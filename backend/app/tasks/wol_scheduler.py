@@ -54,7 +54,7 @@ from app.models.auth import Group, User
 from app.models.wol_schedule import WolRun, WolRunTarget, WolSchedule
 from app.services.feature_modules import get_enabled_modules
 from app.services.wol_scheduler.dispatch import dispatch_wol_targets
-from app.services.wol_scheduler.gating import gate_verdict
+from app.services.wol_scheduler.gating import gate_verdict, load_gate_calendar_events
 from app.services.wol_scheduler.resolver import resolve_wol_targets
 from app.services.wol_scheduler.schedule import (
     InvalidCronExpression,
@@ -280,7 +280,12 @@ async def run_wol_schedule(
             # Evaluate the gate at the candidate FIRE instant (the still-unadvanced
             # ``next_run_at``), not wall-clock ``now`` — a tick that slipped past
             # midnight must still see the scheduled day's blackout/term status.
-            verdict = gate_verdict(schedule.next_run_at or now, schedule)
+            # Load the attached calendar's cached spans (None when no calendar
+            # gate is active) so the Phase-2 calendar step is evaluated too.
+            calendar_events = await load_gate_calendar_events(db, schedule)
+            verdict = gate_verdict(
+                schedule.next_run_at or now, schedule, calendar_events=calendar_events
+            )
             if verdict is not None:
                 return await _finalise_skip(
                     db,

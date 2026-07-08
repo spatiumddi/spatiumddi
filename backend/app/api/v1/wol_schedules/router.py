@@ -1,4 +1,4 @@
-"""Scheduled Wake-on-LAN REST API — Phase 1 (issue #586).
+"""Scheduled Wake-on-LAN REST API (issue #586).
 
 Mounted at ``/api/v1/wake-scheduler`` (see the include in
 ``app.api.v1.router``) behind the ``tools.wake_scheduler`` feature module.
@@ -18,6 +18,10 @@ Surface:
 * ``POST /preview-targets`` — resolve an *unsaved* selector against the
   caller's read scope (the create modal's live match count).
 * ``GET /runs`` / ``GET /runs/{id}`` — execution history + per-host detail.
+* ``/calendars`` CRUD + ``POST /calendars/{id}/sync-now`` +
+  ``GET /calendars/{id}/upcoming-events`` — Phase 2 iCal / CalDAV subscriptions
+  whose all-day event spans gate scheduled wakes. The CalDAV password is
+  Fernet-encrypted at rest and never returned (only ``password_set``).
 
 Every mutation gates on ``use_network_tools`` (symmetry with the manual
 ``POST /ipam/addresses/{id}/wake`` — no new role seed) and writes an
@@ -35,7 +39,7 @@ has lost read access to.
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
@@ -46,12 +50,19 @@ from sqlalchemy.orm import selectinload
 
 from app.api.deps import DB, CurrentUser
 from app.api.v1.dhcp._audit import write_audit
+from app.core.crypto import encrypt_str
 from app.core.permissions import require_permission
 from app.models.auth import Group, User
 from app.models.ipam import Subnet
-from app.models.wol_schedule import WolRun, WolRunTarget, WolSchedule
+from app.models.wol_schedule import (
+    WolCalendar,
+    WolCalendarEvent,
+    WolRun,
+    WolRunTarget,
+    WolSchedule,
+)
 from app.services.nettools.schemas import NetToolTarget
-from app.services.wol_scheduler.gating import gate_verdict
+from app.services.wol_scheduler.gating import gate_verdict, load_gate_calendar_events
 from app.services.wol_scheduler.resolver import (
     SKIP_NO_MAC,
     InvalidSelector,
@@ -66,9 +77,14 @@ from app.services.wol_scheduler.schedule import (
 )
 
 from .schemas import (
+    CalendarEventRead,
+    CalendarSyncResult,
     SkippedTargetRead,
     TargetPreviewRead,
     TargetPreviewRequest,
+    WakeCalendarCreate,
+    WakeCalendarRead,
+    WakeCalendarUpdate,
     WakeRunDetailRead,
     WakeRunRead,
     WakeRunTargetRead,
@@ -98,6 +114,7 @@ _NON_NULLABLE_FIELDS = frozenset(
         "enabled",
         "timezone",
         "target_selector",
+        "calendar_mode",
         "vantage",
         "repeat_count",
         "repeat_interval_ms",
@@ -124,6 +141,9 @@ def _to_schedule_read(row: WolSchedule) -> WakeScheduleRead:
         blackout_dates=row.blackout_dates,
         active_from=row.active_from,
         active_until=row.active_until,
+        calendar_id=row.calendar_id,
+        calendar_mode=row.calendar_mode,
+        calendar_match=row.calendar_match,
         vantage=row.vantage or {"kind": "server", "id": None},
         repeat_count=row.repeat_count,
         repeat_interval_ms=row.repeat_interval_ms,
@@ -137,6 +157,36 @@ def _to_schedule_read(row: WolSchedule) -> WakeScheduleRead:
         created_by_user_id=row.created_by_user_id,
         created_at=row.created_at,
         modified_at=row.modified_at,
+    )
+
+
+def _to_calendar_read(row: WolCalendar) -> WakeCalendarRead:
+    return WakeCalendarRead(
+        id=row.id,
+        name=row.name,
+        kind=row.kind,
+        url=row.url,
+        username=row.username,
+        password_set=bool(row.password_encrypted),
+        enabled=row.enabled,
+        refresh_interval_minutes=row.refresh_interval_minutes,
+        last_synced_at=row.last_synced_at,
+        last_sync_status=row.last_sync_status,
+        last_sync_error=row.last_sync_error,
+        event_count=row.event_count,
+        created_at=row.created_at,
+        modified_at=row.modified_at,
+    )
+
+
+def _to_event_read(row: WolCalendarEvent) -> CalendarEventRead:
+    return CalendarEventRead(
+        id=row.id,
+        starts_on=row.starts_on,
+        ends_on=row.ends_on,
+        summary=row.summary,
+        categories=list(row.categories or []),
+        uid=row.uid,
     )
 
 
@@ -295,6 +345,14 @@ def _vantage_to_jsonb(v: NetToolTarget | None) -> dict[str, Any]:
     return {"kind": v.kind, "id": str(v.id) if v.id is not None else None}
 
 
+async def _assert_calendar_exists(db: AsyncSession, calendar_id: uuid.UUID | None) -> None:
+    """422 if a schedule references a non-existent calendar (FK would 500)."""
+    if calendar_id is None:
+        return
+    if await db.get(WolCalendar, calendar_id) is None:
+        raise HTTPException(status_code=422, detail=f"calendar {calendar_id} not found")
+
+
 async def _resolve_for_preview(
     db: AsyncSession,
     principal: User,
@@ -336,6 +394,7 @@ async def list_schedules(
 async def create_schedule(
     body: WakeScheduleCreate, db: DB, current_user: CurrentUser
 ) -> WakeScheduleRead:
+    await _assert_calendar_exists(db, body.calendar_id)
     row = WolSchedule(
         name=body.name,
         description=body.description,
@@ -346,6 +405,9 @@ async def create_schedule(
         blackout_dates=body.blackout_dates,
         active_from=body.active_from,
         active_until=body.active_until,
+        calendar_id=body.calendar_id,
+        calendar_mode=body.calendar_mode,
+        calendar_match=body.calendar_match,
         vantage=_vantage_to_jsonb(body.vantage),
         repeat_count=body.repeat_count,
         repeat_interval_ms=body.repeat_interval_ms,
@@ -409,6 +471,10 @@ async def update_schedule(
     fields = body.model_dump(exclude_unset=True)
     changed: list[str] = []
 
+    # A newly-referenced calendar must exist (FK would 500 on commit otherwise).
+    if "calendar_id" in fields and fields["calendar_id"] is not None:
+        await _assert_calendar_exists(db, body.calendar_id)
+
     for field, value in fields.items():
         if field in _NON_NULLABLE_FIELDS and value is None:
             continue
@@ -419,6 +485,15 @@ async def update_schedule(
         else:
             setattr(row, field, value)
         changed.append(field)
+
+    # Post-apply consistency — a non-'none' calendar_mode needs an attached
+    # calendar (mirror the create-time model validator, but against the merged
+    # row so "set mode now, calendar already attached" is accepted).
+    if (row.calendar_mode or "none") != "none" and row.calendar_id is None:
+        raise HTTPException(
+            status_code=422,
+            detail=f"calendar_id is required when calendar_mode is {row.calendar_mode!r}",
+        )
 
     # Any cron/tz change (or clear) must re-derive the next fire immediately.
     # Re-enabling must ALSO recompute: a schedule that sat disabled across a
@@ -589,9 +664,11 @@ async def preview_schedule_targets(
     # stay intact for fire-time parity.
     visible = await _caller_visible_subnet_ids(db, caller)
 
-    # Gate verdict at the NEXT fire (or now for a manual-only schedule).
+    # Gate verdict at the NEXT fire (or now for a manual-only schedule),
+    # including the Phase-2 calendar gate (events loaded when one is attached).
     candidate = row.next_run_at or datetime.now(UTC)
-    verdict = gate_verdict(candidate, row)
+    calendar_events = await load_gate_calendar_events(db, row)
+    verdict = gate_verdict(candidate, row, calendar_events=calendar_events)
     return _resolved_to_preview(
         resolved,
         next_run_at=row.next_run_at,
@@ -684,6 +761,255 @@ async def get_run(run_id: uuid.UUID, db: DB, current_user: CurrentUser) -> WakeR
         **base.model_dump(),
         targets=[_to_run_target_read(t) for t in targets],
     )
+
+
+# ── Calendars CRUD (Phase 2) ─────────────────────────────────────────
+
+
+@router.get(
+    "/calendars",
+    response_model=list[WakeCalendarRead],
+    dependencies=[Depends(require_permission("read", PERMISSION))],
+)
+async def list_calendars(
+    db: DB,
+    current_user: CurrentUser,  # noqa: ARG001
+    enabled: bool | None = Query(None),
+) -> list[WakeCalendarRead]:
+    stmt = select(WolCalendar)
+    if enabled is not None:
+        stmt = stmt.where(WolCalendar.enabled.is_(enabled))
+    stmt = stmt.order_by(WolCalendar.name.asc())
+    rows = list((await db.execute(stmt)).scalars().all())
+    return [_to_calendar_read(r) for r in rows]
+
+
+@router.post(
+    "/calendars",
+    response_model=WakeCalendarRead,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permission("write", PERMISSION))],
+)
+async def create_calendar(
+    body: WakeCalendarCreate, db: DB, current_user: CurrentUser
+) -> WakeCalendarRead:
+    row = WolCalendar(
+        name=body.name,
+        kind=body.kind,
+        url=body.url,
+        username=body.username,
+        password_encrypted=(encrypt_str(body.password) if body.password else None),
+        enabled=body.enabled,
+        refresh_interval_minutes=body.refresh_interval_minutes,
+    )
+    db.add(row)
+    await db.flush()
+    write_audit(
+        db,
+        user=current_user,
+        action="create",
+        resource_type="wol_calendar",
+        resource_id=str(row.id),
+        resource_display=row.name,
+        new_value={
+            "name": row.name,
+            "kind": row.kind,
+            "url": row.url,
+            "enabled": row.enabled,
+            "refresh_interval_minutes": row.refresh_interval_minutes,
+        },
+    )
+    await db.commit()
+    await db.refresh(row)
+    return _to_calendar_read(row)
+
+
+@router.get(
+    "/calendars/{calendar_id}",
+    response_model=WakeCalendarRead,
+    dependencies=[Depends(require_permission("read", PERMISSION))],
+)
+async def get_calendar(
+    calendar_id: uuid.UUID, db: DB, current_user: CurrentUser  # noqa: ARG001
+) -> WakeCalendarRead:
+    row = await db.get(WolCalendar, calendar_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Calendar not found")
+    return _to_calendar_read(row)
+
+
+@router.patch(
+    "/calendars/{calendar_id}",
+    response_model=WakeCalendarRead,
+    dependencies=[Depends(require_permission("write", PERMISSION))],
+)
+async def update_calendar(
+    calendar_id: uuid.UUID,
+    body: WakeCalendarUpdate,
+    db: DB,
+    current_user: CurrentUser,
+) -> WakeCalendarRead:
+    row = await db.get(WolCalendar, calendar_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Calendar not found")
+
+    fields = body.model_dump(exclude_unset=True)
+    changed: list[str] = []
+    # Non-nullable columns where an explicit null means "unchanged".
+    non_nullable = {"name", "kind", "url", "enabled", "refresh_interval_minutes"}
+
+    for field, value in fields.items():
+        if field == "password":
+            # Explicit "" clears the stored secret; a non-empty string
+            # re-encrypts; omitting the field (not in ``fields``) leaves it.
+            row.password_encrypted = encrypt_str(value) if value else None
+            changed.append("password")
+            continue
+        if field in non_nullable and value is None:
+            continue
+        setattr(row, field, value)
+        changed.append(field)
+
+    write_audit(
+        db,
+        user=current_user,
+        action="update",
+        resource_type="wol_calendar",
+        resource_id=str(row.id),
+        resource_display=row.name,
+        changed_fields=changed,
+        # Never echo the password back into the audit trail.
+        new_value={k: fields[k] for k in changed if k in fields and k != "password"},
+    )
+    await db.commit()
+    await db.refresh(row)
+    return _to_calendar_read(row)
+
+
+@router.delete(
+    "/calendars/{calendar_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_permission("delete", PERMISSION))],
+)
+async def delete_calendar(calendar_id: uuid.UUID, db: DB, current_user: CurrentUser) -> None:
+    row = await db.get(WolCalendar, calendar_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Calendar not found")
+    name = row.name
+    write_audit(
+        db,
+        user=current_user,
+        action="delete",
+        resource_type="wol_calendar",
+        resource_id=str(row.id),
+        resource_display=name,
+    )
+    # ``wol_schedule.calendar_id`` is ON DELETE SET NULL — schedules survive,
+    # their calendar gate reverts to none-effect (mode stays but no events).
+    await db.delete(row)
+    await db.commit()
+
+
+@router.post(
+    "/calendars/{calendar_id}/sync-now",
+    response_model=CalendarSyncResult,
+    dependencies=[Depends(require_permission("write", PERMISSION))],
+)
+async def sync_calendar_now(
+    calendar_id: uuid.UUID, db: DB, current_user: CurrentUser
+) -> CalendarSyncResult:
+    """Refresh a calendar's cached event spans right now (inline, for immediate
+    operator feedback) reusing the shared reconciler. A transient fetch failure
+    surfaces as a generic 502 (the specific error is persisted on the row's
+    ``last_sync_error`` and the audit log, never echoed to the caller); a parse
+    failure returns a ``status='error'`` result (the row's error state is
+    persisted either way)."""
+    row = await db.get(WolCalendar, calendar_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Calendar not found")
+
+    # Lazy import — keep the sync service (httpx/caldav/icalendar) off the
+    # router's import-time graph (matches the run-now lazy-import pattern).
+    from app.services.wol_scheduler.calendar_sync import sync_calendar  # noqa: PLC0415
+
+    try:
+        # force=True: an explicit operator click may legitimately empty a
+        # cleared calendar (the beat sweep keeps the zero-result guard).
+        summary = await sync_calendar(db, row, force=True)
+    except Exception as exc:  # noqa: BLE001 — transient re-raise from the reconciler
+        await db.refresh(row)
+        write_audit(
+            db,
+            user=current_user,
+            action="sync",
+            resource_type="wol_calendar",
+            resource_id=str(row.id),
+            resource_display=row.name,
+            result="failure",
+            new_value={"error": str(exc)[:2000]},
+        )
+        await db.commit()
+        raise HTTPException(
+            status_code=502,
+            detail="calendar sync failed — see the calendar's last sync status",
+        ) from exc
+
+    await db.refresh(row)
+    write_audit(
+        db,
+        user=current_user,
+        action="sync",
+        resource_type="wol_calendar",
+        resource_id=str(row.id),
+        resource_display=row.name,
+        result="success" if summary.get("status") == "success" else "failure",
+        new_value=summary,
+    )
+    await db.commit()
+    return CalendarSyncResult(
+        status=summary.get("status", "error"),
+        added=summary.get("added", 0),
+        removed=summary.get("removed", 0),
+        total=summary.get("total", 0),
+        error=summary.get("error"),
+        last_synced_at=row.last_synced_at,
+        last_sync_status=row.last_sync_status,
+        last_sync_error=row.last_sync_error,
+    )
+
+
+@router.get(
+    "/calendars/{calendar_id}/upcoming-events",
+    response_model=list[CalendarEventRead],
+    dependencies=[Depends(require_permission("read", PERMISSION))],
+)
+async def upcoming_calendar_events(
+    calendar_id: uuid.UUID,
+    db: DB,
+    current_user: CurrentUser,  # noqa: ARG001
+    days: int = Query(60, ge=1, le=400),
+    limit: int = Query(100, ge=1, le=500),
+) -> list[CalendarEventRead]:
+    """Preview the calendar's cached events whose span reaches into the next
+    ``days`` window (an event still running today counts) — the operator's
+    "does this feed actually mark our holidays?" confirmation."""
+    row = await db.get(WolCalendar, calendar_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Calendar not found")
+    today = datetime.now(UTC).date()
+    horizon = today + timedelta(days=days)
+    stmt = (
+        select(WolCalendarEvent)
+        .where(
+            WolCalendarEvent.calendar_id == calendar_id,
+            WolCalendarEvent.ends_on >= today,
+            WolCalendarEvent.starts_on <= horizon,
+        )
+        .order_by(WolCalendarEvent.starts_on.asc())
+        .limit(limit)
+    )
+    rows = list((await db.execute(stmt)).scalars().all())
+    return [_to_event_read(r) for r in rows]
 
 
 __all__ = ["router"]

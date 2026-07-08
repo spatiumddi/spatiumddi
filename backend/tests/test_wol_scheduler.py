@@ -36,9 +36,11 @@ from app.core.security import hash_password
 from app.models.auth import User
 from app.models.dhcp import DHCPLease, DHCPServer
 from app.models.ipam import IPAddress, IPBlock, IpMacHistory, IPSpace, Subnet
-from app.models.wol_schedule import WolRun, WolSchedule
+from app.models.wol_schedule import WolCalendarEvent, WolRun, WolSchedule
 from app.services.wol_scheduler import (
+    SKIP_CALENDAR_EVENT,
     SKIP_HOLIDAY,
+    SKIP_NO_CALENDAR_EVENT,
     SKIP_OFF_TERM,
     compute_next_run,
     dispatch_wol_targets,
@@ -260,6 +262,84 @@ def test_gate_evaluates_on_local_date_not_utc() -> None:
     sched = _make_schedule(timezone=_NY, blackout_dates=["2026-12-25"])
     at = datetime(2026, 12, 26, 4, 30, tzinfo=UTC)  # local 2026-12-25 23:30
     assert gate_verdict(at, sched) == SKIP_HOLIDAY
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 2b. Phase-2 calendar gate layered ON TOP of the built-in gate
+# ══════════════════════════════════════════════════════════════════════
+
+
+def _cal_event(
+    start: date,
+    end: date,
+    *,
+    summary: str | None = None,
+    categories: list[str] | None = None,
+) -> WolCalendarEvent:
+    """An in-memory (unpersisted) flattened all-day span for the pure gate."""
+    return WolCalendarEvent(
+        calendar_id=uuid.uuid4(),
+        starts_on=start,
+        ends_on=end,
+        summary=summary,
+        categories=categories or [],
+    )
+
+
+def test_gate_calendar_skip_on_event_covers_fire_date() -> None:
+    sched = _make_schedule(timezone="UTC", calendar_id=uuid.uuid4(), calendar_mode="skip_on_event")
+    ev = _cal_event(date(2026, 12, 24), date(2026, 12, 26))  # inclusive multi-day span
+    at = datetime(2026, 12, 25, 7, 0, tzinfo=UTC)  # inside the span
+    assert gate_verdict(at, sched, calendar_events=[ev]) == SKIP_CALENDAR_EVENT
+    # A fire date outside every span is clear to fire.
+    clear = datetime(2026, 12, 30, 7, 0, tzinfo=UTC)
+    assert gate_verdict(clear, sched, calendar_events=[ev]) is None
+
+
+def test_gate_calendar_only_on_event_requires_a_match() -> None:
+    sched = _make_schedule(timezone="UTC", calendar_id=uuid.uuid4(), calendar_mode="only_on_event")
+    ev = _cal_event(date(2026, 9, 1), date(2026, 9, 1))
+    on = datetime(2026, 9, 1, 7, 0, tzinfo=UTC)  # school day → fire
+    off = datetime(2026, 9, 2, 7, 0, tzinfo=UTC)  # no event → skip
+    assert gate_verdict(on, sched, calendar_events=[ev]) is None
+    assert gate_verdict(off, sched, calendar_events=[ev]) == SKIP_NO_CALENDAR_EVENT
+
+
+def test_gate_builtin_blackout_wins_over_calendar() -> None:
+    # only_on_event + a matching event on the date, but the date is ALSO a
+    # blackout → the built-in holiday check (evaluated first) wins.
+    sched = _make_schedule(
+        timezone="UTC",
+        calendar_id=uuid.uuid4(),
+        calendar_mode="only_on_event",
+        blackout_dates=["2026-09-01"],
+    )
+    ev = _cal_event(date(2026, 9, 1), date(2026, 9, 1))
+    at = datetime(2026, 9, 1, 7, 0, tzinfo=UTC)
+    assert gate_verdict(at, sched, calendar_events=[ev]) == SKIP_HOLIDAY
+
+
+def test_gate_builtin_off_term_wins_over_calendar() -> None:
+    # skip_on_event + an event on the date, but the date is before the term
+    # range → off_term (evaluated before the calendar step) wins.
+    sched = _make_schedule(
+        timezone="UTC",
+        calendar_id=uuid.uuid4(),
+        calendar_mode="skip_on_event",
+        active_from=date(2026, 9, 1),
+        active_until=date(2026, 12, 20),
+    )
+    ev = _cal_event(date(2026, 8, 15), date(2026, 8, 15))
+    at = datetime(2026, 8, 15, 7, 0, tzinfo=UTC)
+    assert gate_verdict(at, sched, calendar_events=[ev]) == SKIP_OFF_TERM
+
+
+def test_gate_calendar_noop_when_events_not_supplied() -> None:
+    # Phase-1 callers pass calendar_events=None → the calendar step no-ops even
+    # with a calendar attached (so a pre-Phase-2 code path never suppresses).
+    sched = _make_schedule(timezone="UTC", calendar_id=uuid.uuid4(), calendar_mode="skip_on_event")
+    at = datetime(2026, 12, 25, 7, 0, tzinfo=UTC)
+    assert gate_verdict(at, sched, calendar_events=None) is None
 
 
 # ══════════════════════════════════════════════════════════════════════

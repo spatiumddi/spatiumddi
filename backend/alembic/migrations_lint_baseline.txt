@@ -442,6 +442,12 @@ backend/alembic/versions/d7e2a4f9c1b3_appliance_firewall_prereqs.py:drop_column:
 backend/alembic/versions/d7e2a4f9c1b3_appliance_firewall_prereqs.py:drop_column:65
 backend/alembic/versions/d7e2a4f9c1b3_appliance_firewall_prereqs.py:drop_column:66
 backend/alembic/versions/d7e2a4f9c1b3_appliance_firewall_prereqs.py:drop_column:67
+backend/alembic/versions/d7e3f0a91c24_wake_scheduler_calendar.py:drop_column:147
+backend/alembic/versions/d7e3f0a91c24_wake_scheduler_calendar.py:drop_column:148
+backend/alembic/versions/d7e3f0a91c24_wake_scheduler_calendar.py:drop_column:149
+backend/alembic/versions/d7e3f0a91c24_wake_scheduler_calendar.py:drop_constraint_fk:146
+backend/alembic/versions/d7e3f0a91c24_wake_scheduler_calendar.py:drop_table:151
+backend/alembic/versions/d7e3f0a91c24_wake_scheduler_calendar.py:drop_table:153
 backend/alembic/versions/d7e5b8c91a3f_dhcp_failover_channel.py:drop_column:145
 backend/alembic/versions/d7e5b8c91a3f_dhcp_failover_channel.py:drop_column:146
 backend/alembic/versions/d7e5b8c91a3f_dhcp_failover_channel.py:drop_table:148
@@ -568,9 +574,9 @@ backend/alembic/versions/e7f94b21c8d5_dns_zone_dnssec_ds_records.py:drop_column:
 backend/alembic/versions/e8c3f1b9a724_appliance_revoked_at.py:drop_column:65
 backend/alembic/versions/e8c3f1b9a724_appliance_revoked_at.py:drop_column:72
 backend/alembic/versions/e93b41ad7c5f_ai_daily_digest_setting.py:drop_column:39
-backend/alembic/versions/e9c47a1f3b28_wake_scheduler.py:drop_table:234
-backend/alembic/versions/e9c47a1f3b28_wake_scheduler.py:drop_table:236
-backend/alembic/versions/e9c47a1f3b28_wake_scheduler.py:drop_table:238
+backend/alembic/versions/e9c47a1f3b28_wake_scheduler.py:drop_table:235
+backend/alembic/versions/e9c47a1f3b28_wake_scheduler.py:drop_table:237
+backend/alembic/versions/e9c47a1f3b28_wake_scheduler.py:drop_table:239
 backend/alembic/versions/ee86cea94cf5_appliance_role_assignment.py:drop_column:101
 backend/alembic/versions/ee86cea94cf5_appliance_role_assignment.py:drop_column:102
 backend/alembic/versions/ee86cea94cf5_appliance_role_assignment.py:drop_column:103

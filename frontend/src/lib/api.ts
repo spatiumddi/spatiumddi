@@ -15198,6 +15198,18 @@ export type WolSelectorMode =
   | "hosts";
 
 /**
+ * Calendar-gate polarity (Phase 2, #586). ``none`` = the external calendar
+ * plays no part (built-in blackout/term still apply); ``skip_on_event`` = a
+ * matching event on the fire date SKIPS the wake (holiday calendar);
+ * ``only_on_event`` = the wake only fires when the date intersects a matching
+ * event (term / school-day calendar). Mirrors ``wol_schedule.calendar_mode``.
+ */
+export type WolCalendarMode = "none" | "skip_on_event" | "only_on_event";
+
+/** Calendar subscription kind — mirrors ``wol_calendar.kind``. */
+export type WolCalendarKind = "ical_url" | "caldav";
+
+/**
  * The stored ``target_selector``. Only the list relevant to ``mode`` is
  * consulted by the resolver, but all four fields are carried so the operator
  * can flip modes without losing the other selections. ``tags`` use the
@@ -15232,6 +15244,10 @@ export interface WolSchedule {
   blackout_dates: string[] | null; // ISO YYYY-MM-DD
   active_from: string | null; // ISO date — term-range gate
   active_until: string | null;
+  /** External-calendar gate (Phase 2). ``null`` calendar_id == no feed. */
+  calendar_id: string | null;
+  calendar_mode: WolCalendarMode;
+  calendar_match: string | null; // optional summary/category regex
   vantage: WolVantage;
   repeat_count: number;
   repeat_interval_ms: number;
@@ -15257,6 +15273,14 @@ export interface WolScheduleCreate {
   blackout_dates?: string[] | null;
   active_from?: string | null;
   active_until?: string | null;
+  /**
+   * External-calendar gate (Phase 2). ``calendar_mode !== "none"`` requires
+   * ``calendar_id`` server-side; ``calendar_match`` is an optional
+   * summary/category regex filtering which events count.
+   */
+  calendar_id?: string | null;
+  calendar_mode?: WolCalendarMode;
+  calendar_match?: string | null;
   vantage?: WolVantage | null;
   repeat_count?: number;
   repeat_interval_ms?: number;
@@ -15279,6 +15303,9 @@ export interface WolScheduleUpdate {
   blackout_dates?: string[] | null;
   active_from?: string | null;
   active_until?: string | null;
+  calendar_id?: string | null;
+  calendar_mode?: WolCalendarMode;
+  calendar_match?: string | null;
   vantage?: WolVantage | null;
   repeat_count?: number;
   repeat_interval_ms?: number;
@@ -15361,6 +15388,77 @@ export interface WolRunDetail extends WolRun {
   targets: WolRunTarget[];
 }
 
+// ── Calendars (#586 Phase 2) ─────────────────────────────────────────
+// Subscribed iCal (.ics URL) / authenticated CalDAV feeds whose all-day
+// event spans flatten into ``wol_calendar_event`` rows for the schedule's
+// holiday / term gate. The CalDAV password is write-only — never returned;
+// only ``password_set`` reveals whether one is stored.
+
+export interface WolCalendar {
+  id: string;
+  name: string;
+  kind: WolCalendarKind;
+  url: string;
+  username: string | null;
+  password_set: boolean;
+  enabled: boolean;
+  refresh_interval_minutes: number;
+  last_synced_at: string | null;
+  last_sync_status: string | null;
+  last_sync_error: string | null;
+  event_count: number;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface WolCalendarCreate {
+  name: string;
+  kind: WolCalendarKind;
+  url: string;
+  username?: string | null;
+  /** Write-only; encrypted at rest, never returned. */
+  password?: string | null;
+  enabled?: boolean;
+  refresh_interval_minutes?: number;
+}
+
+/**
+ * PATCH body — every field optional. An explicit ``password: ""`` CLEARS the
+ * stored secret; omitting ``password`` leaves it unchanged; a non-empty string
+ * re-encrypts.
+ */
+export interface WolCalendarUpdate {
+  name?: string;
+  kind?: WolCalendarKind;
+  url?: string;
+  username?: string | null;
+  password?: string | null;
+  enabled?: boolean;
+  refresh_interval_minutes?: number;
+}
+
+/** One flattened all-day event span (recurrence already expanded). */
+export interface WolCalendarEvent {
+  id: string;
+  starts_on: string; // ISO date
+  ends_on: string; // ISO date (inclusive)
+  summary: string | null;
+  categories: string[];
+  uid: string | null;
+}
+
+/** Outcome of a ``POST /calendars/{id}/sync-now`` refresh. */
+export interface WolCalendarSyncResult {
+  status: string;
+  added: number;
+  removed: number;
+  total: number;
+  error: string | null;
+  last_synced_at: string | null;
+  last_sync_status: string | null;
+  last_sync_error: string | null;
+}
+
 export const wakeSchedulesApi = {
   list: (enabled?: boolean) =>
     api
@@ -15409,4 +15507,36 @@ export const wakeSchedulesApi = {
     api.get<WolRun[]>("/wake-scheduler/runs", { params }).then((r) => r.data),
   getRun: (id: string) =>
     api.get<WolRunDetail>(`/wake-scheduler/runs/${id}`).then((r) => r.data),
+
+  // ── Calendars (Phase 2) ──────────────────────────────────────────
+  listCalendars: (enabled?: boolean) =>
+    api
+      .get<WolCalendar[]>("/wake-scheduler/calendars", {
+        params: enabled === undefined ? undefined : { enabled },
+      })
+      .then((r) => r.data),
+  getCalendar: (id: string) =>
+    api.get<WolCalendar>(`/wake-scheduler/calendars/${id}`).then((r) => r.data),
+  createCalendar: (body: WolCalendarCreate) =>
+    api
+      .post<WolCalendar>("/wake-scheduler/calendars", body)
+      .then((r) => r.data),
+  updateCalendar: (id: string, body: WolCalendarUpdate) =>
+    api
+      .patch<WolCalendar>(`/wake-scheduler/calendars/${id}`, body)
+      .then((r) => r.data),
+  removeCalendar: (id: string) =>
+    api.delete<void>(`/wake-scheduler/calendars/${id}`).then((r) => r.data),
+  /** Refresh a calendar's cached event spans right now (inline). */
+  syncCalendarNow: (id: string) =>
+    api
+      .post<WolCalendarSyncResult>(`/wake-scheduler/calendars/${id}/sync-now`)
+      .then((r) => r.data),
+  /** Preview the cached events reaching into the next ``days`` window. */
+  getCalendarEvents: (id: string, params?: { days?: number; limit?: number }) =>
+    api
+      .get<
+        WolCalendarEvent[]
+      >(`/wake-scheduler/calendars/${id}/upcoming-events`, { params })
+      .then((r) => r.data),
 };

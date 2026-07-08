@@ -31,7 +31,7 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -698,6 +698,26 @@ class CreateWolScheduleArgs(BaseModel):
     active_until: str | None = Field(
         default=None, description="ISO date — schedule is inactive after this day."
     )
+    calendar_id: str | None = Field(
+        default=None,
+        description=(
+            "Optional UUID of a wol_calendar (iCal/CalDAV subscription) to gate "
+            "the wake on. Required when calendar_mode is not 'none'."
+        ),
+    )
+    calendar_mode: Literal["none", "skip_on_event", "only_on_event"] = Field(
+        default="none",
+        description=(
+            "External-calendar gate polarity: 'none' (ignore), 'skip_on_event' "
+            "(skip the wake when a matching event covers the fire date — holiday "
+            "calendar), or 'only_on_event' (only fire when a matching event "
+            "covers it — term/school-day calendar)."
+        ),
+    )
+    calendar_match: str | None = Field(
+        default=None,
+        description="Optional regex filtering which calendar events count (summary/categories).",
+    )
     vantage_kind: Literal["server", "appliance"] = Field(
         default="server",
         description=(
@@ -715,6 +735,18 @@ class CreateWolScheduleArgs(BaseModel):
     repeat_interval_ms: int = Field(default=100, ge=0, le=10_000)
     stagger_ms: int = Field(default=0, ge=0, le=60_000)
     port: int = Field(default=9, ge=1, le=65535)
+
+    @field_validator("calendar_match")
+    @classmethod
+    def _check_calendar_match(cls, v: str | None) -> str | None:
+        # Reject a malformed regex at propose time — mirror the REST
+        # WakeScheduleCreate 422 so it can't be persisted then silently
+        # degrade to "match every event" in ``_compile_match``.
+        from app.api.v1.wol_schedules.schemas import (  # noqa: PLC0415
+            _validate_calendar_match,
+        )
+
+        return _validate_calendar_match(v)
 
 
 class RunWolScheduleNowArgs(BaseModel):
@@ -858,7 +890,7 @@ async def _apply_create_wol_schedule(
     db: AsyncSession, user: User, args: CreateWolScheduleArgs
 ) -> dict[str, Any]:
     from app.api.v1.dhcp._audit import write_audit  # noqa: PLC0415
-    from app.models.wol_schedule import WolSchedule  # noqa: PLC0415
+    from app.models.wol_schedule import WolCalendar, WolSchedule  # noqa: PLC0415
     from app.services.wol_scheduler import (  # noqa: PLC0415
         InvalidCronExpression,
         InvalidTimezone,
@@ -875,6 +907,18 @@ async def _apply_create_wol_schedule(
     except ValueError as exc:
         raise ValueError(str(exc)) from exc
 
+    # Calendar gate (Phase 2) — validate mode/id consistency + existence.
+    calendar_uuid: UUID | None = None
+    if args.calendar_id:
+        try:
+            calendar_uuid = UUID(str(args.calendar_id))
+        except ValueError as exc:
+            raise ValueError(f"calendar_id {args.calendar_id!r} is not a valid UUID") from exc
+        if await db.get(WolCalendar, calendar_uuid) is None:
+            raise ValueError(f"calendar {calendar_uuid} not found")
+    if args.calendar_mode != "none" and calendar_uuid is None:
+        raise ValueError(f"calendar_id is required when calendar_mode is {args.calendar_mode!r}")
+
     vantage = {
         "kind": args.vantage_kind,
         "id": args.vantage_appliance_id if args.vantage_kind == "appliance" else None,
@@ -889,6 +933,9 @@ async def _apply_create_wol_schedule(
         blackout_dates=blackouts,
         active_from=active_from,
         active_until=active_until,
+        calendar_id=calendar_uuid,
+        calendar_mode=args.calendar_mode,
+        calendar_match=args.calendar_match,
         vantage=vantage,
         repeat_count=args.repeat_count,
         repeat_interval_ms=args.repeat_interval_ms,

@@ -6,9 +6,10 @@ The wire contract is the ``wake-scheduler`` prefix even though the Python
 package is ``wol_schedules`` — the frontend api client, the MCP tools, and
 the runner docstrings all reference ``/wake-scheduler``.
 
-**Phase 1 only** — the holiday gate is the built-in ``blackout_dates`` +
-``active_from`` / ``active_until`` + ``timezone``. There is NO external
-iCal / CalDAV calendar (that is Phase 2 and deliberately absent).
+The built-in holiday gate is ``blackout_dates`` + ``active_from`` /
+``active_until`` + ``timezone``; Phase 2 (issue #586) layers an external
+iCal / CalDAV calendar gate on top (``calendar_id`` / ``calendar_mode`` /
+``calendar_match`` on the schedule + the ``WakeCalendar*`` shapes below).
 
 Validation reuses the shipped service helpers verbatim so the API and the
 beat runner agree on what a valid schedule is:
@@ -36,6 +37,13 @@ from app.services.wol_scheduler.schedule import (
 
 # Selector modes (mirrors ``app.services.wol_scheduler.resolver.VALID_MODES``).
 SelectorMode = Literal["address_tags", "subnet", "subnet_tags", "hosts"]
+
+# Calendar gate polarities (mirror ``wol_schedule.calendar_mode`` +
+# ``app.services.wol_scheduler.gating`` CAL_MODE_*). Phase 2 (issue #586).
+CalendarMode = Literal["none", "skip_on_event", "only_on_event"]
+
+# Calendar subscription kinds (mirror ``wol_calendar.kind``).
+CalendarKind = Literal["ical_url", "caldav"]
 
 # Vantage kinds Phase-1 WoL can actually send from (a magic packet only
 # originates from the control-plane server or a Fleet appliance NIC).
@@ -99,6 +107,19 @@ def _validate_vantage(v: NetToolTarget | None) -> NetToolTarget | None:
     return v
 
 
+def _validate_calendar_match(value: str | None) -> str | None:
+    """Ensure ``calendar_match`` is a compilable regex (or empty/None)."""
+    if value is None or not value.strip():
+        return value
+    import re  # noqa: PLC0415
+
+    try:
+        re.compile(value)
+    except re.error as exc:
+        raise ValueError(f"calendar_match is not a valid regular expression: {exc}") from exc
+    return value
+
+
 def _validate_blackouts(value: list[str] | None) -> list[str] | None:
     """Ensure every blackout entry is an ISO ``YYYY-MM-DD`` string."""
     if value is None:
@@ -132,6 +153,12 @@ class WakeScheduleCreate(BaseModel):
     blackout_dates: list[str] | None = None
     active_from: date | None = None
     active_until: date | None = None
+
+    # External calendar gate (Phase 2). ``calendar_mode`` != 'none' requires
+    # ``calendar_id``. ``calendar_match`` is an optional summary/category regex.
+    calendar_id: uuid.UUID | None = None
+    calendar_mode: CalendarMode = "none"
+    calendar_match: str | None = None
 
     # Send options honoured by the #533 send path.
     vantage: NetToolTarget | None = None
@@ -170,6 +197,11 @@ class WakeScheduleCreate(BaseModel):
     def _check_vantage(cls, v: NetToolTarget | None) -> NetToolTarget | None:
         return _validate_vantage(v)
 
+    @field_validator("calendar_match")
+    @classmethod
+    def _check_cal_match(cls, v: str | None) -> str | None:
+        return _validate_calendar_match(v)
+
     @model_validator(mode="after")
     def _check_term_range(self) -> WakeScheduleCreate:
         if (
@@ -178,6 +210,10 @@ class WakeScheduleCreate(BaseModel):
             and self.active_from > self.active_until
         ):
             raise ValueError("active_from must be on or before active_until")
+        if self.calendar_mode != "none" and self.calendar_id is None:
+            raise ValueError(
+                f"calendar_id is required when calendar_mode is {self.calendar_mode!r}"
+            )
         return self
 
 
@@ -199,6 +235,13 @@ class WakeScheduleUpdate(BaseModel):
     blackout_dates: list[str] | None = None
     active_from: date | None = None
     active_until: date | None = None
+
+    # Calendar gate (Phase 2). ``calendar_id`` nullable-clearable; setting
+    # ``calendar_mode`` to a non-'none' value with no attached calendar is
+    # rejected in the router (needs the row to check the current calendar_id).
+    calendar_id: uuid.UUID | None = None
+    calendar_mode: CalendarMode | None = None
+    calendar_match: str | None = None
 
     vantage: NetToolTarget | None = None
     repeat_count: int | None = Field(default=None, ge=1, le=10)
@@ -238,6 +281,11 @@ class WakeScheduleUpdate(BaseModel):
     def _check_vantage(cls, v: NetToolTarget | None) -> NetToolTarget | None:
         return _validate_vantage(v)
 
+    @field_validator("calendar_match")
+    @classmethod
+    def _check_cal_match(cls, v: str | None) -> str | None:
+        return _validate_calendar_match(v)
+
 
 # ── Read ─────────────────────────────────────────────────────────────
 
@@ -253,6 +301,9 @@ class WakeScheduleRead(BaseModel):
     blackout_dates: list[str] | None
     active_from: date | None
     active_until: date | None
+    calendar_id: uuid.UUID | None
+    calendar_mode: str
+    calendar_match: str | None
     vantage: dict[str, Any]
     repeat_count: int
     repeat_interval_ms: int
@@ -354,6 +405,100 @@ class WakeRunDetailRead(WakeRunRead):
     targets: list[WakeRunTargetRead]
 
 
+# ── Calendars (Phase 2) ──────────────────────────────────────────────
+
+
+class WakeCalendarCreate(BaseModel):
+    """Operator request to subscribe a calendar (iCal .ics URL or CalDAV)."""
+
+    name: str = Field(min_length=1, max_length=255)
+    kind: CalendarKind
+    url: str = Field(min_length=1)
+    username: str | None = Field(default=None, max_length=255)
+    # Write-only; encrypted at rest, never returned. A CalDAV subscription
+    # usually needs one; an ical_url token feed usually doesn't.
+    password: str | None = None
+    enabled: bool = True
+    refresh_interval_minutes: int = Field(default=360, ge=5, le=10_080)
+
+    @field_validator("url")
+    @classmethod
+    def _check_url(cls, v: str) -> str:
+        u = v.strip()
+        lowered = u.lower()
+        if not lowered.startswith(("http://", "https://", "webcal://", "webcals://")):
+            raise ValueError("url must be an http(s):// or webcal(s):// URL")
+        return u
+
+
+class WakeCalendarUpdate(BaseModel):
+    """PATCH body — every field optional. An explicit ``password: ""`` CLEARS
+    the stored secret; omitting ``password`` leaves it unchanged; a non-empty
+    string re-encrypts."""
+
+    name: str | None = Field(default=None, min_length=1, max_length=255)
+    kind: CalendarKind | None = None
+    url: str | None = Field(default=None, min_length=1)
+    username: str | None = Field(default=None, max_length=255)
+    password: str | None = None
+    enabled: bool | None = None
+    refresh_interval_minutes: int | None = Field(default=None, ge=5, le=10_080)
+
+    @field_validator("url")
+    @classmethod
+    def _check_url(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        u = v.strip()
+        if not u.lower().startswith(("http://", "https://", "webcal://", "webcals://")):
+            raise ValueError("url must be an http(s):// or webcal(s):// URL")
+        return u
+
+
+class WakeCalendarRead(BaseModel):
+    """Calendar row for the wire. The CalDAV password is NEVER serialised —
+    only ``password_set`` reveals whether one is stored."""
+
+    id: uuid.UUID
+    name: str
+    kind: str
+    url: str
+    username: str | None
+    password_set: bool
+    enabled: bool
+    refresh_interval_minutes: int
+    last_synced_at: datetime | None
+    last_sync_status: str | None
+    last_sync_error: str | None
+    event_count: int
+    created_at: datetime
+    modified_at: datetime
+
+
+class CalendarEventRead(BaseModel):
+    """One flattened all-day event span (recurrence already expanded)."""
+
+    id: uuid.UUID
+    starts_on: date
+    ends_on: date
+    summary: str | None
+    categories: list[str]
+    uid: str | None
+
+
+class CalendarSyncResult(BaseModel):
+    """Outcome of a ``POST /calendars/{id}/sync-now`` refresh."""
+
+    status: str
+    added: int = 0
+    removed: int = 0
+    total: int = 0
+    error: str | None = None
+    last_synced_at: datetime | None = None
+    last_sync_status: str | None = None
+    last_sync_error: str | None = None
+
+
 __all__ = [
     "SelectorMode",
     "TargetSelectorIn",
@@ -367,4 +512,11 @@ __all__ = [
     "WakeRunRead",
     "WakeRunTargetRead",
     "WakeRunDetailRead",
+    "CalendarMode",
+    "CalendarKind",
+    "WakeCalendarCreate",
+    "WakeCalendarUpdate",
+    "WakeCalendarRead",
+    "CalendarEventRead",
+    "CalendarSyncResult",
 ]

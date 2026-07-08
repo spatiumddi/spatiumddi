@@ -65,6 +65,7 @@ celery_app = Celery(
         "app.tasks.dnsbl_sweep",
         "app.tasks.schema_check",
         "app.tasks.wol_scheduler",
+        "app.tasks.wol_calendar",
     ],
 )
 
@@ -128,6 +129,7 @@ celery_app.conf.update(
         "app.tasks.tls_certs.*": {"queue": "default"},
         "app.tasks.schema_check.*": {"queue": "default"},
         "app.tasks.wol_scheduler.*": {"queue": "default"},
+        "app.tasks.wol_calendar.*": {"queue": "default"},
     },
     beat_schedule={
         # Every 60 s, mark DNS agents as ``unreachable`` if their
@@ -543,6 +545,15 @@ celery_app.conf.update(
         # feature module, so this cron is harmless when the module is off.
         "wol-schedule-sweep": {
             "task": "app.tasks.wol_scheduler.sweep_wol_schedules",
+            "schedule": schedule(run_every=60.0),
+        },
+        # Every 60 s, refresh any enabled Wake-on-LAN calendar subscription
+        # (iCal .ics URL / CalDAV) whose ``refresh_interval_minutes`` cadence
+        # has elapsed (issue #586 Phase 2). Per-calendar interval gating lives
+        # inside the task; it self-gates on the ``tools.wake_scheduler`` feature
+        # module, so this cron is harmless when the module is off.
+        "wol-calendar-sweep": {
+            "task": "app.tasks.wol_calendar.sweep_wol_calendars",
             "schedule": schedule(run_every=60.0),
         },
         # Every 60 s, soft-revoke time-bound RBAC grants whose

@@ -281,8 +281,9 @@ resolved host set (and skip reasons) before saving or running.
 
 #### Built-in holiday gate (Phase 1)
 
-Phase 1 ships a **built-in** blackout/term gate only — there is deliberately no
-external calendar integration:
+Every schedule carries a **built-in** blackout/term gate that needs no external
+calendar (the [calendar subscription](#calendar-subscriptions-phase-2) below is
+an optional additional gate layered on top):
 
 - `blackout_dates` — a list of ISO `YYYY-MM-DD` dates. A fire whose **local**
   calendar date (evaluated in the schedule's `timezone`) is a member is
@@ -296,10 +297,78 @@ The gate is evaluated on the local date so a 07:00-local wake on a blackout day
 is correctly suppressed regardless of the UTC offset. Skipped runs are still
 recorded as `wol_run` rows so the skip is auditable.
 
-> **Phase 2 (deferred):** external-calendar gating via subscribed **iCal /
-> CalDAV** feeds (so a schedule can honour an org holiday calendar or a
-> room-booking system) is a follow-up and is **not** in Phase 1. Phase 1's
-> holiday awareness is the built-in `blackout_dates` + term-range fields only.
+#### Calendar subscriptions (Phase 2)
+
+Phase 2 layers an **external calendar** gate on top of the built-in
+blackout/term checks. Instead of hand-maintaining a `blackout_dates` list, a
+schedule can subscribe to a calendar the organisation already publishes and let
+its all-day events drive the wake decision — the exact "follow the school/term
+calendar instead of a dumb weekday cron" workflow the feature was requested for.
+
+A **`wol_calendar`** row is a subscribed feed in one of two kinds:
+
+- **iCal `.ics` URL** (`kind = "ical_url"`) — an unauthenticated (or
+  token-in-URL) `.ics` / `webcal://` feed. This is the MVP path and covers the
+  80% case: Google Calendar "public address in iCal format" links and most
+  published school / district holiday calendars. `webcal://` and `webcals://`
+  are normalised to `https://` before fetch.
+- **Authenticated CalDAV** (`kind = "caldav"`) — a `username` + password
+  collection on a CalDAV server (Nextcloud, Radicale, a school's own server).
+  This is the HomeAssistant-CalDAV path the original requester described. The
+  password is **Fernet-encrypted at rest** and is **never returned** by the API
+  — reads expose only a `password_set` boolean.
+
+On each refresh the reconciler pulls the feed, parses it with `icalendar`
+(CalDAV collections via the `caldav` client), and **flattens all-day VEVENTs
+into concrete date spans** in the child `wol_calendar_event` table
+(`starts_on` / `ends_on` inclusive, `summary`, `categories`, `uid`).
+Recurrence (`RRULE` / `RDATE`, minus `EXDATE`) is expanded via
+`python-dateutil` over a bounded forward horizon (~400 days) so a
+`FREQ=YEARLY` rule can't produce an unbounded set. Only all-day events count —
+a timed 09:00 meeting is ignored; a holiday / term calendar is all-day spans.
+`DTEND` is treated as RFC 5545-exclusive, so a stored `ends_on` is
+`DTEND − 1 day`. The flattened spans make the fire-time gate an O(events)
+in-memory check with no per-fire network call — the same last-known-good-cache
+shape the DNS blocklist feed uses, so a schedule keeps gating correctly even
+while the feed source is unreachable.
+
+**Two gate modes** (`wol_schedule.calendar_mode`) cover the two shapes schools
+actually publish:
+
+| Mode | Calendar shape | Behaviour |
+|---|---|---|
+| `skip_on_event` | **Holiday** calendar (events = days off) | A matching event covering the local fire date **skips** the wake (`skip_reason = "calendar_event"`) |
+| `only_on_event` | **School-day / term** calendar (events = days on) | The wake fires **only** when a matching event covers the local fire date; otherwise skipped (`skip_reason = "no_calendar_event"`) |
+| `none` (default) | — | Calendar ignored; pure Phase-1 built-in gating |
+
+**`calendar_match`** (optional, per-schedule) is a case-insensitive regex that
+narrows *which* events count — matched against each event's summary and its
+categories. Use it when one calendar carries mixed entries and only some are
+wake-relevant (e.g. `calendar_match = "closed|holiday"` on a shared calendar
+that also holds staff-PD days). A malformed regex is treated as "no filter" so
+a bad operator entry can never wedge the gate.
+
+The calendar is an **additional** gate: the built-in term-range and
+`blackout_dates` checks still run first (term → blackout → calendar), and the
+whole thing is evaluated on the **local** fire date in the schedule's timezone.
+A skipped fire is still written as a `wol_run` row with the calendar skip
+reason, so "skipped — holiday calendar" stays visible in history.
+
+**Refresh cadence + sync-now.** Each calendar carries a
+`refresh_interval_minutes` cadence (default 6 h). A 60 s beat sweep
+(`app.tasks.wol_calendar.sweep_wol_calendars`) reconciles every enabled
+calendar whose interval has elapsed, mirroring the DNS-blocklist feed pull —
+transient network failures set `last_sync_status = "error"` + `last_sync_error`
+and retry with backoff; a successful pull stamps `last_synced_at` and
+recomputes `event_count`. The Calendars tab surfaces last-synced status and an
+**upcoming-events preview** so an operator can confirm "yes, this feed marks our
+holidays" before wiring a schedule to it, plus a **Sync now** button that runs
+the reconcile inline for immediate feedback.
+
+The `wol_calendar` tables belong to the **same** `tools.wake_scheduler` feature
+module as Phase 1 (no new module). Deleting a calendar `SET NULL`s the
+`calendar_id` on any schedule referencing it — the schedule falls back to its
+built-in gate rather than erroring.
 
 #### Vantage
 

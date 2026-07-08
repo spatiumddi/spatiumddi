@@ -44,7 +44,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.models.auth import Group, User
-from app.models.wol_schedule import WolRun, WolSchedule
+from app.models.wol_schedule import WolCalendar, WolCalendarEvent, WolRun, WolSchedule
 from app.services.ai.operations import (
     CreateWolScheduleArgs,
     RunWolScheduleNowArgs,
@@ -315,6 +315,7 @@ async def preview_wol_schedule_targets(
         SKIP_NO_MAC,
         InvalidSelector,
         gate_verdict,
+        load_gate_calendar_events,
         resolve_wol_targets,
     )
     from app.services.wol_scheduler.resolver import _readable_subnet_ids  # noqa: PLC0415
@@ -364,7 +365,10 @@ async def preview_wol_schedule_targets(
 
     mac_less = sum(1 for s in resolved.skipped if s.reason == SKIP_NO_MAC)
     candidate = row.next_run_at or datetime.now(UTC)
-    verdict = gate_verdict(candidate, row)
+    # Include the Phase-2 calendar gate (events loaded when one is attached),
+    # mirroring the REST preview + fire path exactly.
+    calendar_events = await load_gate_calendar_events(db, row)
+    verdict = gate_verdict(candidate, row, calendar_events=calendar_events)
     return {
         "schedule_id": str(row.id),
         "name": row.name,
@@ -390,6 +394,144 @@ async def preview_wol_schedule_targets(
             {"reason": s.reason, "address": s.address} for s in visible_skipped[:_SAMPLE_CAP]
         ],
     }
+
+
+# ── Calendar reads (Phase 2) ─────────────────────────────────────────
+
+
+def _calendar_summary(row: WolCalendar) -> dict[str, Any]:
+    return {
+        "id": str(row.id),
+        "name": row.name,
+        "kind": row.kind,
+        "url": row.url,
+        "enabled": row.enabled,
+        "refresh_interval_minutes": row.refresh_interval_minutes,
+        "event_count": row.event_count,
+        "last_synced_at": row.last_synced_at.isoformat() if row.last_synced_at else None,
+        "last_sync_status": row.last_sync_status,
+        "last_sync_error": row.last_sync_error,
+        # Never leak the CalDAV password — only whether one is stored.
+        "password_set": bool(row.password_encrypted),
+        "username": row.username,
+    }
+
+
+class FindWolCalendarsArgs(BaseModel):
+    enabled: bool | None = Field(
+        default=None, description="True = only enabled, False = only disabled, omitted = both."
+    )
+    name_contains: str | None = Field(
+        default=None, description="Case-insensitive substring match on the calendar name."
+    )
+    limit: int = Field(default=100, ge=1, le=500)
+
+
+@register_tool(
+    name="find_wol_calendars",
+    description=(
+        "List Wake-on-LAN calendar subscriptions (iCal .ics URL or CalDAV) whose "
+        "all-day events gate scheduled wakes. Each row carries kind, refresh "
+        "cadence, cached event_count, and last sync status/error. The CalDAV "
+        "password is never returned (only a password_set boolean). Answers 'which "
+        "holiday calendars are wired up?', 'did the school calendar sync?'. "
+        "Read-only."
+    ),
+    args_model=FindWolCalendarsArgs,
+    category="network",
+    module=_MODULE,
+)
+async def find_wol_calendars(
+    db: AsyncSession, user: User, args: FindWolCalendarsArgs
+) -> list[dict[str, Any]]:
+    stmt = select(WolCalendar)
+    if args.enabled is not None:
+        stmt = stmt.where(WolCalendar.enabled.is_(args.enabled))
+    if args.name_contains:
+        stmt = stmt.where(WolCalendar.name.ilike(f"%{args.name_contains}%"))
+    stmt = stmt.order_by(WolCalendar.name.asc()).limit(args.limit)
+    rows = (await db.execute(stmt)).scalars().all()
+    return [_calendar_summary(r) for r in rows]
+
+
+class GetWolCalendarArgs(BaseModel):
+    calendar_id: uuid.UUID = Field(description="UUID of the wol_calendar row.")
+
+
+@register_tool(
+    name="get_wol_calendar",
+    description=(
+        "Get one Wake-on-LAN calendar subscription in full — kind, URL, refresh "
+        "cadence, cached event_count, last sync status/error, and whether a "
+        "CalDAV password is stored (password_set; the secret itself is never "
+        "returned). Read-only."
+    ),
+    args_model=GetWolCalendarArgs,
+    category="network",
+    module=_MODULE,
+)
+async def get_wol_calendar(
+    db: AsyncSession, user: User, args: GetWolCalendarArgs
+) -> dict[str, Any]:
+    row = await db.get(WolCalendar, args.calendar_id)
+    if row is None:
+        return {"error": f"calendar {args.calendar_id} not found"}
+    return _calendar_summary(row)
+
+
+class FindWolCalendarEventsArgs(BaseModel):
+    calendar_id: uuid.UUID = Field(description="UUID of the wol_calendar to preview.")
+    days: int = Field(default=60, ge=1, le=400, description="Forward window in days from today.")
+    limit: int = Field(default=50, ge=1, le=500)
+
+
+@register_tool(
+    name="find_wol_calendar_events",
+    description=(
+        "Preview a Wake-on-LAN calendar's upcoming cached all-day event spans "
+        "(recurrence already expanded) within the next N days — the "
+        "'is tomorrow marked as a holiday / school day on this feed?' check. "
+        "Returns start/end date, summary, categories. Read-only."
+    ),
+    args_model=FindWolCalendarEventsArgs,
+    category="network",
+    module=_MODULE,
+)
+async def find_wol_calendar_events(
+    db: AsyncSession, user: User, args: FindWolCalendarEventsArgs
+) -> list[dict[str, Any]]:
+    from datetime import timedelta  # noqa: PLC0415
+
+    cal = await db.get(WolCalendar, args.calendar_id)
+    if cal is None:
+        return [{"error": f"calendar {args.calendar_id} not found"}]
+    today = datetime.now(UTC).date()
+    horizon = today + timedelta(days=args.days)
+    rows = (
+        (
+            await db.execute(
+                select(WolCalendarEvent)
+                .where(
+                    WolCalendarEvent.calendar_id == args.calendar_id,
+                    WolCalendarEvent.ends_on >= today,
+                    WolCalendarEvent.starts_on <= horizon,
+                )
+                .order_by(WolCalendarEvent.starts_on.asc())
+                .limit(args.limit)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return [
+        {
+            "starts_on": r.starts_on.isoformat(),
+            "ends_on": r.ends_on.isoformat(),
+            "summary": r.summary,
+            "categories": list(r.categories or []),
+        }
+        for r in rows
+    ]
 
 
 # ── Write proposals (propose → operator Apply) ───────────────────────

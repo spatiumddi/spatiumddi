@@ -25,6 +25,10 @@ import {
   wakeSchedulesApi,
   type ApplianceRow,
   type Subnet,
+  type WolCalendar,
+  type WolCalendarCreate,
+  type WolCalendarKind,
+  type WolCalendarMode,
   type WolRun,
   type WolSchedule,
   type WolScheduleCreate,
@@ -125,6 +129,22 @@ function relTime(ts: string | null | undefined): string {
   return d.toLocaleDateString();
 }
 
+// A flattened all-day event span. ``ends_on`` is inclusive; a single-day
+// event has ``starts_on === ends_on``.
+function formatEventSpan(startsOn: string, endsOn: string): string {
+  const fmt = (iso: string) => {
+    const d = new Date(`${iso}T00:00:00`);
+    if (Number.isNaN(d.getTime())) return iso;
+    return d.toLocaleDateString(undefined, {
+      month: "short",
+      day: "numeric",
+    });
+  };
+  return startsOn === endsOn
+    ? fmt(startsOn)
+    : `${fmt(startsOn)} – ${fmt(endsOn)}`;
+}
+
 const STATUS_TONE: Record<string, string> = {
   ok: "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400",
   partial: "bg-amber-500/15 text-amber-600 dark:text-amber-400",
@@ -179,7 +199,7 @@ function ipv4Parts(
 // ─────────────────────────────────────────────────────────────────────
 // Page
 // ─────────────────────────────────────────────────────────────────────
-type PageTab = "schedules" | "history";
+type PageTab = "schedules" | "calendars" | "history";
 
 export function WakeSchedulesPage() {
   const [tab, setTab] = useState<PageTab>("schedules");
@@ -210,6 +230,12 @@ export function WakeSchedulesPage() {
             Schedules
           </TabButton>
           <TabButton
+            active={tab === "calendars"}
+            onClick={() => setTab("calendars")}
+          >
+            Calendars
+          </TabButton>
+          <TabButton
             active={tab === "history"}
             onClick={() => setTab("history")}
           >
@@ -218,6 +244,7 @@ export function WakeSchedulesPage() {
         </div>
 
         {tab === "schedules" && <SchedulesTab />}
+        {tab === "calendars" && <CalendarsTab />}
         {tab === "history" && <HistoryTab />}
       </div>
     </div>
@@ -782,6 +809,519 @@ function RunRow({
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// Calendars tab (#586 Phase 2) — subscribed iCal / CalDAV feeds
+// ─────────────────────────────────────────────────────────────────────
+const CAL_KIND_TONE: Record<WolCalendarKind, string> = {
+  ical_url: "bg-sky-500/15 text-sky-600 dark:text-sky-400",
+  caldav: "bg-violet-500/15 text-violet-600 dark:text-violet-400",
+};
+function CalendarKindChip({ kind }: { kind: WolCalendarKind }) {
+  return (
+    <span
+      className={cn(
+        "inline-block rounded px-1.5 py-0.5 text-[11px] font-medium",
+        CAL_KIND_TONE[kind],
+      )}
+    >
+      {kind === "caldav" ? "CalDAV" : "iCal URL"}
+    </span>
+  );
+}
+
+function CalendarsTab() {
+  const qc = useQueryClient();
+  const calendarsQ = useQuery({
+    queryKey: ["wol-calendars"],
+    queryFn: () => wakeSchedulesApi.listCalendars(),
+  });
+  const [editing, setEditing] = useState<
+    { mode: "create" } | { mode: "edit"; calendar: WolCalendar } | null
+  >(null);
+  const [confirm, setConfirm] = useState<{
+    calendar: WolCalendar;
+  } | null>(null);
+  const [banner, setBanner] = useState<string | null>(null);
+
+  const invalidate = () => {
+    qc.invalidateQueries({ queryKey: ["wol-calendars"] });
+    qc.invalidateQueries({ queryKey: ["wol-calendar-events"] });
+  };
+
+  const syncNow = useMutation({
+    mutationFn: (id: string) => wakeSchedulesApi.syncCalendarNow(id),
+    onSuccess: (res) => {
+      setBanner(
+        res.status === "success"
+          ? `Sync complete — ${res.total} events (${res.added} added, ${res.removed} removed).`
+          : `Sync finished with status "${res.status}"${res.error ? `: ${res.error}` : ""}.`,
+      );
+      invalidate();
+    },
+    onError: (e) => setBanner(formatApiError(e, "Sync failed")),
+  });
+
+  const del = useMutation({
+    mutationFn: (id: string) => wakeSchedulesApi.removeCalendar(id),
+    onSuccess: () => {
+      invalidate();
+      qc.invalidateQueries({ queryKey: ["wol-schedules"] });
+      setConfirm(null);
+    },
+    onError: (e) => {
+      setBanner(formatApiError(e, "Delete failed"));
+      setConfirm(null);
+    },
+  });
+
+  const rows = calendarsQ.data ?? [];
+
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <p className="max-w-2xl text-xs text-muted-foreground">
+          Subscribe a holiday / term calendar as an iCal <code>.ics</code> URL
+          (Google Calendar public link, most published school calendars) or an
+          authenticated CalDAV collection (Nextcloud / Radicale / school
+          servers). Its all-day events flatten into date spans a schedule’s gate
+          consults — skip on a holiday feed, or fire only on a school-day feed.
+          The CalDAV password is write-only and stored encrypted.
+        </p>
+        <div className="flex shrink-0 items-center gap-2">
+          <HeaderButton
+            icon={RefreshCw}
+            iconClassName={calendarsQ.isFetching ? "animate-spin" : undefined}
+            onClick={() => calendarsQ.refetch()}
+          >
+            Refresh
+          </HeaderButton>
+          <HeaderButton
+            variant="primary"
+            icon={Plus}
+            onClick={() => setEditing({ mode: "create" })}
+          >
+            New calendar
+          </HeaderButton>
+        </div>
+      </div>
+
+      {banner && (
+        <div className="flex items-start justify-between gap-3 rounded-md border bg-muted/40 px-3 py-2 text-sm">
+          <span className="min-w-0 flex-1 break-words">{banner}</span>
+          <button
+            type="button"
+            className="shrink-0 text-muted-foreground hover:text-foreground"
+            onClick={() => setBanner(null)}
+          >
+            ✕
+          </button>
+        </div>
+      )}
+
+      <div className="overflow-x-auto rounded-lg border">
+        <table className="min-w-[880px] w-full text-sm">
+          <thead className="border-b bg-muted/40 text-left text-xs text-muted-foreground">
+            <tr>
+              <th className="px-3 py-2 font-medium">Name</th>
+              <th className="px-3 py-2 font-medium">Kind</th>
+              <th className="px-3 py-2 font-medium">Events</th>
+              <th className="px-3 py-2 font-medium">Last synced</th>
+              <th className="px-3 py-2 font-medium">Enabled</th>
+              <th className="px-3 py-2 text-right font-medium">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {calendarsQ.isLoading && (
+              <tr>
+                <td
+                  colSpan={6}
+                  className="px-3 py-8 text-center text-muted-foreground"
+                >
+                  <Loader2 className="mx-auto h-5 w-5 animate-spin" />
+                </td>
+              </tr>
+            )}
+            {!calendarsQ.isLoading && rows.length === 0 && (
+              <tr>
+                <td
+                  colSpan={6}
+                  className="px-3 py-8 text-center text-muted-foreground"
+                >
+                  No calendars subscribed yet. Add one so a schedule can skip
+                  holidays (or fire only on school days) from a live feed.
+                </td>
+              </tr>
+            )}
+            {rows.map((c) => (
+              <CalendarRow
+                key={c.id}
+                calendar={c}
+                syncing={syncNow.isPending && syncNow.variables === c.id}
+                onSync={() => syncNow.mutate(c.id)}
+                onEdit={() => setEditing({ mode: "edit", calendar: c })}
+                onDelete={() => setConfirm({ calendar: c })}
+              />
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      {editing && (
+        <CalendarModal
+          existing={editing.mode === "edit" ? editing.calendar : null}
+          onClose={() => setEditing(null)}
+          onSaved={() => {
+            setEditing(null);
+            invalidate();
+          }}
+        />
+      )}
+
+      <ConfirmModal
+        open={!!confirm}
+        title={confirm ? `Delete "${confirm.calendar.name}"?` : ""}
+        message={
+          <>
+            Removes the calendar and its cached events. Schedules referencing it
+            keep their gate mode but revert to no-effect (their{" "}
+            <code>calendar_id</code> is cleared). This cannot be undone.
+          </>
+        }
+        confirmLabel="Delete"
+        tone="destructive"
+        loading={del.isPending}
+        onConfirm={() => confirm && del.mutate(confirm.calendar.id)}
+        onClose={() => setConfirm(null)}
+      />
+    </div>
+  );
+}
+
+function CalendarRow({
+  calendar,
+  syncing,
+  onSync,
+  onEdit,
+  onDelete,
+}: {
+  calendar: WolCalendar;
+  syncing: boolean;
+  onSync: () => void;
+  onEdit: () => void;
+  onDelete: () => void;
+}) {
+  return (
+    <tr className="border-b last:border-0 align-top">
+      <td className="px-3 py-2">
+        <div className="font-medium">{calendar.name}</div>
+        <div className="mt-0.5 max-w-[360px] truncate font-mono text-[11px] text-muted-foreground">
+          {calendar.url}
+        </div>
+        {calendar.username && (
+          <div className="text-[11px] text-muted-foreground">
+            user: {calendar.username}
+            {calendar.password_set ? " · password set" : ""}
+          </div>
+        )}
+      </td>
+      <td className="px-3 py-2">
+        <CalendarKindChip kind={calendar.kind as WolCalendarKind} />
+      </td>
+      <td className="px-3 py-2">{calendar.event_count}</td>
+      <td className="px-3 py-2">
+        <div className="flex flex-col gap-0.5">
+          <StatusChip status={calendar.last_sync_status} />
+          <span className="text-xs text-muted-foreground">
+            {relTime(calendar.last_synced_at)}
+          </span>
+          {calendar.last_sync_error && (
+            <span
+              className="max-w-[240px] truncate text-[11px] text-rose-600 dark:text-rose-400"
+              title={calendar.last_sync_error}
+            >
+              {calendar.last_sync_error}
+            </span>
+          )}
+        </div>
+      </td>
+      <td className="px-3 py-2">
+        {calendar.enabled ? (
+          <span className="inline-block rounded bg-emerald-500/15 px-1.5 py-0.5 text-[11px] font-medium text-emerald-600 dark:text-emerald-400">
+            enabled
+          </span>
+        ) : (
+          <span className="inline-block rounded bg-zinc-500/15 px-1.5 py-0.5 text-[11px] font-medium text-zinc-600 dark:text-zinc-400">
+            disabled
+          </span>
+        )}
+      </td>
+      <td className="px-3 py-2">
+        <div className="flex shrink-0 items-center justify-end gap-1">
+          <IconBtn title="Sync now" onClick={onSync}>
+            {syncing ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <RefreshCw className="h-4 w-4" />
+            )}
+          </IconBtn>
+          <IconBtn title="Edit" onClick={onEdit}>
+            <Pencil className="h-4 w-4" />
+          </IconBtn>
+          <IconBtn title="Delete" tone="destructive" onClick={onDelete}>
+            <Trash2 className="h-4 w-4" />
+          </IconBtn>
+        </div>
+      </td>
+    </tr>
+  );
+}
+
+// ── Calendar create / edit modal ───────────────────────────────────────
+function CalendarModal({
+  existing,
+  onClose,
+  onSaved,
+}: {
+  existing: WolCalendar | null;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const [name, setName] = useState(existing?.name ?? "");
+  const [kind, setKind] = useState<WolCalendarKind>(
+    (existing?.kind as WolCalendarKind) ?? "ical_url",
+  );
+  const [url, setUrl] = useState(existing?.url ?? "");
+  const [username, setUsername] = useState(existing?.username ?? "");
+  // Write-only. On edit we start blank and only send a value when the operator
+  // types one (or explicitly clears an existing secret).
+  const [password, setPassword] = useState("");
+  const [clearPassword, setClearPassword] = useState(false);
+  const [enabled, setEnabled] = useState(existing?.enabled ?? true);
+  const [refreshInterval, setRefreshInterval] = useState(
+    existing?.refresh_interval_minutes ?? 360,
+  );
+  const [error, setError] = useState<string | null>(null);
+
+  const urlValid = /^(https?|webcals?):\/\//i.test(url.trim());
+  const intervalValid =
+    Number.isInteger(refreshInterval) &&
+    refreshInterval >= 5 &&
+    refreshInterval <= 10_080;
+
+  const save = useMutation({
+    mutationFn: () => {
+      if (existing) {
+        // PATCH — password: "" clears; a typed value re-encrypts; omitting the
+        // key leaves the stored secret unchanged.
+        const body: Parameters<typeof wakeSchedulesApi.updateCalendar>[1] = {
+          name: name.trim(),
+          kind,
+          url: url.trim(),
+          username: username.trim() || null,
+          enabled,
+          refresh_interval_minutes: refreshInterval,
+        };
+        if (clearPassword) body.password = "";
+        else if (password) body.password = password;
+        return wakeSchedulesApi.updateCalendar(existing.id, body);
+      }
+      const body: WolCalendarCreate = {
+        name: name.trim(),
+        kind,
+        url: url.trim(),
+        username: username.trim() || null,
+        password: password || null,
+        enabled,
+        refresh_interval_minutes: refreshInterval,
+      };
+      return wakeSchedulesApi.createCalendar(body);
+    },
+    onSuccess: onSaved,
+    onError: (e) => setError(formatApiError(e, "Failed to save calendar")),
+  });
+
+  const canSave =
+    name.trim().length > 0 && urlValid && intervalValid && !save.isPending;
+
+  return (
+    <Modal
+      title={existing ? `Edit "${existing.name}"` : "New calendar subscription"}
+      onClose={onClose}
+    >
+      <div className="space-y-4">
+        <div className="grid gap-3 sm:grid-cols-2">
+          <div>
+            <label className={labelCls}>Name</label>
+            <input
+              className={inputCls}
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="School holidays 2026/27"
+              autoFocus
+            />
+          </div>
+          <div>
+            <label className={labelCls}>Kind</label>
+            <select
+              className={inputCls}
+              value={kind}
+              onChange={(e) => setKind(e.target.value as WolCalendarKind)}
+            >
+              <option value="ical_url">iCal .ics URL (public feed)</option>
+              <option value="caldav">CalDAV (authenticated)</option>
+            </select>
+          </div>
+        </div>
+
+        <div>
+          <label className={labelCls}>
+            {kind === "caldav" ? "CalDAV URL" : "iCal .ics URL"}
+          </label>
+          <input
+            className={cn(
+              inputCls,
+              "font-mono",
+              url.trim() &&
+                !urlValid &&
+                "border-destructive focus:ring-destructive",
+            )}
+            value={url}
+            onChange={(e) => setUrl(e.target.value)}
+            placeholder={
+              kind === "caldav"
+                ? "https://cloud.example.org/remote.php/dav/calendars/user/holidays/"
+                : "https://calendar.google.com/calendar/ical/…/public/basic.ics"
+            }
+          />
+          {url.trim() && !urlValid && (
+            <p className="mt-1 text-[11px] text-destructive">
+              Must be an http(s):// or webcal(s):// URL.
+            </p>
+          )}
+        </div>
+
+        {kind === "caldav" && (
+          <div className="grid gap-3 sm:grid-cols-2">
+            <div>
+              <label className={labelCls}>Username</label>
+              <input
+                className={inputCls}
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                placeholder="calendar-user"
+                autoComplete="off"
+              />
+            </div>
+            <div>
+              <label className={labelCls}>
+                Password
+                {existing?.password_set && (
+                  <span className="ml-1 font-normal text-emerald-600 dark:text-emerald-400">
+                    · set
+                  </span>
+                )}
+              </label>
+              <input
+                type="password"
+                className={inputCls}
+                value={password}
+                onChange={(e) => {
+                  setPassword(e.target.value);
+                  if (e.target.value) setClearPassword(false);
+                }}
+                placeholder={
+                  existing?.password_set
+                    ? "Leave blank to keep the stored password"
+                    : "App password / token"
+                }
+                autoComplete="new-password"
+              />
+              {existing?.password_set && (
+                <label className="mt-1 flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                  <input
+                    type="checkbox"
+                    checked={clearPassword}
+                    onChange={(e) => {
+                      setClearPassword(e.target.checked);
+                      if (e.target.checked) setPassword("");
+                    }}
+                  />
+                  Clear the stored password
+                </label>
+              )}
+            </div>
+          </div>
+        )}
+
+        <div className="grid gap-3 sm:grid-cols-2">
+          <div>
+            <label className={labelCls}>Refresh interval (minutes)</label>
+            <input
+              type="number"
+              min={5}
+              max={10080}
+              className={cn(
+                inputCls,
+                !intervalValid && "border-destructive focus:ring-destructive",
+              )}
+              value={refreshInterval}
+              onChange={(e) => setRefreshInterval(Number(e.target.value))}
+            />
+            {intervalValid ? (
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                How often the background reconciler re-pulls the feed (5 min – 7
+                days). Use “Sync now” after saving for an immediate pull.
+              </p>
+            ) : (
+              <p className="mt-1 text-[11px] text-destructive">
+                Must be 5–10080 minutes.
+              </p>
+            )}
+          </div>
+          <div className="flex items-end">
+            <label className="flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={enabled}
+                onChange={(e) => setEnabled(e.target.checked)}
+              />
+              Enabled (auto-refreshed on its interval)
+            </label>
+          </div>
+        </div>
+
+        {error && (
+          <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-600 dark:text-rose-400">
+            {error}
+          </div>
+        )}
+
+        <div className="flex items-center justify-end gap-2 border-t pt-3">
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            disabled={!canSave}
+            onClick={() => {
+              setError(null);
+              save.mutate();
+            }}
+            className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+          >
+            {save.isPending && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+            {existing ? "Save changes" : "Create calendar"}
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // Create / edit modal
 // ─────────────────────────────────────────────────────────────────────
 type ModalTab = "target" | "schedule" | "holiday" | "send";
@@ -846,6 +1386,17 @@ function WolScheduleModal({
   const [activeFrom, setActiveFrom] = useState(existing?.active_from ?? "");
   const [activeUntil, setActiveUntil] = useState(existing?.active_until ?? "");
 
+  // Phase 2 — external-calendar gate (layered on top of blackout/term).
+  const [calendarId, setCalendarId] = useState<string | null>(
+    existing?.calendar_id ?? null,
+  );
+  const [calendarMode, setCalendarMode] = useState<WolCalendarMode>(
+    existing?.calendar_mode ?? "none",
+  );
+  const [calendarMatch, setCalendarMatch] = useState(
+    existing?.calendar_match ?? "",
+  );
+
   const [vantage, setVantage] = useState<WolVantage>(
     existing?.vantage ?? { kind: "server", id: null },
   );
@@ -899,6 +1450,9 @@ function WolScheduleModal({
         blackout_dates: blackoutDates,
         active_from: activeFrom || null,
         active_until: activeUntil || null,
+        calendar_id: calendarMode === "none" ? null : calendarId,
+        calendar_mode: calendarMode,
+        calendar_match: calendarMatch.trim() || null,
         vantage,
         repeat_count: repeatCount,
         repeat_interval_ms: repeatIntervalMs,
@@ -937,8 +1491,27 @@ function WolScheduleModal({
   };
   const sendValid = Object.values(sendErrors).every((e) => e === null);
 
+  // Calendar gate: a non-'none' mode needs a calendar picked (mirrors the
+  // server-side model_validator), and any match regex must compile.
+  const calendarMatchError = useMemo(() => {
+    const v = calendarMatch.trim();
+    if (!v) return null;
+    try {
+      new RegExp(v);
+      return null;
+    } catch {
+      return "Not a valid regular expression.";
+    }
+  }, [calendarMatch]);
+  const calendarValid =
+    (calendarMode === "none" || !!calendarId) && calendarMatchError === null;
+
   const canSave =
-    name.trim().length > 0 && tzValid && sendValid && !save.isPending;
+    name.trim().length > 0 &&
+    tzValid &&
+    sendValid &&
+    calendarValid &&
+    !save.isPending;
 
   return (
     <Modal
@@ -1014,6 +1587,13 @@ function WolScheduleModal({
             setActiveFrom={setActiveFrom}
             activeUntil={activeUntil}
             setActiveUntil={setActiveUntil}
+            calendarId={calendarId}
+            setCalendarId={setCalendarId}
+            calendarMode={calendarMode}
+            setCalendarMode={setCalendarMode}
+            calendarMatch={calendarMatch}
+            setCalendarMatch={setCalendarMatch}
+            calendarMatchError={calendarMatchError}
           />
         )}
 
@@ -1301,7 +1881,7 @@ function ScheduleStep({
   );
 }
 
-// ── Holiday gate step (built-in — NO external calendar in Phase 1) ─────
+// ── Holiday gate step (built-in blackout/term + external calendar) ─────
 function HolidayStep({
   blackoutDates,
   setBlackoutDates,
@@ -1309,6 +1889,13 @@ function HolidayStep({
   setActiveFrom,
   activeUntil,
   setActiveUntil,
+  calendarId,
+  setCalendarId,
+  calendarMode,
+  setCalendarMode,
+  calendarMatch,
+  setCalendarMatch,
+  calendarMatchError,
 }: {
   blackoutDates: string[];
   setBlackoutDates: (d: string[]) => void;
@@ -1316,6 +1903,13 @@ function HolidayStep({
   setActiveFrom: (d: string) => void;
   activeUntil: string;
   setActiveUntil: (d: string) => void;
+  calendarId: string | null;
+  setCalendarId: (id: string | null) => void;
+  calendarMode: WolCalendarMode;
+  setCalendarMode: (m: WolCalendarMode) => void;
+  calendarMatch: string;
+  setCalendarMatch: (s: string) => void;
+  calendarMatchError: string | null;
 }) {
   const [draft, setDraft] = useState("");
 
@@ -1329,12 +1923,31 @@ function HolidayStep({
   return (
     <div className="space-y-4">
       <p className="rounded-md border bg-muted/30 px-3 py-2 text-[11px] text-muted-foreground">
-        Phase 1 uses a built-in calendar: specific blackout dates (holidays) and
-        an optional term range. A recurring wake is skipped — and logged with a
-        skip reason, not silently dropped — on any blackout date or outside the
-        term window. Subscribing to an external iCal / CalDAV calendar is a
-        later phase.
+        The wake gate has two layers, both evaluated in the schedule’s timezone
+        at fire time and both logged with a skip reason (never a silent no-op):
+        a <strong>built-in calendar</strong> — specific blackout dates
+        (holidays) plus an optional term range — and an{" "}
+        <strong>external subscribed calendar</strong> (iCal / CalDAV) that can
+        skip on a matching event (holiday feed) or fire only on a matching event
+        (term / school-day feed). The external calendar is an{" "}
+        <em>additional</em> gate — the blackout/term checks still apply.
       </p>
+
+      <CalendarGateSection
+        calendarId={calendarId}
+        setCalendarId={setCalendarId}
+        calendarMode={calendarMode}
+        setCalendarMode={setCalendarMode}
+        calendarMatch={calendarMatch}
+        setCalendarMatch={setCalendarMatch}
+        calendarMatchError={calendarMatchError}
+      />
+
+      <div className="border-t pt-3">
+        <div className="mb-1 text-xs font-semibold text-muted-foreground">
+          Built-in calendar
+        </div>
+      </div>
 
       <div>
         <label className={labelCls}>Blackout dates (holidays)</label>
@@ -1402,6 +2015,203 @@ function HolidayStep({
         apply). Both bounds are inclusive and evaluated in the schedule’s
         timezone.
       </p>
+    </div>
+  );
+}
+
+// ── Calendar gate section (Phase 2 — external iCal / CalDAV) ───────────
+const CALENDAR_MODES: {
+  value: WolCalendarMode;
+  label: string;
+  help: string;
+}[] = [
+  {
+    value: "none",
+    label: "No external calendar",
+    help: "Only the built-in blackout dates + term range gate the wake.",
+  },
+  {
+    value: "skip_on_event",
+    label: "Skip on a matching event (holiday calendar)",
+    help: "If the fire date lands on a matching all-day event, the wake is skipped. Point this at a holiday / closure feed.",
+  },
+  {
+    value: "only_on_event",
+    label: "Only on a matching event (term / school-day calendar)",
+    help: "The wake only fires when the date intersects a matching event. Point this at a term / school-day feed.",
+  },
+];
+
+function CalendarGateSection({
+  calendarId,
+  setCalendarId,
+  calendarMode,
+  setCalendarMode,
+  calendarMatch,
+  setCalendarMatch,
+  calendarMatchError,
+}: {
+  calendarId: string | null;
+  setCalendarId: (id: string | null) => void;
+  calendarMode: WolCalendarMode;
+  setCalendarMode: (m: WolCalendarMode) => void;
+  calendarMatch: string;
+  setCalendarMatch: (s: string) => void;
+  calendarMatchError: string | null;
+}) {
+  const calendarsQ = useQuery({
+    queryKey: ["wol-calendars"],
+    queryFn: () => wakeSchedulesApi.listCalendars(),
+  });
+  const calendars = calendarsQ.data ?? [];
+  const modeInfo = CALENDAR_MODES.find((m) => m.value === calendarMode)!;
+  const picked = calendars.find((c) => c.id === calendarId) ?? null;
+
+  // Preview the picked calendar's upcoming events so the operator can confirm
+  // "this feed actually marks our holidays / term days".
+  const eventsQ = useQuery({
+    queryKey: ["wol-calendar-events", calendarId],
+    queryFn: () =>
+      wakeSchedulesApi.getCalendarEvents(calendarId!, { days: 60, limit: 20 }),
+    enabled: calendarMode !== "none" && !!calendarId,
+    staleTime: 60_000,
+  });
+
+  return (
+    <div className="space-y-3">
+      <div className="text-xs font-semibold text-muted-foreground">
+        External calendar
+      </div>
+
+      <div>
+        <label className={labelCls}>Calendar gate</label>
+        <select
+          className={inputCls}
+          value={calendarMode}
+          onChange={(e) => setCalendarMode(e.target.value as WolCalendarMode)}
+        >
+          {CALENDAR_MODES.map((m) => (
+            <option key={m.value} value={m.value}>
+              {m.label}
+            </option>
+          ))}
+        </select>
+        <p className="mt-1 text-[11px] text-muted-foreground">
+          {modeInfo.help}
+        </p>
+      </div>
+
+      {calendarMode !== "none" && (
+        <>
+          <div>
+            <label className={labelCls}>Calendar subscription</label>
+            {calendarsQ.isLoading ? (
+              <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
+            ) : calendars.length === 0 ? (
+              <p className="rounded-md border border-dashed px-3 py-2 text-[11px] text-muted-foreground">
+                No calendars subscribed yet. Add one on the{" "}
+                <strong>Calendars</strong> tab, then pick it here.
+              </p>
+            ) : (
+              <select
+                className={cn(
+                  inputCls,
+                  !calendarId && "border-destructive focus:ring-destructive",
+                )}
+                value={calendarId ?? ""}
+                onChange={(e) => setCalendarId(e.target.value || null)}
+              >
+                <option value="">Select a calendar…</option>
+                {calendars.map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {c.name} ({c.kind === "caldav" ? "CalDAV" : "iCal"}
+                    {c.enabled ? "" : " · disabled"})
+                  </option>
+                ))}
+              </select>
+            )}
+            {calendars.length > 0 && !calendarId && (
+              <p className="mt-1 text-[11px] text-destructive">
+                Pick a calendar (required for this gate mode).
+              </p>
+            )}
+            {picked && !picked.enabled && (
+              <p className="mt-1 text-[11px] text-amber-600 dark:text-amber-400">
+                This calendar is disabled — it will not auto-refresh, so the
+                gate uses whatever events were last synced.
+              </p>
+            )}
+          </div>
+
+          <div>
+            <label className={labelCls}>
+              Match filter (optional regex on summary / category)
+            </label>
+            <input
+              className={cn(
+                inputCls,
+                "font-mono",
+                calendarMatchError &&
+                  "border-destructive focus:ring-destructive",
+              )}
+              value={calendarMatch}
+              onChange={(e) => setCalendarMatch(e.target.value)}
+              placeholder="e.g. holiday|closed  (leave empty to count every event)"
+            />
+            {calendarMatchError ? (
+              <p className="mt-1 text-[11px] text-destructive">
+                {calendarMatchError}
+              </p>
+            ) : (
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                When set, only events whose summary or one of their categories
+                matches this regex (case-insensitive) count toward the gate.
+              </p>
+            )}
+          </div>
+
+          {picked && (
+            <div className="rounded-md border bg-muted/30 px-3 py-2">
+              <div className="mb-1 flex items-center justify-between gap-2">
+                <span className="text-[11px] font-medium text-muted-foreground">
+                  Upcoming events (next 60 days)
+                </span>
+                <StatusChip status={picked.last_sync_status} />
+              </div>
+              {eventsQ.isLoading ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />
+              ) : (eventsQ.data ?? []).length === 0 ? (
+                <p className="text-[11px] text-muted-foreground">
+                  No cached events in the next 60 days. Sync the calendar on the
+                  Calendars tab if you expect some.
+                </p>
+              ) : (
+                <ul className="space-y-0.5">
+                  {(eventsQ.data ?? []).map((ev) => (
+                    <li
+                      key={ev.id}
+                      className="flex items-baseline justify-between gap-2 text-[11px]"
+                    >
+                      <span className="truncate">
+                        {ev.summary || "(untitled)"}
+                        {ev.categories.length > 0 && (
+                          <span className="text-muted-foreground">
+                            {" "}
+                            · {ev.categories.join(", ")}
+                          </span>
+                        )}
+                      </span>
+                      <span className="shrink-0 font-mono text-muted-foreground">
+                        {formatEventSpan(ev.starts_on, ev.ends_on)}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )}
+        </>
+      )}
     </div>
   );
 }

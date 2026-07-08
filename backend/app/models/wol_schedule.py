@@ -1,4 +1,8 @@
-"""SQLAlchemy models for Scheduled Wake-on-LAN — Phase 1 (issue #586).
+"""SQLAlchemy models for Scheduled Wake-on-LAN (issue #586).
+
+Phase 1 tables (``wol_schedule`` / ``wol_run`` / ``wol_run_target``) plus the
+Phase 2 external-calendar gate (``wol_calendar`` + ``wol_calendar_event`` and
+the three ``wol_schedule.calendar_*`` columns).
 
 Three tables:
 
@@ -15,9 +19,10 @@ Three tables:
 * ``wol_run_target`` — per-host outcome (sent / skipped / failed) child
   of ``wol_run``.
 
-**Phase 1 only** — the built-in holiday gate is ``blackout_dates`` +
-``active_from`` / ``active_until`` + ``timezone``. There is NO external
-iCal / CalDAV calendar FK; that is Phase 2 and deliberately absent here.
+The built-in holiday gate is ``blackout_dates`` + ``active_from`` /
+``active_until`` + ``timezone``; Phase 2 layers the external
+``wol_calendar`` / ``wol_calendar_event`` gate on top via the three
+``wol_schedule.calendar_*`` columns.
 
 Reuses the shipped #533 send path (``app.services.wol``) — this module
 adds scheduling state only.
@@ -34,7 +39,9 @@ from sqlalchemy import (
     Date,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
+    LargeBinary,
     String,
     Text,
     func,
@@ -85,6 +92,27 @@ class WolSchedule(Base):
     active_from: Mapped[date | None] = mapped_column(Date, nullable=True)
     active_until: Mapped[date | None] = mapped_column(Date, nullable=True)
 
+    # ── External calendar gate (Phase 2 — issue #586) ───────────────────
+    # Optional subscription (iCal .ics URL or authenticated CalDAV) whose
+    # all-day event spans ADD a gate on top of the built-in blackout/term
+    # checks above. ``calendar_mode`` decides the polarity:
+    #   * ``none``          — calendar ignored (default; pure Phase-1 behaviour).
+    #   * ``skip_on_event`` — a matching event on the local fire date SKIPS
+    #                         the wake (holiday calendar).
+    #   * ``only_on_event`` — the wake only fires when a matching event covers
+    #                         the local fire date (term / school-day calendar).
+    # ``calendar_match`` (optional) is a regex ANDed onto which events count
+    # (matched against the event summary + each category, case-insensitive).
+    calendar_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("wol_calendar.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    calendar_mode: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="none", server_default="none"
+    )
+    calendar_match: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     # ── Send options (honoured by the #533 send path) ───────────────────
     # NetToolTarget shape {kind, id}; default = control-plane server vantage.
     vantage: Mapped[dict[str, Any]] = mapped_column(
@@ -131,6 +159,137 @@ class WolSchedule(Base):
         back_populates="schedule",
         passive_deletes=True,
     )
+    calendar: Mapped[WolCalendar | None] = relationship(
+        "WolCalendar",
+        back_populates="schedules",
+        foreign_keys=[calendar_id],
+    )
+
+
+class WolCalendar(Base):
+    """A subscribed iCal / CalDAV calendar whose all-day event spans gate
+    scheduled wakes (Phase 2 — issue #586).
+
+    ``kind`` is ``ical_url`` (unauthenticated / token-in-URL ``.ics`` or
+    ``webcal://`` feed — covers Google Calendar public links + most published
+    school calendars) or ``caldav`` (authenticated collection — Nextcloud /
+    Radicale / school servers). The CalDAV password is Fernet-encrypted at
+    rest and never returned by the API (only a ``password_set`` boolean).
+
+    A background reconciler (:mod:`app.tasks.wol_calendar`) pulls the feed on
+    the ``refresh_interval_minutes`` cadence and flattens its all-day VEVENTs
+    (recurrence expanded over a bounded forward horizon) into
+    :class:`WolCalendarEvent` date spans for O(events) gate checks + a UI
+    preview — the same last-known-good-cache shape the DNS blocklist feed uses.
+    """
+
+    __tablename__ = "wol_calendar"
+    __table_args__ = (Index("ix_wol_calendar_name", "name"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    modified_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    # ical_url | caldav
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    url: Mapped[str] = mapped_column(Text, nullable=False)
+    username: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Fernet ciphertext (LargeBinary). NULL == no password. Never serialised
+    # back out — the Read schema exposes only ``password_set``.
+    password_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+
+    enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=text("true")
+    )
+    refresh_interval_minutes: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=360, server_default="360"
+    )
+
+    # ── Sync state (mirrors DNSBlockList / UnifiController) ──────────────
+    last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # success | error
+    last_sync_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    last_sync_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # denormalised count of currently-cached event spans (UI list column).
+    event_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+
+    events: Mapped[list[WolCalendarEvent]] = relationship(
+        "WolCalendarEvent",
+        back_populates="calendar",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+    schedules: Mapped[list[WolSchedule]] = relationship(
+        "WolSchedule",
+        back_populates="calendar",
+        foreign_keys="WolSchedule.calendar_id",
+    )
+
+
+class WolCalendarEvent(Base):
+    """A flattened all-day event span pulled from a :class:`WolCalendar`.
+
+    Recurrence (RRULE / RDATE) is expanded at sync time over a bounded forward
+    horizon, so each row is a single concrete ``[starts_on, ends_on]`` inclusive
+    date span (``ends_on`` is already the RFC 5545 exclusive-DTEND minus a day).
+    The gate compares the schedule-local fire date against these spans directly
+    — no tz shift, all-day dates are floating.
+    """
+
+    __tablename__ = "wol_calendar_event"
+    __table_args__ = (
+        # UNIQUE on the reconcile natural key (calendar-scoped span + uid) is the
+        # backstop against a concurrent-sync duplicate: the inline sync-now (API
+        # process) and the beat sweep (worker process) can otherwise both read an
+        # empty ``existing`` for a fresh span and each insert it. The per-calendar
+        # row lock in ``sync_calendar`` serialises them; this constraint makes the
+        # duplicate physically impossible even if the lock is ever bypassed.
+        # ``NULLS NOT DISTINCT`` (PG15+) is required because ``uid`` is nullable
+        # and PG otherwise treats every NULL uid as distinct, which would let
+        # NULL-uid spans duplicate anyway. The leading
+        # (calendar_id, starts_on, ends_on) columns also serve the gate load +
+        # upcoming-events span queries, so this replaces the old plain span index.
+        Index(
+            "uq_wol_calendar_event_natural",
+            "calendar_id",
+            "starts_on",
+            "ends_on",
+            "uid",
+            unique=True,
+            postgresql_nulls_not_distinct=True,
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    calendar_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("wol_calendar.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    starts_on: Mapped[date] = mapped_column(Date, nullable=False)
+    # inclusive end (DTEND is exclusive for all-day VEVENTs → stored -1 day).
+    ends_on: Mapped[date] = mapped_column(Date, nullable=False)
+    summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    categories: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
+    )
+    # VEVENT UID (recurrence occurrences share it) — natural key for the
+    # set-reconcile diff alongside the span.
+    uid: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+    calendar: Mapped[WolCalendar] = relationship("WolCalendar", back_populates="events")
 
 
 class WolRun(Base):
