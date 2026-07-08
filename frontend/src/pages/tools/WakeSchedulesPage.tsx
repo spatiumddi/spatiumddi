@@ -41,7 +41,6 @@ import {
   type WolVantage,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
-import { humanTime } from "@/pages/network/_shared";
 
 // ─────────────────────────────────────────────────────────────────────
 // Scheduled Wake-on-LAN (#586 Phase 1) — Tools page.
@@ -187,7 +186,7 @@ function VerifyChip({
   verifyMethod?: string | null;
 }) {
   const via = verifyMethod ? ` via ${verifyMethod}` : "";
-  const when = verifiedAt ? ` ${humanTime(verifiedAt)}` : "";
+  const when = verifiedAt ? ` ${relTime(verifiedAt)}` : "";
   if (verified === null || verified === undefined) {
     return (
       <span

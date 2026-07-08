@@ -128,6 +128,20 @@ def _coerce_uuid(value: Any) -> uuid.UUID | None:
         return None
 
 
+def _enqueue_verify(run_id: str, attempt: int, countdown: int, *, log_event: str) -> None:
+    """Best-effort push of one ``verify_wol_run`` pass to the broker.
+
+    Centralises the "a broker hiccup must never fail an already-landed wake"
+    contract shared by the arm, the re-wake re-enqueue, and the reaper: the
+    ``apply_async`` push is wrapped so any exception is logged (under
+    ``log_event``) and swallowed, never propagated back into the wake path.
+    """
+    try:
+        verify_wol_run.apply_async(args=[run_id, attempt], countdown=countdown)
+    except Exception as exc:  # noqa: BLE001 — verify is best-effort.
+        logger.warning(log_event, run_id=run_id, attempt=attempt, error=str(exc))
+
+
 def _restamp_next_run(schedule: WolSchedule, after: datetime) -> None:
     """Advance ``next_run_at`` past ``after`` for a cron schedule.
 
@@ -465,14 +479,9 @@ async def run_wol_schedule(
         # broker, so this works from both the beat sweep (worker) and the
         # run-now endpoint (api).
         if verify_run_id is not None:
-            try:
-                verify_wol_run.apply_async(args=[verify_run_id, 1], countdown=max(0, verify_wait))
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "wol_verify_enqueue_failed",
-                    run_id=verify_run_id,
-                    error=str(exc),
-                )
+            _enqueue_verify(
+                verify_run_id, 1, max(0, verify_wait), log_event="wol_verify_enqueue_failed"
+            )
 
         return {
             "run_id": str(run.id),
@@ -649,27 +658,22 @@ async def _finalise_verify(
     honest "did not confirm live" bucket). Recomputed from the child rows so a
     partial mid-flight crash can't leave a stale rollup.
     """
-    verified_count = (
+    # One round-trip: a filtered aggregate over the SENT rows yields both the
+    # UP count and the SENT total, differing only by the extra ``verified``
+    # predicate on the FILTER.
+    verified_count, sent_total = (
         await db.execute(
-            select(func.count())
-            .select_from(WolRunTarget)
-            .where(
-                WolRunTarget.run_id == run.id,
-                WolRunTarget.sent.is_(True),
-                WolRunTarget.verified.is_(True),
+            select(
+                func.count().filter(WolRunTarget.verified.is_(True)),
+                func.count(),
             )
-        )
-    ).scalar_one()
-    sent_total = (
-        await db.execute(
-            select(func.count())
             .select_from(WolRunTarget)
             .where(
                 WolRunTarget.run_id == run.id,
                 WolRunTarget.sent.is_(True),
             )
         )
-    ).scalar_one()
+    ).one()
     unverified_count = sent_total - verified_count
 
     run.verify_state = VERIFY_DONE
@@ -853,21 +857,15 @@ async def _verify_run(run_id: uuid.UUID | str, attempt: int) -> dict[str, Any]:
                 run.verify_claimed_at = now
                 await db.commit()
 
-                try:
-                    verify_wol_run.apply_async(
-                        args=[str(rid), attempt + 1], countdown=max(0, wait_seconds)
-                    )
-                except Exception as exc:  # noqa: BLE001 — verify is best-effort.
-                    # The re-enqueue failed but the row is back in ``pending``; a
-                    # future run-now or the verify reaper can pick it up (its
-                    # anchor is now ``attempt + 1`` to match). Never fails the
-                    # already-landed re-wake.
-                    logger.warning(
-                        "wol_verify_reenqueue_failed",
-                        run_id=str(rid),
-                        attempt=attempt + 1,
-                        error=str(exc),
-                    )
+                # The re-enqueue is best-effort: if it fails the row is back in
+                # ``pending`` at anchor ``attempt + 1``, so a future run-now or
+                # the verify reaper picks it up. Never fails the landed re-wake.
+                _enqueue_verify(
+                    str(rid),
+                    attempt + 1,
+                    max(0, wait_seconds),
+                    log_event="wol_verify_reenqueue_failed",
+                )
                 logger.info(
                     "wol_verify_rewake",
                     run_id=str(rid),
@@ -1017,30 +1015,29 @@ async def _sweep() -> dict[str, int]:
                 )
             )
         ).all()
-        for stale_id, _stale_attempt in stale_verifies:
+        # The guard doesn't depend on the per-row attempt, so every stale row
+        # takes the identical reset — collapse the N per-row UPDATEs into one
+        # set-based statement (the per-row attempts are still read below for the
+        # out-of-session re-enqueue). Same DB effect + reclaimed count as the
+        # loop, one round-trip instead of N.
+        if stale_verifies:
             await db.execute(
                 update(WolRun)
                 .where(
-                    WolRun.id == stale_id,
+                    WolRun.id.in_([s[0] for s in stale_verifies]),
                     WolRun.verify_state.in_([VERIFY_PENDING, VERIFY_VERIFYING]),
                 )
                 .values(verify_state=VERIFY_PENDING, verify_claimed_at=now)
             )
-            verify_reclaimed += 1
-        if stale_verifies:
+            verify_reclaimed = len(stale_verifies)
             await db.commit()
 
     # Re-enqueue reclaimed verify passes outside the session (best-effort broker
     # push at the row's attempt anchor — a hiccup just defers to the next tick).
     for stale_id, stale_attempt in stale_verifies:
-        try:
-            verify_wol_run.apply_async(args=[str(stale_id), stale_attempt or 1], countdown=0)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "wol_verify_reaper_reenqueue_failed",
-                run_id=str(stale_id),
-                error=str(exc),
-            )
+        _enqueue_verify(
+            str(stale_id), stale_attempt or 1, 0, log_event="wol_verify_reaper_reenqueue_failed"
+        )
 
     return {
         "fired": fired,
