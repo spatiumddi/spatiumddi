@@ -151,7 +151,7 @@ class WolSchedule(Base):
     # 'ping'-only in v1 (kept as a column so a future TCP/agent method needs
     # no migration).
     verify_method: Mapped[str] = mapped_column(
-        String(16), nullable=False, default="ping", server_default="'ping'"
+        String(16), nullable=False, default="ping", server_default=text("'ping'")
     )
 
     # ── Last-run mirror (denormalised for the list view) ────────────────
@@ -369,7 +369,7 @@ class WolRun(Base):
     # mutex) → done (finalised, terminal). verified_count / unverified_count are
     # the SENT-target liveness rollup written at finalise.
     verify_state: Mapped[str] = mapped_column(
-        String(16), nullable=False, default="none", server_default="'none'"
+        String(16), nullable=False, default="none", server_default=text("'none'")
     )
     verified_count: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default="0"

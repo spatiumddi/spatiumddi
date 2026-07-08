@@ -136,7 +136,17 @@ async def sync_calendar(
         calendar.last_synced_at = datetime.now(UTC)
         await db.commit()
         logger.warning("wol_calendar_parse_failed", calendar_id=str(calendar.id), error=str(exc))
-        return {"status": "error", "added": 0, "removed": 0, "total": 0, "error": str(exc)}
+        # Return the SAME generic message as the persisted column — the raw
+        # exception (icalendar echoes the offending feed line, an SSRF'd body,
+        # etc.) is logged server-side above and must never reach the caller via
+        # the sync-now response either.
+        return {
+            "status": "error",
+            "added": 0,
+            "removed": 0,
+            "total": 0,
+            "error": "feed is not valid iCalendar",
+        }
 
     # Dedupe parsed events by natural key (recurrence can repeat a UID; a feed
     # can list the same span twice).

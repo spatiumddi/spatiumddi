@@ -445,6 +445,18 @@ originates:
   command channel). **This is the preferred path** when an appliance is on the
   segment — it needs no router changes at all.
 
+  > ⚠️ **Scheduled fires can't use appliance vantage yet.** The appliance
+  > command channel (`agent_cmd`) is an **in-memory, per-replica** queue that the
+  > supervisor long-polls off the **api** process, but a scheduled fire runs in
+  > the **Celery beat worker** — a different process — so its enqueue never
+  > reaches the supervisor and the wake records per-host delivery failures (it is
+  > not silent, but it does not send). This is the same agent_cmd limitation the
+  > verify probe hits above; the fix is the tracked worker→supervisor
+  > Redis-backed multi-replica dispatch. **Until then, for a *scheduled* wake to a
+  > remote segment use server vantage + the router directed-broadcast config
+  > (below), or trigger the appliance-vantage wake interactively via "Run now"
+  > (which originates in the api process and reaches the supervisor).**
+
 #### Stagger auto-tuning (Phase 3)
 
 `stagger_ms` inserts a per-host delay between sends within a run (on top of the

@@ -42,7 +42,6 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -94,8 +93,6 @@ from .schemas import (
     WakeScheduleUpdate,
     WakeTargetRead,
 )
-
-logger = structlog.get_logger(__name__)
 
 # WoL is a network tool — reuse the tools permission already seeded into the
 # Network Editor built-in role (symmetry with POST /ipam/addresses/{id}/wake).

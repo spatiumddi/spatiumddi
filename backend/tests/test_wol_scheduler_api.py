@@ -248,7 +248,7 @@ async def test_rbac_403_on_run_now(client: AsyncClient, db_session: AsyncSession
     # Seed a schedule as superadmin, then attempt to fire it as an
     # unauthorized principal — the write gate must refuse before any dispatch.
     _, admin_token = await _superadmin(db_session)
-    subnet = await _wakeable_host(db_session)  # noqa: F841
+    await _wakeable_host(db_session)
     r = await client.post(f"{_BASE}/schedules", json=_create_body(), headers=_hdr(admin_token))
     sid = r.json()["id"]
 
