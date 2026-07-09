@@ -557,6 +557,13 @@ _FIREWALL_BASE_MARKER_SIDECAR = Path(
 # in-pod fallback writes to; maybe_fire_firewall_reload writes the server-
 # rendered body here when the control plane has firewall authority.
 _FIREWALL_TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/firewall-pending")
+# #593 — last self-partition refusal, surfaced to the operator on the heartbeat
+# (appliance.firewall_state → Fleet chip). Detecting a row/reality divergence
+# and only logging it would leave the node silently diverged forever: the
+# control plane keeps re-shipping the same wrong body, and nothing tells anyone.
+_FIREWALL_REFUSAL_SIDECAR = Path(
+    "/var/lib/spatiumddi-host/release-state/firewall-refused"
+)
 
 # #272 Phase 7b — control-plane cluster join/leave. The join trigger
 # carries the seed's kubeapi URL + join token; the host-side runner
@@ -2264,6 +2271,22 @@ def maybe_fire_firewall_reload(bundle_block: object) -> bool:
     firewall_conf = str(bundle_block.get("firewall_conf") or "")
     if not config_hash or not firewall_conf:
         return False  # no server-side authority → fall back / no-op
+
+    # #593 note: the self-partition guard deliberately does NOT live here.
+    #
+    # Refusing inside this function can only ever mean "do nothing": its bool
+    # return is consumed as "was a trigger fired?", and the caller's in-pod
+    # fallback is gated on the ABSENCE of server authority, not on this return
+    # value. A refusal here would therefore strand a live etcd member with a
+    # stale peer rule — or, on a node that joined while its row was already
+    # wrong, with no peer rule at all and no path to recovery.
+    #
+    # The guard sits in the heartbeat's dispatch instead, where a refusal can
+    # fall through to the in-pod renderer and let it re-derive the peer set
+    # from live membership. Keeping it out of here also keeps the apiserver
+    # probe off the steady-state path, since the hash short-circuit inside
+    # _fire_host_config runs first.
+
     # #387 — shared bounded-retry guard. The short-circuit against the
     # runner's applied-hash sidecar (a body the Phase-1 in-pod path
     # already applied → byte-identical server render → same hash) now
@@ -2275,6 +2298,56 @@ def maybe_fire_firewall_reload(bundle_block: object) -> bool:
         config_hash,
         f"{config_hash}\n{firewall_conf}",
     )
+
+
+# ── #593 — surface a self-partition refusal to the operator ──────────
+#
+# Without this the fix is silent: the guard blocks the bad drop-in, the control
+# plane re-renders the same wrong body from the same stale row on every tick,
+# and the only trace is a log line on a box nobody is tailing. The refusal is
+# persisted here, shipped on the heartbeat as ``firewall_state``, stored on
+# ``appliance.firewall_state``, and rendered as a Fleet chip — the same route
+# ``port_conflicts`` takes.
+
+
+def record_firewall_refusal(source: str, reason: str) -> None:
+    """Persist the latest refusal. Best-effort: never break the firewall path."""
+    payload = {"state": "refused_self_partition", "source": source, "reason": reason}
+    try:
+        _FIREWALL_REFUSAL_SIDECAR.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _FIREWALL_REFUSAL_SIDECAR.with_name(
+            _FIREWALL_REFUSAL_SIDECAR.name + ".new"
+        )
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        tmp.replace(_FIREWALL_REFUSAL_SIDECAR)
+    except OSError as exc:
+        log.debug("supervisor.firewall.refusal_persist_failed", error=str(exc))
+
+
+def clear_firewall_refusal() -> None:
+    """Drop the refusal marker once a body applies cleanly, so a healed node
+    stops reporting a stale divergence."""
+    try:
+        _FIREWALL_REFUSAL_SIDECAR.unlink()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        log.debug("supervisor.firewall.refusal_clear_failed", error=str(exc))
+
+
+def read_firewall_state() -> dict[str, str] | None:
+    """The refusal dict for the heartbeat body, or None when healthy."""
+    try:
+        raw = _FIREWALL_REFUSAL_SIDECAR.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return {str(k): str(v) for k, v in data.items()}
 
 
 # ── LLDP neighbour discovery (#347) ──────────────────────────────────

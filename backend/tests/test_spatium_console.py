@@ -236,3 +236,133 @@ def test_render_frame_no_unsafe_glyphs(m):
     console.print(m.render_frame(state, 1.5))
     bad = re.findall(r"[✓◐○▁-▇▓]", console.file.getvalue())
     assert not bad, f"unsafe glyphs in render: {sorted(set(bad))}"
+
+
+# ── Pods panel shows the whole cluster (#592) ────────────────────────────────
+#
+# On a 3-node HA appliance each node's console showed only that node's pods,
+# while ``kubectl get pods -A`` showed all of them. An auto-filter kicked in
+# above 20 visible pods and kept "problem pods + pods on THIS node"; a 3-node
+# appliance idles at ~22, so the filter was effectively always on for exactly
+# the deployment where cluster-wide visibility matters most.
+#
+# It protected nothing either: render_services sorts by _pod_sort_priority
+# BEFORE the height clamp, so broken pods float to the top and cannot be
+# clipped, and the remainder becomes the "… +N more pods · F3 to list"
+# subtitle. Sorting + overflow already do the filter's stated job.
+
+
+class _StubTail:
+    """JournalTail stand-in — render_log only reads ``.lines``."""
+
+    lines: list[str] = []
+
+    def stop(self) -> None:  # pragma: no cover - never called here
+        pass
+
+
+def _pod592(name: str, node: str, state: str = "Running", ready: str = "1/1") -> dict:
+    return {
+        "Namespace": "spatium",
+        "Names": name,
+        "Type": "Deployment",
+        "Node": node,
+        "Ready": ready,
+        "Restarts": 0,
+        "RestartedAt": "",
+        "K8sState": state,
+        "PodIP": "10.42.0.1",
+        "Ports": "",
+        "Age": "5m",
+    }
+
+
+def _idle_three_node_cluster() -> list[dict]:
+    """~22 visible pods over three nodes — what a real 3-node appliance idles
+    at, and what tripped the old 20-pod threshold."""
+    rows = [
+        _pod592(f"workload-{node}-{i}", node) for node in ("ddi1", "ddi2", "ddi3") for i in range(7)
+    ]
+    rows.append(_pod592("migrate-abc", "ddi3", state="Succeeded", ready="0/1"))
+    return rows
+
+
+def _panel_text(m, rows: list[dict], cap: int | None = None) -> str:
+    buf = Console(width=200, record=True, file=io.StringIO())
+    buf.print(m.render_services("control-plane", rows, cap=cap))
+    return _ANSI.sub("", buf.export_text())
+
+
+def _frame_text(m, rows: list[dict]) -> str:
+    """Render the WHOLE frame. This is the path that carried the bug: the
+    filter lived in render_frame's caller-side helper, not in render_services,
+    so a panel-only test cannot see the regression."""
+    state = m.DashboardState(env={}, tail=_StubTail(), tty_path="/dev/tty1")
+    state.ps_rows = rows
+    buf = Console(width=220, height=70, record=True, file=io.StringIO())
+    buf.print(m.render_frame(state, 0.0))
+    return _ANSI.sub("", buf.export_text())
+
+
+def test_frame_shows_pods_from_nodes_other_than_this_one(m) -> None:
+    """REGRESSION (#592). The old filter kept pods whose Node == this host.
+    None of the fixture's nodes are named after the machine running the test,
+    so the pre-fix code renders ZERO workload pods here — the same defect that,
+    on a real ddi1, rendered only ddi1's third of the cluster.
+
+    Asserting "at least two distinct nodes" rather than all three: 21 pods
+    exceed the panel height, so the last node legitimately overflows into the
+    "+N more pods" subtitle. That is the clamp working, not a filter.
+    """
+    text = _frame_text(m, _idle_three_node_cluster())
+    seen = [n for n in ("ddi1", "ddi2", "ddi3") if f"workload-{n}-0" in text]
+    assert len(seen) >= 2, f"only saw pods from {seen or 'no nodes'}"
+    assert "filtered:" not in text, "the node-local filter label is back"
+
+
+def test_frame_still_reports_overflow(m) -> None:
+    """The subtitle is the operator's cue that the panel is truncated — it is
+    what makes dropping the filter safe."""
+    text = _frame_text(m, _idle_three_node_cluster())
+    assert "more pods" in text
+    assert "F3 to list" in text
+
+
+def test_no_node_local_filter_survives(m) -> None:
+    """Gone, not merely re-tuned. A higher threshold would reintroduce the bug
+    on a 5- or 7-node cluster."""
+    assert not hasattr(m, "_filtered_pods")
+    assert not hasattr(m, "_POD_FILTER_THRESHOLD")
+
+
+def test_completed_jobs_still_hidden(m) -> None:
+    """Dropping the node filter must not drop the Succeeded-Job filter — that
+    one is load-bearing for panel height (see visible_pods)."""
+    assert "migrate-abc" not in _panel_text(m, _idle_three_node_cluster())
+
+
+def test_problem_pods_sort_above_healthy_ones(m) -> None:
+    """The mechanism that actually protects a crash-looping pod."""
+    assert m._pod_sort_priority(_pod592("boom", "ddi3", "CrashLoopBackOff", "0/1")) == 0
+    assert m._pod_sort_priority(_pod592("wait", "ddi2", "Pending", "0/1")) == 1
+    assert m._pod_sort_priority(_pod592("half", "ddi2", "Running", "1/2")) == 2
+    assert m._pod_sort_priority(_pod592("fine", "ddi1")) == 3
+
+
+def test_a_crashloop_on_a_remote_node_survives_a_brutal_clamp(m) -> None:
+    """The filter's stated purpose was stopping a crash-looping pod being
+    buried under healthy ones. Sort + clamp already guarantee that — even when
+    the broken pod is on a REMOTE node and the panel can show one row."""
+    rows = _idle_three_node_cluster()
+    rows.append(_pod592("boom", "ddi3", state="CrashLoopBackOff", ready="0/1"))
+    text = _panel_text(m, rows, cap=1)
+    assert "boom" in text, "the crash-looping pod was clipped by the height clamp"
+    assert "workload-ddi1-0" not in text, "a healthy pod outranked the crashloop"
+
+
+def test_clamped_rows_are_reported_not_silently_dropped(m) -> None:
+    rows = _idle_three_node_cluster()
+    text = _panel_text(m, rows, cap=3)
+    # 21 visible (the Succeeded job is filtered out), 3 shown → 18 hidden.
+    assert "+18 more pods" in text
+    assert "F3 to list" in text

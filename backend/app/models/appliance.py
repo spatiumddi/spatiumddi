@@ -664,6 +664,22 @@ class Appliance(Base):
         server_default=sa.text("'{}'::jsonb"),
     )
 
+    # #593 — the supervisor refused a firewall drop-in that would have closed
+    # etcd's peer port on this node while k3s still considers it an etcd member
+    # (a stale/diverged appliance row). Shape:
+    # ``{"state": "refused_self_partition", "source": "control-plane"|"in-pod",
+    #    "reason": "..."}``; ``{}`` when healthy.
+    #
+    # Detecting the divergence and only logging it would leave the node silently
+    # diverged forever — the control plane keeps re-rendering the same wrong
+    # body from the same row. Surfaced as a Fleet chip, like port_conflicts.
+    firewall_state: Mapped[dict[str, str]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=dict,
+        server_default=sa.text("'{}'::jsonb"),
+    )
+
     # #170 Wave D follow-up — outcome of the supervisor's last
     # docker-compose apply against the assigned roles. ``idle`` /
     # ``ready`` / ``failed``. ``role_switch_reason`` carries the

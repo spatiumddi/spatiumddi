@@ -169,7 +169,12 @@ _ROLE_PORTS_UDP: dict[str, list[int]] = {
 # carry the right source scope. etcd + kubelet are peer-ONLY (the #285
 # hardening); 6443 widens to peers ∪ pod ∪ svc ∪ kubeapi_expose;
 # memberlist is peer-only + gated on multi-node + VIP.
-_K3S_ETCD_KUBELET_TCP: tuple[int, ...] = (2379, 2380, 10250)
+# #593 — etcd's raft PEER port, exported because firewall_peer_audit audits
+# rendered bodies for it. One definition, so a change here can never leave the
+# audit checking a port the renderer no longer opens (which would silently
+# re-enable the self-partition this guard exists to prevent).
+ETCD_PEER_PORT = 2380
+_K3S_ETCD_KUBELET_TCP: tuple[int, ...] = (2379, ETCD_PEER_PORT, 10250)
 _K3S_APISERVER_TCP = 6443
 _METALLB_MEMBERLIST = 7946
 
