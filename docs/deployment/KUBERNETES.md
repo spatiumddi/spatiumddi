@@ -316,6 +316,22 @@ fails over in ~1 minute instead of the default ~5; the reasoning is inline in
 [`values.yaml`](../../charts/spatiumddi/values.yaml) under
 `postgresql.tolerations`.
 
+`postgresql.cnpg.podAntiAffinityType` is `required` on the appliance so
+instances never co-locate; the chart default stays `preferred` for
+BYO-Kubernetes installs that may run more instances than nodes (where
+`required` would leave one instance permanently `Pending`). Because the
+`Cluster` CR carries the `helm.sh/resource-policy: keep` annotation
+(Helm leaves the resource untouched after create), this setting rides
+the supervisor's out-of-band merge-patch rather than a `helm upgrade`.
+
+Flipping an **existing** cluster to `required` can strand an instance
+whose PVC is already bound to an occupied node (`Pending`). The one-time
+repair is the same shape as Redis but stricter — **only ever delete a
+REPLICA's PVC, never the primary's** (that destroys the database);
+confirm the role via the `cnpg.io/instanceRole=primary` label first. Full
+steps in [`k8s/README.md`](../../k8s/README.md) and
+[`charts/spatiumddi/README.md`](../../charts/spatiumddi/README.md).
+
 ### Redis — Sentinel
 
 Set `redis.kind: sentinel` to render a StatefulSet where each pod runs a
@@ -335,6 +351,33 @@ redis:
     failoverTimeoutMs: 60000
 ```
 
+**Hard-power-loss hardening (#590).** Redis here is cache + Celery
+broker; Postgres is the store of record. Three changes make a single
+node's abrupt power loss survivable:
+
+- Pod anti-affinity is now **required** (was `preferred`, which
+  silently stacked replicas on the seed node — defeating the point of
+  HA).
+- Each pod announces its stable StatefulSet FQDN via `replica-announce-ip`
+  / `sentinel announce-ip`, so a rescheduled pod **replaces** its
+  peer-table entry instead of leaving a ghost. Accumulated ghosts stay
+  in the failover-quorum denominator and eventually make failover
+  impossible.
+- `aof-load-corrupt-tail-max-size` is set so a power-cut-torn AOF tail
+  is discarded rather than bricking the replica on startup. This is
+  **not** redundant with `aof-load-truncated`: that knob handles a
+  *short* (mid-record) tail, whereas a *corrupt* (present-but-zero-filled)
+  tail is a hard startup failure that `aof-load-truncated` does not
+  cover.
+
+If you upgrade an **existing** install whose replicas were co-located, a
+replica whose `ReadWriteOnce` PVC is already bound to an occupied node
+goes `Pending` — loud, but the alternative is a cluster that silently
+isn't HA. The one-time repair is to delete the stranded **replica's**
+PVC so it re-provisions on a free node; that data is expendable and
+resyncs from the master. Exact commands are in
+[`k8s/README.md`](../../k8s/README.md).
+
 ### Multi-node control-plane HA
 
 The single-node-to-N-node control-plane HA story (3 / 5 / 7 nodes with
@@ -346,6 +389,16 @@ same HA database/cache via `postgresql.kind: cnpg` + `redis.kind: sentinel`
 above, while the api / frontend / worker scale through their replica counts and
 the api HPA. Beat stays a singleton across the cluster (its `Recreate`
 strategy guarantees no two beats schedule at once).
+
+**Stateless-tier placement (#590).** api / worker / frontend share a
+`podAntiAffinity` helper — `soft` by chart default, `hard` on the
+appliance — plus 20 s `not-ready` / `unreachable` NoExecute tolerations
+so a hard node loss reschedules them promptly. Under `hard` a
+`deploymentStrategy` helper **inverts** `maxSurge` / `maxUnavailable`
+(`maxSurge: 0`, `maxUnavailable: 1` instead of the default `1` / `0`):
+when `replicas == eligible nodes`, required anti-affinity makes a surge
+pod unschedulable, so the default surge-first rollout would deadlock
+forever. Retiring one old pod first frees a node for its replacement.
 
 > **The raw HA prototypes in `k8s/ha/`** (`postgres-cluster.yaml`,
 > `redis-sentinel.yaml`, `postgres-docker-compose.yaml`) are non-Helm
