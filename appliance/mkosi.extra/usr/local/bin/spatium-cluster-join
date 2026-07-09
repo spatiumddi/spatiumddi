@@ -256,6 +256,51 @@ restore_identity() {
     log "restored cluster identity from $bak"
 }
 
+# #590 — turn k3s's fatal into an operator-actionable reason.
+#
+# The runner can only observe "k3s didn't come Ready"; the WHY is in the
+# journal, and the operator only ever sees the ``.state`` sidecar's reason
+# field (which the Fleet UI surfaces on the row). Without this a join that
+# can NEVER succeed — e.g. re-promoting a node whose etcd membership still
+# exists under the same hostname — reports a bare "join failed" and the
+# operator has no idea eviction is the missing step.
+#
+# Reads the log on stdin so it is unit-testable; ``_k3s_log_since`` is the
+# journal reader (overridable for tests).
+classify_join_failure() {
+    local log
+    log="$(cat)"
+    case "$log" in
+        *"duplicate node name found"*)
+            printf '%s' "this hostname is already an etcd member of the target cluster — evict it (Fleet → Replace, or delete its k8s Node) before re-joining"
+            ;;
+        *"bootstrap data already found and encrypted with different token"*)
+            printf '%s' "stale k3s bootstrap data on disk — the join token does not match the cluster"
+            ;;
+        *"member has been permanently removed from the cluster"*)
+            printf '%s' "this node's etcd member was removed from the cluster — it must re-join as a NEW member (leave first)"
+            ;;
+        *"failed to validate token"*|*"token CA hash does not match"*)
+            printf '%s' "the seed rejected the join token"
+            ;;
+        *"connection refused"*|*"i/o timeout"*|*"no route to host"*)
+            printf '%s' "could not reach the seed — check the firewall and tcp/6443 + tcp/2379-2380"
+            ;;
+        *)
+            printf '%s' ""
+            ;;
+    esac
+}
+
+_k3s_log_since() {
+    # Overridable so appliance/tests can feed a canned log without a journal.
+    if [ -n "${SPATIUM_K3S_LOG_CMD:-}" ]; then
+        sh -c "$SPATIUM_K3S_LOG_CMD" 2>/dev/null || true
+        return 0
+    fi
+    journalctl -u k3s --no-pager --since "$1" 2>/dev/null || true
+}
+
 wait_ready() {
     # Poll the local kubeapi until this node reports Ready (or timeout).
     local deadline=$(( $(date +%s) + READY_TIMEOUT )) node
@@ -352,6 +397,10 @@ EOF
 
     log "restarting k3s to join $server_url (fresh identity)"
     clean_k3s_runtime
+    # Anchor for the journal scan below — anything k3s logs from here on
+    # belongs to THIS join attempt, not a previous one.
+    local k3s_started_at reason
+    k3s_started_at="$(date -u '+%Y-%m-%d %H:%M:%S')"
     if systemctl start k3s && wait_ready; then
         log "JOIN ok — node is Ready as a control-plane member"
         write_state ready "$server_url"
@@ -361,8 +410,14 @@ EOF
         exit 0
     fi
 
+    # #590 — say WHY. Some join failures are permanent until an operator
+    # acts (a duplicate etcd member is the one that bit us), and "failed" on
+    # its own gives them nothing to act on.
+    reason="$(_k3s_log_since "$k3s_started_at" | classify_join_failure)"
+    [ -n "$reason" ] || reason="k3s did not come Ready within ${READY_TIMEOUT}s"
+
     # ── Rollback — restore the single-node seed so we don't brick it ──
-    log "JOIN failed — rolling back to single-node seed"
+    log "JOIN failed — rolling back to single-node seed ($reason)"
     systemctl stop k3s || true
     rm -f "$JOIN_DROPIN"
     [ -f "$config_backup" ] && mv -f "$config_backup" "$K3S_CONFIG"
@@ -373,7 +428,7 @@ EOF
     fi
     clean_k3s_runtime
     systemctl start k3s || true
-    write_state failed "join failed; rolled back to single-node"
+    write_state failed "$reason"
     mv -f "$JOIN_TRIGGER" "${JOIN_TRIGGER}.failed.$(date +%s)" || true
     exit 1
 }
