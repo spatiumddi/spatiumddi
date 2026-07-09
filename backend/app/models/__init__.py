@@ -118,6 +118,13 @@ from app.models.tls_cert import TLSCertProbe, TLSCertTarget
 from app.models.unifi import UnifiController
 from app.models.vlans import VLAN, Router
 from app.models.vrf import VRF
+from app.models.wol_schedule import (
+    WolCalendar,
+    WolCalendarEvent,
+    WolRun,
+    WolRunTarget,
+    WolSchedule,
+)
 
 __all__ = [
     "ACMEAccount",
@@ -254,4 +261,9 @@ __all__ = [
     "TimeBoundGrant",
     "ApprovalPolicy",
     "ChangeRequest",
+    "WolSchedule",
+    "WolRun",
+    "WolRunTarget",
+    "WolCalendar",
+    "WolCalendarEvent",
 ]

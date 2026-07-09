@@ -203,6 +203,17 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
             "sensitivity (gated by the manage_packet_capture permission)."
         ),
     ),
+    ModuleSpec(
+        id="tools.wake_scheduler",
+        label="Scheduled Wake-on-LAN",
+        group="Tools",
+        description=(
+            "Recurring, tag-targeted Wake-on-LAN with a built-in holiday "
+            "gate (blackout dates + term range). Cron-scheduled fires from "
+            "a server or appliance vantage, run history, and live target "
+            "preview. Reuses the manual-wake send path; permission-gated."
+        ),
+    ),
     # DNS — togglable extras under the Settings → Import surface and
     # the DNS sidebar group. The importer is one-shot (issue #128) —
     # operators upload BIND9 configs / live-pull from Windows DNS or

@@ -3,6 +3,7 @@ import { NavLink, useLocation } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import {
   Activity,
+  Power,
   Network,
   Globe,
   LayoutDashboard,
@@ -230,6 +231,12 @@ const toolsNav = [
     icon: Activity,
     to: "/tools/pcap",
     module: "tools.pcap",
+  },
+  {
+    label: "Wake Schedules",
+    icon: Power,
+    to: "/tools/wake-schedules",
+    module: "tools.wake_scheduler",
   },
 ];
 

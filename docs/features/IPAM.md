@@ -216,6 +216,468 @@ Gated by the `use_network_tools` permission and audited against the IP
 (shown only when the IP has a MAC) and as the `propose_wake_host` Operator
 Copilot tool. WoL is IPv4-only — the magic packet rides a UDP broadcast.
 
+### Scheduled Wake-on-LAN (#586, Phases 1–3)
+
+The one-shot **Wake** button above sends a single magic packet on demand.
+**Scheduled Wake-on-LAN** layers a recurring, tag-targeted job on top of the
+same #533 send path — the schedule owns *when*, *which hosts*, and *how*; the
+actual packet dispatch is the shipped `app.services.wol` code unchanged.
+
+Phase 1 shipped the recurring tag-targeted schedule + built-in holiday/term gate;
+Phase 2 layered an external iCal / CalDAV calendar gate; Phase 3 adds **post-wake
+liveness verify + bounded retry**, **stagger auto-tuning** for large fleets, and the
+**FOG / PXE re-image runbook** below.
+
+Lives behind the default-enabled `tools.wake_scheduler` feature module
+(disable it and the router prefix, sidebar entry, and MCP tools all drop out —
+non-negotiable #14). REST surface is mounted at `/api/v1/wake-scheduler`
+(the Python package is `wol_schedules`; the wire prefix is `wake-scheduler`,
+the cross-surface contract shared with the frontend and MCP layers). Every
+handler is gated by the `wake_scheduler` permission (`read` / `write` /
+`delete`) and every mutation is audited (non-negotiables #3, #4). Operator
+Copilot gets read tools (`find_wol_schedules`, …) plus a `propose_*` write
+that lands in the standard preview → apply flow (non-negotiable #13).
+
+#### Schedules
+
+A `wol_schedule` row carries the recurrence, the target selector, the built-in
+holiday gate, and the send knobs:
+
+- `name` / `description` / `enabled`.
+- `schedule_cron` — a standard cron expression, or **NULL** for a
+  manual-only schedule (never swept by the beat task; fires only via
+  **Run now**).
+- `timezone` — an IANA zone (e.g. `America/Toronto`). The cron walks the
+  operator's **wall clock** in this zone, so a `0 7 * * 1-5` "07:00 on
+  weekdays" job stays at 07:00 local across DST transitions rather than
+  drifting an hour twice a year.
+- `next_run_at` — denormalised UTC, the beat sweep's due-query key. A
+  Celery beat task polls for due schedules, re-checks the holiday gate at
+  fire time, dispatches, and recomputes `next_run_at` from the cron +
+  timezone.
+
+Each fire (scheduled **or** manual) writes a `wol_run` history row — including
+gated skips, so "skipped because holiday" stays visible — with per-host
+`wol_run_target` children recording `sent` / `skipped` / `failed`, the
+resolved MAC and its `mac_source` (`ip` / `history` / `lease`), the segment
+broadcast, and the vantage the packet left from. Run history uses
+`ON DELETE SET NULL` on the schedule FK so deleting a schedule doesn't erase
+the audit trail of what it did.
+
+#### Targeting modes
+
+The `target_selector` JSONB picks the host set at fire time (resolved fresh on
+every run, so newly-tagged hosts are picked up automatically). Four modes:
+
+| Mode | Selector shape | Wakes |
+|---|---|---|
+| `address_tags` | `{ "mode": "address_tags", "tags": ["wake:nightly"] }` | Every IP address carrying **all** the listed tags |
+| `subnet_tags` | `{ "mode": "subnet_tags", "tags": ["env:lab"] }` | Every host in every subnet carrying the listed tags |
+| `subnet` | `{ "mode": "subnet", "subnet_ids": [<uuid>, …] }` | Every host in the named subnets |
+| `hosts` | `{ "mode": "hosts", "address_ids": [<uuid>, …] }` | An explicit list of IP addresses |
+
+Resolution is **permission-scoped to the schedule's creator** (non-negotiable
+#3): a schedule can only wake hosts in subnets its owner may `read`, so a
+tag-match can't be used to reach across a tenancy boundary. Multicast subnets
+and soft-deleted subnets are excluded (they hold no host MACs); addresses with
+no resolvable MAC are recorded as a per-host `no_mac` skip rather than
+silently dropped. Use **Preview targets** on the schedule modal to see the
+resolved host set (and skip reasons) before saving or running.
+
+#### Built-in holiday gate (Phase 1)
+
+Every schedule carries a **built-in** blackout/term gate that needs no external
+calendar (the [calendar subscription](#calendar-subscriptions-phase-2) below is
+an optional additional gate layered on top):
+
+- `blackout_dates` — a list of ISO `YYYY-MM-DD` dates. A fire whose **local**
+  calendar date (evaluated in the schedule's `timezone`) is a member is
+  skipped with `skip_reason = "holiday"`.
+- `active_from` / `active_until` — an optional term range. A fire whose local
+  date falls outside `[active_from, active_until]` is skipped with
+  `skip_reason = "off_term"` (e.g. a classroom lab that should only wake
+  during the school term).
+
+The gate is evaluated on the local date so a 07:00-local wake on a blackout day
+is correctly suppressed regardless of the UTC offset. Skipped runs are still
+recorded as `wol_run` rows so the skip is auditable.
+
+#### Calendar subscriptions (Phase 2)
+
+Phase 2 layers an **external calendar** gate on top of the built-in
+blackout/term checks. Instead of hand-maintaining a `blackout_dates` list, a
+schedule can subscribe to a calendar the organisation already publishes and let
+its all-day events drive the wake decision — the exact "follow the school/term
+calendar instead of a dumb weekday cron" workflow the feature was requested for.
+
+A **`wol_calendar`** row is a subscribed feed in one of two kinds:
+
+- **iCal `.ics` URL** (`kind = "ical_url"`) — an unauthenticated (or
+  token-in-URL) `.ics` / `webcal://` feed. This is the MVP path and covers the
+  80% case: Google Calendar "public address in iCal format" links and most
+  published school / district holiday calendars. `webcal://` and `webcals://`
+  are normalised to `https://` before fetch.
+- **Authenticated CalDAV** (`kind = "caldav"`) — a `username` + password
+  collection on a CalDAV server (Nextcloud, Radicale, a school's own server).
+  This is the HomeAssistant-CalDAV path the original requester described. The
+  password is **Fernet-encrypted at rest** and is **never returned** by the API
+  — reads expose only a `password_set` boolean.
+
+On each refresh the reconciler pulls the feed, parses it with `icalendar`
+(CalDAV collections via the `caldav` client), and **flattens all-day VEVENTs
+into concrete date spans** in the child `wol_calendar_event` table
+(`starts_on` / `ends_on` inclusive, `summary`, `categories`, `uid`).
+Recurrence (`RRULE` / `RDATE`, minus `EXDATE`) is expanded via
+`python-dateutil` over a bounded forward horizon (~400 days) so a
+`FREQ=YEARLY` rule can't produce an unbounded set. Only all-day events count —
+a timed 09:00 meeting is ignored; a holiday / term calendar is all-day spans.
+`DTEND` is treated as RFC 5545-exclusive, so a stored `ends_on` is
+`DTEND − 1 day`. The flattened spans make the fire-time gate an O(events)
+in-memory check with no per-fire network call — the same last-known-good-cache
+shape the DNS blocklist feed uses, so a schedule keeps gating correctly even
+while the feed source is unreachable.
+
+**Two gate modes** (`wol_schedule.calendar_mode`) cover the two shapes schools
+actually publish:
+
+| Mode | Calendar shape | Behaviour |
+|---|---|---|
+| `skip_on_event` | **Holiday** calendar (events = days off) | A matching event covering the local fire date **skips** the wake (`skip_reason = "calendar_event"`) |
+| `only_on_event` | **School-day / term** calendar (events = days on) | The wake fires **only** when a matching event covers the local fire date; otherwise skipped (`skip_reason = "no_calendar_event"`) |
+| `none` (default) | — | Calendar ignored; pure Phase-1 built-in gating |
+
+**`calendar_match`** (optional, per-schedule) is a case-insensitive regex that
+narrows *which* events count — matched against each event's summary and its
+categories. Use it when one calendar carries mixed entries and only some are
+wake-relevant (e.g. `calendar_match = "closed|holiday"` on a shared calendar
+that also holds staff-PD days). A malformed regex is treated as "no filter" so
+a bad operator entry can never wedge the gate.
+
+The calendar is an **additional** gate: the built-in term-range and
+`blackout_dates` checks still run first (term → blackout → calendar), and the
+whole thing is evaluated on the **local** fire date in the schedule's timezone.
+A skipped fire is still written as a `wol_run` row with the calendar skip
+reason, so "skipped — holiday calendar" stays visible in history.
+
+**Refresh cadence + sync-now.** Each calendar carries a
+`refresh_interval_minutes` cadence (default 6 h). A 60 s beat sweep
+(`app.tasks.wol_calendar.sweep_wol_calendars`) reconciles every enabled
+calendar whose interval has elapsed, mirroring the DNS-blocklist feed pull —
+transient network failures set `last_sync_status = "error"` + `last_sync_error`
+and retry with backoff; a successful pull stamps `last_synced_at` and
+recomputes `event_count`. The Calendars tab surfaces last-synced status and an
+**upcoming-events preview** so an operator can confirm "yes, this feed marks our
+holidays" before wiring a schedule to it, plus a **Sync now** button that runs
+the reconcile inline for immediate feedback.
+
+The `wol_calendar` tables belong to the **same** `tools.wake_scheduler` feature
+module as Phase 1 (no new module). Deleting a calendar `SET NULL`s the
+`calendar_id` on any schedule referencing it — the schedule falls back to its
+built-in gate rather than erroring.
+
+#### Post-wake verify + retry (Phase 3)
+
+A wake that *sent* isn't proof a host *came up*. When `verify_enabled` is set, a
+run chains a non-blocking liveness check after it dispatches, probes each host
+that was actually sent a packet, and re-wakes the ones that didn't answer — up to
+a bound. This turns "did we fire?" into "did the fleet actually power on?".
+
+Per-schedule config (all on `wol_schedule`):
+
+- `verify_enabled` (default `false`) — arm the post-wake check.
+- `verify_wait_seconds` (default `60`, range 5–3600) — grace between the dispatch
+  (and between each retry pass) and the probe, so a host has time to POST + bring
+  its NIC up before it's pinged.
+- `verify_retries` (default `1`, range 0–10) — number of **re-wake** passes after
+  the first probe. Total probe passes ≤ `verify_retries + 1`; `0` == probe once,
+  never re-wake.
+- `verify_method` (`ping`-only in v1) — kept as a column so a future TCP/agent
+  probe method needs no migration.
+
+How it runs (chained, bounded, idempotent — non-negotiables #9):
+
+1. `run_wol_schedule` dispatches as usual, then — if `verify_enabled` and at least
+   one packet went out — enqueues `verify_wol_run(run_id, attempt=1)` with a
+   `verify_wait_seconds` countdown. The dispatch task never blocks on the probe.
+2. Each verify pass atomically claims the run (`verify_state` `pending → verifying`
+   via a conditional `UPDATE … WHERE verify_state='pending'`), so a double-delivery
+   of the same attempt is a no-op and a re-fire after `done` is a no-op.
+3. It pings the still-unverified **sent** targets. A host that answers is stamped
+   `verified=true` and its `IPAddress.last_seen_at` / `last_seen_method='ping'` are
+   updated (the same Seen infra discovery uses). A non-responder is `verified=false`.
+4. If non-responders remain **and** `attempt ≤ verify_retries`, it re-wakes **only**
+   those hosts (reusing the Phase-1 dispatch path), bumps their `wake_attempts`,
+   releases the run back to `pending`, and re-enqueues the next attempt. Otherwise
+   it finalises: `verify_state='done'`, rolls up `verified_count` /
+   `unverified_count`, and writes one `wol_run_verified` audit row.
+
+Read surfaces: `wol_run.verify_state` (`none` → `pending` → `verifying` → `done`) +
+`verified_count` / `unverified_count` on the run; per-host `wol_run_target.verified`
+(tri-state: `null` = not-yet/not-checked · `false` = probed down · `true` = probed
+up), `verified_at`, `verify_method`, `wake_attempts`. The `find_wol_runs` MCP tool
+surfaces the rollup so the copilot can answer "did last night's wake bring the fleet
+up?" — distinct from "did it send?".
+
+**v1 verifies from the SERVER vantage only**, regardless of the schedule's *wake*
+vantage. The appliance command channel (`agent_cmd`) is an in-memory, per-replica
+dispatch the **api** process owns; the verify task runs in the **Celery worker**, and
+there is no worker→supervisor result-return path today. So for an appliance-vantage
+wake, verify still pings from the control plane: correct when the api/worker can reach
+the target segment (routed ICMP / directed broadcast), and a false-negative
+(unverified) — never a false wake — when it can't. `verify_method` records `"ping"`
+so the surface is honest about how it checked. **Appliance-vantage verify** (a
+worker→supervisor result channel) is the named Phase-3 follow-up, alongside the
+deferred [auto-resolve on-segment appliance from the target subnet] and the
+[scheduled-shutdown companion] below.
+
+#### Vantage
+
+A schedule inherits the #533 vantage choice — where the magic packet
+originates:
+
+- **Server vantage** (`{ "kind": "server" }`, default) — the control-plane
+  container broadcasts. Reaches only segments the api container can reach
+  directly, unless the target router forwards a directed broadcast (see the
+  router matrix below).
+- **Fleet-appliance vantage** (`{ "kind": "appliance", "id": <uuid> }`) —
+  dispatch to a Fleet appliance whose NIC sits on the target's segment, so the
+  packet originates in the right broadcast domain (reuses the generic nettool
+  command channel). **This is the preferred path** when an appliance is on the
+  segment — it needs no router changes at all.
+
+  > ⚠️ **Scheduled fires can't use appliance vantage yet.** The appliance
+  > command channel (`agent_cmd`) is an **in-memory, per-replica** queue that the
+  > supervisor long-polls off the **api** process, but a scheduled fire runs in
+  > the **Celery beat worker** — a different process — so its enqueue never
+  > reaches the supervisor and the wake records per-host delivery failures (it is
+  > not silent, but it does not send). This is the same agent_cmd limitation the
+  > verify probe hits above; the fix is the tracked worker→supervisor
+  > Redis-backed multi-replica dispatch. **Until then, for a *scheduled* wake to a
+  > remote segment use server vantage + the router directed-broadcast config
+  > (below), or trigger the appliance-vantage wake interactively via "Run now"
+  > (which originates in the api process and reaches the supervisor).**
+
+#### Stagger auto-tuning (Phase 3)
+
+`stagger_ms` inserts a per-host delay between sends within a run (on top of the
+`repeat_count` / `repeat_interval_ms` per-host retry burst). Firing every magic
+packet back-to-back can spike inrush current on a rack (dozens of machines powering
+on simultaneously) and micro-burst the broadcast domain / a PXE boot server.
+
+As of Phase 3 the default `stagger_ms = 0` means **auto**: the runner ramps a large
+resolved fleet so a same-second all-at-once fire can't inrush / PXE-thundering-herd,
+while a small set still fires immediately. The bands (`auto_stagger_ms`):
+
+| resolved wake count | stagger | approx wakes/sec |
+|---|---|---|
+| ≤ 20 | 0 (all at once) | — |
+| 21 – 100 | 50 ms | ~20/s |
+| 101 – 256 | 100 ms | ~10/s |
+| > 256 (up to the 512 fan-out cap) | 150 ms | ~6–7/s |
+
+Any **positive** `stagger_ms` is an explicit operator override that always wins
+verbatim — auto never touches it. So `0` = "let the platform decide", and a specific
+value = "use exactly this ramp". The `preview-targets` surface returns a
+`suggested_stagger_ms` (the auto value for the resolved count) so the create modal can
+show "waking N hosts → suggest ~X ms" as the operator edits the selector; the
+`preview_wol_schedule_targets` MCP tool returns it too.
+
+#### Scope caveat — wake only
+
+Wake-on-LAN **only wakes**. There is no "scheduled shutdown" counterpart, and
+none of Phases 1–3 add one — WoL is a layer-2 magic packet with no reverse
+operation, and an orderly shutdown needs an authenticated out-of-band path
+(BMC / Redfish / IPMI) or in-guest agent (SSH / ACPI) that is out of scope here.
+The **scheduled-shutdown companion** (BMC/Redfish/IPMI power-off) is a deferred
+follow-up the issue flags as "investigate" — a separate feature, not this pass.
+Schedules turn machines **on**; turning them off is the operator's / OS's
+responsibility.
+
+#### FOG / PXE re-image runbook (Phase 3)
+
+A scheduled wake pairs cleanly with the shipped **DHCP PXE profiles** (#51:
+`pxe_profile` + `DHCPScope.pxe_profile_id`, iPXE-vs-BIOS client-class match) to drive
+lab / classroom re-imaging with a tool like [FOG](https://fogproject.org/). The flow:
+
+1. **Tag the machines** to re-image (e.g. `wake:reimage`) so a `subnet_tags` /
+   `address_tags` selector resolves exactly that set.
+2. **Point the scope's PXE profile at FOG.** With a `pxe_profile` on the target
+   DHCP scope, PXE-booting hosts get the FOG bootfile (BIOS) or the FOG iPXE script
+   (iPXE) via the shipped client-class match — see `docs/features/DHCP.md` PXE
+   profiles.
+3. **Wake at the imaging window.** A schedule with cron `0 2 L * *` (02:00 on the
+   last day of the term — combined with the built-in `active_until` gate) wakes the
+   tagged fleet; a manual-only schedule + `run-now` works for an ad-hoc re-image.
+4. **Hosts PXE-boot into FOG** and image per the FOG task queued for each host.
+
+Operational notes: leave `stagger_ms = 0` (auto) or set a non-trivial explicit stagger
+so a lab-full of machines doesn't PXE-thundering-herd the TFTP / HTTP boot server all
+in the same second (the auto bands above already ramp a large set). Turn on
+**post-wake verify** so you can confirm the fleet actually powered on before the
+imaging window closes — `unverified_count > 0` on the run means some hosts never came
+up (dead PSU, WoL disabled in BIOS, wrong segment). This runbook **pairs with** but
+does **not** implement the deferred scheduled-shutdown companion (above): re-image jobs
+that need the machines off afterward still rely on the OS / FOG task to power them down.
+
+### Directed-broadcast router matrix (server vantage across an L3 boundary)
+
+**Prefer a Fleet appliance on the target segment — it needs none of this.**
+When the wake is dispatched to an appliance whose NIC is on the target subnet,
+the magic packet is broadcast locally and no router configuration is required.
+
+The snippets below are the **fallback** for when there is *no* on-segment
+appliance and the packet must travel from the **server vantage** across a
+routed boundary. In that case delivery depends on the target router
+**forwarding a directed broadcast** to the subnet's broadcast address. That is
+disabled by default on virtually all modern gear — it is the classic
+smurf-amplification vector — so server-vantage cross-subnet wakes silently fail
+until the operator enables it.
+
+Enabling directed broadcast is a **security downgrade**. Every snippet below
+therefore scopes the forwarding to **our single sender only**, via an ACL /
+firewall filter pinned to `<sender-ip>` → the target subnet. **Never** widen
+the source to `any` — that re-opens the smurf reflector. The schedule modal
+renders these auto-filled from what the job already knows, in an expandable
+"Router setup help" block shown only for a server-vantage + remote/L3 target.
+
+Templated fields (auto-filled by the UI, shown as placeholders here):
+
+| Placeholder | Meaning |
+|---|---|
+| `<sender-ip>` | The server/appliance vantage's source IP (the *only* permitted source) |
+| `<target-cidr>` | The target subnet in CIDR (rendered as network + wildcard/mask per vendor) |
+| `<target-directed-broadcast>` | The subnet's directed-broadcast address (computed via `wol.broadcast_for_network`) |
+| `<wol-port>` | The schedule's UDP port (default `9`; some stacks also use `7`) |
+
+Worked example used below: `<sender-ip> = 10.0.0.5`, target subnet
+`192.168.10.0/24` → `<target-cidr> = 192.168.10.0/24`,
+`<target-directed-broadcast> = 192.168.10.255`, `<wol-port> = 9`.
+
+#### Cisco IOS / IOS-XE
+
+```
+access-list 110 permit udp host 10.0.0.5 192.168.10.0 0.0.0.255 eq 9
+!
+interface Vlan10
+ ip directed-broadcast 110
+```
+
+`host 10.0.0.5` = `<sender-ip>`; `192.168.10.0 0.0.0.255` = `<target-cidr>` as
+network + wildcard mask; `eq 9` = `<wol-port>`. The ACL scopes
+`ip directed-broadcast` on the target's downstream interface to only our
+sender → the subnet, so it is not left open as a smurf reflector.
+
+#### Juniper Junos
+
+```
+firewall {
+    family inet {
+        filter WOL-ONLY {
+            term permit-wol {
+                from {
+                    source-address {
+                        10.0.0.5/32;
+                    }
+                    destination-address {
+                        192.168.10.255/32;
+                    }
+                    protocol udp;
+                    destination-port [ 7 9 ];
+                }
+                then accept;
+            }
+            term default {
+                then accept;   # or your normal policy
+            }
+        }
+    }
+}
+```
+
+`10.0.0.5/32` = `<sender-ip>`; `192.168.10.255/32` =
+`<target-directed-broadcast>`; ports `7 9` = WoL. Junos also needs the
+receiving IRB/interface for the target subnet to permit the directed broadcast
+(`set interfaces irb unit <n> family inet targeted-broadcast`) alongside the
+filter — the filter authorises the traffic, `targeted-broadcast` converts the
+inbound directed-broadcast into a link-layer broadcast on egress.
+
+#### Arista EOS
+
+```
+ip access-list WOL-ONLY
+   10 permit udp host 10.0.0.5 192.168.10.0/24 eq 9
+!
+interface Vlan10
+   ip directed-broadcast WOL-ONLY
+```
+
+IOS-like: `host 10.0.0.5` = `<sender-ip>`, `192.168.10.0/24` = `<target-cidr>`,
+`eq 9` = `<wol-port>`. `ip directed-broadcast <acl>` on the SVI facing the
+target subnet forwards directed broadcasts only for ACL-matched traffic.
+
+#### MikroTik RouterOS
+
+```
+/ip firewall filter
+add chain=forward action=accept protocol=udp \
+    src-address=10.0.0.5 dst-address=192.168.10.255 \
+    dst-port=9 comment="WOL directed-broadcast (single sender)"
+/interface ethernet switch
+# RouterOS drops directed broadcasts by default; the forward-accept rule
+# above pins src-address=<sender-ip> (10.0.0.5) to the subnet's
+# directed-broadcast dst-address=<target-directed-broadcast> (192.168.10.255)
+# on dst-port=<wol-port> (9). Keep src-address pinned — never 0.0.0.0/0.
+```
+
+`src-address=10.0.0.5` = `<sender-ip>`; `dst-address=192.168.10.255` =
+`<target-directed-broadcast>`; `dst-port=9` = `<wol-port>`. On CHR / routers
+that also need the broadcast re-broadcast onto the LAN segment, ensure the
+target bridge/interface is not filtering the directed broadcast in the bridge
+firewall.
+
+#### VyOS / EdgeOS
+
+```
+set firewall name WOL-ONLY rule 10 action accept
+set firewall name WOL-ONLY rule 10 protocol udp
+set firewall name WOL-ONLY rule 10 source address 10.0.0.5
+set firewall name WOL-ONLY rule 10 destination address 192.168.10.255
+set firewall name WOL-ONLY rule 10 destination port 9
+!
+# Enable directed-broadcast relay on the interface facing the target subnet:
+set interfaces ethernet eth1 ip enable-directed-broadcast
+```
+
+`source address 10.0.0.5` = `<sender-ip>`; `destination address
+192.168.10.255` = `<target-directed-broadcast>`; `destination port 9` =
+`<wol-port>`. `enable-directed-broadcast` on the egress interface converts the
+routed directed broadcast into a link-layer broadcast; the firewall rule pins
+it to our single sender. Apply the `WOL-ONLY` ruleset to the appropriate
+`in`/`local` direction for your topology.
+
+#### pfSense / OPNsense
+
+Both are FreeBSD/`pf`-based and disable directed-broadcast forwarding by
+default. Add a **single-source** firewall pass rule on the interface the wake
+enters from:
+
+```
+# Firewall → Rules → <WAN/vantage interface> → Add
+Action:            Pass
+Protocol:          UDP
+Source:            10.0.0.5/32            # <sender-ip> — Single host, never "any"
+Destination:       192.168.10.255/32     # <target-directed-broadcast>
+Destination port:  9                     # <wol-port>
+```
+
+Then allow the directed broadcast to be forwarded onto the LAN. On FreeBSD this
+is the `net.inet.ip.directed-broadcast=1` sysctl (System → Advanced →
+System Tunables), scoped in practice by the source-pinned pass rule above.
+Several SpatiumDDI integrations already mirror OPNsense/pfSense, so the target
+subnet + directed-broadcast address are typically already known to the platform
+and pre-filled into this snippet. Keep the source pinned to `<sender-ip>/32` —
+a rule with `Source: any` re-opens the smurf reflector.
+
 ---
 
 ## 6. Custom Fields

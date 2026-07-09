@@ -44,6 +44,14 @@ dependencies = [
     "anthropic>=0.40.0",
     "reportlab>=4.2.0",
     "croniter>=3.0.0",
+    # Scheduled Wake-on-LAN calendar gate (issue #586 Phase 2). ``icalendar``
+    # parses subscribed .ics feeds; ``caldav`` pulls authenticated CalDAV
+    # collections; ``python-dateutil`` (already present transitively via
+    # botocore) expands RRULE/RDATE over a bounded horizon — pinned explicitly
+    # so the recurrence path can't break on a transitive drop.
+    "icalendar>=6.0.0",
+    "caldav>=1.3.0",
+    "python-dateutil>=2.9.0",
     "boto3>=1.35.0",
     "paramiko>=3.4.0",
     "azure-storage-blob>=12.20.0",

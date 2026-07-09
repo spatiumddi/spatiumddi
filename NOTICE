@@ -57,6 +57,9 @@ components. Grouped by role; license + project URL for each.
 - ldap3 (LDAP) — LGPL v3 — https://github.com/cannatag/ldap3
 - python3-saml (SAML) — MIT — https://github.com/SAML-Toolkits/python3-saml
 - reportlab (PDF export) — BSD 3-Clause — https://www.reportlab.com
+- icalendar (Wake-on-LAN calendar gate — .ics parsing) — BSD 2-Clause — https://github.com/collective/icalendar
+- caldav (Wake-on-LAN calendar gate — CalDAV client) — Apache 2.0 — https://github.com/python-caldav/caldav
+- python-dateutil (recurrence RRULE/RDATE expansion) — Apache 2.0 / BSD 3-Clause — https://github.com/dateutil/dateutil
 - Scapy (passive DHCP fingerprinting) — GPL v2 — https://scapy.net
 - nmap (network scanning) — NPSL (Nmap Public Source License) — https://nmap.org
 - tcpdump / libpcap (packet capture) — BSD 3-Clause — https://www.tcpdump.org
