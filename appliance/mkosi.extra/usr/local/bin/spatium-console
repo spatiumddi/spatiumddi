@@ -1941,26 +1941,26 @@ def _pod_sort_priority(row: dict) -> int:
     return 3
 
 
-# P2.1 — above this many visible pods the Pods panel auto-filters to
-# "problems + this node" so a big multi-node cluster doesn't bury a
-# crash-looping pod under dozens of healthy ones (F3 still lists all).
-_POD_FILTER_THRESHOLD = 20
-
-
-def _filtered_pods(state: "DashboardState") -> tuple[list[dict], str]:
-    """(rows, mode_label) for the Pods panel. At/under the threshold: all
-    visible pods + empty label. Above it: keep only problem pods
-    (sort-priority ≤ 2 — broken / pending / not-ready) plus every pod on the
-    LOCAL node, and label the panel so the operator knows it's filtered."""
-    vis = visible_pods(state.ps_rows)
-    if len(vis) <= _POD_FILTER_THRESHOLD:
-        return vis, ""
-    local = os.uname().nodename
-    kept = [
-        r for r in vis
-        if _pod_sort_priority(r) <= 2 or r.get("Node") == local
-    ]
-    return kept, "filtered: problems + this node"
+# #592 — there is deliberately NO pod filter here.
+#
+# A "problems + this node" auto-filter used to kick in above 20 visible pods,
+# to stop a big cluster burying a crash-looping pod under healthy ones. But a
+# 3-node appliance idles at ~22 visible pods, so the filter was effectively
+# always on for exactly the deployment where cluster-wide visibility matters
+# most: each node's console showed only its own third of the cluster, while
+# ``kubectl get pods -A`` showed everything. Operators reasonably concluded
+# the console was broken.
+#
+# It also protected nothing. render_services() already sorts by
+# _pod_sort_priority BEFORE the height clamp, so broken / pending / not-ready
+# pods float to the top and cannot be clipped; whatever doesn't fit becomes
+# the "… +N more pods · F3 to list" subtitle. Sorting + overflow already do
+# the job the filter claimed to do, and the filter's only actual effect was
+# to hide the other nodes.
+#
+# If a cap is ever wanted for very large clusters, filter on problem-priority
+# ONLY (never on node) — hiding a healthy pod is recoverable, hiding a whole
+# node is what caused this bug.
 
 
 def _quorum_verdict(state: "DashboardState") -> tuple[str, str] | None:
@@ -2399,7 +2399,6 @@ def render_services(
     ps_rows: list[dict],
     cap: int | None = None,
     overflow: int = 0,
-    filter_label: str = "",
 ) -> Panel:
     """Render the Pods panel — every pod on the local k3s cluster
     with status + node + ports (the image column was dropped — on an
@@ -2523,11 +2522,6 @@ def render_services(
         )
     else:
         pods_title = f"[bold]Pods[/bold] · {ready_count} Ready"
-    # P2.1 — flag the auto-filter so the operator knows the panel isn't the
-    # full pod list (F3 lists everything).
-    if filter_label:
-        pods_title += f" [dim]· {filter_label}[/dim]"
-
     if not sorted_rows:
         tbl.add_row(
             Text("·", style="dim"),
@@ -3777,7 +3771,7 @@ def render_frame(state: "DashboardState", mono_t: float) -> Layout:
         # list still leaves the log a healthy third (overflow → the "+N more"
         # subtitle).
         remainder = max(rows - header_rows - footer_rows, _MIN_MAIN + _MIN_LOG)
-        pod_rows, pod_filter = _filtered_pods(state)
+        pod_rows = visible_pods(state.ps_rows)
         main_h = max(_MIN_MAIN, min(len(pod_rows) + 3, remainder * 2 // 3))
         max_pod_rows = max(main_h - 3, 1)  # -3 = top border + col-header + bottom border
         pods_overflow = max(len(pod_rows) - max_pod_rows, 0)
@@ -3791,7 +3785,7 @@ def render_frame(state: "DashboardState", mono_t: float) -> Layout:
         layout["header"].update(render_header(state, mono_t, compact=True))
         layout["main"].update(
             render_services(state.role, pod_rows, cap=max_pod_rows,
-                            overflow=pods_overflow, filter_label=pod_filter)
+                            overflow=pods_overflow)
         )
         layout["log"].update(render_log(state.tail, log_h))
         layout["footer"].update(render_footer(state.status_message, state.role))
@@ -3806,7 +3800,7 @@ def render_frame(state: "DashboardState", mono_t: float) -> Layout:
     # the log a healthy third (overflow → the "+N more" subtitle). main_h
     # fits the TALLER of Pods / Top-pods (they share the split_row height).
     remainder = max(rows - reserved, _MIN_MAIN + _MIN_LOG)
-    pod_rows, pod_filter = _filtered_pods(state)
+    pod_rows = visible_pods(state.ps_rows)
     main_content = max(len(pod_rows), len(state.pod_stats), 1) + 3  # col-header + 2 border
     main_h = max(_MIN_MAIN, min(main_content, remainder * 2 // 3))
     log_h = max(remainder - main_h, _MIN_LOG)
@@ -3846,7 +3840,7 @@ def render_frame(state: "DashboardState", mono_t: float) -> Layout:
 
     layout["main"]["pods"].update(
         render_services(state.role, pod_rows, cap=max_pod_rows,
-                        overflow=pods_overflow, filter_label=pod_filter)
+                        overflow=pods_overflow)
     )
     layout["main"]["top"].update(render_top_pods(state, main_h))
 
