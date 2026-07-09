@@ -9,23 +9,28 @@ peers logged ``dial tcp 192.168.0.133:2380: i/o timeout`` every 5 s against a
 member that was up the whole time.
 
 The row bug is fixed (#591). The COUPLING is what these tests pin: any
-row/reality divergence — stuck heartbeat, control plane restored from an older
-backup, half-landed promote, operator clearing state with the #591 escape
-hatch — must not be able to close etcd's peer port on a node that k3s still
-calls an etcd member.
+row/reality divergence must not be able to close etcd's peer port on a node
+that k3s still calls an etcd member.
 
-Two defences, both covered here:
+Three defences, all covered here:
   1. recover a peer set from live membership when the row supplies none
   2. refuse to apply any body that would close 2380 on a live etcd member
+  3. remember the last KNOWN membership on disk, because the probe itself needs
+     the network — the supervisor pod has no hostNetwork, so its kube reads go
+     to the apiserver ClusterIP and can be routed to a REMOTE apiserver. A
+     partitioned node cannot probe; without a memory the guard fails open
+     exactly when it is needed.
 
-And the counter-property, which matters just as much: a plain agent node (or a
-node whose apiserver is unreadable) must still get its firewall updated. A
-guard that fails closed would brick every non-etcd appliance.
+And the counter-properties, which matter just as much: a plain agent appliance
+(or a node that has never successfully probed) must still get its firewall.
+A guard that failed closed there would freeze the ruleset on every non-etcd box.
 
     python3 -m pytest agent/supervisor/tests/test_firewall_self_partition.py -v
 """
 
 from __future__ import annotations
+
+from pathlib import Path
 
 import pytest
 
@@ -43,12 +48,8 @@ udp dport 53 accept comment "role:dns-only"
 tcp dport 53 accept comment "role:dns-only"
 """
 
-# A control-plane body: carries the peer-scoped etcd/kubelet accept.
 CP_BODY = """\
-# ── Base management ────────────────────────────────────────
 tcp dport 22 accept comment "mgmt-ssh"
-
-# ── Control-plane derived (peer-scoped, #272/#285) ─────
 ip saddr { 192.168.0.199, 192.168.0.125 } tcp dport { 2379, 2380, 10250 } \
 accept comment "k3s-peer"
 ip saddr { 10.42.0.0/16 } tcp dport 6443 accept comment "k3s-api"
@@ -56,15 +57,18 @@ ip saddr { 10.42.0.0/16 } tcp dport 6443 accept comment "k3s-api"
 
 
 @pytest.fixture(autouse=True)
-def _clear_cache() -> None:
-    """The membership answer is cached process-globally; leaking it across
-    cases would make each test depend on the order of the previous one."""
+def _isolate(monkeypatch, tmp_path: Path):
+    """The membership cache is a process global and the last-known answer is a
+    file on the host bind mount. Both would leak across cases."""
     fpa._reset_etcd_member_cache()
+    monkeypatch.setattr(fpa, "_ETCD_MEMBER_SIDECAR", tmp_path / "etcd-member")
     yield
     fpa._reset_etcd_member_cache()
 
 
-# ── body_opens_etcd_peers ───────────────────────────────────────────────────
+# ── body_opens_etcd_peers: false positives are the DANGEROUS direction ───────
+# A false "peers are open" tells would_self_partition the body is safe, and the
+# member firewalls itself out of raft.
 
 
 def test_cp_body_is_recognised_as_opening_the_peer_port() -> None:
@@ -75,68 +79,116 @@ def test_agent_body_does_not_open_the_peer_port() -> None:
     assert fpa.body_opens_etcd_peers(AGENT_BODY) is False
 
 
-def test_the_port_named_only_in_a_comment_does_not_count() -> None:
-    """The renderer's header block mentions ``2379`` / ``2380`` in prose. A
-    naive substring check would read that as "peers are open" and let the
-    guard pass on a body that partitions the node."""
-    commented = (
+def test_a_port_range_endpoint_counts() -> None:
+    assert fpa.body_opens_etcd_peers('tcp dport 2379-2380 accept comment "peer"')
+
+
+def test_the_port_named_only_in_a_hash_comment_does_not_count() -> None:
+    """The renderer's header block names 2379/2380 in prose."""
+    assert not fpa.body_opens_etcd_peers(
         "# etcd 2379 / 2380 + kubelet 10250 scoped to the peer set\n"
         'tcp dport 22 accept comment "mgmt-ssh"\n'
     )
-    assert fpa.body_opens_etcd_peers(commented) is False
 
 
-def test_a_trailing_comment_does_not_fake_an_accept() -> None:
-    """Inline comment after a non-accept rule must not smuggle the port in."""
-    body = 'tcp dport 22 accept comment "ssh; not 2380"\n'
-    assert fpa.body_opens_etcd_peers(body) is False
+def test_the_port_inside_an_nft_comment_does_not_count() -> None:
+    """nftables' ``comment "..."`` is not a ``#`` comment."""
+    assert not fpa.body_opens_etcd_peers('tcp dport 22 accept comment "ssh; not 2380"')
 
 
-# ── would_self_partition ────────────────────────────────────────────────────
+def test_a_hash_inside_an_nft_comment_does_not_leak_the_port() -> None:
+    """REGRESSION. Splitting on '#' BEFORE stripping the comment clause
+    truncates ``comment "port 2380 #note"`` into an unterminated quote the
+    comment regex can no longer match, leaking its text — and its 2380 — into
+    the code. The rule opens only :22, yet the guard would call it safe."""
+    assert not fpa.body_opens_etcd_peers('tcp dport 22 accept comment "port 2380 #note"')
 
 
-def test_refuses_an_agent_body_on_a_live_etcd_member(monkeypatch) -> None:
-    """THE bug. Row says agent; k3s says etcd member; body closes 2380."""
-    monkeypatch.setattr(fpa, "_etcd_membership_uncached", lambda: True)
-    assert fpa.would_self_partition(AGENT_BODY) is True
+def test_an_ipv6_address_containing_2380_does_not_count() -> None:
+    """REGRESSION. ``fd00:2380::/64`` puts 2380 between colons, not digits, so
+    a whole-number guard passes. The rule opens 6443 only; matching must be
+    anchored to a dport position."""
+    assert not fpa.body_opens_etcd_peers(
+        'ip6 saddr { fd00:2380::/64 } tcp dport 6443 accept comment "kubeapi-v6"'
+    )
 
 
-def test_allows_a_cp_body_on_a_live_etcd_member(monkeypatch) -> None:
-    monkeypatch.setattr(fpa, "_etcd_membership_uncached", lambda: True)
-    assert fpa.would_self_partition(CP_BODY) is False
+def test_a_longer_number_containing_2380_does_not_count() -> None:
+    assert not fpa.body_opens_etcd_peers("tcp dport 12380 accept")
 
 
-def test_allows_an_agent_body_on_a_real_agent_node(monkeypatch) -> None:
-    """The counter-property: a genuine DNS/DHCP agent appliance is NOT an etcd
-    member, and must still receive its (peer-less) firewall."""
-    monkeypatch.setattr(fpa, "_etcd_membership_uncached", lambda: False)
-    assert fpa.would_self_partition(AGENT_BODY) is False
+def test_the_audited_port_tracks_the_renderer() -> None:
+    """One source of truth: an audit checking a port the renderer no longer
+    opens would silently re-enable the self-partition."""
+    from spatium_supervisor import firewall_renderer
+
+    assert fpa._ETCD_PEER_PORT == str(firewall_renderer.ETCD_PEER_PORT)
+    assert firewall_renderer.ETCD_PEER_PORT in firewall_renderer._K3S_ETCD_KUBELET_TCP
 
 
-def test_unknown_membership_never_blocks_an_update(monkeypatch) -> None:
-    """``None`` means the kube API was unreadable. Blocking on "don't know"
-    would wedge the firewall on every node whose apiserver blips, and on every
-    non-k3s deployment kind. Fail open here; the row-driven render is still
-    the normal path."""
-    monkeypatch.setattr(fpa, "_etcd_membership_uncached", lambda: None)
-    assert fpa.would_self_partition(AGENT_BODY) is False
+def test_the_guard_reads_the_real_renderer_output() -> None:
+    """Fixtures can drift from reality; the renderer cannot."""
+    from spatium_supervisor.firewall_renderer import render_drop_in
+
+    cp = render_drop_in(
+        {"roles": []},
+        ["192.168.0.199/32"],
+        pod_cidrs=["10.42.0.0/16"],
+        service_cidrs=["10.43.0.0/16"],
+        cp_member_count=3,
+        vip_configured=True,
+    )
+    agent = render_drop_in({"roles": ["dns_bind9"]}, [], pod_cidrs=[], service_cidrs=[])
+    assert fpa.body_opens_etcd_peers(cp.body) is True
+    assert fpa.body_opens_etcd_peers(agent.body) is False
 
 
-# ── membership probe + cache ────────────────────────────────────────────────
+# ── would_self_partition is pure: membership is passed in ────────────────────
+
+
+def test_refuses_an_agent_body_on_a_live_etcd_member() -> None:
+    assert fpa.would_self_partition(AGENT_BODY, is_etcd_member=True) is True
+
+
+def test_allows_a_cp_body_on_a_live_etcd_member() -> None:
+    assert fpa.would_self_partition(CP_BODY, is_etcd_member=True) is False
+
+
+def test_allows_an_agent_body_on_a_real_agent_node() -> None:
+    """Counter-property: a DNS/DHCP agent appliance is not an etcd member and
+    must still receive its (peer-less) firewall."""
+    assert fpa.would_self_partition(AGENT_BODY, is_etcd_member=False) is False
+
+
+def test_unknown_membership_never_blocks_an_update() -> None:
+    """Failing closed on 'don't know' would wedge the firewall on every node
+    that has never successfully probed."""
+    assert fpa.would_self_partition(AGENT_BODY, is_etcd_member=None) is False
+
+
+# ── membership probe: cache + persistence ───────────────────────────────────
 
 
 def test_membership_reads_the_local_nodes_own_labels(monkeypatch) -> None:
     monkeypatch.setenv("NODE_NAME", "ddi2")
-    seen: dict[str, str] = {}
+    seen: dict[str, object] = {}
 
-    def fake_request(method: str, path: str):
-        seen["method"], seen["path"] = method, path
-        body = '{"metadata":{"labels":{"node-role.kubernetes.io/etcd":"true"}}}'
-        return 200, body
+    def fake_request(method: str, path: str, timeout: float | None = None):
+        seen.update(method=method, path=path, timeout=timeout)
+        return 200, '{"metadata":{"labels":{"node-role.kubernetes.io/etcd":"true"}}}'
 
     monkeypatch.setattr(fpa.k8s_api, "_request", fake_request)
     assert fpa.local_node_is_etcd_member() is True
-    assert seen == {"method": "GET", "path": "/api/v1/nodes/ddi2"}
+    assert seen["method"] == "GET"
+    assert seen["path"] == "/api/v1/nodes/ddi2"
+    assert seen["timeout"] == fpa._KUBEAPI_TIMEOUT_S
+
+
+def test_the_probe_timeout_is_short_enough_not_to_stall_the_heartbeat() -> None:
+    """k8s_api._request defaults to 10s. check_kubeapi_ready deliberately uses
+    2s 'so a wedged apiserver doesn't stall the heartbeat loop'. Because None is
+    never cached, inheriting 10s would re-pay it every heartbeat of an outage."""
+    assert fpa._KUBEAPI_TIMEOUT_S <= 2.0
 
 
 def test_membership_is_false_when_the_etcd_label_is_absent(monkeypatch) -> None:
@@ -144,15 +196,20 @@ def test_membership_is_false_when_the_etcd_label_is_absent(monkeypatch) -> None:
     monkeypatch.setattr(
         fpa.k8s_api,
         "_request",
-        lambda m, p: (200, '{"metadata":{"labels":{"kubernetes.io/os":"linux"}}}'),
+        lambda m, p, timeout=None: (
+            200,
+            '{"metadata":{"labels":{"kubernetes.io/os":"linux"}}}',
+        ),
     )
     assert fpa.local_node_is_etcd_member() is False
 
 
-def test_membership_is_unknown_when_the_api_is_unreachable(monkeypatch) -> None:
+def test_membership_is_unknown_when_never_probed_and_api_unreachable(
+    monkeypatch,
+) -> None:
     monkeypatch.setenv("NODE_NAME", "ddi2")
 
-    def boom(method: str, path: str):
+    def boom(method: str, path: str, timeout: float | None = None):
         raise RuntimeError("connection refused")
 
     monkeypatch.setattr(fpa.k8s_api, "_request", boom)
@@ -165,32 +222,72 @@ def test_membership_is_unknown_without_a_node_name(monkeypatch) -> None:
     assert fpa.local_node_is_etcd_member() is None
 
 
-def test_a_known_answer_is_cached_but_unknown_is_re_probed(monkeypatch) -> None:
-    """A stale ``True`` only delays narrowing after a demote (harmless). A
-    cached ``None`` would remember "don't know" through an apiserver blip, so
-    it must be re-probed."""
+def test_false_is_never_cached_so_a_promote_is_seen_immediately(monkeypatch) -> None:
+    """REGRESSION. Caching False gives a window where a node k3s has just
+    labelled an etcd server still reads 'not a member', passes the guard, and
+    firewalls its own raft port shut — the exact half-landed-promote case."""
+    state = {"member": False}
+    monkeypatch.setattr(fpa, "_etcd_membership_uncached", lambda: state["member"])
+
+    assert fpa.local_node_is_etcd_member() is False
+    state["member"] = True  # k3s stamps node-role.kubernetes.io/etcd
+    assert fpa.local_node_is_etcd_member() is True
+    assert fpa.would_self_partition(AGENT_BODY, is_etcd_member=True) is True
+
+
+def test_true_is_cached_so_a_healthy_member_does_not_re_probe(monkeypatch) -> None:
+    """A stale True only delays narrowing after a real demote — the safe
+    direction, since the peer rule only over-permits to real cluster members."""
     calls = {"n": 0}
 
-    def probe_true() -> bool:
+    def probe() -> bool:
         calls["n"] += 1
         return True
 
-    monkeypatch.setattr(fpa, "_etcd_membership_uncached", probe_true)
+    monkeypatch.setattr(fpa, "_etcd_membership_uncached", probe)
     assert fpa.local_node_is_etcd_member() is True
     assert fpa.local_node_is_etcd_member() is True
-    assert calls["n"] == 1, "a known answer must be served from cache"
+    assert calls["n"] == 1
+
+
+def test_a_known_answer_survives_a_partition(monkeypatch) -> None:
+    """REGRESSION. The probe reads the apiserver ClusterIP (no hostNetwork), so
+    a partitioned node cannot reach it. Without the persisted last-known answer
+    the guard fails open precisely when it is needed, and the node then closes
+    2380 on itself and can never read membership again to reopen it."""
+    monkeypatch.setattr(fpa, "_etcd_membership_uncached", lambda: True)
+    assert fpa.local_node_is_etcd_member() is True  # persists "true"
+
+    fpa._reset_etcd_member_cache()  # cold cache: supervisor pod restarted
+    monkeypatch.setattr(fpa, "_etcd_membership_uncached", lambda: None)  # partition
+
+    assert fpa.local_node_is_etcd_member() is True
+    assert fpa.would_self_partition(AGENT_BODY, is_etcd_member=True) is True
+
+
+def test_a_demote_overwrites_the_persisted_answer(monkeypatch) -> None:
+    """Persistence must not pin a node to 'member' forever after a real demote."""
+    monkeypatch.setattr(fpa, "_etcd_membership_uncached", lambda: True)
+    assert fpa.local_node_is_etcd_member() is True
 
     fpa._reset_etcd_member_cache()
-    calls["n"] = 0
+    monkeypatch.setattr(fpa, "_etcd_membership_uncached", lambda: False)
+    assert fpa.local_node_is_etcd_member() is False
 
-    def probe_none() -> None:
-        calls["n"] += 1
-        return None
+    fpa._reset_etcd_member_cache()
+    monkeypatch.setattr(fpa, "_etcd_membership_uncached", lambda: None)
+    assert fpa.local_node_is_etcd_member() is False  # recalls the demote
 
-    monkeypatch.setattr(fpa, "_etcd_membership_uncached", probe_none)
-    assert fpa.local_node_is_etcd_member() is None
-    assert fpa.local_node_is_etcd_member() is None
-    assert calls["n"] == 2, "None must never be cached"
+
+def test_an_unwritable_sidecar_never_breaks_the_probe(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(fpa, "_ETCD_MEMBER_SIDECAR", tmp_path / "nope" / "x" / "member")
+    monkeypatch.setattr(tmp_path.__class__, "mkdir", _raise_oserror, raising=False)
+    monkeypatch.setattr(fpa, "_etcd_membership_uncached", lambda: True)
+    assert fpa.local_node_is_etcd_member() is True
+
+
+def _raise_oserror(*_a, **_k):
+    raise OSError("read-only")
 
 
 # ── observed_peer_cidrs ─────────────────────────────────────────────────────
@@ -202,8 +299,10 @@ def test_peer_recovery_excludes_self_and_emits_host_routes(monkeypatch) -> None:
         "list_control_plane_node_ips",
         lambda: ["192.168.0.199", "192.168.0.133", "192.168.0.125"],
     )
-    got = fpa.observed_peer_cidrs(["192.168.0.133"])
-    assert got == ["192.168.0.125/32", "192.168.0.199/32"]
+    assert fpa.observed_peer_cidrs(["192.168.0.133"]) == [
+        "192.168.0.125/32",
+        "192.168.0.199/32",
+    ]
 
 
 def test_peer_recovery_handles_ipv6_prefix_length(monkeypatch) -> None:
@@ -212,58 +311,74 @@ def test_peer_recovery_handles_ipv6_prefix_length(monkeypatch) -> None:
 
 
 def test_peer_recovery_is_empty_when_membership_is_unreadable(monkeypatch) -> None:
-    """Empty, not a guess — the refuse-to-apply guard is what protects us then."""
+    """Empty, not a guess — the refuse-to-apply guard protects us then."""
     monkeypatch.setattr(fpa, "list_control_plane_node_ips", lambda: None)
     assert fpa.observed_peer_cidrs(["192.168.0.133"]) == []
 
 
-# ── the real _maybe_apply_firewall path ─────────────────────────────────────
+def test_a_missing_ca_file_degrades_to_none_rather_than_raising(monkeypatch) -> None:
+    """k8s_api._request builds its HTTPSConnection (reading the CA via
+    _ssl_context) OUTSIDE the try that converts transport errors to
+    RuntimeError, so a missing ca.crt raises OSError straight through."""
+
+    def boom(method: str, path: str, timeout: float | None = None):
+        raise OSError("ca.crt: No such file or directory")
+
+    monkeypatch.setattr(fpa.k8s_api, "_request", boom)
+    assert fpa.list_control_plane_node_ips() is None
+
+
+# ── the real dispatch paths ─────────────────────────────────────────────────
 #
-# The unit tests above pin the predicates. These drive the actual function that
-# writes the trigger file the host runner consumes, because that write is what
-# partitioned ddi2.
+# The unit tests above pin the predicates. These drive the functions that
+# actually write the trigger file the host runner consumes, because that write
+# is what partitioned ddi2.
 
 
 def _wire(monkeypatch, tmp_path, *, is_member, live_members):
-    """Point the heartbeat's trigger paths at tmp_path and stub the world."""
     from spatium_supervisor import appliance_state, heartbeat
 
     trigger = tmp_path / "firewall-pending"
     monkeypatch.setattr(heartbeat, "_NFT_TRIGGER_PATH", trigger)
     monkeypatch.setattr(heartbeat, "_NFT_APPLIED_HASH_PATH", tmp_path / "applied-hash")
+    monkeypatch.setattr(
+        appliance_state, "_FIREWALL_REFUSAL_SIDECAR", tmp_path / "firewall-refused"
+    )
     monkeypatch.setattr(appliance_state, "detect_deployment_kind", lambda: "appliance")
     monkeypatch.setattr(appliance_state, "read_node_ips", lambda: ["192.168.0.133"])
     monkeypatch.setattr(fpa, "_etcd_membership_uncached", lambda: is_member)
     monkeypatch.setattr(fpa, "list_control_plane_node_ips", lambda: live_members)
     monkeypatch.setattr(fpa, "warn_on_peer_drift", lambda *a, **k: None)
-    return heartbeat, trigger
+    return heartbeat, appliance_state, trigger
 
 
 def test_a_live_etcd_member_never_writes_a_partitioning_trigger(
     monkeypatch, tmp_path
 ) -> None:
-    """THE #593 scenario end to end. Row says agent (no peers), kube API is
-    unreadable so recovery finds nothing, and the rendered body has no peer
-    rule. The trigger must NOT be written — the previous ruleset stands."""
+    """THE #593 scenario. Row says agent (no peers), the cluster is unreadable
+    so recovery finds nothing, and the body has no peer rule. Nothing is
+    written; the last-good ruleset stands."""
     import structlog
 
-    heartbeat, trigger = _wire(monkeypatch, tmp_path, is_member=True, live_members=None)
+    heartbeat, appliance_state, trigger = _wire(
+        monkeypatch, tmp_path, is_member=True, live_members=None
+    )
     heartbeat._maybe_apply_firewall(
         {"roles": ["dns_bind9"]}, structlog.get_logger("t"), []
     )
-    assert not trigger.exists(), "wrote a drop-in that would partition this etcd member"
+    assert not trigger.exists(), "wrote a drop-in that would partition this member"
+    state = appliance_state.read_firewall_state()
+    assert state and state["state"] == "refused_self_partition"
 
 
 def test_peer_recovery_rescues_the_render_when_membership_is_readable(
     monkeypatch, tmp_path
 ) -> None:
-    """Row still says agent, but the cluster can be read. We recover the peer
-    set from live membership, so the rendered body DOES open 2380 and the
-    trigger is written normally — the node keeps its firewall current AND
-    stays in raft."""
+    """Row still says agent, but the cluster can be read: recover the peer set,
+    re-render, and write a body that keeps this node in raft."""
     import structlog
 
-    heartbeat, trigger = _wire(
+    heartbeat, appliance_state, trigger = _wire(
         monkeypatch,
         tmp_path,
         is_member=True,
@@ -272,20 +387,20 @@ def test_peer_recovery_rescues_the_render_when_membership_is_readable(
     heartbeat._maybe_apply_firewall(
         {"roles": ["dns_bind9"]}, structlog.get_logger("t"), []
     )
-    assert trigger.exists(), "a recoverable peer set should still produce a drop-in"
+    assert trigger.exists()
     body = trigger.read_text()
     assert fpa.body_opens_etcd_peers(body)
     assert "192.168.0.199" in body and "192.168.0.125" in body
-    assert "192.168.0.133" not in body.split("k3s-peer")[0], "self must not be a peer"
+    assert appliance_state.read_firewall_state() is None, "healed node still flagged"
 
 
 def test_a_real_agent_node_still_gets_its_firewall(monkeypatch, tmp_path) -> None:
-    """The counter-property. A DNS agent appliance is not an etcd member, so the
-    peer-less body is correct and must be applied. A guard that failed closed
-    here would freeze the firewall on every non-etcd appliance."""
+    """Counter-property. A DNS agent appliance is not an etcd member, so the
+    peer-less body is correct and must be applied. Failing closed here would
+    freeze the firewall on every non-etcd appliance."""
     import structlog
 
-    heartbeat, trigger = _wire(
+    heartbeat, appliance_state, trigger = _wire(
         monkeypatch, tmp_path, is_member=False, live_members=None
     )
     heartbeat._maybe_apply_firewall(
@@ -293,3 +408,135 @@ def test_a_real_agent_node_still_gets_its_firewall(monkeypatch, tmp_path) -> Non
     )
     assert trigger.exists()
     assert not fpa.body_opens_etcd_peers(trigger.read_text())
+    assert appliance_state.read_firewall_state() is None
+
+
+def test_a_healthy_cp_node_never_probes_the_apiserver(monkeypatch, tmp_path) -> None:
+    """Efficiency + blast radius: a body that already opens 2380 needs no
+    membership read, so the steady-state control-plane heartbeat costs nothing."""
+    import structlog
+
+    heartbeat, _as, trigger = _wire(
+        monkeypatch, tmp_path, is_member=True, live_members=None
+    )
+    calls = {"n": 0}
+
+    def counted():
+        calls["n"] += 1
+        return True
+
+    monkeypatch.setattr(fpa, "_etcd_membership_uncached", counted)
+    heartbeat._maybe_apply_firewall(
+        {"roles": []},
+        structlog.get_logger("t"),
+        ["192.168.0.199/32"],
+        pod_cidrs=["10.42.0.0/16"],
+        service_cidrs=["10.43.0.0/16"],
+    )
+    assert trigger.exists()
+    assert fpa.body_opens_etcd_peers(trigger.read_text())
+    assert calls["n"] == 0, "probed the apiserver for a body that already opens 2380"
+
+
+def test_the_refusal_marker_clears_once_a_good_body_applies(
+    monkeypatch, tmp_path
+) -> None:
+    """A node that heals must stop reporting a divergence it no longer has."""
+    import structlog
+
+    heartbeat, appliance_state, _t = _wire(
+        monkeypatch, tmp_path, is_member=True, live_members=None
+    )
+    heartbeat._maybe_apply_firewall(
+        {"roles": ["dns_bind9"]}, structlog.get_logger("t"), []
+    )
+    assert appliance_state.read_firewall_state() is not None
+
+    monkeypatch.setattr(
+        fpa,
+        "list_control_plane_node_ips",
+        lambda: ["192.168.0.199", "192.168.0.133"],
+    )
+    heartbeat._maybe_apply_firewall(
+        {"roles": ["dns_bind9"]}, structlog.get_logger("t"), []
+    )
+    assert appliance_state.read_firewall_state() is None
+
+
+# ── bundle-first dispatch: a refusal must FALL THROUGH, not just skip ───────
+
+
+def _bundle(conf: str) -> dict:
+    return {"config_hash": "abc123", "firewall_conf": conf}
+
+
+def test_bundle_is_used_when_its_body_opens_the_peer_port(monkeypatch, tmp_path) -> None:
+    import structlog
+
+    heartbeat, _as, _t = _wire(monkeypatch, tmp_path, is_member=True, live_members=None)
+    assert (
+        heartbeat._server_firewall_body_is_usable(
+            _bundle(CP_BODY), structlog.get_logger("t")
+        )
+        is True
+    )
+
+
+def test_bundle_is_used_on_a_plain_agent_node(monkeypatch, tmp_path) -> None:
+    """A peer-less body is correct there; refusing would freeze its firewall."""
+    import structlog
+
+    heartbeat, _as, _t = _wire(monkeypatch, tmp_path, is_member=False, live_members=None)
+    assert (
+        heartbeat._server_firewall_body_is_usable(
+            _bundle(AGENT_BODY), structlog.get_logger("t")
+        )
+        is True
+    )
+
+
+def test_bundle_is_refused_and_falls_through_on_a_live_etcd_member(
+    monkeypatch, tmp_path
+) -> None:
+    """REGRESSION (#593 review finding 5). Refusing the server body must return
+    False so heartbeat_once runs the IN-POD renderer, which can recover peers.
+    Merely declining to write would strand the member forever, because the
+    control plane re-renders the same wrong body from the same stale row."""
+    import structlog
+
+    heartbeat, appliance_state, _t = _wire(
+        monkeypatch, tmp_path, is_member=True, live_members=None
+    )
+    assert (
+        heartbeat._server_firewall_body_is_usable(
+            _bundle(AGENT_BODY), structlog.get_logger("t")
+        )
+        is False
+    )
+    state = appliance_state.read_firewall_state()
+    assert state and state["source"] == "control-plane"
+
+
+def test_no_server_authority_means_no_bundle(monkeypatch, tmp_path) -> None:
+    import structlog
+
+    heartbeat, _as, _t = _wire(monkeypatch, tmp_path, is_member=True, live_members=None)
+    log = structlog.get_logger("t")
+    assert heartbeat._server_firewall_body_is_usable(None, log) is False
+    assert heartbeat._server_firewall_body_is_usable({}, log) is False
+    assert heartbeat._server_firewall_body_is_usable({"config_hash": ""}, log) is False
+
+
+def test_a_healthy_cp_bundle_never_probes_the_apiserver(monkeypatch, tmp_path) -> None:
+    import structlog
+
+    heartbeat, _as, _t = _wire(monkeypatch, tmp_path, is_member=True, live_members=None)
+    calls = {"n": 0}
+
+    def counted():
+        calls["n"] += 1
+        return True
+
+    monkeypatch.setattr(fpa, "_etcd_membership_uncached", counted)
+    heartbeat._server_firewall_body_is_usable(_bundle(CP_BODY), structlog.get_logger("t"))
+    assert calls["n"] == 0

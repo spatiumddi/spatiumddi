@@ -1070,6 +1070,11 @@ class SupervisorHeartbeatRequest(BaseModel):
     # are the ``users`` string from ``ss -p`` (process name / pid).
     # None / omitted = supervisor didn't run the probe this tick.
     port_conflicts: dict[str, str] | None = None
+    # #593 — the supervisor refused a firewall drop-in that would have closed
+    # etcd's peer port on a node k3s still calls an etcd member (a stale row).
+    # ``{}`` when healthy; None / omitted = an older supervisor didn't report,
+    # so the stored value is left untouched.
+    firewall_state: dict[str, str] | None = None
     # #170 Wave D follow-up — outcome of the supervisor's last
     # compose-lifecycle apply (``idle`` / ``ready`` / ``failed``).
     # None on the first heartbeat / before any role assignment.
@@ -1677,6 +1682,11 @@ async def supervisor_heartbeat(
         # truth. Empty dict explicitly clears prior conflicts; the
         # operator-visible banner stops showing on the next render.
         row.port_conflicts = dict(body.port_conflicts)
+    if body.firewall_state is not None:
+        # #593 — same contract as port_conflicts: overwrite verbatim, and an
+        # empty dict is the supervisor telling us the node has healed. Only a
+        # missing key (old supervisor) leaves the stored value alone.
+        row.firewall_state = dict(body.firewall_state)
     if body.role_switch_state is not None:
         row.role_switch_state = body.role_switch_state
         # ``reason`` is paired with the state — clear it on idle /
@@ -2473,6 +2483,8 @@ class ApplianceRow(BaseModel):
     firewall_extra: str | None
     # #170 Phase E2 — supervisor-reported host-side port conflicts.
     port_conflicts: dict[str, str]
+    # #593 — refused self-partitioning firewall drop-in ({} when healthy).
+    firewall_state: dict[str, str]
     # #170 Wave D follow-up — outcome of the supervisor's last
     # compose-lifecycle apply.
     role_switch_state: str | None
@@ -2591,6 +2603,7 @@ def _row_to_schema(row: Appliance) -> ApplianceRow:
         tags=dict(row.tags or {}),
         firewall_extra=row.firewall_extra,
         port_conflicts=dict(row.port_conflicts or {}),
+        firewall_state=dict(row.firewall_state or {}),
         role_switch_state=row.role_switch_state,
         role_switch_reason=row.role_switch_reason,
         role_health=dict(row.role_health or {}),

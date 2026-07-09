@@ -371,32 +371,17 @@ def _maybe_apply_firewall(
     if appliance_state.detect_deployment_kind() != "appliance":
         return
 
-    # #593 — the control plane's row said "not a control-plane node" while this
-    # node was a live etcd member, so the render dropped the k3s-peer rule and
-    # the node firewalled itself out of its own cluster. When the row hands us
-    # no peers but k3s says we ARE an etcd member, recover the peer set from
-    # live membership instead of rendering a body that partitions us.
-    if not cluster_peer_cidrs:
-        try:
-            if firewall_peer_audit.local_node_is_etcd_member() is True:
-                recovered = firewall_peer_audit.observed_peer_cidrs(
-                    appliance_state.read_node_ips() or []
-                )
-                if recovered:
-                    log.warning(
-                        "supervisor.firewall.peer_cidrs_recovered",
-                        reason="control plane sent no peers but this node is a live etcd member",
-                        peers=recovered,
-                    )
-                    cluster_peer_cidrs = recovered
-        except Exception as exc:  # noqa: BLE001 — best-effort; guard below still fires
-            log.debug("supervisor.firewall.peer_recovery_failed", error=str(exc))
-
     # #285 Phase 5 — warn-only etcd/peer-drift cross-check. Throttled +
     # best-effort + run BEFORE the unchanged-body short-circuit, so a
     # membership change the peer set hasn't caught up to is surfaced even when
     # the local render is stable. Seed-only in practice — a non-seed node's
     # kubeapi read fails and the helper returns None (no-op).
+    #
+    # Deliberately keyed off the CONTROL PLANE's peer set, before any #593
+    # recovery below replaces it. Recovery derives its peers FROM live
+    # membership, so drift-checking the recovered set against that same
+    # membership can only ever report "no drift" — blinding the diagnostic
+    # exactly when the row/reality divergence it exists to surface is happening.
     global _last_peer_drift_at
     if (
         cluster_peer_cidrs
@@ -421,6 +406,56 @@ def _maybe_apply_firewall(
         web_ui_allowed_cidrs=web_ui_allowed_cidrs,
     )
     body = profile.body
+
+    # ── #593 — never render a body that firewalls this node out of raft ──
+    #
+    # Membership is probed ONLY when the body lacks a peer rule. A healthy
+    # control-plane node's body always has one, so it never touches the kube
+    # API here; a node whose body has none pays exactly one 2s-bounded GET per
+    # heartbeat, which is the price of never trusting a stale "not a member".
+    if not firewall_peer_audit.body_opens_etcd_peers(body):
+        is_etcd_member = firewall_peer_audit.local_node_is_etcd_member()
+
+        # Defence 1 — the row gave us no peers, but k3s says we ARE a member.
+        # Re-derive the peer set from live membership and re-render.
+        if is_etcd_member is True and not cluster_peer_cidrs:
+            recovered = firewall_peer_audit.observed_peer_cidrs(
+                appliance_state.read_node_ips() or []
+            )
+            if recovered:
+                log.warning(
+                    "supervisor.firewall.peer_cidrs_recovered",
+                    reason="control plane sent no peers but this node is a live etcd member",
+                    peers=recovered,
+                )
+                profile = render_drop_in(
+                    role_assignment,
+                    recovered,
+                    pod_cidrs=pod_cidrs,
+                    service_cidrs=service_cidrs,
+                    cp_member_count=cp_member_count,
+                    vip_configured=vip_configured,
+                    web_ui_allowed_cidrs=web_ui_allowed_cidrs,
+                )
+                body = profile.body
+
+        # Defence 2 — recovery was impossible (membership unreadable, or the
+        # kube API listed no other members). Refuse rather than partition:
+        # a stale peer rule only over-permits to real cluster members, while
+        # this body drops a voting member out of raft. Non-negotiable #5.
+        if firewall_peer_audit.would_self_partition(body, is_etcd_member=is_etcd_member):
+            reason = (
+                "rendered drop-in has no etcd peer rule but this node is a live "
+                "etcd member; keeping the last-good ruleset"
+            )
+            log.error(
+                "supervisor.firewall.refused_self_partition",
+                profile=profile.name,
+                reason=reason,
+            )
+            appliance_state.record_firewall_refusal("in-pod", reason)
+            return
+
     body_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
 
     # Read the applied-hash sidecar the host runner writes. Matching
@@ -433,22 +468,7 @@ def _maybe_apply_firewall(
         applied_hash = ""
 
     if applied_hash == body_hash:
-        return
-
-    # #593 — last line of defence, checked only for a body we are about to
-    # WRITE (an unchanged body short-circuits above, so this costs nothing on a
-    # steady-state heartbeat). Even after the peer recovery above — which is a
-    # no-op when the kube API is unreadable — never write a drop-in that closes
-    # etcd's peer port on a node k3s still calls an etcd member. Leaving the
-    # previous ruleset in place is strictly safer: a stale peer rule only ever
-    # over-permits to real cluster members, whereas applying this body drops a
-    # voting member out of raft.
-    if firewall_peer_audit.would_self_partition(body):
-        log.error(
-            "supervisor.firewall.refused_self_partition",
-            profile=profile.name,
-            reason="rendered drop-in has no etcd peer rule but this node is a live etcd member",
-        )
+        appliance_state.clear_firewall_refusal()
         return
 
     try:
@@ -460,6 +480,10 @@ def _maybe_apply_firewall(
         # rename ensures the runner sees a complete trigger file
         # rather than a half-written one.
         tmp.replace(_NFT_TRIGGER_PATH)
+        # #593 — a body we were willing to write is, by construction, one that
+        # doesn't partition us. Drop any refusal marker so a healed node stops
+        # reporting a divergence it no longer has.
+        appliance_state.clear_firewall_refusal()
         log.info(
             "supervisor.firewall.trigger_written",
             profile=profile.name,
@@ -468,6 +492,48 @@ def _maybe_apply_firewall(
         )
     except OSError as exc:
         log.warning("supervisor.firewall.trigger_write_failed", error=str(exc))
+
+
+def _server_firewall_body_is_usable(
+    fw_settings: object, log: structlog.stdlib.BoundLogger
+) -> bool:
+    """#285 Phase 2a bundle-first dispatch, with the #593 guard (#5).
+
+    False means "don't pipe the server's body" — either because the control
+    plane has no firewall authority (old control plane, or ``firewall_enabled``
+    off), or because that body would firewall this node out of its own cluster.
+
+    The distinction that matters: a refusal must fall through to the IN-POD
+    renderer, not merely skip the write. The server renders from the appliance
+    ROW, so a stale row ships the same peer-less body on every tick, forever;
+    and since #285 Phase 1b removed the LAN-wide accept from the base config,
+    a node that joined while its row was already wrong has no last-good ruleset
+    to fall back on. The in-pod path can re-derive the peer set from live
+    membership and produce a body that keeps this node in raft.
+
+    The structural test runs first, so a body that already opens 2380 — every
+    healthy control-plane node — costs no apiserver read.
+    """
+    if not isinstance(fw_settings, dict) or not fw_settings.get("config_hash"):
+        return False
+
+    conf = str(fw_settings.get("firewall_conf") or "")
+    if firewall_peer_audit.body_opens_etcd_peers(conf):
+        return True
+    if firewall_peer_audit.local_node_is_etcd_member() is not True:
+        return True
+
+    reason = (
+        "server-rendered drop-in has no etcd peer rule but this node is a live "
+        "etcd member; re-deriving peers locally"
+    )
+    log.error(
+        "supervisor.firewall.refused_self_partition",
+        source="control-plane",
+        reason=reason,
+    )
+    appliance_state.record_firewall_refusal("control-plane", reason)
+    return False
 
 
 def heartbeat_once(
@@ -501,6 +567,13 @@ def heartbeat_once(
         # if the conflict went away. The probe is cheap (``ss``) so
         # running it every heartbeat is fine.
         "port_conflicts": probe_port_conflicts(),
+        # #593 — a self-partition refusal, or {} when healthy. Without this the
+        # guard is silent: the control plane keeps re-shipping the same wrong
+        # body from the same stale row and nothing surfaces the divergence.
+        # ``{}`` (not None) so a healed node explicitly CLEARS the row, exactly
+        # as port_conflicts does; None is reserved for "an old supervisor didn't
+        # report", which must leave the stored value untouched.
+        "firewall_state": appliance_state.read_firewall_state() or {},
         # #272 Phase 9 — report the k8s Nodes this seed evicted on prior
         # ticks so the backend clears their ``evict_requested`` flag +
         # settles them to ``left``. Empty on non-seed / nothing-evicted.
@@ -1006,7 +1079,9 @@ def heartbeat_once(
     # this is what makes the rolling upgrade (supervisor/control-plane skew in
     # either direction) safe.
     fw_settings = body_out.get("firewall_settings")
-    if isinstance(fw_settings, dict) and fw_settings.get("config_hash"):
+    use_bundle = _server_firewall_body_is_usable(fw_settings, log)
+
+    if use_bundle:
         if appliance_state.maybe_fire_firewall_reload(fw_settings):
             log.info(
                 "supervisor.heartbeat.firewall_trigger_fired", source="control-plane"

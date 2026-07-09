@@ -3829,6 +3829,12 @@ function ApplianceRoleAssignmentSection({
           chosen role would bind. */}
       <PortConflictBanner row={row} roles={roles} />
 
+      {/* #593 — the supervisor blocked a firewall drop-in that would have
+          firewalled this node out of its own etcd cluster. Always shown when
+          present: it means the appliance row disagrees with what k3s reports,
+          so the node is running a stale ruleset until an operator reconciles. */}
+      <FirewallRefusalBanner row={row} />
+
       {/* #170 Wave D follow-up — outcome of the supervisor's last
           docker-compose apply. Red banner with stderr-first-line on
           failure. Green-tinted chip on ready. */}
@@ -5182,6 +5188,52 @@ function PortConflictBanner({
               </li>
             ))}
           </ul>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── FirewallRefusalBanner (#593) ────────────────────────────────
+
+/**
+ * The supervisor refused to apply a firewall drop-in that would have closed
+ * etcd's raft peer port on this node while k3s still labels it an etcd member.
+ *
+ * This is a row-vs-reality divergence: the control plane believes the node is
+ * not a cluster member and keeps re-rendering a peer-less body from that belief.
+ * The supervisor blocks it (a stale peer rule only over-permits to real cluster
+ * members; applying the body would drop a voting member out of raft), but the
+ * divergence itself only an operator can fix — hence a persistent banner rather
+ * than a log line nobody reads.
+ */
+function FirewallRefusalBanner({ row }: { row: ApplianceRow }) {
+  const state = row.firewall_state ?? {};
+  if (state.state !== "refused_self_partition") return null;
+  const source =
+    state.source === "control-plane"
+      ? "the control plane's rendered firewall"
+      : "the locally rendered firewall";
+  return (
+    <div className="mt-4 rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-xs">
+      <div className="flex items-start gap-2">
+        <AlertCircle className="mt-0.5 h-4 w-4 flex-shrink-0 text-amber-700 dark:text-amber-300" />
+        <div>
+          <p className="font-medium text-amber-700 dark:text-amber-300">
+            Firewall blocked — it would have partitioned this node from etcd
+          </p>
+          <p className="mt-1 text-muted-foreground">
+            The supervisor rejected {source} because it did not open etcd&apos;s
+            peer port, while k3s still reports this node as an etcd member. The
+            node is running its last-good ruleset. This means this
+            appliance&apos;s stored cluster role disagrees with the live cluster
+            — re-check its role assignment, or clear a stuck cluster transition.
+          </p>
+          {state.reason ? (
+            <p className="mt-2 font-mono text-[11px] text-muted-foreground">
+              {state.reason}
+            </p>
+          ) : null}
         </div>
       </div>
     </div>

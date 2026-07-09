@@ -9923,6 +9923,11 @@ export interface ApplianceRow {
   // ``udp_67``); values are the ss ``users`` string (pid+name when
   // available, else local-address fallback).
   port_conflicts: Record<string, string>;
+  // #593 — the supervisor refused a firewall drop-in that would have closed
+  // etcd's raft peer port on this node while k3s still considers it an etcd
+  // member (a stale / diverged appliance row). `{}` when healthy; otherwise
+  // `{ state: "refused_self_partition", source, reason }`.
+  firewall_state: Record<string, string>;
   // #170 Wave D follow-up — outcome of the supervisor's last
   // docker-compose lifecycle apply. ``idle`` / ``ready`` / ``failed``
   // or null on the first heartbeat / before any role assignment.

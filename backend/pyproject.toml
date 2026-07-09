@@ -96,6 +96,13 @@ dev = [
     "mypy>=1.13.0",
     "types-croniter>=3.0.0",
     "types-paramiko>=3.4.0",
+    # tests/test_spatium_console.py loads the appliance console host script by
+    # path; these are ITS runtime deps, not the API's. Without them the module
+    # importorskip'd itself and the whole console suite skipped silently in CI
+    # — including the #592 regression guard, which is the one thing stopping a
+    # node-local pod filter from quietly coming back.
+    "rich>=13.0.0",
+    "psutil>=5.9.0",
 ]
 
 [tool.ruff]

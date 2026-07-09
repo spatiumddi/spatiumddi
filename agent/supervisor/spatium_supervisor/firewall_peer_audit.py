@@ -23,12 +23,13 @@ import os
 import re
 import time
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
 import structlog
 
-from . import k8s_api
+from . import firewall_renderer, k8s_api
 
 log = structlog.get_logger(__name__)
 
@@ -40,14 +41,33 @@ _CP_LABEL = "node-role.kubernetes.io/control-plane"
 # — it is a statement about reality, not about the control plane's row.
 _ETCD_LABEL = "node-role.kubernetes.io/etcd"
 
-# etcd's raft peer port. Its presence in an accept rule is what distinguishes a
-# drop-in that keeps this node in the cluster from one that partitions it.
-_ETCD_PEER_PORT = "2380"
-# Whole-number match so "12380" can't pass for "2380".
-_ETCD_PEER_PORT_RE = re.compile(rf"(?<!\d){_ETCD_PEER_PORT}(?!\d)")
-# nftables' own comment clause — not a "#" comment, and it survives naive
-# stripping. ``comment "ssh; not 2380"`` must not read as an etcd accept.
+# etcd's raft peer port. Single source of truth is the renderer's port tuple,
+# so a future change there can't leave this audit checking a stale port while
+# the rendered rule opens a different one.
+_ETCD_PEER_PORT = str(firewall_renderer.ETCD_PEER_PORT)
+
+# nftables' own comment clause. NOT a "#" comment, and it must be stripped
+# BEFORE splitting on "#", or a comment containing a "#" leaves an unterminated
+# quote that this regex can no longer match — the comment's text then survives
+# into the code and `comment "port 2380 #note"` reads as an etcd accept.
 _NFT_COMMENT_RE = re.compile(r'comment\s+"[^"]*"')
+
+# The port must appear in a DESTINATION-PORT position, not merely somewhere on
+# an accept line. `ip6 saddr { fd00:2380::/64 } tcp dport 6443 accept` opens
+# 6443 only, yet a bare number match finds "2380" in the address hextet
+# (bracketed by ':' — not digits — so a \d-boundary guard does not help).
+# Captures either a set `{ 2379, 2380, 10250 }` or a single token `2380`.
+_DPORT_RE = re.compile(r"\bdport\s+(\{[^}]*\}|\S+)")
+# Whole-number match inside that capture, so "12380" can't pass for "2380" and
+# a range endpoint like "2379-2380" still counts.
+_ETCD_PEER_PORT_RE = re.compile(rf"(?<!\d){_ETCD_PEER_PORT}(?!\d)")
+
+# Sub-2s so a wedged apiserver can't stall the heartbeat loop — the same
+# reasoning (and value) as k8s_api.check_kubeapi_ready, whose default we would
+# otherwise inherit at 10s. ``None`` is never cached, so a 10s connect timeout
+# would be re-paid on every heartbeat for the whole outage.
+_KUBEAPI_TIMEOUT_S = 2.0
+
 
 
 def compute_peer_drift(
@@ -103,8 +123,13 @@ def list_control_plane_node_ips() -> list[str] | None:
     """Live control-plane node InternalIPs via the kube API, or None when the
     API is unreachable (non-seed node / kubeapi down) — best-effort."""
     try:
-        status, body = k8s_api._request("GET", "/api/v1/nodes")
-    except RuntimeError:
+        status, body = k8s_api._request("GET", "/api/v1/nodes", timeout=_KUBEAPI_TIMEOUT_S)
+    except (RuntimeError, OSError):
+        # OSError is NOT redundant: k8s_api._request builds its HTTPSConnection
+        # (and reads the CA via _ssl_context) OUTSIDE the try that converts
+        # transport errors to RuntimeError, so a missing/unreadable ca.crt
+        # raises straight through. Its sibling _etcd_membership_uncached
+        # already catches both.
         return None
     if status != 200:
         return None
@@ -140,12 +165,72 @@ def list_control_plane_node_ips() -> list[str] | None:
 # closing the peer port on a live member drops it out of raft, which on a
 # 3-node cluster leaves you one node from losing quorum.
 #
-# So the peer rule is keyed off OBSERVED LOCAL STATE, with two defences:
+# So the peer rule is keyed off OBSERVED LOCAL STATE, with three defences:
 #   1. recover a peer set from live membership when the row supplies none
 #   2. refuse to apply any body that would close 2380 on a node that k3s says
 #      is an etcd member — better a stale-but-open ruleset than a self-inflicted
 #      partition (and non-negotiable #5: keep serving when the control plane is
-#      wrong or unreachable).
+#      wrong or unreachable)
+#   3. remember the last KNOWN membership on disk, because the probe itself
+#      depends on the network. k8s_api reads the apiserver ClusterIP (the
+#      supervisor pod has no hostNetwork, so there is no local-apiserver path
+#      to use — k8s_proxy's "127.0.0.1:6443" docstring notwithstanding, it also
+#      dials cfg.host). A partitioned node therefore cannot probe, and without
+#      a memory the guard would fail open exactly when it is needed.
+
+
+# Last KNOWN membership, persisted across supervisor restarts on the host bind
+# mount. The apiserver read below goes to the ``kubernetes`` Service ClusterIP
+# (k8s_api resolves KUBERNETES_SERVICE_HOST; the supervisor DaemonSet has no
+# hostNetwork), so kube-proxy may DNAT it to ANY apiserver endpoint — possibly
+# a remote one. On a node partitioned at the network layer, i.e. exactly the
+# fault this module guards, that read fails and the probe returns None.
+#
+# Without a memory of what we last knew, `None` would mean "don't know", the
+# guard would fail open, and the partitioned member would firewall its own
+# 2380 shut — after which it can never read membership again to reopen it.
+# So a successful probe is written to disk, and an unreadable apiserver falls
+# back to that last-known answer instead of to ignorance.
+_ETCD_MEMBER_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/etcd-member")
+
+
+def _remember_membership(value: bool) -> None:
+    """Persist a KNOWN membership answer. Best-effort: a read-only or missing
+    release-state dir must never break the firewall path."""
+    try:
+        _ETCD_MEMBER_SIDECAR.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _ETCD_MEMBER_SIDECAR.with_name(_ETCD_MEMBER_SIDECAR.name + ".new")
+        tmp.write_text("true\n" if value else "false\n", encoding="utf-8")
+        tmp.replace(_ETCD_MEMBER_SIDECAR)
+    except OSError as exc:
+        log.debug("supervisor.firewall.membership_persist_failed", error=str(exc))
+
+
+def _recall_membership() -> bool | None:
+    try:
+        text = _ETCD_MEMBER_SIDECAR.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if text == "true":
+        return True
+    if text == "false":
+        return False
+    return None
+
+
+# Membership changes only on promote/demote, while the firewall path runs every
+# heartbeat. Cache the answer — but ONLY ``True``.
+#
+# A stale ``True`` merely delays narrowing the firewall after a real demote,
+# and the peer rule only ever over-permits to real cluster members. A stale
+# ``False`` IS the #593 bug: a node promoted to etcd server whose control-plane
+# row hasn't caught up would read the cached "not a member", pass the guard,
+# and firewall its own raft port shut. That is the precise "half-landed
+# promote" case this module exists for, so ``False`` is always re-probed.
+# ``None`` is never cached either — an unreachable apiserver must be retried,
+# not remembered as "don't know".
+_ETCD_MEMBER_TTL_S = 300.0
+_etcd_member_cache: tuple[float, bool] | None = None
 
 
 def _etcd_membership_uncached() -> bool | None:
@@ -153,7 +238,9 @@ def _etcd_membership_uncached() -> bool | None:
     if not node_name:
         return None
     try:
-        status, body = k8s_api._request("GET", f"/api/v1/nodes/{quote(node_name)}")
+        status, body = k8s_api._request(
+            "GET", f"/api/v1/nodes/{quote(node_name)}", timeout=_KUBEAPI_TIMEOUT_S
+        )
     except (RuntimeError, OSError):
         return None
     if status != 200:
@@ -166,36 +253,41 @@ def _etcd_membership_uncached() -> bool | None:
     return _ETCD_LABEL in labels
 
 
-# Membership changes only on promote/demote, but the firewall path runs on
-# every heartbeat — cache so we don't GET the node object each tick. The TTL
-# is safe in one direction only, and that's the direction we want: a stale
-# ``True`` briefly DELAYS narrowing the firewall after a real demote (harmless
-# — the peer rule only ever over-permits to real cluster members), while a
-# stale ``False`` would be the #593 bug itself. Never cache ``None``: an
-# unreachable apiserver must be re-probed, not remembered as "don't know".
-_ETCD_MEMBER_TTL_S = 30.0
-_etcd_member_cache: tuple[float, bool] | None = None
-
-
 def local_node_is_etcd_member() -> bool | None:
     """Does k3s consider THIS node an embedded-etcd server?
 
-    Reads the local node's own labels. ``None`` when the answer is unknowable
-    (no NODE_NAME, kube API unreachable, non-k3s) — callers must treat None as
-    "don't know", never as "no", or they reintroduce the bug on any node whose
-    apiserver is briefly unreachable.
+    Reads the local node's own labels. Falls back to the last KNOWN answer
+    (persisted on disk) when the apiserver is unreachable, so a node that was a
+    member before a partition still knows it is one during the partition.
 
-    Survives the partition it guards against: on a control-plane node the kube
-    API being read is served by the local apiserver.
+    ``None`` only when we have never successfully probed (fresh install, no
+    NODE_NAME, non-k3s). Callers must treat ``None`` as "don't know", never as
+    "no" — the guard fails open there, which is correct for a plain agent
+    appliance and would otherwise freeze the firewall on every non-etcd node.
     """
     global _etcd_member_cache
     now = time.monotonic()
-    if _etcd_member_cache is not None and now - _etcd_member_cache[0] < _ETCD_MEMBER_TTL_S:
-        return _etcd_member_cache[1]
+    if (
+        _etcd_member_cache is not None
+        and _etcd_member_cache[1] is True
+        and now - _etcd_member_cache[0] < _ETCD_MEMBER_TTL_S
+    ):
+        return True
+
     answer = _etcd_membership_uncached()
     if answer is not None:
-        _etcd_member_cache = (now, answer)
-    return answer
+        _etcd_member_cache = (now, answer) if answer else None
+        _remember_membership(answer)
+        return answer
+
+    remembered = _recall_membership()
+    if remembered is not None:
+        log.warning(
+            "supervisor.firewall.membership_probe_unreachable",
+            using_last_known=remembered,
+            reason="kube apiserver unreadable; falling back to persisted membership",
+        )
+    return remembered
 
 
 def _reset_etcd_member_cache() -> None:
@@ -205,26 +297,41 @@ def _reset_etcd_member_cache() -> None:
 
 
 def body_opens_etcd_peers(body: str) -> bool:
-    """True when `body` has at least one accept rule covering etcd's raft peer
-    port.
+    """True when `body` has at least one accept rule whose DESTINATION PORT
+    covers etcd's raft peer port.
 
-    Two ways to get a false positive, both of which would let the guard wave
-    through a body that partitions the node — the dangerous direction:
+    Every subtlety here exists because a false positive is the dangerous
+    direction: it tells `would_self_partition` the body is safe, and a live
+    etcd member then firewalls itself out of raft.
 
-    * ``#`` comments. The renderer's header block names 2379/2380 in prose.
-    * nftables ``comment "..."`` clauses, which are NOT ``#`` comments and so
-      survive naive stripping. A rule commented ``"ssh; not 2380"`` would read
-      as an etcd accept.
+    * nftables ``comment "..."`` clauses are stripped FIRST. They are not
+      ``#`` comments, and splitting on ``#`` first would truncate a comment
+      containing one (``comment "port 2380 #note"``) into an unterminated
+      quote this regex can no longer match — leaking the comment's text, and
+      its ``2380``, into the code.
+    * ``#`` comments go next: the renderer's header names 2379/2380 in prose.
+    * The port must sit in a ``dport`` position. ``ip6 saddr { fd00:2380::/64 }
+      tcp dport 6443 accept`` opens only 6443, but a bare number match finds
+      ``2380`` in the address hextet — it is bracketed by ``:``, not digits, so
+      a digit-boundary guard does not save you.
+    * Inside the dport capture the port is matched as a whole number, so
+      ``12380`` cannot pass and a range endpoint (``2379-2380``) still counts.
 
-    Both are stripped before matching, and the port is matched as a whole
-    number so ``12380`` can't stand in for ``2380``.
+    Known conservative gaps, all in the SAFE direction (a false negative makes
+    the guard refuse a legitimate body, which leaves the last-good ruleset in
+    place rather than partitioning the node): a rule split across physical
+    lines with a trailing ``\\``, a numeric range that merely spans 2380
+    (``2000-3000``), and a named port set (``tcp dport @etcd_ports``). Today's
+    renderer emits one single-line rule per accept with a literal port set, so
+    none of these occur; if that changes, the guard fails closed and loudly.
     """
     for raw in body.splitlines():
-        code = _NFT_COMMENT_RE.sub("", raw.split("#", 1)[0]).strip()
+        code = _NFT_COMMENT_RE.sub("", raw).split("#", 1)[0].strip()
         if not code or "accept" not in code:
             continue
-        if _ETCD_PEER_PORT_RE.search(code):
-            return True
+        for match in _DPORT_RE.finditer(code):
+            if _ETCD_PEER_PORT_RE.search(match.group(1)):
+                return True
     return False
 
 
@@ -248,14 +355,18 @@ def observed_peer_cidrs(self_ips: Iterable[str]) -> list[str]:
     return sorted(set(out))
 
 
-def would_self_partition(body: str) -> bool:
-    """True when applying `body` would close etcd's peer port on a node that
-    k3s says is a live etcd member.
+def would_self_partition(body: str, *, is_etcd_member: bool | None) -> bool:
+    """True when applying `body` would close etcd's peer port on a live member.
 
-    False whenever membership is unknown — an unreadable kube API must not
-    block a legitimate firewall update on a plain agent node.
+    PURE — membership is passed in, never probed here, so a caller performs at
+    most one apiserver read per firewall dispatch and the decision is trivially
+    testable.
+
+    False whenever membership is unknown: an unreadable kube API must not block
+    a legitimate firewall update on a plain agent appliance, which would freeze
+    the ruleset on every non-etcd node.
     """
-    if local_node_is_etcd_member() is not True:
+    if is_etcd_member is not True:
         return False
     return not body_opens_etcd_peers(body)
 
