@@ -1487,8 +1487,20 @@ def _record_cluster_transition_fire(trigger_file: Path, fingerprint: str) -> Non
 def _reset_cluster_transition_attempts(trigger_file: Path) -> None:
     try:
         _fire_state_path(trigger_file).unlink()
-    except OSError:
-        pass
+    except FileNotFoundError:
+        # Expected on the overwhelming majority of ticks: no ledger exists
+        # until a transition actually fires, and this runs on every idle
+        # heartbeat. Not a failure.
+        return
+    except OSError as exc:
+        # A ledger we cannot clear means a later re-drive of the SAME
+        # transition could inherit an exhausted budget and silently never
+        # fire, so this is worth surfacing rather than swallowing.
+        log.warning(
+            "supervisor.cluster_transition.ledger_reset_failed",
+            trigger=trigger_file.name,
+            error=str(exc),
+        )
 
 
 def reset_cluster_join_attempts() -> None:
@@ -1658,8 +1670,18 @@ def mark_cluster_join_state_consumed() -> None:
     try:
         if _CLUSTER_JOIN_STATE_CONSUMED.read_text(encoding="utf-8").strip() == identity:
             return
-    except OSError:
+    except FileNotFoundError:
+        # No marker yet — the common first-consume path. Fall through and
+        # write one.
         pass
+    except OSError as exc:
+        # Marker exists but is unreadable. Fall through and rewrite it: a
+        # marker we cannot read is indistinguishable from one that doesn't
+        # match, and re-reporting a stale ``failed`` is the failure mode we
+        # are here to prevent.
+        log.warning(
+            "supervisor.cluster_join.consumed_marker_unreadable", error=str(exc)
+        )
     try:
         # with_name(), not with_suffix() — the latter would REPLACE the
         # ".consumed" suffix rather than append, landing the temp file on

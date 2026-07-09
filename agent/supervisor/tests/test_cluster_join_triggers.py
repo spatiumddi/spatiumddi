@@ -304,6 +304,30 @@ def test_left_is_never_retired(appliance_paths: Path) -> None:
     assert not (appliance_paths / "cluster-join.state.consumed").exists()
 
 
+def test_mark_consumed_rewrites_an_unreadable_marker(appliance_paths: Path) -> None:
+    """An unreadable marker is indistinguishable from a non-matching one, so
+    it must be rewritten — otherwise a stale ``failed`` keeps being reported,
+    which is exactly the failure the marker exists to prevent."""
+    state = appliance_paths / "cluster-join.state"
+    state.write_text("failed\tboom")
+    # A directory where the marker file should be: read_text raises
+    # IsADirectoryError (an OSError), not FileNotFoundError.
+    marker = appliance_paths / "cluster-join.state.consumed"
+    marker.mkdir()
+
+    appliance_state.mark_cluster_join_state_consumed()  # must not raise
+    # The rewrite can't clobber a directory, so the verdict still reports —
+    # degraded but never silent, and never a wipe.
+    assert appliance_state.read_cluster_join_state() == ("failed", "boom")
+
+
+def test_reset_tolerates_an_absent_ledger_every_tick(appliance_paths: Path) -> None:
+    """The idle heartbeat calls this on every tick of the appliance's life;
+    a missing ledger is the expected case, not an error."""
+    for _ in range(3):
+        appliance_state.reset_cluster_join_attempts()  # must not raise
+
+
 def test_mark_consumed_is_idempotent_and_does_not_rewrite(appliance_paths: Path) -> None:
     """It runs on every steady-state heartbeat; rewriting identical bytes
     would churn the flash-backed /var partition for the appliance's life."""
