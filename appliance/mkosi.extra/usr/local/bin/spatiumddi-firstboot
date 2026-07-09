@@ -30,6 +30,38 @@ CONTROL_MANIFEST="$K3S_MANIFESTS_DIR/spatium-control.yaml"
 METALLB_MANIFEST="$K3S_MANIFESTS_DIR/spatium-metallb.yaml"
 SPATIUMDDI_VERSION_FILE=/usr/lib/spatiumddi/spatiumddi-version
 
+# ── #590 — is this node an etcd member of ANOTHER node's cluster? ────────────
+# Written only by a SUCCESSFUL spatium-cluster-join, so its presence means
+# the seed's HelmCharts govern this cluster and this node owns none of them.
+#
+# This script runs on EVERY boot with no ordering against k3s.service (see
+# the mkdir note below), so on a joined member it would otherwise re-render
+# its own single-node manifests into the auto-deploy dir while k3s is coming
+# up. k3s's deploy controller then applies them CLUSTER-WIDE, clobbering the
+# seed's releases of the same name — the Addon CR is one cluster-scoped
+# object, so whichever node writes last wins.
+#
+# Observed live on a 3-node install after a simultaneous power cut: all three
+# nodes raced, a member's spatium-bootstrap.yaml won, and its values
+# (``cnpg: false`` + ``agentLanding: true``) UNINSTALLED the CloudNativePG
+# operator on a healthy cluster and parked an unschedulable nginx pod on the
+# frontend's :80. The Cluster CR kept reporting "healthy" because nothing was
+# left running to update its status.
+#
+# spatium-cluster-join already moves these manifests aside at join time; the
+# guards below are what keep firstboot from putting them back. NOTE we only
+# ever SKIP writing — never delete. A manifest removed while k3s is running
+# fires fsnotify, k3s deletes the Addon, and the wrangler finalizer
+# UNINSTALLS the release. (do_join is safe because it stops k3s first.)
+K3S_JOIN_DROPIN="${SPATIUM_K3S_JOIN_DROPIN:-/etc/rancher/k3s/config.yaml.d/spatium-cluster.yaml}"
+node_is_cluster_member() { [ -f "$K3S_JOIN_DROPIN" ]; }
+
+# Sourced by the unit tests to reach the helpers above without running any of
+# the boot-time side effects below. Mirrors spatium-cluster-join's guard.
+if [ "${SPATIUM_FIRSTBOOT_LIB:-}" = "1" ]; then
+    return 0 2>/dev/null || exit 0
+fi
+
 mkdir -p "$(dirname "$LOG")" "$(dirname "$STAMP")"
 exec >>"$LOG" 2>&1
 echo "=== spatiumddi-firstboot $(date -Iseconds) ==="
@@ -353,7 +385,14 @@ fi
 # match the chart's volume mount + the in-cluster cert-deployer
 # update path that the api uses on operator upload.
 TLS_CERT_MANIFEST="$K3S_MANIFESTS_DIR/spatium-appliance-tls.yaml"
-if [ ! -f "$TLS_CERT_MANIFEST" ]; then
+# #590 — on a joined member the ``[ ! -f ]`` guard below is always TRUE (the
+# join moved the manifest aside), so every reboot would mint a fresh
+# self-signed cert and overwrite the CLUSTER's spatium-appliance-tls Secret —
+# silently replacing an operator-uploaded or ACME-issued cert with this
+# node's throwaway one. The seed owns that Secret; a member must not write it.
+if node_is_cluster_member; then
+    echo "Joined cluster member — skipping self-signed TLS Secret manifest (the seed owns spatium-appliance-tls)."
+elif [ ! -f "$TLS_CERT_MANIFEST" ]; then
     HN_VAL=$(grep "^APPLIANCE_HOSTNAME=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2-)
     HN_VAL="${HN_VAL:-$(hostname 2>/dev/null || echo spatiumddi)}"
     IPS_VAL=$(grep "^APPLIANCE_HOST_IPS=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2-)
@@ -823,7 +862,18 @@ spec:
 EOF
 }
 
-case "$APPLIANCE_ROLE_VAL" in
+# #590 — a joined member renders NOTHING into the auto-deploy dir. Routed
+# through a separate variable so $APPLIANCE_ROLE_VAL keeps its real value for
+# the agent-landing page render further down.
+BOOTSTRAP_ROLE="$APPLIANCE_ROLE_VAL"
+if node_is_cluster_member; then
+    BOOTSTRAP_ROLE="joined-member"
+fi
+
+case "$BOOTSTRAP_ROLE" in
+    joined-member)
+        echo "Joined cluster member — skipping bootstrap manifest render; the seed's releases govern this cluster."
+        ;;
     appliance|application)
         if [ ! -f "$CHART_TGZ" ]; then
             echo "WARN: $CHART_TGZ missing — supervisor pod won't auto-deploy. Is the chart baked?"
