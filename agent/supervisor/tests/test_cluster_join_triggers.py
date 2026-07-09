@@ -135,6 +135,94 @@ def test_join_refires_after_the_runner_consumes_the_trigger(appliance_paths: Pat
     assert appliance_state.maybe_fire_cluster_join("member", "https://s:6443", "t") is True
 
 
+def test_join_never_refires_after_it_already_succeeded(appliance_paths: Path) -> None:
+    """REGRESSION GUARD (#590), observed live on a 1→3 promote.
+
+    The runner renames the trigger to ``.done`` the moment it succeeds, but
+    ``desired_cluster_role`` stays "member" until the backend sees a ``ready``
+    heartbeat and settles it. In that window the trigger file is gone and the
+    desired-state is still set — and the join re-fired, wiping the node's
+    freshly-joined k3s identity. On the real cluster: "JOIN ok" at 15:43:31,
+    re-fired at 15:43:58, second attempt failed. k3s counted the node as an
+    etcd member; the control plane counted it as nothing."""
+    trigger = appliance_paths / "cluster-join-pending"
+    state = appliance_paths / "cluster-join.state"
+    url = "https://10.0.0.1:6443"
+
+    assert appliance_state.maybe_fire_cluster_join("member", url, "t") is True
+    # Runner succeeds: writes ready + renames the trigger out of the way.
+    state.write_text(f"ready\t{url}")
+    trigger.rename(trigger.with_suffix(".done"))
+
+    # Heartbeat still carries desired=member (backend hasn't settled yet).
+    assert appliance_state.maybe_fire_cluster_join("member", url, "t") is False
+    assert not trigger.exists()
+
+
+def test_join_does_not_refire_while_the_runner_is_mid_flight(appliance_paths: Path) -> None:
+    """The runner writes ``joining`` at the top of its run and renames the
+    trigger before it finishes — so trigger-absence must not mean 'idle'."""
+    trigger = appliance_paths / "cluster-join-pending"
+    state = appliance_paths / "cluster-join.state"
+    url = "https://10.0.0.1:6443"
+
+    assert appliance_state.maybe_fire_cluster_join("member", url, "t") is True
+    state.write_text(f"joining\t{url}")
+    trigger.rename(trigger.with_suffix(".done"))
+
+    assert appliance_state.maybe_fire_cluster_join("member", url, "t") is False
+
+
+def test_join_refires_when_promoted_to_a_DIFFERENT_seed(appliance_paths: Path) -> None:
+    """``ready`` against seed A must not block a join to seed B. The .state
+    reason field carries the target, which is what makes this decidable."""
+    trigger = appliance_paths / "cluster-join-pending"
+    state = appliance_paths / "cluster-join.state"
+
+    assert appliance_state.maybe_fire_cluster_join("member", "https://a:6443", "t") is True
+    state.write_text("ready\thttps://a:6443")
+    trigger.rename(trigger.with_suffix(".done"))
+
+    assert appliance_state.maybe_fire_cluster_join("member", "https://a:6443", "t") is False
+    assert appliance_state.maybe_fire_cluster_join("member", "https://b:6443", "t") is True
+
+
+def test_join_still_retries_after_a_reported_failure(appliance_paths: Path) -> None:
+    """A ``failed`` verdict must NOT block a retry — only ready/joining do."""
+    trigger = appliance_paths / "cluster-join-pending"
+    state = appliance_paths / "cluster-join.state"
+    url = "https://10.0.0.1:6443"
+
+    assert appliance_state.maybe_fire_cluster_join("member", url, "t") is True
+    state.write_text("failed\tboom")
+    _consume(trigger)
+    assert appliance_state.maybe_fire_cluster_join("member", url, "t") is True
+
+
+def test_leave_never_refires_after_it_already_succeeded(appliance_paths: Path) -> None:
+    """do_leave runs the same destructive identity wipe and renames its
+    trigger on success — identical window, identical guard."""
+    trigger = appliance_paths / "cluster-leave-pending"
+    state = appliance_paths / "cluster-join.state"
+
+    assert appliance_state.maybe_fire_cluster_leave("none") is True
+    state.write_text("left\t")
+    trigger.rename(trigger.with_suffix(".done"))
+
+    assert appliance_state.maybe_fire_cluster_leave("none") is False
+
+
+def test_leave_does_not_refire_while_the_runner_is_mid_flight(appliance_paths: Path) -> None:
+    trigger = appliance_paths / "cluster-leave-pending"
+    state = appliance_paths / "cluster-join.state"
+
+    assert appliance_state.maybe_fire_cluster_leave("none") is True
+    state.write_text("leaving\t")
+    trigger.rename(trigger.with_suffix(".done"))
+
+    assert appliance_state.maybe_fire_cluster_leave("none") is False
+
+
 def test_join_stops_firing_at_the_attempt_ceiling(appliance_paths: Path) -> None:
     trigger = appliance_paths / "cluster-join-pending"
     for _ in range(appliance_state._CLUSTER_JOIN_MAX_ATTEMPTS):

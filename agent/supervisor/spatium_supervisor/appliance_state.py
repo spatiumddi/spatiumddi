@@ -1537,6 +1537,21 @@ def maybe_fire_cluster_join(
     ``_CLUSTER_JOIN_CONFIRM`` guardrail marker, then ``server_url``,
     then ``join_token``. The runner refuses any trigger whose first
     line isn't the marker, so a stray file can't fire a wipe.
+
+    #590 — trigger-file presence is NOT sufficient on its own. The runner
+    renames the trigger to ``.done`` the moment it succeeds, but
+    ``desired_cluster_role`` stays ``member`` until the backend sees a
+    ``ready`` heartbeat and settles it. In that window (trigger gone,
+    desired still set) the next heartbeat re-fired the join and wiped the
+    node's freshly-joined k3s identity. Observed live: a member reported
+    "JOIN ok" at 15:43:31 and re-fired at 15:43:58, and the second attempt
+    failed — leaving a node that k3s counted as an etcd member but the
+    control plane counted as nothing.
+
+    So also gate on what the runner last wrote. ``.state`` carries the
+    target it acted on in its reason field (``ready\\t<server_url>``), which
+    is what lets us tell "already joined THIS seed" apart from "promoted to
+    a different seed and must re-join".
     """
     if detect_deployment_kind() != "appliance":
         return False
@@ -1553,11 +1568,22 @@ def maybe_fire_cluster_join(
         return False
     if _CLUSTER_JOIN_TRIGGER_FILE.exists():
         return False
-    # #590 — failure ceiling. The runner renames a failed trigger out of the
-    # way, so trigger-file presence alone can't stop a doomed join from
-    # re-wiping this node's k3s state on every heartbeat. Budget is per
-    # target: a promote against a different seed (or a re-promote after the
-    # ledger is reset) starts over.
+    # #590 — don't re-run a join the runner has already finished (or is still
+    # running). The trigger file is gone in both cases, so it cannot tell us.
+    state, target = read_cluster_join_state()
+    if state == "joining":
+        # Runner is mid-flight: it renames the trigger BEFORE it finishes.
+        return False
+    if state == "ready" and (target or "") == server_url:
+        # Already a member of this exact seed. The backend clears the
+        # desired-state once it sees the ``ready`` heartbeat; until then,
+        # firing again would wipe the identity we just built.
+        return False
+    # Failure ceiling. The runner renames a failed trigger out of the way, so
+    # trigger-file presence alone can't stop a doomed join from re-wiping this
+    # node's k3s state on every heartbeat. Budget is per target: a promote
+    # against a different seed (or a re-promote after the ledger is reset)
+    # starts over.
     fingerprint = _join_target_fingerprint(server_url, join_token)
     if not _cluster_transition_should_fire(_CLUSTER_JOIN_TRIGGER_FILE, fingerprint):
         return False
@@ -1602,6 +1628,13 @@ def maybe_fire_cluster_leave(desired_cluster_role: str | None) -> bool:
     if desired_cluster_role != "none":
         return False
     if _CLUSTER_LEAVE_TRIGGER_FILE.exists():
+        return False
+    # #590 — same window as the join: do_leave renames its trigger away, but
+    # ``desired_cluster_role`` stays "none" until the backend sees a ``left``
+    # heartbeat. Re-firing here would run the destructive identity wipe a
+    # second time on a node that has already left.
+    state, _target = read_cluster_join_state()
+    if state in ("leaving", "left"):
         return False
     # A leave has no target coordinates, so the whole operation is one
     # fingerprint — the budget bounds "this node's demote", period.
