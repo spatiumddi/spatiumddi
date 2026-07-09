@@ -417,7 +417,37 @@ function SchedulesTab() {
     },
   });
 
+  const [detailId, setDetailId] = useState<string | null>(null);
+
+  const askRunNow = (s: WolSchedule) =>
+    setConfirm({
+      title: "Run this schedule now?",
+      message: (
+        <>
+          Sends magic packets to every matching host immediately, bypassing the
+          built-in holiday gate. This is a fire-and-forget wake, not a shutdown.
+        </>
+      ),
+      confirmLabel: "Wake now",
+      tone: "default",
+      run: () => runNow.mutate(s.id),
+    });
+  const askDelete = (s: WolSchedule) =>
+    setConfirm({
+      title: `Delete "${s.name}"?`,
+      message: (
+        <>
+          Removes the schedule and stops all future wakes. Run history is
+          retained. This cannot be undone.
+        </>
+      ),
+      confirmLabel: "Delete",
+      tone: "destructive",
+      run: () => del.mutate(s.id),
+    });
+
   const rows = schedulesQ.data ?? [];
+  const detailSchedule = rows.find((s) => s.id === detailId) ?? null;
 
   return (
     <div className="space-y-4">
@@ -501,37 +531,11 @@ function SchedulesTab() {
                 key={s.id}
                 schedule={s}
                 busyToggle={toggle.isPending && toggle.variables?.id === s.id}
+                onOpen={() => setDetailId(s.id)}
                 onToggle={() => toggle.mutate(s)}
                 onEdit={() => setEditing({ mode: "edit", schedule: s })}
-                onRunNow={() =>
-                  setConfirm({
-                    title: "Run this schedule now?",
-                    message: (
-                      <>
-                        Sends magic packets to every matching host immediately,
-                        bypassing the built-in holiday gate. This is a
-                        fire-and-forget wake, not a shutdown.
-                      </>
-                    ),
-                    confirmLabel: "Wake now",
-                    tone: "default",
-                    run: () => runNow.mutate(s.id),
-                  })
-                }
-                onDelete={() =>
-                  setConfirm({
-                    title: `Delete "${s.name}"?`,
-                    message: (
-                      <>
-                        Removes the schedule and stops all future wakes. Run
-                        history is retained. This cannot be undone.
-                      </>
-                    ),
-                    confirmLabel: "Delete",
-                    tone: "destructive",
-                    run: () => del.mutate(s.id),
-                  })
-                }
+                onRunNow={() => askRunNow(s)}
+                onDelete={() => askDelete(s)}
               />
             ))}
           </tbody>
@@ -546,6 +550,29 @@ function SchedulesTab() {
             setEditing(null);
             qc.invalidateQueries({ queryKey: ["wol-schedules"] });
             qc.invalidateQueries({ queryKey: ["wol-schedule-preview"] });
+          }}
+        />
+      )}
+
+      {detailSchedule && (
+        <ScheduleDetailModal
+          schedule={detailSchedule}
+          busyToggle={
+            toggle.isPending && toggle.variables?.id === detailSchedule.id
+          }
+          onClose={() => setDetailId(null)}
+          onToggle={() => toggle.mutate(detailSchedule)}
+          onEdit={() => {
+            setDetailId(null);
+            setEditing({ mode: "edit", schedule: detailSchedule });
+          }}
+          onRunNow={() => {
+            setDetailId(null);
+            askRunNow(detailSchedule);
+          }}
+          onDelete={() => {
+            setDetailId(null);
+            askDelete(detailSchedule);
           }}
         />
       )}
@@ -567,6 +594,7 @@ function SchedulesTab() {
 function ScheduleRow({
   schedule,
   busyToggle,
+  onOpen,
   onToggle,
   onEdit,
   onRunNow,
@@ -574,6 +602,7 @@ function ScheduleRow({
 }: {
   schedule: WolSchedule;
   busyToggle: boolean;
+  onOpen: () => void;
   onToggle: () => void;
   onEdit: () => void;
   onRunNow: () => void;
@@ -588,7 +617,10 @@ function ScheduleRow({
   const p = previewQ.data;
 
   return (
-    <tr className="border-b last:border-0 align-top">
+    <tr
+      onClick={onOpen}
+      className="cursor-pointer border-b align-top last:border-0 hover:bg-muted/30"
+    >
       <td className="px-3 py-2">
         <div className="font-medium">{schedule.name}</div>
         {schedule.description && (
@@ -637,7 +669,10 @@ function ScheduleRow({
       <td className="px-3 py-2">
         <button
           type="button"
-          onClick={onToggle}
+          onClick={(e) => {
+            e.stopPropagation();
+            onToggle();
+          }}
           disabled={busyToggle}
           aria-label={schedule.enabled ? "Disable" : "Enable"}
           className={cn(
@@ -685,7 +720,10 @@ function IconBtn({
     <button
       type="button"
       title={title}
-      onClick={onClick}
+      onClick={(e) => {
+        e.stopPropagation();
+        onClick();
+      }}
       className={cn(
         "rounded p-1.5 hover:bg-muted",
         tone === "destructive"
@@ -695,6 +733,220 @@ function IconBtn({
     >
       {children}
     </button>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Schedule detail modal — opens on row click; mirrors the row's actions
+// inside the modal (Run now / Edit / Enable-Disable / Delete) and shows the
+// full schedule at a glance. Read-only; "Edit" hands off to WolScheduleModal.
+// ─────────────────────────────────────────────────────────────────────
+function DField({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <div className="flex justify-between gap-4 py-1 text-sm">
+      <span className="shrink-0 text-muted-foreground">{label}</span>
+      <span className="min-w-0 break-words text-right">{children}</span>
+    </div>
+  );
+}
+
+function DSection({ title, children }: { title: string; children: ReactNode }) {
+  return (
+    <div className="rounded-md border p-3">
+      <div className="mb-1 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+        {title}
+      </div>
+      <div className="divide-y">{children}</div>
+    </div>
+  );
+}
+
+function ScheduleDetailModal({
+  schedule,
+  busyToggle,
+  onClose,
+  onEdit,
+  onRunNow,
+  onToggle,
+  onDelete,
+}: {
+  schedule: WolSchedule;
+  busyToggle: boolean;
+  onClose: () => void;
+  onEdit: () => void;
+  onRunNow: () => void;
+  onToggle: () => void;
+  onDelete: () => void;
+}) {
+  // Same query key the row uses, so it's already warm — no extra fetch.
+  const previewQ = useQuery({
+    queryKey: ["wol-schedule-preview", schedule.id],
+    queryFn: () => wakeSchedulesApi.previewScheduleTargets(schedule.id),
+    staleTime: 60_000,
+  });
+  const p = previewQ.data;
+  const sel = schedule.target_selector;
+  const selText =
+    sel.mode === "address_tags" || sel.mode === "subnet_tags"
+      ? `${sel.mode.replace(/_/g, " ")}: ${sel.tags.length ? sel.tags.join(", ") : "—"}`
+      : sel.mode === "subnet"
+        ? `subnet: ${sel.subnet_ids.length} selected`
+        : `hosts: ${sel.address_ids.length} selected`;
+  const vantageText =
+    schedule.vantage.kind === "server"
+      ? "Server (control plane)"
+      : `Appliance ${schedule.vantage.id ?? ""}`.trim();
+  const calText =
+    schedule.calendar_mode === "none"
+      ? "None"
+      : `${schedule.calendar_mode.replace(/_/g, " ")}${
+          schedule.calendar_match ? ` · match /${schedule.calendar_match}/` : ""
+        }`;
+  const term =
+    schedule.active_from || schedule.active_until
+      ? `${schedule.active_from ?? "…"} – ${schedule.active_until ?? "…"}`
+      : "—";
+  const blackout = schedule.blackout_dates?.length
+    ? schedule.blackout_dates.join(", ")
+    : "—";
+
+  const actionBtn =
+    "inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm hover:bg-muted disabled:opacity-50";
+
+  return (
+    <Modal title={schedule.name} onClose={onClose} wide>
+      <div className="space-y-4">
+        {schedule.description && (
+          <p className="text-sm text-muted-foreground">
+            {schedule.description}
+          </p>
+        )}
+
+        {/* Actions — mirror the row buttons, now with labels. */}
+        <div className="flex flex-wrap items-center gap-2 border-b pb-3">
+          <button type="button" className={actionBtn} onClick={onRunNow}>
+            <Play className="h-3.5 w-3.5" /> Run now
+          </button>
+          <button type="button" className={actionBtn} onClick={onEdit}>
+            <Pencil className="h-3.5 w-3.5" /> Edit
+          </button>
+          <button
+            type="button"
+            className={actionBtn}
+            onClick={onToggle}
+            disabled={busyToggle}
+          >
+            <Power className="h-3.5 w-3.5" />{" "}
+            {schedule.enabled ? "Disable" : "Enable"}
+          </button>
+          <button
+            type="button"
+            className={cn(
+              actionBtn,
+              "border-destructive/40 text-destructive hover:bg-destructive/10",
+            )}
+            onClick={onDelete}
+          >
+            <Trash2 className="h-3.5 w-3.5" /> Delete
+          </button>
+        </div>
+
+        <div className="grid gap-3 sm:grid-cols-2">
+          <DSection title="Status & timing">
+            <DField label="Enabled">
+              <span
+                className={cn(
+                  "rounded px-1.5 py-0.5 text-xs",
+                  schedule.enabled
+                    ? "bg-primary/10 text-primary"
+                    : "bg-muted text-muted-foreground",
+                )}
+              >
+                {schedule.enabled ? "Enabled" : "Disabled"}
+              </span>
+            </DField>
+            <DField label="Next run">
+              {localDateTime(schedule.next_run_at)}
+            </DField>
+            <DField label="Last run">
+              <span className="inline-flex flex-col items-end gap-0.5">
+                <StatusChip status={schedule.last_run_status} />
+                <span className="text-xs text-muted-foreground">
+                  {relTime(schedule.last_run_at)}
+                </span>
+                {schedule.last_run_skip_reason && (
+                  <span className="text-[11px] text-muted-foreground">
+                    skip: {schedule.last_run_skip_reason.replace(/_/g, " ")}
+                  </span>
+                )}
+              </span>
+            </DField>
+          </DSection>
+
+          <DSection title="Schedule">
+            <DField label="Cron">
+              <span className="font-mono text-[13px]">
+                {schedule.schedule_cron
+                  ? schedule.schedule_cron
+                  : "manual only"}
+              </span>
+            </DField>
+            <DField label="Timezone">{schedule.timezone}</DField>
+          </DSection>
+
+          <DSection title="Targets">
+            <DField label="Live match">
+              {previewQ.isLoading ? (
+                <Loader2 className="inline h-3.5 w-3.5 animate-spin" />
+              ) : p ? (
+                <>
+                  <span className="font-medium">{p.wake_count}</span> hosts
+                  {p.mac_less_count > 0 && (
+                    <span className="text-amber-600 dark:text-amber-400">
+                      {" "}
+                      · {p.mac_less_count} no-MAC
+                    </span>
+                  )}
+                </>
+              ) : (
+                "—"
+              )}
+            </DField>
+            <DField label="Selector">{selText}</DField>
+          </DSection>
+
+          <DSection title="Holiday gate">
+            <DField label="Blackout dates">{blackout}</DField>
+            <DField label="Term range">{term}</DField>
+            <DField label="Calendar">{calText}</DField>
+          </DSection>
+
+          <DSection title="Send options">
+            <DField label="Vantage">{vantageText}</DField>
+            <DField label="Repeat">
+              {schedule.repeat_count}× every {schedule.repeat_interval_ms} ms
+            </DField>
+            <DField label="Stagger">
+              {schedule.stagger_ms === 0 ? "auto" : `${schedule.stagger_ms} ms`}
+            </DField>
+            <DField label="Port">{schedule.port}</DField>
+          </DSection>
+
+          <DSection title="Post-wake verify">
+            {schedule.verify_enabled ? (
+              <>
+                <DField label="Enabled">Yes</DField>
+                <DField label="Wait">{schedule.verify_wait_seconds}s</DField>
+                <DField label="Retries">{schedule.verify_retries}</DField>
+                <DField label="Method">{schedule.verify_method}</DField>
+              </>
+            ) : (
+              <DField label="Enabled">No</DField>
+            )}
+          </DSection>
+        </div>
+      </div>
+    </Modal>
   );
 }
 
