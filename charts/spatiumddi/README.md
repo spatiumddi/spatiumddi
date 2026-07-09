@@ -248,6 +248,40 @@ helm upgrade ddi oci://ghcr.io/spatiumddi/charts/spatiumddi \
 The migrate Job runs as a `pre-upgrade` hook, so Alembic applies
 before the new API pods roll out.
 
+### Sentinel ghost entries clear themselves on upgrade
+
+Chart versions before the #590 fix let every Redis pod announce itself to
+its peers by its **pod IP**. A pod that gets rescheduled (node loss, drain,
+OS upgrade) returns with a new IP and a new run id, so the surviving
+sentinels record a *second* entry for it and keep the old one as `s_down`
+forever — Sentinel never forgets a Sentinel it has seen.
+
+That is not cosmetic. Sentinel authorizes a failover only with a majority
+of **all known** sentinels, and dead ghosts sit in the denominator without
+ever voting. With three live pods, the third accumulated ghost makes
+failover arithmetically impossible (6 known, 4 needed, 3 usable): the
+master is stranded, `sentinel://` clients never resolve a new one, and the
+API stays down. Each node loss contributes one ghost.
+
+This release pins `replica-announce-ip` / `sentinel announce-ip` to each
+pod's stable StatefulSet FQDN, so a returning pod replaces its own entry
+instead of adding one.
+
+**No manual step is needed.** The init container rewrites `sentinel.conf`
+on every pod start, so the rolling update discards the accumulated ghosts
+along with the rest of each sentinel's learned state. To confirm afterwards
+(`usable` should equal your replica count, and no `s_down` rows):
+
+```bash
+kubectl -n spatiumddi exec <release>-redis-0 -c sentinel -- \
+  redis-cli -p 26379 sentinel ckquorum mymaster
+kubectl -n spatiumddi exec <release>-redis-0 -c sentinel -- \
+  redis-cli -p 26379 sentinel sentinels mymaster | grep -A1 flags
+```
+
+On a cluster you cannot roll yet, `SENTINEL RESET *` on each sentinel
+clears the ghosts immediately without restarting anything.
+
 ### One-time step when upgrading a Sentinel Redis whose replicas were co-located
 
 Chart versions before the #590 fix used best-effort (`preferred`) pod

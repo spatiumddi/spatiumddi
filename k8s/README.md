@@ -93,8 +93,8 @@ kubectl apply -f k8s/ha/redis-sentinel.yaml
 
 Three Redis nodes with Sentinel provides automatic failover with quorum of 2.
 
-**Surviving a hard node loss (#590).** Two properties of the manifest are
-load-bearing, and both were learned the hard way:
+**Surviving a hard node loss (#590).** Three properties of the manifest are
+load-bearing, and all three were learned the hard way:
 
 * **Required pod anti-affinity.** The replicas must land on distinct nodes.
   A node hosting two of three replicas takes the data majority *and* the
@@ -108,6 +108,15 @@ load-bearing, and both were learned the hard way:
   Since Redis here is the cache + Celery broker and Postgres is the store
   of record, discarding a torn tail always beats never booting again. The
   value is a plain byte count; Redis rejects a `16mb`-style suffix.
+* **`announce-ip` pinned to each pod's StatefulSet FQDN.** Unset, every pod
+  announces its *pod IP*, so a rescheduled pod returns with a new IP + run
+  id and its peers add a second entry while the old one lingers `s_down`
+  forever (Sentinel never forgets a Sentinel). Failover needs a majority of
+  **all known** sentinels, and ghosts sit in the denominator without ever
+  voting — so with three live pods, the third accumulated ghost makes
+  failover impossible (6 known, 4 needed, 3 usable) and the master is
+  stranded for good. One ghost per node loss. Verify with
+  `redis-cli -p 26379 sentinel ckquorum mymaster`.
 
   Note this is **not** the same as `aof-load-truncated` (default `yes`),
   which only covers a tail that *ends* mid-record. A power cut usually

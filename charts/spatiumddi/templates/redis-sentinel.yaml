@@ -56,6 +56,12 @@ data:
     # Discard, don't die on, a power-cut-torn AOF tail (#590). Plain byte
     # count — redis rejects a "16mb"-style suffix on this directive.
     aof-load-corrupt-tail-max-size {{ int .Values.redis.aofLoadCorruptTailMaxBytes }}
+    # #590 — announce this replica by its STABLE StatefulSet FQDN, not the
+    # ephemeral pod IP. Without this the master's INFO reports each replica by
+    # the IP it connected from, so a rescheduled pod is recorded as a brand-new
+    # replica while the old IP lingers. Substituted by the init container.
+    replica-announce-ip __POD_FQDN__
+    replica-announce-port 6379
     {{- if $authEnabled }}
     requirepass __PASSWORD__
     masterauth __PASSWORD__
@@ -63,6 +69,33 @@ data:
   sentinel.conf.tmpl: |
     sentinel resolve-hostnames yes
     sentinel announce-hostnames yes
+    # #590 — the two directives above only control how Sentinel RENDERS an
+    # address it already holds as a hostname; they do not decide what each
+    # Sentinel announces about ITSELF. Unset, a Sentinel announces its pod IP.
+    #
+    # A pod that is rescheduled (node loss, drain, upgrade) comes back with a
+    # new IP and a new runid, so its hello no longer matches the stored entry
+    # and the peers add a SECOND one. The old entry never goes away: Sentinel
+    # never forgets a Sentinel it has seen — removal requires SENTINEL RESET.
+    #
+    # That matters because Sentinel authorizes a failover only with a majority
+    # of ALL KNOWN Sentinels (redis: ``voters = known + 1``; CKQUORUM needs
+    # ``usable >= voters/2 + 1``). Dead ghosts stay in the denominator and
+    # never vote, so with 3 live pods:
+    #
+    #     ghosts=1 → known 4 → need 3 → 3 usable → ok (at the edge)
+    #     ghosts=2 → known 5 → need 3 → 3 usable → ok
+    #     ghosts=3 → known 6 → need 4 → 3 usable → FAILOVER IMPOSSIBLE
+    #
+    # i.e. the THIRD node loss permanently strands the master, the api/worker
+    # ``sentinel://`` URL never resolves one again, and the appliance API is
+    # down for good. Observed live: one hard power-off of a single node left
+    # exactly one s_down ghost at the dead pod's old IP.
+    #
+    # Announcing the stable FQDN makes a returning pod's hello match the stored
+    # address, so peers replace the entry in place instead of accumulating one.
+    sentinel announce-ip __POD_FQDN__
+    sentinel announce-port 26379
     sentinel monitor {{ $master }} {{ $masterFqdn }} 6379 {{ $quorum }}
     sentinel down-after-milliseconds {{ $master }} {{ .Values.redis.sentinel.downAfterMs }}
     sentinel failover-timeout {{ $master }} {{ .Values.redis.sentinel.failoverTimeoutMs }}
@@ -111,8 +144,15 @@ spec:
               # chart secret is alnum, but a non-appliance operator may
               # BYO a password with special chars.
               ESC=$(printf '%s' "$PW" | sed -e 's/[\\/&]/\\&/g')
-              sed "s/__PASSWORD__/${ESC}/g" /tmpl/redis.conf.tmpl > /data/redis.conf
-              sed "s/__PASSWORD__/${ESC}/g" /tmpl/sentinel.conf.tmpl > /data/sentinel.conf
+              # #590 — this pod's stable identity. ${HOSTNAME} is <sts>-<ordinal>,
+              # which the headless Service resolves for the pod's whole lifetime,
+              # unlike the pod IP that changes on every reschedule. Contains only
+              # dots + dashes, so it needs no sed escaping.
+              POD_FQDN="${HOSTNAME}.{{ $headless }}.{{ .Release.Namespace }}.svc.cluster.local"
+              sed -e "s/__PASSWORD__/${ESC}/g" -e "s/__POD_FQDN__/${POD_FQDN}/g" \
+                /tmpl/redis.conf.tmpl > /data/redis.conf
+              sed -e "s/__PASSWORD__/${ESC}/g" -e "s/__POD_FQDN__/${POD_FQDN}/g" \
+                /tmpl/sentinel.conf.tmpl > /data/sentinel.conf
               if [ "${HOSTNAME}" != "{{ $sts }}-0" ]; then
                 echo "replicaof {{ $masterFqdn }} 6379" >> /data/redis.conf
               fi

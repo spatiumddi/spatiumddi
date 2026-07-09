@@ -100,6 +100,22 @@ spec:
                 echo "replicaof redis-0.redis-headless.spatiumddi.svc.cluster.local 6379" >> /data/redis.conf
               fi
               cp /config/sentinel.conf /data/sentinel.conf
+              # #590 — announce this pod by its STABLE StatefulSet FQDN rather
+              # than its ephemeral pod IP. A rescheduled pod otherwise returns
+              # with a new IP + a new runid, so peers add a SECOND entry while
+              # the old one lingers as s_down forever (Sentinel never forgets a
+              # Sentinel it has seen; only SENTINEL RESET clears one).
+              #
+              # Failover needs a majority of ALL KNOWN sentinels — ghosts sit in
+              # the denominator and never vote. With 3 live pods the third ghost
+              # makes failover mathematically impossible (known 6, need 4, usable
+              # 3): the master is stranded and the sentinel:// clients never
+              # resolve one again.
+              POD_FQDN="${HOSTNAME}.redis-headless.spatiumddi.svc.cluster.local"
+              printf 'replica-announce-ip %s\nreplica-announce-port 6379\n' \
+                "$POD_FQDN" >> /data/redis.conf
+              printf 'sentinel announce-ip %s\nsentinel announce-port 26379\n' \
+                "$POD_FQDN" >> /data/sentinel.conf
           volumeMounts:
             - name: config
               mountPath: /config
