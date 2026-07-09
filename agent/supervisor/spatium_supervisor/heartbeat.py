@@ -776,6 +776,16 @@ def heartbeat_once(
     elif desired_cluster_role == "none":
         if appliance_state.maybe_fire_cluster_leave(desired_cluster_role):
             log.info("supervisor.heartbeat.cluster_leave_trigger_fired")
+    else:
+        # #590 — no desired cluster role: the control plane settled this
+        # episode (or gave up on it after a reported ``failed``). Two
+        # cleanups, both of which make the NEXT promote work:
+        #   1. Drop the attempt ledger, or a re-promote against the same
+        #      seed would inherit an exhausted budget and never fire.
+        #   2. Retire the terminal .state verdict, or re-reporting it would
+        #      clear the next promote's desired-state before its join fired.
+        appliance_state.reset_cluster_join_attempts()
+        appliance_state.mark_cluster_join_state_consumed()
 
     # #272 Phase 9b — guided etcd restore. The backend stamps
     # ``desired_restore_snapshot`` only on the seed row (after a superadmin

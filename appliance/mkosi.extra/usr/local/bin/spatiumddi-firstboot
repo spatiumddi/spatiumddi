@@ -635,6 +635,25 @@ spec:
     # subPath mount finds it on first scheduling.
     frontend:
       replicas: 1  # spatium:cp-size
+      # #590 — replicas tracks the control-plane node count exactly, so
+      # spread one per node and never stack two on the seed. Inert at
+      # replicas: 1. hostNetwork makes this doubly true: a second frontend
+      # on the same node would collide on :80/:443 anyway.
+      podAntiAffinity: hard
+      # #590 — a dead control-plane node must free this replica in
+      # seconds, not the k8s default 300 s. Set here (not in the chart
+      # defaults) because pinning both taint keys suppresses the
+      # DefaultTolerationSeconds admission plugin, which a BYO-Kubernetes
+      # install still wants.
+      tolerations:
+        - key: node.kubernetes.io/unreachable
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 20
+        - key: node.kubernetes.io/not-ready
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 20
       hostNetwork: true
       # #272 Phase 7c — control-plane VIP. Empty on a fresh install
       # (hostNetwork frontend, no VIP); the seed supervisor patches this
@@ -659,6 +678,25 @@ spec:
     # each + disable HPA (no horizontal scaling on a single host).
     api:
       replicas: 1  # spatium:cp-size
+      # #590 — one api per control-plane node. Without this a promote
+      # could land every api pod on the seed, so losing the seed left no
+      # ready api anywhere and the whole cluster served 502s. Inert at
+      # replicas: 1.
+      podAntiAffinity: hard
+      # #590 — a dead control-plane node must free this replica in
+      # seconds, not the k8s default 300 s. Set here (not in the chart
+      # defaults) because pinning both taint keys suppresses the
+      # DefaultTolerationSeconds admission plugin, which a BYO-Kubernetes
+      # install still wants.
+      tolerations:
+        - key: node.kubernetes.io/unreachable
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 20
+        - key: node.kubernetes.io/not-ready
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 20
       autoscaling:
         enabled: false
       env:
@@ -728,6 +766,22 @@ spec:
         enabled: true
     worker:
       replicas: 1  # spatium:cp-size
+      # #590 — one worker per control-plane node; see api.podAntiAffinity.
+      podAntiAffinity: hard
+      # #590 — a dead control-plane node must free this replica in
+      # seconds, not the k8s default 300 s. Set here (not in the chart
+      # defaults) because pinning both taint keys suppresses the
+      # DefaultTolerationSeconds admission plugin, which a BYO-Kubernetes
+      # install still wants.
+      tolerations:
+        - key: node.kubernetes.io/unreachable
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 20
+        - key: node.kubernetes.io/not-ready
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 20
     # #277 — PostgreSQL runs under CloudNativePG on every appliance, so
     # the data layer scales with the control-plane cluster: 1 instance on
     # a single node, growing to 3/5/7 (primary + streaming replicas with

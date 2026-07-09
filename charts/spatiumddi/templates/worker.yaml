@@ -88,7 +88,4 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.worker.affinity }}
-      affinity:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
+      {{- include "spatiumddi.podAntiAffinity" (merge (dict "component" $cmp "mode" .Values.worker.podAntiAffinity "replicas" .Values.worker.replicas "override" .Values.worker.affinity) .) | nindent 6 }}

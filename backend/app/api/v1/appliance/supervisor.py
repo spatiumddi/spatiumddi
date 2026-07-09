@@ -74,10 +74,13 @@ from app.models.appliance import (
     APPLIANCE_STATE_APPROVED,
     APPLIANCE_STATE_PENDING_APPROVAL,
     APPLIANCE_STATE_REVOKED,
+    CLUSTER_JOIN_STATE_EVICTING,
+    CLUSTER_JOIN_STATE_FAILED,
     CLUSTER_JOIN_STATE_JOINING,
     CLUSTER_JOIN_STATE_LEAVING,
     CLUSTER_JOIN_STATE_LEFT,
     CLUSTER_JOIN_STATE_READY,
+    CLUSTER_JOIN_STATES_TERMINAL,
     CLUSTER_ROLE_MEMBER,
     CLUSTER_ROLE_PRIMARY,
     DESIRED_CLUSTER_ROLE_MEMBER,
@@ -1765,6 +1768,11 @@ async def supervisor_heartbeat(
         # the promote endpoint can hand it to joiners.
         row.k3s_join_token_encrypted = encrypt_str(body.k3s_join_token)
     if body.cluster_join_state is not None:
+        # #590 — stamp only on a real CHANGE, so the staleness clock the
+        # escape hatch keys on measures how long we've been stuck in this
+        # state, not how long ago the last heartbeat landed.
+        if body.cluster_join_state != row.cluster_join_state:
+            row.cluster_join_state_at = datetime.now(UTC)
         row.cluster_join_state = body.cluster_join_state
         row.cluster_join_reason = body.cluster_join_reason
     # The node's real routable InternalIP — used by the promote endpoint
@@ -1844,14 +1852,49 @@ async def supervisor_heartbeat(
     # Auto-clear the promote desired-state once the join landed: the
     # supervisor reports ``ready`` → the node IS a member now, so settle
     # cluster_role and drop the (sensitive) join coordinates.
+    #
+    # #590 — the settle deliberately does NOT require ``desired_cluster_role
+    # == member``. The node reports ``ready`` on every heartbeat (it is that
+    # node's local source of truth for control-plane membership, so it is
+    # never retired), and the desired-state can legitimately be gone by the
+    # time it lands: an operator clearing a "stuck" transition mid-join used
+    # to strand the row at ``cluster_role = NULL`` forever, leaving a live
+    # k3s control-plane member that cp-size scaling, MetalLB and quorum math
+    # all undercount. Settling on ``cluster_role is None`` makes that
+    # self-healing. ``evict_requested`` rows are excluded — a node we are
+    # deliberately evicting must not re-add itself.
     if (
-        row.desired_cluster_role == DESIRED_CLUSTER_ROLE_MEMBER
-        and row.cluster_join_state == CLUSTER_JOIN_STATE_READY
+        row.cluster_join_state == CLUSTER_JOIN_STATE_READY
+        and not row.evict_requested
+        and (row.desired_cluster_role == DESIRED_CLUSTER_ROLE_MEMBER or row.cluster_role is None)
     ):
         row.cluster_role = CLUSTER_ROLE_MEMBER
         row.desired_cluster_role = None
         row.desired_k3s_server_url = None
         row.desired_k3s_join_token_encrypted = None
+    # #590 — clear the promote desired-state on a reported ``failed`` too.
+    # The host runner rolls the node back to its prior single-node seed and
+    # renames its trigger out of the way, so leaving desired_cluster_role
+    # set meant the supervisor re-fired the DESTRUCTIVE wipe-and-rejoin on
+    # every heartbeat — the row read "joining" forever (observed: 50+ min
+    # on a dead-node replace) instead of surfacing a clean failure. The
+    # node is healthy and standalone; the operator re-promotes to retry.
+    # cluster_join_state + cluster_join_reason are left as reported so the
+    # Fleet UI shows WHY.
+    elif (
+        row.desired_cluster_role == DESIRED_CLUSTER_ROLE_MEMBER
+        and row.cluster_join_state == CLUSTER_JOIN_STATE_FAILED
+    ):
+        row.desired_cluster_role = None
+        row.desired_k3s_server_url = None
+        row.desired_k3s_join_token_encrypted = None
+        logger.warning(
+            "control_plane_join_failed",
+            appliance_id=str(row.id),
+            hostname=row.hostname,
+            reason=row.cluster_join_reason,
+            detail="cleared desired-state; re-promote to retry",
+        )
     # Auto-clear the demote desired-state once the leave landed: the
     # supervisor reports ``left`` → the node is back to a plain
     # application appliance.
@@ -1861,6 +1904,22 @@ async def supervisor_heartbeat(
     ):
         row.cluster_role = None
         row.desired_cluster_role = None
+    # #590 — and clear it on a failed leave, for the same reason a failed
+    # join clears above: the leave runner also renames its trigger away, so
+    # a desired-state left standing re-fires the destructive leave every
+    # heartbeat. cluster_role is left as-is (the node did NOT leave).
+    elif (
+        row.desired_cluster_role == DESIRED_CLUSTER_ROLE_NONE
+        and row.cluster_join_state == CLUSTER_JOIN_STATE_FAILED
+    ):
+        row.desired_cluster_role = None
+        logger.warning(
+            "control_plane_leave_failed",
+            appliance_id=str(row.id),
+            hostname=row.hostname,
+            reason=row.cluster_join_reason,
+            detail="cleared desired-state; re-demote to retry",
+        )
 
     # #272 Phase 9b — guided etcd restore. Persist the runner-reported
     # progress, and auto-clear the desired snapshot once it lands ``done``
@@ -2459,6 +2518,10 @@ class ApplianceRow(BaseModel):
     desired_cluster_role: str | None = None
     cluster_join_state: str | None = None
     cluster_join_reason: str | None = None
+    # #590 — when cluster_join_state last changed. The Fleet UI keys the
+    # "Clear stuck state" affordance off its age so the destructive escape
+    # hatch isn't offered during a healthy multi-minute k3s join.
+    cluster_join_state_at: datetime | None = None
     # #170 Wave E follow-up — soft-delete timestamp. Non-null on
     # ``state=revoked`` rows; cleared by re-authorize.
     revoked_at: datetime | None = None
@@ -2542,6 +2605,7 @@ def _row_to_schema(row: Appliance) -> ApplianceRow:
         desired_cluster_role=row.desired_cluster_role,
         cluster_join_state=row.cluster_join_state,
         cluster_join_reason=row.cluster_join_reason,
+        cluster_join_state_at=row.cluster_join_state_at,
         revoked_at=row.revoked_at,
         created_at=row.created_at,
     )
@@ -3710,6 +3774,7 @@ async def promote_control_plane(
         row.desired_k3s_server_url = server_url
         row.desired_k3s_join_token_encrypted = primary.k3s_join_token_encrypted
         row.cluster_join_state = CLUSTER_JOIN_STATE_JOINING
+        row.cluster_join_state_at = datetime.now(UTC)  # #590 staleness clock
         row.cluster_join_reason = None
         db.add(
             AuditLog(
@@ -3788,6 +3853,7 @@ async def demote_control_plane(
     for row in targets:
         row.desired_cluster_role = DESIRED_CLUSTER_ROLE_NONE
         row.cluster_join_state = CLUSTER_JOIN_STATE_LEAVING
+        row.cluster_join_state_at = datetime.now(UTC)  # #590 staleness clock
         row.cluster_join_reason = None
         # The join coordinates aren't needed for a leave; clear any stale ones.
         row.desired_k3s_server_url = None
@@ -3882,7 +3948,8 @@ async def replace_control_plane_member(
     row.desired_cluster_role = None
     row.desired_k3s_server_url = None
     row.desired_k3s_join_token_encrypted = None
-    row.cluster_join_state = "evicting"
+    row.cluster_join_state = CLUSTER_JOIN_STATE_EVICTING
+    row.cluster_join_state_at = datetime.now(UTC)  # #590 staleness clock
     row.cluster_join_reason = None
     row.evict_requested = True
 
@@ -3932,6 +3999,143 @@ async def replace_control_plane_member(
         pairing_code=code,
         pairing_expires_at=expires_at,
     )
+
+
+# #590 — how long a cluster transition may sit before the escape hatch will
+# clear it without ``force``. A k3s server join on a loaded 3-node cluster is
+# minutes, not seconds (the host runner's own wait_ready caps at 180s, and a
+# promote also waits on the trigger-file pickup + a full k3s restart), so the
+# threshold has to be comfortably above the healthy worst case.
+_CLUSTER_TRANSITION_STUCK_AFTER = timedelta(minutes=10)
+
+
+class ClearClusterStateRequest(BaseModel):
+    """Body for the clear-cluster-state escape hatch (#590)."""
+
+    force: bool = Field(
+        default=False,
+        description=(
+            "Clear even a transition younger than the staleness threshold. "
+            "Only set this when the node is known to be gone for good — "
+            "clearing a running join strands it as an unaccounted member."
+        ),
+    )
+
+
+@router.post(
+    "/fleet/control-plane/{appliance_id}/clear-cluster-state",
+    response_model=ApplianceRow,
+    dependencies=[Depends(require_permission("admin", "appliance"))],
+    summary="Clear a stuck cluster transition on an appliance row (superadmin)",
+)
+async def clear_control_plane_state(
+    appliance_id: uuid.UUID,
+    current_user: CurrentUser,
+    db: DB,
+    body: ClearClusterStateRequest | None = None,
+) -> ApplianceRow:
+    """Operator escape hatch for a wedged promote / demote / eviction (#590).
+
+    Every cluster transition converges on a supervisor report: a promote
+    settles when the joiner reports ``ready``, a demote when it reports
+    ``left``, an eviction when the SEED reports the k8s Node deleted. None
+    of those has a timeout, so a transition whose reporter never comes back
+    — a node that died mid-join, a seed that can't reach the kubeapi, a
+    supervisor that will never run again — leaves the row pinned in
+    ``joining`` / ``leaving`` / ``evicting`` forever with no way out. That
+    is precisely how a dead-node replace stranded a cluster at 2/3 for 50+
+    minutes.
+
+    This clears the *bookkeeping* only. It does not touch the node, k3s, or
+    etcd: ``cluster_role`` (what the row IS) is left alone, while the
+    desired-state, the in-flight join coordinates, and the evict flag (what
+    we were trying to make it BE) are dropped. Use it to unstick the row,
+    then re-drive the real operation — or delete the appliance outright if
+    the node is gone for good.
+
+    A k3s join legitimately takes minutes, so clearing a transition younger
+    than ``_CLUSTER_TRANSITION_STUCK_AFTER`` is refused unless ``force`` is
+    set: blanking the desired-state out from under a RUNNING join would let
+    the joiner come up as a live control-plane member that this row — and
+    therefore cp-size scaling, MetalLB and quorum math — accounts for as
+    nothing. (The reported-``ready`` settle is self-healing for exactly that
+    case, but the operator shouldn't have to rely on it.)
+    """
+    _require_superadmin(current_user)
+
+    row = await db.get(Appliance, appliance_id)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"Appliance {appliance_id} not found.")
+
+    before = {
+        "cluster_join_state": row.cluster_join_state,
+        "cluster_join_reason": row.cluster_join_reason,
+        "desired_cluster_role": row.desired_cluster_role,
+        "evict_requested": row.evict_requested,
+    }
+    # Only in-flight bookkeeping is clearable. A settled row (``ready`` /
+    # ``left`` / ``failed`` with nothing pending) has nothing stuck, and
+    # blanking its state would just destroy the operator's audit trail of
+    # how it got there. Read the pre-image so the guard and the audit row
+    # can never disagree about what "in flight" meant.
+    in_flight = (
+        before["cluster_join_state"] not in (None, *CLUSTER_JOIN_STATES_TERMINAL)
+        or before["desired_cluster_role"] is not None
+        or bool(before["evict_requested"])
+    )
+    if not in_flight:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"Appliance {row.hostname!r} has no in-flight cluster transition to clear "
+            f"(cluster_join_state={row.cluster_join_state!r}).",
+        )
+
+    force = bool(body.force) if body is not None else False
+    started_at = row.cluster_join_state_at
+    if not force and started_at is not None:
+        age = datetime.now(UTC) - started_at
+        if age < _CLUSTER_TRANSITION_STUCK_AFTER:
+            remaining = int((_CLUSTER_TRANSITION_STUCK_AFTER - age).total_seconds())
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"Appliance {row.hostname!r} entered {row.cluster_join_state!r} only "
+                f"{int(age.total_seconds())}s ago — a k3s join legitimately takes minutes. "
+                f"Wait {remaining}s for it to converge, or re-send with force=true if you "
+                "know the node is never coming back.",
+            )
+
+    row.cluster_join_state = None
+    row.cluster_join_state_at = None
+    row.cluster_join_reason = None
+    row.desired_cluster_role = None
+    row.desired_k3s_server_url = None
+    row.desired_k3s_join_token_encrypted = None
+    row.evict_requested = False
+
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="appliance.control_plane_state_cleared",
+            resource_type="appliance",
+            resource_id=str(row.id),
+            resource_display=row.hostname,
+            result="success",
+            old_value=before,
+            new_value={"cluster_role": row.cluster_role, "forced": force},
+        )
+    )
+    await db.commit()
+    await db.refresh(row)
+    logger.warning(
+        "control_plane_state_cleared",
+        appliance_id=str(row.id),
+        hostname=row.hostname,
+        cleared=before,
+        user=current_user.username,
+    )
+    return _row_to_schema(row)
 
 
 # ── Admin: etcd snapshot list + guided restore (#272 Phase 9b) ───────

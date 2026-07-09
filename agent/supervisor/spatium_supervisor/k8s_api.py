@@ -593,12 +593,41 @@ def apply_control_plane_overrides(
     src_json = json.dumps(
         [c.strip() for c in (web_ui_allowed_cidrs or []) if c and c.strip()]
     )
+    # #590 — pin api/frontend/worker to one replica per control-plane node,
+    # and evict them from a dead node in seconds rather than the k8s default
+    # 300 s. ``replicas`` here IS the node count, so hard
+    # (requiredDuringScheduling) anti-affinity is exactly right, and the
+    # chart no-ops it below 2 replicas.
+    #
+    # Written on every promote/demote rather than relying on the
+    # firstboot-rendered HelmChart values, because firstboot only runs on a
+    # FRESH install — an appliance that A/B-upgrades into this fix would
+    # otherwise keep the old un-spread values forever. Without it a promote
+    # could stack every api pod on the seed (they schedule while the new
+    # members may not yet be labelled), so losing the seed left no ready api
+    # anywhere and every node answered 502.
+    #
+    # The tolerations are NOT a chart default: pinning both taint keys
+    # suppresses the DefaultTolerationSeconds admission plugin, which a
+    # BYO-Kubernetes install still wants. They belong to the appliance,
+    # where the control-plane node count is fixed.
+    fast_evict = (
+        "  tolerations:\n"
+        "    - key: node.kubernetes.io/unreachable\n"
+        "      operator: Exists\n"
+        "      effect: NoExecute\n"
+        "      tolerationSeconds: 20\n"
+        "    - key: node.kubernetes.io/not-ready\n"
+        "      operator: Exists\n"
+        "      effect: NoExecute\n"
+        "      tolerationSeconds: 20\n"
+    )
     values = (
-        f"api:\n  replicas: {cp_size}\n"
-        f"frontend:\n  replicas: {cp_size}\n"
+        f"api:\n  replicas: {cp_size}\n  podAntiAffinity: hard\n{fast_evict}"
+        f"frontend:\n  replicas: {cp_size}\n  podAntiAffinity: hard\n{fast_evict}"
         f'  controlPlaneVIP: "{vip}"\n'
         f"  loadBalancerSourceRanges: {src_json}\n"
-        f"worker:\n  replicas: {cp_size}\n"
+        f"worker:\n  replicas: {cp_size}\n  podAntiAffinity: hard\n{fast_evict}"
         f"postgresql:\n  cnpg:\n    instances: {cp_size}\n"
         f"redis:\n  sentinel:\n    replicas: {cp_size}\n"
     )

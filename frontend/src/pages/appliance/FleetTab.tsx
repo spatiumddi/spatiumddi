@@ -234,6 +234,42 @@ function isControlPlaneRow(row: ApplianceRow): boolean {
   );
 }
 
+// #590 — is this row pinned in a cluster transition that will never
+// converge on its own? Every transition settles only when a supervisor
+// reports back (``ready`` / ``left`` / the seed's eviction), and none of
+// them has a timeout — so a dead node mid-join, or a seed that can't
+// reach the kubeapi, leaves the row here indefinitely. ``ready`` /
+// ``left`` / ``failed`` are terminal and need no rescue.
+//
+// The AGE gate is load-bearing, not cosmetic. A k3s server join
+// legitimately takes minutes, and clearing a running join blanks the
+// desired-state out from under it — the joiner then comes up as a live
+// control-plane member that cp-size scaling, MetalLB and quorum math all
+// undercount. So the hatch is only offered once the transition has sat
+// long enough that it is not going to finish on its own. Must stay in step
+// with ``_CLUSTER_TRANSITION_STUCK_AFTER`` on the server, which enforces
+// the same threshold and 409s a premature clear.
+//
+// ``evict_requested`` is deliberately not consulted: the schema doesn't
+// expose it, and the replace endpoint always stamps ``evicting`` next to
+// it, so the state alone is sufficient. The server re-validates anyway
+// and 409s a row that isn't really in flight.
+const _STUCK_JOIN_STATES = new Set(["joining", "leaving", "evicting"]);
+const _STUCK_AFTER_MS = 10 * 60 * 1000;
+function isClusterTransitionStuck(row: ApplianceRow): boolean {
+  const inFlight =
+    _STUCK_JOIN_STATES.has(row.cluster_join_state ?? "") ||
+    row.desired_cluster_role != null;
+  if (!inFlight) return false;
+  // No timestamp (a row written before this column existed) means we can't
+  // prove the transition is young — offer the hatch, exactly as the server
+  // allows it in that case.
+  if (!row.cluster_join_state_at) return true;
+  const startedAt = Date.parse(row.cluster_join_state_at);
+  if (Number.isNaN(startedAt)) return true;
+  return Date.now() - startedAt >= _STUCK_AFTER_MS;
+}
+
 // #272 Phase 7c — settled / in-flight control-plane cluster membership.
 const _CLUSTER_CHIP_BASE =
   "inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] font-medium";
@@ -751,6 +787,10 @@ export function FleetTab({
 
   const [drilldown, setDrilldown] = useState<ApplianceRow | null>(null);
   const [showCluster, setShowCluster] = useState(false);
+  // #590 — the row whose wedged cluster transition we're about to clear.
+  const [clearStateTarget, setClearStateTarget] = useState<ApplianceRow | null>(
+    null,
+  );
   const [rejectTarget, setRejectTarget] = useState<ApplianceRow | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<ApplianceRow | null>(null);
   const [rekeyTarget, setRekeyTarget] = useState<ApplianceRow | null>(null);
@@ -793,6 +833,14 @@ export function FleetTab({
       qc.invalidateQueries({ queryKey: ["appliance", "fleet"] });
       setReplaceTarget(null);
       setReplaceResult(result);
+    },
+  });
+  // #590 — clear a promote / demote / eviction that will never converge.
+  const clearClusterState = useMutation({
+    mutationFn: (id: string) => applianceApprovalApi.clearControlPlaneState(id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["appliance", "fleet"] });
+      setClearStateTarget(null);
     },
   });
   // #170 follow-up — password re-auth required for delete (the
@@ -1448,6 +1496,7 @@ export function FleetTab({
                     onReauthorize={(row) => reauthorize.mutate(row.id)}
                     onPermanentDelete={(row) => setPermanentDeleteTarget(row)}
                     onReplace={(row) => setReplaceTarget(row)}
+                    onClearClusterState={(row) => setClearStateTarget(row)}
                   />
                   {/* #402 — the etcd snapshot list + guided restore moved
                     to the Cluster tab (it crowded the fleet roster here). */}
@@ -1729,6 +1778,51 @@ export function FleetTab({
         />
       )}
 
+      {/* #590 — confirm clearing a wedged cluster transition. */}
+      {clearStateTarget && (
+        <ConfirmModal
+          open
+          title="Clear stuck cluster state?"
+          message={
+            <>
+              <p className="text-sm">
+                <strong>{clearStateTarget.hostname}</strong> is stuck in{" "}
+                <code className="rounded bg-muted px-1 py-0.5 text-xs">
+                  {clearStateTarget.cluster_join_state ??
+                    clearStateTarget.desired_cluster_role}
+                </code>
+                {clearStateTarget.cluster_join_state_at && (
+                  <>
+                    {" since "}
+                    {new Date(
+                      clearStateTarget.cluster_join_state_at,
+                    ).toLocaleString()}
+                  </>
+                )}
+                . Clearing drops the desired-state, the in-flight join
+                coordinates, and the eviction flag so the row stops waiting for
+                a report that isn't coming.
+              </p>
+              <p className="mt-2 text-xs text-muted-foreground">
+                Bookkeeping only — the node, k3s and etcd are untouched, and the
+                appliance keeps whatever cluster role it already had. Re-drive
+                the promote / demote / replace afterwards, or revoke the
+                appliance if the node is gone for good.
+              </p>
+              {clearClusterState.isError && (
+                <p className="mt-2 text-xs text-rose-600">
+                  {formatApiError(clearClusterState.error)}
+                </p>
+              )}
+            </>
+          }
+          confirmLabel="Clear stuck state"
+          loading={clearClusterState.isPending}
+          onConfirm={() => clearClusterState.mutate(clearStateTarget.id)}
+          onClose={() => setClearStateTarget(null)}
+        />
+      )}
+
       {/* #272 Phase 9 — show the minted replacement pairing code once. */}
       {replaceResult && (
         <Modal
@@ -1969,6 +2063,7 @@ function ApplianceTableSection({
   onReauthorize,
   onPermanentDelete,
   onReplace,
+  onClearClusterState,
 }: {
   title: string;
   subtitle: string;
@@ -1986,6 +2081,7 @@ function ApplianceTableSection({
   // #272 Phase 9 — only the Control plane section passes this (members
   // can be replaced when dead). Undefined elsewhere → no Replace action.
   onReplace?: (row: ApplianceRow) => void;
+  onClearClusterState?: (row: ApplianceRow) => void;
 }) {
   const total = pendingRows.length + otherRows.length;
   return (
@@ -2037,6 +2133,11 @@ function ApplianceTableSection({
                   onPermanentDelete={() => onPermanentDelete(row)}
                   canRevoke={!isControlPlaneRow(row)}
                   onReplace={onReplace ? () => onReplace(row) : undefined}
+                  onClearClusterState={
+                    onClearClusterState
+                      ? () => onClearClusterState(row)
+                      : undefined
+                  }
                 />
               ))}
               {otherRows.map((row) => (
@@ -2053,6 +2154,11 @@ function ApplianceTableSection({
                   onPermanentDelete={() => onPermanentDelete(row)}
                   canRevoke={!isControlPlaneRow(row)}
                   onReplace={onReplace ? () => onReplace(row) : undefined}
+                  onClearClusterState={
+                    onClearClusterState
+                      ? () => onClearClusterState(row)
+                      : undefined
+                  }
                 />
               ))}
             </tbody>
@@ -2075,6 +2181,7 @@ function ApplianceTableRow({
   onReauthorize,
   onPermanentDelete,
   onReplace,
+  onClearClusterState,
   canRevoke = true,
 }: {
   row: ApplianceRow;
@@ -2088,6 +2195,7 @@ function ApplianceTableRow({
   onReauthorize: () => void;
   onPermanentDelete: () => void;
   onReplace?: (() => void) | undefined;
+  onClearClusterState?: (() => void) | undefined;
   // #272 — false for the sole control-plane node: revoking it would
   // brick the control plane, so we hide the action (the backend also
   // refuses it). True for everything else.
@@ -2246,6 +2354,23 @@ function ApplianceTableRow({
                 >
                   <RefreshCw className="h-3 w-3" />
                   Replace…
+                </button>
+              )}
+              {/* #590 — escape hatch for a wedged cluster transition. No
+                  transition has a timeout (each converges only on a
+                  supervisor report), so a node that died mid-join or a seed
+                  that can't reach the kubeapi pins the row in
+                  joining/leaving/evicting with no way out. Offered only
+                  while the row is actually stuck. */}
+              {onClearClusterState && isClusterTransitionStuck(row) && (
+                <button
+                  type="button"
+                  onClick={onClearClusterState}
+                  className="inline-flex items-center gap-1 rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-xs text-amber-700 hover:bg-amber-500/20 dark:text-amber-400"
+                  title="Clear a stuck promote / demote / eviction. Bookkeeping only — the node, k3s and etcd are untouched."
+                >
+                  <RefreshCw className="h-3 w-3" />
+                  Clear stuck state…
                 </button>
               )}
               {/* #272 — a control-plane cluster member can't be revoked

@@ -248,6 +248,32 @@ helm upgrade ddi oci://ghcr.io/spatiumddi/charts/spatiumddi \
 The migrate Job runs as a `pre-upgrade` hook, so Alembic applies
 before the new API pods roll out.
 
+### One-time step when upgrading a Sentinel Redis whose replicas were co-located
+
+Chart versions before the #590 fix used best-effort (`preferred`) pod
+anti-affinity on the Sentinel Redis StatefulSet, so two replicas could
+land on the same node — and `persistence.enabled` then pinned each
+replica's `ReadWriteOnce` local PV to whichever node it first scheduled
+on. This release makes the anti-affinity **required**, which is what
+makes a single node loss survivable. A replica whose PV is stranded on a
+node that already hosts another replica cannot schedule, and will sit
+`Pending` after the rolling update.
+
+Check for it, and repair by deleting the stranded PVC so it
+re-provisions on a free node (Redis here is cache + Celery broker;
+Postgres is the store of record, so the data is expendable and the
+replica resyncs from the master):
+
+```bash
+kubectl -n spatiumddi get pods -l app.kubernetes.io/component=redis \
+  -o wide                                    # any Pending, and where?
+kubectl -n spatiumddi delete pvc data-<release>-redis-<ordinal>
+kubectl -n spatiumddi delete pod <release>-redis-<ordinal>
+```
+
+Clusters whose replicas were already spread one-per-node upgrade with no
+action. This does not apply to `redis.kind: standalone`.
+
 ## Uninstall
 
 ```bash

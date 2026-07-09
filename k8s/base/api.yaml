@@ -22,6 +22,20 @@ spec:
         app: spatiumddi-api
         app.kubernetes.io/component: api
     spec:
+      # #590 — spread replicas across nodes so a single node loss can't
+      # take every replica of this workload with it. Soft (preferred): a
+      # single-node or replicas>nodes cluster must still schedule. The
+      # Helm chart's appliance path uses required anti-affinity, where the
+      # replica count tracks the control-plane node count exactly.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: spatiumddi-api
+                topologyKey: kubernetes.io/hostname
       terminationGracePeriodSeconds: 30
       containers:
         - name: api

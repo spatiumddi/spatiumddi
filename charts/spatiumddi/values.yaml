@@ -67,7 +67,23 @@ api:
     limits:   { cpu: 1000m, memory: 512Mi }
   env: []                        # extra env entries appended to container
   nodeSelector: {}
+  # Fast-eviction tolerations are NOT a chart default: setting both taint
+  # keys explicitly suppresses Kubernetes' DefaultTolerationSeconds
+  # admission plugin (300 s), so a BYO-Kubernetes install would evict this
+  # pod after a 20 s NotReady blip it previously served straight through.
+  # The appliance — where the control-plane node count is fixed and a dead
+  # node must free its replica fast (#590) — sets them from firstboot and
+  # from the supervisor's apply_control_plane_overrides.
   tolerations: []
+  # One of hard | soft | none — see the ``spatiumddi.podAntiAffinity``
+  # helper. ``soft`` is the safe chart default (a BYO-k8s install may run
+  # more replicas than nodes); the appliance renders ``hard``, where
+  # replicas tracks the control-plane node count exactly.
+  podAntiAffinity: soft
+  # Extra affinity rules (nodeAffinity, podAffinity, …). MERGED with the
+  # anti-affinity spread above, so setting e.g. a nodeAffinity here does
+  # not silently cost you cross-node spreading. Declare your own
+  # ``podAntiAffinity`` key to opt out of the default spread entirely.
   affinity: {}
   podAnnotations: {}
   # Phase 11 wave 4 (#183) — api ServiceAccount + Role for kubeapi
@@ -249,7 +265,10 @@ frontend:
     requests: { cpu: 50m, memory: 64Mi }
     limits:   { cpu: 200m, memory: 128Mi }
   nodeSelector: {}
+  # See api.tolerations — fast eviction is an appliance-only override.
   tolerations: []
+  # One of hard | soft | none — see api.podAntiAffinity.
+  podAntiAffinity: soft
   affinity: {}
   podAnnotations: {}
 
@@ -269,7 +288,10 @@ worker:
   # and want a tighter security posture.
   netRawCapability: true
   nodeSelector: {}
+  # See api.tolerations — fast eviction is an appliance-only override.
   tolerations: []
+  # One of hard | soft | none — see api.podAntiAffinity.
+  podAntiAffinity: soft
   affinity: {}
   podAnnotations: {}
 
@@ -456,6 +478,20 @@ redis:
   # Cap and eviction policy match docker-compose.yml's redis-server
   # CLI flags. Bump if your install needs a larger cache.
   maxmemory: "256mb"
+  # #590 — how much of a torn AOF tail redis will discard at load rather
+  # than refusing to start. Redis defaults this to 0, i.e. ANY corruption
+  # is fatal — so a replica killed mid-write by a power cut crashloops on
+  # "Bad file format reading the append only file" forever. A hard power
+  # loss tearing the last write is expected, not exceptional, and this is
+  # cache + Celery broker data with Postgres as the store of record:
+  # dropping the tail always beats never booting. Set 0 to restore
+  # upstream redis behaviour.
+  #
+  # PLAIN BYTE COUNT, not a "16mb"-style memory string — redis parses this
+  # one as an integer and dies at startup ("argument couldn't be parsed
+  # into an integer") on a suffixed value, in both the redis.conf and the
+  # --flag form. 16 MiB.
+  aofLoadCorruptTailMaxBytes: 16777216
   auth:
     enabled: false               # internal cluster traffic; flip to true if shared
     password: ""                 # empty → generated on first install when auth.enabled=true

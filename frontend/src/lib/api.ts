@@ -10002,6 +10002,10 @@ export interface ApplianceRow {
   desired_cluster_role: string | null;
   cluster_join_state: string | null;
   cluster_join_reason: string | null;
+  // #590 — ISO timestamp of the last cluster_join_state change. The Fleet
+  // UI gates the destructive "Clear stuck state" affordance on its age so
+  // it isn't offered during a healthy multi-minute k3s join.
+  cluster_join_state_at: string | null;
   // Issue #170 Wave E follow-up — soft-delete timestamp. Non-null on
   // ``state=revoked`` rows; cleared by re-authorize.
   revoked_at: string | null;
@@ -10110,6 +10114,24 @@ export const applianceApprovalApi = {
     api
       .post<ControlPlaneReplaceResult>(
         `/appliance/fleet/control-plane/${applianceId}/replace`,
+      )
+      .then((r) => r.data),
+  // #590 — escape hatch for a wedged promote / demote / eviction. No
+  // cluster transition has a timeout: each converges only on a supervisor
+  // report, so a node that died mid-join (or a seed that can't reach the
+  // kubeapi) pins the row in joining/leaving/evicting forever. This clears
+  // the BOOKKEEPING only — cluster_role, k3s and etcd are untouched.
+  //
+  // The server 409s a transition younger than its staleness threshold
+  // unless `force` is set: clearing a RUNNING join would strand the joiner
+  // as a live control-plane member the control plane accounts for as
+  // nothing. The UI only offers the button once the row is already stale,
+  // so `force` is reserved for "the node is never coming back".
+  clearControlPlaneState: (applianceId: string, force = false) =>
+    api
+      .post<ApplianceRow>(
+        `/appliance/fleet/control-plane/${applianceId}/clear-cluster-state`,
+        { force },
       )
       .then((r) => r.data),
   // #272 Phase 7c — cluster-wide MetalLB pool + control-plane VIP. The

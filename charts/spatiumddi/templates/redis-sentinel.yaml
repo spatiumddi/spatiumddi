@@ -34,10 +34,22 @@ data:
   # ``__PASSWORD__`` is substituted by the init container from the
   # REDIS_PASSWORD env (sourced from the chart secret). On no-auth
   # installs the password lines are dropped entirely.
+  {{/*
+    #590 — a hard power loss tears the AOF mid-write, and redis ships
+    ``aof-load-corrupt-tail-max-size 0`` (refuse to start on ANY corrupt
+    tail). A replica killed mid-write then crashloops forever on "Bad file
+    format reading the append only file" — observed bricking a 3-node
+    appliance over 158 bytes of torn cache. Redis is the cache + Celery
+    broker here and Postgres is the store of record, so discarding a torn
+    tail always beats never booting again.
+  */}}
   redis.conf.tmpl: |
     maxmemory {{ .Values.redis.maxmemory }}
     maxmemory-policy allkeys-lru
     appendonly yes
+    # Discard, don't die on, a power-cut-torn AOF tail (#590). Plain byte
+    # count — redis rejects a "16mb"-style suffix on this directive.
+    aof-load-corrupt-tail-max-size {{ int .Values.redis.aofLoadCorruptTailMaxBytes }}
     {{- if $authEnabled }}
     requirepass __PASSWORD__
     masterauth __PASSWORD__
@@ -169,21 +181,26 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      # Spread the redis pods across nodes so a single node loss
-      # doesn't take the quorum with it. Soft anti-affinity (best
-      # effort) keeps single-node dev installs schedulable.
-      affinity:
-        {{- with .Values.redis.affinity }}
-        {{- toYaml . | nindent 8 }}
-        {{- end }}
-        podAntiAffinity:
-          preferredDuringSchedulingIgnoredDuringExecution:
-            - weight: 100
-              podAffinityTerm:
-                labelSelector:
-                  matchLabels:
-                    {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" $cmp) .) | nindent 20 }}
-                topologyKey: kubernetes.io/hostname
+      # Spread the redis pods across nodes so a single node loss doesn't
+      # take the quorum with it.
+      #
+      # #590 — this used to be ``preferred`` (best-effort), which was
+      # silently useless on the appliance. The seed installs with
+      # ``sentinel.replicas: 1``; promote patches it to cp_size, and the
+      # StatefulSet scales 1→3 while the freshly-promoted members may not
+      # yet carry the control-plane node label. The seed is then the only
+      # SCHEDULABLE node, and ``preferred`` cheerfully stacks redis-1 next
+      # to redis-0 on it — where ``persistence.enabled`` pins its
+      # local-path PV forever. One node loss then took 2 of 3 replicas
+      # (data majority AND sentinel quorum) with it.
+      #
+      # ``hard`` (requiredDuringScheduling) instead leaves redis-1 Pending
+      # for the few seconds it takes the member to come up labelled, then
+      # binds its PV on the right node. The shared helper emits nothing
+      # below 2 replicas — a single-replica (single-node / dev) install has
+      # nothing to spread and must stay schedulable — and MERGES an
+      # operator-supplied ``redis.affinity`` rather than replacing it.
+      {{- include "spatiumddi.podAntiAffinity" (merge (dict "component" $cmp "mode" "hard" "replicas" $replicas "override" .Values.redis.affinity) .) | nindent 6 }}
   {{- if .Values.redis.persistence.enabled }}
   volumeClaimTemplates:
     - metadata:

@@ -177,10 +177,7 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.api.affinity }}
-      affinity:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
+      {{- include "spatiumddi.podAntiAffinity" (merge (dict "component" $cmp "mode" .Values.api.podAntiAffinity "replicas" .Values.api.replicas "override" .Values.api.affinity) .) | nindent 6 }}
 ---
 apiVersion: v1
 kind: Service
