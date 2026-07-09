@@ -44,11 +44,17 @@ spec:
           # Match the cache-friendly ``maxmemory`` policy used in
           # docker-compose.yml — keeps the in-cluster Redis bounded
           # and behaves like the compose stack on eviction.
+          # #590 — ``--aof-load-corrupt-tail-max-size`` tolerates the torn
+          # AOF tail a hard power loss leaves behind. Redis defaults it to
+          # 0 (refuse to start on any corruption), which turns a few bytes
+          # of expendable cache into a permanent crashloop. Same rationale
+          # as the sentinel path; see redis-sentinel.yaml. The value is a
+          # plain byte count — redis rejects a "16mb"-style suffix here.
           {{- if .Values.redis.auth.enabled }}
           command:
             - sh
             - -c
-            - exec redis-server --requirepass "$REDIS_PASSWORD" --maxmemory {{ .Values.redis.maxmemory | quote }} --maxmemory-policy allkeys-lru --appendonly yes
+            - exec redis-server --requirepass "$REDIS_PASSWORD" --maxmemory {{ .Values.redis.maxmemory | quote }} --maxmemory-policy allkeys-lru --appendonly yes --aof-load-corrupt-tail-max-size {{ int .Values.redis.aofLoadCorruptTailMaxBytes }}
           env:
             - name: REDIS_PASSWORD
               valueFrom:
@@ -64,6 +70,8 @@ spec:
             - allkeys-lru
             - --appendonly
             - "yes"
+            - --aof-load-corrupt-tail-max-size
+            - {{ int .Values.redis.aofLoadCorruptTailMaxBytes | quote }}
           {{- end }}
           volumeMounts:
             - name: data

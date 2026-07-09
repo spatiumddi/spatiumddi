@@ -30,6 +30,38 @@ CONTROL_MANIFEST="$K3S_MANIFESTS_DIR/spatium-control.yaml"
 METALLB_MANIFEST="$K3S_MANIFESTS_DIR/spatium-metallb.yaml"
 SPATIUMDDI_VERSION_FILE=/usr/lib/spatiumddi/spatiumddi-version
 
+# ── #590 — is this node an etcd member of ANOTHER node's cluster? ────────────
+# Written only by a SUCCESSFUL spatium-cluster-join, so its presence means
+# the seed's HelmCharts govern this cluster and this node owns none of them.
+#
+# This script runs on EVERY boot with no ordering against k3s.service (see
+# the mkdir note below), so on a joined member it would otherwise re-render
+# its own single-node manifests into the auto-deploy dir while k3s is coming
+# up. k3s's deploy controller then applies them CLUSTER-WIDE, clobbering the
+# seed's releases of the same name — the Addon CR is one cluster-scoped
+# object, so whichever node writes last wins.
+#
+# Observed live on a 3-node install after a simultaneous power cut: all three
+# nodes raced, a member's spatium-bootstrap.yaml won, and its values
+# (``cnpg: false`` + ``agentLanding: true``) UNINSTALLED the CloudNativePG
+# operator on a healthy cluster and parked an unschedulable nginx pod on the
+# frontend's :80. The Cluster CR kept reporting "healthy" because nothing was
+# left running to update its status.
+#
+# spatium-cluster-join already moves these manifests aside at join time; the
+# guards below are what keep firstboot from putting them back. NOTE we only
+# ever SKIP writing — never delete. A manifest removed while k3s is running
+# fires fsnotify, k3s deletes the Addon, and the wrangler finalizer
+# UNINSTALLS the release. (do_join is safe because it stops k3s first.)
+K3S_JOIN_DROPIN="${SPATIUM_K3S_JOIN_DROPIN:-/etc/rancher/k3s/config.yaml.d/spatium-cluster.yaml}"
+node_is_cluster_member() { [ -f "$K3S_JOIN_DROPIN" ]; }
+
+# Sourced by the unit tests to reach the helpers above without running any of
+# the boot-time side effects below. Mirrors spatium-cluster-join's guard.
+if [ "${SPATIUM_FIRSTBOOT_LIB:-}" = "1" ]; then
+    return 0 2>/dev/null || exit 0
+fi
+
 mkdir -p "$(dirname "$LOG")" "$(dirname "$STAMP")"
 exec >>"$LOG" 2>&1
 echo "=== spatiumddi-firstboot $(date -Iseconds) ==="
@@ -353,7 +385,14 @@ fi
 # match the chart's volume mount + the in-cluster cert-deployer
 # update path that the api uses on operator upload.
 TLS_CERT_MANIFEST="$K3S_MANIFESTS_DIR/spatium-appliance-tls.yaml"
-if [ ! -f "$TLS_CERT_MANIFEST" ]; then
+# #590 — on a joined member the ``[ ! -f ]`` guard below is always TRUE (the
+# join moved the manifest aside), so every reboot would mint a fresh
+# self-signed cert and overwrite the CLUSTER's spatium-appliance-tls Secret —
+# silently replacing an operator-uploaded or ACME-issued cert with this
+# node's throwaway one. The seed owns that Secret; a member must not write it.
+if node_is_cluster_member; then
+    echo "Joined cluster member — skipping self-signed TLS Secret manifest (the seed owns spatium-appliance-tls)."
+elif [ ! -f "$TLS_CERT_MANIFEST" ]; then
     HN_VAL=$(grep "^APPLIANCE_HOSTNAME=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2-)
     HN_VAL="${HN_VAL:-$(hostname 2>/dev/null || echo spatiumddi)}"
     IPS_VAL=$(grep "^APPLIANCE_HOST_IPS=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2-)
@@ -635,6 +674,25 @@ spec:
     # subPath mount finds it on first scheduling.
     frontend:
       replicas: 1  # spatium:cp-size
+      # #590 — replicas tracks the control-plane node count exactly, so
+      # spread one per node and never stack two on the seed. Inert at
+      # replicas: 1. hostNetwork makes this doubly true: a second frontend
+      # on the same node would collide on :80/:443 anyway.
+      podAntiAffinity: hard
+      # #590 — a dead control-plane node must free this replica in
+      # seconds, not the k8s default 300 s. Set here (not in the chart
+      # defaults) because pinning both taint keys suppresses the
+      # DefaultTolerationSeconds admission plugin, which a BYO-Kubernetes
+      # install still wants.
+      tolerations:
+        - key: node.kubernetes.io/unreachable
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 20
+        - key: node.kubernetes.io/not-ready
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 20
       hostNetwork: true
       # #272 Phase 7c — control-plane VIP. Empty on a fresh install
       # (hostNetwork frontend, no VIP); the seed supervisor patches this
@@ -659,6 +717,25 @@ spec:
     # each + disable HPA (no horizontal scaling on a single host).
     api:
       replicas: 1  # spatium:cp-size
+      # #590 — one api per control-plane node. Without this a promote
+      # could land every api pod on the seed, so losing the seed left no
+      # ready api anywhere and the whole cluster served 502s. Inert at
+      # replicas: 1.
+      podAntiAffinity: hard
+      # #590 — a dead control-plane node must free this replica in
+      # seconds, not the k8s default 300 s. Set here (not in the chart
+      # defaults) because pinning both taint keys suppresses the
+      # DefaultTolerationSeconds admission plugin, which a BYO-Kubernetes
+      # install still wants.
+      tolerations:
+        - key: node.kubernetes.io/unreachable
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 20
+        - key: node.kubernetes.io/not-ready
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 20
       autoscaling:
         enabled: false
       env:
@@ -728,6 +805,22 @@ spec:
         enabled: true
     worker:
       replicas: 1  # spatium:cp-size
+      # #590 — one worker per control-plane node; see api.podAntiAffinity.
+      podAntiAffinity: hard
+      # #590 — a dead control-plane node must free this replica in
+      # seconds, not the k8s default 300 s. Set here (not in the chart
+      # defaults) because pinning both taint keys suppresses the
+      # DefaultTolerationSeconds admission plugin, which a BYO-Kubernetes
+      # install still wants.
+      tolerations:
+        - key: node.kubernetes.io/unreachable
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 20
+        - key: node.kubernetes.io/not-ready
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 20
     # #277 — PostgreSQL runs under CloudNativePG on every appliance, so
     # the data layer scales with the control-plane cluster: 1 instance on
     # a single node, growing to 3/5/7 (primary + streaming replicas with
@@ -741,6 +834,12 @@ spec:
       kind: cnpg
       cnpg:
         instances: 1  # spatium:cp-size
+        # #590 — one Postgres instance per control-plane node. CNPG's
+        # default ``preferred`` anti-affinity let two of three instances
+        # stack on the seed during a 1→3 promote (the members weren't
+        # labelled yet), so a single node loss would have taken the
+        # primary and a replica together. Inert at instances: 1.
+        podAntiAffinityType: required
     # #272 Phase 3 — Redis runs under Sentinel on every appliance so the
     # cache/queue layer is HA like postgres: each replica pairs a
     # redis-server with a redis-sentinel that elects a master + fails
@@ -763,7 +862,18 @@ spec:
 EOF
 }
 
-case "$APPLIANCE_ROLE_VAL" in
+# #590 — a joined member renders NOTHING into the auto-deploy dir. Routed
+# through a separate variable so $APPLIANCE_ROLE_VAL keeps its real value for
+# the agent-landing page render further down.
+BOOTSTRAP_ROLE="$APPLIANCE_ROLE_VAL"
+if node_is_cluster_member; then
+    BOOTSTRAP_ROLE="joined-member"
+fi
+
+case "$BOOTSTRAP_ROLE" in
+    joined-member)
+        echo "Joined cluster member — skipping bootstrap manifest render; the seed's releases govern this cluster."
+        ;;
     appliance|application)
         if [ ! -f "$CHART_TGZ" ]; then
             echo "WARN: $CHART_TGZ missing — supervisor pod won't auto-deploy. Is the chart baked?"

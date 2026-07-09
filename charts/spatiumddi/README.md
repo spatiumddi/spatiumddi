@@ -248,6 +248,98 @@ helm upgrade ddi oci://ghcr.io/spatiumddi/charts/spatiumddi \
 The migrate Job runs as a `pre-upgrade` hook, so Alembic applies
 before the new API pods roll out.
 
+### Sentinel ghost entries clear themselves on upgrade
+
+Chart versions before the #590 fix let every Redis pod announce itself to
+its peers by its **pod IP**. A pod that gets rescheduled (node loss, drain,
+OS upgrade) returns with a new IP and a new run id, so the surviving
+sentinels record a *second* entry for it and keep the old one as `s_down`
+forever — Sentinel never forgets a Sentinel it has seen.
+
+That is not cosmetic. Sentinel authorizes a failover only with a majority
+of **all known** sentinels, and dead ghosts sit in the denominator without
+ever voting. With three live pods, the third accumulated ghost makes
+failover arithmetically impossible (6 known, 4 needed, 3 usable): the
+master is stranded, `sentinel://` clients never resolve a new one, and the
+API stays down. Each node loss contributes one ghost.
+
+This release pins `replica-announce-ip` / `sentinel announce-ip` to each
+pod's stable StatefulSet FQDN, so a returning pod replaces its own entry
+instead of adding one.
+
+**No manual step is needed.** The init container rewrites `sentinel.conf`
+on every pod start, so the rolling update discards the accumulated ghosts
+along with the rest of each sentinel's learned state. To confirm afterwards
+(`usable` should equal your replica count, and no `s_down` rows):
+
+```bash
+kubectl -n spatiumddi exec <release>-redis-0 -c sentinel -- \
+  redis-cli -p 26379 sentinel ckquorum mymaster
+kubectl -n spatiumddi exec <release>-redis-0 -c sentinel -- \
+  redis-cli -p 26379 sentinel sentinels mymaster | grep -A1 flags
+```
+
+On a cluster you cannot roll yet, `SENTINEL RESET *` on each sentinel
+clears the ghosts immediately without restarting anything.
+
+### One-time step when upgrading a Sentinel Redis whose replicas were co-located
+
+Chart versions before the #590 fix used best-effort (`preferred`) pod
+anti-affinity on the Sentinel Redis StatefulSet, so two replicas could
+land on the same node — and `persistence.enabled` then pinned each
+replica's `ReadWriteOnce` local PV to whichever node it first scheduled
+on. This release makes the anti-affinity **required**, which is what
+makes a single node loss survivable. A replica whose PV is stranded on a
+node that already hosts another replica cannot schedule, and will sit
+`Pending` after the rolling update.
+
+Check for it, and repair by deleting the stranded PVC so it
+re-provisions on a free node (Redis here is cache + Celery broker;
+Postgres is the store of record, so the data is expendable and the
+replica resyncs from the master):
+
+```bash
+kubectl -n spatiumddi get pods -l app.kubernetes.io/component=redis \
+  -o wide                                    # any Pending, and where?
+kubectl -n spatiumddi delete pvc data-<release>-redis-<ordinal>
+kubectl -n spatiumddi delete pod <release>-redis-<ordinal>
+```
+
+Clusters whose replicas were already spread one-per-node upgrade with no
+action. This does not apply to `redis.kind: standalone`.
+
+### The same step for CloudNativePG, if you set `podAntiAffinityType: required`
+
+CNPG has the identical hazard, and the repair is the same shape — but
+Postgres is not expendable, so the rule is stricter.
+
+`postgresql.cnpg.podAntiAffinityType` defaults to `preferred` in this chart
+(the appliance renders `required`). Flipping an **existing** cluster to
+`required` can strand an instance whose PVC is already bound to a node that
+now hosts another instance. It goes `Pending`.
+
+Postgres stays available while you fix it: the primary is untouched, and a
+surviving replica keeps failover possible.
+
+> **Only ever delete a REPLICA's PVC. Never the primary's.** Deleting the
+> primary's PVC destroys the database. Confirm the role before you touch
+> anything — CNPG labels the primary `cnpg.io/instanceRole=primary`.
+
+```bash
+# Which instance is Pending, and which one is the primary?
+kubectl -n spatiumddi get pods -l cnpg.io/cluster=<cluster> \
+  -L cnpg.io/instanceRole -o wide
+
+# Confirm the Pending pod is NOT the primary, then drop its PVC.
+# CNPG re-clones the replica from the primary (pg_basebackup).
+kubectl -n spatiumddi delete pvc <cluster>-<ordinal>
+kubectl -n spatiumddi delete pod <cluster>-<ordinal>
+```
+
+If the stranded instance *is* the primary, don't delete anything: run a
+switchover first (`kubectl cnpg promote <cluster> <other-instance>`), wait
+for the role to move, then repair it as a replica.
+
 ## Uninstall
 
 ```bash

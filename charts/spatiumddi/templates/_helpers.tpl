@@ -97,6 +97,101 @@ nodeSelector:
 {{- end -}}
 
 {{/*
+Emit the ``affinity:`` block for a replicated control-plane workload
+(#590). Spreads a component's replicas one-per-node so a single node
+loss costs at most one replica.
+
+  {{- include "spatiumddi.podAntiAffinity" (merge (dict
+        "component" "api"
+        "mode" .Values.api.podAntiAffinity
+        "replicas" .Values.api.replicas
+        "override" .Values.api.affinity) .) | nindent 6 }}
+
+``mode`` is one of:
+  hard  — requiredDuringScheduling. The replica stays Pending until a
+          distinct node is available. Correct on the appliance, where
+          replicas tracks the control-plane node count exactly.
+  soft  — preferredDuringScheduling. Best effort; the chart default so
+          a BYO-Kubernetes install with more replicas than nodes still
+          schedules.
+  none  — emit no podAntiAffinity.
+
+The default spread is MERGED into an operator-supplied
+``<component>.affinity`` rather than replacing it: an operator who sets
+``nodeAffinity`` (say, to keep a workload off spot/tainted nodes) must
+not silently lose the cross-node spread that keeps a single node loss
+survivable. Only an override that declares its OWN ``podAntiAffinity``
+key wins — that one is an explicit opt-out, and merging the two would
+render a duplicate key.
+
+Nothing is spread below 2 replicas (nothing to spread).
+
+#590 — api/worker/frontend previously defaulted to no affinity at all,
+so a 3-node cluster could (and did) land 3 of 4 api pods on the seed.
+Losing that node meant no ready api pod anywhere, and rescheduling off
+a NotReady node waits out ``node.kubernetes.io/not-ready`` first — see
+the matching tolerations on the appliance paths. Redis goes through the
+same helper: its replicas are the ones whose mis-placement (two on the
+seed, pinned there by local-path PVs) caused the outage.
+*/}}
+{{/*
+Emit the ``strategy:`` block for a Deployment that may carry REQUIRED pod
+anti-affinity (#590).
+
+  {{- include "spatiumddi.deploymentStrategy" (dict
+        "mode" .Values.api.podAntiAffinity
+        "replicas" .Values.api.replicas) | nindent 2 }}
+
+Required anti-affinity + ``replicas == number of eligible nodes`` makes the
+default surge pod UNSCHEDULABLE, and the default ``maxUnavailable: 0`` then
+forbids freeing a node by retiring an old pod first. The rollout wedges
+permanently: the anti-affinity labelSelector matches on ``component``, which
+the OUTGOING ReplicaSet's pods carry too, so the incoming surge pod sees
+every node already occupied by one of its own.
+
+Observed live on a 1→3 promote: two new api pods landed on the freshly
+promoted members, the third sat Pending forever with "3 node(s) didn't match
+pod anti-affinity rules" while the old pod held the seed.
+
+So under ``hard`` we invert the knobs — retire one old pod, then schedule its
+replacement onto the node it just freed. Costs one replica of capacity during
+a rollout instead of deadlocking. (frontend's hostNetwork path uses Recreate
+for the same underlying reason: an exclusive per-node resource.)
+*/}}
+{{- define "spatiumddi.deploymentStrategy" -}}
+{{- $mode := default "soft" .mode -}}
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+  {{- if and (gt (int .replicas) 1) (eq $mode "hard") }}
+    maxSurge: 0
+    maxUnavailable: 1
+  {{- else }}
+    maxSurge: 1
+    maxUnavailable: 0
+  {{- end }}
+{{- end -}}
+
+{{- define "spatiumddi.podAntiAffinity" -}}
+{{- $mode := default "soft" .mode -}}
+{{- $affinity := deepCopy (default (dict) .override) -}}
+{{- if and (gt (int .replicas) 1) (ne $mode "none") (not (hasKey $affinity "podAntiAffinity")) -}}
+  {{- $selector := dict "matchLabels" (include "spatiumddi.componentSelectorLabels" . | fromYaml) -}}
+  {{- $term := dict "labelSelector" $selector "topologyKey" "kubernetes.io/hostname" -}}
+  {{- if eq $mode "hard" -}}
+    {{- $_ := set $affinity "podAntiAffinity" (dict "requiredDuringSchedulingIgnoredDuringExecution" (list $term)) -}}
+  {{- else -}}
+    {{- $weighted := dict "weight" 100 "podAffinityTerm" $term -}}
+    {{- $_ := set $affinity "podAntiAffinity" (dict "preferredDuringSchedulingIgnoredDuringExecution" (list $weighted)) -}}
+  {{- end -}}
+{{- end -}}
+{{- if $affinity }}
+affinity:
+  {{- toYaml $affinity | nindent 2 }}
+{{- end }}
+{{- end -}}
+
+{{/*
 Name of the chart-owned secret carrying SECRET_KEY.
 */}}
 {{- define "spatiumddi.appSecretName" -}}

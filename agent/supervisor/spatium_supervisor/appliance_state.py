@@ -584,6 +584,59 @@ _CLUSTER_LEAVE_CONFIRM = "SPATIUMDDI-CLUSTER-LEAVE-CONFIRM-V1"
 _CLUSTER_JOIN_STATE_SIDECAR = Path(
     "/var/lib/spatiumddi-host/release-state/cluster-join.state"
 )
+# #590 — cluster-transition attempt ceiling. ``maybe_fire_cluster_join`` /
+# ``maybe_fire_cluster_leave`` used to guard on nothing but "does the trigger
+# file exist", and the host runner renames the trigger to ``.failed.<ts>``
+# when it gives up — so a transition that could never succeed re-fired a
+# DESTRUCTIVE k3s identity wipe on every single heartbeat, forever, while the
+# row sat in "joining". The backend now clears the desired-state on a
+# reported ``failed`` (which is what actually stops the loop); this ceiling
+# is the belt to that pair of braces, bounding the damage even against a
+# control plane that never processes the failure.
+#
+# The ledger itself is the module's existing hash-keyed fire-state sidecar
+# (``_fire_state_path`` / ``_read_fire_state`` / ``_write_fire_state``, the
+# same one the host-config planes use), keyed by a fingerprint of the
+# transition target — so re-driving against a different seed starts with a
+# fresh budget. ``reset_cluster_join_attempts()`` clears both ledgers
+# whenever the control plane stops asking for a role change.
+_CLUSTER_JOIN_MAX_ATTEMPTS = 3
+
+# #590 — "this terminal verdict has already been delivered" marker.
+#
+# The .state sidecar is written by the ROOT host runner and lives in a
+# 1777-sticky dir, so this unprivileged supervisor cannot delete it — it
+# would otherwise keep re-reporting a stale ``failed`` from a previous
+# episode. Now that the backend CLEARS the desired-state on a reported
+# ``failed`` (instead of re-firing the join forever), a stale re-report
+# would clear the desired-state of the operator's NEXT promote before the
+# join ever fires — turning the old infinite-retry bug into a permanent
+# "promote does nothing" deadlock.
+#
+# So: once the control plane has acknowledged a ``failed`` verdict (it
+# drops the desired-state, which is how we know), stamp the sidecar's
+# identity here and stop reporting it. The runner rewrites .state — and
+# therefore its mtime — at the top of every run, so the next real episode
+# reports again. Owned by the supervisor, so rewriting is permitted.
+_CLUSTER_JOIN_STATE_CONSUMED = Path(
+    "/var/lib/spatiumddi-host/release-state/cluster-join.state.consumed"
+)
+# ONLY ``failed`` is retired — never ``ready`` / ``left``.
+#
+# ``ready`` is NOT merely a report: it is this node's local source of truth
+# for "I am a promoted control-plane member". service_lifecycle
+# .reconcile_node_labels() adds the control-plane node label when it sees
+# ``ready`` and STRIPS it otherwise, and heartbeat._is_control_plane_member
+# () uses it to pick the in-cluster api Service over the seed's external
+# URL. Retiring ``ready`` would deschedule api/frontend/worker/beat/CNPG/
+# redis off every promoted member on the first idle heartbeat after a
+# SUCCESSFUL promote — the exact HA collapse #590 exists to prevent.
+#
+# Retiring them is also unnecessary: the backend's clear-on-failed branches
+# are gated on ``desired_cluster_role``, so a re-reported ``ready``/``left``
+# arriving with no desired-state set is already a no-op there. Only a stale
+# ``failed`` can clear the desired-state of the operator's NEXT promote.
+_CLUSTER_JOIN_CONSUMABLE_STATES = frozenset({"failed"})
 _K3S_JOIN_TOKEN_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/k3s-join-token")
 
 # #272 Phase 9b — guided etcd restore. Same trigger-file + confirm-marker
@@ -846,7 +899,10 @@ def _write_fire_state(
     fire_state_file: Path, config_hash: str, attempts: int, when: datetime
 ) -> None:
     try:
-        tmp = fire_state_file.with_suffix(".new")
+        # with_name(), not with_suffix(): the latter REPLACES ".fire-state",
+        # so "<trigger>.fire-state" would stage through "<trigger>.new" —
+        # the very path the trigger writers use for their own atomic temp.
+        tmp = fire_state_file.with_name(fire_state_file.name + ".new")
         tmp.write_text(
             f"{config_hash}\t{attempts}\t{when.isoformat()}\n", encoding="utf-8"
         )
@@ -1374,6 +1430,91 @@ def maybe_fire_snmp_reload(bundle_block: object) -> bool:
 # ── #272 Phase 7b — control-plane cluster join/leave ────────────────
 
 
+def _join_target_fingerprint(server_url: str, join_token: str) -> str:
+    """Stable, non-reversible id for a join target (#590).
+
+    The token is a control-plane-admin-equivalent secret, so the ledger
+    stores a digest rather than the value — it only ever needs to answer
+    "is this the same target as last time?".
+    """
+    digest = hashlib.sha256(f"{server_url}\n{join_token}".encode())
+    return digest.hexdigest()[:16]
+
+
+def _cluster_transition_should_fire(trigger_file: Path, fingerprint: str) -> bool:
+    """#590 — bound the number of times a DESTRUCTIVE cluster transition
+    re-fires against the same target.
+
+    The host runner renames a failed trigger to ``.failed.<ts>``, so
+    trigger-file presence alone cannot stop a doomed join/leave from
+    re-running a full k3s identity wipe on every heartbeat, forever. The
+    backend's clear-on-failed is the primary brake; this is the backstop
+    for a control plane that never processes the failure.
+
+    Reuses the module's hash-keyed fire-state ledger (``_read_fire_state``
+    / ``_write_fire_state``), the same one the host-config planes use for
+    their re-fire backoff. Budget is per fingerprint: a transition against
+    a different target starts over.
+    """
+    fire_state = _fire_state_path(trigger_file)
+    prev_fingerprint, attempts, _last_at = _read_fire_state(fire_state)
+    if prev_fingerprint != fingerprint:
+        attempts = 0
+    if attempts >= _CLUSTER_JOIN_MAX_ATTEMPTS:
+        log.error(
+            "supervisor.cluster_transition.attempt_ceiling_reached",
+            trigger=trigger_file.name,
+            attempts=attempts,
+            max_attempts=_CLUSTER_JOIN_MAX_ATTEMPTS,
+            detail=(
+                "refusing to re-fire the destructive transition; see "
+                "/var/log/spatiumddi/cluster-join.log, then re-drive it to retry"
+            ),
+        )
+        return False
+    return True
+
+
+def _record_cluster_transition_fire(trigger_file: Path, fingerprint: str) -> None:
+    """Count an armed transition against its per-fingerprint budget."""
+    fire_state = _fire_state_path(trigger_file)
+    prev_fingerprint, attempts, _last_at = _read_fire_state(fire_state)
+    if prev_fingerprint != fingerprint:
+        attempts = 0
+    _write_fire_state(fire_state, fingerprint, attempts + 1, datetime.now(UTC))
+
+
+def _reset_cluster_transition_attempts(trigger_file: Path) -> None:
+    try:
+        _fire_state_path(trigger_file).unlink()
+    except FileNotFoundError:
+        # Expected on the overwhelming majority of ticks: no ledger exists
+        # until a transition actually fires, and this runs on every idle
+        # heartbeat. Not a failure.
+        return
+    except OSError as exc:
+        # A ledger we cannot clear means a later re-drive of the SAME
+        # transition could inherit an exhausted budget and silently never
+        # fire, so this is worth surfacing rather than swallowing.
+        log.warning(
+            "supervisor.cluster_transition.ledger_reset_failed",
+            trigger=trigger_file.name,
+            error=str(exc),
+        )
+
+
+def reset_cluster_join_attempts() -> None:
+    """Drop the join + leave attempt ledgers (#590).
+
+    Called whenever the control plane stops asking this node to change its
+    cluster role — including after the backend clears the desired-state on
+    a reported ``failed``. Without this an operator re-driving the SAME
+    transition would inherit the exhausted budget and never fire a retry.
+    """
+    _reset_cluster_transition_attempts(_CLUSTER_JOIN_TRIGGER_FILE)
+    _reset_cluster_transition_attempts(_CLUSTER_LEAVE_TRIGGER_FILE)
+
+
 def maybe_fire_cluster_join(
     desired_cluster_role: str | None,
     server_url: str | None,
@@ -1396,6 +1537,21 @@ def maybe_fire_cluster_join(
     ``_CLUSTER_JOIN_CONFIRM`` guardrail marker, then ``server_url``,
     then ``join_token``. The runner refuses any trigger whose first
     line isn't the marker, so a stray file can't fire a wipe.
+
+    #590 — trigger-file presence is NOT sufficient on its own. The runner
+    renames the trigger to ``.done`` the moment it succeeds, but
+    ``desired_cluster_role`` stays ``member`` until the backend sees a
+    ``ready`` heartbeat and settles it. In that window (trigger gone,
+    desired still set) the next heartbeat re-fired the join and wiped the
+    node's freshly-joined k3s identity. Observed live: a member reported
+    "JOIN ok" at 15:43:31 and re-fired at 15:43:58, and the second attempt
+    failed — leaving a node that k3s counted as an etcd member but the
+    control plane counted as nothing.
+
+    So also gate on what the runner last wrote. ``.state`` carries the
+    target it acted on in its reason field (``ready\\t<server_url>``), which
+    is what lets us tell "already joined THIS seed" apart from "promoted to
+    a different seed and must re-join".
     """
     if detect_deployment_kind() != "appliance":
         return False
@@ -1412,17 +1568,42 @@ def maybe_fire_cluster_join(
         return False
     if _CLUSTER_JOIN_TRIGGER_FILE.exists():
         return False
+    # #590 — don't re-run a join the runner has already finished (or is still
+    # running). The trigger file is gone in both cases, so it cannot tell us.
+    state, target = read_cluster_join_state()
+    if state == "joining":
+        # Runner is mid-flight: it renames the trigger BEFORE it finishes.
+        return False
+    if state == "ready" and (target or "") == server_url:
+        # Already a member of this exact seed. The backend clears the
+        # desired-state once it sees the ``ready`` heartbeat; until then,
+        # firing again would wipe the identity we just built.
+        return False
+    # Failure ceiling. The runner renames a failed trigger out of the way, so
+    # trigger-file presence alone can't stop a doomed join from re-wiping this
+    # node's k3s state on every heartbeat. Budget is per target: a promote
+    # against a different seed (or a re-promote after the ledger is reset)
+    # starts over.
+    fingerprint = _join_target_fingerprint(server_url, join_token)
+    if not _cluster_transition_should_fire(_CLUSTER_JOIN_TRIGGER_FILE, fingerprint):
+        return False
     try:
         _CLUSTER_JOIN_TRIGGER_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = _CLUSTER_JOIN_TRIGGER_FILE.with_suffix(".new")
+        tmp = _CLUSTER_JOIN_TRIGGER_FILE.with_name(
+            _CLUSTER_JOIN_TRIGGER_FILE.name + ".new"
+        )
         # The join token is a control-plane-admin-equivalent secret; write
         # it owner-only atomically (see _write_owner_only) so it can't be
         # read by another unprivileged user out of the 1777-sticky dir.
         _write_owner_only(tmp, f"{_CLUSTER_JOIN_CONFIRM}\n{server_url}\n{join_token}\n")
         tmp.replace(_CLUSTER_JOIN_TRIGGER_FILE)
-        return True
     except OSError:
         return False
+    # Count the fire only once it's actually armed. Ledger loss (unwritable
+    # dir) must not block the join — the backend's clear-on-failed is the
+    # primary brake; this is the backstop.
+    _record_cluster_transition_fire(_CLUSTER_JOIN_TRIGGER_FILE, fingerprint)
+    return True
 
 
 def maybe_fire_cluster_leave(desired_cluster_role: str | None) -> bool:
@@ -1433,6 +1614,14 @@ def maybe_fire_cluster_leave(desired_cluster_role: str | None) -> bool:
     marker then a timestamp. The runner refuses any trigger whose first
     line isn't the marker. Strict appliance-only + idempotent via
     trigger-file presence.
+
+    #590 — the leave is exactly as destructive as the join (``do_leave``
+    runs the same full ``backup_and_wipe_identity`` + k3s restart) and the
+    runner renames a failed leave trigger to ``.failed.<ts>`` just like the
+    join. So it gets the same per-target attempt ceiling; without it a
+    demote that can never come Ready re-wipes this node's k3s state on
+    every heartbeat, forever, whenever the control plane isn't around to
+    clear the desired-state.
     """
     if detect_deployment_kind() != "appliance":
         return False
@@ -1440,15 +1629,105 @@ def maybe_fire_cluster_leave(desired_cluster_role: str | None) -> bool:
         return False
     if _CLUSTER_LEAVE_TRIGGER_FILE.exists():
         return False
+    # #590 — same window as the join: do_leave renames its trigger away, but
+    # ``desired_cluster_role`` stays "none" until the backend sees a ``left``
+    # heartbeat. Re-firing here would run the destructive identity wipe a
+    # second time on a node that has already left.
+    state, _target = read_cluster_join_state()
+    if state in ("leaving", "left"):
+        return False
+    # A leave has no target coordinates, so the whole operation is one
+    # fingerprint — the budget bounds "this node's demote", period.
+    fingerprint = "leave"
+    if not _cluster_transition_should_fire(_CLUSTER_LEAVE_TRIGGER_FILE, fingerprint):
+        return False
     try:
         _CLUSTER_LEAVE_TRIGGER_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = _CLUSTER_LEAVE_TRIGGER_FILE.with_suffix(".new")
+        tmp = _CLUSTER_LEAVE_TRIGGER_FILE.with_name(
+            _CLUSTER_LEAVE_TRIGGER_FILE.name + ".new"
+        )
         ts = datetime.now(UTC).isoformat().replace("+00:00", "Z")
         tmp.write_text(f"{_CLUSTER_LEAVE_CONFIRM}\n{ts}\n", encoding="utf-8")
         tmp.replace(_CLUSTER_LEAVE_TRIGGER_FILE)
-        return True
     except OSError:
         return False
+    _record_cluster_transition_fire(_CLUSTER_LEAVE_TRIGGER_FILE, fingerprint)
+    return True
+
+
+def _read_cluster_join_sidecar() -> tuple[str, str | None, int] | None:
+    """``(state, reason, mtime_ns)`` for the .state sidecar, or None when
+    it's missing / unreadable / empty.
+
+    One stat + one read. Both the reporting path and the consume path go
+    through here, so the sidecar is never opened twice per heartbeat.
+    """
+    try:
+        stat = _CLUSTER_JOIN_STATE_SIDECAR.stat()
+        raw = _CLUSTER_JOIN_STATE_SIDECAR.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not raw:
+        return None
+    state, _, reason = raw.partition("\t")
+    if not state:
+        return None
+    return state, (reason or None), stat.st_mtime_ns
+
+
+def _consumed_identity(state: str, mtime_ns: int) -> str:
+    """The episode-identity line stored in the consumed marker."""
+    return f"{state}\t{mtime_ns}"
+
+
+def mark_cluster_join_state_consumed() -> None:
+    """Record that the control plane has acted on the current ``failed``
+    verdict, so we stop re-reporting it (#590).
+
+    Called once the heartbeat response carries no desired cluster role —
+    i.e. the backend settled the transition, or gave up on it after the
+    failure. Only ``failed`` is marked: see _CLUSTER_JOIN_CONSUMABLE_STATES
+    for why retiring ``ready`` would deschedule the control plane off every
+    promoted member.
+    """
+    sidecar = _read_cluster_join_sidecar()
+    if sidecar is None:
+        return
+    state, _reason, mtime_ns = sidecar
+    if state not in _CLUSTER_JOIN_CONSUMABLE_STATES:
+        return
+    identity = _consumed_identity(state, mtime_ns)
+    # Idempotent: this runs on every steady-state heartbeat, and rewriting
+    # byte-identical content would churn the flash-backed /var partition
+    # for the life of the appliance.
+    try:
+        if _CLUSTER_JOIN_STATE_CONSUMED.read_text(encoding="utf-8").strip() == identity:
+            return
+    except FileNotFoundError:
+        # No marker yet — the common first-consume path. Fall through and
+        # write one.
+        pass
+    except OSError as exc:
+        # Marker exists but is unreadable. Fall through and rewrite it: a
+        # marker we cannot read is indistinguishable from one that doesn't
+        # match, and re-reporting a stale ``failed`` is the failure mode we
+        # are here to prevent.
+        log.warning(
+            "supervisor.cluster_join.consumed_marker_unreadable", error=str(exc)
+        )
+    try:
+        # with_name(), not with_suffix() — the latter would REPLACE the
+        # ".consumed" suffix rather than append, landing the temp file on
+        # a name that collides with the .state sidecar's namespace.
+        tmp = _CLUSTER_JOIN_STATE_CONSUMED.with_name(
+            _CLUSTER_JOIN_STATE_CONSUMED.name + ".new"
+        )
+        _write_owner_only(tmp, f"{identity}\n")
+        tmp.replace(_CLUSTER_JOIN_STATE_CONSUMED)
+    except OSError:
+        # Best-effort. Worst case the stale verdict is reported once more,
+        # costing the operator one extra promote click — never a wipe.
+        log.warning("supervisor.cluster_join.consumed_marker_write_failed")
 
 
 def read_cluster_join_state() -> tuple[str | None, str | None]:
@@ -1458,19 +1737,31 @@ def read_cluster_join_state() -> tuple[str | None, str | None]:
     Appliance-only; ``(None, None)`` when the sidecar is missing so the
     backend's "only update when not None" semantics leave the columns
     alone on nodes that have never joined/left.
+
+    #590 — also ``(None, None)`` for a ``failed`` verdict the control plane
+    has already consumed. Re-reporting one would clear the desired-state of
+    the operator's next promote before its join ever fired. The runner
+    rewrites .state at the top of each run, so a genuinely new verdict has
+    a fresh mtime and reports normally.
+
+    NOTE: this is not a reporting-only accessor. ``ready`` is also the local
+    source of truth for control-plane membership (reconcile_node_labels +
+    _is_control_plane_member), which is why it is never retired.
     """
     if detect_deployment_kind() != "appliance":
         return None, None
-    if not _CLUSTER_JOIN_STATE_SIDECAR.exists():
+    sidecar = _read_cluster_join_sidecar()
+    if sidecar is None:
         return None, None
-    try:
-        raw = _CLUSTER_JOIN_STATE_SIDECAR.read_text(encoding="utf-8").strip()
-    except OSError:
-        return None, None
-    if not raw:
-        return None, None
-    state, _, reason = raw.partition("\t")
-    return (state or None), (reason or None)
+    state, reason, mtime_ns = sidecar
+    if state in _CLUSTER_JOIN_CONSUMABLE_STATES:
+        try:
+            consumed = _CLUSTER_JOIN_STATE_CONSUMED.read_text(encoding="utf-8").strip()
+        except OSError:
+            consumed = ""
+        if consumed == _consumed_identity(state, mtime_ns):
+            return None, None
+    return state, reason
 
 
 def maybe_fire_cluster_restore(desired_restore_snapshot: str | None) -> bool:

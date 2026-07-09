@@ -41,6 +41,13 @@ class _Recorder:
         return {}
 
 
+_SETTLED_AFFINITY = {
+    "enablePodAntiAffinity": True,
+    "podAntiAffinityType": "required",
+    "topologyKey": "kubernetes.io/hostname",
+}
+
+
 def test_scale_up_patches_when_size_differs(monkeypatch) -> None:
     rec = _Recorder(200, json.dumps({"spec": {"instances": 1}}))
     monkeypatch.setattr(k8s_api, "_request", rec)
@@ -49,11 +56,13 @@ def test_scale_up_patches_when_size_differs(monkeypatch) -> None:
 
     assert (changed, err) == (True, None)
     assert rec.patched
-    assert rec.patch_body == {"spec": {"instances": 3}}
+    assert rec.patch_body == {"spec": {"instances": 3, "affinity": _SETTLED_AFFINITY}}
 
 
-def test_idempotent_when_size_matches(monkeypatch) -> None:
-    rec = _Recorder(200, json.dumps({"spec": {"instances": 3}}))
+def test_idempotent_when_size_and_affinity_match(monkeypatch) -> None:
+    rec = _Recorder(
+        200, json.dumps({"spec": {"instances": 3, "affinity": _SETTLED_AFFINITY}})
+    )
     monkeypatch.setattr(k8s_api, "_request", rec)
 
     changed, err = k8s_api.patch_cnpg_instances(3)
@@ -61,6 +70,66 @@ def test_idempotent_when_size_matches(monkeypatch) -> None:
     # Already at target — no PATCH, no "applied" log on the next heartbeat.
     assert (changed, err) == (False, None)
     assert not rec.patched
+
+
+def test_patches_affinity_even_when_size_matches(monkeypatch) -> None:
+    """#590 — an appliance that A/B-upgrades into the fix is already at the
+    right instance count, but CNPG's ``preferred`` default let two instances
+    stack on the seed. The Cluster carries ``resource-policy: keep`` so Helm
+    will never fix it; this patch is the only path."""
+    rec = _Recorder(
+        200,
+        json.dumps(
+            {
+                "spec": {
+                    "instances": 3,
+                    "affinity": {
+                        "enablePodAntiAffinity": True,
+                        "podAntiAffinityType": "preferred",
+                    },
+                }
+            }
+        ),
+    )
+    monkeypatch.setattr(k8s_api, "_request", rec)
+
+    changed, err = k8s_api.patch_cnpg_instances(3)
+
+    assert (changed, err) == (True, None)
+    assert rec.patch_body["spec"]["affinity"]["podAntiAffinityType"] == "required"
+
+
+def test_patches_when_cnpg_has_no_affinity_block(monkeypatch) -> None:
+    """A pre-#590 Cluster CR has no ``spec.affinity`` at all."""
+    rec = _Recorder(200, json.dumps({"spec": {"instances": 3}}))
+    monkeypatch.setattr(k8s_api, "_request", rec)
+
+    changed, err = k8s_api.patch_cnpg_instances(3)
+
+    assert (changed, err) == (True, None)
+    assert rec.patch_body["spec"]["affinity"] == _SETTLED_AFFINITY
+
+
+def test_rejects_bad_anti_affinity_type(monkeypatch) -> None:
+    rec = _Recorder(200, json.dumps({"spec": {"instances": 3}}))
+    monkeypatch.setattr(k8s_api, "_request", rec)
+
+    changed, err = k8s_api.patch_cnpg_instances(3, pod_anti_affinity_type="hard")
+
+    assert changed is False
+    assert err is not None and "pod_anti_affinity_type" in err
+    assert not rec.calls  # guard short-circuits before any kubeapi call
+
+
+def test_preferred_is_honoured_when_requested(monkeypatch) -> None:
+    """BYO-Kubernetes shape: more instances than nodes wants best-effort."""
+    rec = _Recorder(200, json.dumps({"spec": {"instances": 3}}))
+    monkeypatch.setattr(k8s_api, "_request", rec)
+
+    changed, err = k8s_api.patch_cnpg_instances(3, pod_anti_affinity_type="preferred")
+
+    assert (changed, err) == (True, None)
+    assert rec.patch_body["spec"]["affinity"]["podAntiAffinityType"] == "preferred"
 
 
 def test_missing_cluster_is_quiet_noop(monkeypatch) -> None:

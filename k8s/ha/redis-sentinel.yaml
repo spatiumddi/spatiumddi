@@ -19,6 +19,20 @@ data:
     maxmemory 256mb
     maxmemory-policy allkeys-lru
     appendonly yes
+    # #590 — a hard power loss tears the AOF mid-write, and redis defaults
+    # ``aof-load-corrupt-tail-max-size`` to 0: ANY corruption is fatal, so a
+    # replica killed mid-write crashloops forever on "Bad file format
+    # reading the append only file" (observed bricking a 3-node cluster over
+    # 158 bytes of torn cache). Redis here is the cache + Celery broker and
+    # Postgres is the store of record, so discarding a torn tail always
+    # beats never booting again. Plain byte count (16 MiB) — redis rejects a
+    # "16mb"-style suffix on this directive.
+    #
+    # Distinct from ``aof-load-truncated`` (default yes), which only covers a
+    # tail that ENDS mid-record. A power cut typically leaves a tail that is
+    # present but zero-filled (ext4 records the new size before the data
+    # lands) — that reads as corrupt, not short, and needs this.
+    aof-load-corrupt-tail-max-size 16777216
     requirepass CHANGEME
     masterauth CHANGEME
 
@@ -47,6 +61,30 @@ spec:
       labels:
         app: redis
     spec:
+      # #590 — spread the replicas one per node. Required (not preferred):
+      # a single node hosting two of three replicas takes both the data
+      # majority AND the sentinel quorum with it when it dies, and with
+      # per-replica ReadWriteOnce PVCs a mis-placed replica is pinned to
+      # that node forever. A replica with nowhere to land stays Pending,
+      # which is loud — the alternative is a cluster that silently isn't HA.
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: redis
+              topologyKey: kubernetes.io/hostname
+      # A dead node must release its replica in seconds, not the k8s
+      # default 300 s, or sentinel failover races the pod eviction.
+      tolerations:
+        - key: node.kubernetes.io/unreachable
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 20
+        - key: node.kubernetes.io/not-ready
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 20
       initContainers:
         # Set replica-of on non-primary pods
         - name: init-redis
@@ -62,6 +100,22 @@ spec:
                 echo "replicaof redis-0.redis-headless.spatiumddi.svc.cluster.local 6379" >> /data/redis.conf
               fi
               cp /config/sentinel.conf /data/sentinel.conf
+              # #590 — announce this pod by its STABLE StatefulSet FQDN rather
+              # than its ephemeral pod IP. A rescheduled pod otherwise returns
+              # with a new IP + a new runid, so peers add a SECOND entry while
+              # the old one lingers as s_down forever (Sentinel never forgets a
+              # Sentinel it has seen; only SENTINEL RESET clears one).
+              #
+              # Failover needs a majority of ALL KNOWN sentinels — ghosts sit in
+              # the denominator and never vote. With 3 live pods the third ghost
+              # makes failover mathematically impossible (known 6, need 4, usable
+              # 3): the master is stranded and the sentinel:// clients never
+              # resolve one again.
+              POD_FQDN="${HOSTNAME}.redis-headless.spatiumddi.svc.cluster.local"
+              printf 'replica-announce-ip %s\nreplica-announce-port 6379\n' \
+                "$POD_FQDN" >> /data/redis.conf
+              printf 'sentinel announce-ip %s\nsentinel announce-port 26379\n' \
+                "$POD_FQDN" >> /data/sentinel.conf
           volumeMounts:
             - name: config
               mountPath: /config

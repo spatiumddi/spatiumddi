@@ -67,7 +67,23 @@ api:
     limits:   { cpu: 1000m, memory: 512Mi }
   env: []                        # extra env entries appended to container
   nodeSelector: {}
+  # Fast-eviction tolerations are NOT a chart default: setting both taint
+  # keys explicitly suppresses Kubernetes' DefaultTolerationSeconds
+  # admission plugin (300 s), so a BYO-Kubernetes install would evict this
+  # pod after a 20 s NotReady blip it previously served straight through.
+  # The appliance — where the control-plane node count is fixed and a dead
+  # node must free its replica fast (#590) — sets them from firstboot and
+  # from the supervisor's apply_control_plane_overrides.
   tolerations: []
+  # One of hard | soft | none — see the ``spatiumddi.podAntiAffinity``
+  # helper. ``soft`` is the safe chart default (a BYO-k8s install may run
+  # more replicas than nodes); the appliance renders ``hard``, where
+  # replicas tracks the control-plane node count exactly.
+  podAntiAffinity: soft
+  # Extra affinity rules (nodeAffinity, podAffinity, …). MERGED with the
+  # anti-affinity spread above, so setting e.g. a nodeAffinity here does
+  # not silently cost you cross-node spreading. Declare your own
+  # ``podAntiAffinity`` key to opt out of the default spread entirely.
   affinity: {}
   podAnnotations: {}
   # Phase 11 wave 4 (#183) — api ServiceAccount + Role for kubeapi
@@ -249,7 +265,10 @@ frontend:
     requests: { cpu: 50m, memory: 64Mi }
     limits:   { cpu: 200m, memory: 128Mi }
   nodeSelector: {}
+  # See api.tolerations — fast eviction is an appliance-only override.
   tolerations: []
+  # One of hard | soft | none — see api.podAntiAffinity.
+  podAntiAffinity: soft
   affinity: {}
   podAnnotations: {}
 
@@ -269,7 +288,10 @@ worker:
   # and want a tighter security posture.
   netRawCapability: true
   nodeSelector: {}
+  # See api.tolerations — fast eviction is an appliance-only override.
   tolerations: []
+  # One of hard | soft | none — see api.podAntiAffinity.
+  podAntiAffinity: soft
   affinity: {}
   podAnnotations: {}
 
@@ -390,6 +412,28 @@ postgresql:
     # clusters. CNPG enforces odd counts implicitly via its leader-
     # election layer.
     instances: 3
+    # #590 — instance spreading. CNPG defaults to anti-affinity ON but
+    # ``preferred`` (best effort), which on a 1→3 promote let two of three
+    # instances land on the seed: losing that node would have taken the
+    # primary AND a replica together.
+    #
+    # ``required`` forces one instance per node. It cannot deadlock an
+    # update the way a Deployment's surge pod can — CNPG replaces an
+    # instance in place (same pod name, same PVC) rather than scheduling a
+    # second copy beside it.
+    #
+    # Chart default is ``preferred`` because a BYO-Kubernetes install may
+    # run more instances than nodes, where a Pending replica is worse than
+    # a co-located one. The appliance renders ``required``, where instance
+    # count tracks the control-plane node count exactly.
+    #
+    # ⚠ Flipping an EXISTING cluster to ``required`` can strand an instance
+    # whose PVC is already bound to an occupied node — see the upgrade note
+    # in charts/spatiumddi/README.md. Repair a REPLICA only; never delete
+    # the primary's PVC.
+    enablePodAntiAffinity: true
+    podAntiAffinityType: preferred     # preferred | required
+    topologyKey: kubernetes.io/hostname
     # Postgres image used by CNPG-managed pods. Must be a CNPG-built
     # image (regular ``postgres:16`` images are missing the WAL-G /
     # barman wrappers CNPG relies on for backups + failover).
@@ -456,6 +500,33 @@ redis:
   # Cap and eviction policy match docker-compose.yml's redis-server
   # CLI flags. Bump if your install needs a larger cache.
   maxmemory: "256mb"
+  # #590 — how much of a CORRUPT AOF tail redis will discard at load rather
+  # than refusing to start. Redis defaults this to 0, i.e. any corruption
+  # is fatal, so a replica killed mid-write by a power cut crashloops on
+  # "Bad file format reading the append only file" forever.
+  #
+  # NOT the same thing as ``aof-load-truncated`` (which defaults to yes and
+  # is left alone). A power cut leaves the AOF tail in one of two states:
+  #
+  #   * SHORT (the file simply ends mid-record) → ``aof-load-truncated``
+  #     already handles it: redis logs "Truncating the AOF … loaded anyway"
+  #     and starts. This knob is not involved.
+  #   * CORRUPT (the tail is present but garbage — typically zero-filled,
+  #     because ext4 delayed allocation records the new file size before
+  #     the data reaches disk) → "Bad file format", and redis REFUSES to
+  #     start until you set this. This is what #590 hit.
+  #
+  # So don't remove this on the grounds that aof-load-truncated covers it.
+  # It doesn't. And a torn tail is expected on power loss, not exceptional:
+  # this is cache + Celery broker data with Postgres as the store of
+  # record, so discarding the tail always beats never booting. Set 0 to
+  # restore upstream behaviour.
+  #
+  # PLAIN BYTE COUNT, not a "16mb"-style memory string — redis parses this
+  # one as an integer and dies at startup ("argument couldn't be parsed
+  # into an integer") on a suffixed value, in both the redis.conf and the
+  # --flag form. 16 MiB.
+  aofLoadCorruptTailMaxBytes: 16777216
   auth:
     enabled: false               # internal cluster traffic; flip to true if shared
     password: ""                 # empty → generated on first install when auth.enabled=true

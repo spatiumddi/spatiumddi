@@ -3,14 +3,15 @@
 # (#272 Phase 7b).
 #
 # ┌─────────────────────────────────────────────────────────────────┐
-# │ ⚠️  UNVALIDATED ON A MULTI-NODE CLUSTER. This script performs    │
-# │ DESTRUCTIVE k3s/etcd surgery (it abandons the node's local       │
-# │ single-node etcd to join the seed's cluster). It is written      │
-# │ defensively — the etcd data dir is BACKED UP (moved aside, never │
-# │ rm'd) and a failed join ROLLS BACK to the prior single-node      │
-# │ state — but it has NOT been shaken out on real VMs yet. Validate │
-# │ a 1→3 promote + a demote on three throwaway VMs before trusting  │
-# │ it in the field. See #272 Phase 7b.                              │
+# │ ⚠️  DESTRUCTIVE k3s/etcd surgery — this script abandons the       │
+# │ node's local single-node etcd to join the seed's cluster. It is  │
+# │ written defensively: the etcd data dir is BACKED UP (moved       │
+# │ aside, never rm'd) and a failed join ROLLS BACK to the prior     │
+# │ single-node state. See #272 Phase 7b.                            │
+# │                                                                  │
+# │ Field-validated by #590, which found the identity wipe missed    │
+# │ the server/token files — see K3S_IDENTITY_ENTRIES below. Unit    │
+# │ coverage: appliance/tests/test_cluster_join_identity.py.         │
 # └─────────────────────────────────────────────────────────────────┘
 #
 # Flow (mirrors the slot-upgrade / reboot-agent host-runner pattern):
@@ -39,7 +40,13 @@ set -uo pipefail
 
 MODE="${1:-}"
 
-RELEASE_STATE=/var/lib/spatiumddi/release-state
+# Every path below defaults to its production appliance location and can
+# be overridden from the environment, so appliance/tests/ can drive the
+# real script against a synthetic tmp tree without rewriting it (same
+# convention as spatiumddi-slot-upgrade / SPATIUM_SLOT_*). Sourcing with
+# SPATIUM_CLUSTER_JOIN_LIB=1 skips the dispatch at the bottom, exposing
+# the helpers as a library for unit tests.
+RELEASE_STATE="${SPATIUM_RELEASE_STATE:-/var/lib/spatiumddi/release-state}"
 JOIN_TRIGGER="$RELEASE_STATE/cluster-join-pending"
 LEAVE_TRIGGER="$RELEASE_STATE/cluster-leave-pending"
 STATE="$RELEASE_STATE/cluster-join.state"
@@ -56,8 +63,8 @@ STATE="$RELEASE_STATE/cluster-join.state"
 JOIN_CONFIRM="SPATIUMDDI-CLUSTER-JOIN-CONFIRM-V1"
 LEAVE_CONFIRM="SPATIUMDDI-CLUSTER-LEAVE-CONFIRM-V1"
 
-K3S_CONFIG=/etc/rancher/k3s/config.yaml
-K3S_DROPIN_DIR=/etc/rancher/k3s/config.yaml.d
+K3S_CONFIG="${SPATIUM_K3S_CONFIG:-/etc/rancher/k3s/config.yaml}"
+K3S_DROPIN_DIR="${SPATIUM_K3S_DROPIN_DIR:-/etc/rancher/k3s/config.yaml.d}"
 JOIN_DROPIN="$K3S_DROPIN_DIR/spatium-cluster.yaml"
 # Cluster-identity paths wiped on a join (and restored on rollback).
 # A node that booted as its OWN ``cluster-init`` seed carries a server
@@ -69,20 +76,42 @@ JOIN_DROPIN="$K3S_DROPIN_DIR/spatium-cluster.yaml"
 # image tarballs under agent/images/. This is a surgical state wipe,
 # NOT an uninstall — the appliance bakes no k3s-uninstall.sh and we
 # never remove the binary.
-K3S_SERVER_DIR=/var/lib/rancher/k3s/server
-K3S_AGENT_DIR=/var/lib/rancher/k3s/agent
-K3S_NODE_PASSWORD=/etc/rancher/node/password
-K3S_LOCAL_KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+K3S_SERVER_DIR="${SPATIUM_K3S_SERVER_DIR:-/var/lib/rancher/k3s/server}"
+K3S_AGENT_DIR="${SPATIUM_K3S_AGENT_DIR:-/var/lib/rancher/k3s/agent}"
+K3S_NODE_PASSWORD="${SPATIUM_K3S_NODE_PASSWORD:-/etc/rancher/node/password}"
+K3S_LOCAL_KUBECONFIG="${SPATIUM_K3S_KUBECONFIG:-/etc/rancher/k3s/k3s.yaml}"
 IDENTITY_BAK_ROOT="$RELEASE_STATE/k3s-identity"
+# Entries under $K3S_SERVER_DIR that carry cluster identity — moved aside
+# on a join, moved back on a rollback. Kept as one list so the wipe and
+# the restore can never drift apart.
+#
+# #590 — ``token``/``agent-token``/``node-token`` were missing from this
+# list, and that is what wedged the dead-node REPLACE flow. Every
+# appliance boots with ``cluster-init: true`` (see
+# /etc/rancher/k3s/config.yaml), so it seeds its OWN single-member etcd
+# and writes its OWN self-generated cluster token to server/token. The
+# join then supplies the SEED's token via the drop-in while the node's
+# stale self-generated one survived the wipe, and k3s refuses to start:
+#
+#   failed to bootstrap cluster data: failed to reconcile with local
+#   datastore: bootstrap data already found and encrypted with different
+#   token
+#
+# The node never reached Ready, the control plane never settled it out of
+# "joining", and a replacement for a dead member could never rejoin.
+K3S_IDENTITY_ENTRIES="db tls cred token agent-token node-token"
 # k3s auto-deploy manifests. Once this node joins the SEED's shared
 # etcd, the seed owns the cluster's HelmChart releases — so we move
 # this node's own spatium-*.yaml bootstrap manifests aside on join (or
 # helm-controller would re-apply them into the shared cluster and
 # collide on the same release names) and restore them on leave.
-K3S_MANIFESTS=/var/lib/rancher/k3s/server/manifests
-MANIFESTS_ASIDE=/var/lib/spatiumddi/release-state/manifests-joined-aside
+K3S_MANIFESTS="$K3S_SERVER_DIR/manifests"
+MANIFESTS_ASIDE="$RELEASE_STATE/manifests-joined-aside"
+# Pod-network state cleared on join (#277) — regenerated by flannel.
+FLANNEL_SUBNET_ENV="${SPATIUM_FLANNEL_SUBNET_ENV:-/run/flannel/subnet.env}"
+CNI_NETWORKS_DIR="${SPATIUM_CNI_NETWORKS_DIR:-/var/lib/cni/networks}"
 
-LOG_DIR=/var/log/spatiumddi
+LOG_DIR="${SPATIUM_LOG_DIR:-/var/log/spatiumddi}"
 LOG="$LOG_DIR/cluster-join.log"
 READY_TIMEOUT=180  # seconds to wait for the node to report Ready
 
@@ -145,10 +174,12 @@ backup_and_wipe_identity() {
     local suffix="$1" bak e n
     bak="$IDENTITY_BAK_ROOT.$suffix.$(date +%s)"
     mkdir -p "$bak"
-    # Server cluster state — etcd db + the cluster CA/TLS + creds. The
-    # TLS dir is the load-bearing one: while it exists k3s thinks it
-    # already owns a cluster and won't join.
-    for n in db tls cred; do
+    # Server cluster state — etcd db + the cluster CA/TLS + creds + the
+    # self-generated cluster tokens. The TLS dir is the load-bearing one
+    # for "k3s thinks it already owns a cluster"; the token files are the
+    # load-bearing ones for "bootstrap data ... encrypted with different
+    # token" (#590). See K3S_IDENTITY_ENTRIES above.
+    for n in $K3S_IDENTITY_ENTRIES; do
         [ -e "$K3S_SERVER_DIR/$n" ] && mv "$K3S_SERVER_DIR/$n" "$bak/server-$n"
     done
     # Agent client certs/state — but KEEP images/ (baked airgap tarballs).
@@ -176,8 +207,8 @@ backup_and_wipe_identity() {
     # creation block until flannel writes the new subnet, so every pod
     # lands on the correct CIDR. Host-local IPAM allocations cleared too.
     # Regenerated network state — not backed up.
-    rm -f /run/flannel/subnet.env 2>/dev/null || true
-    rm -rf /var/lib/cni/networks 2>/dev/null || true
+    rm -f "$FLANNEL_SUBNET_ENV" 2>/dev/null || true
+    rm -rf "$CNI_NETWORKS_DIR" 2>/dev/null || true
     log "wiped cluster identity → $bak (k3s binary + airgap images kept)"
     _prune_identity_backups
     printf '%s\n' "$bak"
@@ -204,9 +235,11 @@ _prune_identity_backups() {
 restore_identity() {
     local bak="$1" e n
     [ -n "$bak" ] && [ -d "$bak" ] || return 0
-    for n in db tls cred; do
+    # ``${var:?}`` on every rm -rf root: these paths are env-overridable
+    # (for appliance/tests/), and an empty one would expand to "/$n".
+    for n in $K3S_IDENTITY_ENTRIES; do
         if [ -e "$bak/server-$n" ]; then
-            rm -rf "$K3S_SERVER_DIR/$n"
+            rm -rf "${K3S_SERVER_DIR:?}/$n"
             mv "$bak/server-$n" "$K3S_SERVER_DIR/$n"
         fi
     done
@@ -214,13 +247,71 @@ restore_identity() {
         for e in "$bak/agent"/*; do
             [ -e "$e" ] || continue
             n="$(basename "$e")"
-            rm -rf "$K3S_AGENT_DIR/$n"
+            rm -rf "${K3S_AGENT_DIR:?}/$n"
             mv "$e" "$K3S_AGENT_DIR/$n"
         done
     fi
     [ -f "$bak/node-password" ] && { mkdir -p "$(dirname "$K3S_NODE_PASSWORD")"; mv "$bak/node-password" "$K3S_NODE_PASSWORD"; }
     [ -f "$bak/k3s.yaml" ] && mv "$bak/k3s.yaml" "$K3S_LOCAL_KUBECONFIG"
     log "restored cluster identity from $bak"
+}
+
+# #590 — turn k3s's fatal into an operator-actionable reason.
+#
+# The runner can only observe "k3s didn't come Ready"; the WHY is in the
+# journal, and the operator only ever sees the ``.state`` sidecar's reason
+# field (which the Fleet UI surfaces on the row). Without this a join that
+# can NEVER succeed — e.g. re-promoting a node whose etcd membership still
+# exists under the same hostname — reports a bare "join failed" and the
+# operator has no idea eviction is the missing step.
+#
+# Reads the log on stdin so it is unit-testable; ``_k3s_log_since`` is the
+# journal reader (overridable for tests).
+classify_join_failure() {
+    local log
+    log="$(cat)"
+    case "$log" in
+        *"duplicate node name found"*)
+            printf '%s' "this hostname is already an etcd member of the target cluster — evict it (Fleet → Replace, or delete its k8s Node) before re-joining"
+            ;;
+        *"bootstrap data already found and encrypted with different token"*)
+            printf '%s' "stale k3s bootstrap data on disk — the join token does not match the cluster"
+            ;;
+        *"member has been permanently removed from the cluster"*)
+            printf '%s' "this node's etcd member was removed from the cluster — it must re-join as a NEW member (leave first)"
+            ;;
+        *"failed to validate token"*|*"token CA hash does not match"*)
+            printf '%s' "the seed rejected the join token"
+            ;;
+        *"connection refused"*|*"i/o timeout"*|*"no route to host"*)
+            printf '%s' "could not reach the seed — check the firewall and tcp/6443 + tcp/2379-2380"
+            ;;
+        *)
+            printf '%s' ""
+            ;;
+    esac
+}
+
+_k3s_log_since() {
+    # Overridable so appliance/tests can feed a canned log without a journal.
+    if [ -n "${SPATIUM_K3S_LOG_CMD:-}" ]; then
+        sh -c "$SPATIUM_K3S_LOG_CMD" 2>/dev/null || true
+        return 0
+    fi
+    journalctl -u k3s --no-pager --since "$1" 2>/dev/null || true
+}
+
+# #590 — is this node ALREADY a member of a control-plane cluster?
+#
+# The join drop-in (server: + token:) is written only by a previous
+# SUCCESSFUL join and removed on rollback / demote, so its presence is the
+# on-disk record of "I am a member". do_join uses this to decide whether a
+# rollback may restore this node's single-node bootstrap manifests: on an
+# already-a-member node, restore_identity puts it straight back into the
+# SHARED cluster, and its manifests would then overwrite the seed's
+# HelmCharts of the same name.
+node_was_cluster_member() {
+    [ -f "$JOIN_DROPIN" ]
 }
 
 wait_ready() {
@@ -282,9 +373,27 @@ do_join() {
 
     # Snapshot the config so a failed join can roll back to the prior
     # single-node-seed state.
-    local identity_backup config_backup
+    local identity_backup config_backup was_member
     config_backup="${K3S_CONFIG}.pre-join.$(date +%s)"
     cp -a "$K3S_CONFIG" "$config_backup" 2>/dev/null || true
+
+    # #590 — was this node ALREADY a member of a cluster before this join?
+    # The join drop-in is written only by a previous successful join, so its
+    # presence means the identity we are about to back up is a MEMBER
+    # identity, not a standalone seed.
+    #
+    # That distinction decides what the rollback may safely restore. The
+    # rollback restores the identity backup verbatim — so on an
+    # already-a-member node it puts the node straight back into the SHARED
+    # cluster. Restoring this node's single-node bootstrap manifests on top
+    # of that makes its helm-controller apply them cluster-wide, overwriting
+    # the seed's HelmCharts of the same name. Observed live: a failed
+    # re-join restored ddi2's manifests, whose ``spatium-bootstrap`` values
+    # carry ``cnpg: false`` + ``agentLanding: true`` — which UNINSTALLED the
+    # CloudNativePG operator on a healthy 3-node cluster and parked an nginx
+    # pod on the frontend's :80.
+    was_member=0
+    node_was_cluster_member && was_member=1
 
     # Move this node's own bootstrap manifests aside so it doesn't
     # re-apply its releases into the seed's shared cluster.
@@ -319,6 +428,10 @@ EOF
 
     log "restarting k3s to join $server_url (fresh identity)"
     clean_k3s_runtime
+    # Anchor for the journal scan below — anything k3s logs from here on
+    # belongs to THIS join attempt, not a previous one.
+    local k3s_started_at reason
+    k3s_started_at="$(date -u '+%Y-%m-%d %H:%M:%S')"
     if systemctl start k3s && wait_ready; then
         log "JOIN ok — node is Ready as a control-plane member"
         write_state ready "$server_url"
@@ -328,19 +441,33 @@ EOF
         exit 0
     fi
 
+    # #590 — say WHY. Some join failures are permanent until an operator
+    # acts (a duplicate etcd member is the one that bit us), and "failed" on
+    # its own gives them nothing to act on.
+    reason="$(_k3s_log_since "$k3s_started_at" | classify_join_failure)"
+    [ -n "$reason" ] || reason="k3s did not come Ready within ${READY_TIMEOUT}s"
+
     # ── Rollback — restore the single-node seed so we don't brick it ──
-    log "JOIN failed — rolling back to single-node seed"
+    log "JOIN failed — rolling back to single-node seed ($reason)"
     systemctl stop k3s || true
     rm -f "$JOIN_DROPIN"
     [ -f "$config_backup" ] && mv -f "$config_backup" "$K3S_CONFIG"
     restore_identity "$identity_backup"
-    if [ -d "$MANIFESTS_ASIDE" ] && ls "$MANIFESTS_ASIDE"/*.yaml >/dev/null 2>&1; then
+    # #590 — only a node that was STANDALONE before this join may take its
+    # bootstrap manifests back. If it was already a member, ``restore_identity``
+    # just put it back into the SHARED cluster, and re-applying its single-node
+    # manifests there would overwrite the seed's HelmCharts (see was_member
+    # above). Leave them parked in $MANIFESTS_ASIDE; a later successful demote
+    # (do_leave) restores them once the node really is standalone again.
+    if [ "$was_member" = "1" ]; then
+        log "NOT restoring local bootstrap manifests — this node was already a cluster member, and its manifests would overwrite the seed's releases in the shared cluster (left in $MANIFESTS_ASIDE)"
+    elif [ -d "$MANIFESTS_ASIDE" ] && ls "$MANIFESTS_ASIDE"/*.yaml >/dev/null 2>&1; then
         mv -f "$MANIFESTS_ASIDE"/*.yaml "$K3S_MANIFESTS/" || true
         log "restored local bootstrap manifests"
     fi
     clean_k3s_runtime
     systemctl start k3s || true
-    write_state failed "join failed; rolled back to single-node"
+    write_state failed "$reason"
     mv -f "$JOIN_TRIGGER" "${JOIN_TRIGGER}.failed.$(date +%s)" || true
     exit 1
 }
@@ -391,6 +518,12 @@ do_leave() {
     mv -f "$LEAVE_TRIGGER" "${LEAVE_TRIGGER}.failed.$(date +%s)" || true
     exit 1
 }
+
+# Sourced as a library by appliance/tests/ — expose the helpers without
+# running (or gating on) the destructive dispatch below.
+if [ "${SPATIUM_CLUSTER_JOIN_LIB:-}" = "1" ]; then
+    return 0 2>/dev/null || exit 0
+fi
 
 require_appliance
 case "$MODE" in

@@ -334,6 +334,17 @@ CLUSTER_JOIN_STATE_READY = "ready"  # promote complete — node is a member
 CLUSTER_JOIN_STATE_LEAVING = "leaving"  # demote in progress
 CLUSTER_JOIN_STATE_LEFT = "left"  # demote complete — node left the cluster
 CLUSTER_JOIN_STATE_FAILED = "failed"
+# #590 — dead-node replace: the row awaits the seed deleting its k8s Node,
+# and converges to LEFT when the seed reports the eviction. The replace
+# endpoint used to stamp this as a bare "evicting" string outside the
+# vocabulary, which made it invisible to anything reasoning over the set.
+CLUSTER_JOIN_STATE_EVICTING = "evicting"
+# Terminal states — no supervisor report will move the row on its own.
+CLUSTER_JOIN_STATES_TERMINAL = (
+    CLUSTER_JOIN_STATE_READY,
+    CLUSTER_JOIN_STATE_LEFT,
+    CLUSTER_JOIN_STATE_FAILED,
+)
 
 # Sentinel desired_cluster_role values handed to the supervisor:
 # "member" → join the seed; "none" → leave the cluster + revert to a
@@ -793,9 +804,20 @@ class Appliance(Base):
     # row to populate ``desired_k3s_join_token_encrypted`` on each joiner.
     k3s_join_token_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     # Supervisor-reported progress of the in-flight join/leave:
-    # ``joining`` | ``ready`` | ``leaving`` | ``failed`` | NULL (idle).
+    # ``joining`` | ``ready`` | ``leaving`` | ``failed`` | ``evicting`` |
+    # NULL (idle).
     cluster_join_state: Mapped[str | None] = mapped_column(String(16), nullable=True)
     cluster_join_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # #590 — when ``cluster_join_state`` last CHANGED. No cluster transition
+    # has a timeout (each converges only on a supervisor report), so this is
+    # the only way to tell a healthy multi-minute k3s join from one that will
+    # never converge. Both the Fleet UI's "Clear stuck state" affordance and
+    # the clear-cluster-state endpoint's own guard key off its age, so an
+    # impatient click seconds into a normal promote can't blank the
+    # desired-state out from under a running join.
+    cluster_join_state_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     # The node's k3s-registered InternalIP, reported by the supervisor on
     # heartbeat (``kubectl get node <self> -o …InternalIP``). This is the
     # appliance's REAL routable host IP — distinct from ``last_seen_ip``,

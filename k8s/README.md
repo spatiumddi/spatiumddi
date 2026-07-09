@@ -93,6 +93,47 @@ kubectl apply -f k8s/ha/redis-sentinel.yaml
 
 Three Redis nodes with Sentinel provides automatic failover with quorum of 2.
 
+**Surviving a hard node loss (#590).** Three properties of the manifest are
+load-bearing, and all three were learned the hard way:
+
+* **Required pod anti-affinity.** The replicas must land on distinct nodes.
+  A node hosting two of three replicas takes the data majority *and* the
+  Sentinel quorum with it when it dies — and because each replica holds a
+  `ReadWriteOnce` PVC, a mis-placed replica is pinned to that node forever.
+  A replica with nowhere to schedule stays `Pending`, which is loud; the
+  alternative is a cluster that silently isn't HA.
+* **`aof-load-corrupt-tail-max-size`.** Redis defaults this to `0` — *any*
+  AOF corruption is fatal. A replica killed mid-write by a power cut then
+  crashloops forever on `Bad file format reading the append only file`.
+  Since Redis here is the cache + Celery broker and Postgres is the store
+  of record, discarding a torn tail always beats never booting again. The
+  value is a plain byte count; Redis rejects a `16mb`-style suffix.
+* **`announce-ip` pinned to each pod's StatefulSet FQDN.** Unset, every pod
+  announces its *pod IP*, so a rescheduled pod returns with a new IP + run
+  id and its peers add a second entry while the old one lingers `s_down`
+  forever (Sentinel never forgets a Sentinel). Failover needs a majority of
+  **all known** sentinels, and ghosts sit in the denominator without ever
+  voting — so with three live pods, the third accumulated ghost makes
+  failover impossible (6 known, 4 needed, 3 usable) and the master is
+  stranded for good. One ghost per node loss. Verify with
+  `redis-cli -p 26379 sentinel ckquorum mymaster`.
+
+  Note this is **not** the same as `aof-load-truncated` (default `yes`),
+  which only covers a tail that *ends* mid-record. A power cut usually
+  leaves a tail that is present but zero-filled — ext4 records the new file
+  size before the data reaches disk — and that reads as corrupt, not short.
+  Don't drop this setting on the assumption `aof-load-truncated` covers it.
+
+If you upgrade an existing install whose replicas were co-located, the
+stranded replica will sit `Pending`. Delete its PVC so it re-provisions on
+a free node (the data is expendable — it resyncs from the master):
+
+```bash
+kubectl -n spatiumddi get pods -l app=redis -o wide   # any Pending, and where?
+kubectl -n spatiumddi delete pvc data-redis-<ordinal>
+kubectl -n spatiumddi delete pod redis-<ordinal>
+```
+
 **Recommended alternative:** Use the Bitnami Redis Helm chart with `sentinel.enabled=true` for production — it handles Sentinel configuration correctly and includes proper password injection.
 
 ### Redis HA — Docker Compose
@@ -102,6 +143,23 @@ For Redis HA in Docker Compose, use the Redis Sentinel pattern (see `k8s/ha/redi
 ### Celery Workers — HA
 
 Celery workers are stateless and support any replica count. In K8s, the `worker` Deployment runs 2+ replicas by default. The Beat scheduler runs as a `Recreate` Deployment (replicas: 1) to prevent double-scheduling.
+
+### Control-plane pod spreading
+
+`api`, `worker`, and `frontend` in `k8s/base/` carry **soft** (preferred)
+pod anti-affinity so their replicas spread across nodes: without it a
+multi-node cluster can stack every `api` pod on one node, and losing that
+node leaves no ready `api` anywhere. Soft rather than required, because a
+single-node cluster (or `replicas > nodes`) must still schedule.
+
+Note that a pod on a *dead* node waits out the default 300 s
+`node.kubernetes.io/not-ready` toleration before it is evicted and
+rescheduled. If your cluster has a fixed node count and you want faster
+failover, add `tolerations` with `tolerationSeconds: 20` for the
+`not-ready` and `unreachable` taints. This is deliberately *not* the
+default: pinning both taint keys suppresses the `DefaultTolerationSeconds`
+admission plugin, so a transient 20 s `NotReady` blip that the pods would
+have served straight through starts evicting them instead.
 
 ### Worker capability — `NET_RAW`
 

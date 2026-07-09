@@ -17,6 +17,19 @@ spec:
   instances: 3
   imageName: ghcr.io/cloudnative-pg/postgresql:16
 
+  # #590 — spread the instances one per node. CNPG enables anti-affinity by
+  # default but only as `preferred` (best effort), which lets two of three
+  # instances land on the same node — one node loss then takes the primary
+  # AND a replica together. `required` forces one per node; it cannot
+  # deadlock an update, because CNPG replaces an instance in place (same pod
+  # name, same PVC) rather than surging a second copy beside it.
+  #
+  # Set this back to `preferred` if you run more instances than nodes.
+  affinity:
+    enablePodAntiAffinity: true
+    podAntiAffinityType: required
+    topologyKey: kubernetes.io/hostname
+
   postgresql:
     parameters:
       max_connections: "200"

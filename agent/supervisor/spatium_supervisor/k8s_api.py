@@ -593,12 +593,41 @@ def apply_control_plane_overrides(
     src_json = json.dumps(
         [c.strip() for c in (web_ui_allowed_cidrs or []) if c and c.strip()]
     )
+    # #590 — pin api/frontend/worker to one replica per control-plane node,
+    # and evict them from a dead node in seconds rather than the k8s default
+    # 300 s. ``replicas`` here IS the node count, so hard
+    # (requiredDuringScheduling) anti-affinity is exactly right, and the
+    # chart no-ops it below 2 replicas.
+    #
+    # Written on every promote/demote rather than relying on the
+    # firstboot-rendered HelmChart values, because firstboot only runs on a
+    # FRESH install — an appliance that A/B-upgrades into this fix would
+    # otherwise keep the old un-spread values forever. Without it a promote
+    # could stack every api pod on the seed (they schedule while the new
+    # members may not yet be labelled), so losing the seed left no ready api
+    # anywhere and every node answered 502.
+    #
+    # The tolerations are NOT a chart default: pinning both taint keys
+    # suppresses the DefaultTolerationSeconds admission plugin, which a
+    # BYO-Kubernetes install still wants. They belong to the appliance,
+    # where the control-plane node count is fixed.
+    fast_evict = (
+        "  tolerations:\n"
+        "    - key: node.kubernetes.io/unreachable\n"
+        "      operator: Exists\n"
+        "      effect: NoExecute\n"
+        "      tolerationSeconds: 20\n"
+        "    - key: node.kubernetes.io/not-ready\n"
+        "      operator: Exists\n"
+        "      effect: NoExecute\n"
+        "      tolerationSeconds: 20\n"
+    )
     values = (
-        f"api:\n  replicas: {cp_size}\n"
-        f"frontend:\n  replicas: {cp_size}\n"
+        f"api:\n  replicas: {cp_size}\n  podAntiAffinity: hard\n{fast_evict}"
+        f"frontend:\n  replicas: {cp_size}\n  podAntiAffinity: hard\n{fast_evict}"
         f'  controlPlaneVIP: "{vip}"\n'
         f"  loadBalancerSourceRanges: {src_json}\n"
-        f"worker:\n  replicas: {cp_size}\n"
+        f"worker:\n  replicas: {cp_size}\n  podAntiAffinity: hard\n{fast_evict}"
         f"postgresql:\n  cnpg:\n    instances: {cp_size}\n"
         f"redis:\n  sentinel:\n    replicas: {cp_size}\n"
     )
@@ -753,10 +782,12 @@ def patch_node_labels(
 def patch_cnpg_instances(
     instances: int,
     *,
+    pod_anti_affinity_type: str = "required",
     cluster_name: str = "spatium-control-spatiumddi-postgresql",
     namespace: str = "spatium",
 ) -> tuple[bool, str | None]:
-    """Directly scale the CNPG ``Cluster`` CR's ``spec.instances``.
+    """Directly reconcile the CNPG ``Cluster`` CR's ``spec.instances`` and
+    its instance-spreading policy.
 
     #272 — the CNPG Cluster carries ``helm.sh/resource-policy: keep`` so
     a failed-release recovery (uninstall+reinstall) can't delete it and
@@ -770,17 +801,33 @@ def patch_cnpg_instances(
     a merge-patch isn't a Helm operation, so ``keep`` doesn't apply, and
     the CNPG operator reconciles the new replica set normally.
 
-    Idempotent: GETs the current ``spec.instances`` first and only PATCHes
-    on a real change, so steady-state heartbeats stay quiet. Returns
+    #590 — ``spec.affinity.podAntiAffinityType`` rides the same patch, and
+    for the same reason: the chart can set it on a FRESH install, but an
+    appliance that A/B-upgrades into the fix would keep CNPG's ``preferred``
+    default forever, since Helm won't touch the kept Cluster. Observed live
+    on a 1→3 promote: instances 1 and 2 both landed on the seed, so one node
+    loss would have taken the primary and a replica together.
+
+    Note this can strand an instance whose PVC is already bound to a node
+    that now hosts another instance — it goes Pending until the operator
+    deletes that REPLICA's PVC (never the primary's) and lets CNPG re-clone
+    it. Postgres stays available throughout: the primary is untouched and a
+    surviving replica keeps failover possible. See charts/spatiumddi/
+    README.md.
+
+    Idempotent: GETs the current spec first and only PATCHes on a real
+    change, so steady-state heartbeats stay quiet. Returns
     ``(changed, error)`` mirroring the other override helpers.
     """
     if instances < 1:
         return False, "instances < 1"
+    if pod_anti_affinity_type not in ("preferred", "required"):
+        return False, f"bad pod_anti_affinity_type {pod_anti_affinity_type!r}"
     base = (
         f"/apis/postgresql.cnpg.io/v1/namespaces/{quote(namespace)}"
         f"/clusters/{quote(cluster_name)}"
     )
-    # Read current size — skip the PATCH (and the heartbeat "applied" log)
+    # Read current spec — skip the PATCH (and the heartbeat "applied" log)
     # when it already matches. A 404 means the Cluster isn't up yet (early
     # boot / not a cnpg deployment); treat as a quiet no-op, not an error.
     try:
@@ -792,12 +839,33 @@ def patch_cnpg_instances(
     if status != 200:
         return False, f"kubeapi GET status {status}: {resp[:200]!r}"
     try:
-        current = json.loads(resp).get("spec", {}).get("instances")
+        spec = json.loads(resp).get("spec", {})
+        current = spec.get("instances")
+        current_affinity = spec.get("affinity", {}) or {}
+        current_aa = current_affinity.get("podAntiAffinityType")
+        current_enabled = current_affinity.get("enablePodAntiAffinity")
     except (ValueError, AttributeError):
-        current = None
-    if current == instances:
+        current = current_aa = current_enabled = None
+    if (
+        current == instances
+        and current_aa == pod_anti_affinity_type
+        and current_enabled is True
+    ):
         return False, None
-    payload = json.dumps({"spec": {"instances": instances}}).encode("utf-8")
+    payload = json.dumps(
+        {
+            "spec": {
+                "instances": instances,
+                # merge-patch: this merges INTO spec.affinity, leaving the
+                # chart's nodeSelector + tolerations under it untouched.
+                "affinity": {
+                    "enablePodAntiAffinity": True,
+                    "podAntiAffinityType": pod_anti_affinity_type,
+                    "topologyKey": "kubernetes.io/hostname",
+                },
+            }
+        }
+    ).encode("utf-8")
     try:
         status, resp = _request(
             "PATCH",
