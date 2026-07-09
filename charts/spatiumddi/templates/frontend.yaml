@@ -8,7 +8,7 @@ metadata:
     {{- include "spatiumddi.componentLabels" (merge (dict "component" $cmp) .) | nindent 4 }}
 spec:
   replicas: {{ .Values.frontend.replicas }}
-  {{- if .Values.frontend.hostNetwork }}
+  {{- if and .Values.frontend.hostNetwork (le (int .Values.frontend.replicas) 1) }}
   # hostPort:80 is exclusive on a single node — a RollingUpdate
   # would create the new pod before terminating the old, and it
   # would sit Pending forever ("didn't have free ports for the
@@ -19,9 +19,18 @@ spec:
   strategy:
     type: Recreate
   {{- else }}
-  {{- /* #590 — no hostNetwork (VIP path): required anti-affinity still makes
-         a surge pod unschedulable when replicas == nodes. */}}
-  {{- include "spatiumddi.deploymentStrategy" (dict "mode" .Values.frontend.podAntiAffinity "replicas" .Values.frontend.replicas) | nindent 2 }}
+  {{- /* #590 — every OTHER shape wants "terminate one, then replace it".
+         * hostNetwork + replicas > 1 (the multi-node appliance): Recreate
+           would take the ENTIRE UI down for a chart upgrade. One pod per
+           node means retiring a single pod frees that node's :80 for its
+           own replacement, so the other nodes keep serving.
+         * No hostNetwork (VIP path): required anti-affinity still makes a
+           surge pod unschedulable once replicas == nodes.
+         The strategy helper resolves both: surge-first when it is safe,
+         terminate-first when a per-node exclusive resource (a hostPort, or
+         an anti-affinity slot) has to be freed before the replacement can
+         land. */}}
+  {{- include "spatiumddi.deploymentStrategy" (dict "mode" (ternary "hard" .Values.frontend.podAntiAffinity .Values.frontend.hostNetwork) "replicas" .Values.frontend.replicas) | nindent 2 }}
   {{- end }}
   selector:
     matchLabels:

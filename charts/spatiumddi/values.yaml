@@ -478,14 +478,27 @@ redis:
   # Cap and eviction policy match docker-compose.yml's redis-server
   # CLI flags. Bump if your install needs a larger cache.
   maxmemory: "256mb"
-  # #590 — how much of a torn AOF tail redis will discard at load rather
-  # than refusing to start. Redis defaults this to 0, i.e. ANY corruption
-  # is fatal — so a replica killed mid-write by a power cut crashloops on
-  # "Bad file format reading the append only file" forever. A hard power
-  # loss tearing the last write is expected, not exceptional, and this is
-  # cache + Celery broker data with Postgres as the store of record:
-  # dropping the tail always beats never booting. Set 0 to restore
-  # upstream redis behaviour.
+  # #590 — how much of a CORRUPT AOF tail redis will discard at load rather
+  # than refusing to start. Redis defaults this to 0, i.e. any corruption
+  # is fatal, so a replica killed mid-write by a power cut crashloops on
+  # "Bad file format reading the append only file" forever.
+  #
+  # NOT the same thing as ``aof-load-truncated`` (which defaults to yes and
+  # is left alone). A power cut leaves the AOF tail in one of two states:
+  #
+  #   * SHORT (the file simply ends mid-record) → ``aof-load-truncated``
+  #     already handles it: redis logs "Truncating the AOF … loaded anyway"
+  #     and starts. This knob is not involved.
+  #   * CORRUPT (the tail is present but garbage — typically zero-filled,
+  #     because ext4 delayed allocation records the new file size before
+  #     the data reaches disk) → "Bad file format", and redis REFUSES to
+  #     start until you set this. This is what #590 hit.
+  #
+  # So don't remove this on the grounds that aof-load-truncated covers it.
+  # It doesn't. And a torn tail is expected on power loss, not exceptional:
+  # this is cache + Celery broker data with Postgres as the store of
+  # record, so discarding the tail always beats never booting. Set 0 to
+  # restore upstream behaviour.
   #
   # PLAIN BYTE COUNT, not a "16mb"-style memory string — redis parses this
   # one as an integer and dies at startup ("argument couldn't be parsed

@@ -109,6 +109,12 @@ load-bearing, and both were learned the hard way:
   of record, discarding a torn tail always beats never booting again. The
   value is a plain byte count; Redis rejects a `16mb`-style suffix.
 
+  Note this is **not** the same as `aof-load-truncated` (default `yes`),
+  which only covers a tail that *ends* mid-record. A power cut usually
+  leaves a tail that is present but zero-filled — ext4 records the new file
+  size before the data reaches disk — and that reads as corrupt, not short.
+  Don't drop this setting on the assumption `aof-load-truncated` covers it.
+
 If you upgrade an existing install whose replicas were co-located, the
 stranded replica will sit `Pending`. Delete its PVC so it re-provisions on
 a free node (the data is expendable — it resyncs from the master):

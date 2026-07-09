@@ -42,6 +42,12 @@ data:
     appliance over 158 bytes of torn cache. Redis is the cache + Celery
     broker here and Postgres is the store of record, so discarding a torn
     tail always beats never booting again.
+
+    This is NOT covered by ``aof-load-truncated`` (default yes): that one
+    handles a tail that simply ENDS mid-record. A power cut usually leaves
+    a tail that is present but ZERO-FILLED (ext4 records the new file size
+    before the data lands), which reads as corrupt, not short. See
+    values.yaml for the full distinction.
   */}}
   redis.conf.tmpl: |
     maxmemory {{ .Values.redis.maxmemory }}

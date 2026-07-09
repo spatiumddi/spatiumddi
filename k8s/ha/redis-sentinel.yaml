@@ -27,6 +27,11 @@ data:
     # Postgres is the store of record, so discarding a torn tail always
     # beats never booting again. Plain byte count (16 MiB) — redis rejects a
     # "16mb"-style suffix on this directive.
+    #
+    # Distinct from ``aof-load-truncated`` (default yes), which only covers a
+    # tail that ENDS mid-record. A power cut typically leaves a tail that is
+    # present but zero-filled (ext4 records the new size before the data
+    # lands) — that reads as corrupt, not short, and needs this.
     aof-load-corrupt-tail-max-size 16777216
     requirepass CHANGEME
     masterauth CHANGEME
