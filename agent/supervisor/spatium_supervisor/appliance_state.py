@@ -2264,6 +2264,23 @@ def maybe_fire_firewall_reload(bundle_block: object) -> bool:
     firewall_conf = str(bundle_block.get("firewall_conf") or "")
     if not config_hash or not firewall_conf:
         return False  # no server-side authority → fall back / no-op
+
+    # #593 — the server renders this body from the appliance ROW, so a row that
+    # disagrees with reality ships a body with no etcd peer rule to a node that
+    # is a live etcd member. Applying it drops that member out of raft. Refuse,
+    # and leave the last-good ruleset alone (non-negotiable #5). The in-pod
+    # renderer carries the same guard; this covers the bundle-first path, which
+    # never reaches it.
+    from . import firewall_peer_audit  # noqa: PLC0415 — avoid import cycle at module load
+
+    if firewall_peer_audit.would_self_partition(firewall_conf):
+        log.error(
+            "supervisor.firewall.refused_self_partition",
+            source="control-plane",
+            reason="server-rendered drop-in has no etcd peer rule but this node is a live etcd member",
+        )
+        return False
+
     # #387 — shared bounded-retry guard. The short-circuit against the
     # runner's applied-hash sidecar (a body the Phase-1 in-pod path
     # already applied → byte-identical server render → same hash) now

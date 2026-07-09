@@ -371,6 +371,27 @@ def _maybe_apply_firewall(
     if appliance_state.detect_deployment_kind() != "appliance":
         return
 
+    # #593 — the control plane's row said "not a control-plane node" while this
+    # node was a live etcd member, so the render dropped the k3s-peer rule and
+    # the node firewalled itself out of its own cluster. When the row hands us
+    # no peers but k3s says we ARE an etcd member, recover the peer set from
+    # live membership instead of rendering a body that partitions us.
+    if not cluster_peer_cidrs:
+        try:
+            if firewall_peer_audit.local_node_is_etcd_member() is True:
+                recovered = firewall_peer_audit.observed_peer_cidrs(
+                    appliance_state.read_node_ips() or []
+                )
+                if recovered:
+                    log.warning(
+                        "supervisor.firewall.peer_cidrs_recovered",
+                        reason="control plane sent no peers but this node is a live etcd member",
+                        peers=recovered,
+                    )
+                    cluster_peer_cidrs = recovered
+        except Exception as exc:  # noqa: BLE001 — best-effort; guard below still fires
+            log.debug("supervisor.firewall.peer_recovery_failed", error=str(exc))
+
     # #285 Phase 5 — warn-only etcd/peer-drift cross-check. Throttled +
     # best-effort + run BEFORE the unchanged-body short-circuit, so a
     # membership change the peer set hasn't caught up to is surfaced even when
@@ -412,6 +433,22 @@ def _maybe_apply_firewall(
         applied_hash = ""
 
     if applied_hash == body_hash:
+        return
+
+    # #593 — last line of defence, checked only for a body we are about to
+    # WRITE (an unchanged body short-circuits above, so this costs nothing on a
+    # steady-state heartbeat). Even after the peer recovery above — which is a
+    # no-op when the kube API is unreadable — never write a drop-in that closes
+    # etcd's peer port on a node k3s still calls an etcd member. Leaving the
+    # previous ruleset in place is strictly safer: a stale peer rule only ever
+    # over-permits to real cluster members, whereas applying this body drops a
+    # voting member out of raft.
+    if firewall_peer_audit.would_self_partition(body):
+        log.error(
+            "supervisor.firewall.refused_self_partition",
+            profile=profile.name,
+            reason="rendered drop-in has no etcd peer rule but this node is a live etcd member",
+        )
         return
 
     try:
