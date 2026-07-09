@@ -274,6 +274,38 @@ kubectl -n spatiumddi delete pod <release>-redis-<ordinal>
 Clusters whose replicas were already spread one-per-node upgrade with no
 action. This does not apply to `redis.kind: standalone`.
 
+### The same step for CloudNativePG, if you set `podAntiAffinityType: required`
+
+CNPG has the identical hazard, and the repair is the same shape — but
+Postgres is not expendable, so the rule is stricter.
+
+`postgresql.cnpg.podAntiAffinityType` defaults to `preferred` in this chart
+(the appliance renders `required`). Flipping an **existing** cluster to
+`required` can strand an instance whose PVC is already bound to a node that
+now hosts another instance. It goes `Pending`.
+
+Postgres stays available while you fix it: the primary is untouched, and a
+surviving replica keeps failover possible.
+
+> **Only ever delete a REPLICA's PVC. Never the primary's.** Deleting the
+> primary's PVC destroys the database. Confirm the role before you touch
+> anything — CNPG labels the primary `cnpg.io/instanceRole=primary`.
+
+```bash
+# Which instance is Pending, and which one is the primary?
+kubectl -n spatiumddi get pods -l cnpg.io/cluster=<cluster> \
+  -L cnpg.io/instanceRole -o wide
+
+# Confirm the Pending pod is NOT the primary, then drop its PVC.
+# CNPG re-clones the replica from the primary (pg_basebackup).
+kubectl -n spatiumddi delete pvc <cluster>-<ordinal>
+kubectl -n spatiumddi delete pod <cluster>-<ordinal>
+```
+
+If the stranded instance *is* the primary, don't delete anything: run a
+switchover first (`kubectl cnpg promote <cluster> <other-instance>`), wait
+for the role to move, then repair it as a replica.
+
 ## Uninstall
 
 ```bash

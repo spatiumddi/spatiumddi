@@ -412,6 +412,28 @@ postgresql:
     # clusters. CNPG enforces odd counts implicitly via its leader-
     # election layer.
     instances: 3
+    # #590 — instance spreading. CNPG defaults to anti-affinity ON but
+    # ``preferred`` (best effort), which on a 1→3 promote let two of three
+    # instances land on the seed: losing that node would have taken the
+    # primary AND a replica together.
+    #
+    # ``required`` forces one instance per node. It cannot deadlock an
+    # update the way a Deployment's surge pod can — CNPG replaces an
+    # instance in place (same pod name, same PVC) rather than scheduling a
+    # second copy beside it.
+    #
+    # Chart default is ``preferred`` because a BYO-Kubernetes install may
+    # run more instances than nodes, where a Pending replica is worse than
+    # a co-located one. The appliance renders ``required``, where instance
+    # count tracks the control-plane node count exactly.
+    #
+    # ⚠ Flipping an EXISTING cluster to ``required`` can strand an instance
+    # whose PVC is already bound to an occupied node — see the upgrade note
+    # in charts/spatiumddi/README.md. Repair a REPLICA only; never delete
+    # the primary's PVC.
+    enablePodAntiAffinity: true
+    podAntiAffinityType: preferred     # preferred | required
+    topologyKey: kubernetes.io/hostname
     # Postgres image used by CNPG-managed pods. Must be a CNPG-built
     # image (regular ``postgres:16`` images are missing the WAL-G /
     # barman wrappers CNPG relies on for backups + failover).

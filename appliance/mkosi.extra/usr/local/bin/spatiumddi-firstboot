@@ -795,6 +795,12 @@ spec:
       kind: cnpg
       cnpg:
         instances: 1  # spatium:cp-size
+        # #590 — one Postgres instance per control-plane node. CNPG's
+        # default ``preferred`` anti-affinity let two of three instances
+        # stack on the seed during a 1→3 promote (the members weren't
+        # labelled yet), so a single node loss would have taken the
+        # primary and a replica together. Inert at instances: 1.
+        podAntiAffinityType: required
     # #272 Phase 3 — Redis runs under Sentinel on every appliance so the
     # cache/queue layer is HA like postgres: each replica pairs a
     # redis-server with a redis-sentinel that elects a master + fails
