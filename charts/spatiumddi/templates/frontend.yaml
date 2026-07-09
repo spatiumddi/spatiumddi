@@ -18,6 +18,10 @@ spec:
   # appliance-scale single-instance frontend.
   strategy:
     type: Recreate
+  {{- else }}
+  {{- /* #590 — no hostNetwork (VIP path): required anti-affinity still makes
+         a surge pod unschedulable when replicas == nodes. */}}
+  {{- include "spatiumddi.deploymentStrategy" (dict "mode" .Values.frontend.podAntiAffinity "replicas" .Values.frontend.replicas) | nindent 2 }}
   {{- end }}
   selector:
     matchLabels:

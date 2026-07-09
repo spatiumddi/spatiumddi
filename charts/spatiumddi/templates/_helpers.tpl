@@ -134,6 +134,44 @@ the matching tolerations on the appliance paths. Redis goes through the
 same helper: its replicas are the ones whose mis-placement (two on the
 seed, pinned there by local-path PVs) caused the outage.
 */}}
+{{/*
+Emit the ``strategy:`` block for a Deployment that may carry REQUIRED pod
+anti-affinity (#590).
+
+  {{- include "spatiumddi.deploymentStrategy" (dict
+        "mode" .Values.api.podAntiAffinity
+        "replicas" .Values.api.replicas) | nindent 2 }}
+
+Required anti-affinity + ``replicas == number of eligible nodes`` makes the
+default surge pod UNSCHEDULABLE, and the default ``maxUnavailable: 0`` then
+forbids freeing a node by retiring an old pod first. The rollout wedges
+permanently: the anti-affinity labelSelector matches on ``component``, which
+the OUTGOING ReplicaSet's pods carry too, so the incoming surge pod sees
+every node already occupied by one of its own.
+
+Observed live on a 1→3 promote: two new api pods landed on the freshly
+promoted members, the third sat Pending forever with "3 node(s) didn't match
+pod anti-affinity rules" while the old pod held the seed.
+
+So under ``hard`` we invert the knobs — retire one old pod, then schedule its
+replacement onto the node it just freed. Costs one replica of capacity during
+a rollout instead of deadlocking. (frontend's hostNetwork path uses Recreate
+for the same underlying reason: an exclusive per-node resource.)
+*/}}
+{{- define "spatiumddi.deploymentStrategy" -}}
+{{- $mode := default "soft" .mode -}}
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+  {{- if and (gt (int .replicas) 1) (eq $mode "hard") }}
+    maxSurge: 0
+    maxUnavailable: 1
+  {{- else }}
+    maxSurge: 1
+    maxUnavailable: 0
+  {{- end }}
+{{- end -}}
+
 {{- define "spatiumddi.podAntiAffinity" -}}
 {{- $mode := default "soft" .mode -}}
 {{- $affinity := deepCopy (default (dict) .override) -}}

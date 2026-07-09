@@ -8,6 +8,7 @@ metadata:
     {{- include "spatiumddi.componentLabels" (merge (dict "component" $cmp) .) | nindent 4 }}
 spec:
   replicas: {{ .Values.worker.replicas }}
+  {{- include "spatiumddi.deploymentStrategy" (dict "mode" .Values.worker.podAntiAffinity "replicas" .Values.worker.replicas) | nindent 2 }}
   selector:
     matchLabels:
       {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" $cmp) .) | nindent 6 }}
