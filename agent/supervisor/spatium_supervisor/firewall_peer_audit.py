@@ -171,12 +171,15 @@ def list_control_plane_node_ips() -> list[str] | None:
 #      is an etcd member — better a stale-but-open ruleset than a self-inflicted
 #      partition (and non-negotiable #5: keep serving when the control plane is
 #      wrong or unreachable)
-#   3. remember the last KNOWN membership on disk, because the probe itself
-#      depends on the network. k8s_api reads the apiserver ClusterIP (the
+#   3. fall back WITHOUT the network when the probe can't run, because the probe
+#      itself depends on it. k8s_api reads the apiserver ClusterIP (the
 #      supervisor pod has no hostNetwork, so there is no local-apiserver path
 #      to use — k8s_proxy's "127.0.0.1:6443" docstring notwithstanding, it also
 #      dials cfg.host). A partitioned node therefore cannot probe, and without
-#      a memory the guard would fail open exactly when it is needed.
+#      a fallback the guard would fail open exactly when it is needed. Falls
+#      back to a purely local cluster-member signal, then to a previously
+#      CONFIRMED membership on disk. Only ``True`` is ever remembered — see
+#      _remember_membership for why a persisted ``False`` would be this bug.
 
 
 # Last KNOWN membership, persisted across supervisor restarts on the host bind
@@ -195,27 +198,56 @@ _ETCD_MEMBER_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/etcd-member"
 
 
 def _remember_membership(value: bool) -> None:
-    """Persist a KNOWN membership answer. Best-effort: a read-only or missing
-    release-state dir must never break the firewall path."""
+    """Persist a KNOWN membership answer — but only a ``True``.
+
+    A persisted ``False`` would be the #593 bug written to disk: a node
+    promoted while its apiserver happens to be unreachable would probe None,
+    recall "not a member", pass the guard, and firewall its own raft port shut.
+    A confirmed ``False`` therefore CLEARS the marker rather than recording it.
+
+    Best-effort: a read-only or missing release-state dir must never break the
+    firewall path.
+    """
     try:
+        if not value:
+            _ETCD_MEMBER_SIDECAR.unlink(missing_ok=True)
+            return
         _ETCD_MEMBER_SIDECAR.parent.mkdir(parents=True, exist_ok=True)
         tmp = _ETCD_MEMBER_SIDECAR.with_name(_ETCD_MEMBER_SIDECAR.name + ".new")
-        tmp.write_text("true\n" if value else "false\n", encoding="utf-8")
+        tmp.write_text("true\n", encoding="utf-8")
         tmp.replace(_ETCD_MEMBER_SIDECAR)
     except OSError as exc:
         log.debug("supervisor.firewall.membership_persist_failed", error=str(exc))
 
 
 def _recall_membership() -> bool | None:
+    """``True`` when a previous probe confirmed membership; otherwise None.
+    Never ``False`` — see _remember_membership."""
     try:
         text = _ETCD_MEMBER_SIDECAR.read_text(encoding="utf-8").strip()
     except OSError:
         return None
-    if text == "true":
-        return True
-    if text == "false":
+    return True if text == "true" else None
+
+
+def _local_cluster_member_signal() -> bool:
+    """Is this node a control-plane cluster member, per purely LOCAL state?
+
+    Needs no network, so it answers during the very partition that defeats the
+    kube-API probe. Same two signals heartbeat._is_control_plane_member uses:
+    the node was installed as a control-plane seed, or it was promoted and its
+    host runner reported the join completed. On this appliance a control-plane
+    member always runs embedded etcd, so either implies an etcd member.
+    """
+    from . import appliance_state  # noqa: PLC0415 — avoid import cycle at load
+
+    try:
+        if appliance_state.detect_appliance_variant() == "control-plane":
+            return True
+        join_state, _ = appliance_state.read_cluster_join_state()
+        return join_state == "ready"
+    except Exception:  # noqa: BLE001 — a best-effort fallback must never raise
         return False
-    return None
 
 
 # Membership changes only on promote/demote, while the firewall path runs every
@@ -230,7 +262,9 @@ def _recall_membership() -> bool | None:
 # ``None`` is never cached either — an unreachable apiserver must be retried,
 # not remembered as "don't know".
 _ETCD_MEMBER_TTL_S = 300.0
-_etcd_member_cache: tuple[float, bool] | None = None
+# Monotonic timestamp of the last probe that answered True, or None. The TYPE
+# encodes the invariant: there is nowhere here to put a cached ``False``.
+_etcd_member_true_at: float | None = None
 
 
 def _etcd_membership_uncached() -> bool | None:
@@ -256,44 +290,56 @@ def _etcd_membership_uncached() -> bool | None:
 def local_node_is_etcd_member() -> bool | None:
     """Does k3s consider THIS node an embedded-etcd server?
 
-    Reads the local node's own labels. Falls back to the last KNOWN answer
-    (persisted on disk) when the apiserver is unreachable, so a node that was a
-    member before a partition still knows it is one during the partition.
+    Reads the local node's own labels. When the apiserver is unreachable — the
+    partition this module guards against — falls back, in order, to a purely
+    LOCAL cluster-member signal and then to a previously confirmed ``True``.
 
-    ``None`` only when we have never successfully probed (fresh install, no
-    NODE_NAME, non-k3s). Callers must treat ``None`` as "don't know", never as
+    ``None`` only when nothing says "member": no local signal, never a
+    successful probe. Callers must treat ``None`` as "don't know", never as
     "no" — the guard fails open there, which is correct for a plain agent
     appliance and would otherwise freeze the firewall on every non-etcd node.
+
+    Every fallback can only answer ``True`` or "don't know". A fallback that
+    could answer ``False`` would be this bug on a slower timescale: a node
+    promoted while its apiserver is unreachable would read "not a member",
+    pass the guard, and firewall its own raft port shut.
     """
-    global _etcd_member_cache
+    global _etcd_member_true_at
     now = time.monotonic()
-    if (
-        _etcd_member_cache is not None
-        and _etcd_member_cache[1] is True
-        and now - _etcd_member_cache[0] < _ETCD_MEMBER_TTL_S
-    ):
+    if _etcd_member_true_at is not None and now - _etcd_member_true_at < _ETCD_MEMBER_TTL_S:
         return True
 
     answer = _etcd_membership_uncached()
     if answer is not None:
-        _etcd_member_cache = (now, answer) if answer else None
+        # Only a True is remembered in-process; a False clears the marker so the
+        # very next tick re-probes and a promote is seen immediately.
+        _etcd_member_true_at = now if answer else None
         _remember_membership(answer)
         return answer
 
-    remembered = _recall_membership()
-    if remembered is not None:
+    if _local_cluster_member_signal():
         log.warning(
             "supervisor.firewall.membership_probe_unreachable",
-            using_last_known=remembered,
-            reason="kube apiserver unreadable; falling back to persisted membership",
+            using="local cluster-member signal",
+            reason="kube apiserver unreadable; this node is a control-plane member",
         )
-    return remembered
+        return True
+
+    if _recall_membership() is True:
+        log.warning(
+            "supervisor.firewall.membership_probe_unreachable",
+            using="last confirmed membership",
+            reason="kube apiserver unreadable; a previous probe confirmed this node is an etcd member",
+        )
+        return True
+
+    return None
 
 
 def _reset_etcd_member_cache() -> None:
-    """Test hook — the cache is process-global and would leak across cases."""
-    global _etcd_member_cache
-    _etcd_member_cache = None
+    """Test hook — the marker is process-global and would leak across cases."""
+    global _etcd_member_true_at
+    _etcd_member_true_at = None
 
 
 def body_opens_etcd_peers(body: str) -> bool:

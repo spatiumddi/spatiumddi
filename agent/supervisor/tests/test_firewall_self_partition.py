@@ -15,11 +15,13 @@ that k3s still calls an etcd member.
 Three defences, all covered here:
   1. recover a peer set from live membership when the row supplies none
   2. refuse to apply any body that would close 2380 on a live etcd member
-  3. remember the last KNOWN membership on disk, because the probe itself needs
-     the network — the supervisor pod has no hostNetwork, so its kube reads go
-     to the apiserver ClusterIP and can be routed to a REMOTE apiserver. A
-     partitioned node cannot probe; without a memory the guard fails open
-     exactly when it is needed.
+  3. fall back WITHOUT the network when the probe can't run — the supervisor pod
+     has no hostNetwork, so its kube reads go to the apiserver ClusterIP and may
+     be routed to a REMOTE apiserver. A partitioned node cannot probe, so it
+     falls back to a purely local cluster-member signal and then to a previously
+     CONFIRMED membership on disk. Only ``True`` is ever remembered: a persisted
+     ``False`` would be this bug on disk, since a node promoted while its
+     apiserver is unreachable would read "not a member" and partition itself.
 
 And the counter-properties, which matter just as much: a plain agent appliance
 (or a node that has never successfully probed) must still get its firewall.
@@ -35,6 +37,10 @@ from pathlib import Path
 import pytest
 
 from spatium_supervisor import firewall_peer_audit as fpa
+
+# Captured before the autouse fixture stubs it out, so the two tests that
+# exercise the real local signal can still reach it.
+_REAL_LOCAL_SIGNAL = fpa._local_cluster_member_signal
 
 # A real agent-profile body: mgmt + role ports, NO k3s-peer rule. This is what
 # got applied to ddi2 and partitioned it.
@@ -58,10 +64,13 @@ ip saddr { 10.42.0.0/16 } tcp dport 6443 accept comment "k3s-api"
 
 @pytest.fixture(autouse=True)
 def _isolate(monkeypatch, tmp_path: Path):
-    """The membership cache is a process global and the last-known answer is a
-    file on the host bind mount. Both would leak across cases."""
+    """The membership marker is a process global and the last-known answer is a
+    file on the host bind mount — both would leak across cases. The local
+    cluster-member signal reads real host paths, so it is pinned off by default
+    and opted into by the tests that exercise it."""
     fpa._reset_etcd_member_cache()
     monkeypatch.setattr(fpa, "_ETCD_MEMBER_SIDECAR", tmp_path / "etcd-member")
+    monkeypatch.setattr(fpa, "_local_cluster_member_signal", lambda: False)
     yield
     fpa._reset_etcd_member_cache()
 
@@ -265,18 +274,76 @@ def test_a_known_answer_survives_a_partition(monkeypatch) -> None:
     assert fpa.would_self_partition(AGENT_BODY, is_etcd_member=True) is True
 
 
-def test_a_demote_overwrites_the_persisted_answer(monkeypatch) -> None:
-    """Persistence must not pin a node to 'member' forever after a real demote."""
+def test_a_demote_clears_the_persisted_answer(monkeypatch) -> None:
+    """Persistence must not pin a node to 'member' forever after a real demote.
+    A confirmed False CLEARS the marker (it is never written as False)."""
     monkeypatch.setattr(fpa, "_etcd_membership_uncached", lambda: True)
     assert fpa.local_node_is_etcd_member() is True
+    assert fpa._ETCD_MEMBER_SIDECAR.exists()
 
     fpa._reset_etcd_member_cache()
     monkeypatch.setattr(fpa, "_etcd_membership_uncached", lambda: False)
     assert fpa.local_node_is_etcd_member() is False
+    assert not fpa._ETCD_MEMBER_SIDECAR.exists(), "a False must never be persisted"
 
+    # …and with the apiserver now unreadable, the demoted node reports "don't
+    # know" and the guard fails open, so its firewall can finally narrow.
     fpa._reset_etcd_member_cache()
     monkeypatch.setattr(fpa, "_etcd_membership_uncached", lambda: None)
-    assert fpa.local_node_is_etcd_member() is False  # recalls the demote
+    assert fpa.local_node_is_etcd_member() is None
+
+
+def test_a_promote_during_an_apiserver_outage_is_not_read_as_not_a_member(
+    monkeypatch,
+) -> None:
+    """REGRESSION. Persisting a False would put the #593 bug on disk: a node
+    promoted while its apiserver happens to be unreachable would probe None,
+    recall "not a member", pass the guard, and firewall its own raft port shut.
+
+    The local cluster-member signal answers without the network, so the promote
+    is seen even mid-outage."""
+    # It was a plain agent: a confirmed False, so nothing is persisted.
+    monkeypatch.setattr(fpa, "_etcd_membership_uncached", lambda: False)
+    assert fpa.local_node_is_etcd_member() is False
+    assert not fpa._ETCD_MEMBER_SIDECAR.exists()
+
+    # Now it is promoted (host runner reports the join ready) AND the apiserver
+    # is unreachable.
+    fpa._reset_etcd_member_cache()
+    monkeypatch.setattr(fpa, "_etcd_membership_uncached", lambda: None)
+    monkeypatch.setattr(fpa, "_local_cluster_member_signal", lambda: True)
+
+    assert fpa.local_node_is_etcd_member() is True
+    assert fpa.would_self_partition(AGENT_BODY, is_etcd_member=True) is True
+
+
+def test_the_local_signal_reads_only_host_state(monkeypatch) -> None:
+    """It must answer during the very partition that defeats the kube probe, so
+    it may not touch the network. Same two signals _is_control_plane_member uses."""
+    from spatium_supervisor import appliance_state
+
+    monkeypatch.setattr(appliance_state, "detect_appliance_variant", lambda: "application")
+    monkeypatch.setattr(appliance_state, "read_cluster_join_state", lambda: ("ready", None))
+    assert _REAL_LOCAL_SIGNAL() is True
+
+    monkeypatch.setattr(appliance_state, "read_cluster_join_state", lambda: (None, None))
+    assert _REAL_LOCAL_SIGNAL() is False
+
+    monkeypatch.setattr(
+        appliance_state, "detect_appliance_variant", lambda: "control-plane"
+    )
+    assert _REAL_LOCAL_SIGNAL() is True
+
+
+def test_the_local_signal_never_raises(monkeypatch) -> None:
+    """A best-effort fallback that raised would take the firewall path with it."""
+    from spatium_supervisor import appliance_state
+
+    def boom():
+        raise RuntimeError("host state unreadable")
+
+    monkeypatch.setattr(appliance_state, "detect_appliance_variant", boom)
+    assert _REAL_LOCAL_SIGNAL() is False
 
 
 def test_an_unwritable_sidecar_never_breaks_the_probe(monkeypatch, tmp_path) -> None:

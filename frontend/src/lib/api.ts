@@ -9927,7 +9927,15 @@ export interface ApplianceRow {
   // etcd's raft peer port on this node while k3s still considers it an etcd
   // member (a stale / diverged appliance row). `{}` when healthy; otherwise
   // `{ state: "refused_self_partition", source, reason }`.
-  firewall_state: Record<string, string>;
+  //
+  // Keys are OPTIONAL, not `Record<string, string>`: the healthy case is an
+  // empty object, so a required-key type would tell TypeScript `state.state`
+  // is always a string when it is in fact `undefined` most of the time.
+  firewall_state: {
+    state?: string;
+    source?: string;
+    reason?: string;
+  };
   // #170 Wave D follow-up — outcome of the supervisor's last
   // docker-compose lifecycle apply. ``idle`` / ``ready`` / ``failed``
   // or null on the first heartbeat / before any role assignment.
