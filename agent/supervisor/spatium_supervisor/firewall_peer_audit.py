@@ -23,6 +23,7 @@ import os
 import re
 import time
 from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -67,7 +68,6 @@ _ETCD_PEER_PORT_RE = re.compile(rf"(?<!\d){_ETCD_PEER_PORT}(?!\d)")
 # otherwise inherit at 10s. ``None`` is never cached, so a 10s connect timeout
 # would be re-paid on every heartbeat for the whole outage.
 _KUBEAPI_TIMEOUT_S = 2.0
-
 
 
 def compute_peer_drift(
@@ -262,9 +262,21 @@ def _local_cluster_member_signal() -> bool:
 # ``None`` is never cached either — an unreachable apiserver must be retried,
 # not remembered as "don't know".
 _ETCD_MEMBER_TTL_S = 300.0
-# Monotonic timestamp of the last probe that answered True, or None. The TYPE
-# encodes the invariant: there is nowhere here to put a cached ``False``.
-_etcd_member_true_at: float | None = None
+
+
+@dataclass
+class _MembershipCache:
+    """In-process memo of the last probe that answered True.
+
+    A one-field object rather than a module global + ``global`` statement: the
+    field holds the monotonic timestamp of the last ``True``, and its type
+    encodes the invariant — there is nowhere here to put a cached ``False``.
+    """
+
+    true_at: float | None = None
+
+
+_membership_cache = _MembershipCache()
 
 
 def _etcd_membership_uncached() -> bool | None:
@@ -304,16 +316,16 @@ def local_node_is_etcd_member() -> bool | None:
     promoted while its apiserver is unreachable would read "not a member",
     pass the guard, and firewall its own raft port shut.
     """
-    global _etcd_member_true_at
     now = time.monotonic()
-    if _etcd_member_true_at is not None and now - _etcd_member_true_at < _ETCD_MEMBER_TTL_S:
+    true_at = _membership_cache.true_at
+    if true_at is not None and now - true_at < _ETCD_MEMBER_TTL_S:
         return True
 
     answer = _etcd_membership_uncached()
     if answer is not None:
         # Only a True is remembered in-process; a False clears the marker so the
         # very next tick re-probes and a promote is seen immediately.
-        _etcd_member_true_at = now if answer else None
+        _membership_cache.true_at = now if answer else None
         _remember_membership(answer)
         return answer
 
@@ -337,9 +349,8 @@ def local_node_is_etcd_member() -> bool | None:
 
 
 def _reset_etcd_member_cache() -> None:
-    """Test hook — the marker is process-global and would leak across cases."""
-    global _etcd_member_true_at
-    _etcd_member_true_at = None
+    """Test hook — the marker is process-wide and would leak across cases."""
+    _membership_cache.true_at = None
 
 
 def body_opens_etcd_peers(body: str) -> bool:
