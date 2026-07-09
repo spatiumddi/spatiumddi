@@ -63,8 +63,8 @@ STATE="$RELEASE_STATE/cluster-join.state"
 JOIN_CONFIRM="SPATIUMDDI-CLUSTER-JOIN-CONFIRM-V1"
 LEAVE_CONFIRM="SPATIUMDDI-CLUSTER-LEAVE-CONFIRM-V1"
 
-K3S_CONFIG=/etc/rancher/k3s/config.yaml
-K3S_DROPIN_DIR=/etc/rancher/k3s/config.yaml.d
+K3S_CONFIG="${SPATIUM_K3S_CONFIG:-/etc/rancher/k3s/config.yaml}"
+K3S_DROPIN_DIR="${SPATIUM_K3S_DROPIN_DIR:-/etc/rancher/k3s/config.yaml.d}"
 JOIN_DROPIN="$K3S_DROPIN_DIR/spatium-cluster.yaml"
 # Cluster-identity paths wiped on a join (and restored on rollback).
 # A node that booted as its OWN ``cluster-init`` seed carries a server
@@ -301,6 +301,19 @@ _k3s_log_since() {
     journalctl -u k3s --no-pager --since "$1" 2>/dev/null || true
 }
 
+# #590 — is this node ALREADY a member of a control-plane cluster?
+#
+# The join drop-in (server: + token:) is written only by a previous
+# SUCCESSFUL join and removed on rollback / demote, so its presence is the
+# on-disk record of "I am a member". do_join uses this to decide whether a
+# rollback may restore this node's single-node bootstrap manifests: on an
+# already-a-member node, restore_identity puts it straight back into the
+# SHARED cluster, and its manifests would then overwrite the seed's
+# HelmCharts of the same name.
+node_was_cluster_member() {
+    [ -f "$JOIN_DROPIN" ]
+}
+
 wait_ready() {
     # Poll the local kubeapi until this node reports Ready (or timeout).
     local deadline=$(( $(date +%s) + READY_TIMEOUT )) node
@@ -360,9 +373,27 @@ do_join() {
 
     # Snapshot the config so a failed join can roll back to the prior
     # single-node-seed state.
-    local identity_backup config_backup
+    local identity_backup config_backup was_member
     config_backup="${K3S_CONFIG}.pre-join.$(date +%s)"
     cp -a "$K3S_CONFIG" "$config_backup" 2>/dev/null || true
+
+    # #590 — was this node ALREADY a member of a cluster before this join?
+    # The join drop-in is written only by a previous successful join, so its
+    # presence means the identity we are about to back up is a MEMBER
+    # identity, not a standalone seed.
+    #
+    # That distinction decides what the rollback may safely restore. The
+    # rollback restores the identity backup verbatim — so on an
+    # already-a-member node it puts the node straight back into the SHARED
+    # cluster. Restoring this node's single-node bootstrap manifests on top
+    # of that makes its helm-controller apply them cluster-wide, overwriting
+    # the seed's HelmCharts of the same name. Observed live: a failed
+    # re-join restored ddi2's manifests, whose ``spatium-bootstrap`` values
+    # carry ``cnpg: false`` + ``agentLanding: true`` — which UNINSTALLED the
+    # CloudNativePG operator on a healthy 3-node cluster and parked an nginx
+    # pod on the frontend's :80.
+    was_member=0
+    node_was_cluster_member && was_member=1
 
     # Move this node's own bootstrap manifests aside so it doesn't
     # re-apply its releases into the seed's shared cluster.
@@ -422,7 +453,15 @@ EOF
     rm -f "$JOIN_DROPIN"
     [ -f "$config_backup" ] && mv -f "$config_backup" "$K3S_CONFIG"
     restore_identity "$identity_backup"
-    if [ -d "$MANIFESTS_ASIDE" ] && ls "$MANIFESTS_ASIDE"/*.yaml >/dev/null 2>&1; then
+    # #590 — only a node that was STANDALONE before this join may take its
+    # bootstrap manifests back. If it was already a member, ``restore_identity``
+    # just put it back into the SHARED cluster, and re-applying its single-node
+    # manifests there would overwrite the seed's HelmCharts (see was_member
+    # above). Leave them parked in $MANIFESTS_ASIDE; a later successful demote
+    # (do_leave) restores them once the node really is standalone again.
+    if [ "$was_member" = "1" ]; then
+        log "NOT restoring local bootstrap manifests — this node was already a cluster member, and its manifests would overwrite the seed's releases in the shared cluster (left in $MANIFESTS_ASIDE)"
+    elif [ -d "$MANIFESTS_ASIDE" ] && ls "$MANIFESTS_ASIDE"/*.yaml >/dev/null 2>&1; then
         mv -f "$MANIFESTS_ASIDE"/*.yaml "$K3S_MANIFESTS/" || true
         log "restored local bootstrap manifests"
     fi

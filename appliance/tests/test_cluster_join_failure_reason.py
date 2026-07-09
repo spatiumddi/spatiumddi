@@ -117,6 +117,55 @@ def test_reason_is_a_single_line_with_no_tabs() -> None:
         assert "\n" not in reason
 
 
+def _was_member(dropin_dir: Path) -> bool:
+    """Run `node_was_cluster_member` against a synthetic config.yaml.d."""
+    proc = subprocess.run(
+        ["bash", "-c", f'source "{SCRIPT}"\nnode_was_cluster_member'],
+        env={
+            **os.environ,
+            "SPATIUM_CLUSTER_JOIN_LIB": "1",
+            "SPATIUM_K3S_DROPIN_DIR": str(dropin_dir),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return proc.returncode == 0
+
+
+def test_a_standalone_node_is_not_a_member(tmp_path: Path) -> None:
+    """No join drop-in → never joined. Its rollback MAY restore the node's
+    own single-node bootstrap manifests."""
+    dropins = tmp_path / "config.yaml.d"
+    dropins.mkdir()
+    (dropins / "spatium-cidrs.yaml").write_text("cluster-cidr: 10.42.0.0/16\n")
+    assert _was_member(dropins) is False
+
+
+def test_a_joined_node_is_a_member(tmp_path: Path) -> None:
+    """REGRESSION GUARD (#590). The join drop-in is written only by a
+    SUCCESSFUL join, so its presence means restore_identity would put this
+    node straight back into the SHARED cluster.
+
+    Restoring its single-node bootstrap manifests there makes its
+    helm-controller apply them cluster-wide, overwriting the seed's
+    HelmCharts of the same name. Observed live: a failed re-join restored a
+    member's manifests, whose ``spatium-bootstrap`` values carry
+    ``cnpg: false`` — which UNINSTALLED the CloudNativePG operator on a
+    healthy 3-node cluster, and ``agentLanding: true``, which parked an
+    nginx pod on the frontend's :80."""
+    dropins = tmp_path / "config.yaml.d"
+    dropins.mkdir()
+    (dropins / "spatium-cluster.yaml").write_text(
+        "server: https://10.0.0.1:6443\ntoken: redacted\n"
+    )
+    assert _was_member(dropins) is True
+
+
+def test_missing_dropin_dir_is_not_a_member(tmp_path: Path) -> None:
+    assert _was_member(tmp_path / "does-not-exist") is False
+
+
 def test_first_match_wins_on_a_noisy_log() -> None:
     """A real journal carries connection noise alongside the fatal. The
     duplicate-name fatal is the actionable one and must not be masked by the
