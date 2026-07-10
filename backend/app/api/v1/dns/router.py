@@ -22,6 +22,11 @@ from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.pagination import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, Page, paginate
 from app.core.agent_wake import collect_wake, dns_group_channel, dns_server_channel
 from app.core.crypto import decrypt_dict, encrypt_dict, encrypt_str
+from app.core.dns_names import (
+    contains_control_chars,
+    validate_fqdn,
+    validate_record_owner,
+)
 from app.core.permissions import (
     _token_grants_for,
     require_any_resource_permission,
@@ -771,8 +776,12 @@ class ZoneCreate(BaseModel):
 
     @field_validator("name")
     @classmethod
-    def ensure_trailing_dot(cls, v: str) -> str:
-        return v if v.endswith(".") else v + "."
+    def validate_zone_name(cls, v: str) -> str:
+        # Validate as an FQDN (issue #597) — rejects spaces / control chars /
+        # zone-file-dangerous punctuation, IDNA-normalizes, and lower-cases —
+        # then re-append the trailing root dot the storage convention uses.
+        # ``allow_underscore`` keeps ``_msdcs`` / ``_sip._tcp`` zones legal.
+        return validate_fqdn(v, field="zone name") + "."
 
 
 class ZoneUpdate(BaseModel):
@@ -806,6 +815,15 @@ class ZoneUpdate(BaseModel):
     masters: list[str] | None = None
     customer_id: uuid.UUID | None = None
     tags: dict[str, Any] | None = None
+
+    @field_validator("name")
+    @classmethod
+    def validate_zone_name(cls, v: str | None) -> str | None:
+        # Optional on update; validate + re-append the trailing dot when set
+        # (issue #597), mirroring ZoneCreate.
+        if v is None:
+            return v
+        return validate_fqdn(v, field="zone name") + "."
 
     @field_validator("zone_type")
     @classmethod
@@ -902,6 +920,15 @@ class RecordCreate(BaseModel):
             raise ValueError(f"record_type must be one of {sorted(VALID_RECORD_TYPES)}")
         return v
 
+    @field_validator("name")
+    @classmethod
+    def validate_owner(cls, v: str) -> str:
+        # RFC 2181 owner label rule (issue #597) — permits ``_`` owners
+        # (``_acme-challenge``, ``_443._tcp``) and a leftmost ``*`` wildcard,
+        # normalizes ``""``/``@`` to the apex sentinel ``@`` the handlers use
+        # (``fqdn = name.zone if name != "@" else zone``).
+        return validate_record_owner(v, field="record name")
+
 
 class RecordUpdate(BaseModel):
     name: str | None = None
@@ -912,6 +939,14 @@ class RecordUpdate(BaseModel):
     port: int | None = None
     view_id: uuid.UUID | None = None
     tags: dict[str, Any] | None = None
+
+    @field_validator("name")
+    @classmethod
+    def validate_owner(cls, v: str | None) -> str | None:
+        # Optional on update; same RFC 2181 owner rule as RecordCreate.
+        if v is None:
+            return v
+        return validate_record_owner(v, field="record name")
 
 
 class RecordResponse(BaseModel):
@@ -1013,19 +1048,59 @@ def _normalize_record_struct_fields(
     return None, None, None
 
 
+# rdata for these types is a single bare target *name* — validate it as an
+# FQDN (issue #597). MX / SRV are deliberately excluded: their value may
+# carry the priority / weight / port inline (``10 mail.example.com``) on some
+# client + driver paths, so an FQDN check would reject a legitimate value —
+# the control-character guard below still protects them. Also excludes TXT
+# (freeform, quoted at render), the structured types (SVCB / HTTPS / NAPTR /
+# CAA / SSHFP / TLSA / LOC / LUA), and A/AAAA (IP-validated below).
+_HOSTNAME_TARGET_RECORD_TYPES = frozenset({"CNAME", "NS", "PTR", "DNAME", "ALIAS"})
+
+
 def _validate_address_record_value(record_type: str, value: str) -> None:
-    """Reject A / AAAA values that aren't a single valid IP address (#467).
+    """Reject rdata that would break — or inject into — a rendered zone (#467, #597).
 
-    Each ``DNSRecord`` row holds exactly one address, and the BIND9 / PowerDNS
-    drivers render one RR line per row. So a value like ``10.0.0.1, 10.0.0.2``
-    is silently stored verbatim and emitted as malformed rdata that breaks the
-    zone load. To point one hostname at several IPs an operator adds one A
-    record per IP (RFC 1035 round-robin) or uses a DNS Pool for health-checked
-    failover — never a comma-separated list in one record.
+    Three checks, in order of the record's shape:
 
-    Raises ``HTTPException(422)`` with that guidance on a non-single-IP value.
+    * Any value carrying a control character / newline is rejected for every
+      type — that is the one thing that injects a second zone-file record, and
+      no legitimate rdata contains one. (Spaces and quotes are *not* rejected:
+      structured rdata like CAA / LOC / NAPTR / SVCB needs them.)
+    * A / AAAA must be a single valid IP of the matching family (each row is
+      one RR line, so ``10.0.0.1, 10.0.0.2`` is malformed rdata).
+    * A bare-name target type (CNAME / NS / PTR / DNAME / ALIAS) whose value is
+      the pointed-at name must be a syntactically valid FQDN. MX / SRV are
+      excluded — their value may carry the priority inline on some paths.
+
+    Raises ``HTTPException(422)`` with guidance on any failure.
     """
     rtype = record_type.upper()
+
+    # Injection guard for EVERY type: a newline / control character is the
+    # one thing that can inject a second record into a zone-file line, and no
+    # legitimate rdata carries one. Deliberately narrower than
+    # ``contains_zonefile_unsafe`` — spaces and quotes are load-bearing in
+    # structured rdata (CAA ``0 issue "letsencrypt.org"``, LOC / NAPTR /
+    # SVCB / HTTPS), so only control bytes are rejected here. Interior
+    # whitespace in a *name-valued* type is caught by the FQDN check below;
+    # a comma-separated A/AAAA list by the IP parse.
+    if contains_control_chars(value):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"{rtype} record value contains a control character or newline, "
+                "which is not allowed in DNS record data."
+            ),
+        )
+
+    if rtype in _HOSTNAME_TARGET_RECORD_TYPES:
+        try:
+            validate_fqdn(value, field=f"{rtype} record target")
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return
+
     if rtype not in ("A", "AAAA"):
         return
     candidate = value.strip()

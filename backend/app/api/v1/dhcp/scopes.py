@@ -19,6 +19,7 @@ from sqlalchemy.exc import IntegrityError
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.v1.dhcp._audit import write_audit
 from app.core.agent_wake import collect_wake, dhcp_group_channel
+from app.core.dns_names import validate_fqdn
 from app.core.permissions import require_resource_permission
 from app.models.dhcp import DHCPScope, DHCPServerGroup
 from app.models.ipam import Subnet
@@ -67,11 +68,37 @@ _CODE_TO_NAME: dict[int, str] = {
 _OPTION_NAME_ALIASES: dict[str, str] = {"domain-name-servers": "dns-servers"}
 
 
+def _validate_domain_options(opts: dict[str, Any]) -> dict[str, Any]:
+    """Validate the FQDN-valued DHCP options in place (issue #597).
+
+    ``domain-name`` (option 15) is a single FQDN; ``domain-search``
+    (option 119) is a list of FQDNs. Both render straight into the Kea
+    config, so a malformed value would break the rendered config or ship a
+    bad search suffix. Invalid values raise ``ValueError`` (surfaced as a
+    422). Other options are left untouched.
+    """
+    try:
+        dn = opts.get("domain-name")
+        if isinstance(dn, str) and dn.strip():
+            opts["domain-name"] = validate_fqdn(dn, field="domain-name option")
+        ds = opts.get("domain-search")
+        if isinstance(ds, list):
+            opts["domain-search"] = [
+                validate_fqdn(str(d), field="domain-search option") if str(d).strip() else d
+                for d in ds
+            ]
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return opts
+
+
 def _normalize_options(raw: Any) -> dict[str, Any]:
     if raw is None:
         return {}
     if isinstance(raw, dict):
-        return {_OPTION_NAME_ALIASES.get(str(k), str(k)): v for k, v in raw.items()}
+        return _validate_domain_options(
+            {_OPTION_NAME_ALIASES.get(str(k), str(k)): v for k, v in raw.items()}
+        )
     if isinstance(raw, list):
         out: dict[str, Any] = {}
         for entry in raw:
@@ -85,7 +112,7 @@ def _normalize_options(raw: Any) -> dict[str, Any]:
                 continue
             name = _OPTION_NAME_ALIASES.get(name, name)
             out[name] = entry.get("value")
-        return out
+        return _validate_domain_options(out)
     return {}
 
 

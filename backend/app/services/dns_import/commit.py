@@ -24,6 +24,7 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.dns_names import contains_control_chars
 from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.dns import DNSRecord, DNSServerGroup, DNSView, DNSZone
@@ -152,17 +153,26 @@ async def _build_records_for_zone(
     parsed: ImportedZone,
     source: ImportSource,
     now: datetime,
-) -> int:
-    """Create the DNSRecord rows for one parsed zone. Returns the
-    number of records created.
+) -> tuple[int, list[str]]:
+    """Create the DNSRecord rows for one parsed zone.
 
-    Skips the SOA — SOA fields live as columns on the parent zone,
-    not as a regular record row.
+    Returns ``(records_created, skipped_reasons)``. Skips the SOA (its
+    fields live as columns on the parent zone) and, per issue #597, any
+    record whose owner name or rdata carries a control character / newline
+    — those can't be safely rendered into a zone-file line, so the row is
+    dropped with a reported reason rather than silently imported.
     """
 
     rows: list[DNSRecord] = []
+    skipped: list[str] = []
     for r in parsed.records:
         if r.record_type == "SOA":
+            continue
+        if contains_control_chars(r.name) or contains_control_chars(r.value):
+            skipped.append(
+                f"{r.name or '@'} {r.record_type}: dropped — control character "
+                "in the record name or value"
+            )
             continue
         # FQDN is "<label>.<zone_fqdn>" with the apex label "@"
         # collapsing to just the zone fqdn.
@@ -188,7 +198,7 @@ async def _build_records_for_zone(
         )
     if rows:
         db.add_all(rows)
-    return len(rows)
+    return len(rows), skipped
 
 
 def _zone_kwargs_from_parsed(
@@ -267,7 +277,7 @@ async def _create_zone_at(
     db.add(zone)
     await db.flush()  # populate zone.id for the FK
 
-    records_created = await _build_records_for_zone(
+    records_created, skipped_records = await _build_records_for_zone(
         db,
         zone_id=zone.id,
         zone_fqdn=target_name,
@@ -282,6 +292,8 @@ async def _create_zone_at(
         "records_created": records_created,
         "skipped_record_types": parsed.skipped_record_types,
     }
+    if skipped_records:
+        audit_meta["records_skipped_unsafe"] = skipped_records
     if overwrote_records:
         audit_meta["records_deleted_on_overwrite"] = overwrote_records
     if audit_extra:

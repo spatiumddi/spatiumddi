@@ -19,6 +19,7 @@ from typing import Any
 import structlog
 from jinja2 import Environment, FileSystemLoader, StrictUndefined, select_autoescape
 
+from app.core.dns_names import strip_control_chars
 from app.drivers.dns.base import (
     ConfigBundle,
     DNSDriver,
@@ -62,7 +63,12 @@ def _render_record(zone: ZoneData, r: RecordData) -> str:
     name = "@" if r.name in ("@", "", zone.name.rstrip(".")) else r.name
     ttl = f"{r.ttl} " if r.ttl is not None else ""
     rtype = r.record_type.upper()
-    value = r.value
+    # Render-boundary neutralizer (issue #597): strip control characters /
+    # newlines from the owner + rdata so a value that slipped past the field
+    # validators (importer, legacy row) can't inject a second record line.
+    # Spaces / quotes survive, so structured rdata renders intact.
+    name = strip_control_chars(name)
+    value = strip_control_chars(r.value)
 
     if rtype == "TXT":
         rdata = _quote_txt(value)
@@ -155,7 +161,9 @@ class BIND9Driver(DNSDriver):
         rendered: list[str] = []
         excluded = {d.lower() for d in blocklist.exceptions}
         for e in blocklist.entries:
-            dom = e.domain.lower().rstrip(".")
+            # Feed-sourced domains are untrusted; neutralize control chars
+            # so a malformed feed entry can't inject a zone-file line (#597).
+            dom = strip_control_chars(e.domain.lower().rstrip("."))
             if dom in excluded:
                 continue
             rpz_name = f"*.{dom}" if e.is_wildcard else dom

@@ -14,6 +14,7 @@ from sqlalchemy import select
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.v1.dhcp._audit import write_audit
 from app.core.agent_wake import collect_wake, dhcp_group_channel
+from app.core.dns_names import validate_hostname
 from app.core.permissions import require_resource_permission
 from app.models.dhcp import DHCPPool, DHCPScope, DHCPStaticAssignment
 from app.models.ipam import IPAddress, Subnet
@@ -24,6 +25,17 @@ from app.services.tags import apply_tag_filter
 router = APIRouter(
     tags=["dhcp"], dependencies=[Depends(require_resource_permission("dhcp_static"))]
 )
+
+
+def _validate_optional_hostname(v: str | None) -> str | None:
+    """Reservation hostname is optional; validate the RFC 1123 form when set.
+
+    Operator-entered (not client-supplied), so a malformed value is rejected
+    rather than sanitized (issue #597). ``""`` / ``None`` pass through.
+    """
+    if v is None or v.strip() == "":
+        return v
+    return validate_hostname(v)
 
 
 class StaticCreate(BaseModel):
@@ -39,6 +51,11 @@ class StaticCreate(BaseModel):
     ip_address_id: uuid.UUID | None = None
     tags: dict[str, Any] = Field(default_factory=dict)
 
+    @field_validator("hostname")
+    @classmethod
+    def _hostname(cls, v: str) -> str:
+        return _validate_optional_hostname(v) or ""
+
 
 class StaticUpdate(BaseModel):
     ip_address: str | None = None
@@ -50,6 +67,11 @@ class StaticUpdate(BaseModel):
     options_override: dict[str, Any] | None = None
     ip_address_id: uuid.UUID | None = None
     tags: dict[str, Any] | None = None
+
+    @field_validator("hostname")
+    @classmethod
+    def _hostname(cls, v: str | None) -> str | None:
+        return _validate_optional_hostname(v)
 
 
 class StaticResponse(BaseModel):

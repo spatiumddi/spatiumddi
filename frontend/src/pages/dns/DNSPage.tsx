@@ -82,6 +82,7 @@ import {
   type DNSGroupSyncResult,
 } from "@/lib/api";
 import { copyToClipboard } from "@/lib/clipboard";
+import { fqdnError, recordOwnerError } from "@/lib/dnsNames";
 import { useTableSort, SortableTh } from "@/lib/useTableSort";
 import { cn, swatchCls, zebraBodyCls } from "@/lib/utils";
 import { SwatchPicker } from "@/components/ui/swatch-picker";
@@ -136,10 +137,12 @@ function Btns({
   onClose,
   pending,
   label,
+  disabled,
 }: {
   onClose: () => void;
   pending: boolean;
   label?: string;
+  disabled?: boolean;
 }) {
   return (
     <div className="flex justify-end gap-2 pt-2">
@@ -152,7 +155,7 @@ function Btns({
       </button>
       <button
         type="submit"
-        disabled={pending}
+        disabled={pending || disabled}
         className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
       >
         {pending ? "Saving…" : (label ?? "Save")}
@@ -2058,6 +2061,8 @@ function ZoneModal({
   const [ttl, setTtl] = useState(String(zone?.ttl ?? 3600));
   const [dnssec, setDnssec] = useState(zone?.dnssec_enabled ?? false);
   const [color, setColor] = useState<string | null>(zone?.color ?? null);
+  // Client-side FQDN check (create only — the name is locked on edit).
+  const nameErr = !zone && name.trim() ? fqdnError(name) : null;
   // Forward-zone config — only shown / submitted when zoneType === "forward".
   const [forwardersText, setForwardersText] = useState(
     (zone?.forwarders ?? []).join(", "),
@@ -2151,10 +2156,14 @@ function ZoneModal({
             autoFocus
             disabled={!!zone}
           />
-          {!zone && (
-            <p className="text-xs text-muted-foreground mt-0.5">
-              Trailing dot added automatically.
-            </p>
+          {nameErr ? (
+            <p className="text-xs text-destructive mt-0.5">{nameErr}</p>
+          ) : (
+            !zone && (
+              <p className="text-xs text-muted-foreground mt-0.5">
+                Trailing dot added automatically.
+              </p>
+            )
           )}
         </Field>
         <div className="grid grid-cols-2 gap-3">
@@ -2339,6 +2348,7 @@ function ZoneModal({
           onClose={onClose}
           pending={mut.isPending}
           label={zone ? "Save" : "Add Zone"}
+          disabled={!!nameErr}
         />
       </form>
     </Modal>
@@ -2421,6 +2431,8 @@ function RecordModal({
   const [port, setPort] = useState(String(record?.port ?? ""));
   const [viewId, setViewId] = useState<string>(record?.view_id ?? "");
   const [error, setError] = useState("");
+  // Owner-name check — permits `_`, a leftmost `*`, and empty/`@` (apex).
+  const nameErr = recordOwnerError(name);
 
   const { data: views = [] } = useQuery({
     queryKey: ["dns-views", groupId],
@@ -2481,6 +2493,7 @@ function RecordModal({
               required
               autoFocus
             />
+            {nameErr && <p className="text-xs text-destructive">{nameErr}</p>}
           </Field>
           <Field label="Type">
             <select
@@ -2700,6 +2713,7 @@ function RecordModal({
           onClose={onClose}
           pending={mut.isPending}
           label={record ? "Save" : "Add Record"}
+          disabled={!!nameErr}
         />
       </form>
     </Modal>
