@@ -30,10 +30,12 @@ export function Btns({
   onClose,
   pending,
   label,
+  disabled,
 }: {
   onClose: () => void;
   pending: boolean;
   label?: string;
+  disabled?: boolean;
 }) {
   return (
     <div className="flex justify-end gap-2 pt-2">
@@ -46,7 +48,7 @@ export function Btns({
       </button>
       <button
         type="submit"
-        disabled={pending}
+        disabled={pending || disabled}
         className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
       >
         {pending ? "Saving…" : (label ?? "Save")}

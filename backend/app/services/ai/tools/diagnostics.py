@@ -33,6 +33,7 @@ from app.core.permissions import is_effective_superadmin
 from app.models.auth import User
 from app.models.diagnostics import InternalError
 from app.services.ai.tools.base import register_tool
+from app.services.dns_names_report import scan_name_conformance
 
 
 def _superadmin_gate(user: User) -> dict[str, Any] | None:
@@ -237,3 +238,39 @@ async def get_internal_error(
     summary["acknowledged_by"] = str(row.acknowledged_by) if row.acknowledged_by else None
     summary["suppressed_until"] = row.suppressed_until.isoformat() if row.suppressed_until else None
     return summary
+
+
+# ── find_nonconforming_names ──────────────────────────────────────────
+
+
+class FindNonconformingNamesArgs(BaseModel):
+    pass
+
+
+@register_tool(
+    name="find_nonconforming_names",
+    description=(
+        "Report existing names that violate DNS naming rules "
+        "(issue #597, superadmin only). Scans IPAM hostnames, DNS "
+        "record owners, DNS zone names, and DHCP static reservation "
+        "hostnames for values the write-time validators now reject — "
+        "spaces, control characters, illegal punctuation, "
+        "over-length labels, etc. Returns per-category counts plus "
+        "up to 100 examples each (id + value + reason). Read-only; "
+        "fixes are made by editing the offending rows. Use for 'which "
+        "hostnames aren't valid DNS names?' / 'do we have any records "
+        "that would break a zone file?'."
+    ),
+    args_model=FindNonconformingNamesArgs,
+    category="ops",
+    default_enabled=True,
+)
+async def find_nonconforming_names(
+    db: AsyncSession,
+    user: User,
+    args: FindNonconformingNamesArgs,
+) -> dict[str, Any]:
+    gate = _superadmin_gate(user)
+    if gate:
+        return gate
+    return await scan_name_conformance(db)

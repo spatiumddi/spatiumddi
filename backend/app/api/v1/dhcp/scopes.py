@@ -19,6 +19,7 @@ from sqlalchemy.exc import IntegrityError
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.v1.dhcp._audit import write_audit
 from app.core.agent_wake import collect_wake, dhcp_group_channel
+from app.core.dns_names import validate_fqdn
 from app.core.permissions import require_resource_permission
 from app.models.dhcp import DHCPScope, DHCPServerGroup
 from app.models.ipam import Subnet
@@ -67,7 +68,40 @@ _CODE_TO_NAME: dict[int, str] = {
 _OPTION_NAME_ALIASES: dict[str, str] = {"domain-name-servers": "dns-servers"}
 
 
+def validate_domain_options(
+    opts: dict[str, Any], *, previous: dict[str, Any] | None = None
+) -> None:
+    """Validate the FQDN-valued DHCP options (issue #597); raise 422 on a bad one.
+
+    ``domain-name`` (option 15) is a single FQDN; ``domain-search``
+    (option 119) is a list of FQDNs. Both render straight into the Kea
+    config, so a malformed value would break it or ship a bad search suffix.
+    Empty / whitespace-only entries are rejected too (a blank search suffix
+    is meaningless). A value identical to ``previous`` is skipped, so an
+    update that merely round-trips a grandfathered value doesn't block the
+    edit (validate-on-*change*, matching the issue's report-don't-break stance).
+    """
+    prev = previous or {}
+    try:
+        dn = opts.get("domain-name")
+        if isinstance(dn, str) and dn != prev.get("domain-name"):
+            if not dn.strip():
+                raise ValueError("domain-name option must not be blank")
+            validate_fqdn(dn, field="domain-name option")
+        ds = opts.get("domain-search")
+        if isinstance(ds, list) and ds != prev.get("domain-search"):
+            for d in ds:
+                if not str(d).strip():
+                    raise ValueError("domain-search option contains a blank entry")
+                validate_fqdn(str(d), field="domain-search option")
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
 def _normalize_options(raw: Any) -> dict[str, Any]:
+    """Normalize option shape (name aliases, list→dict). Does NOT validate —
+    callers run ``validate_domain_options`` so the create/update paths can
+    apply different only-on-change gating."""
     if raw is None:
         return {}
     if isinstance(raw, dict):
@@ -439,6 +473,8 @@ async def create_scope(
     except ValueError:
         address_family = "ipv4"
     _validate_relay_family(body.relay_addresses, address_family)
+    _create_options = _normalize_options(body.options)
+    validate_domain_options(_create_options)  # always validate on create (#597)
     scope = DHCPScope(
         subnet_id=subnet_id,
         group_id=group_id,
@@ -448,7 +484,7 @@ async def create_scope(
         lease_time=body.lease_time,
         min_lease_time=body.min_lease_time,
         max_lease_time=body.max_lease_time,
-        options=_normalize_options(body.options),
+        options=_create_options,
         ddns_enabled=body.ddns_enabled,
         ddns_hostname_policy=body.ddns_hostname_policy or "client",
         hostname_to_ipam_sync=sync_mode,
@@ -544,7 +580,13 @@ async def update_scope(
             detail=f"invalid hostname sync mode: {changes['hostname_to_ipam_sync']}",
         )
     if "options" in changes:
-        changes["options"] = _normalize_options(changes["options"])
+        normalized = _normalize_options(changes["options"])
+        # Validate only domain options that CHANGED from the stored value
+        # (issue #597 review) — the scope form round-trips the full options
+        # dict, so re-validating an unchanged grandfathered value would block
+        # an unrelated edit.
+        validate_domain_options(normalized, previous=scope.options or {})
+        changes["options"] = normalized
     # ``clear_pxe_profile=True`` is the explicit detach signal — Pydantic
     # collapses missing + null on ``pxe_profile_id`` so we need a
     # second boolean field to disambiguate. Apply detach first; a

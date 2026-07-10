@@ -19,6 +19,7 @@ from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.v1.dhcp._audit import write_audit
+from app.api.v1.dhcp.scopes import validate_domain_options
 from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
 from app.models.dhcp import (
@@ -146,6 +147,7 @@ async def create_template(
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=409, detail="A template with that name exists")
     options = _normalize_options(body.options)
+    validate_domain_options(options)  # #597 — domain-name/domain-search are FQDNs
     tpl = DHCPOptionTemplate(
         group_id=group_id,
         name=body.name,
@@ -201,6 +203,9 @@ async def update_template(
             raise HTTPException(status_code=409, detail="A template with that name exists")
     if "options" in payload:
         payload["options"] = _normalize_options(payload["options"])
+        # Validate only changed domain options (#597) so a round-tripped
+        # grandfathered value doesn't block an unrelated edit.
+        validate_domain_options(payload["options"], previous=tpl.options or {})
     for k, v in payload.items():
         setattr(tpl, k, v)
     write_audit(

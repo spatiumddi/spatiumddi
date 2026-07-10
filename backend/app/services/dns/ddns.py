@@ -42,13 +42,13 @@ lazy-import the router function at call time to dodge it.
 from __future__ import annotations
 
 import ipaddress
-import re
 from typing import Any
 
 import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.dns_names import sanitize_host_label
 from app.models.dhcp import DHCPScope, DHCPStaticAssignment
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
 
@@ -138,25 +138,15 @@ _POLICIES: frozenset[str] = frozenset(
     {"client_provided", "client_or_generated", "always_generate", "disabled"}
 )
 
-# Hostnames are a subset of RFC 1035 labels. We clamp to lower-case
-# alphanumerics + hyphen and strip anything else; empty after strip
-# means "use the generated form instead".
-_HOSTNAME_SAFE_RE = re.compile(r"[^a-z0-9-]+")
-
 
 def _sanitise(raw: str | None) -> str:
     """Fold a raw client hostname into a safe DNS label.
 
-    Strips quotes, lower-cases, collapses runs of unsafe chars to a
-    single hyphen, trims leading/trailing hyphens, truncates at 63
-    (the RFC 1035 label limit).
+    Thin alias for the shared ``sanitize_host_label`` (issue #597) so the
+    LDH-folding rule lives in exactly one place; empty after folding means
+    "use the generated form instead".
     """
-    if not raw:
-        return ""
-    s = raw.strip().strip('"').lower()
-    s = _HOSTNAME_SAFE_RE.sub("-", s)
-    s = s.strip("-")
-    return s[:63]
+    return sanitize_host_label(raw)
 
 
 def _generate_hostname(ip_str: str) -> str:

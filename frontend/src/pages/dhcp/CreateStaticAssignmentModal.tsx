@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { dhcpApi, type DHCPStaticAssignment, type DHCPScope } from "@/lib/api";
+import { hostnameError } from "@/lib/dnsNames";
 import { Modal, Field, Btns, inputCls, errMsg } from "./_shared";
 
 export function CreateStaticAssignmentModal({
@@ -25,6 +26,8 @@ export function CreateStaticAssignmentModal({
   const isV6 = scope.address_family === "ipv6";
   const [duid, setDuid] = useState(staticAssignment?.duid ?? "");
   const [error, setError] = useState("");
+  // Hostname is optional here — only validate (and block submit) when non-empty.
+  const hostnameErr = hostname.trim() ? hostnameError(hostname) : null;
 
   const { data: pools = [] } = useQuery({
     queryKey: ["dhcp-pools", scope.id],
@@ -113,6 +116,9 @@ export function CreateStaticAssignmentModal({
               value={hostname}
               onChange={(e) => setHostname(e.target.value)}
             />
+            {hostnameErr && (
+              <p className="text-xs text-destructive">{hostnameErr}</p>
+            )}
           </Field>
           <Field
             label="Client ID"
@@ -150,7 +156,11 @@ export function CreateStaticAssignmentModal({
             {error}
           </p>
         )}
-        <Btns onClose={onClose} pending={mut.isPending} />
+        <Btns
+          onClose={onClose}
+          pending={mut.isPending}
+          disabled={!!hostnameErr}
+        />
       </form>
     </Modal>
   );

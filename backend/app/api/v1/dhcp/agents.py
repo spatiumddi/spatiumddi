@@ -17,7 +17,7 @@ from typing import Any
 import structlog
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
 from jose import JWTError
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import select
 
 from app.api.deps import DB
@@ -27,6 +27,7 @@ from app.core.agent_wake import (
     dhcp_wake_channels,
     wake_subscription,
 )
+from app.core.dns_names import sanitize_hostname
 from app.models.dhcp import (
     DHCPConfigOp,
     DHCPLease,
@@ -151,6 +152,18 @@ class LeaseEvent(BaseModel):
     starts_at: datetime | None = None
     ends_at: datetime | None = None
     expires_at: datetime | None = None
+
+    @field_validator("hostname")
+    @classmethod
+    def _sanitize_client_hostname(cls, v: str | None) -> str | None:
+        # The client-supplied DHCP hostname arrives off the wire and flows
+        # into IPAM.hostname + the lease row + DDNS. Fold it to a safe LDH
+        # form at ingress (issue #597) rather than rejecting — a malformed
+        # client hostname must never fail the lease ingest. Empty result →
+        # None ("no usable hostname").
+        if v is None:
+            return None
+        return sanitize_hostname(v) or None
 
 
 class LeaseEventBatch(BaseModel):

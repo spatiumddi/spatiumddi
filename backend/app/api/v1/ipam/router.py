@@ -9,12 +9,12 @@ import re
 import string
 import uuid
 from datetime import UTC, date, datetime, timedelta
-from typing import Any, cast
+from typing import Annotated, Any, cast
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, BeforeValidator, Field, field_validator, model_validator
 from sqlalchemy import String, asc, desc, func, or_, select, text
 from sqlalchemy import cast as sa_cast
 from sqlalchemy.exc import IntegrityError
@@ -23,6 +23,7 @@ from sqlalchemy.orm import selectinload
 
 from app.api.deps import DB, CurrentUser
 from app.api.v1.ipam.io_router import router as io_router
+from app.core.dns_names import validate_fqdn, validate_hostname
 from app.core.permissions import (
     is_effective_superadmin,
     require_any_resource_or_scoped,
@@ -71,6 +72,22 @@ from app.services.oui import bulk_lookup_vendors, is_voip_phone_vendor, normaliz
 from app.services.tags import apply_tag_filter
 
 logger = structlog.get_logger(__name__)
+
+
+def _validate_opt_ddns_domain(v: Any) -> Any:
+    """Reusable validator for the optional ``ddns_domain_override`` FQDN.
+
+    ``None`` / empty pass through (the field is clearable); a supplied
+    value must be a valid FQDN (issue #597).
+    """
+    if v is None or (isinstance(v, str) and v.strip() == ""):
+        return v
+    return validate_fqdn(str(v), field="ddns_domain_override")
+
+
+# Shared field type so every IPSpace / IPBlock / Subnet create+update schema
+# validates the DDNS domain suffix without repeating a per-class validator.
+DDNSDomainOverride = Annotated[str | None, BeforeValidator(_validate_opt_ddns_domain)]
 
 # Router-level permission gate: GET → `read`, POST/PUT/PATCH → `write`,
 # DELETE → `delete`. Endpoints under /ipam manipulate IPAM resources, so we
@@ -1647,7 +1664,7 @@ class IPSpaceCreate(BaseModel):
     dhcp_server_group_id: uuid.UUID | None = None
     ddns_enabled: bool = False
     ddns_hostname_policy: str = "client_or_generated"
-    ddns_domain_override: str | None = None
+    ddns_domain_override: DDNSDomainOverride = None
     ddns_ttl: int | None = None
     # VRF / routing annotation. Pure metadata; address allocation
     # ignores these. ``route_targets`` is a list of strings rather
@@ -1692,7 +1709,7 @@ class IPSpaceUpdate(BaseModel):
     dhcp_server_group_id: uuid.UUID | None = None
     ddns_enabled: bool | None = None
     ddns_hostname_policy: str | None = None
-    ddns_domain_override: str | None = None
+    ddns_domain_override: DDNSDomainOverride = None
     ddns_ttl: int | None = None
     vrf_id: uuid.UUID | None = None
     vrf_name: str | None = None
@@ -1768,7 +1785,7 @@ class IPBlockCreate(BaseModel):
     dhcp_inherit_settings: bool = True
     ddns_enabled: bool = False
     ddns_hostname_policy: str = "client_or_generated"
-    ddns_domain_override: str | None = None
+    ddns_domain_override: DDNSDomainOverride = None
     ddns_ttl: int | None = None
     ddns_inherit_settings: bool = True
     asn_id: uuid.UUID | None = None
@@ -1816,7 +1833,7 @@ class IPBlockUpdate(BaseModel):
     dhcp_inherit_settings: bool | None = None
     ddns_enabled: bool | None = None
     ddns_hostname_policy: str | None = None
-    ddns_domain_override: str | None = None
+    ddns_domain_override: DDNSDomainOverride = None
     ddns_ttl: int | None = None
     ddns_inherit_settings: bool | None = None
     asn_id: uuid.UUID | None = None
@@ -1916,7 +1933,7 @@ class SubnetCreate(BaseModel):
     # space) — see services/dns/ddns.resolve_effective_ddns.
     ddns_enabled: bool = False
     ddns_hostname_policy: str = "client_or_generated"
-    ddns_domain_override: str | None = None
+    ddns_domain_override: DDNSDomainOverride = None
     ddns_ttl: int | None = None
     ddns_inherit_settings: bool = True
     # Device profiling — see Subnet model. Default off because nmap is loud.
@@ -2053,7 +2070,7 @@ class SubnetUpdate(BaseModel):
     dhcp_inherit_settings: bool | None = None
     ddns_enabled: bool | None = None
     ddns_hostname_policy: str | None = None
-    ddns_domain_override: str | None = None
+    ddns_domain_override: DDNSDomainOverride = None
     ddns_ttl: int | None = None
     ddns_inherit_settings: bool | None = None
     auto_profile_on_dhcp_lease: bool | None = None
@@ -2349,11 +2366,11 @@ class IPAddressCreate(BaseModel):
 
     @field_validator("hostname")
     @classmethod
-    def hostname_nonempty(cls, v: str) -> str:
-        v = v.strip()
-        if not v:
-            raise ValueError("Hostname is required")
-        return v
+    def hostname_valid(cls, v: str) -> str:
+        # Required + must be a valid RFC 1123 host name. ``validate_hostname``
+        # normalizes to lowercase A-labels and raises on empty (issue #597),
+        # so the old "required" check is subsumed.
+        return validate_hostname(v)
 
     @field_validator("status")
     @classmethod
@@ -2397,6 +2414,19 @@ class IPAddressUpdate(BaseModel):
     decom_date: date | None = None
     # See IPAddressCreate.force.
     force: bool = False
+
+    @field_validator("hostname")
+    @classmethod
+    def hostname_valid(cls, v: str | None) -> str | None:
+        # Update-path hostname is optional. ``None`` (omitted) leaves it
+        # untouched; an empty string clears it. A non-empty value must be a
+        # valid RFC 1123 host name (issue #597 — the update path previously
+        # validated nothing).
+        if v is None:
+            return v
+        if v.strip() == "":
+            return ""
+        return validate_hostname(v)
 
     @field_validator("status")
     @classmethod
@@ -2556,11 +2586,11 @@ class NextIPRequest(BaseModel):
 
     @field_validator("hostname")
     @classmethod
-    def hostname_nonempty(cls, v: str) -> str:
-        v = v.strip()
-        if not v:
-            raise ValueError("Hostname is required")
-        return v
+    def hostname_valid(cls, v: str) -> str:
+        # Required + must be a valid RFC 1123 host name. ``validate_hostname``
+        # normalizes to lowercase A-labels and raises on empty (issue #597),
+        # so the old "required" check is subsumed.
+        return validate_hostname(v)
 
     @field_validator("strategy")
     @classmethod

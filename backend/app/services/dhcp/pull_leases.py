@@ -49,6 +49,7 @@ import structlog
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.dns_names import sanitize_hostname
 from app.drivers.dhcp import get_driver, is_agentless
 from app.models.dhcp import (
     DHCPLease,
@@ -165,6 +166,16 @@ async def pull_leases_from_server(
         return result
 
     result.server_leases = len(wire)
+
+    # Fold each client-supplied hostname to a safe LDH form at ingress
+    # (issue #597) so the raw wire value — which flows into IPAM.hostname and
+    # the lease row below — can't carry spaces / control chars / a zone-file
+    # newline. The DDNS path re-sanitizes idempotently. Non-raising by
+    # design: a bad hostname must never abort a lease pull.
+    for _lease in wire:
+        _h = _lease.get("hostname")
+        if _h:
+            _lease["hostname"] = sanitize_hostname(_h) or None
 
     scope_cache = await _load_scope_cache(db, server.server_group_id)
     # Inverse map (scope_id -> subnet_id) so the absence-delete branch can
@@ -621,7 +632,7 @@ async def _upsert_scope(
                 ip_address=static["ip_address"],
                 mac_address=static["mac_address"],
                 client_id=static.get("client_id"),
-                hostname=static.get("hostname") or "",
+                hostname=sanitize_hostname(static.get("hostname")),
                 description=static.get("description") or "",
             )
         )
