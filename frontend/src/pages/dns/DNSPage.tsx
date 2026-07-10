@@ -7272,7 +7272,7 @@ function BlocklistModal({
       qc.invalidateQueries({ queryKey: ["dns-blocklists"] });
       onClose();
     },
-    onError: (e: ApiError) => setError(e.response?.data?.detail ?? "Failed"),
+    onError: (e: ApiError) => setError(formatApiError(e, "Failed")),
   });
 
   return (
