@@ -3249,6 +3249,7 @@ export interface PlatformSettings {
   integration_unifi_enabled: boolean;
   integration_cloud_enabled: boolean;
   integration_opnsense_enabled: boolean;
+  integration_netbird_enabled: boolean;
   /** Domain WHOIS refresh cadence (hours). Beat ticks hourly; the
    *  task itself reads this on every fire so cadence changes take
    *  effect on the next tick without restarting beat. 1–168 h range
@@ -8278,7 +8279,8 @@ export type IntegrationDashboardKind =
   | "tailscale"
   | "unifi"
   | "cloud"
-  | "opnsense";
+  | "opnsense"
+  | "netbird";
 export interface IntegrationsDashboardTargetRow {
   id: string;
   display: string;
@@ -11618,6 +11620,90 @@ export const tailscaleApi = {
         status: string;
         task_id: string;
       }>(`/tailscale/tenants/${id}/sync`)
+      .then((r) => r.data),
+};
+
+export interface NetbirdInstance {
+  id: string;
+  name: string;
+  description: string;
+  enabled: boolean;
+  api_url: string;
+  verify_tls: boolean;
+  api_key_present: boolean;
+  ipam_space_id: string;
+  dns_group_id: string | null;
+  network_cidr: string;
+  skip_expired: boolean;
+  sync_interval_seconds: number;
+  last_synced_at: string | null;
+  last_sync_error: string | null;
+  dns_domain: string | null;
+  peer_count: number | null;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface NetbirdInstanceCreate {
+  name: string;
+  description?: string;
+  enabled?: boolean;
+  api_url?: string;
+  verify_tls?: boolean;
+  api_key: string;
+  ipam_space_id: string;
+  dns_group_id?: string | null;
+  network_cidr?: string;
+  skip_expired?: boolean;
+  sync_interval_seconds?: number;
+}
+
+export interface NetbirdInstanceUpdate {
+  name?: string;
+  description?: string;
+  enabled?: boolean;
+  api_url?: string;
+  verify_tls?: boolean;
+  api_key?: string;
+  ipam_space_id?: string;
+  dns_group_id?: string | null;
+  network_cidr?: string;
+  skip_expired?: boolean;
+  sync_interval_seconds?: number;
+}
+
+export interface NetbirdTestResult {
+  ok: boolean;
+  message: string;
+  dns_domain: string | null;
+  peer_count: number | null;
+}
+
+export const netbirdApi = {
+  listInstances: () =>
+    api.get<NetbirdInstance[]>("/netbird/instances").then((r) => r.data),
+  createInstance: (data: NetbirdInstanceCreate) =>
+    api.post<NetbirdInstance>("/netbird/instances", data).then((r) => r.data),
+  updateInstance: (id: string, data: NetbirdInstanceUpdate) =>
+    api
+      .put<NetbirdInstance>(`/netbird/instances/${id}`, data)
+      .then((r) => r.data),
+  deleteInstance: (id: string) => api.delete(`/netbird/instances/${id}`),
+  testConnection: (body: {
+    instance_id?: string;
+    api_url?: string;
+    verify_tls?: boolean;
+    api_key?: string;
+  }) =>
+    api
+      .post<NetbirdTestResult>("/netbird/instances/test", body)
+      .then((r) => r.data),
+  syncNow: (id: string) =>
+    api
+      .post<{
+        status: string;
+        task_id: string;
+      }>(`/netbird/instances/${id}/sync`)
       .then((r) => r.data),
 };
 

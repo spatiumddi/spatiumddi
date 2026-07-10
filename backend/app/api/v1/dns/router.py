@@ -5564,6 +5564,17 @@ def _reject_if_synthesised_zone(zone: DNSZone, op: str) -> None:
                 f"to release the zone."
             ),
         )
+    if zone.netbird_instance_id is not None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"Zone {zone.name!r} is synthesised by the NetBird "
+                f"integration and cannot be {op}ed manually. The reconciler "
+                f"will overwrite any changes on the next sync. Unbind the "
+                f"DNS group on the NetBird instance or delete the instance "
+                f"to release the zone."
+            ),
+        )
 
 
 def _reject_if_synthesised_record(record: DNSRecord, op: str) -> None:
@@ -5573,6 +5584,15 @@ def _reject_if_synthesised_record(record: DNSRecord, op: str) -> None:
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=(
                 f"Record {record.fqdn!r} is synthesised by the Tailscale "
+                f"integration and cannot be {op}ed manually. Edits would be "
+                f"overwritten on the next sync."
+            ),
+        )
+    if record.netbird_instance_id is not None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"Record {record.fqdn!r} is synthesised by the NetBird "
                 f"integration and cannot be {op}ed manually. Edits would be "
                 f"overwritten on the next sync."
             ),

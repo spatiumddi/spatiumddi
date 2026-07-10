@@ -50,6 +50,10 @@ IP_STATUSES_INTEGRATION_OWNED: frozenset[str] = frozenset(
         "proxmox-vm",
         "proxmox-lxc",
         "tailscale-node",
+        # NetBird peer mirror (issue #603). One row per NetBird peer's
+        # overlay IP, mirrored from the management API. Read-only — the
+        # reconciler owns the row unless an operator edits it.
+        "netbird-peer",
         # OPNsense ARP-table mirror (issue #31). Opt-in secondary source
         # — a host the firewall has seen on the wire, distinct from a
         # DHCP lease (status="dhcp") or static reservation
@@ -329,6 +333,15 @@ class IPBlock(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     opnsense_router_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("opnsense_router.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    # NetBird provenance (issue #603) — set on the wrapper block the
+    # NetBird reconciler creates for the overlay CIDR. Cascades on
+    # instance delete.
+    netbird_instance_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("netbird_instance.id", ondelete="CASCADE"),
         nullable=True,
         index=True,
     )
@@ -767,6 +780,16 @@ class Subnet(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
         nullable=True,
         index=True,
     )
+    # NetBird provenance (issue #603). Subnet created by the NetBird
+    # reconciler under the auto-created overlay block. Peer IPs are a
+    # routed overlay (no broadcast / gateway), so the whole range is
+    # one flat subnet. Cascades on instance delete.
+    netbird_instance_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("netbird_instance.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
 
     # Computed / cached. ``total_ips`` is BigInteger because IPv6 subnets can
     # be as large as 2^64 addresses (a /64 — the standard LAN size) which
@@ -974,6 +997,14 @@ class IPAddress(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     opnsense_router_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("opnsense_router.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    # NetBird provenance (issue #603) — set on rows mirrored from a
+    # NetBird peer's overlay IP. Cascades on instance delete.
+    netbird_instance_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("netbird_instance.id", ondelete="CASCADE"),
         nullable=True,
         index=True,
     )

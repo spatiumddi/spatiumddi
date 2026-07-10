@@ -316,6 +316,13 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         description="Read-only mirror of OPNsense interfaces + DHCP leases + reservations into IPAM.",
         default_enabled=False,
     ),
+    ModuleSpec(
+        id="integrations.netbird",
+        label="NetBird",
+        group="Integrations",
+        description="Read-only mirror of NetBird mesh peers into IPAM (self-hosted or cloud), with optional synthetic DNS for the mesh domain. Connect instances from the NetBird page once enabled.",
+        default_enabled=False,
+    ),
     # Appliance — the declarative fleet-firewall policy surface (#285
     # Phase 3). Default-enabled for DISCOVERY/STAGING only: turning this
     # module ON exposes the policy editor + preview but applies NOTHING.
@@ -398,6 +405,7 @@ INTEGRATION_SETTINGS_MIRROR: Final[dict[str, str]] = {
     "integrations.unifi": "integration_unifi_enabled",
     "integrations.cloud": "integration_cloud_enabled",
     "integrations.opnsense": "integration_opnsense_enabled",
+    "integrations.netbird": "integration_netbird_enabled",
 }
 
 MODULES_BY_ID: Final[dict[str, ModuleSpec]] = {m.id: m for m in MODULES}
