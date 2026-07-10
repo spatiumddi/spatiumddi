@@ -91,7 +91,7 @@ async def _scan_category(
             check(value)
         except ValueError as exc:
             report.add(row_id=row_id, value=value, reason=str(exc), context=ctx)
-        if i % _YIELD_EVERY == 0:
+        if i and i % _YIELD_EVERY == 0:
             await asyncio.sleep(0)
 
 

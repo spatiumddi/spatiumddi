@@ -138,6 +138,20 @@ def test_validate_record_owner_wildcard_only_leftmost() -> None:
         validate_record_owner("example.*.com")
 
 
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("www.", "www"),
+        ("www.example.com.", "www.example.com"),
+        ("_acme-challenge.", "_acme-challenge"),
+    ],
+)
+def test_validate_record_owner_strips_trailing_dot(raw: str, expected: str) -> None:
+    # A record owner is relative and the handlers build ``f"{name}.{zone}"``,
+    # so a preserved trailing dot would yield a double-dotted FQDN (#597 review).
+    assert validate_record_owner(raw) == expected
+
+
 # ── FQDNs (zone names, domain-name option, rdata targets) ────────────────
 
 

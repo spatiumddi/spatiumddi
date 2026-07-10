@@ -201,12 +201,15 @@ def validate_record_owner(name: str, *, field: str = "record name") -> str:
 
     ``@`` (the zone apex) and the empty string are both accepted as
     "the apex" and normalized to ``"@"``. A single trailing root dot is
-    tolerated. Returns the normalized, lower-cased owner.
+    tolerated on input but *stripped* from the result — ``DNSRecord.name``
+    is a relative owner that the handlers concatenate as ``f"{name}.{zone}"``,
+    so returning ``www.`` would yield the double-dotted ``www..zone``.
+    Returns the normalized, lower-cased owner.
     """
     raw = name.strip()
     if raw in ("", "@"):
         return "@"
-    body, had_root = _strip_root(raw)
+    body, _ = _strip_root(raw)
     if not body:
         return "@"
     parts = body.split(".")
@@ -217,7 +220,7 @@ def validate_record_owner(name: str, *, field: str = "record name") -> str:
     normalized = ".".join(out)
     if len(normalized) > MAX_NAME_LEN:
         raise ValueError(f"{field} '{normalized}' exceeds {MAX_NAME_LEN} characters")
-    return normalized + "." if had_root else normalized
+    return normalized
 
 
 def validate_fqdn(name: str, *, field: str = "domain", allow_underscore: bool = True) -> str:
