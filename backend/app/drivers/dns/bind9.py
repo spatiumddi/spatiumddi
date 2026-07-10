@@ -13,6 +13,7 @@ The ``reload_config``/``reload_zone`` methods here are surface for the agent.
 from __future__ import annotations
 
 import base64
+import dataclasses
 from pathlib import Path
 from typing import Any
 
@@ -148,6 +149,16 @@ class BIND9Driver(DNSDriver):
     def render_zone_file(self, zone: ZoneData, records: list[RecordData]) -> str:
         env = _env()
         tmpl = env.get_template("zone.file.j2")
+        # Neutralize control chars in the SOA fields (issue #597 review): the
+        # template interpolates ``primary_ns`` + ``admin_email`` raw into the
+        # SOA line, so a newline in either would inject a record the same way
+        # an unescaped owner/rdata would. ``_render_record`` already guards the
+        # record lines; this closes the SOA line one altitude up.
+        zone = dataclasses.replace(
+            zone,
+            primary_ns=strip_control_chars(zone.primary_ns),
+            admin_email=strip_control_chars(zone.admin_email),
+        )
         return tmpl.render(
             zone=zone,
             records=records,

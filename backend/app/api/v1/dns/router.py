@@ -24,6 +24,7 @@ from app.core.agent_wake import collect_wake, dns_group_channel, dns_server_chan
 from app.core.crypto import decrypt_dict, encrypt_dict, encrypt_str
 from app.core.dns_names import (
     contains_control_chars,
+    contains_zonefile_unsafe,
     validate_fqdn,
     validate_record_owner,
 )
@@ -783,6 +784,11 @@ class ZoneCreate(BaseModel):
         # ``allow_underscore`` keeps ``_msdcs`` / ``_sip._tcp`` zones legal.
         return validate_fqdn(v, field="zone name") + "."
 
+    @field_validator("primary_ns", "admin_email")
+    @classmethod
+    def validate_soa_fields(cls, v: str) -> str:
+        return _validate_soa_field(v)
+
 
 class ZoneUpdate(BaseModel):
     name: str | None = None
@@ -824,6 +830,14 @@ class ZoneUpdate(BaseModel):
         if v is None:
             return v
         return validate_fqdn(v, field="zone name") + "."
+
+    @field_validator("primary_ns", "admin_email")
+    @classmethod
+    def validate_soa_fields(cls, v: str | None) -> str | None:
+        # Optional on update; same injection guard as ZoneCreate (issue #597).
+        if v is None:
+            return v
+        return _validate_soa_field(v)
 
     @field_validator("zone_type")
     @classmethod
@@ -1046,6 +1060,26 @@ def _normalize_record_struct_fields(
             detail=f"{rtype} records do not take {', '.join(extra)}",
         )
     return None, None, None
+
+
+def _validate_soa_field(v: str | None) -> str:
+    """Reject a zone SOA ``primary_ns`` / ``admin_email`` that could inject.
+
+    Both are interpolated raw into the BIND9 SOA line (issue #597 review), so
+    a newline / space / zone-file metacharacter would inject a record the same
+    way an unescaped owner would. These fields are stored in exact SOA form
+    (RNAME with a *significant* trailing dot, e.g. ``admin.example.com.``), so
+    validate WITHOUT mutating — a valid nameserver / RNAME contains none of the
+    ``contains_zonefile_unsafe`` set. Empty ("" default / auto-filled) passes.
+    """
+    if v is None or v == "":
+        return v or ""
+    if contains_zonefile_unsafe(v):
+        raise ValueError(
+            "must be a bare domain name — no whitespace, control characters, "
+            "or zone-file syntax (e.g. ';' '$' '@')"
+        )
+    return v
 
 
 # rdata for these types is a single bare target *name* — validate it as an
@@ -4526,7 +4560,12 @@ async def update_record(
     record.priority, record.weight, record.port = _normalize_record_struct_fields(
         record.record_type, record.priority, record.weight, record.port
     )
-    _validate_address_record_value(record.record_type, record.value)
+    # Only validate the value when it's actually being changed (issue #597
+    # review): re-validating the merged value on an unrelated edit (e.g. TTL
+    # only) would 422 a pre-existing row whose value predates the rule —
+    # blocking edits to legacy data, contrary to the validate-on-write stance.
+    if "value" in changes:
+        _validate_address_record_value(record.record_type, record.value)
     if "name" in changes and zone:
         record.fqdn = f"{record.name}.{zone.name}" if record.name != "@" else zone.name
     target_serial = bump_zone_serial(zone) if zone is not None else None

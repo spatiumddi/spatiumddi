@@ -14,10 +14,12 @@ the operator knows the real scale.
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import Select, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.dns_names import (
@@ -27,7 +29,11 @@ from app.core.dns_names import (
 )
 from app.models.dhcp import DHCPStaticAssignment
 from app.models.dns import DNSRecord, DNSZone
-from app.models.ipam import IPAddress
+from app.models.ipam import IP_STATUSES_INTEGRATION_OWNED, IPAddress
+
+# Yield the event loop every this-many rows so a large scan (CPU-bound regex
+# + IDNA validation) doesn't monopolize the loop and stall other requests.
+_YIELD_EVERY = 2000
 
 # Cap the examples returned per category — the count is always exact, only
 # the ``examples`` list is truncated.
@@ -61,6 +67,34 @@ class _CategoryReport:
         }
 
 
+async def _scan_category(
+    db: AsyncSession,
+    report: _CategoryReport,
+    stmt: Select[Any],
+    check: Callable[[str], Any],
+    *,
+    has_context: bool = False,
+) -> None:
+    """Stream one category's rows through ``check``; flag violations.
+
+    Fetches ``cap + 1`` so ``scanned_capped`` distinguishes "exactly at the
+    cap" (fully scanned) from "truncated" (issue #597 review), and yields the
+    event loop every ``_YIELD_EVERY`` rows so the CPU-bound validation can't
+    stall other requests. ``check`` raises ``ValueError`` on a bad value.
+    """
+    rows = (await db.execute(stmt.limit(_MAX_SCAN_PER_CATEGORY + 1))).all()
+    report.scanned_capped = len(rows) > _MAX_SCAN_PER_CATEGORY
+    for i, row in enumerate(rows[:_MAX_SCAN_PER_CATEGORY]):
+        row_id, value = row[0], row[1]
+        ctx = row[2] if has_context else None
+        try:
+            check(value)
+        except ValueError as exc:
+            report.add(row_id=row_id, value=value, reason=str(exc), context=ctx)
+        if i % _YIELD_EVERY == 0:
+            await asyncio.sleep(0)
+
+
 async def scan_name_conformance(db: AsyncSession) -> dict[str, Any]:
     """Scan existing rows for names the #597 validators would now reject.
 
@@ -72,63 +106,48 @@ async def scan_name_conformance(db: AsyncSession) -> dict[str, Any]:
     zone = _CategoryReport("dns_zone_name")
     static = _CategoryReport("dhcp_static_hostname")
 
-    # IPAM hostnames (host rule).
-    n = 0
-    for row_id, value in (
-        await db.execute(
-            select(IPAddress.id, IPAddress.hostname)
-            .where(IPAddress.hostname.isnot(None), IPAddress.hostname != "")
-            .limit(_MAX_SCAN_PER_CATEGORY)
-        )
-    ).all():
-        n += 1
-        try:
-            validate_hostname(value)
-        except ValueError as exc:
-            ipam.add(row_id=row_id, value=value, reason=str(exc))
-    ipam.scanned_capped = n >= _MAX_SCAN_PER_CATEGORY
+    # IPAM hostnames (host rule). Exclude integration-owned rows: their names
+    # are set by an external mirror (Docker / Proxmox / UniFi / …) the operator
+    # can't fix here, and the render boundary + DDNS re-sanitize already keep
+    # them safe — flagging them would be permanent unfixable noise (#597 review).
+    await _scan_category(
+        db,
+        ipam,
+        select(IPAddress.id, IPAddress.hostname).where(
+            IPAddress.hostname.isnot(None),
+            IPAddress.hostname != "",
+            IPAddress.status.notin_(IP_STATUSES_INTEGRATION_OWNED),
+        ),
+        validate_hostname,
+    )
 
     # DNS record owners (RFC 2181 rule).
-    n = 0
-    for row_id, value, ctx in (
-        await db.execute(
-            select(DNSRecord.id, DNSRecord.name, DNSRecord.fqdn).limit(_MAX_SCAN_PER_CATEGORY)
-        )
-    ).all():
-        n += 1
-        try:
-            validate_record_owner(value or "@")
-        except ValueError as exc:
-            rec.add(row_id=row_id, value=value, reason=str(exc), context=ctx)
-    rec.scanned_capped = n >= _MAX_SCAN_PER_CATEGORY
+    await _scan_category(
+        db,
+        rec,
+        select(DNSRecord.id, DNSRecord.name, DNSRecord.fqdn),
+        lambda v: validate_record_owner(v or "@"),
+        has_context=True,
+    )
 
     # DNS zone names (FQDN rule). Strip the stored trailing dot first.
-    n = 0
-    for row_id, value in (
-        await db.execute(select(DNSZone.id, DNSZone.name).limit(_MAX_SCAN_PER_CATEGORY))
-    ).all():
-        n += 1
-        try:
-            validate_fqdn((value or "").rstrip("."), field="zone name")
-        except ValueError as exc:
-            zone.add(row_id=row_id, value=value, reason=str(exc))
-    zone.scanned_capped = n >= _MAX_SCAN_PER_CATEGORY
+    await _scan_category(
+        db,
+        zone,
+        select(DNSZone.id, DNSZone.name),
+        lambda v: validate_fqdn((v or "").rstrip("."), field="zone name"),
+    )
 
     # DHCP static reservation hostnames (host rule; empty is allowed here).
-    n = 0
-    for row_id, value in (
-        await db.execute(
-            select(DHCPStaticAssignment.id, DHCPStaticAssignment.hostname)
-            .where(DHCPStaticAssignment.hostname.isnot(None), DHCPStaticAssignment.hostname != "")
-            .limit(_MAX_SCAN_PER_CATEGORY)
-        )
-    ).all():
-        n += 1
-        try:
-            validate_hostname(value)
-        except ValueError as exc:
-            static.add(row_id=row_id, value=value, reason=str(exc))
-    static.scanned_capped = n >= _MAX_SCAN_PER_CATEGORY
+    await _scan_category(
+        db,
+        static,
+        select(DHCPStaticAssignment.id, DHCPStaticAssignment.hostname).where(
+            DHCPStaticAssignment.hostname.isnot(None),
+            DHCPStaticAssignment.hostname != "",
+        ),
+        validate_hostname,
+    )
 
     categories = [ipam, rec, zone, static]
     return {

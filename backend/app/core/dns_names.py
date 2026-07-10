@@ -262,8 +262,11 @@ def sanitize_host_label(raw: str | None) -> str:
         return ""
     s = raw.strip().strip('"').lower()
     s = _SANITIZE_LABEL_RE.sub("-", s)
-    s = s.strip("-")
-    return s[:MAX_LABEL_LEN]
+    # Truncate FIRST, then strip hyphens — truncating at MAX_LABEL_LEN can land
+    # on a hyphen and re-expose a trailing one, which ``validate_host_label``
+    # (correctly) rejects and which breaks a BIND9 zone load. Stripping after
+    # the cut keeps the sanitizer's output a valid label (issue #597 review).
+    return s[:MAX_LABEL_LEN].strip("-")
 
 
 def sanitize_hostname(raw: str | None) -> str:

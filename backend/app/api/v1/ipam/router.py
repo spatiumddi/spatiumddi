@@ -1746,7 +1746,7 @@ class IPSpaceResponse(BaseModel):
     dhcp_server_group_id: uuid.UUID | None = None
     ddns_enabled: bool = False
     ddns_hostname_policy: str = "client_or_generated"
-    ddns_domain_override: DDNSDomainOverride = None
+    ddns_domain_override: str | None = None
     ddns_ttl: int | None = None
     vrf_id: uuid.UUID | None = None
     vrf_name: str | None = None
@@ -1868,7 +1868,7 @@ class IPBlockResponse(BaseModel):
     dhcp_inherit_settings: bool = True
     ddns_enabled: bool = False
     ddns_hostname_policy: str = "client_or_generated"
-    ddns_domain_override: DDNSDomainOverride = None
+    ddns_domain_override: str | None = None
     ddns_ttl: int | None = None
     ddns_inherit_settings: bool = True
     vrf_id: uuid.UUID | None = None
@@ -2217,7 +2217,7 @@ class SubnetResponse(BaseModel):
     dhcp_inherit_settings: bool = True
     ddns_enabled: bool = False
     ddns_hostname_policy: str = "client_or_generated"
-    ddns_domain_override: DDNSDomainOverride = None
+    ddns_domain_override: str | None = None
     ddns_ttl: int | None = None
     ddns_inherit_settings: bool = True
     auto_profile_on_dhcp_lease: bool = False

@@ -229,10 +229,21 @@ def test_sanitize_hostname(raw: str | None, expected: str) -> None:
 def test_sanitize_hostname_output_is_valid() -> None:
     # Whatever the sanitizer emits (when non-empty) must itself pass strict
     # host validation — otherwise it just moves the problem downstream.
-    for raw in ["my pc", "Weird__Name", "café-01", "a.b.c"]:
+    # Includes truncation-boundary inputs (issue #597 review): a long run of
+    # hyphens truncated at 63 must NOT leave a trailing hyphen.
+    for raw in [
+        "my pc",
+        "Weird__Name",
+        "café-01",
+        "a.b.c",
+        "printer" + "-" * 60 + "lobby",  # 63rd char lands on a hyphen
+        "a" + "-" * 70 + "b",
+        "conference room projector second floor east wing unit annex",
+        "x" * 300,
+    ]:
         out = sanitize_hostname(raw)
         if out:
-            assert validate_hostname(out) == out
+            assert validate_hostname(out) == out, f"{raw!r} -> {out!r} is not a valid hostname"
 
 
 def test_sanitize_hostname_respects_length_cap() -> None:
