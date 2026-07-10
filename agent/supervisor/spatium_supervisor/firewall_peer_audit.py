@@ -392,13 +392,20 @@ def body_opens_etcd_peers(body: str) -> bool:
     return False
 
 
-def observed_peer_cidrs(self_ips: Iterable[str]) -> list[str]:
+def observed_peer_cidrs(self_ips: Iterable[str]) -> list[str] | None:
     """Host CIDRs for every live control-plane node except this one, read from
-    the cluster itself. Empty when membership is unreadable — the caller then
-    falls through to the refuse-to-apply guard rather than guessing."""
+    the cluster itself.
+
+    ``None`` when membership is unreadable — the caller then falls through to
+    the refuse-to-apply guard rather than guessing. ``[]`` when the cluster IS
+    readable and this node is the only control-plane member: a fresh
+    single-node seed's correct body has no peer rule, and there is no raft
+    peer to be partitioned from. Conflating those two empties made the guard
+    refuse every fresh seed's firewall forever (no web-ui accepts; found live
+    on ddi-pg dev rigs 2026-07-10)."""
     members = list_control_plane_node_ips()
     if not members:
-        return []
+        return None
     mine = set(self_ips)
     out: list[str] = []
     for ip in members:
@@ -412,7 +419,8 @@ def observed_peer_cidrs(self_ips: Iterable[str]) -> list[str]:
     return sorted(set(out))
 
 
-def would_self_partition(body: str, *, is_etcd_member: bool | None) -> bool:
+def would_self_partition(body: str, *, is_etcd_member: bool | None,
+                         live_peers: list[str] | None = None) -> bool:
     """True when applying `body` would close etcd's peer port on a live member.
 
     PURE — membership is passed in, never probed here, so a caller performs at
@@ -422,8 +430,18 @@ def would_self_partition(body: str, *, is_etcd_member: bool | None) -> bool:
     False whenever membership is unknown: an unreadable kube API must not block
     a legitimate firewall update on a plain agent appliance, which would freeze
     the ruleset on every non-etcd node.
+
+    ``live_peers`` is the observed_peer_cidrs() result: ``[]`` means the
+    cluster was READ and this node is its only member — a fresh single-node
+    seed. Its correct body has no peer rule and there is no peer to be
+    partitioned from, so it must apply (refusing pinned every fresh seed on
+    the k3s-bootstrap firewall forever — no web-ui accepts, API/UI dead from
+    off-box; found live 2026-07-10). ``None`` means unknown — stay
+    conservative and refuse a peer-rule-less body on a live member.
     """
     if is_etcd_member is not True:
+        return False
+    if live_peers is not None and not live_peers:
         return False
     return not body_opens_etcd_peers(body)
 
