@@ -416,34 +416,46 @@ def _maybe_apply_firewall(
     if not firewall_peer_audit.body_opens_etcd_peers(body):
         is_etcd_member = firewall_peer_audit.local_node_is_etcd_member()
 
-        # Defence 1 — the row gave us no peers, but k3s says we ARE a member.
-        # Re-derive the peer set from live membership and re-render.
-        if is_etcd_member is True and not cluster_peer_cidrs:
-            recovered = firewall_peer_audit.observed_peer_cidrs(
+        # The live peer set, read once and shared by both defences below.
+        # None = membership unreadable; [] = readable and this node is the
+        # cluster's ONLY member — a fresh single-node seed, whose correct
+        # body legitimately has no peer rule (refusing that pinned every
+        # fresh seed on the k3s-bootstrap firewall forever; found live on
+        # ddi-pg dev rigs 2026-07-10).
+        live_peers = None
+        if is_etcd_member is True:
+            live_peers = firewall_peer_audit.observed_peer_cidrs(
                 appliance_state.read_node_ips() or []
             )
-            if recovered:
-                log.warning(
-                    "supervisor.firewall.peer_cidrs_recovered",
-                    reason="control plane sent no peers but this node is a live etcd member",
-                    peers=recovered,
-                )
-                profile = render_drop_in(
-                    role_assignment,
-                    recovered,
-                    pod_cidrs=pod_cidrs,
-                    service_cidrs=service_cidrs,
-                    cp_member_count=cp_member_count,
-                    vip_configured=vip_configured,
-                    web_ui_allowed_cidrs=web_ui_allowed_cidrs,
-                )
-                body = profile.body
 
-        # Defence 2 — recovery was impossible (membership unreadable, or the
-        # kube API listed no other members). Refuse rather than partition:
-        # a stale peer rule only over-permits to real cluster members, while
-        # this body drops a voting member out of raft. Non-negotiable #5.
-        if firewall_peer_audit.would_self_partition(body, is_etcd_member=is_etcd_member):
+        # Defence 1 — the row gave us no peers, but k3s says we ARE a member.
+        # Re-derive the peer set from live membership and re-render.
+        if is_etcd_member is True and not cluster_peer_cidrs and live_peers:
+            log.warning(
+                "supervisor.firewall.peer_cidrs_recovered",
+                reason="control plane sent no peers but this node is a live etcd member",
+                peers=live_peers,
+            )
+            profile = render_drop_in(
+                role_assignment,
+                live_peers,
+                pod_cidrs=pod_cidrs,
+                service_cidrs=service_cidrs,
+                cp_member_count=cp_member_count,
+                vip_configured=vip_configured,
+                web_ui_allowed_cidrs=web_ui_allowed_cidrs,
+            )
+            body = profile.body
+
+        # Defence 2 — refuse rather than partition, but only when the danger
+        # can exist: membership unreadable (can't prove safety), or live
+        # peers present while the body still has no rule. A stale peer rule
+        # only over-permits to real cluster members, while a wrongly-applied
+        # body drops a voting member out of raft. Non-negotiable #5. A
+        # readable sole member ([]) falls through and applies.
+        if firewall_peer_audit.would_self_partition(
+            body, is_etcd_member=is_etcd_member, live_peers=live_peers
+        ):
             reason = (
                 "rendered drop-in has no etcd peer rule but this node is a live "
                 "etcd member; keeping the last-good ruleset"

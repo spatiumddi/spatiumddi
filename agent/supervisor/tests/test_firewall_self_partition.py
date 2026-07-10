@@ -169,6 +169,32 @@ def test_allows_an_agent_body_on_a_real_agent_node() -> None:
     assert fpa.would_self_partition(AGENT_BODY, is_etcd_member=False) is False
 
 
+def test_a_readable_sole_member_is_not_a_partition() -> None:
+    """THE 2026-07-10 false positive: a fresh single-node seed IS a live etcd
+    member, its correct body has no peer rule, and there is no peer to be
+    partitioned from — the body must apply."""
+    assert (
+        fpa.would_self_partition(AGENT_BODY, is_etcd_member=True, live_peers=[])
+        is False
+    )
+
+
+def test_live_peers_without_a_rule_still_refuses() -> None:
+    assert (
+        fpa.would_self_partition(
+            AGENT_BODY, is_etcd_member=True, live_peers=["192.168.0.199/32"]
+        )
+        is True
+    )
+
+
+def test_unknown_live_peers_stays_conservative() -> None:
+    assert (
+        fpa.would_self_partition(AGENT_BODY, is_etcd_member=True, live_peers=None)
+        is True
+    )
+
+
 def test_unknown_membership_never_blocks_an_update() -> None:
     """Failing closed on 'don't know' would wedge the firewall on every node
     that has never successfully probed."""
@@ -377,9 +403,19 @@ def test_peer_recovery_handles_ipv6_prefix_length(monkeypatch) -> None:
     assert fpa.observed_peer_cidrs([]) == ["fd00::2/128"]
 
 
-def test_peer_recovery_is_empty_when_membership_is_unreadable(monkeypatch) -> None:
-    """Empty, not a guess — the refuse-to-apply guard protects us then."""
+def test_peer_recovery_is_none_when_membership_is_unreadable(monkeypatch) -> None:
+    """None, not a guess — the refuse-to-apply guard protects us then. (Not
+    []: an empty list now means "readable, sole member", which the guard must
+    let through — conflating the two pinned every fresh single-node seed on
+    the bootstrap firewall, found live 2026-07-10.)"""
     monkeypatch.setattr(fpa, "list_control_plane_node_ips", lambda: None)
+    assert fpa.observed_peer_cidrs(["192.168.0.133"]) is None
+
+
+def test_peer_recovery_is_empty_for_a_readable_sole_member(monkeypatch) -> None:
+    monkeypatch.setattr(
+        fpa, "list_control_plane_node_ips", lambda: ["192.168.0.133"]
+    )
     assert fpa.observed_peer_cidrs(["192.168.0.133"]) == []
 
 
@@ -459,6 +495,28 @@ def test_peer_recovery_rescues_the_render_when_membership_is_readable(
     assert fpa.body_opens_etcd_peers(body)
     assert "192.168.0.199" in body and "192.168.0.125" in body
     assert appliance_state.read_firewall_state() is None, "healed node still flagged"
+
+
+def test_a_fresh_single_node_seed_applies_its_firewall(monkeypatch, tmp_path) -> None:
+    """THE 2026-07-10 regression (caught by ddi-pg dev rigs, reproduced 2x
+    including the 2026.07.09-1 release-prep build): a fresh single-node seed
+    is a live etcd member with ZERO peers, so its correct body has no peer
+    rule. The guard refused it every heartbeat, pinning the k3s-bootstrap
+    profile forever — 80/443 web-ui accepts never applied, API/UI dead from
+    off-box while /health/* stayed 200 on localhost."""
+    import structlog
+
+    heartbeat, appliance_state, trigger = _wire(
+        monkeypatch,
+        tmp_path,
+        is_member=True,
+        live_members=["192.168.0.133"],  # readable — and only THIS node
+    )
+    heartbeat._maybe_apply_firewall(
+        {"roles": ["dns_bind9"]}, structlog.get_logger("t"), []
+    )
+    assert trigger.exists(), "a sole member's firewall must apply"
+    assert appliance_state.read_firewall_state() is None
 
 
 def test_a_real_agent_node_still_gets_its_firewall(monkeypatch, tmp_path) -> None:
