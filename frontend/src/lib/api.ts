@@ -15295,9 +15295,11 @@ export interface WolVantage {
  */
 export type WolVerifyMethod = "ping" | "tcp" | "seen" | "auto";
 
-/** One entry in a target's post-wake evidence trail (#596). `observed_at` is
- *  when we checked, not when the host was last seen — a sighting timestamp,
- *  when there is one, rides in `detail`. */
+/** One entry in a target's post-wake evidence trail (#596). `observed_at` is a
+ *  structured ISO timestamp of when the evidence was observed: for an active
+ *  probe, when we checked; for a confirmed passive `seen` entry, the sighting
+ *  time itself. `detail` is intentionally timestamp-free, so the UI can format
+ *  `observed_at`. */
 export interface WolVerifyEvidence {
   source: string;
   up: boolean;
@@ -15339,7 +15341,7 @@ export interface WolSchedule {
   /** Per-schedule mute for the `wol_wake_failed` alert (#596). The alert rule's
    *  own enabled flag is the master switch; this silences one noisy schedule. */
   verify_alert_enabled: boolean;
-  verify_method: string;
+  verify_method: WolVerifyMethod;
   last_run_at: string | null;
   last_run_status: string | null;
   last_run_skip_reason: string | null;

@@ -166,14 +166,14 @@ class WolSchedule(Base):
     verify_retries: Mapped[int] = mapped_column(
         Integer, nullable=False, default=1, server_default="1"
     )
-    # 'ping'-only in v1 (kept as a column so a future TCP/agent method needs
-    # no migration).
     # Per-schedule mute for the ``wol_wake_failed`` alert (#596 Phase 2). The
     # rule's own ``enabled`` flag is the master switch; this silences one noisy
     # schedule without turning the rule off fleet-wide.
     verify_alert_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True, server_default=text("true")
     )
+    # Liveness source: ping | tcp | seen | auto (#596). Existing rows keep 'ping'
+    # (the pre-#596 default); new schedules default to 'auto' at the API layer.
     verify_method: Mapped[str] = mapped_column(
         String(16), nullable=False, default="ping", server_default=text("'ping'")
     )
@@ -422,9 +422,11 @@ class WolRun(Base):
     # they read their live ``wol_schedule`` row, so an operator edit mid-flight
     # still takes effect. Ad-hoc runs (``schedule_id IS NULL``) have no parent to
     # read, so they carry their own config here and it is the sole source of
-    # truth: {"method", "wait_seconds", "retries", "vantage", "port",
-    # "repeat_count", "repeat_interval_ms"} — every key optional, per-key
-    # fallback to the model defaults.
+    # truth. Keys are the ``WolSchedule`` attribute names verbatim so ``_cfg``
+    # reads either source with the same key: {"verify_method",
+    # "verify_wait_seconds", "verify_retries", "vantage", "port", "repeat_count",
+    # "repeat_interval_ms", "stagger_ms"} — every key optional, per-key fallback to
+    # the model defaults.
     verify_params: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
 
     # NULL for beat-fired system runs.

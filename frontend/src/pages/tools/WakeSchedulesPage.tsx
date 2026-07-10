@@ -1840,7 +1840,7 @@ function WolScheduleModal({
   // Liveness source (#596). New schedules default to `auto`; an existing
   // schedule keeps whatever it stored (pre-#596 rows are all `ping`).
   const [verifyMethod, setVerifyMethod] = useState<WolVerifyMethod>(
-    (existing?.verify_method as WolVerifyMethod | undefined) ?? "auto",
+    existing?.verify_method ?? "auto",
   );
   // Per-schedule mute for the wake-failure alert (#596). Defaults on: the alert
   // rule itself is seeded off, so this only matters once an operator enables it.

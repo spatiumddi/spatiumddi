@@ -32,7 +32,6 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-import app.services.alerts as alerts_svc
 from app.models.alerts import AlertEvent, AlertRule
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
 from app.models.wol_schedule import (
@@ -303,7 +302,7 @@ async def test_one_event_per_schedule_and_auto_resolve(
 ) -> None:
     """Two failing runs of one schedule hold ONE open event; a sighting closes it."""
     spy = _DeliverSpy()
-    monkeypatch.setattr(alerts_svc, "_deliver", spy)
+    monkeypatch.setattr("app.services.alerts._deliver", spy)
 
     ip = await _ip(db_session)
     sched = await _schedule(db_session)
@@ -336,7 +335,7 @@ async def test_disabled_rule_opens_nothing(
     db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The rule seeds OFF; until an operator enables it, nothing fires."""
-    monkeypatch.setattr(alerts_svc, "_deliver", _DeliverSpy())
+    monkeypatch.setattr("app.services.alerts._deliver", _DeliverSpy())
     ip = await _ip(db_session)
     sched = await _schedule(db_session)
     await _finalised_run(db_session, sched, ip=ip, verified=False)

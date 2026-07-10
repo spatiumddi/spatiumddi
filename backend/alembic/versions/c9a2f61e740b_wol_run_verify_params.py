@@ -13,11 +13,12 @@ NULL and keep reading their live ``wol_schedule`` row (so an operator edit
 mid-flight still takes effect, unchanged from #586). Only ad-hoc runs populate
 it, and for them it is the sole source of truth.
 
-Shape (all keys optional; the reader falls back per-key):
+Shape (keys mirror the WolSchedule column names verbatim; all optional, the
+reader falls back per-key):
 
-    {"method": "auto", "wait_seconds": 60, "retries": 1,
+    {"verify_method": "auto", "verify_wait_seconds": 60, "verify_retries": 1,
      "vantage": {"kind": "server", "id": null},
-     "port": 9, "repeat_count": 1, "repeat_interval_ms": 0}
+     "port": 9, "repeat_count": 1, "repeat_interval_ms": 0, "stagger_ms": 0}
 
 Pure-additive nullable column add — safe under the expand/contract rolling
 upgrade contract (an N-1 pod never reads it). No new table, no new feature

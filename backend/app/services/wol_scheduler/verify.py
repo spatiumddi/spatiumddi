@@ -360,7 +360,6 @@ async def verify_run_targets(
     Idempotent: only not-yet-UP rows are touched, so a re-run re-probes to the
     same verdict without double-counting.
     """
-    now = datetime.now(UTC)
     chain = _METHOD_CHAINS.get(method, _METHOD_CHAINS[VERIFY_METHOD_PING])
     active_chain = [m for m in chain if m in ACTIVE_METHODS]
     passive = VERIFY_METHOD_SEEN in chain
@@ -411,12 +410,19 @@ async def verify_run_targets(
         async with sem:
             for m in active_chain:
                 up, used = await probe_liveness(row.address, run_vantage_of(row), method=m)
-                trail.append(_evidence(used, up, _active_detail(used, up), now))
+                # Stamp each entry with when THIS probe ran, not the pass start —
+                # a large fleet's fan-out spans minutes, so a shared pass-start
+                # time would misdate the trail.
+                trail.append(_evidence(used, up, _active_detail(used, up), datetime.now(UTC)))
                 if up:
                     return row, True, used, trail
         return row, False, active_chain[-1], trail
 
     results = await asyncio.gather(*(_probe_active(r) for r in probeable))
+    # Verdict time — captured AFTER the fan-out, so verified_at, the passive
+    # "no sighting" observed_at, and the Seen re-stamp all reflect when we
+    # actually finished checking rather than a pass-start instant minutes stale.
+    now = datetime.now(UTC)
 
     # The passive read runs AFTER the fan-out: safe (no coroutines are in flight,
     # so the session is single-threaded again) and genuinely short-circuiting —
@@ -456,7 +462,8 @@ async def verify_run_targets(
             row.verify_method = VERIFY_METHOD_SEEN
             # For a confirmed sighting the observation IS the sighting, so
             # ``observed_at`` carries the real last-seen time (structured, so the
-            # UI can format it); a miss records when we checked (now).
+            # UI can format it); a miss records the verdict time (when we ran the
+            # passive check, after the fan-out).
             trail.append(
                 _evidence(
                     VERIFY_METHOD_SEEN,
@@ -487,17 +494,16 @@ async def verify_run_targets(
     # Batch-stamp the Seen infra on every ACTIVE responder's IPAddress. Passive
     # confirmations are excluded by construction: their sighting is already on the
     # row. Two guards against a stale write:
-    #   * ``stamp`` is captured fresh HERE, after the (possibly multi-minute)
-    #     probe fan-out, not the pass-start ``now`` — so it reflects when the host
-    #     actually answered, not when the pass began.
+    #   * ``now`` is the post-fan-out verdict time (not a pass-start instant), so
+    #     it reflects when the host actually answered rather than when the pass
+    #     began.
     #   * the UPDATE only ADVANCES last_seen_at (``last_seen_at IS NULL OR <
-    #     stamp``), so a fresher sighting a concurrent poller committed mid-fan-out
+    #     now``), so a fresher sighting a concurrent poller committed mid-fan-out
     #     is never clobbered backwards. Guarding in SQL (not on loaded rows) keeps
     #     it correct against a commit that landed after our SELECT snapshot.
     # Grouped by winning method (≤ 2: ping / tcp) so last_seen_method stays
     # consistent with the timestamp it's written beside.
     if active_up:
-        stamp = datetime.now(UTC)
         by_method: dict[str, list[Any]] = {}
         for ip_id, m in active_up.items():
             by_method.setdefault(m, []).append(ip_id)
@@ -506,9 +512,9 @@ async def verify_run_targets(
                 update(IPAddress)
                 .where(
                     IPAddress.id.in_(ip_ids),
-                    (IPAddress.last_seen_at.is_(None)) | (IPAddress.last_seen_at < stamp),
+                    (IPAddress.last_seen_at.is_(None)) | (IPAddress.last_seen_at < now),
                 )
-                .values(last_seen_at=stamp, last_seen_method=m)
+                .values(last_seen_at=now, last_seen_method=m)
             )
 
     logger.info(
