@@ -88,7 +88,7 @@ DHCPScope
   max_lease_time: int
   options: JSONB {               -- scope-level options (override server defaults)
     "routers": ["10.1.2.1"],
-    "domain-name-servers": ["10.0.0.53", "10.0.0.54"],
+    "dns-servers": ["10.0.0.53", "10.0.0.54"],
     "domain-name": "internal.example.com",
     "domain-search": ["internal.example.com", "example.com"],
     "tftp-server-name": "10.0.0.10",   -- for PXE
@@ -542,7 +542,7 @@ The following standard DHCP options can be configured at the scope, pool, or hos
 |---|---|---|
 | 1 | Subnet Mask | Auto-computed from subnet prefix |
 | 3 | Router | Default gateway IP(s) |
-| 6 | Domain Name Server | DNS server IPs (up to 3) |
+| 6 | Domain Name Server | DNS server IPs. Canonical option name is `dns-servers`; the IANA name `domain-name-servers` is accepted as a legacy alias on write and still maps to code 6 on read |
 | 12 | Host Name | Override hostname sent to client |
 | 15 | Domain Name | DNS search domain (e.g., corp.example.com) |
 | 28 | Broadcast Address | Auto-computed |

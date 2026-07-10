@@ -644,6 +644,16 @@ class DNSZone(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
         nullable=True,
         index=True,
     )
+    # NetBird synthetic-DNS provenance (issue #603, Phase 2). Set on the
+    # auto-created NetBird DNS-domain zone. While non-null the API blocks
+    # edits / deletes — the reconciler is the only writer. Cascades on
+    # instance delete.
+    netbird_instance_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("netbird_instance.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
     # Optional per-zone color key (from a curated swatch set) shown as a
     # dot/stripe in zone lists + tree nodes. Free-form hex is not accepted
     # so both light and dark themes remain legible. See API validator for
@@ -801,6 +811,15 @@ class DNSRecord(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     tailscale_tenant_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("tailscale_tenant.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    # Set by the NetBird reconciler when the row mirrors a NetBird peer
+    # (Phase 2). The FK cascades on instance delete. API blocks edits /
+    # deletes while non-null.
+    netbird_instance_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("netbird_instance.id", ondelete="CASCADE"),
         nullable=True,
         index=True,
     )

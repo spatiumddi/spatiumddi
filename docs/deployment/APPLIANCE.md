@@ -799,7 +799,11 @@ non-interactively:
 - Every field present in the answer file skips its prompt.
 - A **fully** preseeded run (disk + `confirm_wipe: true` + all fields
   for the chosen role) installs end-to-end with **zero** console
-  interaction — welcome + the final confirm are skipped too.
+  interaction — welcome + the final confirm are skipped too. The
+  terminal "Press OK to reboot" **Done** msgbox is suppressed only
+  when `FULLY_UNATTENDED` is set (#549) — a partial preseed still
+  shows it. (Before this fix a fully-preseeded install completed to
+  disk then blocked forever on that dialog.)
 - A **partial** preseed falls through to the interactive prompt for
   **only the missing fields** (e.g. everything-but-the-disk).
 - A field that is **present but invalid** halts loudly (clear console
@@ -819,6 +823,18 @@ one whole disk. Prefer a stable `/dev/disk/by-id/…` or `by-path/…` id
 (a bare `sda` can renumber). A supplied-but-unresolvable disk drops to
 the interactive picker rather than guessing.
 
+**Lint a preseed offline (#581).** `spatium-install --check-preseed
+<preseed.yaml>` dry-runs the answer file **without installing
+anything** — it is unprivileged, read-only, and host-portable (runs
+identically on a dev laptop and the appliance). It parses the file via
+the same `spatium-preseed-parse` helper a real headless install uses,
+then re-runs the wizard's own validators (hostname RFC 1123; k3s CIDR
+disjoint + ≤ /22 + no LAN overlap; pairing code; static-network
+fields) and reports every error in one pass. Machine-specific checks
+(target-disk presence, the 32 GiB size floor) downgrade to warnings so
+the same file lints the same everywhere. Exit status: `0` valid, `1`
+invalid, `2` usage error.
+
 **Secrets.** `admin_password` / `pairing_code` in a plaintext answer
 file is the usual preseed tradeoff. Use `admin_password_hash` (crypt(3),
 e.g. `openssl passwd -6`) to keep the cleartext out of the file, and
@@ -837,10 +853,18 @@ Once the installed system reboots, `spatiumddi-firstboot.service`
 runs as normal (identical to the interactive path): generates
 `/etc/spatiumddi/.env` (POSTGRES_PASSWORD, SECRET_KEY,
 CREDENTIAL_ENCRYPTION_KEY, DNS_AGENT_KEY, DHCP_AGENT_KEY,
-BOOTSTRAP_PAIRING_CODE) on first run, writes the bootstrap HelmChart
-manifest into `/var/lib/rancher/k3s/server/manifests/`, and polls
+LG_AGENT_KEY, BOOTSTRAP_PAIRING_CODE) on first run, writes the
+bootstrap HelmChart manifest into
+`/var/lib/rancher/k3s/server/manifests/`, and polls
 `http://127.0.0.1:8000/health/live`. Default web-UI login is
 `admin / admin` with `force_password_change=True`.
+
+`LG_AGENT_KEY` (the Looking Glass collector's agent key, #576) is
+generated on control-plane roles only. Because it is the first agent
+key added after GA, an already-installed control plane has none in its
+existing `.env` — firstboot mints and persists one the first time it
+runs on a build that carries the Looking Glass, so an A/B slot upgrade
+picks it up rather than only fresh installs.
 
 Recipe, schema table, and Azure / AWS / Proxmox / PXE examples:
 [`appliance/cloud-init/README.md`](../../appliance/cloud-init/README.md)

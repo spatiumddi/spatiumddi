@@ -65,12 +65,19 @@ from app.models.tls_cert import (
     TLSCertTarget,
 )
 from app.models.vrf import VRF
+from app.models.wol_schedule import (
+    VERIFY_STATE_DONE,
+    WolRun,
+    WolRunTarget,
+    WolSchedule,
+)
 from app.services import audit_forward
 from app.services.bgp.hijack_monitor import (
     RPKI_INVALID,
     expected_origin_set,
     severity_for_rpki,
 )
+from app.services.wol_scheduler.verify import seen_since
 
 logger = structlog.get_logger(__name__)
 
@@ -230,6 +237,29 @@ RULE_TYPE_UNKNOWN_MAC_IN_STATIC_RANGE = "unknown_mac_in_static_range"
 RULE_TYPE_ROGUE_DHCP = "rogue_dhcp"
 _ROGUE_DHCP_RECENCY_DAYS = 1
 
+# Scheduled Wake-on-LAN failed to bring hosts up — issue #596 Phase 2.
+# Subject = **wol_schedule**, deliberately NOT the run: a 15-minute schedule
+# would otherwise open ~96 events a day. One open event per failing schedule,
+# carrying the blast-radius rollup.
+#
+# Fires when a schedule's LATEST finalised run (``verify_state='done'``, started
+# within ``threshold_days``) left SENT hosts unconfirmed AND a fresh passive
+# re-check still can't see them. That re-check is what makes the alert
+# recovery-aware: as stragglers boot and some other subsystem (SNMP ARP/FDB, a
+# DHCP lease, an nmap sweep) stamps ``IPAddress.last_seen_at``, the matcher stops
+# matching and the shared evaluator loop auto-resolves the event — no separate
+# resolve path. A clean next run, or the failing run ageing out of the window,
+# resolves it too.
+#
+# Ad-hoc runs (``schedule_id IS NULL``) never match: they have no schedule
+# subject. Their outcome lives in History + the copilot tools.
+RULE_TYPE_WOL_WAKE_FAILED = "wol_wake_failed"
+# How far back a failing run stays alertable. One day: a lab PC left off over a
+# weekend shouldn't pin an alert open from Friday to Monday.
+_WOL_WAKE_FAILED_RECENCY_DAYS = 1
+# Hostnames sampled into the alert message before it collapses to "+N more".
+_WOL_WAKE_FAILED_SAMPLE = 5
+
 # Rogue IPv6 Router-Advertisement detection — issue #524. Subject = ra_router.
 # Fires on ra_observed_router rows classified ``rogue`` (an RA source that
 # isn't on the group's expected-router allowlist), observed within
@@ -311,6 +341,7 @@ RULE_TYPES = frozenset(
         RULE_TYPE_UNKNOWN_MAC_IN_STATIC_RANGE,
         RULE_TYPE_ROGUE_DHCP,
         RULE_TYPE_ROGUE_RA,
+        RULE_TYPE_WOL_WAKE_FAILED,
         RULE_TYPE_NEW_MAC_SEEN,
         RULE_TYPE_TLS_CERT_EXPIRING,
         RULE_TYPE_TLS_CERT_CHAIN_INVALID,
@@ -848,6 +879,144 @@ async def _matching_rogue_ra_subjects(
             f"router, or acknowledge it if expected."
         )
         matches.append((str(r.id), display, message))
+    return matches
+
+
+async def _matching_wol_wake_failed_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+) -> list[tuple[str, str, str]]:
+    """Schedules whose latest finalised wake left hosts that are STILL not up.
+
+    Subject is the **schedule**, so a 15-minute schedule that fails every fire
+    holds one open event rather than opening ~96 a day.
+
+    Per candidate schedule (``verify_enabled`` AND ``verify_alert_enabled``):
+
+    1. Take its most recent run with ``verify_state='done'`` started inside
+       ``threshold_days``. Only a finalised run is judged — a run mid-re-wake has
+       not given up yet. Ad-hoc runs are excluded structurally: they carry
+       ``schedule_id IS NULL`` and so belong to no schedule.
+    2. Collect the SENT targets that never confirmed (``verified IS NOT TRUE`` —
+       both the probed-down rows and the couldn't-probe NULL rows).
+    3. **Re-check them passively, right now.** A target whose ``IPAddress`` has
+       been seen since that run started has come up on its own since the verify
+       gave up, so it no longer counts. A target with no IPAM row
+       (``ip_address_id IS NULL``) can't be re-checked and stays counted.
+
+    If nothing is still down, the schedule stops matching and the shared
+    evaluator loop auto-resolves its open event. That re-check is the whole
+    recovery story: no bespoke resolve path, and a lab PC that boots twenty
+    minutes late closes its own alert on the next 60 s tick.
+    """
+    days = rule.threshold_days if rule.threshold_days is not None else _WOL_WAKE_FAILED_RECENCY_DAYS
+    cutoff = datetime.now(UTC) - timedelta(days=max(1, days))
+
+    schedules = (
+        (
+            await db.execute(
+                select(WolSchedule).where(
+                    WolSchedule.verify_enabled.is_(True),
+                    WolSchedule.verify_alert_enabled.is_(True),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not schedules:
+        return []
+    by_id = {s.id: s for s in schedules}
+
+    # Latest DONE run per candidate schedule, within the window, in ONE query —
+    # a window function instead of a per-schedule lookup, so the query count
+    # doesn't scale with the schedule count on every 60 s tick. Only the runs
+    # that actually failed (``unverified_count > 0``) then get the target + seen
+    # re-check below, which for a healthy fleet is zero further work.
+    rn = func.row_number().over(
+        partition_by=WolRun.schedule_id,
+        order_by=WolRun.started_at.desc(),
+    )
+    ranked = (
+        select(
+            WolRun.id.label("run_id"),
+            WolRun.schedule_id.label("schedule_id"),
+            WolRun.started_at.label("started_at"),
+            WolRun.sent_count.label("sent_count"),
+            WolRun.unverified_count.label("unverified_count"),
+            rn.label("rn"),
+        )
+        .where(
+            WolRun.schedule_id.in_(list(by_id)),
+            WolRun.verify_state == VERIFY_STATE_DONE,
+            WolRun.started_at >= cutoff,
+        )
+        .subquery()
+    )
+    failing_runs = (
+        await db.execute(
+            select(
+                ranked.c.run_id,
+                ranked.c.schedule_id,
+                ranked.c.started_at,
+                ranked.c.sent_count,
+            ).where(ranked.c.rn == 1, ranked.c.unverified_count > 0)
+        )
+    ).all()
+    if not failing_runs:
+        return []
+
+    # All unconfirmed SENT targets across every failing run, in ONE query.
+    targets_by_run: dict[Any, list[WolRunTarget]] = {}
+    all_targets = (
+        (
+            await db.execute(
+                select(WolRunTarget).where(
+                    WolRunTarget.run_id.in_([r.run_id for r in failing_runs]),
+                    WolRunTarget.sent.is_(True),
+                    WolRunTarget.verified.is_not(True),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for t in all_targets:
+        targets_by_run.setdefault(t.run_id, []).append(t)
+
+    matches: list[tuple[str, str, str]] = []
+    for run in failing_runs:
+        unconfirmed = targets_by_run.get(run.run_id, [])
+        if not unconfirmed:
+            continue
+        # The seen re-check is per-run (each run's wake instant is its own
+        # anchor), but only for the handful of runs that actually failed.
+        seen = await seen_since(
+            db,
+            [t.ip_address_id for t in unconfirmed if t.ip_address_id is not None],
+            run.started_at,
+        )
+        still_down = [
+            t for t in unconfirmed if t.ip_address_id is None or t.ip_address_id not in seen
+        ]
+        if not still_down:
+            continue  # every straggler has since been observed — auto-resolve
+
+        sched = by_id[run.schedule_id]
+        sample = ", ".join(
+            t.address or "(no address)" for t in still_down[:_WOL_WAKE_FAILED_SAMPLE]
+        )
+        more = len(still_down) - _WOL_WAKE_FAILED_SAMPLE
+        if more > 0:
+            sample += f" (+{more} more)"
+        message = (
+            f"{len(still_down)} of {run.sent_count} host(s) sent a magic packet by "
+            f"'{sched.name}' did not come up, and are still not visible on the "
+            f"network. Re-woken up to {sched.verify_retries} time(s), verified via "
+            f"'{sched.verify_method}'. Hosts: {sample}. Resolves automatically once "
+            f"they are seen, or after a clean run."
+        )
+        matches.append((str(sched.id), sched.name, message))
     return matches
 
 
@@ -3201,6 +3370,47 @@ async def seed_rogue_dhcp_alert_rule() -> None:
         await session.commit()
 
 
+async def seed_wol_wake_failed_alert_rule() -> None:
+    """Seed the singleton ``wol_wake_failed`` rule (issue #596), DISABLED by default.
+
+    Meaningful only once an operator arms post-wake verify on a schedule
+    (``verify_enabled``); seeding it off makes it discoverable in the Alerts UI
+    without paging anyone on installs that never opt in. Keyed on ``rule_type`` —
+    an operator who enables / renames it is never overridden.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    async with AsyncSessionLocal() as session:
+        existing = await session.scalar(
+            select(AlertRule).where(AlertRule.rule_type == RULE_TYPE_WOL_WAKE_FAILED)
+        )
+        if existing is not None:
+            return
+        session.add(
+            AlertRule(
+                name="Wake-on-LAN verify failed",
+                description=(
+                    "Fires when a Wake-on-LAN schedule's latest verified run left "
+                    "hosts that never came up, and they are still not visible on "
+                    "the network. One event per schedule (not per run), carrying "
+                    "the blast-radius rollup. Auto-resolves once the stragglers "
+                    "are seen, or after a clean run. Requires post-wake verify on "
+                    "the schedule; mute a noisy one with its "
+                    "'alert on wake failure' toggle."
+                ),
+                rule_type=RULE_TYPE_WOL_WAKE_FAILED,
+                threshold_days=_WOL_WAKE_FAILED_RECENCY_DAYS,
+                severity="warning",
+                enabled=False,
+                notify_syslog=True,
+                notify_webhook=True,
+                notify_smtp=False,
+            )
+        )
+        await session.commit()
+
+
 async def seed_rogue_ra_alert_rule() -> None:
     """Seed the singleton ``rogue_ra`` rule (issue #524), DISABLED by default.
 
@@ -3831,6 +4041,10 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 base = await _matching_rogue_ra_subjects(db, rule)
                 matches = [(sid, disp, msg, None) for sid, disp, msg in base]
                 subject_type = "ra_router"
+            elif rule.rule_type == RULE_TYPE_WOL_WAKE_FAILED:
+                base = await _matching_wol_wake_failed_subjects(db, rule)
+                matches = [(sid, disp, msg, None) for sid, disp, msg in base]
+                subject_type = "wol_schedule"
             elif rule.rule_type == RULE_TYPE_NEW_MAC_SEEN:
                 base = await _matching_new_mac_seen_subjects(db, rule)
                 matches = [(sid, disp, msg, None) for sid, disp, msg in base]

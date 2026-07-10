@@ -461,6 +461,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_rogue_ra_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("rogue_ra_alert_rule_seed_skipped", reason=str(exc))
+    # Wake-on-LAN verify-failed alert rule — singleton, DISABLED by default
+    # (issue #596). Fires only for schedules that arm post-wake verify.
+    try:
+        from app.services.alerts import seed_wol_wake_failed_alert_rule  # noqa: PLC0415
+
+        await seed_wol_wake_failed_alert_rule()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("wol_wake_failed_alert_rule_seed_skipped", reason=str(exc))
     # New-device (arpwatch) alert rule — singleton, DISABLED by default (issue
     # #459). Fires on never-before-seen MACs once new-device watch is on.
     try:

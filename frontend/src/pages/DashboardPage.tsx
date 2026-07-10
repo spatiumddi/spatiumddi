@@ -29,6 +29,7 @@ import {
   RefreshCw,
   Route,
   Server,
+  Bird,
   Shield,
   ShieldCheck,
   Waypoints,
@@ -47,6 +48,7 @@ import {
   proxmoxApi,
   opnsenseApi,
   cloudApi,
+  netbirdApi,
   tailscaleApi,
   unifiApi,
   platformHealthApi,
@@ -69,6 +71,7 @@ import {
   type ProxmoxNode,
   type OPNsenseRouter,
   type CloudEndpoint,
+  type NetbirdInstance,
   type TailscaleTenant,
   type UnifiController,
   type PlatformHealthResponse,
@@ -1142,6 +1145,7 @@ export function DashboardPage() {
   const cloudEnabled = settings?.integration_cloud_enabled ?? false;
   const tailscaleEnabled = settings?.integration_tailscale_enabled ?? false;
   const unifiEnabled = settings?.integration_unifi_enabled ?? false;
+  const netbirdEnabled = settings?.integration_netbird_enabled ?? false;
   const { data: k8sClusters = [] } = useQuery<KubernetesCluster[]>({
     queryKey: ["kubernetes-clusters"],
     queryFn: kubernetesApi.listClusters,
@@ -1158,6 +1162,11 @@ export function DashboardPage() {
     queryKey: ["tailscale-tenants"],
     queryFn: tailscaleApi.listTenants,
     enabled: tailscaleEnabled,
+  });
+  const { data: netbirdInstances = [] } = useQuery<NetbirdInstance[]>({
+    queryKey: ["netbird-instances"],
+    queryFn: netbirdApi.listInstances,
+    enabled: netbirdEnabled,
   });
 
   const { data: proxmoxNodes = [] } = useQuery<ProxmoxNode[]>({
@@ -1880,7 +1889,8 @@ export function DashboardPage() {
             opnsenseEnabled ||
             cloudEnabled ||
             tailscaleEnabled ||
-            unifiEnabled) && (
+            unifiEnabled ||
+            netbirdEnabled) && (
             <div className="space-y-1.5">
               {ipamFilterActive && (
                 <p className="px-1 text-[10px] uppercase tracking-wide text-muted-foreground">
@@ -1903,6 +1913,8 @@ export function DashboardPage() {
                 cloudEndpoints={cloudEndpoints}
                 tailscaleTenants={tailscaleTenants}
                 unifiControllers={unifiControllers}
+                netbirdEnabled={netbirdEnabled}
+                netbirdInstances={netbirdInstances}
               />
             </div>
           )}
@@ -2310,6 +2322,8 @@ function IntegrationsPanel({
   cloudEndpoints,
   tailscaleTenants,
   unifiControllers,
+  netbirdEnabled,
+  netbirdInstances,
 }: {
   kubernetesEnabled: boolean;
   dockerEnabled: boolean;
@@ -2325,6 +2339,8 @@ function IntegrationsPanel({
   cloudEndpoints: CloudEndpoint[];
   tailscaleTenants: TailscaleTenant[];
   unifiControllers: UnifiController[];
+  netbirdEnabled: boolean;
+  netbirdInstances: NetbirdInstance[];
 }) {
   const hasK8s = kubernetesEnabled;
   const hasDocker = dockerEnabled;
@@ -2333,6 +2349,7 @@ function IntegrationsPanel({
   const hasCloud = cloudEnabled;
   const hasTailscale = tailscaleEnabled;
   const hasUnifi = unifiEnabled;
+  const hasNetbird = netbirdEnabled;
   const cols = [
     hasK8s,
     hasDocker,
@@ -2341,6 +2358,7 @@ function IntegrationsPanel({
     hasCloud,
     hasTailscale,
     hasUnifi,
+    hasNetbird,
   ].filter(Boolean).length;
   const totalTargets =
     clusters.length +
@@ -2349,7 +2367,8 @@ function IntegrationsPanel({
     opnsenseRouters.length +
     cloudEndpoints.length +
     tailscaleTenants.length +
-    unifiControllers.length;
+    unifiControllers.length +
+    netbirdInstances.length;
   return (
     <div className="rounded-lg border bg-card">
       <div className="flex items-center justify-between border-b px-4 py-2.5">
@@ -2373,6 +2392,7 @@ function IntegrationsPanel({
           cols === 5 && "md:grid-cols-5 md:divide-x md:divide-y-0",
           cols === 6 && "md:grid-cols-6 md:divide-x md:divide-y-0",
           cols === 7 && "md:grid-cols-7 md:divide-x md:divide-y-0",
+          cols === 8 && "md:grid-cols-8 md:divide-x md:divide-y-0",
         )}
       >
         {hasK8s && (
@@ -2671,6 +2691,47 @@ function IntegrationsPanel({
                       lastSyncError={c.last_sync_error}
                       intervalSeconds={c.sync_interval_seconds}
                       enabled={c.enabled}
+                    />
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+        {hasNetbird && (
+          <div className="min-w-0">
+            <Link
+              to="/netbird"
+              className="flex items-center gap-1.5 bg-muted/30 px-4 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground hover:bg-muted/50"
+            >
+              <Bird className="h-3 w-3" />
+              NetBird ({netbirdInstances.length})
+              <span className="ml-auto text-[10px] text-muted-foreground/70">
+                view all →
+              </span>
+            </Link>
+            {netbirdInstances.length === 0 ? (
+              <p className="px-4 py-3 text-[11px] italic text-muted-foreground">
+                No instances registered.
+              </p>
+            ) : (
+              <div className="overflow-x-auto">
+                <div className="min-w-[520px] divide-y">
+                  {netbirdInstances.map((t) => (
+                    <IntegrationRow
+                      key={t.id}
+                      to={`/netbird`}
+                      name={t.name}
+                      subtitle={t.dns_domain ?? t.api_url}
+                      meta={
+                        t.peer_count != null
+                          ? `${t.peer_count} peer${t.peer_count === 1 ? "" : "s"}`
+                          : "—"
+                      }
+                      lastSyncedAt={t.last_synced_at}
+                      lastSyncError={t.last_sync_error}
+                      intervalSeconds={t.sync_interval_seconds}
+                      enabled={t.enabled}
                     />
                   ))}
                 </div>

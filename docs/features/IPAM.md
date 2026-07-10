@@ -211,10 +211,17 @@ run-from `target`:
   whose NIC sits on the target's segment, so the packet originates in the right
   broadcast domain (reuses the generic nettool command channel).
 
+Optionally arm a post-wake liveness check (#596) — the body accepts `verify`
+(default `false`), `verify_wait_seconds` (default 60), `verify_retries` (default
+1) and `verify_method` (default `auto`). See
+[Ad-hoc wake verify](#ad-hoc-wake-verify-596) below.
+
 Gated by the `use_network_tools` permission and audited against the IP
-(`action="wake_on_lan"`). Surfaced as a **Wake** button on the IP detail modal
-(shown only when the IP has a MAC) and as the `propose_wake_host` Operator
-Copilot tool. WoL is IPv4-only — the magic packet rides a UDP broadcast.
+(`action="wake_on_lan"`; the audit row carries `verify_run_id` when verify was
+armed). Surfaced as a **Wake** button on the IP detail modal (shown only when the
+IP has a MAC), with a **verify** checkbox beside it, and as the
+`propose_wake_host` Operator Copilot tool. WoL is IPv4-only — the magic packet
+rides a UDP broadcast.
 
 ### Scheduled Wake-on-LAN (#586, Phases 1–3)
 
@@ -391,8 +398,45 @@ Per-schedule config (all on `wol_schedule`):
 - `verify_retries` (default `1`, range 0–10) — number of **re-wake** passes after
   the first probe. Total probe passes ≤ `verify_retries + 1`; `0` == probe once,
   never re-wake.
-- `verify_method` (`ping`-only in v1) — kept as a column so a future TCP/agent
-  probe method needs no migration.
+- `verify_method` (default `auto` for new schedules; existing rows keep `ping`) —
+  which liveness source settles the verdict. See **Liveness sources** below.
+- `verify_alert_enabled` (default `true`) — per-schedule mute for the
+  `wol_wake_failed` alert. See **Alerting on a failed wake** below.
+
+#### Liveness sources (#596)
+
+| method | class | what it does |
+|---|---|---|
+| `ping` | active | ICMP echo from the control plane. The pre-#596 behaviour. A host behind a default Windows firewall answers nothing and reads as down. |
+| `tcp` | active | Connect-or-RST across a small port set (22, 80, 443, 445, 3389, 8006, 53, 8080 — the same set the IPAM discovery sweep uses). A **refused** connection still proves the host is up, so this survives an ICMP-blocking host firewall. |
+| `seen` | passive | Emits no traffic. Confirms the host only if `IPAddress.last_seen_at >= run.started_at`. |
+| `auto` | both | `ping` → `tcp` → `seen`, stopping at the first source that confirms. |
+
+Two properties make this safe to default to `auto`:
+
+- **Active probes may report either verdict; a passive probe may only ever
+  *confirm*.** "No sighting" is equally consistent with "the SNMP poller hasn't run
+  yet", so `seen` never asserts a host is down. A richer method can therefore only
+  ever *shrink* the down set relative to `ping` — it can never manufacture a re-wake.
+- **The wake anchor kills the stale-cache false positive.** A sighting only counts
+  if it was recorded *after this run's magic packet went out*. A week-old ARP entry
+  or yesterday's lease can never be mistaken for evidence that the wake worked.
+
+`auto` short-circuits, so a live ICMP-responsive host costs exactly one ping and the
+extra sources are only paid for on hosts a ping-only verify would have re-woken for
+nothing. A **passive** confirmation never re-stamps `last_seen_at` — the sighting is
+already recorded by whichever subsystem actually observed the host. Only an **active**
+UP verdict writes Seen, with `last_seen_method` set to the winning probe.
+
+What `seen` actually observes today: the SNMP ARP/FDB cross-reference, DHCP lease
+pulls, nmap, ping/ARP discovery sweeps, and the DHCP agent's passive L2
+fingerprinting — every writer of `IPAddress.last_seen_at`. **The read-only
+integration mirrors (UniFi, OPNsense, Proxmox, Tailscale) do not stamp `last_seen_at`**,
+so they contribute no sightings. Teaching them to is a follow-up.
+
+The per-target `wol_run_target.verify_method` records the source that *settled* the
+verdict (`ping` / `tcp` / `seen`) — never the `auto` keyword — so the History chip
+stays honest about how each host was confirmed.
 
 How it runs (chained, bounded, idempotent — non-negotiables #9):
 
@@ -402,9 +446,15 @@ How it runs (chained, bounded, idempotent — non-negotiables #9):
 2. Each verify pass atomically claims the run (`verify_state` `pending → verifying`
    via a conditional `UPDATE … WHERE verify_state='pending'`), so a double-delivery
    of the same attempt is a no-op and a re-fire after `done` is a no-op.
-3. It pings the still-unverified **sent** targets. A host that answers is stamped
-   `verified=true` and its `IPAddress.last_seen_at` / `last_seen_method='ping'` are
-   updated (the same Seen infra discovery uses). A non-responder is `verified=false`.
+3. It probes the still-unverified **sent** targets under the schedule's
+   `verify_method`. A host confirmed by an *active* probe is stamped `verified=true`
+   and its `IPAddress.last_seen_at` / `last_seen_method` are updated (the same Seen
+   infra discovery uses). A host confirmed only by `seen` is `verified=true` without
+   re-stamping Seen. A host no source confirmed is `verified=false`. A host **no
+   source could run against** — no address under an active-only method, or no IPAM
+   row (`ip_address_id IS NULL`, the FK is `ON DELETE SET NULL`) under `seen` — stays
+   `verified=null`: honestly "not checked", counted as unverified in the rollup, and
+   never a re-wake candidate.
 4. If non-responders remain **and** `attempt ≤ verify_retries`, it re-wakes **only**
    those hosts (reusing the Phase-1 dispatch path), bumps their `wake_attempts`,
    releases the run back to `pending`, and re-enqueues the next attempt. Otherwise
@@ -418,15 +468,69 @@ up), `verified_at`, `verify_method`, `wake_attempts`. The `find_wol_runs` MCP to
 surfaces the rollup so the copilot can answer "did last night's wake bring the fleet
 up?" — distinct from "did it send?".
 
-**v1 verifies from the SERVER vantage only**, regardless of the schedule's *wake*
+#### Alerting on a failed wake (#596)
+
+A finished verify that gave up used to leave exactly one audit row and page
+nobody. The `wol_wake_failed` alert rule closes that. It is a normal rule on the
+60 s evaluator, so channel delivery, dedupe and auto-resolve come from the shared
+machinery — see [OBSERVABILITY.md §9.1](../OBSERVABILITY.md) for the rule table.
+
+Two decisions worth knowing:
+
+- **The subject is the schedule, not the run.** A 15-minute schedule that fails
+  every fire would otherwise open ~96 events a day. One open event per failing
+  schedule carries the blast-radius rollup (`N of M hosts`, a hostname sample).
+- **It re-checks passively on every tick.** A target counts as still-failed only
+  if `IPAddress.last_seen_at` is *still* older than the run that woke it. So the
+  lab PC that boots twenty minutes late closes its own alert, and an operator is
+  never paged for a host that has since come up. A target with no IPAM row can't
+  be re-checked and keeps the alert open rather than silently resolving.
+
+The rule seeds **disabled** (`rogue_dhcp` precedent) — enable it under
+Administration → Alerts once a schedule arms verify. `verify_alert_enabled` on
+the schedule is the per-schedule mute for a deliberately-noisy lab job.
+
+#### Per-target evidence trail (#596)
+
+`wol_run_target.verify_method` records which source *settled* a host's verdict.
+`verify_evidence` records what every source it consulted actually said — an
+ordered JSONB array of `{source, up, detail, observed_at}`, rendered under each
+host's chip in the run's History drilldown. It answers the operator's real
+question about a down host: *down according to what?* "ICMP timed out, no TCP
+port answered, no sighting since the wake" is a dead box; a short-circuit trail
+that stops at `ping · up` means nothing else was ever needed. `NULL` on rows no
+source could run against, and on rows recorded before the trail shipped.
+
+Two Operator Copilot reads surface the same data: `find_wol_wake_failures` (runs
+whose verify finished with unconfirmed hosts — scheduled *and* ad-hoc, newest
+first) and `count_wol_wake_failures`. Both read-only, both default-enabled.
+
+#### Ad-hoc wake verify (#596)
+
+The single-host wake action (`POST /ipam/addresses/{id}/wake`, the **Wake** button on
+the IP detail modal) can arm the same chain. Tick **verify** next to the button, or
+pass `verify: true` with optional `verify_wait_seconds` / `verify_retries` /
+`verify_method`. Because the machinery is keyed on a run, an opted-in ad-hoc wake
+mints an ephemeral `WolRun` with `schedule_id = NULL`, `trigger = "adhoc"` and a
+single target, and carries its config in `WolRun.verify_params` — there is no parent
+schedule row to read it from. The run appears in **Wake Schedules → History** like any
+other. Requires the `tools.wake_scheduler` feature module (422 otherwise — the run
+would otherwise be invisible in the UI and never reclaimed by the sweep). A failing
+ad-hoc wake raises no alert: alerting is keyed on a schedule subject, and an ad-hoc
+run has none.
+
+**ACTIVE probes run from the SERVER vantage only**, regardless of the schedule's *wake*
 vantage. The appliance command channel (`agent_cmd`) is an in-memory, per-replica
 dispatch the **api** process owns; the verify task runs in the **Celery worker**, and
 there is no worker→supervisor result-return path today. So for an appliance-vantage
-wake, verify still pings from the control plane: correct when the api/worker can reach
-the target segment (routed ICMP / directed broadcast), and a false-negative
-(unverified) — never a false wake — when it can't. `verify_method` records `"ping"`
-so the surface is honest about how it checked. **Appliance-vantage verify** (a
-worker→supervisor result channel) is the named Phase-3 follow-up, alongside the
+wake, an active probe still runs from the control plane: correct when the api/worker
+can reach the target segment (routed ICMP / directed broadcast), and a false-negative
+(unverified) — never a false wake — when it can't. **`seen` sidesteps this entirely**:
+it is a pure DB read, so it verifies hosts on segments the worker cannot reach at all,
+provided some other subsystem (an SNMP poll of the local switch, a DHCP lease)
+observed them — which is why `auto` is the sensible default on a segmented network.
+**Appliance-vantage *active* verify** (a worker→supervisor result channel) remains the
+named follow-up, alongside the
 deferred [auto-resolve on-segment appliance from the target subnet] and the
 [scheduled-shutdown companion] below.
 

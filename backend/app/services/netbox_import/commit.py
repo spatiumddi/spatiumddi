@@ -58,6 +58,7 @@ from typing import Any
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.dns_names import sanitize_hostname
 from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
@@ -1351,7 +1352,10 @@ async def _commit_address(
             )
         existing.status = imported.status or existing.status
         existing.role = imported.role or existing.role
-        existing.hostname = imported.hostname or existing.hostname
+        # Fold a NetBox device/dns name to a valid LDH host name (#597) — a
+        # migration should keep the IP with a cleaned name rather than store a
+        # non-conforming one; a valid FQDN passes through unchanged.
+        existing.hostname = sanitize_hostname(imported.hostname) or existing.hostname
         existing.fqdn = imported.fqdn or existing.fqdn
         if imported.description:
             existing.description = imported.description
@@ -1382,7 +1386,7 @@ async def _commit_address(
         address=imported.address,
         status=imported.status or "allocated",
         role=imported.role,
-        hostname=imported.hostname,
+        hostname=sanitize_hostname(imported.hostname) or None,
         fqdn=imported.fqdn,
         description=imported.description or "",
         managed_by=managed_by,

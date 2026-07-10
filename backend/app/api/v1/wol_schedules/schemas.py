@@ -177,7 +177,16 @@ class WakeScheduleCreate(BaseModel):
     # Number of *re-wake* passes after the first probe (0 == probe once, never
     # re-wake); total probe passes ≤ verify_retries + 1.
     verify_retries: int = Field(default=1, ge=0, le=10)
-    verify_method: Literal["ping"] = "ping"
+    # Per-schedule mute for the ``wol_wake_failed`` alert (#596 Phase 2). The
+    # alert rule's own ``enabled`` flag is the master switch (seeded off); this
+    # silences one noisy schedule without disabling the rule fleet-wide.
+    verify_alert_enabled: bool = True
+    # Liveness source (issue #596). ``auto`` walks ping → tcp → seen and stops at
+    # the first confirmation, so it costs one ping against a live host and only
+    # pays for the extra sources on hosts a ping-only verify would have re-woken
+    # for nothing. Existing schedules keep whatever they stored; only new ones
+    # default to ``auto``.
+    verify_method: Literal["ping", "tcp", "seen", "auto"] = "auto"
 
     @field_validator("timezone")
     @classmethod
@@ -265,7 +274,8 @@ class WakeScheduleUpdate(BaseModel):
     verify_enabled: bool | None = None
     verify_wait_seconds: int | None = Field(default=None, ge=5, le=3600)
     verify_retries: int | None = Field(default=None, ge=0, le=10)
-    verify_method: Literal["ping"] | None = None
+    verify_alert_enabled: bool | None = None
+    verify_method: Literal["ping", "tcp", "seen", "auto"] | None = None
 
     @field_validator("timezone")
     @classmethod
@@ -330,6 +340,7 @@ class WakeScheduleRead(BaseModel):
     verify_enabled: bool
     verify_wait_seconds: int
     verify_retries: int
+    verify_alert_enabled: bool
     verify_method: str
     last_run_at: datetime | None
     last_run_status: str | None
@@ -434,6 +445,10 @@ class WakeRunTargetRead(BaseModel):
     verified: bool | None
     verified_at: datetime | None
     verify_method: str | None
+    # Ordered trail of every liveness source consulted on the final pass
+    # (#596 Phase 3): [{source, up, detail, observed_at}]. NULL when no source
+    # could run against the row, or for rows written before the trail shipped.
+    verify_evidence: list[dict[str, Any]] | None = None
     wake_attempts: int
     created_at: datetime
 

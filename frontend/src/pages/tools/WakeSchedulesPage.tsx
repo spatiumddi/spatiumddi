@@ -39,6 +39,8 @@ import {
   type WolTargetPreview,
   type WolTargetSelector,
   type WolVantage,
+  type WolVerifyEvidence,
+  type WolVerifyMethod,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
@@ -176,6 +178,40 @@ function StatusChip({ status }: { status: string | null }) {
 //   true  → probed UP   (came up after the wake)
 //   false → probed DOWN  (a re-wake candidate / never answered)
 //   null  → not checked  (verify off, or a skipped/address-less target)
+// The per-target evidence trail (#596). ``verify_method`` says which source
+// settled the verdict; this says what every source it consulted actually
+// reported — the answer to "down according to what?". Absent on rows recorded
+// before the trail shipped, and on rows no source could run against.
+function VerifyEvidenceTrail({
+  evidence,
+}: {
+  evidence?: WolVerifyEvidence[] | null;
+}) {
+  if (!evidence || evidence.length === 0) return null;
+  return (
+    <ul className="mt-0.5 space-y-0.5">
+      {evidence.map((e, i) => (
+        <li
+          key={`${e.source}-${i}`}
+          className="text-[10px] leading-tight text-muted-foreground"
+        >
+          <span className="font-mono">{e.source}</span>{" "}
+          <span
+            className={
+              e.up
+                ? "text-emerald-600 dark:text-emerald-400"
+                : "text-muted-foreground"
+            }
+          >
+            {e.up ? "up" : "down"}
+          </span>
+          <span className="text-muted-foreground/70"> — {e.detail}</span>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
 function VerifyChip({
   verified,
   verifiedAt,
@@ -939,6 +975,9 @@ function ScheduleDetailModal({
                 <DField label="Wait">{schedule.verify_wait_seconds}s</DField>
                 <DField label="Retries">{schedule.verify_retries}</DField>
                 <DField label="Method">{schedule.verify_method}</DField>
+                <DField label="Alert on failure">
+                  {schedule.verify_alert_enabled ? "yes" : "muted"}
+                </DField>
               </>
             ) : (
               <DField label="Enabled">No</DField>
@@ -1156,11 +1195,16 @@ function RunRow({
                         </td>
                         <td className="px-2 py-1">
                           {t.sent ? (
-                            <VerifyChip
-                              verified={t.verified}
-                              verifiedAt={t.verified_at}
-                              verifyMethod={t.verify_method}
-                            />
+                            <>
+                              <VerifyChip
+                                verified={t.verified}
+                                verifiedAt={t.verified_at}
+                                verifyMethod={t.verify_method}
+                              />
+                              <VerifyEvidenceTrail
+                                evidence={t.verify_evidence}
+                              />
+                            </>
                           ) : (
                             <span className="text-muted-foreground">—</span>
                           )}
@@ -1793,6 +1837,16 @@ function WolScheduleModal({
   const [verifyRetries, setVerifyRetries] = useState(
     existing?.verify_retries ?? 1,
   );
+  // Liveness source (#596). New schedules default to `auto`; an existing
+  // schedule keeps whatever it stored (pre-#596 rows are all `ping`).
+  const [verifyMethod, setVerifyMethod] = useState<WolVerifyMethod>(
+    existing?.verify_method ?? "auto",
+  );
+  // Per-schedule mute for the wake-failure alert (#596). Defaults on: the alert
+  // rule itself is seeded off, so this only matters once an operator enables it.
+  const [verifyAlertEnabled, setVerifyAlertEnabled] = useState(
+    existing?.verify_alert_enabled ?? true,
+  );
 
   const [error, setError] = useState<string | null>(null);
   const ianaList = useIanaTimezones();
@@ -1846,7 +1900,8 @@ function WolScheduleModal({
         verify_enabled: verifyEnabled,
         verify_wait_seconds: verifyWaitSeconds,
         verify_retries: verifyRetries,
-        verify_method: "ping",
+        verify_method: verifyMethod,
+        verify_alert_enabled: verifyAlertEnabled,
       };
       return existing
         ? wakeSchedulesApi.update(existing.id, body)
@@ -2036,6 +2091,10 @@ function WolScheduleModal({
             setVerifyWaitSeconds={setVerifyWaitSeconds}
             verifyRetries={verifyRetries}
             setVerifyRetries={setVerifyRetries}
+            verifyMethod={verifyMethod}
+            setVerifyMethod={setVerifyMethod}
+            verifyAlertEnabled={verifyAlertEnabled}
+            setVerifyAlertEnabled={setVerifyAlertEnabled}
             vantage={vantage}
             errors={verifyErrors}
           />
@@ -2640,6 +2699,14 @@ function CalendarGateSection({
 }
 
 // ── Post-wake verify step (Phase 3) ───────────────────────────────────
+/** Per-method operator copy for the liveness-source picker (#596). */
+const VERIFY_METHOD_HELP: Record<WolVerifyMethod, string> = {
+  auto: "Tries ping, then TCP connect, then a post-wake network sighting — stopping at the first one that confirms. Costs a single ping against a host that answers ICMP.",
+  ping: "ICMP echo from the control plane. Simple, but a host behind a default Windows firewall answers nothing and reads as down.",
+  tcp: "Opens a TCP connection to a few common ports. A refused connection still proves the host is up, so this works where ICMP is blocked.",
+  seen: "Sends no traffic. Confirms the host only if something on the platform observed it after the wake fired — an SNMP ARP/FDB poll, a DHCP lease, an nmap or discovery sweep, or the DHCP agent's passive L2 sniffer. Because it never emits packets, it can verify hosts on segments the control plane cannot reach.",
+};
+
 function VerifyStep({
   verifyEnabled,
   setVerifyEnabled,
@@ -2647,6 +2714,10 @@ function VerifyStep({
   setVerifyWaitSeconds,
   verifyRetries,
   setVerifyRetries,
+  verifyMethod,
+  setVerifyMethod,
+  verifyAlertEnabled,
+  setVerifyAlertEnabled,
   vantage,
   errors,
 }: {
@@ -2656,6 +2727,10 @@ function VerifyStep({
   setVerifyWaitSeconds: (n: number) => void;
   verifyRetries: number;
   setVerifyRetries: (n: number) => void;
+  verifyMethod: WolVerifyMethod;
+  setVerifyMethod: (m: WolVerifyMethod) => void;
+  verifyAlertEnabled: boolean;
+  setVerifyAlertEnabled: (b: boolean) => void;
   vantage: WolVantage;
   errors: {
     verifyWaitSeconds: string | null;
@@ -2676,11 +2751,11 @@ function VerifyStep({
         Verify hosts came up after the wake
       </label>
       <p className="text-[11px] text-muted-foreground">
-        After the wake dispatches, a background pass pings each host that was
-        sent a magic packet. Hosts that don&apos;t answer are re-woken up to the
-        retry bound. Responders stamp the IPAM &ldquo;last seen&rdquo; timestamp
-        (method <span className="font-mono">ping</span>), so the verify doubles
-        as a liveness refresh.
+        After the wake dispatches, a background pass checks each host that was
+        sent a magic packet. Hosts that don&apos;t confirm are re-woken up to
+        the retry bound. Hosts confirmed by an active probe stamp the IPAM
+        &ldquo;last seen&rdquo; timestamp, so the verify doubles as a liveness
+        refresh.
       </p>
 
       <div
@@ -2689,6 +2764,32 @@ function VerifyStep({
           !verifyEnabled && "pointer-events-none opacity-50",
         )}
       >
+        <div className="sm:col-span-2">
+          <label className={labelCls}>Liveness source</label>
+          <select
+            className={inputCls}
+            disabled={!verifyEnabled}
+            value={verifyMethod}
+            onChange={(e) => setVerifyMethod(e.target.value as WolVerifyMethod)}
+          >
+            <option value="auto">Auto (ping → TCP → seen on network)</option>
+            <option value="ping">Ping (ICMP)</option>
+            <option value="tcp">TCP connect</option>
+            <option value="seen">Seen on network (passive)</option>
+          </select>
+          <p className="mt-1 text-[11px] text-muted-foreground">
+            {VERIFY_METHOD_HELP[verifyMethod]}
+          </p>
+          {(verifyMethod === "seen" || verifyMethod === "auto") && (
+            <p className="mt-1 text-[11px] text-muted-foreground">
+              A sighting only counts if it was recorded{" "}
+              <em>after this wake fired</em>, so a stale ARP entry can never
+              pass a host that never woke. Note that the read-only integration
+              mirrors (UniFi, OPNsense, Proxmox, Tailscale) do not yet record
+              last-seen timestamps, so they do not contribute sightings.
+            </p>
+          )}
+        </div>
         <div>
           <label className={labelCls}>Wait before probing (seconds)</label>
           <input
@@ -2744,16 +2845,60 @@ function VerifyStep({
         </div>
       </div>
 
-      {verifyEnabled && vantage.kind === "appliance" && (
-        <div className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-700 dark:text-amber-300">
-          <strong>Server-vantage probe.</strong> The wake is sent from a Fleet
-          appliance, but v1 verify pings from the control-plane server
-          regardless of the wake vantage. If the server can&apos;t reach the
-          target segment directly, a live host reads as{" "}
-          <span className="font-mono">down</span> (a false negative) — never a
-          false wake. Appliance-vantage verify is a tracked follow-up.
-        </div>
-      )}
+      <label
+        className={cn(
+          "flex items-start gap-2 text-sm",
+          !verifyEnabled && "pointer-events-none opacity-50",
+        )}
+      >
+        <input
+          type="checkbox"
+          className="mt-0.5"
+          disabled={!verifyEnabled}
+          checked={verifyAlertEnabled}
+          onChange={(e) => setVerifyAlertEnabled(e.target.checked)}
+        />
+        <span>
+          Alert when a wake fails
+          <span className="mt-0.5 block text-[11px] font-normal text-muted-foreground">
+            Opens one alert for this schedule (not one per host, and not one per
+            run) when a finished run leaves hosts that never came up and they
+            are still not visible on the network. Resolves itself once they are
+            seen, or after a clean run. Requires the{" "}
+            <span className="font-mono">Wake-on-LAN verify failed</span> rule to
+            be enabled under Administration → Alerts, where it ships switched
+            off.
+          </span>
+        </span>
+      </label>
+
+      {verifyEnabled &&
+        vantage.kind === "appliance" &&
+        verifyMethod !== "seen" && (
+          <div className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-700 dark:text-amber-300">
+            <strong>Active probes run from the server.</strong> The wake is sent
+            from a Fleet appliance, but ping and TCP always probe from the
+            control-plane server regardless of the wake vantage. If the server
+            can&apos;t reach the target segment directly, a live host reads as{" "}
+            <span className="font-mono">down</span> (a false negative) — never a
+            false wake.{" "}
+            {verifyMethod === "auto" ? (
+              <>
+                Because you picked <span className="font-mono">auto</span>, such
+                a host can still be rescued by a{" "}
+                <span className="font-mono">seen</span> sighting, which needs no
+                route to the segment.
+              </>
+            ) : (
+              <>
+                Consider <span className="font-mono">auto</span> or{" "}
+                <span className="font-mono">seen</span>, which confirm hosts via
+                sightings recorded by other subsystems and need no route to the
+                segment.
+              </>
+            )}
+          </div>
+        )}
     </div>
   );
 }

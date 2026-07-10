@@ -35,6 +35,7 @@ import {
   ShieldQuestion,
   ScrollText,
   BellRing,
+  Bird,
   Sparkles,
   Boxes,
   Cloud,
@@ -621,6 +622,9 @@ export function Sidebar({
       : []),
     ...(moduleEnabled("integrations.opnsense")
       ? [{ label: "OPNsense", icon: ShieldCheck, to: "/opnsense" }]
+      : []),
+    ...(moduleEnabled("integrations.netbird")
+      ? [{ label: "NetBird", icon: Bird, to: "/netbird" }]
       : []),
     ...(moduleEnabled("integrations.proxmox")
       ? [{ label: "Proxmox", icon: HardDrive, to: "/proxmox" }]

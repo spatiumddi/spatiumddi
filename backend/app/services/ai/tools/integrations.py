@@ -31,6 +31,7 @@ from app.models.auth import User
 from app.models.cloud import CloudEndpoint
 from app.models.docker import DockerHost
 from app.models.kubernetes import KubernetesCluster
+from app.models.netbird import NetbirdInstance
 from app.models.opnsense import OPNsenseRouter
 from app.models.proxmox import ProxmoxNode
 from app.models.tailscale import TailscaleTenant
@@ -281,6 +282,63 @@ async def list_tailscale_targets(
     if args.enabled is not None:
         stmt = stmt.where(TailscaleTenant.enabled.is_(args.enabled))
     stmt = stmt.order_by(TailscaleTenant.name.asc()).limit(args.limit)
+    rows = (await db.execute(stmt)).scalars().all()
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        last_synced = getattr(r, "last_synced_at", None)
+        out.append(
+            {
+                "id": str(r.id),
+                "name": r.name,
+                "description": getattr(r, "description", "") or "",
+                "enabled": r.enabled,
+                "ipam_space_id": (
+                    str(r.ipam_space_id) if getattr(r, "ipam_space_id", None) else None
+                ),
+                "sync_interval_seconds": getattr(r, "sync_interval_seconds", None),
+                "last_synced_at": last_synced.isoformat() if last_synced else None,
+            }
+        )
+    return out
+
+
+# ── list_netbird_targets ──────────────────────────────────────────────
+
+
+class ListNetbirdTargetsArgs(BaseModel):
+    search: str | None = _common_target_args()["search"]
+    enabled: bool | None = _common_target_args()["enabled"]
+    limit: int = _common_target_args()["limit"]
+
+
+@register_tool(
+    name="list_netbird_targets",
+    module="integrations.netbird",
+    description=(
+        "List configured NetBird instances (mesh deployments) that "
+        "SpatiumDDI mirrors into IPAM. Each row carries id, name, "
+        "description, enabled flag, ipam_space_id, sync_interval_seconds, "
+        "and last_synced_at. Use for 'which NetBird meshes are connected?' "
+        "or 'is NetBird syncing?'. API tokens never appear."
+    ),
+    args_model=ListNetbirdTargetsArgs,
+    category="integrations",
+)
+async def list_netbird_targets(
+    db: AsyncSession, user: User, args: ListNetbirdTargetsArgs
+) -> list[dict[str, Any]]:
+    stmt = select(NetbirdInstance)
+    if args.search:
+        like = f"%{args.search.lower()}%"
+        stmt = stmt.where(
+            or_(
+                func.lower(NetbirdInstance.name).like(like),
+                func.lower(NetbirdInstance.description).like(like),
+            )
+        )
+    if args.enabled is not None:
+        stmt = stmt.where(NetbirdInstance.enabled.is_(args.enabled))
+    stmt = stmt.order_by(NetbirdInstance.name.asc()).limit(args.limit)
     rows = (await db.execute(stmt)).scalars().all()
     out: list[dict[str, Any]] = []
     for r in rows:

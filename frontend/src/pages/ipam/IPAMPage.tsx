@@ -95,6 +95,7 @@ import {
   handleApprovalQueued,
 } from "@/lib/approvalQueue";
 import { copyToClipboard } from "@/lib/clipboard";
+import { hostnameError } from "@/lib/dnsNames";
 import { cn, swatchTintCls, zebraBodyCls } from "@/lib/utils";
 import { StatusTag } from "@/components/ui/status-tag";
 import { SwatchPicker } from "@/components/ui/swatch-picker";
@@ -3293,10 +3294,10 @@ function AddAddressModal({
         setError(null);
         return;
       }
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? "Failed to allocate address";
-      setError(typeof msg === "string" ? msg : JSON.stringify(msg));
+      // Use the shared unwrapper so a FastAPI 422 validation body (a
+      // ``detail: [{msg, loc, …}]`` array) renders as its readable message
+      // instead of raw JSON (e.g. a rejected hostname).
+      setError(formatApiError(err, "Failed to allocate address"));
     },
   });
 
@@ -3307,8 +3308,13 @@ function AddAddressModal({
     setPendingWarnings(null);
   }, [hostname, mac, dnsZoneId, address]);
 
+  // Hostname is required here; only surface the inline reason once the
+  // operator has typed something (empty is already blocked by canSubmit).
+  const hostnameErr = hostname.trim() ? hostnameError(hostname) : null;
+
   const canSubmit =
     !!hostname.trim() &&
+    !hostnameErr &&
     (mode === "next" ? !!nextPreview?.address : !!address && !typedDynamicPool);
 
   // Compute preview FQDN
@@ -3434,6 +3440,9 @@ function AddAddressModal({
             placeholder="Required"
             autoFocus={mode === "next"}
           />
+          {hostnameErr && (
+            <p className="mt-1 text-xs text-destructive">{hostnameErr}</p>
+          )}
         </Field>
         {/* DNS zone selector — only shown when zones are available */}
         {availableZones.length > 0 && (
@@ -8592,10 +8601,9 @@ function EditAddressModal({
         setError(null);
         return;
       }
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? "Failed to save";
-      setError(typeof msg === "string" ? msg : JSON.stringify(msg));
+      // Shared unwrapper so a FastAPI 422 body renders its readable message
+      // (e.g. a rejected hostname) instead of raw JSON.
+      setError(formatApiError(err, "Failed to save"));
     },
   });
 
@@ -8603,6 +8611,10 @@ function EditAddressModal({
   useEffect(() => {
     setPendingWarnings(null);
   }, [hostname, macAddress, dnsZoneId]);
+
+  // Hostname is optional on edit (clearing it is allowed) — only validate
+  // when non-empty.
+  const hostnameErr = hostname.trim() ? hostnameError(hostname) : null;
 
   // ── Tabs ────────────────────────────────────────────────────────────
   // EditAddressModal is also the "IP detail panel" surface — the
@@ -8676,6 +8688,9 @@ function EditAddressModal({
             placeholder="Optional"
             autoFocus
           />
+          {hostnameErr && (
+            <p className="mt-1 text-xs text-destructive">{hostnameErr}</p>
+          )}
         </Field>
         {/* DNS zone — only shown when zones are available */}
         {availableZones.length > 0 && (
@@ -8891,7 +8906,7 @@ function EditAddressModal({
               setError(null);
               mutation.mutate(pendingWarnings != null);
             }}
-            disabled={mutation.isPending}
+            disabled={mutation.isPending || !!hostnameErr}
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             {mutation.isPending

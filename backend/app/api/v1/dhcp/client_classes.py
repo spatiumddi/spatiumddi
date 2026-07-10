@@ -12,6 +12,7 @@ from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.v1.dhcp._audit import write_audit
+from app.api.v1.dhcp.scopes import validate_domain_options
 from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
 from app.models.dhcp import DHCPClientClass, DHCPServerGroup
@@ -72,6 +73,7 @@ async def create_class(
     )
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=409, detail="A client class with that name exists")
+    validate_domain_options(body.options or {})  # #597 — domain-name/domain-search FQDNs
     cc = DHCPClientClass(group_id=group_id, **body.model_dump())
     db.add(cc)
     await db.flush()
@@ -98,6 +100,9 @@ async def update_class(
     if cc is None:
         raise HTTPException(status_code=404, detail="Client class not found")
     changes = body.model_dump(exclude_none=True)
+    if "options" in changes:
+        # Validate only changed domain options (#597) vs the stored value.
+        validate_domain_options(changes["options"], previous=cc.options or {})
     for k, v in changes.items():
         setattr(cc, k, v)
     write_audit(

@@ -67,19 +67,19 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: python3 scripts/lint_appliance_runners.py
 
-  # The ~1900-test suite is DB-bound, so we fan it out across 4 parallel
+  # The ~1900-test suite is DB-bound, so we fan it out across 8 parallel
   # jobs (free concurrent runners) via pytest-split; each job still runs
-  # ``-n auto`` (4 xdist workers on a 4-vCPU runner) → ~16-way parallelism
-  # total, taking the wall-clock from ~18 min to ~5 min. Coverage is no
+  # ``-n auto`` (4 xdist workers on a 4-vCPU runner) → ~32-way parallelism
+  # total, taking the wall-clock from ~18 min to ~3 min. Coverage is no
   # longer collected on the PR gate (it was a non-gating ``continue-on-error``
   # upload anyway and added ~15-30% tracing overhead on every run).
   backend-test-shard:
-    name: Backend — Tests (shard ${{ matrix.shard }}/4)
+    name: Backend — Tests (shard ${{ matrix.shard }}/8)
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
     defaults:
       run:
         working-directory: backend
@@ -126,7 +126,7 @@ jobs:
           DATABASE_URL: postgresql+asyncpg://spatiumddi:test@localhost:5432/spatiumddi_test
         run: alembic upgrade head
 
-      - name: Run tests (shard ${{ matrix.shard }} of 4)
+      - name: Run tests (shard ${{ matrix.shard }} of 8)
         env:
           DATABASE_URL: postgresql+asyncpg://spatiumddi:test@localhost:5432/spatiumddi_test
           # conftest reads its own TEST_DATABASE_URL (defaults to "changeme")
@@ -135,11 +135,11 @@ jobs:
           CELERY_BROKER_URL: redis://localhost:6379/1
           CELERY_RESULT_BACKEND: redis://localhost:6379/2
           SECRET_KEY: ci-test-secret-key-not-for-production
-        # ``--splits 4 --group N`` (pytest-split) selects this shard's slice
+        # ``--splits 8 --group N`` (pytest-split) selects this shard's slice
         # of the suite (even split by test count when no .test_durations file
         # is present); ``-n auto`` then runs that slice across the runner's
         # 4 vCPUs, each xdist worker on its own ``spatiumddi_test_gw<N>`` DB.
-        run: python -m pytest -n auto --splits 4 --group ${{ matrix.shard }}
+        run: python -m pytest -n auto --splits 8 --group ${{ matrix.shard }}
 
   # Required-status-check aggregator: branch protection gates on the stable
   # name "Backend — Tests"; this job passes only if every shard did. Keep
@@ -157,7 +157,7 @@ jobs:
             echo "::error::backend test shards did not all pass (result=$result)"
             exit 1
           fi
-          echo "all 4 backend test shards passed"
+          echo "all 8 backend test shards passed"
 
   # ── Frontend ───────────────────────────────────────────────────────────────
   frontend-lint:

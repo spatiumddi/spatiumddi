@@ -1750,12 +1750,22 @@ export const ipamApi = {
   /** Wake-on-LAN (#533) — send a magic packet to this IP's MAC. The
    *  broadcast target is derived server-side from the IP's subnet. Omit
    *  the vantage to send from the control plane; pass an appliance target
-   *  to originate the packet on that appliance's segment. */
+   *  to originate the packet on that appliance's segment.
+   *
+   *  Pass `verify: true` (#596) to arm a post-wake liveness check: after
+   *  `verifyWaitSeconds` the server probes the host with `verifyMethod` and
+   *  re-wakes it up to `verifyRetries` times. The attempt is recorded as an
+   *  `adhoc` run in Wake Schedules → History. Requires the
+   *  `tools.wake_scheduler` module (422 otherwise). */
   wakeAddress: (
     id: string,
     opts?: {
       port?: number;
       target?: { kind: "server" | "appliance"; id?: string };
+      verify?: boolean;
+      verifyWaitSeconds?: number;
+      verifyRetries?: number;
+      verifyMethod?: WolVerifyMethod;
     },
   ) =>
     api
@@ -1769,6 +1779,10 @@ export const ipamApi = {
       }>(`/ipam/addresses/${id}/wake`, {
         port: opts?.port ?? 9,
         target: opts?.target ?? null,
+        verify: opts?.verify ?? false,
+        verify_wait_seconds: opts?.verifyWaitSeconds ?? 60,
+        verify_retries: opts?.verifyRetries ?? 1,
+        verify_method: opts?.verifyMethod ?? "auto",
       })
       .then((r) => r.data),
   /** Fetch the passive DHCP fingerprint joined to this IP's MAC.
@@ -3235,6 +3249,7 @@ export interface PlatformSettings {
   integration_unifi_enabled: boolean;
   integration_cloud_enabled: boolean;
   integration_opnsense_enabled: boolean;
+  integration_netbird_enabled: boolean;
   /** Domain WHOIS refresh cadence (hours). Beat ticks hourly; the
    *  task itself reads this on every fire so cadence changes take
    *  effect on the next tick without restarting beat. 1–168 h range
@@ -8264,7 +8279,8 @@ export type IntegrationDashboardKind =
   | "tailscale"
   | "unifi"
   | "cloud"
-  | "opnsense";
+  | "opnsense"
+  | "netbird";
 export interface IntegrationsDashboardTargetRow {
   id: string;
   display: string;
@@ -11604,6 +11620,90 @@ export const tailscaleApi = {
         status: string;
         task_id: string;
       }>(`/tailscale/tenants/${id}/sync`)
+      .then((r) => r.data),
+};
+
+export interface NetbirdInstance {
+  id: string;
+  name: string;
+  description: string;
+  enabled: boolean;
+  api_url: string;
+  verify_tls: boolean;
+  api_key_present: boolean;
+  ipam_space_id: string;
+  dns_group_id: string | null;
+  network_cidr: string;
+  skip_expired: boolean;
+  sync_interval_seconds: number;
+  last_synced_at: string | null;
+  last_sync_error: string | null;
+  dns_domain: string | null;
+  peer_count: number | null;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface NetbirdInstanceCreate {
+  name: string;
+  description?: string;
+  enabled?: boolean;
+  api_url?: string;
+  verify_tls?: boolean;
+  api_key: string;
+  ipam_space_id: string;
+  dns_group_id?: string | null;
+  network_cidr?: string;
+  skip_expired?: boolean;
+  sync_interval_seconds?: number;
+}
+
+export interface NetbirdInstanceUpdate {
+  name?: string;
+  description?: string;
+  enabled?: boolean;
+  api_url?: string;
+  verify_tls?: boolean;
+  api_key?: string;
+  ipam_space_id?: string;
+  dns_group_id?: string | null;
+  network_cidr?: string;
+  skip_expired?: boolean;
+  sync_interval_seconds?: number;
+}
+
+export interface NetbirdTestResult {
+  ok: boolean;
+  message: string;
+  dns_domain: string | null;
+  peer_count: number | null;
+}
+
+export const netbirdApi = {
+  listInstances: () =>
+    api.get<NetbirdInstance[]>("/netbird/instances").then((r) => r.data),
+  createInstance: (data: NetbirdInstanceCreate) =>
+    api.post<NetbirdInstance>("/netbird/instances", data).then((r) => r.data),
+  updateInstance: (id: string, data: NetbirdInstanceUpdate) =>
+    api
+      .put<NetbirdInstance>(`/netbird/instances/${id}`, data)
+      .then((r) => r.data),
+  deleteInstance: (id: string) => api.delete(`/netbird/instances/${id}`),
+  testConnection: (body: {
+    instance_id?: string;
+    api_url?: string;
+    verify_tls?: boolean;
+    api_key?: string;
+  }) =>
+    api
+      .post<NetbirdTestResult>("/netbird/instances/test", body)
+      .then((r) => r.data),
+  syncNow: (id: string) =>
+    api
+      .post<{
+        status: string;
+        task_id: string;
+      }>(`/netbird/instances/${id}/sync`)
       .then((r) => r.data),
 };
 
@@ -15267,6 +15367,32 @@ export interface WolVantage {
   id: string | null;
 }
 
+/**
+ * Post-wake liveness source (issue #596).
+ *
+ * - `ping` — ICMP echo from the control plane. Hosts behind a default Windows
+ *   firewall read as down.
+ * - `tcp` — connect-or-RST on a small port set; a refused connection still
+ *   proves the host is up, so this survives an ICMP-blocking host firewall.
+ * - `seen` — no traffic at all: was the host observed on the network *after*
+ *   the wake fired, per `IPAddress.last_seen_at`. Works for segments the
+ *   control plane cannot reach.
+ * - `auto` — ping → tcp → seen, stopping at the first confirmation.
+ */
+export type WolVerifyMethod = "ping" | "tcp" | "seen" | "auto";
+
+/** One entry in a target's post-wake evidence trail (#596). `observed_at` is a
+ *  structured ISO timestamp of when the evidence was observed: for an active
+ *  probe, when we checked; for a confirmed passive `seen` entry, the sighting
+ *  time itself. `detail` is intentionally timestamp-free, so the UI can format
+ *  `observed_at`. */
+export interface WolVerifyEvidence {
+  source: string;
+  up: boolean;
+  detail: string;
+  observed_at: string;
+}
+
 export interface WolSchedule {
   id: string;
   name: string;
@@ -15290,14 +15416,18 @@ export interface WolSchedule {
   port: number;
   /**
    * Post-wake liveness verify + retry (Phase 3). When ``verify_enabled``, a
-   * chained task probes each SENT host (server-vantage ping) after
-   * ``verify_wait_seconds`` and re-wakes non-responders up to ``verify_retries``
-   * extra passes. ``verify_method`` is ``"ping"`` in v1.
+   * chained task probes each SENT host after ``verify_wait_seconds`` and
+   * re-wakes non-responders up to ``verify_retries`` extra passes.
+   * ``verify_method`` picks the liveness source (issue #596) — see
+   * ``WolVerifyMethod``.
    */
   verify_enabled: boolean;
   verify_wait_seconds: number;
   verify_retries: number;
-  verify_method: string;
+  /** Per-schedule mute for the `wol_wake_failed` alert (#596). The alert rule's
+   *  own enabled flag is the master switch; this silences one noisy schedule. */
+  verify_alert_enabled: boolean;
+  verify_method: WolVerifyMethod;
   last_run_at: string | null;
   last_run_status: string | null;
   last_run_skip_reason: string | null;
@@ -15335,7 +15465,8 @@ export interface WolScheduleCreate {
   verify_enabled?: boolean;
   verify_wait_seconds?: number;
   verify_retries?: number;
-  verify_method?: "ping";
+  verify_alert_enabled?: boolean;
+  verify_method?: WolVerifyMethod;
 }
 
 /**
@@ -15365,7 +15496,8 @@ export interface WolScheduleUpdate {
   verify_enabled?: boolean;
   verify_wait_seconds?: number;
   verify_retries?: number;
-  verify_method?: "ping";
+  verify_alert_enabled?: boolean;
+  verify_method?: WolVerifyMethod;
 }
 
 /** A host that WOULD be sent a magic packet (preview). */
@@ -15460,6 +15592,10 @@ export interface WolRunTarget {
   verified: boolean | null;
   verified_at: string | null;
   verify_method: string | null;
+  /** Ordered trail of every liveness source consulted on the final verify pass
+   *  (#596). `null` when no source could run against the row, or for rows
+   *  written before the trail shipped. */
+  verify_evidence: WolVerifyEvidence[] | null;
   wake_attempts: number;
   created_at: string;
 }

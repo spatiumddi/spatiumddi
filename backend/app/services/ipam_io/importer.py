@@ -32,6 +32,7 @@ from fastapi import HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.dns_names import validate_hostname
 from app.models.audit import AuditLog
 from app.models.ipam import IP_STATUSES, IPAddress, IPBlock, IPSpace, Subnet
 from app.services.ipam.resize import _total_ips
@@ -695,7 +696,13 @@ def _row_address_fields(
     if (h := row.get("hostname")) is not None:
         h = str(h).strip() or None
         if h:
-            fields["hostname"] = h
+            # Validate as an RFC 1123 host name (issue #597). A malformed
+            # hostname skips just this row with a clear reason, matching the
+            # per-row error contract above (import never hard-fails a batch).
+            try:
+                fields["hostname"] = validate_hostname(h)
+            except ValueError as exc:
+                return None, {}, str(exc)
     if (m := row.get("mac_address")) is not None:
         m = str(m).strip() or None
         if m:

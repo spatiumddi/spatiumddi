@@ -13,12 +13,14 @@ The ``reload_config``/``reload_zone`` methods here are surface for the agent.
 from __future__ import annotations
 
 import base64
+import dataclasses
 from pathlib import Path
 from typing import Any
 
 import structlog
 from jinja2 import Environment, FileSystemLoader, StrictUndefined, select_autoescape
 
+from app.core.dns_names import strip_control_chars
 from app.drivers.dns.base import (
     ConfigBundle,
     DNSDriver,
@@ -62,7 +64,12 @@ def _render_record(zone: ZoneData, r: RecordData) -> str:
     name = "@" if r.name in ("@", "", zone.name.rstrip(".")) else r.name
     ttl = f"{r.ttl} " if r.ttl is not None else ""
     rtype = r.record_type.upper()
-    value = r.value
+    # Render-boundary neutralizer (issue #597): strip control characters /
+    # newlines from the owner + rdata so a value that slipped past the field
+    # validators (importer, legacy row) can't inject a second record line.
+    # Spaces / quotes survive, so structured rdata renders intact.
+    name = strip_control_chars(name)
+    value = strip_control_chars(r.value)
 
     if rtype == "TXT":
         rdata = _quote_txt(value)
@@ -142,6 +149,16 @@ class BIND9Driver(DNSDriver):
     def render_zone_file(self, zone: ZoneData, records: list[RecordData]) -> str:
         env = _env()
         tmpl = env.get_template("zone.file.j2")
+        # Neutralize control chars in the SOA fields (issue #597 review): the
+        # template interpolates ``primary_ns`` + ``admin_email`` raw into the
+        # SOA line, so a newline in either would inject a record the same way
+        # an unescaped owner/rdata would. ``_render_record`` already guards the
+        # record lines; this closes the SOA line one altitude up.
+        zone = dataclasses.replace(
+            zone,
+            primary_ns=strip_control_chars(zone.primary_ns),
+            admin_email=strip_control_chars(zone.admin_email),
+        )
         return tmpl.render(
             zone=zone,
             records=records,
@@ -155,7 +172,9 @@ class BIND9Driver(DNSDriver):
         rendered: list[str] = []
         excluded = {d.lower() for d in blocklist.exceptions}
         for e in blocklist.entries:
-            dom = e.domain.lower().rstrip(".")
+            # Feed-sourced domains are untrusted; neutralize control chars
+            # so a malformed feed entry can't inject a zone-file line (#597).
+            dom = strip_control_chars(e.domain.lower().rstrip("."))
             if dom in excluded:
                 continue
             rpz_name = f"*.{dom}" if e.is_wildcard else dom

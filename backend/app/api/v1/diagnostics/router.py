@@ -21,6 +21,7 @@ from app.api.deps import DB, CurrentUser
 from app.core.permissions import is_effective_superadmin
 from app.models.auth import User
 from app.models.diagnostics import InternalError
+from app.services.dns_names_report import scan_name_conformance
 
 router = APIRouter()
 
@@ -234,3 +235,19 @@ async def delete_error(
         raise HTTPException(status_code=404, detail="error not found")
     await db.delete(row)
     await db.commit()
+
+
+@router.get("/name-conformance")
+async def name_conformance(
+    db: DB,
+    current_user: CurrentUser,
+) -> dict[str, Any]:
+    """Report existing names that the #597 DNS-name validators would reject.
+
+    Read-only. The validators reject non-conforming names on write, but
+    pre-existing rows are left untouched — this surfaces them (IPAM
+    hostnames, DNS record owners, DNS zone names, DHCP static hostnames)
+    so an operator can fix them deliberately. Nothing is mutated.
+    """
+    _require_superadmin(current_user)
+    return await scan_name_conformance(db)

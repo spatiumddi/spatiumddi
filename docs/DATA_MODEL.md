@@ -304,7 +304,8 @@ core. Files:
 [`circuit.py`](../backend/app/models/circuit.py),
 [`network_service.py`](../backend/app/models/network_service.py),
 [`overlay.py`](../backend/app/models/overlay.py),
-[`network.py`](../backend/app/models/network.py).
+[`network.py`](../backend/app/models/network.py),
+[`bgp_looking_glass.py`](../backend/app/models/bgp_looking_glass.py).
 
 | Model | Table | Notes |
 |---|---|---|
@@ -312,6 +313,9 @@ core. Files:
 | `ASNRpkiRoa` | `asn_rpki_roa` | RPKI ROAs pulled per-ASN |
 | `BGPPeering` | `bgp_peering` | peer / customer / provider / sibling relationships |
 | `BGPCommunity` | `bgp_community` | well-known + per-AS community catalog |
+| `LookingGlassCollector` | `looking_glass_collector` | BGP Looking Glass — receive-only GoBGP collector daemon (#566); agent-registered like `DNSServer`; `appliance_id` (`CASCADE`) |
+| `BGPLGPeer` | `bgp_lg_peer` | configured receive-only BGP session; `collector_id` (`CASCADE`); Fernet TCP-MD5 (`md5_password_encrypted`); `max_prefixes` cap + collector-reported runtime state (`session_state` / `down_since`) |
+| `BGPLGRoute` | `bgp_lg_route` | learned Adj-RIB-In route; absence-reconcile sets `withdrawn_at` (never hard-delete); identity `(peer, prefix, next_hop, route_distinguisher)`; `matched_*_id` IPAM/ASN/VRF links (`SET NULL`); `rpki_status` |
 | `VRF` | `vrf` | routing/forwarding domain; optional `asn_id` (`SET NULL`) |
 | `Domain` | `domain` | registered domain (registrar / expiry / NS / DNSSEC) — distinct from `DNSZone` |
 | `Customer` | `customer` | logical owner; soft-deletable |
@@ -418,7 +422,7 @@ File: [`appliance.py`](../backend/app/models/appliance.py). Deployment:
 
 | Model | Table | Notes |
 |---|---|---|
-| `Appliance` | `appliance` | one row per supervisor; `public_key_fingerprint` unique; `pending_approval` → `approved` / `rejected`; `role_health` JSONB |
+| `Appliance` | `appliance` | one row per supervisor; `public_key_fingerprint` unique; `pending_approval` → `approved` / `rejected`; `role_health` JSONB; `firewall_state` JSONB (`{}` = healthy; set when the supervisor refuses a firewall drop-in that would partition a live etcd member — #593); `cluster_join_state_at` timestamp gating the `clear-cluster-state` escape hatch (#590) |
 | `ApplianceCA` | `appliance_ca` | internal CA (RSA root) for signing supervisor certs |
 | `ApplianceCertificate` | `appliance_certificate` | Web UI TLS cert storage + deploy state |
 | `ApplianceUpgradeImage` | `appliance_upgrade_image` | uploaded A/B slot image metadata |
@@ -520,6 +524,8 @@ OBSERVABILITY.md, not these tables.
 | `AIProvider` / `AIChatSession` / `AIChatMessage` | `ai.py` | Operator Copilot LLM provider + chat history |
 | `OUIVendor` | `oui_vendor` | `oui.py` | MAC OUI → vendor lookup table |
 | `NmapScan` / `PacketCapture` | `nmap.py` / `pcap.py` | on-demand scan / capture job rows |
+| `WolSchedule` / `WolRun` / `WolRunTarget` | `wol_schedule` / `wol_run` / `wol_run_target` | `wol_schedule.py` | Scheduled Wake-on-LAN (#586) — recurring cron/tag-targeted job + per-fire run history + per-host outcome. `wol_schedule.verify_method` picks the liveness source (`ping` / `tcp` / `seen` / `auto`, #596). `wol_run.verify_params` (JSONB, nullable) is the per-run verify+re-wake config snapshot for ad-hoc runs (`schedule_id IS NULL`, `trigger='adhoc'`), which have no parent schedule row to read it from; NULL on scheduled runs. `wol_schedule.verify_alert_enabled` mutes the `wol_wake_failed` alert per schedule; `wol_run_target.verify_evidence` (JSONB, nullable) is the ordered trail of every liveness source consulted on the final pass |
+| `WolCalendar` / `WolCalendarEvent` | `wol_calendar` / `wol_calendar_event` | `wol_schedule.py` | subscribed iCal/CalDAV calendar (Fernet password) whose flattened all-day spans gate scheduled wakes |
 | `TLSCertTarget` / `TLSCertProbe` | `tls_cert.py` | cert-expiry monitoring targets + probe results |
 | `FirewallPolicy` / `FirewallRule` / `FirewallAlias` / `FirewallApplyState` | `firewall.py` | per-appliance host firewall config |
 | `ACMEAccount` | `acme.py` | ACME DNS-01 *provider* account |

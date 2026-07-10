@@ -42,6 +42,7 @@ from typing import Any
 
 import structlog
 
+from app.core.dns_names import strip_control_chars
 from app.drivers.dns.base import (
     ConfigBundle,
     DNSDriver,
@@ -110,17 +111,21 @@ def _record_content(rr: RecordData) -> str:
     columns from the control plane and stitch them together here.
     """
     rtype = rr.record_type.upper()
+    # Strip control chars from the value first (issue #597) — defense in
+    # depth so a legacy/imported row can't push a raw newline into the
+    # PowerDNS API content.
+    value = strip_control_chars(rr.value)
     if rtype == "TXT":
-        return _quote_txt(rr.value)
+        return _quote_txt(value)
     if rtype == "MX":
         prio = rr.priority if rr.priority is not None else 10
-        return f"{prio} {rr.value}"
+        return f"{prio} {value}"
     if rtype == "SRV":
         prio = rr.priority if rr.priority is not None else 0
         weight = rr.weight if rr.weight is not None else 0
         port = rr.port if rr.port is not None else 0
-        return f"{prio} {weight} {port} {rr.value}"
-    return rr.value
+        return f"{prio} {weight} {port} {value}"
+    return value
 
 
 def _qualified_record_name(zone: ZoneData, rr: RecordData) -> str:
@@ -131,9 +136,10 @@ def _qualified_record_name(zone: ZoneData, rr: RecordData) -> str:
     all three resolve to the zone's apex.
     """
     zone_name = zone.name if zone.name.endswith(".") else zone.name + "."
-    if rr.name in ("", "@") or rr.name == zone_name.rstrip("."):
+    name = strip_control_chars(rr.name)
+    if name in ("", "@") or name == zone_name.rstrip("."):
         return zone_name
-    return f"{rr.name}.{zone_name}"
+    return f"{name}.{zone_name}"
 
 
 def render_pdns_conf(

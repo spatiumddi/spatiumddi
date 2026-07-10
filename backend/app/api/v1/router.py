@@ -49,6 +49,7 @@ from app.api.v1.looking_glass.agents import router as looking_glass_agents_route
 from app.api.v1.looking_glass.router import router as looking_glass_router
 from app.api.v1.metrics import router as metrics_router
 from app.api.v1.multicast import router as multicast_router
+from app.api.v1.netbird import router as netbird_router
 from app.api.v1.netbox_import.router import router as netbox_import_router
 from app.api.v1.network import router as network_router
 from app.api.v1.new_devices import router as new_devices_router
@@ -297,6 +298,12 @@ api_v1_router.include_router(
     prefix="/multicast",
     tags=["multicast"],
     dependencies=[Depends(require_module("network.multicast"))],
+)
+api_v1_router.include_router(
+    netbird_router,
+    prefix="/netbird",
+    tags=["netbird"],
+    dependencies=[Depends(require_module("integrations.netbird"))],
 )
 api_v1_router.include_router(
     netbox_import_router,

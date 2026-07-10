@@ -331,6 +331,7 @@ async def _apply_addresses(
                 row.proxmox_node_id is not None
                 or row.kubernetes_cluster_id is not None
                 or row.docker_host_id is not None
+                or row.netbird_instance_id is not None
             ):
                 summary.warnings.append(
                     f"address {row.address} owned by another integration; not claiming"

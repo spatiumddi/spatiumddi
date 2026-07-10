@@ -60,6 +60,7 @@ components. Grouped by role; license + project URL for each.
 - icalendar (Wake-on-LAN calendar gate — .ics parsing) — BSD 2-Clause — https://github.com/collective/icalendar
 - caldav (Wake-on-LAN calendar gate — CalDAV client) — Apache 2.0 — https://github.com/python-caldav/caldav
 - python-dateutil (recurrence RRULE/RDATE expansion) — Apache 2.0 / BSD 3-Clause — https://github.com/dateutil/dateutil
+- idna (IDNA2008 host/record name normalization — issue #597) — BSD 3-Clause — https://github.com/kjd/idna
 - Scapy (passive DHCP fingerprinting) — GPL v2 — https://scapy.net
 - nmap (network scanning) — NPSL (Nmap Public Source License) — https://nmap.org
 - tcpdump / libpcap (packet capture) — BSD 3-Clause — https://www.tcpdump.org

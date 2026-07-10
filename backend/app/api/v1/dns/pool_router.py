@@ -23,6 +23,7 @@ from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.core.agent_wake import collect_wake, dns_group_channel
+from app.core.dns_names import validate_record_owner
 from app.core.permissions import require_resource_permission
 from app.models.audit import AuditLog
 from app.models.dns import DNSPool, DNSPoolMember, DNSZone
@@ -130,6 +131,13 @@ class PoolWrite(BaseModel):
         if v not in VALID_RECORD_TYPES:
             raise ValueError(f"record_type must be one of {sorted(VALID_RECORD_TYPES)}")
         return v
+
+    @field_validator("record_name")
+    @classmethod
+    def _record_name(cls, v: str) -> str:
+        # A GSLB pool renders A/AAAA rows, so its record name is a DNS owner
+        # within the zone — RFC 2181 rule, permitting ``_`` / apex (issue #597).
+        return validate_record_owner(v, field="record name")
 
     @field_validator("hc_type")
     @classmethod
