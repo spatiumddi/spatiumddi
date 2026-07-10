@@ -146,6 +146,31 @@ _TCP_PROBE_TIMEOUT = 1.0
 # safe here.
 _PROBE_CONCURRENCY = 32
 
+# Human-readable ``detail`` for each active source's evidence entry, keyed
+# [method][up]. The operator's question on a down host is "down according to
+# what?", and these are the answers.
+_ACTIVE_DETAIL: dict[str, dict[bool, str]] = {
+    VERIFY_METHOD_PING: {True: "ICMP reply received", False: "no ICMP reply"},
+    VERIFY_METHOD_TCP: {
+        True: "TCP connected or refused (host answered)",
+        False: "no TCP port connected or refused",
+    },
+}
+
+
+def _evidence(source: str, up: bool, detail: str, observed_at: datetime) -> dict[str, Any]:
+    """One entry in a target's ``verify_evidence`` trail.
+
+    ``observed_at`` is when *we* checked, not when the host was last seen — a
+    sighting timestamp, when there is one, rides in ``detail``.
+    """
+    return {
+        "source": source,
+        "up": up,
+        "detail": detail,
+        "observed_at": observed_at.isoformat(),
+    }
+
 
 def auto_stagger_ms(target_count: int, override: int = 0) -> int:
     """Suggested inter-host stagger (ms) for a resolved wake of ``target_count``.
@@ -228,27 +253,42 @@ async def probe_liveness(
     return up, probe_method
 
 
-async def _seen_since(
+async def _seen_map(
+    db: AsyncSession,
+    ip_address_ids: list[uuid.UUID],
+    since: datetime,
+) -> dict[uuid.UUID, datetime]:
+    """``{ip_address_id: last_seen_at}`` for those observed at/after ``since``.
+
+    One batched query for a whole verify pass — never a per-row ``db.get``. Rows
+    whose ``last_seen_at`` is NULL (never observed) or older than the wake are
+    simply absent. The timestamps feed the per-target evidence trail; callers who
+    only need membership use :func:`seen_since`.
+    """
+    if not ip_address_ids:
+        return {}
+    rows = await db.execute(
+        select(IPAddress.id, IPAddress.last_seen_at).where(
+            IPAddress.id.in_(ip_address_ids),
+            IPAddress.last_seen_at.is_not(None),
+            IPAddress.last_seen_at >= since,
+        )
+    )
+    return {row[0]: row[1] for row in rows.all()}
+
+
+async def seen_since(
     db: AsyncSession,
     ip_address_ids: list[uuid.UUID],
     since: datetime,
 ) -> set[uuid.UUID]:
     """The subset of ``ip_address_ids`` observed on the network at/after ``since``.
 
-    One batched query for a whole verify pass — never a per-row ``db.get``. Rows
-    whose ``last_seen_at`` is NULL (never observed) or older than the wake are
-    simply absent from the result.
+    Public because the ``wol_wake_failed`` alert matcher re-runs this same passive
+    check on every evaluator tick, so an alert auto-resolves as stragglers boot and
+    some other subsystem records the sighting.
     """
-    if not ip_address_ids:
-        return set()
-    rows = await db.execute(
-        select(IPAddress.id).where(
-            IPAddress.id.in_(ip_address_ids),
-            IPAddress.last_seen_at.is_not(None),
-            IPAddress.last_seen_at >= since,
-        )
-    )
-    return set(rows.scalars().all())
+    return set(await _seen_map(db, ip_address_ids, since))
 
 
 async def probe_seen(
@@ -277,7 +317,7 @@ async def probe_seen(
     """
     if ip_address_id is None:
         return None
-    return ip_address_id in await _seen_since(db, [ip_address_id], since)
+    return ip_address_id in await seen_since(db, [ip_address_id], since)
 
 
 async def verify_run_targets(
@@ -320,6 +360,11 @@ async def verify_run_targets(
        :func:`app.services.ipam.discovery.reconcile_subnet`. A **passive** UP
        never re-stamps (the sighting is already recorded by its real source), and
        a DOWN verdict proves nothing about liveness, so neither touches Seen.
+    5. Record ``verify_evidence`` — the ordered trail of every source consulted
+       on this pass, with each source's verdict and a human-readable detail. It
+       answers the operator's real question about a down host: *down according to
+       what?* A pass that re-probes a row overwrites the trail, so it always
+       describes the most recent verdict.
 
     Returns the down set (``verified = False`` this pass) — the caller's re-wake
     candidates. Because the chain is first-UP-wins, a richer ``method`` can only
@@ -364,16 +409,26 @@ async def verify_run_targets(
     # Fan out the active probes (network-bound); no DB access inside the gather.
     sem = asyncio.Semaphore(_PROBE_CONCURRENCY)
 
-    async def _probe_active(row: WolRunTarget) -> tuple[WolRunTarget, bool, str | None]:
-        """Walk the row's active chain, short-circuiting on the first UP."""
+    async def _probe_active(
+        row: WolRunTarget,
+    ) -> tuple[WolRunTarget, bool, str | None, list[dict[str, Any]]]:
+        """Walk the row's active chain, short-circuiting on the first UP.
+
+        Returns ``(row, up, last_source_tried, evidence_trail)``. The trail holds
+        one entry per source actually consulted — so a short-circuit on ping
+        records only ping, and the operator can tell "we never needed TCP" apart
+        from "TCP said nothing".
+        """
+        trail: list[dict[str, Any]] = []
         if not row.address or not active_chain:
-            return row, False, None
+            return row, False, None, trail
         async with sem:
             for m in active_chain:
                 up, used = await probe_liveness(row.address, run_vantage_of(row), method=m)
+                trail.append(_evidence(used, up, _ACTIVE_DETAIL[used][up], now))
                 if up:
-                    return row, True, used
-        return row, False, active_chain[-1]
+                    return row, True, used, trail
+        return row, False, active_chain[-1], trail
 
     results = await asyncio.gather(*(_probe_active(r) for r in probeable))
 
@@ -382,24 +437,25 @@ async def verify_run_targets(
     # if every host answered an active probe we never issue the query at all. One
     # batched statement for the whole down set, never a per-row read. Anchored to
     # the wake instant so a pre-wake sighting can't confirm this run (probe_seen).
-    seen_ids: set[Any] = set()
+    seen_at: dict[Any, datetime] = {}
     if passive:
         unconfirmed = [
             row.ip_address_id
-            for row, up, _tried in results
+            for row, up, _tried, _trail in results
             if not up and row.ip_address_id is not None
         ]
         if unconfirmed:
-            seen_ids = await _seen_since(db, unconfirmed, run.started_at)
+            seen_at = await _seen_map(db, unconfirmed, run.started_at)
 
     non_responders: list[WolRunTarget] = []
     # ip_address_id → winning ACTIVE method, for the Seen re-stamp below.
     active_up: dict[Any, str] = {}
-    for row, up, tried in results:
+    for row, up, tried, trail in results:
         if up and tried is not None:
             row.verified = True
             row.verified_at = now
             row.verify_method = tried
+            row.verify_evidence = trail or None
             if row.ip_address_id is not None:
                 active_up[row.ip_address_id] = tried
             continue
@@ -408,9 +464,23 @@ async def verify_run_targets(
         # never condemn: an abstention (no IPAM row) falls through to whatever the
         # active chain already concluded.
         if passive and row.ip_address_id is not None:
-            row.verified = row.ip_address_id in seen_ids
+            sighting = seen_at.get(row.ip_address_id)
+            row.verified = sighting is not None
             row.verified_at = now
             row.verify_method = VERIFY_METHOD_SEEN
+            trail.append(
+                _evidence(
+                    VERIFY_METHOD_SEEN,
+                    sighting is not None,
+                    (
+                        f"last seen {sighting.isoformat()}"
+                        if sighting is not None
+                        else "no sighting since the wake"
+                    ),
+                    now,
+                )
+            )
+            row.verify_evidence = trail
             if not row.verified:
                 non_responders.append(row)
             continue
@@ -420,8 +490,10 @@ async def verify_run_targets(
             row.verified = False
             row.verified_at = now
             row.verify_method = tried
+            row.verify_evidence = trail or None
             non_responders.append(row)
-        # else: nothing could run against this row — leave verified = NULL.
+        # else: nothing could run against this row — leave verified = NULL and
+        # verify_evidence untouched (no source ran, so there is nothing to record).
 
     # Batch-stamp the Seen infra on every ACTIVE responder's IPAddress in one
     # query (never per-row db.get). Passive confirmations are excluded by
@@ -470,6 +542,7 @@ __all__ = [
     "auto_stagger_ms",
     "probe_liveness",
     "probe_seen",
+    "seen_since",
     "verify_run_targets",
     "run_vantage_of",
 ]

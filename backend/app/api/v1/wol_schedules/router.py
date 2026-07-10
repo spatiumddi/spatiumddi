@@ -121,6 +121,7 @@ _NON_NULLABLE_FIELDS = frozenset(
         "verify_enabled",
         "verify_wait_seconds",
         "verify_retries",
+        "verify_alert_enabled",
         "verify_method",
     }
 )
@@ -154,6 +155,7 @@ def _to_schedule_read(row: WolSchedule) -> WakeScheduleRead:
         verify_enabled=row.verify_enabled,
         verify_wait_seconds=row.verify_wait_seconds,
         verify_retries=row.verify_retries,
+        verify_alert_enabled=row.verify_alert_enabled,
         verify_method=row.verify_method,
         last_run_at=row.last_run_at,
         last_run_status=row.last_run_status,
@@ -235,6 +237,7 @@ def _to_run_target_read(row: WolRunTarget) -> WakeRunTargetRead:
         verified=row.verified,
         verified_at=row.verified_at,
         verify_method=row.verify_method,
+        verify_evidence=row.verify_evidence,
         wake_attempts=row.wake_attempts,
         created_at=row.created_at,
     )
@@ -432,6 +435,7 @@ async def create_schedule(
         verify_enabled=body.verify_enabled,
         verify_wait_seconds=body.verify_wait_seconds,
         verify_retries=body.verify_retries,
+        verify_alert_enabled=body.verify_alert_enabled,
         verify_method=body.verify_method,
         created_by_user_id=current_user.id,
     )

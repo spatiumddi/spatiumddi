@@ -52,6 +52,16 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base
 
+# ``wol_run.verify_state`` lifecycle values. Terminal is ``done``. Declared on the
+# model (not the Celery task that drives the machine) so readers outside the task
+# — the alert evaluator, the MCP tools — can key on them without importing the
+# Celery bootstrap. ``app.tasks.wol_scheduler`` re-exports these under its own
+# VERIFY_* names.
+VERIFY_STATE_NONE = "none"  # verify off / never scheduled
+VERIFY_STATE_PENDING = "pending"  # a pass is enqueued, awaiting its atomic claim
+VERIFY_STATE_VERIFYING = "verifying"  # a pass holds the run's verify mutex
+VERIFY_STATE_DONE = "done"  # finalised (all up, or retries exhausted)
+
 
 class WolSchedule(Base):
     """A recurring (or manual-only) Wake-on-LAN job."""
@@ -150,6 +160,12 @@ class WolSchedule(Base):
     )
     # 'ping'-only in v1 (kept as a column so a future TCP/agent method needs
     # no migration).
+    # Per-schedule mute for the ``wol_wake_failed`` alert (#596 Phase 2). The
+    # rule's own ``enabled`` flag is the master switch; this silences one noisy
+    # schedule without turning the rule off fleet-wide.
+    verify_alert_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=text("true")
+    )
     verify_method: Mapped[str] = mapped_column(
         String(16), nullable=False, default="ping", server_default=text("'ping'")
     )
@@ -465,8 +481,14 @@ class WolRunTarget(Base):
     # DOWN (a re-wake candidate) · True == probed and UP.
     verified: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    # 'ping' (server vantage) in v1 — records how the target was probed.
+    # Which source SETTLED the verdict — ping | tcp | seen (never the ``auto``
+    # keyword). NULL when no source could run against this row.
     verify_method: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # Ordered trail of every source consulted on the final pass (#596 Phase 3):
+    # [{source, up, detail, observed_at}]. Answers "down according to what?".
+    # NULL on rows written before the trail shipped, and on rows no source ran
+    # against.
+    verify_evidence: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB, nullable=True)
     # 1 == original dispatch; each re-wake pass bumps it.
     wake_attempts: Mapped[int] = mapped_column(
         Integer, nullable=False, default=1, server_default="1"

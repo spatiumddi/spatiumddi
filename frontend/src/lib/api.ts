@@ -15295,6 +15295,16 @@ export interface WolVantage {
  */
 export type WolVerifyMethod = "ping" | "tcp" | "seen" | "auto";
 
+/** One entry in a target's post-wake evidence trail (#596). `observed_at` is
+ *  when we checked, not when the host was last seen — a sighting timestamp,
+ *  when there is one, rides in `detail`. */
+export interface WolVerifyEvidence {
+  source: string;
+  up: boolean;
+  detail: string;
+  observed_at: string;
+}
+
 export interface WolSchedule {
   id: string;
   name: string;
@@ -15326,6 +15336,9 @@ export interface WolSchedule {
   verify_enabled: boolean;
   verify_wait_seconds: number;
   verify_retries: number;
+  /** Per-schedule mute for the `wol_wake_failed` alert (#596). The alert rule's
+   *  own enabled flag is the master switch; this silences one noisy schedule. */
+  verify_alert_enabled: boolean;
   verify_method: string;
   last_run_at: string | null;
   last_run_status: string | null;
@@ -15364,6 +15377,7 @@ export interface WolScheduleCreate {
   verify_enabled?: boolean;
   verify_wait_seconds?: number;
   verify_retries?: number;
+  verify_alert_enabled?: boolean;
   verify_method?: WolVerifyMethod;
 }
 
@@ -15394,6 +15408,7 @@ export interface WolScheduleUpdate {
   verify_enabled?: boolean;
   verify_wait_seconds?: number;
   verify_retries?: number;
+  verify_alert_enabled?: boolean;
   verify_method?: WolVerifyMethod;
 }
 
@@ -15489,6 +15504,10 @@ export interface WolRunTarget {
   verified: boolean | null;
   verified_at: string | null;
   verify_method: string | null;
+  /** Ordered trail of every liveness source consulted on the final verify pass
+   *  (#596). `null` when no source could run against the row, or for rows
+   *  written before the trail shipped. */
+  verify_evidence: WolVerifyEvidence[] | null;
   wake_attempts: number;
   created_at: string;
 }

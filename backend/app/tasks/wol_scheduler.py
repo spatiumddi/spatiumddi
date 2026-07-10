@@ -51,7 +51,15 @@ from app.celery_app import celery_app
 from app.db import task_session
 from app.models.audit import AuditLog
 from app.models.auth import Group, User
-from app.models.wol_schedule import WolRun, WolRunTarget, WolSchedule
+from app.models.wol_schedule import (
+    VERIFY_STATE_DONE,
+    VERIFY_STATE_NONE,
+    VERIFY_STATE_PENDING,
+    VERIFY_STATE_VERIFYING,
+    WolRun,
+    WolRunTarget,
+    WolSchedule,
+)
 from app.services.feature_modules import get_enabled_modules
 from app.services.wol_scheduler.dispatch import dispatch_wol_targets
 from app.services.wol_scheduler.gating import gate_verdict, load_gate_calendar_events
@@ -88,11 +96,13 @@ SKIP_EMPTY_TARGET_SET = "empty_target_set"
 # Post-wake verify state machine (``wol_run.verify_state``). Terminal is
 # ``done``. ``none`` == verify off / never scheduled; ``pending`` == a verify
 # pass is enqueued + awaiting its atomic claim; ``verifying`` == a pass holds
-# the run's verify mutex.
-VERIFY_NONE = "none"
-VERIFY_PENDING = "pending"
-VERIFY_VERIFYING = "verifying"
-VERIFY_DONE = "done"
+# the run's verify mutex. The strings live on the model so readers outside this
+# Celery module (the alert evaluator, MCP tools) can key on them without
+# importing the Celery bootstrap; these aliases keep the task-local names.
+VERIFY_NONE = VERIFY_STATE_NONE
+VERIFY_PENDING = VERIFY_STATE_PENDING
+VERIFY_VERIFYING = VERIFY_STATE_VERIFYING
+VERIFY_DONE = VERIFY_STATE_DONE
 
 # Verify mutex lease. A run whose ``verify_claimed_at`` is older than this is
 # treated as a crash-wedged verify (worker SIGKILL mid-probe, or a ``pending``

@@ -400,6 +400,8 @@ Per-schedule config (all on `wol_schedule`):
   never re-wake.
 - `verify_method` (default `auto` for new schedules; existing rows keep `ping`) —
   which liveness source settles the verdict. See **Liveness sources** below.
+- `verify_alert_enabled` (default `true`) — per-schedule mute for the
+  `wol_wake_failed` alert. See **Alerting on a failed wake** below.
 
 #### Liveness sources (#596)
 
@@ -465,6 +467,43 @@ Read surfaces: `wol_run.verify_state` (`none` → `pending` → `verifying` → 
 up), `verified_at`, `verify_method`, `wake_attempts`. The `find_wol_runs` MCP tool
 surfaces the rollup so the copilot can answer "did last night's wake bring the fleet
 up?" — distinct from "did it send?".
+
+#### Alerting on a failed wake (#596)
+
+A finished verify that gave up used to leave exactly one audit row and page
+nobody. The `wol_wake_failed` alert rule closes that. It is a normal rule on the
+60 s evaluator, so channel delivery, dedupe and auto-resolve come from the shared
+machinery — see [OBSERVABILITY.md §9.1](../OBSERVABILITY.md) for the rule table.
+
+Two decisions worth knowing:
+
+- **The subject is the schedule, not the run.** A 15-minute schedule that fails
+  every fire would otherwise open ~96 events a day. One open event per failing
+  schedule carries the blast-radius rollup (`N of M hosts`, a hostname sample).
+- **It re-checks passively on every tick.** A target counts as still-failed only
+  if `IPAddress.last_seen_at` is *still* older than the run that woke it. So the
+  lab PC that boots twenty minutes late closes its own alert, and an operator is
+  never paged for a host that has since come up. A target with no IPAM row can't
+  be re-checked and keeps the alert open rather than silently resolving.
+
+The rule seeds **disabled** (`rogue_dhcp` precedent) — enable it under
+Administration → Alerts once a schedule arms verify. `verify_alert_enabled` on
+the schedule is the per-schedule mute for a deliberately-noisy lab job.
+
+#### Per-target evidence trail (#596)
+
+`wol_run_target.verify_method` records which source *settled* a host's verdict.
+`verify_evidence` records what every source it consulted actually said — an
+ordered JSONB array of `{source, up, detail, observed_at}`, rendered under each
+host's chip in the run's History drilldown. It answers the operator's real
+question about a down host: *down according to what?* "ICMP timed out, no TCP
+port answered, no sighting since the wake" is a dead box; a short-circuit trail
+that stops at `ping · up` means nothing else was ever needed. `NULL` on rows no
+source could run against, and on rows recorded before the trail shipped.
+
+Two Operator Copilot reads surface the same data: `find_wol_wake_failures` (runs
+whose verify finished with unconfirmed hosts — scheduled *and* ad-hoc, newest
+first) and `count_wol_wake_failures`. Both read-only, both default-enabled.
 
 #### Ad-hoc wake verify (#596)
 

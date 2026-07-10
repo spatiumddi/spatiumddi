@@ -35,7 +35,7 @@ subnet they themselves can't read — even when the schedule owner can.
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -44,7 +44,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.models.auth import Group, User
-from app.models.wol_schedule import WolCalendar, WolCalendarEvent, WolRun, WolSchedule
+from app.models.wol_schedule import (
+    VERIFY_STATE_DONE,
+    WolCalendar,
+    WolCalendarEvent,
+    WolRun,
+    WolSchedule,
+)
 from app.services.ai.operations import (
     CreateWolScheduleArgs,
     RunWolScheduleNowArgs,
@@ -107,6 +113,7 @@ def _schedule_detail(row: WolSchedule) -> dict[str, Any]:
             "verify_enabled": row.verify_enabled,
             "verify_wait_seconds": row.verify_wait_seconds,
             "verify_retries": row.verify_retries,
+            "verify_alert_enabled": row.verify_alert_enabled,
             "created_by_user_id": (str(row.created_by_user_id) if row.created_by_user_id else None),
             "created_at": row.created_at.isoformat(),
             "modified_at": row.modified_at.isoformat(),
@@ -560,6 +567,116 @@ async def find_wol_calendar_events(
         }
         for r in rows
     ]
+
+
+# ── Wake-failure reads (#596 Phase 3) ────────────────────────────────
+
+
+class FindWolWakeFailuresArgs(BaseModel):
+    days: int = Field(
+        default=7,
+        ge=1,
+        le=90,
+        description="Look back this many days over finalised runs.",
+    )
+    schedule_id: str | None = Field(
+        default=None, description="Restrict to one schedule (UUID). Omitted = all."
+    )
+    limit: int = Field(default=50, ge=1, le=200)
+
+
+def _wake_failure_row(run: WolRun, schedule_name: str | None) -> dict[str, Any]:
+    return {
+        "run_id": str(run.id),
+        "schedule_id": str(run.schedule_id) if run.schedule_id else None,
+        "schedule_name": schedule_name,
+        # ``adhoc`` runs have no schedule; they come from the single-host wake
+        # action on an IP. They never raise an alert, so surfacing them here is
+        # the only way the copilot can answer for them.
+        "trigger": run.trigger,
+        "started_at": run.started_at.isoformat(),
+        "sent_count": run.sent_count,
+        "verified_count": run.verified_count,
+        "unverified_count": run.unverified_count,
+    }
+
+
+@register_tool(
+    name="find_wol_wake_failures",
+    description=(
+        "List Wake-on-LAN runs whose post-wake verify finished with hosts that "
+        "never came up (unverified_count > 0), newest first. Covers both "
+        "scheduled and ad-hoc single-host wakes. Answers 'which wakes failed "
+        "this week?', 'did the lab come up on Monday?'. Read-only."
+    ),
+    args_model=FindWolWakeFailuresArgs,
+    category="network",
+    module=_MODULE,
+    # Read-only, no secrets, no off-prem call — default on so operators discover
+    # it exists (non-negotiable #13).
+    default_enabled=True,
+)
+async def find_wol_wake_failures(
+    db: AsyncSession, user: User, args: FindWolWakeFailuresArgs
+) -> list[dict[str, Any]]:
+    cutoff = datetime.now(UTC) - timedelta(days=args.days)
+    stmt = (
+        select(WolRun, WolSchedule.name)
+        .outerjoin(WolSchedule, WolRun.schedule_id == WolSchedule.id)
+        .where(
+            WolRun.verify_state == VERIFY_STATE_DONE,
+            WolRun.unverified_count > 0,
+            WolRun.started_at >= cutoff,
+        )
+        .order_by(WolRun.started_at.desc())
+        .limit(args.limit)
+    )
+    if args.schedule_id:
+        try:
+            stmt = stmt.where(WolRun.schedule_id == uuid.UUID(args.schedule_id))
+        except ValueError:
+            return []
+    rows = (await db.execute(stmt)).all()
+    return [_wake_failure_row(run, name) for run, name in rows]
+
+
+class CountWolWakeFailuresArgs(BaseModel):
+    days: int = Field(default=7, ge=1, le=90)
+
+
+@register_tool(
+    name="count_wol_wake_failures",
+    description=(
+        "Count Wake-on-LAN runs whose verify finished with unconfirmed hosts, "
+        "over the last N days. Returns {runs_with_failures, hosts_unverified, "
+        "runs_verified_clean}. Read-only."
+    ),
+    args_model=CountWolWakeFailuresArgs,
+    category="network",
+    module=_MODULE,
+    default_enabled=True,
+)
+async def count_wol_wake_failures(
+    db: AsyncSession, user: User, args: CountWolWakeFailuresArgs
+) -> dict[str, int]:
+    cutoff = datetime.now(UTC) - timedelta(days=args.days)
+    done = (WolRun.verify_state == VERIFY_STATE_DONE, WolRun.started_at >= cutoff)
+    failing = (
+        await db.execute(
+            select(
+                func.count(WolRun.id),
+                func.coalesce(func.sum(WolRun.unverified_count), 0),
+            ).where(*done, WolRun.unverified_count > 0)
+        )
+    ).one()
+    clean = (
+        await db.execute(select(func.count(WolRun.id)).where(*done, WolRun.unverified_count == 0))
+    ).scalar_one()
+    return {
+        "runs_with_failures": int(failing[0]),
+        "hosts_unverified": int(failing[1]),
+        "runs_verified_clean": int(clean),
+    }
 
 
 # ── Write proposals (propose → operator Apply) ───────────────────────
