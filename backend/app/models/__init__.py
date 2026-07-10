@@ -89,6 +89,7 @@ from app.models.multicast import (
     MulticastGroupPort,
     MulticastMembership,
 )
+from app.models.netbird import NetbirdInstance
 from app.models.network import (
     NetworkArpEntry,
     NetworkDevice,
@@ -218,6 +219,7 @@ __all__ = [
     "DockerHost",
     "Domain",
     "KubernetesCluster",
+    "NetbirdInstance",
     "OPNsenseRouter",
     "ProxmoxNode",
     "SystemUpgradeRun",

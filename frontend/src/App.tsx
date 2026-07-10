@@ -24,6 +24,7 @@ import { DockerPage } from "@/pages/docker/DockerPage";
 import { ProxmoxPage } from "@/pages/proxmox/ProxmoxPage";
 import { OpnsensePage } from "@/pages/opnsense/OpnsensePage";
 import { CloudPage } from "@/pages/cloud/CloudPage";
+import { NetbirdPage } from "@/pages/netbird/NetbirdPage";
 import { TailscalePage } from "@/pages/tailscale/TailscalePage";
 import { UnifiPage } from "@/pages/unifi/UnifiPage";
 import { UnifiControllerDetailPage } from "@/pages/unifi/UnifiControllerDetailPage";
@@ -174,6 +175,7 @@ export default function App() {
         <Route path="proxmox" element={<ProxmoxPage />} />
         <Route path="opnsense" element={<OpnsensePage />} />
         <Route path="cloud" element={<CloudPage />} />
+        <Route path="netbird" element={<NetbirdPage />} />
         <Route path="tailscale" element={<TailscalePage />} />
         <Route path="unifi" element={<UnifiPage />} />
         <Route path="unifi/:id" element={<UnifiControllerDetailPage />} />

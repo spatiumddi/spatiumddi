@@ -43,6 +43,7 @@ celery_app = Celery(
         "app.tasks.proxmox_sync",
         "app.tasks.opnsense_sync",
         "app.tasks.tailscale_sync",
+        "app.tasks.netbird_sync",
         "app.tasks.unifi_sync",
         "app.tasks.cloud_sync",
         "app.tasks.snmp_poll",
@@ -109,6 +110,7 @@ celery_app.conf.update(
         "app.tasks.proxmox_sync.*": {"queue": "default"},
         "app.tasks.opnsense_sync.*": {"queue": "default"},
         "app.tasks.tailscale_sync.*": {"queue": "default"},
+        "app.tasks.netbird_sync.*": {"queue": "default"},
         "app.tasks.unifi_sync.*": {"queue": "default"},
         "app.tasks.cloud_sync.*": {"queue": "default"},
         "app.tasks.snmp_poll.*": {"queue": "default"},
@@ -394,6 +396,12 @@ celery_app.conf.update(
         # Gated overall by ``PlatformSettings.integration_tailscale_enabled``.
         "tailscale-sync-sweep": {
             "task": "app.tasks.tailscale_sync.sweep_tailscale_tenants",
+            "schedule": schedule(run_every=30.0),
+        },
+        # NetBird — same 30 s beat, per-instance interval gate.
+        # Gated overall by ``PlatformSettings.integration_netbird_enabled``.
+        "netbird-sync-sweep": {
+            "task": "app.tasks.netbird_sync.sweep_netbird_instances",
             "schedule": schedule(run_every=30.0),
         },
         # UniFi — same 30 s beat, per-controller interval gate.
