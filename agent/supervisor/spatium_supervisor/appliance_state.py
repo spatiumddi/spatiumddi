@@ -2321,7 +2321,17 @@ def record_firewall_refusal(source: str, reason: str) -> None:
         tmp.write_text(json.dumps(payload), encoding="utf-8")
         tmp.replace(_FIREWALL_REFUSAL_SIDECAR)
     except OSError as exc:
-        log.debug("supervisor.firewall.refusal_persist_failed", error=str(exc))
+        # A genuine write failure here (read-only fs / ENOSPC / a missing
+        # release-state mount) is the one way a self-partition refusal can go
+        # silent on the host-side console reader — the #593 "never silent"
+        # goal. The in-pod heartbeat still surfaces it (same-container
+        # read-back), so this stays best-effort, but warn so the failure is
+        # not buried at debug. (#611)
+        log.warning(
+            "supervisor.firewall.refusal_persist_failed",
+            error=str(exc),
+            path=str(_FIREWALL_REFUSAL_SIDECAR),
+        )
 
 
 def clear_firewall_refusal() -> None:
