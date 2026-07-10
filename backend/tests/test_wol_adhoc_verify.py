@@ -164,9 +164,11 @@ async def test_wake_with_verify_mints_adhoc_run_and_enqueues(
     assert run.verify_claimed_at is not None  # lease stamped → reaper can reclaim
     assert run.triggered_by_user_id is not None  # who woke it survives in History
     # The config the operator asked for, snapshotted onto the run.
-    assert run.verify_params["method"] == "seen"
-    assert run.verify_params["wait_seconds"] == 120
-    assert run.verify_params["retries"] == 2
+    # Keys mirror the WolSchedule column names verbatim (so _verify_run reads
+    # either source with the same key — no snapshot drift).
+    assert run.verify_params["verify_method"] == "seen"
+    assert run.verify_params["verify_wait_seconds"] == 120
+    assert run.verify_params["verify_retries"] == 2
 
     targets = list(
         (await db_session.execute(select(WolRunTarget).where(WolRunTarget.run_id == run.id)))
@@ -260,7 +262,7 @@ async def test_verify_run_reads_verify_params_when_no_schedule(
         sent_count=1,
         verify_state=task.VERIFY_PENDING,
         verify_attempt=1,
-        verify_params={"method": "seen", "wait_seconds": 30, "retries": 0},
+        verify_params={"verify_method": "seen", "verify_wait_seconds": 30, "verify_retries": 0},
     )
     db_session.add(run)
     await db_session.flush()

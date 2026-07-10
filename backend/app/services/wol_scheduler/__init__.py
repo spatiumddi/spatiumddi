@@ -75,7 +75,7 @@ from app.services.wol_scheduler.verify import (
     VERIFY_METHODS,
     auto_stagger_ms,
     probe_liveness,
-    probe_seen,
+    seen_since,
     verify_run_targets,
 )
 
@@ -121,7 +121,7 @@ __all__ = [
     "DispatchOutcome",
     # verify (Phase 3) + multi-source liveness (#596)
     "probe_liveness",
-    "probe_seen",
+    "seen_since",
     "verify_run_targets",
     "auto_stagger_ms",
     "ACTIVE_METHODS",

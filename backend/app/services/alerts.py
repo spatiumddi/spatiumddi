@@ -924,38 +924,73 @@ async def _matching_wol_wake_failed_subjects(
         .scalars()
         .all()
     )
+    if not schedules:
+        return []
+    by_id = {s.id: s for s in schedules}
 
-    matches: list[tuple[str, str, str]] = []
-    for sched in schedules:
-        run = await db.scalar(
-            select(WolRun)
-            .where(
-                WolRun.schedule_id == sched.id,
-                WolRun.verify_state == VERIFY_STATE_DONE,
-                WolRun.started_at >= cutoff,
-            )
-            .order_by(WolRun.started_at.desc())
-            .limit(1)
+    # Latest DONE run per candidate schedule, within the window, in ONE query —
+    # a window function instead of a per-schedule lookup, so the query count
+    # doesn't scale with the schedule count on every 60 s tick. Only the runs
+    # that actually failed (``unverified_count > 0``) then get the target + seen
+    # re-check below, which for a healthy fleet is zero further work.
+    rn = func.row_number().over(
+        partition_by=WolRun.schedule_id,
+        order_by=WolRun.started_at.desc(),
+    )
+    ranked = (
+        select(
+            WolRun.id.label("run_id"),
+            WolRun.schedule_id.label("schedule_id"),
+            WolRun.started_at.label("started_at"),
+            WolRun.sent_count.label("sent_count"),
+            WolRun.unverified_count.label("unverified_count"),
+            rn.label("rn"),
         )
-        if run is None or run.unverified_count <= 0:
-            continue
+        .where(
+            WolRun.schedule_id.in_(list(by_id)),
+            WolRun.verify_state == VERIFY_STATE_DONE,
+            WolRun.started_at >= cutoff,
+        )
+        .subquery()
+    )
+    failing_runs = (
+        await db.execute(
+            select(
+                ranked.c.run_id,
+                ranked.c.schedule_id,
+                ranked.c.started_at,
+                ranked.c.sent_count,
+            ).where(ranked.c.rn == 1, ranked.c.unverified_count > 0)
+        )
+    ).all()
+    if not failing_runs:
+        return []
 
-        unconfirmed = list(
-            (
-                await db.execute(
-                    select(WolRunTarget).where(
-                        WolRunTarget.run_id == run.id,
-                        WolRunTarget.sent.is_(True),
-                        WolRunTarget.verified.is_not(True),
-                    )
+    # All unconfirmed SENT targets across every failing run, in ONE query.
+    targets_by_run: dict[Any, list[WolRunTarget]] = {}
+    all_targets = (
+        (
+            await db.execute(
+                select(WolRunTarget).where(
+                    WolRunTarget.run_id.in_([r.run_id for r in failing_runs]),
+                    WolRunTarget.sent.is_(True),
+                    WolRunTarget.verified.is_not(True),
                 )
             )
-            .scalars()
-            .all()
         )
+        .scalars()
+        .all()
+    )
+    for t in all_targets:
+        targets_by_run.setdefault(t.run_id, []).append(t)
+
+    matches: list[tuple[str, str, str]] = []
+    for run in failing_runs:
+        unconfirmed = targets_by_run.get(run.run_id, [])
         if not unconfirmed:
             continue
-
+        # The seen re-check is per-run (each run's wake instant is its own
+        # anchor), but only for the handful of runs that actually failed.
         seen = await seen_since(
             db,
             [t.ip_address_id for t in unconfirmed if t.ip_address_id is not None],
@@ -967,6 +1002,7 @@ async def _matching_wol_wake_failed_subjects(
         if not still_down:
             continue  # every straggler has since been observed — auto-resolve
 
+        sched = by_id[run.schedule_id]
         sample = ", ".join(
             t.address or "(no address)" for t in still_down[:_WOL_WAKE_FAILED_SAMPLE]
         )

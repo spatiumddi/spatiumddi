@@ -39,7 +39,12 @@ from app.api.deps import DB, CurrentUser
 from app.api.v1.dhcp._audit import write_audit
 from app.core.permissions import require_permission
 from app.models.ipam import IPAddress
-from app.models.wol_schedule import WolRun, WolRunTarget
+from app.models.wol_schedule import (
+    STATUS_OK,
+    VERIFY_STATE_PENDING,
+    WolRun,
+    WolRunTarget,
+)
 from app.services import wol
 from app.services.feature_modules import is_module_enabled
 from app.services.nettools.schemas import NetToolTarget
@@ -168,23 +173,26 @@ async def _arm_adhoc_verify(
     verify reaper reclaims it rather than leaving it wedged.
     """
     now = datetime.now(UTC)
-    vantage = {"kind": target.kind, "id": str(target.id) if target.id else None}
+    vantage = wol.vantage_to_jsonb(target)
     run = WolRun(
         schedule_id=None,
         trigger="adhoc",
-        status="ok",
+        status=STATUS_OK,
         started_at=now,
         finished_at=now,
         target_count=1,
         sent_count=1,
-        verify_state="pending",
+        verify_state=VERIFY_STATE_PENDING,
         verify_attempt=1,
         verify_claimed_at=now,
         # The sole source of verify + re-wake config for a schedule-less run.
+        # Keys are the WolSchedule attribute names verbatim, so _verify_run reads
+        # either source with the same key and a snapshot can't silently drift from
+        # the column it mirrors (see _cfg in tasks/wol_scheduler.py).
         verify_params={
-            "method": body.verify_method,
-            "wait_seconds": body.verify_wait_seconds,
-            "retries": body.verify_retries,
+            "verify_method": body.verify_method,
+            "verify_wait_seconds": body.verify_wait_seconds,
+            "verify_retries": body.verify_retries,
             "vantage": vantage,
             "port": wire.port,
             # One packet, no burst: an ad-hoc wake is a deliberate single action.

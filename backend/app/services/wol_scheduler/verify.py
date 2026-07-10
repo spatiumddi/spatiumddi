@@ -10,10 +10,11 @@ pure-ish building blocks that task orchestrates:
 * :func:`probe_liveness` — is a host up, per an **active** probe (``ping`` or
   ``tcp``)? Returns ``(up, method_used)``. Never raises: a probe error / missing
   binary / timeout is a ``down`` verdict, never an aborted verify pass.
-* :func:`probe_seen` — the **passive** probe. Was this host observed on the
-  network *since the wake fired*? Reads ``IPAddress.last_seen_at`` — the column
-  the SNMP ARP/FDB cross-reference, DHCP lease pulls, nmap, ping/ARP discovery
-  and passive L2 fingerprinting all already stamp. Emits no traffic.
+* :func:`seen_since` — the **passive** check. Which of these hosts were observed
+  on the network *since the wake fired*? Reads ``IPAddress.last_seen_at`` — the
+  column the SNMP ARP/FDB cross-reference, DHCP lease pulls, nmap, ping/ARP
+  discovery and passive L2 fingerprinting all already stamp. Emits no traffic.
+  Batched (one query per pass); the ``wol_wake_failed`` alert matcher reuses it.
 * :func:`verify_run_targets` — probe the still-unverified SENT targets of a run
   under the schedule's ``verify_method``, stamp their ``wol_run_target`` verify
   columns, stamp the Seen infra (``IPAddress.last_seen_at`` /
@@ -46,8 +47,8 @@ asserts "down", because "no sighting" is equally consistent with "the SNMP
 poller hasn't run yet". This is what makes ``auto`` safe to default to: a
 passive source can shrink the down set but never grow it.
 
-**The wake anchor kills the stale-cache false-up.** ``probe_seen`` compares
-against ``run.started_at``, so a sighting recorded *before* the magic packet
+**The wake anchor kills the stale-cache false-up.** The passive check compares
+``last_seen_at`` against ``run.started_at``, so a sighting recorded *before* the magic packet
 went out — a week-old ARP entry, a lease from yesterday — can never be mistaken
 for evidence that *this wake* worked. Only a sighting strictly after the wake
 counts, and it is precisely that sighting the operator would have looked for by
@@ -81,7 +82,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from app.models.ipam import IPAddress
 from app.models.wol_schedule import WolRunTarget
@@ -158,11 +159,25 @@ _ACTIVE_DETAIL: dict[str, dict[bool, str]] = {
 }
 
 
+def _active_detail(method: str, up: bool) -> str:
+    """Detail string for an active probe's evidence entry — never raises.
+
+    A method absent from :data:`_ACTIVE_DETAIL` (a new active source added to
+    ``_METHOD_CHAINS`` without a matching entry) falls back to a generic phrasing
+    rather than a ``KeyError`` inside the gathered probe coroutine, which — being
+    outside ``verify_run_targets``'s error handling — would otherwise wedge the
+    run pending↔verifying until the retry bound.
+    """
+    return _ACTIVE_DETAIL.get(method, {}).get(up, "host answered" if up else "no response")
+
+
 def _evidence(source: str, up: bool, detail: str, observed_at: datetime) -> dict[str, Any]:
     """One entry in a target's ``verify_evidence`` trail.
 
-    ``observed_at`` is when *we* checked, not when the host was last seen — a
-    sighting timestamp, when there is one, rides in ``detail``.
+    ``observed_at`` is when the evidence was observed: for an active probe, when
+    *we* checked; for a passive ``seen`` confirmation, the sighting time itself
+    (the observation *is* the sighting). Kept structured so the UI can format /
+    localize it — the ``detail`` string never embeds a timestamp.
     """
     return {
         "source": source,
@@ -228,7 +243,7 @@ async def probe_liveness(
 
     A passive method (or any unknown value) falls back to ``ping`` rather than
     raising — passive sources are not probed here, they go through
-    :func:`probe_seen`. A missing binary, a timeout, or *any* exception is a
+    :func:`seen_since`. A missing binary, a timeout, or *any* exception is a
     ``down`` verdict: this function NEVER raises, so one un-probeable host can't
     abort a verify pass over a fleet.
 
@@ -289,35 +304,6 @@ async def seen_since(
     some other subsystem records the sighting.
     """
     return set(await _seen_map(db, ip_address_ids, since))
-
-
-async def probe_seen(
-    db: AsyncSession,
-    ip_address_id: uuid.UUID | None,
-    since: datetime,
-) -> bool | None:
-    """The **passive** probe: was this IP observed on the network since ``since``?
-
-    Reads ``IPAddress.last_seen_at``, which is stamped today by the SNMP ARP/FDB
-    cross-reference, DHCP lease pulls, nmap, ping/ARP discovery, and the DHCP
-    agent's passive L2 fingerprinting. Emits no traffic and needs no route to the
-    target's segment, which is what lets it verify a host the worker cannot reach.
-
-    Returns:
-        * ``True`` — observed at/after ``since`` (i.e. after the wake fired).
-        * ``False`` — the IP row exists but carries no sighting since the wake.
-        * ``None`` — **abstain**. ``ip_address_id`` is NULL (the IPAM row was
-          deleted; the FK is ``ON DELETE SET NULL``), so there is nothing to read.
-          An abstention is not a "down" verdict — the caller must not treat it as
-          evidence either way.
-
-    Callers must pass the **wake anchor** (``run.started_at``) as ``since``, not a
-    rolling window: a sighting from before the magic packet went out says nothing
-    about whether the wake worked.
-    """
-    if ip_address_id is None:
-        return None
-    return ip_address_id in await seen_since(db, [ip_address_id], since)
 
 
 async def verify_run_targets(
@@ -425,7 +411,7 @@ async def verify_run_targets(
         async with sem:
             for m in active_chain:
                 up, used = await probe_liveness(row.address, run_vantage_of(row), method=m)
-                trail.append(_evidence(used, up, _ACTIVE_DETAIL[used][up], now))
+                trail.append(_evidence(used, up, _active_detail(used, up), now))
                 if up:
                     return row, True, used, trail
         return row, False, active_chain[-1], trail
@@ -436,7 +422,7 @@ async def verify_run_targets(
     # so the session is single-threaded again) and genuinely short-circuiting —
     # if every host answered an active probe we never issue the query at all. One
     # batched statement for the whole down set, never a per-row read. Anchored to
-    # the wake instant so a pre-wake sighting can't confirm this run (probe_seen).
+    # the wake instant so a pre-wake sighting can't confirm this run (seen_since).
     seen_at: dict[Any, datetime] = {}
     if passive:
         unconfirmed = [
@@ -468,16 +454,19 @@ async def verify_run_targets(
             row.verified = sighting is not None
             row.verified_at = now
             row.verify_method = VERIFY_METHOD_SEEN
+            # For a confirmed sighting the observation IS the sighting, so
+            # ``observed_at`` carries the real last-seen time (structured, so the
+            # UI can format it); a miss records when we checked (now).
             trail.append(
                 _evidence(
                     VERIFY_METHOD_SEEN,
                     sighting is not None,
                     (
-                        f"last seen {sighting.isoformat()}"
+                        "seen on the network since the wake"
                         if sighting is not None
                         else "no sighting since the wake"
                     ),
-                    now,
+                    sighting if sighting is not None else now,
                 )
             )
             row.verify_evidence = trail
@@ -495,18 +484,32 @@ async def verify_run_targets(
         # else: nothing could run against this row — leave verified = NULL and
         # verify_evidence untouched (no source ran, so there is nothing to record).
 
-    # Batch-stamp the Seen infra on every ACTIVE responder's IPAddress in one
-    # query (never per-row db.get). Passive confirmations are excluded by
-    # construction: their sighting is already on the row.
+    # Batch-stamp the Seen infra on every ACTIVE responder's IPAddress. Passive
+    # confirmations are excluded by construction: their sighting is already on the
+    # row. Two guards against a stale write:
+    #   * ``stamp`` is captured fresh HERE, after the (possibly multi-minute)
+    #     probe fan-out, not the pass-start ``now`` — so it reflects when the host
+    #     actually answered, not when the pass began.
+    #   * the UPDATE only ADVANCES last_seen_at (``last_seen_at IS NULL OR <
+    #     stamp``), so a fresher sighting a concurrent poller committed mid-fan-out
+    #     is never clobbered backwards. Guarding in SQL (not on loaded rows) keeps
+    #     it correct against a commit that landed after our SELECT snapshot.
+    # Grouped by winning method (≤ 2: ping / tcp) so last_seen_method stays
+    # consistent with the timestamp it's written beside.
     if active_up:
-        ip_rows = (
-            (await db.execute(select(IPAddress).where(IPAddress.id.in_(list(active_up)))))
-            .scalars()
-            .all()
-        )
-        for ip_row in ip_rows:
-            ip_row.last_seen_at = now
-            ip_row.last_seen_method = active_up[ip_row.id]
+        stamp = datetime.now(UTC)
+        by_method: dict[str, list[Any]] = {}
+        for ip_id, m in active_up.items():
+            by_method.setdefault(m, []).append(ip_id)
+        for m, ip_ids in by_method.items():
+            await db.execute(
+                update(IPAddress)
+                .where(
+                    IPAddress.id.in_(ip_ids),
+                    (IPAddress.last_seen_at.is_(None)) | (IPAddress.last_seen_at < stamp),
+                )
+                .values(last_seen_at=stamp, last_seen_method=m)
+            )
 
     logger.info(
         "wol_verify_pass",
@@ -541,7 +544,6 @@ __all__ = [
     "VERIFY_METHOD_TCP",
     "auto_stagger_ms",
     "probe_liveness",
-    "probe_seen",
     "seen_since",
     "verify_run_targets",
     "run_vantage_of",

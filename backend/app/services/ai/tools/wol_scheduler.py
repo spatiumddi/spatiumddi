@@ -275,7 +275,14 @@ class FindWolRunsArgs(BaseModel):
         default=None,
         description="Filter by status: ok / partial / skipped / failed / in_progress.",
     )
-    trigger: str | None = Field(default=None, description="Filter by trigger: schedule / manual.")
+    trigger: str | None = Field(
+        default=None,
+        description=(
+            "Filter by trigger: 'schedule' (a cron/calendar fire), 'manual' "
+            "(run-now), or 'adhoc' (a single-host wake from the IPAM address "
+            "action that opted into verify)."
+        ),
+    )
     limit: int = Field(default=50, ge=1, le=500)
 
 
@@ -660,22 +667,26 @@ async def count_wol_wake_failures(
     db: AsyncSession, user: User, args: CountWolWakeFailuresArgs
 ) -> dict[str, int]:
     cutoff = datetime.now(UTC) - timedelta(days=args.days)
-    done = (WolRun.verify_state == VERIFY_STATE_DONE, WolRun.started_at >= cutoff)
-    failing = (
+    # One scan of the finalised-runs window with filtered aggregates, rather than
+    # two passes sharing the same WHERE (mirrors _finalise_verify's rollup).
+    row = (
         await db.execute(
             select(
-                func.count(WolRun.id),
-                func.coalesce(func.sum(WolRun.unverified_count), 0),
-            ).where(*done, WolRun.unverified_count > 0)
+                func.count(WolRun.id).filter(WolRun.unverified_count > 0),
+                func.coalesce(
+                    func.sum(WolRun.unverified_count).filter(WolRun.unverified_count > 0), 0
+                ),
+                func.count(WolRun.id).filter(WolRun.unverified_count == 0),
+            ).where(
+                WolRun.verify_state == VERIFY_STATE_DONE,
+                WolRun.started_at >= cutoff,
+            )
         )
     ).one()
-    clean = (
-        await db.execute(select(func.count(WolRun.id)).where(*done, WolRun.unverified_count == 0))
-    ).scalar_one()
     return {
-        "runs_with_failures": int(failing[0]),
-        "hosts_unverified": int(failing[1]),
-        "runs_verified_clean": int(clean),
+        "runs_with_failures": int(row[0]),
+        "hosts_unverified": int(row[1]),
+        "runs_verified_clean": int(row[2]),
     }
 
 

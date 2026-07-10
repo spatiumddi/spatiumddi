@@ -237,12 +237,22 @@ async def test_muted_schedule_never_matches(db_session: AsyncSession) -> None:
     assert await _matching_wol_wake_failed_subjects(db_session, rule) == []
 
 
-async def test_adhoc_run_never_matches(db_session: AsyncSession) -> None:
-    """An ad-hoc run has no schedule subject, so it cannot open an event."""
+async def test_adhoc_failure_does_not_leak_onto_a_real_schedule(
+    db_session: AsyncSession,
+) -> None:
+    """An ad-hoc run has no schedule subject, so it cannot open an event — and it
+    must not leak onto an unrelated verify-enabled schedule either. A CLEAN
+    schedule is present so the matcher's per-schedule loop body actually runs; a
+    regression broadening the inner filter to include schedule_id IS NULL runs
+    would surface as this clean schedule matching, which the assertion forbids."""
     ip = await _ip(db_session)
-    await _finalised_run(db_session, None, ip=ip, verified=False, trigger="adhoc")
+    clean_sched = await _schedule(db_session)
+    await _finalised_run(db_session, clean_sched, ip=ip, verified=True)  # clean → no match
+    await _finalised_run(db_session, None, ip=ip, verified=False, trigger="adhoc")  # failing adhoc
     rule = await _rule(db_session)
 
+    # The adhoc failure is invisible to the matcher, and it did NOT attach to the
+    # clean schedule.
     assert await _matching_wol_wake_failed_subjects(db_session, rule) == []
 
 
@@ -415,7 +425,11 @@ async def test_seen_confirmation_records_the_sighting_time(
     trail = target.verify_evidence
     assert [e["source"] for e in trail] == ["seen"]
     assert trail[0]["up"] is True
-    assert sighting.isoformat() in trail[0]["detail"]
+    # The sighting time is a structured field, not baked into the prose, so the
+    # UI can format it; detail stays timestamp-free.
+    assert trail[0]["observed_at"] == sighting.isoformat()
+    assert "seen on the network" in trail[0]["detail"]
+    assert sighting.isoformat() not in trail[0]["detail"]
 
 
 # ══════════════════════════════════════════════════════════════════════

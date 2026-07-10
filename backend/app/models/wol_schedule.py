@@ -62,6 +62,14 @@ VERIFY_STATE_PENDING = "pending"  # a pass is enqueued, awaiting its atomic clai
 VERIFY_STATE_VERIFYING = "verifying"  # a pass holds the run's verify mutex
 VERIFY_STATE_DONE = "done"  # finalised (all up, or retries exhausted)
 
+# ``wol_run.status`` values. On the model (not just the Celery task) so the
+# ad-hoc IPAM wake can stamp a run without importing the Celery bootstrap.
+STATUS_OK = "ok"
+STATUS_PARTIAL = "partial"
+STATUS_SKIPPED = "skipped"
+STATUS_FAILED = "failed"
+STATUS_IN_PROGRESS = "in_progress"
+
 
 class WolSchedule(Base):
     """A recurring (or manual-only) Wake-on-LAN job."""

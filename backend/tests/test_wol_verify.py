@@ -44,7 +44,7 @@ from app.models.wol_schedule import WolRun, WolRunTarget, WolSchedule
 from app.services.wol_scheduler.verify import (
     auto_stagger_ms,
     probe_liveness,
-    probe_seen,
+    seen_since,
     verify_run_targets,
 )
 
@@ -551,12 +551,15 @@ async def test_run_wol_schedule_no_verify_when_disabled(db_session: AsyncSession
 # ══════════════════════════════════════════════════════════════════════
 #
 # The verify state machine has no ``status==in_progress`` row for the Phase-1
-# lease reaper to catch, so ``_sweep`` folds in a verify reaper that reclaims
-# any run whose ``verify_claimed_at`` lease is older than
-# ``VERIFY_CLAIM_LEASE_SECONDS`` — for BOTH a wedged ``verifying`` (worker
-# SIGKILL mid-probe) and the narrower ``pending`` hole (``apply_async`` raised
-# at the arm / re-wake enqueue so the committed ``pending`` row has no task).
-# Neither may stay wedged forever.
+# lease reaper to catch, so ``_sweep`` folds in a verify reaper that reclaims a
+# run whose ``verify_claimed_at`` lease has expired — with TWO leases (#596): a
+# wedged ``verifying`` (worker SIGKILL mid-probe) on the short
+# ``VERIFY_CLAIM_LEASE_SECONDS``, and the narrower ``pending`` hole
+# (``apply_async`` raised at the arm / re-wake enqueue) on the LONGER
+# ``VERIFY_PENDING_LEASE_SECONDS`` — because a ``pending`` run may legitimately be
+# counting down up to the 3600 s max wait, and reaping it on the short lease would
+# re-fire the probe early. Neither may stay wedged forever; neither may be cut
+# short.
 
 
 async def _seed_stale_verify(
@@ -618,8 +621,15 @@ async def test_sweep_reclaims_stale_verifying_run(db_session: AsyncSession) -> N
 
 async def test_sweep_reclaims_stale_pending_orphan(db_session: AsyncSession) -> None:
     # The narrower hole: a committed 'pending' row whose enqueue raised (no task
-    # scheduled) with an expired lease. The reaper reclaims it the same way.
-    run = await _seed_stale_verify(db_session, verify_state=task.VERIFY_PENDING, attempt=1)
+    # scheduled). A 'pending' run is reclaimed on the LONGER lease (a legit
+    # countdown may run up to the 3600 s max wait), so it must be aged past
+    # VERIFY_PENDING_LEASE_SECONDS, not merely past the 'verifying' lease.
+    run = await _seed_stale_verify(
+        db_session,
+        verify_state=task.VERIFY_PENDING,
+        attempt=1,
+        age_seconds=task.VERIFY_PENDING_LEASE_SECONDS + 60,
+    )
     run_id = run.id
     stale_claimed_at = run.verify_claimed_at
 
@@ -660,6 +670,35 @@ async def test_sweep_does_not_reclaim_fresh_verifying_run(db_session: AsyncSessi
     fresh = await db_session.get(WolRun, run_id)
     assert fresh is not None
     assert fresh.verify_state == task.VERIFY_VERIFYING  # untouched
+
+
+async def test_sweep_does_not_reclaim_pending_within_countdown(
+    db_session: AsyncSession,
+) -> None:
+    # #596 regression guard: a 'pending' run configured with a long
+    # verify_wait_seconds is still counting down its enqueued task. Aged past the
+    # short 'verifying' lease but within the longer 'pending' lease, it must NOT
+    # be reclaimed — else the probe re-fires ~30 min early and a slow-booting host
+    # reads as a false 'down' (and pages via wol_wake_failed).
+    run = await _seed_stale_verify(
+        db_session,
+        verify_state=task.VERIFY_PENDING,
+        attempt=1,
+        age_seconds=task.VERIFY_CLAIM_LEASE_SECONDS + 60,  # past 'verifying', within 'pending'
+    )
+    run_id = run.id
+
+    reenqueue = MagicMock()
+    with patch.object(task.verify_wol_run, "apply_async", reenqueue):
+        result = await task._sweep()
+
+    assert result["verify_reclaimed"] == 0
+    reenqueue.assert_not_called()
+    await db_session.rollback()
+    db_session.expire_all()
+    fresh = await db_session.get(WolRun, run_id)
+    assert fresh is not None
+    assert fresh.verify_state == task.VERIFY_PENDING  # untouched, still counting down
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -807,12 +846,9 @@ async def test_probe_passive_method_falls_back_to_ping() -> None:
     assert method == "ping"
 
 
-async def test_probe_seen_abstains_on_null_ip(db_session: AsyncSession) -> None:
-    """FK SET NULL left no IPAM row to read — abstain, don't condemn."""
-    assert await probe_seen(db_session, None, datetime.now(UTC)) is None
-
-
-async def test_probe_seen_true_only_for_post_wake_sighting(db_session: AsyncSession) -> None:
+async def test_seen_since_is_wake_anchored(db_session: AsyncSession) -> None:
+    """seen_since returns only IPs observed AT/AFTER the anchor — a pre-wake
+    sighting (stale cache) never counts, and 'never seen' is absent."""
     subnet = await _subnet(db_session)
     wake = datetime.now(UTC)
     ip = IPAddress(
@@ -823,18 +859,21 @@ async def test_probe_seen_true_only_for_post_wake_sighting(db_session: AsyncSess
     )
     db_session.add(ip)
     await db_session.flush()
-    assert await probe_seen(db_session, ip.id, wake) is True
+    assert await seen_since(db_session, [ip.id], wake) == {ip.id}
 
     # The stale-cache false-up: a sighting from BEFORE the magic packet went out
     # says nothing about whether this wake worked.
     ip.last_seen_at = wake - timedelta(minutes=10)
     await db_session.flush()
-    assert await probe_seen(db_session, ip.id, wake) is False
+    assert await seen_since(db_session, [ip.id], wake) == set()
 
     # Never observed at all.
     ip.last_seen_at = None
     await db_session.flush()
-    assert await probe_seen(db_session, ip.id, wake) is False
+    assert await seen_since(db_session, [ip.id], wake) == set()
+
+    # Empty input is a no-op (never a query for zero ids).
+    assert await seen_since(db_session, [], wake) == set()
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -938,7 +977,10 @@ async def test_auto_short_circuits_on_first_up(db_session: AsyncSession) -> None
     assert target.verified is True
     assert target.verify_method == "tcp"
     assert calls == [("10.20.0.11", "ping"), ("10.20.0.11", "tcp")]
-    # An ACTIVE up DOES stamp Seen, with the winning method.
+    # An ACTIVE up DOES stamp Seen, with the winning method. Seen is written via a
+    # Core UPDATE (only-advance guard), so reload the row rather than reading the
+    # stale identity-map instance.
+    await db_session.refresh(ip)
     assert ip.last_seen_at is not None
     assert ip.last_seen_at > run.started_at
     assert ip.last_seen_method == "tcp"

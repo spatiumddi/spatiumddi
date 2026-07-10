@@ -44,7 +44,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 import structlog
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.orm import selectinload
 
 from app.celery_app import celery_app
@@ -52,6 +52,11 @@ from app.db import task_session
 from app.models.audit import AuditLog
 from app.models.auth import Group, User
 from app.models.wol_schedule import (
+    STATUS_FAILED,
+    STATUS_IN_PROGRESS,
+    STATUS_OK,
+    STATUS_PARTIAL,
+    STATUS_SKIPPED,
     VERIFY_STATE_DONE,
     VERIFY_STATE_NONE,
     VERIFY_STATE_PENDING,
@@ -83,12 +88,8 @@ logger = structlog.get_logger(__name__)
 # Feature-module id gating the whole surface (non-negotiable #14).
 MODULE_ID = "tools.wake_scheduler"
 
-# Run + schedule status enum.
-STATUS_OK = "ok"
-STATUS_PARTIAL = "partial"
-STATUS_SKIPPED = "skipped"
-STATUS_FAILED = "failed"
-STATUS_IN_PROGRESS = "in_progress"
+# Run + schedule status enum (STATUS_* imported from the model above, so the
+# ad-hoc IPAM wake can stamp a run status without the Celery bootstrap).
 
 # Run-level (gate) skip reasons stored on ``wol_run.skip_reason``.
 SKIP_EMPTY_TARGET_SET = "empty_target_set"
@@ -104,14 +105,24 @@ VERIFY_PENDING = VERIFY_STATE_PENDING
 VERIFY_VERIFYING = VERIFY_STATE_VERIFYING
 VERIFY_DONE = VERIFY_STATE_DONE
 
-# Verify mutex lease. A run whose ``verify_claimed_at`` is older than this is
-# treated as a crash-wedged verify (worker SIGKILL mid-probe, or a ``pending``
-# hole from a failed enqueue) and is reclaimed by the sweep's verify reaper —
-# the verify-machine analogue of ``CLAIM_LEASE_SECONDS``. Set comfortably above a
-# worst-case probe window PLUS the inter-pass ``verify_wait_seconds`` countdown so
-# a legitimately in-flight (or countdown-pending) pass is never reaped out from
-# under itself.
+# Verify mutex lease — the ``verifying`` case. A run stuck in ``verifying`` past
+# this is a crash-wedged probe pass (worker SIGKILL mid-probe) and is reclaimed
+# by the sweep's verify reaper. 30 min sits comfortably above a worst-case probe
+# window (a 512-host fleet fanned out at ``_PROBE_CONCURRENCY``), so a genuinely
+# in-flight pass is never reaped out from under itself.
 VERIFY_CLAIM_LEASE_SECONDS = 30 * 60
+
+# Verify lease — the ``pending`` case, deliberately LONGER. A ``pending`` run is
+# not wedged: it is waiting ``verify_wait_seconds`` (capped at 3600 in the API
+# schema) for its already-enqueued task to fire. Reaping it on the shorter
+# ``verifying`` lease would re-fire the probe up to ~30 min early — before a
+# slow-booting host has finished POSTing — yielding a false ``down`` verdict and,
+# once #596's ``wol_wake_failed`` alert is enabled, a spurious page. So the
+# ``pending`` reaper only fires past the MAX possible countdown plus a margin for
+# broker/scheduling delay; beyond that a ``pending`` run really is a failed-enqueue
+# hole worth reclaiming. Keep ``> 3600`` in lockstep with the schema's
+# ``verify_wait_seconds`` ``le=3600`` bound.
+VERIFY_PENDING_LEASE_SECONDS = 3600 + 10 * 60
 
 # System audit actor for beat-fired runs (mirrors the backup runner).
 SYSTEM_ACTOR_DISPLAY = "system (schedule)"
@@ -825,24 +836,27 @@ async def _verify_run(run_id: uuid.UUID | str, attempt: int) -> dict[str, Any]:
             #   2. ``run.verify_params`` (ad-hoc runs, #596 Phase 1b) — an
             #      ephemeral run has no parent schedule to read;
             #   3. the model defaults (a schedule deleted mid-flight).
-            # ``method`` falls back to ``ping`` rather than the ``auto`` default
-            # new schedules get: an orphaned run should finish the way it
+            # ``verify_params`` keys are the ``WolSchedule`` attribute names
+            # verbatim, so the same ``attr`` reads either source — a snapshot key
+            # can't silently drift from the column it mirrors.
+            # ``verify_method`` falls back to ``ping`` rather than the ``auto``
+            # default new schedules get: an orphaned run should finish the way it
             # started, not change probe semantics because its parent vanished.
             params = run.verify_params or {}
 
-            def _cfg(attr: str, key: str, default: Any) -> Any:
+            def _cfg(attr: str, default: Any) -> Any:
                 if schedule is not None:
                     return getattr(schedule, attr)
-                return params.get(key, default)
+                return params.get(attr, default)
 
-            retries = _cfg("verify_retries", "retries", 1)
-            wait_seconds = _cfg("verify_wait_seconds", "wait_seconds", 60)
-            vantage = _cfg("vantage", "vantage", None)
-            repeat_count = _cfg("repeat_count", "repeat_count", 2)
-            repeat_interval_ms = _cfg("repeat_interval_ms", "repeat_interval_ms", 100)
-            stagger_override = _cfg("stagger_ms", "stagger_ms", 0)
-            port = _cfg("port", "port", 9)
-            method = _cfg("verify_method", "method", VERIFY_METHOD_PING)
+            retries = _cfg("verify_retries", 1)
+            wait_seconds = _cfg("verify_wait_seconds", 60)
+            vantage = _cfg("vantage", None)
+            repeat_count = _cfg("repeat_count", 2)
+            repeat_interval_ms = _cfg("repeat_interval_ms", 100)
+            stagger_override = _cfg("stagger_ms", 0)
+            port = _cfg("port", 9)
+            method = _cfg("verify_method", VERIFY_METHOD_PING)
 
             # ── 3. Probe the still-unverified SENT targets ─────────────────
             non_responders = await verify_run_targets(db, run, attempt, method=method)
@@ -1036,13 +1050,26 @@ async def _sweep() -> dict[str, int]:
         # re-enqueue ``verify_wol_run`` at the row's current ``verify_attempt``
         # anchor. Idempotent + bounded (the attempt-guarded claim no-ops any
         # already-progressing pass).
-        verify_cutoff = now - timedelta(seconds=VERIFY_CLAIM_LEASE_SECONDS)
+        # Two leases, one per state: a wedged ``verifying`` pass is reclaimed on
+        # the short lease; a ``pending`` run (legitimately counting down up to the
+        # 3600 s max wait) only on the long one, so a genuine countdown is never
+        # cut short (see the lease constants above).
+        verifying_cutoff = now - timedelta(seconds=VERIFY_CLAIM_LEASE_SECONDS)
+        pending_cutoff = now - timedelta(seconds=VERIFY_PENDING_LEASE_SECONDS)
         stale_verifies = (
             await db.execute(
                 select(WolRun.id, WolRun.verify_attempt).where(
-                    WolRun.verify_state.in_([VERIFY_PENDING, VERIFY_VERIFYING]),
                     WolRun.verify_claimed_at.is_not(None),
-                    WolRun.verify_claimed_at < verify_cutoff,
+                    or_(
+                        and_(
+                            WolRun.verify_state == VERIFY_VERIFYING,
+                            WolRun.verify_claimed_at < verifying_cutoff,
+                        ),
+                        and_(
+                            WolRun.verify_state == VERIFY_PENDING,
+                            WolRun.verify_claimed_at < pending_cutoff,
+                        ),
+                    ),
                 )
             )
         ).all()

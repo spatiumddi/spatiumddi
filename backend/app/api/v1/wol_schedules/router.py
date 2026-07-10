@@ -60,7 +60,7 @@ from app.models.wol_schedule import (
     WolRunTarget,
     WolSchedule,
 )
-from app.services.nettools.schemas import NetToolTarget
+from app.services import wol
 from app.services.wol_scheduler.gating import gate_verdict, load_gate_calendar_events
 from app.services.wol_scheduler.resolver import (
     SKIP_NO_MAC,
@@ -358,10 +358,9 @@ def _compute_next(schedule: WolSchedule) -> None:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
-def _vantage_to_jsonb(v: NetToolTarget | None) -> dict[str, Any]:
-    if v is None:
-        return {"kind": "server", "id": None}
-    return {"kind": v.kind, "id": str(v.id) if v.id is not None else None}
+# Vantage serialization is shared with the ad-hoc IPAM wake via
+# wol.vantage_to_jsonb so the {kind, id} wire shape has one source of truth.
+_vantage_to_jsonb = wol.vantage_to_jsonb
 
 
 async def _assert_calendar_exists(db: AsyncSession, calendar_id: uuid.UUID | None) -> None:
