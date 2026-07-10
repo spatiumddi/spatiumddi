@@ -16,9 +16,10 @@ Auth is a personal-access token — ``Authorization: Token <api_key>``
 Base URL is per-instance and operator-supplied: cloud is
 ``https://api.netbird.io``; a self-hosted install is the
 dashboard/management host (API served under ``/api``). Because the URL
-is operator-controlled, callers run it through the SSRF guard
-(``app.core.ssrf``) before we dial it — unlike the fixed-host Tailscale
-client.
+is operator-controlled, the API layer runs it through the advisory
+SSRF guard (``app.core.ssrf``) at the test-connection boundary — the
+same place every operator-URL integration guards — unlike the
+fixed-host Tailscale client, which needs no guard.
 """
 
 from __future__ import annotations
@@ -27,11 +28,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
-import structlog
 
 from app.services._mirror_shape import require_list
-
-logger = structlog.get_logger(__name__)
 
 
 class NetbirdClientError(Exception):

@@ -56,9 +56,9 @@ class NetbirdInstance(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # ── Connection ──────────────────────────────────────────────────
     # Management-server base URL. Cloud is ``https://api.netbird.io``;
     # a self-hosted install is the dashboard/management host (the API
-    # is served under ``/api`` on the same host). Operator-supplied —
-    # the reconciler + probe run it through the SSRF guard before
-    # dialing.
+    # is served under ``/api`` on the same host). Operator-supplied, so
+    # the test-connection probe runs it through the advisory SSRF guard
+    # at the API boundary (as the other operator-URL integrations do).
     api_url: Mapped[str] = mapped_column(
         String(255), nullable=False, default="https://api.netbird.io"
     )

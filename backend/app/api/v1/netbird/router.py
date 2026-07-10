@@ -41,6 +41,32 @@ router = APIRouter(
 # ── Pydantic schemas ─────────────────────────────────────────────────
 
 
+def _normalise_api_url(v: str) -> str:
+    v = v.strip().rstrip("/")
+    if not v:
+        raise ValueError("api_url is required (e.g. https://api.netbird.io)")
+    if not (v.startswith("http://") or v.startswith("https://")):
+        raise ValueError("api_url must start with http:// or https://")
+    return v
+
+
+def _validate_cidr(v: str) -> str:
+    v = v.strip()
+    if not v:
+        raise ValueError("network_cidr is required")
+    try:
+        ipaddress.ip_network(v, strict=False)
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"invalid CIDR: {exc}") from exc
+    return v
+
+
+def _floor_sync_interval(v: int) -> int:
+    if v < 30:
+        raise ValueError("sync_interval_seconds must be ≥ 30")
+    return v
+
+
 class InstanceBase(BaseModel):
     name: str
     description: str = ""
@@ -56,31 +82,17 @@ class InstanceBase(BaseModel):
     @field_validator("api_url")
     @classmethod
     def _valid_api_url(cls, v: str) -> str:
-        v = v.strip().rstrip("/")
-        if not v:
-            raise ValueError("api_url is required (e.g. https://api.netbird.io)")
-        if not (v.startswith("http://") or v.startswith("https://")):
-            raise ValueError("api_url must start with http:// or https://")
-        return v
+        return _normalise_api_url(v)
 
     @field_validator("network_cidr")
     @classmethod
     def _valid_cidr(cls, v: str) -> str:
-        v = v.strip()
-        if not v:
-            raise ValueError("network_cidr is required")
-        try:
-            ipaddress.ip_network(v, strict=False)
-        except (ValueError, TypeError) as exc:
-            raise ValueError(f"invalid CIDR: {exc}") from exc
-        return v
+        return _validate_cidr(v)
 
     @field_validator("sync_interval_seconds")
     @classmethod
     def _floor_interval(cls, v: int) -> int:
-        if v < 30:
-            raise ValueError("sync_interval_seconds must be ≥ 30")
-        return v
+        return _floor_sync_interval(v)
 
 
 class InstanceCreate(InstanceBase):
@@ -108,6 +120,24 @@ class InstanceUpdate(BaseModel):
     network_cidr: str | None = None
     skip_expired: bool | None = None
     sync_interval_seconds: int | None = None
+
+    # Validate the same fields as InstanceBase, but only when a value is
+    # actually supplied (partial update) — so a PUT can't persist an
+    # invalid api_url / CIDR / sub-30s interval that later breaks sync.
+    @field_validator("api_url")
+    @classmethod
+    def _valid_api_url(cls, v: str | None) -> str | None:
+        return None if v is None else _normalise_api_url(v)
+
+    @field_validator("network_cidr")
+    @classmethod
+    def _valid_cidr(cls, v: str | None) -> str | None:
+        return None if v is None else _validate_cidr(v)
+
+    @field_validator("sync_interval_seconds")
+    @classmethod
+    def _floor_interval(cls, v: int | None) -> int | None:
+        return None if v is None else _floor_sync_interval(v)
 
 
 class InstanceResponse(BaseModel):

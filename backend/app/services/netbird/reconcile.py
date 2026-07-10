@@ -347,8 +347,9 @@ async def _apply_addresses(
                 if (row.description or "") != d.description:
                     row.description = d.description
                     changed = True
-                # Custom fields stay reconciler-owned even on a locked
-                # row — the peer metadata is most useful when fresh.
+                # Peer metadata (last_seen / version / groups) refreshes
+                # alongside the other soft fields on non-locked rows so it
+                # stays current.
                 if (row.custom_fields or {}) != d.custom_fields:
                     row.custom_fields = d.custom_fields
                     changed = True
