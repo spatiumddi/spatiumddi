@@ -66,9 +66,16 @@ from app.services.wol_scheduler.schedule import (
     validate_timezone,
 )
 from app.services.wol_scheduler.verify import (
+    ACTIVE_METHODS,
+    PASSIVE_METHODS,
+    VERIFY_METHOD_AUTO,
     VERIFY_METHOD_PING,
+    VERIFY_METHOD_SEEN,
+    VERIFY_METHOD_TCP,
+    VERIFY_METHODS,
     auto_stagger_ms,
     probe_liveness,
+    seen_since,
     verify_run_targets,
 )
 
@@ -112,9 +119,16 @@ __all__ = [
     # dispatch
     "dispatch_wol_targets",
     "DispatchOutcome",
-    # verify (Phase 3)
+    # verify (Phase 3) + multi-source liveness (#596)
     "probe_liveness",
+    "seen_since",
     "verify_run_targets",
     "auto_stagger_ms",
+    "ACTIVE_METHODS",
+    "PASSIVE_METHODS",
+    "VERIFY_METHODS",
+    "VERIFY_METHOD_AUTO",
     "VERIFY_METHOD_PING",
+    "VERIFY_METHOD_SEEN",
+    "VERIFY_METHOD_TCP",
 ]

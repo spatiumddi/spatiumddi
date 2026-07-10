@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field, field_validator
 
-from app.services.nettools.schemas import is_blocked_target
+from app.services.nettools.schemas import NetToolTarget, is_blocked_target
 
 if TYPE_CHECKING:
     import uuid as _uuid_t
@@ -32,6 +32,19 @@ if TYPE_CHECKING:
     from app.models.ipam import IPAddress
 
 _HEX12_RE = re.compile(r"^[0-9A-Fa-f]{12}$")
+
+
+def vantage_to_jsonb(target: NetToolTarget | None) -> dict[str, object]:
+    """Canonical ``{kind, id}`` JSONB for a run/target ``vantage`` column.
+
+    The single serializer for the wake vantage wire shape — shared by the
+    scheduler router and the ad-hoc IPAM wake so the shape can't drift between
+    them. ``None`` (or a ``server`` target) is the control-plane vantage; an
+    appliance target stringifies its id.
+    """
+    if target is None:
+        return {"kind": "server", "id": None}
+    return {"kind": target.kind, "id": str(target.id) if target.id is not None else None}
 
 
 def normalize_mac(mac: str) -> str:
