@@ -72,10 +72,14 @@ Each entry in `Role.permissions` (JSONB) is an object with this shape:
 | `overlay_network` | SD-WAN overlay topology + sites (#95)                 |
 | `routing_policy`  | Per-overlay declarative routing policies (#95)        |
 | `application_category` | SaaS application catalog used by `match_kind=application` (#95) |
+| `looking_glass_collector` | BGP Looking Glass receive-only GoBGP collectors — register / CRUD + learned-route reads (#566) |
+| `bgp_lg_peer`     | BGP Looking Glass configured peer sessions within a collector (#566) |
 | `conformity`      | Conformity policies + results + auditor PDF export (#106) |
 | `manage_packet_capture` | On-demand packet capture (tcpdump) — start / read / download / delete captures (#59). High-sensitivity (captured bytes can contain plaintext creds/PII); granted to `Network Editor`, not `Viewer`. Download is audited. |
 | `address_set`     | Named IP range within a subnet carrying its own RBAC scope — delegates edit of a slice without subnet-wide write (#103). Creating a set / resizing its range additionally requires write on the parent subnet. |
 | `change_request`  | Queued two-person-approval change requests (#62) — `approve` + `read` for the second-person decision (the underlying operation's permission is *also* required server-side). |
+| `wol_schedule`    | Scheduled Wake-on-LAN jobs + run history (#586) — recurring, tag-targeted, calendar-gated fleet wake |
+| `wol_calendar`    | Subscribed iCal / CalDAV calendars whose all-day spans gate scheduled wakes (#586) |
 | `*`               | Wildcard — match any resource type                    |
 
 ## Evaluation rules

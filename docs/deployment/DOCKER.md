@@ -261,15 +261,25 @@ Redis persistence (`appendonly yes`) is enabled. The RDB/AOF files are in the `r
 
 ## 10. Distributed Agent Deployments
 
-For real production use you generally don't want the Kea DHCP agent and the BIND9 DNS agent running on the same host as the control plane. SpatiumDDI ships two standalone compose files for that shape:
+For real production use you generally don't want the Kea DHCP agent and the BIND9 DNS agent running on the same host as the control plane. SpatiumDDI ships standalone compose files for that shape:
 
 | File | Purpose |
 |---|---|
-| `docker-compose.agent-dhcp.yml`         | Kea DHCP agent(s) only — no control plane |
-| `docker-compose.agent-dns-bind9.yml`    | BIND9 DNS agent only — no control plane (renamed from `docker-compose.agent-dns.yml` in `2026.05.11-1`) |
-| `docker-compose.agent-dns-powerdns.yml` | PowerDNS DNS agent only — no control plane (issue #127) |
+| `docker-compose.agent-dhcp.yml`           | Kea DHCP agent(s) only — no control plane |
+| `docker-compose.agent-dns-bind9.yml`      | BIND9 DNS agent only — no control plane (renamed from `docker-compose.agent-dns.yml` in `2026.05.11-1`) |
+| `docker-compose.agent-dns-powerdns.yml`   | PowerDNS DNS agent only — no control plane (issue #127) |
+| `docker-compose.agent-looking-glass.yml`  | Receive-only BGP Looking Glass collector only — no control plane (issue #566) |
 
 The agent containers long-poll the remote control plane's API and cache the last-known-good config locally (non-negotiable #5), so the DHCP / DNS services keep serving even if the control plane is briefly unreachable.
+
+The BGP Looking Glass collector can also run **co-located** with the control plane straight from the main `docker-compose.yml`, gated behind the `looking-glass` profile:
+
+```bash
+# On the control-plane host — requires LG_AGENT_KEY in .env (see .env.example):
+docker compose --profile looking-glass up -d
+```
+
+The `looking-glass` service uses `network_mode: host` so BGP (TCP/179) originates from the host's real routable NIC — a router has no route to a bridged/NATed container IP. Use the standalone `docker-compose.agent-looking-glass.yml` (in the table above) instead when the collector needs to run on a separate VM.
 
 ### Prerequisites
 

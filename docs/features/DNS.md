@@ -938,6 +938,13 @@ enabled member, carrying `pool_member_id`) so BIND9 / PowerDNS /
 Windows DNS render unchanged. Config lives on `DNSPool` +
 `DNSPoolMember`; the reconciler is `app.services.dns.pool_apply`.
 
+A pool's DNS name must live in a **forward** zone. Reverse
+(`in-addr.arpa` / `ip6.arpa`) zones are filtered out of the zone
+picker and rejected server-side by the pool-create endpoint
+(`pool_router.py` returns `400` on a `kind == "reverse"` zone),
+because a pool member renders A / AAAA records and a reverse zone
+holds only PTRs.
+
 > **This is not a load balancer.** DNS is cached client-side, so a
 > member dropping out doesn't take effect until the pool `ttl`
 > expires — clients may keep hitting a dead / distant box for up to

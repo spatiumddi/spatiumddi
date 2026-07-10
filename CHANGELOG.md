@@ -20,6 +20,405 @@ the formatter handles the rest.
 
 ---
 
+## 2026.07.09-1 — 2026-07-09
+
+A **BGP visibility + HA-hardening** release. The headline feature is
+the **BGP Looking Glass** — a receive-only GoBGP collector that peers
+with your routers, ingests their live Adj-RIB-In, and links every
+learned prefix back into IPAM, RPKI-validated. It ships complete
+(Phases 1–6): Sessions + Routes grids with clickable peer / route
+detail modals, IPAM + ASN + VRF linkage, six ``bgp_lg_*`` alert rule
+types with a dashboard health card, an as-path-regexp Query tab with
+collector-vantage ping / traceroute, and VPNv4 / VPNv6 Route-Target
+matching. Riding with it, the long-deferred **MetalLB BGP mode** lights
+up, so the appliance can advertise its control-plane VIP to the same
+routers it peers with. Second feature: **Scheduled Wake-on-LAN** turns
+the one-shot wake (#533) into a recurring, tag-targeted, calendar-aware
+fleet wake that **verifies** which hosts actually booted and re-wakes
+the ones that didn't — built for schools, labs, and re-imaged
+workstation fleets.
+
+The rest of the release is an **HA-hardening arc** driven by pulling
+the power on a node of a real 3-node appliance. A cluster that was HA
+at every documented layer still lost its API for five hours, and the
+documented dead-node replace flow could not restore a 3/3 cluster.
+Eight independent defects are fixed: Redis replicas silently stacked on
+one node and then bricked on a torn AOF tail; Sentinel accumulated a
+ghost per node loss until failover became arithmetically impossible;
+api / worker / frontend had no pod spread; CNPG stacked the primary and
+a replica together; a k3s re-join wiped the identity of a node that had
+already joined; a failed re-join pushed its single-node manifests into
+the shared cluster and uninstalled the CloudNativePG operator; firstboot
+re-seeded those manifests on every boot of a joined member; and a
+node's own firewall could partition it out of an etcd cluster it was
+still a voting member of. Plus a headless-install fix that mattered
+more than its size: a fully-preseeded install completed to disk and then
+waited forever on a "Press OK to reboot" dialog no one was there to
+dismiss.
+
+The Operator Copilot tool registry grows by 19 (8 Looking Glass, 11
+Wake-on-LAN).
+
+### Added
+
+* **#566 — BGP Looking Glass.** A receive-only GoBGP collector
+  (``ghcr.io/spatiumddi/looking-glass``, multi-arch) peers with your
+  routers, ingests the live Adj-RIB-In, and links every learned prefix /
+  origin ASN / community back into IPAM. It **never advertises routes to
+  your network**: a global ``default-export-policy: reject-route`` plus a
+  per-peer max-prefix cap are rendered into the daemon config and
+  re-asserted at runtime by ``_assert_receive_only`` and a live leak
+  test. Behind the default-on ``network.looking_glass`` feature module.
+  Six phases ship together:
+
+  * **Sessions + Routes** grids, each row clickable into a rich detail
+    modal. The **peer modal** rolls up session runtime, matched ASN /
+    device links, an RPKI stacked meter, top origin ASNs + communities,
+    and any open ``bgp_lg_*`` alerts. The **route modal** shows every
+    path for a prefix across all routers with divergent-attribute
+    highlighting and a best-path winner heuristic, headlined as a
+    *possible hijack / route leak* when one prefix arrives from two
+    distinct origin ASNs, or as an *anycast / multi-homed* candidate
+    when it arrives from several routers with one origin.
+  * **IPAM linkage at ingest** — a TTL-cached longest-prefix-match
+    resolver stamps ``matched_{block,subnet,space,asn,vrf}_id`` on every
+    route, with a 5-minute re-resolve sweep catching IPAM edits made
+    between RIB pushes. Surfaces as advertised-prefix chips on subnet /
+    block rows, BGP panels in the subnet / block detail, an IP
+    reverse-lookup section, and *Learned Routes* tabs on ASN + VRF.
+  * **Six ``bgp_lg_*`` alert rule types**, all seeded disabled:
+    ``session_down``, ``rpki_invalid_route``, ``unexpected_origin``,
+    ``more_specific`` (both joined against the #527 tracked-prefix
+    table), ``route_flap``, and ``missing_advertisement`` (a subnet
+    flagged ``bgp_should_advertise`` with no covering route). Plus a
+    Looking Glass health card on the dashboard.
+  * **Query tab** — Cisco / Juniper as-path regexps compiled to Postgres
+    POSIX ERE over the rendered as-path, ``show route <prefix>``,
+    community lookup, and session history. Collector-vantage
+    ``ping`` / ``traceroute`` / ``dig`` / port-test / TLS-cert tools
+    dispatch through the existing agent-command channel, so you can probe
+    from the collector's network position.
+  * **VPNv4 / VPNv6** accepted as peer address-families; the route
+    identity key widens to include the route distinguisher —
+    ``(peer_id, prefix, next_hop, route_distinguisher)`` — so
+    overlapping-prefix VPNs through one peer can't collide.
+    Route-Targets parsed from ext-communities match
+    against a VRF's import / export target lists, taking precedence over
+    the IPAM-effective VRF. Plus a multicast ↔ BGP reachability
+    cross-reference tab.
+
+  Eight MCP tools (7 read + ``propose_create_lg_peer``). Migrations
+  ``cb279a6afd70`` / ``531494dbf44c`` / ``f7883fa6d413``. Per-vendor
+  peering recipes (Cisco IOS / IOS-XR, Juniper, Arista, FRR, BIRD) and
+  TCP/179 firewall rules in ``docs/features/LOOKING_GLASS.md``.
+
+* **#566 D1 — MetalLB BGP mode.** The deferred VIP advertiser lights up:
+  the appliance can advertise its control-plane VIP to the operator's
+  routers over BGP, which is also the cleanest proof that the router will
+  peer with the box at all. New ``platform_settings`` BGP columns
+  (migration ``1440e72b9297``), a BGP form under Fleet → Network & Host,
+  supervisor-driven ``HelmChartConfig`` overrides, and a Looking Glass
+  peer form that can prefill from the MetalLB peer. **Default stays L2
+  mode** — ``bgp.enabled`` and ``frrk8s.enabled`` are both false. Turning
+  BGP mode on pulls in **FRRouting (GPL-2.0)**, the first GPL-v2
+  component in the data path; it is opt-in only, bundled as an unmodified
+  upstream image rather than linked, and recorded in ``NOTICE``.
+
+* **#586 — Scheduled Wake-on-LAN.** The one-shot Wake-on-LAN from #533
+  becomes a recurring, tag-targeted fleet wake, behind the
+  ``tools.wake_scheduler`` feature module. Three phases:
+
+  * **Schedule + resolve + dispatch.** DST-safe timezone-aware cron
+    scheduling with a built-in holiday gate (blackout dates + term
+    range). Targets resolve by ``address_tags`` / subnet / ``subnet_tags``
+    / explicit hosts, with a MAC fallback chain (IP → ``ip_mac_history``
+    → DHCP lease); MAC-less matches are reported as skipped rather than
+    silently dropped, multicast is excluded, and fan-out is hard-capped.
+    The beat sweep claims a due schedule with an atomic
+    ``UPDATE … RETURNING`` plus an ``in_progress_since`` lease reaper, so
+    overlapping ticks can't double-fire.
+  * **Calendar subscriptions.** An iCal ``.ics`` URL (Google, published
+    school calendars) or authenticated CalDAV (Nextcloud, Radicale)
+    drives the gate, so a fleet wake follows the term calendar instead of
+    hand-maintained blackout dates. Both ``skip_on_event`` (holiday
+    calendar) and ``only_on_event`` (school-day calendar) modes, with an
+    optional summary / category match regex. All-day events are flattened
+    with the DTEND-exclusive correction; RRULE / RDATE / EXDATE expansion
+    is bounded. Every feed URL runs through ``assert_safe_target`` with
+    per-redirect-hop revalidation, and sync errors are generic so they
+    can't act as a content-disclosure oracle. CalDAV passwords are
+    Fernet-encrypted and write-only.
+  * **Post-wake verify + retry.** After a run, each sent host is probed
+    for liveness (bounded concurrency, never-raise), responders stamp
+    ``IPAddress.last_seen_at`` into the existing *Seen* infrastructure,
+    and a chained Celery task re-wakes **only** the non-responders up to
+    ``verify_retries``. A ``verify_claimed_at`` lease plus an
+    attempt-anchored claim makes an ``acks_late`` redelivery a no-op, and
+    a reaper folded into the schedule sweep reclaims a run wedged at
+    ``verifying`` by a worker crash. Stagger auto-tunes for large fleets.
+
+  Eleven MCP tools (8 read + 3 propose). Migrations ``e9c47a1f3b28`` /
+  ``d7e3f0a91c24`` / ``b4f2a9c17e63``. New deps ``icalendar``, ``caldav``,
+  ``python-dateutil``. A Tools → Wake Schedules page with a per-schedule
+  detail modal, and a FOG / PXE re-image runbook plus a per-vendor
+  directed-broadcast matrix in ``docs/features/IPAM.md``. Deferred:
+  auto-resolving an on-segment appliance vantage (agents don't advertise
+  L2 segments cleanly), and a BMC / Redfish scheduled-shutdown companion.
+
+* **#581 — ``spatium-install --check-preseed``.** An unprivileged,
+  read-only, touch-nothing linter that validates a
+  ``spatium-preseed.yaml`` on any machine before you boot the installer
+  media. It parses through the **same** helper a real headless install
+  uses, then re-runs the wizard's **own** rules against the resolved
+  values and reports every error in one pass. Machine-specific checks
+  (disk presence, the 32 GiB floor) downgrade to warnings so the lint
+  stays host-portable. Exit 0 valid / 1 invalid / 2 usage. The pure
+  core of the k3s CIDR validator is split out and shared with the
+  interactive path, so the two rules cannot drift. Its real value is
+  catching, offline and pre-boot, the static-network cases the parser
+  accepts but a real install only rejects at the interactive re-check —
+  i.e. after the operator has already committed the boot. Adds 61
+  host-portable tests to a disk-wiping feature that shipped with none.
+
+### Changed
+
+* **#575 — ``kube-rbac-proxy`` repointed off the sunset
+  ``gcr.io/kubebuilder`` mirror** to its maintained upstream home
+  ``quay.io/brancz`` (same image, same ``v0.12.0`` tag). Google retired
+  the mirror, which broke both the appliance image bake (an unconditional
+  ``docker pull`` of every third-party image) and any non-airgap frr-k8s
+  pull, where the metrics sidecar hit ``ErrImagePull``. Repointed in
+  lock-step across ``bake-images.sh`` and the
+  ``spatiumddi-metallb`` chart values.
+
+* **#592 — the console Pods panel now shows the whole cluster.** It
+  auto-filtered to "problem pods + pods on **this** node" above 20 visible
+  pods; a 3-node appliance idles at ~22, so the filter was effectively
+  always on for exactly the deployment where cluster-wide visibility
+  matters most. Each node's console showed only its own third of the
+  cluster while ``kubectl get pods -A`` showed everything, and the only
+  hint was a dim suffix on the panel title. The filter also protected
+  nothing — pods are sorted by problem-priority *before* the height
+  clamp, so a crash-looping pod cannot be clipped, and the overflow
+  already becomes a "… +N more pods · F3 to list" subtitle. Dropped, with
+  its now-dead plumbing.
+
+### Fixed
+
+* **#590 — a 3-node HA cluster did not survive hard power loss of one
+  node.** Every layer that was supposed to be HA did its job — k3s stayed
+  up, etcd kept quorum, CNPG failed Postgres over cleanly — yet the API
+  went down cluster-wide and stayed down for 5+ hours. Eight independent
+  defects:
+
+  * **Redis placement.** The Sentinel StatefulSet had *preferred*
+    (best-effort) anti-affinity, which is silently useless here: the seed
+    installs with one replica and promote scales to the control-plane
+    size, so ``redis-1`` schedules while the freshly promoted members may
+    not yet carry the control-plane node label. The seed is then the only
+    schedulable node, and *preferred* cheerfully stacks ``redis-1`` beside
+    ``redis-0`` — where ``persistence.enabled`` pins its local-path PV
+    forever. One node loss took 2 of 3 replicas: both the data majority
+    and the sentinel quorum. Now *required*.
+  * **Redis AOF durability.** ``aof-load-corrupt-tail-max-size`` defaults
+    to 0, so *any* corrupt tail is fatal — and a power cut tearing the
+    last write is expected, not exceptional. A replica crash-looped
+    forever over 158 bytes of expendable cache. Redis here is the cache +
+    Celery broker and Postgres is the store of record, so a torn tail is
+    now discarded (16 MiB budget). This is **not** redundant with
+    ``aof-load-truncated``: a *short* tail (ends mid-record) is already
+    handled by that knob, while a *corrupt* one (present but zero-filled,
+    via ext4 delayed allocation) is what bricks redis. Spelled out
+    wherever the value appears, so a future reader doesn't drop it.
+  * **Sentinel ghosts.** Every Redis pod announced itself by pod IP, so a
+    rescheduled pod returned with a new IP and its peers added a *second*
+    entry — and Sentinel never forgets a Sentinel it has seen. Dead ghosts
+    stay in the failover-quorum denominator and never vote: one ghost per
+    node loss, and on the **third** loss a failover becomes arithmetically
+    impossible, the ``sentinel://`` URL never resolves a master again, and
+    the API is down permanently. Pods now announce their stable
+    StatefulSet FQDN, so a returning pod's hello replaces its entry in
+    place. No manual step on upgrade — the init container rewrites
+    ``sentinel.conf`` on every pod start.
+  * **Control-plane pod spread.** api / worker / frontend shipped no
+    affinity and the default 300 s not-ready toleration, so a promote
+    could stack every api pod on the seed and losing it left every node
+    answering 502 for minutes. They now share a ``podAntiAffinity`` helper
+    (``soft`` chart default, ``hard`` on the appliance where replicas
+    track node count exactly) and get 20 s tolerations. The helper
+    **merges** an operator-supplied affinity rather than replacing it.
+  * **Rollout deadlock under the new anti-affinity.** A replica count
+    equal to the number of eligible nodes, plus *required* anti-affinity,
+    makes the default surge
+    pod unschedulable, and the default ``maxUnavailable: 0`` then forbids
+    freeing a node — the rollout can never converge. Under ``hard`` the
+    knobs invert: retire one old pod, then schedule its replacement onto
+    the node it just freed. ``frontend`` gets the same treatment for its
+    exclusive ``hostPort :80`` (its old ``strategy: Recreate`` took the
+    whole UI down on a chart upgrade once it ran one replica per node).
+  * **CNPG Postgres spread.** CNPG enables pod anti-affinity by default,
+    but only as *preferred*, so after a promote the primary and a replica
+    both landed on the seed — losing that node would have taken both.
+    The appliance renders *required*; the chart default stays *preferred*
+    for BYO-Kubernetes installs that may run more instances than nodes.
+    Because the Cluster CR carries ``helm.sh/resource-policy: keep``, the
+    setting rides the supervisor's existing out-of-band merge-patch.
+  * **k3s dead-node replace.** The identity wipe left
+    ``/var/lib/rancher/k3s/server/token`` behind, so a join presented the
+    seed's token against stale local bootstrap data and k3s fataled. The
+    transition state machine also had no timeout, no failure ceiling, and
+    no escape hatch: a reported ``failed`` didn't clear the desired state,
+    so the supervisor re-fired a **destructive** wipe-and-rejoin every
+    heartbeat (observed: 50+ minutes). Both join and leave now get a
+    per-target attempt ceiling; ``POST …/clear-cluster-state`` is the
+    operator escape hatch, gated on a staleness clock so clearing a
+    *running* join can't strand the joiner as a live member that quorum
+    math undercounts.
+  * **A join that had already succeeded re-fired and wiped its own
+    identity.** The guard checked only trigger-file presence, but the
+    runner renames the trigger to ``.done`` the moment it succeeds while
+    the desired state stays set until the backend sees a ``ready``
+    heartbeat. In that window the next heartbeat re-fired the destructive
+    join. Gated on what the runner last wrote instead, which also tells
+    "already joined this seed" apart from "re-targeted at a different
+    seed". And when such a join then failed, its rollback restored this
+    node's **single-node** bootstrap manifests into the *shared* cluster,
+    whose helm-controller applied them — **uninstalling the CloudNativePG
+    operator** and parking an nginx pod on the frontend's ``:80``. The CNPG
+    Cluster CR kept reporting "healthy" because no operator remained to
+    update it: a silent loss of failover. ``spatiumddi-firstboot`` hit the
+    same race from the other side, re-seeding those manifests on **every
+    boot** of a joined member and minting a fresh self-signed cert over an
+    operator-uploaded or ACME-issued one. Both paths now skip (never
+    delete) on a joined member. Join failures are additionally classified
+    into five operator-actionable causes — a bare "join failed" left
+    nothing to act on for the permanent ones.
+
+* **#593 — a node's own firewall could partition it out of a live etcd
+  cluster.** The per-role nftables drop-in was rendered purely from the
+  control plane's row, not from whether the node is actually an etcd
+  member. Observed live: a node's row had gone ``cluster_role = NULL``
+  after a failed re-join while the node was still a voting etcd member
+  serving raft normally. The supervisor concluded "plain agent node",
+  rendered a firewall with no peer rule, and the node's own nftables
+  dropped its peers' inbound raft — they logged an i/o timeout every 5 s
+  against a member that was up the whole time. It fails in the most
+  damaging direction: dropping a voting member out of raft leaves a
+  3-node cluster one node from losing quorum. Now keyed off **observed
+  local state**: when the row supplies no peers but k3s labels the node an
+  etcd member, the peer set is recovered from live kube-API membership;
+  and the supervisor **refuses to write any drop-in that closes 2380** on
+  a node k3s still calls a member, leaving the previous ruleset in place.
+  Membership *unknown* never blocks an update (the guard fails open), and
+  only a ``True`` is ever memoised — a stale ``True`` merely delays
+  narrowing after a real demote, while a stale ``False`` would be this bug
+  again. Refusals surface as a new ``appliance.firewall_state`` JSONB
+  riding the heartbeat, rendered as a Fleet banner (migration
+  ``d1f4b7c92e58``).
+
+* **#549 — a fully-unattended install finished, then waited forever for
+  someone to press OK.** ``do_install``'s final "Press OK to reboot"
+  whiptail msgbox was shown unconditionally. On a headless box there is no
+  operator on tty1 to dismiss it, so the wizard blocked and the
+  ``systemctl reboot`` after it never ran: the appliance installed
+  correctly to disk and never booted into the installed system. It can't
+  be worked around hypervisor-side — the install ISO is the live boot
+  medium, so its tray is locked closed for the whole install, and whiptail
+  ignores an injected Enter. Now gated on ``FULLY_UNATTENDED``, like the
+  welcome and final-confirm dialogs already were. Affects both roles
+  (control-plane + appliance) on any fully-unattended install, i.e. every
+  release ISO carrying the preseed installer that shipped in
+  ``2026.07.04-1``. Interactive and partial-preseed installs are unchanged
+  — they still get the media-removal reminder.
+
+* **#571 — the GSLB pool zone picker offered reverse zones.** Pools render
+  A/AAAA records, which only belong in a forward zone, so a pool targeting
+  an ``in-addr.arpa`` / ``ip6.arpa`` zone can never render a valid record.
+  Reverse zones slipped through because they carry
+  ``zone_type="primary"``; the picker now filters on the dedicated ``kind``
+  field, and the pool-create endpoint rejects a reverse-zone target
+  server-side (API-first — the UI filter is not the enforcement layer).
+
+* **#583 — the DHCP scope edit form blanked DNS Servers and PXE profile,
+  and saving wiped them.** Two independent round-trip bugs. The frontend
+  labelled option 6 with the IANA name ``domain-name-servers`` while the
+  backend's canonical vocabulary is ``dns-servers``, so on read-back the
+  name→code table returned code 0 and the value fell into the hidden
+  custom-options bucket. The frontend is aligned, and a backend alias
+  normalises the legacy name on write and still maps it to code 6 on read,
+  so already-persisted rows recover without a migration. Separately,
+  ``pxe_profile_id`` was missing from ``ScopeResponse`` entirely, so the
+  picker always reset to "(none)" and a save silently detached the bound
+  profile.
+
+* **#576 — the Looking Glass never started on a k3s appliance.** The whole
+  supervisor → HelmChart → DaemonSet → pod path was already in place; the
+  only missing link was firstboot, which generates and injects
+  ``DNS_AGENT_KEY`` / ``DHCP_AGENT_KEY`` but nothing for ``LG_AGENT_KEY``.
+  So the API 503'd every collector registration and shipped an empty key to
+  the supervisor. Mirrors the DNS / DHCP wiring, including a one-time
+  backfill for an already-installed control plane that A/B-upgrades into a
+  Looking Glass build (first-boot generation is skipped on those).
+
+* **#576 — the collector crash-looped on the appliance from an early
+  SIGHUP.** The supervisor started ``gobgpd`` then immediately started the
+  sync thread, whose bootstrap-from-cache apply sent SIGHUP ~4 ms later.
+  gobgpd installs its SIGHUP reload handler partway through startup, so a
+  signal arriving before then hits the default disposition — terminate —
+  and kills the daemon before it prints anything. The race was won under
+  Docker locally and reliably lost on the slower k3s appliance. The first
+  apply now waits until the gobgpd gRPC listener answers, which proves the
+  handler is installed; a gobgpd that exits during startup (a real config
+  or bind failure) short-circuits to a restart instead of running the
+  threads against a dead daemon. The DaemonSet also gets an explicit
+  ``NET_BIND_SERVICE`` capability, since binding privileged ``:179`` as
+  non-root via a file capability is fragile under Kubernetes.
+
+* **#573 — ``make build`` left a stale ``looking-glass:dev``.** The image
+  was listed in ``bake-images.sh`` but the ``build`` target never built or
+  retagged it, so ``make appliance-baked-iso`` could bake an old collector
+  or trip the stale-source guard. Added the build line and the ghcr retag
+  pair, mirroring the DNS / DHCP wiring.
+
+### Migrations
+
+Nine additive migrations, chaining linearly from the last release's head
+``c9f2e1a4d7b6``: → ``cb279a6afd70`` (#566 — Looking Glass collector /
+peers / routes) → ``531494dbf44c`` (#566 — ``bgp_lg_*`` alerts +
+``Subnet.bgp_should_advertise``) → ``f7883fa6d413`` (#566 — route
+distinguisher on ``bgp_lg_route``) → ``1440e72b9297`` (#566 D1 — MetalLB
+BGP-mode ``platform_settings`` columns) → ``e9c47a1f3b28`` (#586 — wake
+scheduler) → ``d7e3f0a91c24`` (#586 — wake-scheduler calendars) →
+``b4f2a9c17e63`` (#586 — post-wake verify columns) → ``c7a3f1e28d94``
+(#590 — ``appliance.cluster_join_state_at``) → ``d1f4b7c92e58`` (#593 —
+``appliance.firewall_state``). New-table downgrades are baselined for the
+shape linter.
+
+### Notes
+
+* **Existing HA installs need a one-time repair.** The #590 placement
+  fixes are declarative, but a Redis replica or a CNPG instance whose PVC
+  is *already* bound to an occupied node will go ``Pending`` when the
+  cluster flips to *required* anti-affinity. Postgres stays available
+  throughout (the primary is untouched and a surviving replica keeps
+  failover possible). The repair for each is documented in
+  ``k8s/README.md`` and ``charts/spatiumddi/README.md``, with the rule
+  stated unambiguously: delete a **replica's** PVC only, never the
+  primary's.
+
+* **MetalLB BGP mode is opt-in and pulls in GPL-2.0 code.** Enabling it
+  deploys FRRouting, the first GPL-v2 component in the data path. It is
+  bundled as an unmodified upstream image rather than linked, both
+  ``bgp.enabled`` and ``frrk8s.enabled`` default to false, and L2 mode is
+  unchanged. See ``NOTICE``.
+
+* **Scheduled Wake-on-LAN cannot use appliance vantage on a scheduled
+  fire.** The agent-command channel is in-memory and per-replica, so the
+  beat worker can't reach the supervisor. Use server vantage, or "Run
+  now", until the Redis-backed dispatch lands.
+
+---
+
 ## 2026.07.04-1 — 2026-07-04
 
 A **network-intelligence + IPAM-at-scale** release. Four new
