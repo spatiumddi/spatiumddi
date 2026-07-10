@@ -58,3 +58,38 @@ def test_collect_off_appliance_emits_none(monkeypatch: pytest.MonkeyPatch) -> No
     assert out["firewall_applied_hash"] is None
     assert out["firewall_applied_status"] is None
     assert out["firewall_base_marker"] is None
+
+
+def test_refusal_round_trip(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    sidecar = tmp_path / "sub" / "firewall-refused"  # parent absent → mkdir path
+    monkeypatch.setattr(appliance_state, "_FIREWALL_REFUSAL_SIDECAR", sidecar)
+    assert appliance_state.read_firewall_state() is None
+    appliance_state.record_firewall_refusal("in-pod", "no etcd peer rule")
+    state = appliance_state.read_firewall_state()
+    assert state == {
+        "state": "refused_self_partition",
+        "source": "in-pod",
+        "reason": "no etcd peer rule",
+    }
+    appliance_state.clear_firewall_refusal()
+    assert appliance_state.read_firewall_state() is None
+
+
+def test_refusal_persist_failure_warns(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """#611 — a genuine write failure is the one way a self-partition refusal
+    can go silent on the host-side reader, so it must warn (not debug)."""
+    # A file where the sidecar's grandparent dir should be makes mkdir raise.
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a dir")
+    monkeypatch.setattr(
+        appliance_state, "_FIREWALL_REFUSAL_SIDECAR", blocker / "deep" / "refused"
+    )
+    calls: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        appliance_state.log, "warning", lambda event, **kw: calls.append((event, kw))
+    )
+    appliance_state.record_firewall_refusal("in-pod", "boom")  # must not raise
+    assert calls and calls[0][0] == "supervisor.firewall.refusal_persist_failed"
+    assert "error" in calls[0][1] and "path" in calls[0][1]
