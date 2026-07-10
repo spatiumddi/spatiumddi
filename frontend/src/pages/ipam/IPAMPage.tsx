@@ -3294,10 +3294,10 @@ function AddAddressModal({
         setError(null);
         return;
       }
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? "Failed to allocate address";
-      setError(typeof msg === "string" ? msg : JSON.stringify(msg));
+      // Use the shared unwrapper so a FastAPI 422 validation body (a
+      // ``detail: [{msg, loc, …}]`` array) renders as its readable message
+      // instead of raw JSON (e.g. a rejected hostname).
+      setError(formatApiError(err, "Failed to allocate address"));
     },
   });
 
@@ -8601,10 +8601,9 @@ function EditAddressModal({
         setError(null);
         return;
       }
-      const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data
-          ?.detail ?? "Failed to save";
-      setError(typeof msg === "string" ? msg : JSON.stringify(msg));
+      // Shared unwrapper so a FastAPI 422 body renders its readable message
+      // (e.g. a rejected hostname) instead of raw JSON.
+      setError(formatApiError(err, "Failed to save"));
     },
   });
 
