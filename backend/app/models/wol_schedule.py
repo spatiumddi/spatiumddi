@@ -339,7 +339,8 @@ class WolRun(Base):
         ForeignKey("wol_schedule.id", ondelete="SET NULL"),
         nullable=True,
     )
-    # schedule | manual
+    # schedule | manual | adhoc  (adhoc == a single-host wake from the IPAM
+    # address action that opted into post-wake verify; schedule_id is NULL)
     trigger: Mapped[str] = mapped_column(String(16), nullable=False)
 
     started_at: Mapped[datetime] = mapped_column(
@@ -392,6 +393,15 @@ class WolRun(Base):
     verify_attempt: Mapped[int] = mapped_column(
         Integer, nullable=False, default=1, server_default="1"
     )
+
+    # Per-run verify config snapshot (#596 Phase 1b). NULL for scheduled runs —
+    # they read their live ``wol_schedule`` row, so an operator edit mid-flight
+    # still takes effect. Ad-hoc runs (``schedule_id IS NULL``) have no parent to
+    # read, so they carry their own config here and it is the sole source of
+    # truth: {"method", "wait_seconds", "retries", "vantage", "port",
+    # "repeat_count", "repeat_interval_ms"} — every key optional, per-key
+    # fallback to the model defaults.
+    verify_params: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
 
     # NULL for beat-fired system runs.
     triggered_by_user_id: Mapped[uuid.UUID | None] = mapped_column(

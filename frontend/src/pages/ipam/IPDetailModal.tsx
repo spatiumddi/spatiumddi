@@ -156,16 +156,23 @@ export function IPDetailModal({
   const [wakeMsg, setWakeMsg] = useState<{ ok: boolean; text: string } | null>(
     null,
   );
+  // Opt in to the post-wake liveness check (#596). Off by default: a bare Wake
+  // stays the one-click fire-and-forget it has always been.
+  const [verifyAfterWake, setVerifyAfterWake] = useState(false);
   const wake = useMutation({
-    mutationFn: () => ipamApi.wakeAddress(addr.id),
-    onSuccess: (data) => {
+    mutationFn: (verify: boolean) => ipamApi.wakeAddress(addr.id, { verify }),
+    onSuccess: (data, verify) => {
       const via =
         data.ran_from === "server"
           ? "the server"
           : data.ran_from.replace(":", " ");
       setWakeMsg({
         ok: true,
-        text: `Magic packet sent to ${data.mac} via ${via}.`,
+        text:
+          `Magic packet sent to ${data.mac} via ${via}.` +
+          (verify
+            ? " Checking in 60s whether it came up — the result appears in Wake Schedules → History."
+            : ""),
       });
     },
     onError: (err: unknown) => {
@@ -285,23 +292,37 @@ export function IPDetailModal({
               <Radar className="h-3.5 w-3.5" /> Scan with Nmap
             </button>
             {addr.mac_address && (
-              <button
-                type="button"
-                onClick={() => {
-                  setWakeMsg(null);
-                  wake.mutate();
-                }}
-                disabled={wake.isPending}
-                className="inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs hover:bg-accent disabled:opacity-50"
-                title="Send a Wake-on-LAN magic packet to this MAC"
-              >
-                {wake.isPending ? (
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                ) : (
-                  <Power className="h-3.5 w-3.5" />
-                )}{" "}
-                Wake
-              </button>
+              <div className="inline-flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setWakeMsg(null);
+                    wake.mutate(verifyAfterWake);
+                  }}
+                  disabled={wake.isPending}
+                  className="inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs hover:bg-accent disabled:opacity-50"
+                  title="Send a Wake-on-LAN magic packet to this MAC"
+                >
+                  {wake.isPending ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <Power className="h-3.5 w-3.5" />
+                  )}{" "}
+                  Wake
+                </button>
+                <label
+                  className="inline-flex cursor-pointer items-center gap-1 text-[11px] text-muted-foreground"
+                  title="After 60s, check whether the host came up (ping, then TCP, then a network sighting) and re-wake it once if it didn't. The outcome is recorded in Wake Schedules → History."
+                >
+                  <input
+                    type="checkbox"
+                    checked={verifyAfterWake}
+                    onChange={(e) => setVerifyAfterWake(e.target.checked)}
+                    disabled={wake.isPending}
+                  />
+                  verify
+                </label>
+              </div>
             )}
             {canEdit && (
               <button

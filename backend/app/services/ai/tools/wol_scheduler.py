@@ -79,6 +79,9 @@ def _schedule_summary(row: WolSchedule) -> dict[str, Any]:
         "last_run_skip_reason": row.last_run_skip_reason,
         "last_target_count": row.last_target_count,
         "vantage": row.vantage or {"kind": "server", "id": None},
+        # Surfaced on the LIST view (not just the detail) so the copilot can
+        # answer "which schedules still verify with ping only?" in one call.
+        "verify_method": row.verify_method,
     }
 
 
@@ -100,10 +103,10 @@ def _schedule_detail(row: WolSchedule) -> dict[str, Any]:
             "port": row.port,
             # Post-wake verify config (Phase 3): whether a run probes SENT hosts
             # for liveness after firing, how long it waits, and the re-wake bound.
+            # ``verify_method`` already rides along from _schedule_summary.
             "verify_enabled": row.verify_enabled,
             "verify_wait_seconds": row.verify_wait_seconds,
             "verify_retries": row.verify_retries,
-            "verify_method": row.verify_method,
             "created_by_user_id": (str(row.created_by_user_id) if row.created_by_user_id else None),
             "created_at": row.created_at.isoformat(),
             "modified_at": row.modified_at.isoformat(),

@@ -39,6 +39,7 @@ import {
   type WolTargetPreview,
   type WolTargetSelector,
   type WolVantage,
+  type WolVerifyMethod,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
@@ -1793,6 +1794,11 @@ function WolScheduleModal({
   const [verifyRetries, setVerifyRetries] = useState(
     existing?.verify_retries ?? 1,
   );
+  // Liveness source (#596). New schedules default to `auto`; an existing
+  // schedule keeps whatever it stored (pre-#596 rows are all `ping`).
+  const [verifyMethod, setVerifyMethod] = useState<WolVerifyMethod>(
+    (existing?.verify_method as WolVerifyMethod | undefined) ?? "auto",
+  );
 
   const [error, setError] = useState<string | null>(null);
   const ianaList = useIanaTimezones();
@@ -1846,7 +1852,7 @@ function WolScheduleModal({
         verify_enabled: verifyEnabled,
         verify_wait_seconds: verifyWaitSeconds,
         verify_retries: verifyRetries,
-        verify_method: "ping",
+        verify_method: verifyMethod,
       };
       return existing
         ? wakeSchedulesApi.update(existing.id, body)
@@ -2036,6 +2042,8 @@ function WolScheduleModal({
             setVerifyWaitSeconds={setVerifyWaitSeconds}
             verifyRetries={verifyRetries}
             setVerifyRetries={setVerifyRetries}
+            verifyMethod={verifyMethod}
+            setVerifyMethod={setVerifyMethod}
             vantage={vantage}
             errors={verifyErrors}
           />
@@ -2640,6 +2648,14 @@ function CalendarGateSection({
 }
 
 // ── Post-wake verify step (Phase 3) ───────────────────────────────────
+/** Per-method operator copy for the liveness-source picker (#596). */
+const VERIFY_METHOD_HELP: Record<WolVerifyMethod, string> = {
+  auto: "Tries ping, then TCP connect, then a post-wake network sighting — stopping at the first one that confirms. Costs a single ping against a host that answers ICMP.",
+  ping: "ICMP echo from the control plane. Simple, but a host behind a default Windows firewall answers nothing and reads as down.",
+  tcp: "Opens a TCP connection to a few common ports. A refused connection still proves the host is up, so this works where ICMP is blocked.",
+  seen: "Sends no traffic. Confirms the host only if something on the platform observed it after the wake fired — an SNMP ARP/FDB poll, a DHCP lease, an nmap or discovery sweep, or the DHCP agent's passive L2 sniffer. Because it never emits packets, it can verify hosts on segments the control plane cannot reach.",
+};
+
 function VerifyStep({
   verifyEnabled,
   setVerifyEnabled,
@@ -2647,6 +2663,8 @@ function VerifyStep({
   setVerifyWaitSeconds,
   verifyRetries,
   setVerifyRetries,
+  verifyMethod,
+  setVerifyMethod,
   vantage,
   errors,
 }: {
@@ -2656,6 +2674,8 @@ function VerifyStep({
   setVerifyWaitSeconds: (n: number) => void;
   verifyRetries: number;
   setVerifyRetries: (n: number) => void;
+  verifyMethod: WolVerifyMethod;
+  setVerifyMethod: (m: WolVerifyMethod) => void;
   vantage: WolVantage;
   errors: {
     verifyWaitSeconds: string | null;
@@ -2676,11 +2696,11 @@ function VerifyStep({
         Verify hosts came up after the wake
       </label>
       <p className="text-[11px] text-muted-foreground">
-        After the wake dispatches, a background pass pings each host that was
-        sent a magic packet. Hosts that don&apos;t answer are re-woken up to the
-        retry bound. Responders stamp the IPAM &ldquo;last seen&rdquo; timestamp
-        (method <span className="font-mono">ping</span>), so the verify doubles
-        as a liveness refresh.
+        After the wake dispatches, a background pass checks each host that was
+        sent a magic packet. Hosts that don&apos;t confirm are re-woken up to
+        the retry bound. Hosts confirmed by an active probe stamp the IPAM
+        &ldquo;last seen&rdquo; timestamp, so the verify doubles as a liveness
+        refresh.
       </p>
 
       <div
@@ -2689,6 +2709,32 @@ function VerifyStep({
           !verifyEnabled && "pointer-events-none opacity-50",
         )}
       >
+        <div className="sm:col-span-2">
+          <label className={labelCls}>Liveness source</label>
+          <select
+            className={inputCls}
+            disabled={!verifyEnabled}
+            value={verifyMethod}
+            onChange={(e) => setVerifyMethod(e.target.value as WolVerifyMethod)}
+          >
+            <option value="auto">Auto (ping → TCP → seen on network)</option>
+            <option value="ping">Ping (ICMP)</option>
+            <option value="tcp">TCP connect</option>
+            <option value="seen">Seen on network (passive)</option>
+          </select>
+          <p className="mt-1 text-[11px] text-muted-foreground">
+            {VERIFY_METHOD_HELP[verifyMethod]}
+          </p>
+          {(verifyMethod === "seen" || verifyMethod === "auto") && (
+            <p className="mt-1 text-[11px] text-muted-foreground">
+              A sighting only counts if it was recorded{" "}
+              <em>after this wake fired</em>, so a stale ARP entry can never
+              pass a host that never woke. Note that the read-only integration
+              mirrors (UniFi, OPNsense, Proxmox, Tailscale) do not yet record
+              last-seen timestamps, so they do not contribute sightings.
+            </p>
+          )}
+        </div>
         <div>
           <label className={labelCls}>Wait before probing (seconds)</label>
           <input

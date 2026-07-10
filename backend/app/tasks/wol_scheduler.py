@@ -61,7 +61,11 @@ from app.services.wol_scheduler.schedule import (
     InvalidTimezone,
     compute_next_run,
 )
-from app.services.wol_scheduler.verify import auto_stagger_ms, verify_run_targets
+from app.services.wol_scheduler.verify import (
+    VERIFY_METHOD_PING,
+    auto_stagger_ms,
+    verify_run_targets,
+)
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -730,8 +734,9 @@ async def _verify_run(run_id: uuid.UUID | str, attempt: int) -> dict[str, Any]:
        attempt N (arriving after a re-wake already advanced the row to N+1 +
        reset it to ``pending``) a no-op, so the down set is never re-woken twice
        (non-negotiable #9).
-    2. Probe the still-unverified SENT targets (server-vantage ping) + stamp the
-       Seen infra on responders (``verify_run_targets``).
+    2. Probe the still-unverified SENT targets under the schedule's
+       ``verify_method`` (ping / tcp / seen / auto) + stamp the Seen infra on
+       active responders (``verify_run_targets``).
     3. **Bounded retry** — if non-responders remain AND ``attempt <=
        verify_retries``, re-wake ONLY those (reuse the dispatch path), bump
        their ``wake_attempts``, release the mutex back to ``pending`` while
@@ -804,17 +809,33 @@ async def _verify_run(run_id: uuid.UUID | str, attempt: int) -> dict[str, Any]:
             if schedule is not None and not schedule.verify_enabled:
                 return await _finalise_verify(db, run, schedule)
 
-            # Config (fall back to model defaults if the schedule was deleted).
-            retries = schedule.verify_retries if schedule is not None else 1
-            wait_seconds = schedule.verify_wait_seconds if schedule is not None else 60
-            vantage = schedule.vantage if schedule is not None else None
-            repeat_count = schedule.repeat_count if schedule is not None else 2
-            repeat_interval_ms = schedule.repeat_interval_ms if schedule is not None else 100
-            stagger_override = schedule.stagger_ms if schedule is not None else 0
-            port = schedule.port if schedule is not None else 9
+            # Config resolution, in precedence order:
+            #   1. the live ``wol_schedule`` row (scheduled + run-now runs) — read
+            #      fresh each pass, so an operator edit mid-flight takes effect;
+            #   2. ``run.verify_params`` (ad-hoc runs, #596 Phase 1b) — an
+            #      ephemeral run has no parent schedule to read;
+            #   3. the model defaults (a schedule deleted mid-flight).
+            # ``method`` falls back to ``ping`` rather than the ``auto`` default
+            # new schedules get: an orphaned run should finish the way it
+            # started, not change probe semantics because its parent vanished.
+            params = run.verify_params or {}
+
+            def _cfg(attr: str, key: str, default: Any) -> Any:
+                if schedule is not None:
+                    return getattr(schedule, attr)
+                return params.get(key, default)
+
+            retries = _cfg("verify_retries", "retries", 1)
+            wait_seconds = _cfg("verify_wait_seconds", "wait_seconds", 60)
+            vantage = _cfg("vantage", "vantage", None)
+            repeat_count = _cfg("repeat_count", "repeat_count", 2)
+            repeat_interval_ms = _cfg("repeat_interval_ms", "repeat_interval_ms", 100)
+            stagger_override = _cfg("stagger_ms", "stagger_ms", 0)
+            port = _cfg("port", "port", 9)
+            method = _cfg("verify_method", "method", VERIFY_METHOD_PING)
 
             # ── 3. Probe the still-unverified SENT targets ─────────────────
-            non_responders = await verify_run_targets(db, run, attempt)
+            non_responders = await verify_run_targets(db, run, attempt, method=method)
 
             # A row can only be re-woken if it still carries a mac + broadcast
             # (the WakeTarget requires both). An address-less / mac-less edge row

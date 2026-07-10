@@ -524,7 +524,7 @@ OBSERVABILITY.md, not these tables.
 | `AIProvider` / `AIChatSession` / `AIChatMessage` | `ai.py` | Operator Copilot LLM provider + chat history |
 | `OUIVendor` | `oui_vendor` | `oui.py` | MAC OUI → vendor lookup table |
 | `NmapScan` / `PacketCapture` | `nmap.py` / `pcap.py` | on-demand scan / capture job rows |
-| `WolSchedule` / `WolRun` / `WolRunTarget` | `wol_schedule` / `wol_run` / `wol_run_target` | `wol_schedule.py` | Scheduled Wake-on-LAN (#586) — recurring cron/tag-targeted job + per-fire run history + per-host outcome |
+| `WolSchedule` / `WolRun` / `WolRunTarget` | `wol_schedule` / `wol_run` / `wol_run_target` | `wol_schedule.py` | Scheduled Wake-on-LAN (#586) — recurring cron/tag-targeted job + per-fire run history + per-host outcome. `wol_schedule.verify_method` picks the liveness source (`ping` / `tcp` / `seen` / `auto`, #596). `wol_run.verify_params` (JSONB, nullable) is the per-run verify+re-wake config snapshot for ad-hoc runs (`schedule_id IS NULL`, `trigger='adhoc'`), which have no parent schedule row to read it from; NULL on scheduled runs |
 | `WolCalendar` / `WolCalendarEvent` | `wol_calendar` / `wol_calendar_event` | `wol_schedule.py` | subscribed iCal/CalDAV calendar (Fernet password) whose flattened all-day spans gate scheduled wakes |
 | `TLSCertTarget` / `TLSCertProbe` | `tls_cert.py` | cert-expiry monitoring targets + probe results |
 | `FirewallPolicy` / `FirewallRule` / `FirewallAlias` / `FirewallApplyState` | `firewall.py` | per-appliance host firewall config |

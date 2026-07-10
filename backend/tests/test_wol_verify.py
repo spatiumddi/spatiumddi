@@ -3,6 +3,11 @@
 Covers the chained verify state machine (:func:`app.tasks.wol_scheduler._verify_run`)
 end to end plus its two pure building blocks:
 
+Multi-source liveness (#596) adds sections 4 + 5: the ``tcp`` / ``seen`` probes
+and the fusion policy — passive sources may only confirm, never condemn; a
+sighting predating the wake can never confirm it; a passive confirm never
+re-stamps Seen; and ``auto`` short-circuits on the first source that answers.
+
 * ``auto_stagger_ms`` — the stagger auto-tune bands + the operator-override
   passthrough.
 * ``probe_liveness`` — ping exit-code → up/down, never-raises.
@@ -36,7 +41,12 @@ from app.core.security import hash_password
 from app.models.auth import User
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
 from app.models.wol_schedule import WolRun, WolRunTarget, WolSchedule
-from app.services.wol_scheduler.verify import auto_stagger_ms, probe_liveness
+from app.services.wol_scheduler.verify import (
+    auto_stagger_ms,
+    probe_liveness,
+    probe_seen,
+    verify_run_targets,
+)
 
 # ══════════════════════════════════════════════════════════════════════
 # 1. auto_stagger_ms — bands + override passthrough (pure)
@@ -754,3 +764,255 @@ async def test_stale_attempt_redelivery_is_noop_and_waves_bounded(
     assert fresh is not None
     assert fresh.verify_state == task.VERIFY_DONE
     assert fresh.unverified_count == 1
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 4. Multi-source liveness — probes (issue #596)
+# ══════════════════════════════════════════════════════════════════════
+
+
+async def test_probe_tcp_up_on_connect() -> None:
+    with patch("app.services.wol_scheduler.verify._tcp_alive", new=AsyncMock(return_value=True)):
+        up, method = await probe_liveness("10.20.0.11", method="tcp")
+    assert up is True
+    assert method == "tcp"
+
+
+async def test_probe_tcp_down_when_filtered() -> None:
+    with patch("app.services.wol_scheduler.verify._tcp_alive", new=AsyncMock(return_value=False)):
+        up, method = await probe_liveness("10.20.0.11", method="tcp")
+    assert up is False
+    assert method == "tcp"
+
+
+async def test_probe_tcp_never_raises() -> None:
+    """A probe blowing up is a DOWN verdict, never an aborted pass."""
+    with patch(
+        "app.services.wol_scheduler.verify._tcp_alive",
+        new=AsyncMock(side_effect=OSError("no route")),
+    ):
+        up, method = await probe_liveness("10.20.0.11", method="tcp")
+    assert up is False
+    assert method == "tcp"
+
+
+async def test_probe_passive_method_falls_back_to_ping() -> None:
+    """``probe_liveness`` only runs ACTIVE probes; ``seen`` is not its job."""
+    with patch(
+        "app.services.wol_scheduler.verify.run_ping",
+        new=AsyncMock(return_value=_ping_result(0)),
+    ):
+        up, method = await probe_liveness("10.20.0.11", method="seen")
+    assert up is True
+    assert method == "ping"
+
+
+async def test_probe_seen_abstains_on_null_ip(db_session: AsyncSession) -> None:
+    """FK SET NULL left no IPAM row to read — abstain, don't condemn."""
+    assert await probe_seen(db_session, None, datetime.now(UTC)) is None
+
+
+async def test_probe_seen_true_only_for_post_wake_sighting(db_session: AsyncSession) -> None:
+    subnet = await _subnet(db_session)
+    wake = datetime.now(UTC)
+    ip = IPAddress(
+        subnet_id=subnet.id,
+        address="10.20.0.11",
+        mac_address="aa:bb:cc:dd:ee:01",
+        last_seen_at=wake + timedelta(seconds=5),
+    )
+    db_session.add(ip)
+    await db_session.flush()
+    assert await probe_seen(db_session, ip.id, wake) is True
+
+    # The stale-cache false-up: a sighting from BEFORE the magic packet went out
+    # says nothing about whether this wake worked.
+    ip.last_seen_at = wake - timedelta(minutes=10)
+    await db_session.flush()
+    assert await probe_seen(db_session, ip.id, wake) is False
+
+    # Never observed at all.
+    ip.last_seen_at = None
+    await db_session.flush()
+    assert await probe_seen(db_session, ip.id, wake) is False
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 5. Multi-source liveness — fusion in verify_run_targets (issue #596)
+# ══════════════════════════════════════════════════════════════════════
+
+
+def _probe_by_method(up_for: dict[str, set[str]], calls: list[tuple[str, str]]) -> Any:
+    """A patched ``probe_liveness`` keyed on (method, address), recording calls.
+
+    ``up_for`` maps an active method → the set of addresses it reports UP.
+    """
+
+    async def fake(address: str | None, vantage: Any = None, *, method: str = "ping"):
+        calls.append((str(address), method))
+        return (address in up_for.get(method, set())), method
+
+    return fake
+
+
+async def _seeded_target(
+    db: AsyncSession,
+    *,
+    seen_offset: timedelta | None,
+    link_ip: bool = True,
+) -> tuple[WolRun, WolRunTarget, IPAddress | None]:
+    """One SENT target, optionally linked to an IP seen ``seen_offset`` from the wake."""
+    owner = await _owner(db)
+    subnet = await _subnet(db)
+    ip: IPAddress | None = None
+    if link_ip:
+        ip = IPAddress(subnet_id=subnet.id, address="10.20.0.11", mac_address="aa:bb:cc:dd:ee:01")
+        db.add(ip)
+        await db.flush()
+    schedule = _make_schedule(owner.id)
+    db.add(schedule)
+    await db.flush()
+    run, targets = await _run_with_sent_targets(
+        db, schedule, [("10.20.0.11", "aa:bb:cc:dd:ee:01", ip.id if ip else None)]
+    )
+    await db.refresh(run)
+    if ip is not None and seen_offset is not None:
+        ip.last_seen_at = run.started_at + seen_offset
+        await db.flush()
+    return run, targets[0], ip
+
+
+async def test_seen_confirms_post_wake_sighting_without_restamping(
+    db_session: AsyncSession,
+) -> None:
+    """A passive confirm must not claim we probed the host ourselves."""
+    run, target, ip = await _seeded_target(db_session, seen_offset=timedelta(seconds=5))
+    assert ip is not None
+    original_seen_at = ip.last_seen_at
+
+    down = await verify_run_targets(db_session, run, 1, method="seen")
+
+    assert down == []
+    assert target.verified is True
+    assert target.verify_method == "seen"
+    # Seen infra untouched: the sighting belongs to whichever subsystem saw it.
+    assert ip.last_seen_at == original_seen_at
+    assert ip.last_seen_method is None
+
+
+async def test_seen_pre_wake_sighting_is_down_not_up(db_session: AsyncSession) -> None:
+    """The stale-cache false-up guard, end to end through the fusion path."""
+    run, target, _ip = await _seeded_target(db_session, seen_offset=timedelta(minutes=-10))
+
+    down = await verify_run_targets(db_session, run, 1, method="seen")
+
+    assert down == [target]
+    assert target.verified is False
+    assert target.verify_method == "seen"
+
+
+async def test_seen_null_ip_target_stays_unchecked(db_session: AsyncSession) -> None:
+    """Abstain, don't condemn: no IPAM row means no verdict, not a down verdict."""
+    run, target, _ip = await _seeded_target(db_session, seen_offset=None, link_ip=False)
+
+    down = await verify_run_targets(db_session, run, 1, method="seen")
+
+    assert down == []  # never a re-wake candidate
+    assert target.verified is None  # honestly "not checked"
+    assert target.verify_method is None
+
+
+async def test_auto_short_circuits_on_first_up(db_session: AsyncSession) -> None:
+    """ping down → tcp up: the chain stops at tcp and never consults seen."""
+    run, target, ip = await _seeded_target(db_session, seen_offset=timedelta(minutes=-10))
+    assert ip is not None
+    calls: list[tuple[str, str]] = []
+
+    with patch(
+        "app.services.wol_scheduler.verify.probe_liveness",
+        new=_probe_by_method({"tcp": {"10.20.0.11"}}, calls),
+    ):
+        down = await verify_run_targets(db_session, run, 1, method="auto")
+
+    assert down == []
+    assert target.verified is True
+    assert target.verify_method == "tcp"
+    assert calls == [("10.20.0.11", "ping"), ("10.20.0.11", "tcp")]
+    # An ACTIVE up DOES stamp Seen, with the winning method.
+    assert ip.last_seen_at is not None
+    assert ip.last_seen_at > run.started_at
+    assert ip.last_seen_method == "tcp"
+
+
+async def test_auto_live_host_costs_one_ping(db_session: AsyncSession) -> None:
+    run, target, _ip = await _seeded_target(db_session, seen_offset=None)
+    calls: list[tuple[str, str]] = []
+
+    with patch(
+        "app.services.wol_scheduler.verify.probe_liveness",
+        new=_probe_by_method({"ping": {"10.20.0.11"}}, calls),
+    ):
+        down = await verify_run_targets(db_session, run, 1, method="auto")
+
+    assert down == []
+    assert target.verify_method == "ping"
+    assert calls == [("10.20.0.11", "ping")]  # tcp never ran
+
+
+async def test_auto_falls_through_to_seen_when_active_probes_fail(
+    db_session: AsyncSession,
+) -> None:
+    """The ICMP+TCP-silent-but-alive host, rescued by a post-wake sighting."""
+    run, target, ip = await _seeded_target(db_session, seen_offset=timedelta(seconds=30))
+    assert ip is not None
+    original_seen_at = ip.last_seen_at
+    calls: list[tuple[str, str]] = []
+
+    with patch(
+        "app.services.wol_scheduler.verify.probe_liveness",
+        new=_probe_by_method({}, calls),  # nothing answers actively
+    ):
+        down = await verify_run_targets(db_session, run, 1, method="auto")
+
+    assert down == []
+    assert target.verified is True
+    assert target.verify_method == "seen"
+    assert calls == [("10.20.0.11", "ping"), ("10.20.0.11", "tcp")]
+    assert ip.last_seen_at == original_seen_at  # passive never re-stamps
+
+
+async def test_auto_all_sources_down_is_a_rewake_candidate(db_session: AsyncSession) -> None:
+    run, target, _ip = await _seeded_target(db_session, seen_offset=timedelta(minutes=-10))
+    calls: list[tuple[str, str]] = []
+
+    with patch(
+        "app.services.wol_scheduler.verify.probe_liveness",
+        new=_probe_by_method({}, calls),
+    ):
+        down = await verify_run_targets(db_session, run, 1, method="auto")
+
+    assert down == [target]
+    assert target.verified is False
+    assert target.verify_method == "seen"  # the last source consulted
+
+
+async def test_richer_method_can_only_shrink_the_down_set(db_session: AsyncSession) -> None:
+    """A passive confirm removes a re-wake that ping-only would have fired."""
+    run, target, _ip = await _seeded_target(db_session, seen_offset=timedelta(seconds=30))
+    calls: list[tuple[str, str]] = []
+
+    with patch(
+        "app.services.wol_scheduler.verify.probe_liveness",
+        new=_probe_by_method({}, calls),
+    ):
+        ping_down = await verify_run_targets(db_session, run, 1, method="ping")
+    assert ping_down == [target]  # ping-only: re-wake it
+
+    # Re-probe the same row (verified is False → still a candidate) under auto.
+    with patch(
+        "app.services.wol_scheduler.verify.probe_liveness",
+        new=_probe_by_method({}, calls),
+    ):
+        auto_down = await verify_run_targets(db_session, run, 1, method="auto")
+    assert auto_down == []  # seen rescues it — no needless re-wake
+    assert target.verified is True

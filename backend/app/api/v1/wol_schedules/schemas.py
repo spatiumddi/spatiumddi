@@ -177,7 +177,12 @@ class WakeScheduleCreate(BaseModel):
     # Number of *re-wake* passes after the first probe (0 == probe once, never
     # re-wake); total probe passes ≤ verify_retries + 1.
     verify_retries: int = Field(default=1, ge=0, le=10)
-    verify_method: Literal["ping"] = "ping"
+    # Liveness source (issue #596). ``auto`` walks ping → tcp → seen and stops at
+    # the first confirmation, so it costs one ping against a live host and only
+    # pays for the extra sources on hosts a ping-only verify would have re-woken
+    # for nothing. Existing schedules keep whatever they stored; only new ones
+    # default to ``auto``.
+    verify_method: Literal["ping", "tcp", "seen", "auto"] = "auto"
 
     @field_validator("timezone")
     @classmethod
@@ -265,7 +270,7 @@ class WakeScheduleUpdate(BaseModel):
     verify_enabled: bool | None = None
     verify_wait_seconds: int | None = Field(default=None, ge=5, le=3600)
     verify_retries: int | None = Field(default=None, ge=0, le=10)
-    verify_method: Literal["ping"] | None = None
+    verify_method: Literal["ping", "tcp", "seen", "auto"] | None = None
 
     @field_validator("timezone")
     @classmethod
