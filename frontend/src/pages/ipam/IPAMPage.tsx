@@ -3247,8 +3247,9 @@ function AddAddressModal({
             });
       // If the user picked a static_dhcp status and a scope, mirror the row
       // into the DHCP side so the two stay in sync (the backend
-      // `_upsert_ipam_for_static` helper will find the existing IPAM row and
-      // just link / update it — no duplicate is created).
+      // `upsert_ipam_for_static` helper in `services/dhcp/static_ipam.py` will
+      // find the existing IPAM row and just link / update it — no duplicate is
+      // created).
       // #516 — the address IS already created at this point; a failing
       // reservation must NOT surface as "Failed to allocate address" (the
       // row exists, so re-submitting collides). Catch it separately and

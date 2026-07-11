@@ -979,8 +979,28 @@ class IPAddress(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     dns_record_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("dns_record.id", ondelete="SET NULL"), nullable=True
     )
-    # DHCP linkage: stored as strings (DHCP models don't exist yet).
+    # DHCP linkage: stored as a string (the DHCP models didn't exist yet when
+    # this column landed).
     dhcp_lease_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Back-link to the reservation that owns this row (mirror of the forward
+    # ``DHCPStaticAssignment.ip_address_id`` FK).
+    #
+    # Still a bare string, NOT a foreign key: as a varchar it can dangle, and it
+    # did — a scope hard-delete/purge removes reservations via FK CASCADE (or a
+    # Core DELETE), neither of which runs Python, so nothing released the mirror
+    # and this row was left stranded at ``status="static_dhcp"`` pointing at a
+    # reservation Postgres had already dropped (#618). Fixed at the behavioural
+    # level: the destruction paths now call
+    # ``services.dhcp.static_ipam.detach_ipam_for_static`` first — see that
+    # module's docstring for the wired-in list, and for the one known gap
+    # (the Windows scope-sync reconciler) that still needs a re-point pass.
+    #
+    # Making it a real ``uuid`` FK (ON DELETE SET NULL) would make the dangle
+    # unrepresentable, but retyping varchar → uuid in one shot breaks the
+    # rolling-upgrade contract (#296): during the mixed-version window N-1 pods
+    # still compare this column against a Python ``str``, which Postgres cannot
+    # coerce to ``uuid``. It needs the two-release expand/contract treatment —
+    # deferred, tracked on #618.
     static_assignment_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     # True if the row was auto-created from a live DHCP lease (as opposed to
     # being manually allocated or from a static assignment). When the lease

@@ -1,15 +1,24 @@
 """Shared soft-delete + restore primitives.
 
-Soft-deletable models live in IPAM / DNS / DHCP — see ``SOFT_DELETE_MODELS``.
+Soft-deletable models live in IPAM / DNS / DHCP — see ``TYPE_TO_MODEL``.
 The default ORM query filter (``app.db._filter_soft_deleted``) hides any row
 with a non-null ``deleted_at`` from every SELECT unless the caller opts in
 via ``execution_options(include_deleted=True)``.
 
-Cascading: when soft-deleting a parent (IPSpace / IPBlock / Subnet / DNSZone)
-we walk every descendant in scope and stamp them with the same ``deleted_at``
-+ ``deletion_batch_id``. ``DHCPScope`` is a leaf so its cascades only matter
-when an ancestor Subnet is being deleted. ``DNSRecord`` cascades from a
-parent DNSZone the same way.
+Cascading: when soft-deleting a parent (IPSpace / IPBlock / Subnet / DNSZone /
+DHCPScope) we walk every descendant in scope and stamp them with the same
+``deleted_at`` + ``deletion_batch_id``. ``DNSRecord`` cascades from a parent
+DNSZone; ``DHCPPool`` + ``DHCPStaticAssignment`` cascade from a parent
+DHCPScope (#617 — a scope used to be treated as a leaf, which left its pools
+and reservations as live, un-stamped rows pointing at a hidden parent: still
+enforcing group-wide MAC uniqueness and still answering ``GET
+/scopes/{id}/statics`` for a scope the operator could no longer see).
+
+Root vs child: ``SOFT_DELETE_RESOURCE_TYPES`` is the set of types the trash UI
+*browses* and can restore/purge individually. ``TYPE_TO_MODEL`` is the wider
+set that :func:`restore_batch` sweeps — it also carries the cascade-only
+children, which are restored with their parent's batch but are never addressed
+on their own.
 
 A standalone soft-delete still gets a fresh batch UUID, which keeps the
 restore-by-batch lookup uniform on the wire.
@@ -29,10 +38,15 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.dhcp import DHCPScope
+from app.models.dhcp import DHCPPool, DHCPScope, DHCPStaticAssignment
 from app.models.dns import DNSRecord, DNSZone
 from app.models.ipam import IPBlock, IPSpace, Subnet
 
+# Types the trash UI browses, and that ``restore_row`` /
+# ``permanent_delete_from_trash`` accept as an addressable target. Cascade-only
+# children (DHCPPool / DHCPStaticAssignment) are deliberately NOT here: they
+# ride their parent's batch and would otherwise spam the trash list with one
+# row per reservation.
 SOFT_DELETE_RESOURCE_TYPES: tuple[str, ...] = (
     "ip_space",
     "ip_block",
@@ -47,6 +61,10 @@ SOFT_DELETE_RESOURCE_TYPES: tuple[str, ...] = (
 # to look up rows generically. Kept here so the canonical names live in one
 # place — anywhere outside this module that needs the mapping should import
 # it rather than hand-rolling its own copy.
+#
+# Superset of SOFT_DELETE_RESOURCE_TYPES: this is what ``restore_batch`` sweeps,
+# so it must carry the cascade-only children too or a restore would bring the
+# scope back without its pools and reservations.
 TYPE_TO_MODEL: dict[str, type] = {
     "ip_space": IPSpace,
     "ip_block": IPBlock,
@@ -54,6 +72,9 @@ TYPE_TO_MODEL: dict[str, type] = {
     "dns_zone": DNSZone,
     "dns_record": DNSRecord,
     "dhcp_scope": DHCPScope,
+    # Cascade-only children — restored with the batch, never addressed alone.
+    "dhcp_pool": DHCPPool,
+    "dhcp_static_assignment": DHCPStaticAssignment,
 }
 
 
@@ -90,6 +111,10 @@ def _row_display(obj: Any) -> str:
         return f"{obj.fqdn} {obj.record_type}"
     if isinstance(obj, DHCPScope):
         return obj.name or str(obj.id)
+    if isinstance(obj, DHCPPool):
+        return f"{obj.pool_type} pool {obj.start_ip}-{obj.end_ip}"
+    if isinstance(obj, DHCPStaticAssignment):
+        return f"{obj.mac_address} → {obj.ip_address}"
     return str(getattr(obj, "id", obj))
 
 
@@ -106,6 +131,10 @@ def _resource_type(obj: Any) -> str:
         return "dns_record"
     if isinstance(obj, DHCPScope):
         return "dhcp_scope"
+    if isinstance(obj, DHCPPool):
+        return "dhcp_pool"
+    if isinstance(obj, DHCPStaticAssignment):
+        return "dhcp_static_assignment"
     raise ValueError(f"Not a soft-deletable model: {type(obj).__name__}")
 
 
@@ -144,7 +173,20 @@ async def _collect_descendants(db: AsyncSession, root: Any) -> list[Any]:
     elif isinstance(root, Subnet):
         scope_res = await db.execute(select(DHCPScope).where(DHCPScope.subnet_id == root.id))
         for scope in scope_res.scalars().all():
+            out.extend(await _collect_descendants(db, scope))
             out.append(scope)
+    elif isinstance(root, DHCPScope):
+        # A scope's pools + reservations are cascade children, not independent
+        # rows: the FK is NOT NULL / ON DELETE CASCADE, uniqueness is keyed on
+        # the scope, and Kea renders reservations nested inside the scope's
+        # subnet4 stanza. They must ride the same batch so a restore brings the
+        # scope back whole (#617).
+        pool_res = await db.execute(select(DHCPPool).where(DHCPPool.scope_id == root.id))
+        out.extend(pool_res.scalars().all())
+        static_res = await db.execute(
+            select(DHCPStaticAssignment).where(DHCPStaticAssignment.scope_id == root.id)
+        )
+        out.extend(static_res.scalars().all())
     elif isinstance(root, DNSZone):
         rec_res = await db.execute(select(DNSRecord).where(DNSRecord.zone_id == root.id))
         for record in rec_res.scalars().all():
@@ -312,5 +354,35 @@ async def default_conflict_check(db: AsyncSession, obj: Any) -> str | None:
         ).scalar_one_or_none()
         if existing is not None:
             return "An active DHCP scope already exists for this group + subnet"
+
+    elif isinstance(obj, DHCPStaticAssignment):
+        # A reservation's MAC is unique across the whole group, not just the
+        # scope (see ``_conflict_check`` on the create path). While the scope
+        # sat in the trash, a live scope in the same group may have claimed
+        # this MAC — restoring would resurrect a group-wide duplicate that the
+        # create path would have refused (#617).
+        parent = (
+            await db.execute(
+                select(DHCPScope)
+                .where(DHCPScope.id == obj.scope_id)
+                .execution_options(include_deleted=True)
+            )
+        ).scalar_one_or_none()
+        if parent is not None:
+            clash = (
+                await db.execute(
+                    select(DHCPStaticAssignment)
+                    .join(DHCPScope, DHCPStaticAssignment.scope_id == DHCPScope.id)
+                    .where(
+                        DHCPScope.group_id == parent.group_id,
+                        DHCPStaticAssignment.mac_address == obj.mac_address,
+                        DHCPStaticAssignment.id != obj.id,
+                    )
+                )
+            ).first()
+            if clash is not None:
+                return (
+                    f"MAC {obj.mac_address} has since been reserved by a live scope in this group"
+                )
 
     return None

@@ -438,17 +438,42 @@ class DHCPScope(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     imported_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     group: Mapped[DHCPServerGroup] = relationship("DHCPServerGroup", back_populates="scopes")
+    # ``selectin``, NOT ``joined`` (#617). These are collections, so a joined
+    # eager load multiplies rows and — the part that actually bit us — forces
+    # every ``select(DHCPScope)`` in the codebase to remember ``.unique()`` or
+    # raise ``InvalidRequestError`` at runtime. Several didn't: the Trash list,
+    # restore, and permanent-delete all 500'd the moment a soft-deleted scope had
+    # a single pool or reservation (i.e. any real scope), and the conformity
+    # engine / subnet resize / radvd tool carried the same latent trap.
+    #
+    # It also fixes soft-delete filtering of the children, which ``joined`` got
+    # wrong. The global filter registers with ``propagate_to_loaders=False``
+    # (app/db.py) so it does NOT reach a JOINED child — a soft-deleted pool would
+    # ride the parent's statement straight into the rendered config. ``selectin``
+    # emits the child as its own ORM execute, so the filter is applied to it
+    # independently (primary entity = the child model). Verified both ways:
+    #
+    #   live scope + soft-deleted child, no opt-out  -> scope.pools == []
+    #   parent loaded with include_deleted=True      -> scope.pools == [child]
+    #
+    # i.e. the ``include_deleted`` opt-out propagates from the parent statement to
+    # the child load, so a blast-radius count / purge pre-pass CAN read the
+    # collections on a trashed scope, and a renderer never sees a trashed child.
+    #
+    # Still eager, which async SQLAlchemy requires; delete-orphan cascade is
+    # unaffected (a soft-deleted child the ORM cascade no longer enumerates is
+    # removed by the DB-level ON DELETE CASCADE instead).
     pools: Mapped[list[DHCPPool]] = relationship(
         "DHCPPool",
         back_populates="scope",
         cascade="all, delete-orphan",
-        lazy="joined",
+        lazy="selectin",
     )
     statics: Mapped[list[DHCPStaticAssignment]] = relationship(
         "DHCPStaticAssignment",
         back_populates="scope",
         cascade="all, delete-orphan",
-        lazy="joined",
+        lazy="selectin",
     )
     # ``selectin`` rather than ``joined`` because the profile's
     # ``matches`` collection is itself joined-loaded — pulling profile
@@ -464,8 +489,14 @@ class DHCPScope(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     )
 
 
-class DHCPPool(UUIDPrimaryKeyMixin, TimestampMixin, Base):
-    """A range within a scope: dynamic, excluded, or reserved."""
+class DHCPPool(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
+    """A range within a scope: dynamic, excluded, or reserved.
+
+    Soft-deletable (#617) purely as a cascade child of ``DHCPScope`` — a pool
+    is never soft-deleted on its own (``delete_pool`` is a hard delete), it is
+    only stamped as part of its scope's deletion batch so a scope restore
+    brings its ranges back atomically.
+    """
 
     __tablename__ = "dhcp_pool"
     __table_args__ = (Index("ix_dhcp_pool_scope", "scope_id"),)
@@ -504,13 +535,41 @@ class DHCPPool(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     scope: Mapped[DHCPScope] = relationship("DHCPScope", back_populates="pools")
 
 
-class DHCPStaticAssignment(UUIDPrimaryKeyMixin, TimestampMixin, Base):
-    """A DHCP reservation (MAC → IP) within a scope."""
+class DHCPStaticAssignment(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
+    """A DHCP reservation (MAC → IP) within a scope.
+
+    The scope is part of the reservation's identity — uniqueness is keyed on
+    it, Kea renders reservations *nested inside* the scope's ``subnet4``
+    stanza, and Windows keys them by the scope's network address. There is no
+    renderable form of a scope-less reservation, which is why ``scope_id`` is
+    NOT NULL / CASCADE and why the reservation soft-deletes as a cascade child
+    of its scope rather than being re-pointed or orphaned (#617).
+
+    Soft-deletable purely as that cascade child — a reservation is never
+    soft-deleted on its own (``delete_static`` is a hard delete that releases
+    the IPAM mirror); it is only stamped as part of its scope's deletion batch,
+    so a scope restore brings its reservations back atomically.
+    """
 
     __tablename__ = "dhcp_static_assignment"
     __table_args__ = (
-        UniqueConstraint("scope_id", "mac_address", name="uq_dhcp_static_scope_mac"),
-        UniqueConstraint("scope_id", "ip_address", name="uq_dhcp_static_scope_ip"),
+        # Partial unique indexes, not plain UniqueConstraints: a soft-deleted
+        # reservation must not hold the (scope, mac) / (scope, ip) slot against
+        # a live one. Same shape as ``uq_dhcp_scope_group_subnet`` (#474).
+        Index(
+            "uq_dhcp_static_scope_mac",
+            "scope_id",
+            "mac_address",
+            unique=True,
+            postgresql_where=sa_text("deleted_at IS NULL"),
+        ),
+        Index(
+            "uq_dhcp_static_scope_ip",
+            "scope_id",
+            "ip_address",
+            unique=True,
+            postgresql_where=sa_text("deleted_at IS NULL"),
+        ),
         Index("ix_dhcp_static_scope", "scope_id"),
         Index("ix_dhcp_static_mac", "mac_address"),
     )

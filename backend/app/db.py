@@ -127,11 +127,26 @@ def _soft_delete_models() -> tuple[type, ...]:
     is trivial.
     """
 
-    from app.models.dhcp import DHCPScope
+    from app.models.dhcp import DHCPPool, DHCPScope, DHCPStaticAssignment
     from app.models.dns import DNSRecord, DNSZone
     from app.models.ipam import IPBlock, IPSpace, Subnet
 
-    return (IPSpace, IPBlock, Subnet, DNSZone, DNSRecord, DHCPScope)
+    return (
+        IPSpace,
+        IPBlock,
+        Subnet,
+        DNSZone,
+        DNSRecord,
+        DHCPScope,
+        # Cascade children of DHCPScope (#617). Registering them here is what
+        # closes the read leaks: a bare ``select(DHCPStaticAssignment)`` — the
+        # statics list route, the group-wide MAC conflict check, the
+        # ``find_dhcp_statics`` MCP tool — is now filtered on the primary
+        # entity, so a trashed scope's reservations stop answering queries and
+        # stop 409-ing new ones against a scope the operator cannot see.
+        DHCPPool,
+        DHCPStaticAssignment,
+    )
 
 
 _CACHED_SOFT_DELETE_MODELS: tuple[type, ...] | None = None

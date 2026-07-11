@@ -1159,14 +1159,20 @@ function ScopeDeleteModal({
       `${statics.length} reservation${statics.length === 1 ? "" : "s"}`,
     );
   const windowsNote = groupServers.some((s) => s.driver === "windows_dhcp")
-    ? " The scope will also be removed from the Windows DHCP server via WinRM."
+    ? " The scope is also removed from the Windows DHCP server via WinRM."
     : "";
   return (
     <DeleteConfirmModal
       title="Delete DHCP Scope"
       description={
+        // The old copy — "All its pools and reservations will be removed as
+        // well" — described the permanent path, which the UI never takes. The
+        // default is a soft-delete: the scope and its children stop being served
+        // immediately (agents converge within seconds) but move to Trash
+        // together and restore together (#617).
         `Delete scope "${scope.name || scope.id.slice(0, 8)}"? ` +
-        "All its pools and reservations will be removed as well." +
+        "Its pools and reservations go with it — they stop being served straight " +
+        "away, and are restorable as a set from Administration → Trash." +
         windowsNote
       }
       referencesTitle={

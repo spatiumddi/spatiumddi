@@ -22,13 +22,19 @@ from app.api.deps import DB, SuperAdmin
 from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.dhcp import DHCPScope
-from app.models.dns import DNSRecord, DNSZone
-from app.models.ipam import IPBlock, IPSpace, Subnet
-from app.services.soft_delete import (
+from app.services.dhcp.static_ipam import detach_ipam_for_scope_statics
+from app.services.dhcp.windows_writethrough import push_scope_restore
+from app.services.soft_delete import (  # noqa: PLC2701 — canonical labels, keep in one place
     SOFT_DELETE_RESOURCE_TYPES,
     TYPE_TO_MODEL,
     default_conflict_check,
     restore_batch,
+)
+from app.services.soft_delete import (
+    _resource_type as resource_type_for,
+)
+from app.services.soft_delete import (
+    _row_display as _row_label,
 )
 
 logger = structlog.get_logger(__name__)
@@ -69,22 +75,6 @@ class RestoreConflict(BaseModel):
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────
-
-
-def _row_label(obj: Any) -> str:
-    """Mirror of services.soft_delete._row_display, kept here so the trash
-    list can label rows without importing that private helper."""
-    if isinstance(obj, IPSpace):
-        return obj.name
-    if isinstance(obj, (IPBlock, Subnet)):
-        return f"{obj.network}{(' ' + obj.name) if getattr(obj, 'name', '') else ''}".strip()
-    if isinstance(obj, DNSZone):
-        return obj.name
-    if isinstance(obj, DNSRecord):
-        return f"{obj.fqdn} {obj.record_type}"
-    if isinstance(obj, DHCPScope):
-        return obj.name or str(obj.id)
-    return str(getattr(obj, "id", obj))
 
 
 async def _resolve_usernames(db: Any, user_ids: set[uuid.UUID]) -> dict[uuid.UUID, str]:
@@ -164,8 +154,11 @@ async def list_trash(
     }
     for batch_id in seen_batches:
         size = 0
-        for resource_type in SOFT_DELETE_RESOURCE_TYPES:
-            model = TYPE_TO_MODEL[resource_type]
+        # TYPE_TO_MODEL, not SOFT_DELETE_RESOURCE_TYPES: the batch carries
+        # cascade-only children (a scope's pools + reservations) that the trash
+        # list deliberately doesn't browse, but that must still be counted or
+        # the blast radius under-reports (#617).
+        for model in TYPE_TO_MODEL.values():
             res = await db.execute(
                 select(func.count())
                 .select_from(model)
@@ -229,9 +222,13 @@ async def restore_row(
             detail={"message": "Restore would clash with active rows", "conflicts": conflicts},
         )
 
+    # Soft-delete pushed a remove-scope to every agentless (Windows) member
+    # (#616); the restore owes them the inverse or the scope comes back in
+    # SpatiumDDI only and the two silently diverge. Runs after restore_batch has
+    # un-stamped the rows, so the per-object helpers' scope lookups resolve.
     for obj in restored:
-        from app.services.soft_delete import _resource_type as resource_type_for  # noqa: PLC0415
-
+        if isinstance(obj, DHCPScope):
+            await push_scope_restore(db, obj)
         db.add(
             AuditLog(
                 user_id=current_user.id,
@@ -265,12 +262,14 @@ async def permanent_delete_from_trash(
 ) -> None:
     """Hard-delete a soft-deleted row from the trash.
 
-    Unlike the per-resource ``?permanent=true`` flag (which both deletes
-    *and* runs the legacy write-through hooks), this endpoint just removes
-    the DB row that's already been soft-deleted. The downstream cleanup
-    (Windows DHCP scope removal, DNS zone delete on agentless servers)
-    has either already happened or doesn't need to since the row was
-    already hidden from queries.
+    The agentless write-through (Windows DHCP scope removal, DNS zone delete)
+    already fired at soft-delete time — deleted means deleted on every backend
+    the moment the operator asks for it (#616) — so this endpoint only has to
+    remove the DB row.
+
+    It does still have to release the IPAM mirror of any reservation it is about
+    to destroy: the rows go via FK CASCADE, which runs no Python, so nothing else
+    would (#618).
     """
 
     if type not in SOFT_DELETE_RESOURCE_TYPES:
@@ -290,6 +289,8 @@ async def permanent_delete_from_trash(
         raise HTTPException(status_code=404, detail="Soft-deleted row not found")
 
     label = _row_label(target)
+    if isinstance(target, DHCPScope):
+        await detach_ipam_for_scope_statics(db, target.id)
     db.add(
         AuditLog(
             user_id=current_user.id,

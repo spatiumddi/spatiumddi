@@ -161,7 +161,7 @@ async def test_delete_lease_endpoint_removes_lease_and_mirror(
 
 @pytest.mark.asyncio
 async def test_detach_static_frees_ipam_row_to_available(db_session: AsyncSession) -> None:
-    from app.api.v1.dhcp.statics import _detach_ipam_for_static
+    from app.services.dhcp.static_ipam import detach_ipam_for_static
 
     grp, _srv = await _server(db_session)
     subnet, scope = await _subnet(db_session, grp)
@@ -180,7 +180,7 @@ async def test_detach_static_frees_ipam_row_to_available(db_session: AsyncSessio
     db_session.add(row)
     await db_session.commit()
 
-    await _detach_ipam_for_static(db_session, st)
+    await detach_ipam_for_static(db_session, st)
     await db_session.flush()
     await db_session.refresh(row)
 

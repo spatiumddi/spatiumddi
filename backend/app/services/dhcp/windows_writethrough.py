@@ -178,6 +178,81 @@ async def push_scope_delete(db: AsyncSession, scope: DHCPScope) -> None:
             raise WindowsPushError(str(exc)) from exc
 
 
+async def push_scope_restore(db: AsyncSession, scope: DHCPScope) -> None:
+    """Re-create a restored scope, plus its pools and reservations, on Windows members.
+
+    The counterpart to :func:`push_scope_delete` firing on the soft-delete path
+    (#616). Soft-delete removes the scope from the Windows box; a restore has to
+    put it back, or the operator gets it back in SpatiumDDI only and the two
+    silently diverge — the exact drift the write-through exists to prevent.
+
+    Best-effort per child, unlike the edit paths: a restore is a recovery
+    action, and one un-pushable child (e.g. a ``reserved`` pool, which Windows
+    has no equivalent for) must not wedge the whole thing. Failures are logged;
+    the operator can re-sync. The DB restore is authoritative either way.
+
+    Callers must invoke this *after* the rows are un-stamped, so the scope
+    lookups inside the per-object helpers resolve.
+    """
+    win_servers = await _windows_servers_for_group(db, scope.group_id)
+    if not win_servers:
+        return
+
+    # Best-effort INCLUDING the scope itself. push_scope_upsert raises
+    # WindowsPushError (a 502) on failure, which would propagate out of the trash
+    # restore handler and roll the DB restore back — so an unreachable Windows
+    # member would make the row unrestorable, which is the opposite of what a
+    # recovery action should do. Log and bail: the children cannot land if the
+    # scope isn't there, so continuing would only add noise.
+    try:
+        await push_scope_upsert(db, scope)
+    except Exception as exc:  # noqa: BLE001 — best-effort, see docstring
+        logger.warning(
+            "windows_dhcp_push_scope_restore_scope_failed",
+            scope=str(scope.id),
+            error=str(exc),
+        )
+        return
+
+    pools = (
+        (await db.execute(select(DHCPPool).where(DHCPPool.scope_id == scope.id))).scalars().all()
+    )
+    for pool in pools:
+        if pool.pool_type == "dynamic":
+            # Already covered — a dynamic range is a scope property on Windows
+            # and push_scope_upsert re-applied it.
+            continue
+        try:
+            await push_pool_change(db, pool, action="create")
+        except Exception as exc:  # noqa: BLE001 — best-effort, see docstring
+            logger.warning(
+                "windows_dhcp_push_scope_restore_pool_failed",
+                scope=str(scope.id),
+                pool=str(pool.id),
+                error=str(exc),
+            )
+
+    statics = (
+        (
+            await db.execute(
+                select(DHCPStaticAssignment).where(DHCPStaticAssignment.scope_id == scope.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for st in statics:
+        try:
+            await push_static_change(db, st, action="create")
+        except Exception as exc:  # noqa: BLE001 — best-effort, see docstring
+            logger.warning(
+                "windows_dhcp_push_scope_restore_static_failed",
+                scope=str(scope.id),
+                static=str(st.id),
+                error=str(exc),
+            )
+
+
 async def push_pool_change(
     db: AsyncSession,
     pool: DHCPPool,
@@ -389,6 +464,7 @@ __all__ = [
     "WindowsPushError",
     "push_pool_change",
     "push_scope_delete",
+    "push_scope_restore",
     "push_scope_upsert",
     "push_static_change",
     "push_statics_bulk_delete",

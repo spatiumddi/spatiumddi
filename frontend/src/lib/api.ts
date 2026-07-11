@@ -7033,14 +7033,14 @@ export const dhcpApi = {
         params,
       })
       .then((r) => r.data),
-  createStatic: (scopeId: string, data: Partial<DHCPStaticAssignment>) =>
+  createStatic: (scopeId: string, data: DHCPStaticAssignmentWrite) =>
     api
       .post<DHCPStaticAssignment>(`/dhcp/scopes/${scopeId}/statics`, data)
       .then((r) => r.data),
   updateStatic: (
     _scopeId: string,
     staticId: string,
-    data: Partial<DHCPStaticAssignment>,
+    data: DHCPStaticAssignmentWrite,
   ) =>
     api
       .put<DHCPStaticAssignment>(`/dhcp/statics/${staticId}`, data)
@@ -7333,6 +7333,30 @@ export interface DHCPPool {
   created_at: string;
   modified_at: string;
 }
+
+/**
+ * Fields the reservation create/update API actually accepts.
+ *
+ * Deliberately NOT `Partial<DHCPStaticAssignment>`: that includes `scope_id`,
+ * which the API refuses. A reservation cannot be re-pointed at another scope —
+ * the scope is part of its identity (uniqueness is keyed on it, and Kea renders
+ * the reservation nested inside the scope's subnet stanza). The backend used to
+ * drop a stray `scope_id` silently; it now 422s (#619), so the payload type has
+ * to be honest about what is sendable.
+ */
+export type DHCPStaticAssignmentWrite = Partial<
+  Pick<
+    DHCPStaticAssignment,
+    | "ip_address"
+    | "mac_address"
+    | "hostname"
+    | "description"
+    | "client_id"
+    | "duid"
+    | "options_override"
+    | "ip_address_id"
+  >
+> & { tags?: Record<string, unknown> };
 
 export interface DHCPStaticAssignment {
   id: string;

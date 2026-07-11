@@ -711,8 +711,9 @@ async def find_dhcp_pool_occupancy(
         stmt = stmt.where(DHCPPool.scope_id == args.scope_id)
     if args.group_id:
         stmt = stmt.where(DHCPScope.group_id == args.group_id)
-    # ``.unique()`` is required because the ORM entities carry eager-loaded
-    # collection relationships (DHCPScope.pools etc.).
+    # ``.unique()`` is a harmless leftover, not a requirement: DHCPScope's
+    # collections are selectin-loaded as of #617, so no joined-collection rows
+    # need de-duplicating.
     rows = (await db.execute(stmt)).unique().all()
 
     # One batched lease query for all pools rather than one per pool (N+1).
