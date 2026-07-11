@@ -128,9 +128,7 @@ class MerakiOrg(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # built-in ``Blocked`` (sent verbatim as ``devicePolicy``); a custom named
     # group policy would additionally need its ``groupPolicyId`` resolved and
     # ``devicePolicy="Group policy"`` — a follow-up. Keep this ``Blocked``.
-    block_policy_name: Mapped[str] = mapped_column(
-        String(127), nullable=False, default="Blocked"
-    )
+    block_policy_name: Mapped[str] = mapped_column(String(127), nullable=False, default="Blocked")
 
     # Block-sync convergence state (surfaced in the UI).
     last_block_sync_at: Mapped[datetime | None] = mapped_column(

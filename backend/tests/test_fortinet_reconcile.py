@@ -61,7 +61,9 @@ async def _make_fw(
 
 
 class _FakeClient:
-    def __init__(self, *, objects=None, groups=None, nat=None, interfaces=None, leases=None) -> None:
+    def __init__(
+        self, *, objects=None, groups=None, nat=None, interfaces=None, leases=None
+    ) -> None:
         self.objects = objects or []
         self.groups = groups or []
         self.nat = nat or []
@@ -104,7 +106,9 @@ async def test_objects_mirrored_and_owned_by_fortinet(db_session: AsyncSession) 
     block = IPBlock(space_id=space.id, network="10.0.0.0/24", name="b")
     db_session.add(block)
     await db_session.flush()
-    sub = Subnet(space_id=space.id, block_id=block.id, network="10.0.0.0/24", name="s", total_ips=254)
+    sub = Subnet(
+        space_id=space.id, block_id=block.id, network="10.0.0.0/24", name="s", total_ips=254
+    )
     db_session.add(sub)
     await db_session.flush()
     db_session.add(IPAddress(subnet_id=sub.id, address="10.0.0.5", status="reserved"))
@@ -163,9 +167,7 @@ async def test_vip_mirrored_to_nat_mapping(db_session: AsyncSession) -> None:
 
     assert summary.nat_created == 1
     row = (
-        await db_session.execute(
-            select(NATMapping).where(NATMapping.fortinet_firewall_id == fw.id)
-        )
+        await db_session.execute(select(NATMapping).where(NATMapping.fortinet_firewall_id == fw.id))
     ).scalar_one()
     assert str(row.internal_ip) == "10.0.0.5"
     assert str(row.external_ip) == "203.0.113.10"
@@ -178,8 +180,12 @@ async def test_interfaces_and_leases_mirrored(db_session: AsyncSession) -> None:
     await db_session.commit()
 
     fake = _FakeClient(
-        interfaces=[_FortiInterface(name="port1", cidr="10.0.0.0/24", address="10.0.0.1", zone="lan")],
-        leases=[_FortiLease(address="10.0.0.50", mac="aa:bb:cc:dd:ee:ff", hostname="pc", state="active")],
+        interfaces=[
+            _FortiInterface(name="port1", cidr="10.0.0.0/24", address="10.0.0.1", zone="lan")
+        ],
+        leases=[
+            _FortiLease(address="10.0.0.50", mac="aa:bb:cc:dd:ee:ff", hostname="pc", state="active")
+        ],
     )
     with _patch(fake):
         summary = await reconcile_firewall(db_session, fw)

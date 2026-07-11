@@ -63,9 +63,7 @@ class FirewallFeed(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # Poll telemetry — proves a firewall is actually consuming the feed.
     last_polled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_polled_ip: Mapped[str | None] = mapped_column(INET, nullable=True)
-    poll_count: Mapped[int] = mapped_column(
-        nullable=False, default=0, server_default=sa_text("0")
-    )
+    poll_count: Mapped[int] = mapped_column(nullable=False, default=0, server_default=sa_text("0"))
 
 
 __all__ = ["FIREWALL_FEED_KINDS", "FirewallFeed"]

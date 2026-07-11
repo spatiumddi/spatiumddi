@@ -295,9 +295,7 @@ async def create_org(body: OrgCreate, db: DB, user: SuperAdmin) -> OrgResponse:
 
 
 @router.put("/orgs/{org_pk}", response_model=OrgResponse)
-async def update_org(
-    org_pk: uuid.UUID, body: OrgUpdate, db: DB, user: SuperAdmin
-) -> OrgResponse:
+async def update_org(org_pk: uuid.UUID, body: OrgUpdate, db: DB, user: SuperAdmin) -> OrgResponse:
     o = await db.get(MerakiOrg, org_pk)
     if o is None:
         raise HTTPException(status_code=404, detail="Meraki org not found")

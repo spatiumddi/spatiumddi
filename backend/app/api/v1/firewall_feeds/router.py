@@ -171,9 +171,7 @@ async def create_feed(body: FeedCreate, db: DB, user: SuperAdmin) -> CreatedFeed
     _audit(db, user=user, action="firewall_feed_create", feed_id=f.id, feed_name=f.name)
     await db.commit()
     await db.refresh(f)
-    return CreatedFeedResponse(
-        feed=_to_response(f), token=token, poll_path=_poll_path(f.id, token)
-    )
+    return CreatedFeedResponse(feed=_to_response(f), token=token, poll_path=_poll_path(f.id, token))
 
 
 @router.put("/feeds/{feed_id}", response_model=FeedResponse)

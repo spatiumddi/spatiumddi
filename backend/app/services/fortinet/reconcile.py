@@ -131,7 +131,9 @@ async def reconcile_firewall(db: AsyncSession, fw: FortinetFirewall) -> MirrorSu
     await apply_objects(
         db, FORTINET_OWNER, fw.id, fw.ipam_space_id, [_to_object(o) for o in objects], summary
     )
-    await apply_nat(db, FORTINET_OWNER, fw.id, fw.name, [_to_nat(fw, r) for r in nat_rules], summary)
+    await apply_nat(
+        db, FORTINET_OWNER, fw.id, fw.name, [_to_nat(fw, r) for r in nat_rules], summary
+    )
     await apply_subnets(
         db,
         FORTINET_OWNER,
