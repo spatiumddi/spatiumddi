@@ -11375,9 +11375,10 @@ export const panosApi = {
   remove: (id: string) => api.delete(`/paloalto/firewalls/${id}`),
   sync: (id: string) =>
     api
-      .post<{ status: string; task_id: string }>(
-        `/paloalto/firewalls/${id}/sync`,
-      )
+      .post<{
+        status: string;
+        task_id: string;
+      }>(`/paloalto/firewalls/${id}/sync`)
       .then((r) => r.data),
   listObjects: (id: string) =>
     api
