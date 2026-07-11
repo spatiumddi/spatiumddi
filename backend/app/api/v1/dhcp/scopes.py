@@ -628,11 +628,16 @@ async def delete_scope(
 ) -> Any:
     """Delete a DHCP scope.
 
-    Default soft-delete stamps the scope with a fresh batch UUID so it
-    can be restored from /admin/trash. The Windows write-through is only
-    fired on the permanent path; soft-delete leaves the scope in the
-    rendered config until restoration deadline expires (the purge sweep
-    triggers the actual config refresh by hard-deleting then).
+    Default soft-delete stamps the scope — plus its pools and reservations,
+    which are cascade children (#617) — with a fresh batch UUID, so the whole
+    set restores together from /admin/trash.
+
+    Soft-delete means *stop serving immediately*, on every backend. The scope
+    drops out of the rendered ConfigBundle at once (the global ``deleted_at IS
+    NULL`` filter hides it) and ``collect_wake`` pushes agents to re-poll, so
+    Kea members converge within seconds; the Windows write-through fires on this
+    path too, so agentless members converge as well (#616). The purge sweep
+    later hard-deletes the rows; it is not what makes the config change.
 
     Two-person approval (#62): when the ``governance.approvals`` module is on
     and a ``delete:dhcp_scope`` policy matches, returns ``202`` with a pending

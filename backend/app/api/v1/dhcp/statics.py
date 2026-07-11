@@ -17,8 +17,8 @@ from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.dns_names import validate_hostname
 from app.core.permissions import require_resource_permission
 from app.models.dhcp import DHCPPool, DHCPScope, DHCPStaticAssignment
-from app.models.ipam import IPAddress, Subnet
-from app.services.dhcp.ipam_mirror import insert_ipam_mirror_row
+from app.models.ipam import Subnet
+from app.services.dhcp.static_ipam import detach_ipam_for_static, upsert_ipam_for_static
 from app.services.dhcp.windows_writethrough import push_static_change
 from app.services.tags import apply_tag_filter
 
@@ -38,6 +38,23 @@ def _validate_optional_hostname(v: str | None) -> str | None:
     return validate_hostname(v)
 
 
+def _no_scope_move(v: uuid.UUID | None) -> uuid.UUID | None:
+    """Reject a body-supplied ``scope_id`` on reservation create/update (#619).
+
+    A reservation belongs to its scope — uniqueness is keyed on it and Kea renders
+    the reservation nested inside that scope's ``subnet4`` stanza, so there is no
+    renderable form of a relocated row. On create the scope comes from the path;
+    on update it cannot change at all. Either way, a value here means the caller
+    expects something we will not do, so say so instead of silently ignoring it.
+    """
+    if v is not None:
+        raise ValueError(
+            "scope_id cannot be set from the request body. A reservation belongs to "
+            "its scope; to move one, delete it and re-create it under the target scope."
+        )
+    return v
+
+
 class StaticCreate(BaseModel):
     ip_address: str
     mac_address: str
@@ -50,6 +67,17 @@ class StaticCreate(BaseModel):
     options_override: dict[str, Any] | None = None
     ip_address_id: uuid.UUID | None = None
     tags: dict[str, Any] = Field(default_factory=dict)
+
+    # Declared only so a body ``scope_id`` is REJECTED rather than silently
+    # dropped (#619) — it is a path parameter here, and Pydantic's default
+    # ``extra="ignore"`` would swallow it with a 200 and no effect. Blanket
+    # ``extra="forbid"`` would do that too, but it would also 422 the common
+    # GET → edit → PUT round-trip (StaticResponse carries ``id`` /
+    # ``created_at`` / ``modified_at``), so reject the one field that means
+    # something and keep ignoring the server-owned ones.
+    scope_id: uuid.UUID | None = None
+
+    _reject_scope_id = field_validator("scope_id")(_no_scope_move)
 
     @field_validator("hostname")
     @classmethod
@@ -67,6 +95,16 @@ class StaticUpdate(BaseModel):
     options_override: dict[str, Any] | None = None
     ip_address_id: uuid.UUID | None = None
     tags: dict[str, Any] | None = None
+
+    # A reservation cannot be re-pointed at another scope: the scope is part of
+    # its identity (uniqueness is keyed on it, and Kea renders the reservation
+    # nested inside the scope's ``subnet4`` stanza), so there is no renderable
+    # form of a relocated row. Declared here purely to REJECT it — sending one
+    # used to be a silent 200-no-op (#619). See the note on StaticCreate for why
+    # this is a field validator and not ``extra="forbid"``.
+    scope_id: uuid.UUID | None = None
+
+    _reject_scope_id = field_validator("scope_id")(_no_scope_move)
 
     @field_validator("hostname")
     @classmethod
@@ -97,82 +135,6 @@ class StaticResponse(BaseModel):
         return str(v) if v is not None else v
 
 
-async def _upsert_ipam_for_static(
-    db, scope: DHCPScope, st: DHCPStaticAssignment, *, action: str = "create"
-) -> None:
-    """Create or update the IPAM row mirroring a static DHCP assignment.
-
-    The static is the source of truth for hostname/MAC; IPAM reflects it with
-    ``status='static_dhcp'`` and a back-link via ``static_assignment_id`` so the
-    subnet view shows the reservation alongside regular addresses.
-    """
-    ip_str = str(st.ip_address)
-    # Detach any previous IPAM row that was pointing at this static (IP change).
-    prior = await db.execute(select(IPAddress).where(IPAddress.static_assignment_id == str(st.id)))
-    for row in prior.scalars().all():
-        if str(row.address) == ip_str:
-            continue
-        row.static_assignment_id = None
-        if row.status == "static_dhcp":
-            row.status = "allocated"
-    # Find or create the IPAM row for this IP within the scope's subnet.
-    res = await db.execute(
-        select(IPAddress).where(IPAddress.subnet_id == scope.subnet_id, IPAddress.address == ip_str)
-    )
-    row = res.scalar_one_or_none()
-    if row is None:
-        # #564 — a concurrent Kea agent lease-event / Sync-DHCP writer
-        # may have already mirrored a dynamic lease at this IP. Insert
-        # inside a savepoint so the unique-violation self-heals into the
-        # incumbent row (which we then overwrite to static_dhcp — the
-        # static is the source of truth) instead of 500-ing on
-        # uq_ip_address_subnet_address.
-        candidate = IPAddress(subnet_id=scope.subnet_id, address=ip_str, status="static_dhcp")
-        row, _created = await insert_ipam_mirror_row(db, candidate)
-    row.hostname = st.hostname or row.hostname
-    row.mac_address = str(st.mac_address)
-    row.status = "static_dhcp"
-    row.static_assignment_id = str(st.id)
-    await db.flush()
-    st.ip_address_id = row.id
-    # Fire DNS sync so forward/reverse records follow the static.
-    from app.api.v1.ipam.router import _sync_dns_record
-
-    subnet_row = await db.get(Subnet, scope.subnet_id)
-    if subnet_row is not None and row.hostname:
-        try:
-            await _sync_dns_record(db, row, subnet_row, action=action)
-        except Exception:  # noqa: BLE001 — DNS sync is best-effort
-            pass
-
-
-async def _detach_ipam_for_static(db, st: DHCPStaticAssignment) -> None:
-    """Release the IPAM row back to `available` when the static is removed.
-
-    Also tears down the forward A (DNS sync with action=delete).
-
-    The row is freed to ``available`` (not ``allocated``): the IP no longer
-    holds a reservation, and — crucially — a leftover ``allocated`` /
-    ``auto_from_lease=False`` row is skipped by the agent's lease-mirror refresh
-    (it only re-mirrors ``available`` or ``auto_from_lease`` rows), so it would
-    shadow a future dynamic lease at that IP AND never be reaped. ``available``
-    lets a new lease reclaim the row (#478).
-    """
-    from app.api.v1.ipam.router import _sync_dns_record
-
-    res = await db.execute(select(IPAddress).where(IPAddress.static_assignment_id == str(st.id)))
-    for row in res.scalars().all():
-        subnet_row = await db.get(Subnet, row.subnet_id)
-        if subnet_row is not None:
-            try:
-                await _sync_dns_record(db, row, subnet_row, action="delete")
-            except Exception:  # noqa: BLE001
-                pass
-        row.static_assignment_id = None
-        if row.status == "static_dhcp":
-            row.status = "available"
-
-
 async def _conflict_check(
     db, scope: DHCPScope, ip: str, mac: str, exclude_id: uuid.UUID | None = None
 ) -> None:
@@ -194,11 +156,33 @@ async def _conflict_check(
             detail=f"MAC {mac} already reserved in this group in scope {row.scope_id}",
         )
 
-    # IP inside existing pool of this scope — reject if dynamic
     try:
         ip_addr = ipaddress.ip_address(ip)
     except ValueError as e:
         raise HTTPException(status_code=422, detail=f"Invalid IP: {e}") from e
+
+    # The reservation's IP must fall inside the scope's subnet. Kea renders the
+    # reservation *nested inside* that subnet's stanza
+    # (``"subnet4": [{"subnet": "<cidr>", "reservations": [...]}]``) and Windows
+    # keys reservations by the scope's network address, so an out-of-CIDR
+    # reservation ships structurally invalid config to the backend. Catch it
+    # here as a legible 422 instead of a downstream agent failure (#619).
+    subnet_row = await db.get(Subnet, scope.subnet_id)
+    if subnet_row is not None:
+        try:
+            network = ipaddress.ip_network(str(subnet_row.network), strict=False)
+        except ValueError:  # pragma: no cover — a malformed subnet CIDR can't be validated against
+            network = None
+        if network is not None and ip_addr not in network:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"IP {ip} is outside the scope's subnet {network}. "
+                    "A reservation must fall inside the subnet its scope serves."
+                ),
+            )
+
+    # IP inside existing pool of this scope — reject if dynamic
     pools_res = await db.execute(select(DHCPPool).where(DHCPPool.scope_id == scope.id))
     for p in pools_res.scalars().all():
         try:
@@ -241,13 +225,13 @@ async def create_static(
     st = DHCPStaticAssignment(
         scope_id=scope_id,
         created_by_user_id=user.id,
-        **body.model_dump(),
+        **body.model_dump(exclude={"scope_id"}),
     )
     db.add(st)
     await db.flush()
     await push_static_change(db, st, action="create")
     collect_wake(dhcp_group_channel(scope.group_id))
-    await _upsert_ipam_for_static(db, scope, st)
+    await upsert_ipam_for_static(db, scope, st)
     write_audit(
         db,
         user=user,
@@ -287,7 +271,7 @@ async def update_static(
     await db.flush()
     await push_static_change(db, st, action="update", prev_mac=prev_mac, prev_ip=prev_ip)
     collect_wake(dhcp_group_channel(scope.group_id))
-    await _upsert_ipam_for_static(db, scope, st, action="update")
+    await upsert_ipam_for_static(db, scope, st, action="update")
     write_audit(
         db,
         user=user,
@@ -312,7 +296,7 @@ async def delete_static(static_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
     if scope is not None:
         collect_wake(dhcp_group_channel(scope.group_id))
     await push_static_change(db, st, action="delete")
-    await _detach_ipam_for_static(db, st)
+    await detach_ipam_for_static(db, st)
     write_audit(
         db,
         user=user,

@@ -147,6 +147,10 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
                         DHCPScope.is_active.is_(True),
                     )
                     .options(
+                        # Soft-deleted pools / reservations cannot reach the
+                        # bundle: these are selectin-loaded, so the global
+                        # deleted_at filter applies to each child statement in its
+                        # own right (see the note on DHCPScope.pools, #617).
                         selectinload(DHCPScope.pools),
                         selectinload(DHCPScope.statics),
                     )

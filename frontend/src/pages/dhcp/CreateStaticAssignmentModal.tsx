@@ -1,6 +1,11 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { dhcpApi, type DHCPStaticAssignment, type DHCPScope } from "@/lib/api";
+import {
+  dhcpApi,
+  type DHCPStaticAssignment,
+  type DHCPStaticAssignmentWrite,
+  type DHCPScope,
+} from "@/lib/api";
 import { hostnameError } from "@/lib/dnsNames";
 import { Modal, Field, Btns, inputCls, errMsg } from "./_shared";
 
@@ -40,7 +45,7 @@ export function CreateStaticAssignmentModal({
 
   const mut = useMutation({
     mutationFn: () => {
-      const data: Partial<DHCPStaticAssignment> = {
+      const data: DHCPStaticAssignmentWrite = {
         mac_address: mac,
         ip_address: ip,
         hostname,

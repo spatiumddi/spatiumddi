@@ -41,6 +41,7 @@ from app.models.dhcp import (
     DHCPStaticAssignment,
 )
 from app.models.ipam import IPBlock, IPSpace, Subnet
+from app.services.dhcp.static_ipam import detach_ipam_for_scope_statics
 
 from .canonical import (
     ConflictAction,
@@ -167,9 +168,13 @@ async def detect_conflicts(
             scope = await _existing_scope(db, target_group_id, subnet.id, include_deleted=True)
             if scope is not None:
                 existing_scope_id = str(scope.id)
+                soft_deleted = scope.deleted_at is not None
+                # Safe on a trashed scope: ``_existing_scope`` opted in with
+                # include_deleted, and that propagates to the selectin child
+                # loads — so these counts are the real blast radius the operator
+                # is about to hard-delete with ``overwrite`` (see DHCPScope.pools).
                 pool_count = len(scope.pools)
                 res_count = len(scope.statics)
-                soft_deleted = scope.deleted_at is not None
         # Emit a row when there's anything to tell the operator: an
         # existing scope (blocking) or an existing subnet (link vs
         # create). Pure-new scopes don't generate a row.
@@ -340,6 +345,11 @@ async def _commit_one_scope(
         # overwrite — hard-delete the existing scope (cascades pools +
         # statics, and purges it from Trash if it was soft-deleted),
         # freeing the unique slot before the recreate flush.
+        #
+        # The reservations go via FK CASCADE, which runs no Python, so their
+        # IPAM mirrors have to be released here or the addresses are stranded at
+        # ``status="static_dhcp"`` pointing at rows Postgres has dropped (#618).
+        await detach_ipam_for_scope_statics(db, existing.id)
         await db.delete(existing)
         await db.flush()
         overwrote = True

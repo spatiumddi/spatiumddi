@@ -109,9 +109,18 @@ async def _soft_delete_cascade_summary(db: AsyncSession, root: Any) -> str:
         "ip_block": "child block",
         "subnet": "subnet",
         "dhcp_scope": "DHCP scope",
+        "dhcp_pool": "DHCP pool",
+        "dhcp_static_assignment": "DHCP reservation",
         "dns_record": "DNS record",
     }
-    order = ["ip_block", "subnet", "dhcp_scope", "dns_record"]
+    order = [
+        "ip_block",
+        "subnet",
+        "dhcp_scope",
+        "dhcp_pool",
+        "dhcp_static_assignment",
+        "dns_record",
+    ]
     parts = []
     for rt in order:
         n = counts.get(rt, 0)
@@ -126,6 +135,39 @@ async def _soft_delete_cascade_summary(db: AsyncSession, root: Any) -> str:
     if not parts:
         return "cascades nothing (empty)"
     return "cascades " + ", ".join(parts)
+
+
+async def _push_agentless_scope_deletes(db: AsyncSession, batch: Any) -> set[UUID]:
+    """Remove every DHCP scope in a soft-delete batch from its agentless members.
+
+    Soft-delete means "stop serving", and that has to hold on every backend.
+    Agent-based (Kea) members converge on their own — a stamped scope drops
+    straight out of the rendered ConfigBundle — but agentless members (Windows
+    DHCP today, and any future agentless driver) only converge on an explicit
+    push (#616).
+
+    EVERY delete whose cascade can reach a DHCPScope owes this call: scope,
+    subnet, block, and space. Driving it off the batch rather than a hand-rolled
+    per-handler query is deliberate — the batch is the one thing that already
+    knows exactly which scopes are being trashed, so a new ancestor type added to
+    ``_collect_descendants`` cannot silently skip the write-through.
+
+    ORDER IS LOAD-BEARING: call this BEFORE ``apply_soft_delete``. The push
+    resolves each scope's CIDR through ``db.get(Subnet, ...)``; once the subnet
+    row is stamped, the global soft-delete filter hides it and the push would
+    raise ``WindowsPushError("subnet is missing from IPAM")``.
+
+    Returns the group ids whose agents should be woken after the commit.
+    """
+    from app.models.dhcp import DHCPScope  # noqa: PLC0415
+    from app.services.dhcp.windows_writethrough import push_scope_delete  # noqa: PLC0415
+
+    group_ids: set[UUID] = set()
+    for row in batch.rows:
+        if isinstance(row.obj, DHCPScope):
+            await push_scope_delete(db, row.obj)
+            group_ids.add(row.obj.group_id)
+    return group_ids
 
 
 # ── delete_subnet ──────────────────────────────────────────────────────────
@@ -250,22 +292,13 @@ async def _apply_delete_subnet(
 
         # Wake DHCP agents for groups whose scopes are being trashed: soft-delete
         # stamps the scopes deleted, changing rendered Kea config, but without a
-        # wake convergence waits for the 12s safety tick (#512). Capture the
-        # group ids BEFORE the soft-delete filter hides the scope rows.
+        # wake convergence waits for the 12s safety tick (#512). The push +
+        # group-id capture both run BEFORE apply_soft_delete stamps the batch —
+        # see _push_agentless_scope_deletes.
         from app.core.agent_wake import collect_wake, dhcp_group_channel  # noqa: PLC0415
-        from app.models.dhcp import DHCPScope as _DHCPScope  # noqa: PLC0415
-
-        wake_group_ids = set(
-            (
-                await db.execute(
-                    select(_DHCPScope.group_id).where(_DHCPScope.subnet_id == args.subnet_id)
-                )
-            )
-            .scalars()
-            .all()
-        )
 
         batch = await collect_soft_delete_batch(db, subnet)
+        wake_group_ids = await _push_agentless_scope_deletes(db, batch)
         apply_soft_delete(batch, user.id)
         for row in batch.rows:
             db.add(
@@ -513,7 +546,12 @@ async def _apply_delete_block(
         await db.commit()
         return {"block_id": str(args.block_id), "mode": "delete"}
 
+    from app.core.agent_wake import collect_wake, dhcp_group_channel  # noqa: PLC0415
+
     batch = await collect_soft_delete_batch(db, block)
+    # A block cascade reaches DHCP scopes (via its subnets), so it owes the same
+    # agentless write-through the scope + subnet paths do (#616). Before the stamp.
+    wake_group_ids = await _push_agentless_scope_deletes(db, batch)
     apply_soft_delete(batch, user.id)
     for row in batch.rows:
         db.add(
@@ -527,6 +565,8 @@ async def _apply_delete_block(
             )
         )
     await db.commit()
+    for gid in wake_group_ids:
+        collect_wake(dhcp_group_channel(gid))
     return {"block_id": str(args.block_id), "mode": "soft_delete"}
 
 
@@ -642,7 +682,12 @@ async def _apply_delete_space(
         await db.commit()
         return {"space_id": str(args.space_id), "mode": "delete"}
 
+    from app.core.agent_wake import collect_wake, dhcp_group_channel  # noqa: PLC0415
+
     batch = await collect_soft_delete_batch(db, space)
+    # A space cascade reaches DHCP scopes (via its subnets), so it owes the same
+    # agentless write-through the scope + subnet paths do (#616). Before the stamp.
+    wake_group_ids = await _push_agentless_scope_deletes(db, batch)
     apply_soft_delete(batch, user.id)
     for row in batch.rows:
         db.add(
@@ -656,6 +701,8 @@ async def _apply_delete_space(
             )
         )
     await db.commit()
+    for gid in wake_group_ids:
+        collect_wake(dhcp_group_channel(gid))
     return {"space_id": str(args.space_id), "mode": "soft_delete"}
 
 
@@ -804,13 +851,18 @@ async def _preview_delete_scope(
     if scope is None:
         return PreviewResult(ok=False, detail="Scope not found")
     mode = "Permanently delete" if args.permanent else "Soft-delete"
+    # A scope carries its pools + reservations into the batch (#617), so both
+    # modes report a real blast radius. This used to claim a scope was a cascade
+    # leaf, which made the approval preview read as "nothing else affected" for
+    # a scope holding hundreds of reservations.
+    cascade = await _soft_delete_cascade_summary(db, scope)
     if args.permanent:
-        # A scope is a cascade leaf (no soft-delete descendants), so there is
-        # no growing blast radius — the preview stays stable across request →
-        # approve, which is correct (#3a: a leaf has nothing to drift).
-        suffix = " (pushes a remove-scope write-through to Windows members first)"
+        suffix = (
+            f" — {cascade} (unrecoverable; pushes a remove-scope write-through "
+            "to Windows members first)"
+        )
     else:
-        suffix = f" — {await _soft_delete_cascade_summary(db, scope)}; restorable from /admin/trash"
+        suffix = f" — {cascade}; restorable from /admin/trash"
     return PreviewResult(
         ok=True, detail="ready", preview_text=f"{mode} DHCP scope `{scope.id}`{suffix}"
     )
@@ -824,6 +876,7 @@ async def _apply_delete_scope(
     from app.api.v1.dhcp._audit import write_audit
     from app.core.agent_wake import collect_wake, dhcp_group_channel
     from app.models.dhcp import DHCPScope
+    from app.services.dhcp.static_ipam import detach_ipam_for_scope_statics
     from app.services.dhcp.windows_writethrough import push_scope_delete
     from app.services.soft_delete import apply_soft_delete, collect_soft_delete_batch
 
@@ -834,6 +887,17 @@ async def _apply_delete_scope(
     if scope is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scope not found")
     collect_wake(dhcp_group_channel(scope.group_id))
+
+    # Deleted means deleted on every backend (#616). Agent-based (Kea) members
+    # converge by themselves — the soft-deleted scope drops straight out of the
+    # rendered ConfigBundle — but agentless members (Windows DHCP today, and any
+    # future agentless driver) only converge on an explicit push. This used to
+    # fire on the permanent path only, and since the UI never sends
+    # ``permanent=true``, a scope deleted from the UI stayed live on the Windows
+    # box forever: not removed by the trash permanent-delete (which skips the
+    # write-through hooks) nor by the purge sweep (a Core DELETE that runs no
+    # Python). Fire it on both paths.
+    await push_scope_delete(db, scope)
 
     if not args.permanent:
         batch = await collect_soft_delete_batch(db, scope)
@@ -851,7 +915,9 @@ async def _apply_delete_scope(
         await db.commit()
         return {"scope_id": str(args.scope_id), "mode": "soft_delete"}
 
-    await push_scope_delete(db, scope)
+    # Release each reservation's IPAM mirror before the FK CASCADE wipes the
+    # rows — the cascade runs no Python, so nothing else would (#618).
+    released = await detach_ipam_for_scope_statics(db, scope.id)
     write_audit(
         db,
         user=user,
@@ -859,6 +925,7 @@ async def _apply_delete_scope(
         resource_type="dhcp_scope",
         resource_id=str(scope.id),
         resource_display=str(scope.id),
+        old_value={"ipam_mirrors_released": released},
     )
     await db.delete(scope)
     await db.commit()
@@ -945,6 +1012,28 @@ async def _apply_delete_group(
             ),
         )
 
+    # Deleting the group hard-deletes its scopes, and the FK CASCADE takes their
+    # reservations with them — no Python runs, so nothing would release the IPAM
+    # mirrors and the addresses would be stranded at ``status="static_dhcp"``
+    # pointing at rows Postgres has dropped (#618).
+    from app.models.dhcp import DHCPScope  # noqa: PLC0415
+    from app.services.dhcp.static_ipam import detach_ipam_for_scope_statics  # noqa: PLC0415
+
+    group_scopes = (
+        (
+            await db.execute(
+                select(DHCPScope)
+                .where(DHCPScope.group_id == args.group_id)
+                .execution_options(include_deleted=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    released = 0
+    for sc in group_scopes:
+        released += await detach_ipam_for_scope_statics(db, sc.id)
+
     write_audit(
         db,
         user=user,
@@ -952,6 +1041,7 @@ async def _apply_delete_group(
         resource_type="dhcp_server_group",
         resource_id=str(g.id),
         resource_display=g.name,
+        old_value={"ipam_mirrors_released": released},
     )
     await db.delete(g)
     await db.commit()

@@ -17,15 +17,16 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
-from sqlalchemy import delete, select
+from sqlalchemy import and_, delete, or_, select
 
 from app.celery_app import celery_app
 from app.db import task_session
 from app.models.audit import AuditLog
-from app.models.dhcp import DHCPScope
+from app.models.dhcp import DHCPPool, DHCPScope, DHCPStaticAssignment
 from app.models.dns import DNSRecord, DNSZone
 from app.models.ipam import IPBlock, IPSpace, Subnet
 from app.models.settings import PlatformSettings
+from app.services.dhcp.static_ipam import detach_ipam_for_static
 
 logger = structlog.get_logger(__name__)
 
@@ -34,15 +35,59 @@ logger = structlog.get_logger(__name__)
 # FK is CASCADE, so this is safe either way; we order it explicitly to keep
 # the per-type counters honest — without ordering, the records would
 # already be gone by the time we counted them and the row count would
-# under-report).
+# under-report). Same for ``DHCPStaticAssignment`` / ``DHCPPool`` under
+# ``DHCPScope`` (#617).
 _PURGE_MODELS_LEAF_FIRST: tuple[type, ...] = (
     DNSRecord,
+    DHCPStaticAssignment,
+    DHCPPool,
     DHCPScope,
     Subnet,
     IPBlock,
     DNSZone,
     IPSpace,
 )
+
+
+async def _release_ipam_mirrors(db: Any, cutoff: datetime) -> int:
+    """Release the IPAM row behind every reservation this sweep is about to purge.
+
+    The purge is a Core ``DELETE`` — it runs no per-row Python, so nothing would
+    otherwise call the detach and the mirrored ``ip_address`` row would be left
+    stranded at ``status="static_dhcp"`` pointing at a reservation Postgres had
+    already removed: not allocated, not free, not reclaimable by any sweeper
+    (#618). Run before the deletes, while the reservations are still readable.
+
+    Selected by what the sweep will actually destroy, NOT by the reservation's
+    own tombstone: the ``dhcp_scope`` DELETE below FK-cascades its reservations
+    regardless of their ``deleted_at``, so keying only on the child's timestamp
+    would miss any reservation whose stamp is absent or newer than its scope's
+    (a pre-#617 row the migration backfill didn't reach, a clock skew, a future
+    path that stamps parent and child separately) and strand its mirror.
+
+    ``include_deleted`` because these rows are soft-deleted by definition — the
+    global filter would hide the very rows we need to clean up.
+    """
+    res = await db.execute(
+        select(DHCPStaticAssignment)
+        .join(DHCPScope, DHCPStaticAssignment.scope_id == DHCPScope.id)
+        .where(
+            or_(
+                and_(
+                    DHCPStaticAssignment.deleted_at.is_not(None),
+                    DHCPStaticAssignment.deleted_at < cutoff,
+                ),
+                and_(DHCPScope.deleted_at.is_not(None), DHCPScope.deleted_at < cutoff),
+            )
+        )
+        .execution_options(include_deleted=True)
+    )
+    statics = list(res.scalars().all())
+    for st in statics:
+        await detach_ipam_for_static(db, st)
+    if statics:
+        await db.flush()
+    return len(statics)
 
 
 async def _sweep() -> dict[str, Any]:
@@ -62,6 +107,9 @@ async def _sweep() -> dict[str, Any]:
         cutoff = datetime.now(UTC) - timedelta(days=purge_days)
         per_type: dict[str, int] = {}
         total_removed = 0
+
+        # Release IPAM mirrors before the Core DELETEs wipe the reservations.
+        ipam_released = await _release_ipam_mirrors(db, cutoff)
 
         for model in _PURGE_MODELS_LEAF_FIRST:
             stmt = (
@@ -85,7 +133,11 @@ async def _sweep() -> dict[str, Any]:
                     resource_type="trash",
                     resource_id="sweep",
                     resource_display=f"{total_removed} rows purged",
-                    new_value={"counts": per_type, "purge_days": purge_days},
+                    new_value={
+                        "counts": per_type,
+                        "purge_days": purge_days,
+                        "ipam_mirrors_released": ipam_released,
+                    },
                     result="success",
                 )
             )
@@ -94,6 +146,7 @@ async def _sweep() -> dict[str, Any]:
         return {
             "removed": total_removed,
             "per_type": per_type,
+            "ipam_mirrors_released": ipam_released,
             "purge_days": purge_days,
             "skipped": False,
         }
