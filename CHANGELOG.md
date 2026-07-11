@@ -22,184 +22,31 @@ the formatter handles the rest.
 
 ## 2026.07.11-1 — 2026-07-11
 
-**Enterprise firewall family, Phase 1 — Fortinet FortiGate + Cisco
-Meraki MX** (#606), following the Palo Alto (#605) shape. Both land a
-read-only mirror of the firewall's "shadow IPAM" into native rows plus
-an opt-in enforcement tier — but each vendor uses its own *native*
-enforcement primitive, and one of them inverts the credential model
-entirely. The shared `firewall_endpoint_object` mirror store #605
-introduced now carries objects from any of the three vendors
-(exactly-one owner), and the address-object / NAT / interface-subnet /
-DHCP-lease mirror logic is lifted into one shared engine all three
-reconcilers converge through.
+**The firewall release.** SpatiumDDI has always been a read-only
+observer of the devices it mirrors. This release closes the
+detect→block loop: it could already *see* a rogue DHCP responder
+(#370) or an unknown MAC (#459) and starve it of a DHCP lease, but a
+device that self-assigned a static IP walked straight past the block.
+**Active block sync** (#601) adds a narrow, heavily guarded write path
+that pushes a real block at the natural enforcement point — an
+OPNsense firewall table alias (by IP) or a UniFi L2 client quarantine
+(by MAC) — so the block actually sticks. On top of it lands an
+**enterprise-firewall family**: Palo Alto PAN-OS / Panorama (#605) as
+the reference vendor, then Fortinet FortiGate and Cisco Meraki MX
+(#606). Each contributes a read-only mirror of the firewall's "shadow
+IPAM" into native rows plus its own *native* enforcement primitive —
+and one of them inverts the credential model entirely.
 
-### Added
+Active enforcement is the deliberate exception to the
+read-only-mirror stance. Every write path here is off by default and
+layered behind a feature module, a per-target enforcement master
+switch, distinct write-scoped credentials, preview + audit on every
+push, a dedicated RBAC permission, and two-person approval (#62).
 
-- **Fortinet FortiGate read-only mirror.** New `integrations.fortinet`
-  feature module (default-off). One `FortinetFirewall` row per
-  FortiGate VDOM, driven over the FortiOS REST API (bearer-token auth,
-  Fernet-encrypted at rest). A 30 s beat sweep with per-firewall
-  interval gating mirrors address objects/groups → `firewall_endpoint_
-  object`, VIPs (destination NAT) → `nat_mapping` provenance rows, and
-  — opt-in — interface CIDRs → IPAM subnets + DHCP leases → IPAM
-  addresses. Two-way IPAM drift report (objects with no IPAM row;
-  in-space subnets no object covers). CRUD + test-connection + Sync-now
-  + objects + drift at `/api/v1/fortinet`. Fleet-scoped page under
-  Integrations → Fortinet.
-- **Fortinet Threat-Feed enforcement — the "feed inversion".** New
-  `security.firewall_feeds` module (default-on, discovery-only). A
-  `FirewallFeed` row exposes a token-scoped URL
-  (`GET /api/v1/firewall-feeds/feeds/{id}/blocklist.txt`) that renders
-  the `NetworkBlock` set (the same intent Active block sync #601
-  pushes) as plain text, one IP/CIDR per line. A FortiGate External
-  Threat Feed (or a Cisco Security-Intelligence feed) polls it — so
-  **SpatiumDDI holds no write credentials on the firewall at all**.
-  The token is Fernet-encrypted, revealed once on create + via a
-  password-confirmed reveal, and rotatable; the public poll endpoint
-  is authed purely by the token and stamps poll telemetry
-  (`last_polled_at` / `_ip` / `poll_count`). Feeds page under Security.
-- **Cisco Meraki MX read-only mirror.** New `integrations.meraki`
-  feature module (default-off). One `MerakiOrg` row per Meraki
-  organization, driven over the cloud Dashboard API (API key + org id,
-  nothing on-prem, Fernet-encrypted at rest). Mirrors per-network
-  appliance VLANs → IPAM subnets, DHCP fixed-IP reservations → IPAM
-  addresses, org policy objects/groups → `firewall_endpoint_object`,
-  MX 1:1 NAT + port-forward → `nat_mapping`, and — opt-in — network
-  clients → IPAM addresses. Rate-limit-aware (429 + `Retry-After`) with
-  a slower 300 s default cadence. CRUD + test + Sync-now + objects +
-  drift at `/api/v1/meraki`. Page under Integrations → Meraki.
-- **Meraki per-client Blocked enforcement (the #601 tier).** A new
-  `meraki` block-sync target kind (consumes `mac` blocks): the
-  reconciler resolves a blocked MAC to its (network, client) across the
-  org's appliance networks and moves it to the built-in `Blocked`
-  device policy via the Dashboard API — the cloud applies it
-  immediately, no on-prem deploy. Distinct write-scoped key, default-
-  off per-target master switch, gated by the `security.block_sync`
-  module + the `manage_firewall_enforcement` permission + two-person
-  approval (#62), previewable + audited. Armed from the Active block
-  sync page.
-- **MCP tools.** `list_fortinet_targets`, `list_meraki_targets`, and
-  `list_firewall_feeds` (each gated on its module). `find_firewall_
-  objects` / `count_firewall_objects` are now vendor-neutral (query the
-  shadow-IPAM store across Palo Alto / Fortinet / Meraki, filterable by
-  `source_kind`).
-- Fortinet + Meraki panels on both dashboard surfaces (the IPAM-tab
-  IntegrationsPanel + the Integrations dashboard tab).
-
-### Changed
-
-- **Shared firewall-mirror engine.** The address-object / NAT /
-  interface-subnet / DHCP-lease "shadow IPAM" mirror logic #605 shipped
-  inline in the PAN-OS reconciler is lifted into
-  `app/services/firewall_mirror.py`, parameterized by a `FirewallOwner`.
-  All three vendor reconcilers (PAN-OS migrated onto it, Fortinet +
-  Meraki new) converge through one implementation, so there's a single
-  place to fix mirror bugs. The PAN-OS reconcile behaviour is unchanged
-  (its test suite pins it).
-- `firewall_endpoint_object` generalized from a single
-  `panos_firewall_id` owner to one-of-three vendor owners (PAN-OS /
-  Fortinet / Meraki), enforced by a `num_nonnulls(...) = 1` CHECK. The
-  eight pre-existing integration reconcilers' ownership guards learned
-  the two new provenance columns so no mirror claims another's rows.
-
-### Migrations
-
-- `a7c3e91f4d28` — creates `fortinet_firewall`, `meraki_org`, and
-  `firewall_feed`; adds `fortinet_firewall_id` + `meraki_org_id`
-  provenance FKs (ON DELETE CASCADE) to `firewall_endpoint_object`
-  (dropping the NOT NULL on `panos_firewall_id` + adding the one-owner
-  CHECK) and to `ip_address` / `ip_block` / `subnet` / `nat_mapping`;
-  adds the two `integration_*_enabled` settings toggles; seeds the
-  `integrations.fortinet` / `integrations.meraki` (off) +
-  `security.firewall_feeds` (on) feature-module rows.
-
----
-
-## 2026.07.10-2 — 2026-07-10
-
-A **Palo Alto PAN-OS / Panorama** integration (#605) — the reference
-vendor for an enterprise-firewall family. It fills two gaps: SpatiumDDI
-had no "address object" concept, and its `NATMapping` table was
-manual-entry, visibility-only. Palo Alto goes first because its API is
-the best of the family and its **Dynamic Address Group** model is a
-near-perfect fit for SpatiumDDI's desired-state enforcement design.
-Two shapes ride one `panos_firewall` row: a read-only mirror of the
-firewall's "shadow IPAM" into native rows (default-off), and an
-opt-in, commit-free Dynamic Address Group enforcement tier that
-extends Active block sync (#601).
-
-### Added
-
-- **Palo Alto read-only mirror.** New `integrations.paloalto` feature
-  module (default-off). One `PANOSFirewall` row per managed scope —
-  a standalone NGFW `vsys` or a Panorama `device-group`. A 30 s beat
-  sweep with per-firewall interval gating reconciles:
-  - **Address objects + groups → a new `firewall_endpoint_object`
-    mirror** (the "shadow IPAM" store, named to not collide with the
-    appliance's own #285 firewall models), each resolved to a live
-    IPAM `ip_address` / `subnet` where the value matches, with a
-    two-way **drift report** (`GET /paloalto/firewalls/{id}/drift`):
-    objects with no IPAM row + subnets with no object.
-  - **NAT rules → `nat_mapping` rows** with `panos_firewall_id`
-    provenance — making the previously manual-only NAT table a live
-    data source.
-  - **Zones/interfaces → IPAM subnets** and **DHCP-server leases →
-    IPAM addresses** (both opt-in).
-  - REST client (`X-PAN-KEY`, `/restapi/v{ver}/Objects|Policies/…`)
-    for objects/NAT + legacy XML API (`type=keygen` / `op` /
-    `user-id`) for key minting, op-commands, and DAG tag register.
-    Test-connection mints a key from admin creds via `type=keygen`
-    or validates a pasted key.
-  - Admin page at `/paloalto`; both dashboard surfaces (IPAM-tab
-    `IntegrationsPanel` + the Integrations dashboard tab); MCP
-    `list_panos_targets` / `find_firewall_objects` /
-    `count_firewall_objects` read tools.
-- **Dynamic Address Group enforcement (the #601 tier).** `paloalto`
-  becomes a new Active-block-sync target kind: IP-kind blocks register
-  an `IP → tag` mapping via the PAN-OS **User-ID API** with no policy
-  commit; an operator-pre-created DAG matching the tag enforces it
-  near-instantly. Convergence reads on-device state (`show object
-  registered-ip`) so it adds only what's missing and unregisters only
-  what it owns. Guardrails on top of the shared block-sync gates:
-  targets a standalone firewall vsys (arming a Panorama target 422s),
-  a distinct User-ID-capable write key (Fernet-encrypted, reveal
-  behind re-auth), and a new **`manage_firewall_enforcement`**
-  permission required to arm (an off-prem, broad-blast-radius write).
-  Blocks still flow through the existing `network_block` desired-state
-  + two-person approval, so `propose_create_network_block` already
-  covers the PAN write path.
-
-### Changed
-
-- `panos_firewall_id` provenance FK is threaded through every mirror
-  reconciler's sibling-ownership guard so PAN-owned IPAM rows are
-  never claimed by another integration.
-
-### Migrations
-
-- `f4a1c9e072d5` — `panos_firewall` + `firewall_endpoint_object`
-  tables, `panos_firewall_id` FK on `ip_address` / `ip_block` /
-  `subnet` / `nat_mapping`, the `integration_panos_enabled` platform
-  setting, and the seeded (disabled) `integrations.paloalto`
-  feature-module row.
-
----
-
-## 2026.07.10-1 — 2026-07-10
-
-An **active enforcement** release. It closes the half-open
-detect→block loop: SpatiumDDI could already *see* a rogue DHCP
-responder (#370) or an unknown MAC (#459) and starve it of a DHCP
-lease, but a device that self-assigns a static IP walked right past
-the DHCP block. **Active block sync (#601)** adds a narrow, heavily
-guarded write path that pushes a real block at the natural
-enforcement point — an **OPNsense** firewall table alias (by IP) or a
-**UniFi** L2 client quarantine (by MAC) — so the block actually
-sticks. It is the deliberate exception to the read-only-mirror stance:
-off by default, layered behind a feature module, a per-target
-enforcement master switch, distinct write-scoped credentials,
-preview + audit on every push, `manage_block_sync` RBAC, and
-two-person approval.
+Also in this release: a **NetBird** mesh mirror (#603), **post-wake
+verification** for Wake-on-LAN (#596), **DNS-standard name
+validation** across IPAM / DNS / DHCP (#597), and a four-bug
+correctness pass on **DHCP scope deletion** (#616–#619).
 
 ### Added
 
@@ -227,19 +74,305 @@ two-person approval.
     quarantine upstream" option that creates a MAC block when a
     UniFi target is armed.
   - Guardrails: per-target default-off `block_sync_enabled` master
-    switch (independent of the mirror module), distinct Fernet-
-    encrypted write-scoped creds, `manage_block_sync` permission
-    (granted to Network Editor), full audit + two-person approval
-    (#62) on every create, and `find_network_blocks` /
+    switch (independent of the mirror module), distinct
+    Fernet-encrypted write-scoped creds, `manage_block_sync`
+    permission (granted to Network Editor), full audit + two-person
+    approval (#62) on every create, and `find_network_blocks` /
     `count_network_blocks` + a default-disabled
     `propose_create_network_block` Operator Copilot tool.
+- **Palo Alto PAN-OS / Panorama read-only mirror (#605).** New
+  `integrations.paloalto` feature module (default-off). One
+  `PANOSFirewall` row per managed scope — a standalone NGFW `vsys` or
+  a Panorama `device-group`. A 30 s beat sweep with per-firewall
+  interval gating reconciles:
+  - **Address objects + groups → a new `firewall_endpoint_object`
+    mirror** (the "shadow IPAM" store, named to not collide with the
+    appliance's own #285 firewall models), each resolved to a live
+    IPAM `ip_address` / `subnet` where the value matches, with a
+    two-way **drift report** (`GET /paloalto/firewalls/{id}/drift`):
+    objects with no IPAM row + subnets with no object.
+  - **NAT rules → `nat_mapping` rows** with `panos_firewall_id`
+    provenance — making the previously manual-only NAT table a live
+    data source.
+  - **Zones/interfaces → IPAM subnets** and **DHCP-server leases →
+    IPAM addresses** (both opt-in).
+  - REST client (`X-PAN-KEY`, `/restapi/v{ver}/Objects|Policies/…`)
+    for objects/NAT + legacy XML API (`type=keygen` / `op` /
+    `user-id`) for key minting, op-commands, and DAG tag register.
+    Test-connection mints a key from admin creds via `type=keygen`
+    or validates a pasted key.
+  - Admin page at `/paloalto`; both dashboard surfaces (IPAM-tab
+    `IntegrationsPanel` + the Integrations dashboard tab); MCP
+    `list_panos_targets` / `find_firewall_objects` /
+    `count_firewall_objects` read tools.
+- **Palo Alto Dynamic Address Group enforcement (the #601 tier).**
+  `paloalto` becomes a new Active-block-sync target kind: IP-kind
+  blocks register an `IP → tag` mapping via the PAN-OS **User-ID
+  API** with no policy commit; an operator-pre-created DAG matching
+  the tag enforces it near-instantly. Convergence reads on-device
+  state (`show object registered-ip`) so it adds only what's missing
+  and unregisters only what it owns. Guardrails on top of the shared
+  block-sync gates: targets a standalone firewall vsys (arming a
+  Panorama target 422s), a distinct User-ID-capable write key
+  (Fernet-encrypted, reveal behind re-auth), and a new
+  **`manage_firewall_enforcement`** permission required to arm (an
+  off-prem, broad-blast-radius write). Blocks still flow through the
+  existing `network_block` desired-state + two-person approval, so
+  `propose_create_network_block` already covers the PAN write path.
+- **Fortinet FortiGate read-only mirror (#606).** New
+  `integrations.fortinet` feature module (default-off). One
+  `FortinetFirewall` row per FortiGate VDOM, driven over the FortiOS
+  REST API (bearer-token auth, Fernet-encrypted at rest). A 30 s beat
+  sweep with per-firewall interval gating mirrors address
+  objects/groups → `firewall_endpoint_object`, VIPs (destination NAT)
+  → `nat_mapping` provenance rows, and — opt-in — interface CIDRs →
+  IPAM subnets + DHCP leases → IPAM addresses. Two-way IPAM drift
+  report (objects with no IPAM row; in-space subnets no object
+  covers). CRUD + test-connection + Sync-now + objects + drift at
+  `/api/v1/fortinet`. Fleet-scoped page under Integrations →
+  Fortinet.
+- **Fortinet Threat-Feed enforcement — the "feed inversion" (#606).**
+  New `security.firewall_feeds` module (default-on, discovery-only).
+  A `FirewallFeed` row exposes a token-scoped URL
+  (`GET /api/v1/firewall-feeds/feeds/{id}/blocklist.txt`) that
+  renders the `NetworkBlock` set (the same intent Active block sync
+  #601 pushes) as plain text, one IP/CIDR per line. A FortiGate
+  External Threat Feed (or a Cisco Security-Intelligence feed) polls
+  it — so **SpatiumDDI holds no write credentials on the firewall at
+  all**. The token is Fernet-encrypted, revealed once on create + via
+  a password-confirmed reveal, and rotatable; the public poll
+  endpoint is authed purely by the token and stamps poll telemetry
+  (`last_polled_at` / `_ip` / `poll_count`). Feeds page under
+  Security.
+- **Cisco Meraki MX read-only mirror (#606).** New
+  `integrations.meraki` feature module (default-off). One `MerakiOrg`
+  row per Meraki organization, driven over the cloud Dashboard API
+  (API key + org id, nothing on-prem, Fernet-encrypted at rest).
+  Mirrors per-network appliance VLANs → IPAM subnets, DHCP fixed-IP
+  reservations → IPAM addresses, org policy objects/groups →
+  `firewall_endpoint_object`, MX 1:1 NAT + port-forward →
+  `nat_mapping`, and — opt-in — network clients → IPAM addresses.
+  Rate-limit-aware (429 + `Retry-After`) with a slower 300 s default
+  cadence. CRUD + test + Sync-now + objects + drift at
+  `/api/v1/meraki`. Page under Integrations → Meraki.
+- **Meraki per-client Blocked enforcement (the #601 tier).** A new
+  `meraki` block-sync target kind (consumes `mac` blocks): the
+  reconciler resolves a blocked MAC to its (network, client) across
+  the org's appliance networks and moves it to the built-in `Blocked`
+  device policy via the Dashboard API — the cloud applies it
+  immediately, no on-prem deploy. Distinct write-scoped key,
+  default-off per-target master switch, gated by the
+  `security.block_sync` module + the `manage_firewall_enforcement`
+  permission + two-person approval (#62), previewable + audited.
+  Armed from the Active block sync page.
+- **NetBird mesh mirror (#603).** New `integrations.netbird` feature
+  module (default-off) — a read-only mirror for NetBird (managed
+  WireGuard mesh), following the Tailscale shape. NetBird's real
+  management API is what makes it a legitimate pull mirror, unlike
+  raw WireGuard. **Phase 1** mirrors each peer's overlay IP into the
+  bound IPAM space (`netbird-peer` status; OS / version / groups /
+  connection state in custom fields) under an auto-created overlay
+  block + subnet, with the owned-row + `user_modified_at` lock model.
+  **Phase 2** adds an optional synthetic read-only DNS zone for the
+  mesh domain (A records), with 422 write-guards blocking operator
+  edits. Per-instance operator-supplied management URL + `verify_tls`
+  toggle (SSRF-guarded at the test-connection boundary, since the
+  host isn't fixed), Token auth, and a complete cross-integration
+  ownership guard — NetBird and Tailscale both default to the
+  `100.64.0.0/10` CGNAT range, so each reconciler now refuses to
+  claim the other's rows. Management page + sidebar entry + both
+  dashboard surfaces; `list_netbird_targets` MCP tool.
+- **Wake-on-LAN post-wake verification (#596).** The follow-up to
+  #586 Phase 3's ping-only verify. Post-wake liveness now resolves
+  from multiple sources (`ping` / `tcp` / `seen` / `auto`), ad-hoc
+  single-host wakes (`POST /ipam/addresses/{id}/wake`) opt into the
+  same verify + bounded re-wake chain scheduled runs get (via a
+  per-run `verify_params` snapshot), and every target carries a
+  **verify evidence trail** — an ordered record of what each source
+  actually said, so "down according to what?" has an answer ("ping
+  timed out, TCP refused nothing, last seen 3 days ago" is a dead
+  box; "ping timed out, TCP connected" is a contradiction worth
+  investigating). New `wol_wake_failed` alert rule (seeded off) opens
+  one event per schedule whose latest finalised run left hosts
+  unconfirmed, with a per-schedule `verify_alert_enabled` mute so one
+  deliberately-noisy lab schedule doesn't force the whole rule off.
+  `find_wol_wake_failures` / `count_wol_wake_failures` MCP tools.
+- **DNS-standard name validation across IPAM / DNS / DHCP (#597).**
+  User-supplied name fields accepted arbitrary strings up to their
+  column length — spaces, uppercase, unicode, leading/trailing
+  hyphens, consecutive dots, and even embedded newlines all persisted
+  verbatim. There is no single "valid DNS name" rule, so validation
+  is per-context: host names (IPAM hostname, DHCP reservation) follow
+  RFC 1123 LDH; DNS record owners follow RFC 2181, which permits `_`
+  and `*` so `_acme-challenge`, `_443._tcp` SRV/TLSA owners, and
+  `*.example.com` stay legal; FQDNs (zone name, `domain-name` option)
+  are dotted RFC 2181 labels. A new shared `app/core/dns_names.py`
+  holds every rule in one place and returns the normalized value
+  (lowercased; unicode → IDNA `xn--` A-label). Client-supplied DHCP
+  hostnames are folded to LDH at ingress, and the BIND9 + PowerDNS
+  drivers strip control characters from every rendered name + rdata
+  as defense in depth. **Back-compat: validate-on-write only —
+  existing rows are never auto-mutated.** A read-only
+  `GET /diagnostics/name-conformance` (superadmin) +
+  `find_nonconforming_names` MCP tool surface pre-existing violations
+  so operators fix them deliberately.
+
+### Changed
+
+- **Shared firewall-mirror engine.** The address-object / NAT /
+  interface-subnet / DHCP-lease "shadow IPAM" mirror logic #605
+  shipped inline in the PAN-OS reconciler is lifted into
+  `app/services/firewall_mirror.py`, parameterized by a
+  `FirewallOwner`. All three vendor reconcilers (PAN-OS migrated onto
+  it, Fortinet + Meraki new) converge through one implementation, so
+  there's a single place to fix mirror bugs. The PAN-OS reconcile
+  behaviour is unchanged (its test suite pins it).
+- `firewall_endpoint_object` generalized from a single
+  `panos_firewall_id` owner to one-of-three vendor owners (PAN-OS /
+  Fortinet / Meraki), enforced by a `num_nonnulls(...) = 1` CHECK.
+  The eight pre-existing integration reconcilers' ownership guards
+  learned the two new provenance columns so no mirror claims
+  another's rows.
+- `find_firewall_objects` / `count_firewall_objects` are now
+  vendor-neutral — they query the shadow-IPAM store across Palo Alto
+  / Fortinet / Meraki, filterable by `source_kind`.
+- `DHCPScope.pools` / `.statics` switch from `lazy="joined"` to
+  `lazy="selectin"`. As joined *collections* they forced every
+  `select(DHCPScope)` to remember `.unique()` or raise at runtime —
+  and several didn't. `selectin` also fixes child filtering: the
+  global soft-delete filter registers `propagate_to_loaders=False`,
+  so a joined child rode the parent's statement straight past it.
+- Failed API mutations in the IPAM allocate/edit-address modals and
+  the DNS blocklist modal now render through the shared
+  `formatApiError` helper instead of dumping the raw response body,
+  so a rejected hostname surfaces as its message rather than a raw
+  Pydantic 422 `detail` array (#607). Newly visible now that #597
+  rejects malformed hostnames server-side.
+- CI: the backend test matrix fans out across 8 `pytest-split` shards
+  instead of 4 (each still `-n auto` across the runner's vCPUs) as
+  the suite has grown. The required-status-check aggregator name
+  `Backend — Tests` is unchanged, so branch protection needs no
+  update (#599).
+
+### Fixed
+
+- **DHCP scope deletion — agentless write-through never fired on the
+  soft path (#616).** `push_scope_delete` only ran on the
+  `permanent=true` branch and the UI never sends that flag, so a
+  scope deleted from the UI vanished from SpatiumDDI and from Kea's
+  rendered config while a **Windows DHCP server kept serving it — and
+  its reservations — forever**. The push now fires on the soft path
+  too, driven off the soft-delete batch, so every ancestor whose
+  cascade can reach a scope (scope, subnet, block, space) is covered.
+  Restore pushes the inverse, best-effort so an unreachable Windows
+  box can't make a row unrestorable.
+- **A DHCP scope was treated as a cascade leaf (#617).** `DHCPScope`
+  has been soft-deletable since `c1f4a8b27d09`, but the cascade walk
+  had no branch for it, so its pools and reservations were left live
+  and un-stamped under a hidden parent — still answering the statics
+  list, still enforcing the group-wide MAC conflict check (which 409'd
+  naming a scope UUID the operator could no longer see), still
+  visible to the `find_dhcp_statics` MCP tool, and reported as a zero
+  blast radius by the approval preview. `DHCPPool` +
+  `DHCPStaticAssignment` now carry `SoftDeleteMixin` and ride the
+  scope's `deletion_batch_id`, so a restore brings the scope back
+  whole.
+- **The IPAM mirror was stranded on wholesale deletes (#618).**
+  `_detach_ipam_for_static` was only reachable from the
+  per-reservation handlers, so every path that destroys reservations
+  in bulk (FK CASCADE or Core DELETE — no Python) left `ip_address`
+  rows at `status="static_dhcp"` pointing at reservations Postgres had
+  already dropped: not allocated, not free, not reclaimable. Hoisted
+  to `services/dhcp/static_ipam.py` and wired into scope
+  permanent-delete, trash permanent-delete, the purge sweep,
+  server-group delete, and the DHCP importer's overwrite. The
+  migration repairs already-stranded rows.
+- **DHCP reservation validation gaps (#619).** A body `scope_id` was
+  silently dropped with a 200 (Pydantic `extra="ignore"`), so a caller
+  re-pointing a reservation got no error and no effect; it now 422s.
+  Nothing validated that a reservation's IP fell inside its scope's
+  subnet, even though Kea renders it nested inside that subnet's
+  stanza — an out-of-CIDR reservation shipped structurally invalid
+  config to the agent.
+- **A readable sole etcd member must apply its peer-rule-less body
+  (#610).** The #593 self-partition guard conflated two empties:
+  membership *unreadable* and membership *readable with no other
+  member*. A fresh single-node seed is a live etcd member whose
+  correct firewall body has no peer rule, so the guard refused it
+  every heartbeat and pinned the k3s-bootstrap firewall forever — the
+  80/443 web-UI accepts never applied and **the appliance API/UI was
+  unreachable from off-box** while `/health/*` stayed 200 on
+  localhost. `observed_peer_cidrs()` now distinguishes the two
+  (`None` = unreadable, `[]` = readable sole member) and the guard
+  refuses only when membership is unknown or live peers exist without
+  a rule.
+- **A self-partition refusal that fails to persist is no longer
+  silent (#611).** A real write failure (read-only fs / ENOSPC / a
+  truly-missing mount) was swallowed at `log.debug` — the one path by
+  which a refusal could go invisible to the host-side console reader.
+  Elevated to `log.warning` with the target path.
 
 ### Migrations
 
+Eight migrations, chained
+`c9a2f61e740b → a71e5c30d9f4 → e4b8073af215 → c9a4e1f7b820 →
+d3b9f42a1c05 → f4a1c9e072d5 → a7c3e91f4d28 → b3e7d21c9f04`:
+
+- `c9a2f61e740b` — `wol_run.verify_params`, the per-run verify config
+  snapshot that lets an ad-hoc wake carry the operator's chosen
+  method / wait / retries (scheduled runs leave it NULL and keep
+  reading their live `wol_schedule` row).
+- `a71e5c30d9f4` — `wol_schedule.verify_alert_enabled`, the
+  per-schedule mute for the new `wol_wake_failed` rule (defaults
+  `true`; changes nothing until the rule itself is enabled).
+- `e4b8073af215` — `wol_run_target.verify_evidence`, the ordered
+  JSONB liveness-evidence array (one entry per source consulted).
+- `c9a4e1f7b820` — `netbird_instance` table; `netbird_instance_id` FK
+  on `ip_address` / `ip_block` / `subnet` (Phase 1) and `dns_zone` /
+  `dns_record` (Phase 2), all ON DELETE CASCADE; the settings toggle
+  and the seeded (disabled) `integrations.netbird` feature-module row.
 - `d3b9f42a1c05` — `network_block` + `network_block_push` tables,
   block-sync enforcement columns on `opnsense_router` /
   `unifi_controller`, and the seeded (disabled) `security.block_sync`
   feature-module row.
+- `f4a1c9e072d5` — `panos_firewall` + `firewall_endpoint_object`
+  tables, `panos_firewall_id` FK on `ip_address` / `ip_block` /
+  `subnet` / `nat_mapping`, the `integration_panos_enabled` platform
+  setting, and the seeded (disabled) `integrations.paloalto`
+  feature-module row.
+- `a7c3e91f4d28` — creates `fortinet_firewall`, `meraki_org`, and
+  `firewall_feed`; adds `fortinet_firewall_id` + `meraki_org_id`
+  provenance FKs (ON DELETE CASCADE) to `firewall_endpoint_object`
+  (dropping the NOT NULL on `panos_firewall_id` + adding the
+  one-owner CHECK) and to `ip_address` / `ip_block` / `subnet` /
+  `nat_mapping`; adds the two `integration_*_enabled` settings
+  toggles; seeds the `integrations.fortinet` / `integrations.meraki`
+  (off) + `security.firewall_feeds` (on) feature-module rows.
+- `b3e7d21c9f04` — soft-delete columns on `dhcp_pool` +
+  `dhcp_static_assignment` so a scope's cascade reaches them (#617),
+  and a data repair for the `ip_address` rows an earlier hard-delete
+  stranded at `status="static_dhcp"` (#618).
+
+### Security
+
+- Two new RBAC permissions gate the write paths. `manage_block_sync`
+  (arm an OPNsense / UniFi block-sync target) is granted to the
+  `Network Editor` builtin role. `manage_firewall_enforcement` — arm
+  a Palo Alto DAG or Meraki client-block target, which pushes to a
+  vendor cloud / User-ID surface with a separate write-scoped
+  credential — is required *in addition to* `manage_block_sync` and
+  is deliberately granted to **no builtin role at all**: only
+  Superadmin (which bypasses every check) has it out of the box, so
+  an operator must grant it on purpose.
+- The `security.firewall_feeds` poll endpoint is authenticated purely
+  by a Fernet-encrypted, rotatable bearer token and returns only the
+  block list — it is the one deliberately unauthenticated-by-session
+  surface, and it is read-only.
+- #597's name validation closes an injection-adjacent gap: embedded
+  newlines and control characters in hostnames / record owners
+  previously persisted verbatim and reached the BIND9 + PowerDNS
+  config renderers. Both drivers now strip control characters at the
+  render boundary regardless of row provenance.
 
 ---
 

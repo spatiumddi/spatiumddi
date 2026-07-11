@@ -232,6 +232,78 @@ Shipped as Option 2 from the original plan (synthetic `DNSZone` materialised by 
 
 ---
 
+## NetBird (#603)
+
+**Phase status**: 1 shipped (read-only peer mirror) + 2 shipped (synthetic mesh-domain DNS surface). Gated behind the `integrations.netbird` feature module (**default off** — Settings → Features).
+
+NetBird is the Tailscale-shaped sibling — a managed WireGuard mesh overlay with a real REST management API, but self-hostable. One `NetbirdInstance` row per NetBird deployment (a management server + a personal-access token). Unlike Tailscale's fixed `api.tailscale.com` host, the management URL is operator-supplied, and NetBird peers carry a **single IPv4 overlay address** (no IPv6 ULA), so there is one overlay CIDR — not the CGNAT + ULA pair Tailscale mirrors.
+
+Per-instance config (`NetbirdInstance` rows):
+
+| Field | Notes |
+|---|---|
+| `api_url` | Management-server base URL. Cloud is `https://api.netbird.io`; a self-hosted install is the dashboard / management host (the API is served under `/api` on the same host — a trailing `/api` is stripped so either form works). Operator-supplied, so the **Test Connection** probe runs it through the advisory SSRF guard (`app.core.ssrf`) at the API boundary, as every operator-URL integration does. |
+| `verify_tls` | Default `true`. Turn off for a self-hosted install behind a private-CA / self-signed cert. |
+| `api_key` | Personal-access token (`nbp_…`), minted under **Settings → Users** in the NetBird dashboard. Fernet-encrypted at rest and **never returned** by the API — responses only carry an `api_key_present` boolean. Auth header is `Authorization: Token <key>` (NetBird's scheme — `Token`, not `Bearer`). SpatiumDDI only ever reads. |
+| `ipam_space_id` | Required. The overlay block + subnet land here. |
+| `dns_group_id` | Optional. Binding a group activates the Phase 2 synthetic zone; leave unset to run the IPAM mirror only. |
+| `network_cidr` | Default `100.64.0.0/10` (NetBird allocates peer addresses from CGNAT space). Override if your management server is configured with a custom slice. Mirrored as **one flat subnet** — the mesh is a routed overlay, not a subdivided LAN. |
+| `skip_expired` | Default `true`. Skips a peer only when the instance opts in **and** the peer actually has login-expiration enabled **and** it has expired — long-lived setup-key / service peers commonly disable expiration entirely. |
+| `sync_interval_seconds` | Default `60`, floor `30`. Swept by `sweep_netbird_instances` on the shared 30 s beat tick, with per-instance interval gating. |
+
+### Mirror semantics
+
+- **Overlay block + subnet** are auto-created under the bound space on first sync (one instance-owned `IPBlock` + one `Subnet` covering the whole `network_cidr`). Routed-overlay semantics — no broadcast, every host address usable.
+- **Peers** (`GET /api/peers` — one round-trip, no pagination) → one `IPAddress` per peer overlay `ip`, with:
+  - `status="netbird-peer"`, `hostname` = the peer's FQDN from `dns_label` (falling back to the short `hostname` / `name` while a peer is still onboarding).
+  - `description` = `<os> <version>`.
+  - `custom_fields` carry: `netbird_id`, `os`, `version`, `hostname`, `dns_label`, `groups`, `connected`, `last_seen`, `login_expired`, `ssh_enabled`, `approval_required`, `user_id`. Empty / falsy fields are dropped to keep the JSON column compact.
+- **MAC** is always null — NetBird is an L3 overlay, no L2 addresses.
+- **Mesh DNS domain** (`dns_domain` on the row) is auto-derived from the first peer's `dns_label` FQDN (e.g. `server-1.netbird.cloud` → `netbird.cloud`) — no separate config field.
+
+### Lock semantics
+
+Same ownership shape as Proxmox / Tailscale / UniFi:
+
+- **Claim-on-existing**: pre-existing operator rows at desired peer addresses are adopted (FK stamped) with `user_modified_at` set, locking the operator's hostname / description / status from reconciler overwrites.
+- **Skip-on-locked**: locked rows keep their soft fields on every subsequent pass. The reconciler still corrects the factual `subnet_id`.
+- **Un-claim-on-disappear**: a locked row whose upstream peer is gone keeps the operator's edits — the FK is **released**, not the row deleted, so it appears as "manually managed". Unlocked rows are deleted.
+- **Cross-integration safety**: rows already owned by any sibling integration are skipped with a warning rather than claimed.
+
+**⚠️ NetBird and Tailscale share the same default CGNAT range** (`100.64.0.0/10`), so a peer and a tailnet device can legitimately land on the same address. Each reconciler therefore refuses to claim rows owned by the other (the guard was added symmetrically to the Tailscale reconciler in the same change). If you run both mirrors, bind them to **different IPAM spaces** — or expect one to win the address and the other to log an `owned by another integration; not claiming` warning.
+
+### Setup
+
+1. In the NetBird dashboard open **Settings → Users**, pick an account admin (or a service user with read access), and create a **personal-access token**. Copy the printed value (`nbp_…`).
+2. Paste the management URL into **API URL** — `https://api.netbird.io` for NetBird Cloud, or your self-hosted management host.
+3. Bind an **IPAM space** (required) and, optionally, a **DNS server group** to light up Phase 2.
+4. Hit **Test Connection** (`POST /netbird/instances/test`) — it verifies reachability + auth and reports the derived mesh domain + peer count before save.
+
+A `401` means the token is invalid or revoked; a `403` means the token's user can't list peers; a `404` usually means the management URL isn't the API base.
+
+### Phase 2 — synthetic mesh DNS surface
+
+Same shape as Tailscale's Phase 2: a synthetic `DNSZone` materialised by the reconciler (not a driver). Activates automatically when the instance has `dns_group_id` bound; **skipped silently otherwise**.
+
+**What it does.** Every reconcile pass:
+
+1. Derives the mesh domain from the first peer's `dns_label` FQDN (cached on `NetbirdInstance.dns_domain`).
+2. Upserts a `DNSZone` named `<domain>.` in the bound DNS group, FK-stamped with `netbird_instance_id` + `is_auto_generated=True`.
+3. Diffs the desired record set — one **A** record per peer (NetBird peers are IPv4-only, so no AAAA) — against the existing synthesised records, keyed on `(label, record_type, value)`. Adds new, deletes orphaned.
+4. Stamps each record with `auto_generated=True` + `netbird_instance_id`. TTL = 300 s.
+
+**Read-only enforcement.** DNS API write paths return **422** when `netbird_instance_id IS NOT NULL` on the target zone or record, with a message pointing the operator at unbinding the DNS group (or deleting the instance) to release the zone.
+
+**Conflict with operator zones.** A pre-existing **operator-managed** zone of the same name in the bound group is **not** claimed — claiming it would silently overwrite operator records every sync. The collision is reported as a `summary.warnings` entry (visible in the `netbird.reconcile` audit row), the operator's zone is left untouched, and the IPAM mirror still runs to completion. Delete / rename the manual zone (or rebind the instance to a different group) to unblock Phase 2.
+
+**Filtering.** Peers skipped by the IPAM mirror (expired logins, no FQDN, an FQDN outside the derived domain) are skipped here too, so the DNS view stays consistent with the IPAM view.
+
+### Operator Copilot
+
+`list_netbird_targets` (module-gated on `integrations.netbird`) lists configured instances — name, description, enabled flag, bound IPAM space, sync interval, `last_synced_at`. API tokens never appear in the response.
+
+---
+
 ## UniFi Network Application
 
 **Phase status**: read-only mirror shipped. Gated behind the `integrations.unifi` feature module (**default off** — Settings → Features).
@@ -547,7 +619,7 @@ A `FirewallFeed` row exposes `GET /api/v1/firewall-feeds/feeds/{id}/blocklist.tx
 
 When **any** integration toggle is on, the dashboard renders an **Integrations panel** below the service health strip with:
 
-- One column per enabled integration (Kubernetes / Docker / Proxmox / Tailscale / UniFi / Cloud / OPNsense), header linking to the full admin page.
+- One column per enabled integration (Kubernetes / Docker / Proxmox / Tailscale / NetBird / UniFi / Cloud / OPNsense / Palo Alto / Fortinet / Meraki), header linking to the full admin page.
 - Per-row: status dot (green = synced recently, amber = stalled > 3× sync interval, red = `last_sync_error`, gray = disabled or never synced), name, endpoint, node / container count, humanized last-synced age.
 - `last_sync_error` is exposed as the row tooltip so operators can triage without leaving the dashboard.
 
@@ -555,7 +627,9 @@ When **any** integration toggle is on, the dashboard renders an **Integrations p
 
 ## Roadmap — additional integrations
 
-Tier 1 status (tracked in [CLAUDE.md §Integration roadmap](../../CLAUDE.md)): **UniFi Network Application** and **OPNsense** have shipped as read-only mirrors (gated by the `integrations.unifi` / `integrations.opnsense` feature modules); **pfSense** remains. All target the same homelab / SMB audience and fit the Kubernetes/Docker/Proxmox/Tailscale reconciler shape. See CLAUDE.md for per-integration scope notes.
+Tier 1 status (tracked in [CLAUDE.md §Integration roadmap](../../CLAUDE.md)): **UniFi Network Application**, **OPNsense** and **NetBird** have shipped as read-only mirrors (gated by the `integrations.unifi` / `integrations.opnsense` / `integrations.netbird` feature modules); **pfSense** remains. All target the same homelab / SMB audience and fit the Kubernetes/Docker/Proxmox/Tailscale reconciler shape. See CLAUDE.md for per-integration scope notes.
+
+The **enterprise-firewall family** has since shipped on the same reconciler shape — **Palo Alto PAN-OS / Panorama** (#605) plus **Fortinet FortiGate** and **Cisco Meraki MX** (#606, Phase 1), each with its own section above. Check Point and Cisco FTD / FMC are the remaining Phase 2 vendors.
 
 Tier 2 (narrower): MikroTik RouterOS 7, Incus / LXD, HashiCorp Nomad, NetBox one-shot import.
 

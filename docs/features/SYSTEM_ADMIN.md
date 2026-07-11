@@ -15,7 +15,9 @@ remains the design reference for what hasn't shipped yet.
 ### Trash (`/admin/trash`) — landed in `2026.04.26-1`
 
 Soft-delete + 30-day recovery for IP spaces, blocks, subnets,
-DNS zones / records, and DHCP scopes. See
+DNS zones / records, and DHCP scopes (with their pools + static
+reservations cascading under the scope's batch, so one Restore
+brings the scope back whole — #617). See
 [IPAM § 15.16](IPAM.md#-1516-soft-delete--trash-recovery) for
 the full data model + cascade-batch semantics. The admin page
 lists deleted rows newest-first with type / since / `q` filters,

@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="1310" viewBox="0 0 1400 1310"
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="1384" viewBox="0 0 1400 1384"
      preserveAspectRatio="xMidYMid meet"
      font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
   <defs>
@@ -301,9 +301,9 @@
   <text x="1134" y="1024" text-anchor="middle" class="lane-label" font-size="10.5px" fill="#64748b">control plane calls REST/SDK directly · import-existing-zones</text>
 
   <!-- ───── Integration mirrors ───── -->
-  <text x="40" y="1062" class="layer-label">Read-only integration mirrors — scheduled pull → IPAM (never written back)</text>
-  <rect x="36" y="1068" width="1328" height="186" rx="12" class="band"/>
-  <rect x="52" y="1082" width="1292" height="158" rx="10" class="card" fill="url(#g-integrations)"/>
+  <text x="40" y="1062" class="layer-label">Integration mirrors — scheduled pull → IPAM (read-only; block-sync push is the one opt-in exception)</text>
+  <rect x="36" y="1068" width="1328" height="260" rx="12" class="band"/>
+  <rect x="52" y="1082" width="1292" height="232" rx="10" class="card" fill="url(#g-integrations)"/>
 
   <text x="212" y="1116" text-anchor="middle" class="card-title-sm">Kubernetes</text>
   <text x="212" y="1134" text-anchor="middle" class="card-sub-dim">CIDRs · nodes · LB VIPs · Ingress→DNS</text>
@@ -322,8 +322,19 @@
   <text x="532" y="1208" text-anchor="middle" class="card-sub-dim">sites · VLANs · clients (host+MAC)</text>
   <text x="852" y="1190" text-anchor="middle" class="card-title-sm">OPNsense</text>
   <text x="852" y="1208" text-anchor="middle" class="card-sub-dim">interfaces · DHCP leases + reservations</text>
-  <text x="1180" y="1196" text-anchor="middle" class="card-sub">Fernet-encrypted creds · 30 s sync</text>
-  <text x="1180" y="1214" text-anchor="middle" class="card-sub-dim">shape-guarded absence-delete</text>
+  <text x="1180" y="1190" text-anchor="middle" class="card-title-sm">NetBird</text>
+  <text x="1180" y="1208" text-anchor="middle" class="card-sub-dim">peers · synthetic DNS zone · overlay CIDR</text>
+
+  <line x1="76" y1="1232" x2="1320" y2="1232" class="divider"/>
+
+  <text x="212" y="1264" text-anchor="middle" class="card-title-sm">Palo Alto PAN-OS</text>
+  <text x="212" y="1282" text-anchor="middle" class="card-sub-dim">address objects · NAT rules · zones</text>
+  <text x="532" y="1264" text-anchor="middle" class="card-title-sm">Fortinet FortiGate</text>
+  <text x="532" y="1282" text-anchor="middle" class="card-sub-dim">address objects · VIPs → NAT mappings</text>
+  <text x="852" y="1264" text-anchor="middle" class="card-title-sm">Cisco Meraki MX</text>
+  <text x="852" y="1282" text-anchor="middle" class="card-sub-dim">VLANs · reservations · policy objects</text>
+  <text x="1180" y="1270" text-anchor="middle" class="card-sub">Fernet-encrypted creds · 30 s sync</text>
+  <text x="1180" y="1288" text-anchor="middle" class="card-sub-dim">shape-guarded absence-delete</text>
 
   <!-- ───── Edges ───── -->
   <!-- Clients → control plane -->
