@@ -9,6 +9,8 @@ keygen, User-ID register, and error mapping without a real firewall.
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import httpx
 import pytest
 
@@ -277,22 +279,16 @@ async def test_keygen_parses_key() -> None:
             200, text="<response status='success'><result><key>MINTED==</key></result></response>"
         )
 
-    # keygen builds its own client internally; patch httpx via transport by
-    # monkeypatching is awkward, so drive the classmethod against MockTransport
-    # through a tiny subclass override of the client construction.
-    import app.services.panos.client as mod  # noqa: PLC0415
-
+    # keygen builds its own httpx client internally; drive it against
+    # MockTransport by patching the constructor to inject the transport.
     orig = httpx.AsyncClient
 
     def _factory(*args, **kwargs):  # noqa: ANN002, ANN003
         kwargs.pop("verify", None)
         return orig(*args, transport=httpx.MockTransport(handler), **kwargs)
 
-    mod.httpx.AsyncClient = _factory  # type: ignore[attr-defined]
-    try:
+    with patch.object(httpx, "AsyncClient", _factory):
         key = await PANOSClient.keygen(
             host="pa.example.test", port=443, username="admin", password="pw", verify_tls=False
         )
-    finally:
-        mod.httpx.AsyncClient = orig  # type: ignore[attr-defined]
     assert key == "MINTED=="
