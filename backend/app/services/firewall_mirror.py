@@ -28,14 +28,11 @@ import ipaddress
 from dataclasses import dataclass, field
 from typing import Any
 
-import structlog
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.ipam import IPAddress, IPBlock, NATMapping, Subnet
 from app.models.panos import FIREWALL_OBJECT_KINDS, FirewallObject
-
-logger = structlog.get_logger(__name__)
 
 _BIGINT_MAX = 2**63 - 1
 
