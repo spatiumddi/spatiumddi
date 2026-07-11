@@ -165,9 +165,8 @@ async def test_trashed_statics_are_hidden_from_default_selects(
     scope_id = scope.id
     await db_session.commit()
 
-    assert (
-        await client.delete(f"/api/v1/dhcp/scopes/{scope_id}", headers=headers)
-    ).status_code == 204
+    deleted = await client.delete(f"/api/v1/dhcp/scopes/{scope_id}", headers=headers)
+    assert deleted.status_code == 204, deleted.text
 
     # Holding the trashed scope's UUID must not get you its reservations back.
     listed = await client.get(f"/api/v1/dhcp/scopes/{scope_id}/statics", headers=headers)
@@ -203,9 +202,8 @@ async def test_trashed_static_does_not_block_mac_reuse(
     await db_session.flush()
     await db_session.commit()
 
-    assert (
-        await client.delete(f"/api/v1/dhcp/scopes/{scope.id}", headers=headers)
-    ).status_code == 204
+    deleted = await client.delete(f"/api/v1/dhcp/scopes/{scope.id}", headers=headers)
+    assert deleted.status_code == 204, deleted.text
 
     # Same group, same subnet, fresh scope — the partial unique index on
     # (group, subnet) released the slot when the old scope was trashed.
@@ -250,9 +248,8 @@ async def test_restore_brings_back_pools_and_statics(
     scope_id = scope.id
     await db_session.commit()
 
-    assert (
-        await client.delete(f"/api/v1/dhcp/scopes/{scope_id}", headers=headers)
-    ).status_code == 204
+    deleted = await client.delete(f"/api/v1/dhcp/scopes/{scope_id}", headers=headers)
+    assert deleted.status_code == 204, deleted.text
 
     restore = await client.post(
         f"/api/v1/admin/trash/dhcp_scope/{scope_id}/restore", headers=headers
@@ -308,9 +305,8 @@ async def test_trash_batch_size_counts_cascade_children(
     scope_id = scope.id
     await db_session.commit()
 
-    assert (
-        await client.delete(f"/api/v1/dhcp/scopes/{scope_id}", headers=headers)
-    ).status_code == 204
+    deleted = await client.delete(f"/api/v1/dhcp/scopes/{scope_id}", headers=headers)
+    assert deleted.status_code == 204, deleted.text
 
     listing = await client.get("/api/v1/admin/trash?type=dhcp_scope", headers=headers)
     assert listing.status_code == 200
@@ -521,9 +517,8 @@ async def test_selectin_children_filter_and_opt_out_both_work(
     scope_id = scope.id
     await db_session.commit()
 
-    assert (
-        await client.delete(f"/api/v1/dhcp/scopes/{scope_id}", headers=headers)
-    ).status_code == 204
+    deleted = await client.delete(f"/api/v1/dhcp/scopes/{scope_id}", headers=headers)
+    assert deleted.status_code == 204, deleted.text
 
     # Opted in: the children are visible, so a blast-radius count is honest.
     db_session.expire_all()
@@ -639,9 +634,8 @@ async def test_purge_sweep_releases_ipam_mirror_of_reservations(
     )
     assert created.status_code == 201, created.text
 
-    assert (
-        await client.delete(f"/api/v1/dhcp/scopes/{scope_id}", headers=headers)
-    ).status_code == 204
+    deleted = await client.delete(f"/api/v1/dhcp/scopes/{scope_id}", headers=headers)
+    assert deleted.status_code == 204, deleted.text
 
     # Backdate the whole batch past the retention window so the sweep takes it.
     old = datetime.now(UTC) - timedelta(days=90)
