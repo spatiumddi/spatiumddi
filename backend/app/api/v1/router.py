@@ -21,6 +21,7 @@ from app.api.v1.auth.router import router as auth_router
 from app.api.v1.auth_providers.router import router as auth_providers_router
 from app.api.v1.backup import router as backup_router
 from app.api.v1.bgp import router as bgp_router
+from app.api.v1.block_sync import router as block_sync_router
 from app.api.v1.change_requests import router as change_requests_router
 from app.api.v1.circuits import router as circuits_router
 from app.api.v1.cloud import router as cloud_router
@@ -323,6 +324,10 @@ api_v1_router.include_router(
 api_v1_router.include_router(
     new_devices_router,
     dependencies=[Depends(require_module("security.new_device_watch"))],
+)
+api_v1_router.include_router(
+    block_sync_router,
+    dependencies=[Depends(require_module("security.block_sync"))],
 )
 api_v1_router.include_router(
     nmap_router,

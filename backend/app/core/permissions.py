@@ -740,6 +740,7 @@ def require_any_resource_or_scoped(
 # `docs/PERMISSIONS.md` honest as new ones land.
 KNOWN_MANAGE_PERMISSIONS: frozenset[str] = frozenset(
     {
+        "manage_block_sync",
         "manage_dns_pools",
         "manage_domains",
         "manage_network_devices",

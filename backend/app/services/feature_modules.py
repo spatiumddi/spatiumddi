@@ -379,6 +379,21 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         description="Alert the moment a previously-unseen MAC address appears on the network (arpwatch-style), across DHCP leases, SNMP ARP/FDB, and an opt-in L2 sniffer. Maintain an allowlist of trusted MACs (or OUI prefixes for VMs/containers), acknowledge or block from a review queue, and fire a real-time device.first_seen event. Default-off: enable, run a baseline import to mark the existing fleet as known, then arm.",
         default_enabled=False,
     ),
+    # Security — active block sync / write-back enforcement (#601). The
+    # deliberate, guarded exception to the read-only-mirror stance: pushes
+    # SpatiumDDI-owned IP/MAC blocks into OPNsense (firewall table alias)
+    # and UniFi (L2 client quarantine). Default-OFF — the whole surface is
+    # dark until an operator opts in, AND every push additionally requires
+    # a per-target ``block_sync_enabled`` master switch + distinct
+    # write-scoped credentials. Turning this module ON exposes the surface
+    # but arms nothing.
+    ModuleSpec(
+        id="security.block_sync",
+        label="Active block sync (firewall enforcement)",
+        group="Security",
+        description="Turn passive rogue-device / new-MAC detection into active enforcement: push a SpatiumDDI-owned block set of IPs / MACs into OPNsense (firewall table-alias membership) and UniFi (L2 client quarantine), so a device that self-assigns a static IP is stopped at the firewall/gateway — not only starved of DHCP. Default-off and heavily guarded: each target has its own default-off enforcement master switch + distinct write-scoped credentials, every push is previewable + audited + RBAC-gated (manage_block_sync) + eligible for two-person approval. Discovery toggle only — enabling this arms nothing on its own.",
+        default_enabled=False,
+    ),
     # Security — DNSBL / RBL reputation monitoring (#528). Default-ENABLED
     # as a DISCOVERY toggle: the catalog + settings UI are visible so
     # operators find the feature, but the module makes ZERO off-prem DNS

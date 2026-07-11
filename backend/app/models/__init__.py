@@ -23,6 +23,7 @@ from app.models.backup import BackupTarget
 from app.models.base import Base
 from app.models.bgp_looking_glass import BGPLGPeer, BGPLGRoute, LookingGlassCollector
 from app.models.bgp_monitor import BGPHijackDetection, BGPTrackedPrefix
+from app.models.block_sync import NetworkBlock, NetworkBlockPush
 from app.models.change_request import ApprovalPolicy, ChangeRequest
 from app.models.circuit import Circuit
 from app.models.cloud import CloudEndpoint
@@ -157,6 +158,8 @@ __all__ = [
     "BGPPeering",
     "BGPTrackedPrefix",
     "BGPHijackDetection",
+    "NetworkBlock",
+    "NetworkBlockPush",
     "LookingGlassCollector",
     "BGPLGPeer",
     "BGPLGRoute",

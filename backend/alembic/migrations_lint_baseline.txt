@@ -417,6 +417,10 @@ backend/alembic/versions/d1f4b7c92e58_appliance_firewall_state.py:drop_column:43
 backend/alembic/versions/d2a8e417b9f3_backup_target.py:drop_table:112
 backend/alembic/versions/d2f7a91e4c8b_nmap_scans.py:drop_table:96
 backend/alembic/versions/d3a9c5b71e84_subnet_kind.py:drop_column:71
+backend/alembic/versions/d3b9f42a1c05_active_block_sync.py:drop_column:196
+backend/alembic/versions/d3b9f42a1c05_active_block_sync.py:drop_column:205
+backend/alembic/versions/d3b9f42a1c05_active_block_sync.py:drop_table:207
+backend/alembic/versions/d3b9f42a1c05_active_block_sync.py:drop_table:209
 backend/alembic/versions/d3f1ab7c8e02_windows_dns_credentials.py:drop_column:36
 backend/alembic/versions/d3f2a51c8e76_bgp_peering.py:drop_column:98
 backend/alembic/versions/d3f2a51c8e76_bgp_peering.py:drop_constraint_fk:96

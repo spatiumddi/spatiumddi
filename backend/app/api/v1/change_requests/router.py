@@ -52,7 +52,11 @@ from app.services.ai.operations_control import (
     is_controls_protected,
     maybe_gate_control,
 )
-from app.services.approvals.policy import GATEABLE_ACTIONS, GATEABLE_RESOURCE_TYPES
+from app.services.approvals.policy import (
+    GATEABLE_ACTIONS,
+    GATEABLE_RESOURCE_TYPES,
+    gateable_pairs,
+)
 from app.services.approvals.service import (
     ChangeRequestStateError,
     DecisionError,
@@ -234,6 +238,20 @@ def _validate_gateable(action: str | None, resource_type: str | None) -> None:
                 f"{sorted(GATEABLE_RESOURCE_TYPES)}"
             ),
         )
+    # Both axes may individually be gateable while the PAIR maps to no
+    # registered risky operation (e.g. ('admin','subnet')). Such a policy
+    # would validate but ``match_policy`` could never select it — an
+    # enabled-but-inert fail-open. Reject the pair unless an op declares it.
+    if action is not None and resource_type is not None:
+        if (action, resource_type) not in gateable_pairs():
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=(
+                    f"no risky operation gates ({action!r}, {resource_type!r}); a policy for "
+                    f"this pair would never fire — supported pairs: "
+                    f"{sorted(gateable_pairs())}"
+                ),
+            )
 
 
 def _require_read(user: CurrentUser) -> None:

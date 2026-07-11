@@ -101,6 +101,40 @@ class OPNsenseRouter(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # 30 s beat tick.
     sync_interval_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=60)
 
+    # ── Active block sync (#601 — enforcement write-back) ────────────
+    # The mirror above stays strictly read-only. This block is a
+    # SEPARATE, opt-in write capability that pushes SpatiumDDI's
+    # ``network_block`` desired-state (IPs) into an operator-pre-created
+    # OPNsense firewall *table alias*. SpatiumDDI only ever mutates alias
+    # membership (add/delete + reconfigure) — never rule CRUD.
+    #
+    # ``block_sync_enabled`` is the per-target master switch — default
+    # OFF, independent of both ``enabled`` (mirror) and the
+    # ``integrations.opnsense`` feature module. Nothing is ever pushed
+    # unless an operator explicitly arms this AND the
+    # ``security.block_sync`` module is on.
+    block_sync_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+    # Distinct WRITE-scoped credentials. The read mirror only needs a
+    # read-only API user; enforcement needs a Firewall-privileged user.
+    # When empty, the reconciler refuses to push (it does NOT silently
+    # fall back to the read creds). Same Basic-auth shape as above.
+    block_sync_api_key: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    block_sync_api_secret_encrypted: Mapped[bytes] = mapped_column(
+        LargeBinary, nullable=False, default=b"", server_default=sa_text("''::bytea")
+    )
+    # The OPNsense table alias SpatiumDDI mutates (e.g. ``spatiumddi_blocked``).
+    # The operator pre-creates one block rule referencing this alias; we
+    # add/remove IPs to converge. Empty = not configured (reconcile no-ops).
+    block_alias_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+
+    # Block-sync convergence state (surfaced in the UI).
+    last_block_sync_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_block_sync_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     # ── Sync state ──────────────────────────────────────────────────
     last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_sync_error: Mapped[str | None] = mapped_column(Text, nullable=True)

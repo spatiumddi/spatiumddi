@@ -396,6 +396,20 @@ async def delete_router(router_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
     r = await db.get(OPNsenseRouter, router_id)
     if r is None:
         raise HTTPException(status_code=404, detail="OPNsense firewall not found")
+    # #601 — sweep any active block-sync push rows for this target. They have no
+    # FK to opnsense_router (target_id is polymorphic), so nothing cascades.
+    # NOTE: this does NOT lift the blocks off the firewall — disarm the target
+    # first (which lifts) if the device should stop enforcing them.
+    from sqlalchemy import delete as sa_delete  # noqa: PLC0415
+
+    from app.models.block_sync import NetworkBlockPush  # noqa: PLC0415
+
+    await db.execute(
+        sa_delete(NetworkBlockPush).where(
+            NetworkBlockPush.target_kind == "opnsense",
+            NetworkBlockPush.target_id == r.id,
+        )
+    )
     _audit(db, user=user, action="delete", router_id=r.id, router_name=r.name)
     await db.delete(r)
     await db.commit()

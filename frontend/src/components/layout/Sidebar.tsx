@@ -32,6 +32,7 @@ import {
   Tags,
   ShieldCheck,
   ShieldAlert,
+  ShieldBan,
   ShieldQuestion,
   ScrollText,
   BellRing,
@@ -219,6 +220,12 @@ const toolsNav = [
     icon: ShieldQuestion,
     to: "/security/new-devices",
     module: "security.new_device_watch",
+  },
+  {
+    label: "Block Sync",
+    icon: ShieldBan,
+    to: "/security/block-sync",
+    module: "security.block_sync",
   },
   { label: "Nmap", icon: Search, to: "/tools/nmap", module: "tools.nmap" },
   {

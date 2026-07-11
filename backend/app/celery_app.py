@@ -45,6 +45,7 @@ celery_app = Celery(
         "app.tasks.tailscale_sync",
         "app.tasks.netbird_sync",
         "app.tasks.unifi_sync",
+        "app.tasks.block_sync",
         "app.tasks.cloud_sync",
         "app.tasks.snmp_poll",
         "app.tasks.nmap",
@@ -109,6 +110,7 @@ celery_app.conf.update(
         "app.tasks.docker_sync.*": {"queue": "default"},
         "app.tasks.proxmox_sync.*": {"queue": "default"},
         "app.tasks.opnsense_sync.*": {"queue": "default"},
+        "app.tasks.block_sync.*": {"queue": "default"},
         "app.tasks.tailscale_sync.*": {"queue": "default"},
         "app.tasks.netbird_sync.*": {"queue": "default"},
         "app.tasks.unifi_sync.*": {"queue": "default"},
@@ -391,6 +393,15 @@ celery_app.conf.update(
         "opnsense-sync-sweep": {
             "task": "app.tasks.opnsense_sync.sweep_opnsense_routers",
             "schedule": schedule(run_every=30.0),
+        },
+        # Active block sync (#601) — converge SpatiumDDI-owned network
+        # blocks onto every armed OPNsense/UniFi target. 60 s cadence
+        # (enforcement, not discovery — the on-create/lift path handles
+        # immediacy). Gated by the ``security.block_sync`` feature module
+        # + each target's own ``block_sync_enabled`` master switch.
+        "block-sync-sweep": {
+            "task": "app.tasks.block_sync.sweep_block_sync",
+            "schedule": schedule(run_every=60.0),
         },
         # Tailscale — same 30 s beat, per-tenant interval gate.
         # Gated overall by ``PlatformSettings.integration_tailscale_enabled``.

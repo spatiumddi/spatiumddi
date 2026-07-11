@@ -76,6 +76,7 @@ Each entry in `Role.permissions` (JSONB) is an object with this shape:
 | `bgp_lg_peer`     | BGP Looking Glass configured peer sessions within a collector (#566) |
 | `conformity`      | Conformity policies + results + auditor PDF export (#106) |
 | `manage_packet_capture` | On-demand packet capture (tcpdump) — start / read / download / delete captures (#59). High-sensitivity (captured bytes can contain plaintext creds/PII); granted to `Network Editor`, not `Viewer`. Download is audited. |
+| `manage_block_sync` | Active block sync / write-back enforcement (#601) — create/lift SpatiumDDI-owned IP/MAC blocks, arm per-target OPNsense/UniFi enforcement + write-scoped creds, reveal + reconcile. High blast-radius (pushes a real firewall/gateway block that can lock devices out); granted to `Network Editor`, not `Viewer`. Every push is audited and eligible for two-person approval (`admin:manage_block_sync`). |
 | `address_set`     | Named IP range within a subnet carrying its own RBAC scope — delegates edit of a slice without subnet-wide write (#103). Creating a set / resizing its range additionally requires write on the parent subnet. |
 | `change_request`  | Queued two-person-approval change requests (#62) — `approve` + `read` for the second-person decision (the underlying operation's permission is *also* required server-side). |
 | `wol_schedule`    | Scheduled Wake-on-LAN jobs + run history (#586) — recurring, tag-targeted, calendar-gated fleet wake |
@@ -140,7 +141,7 @@ on inactive.
 | `IPAM Editor`  | `admin` on `ip_space`, `ip_block`, `subnet`, `ip_address`, `address_set`, `vlan`, `nat_mapping`, `custom_field`, `manage_ipam_templates`, `customer`, `site`, `provider`, `network_service` |
 | `DNS Editor`   | `admin` on `dns_zone`, `dns_record`, `dns_group`, `dns_blocklist`, `manage_dns_pools` |
 | `DHCP Editor`  | `admin` on `dhcp_server`, `dhcp_scope`, `dhcp_pool`, `dhcp_static`, `dhcp_client_class`, `dhcp_option_template`, `dhcp_mac_block` |
-| `Network Editor` | `admin` on `manage_network_devices`, `manage_nmap_scans`, `manage_packet_capture`, `use_network_tools`, `manage_asns`, `vrf`, `circuit`, `multicast`, `network_service`, `overlay_network`, `routing_policy`, `application_category`, `customer`, `site`, `provider`, `tls_cert` |
+| `Network Editor` | `admin` on `manage_network_devices`, `manage_nmap_scans`, `manage_packet_capture`, `manage_block_sync`, `use_network_tools`, `manage_asns`, `vrf`, `circuit`, `multicast`, `network_service`, `overlay_network`, `routing_policy`, `application_category`, `customer`, `site`, `provider`, `tls_cert` |
 | `Auditor`        | `read` on `conformity`, `audit`, `subnet`, `ip_address`, `dns_zone`, `dhcp_scope`, `tls_cert` — external auditor account, can view conformity dashboard + pull the auditor PDF + verify supporting evidence without making changes |
 | `Compliance Editor` | `admin` on `conformity`, `read` on `audit`, `subnet`, `ip_address`, `dns_zone`, `dhcp_scope` — for the team that authors / tunes conformity policies without touching operational config |
 | `Address Set Editor` | `admin` on `address_set` (#103) — delegated edit of a named IP slice within a subnet without subnet-wide write. Grant on a specific address-set id to scope a department admin to just their slice. Creating / resizing a set still requires write on the parent subnet. |

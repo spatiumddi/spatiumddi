@@ -766,6 +766,19 @@ async def delete_controller(controller_id: uuid.UUID, db: DB, user: SuperAdmin) 
     c = await db.get(UnifiController, controller_id)
     if c is None:
         raise HTTPException(status_code=404, detail="UniFi controller not found")
+    # #601 — sweep any active block-sync push rows for this target (polymorphic
+    # target_id, no cascade). Disarm the target first if the controller should
+    # stop quarantining the MACs (disarm lifts them; delete does not).
+    from sqlalchemy import delete as sa_delete  # noqa: PLC0415
+
+    from app.models.block_sync import NetworkBlockPush  # noqa: PLC0415
+
+    await db.execute(
+        sa_delete(NetworkBlockPush).where(
+            NetworkBlockPush.target_kind == "unifi",
+            NetworkBlockPush.target_id == c.id,
+        )
+    )
     _audit(db, user=user, action="delete", controller_id=c.id, controller_name=c.name)
     await db.delete(c)
     await db.commit()

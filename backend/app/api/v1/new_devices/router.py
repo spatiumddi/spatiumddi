@@ -13,7 +13,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, model_validator
 from sqlalchemy import String, and_, cast, func, or_, select
 from sqlalchemy.exc import IntegrityError
@@ -80,12 +80,24 @@ class BlockBody(BaseModel):
     group_id: uuid.UUID | None = None  # None → block in every DHCP server group
     reason: str = "other"
     description: str = ""
+    # #601 — also push an upstream MAC quarantine (UniFi block-sta) via the
+    # active block-sync surface. Only takes effect when the
+    # ``security.block_sync`` module is on, the caller holds
+    # ``manage_block_sync``, and at least one UniFi target is armed —
+    # otherwise it is ignored (the DHCP block still lands). A DHCP block
+    # only starves the device of a lease; a self-assigned static IP walks
+    # right past it, which is exactly the gap this closes.
+    block_upstream: bool = False
 
 
 class BlockResult(BaseModel):
     mac_address: str
     blocked_group_ids: list[uuid.UUID]
     already_blocked_group_ids: list[uuid.UUID]
+    # Set when ``block_upstream`` produced an active network block (or queued
+    # one for two-person approval).
+    upstream_block_created: bool = False
+    upstream_change_request_id: str | None = None
 
 
 class AllowlistOut(BaseModel):
@@ -402,10 +414,14 @@ async def delete_allowlist(allowlist_id: uuid.UUID, db: DB, user: WriteUser) -> 
 
 
 @router.post("/block", response_model=BlockResult)
-async def block_mac(body: BlockBody, db: DB, user: WriteUser) -> BlockResult:
+async def block_mac(body: BlockBody, db: DB, user: WriteUser, request: Request) -> BlockResult:
     """Block a MAC in one DHCP server group (or all groups when ``group_id`` is
     omitted) — arpwatch with teeth. Creates ``dhcp_mac_block`` rows + wakes the
-    affected agents."""
+    affected agents.
+
+    With ``block_upstream=True`` (#601) it *also* pushes an L2 quarantine to
+    every armed UniFi target through the active block-sync surface — closing
+    the "device self-assigns a static IP and walks past the DHCP block" gap."""
     if body.group_id is not None:
         group_ids = [body.group_id]
         if await db.get(DHCPServerGroup, body.group_id) is None:
@@ -455,11 +471,65 @@ async def block_mac(body: BlockBody, db: DB, user: WriteUser) -> BlockResult:
             new_value={"mac_address": body.mac_address, "blocked_groups": len(blocked)},
         )
     await db.commit()
+
+    upstream_created = False
+    upstream_cr: str | None = None
+    if body.block_upstream:
+        upstream_created, upstream_cr = await _maybe_block_upstream(db, user, request, body)
+
     return BlockResult(
         mac_address=body.mac_address,
         blocked_group_ids=blocked,
         already_blocked_group_ids=list(already),
+        upstream_block_created=upstream_created,
+        upstream_change_request_id=upstream_cr,
     )
+
+
+async def _maybe_block_upstream(
+    db: DB, user: User, request: Request, body: BlockBody
+) -> tuple[bool, str | None]:
+    """Create a MAC-kind ``network_block`` (source=new_device) so armed UniFi
+    targets quarantine the device. Silently no-ops unless the block-sync
+    module is on, the caller holds ``manage_block_sync``, and a target is
+    armed. Routes through the two-person approval gate like the dedicated
+    block-sync surface — returns ``(created, change_request_id)``."""
+    from app.core.permissions import user_has_permission
+    from app.services.ai.operations import get_operation
+    from app.services.ai.operations_risky import CreateNetworkBlockArgs
+    from app.services.approvals.gate import gate_or_execute
+    from app.services.block_sync.reconcile import applicable_targets_for_kind
+    from app.services.feature_modules import is_module_enabled
+
+    # All three gates are "ignore, don't fail" per the BlockBody contract:
+    # the DHCP block has already committed, so a hard error here would report
+    # total failure for a partial success. Missing the manage_block_sync
+    # permission is treated the same as the module being off — the upstream
+    # push is simply skipped (the frontend only offers the checkbox when the
+    # module is on; a caller without the permission just gets no upstream
+    # block, matching the documented "otherwise it is ignored" behaviour).
+    if not await is_module_enabled(db, "security.block_sync"):
+        return False, None
+    if not user_has_permission(user, "admin", "manage_block_sync"):
+        return False, None
+    if not await applicable_targets_for_kind(db, "mac"):
+        return False, None  # nothing armed — DHCP block still applies
+
+    op = get_operation("create_network_block")
+    assert op is not None
+    args = CreateNetworkBlockArgs(
+        kind="mac",
+        value=body.mac_address,
+        reason=body.reason if body.reason != "other" else "quarantine",
+        description=body.description or "Blocked from new-device review (#459/#601)",
+        source="new_device",
+        source_ref=body.mac_address,
+    )
+    pending = await gate_or_execute(db, user, request, operation=op, args=args)
+    if pending is not None:
+        return False, str(pending.change_request_id)
+    await op.apply(db, user, args)
+    return True, None
 
 
 # Keep ``normalize_oui_prefix`` reachable for tests that exercise the parser.

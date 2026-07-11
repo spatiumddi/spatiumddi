@@ -48,6 +48,7 @@ import { NetworkToolsPage } from "@/pages/tools/NetworkToolsPage";
 import { CidrCalculatorPage } from "@/pages/tools/CidrCalculatorPage";
 import { WakeSchedulesPage } from "@/pages/tools/WakeSchedulesPage";
 import { NewDevicesPage } from "@/pages/security/NewDevicesPage";
+import { BlockSyncPage } from "@/pages/security/BlockSyncPage";
 import { SubnetPlannerListPage } from "@/pages/ipam/SubnetPlannerListPage";
 import { SubnetPlannerEditorPage } from "@/pages/ipam/SubnetPlannerEditorPage";
 import { LogsPage } from "@/pages/LogsPage";
@@ -166,6 +167,7 @@ export default function App() {
         <Route path="tools/cidr" element={<CidrCalculatorPage />} />
         <Route path="tools/wake-schedules" element={<WakeSchedulesPage />} />
         <Route path="security/new-devices" element={<NewDevicesPage />} />
+        <Route path="security/block-sync" element={<BlockSyncPage />} />
         <Route path="dhcp" element={<DHCPPage />} />
         <Route path="dhcp/groups/:groupId/pxe" element={<PXEProfilesPage />} />
         <Route path="logs" element={<LogsPage />} />

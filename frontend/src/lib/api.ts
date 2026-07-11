@@ -1,4 +1,8 @@
-import axios, { AxiosError, type AxiosInstance } from "axios";
+import axios, {
+  AxiosError,
+  type AxiosInstance,
+  type AxiosResponse,
+} from "axios";
 import { getAccessToken, setAccessToken } from "@/lib/authToken";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "/api/v1";
@@ -7224,6 +7228,10 @@ export interface NewDeviceBlockResult {
   mac_address: string;
   blocked_group_ids: string[];
   already_blocked_group_ids: string[];
+  // #601 — set when ``block_upstream`` also pushed an L2 quarantine into
+  // the active block-sync set (or queued it for two-person approval).
+  upstream_block_created: boolean;
+  upstream_change_request_id: string | null;
 }
 
 export const newDeviceApi = {
@@ -7287,6 +7295,9 @@ export const newDeviceApi = {
     group_id?: string;
     reason?: string;
     description?: string;
+    // #601 — also push an L2 quarantine to armed UniFi block-sync targets.
+    // Only meaningful when the ``security.block_sync`` module is enabled.
+    block_upstream?: boolean;
   }) =>
     api
       .post<NewDeviceBlockResult>("/new-devices/block", data)
@@ -15755,5 +15766,157 @@ export const wakeSchedulesApi = {
       .get<
         WolCalendarEvent[]
       >(`/wake-scheduler/calendars/${id}/upcoming-events`, { params })
+      .then((r) => r.data),
+};
+
+// ── Active block sync — firewall / network-block enforcement (#601) ────
+// The enforcement half of the detect→block loop: SpatiumDDI-owned blocked
+// IPs / MACs pushed into armed OPNsense (firewall alias membership) and
+// UniFi (L2 client quarantine) targets. The whole surface is gated by the
+// (default-off) ``security.block_sync`` feature module — every endpoint
+// 404s when the module is off, so callers gate their queries on
+// ``useFeatureModules().enabled("security.block_sync")``. Requires the
+// ``manage_block_sync`` admin permission on every call.
+
+export type BlockKind = "ip" | "mac";
+export type BlockSource = "manual" | "new_device" | "rogue_dhcp";
+export type BlockTargetKind = "opnsense" | "unifi";
+export type BlockPushStatus = "pending" | "pushed" | "removing" | "error";
+export type BlockUnifiAuthKind = "api_key" | "user_password";
+
+export interface BlockPushOut {
+  target_kind: string;
+  target_id: string;
+  push_status: BlockPushStatus;
+  last_pushed_at: string | null;
+  last_error: string | null;
+}
+
+export interface NetworkBlock {
+  id: string;
+  kind: string;
+  value: string;
+  reason: string;
+  description: string;
+  source: string;
+  source_ref: string | null;
+  enabled: boolean;
+  expires_at: string | null;
+  created_at: string;
+  modified_at: string;
+  pushes: BlockPushOut[];
+}
+
+export interface NetworkBlockCreate {
+  kind: BlockKind;
+  value: string;
+  reason?: string;
+  description?: string;
+  source?: BlockSource;
+  source_ref?: string | null;
+  expires_at?: string | null;
+}
+
+export interface BlockTargetDiff {
+  target_kind: string;
+  target_id: string;
+  target_name: string;
+  to_add: string[];
+  to_remove: string[];
+  error: string | null;
+}
+
+export interface BlockTarget {
+  target_kind: BlockTargetKind;
+  target_id: string;
+  name: string;
+  block_sync_enabled: boolean;
+  // OPNsense-only
+  block_alias_name?: string | null;
+  // UniFi-only
+  block_sync_site?: string | null;
+  block_sync_auth_kind?: string | null;
+  write_credentials_present: boolean;
+  last_block_sync_at: string | null;
+  last_block_sync_error: string | null;
+}
+
+export interface BlockOpnsenseArm {
+  block_sync_enabled?: boolean;
+  block_alias_name?: string;
+  block_sync_api_key?: string;
+  // Omit / empty keeps the stored secret; non-empty rotates it.
+  block_sync_api_secret?: string;
+}
+
+export interface BlockUnifiArm {
+  block_sync_enabled?: boolean;
+  block_sync_site?: string;
+  block_sync_auth_kind?: BlockUnifiAuthKind;
+  block_sync_api_key?: string;
+  block_sync_username?: string;
+  block_sync_password?: string;
+}
+
+export interface BlockRevealResult {
+  api_secret?: string;
+  api_key?: string;
+  password?: string;
+}
+
+export const blockSyncApi = {
+  listBlocks: () =>
+    api.get<NetworkBlock[]>("/block-sync/blocks").then((r) => r.data),
+  previewBlock: (data: NetworkBlockCreate) =>
+    api
+      .post<BlockTargetDiff[]>("/block-sync/blocks/preview", data)
+      .then((r) => r.data),
+  // 201 → NetworkBlock, or 202 → ChangeRequestQueued when two-person
+  // approval is armed. Returns the FULL axios response on purpose — do
+  // NOT chain ``.then((r) => r.data)`` here or the 202 status is
+  // invisible. Callers pass the response to ``handleApprovalQueued``.
+  createBlock: (
+    data: NetworkBlockCreate,
+  ): Promise<AxiosResponse<NetworkBlock | ChangeRequestQueued>> =>
+    api.post<NetworkBlock | ChangeRequestQueued>("/block-sync/blocks", data),
+  liftBlock: (id: string) =>
+    api.delete<NetworkBlock>(`/block-sync/blocks/${id}`).then((r) => r.data),
+  listTargets: () =>
+    api.get<BlockTarget[]>("/block-sync/targets").then((r) => r.data),
+  armOpnsense: (id: string, data: BlockOpnsenseArm) =>
+    api
+      .put<BlockTarget>(`/block-sync/targets/opnsense/${id}`, data)
+      .then((r) => r.data),
+  armUnifi: (id: string, data: BlockUnifiArm) =>
+    api
+      .put<BlockTarget>(`/block-sync/targets/unifi/${id}`, data)
+      .then((r) => r.data),
+  // ``preview=true`` reads the device + returns the diff without pushing;
+  // ``preview=false`` enqueues a converge.
+  reconcile: (
+    targetKind: BlockTargetKind,
+    targetId: string,
+    preview: boolean,
+  ) =>
+    api
+      .post<BlockTargetDiff>(
+        `/block-sync/targets/${targetKind}/${targetId}/reconcile`,
+        undefined,
+        { params: { preview } },
+      )
+      .then((r) => r.data),
+  // Password / TOTP re-confirm reveal of the stored write-scoped secret,
+  // mirroring the agent-bootstrap-key reveal. Audited server-side.
+  reveal: (
+    targetKind: BlockTargetKind,
+    targetId: string,
+    password?: string,
+    totpCode?: string,
+  ) =>
+    api
+      .post<BlockRevealResult>(
+        `/block-sync/targets/${targetKind}/${targetId}/reveal`,
+        { password, totp_code: totpCode },
+      )
       .then((r) => r.data),
 };

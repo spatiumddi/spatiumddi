@@ -237,6 +237,7 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
             {"action": "admin", "resource_type": "manage_network_devices"},
             {"action": "admin", "resource_type": "manage_nmap_scans"},
             {"action": "admin", "resource_type": "manage_packet_capture"},
+            {"action": "admin", "resource_type": "manage_block_sync"},
             {"action": "admin", "resource_type": "use_network_tools"},
             {"action": "admin", "resource_type": "manage_asns"},
             {"action": "admin", "resource_type": "vrf"},

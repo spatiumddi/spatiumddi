@@ -159,6 +159,25 @@ def _unwrap_rows(body: Any) -> list[dict[str, Any]]:
     return [r for r in rows if isinstance(r, dict)]
 
 
+def _assert_alias_op_ok(data: Any, label: str) -> None:
+    """Raise ``OPNsenseClientError`` unless an alias_util / reconfigure
+    response reports success.
+
+    OPNsense returns ``{"status": "done"}`` (add/delete/reconfigure) or
+    ``{"result": "saved"}`` on success. A ``{"status": "failed"}`` or a
+    validation envelope means the operation didn't take — surface it so
+    the reconciler marks the push errored instead of falsely converged.
+    """
+    if isinstance(data, dict):
+        status_val = str(data.get("status") or data.get("result") or "").strip().lower()
+        if status_val in {"done", "saved", "ok"}:
+            return
+        # Some firmwares return an empty {} for add-of-already-present.
+        if not status_val and not data.get("validations"):
+            return
+    raise OPNsenseClientError(f"{label}: unexpected response {str(data)[:200]}")
+
+
 def _network_cidr(address: str, prefix: Any) -> str | None:
     """Build the network CIDR (``10.0.0.0/24``) from an interface IP +
     prefix length. Returns ``None`` on parse failure.
@@ -450,6 +469,61 @@ class OPNsenseClient:
                 )
             )
         return out
+
+    # ── Write surface (active block sync #601, opt-in) ───────────────
+    #
+    # Firewall enforcement via *table-alias membership only* — never rule
+    # CRUD. The operator pre-creates one block rule referencing an alias
+    # (e.g. ``spatiumddi_blocked``); SpatiumDDI adds/removes IPs to
+    # converge, then reconfigures to apply. Idempotent + no rule-ordering
+    # state. These require a Firewall-privileged API user (distinct from
+    # the read mirror's read-only user).
+
+    async def alias_list_addresses(self, alias: str) -> list[str]:
+        """Current member IPs of a table alias.
+
+        ``GET /api/firewall/alias_util/list/{alias}`` returns
+        ``{"total": N, "rows": [{"ip": "1.2.3.4"}, ...]}``. Raises
+        (no swallow) so the reconciler can distinguish a real read from a
+        transient failure and never diff against a bad-empty set (#5).
+        """
+        body = await self._get(f"/api/firewall/alias_util/list/{alias}")
+        out: list[str] = []
+        for r in _unwrap_rows(body):
+            ip = str(r.get("ip") or r.get("address") or "").strip()
+            if ip:
+                out.append(ip)
+        return out
+
+    async def alias_add_address(self, alias: str, address: str) -> None:
+        """Add one IP to a table alias.
+
+        ``POST /api/firewall/alias_util/add/{alias}`` with
+        ``{"address": "<ip>"}``. OPNsense returns ``{"status": "done"}``
+        on success; anything else is surfaced as an error.
+        """
+        data = await self._post(f"/api/firewall/alias_util/add/{alias}", json={"address": address})
+        _assert_alias_op_ok(data, f"add {address} to {alias}")
+
+    async def alias_delete_address(self, alias: str, address: str) -> None:
+        """Remove one IP from a table alias.
+
+        ``POST /api/firewall/alias_util/delete/{alias}`` with
+        ``{"address": "<ip>"}``.
+        """
+        data = await self._post(
+            f"/api/firewall/alias_util/delete/{alias}", json={"address": address}
+        )
+        _assert_alias_op_ok(data, f"delete {address} from {alias}")
+
+    async def alias_reconfigure(self) -> None:
+        """Apply pending alias membership changes.
+
+        ``POST /api/firewall/alias/reconfigure`` — cheap, and required for
+        the table update to take effect in the running ruleset.
+        """
+        data = await self._post("/api/firewall/alias/reconfigure")
+        _assert_alias_op_ok(data, "alias reconfigure")
 
     async def list_arp(self) -> list[_OPNArpEntry]:
         """ARP table — secondary population, only fetched when the
