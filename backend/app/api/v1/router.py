@@ -62,6 +62,7 @@ from app.api.v1.ownership import (
     providers_router,
     sites_router,
 )
+from app.api.v1.panos import router as panos_router
 from app.api.v1.pcap import router as pcap_router
 from app.api.v1.proxmox import router as proxmox_router
 from app.api.v1.reports import router as reports_router
@@ -352,6 +353,12 @@ api_v1_router.include_router(
     prefix="/overlays",
     tags=["overlays"],
     dependencies=[Depends(require_module("network.overlay"))],
+)
+api_v1_router.include_router(
+    panos_router,
+    prefix="/paloalto",
+    tags=["paloalto"],
+    dependencies=[Depends(require_module("integrations.paloalto"))],
 )
 api_v1_router.include_router(
     providers_router,

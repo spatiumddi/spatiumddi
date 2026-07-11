@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   RefreshCw,
+  ShieldAlert,
   ShieldBan,
   ShieldCheck,
   Wifi,
@@ -150,7 +151,8 @@ export function BlockSyncPage() {
           </h1>
           <p className="text-sm text-muted-foreground">
             SpatiumDDI-owned blocked IPs / MACs, pushed into armed OPNsense
-            firewalls (alias membership) and UniFi controllers (L2 quarantine).
+            firewalls (alias membership), Palo Alto firewalls (Dynamic Address
+            Group tag), and UniFi controllers (L2 quarantine).
             Each target is armed separately with distinct write credentials;
             every push is previewable + audited.
           </p>
@@ -205,7 +207,7 @@ export function BlockSyncPage() {
             <p className="p-8 text-center text-sm text-muted-foreground">
               {targetsQ.isLoading
                 ? "Loading…"
-                : "No OPNsense routers or UniFi controllers to arm. Add an OPNsense or UniFi integration first."}
+                : "No OPNsense routers, Palo Alto firewalls, or UniFi controllers to arm. Add an OPNsense, Palo Alto, or UniFi integration first."}
             </p>
           ) : (
             <div className="overflow-x-auto">
@@ -216,7 +218,7 @@ export function BlockSyncPage() {
                     <th className="px-3 py-2 text-left font-medium">Kind</th>
                     <th className="px-3 py-2 text-left font-medium">Armed</th>
                     <th className="px-3 py-2 text-left font-medium">
-                      Alias / Site
+                      Alias / Tag / Site
                     </th>
                     <th className="px-3 py-2 text-left font-medium">
                       Write creds
@@ -238,10 +240,16 @@ export function BlockSyncPage() {
                         <span className="inline-flex items-center gap-1 text-muted-foreground">
                           {t.target_kind === "unifi" ? (
                             <Wifi className="h-3.5 w-3.5" />
+                          ) : t.target_kind === "paloalto" ? (
+                            <ShieldAlert className="h-3.5 w-3.5" />
                           ) : (
                             <ShieldCheck className="h-3.5 w-3.5" />
                           )}
-                          {t.target_kind === "unifi" ? "UniFi" : "OPNsense"}
+                          {t.target_kind === "unifi"
+                            ? "UniFi"
+                            : t.target_kind === "paloalto"
+                              ? "Palo Alto"
+                              : "OPNsense"}
                         </span>
                       </td>
                       <td className="px-3 py-2">
@@ -258,7 +266,9 @@ export function BlockSyncPage() {
                       <td className="px-3 py-2 text-muted-foreground">
                         {t.target_kind === "opnsense"
                           ? t.block_alias_name || "—"
-                          : t.block_sync_site || "—"}
+                          : t.target_kind === "paloalto"
+                            ? t.block_tag_name || "—"
+                            : t.block_sync_site || "—"}
                       </td>
                       <td className="px-3 py-2">
                         {t.write_credentials_present ? (
@@ -524,12 +534,20 @@ function ArmTargetModal({
   onDone: () => void;
 }) {
   const isUnifi = target.target_kind === "unifi";
+  const isPaloalto = target.target_kind === "paloalto";
+  // A Panorama target can't drive Dynamic Address Group enforcement — that
+  // needs a standalone firewall with a vsys. The backend 422s the arm call;
+  // gate the UI so operators don't hit it.
+  const isPanoramaTarget = isPaloalto && !!target.is_panorama;
 
   const [enabled, setEnabled] = useState(target.block_sync_enabled);
   // OPNsense
   const [alias, setAlias] = useState(target.block_alias_name ?? "");
   const [apiKey, setApiKey] = useState("");
   const [apiSecret, setApiSecret] = useState("");
+  // Palo Alto PAN-OS
+  const [tagName, setTagName] = useState(target.block_tag_name ?? "");
+  const [panosApiKey, setPanosApiKey] = useState("");
   // UniFi
   const [site, setSite] = useState(target.block_sync_site ?? "default");
   const [authKind, setAuthKind] = useState<BlockUnifiAuthKind>(
@@ -560,6 +578,13 @@ function ArmTargetModal({
             authKind === "user_password" && password ? password : undefined,
         });
       }
+      if (isPaloalto) {
+        return blockSyncApi.armPaloalto(target.target_id, {
+          block_sync_enabled: enabled,
+          block_tag_name: tagName.trim(),
+          block_sync_api_key: panosApiKey.trim() || undefined,
+        });
+      }
       return blockSyncApi.armOpnsense(target.target_id, {
         block_sync_enabled: enabled,
         block_alias_name: alias.trim(),
@@ -577,7 +602,9 @@ function ArmTargetModal({
 
   return (
     <Modal
-      title={`Arm ${isUnifi ? "UniFi" : "OPNsense"} · ${target.name}`}
+      title={`Arm ${
+        isUnifi ? "UniFi" : isPaloalto ? "Palo Alto" : "OPNsense"
+      } · ${target.name}`}
       onClose={onClose}
       wide
     >
@@ -588,11 +615,20 @@ function ArmTargetModal({
         }}
         className="space-y-4"
       >
+        {isPanoramaTarget && (
+          <div className="rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
+            This is a Panorama target. Dynamic Address Group enforcement needs a
+            standalone firewall with a vsys — arm the individual firewalls
+            instead. The server rejects arming a Panorama target.
+          </div>
+        )}
+
         <label className="flex cursor-pointer items-center gap-2 text-sm">
           <input
             type="checkbox"
             checked={enabled}
             onChange={(e) => setEnabled(e.target.checked)}
+            disabled={isPanoramaTarget}
           />
           <span className="font-medium">Arm block sync on this target</span>
         </label>
@@ -669,6 +705,34 @@ function ArmTargetModal({
               </>
             )}
           </>
+        ) : isPaloalto ? (
+          <>
+            <Field
+              label="Block tag name"
+              hint="The tag SpatiumDDI writes onto blocked IPs. A Dynamic Address Group matching this tag, referenced by a deny rule, does the enforcement."
+            >
+              <input
+                className={`${inputCls} font-mono`}
+                value={tagName}
+                onChange={(e) => setTagName(e.target.value)}
+                placeholder="spatium_blocklist"
+                disabled={isPanoramaTarget}
+              />
+            </Field>
+            <Field label="API key" hint={credsHint}>
+              <input
+                className={`${inputCls} font-mono`}
+                type="password"
+                autoComplete="new-password"
+                value={panosApiKey}
+                onChange={(e) => setPanosApiKey(e.target.value)}
+                placeholder={
+                  target.write_credentials_present ? "•••••• (unchanged)" : ""
+                }
+                disabled={isPanoramaTarget}
+              />
+            </Field>
+          </>
         ) : (
           <>
             <Field
@@ -724,7 +788,7 @@ function ArmTargetModal({
           </button>
           <button
             type="submit"
-            disabled={mut.isPending}
+            disabled={mut.isPending || isPanoramaTarget}
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             {mut.isPending ? "Saving…" : "Save"}

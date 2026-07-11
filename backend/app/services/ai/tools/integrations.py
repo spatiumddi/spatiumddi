@@ -33,6 +33,7 @@ from app.models.docker import DockerHost
 from app.models.kubernetes import KubernetesCluster
 from app.models.netbird import NetbirdInstance
 from app.models.opnsense import OPNsenseRouter
+from app.models.panos import FirewallObject, PANOSFirewall
 from app.models.proxmox import ProxmoxNode
 from app.models.tailscale import TailscaleTenant
 from app.models.unifi import UnifiController
@@ -567,3 +568,204 @@ async def list_opnsense_targets(
             }
         )
     return out
+
+
+# ── list_panos_targets (#605) ─────────────────────────────────────────
+
+
+class ListPanosTargetsArgs(BaseModel):
+    search: str | None = _common_target_args()["search"]
+    enabled: bool | None = _common_target_args()["enabled"]
+    limit: int = _common_target_args()["limit"]
+
+
+@register_tool(
+    name="list_panos_targets",
+    module="integrations.paloalto",
+    description=(
+        "List configured Palo Alto PAN-OS / Panorama firewalls that "
+        "SpatiumDDI mirrors into IPAM (address objects, NAT rules, and "
+        "optionally zones/interfaces + DHCP leases). Each row carries id, "
+        "name, description, endpoint, enabled flag, whether it is a Panorama "
+        "device-group or a standalone vsys, ipam_space_id, "
+        "sync_interval_seconds, last_synced_at, sw_version, model, "
+        "object_count, nat_rule_count, and whether DAG enforcement "
+        "(block_sync) is armed. Use for 'which Palo Alto firewalls are "
+        "configured?' or 'is PAN-OS syncing?'. API keys never appear."
+    ),
+    args_model=ListPanosTargetsArgs,
+    category="integrations",
+)
+async def list_panos_targets(
+    db: AsyncSession, user: User, args: ListPanosTargetsArgs
+) -> list[dict[str, Any]]:
+    stmt = select(PANOSFirewall)
+    if args.search:
+        like = f"%{args.search.lower()}%"
+        stmt = stmt.where(
+            or_(
+                func.lower(PANOSFirewall.name).like(like),
+                func.lower(PANOSFirewall.description).like(like),
+                func.lower(PANOSFirewall.host).like(like),
+            )
+        )
+    if args.enabled is not None:
+        stmt = stmt.where(PANOSFirewall.enabled.is_(args.enabled))
+    stmt = stmt.order_by(PANOSFirewall.name.asc()).limit(args.limit)
+    rows = (await db.execute(stmt)).scalars().all()
+    return [
+        {
+            "id": str(f.id),
+            "name": f.name,
+            "description": f.description or "",
+            "enabled": f.enabled,
+            "endpoint": f"https://{f.host}:{f.port}",
+            "is_panorama": f.is_panorama,
+            "scope": (f"device-group {f.device_group}" if f.is_panorama else f"vsys {f.vsys}"),
+            "ipam_space_id": str(f.ipam_space_id),
+            "sync_interval_seconds": f.sync_interval_seconds,
+            "last_synced_at": f.last_synced_at.isoformat() if f.last_synced_at else None,
+            "last_sync_error": f.last_sync_error,
+            "sw_version": f.sw_version,
+            "model": f.model,
+            "object_count": f.object_count,
+            "nat_rule_count": f.nat_rule_count,
+            "dag_enforcement_armed": f.block_sync_enabled,
+        }
+        for f in rows
+    ]
+
+
+# ── find_firewall_objects / count_firewall_objects (#605) ─────────────
+
+
+class FindFirewallObjectsArgs(BaseModel):
+    firewall_id: str | None = Field(
+        default=None, description="Filter to one PAN-OS firewall (UUID). Omit for all."
+    )
+    kind: str | None = Field(
+        default=None, description="Filter by kind: host | network | range | fqdn | group."
+    )
+    search: str | None = Field(
+        default=None, description="Substring match on the object name / value."
+    )
+    unlinked_only: bool = Field(
+        default=False,
+        description=(
+            "When true, only objects that resolve to a CIDR/IP but have no "
+            "matching IPAM row — the 'firewall object with no IPAM row' drift set."
+        ),
+    )
+    limit: int = Field(default=50, ge=1, le=200)
+
+
+@register_tool(
+    name="find_firewall_objects",
+    module="integrations.paloalto",
+    description=(
+        "List mirrored Palo Alto address objects / groups (the 'shadow IPAM' "
+        "store, #605). Each row carries name, kind (host/network/range/fqdn/"
+        "group), value, description, tags, the resolved CIDR, and whether it "
+        "links to a live IPAM subnet/address. Use unlinked_only=true to surface "
+        "drift ('firewall objects with no IPAM row'). Read-only."
+    ),
+    args_model=FindFirewallObjectsArgs,
+    category="read",
+    default_enabled=True,
+)
+async def find_firewall_objects(
+    db: AsyncSession, user: User, args: FindFirewallObjectsArgs
+) -> dict[str, Any]:
+    import uuid as _uuid  # noqa: PLC0415
+
+    stmt = select(FirewallObject)
+    if args.firewall_id:
+        try:
+            stmt = stmt.where(FirewallObject.panos_firewall_id == _uuid.UUID(args.firewall_id))
+        except ValueError:
+            return {"firewall_objects": [], "count": 0, "error": "invalid firewall_id"}
+    if args.kind:
+        stmt = stmt.where(FirewallObject.kind == args.kind)
+    if args.search:
+        like = f"%{args.search.lower()}%"
+        stmt = stmt.where(
+            or_(
+                func.lower(FirewallObject.name).like(like),
+                func.lower(FirewallObject.value).like(like),
+            )
+        )
+    if args.unlinked_only:
+        stmt = (
+            stmt.where(FirewallObject.resolved_cidr.isnot(None))
+            .where(FirewallObject.ip_address_id.is_(None))
+            .where(FirewallObject.subnet_id.is_(None))
+        )
+    stmt = stmt.order_by(FirewallObject.name.asc()).limit(args.limit)
+    rows = (await db.execute(stmt)).scalars().all()
+    return {
+        "firewall_objects": [
+            {
+                "id": str(o.id),
+                "firewall_id": str(o.panos_firewall_id),
+                "name": o.name,
+                "kind": o.kind,
+                "value": o.value,
+                "description": o.description or "",
+                "tags": list(o.tags or []),
+                "resolved_cidr": str(o.resolved_cidr) if o.resolved_cidr else None,
+                "linked_to_ipam": o.ip_address_id is not None or o.subnet_id is not None,
+            }
+            for o in rows
+        ],
+        "count": len(rows),
+    }
+
+
+class CountFirewallObjectsArgs(BaseModel):
+    firewall_id: str | None = Field(
+        default=None, description="Filter to one PAN-OS firewall (UUID). Omit for all."
+    )
+
+
+@register_tool(
+    name="count_firewall_objects",
+    module="integrations.paloalto",
+    description=(
+        "Count mirrored Palo Alto address objects (#605) grouped by kind, plus "
+        "the number that resolve to a CIDR/IP but link no IPAM row (the drift "
+        "count). Use to size the shadow-IPAM set. Read-only."
+    ),
+    args_model=CountFirewallObjectsArgs,
+    category="read",
+    default_enabled=True,
+)
+async def count_firewall_objects(
+    db: AsyncSession, user: User, args: CountFirewallObjectsArgs
+) -> dict[str, Any]:
+    import uuid as _uuid  # noqa: PLC0415
+
+    fw_filter = None
+    if args.firewall_id:
+        try:
+            fw_filter = _uuid.UUID(args.firewall_id)
+        except ValueError:
+            return {"total": 0, "by_kind": {}, "unlinked": 0, "error": "invalid firewall_id"}
+
+    kind_stmt = select(FirewallObject.kind, func.count(FirewallObject.id)).group_by(
+        FirewallObject.kind
+    )
+    if fw_filter is not None:
+        kind_stmt = kind_stmt.where(FirewallObject.panos_firewall_id == fw_filter)
+    by_kind = {k: int(n) for k, n in (await db.execute(kind_stmt)).all()}
+
+    unlinked_stmt = (
+        select(func.count(FirewallObject.id))
+        .where(FirewallObject.resolved_cidr.isnot(None))
+        .where(FirewallObject.ip_address_id.is_(None))
+        .where(FirewallObject.subnet_id.is_(None))
+    )
+    if fw_filter is not None:
+        unlinked_stmt = unlinked_stmt.where(FirewallObject.panos_firewall_id == fw_filter)
+    unlinked = int((await db.execute(unlinked_stmt)).scalar_one())
+
+    return {"total": sum(by_kind.values()), "by_kind": by_kind, "unlinked": unlinked}

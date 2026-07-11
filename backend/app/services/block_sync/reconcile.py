@@ -38,9 +38,11 @@ from app.core.crypto import decrypt_str
 from app.models.audit import AuditLog
 from app.models.block_sync import NetworkBlock, NetworkBlockPush
 from app.models.opnsense import OPNsenseRouter
+from app.models.panos import PANOSFirewall
 from app.models.unifi import UnifiController
 from app.services.opnsense.client import OPNsenseClient, OPNsenseClientError
 from app.services.oui import normalize_mac_key
+from app.services.panos.client import PANOSClient, PANOSClientError
 from app.services.unifi.client import UnifiClient, UnifiClientConfig, UnifiClientError
 
 # How often a UniFi block is re-asserted even when its push row is already
@@ -113,6 +115,16 @@ async def applicable_targets_for_kind(db: AsyncSession, kind: str) -> list[tuple
             .all()
         )
         out.extend(("opnsense", rid) for rid in rows)
+        panos_rows = (
+            (
+                await db.execute(
+                    select(PANOSFirewall.id).where(PANOSFirewall.block_sync_enabled.is_(True))
+                )
+            )
+            .scalars()
+            .all()
+        )
+        out.extend(("paloalto", pid) for pid in panos_rows)
     elif kind == "mac":
         rows = (
             (
@@ -544,6 +556,155 @@ async def reconcile_unifi(db: AsyncSession, controller: UnifiController) -> Bloc
     return summary
 
 
+# ── Palo Alto PAN-OS (Dynamic Address Group tag register, #605) ──────
+#
+# kind=``ip`` blocks → an ``IP → tag`` User-ID registration (no policy commit).
+# The operator pre-creates a Dynamic Address Group whose match is the target's
+# ``block_tag_name``; registering the tag enforces the block near-instantly.
+# Convergence reads current registered IPs for the tag (``show object
+# registered-ip tag <t>``) so we add only what's missing and remove only what
+# we own — never diff against a bad-empty set (NN#5).
+
+
+def _panos_client(fw: PANOSFirewall) -> PANOSClient:
+    key = decrypt_str(fw.block_sync_api_key_encrypted)
+    return PANOSClient(
+        host=fw.host,
+        port=fw.port,
+        api_key=key,
+        api_version=fw.api_version,
+        is_panorama=fw.is_panorama,
+        vsys=fw.vsys,
+        device_group=fw.device_group,
+        verify_tls=fw.verify_tls,
+        ca_bundle_pem=fw.ca_bundle_pem,
+    )
+
+
+def panos_config_error(fw: PANOSFirewall) -> str | None:
+    if not fw.block_sync_enabled:
+        return "block sync not armed on this target"
+    if fw.is_panorama:
+        # User-ID tag registration targets a firewall vsys, not Panorama.
+        return "DAG enforcement requires a standalone firewall (vsys), not a Panorama target"
+    if not fw.block_tag_name.strip():
+        return "no DAG tag configured (block_tag_name)"
+    if not fw.block_sync_api_key_encrypted:
+        return "User-ID write-scoped API key not configured"
+    return None
+
+
+async def preview_panos(
+    db: AsyncSession, fw: PANOSFirewall, *, read_device: bool = True
+) -> TargetDiff:
+    diff = TargetDiff(target_kind="paloalto", target_id=fw.id, target_name=fw.name)
+    cfg_err = panos_config_error(fw)
+    if cfg_err:
+        diff.error = cfg_err
+        return diff
+
+    now = datetime.now(UTC)
+    blocks = await _load_blocks(db, "ip")
+    active = {b.value for b in blocks if block_is_active(b, now)}
+    pushes = await _load_pushes(db, "paloalto", fw.id)
+    block_by_id = {b.id: b for b in blocks}
+
+    owned = {block_by_id[bid].value for bid in pushes if bid in block_by_id}
+    for bid, push in pushes.items():
+        b = block_by_id.get(bid)
+        if b is None or not block_is_active(b, now):
+            diff.to_remove.append(push_value_hint(push, b))
+
+    on_device: set[str] = set()
+    if read_device:
+        try:
+            async with _panos_client(fw) as client:
+                regs = await client.list_registered_ips(fw.block_tag_name.strip())
+                on_device = {r.ip for r in regs}
+        except PANOSClientError as exc:
+            diff.error = f"cannot read registered IPs: {exc}"
+            return diff
+
+    for value in sorted(active):
+        if value not in owned or (read_device and value not in on_device):
+            diff.to_add.append(value)
+    return diff
+
+
+async def reconcile_panos(db: AsyncSession, fw: PANOSFirewall) -> BlockSyncSummary:
+    """Push the PAN-OS target to match desired state: register active IP blocks
+    as ``IP → tag`` and unregister lifted/expired/deleted ones. Commits push-row
+    changes; the caller commits the target's timestamp fields."""
+    summary = BlockSyncSummary(target_kind="paloalto", target_id=fw.id, target_name=fw.name)
+    cfg_err = panos_config_error(fw)
+    if cfg_err:
+        summary.ok = False
+        summary.error = cfg_err
+        fw.last_block_sync_error = cfg_err
+        return summary
+
+    now = datetime.now(UTC)
+    tag = fw.block_tag_name.strip()
+    blocks = await _load_blocks(db, "ip")
+    block_by_id = {b.id: b for b in blocks}
+    active_blocks = [b for b in blocks if block_is_active(b, now)]
+    pushes = await _load_pushes(db, "paloalto", fw.id)
+    added_vals: list[str] = []
+    removed_vals: list[str] = []
+
+    try:
+        async with _panos_client(fw) as client:
+            regs = await client.list_registered_ips(tag)
+            on_device = {r.ip for r in regs}
+
+            # Unregister blocks that are no longer active (or whose row is gone).
+            for bid, push in list(pushes.items()):
+                b = block_by_id.get(bid)
+                if b is not None and block_is_active(b, now):
+                    continue
+                value = b.value if b is not None else None
+                try:
+                    if value and value in on_device:
+                        await client.unregister_ip_tag(value, tag)
+                        removed_vals.append(value)
+                    await db.delete(push)
+                    summary.removed += 1
+                except PANOSClientError as exc:
+                    push.push_status = "error"
+                    push.last_error = str(exc)
+                    summary.errors += 1
+
+            # Register / re-assert active blocks.
+            for b in active_blocks:
+                push = pushes.get(b.id)
+                confirmed = push is not None and push.push_status == "pushed"
+                on_dev = b.value in on_device
+                if confirmed and on_dev:
+                    continue
+                try:
+                    if not on_dev:
+                        await client.register_ip_tag(b.value, tag)
+                        added_vals.append(b.value)
+                        summary.added += 1
+                    _upsert_push(db, push, b.id, "paloalto", fw.id, now)
+                except PANOSClientError as exc:
+                    _upsert_push(
+                        db, push, b.id, "paloalto", fw.id, now, status="error", error=str(exc)
+                    )
+                    summary.errors += 1
+    except PANOSClientError as exc:
+        summary.ok = False
+        summary.error = str(exc)
+        fw.last_block_sync_error = str(exc)
+        return summary
+
+    fw.last_block_sync_at = now
+    fw.last_block_sync_error = None if summary.errors == 0 else f"{summary.errors} push error(s)"
+    summary.ok = summary.errors == 0
+    _audit_device_push(db, "paloalto", fw.id, fw.name, added_vals, removed_vals)
+    return summary
+
+
 # ── Shared push-row upsert ───────────────────────────────────────────
 
 
@@ -576,7 +737,7 @@ def _upsert_push(
 
 async def armed_targets(
     db: AsyncSession,
-) -> tuple[list[OPNsenseRouter], list[UnifiController]]:
+) -> tuple[list[OPNsenseRouter], list[UnifiController], list[PANOSFirewall]]:
     routers = list(
         (
             await db.execute(
@@ -595,11 +756,16 @@ async def armed_targets(
         .scalars()
         .all()
     )
-    return routers, controllers
+    firewalls = list(
+        (await db.execute(select(PANOSFirewall).where(PANOSFirewall.block_sync_enabled.is_(True))))
+        .scalars()
+        .all()
+    )
+    return routers, controllers, firewalls
 
 
 async def lift_all_for_target(
-    db: AsyncSession, target_kind: str, target: OPNsenseRouter | UnifiController
+    db: AsyncSession, target_kind: str, target: OPNsenseRouter | UnifiController | PANOSFirewall
 ) -> BlockSyncSummary:
     """Remove EVERY value SpatiumDDI pushed to a target and delete its push
     rows — used when a target is disarmed (block_sync_enabled → False), so a
@@ -636,7 +802,7 @@ async def lift_all_for_target(
                     summary.removed += 1
                 if changed:
                     await client.alias_reconfigure()
-        else:
+        elif target_kind == "unifi":
             controller = target
             assert isinstance(controller, UnifiController)
             kind = controller.block_sync_auth_kind or "api_key"
@@ -659,7 +825,23 @@ async def lift_all_for_target(
                         removed_vals.append(b.value)
                     await db.delete(push)
                     summary.removed += 1
-    except (OPNsenseClientError, UnifiClientError) as exc:
+        else:
+            fw = target
+            assert isinstance(fw, PANOSFirewall)
+            if not fw.block_tag_name.strip() or not fw.block_sync_api_key_encrypted:
+                return summary  # no tag/creds to work with; leave rows as-is
+            tag = fw.block_tag_name.strip()
+            async with _panos_client(fw) as client:
+                regs = await client.list_registered_ips(tag)
+                on_device = {r.ip for r in regs}
+                for bid, push in list(pushes.items()):
+                    b = block_by_id.get(bid)
+                    if b is not None and b.value in on_device:
+                        await client.unregister_ip_tag(b.value, tag)
+                        removed_vals.append(b.value)
+                    await db.delete(push)
+                    summary.removed += 1
+    except (OPNsenseClientError, UnifiClientError, PANOSClientError) as exc:
         summary.ok = False
         summary.error = str(exc)
         target.last_block_sync_error = f"disarm-lift failed: {exc}"
@@ -672,12 +854,14 @@ async def lift_all_for_target(
 
 async def preview_all(db: AsyncSession, *, read_device: bool = True) -> list[TargetDiff]:
     """Preview every armed target (used by the reconcile-all preview)."""
-    routers, controllers = await armed_targets(db)
+    routers, controllers, firewalls = await armed_targets(db)
     diffs: list[TargetDiff] = []
     for r in routers:
         diffs.append(await preview_opnsense(db, r, read_device=read_device))
     for c in controllers:
         diffs.append(await preview_unifi(db, c))
+    for fw in firewalls:
+        diffs.append(await preview_panos(db, fw, read_device=read_device))
     return diffs
 
 
@@ -690,10 +874,13 @@ __all__ = [
     "lift_all_for_target",
     "normalize_block_value",
     "opnsense_config_error",
+    "panos_config_error",
     "preview_all",
     "preview_opnsense",
+    "preview_panos",
     "preview_unifi",
     "reconcile_opnsense",
+    "reconcile_panos",
     "reconcile_unifi",
     "unifi_config_error",
 ]

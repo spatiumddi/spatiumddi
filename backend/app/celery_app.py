@@ -42,6 +42,7 @@ celery_app = Celery(
         "app.tasks.docker_sync",
         "app.tasks.proxmox_sync",
         "app.tasks.opnsense_sync",
+        "app.tasks.panos_sync",
         "app.tasks.tailscale_sync",
         "app.tasks.netbird_sync",
         "app.tasks.unifi_sync",
@@ -110,6 +111,7 @@ celery_app.conf.update(
         "app.tasks.docker_sync.*": {"queue": "default"},
         "app.tasks.proxmox_sync.*": {"queue": "default"},
         "app.tasks.opnsense_sync.*": {"queue": "default"},
+        "app.tasks.panos_sync.*": {"queue": "default"},
         "app.tasks.block_sync.*": {"queue": "default"},
         "app.tasks.tailscale_sync.*": {"queue": "default"},
         "app.tasks.netbird_sync.*": {"queue": "default"},
@@ -392,6 +394,13 @@ celery_app.conf.update(
         # Gated overall by ``PlatformSettings.integration_opnsense_enabled``.
         "opnsense-sync-sweep": {
             "task": "app.tasks.opnsense_sync.sweep_opnsense_routers",
+            "schedule": schedule(run_every=30.0),
+        },
+        # Palo Alto PAN-OS / Panorama (#605) — same 30 s beat, per-firewall
+        # interval gate. Gated overall by
+        # ``PlatformSettings.integration_panos_enabled``.
+        "panos-sync-sweep": {
+            "task": "app.tasks.panos_sync.sweep_panos_firewalls",
             "schedule": schedule(run_every=30.0),
         },
         # Active block sync (#601) — converge SpatiumDDI-owned network

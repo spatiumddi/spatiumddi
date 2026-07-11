@@ -31,6 +31,7 @@ import {
   Server,
   Bird,
   Shield,
+  ShieldAlert,
   ShieldCheck,
   Waypoints,
   Wifi,
@@ -47,6 +48,7 @@ import {
   dockerApi,
   proxmoxApi,
   opnsenseApi,
+  panosApi,
   cloudApi,
   netbirdApi,
   tailscaleApi,
@@ -70,6 +72,7 @@ import {
   type DockerHost,
   type ProxmoxNode,
   type OPNsenseRouter,
+  type PANOSFirewall,
   type CloudEndpoint,
   type NetbirdInstance,
   type TailscaleTenant,
@@ -1142,6 +1145,7 @@ export function DashboardPage() {
   const dockerEnabled = settings?.integration_docker_enabled ?? false;
   const proxmoxEnabled = settings?.integration_proxmox_enabled ?? false;
   const opnsenseEnabled = settings?.integration_opnsense_enabled ?? false;
+  const panosEnabled = settings?.integration_panos_enabled ?? false;
   const cloudEnabled = settings?.integration_cloud_enabled ?? false;
   const tailscaleEnabled = settings?.integration_tailscale_enabled ?? false;
   const unifiEnabled = settings?.integration_unifi_enabled ?? false;
@@ -1180,6 +1184,13 @@ export function DashboardPage() {
     queryKey: ["opnsense-routers"],
     queryFn: opnsenseApi.listRouters,
     enabled: opnsenseEnabled,
+    refetchInterval: 30_000,
+  });
+
+  const { data: panosFirewalls = [] } = useQuery<PANOSFirewall[]>({
+    queryKey: ["panos-firewalls"],
+    queryFn: panosApi.list,
+    enabled: panosEnabled,
     refetchInterval: 30_000,
   });
 
@@ -1887,6 +1898,7 @@ export function DashboardPage() {
             dockerEnabled ||
             proxmoxEnabled ||
             opnsenseEnabled ||
+            panosEnabled ||
             cloudEnabled ||
             tailscaleEnabled ||
             unifiEnabled ||
@@ -1903,6 +1915,7 @@ export function DashboardPage() {
                 dockerEnabled={dockerEnabled}
                 proxmoxEnabled={proxmoxEnabled}
                 opnsenseEnabled={opnsenseEnabled}
+                panosEnabled={panosEnabled}
                 cloudEnabled={cloudEnabled}
                 tailscaleEnabled={tailscaleEnabled}
                 unifiEnabled={unifiEnabled}
@@ -1910,6 +1923,7 @@ export function DashboardPage() {
                 hosts={dockerHosts}
                 proxmoxNodes={proxmoxNodes}
                 opnsenseRouters={opnsenseRouters}
+                panosFirewalls={panosFirewalls}
                 cloudEndpoints={cloudEndpoints}
                 tailscaleTenants={tailscaleTenants}
                 unifiControllers={unifiControllers}
@@ -2312,6 +2326,7 @@ function IntegrationsPanel({
   dockerEnabled,
   proxmoxEnabled,
   opnsenseEnabled,
+  panosEnabled,
   cloudEnabled,
   tailscaleEnabled,
   unifiEnabled,
@@ -2319,6 +2334,7 @@ function IntegrationsPanel({
   hosts,
   proxmoxNodes,
   opnsenseRouters,
+  panosFirewalls,
   cloudEndpoints,
   tailscaleTenants,
   unifiControllers,
@@ -2329,6 +2345,7 @@ function IntegrationsPanel({
   dockerEnabled: boolean;
   proxmoxEnabled: boolean;
   opnsenseEnabled: boolean;
+  panosEnabled: boolean;
   cloudEnabled: boolean;
   tailscaleEnabled: boolean;
   unifiEnabled: boolean;
@@ -2336,6 +2353,7 @@ function IntegrationsPanel({
   hosts: DockerHost[];
   proxmoxNodes: ProxmoxNode[];
   opnsenseRouters: OPNsenseRouter[];
+  panosFirewalls: PANOSFirewall[];
   cloudEndpoints: CloudEndpoint[];
   tailscaleTenants: TailscaleTenant[];
   unifiControllers: UnifiController[];
@@ -2346,6 +2364,7 @@ function IntegrationsPanel({
   const hasDocker = dockerEnabled;
   const hasProxmox = proxmoxEnabled;
   const hasOpnsense = opnsenseEnabled;
+  const hasPanos = panosEnabled;
   const hasCloud = cloudEnabled;
   const hasTailscale = tailscaleEnabled;
   const hasUnifi = unifiEnabled;
@@ -2355,6 +2374,7 @@ function IntegrationsPanel({
     hasDocker,
     hasProxmox,
     hasOpnsense,
+    hasPanos,
     hasCloud,
     hasTailscale,
     hasUnifi,
@@ -2365,6 +2385,7 @@ function IntegrationsPanel({
     hosts.length +
     proxmoxNodes.length +
     opnsenseRouters.length +
+    panosFirewalls.length +
     cloudEndpoints.length +
     tailscaleTenants.length +
     unifiControllers.length +
@@ -2393,6 +2414,7 @@ function IntegrationsPanel({
           cols === 6 && "md:grid-cols-6 md:divide-x md:divide-y-0",
           cols === 7 && "md:grid-cols-7 md:divide-x md:divide-y-0",
           cols === 8 && "md:grid-cols-8 md:divide-x md:divide-y-0",
+          cols === 9 && "md:grid-cols-9 md:divide-x md:divide-y-0",
         )}
       >
         {hasK8s && (
@@ -2555,6 +2577,52 @@ function IntegrationsPanel({
                       lastSyncError={r.last_sync_error}
                       intervalSeconds={r.sync_interval_seconds}
                       enabled={r.enabled}
+                    />
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+        {hasPanos && (
+          <div className="min-w-0">
+            <Link
+              to="/paloalto"
+              className="flex items-center gap-1.5 bg-muted/30 px-4 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground hover:bg-muted/50"
+            >
+              <ShieldAlert className="h-3 w-3" />
+              Palo Alto ({panosFirewalls.length})
+              <span className="ml-auto text-[10px] text-muted-foreground/70">
+                view all →
+              </span>
+            </Link>
+            {panosFirewalls.length === 0 ? (
+              <p className="px-4 py-3 text-[11px] italic text-muted-foreground">
+                No firewalls registered.
+              </p>
+            ) : (
+              <div className="overflow-x-auto">
+                <div className="min-w-[520px] divide-y">
+                  {panosFirewalls.map((f) => (
+                    <IntegrationRow
+                      key={f.id}
+                      to={`/paloalto`}
+                      name={f.name}
+                      subtitle={`${f.host}:${f.port}`}
+                      meta={
+                        f.object_count != null
+                          ? `${f.object_count} obj${f.object_count === 1 ? "" : "s"}` +
+                            (f.nat_rule_count != null
+                              ? ` · ${f.nat_rule_count} NAT`
+                              : "")
+                          : f.is_panorama
+                            ? "Panorama"
+                            : "—"
+                      }
+                      lastSyncedAt={f.last_synced_at}
+                      lastSyncError={f.last_sync_error}
+                      intervalSeconds={f.sync_interval_seconds}
+                      enabled={f.enabled}
                     />
                   ))}
                 </div>

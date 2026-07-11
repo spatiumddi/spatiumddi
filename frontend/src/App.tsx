@@ -23,6 +23,7 @@ import { KubernetesPage } from "@/pages/kubernetes/KubernetesPage";
 import { DockerPage } from "@/pages/docker/DockerPage";
 import { ProxmoxPage } from "@/pages/proxmox/ProxmoxPage";
 import { OpnsensePage } from "@/pages/opnsense/OpnsensePage";
+import { PanosPage } from "@/pages/panos/PanosPage";
 import { CloudPage } from "@/pages/cloud/CloudPage";
 import { NetbirdPage } from "@/pages/netbird/NetbirdPage";
 import { TailscalePage } from "@/pages/tailscale/TailscalePage";
@@ -176,6 +177,7 @@ export default function App() {
         <Route path="docker" element={<DockerPage />} />
         <Route path="proxmox" element={<ProxmoxPage />} />
         <Route path="opnsense" element={<OpnsensePage />} />
+        <Route path="paloalto" element={<PanosPage />} />
         <Route path="cloud" element={<CloudPage />} />
         <Route path="netbird" element={<NetbirdPage />} />
         <Route path="tailscale" element={<TailscalePage />} />

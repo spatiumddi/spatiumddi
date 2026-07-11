@@ -62,9 +62,11 @@ BLOCK_SOURCES: tuple[str, ...] = ("manual", "new_device", "rogue_dhcp")
 #   error     — last push/remove attempt failed (see ``last_error``)
 PUSH_STATUSES: tuple[str, ...] = ("pending", "pushed", "removing", "error")
 
-# Target kinds a push row can point at. Loose (no cross-table FK) because
-# the target is polymorphic across ``opnsense_router`` / ``unifi_controller``.
-BLOCK_TARGET_KINDS: tuple[str, ...] = ("opnsense", "unifi")
+# Target kinds a push row can point at. Loose (no cross-table FK) because the
+# target is polymorphic across ``opnsense_router`` / ``unifi_controller`` /
+# ``panos_firewall``. ``paloalto`` consumes ``ip`` blocks (Dynamic Address
+# Group tag register via the User-ID API, #605).
+BLOCK_TARGET_KINDS: tuple[str, ...] = ("opnsense", "unifi", "paloalto")
 
 
 class NetworkBlock(UUIDPrimaryKeyMixin, TimestampMixin, Base):

@@ -323,6 +323,13 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         description="Read-only mirror of NetBird mesh peers into IPAM (self-hosted or cloud), with optional synthetic DNS for the mesh domain. Connect instances from the NetBird page once enabled.",
         default_enabled=False,
     ),
+    ModuleSpec(
+        id="integrations.paloalto",
+        label="Palo Alto (PAN-OS / Panorama)",
+        group="Integrations",
+        description="Read-only mirror of Palo Alto address objects/groups + NAT rules (+ optional zones/interfaces and DHCP leases) into IPAM, with a drift report vs your IPAM subnets. Optional Dynamic Address Group enforcement (commit-free User-ID tag register) is a separate, default-off master switch gated by the Active block sync module. Connect firewalls from the Palo Alto page once enabled.",
+        default_enabled=False,
+    ),
     # Appliance — the declarative fleet-firewall policy surface (#285
     # Phase 3). Default-enabled for DISCOVERY/STAGING only: turning this
     # module ON exposes the policy editor + preview but applies NOTHING.
@@ -421,6 +428,7 @@ INTEGRATION_SETTINGS_MIRROR: Final[dict[str, str]] = {
     "integrations.cloud": "integration_cloud_enabled",
     "integrations.opnsense": "integration_opnsense_enabled",
     "integrations.netbird": "integration_netbird_enabled",
+    "integrations.paloalto": "integration_panos_enabled",
 }
 
 MODULES_BY_ID: Final[dict[str, ModuleSpec]] = {m.id: m for m in MODULES}

@@ -595,7 +595,11 @@ async def _apply_addresses(
                     f"address {row.address} owned by another Kubernetes cluster; not claiming"
                 )
                 continue
-            if row.docker_host_id is not None or row.proxmox_node_id is not None:
+            if (
+                row.docker_host_id is not None
+                or row.proxmox_node_id is not None
+                or row.panos_firewall_id is not None
+            ):
                 summary.warnings.append(
                     f"address {row.address} owned by another integration; not claiming"
                 )

@@ -454,6 +454,7 @@ async def _apply_blocks_and_subnets(
             and s.docker_host_id is None
             and s.tailscale_tenant_id is None
             and s.unifi_controller_id is None
+            and s.panos_firewall_id is None
         ):
             operator_subnets[net_key] = s
         else:
@@ -621,6 +622,7 @@ async def _apply_addresses(
                 or row.proxmox_node_id is not None
                 or row.tailscale_tenant_id is not None
                 or row.unifi_controller_id is not None
+                or row.panos_firewall_id is not None
             ):
                 summary.warnings.append(
                     f"address {row.address} owned by another integration; not claiming"

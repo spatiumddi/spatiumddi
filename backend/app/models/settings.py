@@ -313,6 +313,7 @@ class PlatformSettings(Base):
     integration_netbird_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False
     )
+    integration_panos_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
     # Trash retention — high-blast-radius IPAM/DNS/DHCP rows are soft-
     # deleted (``deleted_at`` set) and the nightly purge sweep hard-
