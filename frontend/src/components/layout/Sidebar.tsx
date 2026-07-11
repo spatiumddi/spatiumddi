@@ -631,6 +631,9 @@ export function Sidebar({
     ...(moduleEnabled("integrations.opnsense")
       ? [{ label: "OPNsense", icon: ShieldCheck, to: "/opnsense" }]
       : []),
+    ...(moduleEnabled("integrations.paloalto")
+      ? [{ label: "Palo Alto", icon: ShieldAlert, to: "/paloalto" }]
+      : []),
     ...(moduleEnabled("integrations.netbird")
       ? [{ label: "NetBird", icon: Bird, to: "/netbird" }]
       : []),

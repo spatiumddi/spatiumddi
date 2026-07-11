@@ -32,6 +32,7 @@ from app.models.docker import DockerHost
 from app.models.kubernetes import KubernetesCluster
 from app.models.netbird import NetbirdInstance
 from app.models.opnsense import OPNsenseRouter
+from app.models.panos import PANOSFirewall
 from app.models.proxmox import ProxmoxNode
 from app.models.settings import PlatformSettings
 from app.models.tailscale import TailscaleTenant
@@ -93,6 +94,7 @@ _INTEGRATION_RESOURCE_TYPES = (
     "cloud_endpoint",
     "opnsense_router",
     "netbird_instance",
+    "panos_firewall",
 )
 
 
@@ -173,6 +175,7 @@ async def integrations_summary(
     cloud_targets = list((await db.execute(select(CloudEndpoint))).scalars().all())
     opnsense_targets = list((await db.execute(select(OPNsenseRouter))).scalars().all())
     netbird_targets = list((await db.execute(select(NetbirdInstance))).scalars().all())
+    panos_targets = list((await db.execute(select(PANOSFirewall))).scalars().all())
 
     panels = [
         _build_panel(
@@ -239,6 +242,14 @@ async def integrations_summary(
             label="NetBird",
             enabled=getattr(settings, "integration_netbird_enabled", False),
             targets=netbird_targets,
+            display_attr="name",
+            now=now,
+        ),
+        _build_panel(
+            kind="paloalto",
+            label="Palo Alto (PAN-OS / Panorama)",
+            enabled=getattr(settings, "integration_panos_enabled", False),
+            targets=panos_targets,
             display_attr="name",
             now=now,
         ),

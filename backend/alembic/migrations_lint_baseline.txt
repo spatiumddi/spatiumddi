@@ -417,10 +417,10 @@ backend/alembic/versions/d1f4b7c92e58_appliance_firewall_state.py:drop_column:43
 backend/alembic/versions/d2a8e417b9f3_backup_target.py:drop_table:112
 backend/alembic/versions/d2f7a91e4c8b_nmap_scans.py:drop_table:96
 backend/alembic/versions/d3a9c5b71e84_subnet_kind.py:drop_column:71
-backend/alembic/versions/d3b9f42a1c05_active_block_sync.py:drop_column:196
-backend/alembic/versions/d3b9f42a1c05_active_block_sync.py:drop_column:205
+backend/alembic/versions/d3b9f42a1c05_active_block_sync.py:drop_column:194
+backend/alembic/versions/d3b9f42a1c05_active_block_sync.py:drop_column:203
+backend/alembic/versions/d3b9f42a1c05_active_block_sync.py:drop_table:205
 backend/alembic/versions/d3b9f42a1c05_active_block_sync.py:drop_table:207
-backend/alembic/versions/d3b9f42a1c05_active_block_sync.py:drop_table:209
 backend/alembic/versions/d3f1ab7c8e02_windows_dns_credentials.py:drop_column:36
 backend/alembic/versions/d3f2a51c8e76_bgp_peering.py:drop_column:98
 backend/alembic/versions/d3f2a51c8e76_bgp_peering.py:drop_constraint_fk:96
@@ -649,6 +649,10 @@ backend/alembic/versions/f3e8b1d72a9c_tls_cert_monitoring.py:drop_column:176
 backend/alembic/versions/f3e8b1d72a9c_tls_cert_monitoring.py:drop_column:177
 backend/alembic/versions/f3e8b1d72a9c_tls_cert_monitoring.py:drop_table:169
 backend/alembic/versions/f3e8b1d72a9c_tls_cert_monitoring.py:drop_table:174
+backend/alembic/versions/f4a1c9e072d5_panos_integration.py:drop_column:205
+backend/alembic/versions/f4a1c9e072d5_panos_integration.py:drop_column:208
+backend/alembic/versions/f4a1c9e072d5_panos_integration.py:drop_table:211
+backend/alembic/versions/f4a1c9e072d5_panos_integration.py:drop_table:213
 backend/alembic/versions/f4a1c9e7b2d8_appliance_host_config_health.py:drop_column:43
 backend/alembic/versions/f4a6c8b2e571_bgp_communities.py:drop_table:83
 backend/alembic/versions/f4a9c1b2d6e7_dns_zone_color.py:drop_column:33

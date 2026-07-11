@@ -345,6 +345,15 @@ class IPBlock(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
         nullable=True,
         index=True,
     )
+    # Palo Alto PAN-OS / Panorama provenance (issue #605). Set on the wrapper
+    # block the PAN-OS reconciler creates for a mirrored zone/interface CIDR.
+    # Cascades on firewall delete.
+    panos_firewall_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("panos_firewall.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
 
     # DNS assignment (propagates to child blocks and subnets unless overridden)
     dns_group_ids: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
@@ -790,6 +799,14 @@ class Subnet(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
         nullable=True,
         index=True,
     )
+    # Palo Alto PAN-OS / Panorama provenance (issue #605). Set on subnets the
+    # PAN-OS reconciler mirrors from zone/interface CIDRs. Cascades on delete.
+    panos_firewall_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("panos_firewall.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
 
     # Computed / cached. ``total_ips`` is BigInteger because IPv6 subnets can
     # be as large as 2^64 addresses (a /64 — the standard LAN size) which
@@ -1005,6 +1022,14 @@ class IPAddress(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     netbird_instance_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("netbird_instance.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    # Palo Alto PAN-OS / Panorama provenance (issue #605). Set on IP rows the
+    # PAN-OS reconciler mirrors from DHCP leases. Cascades on firewall delete.
+    panos_firewall_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("panos_firewall.id", ondelete="CASCADE"),
         nullable=True,
         index=True,
     )
@@ -1257,6 +1282,18 @@ class NATMapping(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     tags: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
     custom_fields: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+
+    # Integration provenance (issue #605). NULL for operator-entered rows;
+    # set when the PAN-OS reconciler mirrored this mapping from a firewall NAT
+    # rule, so the mirror owns (and sweeps) its rows on target delete. Manual
+    # rows stay untouched. ``ON DELETE CASCADE`` — a firewall delete removes
+    # the NAT rows it created (mirroring how the IPAM mirrors own their rows).
+    panos_firewall_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("panos_firewall.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
 
 
 class VLANMapping(UUIDPrimaryKeyMixin, Base):

@@ -60,6 +60,7 @@ _OTHER_INTEGRATION_FKS = (
     "unifi_controller_id",
     "cloud_endpoint_id",
     "opnsense_router_id",
+    "panos_firewall_id",
 )
 
 

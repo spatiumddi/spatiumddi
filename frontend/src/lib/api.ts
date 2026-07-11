@@ -3253,6 +3253,7 @@ export interface PlatformSettings {
   integration_unifi_enabled: boolean;
   integration_cloud_enabled: boolean;
   integration_opnsense_enabled: boolean;
+  integration_panos_enabled: boolean;
   integration_netbird_enabled: boolean;
   /** Domain WHOIS refresh cadence (hours). Beat ticks hourly; the
    *  task itself reads this on every fire so cadence changes take
@@ -8291,6 +8292,7 @@ export type IntegrationDashboardKind =
   | "unifi"
   | "cloud"
   | "opnsense"
+  | "paloalto"
   | "netbird";
 export interface IntegrationsDashboardTargetRow {
   id: string;
@@ -11247,6 +11249,159 @@ export const opnsenseApi = {
   syncNow: (id: string) =>
     api
       .post<{ status: string; task_id: string }>(`/opnsense/routers/${id}/sync`)
+      .then((r) => r.data),
+};
+
+// ── Palo Alto PAN-OS / Panorama integration (issue #605) ───────────
+
+export interface PANOSFirewall {
+  id: string;
+  name: string;
+  description: string;
+  enabled: boolean;
+  host: string;
+  port: number;
+  verify_tls: boolean;
+  ca_bundle_present: boolean;
+  api_version: string;
+  api_key_present: boolean;
+  is_panorama: boolean;
+  vsys: string;
+  device_group: string;
+  ipam_space_id: string;
+  dns_group_id: string | null;
+  mirror_address_objects: boolean;
+  mirror_nat_rules: boolean;
+  mirror_interfaces: boolean;
+  mirror_dhcp_leases: boolean;
+  sync_interval_seconds: number;
+  block_sync_enabled: boolean;
+  block_tag_name: string;
+  last_block_sync_at: string | null;
+  last_block_sync_error: string | null;
+  last_synced_at: string | null;
+  last_sync_error: string | null;
+  sw_version: string | null;
+  model: string | null;
+  object_count: number | null;
+  nat_rule_count: number | null;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface PANOSFirewallCreate {
+  name: string;
+  description?: string;
+  enabled?: boolean;
+  host: string;
+  port?: number;
+  verify_tls?: boolean;
+  ca_bundle_pem?: string;
+  api_version?: string;
+  is_panorama?: boolean;
+  vsys?: string;
+  device_group?: string;
+  api_key: string;
+  ipam_space_id: string;
+  dns_group_id?: string | null;
+  mirror_address_objects?: boolean;
+  mirror_nat_rules?: boolean;
+  mirror_interfaces?: boolean;
+  mirror_dhcp_leases?: boolean;
+  sync_interval_seconds?: number;
+}
+
+export interface PANOSFirewallUpdate {
+  name?: string;
+  description?: string;
+  enabled?: boolean;
+  host?: string;
+  port?: number;
+  verify_tls?: boolean;
+  ca_bundle_pem?: string;
+  api_version?: string;
+  is_panorama?: boolean;
+  vsys?: string;
+  device_group?: string;
+  api_key?: string;
+  ipam_space_id?: string;
+  dns_group_id?: string | null;
+  mirror_address_objects?: boolean;
+  mirror_nat_rules?: boolean;
+  mirror_interfaces?: boolean;
+  mirror_dhcp_leases?: boolean;
+  sync_interval_seconds?: number;
+}
+
+export interface PANOSTestResult {
+  ok: boolean;
+  message: string;
+  sw_version?: string | null;
+  model?: string | null;
+  // Returned when a keygen (username + password) minted a fresh API key —
+  // the create form captures it so the operator doesn't have to paste it.
+  api_key?: string | null;
+}
+
+export interface FirewallObject {
+  id: string;
+  name: string;
+  kind: string;
+  value: string;
+  description: string;
+  tags: string[];
+  resolved_cidr: string | null;
+  ip_address_id: string | null;
+  subnet_id: string | null;
+  unlinked: boolean;
+}
+
+export interface PANOSDrift {
+  objects_total: number;
+  objects_unlinked: number;
+  subnets_uncovered: number;
+  subnets_uncovered_cidrs: string[];
+}
+
+export const panosApi = {
+  list: () =>
+    api.get<PANOSFirewall[]>("/paloalto/firewalls").then((r) => r.data),
+  create: (data: PANOSFirewallCreate) =>
+    api.post<PANOSFirewall>("/paloalto/firewalls", data).then((r) => r.data),
+  update: (id: string, data: PANOSFirewallUpdate) =>
+    api
+      .put<PANOSFirewall>(`/paloalto/firewalls/${id}`, data)
+      .then((r) => r.data),
+  remove: (id: string) => api.delete(`/paloalto/firewalls/${id}`),
+  sync: (id: string) =>
+    api
+      .post<{
+        status: string;
+        task_id: string;
+      }>(`/paloalto/firewalls/${id}/sync`)
+      .then((r) => r.data),
+  listObjects: (id: string) =>
+    api
+      .get<FirewallObject[]>(`/paloalto/firewalls/${id}/objects`)
+      .then((r) => r.data),
+  drift: (id: string) =>
+    api.get<PANOSDrift>(`/paloalto/firewalls/${id}/drift`).then((r) => r.data),
+  test: (body: {
+    firewall_id?: string;
+    host?: string;
+    port?: number;
+    verify_tls?: boolean;
+    ca_bundle_pem?: string;
+    api_version?: string;
+    is_panorama?: boolean;
+    vsys?: string;
+    device_group?: string;
+    api_key?: string;
+    username?: string;
+    password?: string;
+  }) =>
+    api
+      .post<PANOSTestResult>("/paloalto/firewalls/test", body)
       .then((r) => r.data),
 };
 
@@ -15780,7 +15935,7 @@ export const wakeSchedulesApi = {
 
 export type BlockKind = "ip" | "mac";
 export type BlockSource = "manual" | "new_device" | "rogue_dhcp";
-export type BlockTargetKind = "opnsense" | "unifi";
+export type BlockTargetKind = "opnsense" | "unifi" | "paloalto";
 export type BlockPushStatus = "pending" | "pushed" | "removing" | "error";
 export type BlockUnifiAuthKind = "api_key" | "user_password";
 
@@ -15833,6 +15988,11 @@ export interface BlockTarget {
   block_sync_enabled: boolean;
   // OPNsense-only
   block_alias_name?: string | null;
+  // Palo Alto PAN-OS-only — the Dynamic Address Group tag SpatiumDDI writes.
+  block_tag_name?: string | null;
+  // Palo Alto PAN-OS-only — a Panorama target cannot be armed (DAG enforcement
+  // needs a standalone firewall with a vsys); the backend 422s the arm call.
+  is_panorama?: boolean;
   // UniFi-only
   block_sync_site?: string | null;
   block_sync_auth_kind?: string | null;
@@ -15847,6 +16007,13 @@ export interface BlockOpnsenseArm {
   block_sync_api_key?: string;
   // Omit / empty keeps the stored secret; non-empty rotates it.
   block_sync_api_secret?: string;
+}
+
+export interface BlockPaloaltoArm {
+  block_sync_enabled?: boolean;
+  block_tag_name?: string;
+  // Omit / empty keeps the stored key; non-empty rotates it.
+  block_sync_api_key?: string;
 }
 
 export interface BlockUnifiArm {
@@ -15890,6 +16057,10 @@ export const blockSyncApi = {
   armUnifi: (id: string, data: BlockUnifiArm) =>
     api
       .put<BlockTarget>(`/block-sync/targets/unifi/${id}`, data)
+      .then((r) => r.data),
+  armPaloalto: (id: string, data: BlockPaloaltoArm) =>
+    api
+      .put<BlockTarget>(`/block-sync/targets/paloalto/${id}`, data)
       .then((r) => r.data),
   // ``preview=true`` reads the device + returns the diff without pushing;
   // ``preview=false`` enqueues a converge.

@@ -421,6 +421,31 @@ Paste `key` into **API Key** and `secret` into **API Secret**. **Test Connection
 
 ---
 
+## Palo Alto PAN-OS / Panorama (#605)
+
+One `PANOSFirewall` row points SpatiumDDI at a single managed **scope**: a standalone NGFW (one `vsys`, default `vsys1`) or a Panorama **device-group** (`is_panorama=True` + `device_group`). Feature module `integrations.paloalto`, default-OFF. Two integration shapes ride the one row — a read-only mirror (this section) and opt-in Dynamic Address Group enforcement (folded into [Active block sync](#active-block-sync--write-back-enforcement-601) below).
+
+Palo Alto is the reference vendor for the enterprise-firewall family because its API is the best of the family and its **Dynamic Address Group** model is a near-perfect fit for SpatiumDDI's desired-state enforcement design.
+
+Per-scope config (`PANOSFirewall` rows): connection (`host` / `port` / `verify_tls` / optional `ca_bundle_pem` / REST `api_version`, default `10.1`), a Fernet-encrypted read-scoped `api_key`, the Panorama/vsys scoping, the bound `ipam_space_id` (+ optional `dns_group_id`), four mirror toggles, and `sync_interval_seconds` (default 60, 30 s floor, swept on the 30 s beat tick). The client speaks the **REST API** (`/restapi/v{ver}/Objects/Addresses`, `/AddressGroups`, `/Policies/NatRules`, header `X-PAN-KEY`) for objects/NAT and the legacy **XML API** (`type=keygen` / `type=op` / `type=user-id`) for key minting, op-commands (system info, interface IPs, DHCP leases), and DAG tag registration.
+
+### Mirror semantics
+
+- **Address objects + groups → `firewall_endpoint_object` mirror rows** (the "shadow IPAM" store). Named to *not* collide with the appliance's own fleet-nftables `FirewallPolicy` / `FirewallRule` / `FirewallAlias` (#285). Each row carries provenance (`panos_firewall_id`, `ON DELETE CASCADE`), the object `kind` (host / network / range / fqdn / group), its verbatim `value`, tags, and — where the value resolves to a known IPAM CIDR/IP — an optional link to the live `ip_address` / `subnet` row. **Drift report** (`GET /paloalto/firewalls/{id}/drift`): objects that resolve to a CIDR/IP but link no IPAM row, and in-space subnets that no firewall object covers.
+- **NAT rules → `nat_mapping` rows** stamped with `panos_firewall_id` provenance (making the previously manual-entry-only NAT table a live data source). DNAT / port-forward → `internal_ip` = translated dst, `external_ip` = original dst; source-NAT → `internal_ip` = original source, `external_ip` = translated source. Mirror-owned rows sweep on target delete and never collide with operator-entered rows.
+- **Zones + interfaces → IPAM subnets** (opt-in, `mirror_interfaces`): interface CIDRs from `show interface all` become PAN-owned subnets under an auto-created wrapper block, gateway = the interface IP, zone in the description.
+- **DHCP leases → IPAM addresses** (opt-in, `mirror_dhcp_leases`, when the firewall is a DHCP server): `status="dhcp"` + `auto_from_lease=True`, Kea-shape parity.
+
+### Lock semantics
+
+Same ownership shape as the other integrations: pre-existing operator rows at a desired address are adopted (FK stamped, `user_modified_at` set); rows owned by another integration are skipped with a warning (`panos_firewall_id` is threaded through every reconciler's sibling-ownership guard); operator subnets at an exact-CIDR match are reused untouched; a PAN-owned subnet that still has non-PAN addresses in it is un-claimed rather than cascade-deleted.
+
+### Setup
+
+The admin page at `/paloalto` collects the connection + scope. Provide either a pre-minted API key (**Device → Setup → Management → API key**, or a custom admin role scoped to XML/REST read) **or** admin username + password — **Test Connection** (`POST /paloalto/firewalls/test`) then mints the key via `type=keygen` and returns it for the create form to store. Least privilege: an admin role with read on Objects + Policies + Operational commands is enough for the mirror; DAG enforcement needs a separate User-ID-capable key (below).
+
+---
+
 ## Active block sync — write-back enforcement (#601)
 
 > **This is the deliberate exception to the read-only-mirror rule above.** Every other integration in this doc is a one-way `source → IPAM` pull. Active block sync is the opposite direction — `decision → source`, a push reconciler. It exists to close the half-open detect→block loop: rogue-DHCP detection (#370) and new-device watch (#459) can *see* a hostile device, and the DHCP MAC blocklist can starve it of a lease, but a device that **self-assigns a static IP walks right past a DHCP block**. Active block sync pushes a real block at the natural enforcement point instead.
@@ -428,9 +453,9 @@ Paste `key` into **API Key** and `secret` into **API Secret**. **Test Connection
 It is off by default and layered behind several independent gates so it can never fire by accident:
 
 1. **Feature module `security.block_sync`** (default-OFF) gates the entire surface (REST router, MCP tools, sidebar entry). Enabling it exposes the UI but **arms nothing**.
-2. **Per-target enforcement master switch** (`block_sync_enabled`, default-OFF) on each OPNsense router / UniFi controller — independent of both the mirror's `enabled` flag and the `integrations.opnsense` / `integrations.unifi` modules. The read-only mirror is never touched; enforcement is a separate armed capability on the same row.
-3. **Distinct write-scoped credentials.** The read mirror uses a read-only API user; enforcement needs a Firewall-privileged OPNsense user / a UniFi admin key. Stored Fernet-encrypted, never returned (password-confirm reveal, audited — mirrors the agent-bootstrap-key reveal).
-4. **RBAC `manage_block_sync`** on every endpoint (Network Editor builtin role; superadmin bypasses).
+2. **Per-target enforcement master switch** (`block_sync_enabled`, default-OFF) on each OPNsense router / UniFi controller / Palo Alto firewall — independent of both the mirror's `enabled` flag and the `integrations.opnsense` / `integrations.unifi` / `integrations.paloalto` modules. The read-only mirror is never touched; enforcement is a separate armed capability on the same row.
+3. **Distinct write-scoped credentials.** The read mirror uses a read-only API user; enforcement needs a Firewall-privileged OPNsense user / a UniFi admin key / a PAN-OS User-ID-capable key. Stored Fernet-encrypted, never returned (password-confirm reveal, audited — mirrors the agent-bootstrap-key reveal).
+4. **RBAC `manage_block_sync`** on every endpoint (Network Editor builtin role; superadmin bypasses). Palo Alto DAG enforcement additionally requires **`manage_firewall_enforcement`** to arm.
 5. **Preview + confirm + full audit** on every push — `POST /block-sync/blocks/preview` (and `?preview` on reconcile) returns the exact per-target add/remove diff without writing.
 6. **Two-person approval** — creating/arming a block routes through the approval workflow (#62) as `admin:manage_block_sync` when a policy matches.
 
@@ -446,13 +471,19 @@ IP-kind blocks push to an operator-**pre-created** OPNsense table alias (e.g. `s
 
 MAC-kind blocks push a device quarantine via the legacy controller command `POST /proxy/network/api/s/{site}/cmd/stamgr` `{"cmd": "block-sta", "mac": …}` / `unblock-sta` — the same call the UniFi UI issues (the public Integration v1 API does not expose client-block, so the legacy path + captured `X-CSRF-Token` / `X-API-Key` is mandatory). This is an L2 quarantine at the AP/switch, great for "quarantine this device"; subnet/CIDR firewall rules (`rest/firewallrule`) are out of scope for v1.
 
+### Palo Alto PAN-OS — Dynamic Address Group tag register (#605)
+
+The enterprise-grade, **commit-free** tier of the same enforcement theme. IP-kind blocks push an `IP → tag` registration via the PAN-OS **User-ID API** (`type=user-id`, `<uid-message><payload><register>…`), with `timeout='0'` for a persistent registration and **no policy commit**. The operator pre-creates a **Dynamic Address Group** whose match is `'<block_tag_name>'` (default `spatiumddi-quarantine`); the DAG picks up the registered IP near-instantly and any security rule referencing the DAG enforces it. Convergence reads current on-device state (`show object registered-ip tag <t>`) so SpatiumDDI adds only what's missing and unregisters only what it owns (never diffing against a bad-empty set, NN#5). SpatiumDDI's classification flags (`pci_scope` / `internet_facing`) and free-form tags map naturally onto DAG tags.
+
+Extra guardrails on top of the shared block-sync gates: enforcement targets a **standalone firewall vsys** (User-ID registration is not a Panorama operation — arming a Panorama target 422s); it needs a **distinct User-ID-capable write key** (Fernet-encrypted, never returned, password-confirm reveal); and arming it requires the dedicated **`manage_firewall_enforcement`** permission *in addition to* `manage_block_sync` (an off-prem, broad-blast-radius write). **Setup:** create an admin role / API key with User-ID write on the target vsys, pre-create the DAG referencing the tag, then arm the target from **Block sync → Targets** with the tag name + write key.
+
 ### One-click from detection
 
-The New Devices review-queue **Block** action grows an "also quarantine upstream" option: when the module is on, the caller holds `manage_block_sync`, and a UniFi target is armed, blocking a MAC there *also* creates a `network_block` (source=`new_device`) — routed through the same approval gate. Rogue-DHCP responders can be blocked by IP the same way through the dedicated surface (source=`rogue_dhcp`).
+The New Devices review-queue **Block** action grows an "also quarantine upstream" option: when the module is on, the caller holds `manage_block_sync`, and a UniFi target is armed, blocking a MAC there *also* creates a `network_block` (source=`new_device`) — routed through the same approval gate. Rogue-DHCP responders can be blocked by IP the same way through the dedicated surface (source=`rogue_dhcp`) — an armed OPNsense alias or Palo Alto DAG enforces it at the firewall.
 
 ### Non-goals (v1)
 
-Full firewall rule authoring / reordering on OPNsense (alias membership only); UniFi subnet/CIDR firewall rules (L2 MAC quarantine only); any write-back other than block/unblock; pfSense enforcement (folds in once the pfSense mirror #32 lands, same shape).
+Full firewall rule authoring / reordering (OPNsense alias membership + PAN-OS DAG tags only, never security-rule CRUD or any commit); UniFi subnet/CIDR firewall rules (L2 MAC quarantine only); any write-back other than block/unblock/tag-register; pfSense enforcement (folds in once the pfSense mirror #32 lands, same shape).
 
 ---
 

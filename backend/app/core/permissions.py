@@ -743,6 +743,7 @@ KNOWN_MANAGE_PERMISSIONS: frozenset[str] = frozenset(
         "manage_block_sync",
         "manage_dns_pools",
         "manage_domains",
+        "manage_firewall_enforcement",
         "manage_network_devices",
         "manage_nmap_scans",
         "manage_packet_capture",

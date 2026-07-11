@@ -109,6 +109,7 @@ from app.models.overlay import (
     RoutingPolicy,
 )
 from app.models.ownership import Customer, Provider, Site
+from app.models.panos import FirewallObject, PANOSFirewall
 from app.models.pcap import PacketCapture
 from app.models.proxmox import ProxmoxNode
 from app.models.saved_view import SavedView
@@ -222,8 +223,10 @@ __all__ = [
     "DockerHost",
     "Domain",
     "KubernetesCluster",
+    "FirewallObject",
     "NetbirdInstance",
     "OPNsenseRouter",
+    "PANOSFirewall",
     "ProxmoxNode",
     "SystemUpgradeRun",
     "TailscaleTenant",

@@ -20,6 +20,76 @@ the formatter handles the rest.
 
 ---
 
+## 2026.07.10-2 — 2026-07-10
+
+A **Palo Alto PAN-OS / Panorama** integration (#605) — the reference
+vendor for an enterprise-firewall family. It fills two gaps: SpatiumDDI
+had no "address object" concept, and its `NATMapping` table was
+manual-entry, visibility-only. Palo Alto goes first because its API is
+the best of the family and its **Dynamic Address Group** model is a
+near-perfect fit for SpatiumDDI's desired-state enforcement design.
+Two shapes ride one `panos_firewall` row: a read-only mirror of the
+firewall's "shadow IPAM" into native rows (default-off), and an
+opt-in, commit-free Dynamic Address Group enforcement tier that
+extends Active block sync (#601).
+
+### Added
+
+- **Palo Alto read-only mirror.** New `integrations.paloalto` feature
+  module (default-off). One `PANOSFirewall` row per managed scope —
+  a standalone NGFW `vsys` or a Panorama `device-group`. A 30 s beat
+  sweep with per-firewall interval gating reconciles:
+  - **Address objects + groups → a new `firewall_endpoint_object`
+    mirror** (the "shadow IPAM" store, named to not collide with the
+    appliance's own #285 firewall models), each resolved to a live
+    IPAM `ip_address` / `subnet` where the value matches, with a
+    two-way **drift report** (`GET /paloalto/firewalls/{id}/drift`):
+    objects with no IPAM row + subnets with no object.
+  - **NAT rules → `nat_mapping` rows** with `panos_firewall_id`
+    provenance — making the previously manual-only NAT table a live
+    data source.
+  - **Zones/interfaces → IPAM subnets** and **DHCP-server leases →
+    IPAM addresses** (both opt-in).
+  - REST client (`X-PAN-KEY`, `/restapi/v{ver}/Objects|Policies/…`)
+    for objects/NAT + legacy XML API (`type=keygen` / `op` /
+    `user-id`) for key minting, op-commands, and DAG tag register.
+    Test-connection mints a key from admin creds via `type=keygen`
+    or validates a pasted key.
+  - Admin page at `/paloalto`; both dashboard surfaces (IPAM-tab
+    `IntegrationsPanel` + the Integrations dashboard tab); MCP
+    `list_panos_targets` / `find_firewall_objects` /
+    `count_firewall_objects` read tools.
+- **Dynamic Address Group enforcement (the #601 tier).** `paloalto`
+  becomes a new Active-block-sync target kind: IP-kind blocks register
+  an `IP → tag` mapping via the PAN-OS **User-ID API** with no policy
+  commit; an operator-pre-created DAG matching the tag enforces it
+  near-instantly. Convergence reads on-device state (`show object
+  registered-ip`) so it adds only what's missing and unregisters only
+  what it owns. Guardrails on top of the shared block-sync gates:
+  targets a standalone firewall vsys (arming a Panorama target 422s),
+  a distinct User-ID-capable write key (Fernet-encrypted, reveal
+  behind re-auth), and a new **`manage_firewall_enforcement`**
+  permission required to arm (an off-prem, broad-blast-radius write).
+  Blocks still flow through the existing `network_block` desired-state
+  + two-person approval, so `propose_create_network_block` already
+  covers the PAN write path.
+
+### Changed
+
+- `panos_firewall_id` provenance FK is threaded through every mirror
+  reconciler's sibling-ownership guard so PAN-owned IPAM rows are
+  never claimed by another integration.
+
+### Migrations
+
+- `f4a1c9e072d5` — `panos_firewall` + `firewall_endpoint_object`
+  tables, `panos_firewall_id` FK on `ip_address` / `ip_block` /
+  `subnet` / `nat_mapping`, the `integration_panos_enabled` platform
+  setting, and the seeded (disabled) `integrations.paloalto`
+  feature-module row.
+
+---
+
 ## 2026.07.10-1 — 2026-07-10
 
 An **active enforcement** release. It closes the half-open

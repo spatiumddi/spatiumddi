@@ -1,9 +1,9 @@
 """Active block-sync convergence tasks (#601).
 
 * ``sweep_block_sync`` — beat-driven fan-out over every armed OPNsense /
-  UniFi target. Gated on the ``security.block_sync`` feature module (the
-  discovery/master gate) — each target additionally carries its own
-  ``block_sync_enabled`` switch (enforced in the reconciler).
+  UniFi / Palo Alto PAN-OS target. Gated on the ``security.block_sync``
+  feature module (the discovery/master gate) — each target additionally
+  carries its own ``block_sync_enabled`` switch (enforced in the reconciler).
 * ``reconcile_target_now`` — fired immediately after a block is created /
   lifted / a target is armed, so enforcement converges within seconds
   instead of waiting for the next sweep tick.
@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from app.celery_app import celery_app
 from app.config import settings
 from app.models.opnsense import OPNsenseRouter
+from app.models.panos import PANOSFirewall
 from app.models.unifi import UnifiController
 from app.services.feature_modules import is_module_enabled
 
@@ -35,6 +36,7 @@ async def _run_sweep() -> dict[str, Any]:
     from app.services.block_sync.reconcile import (  # noqa: PLC0415
         armed_targets,
         reconcile_opnsense,
+        reconcile_panos,
         reconcile_unifi,
     )
 
@@ -45,9 +47,10 @@ async def _run_sweep() -> dict[str, Any]:
             if not await is_module_enabled(db, _MODULE_ID):
                 return {"status": "disabled"}
 
-            routers, controllers = await armed_targets(db)
+            routers, controllers, firewalls = await armed_targets(db)
             router_ids = [r.id for r in routers]
             controller_ids = [c.id for c in controllers]
+            firewall_ids = [f.id for f in firewalls]
 
             ran = ok = errors = 0
             messages: list[str] = []
@@ -90,6 +93,25 @@ async def _run_sweep() -> dict[str, Any]:
                 if summary.error:
                     messages.append(f"unifi {controller.name}: {summary.error}")
 
+            for fid in firewall_ids:
+                fw = await db.get(PANOSFirewall, fid)
+                if fw is None:
+                    continue
+                try:
+                    summary = await reconcile_panos(db, fw)
+                    await db.commit()
+                except Exception as exc:  # noqa: BLE001
+                    await db.rollback()
+                    errors += 1
+                    messages.append(f"{fid}: {exc}")
+                    logger.warning("block_sync_panos_crash", target=str(fid), error=str(exc))
+                    continue
+                ran += 1
+                ok += 1 if summary.ok else 0
+                errors += 0 if summary.ok else 1
+                if summary.error:
+                    messages.append(f"paloalto {fw.name}: {summary.error}")
+
             return {
                 "status": "ok",
                 "ran": ran,
@@ -104,6 +126,7 @@ async def _run_sweep() -> dict[str, Any]:
 async def _run_one(target_kind: str, target_id: str) -> dict[str, Any]:
     from app.services.block_sync.reconcile import (  # noqa: PLC0415
         reconcile_opnsense,
+        reconcile_panos,
         reconcile_unifi,
     )
 
@@ -124,6 +147,11 @@ async def _run_one(target_kind: str, target_id: str) -> dict[str, Any]:
                 if controller is None:
                     return {"status": "not_found"}
                 summary = await reconcile_unifi(db, controller)
+            elif target_kind == "paloalto":
+                fw = await db.get(PANOSFirewall, tid)
+                if fw is None:
+                    return {"status": "not_found"}
+                summary = await reconcile_panos(db, fw)
             else:
                 return {"status": "bad_target_kind"}
             await db.commit()
@@ -149,11 +177,13 @@ async def _run_lift(target_kind: str, target_id: str) -> dict[str, Any]:
     try:
         async with session_factory() as db:
             tid = _uuid.UUID(target_id)
-            target: OPNsenseRouter | UnifiController | None
+            target: OPNsenseRouter | UnifiController | PANOSFirewall | None
             if target_kind == "opnsense":
                 target = await db.get(OPNsenseRouter, tid)
             elif target_kind == "unifi":
                 target = await db.get(UnifiController, tid)
+            elif target_kind == "paloalto":
+                target = await db.get(PANOSFirewall, tid)
             else:
                 return {"status": "bad_target_kind"}
             if target is None:

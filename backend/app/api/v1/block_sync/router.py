@@ -2,8 +2,10 @@
 
 The *enforcement* half of the detect→block loop. Manages the
 SpatiumDDI-owned ``network_block`` desired-state (blocked IPs / MACs) and
-arms per-target write-back into OPNsense (firewall alias membership) and
-UniFi (L2 client quarantine).
+arms per-target write-back into OPNsense (firewall alias membership),
+UniFi (L2 client quarantine), and Palo Alto PAN-OS (Dynamic Address Group
+tag register via the User-ID API, #605 — the extra
+``manage_firewall_enforcement`` permission gates arming that target).
 
 Guardrails, all enforced here:
 
@@ -42,6 +44,7 @@ from app.models.block_sync import (
     NetworkBlockPush,
 )
 from app.models.opnsense import OPNsenseRouter
+from app.models.panos import PANOSFirewall
 from app.models.unifi import UnifiController
 from app.services.ai.operations import get_operation
 from app.services.ai.operations_risky import CreateNetworkBlockArgs
@@ -50,7 +53,9 @@ from app.services.block_sync.reconcile import (
     applicable_targets_for_kind,
     normalize_block_value,
     opnsense_config_error,
+    panos_config_error,
     preview_opnsense,
+    preview_panos,
     preview_unifi,
     unifi_config_error,
 )
@@ -139,6 +144,9 @@ class TargetOut(BaseModel):
     # UniFi-only
     block_sync_site: str | None = None
     block_sync_auth_kind: str | None = None
+    # PAN-OS-only
+    block_tag_name: str | None = None
+    is_panorama: bool | None = None
     write_credentials_present: bool
     last_block_sync_at: datetime | None
     last_block_sync_error: str | None
@@ -159,6 +167,13 @@ class UnifiArm(BaseModel):
     block_sync_api_key: str | None = None
     block_sync_username: str | None = None
     block_sync_password: str | None = None
+
+
+class PanosArm(BaseModel):
+    block_sync_enabled: bool | None = None
+    block_tag_name: str | None = None
+    # The User-ID-capable write API key. Omit / empty keeps the stored key.
+    block_sync_api_key: str | None = None
 
 
 class RevealRequest(BaseModel):
@@ -266,6 +281,20 @@ def _unifi_target_out(c: UnifiController) -> TargetOut:
         write_credentials_present=creds,
         last_block_sync_at=c.last_block_sync_at,
         last_block_sync_error=c.last_block_sync_error,
+    )
+
+
+def _panos_target_out(f: PANOSFirewall) -> TargetOut:
+    return TargetOut(
+        target_kind="paloalto",
+        target_id=f.id,
+        name=f.name,
+        block_sync_enabled=f.block_sync_enabled,
+        block_tag_name=f.block_tag_name or "",
+        is_panorama=f.is_panorama,
+        write_credentials_present=bool(f.block_sync_api_key_encrypted),
+        last_block_sync_at=f.last_block_sync_at,
+        last_block_sync_error=f.last_block_sync_error,
     )
 
 
@@ -418,6 +447,9 @@ async def _target_name(db: DB, target_kind: str, target_id: uuid.UUID) -> str | 
     if target_kind == "opnsense":
         r = await db.get(OPNsenseRouter, target_id)
         return r.name if r else None
+    if target_kind == "paloalto":
+        f = await db.get(PANOSFirewall, target_id)
+        return f.name if f else None
     c = await db.get(UnifiController, target_id)
     return c.name if c else None
 
@@ -432,7 +464,14 @@ async def list_targets(db: DB, _: ManageUser) -> list[TargetOut]:
     controllers = (
         (await db.execute(select(UnifiController).order_by(UnifiController.name))).scalars().all()
     )
-    return [_opnsense_target_out(r) for r in routers] + [_unifi_target_out(c) for c in controllers]
+    firewalls = (
+        (await db.execute(select(PANOSFirewall).order_by(PANOSFirewall.name))).scalars().all()
+    )
+    return (
+        [_opnsense_target_out(r) for r in routers]
+        + [_unifi_target_out(c) for c in controllers]
+        + [_panos_target_out(f) for f in firewalls]
+    )
 
 
 @router.put("/targets/opnsense/{target_id}", response_model=TargetOut)
@@ -533,12 +572,58 @@ async def arm_unifi(target_id: uuid.UUID, body: UnifiArm, db: DB, user: ManageUs
     return _unifi_target_out(c)
 
 
+@router.put("/targets/paloalto/{target_id}", response_model=TargetOut)
+async def arm_paloalto(
+    target_id: uuid.UUID,
+    body: PanosArm,
+    db: DB,
+    user: ManageUser,
+    # DAG enforcement is off-prem, broad-blast-radius write — it needs a
+    # DISTINCT permission on top of manage_block_sync (issue #605 guardrail 5).
+    _enforce: Annotated[User, Depends(require_permission("admin", "manage_firewall_enforcement"))],
+) -> TargetOut:
+    forbid_in_demo_mode("Block-sync arming is disabled in demo mode")
+    f = await db.get(PANOSFirewall, target_id)
+    if f is None:
+        raise HTTPException(status_code=404, detail="Palo Alto target not found")
+    was_enabled = f.block_sync_enabled
+    changes = body.model_dump(exclude_unset=True)
+    if "block_sync_enabled" in changes:
+        f.block_sync_enabled = bool(changes["block_sync_enabled"])
+    if "block_tag_name" in changes and changes["block_tag_name"] is not None:
+        f.block_tag_name = changes["block_tag_name"].strip()
+    if changes.get("block_sync_api_key"):
+        f.block_sync_api_key_encrypted = encrypt_str(changes["block_sync_api_key"])
+    if f.block_sync_enabled:
+        cfg_err = panos_config_error(f)
+        if cfg_err is not None:
+            raise HTTPException(
+                status_code=422, detail=f"cannot arm Palo Alto DAG enforcement: {cfg_err}"
+            )
+    _audit(
+        db,
+        user=user,
+        action="arm_target",
+        resource_id=str(f.id),
+        resource_display=f"paloalto:{f.name}",
+        changed_fields=[k for k in changes if k != "block_sync_api_key"],
+        new_value={"block_sync_enabled": f.block_sync_enabled},
+    )
+    await db.commit()
+    await db.refresh(f)
+    if f.block_sync_enabled:
+        _enqueue_reconcile([("paloalto", f.id)])
+    elif was_enabled:
+        _enqueue_lift([("paloalto", f.id)])
+    return _panos_target_out(f)
+
+
 @router.post(
     "/targets/{target_kind}/{target_id}/reconcile",
     response_model=TargetDiffOut,
 )
 async def reconcile_target(
-    target_kind: Literal["opnsense", "unifi"],
+    target_kind: Literal["opnsense", "unifi", "paloalto"],
     target_id: uuid.UUID,
     db: DB,
     user: ManageUser,
@@ -551,6 +636,11 @@ async def reconcile_target(
         if r is None:
             raise HTTPException(status_code=404, detail="OPNsense target not found")
         diff = await preview_opnsense(db, r, read_device=preview)
+    elif target_kind == "paloalto":
+        f = await db.get(PANOSFirewall, target_id)
+        if f is None:
+            raise HTTPException(status_code=404, detail="Palo Alto target not found")
+        diff = await preview_panos(db, f, read_device=preview)
     else:
         c = await db.get(UnifiController, target_id)
         if c is None:
@@ -572,7 +662,7 @@ async def reconcile_target(
 
 @router.post("/targets/{target_kind}/{target_id}/reveal")
 async def reveal_credentials(
-    target_kind: Literal["opnsense", "unifi"],
+    target_kind: Literal["opnsense", "unifi", "paloalto"],
     target_id: uuid.UUID,
     body: RevealRequest,
     db: DB,
@@ -606,6 +696,13 @@ async def reveal_credentials(
         if r.block_sync_api_secret_encrypted:
             revealed["api_secret"] = decrypt_str(r.block_sync_api_secret_encrypted)
         name = r.name
+    elif target_kind == "paloalto":
+        f = await db.get(PANOSFirewall, target_id)
+        if f is None:
+            raise HTTPException(status_code=404, detail="Palo Alto target not found")
+        if f.block_sync_api_key_encrypted:
+            revealed["api_key"] = decrypt_str(f.block_sync_api_key_encrypted)
+        name = f.name
     else:
         c = await db.get(UnifiController, target_id)
         if c is None:

@@ -20,7 +20,7 @@ from __future__ import annotations
 import uuid
 
 import pytest
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -38,6 +38,22 @@ from app.services.ai.operations import (
     get_operation,
 )
 from app.services.ai.tools import REGISTRY
+
+
+def _fake_request() -> Request:
+    """A minimal ASGI ``Request`` for the ``apply_proposal`` calls below.
+
+    ``apply_proposal`` gained a required ``request`` parameter in #601 (it now
+    routes risky ops through ``gate_or_execute(db, user, request, …)`` for the
+    two-person approval workflow), but these #400 RBAC tests predate that and
+    were never updated — so they broke with ``missing 1 required positional
+    argument: 'request'``. The parameter is only dereferenced for a *risky*
+    operation; the ops exercised here (CreateIPAddress) are not risky and the
+    RBAC denial fires before ``gate_or_execute``, so a bare http scope is enough.
+    """
+    return Request(
+        {"type": "http", "method": "POST", "path": "/api/v1/ai/proposals/apply", "headers": []}
+    )
 
 
 async def _user(
@@ -156,7 +172,7 @@ async def test_apply_proposal_403_for_unprivileged_owner(db_session: AsyncSessio
     )
 
     with pytest.raises(HTTPException) as ei:
-        await apply_proposal(proposal.id, viewer, db_session)
+        await apply_proposal(proposal.id, viewer, db_session, _fake_request())
     assert ei.value.status_code == 403
 
     # And no IPAddress row was written.
@@ -185,7 +201,7 @@ async def test_apply_proposal_succeeds_for_authorized_writer(db_session: AsyncSe
         args=CreateIPAddressArgs(subnet_id=str(subnet.id), address="10.0.5.11").model_dump(),
     )
 
-    resp = await apply_proposal(proposal.id, writer, db_session)
+    resp = await apply_proposal(proposal.id, writer, db_session, _fake_request())
     assert resp.ok is True
     rows = (
         (
@@ -211,7 +227,7 @@ async def test_apply_proposal_succeeds_for_superadmin(db_session: AsyncSession) 
         operation="create_ip_address",
         args=CreateIPAddressArgs(subnet_id=str(subnet.id), address="10.0.5.12").model_dump(),
     )
-    resp = await apply_proposal(proposal.id, admin, db_session)
+    resp = await apply_proposal(proposal.id, admin, db_session, _fake_request())
     assert resp.ok is True
 
 
@@ -232,7 +248,7 @@ async def test_apply_proposal_wrong_resource_type_perm_still_403(db_session: Asy
         args=CreateIPAddressArgs(subnet_id=str(subnet.id), address="10.0.5.20").model_dump(),
     )
     with pytest.raises(HTTPException) as ei:
-        await apply_proposal(proposal.id, user, db_session)
+        await apply_proposal(proposal.id, user, db_session, _fake_request())
     assert ei.value.status_code == 403
 
 

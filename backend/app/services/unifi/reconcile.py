@@ -742,6 +742,7 @@ async def _apply_addresses(
                 and r.docker_host_id is None
                 and r.proxmox_node_id is None
                 and r.tailscale_tenant_id is None
+                and r.panos_firewall_id is None
             ]
             if not eligible:
                 if any(
@@ -755,6 +756,7 @@ async def _apply_addresses(
                     or r.docker_host_id
                     or r.proxmox_node_id
                     or r.tailscale_tenant_id
+                    or r.panos_firewall_id
                     for r in rows
                 ):
                     summary.warnings.append(
