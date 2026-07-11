@@ -31,7 +31,6 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
-import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -43,8 +42,6 @@ from app.models.unifi import UnifiController
 from app.services.opnsense.client import OPNsenseClient, OPNsenseClientError
 from app.services.oui import normalize_mac_key
 from app.services.unifi.client import UnifiClient, UnifiClientConfig, UnifiClientError
-
-logger = structlog.get_logger(__name__)
 
 # How often a UniFi block is re-asserted even when its push row is already
 # "pushed". UniFi has no cheap "list blocked" read, so a MAC an operator
