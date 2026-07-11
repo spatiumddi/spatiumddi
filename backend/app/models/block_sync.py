@@ -64,9 +64,12 @@ PUSH_STATUSES: tuple[str, ...] = ("pending", "pushed", "removing", "error")
 
 # Target kinds a push row can point at. Loose (no cross-table FK) because the
 # target is polymorphic across ``opnsense_router`` / ``unifi_controller`` /
-# ``panos_firewall``. ``paloalto`` consumes ``ip`` blocks (Dynamic Address
-# Group tag register via the User-ID API, #605).
-BLOCK_TARGET_KINDS: tuple[str, ...] = ("opnsense", "unifi", "paloalto")
+# ``panos_firewall`` / ``meraki_org``. ``paloalto`` consumes ``ip`` blocks
+# (Dynamic Address Group tag register via the User-ID API, #605); ``meraki``
+# consumes ``mac`` blocks (per-client ``Blocked`` device policy via the
+# Dashboard API, #606). Fortinet enforcement is NOT a push target — it polls a
+# ``FirewallFeed`` URL (the "feed inversion", #606).
+BLOCK_TARGET_KINDS: tuple[str, ...] = ("opnsense", "unifi", "paloalto", "meraki")
 
 
 class NetworkBlock(UUIDPrimaryKeyMixin, TimestampMixin, Base):

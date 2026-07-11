@@ -354,6 +354,22 @@ class IPBlock(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
         nullable=True,
         index=True,
     )
+    # Fortinet FortiGate provenance (issue #606) — wrapper block for a mirrored
+    # FortiGate interface CIDR. Cascades on firewall delete.
+    fortinet_firewall_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("fortinet_firewall.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    # Cisco Meraki provenance (issue #606) — wrapper block for a mirrored
+    # Meraki VLAN subnet. Cascades on org delete.
+    meraki_org_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("meraki_org.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
 
     # DNS assignment (propagates to child blocks and subnets unless overridden)
     dns_group_ids: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
@@ -807,6 +823,22 @@ class Subnet(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
         nullable=True,
         index=True,
     )
+    # Fortinet FortiGate provenance (issue #606) — subnets mirrored from a
+    # FortiGate interface CIDR. Cascades on firewall delete.
+    fortinet_firewall_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("fortinet_firewall.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    # Cisco Meraki provenance (issue #606) — subnets mirrored from a Meraki
+    # appliance VLAN. Cascades on org delete.
+    meraki_org_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("meraki_org.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
 
     # Computed / cached. ``total_ips`` is BigInteger because IPv6 subnets can
     # be as large as 2^64 addresses (a /64 — the standard LAN size) which
@@ -1030,6 +1062,22 @@ class IPAddress(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     panos_firewall_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("panos_firewall.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    # Fortinet FortiGate provenance (issue #606) — IP rows mirrored from a
+    # FortiGate DHCP lease. Cascades on firewall delete.
+    fortinet_firewall_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("fortinet_firewall.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    # Cisco Meraki provenance (issue #606) — IP rows mirrored from a Meraki DHCP
+    # fixed-IP reservation or client. Cascades on org delete.
+    meraki_org_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("meraki_org.id", ondelete="CASCADE"),
         nullable=True,
         index=True,
     )
@@ -1283,14 +1331,26 @@ class NATMapping(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     tags: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
     custom_fields: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
 
-    # Integration provenance (issue #605). NULL for operator-entered rows;
-    # set when the PAN-OS reconciler mirrored this mapping from a firewall NAT
-    # rule, so the mirror owns (and sweeps) its rows on target delete. Manual
-    # rows stay untouched. ``ON DELETE CASCADE`` — a firewall delete removes
-    # the NAT rows it created (mirroring how the IPAM mirrors own their rows).
+    # Integration provenance (issue #605/#606). NULL for operator-entered rows;
+    # set when a firewall reconciler mirrored this mapping from a NAT rule (PAN-OS
+    # NAT / FortiGate VIP / Meraki 1:1-NAT + port-forward), so the mirror owns
+    # (and sweeps) its rows on target delete. Manual rows stay untouched.
+    # ``ON DELETE CASCADE`` — a firewall delete removes the NAT rows it created.
     panos_firewall_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("panos_firewall.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    fortinet_firewall_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("fortinet_firewall.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    meraki_org_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("meraki_org.id", ondelete="CASCADE"),
         nullable=True,
         index=True,
     )

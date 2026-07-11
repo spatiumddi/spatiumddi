@@ -41,6 +41,9 @@ from app.api.v1.dns_tools import router as dns_tools_router
 from app.api.v1.dnsbl import router as dnsbl_router
 from app.api.v1.docker import router as docker_router
 from app.api.v1.domains import router as domains_router
+from app.api.v1.firewall_feeds.router import public_router as firewall_feeds_public_router
+from app.api.v1.firewall_feeds.router import router as firewall_feeds_router
+from app.api.v1.fortinet.router import router as fortinet_router
 from app.api.v1.groups.router import router as groups_router
 from app.api.v1.groups.time_bound_grants import router as time_bound_grants_router
 from app.api.v1.ipam.router import router as ipam_router
@@ -48,6 +51,7 @@ from app.api.v1.kubernetes import router as kubernetes_router
 from app.api.v1.logs import logs_router
 from app.api.v1.looking_glass.agents import router as looking_glass_agents_router
 from app.api.v1.looking_glass.router import router as looking_glass_router
+from app.api.v1.meraki.router import router as meraki_router
 from app.api.v1.metrics import router as metrics_router
 from app.api.v1.multicast import router as multicast_router
 from app.api.v1.netbird import router as netbird_router
@@ -359,6 +363,32 @@ api_v1_router.include_router(
     prefix="/paloalto",
     tags=["paloalto"],
     dependencies=[Depends(require_module("integrations.paloalto"))],
+)
+api_v1_router.include_router(
+    fortinet_router,
+    prefix="/fortinet",
+    tags=["fortinet"],
+    dependencies=[Depends(require_module("integrations.fortinet"))],
+)
+api_v1_router.include_router(
+    meraki_router,
+    prefix="/meraki",
+    tags=["meraki"],
+    dependencies=[Depends(require_module("integrations.meraki"))],
+)
+# Firewall block-list feeds (#606). Admin CRUD is module-gated; the public
+# token-authed poll endpoint is included with NO dependency so a polling
+# firewall can always reach it (its own token is the auth).
+api_v1_router.include_router(
+    firewall_feeds_router,
+    prefix="/firewall-feeds",
+    tags=["firewall-feeds"],
+    dependencies=[Depends(require_module("security.firewall_feeds"))],
+)
+api_v1_router.include_router(
+    firewall_feeds_public_router,
+    prefix="/firewall-feeds",
+    tags=["firewall-feeds"],
 )
 api_v1_router.include_router(
     providers_router,

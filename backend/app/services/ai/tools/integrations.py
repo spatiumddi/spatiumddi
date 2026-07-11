@@ -30,7 +30,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.auth import User
 from app.models.cloud import CloudEndpoint
 from app.models.docker import DockerHost
+from app.models.firewall_feed import FirewallFeed
+from app.models.fortinet import FortinetFirewall
 from app.models.kubernetes import KubernetesCluster
+from app.models.meraki import MerakiOrg
 from app.models.netbird import NetbirdInstance
 from app.models.opnsense import OPNsenseRouter
 from app.models.panos import FirewallObject, PANOSFirewall
@@ -639,9 +642,23 @@ async def list_panos_targets(
 # ── find_firewall_objects / count_firewall_objects (#605) ─────────────
 
 
+def _firewall_owner_match(firewall_id: Any) -> Any:
+    """A predicate matching a FirewallObject owned by ``firewall_id`` across any
+    of the three vendor owner columns (PAN-OS / Fortinet / Meraki)."""
+    return or_(
+        FirewallObject.panos_firewall_id == firewall_id,
+        FirewallObject.fortinet_firewall_id == firewall_id,
+        FirewallObject.meraki_org_id == firewall_id,
+    )
+
+
 class FindFirewallObjectsArgs(BaseModel):
     firewall_id: str | None = Field(
-        default=None, description="Filter to one PAN-OS firewall (UUID). Omit for all."
+        default=None,
+        description="Filter to one firewall / org (UUID, any vendor). Omit for all.",
+    )
+    source_kind: str | None = Field(
+        default=None, description="Filter by vendor: paloalto | fortinet | meraki."
     )
     kind: str | None = Field(
         default=None, description="Filter by kind: host | network | range | fqdn | group."
@@ -659,15 +676,22 @@ class FindFirewallObjectsArgs(BaseModel):
     limit: int = Field(default=50, ge=1, le=200)
 
 
+_SOURCE_KIND_COL = {
+    "paloalto": FirewallObject.panos_firewall_id,
+    "fortinet": FirewallObject.fortinet_firewall_id,
+    "meraki": FirewallObject.meraki_org_id,
+}
+
+
 @register_tool(
     name="find_firewall_objects",
-    module="integrations.paloalto",
     description=(
-        "List mirrored Palo Alto address objects / groups (the 'shadow IPAM' "
-        "store, #605). Each row carries name, kind (host/network/range/fqdn/"
-        "group), value, description, tags, the resolved CIDR, and whether it "
-        "links to a live IPAM subnet/address. Use unlinked_only=true to surface "
-        "drift ('firewall objects with no IPAM row'). Read-only."
+        "List mirrored firewall address objects / groups from every configured "
+        "firewall vendor (Palo Alto #605, Fortinet + Meraki #606) — the 'shadow "
+        "IPAM' store. Each row carries source_kind, name, kind (host/network/"
+        "range/fqdn/group), value, description, tags, the resolved CIDR, and "
+        "whether it links to a live IPAM subnet/address. Use unlinked_only=true "
+        "to surface drift ('firewall objects with no IPAM row'). Read-only."
     ),
     args_model=FindFirewallObjectsArgs,
     category="read",
@@ -681,9 +705,14 @@ async def find_firewall_objects(
     stmt = select(FirewallObject)
     if args.firewall_id:
         try:
-            stmt = stmt.where(FirewallObject.panos_firewall_id == _uuid.UUID(args.firewall_id))
+            stmt = stmt.where(_firewall_owner_match(_uuid.UUID(args.firewall_id)))
         except ValueError:
             return {"firewall_objects": [], "count": 0, "error": "invalid firewall_id"}
+    if args.source_kind:
+        col = _SOURCE_KIND_COL.get(args.source_kind)
+        if col is None:
+            return {"firewall_objects": [], "count": 0, "error": "invalid source_kind"}
+        stmt = stmt.where(col.isnot(None))
     if args.kind:
         stmt = stmt.where(FirewallObject.kind == args.kind)
     if args.search:
@@ -706,7 +735,8 @@ async def find_firewall_objects(
         "firewall_objects": [
             {
                 "id": str(o.id),
-                "firewall_id": str(o.panos_firewall_id),
+                "source_kind": o.source_kind,
+                "firewall_id": str(o.source_id) if o.source_id else None,
                 "name": o.name,
                 "kind": o.kind,
                 "value": o.value,
@@ -723,17 +753,18 @@ async def find_firewall_objects(
 
 class CountFirewallObjectsArgs(BaseModel):
     firewall_id: str | None = Field(
-        default=None, description="Filter to one PAN-OS firewall (UUID). Omit for all."
+        default=None,
+        description="Filter to one firewall / org (UUID, any vendor). Omit for all.",
     )
 
 
 @register_tool(
     name="count_firewall_objects",
-    module="integrations.paloalto",
     description=(
-        "Count mirrored Palo Alto address objects (#605) grouped by kind, plus "
-        "the number that resolve to a CIDR/IP but link no IPAM row (the drift "
-        "count). Use to size the shadow-IPAM set. Read-only."
+        "Count mirrored firewall address objects across every vendor (Palo Alto "
+        "#605, Fortinet + Meraki #606) grouped by kind, plus the number that "
+        "resolve to a CIDR/IP but link no IPAM row (the drift count). Use to "
+        "size the shadow-IPAM set. Read-only."
     ),
     args_model=CountFirewallObjectsArgs,
     category="read",
@@ -755,7 +786,7 @@ async def count_firewall_objects(
         FirewallObject.kind
     )
     if fw_filter is not None:
-        kind_stmt = kind_stmt.where(FirewallObject.panos_firewall_id == fw_filter)
+        kind_stmt = kind_stmt.where(_firewall_owner_match(fw_filter))
     by_kind = {k: int(n) for k, n in (await db.execute(kind_stmt)).all()}
 
     unlinked_stmt = (
@@ -765,7 +796,165 @@ async def count_firewall_objects(
         .where(FirewallObject.subnet_id.is_(None))
     )
     if fw_filter is not None:
-        unlinked_stmt = unlinked_stmt.where(FirewallObject.panos_firewall_id == fw_filter)
+        unlinked_stmt = unlinked_stmt.where(_firewall_owner_match(fw_filter))
     unlinked = int((await db.execute(unlinked_stmt)).scalar_one())
 
     return {"total": sum(by_kind.values()), "by_kind": by_kind, "unlinked": unlinked}
+
+
+# ── list_fortinet_targets / list_meraki_targets / list_firewall_feeds (#606) ──
+
+
+class ListFortinetTargetsArgs(BaseModel):
+    search: str | None = _common_target_args()["search"]
+    enabled: bool | None = _common_target_args()["enabled"]
+    limit: int = _common_target_args()["limit"]
+
+
+@register_tool(
+    name="list_fortinet_targets",
+    module="integrations.fortinet",
+    description=(
+        "List configured Fortinet FortiGate firewalls that SpatiumDDI mirrors "
+        "into IPAM (address objects, VIPs/DNAT, and optionally interfaces + DHCP "
+        "leases). Each row carries id, name, description, endpoint, enabled, vdom, "
+        "ipam_space_id, sync_interval_seconds, last_synced_at, sw_version, model, "
+        "object_count, nat_rule_count. FortiGate enforcement is the credential-free "
+        "threat-feed path (see list_firewall_feeds). API tokens never appear."
+    ),
+    args_model=ListFortinetTargetsArgs,
+    category="integrations",
+)
+async def list_fortinet_targets(
+    db: AsyncSession, user: User, args: ListFortinetTargetsArgs
+) -> list[dict[str, Any]]:
+    stmt = select(FortinetFirewall)
+    if args.search:
+        like = f"%{args.search.lower()}%"
+        stmt = stmt.where(
+            or_(
+                func.lower(FortinetFirewall.name).like(like),
+                func.lower(FortinetFirewall.description).like(like),
+                func.lower(FortinetFirewall.host).like(like),
+            )
+        )
+    if args.enabled is not None:
+        stmt = stmt.where(FortinetFirewall.enabled.is_(args.enabled))
+    stmt = stmt.order_by(FortinetFirewall.name.asc()).limit(args.limit)
+    rows = (await db.execute(stmt)).scalars().all()
+    return [
+        {
+            "id": str(f.id),
+            "name": f.name,
+            "description": f.description or "",
+            "enabled": f.enabled,
+            "endpoint": f"https://{f.host}:{f.port}",
+            "vdom": f.vdom,
+            "ipam_space_id": str(f.ipam_space_id),
+            "sync_interval_seconds": f.sync_interval_seconds,
+            "last_synced_at": f.last_synced_at.isoformat() if f.last_synced_at else None,
+            "last_sync_error": f.last_sync_error,
+            "sw_version": f.sw_version,
+            "model": f.model,
+            "object_count": f.object_count,
+            "nat_rule_count": f.nat_rule_count,
+        }
+        for f in rows
+    ]
+
+
+class ListMerakiTargetsArgs(BaseModel):
+    search: str | None = _common_target_args()["search"]
+    enabled: bool | None = _common_target_args()["enabled"]
+    limit: int = _common_target_args()["limit"]
+
+
+@register_tool(
+    name="list_meraki_targets",
+    module="integrations.meraki",
+    description=(
+        "List configured Cisco Meraki organizations that SpatiumDDI mirrors into "
+        "IPAM (appliance VLANs -> subnets, DHCP fixed-IP reservations, policy "
+        "objects, 1:1 NAT / port-forward, and optionally clients). Each row "
+        "carries id, name, description, org_id, enabled, ipam_space_id, "
+        "sync_interval_seconds, last_synced_at, network_count, object_count, and "
+        "whether per-client block enforcement (block_sync) is armed. API keys "
+        "never appear."
+    ),
+    args_model=ListMerakiTargetsArgs,
+    category="integrations",
+)
+async def list_meraki_targets(
+    db: AsyncSession, user: User, args: ListMerakiTargetsArgs
+) -> list[dict[str, Any]]:
+    stmt = select(MerakiOrg)
+    if args.search:
+        like = f"%{args.search.lower()}%"
+        stmt = stmt.where(
+            or_(
+                func.lower(MerakiOrg.name).like(like),
+                func.lower(MerakiOrg.description).like(like),
+                func.lower(MerakiOrg.org_id).like(like),
+            )
+        )
+    if args.enabled is not None:
+        stmt = stmt.where(MerakiOrg.enabled.is_(args.enabled))
+    stmt = stmt.order_by(MerakiOrg.name.asc()).limit(args.limit)
+    rows = (await db.execute(stmt)).scalars().all()
+    return [
+        {
+            "id": str(o.id),
+            "name": o.name,
+            "description": o.description or "",
+            "enabled": o.enabled,
+            "org_id": o.org_id,
+            "ipam_space_id": str(o.ipam_space_id),
+            "sync_interval_seconds": o.sync_interval_seconds,
+            "last_synced_at": o.last_synced_at.isoformat() if o.last_synced_at else None,
+            "last_sync_error": o.last_sync_error,
+            "network_count": o.network_count,
+            "object_count": o.object_count,
+            "client_block_enforcement_armed": o.block_sync_enabled,
+        }
+        for o in rows
+    ]
+
+
+class ListFirewallFeedsArgs(BaseModel):
+    limit: int = _common_target_args()["limit"]
+
+
+@register_tool(
+    name="list_firewall_feeds",
+    module="security.firewall_feeds",
+    description=(
+        "List SpatiumDDI-hosted firewall block-list feeds (#606). A feed-polling "
+        "firewall (FortiGate External Threat Feed, Cisco Security Intelligence) "
+        "subscribes to a feed's token-scoped URL to enforce the block set with no "
+        "write credentials held by SpatiumDDI. Each row carries id, name, "
+        "description, enabled, kind, poll_count, and last_polled_at/ip so you can "
+        "confirm a firewall is actually consuming the feed. Feed tokens never "
+        "appear."
+    ),
+    args_model=ListFirewallFeedsArgs,
+    category="read",
+    default_enabled=True,
+)
+async def list_firewall_feeds(
+    db: AsyncSession, user: User, args: ListFirewallFeedsArgs
+) -> list[dict[str, Any]]:
+    stmt = select(FirewallFeed).order_by(FirewallFeed.name.asc()).limit(args.limit)
+    rows = (await db.execute(stmt)).scalars().all()
+    return [
+        {
+            "id": str(f.id),
+            "name": f.name,
+            "description": f.description or "",
+            "enabled": f.enabled,
+            "kind": f.kind,
+            "poll_count": f.poll_count or 0,
+            "last_polled_at": f.last_polled_at.isoformat() if f.last_polled_at else None,
+            "last_polled_ip": str(f.last_polled_ip) if f.last_polled_ip else None,
+        }
+        for f in rows
+    ]

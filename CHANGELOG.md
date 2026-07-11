@@ -20,6 +20,101 @@ the formatter handles the rest.
 
 ---
 
+## 2026.07.11-1 — 2026-07-11
+
+**Enterprise firewall family, Phase 1 — Fortinet FortiGate + Cisco
+Meraki MX** (#606), following the Palo Alto (#605) shape. Both land a
+read-only mirror of the firewall's "shadow IPAM" into native rows plus
+an opt-in enforcement tier — but each vendor uses its own *native*
+enforcement primitive, and one of them inverts the credential model
+entirely. The shared `firewall_endpoint_object` mirror store #605
+introduced now carries objects from any of the three vendors
+(exactly-one owner), and the address-object / NAT / interface-subnet /
+DHCP-lease mirror logic is lifted into one shared engine all three
+reconcilers converge through.
+
+### Added
+
+- **Fortinet FortiGate read-only mirror.** New `integrations.fortinet`
+  feature module (default-off). One `FortinetFirewall` row per
+  FortiGate VDOM, driven over the FortiOS REST API (bearer-token auth,
+  Fernet-encrypted at rest). A 30 s beat sweep with per-firewall
+  interval gating mirrors address objects/groups → `firewall_endpoint_
+  object`, VIPs (destination NAT) → `nat_mapping` provenance rows, and
+  — opt-in — interface CIDRs → IPAM subnets + DHCP leases → IPAM
+  addresses. Two-way IPAM drift report (objects with no IPAM row;
+  in-space subnets no object covers). CRUD + test-connection + Sync-now
+  + objects + drift at `/api/v1/fortinet`. Fleet-scoped page under
+  Integrations → Fortinet.
+- **Fortinet Threat-Feed enforcement — the "feed inversion".** New
+  `security.firewall_feeds` module (default-on, discovery-only). A
+  `FirewallFeed` row exposes a token-scoped URL
+  (`GET /api/v1/firewall-feeds/feeds/{id}/blocklist.txt`) that renders
+  the `NetworkBlock` set (the same intent Active block sync #601
+  pushes) as plain text, one IP/CIDR per line. A FortiGate External
+  Threat Feed (or a Cisco Security-Intelligence feed) polls it — so
+  **SpatiumDDI holds no write credentials on the firewall at all**.
+  The token is Fernet-encrypted, revealed once on create + via a
+  password-confirmed reveal, and rotatable; the public poll endpoint
+  is authed purely by the token and stamps poll telemetry
+  (`last_polled_at` / `_ip` / `poll_count`). Feeds page under Security.
+- **Cisco Meraki MX read-only mirror.** New `integrations.meraki`
+  feature module (default-off). One `MerakiOrg` row per Meraki
+  organization, driven over the cloud Dashboard API (API key + org id,
+  nothing on-prem, Fernet-encrypted at rest). Mirrors per-network
+  appliance VLANs → IPAM subnets, DHCP fixed-IP reservations → IPAM
+  addresses, org policy objects/groups → `firewall_endpoint_object`,
+  MX 1:1 NAT + port-forward → `nat_mapping`, and — opt-in — network
+  clients → IPAM addresses. Rate-limit-aware (429 + `Retry-After`) with
+  a slower 300 s default cadence. CRUD + test + Sync-now + objects +
+  drift at `/api/v1/meraki`. Page under Integrations → Meraki.
+- **Meraki per-client Blocked enforcement (the #601 tier).** A new
+  `meraki` block-sync target kind (consumes `mac` blocks): the
+  reconciler resolves a blocked MAC to its (network, client) across the
+  org's appliance networks and moves it to the built-in `Blocked`
+  device policy via the Dashboard API — the cloud applies it
+  immediately, no on-prem deploy. Distinct write-scoped key, default-
+  off per-target master switch, gated by the `security.block_sync`
+  module + the `manage_firewall_enforcement` permission + two-person
+  approval (#62), previewable + audited. Armed from the Active block
+  sync page.
+- **MCP tools.** `list_fortinet_targets`, `list_meraki_targets`, and
+  `list_firewall_feeds` (each gated on its module). `find_firewall_
+  objects` / `count_firewall_objects` are now vendor-neutral (query the
+  shadow-IPAM store across Palo Alto / Fortinet / Meraki, filterable by
+  `source_kind`).
+- Fortinet + Meraki panels on both dashboard surfaces (the IPAM-tab
+  IntegrationsPanel + the Integrations dashboard tab).
+
+### Changed
+
+- **Shared firewall-mirror engine.** The address-object / NAT /
+  interface-subnet / DHCP-lease "shadow IPAM" mirror logic #605 shipped
+  inline in the PAN-OS reconciler is lifted into
+  `app/services/firewall_mirror.py`, parameterized by a `FirewallOwner`.
+  All three vendor reconcilers (PAN-OS migrated onto it, Fortinet +
+  Meraki new) converge through one implementation, so there's a single
+  place to fix mirror bugs. The PAN-OS reconcile behaviour is unchanged
+  (its test suite pins it).
+- `firewall_endpoint_object` generalized from a single
+  `panos_firewall_id` owner to one-of-three vendor owners (PAN-OS /
+  Fortinet / Meraki), enforced by a `num_nonnulls(...) = 1` CHECK. The
+  eight pre-existing integration reconcilers' ownership guards learned
+  the two new provenance columns so no mirror claims another's rows.
+
+### Migrations
+
+- `a7c3e91f4d28` — creates `fortinet_firewall`, `meraki_org`, and
+  `firewall_feed`; adds `fortinet_firewall_id` + `meraki_org_id`
+  provenance FKs (ON DELETE CASCADE) to `firewall_endpoint_object`
+  (dropping the NOT NULL on `panos_firewall_id` + adding the one-owner
+  CHECK) and to `ip_address` / `ip_block` / `subnet` / `nat_mapping`;
+  adds the two `integration_*_enabled` settings toggles; seeds the
+  `integrations.fortinet` / `integrations.meraki` (off) +
+  `security.firewall_feeds` (on) feature-module rows.
+
+---
+
 ## 2026.07.10-2 — 2026-07-10
 
 A **Palo Alto PAN-OS / Panorama** integration (#605) — the reference

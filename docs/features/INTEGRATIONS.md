@@ -446,7 +446,49 @@ The admin page at `/paloalto` collects the connection + scope. Provide either a 
 
 ---
 
-## Active block sync — write-back enforcement (#601)
+## The shared firewall-mirror engine (#606)
+
+The address-object / NAT / interface-subnet / DHCP-lease mirror is identical across every firewall vendor — only the *owner* (which provenance FK carries the vendor id) differs. `backend/app/services/firewall_mirror.py` holds that logic once, parameterized by a `FirewallOwner` (`paloalto` / `fortinet` / `meraki`). Each vendor reconciler fetches from its own client, maps the wire shapes into neutral `MirrorObject` / `MirrorNat` / `MirrorSubnet` / `MirrorAddress` dataclasses, and calls `apply_objects` / `apply_nat` / `apply_subnets` / `apply_addresses`. The #605 PAN-OS reconciler was migrated onto this engine (its test suite pins the behaviour). The `firewall_endpoint_object` store carries all three vendors via mutually-exclusive owner FKs with a `num_nonnulls(...) = 1` CHECK, and `INTEGRATION_OWNERSHIP_FKS` centralises the sibling-ownership guard set so no mirror claims another vendor's rows.
+
+---
+
+## Fortinet FortiGate (#606)
+
+One `FortinetFirewall` row points SpatiumDDI at a single FortiGate **VDOM** (default `root`), driven over the **FortiOS REST API** (`/api/v2/cmdb/...` + `/api/v2/monitor/...`, `Authorization: Bearer <token>`, every request carrying `?vdom=`). Feature module `integrations.fortinet`, default-OFF. This vendor is **read-only mirror only** on this row — FortiGate enforcement is the credential-free threat-feed path (see [Firewall block-list feeds](#firewall-block-list-feeds-606) below), not a write-back.
+
+Per-firewall config: connection (`host` / `port` / `verify_tls` / optional `ca_bundle_pem` / `vdom`), a Fernet-encrypted read-scoped `api_token` (a FortiGate REST-API-admin bearer token), the bound `ipam_space_id` (+ optional `dns_group_id`), four mirror toggles, and `sync_interval_seconds` (default 60, 30 s floor). Reads share the [shared firewall-mirror engine](#the-shared-firewall-mirror-engine-606).
+
+### Mirror semantics
+
+- **Address objects + groups → `firewall_endpoint_object`** (`/api/v2/cmdb/firewall/address` + `/addrgrp`). `ipmask` → host or network, `iprange` → range, `fqdn` → fqdn, group → member-name list; `tagging` flattened into the object's tags. Same "shadow IPAM" store + two-way **drift report** (`GET /fortinet/firewalls/{id}/drift`) as Palo Alto.
+- **VIPs (destination NAT) → `nat_mapping`** (`/api/v2/cmdb/firewall/vip`): `external_ip` = the VIP `extip`, `internal_ip` = the mapped IP.
+- **Interface CIDRs → IPAM subnets** (opt-in, `mirror_interfaces`) and **DHCP leases → IPAM addresses** (opt-in, `mirror_dhcp_leases`), same ownership/lock semantics as the other mirrors.
+
+### Setup
+
+Create a REST API admin on the FortiGate (**System → Administrators → Create New → REST API Admin**) with a read-only profile scoped to the relevant VDOM, copy its API token, and paste it on the `/fortinet` admin page. **Test Connection** (`POST /fortinet/firewalls/test`) probes `/api/v2/monitor/system/status`.
+
+---
+
+## Cisco Meraki MX (#606)
+
+One `MerakiOrg` row points SpatiumDDI at a single Meraki **organization**, driven over the cloud **Dashboard API** (`https://api.meraki.com/api/v1`, `Authorization: Bearer <key>`) — nothing on-prem to reach. Feature module `integrations.meraki`, default-OFF. Two shapes ride the one row — a read-only mirror (this section) and opt-in per-client Blocked enforcement (folded into [Active block sync](#active-block-sync--write-back-enforcement-601)).
+
+Per-org config: `base_url` (regional shard override), the `org_id`, a Fernet-encrypted read-scoped `api_key`, an optional `network_ids` allow-list (empty = every appliance network), the bound `ipam_space_id` (+ optional `dns_group_id`), five mirror toggles, and `sync_interval_seconds` (default **300** — the Dashboard API is rate-limited; the client honours `429` + `Retry-After`). The reconciler accumulates every network's desired state before converging the [shared engine](#the-shared-firewall-mirror-engine-606) once per kind (a per-network apply would delete the other networks' rows).
+
+### Mirror semantics
+
+- **Appliance VLANs → IPAM subnets** (`/networks/{id}/appliance/vlans`): each VLAN `subnet` → an owned subnet under an auto-created wrapper block, gateway = the MX applianceIp. Networks with VLANs disabled fall back gracefully (the `400` "VLANs are not enabled" is treated as an empty list).
+- **DHCP fixed-IP reservations → IPAM addresses** (the high-value signal): each VLAN's `fixedIpAssignments` → a `reserved` IP row keyed by MAC.
+- **Org policy objects / groups → `firewall_endpoint_object`** (`/organizations/{id}/policyObjects` + `/groups`): `cidr`/`ip`/`fqdn` mapped to the shared kinds; category carried as a tag. Same drift report (`GET /meraki/orgs/{id}/drift`).
+- **MX 1:1 NAT + port-forward → `nat_mapping`** (`oneToOneNatRules` + `portForwardingRules`).
+- **Network clients → IPAM addresses** (opt-in, `mirror_clients`, noisy): `status="dhcp"`.
+
+### Setup
+
+Generate a Dashboard API key (**Organization → Settings → Dashboard API access**, or a per-user key), find the organization id (`getOrganizations`), and paste both on the `/meraki` admin page. **Test Connection** (`POST /meraki/orgs/test`) confirms the org + counts its appliance networks. Enforcement needs a *separate* write-scoped key (below).
+
+---
 
 > **This is the deliberate exception to the read-only-mirror rule above.** Every other integration in this doc is a one-way `source → IPAM` pull. Active block sync is the opposite direction — `decision → source`, a push reconciler. It exists to close the half-open detect→block loop: rogue-DHCP detection (#370) and new-device watch (#459) can *see* a hostile device, and the DHCP MAC blocklist can starve it of a lease, but a device that **self-assigns a static IP walks right past a DHCP block**. Active block sync pushes a real block at the natural enforcement point instead.
 
@@ -477,6 +519,10 @@ The enterprise-grade, **commit-free** tier of the same enforcement theme. IP-kin
 
 Extra guardrails on top of the shared block-sync gates: enforcement targets a **standalone firewall vsys** (User-ID registration is not a Panorama operation — arming a Panorama target 422s); it needs a **distinct User-ID-capable write key** (Fernet-encrypted, never returned, password-confirm reveal); and arming it requires the dedicated **`manage_firewall_enforcement`** permission *in addition to* `manage_block_sync` (an off-prem, broad-blast-radius write). **Setup:** create an admin role / API key with User-ID write on the target vsys, pre-create the DAG referencing the tag, then arm the target from **Block sync → Targets** with the tag name + write key.
 
+### Cisco Meraki — per-client Blocked device policy (#606)
+
+A `meraki` block-sync target consumes **`mac`**-kind blocks (alongside UniFi). The reconciler resolves a blocked MAC to its `(network, client)` across the org's appliance networks and moves the client to the built-in **`Blocked`** device policy via the Dashboard API (`updateNetworkClientPolicy`) — the cloud applies it immediately, **no on-prem deploy**. Lifting a block restores the client to `Normal`. Like UniFi there's no cheap "list blocked" read, so convergence is push-row driven with a periodic re-assert; a MAC not currently seen in any network records a soft error and retries next sweep. Needs a **distinct write-scoped Dashboard key** + the `manage_firewall_enforcement` permission (same guardrails as PAN-OS). Phase 1 wires the built-in `Blocked` policy; a custom named group policy (which needs `groupPolicyId` resolution) is a follow-up.
+
 ### One-click from detection
 
 The New Devices review-queue **Block** action grows an "also quarantine upstream" option: when the module is on, the caller holds `manage_block_sync`, and a UniFi target is armed, blocking a MAC there *also* creates a `network_block` (source=`new_device`) — routed through the same approval gate. Rogue-DHCP responders can be blocked by IP the same way through the dedicated surface (source=`rogue_dhcp`) — an armed OPNsense alias or Palo Alto DAG enforces it at the firewall.
@@ -484,6 +530,16 @@ The New Devices review-queue **Block** action grows an "also quarantine upstream
 ### Non-goals (v1)
 
 Full firewall rule authoring / reordering (OPNsense alias membership + PAN-OS DAG tags only, never security-rule CRUD or any commit); UniFi subnet/CIDR firewall rules (L2 MAC quarantine only); any write-back other than block/unblock/tag-register; pfSense enforcement (folds in once the pfSense mirror #32 lands, same shape).
+
+---
+
+## Firewall block-list feeds (#606)
+
+The **feed inversion** — the credential-free enforcement path. Instead of SpatiumDDI holding write credentials and pushing to the device (the #601 model above), the device polls a SpatiumDDI-hosted URL and applies whatever it returns. Feature module `security.firewall_feeds`, **default-ON** (discovery only — no feed serves anything until an operator creates one).
+
+A `FirewallFeed` row exposes `GET /api/v1/firewall-feeds/feeds/{id}/blocklist.txt` — an **unauthenticated** (session-less) endpoint authed purely by a per-feed token (`?token=` or `Authorization: Bearer`). It renders the active `NetworkBlock` set of the feed's kind (`ip` today) as plain text, one IP/CIDR per line — the same desired-state intent the #601 push reconcilers converge, fed by rogue-DHCP (#370), new-device watch (#459), and manual entries. The token is Fernet-encrypted at rest, shown once on create, revealed again through a password-confirmed endpoint, and rotatable (invalidating the old URL). Each poll stamps `last_polled_at` / `last_polled_ip` / `poll_count` so operators can confirm a firewall is actually consuming the feed.
+
+**Subscribers:** a **Fortinet FortiGate** *External Threat Feed* (Security Fabric → External Connectors → Threat Feeds → IP Address) points at the feed URL — no write creds on the FortiGate at all. **Cisco FTD/FMC** *Security Intelligence* network feeds and **Check Point** IOC feeds follow the same shape (Phase 2). Managed from the **Security → Firewall Feeds** page; three superadmin-safe MCP reads and `list_firewall_feeds`.
 
 ---
 

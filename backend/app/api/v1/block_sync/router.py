@@ -43,6 +43,7 @@ from app.models.block_sync import (
     NetworkBlock,
     NetworkBlockPush,
 )
+from app.models.meraki import MerakiOrg
 from app.models.opnsense import OPNsenseRouter
 from app.models.panos import PANOSFirewall
 from app.models.unifi import UnifiController
@@ -51,9 +52,11 @@ from app.services.ai.operations_risky import CreateNetworkBlockArgs
 from app.services.approvals.gate import gate_or_execute
 from app.services.block_sync.reconcile import (
     applicable_targets_for_kind,
+    meraki_config_error,
     normalize_block_value,
     opnsense_config_error,
     panos_config_error,
+    preview_meraki,
     preview_opnsense,
     preview_panos,
     preview_unifi,
@@ -147,6 +150,8 @@ class TargetOut(BaseModel):
     # PAN-OS-only
     block_tag_name: str | None = None
     is_panorama: bool | None = None
+    # Meraki-only
+    block_policy_name: str | None = None
     write_credentials_present: bool
     last_block_sync_at: datetime | None
     last_block_sync_error: str | None
@@ -173,6 +178,13 @@ class PanosArm(BaseModel):
     block_sync_enabled: bool | None = None
     block_tag_name: str | None = None
     # The User-ID-capable write API key. Omit / empty keeps the stored key.
+    block_sync_api_key: str | None = None
+
+
+class MerakiArm(BaseModel):
+    block_sync_enabled: bool | None = None
+    block_policy_name: str | None = None
+    # The write-scoped Dashboard API key. Omit / empty keeps the stored key.
     block_sync_api_key: str | None = None
 
 
@@ -295,6 +307,19 @@ def _panos_target_out(f: PANOSFirewall) -> TargetOut:
         write_credentials_present=bool(f.block_sync_api_key_encrypted),
         last_block_sync_at=f.last_block_sync_at,
         last_block_sync_error=f.last_block_sync_error,
+    )
+
+
+def _meraki_target_out(o: MerakiOrg) -> TargetOut:
+    return TargetOut(
+        target_kind="meraki",
+        target_id=o.id,
+        name=o.name,
+        block_sync_enabled=o.block_sync_enabled,
+        block_policy_name=o.block_policy_name or "Blocked",
+        write_credentials_present=bool(o.block_sync_api_key_encrypted),
+        last_block_sync_at=o.last_block_sync_at,
+        last_block_sync_error=o.last_block_sync_error,
     )
 
 
@@ -450,14 +475,17 @@ async def _target_name(db: DB, target_kind: str, target_id: uuid.UUID) -> str | 
     if target_kind == "paloalto":
         f = await db.get(PANOSFirewall, target_id)
         return f.name if f else None
+    if target_kind == "meraki":
+        o = await db.get(MerakiOrg, target_id)
+        return o.name if o else None
     c = await db.get(UnifiController, target_id)
     return c.name if c else None
 
 
 @router.get("/targets", response_model=list[TargetOut])
 async def list_targets(db: DB, _: ManageUser) -> list[TargetOut]:
-    """Every OPNsense router + UniFi controller that CAN be a block-sync
-    target, with its current arming state (armed or not)."""
+    """Every OPNsense router / UniFi controller / Palo Alto firewall / Meraki
+    org that CAN be a block-sync target, with its current arming state."""
     routers = (
         (await db.execute(select(OPNsenseRouter).order_by(OPNsenseRouter.name))).scalars().all()
     )
@@ -467,10 +495,12 @@ async def list_targets(db: DB, _: ManageUser) -> list[TargetOut]:
     firewalls = (
         (await db.execute(select(PANOSFirewall).order_by(PANOSFirewall.name))).scalars().all()
     )
+    orgs = (await db.execute(select(MerakiOrg).order_by(MerakiOrg.name))).scalars().all()
     return (
         [_opnsense_target_out(r) for r in routers]
         + [_unifi_target_out(c) for c in controllers]
         + [_panos_target_out(f) for f in firewalls]
+        + [_meraki_target_out(o) for o in orgs]
     )
 
 
@@ -618,12 +648,58 @@ async def arm_paloalto(
     return _panos_target_out(f)
 
 
+@router.put("/targets/meraki/{target_id}", response_model=TargetOut)
+async def arm_meraki(
+    target_id: uuid.UUID,
+    body: MerakiArm,
+    db: DB,
+    user: ManageUser,
+    # Per-client block enforcement is an off-prem, broad-blast-radius write — it
+    # needs a DISTINCT permission on top of manage_block_sync (mirrors #605).
+    _enforce: Annotated[User, Depends(require_permission("admin", "manage_firewall_enforcement"))],
+) -> TargetOut:
+    forbid_in_demo_mode("Block-sync arming is disabled in demo mode")
+    o = await db.get(MerakiOrg, target_id)
+    if o is None:
+        raise HTTPException(status_code=404, detail="Meraki target not found")
+    was_enabled = o.block_sync_enabled
+    changes = body.model_dump(exclude_unset=True)
+    if "block_sync_enabled" in changes:
+        o.block_sync_enabled = bool(changes["block_sync_enabled"])
+    if "block_policy_name" in changes and changes["block_policy_name"] is not None:
+        o.block_policy_name = changes["block_policy_name"].strip() or "Blocked"
+    if changes.get("block_sync_api_key"):
+        o.block_sync_api_key_encrypted = encrypt_str(changes["block_sync_api_key"])
+    if o.block_sync_enabled:
+        cfg_err = meraki_config_error(o)
+        if cfg_err is not None:
+            raise HTTPException(
+                status_code=422, detail=f"cannot arm Meraki client-block enforcement: {cfg_err}"
+            )
+    _audit(
+        db,
+        user=user,
+        action="arm_target",
+        resource_id=str(o.id),
+        resource_display=f"meraki:{o.name}",
+        changed_fields=[k for k in changes if k != "block_sync_api_key"],
+        new_value={"block_sync_enabled": o.block_sync_enabled},
+    )
+    await db.commit()
+    await db.refresh(o)
+    if o.block_sync_enabled:
+        _enqueue_reconcile([("meraki", o.id)])
+    elif was_enabled:
+        _enqueue_lift([("meraki", o.id)])
+    return _meraki_target_out(o)
+
+
 @router.post(
     "/targets/{target_kind}/{target_id}/reconcile",
     response_model=TargetDiffOut,
 )
 async def reconcile_target(
-    target_kind: Literal["opnsense", "unifi", "paloalto"],
+    target_kind: Literal["opnsense", "unifi", "paloalto", "meraki"],
     target_id: uuid.UUID,
     db: DB,
     user: ManageUser,
@@ -641,6 +717,11 @@ async def reconcile_target(
         if f is None:
             raise HTTPException(status_code=404, detail="Palo Alto target not found")
         diff = await preview_panos(db, f, read_device=preview)
+    elif target_kind == "meraki":
+        o = await db.get(MerakiOrg, target_id)
+        if o is None:
+            raise HTTPException(status_code=404, detail="Meraki target not found")
+        diff = await preview_meraki(db, o)
     else:
         c = await db.get(UnifiController, target_id)
         if c is None:
@@ -662,7 +743,7 @@ async def reconcile_target(
 
 @router.post("/targets/{target_kind}/{target_id}/reveal")
 async def reveal_credentials(
-    target_kind: Literal["opnsense", "unifi", "paloalto"],
+    target_kind: Literal["opnsense", "unifi", "paloalto", "meraki"],
     target_id: uuid.UUID,
     body: RevealRequest,
     db: DB,
@@ -703,6 +784,13 @@ async def reveal_credentials(
         if f.block_sync_api_key_encrypted:
             revealed["api_key"] = decrypt_str(f.block_sync_api_key_encrypted)
         name = f.name
+    elif target_kind == "meraki":
+        o = await db.get(MerakiOrg, target_id)
+        if o is None:
+            raise HTTPException(status_code=404, detail="Meraki target not found")
+        if o.block_sync_api_key_encrypted:
+            revealed["api_key"] = decrypt_str(o.block_sync_api_key_encrypted)
+        name = o.name
     else:
         c = await db.get(UnifiController, target_id)
         if c is None:

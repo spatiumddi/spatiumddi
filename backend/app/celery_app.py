@@ -43,6 +43,8 @@ celery_app = Celery(
         "app.tasks.proxmox_sync",
         "app.tasks.opnsense_sync",
         "app.tasks.panos_sync",
+        "app.tasks.fortinet_sync",
+        "app.tasks.meraki_sync",
         "app.tasks.tailscale_sync",
         "app.tasks.netbird_sync",
         "app.tasks.unifi_sync",
@@ -112,6 +114,8 @@ celery_app.conf.update(
         "app.tasks.proxmox_sync.*": {"queue": "default"},
         "app.tasks.opnsense_sync.*": {"queue": "default"},
         "app.tasks.panos_sync.*": {"queue": "default"},
+        "app.tasks.fortinet_sync.*": {"queue": "default"},
+        "app.tasks.meraki_sync.*": {"queue": "default"},
         "app.tasks.block_sync.*": {"queue": "default"},
         "app.tasks.tailscale_sync.*": {"queue": "default"},
         "app.tasks.netbird_sync.*": {"queue": "default"},
@@ -401,6 +405,19 @@ celery_app.conf.update(
         # ``PlatformSettings.integration_panos_enabled``.
         "panos-sync-sweep": {
             "task": "app.tasks.panos_sync.sweep_panos_firewalls",
+            "schedule": schedule(run_every=30.0),
+        },
+        # Fortinet FortiGate (#606) — same 30 s beat, per-firewall interval
+        # gate. Gated overall by ``PlatformSettings.integration_fortinet_enabled``.
+        "fortinet-sync-sweep": {
+            "task": "app.tasks.fortinet_sync.sweep_fortinet_firewalls",
+            "schedule": schedule(run_every=30.0),
+        },
+        # Cisco Meraki (#606) — same 30 s beat, per-org interval gate (Meraki's
+        # slower cloud rate limit defaults to a 300 s per-org interval). Gated
+        # overall by ``PlatformSettings.integration_meraki_enabled``.
+        "meraki-sync-sweep": {
+            "task": "app.tasks.meraki_sync.sweep_meraki_orgs",
             "schedule": schedule(run_every=30.0),
         },
         # Active block sync (#601) — converge SpatiumDDI-owned network

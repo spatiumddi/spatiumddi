@@ -330,6 +330,20 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         description="Read-only mirror of Palo Alto address objects/groups + NAT rules (+ optional zones/interfaces and DHCP leases) into IPAM, with a drift report vs your IPAM subnets. Optional Dynamic Address Group enforcement (commit-free User-ID tag register) is a separate, default-off master switch gated by the Active block sync module. Connect firewalls from the Palo Alto page once enabled.",
         default_enabled=False,
     ),
+    ModuleSpec(
+        id="integrations.fortinet",
+        label="Fortinet (FortiGate)",
+        group="Integrations",
+        description="Read-only mirror of FortiGate address objects/groups + VIPs (destination NAT) (+ optional interfaces and DHCP leases) into IPAM, with a drift report vs your IPAM subnets. Enforcement is credential-free: point a FortiGate External Threat Feed at a SpatiumDDI-hosted block-list URL (Active block sync module). Connect firewalls from the Fortinet page once enabled.",
+        default_enabled=False,
+    ),
+    ModuleSpec(
+        id="integrations.meraki",
+        label="Cisco Meraki (MX)",
+        group="Integrations",
+        description="Read-only mirror of a Meraki organization's appliance VLANs → subnets, DHCP fixed-IP reservations → IPAM, org policy objects/groups → firewall objects, and 1:1 NAT / port-forward → NAT mappings (+ optional network clients). Optional per-client Blocked enforcement (move a client to a restrictive device policy via the Dashboard API — no on-prem deploy) is a separate, default-off master switch gated by the Active block sync module. Connect an org from the Meraki page once enabled.",
+        default_enabled=False,
+    ),
     # Appliance — the declarative fleet-firewall policy surface (#285
     # Phase 3). Default-enabled for DISCOVERY/STAGING only: turning this
     # module ON exposes the policy editor + preview but applies NOTHING.
@@ -400,6 +414,19 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         group="Security",
         description="Turn passive rogue-device / new-MAC detection into active enforcement: push a SpatiumDDI-owned block set of IPs / MACs into OPNsense (firewall table-alias membership) and UniFi (L2 client quarantine), so a device that self-assigns a static IP is stopped at the firewall/gateway — not only starved of DHCP. Default-off and heavily guarded: each target has its own default-off enforcement master switch + distinct write-scoped credentials, every push is previewable + audited + RBAC-gated (manage_block_sync) + eligible for two-person approval. Discovery toggle only — enabling this arms nothing on its own.",
         default_enabled=False,
+    ),
+    # Security — SpatiumDDI-hosted firewall block-list feeds (#606, the "feed
+    # inversion"). Default-ENABLED as a DISCOVERY toggle: the feeds admin page
+    # is visible so operators find the capability, but NO feed serves anything
+    # until an operator creates one (each feed is token-scoped + opt-in). This
+    # is the credential-free enforcement path — a FortiGate External Threat
+    # Feed / Cisco Security-Intelligence feed polls a SpatiumDDI URL instead of
+    # SpatiumDDI holding write creds on the firewall.
+    ModuleSpec(
+        id="security.firewall_feeds",
+        label="Firewall block-list feeds",
+        group="Security",
+        description="Serve the SpatiumDDI block set (the same IP/MAC intent the Active block sync module pushes) as token-scoped block-list URLs that feed-polling firewalls subscribe to — FortiGate External Threat Feed, Cisco Security Intelligence, Check Point IOC — so the firewall enforces with NO write credentials held by SpatiumDDI. Discovery toggle only: enabling this exposes the feeds page but serves nothing until you create a feed.",
     ),
     # Security — DNSBL / RBL reputation monitoring (#528). Default-ENABLED
     # as a DISCOVERY toggle: the catalog + settings UI are visible so

@@ -40,6 +40,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     DateTime,
     ForeignKey,
     Index,
@@ -191,34 +192,63 @@ class PANOSFirewall(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
 
 class FirewallObject(UUIDPrimaryKeyMixin, TimestampMixin, Base):
-    """A mirrored PAN-OS address object / group — SpatiumDDI's "shadow IPAM".
+    """A mirrored firewall address object / group — SpatiumDDI's "shadow IPAM".
+
+    Defined by #605 (Palo Alto) as the shared cross-vendor mirror shape and
+    reused by the #606 enterprise-firewall family (Fortinet, Meraki, …). Each
+    row is owned by *exactly one* vendor target via one of the mutually
+    exclusive owner FKs below — a CHECK enforces the exactly-one invariant, so
+    the table stays a single unified store instead of one table per vendor.
 
     Named deliberately to NOT collide with the appliance's own fleet-nftables
     ``FirewallPolicy`` / ``FirewallRule`` / ``FirewallAlias`` (#285). The table
     name ``firewall_endpoint_object`` reinforces that these mirror an external
     firewall's *endpoint* address objects, not the appliance's own rules.
 
-    Rows carry provenance (``panos_firewall_id`` FK, ``ON DELETE CASCADE``) so
-    they sweep when the target is removed. Where an object resolves to a known
-    IPAM CIDR/IP, ``ip_address_id`` / ``subnet_id`` are stamped so the UI can
-    show the drift both ways (object with no IPAM row, subnet with no object).
+    Rows carry provenance via the owning-target FK (all ``ON DELETE CASCADE``)
+    so they sweep when the target is removed. Where an object resolves to a
+    known IPAM CIDR/IP, ``ip_address_id`` / ``subnet_id`` are stamped so the UI
+    can show the drift both ways (object with no IPAM row, subnet with no
+    object).
     """
 
     __tablename__ = "firewall_endpoint_object"
     __table_args__ = (
-        # One object name is unique within a firewall scope.
+        # One object name is unique within a firewall scope. NULLs are distinct
+        # in Postgres unique indexes, so each per-vendor constraint only sees
+        # rows owned by that vendor (the other two owner columns are NULL).
         UniqueConstraint("panos_firewall_id", "name", name="uq_firewall_object_fw_name"),
+        UniqueConstraint("fortinet_firewall_id", "name", name="uq_firewall_object_fortinet_name"),
+        UniqueConstraint("meraki_org_id", "name", name="uq_firewall_object_meraki_name"),
+        # Exactly one vendor owner per row.
+        CheckConstraint(
+            "num_nonnulls(panos_firewall_id, fortinet_firewall_id, meraki_org_id) = 1",
+            name="ck_firewall_object_one_owner",
+        ),
         Index("ix_firewall_object_panos_firewall_id", "panos_firewall_id"),
+        Index("ix_firewall_object_fortinet_firewall_id", "fortinet_firewall_id"),
+        Index("ix_firewall_object_meraki_org_id", "meraki_org_id"),
         Index("ix_firewall_object_value", "value"),
     )
 
-    panos_firewall_id: Mapped[uuid.UUID] = mapped_column(
+    # ── Owner (exactly one non-NULL, per the CHECK above) ────────────
+    panos_firewall_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("panos_firewall.id", ondelete="CASCADE"),
-        nullable=False,
+        nullable=True,
+    )
+    fortinet_firewall_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("fortinet_firewall.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    meraki_org_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("meraki_org.id", ondelete="CASCADE"),
+        nullable=True,
     )
 
-    # The PAN-OS object name (its primary key on the firewall).
+    # The firewall object name (its primary key on the firewall).
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     # host | network | range | fqdn | group — validated against
     # ``FIREWALL_OBJECT_KINDS`` at the reconciler.
@@ -247,6 +277,19 @@ class FirewallObject(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     subnet_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("subnet.id", ondelete="SET NULL"), nullable=True
     )
+
+    @property
+    def source_kind(self) -> str:
+        """Which vendor integration owns this row — for the UI + drift report."""
+        if self.fortinet_firewall_id is not None:
+            return "fortinet"
+        if self.meraki_org_id is not None:
+            return "meraki"
+        return "paloalto"
+
+    @property
+    def source_id(self) -> uuid.UUID | None:
+        return self.panos_firewall_id or self.fortinet_firewall_id or self.meraki_org_id
 
 
 __all__ = ["FIREWALL_OBJECT_KINDS", "PANOSFirewall", "FirewallObject"]

@@ -37,13 +37,21 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.crypto import decrypt_str
 from app.models.audit import AuditLog
 from app.models.block_sync import NetworkBlock, NetworkBlockPush
+from app.models.meraki import MerakiOrg
 from app.models.opnsense import OPNsenseRouter
 from app.models.panos import PANOSFirewall
 from app.models.unifi import UnifiController
+from app.services.meraki.client import MerakiClient, MerakiClientError
 from app.services.opnsense.client import OPNsenseClient, OPNsenseClientError
 from app.services.oui import normalize_mac_key
 from app.services.panos.client import PANOSClient, PANOSClientError
 from app.services.unifi.client import UnifiClient, UnifiClientConfig, UnifiClientError
+
+# Re-assert cadence for the Meraki per-client policy (same rationale as UniFi:
+# no cheap "list blocked" read, so a client an operator manually un-blocked in
+# the Dashboard must be periodically re-asserted — the block set is the source
+# of truth).
+_MERAKI_REASSERT_SECONDS = 3600.0
 
 # How often a UniFi block is re-asserted even when its push row is already
 # "pushed". UniFi has no cheap "list blocked" read, so a MAC an operator
@@ -136,6 +144,12 @@ async def applicable_targets_for_kind(db: AsyncSession, kind: str) -> list[tuple
             .all()
         )
         out.extend(("unifi", cid) for cid in rows)
+        meraki_rows = (
+            (await db.execute(select(MerakiOrg.id).where(MerakiOrg.block_sync_enabled.is_(True))))
+            .scalars()
+            .all()
+        )
+        out.extend(("meraki", mid) for mid in meraki_rows)
     return out
 
 
@@ -146,7 +160,7 @@ async def applicable_targets_for_kind(db: AsyncSession, kind: str) -> list[tuple
 class TargetDiff:
     """What a reconcile pass *would* change on one target (preview)."""
 
-    target_kind: str  # "opnsense" | "unifi"
+    target_kind: str  # "opnsense" | "unifi" | "paloalto" | "meraki"
     target_id: uuid.UUID
     target_name: str
     to_add: list[str] = field(default_factory=list)  # values to push
@@ -705,6 +719,172 @@ async def reconcile_panos(db: AsyncSession, fw: PANOSFirewall) -> BlockSyncSumma
     return summary
 
 
+# ── Cisco Meraki (per-client Blocked device policy, #606) ────────────
+#
+# kind=``mac`` blocks → the client's ``devicePolicy`` set to the org's
+# ``block_policy_name`` (the Meraki built-in ``Blocked``) via the Dashboard
+# API. The cloud applies it immediately (no on-prem deploy). Like UniFi there
+# is no cheap "list blocked" read, so convergence is push-row driven with a
+# periodic re-assert. Blocking a MAC means resolving it to a (network, client)
+# across the org's appliance networks first.
+
+
+def _meraki_client(org: MerakiOrg) -> MerakiClient:
+    key = decrypt_str(org.block_sync_api_key_encrypted)
+    return MerakiClient(
+        api_key=key,
+        org_id=org.org_id.strip(),
+        base_url=org.base_url or "https://api.meraki.com/api/v1",
+        verify_tls=True,
+    )
+
+
+def meraki_config_error(org: MerakiOrg) -> str | None:
+    if not org.block_sync_enabled:
+        return "block sync not armed on this target"
+    if not org.org_id.strip():
+        return "no organization id configured"
+    if not org.block_sync_api_key_encrypted:
+        return "write-scoped Dashboard API key not configured"
+    return None
+
+
+async def _meraki_resolve(client: MerakiClient, networks: list, mac: str) -> tuple[str, str] | None:
+    """Find the (network_id, client_id) for a MAC across the org's appliance
+    networks. Returns None when the MAC isn't currently seen anywhere."""
+    for net in networks:
+        client_id = await client.find_client(net.id, mac)
+        if client_id is not None:
+            return net.id, client_id
+    return None
+
+
+async def preview_meraki(db: AsyncSession, org: MerakiOrg) -> TargetDiff:
+    """Compute the add/remove diff for one Meraki target (push-row driven — the
+    Dashboard has no cheap 'list blocked' read)."""
+    diff = TargetDiff(target_kind="meraki", target_id=org.id, target_name=org.name)
+    cfg_err = meraki_config_error(org)
+    if cfg_err:
+        diff.error = cfg_err
+        return diff
+
+    now = datetime.now(UTC)
+    blocks = await _load_blocks(db, "mac")
+    block_by_id = {b.id: b for b in blocks}
+    pushes = await _load_pushes(db, "meraki", org.id)
+    owned = {block_by_id[bid].value for bid in pushes if bid in block_by_id}
+
+    for b in blocks:
+        if block_is_active(b, now) and (
+            b.value not in owned or pushes[b.id].push_status != "pushed"
+        ):
+            diff.to_add.append(b.value)
+    for bid, push in pushes.items():
+        b = block_by_id.get(bid)
+        if b is None or not block_is_active(b, now):
+            diff.to_remove.append(push_value_hint(push, b))
+    return diff
+
+
+async def reconcile_meraki(db: AsyncSession, org: MerakiOrg) -> BlockSyncSummary:
+    """Push the Meraki target to match desired state: set active MAC blocks'
+    clients to the Blocked device policy and restore lifted/expired/deleted ones
+    to Normal. Commits push-row changes; the caller commits the org's timestamp
+    fields."""
+    summary = BlockSyncSummary(target_kind="meraki", target_id=org.id, target_name=org.name)
+    cfg_err = meraki_config_error(org)
+    if cfg_err:
+        summary.ok = False
+        summary.error = cfg_err
+        org.last_block_sync_error = cfg_err
+        return summary
+
+    now = datetime.now(UTC)
+    policy = org.block_policy_name.strip() or "Blocked"
+    blocks = await _load_blocks(db, "mac")
+    block_by_id = {b.id: b for b in blocks}
+    active_blocks = [b for b in blocks if block_is_active(b, now)]
+    pushes = await _load_pushes(db, "meraki", org.id)
+    added_vals: list[str] = []
+    removed_vals: list[str] = []
+
+    try:
+        async with _meraki_client(org) as client:
+            networks = await client.list_networks(list(org.network_ids or []))
+
+            # Lift — restore lifted/expired/deleted blocks to Normal.
+            for bid, push in list(pushes.items()):
+                b = block_by_id.get(bid)
+                if b is not None and block_is_active(b, now):
+                    continue
+                try:
+                    if b is not None:
+                        found = await _meraki_resolve(client, networks, b.value)
+                        if found is not None:
+                            net_id, client_id = found
+                            await client.set_client_policy(net_id, client_id, "Normal")
+                            removed_vals.append(b.value)
+                    await db.delete(push)
+                    summary.removed += 1
+                except MerakiClientError as exc:
+                    push.push_status = "error"
+                    push.last_error = str(exc)
+                    summary.errors += 1
+
+            # (Re)assert active blocks. Periodic re-assert because Meraki has no
+            # "list blocked" read (mirrors UniFi).
+            for b in active_blocks:
+                push = pushes.get(b.id)
+                is_pushed = push is not None and push.push_status == "pushed"
+                stale = (
+                    push is None
+                    or push.last_pushed_at is None
+                    or (now - push.last_pushed_at).total_seconds() >= _MERAKI_REASSERT_SECONDS
+                )
+                if is_pushed and not stale:
+                    continue
+                try:
+                    found = await _meraki_resolve(client, networks, b.value)
+                    if found is None:
+                        # The MAC isn't currently seen in any network — record a
+                        # soft error so the operator knows it's not yet enforced;
+                        # the next sweep retries (the device may reappear).
+                        _upsert_push(
+                            db,
+                            push,
+                            b.id,
+                            "meraki",
+                            org.id,
+                            now,
+                            status="error",
+                            error="client not currently seen in any org network",
+                        )
+                        summary.errors += 1
+                        continue
+                    net_id, client_id = found
+                    await client.set_client_policy(net_id, client_id, policy)
+                    _upsert_push(db, push, b.id, "meraki", org.id, now)
+                    if not is_pushed:
+                        added_vals.append(b.value)
+                        summary.added += 1
+                except MerakiClientError as exc:
+                    _upsert_push(
+                        db, push, b.id, "meraki", org.id, now, status="error", error=str(exc)
+                    )
+                    summary.errors += 1
+    except MerakiClientError as exc:
+        summary.ok = False
+        summary.error = str(exc)
+        org.last_block_sync_error = str(exc)
+        return summary
+
+    org.last_block_sync_at = now
+    org.last_block_sync_error = None if summary.errors == 0 else f"{summary.errors} push error(s)"
+    summary.ok = summary.errors == 0
+    _audit_device_push(db, "meraki", org.id, org.name, added_vals, removed_vals)
+    return summary
+
+
 # ── Shared push-row upsert ───────────────────────────────────────────
 
 
@@ -737,7 +917,7 @@ def _upsert_push(
 
 async def armed_targets(
     db: AsyncSession,
-) -> tuple[list[OPNsenseRouter], list[UnifiController], list[PANOSFirewall]]:
+) -> tuple[list[OPNsenseRouter], list[UnifiController], list[PANOSFirewall], list[MerakiOrg]]:
     routers = list(
         (
             await db.execute(
@@ -761,11 +941,18 @@ async def armed_targets(
         .scalars()
         .all()
     )
-    return routers, controllers, firewalls
+    orgs = list(
+        (await db.execute(select(MerakiOrg).where(MerakiOrg.block_sync_enabled.is_(True))))
+        .scalars()
+        .all()
+    )
+    return routers, controllers, firewalls, orgs
 
 
 async def lift_all_for_target(
-    db: AsyncSession, target_kind: str, target: OPNsenseRouter | UnifiController | PANOSFirewall
+    db: AsyncSession,
+    target_kind: str,
+    target: OPNsenseRouter | UnifiController | PANOSFirewall | MerakiOrg,
 ) -> BlockSyncSummary:
     """Remove EVERY value SpatiumDDI pushed to a target and delete its push
     rows — used when a target is disarmed (block_sync_enabled → False), so a
@@ -825,7 +1012,7 @@ async def lift_all_for_target(
                         removed_vals.append(b.value)
                     await db.delete(push)
                     summary.removed += 1
-        else:
+        elif target_kind == "paloalto":
             fw = target
             assert isinstance(fw, PANOSFirewall)
             if not fw.block_tag_name.strip() or not fw.block_sync_api_key_encrypted:
@@ -841,7 +1028,24 @@ async def lift_all_for_target(
                         removed_vals.append(b.value)
                     await db.delete(push)
                     summary.removed += 1
-    except (OPNsenseClientError, UnifiClientError, PANOSClientError) as exc:
+        else:
+            org = target
+            assert isinstance(org, MerakiOrg)
+            if not org.org_id.strip() or not org.block_sync_api_key_encrypted:
+                return summary  # no org/creds to work with; leave rows as-is
+            async with _meraki_client(org) as client:
+                networks = await client.list_networks(list(org.network_ids or []))
+                for bid, push in list(pushes.items()):
+                    b = block_by_id.get(bid)
+                    if b is not None:
+                        found = await _meraki_resolve(client, networks, b.value)
+                        if found is not None:
+                            net_id, client_id = found
+                            await client.set_client_policy(net_id, client_id, "Normal")
+                            removed_vals.append(b.value)
+                    await db.delete(push)
+                    summary.removed += 1
+    except (OPNsenseClientError, UnifiClientError, PANOSClientError, MerakiClientError) as exc:
         summary.ok = False
         summary.error = str(exc)
         target.last_block_sync_error = f"disarm-lift failed: {exc}"
@@ -854,7 +1058,7 @@ async def lift_all_for_target(
 
 async def preview_all(db: AsyncSession, *, read_device: bool = True) -> list[TargetDiff]:
     """Preview every armed target (used by the reconcile-all preview)."""
-    routers, controllers, firewalls = await armed_targets(db)
+    routers, controllers, firewalls, orgs = await armed_targets(db)
     diffs: list[TargetDiff] = []
     for r in routers:
         diffs.append(await preview_opnsense(db, r, read_device=read_device))
@@ -862,6 +1066,8 @@ async def preview_all(db: AsyncSession, *, read_device: bool = True) -> list[Tar
         diffs.append(await preview_unifi(db, c))
     for fw in firewalls:
         diffs.append(await preview_panos(db, fw, read_device=read_device))
+    for org in orgs:
+        diffs.append(await preview_meraki(db, org))
     return diffs
 
 
@@ -872,13 +1078,16 @@ __all__ = [
     "armed_targets",
     "block_is_active",
     "lift_all_for_target",
+    "meraki_config_error",
     "normalize_block_value",
     "opnsense_config_error",
     "panos_config_error",
     "preview_all",
+    "preview_meraki",
     "preview_opnsense",
     "preview_panos",
     "preview_unifi",
+    "reconcile_meraki",
     "reconcile_opnsense",
     "reconcile_panos",
     "reconcile_unifi",

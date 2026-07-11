@@ -43,6 +43,8 @@ import {
   Container as ContainerIcon,
   Cpu,
   Earth,
+  Flame,
+  Rss,
   HardDrive,
   LayoutTemplate,
   Wifi,
@@ -222,6 +224,12 @@ const toolsNav = [
     module: "security.block_sync",
   },
   { label: "CIDR Calculator", icon: Calculator, to: "/tools/cidr" },
+  {
+    label: "Firewall Feeds",
+    icon: Rss,
+    to: "/security/firewall-feeds",
+    module: "security.firewall_feeds",
+  },
   {
     label: "Network Tools",
     icon: Wrench,
@@ -633,6 +641,12 @@ export function Sidebar({
       : []),
     ...(moduleEnabled("integrations.paloalto")
       ? [{ label: "Palo Alto", icon: ShieldAlert, to: "/paloalto" }]
+      : []),
+    ...(moduleEnabled("integrations.fortinet")
+      ? [{ label: "Fortinet", icon: Flame, to: "/fortinet" }]
+      : []),
+    ...(moduleEnabled("integrations.meraki")
+      ? [{ label: "Meraki", icon: Network, to: "/meraki" }]
       : []),
     ...(moduleEnabled("integrations.netbird")
       ? [{ label: "NetBird", icon: Bird, to: "/netbird" }]

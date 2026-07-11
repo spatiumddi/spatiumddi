@@ -333,6 +333,8 @@ async def _apply_addresses(
                 or row.docker_host_id is not None
                 or row.netbird_instance_id is not None
                 or row.panos_firewall_id is not None
+                or row.fortinet_firewall_id is not None
+                or row.meraki_org_id is not None
             ):
                 summary.warnings.append(
                     f"address {row.address} owned by another integration; not claiming"

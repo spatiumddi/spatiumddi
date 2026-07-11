@@ -29,7 +29,9 @@ from app.api.deps import DB, CurrentUser  # noqa: F401
 from app.models.audit import AuditLog
 from app.models.cloud import CloudEndpoint
 from app.models.docker import DockerHost
+from app.models.fortinet import FortinetFirewall
 from app.models.kubernetes import KubernetesCluster
+from app.models.meraki import MerakiOrg
 from app.models.netbird import NetbirdInstance
 from app.models.opnsense import OPNsenseRouter
 from app.models.panos import PANOSFirewall
@@ -95,6 +97,8 @@ _INTEGRATION_RESOURCE_TYPES = (
     "opnsense_router",
     "netbird_instance",
     "panos_firewall",
+    "fortinet_firewall",
+    "meraki_org",
 )
 
 
@@ -176,6 +180,8 @@ async def integrations_summary(
     opnsense_targets = list((await db.execute(select(OPNsenseRouter))).scalars().all())
     netbird_targets = list((await db.execute(select(NetbirdInstance))).scalars().all())
     panos_targets = list((await db.execute(select(PANOSFirewall))).scalars().all())
+    fortinet_targets = list((await db.execute(select(FortinetFirewall))).scalars().all())
+    meraki_targets = list((await db.execute(select(MerakiOrg))).scalars().all())
 
     panels = [
         _build_panel(
@@ -253,10 +259,26 @@ async def integrations_summary(
             display_attr="name",
             now=now,
         ),
+        _build_panel(
+            kind="fortinet",
+            label="Fortinet (FortiGate)",
+            enabled=getattr(settings, "integration_fortinet_enabled", False),
+            targets=fortinet_targets,
+            display_attr="name",
+            now=now,
+        ),
+        _build_panel(
+            kind="meraki",
+            label="Cisco Meraki (MX)",
+            enabled=getattr(settings, "integration_meraki_enabled", False),
+            targets=meraki_targets,
+            display_attr="name",
+            now=now,
+        ),
     ]
 
     # Recent reconciler errors — one filtered audit query covers all
-    # four integrations at once.
+    # integrations at once.
     err_rows = list(
         (
             await db.execute(
