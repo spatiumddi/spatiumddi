@@ -16,6 +16,7 @@ import {
   Cpu,
   FileDown,
   FileText,
+  Flame,
   Globe,
   Globe2,
   HardDrive,
@@ -49,6 +50,8 @@ import {
   proxmoxApi,
   opnsenseApi,
   panosApi,
+  fortinetApi,
+  merakiApi,
   cloudApi,
   netbirdApi,
   tailscaleApi,
@@ -73,6 +76,8 @@ import {
   type ProxmoxNode,
   type OPNsenseRouter,
   type PANOSFirewall,
+  type FortinetFirewall,
+  type MerakiOrg,
   type CloudEndpoint,
   type NetbirdInstance,
   type TailscaleTenant,
@@ -1146,6 +1151,8 @@ export function DashboardPage() {
   const proxmoxEnabled = settings?.integration_proxmox_enabled ?? false;
   const opnsenseEnabled = settings?.integration_opnsense_enabled ?? false;
   const panosEnabled = settings?.integration_panos_enabled ?? false;
+  const fortinetEnabled = settings?.integration_fortinet_enabled ?? false;
+  const merakiEnabled = settings?.integration_meraki_enabled ?? false;
   const cloudEnabled = settings?.integration_cloud_enabled ?? false;
   const tailscaleEnabled = settings?.integration_tailscale_enabled ?? false;
   const unifiEnabled = settings?.integration_unifi_enabled ?? false;
@@ -1191,6 +1198,20 @@ export function DashboardPage() {
     queryKey: ["panos-firewalls"],
     queryFn: panosApi.list,
     enabled: panosEnabled,
+    refetchInterval: 30_000,
+  });
+
+  const { data: fortinetFirewalls = [] } = useQuery<FortinetFirewall[]>({
+    queryKey: ["fortinet-firewalls"],
+    queryFn: fortinetApi.list,
+    enabled: fortinetEnabled,
+    refetchInterval: 30_000,
+  });
+
+  const { data: merakiOrgs = [] } = useQuery<MerakiOrg[]>({
+    queryKey: ["meraki-orgs"],
+    queryFn: merakiApi.list,
+    enabled: merakiEnabled,
     refetchInterval: 30_000,
   });
 
@@ -1899,6 +1920,8 @@ export function DashboardPage() {
             proxmoxEnabled ||
             opnsenseEnabled ||
             panosEnabled ||
+            fortinetEnabled ||
+            merakiEnabled ||
             cloudEnabled ||
             tailscaleEnabled ||
             unifiEnabled ||
@@ -1916,6 +1939,8 @@ export function DashboardPage() {
                 proxmoxEnabled={proxmoxEnabled}
                 opnsenseEnabled={opnsenseEnabled}
                 panosEnabled={panosEnabled}
+                fortinetEnabled={fortinetEnabled}
+                merakiEnabled={merakiEnabled}
                 cloudEnabled={cloudEnabled}
                 tailscaleEnabled={tailscaleEnabled}
                 unifiEnabled={unifiEnabled}
@@ -1924,6 +1949,8 @@ export function DashboardPage() {
                 proxmoxNodes={proxmoxNodes}
                 opnsenseRouters={opnsenseRouters}
                 panosFirewalls={panosFirewalls}
+                fortinetFirewalls={fortinetFirewalls}
+                merakiOrgs={merakiOrgs}
                 cloudEndpoints={cloudEndpoints}
                 tailscaleTenants={tailscaleTenants}
                 unifiControllers={unifiControllers}
@@ -2327,6 +2354,8 @@ function IntegrationsPanel({
   proxmoxEnabled,
   opnsenseEnabled,
   panosEnabled,
+  fortinetEnabled,
+  merakiEnabled,
   cloudEnabled,
   tailscaleEnabled,
   unifiEnabled,
@@ -2335,6 +2364,8 @@ function IntegrationsPanel({
   proxmoxNodes,
   opnsenseRouters,
   panosFirewalls,
+  fortinetFirewalls,
+  merakiOrgs,
   cloudEndpoints,
   tailscaleTenants,
   unifiControllers,
@@ -2346,6 +2377,8 @@ function IntegrationsPanel({
   proxmoxEnabled: boolean;
   opnsenseEnabled: boolean;
   panosEnabled: boolean;
+  fortinetEnabled: boolean;
+  merakiEnabled: boolean;
   cloudEnabled: boolean;
   tailscaleEnabled: boolean;
   unifiEnabled: boolean;
@@ -2354,6 +2387,8 @@ function IntegrationsPanel({
   proxmoxNodes: ProxmoxNode[];
   opnsenseRouters: OPNsenseRouter[];
   panosFirewalls: PANOSFirewall[];
+  fortinetFirewalls: FortinetFirewall[];
+  merakiOrgs: MerakiOrg[];
   cloudEndpoints: CloudEndpoint[];
   tailscaleTenants: TailscaleTenant[];
   unifiControllers: UnifiController[];
@@ -2365,6 +2400,8 @@ function IntegrationsPanel({
   const hasProxmox = proxmoxEnabled;
   const hasOpnsense = opnsenseEnabled;
   const hasPanos = panosEnabled;
+  const hasFortinet = fortinetEnabled;
+  const hasMeraki = merakiEnabled;
   const hasCloud = cloudEnabled;
   const hasTailscale = tailscaleEnabled;
   const hasUnifi = unifiEnabled;
@@ -2375,6 +2412,8 @@ function IntegrationsPanel({
     hasProxmox,
     hasOpnsense,
     hasPanos,
+    hasFortinet,
+    hasMeraki,
     hasCloud,
     hasTailscale,
     hasUnifi,
@@ -2386,6 +2425,8 @@ function IntegrationsPanel({
     proxmoxNodes.length +
     opnsenseRouters.length +
     panosFirewalls.length +
+    fortinetFirewalls.length +
+    merakiOrgs.length +
     cloudEndpoints.length +
     tailscaleTenants.length +
     unifiControllers.length +
@@ -2415,6 +2456,8 @@ function IntegrationsPanel({
           cols === 7 && "md:grid-cols-7 md:divide-x md:divide-y-0",
           cols === 8 && "md:grid-cols-8 md:divide-x md:divide-y-0",
           cols === 9 && "md:grid-cols-9 md:divide-x md:divide-y-0",
+          cols === 10 && "md:grid-cols-10 md:divide-x md:divide-y-0",
+          cols === 11 && "md:grid-cols-11 md:divide-x md:divide-y-0",
         )}
       >
         {hasK8s && (
@@ -2623,6 +2666,94 @@ function IntegrationsPanel({
                       lastSyncError={f.last_sync_error}
                       intervalSeconds={f.sync_interval_seconds}
                       enabled={f.enabled}
+                    />
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+        {hasFortinet && (
+          <div className="min-w-0">
+            <Link
+              to="/fortinet"
+              className="flex items-center gap-1.5 bg-muted/30 px-4 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground hover:bg-muted/50"
+            >
+              <Flame className="h-3 w-3" />
+              Fortinet ({fortinetFirewalls.length})
+              <span className="ml-auto text-[10px] text-muted-foreground/70">
+                view all →
+              </span>
+            </Link>
+            {fortinetFirewalls.length === 0 ? (
+              <p className="px-4 py-3 text-[11px] italic text-muted-foreground">
+                No firewalls registered.
+              </p>
+            ) : (
+              <div className="overflow-x-auto">
+                <div className="min-w-[520px] divide-y">
+                  {fortinetFirewalls.map((f) => (
+                    <IntegrationRow
+                      key={f.id}
+                      to={`/fortinet`}
+                      name={f.name}
+                      subtitle={`${f.host}:${f.port}`}
+                      meta={
+                        f.object_count != null
+                          ? `${f.object_count} obj${f.object_count === 1 ? "" : "s"}` +
+                            (f.nat_rule_count != null
+                              ? ` · ${f.nat_rule_count} NAT`
+                              : "")
+                          : "—"
+                      }
+                      lastSyncedAt={f.last_synced_at}
+                      lastSyncError={f.last_sync_error}
+                      intervalSeconds={f.sync_interval_seconds}
+                      enabled={f.enabled}
+                    />
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+        {hasMeraki && (
+          <div className="min-w-0">
+            <Link
+              to="/meraki"
+              className="flex items-center gap-1.5 bg-muted/30 px-4 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground hover:bg-muted/50"
+            >
+              <Network className="h-3 w-3" />
+              Meraki ({merakiOrgs.length})
+              <span className="ml-auto text-[10px] text-muted-foreground/70">
+                view all →
+              </span>
+            </Link>
+            {merakiOrgs.length === 0 ? (
+              <p className="px-4 py-3 text-[11px] italic text-muted-foreground">
+                No organizations registered.
+              </p>
+            ) : (
+              <div className="overflow-x-auto">
+                <div className="min-w-[520px] divide-y">
+                  {merakiOrgs.map((o) => (
+                    <IntegrationRow
+                      key={o.id}
+                      to={`/meraki`}
+                      name={o.name}
+                      subtitle={`org ${o.org_id}`}
+                      meta={
+                        o.network_count != null
+                          ? `${o.network_count} net${o.network_count === 1 ? "" : "s"}` +
+                            (o.object_count != null
+                              ? ` · ${o.object_count} obj`
+                              : "")
+                          : "—"
+                      }
+                      lastSyncedAt={o.last_synced_at}
+                      lastSyncError={o.last_sync_error}
+                      intervalSeconds={o.sync_interval_seconds}
+                      enabled={o.enabled}
                     />
                   ))}
                 </div>

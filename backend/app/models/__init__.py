@@ -69,6 +69,8 @@ from app.models.firewall import (
     FirewallPolicy,
     FirewallRule,
 )
+from app.models.firewall_feed import FirewallFeed
+from app.models.fortinet import FortinetFirewall
 from app.models.ipam import (
     CustomFieldDefinition,
     IPAddress,
@@ -83,6 +85,7 @@ from app.models.ipam import (
 )
 from app.models.kubernetes import KubernetesCluster
 from app.models.logs import DHCPLogEntry, DNSQueryLogEntry
+from app.models.meraki import MerakiOrg
 from app.models.metrics import DHCPMetricSample, DNSMetricSample
 from app.models.multicast import (
     MulticastDomain,
@@ -224,6 +227,9 @@ __all__ = [
     "Domain",
     "KubernetesCluster",
     "FirewallObject",
+    "FirewallFeed",
+    "FortinetFirewall",
+    "MerakiOrg",
     "NetbirdInstance",
     "OPNsenseRouter",
     "PANOSFirewall",

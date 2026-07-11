@@ -24,6 +24,9 @@ import { DockerPage } from "@/pages/docker/DockerPage";
 import { ProxmoxPage } from "@/pages/proxmox/ProxmoxPage";
 import { OpnsensePage } from "@/pages/opnsense/OpnsensePage";
 import { PanosPage } from "@/pages/panos/PanosPage";
+import { FortinetPage } from "@/pages/fortinet/FortinetPage";
+import { MerakiPage } from "@/pages/meraki/MerakiPage";
+import { FirewallFeedsPage } from "@/pages/firewall_feeds/FirewallFeedsPage";
 import { CloudPage } from "@/pages/cloud/CloudPage";
 import { NetbirdPage } from "@/pages/netbird/NetbirdPage";
 import { TailscalePage } from "@/pages/tailscale/TailscalePage";
@@ -169,6 +172,7 @@ export default function App() {
         <Route path="tools/wake-schedules" element={<WakeSchedulesPage />} />
         <Route path="security/new-devices" element={<NewDevicesPage />} />
         <Route path="security/block-sync" element={<BlockSyncPage />} />
+        <Route path="security/firewall-feeds" element={<FirewallFeedsPage />} />
         <Route path="dhcp" element={<DHCPPage />} />
         <Route path="dhcp/groups/:groupId/pxe" element={<PXEProfilesPage />} />
         <Route path="logs" element={<LogsPage />} />
@@ -178,6 +182,8 @@ export default function App() {
         <Route path="proxmox" element={<ProxmoxPage />} />
         <Route path="opnsense" element={<OpnsensePage />} />
         <Route path="paloalto" element={<PanosPage />} />
+        <Route path="fortinet" element={<FortinetPage />} />
+        <Route path="meraki" element={<MerakiPage />} />
         <Route path="cloud" element={<CloudPage />} />
         <Route path="netbird" element={<NetbirdPage />} />
         <Route path="tailscale" element={<TailscalePage />} />

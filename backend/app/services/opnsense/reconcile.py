@@ -353,6 +353,8 @@ async def _apply_blocks_and_subnets(
             and s.unifi_controller_id is None
             and s.cloud_endpoint_id is None
             and s.panos_firewall_id is None
+            and s.fortinet_firewall_id is None
+            and s.meraki_org_id is None
         ):
             operator_subnets[net_key] = s
         else:
@@ -542,6 +544,8 @@ async def _apply_addresses(
                 or row.unifi_controller_id is not None
                 or row.cloud_endpoint_id is not None
                 or row.panos_firewall_id is not None
+                or row.fortinet_firewall_id is not None
+                or row.meraki_org_id is not None
             ):
                 summary.warnings.append(
                     f"address {row.address} owned by another integration; not claiming"

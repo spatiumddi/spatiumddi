@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  Network,
   RefreshCw,
   ShieldAlert,
   ShieldBan,
@@ -152,8 +153,9 @@ export function BlockSyncPage() {
           <p className="text-sm text-muted-foreground">
             SpatiumDDI-owned blocked IPs / MACs, pushed into armed OPNsense
             firewalls (alias membership), Palo Alto firewalls (Dynamic Address
-            Group tag), and UniFi controllers (L2 quarantine). Each target is
-            armed separately with distinct write credentials; every push is
+            Group tag), UniFi controllers (L2 quarantine), and Meraki
+            organizations (per-client Blocked policy). Each target is armed
+            separately with distinct write credentials; every push is
             previewable + audited.
           </p>
         </div>
@@ -207,7 +209,7 @@ export function BlockSyncPage() {
             <p className="p-8 text-center text-sm text-muted-foreground">
               {targetsQ.isLoading
                 ? "Loading…"
-                : "No OPNsense routers, Palo Alto firewalls, or UniFi controllers to arm. Add an OPNsense, Palo Alto, or UniFi integration first."}
+                : "No OPNsense routers, Palo Alto firewalls, UniFi controllers, or Meraki organizations to arm. Add an OPNsense, Palo Alto, UniFi, or Meraki integration first."}
             </p>
           ) : (
             <div className="overflow-x-auto">
@@ -242,6 +244,8 @@ export function BlockSyncPage() {
                             <Wifi className="h-3.5 w-3.5" />
                           ) : t.target_kind === "paloalto" ? (
                             <ShieldAlert className="h-3.5 w-3.5" />
+                          ) : t.target_kind === "meraki" ? (
+                            <Network className="h-3.5 w-3.5" />
                           ) : (
                             <ShieldCheck className="h-3.5 w-3.5" />
                           )}
@@ -249,7 +253,9 @@ export function BlockSyncPage() {
                             ? "UniFi"
                             : t.target_kind === "paloalto"
                               ? "Palo Alto"
-                              : "OPNsense"}
+                              : t.target_kind === "meraki"
+                                ? "Meraki"
+                                : "OPNsense"}
                         </span>
                       </td>
                       <td className="px-3 py-2">
@@ -268,7 +274,9 @@ export function BlockSyncPage() {
                           ? t.block_alias_name || "—"
                           : t.target_kind === "paloalto"
                             ? t.block_tag_name || "—"
-                            : t.block_sync_site || "—"}
+                            : t.target_kind === "meraki"
+                              ? t.block_policy_name || "—"
+                              : t.block_sync_site || "—"}
                       </td>
                       <td className="px-3 py-2">
                         {t.write_credentials_present ? (
@@ -535,6 +543,7 @@ function ArmTargetModal({
 }) {
   const isUnifi = target.target_kind === "unifi";
   const isPaloalto = target.target_kind === "paloalto";
+  const isMeraki = target.target_kind === "meraki";
   // A Panorama target can't drive Dynamic Address Group enforcement — that
   // needs a standalone firewall with a vsys. The backend 422s the arm call;
   // gate the UI so operators don't hit it.
@@ -548,6 +557,11 @@ function ArmTargetModal({
   // Palo Alto PAN-OS
   const [tagName, setTagName] = useState(target.block_tag_name ?? "");
   const [panosApiKey, setPanosApiKey] = useState("");
+  // Meraki
+  const [policyName, setPolicyName] = useState(
+    target.block_policy_name ?? "Blocked",
+  );
+  const [merakiApiKey, setMerakiApiKey] = useState("");
   // UniFi
   const [site, setSite] = useState(target.block_sync_site ?? "default");
   const [authKind, setAuthKind] = useState<BlockUnifiAuthKind>(
@@ -585,6 +599,13 @@ function ArmTargetModal({
           block_sync_api_key: panosApiKey.trim() || undefined,
         });
       }
+      if (isMeraki) {
+        return blockSyncApi.armMeraki(target.target_id, {
+          block_sync_enabled: enabled,
+          block_policy_name: policyName.trim() || "Blocked",
+          block_sync_api_key: merakiApiKey.trim() || undefined,
+        });
+      }
       return blockSyncApi.armOpnsense(target.target_id, {
         block_sync_enabled: enabled,
         block_alias_name: alias.trim(),
@@ -603,7 +624,13 @@ function ArmTargetModal({
   return (
     <Modal
       title={`Arm ${
-        isUnifi ? "UniFi" : isPaloalto ? "Palo Alto" : "OPNsense"
+        isUnifi
+          ? "UniFi"
+          : isPaloalto
+            ? "Palo Alto"
+            : isMeraki
+              ? "Meraki"
+              : "OPNsense"
       } · ${target.name}`}
       onClose={onClose}
       wide
@@ -730,6 +757,32 @@ function ArmTargetModal({
                   target.write_credentials_present ? "•••••• (unchanged)" : ""
                 }
                 disabled={isPanoramaTarget}
+              />
+            </Field>
+          </>
+        ) : isMeraki ? (
+          <>
+            <Field
+              label="Block policy name"
+              hint="The per-client group policy SpatiumDDI applies to blocked MACs. Defaults to Meraki's built-in Blocked policy."
+            >
+              <input
+                className={`${inputCls} font-mono`}
+                value={policyName}
+                onChange={(e) => setPolicyName(e.target.value)}
+                placeholder="Blocked"
+              />
+            </Field>
+            <Field label="API key" hint={credsHint}>
+              <input
+                className={`${inputCls} font-mono`}
+                type="password"
+                autoComplete="new-password"
+                value={merakiApiKey}
+                onChange={(e) => setMerakiApiKey(e.target.value)}
+                placeholder={
+                  target.write_credentials_present ? "•••••• (unchanged)" : ""
+                }
               />
             </Field>
           </>

@@ -3254,6 +3254,8 @@ export interface PlatformSettings {
   integration_cloud_enabled: boolean;
   integration_opnsense_enabled: boolean;
   integration_panos_enabled: boolean;
+  integration_fortinet_enabled: boolean;
+  integration_meraki_enabled: boolean;
   integration_netbird_enabled: boolean;
   /** Domain WHOIS refresh cadence (hours). Beat ticks hourly; the
    *  task itself reads this on every fire so cadence changes take
@@ -8293,6 +8295,8 @@ export type IntegrationDashboardKind =
   | "cloud"
   | "opnsense"
   | "paloalto"
+  | "fortinet"
+  | "meraki"
   | "netbird";
 export interface IntegrationsDashboardTargetRow {
   id: string;
@@ -11402,6 +11406,293 @@ export const panosApi = {
   }) =>
     api
       .post<PANOSTestResult>("/paloalto/firewalls/test", body)
+      .then((r) => r.data),
+};
+
+// ── Fortinet integration (issue #606) ──────────────────────────────
+// FirewallObject + PANOSDrift are shared shapes reused across the
+// firewall-family integrations (Palo Alto / Fortinet / Meraki).
+
+export interface FortinetFirewall {
+  id: string;
+  name: string;
+  description: string;
+  enabled: boolean;
+  host: string;
+  port: number;
+  verify_tls: boolean;
+  ca_bundle_present: boolean;
+  vdom: string;
+  api_token_present: boolean;
+  ipam_space_id: string;
+  dns_group_id: string | null;
+  mirror_address_objects: boolean;
+  mirror_nat_rules: boolean;
+  mirror_interfaces: boolean;
+  mirror_dhcp_leases: boolean;
+  sync_interval_seconds: number;
+  last_synced_at: string | null;
+  last_sync_error: string | null;
+  sw_version: string | null;
+  model: string | null;
+  object_count: number | null;
+  nat_rule_count: number | null;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface FortinetFirewallCreate {
+  name: string;
+  description?: string;
+  enabled?: boolean;
+  host: string;
+  port?: number;
+  verify_tls?: boolean;
+  ca_bundle_pem?: string;
+  vdom?: string;
+  api_token: string;
+  ipam_space_id: string;
+  dns_group_id?: string | null;
+  mirror_address_objects?: boolean;
+  mirror_nat_rules?: boolean;
+  mirror_interfaces?: boolean;
+  mirror_dhcp_leases?: boolean;
+  sync_interval_seconds?: number;
+}
+
+export interface FortinetFirewallUpdate {
+  name?: string;
+  description?: string;
+  enabled?: boolean;
+  host?: string;
+  port?: number;
+  verify_tls?: boolean;
+  ca_bundle_pem?: string;
+  vdom?: string;
+  api_token?: string;
+  ipam_space_id?: string;
+  dns_group_id?: string | null;
+  mirror_address_objects?: boolean;
+  mirror_nat_rules?: boolean;
+  mirror_interfaces?: boolean;
+  mirror_dhcp_leases?: boolean;
+  sync_interval_seconds?: number;
+}
+
+export interface FortinetTestResult {
+  ok: boolean;
+  message: string;
+  sw_version?: string | null;
+  model?: string | null;
+}
+
+export const fortinetApi = {
+  list: () =>
+    api.get<FortinetFirewall[]>("/fortinet/firewalls").then((r) => r.data),
+  create: (data: FortinetFirewallCreate) =>
+    api.post<FortinetFirewall>("/fortinet/firewalls", data).then((r) => r.data),
+  update: (id: string, data: FortinetFirewallUpdate) =>
+    api
+      .put<FortinetFirewall>(`/fortinet/firewalls/${id}`, data)
+      .then((r) => r.data),
+  remove: (id: string) => api.delete(`/fortinet/firewalls/${id}`),
+  sync: (id: string) =>
+    api
+      .post<{
+        status: string;
+        task_id: string;
+      }>(`/fortinet/firewalls/${id}/sync`)
+      .then((r) => r.data),
+  listObjects: (id: string) =>
+    api
+      .get<FirewallObject[]>(`/fortinet/firewalls/${id}/objects`)
+      .then((r) => r.data),
+  drift: (id: string) =>
+    api.get<PANOSDrift>(`/fortinet/firewalls/${id}/drift`).then((r) => r.data),
+  test: (body: {
+    firewall_id?: string;
+    host?: string;
+    port?: number;
+    verify_tls?: boolean;
+    ca_bundle_pem?: string;
+    vdom?: string;
+    api_token?: string;
+  }) =>
+    api
+      .post<FortinetTestResult>("/fortinet/firewalls/test", body)
+      .then((r) => r.data),
+};
+
+// ── Meraki integration (issue #606) ────────────────────────────────
+// Cloud dashboard — no host/port; an org_id string + optional
+// network-id allow-list. Per-client Blocked enforcement is armed on
+// the Active block sync page (a mac target).
+
+export interface MerakiOrg {
+  id: string;
+  name: string;
+  description: string;
+  enabled: boolean;
+  base_url: string;
+  org_id: string;
+  network_ids: string[];
+  api_key_present: boolean;
+  ipam_space_id: string;
+  dns_group_id: string | null;
+  mirror_policy_objects: boolean;
+  mirror_vlans: boolean;
+  mirror_dhcp_reservations: boolean;
+  mirror_nat_rules: boolean;
+  mirror_clients: boolean;
+  sync_interval_seconds: number;
+  block_sync_enabled: boolean;
+  block_policy_name: string;
+  last_block_sync_at: string | null;
+  last_block_sync_error: string | null;
+  last_synced_at: string | null;
+  last_sync_error: string | null;
+  network_count: number | null;
+  object_count: number | null;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface MerakiOrgCreate {
+  name: string;
+  description?: string;
+  enabled?: boolean;
+  base_url?: string;
+  org_id: string;
+  network_ids?: string[];
+  api_key: string;
+  ipam_space_id: string;
+  dns_group_id?: string | null;
+  mirror_policy_objects?: boolean;
+  mirror_vlans?: boolean;
+  mirror_dhcp_reservations?: boolean;
+  mirror_nat_rules?: boolean;
+  mirror_clients?: boolean;
+  sync_interval_seconds?: number;
+}
+
+export interface MerakiOrgUpdate {
+  name?: string;
+  description?: string;
+  enabled?: boolean;
+  base_url?: string;
+  org_id?: string;
+  network_ids?: string[];
+  api_key?: string;
+  ipam_space_id?: string;
+  dns_group_id?: string | null;
+  mirror_policy_objects?: boolean;
+  mirror_vlans?: boolean;
+  mirror_dhcp_reservations?: boolean;
+  mirror_nat_rules?: boolean;
+  mirror_clients?: boolean;
+  sync_interval_seconds?: number;
+}
+
+export interface MerakiTestResult {
+  ok: boolean;
+  message: string;
+  org_name?: string | null;
+  network_count?: number | null;
+}
+
+export const merakiApi = {
+  list: () => api.get<MerakiOrg[]>("/meraki/orgs").then((r) => r.data),
+  create: (data: MerakiOrgCreate) =>
+    api.post<MerakiOrg>("/meraki/orgs", data).then((r) => r.data),
+  update: (id: string, data: MerakiOrgUpdate) =>
+    api.put<MerakiOrg>(`/meraki/orgs/${id}`, data).then((r) => r.data),
+  remove: (id: string) => api.delete(`/meraki/orgs/${id}`),
+  sync: (id: string) =>
+    api
+      .post<{
+        status: string;
+        task_id: string;
+      }>(`/meraki/orgs/${id}/sync`)
+      .then((r) => r.data),
+  listObjects: (id: string) =>
+    api.get<FirewallObject[]>(`/meraki/orgs/${id}/objects`).then((r) => r.data),
+  drift: (id: string) =>
+    api.get<PANOSDrift>(`/meraki/orgs/${id}/drift`).then((r) => r.data),
+  test: (body: {
+    org_id_pk?: string;
+    base_url?: string;
+    org_id?: string;
+    api_key?: string;
+  }) =>
+    api.post<MerakiTestResult>("/meraki/orgs/test", body).then((r) => r.data),
+};
+
+// ── Firewall block-list feeds (issue #606) ─────────────────────────
+// The feed-inversion path — SpatiumDDI serves a token-guarded plain-
+// text blocklist that a FortiGate External Threat Feed (or a Cisco SI
+// feed) polls. Credential-free enforcement: no write access to the
+// device is required.
+
+export interface FirewallFeed {
+  id: string;
+  name: string;
+  description: string;
+  enabled: boolean;
+  kind: string;
+  poll_path: string;
+  last_polled_at: string | null;
+  last_polled_ip: string | null;
+  poll_count: number;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface FirewallFeedCreate {
+  name: string;
+  description?: string;
+  enabled?: boolean;
+  kind?: string;
+}
+
+export interface FirewallFeedCreateResult {
+  feed: FirewallFeed;
+  token: string;
+  poll_path: string;
+}
+
+export interface FirewallFeedUpdate {
+  name?: string;
+  description?: string;
+  enabled?: boolean;
+}
+
+export interface FirewallFeedTokenResult {
+  token: string;
+  poll_path: string;
+}
+
+export const firewallFeedsApi = {
+  list: () =>
+    api.get<FirewallFeed[]>("/firewall-feeds/feeds").then((r) => r.data),
+  create: (data: FirewallFeedCreate) =>
+    api
+      .post<FirewallFeedCreateResult>("/firewall-feeds/feeds", data)
+      .then((r) => r.data),
+  update: (id: string, data: FirewallFeedUpdate) =>
+    api
+      .put<FirewallFeed>(`/firewall-feeds/feeds/${id}`, data)
+      .then((r) => r.data),
+  remove: (id: string) => api.delete(`/firewall-feeds/feeds/${id}`),
+  reveal: (id: string, password?: string, totpCode?: string) =>
+    api
+      .post<FirewallFeedTokenResult>(`/firewall-feeds/feeds/${id}/reveal`, {
+        password,
+        totp_code: totpCode,
+      })
+      .then((r) => r.data),
+  rotateToken: (id: string) =>
+    api
+      .post<FirewallFeedTokenResult>(`/firewall-feeds/feeds/${id}/rotate-token`)
       .then((r) => r.data),
 };
 
@@ -15935,7 +16226,7 @@ export const wakeSchedulesApi = {
 
 export type BlockKind = "ip" | "mac";
 export type BlockSource = "manual" | "new_device" | "rogue_dhcp";
-export type BlockTargetKind = "opnsense" | "unifi" | "paloalto";
+export type BlockTargetKind = "opnsense" | "unifi" | "paloalto" | "meraki";
 export type BlockPushStatus = "pending" | "pushed" | "removing" | "error";
 export type BlockUnifiAuthKind = "api_key" | "user_password";
 
@@ -15993,6 +16284,8 @@ export interface BlockTarget {
   // Palo Alto PAN-OS-only — a Panorama target cannot be armed (DAG enforcement
   // needs a standalone firewall with a vsys); the backend 422s the arm call.
   is_panorama?: boolean;
+  // Meraki-only — the per-client policy name SpatiumDDI applies (Blocked).
+  block_policy_name?: string | null;
   // UniFi-only
   block_sync_site?: string | null;
   block_sync_auth_kind?: string | null;
@@ -16012,6 +16305,13 @@ export interface BlockOpnsenseArm {
 export interface BlockPaloaltoArm {
   block_sync_enabled?: boolean;
   block_tag_name?: string;
+  // Omit / empty keeps the stored key; non-empty rotates it.
+  block_sync_api_key?: string;
+}
+
+export interface BlockMerakiArm {
+  block_sync_enabled?: boolean;
+  block_policy_name?: string;
   // Omit / empty keeps the stored key; non-empty rotates it.
   block_sync_api_key?: string;
 }
@@ -16061,6 +16361,10 @@ export const blockSyncApi = {
   armPaloalto: (id: string, data: BlockPaloaltoArm) =>
     api
       .put<BlockTarget>(`/block-sync/targets/paloalto/${id}`, data)
+      .then((r) => r.data),
+  armMeraki: (id: string, data: BlockMerakiArm) =>
+    api
+      .put<BlockTarget>(`/block-sync/targets/meraki/${id}`, data)
       .then((r) => r.data),
   // ``preview=true`` reads the device + returns the diff without pushing;
   // ``preview=false`` enqueues a converge.

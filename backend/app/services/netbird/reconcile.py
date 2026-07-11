@@ -61,6 +61,8 @@ _OTHER_INTEGRATION_FKS = (
     "cloud_endpoint_id",
     "opnsense_router_id",
     "panos_firewall_id",
+    "fortinet_firewall_id",
+    "meraki_org_id",
 )
 
 

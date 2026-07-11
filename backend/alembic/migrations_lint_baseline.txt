@@ -144,6 +144,16 @@ backend/alembic/versions/a7b3c8d92e14_account_lockout.py:drop_column:91
 backend/alembic/versions/a7b3c8d92e14_account_lockout.py:drop_column:92
 backend/alembic/versions/a7b3c8d92e14_account_lockout.py:drop_column:93
 backend/alembic/versions/a7b3c8d92e14_account_lockout.py:drop_column:94
+backend/alembic/versions/a7c3e91f4d28_fortinet_meraki_firewall_feeds.py:alter_column_not_null:333
+backend/alembic/versions/a7c3e91f4d28_fortinet_meraki_firewall_feeds.py:drop_column:305
+backend/alembic/versions/a7c3e91f4d28_fortinet_meraki_firewall_feeds.py:drop_column:306
+backend/alembic/versions/a7c3e91f4d28_fortinet_meraki_firewall_feeds.py:drop_column:311
+backend/alembic/versions/a7c3e91f4d28_fortinet_meraki_firewall_feeds.py:drop_column:312
+backend/alembic/versions/a7c3e91f4d28_fortinet_meraki_firewall_feeds.py:drop_column:327
+backend/alembic/versions/a7c3e91f4d28_fortinet_meraki_firewall_feeds.py:drop_column:328
+backend/alembic/versions/a7c3e91f4d28_fortinet_meraki_firewall_feeds.py:drop_table:336
+backend/alembic/versions/a7c3e91f4d28_fortinet_meraki_firewall_feeds.py:drop_table:338
+backend/alembic/versions/a7c3e91f4d28_fortinet_meraki_firewall_feeds.py:drop_table:340
 backend/alembic/versions/a7c3e9f1b405_console_mode.py:drop_column:48
 backend/alembic/versions/a7c3e9f1b405_console_mode.py:drop_column:65
 backend/alembic/versions/a7e3c1f49d20_subnet_ip_discovery.py:drop_column:54
