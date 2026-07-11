@@ -213,27 +213,28 @@ const networkInfrastructureNav = [
   },
 ];
 
+// Keep this list alphabetised by label.
 const toolsNav = [
-  { label: "CIDR Calculator", icon: Calculator, to: "/tools/cidr" },
-  {
-    label: "New Devices",
-    icon: ShieldQuestion,
-    to: "/security/new-devices",
-    module: "security.new_device_watch",
-  },
   {
     label: "Block Sync",
     icon: ShieldBan,
     to: "/security/block-sync",
     module: "security.block_sync",
   },
-  { label: "Nmap", icon: Search, to: "/tools/nmap", module: "tools.nmap" },
+  { label: "CIDR Calculator", icon: Calculator, to: "/tools/cidr" },
   {
     label: "Network Tools",
     icon: Wrench,
     to: "/tools/network",
     module: "tools.network",
   },
+  {
+    label: "New Devices",
+    icon: ShieldQuestion,
+    to: "/security/new-devices",
+    module: "security.new_device_watch",
+  },
+  { label: "Nmap", icon: Search, to: "/tools/nmap", module: "tools.nmap" },
   {
     label: "Packet Capture",
     icon: Activity,
