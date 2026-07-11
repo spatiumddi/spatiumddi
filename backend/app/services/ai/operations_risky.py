@@ -1092,8 +1092,8 @@ async def _apply_create_network_block(
         for target_kind, target_id in targets:
             try:
                 reconcile_target_now.delay(target_kind, str(target_id))
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception:  # noqa: BLE001 — broker unavailable; the 60 s
+                pass  # sweep converges this target, so a lost enqueue is safe
     except Exception:  # noqa: BLE001 — task import/broker issues never fail the write
         pass
 

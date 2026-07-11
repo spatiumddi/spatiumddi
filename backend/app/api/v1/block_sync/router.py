@@ -292,8 +292,8 @@ def _enqueue_lift(targets: list[tuple[str, uuid.UUID]]) -> None:
     for target_kind, target_id in targets:
         try:
             lift_target_now.delay(target_kind, str(target_id))
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception:  # noqa: BLE001 — broker down; the target is disarmed
+            pass  # so no sweep re-pushes; stale device state surfaces on next run
 
 
 # ── Block endpoints ──────────────────────────────────────────────────
