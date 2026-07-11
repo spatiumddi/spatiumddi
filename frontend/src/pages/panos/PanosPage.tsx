@@ -1045,7 +1045,12 @@ function FirewallModal({
           </button>
           <button
             type="submit"
-            disabled={saveMut.isPending}
+            // A new firewall always needs a resolved API key. In keygen mode
+            // `apiKey` stays empty until Test Connection mints it (and flips
+            // authMode back to "api_key"), so this also forces a successful
+            // Test before Create. Editing leaves the key blank to keep the
+            // stored one, so no gate there.
+            disabled={saveMut.isPending || (!editing && !apiKey)}
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             {saveMut.isPending ? "Saving…" : editing ? "Save" : "Create"}

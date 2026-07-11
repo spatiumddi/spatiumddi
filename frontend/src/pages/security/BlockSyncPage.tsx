@@ -152,9 +152,9 @@ export function BlockSyncPage() {
           <p className="text-sm text-muted-foreground">
             SpatiumDDI-owned blocked IPs / MACs, pushed into armed OPNsense
             firewalls (alias membership), Palo Alto firewalls (Dynamic Address
-            Group tag), and UniFi controllers (L2 quarantine).
-            Each target is armed separately with distinct write credentials;
-            every push is previewable + audited.
+            Group tag), and UniFi controllers (L2 quarantine). Each target is
+            armed separately with distinct write credentials; every push is
+            previewable + audited.
           </p>
         </div>
         <HeaderButton
@@ -715,7 +715,7 @@ function ArmTargetModal({
                 className={`${inputCls} font-mono`}
                 value={tagName}
                 onChange={(e) => setTagName(e.target.value)}
-                placeholder="spatium_blocklist"
+                placeholder="spatiumddi-quarantine"
                 disabled={isPanoramaTarget}
               />
             </Field>

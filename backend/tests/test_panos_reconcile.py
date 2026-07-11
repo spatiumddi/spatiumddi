@@ -264,6 +264,70 @@ async def test_interfaces_and_leases_mirrored(db_session: AsyncSession) -> None:
     assert lease.status == "dhcp"
 
 
+@pytest.mark.asyncio
+async def test_interfaces_multi_range_get_containing_wrappers(
+    db_session: AsyncSession,
+) -> None:
+    """Each mirrored subnet must be parented on a block that contains it — a
+    single shared wrapper would strand the 192.168 subnet under a 10.x block."""
+    from app.models.ipam import IPBlock
+
+    space = await _make_space(db_session)
+    fw = await _make_fw(db_session, space, mirror_interfaces=True)
+    await db_session.commit()
+
+    fake = _FakeClient(
+        interfaces=[
+            _PANInterface(name="e1/1", cidr="10.1.0.0/24", address="10.1.0.1", zone="trust"),
+            _PANInterface(name="e1/2", cidr="192.168.5.0/24", address="192.168.5.1", zone="dmz"),
+        ],
+    )
+    with _patch_client(fake):
+        summary = await reconcile_firewall(db_session, fw)
+
+    assert summary.ok, summary.error
+    assert summary.subnets_created == 2
+    subs = (
+        (await db_session.execute(select(Subnet).where(Subnet.panos_firewall_id == fw.id)))
+        .scalars()
+        .all()
+    )
+    import ipaddress as _ip
+
+    for s in subs:
+        block = await db_session.get(IPBlock, s.block_id)
+        assert block is not None
+        # The parent block's network must contain the subnet's network.
+        assert _ip.ip_network(str(s.network)).subnet_of(_ip.ip_network(str(block.network)))
+
+
+@pytest.mark.asyncio
+async def test_mirror_toggle_off_sweeps_previous_rows(db_session: AsyncSession) -> None:
+    """Disabling a mirror toggle must clean up rows a prior enabled sync made,
+    not strand them."""
+    space = await _make_space(db_session)
+    fw = await _make_fw(db_session, space)
+    await db_session.commit()
+
+    with _patch_client(
+        _FakeClient(objects=[_PANAddressObject("a", "host", "10.0.0.1/32", "", [])])
+    ):
+        await reconcile_firewall(db_session, fw)
+    assert (
+        await db_session.scalar(select(FirewallObject).where(FirewallObject.name == "a"))
+    ) is not None
+
+    # Operator turns the address-object mirror off; the row must be swept.
+    fw.mirror_address_objects = False
+    await db_session.commit()
+    with _patch_client(_FakeClient()):
+        summary = await reconcile_firewall(db_session, fw)
+    assert summary.objects_deleted == 1
+    assert (
+        await db_session.scalar(select(FirewallObject).where(FirewallObject.name == "a"))
+    ) is None
+
+
 # ── Enforcement tests ────────────────────────────────────────────────
 
 

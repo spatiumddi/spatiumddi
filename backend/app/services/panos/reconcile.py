@@ -46,12 +46,6 @@ from app.services.panos.client import (
 
 logger = structlog.get_logger(__name__)
 
-_PRIVATE_SUPERNETS = [
-    ipaddress.ip_network("10.0.0.0/8"),
-    ipaddress.ip_network("172.16.0.0/12"),
-    ipaddress.ip_network("192.168.0.0/16"),
-    ipaddress.ip_network("100.64.0.0/10"),
-]
 _BIGINT_MAX = 2**63 - 1
 
 # Sibling integration provenance columns — a row carrying any of these is
@@ -104,16 +98,6 @@ def _parse_net(value: str) -> ipaddress.IPv4Network | ipaddress.IPv6Network | No
         return None
 
 
-def _private_supernet_of(cidr: str) -> str | None:
-    net = _parse_net(cidr)
-    if net is None or not isinstance(net, ipaddress.IPv4Network):
-        return None
-    for parent in _PRIVATE_SUPERNETS:
-        if net.subnet_of(parent) and net.prefixlen > parent.prefixlen:  # type: ignore[arg-type]
-            return str(parent)
-    return None
-
-
 def _lan_total_ips(net: ipaddress.IPv4Network | ipaddress.IPv6Network) -> int:
     if isinstance(net, ipaddress.IPv6Network):
         return min(net.num_addresses, _BIGINT_MAX)
@@ -125,36 +109,47 @@ def _lan_total_ips(net: ipaddress.IPv4Network | ipaddress.IPv6Network) -> int:
 # ── FirewallObject mirror ────────────────────────────────────────────
 
 
-async def _resolve_object_links(
-    db: AsyncSession, fw: PANOSFirewall, kind: str, resolved_cidr: str | None
+async def _load_ipam_resolve_maps(
+    db: AsyncSession, fw: PANOSFirewall
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Preload the in-space host→ip_id and cidr→subnet_id maps in two queries so
+    the per-object drift resolve is a dict lookup, not an N+1 SELECT storm."""
+    ip_rows = (
+        await db.execute(
+            select(IPAddress.id, IPAddress.address)
+            .join(Subnet, IPAddress.subnet_id == Subnet.id)
+            .where(Subnet.space_id == fw.ipam_space_id)
+        )
+    ).all()
+    ip_by_host = {str(addr): rid for rid, addr in ip_rows}
+    subnet_rows = (
+        await db.execute(
+            select(Subnet.id, Subnet.network).where(Subnet.space_id == fw.ipam_space_id)
+        )
+    ).all()
+    subnet_by_cidr = {str(net): sid for sid, net in subnet_rows}
+    return ip_by_host, subnet_by_cidr
+
+
+def _resolve_object_links(
+    resolved_cidr: str | None,
+    ip_by_host: dict[str, Any],
+    subnet_by_cidr: dict[str, Any],
 ) -> tuple[Any, Any]:
-    """Best-effort link a mirrored object to a live IPAM row in the bound
-    space. Returns ``(ip_address_id, subnet_id)`` — either/both may be None."""
+    """Best-effort link a mirrored object to a live IPAM row using the preloaded
+    maps. Returns ``(ip_address_id, subnet_id)`` — either/both may be None."""
     if not resolved_cidr:
         return None, None
     net = _parse_net(resolved_cidr)
     if net is None:
         return None, None
-    # A /32 (or /128) host object → try to find the exact IPAddress in-space.
+    # A /32 (or /128) host object → the exact in-space IPAddress, if any.
     if net.prefixlen in (32, 128):
-        host = str(net.network_address)
-        ip_row = await db.scalar(
-            select(IPAddress.id)
-            .join(Subnet, IPAddress.subnet_id == Subnet.id)
-            .where(Subnet.space_id == fw.ipam_space_id)
-            .where(IPAddress.address == host)
-            .limit(1)
-        )
-        if ip_row is not None:
-            return ip_row, None
-    # Otherwise (or if no host match) → try an exact-CIDR subnet match.
-    subnet_row = await db.scalar(
-        select(Subnet.id)
-        .where(Subnet.space_id == fw.ipam_space_id)
-        .where(Subnet.network == str(net))
-        .limit(1)
-    )
-    return None, subnet_row
+        ip_id = ip_by_host.get(str(net.network_address))
+        if ip_id is not None:
+            return ip_id, None
+    # Otherwise (or if no host match) → an exact-CIDR subnet match.
+    return None, subnet_by_cidr.get(str(net))
 
 
 async def _apply_objects(
@@ -176,10 +171,11 @@ async def _apply_objects(
             await db.delete(row)
             summary.objects_deleted += 1
 
+    ip_by_host, subnet_by_cidr = await _load_ipam_resolve_maps(db, fw) if desired_map else ({}, {})
     for name, d in desired_map.items():
         kind = d.kind if d.kind in FIREWALL_OBJECT_KINDS else "host"
         resolved = resolved_cidr_for(kind, d.value)
-        ip_id, subnet_id = await _resolve_object_links(db, fw, kind, resolved)
+        ip_id, subnet_id = _resolve_object_links(resolved, ip_by_host, subnet_by_cidr)
         row = existing.get(name)
         if row is None:
             db.add(
@@ -264,6 +260,15 @@ async def _apply_nat(
 
     for name, d in desired_map.items():
         internal, external = _nat_ips(d)
+        # A rule whose endpoints are named objects / 'any' resolves to no bare
+        # IPs — a content-free nat_mapping row. Don't mirror it; drop the row if
+        # a previous sync created one when the rule still had a literal IP.
+        if internal is None and external is None:
+            row = existing.get(name)
+            if row is not None:
+                await db.delete(row)
+                summary.nat_deleted += 1
+            continue
         description = d.description or f"PAN-OS NAT rule on {fw.name}"
         row = existing.get(name)
         if row is None:
@@ -332,14 +337,35 @@ async def _recompute_subnet_utilization(db: AsyncSession, subnet_id: Any) -> Non
     )
 
 
+def _find_enclosing_operator_block(blocks: list[IPBlock], cidr: str) -> IPBlock | None:
+    """The tightest unowned (operator) block that contains ``cidr`` — used as the
+    subnet's parent so we don't create a redundant wrapper. Same shape as the
+    OPNsense reconciler's lookup."""
+    net = _parse_net(cidr)
+    if net is None:
+        return None
+    best: IPBlock | None = None
+    best_prefix = -1
+    for b in blocks:
+        bnet = _parse_net(str(b.network))
+        if bnet is None or type(bnet) is not type(net):
+            continue
+        if net.subnet_of(bnet) and bnet.prefixlen > best_prefix:  # type: ignore[arg-type]
+            best, best_prefix = b, bnet.prefixlen
+    return best
+
+
 async def _apply_interfaces(
     db: AsyncSession,
     fw: PANOSFirewall,
     interfaces: list[_PANInterface],
     summary: ReconcileSummary,
 ) -> None:
-    """Mirror interface CIDRs as PAN-owned subnets under an auto-created
-    wrapper block. Operator/foreign subnets at the same CIDR are reused/left."""
+    """Mirror interface CIDRs as PAN-owned subnets. Each subnet is parented on
+    the tightest enclosing operator block, or — failing that — a per-CIDR wrapper
+    block (``network == cidr``) so the parent always contains the subnet. A
+    single shared wrapper would strand subnets in unrelated ranges under a
+    wrong-CIDR parent (e.g. a 192.168.x subnet under a 10.0.0.0/8 wrapper)."""
     all_subnets = (
         (await db.execute(select(Subnet).where(Subnet.space_id == fw.ipam_space_id)))
         .scalars()
@@ -364,13 +390,19 @@ async def _apply_interfaces(
         if iface.cidr not in desired:
             desired[iface.cidr] = iface
 
-    # Ensure a wrapper block exists for PAN-owned subnets.
-    blocks = (
+    blocks = list(
         (await db.execute(select(IPBlock).where(IPBlock.space_id == fw.ipam_space_id)))
         .scalars()
         .all()
     )
-    wrapper = next((b for b in blocks if b.panos_firewall_id == fw.id), None)
+    operator_blocks = [
+        b
+        for b in blocks
+        if b.panos_firewall_id is None
+        and all(getattr(b, fk) is None for fk in _OTHER_INTEGRATION_FKS)
+    ]
+    # One wrapper block per CIDR, keyed by network — never a single shared one.
+    fw_wrappers = {str(b.network): b for b in blocks if b.panos_firewall_id == fw.id}
 
     # Delete PAN-owned subnets no longer present (un-claim if foreign IPs live in).
     for cidr, row in list(fw_subnets.items()):
@@ -389,6 +421,7 @@ async def _apply_interfaces(
             await db.delete(row)
             summary.subnets_deleted += 1
 
+    used_wrapper_cidrs: set[str] = set()
     for cidr, iface in desired.items():
         if cidr in operator_subnets:
             summary.subnets_matched += 1
@@ -398,18 +431,25 @@ async def _apply_interfaces(
                 f"subnet {cidr} already exists, owned by another integration; not duplicating"
             )
             continue
-        if wrapper is None:
-            supernet = _private_supernet_of(cidr) or cidr
-            wrapper = IPBlock(
-                space_id=fw.ipam_space_id,
-                network=supernet,
-                name=f"{fw.name} {supernet}",
-                description=f"Auto-created for Palo Alto firewall {fw.name}",
-                panos_firewall_id=fw.id,
-            )
-            db.add(wrapper)
-            await db.flush()
-            summary.blocks_created += 1
+
+        parent = _find_enclosing_operator_block(operator_blocks, cidr)
+        if parent is None:
+            wrapper = fw_wrappers.get(cidr)
+            if wrapper is None:
+                wrapper = IPBlock(
+                    space_id=fw.ipam_space_id,
+                    network=cidr,
+                    name=f"{fw.name} {cidr}",
+                    description=f"Auto-created for Palo Alto firewall {fw.name}",
+                    panos_firewall_id=fw.id,
+                )
+                db.add(wrapper)
+                await db.flush()
+                fw_wrappers[cidr] = wrapper
+                summary.blocks_created += 1
+            used_wrapper_cidrs.add(cidr)
+            parent = wrapper
+
         net = _parse_net(cidr)
         total = _lan_total_ips(net) if net is not None else 0
         existing = fw_subnets.get(cidr)
@@ -419,7 +459,7 @@ async def _apply_interfaces(
             db.add(
                 Subnet(
                     space_id=fw.ipam_space_id,
-                    block_id=wrapper.id,
+                    block_id=parent.id,
                     network=cidr,
                     name=name,
                     description=desc,
@@ -431,6 +471,8 @@ async def _apply_interfaces(
             summary.subnets_created += 1
         else:
             changed = False
+            if existing.block_id != parent.id:
+                existing.block_id, changed = parent.id, True
             if existing.name != name:
                 existing.name, changed = name, True
             if existing.description != desc:
@@ -443,12 +485,14 @@ async def _apply_interfaces(
                 summary.subnets_updated += 1
     await db.flush()
 
-    # Drop the wrapper block if it now has no subnets.
-    if wrapper is not None:
+    # Drop PAN-owned wrapper blocks that no longer back a subnet.
+    for cidr, wrapper in fw_wrappers.items():
+        if cidr in used_wrapper_cidrs:
+            continue
         refs = await db.scalar(
             select(func.count()).select_from(Subnet).where(Subnet.block_id == wrapper.id)
         )
-        if not refs and wrapper.panos_firewall_id == fw.id:
+        if not refs:
             await db.delete(wrapper)
             summary.blocks_deleted += 1
 
@@ -583,14 +627,13 @@ async def reconcile_firewall(db: AsyncSession, fw: PANOSFirewall) -> ReconcileSu
     summary.interface_count = len(interfaces)
     summary.lease_count = len(leases)
 
-    if fw.mirror_address_objects:
-        await _apply_objects(db, fw, objects, summary)
-    if fw.mirror_nat_rules:
-        await _apply_nat(db, fw, nat_rules, summary)
-    if fw.mirror_interfaces:
-        await _apply_interfaces(db, fw, interfaces, summary)
-    if fw.mirror_dhcp_leases:
-        await _apply_leases(db, fw, leases, summary)
+    # Always apply, even for a disabled mirror: the fetch above already passed
+    # an empty desired set when the toggle is off, so the apply sweeps any rows
+    # a previous (enabled) sync created instead of stranding them forever.
+    await _apply_objects(db, fw, objects, summary)
+    await _apply_nat(db, fw, nat_rules, summary)
+    await _apply_interfaces(db, fw, interfaces, summary)
+    await _apply_leases(db, fw, leases, summary)
 
     fw.last_synced_at = datetime.now(UTC)
     fw.last_sync_error = None
