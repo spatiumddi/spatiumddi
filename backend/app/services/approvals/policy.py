@@ -30,10 +30,43 @@ logger = structlog.get_logger(__name__)
 # that isn't wired yet (the fail-open #2/#4 the seed used to ship). P2 widens
 # both sets as bulk_delete / bulk_edit / bulk_allocate / factory_reset /
 # import_commit ops land their gate threading.
-GATEABLE_ACTIONS: frozenset[str] = frozenset({"delete"})
+GATEABLE_ACTIONS: frozenset[str] = frozenset({"delete", "admin"})
 GATEABLE_RESOURCE_TYPES: frozenset[str] = frozenset(
-    {"subnet", "ip_block", "ip_space", "dns_zone", "dhcp_scope", "dhcp_server_group"}
+    {
+        "subnet",
+        "ip_block",
+        "ip_space",
+        "dns_zone",
+        "dhcp_scope",
+        "dhcp_server_group",
+        # #601 — active block sync: creating/arming a network block pushes a
+        # real firewall/gateway block (broad blast radius), so it is a
+        # two-person-rule candidate. Gated as ``admin:manage_block_sync``.
+        "manage_block_sync",
+    }
 )
+
+
+def gateable_pairs() -> frozenset[tuple[str, str]]:
+    """The ``(action, resource_type)`` pairs an ENABLED policy can actually
+    gate — exactly those declared by a registered risky ``Operation``.
+
+    Validating a policy against these PAIRS (not the two axes independently)
+    is what prevents an enabled-but-inert policy: once ``GATEABLE_ACTIONS`` /
+    ``GATEABLE_RESOURCE_TYPES`` hold more than one value each, their product
+    admits cross pairs like ``(admin, subnet)`` or ``(delete, manage_block_
+    sync)`` that no op declares, so ``match_policy`` could never select them
+    and the operator would get silent, false protection (#601 review).
+    """
+    from app.services.ai.operations import get_operation  # noqa: PLC0415
+    from app.services.ai.operations_risky import RISKY_OPERATION_NAMES  # noqa: PLC0415
+
+    pairs: set[tuple[str, str]] = set()
+    for name in RISKY_OPERATION_NAMES:
+        op = get_operation(name)
+        if op is not None and op.required_permission is not None:
+            pairs.add(op.required_permission)
+    return frozenset(pairs)
 
 
 async def match_policy(
@@ -114,4 +147,4 @@ def _is_stronger(candidate: ApprovalPolicy, current: ApprovalPolicy, resource_ty
     return candidate.min_count < current.min_count
 
 
-__all__ = ["GATEABLE_ACTIONS", "GATEABLE_RESOURCE_TYPES", "match_policy"]
+__all__ = ["GATEABLE_ACTIONS", "GATEABLE_RESOURCE_TYPES", "gateable_pairs", "match_policy"]

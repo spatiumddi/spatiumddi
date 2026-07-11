@@ -145,6 +145,47 @@ class UnifiController(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # ``mode="cloud"`` so we don't hammer api.ui.com (it rate-limits).
     sync_interval_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=60)
 
+    # ── Active block sync (#601 — enforcement write-back) ────────────
+    # The mirror above stays strictly read-only. This block is a
+    # SEPARATE, opt-in write capability that quarantines a device at L2
+    # via the controller's ``cmd/stamgr`` ``block-sta`` / ``unblock-sta``
+    # command (the same call the UniFi UI issues). It consumes MAC-kind
+    # ``network_block`` rows.
+    #
+    # ``block_sync_enabled`` is the per-target master switch — default
+    # OFF, independent of ``enabled`` (mirror) and the
+    # ``integrations.unifi`` feature module.
+    block_sync_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+    # Distinct WRITE-scoped credentials — the public Integration v1 API
+    # does NOT expose client-block, so the write path is the legacy
+    # controller API and needs an admin key / admin login. Same auth
+    # shapes as the read creds above but stored separately; the reconciler
+    # refuses to push when the required secret for ``block_sync_auth_kind``
+    # is empty (no fallback to read creds).
+    block_sync_auth_kind: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="api_key", server_default=sa_text("'api_key'")
+    )
+    block_sync_api_key_encrypted: Mapped[bytes] = mapped_column(
+        LargeBinary, nullable=False, default=b"", server_default=sa_text("''::bytea")
+    )
+    block_sync_username_encrypted: Mapped[bytes] = mapped_column(
+        LargeBinary, nullable=False, default=b"", server_default=sa_text("''::bytea")
+    )
+    block_sync_password_encrypted: Mapped[bytes] = mapped_column(
+        LargeBinary, nullable=False, default=b"", server_default=sa_text("''::bytea")
+    )
+    # The site (legacy short id, e.g. ``default``) whose ``stamgr`` command
+    # endpoint receives the block. Empty = ``default``.
+    block_sync_site: Mapped[str] = mapped_column(String(64), nullable=False, default="default")
+
+    # Block-sync convergence state (surfaced in the UI).
+    last_block_sync_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_block_sync_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     # ── Sync state ──────────────────────────────────────────────────
     last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_sync_error: Mapped[str | None] = mapped_column(Text, nullable=True)

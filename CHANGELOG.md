@@ -20,6 +20,64 @@ the formatter handles the rest.
 
 ---
 
+## 2026.07.10-1 — 2026-07-10
+
+An **active enforcement** release. It closes the half-open
+detect→block loop: SpatiumDDI could already *see* a rogue DHCP
+responder (#370) or an unknown MAC (#459) and starve it of a DHCP
+lease, but a device that self-assigns a static IP walked right past
+the DHCP block. **Active block sync (#601)** adds a narrow, heavily
+guarded write path that pushes a real block at the natural
+enforcement point — an **OPNsense** firewall table alias (by IP) or a
+**UniFi** L2 client quarantine (by MAC) — so the block actually
+sticks. It is the deliberate exception to the read-only-mirror stance:
+off by default, layered behind a feature module, a per-target
+enforcement master switch, distinct write-scoped credentials,
+preview + audit on every push, `manage_block_sync` RBAC, and
+two-person approval.
+
+### Added
+
+- **Active block sync — write-back enforcement (#601).** A new
+  `security.block_sync` feature module (default-off) exposes a
+  SpatiumDDI-owned block set (`network_block`: IP or MAC, with
+  reason / source / optional auto-expiry) that a target-driven,
+  idempotent reconciler converges onto every *armed* OPNsense /
+  UniFi target and lifts when a block is disabled / expired /
+  deleted. Convergence is non-destructive — SpatiumDDI only removes
+  values it added (tracked in `network_block_push`), never alias
+  members / blocked clients it doesn't own.
+  - **OPNsense** enforcement mutates operator-pre-created firewall
+    **table-alias** membership only (`alias_util/add|delete` +
+    `alias/reconfigure`) — never rule CRUD.
+  - **UniFi** enforcement issues the legacy `cmd/stamgr`
+    `block-sta` / `unblock-sta` L2 quarantine (the public
+    Integration v1 API doesn't expose client-block), replaying the
+    captured `X-CSRF-Token` / `X-API-Key`.
+  - REST surface at `/api/v1/block-sync` (blocks CRUD with a
+    per-target preview diff, target arm/creds, force-reconcile,
+    password-confirm credential reveal); a 60 s beat sweep plus an
+    immediate on-create/lift converge.
+  - The New Devices review-queue **Block** action grows an "also
+    quarantine upstream" option that creates a MAC block when a
+    UniFi target is armed.
+  - Guardrails: per-target default-off `block_sync_enabled` master
+    switch (independent of the mirror module), distinct Fernet-
+    encrypted write-scoped creds, `manage_block_sync` permission
+    (granted to Network Editor), full audit + two-person approval
+    (#62) on every create, and `find_network_blocks` /
+    `count_network_blocks` + a default-disabled
+    `propose_create_network_block` Operator Copilot tool.
+
+### Migrations
+
+- `d3b9f42a1c05` — `network_block` + `network_block_push` tables,
+  block-sync enforcement columns on `opnsense_router` /
+  `unifi_controller`, and the seeded (disabled) `security.block_sync`
+  feature-module row.
+
+---
+
 ## 2026.07.09-1 — 2026-07-09
 
 A **BGP visibility + HA-hardening** release. The headline feature is

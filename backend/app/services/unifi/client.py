@@ -362,6 +362,62 @@ class UnifiClient:
         except ValueError as exc:  # non-JSON body (HTML error page, …)
             raise UnifiClientError(f"{path}: non-JSON body: {resp.text[:200]}") from exc
 
+    async def _post_legacy(self, suffix: str, payload: dict[str, Any]) -> Any:
+        """POST to the legacy controller API, replaying the captured CSRF
+        token (user_password auth) and relying on the ``X-API-Key`` header
+        set at construction (api_key auth).
+
+        The public Integration v1 API deliberately omits client-block, so
+        every write rides this legacy path. Used only by the active
+        block-sync surface (#601) — reads never write.
+        """
+        assert self._client is not None, "use within 'async with'"
+        path = self._legacy_path(suffix)
+        headers: dict[str, str] = {}
+        if self._csrf:
+            headers["X-CSRF-Token"] = self._csrf
+        try:
+            resp = await self._client.post(path, json=payload, headers=headers)
+        except httpx.HTTPError as exc:
+            raise UnifiClientError(f"{path}: {exc}") from exc
+        if resp.status_code == 401:
+            raise UnifiClientError(f"{path}: HTTP 401 — auth invalid / expired")
+        if resp.status_code == 403:
+            raise UnifiClientError(f"{path}: HTTP 403 — token / role denies this write")
+        if resp.status_code >= 400:
+            raise UnifiClientError(f"{path}: HTTP {resp.status_code} {resp.text[:200]}")
+        try:
+            body = resp.json()
+        except ValueError:
+            # Some stamgr responses are empty-bodied 200s — treat as success.
+            return {}
+        # The legacy controller signals command failure in-band: HTTP 200 with
+        # ``{"meta": {"rc": "error", "msg": "api.err.…"}}`` (wrong site, a
+        # key/role without device-block rights, unknown MAC). Without this a
+        # failed block-sta would be recorded as a converged push (#601 review).
+        if isinstance(body, dict):
+            meta = body.get("meta")
+            if isinstance(meta, dict) and str(meta.get("rc", "")).lower() == "error":
+                raise UnifiClientError(
+                    f"{path}: controller rejected command — {meta.get('msg') or 'rc=error'}"
+                )
+        return body
+
+    # ── Write surface (active block sync #601, opt-in) ───────────────
+    #
+    # L2 client quarantine at the AP/switch via the same ``cmd/stamgr``
+    # command the UniFi UI issues. Idempotent-ish: re-blocking a blocked
+    # device is a no-op on the controller. Requires an admin key / admin
+    # login (distinct from the read mirror's creds).
+
+    async def block_client(self, site_name: str, mac: str) -> None:
+        """Quarantine a device by MAC (``block-sta``)."""
+        await self._post_legacy(f"s/{site_name}/cmd/stamgr", {"cmd": "block-sta", "mac": mac})
+
+    async def unblock_client(self, site_name: str, mac: str) -> None:
+        """Lift a device quarantine by MAC (``unblock-sta``)."""
+        await self._post_legacy(f"s/{site_name}/cmd/stamgr", {"cmd": "unblock-sta", "mac": mac})
+
     # ── Public surface ───────────────────────────────────────────────
 
     async def get_version(self) -> _UnifiVersion:

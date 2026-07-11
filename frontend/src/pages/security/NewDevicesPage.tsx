@@ -24,6 +24,7 @@ import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { Pager } from "@/components/ui/pager";
 import { errMsg, inputCls } from "@/pages/dhcp/_shared";
+import { useFeatureModules } from "@/hooks/useFeatureModules";
 
 const PAGE_SIZE = 100;
 
@@ -89,6 +90,12 @@ export function NewDevicesPage() {
   const [showAddAllowlist, setShowAddAllowlist] = useState(false);
   const [showBlock, setShowBlock] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [actionNotice, setActionNotice] = useState<string | null>(null);
+
+  // #601 — the "also quarantine upstream" affordance in the block modal
+  // only makes sense when the active block-sync module is enabled.
+  const { enabled: moduleEnabled } = useFeatureModules();
+  const blockSyncEnabled = moduleEnabled("security.block_sync");
 
   const summaryQ = useQuery({
     queryKey: ["new-devices", "summary"],
@@ -329,6 +336,18 @@ export function NewDevicesPage() {
           {actionError}
         </div>
       )}
+      {actionNotice && (
+        <div className="flex items-start justify-between gap-2 rounded-md border border-emerald-500/40 bg-emerald-500/5 px-3 py-2 text-xs text-emerald-700 dark:text-emerald-400">
+          <span>{actionNotice}</span>
+          <button
+            type="button"
+            onClick={() => setActionNotice(null)}
+            className="text-emerald-700/70 hover:text-emerald-700 dark:text-emerald-400/70"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
 
       {/* Bulk toolbar — slides in when rows are selected. */}
       {someSelected && (
@@ -498,11 +517,13 @@ export function NewDevicesPage() {
       {showBlock && (
         <BlockSelectedModal
           sightings={selectedRows}
+          blockSyncEnabled={blockSyncEnabled}
           onClose={() => setShowBlock(false)}
-          onDone={() => {
+          onDone={(notice) => {
             invalidateAll();
             setSelected(new Set());
             setShowBlock(false);
+            setActionNotice(notice ?? null);
           }}
           onError={(m) => setActionError(m)}
         />
@@ -819,16 +840,21 @@ function AddSelectedToAllowlistModal({
 // ── Block selected MACs across DHCP server groups ─────────────────────
 function BlockSelectedModal({
   sightings,
+  blockSyncEnabled,
   onClose,
   onDone,
   onError,
 }: {
   sightings: NewDeviceSighting[];
+  blockSyncEnabled: boolean;
   onClose: () => void;
-  onDone: () => void;
+  onDone: (notice?: string) => void;
   onError: (msg: string) => void;
 }) {
   const [reason, setReason] = useState("");
+  // #601 — optionally also push an L2 quarantine to armed UniFi block-sync
+  // targets, not just starve the device of DHCP.
+  const [blockUpstream, setBlockUpstream] = useState(false);
   const mut = useMutation({
     mutationFn: async () => {
       const results = await Promise.allSettled(
@@ -836,14 +862,32 @@ function BlockSelectedModal({
           newDeviceApi.block({
             mac_address: s.mac_address,
             reason: reason.trim() || undefined,
+            block_upstream: blockUpstream || undefined,
           }),
         ),
       );
       const failed = results.filter((r) => r.status === "rejected").length;
       if (failed > 0)
         throw new Error(`${failed} of ${sightings.length} failed to block`);
+      // Summarise the upstream outcome so the operator knows whether the
+      // L2 quarantine landed or is waiting on a second approver.
+      let upstreamCreated = 0;
+      let upstreamQueued = 0;
+      for (const r of results) {
+        if (r.status !== "fulfilled") continue;
+        if (r.value.upstream_block_created) upstreamCreated += 1;
+        if (r.value.upstream_change_request_id) upstreamQueued += 1;
+      }
+      const parts: string[] = [];
+      if (upstreamCreated > 0)
+        parts.push(`${upstreamCreated} upstream quarantine(s) pushed`);
+      if (upstreamQueued > 0)
+        parts.push(
+          `${upstreamQueued} upstream quarantine(s) queued for approval`,
+        );
+      return parts.length > 0 ? parts.join("; ") + "." : undefined;
     },
-    onSuccess: onDone,
+    onSuccess: (notice) => onDone(notice),
     onError: (e) => onError(errMsg(e, "Failed to block")),
   });
 
@@ -874,6 +918,24 @@ function BlockSelectedModal({
           value={reason}
           onChange={(e) => setReason(e.target.value)}
         />
+        {blockSyncEnabled && (
+          <label className="flex cursor-pointer items-start gap-2 text-sm">
+            <input
+              type="checkbox"
+              className="mt-0.5"
+              checked={blockUpstream}
+              onChange={(e) => setBlockUpstream(e.target.checked)}
+            />
+            <span>
+              Also quarantine upstream (UniFi block-sta)
+              <span className="block text-xs text-muted-foreground">
+                Pushes an L2 client quarantine to armed UniFi block-sync
+                targets, not only a DHCP block. May queue for two-person
+                approval.
+              </span>
+            </span>
+          </label>
+        )}
         <div className="flex justify-end gap-2 pt-2">
           <button
             type="button"

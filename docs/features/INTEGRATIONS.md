@@ -421,6 +421,41 @@ Paste `key` into **API Key** and `secret` into **API Secret**. **Test Connection
 
 ---
 
+## Active block sync — write-back enforcement (#601)
+
+> **This is the deliberate exception to the read-only-mirror rule above.** Every other integration in this doc is a one-way `source → IPAM` pull. Active block sync is the opposite direction — `decision → source`, a push reconciler. It exists to close the half-open detect→block loop: rogue-DHCP detection (#370) and new-device watch (#459) can *see* a hostile device, and the DHCP MAC blocklist can starve it of a lease, but a device that **self-assigns a static IP walks right past a DHCP block**. Active block sync pushes a real block at the natural enforcement point instead.
+
+It is off by default and layered behind several independent gates so it can never fire by accident:
+
+1. **Feature module `security.block_sync`** (default-OFF) gates the entire surface (REST router, MCP tools, sidebar entry). Enabling it exposes the UI but **arms nothing**.
+2. **Per-target enforcement master switch** (`block_sync_enabled`, default-OFF) on each OPNsense router / UniFi controller — independent of both the mirror's `enabled` flag and the `integrations.opnsense` / `integrations.unifi` modules. The read-only mirror is never touched; enforcement is a separate armed capability on the same row.
+3. **Distinct write-scoped credentials.** The read mirror uses a read-only API user; enforcement needs a Firewall-privileged OPNsense user / a UniFi admin key. Stored Fernet-encrypted, never returned (password-confirm reveal, audited — mirrors the agent-bootstrap-key reveal).
+4. **RBAC `manage_block_sync`** on every endpoint (Network Editor builtin role; superadmin bypasses).
+5. **Preview + confirm + full audit** on every push — `POST /block-sync/blocks/preview` (and `?preview` on reconcile) returns the exact per-target add/remove diff without writing.
+6. **Two-person approval** — creating/arming a block routes through the approval workflow (#62) as `admin:manage_block_sync` when a policy matches.
+
+### Desired-state model
+
+`network_block` is the SpatiumDDI-owned block set: one row per blocked value (`kind` = `ip` | `mac`), with `reason`, `source` (`manual` / `new_device` / `rogue_dhcp`), `enabled`, and an optional `expires_at` for auto-lift. `network_block_push` tracks per-(block, target) convergence (`push_status` = pending / pushed / removing / error + `last_error`). The reconciler is **target-driven and idempotent** (NN#9): for each armed target it ensures every applicable enabled block is present on the device and lifts every push whose block was disabled / expired / deleted. Convergence is **non-destructive** — SpatiumDDI only removes values it added (tracked via push rows); it never touches alias members / blocked clients it doesn't own. A 60 s beat sweep plus an immediate on-create/lift enqueue keep the device converged.
+
+### OPNsense — firewall table-alias membership
+
+IP-kind blocks push to an operator-**pre-created** OPNsense table alias (e.g. `spatiumddi_blocked`) that the operator references from one block rule. SpatiumDDI only ever mutates alias membership: `POST /api/firewall/alias_util/add|delete/{alias}` then `POST /api/firewall/alias/reconfigure`. No rule CRUD, no rule-ordering state. **Setup:** create a user with Firewall-alias privileges, mint an API key/secret, create the block rule + alias by hand, then arm the target with the alias name + write creds.
+
+### UniFi — L2 client quarantine
+
+MAC-kind blocks push a device quarantine via the legacy controller command `POST /proxy/network/api/s/{site}/cmd/stamgr` `{"cmd": "block-sta", "mac": …}` / `unblock-sta` — the same call the UniFi UI issues (the public Integration v1 API does not expose client-block, so the legacy path + captured `X-CSRF-Token` / `X-API-Key` is mandatory). This is an L2 quarantine at the AP/switch, great for "quarantine this device"; subnet/CIDR firewall rules (`rest/firewallrule`) are out of scope for v1.
+
+### One-click from detection
+
+The New Devices review-queue **Block** action grows an "also quarantine upstream" option: when the module is on, the caller holds `manage_block_sync`, and a UniFi target is armed, blocking a MAC there *also* creates a `network_block` (source=`new_device`) — routed through the same approval gate. Rogue-DHCP responders can be blocked by IP the same way through the dedicated surface (source=`rogue_dhcp`).
+
+### Non-goals (v1)
+
+Full firewall rule authoring / reordering on OPNsense (alias membership only); UniFi subnet/CIDR firewall rules (L2 MAC quarantine only); any write-back other than block/unblock; pfSense enforcement (folds in once the pfSense mirror #32 lands, same shape).
+
+---
+
 ## Dashboard surface
 
 When **any** integration toggle is on, the dashboard renders an **Integrations panel** below the service health strip with:

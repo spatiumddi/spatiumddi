@@ -20,13 +20,15 @@ from datetime import UTC, datetime
 from typing import Any
 
 import structlog
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel
 from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser
 from app.models.ai import AIOperationProposal
 from app.services.ai import operations
+from app.services.ai.operations_risky import RISKY_OPERATION_NAMES
+from app.services.approvals.gate import gate_or_execute
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
@@ -117,7 +119,7 @@ async def get_proposal(
 
 @router.post("/proposals/{proposal_id}/apply", response_model=ApplyResponse)
 async def apply_proposal(
-    proposal_id: uuid.UUID, current_user: CurrentUser, db: DB
+    proposal_id: uuid.UUID, current_user: CurrentUser, db: DB, request: Request
 ) -> ApplyResponse:
     row = await db.get(AIOperationProposal, proposal_id)
     if row is None or row.user_id != current_user.id:
@@ -170,6 +172,30 @@ async def apply_proposal(
             result=None,
             proposal=_to_response(row),
         )
+
+    # Two-person approval (#62): a risky op reached via propose→Apply must
+    # route through the SAME gate the equivalent REST route uses — otherwise
+    # the AI surface would be a bypass around the approval workflow (#601
+    # review). Module-off / no matching policy / superadmin-exempt → the gate
+    # returns None and we apply inline exactly as before.
+    if op.name in RISKY_OPERATION_NAMES:
+        pending = await gate_or_execute(db, current_user, request, operation=op, args=args)
+        if pending is not None:
+            row.applied_at = datetime.now(UTC)
+            row.result = {
+                "queued_for_approval": True,
+                "change_request_id": str(pending.change_request_id),
+                "state": pending.state,
+            }
+            row.error = None
+            await db.commit()
+            await db.refresh(row)
+            return ApplyResponse(
+                ok=True,
+                detail="Queued for two-person approval",
+                result=row.result,
+                proposal=_to_response(row),
+            )
 
     try:
         result = await op.apply(db, current_user, args)

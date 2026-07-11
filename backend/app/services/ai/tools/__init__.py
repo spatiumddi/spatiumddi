@@ -17,6 +17,7 @@ from app.services.ai.tools import (  # noqa: F401, E402
     bgp,
     bgp_lg,
     bgp_monitor,
+    block_sync,
     certificates,
     changes,
     conformity,

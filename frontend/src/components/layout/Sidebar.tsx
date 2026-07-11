@@ -32,6 +32,7 @@ import {
   Tags,
   ShieldCheck,
   ShieldAlert,
+  ShieldBan,
   ShieldQuestion,
   ScrollText,
   BellRing,
@@ -212,8 +213,21 @@ const networkInfrastructureNav = [
   },
 ];
 
+// Keep this list alphabetised by label.
 const toolsNav = [
+  {
+    label: "Block Sync",
+    icon: ShieldBan,
+    to: "/security/block-sync",
+    module: "security.block_sync",
+  },
   { label: "CIDR Calculator", icon: Calculator, to: "/tools/cidr" },
+  {
+    label: "Network Tools",
+    icon: Wrench,
+    to: "/tools/network",
+    module: "tools.network",
+  },
   {
     label: "New Devices",
     icon: ShieldQuestion,
@@ -221,12 +235,6 @@ const toolsNav = [
     module: "security.new_device_watch",
   },
   { label: "Nmap", icon: Search, to: "/tools/nmap", module: "tools.nmap" },
-  {
-    label: "Network Tools",
-    icon: Wrench,
-    to: "/tools/network",
-    module: "tools.network",
-  },
   {
     label: "Packet Capture",
     icon: Activity,

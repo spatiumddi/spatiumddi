@@ -50,6 +50,7 @@ row before the commit inside ``apply()``).
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 from typing import Any
 from uuid import UUID
 
@@ -971,6 +972,146 @@ _OP_DELETE_GROUP = Operation(
 register(_OP_DELETE_GROUP)
 
 
+# ── create_network_block (active block sync #601) ───────────────────────────
+#
+# Unlike the six deletes, this is a *create* — but it is a genuine risky op:
+# a network block, once armed, pushes a real firewall/gateway block that can
+# lock a device (or the operator) out of the network. Gating it through the
+# same two-person workflow is the issue's explicit guardrail #6. The op body
+# does the network_block upsert + audit + immediate reconcile-enqueue; the
+# router delegates to it on the inline path and the approve endpoint replays
+# it under the approver's identity.
+
+
+class CreateNetworkBlockArgs(BaseModel):
+    kind: str
+    value: str
+    reason: str = "quarantine"
+    description: str = ""
+    source: str = "manual"
+    source_ref: str | None = None
+    expires_at: datetime | None = None
+
+
+async def _preview_create_network_block(
+    db: AsyncSession, user: User, args: CreateNetworkBlockArgs
+) -> PreviewResult:
+    from app.models.block_sync import BLOCK_KINDS, BLOCK_SOURCES
+    from app.services.block_sync.reconcile import (
+        applicable_targets_for_kind,
+        normalize_block_value,
+    )
+
+    if args.kind not in BLOCK_KINDS:
+        return PreviewResult(ok=False, detail=f"kind must be one of {BLOCK_KINDS}")
+    if args.source not in BLOCK_SOURCES:
+        return PreviewResult(ok=False, detail=f"source must be one of {BLOCK_SOURCES}")
+    try:
+        value = normalize_block_value(args.kind, args.value)
+    except ValueError as exc:
+        return PreviewResult(ok=False, detail=str(exc))
+    targets = await applicable_targets_for_kind(db, args.kind)
+    names = ", ".join(f"{tk}:{tid}" for tk, tid in targets) or "no armed targets"
+    return PreviewResult(
+        ok=True,
+        detail="ready",
+        preview_text=(
+            f"Block {args.kind} `{value}` and push to {len(targets)} armed " f"target(s) ({names})"
+        ),
+    )
+
+
+async def _apply_create_network_block(
+    db: AsyncSession, user: User, args: CreateNetworkBlockArgs
+) -> dict[str, Any]:
+    from app.models.audit import AuditLog
+    from app.models.block_sync import NetworkBlock
+    from app.services.block_sync.reconcile import (
+        applicable_targets_for_kind,
+        normalize_block_value,
+    )
+
+    value = normalize_block_value(args.kind, args.value)
+    existing = (
+        await db.execute(
+            select(NetworkBlock).where(NetworkBlock.kind == args.kind, NetworkBlock.value == value)
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        existing.enabled = True
+        existing.reason = args.reason
+        existing.description = args.description
+        existing.source = args.source
+        existing.source_ref = args.source_ref
+        existing.expires_at = args.expires_at
+        existing.updated_by_user_id = user.id
+        block = existing
+        action = "update"
+    else:
+        block = NetworkBlock(
+            kind=args.kind,
+            value=value,
+            reason=args.reason,
+            description=args.description,
+            source=args.source,
+            source_ref=args.source_ref,
+            enabled=True,
+            expires_at=args.expires_at,
+            created_by_user_id=user.id,
+            updated_by_user_id=user.id,
+        )
+        db.add(block)
+        action = "create"
+    await db.flush()
+
+    targets = await applicable_targets_for_kind(db, args.kind)
+    db.add(
+        AuditLog(
+            user_id=user.id,
+            user_display_name=user.display_name,
+            auth_source=user.auth_source,
+            action=action,
+            resource_type="network_block",
+            resource_id=str(block.id),
+            resource_display=f"{args.kind}:{value}",
+            new_value={
+                "kind": args.kind,
+                "value": value,
+                "reason": args.reason,
+                "source": args.source,
+                "targets": len(targets),
+            },
+        )
+    )
+    await db.commit()
+
+    # Immediate converge on each armed target (broker-down → 60 s sweep).
+    try:
+        from app.tasks.block_sync import reconcile_target_now  # noqa: PLC0415
+
+        for target_kind, target_id in targets:
+            try:
+                reconcile_target_now.delay(target_kind, str(target_id))
+            except Exception:  # noqa: BLE001 — broker unavailable; the 60 s
+                pass  # sweep converges this target, so a lost enqueue is safe
+    except Exception:  # noqa: BLE001 — task import/broker issues never fail the write
+        pass
+
+    return {"block_id": str(block.id), "kind": args.kind, "value": value, "mode": action}
+
+
+_OP_CREATE_NETWORK_BLOCK = Operation(
+    name="create_network_block",
+    description="Create/arm a network block (IP or MAC) and push it to armed OPNsense/UniFi targets.",
+    args_model=CreateNetworkBlockArgs,
+    preview=_preview_create_network_block,
+    apply=_apply_create_network_block,
+    category="security",
+    required_permission=("admin", "manage_block_sync"),
+)
+register(_OP_CREATE_NETWORK_BLOCK)
+
+
 # Registry-completeness anchor for the startup assertion (sibling slice):
 # every operation name the seeded policies reference must exist here.
 RISKY_OPERATION_NAMES: frozenset[str] = frozenset(
@@ -981,6 +1122,7 @@ RISKY_OPERATION_NAMES: frozenset[str] = frozenset(
         "delete_zone",
         "delete_scope",
         "delete_group",
+        "create_network_block",
     }
 )
 
