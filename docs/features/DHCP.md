@@ -166,16 +166,23 @@ Static assignments bind a MAC address (or client identifier) to a specific IP, h
 
 ```
 DHCPStaticAssignment
-  id, scope_id
-  ip_address: inet              -- expected within subnet (not enforced at the API layer)
+  id, scope_id                  -- NOT NULL / ON DELETE CASCADE; part of the reservation's identity
+  ip_address: inet              -- must fall inside the scope's subnet (422 if not — issue #619)
   mac_address: macaddr          -- primary identifier
   client_id: str (nullable)     -- DHCP client identifier (alternative to MAC)
   hostname: str
   description: str
   options_override: JSONB (nullable)  -- host-specific options
   ip_address_id (FK → IPAddress)      -- linked IPAM record
+  deleted_at, deleted_by_user_id, deletion_batch_id  -- soft-delete, as a cascade child of the scope (#617)
   created_by_user_id, created_at
 ```
+
+`scope_id` cannot be re-pointed. Kea renders a reservation *nested inside* its
+scope's `subnet4` stanza and Windows binds it to the scope's network address, so
+there is no renderable form of a relocated reservation — a body `scope_id` on
+create/update is rejected with a `422` (issue #619). To move one, delete it and
+re-create it under the target scope.
 
 ### Static Assignment UI Workflow
 
@@ -258,11 +265,12 @@ up, walk this checklist — each item is a real, mostly-silent drop point:
 - **The scope's group has no Kea member.** A server not attached to a group (or a
   group with zero Kea members) renders an empty bundle — nothing polls for the
   reservation.
-- **The reservation IP is outside the scope's subnet.** This is **not** validated
-  on create, but Kea rejects the *entire* config at load when a host reservation
-  falls outside its subnet — so one out-of-range IP makes **all** statics on that
-  server silently fail while the agent keeps serving its last-good config. Keep
-  the reserved IP inside the subnet CIDR.
+- **The reservation IP is outside the scope's subnet.** Rejected with a `422`
+  since issue #619 — but a row created *before* that landed (or written by an
+  importer) can still be out of range, and Kea rejects the *entire* config at
+  load when a host reservation falls outside its subnet, so one out-of-range IP
+  makes **all** statics on that server silently fail while the agent keeps
+  serving its last-good config. Keep the reserved IP inside the subnet CIDR.
 - **Pure-SLAAC IPv6 scopes emit no reservations by design** — a v6 scope in
   SLAAC-only mode has no stateful addressing role, so its `reservations` is
   always empty.
@@ -274,12 +282,124 @@ up, walk this checklist — each item is a real, mostly-silent drop point:
   across every scope in the same group (409).
 - **IP inside a `dynamic` pool on the scope** — the IP must be excluded from any
   dynamic pool first (409). (Reserved/excluded pools do not block a static.)
+- **IP outside the scope's subnet** — 422 (issue #619). See §16 for the
+  rationale.
+- **A body `scope_id`** — 422 (issue #619). The scope comes from the path on
+  create and cannot change on update.
 - **Malformed IP** — 422.
+- **Malformed hostname** — 422. The reservation hostname is operator-entered,
+  so it is validated against the RFC 1123 host rule rather than sanitized (see
+  `DNS.md` §18).
 
-Note what is **not** checked here: the reservation IP is **not** validated
-against the scope's subnet CIDR, and IP duplication across statics is not
-rejected at this layer — see the troubleshooting checklist above for why an
-out-of-subnet IP is dangerous.
+---
+
+## 3a. Scope deletion, cascade, and restore
+
+Deleting a DHCP scope is a **soft delete** by default: the row is stamped
+(`deleted_at` / `deleted_by_user_id` / `deletion_batch_id`), disappears from
+every read surface, and is recoverable from **Administration → Trash** for the
+retention window (`PlatformSettings.soft_delete_purge_days`, default **30
+days**) before the nightly purge sweep hard-deletes it. `DELETE
+/api/v1/dhcp/scopes/{id}?permanent=true` skips the trash — but the UI never
+sends that flag, so the soft path is what an operator actually exercises.
+
+Four things happen on that path. Each was a shipped bug until `2026.07.11-1`
+(issues #616–#619, migration `b3e7d21c9f04`).
+
+### Pools and reservations cascade with the scope (#617)
+
+`DHCPPool` and `DHCPStaticAssignment` carry `SoftDeleteMixin` and ride the
+scope's `deletion_batch_id`
+(`backend/app/services/soft_delete.py::_collect_descendants`), so one **Restore**
+brings the scope back **whole** — its ranges and its reservations with it. They
+are cascade-only children: never soft-deleted on their own, never listed in the
+trash individually (`SOFT_DELETE_RESOURCE_TYPES` deliberately omits them), but
+present in `TYPE_TO_MODEL` so `restore_batch` sweeps them.
+
+Before this, a scope was treated as a cascade **leaf** — its pools and
+reservations stayed live and un-stamped under a hidden parent:
+
+- still answering `GET /api/v1/dhcp/scopes/{id}/statics`,
+- still enforcing the group-wide MAC conflict check, which `409`'d naming a
+  scope UUID the operator could no longer see,
+- still visible to the `find_dhcp_statics` MCP tool,
+- and the approval-workflow preview reported a **zero blast radius** for a scope
+  holding hundreds of reservations.
+
+Restore is conflict-checked per row: while the scope sat in the trash a live
+scope in the same group may have claimed one of its MACs, so
+`default_conflict_check` refuses the restore rather than resurrecting a
+group-wide duplicate the create path would have refused. The two reservation
+uniqueness rules are **partial** unique indexes (`WHERE deleted_at IS NULL`), so
+a trashed reservation never holds the `(scope, mac)` / `(scope, ip)` slot against
+a live one.
+
+### Agentless write-through fires on the soft path (#616)
+
+Soft-delete means *stop serving*, and that has to hold on every backend. Kea
+members converge on their own — a stamped scope drops straight out of the
+rendered `ConfigBundle` and the ETag shifts. **Agentless** members (Windows DHCP
+today) only converge on an explicit push, and `push_scope_delete` previously ran
+**only** on the `permanent=true` branch. Since the UI never sends that flag, a
+UI-deleted scope vanished from SpatiumDDI and from Kea's rendered config while
+the Windows DHCP server kept serving it — **and its reservations** — forever.
+Nothing removed it later either: the trash permanent-delete skips the
+write-through hooks, and the purge sweep is a Core `DELETE` that runs no Python.
+
+The push is now driven off the **soft-delete batch**
+(`backend/app/services/ai/operations_risky.py::_push_agentless_scope_deletes`)
+rather than a hand-rolled per-handler query, so **every** delete whose cascade
+can reach a scope — scope, subnet, block, space — is covered, and a new ancestor
+type added to `_collect_descendants` cannot silently skip it. Order is
+load-bearing: the push runs *before* `apply_soft_delete` stamps the batch, or the
+global filter would hide the subnet the push needs to resolve the scope's CIDR.
+
+**Restore pushes the inverse** — `push_scope_restore` re-creates the scope, its
+non-dynamic pools, and its reservations on every Windows member. It is
+best-effort by design (failures are logged, not raised): a `502` from an
+unreachable Windows box would roll the DB restore back and make the row
+*unrestorable*, which is the opposite of what a recovery action should do.
+
+### The IPAM mirror is released on wholesale deletes (#618)
+
+A reservation owns an `ip_address` row at `status="static_dhcp"`, back-linked via
+`IPAddress.static_assignment_id`. `_detach_ipam_for_static` used to live in the
+router, so it was only reachable from the per-reservation CRUD handlers — every
+path that destroys reservations *in bulk* (FK `CASCADE`, or a Core `DELETE`: no
+Python runs) stranded the mirror at `status="static_dhcp"` pointing at a
+reservation Postgres had already dropped. Not allocated, not free, not
+reclaimable by any sweeper.
+
+It is now `backend/app/services/dhcp/static_ipam.py` —
+`detach_ipam_for_static` + `detach_ipam_for_scope_statics` — and wired into every
+wholesale path:
+
+| Path | Where |
+|---|---|
+| Scope permanent-delete | `services/ai/operations_risky.py::_apply_delete_scope` |
+| Trash permanent-delete | `api/v1/admin/trash.py::permanent_delete_from_trash` |
+| Nightly purge sweep | `tasks/trash_purge.py::_release_ipam_mirrors` |
+| DHCP server-group delete | `services/ai/operations_risky.py::_apply_delete_group` |
+| DHCP importer `overwrite` mode | `services/dhcp_import/commit.py` |
+
+The row is released to `available` (not `allocated`): a leftover `allocated` row
+is skipped by the agent's lease-mirror refresh, so it would shadow a future
+dynamic lease at that IP *and* never be reaped (#478). Migration `b3e7d21c9f04`
+repairs the rows already stranded by pre-existing hard-deletes.
+
+### Known gap — Windows scope sync (issue #620)
+
+`services/dhcp/pull_leases.py::_upsert_scope` still Core-`DELETE`s a Windows
+scope's reservations and re-inserts them from the wire without going through the
+release path, so a **UI-created reservation's IPAM mirror can be stranded on the
+next Windows scope sync**. It is deliberately *not* patched with a plain detach:
+that reconciler runs on a schedule, and a detach would tear down and recreate the
+forward A record on every pass for reservations that never changed. It needs a
+re-point-by-IP reconcile instead.
+
+The `IPAddress.static_assignment_id` `varchar` → `uuid` FK retype is deferred
+alongside it — it breaks the #296 rolling-upgrade contract and needs a
+two-release expand/contract.
 
 ---
 
@@ -794,9 +914,33 @@ rule here has been surfaced to an operator, not just silently logged.
 - **Static IP inside a dynamic pool.** A static reservation whose IP
   falls inside a `dynamic` pool is refused; delete or shrink the pool,
   or convert the pool to `reserved` / `excluded` first. `409` at
-  `backend/app/api/v1/dhcp/statics.py:164`.
+  `backend/app/api/v1/dhcp/statics.py:194`.
+- **Reservation IP outside the scope's subnet.** `422` at
+  `backend/app/api/v1/dhcp/statics.py:177` (issue #619). Kea renders a
+  reservation **nested inside** its subnet's `subnet4` stanza and Windows
+  binds it to the scope's network address, so an out-of-CIDR reservation
+  ships structurally invalid config to the agent — Kea refuses the whole
+  config at load, taking every *other* reservation on that server down with
+  it. Caught here as a legible 422 instead of a downstream agent failure.
+- **A body `scope_id` on create / update.** `422` at
+  `backend/app/api/v1/dhcp/statics.py:41` (issue #619). A reservation belongs
+  to its scope (uniqueness is keyed on it, and there is no renderable form of
+  a relocated row), so on create the scope comes from the path and on update
+  it cannot change at all. It used to be **silently dropped with a `200`**
+  (Pydantic's default `extra="ignore"`), so a caller re-pointing a reservation
+  got no error and no effect. Rejected as a *declared* field rather than via a
+  blanket `extra="forbid"` — that would also `422` an ordinary
+  GET → edit → PUT round-trip, since `StaticResponse` carries the server-owned
+  `id` / `created_at` / `modified_at`.
 - **Malformed IP.** Non-parseable IP strings return `422` at
-  `backend/app/api/v1/dhcp/statics.py:155`.
+  `backend/app/api/v1/dhcp/statics.py:162`.
+- **Malformed hostname.** The reservation hostname is operator-entered, so a
+  bad value is rejected (`422`), not sanitized — RFC 1123 host rule, via
+  `app.core.dns_names.validate_hostname` at
+  `backend/app/api/v1/dhcp/statics.py:30`. (A *client-supplied* hostname
+  arriving off the DHCP lease wire is sanitized instead — see `DNS.md` §18.)
+- **Malformed `domain-name` / `domain-search` scope option.** `422` — validated
+  as an FQDN at `backend/app/api/v1/dhcp/scopes.py:90`.
 
 ### Servers & server groups
 

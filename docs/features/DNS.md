@@ -866,6 +866,31 @@ most of these feed the IPAM / DNS / DHCP UI error banners directly.
   CNAME, MX, TXT, NS, PTR, SRV, CAA, TLSA, SSHFP, NAPTR, LOC, SVCB,
   HTTPS, DNAME, plus the PowerDNS-only ALIAS / LUA types.
   `backend/app/api/v1/dns/router.py`.
+- **Record owner-name conformance (issue #597).** `DNSRecord.name` is
+  validated against the **RFC 2181 §11** rule, *not* the RFC 1123 LDH host
+  rule — deliberately looser, because the DNS protocol permits an
+  underscore and RFC 1123 does not. That looseness is load-bearing: it is
+  exactly what keeps `_acme-challenge` (SpatiumDDI's own ACME DNS-01
+  client, #438), `_dmarc`, and `_443._tcp` SRV / TLSA owners legal. A naive
+  RFC 1123 check here would have broken our own certificate issuance.
+  Wildcards are accepted as a leftmost `*` label. What *is* rejected:
+  whitespace, control characters (a raw newline can inject a second record
+  into a zone-file line), the zone-file-dangerous punctuation
+  (`;` `$` `(` `)` `"` `@` `\`), and a leading or trailing hyphen. Labels
+  cap at 63 characters, the whole name at 253. `422` via
+  `app.core.dns_names.validate_record_owner` at
+  `backend/app/api/v1/dns/router.py:944` (create) / `:963` (update) — and
+  the same validator on GSLB pool members at
+  `backend/app/api/v1/dns/pool_router.py:140`. See §18.
+- **Bare-name rdata targets.** The target of a CNAME / MX / NS / SRV / PTR /
+  DNAME record is validated as an FQDN. `422` at
+  `backend/app/api/v1/dns/router.py:1133`.
+- **Zone-name FQDN validation (issue #597).** `DNSZone.name` goes through the
+  FQDN rule — a dotted series of RFC 2181 labels, IDN-normalised to `xn--`
+  A-labels, lower-cased, with the trailing root dot re-appended on the way
+  into storage. Underscore labels are allowed (`_msdcs.example.com` is a real
+  zone); wildcards are not. `422` via `app.core.dns_names.validate_fqdn` at
+  `backend/app/api/v1/dns/router.py:785` (create) / `:832` (update). See §18.
 
 ### Servers & server groups
 
@@ -1052,3 +1077,82 @@ scope (e.g. a roaming laptop that moves between sites). Keep the pool
 TTL short. This is the same caveat as the base pool feature — DNS
 steering is a coarse, cache-bounded mechanism, not a per-request load
 balancer.
+
+## 18. DNS-name conformance (issue #597)
+
+**There is no single "valid DNS name" rule.** The correct rule depends on
+what the field *is* — a host name, a DNS record owner, and an FQDN are
+three different grammars, and applying the strictest one everywhere breaks
+legitimate DNS. `backend/app/core/dns_names.py` is the single place that
+decides; nothing else hand-rolls a name regex.
+
+| Context | Rule | Where |
+|---|---|---|
+| **Host names** — `IPAddress.hostname`, a DHCP reservation hostname | RFC 952 + RFC 1123 §2.1 **LDH**: letters, digits, hyphens; no leading / trailing hyphen. Internationalized input is normalised to its IDNA **A-label** (`xn--`) form rather than rejected. | `validate_hostname` / `validate_host_label` |
+| **DNS record owners** — `DNSRecord.name` | RFC 2181 §11: LDH **plus underscore**, plus a leftmost `*` wildcard. | `validate_record_owner` / `validate_dns_label` |
+| **FQDNs** — `DNSZone.name`, the DHCP `domain-name` / `domain-search` options, bare-name rdata targets | A dotted series of RFC 2181 labels (underscore allowed, wildcards not). | `validate_fqdn` |
+
+The record-owner rule is deliberately the **looser** one. RFC 1123 forbids
+an underscore; the DNS protocol does not — and `_acme-challenge`,
+`_dmarc`, and `_443._tcp` SRV / TLSA owners all need it. Applying the host
+rule to record owners would have broken SpatiumDDI's **own** ACME DNS-01
+client (#438), which writes `_acme-challenge` TXT records into managed
+zones to prove domain control. Underscore support here is a correctness
+requirement, not a leniency.
+
+Every `validate_*` helper both **rejects and canonicalises**: it raises
+`ValueError` with an operator-facing message on a bad value, and returns
+the *normalised* (IDNA-encoded, lower-cased, root-dot-stripped) value on
+success — so a Pydantic `field_validator` does both in one pass. Common
+caps across all three rules: label ≤ **63** characters, whole name ≤ **253**.
+
+### 18.1 Validate on write — never auto-mutate
+
+**The validators run on write only. Existing rows are never rewritten.**
+Silently mutating an operator's stored name would be a worse failure than
+leaving it alone — so a non-conforming legacy row stays exactly as it is
+until someone edits it deliberately. §18.3 is how you find them.
+
+The one place a bad name must *not* raise is the **DHCP lease path**. A
+client-supplied hostname arriving off the wire (option 12 on a DISCOVER, a
+lease event, a Windows lease pull) goes through the **non-raising**
+`sanitize_hostname` instead, which folds it into a safe multi-label LDH
+form (or `""` if nothing usable is left). A malformed hostname must never
+drop a lease. Call sites: `backend/app/api/v1/dhcp/agents.py:166` and
+`backend/app/services/dhcp/pull_leases.py:178`.
+
+### 18.2 Defense in depth at the render boundary
+
+The BIND9 and PowerDNS drivers run **every** rendered name and rdata value
+through `strip_control_chars` before it reaches a zone-file master line or
+the pdns API (`backend/app/drivers/dns/bind9.py:71` /
+`backend/app/drivers/dns/powerdns.py:117`). A raw newline is the one
+character that can inject a *second* record into a zone-file line, and no
+legitimate name or rdata ever contains a control byte. This catches values
+that never passed a field validator — an importer row, a legacy row, a
+future code path — so they still cannot break out of their own record.
+Spaces and quotes are left intact, so structured rdata (CAA / LOC / NAPTR /
+SVCB) renders unharmed.
+
+### 18.3 Auditing existing rows
+
+`GET /api/v1/diagnostics/name-conformance` (**superadmin**, read-only,
+mutates nothing) scans the live database for names today's validators would
+reject and reports them by category:
+
+| Category | Rows scanned | Rule applied |
+|---|---|---|
+| `ipam_hostname` | `IPAddress.hostname` (integration-owned rows excluded — an external mirror owns those names and the operator can't fix them here) | host |
+| `dns_record_name` | `DNSRecord.name` | record owner |
+| `dns_zone_name` | `DNSZone.name` | FQDN |
+| `dhcp_static_hostname` | `DHCPStaticAssignment.hostname` | host |
+
+Each category returns an exact `total` plus up to 100 examples
+(`id` + `value` + the validator's own rejection `reason`), and a
+`scanned_capped` flag when the per-category 200 000-row scan ceiling bit.
+Implementation: `backend/app/services/dns_names_report.py`.
+
+The same report is exposed to the Operator Copilot as the read-only
+`find_nonconforming_names` MCP tool (default-enabled, superadmin-gated) —
+*"which hostnames aren't valid DNS names?"* / *"do we have any records that
+would break a zone file?"*.

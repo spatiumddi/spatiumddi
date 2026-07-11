@@ -1815,9 +1815,12 @@ block.
 
 ### ✅ 15.16 Soft-delete + Trash recovery
 
-IPSpace, IPBlock, Subnet, DNSZone, DNSRecord, and DHCPScope
-inherit `SoftDeleteMixin` (`deleted_at`, `deleted_by_user_id`,
-`deletion_batch_id`). A global `do_orm_execute` listener injects
+IPSpace, IPBlock, Subnet, DNSZone, DNSRecord, DHCPScope, and — since
+#617 — a scope's DHCPPool and DHCPStaticAssignment children (which
+ride the scope's `deletion_batch_id`, so one Restore brings the scope
+back whole) inherit `SoftDeleteMixin` (`deleted_at`,
+`deleted_by_user_id`, `deletion_batch_id`). A global `do_orm_execute`
+listener injects
 `deleted_at IS NULL` into every SELECT — opt out via
 `execution_options(include_deleted=True)`. Cascade-stamping under
 one `deletion_batch_id` lets a single Restore click bring back

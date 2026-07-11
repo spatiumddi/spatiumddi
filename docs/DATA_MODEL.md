@@ -76,7 +76,7 @@ Models carrying `SoftDeleteMixin`:
 |---|---|
 | `IPSpace`, `IPBlock`, `Subnet` | `ip_space`, `ip_block`, `subnet` |
 | `DNSZone`, `DNSRecord` | `dns_zone`, `dns_record` |
-| `DHCPScope` | `dhcp_scope` |
+| `DHCPScope`, `DHCPPool`, `DHCPStaticAssignment` | `dhcp_scope`, `dhcp_pool`, `dhcp_static_assignment` |
 | `Customer` | `customer` |
 | `Circuit` | `circuit` |
 | `NetworkService` | `network_service` |
