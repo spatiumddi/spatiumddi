@@ -81,7 +81,7 @@ def make_async_redis(url: str, **kwargs: Any) -> aioredis.Redis:
     sentinel_password = settings.redis_sentinel_password or url_password
     sentinel = Sentinel(
         hosts,
-        sentinel_kwargs=({"password": sentinel_password} if sentinel_password else {}),
+        sentinel_kwargs=_sentinel_kwargs(sentinel_password, kwargs),
         password=url_password,
         **kwargs,
     )
@@ -90,6 +90,33 @@ def make_async_redis(url: str, **kwargs: Any) -> aioredis.Redis:
         db=db,
         password=url_password,
     )
+
+
+def _sentinel_kwargs(password: str | None, kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Connection kwargs for the SENTINEL hops, not just the master hop.
+
+    #590 — ``**kwargs`` (socket timeouts et al.) only reaches the
+    master-bound connection pool; the Sentinel objects that
+    ``discover_master`` iterates get ``sentinel_kwargs``, which carried
+    ONLY the password. So a caller's ``socket_connect_timeout=2`` did
+    not bound the sentinel hops at all: connecting to a sentinel whose
+    pod died with its node — but whose headless FQDN still resolves for
+    the ~20-40 s until Kubernetes marks the node's pods not-ready —
+    hangs for the OS TCP connect timeout (minutes, SYNs into a black
+    hole). The api's readiness check walks exactly that path on every
+    probe, so ``/health/ready`` blew straight through the kubelet's 1 s
+    probe timeout and the api sat NotReady cluster-wide during exactly
+    the window a node loss must be survivable (observed live 2026-07-12,
+    kill_leader drill on a nested 3-node rig). Propagate the socket
+    knobs so a dead sentinel costs its timeout, not minutes."""
+    out: dict[str, Any] = {
+        k: v
+        for k, v in kwargs.items()
+        if k in ("socket_connect_timeout", "socket_timeout", "socket_keepalive")
+    }
+    if password:
+        out["password"] = password
+    return out
 
 
 def make_sync_redis(url: str, **kwargs: Any) -> redis_sync.Redis:
@@ -103,7 +130,7 @@ def make_sync_redis(url: str, **kwargs: Any) -> redis_sync.Redis:
     sentinel_password = settings.redis_sentinel_password or url_password
     sentinel = SentinelSync(
         hosts,
-        sentinel_kwargs=({"password": sentinel_password} if sentinel_password else {}),
+        sentinel_kwargs=_sentinel_kwargs(sentinel_password, kwargs),
         password=url_password,
         **kwargs,
     )

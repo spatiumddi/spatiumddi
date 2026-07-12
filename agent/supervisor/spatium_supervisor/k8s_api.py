@@ -501,6 +501,71 @@ def delete_node(name: str) -> tuple[bool, str | None]:
     return False, f"kubeapi status {status}: {resp[:200]!r}"
 
 
+def reclaim_stranded_redis_storage(
+    node: str, namespace: str = "spatium"
+) -> tuple[list[str], str | None]:
+    """Delete Redis PVCs (and their Pending consumer pods) stranded on a
+    just-deleted node — returns (reclaimed_pvc_names, error).
+
+    #590 — local-path PVs are node-affine, so evicting a dead node
+    permanently strands every ReadWriteOnce PVC provisioned on it: the
+    StatefulSet's replacement pod references the old claim and sits
+    ``Pending`` forever ("volume node affinity conflict"). For the
+    Sentinel Redis that is not cosmetic — the missing replica's sentinel
+    silently drops the quorum from 3 to 2, and the NEXT node loss leaves
+    one lone sentinel that can never authorize a failover: the master is
+    stranded, ``sentinel://`` clients never resolve a new one, and the
+    appliance API is down cluster-wide (observed live 2026-07-12; the
+    chart README documented the manual PVC-delete repair — an appliance
+    must do it itself).
+
+    Redis here is cache + Celery broker; Postgres is the store of record,
+    so the data is expendable and the replica resyncs from the master.
+    Deliberately restricted to claims with ``-redis-`` in the name: CNPG
+    manages (deletes + recreates) its own instance PVCs, and anything
+    else is not ours to reap. The PVC goes first (pvc-protection holds it
+    until its pod is gone), then the pod — the StatefulSet then recreates
+    both and the provisioner lands the new PV on a live node."""
+    base = f"/api/v1/namespaces/{quote(namespace)}"
+    try:
+        status, resp = _request("GET", f"{base}/persistentvolumeclaims")
+    except RuntimeError as exc:
+        return [], str(exc)
+    if status != 200:
+        return [], f"kubeapi status {status}: {resp[:200]!r}"
+    try:
+        items = json.loads(resp).get("items", [])
+    except ValueError:
+        return [], "unparseable PVC list"
+    reclaimed: list[str] = []
+    for pvc in items:
+        meta = pvc.get("metadata") or {}
+        name = str(meta.get("name") or "")
+        anns = meta.get("annotations") or {}
+        if "-redis-" not in name:
+            continue
+        if anns.get("volume.kubernetes.io/selected-node") != node:
+            continue
+        try:
+            status, resp = _request(
+                "DELETE", f"{base}/persistentvolumeclaims/{quote(name)}")
+        except RuntimeError as exc:
+            return reclaimed, str(exc)
+        if status not in (200, 202, 404):
+            return reclaimed, f"kubeapi status {status}: {resp[:200]!r}"
+        # volumeClaimTemplate name is the prefix: data-<pod-name>. Delete
+        # the Pending pod so the StatefulSet recreates it against a fresh
+        # claim (an existing pod keeps referencing the deleted PVC).
+        pod = name.partition("-")[2]
+        if pod:
+            try:
+                _request("DELETE", f"{base}/pods/{quote(pod)}")
+            except RuntimeError:
+                pass  # pod may not exist; the PVC reclaim is what matters
+        reclaimed.append(name)
+    return reclaimed, None
+
+
 # #272 — durable control-plane state via k3s HelmChartConfig.
 #
 # The seed supervisor reflects cluster state (control-plane member count,
@@ -770,6 +835,103 @@ def patch_node_labels(
             "PATCH",
             path,
             body=payload,
+            content_type="application/merge-patch+json",
+        )
+    except RuntimeError as exc:
+        return False, str(exc)
+    if status in (200, 201):
+        return True, None
+    return False, f"kubeapi status {status}: {resp[:200]!r}"
+
+
+def ensure_coredns_ha(replicas: int = 2) -> tuple[bool, str | None]:
+    """Keep the k3s-bundled CoreDNS able to survive a node loss —
+    returns (changed, error); ``(False, None)`` means already converged.
+
+    #590 — k3s ships CoreDNS as a SINGLE replica with the default 300 s
+    unreachable toleration, and on an appliance it deterministically
+    lands on the seed (single-node install; members join later; the pod
+    never moves). Hard-kill the seed and cluster DNS is gone for 5
+    minutes — and *everything* the api readiness gate touches resolves
+    through it (the Postgres ``-rw`` Service, the Redis sentinel
+    FQDNs), so every api pod goes NotReady cluster-wide until CoreDNS
+    finally reschedules. Observed live 2026-07-12: kill_leader failed
+    identically across four builds while postgres/redis fixes landed,
+    because DNS was the common upstream casualty.
+
+    Reconciled from the seed's heartbeat (idempotent GET-then-patch):
+    k3s re-applies its bundled manifest on every restart, which resets
+    replicas to 1 — a one-shot patch would silently regress, the
+    heartbeat re-converges it. The toleration list is REPLACED by the
+    merge-patch, so the stock entries ride along with the fast-evict
+    pair (same 20 s rationale as api/frontend/worker/postgresql/redis).
+
+    REQUIRED (not preferred) anti-affinity, deliberately: the reconciler
+    first fires while the appliance is still a single node (firstboot —
+    members join minutes later), and preferred anti-affinity happily
+    parked BOTH replicas on the seed; Kubernetes never rebalances
+    running pods, so the "HA" DNS died with the seed anyway (observed
+    live 2026-07-12: both coredns replicas Terminating in the same
+    kill_leader window the fix was meant to survive). Under required
+    anti-affinity the second replica sits Pending until a member joins
+    and then schedules there — a Pending spare on a genuinely
+    single-node box is harmless (the first replica serves), a
+    co-located spare is worthless."""
+    path = "/apis/apps/v1/namespaces/kube-system/deployments/coredns"
+    try:
+        status, resp = _request("GET", path)
+    except RuntimeError as exc:
+        return False, str(exc)
+    if status != 200:
+        return False, f"kubeapi status {status}: {resp[:200]!r}"
+    try:
+        dep = json.loads(resp)
+    except ValueError:
+        return False, "unparseable coredns deployment"
+    spec = dep.get("spec") or {}
+    tmpl_spec = (spec.get("template") or {}).get("spec") or {}
+    tolerations = tmpl_spec.get("tolerations") or []
+    has_fast_evict = any(
+        t.get("key") == "node.kubernetes.io/unreachable"
+        and (t.get("tolerationSeconds") or 10**9) <= 30
+        for t in tolerations
+    )
+    has_required_spread = bool(
+        ((tmpl_spec.get("affinity") or {}).get("podAntiAffinity") or {})
+        .get("requiredDuringSchedulingIgnoredDuringExecution")
+    )
+    if (int(spec.get("replicas") or 0) >= replicas and has_fast_evict
+            and has_required_spread):
+        return False, None
+    fast = [
+        {"key": "node.kubernetes.io/unreachable", "operator": "Exists",
+         "effect": "NoExecute", "tolerationSeconds": 20},
+        {"key": "node.kubernetes.io/not-ready", "operator": "Exists",
+         "effect": "NoExecute", "tolerationSeconds": 20},
+    ]
+    keep = [t for t in tolerations
+            if t.get("key") not in ("node.kubernetes.io/unreachable",
+                                    "node.kubernetes.io/not-ready")]
+    spread = {
+        "podAntiAffinity": {
+            "requiredDuringSchedulingIgnoredDuringExecution": [{
+                "topologyKey": "kubernetes.io/hostname",
+                "labelSelector": {"matchLabels": {"k8s-app": "kube-dns"}},
+            }],
+        },
+    }
+    payload = json.dumps({
+        "spec": {
+            "replicas": replicas,
+            "template": {"spec": {
+                "tolerations": keep + fast,
+                "affinity": spread,
+            }},
+        },
+    }).encode("utf-8")
+    try:
+        status, resp = _request(
+            "PATCH", path, body=payload,
             content_type="application/merge-patch+json",
         )
     except RuntimeError as exc:

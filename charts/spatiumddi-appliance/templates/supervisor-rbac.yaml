@@ -87,6 +87,20 @@ rules:
   - apiGroups: [""]
     resources: ["pods", "services", "events", "configmaps"]
     verbs: ["get", "list", "watch"]
+    # #590/#272 Phase 9 — the dead-node evict reclaims Redis PVCs the
+    # deleted node stranded (node-affine local-path PVs), then deletes
+    # the Pending consumer pod so the StatefulSet recreates both on a
+    # live node (k8s_api.reclaim_stranded_redis_storage, run from the
+    # seed's heartbeat right after delete_node). Without the reclaim the
+    # missing replica's sentinel silently halves the failover quorum and
+    # the next node loss strands the Redis master for good. delete on
+    # pods+PVCs only — everything else in this Role stays read-only.
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -158,7 +172,20 @@ rules:
     # + ``update`` cover both the merge-patch form used by
     # k8s_api.patch_node_labels and a fallback strategic-merge if we
     # ever switch.
-    verbs: ["get", "list", "watch", "patch", "update"]
+    #
+    # #590/#272 Phase 9 — ``delete``: the dead-node replacement evict is
+    # the SEED SUPERVISOR calling ``k8s_api.delete_node()`` from its
+    # heartbeat (deleting the k8s Node makes k3s drop the etcd member).
+    # Without this verb every evict 403s
+    # (``supervisor.heartbeat.node_evict_failed`` each heartbeat), the
+    # row stays pinned in ``evicting``, and — because the product
+    # serializes the replacement member's join behind the evict — the
+    # replacement never joins: observed live 2026-07-12 as the ha
+    # suite's dead_node_replace stuck at nodes_ready=2 for 30 min with
+    # the dead Node still listed NotReady (and 2026-07-08 as a member
+    # sitting ``evicting`` 20+ min). The feature shipped without the
+    # RBAC verb it depends on.
+    verbs: ["get", "list", "watch", "patch", "update", "delete"]
     # #389 — read-only on the k3s ETCDSnapshotFile CRs so the
     # heartbeat's ``list_etcd_snapshots()`` can populate the Fleet →
     # etcd snapshots inventory. Without this grant the
@@ -171,6 +198,16 @@ rules:
   - apiGroups: ["k3s.cattle.io"]
     resources: ["etcdsnapshotfiles"]
     verbs: ["get", "list", "watch"]
+    # #590 — ensure_coredns_ha: the seed's heartbeat keeps the k3s-bundled
+    # CoreDNS at >=2 replicas with fast-evict tolerations (k3s resets it to
+    # a single 300s-toleration replica on every restart; a single replica
+    # deterministically sits on the seed, so a hard seed kill silences all
+    # Service/pod-FQDN resolution — api readiness's Postgres + Redis
+    # lookups included — for 5 minutes). resourceNames-pinned to coredns.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: ["coredns"]
+    verbs: ["get", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

@@ -47,6 +47,32 @@ engine = create_async_engine(
     #     produce the same symptom without pre-ping; with it, the
     #     pool quietly recycles and the request succeeds.
     pool_pre_ping=True,
+    # #590 — pre-ping only helps when a dead connection FAILS FAST
+    # (postgres restarted on a live host → RST). A node death is a
+    # BLACK HOLE: the peer vanishes mid-connection, nothing answers,
+    # and the ping's SELECT 1 waits out the OS TCP retransmission
+    # timeout — minutes — while holding the checkout. Every pooled
+    # connection that pointed at the dead node poisons requests in
+    # turn, /health/ready's database check included, so the api sat
+    # NotReady cluster-wide long after CNPG had already promoted a
+    # new primary (observed live 2026-07-12: the survivor's readiness
+    # still timing out 3+ min into a kill_leader drill while the
+    # postgres -rw endpoint was healthy the whole time).
+    #
+    #   * command_timeout bounds EVERY command on the wire, the
+    #     pre-ping included: a black-holed connection now raises in
+    #     30 s instead of minutes, SQLAlchemy invalidates it, and the
+    #     retry connects fresh — which lands on the NEW primary via
+    #     the Service. Ceiling chosen well above any legitimate
+    #     single statement in the app path (route handlers are many
+    #     small queries; bulk work is chunked; alembic runs on its
+    #     own engine and is unaffected).
+    #   * timeout bounds the fresh CONNECT during failover, so a
+    #     half-open target costs 5 s, not the OS default.
+    connect_args={
+        "timeout": 5,
+        "command_timeout": 30,
+    },
 )
 
 AsyncSessionLocal = async_sessionmaker(
