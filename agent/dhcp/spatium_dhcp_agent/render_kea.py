@@ -39,7 +39,6 @@ A minimal bundle looks like::
         "client_classes": [
             {"name": "voip", "test": "substring(option[60].hex,0,12) == 'Cisco-Phone'"}
         ],
-        "reservation_mode": "all",
     }
 
 NTP servers are REQUIRED to be emitted as DHCP option 42 (RFC 2132). Users
@@ -751,9 +750,6 @@ def render(
 
     if rendered_classes:
         dhcp4["client-classes"] = rendered_classes
-
-    if bundle.get("reservation_mode"):
-        dhcp4["reservation-mode"] = bundle["reservation_mode"]
 
     out: dict[str, Any] = {"Dhcp4": dhcp4}
 

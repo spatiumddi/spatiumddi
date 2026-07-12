@@ -2984,6 +2984,12 @@ type CollisionWarning =
       existing_hostname: string | null;
       existing_subnet: string;
       existing_ip_id: string;
+    }
+  | {
+      kind: "dynamic_pool";
+      address: string;
+      pool_start: string | null;
+      pool_end: string | null;
     };
 
 function parseCollisionWarnings(err: unknown): CollisionWarning[] | null {
@@ -3020,6 +3026,16 @@ function CollisionWarningBanner({
                 FQDN <span className="font-mono">{w.fqdn}</span> is already on{" "}
                 <span className="font-mono">{w.existing_ip}</span> in{" "}
                 <span className="font-mono">{w.existing_subnet}</span>
+              </>
+            ) : w.kind === "dynamic_pool" ? (
+              <>
+                <span className="font-mono">{w.address}</span> is inside dynamic
+                DHCP pool{" "}
+                <span className="font-mono">
+                  {w.pool_start}–{w.pool_end}
+                </span>
+                . The DHCP server may lease it to another client — also add a
+                matching static reservation on the scope.
               </>
             ) : (
               <>
@@ -3110,8 +3126,9 @@ function AddAddressModal({
   }, [needsDhcpScope, dhcpScopes.length]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Which dynamic pool does the manually-entered IP fall in, if any?
-  // Server-side ``create_address`` will reject with 422 regardless, but
-  // a red inline warning + disabled submit button is friendlier.
+  // In-pool allocation is allowed (#631) — the server returns a soft,
+  // force-overridable collision warning — so this drives an amber advisory,
+  // not a hard block, telling the operator to also pin a static reservation.
   const typedDynamicPool = (() => {
     if (mode !== "manual" || !address) return null;
     const ipInt = ipStringToInt(address);
@@ -3316,7 +3333,7 @@ function AddAddressModal({
   const canSubmit =
     !!hostname.trim() &&
     !hostnameErr &&
-    (mode === "next" ? !!nextPreview?.address : !!address && !typedDynamicPool);
+    (mode === "next" ? !!nextPreview?.address : !!address);
 
   // Compute preview FQDN
   const selectedZone = availableZones.find((z: DNSZone) => z.id === dnsZoneId);
@@ -3436,13 +3453,15 @@ function AddAddressModal({
               autoFocus
             />
             {typedDynamicPool && (
-              <p className="mt-1 rounded-md border border-destructive/40 bg-destructive/10 px-2 py-1 text-xs text-destructive">
+              <p className="mt-1 rounded-md border border-amber-500/50 bg-amber-500/10 px-2 py-1 text-xs text-amber-700 dark:text-amber-400">
                 {address} is inside the dynamic DHCP pool{" "}
                 <span className="font-mono">
                   {typedDynamicPool.start_ip}–{typedDynamicPool.end_ip}
                 </span>
                 {typedDynamicPool.name ? ` (${typedDynamicPool.name})` : ""}.
-                The DHCP server owns this range — pick an address outside it.
+                Allowed, but the DHCP server may also lease it — add a matching
+                static reservation on the scope so it isn't handed to another
+                client.
               </p>
             )}
           </Field>

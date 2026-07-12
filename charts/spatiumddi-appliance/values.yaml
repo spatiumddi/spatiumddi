@@ -301,6 +301,47 @@ cnpg:
     limits:
       cpu: 500m
       memory: 512Mi
+  # #590 — the operator itself must survive node loss, because it IS the
+  # failover: with the operator down, CNPG performs no reconciliation, so a
+  # dead node holding the Postgres primary is never failed over and the api
+  # (which needs a writable primary to be ready) 502s cluster-wide until the
+  # operator comes back. The #590 fast-evict work covered the
+  # spatium-control workloads (api/frontend/worker via the supervisor's
+  # HelmChartConfig, postgresql/redis instance pods via the spatiumddi
+  # chart) but MISSED this operator: a single replica with the k8s-default
+  # 300 s unreachable toleration. Kill the node it happens to sit on and
+  # Postgres failover stalls ~5 minutes — observed live 2026-07-11 as the
+  # ha suite's kill_leader "did not recover" (60 s spec).
+  #
+  # Two layers, same shape as the rest of #590:
+  #  * replicaCount 2 + preferred pod anti-affinity: a single node loss
+  #    never takes the only operator; controller-runtime leader election
+  #    hands the lease to the survivor in seconds. (Preferred, not
+  #    required — a momentarily-unlabelled fresh member must not leave the
+  #    second replica Pending forever; co-location is a degraded-but-safe
+  #    fallback, and the tolerations below still bound it.)
+  #  * fast-evict tolerations: even a co-located replica leaves a dead
+  #    node in ~20 s instead of 300 s (suppresses DefaultTolerationSeconds,
+  #    exactly like api/frontend/worker/postgresql/redis).
+  replicaCount: 2
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            topologyKey: kubernetes.io/hostname
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/name: cloudnative-pg
+  tolerations:
+    - key: node.kubernetes.io/unreachable
+      operator: Exists
+      effect: NoExecute
+      tolerationSeconds: 20
+    - key: node.kubernetes.io/not-ready
+      operator: Exists
+      effect: NoExecute
+      tolerationSeconds: 20
   # Loosen the default 3s-delay / 30s-window (6 × 5s) startup gate — on
   # constrained appliance VMs the operator + its webhook TLS bootstrap
   # can take longer than 30s to answer ``/readyz``, and a startup-probe

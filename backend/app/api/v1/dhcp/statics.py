@@ -16,7 +16,7 @@ from app.api.v1.dhcp._audit import write_audit
 from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.dns_names import validate_hostname
 from app.core.permissions import require_resource_permission
-from app.models.dhcp import DHCPPool, DHCPScope, DHCPStaticAssignment
+from app.models.dhcp import DHCPScope, DHCPStaticAssignment
 from app.models.ipam import Subnet
 from app.services.dhcp.static_ipam import detach_ipam_for_static, upsert_ipam_for_static
 from app.services.dhcp.windows_writethrough import push_static_change
@@ -182,19 +182,17 @@ async def _conflict_check(
                 ),
             )
 
-    # IP inside existing pool of this scope — reject if dynamic
-    pools_res = await db.execute(select(DHCPPool).where(DHCPPool.scope_id == scope.id))
-    for p in pools_res.scalars().all():
-        try:
-            start = ipaddress.ip_address(str(p.start_ip))
-            end = ipaddress.ip_address(str(p.end_ip))
-        except ValueError:
-            continue
-        if start <= ip_addr <= end and p.pool_type == "dynamic":
-            raise HTTPException(
-                status_code=409,
-                detail=f"IP {ip} falls inside dynamic pool {p.start_ip}-{p.end_ip}; exclude it first",
-            )
+    # NOTE: a reservation whose IP lands inside a *dynamic* pool is explicitly
+    # allowed. Pinning a MAC inside the range is the standard idiom on every
+    # driver we ship — Kea honours it (default ``reservations-out-of-pool:
+    # false`` runs the in-pool check and won't hand the address to another
+    # client), FortiGate renders ``reserved-address`` independently of
+    # ``ip-range``, and Windows *requires* the reservation to fall inside the
+    # scope's StartRange–EndRange (which is derived from the dynamic pool). The
+    # old in-pool 409 had no driver basis, its "exclude it first" workaround was
+    # a no-op or actively harmful, and it looked like it broke Windows statics
+    # outright (#631). Pool occupancy accounts for these reservations separately
+    # (``services/dhcp/pool_occupancy.py``).
 
 
 @router.get("/scopes/{scope_id}/statics", response_model=list[StaticResponse])
