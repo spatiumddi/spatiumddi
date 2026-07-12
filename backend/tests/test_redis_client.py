@@ -37,3 +37,33 @@ def test_parse_sentinel_url_no_db_path() -> None:
     assert hosts == [("only", 26379)]
     assert db == 0
     assert password is None
+
+
+def test_sentinel_kwargs_propagates_socket_knobs() -> None:
+    # #590 — the sentinel hops must inherit the caller's timeouts: without
+    # them, connecting to a sentinel whose pod died with its node (but whose
+    # FQDN still resolves for the ~20-40s until Kubernetes marks the node's
+    # pods not-ready) hangs for the OS TCP timeout, and the api readiness
+    # check rides that hang straight through the kubelet's 1s probe timeout.
+    from app.core.redis_client import _sentinel_kwargs
+
+    out = _sentinel_kwargs("pw", {
+        "socket_connect_timeout": 2,
+        "socket_timeout": 2,
+        "socket_keepalive": True,
+        "db": 0,                      # not a socket knob — must not leak
+        "decode_responses": True,     # not a socket knob — must not leak
+    })
+    assert out == {
+        "socket_connect_timeout": 2,
+        "socket_timeout": 2,
+        "socket_keepalive": True,
+        "password": "pw",
+    }
+
+
+def test_sentinel_kwargs_without_password_or_knobs() -> None:
+    from app.core.redis_client import _sentinel_kwargs
+
+    assert _sentinel_kwargs(None, {}) == {}
+    assert _sentinel_kwargs(None, {"socket_timeout": 5}) == {"socket_timeout": 5}
