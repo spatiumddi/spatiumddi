@@ -87,6 +87,20 @@ rules:
   - apiGroups: [""]
     resources: ["pods", "services", "events", "configmaps"]
     verbs: ["get", "list", "watch"]
+    # #590/#272 Phase 9 — the dead-node evict reclaims Redis PVCs the
+    # deleted node stranded (node-affine local-path PVs), then deletes
+    # the Pending consumer pod so the StatefulSet recreates both on a
+    # live node (k8s_api.reclaim_stranded_redis_storage, run from the
+    # seed's heartbeat right after delete_node). Without the reclaim the
+    # missing replica's sentinel silently halves the failover quorum and
+    # the next node loss strands the Redis master for good. delete on
+    # pods+PVCs only — everything else in this Role stays read-only.
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

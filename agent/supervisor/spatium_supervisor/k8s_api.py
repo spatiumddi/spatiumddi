@@ -501,6 +501,71 @@ def delete_node(name: str) -> tuple[bool, str | None]:
     return False, f"kubeapi status {status}: {resp[:200]!r}"
 
 
+def reclaim_stranded_redis_storage(
+    node: str, namespace: str = "spatium"
+) -> tuple[list[str], str | None]:
+    """Delete Redis PVCs (and their Pending consumer pods) stranded on a
+    just-deleted node — returns (reclaimed_pvc_names, error).
+
+    #590 — local-path PVs are node-affine, so evicting a dead node
+    permanently strands every ReadWriteOnce PVC provisioned on it: the
+    StatefulSet's replacement pod references the old claim and sits
+    ``Pending`` forever ("volume node affinity conflict"). For the
+    Sentinel Redis that is not cosmetic — the missing replica's sentinel
+    silently drops the quorum from 3 to 2, and the NEXT node loss leaves
+    one lone sentinel that can never authorize a failover: the master is
+    stranded, ``sentinel://`` clients never resolve a new one, and the
+    appliance API is down cluster-wide (observed live 2026-07-12; the
+    chart README documented the manual PVC-delete repair — an appliance
+    must do it itself).
+
+    Redis here is cache + Celery broker; Postgres is the store of record,
+    so the data is expendable and the replica resyncs from the master.
+    Deliberately restricted to claims with ``-redis-`` in the name: CNPG
+    manages (deletes + recreates) its own instance PVCs, and anything
+    else is not ours to reap. The PVC goes first (pvc-protection holds it
+    until its pod is gone), then the pod — the StatefulSet then recreates
+    both and the provisioner lands the new PV on a live node."""
+    base = f"/api/v1/namespaces/{quote(namespace)}"
+    try:
+        status, resp = _request("GET", f"{base}/persistentvolumeclaims")
+    except RuntimeError as exc:
+        return [], str(exc)
+    if status != 200:
+        return [], f"kubeapi status {status}: {resp[:200]!r}"
+    try:
+        items = json.loads(resp).get("items", [])
+    except ValueError:
+        return [], "unparseable PVC list"
+    reclaimed: list[str] = []
+    for pvc in items:
+        meta = pvc.get("metadata") or {}
+        name = str(meta.get("name") or "")
+        anns = meta.get("annotations") or {}
+        if "-redis-" not in name:
+            continue
+        if anns.get("volume.kubernetes.io/selected-node") != node:
+            continue
+        try:
+            status, resp = _request(
+                "DELETE", f"{base}/persistentvolumeclaims/{quote(name)}")
+        except RuntimeError as exc:
+            return reclaimed, str(exc)
+        if status not in (200, 202, 404):
+            return reclaimed, f"kubeapi status {status}: {resp[:200]!r}"
+        # volumeClaimTemplate name is the prefix: data-<pod-name>. Delete
+        # the Pending pod so the StatefulSet recreates it against a fresh
+        # claim (an existing pod keeps referencing the deleted PVC).
+        pod = name.partition("-")[2]
+        if pod:
+            try:
+                _request("DELETE", f"{base}/pods/{quote(pod)}")
+            except RuntimeError:
+                pass  # pod may not exist; the PVC reclaim is what matters
+        reclaimed.append(name)
+    return reclaimed, None
+
+
 # #272 — durable control-plane state via k3s HelmChartConfig.
 #
 # The seed supervisor reflects cluster state (control-plane member count,

@@ -1040,6 +1040,27 @@ def heartbeat_once(
             if ok:
                 _evicted_pending.add(str(name))
                 log.info("supervisor.heartbeat.node_evicted", node=name)
+                # #590 — the deleted node strands any local-path Redis PVC
+                # provisioned on it (node-affine PV): the replacement
+                # replica sits Pending forever and its missing sentinel
+                # silently halves the failover quorum, so the NEXT node
+                # loss takes the whole API down. Reclaim now — the
+                # StatefulSet recreates pod + claim on a live node and the
+                # replica resyncs from the master (cache/broker data;
+                # Postgres is the store of record).
+                pvcs, pvc_err = k8s_api.reclaim_stranded_redis_storage(str(name))
+                if pvcs:
+                    log.info(
+                        "supervisor.heartbeat.redis_storage_reclaimed",
+                        node=name,
+                        pvcs=pvcs,
+                    )
+                elif pvc_err:
+                    log.warning(
+                        "supervisor.heartbeat.redis_storage_reclaim_failed",
+                        node=name,
+                        error=pvc_err,
+                    )
             else:
                 log.warning(
                     "supervisor.heartbeat.node_evict_failed", node=name, error=evict_err
