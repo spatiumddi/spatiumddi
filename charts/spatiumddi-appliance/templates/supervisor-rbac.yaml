@@ -198,6 +198,16 @@ rules:
   - apiGroups: ["k3s.cattle.io"]
     resources: ["etcdsnapshotfiles"]
     verbs: ["get", "list", "watch"]
+    # #590 — ensure_coredns_ha: the seed's heartbeat keeps the k3s-bundled
+    # CoreDNS at >=2 replicas with fast-evict tolerations (k3s resets it to
+    # a single 300s-toleration replica on every restart; a single replica
+    # deterministically sits on the seed, so a hard seed kill silences all
+    # Service/pod-FQDN resolution — api readiness's Postgres + Redis
+    # lookups included — for 5 minutes). resourceNames-pinned to coredns.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: ["coredns"]
+    verbs: ["get", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

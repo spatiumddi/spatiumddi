@@ -1067,6 +1067,20 @@ def heartbeat_once(
                 )
         _evicted_pending.intersection_update({str(n) for n in evict_names})
 
+        # #590 — cluster DNS must survive a node loss. k3s's bundled
+        # CoreDNS is a single replica that deterministically sits on the
+        # seed and takes the k8s-default 300 s to evict, so a hard seed
+        # kill silences ALL Service/pod-FQDN resolution — the api
+        # readiness gate's Postgres and Redis lookups included — for
+        # longer than the whole recovery budget. Re-converged every
+        # heartbeat because k3s re-applies its bundled manifest (replicas
+        # back to 1) on every restart.
+        dns_changed, dns_err = k8s_api.ensure_coredns_ha()
+        if dns_changed:
+            log.info("supervisor.heartbeat.coredns_ha_applied")
+        elif dns_err:
+            log.warning("supervisor.heartbeat.coredns_ha_failed", error=dns_err)
+
     # #170 Wave C2 — render the role-driven compose env. C3 will
     # consume this via ``docker compose --env-file`` to actually
     # bring services up/down; for now we just write the file so the
