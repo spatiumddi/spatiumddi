@@ -41,7 +41,7 @@ from app.models.dhcp import (
     DHCPStaticAssignment,
 )
 from app.models.ipam import IPBlock, IPSpace, Subnet
-from app.services.dhcp.static_ipam import detach_ipam_for_scope_statics
+from app.services.dhcp.static_ipam import remove_ipam_for_scope_statics
 
 from .canonical import (
     ConflictAction,
@@ -347,9 +347,11 @@ async def _commit_one_scope(
         # freeing the unique slot before the recreate flush.
         #
         # The reservations go via FK CASCADE, which runs no Python, so their
-        # IPAM mirrors have to be released here or the addresses are stranded at
+        # IPAM mirrors have to be removed here or the addresses are stranded at
         # ``status="static_dhcp"`` pointing at rows Postgres has dropped (#618).
-        await detach_ipam_for_scope_statics(db, existing.id)
+        # Delete the mirror rows (not just free them) so the IPs fold back into
+        # free gaps in the subnet view.
+        await remove_ipam_for_scope_statics(db, existing.id)
         await db.delete(existing)
         await db.flush()
         overwrote = True

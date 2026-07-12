@@ -389,11 +389,12 @@ async def test_permanent_scope_delete_releases_ipam_mirror(
     db_session.expire_all()
     mirror_after = (
         await db_session.execute(select(IPAddress).where(IPAddress.id == mirror_id))
-    ).scalar_one()
-    # Released to `available`, not `allocated` (#478: an allocated row would
-    # shadow a future dynamic lease at that IP and never be reaped).
-    assert mirror_after.status == "available"
-    assert mirror_after.static_assignment_id is None
+    ).scalar_one_or_none()
+    # The mirror ROW is deleted, not just freed to "available" (#623). A persisted
+    # "available" row still renders as a visible line in the subnet table, so a
+    # former reservation kept showing after its scope was gone. Deleting folds the
+    # IP back into a free gap and drops it out of the utilization count.
+    assert mirror_after is None
 
 
 # ── #619 — validation gaps ────────────────────────────────────────────────
@@ -656,16 +657,17 @@ async def test_purge_sweep_releases_ipam_mirror_of_reservations(
     await db_session.commit()
 
     result = await _sweep()
-    assert result["ipam_mirrors_released"] >= 1, result
     assert result["per_type"]["dhcp_static_assignment"] >= 1, result
 
     db_session.expire_all()
+    # The mirror ROW is gone (#623). It's now deleted at soft-delete time, and the
+    # purge sweep's own remove pass is defense-in-depth — either way the IP is no
+    # longer stranded at ``static_dhcp`` and has folded back into a free gap.
     mirror = (
         await db_session.execute(
             select(IPAddress).where(
                 IPAddress.subnet_id == subnet_id, IPAddress.address == "10.50.0.50"
             )
         )
-    ).scalar_one()
-    assert mirror.status == "available"
-    assert mirror.static_assignment_id is None
+    ).scalar_one_or_none()
+    assert mirror is None

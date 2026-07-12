@@ -10,19 +10,21 @@ expired and its IPAM row (if auto_from_lease) removed.
 from __future__ import annotations
 
 import asyncio
-import ipaddress
-import uuid
 from datetime import UTC, datetime, timedelta
 
 import structlog
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.celery_app import celery_app
 from app.db import task_session
-from app.models.dhcp import DHCPLease, DHCPScope
-from app.models.ipam import IPAddress, Subnet
+from app.models.dhcp import DHCPLease
+from app.models.ipam import IPAddress
+
+# The subnet resolvers now live in services/dhcp/lease_cleanup.py (so a service no
+# longer imports *up* from a task — servers.py:delete_lease used to); the sweep
+# imports them back here.
+from app.services.dhcp.lease_cleanup import _load_subnet_cache, _resolve_lease_subnet_id
 from app.services.dhcp.lease_history import record_lease_history
 
 logger = structlog.get_logger(__name__)
@@ -39,65 +41,6 @@ EXPIRY_GRACE = timedelta(minutes=5)
 # lease *history* is permanent regardless, so deleting the live row loses
 # nothing and a renewal just creates a fresh active row.
 EXPIRED_DELETE_GRACE = timedelta(hours=24)
-
-
-async def _load_subnet_cache(
-    db: AsyncSession,
-) -> list[tuple[uuid.UUID, ipaddress.IPv4Network | ipaddress.IPv6Network]]:
-    """Load ``(subnet_id, parsed_network)`` for every subnet ONCE per sweep.
-
-    ``_resolve_lease_subnet_id`` used to run a full ``SELECT id, network
-    FROM subnet`` for every stale lease when it lacked a scope backlink —
-    O(stale_leases × subnets) round-trips + reparse per lease. Loading the
-    list once (and pre-parsing each CIDR) keeps the longest-prefix fallback
-    at a single query per sweep, mirroring the pull-leases path. Unparseable
-    networks are dropped up front so the per-lease loop stays clean.
-    """
-    cache: list[tuple[uuid.UUID, ipaddress.IPv4Network | ipaddress.IPv6Network]] = []
-    for sid, network in (await db.execute(select(Subnet.id, Subnet.network))).all():
-        try:
-            cache.append((sid, ipaddress.ip_network(str(network), strict=False)))
-        except (ValueError, TypeError):
-            continue
-    return cache
-
-
-async def _resolve_lease_subnet_id(
-    db: AsyncSession,
-    lease: DHCPLease,
-    subnet_cache: (
-        list[tuple[uuid.UUID, ipaddress.IPv4Network | ipaddress.IPv6Network]] | None
-    ) = None,
-) -> uuid.UUID | None:
-    """Find the IPAM subnet that owns this lease's address.
-
-    SpatiumDDI allows overlapping private ranges across IPSpaces/VRFs, so
-    the same address (e.g. 10.0.0.50) can be a valid auto_from_lease
-    mirror in multiple subnets. Scope the mirror cleanup to the lease's
-    own subnet so expiring one subnet's lease can't drop another's
-    mirror. Prefer the lease's scope FK (DHCPScope.subnet_id); fall back
-    to longest-prefix match over ``subnet_cache`` when the lease has no
-    scope backlink. The sweep passes a cache loaded ONCE per run; the
-    single-lease delete path leaves it None and we load it on demand.
-    """
-    if lease.scope_id is not None:
-        subnet_id = (
-            await db.execute(select(DHCPScope.subnet_id).where(DHCPScope.id == lease.scope_id))
-        ).scalar_one_or_none()
-        if subnet_id is not None:
-            return subnet_id
-
-    try:
-        addr = ipaddress.ip_address(str(lease.ip_address))
-    except (ValueError, TypeError):
-        return None
-    if subnet_cache is None:
-        subnet_cache = await _load_subnet_cache(db)
-    best: tuple[int, uuid.UUID] | None = None
-    for sid, net in subnet_cache:
-        if addr in net and (best is None or net.prefixlen > best[0]):
-            best = (net.prefixlen, sid)
-    return best[1] if best else None
 
 
 async def _sweep() -> tuple[int, int]:

@@ -118,6 +118,40 @@ async def test_empty_wire_skips_absence_delete(
 
 
 @pytest.mark.asyncio
+async def test_empty_wire_authoritative_when_no_live_scope(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the server's group has no live scope left (e.g. its last scope was
+    just deleted), an empty wire is authoritative: the absence-delete runs and
+    reclaims the stranded lease + mirror instead of waiting for the time-based
+    expiry sweep (#623). The hiccup guard only applies while a live scope remains.
+    """
+    from datetime import UTC, datetime
+
+    from app.services.dhcp import pull_leases as pl
+
+    srv, lease, mirror = await _server_with_active_lease(db_session)
+    # Soft-delete the group's only scope so it no longer counts as "live".
+    scope = (
+        await db_session.execute(select(DHCPScope).where(DHCPScope.group_id == srv.server_group_id))
+    ).scalar_one()
+    scope.deleted_at = datetime.now(UTC)
+    await db_session.commit()
+
+    _patch(monkeypatch, [])  # empty wire
+    result = await pl.pull_leases_from_server(db_session, srv, apply=True)
+    await db_session.commit()
+
+    assert result.removed == 1
+    assert (
+        await db_session.execute(select(DHCPLease).where(DHCPLease.id == lease.id))
+    ).scalar_one_or_none() is None
+    assert (
+        await db_session.execute(select(IPAddress).where(IPAddress.id == mirror.id))
+    ).scalar_one_or_none() is None
+
+
+@pytest.mark.asyncio
 async def test_nonempty_wire_still_absence_deletes(
     db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:

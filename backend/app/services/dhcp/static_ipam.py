@@ -45,6 +45,9 @@ from app.services.dhcp.ipam_mirror import insert_ipam_mirror_row
 __all__ = [
     "detach_ipam_for_scope_statics",
     "detach_ipam_for_static",
+    "remirror_scope_statics",
+    "remove_ipam_for_scope_statics",
+    "remove_ipam_for_static",
     "upsert_ipam_for_static",
 ]
 
@@ -165,4 +168,78 @@ async def detach_ipam_for_scope_statics(
     statics = list(res.scalars().all())
     for st in statics:
         await detach_ipam_for_static(db, st, to_status=to_status)
+    return len(statics)
+
+
+async def remove_ipam_for_static(db: AsyncSession, st: DHCPStaticAssignment) -> int:
+    """DELETE the IPAM mirror row(s) for a reservation (not just free them).
+
+    ``detach_ipam_for_static`` sets ``status="available"`` and keeps the row.
+    But a persisted ``available`` row still renders as an explicit line in the
+    IPAM subnet table (the frontend paints one row per address; "free" is the
+    *absence* of a row), so a former reservation kept lingering visibly after
+    its scope was deleted — and kept counting toward the subnet's utilization.
+    This deletes the ``ip_address`` mirror so the IP folds back into a
+    "N free · click to allocate" gap and drops out of the allocated count.
+
+    Tears down the forward/reverse DNS first (same as the detach path). Used by
+    the wholesale reservation-removal paths (scope / group / import / purge).
+    Returns the number of rows removed.
+    """
+    from app.api.v1.ipam.router import _sync_dns_record  # noqa: PLC0415
+
+    res = await db.execute(select(IPAddress).where(IPAddress.static_assignment_id == str(st.id)))
+    removed = 0
+    for row in res.scalars().all():
+        subnet_row = await db.get(Subnet, row.subnet_id)
+        if subnet_row is not None:
+            try:
+                await _sync_dns_record(db, row, subnet_row, action="delete")
+            except Exception:  # noqa: BLE001 — DNS sync is best-effort
+                pass
+        # Clear the forward FK before the delete so the ORM's in-memory
+        # ``st`` doesn't hang onto a stale id (the DB FK is ON DELETE SET NULL).
+        if st.ip_address_id == row.id:
+            st.ip_address_id = None
+        await db.delete(row)
+        removed += 1
+    return removed
+
+
+async def remove_ipam_for_scope_statics(db: AsyncSession, scope_id: uuid.UUID) -> int:
+    """DELETE the IPAM mirror of every reservation under ``scope_id``.
+
+    The delete-the-row counterpart to ``detach_ipam_for_scope_statics`` (see
+    ``remove_ipam_for_static`` for why deleting, not freeing, is required). Uses
+    ``include_deleted`` because the reservations may already be soft-deleted as
+    part of their scope's batch by the time this runs. Returns the number of
+    mirror rows removed.
+    """
+    res = await db.execute(
+        select(DHCPStaticAssignment)
+        .where(DHCPStaticAssignment.scope_id == scope_id)
+        .execution_options(include_deleted=True)
+    )
+    removed = 0
+    for st in res.scalars().all():
+        removed += await remove_ipam_for_static(db, st)
+    return removed
+
+
+async def remirror_scope_statics(db: AsyncSession, scope: DHCPScope) -> int:
+    """Re-create the IPAM mirror for each of a restored scope's reservations.
+
+    Counterpart to ``remove_ipam_for_scope_statics``: soft-deleting a scope now
+    deletes its ``static_dhcp`` mirror rows, so a Trash restore has to put them
+    back. ``upsert_ipam_for_static`` re-creates the row (status + back-link) and
+    re-syncs DNS; its #564 savepoint self-heal reclaims the IP if it was taken
+    during the Trash window (the static is the source of truth). Call AFTER the
+    batch has been un-stamped so the statics are visible. Returns the count.
+    """
+    res = await db.execute(
+        select(DHCPStaticAssignment).where(DHCPStaticAssignment.scope_id == scope.id)
+    )
+    statics = list(res.scalars().all())
+    for st in statics:
+        await upsert_ipam_for_static(db, scope, st, action="create")
     return len(statics)

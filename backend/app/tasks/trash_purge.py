@@ -26,7 +26,7 @@ from app.models.dhcp import DHCPPool, DHCPScope, DHCPStaticAssignment
 from app.models.dns import DNSRecord, DNSZone
 from app.models.ipam import IPBlock, IPSpace, Subnet
 from app.models.settings import PlatformSettings
-from app.services.dhcp.static_ipam import detach_ipam_for_static
+from app.services.dhcp.static_ipam import remove_ipam_for_static
 
 logger = structlog.get_logger(__name__)
 
@@ -84,7 +84,7 @@ async def _release_ipam_mirrors(db: Any, cutoff: datetime) -> int:
     )
     statics = list(res.scalars().all())
     for st in statics:
-        await detach_ipam_for_static(db, st)
+        await remove_ipam_for_static(db, st)
     if statics:
         await db.flush()
     return len(statics)
