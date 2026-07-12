@@ -59,8 +59,7 @@ def test_reclaims_redis_pvc_and_pending_pod_on_dead_node(monkeypatch) -> None:
     assert (reclaimed, err) == (["data-spatium-control-spatiumddi-redis-2"], None)
     # PVC first (pvc-protection holds it until its pod is gone), then the pod.
     assert rec.deleted == [
-        "/api/v1/namespaces/spatium/persistentvolumeclaims/"
-        "data-spatium-control-spatiumddi-redis-2",
+        "/api/v1/namespaces/spatium/persistentvolumeclaims/data-spatium-control-spatiumddi-redis-2",
         "/api/v1/namespaces/spatium/pods/spatium-control-spatiumddi-redis-2",
     ]
 
