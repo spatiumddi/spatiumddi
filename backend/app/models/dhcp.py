@@ -421,6 +421,17 @@ class DHCPScope(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
 
     last_pushed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
+    # ── Agentless cloud-provider ownership refs (FortiGate, #630) ─────
+    # Records the provider-side object this scope owns, per cloud DHCP
+    # server, so a push never adopts/overwrites/deletes an object the
+    # operator hand-managed on the device. Shape:
+    #   {"<dhcp_server_uuid>": {"mkey": <int>, "interface": "<name>"}}
+    # Written by the cloud write-through after a create-we-made (or a
+    # confirmed opt-in adopt); an empty/absent entry means "we own
+    # nothing here yet", so the driver refuses to clobber a pre-existing
+    # object unless the operator opts in. Null for non-cloud scopes.
+    provider_refs: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+
     # ── PXE / iPXE provisioning (issue #51) ─────────────────────────
     # Operator picks one PXEProfile per scope. The profile carries
     # the next-server + N arch-matches; the Kea driver renders one
@@ -619,6 +630,16 @@ class DHCPStaticAssignment(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin,
     # Provenance — set by the DHCP configuration importer (issue #129).
     import_source: Mapped[str | None] = mapped_column(String(20), nullable=True)
     imported_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # ── Operator-metadata snapshot for lossless soft-delete restore (#630) ──
+    # A wholesale reservation delete HARD-DELETEs the ``ip_address`` mirror row
+    # (a freed row still renders + inflates utilization), which would lose any
+    # operator-authored columns on that row (description / tags / custom_fields
+    # / owner / role / …). Before deleting, ``remove_ipam_for_static`` snapshots
+    # them here (the reservation itself is only soft-deleted, so this survives),
+    # and ``upsert_ipam_for_static`` re-applies them when a Trash restore
+    # re-creates the mirror. Null when there's nothing worth preserving.
+    ipam_metadata_snapshot: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
     scope: Mapped[DHCPScope] = relationship("DHCPScope", back_populates="statics")
 

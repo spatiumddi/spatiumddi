@@ -46,7 +46,12 @@ export function CreateServerModal({
   // FortiGate-only fields. Same "blank = keep stored" contract on edit.
   const [fgToken, setFgToken] = useState("");
   const [fgVdom, setFgVdom] = useState(server?.vdom ?? "root");
-  const [fgVerifyTLS, setFgVerifyTLS] = useState(false);
+  // Seed from the stored value so an unrelated edit doesn't silently re-disable
+  // verification. Secure default (true) for new servers and legacy rows the API
+  // can't echo. See H2 in PR #630 review.
+  const [fgVerifyTLS, setFgVerifyTLS] = useState(server?.verify_tls ?? true);
+  // Optional private-CA PEM. Write-only (blank = keep stored), like the token.
+  const [fgCaBundle, setFgCaBundle] = useState("");
   const [fgClearCreds, setFgClearCreds] = useState(false);
 
   const [testResult, setTestResult] = useState<{
@@ -79,6 +84,7 @@ export function CreateServerModal({
             api_token: fgToken,
             vdom: fgVdom || "root",
             verify_tls: fgVerifyTLS,
+            ...(fgCaBundle.trim() ? { ca_bundle_pem: fgCaBundle.trim() } : {}),
           },
         });
       }
@@ -139,6 +145,7 @@ export function CreateServerModal({
             verify_tls: fgVerifyTLS,
           };
           if (fgToken) creds.api_token = fgToken;
+          if (fgCaBundle.trim()) creds.ca_bundle_pem = fgCaBundle.trim();
           if (!editing && !fgToken) {
             throw new Error(
               "FortiGate requires an API token to connect over the REST API.",
@@ -414,6 +421,23 @@ export function CreateServerModal({
                   type="checkbox"
                   checked={fgVerifyTLS}
                   onChange={(e) => setFgVerifyTLS(e.target.checked)}
+                />
+              </Field>
+              <Field
+                label="CA bundle (PEM)"
+                hint="Optional — pin a private-CA FortiGate without disabling verification"
+              >
+                <textarea
+                  className={`${inputCls} font-mono text-xs`}
+                  rows={3}
+                  value={fgCaBundle}
+                  onChange={(e) => setFgCaBundle(e.target.value)}
+                  placeholder={
+                    hasExistingCreds
+                      ? "(unchanged — leave blank to keep stored)"
+                      : "-----BEGIN CERTIFICATE-----"
+                  }
+                  autoComplete="off"
                 />
               </Field>
             </div>

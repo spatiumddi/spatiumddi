@@ -11,8 +11,9 @@ The driver registry ([`registry.py`](../../backend/app/drivers/dhcp/registry.py)
 
 | Axis | Values | What it means |
 |---|---|---|
-| `AGENTLESS_DRIVERS` | `windows_dhcp` | Driver runs from the control plane. No co-located agent, no `ConfigBundle` long-poll. |
+| `AGENTLESS_DRIVERS` | `windows_dhcp`, `fortigate` | Driver runs from the control plane. No co-located agent, no `ConfigBundle` long-poll. |
 | `READ_ONLY_DRIVERS` | `windows_dhcp` | Driver implements lease reads only. Config push / reload / restart raise `NotImplementedError`. |
+| `CLOUD_DHCP_DRIVERS` | `fortigate` | Agentless **and** write-capable: pushes whole-scope config to a provider REST API. `is_cloud()` gates the write-through + port defaults. |
 
 All other drivers (currently just `kea`) are agented: the control plane renders a `ConfigBundle`, hash-keyed by SHA-256 ETag, and the co-located `spatium-dhcp-agent` long-polls `/config` to pick up changes.
 
@@ -20,25 +21,25 @@ All other drivers (currently just `kea`) are agented: the control plane renders 
 
 ## 1. Driver shapes
 
-Today's drivers split into two shapes:
+Today's drivers split into three shapes:
 
 ```
-┌──────────────────────────────┐     ┌──────────────────────────────┐
-│  Agented + write             │     │  Agentless + read-only       │
-│  (Kea)                       │     │  (Windows DHCP — Path A)     │
-│                              │     │                              │
-│  Control plane:              │     │  Control plane:              │
-│    render_config() → bundle  │     │    get_leases() via WinRM    │
-│    ETag long-poll            │     │    get_scopes() via WinRM    │
-│                              │     │                              │
-│  Agent (sidecar):            │     │  No agent.                   │
-│    fetch bundle              │     │  Writes raise                │
-│    apply_config()            │     │    NotImplementedError.      │
-│    reload / restart          │     │                              │
-└──────────────────────────────┘     └──────────────────────────────┘
+┌────────────────────────┐  ┌────────────────────────┐  ┌────────────────────────┐
+│  Agented + write       │  │  Agentless + read-only │  │  Agentless + write     │
+│  (Kea)                 │  │  (Windows DHCP—Path A) │  │  (FortiGate — cloud)   │
+│                        │  │                        │  │                        │
+│  Control plane:        │  │  Control plane:        │  │  Control plane:        │
+│    render_config()     │  │    get_leases() WinRM  │  │    apply_scope_full()  │
+│    ETag long-poll      │  │    get_scopes() WinRM  │  │      → REST PUT/POST   │
+│                        │  │                        │  │    get_leases() REST   │
+│  Agent (sidecar):      │  │  No agent.             │  │  No agent.             │
+│    fetch bundle        │  │  Writes raise          │  │  Whole-scope push,     │
+│    apply_config()      │  │    NotImplementedError.│  │    synchronous,        │
+│    reload / restart    │  │                        │  │    before-commit.      │
+└────────────────────────┘  └────────────────────────┘  └────────────────────────┘
 ```
 
-The abstract base (`DHCPDriver`) has methods for both halves. Agentless drivers implement only the read methods + a stub `apply_config` / `reload` / `restart` / `validate_config` that raises; the API layer consults `READ_ONLY_DRIVERS` before offering write endpoints.
+The abstract base (`DHCPDriver`) has methods for both halves. Read-only agentless drivers (Windows) implement only the read methods + a stub `apply_config` / `reload` / `restart` / `validate_config` that raises; the API layer consults `READ_ONLY_DRIVERS` before offering write endpoints. Cloud agentless drivers (FortiGate) are write-capable but push the **whole scope object** synchronously over a REST API instead of rendering a daemon config bundle — see §5.
 
 ---
 
@@ -277,7 +278,39 @@ Default ABC impls call the singular method in a loop — Kea inherits the plural
 
 ---
 
-## 5. Error handling
+## 5. FortiGate driver (agentless + cloud push)
+
+[`fortigate.py`](../../backend/app/drivers/dhcp/fortigate.py) is the first **cloud** agentless DHCP driver: the control plane drives a FortiGate's per-interface DHCP server directly over the FortiOS REST API with an API-admin **Bearer token**, VDOM-scoped, no co-located agent. It subclasses [`AgentlessDHCPDriverBase`](../../backend/app/drivers/dhcp/_cloud_base.py) (the shared cloud base) rather than rendering a daemon config.
+
+### Model mapping
+
+One SpatiumDDI `DHCPServer(driver="fortigate")` = one FortiGate device + VDOM. A `DHCPScope` (one subnet) maps to the `system.dhcp.server` object on the **interface whose primary IP+netmask CIDR equals the scope CIDR** — SpatiumDDI never creates interfaces or changes interface IPs; no match / multiple matches raise a clear error. Dynamic pools → `ip-range`; excluded/reserved pools → `exclude-range` (clipped to the dynamic range — FortiGate rejects an exclude outside the ip-range); statics → `reserved-address`; scope options → first-class fields (`default-gateway` / `dns-server1..4` / `domain` / `ntp-server1..3` / `filename` / `lease-time`) or the generic `options` subtable. Numeric options (`mtu`, `time-offset`) are emitted as `type: "hex"` big-endian — a `string` MTU would reach the client as ASCII, not a 16-bit integer.
+
+### Write unit
+
+The whole DHCP-server object per scope: any scope / pool / static / option edit rebuilds the full desired object from the DB and PUTs it (create-if-absent). The cloud write-through ([`services/dhcp/cloud_writethrough.py`](../../backend/app/services/dhcp/cloud_writethrough.py)) runs **synchronously, before commit**, so a REST failure raises `CloudPushError` (502) and rolls the transaction back — keeping the DB and the FortiGate in sync. `push_cloud_scope_upsert` fans a scope out to every cloud member of its group; cascade / group / restore paths reach it through the shared `windows_writethrough` seam.
+
+### Ownership + adopt-guard (#630)
+
+So a push never silently overwrites or deletes a DHCP server an operator hand-managed on the FortiGate, the control plane records the FortiOS `mkey` of the object *SpatiumDDI created* on the scope (`DHCPScope.provider_refs`, keyed per cloud server) and passes it back as `provider_ref`:
+
+* recorded mkey present → PUT that object;
+* no mkey + interface empty → POST, then record the new mkey;
+* no mkey + an object already exists → raise `CloudDHCPAdoptionError` → **409**, unless the operator opts in with `adopt_existing` (query param on `POST /{id}/sync`).
+
+`_remove_scope` only deletes an object whose mkey we recorded. The `GET /{id}/fortigate-interfaces` preflight surfaces any pre-existing DHCP server (ip-range / reservation / option counts + a `managed` flag) so the clobber risk is visible before an adopt-and-sync.
+
+### Credentials + TLS
+
+Fernet-encrypted on `DHCPServer.credentials_encrypted`: `{"api_token", "vdom", "verify_tls", "ca_bundle_pem"}`. `verify_tls` **defaults to `True`** (the admin Bearer token is sensitive) with an optional `ca_bundle_pem` to pin a private-CA FortiGate; disabling verification logs a WARNING. The API echoes the non-secret `vdom` + `verify_tls` on the server response so the edit modal seeds the checkbox from the stored value instead of silently re-disabling it. API-created cloud servers default to **port 443** when the caller omits `port`.
+
+### Endpoints
+
+`POST /dhcp/servers/test-fortigate-credentials` (dry-run probe), `GET /dhcp/servers/{id}/fortigate-interfaces` (preflight), `POST /dhcp/servers/{id}/sync?adopt_existing=` (synchronous full reconcile). All three call `assert_safe_target` (advisory SSRF guard) before dialing the host.
+
+---
+
+## 6. Error handling
 
 All driver methods:
 
@@ -290,7 +323,7 @@ For WinRM drivers, `pywinrm` errors get caught and re-raised as `DriverConnectio
 
 ---
 
-## 6. Adding a new driver
+## 7. Adding a new driver
 
 1. Subclass `DHCPDriver`. Implement all abstract methods. If read-only, raise `NotImplementedError` on writes.
 2. Register in `app/drivers/dhcp/registry.py`:
@@ -304,7 +337,7 @@ For WinRM drivers, `pywinrm` errors get caught and re-raised as `DriverConnectio
 
 ---
 
-## 7. Importing existing daemon configs (issue #129)
+## 8. Importing existing daemon configs (issue #129)
 
 The **DHCP configuration importer** is separate from the driver
 abstraction: drivers *render + push* config to managed servers; the

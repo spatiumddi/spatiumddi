@@ -2541,9 +2541,30 @@ function ServerDetailView({
     server.driver === "kea" && group !== null && groupIsKeaManaged(group);
   const [tab, setTab] = useState<Tab>(groupOwnsConfig ? "leases" : "scopes");
   const [syncBanner, setSyncBanner] = useState<string | null>(null);
+  // 409 from a FortiGate sync: an operator-managed DHCP object already exists
+  // on the interface. Holds the detail so we can offer an adopt-and-retry.
+  const [adoptConflict, setAdoptConflict] = useState<string | null>(null);
   const syncMut = useMutation({
-    mutationFn: () => dhcpApi.syncServer(server.id),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["dhcp-servers"] }),
+    mutationFn: (adoptExisting: boolean = false) =>
+      dhcpApi.syncServer(server.id, adoptExisting),
+    onSuccess: () => {
+      setSyncBanner(null);
+      setAdoptConflict(null);
+      qc.invalidateQueries({ queryKey: ["dhcp-servers"] });
+    },
+    onError: (e) => {
+      const err = e as {
+        response?: { status?: number; data?: { detail?: string } };
+      };
+      const detail = err?.response?.data?.detail;
+      if (err?.response?.status === 409) {
+        setAdoptConflict(
+          detail ?? "A DHCP server already exists on the interface.",
+        );
+      } else {
+        setSyncBanner(detail ?? "Force sync failed");
+      }
+    },
   });
   const leaseSyncMut = useMutation({
     mutationFn: () => dhcpApi.syncLeasesNow(server.id),
@@ -2690,7 +2711,7 @@ function ServerDetailView({
               <HeaderButton
                 icon={RefreshCw}
                 iconClassName={syncMut.isPending ? "animate-spin" : ""}
-                onClick={() => syncMut.mutate()}
+                onClick={() => syncMut.mutate(false)}
                 disabled={syncMut.isPending}
               >
                 Force Sync
@@ -2731,6 +2752,28 @@ function ServerDetailView({
                 Open group →
               </button>
             )}
+          </div>
+        )}
+        {adoptConflict && (
+          <div className="mt-3 flex items-center justify-between gap-2 rounded border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-800 dark:text-amber-300">
+            <span>{adoptConflict}</span>
+            <div className="flex flex-shrink-0 gap-1.5">
+              <button
+                type="button"
+                onClick={() => syncMut.mutate(true)}
+                disabled={syncMut.isPending}
+                className="rounded-md border border-amber-500/50 bg-amber-500/10 px-2.5 py-1 font-medium hover:bg-amber-500/20 disabled:opacity-50"
+              >
+                Adopt existing &amp; sync
+              </button>
+              <button
+                type="button"
+                onClick={() => setAdoptConflict(null)}
+                className="rounded border px-1.5 py-0.5 text-[10px] hover:bg-accent"
+              >
+                dismiss
+              </button>
+            </div>
           </div>
         )}
         {syncBanner && (

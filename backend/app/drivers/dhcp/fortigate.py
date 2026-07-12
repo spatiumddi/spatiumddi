@@ -26,21 +26,33 @@ FortiGate device + VDOM):
 The write unit is the **whole DHCP-server object per scope**: any
 scope/pool/static/option edit rebuilds the full desired object and PUTs it
 (create-if-absent). This makes "replace-all per interface" atomic. The
-interface name is the natural key — one DHCP server per interface — so the
-driver stays stateless (no FortiGate mkey persisted).
+interface name is the natural key — one DHCP server per interface.
+
+**Ownership (#630).** So the driver never silently overwrites or deletes a
+DHCP server the operator hand-managed on the FortiGate, the control plane
+records the FortiOS ``mkey`` of the object *SpatiumDDI created* on the scope
+(``DHCPScope.provider_refs``) and passes it back in as ``provider_ref``. On a
+push: if we hold the mkey, PUT it; if we hold none and the interface is empty,
+POST and record the new mkey; if we hold none but an object already exists, we
+:class:`~app.drivers.dhcp._cloud_base.CloudDHCPAdoptionError` (→ 409) unless the
+operator opts in via ``adopt_existing``. Removal only deletes an object we own.
 
 Credential dict shape (Fernet-encrypted on ``DHCPServer.credentials_encrypted``)::
 
-    {"api_token": "<api-admin-token>", "vdom": "root", "verify_tls": false}
+    {"api_token": "<api-admin-token>", "vdom": "root",
+     "verify_tls": true, "ca_bundle_pem": "<optional PEM>"}
 
-``verify_tls`` defaults to ``False`` (lab firewalls ship self-signed
-certs) and a WARNING is logged when TLS verification is disabled, matching
-the proxmox / unifi clients.
+``verify_tls`` defaults to ``True`` — the FortiOS admin Bearer token is
+sensitive, so we verify the TLS chain by default (matching the sibling
+``services.fortinet.client.FortinetClient``). A WARNING is logged only when
+an operator explicitly opts out. ``ca_bundle_pem`` lets a private-CA
+FortiGate be pinned without disabling verification.
 """
 
 from __future__ import annotations
 
 import ipaddress
+import ssl
 from datetime import UTC, datetime
 from typing import Any
 
@@ -49,6 +61,7 @@ import structlog
 
 from app.drivers.dhcp._cloud_base import (
     AgentlessDHCPDriverBase,
+    CloudDHCPAdoptionError,
     CloudDHCPError,
     CloudDHCPProbe,
 )
@@ -68,6 +81,16 @@ _OPTION_NAME_TO_CODE: dict[str, int] = {
     "tftp-server-name": 66,
     "domain-search": 119,
     "tftp-server-address": 150,
+}
+
+# Numeric DHCP options carry a binary integer on the wire, NOT ASCII text, so
+# FortiGate must send them as ``type: "hex"`` (big-endian) — a ``type: "string"``
+# "1500" reaches the client as the literal characters, not the 16-bit MTU. Maps
+# code → (byte width, signed). ``time-offset`` (2) is a signed 32-bit seconds
+# offset; ``mtu`` (26) is an unsigned 16-bit size.
+_NUMERIC_OPTION_ENCODING: dict[int, tuple[int, bool]] = {
+    2: (4, True),
+    26: (2, False),
 }
 
 # Option names FortiGate derives itself / that map to a first-class field,
@@ -126,8 +149,14 @@ class FortiGateDHCPDriver(AgentlessDHCPDriverBase):
 
     name = "fortigate"
     # The create modal renders + the probe requires these. ``verify_tls``
-    # is a bool checkbox; ``vdom`` defaults to ``root`` in the UI.
-    credential_fields: tuple[str, ...] = ("api_token", "vdom", "verify_tls")
+    # is a bool checkbox (default on); ``vdom`` defaults to ``root`` in the
+    # UI; ``ca_bundle_pem`` is an optional PEM for private-CA FortiGates.
+    credential_fields: tuple[str, ...] = (
+        "api_token",
+        "vdom",
+        "verify_tls",
+        "ca_bundle_pem",
+    )
 
     # ── HTTP plumbing ───────────────────────────────────────────────────
     def _client(self, server: Any, creds: dict[str, Any]) -> httpx.AsyncClient:
@@ -142,13 +171,12 @@ class FortiGateDHCPDriver(AgentlessDHCPDriverBase):
         host = getattr(server, "host", "") or ""
         port = int(getattr(server, "port", 443) or 443)
         vdom = str(creds.get("vdom") or "root")
-        verify = bool(creds.get("verify_tls", False))
-        if not verify:
-            logger.warning(
-                "fortigate.tls_verification_disabled",
-                server=str(getattr(server, "id", "")),
-                host=host,
-            )
+        verify = self._build_verify(
+            bool(creds.get("verify_tls", True)),
+            str(creds.get("ca_bundle_pem") or ""),
+            server=str(getattr(server, "id", "")),
+            host=host,
+        )
         return httpx.AsyncClient(
             base_url=f"https://{host}:{port}/api/v2",
             headers={"Authorization": f"Bearer {token}"},
@@ -156,6 +184,20 @@ class FortiGateDHCPDriver(AgentlessDHCPDriverBase):
             verify=verify,
             timeout=30.0,
         )
+
+    @staticmethod
+    def _build_verify(verify_tls: bool, ca_bundle_pem: str, *, server: str, host: str) -> Any:
+        """httpx ``verify`` value: ``False`` when opted out (with a WARNING),
+        a CA-pinned SSL context when a PEM bundle is supplied, else ``True``
+        for the system trust store. Mirrors
+        ``services.fortinet.client.FortinetClient._build_verify``."""
+        if not verify_tls:
+            logger.warning("fortigate.tls_verification_disabled", server=server, host=host)
+            return False
+        ca = (ca_bundle_pem or "").strip()
+        if ca:
+            return ssl.create_default_context(cadata=ca)
+        return True
 
     @staticmethod
     def _token(creds: dict[str, Any]) -> str:
@@ -414,7 +456,11 @@ class FortiGateDHCPDriver(AgentlessDHCPDriverBase):
             if not values:
                 continue
             item: dict[str, Any] = {"id": len(out) + 1, "code": code}
-            if _all_ips(values):
+            hex_val = self._numeric_option_hex(code, values)
+            if hex_val is not None:
+                item["type"] = "hex"
+                item["hex"] = hex_val
+            elif _all_ips(values):
                 item["type"] = "ip"
                 item["ip"] = " ".join(values)
             else:
@@ -423,51 +469,141 @@ class FortiGateDHCPDriver(AgentlessDHCPDriverBase):
             out.append(item)
         return out
 
+    @staticmethod
+    def _numeric_option_hex(code: int, values: list[str]) -> str | None:
+        """Big-endian hex for a numeric option (``mtu`` / ``time-offset``), or
+        None if this option isn't numeric or the value doesn't fit its width."""
+        enc = _NUMERIC_OPTION_ENCODING.get(code)
+        if enc is None or len(values) != 1:
+            return None
+        width, signed = enc
+        try:
+            n = int(str(values[0]).strip())
+            return n.to_bytes(width, "big", signed=signed).hex()
+        except (ValueError, OverflowError):
+            # Not an integer / out of range → fall back to string encoding.
+            return None
+
     # ── Provider hooks (whole-scope write, lease read, probe) ───────────
-    async def _find_server_id(self, client: httpx.AsyncClient, interface: str) -> int | None:
-        """Return the mkey of the DHCP-server object on ``interface``, or None."""
+    async def _find_server(
+        self, client: httpx.AsyncClient, interface: str
+    ) -> dict[str, Any] | None:
+        """Return the raw ``system.dhcp.server`` object on ``interface``, or None."""
         resp = await client.get("/cmdb/system.dhcp/server")
         body = self._unwrap(resp)
         for srv in body.get("results") or []:
             if srv.get("interface") == interface:
-                try:
-                    return int(srv.get("id"))
-                except (TypeError, ValueError):
-                    return None
+                return srv if isinstance(srv, dict) else None
         return None
 
-    async def _apply_scope(self, server: Any, creds: dict[str, Any], scope: ScopeDef) -> None:
+    async def _find_server_id(self, client: httpx.AsyncClient, interface: str) -> int | None:
+        """Return the mkey of the DHCP-server object on ``interface``, or None."""
+        srv = await self._find_server(client, interface)
+        if srv is None:
+            return None
+        return self._coerce_mkey(srv.get("id"))
+
+    @staticmethod
+    def _coerce_mkey(raw: Any) -> int | None:
+        """Best-effort int() of a FortiOS mkey field; None on missing/garbage."""
+        if raw is None:
+            return None
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _mkey_of(provider_ref: dict[str, Any] | None) -> int | None:
+        if not provider_ref:
+            return None
+        try:
+            return int(provider_ref["mkey"])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    async def _apply_scope(
+        self,
+        server: Any,
+        creds: dict[str, Any],
+        scope: ScopeDef,
+        *,
+        provider_ref: dict[str, Any] | None = None,
+        adopt_existing: bool = False,
+    ) -> dict[str, Any] | None:
         async with self._client(server, creds) as client:
             interface = await self._match_interface(client, scope.subnet_cidr)
             body = self._build_server_body(interface, scope)
             existing_id = await self._find_server_id(client, interface)
-            if existing_id is None:
-                resp = await client.post("/cmdb/system.dhcp/server", json=body)
-                self._unwrap(resp)
-            else:
-                # Adopt + replace-all: overwrite whatever was on this
-                # interface's DHCP server with SpatiumDDI's desired state.
-                logger.info(
-                    "fortigate.adopt_existing_dhcp_server",
-                    server=str(getattr(server, "id", "")),
-                    interface=interface,
-                    mkey=existing_id,
-                )
-                resp = await client.put(f"/cmdb/system.dhcp/server/{existing_id}", json=body)
-                self._unwrap(resp)
+            owned_mkey = self._mkey_of(provider_ref)
 
-    async def _remove_scope(self, server: Any, creds: dict[str, Any], subnet_cidr: str) -> None:
-        async with self._client(server, creds) as client:
-            try:
-                interface = await self._match_interface(client, subnet_cidr)
-            except CloudDHCPError:
-                # No matching interface → nothing we own to delete. Idempotent.
-                return
-            existing_id = await self._find_server_id(client, interface)
+            if owned_mkey is not None:
+                # This scope+server already owns an object on this interface.
+                # Overwriting it is safe. If it was deleted out from under us,
+                # recreate; otherwise PUT the object that's actually there.
+                target = existing_id if existing_id is not None else None
+                if target is None:
+                    resp = await client.post("/cmdb/system.dhcp/server", json=body)
+                    new_id = self._new_mkey(resp)
+                    return {"mkey": new_id, "interface": interface}
+                resp = await client.put(f"/cmdb/system.dhcp/server/{target}", json=body)
+                self._unwrap(resp)
+                return {"mkey": target, "interface": interface}
+
+            # We hold no ownership marker for this interface.
             if existing_id is None:
-                return
-            resp = await client.delete(f"/cmdb/system.dhcp/server/{existing_id}")
+                # Nothing here — create it and claim ownership.
+                resp = await client.post("/cmdb/system.dhcp/server", json=body)
+                new_id = self._new_mkey(resp)
+                return {"mkey": new_id, "interface": interface}
+
+            # An object exists that we never created. Refuse to clobber it
+            # unless the operator explicitly opted in to adopt.
+            if not adopt_existing:
+                raise CloudDHCPAdoptionError(
+                    f"A DHCP server already exists on FortiGate interface "
+                    f"{interface!r} that SpatiumDDI did not create. Enable "
+                    f"'adopt existing' to overwrite it with the managed scope, "
+                    f"or remove it on the FortiGate first."
+                )
+            logger.info(
+                "fortigate.adopt_existing_dhcp_server",
+                server=str(getattr(server, "id", "")),
+                interface=interface,
+                mkey=existing_id,
+            )
+            resp = await client.put(f"/cmdb/system.dhcp/server/{existing_id}", json=body)
             self._unwrap(resp)
+            return {"mkey": existing_id, "interface": interface}
+
+    def _new_mkey(self, resp: httpx.Response) -> int | None:
+        """Extract the mkey FortiOS assigned to a freshly-POSTed object."""
+        body = self._unwrap(resp)
+        return self._coerce_mkey(body.get("mkey"))
+
+    async def _remove_scope(
+        self,
+        server: Any,
+        creds: dict[str, Any],
+        subnet_cidr: str,
+        *,
+        provider_ref: dict[str, Any] | None = None,
+    ) -> None:
+        owned_mkey = self._mkey_of(provider_ref)
+        if owned_mkey is None:
+            # We never created an object here — leave any operator-managed DHCP
+            # server on the interface untouched. Idempotent no-op.
+            logger.info(
+                "fortigate.remove_scope_skipped_unowned",
+                server=str(getattr(server, "id", "")),
+                subnet=subnet_cidr,
+            )
+            return
+        async with self._client(server, creds) as client:
+            resp = await client.delete(f"/cmdb/system.dhcp/server/{owned_mkey}")
+            # A 404 (already gone) is fine — the object we owned is absent.
+            if resp.status_code != 404:
+                self._unwrap(resp)
 
     async def _get_leases(self, server: Any, creds: dict[str, Any]) -> list[dict[str, Any]]:
         async with self._client(server, creds) as client:
@@ -507,10 +643,34 @@ class FortiGateDHCPDriver(AgentlessDHCPDriverBase):
         )
 
     async def list_interfaces(self, server: Any) -> list[dict[str, Any]]:
-        """Preflight helper — list L3 interfaces + their CIDRs for the UI."""
+        """Preflight helper — list L3 interfaces + their CIDRs for the UI.
+
+        Each interface is annotated with ``existing_dhcp_server`` (or ``None``)
+        so the operator can see a pre-existing DHCP server — and its ip-range /
+        reservation / option counts — that a sync would otherwise adopt.
+        """
         creds = self._load_credentials(server)
         async with self._client(server, creds) as client:
-            return await self._list_interface_cidrs(client)
+            interfaces = await self._list_interface_cidrs(client)
+            resp = await client.get("/cmdb/system.dhcp/server")
+            body = self._unwrap(resp)
+        by_iface: dict[str, dict[str, Any]] = {}
+        for srv in body.get("results") or []:
+            if not isinstance(srv, dict):
+                continue
+            iface = srv.get("interface")
+            if not iface:
+                continue
+            mkey = self._coerce_mkey(srv.get("id"))
+            by_iface[str(iface)] = {
+                "mkey": mkey,
+                "ip_range_count": len(srv.get("ip-range") or []),
+                "reserved_count": len(srv.get("reserved-address") or []),
+                "option_count": len(srv.get("options") or []),
+            }
+        for iface in interfaces:
+            iface["existing_dhcp_server"] = by_iface.get(str(iface.get("name")))
+        return interfaces
 
     # ── Capabilities ────────────────────────────────────────────────────
     def capabilities(self) -> dict[str, Any]:

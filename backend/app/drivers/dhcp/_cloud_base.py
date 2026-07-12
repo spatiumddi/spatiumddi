@@ -60,6 +60,15 @@ class CloudDHCPError(Exception):
     """
 
 
+class CloudDHCPAdoptionError(CloudDHCPError):
+    """A push would overwrite a provider DHCP object SpatiumDDI never created.
+
+    Distinct from :class:`CloudDHCPError` so the write-through can map it to a
+    409 (operator must opt in to adopt) instead of the generic 502 that a real
+    API failure gets. See the ``adopt_existing`` opt-in on the write-through.
+    """
+
+
 @dataclass(frozen=True)
 class CloudDHCPProbe:
     """Result of an agentless DHCP credential probe (Test-connection button)."""
@@ -116,16 +125,32 @@ class AgentlessDHCPDriverBase(DHCPDriver):
             raise CloudDHCPError(f"{self.name} credentials could not be decrypted: {exc}") from exc
 
     # ── Whole-scope write path (synchronous, control-plane) ─────────────
-    async def apply_scope_full(self, server: Any, scope: ScopeDef) -> None:
+    async def apply_scope_full(
+        self,
+        server: Any,
+        scope: ScopeDef,
+        *,
+        provider_ref: dict[str, Any] | None = None,
+        adopt_existing: bool = False,
+    ) -> dict[str, Any] | None:
         """Push one scope's full desired DHCP config to the provider.
 
         Called by ``windows_writethrough`` after a scope / pool / static /
         option edit (and on ``/sync``). The provider create-or-updates the
         object that serves ``scope.subnet_cidr``. Failures raise
         :class:`CloudDHCPError` so the caller rolls back with a 502.
+
+        ``provider_ref`` is the ownership marker this ``(scope, server)`` pair
+        recorded on a previous push (e.g. ``{"mkey": 3, "interface": "port2"}``)
+        or ``None`` if none is held yet. ``adopt_existing`` lets the caller opt
+        in to overwriting a pre-existing provider object we never created.
+        Returns the (possibly new) ownership marker for the caller to persist,
+        or ``None`` if the provider is stateless about ownership.
         """
         creds = self._load_credentials(server)
-        await self._apply_scope(server, creds, scope)
+        new_ref = await self._apply_scope(
+            server, creds, scope, provider_ref=provider_ref, adopt_existing=adopt_existing
+        )
         logger.info(
             "cloud_dhcp.apply_scope",
             driver=self.name,
@@ -134,11 +159,23 @@ class AgentlessDHCPDriverBase(DHCPDriver):
             pools=len(scope.pools),
             statics=len(scope.statics),
         )
+        return new_ref
 
-    async def remove_scope_full(self, server: Any, subnet_cidr: str) -> None:
-        """Delete the provider DHCP object serving ``subnet_cidr``."""
+    async def remove_scope_full(
+        self,
+        server: Any,
+        subnet_cidr: str,
+        *,
+        provider_ref: dict[str, Any] | None = None,
+    ) -> None:
+        """Delete the provider DHCP object serving ``subnet_cidr``.
+
+        Only removes an object this ``(scope, server)`` pair owns — identified
+        by ``provider_ref`` — so a scope delete never tears down an operator's
+        hand-managed DHCP server that merely happens to share the interface.
+        """
         creds = self._load_credentials(server)
-        await self._remove_scope(server, creds, subnet_cidr)
+        await self._remove_scope(server, creds, subnet_cidr, provider_ref=provider_ref)
         logger.info(
             "cloud_dhcp.remove_scope",
             driver=self.name,
@@ -177,12 +214,32 @@ class AgentlessDHCPDriverBase(DHCPDriver):
 
     # ── Provider hooks (subclasses implement) ───────────────────────────
     @abstractmethod
-    async def _apply_scope(self, server: Any, creds: dict[str, Any], scope: ScopeDef) -> None:
-        """Create / update the provider DHCP object for ``scope``."""
+    async def _apply_scope(
+        self,
+        server: Any,
+        creds: dict[str, Any],
+        scope: ScopeDef,
+        *,
+        provider_ref: dict[str, Any] | None = None,
+        adopt_existing: bool = False,
+    ) -> dict[str, Any] | None:
+        """Create / update the provider DHCP object for ``scope``.
+
+        Return the ownership marker to persist (or ``None``). Raise
+        :class:`CloudDHCPAdoptionError` when an object we don't own already
+        exists and ``adopt_existing`` is False.
+        """
 
     @abstractmethod
-    async def _remove_scope(self, server: Any, creds: dict[str, Any], subnet_cidr: str) -> None:
-        """Delete the provider DHCP object serving ``subnet_cidr`` (idempotent)."""
+    async def _remove_scope(
+        self,
+        server: Any,
+        creds: dict[str, Any],
+        subnet_cidr: str,
+        *,
+        provider_ref: dict[str, Any] | None = None,
+    ) -> None:
+        """Delete the provider DHCP object we own for ``subnet_cidr`` (idempotent)."""
 
     @abstractmethod
     async def _get_leases(self, server: Any, creds: dict[str, Any]) -> list[dict[str, Any]]:

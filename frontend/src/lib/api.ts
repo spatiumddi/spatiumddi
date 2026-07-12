@@ -6549,6 +6549,10 @@ export interface DHCPServer {
   // modal can show / change it without re-entering the token. Null for
   // non-cloud drivers.
   vdom?: string | null;
+  // Non-secret TLS-verify flag echoed for cloud drivers so the edit modal
+  // seeds the checkbox from the stored value instead of resetting it (which
+  // would silently re-disable verification). Null for non-cloud drivers.
+  verify_tls?: boolean | null;
   // Per-server maintenance mode (issue #182). When true the control
   // plane skips shipping pending DHCPConfigOp rows + suppresses the
   // heartbeat-stale alert; the UI renders an amber Maintenance chip.
@@ -6576,10 +6580,23 @@ export interface FortiGateCredentials {
   api_token?: string;
   vdom?: string;
   verify_tls?: boolean;
+  // Optional PEM chain to pin a private-CA FortiGate without disabling
+  // verification. Merged into the stored credential blob.
+  ca_bundle_pem?: string;
 }
 
 // One FortiGate L3 interface + which managed scope its CIDR matches
 // (preflight before a sync). From GET /dhcp/servers/{id}/fortigate-interfaces.
+export interface FortiGateExistingDHCPServer {
+  mkey: number | null;
+  ip_range_count: number;
+  reserved_count: number;
+  option_count: number;
+  // True when SpatiumDDI already owns this object (adopting is a no-op);
+  // false means a plain sync would clobber operator-managed config.
+  managed: boolean;
+}
+
 export interface FortiGateInterface {
   name: string;
   cidr: string;
@@ -6589,6 +6606,9 @@ export interface FortiGateInterface {
   alias: string;
   matched_subnet_id: string | null;
   matched_scope_id: string | null;
+  // A pre-existing DHCP server on this interface, or null if none. Surfaced so
+  // the operator sees the clobber risk before an adopt-and-sync.
+  existing_dhcp_server: FortiGateExistingDHCPServer | null;
 }
 
 export interface DHCPLeaseSyncResult {
@@ -6901,13 +6921,18 @@ export const dhcpApi = {
   updateServer: (id: string, data: Partial<DHCPServer>) =>
     api.put<DHCPServer>(`/dhcp/servers/${id}`, data).then((r) => r.data),
   deleteServer: (id: string) => api.delete(`/dhcp/servers/${id}`),
-  syncServer: (id: string) =>
+  // `adoptExisting` (cloud/FortiGate only) opts in to overwriting a
+  // pre-existing provider DHCP object SpatiumDDI never created; without it a
+  // clobber-risk sync returns 409.
+  syncServer: (id: string, adoptExisting = false) =>
     api
       .post<{
         status: string;
         op_id: string;
         etag: string;
-      }>(`/dhcp/servers/${id}/sync`)
+      }>(
+        `/dhcp/servers/${id}/sync${adoptExisting ? "?adopt_existing=true" : ""}`,
+      )
       .then((r) => r.data),
   syncLeasesNow: (id: string) =>
     api

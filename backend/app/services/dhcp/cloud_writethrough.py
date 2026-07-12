@@ -23,6 +23,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.drivers.dhcp import get_driver, is_cloud
+from app.drivers.dhcp._cloud_base import CloudDHCPAdoptionError
 from app.drivers.dhcp.base import PoolDef, ScopeDef, StaticAssignmentDef
 from app.models.dhcp import DHCPPool, DHCPScope, DHCPServer, DHCPStaticAssignment
 from app.models.ipam import Subnet
@@ -35,6 +36,18 @@ class CloudPushError(HTTPException):
 
     def __init__(self, detail: str) -> None:
         super().__init__(status_code=502, detail=f"DHCP provider push failed: {detail}")
+
+
+class CloudAdoptionRequired(HTTPException):
+    """409 — a push would overwrite a provider DHCP object we never created.
+
+    The operator must opt in (``adopt_existing``) to take it over. Distinct
+    from :class:`CloudPushError` so the UI can offer an adopt-and-retry action
+    instead of treating it as a transient provider failure.
+    """
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(status_code=409, detail=detail)
 
 
 async def cloud_servers_for_group(db: AsyncSession, group_id: Any) -> list[DHCPServer]:
@@ -131,18 +144,47 @@ async def build_scope_def(
     )
 
 
+def _provider_ref_for(scope: DHCPScope, server: DHCPServer) -> dict[str, Any] | None:
+    """The ownership marker this ``(scope, server)`` pair holds, if any."""
+    refs = scope.provider_refs or {}
+    ref = refs.get(str(server.id))
+    return ref if isinstance(ref, dict) else None
+
+
+def _set_provider_ref(scope: DHCPScope, server: DHCPServer, ref: dict[str, Any] | None) -> None:
+    """Persist / clear the ownership marker for ``(scope, server)``.
+
+    Reassigns a fresh dict so SQLAlchemy flags the JSONB column dirty (mutating
+    in place wouldn't, absent a MutableDict wrapper).
+    """
+    refs = dict(scope.provider_refs or {})
+    key = str(server.id)
+    if ref is None:
+        refs.pop(key, None)
+    else:
+        refs[key] = ref
+    scope.provider_refs = refs or None
+
+
 async def push_cloud_scope_upsert(
     db: AsyncSession,
     scope: DHCPScope,
     *,
     exclude_pool_ids: set[Any] | None = None,
     exclude_static_ids: set[Any] | None = None,
+    adopt_existing: bool = False,
 ) -> None:
     """Re-push the whole scope object to every cloud member of its group.
 
     ``exclude_pool_ids`` / ``exclude_static_ids`` drop rows pending deletion
     that the endpoint hasn't removed from the DB yet (see
     :func:`build_scope_def`).
+
+    ``adopt_existing`` opts in to overwriting a pre-existing provider DHCP
+    object SpatiumDDI never created (default off → :class:`CloudAdoptionRequired`
+    / 409). The provider-assigned ownership marker each push returns is
+    persisted onto ``scope.provider_refs`` so later edits target the same
+    object without re-adopting.
     """
     servers = await cloud_servers_for_group(db, scope.group_id)
     if not servers:
@@ -156,7 +198,20 @@ async def push_cloud_scope_upsert(
     for server in servers:
         driver = get_driver(server.driver)
         try:
-            await driver.apply_scope_full(server, scope_def)  # type: ignore[attr-defined]
+            new_ref = await driver.apply_scope_full(  # type: ignore[attr-defined]
+                server,
+                scope_def,
+                provider_ref=_provider_ref_for(scope, server),
+                adopt_existing=adopt_existing,
+            )
+        except CloudDHCPAdoptionError as exc:
+            logger.info(
+                "cloud_dhcp_push_scope_adoption_required",
+                scope=str(scope.id),
+                server=str(server.id),
+                driver=server.driver,
+            )
+            raise CloudAdoptionRequired(str(exc)) from exc
         except Exception as exc:  # noqa: BLE001 — surface the error as a 502
             logger.warning(
                 "cloud_dhcp_push_scope_failed",
@@ -166,6 +221,8 @@ async def push_cloud_scope_upsert(
                 error=str(exc),
             )
             raise CloudPushError(str(exc)) from exc
+        if new_ref is not None:
+            _set_provider_ref(scope, server, new_ref)
 
 
 async def push_cloud_scopes_delete_from_batch(db: AsyncSession, batch: Any) -> None:
@@ -196,7 +253,9 @@ async def push_cloud_scope_delete(db: AsyncSession, scope: DHCPScope) -> None:
     for server in servers:
         driver = get_driver(server.driver)
         try:
-            await driver.remove_scope_full(server, subnet_cidr)  # type: ignore[attr-defined]
+            await driver.remove_scope_full(  # type: ignore[attr-defined]
+                server, subnet_cidr, provider_ref=_provider_ref_for(scope, server)
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "cloud_dhcp_push_scope_delete_failed",
@@ -206,9 +265,13 @@ async def push_cloud_scope_delete(db: AsyncSession, scope: DHCPScope) -> None:
                 error=str(exc),
             )
             raise CloudPushError(str(exc)) from exc
+        # We released (or never owned) the object — drop the ownership marker so
+        # a later restore re-creates + re-claims rather than assuming ownership.
+        _set_provider_ref(scope, server, None)
 
 
 __all__ = [
+    "CloudAdoptionRequired",
     "CloudPushError",
     "build_scope_def",
     "cloud_servers_for_group",

@@ -9,16 +9,21 @@ fortigate member — with the pending-delete row correctly excluded from the
 whole-object rebuild.
 
 The FortiOS payloads themselves are covered by ``test_fortigate_dhcp_driver.py``;
-here we stub the cloud push (patched in the ``windows_writethrough`` namespace,
-where the seam imported the names) and assert the seam invokes it.
+the seam-routing tests here stub the cloud push (patched in the
+``windows_writethrough`` namespace, where the seam imported the names) and assert
+the seam invokes it. ``test_real_upsert_persists_provider_ref`` drives the REAL
+``push_cloud_scope_upsert`` end-to-end (stubbing only the driver's leaf
+``_client``) so the ownership-marker persistence (#630) is actually exercised.
 """
 
 from __future__ import annotations
 
 import uuid
+from typing import Any
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.crypto import encrypt_dict
@@ -28,6 +33,46 @@ from app.models.dhcp import DHCPScope, DHCPServer, DHCPServerGroup, DHCPStaticAs
 from app.models.ipam import IPBlock, IPSpace, Subnet
 
 CIDR = "10.88.0.0/24"
+
+
+class _FakeResponse:
+    def __init__(self, status_code: int, payload: dict[str, Any]) -> None:
+        self.status_code = status_code
+        self._payload = payload
+
+    def json(self) -> dict[str, Any]:
+        return self._payload
+
+
+class _FakeClient:
+    """Minimal async-context fake of the FortiOS client, serving canned
+    envelopes and recording calls (see test_fortigate_dhcp_driver.py)."""
+
+    def __init__(self, queues: dict[str, list[Any]]) -> None:
+        self._queues = queues
+        self.calls: list[dict[str, Any]] = []
+
+    async def __aenter__(self) -> _FakeClient:
+        return self
+
+    async def __aexit__(self, *exc: Any) -> bool:
+        return False
+
+    def _next(self, method: str, path: str, body: Any) -> _FakeResponse:
+        self.calls.append({"method": method, "path": path, "json": body})
+        return self._queues[method].pop(0)
+
+    async def get(self, path: str, params: Any = None) -> _FakeResponse:
+        return self._next("get", path, None)
+
+    async def post(self, path: str, json: Any = None) -> _FakeResponse:
+        return self._next("post", path, json)
+
+    async def put(self, path: str, json: Any = None) -> _FakeResponse:
+        return self._next("put", path, json)
+
+    async def delete(self, path: str, params: Any = None) -> _FakeResponse:
+        return self._next("delete", path, None)
 
 
 async def _setup(db: AsyncSession) -> tuple[User, DHCPScope]:
@@ -160,3 +205,58 @@ async def test_restore_reattaches_cloud_member(
     assert resp.status_code == 200, resp.text
     # push_scope_restore re-pushes the whole object to cloud members.
     assert scope_id in upserts
+
+
+async def test_real_upsert_persists_provider_ref(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Drive the REAL push_cloud_scope_upsert (only the leaf _client stubbed):
+    a first push with no object on the interface POSTs a new DHCP server and
+    records its FortiOS mkey on the scope's provider_refs (#630)."""
+    from app.drivers.dhcp.fortigate import FortiGateDHCPDriver
+    from app.services.dhcp.cloud_writethrough import push_cloud_scope_upsert
+
+    _user, scope = await _setup(db_session)
+    # A reservation so the rebuilt scope object carries a reserved-address.
+    db_session.add(
+        DHCPStaticAssignment(
+            scope_id=scope.id,
+            ip_address="10.88.0.10",
+            mac_address="00:11:22:33:44:55",
+            hostname="h",
+        )
+    )
+    await db_session.flush()
+    server = (
+        await db_session.execute(
+            select(DHCPServer).where(DHCPServer.server_group_id == scope.group_id)
+        )
+    ).scalar_one()
+
+    fake = _FakeClient(
+        {
+            "get": [
+                # interface list — port2's primary IP CIDR == the scope CIDR
+                _FakeResponse(
+                    200,
+                    {
+                        "status": "success",
+                        "results": [{"name": "port2", "ip": ["10.88.0.1", "255.255.255.0"]}],
+                    },
+                ),
+                # existing DHCP servers on the box — none
+                _FakeResponse(200, {"status": "success", "results": []}),
+            ],
+            "post": [_FakeResponse(200, {"status": "success", "mkey": 9})],
+        }
+    )
+    monkeypatch.setattr(FortiGateDHCPDriver, "_client", lambda self, server, creds: fake)
+
+    await push_cloud_scope_upsert(db_session, scope)
+
+    # A POST landed (create), carrying the reservation, on interface port2…
+    post = next(c for c in fake.calls if c["method"] == "post")
+    assert post["json"]["interface"] == "port2"
+    assert post["json"]["reserved-address"][0]["ip"] == "10.88.0.10"
+    # …and the FortiOS mkey is recorded as this scope+server's ownership marker.
+    assert scope.provider_refs == {str(server.id): {"mkey": 9, "interface": "port2"}}

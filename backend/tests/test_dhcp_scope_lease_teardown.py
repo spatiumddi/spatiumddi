@@ -295,6 +295,58 @@ async def test_restore_recreates_static_mirror(
 
 
 @pytest.mark.asyncio
+async def test_restore_preserves_operator_metadata(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A delete→restore cycle must not lose operator-authored columns on the
+    reservation's IPAM mirror (#630). The mirror is hard-deleted (so a freed row
+    doesn't linger + inflate utilization), so the operator fields are snapshotted
+    onto the retained reservation and re-applied on restore."""
+    _, token = await _make_admin(db_session)
+    headers = {"Authorization": f"Bearer {token}"}
+    scope_id, subnet_id, _server_id = await _seed_scope_with_static_and_lease(
+        client, db_session, headers
+    )
+
+    # Operator edits the reservation's mirror: description + tags + custom fields.
+    mirror = (
+        await db_session.execute(
+            select(IPAddress).where(
+                IPAddress.subnet_id == subnet_id, IPAddress.address == _STATIC_IP
+            )
+        )
+    ).scalar_one()
+    mirror.description = "printer in room 3"
+    mirror.tags = {"env": "lab"}
+    mirror.custom_fields = {"asset": "A-42"}
+    mirror.role = "reserved-role"
+    await db_session.commit()
+
+    resp = await client.delete(f"/api/v1/dhcp/scopes/{scope_id}", headers=headers)
+    assert resp.status_code == 204, resp.text
+    db_session.expire_all()
+    assert _STATIC_IP not in await _subnet_addresses(db_session, subnet_id)
+
+    restored = await client.post(
+        f"/api/v1/admin/trash/dhcp_scope/{scope_id}/restore", headers=headers
+    )
+    assert restored.status_code == 200, restored.text
+    db_session.expire_all()
+
+    recreated = (
+        await db_session.execute(
+            select(IPAddress).where(
+                IPAddress.subnet_id == subnet_id, IPAddress.address == _STATIC_IP
+            )
+        )
+    ).scalar_one()
+    assert recreated.description == "printer in room 3"
+    assert recreated.tags == {"env": "lab"}
+    assert recreated.custom_fields == {"asset": "A-42"}
+    assert recreated.role == "reserved-role"
+
+
+@pytest.mark.asyncio
 async def test_delete_lease_endpoint_purges_row_and_mirror(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:

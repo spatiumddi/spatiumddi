@@ -34,6 +34,8 @@ re-point-by-IP reconcile instead. Tracked separately.
 from __future__ import annotations
 
 import uuid
+from datetime import date, datetime
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -43,13 +45,69 @@ from app.models.ipam import IPAddress, Subnet
 from app.services.dhcp.ipam_mirror import insert_ipam_mirror_row
 
 __all__ = [
-    "detach_ipam_for_scope_statics",
     "detach_ipam_for_static",
     "remirror_scope_statics",
     "remove_ipam_for_scope_statics",
     "remove_ipam_for_static",
     "upsert_ipam_for_static",
 ]
+
+
+# Operator-authored columns on the ``ip_address`` mirror that a wholesale
+# reservation delete would otherwise lose (the DHCP-derived columns —
+# status / hostname / mac / back-links — are re-derived from the static on
+# restore, so they're excluded). ``uuid`` / ``datetime`` / ``date`` values are
+# JSON-encoded to ISO strings on snapshot and parsed back on restore.
+_OPERATOR_MIRROR_FIELDS: tuple[str, ...] = (
+    "description",
+    "tags",
+    "custom_fields",
+    "owner_user_id",
+    "owner_group_id",
+    "managed_by",
+    "role",
+    "reserved_until",
+    "decom_date",
+)
+
+
+def _snapshot_operator_fields(row: IPAddress) -> dict[str, Any] | None:
+    """Capture the operator-authored columns of ``row`` as a JSON-safe dict.
+
+    Returns ``None`` when every field is at its empty/default value, so we
+    don't persist a snapshot that carries nothing.
+    """
+    snap: dict[str, Any] = {}
+    for field in _OPERATOR_MIRROR_FIELDS:
+        val = getattr(row, field, None)
+        if val in (None, "", {}, []):
+            continue
+        if isinstance(val, uuid.UUID):
+            snap[field] = str(val)
+        elif isinstance(val, (datetime, date)):
+            snap[field] = val.isoformat()
+        else:
+            snap[field] = val
+    return snap or None
+
+
+def _restore_operator_fields(row: IPAddress, snapshot: dict[str, Any]) -> None:
+    """Re-apply a :func:`_snapshot_operator_fields` dict onto a fresh mirror row."""
+    for field, val in snapshot.items():
+        if field not in _OPERATOR_MIRROR_FIELDS:
+            continue
+        try:
+            if field in ("owner_user_id", "owner_group_id") and isinstance(val, str):
+                setattr(row, field, uuid.UUID(val))
+            elif field == "reserved_until" and isinstance(val, str):
+                setattr(row, field, datetime.fromisoformat(val))
+            elif field == "decom_date" and isinstance(val, str):
+                setattr(row, field, date.fromisoformat(val))
+            else:
+                setattr(row, field, val)
+        except (ValueError, TypeError):
+            # A malformed snapshot value must never break restore.
+            continue
 
 
 async def upsert_ipam_for_static(
@@ -92,6 +150,12 @@ async def upsert_ipam_for_static(
     row.mac_address = str(st.mac_address)
     row.status = "static_dhcp"
     row.static_assignment_id = str(st.id)
+    # Restore any operator-authored columns captured when this reservation's
+    # mirror was deleted (lossless Trash restore, #630), then clear the
+    # snapshot so it can't go stale or re-apply on a later ordinary edit.
+    if st.ipam_metadata_snapshot:
+        _restore_operator_fields(row, st.ipam_metadata_snapshot)
+        st.ipam_metadata_snapshot = None
     await db.flush()
     st.ip_address_id = row.id
     # Fire DNS sync so forward/reverse records follow the static.
@@ -141,36 +205,6 @@ async def detach_ipam_for_static(
             row.status = to_status
 
 
-async def detach_ipam_for_scope_statics(
-    db: AsyncSession,
-    scope_id: uuid.UUID,
-    *,
-    to_status: str = "available",
-) -> int:
-    """Detach the IPAM mirror of every reservation under ``scope_id``.
-
-    Called by the paths that are about to destroy the reservations physically
-    (scope permanent-delete, trash permanent-delete, purge sweep) — the FK
-    CASCADE that removes them runs no Python, so the mirror has to be released
-    here, *before* the delete, while the rows are still readable.
-
-    ``include_deleted`` because by this point the reservations are themselves
-    soft-deleted (stamped as part of their scope's batch), so the global filter
-    would otherwise hide the very rows we need to clean up.
-
-    Returns the number of reservations processed.
-    """
-    res = await db.execute(
-        select(DHCPStaticAssignment)
-        .where(DHCPStaticAssignment.scope_id == scope_id)
-        .execution_options(include_deleted=True)
-    )
-    statics = list(res.scalars().all())
-    for st in statics:
-        await detach_ipam_for_static(db, st, to_status=to_status)
-    return len(statics)
-
-
 async def remove_ipam_for_static(db: AsyncSession, st: DHCPStaticAssignment) -> int:
     """DELETE the IPAM mirror row(s) for a reservation (not just free them).
 
@@ -191,6 +225,12 @@ async def remove_ipam_for_static(db: AsyncSession, st: DHCPStaticAssignment) -> 
     res = await db.execute(select(IPAddress).where(IPAddress.static_assignment_id == str(st.id)))
     removed = 0
     for row in res.scalars().all():
+        # Snapshot operator-authored columns onto the (soft-deleted, retained)
+        # reservation before we hard-delete the mirror, so a Trash restore is
+        # lossless (#630). The last mirror row wins — there is realistically one.
+        snapshot = _snapshot_operator_fields(row)
+        if snapshot is not None:
+            st.ipam_metadata_snapshot = snapshot
         subnet_row = await db.get(Subnet, row.subnet_id)
         if subnet_row is not None:
             try:
@@ -209,8 +249,8 @@ async def remove_ipam_for_static(db: AsyncSession, st: DHCPStaticAssignment) -> 
 async def remove_ipam_for_scope_statics(db: AsyncSession, scope_id: uuid.UUID) -> int:
     """DELETE the IPAM mirror of every reservation under ``scope_id``.
 
-    The delete-the-row counterpart to ``detach_ipam_for_scope_statics`` (see
-    ``remove_ipam_for_static`` for why deleting, not freeing, is required). Uses
+    The delete-the-row, scope-wide counterpart to ``remove_ipam_for_static``
+    (see it for why deleting, not freeing, is required). Uses
     ``include_deleted`` because the reservations may already be soft-deleted as
     part of their scope's batch by the time this runs. Returns the number of
     mirror rows removed.

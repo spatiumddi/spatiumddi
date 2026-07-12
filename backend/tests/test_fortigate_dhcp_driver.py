@@ -14,7 +14,7 @@ from typing import Any
 
 import pytest
 
-from app.drivers.dhcp._cloud_base import CloudDHCPError
+from app.drivers.dhcp._cloud_base import CloudDHCPAdoptionError, CloudDHCPError
 from app.drivers.dhcp.base import PoolDef, ScopeDef, StaticAssignmentDef
 from app.drivers.dhcp.fortigate import FortiGateDHCPDriver
 
@@ -105,7 +105,7 @@ def _full_scope() -> ScopeDef:
             "domain-name": "lab.local",
             "ntp-servers": "192.168.20.1",
             "broadcast-address": "192.168.20.255",  # must be dropped
-            "mtu": "1500",  # generic option, non-ip → string
+            "mtu": "1500",  # numeric generic option → hex (0x05dc)
             "code:252": "http://wpad.lab/wpad.dat",  # custom code → string
             "tftp-server-address": "192.168.20.5",  # generic option, ip
         },
@@ -162,12 +162,28 @@ def test_build_body_generic_options() -> None:
     opts = {(o["code"], o["type"]): o for o in body["options"]}
     # broadcast-address (28) is derived by FortiGate → never emitted.
     assert not any(o["code"] == 28 for o in body["options"])
-    # mtu (26) is not an IP → string.
-    assert opts[(26, "string")]["value"] == "1500"
+    # mtu (26) is a numeric option → big-endian hex, NOT the ASCII string "1500"
+    # (a string reaches the client as characters, not a 16-bit MTU). 1500 = 0x05dc.
+    assert opts[(26, "hex")]["hex"] == "05dc"
     # custom code:252 → string.
     assert opts[(252, "string")]["value"] == "http://wpad.lab/wpad.dat"
     # tftp-server-address (150) is an IP → type ip.
     assert opts[(150, "ip")]["ip"] == "192.168.20.5"
+
+
+def test_build_body_numeric_options_as_hex() -> None:
+    # time-offset (2) is a SIGNED 32-bit seconds value; mtu (26) is UNSIGNED
+    # 16-bit. Both must be big-endian hex, not ASCII.
+    scope = ScopeDef(
+        subnet_cidr="10.0.0.0/24",
+        options={"mtu": "9000", "time-offset": "-3600"},
+    )
+    body = FortiGateDHCPDriver()._build_server_body("port1", scope)
+    opts = {o["code"]: o for o in body["options"]}
+    assert opts[26]["type"] == "hex"
+    assert opts[26]["hex"] == "2328"  # 9000 unsigned 16-bit
+    assert opts[2]["type"] == "hex"
+    assert opts[2]["hex"] == "fffff1f0"  # -3600 signed 32-bit two's complement
 
 
 def test_build_body_clips_exclude_to_pool() -> None:
@@ -259,45 +275,103 @@ async def test_iface_ip_string_form(monkeypatch: pytest.MonkeyPatch) -> None:
     assert any(c["method"] == "post" for c in fake.calls)
 
 
-# ── Create vs update (adopt) ─────────────────────────────────────────────
+# ── Create vs update vs adopt-guard (#630) ───────────────────────────────
 
 
-async def test_apply_scope_updates_existing(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_apply_scope_create_records_mkey(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No object on the interface → POST + return the FortiOS-assigned mkey."""
     fake = _FakeClient(
         {
             "get": [
                 _ok([_iface("port2", "192.168.20.1", "255.255.255.0")]),
-                _ok([{"id": 7, "interface": "port2"}]),  # existing server on port2
+                _ok([]),  # existing servers list (none)
             ],
-            "put": [_write_ok(7)],
+            "post": [_write_ok(5)],
         }
     )
     driver = _patch(monkeypatch, fake)
-    await driver._apply_scope(_server(), _CREDS, _full_scope())
-    put = next(c for c in fake.calls if c["method"] == "put")
-    assert put["path"] == "/cmdb/system.dhcp/server/7"
+    ref = await driver._apply_scope(_server(), _CREDS, _full_scope())
+    assert ref == {"mkey": 5, "interface": "port2"}
+    assert next(c for c in fake.calls if c["method"] == "post")
 
 
-async def test_remove_scope_deletes(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_apply_scope_updates_owned(monkeypatch: pytest.MonkeyPatch) -> None:
+    """We already own the object (provider_ref) → PUT it, no adopt needed."""
     fake = _FakeClient(
         {
             "get": [
                 _ok([_iface("port2", "192.168.20.1", "255.255.255.0")]),
                 _ok([{"id": 7, "interface": "port2"}]),
             ],
-            "delete": [_write_ok(7)],
+            "put": [_write_ok(7)],
         }
     )
     driver = _patch(monkeypatch, fake)
-    await driver._remove_scope(_server(), _CREDS, "192.168.20.0/24")
+    ref = await driver._apply_scope(
+        _server(),
+        _CREDS,
+        _full_scope(),
+        provider_ref={"mkey": 7, "interface": "port2"},
+    )
+    put = next(c for c in fake.calls if c["method"] == "put")
+    assert put["path"] == "/cmdb/system.dhcp/server/7"
+    assert ref == {"mkey": 7, "interface": "port2"}
+
+
+async def test_apply_scope_refuses_unowned_existing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An object we never created + no opt-in → refuse (no PUT), so an
+    operator's hand-managed DHCP server isn't silently clobbered."""
+    fake = _FakeClient(
+        {
+            "get": [
+                _ok([_iface("port2", "192.168.20.1", "255.255.255.0")]),
+                _ok([{"id": 7, "interface": "port2"}]),
+            ],
+        }
+    )
+    driver = _patch(monkeypatch, fake)
+    with pytest.raises(CloudDHCPAdoptionError, match="already exists"):
+        await driver._apply_scope(_server(), _CREDS, _full_scope())
+    assert not any(c["method"] == "put" for c in fake.calls)
+
+
+async def test_apply_scope_adopts_when_opted_in(monkeypatch: pytest.MonkeyPatch) -> None:
+    """adopt_existing=True → overwrite the pre-existing object + claim it."""
+    fake = _FakeClient(
+        {
+            "get": [
+                _ok([_iface("port2", "192.168.20.1", "255.255.255.0")]),
+                _ok([{"id": 7, "interface": "port2"}]),
+            ],
+            "put": [_write_ok(7)],
+        }
+    )
+    driver = _patch(monkeypatch, fake)
+    ref = await driver._apply_scope(_server(), _CREDS, _full_scope(), adopt_existing=True)
+    put = next(c for c in fake.calls if c["method"] == "put")
+    assert put["path"] == "/cmdb/system.dhcp/server/7"
+    assert ref == {"mkey": 7, "interface": "port2"}
+
+
+async def test_remove_scope_deletes_owned(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With a recorded mkey we delete that exact object (no interface lookup)."""
+    fake = _FakeClient({"delete": [_write_ok(7)]})
+    driver = _patch(monkeypatch, fake)
+    await driver._remove_scope(
+        _server(),
+        _CREDS,
+        "192.168.20.0/24",
+        provider_ref={"mkey": 7, "interface": "port2"},
+    )
     delete = next(c for c in fake.calls if c["method"] == "delete")
     assert delete["path"] == "/cmdb/system.dhcp/server/7"
 
 
-async def test_remove_scope_no_interface_is_noop(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake = _FakeClient({"get": [_ok([_iface("port1", "10.0.0.1", "255.255.255.0")])]})
+async def test_remove_scope_unowned_is_noop(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No recorded mkey → never touch the device (an unmanaged server on the
+    interface stays put). Idempotent no-op, no delete issued."""
+    fake = _FakeClient({"delete": [_write_ok(7)]})
     driver = _patch(monkeypatch, fake)
-    # No matching interface → idempotent no-op (no delete issued, no raise).
     await driver._remove_scope(_server(), _CREDS, "192.168.20.0/24")
     assert not any(c["method"] == "delete" for c in fake.calls)
 

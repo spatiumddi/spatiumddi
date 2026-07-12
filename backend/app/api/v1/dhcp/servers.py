@@ -23,6 +23,7 @@ from app.core.agent_wake import (
 )
 from app.core.crypto import encrypt_dict
 from app.core.permissions import require_resource_permission
+from app.core.ssrf import assert_safe_target
 from app.drivers.dhcp import is_agentless, is_cloud, is_read_only
 from app.drivers.dhcp.base import MACBlockDef
 from app.drivers.dhcp.fortigate import test_fortigate_credentials
@@ -122,7 +123,10 @@ class ServerCreate(BaseModel):
     description: str = ""
     driver: str = "kea"
     host: str
-    port: int = 67
+    # None → resolved per-driver in the handler (443 for cloud/REST drivers like
+    # FortiGate that dial HTTPS, 67 for agent/agentless DHCP daemons). A literal
+    # 67 default would silently point a FortiGate at ``https://host:67`` (#630).
+    port: int | None = None
     roles: list[str] = []
     server_group_id: uuid.UUID | None = None
     # Kea HA listener URL (this server's own endpoint). Empty string
@@ -197,6 +201,11 @@ class ServerResponse(BaseModel):
     # dict for cloud drivers so the edit modal can show / change it without
     # re-entering the token. Null for non-cloud drivers.
     vdom: str | None = None
+    # Non-secret TLS-verify flag, echoed for cloud drivers so the edit modal
+    # can seed the checkbox from the stored value instead of resetting it to a
+    # hard-coded default (which would silently re-disable verification on any
+    # unrelated edit). Null for non-cloud drivers.
+    verify_tls: bool | None = None
     # Kea HA listener URL this server exposes to its partner.
     ha_peer_url: str = ""
     # Kea HA state — latest value reported by the agent's periodic
@@ -218,13 +227,19 @@ class ServerResponse(BaseModel):
         # Echo the non-secret VDOM for cloud drivers (best-effort decrypt —
         # never surface the token, and never fail the response on a bad blob).
         vdom: str | None = None
+        verify_tls: bool | None = None
         if is_cloud(s.driver) and s.credentials_encrypted:
             try:
                 from app.core.crypto import decrypt_dict  # noqa: PLC0415
 
-                vdom = decrypt_dict(s.credentials_encrypted).get("vdom")
+                _creds = decrypt_dict(s.credentials_encrypted)
+                vdom = _creds.get("vdom")
+                # Default the echo to True to match the secure create default
+                # for rows stored before this field existed.
+                verify_tls = bool(_creds.get("verify_tls", True))
             except Exception:  # noqa: BLE001 — never break the listing
                 vdom = None
+                verify_tls = None
         return cls(
             id=s.id,
             name=s.name,
@@ -253,6 +268,7 @@ class ServerResponse(BaseModel):
             is_agentless=agentless,
             is_read_only=is_read_only(s.driver),
             vdom=vdom,
+            verify_tls=verify_tls,
             ha_peer_url=s.ha_peer_url or "",
             ha_state=s.ha_state,
             ha_last_heartbeat_at=s.ha_last_heartbeat_at,
@@ -335,6 +351,20 @@ class TestFortiGateCredentialsRequest(BaseModel):
     server_id: uuid.UUID | None = None
 
 
+class FortiGateExistingDHCPServer(BaseModel):
+    """A DHCP-server object already present on a FortiGate interface — the
+    preflight surfaces its counts so a destructive sync/adopt is visible."""
+
+    mkey: int | None = None
+    ip_range_count: int = 0
+    reserved_count: int = 0
+    option_count: int = 0
+    # True when this object is one SpatiumDDI already owns (its mkey is
+    # recorded in some scope's provider_refs), so adopting it is a no-op —
+    # False means a plain sync would clobber operator-managed config.
+    managed: bool = False
+
+
 class FortiGateInterface(BaseModel):
     name: str
     cidr: str
@@ -345,6 +375,8 @@ class FortiGateInterface(BaseModel):
     # Which managed scope (if any) this interface's CIDR matches.
     matched_subnet_id: uuid.UUID | None = None
     matched_scope_id: uuid.UUID | None = None
+    # A pre-existing DHCP server on this interface, or null if none.
+    existing_dhcp_server: FortiGateExistingDHCPServer | None = None
 
 
 class SyncLeasesResponse(BaseModel):
@@ -385,6 +417,10 @@ async def create_server(body: ServerCreate, db: DB, user: SuperAdmin) -> ServerR
         raise HTTPException(status_code=409, detail="A DHCP server with that name exists")
 
     payload = body.model_dump(exclude={"windows_credentials", "cloud_credentials"})
+    # Resolve the per-driver default port when the caller omitted it: cloud/REST
+    # drivers (FortiGate) speak HTTPS on 443; agent/agentless DHCP daemons use 67.
+    if payload.get("port") is None:
+        payload["port"] = 443 if body.driver in CLOUD_DHCP_DRIVERS else 67
     s = DHCPServer(**payload)
     if body.driver == "windows_dhcp" and body.windows_credentials is not None:
         creds = body.windows_credentials.model_dump(exclude_none=True)
@@ -409,7 +445,10 @@ async def create_server(body: ServerCreate, db: DB, user: SuperAdmin) -> ServerR
                 detail=f"{body.driver} create requires an 'api_token' in cloud_credentials",
             )
         cloud.setdefault("vdom", "root")
-        cloud.setdefault("verify_tls", False)
+        # Secure-by-default: the FortiOS admin Bearer token is sensitive, so
+        # verify the TLS chain unless the operator explicitly opts out. Any
+        # ``ca_bundle_pem`` the caller supplied flows through untouched.
+        cloud.setdefault("verify_tls", True)
         s.credentials_encrypted = encrypt_dict(cloud)
     # Agentless drivers have no agent to approve; skip the pending-approval
     # dance entirely so the UI doesn't show a bogus "Approve" button.
@@ -538,7 +577,7 @@ async def update_server(
                         detail="First-time cloud credentials require an 'api_token'.",
                     )
                 patch.setdefault("vdom", "root")
-                patch.setdefault("verify_tls", False)
+                patch.setdefault("verify_tls", True)
                 s.credentials_encrypted = encrypt_dict(patch)
                 changes["cloud_credentials_set"] = True
 
@@ -594,13 +633,22 @@ async def delete_server(server_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
 
 
 @router.post("/{server_id}/sync", status_code=status.HTTP_202_ACCEPTED)
-async def sync_server(server_id: uuid.UUID, db: DB, user: SuperAdmin) -> dict[str, str]:
+async def sync_server(
+    server_id: uuid.UUID,
+    db: DB,
+    user: SuperAdmin,
+    adopt_existing: bool = False,
+) -> dict[str, str]:
     """Force a config push: rebuild the bundle, enqueue an apply_config op.
 
     Coalesces consecutive clicks: if an ``apply_config`` op is already
     pending for this server, reuse it instead of queueing another reload.
 
     Rejects read-only drivers (windows_dhcp): there's no config to push.
+
+    ``adopt_existing`` (cloud/FortiGate only) opts in to overwriting a
+    pre-existing provider DHCP object SpatiumDDI never created; without it a
+    clobber-risk sync returns 409 so the operator can review the preflight.
     """
     s = await db.get(DHCPServer, server_id)
     if s is None:
@@ -615,6 +663,7 @@ async def sync_server(server_id: uuid.UUID, db: DB, user: SuperAdmin) -> dict[st
                 status_code=400,
                 detail="Server is not in a group; attach it to a group with scopes first",
             )
+        assert_safe_target(s.host, label="fortigate")
         scopes = list(
             (
                 await db.execute(
@@ -629,7 +678,7 @@ async def sync_server(server_id: uuid.UUID, db: DB, user: SuperAdmin) -> dict[st
             .all()
         )
         for scope in scopes:
-            await push_cloud_scope_upsert(db, scope)
+            await push_cloud_scope_upsert(db, scope, adopt_existing=adopt_existing)
         s.last_sync_at = datetime.now(UTC)
         write_audit(
             db,
@@ -775,7 +824,7 @@ async def test_fortigate_credentials_endpoint(
             host = host or s.host
             port = body.port or s.port
         creds.setdefault("vdom", "root")
-        creds.setdefault("verify_tls", False)
+        creds.setdefault("verify_tls", True)
     elif body.server_id is not None:
         s = await db.get(DHCPServer, body.server_id)
         if s is None:
@@ -793,6 +842,7 @@ async def test_fortigate_credentials_endpoint(
 
     if not host:
         raise HTTPException(status_code=400, detail="host is required")
+    assert_safe_target(host, label="fortigate")
     ok, msg = await test_fortigate_credentials(host, port, creds)
     return TestResult(ok=ok, message=msg)
 
@@ -814,6 +864,7 @@ async def fortigate_interfaces(
             status_code=400,
             detail=f"driver {s.driver!r} is not a FortiGate server",
         )
+    assert_safe_target(s.host, label="fortigate")
     driver = get_driver(s.driver)
     try:
         ifaces = await driver.list_interfaces(s)  # type: ignore[attr-defined]
@@ -823,12 +874,21 @@ async def fortigate_interfaces(
         ) from exc
 
     # Build a CIDR → (subnet_id, scope_id) map for this server's group so we
-    # can annotate which interface will bind to which scope.
+    # can annotate which interface will bind to which scope. Also collect the
+    # set of FortiOS mkeys SpatiumDDI already owns (from every scope's
+    # provider_refs for THIS server) so the preflight can tell an adopt-safe
+    # managed object apart from an operator's unmanaged one.
     scope_map: dict[str, tuple[uuid.UUID, uuid.UUID]] = {}
+    owned_mkeys: set[int] = set()
     if s.server_group_id is not None:
         rows = (
             await db.execute(
-                select(DHCPScope.id, DHCPScope.subnet_id, Subnet.network)
+                select(
+                    DHCPScope.id,
+                    DHCPScope.subnet_id,
+                    DHCPScope.provider_refs,
+                    Subnet.network,
+                )
                 .join(Subnet, Subnet.id == DHCPScope.subnet_id)
                 .where(
                     DHCPScope.group_id == s.server_group_id,
@@ -836,12 +896,18 @@ async def fortigate_interfaces(
                 )
             )
         ).all()
-        for scope_id, subnet_id, network in rows:
+        for scope_id, subnet_id, provider_refs, network in rows:
             try:
                 key = str(_ipaddress.ip_network(str(network), strict=False))
             except (ValueError, TypeError):
                 continue
             scope_map[key] = (subnet_id, scope_id)
+            ref = (provider_refs or {}).get(str(s.id)) if provider_refs else None
+            if isinstance(ref, dict):
+                try:
+                    owned_mkeys.add(int(ref["mkey"]))
+                except (KeyError, TypeError, ValueError):
+                    pass
 
     out: list[FortiGateInterface] = []
     for iface in ifaces:
@@ -850,6 +916,17 @@ async def fortigate_interfaces(
         except (ValueError, TypeError):
             key = iface.get("cidr", "")
         match = scope_map.get(key)
+        existing_raw = iface.get("existing_dhcp_server")
+        existing: FortiGateExistingDHCPServer | None = None
+        if isinstance(existing_raw, dict):
+            mkey = existing_raw.get("mkey")
+            existing = FortiGateExistingDHCPServer(
+                mkey=mkey,
+                ip_range_count=int(existing_raw.get("ip_range_count", 0) or 0),
+                reserved_count=int(existing_raw.get("reserved_count", 0) or 0),
+                option_count=int(existing_raw.get("option_count", 0) or 0),
+                managed=(isinstance(mkey, int) and mkey in owned_mkeys),
+            )
         out.append(
             FortiGateInterface(
                 name=iface.get("name", ""),
@@ -860,6 +937,7 @@ async def fortigate_interfaces(
                 alias=iface.get("alias", ""),
                 matched_subnet_id=match[0] if match else None,
                 matched_scope_id=match[1] if match else None,
+                existing_dhcp_server=existing,
             )
         )
     return out
