@@ -543,6 +543,32 @@ def _collision_http_exc(warnings: list[dict[str, Any]]) -> HTTPException:
     )
 
 
+def _dynamic_pool_warning(
+    address: str, ip_int: int, ranges: list[tuple[int, int]]
+) -> dict[str, Any]:
+    """Build the 'inside a dynamic DHCP pool' soft-collision warning (#631).
+
+    In-pool allocation is allowed but flagged: the DHCP server owns the range
+    and will lease it on ``DISCOVER``, and a bare IPAM row — even
+    ``status="static_dhcp"`` — does not create a ``DHCPStaticAssignment`` (the
+    mirror only flows reservation → IPAM), so nothing tells the server to stop
+    handing the address out. The operator confirms via ``force=True`` and is
+    reminded to also pin a matching static reservation on the scope.
+    """
+    pool_start = pool_end = None
+    for start, end in ranges:
+        if start <= ip_int <= end:
+            pool_start = str(ipaddress.ip_address(start))
+            pool_end = str(ipaddress.ip_address(end))
+            break
+    return {
+        "kind": "dynamic_pool",
+        "address": address,
+        "pool_start": pool_start,
+        "pool_end": pool_end,
+    }
+
+
 async def _check_public_facing_warnings(
     db: AsyncSession,
     *,
@@ -6568,20 +6594,6 @@ async def create_address(
             detail=(f"No write permission on subnet or any address set covering {body.address}"),
         )
 
-    # Refuse allocation inside a dynamic DHCP pool — the DHCP server owns
-    # that range and will hand it out on first ``DISCOVER``. Other pool
-    # types (excluded / reserved) don't conflict with manual allocation.
-    dynamic_ranges = await _load_dynamic_pool_ranges(db, subnet_id)
-    if dynamic_ranges and _ip_int_in_dynamic_pool(int(addr), dynamic_ranges):
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"{body.address} falls inside a dynamic DHCP pool — those IPs "
-                "are managed by the DHCP server. Use a static-DHCP reservation "
-                "or pick an address outside the dynamic range."
-            ),
-        )
-
     # MAC address required for static_dhcp
     if body.status == "static_dhcp" and not body.mac_address:
         raise HTTPException(
@@ -6625,6 +6637,12 @@ async def create_address(
                 extra_zone_ids=body.extra_zone_ids,
             )
         )
+        # Allocating inside a dynamic DHCP pool is allowed but flagged (#631):
+        # soft, force-overridable warning rather than the old hard 422, since a
+        # MAC pinned inside the range is the standard idiom on every driver.
+        dynamic_ranges = await _load_dynamic_pool_ranges(db, subnet_id)
+        if dynamic_ranges and _ip_int_in_dynamic_pool(int(addr), dynamic_ranges):
+            warnings.append(_dynamic_pool_warning(body.address, int(addr), dynamic_ranges))
         if warnings:
             raise _collision_http_exc(warnings)
 

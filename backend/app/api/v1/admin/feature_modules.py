@@ -30,7 +30,7 @@ from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.core.auth_throttle import login_rate_limited
 from app.core.demo_mode import DEMO_RESTRICTED_MODULES, is_demo_mode
 from app.core.permissions import is_effective_superadmin
-from app.core.request_meta import client_ip
+from app.core.request_meta import get_trusted_client_ip
 from app.models.audit import AuditLog
 from app.models.feature_module import FeatureModule
 from app.models.settings import PlatformSettings
@@ -385,7 +385,7 @@ async def break_glass(
     # 0. Per-IP rate limit (#4) — same Redis budget /auth/login uses, fails open.
     #    Bounds TOTP-spray + high-sev audit noise from one source even before
     #    we touch the per-account counter.
-    if await login_rate_limited(client_ip(request)):
+    if await login_rate_limited(get_trusted_client_ip(request)):
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Too many break-glass attempts. Try again shortly.",

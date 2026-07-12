@@ -26,6 +26,7 @@ from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.core.crypto import encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.permissions import require_resource_permission
+from app.core.request_meta import get_trusted_client_ip
 from app.models.audit import AuditLog
 from app.models.firewall_feed import FIREWALL_FEED_KINDS, FirewallFeed
 from app.services.firewall_feeds.service import (
@@ -268,7 +269,9 @@ async def poll_blocklist(
         raise HTTPException(status_code=401, detail="invalid or missing token")
 
     body = await render_blocklist(db, f)
-    source_ip = request.client.host if request.client else None
+    # Provenance IP the operator sees for "who polled this feed" — use the
+    # unspoofable X-Real-IP so a client can't forge last_polled_ip (#626).
+    source_ip = get_trusted_client_ip(request)
     await record_poll(db, f, source_ip)
     await db.commit()
     return PlainTextResponse(content=body, media_type="text/plain")

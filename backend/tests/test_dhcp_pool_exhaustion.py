@@ -15,7 +15,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.security import hash_password
 from app.models.alerts import AlertEvent, AlertRule
 from app.models.auth import User
-from app.models.dhcp import DHCPLease, DHCPPool, DHCPScope, DHCPServer, DHCPServerGroup
+from app.models.dhcp import (
+    DHCPLease,
+    DHCPPool,
+    DHCPScope,
+    DHCPServer,
+    DHCPServerGroup,
+    DHCPStaticAssignment,
+)
 from app.models.ipam import IPBlock, IPSpace, Subnet
 from app.services.alerts import RULE_TYPE_DHCP_POOL_EXHAUSTION, evaluate_all
 from app.services.dhcp.pool_occupancy import (
@@ -75,6 +82,16 @@ async def _lease(
             ip_address=f"10.60.0.{last_octet}",
             mac_address=f"02:00:00:00:00:{last_octet:02x}",
             state=state,
+        )
+    )
+
+
+async def _static(db: AsyncSession, scope: DHCPScope, last_octet: int) -> None:
+    db.add(
+        DHCPStaticAssignment(
+            scope_id=scope.id,
+            ip_address=f"10.60.0.{last_octet}",
+            mac_address=f"02:00:00:00:0a:{last_octet:02x}",
         )
     )
 
@@ -171,6 +188,66 @@ async def test_compute_pool_occupancy_batch_matches_single(db_session: AsyncSess
     # Batch result matches the per-pool helper exactly.
     single = await compute_pool_occupancy(db_session, pool)
     assert (batch[pool.id].assigned, batch[pool.id].total) == (single.assigned, single.total)
+
+
+async def test_occupancy_counts_offline_in_pool_reservation(
+    db_session: AsyncSession,
+) -> None:
+    # #631: an in-pool static reservation withholds its address from the dynamic
+    # set even with no active lease (device offline). It must count as assigned,
+    # or exhaustion is under-reported.
+    scope, server = await _scope_and_server(db_session)
+    pool = await _pool(db_session, scope)
+    await _lease(db_session, server, scope, 10)  # one live dynamic lease
+    await _static(db_session, scope, 15)  # reserved, device currently offline
+    await _static(db_session, scope, 50)  # reservation OUTSIDE the pool — ignored
+    await db_session.flush()
+
+    occ = await compute_pool_occupancy(db_session, pool)
+    assert occ.assigned == 2  # 1 lease + 1 in-pool reservation
+    assert occ.free == 8
+    # Batch path agrees.
+    batch = await compute_pool_occupancy_batch(db_session, [pool])
+    assert batch[pool.id].assigned == 2
+
+
+async def test_occupancy_dedupes_reservation_and_its_lease(
+    db_session: AsyncSession,
+) -> None:
+    # #631: a reserved device that is ALSO currently leased is one occupied
+    # address, not two — union, not sum. (Would otherwise over-count / go free<0.)
+    scope, server = await _scope_and_server(db_session)
+    pool = await _pool(db_session, scope)
+    await _lease(db_session, server, scope, 12)
+    await _static(db_session, scope, 12)  # same address, reserved + leased
+    await db_session.flush()
+
+    occ = await compute_pool_occupancy(db_session, pool)
+    assert occ.assigned == 1
+    batch = await compute_pool_occupancy_batch(db_session, [pool])
+    assert batch[pool.id].assigned == 1
+
+
+async def test_occupancy_ignores_soft_deleted_reservation(
+    db_session: AsyncSession,
+) -> None:
+    # A soft-deleted reservation is filtered by the global ORM listener, so it
+    # must not keep counting against the pool.
+    from datetime import UTC, datetime
+
+    scope, server = await _scope_and_server(db_session)
+    pool = await _pool(db_session, scope)
+    reservation = DHCPStaticAssignment(
+        scope_id=scope.id,
+        ip_address="10.60.0.15",
+        mac_address="02:00:00:00:0a:15",
+        deleted_at=datetime.now(UTC),
+    )
+    db_session.add(reservation)
+    await db_session.flush()
+
+    occ = await compute_pool_occupancy(db_session, pool)
+    assert occ.assigned == 0
 
 
 # ── Alert evaluator ───────────────────────────────────────────────────────

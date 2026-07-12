@@ -911,10 +911,15 @@ rule here has been surfaced to an operator, not just silently logged.
   — under the group-centric model every peer in the group serves
   the same reservation so duplicates across scopes in the same
   group are rejected. `409` at `backend/app/api/v1/dhcp/statics.py`.
-- **Static IP inside a dynamic pool.** A static reservation whose IP
-  falls inside a `dynamic` pool is refused; delete or shrink the pool,
-  or convert the pool to `reserved` / `excluded` first. `409` at
-  `backend/app/api/v1/dhcp/statics.py:194`.
+- **Static IP inside a dynamic pool is allowed (#631).** Pinning a
+  reservation whose IP falls inside a `dynamic` pool is the standard
+  idiom on every driver we ship — Kea honours it (default
+  `reservations-out-of-pool: false` won't hand the reserved address to
+  another client), FortiGate renders `reserved-address` independently
+  of `ip-range`, and Windows *requires* the reservation to fall inside
+  the scope's range. No conflict check refuses it. Pool occupancy
+  counts in-pool reservations as assigned so exhaustion isn't
+  under-reported even while the reserved device is offline.
 - **Reservation IP outside the scope's subnet.** `422` at
   `backend/app/api/v1/dhcp/statics.py:177` (issue #619). Kea renders a
   reservation **nested inside** its subnet's `subnet4` stanza and Windows
