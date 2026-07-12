@@ -98,7 +98,15 @@ async def readiness() -> JSONResponse:
         from app.config import settings
         from app.core.redis_client import make_async_redis
 
-        r = make_async_redis(settings.redis_url, socket_connect_timeout=2)
+        # #590 — socket_timeout too, and both knobs now reach the SENTINEL
+        # hops as well (redis_client._sentinel_kwargs): an unbounded
+        # connect to a dead-but-still-resolving sentinel hung this check
+        # for minutes, which the kubelet's 1 s probe timeout reads as
+        # NotReady — on every api pod at once, during exactly the
+        # node-loss window readiness exists to survive.
+        r = make_async_redis(
+            settings.redis_url, socket_connect_timeout=2, socket_timeout=2
+        )
         await cast(Awaitable[bool], r.ping())
         await r.aclose()
         checks["redis"] = "ok"
@@ -168,7 +176,15 @@ async def platform_health() -> JSONResponse:
         from app.config import settings
         from app.core.redis_client import make_async_redis
 
-        r = make_async_redis(settings.redis_url, socket_connect_timeout=2)
+        # #590 — socket_timeout too, and both knobs now reach the SENTINEL
+        # hops as well (redis_client._sentinel_kwargs): an unbounded
+        # connect to a dead-but-still-resolving sentinel hung this check
+        # for minutes, which the kubelet's 1 s probe timeout reads as
+        # NotReady — on every api pod at once, during exactly the
+        # node-loss window readiness exists to survive.
+        r = make_async_redis(
+            settings.redis_url, socket_connect_timeout=2, socket_timeout=2
+        )
         await cast(Awaitable[bool], r.ping())
         await r.aclose()
         components.append(
@@ -239,7 +255,15 @@ async def platform_health() -> JSONResponse:
         # Sentinel-aware (HA Redis uses ``sentinel://``, which raw
         # ``aioredis.from_url`` rejects with "must specify one of redis:// …"
         # — the same helper the redis + workers checks above use).
-        r = make_async_redis(settings.redis_url, socket_connect_timeout=2)
+        # #590 — socket_timeout too, and both knobs now reach the SENTINEL
+        # hops as well (redis_client._sentinel_kwargs): an unbounded
+        # connect to a dead-but-still-resolving sentinel hung this check
+        # for minutes, which the kubelet's 1 s probe timeout reads as
+        # NotReady — on every api pod at once, during exactly the
+        # node-loss window readiness exists to survive.
+        r = make_async_redis(
+            settings.redis_url, socket_connect_timeout=2, socket_timeout=2
+        )
         raw = await r.get(BEAT_HEARTBEAT_KEY)
         await r.aclose()
         if raw is None:
