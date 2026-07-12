@@ -110,7 +110,8 @@ def _sentinel_kwargs(password: str | None, kwargs: dict[str, Any]) -> dict[str, 
     kill_leader drill on a nested 3-node rig). Propagate the socket
     knobs so a dead sentinel costs its timeout, not minutes."""
     out: dict[str, Any] = {
-        k: v for k, v in kwargs.items()
+        k: v
+        for k, v in kwargs.items()
         if k in ("socket_connect_timeout", "socket_timeout", "socket_keepalive")
     }
     if password:

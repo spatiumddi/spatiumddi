@@ -91,8 +91,11 @@ async def readiness() -> JSONResponse:
                 await session.execute(text("SELECT 1"))
         checks["database"] = "ok"
     except TimeoutError:
-        logger.warning("readiness_check_failed", check="database",
-                       error="timed out after 4s (pool draining dead connections?)")
+        logger.warning(
+            "readiness_check_failed",
+            check="database",
+            error="timed out after 4s (pool draining dead connections?)",
+        )
         checks["database"] = "error: timed out after 4s"
         healthy = False
     except Exception as exc:
@@ -126,9 +129,7 @@ async def readiness() -> JSONResponse:
         # for minutes, which the kubelet's 1 s probe timeout reads as
         # NotReady — on every api pod at once, during exactly the
         # node-loss window readiness exists to survive.
-        r = make_async_redis(
-            settings.redis_url, socket_connect_timeout=2, socket_timeout=2
-        )
+        r = make_async_redis(settings.redis_url, socket_connect_timeout=2, socket_timeout=2)
         await cast(Awaitable[bool], r.ping())
         await r.aclose()
         checks["redis"] = "ok"
@@ -204,9 +205,7 @@ async def platform_health() -> JSONResponse:
         # for minutes, which the kubelet's 1 s probe timeout reads as
         # NotReady — on every api pod at once, during exactly the
         # node-loss window readiness exists to survive.
-        r = make_async_redis(
-            settings.redis_url, socket_connect_timeout=2, socket_timeout=2
-        )
+        r = make_async_redis(settings.redis_url, socket_connect_timeout=2, socket_timeout=2)
         await cast(Awaitable[bool], r.ping())
         await r.aclose()
         components.append(
@@ -283,9 +282,7 @@ async def platform_health() -> JSONResponse:
         # for minutes, which the kubelet's 1 s probe timeout reads as
         # NotReady — on every api pod at once, during exactly the
         # node-loss window readiness exists to survive.
-        r = make_async_redis(
-            settings.redis_url, socket_connect_timeout=2, socket_timeout=2
-        )
+        r = make_async_redis(settings.redis_url, socket_connect_timeout=2, socket_timeout=2)
         raw = await r.get(BEAT_HEARTBEAT_KEY)
         await r.aclose()
         if raw is None:

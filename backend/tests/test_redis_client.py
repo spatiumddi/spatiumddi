@@ -47,13 +47,16 @@ def test_sentinel_kwargs_propagates_socket_knobs() -> None:
     # check rides that hang straight through the kubelet's 1s probe timeout.
     from app.core.redis_client import _sentinel_kwargs
 
-    out = _sentinel_kwargs("pw", {
-        "socket_connect_timeout": 2,
-        "socket_timeout": 2,
-        "socket_keepalive": True,
-        "db": 0,                      # not a socket knob — must not leak
-        "decode_responses": True,     # not a socket knob — must not leak
-    })
+    out = _sentinel_kwargs(
+        "pw",
+        {
+            "socket_connect_timeout": 2,
+            "socket_timeout": 2,
+            "socket_keepalive": True,
+            "db": 0,  # not a socket knob — must not leak
+            "decode_responses": True,  # not a socket knob — must not leak
+        },
+    )
     assert out == {
         "socket_connect_timeout": 2,
         "socket_timeout": 2,
