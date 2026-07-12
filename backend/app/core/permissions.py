@@ -33,7 +33,7 @@ from fastapi import Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, get_db
-from app.core.request_meta import clean_user_agent
+from app.core.request_meta import clean_user_agent, get_trusted_client_ip
 from app.models.audit import AuditLog
 from app.models.auth import User
 
@@ -504,7 +504,7 @@ async def _record_denial(
                 user_id=user.id,
                 user_display_name=user.display_name,
                 auth_source=getattr(user, "auth_source", "local") or "local",
-                source_ip=request.client.host if request.client else None,
+                source_ip=get_trusted_client_ip(request),
                 user_agent=clean_user_agent(request.headers.get("user-agent")),
                 action=action,
                 resource_type=resource_type,

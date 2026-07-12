@@ -37,6 +37,7 @@ from sqlalchemy.orm import selectinload
 
 from app.api.deps import DB, CurrentUser
 from app.core.permissions import require_permission
+from app.core.request_meta import get_trusted_client_ip
 from app.models.acme import ACMEAccount
 from app.models.audit import AuditLog
 from app.models.dns import DNSZone
@@ -319,17 +320,21 @@ async def _auth_acme(
             detail="X-Api-User and X-Api-Key headers required",
         )
     account = await acme_svc.authenticate(db, x_api_user, x_api_key)
+    # Spoofing-resistant source IP for the account's allowlist gate (#626):
+    # X-Real-IP is the nginx-set peer the client can't forge, unlike the
+    # X-Forwarded-For-derived request.client.host.
+    trusted_ip = get_trusted_client_ip(request)
     if account is None:
         logger.warning(
             "acme_auth_failed",
             user=x_api_user[:8] + "…",
-            source_ip=request.client.host if request.client else None,
+            source_ip=trusted_ip,
         )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="invalid credentials",
         )
-    client_ip = request.client.host if request.client else None
+    client_ip = trusted_ip
     if not acme_svc.client_ip_allowed(account, client_ip):
         logger.warning(
             "acme_source_ip_denied",

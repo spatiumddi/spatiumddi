@@ -43,7 +43,7 @@ from app.core.auth.user_sync import (
 from app.core.auth_throttle import login_rate_limited, mfa_challenge_consume
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.permissions import effective_grants, is_effective_superadmin
-from app.core.request_meta import clean_user_agent
+from app.core.request_meta import clean_user_agent, get_trusted_client_ip
 from app.core.security import (
     create_access_token,
     create_mfa_challenge_token,
@@ -203,7 +203,12 @@ class PasswordPolicyResponse(BaseModel):
 
 
 def _client_ip(request: Request) -> str | None:
-    return request.client.host if request.client else None
+    # Auth-surface source IP: the per-IP login throttle (#4) gates on this,
+    # and it also lands in the login audit rows + ``last_login_ip``. Use the
+    # spoofing-resistant value (X-Real-IP, not the forgeable
+    # X-Forwarded-For-derived peer) so neither the throttle nor the audit
+    # trail can be evaded / poisoned by a client-supplied header (#626).
+    return get_trusted_client_ip(request)
 
 
 # SECURITY (#484 / #400 L1): the refresh token is delivered ONLY as an
