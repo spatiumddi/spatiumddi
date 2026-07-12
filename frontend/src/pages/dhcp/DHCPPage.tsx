@@ -1172,7 +1172,9 @@ function ScopeDeleteModal({
         // together and restore together (#617).
         `Delete scope "${scope.name || scope.id.slice(0, 8)}"? ` +
         "Its pools and reservations go with it — they stop being served straight " +
-        "away, and are restorable as a set from Administration → Trash." +
+        "away, and are restorable as a set from Administration → Trash. Any " +
+        "dynamic clients (leases) it learned are released too, and their IPAM " +
+        "and DNS entries removed." +
         windowsNote
       }
       referencesTitle={
@@ -2016,6 +2018,20 @@ function LeasesTab({ server }: { server: DHCPServer }) {
   const [page, setPage] = useState(1);
   const pageSize = 100;
 
+  const qc = useQueryClient();
+  const { isSuperadmin } = usePermissions();
+  // Manual single-lease delete (#478). Backend is SuperAdmin-gated, so only
+  // offer it to superadmins. A still-live lease may be re-learned on the next
+  // poll — this is for expired/stray leases; scope deletion handles the rest.
+  const [del, setDel] = useState<DHCPLease | null>(null);
+  const delMut = useMutation({
+    mutationFn: (leaseId: string) => dhcpApi.deleteLease(server.id, leaseId),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["dhcp-leases", server.id] });
+      setDel(null);
+    },
+  });
+
   const { data: subnets = [] } = useQuery({
     queryKey: ["subnets"],
     queryFn: () => ipamApi.listSubnets(),
@@ -2252,6 +2268,17 @@ function LeasesTab({ server }: { server: DHCPServer }) {
                       Copy Hostname
                     </ContextMenuItem>
                   )}
+                  {isSuperadmin && (
+                    <>
+                      <ContextMenuSeparator />
+                      <ContextMenuItem
+                        className="text-destructive"
+                        onSelect={() => setDel(l)}
+                      >
+                        Delete lease
+                      </ContextMenuItem>
+                    </>
+                  )}
                 </ContextMenuContent>
               </ContextMenu>
             ))}
@@ -2271,6 +2298,25 @@ function LeasesTab({ server }: { server: DHCPServer }) {
           onChange={setPage}
         />
       </div>
+      {del && (
+        <DeleteConfirmModal
+          title="Delete Lease"
+          description={
+            `Delete the lease for ${del.ip_address} (${del.mac_address})? ` +
+            "This removes the lease and its IPAM mirror. A still-active lease " +
+            "may be re-learned on the next poll — this is for stray or expired " +
+            "leases; deleting the scope clears its leases automatically."
+          }
+          onConfirm={() => delMut.mutate(del.id)}
+          onClose={() => setDel(null)}
+          isPending={delMut.isPending}
+          error={
+            delMut.isError
+              ? "Delete failed — check your permissions or refresh the list."
+              : null
+          }
+        />
+      )}
     </div>
   );
 }

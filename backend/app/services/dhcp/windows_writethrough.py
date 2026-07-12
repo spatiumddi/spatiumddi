@@ -49,6 +49,10 @@ from app.drivers.dhcp import get_driver
 from app.drivers.dhcp.base import RemoveReservationItem
 from app.models.dhcp import DHCPPool, DHCPScope, DHCPServer, DHCPStaticAssignment
 from app.models.ipam import Subnet
+from app.services.dhcp.cloud_writethrough import (
+    push_cloud_scope_delete,
+    push_cloud_scope_upsert,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -126,7 +130,17 @@ async def _scope_range(
 
 
 async def push_scope_upsert(db: AsyncSession, scope: DHCPScope) -> None:
-    """Push a scope create/update to every Windows DHCP member of the scope's group."""
+    """Push a scope create/update to every agentless member of the scope's group.
+
+    Windows members take a per-object ``apply_scope``; agentless cloud/REST
+    members (FortiGate) take the whole ``system.dhcp.server`` object rebuilt
+    from DB (see ``cloud_writethrough``). Both run before commit so a push
+    failure surfaces as a 502 and rolls back.
+    """
+    # Cloud/REST members first — independent of, and not gated by, the Windows
+    # early-return below (a cloud-only group has no Windows members).
+    await push_cloud_scope_upsert(db, scope)
+
     win_servers = await _windows_servers_for_group(db, scope.group_id)
     if not win_servers:
         return
@@ -159,7 +173,15 @@ async def push_scope_upsert(db: AsyncSession, scope: DHCPScope) -> None:
 
 
 async def push_scope_delete(db: AsyncSession, scope: DHCPScope) -> None:
-    """Remove the scope from every Windows DHCP member of its group."""
+    """Remove the scope from every agentless member of its group.
+
+    Fires on the soft-delete path too (via ``_push_agentless_scope_deletes``)
+    and the permanent path — an agentless push driver only reflects the delete
+    if we push it (#616). Cloud/REST members remove the whole interface DHCP
+    object; Windows members remove the scope by network address.
+    """
+    await push_cloud_scope_delete(db, scope)
+
     win_servers = await _windows_servers_for_group(db, scope.group_id)
     if not win_servers:
         return
@@ -194,6 +216,18 @@ async def push_scope_restore(db: AsyncSession, scope: DHCPScope) -> None:
     Callers must invoke this *after* the rows are un-stamped, so the scope
     lookups inside the per-object helpers resolve.
     """
+    # Cloud/REST members: one whole-object rebuild re-creates the scope, its
+    # pools and its reservations in a single push (the rows are un-stamped by
+    # now, so the rebuild sees them). Best-effort like the Windows path below.
+    try:
+        await push_cloud_scope_upsert(db, scope)
+    except Exception as exc:  # noqa: BLE001 — recovery action, don't wedge restore
+        logger.warning(
+            "cloud_dhcp_push_scope_restore_failed",
+            scope=str(scope.id),
+            error=str(exc),
+        )
+
     win_servers = await _windows_servers_for_group(db, scope.group_id)
     if not win_servers:
         return
@@ -271,6 +305,15 @@ async def push_pool_change(
     scope = await db.get(DHCPScope, pool.scope_id)
     if scope is None:
         return
+    # Cloud/REST members (FortiGate) — any pool change re-pushes the whole scope
+    # object (ip-range + exclude-range rebuilt from DB), covering every pool_type
+    # incl. reserved. On delete the row isn't removed from the DB until after
+    # this call, so exclude it explicitly. Runs before the Windows early-return
+    # and the Windows-only reserved-pool refusal below.
+    await push_cloud_scope_upsert(
+        db, scope, exclude_pool_ids={pool.id} if action == "delete" else None
+    )
+
     win_servers = await _windows_servers_for_group(db, scope.group_id)
     if not win_servers:
         return
@@ -349,6 +392,13 @@ async def push_static_change(
     scope = await db.get(DHCPScope, static.scope_id)
     if scope is None:
         return
+    # Cloud/REST members (FortiGate) — a static change re-pushes the whole scope
+    # object (reserved-address rebuilt from DB). On delete the row isn't removed
+    # from the DB until after this call, so exclude it explicitly.
+    await push_cloud_scope_upsert(
+        db, scope, exclude_static_ids={static.id} if action == "delete" else None
+    )
+
     win_servers = await _windows_servers_for_group(db, scope.group_id)
     if not win_servers:
         return
@@ -418,6 +468,22 @@ async def push_statics_bulk_delete(
     # Group by (server, scope) across all Windows servers in each scope's group.
     grouped: dict[tuple[Any, Any], list[DHCPStaticAssignment]] = defaultdict(list)
     server_cache: dict[Any, DHCPServer] = {}
+
+    # Cloud/REST members (FortiGate) — re-push each affected scope's whole object
+    # once, excluding the reservations being deleted (the endpoint removes the
+    # rows only after this call, so a plain rebuild would still see them).
+    exclude_by_scope: dict[Any, set[Any]] = defaultdict(set)
+    cloud_scopes: dict[Any, DHCPScope] = {}
+    for st in statics:
+        sc = cloud_scopes.get(st.scope_id)
+        if sc is None:
+            sc = await db.get(DHCPScope, st.scope_id)
+            if sc is None:
+                continue
+            cloud_scopes[st.scope_id] = sc
+        exclude_by_scope[st.scope_id].add(st.id)
+    for sid, sc in cloud_scopes.items():
+        await push_cloud_scope_upsert(db, sc, exclude_static_ids=exclude_by_scope.get(sid))
 
     for st in statics:
         scope = scope_cache.get(st.scope_id)

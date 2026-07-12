@@ -3332,7 +3332,21 @@ function AddAddressModal({
           {(["next", "manual"] as const).map((m) => (
             <button
               key={m}
-              onClick={() => setMode(m)}
+              onClick={() => {
+                // Carry the "next available" IP into the Specific-IP field so
+                // switching modes doesn't drop the operator on an empty input.
+                // Only seed when the field is empty (don't clobber a typed
+                // value) and there's no preset-range pre-fill in play.
+                if (
+                  m === "manual" &&
+                  !presetRange &&
+                  !address &&
+                  nextPreview?.address
+                ) {
+                  setAddress(nextPreview.address);
+                }
+                setMode(m);
+              }}
               className={cn(
                 "flex-1 rounded-md border px-3 py-1.5 text-sm",
                 mode === m
@@ -4965,20 +4979,41 @@ function SubnetDetail({
     const started = new Set<string>();
     const ended = new Set<string>();
 
-    const emitStarts = (ipInt: number) => {
+    // Emit every pool-boundary marker that resolves at or before ``ipInt``,
+    // interleaved by the marker's own IP position. When several pools resolve
+    // at the same address crossing (e.g. two dynamic pools with no allocated
+    // IP between them), emitting all starts then all ends would render
+    // ``START a, START b, END a, END b``; sorting the events by position keeps
+    // it ``START a, END a, START b, END b`` — each pool's END precedes the next
+    // pool's START. (Since ``_start <= _end`` for a pool, its start always
+    // sorts before its end, so a pool opened in this same batch is closed in
+    // order too.)
+    const emitBoundariesUpTo = (ipInt: number) => {
+      type BoundaryEvent = {
+        pos: number;
+        pool: (typeof sortedPools)[number];
+        boundary: "start" | "end";
+      };
+      const events: BoundaryEvent[] = [];
       for (const p of sortedPools) {
         if (!started.has(p.id) && p._start <= ipInt) {
-          rows.push({ kind: "pool-boundary", pool: p, boundary: "start" });
-          started.add(p.id);
+          events.push({ pos: p._start, pool: p, boundary: "start" });
+        }
+        if (!ended.has(p.id) && p._end < ipInt) {
+          events.push({ pos: p._end, pool: p, boundary: "end" });
         }
       }
-    };
-    const emitEnds = (ipInt: number) => {
-      for (const p of sortedPools) {
-        if (started.has(p.id) && !ended.has(p.id) && p._end < ipInt) {
-          rows.push({ kind: "pool-boundary", pool: p, boundary: "end" });
-          ended.add(p.id);
-        }
+      events.sort((a, b) =>
+        a.pos !== b.pos ? a.pos - b.pos : a.boundary === "end" ? -1 : 1,
+      );
+      for (const e of events) {
+        rows.push({
+          kind: "pool-boundary",
+          pool: e.pool,
+          boundary: e.boundary,
+        });
+        if (e.boundary === "start") started.add(e.pool.id);
+        else ended.add(e.pool.id);
       }
     };
 
@@ -4999,8 +5034,7 @@ function SubnetDetail({
         prevIpInt = null;
         continue;
       }
-      emitStarts(ipInt);
-      emitEnds(ipInt);
+      emitBoundariesUpTo(ipInt);
 
       // Gap detection between the previous IP and this one. Skipped
       // when a pool boundary just got emitted (the boundary already
@@ -6346,6 +6380,17 @@ function SubnetDetail({
                               </td>
                               <td className="px-4 py-2">
                                 {(() => {
+                                  // A static reservation sits outside every
+                                  // dynamic pool (validation forbids overlap),
+                                  // so the range match below never hits and the
+                                  // cell would read "—" for a DHCP-managed IP.
+                                  // Label it explicitly.
+                                  if (addr.status === "static_dhcp")
+                                    return (
+                                      <span className="inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium bg-violet-100 text-violet-800 dark:bg-violet-900/30 dark:text-violet-400">
+                                        Reservation
+                                      </span>
+                                    );
                                   const pi = ipPoolInfo(addr);
                                   if (!pi)
                                     return (

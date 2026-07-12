@@ -893,7 +893,7 @@ const SECTIONS: SectionDef[] = [
     title: "DHCP Lease Sync",
     group: "DHCP",
     description:
-      "Poll agentless DHCP servers (Windows DHCP today) for active leases and mirror them into DHCP + IPAM. Additive only; expiry is handled by the existing lease cleanup sweep.",
+      "Poll agentless DHCP servers (e.g. Windows DHCP, FortiGate) for active leases and mirror them into DHCP + IPAM. Additive only; expiry is handled by the existing lease cleanup sweep.",
     keywords: [
       "dhcp",
       "lease",
@@ -1529,7 +1529,7 @@ export function SettingsPage() {
               <>
                 <Field
                   label="Enable Lease Sync"
-                  description="Periodically poll agentless DHCP servers (Windows DHCP today) and upsert their active leases into SpatiumDDI. Each lease also mirrors into IPAM as an auto-from-lease row when the IP lives in a known subnet. Expiry is handled by the existing lease-cleanup sweep, not here."
+                  description="Periodically poll agentless DHCP servers (e.g. Windows DHCP, FortiGate) and upsert their active leases into SpatiumDDI. Each lease also mirrors into IPAM as an auto-from-lease row when the IP lives in a known subnet. Expiry is handled by the existing lease-cleanup sweep, not here."
                 >
                   <Toggle
                     checked={!!values.dhcp_pull_leases_enabled}
@@ -1539,7 +1539,7 @@ export function SettingsPage() {
                 </Field>
                 <Field
                   label="Poll Interval"
-                  description="How often the sync job polls each agentless server, in seconds. Beat ticks every 10 s (the floor); 15 s is the default — near-real-time IPAM population without hammering the Windows DC. Raise it (e.g. 60 / 300) if WinRM latency matters more than freshness."
+                  description="How often the sync job polls each agentless server, in seconds. Beat ticks every 10 s (the floor); 15 s is the default — near-real-time IPAM population without hammering the upstream server. Raise it (e.g. 60 / 300) if server/API latency matters more than freshness."
                 >
                   <div className="flex items-center gap-2">
                     <input

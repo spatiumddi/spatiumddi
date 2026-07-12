@@ -5,10 +5,10 @@ Two code paths:
 * **Agent-based drivers** (``kea``): trust the agent heartbeat.
   ``agent_last_seen`` is stamped by ``POST /api/v1/dhcp/servers/{id}/heartbeat``;
   if it's fresh we flip status to ``active``, otherwise ``unreachable``.
-* **Agentless drivers** (``windows_dhcp``): the control plane has to do the
-  poking itself. We call ``driver.health_check(server)`` which runs a small
-  WinRM round-trip (``Get-DhcpServerVersion``) and flip status based on the
-  boolean result.
+* **Agentless drivers** (``windows_dhcp``, ``fortigate``): the control plane
+  has to do the poking itself. We call ``driver.health_check(server)`` — a
+  WinRM round-trip (``Get-DhcpServerVersion``) for Windows, a REST probe (list
+  interfaces) for FortiGate — and flip status based on the boolean result.
 
 Either way, ``last_health_check_at`` is always stamped so the dashboard shows
 an up-to-date timestamp instead of the "never checked" placeholder.

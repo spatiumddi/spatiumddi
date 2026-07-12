@@ -23,16 +23,18 @@ from app.core.agent_wake import (
 )
 from app.core.crypto import encrypt_dict
 from app.core.permissions import require_resource_permission
-from app.drivers.dhcp import is_agentless, is_read_only
+from app.drivers.dhcp import is_agentless, is_cloud, is_read_only
 from app.drivers.dhcp.base import MACBlockDef
+from app.drivers.dhcp.fortigate import test_fortigate_credentials
 from app.drivers.dhcp.registry import _DRIVERS as _DHCP_DRIVERS
-from app.drivers.dhcp.registry import get_driver
+from app.drivers.dhcp.registry import CLOUD_DHCP_DRIVERS, get_driver
 from app.drivers.dhcp.windows import test_winrm_credentials
 from app.models.audit import AuditLog
-from app.models.dhcp import DHCPConfigOp, DHCPLease, DHCPMACBlock, DHCPServer
+from app.models.dhcp import DHCPConfigOp, DHCPLease, DHCPMACBlock, DHCPScope, DHCPServer
 from app.models.dhcp_fingerprint import DHCPFingerprint
-from app.models.ipam import IPAddress, Subnet
+from app.models.ipam import Subnet
 from app.models.metrics import DHCPMetricSample
+from app.services.dhcp.cloud_writethrough import push_cloud_scope_upsert
 from app.services.dhcp.config_bundle import build_config_bundle
 from app.services.dhcp.pull_leases import pull_leases_from_server
 from app.services.dhcp.stats import (
@@ -98,6 +100,23 @@ class WindowsCredentialsInput(BaseModel):
         return v
 
 
+class FortiGateCredentialsInput(BaseModel):
+    """FortiGate API-token credentials (for driver='fortigate').
+
+    Stored Fernet-encrypted on ``DHCPServer.credentials_encrypted`` as
+    ``{api_token, vdom, verify_tls}``. The token is never returned; the
+    response echoes only ``has_credentials`` + the non-secret ``vdom``.
+
+    All fields optional to support partial edits (change ``vdom`` /
+    ``verify_tls`` without re-typing the token — the create endpoint still
+    requires ``api_token`` on first set).
+    """
+
+    api_token: str | None = None
+    vdom: str | None = None
+    verify_tls: bool | None = None
+
+
 class ServerCreate(BaseModel):
     name: str
     description: str = ""
@@ -112,6 +131,10 @@ class ServerCreate(BaseModel):
     ha_peer_url: str = ""
     # Only used when driver='windows_dhcp' — ignored otherwise.
     windows_credentials: WindowsCredentialsInput | None = None
+    # Provider credential dict for agentless cloud/REST drivers
+    # (driver='fortigate' → {api_token, vdom, verify_tls}). Ignored for
+    # other drivers.
+    cloud_credentials: dict[str, Any] | None = None
 
     @field_validator("driver")
     @classmethod
@@ -135,6 +158,10 @@ class ServerUpdate(BaseModel):
     # (the default) leaves them untouched. To clear, set an empty dict
     # ``{}`` — server treats it as "remove credentials".
     windows_credentials: WindowsCredentialsInput | dict[str, Any] | None = None
+    # Agentless cloud/REST creds (fortigate). Same contract: ``null`` =
+    # leave, ``{}`` = clear, dict = decrypt-merge-reencrypt (so vdom /
+    # verify_tls can change without re-typing the token).
+    cloud_credentials: dict[str, Any] | None = None
 
     @field_validator("driver")
     @classmethod
@@ -166,6 +193,10 @@ class ServerResponse(BaseModel):
     has_credentials: bool
     is_agentless: bool
     is_read_only: bool
+    # Non-secret FortiGate VDOM, echoed back from the decrypted credential
+    # dict for cloud drivers so the edit modal can show / change it without
+    # re-entering the token. Null for non-cloud drivers.
+    vdom: str | None = None
     # Kea HA listener URL this server exposes to its partner.
     ha_peer_url: str = ""
     # Kea HA state — latest value reported by the agent's periodic
@@ -184,6 +215,16 @@ class ServerResponse(BaseModel):
     @classmethod
     def from_model(cls, s: DHCPServer) -> ServerResponse:
         agentless = is_agentless(s.driver)
+        # Echo the non-secret VDOM for cloud drivers (best-effort decrypt —
+        # never surface the token, and never fail the response on a bad blob).
+        vdom: str | None = None
+        if is_cloud(s.driver) and s.credentials_encrypted:
+            try:
+                from app.core.crypto import decrypt_dict  # noqa: PLC0415
+
+                vdom = decrypt_dict(s.credentials_encrypted).get("vdom")
+            except Exception:  # noqa: BLE001 — never break the listing
+                vdom = None
         return cls(
             id=s.id,
             name=s.name,
@@ -211,6 +252,7 @@ class ServerResponse(BaseModel):
             has_credentials=bool(s.credentials_encrypted),
             is_agentless=agentless,
             is_read_only=is_read_only(s.driver),
+            vdom=vdom,
             ha_peer_url=s.ha_peer_url or "",
             ha_state=s.ha_state,
             ha_last_heartbeat_at=s.ha_last_heartbeat_at,
@@ -276,6 +318,35 @@ class TestResult(BaseModel):
     message: str
 
 
+class TestFortiGateCredentialsRequest(BaseModel):
+    """Pre-save / post-save dry-run probe for a FortiGate DHCP server.
+
+    * **Pre-save** — pass ``host`` + ``port`` + ``credentials`` (typed in
+      the create/edit form). Nothing is written to the DB.
+    * **Post-save** — pass ``server_id`` only; stored Fernet-encrypted
+      credentials are decrypted and used. A partial ``credentials`` dict
+      (e.g. a new ``vdom`` without the token) is merged with the stored
+      blob when ``server_id`` is also supplied.
+    """
+
+    host: str | None = None
+    port: int = 443
+    credentials: FortiGateCredentialsInput | None = None
+    server_id: uuid.UUID | None = None
+
+
+class FortiGateInterface(BaseModel):
+    name: str
+    cidr: str
+    ip: str
+    netmask: str
+    status: str = ""
+    alias: str = ""
+    # Which managed scope (if any) this interface's CIDR matches.
+    matched_subnet_id: uuid.UUID | None = None
+    matched_scope_id: uuid.UUID | None = None
+
+
 class SyncLeasesResponse(BaseModel):
     server_leases: int
     imported: int
@@ -313,7 +384,7 @@ async def create_server(body: ServerCreate, db: DB, user: SuperAdmin) -> ServerR
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=409, detail="A DHCP server with that name exists")
 
-    payload = body.model_dump(exclude={"windows_credentials"})
+    payload = body.model_dump(exclude={"windows_credentials", "cloud_credentials"})
     s = DHCPServer(**payload)
     if body.driver == "windows_dhcp" and body.windows_credentials is not None:
         creds = body.windows_credentials.model_dump(exclude_none=True)
@@ -330,6 +401,16 @@ async def create_server(body: ServerCreate, db: DB, user: SuperAdmin) -> ServerR
         # default from the (now-resolved) use_tls flag.
         creds.setdefault("winrm_port", 5986 if creds.get("use_tls") else 5985)
         s.credentials_encrypted = encrypt_dict(creds)
+    elif body.driver in CLOUD_DHCP_DRIVERS:
+        cloud = dict(body.cloud_credentials or {})
+        if not cloud.get("api_token"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"{body.driver} create requires an 'api_token' in cloud_credentials",
+            )
+        cloud.setdefault("vdom", "root")
+        cloud.setdefault("verify_tls", False)
+        s.credentials_encrypted = encrypt_dict(cloud)
     # Agentless drivers have no agent to approve; skip the pending-approval
     # dance entirely so the UI doesn't show a bogus "Approve" button.
     if is_agentless(body.driver):
@@ -337,8 +418,11 @@ async def create_server(body: ServerCreate, db: DB, user: SuperAdmin) -> ServerR
     db.add(s)
     await db.flush()
 
-    audit_payload = body.model_dump(mode="json", exclude={"windows_credentials"})
+    audit_payload = body.model_dump(
+        mode="json", exclude={"windows_credentials", "cloud_credentials"}
+    )
     audit_payload["windows_credentials_set"] = bool(body.windows_credentials)
+    audit_payload["cloud_credentials_set"] = bool(body.cloud_credentials)
     write_audit(
         db,
         user=user,
@@ -377,7 +461,9 @@ async def update_server(
     old_group_id = s.server_group_id
     old_ha_peer_url = s.ha_peer_url
 
-    changes = body.model_dump(exclude_none=True, exclude={"windows_credentials"})
+    changes = body.model_dump(
+        exclude_none=True, exclude={"windows_credentials", "cloud_credentials"}
+    )
     for k, v in changes.items():
         setattr(s, k, v)
 
@@ -431,11 +517,44 @@ async def update_server(
             s.credentials_encrypted = None
             changes["windows_credentials_cleared"] = True
 
-    audit_payload = body.model_dump(mode="json", exclude_none=True, exclude={"windows_credentials"})
+    # Cloud/REST creds (fortigate): None → leave, {} → clear, dict → merge.
+    if body.cloud_credentials is not None:
+        if body.cloud_credentials == {}:
+            s.credentials_encrypted = None
+            changes["cloud_credentials_cleared"] = True
+        else:
+            patch = {k: v for k, v in body.cloud_credentials.items() if v is not None}
+            if s.credentials_encrypted:
+                from app.core.crypto import decrypt_dict  # noqa: PLC0415
+
+                existing = decrypt_dict(s.credentials_encrypted)
+                existing.update(patch)
+                s.credentials_encrypted = encrypt_dict(existing)
+                changes["cloud_credentials_updated"] = sorted(patch.keys())
+            else:
+                if not patch.get("api_token"):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="First-time cloud credentials require an 'api_token'.",
+                    )
+                patch.setdefault("vdom", "root")
+                patch.setdefault("verify_tls", False)
+                s.credentials_encrypted = encrypt_dict(patch)
+                changes["cloud_credentials_set"] = True
+
+    audit_payload = body.model_dump(
+        mode="json", exclude_none=True, exclude={"windows_credentials", "cloud_credentials"}
+    )
     if "windows_credentials_set" in changes:
         audit_payload["windows_credentials_set"] = True
     if "windows_credentials_cleared" in changes:
         audit_payload["windows_credentials_cleared"] = True
+    if "cloud_credentials_set" in changes:
+        audit_payload["cloud_credentials_set"] = True
+    if "cloud_credentials_updated" in changes:
+        audit_payload["cloud_credentials_updated"] = changes["cloud_credentials_updated"]
+    if "cloud_credentials_cleared" in changes:
+        audit_payload["cloud_credentials_cleared"] = True
 
     write_audit(
         db,
@@ -486,6 +605,43 @@ async def sync_server(server_id: uuid.UUID, db: DB, user: SuperAdmin) -> dict[st
     s = await db.get(DHCPServer, server_id)
     if s is None:
         raise HTTPException(status_code=404, detail="Server not found")
+    if is_cloud(s.driver):
+        # Agentless cloud/REST driver (FortiGate): no agent drains ops.
+        # Do a synchronous full reconcile — push every active scope's whole
+        # object to the provider. A REST failure raises CloudPushError (502)
+        # and rolls the transaction back.
+        if s.server_group_id is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Server is not in a group; attach it to a group with scopes first",
+            )
+        scopes = list(
+            (
+                await db.execute(
+                    select(DHCPScope).where(
+                        DHCPScope.group_id == s.server_group_id,
+                        DHCPScope.is_active.is_(True),
+                    )
+                )
+            )
+            .unique()
+            .scalars()
+            .all()
+        )
+        for scope in scopes:
+            await push_cloud_scope_upsert(db, scope)
+        s.last_sync_at = datetime.now(UTC)
+        write_audit(
+            db,
+            user=user,
+            action="dhcp.server.sync",
+            resource_type="dhcp_server",
+            resource_id=str(s.id),
+            resource_display=s.name,
+            new_value={"reconciled_scopes": len(scopes)},
+        )
+        await db.commit()
+        return {"status": "reconciled", "scopes": str(len(scopes))}
     if is_read_only(s.driver):
         raise HTTPException(
             status_code=400,
@@ -587,11 +743,133 @@ async def test_windows_credentials_endpoint(
     return TestResult(ok=ok, message=msg)
 
 
+@router.post("/test-fortigate-credentials", response_model=TestResult)
+async def test_fortigate_credentials_endpoint(
+    body: TestFortiGateCredentialsRequest, db: DB, _user: SuperAdmin
+) -> TestResult:
+    """Dry-run FortiOS probe — reach the FortiGate, list L3 interfaces."""
+    from app.core.crypto import decrypt_dict  # noqa: PLC0415
+
+    if body.credentials is not None:
+        creds = body.credentials.model_dump(exclude_none=True)
+        host = body.host
+        port = body.port
+        if not creds.get("api_token"):
+            # Partial creds (e.g. vdom-only tweak) — merge with stored.
+            if body.server_id is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Partial credentials require 'server_id' to merge with stored",
+                )
+            s = await db.get(DHCPServer, body.server_id)
+            if s is None:
+                raise HTTPException(status_code=404, detail="Server not found")
+            if not s.credentials_encrypted:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Server has no stored credentials to merge against",
+                )
+            existing = decrypt_dict(s.credentials_encrypted)
+            existing.update(creds)
+            creds = existing
+            host = host or s.host
+            port = body.port or s.port
+        creds.setdefault("vdom", "root")
+        creds.setdefault("verify_tls", False)
+    elif body.server_id is not None:
+        s = await db.get(DHCPServer, body.server_id)
+        if s is None:
+            raise HTTPException(status_code=404, detail="Server not found")
+        if not s.credentials_encrypted:
+            raise HTTPException(status_code=400, detail="Server has no stored credentials to test")
+        creds = decrypt_dict(s.credentials_encrypted)
+        host = body.host or s.host
+        port = body.port or s.port
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide either 'credentials' (dry-run) or 'server_id' (stored)",
+        )
+
+    if not host:
+        raise HTTPException(status_code=400, detail="host is required")
+    ok, msg = await test_fortigate_credentials(host, port, creds)
+    return TestResult(ok=ok, message=msg)
+
+
+@router.get("/{server_id}/fortigate-interfaces", response_model=list[FortiGateInterface])
+async def fortigate_interfaces(
+    server_id: uuid.UUID, db: DB, _user: SuperAdmin
+) -> list[FortiGateInterface]:
+    """Preflight: list the FortiGate's L3 interfaces + which managed scope
+    each one's CIDR matches, so the operator sees what will bind before sync.
+    """
+    import ipaddress as _ipaddress  # noqa: PLC0415
+
+    s = await db.get(DHCPServer, server_id)
+    if s is None:
+        raise HTTPException(status_code=404, detail="Server not found")
+    if s.driver not in CLOUD_DHCP_DRIVERS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"driver {s.driver!r} is not a FortiGate server",
+        )
+    driver = get_driver(s.driver)
+    try:
+        ifaces = await driver.list_interfaces(s)  # type: ignore[attr-defined]
+    except Exception as exc:  # noqa: BLE001 — surface the FortiOS error cleanly
+        raise HTTPException(
+            status_code=502, detail=f"FortiGate interface query failed: {exc}"
+        ) from exc
+
+    # Build a CIDR → (subnet_id, scope_id) map for this server's group so we
+    # can annotate which interface will bind to which scope.
+    scope_map: dict[str, tuple[uuid.UUID, uuid.UUID]] = {}
+    if s.server_group_id is not None:
+        rows = (
+            await db.execute(
+                select(DHCPScope.id, DHCPScope.subnet_id, Subnet.network)
+                .join(Subnet, Subnet.id == DHCPScope.subnet_id)
+                .where(
+                    DHCPScope.group_id == s.server_group_id,
+                    DHCPScope.is_active.is_(True),
+                )
+            )
+        ).all()
+        for scope_id, subnet_id, network in rows:
+            try:
+                key = str(_ipaddress.ip_network(str(network), strict=False))
+            except (ValueError, TypeError):
+                continue
+            scope_map[key] = (subnet_id, scope_id)
+
+    out: list[FortiGateInterface] = []
+    for iface in ifaces:
+        try:
+            key = str(_ipaddress.ip_network(iface["cidr"], strict=False))
+        except (ValueError, TypeError):
+            key = iface.get("cidr", "")
+        match = scope_map.get(key)
+        out.append(
+            FortiGateInterface(
+                name=iface.get("name", ""),
+                cidr=iface.get("cidr", ""),
+                ip=iface.get("ip", ""),
+                netmask=iface.get("netmask", ""),
+                status=iface.get("status", ""),
+                alias=iface.get("alias", ""),
+                matched_subnet_id=match[0] if match else None,
+                matched_scope_id=match[1] if match else None,
+            )
+        )
+    return out
+
+
 @router.post("/{server_id}/sync-leases", response_model=SyncLeasesResponse)
 async def sync_leases_now(server_id: uuid.UUID, db: DB, user: SuperAdmin) -> SyncLeasesResponse:
     """Poll the DHCP server for current leases and reconcile into the DB.
 
-    Only valid for agentless drivers (windows_dhcp today). Agent-based
+    Only valid for agentless drivers (windows_dhcp, fortigate). Agent-based
     drivers stream lease events continuously and don't need polling.
     """
     s = await db.get(DHCPServer, server_id)
@@ -1127,40 +1405,14 @@ async def delete_lease(server_id: uuid.UUID, lease_id: uuid.UUID, db: DB, user: 
     if lease is None or lease.server_id != server_id:
         raise HTTPException(status_code=404, detail="Lease not found")
 
-    # Reuse the sweep's scope-FK-first / prefix-match subnet resolver so the
-    # mirror lookup is scoped exactly like the time-based cleanup (#329).
-    from app.tasks.dhcp_lease_cleanup import _resolve_lease_subnet_id
+    # Shared teardown: resolve the lease's subnet (scope-FK-first / prefix-match),
+    # revoke any DDNS the mirror published, delete the auto_from_lease mirror, stamp
+    # ``removed`` history, delete the lease. Same helper the pull-leases
+    # absence-delete branch and scope deletion use (#329, DRY).
+    from app.services.dhcp.lease_cleanup import purge_lease
 
     ip = str(lease.ip_address)
-    mirror_removed = False
-    subnet_id = await _resolve_lease_subnet_id(db, lease)
-    if subnet_id is not None:
-        mirror = (
-            await db.execute(
-                select(IPAddress).where(
-                    IPAddress.subnet_id == subnet_id,
-                    IPAddress.address == lease.ip_address,
-                    IPAddress.auto_from_lease.is_(True),
-                )
-            )
-        ).scalar_one_or_none()
-        if mirror is not None:
-            subnet = await db.get(Subnet, subnet_id)
-            if subnet is not None:
-                try:
-                    from app.services.dns.ddns import revoke_ddns_for_lease
-
-                    await revoke_ddns_for_lease(db, subnet=subnet, ipam_row=mirror)
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("dhcp_lease_delete_ddns_revoke_failed", ip=ip, error=str(exc))
-            await db.delete(mirror)
-            mirror_removed = True
-
-    # Stamp history BEFORE deleting the row (it reads the lease's fields).
-    from app.services.dhcp.lease_history import record_lease_history
-
-    record_lease_history(db, lease, lease_state="removed", expired_at=datetime.now(UTC))
-    await db.delete(lease)
+    mirror_removed = await purge_lease(db, lease)
     write_audit(
         db,
         user=user,
@@ -1221,7 +1473,7 @@ async def get_server_stats(
     ``rate_buckets`` list without error — the UI shows a "no activity"
     empty state. ``date_bin`` emits rows only for buckets that have samples
     (sparse), so empty windows naturally yield ``[]``; the client renders
-    whatever points exist. Agentless (windows_dhcp) servers are not
+    whatever points exist. Agentless (windows_dhcp, fortigate) servers are not
     special-cased — they return synced ``leases_active`` and empty
     ``rate_buckets`` (no Kea metric stream); the frontend hides the tab for
     them anyway.

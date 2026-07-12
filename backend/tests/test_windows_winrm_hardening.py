@@ -302,6 +302,14 @@ async def _run_push(monkeypatch, *, prev_mac, prev_ip, cur_mac, cur_ip):
     monkeypatch.setattr(wt, "_windows_servers_for_group", fake_servers)
     monkeypatch.setattr(wt, "_scope_cidr", fake_cidr)
 
+    # push_static_change now fans a cloud write-through in first (agentless
+    # FortiGate seam). These tests exercise the Windows path only, so stub the
+    # cloud push to a no-op — otherwise it would query the DB for cloud members.
+    async def fake_cloud_push(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(wt, "push_cloud_scope_upsert", fake_cloud_push)
+
     class FakeDB:
         async def get(self, model, key):
             return SimpleNamespace(id="s", group_id="g")

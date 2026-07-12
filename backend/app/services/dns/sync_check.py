@@ -308,6 +308,58 @@ async def compute_subnet_dns_drift(
         ips_res = await db.execute(select(IPAddress).where(IPAddress.subnet_id == subnet_id))
         ips = list(ips_res.scalars().all())
 
+    # Scopes may opt out of DNS drift for their dynamic-pool lease mirrors:
+    # a pulled lease carries a client-supplied hostname, so without this the
+    # drift check flags every ephemeral lease with no DNS record as "out of
+    # sync". Collect the dynamic-pool ranges of every scope on this subnet with
+    # ``dns_track_dynamic_leases=False``; ``auto_from_lease`` IPs inside them
+    # are skipped in the walk below (and any leftover auto-records for them are
+    # treated as stale, so disabling the toggle offers to clean them up).
+    from app.models.dhcp import DHCPPool, DHCPScope  # noqa: PLC0415 — lazy DNS→DHCP dep
+
+    suppressed_ranges: list[tuple[int, int]] = []
+    untracked_scope_ids = list(
+        (
+            await db.execute(
+                select(DHCPScope.id).where(
+                    DHCPScope.subnet_id == subnet_id,
+                    DHCPScope.dns_track_dynamic_leases.is_(False),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if untracked_scope_ids:
+        untracked_pools = (
+            (
+                await db.execute(
+                    select(DHCPPool).where(
+                        DHCPPool.scope_id.in_(untracked_scope_ids),
+                        DHCPPool.pool_type == "dynamic",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for p in untracked_pools:
+            try:
+                lo = int(ipaddress.ip_address(str(p.start_ip)))
+                hi = int(ipaddress.ip_address(str(p.end_ip)))
+            except (ValueError, TypeError):
+                continue
+            suppressed_ranges.append((min(lo, hi), max(lo, hi)))
+
+    def _dns_suppressed(ip_row: IPAddress) -> bool:
+        if not getattr(ip_row, "auto_from_lease", False) or not suppressed_ranges:
+            return False
+        try:
+            v = int(ipaddress.ip_address(str(ip_row.address)))
+        except (ValueError, TypeError):
+            return False
+        return any(lo <= v <= hi for lo, hi in suppressed_ranges)
+
     # All auto-generated DNS records that point at IPs in this subnet.
     if preloaded_recs_by_ip is not None:
         recs_by_ip = preloaded_recs_by_ip
@@ -359,9 +411,16 @@ async def compute_subnet_dns_drift(
 
     # Walk each live IP and classify.
     for ip in ips:
-        # Skip system rows (network/broadcast/gateway/orphan) — IPAM never
-        # publishes DNS for these.
-        if ip.status in ("network", "broadcast", "orphan") or not ip.hostname:
+        # Skip system rows (network/broadcast/gateway/orphan), rows with no
+        # hostname, and dynamic-pool lease mirrors on a scope that opted out of
+        # dynamic-lease DNS tracking — IPAM never publishes DNS for these.
+        dns_suppressed = _dns_suppressed(ip)
+        if ip.status in ("network", "broadcast", "orphan") or not ip.hostname or dns_suppressed:
+            reason = (
+                "dynamic-lease-untracked"
+                if dns_suppressed
+                else "ip-orphan" if ip.status == "orphan" else "no-hostname"
+            )
             # If there are leftover auto-records pointing here, they're stale.
             for r in recs_by_ip.get(ip.id, []):
                 zone_name = ""
@@ -377,7 +436,7 @@ async def compute_subnet_dns_drift(
                         zone_name=zone_name,
                         name=r.name,
                         value=r.value,
-                        reason=("ip-orphan" if ip.status == "orphan" else "no-hostname"),
+                        reason=reason,
                     )
                 )
             continue

@@ -78,6 +78,11 @@ export function CreateScopeModal({
   const [ddnsDomain, setDdnsDomain] = useState(
     scope?.ddns_domain_override ?? "",
   );
+  // When off, this scope's dynamic-pool lease mirrors are excluded from the
+  // IPAM↔DNS drift check (ephemeral pulled leases don't read as "out of sync").
+  const [dnsTrackDynamicLeases, setDnsTrackDynamicLeases] = useState(
+    scope?.dns_track_dynamic_leases ?? true,
+  );
   const [pxeProfileId, setPxeProfileId] = useState<string>(
     scope?.pxe_profile_id ?? "",
   );
@@ -270,6 +275,7 @@ export function CreateScopeModal({
         ddns_hostname_policy: ddnsEnabled ? ddnsPolicy : null,
         ddns_domain_override: ddnsDomain || null,
         hostname_sync_mode: hostnameSync,
+        dns_track_dynamic_leases: dnsTrackDynamicLeases,
         options,
         // Relay-agent IPs (issue #337). Split on commas / whitespace /
         // newlines; the backend validates each entry as an IP. Always
@@ -749,6 +755,23 @@ export function CreateScopeModal({
             <option value="on_lease">Write to IPAM on every lease</option>
           </select>
         </Field>
+
+        <label className="flex items-start gap-2 text-sm">
+          <input
+            type="checkbox"
+            className="mt-0.5"
+            checked={dnsTrackDynamicLeases}
+            onChange={(e) => setDnsTrackDynamicLeases(e.target.checked)}
+          />
+          <span>
+            Track dynamic-lease DNS drift
+            <span className="block text-xs text-muted-foreground">
+              When off, this scope's dynamic-pool lease mirrors are excluded
+              from the IPAM ↔ DNS drift check, so ephemeral pulled leases
+              without DNS records don't show as “out of sync”.
+            </span>
+          </span>
+        </label>
 
         <div className="border-t pt-3">
           <div className="mb-2 flex items-center justify-between gap-3">

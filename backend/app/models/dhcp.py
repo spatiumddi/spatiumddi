@@ -409,6 +409,15 @@ class DHCPScope(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     hostname_to_ipam_sync: Mapped[str] = mapped_column(
         String(30), nullable=False, default="on_static_only"
     )
+    # When False, the IPAM↔DNS drift check ignores this scope's dynamic-pool
+    # lease mirrors (``auto_from_lease`` IPs inside a ``dynamic`` pool). Pulled
+    # leases carry a client-supplied hostname, so without this the drift check
+    # flags every ephemeral lease that has no DNS record as "out of sync" —
+    # noise for scopes not publishing lease DNS. Default True preserves the
+    # prior behaviour; operators opt out per scope. See ``compute_subnet_dns_drift``.
+    dns_track_dynamic_leases: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default="true"
+    )
 
     last_pushed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
