@@ -4,9 +4,13 @@ Occupancy is computed from the mirrored ``DHCPLease`` rows rather than a
 per-driver statistics call, so it works identically for Kea and Windows
 DHCP (both pull active leases into ``dhcp_lease``) with no agent-protocol
 change. A dynamic pool's *assigned* count is the number of distinct
-active-lease IPs that fall inside ``[start_ip, end_ip]`` for the pool's
-scope (DISTINCT dedupes the two rows an HA pair reports for one lease);
-*total* is the address count of the inclusive range.
+addresses inside ``[start_ip, end_ip]`` that are unavailable to a dynamic
+client: active-lease IPs **union** in-pool static reservations. Reservations
+are counted even when the reserved device is currently offline (no active
+lease) — the address is still withheld from the dynamic set, so counting
+leases alone under-reports exhaustion (#631). The union (not a sum) keeps a
+reserved-and-currently-online device from being double-counted. *Total* is
+the address count of the inclusive range.
 
 This is the data source for both the ``find_dhcp_pool_occupancy`` MCP tool
 and the ``dhcp_pool_exhaustion`` alert evaluator.
@@ -16,13 +20,14 @@ from __future__ import annotations
 
 import ipaddress
 import uuid
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from typing import Any
 
-from sqlalchemy import func, select, text
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.dhcp import DHCPLease, DHCPPool
+from app.models.dhcp import DHCPLease, DHCPPool, DHCPStaticAssignment
 
 
 @dataclass(frozen=True)
@@ -57,34 +62,63 @@ def pool_total_addresses(start_ip: str, end_ip: str) -> int:
     return n if n > 0 else 0
 
 
+def _ints_in_range(ips: Iterable[object], start: int, end: int) -> set[int]:
+    """Distinct integer IPs from ``ips`` that fall inside ``[start, end]``.
+
+    Malformed / wrong-family values are skipped rather than raising, so a bad
+    row can't blow up occupancy.
+    """
+    out: set[int] = set()
+    for ip in ips:
+        try:
+            value = int(ipaddress.ip_address(str(ip)))
+        except (ValueError, TypeError):
+            continue
+        if start <= value <= end:
+            out.add(value)
+    return out
+
+
 async def compute_pool_occupancy(db: AsyncSession, pool: DHCPPool) -> PoolOccupancy:
     """Return live occupancy for one pool.
 
-    Counts distinct active-lease IPs inside the pool range for the pool's
-    scope. ``ip_address`` is INET, so the range comparison is cast
-    explicitly (asyncpg otherwise binds the params as VARCHAR and Postgres
-    rejects the inet operators — same cast the voice-lease alert uses).
+    ``assigned`` is the count of distinct in-range addresses that are
+    unavailable to a dynamic client: active-lease IPs union in-pool static
+    reservations (#631). Reservations are soft-delete-filtered by the global
+    ORM listener. Range membership is checked in Python (ints) rather than via
+    an INET SQL cast so leases + reservations share one comparison path.
     """
     total = pool_total_addresses(pool.start_ip, pool.end_ip)
     if total == 0:
-        # Malformed / inverted / mixed-family range — skip the DB range query
-        # entirely. Running it could match unrelated rows (inet ordering across
-        # families) and hand back a non-zero ``assigned`` for a 0-size pool,
-        # so a bad pool can't make occupancy blow up.
+        # Malformed / inverted / mixed-family range — skip the DB query
+        # entirely so a bad pool can't make occupancy blow up.
         return PoolOccupancy(assigned=0, total=0)
-    assigned = (
-        await db.execute(
-            select(func.count(func.distinct(DHCPLease.ip_address)))
-            .where(DHCPLease.scope_id == pool.scope_id)
-            .where(DHCPLease.state == "active")
-            .where(
-                text(
-                    "ip_address >= CAST(:start AS inet) AND ip_address <= CAST(:end AS inet)"
-                ).bindparams(start=str(pool.start_ip), end=str(pool.end_ip))
+    start = int(ipaddress.ip_address(str(pool.start_ip)))
+    end = int(ipaddress.ip_address(str(pool.end_ip)))
+    lease_ips = (
+        (
+            await db.execute(
+                select(DHCPLease.ip_address)
+                .where(DHCPLease.scope_id == pool.scope_id)
+                .where(DHCPLease.state == "active")
             )
         )
-    ).scalar_one()
-    return PoolOccupancy(assigned=int(assigned or 0), total=total)
+        .scalars()
+        .all()
+    )
+    reservation_ips = (
+        (
+            await db.execute(
+                select(DHCPStaticAssignment.ip_address).where(
+                    DHCPStaticAssignment.scope_id == pool.scope_id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    occupied = _ints_in_range(lease_ips, start, end) | _ints_in_range(reservation_ips, start, end)
+    return PoolOccupancy(assigned=len(occupied), total=total)
 
 
 async def compute_pool_occupancy_batch(
@@ -111,7 +145,7 @@ async def compute_pool_occupancy_batch(
         return result
 
     scope_ids = {p.scope_id for p in valid}
-    rows = (
+    lease_rows = (
         await db.execute(
             select(DHCPLease.scope_id, DHCPLease.ip_address)
             .where(DHCPLease.scope_id.in_(scope_ids))
@@ -119,13 +153,28 @@ async def compute_pool_occupancy_batch(
             .distinct()
         )
     ).all()
-    # Bucket distinct lease IPs (as ints) by scope.
-    by_scope: dict[uuid.UUID, list[int]] = {}
-    for scope_id, ip in rows:
-        try:
-            by_scope.setdefault(scope_id, []).append(int(ipaddress.ip_address(str(ip))))
-        except ValueError:
-            continue
+    # In-pool static reservations withhold their address from the dynamic set
+    # too (#631). Soft-delete-filtered by the global ORM listener.
+    reservation_rows = (
+        await db.execute(
+            select(DHCPStaticAssignment.scope_id, DHCPStaticAssignment.ip_address).where(
+                DHCPStaticAssignment.scope_id.in_(scope_ids)
+            )
+        )
+    ).all()
+    # Bucket occupied IPs (as ints) into a per-scope set so a reserved-and-
+    # currently-leased address is counted once, not twice.
+    by_scope: dict[uuid.UUID, set[int]] = {}
+
+    def _bucket(rows: Iterable[Any]) -> None:
+        for scope_id, ip in rows:
+            try:
+                by_scope.setdefault(scope_id, set()).add(int(ipaddress.ip_address(str(ip))))
+            except (ValueError, TypeError):
+                continue
+
+    _bucket(lease_rows)
+    _bucket(reservation_rows)
 
     for pool in valid:
         start = int(ipaddress.ip_address(str(pool.start_ip)))

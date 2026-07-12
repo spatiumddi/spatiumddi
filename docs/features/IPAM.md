@@ -1696,7 +1696,7 @@ range, so the operator sees pool extents as first-class structure.
 
 | Path | Behaviour |
 |---|---|
-| ``POST /subnets/{id}/addresses`` (manual) | **422** if ``body.address`` lands inside a dynamic pool. Excluded / reserved pools are still allowed — they don't race with the DHCP server on lease grants. |
+| ``POST /subnets/{id}/addresses`` (manual) | Allowed inside a dynamic pool, but returns a **force-overridable collision warning** (`409` with `{warnings, requires_confirmation}`, `kind: "dynamic_pool"`) so the operator confirms and knows to also pin a matching static reservation (#631). Excluded / reserved pools raise no warning. |
 | ``POST /subnets/{id}/next`` | ``_pick_next_available_ip`` skips dynamic ranges during its linear search. |
 | ``GET  /subnets/{id}/next-ip-preview?strategy=sequential\|random`` | Read-only peek. Returns ``{address, strategy}``; ``address: null`` means IPv6 (not supported) or exhausted subnet. No lock, no write. |
 
@@ -2005,11 +2005,16 @@ already wires this up for every delete / allocate / create flow.
 
 - **IP must be inside the subnet's CIDR.** `422`. Same
   check applies in the import path.
-- **IP inside a dynamic DHCP pool is refused.** Manual allocation
-  inside an active `dynamic` pool is blocked — DHCP owns those
-  addresses. Move the pool to `reserved` / `excluded` or shrink it
-  first. `422`. `GET /subnets/{id}/next-ip-preview`
-  honours the same skip.
+- **IP inside a dynamic DHCP pool is a soft warning (#631).** Manual
+  allocation inside an active `dynamic` pool is *allowed* — pinning a
+  MAC in-range is the standard idiom on every driver we ship — but
+  returns a force-overridable collision warning (`409`,
+  `kind: "dynamic_pool"`) reminding the operator to also create a
+  matching static reservation on the scope, since a bare IPAM row does
+  not itself stop the DHCP server leasing the address. Re-submit with
+  `force=true` to proceed. Auto-allocation (`next` / `next-ip-preview`
+  / bulk) still *skips* dynamic ranges — only the explicit, typed path
+  opens up.
 - **IP already allocated in the subnet.** Duplicate address in the
   same subnet returns `409`.
 - **Malformed IP.** Non-parseable address in create / import paths
