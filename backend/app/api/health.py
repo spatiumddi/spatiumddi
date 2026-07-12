@@ -75,10 +75,26 @@ async def readiness() -> JSONResponse:
     # from the schema check so an operator looking at a 503 response
     # can tell "Postgres is down" apart from "Postgres is up but the
     # schema is behind."
+    #
+    # #590 — each check is wait_for-bounded so the ENDPOINT answers in
+    # seconds no matter what state the pool is in. During a node loss a
+    # pooled connection to the dead primary black-holes (no RST), and a
+    # checkout that waits on it held this endpoint open for minutes —
+    # the kubelet's probe timeout read that as NotReady on every api
+    # pod at once, which emptied the api Service and 502'd the cluster
+    # (observed live 2026-07-12). db.py's command_timeout now culls
+    # such connections in bounded time; the wait_for here keeps the
+    # probe response itself honest-and-fast while that happens.
     try:
-        async with AsyncSessionLocal() as session:
-            await session.execute(text("SELECT 1"))
+        async with asyncio.timeout(4):
+            async with AsyncSessionLocal() as session:
+                await session.execute(text("SELECT 1"))
         checks["database"] = "ok"
+    except TimeoutError:
+        logger.warning("readiness_check_failed", check="database",
+                       error="timed out after 4s (pool draining dead connections?)")
+        checks["database"] = "error: timed out after 4s"
+        healthy = False
     except Exception as exc:
         logger.warning("readiness_check_failed", check="database", error=str(exc))
         checks["database"] = f"error: {exc}"
@@ -87,8 +103,14 @@ async def readiness() -> JSONResponse:
     # Schema-at-head check. Only run when the DB connect succeeded —
     # otherwise the schema check would surface a confusing
     # "could not connect" error on top of the database error above.
+    # Bounded like the database check: it opens its own session, so an
+    # unlucky checkout could land on a not-yet-culled dead connection.
     if checks["database"] == "ok":
-        verdict, detail = await _check_schema_ready()
+        try:
+            async with asyncio.timeout(4):
+                verdict, detail = await _check_schema_ready()
+        except TimeoutError:
+            verdict, detail = "error", "timed out after 4s"
         checks["schema"] = "ok" if verdict == "ok" else f"error: {detail}"
         if verdict != "ok":
             healthy = False
