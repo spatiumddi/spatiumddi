@@ -158,7 +158,20 @@ rules:
     # + ``update`` cover both the merge-patch form used by
     # k8s_api.patch_node_labels and a fallback strategic-merge if we
     # ever switch.
-    verbs: ["get", "list", "watch", "patch", "update"]
+    #
+    # #590/#272 Phase 9 — ``delete``: the dead-node replacement evict is
+    # the SEED SUPERVISOR calling ``k8s_api.delete_node()`` from its
+    # heartbeat (deleting the k8s Node makes k3s drop the etcd member).
+    # Without this verb every evict 403s
+    # (``supervisor.heartbeat.node_evict_failed`` each heartbeat), the
+    # row stays pinned in ``evicting``, and — because the product
+    # serializes the replacement member's join behind the evict — the
+    # replacement never joins: observed live 2026-07-12 as the ha
+    # suite's dead_node_replace stuck at nodes_ready=2 for 30 min with
+    # the dead Node still listed NotReady (and 2026-07-08 as a member
+    # sitting ``evicting`` 20+ min). The feature shipped without the
+    # RBAC verb it depends on.
+    verbs: ["get", "list", "watch", "patch", "update", "delete"]
     # #389 — read-only on the k3s ETCDSnapshotFile CRs so the
     # heartbeat's ``list_etcd_snapshots()`` can populate the Fleet →
     # etcd snapshots inventory. Without this grant the
