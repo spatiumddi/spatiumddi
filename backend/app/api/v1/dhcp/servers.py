@@ -907,6 +907,13 @@ async def fortigate_interfaces(
                 try:
                     owned_mkeys.add(int(ref["mkey"]))
                 except (KeyError, TypeError, ValueError):
+                    # A ref with a missing or non-numeric mkey means we never
+                    # successfully pushed this scope to the FortiGate, so there
+                    # is no object of ours to claim. Leaving it out of
+                    # owned_mkeys is the correct outcome: any DHCP server the
+                    # preflight finds on that interface is then reported as
+                    # unmanaged, which is the safe side to err on (we refuse to
+                    # adopt it rather than silently clobbering operator config).
                     pass
 
     out: list[FortiGateInterface] = []
