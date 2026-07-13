@@ -245,7 +245,8 @@ export function DHCPSubnetPanel({ subnetId }: { subnetId: string }) {
         <div>
           <h2 className="text-sm font-semibold">DHCP Scopes</h2>
           <p className="text-xs text-muted-foreground mt-0.5">
-            One scope per server — use multiple scopes for HA pairs.
+            Scopes belong to the server group — every server in the group serves
+            them (one scope per subnet per group).
           </p>
         </div>
         <button

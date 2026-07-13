@@ -98,12 +98,42 @@ DHCPScope
   }
   ddns_enabled: bool
   ddns_hostname_policy: enum(client_provided, client_or_generated, always_generate, disabled)
+  dns_track_dynamic_leases: bool (default true)  -- see "Dynamic-lease DNS drift" below
   address_family: enum(ipv4, ipv6)   -- inferred from the bound subnet's CIDR
   v6_address_mode: enum(stateful, stateless, slaac)  -- v6 only (issue #52)
   ra_managed_flag: bool              -- intended RA M-flag (router-side intent)
   ra_other_flag: bool                -- intended RA O-flag (router-side intent)
   last_pushed_at: timestamp
 ```
+
+#### Dynamic-lease DNS drift (`dns_track_dynamic_leases`)
+
+When SpatiumDDI pulls active leases from an agentless DHCP server (Windows DHCP,
+FortiGate) it mirrors each into IPAM as an `auto_from_lease` address row. A
+pulled lease carries the client-supplied hostname, so the IPAM ↔ DNS drift
+check (`services/dns/sync_check.compute_subnet_dns_drift`, surfaced as the "DNS"
+column / "N out of sync" banner and the **Sync DNS** flow) would treat every
+ephemeral lease with no forward/reverse record as **missing** — flagging the
+whole dynamic pool as "out of sync" even though the operator has no intention of
+publishing DNS for transient leases.
+
+`dns_track_dynamic_leases` is the per-scope opt-out. When **false**, the drift
+check ignores this scope's dynamic-pool lease mirrors (`auto_from_lease` IPs
+whose address falls inside one of the scope's `dynamic` pools), and any leftover
+auto-generated records for them are reported as `stale` so a Sync DNS run offers
+to clean them up.
+
+**Design decision (documented for the MR):** the flag defaults to **`true`** —
+preserving the prior behaviour (dynamic-lease rows *are* drift-checked) so no
+existing install silently changes. Operators opt out per scope when lease DNS is
+noise. The gate is scope-level (not a global toggle) because dynamic pools —
+and the decision to publish DNS for them — belong to a scope; and it keys on
+`auto_from_lease` **and** dynamic-pool membership so a manually-allocated IP that
+happens to sit in the pool is still tracked. Static reservations
+(`status="static_dhcp"`) are never affected — only dynamic-lease mirrors.
+Rejected alternatives: a global setting (too coarse — mixed scopes want
+different policies) and suppressing the hostname on the mirror row (loses
+operator-visible lease hostnames in IPAM).
 
 #### DHCPv6 operating mode (issue #52)
 

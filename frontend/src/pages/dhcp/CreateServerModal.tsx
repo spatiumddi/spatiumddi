@@ -4,6 +4,7 @@ import {
   dhcpApi,
   type DHCPServer,
   type WindowsDHCPCredentials,
+  type FortiGateCredentials,
   formatApiError,
 } from "@/lib/api";
 import { Modal, Field, Btns, inputCls, errMsg } from "./_shared";
@@ -41,6 +42,18 @@ export function CreateServerModal({
   const [winUseTLS, setWinUseTLS] = useState(false);
   const [winVerifyTLS, setWinVerifyTLS] = useState(false);
   const [winClearCreds, setWinClearCreds] = useState(false);
+
+  // FortiGate-only fields. Same "blank = keep stored" contract on edit.
+  const [fgToken, setFgToken] = useState("");
+  const [fgVdom, setFgVdom] = useState(server?.vdom ?? "root");
+  // Seed from the stored value so an unrelated edit doesn't silently re-disable
+  // verification. Secure default (true) for new servers and legacy rows the API
+  // can't echo. See H2 in PR #630 review.
+  const [fgVerifyTLS, setFgVerifyTLS] = useState(server?.verify_tls ?? true);
+  // Optional private-CA PEM. Write-only (blank = keep stored), like the token.
+  const [fgCaBundle, setFgCaBundle] = useState("");
+  const [fgClearCreds, setFgClearCreds] = useState(false);
+
   const [testResult, setTestResult] = useState<{
     ok: boolean;
     message: string;
@@ -50,11 +63,31 @@ export function CreateServerModal({
 
   const testMut = useMutation({
     mutationFn: () => {
-      // Two modes — mirrors the backend endpoint:
+      // Two modes — mirrors the backend endpoints:
       //  * Plaintext form values (pre-save probe before the user hits Save).
       //  * server_id-only (use stored Fernet-encrypted creds; only makes
       //    sense when editing a server that already has creds and the
       //    user hasn't typed new ones).
+      if (driver === "fortigate") {
+        const useStored = editing && hasExistingCreds && !fgToken;
+        if (useStored) {
+          return dhcpApi.testFortigateCredentials({
+            host,
+            port: parseInt(port, 10) || 443,
+            server_id: server!.id,
+          });
+        }
+        return dhcpApi.testFortigateCredentials({
+          host,
+          port: parseInt(port, 10) || 443,
+          credentials: {
+            api_token: fgToken,
+            vdom: fgVdom || "root",
+            verify_tls: fgVerifyTLS,
+            ...(fgCaBundle.trim() ? { ca_bundle_pem: fgCaBundle.trim() } : {}),
+          },
+        });
+      }
       const useStored =
         editing && hasExistingCreds && !winPassword && !winUsername;
       if (useStored) {
@@ -89,16 +122,38 @@ export function CreateServerModal({
     mutationFn: () => {
       const data: Partial<DHCPServer> & {
         windows_credentials?: WindowsDHCPCredentials | Record<string, never>;
+        cloud_credentials?: FortiGateCredentials | Record<string, never>;
         ha_peer_url?: string;
       } = {
         name,
         driver,
         host,
-        port: parseInt(port, 10) || (driver === "windows_dhcp" ? 0 : 67),
+        port:
+          parseInt(port, 10) ||
+          (driver === "windows_dhcp" ? 0 : driver === "fortigate" ? 443 : 67),
         server_group_id: groupId || null,
         ha_peer_url: haPeerUrl,
         description,
       };
+
+      if (driver === "fortigate") {
+        if (fgClearCreds) {
+          data.cloud_credentials = {};
+        } else {
+          const creds: FortiGateCredentials = {
+            vdom: fgVdom || "root",
+            verify_tls: fgVerifyTLS,
+          };
+          if (fgToken) creds.api_token = fgToken;
+          if (fgCaBundle.trim()) creds.ca_bundle_pem = fgCaBundle.trim();
+          if (!editing && !fgToken) {
+            throw new Error(
+              "FortiGate requires an API token to connect over the REST API.",
+            );
+          }
+          data.cloud_credentials = creds;
+        }
+      }
 
       if (driver === "windows_dhcp") {
         if (winClearCreds) {
@@ -138,6 +193,7 @@ export function CreateServerModal({
   });
 
   const isWindows = driver === "windows_dhcp";
+  const isFortigate = driver === "fortigate";
 
   return (
     <Modal
@@ -174,10 +230,12 @@ export function CreateServerModal({
                 const next = e.target.value;
                 setDriver(next);
                 // Helpful default: DHCP native port is irrelevant for WinRM,
-                // but Kea/ISC need 67. Flip sensibly on driver change.
+                // FortiGate uses its HTTPS admin port (443), Kea/ISC need 67.
                 if (next === "windows_dhcp") {
                   setPort("0");
-                } else if (port === "0") {
+                } else if (next === "fortigate") {
+                  setPort("443");
+                } else if (port === "0" || port === "443") {
                   setPort("67");
                 }
               }}
@@ -186,6 +244,9 @@ export function CreateServerModal({
               <option value="windows_dhcp">
                 Windows DHCP (WinRM, read-only)
               </option>
+              <optgroup label="Agentless (REST API)">
+                <option value="fortigate">FortiGate (FortiOS REST)</option>
+              </optgroup>
             </select>
           </Field>
           <Field label="Host">
@@ -196,12 +257,22 @@ export function CreateServerModal({
               placeholder={
                 isWindows
                   ? "192.168.0.10 or dc01.corp.example.com"
-                  : "10.0.0.10"
+                  : isFortigate
+                    ? "192.168.1.99 or fw01.corp.example.com"
+                    : "10.0.0.10"
               }
               required
             />
           </Field>
-          <Field label={isWindows ? "DHCP Port (informational)" : "Port"}>
+          <Field
+            label={
+              isWindows
+                ? "DHCP Port (informational)"
+                : isFortigate
+                  ? "HTTPS Admin Port"
+                  : "Port"
+            }
+          >
             <input
               type="number"
               className={inputCls}
@@ -245,6 +316,166 @@ export function CreateServerModal({
             onChange={(e) => setDescription(e.target.value)}
           />
         </Field>
+
+        {isFortigate && (
+          <div className="rounded-md border border-sky-500/40 bg-sky-500/5 p-3 space-y-3">
+            <div className="text-xs">
+              <div className="font-medium text-sky-600 dark:text-sky-400">
+                FortiGate — agentless (FortiOS REST API)
+              </div>
+              <p className="mt-1 text-muted-foreground">
+                SpatiumDDI manages this FortiGate's per-interface DHCP over the
+                REST API with an API-admin token. Each SpatiumDDI subnet is
+                matched to the FortiGate interface with the same CIDR and its
+                DHCP server (range, reservations, exclusions, options) is pushed
+                on every edit. SpatiumDDI is the source of truth (push-only);
+                the token is stored Fernet-encrypted and never returned.
+              </p>
+            </div>
+
+            <details className="rounded border bg-background/40 text-xs">
+              <summary className="cursor-pointer px-3 py-2 font-medium select-none">
+                FortiGate setup — click to expand
+              </summary>
+              <div className="space-y-2 border-t px-3 py-2.5 text-muted-foreground">
+                <p>
+                  Create a REST API admin with a DHCP-capable profile and copy
+                  its token:
+                </p>
+                <ol className="list-decimal space-y-1 pl-5">
+                  <li>
+                    System → Administrators → Create New → REST API Admin.
+                  </li>
+                  <li>
+                    Give it an Administrator profile with read-write on{" "}
+                    <code className="font-mono">System</code> (DHCP lives under
+                    system.dhcp) for the target VDOM.
+                  </li>
+                  <li>
+                    Restrict the Trusted Hosts to the SpatiumDDI control-plane
+                    IP.
+                  </li>
+                  <li>Copy the generated API token into the field below.</li>
+                </ol>
+                <p>
+                  The interface that serves each subnet must already have its
+                  IP/netmask configured — SpatiumDDI matches on CIDR and never
+                  changes interface addressing.
+                </p>
+              </div>
+            </details>
+
+            {hasExistingCreds && !fgClearCreds && (
+              <div className="flex items-center justify-between rounded border bg-background/50 px-3 py-2 text-xs">
+                <span>
+                  <span className="font-medium">API token set.</span> Leave the
+                  token blank to keep it, or enter a new one to replace.
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setFgClearCreds(true)}
+                  className="rounded border px-2 py-0.5 text-[11px] hover:bg-muted"
+                >
+                  Clear
+                </button>
+              </div>
+            )}
+            {fgClearCreds && (
+              <div className="flex items-center justify-between rounded border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs">
+                <span className="text-destructive">
+                  Credentials will be removed on save.
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setFgClearCreds(false)}
+                  className="rounded border px-2 py-0.5 text-[11px] hover:bg-muted"
+                >
+                  Undo
+                </button>
+              </div>
+            )}
+
+            <div
+              className={`grid grid-cols-2 gap-3 ${fgClearCreds ? "opacity-40 pointer-events-none" : ""}`}
+            >
+              <Field label="API Token" hint="FortiOS REST API admin token">
+                <input
+                  type="password"
+                  className={inputCls}
+                  value={fgToken}
+                  onChange={(e) => setFgToken(e.target.value)}
+                  placeholder={hasExistingCreds ? "(unchanged)" : "required"}
+                  autoComplete="off"
+                />
+              </Field>
+              <Field label="VDOM" hint="Virtual domain (default: root)">
+                <input
+                  className={inputCls}
+                  value={fgVdom}
+                  onChange={(e) => setFgVdom(e.target.value)}
+                  placeholder="root"
+                />
+              </Field>
+              <Field label="Verify TLS certificate">
+                <input
+                  type="checkbox"
+                  checked={fgVerifyTLS}
+                  onChange={(e) => setFgVerifyTLS(e.target.checked)}
+                />
+              </Field>
+              <Field
+                label="CA bundle (PEM)"
+                hint="Optional — pin a private-CA FortiGate without disabling verification"
+              >
+                <textarea
+                  className={`${inputCls} font-mono text-xs`}
+                  rows={3}
+                  value={fgCaBundle}
+                  onChange={(e) => setFgCaBundle(e.target.value)}
+                  placeholder={
+                    hasExistingCreds
+                      ? "(unchanged — leave blank to keep stored)"
+                      : "-----BEGIN CERTIFICATE-----"
+                  }
+                  autoComplete="off"
+                />
+              </Field>
+            </div>
+
+            <div
+              className={`flex items-center gap-3 ${fgClearCreds ? "opacity-40 pointer-events-none" : ""}`}
+            >
+              <button
+                type="button"
+                onClick={() => {
+                  setTestResult(null);
+                  testMut.mutate();
+                }}
+                disabled={
+                  testMut.isPending ||
+                  !host ||
+                  (!fgToken && !(editing && hasExistingCreds))
+                }
+                className="rounded-md border px-3 py-1.5 text-xs hover:bg-accent disabled:opacity-50"
+              >
+                {testMut.isPending ? "Testing…" : "Test Connection"}
+              </button>
+              {editing && hasExistingCreds && !fgToken && (
+                <span className="text-[11px] text-muted-foreground">
+                  will use stored token
+                </span>
+              )}
+              {testResult && (
+                <span
+                  className={`text-xs ${testResult.ok ? "text-emerald-600 dark:text-emerald-400" : "text-destructive"}`}
+                >
+                  {testResult.ok ? "✓ " : "✗ "}
+                  {testResult.message}
+                </span>
+              )}
+            </div>
+          </div>
+        )}
 
         {isWindows && (
           <div className="rounded-md border border-amber-500/40 bg-amber-500/5 p-3 space-y-3">

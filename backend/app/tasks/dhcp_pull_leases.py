@@ -8,7 +8,7 @@ near-real-time IPAM population from Windows DHCP without restarting
 beat.
 
 Each run iterates every ``DHCPServer`` whose driver is registered as
-agentless (today: ``windows_dhcp``) and calls
+agentless (``windows_dhcp``, ``fortigate``) and calls
 ``pull_leases_from_server`` to:
 
   1. Poll the server for active leases (driver-specific — WinRM +

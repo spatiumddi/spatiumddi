@@ -204,6 +204,9 @@ class ScopeCreate(BaseModel):
     ddns_hostname_policy: str | None = "client"
     hostname_to_ipam_sync: str = "on_static_only"
     hostname_sync_mode: str | None = None
+    # When False, this scope's dynamic-pool lease mirrors are excluded from the
+    # IPAM↔DNS drift check (ephemeral leases don't read as "out of sync").
+    dns_track_dynamic_leases: bool = True
     # DHCPv6 operating mode (issue #52) — ignored for v4 scopes.
     v6_address_mode: str = "stateful"
     ra_managed_flag: bool = True
@@ -263,6 +266,7 @@ class ScopeUpdate(BaseModel):
     ddns_hostname_policy: str | None = None
     hostname_to_ipam_sync: str | None = None
     hostname_sync_mode: str | None = None
+    dns_track_dynamic_leases: bool | None = None
     # PXE / iPXE profile binding (issue #51). Pass the UUID of a
     # ``DHCPPXEProfile`` in this scope's group to enable PXE; pass
     # null to detach. The bound profile's matches render as Kea
@@ -331,6 +335,7 @@ class ScopeResponse(BaseModel):
     ddns_hostname_policy: str | None
     ddns_domain_override: str | None = None
     hostname_sync_mode: str
+    dns_track_dynamic_leases: bool = True
     address_family: str = "ipv4"
     v6_address_mode: str = "stateful"
     ra_managed_flag: bool = True
@@ -378,6 +383,7 @@ def _scope_to_response(scope: DHCPScope) -> ScopeResponse:
         ddns_hostname_policy=scope.ddns_hostname_policy,
         ddns_domain_override=None,
         hostname_sync_mode=scope.hostname_to_ipam_sync,
+        dns_track_dynamic_leases=getattr(scope, "dns_track_dynamic_leases", True),
         address_family=getattr(scope, "address_family", "ipv4") or "ipv4",
         v6_address_mode=getattr(scope, "v6_address_mode", "stateful") or "stateful",
         ra_managed_flag=getattr(scope, "ra_managed_flag", True),
@@ -488,6 +494,7 @@ async def create_scope(
         ddns_enabled=body.ddns_enabled,
         ddns_hostname_policy=body.ddns_hostname_policy or "client",
         hostname_to_ipam_sync=sync_mode,
+        dns_track_dynamic_leases=body.dns_track_dynamic_leases,
         address_family=address_family,
         v6_address_mode=body.v6_address_mode,
         ra_managed_flag=body.ra_managed_flag,

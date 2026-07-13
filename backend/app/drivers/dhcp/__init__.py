@@ -20,15 +20,18 @@ from app.drivers.dhcp.base import (
 )
 from app.drivers.dhcp.registry import (
     AGENTLESS_DRIVERS,
+    CLOUD_DHCP_DRIVERS,
     READ_ONLY_DRIVERS,
     get_driver,
     is_agentless,
+    is_cloud,
     is_read_only,
     register_driver,
 )
 
 __all__ = [
     "AGENTLESS_DRIVERS",
+    "CLOUD_DHCP_DRIVERS",
     "READ_ONLY_DRIVERS",
     "ClientClassDef",
     "ConfigBundle",
@@ -44,6 +47,7 @@ __all__ = [
     "StaticAssignmentDef",
     "get_driver",
     "is_agentless",
+    "is_cloud",
     "is_read_only",
     "register_driver",
 ]

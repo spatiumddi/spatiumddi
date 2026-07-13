@@ -22,7 +22,11 @@ from app.api.deps import DB, SuperAdmin
 from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.dhcp import DHCPScope
-from app.services.dhcp.static_ipam import detach_ipam_for_scope_statics
+from app.services.dhcp.lease_cleanup import delete_leases_for_scope
+from app.services.dhcp.static_ipam import (
+    remirror_scope_statics,
+    remove_ipam_for_scope_statics,
+)
 from app.services.dhcp.windows_writethrough import push_scope_restore
 from app.services.soft_delete import (  # noqa: PLC2701 — canonical labels, keep in one place
     SOFT_DELETE_RESOURCE_TYPES,
@@ -229,6 +233,12 @@ async def restore_row(
     for obj in restored:
         if isinstance(obj, DHCPScope):
             await push_scope_restore(db, obj)
+            # Soft-delete deleted this scope's static_dhcp mirror rows (so the
+            # IPs folded into free gaps); a restore has to re-create them —
+            # re-asserting status + back-link + DNS. Leases need no restore work:
+            # push_scope_restore re-creates the device scope and the next poll
+            # re-populates them.
+            await remirror_scope_statics(db, obj)
         db.add(
             AuditLog(
                 user_id=current_user.id,
@@ -290,7 +300,12 @@ async def permanent_delete_from_trash(
 
     label = _row_label(target)
     if isinstance(target, DHCPScope):
-        await detach_ipam_for_scope_statics(db, target.id)
+        # Delete the reservation mirror rows (not just free them) so the IPs fold
+        # back into free gaps, and purge any dynamic leases still pointing here —
+        # defense-in-depth for pre-fix strays / convergence-race leftovers (the
+        # first soft-delete normally already cleaned both up).
+        await remove_ipam_for_scope_statics(db, target.id)
+        await delete_leases_for_scope(db, target.id)
     db.add(
         AuditLog(
             user_id=current_user.id,

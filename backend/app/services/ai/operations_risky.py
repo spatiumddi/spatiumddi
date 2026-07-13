@@ -170,6 +170,32 @@ async def _push_agentless_scope_deletes(db: AsyncSession, batch: Any) -> set[UUI
     return group_ids
 
 
+async def _purge_leases_for_scope_batch(db: AsyncSession, batch: Any) -> None:
+    """Tear down each batched scope's DHCP-derived rows before the soft-delete stamp.
+
+    A scope owns two kinds of derived row that the soft-delete batch does NOT
+    cover: dynamic ``DHCPLease`` rows (only a nullable ``ON DELETE SET NULL``
+    backlink to the scope, so they'd survive) and their + the reservations'
+    IPAM mirror ``ip_address`` rows (``status="dhcp"`` / ``static_dhcp``), which
+    otherwise linger visibly in the subnet table and keep counting toward
+    utilization after the scope is gone. Delete both here.
+
+    MUST run BEFORE ``apply_soft_delete`` (same constraint as
+    ``_push_agentless_scope_deletes``): once the scope/subnet is stamped the
+    global filter hides it and the lease-subnet resolver / DDNS lookups see
+    nothing. Drives off ``batch.rows`` so every ancestor whose cascade reaches a
+    scope — scope, subnet, block, space — is covered from one place.
+    """
+    from app.models.dhcp import DHCPScope  # noqa: PLC0415
+    from app.services.dhcp.lease_cleanup import delete_leases_for_scope  # noqa: PLC0415
+    from app.services.dhcp.static_ipam import remove_ipam_for_scope_statics  # noqa: PLC0415
+
+    for row in batch.rows:
+        if isinstance(row.obj, DHCPScope):
+            await delete_leases_for_scope(db, row.obj.id)
+            await remove_ipam_for_scope_statics(db, row.obj.id)
+
+
 # ── delete_subnet ──────────────────────────────────────────────────────────
 
 
@@ -279,6 +305,7 @@ async def _apply_delete_subnet(
     from app.models.dns import DNSRecord, DNSZone
     from app.models.ipam import IPAddress, Subnet
     from app.services.dhcp.config_bundle import build_config_bundle
+    from app.services.dhcp.lease_cleanup import delete_leases_for_scope
     from app.services.dhcp.windows_writethrough import push_scope_delete
     from app.services.soft_delete import apply_soft_delete, collect_soft_delete_batch
 
@@ -299,6 +326,7 @@ async def _apply_delete_subnet(
 
         batch = await collect_soft_delete_batch(db, subnet)
         wake_group_ids = await _push_agentless_scope_deletes(db, batch)
+        await _purge_leases_for_scope_batch(db, batch)
         apply_soft_delete(batch, user.id)
         for row in batch.rows:
             db.add(
@@ -333,6 +361,11 @@ async def _apply_delete_subnet(
     agent_servers_to_refresh: dict[uuid.UUID, DHCPServer] = {}
     for scope in scope_rows:
         await push_scope_delete(db, scope)
+        # Leases have a nullable ON DELETE SET NULL backlink to the scope, so the
+        # subnet cascade would leave them scopeless survivors — purge them (and
+        # their mirrors + DDNS) here, before db.delete(subnet). Static mirrors go
+        # with the subnet's ip_address cascade below.
+        await delete_leases_for_scope(db, scope.id)
         group_servers = (
             (
                 await db.execute(
@@ -552,6 +585,7 @@ async def _apply_delete_block(
     # A block cascade reaches DHCP scopes (via its subnets), so it owes the same
     # agentless write-through the scope + subnet paths do (#616). Before the stamp.
     wake_group_ids = await _push_agentless_scope_deletes(db, batch)
+    await _purge_leases_for_scope_batch(db, batch)
     apply_soft_delete(batch, user.id)
     for row in batch.rows:
         db.add(
@@ -688,6 +722,7 @@ async def _apply_delete_space(
     # A space cascade reaches DHCP scopes (via its subnets), so it owes the same
     # agentless write-through the scope + subnet paths do (#616). Before the stamp.
     wake_group_ids = await _push_agentless_scope_deletes(db, batch)
+    await _purge_leases_for_scope_batch(db, batch)
     apply_soft_delete(batch, user.id)
     for row in batch.rows:
         db.add(
@@ -845,7 +880,7 @@ class DeleteScopeArgs(BaseModel):
 async def _preview_delete_scope(
     db: AsyncSession, user: User, args: DeleteScopeArgs
 ) -> PreviewResult:
-    from app.models.dhcp import DHCPScope
+    from app.models.dhcp import DHCPLease, DHCPScope
 
     scope = await db.get(DHCPScope, args.scope_id)
     if scope is None:
@@ -856,6 +891,16 @@ async def _preview_delete_scope(
     # leaf, which made the approval preview read as "nothing else affected" for
     # a scope holding hundreds of reservations.
     cascade = await _soft_delete_cascade_summary(db, scope)
+    # Dynamic leases aren't in the soft-delete batch (they're server-owned), but
+    # scope deletion now clears them too (#623) — surface the count so the
+    # preview / approval doesn't under-report the blast radius.
+    lease_count = (
+        await db.execute(
+            select(func.count()).select_from(DHCPLease).where(DHCPLease.scope_id == scope.id)
+        )
+    ).scalar_one()
+    if lease_count:
+        cascade += f" + {lease_count} dynamic lease" + ("s" if lease_count != 1 else "")
     if args.permanent:
         suffix = (
             f" — {cascade} (unrecoverable; pushes a remove-scope write-through "
@@ -876,7 +921,8 @@ async def _apply_delete_scope(
     from app.api.v1.dhcp._audit import write_audit
     from app.core.agent_wake import collect_wake, dhcp_group_channel
     from app.models.dhcp import DHCPScope
-    from app.services.dhcp.static_ipam import detach_ipam_for_scope_statics
+    from app.services.dhcp.lease_cleanup import delete_leases_for_scope
+    from app.services.dhcp.static_ipam import remove_ipam_for_scope_statics
     from app.services.dhcp.windows_writethrough import push_scope_delete
     from app.services.soft_delete import apply_soft_delete, collect_soft_delete_batch
 
@@ -899,6 +945,22 @@ async def _apply_delete_scope(
     # Python). Fire it on both paths.
     await push_scope_delete(db, scope)
 
+    # Tear down the scope's DHCP-derived rows that the soft-delete batch / FK
+    # CASCADE do NOT cover: dynamic leases (only a nullable ON DELETE SET NULL
+    # backlink, so they'd survive) + their and the reservations' IPAM mirror
+    # rows (which otherwise linger visibly in the subnet table and keep counting
+    # toward utilization). Delete both — leases are ephemeral polled state
+    # (re-populated from the next poll on restore), and freeing the IPs to a
+    # deleted row folds them back into free gaps. Runs on BOTH paths, before the
+    # stamp / CASCADE so the scope + subnet are still resolvable.
+    leases_removed, lease_mirrors = await delete_leases_for_scope(db, scope.id)
+    statics_released = await remove_ipam_for_scope_statics(db, scope.id)
+    cleanup_audit = {
+        "leases_removed": leases_removed,
+        "lease_mirrors_removed": lease_mirrors,
+        "static_mirrors_removed": statics_released,
+    }
+
     if not args.permanent:
         batch = await collect_soft_delete_batch(db, scope)
         apply_soft_delete(batch, user.id)
@@ -910,14 +972,11 @@ async def _apply_delete_scope(
                 resource_type=row.resource_type,
                 resource_id=str(row.obj.id),
                 resource_display=row.display,
-                old_value={"deletion_batch_id": str(batch.batch_id)},
+                old_value={"deletion_batch_id": str(batch.batch_id), **cleanup_audit},
             )
         await db.commit()
         return {"scope_id": str(args.scope_id), "mode": "soft_delete"}
 
-    # Release each reservation's IPAM mirror before the FK CASCADE wipes the
-    # rows — the cascade runs no Python, so nothing else would (#618).
-    released = await detach_ipam_for_scope_statics(db, scope.id)
     write_audit(
         db,
         user=user,
@@ -925,7 +984,7 @@ async def _apply_delete_scope(
         resource_type="dhcp_scope",
         resource_id=str(scope.id),
         resource_display=str(scope.id),
-        old_value={"ipam_mirrors_released": released},
+        old_value=cleanup_audit,
     )
     await db.delete(scope)
     await db.commit()
@@ -1015,9 +1074,13 @@ async def _apply_delete_group(
     # Deleting the group hard-deletes its scopes, and the FK CASCADE takes their
     # reservations with them — no Python runs, so nothing would release the IPAM
     # mirrors and the addresses would be stranded at ``status="static_dhcp"``
-    # pointing at rows Postgres has dropped (#618).
+    # pointing at rows Postgres has dropped (#618). Delete the mirror rows (not
+    # just free them) so the IPs fold back into free gaps. The scopes' dynamic
+    # leases (nullable ON DELETE SET NULL backlink) would otherwise survive the
+    # group delete, so tear those + their mirrors down too.
     from app.models.dhcp import DHCPScope  # noqa: PLC0415
-    from app.services.dhcp.static_ipam import detach_ipam_for_scope_statics  # noqa: PLC0415
+    from app.services.dhcp.lease_cleanup import delete_leases_for_scope  # noqa: PLC0415
+    from app.services.dhcp.static_ipam import remove_ipam_for_scope_statics  # noqa: PLC0415
 
     group_scopes = (
         (
@@ -1032,7 +1095,8 @@ async def _apply_delete_group(
     )
     released = 0
     for sc in group_scopes:
-        released += await detach_ipam_for_scope_statics(db, sc.id)
+        released += await remove_ipam_for_scope_statics(db, sc.id)
+        await delete_leases_for_scope(db, sc.id)
 
     write_audit(
         db,

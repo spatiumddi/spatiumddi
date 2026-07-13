@@ -6545,6 +6545,14 @@ export interface DHCPServer {
   is_agentless: boolean;
   // Driver only supports reads — UI hides config-push actions.
   is_read_only: boolean;
+  // Non-secret FortiGate VDOM echoed back for cloud drivers so the edit
+  // modal can show / change it without re-entering the token. Null for
+  // non-cloud drivers.
+  vdom?: string | null;
+  // Non-secret TLS-verify flag echoed for cloud drivers so the edit modal
+  // seeds the checkbox from the stored value instead of resetting it (which
+  // would silently re-disable verification). Null for non-cloud drivers.
+  verify_tls?: boolean | null;
   // Per-server maintenance mode (issue #182). When true the control
   // plane skips shipping pending DHCPConfigOp rows + suppresses the
   // heartbeat-stale alert; the UI renders an amber Maintenance chip.
@@ -6562,6 +6570,45 @@ export interface WindowsDHCPCredentials {
   transport?: "ntlm" | "kerberos" | "basic" | "credssp";
   use_tls?: boolean;
   verify_tls?: boolean;
+}
+
+// FortiGate (driver='fortigate') agentless credentials — API token + VDOM.
+// The token is never returned by the API; only `has_credentials` + the
+// non-secret `vdom` come back. Sent via `cloud_credentials` on the
+// create/update body.
+export interface FortiGateCredentials {
+  api_token?: string;
+  vdom?: string;
+  verify_tls?: boolean;
+  // Optional PEM chain to pin a private-CA FortiGate without disabling
+  // verification. Merged into the stored credential blob.
+  ca_bundle_pem?: string;
+}
+
+// One FortiGate L3 interface + which managed scope its CIDR matches
+// (preflight before a sync). From GET /dhcp/servers/{id}/fortigate-interfaces.
+export interface FortiGateExistingDHCPServer {
+  mkey: number | null;
+  ip_range_count: number;
+  reserved_count: number;
+  option_count: number;
+  // True when SpatiumDDI already owns this object (adopting is a no-op);
+  // false means a plain sync would clobber operator-managed config.
+  managed: boolean;
+}
+
+export interface FortiGateInterface {
+  name: string;
+  cidr: string;
+  ip: string;
+  netmask: string;
+  status: string;
+  alias: string;
+  matched_subnet_id: string | null;
+  matched_scope_id: string | null;
+  // A pre-existing DHCP server on this interface, or null if none. Surfaced so
+  // the operator sees the clobber risk before an adopt-and-sync.
+  existing_dhcp_server: FortiGateExistingDHCPServer | null;
 }
 
 export interface DHCPLeaseSyncResult {
@@ -6608,6 +6655,9 @@ export interface DHCPScope {
   ddns_hostname_policy: string | null;
   ddns_domain_override: string | null;
   hostname_sync_mode: string;
+  // When false, this scope's dynamic-pool lease mirrors are excluded from the
+  // IPAM↔DNS drift check, so ephemeral pulled leases don't read as "out of sync".
+  dns_track_dynamic_leases?: boolean;
   // "ipv4" → Kea Dhcp4; "ipv6" → Kea Dhcp6. Inferred from subnet CIDR.
   address_family?: "ipv4" | "ipv6";
   // DHCPv6 operating mode (issue #52). Only meaningful for ipv6 scopes.
@@ -6871,13 +6921,18 @@ export const dhcpApi = {
   updateServer: (id: string, data: Partial<DHCPServer>) =>
     api.put<DHCPServer>(`/dhcp/servers/${id}`, data).then((r) => r.data),
   deleteServer: (id: string) => api.delete(`/dhcp/servers/${id}`),
-  syncServer: (id: string) =>
+  // `adoptExisting` (cloud/FortiGate only) opts in to overwriting a
+  // pre-existing provider DHCP object SpatiumDDI never created; without it a
+  // clobber-risk sync returns 409.
+  syncServer: (id: string, adoptExisting = false) =>
     api
       .post<{
         status: string;
         op_id: string;
         etag: string;
-      }>(`/dhcp/servers/${id}/sync`)
+      }>(
+        `/dhcp/servers/${id}/sync${adoptExisting ? "?adopt_existing=true" : ""}`,
+      )
       .then((r) => r.data),
   syncLeasesNow: (id: string) =>
     api
@@ -6893,6 +6948,22 @@ export const dhcpApi = {
         ok: boolean;
         message: string;
       }>("/dhcp/servers/test-windows-credentials", body)
+      .then((r) => r.data),
+  testFortigateCredentials: (body: {
+    host?: string;
+    port?: number;
+    credentials?: FortiGateCredentials;
+    server_id?: string;
+  }) =>
+    api
+      .post<{
+        ok: boolean;
+        message: string;
+      }>("/dhcp/servers/test-fortigate-credentials", body)
+      .then((r) => r.data),
+  getFortigateInterfaces: (id: string) =>
+    api
+      .get<FortiGateInterface[]>(`/dhcp/servers/${id}/fortigate-interfaces`)
       .then((r) => r.data),
   approveServer: (id: string) =>
     api.post<DHCPServer>(`/dhcp/servers/${id}/approve`).then((r) => r.data),
@@ -6921,6 +6992,11 @@ export const dhcpApi = {
     api
       .get<Page<DHCPLease>>(`/dhcp/servers/${id}/leases`, { params })
       .then((r) => r.data),
+  // Delete a single lease + its auto_from_lease IPAM mirror (SuperAdmin, #478).
+  // A still-live lease may be re-learned on the next poll — durable only once
+  // its scope/device is gone (the scope-delete path handles that automatically).
+  deleteLease: (serverId: string, leaseId: string) =>
+    api.delete(`/dhcp/servers/${serverId}/leases/${leaseId}`),
 
   // Per-server detail (powers the DHCP ServerDetailModal — issue #181)
   getServerPendingOps: (serverId: string, limit = 50) =>

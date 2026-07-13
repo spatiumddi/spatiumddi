@@ -5995,10 +5995,25 @@ async def _apply_dns_sync(
             # begin with) is safe to delete locally.
             for r, op_row in zip(recs, op_rows, strict=True):
                 if op_row is None:
-                    errors.append(
-                        f"{r.record_type} {r.name}.{zone.name}: "
-                        "no primary configured for zone — wire delete skipped"
-                    )
+                    # No server in the zone's group will apply the op (no
+                    # primary configured, or the only primary is a disabled
+                    # agentless server) — so nothing is serving this zone and
+                    # there is no wire state to diverge from. A stale record
+                    # (its IPAM address already deleted) is therefore just
+                    # DB-only cruft; delete it, exactly like the zone-less
+                    # orphans below. Without this a no-primary zone's stale
+                    # records could never be cleared from the subnet's DNS view
+                    # (#623). Contrast: op_row.state=="failed" means a real
+                    # server rejected the delete and still serves the record.
+                    try:
+                        linked_ip = (
+                            ips_by_id.get(r.ip_address_id) if r.ip_address_id is not None else None
+                        )
+                        _invalidate_ip_dns_cache(r, linked_ip)
+                        await db.delete(r)
+                        deleted += 1
+                    except Exception as exc:  # noqa: BLE001
+                        errors.append(f"record {r.id}: {exc}")
                     continue
                 if op_row.state != "applied":
                     errors.append(

@@ -1172,7 +1172,9 @@ function ScopeDeleteModal({
         // together and restore together (#617).
         `Delete scope "${scope.name || scope.id.slice(0, 8)}"? ` +
         "Its pools and reservations go with it — they stop being served straight " +
-        "away, and are restorable as a set from Administration → Trash." +
+        "away, and are restorable as a set from Administration → Trash. Any " +
+        "dynamic clients (leases) it learned are released too, and their IPAM " +
+        "and DNS entries removed." +
         windowsNote
       }
       referencesTitle={
@@ -2016,6 +2018,20 @@ function LeasesTab({ server }: { server: DHCPServer }) {
   const [page, setPage] = useState(1);
   const pageSize = 100;
 
+  const qc = useQueryClient();
+  const { isSuperadmin } = usePermissions();
+  // Manual single-lease delete (#478). Backend is SuperAdmin-gated, so only
+  // offer it to superadmins. A still-live lease may be re-learned on the next
+  // poll — this is for expired/stray leases; scope deletion handles the rest.
+  const [del, setDel] = useState<DHCPLease | null>(null);
+  const delMut = useMutation({
+    mutationFn: (leaseId: string) => dhcpApi.deleteLease(server.id, leaseId),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["dhcp-leases", server.id] });
+      setDel(null);
+    },
+  });
+
   const { data: subnets = [] } = useQuery({
     queryKey: ["subnets"],
     queryFn: () => ipamApi.listSubnets(),
@@ -2252,6 +2268,17 @@ function LeasesTab({ server }: { server: DHCPServer }) {
                       Copy Hostname
                     </ContextMenuItem>
                   )}
+                  {isSuperadmin && (
+                    <>
+                      <ContextMenuSeparator />
+                      <ContextMenuItem
+                        className="text-destructive"
+                        onSelect={() => setDel(l)}
+                      >
+                        Delete lease
+                      </ContextMenuItem>
+                    </>
+                  )}
                 </ContextMenuContent>
               </ContextMenu>
             ))}
@@ -2271,6 +2298,25 @@ function LeasesTab({ server }: { server: DHCPServer }) {
           onChange={setPage}
         />
       </div>
+      {del && (
+        <DeleteConfirmModal
+          title="Delete Lease"
+          description={
+            `Delete the lease for ${del.ip_address} (${del.mac_address})? ` +
+            "This removes the lease and its IPAM mirror. A still-active lease " +
+            "may be re-learned on the next poll — this is for stray or expired " +
+            "leases; deleting the scope clears its leases automatically."
+          }
+          onConfirm={() => delMut.mutate(del.id)}
+          onClose={() => setDel(null)}
+          isPending={delMut.isPending}
+          error={
+            delMut.isError
+              ? "Delete failed — check your permissions or refresh the list."
+              : null
+          }
+        />
+      )}
     </div>
   );
 }
@@ -2495,9 +2541,30 @@ function ServerDetailView({
     server.driver === "kea" && group !== null && groupIsKeaManaged(group);
   const [tab, setTab] = useState<Tab>(groupOwnsConfig ? "leases" : "scopes");
   const [syncBanner, setSyncBanner] = useState<string | null>(null);
+  // 409 from a FortiGate sync: an operator-managed DHCP object already exists
+  // on the interface. Holds the detail so we can offer an adopt-and-retry.
+  const [adoptConflict, setAdoptConflict] = useState<string | null>(null);
   const syncMut = useMutation({
-    mutationFn: () => dhcpApi.syncServer(server.id),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["dhcp-servers"] }),
+    mutationFn: (adoptExisting: boolean = false) =>
+      dhcpApi.syncServer(server.id, adoptExisting),
+    onSuccess: () => {
+      setSyncBanner(null);
+      setAdoptConflict(null);
+      qc.invalidateQueries({ queryKey: ["dhcp-servers"] });
+    },
+    onError: (e) => {
+      const err = e as {
+        response?: { status?: number; data?: { detail?: string } };
+      };
+      const detail = err?.response?.data?.detail;
+      if (err?.response?.status === 409) {
+        setAdoptConflict(
+          detail ?? "A DHCP server already exists on the interface.",
+        );
+      } else {
+        setSyncBanner(detail ?? "Force sync failed");
+      }
+    },
   });
   const leaseSyncMut = useMutation({
     mutationFn: () => dhcpApi.syncLeasesNow(server.id),
@@ -2644,7 +2711,7 @@ function ServerDetailView({
               <HeaderButton
                 icon={RefreshCw}
                 iconClassName={syncMut.isPending ? "animate-spin" : ""}
-                onClick={() => syncMut.mutate()}
+                onClick={() => syncMut.mutate(false)}
                 disabled={syncMut.isPending}
               >
                 Force Sync
@@ -2685,6 +2752,28 @@ function ServerDetailView({
                 Open group →
               </button>
             )}
+          </div>
+        )}
+        {adoptConflict && (
+          <div className="mt-3 flex items-center justify-between gap-2 rounded border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-800 dark:text-amber-300">
+            <span>{adoptConflict}</span>
+            <div className="flex flex-shrink-0 gap-1.5">
+              <button
+                type="button"
+                onClick={() => syncMut.mutate(true)}
+                disabled={syncMut.isPending}
+                className="rounded-md border border-amber-500/50 bg-amber-500/10 px-2.5 py-1 font-medium hover:bg-amber-500/20 disabled:opacity-50"
+              >
+                Adopt existing &amp; sync
+              </button>
+              <button
+                type="button"
+                onClick={() => setAdoptConflict(null)}
+                className="rounded border px-1.5 py-0.5 text-[10px] hover:bg-accent"
+              >
+                dismiss
+              </button>
+            </div>
           </div>
         )}
         {syncBanner && (
