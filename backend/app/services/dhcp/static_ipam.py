@@ -22,13 +22,16 @@ Wired in as of #618:
 * DHCP server-group delete (``ai.operations_risky._apply_delete_group``)
 * DHCP-import ``overwrite`` (``services.dhcp_import.commit``)
 
-KNOWN GAP — ``services.dhcp.pull_leases._upsert_scope`` still Core-DELETEs a
-Windows scope's reservations and re-inserts them from the wire without going
-through here, so a UI-created reservation's mirror is stranded on the next
-Windows scope sync. It is deliberately NOT fixed with a plain detach: that
-reconciler runs on a schedule, and a detach would tear down and recreate the
-forward A record on every pass for reservations that never changed. It needs a
-re-point-by-IP reconcile instead. Tracked separately.
+``services.dhcp.pull_leases._upsert_scope`` — the Windows scope reconciler —
+used to be the one path that destroyed reservations without coming through
+here: it Core-DELETEd every reservation under a scope and re-inserted them from
+the wire, stranding the mirror of any reservation an operator had created in
+the UI. #620 fixed it by making that reconciler diff-merge instead of replace,
+so a reservation keeps its id across polls and its mirror's back-link stays
+valid. It calls ``upsert_ipam_for_static`` only for reservations that actually
+changed (a schedule-driven detach/re-attach would have torn down and recreated
+the forward A record on every pass), and ``remove_ipam_for_static`` for the ones
+that genuinely vanished from the server.
 """
 
 from __future__ import annotations

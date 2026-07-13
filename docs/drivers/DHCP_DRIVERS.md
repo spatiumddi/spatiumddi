@@ -249,6 +249,22 @@ Per poll cycle:
 5. **Absence-delete** — any active `DHCPLease` row for this server whose IP didn't come back in the wire response is deleted along with its `auto_from_lease=True` IPAM mirror. The driver's `get_leases()` returns only currently-active leases, so absence means the server deleted it (admin purged / client released / etc.). `PullLeasesResult` gains `removed` + `ipam_revoked` counters; both flow into the scheduled-task audit row and the manual sync response. See [features/DHCP.md §15.3](../features/DHCP.md) for the rationale.
 6. The time-based `dhcp_lease_cleanup` sweep still handles leases that drift past `expires_at` between polls. The two mechanisms overlap harmlessly.
 
+### Scope reconcile (topology)
+
+The same beat task runs a **topology** phase ahead of the lease phase, for any driver that implements `get_scopes` — which today means Windows DHCP alone. For each wire scope whose CIDR exactly matches an IPAM `Subnet.network` (no auto-create), the scope row is upserted and its pools + reservations are **diff-merged** against the wire. Reservations are keyed on MAC, pools on `(start, end)`; a MAC / range that is already tracked is updated in place, so **a reservation keeps its row id across polls**.
+
+That id stability is load-bearing (#620). A reservation owns an `ip_address` mirror that back-links to it by id, so anything that re-creates the row (the pre-#620 reconciler Core-DELETEd and re-inserted every reservation, every poll) leaves the mirror pointing at a row Postgres has dropped — an address that is neither allocated nor free, and that deleting the reservation in the UI never frees, because the lookup keys on the *current* id. Merging also means an unchanged reservation is not written at all, which is what keeps the reconciler from re-publishing its DNS records on every tick.
+
+Reservations found on the server are mirrored into IPAM exactly like UI-created ones (`status="static_dhcp"`), via the same `upsert_ipam_for_static` helper — a reservation is an allocation whoever made it, and an IPAM that doesn't show it is an IPAM that will hand the address out twice. The mirror upsert (and therefore the DNS re-sync it performs) fires only when the reservation's address or hostname actually moved, or when its mirror is missing or stale.
+
+Three things the merge deliberately refuses to do:
+
+* **Absence-delete against a wire it can't trust.** Absence normally means "deleted on the server" — the reservation is dropped, its mirror deleted and its DNS torn down. But `_PS_LIST_TOPOLOGY` enumerates options / exclusions / reservations inside per-list `try/catch` blocks, so a failure hands back an *empty array*, not an error. The driver therefore reports `pools_ok` / `statics_ok` alongside each list, and the reconciler also declines to delete when a wholly-empty list arrives while it tracks rows (the same call the lease path's zero-wire floor guard makes, #482). Both cases record a soft error on the sync result. The trade is deliberate: a stale reservation an operator can delete beats a reservation and its A record torn down on a blip.
+* **Act on rows newer than its own information.** The wire is a snapshot taken before a multi-second WinRM round-trip. A reservation created or edited *after* that snapshot is judged against stale data, so it is skipped — otherwise a reservation created in the UI mid-poll is "absent from the wire" and gets deleted out from under the operator.
+* **Write an address change row-by-row.** Renumbering reservations on the server (`A` takes `B`'s address) produces a wire whose end state is legal but whose intermediate states violate `uq_dhcp_static_scope_ip` — which would abort the poll, and keep aborting it, since the wire keeps reporting the same state. Movers are lifted out of that partial index (it is `WHERE deleted_at IS NULL`) inside the transaction, re-addressed, and put back.
+
+`PullLeasesResult` reports `scopes_imported` / `scopes_refreshed` / `scopes_skipped_no_subnet` plus `pools_synced` / `statics_synced` (created **or changed**) and `pools_removed` / `statics_removed`. Because the merge is a diff, a steady-state poll reports zeros.
+
 ### Batched WinRM writes
 
 Per-object writes against Windows DHCP used to round-trip WinRM **per reservation / exclusion** — a bulk delete of 200 reservations took minutes. The driver now groups writes into a single PowerShell script per `(server, scope)` chunk.

@@ -393,6 +393,8 @@ class SyncLeasesResponse(BaseModel):
     scopes_skipped_no_subnet: int = 0
     pools_synced: int = 0
     statics_synced: int = 0
+    pools_removed: int = 0
+    statics_removed: int = 0
     # MAC deny-filter reconciliation against the group's active blocks.
     # Zero when the server isn't in a group or has no blocks configured.
     mac_blocks_added: int = 0
@@ -1047,6 +1049,8 @@ async def sync_leases_now(server_id: uuid.UUID, db: DB, user: SuperAdmin) -> Syn
             "scopes_skipped_no_subnet": result.scopes_skipped_no_subnet,
             "pools_synced": result.pools_synced,
             "statics_synced": result.statics_synced,
+            "pools_removed": result.pools_removed,
+            "statics_removed": result.statics_removed,
             "mac_blocks_added": mac_added,
             "mac_blocks_removed": mac_removed,
             "errors": result.errors[:20],
@@ -1067,6 +1071,8 @@ async def sync_leases_now(server_id: uuid.UUID, db: DB, user: SuperAdmin) -> Syn
         scopes_skipped_no_subnet=result.scopes_skipped_no_subnet,
         pools_synced=result.pools_synced,
         statics_synced=result.statics_synced,
+        pools_removed=result.pools_removed,
+        statics_removed=result.statics_removed,
         mac_blocks_added=mac_added,
         mac_blocks_removed=mac_removed,
         errors=result.errors,

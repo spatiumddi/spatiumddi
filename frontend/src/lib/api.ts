@@ -6625,6 +6625,8 @@ export interface DHCPLeaseSyncResult {
   scopes_skipped_no_subnet: number;
   pools_synced: number;
   statics_synced: number;
+  pools_removed?: number;
+  statics_removed?: number;
   mac_blocks_added?: number;
   mac_blocks_removed?: number;
   errors: string[];

@@ -53,24 +53,16 @@ from app.services.dhcp.cloud_writethrough import (
     push_cloud_scope_delete,
     push_cloud_scope_upsert,
 )
+from app.services.dhcp.normalize import norm_ip, norm_mac
 
 logger = structlog.get_logger(__name__)
 
 
-def _norm_mac(mac: str) -> str:
-    """Canonicalise a MAC to bare lowercase hex so a cosmetic reformat
-    (case / ':' vs '-' separators) doesn't read as a change (#426)."""
-    return "".join(c for c in mac.lower() if c in "0123456789abcdef")
-
-
-def _norm_ip(ip: str) -> str:
-    """Canonicalise an IP for change-detection; falls back to the raw
-    string if it doesn't parse (so a bad value still compares equal to
-    itself)."""
-    try:
-        return str(ipaddress.ip_address(ip.strip()))
-    except ValueError:
-        return ip.strip()
+# Change-detection normalisers (#426). They live in ``services.dhcp.normalize``
+# because ``pull_leases`` diffs the same wire state against the same rows and
+# has to agree byte-for-byte on what counts as a change (#620).
+_norm_mac = norm_mac
+_norm_ip = norm_ip
 
 
 class WindowsPushError(HTTPException):

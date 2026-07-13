@@ -2599,9 +2599,16 @@ function ServerDetailView({
           scopeBits.push(
             `${result.scopes_skipped_no_subnet} skipped (no matching IPAM subnet)`,
           );
-        if (result.pools_synced) scopeBits.push(`${result.pools_synced} pools`);
+        // Counts are changes, not totals: the scope reconciler diff-merges, so
+        // an unchanged pool / reservation is not touched and not counted.
+        if (result.pools_synced)
+          scopeBits.push(`${result.pools_synced} pools changed`);
+        if (result.pools_removed)
+          scopeBits.push(`${result.pools_removed} pools removed`);
         if (result.statics_synced)
-          scopeBits.push(`${result.statics_synced} reservations`);
+          scopeBits.push(`${result.statics_synced} reservations changed`);
+        if (result.statics_removed)
+          scopeBits.push(`${result.statics_removed} reservations removed`);
         parts.push(scopeBits.join(" / "));
       }
       parts.push(`${result.server_leases} leases on wire`);
