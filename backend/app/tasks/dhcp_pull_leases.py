@@ -98,6 +98,8 @@ async def _run_pull() -> dict[str, Any]:
             total_scopes_skipped = 0
             total_pools_synced = 0
             total_statics_synced = 0
+            total_pools_removed = 0
+            total_statics_removed = 0
             errors: list[str] = []
             wake_group_ids: set[str] = set()  # #428 — DNS groups to wake post-commit
 
@@ -131,6 +133,8 @@ async def _run_pull() -> dict[str, Any]:
                 total_scopes_skipped += result.scopes_skipped_no_subnet
                 total_pools_synced += result.pools_synced
                 total_statics_synced += result.statics_synced
+                total_pools_removed += result.pools_removed
+                total_statics_removed += result.statics_removed
                 wake_group_ids.update(result.dns_wake_group_ids)
                 errors.extend(f"{server.name}: {e}" for e in result.errors)
 
@@ -142,6 +146,13 @@ async def _run_pull() -> dict[str, Any]:
                 or total_removed
                 or total_ipam_created
                 or total_ipam_revoked
+                # Destructive topology work counts too (#620). Without these, a
+                # poll whose only effect was absence-deleting reservations — and
+                # their IPAM mirrors, and their DNS records — wrote NO audit row
+                # at all, because every counter above tracks leases, not statics.
+                or total_statics_synced
+                or total_statics_removed
+                or total_pools_removed
                 or errors
             ):
                 db.add(
@@ -168,6 +179,8 @@ async def _run_pull() -> dict[str, Any]:
                             "scopes_skipped_no_subnet": total_scopes_skipped,
                             "pools_synced": total_pools_synced,
                             "statics_synced": total_statics_synced,
+                            "pools_removed": total_pools_removed,
+                            "statics_removed": total_statics_removed,
                             "errors": errors[:20],
                         },
                     )

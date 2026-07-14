@@ -138,19 +138,32 @@ foreach ($s in $scopes) {
         }
     } catch { }
 
+    # #620: the *_ok flags tell the reconciler whether an empty list means
+    # "this scope genuinely has none" or "the enumeration blew up". Without
+    # them an empty array is ambiguous, and the scope reconciler — which
+    # absence-deletes what the wire no longer reports — would tear down every
+    # exclusion / reservation (and their IPAM mirrors) on a transient failure.
+    # ``-ErrorAction Stop`` (NOT SilentlyContinue) on these two: the *_ok flags
+    # are only meaningful if every error category reaches the catch, and
+    # SilentlyContinue suppresses non-terminating errors before it can. Verified
+    # against Windows Server that this does not over-trip — a scope with zero
+    # reservations / exclusions returns an empty set WITHOUT throwing, so "empty"
+    # stays authoritative and only a genuine enumeration failure clears the flag.
     $exclusions = @()
+    $exclusionsOk = $true
     try {
-        foreach ($e in (Get-DhcpServerv4ExclusionRange -ScopeId $s.ScopeId -ErrorAction SilentlyContinue)) {
+        foreach ($e in (Get-DhcpServerv4ExclusionRange -ScopeId $s.ScopeId -ErrorAction Stop)) {
             $exclusions += [PSCustomObject]@{
                 start_ip = $e.StartRange.ToString()
                 end_ip   = $e.EndRange.ToString()
             }
         }
-    } catch { }
+    } catch { $exclusionsOk = $false }
 
     $reservations = @()
+    $reservationsOk = $true
     try {
-        foreach ($r in (Get-DhcpServerv4Reservation -ScopeId $s.ScopeId -ErrorAction SilentlyContinue)) {
+        foreach ($r in (Get-DhcpServerv4Reservation -ScopeId $s.ScopeId -ErrorAction Stop)) {
             $reservations += [PSCustomObject]@{
                 ip_address = $r.IPAddress.ToString()
                 client_id  = $r.ClientId
@@ -158,7 +171,7 @@ foreach ($s in $scopes) {
                 description= $r.Description
             }
         }
-    } catch { }
+    } catch { $reservationsOk = $false }
 
     $result += [PSCustomObject]@{
         scope_id               = $s.ScopeId.ToString()
@@ -171,7 +184,9 @@ foreach ($s in $scopes) {
         state                  = $s.State.ToString()
         options                = $options
         exclusions             = $exclusions
+        exclusions_ok          = $exclusionsOk
         reservations           = $reservations
+        reservations_ok        = $reservationsOk
     }
 }
 $result | ConvertTo-Json -Compress -Depth 5
@@ -252,12 +267,19 @@ class WindowsDHCPReadOnlyDriver(DHCPDriver):
               "statics":             [
                   {"ip_address", "mac_address", "hostname", "client_id", "description"},
               ],
+              "pools_ok":            True,   # exclusion enumeration succeeded
+              "statics_ok":          True,   # reservation enumeration succeeded
             }
 
         All writes are external — the service layer upserts these into
         ``DHCPScope`` / ``DHCPPool`` / ``DHCPStaticAssignment`` only for
         scopes whose CIDR matches an existing IPAM ``Subnet``. No auto-
         subnet creation.
+
+        ``pools_ok`` / ``statics_ok`` exist because the reconciler treats the
+        wire as ground truth and deletes what it stops reporting: an empty
+        ``statics`` list has to be readable as "this scope has no reservations"
+        and NOT as "``Get-DhcpServerv4Reservation`` threw" (#620).
         """
         creds = _load_credentials(server)
         raw = await asyncio.to_thread(_run_ps, server, creds, _PS_LIST_TOPOLOGY)
@@ -881,6 +903,13 @@ def _parse_scopes(raw: str) -> list[dict[str, Any]]:
                 "options": options,
                 "pools": pools,
                 "statics": statics,
+                # Did the enumeration behind each list actually succeed? (#620)
+                # The reconciler absence-deletes what the wire stops reporting,
+                # so it must not read a blown-up enumeration's empty list as
+                # "the operator removed everything". Absent ⇒ assume success,
+                # so a driver that doesn't report the flag stays authoritative.
+                "pools_ok": bool(item.get("exclusions_ok", True)),
+                "statics_ok": bool(item.get("reservations_ok", True)),
             }
         )
     return out

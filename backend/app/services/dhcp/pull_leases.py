@@ -33,6 +33,14 @@ polls, or when lease pull is disabled). The two mechanisms overlap
 harmlessly: expiry sweeps anything the pull missed, pull deletes
 anything the sweep hasn't seen yet.
 
+**Phase 1 — topology**, for drivers that also implement ``get_scopes``
+(only ``windows_dhcp`` today): the server's scopes, pools and
+reservations are reconciled the same way, by diff-merge — see
+``_upsert_scope``. Reservations are matched on MAC so they keep their
+row id across polls, which is what lets an ``ip_address`` mirror
+back-link to one and stay valid (#620). Absence still means deleted,
+under the same floor guards (``_absence_delete_ok``).
+
 Per CLAUDE.md non-negotiable #9, the whole operation is idempotent: a
 second run over the same wire state is a no-op (the dedup key is
 ``(server_id, ip_address)`` and all updates are set-to-observed).
@@ -62,6 +70,8 @@ from app.models.ipam import IPAddress, Subnet
 from app.services.dhcp.ipam_mirror import insert_ipam_mirror_row
 from app.services.dhcp.lease_cleanup import purge_lease
 from app.services.dhcp.lease_history import record_lease_history
+from app.services.dhcp.normalize import norm_ip, norm_mac
+from app.services.dhcp.static_ipam import remove_ipam_for_static, upsert_ipam_for_static
 
 
 def _refresh_lease_owned_row(
@@ -92,8 +102,10 @@ class PullLeasesResult:
     scopes_imported: int = 0  # new DHCPScope rows added
     scopes_refreshed: int = 0  # existing DHCPScope rows updated in place
     scopes_skipped_no_subnet: int = 0  # scope CIDR not tracked in IPAM — skipped
-    pools_synced: int = 0  # DHCPPool rows (re-)created from the import
-    statics_synced: int = 0  # DHCPStaticAssignment rows (re-)created
+    pools_synced: int = 0  # DHCPPool rows created or changed by the import
+    statics_synced: int = 0  # DHCPStaticAssignment rows created or changed
+    pools_removed: int = 0  # DHCPPool rows gone from the wire
+    statics_removed: int = 0  # DHCPStaticAssignment rows gone from the wire
     errors: list[str] = field(default_factory=list)
     # #428 — DNS group ids whose zones received a DDNS record this pull;
     # the caller publishes an agent wake for them AFTER its commit so the
@@ -134,11 +146,29 @@ async def pull_leases_from_server(
 
     # Phase 1 — topology (scopes + pools + reservations). Optional: only
     # runs for drivers that expose ``get_scopes``. For each scope whose
-    # CIDR matches a known IPAM subnet, upsert the scope, then replace
-    # its pools and statics with what Windows reports. Scopes whose CIDR
+    # CIDR matches a known IPAM subnet, upsert the scope, then diff-merge
+    # its pools and statics against what Windows reports. Scopes whose CIDR
     # has no matching IPAM subnet are skipped — we intentionally do not
     # auto-create subnets (that belongs in a separate workflow).
     if hasattr(driver, "get_scopes"):
+        # Stamped BEFORE the wire read: everything the wire tells us is a
+        # snapshot of the server as of (at latest) this instant, so a DB row an
+        # operator created or edited *after* it is newer than our information
+        # and the merge must not act on it (#620). The WinRM round-trip is
+        # seconds long — long enough for a reservation created in the UI mid-poll
+        # to be absent from the wire we're holding, and absence means delete.
+        #
+        # Read from the DATABASE's clock, not this process's. The guard compares
+        # against ``created_at`` / ``modified_at``, which TimestampMixin fills
+        # with ``func.now()`` — i.e. Postgres's clock. Comparing those to a local
+        # ``datetime.now(UTC)`` is a cross-clock comparison, and on a multi-node
+        # appliance (CNPG on another node, chrony drifting) a DB clock running
+        # ahead by more than the poll interval would make EVERY row look newer
+        # than the snapshot: every reservation skipped, every stale one spared,
+        # the reconciler silently converging on nothing. ``clock_timestamp()``,
+        # not ``now()`` — the latter is transaction-start time and would drift
+        # earlier the longer this transaction runs.
+        snapshot_at = (await db.execute(select(func.clock_timestamp()))).scalar_one()
         try:
             wire_scopes = await driver.get_scopes(server)
         except Exception as exc:  # noqa: BLE001
@@ -151,7 +181,9 @@ async def pull_leases_from_server(
             )
             wire_scopes = []
         for wscope in wire_scopes:
-            await _upsert_scope(db, server, wscope, subnets, result, apply=apply)
+            await _upsert_scope(
+                db, server, wscope, subnets, result, apply=apply, snapshot_at=snapshot_at
+            )
 
     # Phase 2 — leases.
     try:
@@ -525,17 +557,29 @@ async def _upsert_scope(
     result: PullLeasesResult,
     *,
     apply: bool,
+    snapshot_at: datetime,
 ) -> None:
     """Upsert one Windows-reported scope + its pools + its reservations.
 
     Matching: the scope's ``subnet_cidr`` must exactly match an existing
     IPAM ``Subnet.network`` (prefix-length identical). No auto-create.
 
-    For pools + statics we do a **replace-all** per scope: delete
-    everything for this scope_id, then insert what Windows reports.
-    That's safe because windows_dhcp is read-only — there are no manual
-    pools/statics anyone could have added through our UI for a
-    windows_dhcp scope.
+    Pools + statics are **diff-merged** against the wire, not replaced (#620).
+    They used to be replaced: a Core ``DELETE`` of every pool + reservation
+    under the scope, then a re-insert from the wire. That was written when
+    ``windows_dhcp`` was a read-only driver and its rows were pure derived
+    state. It stopped being true once write-through landed — operators create
+    reservations through our UI now, and a reservation owns an ``ip_address``
+    mirror that back-links to it by id. Re-inserting minted a fresh id on every
+    poll, so the mirror was left pointing at a row Postgres had dropped (and a
+    Core ``DELETE`` runs no per-row Python, so nothing released it): the address
+    was neither allocated nor free, and deleting the reservation in the UI never
+    freed it, because the lookup keyed on the *current* id and matched nothing.
+
+    Merging keeps a reservation's id stable across polls, which is what makes
+    the mirror's back-link durable. It also means an unchanged reservation is
+    not written at all — so, unlike a detach/re-attach repair, this fires no DNS
+    record churn on the steady state. Only real changes touch anything.
     """
     cidr = wscope.get("subnet_cidr")
     if not cidr:
@@ -606,45 +650,393 @@ async def _upsert_scope(
     if not apply or existing_scope is None:
         return
 
-    # Replace-all: drop old pools + statics for this scope, re-insert.
-    # Cheap on scopes with tens of entries; avoids diff-merge complexity.
-    await db.execute(DHCPPool.__table__.delete().where(DHCPPool.scope_id == existing_scope.id))
-    await db.execute(
-        DHCPStaticAssignment.__table__.delete().where(
-            DHCPStaticAssignment.scope_id == existing_scope.id
+    await _merge_pools(db, existing_scope, wscope, result, snapshot_at=snapshot_at)
+    await _merge_statics(db, existing_scope, wscope, result, snapshot_at=snapshot_at)
+    await db.flush()
+
+
+def _absence_delete_ok(
+    *,
+    kind: str,
+    cidr: str,
+    wire_count: int,
+    tracked_count: int,
+    enumeration_ok: bool,
+    result: PullLeasesResult,
+) -> bool:
+    """May we treat "absent from the wire" as "deleted on the server"?
+
+    Two ways an empty/short wire list lies, and both end in us deleting rows an
+    operator still has (for reservations: their IPAM mirror and DNS records too):
+
+    * the driver told us the enumeration failed (``*_ok`` false) — see #620's
+      note on ``_PS_LIST_TOPOLOGY``, whose per-list ``try/catch`` can hand back
+      an empty array for a scope that is full of reservations;
+    * the enumeration *claims* success but came back wholly empty while we track
+      rows — the same ambiguity the lease path's zero-wire floor guard (#482)
+      refuses to resolve in favour of deletion.
+
+    Erring toward divergence over data loss: a stale row an operator can delete
+    in the UI beats a reservation (and its A record) we tore down on a hiccup.
+    """
+    if not enumeration_ok:
+        result.errors.append(
+            f"scope {cidr}: the server's {kind} enumeration failed — keeping the "
+            f"{tracked_count} tracked {kind} and skipping the absence-delete this pass"
         )
+        return False
+    if wire_count == 0 and tracked_count > 0:
+        result.errors.append(
+            f"scope {cidr}: wire reported 0 {kind} while {tracked_count} are tracked — "
+            f"skipping the absence-delete this pass (#482). If they really were removed "
+            f"on the server, delete them here to converge."
+        )
+        return False
+    return True
+
+
+async def _merge_pools(
+    db: AsyncSession,
+    scope: DHCPScope,
+    wscope: dict[str, Any],
+    result: PullLeasesResult,
+    *,
+    snapshot_at: datetime,
+) -> None:
+    """Diff-merge the scope's pools against the wire, keyed by (start, end).
+
+    Pools carry no IPAM mirror, so churning them strands nothing — but IPAM
+    *reads* them (a manual allocation inside a dynamic range is refused), so a
+    pool that blinks out of existence between polls briefly opens a hole for an
+    operator to allocate an address the DHCP server hands out dynamically.
+    """
+    wire = [p for p in (wscope.get("pools") or []) if p.get("start_ip") and p.get("end_ip")]
+    existing = list(
+        (await db.execute(select(DHCPPool).where(DHCPPool.scope_id == scope.id))).scalars().all()
     )
+    by_range = {(norm_ip(str(p.start_ip)), norm_ip(str(p.end_ip))): p for p in existing}
 
-    for pool in wscope.get("pools") or []:
-        if not pool.get("start_ip") or not pool.get("end_ip"):
+    seen: set[tuple[str, str]] = set()
+    for wpool in wire:
+        key = (norm_ip(str(wpool["start_ip"])), norm_ip(str(wpool["end_ip"])))
+        if key in seen:
             continue
-        db.add(
-            DHCPPool(
-                scope_id=existing_scope.id,
-                start_ip=pool["start_ip"],
-                end_ip=pool["end_ip"],
-                pool_type=pool.get("pool_type") or "dynamic",
-                name="",
+        seen.add(key)
+        pool_type = wpool.get("pool_type") or "dynamic"
+        row = by_range.get(key)
+        if row is None:
+            db.add(
+                DHCPPool(
+                    scope_id=scope.id,
+                    start_ip=wpool["start_ip"],
+                    end_ip=wpool["end_ip"],
+                    pool_type=pool_type,
+                    name="",
+                )
+            )
+            result.pools_synced += 1
+        elif row.pool_type != pool_type:
+            row.pool_type = pool_type
+            result.pools_synced += 1
+
+    stale = [
+        row
+        for key, row in by_range.items()
+        # Same snapshot guard the reservations get: a pool an operator added
+        # mid-poll (write-through pushed it to the server, but our wire read
+        # predates it) is absent from a wire that simply never saw it, and
+        # deleting it would take IPAM's dynamic-range protection away for a poll
+        # — the exact hole this function's docstring warns about.
+        if key not in seen and not (row.created_at is not None and row.created_at > snapshot_at)
+    ]
+    if not stale:
+        return
+    if not _absence_delete_ok(
+        kind="pools",
+        cidr=str(wscope.get("subnet_cidr") or ""),
+        wire_count=len(wire),
+        tracked_count=len(existing),
+        enumeration_ok=bool(wscope.get("pools_ok", True)),
+        result=result,
+    ):
+        return
+    for row in stale:
+        await db.delete(row)
+        result.pools_removed += 1
+
+
+async def _merge_statics(
+    db: AsyncSession,
+    scope: DHCPScope,
+    wscope: dict[str, Any],
+    result: PullLeasesResult,
+    *,
+    snapshot_at: datetime,
+) -> None:
+    """Diff-merge the scope's reservations against the wire, keyed by MAC.
+
+    MAC is the key because it is what Windows keys a reservation on and what
+    survives an IP change; matching on it lets a relocated reservation keep its
+    id — and therefore its IPAM mirror, and therefore its DNS records.
+
+    Every reservation on the wire gets an IPAM mirror, not just the ones created
+    through our UI (#620). A reservation is an allocation whoever made it, and
+    IPAM that doesn't show it is IPAM that will hand the address out twice.
+    ``upsert_ipam_for_static`` is the same helper the UI create path uses, so
+    both kinds of reservation produce the same row — but we only call it when
+    something actually changed (or the mirror is missing/stale), because it
+    re-syncs DNS, and this runs on the beat.
+    """
+    wire = _dedupe_wire_statics(wscope.get("statics") or [])
+    existing = list(
+        (
+            await db.execute(
+                select(DHCPStaticAssignment).where(DHCPStaticAssignment.scope_id == scope.id)
             )
         )
-        result.pools_synced += 1
+        .scalars()
+        .all()
+    )
+    by_mac = {norm_mac(str(st.mac_address)): st for st in existing}
+    cidr = str(wscope.get("subnet_cidr") or "")
 
-    for static in wscope.get("statics") or []:
-        if not static.get("ip_address") or not static.get("mac_address"):
+    # ── 1. absence-delete, first — it frees addresses the wire may be reusing ──
+    stale = [
+        st
+        for mac_key, st in by_mac.items()
+        # A reservation created after the snapshot cannot be judged by it: the
+        # wire we are holding predates it, so its absence proves nothing.
+        if mac_key not in wire and not (st.created_at is not None and st.created_at > snapshot_at)
+    ]
+    if stale and _absence_delete_ok(
+        kind="reservations",
+        cidr=cidr,
+        wire_count=len(wire),
+        tracked_count=len(existing),
+        enumeration_ok=bool(wscope.get("statics_ok", True)),
+        result=result,
+    ):
+        for st in stale:
+            # Gone from the server ⇒ the address is not reserved for anyone.
+            # Delete the mirror rather than freeing it to ``available``: this is
+            # a machine reconcile, and a persisted freed row still renders as a
+            # line in the subnet table and still counts toward utilization
+            # (#618). Tears the reservation's DNS records down first.
+            await remove_ipam_for_static(db, st)
+            await db.delete(st)
+            by_mac.pop(norm_mac(str(st.mac_address)), None)
+            result.statics_removed += 1
+        await db.flush()
+
+    # ── 2. classify what the wire wants against what survived ──
+    creates: list[dict[str, Any]] = []
+    movers: list[tuple[DHCPStaticAssignment, dict[str, Any]]] = []
+    in_place: list[tuple[DHCPStaticAssignment, dict[str, Any]]] = []
+    for mac_key, wstatic in wire.items():
+        st = by_mac.get(mac_key)
+        if st is None:
+            creates.append(wstatic)
+        # Never overwrite a row an operator touched after we took the wire
+        # snapshot — our information is the older of the two. The write-through
+        # already pushed their edit to the server, so the next poll reads it back
+        # and converges on it.
+        elif st.modified_at is not None and st.modified_at > snapshot_at:
             continue
-        db.add(
-            DHCPStaticAssignment(
-                scope_id=existing_scope.id,
-                ip_address=static["ip_address"],
-                mac_address=static["mac_address"],
-                client_id=static.get("client_id"),
-                hostname=sanitize_hostname(static.get("hostname")),
-                description=static.get("description") or "",
+        elif norm_ip(str(st.ip_address)) != norm_ip(str(wstatic["ip_address"])):
+            movers.append((st, wstatic))
+        else:
+            in_place.append((st, wstatic))
+
+    await _apply_moves(db, scope, movers, by_mac, result, cidr=cidr)
+
+    # Load every in-place reservation's mirror in ONE query. The steady state is
+    # this loop's whole point — it writes nothing — so a per-reservation
+    # ``db.get`` here would be N round-trips per scope per poll, forever, to
+    # establish that there is nothing to do.
+    mirrors = await _load_mirrors(db, [st for st, _ in in_place])
+    for st, wstatic in in_place:
+        changed, mirrored = _apply_wire_fields(st, wstatic)
+        if changed:
+            result.statics_synced += 1
+        # Re-mirror on a change the mirror reflects (the hostname), or when the
+        # mirror is missing / points at a dead id — which is exactly the residue
+        # the old replace-all left behind, so those installs repair themselves on
+        # the next poll, with no operator action and no migration. A steady-state
+        # poll hits neither, and so writes nothing at all.
+        if mirrored or not _mirror_is_current(scope, st, mirrors.get(st.ip_address_id)):
+            await upsert_ipam_for_static(db, scope, st, action="update")
+
+    # ``by_mac`` now holds every surviving reservation at its final address, so
+    # it is the occupancy map a new one has to fit into. A new reservation can
+    # only be blocked by a row the absence-delete floor guard declined to remove
+    # — same story as a blocked move, and the same answer: report it rather than
+    # violate the index and abort the poll.
+    occupied = {norm_ip(str(st.ip_address)): st for st in by_mac.values()}
+    for wstatic in creates:
+        ip_key = norm_ip(str(wstatic["ip_address"]))
+        blocker = occupied.get(ip_key)
+        if blocker is not None:
+            result.errors.append(
+                f"scope {cidr}: reservation {wstatic['mac_address']} cannot be added at "
+                f"{wstatic['ip_address']} — {blocker.mac_address} still holds that address "
+                f"here; retrying next poll"
             )
+            continue
+        st = DHCPStaticAssignment(
+            scope_id=scope.id,
+            ip_address=str(wstatic["ip_address"]),
+            mac_address=str(wstatic["mac_address"]),
+            client_id=wstatic.get("client_id"),
+            hostname=sanitize_hostname(wstatic.get("hostname")) or "",
+            description=wstatic.get("description") or "",
         )
+        db.add(st)
+        await db.flush()
+        await upsert_ipam_for_static(db, scope, st, action="create")
+        occupied[ip_key] = st
         result.statics_synced += 1
 
+
+def _dedupe_wire_statics(raw: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """``{normalised mac: wire static}``, dropping unusable and duplicate rows.
+
+    Both keys a reservation is unique on per scope — MAC and address — are
+    de-duplicated, because the merge writes against unique indexes on both and a
+    wire that claimed the same address twice would abort the poll.
+    """
+    out: dict[str, dict[str, Any]] = {}
+    ips: set[str] = set()
+    for wstatic in raw:
+        if not wstatic.get("ip_address") or not wstatic.get("mac_address"):
+            continue
+        mac_key = norm_mac(str(wstatic["mac_address"]))
+        ip_key = norm_ip(str(wstatic["ip_address"]))
+        if not mac_key or mac_key in out or ip_key in ips:
+            continue
+        out[mac_key] = wstatic
+        ips.add(ip_key)
+    return out
+
+
+def _apply_wire_fields(st: DHCPStaticAssignment, wstatic: dict[str, Any]) -> tuple[bool, bool]:
+    """Copy the wire's non-address fields onto ``st``.
+
+    Returns ``(changed, mirrored)`` — the second flag says whether the change is
+    one the IPAM mirror (and the DNS records published off it) reflects. Only
+    the hostname is: a description or client_id the wire taught us does not move
+    a record anywhere, and ``upsert_ipam_for_static`` re-syncs DNS every time it
+    runs, on a path that runs on the beat.
+
+    Deliberately excludes the address — re-addressing has to be sequenced against
+    the ``(scope, address)`` unique index (see ``_apply_moves``) — but note an
+    address change is mirrored too, and its caller always upserts.
+    """
+    changed = mirrored = False
+    hostname = sanitize_hostname(wstatic.get("hostname")) or ""
+    if (st.hostname or "") != hostname:
+        st.hostname = hostname
+        changed = mirrored = True
+    for attr, value in (
+        ("description", wstatic.get("description") or ""),
+        ("client_id", wstatic.get("client_id")),
+    ):
+        if (getattr(st, attr) or "") != (value or ""):
+            setattr(st, attr, value)
+            changed = True
+    return changed, mirrored
+
+
+async def _apply_moves(
+    db: AsyncSession,
+    scope: DHCPScope,
+    movers: list[tuple[DHCPStaticAssignment, dict[str, Any]]],
+    by_mac: dict[str, DHCPStaticAssignment],
+    result: PullLeasesResult,
+    *,
+    cidr: str,
+) -> None:
+    """Re-address the reservations the wire says have moved.
+
+    Writing the new addresses one row at a time is not safe: renumbering a scope
+    on the server (``A`` takes ``B``'s address, ``B`` takes ``C``'s) hands us a
+    wire whose end state is legal but whose every intermediate state is not, and
+    the first row to land on an address a not-yet-moved reservation still holds
+    violates ``uq_dhcp_static_scope_ip``. That aborts the poll — and the wire
+    keeps reporting the same thing, so it aborts every poll after it, forever.
+
+    That index is partial (``WHERE deleted_at IS NULL``), so lift every mover out
+    of it, flush, then write the new addresses and put the rows back. The
+    interim state lives and dies inside the caller's transaction; no other
+    session can observe it, and a mid-flight failure rolls the whole thing back.
+    """
+    if not movers:
+        return
+
+    # A mover whose destination is held by a reservation that is NOT itself
+    # moving cannot land, lift or no lift. That means a reservation we chose to
+    # keep — the absence-delete floor guard declined to remove it — is sitting on
+    # the address. Say so and leave it for a poll with better information.
+    moving = {id(st) for st, _ in movers}
+    held = {norm_ip(str(st.ip_address)): st for st in by_mac.values()}
+    landable: list[tuple[DHCPStaticAssignment, dict[str, Any]]] = []
+    for st, wstatic in movers:
+        blocker = held.get(norm_ip(str(wstatic["ip_address"])))
+        if blocker is not None and blocker is not st and id(blocker) not in moving:
+            result.errors.append(
+                f"scope {cidr}: reservation {st.mac_address} cannot move to "
+                f"{wstatic['ip_address']} — {blocker.mac_address} still holds that "
+                f"address here; retrying next poll"
+            )
+            continue
+        landable.append((st, wstatic))
+    if not landable:
+        return
+
+    lifted_at = datetime.now(UTC)
+    for st, _ in landable:
+        st.deleted_at = lifted_at
     await db.flush()
+
+    for st, wstatic in landable:
+        st.deleted_at = None
+        st.ip_address = str(wstatic["ip_address"])
+        _apply_wire_fields(st, wstatic)  # the address already counts as a change
+        result.statics_synced += 1
+    await db.flush()
+
+    # Mirrors last, once every row is back in the index at its final address:
+    # upsert_ipam_for_static re-points the mirror and re-syncs DNS, which is
+    # right for a move — the record really did change address.
+    for st, _ in landable:
+        await upsert_ipam_for_static(db, scope, st, action="update")
+
+
+async def _load_mirrors(
+    db: AsyncSession, statics: list[DHCPStaticAssignment]
+) -> dict[Any, IPAddress]:
+    """``{ip_address_id: row}`` for every reservation that claims to have a mirror."""
+    ids = [st.ip_address_id for st in statics if st.ip_address_id is not None]
+    if not ids:
+        return {}
+    rows = (await db.execute(select(IPAddress).where(IPAddress.id.in_(ids)))).scalars().all()
+    return {row.id: row for row in rows}
+
+
+def _mirror_is_current(scope: DHCPScope, st: DHCPStaticAssignment, row: IPAddress | None) -> bool:
+    """Is ``st``'s IPAM mirror present and pointing back at ``st``?
+
+    False for the rows the pre-#620 replace-all stranded (mirror survives, its
+    ``static_assignment_id`` names a reservation that no longer exists), and for
+    a reservation whose mirror an operator deleted out from under it.
+    """
+    if row is None:
+        return False
+    return (
+        row.subnet_id == scope.subnet_id
+        and norm_ip(str(row.address)) == norm_ip(str(st.ip_address))
+        and row.status == "static_dhcp"
+        and row.static_assignment_id == str(st.id)
+    )
 
 
 __all__ = ["PullLeasesResult", "pull_leases_from_server"]
