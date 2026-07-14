@@ -34,7 +34,16 @@ RUN python3 -m pip install --prefix=/install --no-cache-dir --break-system-packa
 # linux/amd64 + linux/arm64. Bump GOBGP_VERSION (a git tag from
 # https://github.com/osrg/gobgp/tags) + the golang base image together; the
 # repo's committed go.sum verifies every module checksum during the build.
-FROM --platform=$BUILDPLATFORM golang:1.26.4-alpine AS gobgp-build
+#
+# The Go toolchain version is a SECURITY pin, not just a build detail: Go links
+# its standard library statically into the binary, so a stdlib CVE ships inside
+# ``gobgpd`` itself and Trivy flags it against the ``gobinary`` target — there is
+# no separate package to patch and no ``apk upgrade`` that can fix it. The only
+# remedy is to rebuild with a fixed toolchain.
+#
+# ``1.26.5`` clears CVE-2026-39822 (HIGH — ``os.Root`` symlink following allows
+# directory traversal), which 1.26.4 carries. Keep this at the latest 1.26.x.
+FROM --platform=$BUILDPLATFORM golang:1.26.5-alpine AS gobgp-build
 ARG GOBGP_VERSION
 ARG TARGETOS
 ARG TARGETARCH

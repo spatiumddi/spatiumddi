@@ -434,6 +434,11 @@ make migrate                           # apply
 # Lint, typecheck, test
 make lint                              # ruff + black + mypy, eslint + prettier
 make ci                                # same three lint jobs CI runs (backend-lint + frontend-lint + frontend-build). Run before pushing.
+make trivy                             # container-image CVE scan — run before pushing ANY agent Dockerfile change.
+make trivy IMAGE=kea                   #   ...one image only. Same gate CI uses (HIGH/CRITICAL, ignore-unfixed).
+                                       #   CI's Trivy is path-filtered + PR-only, so touching a Dockerfile can surface a
+                                       #   PRE-EXISTING CVE. Note golang:X.Y.Z pins are SECURITY pins — Go static-links its
+                                       #   stdlib into the binary, so no apk upgrade can fix a stdlib CVE.
 make test                              # backend pytest — runs `-n auto` via pytest-xdist; one worker per CPU, each carving its own `spatiumddi_test_gw<N>` DB (conftest sets that up automatically). ~3-4× faster than serial.
 make test-one T=tests/test_health.py::test_liveness   # single test runs serial — xdist overhead isn't worth it for one
 

@@ -64,3 +64,6 @@ appliance/mkosi.extra/usr/lib/spatiumddi/docker-overlay.version
 
 # Ad-hoc agent working notes (should never be committed)
 scratchpad-*.md
+
+# Trivy vulnerability-DB cache (make trivy)
+.trivy-cache/
