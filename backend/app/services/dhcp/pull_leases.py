@@ -157,7 +157,18 @@ async def pull_leases_from_server(
         # and the merge must not act on it (#620). The WinRM round-trip is
         # seconds long — long enough for a reservation created in the UI mid-poll
         # to be absent from the wire we're holding, and absence means delete.
-        snapshot_at = datetime.now(UTC)
+        #
+        # Read from the DATABASE's clock, not this process's. The guard compares
+        # against ``created_at`` / ``modified_at``, which TimestampMixin fills
+        # with ``func.now()`` — i.e. Postgres's clock. Comparing those to a local
+        # ``datetime.now(UTC)`` is a cross-clock comparison, and on a multi-node
+        # appliance (CNPG on another node, chrony drifting) a DB clock running
+        # ahead by more than the poll interval would make EVERY row look newer
+        # than the snapshot: every reservation skipped, every stale one spared,
+        # the reconciler silently converging on nothing. ``clock_timestamp()``,
+        # not ``now()`` — the latter is transaction-start time and would drift
+        # earlier the longer this transaction runs.
+        snapshot_at = (await db.execute(select(func.clock_timestamp()))).scalar_one()
         try:
             wire_scopes = await driver.get_scopes(server)
         except Exception as exc:  # noqa: BLE001
@@ -639,7 +650,7 @@ async def _upsert_scope(
     if not apply or existing_scope is None:
         return
 
-    await _merge_pools(db, existing_scope, wscope, result)
+    await _merge_pools(db, existing_scope, wscope, result, snapshot_at=snapshot_at)
     await _merge_statics(db, existing_scope, wscope, result, snapshot_at=snapshot_at)
     await db.flush()
 
@@ -689,6 +700,8 @@ async def _merge_pools(
     scope: DHCPScope,
     wscope: dict[str, Any],
     result: PullLeasesResult,
+    *,
+    snapshot_at: datetime,
 ) -> None:
     """Diff-merge the scope's pools against the wire, keyed by (start, end).
 
@@ -726,7 +739,16 @@ async def _merge_pools(
             row.pool_type = pool_type
             result.pools_synced += 1
 
-    stale = [row for key, row in by_range.items() if key not in seen]
+    stale = [
+        row
+        for key, row in by_range.items()
+        # Same snapshot guard the reservations get: a pool an operator added
+        # mid-poll (write-through pushed it to the server, but our wire read
+        # predates it) is absent from a wire that simply never saw it, and
+        # deleting it would take IPAM's dynamic-range protection away for a poll
+        # — the exact hole this function's docstring warns about.
+        if key not in seen and not (row.created_at is not None and row.created_at > snapshot_at)
+    ]
     if not stale:
         return
     if not _absence_delete_ok(
@@ -827,6 +849,11 @@ async def _merge_statics(
 
     await _apply_moves(db, scope, movers, by_mac, result, cidr=cidr)
 
+    # Load every in-place reservation's mirror in ONE query. The steady state is
+    # this loop's whole point — it writes nothing — so a per-reservation
+    # ``db.get`` here would be N round-trips per scope per poll, forever, to
+    # establish that there is nothing to do.
+    mirrors = await _load_mirrors(db, [st for st, _ in in_place])
     for st, wstatic in in_place:
         changed, mirrored = _apply_wire_fields(st, wstatic)
         if changed:
@@ -836,7 +863,7 @@ async def _merge_statics(
         # the old replace-all left behind, so those installs repair themselves on
         # the next poll, with no operator action and no migration. A steady-state
         # poll hits neither, and so writes nothing at all.
-        if mirrored or not await _mirror_is_current(db, scope, st):
+        if mirrored or not _mirror_is_current(scope, st, mirrors.get(st.ip_address_id)):
             await upsert_ipam_for_static(db, scope, st, action="update")
 
     # ``by_mac`` now holds every surviving reservation at its final address, so
@@ -984,16 +1011,24 @@ async def _apply_moves(
         await upsert_ipam_for_static(db, scope, st, action="update")
 
 
-async def _mirror_is_current(db: AsyncSession, scope: DHCPScope, st: DHCPStaticAssignment) -> bool:
+async def _load_mirrors(
+    db: AsyncSession, statics: list[DHCPStaticAssignment]
+) -> dict[Any, IPAddress]:
+    """``{ip_address_id: row}`` for every reservation that claims to have a mirror."""
+    ids = [st.ip_address_id for st in statics if st.ip_address_id is not None]
+    if not ids:
+        return {}
+    rows = (await db.execute(select(IPAddress).where(IPAddress.id.in_(ids)))).scalars().all()
+    return {row.id: row for row in rows}
+
+
+def _mirror_is_current(scope: DHCPScope, st: DHCPStaticAssignment, row: IPAddress | None) -> bool:
     """Is ``st``'s IPAM mirror present and pointing back at ``st``?
 
     False for the rows the pre-#620 replace-all stranded (mirror survives, its
     ``static_assignment_id`` names a reservation that no longer exists), and for
     a reservation whose mirror an operator deleted out from under it.
     """
-    if st.ip_address_id is None:
-        return False
-    row = await db.get(IPAddress, st.ip_address_id)
     if row is None:
         return False
     return (

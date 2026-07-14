@@ -143,10 +143,16 @@ foreach ($s in $scopes) {
     # them an empty array is ambiguous, and the scope reconciler — which
     # absence-deletes what the wire no longer reports — would tear down every
     # exclusion / reservation (and their IPAM mirrors) on a transient failure.
+    # ``-ErrorAction Stop`` (NOT SilentlyContinue) on these two: the *_ok flags
+    # are only meaningful if every error category reaches the catch, and
+    # SilentlyContinue suppresses non-terminating errors before it can. Verified
+    # against Windows Server that this does not over-trip — a scope with zero
+    # reservations / exclusions returns an empty set WITHOUT throwing, so "empty"
+    # stays authoritative and only a genuine enumeration failure clears the flag.
     $exclusions = @()
     $exclusionsOk = $true
     try {
-        foreach ($e in (Get-DhcpServerv4ExclusionRange -ScopeId $s.ScopeId -ErrorAction SilentlyContinue)) {
+        foreach ($e in (Get-DhcpServerv4ExclusionRange -ScopeId $s.ScopeId -ErrorAction Stop)) {
             $exclusions += [PSCustomObject]@{
                 start_ip = $e.StartRange.ToString()
                 end_ip   = $e.EndRange.ToString()
@@ -157,7 +163,7 @@ foreach ($s in $scopes) {
     $reservations = @()
     $reservationsOk = $true
     try {
-        foreach ($r in (Get-DhcpServerv4Reservation -ScopeId $s.ScopeId -ErrorAction SilentlyContinue)) {
+        foreach ($r in (Get-DhcpServerv4Reservation -ScopeId $s.ScopeId -ErrorAction Stop)) {
             $reservations += [PSCustomObject]@{
                 ip_address = $r.IPAddress.ToString()
                 client_id  = $r.ClientId

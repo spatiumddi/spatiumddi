@@ -351,9 +351,12 @@ async def test_relocated_reservation_keeps_its_id_and_moves_its_mirror(
     moved = await _mirror(db_session, subnet, "10.20.0.77")
     assert moved is not None
     assert moved.static_assignment_id == str(original_id)
-    # The old address is no longer reserved.
-    old = await _mirror(db_session, subnet, "10.20.0.10")
-    assert old is None or old.status != "static_dhcp"
+    # The address it left is FREE — the row is gone, not merely downgraded to
+    # `allocated`. An allocated row with no owner is reclaimed by nothing (the
+    # orphan sweep only looks at `static_dhcp`, the lease mirror skips rows it
+    # doesn't own), so every renumber would leak one address. Asserting "not
+    # static_dhcp" here is what let that through the first time.
+    assert await _mirror(db_session, subnet, "10.20.0.10") is None
 
 
 @pytest.mark.asyncio
@@ -698,3 +701,91 @@ async def test_hostname_change_on_the_wire_follows_into_ipam(
     assert mirror is not None
     assert mirror.hostname == "plotter"
     assert spy.calls == ["update:10.20.0.10"]
+
+
+# ── regressions caught in review of the fix itself ────────────────────
+
+
+@pytest.mark.asyncio
+async def test_move_carries_operator_columns_to_the_new_address(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Freeing the old address must not throw the operator's work away with it:
+    the columns they authored ride onto the reservation and are re-applied at the
+    new address."""
+    from app.services.dhcp import pull_leases as pl
+
+    srv, scope, subnet = await _fixture(db_session)
+    await _make_ui_reservation(db_session, scope)
+    mirror = await _mirror(db_session, subnet, "10.20.0.10")
+    assert mirror is not None
+    mirror.description = "rack 4, port 12"
+    mirror.tags = {"owner": "lab"}
+    await db_session.commit()
+
+    _patch(monkeypatch, [wire_scope(statics=[wire_static(ip="10.20.0.77")])])
+    await pl.pull_leases_from_server(db_session, srv, apply=True)
+    await db_session.commit()
+
+    moved = await _mirror(db_session, subnet, "10.20.0.77")
+    assert moved is not None
+    assert moved.description == "rack 4, port 12"
+    assert moved.tags == {"owner": "lab"}
+
+
+@pytest.mark.asyncio
+async def test_hostname_cleared_on_the_wire_clears_in_ipam(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An operator clearing a reservation's Name on the server has to converge.
+    `row.hostname = st.hostname or row.hostname` made an empty name
+    unrepresentable — the mirror kept the old one and re-published its A record,
+    forever."""
+    from app.services.dhcp import pull_leases as pl
+
+    srv, scope, subnet = await _fixture(db_session)
+    await _make_ui_reservation(db_session, scope)
+    await db_session.commit()
+
+    _patch(monkeypatch, [wire_scope(statics=[wire_static(hostname="")])])
+    result = await pl.pull_leases_from_server(db_session, srv, apply=True)
+    await db_session.commit()
+
+    assert result.statics_synced == 1
+    mirror = await _mirror(db_session, subnet, "10.20.0.10")
+    assert mirror is not None
+    assert mirror.hostname in (None, "")
+
+
+@pytest.mark.asyncio
+async def test_pool_created_mid_poll_is_not_absence_deleted(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same snapshot reasoning as reservations. A pool an operator added while the
+    poll was in flight is absent from a wire that never saw it — deleting it takes
+    IPAM's dynamic-range protection away, so an operator can allocate an address
+    the DHCP server is actively handing out."""
+    from datetime import UTC, datetime, timedelta
+
+    from app.services.dhcp import pull_leases as pl
+
+    srv, scope, _subnet = await _fixture(db_session)
+    fresh = DHCPPool(
+        scope_id=scope.id,
+        start_ip="10.20.0.5",
+        end_ip="10.20.0.6",
+        pool_type="excluded",
+        name="",
+    )
+    db_session.add(fresh)
+    await db_session.flush()
+    fresh.created_at = datetime.now(UTC) + timedelta(minutes=5)
+    await db_session.commit()
+
+    # Wire reports only the dynamic pool — the new exclusion isn't on it yet.
+    _patch(monkeypatch, [wire_scope()])
+    result = await pl.pull_leases_from_server(db_session, srv, apply=True)
+    await db_session.commit()
+
+    assert result.pools_removed == 0
+    assert await db_session.get(DHCPPool, fresh.id) is not None

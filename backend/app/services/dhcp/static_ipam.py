@@ -40,7 +40,7 @@ import uuid
 from datetime import date, datetime
 from typing import Any
 
-from sqlalchemy import String, cast, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.dhcp import DHCPScope, DHCPStaticAssignment
@@ -128,14 +128,27 @@ async def upsert_ipam_for_static(
     subnet view shows the reservation alongside regular addresses.
     """
     ip_str = str(st.ip_address)
-    # Detach any previous IPAM row that was pointing at this static (IP change).
+    # Release any previous IPAM row this static was pointing at (its address
+    # changed). Freeing the row it left behind — rather than downgrading it to
+    # ``allocated``, which is what this did before #620 — because an
+    # ``allocated`` row with no owner is reclaimed by NOTHING: the orphan sweep
+    # only looks at ``static_dhcp`` rows, and the lease-mirror path skips rows it
+    # doesn't own. Every reservation re-address leaked its old address into a
+    # permanently-allocated ghost, and the Windows reconciler now re-addresses
+    # reservations on its own, so a renumber on the server would leak one address
+    # per reservation. Deleting the row also snapshots the operator's columns
+    # onto the reservation, which the restore below re-applies at the new
+    # address — so a move carries them across instead of stranding them.
     prior = await db.execute(select(IPAddress).where(IPAddress.static_assignment_id == str(st.id)))
     for row in prior.scalars().all():
         if str(row.address) == ip_str:
             continue
-        row.static_assignment_id = None
         if row.status == "static_dhcp":
-            row.status = "allocated"
+            await _delete_mirror_row(db, row, st)
+        else:
+            # Not ours to delete — an operator re-purposed the row's status. Just
+            # drop the back-link so it can't dangle.
+            row.static_assignment_id = None
     # Find or create the IPAM row for this IP within the scope's subnet.
     res = await db.execute(
         select(IPAddress).where(IPAddress.subnet_id == scope.subnet_id, IPAddress.address == ip_str)
@@ -150,7 +163,12 @@ async def upsert_ipam_for_static(
         # uq_ip_address_subnet_address.
         candidate = IPAddress(subnet_id=scope.subnet_id, address=ip_str, status="static_dhcp")
         row, _created = await insert_ipam_mirror_row(db, candidate)
-    row.hostname = st.hostname or row.hostname
+    # Assigned outright, not ``st.hostname or row.hostname``: the reservation is
+    # the source of truth for the hostname (as it already is for the MAC, right
+    # below), and the ``or`` made an empty one unrepresentable — clearing a
+    # reservation's name left the mirror on the old name and re-published the
+    # stale A record off it, with no number of polls able to converge them.
+    row.hostname = st.hostname
     row.mac_address = str(st.mac_address)
     row.status = "static_dhcp"
     row.static_assignment_id = str(st.id)
@@ -293,26 +311,20 @@ async def sweep_orphaned_static_mirrors(db: AsyncSession, *, limit: int = 500) -
 
     Returns the number of mirror rows freed.
     """
-    # Query the reservation table through its Core ``__table__`` so the ORM's
-    # soft-delete filter doesn't silently inject a second ``deleted_at IS NULL``
-    # — the liveness predicate here is explicit and needs to stay that way.
-    sa_tbl = DHCPStaticAssignment.__table__
-    live_reservation = (
-        select(sa_tbl.c.id)
-        .where(
-            cast(sa_tbl.c.id, String) == IPAddress.static_assignment_id,
-            sa_tbl.c.deleted_at.is_(None),
-        )
-        .exists()
-    )
-    rows = (
+    # Two indexed queries rather than one correlated NOT EXISTS. The obvious
+    # anti-join has to compare a uuid column against a varchar one, and the
+    # ``cast(reservation.id AS text)`` that makes that typecheck also makes the
+    # reservation table's primary-key index unusable — so Postgres re-scans it
+    # for every candidate row, on a task that runs hourly forever and finds
+    # nothing on a healthy install. Resolving the back-links in a second query
+    # keyed on the uuid column keeps the PK index in play.
+    candidates = (
         (
             await db.execute(
                 select(IPAddress)
                 .where(
                     IPAddress.status == "static_dhcp",
                     IPAddress.static_assignment_id.is_not(None),
-                    ~live_reservation,
                 )
                 .limit(limit)
             )
@@ -320,12 +332,51 @@ async def sweep_orphaned_static_mirrors(db: AsyncSession, *, limit: int = 500) -
         .scalars()
         .all()
     )
+    if not candidates:
+        return 0
+
+    # A back-link that doesn't parse as a uuid can name no reservation at all, so
+    # it is residue by definition — keep it in the candidate set (mapped to None)
+    # rather than letting it slip through the liveness check unexamined.
+    parsed: list[tuple[IPAddress, uuid.UUID | None]] = [
+        (row, _parse_uuid(row.static_assignment_id)) for row in candidates
+    ]
+    wanted = {static_id for _row, static_id in parsed if static_id is not None}
+
+    # Core ``__table__`` so the ORM's soft-delete filter doesn't silently inject a
+    # second ``deleted_at IS NULL`` — the liveness predicate is explicit here and
+    # needs to stay that way.
+    sa_tbl = DHCPStaticAssignment.__table__
+    live: set[uuid.UUID] = set()
+    if wanted:
+        live = {
+            row_id
+            for (row_id,) in (
+                await db.execute(
+                    select(sa_tbl.c.id).where(
+                        sa_tbl.c.id.in_(wanted),
+                        sa_tbl.c.deleted_at.is_(None),
+                    )
+                )
+            ).all()
+        }
 
     freed = 0
-    for row in rows:
+    for row, static_id in parsed:
+        if static_id is not None and static_id in live:
+            continue
         await _delete_mirror_row(db, row, await _load_reservation_any(db, row.static_assignment_id))
         freed += 1
     return freed
+
+
+def _parse_uuid(raw: str | None) -> uuid.UUID | None:
+    if not raw:
+        return None
+    try:
+        return uuid.UUID(raw)
+    except (ValueError, TypeError):
+        return None
 
 
 async def _load_reservation_any(
@@ -337,11 +388,8 @@ async def _load_reservation_any(
     the common case for the sweep, whose whole subject is back-links pointing at
     reservations that no longer exist.
     """
-    if not raw_id:
-        return None
-    try:
-        static_id = uuid.UUID(raw_id)
-    except (ValueError, TypeError):
+    static_id = _parse_uuid(raw_id)
+    if static_id is None:
         return None
     return (
         await db.execute(
