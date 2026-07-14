@@ -18,6 +18,7 @@ celery_app = Celery(
         "app.tasks.dhcp_health",
         "app.tasks.dhcp_lease_cleanup",
         "app.tasks.dhcp_mac_blocks",
+        "app.tasks.dhcp_mirror_sweep",
         "app.tasks.dhcp_pull_leases",
         "app.tasks.alerts",
         "app.tasks.conformity",
@@ -91,6 +92,7 @@ celery_app.conf.update(
         "app.tasks.dhcp_health.*": {"queue": "dhcp"},
         "app.tasks.dhcp_lease_cleanup.*": {"queue": "dhcp"},
         "app.tasks.dhcp_mac_blocks.*": {"queue": "dhcp"},
+        "app.tasks.dhcp_mirror_sweep.*": {"queue": "dhcp"},
         "app.tasks.dhcp_pull_leases.*": {"queue": "dhcp"},
         "app.tasks.alerts.*": {"queue": "default"},
         "app.tasks.heartbeat.*": {"queue": "default"},
@@ -182,6 +184,13 @@ celery_app.conf.update(
         "dhcp-lease-cleanup": {
             "task": "app.tasks.dhcp_lease_cleanup.sweep_expired_leases",
             "schedule": schedule(run_every=300.0),
+        },
+        # Hourly backstop for reservation mirrors no release path freed (#620).
+        # A healthy install frees nothing here, so the cadence only bounds how
+        # long a stranded address stays stuck — it is not on any hot path.
+        "dhcp-mirror-sweep": {
+            "task": "app.tasks.dhcp_mirror_sweep.sweep_orphaned_mirrors",
+            "schedule": schedule(run_every=3600.0),
         },
         # Every 60 s, tick the IPAM↔DNS auto-sync task. The task itself
         # checks ``PlatformSettings.dns_auto_sync_enabled`` and the per-run

@@ -265,6 +265,14 @@ Three things the merge deliberately refuses to do:
 
 `PullLeasesResult` reports `scopes_imported` / `scopes_refreshed` / `scopes_skipped_no_subnet` plus `pools_synced` / `statics_synced` (created **or changed**) and `pools_removed` / `statics_removed`. Because the merge is a diff, a steady-state poll reports zeros.
 
+### The orphaned-mirror backstop
+
+A reservation owns its `ip_address` mirror by id, and every path that destroys a reservation is responsible for releasing that mirror first. When one doesn't, the result is nasty out of proportion to the mistake: the address sits at `status="static_dhcp"` pointing at a row Postgres has dropped, so it is neither allocated nor free, nothing hands it out, and *no amount of clicking in the UI frees it* — every release path looks the mirror up by the reservation's current id and matches nothing. It took a one-shot repair migration (`d7b3f2a9c15e`) to clear the last batch.
+
+So there is a recurring backstop: `app.tasks.dhcp_mirror_sweep.sweep_orphaned_mirrors`, hourly, which is that migration's step 1 made permanent. It frees any `static_dhcp` row whose **non-NULL** back-link resolves to no live reservation, deleting the row (a freed-but-persisted row still renders in the subnet table and still counts toward utilization) after tearing down its DNS. If the reservation is merely soft-deleted, the operator-authored columns are snapshotted onto it first so a Trash restore stays lossless.
+
+The predicate is deliberately narrow: a `static_dhcp` row with a **NULL** back-link is left alone, because an operator can set that status by hand and a sweep that deletes hand-made rows is worse than the bug it fixes. On a healthy install it matches nothing and writes nothing — so a non-zero `mirrors_freed` (logged at WARNING, and audited) is itself the signal that some path is still skipping its mirror release.
+
 ### Batched WinRM writes
 
 Per-object writes against Windows DHCP used to round-trip WinRM **per reservation / exclusion** — a bulk delete of 200 reservations took minutes. The driver now groups writes into a single PowerShell script per `(server, scope)` chunk.

@@ -40,7 +40,7 @@ import uuid
 from datetime import date, datetime
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import String, cast, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.dhcp import DHCPScope, DHCPStaticAssignment
@@ -52,6 +52,7 @@ __all__ = [
     "remirror_scope_statics",
     "remove_ipam_for_scope_statics",
     "remove_ipam_for_static",
+    "sweep_orphaned_static_mirrors",
     "upsert_ipam_for_static",
 ]
 
@@ -223,30 +224,132 @@ async def remove_ipam_for_static(db: AsyncSession, st: DHCPStaticAssignment) -> 
     the wholesale reservation-removal paths (scope / group / import / purge).
     Returns the number of rows removed.
     """
-    from app.api.v1.ipam.router import _sync_dns_record  # noqa: PLC0415
-
     res = await db.execute(select(IPAddress).where(IPAddress.static_assignment_id == str(st.id)))
     removed = 0
     for row in res.scalars().all():
+        await _delete_mirror_row(db, row, st)
+        removed += 1
+    return removed
+
+
+async def _delete_mirror_row(
+    db: AsyncSession, row: IPAddress, st: DHCPStaticAssignment | None
+) -> None:
+    """Tear down a mirror row's DNS and delete it.
+
+    ``st`` is the reservation the row mirrors, when we still have it — the
+    orphan sweep calls this for rows whose reservation is *gone*, so it passes
+    ``None`` and simply skips the parts that need one.
+    """
+    from app.api.v1.ipam.router import _sync_dns_record  # noqa: PLC0415
+
+    if st is not None:
         # Snapshot operator-authored columns onto the (soft-deleted, retained)
         # reservation before we hard-delete the mirror, so a Trash restore is
         # lossless (#630). The last mirror row wins — there is realistically one.
         snapshot = _snapshot_operator_fields(row)
         if snapshot is not None:
             st.ipam_metadata_snapshot = snapshot
-        subnet_row = await db.get(Subnet, row.subnet_id)
-        if subnet_row is not None:
-            try:
-                await _sync_dns_record(db, row, subnet_row, action="delete")
-            except Exception:  # noqa: BLE001 — DNS sync is best-effort
-                pass
-        # Clear the forward FK before the delete so the ORM's in-memory
-        # ``st`` doesn't hang onto a stale id (the DB FK is ON DELETE SET NULL).
+        # Clear the forward FK before the delete so the ORM's in-memory ``st``
+        # doesn't hang onto a stale id (the DB FK is ON DELETE SET NULL).
         if st.ip_address_id == row.id:
             st.ip_address_id = None
-        await db.delete(row)
-        removed += 1
-    return removed
+
+    subnet_row = await db.get(Subnet, row.subnet_id)
+    if subnet_row is not None:
+        try:
+            await _sync_dns_record(db, row, subnet_row, action="delete")
+        except Exception:  # noqa: BLE001 — DNS sync is best-effort
+            pass
+    await db.delete(row)
+
+
+async def sweep_orphaned_static_mirrors(db: AsyncSession, *, limit: int = 500) -> int:
+    """Free ``ip_address`` rows stuck at ``static_dhcp`` with no live reservation.
+
+    The safety net under every path that destroys a reservation. Those paths are
+    all supposed to release the mirror first (#618 wired the ones that didn't,
+    #620 fixed the Windows reconciler that re-created reservations under new ids
+    and orphaned theirs). But the failure mode is nasty and silent — the address
+    is left neither allocated nor free nor reclaimable by any sweeper, and no
+    amount of clicking in the UI frees it, because every release path looks the
+    mirror up by the *current* reservation id and matches nothing — so it is
+    worth being able to recover from without an operator noticing first, and
+    without another one-shot repair migration (``d7b3f2a9c15e`` was the last
+    one). This is that migration's step 1, made recurring.
+
+    Deliberately narrow. Only rows carrying a **non-NULL** back-link that
+    resolves to no live reservation are touched: that state is unreachable by
+    any legitimate flow, so it is provably residue. A ``static_dhcp`` row with a
+    NULL back-link is left alone — an operator can set that status by hand, and
+    a sweeper that deletes hand-made rows is worse than the bug it fixes.
+
+    "Live" excludes soft-deleted reservations, matching ``d7b3f2a9c15e``: a
+    scope in the Trash has already had its mirrors removed (#618) and gets them
+    re-created on restore, so a mirror still pointing at a soft-deleted
+    reservation is residue too — and when that reservation is still around to
+    hold it, the operator's columns are snapshotted onto it first, so the
+    restore stays lossless.
+
+    Returns the number of mirror rows freed.
+    """
+    # Query the reservation table through its Core ``__table__`` so the ORM's
+    # soft-delete filter doesn't silently inject a second ``deleted_at IS NULL``
+    # — the liveness predicate here is explicit and needs to stay that way.
+    sa_tbl = DHCPStaticAssignment.__table__
+    live_reservation = (
+        select(sa_tbl.c.id)
+        .where(
+            cast(sa_tbl.c.id, String) == IPAddress.static_assignment_id,
+            sa_tbl.c.deleted_at.is_(None),
+        )
+        .exists()
+    )
+    rows = (
+        (
+            await db.execute(
+                select(IPAddress)
+                .where(
+                    IPAddress.status == "static_dhcp",
+                    IPAddress.static_assignment_id.is_not(None),
+                    ~live_reservation,
+                )
+                .limit(limit)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    freed = 0
+    for row in rows:
+        await _delete_mirror_row(db, row, await _load_reservation_any(db, row.static_assignment_id))
+        freed += 1
+    return freed
+
+
+async def _load_reservation_any(
+    db: AsyncSession, raw_id: str | None
+) -> DHCPStaticAssignment | None:
+    """Load a reservation by its back-link string, soft-deleted ones included.
+
+    Returns ``None`` when the id doesn't parse or names no row at all — which is
+    the common case for the sweep, whose whole subject is back-links pointing at
+    reservations that no longer exist.
+    """
+    if not raw_id:
+        return None
+    try:
+        static_id = uuid.UUID(raw_id)
+    except (ValueError, TypeError):
+        return None
+    return (
+        await db.execute(
+            select(DHCPStaticAssignment)
+            .where(DHCPStaticAssignment.id == static_id)
+            .execution_options(include_deleted=True)
+        )
+    ).scalar_one_or_none()
 
 
 async def remove_ipam_for_scope_statics(db: AsyncSession, scope_id: uuid.UUID) -> int:
