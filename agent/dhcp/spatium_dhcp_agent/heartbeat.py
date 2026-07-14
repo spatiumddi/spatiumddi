@@ -25,6 +25,9 @@ class HeartbeatClient:
         self.daemon_status: dict[str, Any] = {}
         self.lease_count_since_start = 0
         self.pending_acks: list[dict] = []
+        # #637 — cached Kea daemon version. See _kea_version(); immutable for the
+        # life of this process, so it is probed until it answers and then reused.
+        self._kea_version_cached: str | None = None
 
     def stop(self) -> None:
         self._stop.set()
@@ -37,10 +40,21 @@ class HeartbeatClient:
         )
 
     def _kea_version(self) -> str | None:
-        sock = getattr(self.cfg, "kea_control_socket", None)
-        if sock is None:
-            return None
-        return kea_ctrl.version_get(sock)
+        """Running Kea daemon version, probed once and cached.
+
+        The Kea binary cannot change while this process lives — a new image means
+        a new container, which restarts the agent too. So probe until we get an
+        answer, then stop: re-opening the control socket on every heartbeat would
+        be a blocking round-trip (``send_command`` waits up to 10s) on the very
+        thread that carries our liveness signal, and a wedged Kea would stall the
+        heartbeat rather than merely failing to report a version.
+
+        Stays None-and-retrying until the daemon first answers, which covers the
+        cold-start window where the agent is up before Kea's socket is.
+        """
+        if self._kea_version_cached is None:
+            self._kea_version_cached = kea_ctrl.version_get(self.cfg.kea_control_socket)
+        return self._kea_version_cached
 
     def send_once(self) -> None:
         # Drain queued op acks (queued by SyncLoop when bundle includes pending_ops).

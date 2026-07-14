@@ -467,12 +467,27 @@ Two things make this visible rather than a surprise:
 
    | Condition | Level | Why |
    |---|---|---|
-   | Members of one HA group already on different Kea majors | `fail` | HA lease sync is broken *now*; an upgrade isn't the fix. |
+   | Members of one HA group already on different Kea majors | `warn` | HA lease sync is broken *now* — and finishing the upgrade is what converges them. |
    | An HA group is on pre-3.0 Kea | `warn` | This run will cross the boundary node-at-a-time; HA degrades until it completes. |
    | A member has never reported a version | `warn` | Unknown, so we can't rule out the crossing. |
    | Every member already on Kea ≥ 3 | `ok` | Nothing to do — and the check self-clears, so it isn't a permanent nag. |
 
-The crossing case is deliberately a **`warn`, not a `fail`**: DHCP keeps serving
-throughout (each Kea answers from its own lease store), and only the HA
-replication *between* the peers is disrupted. Blocking an informed operator would
-be worse than letting them proceed.
+Two pieces of scoping keep the check honest, and getting either wrong turns it
+into something that blocks unrelated work:
+
+* **Appliance nodes only.** The orchestrator never touches docker / k8s DHCP
+  agents (they upgrade through the manual copy-paste path), so counting them
+  would let two unrelated containers veto an appliance-cluster upgrade.
+  `deployment_kind` is matched strictly against `appliance`.
+* **Real HA pairs only.** HA is *not* "≥ 2 Kea members" — `_resolve_failover`
+  renders the HA hook only when there are ≥ 2 Kea members **and every one has a
+  non-empty `ha_peer_url`**. Without a URL there is no HA relationship and
+  nothing for an upgrade to disrupt. The check uses the same predicate, or it
+  would invent pairs the renderer never built.
+
+**The check never returns `fail`.** A `fail` sets `can_start=False`, and blocking
+would be exactly backwards: an already-mixed pair has broken HA *right now*, and
+completing the rolling upgrade is what gets both members onto one version.
+Refusing to start would strand the operator in the broken state. DHCP also keeps
+serving throughout (each Kea answers from its own lease store) — only the HA
+replication *between* peers is disrupted.

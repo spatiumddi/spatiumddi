@@ -302,9 +302,15 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
     # Issue #637 — Kea lease cache, group-wide default. 0.0 (disabled) both when
     # there is no group and when the column is unset, so the 2.6 → 3.0 jump keeps
     # the old write-through behaviour instead of inheriting Kea 3.0's 0.25.
-    lease_cache_threshold = (
-        float(getattr(group, "lease_cache_threshold", 0.0) or 0.0) if group else 0.0
-    )
+    #
+    # Note the explicit ``is None`` test rather than ``or 0.0``: 0.0 is a REAL
+    # value for this column (caching deliberately off), and every other layer is
+    # written to distinguish it from "unset". A truthiness coalesce happens to be
+    # harmless while the column is NOT NULL, but it would silently swallow a NULL
+    # into 0.0 the moment it becomes nullable — breaking the one invariant this
+    # feature's tests exist to protect.
+    _group_threshold = getattr(group, "lease_cache_threshold", None) if group else None
+    lease_cache_threshold = 0.0 if _group_threshold is None else float(_group_threshold)
     lease_cache_max_age = getattr(group, "lease_cache_max_age", None) if group else None
 
     bundle = ConfigBundle(

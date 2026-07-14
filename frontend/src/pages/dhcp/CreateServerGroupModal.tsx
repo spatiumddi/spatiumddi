@@ -47,6 +47,29 @@ export function CreateServerGroupModal({
 
   const mut = useMutation({
     mutationFn: () => {
+      // #637 — validate client-side so an out-of-range threshold surfaces as an
+      // inline message instead of a raw 422, matching CreateScopeModal's handling
+      // of the same field. Blank threshold falls back to 0 (caching disabled);
+      // blank max-age means uncapped, which the API models as null.
+      const parsedCacheThreshold =
+        leaseCacheThreshold.trim() === "" ? 0 : parseFloat(leaseCacheThreshold);
+      const parsedCacheMaxAge =
+        leaseCacheMaxAge.trim() === "" ? null : parseInt(leaseCacheMaxAge, 10);
+
+      if (
+        Number.isNaN(parsedCacheThreshold) ||
+        parsedCacheThreshold < 0 ||
+        parsedCacheThreshold > 1
+      ) {
+        throw new Error("Lease cache threshold must be between 0 and 1.");
+      }
+      if (
+        parsedCacheMaxAge !== null &&
+        (Number.isNaN(parsedCacheMaxAge) || parsedCacheMaxAge < 1)
+      ) {
+        throw new Error("Lease cache max age must be at least 1 second.");
+      }
+
       const data = {
         name,
         description,
@@ -57,10 +80,8 @@ export function CreateServerGroupModal({
         max_ack_delay_ms: parseInt(maxAck, 10) || 10000,
         max_unacked_clients: parseInt(maxUnacked, 10) || 5,
         auto_failover: autoFailover,
-        lease_cache_threshold: parseFloat(leaseCacheThreshold) || 0,
-        lease_cache_max_age: leaseCacheMaxAge
-          ? parseInt(leaseCacheMaxAge, 10)
-          : null,
+        lease_cache_threshold: parsedCacheThreshold,
+        lease_cache_max_age: parsedCacheMaxAge,
       };
       return editing
         ? dhcpApi.updateGroup(group!.id, data)

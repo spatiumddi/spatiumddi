@@ -279,10 +279,15 @@ def _apply_lease_cache(out: dict[str, Any], scope: dict[str, Any]) -> None:
     IPAM lease mirror), so the control plane renders an explicit value rather
     than inheriting Kea's default.
 
-    ``None`` means the scope inherits the group-wide value, which the caller has
-    already resolved. **0.0 is a real value** (caching explicitly disabled — the
-    pre-3.0 behaviour), so this guards on ``is not None``; a truthiness check
-    would drop it and silently re-enable Kea's 0.25 default.
+    ``None`` means "inherit the group". Nothing resolves that here: the key is
+    simply OMITTED from the subnet, and Kea itself falls back to the
+    ``cache-threshold`` / ``cache-max-age`` emitted on the ``Dhcp4`` / ``Dhcp6``
+    root. Do not "fix" this by coalescing None to the group value at the call
+    site — the absence of the key IS the inheritance mechanism.
+
+    **0.0 is a real value** (caching explicitly disabled — the pre-3.0
+    behaviour), so this guards on ``is not None``; a truthiness check would drop
+    it and the subnet would silently inherit the group's threshold instead.
     """
     threshold = scope.get("lease_cache_threshold")
     if threshold is not None:
