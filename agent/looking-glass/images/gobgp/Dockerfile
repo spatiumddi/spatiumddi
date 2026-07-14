@@ -10,7 +10,7 @@
 # from every configured peer but can never advertise one back.
 ARG GOBGP_VERSION=4.7.0
 
-FROM alpine:3.22 AS agent-build
+FROM alpine:3.23 AS agent-build
 RUN apk add --no-cache python3 py3-pip py3-wheel
 WORKDIR /src
 COPY agent/looking-glass/pyproject.toml /src/pyproject.toml
@@ -53,7 +53,7 @@ RUN GOOS="${TARGETOS:-linux}" GOARCH="${TARGETARCH}" \
  && GOOS="${TARGETOS:-linux}" GOARCH="${TARGETARCH}" \
       go build -trimpath -ldflags="-s -w" -o /out/gobgp ./cmd/gobgp
 
-FROM alpine:3.22 AS runtime
+FROM alpine:3.23 AS runtime
 # ``libcap`` brings in ``setcap`` so gobgpd can bind BGP's privileged
 # TCP/179 as the unprivileged ``spatium`` user (same pattern as
 # kea-dhcp4/6 + named/pdns_server in the DHCP/DNS images — a

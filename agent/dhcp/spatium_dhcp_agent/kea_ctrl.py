@@ -91,3 +91,33 @@ def config_test(socket_path: Path, config_doc: dict[str, Any]) -> None:
             return
         raise
     log.info("kea_config_test_ok")
+
+
+def version_get(socket_path: Path) -> str | None:
+    """Return the running kea-dhcp4 daemon's version (e.g. ``"3.0.3"``).
+
+    Issue #637. The control plane needs to know which Kea MAJOR each member of
+    an HA pair is running, because Kea 3.0's HA hook is wire-incompatible with
+    peers older than 2.7.0 (3.0 introduced the "released" lease state, value 3,
+    in the lease updates exchanged between partners, and older peers reject
+    them). There is therefore no rolling 2.6 → 3.0 HA upgrade: both members must
+    cross in the same window. The rolling-upgrade preflight uses this to tell the
+    operator *before* they start, instead of after HA has fallen over.
+
+    Reported as ``kea_version`` on the heartbeat. Returns None if the daemon
+    isn't up yet or doesn't answer — the caller must treat that as "unknown",
+    not as "old".
+    """
+    try:
+        resp = send_command(socket_path, "version-get")
+    except (KeaCtrlError, OSError) as e:
+        # Socket not ready (cold start) or command refused. Not fatal — the
+        # heartbeat simply reports no version this tick and retries next one.
+        log.debug("kea_version_get_failed", socket=str(socket_path), error=str(e))
+        return None
+    text = resp.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return None
+    # ``version-get`` answers with the bare version in ``text`` (e.g. "3.0.3"),
+    # sometimes with a trailing build/extended blob after a newline.
+    return text.strip().splitlines()[0].strip() or None

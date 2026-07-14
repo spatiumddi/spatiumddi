@@ -243,6 +243,11 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
                 address_family=getattr(sc, "address_family", "ipv4") or "ipv4",
                 v6_address_mode=getattr(sc, "v6_address_mode", "stateful") or "stateful",
                 relay_addresses=tuple(getattr(sc, "relay_addresses", None) or ()),
+                # #637 — per-scope lease-cache override. NULL in the DB means
+                # "inherit the group", so pass None through verbatim; 0.0 is a
+                # real value (caching explicitly off) and must not be coalesced.
+                lease_cache_threshold=getattr(sc, "lease_cache_threshold", None),
+                lease_cache_max_age=getattr(sc, "lease_cache_max_age", None),
             )
         )
 
@@ -293,6 +298,15 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
     # render an empty bundle anyway, but default them to ``raw`` too.
     socket_mode = getattr(group, "dhcp_socket_mode", "direct") if group else "direct"
     dhcp_socket_type = "udp" if socket_mode == "relay" else "raw"
+
+    # Issue #637 — Kea lease cache, group-wide default. 0.0 (disabled) both when
+    # there is no group and when the column is unset, so the 2.6 → 3.0 jump keeps
+    # the old write-through behaviour instead of inheriting Kea 3.0's 0.25.
+    lease_cache_threshold = (
+        float(getattr(group, "lease_cache_threshold", 0.0) or 0.0) if group else 0.0
+    )
+    lease_cache_max_age = getattr(group, "lease_cache_max_age", None) if group else None
+
     bundle = ConfigBundle(
         server_id=str(server.id),
         server_name=server.name,
@@ -307,6 +321,8 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
         generated_at=datetime.now(UTC),
         failover=failover,
         dhcp_socket_type=dhcp_socket_type,
+        lease_cache_threshold=lease_cache_threshold,
+        lease_cache_max_age=lease_cache_max_age,
         ra_configs=tuple(ra_configs),
         radvd_conf=radvd_conf,
     )

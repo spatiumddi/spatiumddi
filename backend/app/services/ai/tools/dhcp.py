@@ -109,6 +109,13 @@ async def list_dhcp_scopes(
             "name": s.name,
             "address_family": s.address_family,
             "v6_address_mode": getattr(s, "v6_address_mode", "stateful"),
+            # #637 — per-scope Kea lease-cache override; null = inherits the
+            # group. Lets the copilot answer "why did this client's lease stop
+            # refreshing / why is its DDNS record stale?" — a non-zero cache
+            # threshold means Kea reuses the lease without a database write, so
+            # no lease-event reaches DDNS or the IPAM mirror.
+            "lease_cache_threshold": s.lease_cache_threshold,
+            "lease_cache_max_age": s.lease_cache_max_age,
         }
         for s in rows
     ]
@@ -230,9 +237,13 @@ class ListServerGroupsArgs(BaseModel):
     description=(
         "List DHCP server groups (logical bundles of Kea servers, "
         "with HA implicit when the group has ≥ 2 members). Each "
-        "summary includes name, member count, DDNS toggle, and "
+        "summary includes name, member count, DDNS toggle, "
         "dhcp_socket_mode ('direct' = raw sockets that hear broadcast "
-        "DISCOVERs from on-LAN clients; 'relay' = udp, relay-only)."
+        "DISCOVERs from on-LAN clients; 'relay' = udp, relay-only), and the "
+        "group-wide Kea lease cache (lease_cache_threshold 0.0 = disabled / "
+        "every renewal writes through; > 0 = Kea reuses a lease without a "
+        "database write, which suppresses lease-events and can leave DDNS "
+        "records and IPAM last-seen timestamps stale)."
     ),
     args_model=ListServerGroupsArgs,
     category="dhcp",
@@ -259,6 +270,11 @@ async def list_dhcp_server_groups(
                 # "relay" (udp sockets, relay-only). Helps the copilot answer
                 # "why isn't this DHCP server replying to direct clients?".
                 "dhcp_socket_mode": g.dhcp_socket_mode,
+                # #637 — group-wide Kea lease cache. 0.0 = disabled (the Kea 2.6
+                # write-through behaviour we default to); Kea 3.0's own default
+                # would be 0.25. Scopes may override this individually.
+                "lease_cache_threshold": g.lease_cache_threshold,
+                "lease_cache_max_age": g.lease_cache_max_age,
                 "member_count": int(member_count or 0),
             }
         )

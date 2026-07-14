@@ -22,7 +22,7 @@ maintainers:
   - name: SpatiumDDI Contributors
 # No subchart dependencies. Postgres + Redis ship as plain
 # StatefulSet + Service templates owned by this chart, using the
-# official ``postgres:16-alpine`` and ``redis:8.6-alpine`` images
+# official ``postgres:16-alpine`` and ``redis:8.8-alpine`` images
 # (the same ones docker-compose.yml uses). The bundled subcharts
 # previously came from the Bitnami chart family, but Bitnami pruned
 # the ``bitnami/*`` Docker Hub namespace in late 2025 in favour of

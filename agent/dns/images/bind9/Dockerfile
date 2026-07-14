@@ -3,14 +3,14 @@
 # Multi-arch: linux/amd64, linux/arm64 (non-negotiable #11)
 ARG PYTHON_VERSION=3.12
 
-FROM alpine:3.22 AS agent-build
+FROM alpine:3.23 AS agent-build
 RUN apk add --no-cache python3 py3-pip py3-wheel
 WORKDIR /src
 COPY agent/dns/pyproject.toml /src/pyproject.toml
 COPY agent/dns/spatium_dns_agent /src/spatium_dns_agent
 RUN python3 -m pip install --prefix=/install --no-cache-dir --break-system-packages .
 
-FROM alpine:3.22 AS runtime
+FROM alpine:3.23 AS runtime
 # ``libcap`` brings in ``setcap`` so we can grant ``named`` the
 # CAP_NET_BIND_SERVICE file capability — without it, the unprivileged
 # ``spatium`` user the entrypoint drops to can't bind port 53 (named

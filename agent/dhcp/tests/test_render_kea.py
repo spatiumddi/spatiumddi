@@ -693,3 +693,89 @@ def test_legacy_subnets_relay_ips_still_render() -> None:
     assert render(bundle)["Dhcp4"]["subnet4"][0]["relay"] == {
         "ip-addresses": ["10.60.0.1"]
     }
+
+
+# ── Kea lease cache (#637) ─────────────────────────────────────────────
+
+
+def _lc_bundle(
+    *,
+    group_threshold: float | None = None,
+    group_max_age: int | None = None,
+    scope_threshold: float | None = None,
+    scope_max_age: int | None = None,
+) -> dict:
+    """Wire bundle carrying the lease-cache keys agents.py now serializes."""
+    server: dict = {"interfaces": ["*"], "dhcp_socket_type": "raw"}
+    if group_threshold is not None:
+        server["lease_cache_threshold"] = group_threshold
+    if group_max_age is not None:
+        server["lease_cache_max_age"] = group_max_age
+    return {
+        "server": server,
+        "scopes": [
+            {
+                "subnet_cidr": "10.37.0.0/24",
+                "lease_time": 3600,
+                "pools": [
+                    {
+                        "start_ip": "10.37.0.10",
+                        "end_ip": "10.37.0.99",
+                        "pool_type": "dynamic",
+                    }
+                ],
+                "statics": [],
+                "lease_cache_threshold": scope_threshold,
+                "lease_cache_max_age": scope_max_age,
+            }
+        ],
+    }
+
+
+def test_lease_cache_defaults_to_explicit_zero() -> None:
+    """Kea 3.0 defaults cache-threshold to 0.25. The renderer must emit an
+    explicit 0.0 rather than omitting the key, or upgrading installs silently
+    start caching leases — which suppresses the memfile writes that drive
+    lease-events → DDNS + the IPAM lease mirror."""
+    out = render(_lc_bundle())
+    assert out["Dhcp4"]["cache-threshold"] == 0.0
+    assert out["Dhcp6"]["cache-threshold"] == 0.0
+
+
+def test_lease_cache_group_threshold_renders() -> None:
+    out = render(_lc_bundle(group_threshold=0.25))
+    assert out["Dhcp4"]["cache-threshold"] == 0.25
+
+
+def test_lease_cache_group_max_age_renders_when_set() -> None:
+    out = render(_lc_bundle(group_threshold=0.25, group_max_age=900))
+    assert out["Dhcp4"]["cache-max-age"] == 900
+    assert out["Dhcp6"]["cache-max-age"] == 900
+
+
+def test_lease_cache_group_max_age_absent_when_unset() -> None:
+    out = render(_lc_bundle(group_threshold=0.25))
+    assert "cache-max-age" not in out["Dhcp4"]
+
+
+def test_lease_cache_scope_without_override_inherits_group() -> None:
+    out = render(_lc_bundle(group_threshold=0.25))
+    assert "cache-threshold" not in out["Dhcp4"]["subnet4"][0]
+
+
+def test_lease_cache_scope_override_renders() -> None:
+    out = render(_lc_bundle(group_threshold=0.25, scope_threshold=0.5))
+    assert out["Dhcp4"]["subnet4"][0]["cache-threshold"] == 0.5
+
+
+def test_lease_cache_scope_override_of_zero_survives() -> None:
+    """0.0 is a REAL value (caching explicitly off for this scope) while the
+    group has it on. ``if scope.get(...)`` truthiness would drop it and the
+    scope would silently inherit the group's 0.25 — the exact bug this guards."""
+    out = render(_lc_bundle(group_threshold=0.25, scope_threshold=0.0))
+    assert out["Dhcp4"]["subnet4"][0]["cache-threshold"] == 0.0
+
+
+def test_lease_cache_scope_max_age_override_renders() -> None:
+    out = render(_lc_bundle(group_threshold=0.25, scope_threshold=0.5, scope_max_age=120))
+    assert out["Dhcp4"]["subnet4"][0]["cache-max-age"] == 120

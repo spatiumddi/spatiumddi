@@ -79,8 +79,6 @@ services:
       # for heartbeats + lease updates. Expose if the partner is on
       # a different host.
       - "${DHCP_HA_HOST_PORT:-8001}:8000/tcp"
-      # Optional operator-facing kea-ctrl-agent REST.
-      # - "8544:8544/tcp"
     # NET_BIND_SERVICE binds UDP/67; NET_RAW (#365) lets Kea use raw
     # AF_PACKET sockets — the default "direct" socket mode. For a
     # directly-attached LAN switch this to `network_mode: host`; the

@@ -10,7 +10,7 @@ from typing import Any
 import httpx
 import structlog
 
-from . import __version__
+from . import __version__, kea_ctrl
 from .cache import save_token
 from .config import AgentConfig
 
@@ -36,6 +36,12 @@ class HeartbeatClient:
             timeout=15.0,
         )
 
+    def _kea_version(self) -> str | None:
+        sock = getattr(self.cfg, "kea_control_socket", None)
+        if sock is None:
+            return None
+        return kea_ctrl.version_get(sock)
+
     def send_once(self) -> None:
         # Drain queued op acks (queued by SyncLoop when bundle includes pending_ops).
         ops_ack: list[dict] = []
@@ -48,6 +54,13 @@ class HeartbeatClient:
             "daemon": self.daemon_status,
             "lease_count_since_start": self.lease_count_since_start,
             "ops_ack": ops_ack,
+            # #637 — the running Kea daemon's version (e.g. "3.0.3"), read live
+            # off the control socket. The rolling-upgrade preflight needs it:
+            # Kea 3.0's HA hook cannot talk to a peer older than 2.7, so a
+            # node-at-a-time upgrade across that boundary breaks HA mid-run.
+            # None = daemon not up yet / didn't answer; the control plane must
+            # treat that as "unknown", never as "old".
+            "kea_version": self._kea_version(),
         }
         # #170 Wave C1 — slot / deployment / upgrade-state telemetry
         # used to ship here per Phase 8f-2; now lives on the

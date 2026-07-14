@@ -174,6 +174,12 @@ class ScopeDef:
     # relay (matched on ``giaddr``). Empty tuple (default) → no relay
     # block, preserving direct-attach subnet selection + legacy bundles.
     relay_addresses: tuple[str, ...] = ()
+    # Kea lease cache (issue #637) — per-scope override. ``None`` = inherit the
+    # group-wide ``ConfigBundle.lease_cache_threshold`` / ``_max_age``. Note
+    # 0.0 is a MEANINGFUL value (caching explicitly disabled), so every consumer
+    # must test ``is not None`` rather than truthiness.
+    lease_cache_threshold: float | None = None
+    lease_cache_max_age: int | None = None
 
 
 @dataclass(frozen=True)
@@ -266,6 +272,13 @@ class ConfigBundle:
     # group (or by an older control plane) still serves directly-attached
     # clients. v6 is unaffected — DHCPv6 has no socket-type concept.
     dhcp_socket_type: str = "raw"
+    # Issue #637 — Kea lease cache, group-wide default (per-scope overrides ride
+    # on ScopeDef). ``cache-threshold`` 0.0 disables caching, which is what Kea
+    # 2.6 did implicitly; Kea 3.0 defaults it to 0.25. We default to 0.0 so the
+    # 2.6 → 3.0 jump does not silently suppress the memfile writes that drive
+    # lease-events → DDNS + the IPAM lease mirror. ``cache-max-age`` None = uncapped.
+    lease_cache_threshold: float = 0.0
+    lease_cache_max_age: int | None = None
     # IPv6 Router-Advertisement config (issue #524) — one entry per
     # RA-enabled IPv6 subnet the server's group serves. ``radvd_conf`` is
     # the pre-rendered radvd.conf text the agent writes verbatim; the
@@ -288,6 +301,8 @@ class ConfigBundle:
             "phone_classes": [asdict(c) for c in self.phone_classes],
             "failover": asdict(self.failover) if self.failover else None,
             "dhcp_socket_type": self.dhcp_socket_type,
+            "lease_cache_threshold": self.lease_cache_threshold,
+            "lease_cache_max_age": self.lease_cache_max_age,
             "ra_configs": [asdict(r) for r in self.ra_configs],
             "radvd_conf": self.radvd_conf,
         }

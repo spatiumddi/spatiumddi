@@ -21,6 +21,7 @@ from datetime import datetime
 from sqlalchemy import (
     Boolean,
     DateTime,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -98,6 +99,28 @@ class DHCPServerGroup(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     max_ack_delay_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=10000)
     max_unacked_clients: Mapped[int] = mapped_column(Integer, nullable=False, default=5)
     auto_failover: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+    # Kea lease cache (issue #637) — group-wide default, overridable per scope.
+    #
+    # ``cache-threshold`` is a fraction of ``valid-lifetime``: when a client
+    # re-requests a lease that still has more than (1 - threshold) of its
+    # lifetime left, Kea hands back the SAME lease with an UNCHANGED expiry and
+    # skips the lease-database write entirely.
+    #
+    # Kea 3.0 turns this on by default (0.25). We default to **0.0 (disabled)**
+    # deliberately: SpatiumDDI's lease pipeline is driven by memfile CSV writes
+    # (the agent tails the lease file and POSTs lease-events, which in turn feed
+    # DDNS and the IPAM lease mirror). Caching suppresses those writes, so a
+    # chatty client would stop producing lease events and its DDNS record /
+    # IPAM ``last_seen`` would go stale. 0.0 preserves the pre-3.0 write-through
+    # behaviour exactly; operators who want the reduced DB churn can opt in.
+    #
+    # ``cache-max-age`` caps how long a cached lease may be reused regardless of
+    # the threshold. NULL = unset (Kea's own default: no cap).
+    lease_cache_threshold: Mapped[float] = mapped_column(
+        Float, nullable=False, default=0.0, server_default=sa_text("0.0")
+    )
+    lease_cache_max_age: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     # Eager-load `servers` by default. The API's group list endpoint
     # reads this relationship to compute `kea_member_count` + roll up
@@ -177,6 +200,13 @@ class DHCPServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         index=True,
     )
     agent_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # #637 — the running Kea DAEMON's version (e.g. "3.0.3"), distinct from
+    # ``agent_version`` (the python agent). Read live off the control socket via
+    # ``version-get`` and reported on each heartbeat. The rolling-upgrade
+    # preflight needs it: Kea 3.0's HA hook is wire-incompatible with peers
+    # older than 2.7, so upgrading an HA pair one node at a time breaks HA
+    # mid-run. NULL = not reported yet (treat as UNKNOWN, never as "old").
+    kea_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
     agent_approved: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     agent_fingerprint: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
@@ -387,6 +417,13 @@ class DHCPScope(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     lease_time: Mapped[int] = mapped_column(Integer, nullable=False, default=86400)
     min_lease_time: Mapped[int | None] = mapped_column(Integer, nullable=True)
     max_lease_time: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # Per-scope Kea lease-cache override (issue #637). NULL = inherit the
+    # group's ``lease_cache_threshold`` / ``lease_cache_max_age``. See the
+    # block comment on DHCPServerGroup for what the cache actually does and
+    # why the platform default is 0.0 (disabled).
+    lease_cache_threshold: Mapped[float | None] = mapped_column(Float, nullable=True)
+    lease_cache_max_age: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     # ── DHCP relay / giaddr matching (issue #337) ───────────────────
     # List of relay-agent IP addresses (the ``giaddr`` a DHCP relay /

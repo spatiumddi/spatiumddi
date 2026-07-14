@@ -2,6 +2,29 @@
 # SpatiumDDI PowerDNS-Authoritative container — pdns_server + spatium-dns-agent.
 # Issue #127, Phase 1 — LMDB backend, no external DB dependency.
 # Multi-arch: linux/amd64, linux/arm64 (non-negotiable #11)
+#
+# ⚠️ DELIBERATELY HELD ON alpine:3.22 — DO NOT BUMP TO 3.23 (issue #638).
+#
+# Every other agent image moved to alpine:3.23 in #637. This one did not,
+# because 3.23 ships pdns 5.0.5 (3.22 ships 4.9.5) and PowerDNS 5.0 performs
+# an AUTOMATIC, SILENT, IRREVERSIBLE LMDB schema upgrade (v5 → v6) on the
+# first open of the database — a read is enough to trigger it, and there is
+# no opt-out (the documented ``lmdb-schema-version=5`` escape hatch is an
+# upstream docs bug: it makes pdns refuse to boot outright).
+#
+# Once 5.0 has opened the LMDB, pdns 4.9 can no longer read it at all:
+#     Error: Somehow, we are not at schema version 5. Giving up
+#
+# Our LMDB is persisted in every deployment shape (compose named volume /
+# appliance hostPath / chart PVC), and the appliance A/B slot rollback swaps
+# the ROOTFS while /var — where the database lives — is the shared persistent
+# partition. So an upgrade-then-rollback leaves pdns 4.9 crash-looping on a
+# schema-6 database: DNS down, and the rollback cannot recover it.
+#
+# Pinning ``pdns=4.9.*`` on a 3.23 base is NOT an option — the 3.23 index has
+# no 4.9 package at all. The image therefore stays on 3.22 (a supported Alpine
+# branch; ``apk upgrade`` below still pulls 3.22 security fixes) until #638
+# lands the pre-upgrade LMDB snapshot + restore path.
 ARG PYTHON_VERSION=3.12
 
 FROM alpine:3.22 AS agent-build
