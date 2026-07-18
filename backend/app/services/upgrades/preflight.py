@@ -19,6 +19,11 @@ Checks shipped in Phase A:
   image + a safety margin.
 * ``check_version_path`` — target tag is a valid forward jump from
   ``settings.version``; no skip-release across the supported skew window.
+* ``check_kea_ha_version_skew`` — a Kea HA pair on pre-3.0 cannot be
+  upgraded node-at-a-time (3.0's HA hook won't talk to a < 2.7 peer);
+  warn the operator before they start. Scoped to appliance nodes and to
+  real HA pairs only, and never returns ``fail`` (blocking would strand a
+  broken pair in its broken state). See issue #637.
 * ``check_quorum`` — cluster size is odd + ≥ 3 + every node currently
   Ready (so we don't start a rolling upgrade with a node already down).
 
@@ -575,6 +580,7 @@ async def run_all(
         await check_mirror_disk_headroom(),
         check_version_path(target_version=target_version),
         check_quorum(),
+        await check_kea_ha_version_skew(),
     ]
     levels = {r.level for r in results}
     if "fail" in levels:
@@ -589,4 +595,179 @@ async def run_all(
         overall=overall,
         can_start=overall != "fail",
         results=results,
+    )
+
+
+# Kea 3.0's HA hook cannot exchange lease updates with a peer older than this.
+# 3.0 added the "released" lease state (value 3) to the updates partners send
+# each other; a pre-2.7 peer rejects them outright. Upstream is explicit that
+# every HA member must be upgraded at the same time.
+_KEA_HA_MIN_COMPATIBLE_MAJOR = 3
+
+
+def _kea_major(version: str | None) -> int | None:
+    """Major version from a Kea version string ("3.0.3" → 3). None if unknown."""
+    if not version:
+        return None
+    head = version.strip().split(".", 1)[0]
+    try:
+        return int(head)
+    except ValueError:
+        return None
+
+
+async def check_kea_ha_version_skew() -> PreflightResult:
+    """Warn when a rolling upgrade will disrupt a Kea HA pair (#637).
+
+    The #296 orchestrator upgrades nodes **one at a time** — cordon, drain, swap
+    slot, reboot, uncordon, next. That is exactly the sequence Kea 3.0's HA hook
+    cannot survive when the pair starts on 2.6: mid-run one member is on 3.0 and
+    its partner is still on 2.6, they reject each other's lease updates, and the
+    pair falls out of sync until BOTH have crossed. There is no fix inside the
+    orchestrator — the incompatibility is in Kea's wire protocol, and ISC's
+    guidance is to upgrade every HA member together. So the honest thing is to
+    tell the operator before they press Start.
+
+    Two pieces of scoping matter, and getting either wrong turns this check into
+    a liar that blocks unrelated work:
+
+    * **Only appliance nodes.** The orchestrator only ever touches appliance
+      nodes; docker / k8s DHCP agents upgrade through the manual copy-paste path
+      and are never cordoned, drained or slot-swapped by this run. Counting them
+      would let two unrelated docker containers veto an appliance-cluster
+      upgrade. ``deployment_kind`` is matched strictly against ``appliance`` (an
+      ``appliance`` OR ``NULL`` fallback would lie about a row that has not
+      checked in yet — same convention as the Upgrade / Reboot affordances).
+    * **Only *real* HA pairs.** HA is not "≥ 2 Kea members" — that is half the
+      condition. ``_resolve_failover`` in ``services/dhcp/config_bundle.py``
+      renders the HA hook only when there are ≥ 2 Kea members AND every one of
+      them carries a non-empty ``ha_peer_url``; without a URL a peer cannot be
+      reached for heartbeats or lease updates, so no HA relationship exists and
+      there is nothing for an upgrade to disrupt. This check must use the same
+      predicate or it invents HA pairs that the renderer never built.
+
+    **This check never returns ``fail``.** A ``fail`` sets ``can_start=False``,
+    and blocking the upgrade would be exactly backwards: if a pair is *already*
+    split across Kea majors its HA is broken right now, and completing the
+    rolling upgrade is what converges both members onto one version. Refusing to
+    start would strand the operator in the broken state. So an already-mixed pair
+    is a loud ``warn`` that says "proceeding will fix this", not a gate.
+    """
+    try:
+        async with AsyncSessionLocal() as db:
+            rows = (await db.execute(text("""
+                            SELECT g.name         AS group_name,
+                                   s.name         AS server_name,
+                                   s.kea_version  AS kea_version,
+                                   s.ha_peer_url  AS ha_peer_url
+                            FROM dhcp_server_group g
+                            JOIN dhcp_server s ON s.server_group_id = g.id
+                            WHERE s.driver = 'kea'
+                              AND s.deployment_kind = 'appliance'
+                            ORDER BY g.name, s.name
+                            """))).mappings().all()
+    except Exception as e:  # pragma: no cover - DB unavailable is its own signal
+        logger.warning("preflight_kea_ha_skew_query_failed", error=str(e))
+        return PreflightResult(
+            name="kea_ha_version_skew",
+            level="warn",
+            message="Could not determine Kea versions — verify HA members manually.",
+            detail={"error": str(e)},
+        )
+
+    by_group: dict[str, list[dict[str, Any]]] = {}
+    for r in rows:
+        by_group.setdefault(r["group_name"], []).append(dict(r))
+
+    # Mirror _resolve_failover exactly: ≥ 2 Kea members AND every member has a
+    # peer URL. Anything else renders no HA hook, so there is no HA to disrupt.
+    ha_groups = {
+        name: members
+        for name, members in by_group.items()
+        if len(members) >= 2 and all(m["ha_peer_url"] for m in members)
+    }
+    if not ha_groups:
+        return PreflightResult(
+            name="kea_ha_version_skew",
+            level="ok",
+            message="No Kea HA pairs on appliance nodes — no same-window upgrade constraint.",
+            detail={"ha_groups": 0},
+        )
+
+    # Classification is mutually exclusive, worst-first, so a group is reported
+    # under exactly one heading and the structured detail can't contradict itself.
+    mixed: list[str] = []
+    pre_3: list[str] = []
+    unknown: list[str] = []
+    groups: list[dict[str, Any]] = []
+    for name, members in ha_groups.items():
+        majors = {_kea_major(m["kea_version"]) for m in members}
+        known = {m for m in majors if m is not None}
+        if len(known) > 1:
+            mixed.append(name)
+        elif None in majors:
+            # At least one member has never reported. Unknown, never "old" —
+            # even if a sibling reports a pre-3.0 version, we can't say what the
+            # silent one runs, so "unknown" is the honest heading.
+            unknown.append(name)
+        elif known and next(iter(known)) < _KEA_HA_MIN_COMPATIBLE_MAJOR:
+            pre_3.append(name)
+        groups.append(
+            {
+                "group": name,
+                "members": [
+                    {"server": m["server_name"], "kea_version": m["kea_version"]} for m in members
+                ],
+            }
+        )
+
+    detail: dict[str, Any] = {
+        "ha_groups": len(ha_groups),
+        "mixed_major": mixed,
+        "pre_3_0": pre_3,
+        "unknown_version": unknown,
+        "groups": groups,
+    }
+
+    if mixed:
+        return PreflightResult(
+            name="kea_ha_version_skew",
+            level="warn",
+            message=(
+                f"Kea HA {'pairs' if len(mixed) > 1 else 'pair'} {', '.join(mixed)} "
+                "already span different Kea major versions, so HA lease sync is "
+                "broken right now. Completing this upgrade is what converges every "
+                "member onto one version — expect HA to stay degraded until it finishes."
+            ),
+            detail=detail,
+        )
+    if pre_3:
+        return PreflightResult(
+            name="kea_ha_version_skew",
+            level="warn",
+            message=(
+                f"Kea HA {'pairs' if len(pre_3) > 1 else 'pair'} {', '.join(pre_3)} "
+                "run Kea < 3.0. This upgrade moves nodes one at a time, and Kea 3.0's "
+                "HA hook cannot exchange lease updates with a pre-2.7 peer — so the "
+                "pair will fall out of sync until every member has crossed. DHCP keeps "
+                "serving throughout; only HA replication between the peers is affected."
+            ),
+            detail=detail,
+        )
+    if unknown:
+        return PreflightResult(
+            name="kea_ha_version_skew",
+            level="warn",
+            message=(
+                f"Kea version unknown for {'groups' if len(unknown) > 1 else 'group'} "
+                f"{', '.join(unknown)} (agent has not reported it yet). If those members "
+                "are on Kea < 3.0, HA will be degraded mid-upgrade."
+            ),
+            detail=detail,
+        )
+    return PreflightResult(
+        name="kea_ha_version_skew",
+        level="ok",
+        message=f"All {len(ha_groups)} Kea HA group(s) already on Kea ≥ 3.0.",
+        detail=detail,
     )

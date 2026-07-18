@@ -6482,6 +6482,11 @@ export interface DHCPServerGroup {
   max_ack_delay_ms: number;
   max_unacked_clients: number;
   auto_failover: boolean;
+  /** #637 — Kea lease cache. 0.0 = disabled (every renewal writes through,
+   * the pre-Kea-3.0 behaviour). > 0 reuses leases without a DB write, which
+   * suppresses the lease-events that drive DDNS + the IPAM lease mirror. */
+  lease_cache_threshold: number;
+  lease_cache_max_age: number | null;
   // Number of Kea servers currently in the group. ≥ 2 means HA is
   // rendered into every peer's Kea config via libdhcp_ha.so.
   kea_member_count: number;
@@ -6501,6 +6506,8 @@ export interface DHCPServerGroupCreate {
   max_ack_delay_ms?: number;
   max_unacked_clients?: number;
   auto_failover?: boolean;
+  lease_cache_threshold?: number;
+  lease_cache_max_age?: number | null;
 }
 
 export interface DHCPServer {
@@ -6653,6 +6660,10 @@ export interface DHCPScope {
   lease_time: number;
   min_lease_time: number | null;
   max_lease_time: number | null;
+  /** #637 — per-scope Kea lease-cache override. null = inherit the group's
+   * value. 0 is meaningful: caching explicitly disabled for this scope. */
+  lease_cache_threshold: number | null;
+  lease_cache_max_age: number | null;
   ddns_enabled: boolean;
   ddns_hostname_policy: string | null;
   ddns_domain_override: string | null;

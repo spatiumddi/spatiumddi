@@ -14,7 +14,7 @@ from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
@@ -38,6 +38,12 @@ VALID_MODES = {"standalone", "load-balancing", "hot-standby"}
 # → udp sockets (relay-only).
 VALID_SOCKET_MODES = {"direct", "relay"}
 
+# #637 — nullable group fields an operator must be able to CLEAR. ``exclude_none``
+# alone would silently swallow an explicit ``null``, making "uncap the lease cache"
+# impossible once a max-age had been set. Mirrors NULLABLE_CLEARABLE_SCOPE_FIELDS
+# in scopes.py.
+NULLABLE_CLEARABLE_GROUP_FIELDS = {"lease_cache_max_age"}
+
 
 class GroupCreate(BaseModel):
     name: str
@@ -49,6 +55,11 @@ class GroupCreate(BaseModel):
     max_ack_delay_ms: int = 10000
     max_unacked_clients: int = 5
     auto_failover: bool = True
+    # #637 — Kea lease cache. 0.0 disables (the pre-Kea-3.0 behaviour and our
+    # default); Kea 3.0's own default is 0.25. See models/dhcp.py for why we
+    # do not simply inherit it.
+    lease_cache_threshold: float = Field(default=0.0, ge=0.0, le=1.0)
+    lease_cache_max_age: int | None = Field(default=None, ge=1)
 
     @field_validator("mode")
     @classmethod
@@ -75,6 +86,8 @@ class GroupUpdate(BaseModel):
     max_ack_delay_ms: int | None = None
     max_unacked_clients: int | None = None
     auto_failover: bool | None = None
+    lease_cache_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    lease_cache_max_age: int | None = Field(default=None, ge=1)
 
     @field_validator("mode")
     @classmethod
@@ -113,6 +126,8 @@ class GroupResponse(BaseModel):
     max_ack_delay_ms: int
     max_unacked_clients: int
     auto_failover: bool
+    lease_cache_threshold: float
+    lease_cache_max_age: int | None
     # Computed: count of Kea servers currently in the group. ≥ 2 means
     # the group renders the libdhcp_ha.so hook on every peer.
     kea_member_count: int = 0
@@ -138,6 +153,8 @@ def _group_to_response(g: DHCPServerGroup) -> GroupResponse:
         max_ack_delay_ms=g.max_ack_delay_ms,
         max_unacked_clients=g.max_unacked_clients,
         auto_failover=g.auto_failover,
+        lease_cache_threshold=g.lease_cache_threshold,
+        lease_cache_max_age=g.lease_cache_max_age,
         kea_member_count=len(kea),
         servers=[
             ServerSummary(
@@ -200,7 +217,11 @@ async def update_group(
     g = await db.get(DHCPServerGroup, group_id)
     if g is None:
         raise HTTPException(status_code=404, detail="Server group not found")
-    changes = body.model_dump(exclude_none=True)
+    changes = {
+        k: v
+        for k, v in body.model_dump(exclude_unset=True).items()
+        if v is not None or k in NULLABLE_CLEARABLE_GROUP_FIELDS
+    }
     for k, v in changes.items():
         setattr(g, k, v)
     # HA tuning (mode / heartbeat / delays / auto-failover) and the Kea

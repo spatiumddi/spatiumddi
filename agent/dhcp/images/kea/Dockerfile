@@ -3,7 +3,7 @@
 # Multi-arch: linux/amd64, linux/arm64 (non-negotiable #11)
 ARG PYTHON_VERSION=3.12
 
-FROM alpine:3.22 AS agent-build
+FROM alpine:3.23 AS agent-build
 RUN apk add --no-cache python3 py3-pip py3-wheel
 WORKDIR /src
 COPY agent/dhcp/pyproject.toml /src/pyproject.toml
@@ -11,7 +11,7 @@ COPY agent/dhcp/spatium_dhcp_agent /src/spatium_dhcp_agent
 COPY agent/dhcp/README.md /src/README.md
 RUN python3 -m pip install --prefix=/install --no-cache-dir --break-system-packages .
 
-FROM alpine:3.22 AS runtime
+FROM alpine:3.23 AS runtime
 # libpcap is pulled in for scapy's BPF socket support, used by the
 # optional Phase 2 device-fingerprinting sniffer (DHCP_FINGERPRINT_ENABLED=1).
 # scapy itself is pure-python so the install works on amd64 + arm64
@@ -38,35 +38,62 @@ FROM alpine:3.22 AS runtime
 # raises NET_RAW into the *ambient* set via setpriv (survives the
 # setuid + execve into ``spatium``). See entrypoint.sh (#383).
 #
-# ``kea>=2.6.5-r0`` ships the CVE-2026-3608 (HIGH) fix that Trivy flags
-# in 2.6.3-r0; the explicit ``>=`` lower-bound both pulls the patched
-# package AND busts the BuildKit ``cache-from`` layer so a stale
-# ``apk add`` layer can't serve the vulnerable version. ``kea-dhcp6``
-# is named explicitly (the ``kea`` meta-package pulls it in too) so it
-# is obvious the v6 daemon is part of the always-on dual-stack image.
+# ``kea>=3.0.3-r0`` (issue #637) — alpine 3.23 ships Kea 3.0.3, ISC's first
+# LTS. The explicit ``>=`` lower-bound is what makes the major EXPLICIT: the
+# old ``>=2.6.5-r0`` bound was *satisfied* by 3.0.3-r0, so flipping the base
+# tag alone would have silently pulled a major version bump. 3.0.3 (not
+# 3.0.0-3.0.2) is also the CVE floor — it carries the CVE-2026-3608 fix
+# (deeply-nested-JSON stack overflow, reachable on every control endpoint and
+# explicitly noted upstream to bypass the HA command filters) plus the
+# 3.0.0/3.0.2 crafted-packet crash fixes. The bound additionally busts the
+# BuildKit ``cache-from`` layer so a stale ``apk add`` layer can't serve a
+# vulnerable version. ``kea-dhcp6`` is named explicitly (the ``kea``
+# meta-package pulls it in too) so it is obvious the v6 daemon is part of the
+# always-on dual-stack image.
+#
+# ⚠️ KEA 3.0 PATH RESTRICTIONS — DO NOT "TIDY" THE PATHS BELOW.
+# Kea 3.0 (CVE-2025-32801/2/3) refuses to start if hook libraries, unix
+# control sockets, lease files or log files live outside its COMPILED-IN
+# default directories. Enforcement is a literal string compare of the config
+# path's parent — there is no realpath(), so even ``/var/run/kea`` vs
+# ``/run/kea`` fails. Alpine builds Kea with ``-Dprefix=/usr
+# -Dlocalstatedir=/var -Drunstatedir=/run``, making the enforced defaults:
+#     hooks   → /usr/lib/kea/hooks   (render_kea.py: HA + lease_cmds ``library``)
+#     socket  → /run/kea             (KEA_CONTROL_SOCKET; dir must be mode 0750)
+#     leases  → /var/lib/kea         (KEA_LEASE_FILE)
+#     logs    → /var/log/kea         (render_kea.py ``output_options``)
+# Those happen to be exactly our existing layout, which is why the 2.6 → 3.0
+# jump needed no config changes at all. Move any of them and kea-dhcp4 will
+# refuse to start (or log an unrecoverable error if already running). Verify
+# with ``kea-dhcp4 -W`` ("Hooks directory") and ``kea-dhcp4 -T <conf>``.
+#
+# ``kea-ctrl-agent`` is deliberately NOT installed (#637). Kea 3.0 deprecates
+# it, and nothing in SpatiumDDI ever spoke to it: the agent drives kea-dhcp4 /
+# kea-dhcp6 over their unix control sockets (spatium_dhcp_agent/kea_ctrl.py —
+# config-test, config-reload, status-get, statistic-get-all) and the backend
+# KeaDriver.apply_config is a no-op. It was dead weight whose supervise loop
+# could take the whole container down via the entrypoint's ``wait -n``.
 #
 # ``apk upgrade --no-cache`` runs BEFORE ``apk add`` so the package
 # database is fresh and any previously-baked layer carrying an older
 # libpq version (CVE-2026-6638 fixed in 17.10-r0 — pulled in
 # transitively by kea-admin's optional psql backend wiring) gets
-# re-resolved against the current alpine 3.22 index. GitHub Actions
+# re-resolved against the current alpine 3.23 index. GitHub Actions
 # Docker layer cache (``cache-from: type=gha``) is otherwise happy
 # to serve a 30-day-old ``apk add`` layer that Trivy will then flag.
 #
-# ``libcrypto3``/``libssl3`` pinned ``>=3.5.7-r0`` for CVE-2026-45447
-# (HIGH, OpenSSL — alpine 3.22 base ships 3.5.6-r0, fixed in 3.5.7-r0):
-# the explicit lower bound installs the patched openssl libs AND busts
-# the ``cache-from`` layer so a stale apk add can't reintroduce 3.5.6-r0.
+# The old explicit ``libcrypto3>=3.5.7-r0`` / ``libssl3>=3.5.7-r0`` bounds
+# (CVE-2026-45447) are gone: the alpine 3.23 base already ships openssl
+# 3.5.7-r0, so they were redundant. ``apk upgrade`` above keeps them current.
 RUN apk upgrade --no-cache \
  && apk add --no-cache \
-      'kea>=2.6.5-r0' kea-dhcp4 kea-dhcp6 kea-ctrl-agent kea-admin \
+      'kea>=3.0.3-r0' kea-dhcp4 kea-dhcp6 kea-admin \
       kea-hook-lease-cmds kea-hook-ha \
       tini su-exec setpriv \
       python3 py3-pip libpcap \
       libcap \
       radvd \
       ca-certificates tzdata \
-      'libcrypto3>=3.5.7-r0' 'libssl3>=3.5.7-r0' \
  && setcap cap_net_bind_service,cap_net_raw=+ep /usr/sbin/kea-dhcp4 \
  && setcap cap_net_bind_service,cap_net_raw=+ep /usr/sbin/kea-dhcp6 \
  # radvd (issue #524) — opt-in IPv6 Router Advertisement daemon, started
@@ -91,11 +118,10 @@ RUN apk upgrade --no-cache \
 COPY --from=agent-build /install /usr/local
 COPY agent/dhcp/images/kea/kea-dhcp4.conf /etc/kea/kea-dhcp4.conf
 COPY agent/dhcp/images/kea/kea-dhcp6.conf /etc/kea/kea-dhcp6.conf
-COPY agent/dhcp/images/kea/kea-ctrl-agent.conf /etc/kea/kea-ctrl-agent.conf
 COPY agent/dhcp/images/kea/entrypoint.sh /usr/local/bin/spatium-dhcp-entrypoint
 RUN chmod +x /usr/local/bin/spatium-dhcp-entrypoint \
  && chown spatium:spatium \
-      /etc/kea/kea-dhcp4.conf /etc/kea/kea-dhcp6.conf /etc/kea/kea-ctrl-agent.conf
+      /etc/kea/kea-dhcp4.conf /etc/kea/kea-dhcp6.conf
 
 ENV CACHE_DIR=/var/lib/spatium-dhcp-agent \
     KEA_CONFIG_PATH=/etc/kea/kea-dhcp4.conf \
@@ -117,10 +143,13 @@ EXPOSE 67/udp
 EXPOSE 547/udp
 # Kea HA hook peer-to-peer HTTP listener (CmdHttpListener bound to the
 # this-server peer URL). When HA is inactive the port is unused.
+#
+# This is now the ONLY TCP port the image exposes: kea-ctrl-agent (:8544) was
+# removed in #637 — see the package-install comment above. The HA hook owns
+# 8000 exclusively, so the old "don't collide with 8544" constraint is moot.
+# Note Kea 3.0 also flips the HA listener's ``restrict-commands`` default to
+# true, so this port now answers only HA-internal commands regardless.
 EXPOSE 8000/tcp
-# kea-ctrl-agent operator-facing REST. Deliberately NOT 8000 — the HA
-# hook owns 8000. See agent/dhcp/images/kea/kea-ctrl-agent.conf.
-EXPOSE 8544/tcp
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s \
   CMD test -S /run/kea/kea4-ctrl-socket || exit 1

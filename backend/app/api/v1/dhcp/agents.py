@@ -93,6 +93,10 @@ class AgentHeartbeatRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     agent_version: str | None = None
+    # #637 — running Kea daemon version, e.g. "3.0.3". MUST be declared here:
+    # this model is extra="forbid", so an undeclared field would 422 every
+    # heartbeat from a current agent.
+    kea_version: str | None = None
     daemon: dict[str, Any] = {}
     config: dict[str, Any] = {}
     # Bound the ACK list so a malformed / hostile heartbeat can't pin memory.
@@ -539,6 +543,11 @@ async def agent_config_longpoll(
                         "server": {
                             "interfaces": ["*"],
                             "dhcp_socket_type": bundle.dhcp_socket_type,
+                            # #637 — group-wide Kea lease cache. Scopes may
+                            # override (see the per-scope keys below); the agent
+                            # falls back to these when the scope value is null.
+                            "lease_cache_threshold": bundle.lease_cache_threshold,
+                            "lease_cache_max_age": bundle.lease_cache_max_age,
                         },
                         "scopes": [
                             {
@@ -549,6 +558,13 @@ async def agent_config_longpoll(
                                 # min/max-valid-lifetime (silent no-op).
                                 "min_lease_time": s.min_lease_time,
                                 "max_lease_time": s.max_lease_time,
+                                # #637 — per-scope lease-cache override; null =
+                                # inherit the group value from the "server" block
+                                # above. Serialized here as well as folded into
+                                # the ETag: those are separate steps, and skipping
+                                # this one is exactly the #430 silent no-op.
+                                "lease_cache_threshold": s.lease_cache_threshold,
+                                "lease_cache_max_age": s.lease_cache_max_age,
                                 "options": s.options,
                                 # Issue #330 — the agent's render_kea branches on
                                 # these to emit a Dhcp6/subnet6 entry for v6
@@ -717,6 +733,11 @@ async def agent_heartbeat(
         server.last_seen_ip = request.client.host
     if body.agent_version:
         server.agent_version = body.agent_version
+    # #637 — only overwrite when the agent actually reported a version. A cold
+    # daemon answers None, and clobbering a known-good value with NULL would
+    # make the HA-skew preflight fall back to "unknown" for no reason.
+    if body.kea_version:
+        server.kea_version = body.kea_version
 
     # Phase 8f-2 — persist whatever slot state the agent reported. Only
     # overwrite when the agent actually sent a value (older agents

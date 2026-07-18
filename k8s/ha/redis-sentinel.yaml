@@ -88,7 +88,7 @@ spec:
       initContainers:
         # Set replica-of on non-primary pods
         - name: init-redis
-          image: redis:8.6-alpine
+          image: redis:8.8-alpine
           command:
             - sh
             - -c
@@ -123,7 +123,7 @@ spec:
               mountPath: /data
       containers:
         - name: redis
-          image: redis:8.6-alpine
+          image: redis:8.8-alpine
           command: ["redis-server", "/data/redis.conf"]
           ports:
             - containerPort: 6379
@@ -144,7 +144,7 @@ spec:
               memory: 512Mi
 
         - name: sentinel
-          image: redis:8.6-alpine
+          image: redis:8.8-alpine
           command: ["redis-sentinel", "/data/sentinel.conf"]
           ports:
             - containerPort: 26379

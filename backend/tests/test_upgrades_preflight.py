@@ -219,10 +219,11 @@ async def test_run_all_overall_ok() -> None:
             report = await preflight.run_all(target_version="2026.06.01-1")
     assert report.overall == "ok"
     assert report.can_start is True
-    # 6 results: Phase A's 5 (inflight, replication_lag, disk_headroom,
-    # version_path, quorum) plus Phase B's mirror_disk_headroom which
-    # short-circuits to ok when ``slot_image_mirror_url`` is unset.
-    assert len(report.results) == 6
+    # 7 results: Phase A's 5 (inflight, replication_lag, disk_headroom,
+    # version_path, quorum), plus Phase B's mirror_disk_headroom which
+    # short-circuits to ok when ``slot_image_mirror_url`` is unset, plus
+    # #637's kea_ha_version_skew (ok here — no appliance Kea HA pairs).
+    assert len(report.results) == 7
 
 
 @pytest.mark.asyncio

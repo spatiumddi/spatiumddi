@@ -486,6 +486,52 @@ Group-global is deliberate. Kea supports per-subnet via class/pool pinning; Wind
 
 ---
 
+## 4b. Kea Lease Cache (#637)
+
+Kea 3.0 (shipped from Alpine 3.23) enables **lease caching** by default —
+`cache-threshold: 0.25`. When a client re-requests a lease that still has more
+than 75% of its lifetime remaining, Kea hands back the *same* lease with an
+**unchanged expiry** and skips the lease-database write entirely.
+
+That is a sensible default for a standalone Kea. It is **not** a safe default
+for SpatiumDDI, because our lease pipeline is driven by exactly those writes:
+
+```
+kea-dhcp4 → memfile CSV write → agent tails the file → POST /dhcp/agents/lease-events
+                                                          ↓
+                                              DDNS record + IPAM lease mirror
+```
+
+Suppress the write and the lease event never happens — so a chatty client's DDNS
+record and its IPAM "last seen" timestamp quietly go stale, with nothing in the
+UI to indicate why.
+
+So SpatiumDDI **renders the value explicitly rather than inheriting Kea's
+default**, and ships it as an operator setting that defaults to **`0.0`
+(disabled)** — i.e. every renewal writes through, exactly as on Kea 2.6. An
+install upgrading across the Kea major keeps its existing behaviour with no
+action required; operators who want the reduced database churn opt in.
+
+| Setting | Where | Default | Meaning |
+|---|---|---|---|
+| `lease_cache_threshold` | `DHCPServerGroup` | `0.0` | Fraction of the lease lifetime (0–1). `0.0` disables caching. |
+| `lease_cache_max_age` | `DHCPServerGroup` | `NULL` | Cap on how long a cached lease may be reused. `NULL` = uncapped (Kea's own default). |
+| `lease_cache_threshold` | `DHCPScope` | `NULL` | Per-scope override. `NULL` = inherit the group. |
+| `lease_cache_max_age` | `DHCPScope` | `NULL` | Per-scope override. `NULL` = inherit the group. |
+
+Rendered as Kea's `cache-threshold` / `cache-max-age` on the `Dhcp4` / `Dhcp6`
+root (group-wide) and on the individual `subnet4` / `subnet6` entry (per-scope
+override).
+
+> **`0.0` is a value, not an absence.** A scope with `lease_cache_threshold = 0.0`
+> means "caching explicitly off for this scope" and must survive even when the
+> group has caching on; `NULL` means "inherit". Every layer therefore tests
+> `is not None` rather than truthiness — a truthy check silently converts an
+> explicit disable into an inherit (and `"0"` is falsy in JS too, which is why the
+> scope modal compares the input string against `""`).
+
+---
+
 ## 5. DHCP Lease Tracking
 
 Leases are **read-only** in SpatiumDDI — they are pulled from the DHCP server, not managed directly.

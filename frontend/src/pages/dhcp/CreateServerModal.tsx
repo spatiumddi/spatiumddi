@@ -298,7 +298,7 @@ export function CreateServerModal({
         {driver === "kea" && (
           <Field
             label="HA Peer URL (optional)"
-            hint="This server's own kea-ctrl-agent endpoint. Required for Kea HA pairs — the partner calls this URL for heartbeats and lease updates. Leave blank for standalone servers. Example: http://dhcp-kea:8000/"
+            hint="This server's own Kea HA hook listener endpoint. Required for Kea HA pairs — the partner calls this URL for heartbeats and lease updates. Leave blank for standalone servers. Example: http://dhcp-kea:8000/"
           >
             <input
               className={inputCls}

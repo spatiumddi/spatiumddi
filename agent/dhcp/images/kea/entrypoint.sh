@@ -1,7 +1,14 @@
 #!/bin/sh
-# Container entrypoint — starts kea-dhcp4, kea-dhcp6, kea-ctrl-agent,
-# and the spatium-dhcp-agent. tini (PID 1) reaps zombies and forwards
-# signals.
+# Container entrypoint — starts kea-dhcp4, kea-dhcp6, and the
+# spatium-dhcp-agent. tini (PID 1) reaps zombies and forwards signals.
+#
+# kea-ctrl-agent was removed in #637. Kea 3.0 deprecates it (it logs
+# CTRL_AGENT_IS_DEPRECATED on every start), and SpatiumDDI never used it:
+# the agent talks to kea-dhcp4 / kea-dhcp6 directly over their unix control
+# sockets (spatium_dhcp_agent/kea_ctrl.py — config-test, config-reload,
+# status-get, statistic-get-all). Supervising a daemon nothing calls was a
+# liability, not a feature: its crash-loop give-up path would return from
+# the ``wait -n`` below and take the whole container down with it.
 #
 # kea-dhcp6 runs always-on alongside kea-dhcp4 (dual-stack): it boots
 # from a minimal idle config (``interfaces: []`` + empty ``subnet6``)
@@ -33,21 +40,23 @@ set -eu
 # Ensure state + runtime dirs are writable by the agent user.
 mkdir -p /var/lib/spatium-dhcp-agent /var/lib/kea /run/kea /var/log/kea
 chown -R spatium:spatium /var/lib/spatium-dhcp-agent /var/lib/kea /run/kea /var/log/kea || true
-# Kea 2.6+ requires socket parent dir to be exactly mode 0750.
+# Kea requires the control-socket parent dir to be exactly mode 0750.
+# Kea 3.0 hardened this: the socket path itself must also sit under the
+# compiled-in default dir (/run/kea on Alpine) or the daemon refuses to
+# start outright — see the path-restriction note in the Dockerfile (#637).
 chmod 0750 /run/kea
 
 KEA_CFG="${KEA_CONFIG_PATH:-/etc/kea/kea-dhcp4.conf}"
 KEA_CFG6="${KEA_CONFIG_PATH_V6:-/etc/kea/kea-dhcp6.conf}"
 KEA_PID_FILE="/run/kea/kea-dhcp4.kea-dhcp4.pid"
 KEA6_PID_FILE="/run/kea/kea-dhcp6.kea-dhcp6.pid"
-CTRL_PID_FILE="/run/kea/kea-ctrl-agent.kea-ctrl-agent.pid"
 
 # Top-level cleanup — scrub any leftover PID files from a prior
 # container incarnation BEFORE either supervisor starts. Belt and
 # suspenders: the per-iteration rm below catches in-container
 # crashes, this handles the docker-compose-restart case where the
 # entire container came back up with the tmpfs state intact.
-rm -f "$KEA_PID_FILE" "$KEA6_PID_FILE" "$CTRL_PID_FILE" 2>/dev/null || true
+rm -f "$KEA_PID_FILE" "$KEA6_PID_FILE" 2>/dev/null || true
 
 supervise_kea() {
     STOPPING=0
@@ -117,37 +126,6 @@ supervise_kea6() {
     return 0
 }
 
-supervise_ctrl_agent() {
-    STOPPING=0
-    CTRL_CHILD=
-    # shellcheck disable=SC2064
-    trap 'STOPPING=1; [ -n "$CTRL_CHILD" ] && kill -TERM "$CTRL_CHILD" 2>/dev/null; exit 0' TERM INT
-    fails=0
-    while [ "$STOPPING" -eq 0 ]; do
-        rm -f "$CTRL_PID_FILE" 2>/dev/null || true
-        start_ts=$(date +%s)
-        su-exec spatium:spatium kea-ctrl-agent -c /etc/kea/kea-ctrl-agent.conf &
-        CTRL_CHILD=$!
-        wait "$CTRL_CHILD" || true
-        code=$?
-        CTRL_CHILD=
-        [ "$STOPPING" -eq 1 ] && break
-        end_ts=$(date +%s)
-        runtime=$((end_ts - start_ts))
-        if [ "$runtime" -ge 30 ]; then
-            fails=0
-        else
-            fails=$((fails + 1))
-        fi
-        if [ "$fails" -ge 5 ]; then
-            echo "kea-ctrl-agent crash-looping (5x in <30s), giving up code=$code" >&2
-            return "$code"
-        fi
-        echo "kea-ctrl-agent exited code=$code after ${runtime}s, restarting (attempt $fails/5)" >&2
-        sleep 2
-    done
-    return 0
-}
 
 # radvd (issue #524) — opt-in IPv6 Router Advertisement daemon. Only
 # runs when RADVD_MANAGED=1. The python agent renders the control-plane's
@@ -186,8 +164,6 @@ KEA_PID=$!
 supervise_kea6 &
 KEA6_PID=$!
 
-supervise_ctrl_agent &
-CTRL_PID=$!
 
 # radvd only when opted in — best-effort, not part of the container
 # liveness wait (a radvd flap must not take the DHCP server down).
@@ -200,7 +176,7 @@ fi
 # Forward container SIGTERM to all supervisor subshells and the
 # agent. The supervisors' own traps handle the in-flight daemon.
 _term() {
-    kill -TERM "$KEA_PID" "$KEA6_PID" "$CTRL_PID" "${RADVD_PID:-0}" "${AGENT_PID:-0}" 2>/dev/null || true
+    kill -TERM "$KEA_PID" "$KEA6_PID" "${RADVD_PID:-0}" "${AGENT_PID:-0}" 2>/dev/null || true
 }
 trap _term TERM INT
 
@@ -218,8 +194,8 @@ AGENT_PID=$!
 
 # wait -n is a bash-ism; busybox ash accepts it too as of 1.30+
 # (Alpine 3.11+). Fall back to plain wait on older variants.
-wait -n "$KEA_PID" "$KEA6_PID" "$CTRL_PID" "$AGENT_PID" 2>/dev/null \
-    || wait "$KEA_PID" "$KEA6_PID" "$CTRL_PID" "$AGENT_PID"
+wait -n "$KEA_PID" "$KEA6_PID" "$AGENT_PID" 2>/dev/null \
+    || wait "$KEA_PID" "$KEA6_PID" "$AGENT_PID"
 EXIT_CODE=$?
 _term
 wait

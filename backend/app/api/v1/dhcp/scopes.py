@@ -39,7 +39,14 @@ VALID_SYNC_MODES = {"disabled", "on_lease", "on_static_only", "ipam", "learned"}
 # nullable column keeps its ``exclude_none`` behaviour — a stray null is dropped
 # rather than applied — so a NOT-NULL column can't 500 on ``setattr(None)`` and a
 # partial-body client can't silently wipe a column it didn't mean to touch.
-NULLABLE_CLEARABLE_SCOPE_FIELDS = {"min_lease_time", "max_lease_time"}
+NULLABLE_CLEARABLE_SCOPE_FIELDS = {
+    "min_lease_time",
+    "max_lease_time",
+    # #637 — null means "inherit the group's lease-cache setting", so an
+    # explicit null MUST reach the model to clear a previous override.
+    "lease_cache_threshold",
+    "lease_cache_max_age",
+}
 # DHCPv6 operating modes (issue #52). Only meaningful for ipv6 scopes.
 VALID_V6_MODES = {"stateful", "stateless", "slaac"}
 
@@ -199,6 +206,9 @@ class ScopeCreate(BaseModel):
     lease_time: int = 86400
     min_lease_time: int | None = None
     max_lease_time: int | None = None
+    # #637 — per-scope Kea lease-cache override; null = inherit the group.
+    lease_cache_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    lease_cache_max_age: int | None = Field(default=None, ge=1)
     options: Any = None
     ddns_enabled: bool = False
     ddns_hostname_policy: str | None = "client"
@@ -261,6 +271,8 @@ class ScopeUpdate(BaseModel):
     lease_time: int | None = None
     min_lease_time: int | None = None
     max_lease_time: int | None = None
+    lease_cache_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    lease_cache_max_age: int | None = Field(default=None, ge=1)
     options: Any = None
     ddns_enabled: bool | None = None
     ddns_hostname_policy: str | None = None
@@ -330,6 +342,8 @@ class ScopeResponse(BaseModel):
     lease_time: int
     min_lease_time: int | None
     max_lease_time: int | None
+    lease_cache_threshold: float | None
+    lease_cache_max_age: int | None
     options: list[dict[str, Any]]
     ddns_enabled: bool
     ddns_hostname_policy: str | None
@@ -378,6 +392,8 @@ def _scope_to_response(scope: DHCPScope) -> ScopeResponse:
         lease_time=scope.lease_time,
         min_lease_time=scope.min_lease_time,
         max_lease_time=scope.max_lease_time,
+        lease_cache_threshold=scope.lease_cache_threshold,
+        lease_cache_max_age=scope.lease_cache_max_age,
         options=opts,
         ddns_enabled=scope.ddns_enabled,
         ddns_hostname_policy=scope.ddns_hostname_policy,
@@ -490,6 +506,8 @@ async def create_scope(
         lease_time=body.lease_time,
         min_lease_time=body.min_lease_time,
         max_lease_time=body.max_lease_time,
+        lease_cache_threshold=body.lease_cache_threshold,
+        lease_cache_max_age=body.lease_cache_max_age,
         options=_create_options,
         ddns_enabled=body.ddns_enabled,
         ddns_hostname_policy=body.ddns_hostname_policy or "client",

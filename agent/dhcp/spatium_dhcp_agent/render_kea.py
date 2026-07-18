@@ -268,6 +268,35 @@ def _pd_pool_v6(p: dict[str, Any]) -> dict[str, Any] | None:
     return out
 
 
+def _apply_lease_cache(out: dict[str, Any], scope: dict[str, Any]) -> None:
+    """Emit Kea's ``cache-threshold`` / ``cache-max-age`` on a rendered subnet.
+
+    Issue #637. Kea 3.0 enables lease caching by default (``cache-threshold``
+    0.25): a client re-requesting a lease with >75% of its lifetime left gets
+    the same lease back with an unchanged expiry and NO lease-database write.
+    That silently starves SpatiumDDI's lease pipeline, which is driven by
+    memfile CSV writes (leases.py tails the file → lease-events → DDNS + the
+    IPAM lease mirror), so the control plane renders an explicit value rather
+    than inheriting Kea's default.
+
+    ``None`` means "inherit the group". Nothing resolves that here: the key is
+    simply OMITTED from the subnet, and Kea itself falls back to the
+    ``cache-threshold`` / ``cache-max-age`` emitted on the ``Dhcp4`` / ``Dhcp6``
+    root. Do not "fix" this by coalescing None to the group value at the call
+    site — the absence of the key IS the inheritance mechanism.
+
+    **0.0 is a real value** (caching explicitly disabled — the pre-3.0
+    behaviour), so this guards on ``is not None``; a truthiness check would drop
+    it and the subnet would silently inherit the group's threshold instead.
+    """
+    threshold = scope.get("lease_cache_threshold")
+    if threshold is not None:
+        out["cache-threshold"] = float(threshold)
+    max_age = scope.get("lease_cache_max_age")
+    if max_age is not None:
+        out["cache-max-age"] = int(max_age)
+
+
 def _scope_to_subnet6(scope: dict[str, Any]) -> dict[str, Any]:
     """Translate a wire-shape v6 ScopeDef dict into a Kea ``subnet6`` entry.
 
@@ -342,6 +371,7 @@ def _scope_to_subnet6(scope: dict[str, Any]) -> dict[str, Any]:
         out["min-valid-lifetime"] = int(scope["min_lease_time"])
     if scope.get("max_lease_time"):
         out["max-valid-lifetime"] = int(scope["max_lease_time"])
+    _apply_lease_cache(out, scope)
     relay = scope.get("relay_addresses")
     if relay:
         out["relay"] = {"ip-addresses": list(relay)}
@@ -516,6 +546,7 @@ def _scope_to_subnet(scope: dict[str, Any]) -> dict[str, Any]:
         out["min-valid-lifetime"] = int(scope["min_lease_time"])
     if scope.get("max_lease_time"):
         out["max-valid-lifetime"] = int(scope["max_lease_time"])
+    _apply_lease_cache(out, scope)
     # Relay-agent matching (issue #337) — Kea selects this subnet for
     # packets whose giaddr is one of these relay IPs. Required for
     # subnets not directly attached to a centralized server.
@@ -660,6 +691,11 @@ def render(
         "valid-lifetime": int(
             bundle.get("global_options", {}).get("lease_time") or 3600
         ),
+        # #637 — group-wide Kea lease cache. Rendered explicitly (not left to
+        # Kea's default) because Kea 3.0 flipped that default from "off" to
+        # 0.25, which would silently suppress the memfile writes that drive
+        # lease-events → DDNS + the IPAM lease mirror. See _apply_lease_cache.
+        "cache-threshold": float(server.get("lease_cache_threshold") or 0.0),
         "renew-timer": 900,
         "rebind-timer": 1800,
         "hooks-libraries": [
@@ -689,6 +725,12 @@ def render(
             }
         ],
     }
+
+    # #637 — group-wide ``cache-max-age`` is optional (None = uncapped, which is
+    # Kea's own default), so it is set conditionally rather than in the literal.
+    _global_max_age = server.get("lease_cache_max_age")
+    if _global_max_age is not None:
+        dhcp4["cache-max-age"] = int(_global_max_age)
 
     # HA hook — only present when the control plane pins this server to
     # a DHCPFailoverChannel. Kea rejects a config that references
@@ -796,6 +838,8 @@ def render(
         "valid-lifetime": int(
             bundle.get("global_options", {}).get("lease_time") or 3600
         ),
+        # #637 — see the Dhcp4 block. Same group-wide lease-cache default.
+        "cache-threshold": float(server.get("lease_cache_threshold") or 0.0),
         "renew-timer": 900,
         "rebind-timer": 1800,
         "hooks-libraries": [
@@ -818,6 +862,10 @@ def render(
             }
         ],
     }
+    # #637 — see the Dhcp4 block. Optional, so set conditionally.
+    if _global_max_age is not None:
+        dhcp6["cache-max-age"] = int(_global_max_age)
+
     # Global option-data + client classes only apply when v6 scopes are
     # being served — the idle skeleton stays bare so it can't reject on
     # an inherited v4-only global option.

@@ -61,6 +61,17 @@ class PeerResolveWatcher:
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._bundle: dict[str, Any] | None = None
+        # Maps hostname → last resolved IP. We only reload when the resolution
+        # changes, not on every tick.
+        #
+        # This MUST be initialised in __init__, not in set_apply_fn: the #265
+        # refactor made apply_fn deferrable, so set_apply_fn is called LATE (once
+        # the SyncLoop exists) — but set_bundle() and _tick_once() both run before
+        # that on the bootstrap-from-cache path and both touch _resolved. Leaving
+        # it in set_apply_fn raised AttributeError on every set_bundle, which
+        # sync.py swallowed as ``peer_watcher_set_bundle_failed`` — so the HA
+        # peer-IP-drift self-healing this class exists to provide never ran.
+        self._resolved: dict[str, str] = {}
 
     def set_apply_fn(self, apply_fn: Callable[..., None]) -> None:
         """Arm the watcher with the SyncLoop's bundle-apply callback.
@@ -70,9 +81,6 @@ class PeerResolveWatcher:
         wired chain (issue #265).
         """
         self._apply_fn = apply_fn
-        # Maps hostname → last resolved IP. We only reload when the
-        # resolution changes, not on every tick.
-        self._resolved: dict[str, str] = {}
 
     def set_bundle(self, bundle: dict[str, Any]) -> None:
         """Called by the sync loop after each successful bundle apply.

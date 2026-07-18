@@ -71,6 +71,16 @@ export function CreateScopeModal({
   const [maxLease, setMaxLease] = useState(
     scope?.max_lease_time != null ? String(scope.max_lease_time) : "",
   );
+  // #637 — per-scope Kea lease-cache override. Blank = inherit the group.
+  // Note "0" is NOT blank: it explicitly disables caching for this scope.
+  const [leaseCacheThreshold, setLeaseCacheThreshold] = useState(
+    scope?.lease_cache_threshold != null
+      ? String(scope.lease_cache_threshold)
+      : "",
+  );
+  const [leaseCacheMaxAge, setLeaseCacheMaxAge] = useState(
+    scope?.lease_cache_max_age != null ? String(scope.lease_cache_max_age) : "",
+  );
   const [ddnsEnabled, setDdnsEnabled] = useState(scope?.ddns_enabled ?? false);
   const [ddnsPolicy, setDdnsPolicy] = useState(
     scope?.ddns_hostname_policy ?? "client",
@@ -239,6 +249,25 @@ export function CreateScopeModal({
       const parsedLeaseTime = parseInt(leaseTime, 10) || 86400;
       const parsedMinLease = minLease ? parseInt(minLease, 10) : null;
       const parsedMaxLease = maxLease ? parseInt(maxLease, 10) : null;
+      // #637 — blank means "inherit the group"; "0" means "caching off for this
+      // scope". Test the string against "" rather than truthiness, because the
+      // string "0" is falsy in JS and a truthy check would silently turn an
+      // explicit disable into an inherit.
+      const parsedCacheThreshold =
+        leaseCacheThreshold.trim() === ""
+          ? null
+          : parseFloat(leaseCacheThreshold);
+      const parsedCacheMaxAge =
+        leaseCacheMaxAge.trim() === "" ? null : parseInt(leaseCacheMaxAge, 10);
+
+      if (
+        parsedCacheThreshold !== null &&
+        (Number.isNaN(parsedCacheThreshold) ||
+          parsedCacheThreshold < 0 ||
+          parsedCacheThreshold > 1)
+      ) {
+        throw new Error("Lease cache threshold must be between 0 and 1.");
+      }
 
       if (parsedMinLease !== null && parsedMinLease > parsedLeaseTime) {
         throw new Error(
@@ -271,6 +300,8 @@ export function CreateScopeModal({
         lease_time: parsedLeaseTime,
         min_lease_time: parsedMinLease,
         max_lease_time: parsedMaxLease,
+        lease_cache_threshold: parsedCacheThreshold,
+        lease_cache_max_age: parsedCacheMaxAge,
         ddns_enabled: ddnsEnabled,
         ddns_hostname_policy: ddnsEnabled ? ddnsPolicy : null,
         ddns_domain_override: ddnsDomain || null,
@@ -500,6 +531,38 @@ export function CreateScopeModal({
               className={inputCls}
               value={maxLease}
               onChange={(e) => setMaxLease(e.target.value)}
+            />
+          </Field>
+        </div>
+
+        <div className="grid grid-cols-2 gap-3">
+          <Field
+            label="Lease cache threshold"
+            hint="Overrides the server group's setting for this scope. Leave blank to inherit. 0 disables caching here (every renewal writes through); a value up to 1 lets Kea reuse a lease without a database write, which also means no DDNS update and no IPAM last-seen refresh for that client."
+          >
+            <input
+              type="number"
+              min="0"
+              max="1"
+              step="0.05"
+              placeholder="inherit"
+              className={inputCls}
+              value={leaseCacheThreshold}
+              onChange={(e) => setLeaseCacheThreshold(e.target.value)}
+            />
+          </Field>
+          <Field
+            label="Lease cache max age (sec)"
+            hint="Overrides the server group's cap on how long a cached lease may be reused. Leave blank to inherit."
+          >
+            <input
+              type="number"
+              min="1"
+              step="1"
+              placeholder="inherit"
+              className={inputCls}
+              value={leaseCacheMaxAge}
+              onChange={(e) => setLeaseCacheMaxAge(e.target.value)}
             />
           </Field>
         </div>

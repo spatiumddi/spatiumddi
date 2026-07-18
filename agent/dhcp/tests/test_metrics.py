@@ -67,6 +67,8 @@ def _poller(tmp_path) -> MetricsPoller:
         kea_config_path=tmp_path / "kea.conf",
         kea_control_socket=tmp_path / "sock",
         kea_lease_file=tmp_path / "leases.csv",
+        kea_config_path_v6=tmp_path / "kea6.conf",
+        kea_control_socket_v6=tmp_path / "sock6",
         group_name=None,
         roles=["primary"],
         tls_ca_path=None,

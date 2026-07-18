@@ -1,5 +1,6 @@
 .PHONY: help up down dev build build-supervisor migrate lint test lint-backend lint-frontend test-backend \
         ci ci-backend-lint ci-frontend-lint ci-frontend-build screenshots \
+        trivy \
         appliance appliance-builder appliance-iso appliance-clean \
         appliance-bake-images appliance-clean-baked-images appliance-dev-iso \
         appliance-baked-iso appliance-stamp-dev appliance-slot-image \
@@ -197,6 +198,64 @@ test-one:
 # backend-tests job is not included — it needs a fresh `spatiumddi_test`
 # database and is covered by `make test`. Requires the dev stack to be running
 # (backend checks execute inside the api container) and Node 20+ locally.
+# ── Trivy — container image vulnerability scan ────────────────────────────────
+#
+# Run this before pushing ANY change to an agent Dockerfile. CI's Trivy step is
+# path-filtered (each build-*-images.yml only fires when its own agent/<x>/**
+# paths change) AND PR-only, so an image can sit for months accumulating CVEs
+# that nothing scans. The moment you touch its Dockerfile for an unrelated
+# reason, CI scans it and fails on a PRE-EXISTING vulnerability you didn't
+# introduce — which is exactly how PR #639 (an Alpine base bump) tripped over
+# CVE-2026-39822 sitting in the gobgp image's Go toolchain pin.
+#
+# Gate matches the Trivy step in .github/workflows/build-*-images.yml exactly:
+# HIGH,CRITICAL + --ignore-unfixed + non-zero exit on findings.
+#
+# Note on Go images: the toolchain pin (golang:X.Y.Z-alpine) is a SECURITY pin.
+# Go static-links its stdlib into the binary, so a stdlib CVE ships inside
+# gobgpd itself and Trivy flags it against the `gobinary` target. No package
+# patch or `apk upgrade` can fix it — only rebuilding on a newer golang base.
+#
+# IMAGE=<name> scans one image; omit to scan all six.
+TRIVY_CACHE ?= $(CURDIR)/.trivy-cache
+TRIVY_IMAGES ?= \
+	agent/dhcp/images/kea/Dockerfile:kea \
+	agent/dns/images/bind9/Dockerfile:bind9 \
+	agent/dns/images/powerdns/Dockerfile:powerdns \
+	agent/dns/images/dnsdist/Dockerfile:dnsdist \
+	agent/supervisor/images/supervisor/Dockerfile:supervisor \
+	agent/looking-glass/images/gobgp/Dockerfile:looking-glass
+
+trivy:
+	@mkdir -p $(TRIVY_CACHE)
+	@fail=0; \
+	for spec in $(TRIVY_IMAGES); do \
+	  df=$${spec%%:*}; name=$${spec##*:}; \
+	  if [ -n "$(IMAGE)" ] && [ "$(IMAGE)" != "$$name" ]; then continue; fi; \
+	  printf "→ %-14s building… " "$$name"; \
+	  if ! docker build -q -f "$$df" -t "spatiumddi-trivy-$$name:scan" . >/dev/null 2>&1; then \
+	    printf "BUILD FAILED\n"; fail=1; continue; \
+	  fi; \
+	  printf "scanning… "; \
+	  if docker run --rm \
+	      -v /var/run/docker.sock:/var/run/docker.sock \
+	      -v "$(TRIVY_CACHE)":/root/.cache/ \
+	      aquasec/trivy:latest image \
+	      --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 --scanners vuln -q \
+	      "spatiumddi-trivy-$$name:scan" >/tmp/trivy-$$name.txt 2>&1; then \
+	    printf "clean\n"; \
+	  else \
+	    printf "FINDINGS\n"; \
+	    grep -E "CVE-|Total:" /tmp/trivy-$$name.txt | head -8 | sed 's/^/     /'; \
+	    fail=1; \
+	  fi; \
+	done; \
+	if [ $$fail -ne 0 ]; then \
+	  echo ""; echo "✗ Trivy found HIGH/CRITICAL vulnerabilities — fix before pushing."; \
+	  exit 1; \
+	fi; \
+	echo ""; echo "✓ Trivy clean (HIGH/CRITICAL, ignore-unfixed) — safe to push."
+
 ci: ci-backend-lint ci-frontend-lint ci-frontend-build
 	@echo ""
 	@echo "✓ All CI checks passed — safe to push."

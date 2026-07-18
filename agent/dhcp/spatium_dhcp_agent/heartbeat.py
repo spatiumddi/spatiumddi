@@ -10,7 +10,7 @@ from typing import Any
 import httpx
 import structlog
 
-from . import __version__
+from . import __version__, kea_ctrl
 from .cache import save_token
 from .config import AgentConfig
 
@@ -25,6 +25,9 @@ class HeartbeatClient:
         self.daemon_status: dict[str, Any] = {}
         self.lease_count_since_start = 0
         self.pending_acks: list[dict] = []
+        # #637 — cached Kea daemon version. See _kea_version(); immutable for the
+        # life of this process, so it is probed until it answers and then reused.
+        self._kea_version_cached: str | None = None
 
     def stop(self) -> None:
         self._stop.set()
@@ -35,6 +38,23 @@ class HeartbeatClient:
             verify=self.cfg.httpx_verify(),
             timeout=15.0,
         )
+
+    def _kea_version(self) -> str | None:
+        """Running Kea daemon version, probed once and cached.
+
+        The Kea binary cannot change while this process lives — a new image means
+        a new container, which restarts the agent too. So probe until we get an
+        answer, then stop: re-opening the control socket on every heartbeat would
+        be a blocking round-trip (``send_command`` waits up to 10s) on the very
+        thread that carries our liveness signal, and a wedged Kea would stall the
+        heartbeat rather than merely failing to report a version.
+
+        Stays None-and-retrying until the daemon first answers, which covers the
+        cold-start window where the agent is up before Kea's socket is.
+        """
+        if self._kea_version_cached is None:
+            self._kea_version_cached = kea_ctrl.version_get(self.cfg.kea_control_socket)
+        return self._kea_version_cached
 
     def send_once(self) -> None:
         # Drain queued op acks (queued by SyncLoop when bundle includes pending_ops).
@@ -48,6 +68,13 @@ class HeartbeatClient:
             "daemon": self.daemon_status,
             "lease_count_since_start": self.lease_count_since_start,
             "ops_ack": ops_ack,
+            # #637 — the running Kea daemon's version (e.g. "3.0.3"), read live
+            # off the control socket. The rolling-upgrade preflight needs it:
+            # Kea 3.0's HA hook cannot talk to a peer older than 2.7, so a
+            # node-at-a-time upgrade across that boundary breaks HA mid-run.
+            # None = daemon not up yet / didn't answer; the control plane must
+            # treat that as "unknown", never as "old".
+            "kea_version": self._kea_version(),
         }
         # #170 Wave C1 — slot / deployment / upgrade-state telemetry
         # used to ship here per Phase 8f-2; now lives on the

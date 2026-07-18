@@ -42,7 +42,7 @@ services:
 
   # ── Redis ───────────────────────────────────────────────────────────────────
   redis:
-    image: redis:8.6-alpine
+    image: redis:8.8-alpine
     restart: unless-stopped
     networks:
       - spatiumddi
@@ -364,10 +364,7 @@ services:
     #   # (that's the peer URL advertised to the partner). Host-side mapped
     #   # off 8000 so the control plane API keeps :8000.
     #   - "8001:8000/tcp"
-    #   # Optional kea-ctrl-agent REST (operator-facing). Lives on :8544
-    #   # inside the container — see agent/dhcp/images/kea/kea-ctrl-agent.conf
     #   # for why it's deliberately not on :8000.
-    #   - "8544:8544/tcp"
     depends_on:
       api:
         condition: service_started
@@ -419,7 +416,6 @@ services:
     #   # Distinct host ports so both peers can listen without colliding.
     #   - "6768:67/udp"
     #   - "8002:8000/tcp"   # HA hook peer-to-peer HTTP
-    #   - "8545:8544/tcp"   # optional kea-ctrl-agent REST
     depends_on:
       api:
         condition: service_started

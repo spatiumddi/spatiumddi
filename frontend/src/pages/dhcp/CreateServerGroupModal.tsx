@@ -33,12 +33,43 @@ export function CreateServerGroupModal({
   const [socketMode, setSocketMode] = useState<"direct" | "relay">(
     group?.dhcp_socket_mode ?? "direct",
   );
+  // #637 — Kea lease cache. Empty string in the max-age box means "uncapped",
+  // which the API models as null.
+  const [leaseCacheThreshold, setLeaseCacheThreshold] = useState(
+    String(group?.lease_cache_threshold ?? 0),
+  );
+  const [leaseCacheMaxAge, setLeaseCacheMaxAge] = useState(
+    group?.lease_cache_max_age != null ? String(group.lease_cache_max_age) : "",
+  );
   const [error, setError] = useState("");
 
   const isHA = mode === "hot-standby" || mode === "load-balancing";
 
   const mut = useMutation({
     mutationFn: () => {
+      // #637 — validate client-side so an out-of-range threshold surfaces as an
+      // inline message instead of a raw 422, matching CreateScopeModal's handling
+      // of the same field. Blank threshold falls back to 0 (caching disabled);
+      // blank max-age means uncapped, which the API models as null.
+      const parsedCacheThreshold =
+        leaseCacheThreshold.trim() === "" ? 0 : parseFloat(leaseCacheThreshold);
+      const parsedCacheMaxAge =
+        leaseCacheMaxAge.trim() === "" ? null : parseInt(leaseCacheMaxAge, 10);
+
+      if (
+        Number.isNaN(parsedCacheThreshold) ||
+        parsedCacheThreshold < 0 ||
+        parsedCacheThreshold > 1
+      ) {
+        throw new Error("Lease cache threshold must be between 0 and 1.");
+      }
+      if (
+        parsedCacheMaxAge !== null &&
+        (Number.isNaN(parsedCacheMaxAge) || parsedCacheMaxAge < 1)
+      ) {
+        throw new Error("Lease cache max age must be at least 1 second.");
+      }
+
       const data = {
         name,
         description,
@@ -49,6 +80,8 @@ export function CreateServerGroupModal({
         max_ack_delay_ms: parseInt(maxAck, 10) || 10000,
         max_unacked_clients: parseInt(maxUnacked, 10) || 5,
         auto_failover: autoFailover,
+        lease_cache_threshold: parsedCacheThreshold,
+        lease_cache_max_age: parsedCacheMaxAge,
       };
       return editing
         ? dhcpApi.updateGroup(group!.id, data)
@@ -122,6 +155,49 @@ export function CreateServerGroupModal({
             <option value="relay">Relay-only (UDP sockets)</option>
           </select>
         </Field>
+
+        <div className="rounded-md border bg-muted/20 p-3 space-y-3">
+          <p className="text-xs font-semibold text-muted-foreground">
+            Lease cache
+          </p>
+          <p className="text-xs text-muted-foreground">
+            Kea 3.0 can hand a returning client its existing lease without
+            writing to the lease database. That cuts disk churn, but SpatiumDDI
+            derives lease events from those writes — so a non-zero threshold
+            means fewer DDNS updates and staler IPAM “last seen” timestamps for
+            chatty clients. Leave it at 0 unless you need the write reduction.
+            Individual scopes can override this.
+          </p>
+          <div className="grid grid-cols-2 gap-3">
+            <Field
+              label="Cache threshold"
+              hint="Fraction of the lease lifetime (0–1). 0 disables caching — every renewal writes through, matching pre-3.0 behaviour. 0.25 is Kea's own default: a client renewing with more than 75% of its lease left is handed the same lease with no database write."
+            >
+              <input
+                className={inputCls}
+                type="number"
+                min="0"
+                max="1"
+                step="0.05"
+                value={leaseCacheThreshold}
+                onChange={(e) => setLeaseCacheThreshold(e.target.value)}
+              />
+            </Field>
+            <Field
+              label="Cache max age (sec)"
+              hint="Upper bound on how long a cached lease may be reused, regardless of the threshold. Leave blank for no cap (Kea's default)."
+            >
+              <input
+                className={inputCls}
+                type="number"
+                min="1"
+                placeholder="uncapped"
+                value={leaseCacheMaxAge}
+                onChange={(e) => setLeaseCacheMaxAge(e.target.value)}
+              />
+            </Field>
+          </div>
+        </div>
 
         {isHA && (
           <div className="rounded-md border bg-muted/20 p-3 space-y-3">

@@ -10,7 +10,7 @@
 # from every configured peer but can never advertise one back.
 ARG GOBGP_VERSION=4.7.0
 
-FROM alpine:3.22 AS agent-build
+FROM alpine:3.23 AS agent-build
 RUN apk add --no-cache python3 py3-pip py3-wheel
 WORKDIR /src
 COPY agent/looking-glass/pyproject.toml /src/pyproject.toml
@@ -34,7 +34,16 @@ RUN python3 -m pip install --prefix=/install --no-cache-dir --break-system-packa
 # linux/amd64 + linux/arm64. Bump GOBGP_VERSION (a git tag from
 # https://github.com/osrg/gobgp/tags) + the golang base image together; the
 # repo's committed go.sum verifies every module checksum during the build.
-FROM --platform=$BUILDPLATFORM golang:1.26.4-alpine AS gobgp-build
+#
+# The Go toolchain version is a SECURITY pin, not just a build detail: Go links
+# its standard library statically into the binary, so a stdlib CVE ships inside
+# ``gobgpd`` itself and Trivy flags it against the ``gobinary`` target — there is
+# no separate package to patch and no ``apk upgrade`` that can fix it. The only
+# remedy is to rebuild with a fixed toolchain.
+#
+# ``1.26.5`` clears CVE-2026-39822 (HIGH — ``os.Root`` symlink following allows
+# directory traversal), which 1.26.4 carries. Keep this at the latest 1.26.x.
+FROM --platform=$BUILDPLATFORM golang:1.26.5-alpine AS gobgp-build
 ARG GOBGP_VERSION
 ARG TARGETOS
 ARG TARGETARCH
@@ -53,7 +62,7 @@ RUN GOOS="${TARGETOS:-linux}" GOARCH="${TARGETARCH}" \
  && GOOS="${TARGETOS:-linux}" GOARCH="${TARGETARCH}" \
       go build -trimpath -ldflags="-s -w" -o /out/gobgp ./cmd/gobgp
 
-FROM alpine:3.22 AS runtime
+FROM alpine:3.23 AS runtime
 # ``libcap`` brings in ``setcap`` so gobgpd can bind BGP's privileged
 # TCP/179 as the unprivileged ``spatium`` user (same pattern as
 # kea-dhcp4/6 + named/pdns_server in the DHCP/DNS images — a

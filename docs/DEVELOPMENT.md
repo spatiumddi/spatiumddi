@@ -226,7 +226,7 @@ triggered on push to `main` and on every pull request:
 | Job | What it does |
 |---|---|
 | **Backend — Lint & Type Check** (`backend-lint`) | `pip install -e ".[dev]"` on Python 3.12, then `ruff check`, `black --check`, `mypy app`, **plus the migration-shape linter** (`python3 scripts/lint_migrations.py` — see §8). |
-| **Backend — Tests** (`backend-test`) | A required-check aggregator over four parallel `backend-test-shard` jobs. Each shard spins up `postgres:16-alpine` + `redis:8.6-alpine` services, runs `alembic upgrade head`, then `pytest -n auto --splits 4 --group N` (pytest-split selects the shard's slice; `-n auto` parallelizes it across the runner's vCPUs, each xdist worker on its own `spatiumddi_test_gw<N>` DB). The aggregator passes only if all four shards pass. |
+| **Backend — Tests** (`backend-test`) | A required-check aggregator over four parallel `backend-test-shard` jobs. Each shard spins up `postgres:16-alpine` + `redis:8.8-alpine` services, runs `alembic upgrade head`, then `pytest -n auto --splits 4 --group N` (pytest-split selects the shard's slice; `-n auto` parallelizes it across the runner's vCPUs, each xdist worker on its own `spatiumddi_test_gw<N>` DB). The aggregator passes only if all four shards pass. |
 | **Frontend — Lint & Type Check** (`frontend-lint`) | Node 22, `npm install`, then `npm run lint`, `npm run format:check`, `npm run typecheck`. |
 | **Frontend — Build** (`frontend-build`) | Node 22, `npm install`, `npm run build`. |
 

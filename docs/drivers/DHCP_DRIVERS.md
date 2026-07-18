@@ -99,16 +99,25 @@ Located at [`app/drivers/dhcp/kea.py`](../../backend/app/drivers/dhcp/kea.py). A
 
 | Operation | Mechanism | Notes |
 |---|---|---|
-| Full scope/pool/reservation push | `render_config()` → `ConfigBundle` → agent fetches via long-poll → agent writes `/etc/kea/kea-dhcp4.conf` → `kea-dhcp4 --test` → `config-reload` via Kea Control Agent | Incremental config — no daemon restart. |
-| Validate | `kea-dhcp4 --test -c <rendered.conf>` | Driver method returns `(ok, message)`. |
-| Read leases | Kea `lease_cmds` hook → HTTP POST to Kea Control Agent `/` with `command: lease4-get-all` | Real-time; falls back to polling if CA is unreachable. |
-| Read scopes | Kea Control Agent `config-get` | Used by the /scopes read endpoints. |
+| Full scope/pool/reservation push | `ConfigBundle` → agent fetches via long-poll → agent renders + writes `/etc/kea/kea-dhcp4.conf` → `config-test` → `config-reload` over the Kea **unix control socket** | Incremental config — no daemon restart. |
+| Validate | `config-test` on the unix socket (with the full config doc as `arguments`) | Preflight — a config Kea rejects is never reloaded. |
+| Read leases | Agent tails the **memfile lease CSV** (`/var/lib/kea/kea-leases4.csv`) | Not the `lease_cmds` HTTP API. The hook is still loaded (HA depends on it), but leases reach the control plane by CSV tail → `POST /dhcp/agents/lease-events`. |
+| HA state | `status-get` on the unix socket, every ~15 s | Drives the live HA pill in the UI. |
+| Metrics | `statistic-get-all` on the unix socket, every ~60 s | Deltas of the `pkt4-*` counters. |
 
-Kea runs an HTTP Control Agent on `localhost:8544` (inside the agent pod/container — `:8000` is reserved for the HA hook's peer-to-peer listener). The agent drives Kea by:
+**There is no HTTP Control Agent.** `kea-ctrl-agent` was removed in #637: Kea 3.0 deprecates it, and SpatiumDDI never spoke to it. Everything above rides the **unix control sockets** (`/run/kea/kea4-ctrl-socket`, `/run/kea/kea6-ctrl-socket`) via `agent/dhcp/spatium_dhcp_agent/kea_ctrl.py`. `:8000` is the HA hook's peer-to-peer listener and is now the only TCP port the image exposes.
+
+Note also that the backend's `KeaDriver.apply_config()` / `reload()` / `get_leases()` are **no-ops** — the backend renders config only for the ETag / audit / shape-validation path. The renderer that actually feeds the daemon is the agent's `render_kea.py`. Two renderers exist; the agent one is the load-bearing one.
+
+The agent drives Kea by:
 
 1. Rendering the config bundle into Kea JSON (`Dhcp4` for IPv4, `Dhcp6` for IPv6 — address-family split on `DHCPScope.address_family`).
-2. POSTing to `config-test` before `config-set` to catch validation errors early.
-3. Calling `config-reload` which re-reads the file without dropping in-flight leases.
+2. Sending `config-test` with the rendered doc to catch validation errors *before* touching the live config (a daemon too old to know the command answers `result=2`, which is treated as a soft pass).
+3. Calling `config-reload`, which re-reads the file without dropping in-flight leases.
+
+### Kea 3.0 path restrictions
+
+Kea 3.0 (CVE-2025-32801/2/3) refuses to start if hook libraries, unix control sockets, lease files or log files sit outside its **compiled-in default directories**. Enforcement is a literal string compare of the config path's parent — there is no `realpath()`, so even `/var/run/kea` vs `/run/kea` fails. Alpine builds Kea with `-Dprefix=/usr -Dlocalstatedir=/var -Drunstatedir=/run`, so the enforced defaults are `/usr/lib/kea/hooks`, `/run/kea`, `/var/lib/kea`, `/var/log/kea` — **exactly** SpatiumDDI's existing layout, which is why the 2.6 → 3.0 jump needed no config changes. Do not relocate any of them. Verify with `kea-dhcp4 -W` ("Hooks directory") and `kea-dhcp4 -T <conf>`.
 
 The IPv6 path renders a `Dhcp6` tree in parallel to `Dhcp4`. Dhcp6 option-name translation lands via `_KEA_OPTION_NAMES_V6` in both `backend/app/drivers/dhcp/kea.py` and the agent's `render_kea._options_from_mapping_v6`; v4-only options (`routers`, `broadcast-address`, `mtu`, `time-offset`, tftp-*) are dropped from v6 scopes with a warning.
 
@@ -428,3 +437,57 @@ and the DNS-importer sibling.
 - [Getting Started](../GETTING_STARTED.md) — where DHCP fits in the setup order.
 - [Windows Setup](../deployment/WINDOWS.md) — WinRM prerequisites, service accounts.
 - [DNS Drivers](DNS_DRIVERS.md) — the parallel structure on the DNS side.
+
+---
+
+## Kea 3.0 — HA has no rolling-upgrade path (#637)
+
+Kea 3.0's HA hook is **wire-incompatible with peers older than 2.7.0**. 3.0
+introduced the "released" lease state (value `3`) into the lease updates that HA
+partners exchange, and an older peer rejects them outright.
+
+**There is therefore no rolling 2.6 → 3.0 upgrade for an HA pair — both members
+must cross in the same window.** This is upstream's guidance, not a SpatiumDDI
+limitation, and there is nothing the orchestrator can do about it.
+
+That collides directly with the #296 rolling-upgrade orchestrator, whose whole
+primitive is *one node at a time*: cordon → drain → swap slot → reboot →
+uncordon → next. Midway through such a run, one Kea is on 3.0 and its partner is
+still on 2.6, and the pair falls out of sync until the second node lands.
+
+Two things make this visible rather than a surprise:
+
+1. **`dhcp_server.kea_version`** — the agent reads the running daemon's version
+   off the control socket (`version-get`) and reports it on every heartbeat. This
+   is the Kea *daemon* version, distinct from `agent_version` (the Python agent).
+   `NULL` means "not reported yet" and must be treated as **unknown**, never as
+   "old".
+2. **The `kea_ha_version_skew` preflight check** — runs as part of the
+   rolling-upgrade preflight and classifies the fleet:
+
+   | Condition | Level | Why |
+   |---|---|---|
+   | Members of one HA group already on different Kea majors | `warn` | HA lease sync is broken *now* — and finishing the upgrade is what converges them. |
+   | An HA group is on pre-3.0 Kea | `warn` | This run will cross the boundary node-at-a-time; HA degrades until it completes. |
+   | A member has never reported a version | `warn` | Unknown, so we can't rule out the crossing. |
+   | Every member already on Kea ≥ 3 | `ok` | Nothing to do — and the check self-clears, so it isn't a permanent nag. |
+
+Two pieces of scoping keep the check honest, and getting either wrong turns it
+into something that blocks unrelated work:
+
+* **Appliance nodes only.** The orchestrator never touches docker / k8s DHCP
+  agents (they upgrade through the manual copy-paste path), so counting them
+  would let two unrelated containers veto an appliance-cluster upgrade.
+  `deployment_kind` is matched strictly against `appliance`.
+* **Real HA pairs only.** HA is *not* "≥ 2 Kea members" — `_resolve_failover`
+  renders the HA hook only when there are ≥ 2 Kea members **and every one has a
+  non-empty `ha_peer_url`**. Without a URL there is no HA relationship and
+  nothing for an upgrade to disrupt. The check uses the same predicate, or it
+  would invent pairs the renderer never built.
+
+**The check never returns `fail`.** A `fail` sets `can_start=False`, and blocking
+would be exactly backwards: an already-mixed pair has broken HA *right now*, and
+completing the rolling upgrade is what gets both members onto one version.
+Refusing to start would strand the operator in the broken state. DHCP also keeps
+serving throughout (each Kea answers from its own lease store) — only the HA
+replication *between* peers is disrupted.

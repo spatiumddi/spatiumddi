@@ -86,10 +86,11 @@ spec:
             {{- with .Values.global.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
-          # Liveness via ``kea-ctrl-agent``'s status-get over the
-          # control channel socket. Phase 3 wires this in for real;
-          # Phase 2 ships a minimal tcpSocket-based liveness against
-          # the v4 server.
+          # (Historical note: an earlier plan routed liveness through
+          # ``kea-ctrl-agent``'s status-get. That daemon was never used by
+          # SpatiumDDI and was removed in #637 — the agent speaks to Kea over
+          # its unix control socket. The real gate is the two-condition
+          # readiness probe below.)
           #
           # #296 Phase A2 — readiness gates the per-node Phase 8 rolling
           # upgrade's uncordon step. A kubernetes-Ready node briefly

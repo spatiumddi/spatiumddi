@@ -231,6 +231,12 @@ def _render_scope(scope: ScopeDef) -> dict[str, Any]:
         out["min-valid-lifetime"] = scope.min_lease_time
     if scope.max_lease_time is not None:
         out["max-valid-lifetime"] = scope.max_lease_time
+    # #637 — per-scope lease-cache override. None = inherit the group-wide value
+    # emitted on the Dhcp4/Dhcp6 root; 0.0 is meaningful (caching explicitly off).
+    if scope.lease_cache_threshold is not None:
+        out["cache-threshold"] = scope.lease_cache_threshold
+    if scope.lease_cache_max_age is not None:
+        out["cache-max-age"] = scope.lease_cache_max_age
     if scope.options and serve_options:
         out["option-data"] = _render_option_data(scope.options, address_family=af)
     # Relay-agent matching (issue #337). Kea selects this subnet for
@@ -316,6 +322,9 @@ class KeaDriver(DHCPDriver):
         if v4_scopes or not v6_scopes:
             out["Dhcp4"] = {
                 "valid-lifetime": bundle.options.lease_time,
+                # #637 — group-wide Kea lease cache, rendered explicitly because
+                # Kea 3.0 flipped the default from off to 0.25.
+                "cache-threshold": bundle.lease_cache_threshold,
                 # Issue #365 — ``raw`` (group socket_mode "direct") receives
                 # broadcast DISCOVERs from directly-attached clients; ``udp``
                 # is relay-only. v6 below has no socket-type concept.
@@ -348,6 +357,8 @@ class KeaDriver(DHCPDriver):
                 # issue #368) and hw-address (when the operator only knows the
                 # MAC). Order = match precedence.
                 "host-reservation-identifiers": ["duid", "hw-address"],
+                # #637 — see the Dhcp4 block.
+                "cache-threshold": bundle.lease_cache_threshold,
                 "lease-database": {
                     "type": "memfile",
                     "persist": True,
@@ -359,6 +370,12 @@ class KeaDriver(DHCPDriver):
                 ],
                 "option-data": _render_option_data(bundle.options.options, address_family="ipv6"),
             }
+        # #637 — group-wide ``cache-max-age`` is optional (None = uncapped, Kea's
+        # own default), so it is applied conditionally rather than in the literals.
+        if bundle.lease_cache_max_age is not None:
+            for family in ("Dhcp4", "Dhcp6"):
+                if family in out:
+                    out[family]["cache-max-age"] = bundle.lease_cache_max_age
         return json.dumps(out, indent=2, sort_keys=True)
 
     async def apply_config(self, server: Any, bundle: ConfigBundle) -> None:
