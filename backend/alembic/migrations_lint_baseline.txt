@@ -114,6 +114,8 @@ backend/alembic/versions/a3c8e5d61b94_subnet_classification_tags.py:drop_column:
 backend/alembic/versions/a3d7f1c9e6b2_dns_pool_member_geo_steering.py:drop_column:71
 backend/alembic/versions/a3d7f1c9e6b2_dns_pool_member_geo_steering.py:drop_column:72
 backend/alembic/versions/a3d7f1c9e6b2_dns_pool_member_geo_steering.py:drop_constraint_fk:69
+backend/alembic/versions/a3d9f1e64c72_dns_zone_update_acl.py:drop_column:106
+backend/alembic/versions/a3d9f1e64c72_dns_zone_update_acl.py:drop_table:105
 backend/alembic/versions/a3e7c9d12f80_appliance_resolver_settings.py:drop_column:106
 backend/alembic/versions/a3e7c9d12f80_appliance_resolver_settings.py:drop_column:108
 backend/alembic/versions/a3f1d6c92b58_new_device_watch.py:drop_column:139

@@ -22,9 +22,12 @@ from app.models.dns import (
     DNSRecord,
     DNSServerGroup,
     DNSServerOptions,
+    DNSTSIGKey,
     DNSView,
     DNSZone,
+    DNSZoneUpdateAcl,
 )
+from app.services.ai.operations_writes import SetZoneUpdateAclArgs
 from app.services.ai.tools.base import register_tool
 
 
@@ -984,3 +987,96 @@ async def find_dns_query_stats(
 # module load, but the linters want at-least-one referent in module
 # scope.
 _ = (DNSPoolMember, DNSServerGroup)
+
+
+class FindZoneUpdateAclsArgs(BaseModel):
+    zone_id: uuid.UUID = Field(description="UUID of the DNS zone to inspect.")
+
+
+@register_tool(
+    name="find_zone_update_acls",
+    description=(
+        "Return a DNS zone's dynamic-update (RFC 2136) ACL (issue #641): "
+        "whether ``dynamic_update_enabled`` is on, the ordered list of "
+        "authorized writers (each identified by a TSIG key NAME or a "
+        "source IP/CIDR — secrets are never returned), and what the "
+        "zone's DNS backend can express (``caps``). Use this to answer "
+        "'who can send dynamic updates to example.com?' or 'is the DC "
+        "allowed to register records in this zone?'. Read-only — the "
+        "matching ``propose_set_zone_update_acl`` write sets the ACL."
+    ),
+    args_model=FindZoneUpdateAclsArgs,
+    category="dns",
+    module="dns.dynamic_update_acl",
+)
+async def find_zone_update_acls(
+    db: AsyncSession, user: User, args: FindZoneUpdateAclsArgs
+) -> dict[str, Any]:
+    from app.api.v1.dns.router import (  # noqa: PLC0415
+        _effective_dynamic_update_caps,
+        _group_driver_names,
+    )
+
+    zone = await db.get(DNSZone, args.zone_id)
+    if zone is None:
+        return {"error": "DNS zone not found", "zone_id": str(args.zone_id)}
+    driver_names = await _group_driver_names(db, zone.group_id)
+    caps = _effective_dynamic_update_caps(driver_names)
+    rows = (
+        await db.execute(
+            select(DNSZoneUpdateAcl, DNSTSIGKey.name)
+            .outerjoin(DNSTSIGKey, DNSZoneUpdateAcl.tsig_key_id == DNSTSIGKey.id)
+            .where(DNSZoneUpdateAcl.zone_id == zone.id)
+            .order_by(DNSZoneUpdateAcl.seq)
+        )
+    ).all()
+    return {
+        "zone_id": str(zone.id),
+        "name": zone.name,
+        "dynamic_update_enabled": zone.dynamic_update_enabled,
+        "driver_names": driver_names,
+        "caps": {
+            "supports_ip_acl": caps.supports_ip_acl,
+            "supports_tsig_acl": caps.supports_tsig_acl,
+            "supports_name_scoping": caps.supports_name_scoping,
+            "supports_per_type": caps.supports_per_type,
+            "coarse_enum_only": caps.coarse_enum_only,
+        },
+        "entries": [
+            {
+                "seq": acl.seq,
+                "action": acl.action,
+                "match_kind": acl.match_kind,
+                "ip_cidr": acl.ip_cidr,
+                "tsig_key_name": key_name,
+                "name_scope": acl.name_scope,
+                "name_pattern": acl.name_pattern,
+                "record_types": acl.record_types,
+            }
+            for acl, key_name in rows
+        ],
+    }
+
+
+@register_tool(
+    name="propose_set_zone_update_acl",
+    description=(
+        "Propose setting a DNS zone's dynamic-update (RFC 2136) ACL "
+        "(issue #641) — a full ordered replace of who may send DDNS "
+        "updates (by TSIG key id or source IP/CIDR), optionally flipping "
+        "``dynamic_update_enabled``. Preview/apply: the model proposes, "
+        "the operator clicks Apply. Security-sensitive (authorizes "
+        "third-party writers to a zone), so this is disabled by default."
+    ),
+    args_model=SetZoneUpdateAclArgs,
+    category="dns",
+    writes=True,
+    default_enabled=False,
+    module="dns.dynamic_update_acl",
+)
+async def propose_set_zone_update_acl(
+    db: AsyncSession, user: User, args: SetZoneUpdateAclArgs
+) -> dict[str, Any]:
+    from app.services.ai.tools.proposals import _propose_via  # noqa: PLC0415
+
+    return await _propose_via(db=db, user=user, operation_name="set_zone_update_acl", args=args)

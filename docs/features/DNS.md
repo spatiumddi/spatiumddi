@@ -1156,3 +1156,101 @@ The same report is exposed to the Operator Copilot as the read-only
 `find_nonconforming_names` MCP tool (default-enabled, superadmin-gated) —
 *"which hostnames aren't valid DNS names?"* / *"do we have any records that
 would break a zone file?"*.
+
+## 19. Dynamic-update (RFC 2136) ACLs on zones (issue #641)
+
+Operators can authorize **third-party dynamic-DNS writers** — an AD
+domain controller, a DHCP server registering A/PTR — to update a managed
+zone over RFC 2136, identified **by TSIG key** or **by source IP/CIDR**.
+This is distinct from (and layered on top of) SpatiumDDI's own internal
+loopback writes: the agent always keeps its group-key `allow-update` grant
+so control-plane record ops keep flowing.
+
+### 19.1 Data model
+
+- `DNSZone.dynamic_update_enabled` (bool, default false) — the master
+  gate. Off ⇒ only the internal loopback writer is authorized (today's
+  behaviour).
+- `dns_zone_update_acl` — one row per authorized writer, ordered by `seq`
+  (first-match). Each row identifies a writer by *either* `tsig_key_id`
+  (FK → `dns_tsig_key`) *or* `ip_cidr`; a `CHECK (num_nonnulls(...) = 1)`
+  enforces exactly one. `action` / `name_scope` / `name_pattern` /
+  `record_types` are forward-compatible storage for the P2 BIND9
+  `update-policy` path — persisted now, rendered later.
+
+Secrets never surface: a TSIG entry references a key by id/name, and the
+Fernet-encrypted secret is resolved to a *name* only when the ACL renders
+into the config bundle. API responses expose `tsig_key_name`, never the
+secret.
+
+### 19.2 Driver capability model
+
+Backends differ in what they can express, so the driver ABC carries a
+`DynamicUpdateCaps` descriptor (`supports_ip_acl`, `supports_tsig_acl`,
+`supports_name_scoping`, `supports_per_type`, `coarse_enum_only`). The API
+consults it **before** accepting an ACL:
+
+| Backend | ip | tsig | name-scope | per-type | notes |
+|---|---|---|---|---|---|
+| **BIND9** | ✅ | ✅ | ⬜ (P2) | ⬜ (P2) | coarse `allow-update` today |
+| **PowerDNS / Windows** | ⬜ | ⬜ | ⬜ | ⬜ | rendering is P3 — feature 422s for now |
+| **Route53 / Azure / Cloudflare / Google** | ⬜ | ⬜ | ⬜ | ⬜ | no RFC 2136 → 422 `DYNAMIC_UPDATE_UNSUPPORTED` |
+
+An entry the group's driver can't honour is rejected (422); a
+lossy-but-accepted mapping comes back as a `warnings[]` entry (e.g. an IP
+entry is UDP-spoofable → recommend TSIG).
+
+### 19.3 API
+
+- `GET /dns/groups/{gid}/dynamic-update-caps` — what the group's driver(s)
+  can express (the UI greys unsupported controls; `supported=false` ⇒ the
+  whole feature 422s).
+- `GET /dns/groups/{gid}/zones/{zid}/update-acl` — the current ACL +
+  `dynamic_update_enabled` + resolved `tsig_key_name`s + standing warnings.
+- `PUT /dns/groups/{gid}/zones/{zid}/update-acl` — full ordered replace
+  (optionally flips `dynamic_update_enabled` in the same call). Superadmin;
+  every mutation is audited; validation runs the driver capability gate.
+
+All three gate behind the default-on `dns.dynamic_update_acl` feature
+module. MCP: `find_zone_update_acls` (read, default-on) +
+`propose_set_zone_update_acl` (write, preview/apply, **default-off** —
+security-sensitive).
+
+### 19.4 Rendering (BIND9, P1)
+
+The agent renders a single coarse `allow-update` address-match-list mixing
+IP + TSIG:
+
+```
+allow-update { 10.0.0.0/24; key "dc01-ddns."; };
+```
+
+Every TSIG key in the bundle now renders a `key { … }` block (previously
+only the group loopback key did), so an operator key referenced in
+`allow-update` is always defined. The internal loopback grant is always
+included. The fine-grained `update-policy` path (name scoping, per-type,
+deny) is P2.
+
+### 19.5 Drift — ingest-back (Alt.1)
+
+A dynamic zone accepts records the control plane didn't create; those live
+only in the daemon journal and would be dropped on a full re-render (cold
+boot, from-scratch re-seed). The BIND9 agent closes the loop: it AXFRs
+each dynamic zone from loopback (signed with the group loopback key — the
+zone stanza grants `allow-transfer { key … }` for exactly this, nothing is
+opened to the network) and POSTs the live record set to
+`POST /dns/agents/ingested-records`. The control plane mirrors any record
+it doesn't already manage as an ordinary `DNSRecord` stamped
+`import_source="ddns_external"`, so externally-injected records become
+UI/IPAM-visible and survive a re-render.
+
+**Conflict rule: control-plane-managed names win.** An incoming record
+whose `(name, record_type)` collides with a managed row is skipped; only
+external-only names are mirrored. Zone-management + DNSSEC RRs (SOA, apex
+NS, RRSIG/NSEC*/DNSKEY/CDS/CDNSKEY, private-type 65534) are never ingested.
+
+**P1 limitation:** live multi-server propagation of an ingested record
+across every server in a group happens on the next full re-render, not
+instantly (ingested rows aren't re-shipped as per-server record ops). The
+record is durable + visible immediately; other servers converge on their
+next structural reload.

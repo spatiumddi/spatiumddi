@@ -20,6 +20,77 @@ the formatter handles the rest.
 
 ---
 
+## 2026.07.19-1 — 2026-07-19
+
+**The dynamic-update ACL release.** SpatiumDDI already ran managed
+BIND9 zones and let the control plane write them over a TSIG-signed
+loopback path — but there was **no** operator-facing way to let a
+*third party* (an AD domain controller, a DHCP server registering
+A/PTR) send RFC 2136 dynamic updates to a zone. The zone model
+advertised an `allow-update` surface in the docs that never existed.
+This release ships the real thing (#641): a per-zone dynamic-update
+ACL — authorize writers **by TSIG key or source IP/CIDR** — with a
+driver capability model that degrades cleanly (BIND9 renders it; cloud
+drivers 422; PowerDNS + Windows are gated for a later phase), plus
+**ingest-back** so externally-injected records the control plane never
+created become visible and survive a full re-render instead of being
+clobbered.
+
+### Added
+
+- **Dynamic-update (RFC 2136) ACLs on DNS zones (#641).**
+  - `DNSZone.dynamic_update_enabled` + a new `dns_zone_update_acl`
+    table (ordered first-match rows; each authorizes a writer by
+    `tsig_key_id` *or* `ip_cidr`, `CHECK num_nonnulls = 1`). Reuses
+    the existing operator-managed `DNSTSIGKey` rows — the "last mile"
+    that attaches a key to a zone's `allow-update`.
+  - Driver capability model: `DynamicUpdateCaps` +
+    `validate_update_acl()` on the DNS driver ABC. BIND9 advertises
+    IP + TSIG (coarse `allow-update`); cloud drivers advertise nothing
+    and the write 422s `DYNAMIC_UPDATE_UNSUPPORTED`; lossy mappings
+    surface as `warnings[]`.
+  - REST: `GET /dns/groups/{gid}/dynamic-update-caps`,
+    `GET`/`PUT /dns/groups/{gid}/zones/{zid}/update-acl` (full ordered
+    replace, superadmin, audited), plus `dynamic_update_enabled` on the
+    zone schema. Secrets never surface — responses carry
+    `tsig_key_name` only. All gated behind the default-on
+    `dns.dynamic_update_acl` feature module.
+  - Config bundle ships `dynamic_update_enabled` + the resolved ACL
+    (by key name) so an edit shifts the structural ETag and wakes the
+    agent long-poll → a full, `allow-update`-correct re-render.
+  - Agent (BIND9): renders one coarse `allow-update` mixing IP + TSIG,
+    always keeping the internal loopback grant; now renders a `key {}`
+    block for **every** TSIG key in the bundle (previously only the
+    group key), so an operator key named in `allow-update` is defined.
+  - **Ingest-back (Alt.1):** a new agent worker AXFRs each dynamic
+    zone from loopback (signed with the group key; the zone grants
+    `allow-transfer { key … }` for exactly this) and posts the live
+    records to `POST /dns/agents/ingested-records`. The control plane
+    mirrors anything it doesn't manage as
+    `import_source="ddns_external"` `DNSRecord` rows — control-plane
+    names win on conflict — so externally-injected records become
+    UI/IPAM-visible and survive a re-render.
+  - Operator Copilot: `find_zone_update_acls` (read, default-on) +
+    `propose_set_zone_update_acl` (write, preview/apply, default-off).
+  - UI: a **Dynamic Updates** button + editor on the zone detail —
+    TSIG-key picker / IP-CIDR rows, capability-gated controls, and a
+    persistent UDP-spoofing warning on IP entries.
+
+### Fixed
+
+- **Docs bug (#641):** `docs/SHIPPED.md` claimed operators could
+  reference TSIG keys from a zone's `allow-update` field. That field
+  never existed (only `allow_query` / `allow_transfer` did) and
+  nothing rendered `allow-update` from a key reference. Corrected, and
+  the real surface now exists.
+
+### Migrations
+
+- `a3d9f1e64c72` — `dns_zone.dynamic_update_enabled` +
+  `dns_zone_update_acl` table + seed the `dns.dynamic_update_acl`
+  feature module. Backfill-free: existing zones stay exactly as they
+  render today (only the internal loopback grant).
+
 ## 2026.07.11-1 — 2026-07-11
 
 **The firewall release.** SpatiumDDI has always been a read-only

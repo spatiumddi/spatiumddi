@@ -1558,13 +1558,22 @@ Mirrors CLAUDE.md's three mixed sections:
   stanza per row. UI: new "TSIG Keys" tab on the DNS server
   group view, with create / edit / rotate / delete plus a
   one-shot "Copy this secret now" modal after each
-  create / rotate. Operators reference keys from a zone's
-  allow-update / allow-transfer fields as `key keyname.;`.
+  create / rotate. These keys are attachable to a zone's
+  dynamic-update ACL — see the **Dynamic-update (RFC 2136)
+  ACLs** entry below (issue #641), which is the surface that
+  wires a key into a zone's `allow-update` clause.
   Migration `7c299e8a5490_dns_tsig_keys`.
-  **Deferred:** zone-level dropdown picker that suggests
-  available keys (today operators paste the key reference into
-  the existing free-text allow-update / allow-transfer fields);
-  per-key audit-log of which zones reference it.
+  **Deferred:** per-key audit-log of which zones reference it.
+
+  > **Correction (issue #641):** earlier revisions of this entry
+  > claimed operators "reference keys from a zone's allow-update /
+  > allow-transfer fields as `key keyname.;`" and listed only a
+  > dropdown picker as deferred. That was inaccurate — the zone
+  > model never had an `allow-update` field, only `allow_query` /
+  > `allow_transfer`, and nothing rendered `allow-update` from a
+  > key reference. The real "last mile" (a per-zone dynamic-update
+  > ACL that attaches these TSIG keys to `allow-update`) shipped
+  > under issue #641; the dropdown picker landed there too.
 
 - ✅ **Conditional forwarders** — per-zone forwarding for mixed-AD
   environments. `DNSZone` carries `forwarders` (JSONB list of IPs)

@@ -678,3 +678,54 @@ Same agent caching model as DHCP (see DHCP spec). For DNS:
 - Agent tracks the last-applied `ConfigBundle` ETag in `/var/lib/spatium-dns-agent/config/current.etag` (alongside the cached bundle in `config/current.json`)
 - On reconnect: long-poll picks up any new ETag, the agent reconciles by GET-ing PowerDNS's current zone list and PATCHing the rrset diff against the new ConfigBundle. Same convergence shape as BIND9.
 
+
+## 8. Dynamic-update (RFC 2136) ACLs (issue #641)
+
+The driver ABC exposes what a backend can express for operator-configured
+dynamic-update ACLs via a capability descriptor + a validator:
+
+```python
+@property
+def dynamic_update_caps(self) -> DynamicUpdateCaps: ...
+def validate_update_acl(self, zone_name, entries) -> list[str]: ...  # warnings; raises on unsupported
+```
+
+`DynamicUpdateCaps` flags: `supports_ip_acl`, `supports_tsig_acl`,
+`supports_name_scoping`, `supports_per_type`, `coarse_enum_only`. The base
+class defaults every flag to **False** (feature unsupported), so cloud
+drivers 422 the write for free; drivers override to opt in.
+
+| Driver | ip | tsig | name-scope | per-type | render path |
+|---|---|---|---|---|---|
+| **BIND9** | ✅ | ✅ | ⬜ (P2) | ⬜ (P2) | coarse `allow-update` (agent `_render_allow_update`) |
+| **PowerDNS** | ⬜ | ⬜ | ⬜ | ⬜ | P3 — `dnsupdate=yes` + `ALLOW-DNSUPDATE-FROM` / `TSIG-ALLOW-DNSUPDATE` |
+| **Windows DNS** | ⬜ | ⬜ | ⬜ | ⬜ | P3 — `coarse_enum_only` maps to None/Secure/NonsecureAndSecure |
+| **Cloud (R53/Azure/CF/Google)** | ⬜ | ⬜ | ⬜ | ⬜ | N/A — no RFC 2136; feature disabled |
+
+`validate_update_acl` returns human-readable **warnings** for
+lossy-but-accepted mappings (an IP entry is UDP-spoofable; on a
+`coarse_enum_only` backend an IP entry opens the zone wider than the CIDR)
+and **raises** `ValueError` (surfaced as a 422 by the API) on a
+hard-unsupported entry — any entry on a no-surface driver, or a
+name-scoped / per-type / `deny` entry on coarse-only BIND9-P1.
+
+### 8.1 BIND9 agent rendering
+
+The **agent** (`agent/dns/spatium_dns_agent/drivers/bind9.py`) is the
+authoritative renderer on an appliance. Two changes support #641:
+
+1. `_render_allow_update(zone, group_key)` builds one coarse
+   `allow-update { … }` mixing the always-present group loopback key with
+   the operator ACL's grant entries (`<cidr>;` / `key "<name>";`). `deny`
+   and name/type-scoped entries are skipped (they never reach a coarse
+   render — the capability gate blocks them until P2).
+2. Every TSIG key in the bundle now renders a `key { … }` block (not just
+   `tsig_keys[0]`), so an operator key named in `allow-update` is defined —
+   BIND rejects a stanza that references an undefined key.
+
+Dynamic zones also render `allow-transfer { key "<group-key>"; };` so the
+ingest-back worker can AXFR the live zone from loopback (see DNS.md §19.5).
+
+The control-plane BIND9 template (`zone.stanza.j2`) renders the same coarse
+`allow-update` for the preview / agentless path, kept in parity with the
+agent renderer.

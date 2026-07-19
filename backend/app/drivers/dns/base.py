@@ -75,6 +75,53 @@ class ZoneData:
     # primary zones; PowerDNS ignores both (online-signing is op-driven).
     dnssec_enabled: bool = False
     dnssec_policy_name: str | None = None
+    # Operator-configurable dynamic-update ACL (issue #641). When
+    # ``dynamic_update_enabled`` the driver renders backend-specific
+    # authorization (BIND9 ``allow-update`` / PowerDNS metadata) from
+    # ``update_acl`` *in addition* to the internal agent loopback grant.
+    # Empty / disabled ⇒ today's behaviour (loopback grant only). Only
+    # meaningful for primary zones on drivers whose ``dynamic_update_caps``
+    # advertise support; ignored otherwise.
+    dynamic_update_enabled: bool = False
+    update_acl: tuple[UpdateAclEntry, ...] = ()
+
+
+@dataclass(frozen=True)
+class UpdateAclEntry:
+    """One neutral dynamic-update ACL grant/deny (issue #641).
+
+    Backend-neutral projection of a ``DNSZoneUpdateAcl`` row. Carries a
+    TSIG key **name** (never the secret) or a source ``ip_cidr`` — exactly
+    one is set. ``action`` / ``name_scope`` / ``name_pattern`` /
+    ``record_types`` drive the BIND9 ``update-policy`` fine-grained path
+    (P2); the coarse ``allow-update`` path (P1) consumes only
+    ``match_kind`` + ``ip_cidr`` / ``tsig_key_name``.
+    """
+
+    match_kind: str  # "tsig_key" | "ip"
+    action: str = "grant"  # "grant" | "deny"
+    ip_cidr: str | None = None
+    tsig_key_name: str | None = None
+    name_scope: str | None = None
+    name_pattern: str | None = None
+    record_types: tuple[str, ...] | None = None
+
+
+@dataclass(frozen=True)
+class DynamicUpdateCaps:
+    """What a DNS backend can express for dynamic-update ACLs (issue #641).
+
+    The API consults these *before* accepting an ACL: an entry the target
+    group's driver can't honour is rejected (422), and a lossy mapping
+    (e.g. an IP entry on Windows) is surfaced as a warning. A driver with
+    every flag False (cloud) means the feature is unsupported entirely.
+    """
+
+    supports_ip_acl: bool = False  # allow-update with address-match-list
+    supports_tsig_acl: bool = False  # key-based authorization
+    supports_name_scoping: bool = False  # per-name / subdomain grants (BIND update-policy)
+    supports_per_type: bool = False  # restrict a grant to A/PTR/…
+    coarse_enum_only: bool = False  # Windows: zone-level None/Secure/NonsecureAndSecure
 
 
 @dataclass(frozen=True)
@@ -369,12 +416,90 @@ class DNSDriver(ABC):
     def capabilities(self) -> dict[str, Any]:
         """Return a dict describing what this driver supports."""
 
+    # ── Dynamic-update ACLs (issue #641) ─────────────────────────────────
+
+    @property
+    def dynamic_update_caps(self) -> DynamicUpdateCaps:
+        """What this backend can express for dynamic-update (RFC 2136) ACLs.
+
+        Default is "unsupported entirely" (every flag False). BIND9 /
+        PowerDNS / Windows override; cloud drivers inherit this default so
+        the API 422s the feature for them.
+        """
+        return DynamicUpdateCaps()
+
+    def validate_update_acl(self, zone_name: str, entries: Sequence[UpdateAclEntry]) -> list[str]:
+        """Validate an ACL against this driver's capabilities.
+
+        Returns a list of human-readable *warnings* for lossy-but-accepted
+        mappings (e.g. an IP entry on Windows opens the zone wider than the
+        CIDR). Raises :class:`ValueError` (surfaced by the API as a 422)
+        when an entry is hard-unsupported. An empty warning list + no raise
+        means the ACL renders exactly as written.
+        """
+        caps = self.dynamic_update_caps
+        if not (
+            caps.supports_ip_acl
+            or caps.supports_tsig_acl
+            or caps.supports_name_scoping
+            or caps.coarse_enum_only
+        ):
+            raise ValueError(
+                f"{self.name} does not support dynamic-update ACLs "
+                f"(no RFC 2136 surface for zone {zone_name})"
+            )
+        warnings: list[str] = []
+        for e in entries:
+            if e.match_kind == "ip":
+                if caps.coarse_enum_only:
+                    warnings.append(
+                        f"IP entry {e.ip_cidr!r}: {self.name} cannot restrict dynamic "
+                        "updates to a source range — enabling opens the zone to any "
+                        "nonsecure client, not just this CIDR. Prefer a TSIG/secure grant."
+                    )
+                elif not caps.supports_ip_acl:
+                    raise ValueError(
+                        f"{self.name} cannot authorize dynamic updates by source IP "
+                        f"({e.ip_cidr!r}); use a TSIG key instead."
+                    )
+                else:
+                    warnings.append(
+                        f"IP entry {e.ip_cidr!r} is UDP-spoofable; a TSIG key is "
+                        "strongly recommended for any writer outside a trusted segment."
+                    )
+            elif e.match_kind == "tsig_key":
+                if not caps.supports_tsig_acl:
+                    raise ValueError(
+                        f"{self.name} cannot authorize dynamic updates by TSIG key "
+                        f"({e.tsig_key_name!r})."
+                    )
+            else:
+                raise ValueError(f"unknown match_kind {e.match_kind!r}")
+            if e.action == "deny" and not caps.supports_name_scoping:
+                raise ValueError(
+                    f"{self.name} has no update-policy surface, so a 'deny' entry "
+                    "cannot be expressed (deny is only meaningful for BIND9 "
+                    "update-policy). Use grant-only ACLs on this backend."
+                )
+            if (e.name_scope or e.name_pattern) and not caps.supports_name_scoping:
+                raise ValueError(
+                    f"{self.name} cannot scope a dynamic-update grant to a name "
+                    "pattern; drop name_scope/name_pattern for this backend."
+                )
+            if e.record_types and not caps.supports_per_type:
+                raise ValueError(
+                    f"{self.name} cannot restrict a dynamic-update grant to specific "
+                    "record types; drop record_types for this backend."
+                )
+        return warnings
+
 
 __all__ = [
     "AclData",
     "BlocklistEntry",
     "ConfigBundle",
     "DNSDriver",
+    "DynamicUpdateCaps",
     "EffectiveBlocklistData",
     "RecordChange",
     "RecordChangeResult",
@@ -382,6 +507,7 @@ __all__ = [
     "ServerOptions",
     "TrustAnchorData",
     "TsigKey",
+    "UpdateAclEntry",
     "ViewData",
     "ZoneData",
 ]

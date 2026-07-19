@@ -34,7 +34,8 @@ from app.core.permissions import (
     token_scope_allows,
 )
 from app.drivers.dns import _DRIVERS as _DNS_DRIVERS
-from app.drivers.dns import CLOUD_DNS_DRIVERS, is_agentless
+from app.drivers.dns import CLOUD_DNS_DRIVERS, get_driver, is_agentless
+from app.drivers.dns.base import DynamicUpdateCaps, UpdateAclEntry
 from app.drivers.dns.windows import test_winrm_credentials
 from app.models.audit import AuditLog
 from app.models.dns import (
@@ -52,6 +53,7 @@ from app.models.dns import (
     DNSTSIGKey,
     DNSView,
     DNSZone,
+    DNSZoneUpdateAcl,
 )
 from app.services.ai.operations import get_operation
 from app.services.ai.operations_risky import DeleteZoneArgs
@@ -80,6 +82,7 @@ from app.services.dns_io import (
     parse_zone_file,
     write_zone_file,
 )
+from app.services.feature_modules import require_module
 from app.services.soft_delete import (
     apply_soft_delete,
     collect_soft_delete_batch,
@@ -813,6 +816,11 @@ class ZoneUpdate(BaseModel):
     allow_transfer: list[str] | None = None
     also_notify: list[str] | None = None
     notify_enabled: str | None = None
+    # Dynamic-update (RFC 2136) ACL toggle (issue #641). The ACL rows
+    # themselves are managed through the dedicated
+    # ``/zones/{id}/update-acl`` endpoint; this flag gates whether they
+    # render into ``allow-update``. Flipping it re-renders the zone.
+    dynamic_update_enabled: bool | None = None
     forwarders: list[str] | None = None
     forward_only: bool | None = None
     # Secondary / stub primaries (issue #336). Validated against the
@@ -889,6 +897,7 @@ class ZoneResponse(BaseModel):
     dnssec_enabled: bool
     auto_tls_probe: bool = False
     dnssec_policy_id: uuid.UUID | None = None
+    dynamic_update_enabled: bool = False
     color: str | None
     last_serial: int
     last_pushed_at: datetime | None
@@ -3556,6 +3565,387 @@ async def update_zone(
     await db.commit()
     await db.refresh(zone)
     return zone
+
+
+# ── Dynamic-update (RFC 2136) ACLs (issue #641) ─────────────────────────────
+
+_ACL_MATCH_KINDS = frozenset({"tsig_key", "ip"})
+_ACL_ACTIONS = frozenset({"grant", "deny"})
+_ACL_NAME_SCOPES = frozenset({"self", "subdomain", "zonesub", "wildcard", "name"})
+
+
+class UpdateAclEntryIn(BaseModel):
+    """One dynamic-update ACL grant/deny in a full-replace payload."""
+
+    match_kind: str  # tsig_key | ip
+    action: str = "grant"
+    ip_cidr: str | None = None
+    tsig_key_id: uuid.UUID | None = None
+    name_scope: str | None = None
+    name_pattern: str | None = None
+    record_types: list[str] | None = None
+
+    @field_validator("match_kind")
+    @classmethod
+    def _v_kind(cls, v: str) -> str:
+        if v not in _ACL_MATCH_KINDS:
+            raise ValueError(f"match_kind must be one of {sorted(_ACL_MATCH_KINDS)}")
+        return v
+
+    @field_validator("action")
+    @classmethod
+    def _v_action(cls, v: str) -> str:
+        if v not in _ACL_ACTIONS:
+            raise ValueError(f"action must be one of {sorted(_ACL_ACTIONS)}")
+        return v
+
+    @field_validator("name_scope")
+    @classmethod
+    def _v_scope(cls, v: str | None) -> str | None:
+        if v is not None and v not in _ACL_NAME_SCOPES:
+            raise ValueError(f"name_scope must be one of {sorted(_ACL_NAME_SCOPES)}")
+        return v
+
+    @field_validator("record_types")
+    @classmethod
+    def _v_rtypes(cls, v: list[str] | None) -> list[str] | None:
+        if v is None:
+            return None
+        return [t.strip().upper() for t in v if t and t.strip()] or None
+
+    @model_validator(mode="after")
+    def _v_identity(self) -> UpdateAclEntryIn:
+        # Exactly one identity column, matching the DB CHECK constraint.
+        if self.match_kind == "tsig_key":
+            if self.tsig_key_id is None or self.ip_cidr is not None:
+                raise ValueError("a tsig_key entry requires tsig_key_id and no ip_cidr")
+        else:  # ip
+            if self.ip_cidr is None or self.tsig_key_id is not None:
+                raise ValueError("an ip entry requires ip_cidr and no tsig_key_id")
+            try:
+                # Normalise + validate. strict=False accepts host bits set
+                # (a bare host becomes /32 or /128).
+                self.ip_cidr = str(ipaddress.ip_network(self.ip_cidr, strict=False))
+            except ValueError as exc:
+                raise ValueError(f"invalid ip_cidr: {exc}") from exc
+        return self
+
+
+class UpdateAclEntryOut(BaseModel):
+    id: uuid.UUID
+    seq: int
+    action: str
+    match_kind: str
+    ip_cidr: str | None
+    tsig_key_id: uuid.UUID | None
+    tsig_key_name: str | None
+    name_scope: str | None
+    name_pattern: str | None
+    record_types: list[str] | None
+
+
+class DynamicUpdateCapsOut(BaseModel):
+    supports_ip_acl: bool
+    supports_tsig_acl: bool
+    supports_name_scoping: bool
+    supports_per_type: bool
+    coarse_enum_only: bool
+    supported: bool  # any surface at all — else the feature 422s for this group
+
+
+class ZoneUpdateAclReplace(BaseModel):
+    # Optionally flip the zone's dynamic_update_enabled flag in the same
+    # call so the UI can toggle + set the ACL atomically. None = leave as-is.
+    dynamic_update_enabled: bool | None = None
+    entries: list[UpdateAclEntryIn] = Field(default_factory=list)
+
+
+class ZoneUpdateAclResponse(BaseModel):
+    zone_id: uuid.UUID
+    dynamic_update_enabled: bool
+    driver_names: list[str]
+    caps: DynamicUpdateCapsOut
+    entries: list[UpdateAclEntryOut]
+    # Non-fatal warnings from the driver (e.g. "IP entries are UDP-spoofable").
+    warnings: list[str] = Field(default_factory=list)
+
+
+async def _group_driver_names(db: DB, group_id: uuid.UUID) -> list[str]:
+    """Distinct driver names among a group's servers.
+
+    Defaults to ``["bind9"]`` when the group has no servers yet (the
+    flagship backend — the operator hasn't added a server to say
+    otherwise). The dynamic-update caps + validation are computed against
+    every driver in this set, so a mixed-driver group only gets what all
+    of its drivers can express.
+    """
+    rows = (
+        (
+            await db.execute(
+                select(DNSServer.driver).where(DNSServer.group_id == group_id).distinct()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    names = sorted({d for d in rows if d})
+    return names or ["bind9"]
+
+
+def _effective_dynamic_update_caps(driver_names: list[str]) -> DynamicUpdateCaps:
+    """AND the per-driver caps across a group's drivers (conservative)."""
+    per = [get_driver(n).dynamic_update_caps for n in driver_names]
+    if not per:
+        return DynamicUpdateCaps()
+    return DynamicUpdateCaps(
+        supports_ip_acl=all(c.supports_ip_acl for c in per),
+        supports_tsig_acl=all(c.supports_tsig_acl for c in per),
+        supports_name_scoping=all(c.supports_name_scoping for c in per),
+        supports_per_type=all(c.supports_per_type for c in per),
+        coarse_enum_only=any(c.coarse_enum_only for c in per),
+    )
+
+
+def _caps_out(caps: DynamicUpdateCaps) -> DynamicUpdateCapsOut:
+    return DynamicUpdateCapsOut(
+        supports_ip_acl=caps.supports_ip_acl,
+        supports_tsig_acl=caps.supports_tsig_acl,
+        supports_name_scoping=caps.supports_name_scoping,
+        supports_per_type=caps.supports_per_type,
+        coarse_enum_only=caps.coarse_enum_only,
+        supported=(
+            caps.supports_ip_acl
+            or caps.supports_tsig_acl
+            or caps.supports_name_scoping
+            or caps.coarse_enum_only
+        ),
+    )
+
+
+async def _load_acl_out(db: DB, zone_id: uuid.UUID) -> list[UpdateAclEntryOut]:
+    rows = (
+        await db.execute(
+            select(DNSZoneUpdateAcl, DNSTSIGKey.name)
+            .outerjoin(DNSTSIGKey, DNSZoneUpdateAcl.tsig_key_id == DNSTSIGKey.id)
+            .where(DNSZoneUpdateAcl.zone_id == zone_id)
+            .order_by(DNSZoneUpdateAcl.seq)
+        )
+    ).all()
+    return [
+        UpdateAclEntryOut(
+            id=acl.id,
+            seq=acl.seq,
+            action=acl.action,
+            match_kind=acl.match_kind,
+            ip_cidr=acl.ip_cidr,
+            tsig_key_id=acl.tsig_key_id,
+            tsig_key_name=key_name,
+            name_scope=acl.name_scope,
+            name_pattern=acl.name_pattern,
+            record_types=acl.record_types,
+        )
+        for acl, key_name in rows
+    ]
+
+
+@router.get(
+    "/groups/{group_id}/dynamic-update-caps",
+    response_model=DynamicUpdateCapsOut,
+    dependencies=[Depends(require_module("dns.dynamic_update_acl"))],
+)
+async def get_group_dynamic_update_caps(
+    group_id: uuid.UUID, db: DB, _: CurrentUser
+) -> DynamicUpdateCapsOut:
+    """What dynamic-update ACL controls this group's driver(s) can express.
+
+    The UI reads this to render only the supported controls (and to grey
+    the whole feature out for a cloud-driver group, where ``supported`` is
+    False and any PUT 422s).
+    """
+    await _require_group(group_id, db)
+    driver_names = await _group_driver_names(db, group_id)
+    return _caps_out(_effective_dynamic_update_caps(driver_names))
+
+
+@router.get(
+    "/groups/{group_id}/zones/{zone_id}/update-acl",
+    response_model=ZoneUpdateAclResponse,
+    dependencies=[Depends(require_module("dns.dynamic_update_acl"))],
+)
+async def get_zone_update_acl(
+    group_id: uuid.UUID, zone_id: uuid.UUID, db: DB, _: CurrentUser
+) -> ZoneUpdateAclResponse:
+    zone = await _require_zone(group_id, zone_id, db)
+    driver_names = await _group_driver_names(db, group_id)
+    caps = _effective_dynamic_update_caps(driver_names)
+    entries = await _load_acl_out(db, zone.id)
+    # Re-validate current state so the UI can surface standing warnings
+    # (e.g. an IP entry that predates a driver change) without a write.
+    warnings: list[str] = []
+    if entries:
+        neutral = [
+            UpdateAclEntry(
+                match_kind=e.match_kind,
+                action=e.action,
+                ip_cidr=e.ip_cidr,
+                tsig_key_name=e.tsig_key_name,
+                name_scope=e.name_scope,
+                name_pattern=e.name_pattern,
+                record_types=tuple(e.record_types) if e.record_types else None,
+            )
+            for e in entries
+        ]
+        for name in driver_names:
+            try:
+                warnings.extend(get_driver(name).validate_update_acl(zone.name, neutral))
+            except ValueError:
+                # A standing entry the current driver can't honour — surface
+                # it as a warning rather than 500 the read.
+                warnings.append(
+                    f"{name}: the current ACL contains entries this driver cannot "
+                    "render; re-save to reconcile."
+                )
+    return ZoneUpdateAclResponse(
+        zone_id=zone.id,
+        dynamic_update_enabled=zone.dynamic_update_enabled,
+        driver_names=driver_names,
+        caps=_caps_out(caps),
+        entries=entries,
+        warnings=sorted(set(warnings)),
+    )
+
+
+async def _replace_update_acl_rows(
+    db: DB, group_id: uuid.UUID, zone: DNSZone, body: ZoneUpdateAclReplace
+) -> tuple[list[str], list[str]]:
+    """Validate + replace a zone's ACL rows in the session (no audit/commit).
+
+    Shared by the REST PUT endpoint and the MCP ``set_zone_update_acl``
+    apply. Verifies every referenced TSIG key belongs to the group, runs
+    the driver capability gate (raising ``HTTPException(422)`` on a
+    hard-unsupported entry), then drops + re-inserts the ordered set and
+    optionally flips ``dynamic_update_enabled``. Returns
+    ``(driver_names, warnings)``; the caller writes the audit row +
+    commits.
+    """
+    driver_names = await _group_driver_names(db, group_id)
+
+    key_ids = [e.tsig_key_id for e in body.entries if e.tsig_key_id is not None]
+    key_name_by_id: dict[uuid.UUID, str] = {}
+    if key_ids:
+        krows = (
+            (
+                await db.execute(
+                    select(DNSTSIGKey).where(
+                        DNSTSIGKey.group_id == group_id, DNSTSIGKey.id.in_(key_ids)
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        key_name_by_id = {k.id: k.name for k in krows}
+        missing = [str(kid) for kid in key_ids if kid not in key_name_by_id]
+        if missing:
+            raise HTTPException(
+                status_code=422,
+                detail=f"TSIG key(s) not found in this group: {', '.join(missing)}",
+            )
+
+    neutral = [
+        UpdateAclEntry(
+            match_kind=e.match_kind,
+            action=e.action,
+            ip_cidr=e.ip_cidr,
+            tsig_key_name=(key_name_by_id.get(e.tsig_key_id) if e.tsig_key_id else None),
+            name_scope=e.name_scope,
+            name_pattern=e.name_pattern,
+            record_types=tuple(e.record_types) if e.record_types else None,
+        )
+        for e in body.entries
+    ]
+    warnings: list[str] = []
+    for name in driver_names:
+        try:
+            warnings.extend(get_driver(name).validate_update_acl(zone.name, neutral))
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={"code": "DYNAMIC_UPDATE_UNSUPPORTED", "message": str(exc)},
+            ) from exc
+
+    # Replace: drop existing rows, insert the new ordered set (seq = position).
+    await db.execute(sa_delete(DNSZoneUpdateAcl).where(DNSZoneUpdateAcl.zone_id == zone.id))
+    for seq, e in enumerate(body.entries):
+        db.add(
+            DNSZoneUpdateAcl(
+                zone_id=zone.id,
+                seq=seq,
+                action=e.action,
+                match_kind=e.match_kind,
+                tsig_key_id=e.tsig_key_id,
+                ip_cidr=e.ip_cidr,
+                name_scope=e.name_scope,
+                name_pattern=e.name_pattern,
+                record_types=e.record_types,
+            )
+        )
+    if body.dynamic_update_enabled is not None:
+        zone.dynamic_update_enabled = body.dynamic_update_enabled
+    return driver_names, warnings
+
+
+@router.put(
+    "/groups/{group_id}/zones/{zone_id}/update-acl",
+    response_model=ZoneUpdateAclResponse,
+    dependencies=[Depends(require_module("dns.dynamic_update_acl"))],
+)
+async def replace_zone_update_acl(
+    group_id: uuid.UUID,
+    zone_id: uuid.UUID,
+    body: ZoneUpdateAclReplace,
+    db: DB,
+    current_user: SuperAdmin,
+) -> ZoneUpdateAclResponse:
+    """Full ordered replace of a zone's dynamic-update ACL (issue #641).
+
+    Validates every entry against the group's driver(s) *before* touching
+    the DB: a hard-unsupported entry (e.g. any entry on a cloud driver, or
+    a name-scoped entry on coarse-only BIND9-P1) 422s with
+    ``DYNAMIC_UPDATE_UNSUPPORTED``; lossy-but-accepted mappings come back as
+    ``warnings``. Secrets never appear in the response — TSIG entries carry
+    a ``tsig_key_name`` only.
+    """
+    zone = await _require_zone(group_id, zone_id, db)
+    _reject_if_synthesised_zone(zone, "edit")
+    driver_names, warnings = await _replace_update_acl_rows(db, group_id, zone, body)
+
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="update",
+            resource_type="dns_zone",
+            resource_id=str(zone.id),
+            resource_display=f"{zone.name} dynamic-update ACL",
+            changed_fields=["update_acl", "dynamic_update_enabled"],
+            result="success",
+        )
+    )
+    collect_wake(dns_group_channel(group_id))
+    await db.commit()
+    await db.refresh(zone)
+
+    caps = _effective_dynamic_update_caps(driver_names)
+    return ZoneUpdateAclResponse(
+        zone_id=zone.id,
+        dynamic_update_enabled=zone.dynamic_update_enabled,
+        driver_names=driver_names,
+        caps=_caps_out(caps),
+        entries=await _load_acl_out(db, zone.id),
+        warnings=sorted(set(warnings)),
+    )
 
 
 # ── DNSSEC policies (issue #49) ─────────────────────────────────────────────

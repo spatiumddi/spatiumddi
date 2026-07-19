@@ -615,6 +615,107 @@ class DNSSECStateBatch(BaseModel):
     zones: list[DNSSECStateReport]
 
 
+class IngestedRecord(BaseModel):
+    """One record the agent read back off a live dynamic zone (issue #641)."""
+
+    name: str  # relative label, "@" = apex
+    record_type: str
+    value: str
+    ttl: int | None = None
+    priority: int | None = None
+    weight: int | None = None
+    port: int | None = None
+
+
+class IngestedRecordsReport(BaseModel):
+    """The *complete* current external record set for one dynamic zone.
+
+    The agent sends everything it found on-wire that isn't in the shipped
+    bundle; the control plane reconciles its ``ddns_external`` mirror rows
+    to match (add new, drop vanished), skipping anything a managed record
+    or the daemon owns. See ``app.services.dns.ingest``.
+    """
+
+    zone_name: str
+    records: list[IngestedRecord] = []
+
+
+@router.post("/ingested-records")
+async def agent_ingested_records(
+    body: IngestedRecordsReport,
+    db: DB,
+    auth: tuple[DNSServer, dict[str, Any]] = Depends(_auth_agent),
+) -> dict[str, Any]:
+    """Ingest externally-injected DDNS records back into the control plane.
+
+    Alt.1 of issue #641's drift solution: records a third-party writer
+    (AD DC, DHCP server) injected over RFC 2136 live only in the daemon
+    journal; the agent AXFRs them and posts them here so they become
+    UI/IPAM-visible + survive a full re-render. Gated on the zone actually
+    having ``dynamic_update_enabled`` (defense-in-depth against a
+    misbehaving agent) and scoped to the posting server's group.
+    """
+    from app.services.dns.ingest import (  # noqa: PLC0415
+        IncomingRecord,
+        reconcile_external_records,
+        to_summary,
+    )
+
+    server, _ = auth
+    zone_name = body.zone_name.rstrip(".")
+    # Match either stored form (with/without trailing dot). Under split-horizon
+    # the same name can exist once per view, so we can't use
+    # ``scalar_one_or_none`` (it raises MultipleResultsFound): prefer the global
+    # zone (``view_id IS NULL``) and take the first — loopback AXFR is
+    # inherently view-ambiguous, and the global copy is the common case.
+    zone = (
+        (
+            await db.execute(
+                select(DNSZone)
+                .where(
+                    DNSZone.group_id == server.group_id,
+                    DNSZone.name.in_([zone_name + ".", zone_name]),
+                    DNSZone.deleted_at.is_(None),
+                )
+                .order_by(DNSZone.view_id.nulls_first())
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if zone is None:
+        # Zone unknown to the control plane (deleted, or agent serving a
+        # stale bundle). Silently accept — the next bundle drops it.
+        return {"zone": zone_name, "skipped": "unknown_zone"}
+    if not zone.dynamic_update_enabled:
+        return {"zone": zone_name, "skipped": "dynamic_update_disabled"}
+
+    incoming = [
+        IncomingRecord(
+            name=r.name,
+            record_type=r.record_type,
+            value=r.value,
+            ttl=r.ttl,
+            priority=r.priority,
+            weight=r.weight,
+            port=r.port,
+        )
+        for r in body.records
+    ]
+    result = await reconcile_external_records(db, zone, incoming)
+    await db.commit()
+    summary = to_summary(result)
+    if summary["added"] or summary["removed"]:
+        logger.info(
+            "dns_ingested_external_records",
+            server_id=str(server.id),
+            zone=zone_name,
+            **summary,
+        )
+    return {"zone": zone_name, **summary}
+
+
 @router.post("/dnssec-state")
 async def agent_dnssec_state(
     body: DNSSECStateBatch,

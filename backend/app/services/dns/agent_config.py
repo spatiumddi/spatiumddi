@@ -31,6 +31,7 @@ from app.models.dns import (
     DNSTSIGKey,
     DNSView,
     DNSZone,
+    DNSZoneUpdateAcl,
 )
 from app.models.settings import PlatformSettings
 from app.services.appliance.ntp import ntp_bundle
@@ -135,6 +136,36 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
     zones_res = await db.execute(select(DNSZone).where(DNSZone.group_id == server.group_id))
     zones = zones_res.scalars().all()
 
+    # Dynamic-update ACLs (issue #641). One JOIN across every ACL row in the
+    # group's zones, resolving each TSIG entry's key NAME (never the secret)
+    # so the agent renders ``allow-update { <cidr>; key "<name>."; }``. Keyed
+    # by zone_id → ordered entry dicts. Secrets stay Fernet-encrypted; only
+    # the key name crosses the wire (the key material itself already ships in
+    # the ``tsig_keys`` block for the agent to build the ``key {}`` stanza).
+    zone_ids = [z.id for z in zones]
+    update_acls_by_zone: dict[Any, list[dict[str, Any]]] = {}
+    if zone_ids:
+        acl_rows = (
+            await db.execute(
+                select(DNSZoneUpdateAcl, DNSTSIGKey.name)
+                .outerjoin(DNSTSIGKey, DNSZoneUpdateAcl.tsig_key_id == DNSTSIGKey.id)
+                .where(DNSZoneUpdateAcl.zone_id.in_(zone_ids))
+                .order_by(DNSZoneUpdateAcl.zone_id, DNSZoneUpdateAcl.seq)
+            )
+        ).all()
+        for acl, key_name in acl_rows:
+            update_acls_by_zone.setdefault(acl.zone_id, []).append(
+                {
+                    "action": acl.action,
+                    "match_kind": acl.match_kind,
+                    "ip_cidr": acl.ip_cidr,
+                    "tsig_key_name": key_name,
+                    "name_scope": acl.name_scope,
+                    "name_pattern": acl.name_pattern,
+                    "record_types": acl.record_types,
+                }
+            )
+
     def _rec_dict(r: DNSRecord) -> dict[str, Any]:
         return {
             "name": r.name,
@@ -186,6 +217,12 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
             # built-in "default".
             "dnssec_enabled": bool(getattr(z, "dnssec_enabled", False)),
             "dnssec_policy_name": _zone_policy_name(z),
+            # Dynamic-update ACL (issue #641). Flows into the structural
+            # etag below (zones_structural derives from zone_payload), so
+            # flipping the flag or editing an ACL row shifts the etag and
+            # wakes the long-poll → a full, allow-update-correct re-render.
+            "dynamic_update_enabled": bool(getattr(z, "dynamic_update_enabled", False)),
+            "update_acl": update_acls_by_zone.get(z.id, []),
         }
         # Ship records to every server in the group. The is_primary flag
         # historically gated this, but agents need records to render zone

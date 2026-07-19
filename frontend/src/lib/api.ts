@@ -4801,6 +4801,9 @@ export interface DNSZone {
   dnssec_enabled: boolean;
   auto_tls_probe?: boolean;
   dnssec_policy_id?: string | null;
+  // Dynamic-update (RFC 2136) ACL toggle (issue #641). ACL rows are
+  // managed via getZoneUpdateAcl / replaceZoneUpdateAcl.
+  dynamic_update_enabled?: boolean;
   dnssec_ds_records: string[] | null;
   dnssec_synced_at: string | null;
   color: string | null;
@@ -4941,6 +4944,55 @@ export interface TSIGKeyUpdate {
   algorithm?: string;
   purpose?: string | null;
   notes?: string;
+}
+
+// ── Dynamic-update (RFC 2136) ACLs (issue #641) ──────────────────────────────
+
+export interface DynamicUpdateCaps {
+  supports_ip_acl: boolean;
+  supports_tsig_acl: boolean;
+  supports_name_scoping: boolean;
+  supports_per_type: boolean;
+  coarse_enum_only: boolean;
+  // false ⇒ the group's driver has no RFC 2136 surface; the feature 422s.
+  supported: boolean;
+}
+
+export interface UpdateAclEntry {
+  id: string;
+  seq: number;
+  action: "grant" | "deny";
+  match_kind: "tsig_key" | "ip";
+  ip_cidr: string | null;
+  tsig_key_id: string | null;
+  tsig_key_name: string | null;
+  name_scope: string | null;
+  name_pattern: string | null;
+  record_types: string[] | null;
+}
+
+export interface UpdateAclEntryInput {
+  match_kind: "tsig_key" | "ip";
+  action?: "grant" | "deny";
+  ip_cidr?: string | null;
+  tsig_key_id?: string | null;
+  name_scope?: string | null;
+  name_pattern?: string | null;
+  record_types?: string[] | null;
+}
+
+export interface ZoneUpdateAcl {
+  zone_id: string;
+  dynamic_update_enabled: boolean;
+  driver_names: string[];
+  caps: DynamicUpdateCaps;
+  entries: UpdateAclEntry[];
+  warnings: string[];
+}
+
+export interface ZoneUpdateAclReplace {
+  dynamic_update_enabled?: boolean | null;
+  entries: UpdateAclEntryInput[];
 }
 
 // Generic server-side pagination envelope (#455). Matches the backend
@@ -5389,6 +5441,27 @@ export const dnsApi = {
       }>(`/dns/groups/${groupId}/tsig-keys/generate-secret`, {
         params: { algorithm },
       })
+      .then((r) => r.data),
+
+  // Dynamic-update (RFC 2136) ACLs (issue #641)
+  getGroupDynamicUpdateCaps: (groupId: string) =>
+    api
+      .get<DynamicUpdateCaps>(`/dns/groups/${groupId}/dynamic-update-caps`)
+      .then((r) => r.data),
+  getZoneUpdateAcl: (groupId: string, zoneId: string) =>
+    api
+      .get<ZoneUpdateAcl>(`/dns/groups/${groupId}/zones/${zoneId}/update-acl`)
+      .then((r) => r.data),
+  replaceZoneUpdateAcl: (
+    groupId: string,
+    zoneId: string,
+    body: ZoneUpdateAclReplace,
+  ) =>
+    api
+      .put<ZoneUpdateAcl>(
+        `/dns/groups/${groupId}/zones/${zoneId}/update-acl`,
+        body,
+      )
       .then((r) => r.data),
 
   // Records — server-side paginated (#455)

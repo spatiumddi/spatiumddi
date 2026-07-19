@@ -228,6 +228,19 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         group="DNS",
         description="One-shot import from BIND9 / Windows DNS / PowerDNS into SpatiumDDI's native zones + records. Settings → Import → DNS surface; sources gate behind their own credential / file-upload step.",
     ),
+    # Dynamic-update (RFC 2136) ACLs on zones (issue #641). Lets an
+    # operator authorize third-party DDNS writers (an AD DC, a DHCP
+    # server registering A/PTR) to a managed zone by TSIG key or source
+    # IP/CIDR. Default-enabled for discovery — the surface exposes no
+    # secrets by itself (TSIG keys are referenced by name; the encrypted
+    # secret never surfaces), and the endpoints are RBAC-gated + the
+    # write path is capability-gated per DNS backend.
+    ModuleSpec(
+        id="dns.dynamic_update_acl",
+        label="Dynamic update ACLs",
+        group="DNS",
+        description="Operator-configurable RFC 2136 dynamic-update ACLs on DNS zones — authorize external DDNS writers (AD DC, DHCP server) by TSIG key or source IP/CIDR. BIND9 + PowerDNS express it natively; Windows maps coarsely; cloud drivers can't (the write 422s).",
+    ),
     # DHCP — sister importer to ``dns.import`` (issue #129). One-shot
     # import of scopes / pools / reservations / classes from Kea JSON /
     # Windows DHCP live-pull / ISC dhcpd.conf so operators can seed a

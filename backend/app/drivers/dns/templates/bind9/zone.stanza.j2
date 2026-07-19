@@ -30,6 +30,22 @@ zone "{{ zone.name }}" {
     {%- if zone.allow_transfer %}
     allow-transfer { {% for a in zone.allow_transfer %}{{ a }}; {% endfor %}};
     {%- endif %}
+    {#- Dynamic-update (RFC 2136) ACL (issue #641). Coarse allow-update:
+        grant-only IP/TSIG entries. Name-scoped / per-type / deny entries
+        are the P2 update-policy path and never reach a coarse render. #}
+    {%- if zone.dynamic_update_enabled and zone.update_acl %}
+    {%- set _upd = [] %}
+    {%- for e in zone.update_acl %}
+    {%- if e.action == "grant" and not e.name_scope and not e.name_pattern and not e.record_types %}
+    {%- if e.match_kind == "ip" and e.ip_cidr %}{% set _ = _upd.append(e.ip_cidr ~ ";") %}
+    {%- elif e.match_kind == "tsig_key" and e.tsig_key_name %}{% set _ = _upd.append('key "' ~ e.tsig_key_name ~ '";') %}
+    {%- endif %}
+    {%- endif %}
+    {%- endfor %}
+    {%- if _upd %}
+    allow-update { {{ _upd | join(" ") }} };
+    {%- endif %}
+    {%- endif %}
     {%- if zone.also_notify %}
     also-notify { {% for a in zone.also_notify %}{{ a }}; {% endfor %}};
     {%- endif %}

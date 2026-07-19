@@ -24,6 +24,7 @@ from app.core.dns_names import strip_control_chars
 from app.drivers.dns.base import (
     ConfigBundle,
     DNSDriver,
+    DynamicUpdateCaps,
     EffectiveBlocklistData,
     RecordChange,
     RecordData,
@@ -345,6 +346,20 @@ class BIND9Driver(DNSDriver):
                 "DNAME",
             ],
         }
+
+    @property
+    def dynamic_update_caps(self) -> DynamicUpdateCaps:
+        # P1 (issue #641): coarse ``allow-update`` mixing IP + TSIG in one
+        # address-match-list. The fine-grained ``update-policy`` path
+        # (name scoping, per-type grants, deny) is P2 — BIND9 *can* express
+        # it, but the render isn't wired yet, so name_scoping/per_type stay
+        # False here so the API rejects those fields until P2 lands.
+        return DynamicUpdateCaps(
+            supports_ip_acl=True,
+            supports_tsig_acl=True,
+            supports_name_scoping=False,
+            supports_per_type=False,
+        )
 
 
 __all__ = ["BIND9Driver"]

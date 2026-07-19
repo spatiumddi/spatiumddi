@@ -20,6 +20,7 @@ from .drivers.base import DriverBase
 from .drivers.bind9 import Bind9Driver
 from .drivers.powerdns import PowerDNSDriver
 from .heartbeat import HeartbeatClient
+from .ingest import IngestWorker
 from .metrics import MetricsPoller
 from .query_log_shipper import QueryLogShipper
 from .sync import SyncLoop
@@ -64,15 +65,23 @@ def run(cfg: AgentConfig) -> int:
     metrics: MetricsPoller | None = None
     query_log: QueryLogShipper | None = None
     rndc_status: RndcStatusPoller | None = None
+    ingest: IngestWorker | None = None
     if cfg.driver == "bind9":
         metrics = MetricsPoller(cfg, token_ref)
         query_log = QueryLogShipper(cfg, token_ref)
         rndc_status = RndcStatusPoller(cfg, token_ref)
+        # Ingest-back for externally-injected DDNS records (issue #641).
+        # BIND9 only — AXFRs dynamic zones from loopback and ships unknown
+        # records to the control plane.
+        ingest = IngestWorker(cfg, token_ref)
         threads.extend(
             [
                 threading.Thread(target=metrics.run, name="metrics", daemon=True),
                 threading.Thread(target=query_log.run, name="query-log", daemon=True),
-                threading.Thread(target=rndc_status.run, name="rndc-status", daemon=True),
+                threading.Thread(
+                    target=rndc_status.run, name="rndc-status", daemon=True
+                ),
+                threading.Thread(target=ingest.run, name="ingest", daemon=True),
             ]
         )
     elif cfg.driver == "powerdns":
@@ -102,6 +111,8 @@ def run(cfg: AgentConfig) -> int:
             query_log.stop()
         if rndc_status is not None:
             rndc_status.stop()
+        if ingest is not None:
+            ingest.stop()
 
     signal.signal(signal.SIGTERM, _sig)
     signal.signal(signal.SIGINT, _sig)

@@ -243,7 +243,10 @@ async def _apply_update_conformity_policy(
         resource_id=str(p.id),
         resource_display=p.name,
         changed_fields=list(applied),
-        new_value={"via": "ai_proposal", **{k: str(v)[:200] for k, v in applied.items()}},
+        new_value={
+            "via": "ai_proposal",
+            **{k: str(v)[:200] for k, v in applied.items()},
+        },
     )
     await db.commit()
     await db.refresh(p)
@@ -411,7 +414,11 @@ async def _apply_create_webhook(
         resource_type="event_subscription",
         resource_id=str(sub.id),
         resource_display=args.name,
-        new_value={"via": "ai_proposal", "url": args.url, "event_types": args.event_types},
+        new_value={
+            "via": "ai_proposal",
+            "url": args.url,
+            "event_types": args.event_types,
+        },
     )
     await db.commit()
     await db.refresh(sub)
@@ -481,14 +488,14 @@ async def _apply_update_webhook(
     body = WebhookSubscriptionWrite(
         name=args.name if args.name is not None else sub.name,
         url=args.url if args.url is not None else sub.url,
-        description=args.description if args.description is not None else sub.description,
+        description=(args.description if args.description is not None else sub.description),
         enabled=args.enabled if args.enabled is not None else sub.enabled,
         secret=None,
         event_types=event_types,
         timeout_seconds=(
             args.timeout_seconds if args.timeout_seconds is not None else sub.timeout_seconds
         ),
-        max_attempts=args.max_attempts if args.max_attempts is not None else sub.max_attempts,
+        max_attempts=(args.max_attempts if args.max_attempts is not None else sub.max_attempts),
     )
     _apply_body(sub, body, creating=False)
     write_audit(
@@ -535,7 +542,10 @@ async def _apply_test_webhook(
     import httpx as _httpx  # noqa: PLC0415
 
     from app.core.crypto import decrypt_str  # noqa: PLC0415
-    from app.models.event_subscription import EventOutbox, EventSubscription  # noqa: PLC0415
+    from app.models.event_subscription import (
+        EventOutbox,
+        EventSubscription,
+    )  # noqa: PLC0415
     from app.services import event_delivery  # noqa: PLC0415
 
     sub = await db.get(EventSubscription, args.subscription_id)
@@ -557,7 +567,11 @@ async def _apply_test_webhook(
             "display_name": user.display_name,
             "auth_source": getattr(user, "auth_source", "local") or "local",
         },
-        "resource": {"type": "event_subscription", "id": str(sub.id), "display": sub.name},
+        "resource": {
+            "type": "event_subscription",
+            "id": str(sub.id),
+            "display": sub.name,
+        },
         "action": "test_ping",
         "result": "success",
         "old_value": None,
@@ -696,7 +710,9 @@ async def _apply_create_multicast_domain(
         await _check_vrf(db, args.vrf_id)
         await _check_device(db, args.rendezvous_point_device_id)
         _validate_rp_for_mode(
-            args.pim_mode, args.rendezvous_point_device_id, args.rendezvous_point_address
+            args.pim_mode,
+            args.rendezvous_point_device_id,
+            args.rendezvous_point_address,
         )
     except Exception as exc:  # noqa: BLE001 — HTTPException / ValueError → operator text
         raise ValueError(getattr(exc, "detail", str(exc))) from exc
@@ -738,7 +754,14 @@ class UpdateMulticastDomainArgs(BaseModel):
 
 
 def _multicast_domain_changes(args: UpdateMulticastDomainArgs) -> dict[str, Any]:
-    fields = ("name", "description", "pim_mode", "rendezvous_point_address", "ssm_range", "notes")
+    fields = (
+        "name",
+        "description",
+        "pim_mode",
+        "rendezvous_point_address",
+        "ssm_range",
+        "notes",
+    )
     return {f: getattr(args, f) for f in fields if getattr(args, f) is not None}
 
 
@@ -766,7 +789,9 @@ async def _preview_update_multicast_domain(
         return PreviewResult(ok=False, detail=rp_err)
     summary = ", ".join(f"{k}={_clip(str(v), 40)}" for k, v in changes.items())
     return PreviewResult(
-        ok=True, detail="ready", preview_text=f"Update multicast domain {row.name!r}: {summary}"
+        ok=True,
+        detail="ready",
+        preview_text=f"Update multicast domain {row.name!r}: {summary}",
     )
 
 
@@ -805,7 +830,10 @@ async def _apply_update_multicast_domain(
         resource_id=str(row.id),
         resource_display=row.name,
         changed_fields=list(applied),
-        new_value={"via": "ai_proposal", **{k: str(v)[:200] for k, v in applied.items()}},
+        new_value={
+            "via": "ai_proposal",
+            **{k: str(v)[:200] for k, v in applied.items()},
+        },
     )
     await db.commit()
     await db.refresh(row)
@@ -837,7 +865,9 @@ async def _preview_delete_multicast_domain(
         else ""
     )
     return PreviewResult(
-        ok=True, detail="ready", preview_text=f"Delete multicast domain {row.name!r}{note}"
+        ok=True,
+        detail="ready",
+        preview_text=f"Delete multicast domain {row.name!r}{note}",
     )
 
 
@@ -905,7 +935,8 @@ class SignZoneDNSSECArgs(BaseModel):
     group_id: uuid.UUID
     zone_id: uuid.UUID
     policy_id: uuid.UUID | None = Field(
-        default=None, description="DNSSEC policy to apply; omit to keep the current/default."
+        default=None,
+        description="DNSSEC policy to apply; omit to keep the current/default.",
     )
 
 
@@ -1051,6 +1082,160 @@ register(
 )
 
 
+# ── Dynamic-update ACLs (issue #641) ────────────────────────────────────────
+
+
+class SetZoneUpdateAclEntry(BaseModel):
+    match_kind: str  # tsig_key | ip
+    action: str = "grant"
+    ip_cidr: str | None = None
+    tsig_key_id: uuid.UUID | None = None
+    name_scope: str | None = None
+    name_pattern: str | None = None
+    record_types: list[str] | None = None
+
+
+class SetZoneUpdateAclArgs(BaseModel):
+    group_id: uuid.UUID
+    zone_id: uuid.UUID
+    dynamic_update_enabled: bool | None = Field(
+        default=None,
+        description="Optionally flip whether the zone accepts dynamic updates at all.",
+    )
+    entries: list[SetZoneUpdateAclEntry] = Field(
+        default_factory=list,
+        description="Full ordered ACL to set (replaces the existing one). Empty clears it.",
+    )
+
+
+def _build_acl_replace(args: SetZoneUpdateAclArgs) -> Any:
+    """Convert MCP args → the router's validated ZoneUpdateAclReplace.
+
+    Raises ValueError (surfaced to the operator) on malformed entries —
+    invalid CIDR, both/neither identity column, bad enum.
+    """
+    from pydantic import ValidationError  # noqa: PLC0415
+
+    from app.api.v1.dns.router import (  # noqa: PLC0415
+        UpdateAclEntryIn,
+        ZoneUpdateAclReplace,
+    )
+
+    try:
+        entries = [UpdateAclEntryIn(**e.model_dump()) for e in args.entries]
+    except ValidationError as exc:
+        raise ValueError(f"invalid ACL entry: {exc}") from exc
+    return ZoneUpdateAclReplace(dynamic_update_enabled=args.dynamic_update_enabled, entries=entries)
+
+
+async def _preview_set_zone_update_acl(
+    db: AsyncSession, user: User, args: SetZoneUpdateAclArgs
+) -> PreviewResult:
+    from fastapi import HTTPException  # noqa: PLC0415
+
+    from app.api.v1.dns import router as dns_router  # noqa: PLC0415
+    from app.drivers.dns import get_driver  # noqa: PLC0415
+    from app.drivers.dns.base import UpdateAclEntry  # noqa: PLC0415
+
+    _require_superadmin(user)
+    try:
+        zone = await dns_router._require_zone(args.group_id, args.zone_id, db)  # noqa: SLF001
+        dns_router._reject_if_synthesised_zone(zone, "edit")  # noqa: SLF001
+    except HTTPException as exc:
+        return PreviewResult(ok=False, detail=str(exc.detail))
+    try:
+        body = _build_acl_replace(args)
+    except ValueError as exc:
+        return PreviewResult(ok=False, detail=str(exc))
+
+    driver_names = await dns_router._group_driver_names(db, args.group_id)  # noqa: SLF001
+    neutral = [
+        UpdateAclEntry(
+            match_kind=e.match_kind,
+            action=e.action,
+            ip_cidr=e.ip_cidr,
+            tsig_key_name=None,
+            name_scope=e.name_scope,
+            name_pattern=e.name_pattern,
+            record_types=tuple(e.record_types) if e.record_types else None,
+        )
+        for e in body.entries
+    ]
+    for name in driver_names:
+        try:
+            get_driver(name).validate_update_acl(zone.name, neutral)
+        except ValueError as exc:
+            return PreviewResult(ok=False, detail=f"{name}: {exc}")
+
+    flag = ""
+    if args.dynamic_update_enabled is not None:
+        flag = f", dynamic updates {'ON' if args.dynamic_update_enabled else 'OFF'}"
+    return PreviewResult(
+        ok=True,
+        detail="ready",
+        preview_text=(
+            f"Set {len(body.entries)} dynamic-update ACL entr"
+            f"{'y' if len(body.entries) == 1 else 'ies'} on zone {zone.name}{flag} "
+            f"(driver: {', '.join(driver_names)})"
+        ),
+    )
+
+
+async def _apply_set_zone_update_acl(
+    db: AsyncSession, user: User, args: SetZoneUpdateAclArgs
+) -> dict[str, Any]:
+    from fastapi import HTTPException  # noqa: PLC0415
+
+    from app.api.v1.dns import router as dns_router  # noqa: PLC0415
+    from app.core.agent_wake import collect_wake, dns_group_channel  # noqa: PLC0415
+
+    _require_superadmin(user)
+    body = _build_acl_replace(args)
+    # Translate every HTTPException from the DNS-router helpers into a
+    # ValueError so the proposal-apply spine surfaces a clean rejection —
+    # the zone may have been deleted (404) or turned synthetic (422) between
+    # preview and apply.
+    try:
+        zone = await dns_router._require_zone(args.group_id, args.zone_id, db)  # noqa: SLF001
+        dns_router._reject_if_synthesised_zone(zone, "edit")  # noqa: SLF001
+        _driver_names, warnings = await dns_router._replace_update_acl_rows(  # noqa: SLF001
+            db, args.group_id, zone, body
+        )
+    except HTTPException as exc:
+        raise ValueError(str(exc.detail)) from exc
+    write_audit(
+        db,
+        user=user,
+        action="update",
+        resource_type="dns_zone",
+        resource_id=str(zone.id),
+        resource_display=f"{zone.name} dynamic-update ACL",
+        new_value={"via": "ai_proposal", "entry_count": len(body.entries)},
+    )
+    collect_wake(dns_group_channel(args.group_id))
+    await db.commit()
+    await db.refresh(zone)
+    return {
+        "id": str(zone.id),
+        "name": zone.name,
+        "dynamic_update_enabled": zone.dynamic_update_enabled,
+        "entry_count": len(body.entries),
+        "warnings": warnings,
+    }
+
+
+register(
+    Operation(
+        name="set_zone_update_acl",
+        description="Set a DNS zone's dynamic-update (RFC 2136) ACL — full replace.",
+        args_model=SetZoneUpdateAclArgs,
+        preview=_preview_set_zone_update_acl,
+        apply=_apply_set_zone_update_acl,
+        category="dns",
+    )
+)
+
+
 # ══════════════════════════════════════════════════════════════════════
 # SNMP / NTP appliance host config (#153 / #154)
 # ══════════════════════════════════════════════════════════════════════
@@ -1122,7 +1307,11 @@ async def _apply_update_snmp_settings(
         resource_type="platform_settings",
         resource_id="snmp",
         resource_display="SNMP host config",
-        new_value={"via": "ai_proposal", "enabled": args.enabled, "version": args.version},
+        new_value={
+            "via": "ai_proposal",
+            "enabled": args.enabled,
+            "version": args.version,
+        },
     )
     await db.commit()
     return {"snmp_enabled": args.enabled, "snmp_version": args.version}
@@ -1150,7 +1339,9 @@ async def _preview_update_ntp_settings(
     if args.allow_clients is not None:
         bits.append(f"allow_clients={args.allow_clients}")
     return PreviewResult(
-        ok=True, detail="ready", preview_text="Update NTP host config: " + ", ".join(bits)
+        ok=True,
+        detail="ready",
+        preview_text="Update NTP host config: " + ", ".join(bits),
     )
 
 
@@ -1488,7 +1679,8 @@ class CommitDHCPImportArgs(BaseModel):
     server_id: uuid.UUID = Field(description="DHCP server row to pull from.")
     target_group_id: uuid.UUID
     ipam_space_id: uuid.UUID | None = Field(
-        default=None, description="IP space for subnet auto-create (with ipam_block_id)."
+        default=None,
+        description="IP space for subnet auto-create (with ipam_block_id).",
     )
     ipam_block_id: uuid.UUID | None = None
 
@@ -1784,7 +1976,10 @@ async def _apply_allowlist_bgp_origin(
         resource_type="bgp_hijack_detection",
         resource_id=str(row.id),
         resource_display=f"{row.observed_prefix} <- AS{row.observed_origin_asn}",
-        new_value={"via": "ai_proposal", "allowlisted_origin": int(row.observed_origin_asn)},
+        new_value={
+            "via": "ai_proposal",
+            "allowlisted_origin": int(row.observed_origin_asn),
+        },
     )
     await db.commit()
     return {
