@@ -1,0 +1,90 @@
+# Dependabot — proactive dependency, base-image and Actions version bumps.
+#
+# Complements the scheduled Trivy scan (trivy-scheduled.yml, #640): Trivy flags
+# KNOWN CVEs in already-built images after the fact; Dependabot opens
+# (de-duplicated) PRs to move manifests, Docker base images and GitHub Actions
+# forward *before* they rot — security updates included. Between the two, a
+# vulnerable/outdated package surfaces either as a bump PR (Dependabot) or, if it
+# slips through, as the weekly tracking issue (Trivy).
+#
+# Cadence is weekly/Monday to line up with the Trivy scheduled scan. Minor +
+# patch bumps are grouped into one PR per ecosystem to keep the noise down;
+# majors arrive as individual PRs so they get a proper review.
+#
+# NOTE: the Python manifests (backend + the three agents) use unpinned ``>=``
+# ranges with no lock file, so routine ``pip`` *version* PRs will be sparse —
+# the real value there is Dependabot *security* updates (driven by the
+# dependency graph), which fire regardless of pinning.
+version: 2
+
+updates:
+  # GitHub Actions pinned across every workflow (actions/checkout@v4,
+  # setup-python@v5, github-script@v7, aquasecurity/trivy-action, …).
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+    groups:
+      github-actions:
+        update-types: ["minor", "patch"]
+
+  # ``FROM`` base images in every shipped Dockerfile — the exact rot the #640
+  # scheduled Trivy scan catches after the fact (e.g. #639's stale golang pin);
+  # Dependabot bumps them proactively instead.
+  - package-ecosystem: "docker"
+    directories:
+      - "/backend"
+      - "/frontend"
+      - "/agent/dhcp/images/kea"
+      - "/agent/dns/images/bind9"
+      - "/agent/dns/images/powerdns"
+      - "/agent/dns/images/dnsdist"
+      - "/agent/supervisor/images/supervisor"
+      - "/agent/looking-glass/images/gobgp"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+    groups:
+      docker-base-images:
+        update-types: ["minor", "patch"]
+
+  # Python — control plane (backend) plus the three standalone agents.
+  - package-ecosystem: "pip"
+    directories:
+      - "/backend"
+      - "/agent/dhcp"
+      - "/agent/dns"
+      - "/agent/supervisor"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+    groups:
+      python:
+        update-types: ["minor", "patch"]
+
+  # Frontend — React / Vite / TypeScript (package-lock.json present).
+  - package-ecosystem: "npm"
+    directory: "/frontend"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+    groups:
+      npm:
+        update-types: ["minor", "patch"]
