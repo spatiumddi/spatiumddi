@@ -25,7 +25,9 @@ import { dnsApi, formatApiError, type UpdateAclEntryInput } from "@/lib/api";
  * key material stays server-side.
  */
 
-type Row = UpdateAclEntryInput & { _key: number };
+// ``_types_text`` holds the raw record-types input so an in-progress comma /
+// space isn't stripped on every keystroke (the parsed array drives logic + save).
+type Row = UpdateAclEntryInput & { _key: number; _types_text?: string };
 
 // BIND update-policy ruletypes that take a name argument.
 const NAMED_SCOPES = ["subdomain", "name", "wildcard", "self"];
@@ -321,10 +323,13 @@ export function DynamicUpdateAclModal({
                             className="min-w-24 rounded border bg-background px-2 py-1 font-mono text-xs"
                             placeholder="types (A, PTR…)"
                             title="Restrict to these record types (comma-separated); empty = all"
-                            value={(r.record_types ?? []).join(", ")}
+                            value={
+                              r._types_text ?? (r.record_types ?? []).join(", ")
+                            }
                             disabled={saveMut.isPending}
                             onChange={(e) =>
                               updateRow(r._key, {
+                                _types_text: e.target.value,
                                 record_types: e.target.value
                                   .split(",")
                                   .map((t) => t.trim().toUpperCase())
