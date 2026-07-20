@@ -50,7 +50,7 @@ dependencies = [
     # botocore) expands RRULE/RDATE over a bounded horizon — pinned explicitly
     # so the recurrence path can't break on a transitive drop.
     "icalendar>=6.0.0",
-    "caldav>=1.3.0",
+    "caldav>=3.2.1",
     "python-dateutil>=2.9.0",
     # IDNA2008 encoding for the shared DNS-name validators (issue #597) —
     # normalizes internationalized host/record names to their xn-- A-label
