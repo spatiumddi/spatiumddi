@@ -1,0 +1,243 @@
+name: Scheduled Image Vulnerability Scan
+
+# Why this exists (issue #640, Gap 2):
+#
+# The per-image ``build-*-images.yml`` workflows are path-filtered and their
+# Trivy step is PR-only, so an image is scanned ONLY when someone happens to
+# touch its Dockerfile. Between those moments upstream CVEs land and nothing
+# looks — until an unrelated PR trips the Dockerfile path filter and inherits
+# a pre-existing HIGH/CRITICAL it didn't introduce (exactly what happened to
+# #639: an Alpine bump surfaced a months-old ``golang`` stdlib CVE).
+#
+# This job scans EVERY shipped container image on a fixed weekly cadence,
+# independent of path filters, and funnels findings into a single tracking
+# issue so a newly-published CVE surfaces on its own instead of ambushing the
+# next contributor. It uses CI's exact gate — HIGH,CRITICAL + --ignore-unfixed
+# (matching ``make trivy`` and the ``build-*-images.yml`` Trivy steps).
+#
+# Unlike ``make trivy`` (six agent images — the contributor pre-push gate),
+# this superset also covers ``backend/Dockerfile`` + ``frontend/Dockerfile``,
+# which had no Trivy coverage anywhere.
+
+on:
+  schedule:
+    # Mondays 06:17 UTC. Off the top of the hour to avoid the cron stampede
+    # that delays runner scheduling on shared infrastructure.
+    - cron: "17 6 * * 1"
+  workflow_dispatch: {}
+
+concurrency:
+  group: trivy-scheduled
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  scan:
+    name: Trivy — all shipped images
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and scan every image
+        id: scan
+        run: |
+          set -uo pipefail
+
+          # One spec per shipped image: name|dockerfile|context|target
+          # Contexts mirror release.yml: the agent images build from the repo
+          # root, backend from ./backend, frontend from ./frontend. Targets:
+          # backend is pinned to ``runtime`` — the documented production stage
+          # (backend/Dockerfile); its final ``dev`` stage only layers test
+          # tooling on top, which we don't ship-scan. frontend's last stage is
+          # already the nginx ``runtime``, so no target is needed;
+          # ``VITE_APP_VERSION`` defaults to ``dev`` in the Dockerfile and is
+          # irrelevant to a CVE scan.
+          specs=(
+            "kea|agent/dhcp/images/kea/Dockerfile|.|"
+            "bind9|agent/dns/images/bind9/Dockerfile|.|"
+            "powerdns|agent/dns/images/powerdns/Dockerfile|.|"
+            "dnsdist|agent/dns/images/dnsdist/Dockerfile|.|"
+            "supervisor|agent/supervisor/images/supervisor/Dockerfile|.|"
+            "looking-glass|agent/looking-glass/images/gobgp/Dockerfile|.|"
+            "backend|backend/Dockerfile|./backend|runtime"
+            "frontend|frontend/Dockerfile|./frontend|"
+          )
+
+          # Shared Trivy cache so the vuln DB downloads once for the whole
+          # job rather than once per image (8× ghcr pulls risks rate limits).
+          cache="$RUNNER_TEMP/trivy-cache"
+          mkdir -p "$cache"
+
+          report="$RUNNER_TEMP/findings.md"
+          : > "$report"
+          any=0
+
+          for spec in "${specs[@]}"; do
+            IFS='|' read -r name df ctx target <<< "$spec"
+            echo "::group::$name ($df)"
+
+            build=(docker build -q -f "$df" -t "trivy-scan-$name:scan")
+            [ -n "$target" ] && build+=(--target "$target")
+            build+=("$ctx")
+            if ! "${build[@]}"; then
+              echo "❌ build failed"
+              {
+                echo "### \`$name\` — ⚠️ image build FAILED"
+                echo ""
+                echo "The scheduled scan could not build this image (see the run log)."
+                echo ""
+              } >> "$report"
+              any=1
+              echo "::endgroup::"
+              continue
+            fi
+
+            # CI's exact gate: HIGH,CRITICAL + fix-available only. exit-code 1
+            # ⇒ findings, 0 ⇒ clean, ≥2 ⇒ scan error. Table → stdout, logs →
+            # stderr (kept out of the report).
+            docker run --rm \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              -v "$cache":/root/.cache/ \
+              aquasec/trivy:latest image \
+              --severity HIGH,CRITICAL --ignore-unfixed --scanners vuln \
+              --format table --exit-code 1 -q \
+              "trivy-scan-$name:scan" > "$RUNNER_TEMP/trivy-$name.txt" 2>"$RUNNER_TEMP/trivy-$name.log"
+            rc=$?
+
+            if [ "$rc" -eq 0 ]; then
+              echo "✅ clean"
+            elif [ "$rc" -eq 1 ]; then
+              echo "🚨 findings"
+              any=1
+              {
+                echo "### \`$name\` (\`$df\`)"
+                echo ""
+                echo '```'
+                head -c 12000 "$RUNNER_TEMP/trivy-$name.txt"
+                echo '```'
+                echo ""
+              } >> "$report"
+            else
+              echo "⚠️ trivy scan error (rc=$rc)"
+              any=1
+              {
+                echo "### \`$name\` — ⚠️ Trivy scan error (rc=$rc)"
+                echo ""
+                echo '```'
+                tail -c 4000 "$RUNNER_TEMP/trivy-$name.log"
+                echo '```'
+                echo ""
+              } >> "$report"
+            fi
+            echo "::endgroup::"
+          done
+
+          echo "has_findings=$any" >> "$GITHUB_OUTPUT"
+
+          # Human-readable rollup on the run's summary page regardless of outcome.
+          {
+            echo "## Scheduled Trivy scan"
+            echo ""
+            if [ "$any" -eq 0 ]; then
+              echo "✅ All shipped images clean (HIGH/CRITICAL, fix-available)."
+            else
+              cat "$report"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Never fail the job on findings — the tracking issue is the durable
+          # signal (a red weekly run would just add notification noise). The
+          # job only fails if the scan step itself errors out above.
+          exit 0
+
+      - name: Open, update or close the tracking issue
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          HAS_FINDINGS: ${{ steps.scan.outputs.has_findings }}
+        with:
+          script: |
+            const fs = require('fs');
+            const { owner, repo } = context.repo;
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const today = new Date().toISOString().slice(0, 10);
+
+            // Fail safe: if the scan step was killed (OOM / timeout) before it
+            // wrote its output, ``has_findings`` interpolates to '' here. We do
+            // NOT know the images are clean, so leave the tracking issue exactly
+            // as it is — closing it on an indeterminate result would mask real,
+            // still-unfixed CVEs.
+            const raw = process.env.HAS_FINDINGS;
+            if (raw !== '0' && raw !== '1') {
+              core.warning(
+                `Scan produced no definitive result (has_findings=${JSON.stringify(raw)}); ` +
+                `leaving any tracking issue untouched.`);
+              return;
+            }
+            const hasFindings = raw === '1';
+
+            const label = 'security:trivy';
+            const title = 'Scheduled Trivy scan: HIGH/CRITICAL CVEs in shipped images';
+            const marker = '<!-- trivy-scheduled-scan -->';
+
+            // Ensure the label exists (idempotent).
+            try {
+              await github.rest.issues.getLabel({ owner, repo, name: label });
+            } catch (e) {
+              if (e.status !== 404) throw e;
+              await github.rest.issues.createLabel({
+                owner, repo, name: label, color: 'b60205',
+                description: 'Automated weekly Trivy image scan findings',
+              });
+            }
+
+            // Find our open tracking issue (by label, confirmed via body
+            // marker). listForRepo returns PRs too — they're issues in the REST
+            // API — so drop anything with a ``pull_request`` field before matching.
+            const open = (await github.rest.issues.listForRepo({
+              owner, repo, state: 'open', labels: label, per_page: 100,
+            })).data.filter(i => !i.pull_request).find(i => (i.body || '').includes(marker));
+
+            if (hasFindings) {
+              let report = '(report file missing — see the run log)';
+              const path = `${process.env.RUNNER_TEMP}/findings.md`;
+              if (fs.existsSync(path)) report = fs.readFileSync(path, 'utf8');
+              let body =
+                `${marker}\n\n` +
+                `The weekly image vulnerability scan found **HIGH/CRITICAL, ` +
+                `fix-available** CVEs (or a scan/build error).\n\n` +
+                `- Scan run: ${runUrl}\n- Last updated: ${today}\n\n` +
+                `${report}\n\n---\n` +
+                `Reproduce the agent images locally with \`make trivy\`. ` +
+                `This issue auto-closes when a later scheduled scan is clean.`;
+              // GitHub caps issue bodies at 65536 chars.
+              if (body.length > 60000) body = body.slice(0, 60000) + '\n\n_…truncated._';
+
+              if (open) {
+                await github.rest.issues.update({ owner, repo, issue_number: open.number, body });
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: open.number,
+                  body: `🔁 Still failing as of ${today} — ${runUrl}`,
+                });
+                core.info(`Updated tracking issue #${open.number}`);
+              } else {
+                const created = await github.rest.issues.create({
+                  owner, repo, title, labels: [label], body,
+                });
+                core.info(`Opened tracking issue #${created.data.number}`);
+              }
+            } else if (open) {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: open.number,
+                body: `✅ All shipped images clean as of ${today} — ${runUrl}. Closing.`,
+              });
+              await github.rest.issues.update({
+                owner, repo, issue_number: open.number, state: 'closed',
+              });
+              core.info(`Closed tracking issue #${open.number} (now clean)`);
+            } else {
+              core.info('All images clean; no open tracking issue to close.');
+            }
