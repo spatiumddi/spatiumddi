@@ -106,7 +106,7 @@ dev = [
     # importorskip'd itself and the whole console suite skipped silently in CI
     # — including the #592 regression guard, which is the one thing stopping a
     # node-local pod filter from quietly coming back.
-    "rich>=13.0.0",
+    "rich>=15.0.0",
     "psutil>=5.9.0",
 ]
 
