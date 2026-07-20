@@ -8,7 +8,11 @@ output into record dicts, dropping daemon-owned RRs).
 
 from __future__ import annotations
 
-from spatium_dns_agent.drivers.bind9 import _render_allow_update
+from spatium_dns_agent.drivers.bind9 import (
+    _render_allow_update,
+    _render_update_policy,
+    _zone_needs_update_policy,
+)
 from spatium_dns_agent.ingest import _saw_soa, parse_axfr
 
 
@@ -44,8 +48,9 @@ def test_allow_update_mixes_ip_and_tsig_and_keeps_group_key() -> None:
 
 
 def test_allow_update_skips_deny_and_name_scoped_entries() -> None:
-    # deny + name-scoped are the P2 update-policy path; the coarse render
-    # must not emit them (belt-and-braces — the control plane blocks them).
+    # deny + name-scoped entries route to the update-policy renderer; the
+    # coarse allow-update renderer must never emit them (belt-and-braces —
+    # the selector picks update-policy for such a zone).
     zone = {
         "dynamic_update_enabled": True,
         "update_acl": [
@@ -118,3 +123,67 @@ def test_saw_soa_false_on_failed_transfer_output() -> None:
     # every external mirror).
     assert _saw_soa("") is False
     assert _saw_soa("\n  \n") is False
+
+
+def test_needs_update_policy_selector() -> None:
+    fine = {
+        "dynamic_update_enabled": True,
+        "update_acl": [
+            {
+                "match_kind": "tsig_key",
+                "tsig_key_name": "k.",
+                "name_scope": "subdomain",
+                "name_pattern": "x.z.",
+                "action": "grant",
+            }
+        ],
+    }
+    coarse = {
+        "dynamic_update_enabled": True,
+        "update_acl": [
+            {"match_kind": "ip", "ip_cidr": "10.0.0.0/24", "action": "grant"}
+        ],
+    }
+    assert _zone_needs_update_policy(fine) is True
+    assert _zone_needs_update_policy(coarse) is False
+    # disabled zone never needs a policy even with fine-grained entries
+    assert _zone_needs_update_policy({**fine, "dynamic_update_enabled": False}) is False
+
+
+def test_render_update_policy_grammar_and_loopback_and_ip_skip() -> None:
+    zone = {
+        "dynamic_update_enabled": True,
+        "update_acl": [
+            {
+                "action": "grant",
+                "match_kind": "tsig_key",
+                "tsig_key_name": "dc01.",
+                "name_scope": "subdomain",
+                "name_pattern": "wks.example.com.",
+                "record_types": ["A", "AAAA"],
+            },
+            {
+                "action": "grant",
+                "match_kind": "tsig_key",
+                "tsig_key_name": "dhcp01.",
+                "name_scope": "zonesub",
+                "record_types": ["PTR"],
+            },
+            {
+                "action": "deny",
+                "match_kind": "tsig_key",
+                "tsig_key_name": "dc01.",
+                "name_scope": "name",
+                "name_pattern": "_locked.example.com.",
+            },
+            # IP entries can't be expressed in update-policy -> skipped.
+            {"action": "grant", "match_kind": "ip", "ip_cidr": "10.0.0.0/24"},
+        ],
+    }
+    out = _render_update_policy(zone, "spatium-loop.")
+    assert out.startswith("update-policy { ")
+    assert "grant spatium-loop. zonesub;" in out  # loopback grant kept
+    assert "grant dc01. subdomain wks.example.com. A AAAA;" in out
+    assert "grant dhcp01. zonesub PTR;" in out
+    assert "deny dc01. name _locked.example.com.;" in out
+    assert "10.0.0.0/24" not in out  # IP skipped

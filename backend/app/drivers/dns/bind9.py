@@ -88,6 +88,52 @@ def _render_record(zone: ZoneData, r: RecordData) -> str:
     return f"{name} {ttl}IN {rtype} {rdata}"
 
 
+_UPDATE_POLICY_NAMED_SCOPES = frozenset({"subdomain", "name", "wildcard", "self"})
+
+
+def _render_update_clause(zone: ZoneData) -> str:
+    """Coarse ``allow-update`` or fine ``update-policy`` clause for the
+    preview / agentless render path (issue #641). Operator entries only —
+    the agent adds its own loopback grant. Returns "" when nothing to render.
+
+    Mirrors the agent-side renderer (``agent/.../drivers/bind9.py``); the two
+    live in separate packages so the logic is intentionally duplicated.
+    """
+    if not zone.dynamic_update_enabled or not zone.update_acl:
+        return ""
+    needs_policy = any(
+        e.action == "deny" or e.name_scope or e.name_pattern or e.record_types
+        for e in zone.update_acl
+    )
+    if needs_policy:
+        lines: list[str] = []
+        for e in zone.update_acl:
+            if e.match_kind != "tsig_key" or not e.tsig_key_name:
+                continue  # update-policy is TSIG-identity only
+            action = "deny" if e.action == "deny" else "grant"
+            scope = e.name_scope or "zonesub"
+            types = " ".join(str(t) for t in (e.record_types or ()) if t)
+            suffix = f" {types}" if types else ""
+            if scope in _UPDATE_POLICY_NAMED_SCOPES:
+                name = (e.name_pattern or "").strip()
+                if not name:
+                    continue
+                lines.append(f"{action} {e.tsig_key_name} {scope} {name}{suffix};")
+            else:
+                lines.append(f"{action} {e.tsig_key_name} zonesub{suffix};")
+        return f"update-policy {{ {' '.join(lines)} }};" if lines else ""
+    # Coarse allow-update — grant-only IP + TSIG.
+    items: list[str] = []
+    for e in zone.update_acl:
+        if e.action != "grant":
+            continue
+        if e.match_kind == "ip" and e.ip_cidr:
+            items.append(f"{e.ip_cidr};")
+        elif e.match_kind == "tsig_key" and e.tsig_key_name:
+            items.append(f'key "{e.tsig_key_name}";')
+    return f"allow-update {{ {' '.join(items)} }};" if items else ""
+
+
 class BIND9Driver(DNSDriver):
     name = "bind9"
 
@@ -145,7 +191,7 @@ class BIND9Driver(DNSDriver):
     def render_zone_config(self, zone: ZoneData) -> str:
         env = _env()
         tmpl = env.get_template("zone.stanza.j2")
-        return tmpl.render(zone=zone)
+        return tmpl.render(zone=zone, update_clause=_render_update_clause(zone))
 
     def render_zone_file(self, zone: ZoneData, records: list[RecordData]) -> str:
         env = _env()
@@ -349,16 +395,16 @@ class BIND9Driver(DNSDriver):
 
     @property
     def dynamic_update_caps(self) -> DynamicUpdateCaps:
-        # P1 (issue #641): coarse ``allow-update`` mixing IP + TSIG in one
-        # address-match-list. The fine-grained ``update-policy`` path
-        # (name scoping, per-type grants, deny) is P2 — BIND9 *can* express
-        # it, but the render isn't wired yet, so name_scoping/per_type stay
-        # False here so the API rejects those fields until P2 lands.
+        # BIND9 expresses the full RFC 2136 ACL surface (issue #641):
+        #   * coarse ``allow-update`` mixing IP + TSIG (P1), and
+        #   * fine-grained ``update-policy`` — per-name / subdomain grants +
+        #     per-type restriction + ``deny`` (P2, TSIG-identity only).
+        # The renderer picks the clause per zone by what the ACL needs.
         return DynamicUpdateCaps(
             supports_ip_acl=True,
             supports_tsig_acl=True,
-            supports_name_scoping=False,
-            supports_per_type=False,
+            supports_name_scoping=True,
+            supports_per_type=True,
         )
 
 

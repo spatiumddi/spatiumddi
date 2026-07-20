@@ -1175,8 +1175,7 @@ so control-plane record ops keep flowing.
   (first-match). Each row identifies a writer by *either* `tsig_key_id`
   (FK → `dns_tsig_key`) *or* `ip_cidr`; a `CHECK (num_nonnulls(...) = 1)`
   enforces exactly one. `action` / `name_scope` / `name_pattern` /
-  `record_types` are forward-compatible storage for the P2 BIND9
-  `update-policy` path — persisted now, rendered later.
+  `record_types` drive the fine-grained BIND9 `update-policy` path (P2).
 
 Secrets never surface: a TSIG entry references a key by id/name, and the
 Fernet-encrypted secret is resolved to a *name* only when the ACL renders
@@ -1192,7 +1191,7 @@ consults it **before** accepting an ACL:
 
 | Backend | ip | tsig | name-scope | per-type | notes |
 |---|---|---|---|---|---|
-| **BIND9** | ✅ | ✅ | ⬜ (P2) | ⬜ (P2) | coarse `allow-update` today |
+| **BIND9** | ✅ | ✅ | ✅ | ✅ | coarse `allow-update` + fine `update-policy` |
 | **PowerDNS / Windows** | ⬜ | ⬜ | ⬜ | ⬜ | rendering is P3 — feature 422s for now |
 | **Route53 / Azure / Cloudflare / Google** | ⬜ | ⬜ | ⬜ | ⬜ | no RFC 2136 → 422 `DYNAMIC_UPDATE_UNSUPPORTED` |
 
@@ -1216,20 +1215,39 @@ module. MCP: `find_zone_update_acls` (read, default-on) +
 `propose_set_zone_update_acl` (write, preview/apply, **default-off** —
 security-sensitive).
 
-### 19.4 Rendering (BIND9, P1)
+### 19.4 Rendering (BIND9)
 
-The agent renders a single coarse `allow-update` address-match-list mixing
-IP + TSIG:
+The renderer picks **one** clause per zone by what the ACL needs:
 
-```
-allow-update { 10.0.0.0/24; key "dc01-ddns."; };
-```
+- **Coarse (P1)** — all grants are unscoped, all-type, no `deny`: a single
+  `allow-update` address-match-list mixing IP + TSIG:
 
-Every TSIG key in the bundle now renders a `key { … }` block (previously
-only the group loopback key did), so an operator key referenced in
-`allow-update` is always defined. The internal loopback grant is always
-included. The fine-grained `update-policy` path (name scoping, per-type,
-deny) is P2.
+  ```
+  allow-update { 10.0.0.0/24; key "dc01-ddns."; };
+  ```
+
+- **Fine-grained (P2)** — any grant carries a `name_scope`, a `record_types`
+  restriction, or is a `deny`: a BIND `update-policy` block (TSIG-identity
+  only — IP entries are rejected at validation, since update-policy can't
+  match on source IP):
+
+  ```
+  update-policy {
+      grant spatium-loop. zonesub;                       # internal loopback
+      grant dc01-ddns. subdomain wks.example.com. A AAAA;
+      grant dhcp01-ddns. zonesub PTR;
+      deny  dc01-ddns. name _locked.example.com.;
+  };
+  ```
+
+  `name_scope` maps to the ruletype (`zonesub` / `subdomain` / `name` /
+  `wildcard` / `self`); a name is required for the last four. `record_types`
+  becomes the trailing type list (omitted ⇒ BIND's standard set).
+
+Either way the internal loopback grant is always kept so control-plane
+record ops keep flowing, and every TSIG key in the bundle renders a
+`key { … }` block (previously only the group loopback key did) so an
+operator key referenced in a clause is always defined.
 
 ### 19.5 Drift — ingest-back (Alt.1)
 

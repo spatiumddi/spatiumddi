@@ -58,10 +58,15 @@ clobbered.
   - Config bundle ships `dynamic_update_enabled` + the resolved ACL
     (by key name) so an edit shifts the structural ETag and wakes the
     agent long-poll → a full, `allow-update`-correct re-render.
-  - Agent (BIND9): renders one coarse `allow-update` mixing IP + TSIG,
-    always keeping the internal loopback grant; now renders a `key {}`
-    block for **every** TSIG key in the bundle (previously only the
-    group key), so an operator key named in `allow-update` is defined.
+  - Agent (BIND9): the renderer picks one clause per zone — coarse
+    `allow-update` (IP + TSIG) for unscoped grants, or fine-grained
+    `update-policy` (TSIG-identity only) when a grant uses a name scope
+    (`subdomain` / `name` / `wildcard` / `self` / `zonesub`), a per-type
+    restriction, or `deny`. The internal loopback grant is always kept,
+    and now a `key {}` block renders for **every** TSIG key in the
+    bundle (previously only the group key) so an operator key named in
+    either clause is defined. Validation rejects mixing an IP entry with
+    an `update-policy` grant (it can't match on source IP).
   - **Ingest-back (Alt.1):** a new agent worker AXFRs each dynamic
     zone from loopback (signed with the group key; the zone grants
     `allow-transfer { key … }` for exactly this) and posts the live

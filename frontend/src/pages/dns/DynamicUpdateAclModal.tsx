@@ -27,6 +27,9 @@ import { dnsApi, formatApiError, type UpdateAclEntryInput } from "@/lib/api";
 
 type Row = UpdateAclEntryInput & { _key: number };
 
+// BIND update-policy ruletypes that take a name argument.
+const NAMED_SCOPES = ["subdomain", "name", "wildcard", "self"];
+
 export function DynamicUpdateAclModal({
   groupId,
   zoneId,
@@ -81,11 +84,24 @@ export function DynamicUpdateAclModal({
 
   const caps = aclQuery.data?.caps;
   const supported = caps?.supported ?? false;
+  const fineGrained = caps?.supports_name_scoping ?? false;
   const hasIpEntry = rows.some((r) => r.match_kind === "ip");
+  const needsName = (r: Row) =>
+    !!r.name_scope && NAMED_SCOPES.includes(r.name_scope);
+  const rowIsFine = (r: Row) =>
+    r.action === "deny" ||
+    !!r.name_scope ||
+    !!(r.record_types && r.record_types.length);
+  // update-policy (any fine-grained row) is TSIG-only; mixing it with an IP
+  // row is unsatisfiable — the backend 422s it, so block Save + warn.
+  const mixingConflict = rows.some(rowIsFine) && hasIpEntry;
   // Every row must be complete before Save: an IP row needs a CIDR, a TSIG
-  // row needs a key selected (the backend 422s an incomplete row otherwise).
+  // row needs a key (and a name pattern when its scope takes one).
   const rowsComplete = rows.every((r) =>
-    r.match_kind === "ip" ? !!(r.ip_cidr && r.ip_cidr.trim()) : !!r.tsig_key_id,
+    r.match_kind === "ip"
+      ? !!(r.ip_cidr && r.ip_cidr.trim())
+      : !!r.tsig_key_id &&
+        (!needsName(r) || !!(r.name_pattern && r.name_pattern.trim())),
   );
 
   const saveMut = useMutation({
@@ -98,6 +114,15 @@ export function DynamicUpdateAclModal({
           ip_cidr: r.match_kind === "ip" ? (r.ip_cidr ?? null) : null,
           tsig_key_id:
             r.match_kind === "tsig_key" ? (r.tsig_key_id ?? null) : null,
+          name_scope: r.match_kind === "tsig_key" ? r.name_scope || null : null,
+          name_pattern:
+            r.match_kind === "tsig_key" ? r.name_pattern || null : null,
+          record_types:
+            r.match_kind === "tsig_key" &&
+            r.record_types &&
+            r.record_types.length
+              ? r.record_types
+              : null,
         })),
       }),
     onSuccess: (data) => {
@@ -245,6 +270,71 @@ export function DynamicUpdateAclModal({
                         />
                       )}
 
+                      {fineGrained && r.match_kind === "tsig_key" && (
+                        <>
+                          <select
+                            className="rounded border bg-background px-2 py-1 text-xs"
+                            value={r.action ?? "grant"}
+                            disabled={saveMut.isPending}
+                            title="grant or (BIND update-policy only) deny"
+                            onChange={(e) =>
+                              updateRow(r._key, {
+                                action: e.target.value as "grant" | "deny",
+                              })
+                            }
+                          >
+                            <option value="grant">grant</option>
+                            <option value="deny">deny</option>
+                          </select>
+                          <select
+                            className="rounded border bg-background px-2 py-1 text-xs"
+                            value={r.name_scope ?? ""}
+                            disabled={saveMut.isPending}
+                            title="Name scope (BIND update-policy ruletype)"
+                            onChange={(e) =>
+                              updateRow(r._key, {
+                                name_scope: e.target.value || null,
+                              })
+                            }
+                          >
+                            <option value="">any name</option>
+                            <option value="zonesub">whole zone</option>
+                            <option value="subdomain">subdomain of…</option>
+                            <option value="name">exact name…</option>
+                            <option value="wildcard">wildcard…</option>
+                            <option value="self">self…</option>
+                          </select>
+                          {needsName(r) && (
+                            <input
+                              className="min-w-32 flex-1 rounded border bg-background px-2 py-1 font-mono text-xs"
+                              placeholder="wks.example.com."
+                              value={r.name_pattern ?? ""}
+                              disabled={saveMut.isPending}
+                              onChange={(e) =>
+                                updateRow(r._key, {
+                                  name_pattern: e.target.value,
+                                })
+                              }
+                            />
+                          )}
+                          <input
+                            className="min-w-24 rounded border bg-background px-2 py-1 font-mono text-xs"
+                            placeholder="types (A, PTR…)"
+                            title="Restrict to these record types (comma-separated); empty = all"
+                            value={(r.record_types ?? []).join(", ")}
+                            disabled={saveMut.isPending}
+                            onChange={(e) =>
+                              updateRow(r._key, {
+                                record_types: e.target.value
+                                  .split(",")
+                                  .map((t) => t.trim().toUpperCase())
+                                  .filter(Boolean),
+                              })
+                            }
+                          />
+                        </>
+                      )}
+
                       <button
                         type="button"
                         className="rounded p-1 text-muted-foreground hover:text-destructive"
@@ -264,6 +354,18 @@ export function DynamicUpdateAclModal({
                     <span>
                       IP-based authorization is UDP-spoofable. For any writer
                       outside a trusted segment, prefer a TSIG key.
+                    </span>
+                  </div>
+                )}
+
+                {mixingConflict && (
+                  <div className="flex items-start gap-2 rounded border border-destructive/50 bg-destructive/10 p-2 text-xs text-destructive">
+                    <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                    <span>
+                      A name-scoped / per-type / deny grant renders as BIND{" "}
+                      <span className="font-mono">update-policy</span>, which
+                      matches TSIG identity only — it can't be combined with an
+                      IP entry. Remove the IP row(s) or the fine-grained fields.
                     </span>
                   </div>
                 )}
@@ -299,11 +401,18 @@ export function DynamicUpdateAclModal({
               <button
                 type="button"
                 className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground disabled:opacity-50"
-                disabled={!supported || saveMut.isPending || !rowsComplete}
+                disabled={
+                  !supported ||
+                  saveMut.isPending ||
+                  !rowsComplete ||
+                  mixingConflict
+                }
                 title={
-                  !rowsComplete
-                    ? "Every entry needs a source IP/CIDR or a selected TSIG key."
-                    : undefined
+                  mixingConflict
+                    ? "Can't mix IP entries with name-scoped / per-type / deny grants."
+                    : !rowsComplete
+                      ? "Every entry needs a source IP/CIDR, or a TSIG key (and a name where the scope requires one)."
+                      : undefined
                 }
                 onClick={() => saveMut.mutate()}
               >

@@ -491,6 +491,34 @@ class DNSDriver(ABC):
                     f"{self.name} cannot restrict a dynamic-update grant to specific "
                     "record types; drop record_types for this backend."
                 )
+        # Fine-grained (update-policy) is TSIG-identity only — it cannot match
+        # on source IP, and the renderer picks ONE clause for the whole zone.
+        # So when any entry forces the zone onto the update-policy path
+        # (name-scope / per-type / deny), an IP entry in the same ACL is
+        # unsatisfiable, and name-scoped ruletypes that take a name need one.
+        if caps.supports_name_scoping:
+            needs_policy = any(
+                e.action == "deny" or e.name_scope or e.name_pattern or e.record_types
+                for e in entries
+            )
+            if needs_policy:
+                ip_entries = [e.ip_cidr for e in entries if e.match_kind == "ip"]
+                if ip_entries:
+                    raise ValueError(
+                        "this ACL uses name-scoped / per-type / deny grants, which "
+                        "render as BIND update-policy (TSIG-identity only). Remove the "
+                        f"IP entr{'y' if len(ip_entries) == 1 else 'ies'} "
+                        f"({', '.join(str(c) for c in ip_entries)}) — update-policy "
+                        "cannot match on source IP."
+                    )
+                for e in entries:
+                    if e.name_scope in ("subdomain", "name", "wildcard", "self") and not (
+                        e.name_pattern and e.name_pattern.strip()
+                    ):
+                        raise ValueError(
+                            f"name_scope={e.name_scope!r} requires a name_pattern "
+                            "(the FQDN / subtree the grant applies to)."
+                        )
         return warnings
 
 

@@ -697,7 +697,7 @@ drivers 422 the write for free; drivers override to opt in.
 
 | Driver | ip | tsig | name-scope | per-type | render path |
 |---|---|---|---|---|---|
-| **BIND9** | ✅ | ✅ | ⬜ (P2) | ⬜ (P2) | coarse `allow-update` (agent `_render_allow_update`) |
+| **BIND9** | ✅ | ✅ | ✅ | ✅ | coarse `allow-update` or fine `update-policy` (agent `_render_allow_update` / `_render_update_policy`) |
 | **PowerDNS** | ⬜ | ⬜ | ⬜ | ⬜ | P3 — `dnsupdate=yes` + `ALLOW-DNSUPDATE-FROM` / `TSIG-ALLOW-DNSUPDATE` |
 | **Windows DNS** | ⬜ | ⬜ | ⬜ | ⬜ | P3 — `coarse_enum_only` maps to None/Secure/NonsecureAndSecure |
 | **Cloud (R53/Azure/CF/Google)** | ⬜ | ⬜ | ⬜ | ⬜ | N/A — no RFC 2136; feature disabled |
@@ -706,22 +706,34 @@ drivers 422 the write for free; drivers override to opt in.
 lossy-but-accepted mappings (an IP entry is UDP-spoofable; on a
 `coarse_enum_only` backend an IP entry opens the zone wider than the CIDR)
 and **raises** `ValueError` (surfaced as a 422 by the API) on a
-hard-unsupported entry — any entry on a no-surface driver, or a
-name-scoped / per-type / `deny` entry on coarse-only BIND9-P1.
+hard-unsupported entry — any entry on a no-surface driver. For a
+name-scoped / per-type / `deny` ACL (which must render as `update-policy`,
+TSIG-identity only) it also rejects any IP entry in the same ACL, and
+requires a `name_pattern` for the ruletypes that take a name
+(`subdomain` / `name` / `wildcard` / `self`).
 
 ### 8.1 BIND9 agent rendering
 
 The **agent** (`agent/dns/spatium_dns_agent/drivers/bind9.py`) is the
-authoritative renderer on an appliance. Two changes support #641:
+authoritative renderer on an appliance. It picks ONE clause per zone:
 
-1. `_render_allow_update(zone, group_key)` builds one coarse
+1. **Coarse** — `_render_allow_update(zone, group_key)` builds one
    `allow-update { … }` mixing the always-present group loopback key with
-   the operator ACL's grant entries (`<cidr>;` / `key "<name>";`). `deny`
-   and name/type-scoped entries are skipped (they never reach a coarse
-   render — the capability gate blocks them until P2).
-2. Every TSIG key in the bundle now renders a `key { … }` block (not just
-   `tsig_keys[0]`), so an operator key named in `allow-update` is defined —
+   the operator ACL's grant entries (`<cidr>;` / `key "<name>";`). Used when
+   no entry needs the fine-grained path.
+2. **Fine-grained** — `_render_update_policy(zone, group_key)` builds an
+   `update-policy { … }` when `_zone_needs_update_policy` sees any
+   `name_scope` / `record_types` / `deny` entry. Renders
+   `grant <groupkey> zonesub;` (loopback) + one
+   `<grant|deny> <keyname> <ruletype> [<name>] [<types>];` per operator
+   entry. IP entries are skipped (rejected upstream).
+3. Every TSIG key in the bundle renders a `key { … }` block (not just
+   `tsig_keys[0]`), so an operator key named in either clause is defined —
    BIND rejects a stanza that references an undefined key.
+
+The control-plane driver mirrors the same selection in
+`_render_update_clause(zone)` (`backend/app/drivers/dns/bind9.py`) for the
+preview / agentless path.
 
 Dynamic zones also render `allow-transfer { key "<group-key>"; };` so the
 ingest-back worker can AXFR the live zone from loopback (see DNS.md §19.5).

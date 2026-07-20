@@ -29,13 +29,13 @@ from app.services.dns.ingest import IncomingRecord, reconcile_external_records
 # ── Driver capability + validation (pure) ───────────────────────────────────
 
 
-def test_bind9_caps_ip_and_tsig_only_in_p1() -> None:
+def test_bind9_caps_full_surface() -> None:
     caps = get_driver("bind9").dynamic_update_caps
+    # P1 coarse allow-update + P2 fine-grained update-policy.
     assert caps.supports_ip_acl is True
     assert caps.supports_tsig_acl is True
-    # Fine-grained update-policy is P2.
-    assert caps.supports_name_scoping is False
-    assert caps.supports_per_type is False
+    assert caps.supports_name_scoping is True
+    assert caps.supports_per_type is True
 
 
 def test_bind9_validate_accepts_ip_and_tsig_with_spoof_warning() -> None:
@@ -51,29 +51,87 @@ def test_bind9_validate_accepts_ip_and_tsig_with_spoof_warning() -> None:
     assert any("spoofable" in w.lower() for w in warnings)
 
 
-def test_bind9_validate_rejects_name_scope_in_p1() -> None:
+def test_bind9_accepts_fine_grained_update_policy() -> None:
+    # P2: name-scope + per-type + deny are all valid for BIND9 now.
     drv = get_driver("bind9")
-    with pytest.raises(ValueError, match="name"):
+    warns = drv.validate_update_acl(
+        "example.com.",
+        [
+            UpdateAclEntry(
+                match_kind="tsig_key",
+                tsig_key_name="dc01.",
+                name_scope="subdomain",
+                name_pattern="wks.example.com.",
+                record_types=("A", "AAAA"),
+            ),
+            UpdateAclEntry(
+                match_kind="tsig_key", action="deny", tsig_key_name="dc01.", name_scope="zonesub"
+            ),
+        ],
+    )
+    assert warns == []  # TSIG-only, no spoofable-IP warnings
+
+
+def test_bind9_rejects_ip_mixed_with_update_policy() -> None:
+    drv = get_driver("bind9")
+    with pytest.raises(ValueError, match="update-policy"):
         drv.validate_update_acl(
             "example.com.",
             [
+                UpdateAclEntry(match_kind="ip", ip_cidr="10.0.0.0/24"),
                 UpdateAclEntry(
                     match_kind="tsig_key",
                     tsig_key_name="k.",
-                    name_scope="subdomain",
-                    name_pattern="wks.example.com.",
-                )
+                    name_scope="zonesub",
+                    record_types=("PTR",),
+                ),
             ],
         )
 
 
-def test_bind9_validate_rejects_deny_in_p1() -> None:
+def test_bind9_requires_name_pattern_for_named_scope() -> None:
     drv = get_driver("bind9")
-    with pytest.raises(ValueError, match="deny"):
+    with pytest.raises(ValueError, match="name_pattern"):
         drv.validate_update_acl(
             "example.com.",
-            [UpdateAclEntry(match_kind="ip", action="deny", ip_cidr="10.0.0.0/24")],
+            [UpdateAclEntry(match_kind="tsig_key", tsig_key_name="k.", name_scope="subdomain")],
         )
+
+
+def test_control_plane_renders_update_policy() -> None:
+    from app.drivers.dns.base import ZoneData
+    from app.drivers.dns.bind9 import _render_update_clause
+
+    z = ZoneData(
+        name="example.com.",
+        zone_type="primary",
+        kind="forward",
+        ttl=3600,
+        refresh=1,
+        retry=1,
+        expire=1,
+        minimum=1,
+        primary_ns="ns1.example.com.",
+        admin_email="admin.example.com.",
+        serial=1,
+        dynamic_update_enabled=True,
+        update_acl=(
+            UpdateAclEntry(
+                match_kind="tsig_key",
+                tsig_key_name="dc01.",
+                name_scope="subdomain",
+                name_pattern="wks.example.com.",
+                record_types=("A", "AAAA"),
+            ),
+            UpdateAclEntry(
+                match_kind="tsig_key", action="deny", tsig_key_name="dc01.", name_scope="zonesub"
+            ),
+        ),
+    )
+    out = _render_update_clause(z)
+    assert out.startswith("update-policy {")
+    assert "grant dc01. subdomain wks.example.com. A AAAA;" in out
+    assert "deny dc01. zonesub;" in out
 
 
 def test_cloud_driver_has_no_dynamic_update_surface() -> None:
@@ -276,9 +334,8 @@ async def test_put_and_get_update_acl_roundtrip(
     assert len(g.json()["entries"]) == 2
 
 
-async def test_put_rejects_name_scoped_entry_422(
-    client: AsyncClient, db_session: AsyncSession
-) -> None:
+async def test_put_accepts_name_scoped_entry(client: AsyncClient, db_session: AsyncSession) -> None:
+    """P2: a name-scoped / per-type TSIG grant is now accepted (update-policy)."""
     _, headers = await _superadmin(db_session)
     group, zone, key = await _bind9_group_zone_key(db_session)
     await db_session.commit()
@@ -293,7 +350,35 @@ async def test_put_rejects_name_scoped_entry_422(
                     "tsig_key_id": str(key.id),
                     "name_scope": "subdomain",
                     "name_pattern": "wks.api.example.com.",
+                    "record_types": ["A", "AAAA"],
                 }
+            ]
+        },
+    )
+    assert r.status_code == 200, r.text
+    e = r.json()["entries"][0]
+    assert e["name_scope"] == "subdomain" and e["record_types"] == ["A", "AAAA"]
+
+
+async def test_put_rejects_ip_mixed_with_update_policy_422(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    _, headers = await _superadmin(db_session)
+    group, zone, key = await _bind9_group_zone_key(db_session)
+    await db_session.commit()
+
+    r = await client.put(
+        f"/api/v1/dns/groups/{group.id}/zones/{zone.id}/update-acl",
+        headers=headers,
+        json={
+            "entries": [
+                {"match_kind": "ip", "ip_cidr": "10.0.0.0/24"},
+                {
+                    "match_kind": "tsig_key",
+                    "tsig_key_id": str(key.id),
+                    "name_scope": "zonesub",
+                    "record_types": ["PTR"],
+                },
             ]
         },
     )

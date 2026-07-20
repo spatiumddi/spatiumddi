@@ -1086,13 +1086,32 @@ register(
 
 
 class SetZoneUpdateAclEntry(BaseModel):
-    match_kind: str  # tsig_key | ip
-    action: str = "grant"
-    ip_cidr: str | None = None
-    tsig_key_id: uuid.UUID | None = None
-    name_scope: str | None = None
-    name_pattern: str | None = None
-    record_types: list[str] | None = None
+    match_kind: str = Field(description="'tsig_key' or 'ip'.")
+    action: str = Field(
+        default="grant",
+        description="'grant' or 'deny'. 'deny' is BIND update-policy only (TSIG entries).",
+    )
+    ip_cidr: str | None = Field(default=None, description="Source IP/CIDR when match_kind='ip'.")
+    tsig_key_id: uuid.UUID | None = Field(
+        default=None, description="TSIG key UUID when match_kind='tsig_key'."
+    )
+    name_scope: str | None = Field(
+        default=None,
+        description=(
+            "Fine-grained BIND update-policy ruletype (TSIG entries only): "
+            "'zonesub' (whole zone), 'subdomain', 'name', 'wildcard', 'self'. "
+            "Omit for a coarse grant. Any entry using this forces the zone onto "
+            "update-policy, which can't be combined with an ip entry."
+        ),
+    )
+    name_pattern: str | None = Field(
+        default=None,
+        description="FQDN/subtree the grant applies to; required for subdomain/name/wildcard/self.",
+    )
+    record_types: list[str] | None = Field(
+        default=None,
+        description="Restrict the grant to these RR types (e.g. ['A','PTR']); null = all.",
+    )
 
 
 class SetZoneUpdateAclArgs(BaseModel):

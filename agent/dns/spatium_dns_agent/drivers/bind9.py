@@ -110,6 +110,60 @@ def _render_allow_update(zone: dict[str, Any], group_key_name: str | None) -> st
     return f'allow-update {{ {" ".join(items)} }}; '
 
 
+_UPDATE_POLICY_NAMED_SCOPES = frozenset({"subdomain", "name", "wildcard", "self"})
+
+
+def _zone_needs_update_policy(zone: dict[str, Any]) -> bool:
+    """True when the ACL needs BIND's fine-grained ``update-policy`` clause
+    (issue #641 P2) — any grant carries a name scope, a per-type restriction,
+    or is a ``deny``. Otherwise the coarse ``allow-update`` clause is used.
+    """
+    if not zone.get("dynamic_update_enabled"):
+        return False
+    for e in zone.get("update_acl") or []:
+        if (
+            e.get("action") == "deny"
+            or e.get("name_scope")
+            or e.get("name_pattern")
+            or e.get("record_types")
+        ):
+            return True
+    return False
+
+
+def _render_update_policy(zone: dict[str, Any], group_key_name: str | None) -> str:
+    """Build the ``update-policy { ... };`` clause for a fine-grained zone.
+
+    TSIG-identity only (IP entries can't be expressed and are rejected at the
+    control plane, so they're skipped defensively here). The group loopback
+    key is always granted the whole zone so the agent's own record ops keep
+    flowing. Each operator entry renders as
+    ``<grant|deny> <keyname> <ruletype> [<name>] [<types>];`` — the type list
+    is omitted when unrestricted (BIND then allows the standard rrtype set).
+    """
+    lines: list[str] = []
+    if group_key_name:
+        lines.append(f"grant {group_key_name} zonesub;")
+    for e in zone.get("update_acl") or []:
+        if e.get("match_kind") != "tsig_key" or not e.get("tsig_key_name"):
+            continue
+        action = "deny" if e.get("action") == "deny" else "grant"
+        identity = e["tsig_key_name"]
+        scope = e.get("name_scope") or "zonesub"
+        types = " ".join(str(t) for t in (e.get("record_types") or []) if t)
+        type_suffix = f" {types}" if types else ""
+        if scope in _UPDATE_POLICY_NAMED_SCOPES:
+            name = (e.get("name_pattern") or "").strip()
+            if not name:
+                continue  # required by validation; skip defensively
+            lines.append(f"{action} {identity} {scope} {name}{type_suffix};")
+        else:  # zonesub (default) — whole zone, no name
+            lines.append(f"{action} {identity} zonesub{type_suffix};")
+    if not lines:
+        return ""
+    return f'update-policy {{ {" ".join(lines)} }}; '
+
+
 def _render_rate_limit_block(opts: dict[str, Any]) -> str:
     """Build the named.conf RRL + amplification directives from bundle opts
     (issue #146). Returns "" (no-op) unless something is enabled/set, so the
@@ -416,7 +470,12 @@ class Bind9Driver(DriverBase):
             # `directory` (/var/cache/bind, not our rendered tree).
             rel_zfile = f"zones/{file_prefix}{zname.rstrip('.')}.db"
             abs_zfile = self.state_dir / self.rendered_dir_name / rel_zfile
-            allow_update = _render_allow_update(zone, tsig_key_name)
+            # Coarse allow-update (IP + TSIG) unless the ACL needs the
+            # fine-grained update-policy path (name-scope / per-type / deny).
+            if _zone_needs_update_policy(zone):
+                update_clause = _render_update_policy(zone, tsig_key_name)
+            else:
+                update_clause = _render_allow_update(zone, tsig_key_name)
             # Ingest-back (issue #641): a dynamic zone can accept externally-
             # injected records that live only in the journal. The agent AXFRs
             # the live zone from loopback to read them back — but the global
@@ -438,7 +497,7 @@ class Bind9Driver(DriverBase):
             self._write_zone_file(new_dir / rel_zfile, zone)
             return (
                 f'zone "{zname}" {{ type master; file "{abs_zfile}"; '
-                f"{allow_update}{allow_transfer}{dnssec_clause}}};\n"
+                f"{update_clause}{allow_transfer}{dnssec_clause}}};\n"
             )
 
         def _rpz_stanza(bl: dict[str, Any], file_prefix: str) -> str:
