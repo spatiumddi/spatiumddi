@@ -309,7 +309,7 @@ jobs:
       chart_version: ${{ steps.pkg.outputs.chart_version }}
     steps:
       - uses: actions/checkout@v4
-      - uses: azure/setup-helm@v4
+      - uses: azure/setup-helm@v5
         with:
           version: v3.20.2
       - name: Log in to GHCR
@@ -417,7 +417,7 @@ jobs:
         # host: baltocdn.com" — Azure runner network policy).
         # bake-chart.sh shells out to ``helm package`` so helm must be
         # on PATH before the chart-bake step.
-        uses: azure/setup-helm@v4
+        uses: azure/setup-helm@v5
         with:
           version: v3.20.2
       - name: Fetch k3s binary + airgap tarball
