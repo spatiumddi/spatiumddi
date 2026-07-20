@@ -203,3 +203,64 @@ jobs:
 
       - name: Build
         run: npm run build
+
+  # ── Agents ───────────────────────────────────────────────────────────────────
+  # The standalone agents (DNS / DHCP / supervisor) each ship their own test
+  # suite under ``agent/<name>/tests`` but were never run in CI — ``ci.yml``
+  # only ever touched ``backend`` + ``frontend`` (issue #640). That let
+  # ``agent/supervisor`` sit RED on main undetected, which in turn hid a real
+  # production bug (the ``PeerResolveWatcher`` ``AttributeError`` on the
+  # bootstrap-from-cache path — see #640). These suites are DB-less and fast
+  # (~1-2 s each), so running them on every PR is nearly free.
+  #
+  # NOTE: agent code is NOT yet lint-checked (Backend Lint scopes to
+  # ``backend/app`` + ``backend/tests``) and carries pre-existing ruff/black
+  # drift, so this job runs *tests only*. Bringing agent code under lint is a
+  # separate, larger cleanup (~30 files of black reformatting) deliberately
+  # left out of #640 to keep this change focused.
+  agent-test-shard:
+    name: Agent — Tests (${{ matrix.agent }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        agent: [dhcp, dns, supervisor]
+    defaults:
+      run:
+        working-directory: agent/${{ matrix.agent }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: agent/${{ matrix.agent }}/pyproject.toml
+
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Run tests
+        # The ``@pytest.mark.e2e`` acceptance tests self-``skip()`` when their
+        # docker/live-daemon prerequisites are absent, so a plain ``pytest``
+        # run stays hermetic (no database, no network) — see each agent's
+        # ``tests/test_acceptance.py``.
+        run: python -m pytest tests -q
+
+  # Required-status-check aggregator: branch protection can gate on the stable
+  # name "Agent — Tests"; this job passes only if all three agent suites did.
+  # Keep this name (and the matrix above) in sync with the required check.
+  agent-test:
+    name: Agent — Tests
+    runs-on: ubuntu-latest
+    needs: [agent-test-shard]
+    if: always()
+    steps:
+      - name: All agent suites passed
+        run: |
+          result="${{ needs.agent-test-shard.result }}"
+          if [ "$result" != "success" ]; then
+            echo "::error::one or more agent test suites failed (result=$result)"
+            exit 1
+          fi
+          echo "all agent test suites passed"

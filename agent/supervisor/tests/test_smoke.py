@@ -36,7 +36,10 @@ def test_config_defaults_from_empty_env(monkeypatch) -> None:
     assert cfg.control_plane_url == ""
     assert cfg.state_dir == Path("/var/lib/spatium-supervisor")
     assert cfg.bootstrap_pairing_code == ""
-    assert cfg.heartbeat_interval_seconds == 60
+    # 30s default cadence — operator feedback that 60s felt sluggish on
+    # role-swap (reconcile_node_labels only fires per heartbeat). See the
+    # comment on SupervisorConfig.from_env.
+    assert cfg.heartbeat_interval_seconds == 30
     assert cfg.hostname  # gethostname() always returns something
 
 
@@ -94,4 +97,11 @@ def test_entrypoint_drops_to_unprivileged_user() -> None:
     # The supervisor must not run as root in the container — only the
     # bind-mounted sockets/dirs we mount in get root-capable access,
     # not the Python entrypoint.
-    assert "su-exec spatium:spatium" in text
+    assert "su-exec spatium /usr/local/bin/spatium-supervisor" in text
+    # Must NOT pin an explicit ``:group``. ``su-exec spatium:spatium``
+    # clears supplementary groups, which locks the unprivileged user out
+    # of the host docker.sock (owned root:<docker-gid>); the entrypoint
+    # instead adds spatium to a matching docker group and drops the
+    # ``:group`` so initgroups() keeps it. Regressing this silently
+    # re-breaks docker access — hence the negative assertion.
+    assert "su-exec spatium:spatium" not in text

@@ -34,6 +34,10 @@ def test_register_happy_path(tmp_path: Path) -> None:
                 "appliance_id": "11111111-2222-3333-4444-555555555555",
                 "state": "pending_approval",
                 "public_key_fingerprint": identity.fingerprint,
+                # Register returns a cleartext session token the supervisor
+                # re-presents on every poll/heartbeat until approval lands
+                # the mTLS switch (see RegisterResult.session_token).
+                "session_token": "tok-abc123",
             },
         )
 
@@ -48,6 +52,7 @@ def test_register_happy_path(tmp_path: Path) -> None:
     )
     assert result.appliance_id == "11111111-2222-3333-4444-555555555555"
     assert result.state == "pending_approval"
+    assert result.session_token == "tok-abc123"
     assert (
         captured["url"]
         == "https://ddi.example.com/api/v1/appliance/supervisor/register"
@@ -107,6 +112,7 @@ def test_register_retries_on_5xx_then_succeeds(tmp_path: Path) -> None:
                 "appliance_id": "11111111-2222-3333-4444-555555555555",
                 "state": "pending_approval",
                 "public_key_fingerprint": identity.fingerprint,
+                "session_token": "tok-abc123",
             },
         )
 
