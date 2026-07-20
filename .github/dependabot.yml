@@ -15,6 +15,13 @@
 # ranges with no lock file, so routine ``pip`` *version* PRs will be sparse —
 # the real value there is Dependabot *security* updates (driven by the
 # dependency graph), which fire regardless of pinning.
+#
+# POLICY: major bumps of application deps (pip + npm) are *breaking* and done
+# as deliberate upgrade efforts, not weekly auto-PRs — so ``semver-major`` is
+# ignored for those two ecosystems (minor/patch + security still flow). The
+# backend Docker base image is likewise pinned to Python 3.12 (the version the
+# codebase + CI target). GitHub Actions and the remaining Docker base images
+# keep taking majors — those are low-risk, low-volume, and worth staying on.
 version: 2
 
 updates:
@@ -56,6 +63,15 @@ updates:
     groups:
       docker-base-images:
         update-types: ["minor", "patch"]
+    ignore:
+      # The codebase + CI target Python 3.12 (mypy ``target-version = py312``,
+      # setup-python 3.12). Keep the backend runtime image on 3.12 so Dependabot
+      # doesn't push 3.13/3.14 ahead of a deliberate interpreter upgrade (a
+      # 3.12→3.14 bump lands as a Docker "minor", so it must be ignored by name
+      # here rather than by update-type).
+      - dependency-name: "python"
+        update-types:
+          ["version-update:semver-minor", "version-update:semver-major"]
 
   # Python — control plane (backend) plus the three standalone agents.
   - package-ecosystem: "pip"
@@ -74,6 +90,12 @@ updates:
     groups:
       python:
         update-types: ["minor", "patch"]
+    ignore:
+      # Major Python-dep upgrades (redis 5→8, caldav 1→3, black 24→26, …) are
+      # breaking and done deliberately. Minor/patch (grouped) + Dependabot
+      # security updates still flow.
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
 
   # Frontend — React / Vite / TypeScript (package-lock.json present).
   - package-ecosystem: "npm"
@@ -88,3 +110,9 @@ updates:
     groups:
       npm:
         update-types: ["minor", "patch"]
+    ignore:
+      # Major JS/TS framework upgrades (React, TypeScript, ESLint, Vite, …) are
+      # breaking and done as deliberate efforts, not weekly auto-PRs. Minor/patch
+      # (grouped) + Dependabot security updates still flow.
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
