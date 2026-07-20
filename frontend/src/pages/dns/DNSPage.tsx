@@ -45,6 +45,7 @@ import { TagFilterChips } from "@/components/TagFilterChips";
 import { PropagationCheckModal } from "./PropagationCheckModal";
 import { BlocklistCatalogModal } from "./BlocklistCatalogModal";
 import { DelegationModal } from "./DelegationModal";
+import { DynamicUpdateAclModal } from "./DynamicUpdateAclModal";
 import { ZoneTemplateModal } from "./ZoneTemplateModal";
 import { ServerDetailModal } from "./ServerDetailModal";
 import { PauseServerModal } from "@/components/ui/pause-server-modal";
@@ -2793,6 +2794,7 @@ function ZoneDetailView({
   const [showEditZone, setShowEditZone] = useState(false);
   const [showAddSubzone, setShowAddSubzone] = useState(false);
   const [showDelegate, setShowDelegate] = useState(false);
+  const [showUpdateAcl, setShowUpdateAcl] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [deleteNotice, setDeleteNotice] = useState<string | null>(null);
   const [showImport, setShowImport] = useState(false);
@@ -3042,6 +3044,14 @@ function ZoneDetailView({
                 DNSSEC
               </span>
             )}
+            {zone.dynamic_update_enabled && (
+              <span
+                className="inline-flex items-center rounded px-1.5 py-0.5 text-xs bg-sky-500/15 text-sky-600 dark:text-sky-300"
+                title="This zone accepts external RFC 2136 dynamic updates from an operator-configured ACL."
+              >
+                Dynamic updates
+              </span>
+            )}
             {zone.tailscale_tenant_id && (
               <span
                 className="inline-flex items-center rounded px-1.5 py-0.5 text-xs bg-cyan-500/15 text-cyan-700 dark:text-cyan-300"
@@ -3132,6 +3142,16 @@ function ZoneDetailView({
             resourceId={zone.id}
             label={zone.name}
           />
+          {(zone.zone_type === "primary" || zone.zone_type === "master") &&
+            moduleEnabled("dns.dynamic_update_acl") && (
+              <HeaderButton
+                icon={KeyRound}
+                onClick={() => setShowUpdateAcl(true)}
+                title="Manage which external clients (by TSIG key or source IP/CIDR) may send RFC 2136 dynamic updates to this zone."
+              >
+                Dynamic Updates
+              </HeaderButton>
+            )}
           <HeaderButton
             icon={Pencil}
             onClick={() => setShowEditZone(true)}
@@ -3818,6 +3838,14 @@ function ZoneDetailView({
           // the leading label at the cursor: "sub" + ".example.com".
           initialName={"." + zone.name.replace(/\.$/, "")}
           onClose={() => setShowAddSubzone(false)}
+        />
+      )}
+      {showUpdateAcl && (
+        <DynamicUpdateAclModal
+          groupId={group.id}
+          zoneId={zone.id}
+          zoneName={zone.name}
+          onClose={() => setShowUpdateAcl(false)}
         />
       )}
       {showDelegate && (

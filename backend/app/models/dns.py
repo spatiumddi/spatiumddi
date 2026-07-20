@@ -5,6 +5,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     Column,
     DateTime,
     ForeignKey,
@@ -695,6 +696,19 @@ class DNSZone(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     also_notify: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     notify_enabled: Mapped[str | None] = mapped_column(String(20), nullable=True)
 
+    # Operator-configurable dynamic-update (RFC 2136) ACL (issue #641).
+    # When True the zone accepts DDNS updates from the clients enumerated in
+    # ``update_acl_entries`` (by TSIG key or source IP/CIDR), *in addition* to
+    # the agent's own loopback writes (the group loopback key is always kept
+    # so internal record ops keep flowing). False renders no operator ACL —
+    # only the internal loopback grant, i.e. today's behaviour. Only the
+    # BIND9 / PowerDNS drivers can express this; cloud drivers 422 the write
+    # and Windows maps it coarsely to its enum (see the driver capability
+    # descriptors). The ACL rows themselves live in ``dns_zone_update_acl``.
+    dynamic_update_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+
     # Conditional-forwarder config. Only meaningful when ``zone_type == "forward"``.
     # ``forwarders`` is the upstream resolver list (IP or IP@port strings).
     # ``forward_only`` true → ``forward only;`` (don't fall through to recursion);
@@ -747,6 +761,12 @@ class DNSZone(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     view: Mapped["DNSView | None"] = relationship("DNSView", back_populates="zones")
     records: Mapped[list["DNSRecord"]] = relationship(
         "DNSRecord", back_populates="zone", cascade="all, delete-orphan"
+    )
+    update_acl_entries: Mapped[list["DNSZoneUpdateAcl"]] = relationship(
+        "DNSZoneUpdateAcl",
+        back_populates="zone",
+        cascade="all, delete-orphan",
+        order_by="DNSZoneUpdateAcl.seq",
     )
 
 
@@ -849,6 +869,79 @@ class DNSRecord(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     imported_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     zone: Mapped["DNSZone"] = relationship("DNSZone", back_populates="records")
+
+
+class DNSZoneUpdateAcl(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """One entry in a zone's dynamic-update (RFC 2136) ACL (issue #641).
+
+    Rows are ordered by ``seq`` (first-match, matching BIND9
+    ``update-policy`` semantics) and authorize a dynamic-DNS writer to
+    the parent zone — identified either by a named TSIG key
+    (``match_kind="tsig_key"`` → ``tsig_key_id``) or by source
+    address/prefix (``match_kind="ip"`` → ``ip_cidr``). The
+    ``CHECK (num_nonnulls(...) = 1)`` constraint guarantees exactly one
+    of the two identity columns is set per row.
+
+    Secrets never live here — a TSIG entry references an operator-managed
+    :class:`DNSTSIGKey` by FK, and the key's Fernet-encrypted secret is
+    resolved to a *name* only when the ACL is rendered into the config
+    bundle. ACL API responses expose ``tsig_key_name`` but never the
+    secret (the ``*_set`` boolean pattern used elsewhere).
+
+    P1 renders the coarse ``allow-update`` clause (IP + TSIG mixed) for
+    BIND9. The fine-grained BIND9 ``update-policy`` fields
+    (``action="deny"``, ``name_scope`` / ``name_pattern``,
+    ``record_types``) are persisted but not yet rendered — the API
+    rejects them until P2 via the driver capability descriptor, so the
+    columns are forward-compatible storage, not live behaviour.
+    """
+
+    __tablename__ = "dns_zone_update_acl"
+    __table_args__ = (
+        CheckConstraint(
+            "num_nonnulls(tsig_key_id, ip_cidr) = 1",
+            name="ck_dns_zone_update_acl_one_identity",
+        ),
+        Index("ix_dns_zone_update_acl_zone_seq", "zone_id", "seq"),
+    )
+
+    zone_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dns_zone.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    # First-match order. Lower = evaluated first (BIND update-policy).
+    seq: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # grant | deny. ``deny`` is only meaningful for BIND update-policy
+    # (P2); coarse allow-update has no deny concept, so a deny row on a
+    # coarse-only driver is rejected at validation.
+    action: Mapped[str] = mapped_column(String(10), nullable=False, default="grant")
+    # tsig_key | ip — which identity column below is populated.
+    match_kind: Mapped[str] = mapped_column(String(10), nullable=False)
+    # Populated when match_kind="tsig_key". SET NULL would violate the
+    # check constraint, so the FK cascades: deleting a referenced key
+    # removes the ACL rows that point at it (the grant is meaningless
+    # once its key is gone).
+    tsig_key_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dns_tsig_key.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    # Populated when match_kind="ip". CIDR or bare IP, stored as text for
+    # cross-backend portability (BIND address-match-list / PowerDNS
+    # ALLOW-DNSUPDATE-FROM both take plain CIDR strings). Validated in
+    # the API layer via ``ipaddress.ip_network``.
+    ip_cidr: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # BIND update-policy name scoping (P2). self|subdomain|zonesub|wildcard|name.
+    name_scope: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    name_pattern: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Restrict the grant to these RR types (["A","PTR",…]). NULL = all types.
+    record_types: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+
+    zone: Mapped["DNSZone"] = relationship("DNSZone", back_populates="update_acl_entries")
+    tsig_key: Mapped["DNSTSIGKey | None"] = relationship("DNSTSIGKey")
 
 
 # ── DNS Pools (GSLB-lite) ───────────────────────────────────────────────────

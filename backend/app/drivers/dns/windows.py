@@ -49,6 +49,7 @@ from app.drivers._winrm import (
 from app.drivers.dns.base import (
     ConfigBundle,
     DNSDriver,
+    DynamicUpdateCaps,
     EffectiveBlocklistData,
     RecordChange,
     RecordChangeResult,
@@ -58,6 +59,26 @@ from app.drivers.dns.base import (
 )
 
 logger = structlog.get_logger(__name__)
+
+# Windows DNS ``-DynamicUpdate`` enum values.
+_WINDOWS_DYNAMIC_UPDATE_MODES = frozenset({"None", "Secure", "NonsecureAndSecure"})
+
+
+def windows_dynamic_update_mode(enabled: bool, has_ip_entry: bool) -> str:
+    """Map an operator's dynamic-update ACL onto the Windows zone-level enum.
+
+    Windows DNS can't express a per-client ACL (issue #641) — it only has a
+    three-way zone enum. So we degrade coarsely:
+
+    * disabled                → ``None`` (reject all dynamic updates)
+    * enabled, TSIG/secure    → ``Secure`` (AD GSS-TSIG only)
+    * enabled, any IP entry   → ``NonsecureAndSecure`` — Windows accepts
+      *any* nonsecure client, NOT just the operator's CIDR, so the caller
+      surfaces a loud warning that the source restriction is lost.
+    """
+    if not enabled:
+        return "None"
+    return "NonsecureAndSecure" if has_ip_entry else "Secure"
 
 
 # Record types this driver knows how to format for an RFC 2136 update.
@@ -513,6 +534,47 @@ class WindowsDNSDriver(DNSDriver):
                 "PowerShell when credentials are configured on the server."
             ),
         }
+
+    @property
+    def dynamic_update_caps(self) -> DynamicUpdateCaps:
+        # Windows DNS has no per-client ACL — only a zone-level enum
+        # (None/Secure/NonsecureAndSecure), so this is the coarse-enum path
+        # (issue #641). TSIG maps to "Secure" (AD GSS); an IP entry is
+        # accepted but degraded to "NonsecureAndSecure" with a warning
+        # (validate_update_acl surfaces it). Name-scope / per-type / deny are
+        # rejected — Windows can't express them.
+        return DynamicUpdateCaps(
+            supports_ip_acl=False,
+            supports_tsig_acl=True,
+            supports_name_scoping=False,
+            supports_per_type=False,
+            coarse_enum_only=True,
+        )
+
+    async def apply_dynamic_update_mode(self, server: Any, zone_name: str, mode: str) -> None:
+        """Set a zone's Windows ``-DynamicUpdate`` mode over WinRM (issue #641).
+
+        Agentless: the control plane pushes the mapped enum
+        (None/Secure/NonsecureAndSecure) via ``Set-DnsServerPrimaryZone``.
+        Requires stored WinRM credentials on the server.
+        """
+        if mode not in _WINDOWS_DYNAMIC_UPDATE_MODES:
+            raise ValueError(f"windows_dns: bad DynamicUpdate mode {mode!r}")
+        if not getattr(server, "credentials_encrypted", None):
+            raise RuntimeError("windows_dns.apply_dynamic_update_mode requires WinRM credentials")
+        creds = _load_credentials(server)
+        name = _ps_escape_single_quoted((zone_name or "").rstrip("."))
+        script = (
+            f"Set-DnsServerPrimaryZone -Name '{name}' -DynamicUpdate {mode} -ErrorAction Stop; "
+            f"Write-Output \"zone '{name}' DynamicUpdate set to {mode}\""
+        )
+        await asyncio.to_thread(_run_ps, server, creds, script)
+        logger.info(
+            "windows_dns.apply_dynamic_update_mode",
+            server=str(getattr(server, "id", "")),
+            zone=zone_name,
+            mode=mode,
+        )
 
     # ── Path B — WinRM / PowerShell (credentials required) ──────────────
 

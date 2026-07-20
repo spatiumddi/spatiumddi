@@ -678,3 +678,121 @@ Same agent caching model as DHCP (see DHCP spec). For DNS:
 - Agent tracks the last-applied `ConfigBundle` ETag in `/var/lib/spatium-dns-agent/config/current.etag` (alongside the cached bundle in `config/current.json`)
 - On reconnect: long-poll picks up any new ETag, the agent reconciles by GET-ing PowerDNS's current zone list and PATCHing the rrset diff against the new ConfigBundle. Same convergence shape as BIND9.
 
+
+## 8. Dynamic-update (RFC 2136) ACLs (issue #641)
+
+The driver ABC exposes what a backend can express for operator-configured
+dynamic-update ACLs via a capability descriptor + a validator:
+
+```python
+@property
+def dynamic_update_caps(self) -> DynamicUpdateCaps: ...
+def validate_update_acl(self, zone_name, entries) -> list[str]: ...  # warnings; raises on unsupported
+```
+
+`DynamicUpdateCaps` flags: `supports_ip_acl`, `supports_tsig_acl`,
+`supports_name_scoping`, `supports_per_type`, `coarse_enum_only`. The base
+class defaults every flag to **False** (feature unsupported), so cloud
+drivers 422 the write for free; drivers override to opt in.
+
+| Driver | ip | tsig | name-scope | per-type | render path |
+|---|---|---|---|---|---|
+| **BIND9** | ✅ | ✅ | ✅ | ✅ | coarse `allow-update` or fine `update-policy` (agent `_render_allow_update` / `_render_update_policy`) |
+| **PowerDNS** | ✅ | ✅ | ⬜ | ⬜ | `dnsupdate=yes` + per-zone `ALLOW-DNSUPDATE-FROM` / `TSIG-ALLOW-DNSUPDATE` metadata |
+| **Windows DNS** | ⚠️ | ✅ | ⬜ | ⬜ | `coarse_enum_only` — maps to `None` / `Secure` / `NonsecureAndSecure` over WinRM |
+| **Cloud (R53/Azure/CF/Google)** | ⬜ | ⬜ | ⬜ | ⬜ | N/A — no RFC 2136; feature disabled |
+
+`validate_update_acl` returns human-readable **warnings** for
+lossy-but-accepted mappings (an IP entry is UDP-spoofable; on a
+`coarse_enum_only` backend an IP entry opens the zone wider than the CIDR)
+and **raises** `ValueError` (surfaced as a 422 by the API) on a
+hard-unsupported entry — any entry on a no-surface driver. For a
+name-scoped / per-type / `deny` ACL (which must render as `update-policy`,
+TSIG-identity only) it also rejects any IP entry in the same ACL, and
+requires a `name_pattern` for the ruletypes that take a name
+(`subdomain` / `name` / `wildcard` / `self`).
+
+### 8.1 BIND9 agent rendering
+
+The **agent** (`agent/dns/spatium_dns_agent/drivers/bind9.py`) is the
+authoritative renderer on an appliance. It picks ONE clause per zone:
+
+1. **Coarse** — `_render_allow_update(zone, group_key)` builds one
+   `allow-update { … }` mixing the always-present group loopback key with
+   the operator ACL's grant entries (`<cidr>;` / `key "<name>";`). Used when
+   no entry needs the fine-grained path.
+2. **Fine-grained** — `_render_update_policy(zone, group_key)` builds an
+   `update-policy { … }` when `_zone_needs_update_policy` sees any
+   `name_scope` / `record_types` / `deny` entry. Renders
+   `grant <groupkey> zonesub;` (loopback) + one
+   `<grant|deny> <keyname> <ruletype> [<name>] [<types>];` per operator
+   entry. IP entries are skipped (rejected upstream).
+3. Every TSIG key in the bundle renders a `key { … }` block (not just
+   `tsig_keys[0]`), so an operator key named in either clause is defined —
+   BIND rejects a stanza that references an undefined key.
+
+The control-plane driver mirrors the same selection in
+`_render_update_clause(zone)` (`backend/app/drivers/dns/bind9.py`) for the
+preview / agentless path.
+
+Dynamic zones also render `allow-transfer { key "<group-key>"; };` so the
+ingest-back worker can AXFR the live zone from loopback (see DNS.md §19.5).
+
+### 8.2 PowerDNS (coarse, P3)
+
+PowerDNS is coarse-only — no per-name / per-type / `deny`, so
+`validate_update_acl` rejects those fields. Enforcement is two parts:
+
+1. **Global** — the agent renders `dnsupdate=yes` in `pdns.conf`
+   (`_render_conf`) instead of the old `dnsupdate=no`. It's enabled
+   unconditionally because per-zone metadata is the real gate (a zone with
+   no allow-metadata rejects every update), so it's a no-op for zones
+   without an ACL. `dnsupdate` is a **startup** setting, so a pdns already
+   running with it off only picks this up on the next container restart.
+2. **Per-zone** — the agent's `_reconcile_zones` calls
+   `_apply_dynamic_update` per zone, which (a) imports the referenced TSIG
+   keys into pdns via the `tsigkeys` API and (b) sets the zone metadata via
+   the REST API: `ALLOW-DNSUPDATE-FROM` ← grant IP/CIDRs,
+   `TSIG-ALLOW-DNSUPDATE` ← grant key names. An empty ACL DELETEs both so a
+   zone whose dynamic updates were turned off stops accepting them.
+
+**Drift** — the pdns reconciler is additive per-rrset (`REPLACE` per managed
+`name+type`, never a blanket zone replace), so externally-injected records
+(new names) **already survive** a reconcile, and a conflicting managed
+`name+type` is re-asserted (control-plane wins). An active ingest-back for
+*visibility* (mirroring external records into the control-plane DB, like the
+BIND9 AXFR worker) is a deferred follow-up — not needed for survival.
+
+**dnsdist** — when the optional dnsdist front (#146 Phase 2) is enabled it
+stays a rate-limit tier; an `OpcodeRule(Update)` + `NetmaskGroupRule`
+advisory gate is a possible defense-in-depth add-on, never the sole
+enforcement (pdns metadata is authoritative). Deferred.
+
+### 8.3 Windows DNS (coarse enum, P3)
+
+Windows DNS has no per-client ACL — only a zone-level `-DynamicUpdate` enum,
+so `dynamic_update_caps.coarse_enum_only = True` and `validate_update_acl`
+maps the ACL coarsely (`windows_dynamic_update_mode`):
+
+| ACL state | Windows enum |
+|---|---|
+| disabled | `None` |
+| enabled, TSIG-only | `Secure` (AD GSS-TSIG) |
+| enabled, any IP entry | `NonsecureAndSecure` **+ loud warning** |
+
+`NonsecureAndSecure` accepts **any** nonsecure client, not just the
+operator's CIDR — Windows can't restrict by source, so the API returns a
+warning telling the operator the range isn't enforced. Name-scope /
+per-type / `deny` are rejected (Windows can't express them).
+
+Windows is **agentless**, so the enum is pushed over WinRM
+(`Set-DnsServerPrimaryZone -DynamicUpdate <mode>`) by
+`apply_dynamic_update_mode`, which the `update-acl` endpoint (and the MCP
+apply) call for every Windows-driver server in the group after commit — a
+best-effort push whose failures come back as warnings. **Drift** needs
+nothing new: Windows updates land in the same AD-integrated store the
+existing `Get-DnsServerResourceRecord` sync reads.
+
+The control-plane BIND9 template (`zone.stanza.j2`) renders the same coarse
+`allow-update` for the preview / agentless path, kept in parity with the
+agent renderer.

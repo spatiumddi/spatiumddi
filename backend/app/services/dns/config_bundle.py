@@ -26,6 +26,7 @@ from app.drivers.dns.base import (
     ServerOptions,
     TrustAnchorData,
     TsigKey,
+    UpdateAclEntry,
     ViewData,
     ZoneData,
 )
@@ -37,6 +38,7 @@ from app.models.dns import (
     DNSServerOptions,
     DNSView,
     DNSZone,
+    DNSZoneUpdateAcl,
 )
 from app.services.dns.pool_geo import (
     build_geo_steering,
@@ -192,7 +194,12 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
             await db.execute(
                 select(DNSZone)
                 .where(DNSZone.group_id == server.group_id)
-                .options(selectinload(DNSZone.records))
+                .options(
+                    selectinload(DNSZone.records),
+                    selectinload(DNSZone.update_acl_entries).selectinload(
+                        DNSZoneUpdateAcl.tsig_key
+                    ),
+                )
             )
         )
         .scalars()
@@ -226,6 +233,23 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
         pol = policies_by_id.get(z.dnssec_policy_id)
         return pol.name if pol is not None else None
 
+    def _update_acl(z: DNSZone) -> tuple[UpdateAclEntry, ...]:
+        # Neutral projection of the zone's dynamic-update ACL rows (issue
+        # #641). TSIG entries carry the key NAME only — the secret ships
+        # separately in the bundle's ``tsig_keys`` block and never here.
+        return tuple(
+            UpdateAclEntry(
+                match_kind=e.match_kind,
+                action=e.action,
+                ip_cidr=e.ip_cidr,
+                tsig_key_name=(e.tsig_key.name if e.tsig_key is not None else None),
+                name_scope=e.name_scope,
+                name_pattern=e.name_pattern,
+                record_types=tuple(e.record_types) if e.record_types else None,
+            )
+            for e in z.update_acl_entries
+        )
+
     def _zone_data(z: DNSZone, records: tuple[RecordData, ...], view_name: str | None) -> ZoneData:
         return ZoneData(
             name=z.name,
@@ -250,6 +274,8 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
             masters=tuple(z.masters or ()),
             dnssec_enabled=bool(z.dnssec_enabled),
             dnssec_policy_name=_zone_policy_name(z),
+            dynamic_update_enabled=bool(z.dynamic_update_enabled),
+            update_acl=_update_acl(z),
         )
 
     zones: list[ZoneData] = []

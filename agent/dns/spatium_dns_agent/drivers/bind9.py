@@ -70,6 +70,100 @@ logging {
 """
 
 
+def _render_allow_update(zone: dict[str, Any], group_key_name: str | None) -> str:
+    """Build the ``allow-update { ... };`` clause for a primary zone (issue #641).
+
+    The internal agent loopback grant (the group TSIG key) is ALWAYS
+    included so control-plane record ops keep flowing over loopback. When
+    the operator enabled dynamic updates, the per-zone ACL entries — source
+    CIDRs and named TSIG keys — are appended. P1 renders the coarse
+    address-match-list only: ``grant`` entries by ``ip_cidr`` / key name.
+    ``deny`` + name-scoped + per-type entries belong to the P2
+    ``update-policy`` path and are skipped here (the control plane blocks
+    them from ever reaching a coarse render via the driver capability gate).
+
+    Returns "" (no clause) only when there's no group key AND no operator
+    grants — i.e. a zone with dynamic updates off and no loopback key.
+    """
+    items: list[str] = []
+    seen_keys: set[str] = set()
+    if group_key_name:
+        items.append(f'key "{group_key_name}";')
+        seen_keys.add(group_key_name)
+    if zone.get("dynamic_update_enabled"):
+        for e in zone.get("update_acl") or []:
+            if e.get("action") != "grant":
+                continue
+            if e.get("name_scope") or e.get("name_pattern") or e.get("record_types"):
+                continue
+            kind = e.get("match_kind")
+            if kind == "ip" and e.get("ip_cidr"):
+                items.append(f'{e["ip_cidr"]};')
+            elif kind == "tsig_key" and e.get("tsig_key_name"):
+                name = e["tsig_key_name"]
+                if name in seen_keys:
+                    continue
+                seen_keys.add(name)
+                items.append(f'key "{name}";')
+    if not items:
+        return ""
+    return f'allow-update {{ {" ".join(items)} }}; '
+
+
+_UPDATE_POLICY_NAMED_SCOPES = frozenset({"subdomain", "name", "wildcard", "self"})
+
+
+def _zone_needs_update_policy(zone: dict[str, Any]) -> bool:
+    """True when the ACL needs BIND's fine-grained ``update-policy`` clause
+    (issue #641 P2) — any grant carries a name scope, a per-type restriction,
+    or is a ``deny``. Otherwise the coarse ``allow-update`` clause is used.
+    """
+    if not zone.get("dynamic_update_enabled"):
+        return False
+    for e in zone.get("update_acl") or []:
+        if (
+            e.get("action") == "deny"
+            or e.get("name_scope")
+            or e.get("name_pattern")
+            or e.get("record_types")
+        ):
+            return True
+    return False
+
+
+def _render_update_policy(zone: dict[str, Any], group_key_name: str | None) -> str:
+    """Build the ``update-policy { ... };`` clause for a fine-grained zone.
+
+    TSIG-identity only (IP entries can't be expressed and are rejected at the
+    control plane, so they're skipped defensively here). The group loopback
+    key is always granted the whole zone so the agent's own record ops keep
+    flowing. Each operator entry renders as
+    ``<grant|deny> <keyname> <ruletype> [<name>] [<types>];`` — the type list
+    is omitted when unrestricted (BIND then allows the standard rrtype set).
+    """
+    lines: list[str] = []
+    if group_key_name:
+        lines.append(f"grant {group_key_name} zonesub;")
+    for e in zone.get("update_acl") or []:
+        if e.get("match_kind") != "tsig_key" or not e.get("tsig_key_name"):
+            continue
+        action = "deny" if e.get("action") == "deny" else "grant"
+        identity = e["tsig_key_name"]
+        scope = e.get("name_scope") or "zonesub"
+        types = " ".join(str(t) for t in (e.get("record_types") or []) if t)
+        type_suffix = f" {types}" if types else ""
+        if scope in _UPDATE_POLICY_NAMED_SCOPES:
+            name = (e.get("name_pattern") or "").strip()
+            if not name:
+                continue  # required by validation; skip defensively
+            lines.append(f"{action} {identity} {scope} {name}{type_suffix};")
+        else:  # zonesub (default) — whole zone, no name
+            lines.append(f"{action} {identity} zonesub{type_suffix};")
+    if not lines:
+        return ""
+    return f'update-policy {{ {" ".join(lines)} }}; '
+
+
 def _render_rate_limit_block(opts: dict[str, Any]) -> str:
     """Build the named.conf RRL + amplification directives from bundle opts
     (issue #146). Returns "" (no-op) unless something is enabled/set, so the
@@ -178,7 +272,9 @@ def _parse_dnssec_status(text: str) -> list[dict[str, Any]]:
         low = line.lower()
         if ("key signing:" in low or "zone signing:" in low) and "yes" in low:
             cur["state"] = "active"
-        mt = re.match(r"(published|active|retire|remove|key signing|zone signing):\s*(.+)", low)
+        mt = re.match(
+            r"(published|active|retire|remove|key signing|zone signing):\s*(.+)", low
+        )
         if mt:
             cur["timing"][mt.group(1).replace(" ", "_")] = mt.group(2).strip()
     if cur is not None:
@@ -264,7 +360,9 @@ class Bind9Driver(DriverBase):
 
         tsig_keys = bundle.get("tsig_keys") or []
         tsig_key_name = tsig_keys[0]["name"] if tsig_keys else None
-        tsig_include = 'include "/var/lib/spatium-dns-agent/tsig/ddns.key";\n' if tsig_keys else ""
+        tsig_include = (
+            'include "/var/lib/spatium-dns-agent/tsig/ddns.key";\n' if tsig_keys else ""
+        )
 
         # Split-horizon (issue #24): when the group defines views, every
         # zone — and every RPZ/response-policy — lives INSIDE a
@@ -280,12 +378,16 @@ class Bind9Driver(DriverBase):
         blocklists = bundle.get("blocklists") or []
         response_policy_block = ""
         if blocklists and not has_views:
-            zones_list = "; ".join(f'zone "{bl["rpz_zone_name"].rstrip(".")}"' for bl in blocklists)
+            zones_list = "; ".join(
+                f'zone "{bl["rpz_zone_name"].rstrip(".")}"' for bl in blocklists
+            )
             # break-dnssec lets RPZ rewrite responses from DNSSEC-signed zones
             # (otherwise BIND9 returns SERVFAIL on a DNSSEC conflict). For a
             # blocking use-case this is what you want: the user intent is to
             # block, not to preserve validation integrity.
-            response_policy_block = f"    response-policy {{ {zones_list}; }} break-dnssec yes;\n"
+            response_policy_block = (
+                f"    response-policy {{ {zones_list}; }} break-dnssec yes;\n"
+            )
 
         logging_block = _QUERY_LOG_BLOCK if bool(opts.get("query_log_enabled")) else ""
         conf = NAMED_CONF_SKELETON.format(
@@ -368,7 +470,23 @@ class Bind9Driver(DriverBase):
             # `directory` (/var/cache/bind, not our rendered tree).
             rel_zfile = f"zones/{file_prefix}{zname.rstrip('.')}.db"
             abs_zfile = self.state_dir / self.rendered_dir_name / rel_zfile
-            allow_update = f'allow-update {{ key "{tsig_key_name}"; }}; ' if tsig_key_name else ""
+            # Coarse allow-update (IP + TSIG) unless the ACL needs the
+            # fine-grained update-policy path (name-scope / per-type / deny).
+            if _zone_needs_update_policy(zone):
+                update_clause = _render_update_policy(zone, tsig_key_name)
+            else:
+                update_clause = _render_allow_update(zone, tsig_key_name)
+            # Ingest-back (issue #641): a dynamic zone can accept externally-
+            # injected records that live only in the journal. The agent AXFRs
+            # the live zone from loopback to read them back — but the global
+            # ``allow-transfer`` defaults to ``none``, so grant transfer to the
+            # loopback TSIG key (only, and only on dynamic zones). The AXFR is
+            # signed with that key; nothing is opened to the network.
+            allow_transfer = (
+                f'allow-transfer {{ key "{tsig_key_name}"; }}; '
+                if (zone.get("dynamic_update_enabled") and tsig_key_name)
+                else ""
+            )
             # DNSSEC inline-signing (issue #49): primary zones with signing on
             # reference a dnssec-policy + enable inline-signing; BIND
             # auto-generates keys in key-directory + signs on load.
@@ -379,7 +497,7 @@ class Bind9Driver(DriverBase):
             self._write_zone_file(new_dir / rel_zfile, zone)
             return (
                 f'zone "{zname}" {{ type master; file "{abs_zfile}"; '
-                f"{allow_update}{dnssec_clause}}};\n"
+                f"{update_clause}{allow_transfer}{dnssec_clause}}};\n"
             )
 
         def _rpz_stanza(bl: dict[str, Any], file_prefix: str) -> str:
@@ -401,7 +519,8 @@ class Bind9Driver(DriverBase):
         def _indent(text: str, spaces: int = 4) -> str:
             pad = " " * spaces
             return "".join(
-                (pad + ln if ln.strip() else ln) for ln in text.splitlines(keepends=True)
+                (pad + ln if ln.strip() else ln)
+                for ln in text.splitlines(keepends=True)
             )
 
         if has_views:
@@ -417,9 +536,13 @@ class Bind9Driver(DriverBase):
                 vname = view.get("name") or ""
                 if not vname:
                     continue
-                match_clients = "; ".join(str(c) for c in (view.get("match_clients") or ["any"]))
+                match_clients = "; ".join(
+                    str(c) for c in (view.get("match_clients") or ["any"])
+                )
                 recursion_v = "yes" if view.get("recursion", True) else "no"
-                view_bls = [bl for bl in blocklists if bl.get("view_name") == vname] + global_bls
+                view_bls = [
+                    bl for bl in blocklists if bl.get("view_name") == vname
+                ] + global_bls
                 body = ""
                 if view_bls:
                     zlist = "; ".join(
@@ -442,7 +565,11 @@ class Bind9Driver(DriverBase):
                 # allow_query / allow_query_cache on a view, enforce it here;
                 # a null/empty value inherits the server-options allow-query.
                 aq = view.get("allow_query")
-                aq_line = f"    allow-query {{ {'; '.join(str(c) for c in aq)}; }};\n" if aq else ""
+                aq_line = (
+                    f"    allow-query {{ {'; '.join(str(c) for c in aq)}; }};\n"
+                    if aq
+                    else ""
+                )
                 aqc = view.get("allow_query_cache")
                 aqc_line = (
                     f"    allow-query-cache {{ {'; '.join(str(c) for c in aqc)}; }};\n"
@@ -498,18 +625,24 @@ class Bind9Driver(DriverBase):
 
         (new_dir / "named.conf").write_text(conf)
 
-        # TSIG key — written to tsig/ddns.key (stable path).
+        # TSIG keys — written to tsig/ddns.key (stable path). ALL keys in
+        # the bundle are rendered as ``key {}`` blocks, not just the group
+        # loopback key: operator-managed keys (DNSTSIGKey rows) can be
+        # referenced from a zone's dynamic-update ACL (issue #641), and BIND
+        # rejects an ``allow-update { key "X"; }`` that names an undefined
+        # key. tsig_keys[0] is the group loopback key (control plane appends
+        # it first); the rest are operator keys.
         # Issue #249 — atomic write so a crash between write_text +
         # chmod doesn't leave a world-readable secret on disk.
         if tsig_keys:
             tsig_dir = self.state_dir / "tsig"
             tsig_dir.mkdir(parents=True, exist_ok=True)
-            k = tsig_keys[0]
             tsig_file = tsig_dir / "ddns.key"
             tsig_tmp = tsig_file.with_suffix(".key.new")
-            payload = (
+            payload = "".join(
                 f'key "{k["name"]}" {{ algorithm {k.get("algorithm", "hmac-sha256")}; '
                 f'secret "{k["secret"]}"; }};\n'
+                for k in tsig_keys
             )
             fd = os.open(
                 str(tsig_tmp),
@@ -691,7 +824,9 @@ class Bind9Driver(DriverBase):
             res = subprocess.run(cmd, capture_output=True, text=True, check=False)
             rndc_ok = res.returncode == 0
             if not rndc_ok:
-                log.warning("rndc_failed_falling_back_to_sighup", stderr=res.stderr.strip())
+                log.warning(
+                    "rndc_failed_falling_back_to_sighup", stderr=res.stderr.strip()
+                )
         if not rndc_ok and self.daemon_pid:
             try:
                 os.kill(self.daemon_pid, signal.SIGHUP)
@@ -750,7 +885,12 @@ class Bind9Driver(DriverBase):
             pri = rec.get("priority")
             wt = rec.get("weight")
             prt = rec.get("port")
-            if pri is not None and wt is not None and prt is not None and len(value.split()) < 4:
+            if (
+                pri is not None
+                and wt is not None
+                and prt is not None
+                and len(value.split()) < 4
+            ):
                 wire_value = f"{pri} {wt} {prt} {value}"
 
         # ``rrset_action`` is set by callers that need precise multi-RR
