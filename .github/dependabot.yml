@@ -8,20 +8,23 @@
 # slips through, as the weekly tracking issue (Trivy).
 #
 # Cadence is weekly/Monday to line up with the Trivy scheduled scan. Minor +
-# patch bumps are grouped into one PR per ecosystem to keep the noise down;
-# majors arrive as individual PRs so they get a proper review.
+# patch bumps are grouped into one PR per ecosystem to keep the noise down.
 #
-# NOTE: the Python manifests (backend + the three agents) use unpinned ``>=``
-# ranges with no lock file, so routine ``pip`` *version* PRs will be sparse —
-# the real value there is Dependabot *security* updates (driven by the
-# dependency graph), which fire regardless of pinning.
-#
-# POLICY: major bumps of application deps (pip + npm) are *breaking* and done
-# as deliberate upgrade efforts, not weekly auto-PRs — so ``semver-major`` is
-# ignored for those two ecosystems (minor/patch + security still flow). The
-# backend Docker base image is likewise pinned to Python 3.12 (the version the
-# codebase + CI target). GitHub Actions and the remaining Docker base images
-# keep taking majors — those are low-risk, low-volume, and worth staying on.
+# POLICY — deliberately low-noise (the first run opened ~30 PRs; #640 follow-up):
+#   * ALL majors are deferred (``semver-major`` ignored for every ecosystem).
+#     Major bumps are breaking and done as deliberate upgrade efforts. Security
+#     fixes still land via Dependabot *security* updates, which fire regardless
+#     of these ``ignore`` rules; base-image CVEs are also caught by the weekly
+#     Trivy scan (trivy-scheduled.yml).
+#   * ``pip`` is SECURITY-ONLY. The Python manifests use unpinned ``>=`` ranges
+#     with no lock file, so a routine version PR only raises a floor pip already
+#     satisfies (it installs the latest anyway) — pure noise. Ignoring every
+#     ``pip`` version-update leaves only security updates, the sole thing worth
+#     a PR here.
+#   * The backend Docker base is pinned to Python 3.12 (mypy target-version
+#     py312 / setup-python 3.12) — no 3.13/3.14 until a deliberate move.
+# Net effect: at most a couple of grouped minor/patch PRs a week (docker, npm,
+# actions) plus security updates.
 version: 2
 
 updates:
@@ -39,6 +42,12 @@ updates:
     groups:
       github-actions:
         update-types: ["minor", "patch"]
+    ignore:
+      # Defer Action majors (setup-python 5→7, build-push 5→7, …): they can
+      # break release.yml / build-*.yml, which don't run on a workflow-only PR,
+      # so a green PR isn't proof. Do them deliberately. Minor/patch flow grouped.
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
 
   # ``FROM`` base images in every shipped Dockerfile — the exact rot the #640
   # scheduled Trivy scan catches after the fact (e.g. #639's stale golang pin);
@@ -72,6 +81,10 @@ updates:
       - dependency-name: "python"
         update-types:
           ["version-update:semver-minor", "version-update:semver-major"]
+      # Defer base-image majors (node 22→26, alpine 3→4, …); base-image CVEs
+      # are backstopped by the weekly Trivy scan. Minor/patch flow grouped.
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
 
   # Python — control plane (backend) plus the three standalone agents.
   - package-ecosystem: "pip"
@@ -87,15 +100,18 @@ updates:
     commit-message:
       prefix: "chore"
       include: "scope"
-    groups:
-      python:
-        update-types: ["minor", "patch"]
+    # SECURITY-ONLY: ignore ALL routine version updates. Unpinned ``>=`` ranges
+    # mean a version PR only raises a floor pip already satisfies (it installs
+    # the latest at build time) — the first run produced a dozen such no-op
+    # floor bumps (#662-679). Dependabot *security* updates ignore this block
+    # and still open when an advisory lands; the Trivy image scan is the other
+    # backstop. (No group here — there are no routine version updates to group.)
     ignore:
-      # Major Python-dep upgrades (redis 5→8, caldav 1→3, black 24→26, …) are
-      # breaking and done deliberately. Minor/patch (grouped) + Dependabot
-      # security updates still flow.
       - dependency-name: "*"
-        update-types: ["version-update:semver-major"]
+        update-types:
+          - "version-update:semver-major"
+          - "version-update:semver-minor"
+          - "version-update:semver-patch"
 
   # Frontend — React / Vite / TypeScript (package-lock.json present).
   - package-ecosystem: "npm"

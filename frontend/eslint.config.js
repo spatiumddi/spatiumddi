@@ -37,4 +37,15 @@ export default tseslint.config(
       "@typescript-eslint/no-explicit-any": "off",
     },
   },
+  {
+    // shadcn-style UI primitives intentionally re-export Radix primitives
+    // alongside components (`export const X = SomePrimitive.Y`), which newer
+    // eslint-plugin-react-refresh flags as a mixed-export fast-refresh hazard.
+    // Fast-refresh granularity is irrelevant for these stable wrappers, so
+    // turn the rule off for the ui/ primitives only.
+    files: ["src/components/ui/**/*.{ts,tsx}"],
+    rules: {
+      "react-refresh/only-export-components": "off",
+    },
+  },
 );
