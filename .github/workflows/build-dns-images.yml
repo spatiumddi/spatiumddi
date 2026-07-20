@@ -51,7 +51,7 @@ jobs:
 
       - name: Build (PR — single-arch, load locally for Trivy)
         if: github.event_name == 'pull_request'
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: agent/dns/images/${{ matrix.flavor }}/Dockerfile
@@ -69,7 +69,7 @@ jobs:
 
       - name: Build and push (main / tag — multi-arch, push to ghcr)
         if: github.event_name != 'pull_request'
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: agent/dns/images/${{ matrix.flavor }}/Dockerfile

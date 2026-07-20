@@ -37,7 +37,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build (PR) / Build + push (main)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: appliance/builder
           push: ${{ github.event_name != 'pull_request' }}
