@@ -155,7 +155,7 @@ jobs:
 
       - name: Open, update or close the tracking issue
         if: always()
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         env:
           HAS_FINDINGS: ${{ steps.scan.outputs.has_findings }}
         with:
