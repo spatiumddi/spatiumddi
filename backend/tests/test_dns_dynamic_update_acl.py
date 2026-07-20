@@ -471,3 +471,33 @@ async def test_ingest_endpoint_handles_split_horizon_zone(
     )
     assert len(externals) == 1
     assert externals[0]["zone_id"] == zglobal.id
+
+
+# ── PowerDNS (P3, coarse-only) ───────────────────────────────────────────────
+
+
+def test_powerdns_caps_coarse_only() -> None:
+    caps = get_driver("powerdns").dynamic_update_caps
+    assert caps.supports_ip_acl and caps.supports_tsig_acl
+    assert not caps.supports_name_scoping and not caps.supports_per_type
+
+
+def test_powerdns_rejects_fine_grained() -> None:
+    with pytest.raises(ValueError, match="scope"):
+        get_driver("powerdns").validate_update_acl(
+            "z.",
+            [
+                UpdateAclEntry(
+                    match_kind="tsig_key",
+                    tsig_key_name="k.",
+                    name_scope="subdomain",
+                    name_pattern="x.z.",
+                )
+            ],
+        )
+
+
+def test_powerdns_conf_enables_dnsupdate() -> None:
+    from app.drivers.dns.powerdns import render_pdns_conf
+
+    assert "dnsupdate=yes" in render_pdns_conf(api_key="k")

@@ -698,7 +698,7 @@ drivers 422 the write for free; drivers override to opt in.
 | Driver | ip | tsig | name-scope | per-type | render path |
 |---|---|---|---|---|---|
 | **BIND9** | ✅ | ✅ | ✅ | ✅ | coarse `allow-update` or fine `update-policy` (agent `_render_allow_update` / `_render_update_policy`) |
-| **PowerDNS** | ⬜ | ⬜ | ⬜ | ⬜ | P3 — `dnsupdate=yes` + `ALLOW-DNSUPDATE-FROM` / `TSIG-ALLOW-DNSUPDATE` |
+| **PowerDNS** | ✅ | ✅ | ⬜ | ⬜ | `dnsupdate=yes` + per-zone `ALLOW-DNSUPDATE-FROM` / `TSIG-ALLOW-DNSUPDATE` metadata |
 | **Windows DNS** | ⬜ | ⬜ | ⬜ | ⬜ | P3 — `coarse_enum_only` maps to None/Secure/NonsecureAndSecure |
 | **Cloud (R53/Azure/CF/Google)** | ⬜ | ⬜ | ⬜ | ⬜ | N/A — no RFC 2136; feature disabled |
 
@@ -737,6 +737,36 @@ preview / agentless path.
 
 Dynamic zones also render `allow-transfer { key "<group-key>"; };` so the
 ingest-back worker can AXFR the live zone from loopback (see DNS.md §19.5).
+
+### 8.2 PowerDNS (coarse, P3)
+
+PowerDNS is coarse-only — no per-name / per-type / `deny`, so
+`validate_update_acl` rejects those fields. Enforcement is two parts:
+
+1. **Global** — the agent renders `dnsupdate=yes` in `pdns.conf`
+   (`_render_conf`) instead of the old `dnsupdate=no`. It's enabled
+   unconditionally because per-zone metadata is the real gate (a zone with
+   no allow-metadata rejects every update), so it's a no-op for zones
+   without an ACL. `dnsupdate` is a **startup** setting, so a pdns already
+   running with it off only picks this up on the next container restart.
+2. **Per-zone** — the agent's `_reconcile_zones` calls
+   `_apply_dynamic_update` per zone, which (a) imports the referenced TSIG
+   keys into pdns via the `tsigkeys` API and (b) sets the zone metadata via
+   the REST API: `ALLOW-DNSUPDATE-FROM` ← grant IP/CIDRs,
+   `TSIG-ALLOW-DNSUPDATE` ← grant key names. An empty ACL DELETEs both so a
+   zone whose dynamic updates were turned off stops accepting them.
+
+**Drift** — the pdns reconciler is additive per-rrset (`REPLACE` per managed
+`name+type`, never a blanket zone replace), so externally-injected records
+(new names) **already survive** a reconcile, and a conflicting managed
+`name+type` is re-asserted (control-plane wins). An active ingest-back for
+*visibility* (mirroring external records into the control-plane DB, like the
+BIND9 AXFR worker) is a deferred follow-up — not needed for survival.
+
+**dnsdist** — when the optional dnsdist front (#146 Phase 2) is enabled it
+stays a rate-limit tier; an `OpcodeRule(Update)` + `NetmaskGroupRule`
+advisory gate is a possible defense-in-depth add-on, never the sole
+enforcement (pdns metadata is authoritative). Deferred.
 
 The control-plane BIND9 template (`zone.stanza.j2`) renders the same coarse
 `allow-update` for the preview / agentless path, kept in parity with the

@@ -46,6 +46,7 @@ from app.core.dns_names import strip_control_chars
 from app.drivers.dns.base import (
     ConfigBundle,
     DNSDriver,
+    DynamicUpdateCaps,
     EffectiveBlocklistData,
     RecordChange,
     RecordData,
@@ -202,7 +203,10 @@ def render_pdns_conf(
             "# who turn these on will need the matching control-plane",
             "# wiring (Phase 2/3).",
             "expand-alias=no",
-            "dnsupdate=no",
+            # RFC 2136 dynamic updates (issue #641). Enabled globally; per-zone
+            # ``ALLOW-DNSUPDATE-FROM`` / ``TSIG-ALLOW-DNSUPDATE`` metadata gates
+            # actual acceptance, so this is a no-op for zones without an ACL.
+            "dnsupdate=yes",
             "",
         ]
     )
@@ -381,6 +385,19 @@ class PowerDNSDriver(DNSDriver):
             "lua_records": True,  # Phase 3b — landed
             "catalog_zones": "producer-only",  # Phase 3d — landed
         }
+
+    @property
+    def dynamic_update_caps(self) -> DynamicUpdateCaps:
+        # PowerDNS dynamic updates (issue #641) are coarse only: per-zone
+        # ``ALLOW-DNSUPDATE-FROM`` (IP) + ``TSIG-ALLOW-DNSUPDATE`` (key) zone
+        # metadata. There's no per-name / per-type / deny surface, so those
+        # fields are rejected by ``validate_update_acl``.
+        return DynamicUpdateCaps(
+            supports_ip_acl=True,
+            supports_tsig_acl=True,
+            supports_name_scoping=False,
+            supports_per_type=False,
+        )
 
 
 __all__ = ["PowerDNSDriver", "render_pdns_conf"]

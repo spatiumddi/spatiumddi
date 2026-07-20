@@ -75,6 +75,13 @@ clobbered.
     `import_source="ddns_external"` `DNSRecord` rows — control-plane
     names win on conflict — so externally-injected records become
     UI/IPAM-visible and survive a re-render.
+  - **PowerDNS (coarse, P3):** the agent renders `dnsupdate=yes` in
+    `pdns.conf` and applies per-zone metadata via the pdns REST API —
+    `ALLOW-DNSUPDATE-FROM` (IP grants) + `TSIG-ALLOW-DNSUPDATE` (key
+    grants, imported into pdns first); an empty ACL clears both. Coarse
+    only (name-scope / per-type / `deny` are rejected). External records
+    already survive the additive per-rrset reconcile; an ingest-back for
+    *visibility* is a deferred follow-up.
   - Operator Copilot: `find_zone_update_acls` (read, default-on) +
     `propose_set_zone_update_acl` (write, preview/apply, default-off).
   - UI: a **Dynamic Updates** button + editor on the zone detail —
