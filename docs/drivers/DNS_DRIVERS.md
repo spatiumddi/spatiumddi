@@ -699,7 +699,7 @@ drivers 422 the write for free; drivers override to opt in.
 |---|---|---|---|---|---|
 | **BIND9** | ✅ | ✅ | ✅ | ✅ | coarse `allow-update` or fine `update-policy` (agent `_render_allow_update` / `_render_update_policy`) |
 | **PowerDNS** | ✅ | ✅ | ⬜ | ⬜ | `dnsupdate=yes` + per-zone `ALLOW-DNSUPDATE-FROM` / `TSIG-ALLOW-DNSUPDATE` metadata |
-| **Windows DNS** | ⬜ | ⬜ | ⬜ | ⬜ | P3 — `coarse_enum_only` maps to None/Secure/NonsecureAndSecure |
+| **Windows DNS** | ⚠️ | ✅ | ⬜ | ⬜ | `coarse_enum_only` — maps to `None` / `Secure` / `NonsecureAndSecure` over WinRM |
 | **Cloud (R53/Azure/CF/Google)** | ⬜ | ⬜ | ⬜ | ⬜ | N/A — no RFC 2136; feature disabled |
 
 `validate_update_acl` returns human-readable **warnings** for
@@ -767,6 +767,31 @@ BIND9 AXFR worker) is a deferred follow-up — not needed for survival.
 stays a rate-limit tier; an `OpcodeRule(Update)` + `NetmaskGroupRule`
 advisory gate is a possible defense-in-depth add-on, never the sole
 enforcement (pdns metadata is authoritative). Deferred.
+
+### 8.3 Windows DNS (coarse enum, P3)
+
+Windows DNS has no per-client ACL — only a zone-level `-DynamicUpdate` enum,
+so `dynamic_update_caps.coarse_enum_only = True` and `validate_update_acl`
+maps the ACL coarsely (`windows_dynamic_update_mode`):
+
+| ACL state | Windows enum |
+|---|---|
+| disabled | `None` |
+| enabled, TSIG-only | `Secure` (AD GSS-TSIG) |
+| enabled, any IP entry | `NonsecureAndSecure` **+ loud warning** |
+
+`NonsecureAndSecure` accepts **any** nonsecure client, not just the
+operator's CIDR — Windows can't restrict by source, so the API returns a
+warning telling the operator the range isn't enforced. Name-scope /
+per-type / `deny` are rejected (Windows can't express them).
+
+Windows is **agentless**, so the enum is pushed over WinRM
+(`Set-DnsServerPrimaryZone -DynamicUpdate <mode>`) by
+`apply_dynamic_update_mode`, which the `update-acl` endpoint (and the MCP
+apply) call for every Windows-driver server in the group after commit — a
+best-effort push whose failures come back as warnings. **Drift** needs
+nothing new: Windows updates land in the same AD-integrated store the
+existing `Get-DnsServerResourceRecord` sync reads.
 
 The control-plane BIND9 template (`zone.stanza.j2`) renders the same coarse
 `allow-update` for the preview / agentless path, kept in parity with the

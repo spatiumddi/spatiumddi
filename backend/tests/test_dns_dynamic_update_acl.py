@@ -501,3 +501,47 @@ def test_powerdns_conf_enables_dnsupdate() -> None:
     from app.drivers.dns.powerdns import render_pdns_conf
 
     assert "dnsupdate=yes" in render_pdns_conf(api_key="k")
+
+
+# ── Windows DNS (P3, coarse enum) ────────────────────────────────────────────
+
+
+def test_windows_caps_coarse_enum() -> None:
+    from app.api.v1.dns.router import _caps_out
+
+    caps = get_driver("windows_dns").dynamic_update_caps
+    assert caps.coarse_enum_only is True
+    assert caps.supports_tsig_acl is True
+    assert not caps.supports_name_scoping and not caps.supports_per_type
+    # coarse_enum_only ⇒ the feature is "supported" (not outright 422'd).
+    assert _caps_out(caps).supported is True
+
+
+def test_windows_enum_mapping() -> None:
+    from app.drivers.dns.windows import windows_dynamic_update_mode
+
+    assert windows_dynamic_update_mode(False, False) == "None"
+    assert windows_dynamic_update_mode(True, False) == "Secure"
+    assert windows_dynamic_update_mode(True, True) == "NonsecureAndSecure"
+
+
+def test_windows_ip_entry_warns_not_rejects() -> None:
+    warns = get_driver("windows_dns").validate_update_acl(
+        "z.", [UpdateAclEntry(match_kind="ip", ip_cidr="10.0.0.0/24")]
+    )
+    assert any("nonsecure" in w.lower() for w in warns)
+
+
+def test_windows_rejects_name_scope() -> None:
+    with pytest.raises(ValueError, match="scope"):
+        get_driver("windows_dns").validate_update_acl(
+            "z.",
+            [
+                UpdateAclEntry(
+                    match_kind="tsig_key",
+                    tsig_key_name="k.",
+                    name_scope="subdomain",
+                    name_pattern="x.z.",
+                )
+            ],
+        )

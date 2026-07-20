@@ -1193,7 +1193,7 @@ consults it **before** accepting an ACL:
 |---|---|---|---|---|---|
 | **BIND9** | ✅ | ✅ | ✅ | ✅ | coarse `allow-update` + fine `update-policy` |
 | **PowerDNS** | ✅ | ✅ | ⬜ | ⬜ | coarse per-zone metadata (`ALLOW-DNSUPDATE-FROM` / `TSIG-ALLOW-DNSUPDATE`) |
-| **Windows DNS** | ⬜ | ⬜ | ⬜ | ⬜ | rendering is P3 — feature 422s for now |
+| **Windows DNS** | ⚠️ | ✅ | ⬜ | ⬜ | coarse zone enum (`None` / `Secure` / `NonsecureAndSecure`); an IP entry → `NonsecureAndSecure` + loud warning |
 | **Route53 / Azure / Cloudflare / Google** | ⬜ | ⬜ | ⬜ | ⬜ | no RFC 2136 → 422 `DYNAMIC_UPDATE_UNSUPPORTED` |
 
 An entry the group's driver can't honour is rejected (422); a

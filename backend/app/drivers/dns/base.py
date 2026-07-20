@@ -428,6 +428,17 @@ class DNSDriver(ABC):
         """
         return DynamicUpdateCaps()
 
+    async def apply_dynamic_update_mode(self, server: Any, zone_name: str, mode: str) -> None:
+        """Push a coarse zone-level dynamic-update mode to an agentless server.
+
+        Only meaningful for drivers whose ``dynamic_update_caps`` set
+        ``coarse_enum_only`` (Windows DNS maps the ACL to a
+        None/Secure/NonsecureAndSecure zone enum over WinRM). Agent-based
+        drivers (BIND9 / PowerDNS) deliver the ACL through the config bundle,
+        so this is a no-op for them.
+        """
+        return None
+
     def validate_update_acl(self, zone_name: str, entries: Sequence[UpdateAclEntry]) -> list[str]:
         """Validate an ACL against this driver's capabilities.
 

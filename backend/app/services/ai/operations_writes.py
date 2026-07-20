@@ -1234,12 +1234,20 @@ async def _apply_set_zone_update_acl(
     collect_wake(dns_group_channel(args.group_id))
     await db.commit()
     await db.refresh(zone)
+    # Windows DNS is agentless — push the coarse zone enum over WinRM (#641).
+    win_warnings = await dns_router._push_windows_dynamic_update(  # noqa: SLF001
+        db,
+        args.group_id,
+        zone,
+        zone.dynamic_update_enabled,
+        any(e.match_kind == "ip" for e in body.entries),
+    )
     return {
         "id": str(zone.id),
         "name": zone.name,
         "dynamic_update_enabled": zone.dynamic_update_enabled,
         "entry_count": len(body.entries),
-        "warnings": warnings,
+        "warnings": sorted(set(warnings + win_warnings)),
     }
 
 

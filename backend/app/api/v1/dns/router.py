@@ -3815,6 +3815,50 @@ async def get_zone_update_acl(
     )
 
 
+async def _push_windows_dynamic_update(
+    db: DB, group_id: uuid.UUID, zone: DNSZone, enabled: bool, has_ip: bool
+) -> list[str]:
+    """Push the mapped Windows ``-DynamicUpdate`` enum to every Windows-driver
+    server in the group over WinRM (issue #641). Windows is agentless, so the
+    coarse zone enum (None/Secure/NonsecureAndSecure) is pushed here rather
+    than via the config bundle. Best-effort — returns warnings, never raises.
+    """
+    from app.drivers.dns.windows import windows_dynamic_update_mode  # noqa: PLC0415
+
+    servers = (
+        (
+            await db.execute(
+                select(DNSServer).where(
+                    DNSServer.group_id == group_id,
+                    DNSServer.driver == "windows_dns",
+                    DNSServer.credentials_encrypted.isnot(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not servers:
+        return []
+    mode = windows_dynamic_update_mode(enabled, has_ip)
+    drv = get_driver("windows_dns")
+    warnings: list[str] = []
+    for s in servers:
+        try:
+            await drv.apply_dynamic_update_mode(s, zone.name, mode)
+        except Exception as exc:  # noqa: BLE001 — WinRM push is best-effort
+            warnings.append(
+                f"Windows server {s.name!r}: could not set DynamicUpdate={mode} ({exc})"
+            )
+    if mode == "NonsecureAndSecure":
+        warnings.append(
+            "Windows maps this ACL to 'NonsecureAndSecure' — the zone accepts "
+            "dynamic updates from ANY nonsecure client, not just the configured "
+            "IP range. Prefer a TSIG/secure grant on Windows."
+        )
+    return warnings
+
+
 async def _replace_update_acl_rows(
     db: DB, group_id: uuid.UUID, zone: DNSZone, body: ZoneUpdateAclReplace
 ) -> tuple[list[str], list[str]]:
@@ -3937,6 +3981,16 @@ async def replace_zone_update_acl(
     await db.commit()
     await db.refresh(zone)
 
+    # Windows DNS is agentless — push the coarse zone enum over WinRM now
+    # (BIND9 / PowerDNS pick the ACL up via the config bundle long-poll).
+    win_warnings = await _push_windows_dynamic_update(
+        db,
+        group_id,
+        zone,
+        zone.dynamic_update_enabled,
+        any(e.match_kind == "ip" for e in body.entries),
+    )
+
     caps = _effective_dynamic_update_caps(driver_names)
     return ZoneUpdateAclResponse(
         zone_id=zone.id,
@@ -3944,7 +3998,7 @@ async def replace_zone_update_acl(
         driver_names=driver_names,
         caps=_caps_out(caps),
         entries=await _load_acl_out(db, zone.id),
-        warnings=sorted(set(warnings)),
+        warnings=sorted(set(warnings + win_warnings)),
     )
 
 

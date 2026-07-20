@@ -82,6 +82,14 @@ clobbered.
     only (name-scope / per-type / `deny` are rejected). External records
     already survive the additive per-rrset reconcile; an ingest-back for
     *visibility* is a deferred follow-up.
+  - **Windows DNS (coarse enum, P3):** no per-client ACL, so the
+    driver maps the ACL onto the zone `-DynamicUpdate` enum
+    (`windows_dynamic_update_mode`): disabled → `None`, TSIG-only →
+    `Secure`, any IP entry → `NonsecureAndSecure` **with a loud
+    warning** that Windows accepts any nonsecure client (the source
+    range isn't enforced). Agentless — pushed over WinRM
+    (`Set-DnsServerPrimaryZone`) after commit; name-scope / per-type /
+    `deny` are rejected.
   - Operator Copilot: `find_zone_update_acls` (read, default-on) +
     `propose_set_zone_update_acl` (write, preview/apply, default-off).
   - UI: a **Dynamic Updates** button + editor on the zone detail —
