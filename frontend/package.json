@@ -21,7 +21,7 @@
     "axios": "^1.16.0",
     "clsx": "^2.1.1",
     "lucide-react": "^0.468.0",
-    "react": "^18.3.1",
+    "react": "^19.2.7",
     "react-dom": "^18.3.1",
     "react-markdown": "^10.1.0",
     "react-router-dom": "^6.30.4",
@@ -33,7 +33,7 @@
   "devDependencies": {
     "@eslint/js": "^9.15.0",
     "@types/node": "^22.10.0",
-    "@types/react": "^18.3.12",
+    "@types/react": "^19.2.17",
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^6.0.2",
     "autoprefixer": "^10.4.20",
