@@ -72,7 +72,7 @@ dependencies = [
     "azure-mgmt-compute>=33.0.0",
     "azure-mgmt-dns>=8.2.0",
     "azure-mgmt-resource>=23.0.0",
-    "google-cloud-compute>=1.19.0",
+    "google-cloud-compute>=1.50.0",
     "google-cloud-dns>=0.35.0",
     "google-auth>=2.35.0",
     # docker SDK — only used on the SpatiumDDI OS appliance to send
