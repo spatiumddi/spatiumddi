@@ -67,6 +67,7 @@ from app.services.dns.record_ops import (
     enqueue_record_op,
     enqueue_record_ops_batch,
     enqueue_record_ops_bulk,
+    record_op_payload,
 )
 from app.services.dns.serial import bump_zone_serial
 from app.services.dns.zone_templates import (
@@ -5060,15 +5061,32 @@ async def delete_record(
     """Delete a DNS record.
 
     Default soft-delete stamps the record with a fresh ``deletion_batch_id``
-    so it can be individually restored from /admin/trash. The DDNS / agent
-    record-op is enqueued only on the permanent path; on soft-delete the
-    record is hidden from queries but still in the served bundle until the
-    next render — operators who want to re-instate it within the trash
-    window won't see a serial bump round trip first.
+    so it can be individually restored from /admin/trash, and — on both the
+    soft and permanent paths — pushes the retraction to the provider (#632):
+    agentless drivers (Cloudflare / Route 53 / Azure / Google / Windows DNS)
+    have no ConfigBundle to re-render from live DB state, so without the push
+    the record keeps resolving until — and past — the 30-day purge. Agent-based
+    BIND9 / PowerDNS also converge via the bundle drop; the enqueued op is an
+    idempotent delete there. Restore re-pushes ``create`` (admin/trash.py).
     """
     record = await _require_record(group_id, zone_id, record_id, db)
     _enforce_zone_token_scope(current_user, zone_id)
     _reject_if_synthesised_record(record, "delete")
+
+    # Zone + field snapshot captured before the soft-delete stamp so both paths
+    # push the provider retraction with the record's pre-delete values.
+    zone = await db.get(DNSZone, record.zone_id)
+    rec_snapshot = record_op_payload(record)
+
+    async def _push_delete() -> None:
+        # enqueue_record_op dispatches per-driver: agentless applies immediately
+        # (recording a ``failed`` op row, non-fatal, if the provider rejects);
+        # agent-based enqueues a delete op the bundle drop also covers
+        # (idempotent against an already-absent record). Kept in one closure so
+        # the soft and permanent paths retract identically (#632).
+        if zone is not None:
+            target_serial = bump_zone_serial(zone)
+            await enqueue_record_op(db, zone, "delete", rec_snapshot, target_serial=target_serial)
 
     if not permanent:
         batch = await collect_soft_delete_batch(db, record)
@@ -5087,6 +5105,7 @@ async def delete_record(
                     result="success",
                 )
             )
+        await _push_delete()
         await db.commit()
         return
 
@@ -5094,7 +5113,6 @@ async def delete_record(
 
     require_superadmin(current_user)
 
-    zone = await db.get(DNSZone, record.zone_id)
     db.add(
         AuditLog(
             user_id=current_user.id,
@@ -5107,19 +5125,8 @@ async def delete_record(
             result="success",
         )
     )
-    rec_snapshot = {
-        "name": record.name,
-        "type": record.record_type,
-        "value": record.value,
-        "ttl": record.ttl,
-        "priority": record.priority,
-        "weight": record.weight,
-        "port": record.port,
-    }
     await db.delete(record)
-    if zone is not None:
-        target_serial = bump_zone_serial(zone)
-        await enqueue_record_op(db, zone, "delete", rec_snapshot, target_serial=target_serial)
+    await _push_delete()
     await db.commit()
 
 

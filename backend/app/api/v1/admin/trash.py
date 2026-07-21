@@ -22,12 +22,14 @@ from app.api.deps import DB, SuperAdmin
 from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.dhcp import DHCPScope
+from app.models.dns import DNSRecord, DNSZone
 from app.services.dhcp.lease_cleanup import delete_leases_for_scope
 from app.services.dhcp.static_ipam import (
     remirror_scope_statics,
     remove_ipam_for_scope_statics,
 )
 from app.services.dhcp.windows_writethrough import push_scope_restore
+from app.services.dns.record_ops import push_record_restore
 from app.services.soft_delete import (  # noqa: PLC2701 — canonical labels, keep in one place
     SOFT_DELETE_RESOURCE_TYPES,
     TYPE_TO_MODEL,
@@ -230,6 +232,14 @@ async def restore_row(
     # (#616); the restore owes them the inverse or the scope comes back in
     # SpatiumDDI only and the two silently diverge. Runs after restore_batch has
     # un-stamped the rows, so the per-object helpers' scope lookups resolve.
+    #
+    # DNS records are the analogue (#632): an individually soft-deleted record
+    # was retracted from agentless providers on delete, so restoring it owes the
+    # inverse ``create``. A record restored as part of a *zone* restore is
+    # skipped — the zone-delete path never retracts the provider (no hosted-zone
+    # teardown on soft-delete, to avoid cloud zone-ID / NS churn), so its
+    # cascade-deleted records are still live there and need no re-push.
+    restored_has_zone = any(isinstance(o, DNSZone) for o in restored)
     for obj in restored:
         if isinstance(obj, DHCPScope):
             await push_scope_restore(db, obj)
@@ -239,6 +249,8 @@ async def restore_row(
             # push_scope_restore re-creates the device scope and the next poll
             # re-populates them.
             await remirror_scope_statics(db, obj)
+        elif isinstance(obj, DNSRecord) and not restored_has_zone:
+            await push_record_restore(db, obj)
         db.add(
             AuditLog(
                 user_id=current_user.id,

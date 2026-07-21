@@ -21,7 +21,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.agent_wake import collect_wake, dns_group_channel
 from app.drivers.dns import get_driver, is_agentless
 from app.drivers.dns.base import RecordChange, RecordData
-from app.models.dns import DNSRecordOp, DNSServer, DNSZone
+from app.models.dns import DNSRecord, DNSRecordOp, DNSServer, DNSZone
+from app.services.dns.serial import bump_zone_serial
 
 logger = structlog.get_logger(__name__)
 
@@ -246,6 +247,41 @@ async def enqueue_record_op(
     # wire op dispatched?" (e.g. dns bulk-delete) doesn't keep a row whose
     # record was already removed on-wire.
     return primary_op or first_op
+
+
+def record_op_payload(record: DNSRecord) -> dict[str, Any]:
+    """The neutral RecordOp payload (``name``/``type``/``value``/``ttl``/
+    ``priority``/``weight``/``port``) ``enqueue_record_op`` + the agentless
+    drivers consume, built from a ``DNSRecord`` row. One place to add a field so
+    a new one can't be silently dropped from a provider push (#632)."""
+    return {
+        "name": record.name,
+        "type": record.record_type,
+        "value": record.value,
+        "ttl": record.ttl,
+        "priority": record.priority,
+        "weight": record.weight,
+        "port": record.port,
+    }
+
+
+async def push_record_restore(db: AsyncSession, record: DNSRecord) -> DNSRecordOp | None:
+    """Re-assert a restored record at its provider by pushing ``create``.
+
+    The inverse of the ``delete`` push ``delete_record`` fires on soft-delete
+    (#632). Call **after** the row's ``deleted_at`` has been cleared — the
+    record must be live for the zone lookup + field snapshot to be correct.
+    ``enqueue_record_op`` re-creates it at agentless providers and enqueues an
+    idempotent create for agent-based servers (the next bundle also covers it).
+    Returns ``None`` when the zone can't be resolved (nothing to push).
+    """
+    zone = await db.get(DNSZone, record.zone_id)
+    if zone is None:
+        return None
+    target_serial = bump_zone_serial(zone)
+    return await enqueue_record_op(
+        db, zone, "create", record_op_payload(record), target_serial=target_serial
+    )
 
 
 async def enqueue_record_ops_batch(
