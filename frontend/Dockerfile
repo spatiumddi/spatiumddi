@@ -26,7 +26,7 @@ RUN npm run build
 
 
 # ── Stage 2: serve via nginx ──────────────────────────────────────────────────
-FROM nginx:1.30.3-alpine AS runtime
+FROM nginx:1.31.3-alpine AS runtime
 
 COPY --from=builder /app/dist /usr/share/nginx/html
 # Issue #176: the API upstream + DNS resolver are now templated so the
