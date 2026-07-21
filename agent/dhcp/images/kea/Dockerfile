@@ -3,7 +3,7 @@
 # Multi-arch: linux/amd64, linux/arm64 (non-negotiable #11)
 ARG PYTHON_VERSION=3.12
 
-FROM alpine:3.23 AS agent-build
+FROM alpine:3.24 AS agent-build
 RUN apk add --no-cache python3 py3-pip py3-wheel
 WORKDIR /src
 COPY agent/dhcp/pyproject.toml /src/pyproject.toml
@@ -11,7 +11,7 @@ COPY agent/dhcp/spatium_dhcp_agent /src/spatium_dhcp_agent
 COPY agent/dhcp/README.md /src/README.md
 RUN python3 -m pip install --prefix=/install --no-cache-dir --break-system-packages .
 
-FROM alpine:3.23 AS runtime
+FROM alpine:3.24 AS runtime
 # libpcap is pulled in for scapy's BPF socket support, used by the
 # optional Phase 2 device-fingerprinting sniffer (DHCP_FINGERPRINT_ENABLED=1).
 # scapy itself is pure-python so the install works on amd64 + arm64

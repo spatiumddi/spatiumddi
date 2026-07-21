@@ -27,14 +27,14 @@
 # lands the pre-upgrade LMDB snapshot + restore path.
 ARG PYTHON_VERSION=3.12
 
-FROM alpine:3.22 AS agent-build
+FROM alpine:3.24 AS agent-build
 RUN apk add --no-cache python3 py3-pip py3-wheel
 WORKDIR /src
 COPY agent/dns/pyproject.toml /src/pyproject.toml
 COPY agent/dns/spatium_dns_agent /src/spatium_dns_agent
 RUN python3 -m pip install --prefix=/install --no-cache-dir --break-system-packages .
 
-FROM alpine:3.22 AS runtime
+FROM alpine:3.24 AS runtime
 # pdns + the LMDB backend; bind-tools only for `dig` so the smoke test
 # in agent-e2e.yml works against the PowerDNS pod the same way it
 # does against the BIND pod. ``libcap`` brings in ``setcap`` so we
