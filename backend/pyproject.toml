@@ -85,7 +85,7 @@ dependencies = [
     # HelmChartConfig.valuesContent string when bumping the image tag
     # post-rolling-upgrade. Pinned explicitly so the chart-bump path
     # doesn't break if a transitive consumer drops the dep.
-    "PyYAML>=6.0",
+    "PyYAML>=6.0.3",
 ]
 
 [project.optional-dependencies]
