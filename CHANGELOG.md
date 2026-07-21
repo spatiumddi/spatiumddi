@@ -20,21 +20,29 @@ the formatter handles the rest.
 
 ---
 
-## 2026.07.19-1 — 2026-07-19
+## 2026.07.21-1 — 2026-07-21
 
-**The dynamic-update ACL release.** SpatiumDDI already ran managed
-BIND9 zones and let the control plane write them over a TSIG-signed
-loopback path — but there was **no** operator-facing way to let a
-*third party* (an AD domain controller, a DHCP server registering
-A/PTR) send RFC 2136 dynamic updates to a zone. The zone model
-advertised an `allow-update` surface in the docs that never existed.
-This release ships the real thing (#641): a per-zone dynamic-update
-ACL — authorize writers **by TSIG key or source IP/CIDR** — with a
-driver capability model that degrades cleanly (BIND9 renders it; cloud
-drivers 422; PowerDNS + Windows are gated for a later phase), plus
-**ingest-back** so externally-injected records the control plane never
-created become visible and survive a full re-render instead of being
-clobbered.
+**The dynamic-update ACL release** — with an agentless FortiGate DHCP
+driver, HA node-loss hardening, and a security sweep riding alongside.
+The headline: SpatiumDDI already ran managed BIND9 zones and let the
+control plane write them over a TSIG-signed loopback path, but there
+was **no** operator-facing way to let a *third party* (an AD domain
+controller, a DHCP server registering A/PTR) send RFC 2136 dynamic
+updates to a zone — the zone model advertised an `allow-update`
+surface in the docs that never existed. This release ships the real
+thing (#641): a per-zone dynamic-update ACL — authorize writers **by
+TSIG key or source IP/CIDR** — with a driver capability model that
+degrades cleanly (BIND9 renders it fully; PowerDNS + Windows get a
+coarse mapping; cloud drivers 422), plus **ingest-back** so
+externally-injected records the control plane never created become
+visible and survive a full re-render instead of being clobbered.
+Alongside it: an agentless **FortiGate cloud DHCP driver** (#635), the
+six remaining **HA control-plane node-loss** root causes closed
+(#633), DHCP scope-deletion + Windows-sync cleanup that stops
+stranding IPAM mirrors (#635, #636), and a **security sweep** —
+X-Forwarded-For spoofing hardening (#626), DNS agentless soft-delete
+retraction that closes a subdomain-takeover vector (#632), and
+CVE-driven dependency bumps.
 
 ### Added
 
@@ -95,21 +103,110 @@ clobbered.
   - UI: a **Dynamic Updates** button + editor on the zone detail —
     TSIG-key picker / IP-CIDR rows, capability-gated controls, and a
     persistent UDP-spoofing warning on IP entries.
+- **Agentless FortiGate cloud DHCP driver (#635).** A first-class DHCP
+  driver that manages scopes / pools / reservations on a FortiGate over
+  the FortiOS REST API with no agent to deploy — the DHCP analogue of
+  the cloud DNS driver family. Renders reserved addresses independently
+  of the dynamic range, so an in-pool reservation is honoured.
+
+### Changed
+
+- **Agent image base bumps (#639).** Alpine 3.22 → 3.23 across the
+  agent images, which moves Kea 2.6.5 → 3.0.3 and dnsdist 1.9.11 →
+  2.0.4, plus nginx and redis bumps. The reported Kea version now
+  surfaces per DHCP server.
+- **CI: agent test suites + a scheduled Trivy scan + Dependabot
+  (#640).** The `agent/{dhcp,dns,supervisor}` pytest suites now run in
+  CI (they were never executed — `supervisor` was red on `main`), and a
+  weekly scheduled Trivy job scans all six agent images plus the
+  backend / frontend Dockerfiles, opening or updating a single tracking
+  issue. Dependabot is enabled with a deliberately low-noise posture:
+  pip security-only, all majors deferred, the npm lint/format toolchain
+  excluded, and the backend / agent base images pinned (Python 3.12,
+  Alpine 3.23) (#671, #680, #685, #687).
 
 ### Fixed
 
+- **HA: survive control-plane node loss (#633).** Closes the six
+  remaining #590 root causes surfaced on a 3-node rig — most notably
+  the CloudNativePG operator ran as a single replica with the k8s
+  default 300 s unreachable toleration, so a dead node holding the
+  Postgres primary was never failed over and the API 502'd
+  cluster-wide for ~5 min; the operator now runs 2 replicas with
+  fast-evict tolerations, and the supervisor gained the `nodes/delete`
+  RBAC its dead-node eviction needs.
+- **DHCP scope deletion no longer strands leases / IPAM mirrors / DNS
+  (#635).** A scope delete left `static_dhcp` IPAM mirror rows and
+  dynamic leases dangling in the subnet view (inflating utilization)
+  long after the scope was gone. A shared `lease_cleanup` teardown now
+  deletes the mirror row (folding the IP back into a free gap),
+  hard-deletes leases, and revokes DDNS on every scope-reaching delete
+  path; a Trash restore re-creates them.
+- **Windows DHCP scope sync strands IPAM mirrors (#636).** The poll
+  reconciler Core-DELETE'd + re-inserted every pool / reservation each
+  cycle, minting fresh ids and orphaning the `ip_address` mirror that
+  back-links by id. It now diff-merges (reservations keyed on MAC,
+  pools on start/end) so a row keeps its id across polls, declines to
+  delete against an empty / failed enumeration, and mirrors server-side
+  reservations too. A data migration repairs already-stranded mirrors.
+- **In-pool DHCP reservations + manual allocation are allowed (#631).**
+  The 409 on a reservation inside a dynamic pool (and the 422 on manual
+  IPAM allocation there) had no driver basis — Kea, FortiGate, and
+  Windows all honour in-pool reservations, and Windows *requires* them
+  in-range. Dropped the 409; the manual-allocation block is now a
+  force-overridable soft collision warning.
+- **HA peer-IP-drift self-healing never ran (#639).** The
+  `PeerResolveWatcher` initialised `_resolved` in `set_apply_fn()` (a
+  late call) instead of `__init__`, so every `set_bundle()` on the
+  bootstrap-from-cache path raised `AttributeError` and was swallowed —
+  Kea HA silently drifted to `partner-down` when a peer's IP changed.
+  Fixed the init.
 - **Docs bug (#641):** `docs/SHIPPED.md` claimed operators could
   reference TSIG keys from a zone's `allow-update` field. That field
   never existed (only `allow_query` / `allow_transfer` did) and
   nothing rendered `allow-update` from a key reference. Corrected, and
   the real surface now exists.
 
+### Security
+
+- **X-Forwarded-For spoofing hardening (#626).** The API ran uvicorn
+  with `--forwarded-allow-ips *` and nginx *appends* XFF, so
+  `request.client.host` was attacker-influenced — a client could forge
+  a source IP and defeat every source-IP check. Security-sensitive call
+  sites (login throttle + break-glass, ACME account IP allowlist,
+  firewall-feed provenance, auth / permission-denied audit) now resolve
+  the client IP through `get_trusted_client_ip()`, which prefers the
+  nginx-set `X-Real-IP` overwrite and falls back to the peer.
+- **DNS soft-delete no longer orphans records at agentless providers
+  (#632).** Soft-deleting a DNS record or zone never retracted it from
+  the agentless drivers (Cloudflare / Route 53 / Azure / Google /
+  Windows DNS), and the 30-day purge then hard-removed the DB row with
+  no provider push — leaving a live record the platform had no trace of
+  (a subdomain-takeover vector once the IP is reclaimed). Records now
+  retract on soft-delete and restore re-pushes; zones retract at the
+  purge via a per-row teardown that keeps the row rather than orphan it
+  if the provider push fails.
+- **Dependency security bumps.** axios 1.16 → 1.18 (part of the #686
+  npm runtime group), nginx 1.30.3 → 1.31.3 on the frontend image
+  (#688), and `npm audit fix` for two high dev-transitive advisories —
+  brace-expansion (GHSA-3jxr-9vmj-r5cp) and js-yaml
+  (GHSA-52cp-r559-cp3m) (#690).
+
 ### Migrations
 
 - `a3d9f1e64c72` — `dns_zone.dynamic_update_enabled` +
   `dns_zone_update_acl` table + seed the `dns.dynamic_update_acl`
   feature module. Backfill-free: existing zones stay exactly as they
-  render today (only the internal loopback grant).
+  render today (only the internal loopback grant) (#641).
+- `a1f4c7e92b30` — DHCP scope provider references (agentless
+  FortiGate) (#635).
+- `b2e5d8a41c67` — static-IPAM metadata snapshot (#635).
+- `c9a1f4e07b52` — DHCP scope DNS + track-dynamic-leases columns
+  (#635).
+- `d7b3f2a9c15e` — data migration: repair DHCP lease / static-IPAM
+  mirrors stranded by pre-fix scope handling (#635).
+- `c7d3f9a15e28` — DHCP lease cache (#639).
+- `d4a8e2b16f39` — per-server reported Kea version (#639).
 
 ## 2026.07.11-1 — 2026-07-11
 
