@@ -81,8 +81,17 @@ updates:
       - dependency-name: "python"
         update-types:
           ["version-update:semver-minor", "version-update:semver-major"]
-      # Defer base-image majors (node 22→26, alpine 3→4, …); base-image CVEs
-      # are backstopped by the weekly Trivy scan. Minor/patch flow grouped.
+      # Alpine 3.24 bumps the bundled Python 3.12→3.13, which breaks the agent
+      # images: they install spatium_*_agent for 3.12, so on 3.24 the module
+      # lands on the wrong Python path -> "ModuleNotFoundError: No module named
+      # 'spatium_dns_agent'" -> CrashLoopBackOff (caught by agent-e2e on #672).
+      # Pin the agents to alpine 3.23.x until their Dockerfiles are updated for
+      # 3.13; patch bumps (3.23.x) still flow. The 3.24 move is a deliberate task.
+      - dependency-name: "alpine"
+        update-types:
+          ["version-update:semver-minor", "version-update:semver-major"]
+      # Defer base-image majors (node 22→26, …); base-image CVEs are backstopped
+      # by the weekly Trivy scan. Minor/patch flow grouped.
       - dependency-name: "*"
         update-types: ["version-update:semver-major"]
 
