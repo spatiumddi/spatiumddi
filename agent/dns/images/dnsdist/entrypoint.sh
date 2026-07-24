@@ -45,6 +45,31 @@ build_conf() {
   } > "$FULL_CONF"
 }
 
+# Pre-flight the TLS material referenced by the rules file (issue #50).
+#
+# ``dnsdist --check-config`` does NOT open the cert/key paths in
+# addTLSLocal() / addDOHLocal() — a config naming a missing or unreadable
+# PEM reports "Configuration OK!" and then dies with a *fatal* error on
+# real startup. Since the reload path below stops the running instance
+# BEFORE starting the new one, trusting --check-config alone would take the
+# whole front down — Do53 included — on nothing worse than a half-written
+# cert or a uid mismatch.
+#
+# So: extract every quoted *.crt / *.key token from the rules and confirm
+# this process can actually read it. Returns non-zero if any can't be, and
+# the caller keeps the current instance serving.
+certs_readable() {
+  local conf="$1" path
+  # -o prints only the match; the sed strips the surrounding quotes.
+  for path in $(grep -oE '"[^"]+\.(crt|key)"' "$conf" 2>/dev/null | sed 's/"//g' | sort -u); do
+    if [ ! -r "$path" ]; then
+      echo "dnsdist front: TLS material not readable: $path" >&2
+      return 1
+    fi
+  done
+  return 0
+}
+
 stop_dnsdist() {
   if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
     kill "$pid" 2>/dev/null || true
@@ -70,14 +95,21 @@ while true; do
   sig="${backend_ip}|${rules_sig}"
   if [ "$sig" != "$last_sig" ] || { [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; }; then
     build_conf "$backend_ip"
-    if "$DNSDIST_BIN" --check-config -C "$FULL_CONF" >/dev/null 2>&1; then
+    if ! "$DNSDIST_BIN" --check-config -C "$FULL_CONF" >/dev/null 2>&1; then
+      echo "dnsdist front: rebuilt config failed --check-config; keeping current instance" >&2
+      last_sig="$sig"
+    elif ! certs_readable "$FULL_CONF"; then
+      # Don't advance last_sig: unlike a bad config (operator error, won't
+      # fix itself), unreadable TLS material is usually transient — the
+      # agent is mid-write, or hasn't received the cert yet. Leaving the
+      # signature stale means the next poll retries instead of waiting for
+      # another rules change that may never come.
+      echo "dnsdist front: TLS material unreadable; keeping current instance" >&2
+    else
       echo "dnsdist front: (re)loading (backend=$backend_ip rules=$rules_sig)"
       stop_dnsdist
       "$DNSDIST_BIN" --supervised --disable-syslog -C "$FULL_CONF" &
       pid="$!"
-      last_sig="$sig"
-    else
-      echo "dnsdist front: rebuilt config failed --check-config; keeping current instance" >&2
       last_sig="$sig"
     fi
   fi

@@ -97,6 +97,16 @@ spec:
           ports:
             - { name: dns-udp, containerPort: 53, protocol: UDP }
             - { name: dns-tcp, containerPort: 53, protocol: TCP }
+            {{- /* #50 — encrypted transports. Listener ports are configured
+                   in the DB (DNS -> group -> options); these declarations
+                   only make them routable + visible. Set per server to
+                   match. */}}
+            {{- with $server.dotPort }}
+            - { name: dns-dot, containerPort: {{ . }}, protocol: TCP }
+            {{- end }}
+            {{- with $server.dohPort }}
+            - { name: dns-doh, containerPort: {{ . }}, protocol: TCP }
+            {{- end }}
           readinessProbe:
             tcpSocket: { port: 53 }
             initialDelaySeconds: 5
@@ -136,6 +146,12 @@ spec:
   ports:
     - { name: dns-udp, port: 53, targetPort: 53, protocol: UDP }
     - { name: dns-tcp, port: 53, targetPort: 53, protocol: TCP }
+    {{- with $server.dotPort }}
+    - { name: dns-dot, port: {{ . }}, targetPort: {{ . }}, protocol: TCP }
+    {{- end }}
+    {{- with $server.dohPort }}
+    - { name: dns-doh, port: {{ . }}, targetPort: {{ . }}, protocol: TCP }
+    {{- end }}
 ---
 apiVersion: v1
 kind: Service
@@ -153,6 +169,12 @@ spec:
   ports:
     - { name: dns-udp, port: 53, protocol: UDP }
     - { name: dns-tcp, port: 53, protocol: TCP }
+    {{- with $server.dotPort }}
+    - { name: dns-dot, port: {{ . }}, protocol: TCP }
+    {{- end }}
+    {{- with $server.dohPort }}
+    - { name: dns-doh, port: {{ . }}, protocol: TCP }
+    {{- end }}
 ---
 {{- end }}
 {{- end }}

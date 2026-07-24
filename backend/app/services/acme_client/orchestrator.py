@@ -31,7 +31,7 @@ import httpx
 import structlog
 from cryptography.hazmat.primitives import serialization
 from cryptography.x509 import load_pem_x509_csr
-from sqlalchemy import update
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.crypto import decrypt_str, encrypt_str
@@ -57,6 +57,7 @@ from app.services.appliance.tls import (
     generate_csr_and_key,
     parse_pem_certificate,
 )
+from app.services.dns.cert_rotation import wake_dns_groups_serving_cert
 
 logger = structlog.get_logger(__name__)
 
@@ -350,8 +351,6 @@ async def _store_certificate(
         row = await db.get(ApplianceCertificate, order.certificate_id)
     if row is None:
         # Re-run with no prior cert pointer — look up by our stable name.
-        from sqlalchemy import select  # noqa: PLC0415
-
         row = (
             await db.execute(select(ApplianceCertificate).where(ApplianceCertificate.name == name))
         ).scalar_one_or_none()
@@ -421,6 +420,10 @@ async def _store_certificate(
         )
     except Exception as exc:  # noqa: BLE001 — never let a deploy hiccup fail issuance
         logger.warning("acme_client_cert_deploy_failed", cert_id=str(row.id), error=str(exc))
+
+    # #50 — a renewal rewrites cert_pem in place, so any DoT/DoH listener
+    # serving this row needs to pick up the new material.
+    await wake_dns_groups_serving_cert(db, row.id)
 
     return row
 

@@ -796,3 +796,91 @@ existing `Get-DnsServerResourceRecord` sync reads.
 The control-plane BIND9 template (`zone.stanza.j2`) renders the same coarse
 `allow-update` for the preview / agentless path, kept in parity with the
 agent renderer.
+
+---
+
+## 9. Encrypted transports (issue #50)
+
+Rendering details for DoT / DoH listeners and TLS upstream forwarding.
+Operator-facing behaviour + the certificate lifecycle live in
+`docs/features/DNS.md` §20.
+
+### 9.1 BIND9
+
+Verified against BIND **9.20.23** (the version in
+`agent/dns/images/bind9`) with `named-checkconf` plus live `dig +tls` /
+`dig +https` queries.
+
+Top-level statements are emitted before `options {}` by
+`_render_tls_statements` in `agent/dns/spatium_dns_agent/drivers/bind9.py`:
+
+```
+tls spatium-local-tls {
+    cert-file "/var/lib/spatium-dns-agent/tls/listener.crt";
+    key-file "/var/lib/spatium-dns-agent/tls/listener.key";
+    protocols { TLSv1.2; TLSv1.3; };
+};
+http spatium-local-http {
+    endpoints { "/dns-query"; };
+};
+tls spatium-upstream-tls {
+    ca-file "/etc/ssl/certs/ca-certificates.crt";
+    remote-hostname "cloudflare-dns.com";
+    protocols { TLSv1.2; TLSv1.3; };
+};
+```
+
+`protocols { … }` pins a modern floor **and** keeps the block non-empty in
+the opportunistic case (verification off ⇒ no `ca-file` /
+`remote-hostname`), which BIND would otherwise reject as an empty `tls`
+block.
+
+Listeners land inside `options {}` via `_render_encrypted_listeners`,
+alongside — never replacing — the plain pair:
+
+```
+listen-on port 853 tls spatium-local-tls { any; };
+listen-on port 8443 tls spatium-local-tls http spatium-local-http { any; };
+```
+
+A DoH listener needs **both** clauses: `tls` terminates, `http` routes the
+path.
+
+Forwarders go through `_format_forwarder`, which also fixed a latent bug:
+the wire shape is `ip` or `ip@port`, and the previous code emitted the raw
+string, rendering an unloadable `192.0.2.2@5353;` token for any forwarder
+that pinned a port. Over TLS the port defaults to 853 rather than 53.
+
+Cert material arrives in the config bundle as `tls_cert` and is written to
+the stable `tls/` paths above — outside the `rendered.new` swap, like the
+TSIG key, and with the same atomic `O_NOFOLLOW` 0600 write so the private
+key is never briefly world-readable.
+
+The server-side Jinja preview (`templates/bind9/named.conf.j2`) mirrors
+all of this so the config-preview UI matches what the agent will write.
+
+### 9.2 PowerDNS / dnsdist
+
+pdns Authoritative speaks neither protocol and doesn't recurse, so:
+
+* **inbound** is `addTLSLocal` / `addDOHLocal` on the dnsdist front, which
+  terminates TLS and forwards plaintext to pdns;
+* **outbound** has no meaning here — the only hop dnsdist makes is to the
+  local pdns backend.
+
+`render_dnsdist_conf` emits into the same shared rules file the #146 Phase
+2 rate-limit rules use. Two cross-container details matter:
+
+1. **Paths are dnsdist-side.** The front runs in its own container and
+   mounts the agent's state dir at `/agent-state`, so the rendered rules
+   reference `/agent-state/tls/listener.crt`, not the agent's own
+   `state_dir`. Override with `DNSDIST_STATE_MOUNT` if that mount moves.
+2. **uid alignment.** Both images create `spatium` as uid 101, so the 0600
+   key the pdns agent writes is readable by dnsdist. If either image's
+   user ever changes, the listeners break with a fatal TLS-load error.
+
+The agent writes the cert **before** the rules file, so the front can
+never observe rules pointing at a PEM that isn't on disk yet.
+
+See §20.4 of `docs/features/DNS.md` for the `--check-config` hazard and
+the entrypoint pre-flight that guards against it.

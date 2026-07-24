@@ -530,6 +530,19 @@ def compile_firewall_from_policies(
                 role_udp.update(r.ports)
             elif r.protocol == "tcp":
                 role_tcp.update(r.ports)
+    # Issue #50 — DoT / DoH listen on operator-chosen ports, so they can't be
+    # seeded as policy rules the way Do53's fixed 53 is. The control plane
+    # derives them from the assigned DNS group's options and ships them on the
+    # role assignment. Keep byte-identical to ``firewall.compile_firewall_body``
+    # + the supervisor's ``firewall_renderer.render_drop_in``.
+    if any(r in ctx.roles for r in ("dns-bind9", "dns-powerdns")):
+        for raw in ra.get("dns_encrypted_tcp_ports") or []:
+            try:
+                port = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if 1 <= port <= 65535:
+                role_tcp.add(port)
     if role_udp or role_tcp:
         lines.append("")
         lines.append("# ── Per-role service ports ─────────────────────────────")

@@ -20,7 +20,13 @@ from sqlalchemy.orm import selectinload
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.pagination import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, Page, paginate
-from app.core.agent_wake import collect_wake, dns_group_channel, dns_server_channel
+from app.config import settings
+from app.core.agent_wake import (
+    appliance_channel,
+    collect_wake,
+    dns_group_channel,
+    dns_server_channel,
+)
 from app.core.crypto import decrypt_dict, encrypt_dict, encrypt_str
 from app.core.dns_names import (
     contains_control_chars,
@@ -37,6 +43,7 @@ from app.drivers.dns import _DRIVERS as _DNS_DRIVERS
 from app.drivers.dns import CLOUD_DNS_DRIVERS, get_driver, is_agentless
 from app.drivers.dns.base import DynamicUpdateCaps, UpdateAclEntry
 from app.drivers.dns.windows import test_winrm_credentials
+from app.models.appliance import ApplianceCertificate
 from app.models.audit import AuditLog
 from app.models.dns import (
     DNSSEC_ALGORITHMS,
@@ -165,6 +172,21 @@ VALID_FORWARD_POLICIES = {"first", "only"}
 VALID_DNSSEC = {"auto", "yes", "no"}
 VALID_NOTIFY = {"yes", "no", "explicit", "master-only"}
 VALID_DNSDIST_ACTIONS = {"truncate", "drop"}
+# Upstream forwarding transport (issue #50). No "https" member: BIND has no
+# client-side HTTP transport, so DoH-upstream isn't expressible on the BIND9
+# driver. The dnsdist front used by PowerDNS can do it and gets its own knob
+# if/when that's wired.
+VALID_FORWARD_TRANSPORTS = {"do53", "tls"}
+# Ports a DoT / DoH listener may never claim (issue #50). The listeners bind
+# ``any``, which includes loopback, so they collide with the fixed ports the
+# agent hardcodes into every rendered named.conf. Value is the operator-facing
+# reason. Keep in sync with ``NAMED_CONF_SKELETON`` +  the ``controls`` block
+# in ``agent/dns/spatium_dns_agent/drivers/bind9.py``.
+_RESERVED_DNS_PORTS: dict[int, str] = {
+    53: "the Do53 listener already binds it",
+    953: "rndc's control channel already binds it",
+    8053: "the BIND statistics channel already binds it",
+}
 
 
 # ── Pydantic schemas ────────────────────────────────────────────────────────
@@ -486,6 +508,55 @@ class ServerOptionsUpdate(BaseModel):
     dnsdist_action: str | None = None
     dnsdist_dynblock_qps: int | None = Field(default=None, ge=1, le=1000000)
     dnsdist_dynblock_seconds: int | None = Field(default=None, ge=1, le=86400)
+    # Encrypted transports (issue #50)
+    dot_enabled: bool | None = None
+    dot_port: int | None = Field(default=None, ge=1, le=65535)
+    doh_enabled: bool | None = None
+    doh_port: int | None = Field(default=None, ge=1, le=65535)
+    # max_length mirrors the column widths (String(128) / String(255)) so an
+    # over-long value 422s at the boundary instead of 500-ing on asyncpg's
+    # StringDataRightTruncation at commit.
+    doh_path: str | None = Field(default=None, max_length=128)
+    tls_certificate_id: uuid.UUID | None = None
+    forward_transport: str | None = None
+    forward_tls_hostname: str | None = Field(default=None, max_length=255)
+    forward_tls_verify: bool | None = None
+
+    @field_validator("forward_transport")
+    @classmethod
+    def validate_forward_transport(cls, v: str | None) -> str | None:
+        if v is not None and v not in VALID_FORWARD_TRANSPORTS:
+            raise ValueError(f"forward_transport must be one of {sorted(VALID_FORWARD_TRANSPORTS)}")
+        return v
+
+    @field_validator("doh_path")
+    @classmethod
+    def validate_doh_path(cls, v: str | None) -> str | None:
+        # RFC 8484 endpoints are absolute paths. BIND's ``endpoints { … }``
+        # takes the path verbatim, so a missing leading slash renders a
+        # config named refuses to load. Whitespace would do the same.
+        if v is None:
+            return None
+        path = v.strip()
+        if not path.startswith("/"):
+            raise ValueError("doh_path must start with '/'")
+        if any(c.isspace() for c in path) or '"' in path:
+            raise ValueError("doh_path must not contain whitespace or quotes")
+        return path
+
+    @field_validator("forward_tls_hostname")
+    @classmethod
+    def validate_forward_tls_hostname(cls, v: str | None) -> str | None:
+        # Empty string is the UI's "cleared the field" shape; normalise it to
+        # NULL so the renderer's ``is not None`` checks stay honest.
+        if v is None:
+            return None
+        host = v.strip()
+        if not host:
+            return None
+        if any(c.isspace() for c in host) or '"' in host:
+            raise ValueError("forward_tls_hostname must not contain whitespace or quotes")
+        return host
 
     @field_validator("dnsdist_action")
     @classmethod
@@ -575,6 +646,15 @@ class ServerOptionsResponse(BaseModel):
     dnsdist_action: str
     dnsdist_dynblock_qps: int | None
     dnsdist_dynblock_seconds: int
+    dot_enabled: bool
+    dot_port: int
+    doh_enabled: bool
+    doh_port: int
+    doh_path: str
+    tls_certificate_id: uuid.UUID | None
+    forward_transport: str
+    forward_tls_hostname: str | None
+    forward_tls_verify: bool
     trust_anchors: list[TrustAnchorResponse]
     modified_at: datetime
 
@@ -2283,6 +2363,105 @@ async def apply_record(
 # ── Server Options endpoints ────────────────────────────────────────────────
 
 
+async def _collect_appliance_wakes_for_dns_group(db: DB, group_id: uuid.UUID) -> None:
+    """Queue a wake for every appliance serving this DNS group (issue #50).
+
+    The supervisor's firewall opens the group's DoT/DoH ports, so a listener
+    change is a per-appliance desired-state change even though the operator
+    made it on a DNS screen. Advisory only — the heartbeat re-reads the role
+    assignment on its own interval regardless, so a miss here costs latency,
+    never correctness.
+    """
+    from app.models.appliance import Appliance  # noqa: PLC0415 — avoids an import cycle
+
+    rows = (
+        (await db.execute(select(Appliance.id).where(Appliance.assigned_dns_group_id == group_id)))
+        .scalars()
+        .all()
+    )
+    if rows:
+        collect_wake(*[appliance_channel(a) for a in rows])
+
+
+async def _assert_encrypted_transport_sane(opts: DNSServerOptions, db: DB) -> None:
+    """Validate the issue-#50 encrypted-transport knobs as a *merged* set.
+
+    Runs against the post-mutation row rather than the request payload, so
+    a two-call sequence ("set the cert" then "enable DoT") is validated the
+    same as a single combined call.
+
+    Everything here is a config that BIND would reject at load time, or a
+    port bind that would fail at runtime. Catching it on the API boundary
+    turns an agent that won't start into a 422 the operator can read.
+    """
+    if opts.dot_enabled or opts.doh_enabled:
+        if opts.tls_certificate_id is None:
+            raise HTTPException(
+                422,
+                "A TLS certificate is required to enable DoT or DoH. "
+                "Upload or issue one under Appliance → Web UI Certificate first.",
+            )
+        cert = await db.get(ApplianceCertificate, opts.tls_certificate_id)
+        if cert is None:
+            raise HTTPException(422, "tls_certificate_id does not match a certificate")
+        if not cert.cert_pem:
+            # CSR-pending row: private key + CSR exist, signed cert doesn't.
+            raise HTTPException(
+                422,
+                f"Certificate '{cert.name}' is still awaiting a signed certificate "
+                "(CSR pending) and cannot be served yet.",
+            )
+
+    # Both listeners are additive to the plain :53 one, which is always up,
+    # and both bind ``any`` — so they also collide with the loopback-only
+    # ports the agent hardcodes into every named.conf. Rejecting these here
+    # keeps the "every path degrades to Do53" promise honest: a listener on
+    # one of them would break the daemon outright, not fall back.
+    for label, enabled, port in (
+        ("dot_port", opts.dot_enabled, opts.dot_port),
+        ("doh_port", opts.doh_enabled, opts.doh_port),
+    ):
+        if not enabled:
+            continue
+        reason = _RESERVED_DNS_PORTS.get(port)
+        if reason:
+            raise HTTPException(422, f"{label} cannot be {port} — {reason}")
+
+    if opts.dot_enabled and opts.doh_enabled and opts.dot_port == opts.doh_port:
+        raise HTTPException(422, "dot_port and doh_port must differ")
+
+    # On an appliance the frontend already serves HTTPS on 443/80, and the
+    # DNS workload runs with hostNetwork — so a listener there would fight
+    # the web UI for the port. Applies to BOTH listeners: nothing stops an
+    # operator putting DoT on 443. Operators on docker / k8s own their own
+    # topology, so only the appliance case is refused.
+    if settings.appliance_mode:
+        for label, enabled, port in (
+            ("dot_port", opts.dot_enabled, opts.dot_port),
+            ("doh_port", opts.doh_enabled, opts.doh_port),
+        ):
+            if enabled and port in (80, 443):
+                raise HTTPException(
+                    422,
+                    f"{label} {port} conflicts with the appliance web UI on this "
+                    "install. Pick another port (8443 is the usual choice) and "
+                    "publish it to clients via DoH bootstrap configuration.",
+                )
+
+    if (
+        opts.forward_transport == "tls"
+        and opts.forward_tls_verify
+        and not opts.forward_tls_hostname
+    ):
+        raise HTTPException(
+            422,
+            "forward_tls_hostname is required when forwarding over TLS with "
+            "verification on — there is no name to check the upstream "
+            "certificate against. Set the provider's DoT hostname (e.g. "
+            "cloudflare-dns.com) or turn verification off for opportunistic DoT.",
+        )
+
+
 async def _load_options(group_id: uuid.UUID, db: DB) -> DNSServerOptions | None:
     result = await db.execute(
         select(DNSServerOptions)
@@ -2328,11 +2507,18 @@ async def update_options(
         "max_clients_per_query",
         "dnsdist_max_qps_per_client",
         "dnsdist_dynblock_qps",
+        # Issue #50 — clearing the cert (un-linking it before deleting the
+        # cert row) and clearing the upstream hostname both have to survive
+        # exclude_none, same as the knobs above.
+        "tls_certificate_id",
+        "forward_tls_hostname",
     ):
         if field in body.model_fields_set and getattr(body, field) is None:
             changes[field] = None
     for k, v in changes.items():
         setattr(opts, k, v)
+
+    await _assert_encrypted_transport_sane(opts, db)
 
     db.add(
         AuditLog(
@@ -2348,6 +2534,17 @@ async def update_options(
         )
     )
     collect_wake(dns_group_channel(group_id))
+    # Issue #50 — a DoT/DoH toggle or port change also alters the supervisor's
+    # role assignment (dns_encrypted_tcp_ports), and therefore the rendered
+    # firewall. Without this the DNS agent re-renders within a second while
+    # the firewall waits for the next heartbeat interval, leaving the listener
+    # up on a port nftables still drops. Cross-cutting pattern #2: a
+    # per-appliance desired-state change wakes the appliance channel too.
+    if any(
+        f in changes
+        for f in ("dot_enabled", "dot_port", "doh_enabled", "doh_port", "tls_certificate_id")
+    ):
+        await _collect_appliance_wakes_for_dns_group(db, group_id)
     await db.commit()
     reloaded = await _load_options(group_id, db)
     return reloaded  # type: ignore[return-value]

@@ -10,8 +10,42 @@ acl "{{ acl.name }}" {
 };
 {% endfor %}
 
+{#- Encrypted transports (issue #50). The top-level tls/http statements must
+    exist before anything references them. ``tls_cert_present`` mirrors the
+    agent renderer: a listener whose cert has been deleted out from under it
+    degrades to Do53 rather than emitting a config named refuses to load. #}
+{%- if (options.dot_enabled or options.doh_enabled) and tls_cert_present %}
+tls spatium-local-tls {
+    cert-file "/var/lib/spatium-dns-agent/tls/listener.crt";
+    key-file "/var/lib/spatium-dns-agent/tls/listener.key";
+    protocols { TLSv1.2; TLSv1.3; };
+};
+{%- endif %}
+{%- if options.doh_enabled and tls_cert_present %}
+http spatium-local-http {
+    endpoints { "{{ options.doh_path }}"; };
+};
+{%- endif %}
+{%- if options.forward_transport == "tls" %}
+tls spatium-upstream-tls {
+    {%- if options.forward_tls_verify and options.forward_tls_hostname %}
+    ca-file "/etc/ssl/certs/ca-certificates.crt";
+    remote-hostname "{{ options.forward_tls_hostname }}";
+    {%- endif %}
+    protocols { TLSv1.2; TLSv1.3; };
+};
+{%- endif %}
+
 options {
     directory "/var/cache/bind";
+    {%- if options.dot_enabled and tls_cert_present %}
+    listen-on port {{ options.dot_port }} tls spatium-local-tls { any; };
+    listen-on-v6 port {{ options.dot_port }} tls spatium-local-tls { any; };
+    {%- endif %}
+    {%- if options.doh_enabled and tls_cert_present %}
+    listen-on port {{ options.doh_port }} tls spatium-local-tls http spatium-local-http { any; };
+    listen-on-v6 port {{ options.doh_port }} tls spatium-local-tls http spatium-local-http { any; };
+    {%- endif %}
     recursion {{ "yes" if options.recursion_enabled else "no" }};
     allow-recursion { {% for a in options.allow_recursion %}{{ a }}; {% endfor %}};
     allow-query { {% for a in options.allow_query %}{{ a }}; {% endfor %}};
@@ -28,8 +62,17 @@ options {
     {%- if options.allow_notify %}
     allow-notify { {% for a in options.allow_notify %}{{ a }}; {% endfor %}};
     {%- endif %}
+    {#- Over DoT the port defaults to 853 (RFC 7858), and each upstream
+        carries the tls statement defined above. ``ip@port`` is the
+        control-plane wire shape; splitting it here keeps a forwarder that
+        pins a port from rendering an unloadable ``1.1.1.1@853;`` token. #}
     {%- if options.forwarders %}
-    forwarders { {% for f in options.forwarders %}{{ f }}; {% endfor %}};
+    {%- set _tls_up = options.forward_transport == "tls" %}
+    forwarders { {% for f in options.forwarders %}
+        {%- set _ip = f.split("@")[0] %}
+        {%- set _port = f.split("@")[1] if "@" in f else ("853" if _tls_up else "") %}
+        {{- _ip }}{% if _port %} port {{ _port }}{% endif %}
+        {%- if _tls_up %} tls spatium-upstream-tls{% endif %}; {% endfor %}};
     forward {{ options.forward_policy }};
     {%- endif %}
     {#- RRL + amplification defenses (issue #146); render only when set #}

@@ -61,6 +61,7 @@ import { Pager } from "@/components/ui/pager";
 import { AskAIButton } from "@/components/copilot/AskAIButton";
 import { ServicesUsingButton } from "@/components/ServicesUsingButton";
 import {
+  applianceTlsApi,
   dnsApi,
   dnsBlocklistApi,
   domainsApi,
@@ -5119,6 +5120,15 @@ function OptionsTab({ groupId }: { groupId: string }) {
     queryKey: ["dns-options", groupId],
     queryFn: () => dnsApi.getOptions(groupId),
   });
+  // Certificate picker for the DoT/DoH listeners (issue #50). Shares the
+  // appliance cert store with the web UI cert + the ACME client, so the
+  // operator issues once and points both at it. Non-admins get a 403 here;
+  // the select just falls back to "— none —" rather than erroring the page.
+  const { data: certs } = useQuery({
+    queryKey: ["appliance-tls-certs"],
+    queryFn: () => applianceTlsApi.list(),
+    retry: false,
+  });
 
   const [forwardersEnabled, setForwardersEnabled] = useState(false);
   const [forwarders, setForwarders] = useState("");
@@ -5154,6 +5164,16 @@ function OptionsTab({ groupId }: { groupId: string }) {
   const [dnsdistAction, setDnsdistAction] = useState("truncate");
   const [dnsdistDynblockQps, setDnsdistDynblockQps] = useState("");
   const [dnsdistDynblockSeconds, setDnsdistDynblockSeconds] = useState(60);
+  // Encrypted transports (issue #50).
+  const [dotEnabled, setDotEnabled] = useState(false);
+  const [dotPort, setDotPort] = useState(853);
+  const [dohEnabled, setDohEnabled] = useState(false);
+  const [dohPort, setDohPort] = useState(443);
+  const [dohPath, setDohPath] = useState("/dns-query");
+  const [tlsCertificateId, setTlsCertificateId] = useState("");
+  const [forwardTransport, setForwardTransport] = useState("do53");
+  const [forwardTlsHostname, setForwardTlsHostname] = useState("");
+  const [forwardTlsVerify, setForwardTlsVerify] = useState(true);
   const [dirty, setDirty] = useState(false);
   const [saved, setSaved] = useState(false);
   const [initialized, setInitialized] = useState(false);
@@ -5188,6 +5208,15 @@ function OptionsTab({ groupId }: { groupId: string }) {
     setDnsdistAction(opts.dnsdist_action);
     setDnsdistDynblockQps(opts.dnsdist_dynblock_qps?.toString() ?? "");
     setDnsdistDynblockSeconds(opts.dnsdist_dynblock_seconds);
+    setDotEnabled(opts.dot_enabled);
+    setDotPort(opts.dot_port);
+    setDohEnabled(opts.doh_enabled);
+    setDohPort(opts.doh_port);
+    setDohPath(opts.doh_path);
+    setTlsCertificateId(opts.tls_certificate_id ?? "");
+    setForwardTransport(opts.forward_transport);
+    setForwardTlsHostname(opts.forward_tls_hostname ?? "");
+    setForwardTlsVerify(opts.forward_tls_verify);
     setInitialized(true);
   }
 
@@ -5255,6 +5284,17 @@ function OptionsTab({ groupId }: { groupId: string }) {
       dnsdist_action: dnsdistAction,
       dnsdist_dynblock_qps: numOrNull(dnsdistDynblockQps),
       dnsdist_dynblock_seconds: dnsdistDynblockSeconds,
+      dot_enabled: dotEnabled,
+      dot_port: dotPort,
+      doh_enabled: dohEnabled,
+      doh_port: dohPort,
+      doh_path: dohPath.trim() || "/dns-query",
+      // "" is the "no cert linked" shape; send explicit null so the server's
+      // exclude_none re-injection clears the column instead of dropping it.
+      tls_certificate_id: tlsCertificateId || null,
+      forward_transport: forwardTransport,
+      forward_tls_hostname: forwardTlsHostname.trim() || null,
+      forward_tls_verify: forwardTlsVerify,
     });
   }
 
@@ -5290,6 +5330,16 @@ function OptionsTab({ groupId }: { groupId: string }) {
           )}
         </button>
       </div>
+
+      {/* Server-side validation (e.g. the issue-#50 encrypted-transport
+          rules) returns 422 with an explanatory message. Without this the
+          button just flips back to "Save Changes" and the operator has no
+          idea why nothing happened. */}
+      {saveMut.isError && (
+        <p className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+          {formatApiError(saveMut.error, "Save failed")}
+        </p>
+      )}
 
       <div className={card}>
         <div className="flex items-center justify-between">
@@ -5559,6 +5609,206 @@ function OptionsTab({ groupId }: { groupId: string }) {
               />
             </Field>
           </div>
+        </div>
+      </div>
+
+      <div className={card}>
+        <h4 className={cardTitle}>
+          <Shield className="h-4 w-4 text-muted-foreground" /> Encrypted
+          transports (DoT / DoH)
+        </h4>
+        <p className="text-xs text-muted-foreground">
+          Serve DNS-over-TLS and DNS-over-HTTPS to clients, and forward to
+          upstream resolvers over TLS instead of plaintext port 53. Listeners
+          are <strong>additive</strong> — plain DNS on :53 keeps working.
+        </p>
+
+        <Field label="TLS certificate (served by both listeners)">
+          <select
+            className={selCls}
+            value={tlsCertificateId}
+            onChange={(e) => {
+              setTlsCertificateId(e.target.value);
+              setDirty(true);
+            }}
+          >
+            <option value="">— none —</option>
+            {/* CSR-pending rows (pending === true, i.e. cert_pem IS NULL)
+                are shown but disabled: the server 422s them with "CSR
+                pending", so offering them as a live choice would be an
+                option that can only ever fail. Rendering them greyed-out
+                explains WHY the cert they just generated isn't usable
+                yet. */}
+            {(certs ?? []).map((c) => (
+              <option key={c.id} value={c.id} disabled={c.pending}>
+                {c.name} ({c.subject_cn})
+                {c.pending ? " — awaiting signed certificate" : ""}
+              </option>
+            ))}
+          </select>
+        </Field>
+        <p className="text-xs text-muted-foreground">
+          Managed under Appliance → Web UI Certificate — upload one, or issue it
+          from Let's Encrypt with the built-in ACME client. Renewals are picked
+          up automatically. A listener with no usable certificate is skipped and
+          the server stays Do53-only rather than failing to start.
+        </p>
+
+        <div className="flex items-center justify-between border-t pt-3">
+          <span className="text-sm">DNS-over-TLS (DoT)</span>
+          <label className="flex items-center gap-2 cursor-pointer text-sm">
+            <input
+              type="checkbox"
+              checked={dotEnabled}
+              onChange={(e) => {
+                setDotEnabled(e.target.checked);
+                setDirty(true);
+              }}
+              className="h-4 w-4"
+            />
+            Enable
+          </label>
+        </div>
+        {dotEnabled && (
+          <Field label="DoT port">
+            <input
+              type="number"
+              min={1}
+              max={65535}
+              className={inputCls}
+              value={dotPort}
+              onChange={(e) => {
+                setDotPort(numOrDefault(e.target.value, 853));
+                setDirty(true);
+              }}
+            />
+          </Field>
+        )}
+
+        <div className="flex items-center justify-between border-t pt-3">
+          <span className="text-sm">DNS-over-HTTPS (DoH)</span>
+          <label className="flex items-center gap-2 cursor-pointer text-sm">
+            <input
+              type="checkbox"
+              checked={dohEnabled}
+              onChange={(e) => {
+                setDohEnabled(e.target.checked);
+                setDirty(true);
+              }}
+              className="h-4 w-4"
+            />
+            Enable
+          </label>
+        </div>
+        {dohEnabled && (
+          <>
+            <div className="grid grid-cols-2 gap-3">
+              <Field label="DoH port">
+                <input
+                  type="number"
+                  min={1}
+                  max={65535}
+                  className={inputCls}
+                  value={dohPort}
+                  onChange={(e) => {
+                    setDohPort(numOrDefault(e.target.value, 443));
+                    setDirty(true);
+                  }}
+                />
+              </Field>
+              <Field label="URL path">
+                <input
+                  className={inputCls}
+                  value={dohPath}
+                  placeholder="/dns-query"
+                  onChange={(e) => {
+                    setDohPath(e.target.value);
+                    setDirty(true);
+                  }}
+                />
+              </Field>
+            </div>
+            {dohPort === 443 && (
+              <p className="text-xs text-amber-600">
+                Port 443 is the RFC 8484 default but collides with the web UI on
+                an appliance install, where it will be rejected. Use 8443 and
+                publish it to clients in their DoH URL.
+              </p>
+            )}
+          </>
+        )}
+        <p className="text-xs text-muted-foreground">
+          On PowerDNS groups the listeners run on the dnsdist front below (pdns
+          speaks neither protocol), so DoT/DoH there needs that front deployed.
+          BIND9 serves both natively.
+        </p>
+
+        <div className="border-t pt-3 space-y-3">
+          <Field label="Upstream forwarding transport">
+            <select
+              className={selCls}
+              value={forwardTransport}
+              onChange={(e) => {
+                setForwardTransport(e.target.value);
+                setDirty(true);
+              }}
+            >
+              <option value="do53">
+                do53 — plaintext UDP/TCP port 53 (default)
+              </option>
+              <option value="tls">
+                tls — DNS-over-TLS to the forwarders above
+              </option>
+            </select>
+          </Field>
+          {forwardTransport === "tls" && (
+            <>
+              <p className="text-xs text-muted-foreground">
+                Applies to the forwarders configured above, and to per-zone
+                forwarders. Forwarders default to port 853 unless one pins its
+                own. BIND cannot forward over DoH, so there is no HTTPS option
+                here.
+              </p>
+              <label className="flex items-center gap-2 cursor-pointer text-sm">
+                <input
+                  type="checkbox"
+                  checked={forwardTlsVerify}
+                  onChange={(e) => {
+                    setForwardTlsVerify(e.target.checked);
+                    setDirty(true);
+                  }}
+                  className="h-4 w-4"
+                />
+                Verify the upstream certificate
+              </label>
+              {forwardTlsVerify ? (
+                <Field label="Upstream TLS hostname (required)">
+                  <input
+                    className={inputCls}
+                    value={forwardTlsHostname}
+                    placeholder="cloudflare-dns.com"
+                    onChange={(e) => {
+                      setForwardTlsHostname(e.target.value);
+                      setDirty(true);
+                    }}
+                  />
+                </Field>
+              ) : (
+                <p className="text-xs text-amber-600">
+                  Opportunistic DoT: traffic is encrypted but the upstream isn't
+                  authenticated, so an active on-path attacker can still
+                  impersonate it. Prefer verification wherever the provider
+                  publishes a DoT hostname.
+                </p>
+              )}
+              <p className="text-xs text-muted-foreground">
+                One hostname applies to every forwarder, so all of them must
+                present it (e.g. 1.1.1.1 + 1.0.0.1 both serve
+                cloudflare-dns.com). Mixing providers needs one group per
+                provider.
+              </p>
+            </>
+          )}
         </div>
       </div>
 

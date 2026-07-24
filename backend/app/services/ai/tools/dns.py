@@ -1080,3 +1080,98 @@ async def propose_set_zone_update_acl(
     from app.services.ai.tools.proposals import _propose_via  # noqa: PLC0415
 
     return await _propose_via(db=db, user=user, operation_name="set_zone_update_acl", args=args)
+
+
+class FindDNSEncryptedTransportsArgs(BaseModel):
+    group_id: str | None = Field(
+        default=None,
+        description="Filter to one DNS server group UUID. Omit for every group.",
+    )
+
+
+@register_tool(
+    name="find_dns_encrypted_transports",
+    description=(
+        "Report which DNS server groups serve DNS-over-TLS (DoT) or "
+        "DNS-over-HTTPS (DoH) to clients, and which forward to their "
+        "upstream resolvers over TLS instead of plaintext port 53 "
+        "(issue #50). Returns per group: the listener toggles + ports + "
+        "DoH URL path, whether a usable TLS certificate is actually linked "
+        "(a listener without one silently degrades to Do53), and the "
+        "upstream transport with its verification hostname. Use this to "
+        "answer 'is encrypted DNS on?', 'what port is DoH on?', 'are we "
+        "still forwarding in cleartext?', or 'why isn't DoT working?'. "
+        "Read-only; never returns certificate or key material."
+    ),
+    args_model=FindDNSEncryptedTransportsArgs,
+    category="dns",
+)
+async def find_dns_encrypted_transports(
+    db: AsyncSession, user: User, args: FindDNSEncryptedTransportsArgs
+) -> dict[str, Any]:
+    from app.models.appliance import ApplianceCertificate  # noqa: PLC0415
+
+    # Resolve the cert in the SAME query — one round-trip regardless of how
+    # many groups exist, on the LLM's synchronous request path. Only the
+    # name + a usability flag are selected: the row also carries an
+    # encrypted private key, and an LLM surface has no business paging it.
+    stmt = (
+        select(
+            DNSServerOptions,
+            DNSServerGroup,
+            ApplianceCertificate.name,
+            ApplianceCertificate.cert_pem.isnot(None),
+        )
+        .join(DNSServerGroup, DNSServerGroup.id == DNSServerOptions.group_id)
+        .outerjoin(
+            ApplianceCertificate,
+            ApplianceCertificate.id == DNSServerOptions.tls_certificate_id,
+        )
+    )
+    if args.group_id:
+        try:
+            stmt = stmt.where(DNSServerOptions.group_id == uuid.UUID(args.group_id))
+        except ValueError:
+            return {"error": f"group_id is not a valid UUID: {args.group_id}"}
+
+    groups: list[dict[str, Any]] = []
+    for opts, group, cert_name, has_pem in (
+        await db.execute(stmt.order_by(DNSServerGroup.name))
+    ).all():
+        cert_usable = bool(has_pem)
+        listeners_effective = cert_usable and (opts.dot_enabled or opts.doh_enabled)
+        groups.append(
+            {
+                "group_id": str(group.id),
+                "group_name": group.name,
+                "dot_enabled": opts.dot_enabled,
+                "dot_port": opts.dot_port,
+                "doh_enabled": opts.doh_enabled,
+                "doh_port": opts.doh_port,
+                "doh_path": opts.doh_path,
+                "tls_certificate_name": cert_name,
+                "tls_certificate_usable": cert_usable,
+                # The honest answer to "is it actually serving?" — the agent
+                # renderers skip a listener whose cert is missing rather than
+                # emit a config the daemon would refuse to load.
+                "listeners_effective": listeners_effective,
+                "forward_transport": opts.forward_transport,
+                "forward_tls_hostname": opts.forward_tls_hostname,
+                "forward_tls_verify": opts.forward_tls_verify,
+                "upstream_encrypted": opts.forward_transport == "tls",
+            }
+        )
+
+    return {
+        "groups": groups,
+        "count": len(groups),
+        "summary": {
+            "groups_serving_encrypted": sum(1 for g in groups if g["listeners_effective"]),
+            "groups_forwarding_encrypted": sum(1 for g in groups if g["upstream_encrypted"]),
+            "groups_with_broken_listener": sum(
+                1
+                for g in groups
+                if (g["dot_enabled"] or g["doh_enabled"]) and not g["tls_certificate_usable"]
+            ),
+        },
+    }

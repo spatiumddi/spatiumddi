@@ -129,6 +129,14 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
             dnsdist_action=opts_row.dnsdist_action,
             dnsdist_dynblock_qps=opts_row.dnsdist_dynblock_qps,
             dnsdist_dynblock_seconds=opts_row.dnsdist_dynblock_seconds,
+            dot_enabled=opts_row.dot_enabled,
+            dot_port=opts_row.dot_port,
+            doh_enabled=opts_row.doh_enabled,
+            doh_port=opts_row.doh_port,
+            doh_path=opts_row.doh_path,
+            forward_transport=opts_row.forward_transport,
+            forward_tls_hostname=opts_row.forward_tls_hostname,
+            forward_tls_verify=opts_row.forward_tls_verify,
             trust_anchors=tuple(
                 TrustAnchorData(
                     zone_name=ta.zone_name,

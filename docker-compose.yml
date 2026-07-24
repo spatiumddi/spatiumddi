@@ -223,6 +223,11 @@ services:
       - dns_bind9_state:/var/lib/spatium-dns-agent
       - dns_bind9_cache:/var/cache/bind
     ports:
+      # Encrypted transports (#50) are NOT published here. Compose has no
+      # conditional publishing, so binding 853/443 unconditionally would
+      # break `up -d` on any host already using those ports — for a feature
+      # that is off by default. Add the overlay instead:
+      #   docker compose -f docker-compose.yml -f docker-compose.dns-encrypted.yml up -d
       - "1053:53/udp"
       - "1053:53/tcp"
     depends_on:
@@ -285,6 +290,10 @@ services:
     volumes:
       - dns_powerdns_state:/agent-state:ro
     ports:
+      # Encrypted transports (#50) live on THIS container for the PowerDNS
+      # driver (pdns auth speaks neither protocol), but are published by
+      # the docker-compose.dns-encrypted.yml overlay rather than here —
+      # see the note on dns-bind9 above.
       - "5455:53/udp"
       - "5455:53/tcp"
     depends_on:

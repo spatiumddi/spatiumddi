@@ -304,6 +304,20 @@ def render_drop_in(
     for role in roles:
         role_tcp.update(_ROLE_PORTS_TCP.get(role, []))
         role_udp.update(_ROLE_PORTS_UDP.get(role, []))
+    # Issue #50 — DoT / DoH listen on operator-chosen ports, so unlike Do53
+    # they can't come from the static table above. The control plane derives
+    # them from the assigned DNS group's options (only when a cert is
+    # actually present) and ships them on the role assignment. Ignored
+    # unless a DNS role is assigned, so a stale value on a re-roled
+    # appliance can't leave a port open.
+    if any(r in roles for r in ("dns-bind9", "dns-powerdns")):
+        for raw in role_assignment.get("dns_encrypted_tcp_ports") or []:
+            try:
+                port = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if 1 <= port <= 65535:
+                role_tcp.add(port)
     if role_udp or role_tcp:
         lines.append("")
         lines.append("# ── Per-role service ports ─────────────────────────────")

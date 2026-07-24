@@ -350,7 +350,27 @@ suggestion, free-space treemap.
 #### DNS-specific
 
 - ⬜ [**DNSSEC**](https://github.com/spatiumddi/spatiumddi/issues/49)
-- ⬜ [**DoT / DoH listener**](https://github.com/spatiumddi/spatiumddi/issues/50)
+- 🟡 [**DoT / DoH — inbound listener + encrypted upstream forwarding**](https://github.com/spatiumddi/spatiumddi/issues/50) —
+  implemented on `issue-50` (pending release cut). Serves DoT (853) / DoH
+  (`/dns-query`) to local clients *and* forwards to upstream resolvers
+  over TLS instead of plaintext 53. Both halves are per-group, default-off
+  (existing installs render a byte-identical `named.conf`), and additive —
+  the Do53 listener is unaffected. **BIND9** renders `tls` / `http`
+  statements + extra `listen-on` clauses natively and forwards over DoT
+  with strict `remote-hostname` validation that fails closed;
+  **PowerDNS** gets inbound-only via the dnsdist sidecar (#146 Phase 2,
+  docker-compose-only) since pdns auth speaks neither protocol and doesn't
+  forward at all. Certs come from the existing `ApplianceCertificate`
+  store + the shipped ACME client (#438), ride the hashed config bundle so
+  a renewal shifts the ETag, and degrade to Do53 (never a dead daemon) if
+  the cert is deleted out from under a live listener. Operator-chosen
+  ports flow to the supervisor firewall via a new `dns_encrypted_tcp_ports`
+  field on the role assignment. Deferred: DoH-upstream (BIND has no
+  client-side HTTP transport — needs the dnsdist path), per-forwarder TLS
+  hostnames (one per group today, so mixed providers need one group each),
+  DoQ, and a k8s dnsdist front to unblock PowerDNS DoT/DoH off compose.
+  Not to be confused with `PlatformSettings.resolver_dns_over_tls`, which
+  is the appliance host's own systemd-resolved stub resolver.
 
 #### DHCP-specific
 

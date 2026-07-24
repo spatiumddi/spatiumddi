@@ -111,6 +111,7 @@ SpatiumDDI is built on nights and weekends with no commercial backing — every 
 | ✂️ | **Subnet operations** | Split · Merge · Find-free · subnet planner (multi-level CIDR design + transactional apply) — preview-then-commit with typed-CIDR confirm · single Tools dropdown on subnet headers |
 | 🧮 | **Planning tools** | CIDR calculator · address planner (pack /N requests into free space) · aggregation suggestion · free-space treemap |
 | 🌐 | **DNS** | BIND9 container, auto-registering · RFC 2136 dynamic updates · per-zone dynamic-update ACLs (authorize external writers by TSIG key or source IP/CIDR, with ingest-back of records they inject) · per-server zone-serial drift · TSIG keys · zone delegation wizard · zone templates · RPZ blocklists with curated catalog · BIND9 catalog zones (RFC 9432) · secondary / stub zones (`masters`) · SVCB / HTTPS / DNAME records · Response Rate Limiting (RRL) + amplification defenses · query-log analytics (top names / clients / qtypes + per-view breakdown) with NXDOMAIN-spike / query-rate-spike alerting |
+| 🔒 | **Encrypted DNS (DoT / DoH)** | serve DNS-over-TLS (853) + DNS-over-HTTPS (`/dns-query`) to local clients **and** forward upstream over TLS instead of plaintext 53 · BIND9 native, PowerDNS via the dnsdist front · certs from the built-in ACME client or an upload, auto-picked-up on renewal · strict upstream `remote-hostname` validation that fails closed · per-group, default-off, additive (plain :53 keeps working) |
 | 🔐 | **DNSSEC** | BIND9 inline-signing (BIND owns + auto-rotates keys) + PowerDNS online sign · reusable `dnssec-policy` library · per-zone public key state + DS export · manual + automatic rollover |
 | 🔀 | **DNS Views (split-horizon)** | per-view zone + record rendering on BIND9 — `view_id IS NULL` records shared across views, scoped records render only in their view, RPZ / blocklists replicate into each view block |
 | ⚖️ | **GSLB-lite + GeoDNS steering** | health-checked DNS pools — tcp / http / https / icmp / none probes flip A/AAAA records in/out of the rendered rrset; manual enable per member · **topology-aware steering** — a per-member serving scope (client CIDRs and/or Site) renders as BIND9 geo views composed over split-horizon, evaluated before operator views with a union fallback so a scoped-only pool never blackholes |
@@ -293,6 +294,12 @@ The tables above are the elevator pitch. The bullets here are the same surface w
   - **Rate limiting (RRL) + amplification defenses** — BIND9 Response Rate Limiting (responses-per-second / window / slip / qps-scale / exempt-clients) with a `log-only` dry-run, plus `minimal-responses` / `tcp-clients` / `clients-per-query` toggles; group-level, default-off (no-op until opted in)
     - **RRL drop observability** — `RateDropped` / `RateSlipped` charted as an "RRL drops/s" line on the server Stats tab + a default-off `dns_rate_limit_dropping` alert (fires when the server is actively shedding a flood)
     - **dnsdist front for PowerDNS** — opt-in front container (PowerDNS auth has no RRL of its own) forwarding to pdns: per-source-IP QPS cap (truncate / drop) + sustained-rate dynamic blocking, on a `dns-powerdns-with-dnsdist` compose profile (docker-compose for now)
+  - **Encrypted transports (DoT / DoH)** — two independent halves, both per-group and default-off so an existing install renders a byte-identical `named.conf` until you opt in
+    - **Inbound** — serve DNS-over-TLS (RFC 7858, :853) and DNS-over-HTTPS (RFC 8484, `/dns-query`) alongside plain Do53, which is unaffected
+    - **Outbound** — forward to upstream resolvers over DoT instead of cleartext :53, with `remote-hostname` validation that fails closed (SERVFAIL, never a silent downgrade); opportunistic mode available for upstreams that publish no DoT hostname
+    - **Certificates** reuse the appliance cert store — upload one or issue it from Let's Encrypt with the built-in ACME client; renewals reach the agents automatically. A listener whose cert is deleted degrades to Do53 rather than taking the daemon down
+    - BIND9 serves both natively; PowerDNS gets inbound-only via the dnsdist front (pdns auth speaks neither protocol and doesn't forward)
+    - Ports are operator-chosen and flow through to the appliance firewall automatically. DoH defaults to 443, which the appliance rejects because the web UI owns it there — use 8443
   - **Catalog zones (RFC 9432)** — producer / consumer roles auto-derived from the group's primary
     - RFC-compliant SHA-1 hashing of zone names
   - **Operator tools**:
@@ -1130,6 +1137,53 @@ dig @127.0.0.1 -p 1053 -x <your-ip> +short    # reverse (PTR)
 Record changes propagate to BIND9 via RFC 2136 — typically sub-second, no daemon restart. Zone / ACL / view changes trigger a config reload.
 
 **Production**: point the agent at your real control plane, expose `53/udp` + `53/tcp`, and run one container per DNS server you want in the cluster. All servers in a group share the same TSIG key for dynamic updates.
+
+#### Encrypted DNS (DoT / DoH)
+
+Turn it on per group under **DNS → Server Groups → Options → Encrypted
+transports**, after linking a TLS certificate (upload one, or issue it
+from Let's Encrypt under **Appliance → Web UI Certificate**). Both
+listeners are additive — plain DNS on `:53` keeps working.
+
+The listener port lives in the database; what you change to make it
+*reachable* depends on how you deploy:
+
+| Deployment | What to do |
+|---|---|
+| **OS appliance** | Nothing. The DNS workload is `hostNetwork` and the supervisor opens the firewall port automatically when you enable a listener. |
+| **Docker Compose** | Add the overlay: `-f docker-compose.dns-encrypted.yml`. It publishes `1853→853` (DoT) and `8443→443` (DoH); tune with `DNS_DOT_HOST_PORT` / `DNS_DOH_HOST_PORT`, and if you changed the port *in the UI* match it with `DNS_DOT_PORT` / `DNS_DOH_PORT`. |
+| **Kubernetes / Helm** | Set `dnsBind9.dotPort` / `dnsBind9.dohPort` (appliance chart) or per-server `dotPort` / `dohPort` (umbrella chart). |
+
+```bash
+docker compose -f docker-compose.yml \
+               -f docker-compose.dns-encrypted.yml \
+               --profile dns-bind9 up -d
+```
+
+The ports live in an overlay rather than the base file because Compose
+can't publish conditionally — binding 853/443 unconditionally would break
+`up -d` on any host already using them, for a feature that ships off.
+
+```bash
+# DoT
+dig +tls +tls-hostname=dns.example.com @127.0.0.1 -p 1853 www.example.com A +short
+# DoH
+dig +https=/dns-query +tls-hostname=dns.example.com @127.0.0.1 -p 8443 www.example.com A +short
+```
+
+> **DoH and port 443.** 443 is the RFC 8484 default and is what the UI
+> starts with, but on an **appliance** the web UI already owns it — the
+> API rejects `443` there, so pick `8443` and hand clients a DoH URL with
+> the port in it. On Compose there's no clash: the frontend publishes
+> `8077→80` and never binds 443, and the container-side 443 is private to
+> the DNS container.
+
+**PowerDNS**: pdns Authoritative speaks neither protocol, so DoT/DoH runs
+on the dnsdist front — bring up both the `dns-powerdns` and
+`dns-powerdns-with-dnsdist` profiles and point clients at the front
+(`5853` / `5444`). The standalone `docker-compose.agent-dns-powerdns.yml`
+has no front, so encrypted transports aren't available there. BIND9 needs
+no sidecar. Upstream-over-TLS is BIND9-only — pdns doesn't forward at all.
 
 ### API & interactive docs
 

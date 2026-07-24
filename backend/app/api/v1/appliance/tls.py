@@ -20,7 +20,7 @@ from datetime import UTC, datetime
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from app.api.deps import DB, CurrentUser
 from app.config import settings
@@ -40,6 +40,10 @@ from app.services.appliance.tls import (
     generate_csr_and_key,
     parse_pem_certificate,
     validate_key_matches_cert,
+)
+from app.services.dns.cert_rotation import (
+    wake_dns_groups_serving_cert,
+    wake_for_cert_deletion,
 )
 
 logger = structlog.get_logger(__name__)
@@ -461,6 +465,9 @@ async def import_signed_cert(
     # ``stored_key_pem`` is in scope from earlier in this function
     # — reuse it so we don't decrypt twice.
     _deploy_if_active(row, stored_key_pem)
+    # #50 — this row may also back a DNS group's DoT/DoH listener; the
+    # freshly-signed cert has to reach those agents too.
+    await wake_dns_groups_serving_cert(db, row.id)
     return _to_summary(row)
 
 
@@ -538,6 +545,28 @@ async def delete_certificate(
             "this certificate is currently active — activate a different one first",
         )
 
+    # #50 — the same store backs DNS DoT/DoH listeners, and the FK is
+    # ON DELETE SET NULL, so without this guard deleting a cert silently
+    # drops every encrypted-DNS client in those groups back to "connection
+    # refused" with nothing warning the operator. Mirrors the is_active
+    # check above: refuse, name what's using it, let them unlink first.
+    serving = await _dns_groups_serving_cert(db, cert_id)
+    if serving:
+        names = ", ".join(serving)
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"this certificate serves DoT/DoH for DNS server group(s): {names}. "
+            "Disable those listeners (or point them at another certificate) "
+            "under DNS → Server Groups → Options → Encrypted transports first.",
+        )
+
+    # Wake BEFORE the delete: afterwards the FK is already NULL and the
+    # owning groups can no longer be found. Nothing is actually serving this
+    # cert (the guard above just proved it), so this only covers the
+    # cert-linked-but-listeners-off case, where the bundle carries no
+    # material and the wake is a cheap no-op.
+    await wake_for_cert_deletion(db, cert_id)
+
     name = row.name
     await db.delete(row)
     db.add(
@@ -557,6 +586,36 @@ async def delete_certificate(
 
 
 # ── Internal helpers ────────────────────────────────────────────────
+
+
+async def _dns_groups_serving_cert(db: DB, cert_id: uuid.UUID) -> list[str]:
+    """Names of DNS server groups with a LIVE DoT/DoH listener on this cert.
+
+    Only groups with a listener actually enabled count — a group that merely
+    points at the cert with both listeners off isn't serving anything, so
+    deleting the cert costs it nothing.
+    """
+    from app.models.dns import DNSServerGroup, DNSServerOptions  # noqa: PLC0415
+
+    rows = (
+        (
+            await db.execute(
+                select(DNSServerGroup.name)
+                .join(DNSServerOptions, DNSServerOptions.group_id == DNSServerGroup.id)
+                .where(
+                    DNSServerOptions.tls_certificate_id == cert_id,
+                    or_(
+                        DNSServerOptions.dot_enabled.is_(True),
+                        DNSServerOptions.doh_enabled.is_(True),
+                    ),
+                )
+                .order_by(DNSServerGroup.name)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return list(rows)
 
 
 def _deploy_if_active(row: ApplianceCertificate, key_pem: str | None) -> None:

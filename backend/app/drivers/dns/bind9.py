@@ -186,6 +186,15 @@ class BIND9Driver(DNSDriver):
             blocklists=blocklists,
             dnssec_policies=dnssec_policies,
             zone_stanzas=zone_stanzas,
+            # Issue #50 — this preview renders from ``ServerOptions`` alone,
+            # which carries the operator's intent but not the cert material
+            # (that only exists in the agent-facing bundle). Assume the cert
+            # is present so the preview shows what a correctly-configured
+            # group WILL render; the API refuses to enable a listener
+            # without a usable cert, so the two only diverge in the window
+            # after someone deletes the cert row out from under a live
+            # listener — where the agent degrades to Do53 and logs.
+            tls_cert_present=True,
         )
 
     def render_zone_config(self, zone: ZoneData) -> str:

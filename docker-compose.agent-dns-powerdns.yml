@@ -77,6 +77,13 @@ services:
       # ``DNS_HOST_PORT=5353`` in .env.
       - "${DNS_HOST_PORT:-1053}:53/udp"
       - "${DNS_HOST_PORT:-1053}:53/tcp"
+      # No DoT / DoH ports here (#50): pdns Authoritative speaks neither
+      # protocol. On the PowerDNS driver those listeners live on the
+      # dnsdist front, which this standalone agent file doesn't deploy —
+      # so enabling DoT/DoH for a group served only by THIS stack has no
+      # effect. Use the main docker-compose.yml with both the
+      # ``dns-powerdns`` and ``dns-powerdns-with-dnsdist`` profiles, or
+      # run BIND9, which serves both natively.
 
 networks:
   spatiumddi-agent:
