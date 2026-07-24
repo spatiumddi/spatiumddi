@@ -432,6 +432,50 @@ class DNSServerOptions(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     dnsdist_dynblock_qps: Mapped[int | None] = mapped_column(Integer, nullable=True)
     dnsdist_dynblock_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=60)
 
+    # ── Encrypted DNS transports (issue #50) ───────────────────────────────
+    # Inbound: serve DoT / DoH to local clients alongside Do53 (the plain
+    # :53 listener always stays up — these are additive). Outbound: forward
+    # to upstream resolvers over TLS instead of plaintext 53. Every knob
+    # defaults to a no-op so an existing install renders a byte-identical
+    # named.conf until an operator opts in (same discipline as the RRL
+    # block above).
+    dot_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    dot_port: Mapped[int] = mapped_column(Integer, nullable=False, default=853)
+    doh_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # 443 is the RFC 8484 default. On a full-stack appliance the frontend
+    # already owns 443, so the API refuses to co-locate them (see
+    # ``_assert_encrypted_transport_sane``) and operators pick another port.
+    doh_port: Mapped[int] = mapped_column(Integer, nullable=False, default=443)
+    doh_path: Mapped[str] = mapped_column(String(128), nullable=False, default="/dns-query")
+
+    # Cert served by BOTH listeners. SET NULL rather than CASCADE: deleting a
+    # certificate must not delete the whole options row. A NULL id with a
+    # listener still flagged on means the cert was deleted out from under
+    # us — the renderer skips the listener and logs rather than emitting an
+    # unloadable ``tls`` block that would take the whole daemon down.
+    tls_certificate_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("appliance_certificate.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    # Outbound forwarding transport — do53 | tls. BIND 9.20 can forward over
+    # DoT but NOT over DoH (there is no client-side HTTP transport), so
+    # "https" is deliberately not a value here; the PowerDNS/dnsdist path
+    # gets DoH-upstream separately.
+    forward_transport: Mapped[str] = mapped_column(String(10), nullable=False, default="do53")
+    # ``remote-hostname`` for strict upstream cert validation. Group-level
+    # rather than per-forwarder because the common case is one provider's
+    # anycast pair (1.1.1.1 + 1.0.0.1 both present cloudflare-dns.com).
+    # Mixing providers in one group means one of them fails validation —
+    # use one group per provider.
+    forward_tls_hostname: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Off = encrypt without authenticating the upstream (opportunistic DoT).
+    # Still beats plaintext against a passive observer, but not against an
+    # active MITM — hence default-on.
+    forward_tls_verify: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
     group: Mapped["DNSServerGroup"] = relationship("DNSServerGroup", back_populates="options")
     trust_anchors: Mapped[list["DNSTrustAnchor"]] = relationship(
         "DNSTrustAnchor", back_populates="server_options", cascade="all, delete-orphan"

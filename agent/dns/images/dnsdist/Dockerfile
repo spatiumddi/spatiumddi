@@ -13,8 +13,11 @@ FROM alpine:3.23 AS runtime
 # Trivy would then flag (mirrors the powerdns image rationale).
 RUN apk upgrade --no-cache \
     && apk add --no-cache dnsdist libcap bash tini \
-    && addgroup -S spatium \
-    && adduser -S -G spatium -h /var/lib/dnsdist spatium \
+    # uid/gid PINNED (#50) — must match the powerdns image, whose agent
+    # writes the DoT/DoH listener key at mode 0600 into the volume this
+    # container mounts read-only. See the matching note there.
+    && addgroup -S -g 102 spatium \
+    && adduser -S -u 101 -G spatium -h /var/lib/dnsdist spatium \
     # dnsdist binds :53 as the unprivileged spatium user.
     && setcap cap_net_bind_service=+ep /usr/sbin/dnsdist 2>/dev/null \
        || setcap cap_net_bind_service=+ep /usr/bin/dnsdist

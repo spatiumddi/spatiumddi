@@ -65,8 +65,16 @@ RUN apk upgrade --no-cache \
       ca-certificates tzdata \
       'libcrypto3>=3.5.7-r0' 'libssl3>=3.5.7-r0' \
  && setcap cap_net_bind_service=+ep /usr/sbin/pdns_server \
- && addgroup -S spatium \
- && adduser -S -G spatium spatium \
+    # uid/gid PINNED (#50). The dnsdist front container reads the DoT/DoH
+    # listener key this image writes at mode 0600 through a shared volume,
+    # so the two must agree on the uid. Both landed on 101:102 by accident
+    # of package ordering; pinning makes a future package that creates a
+    # system user fail the BUILD loudly instead of silently shifting the
+    # uid and breaking TLS at runtime (dnsdist --check-config never opens
+    # the PEM, so the failure would only surface as a fatal daemon start).
+    # Also matches the on-disk ownership of existing state volumes.
+ && addgroup -S -g 102 spatium \
+ && adduser -S -u 101 -G spatium spatium \
  && mkdir -p /var/lib/spatium-dns-agent /var/lib/powerdns /var/run/pdns \
  && chown -R spatium:spatium /var/lib/spatium-dns-agent /var/lib/powerdns /var/run/pdns \
  && { \

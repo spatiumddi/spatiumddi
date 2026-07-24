@@ -60,6 +60,19 @@ spec:
             - name: dns-tcp
               containerPort: 53
               protocol: TCP
+            # Encrypted transports — DoT / DoH (issue #50). Commented out
+            # because both listeners ship OFF; the ports are configured in
+            # the database (DNS → Server Groups → Options → Encrypted
+            # transports) and the agent renders named.conf from the config
+            # bundle, not from this manifest. Uncomment once a listener is
+            # enabled, matching the ports you chose there, and add the same
+            # entries to service-dns.yaml so they're routable.
+            # - name: dns-dot
+            #   containerPort: 853
+            #   protocol: TCP
+            # - name: dns-doh
+            #   containerPort: 8443
+            #   protocol: TCP
           resources:
             requests: { cpu: 100m, memory: 128Mi }
             limits:   { cpu: 500m, memory: 512Mi }

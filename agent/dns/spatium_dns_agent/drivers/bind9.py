@@ -32,11 +32,11 @@ from .base import DriverBase
 log = structlog.get_logger(__name__)
 
 NAMED_CONF_SKELETON = """\
-options {{
+{tls_statements}options {{
     directory "/var/cache/bind";
     listen-on {{ any; }};
     listen-on-v6 {{ any; }};
-    recursion {recursion};
+{encrypted_listeners}    recursion {recursion};
     allow-query {{ {allow_query}; }};
     dnssec-validation {dnssec};
     key-directory "/var/cache/bind/keys";
@@ -206,6 +206,136 @@ def _render_rate_limit_block(opts: dict[str, Any]) -> str:
     return ("\n" + "\n".join(lines)) if lines else ""
 
 
+# ── Encrypted transports (issue #50) ────────────────────────────────────────
+# Stable on-disk paths for the listener cert. Written outside ``rendered.new``
+# (like the TSIG key) so the atomic rendered-dir swap can't leave named.conf
+# pointing at a path that's mid-rename.
+TLS_DIR_NAME = "tls"
+TLS_CERT_FILENAME = "listener.crt"
+TLS_KEY_FILENAME = "listener.key"
+
+# named.conf identifiers for the tls/http statements we generate. Prefixed so
+# they can't collide with anything an operator ever gets to name.
+_LOCAL_TLS_ID = "spatium-local-tls"
+_LOCAL_HTTP_ID = "spatium-local-http"
+_UPSTREAM_TLS_ID = "spatium-upstream-tls"
+
+# CA bundle shipped by Alpine's ca-certificates package (installed in the
+# bind9 agent image) — used to validate the UPSTREAM's certificate when
+# forwarding over DoT with verification on.
+_CA_BUNDLE_PATH = "/etc/ssl/certs/ca-certificates.crt"
+
+# Protocol floor applied to both the listener and the upstream statement.
+# Also keeps the ``tls`` block non-empty in the opportunistic-DoT case
+# (verification off ⇒ no ca-file / remote-hostname), which BIND rejects.
+_TLS_PROTOCOLS_LINE = "    protocols { TLSv1.2; TLSv1.3; };"
+
+
+def _dot_listener_active(opts: dict[str, Any], has_cert: bool) -> bool:
+    return bool(opts.get("dot_enabled")) and has_cert
+
+
+def _doh_listener_active(opts: dict[str, Any], has_cert: bool) -> bool:
+    return bool(opts.get("doh_enabled")) and has_cert
+
+
+def _forward_over_tls(opts: dict[str, Any]) -> bool:
+    return (opts.get("forward_transport") or "do53") == "tls"
+
+
+def _render_tls_statements(opts: dict[str, Any], state_dir: Path, has_cert: bool) -> str:
+    """Top-level ``tls`` / ``http`` statements for the encrypted transports.
+
+    Returns "" when nothing is enabled so an install that never opted in
+    renders a byte-identical named.conf.
+
+    ``has_cert`` is deliberately separate from the operator's enable flags:
+    the cert lives in ``appliance_certificate`` with ``ON DELETE SET NULL``,
+    so it can vanish while the flags stay on. Emitting a ``tls`` block whose
+    ``cert-file`` doesn't exist makes named refuse to start — losing Do53
+    too. Degrading to Do53-only is the safe failure direction.
+    """
+    blocks: list[str] = []
+
+    if _dot_listener_active(opts, has_cert) or _doh_listener_active(opts, has_cert):
+        cert_path = state_dir / TLS_DIR_NAME / TLS_CERT_FILENAME
+        key_path = state_dir / TLS_DIR_NAME / TLS_KEY_FILENAME
+        blocks.append(
+            f"tls {_LOCAL_TLS_ID} {{\n"
+            f'    cert-file "{cert_path}";\n'
+            f'    key-file "{key_path}";\n'
+            f"{_TLS_PROTOCOLS_LINE}\n"
+            f"}};\n"
+        )
+
+    if _doh_listener_active(opts, has_cert):
+        path = (opts.get("doh_path") or "/dns-query").strip()
+        blocks.append(f"http {_LOCAL_HTTP_ID} {{\n    endpoints {{ \"{path}\"; }};\n}};\n")
+
+    if _forward_over_tls(opts):
+        lines = [f"tls {_UPSTREAM_TLS_ID} {{"]
+        # Strict validation needs BOTH a trust store to chain against and a
+        # name to match. The control plane refuses verify-on without a
+        # hostname, but re-check here — the agent must never silently
+        # downgrade a config it can't render faithfully.
+        hostname = (opts.get("forward_tls_hostname") or "").strip()
+        if opts.get("forward_tls_verify", True) and hostname:
+            lines.append(f'    ca-file "{_CA_BUNDLE_PATH}";')
+            lines.append(f'    remote-hostname "{hostname}";')
+        lines.append(_TLS_PROTOCOLS_LINE)
+        lines.append("};\n")
+        blocks.append("\n".join(lines))
+
+    return ("\n".join(blocks) + "\n") if blocks else ""
+
+
+def _render_encrypted_listeners(opts: dict[str, Any], has_cert: bool) -> str:
+    """``listen-on`` clauses for DoT / DoH, rendered inside ``options {}``.
+
+    Additive — the plain ``listen-on { any; }`` pair above these stays, so
+    Do53 clients are unaffected by turning an encrypted transport on.
+    """
+    lines: list[str] = []
+    if _dot_listener_active(opts, has_cert):
+        port = int(opts.get("dot_port", 853))
+        for directive in ("listen-on", "listen-on-v6"):
+            lines.append(f"    {directive} port {port} tls {_LOCAL_TLS_ID} {{ any; }};")
+    if _doh_listener_active(opts, has_cert):
+        port = int(opts.get("doh_port", 443))
+        for directive in ("listen-on", "listen-on-v6"):
+            lines.append(
+                f"    {directive} port {port} tls {_LOCAL_TLS_ID} "
+                f"http {_LOCAL_HTTP_ID} {{ any; }};"
+            )
+    return ("\n".join(lines) + "\n") if lines else ""
+
+
+def _format_forwarder(entry: str, opts: dict[str, Any]) -> str:
+    """Render one ``forwarders`` token, honouring the upstream transport.
+
+    Accepts ``ip`` or ``ip@port`` (the control-plane wire shape, same as
+    ``_format_master``). Previously the raw string was emitted verbatim,
+    which rendered an unloadable ``1.1.1.1@853;`` for any entry that carried
+    a port.
+
+    Over DoT the port defaults to 853 (RFC 7858) rather than 53, so an
+    operator who flips the transport without editing every forwarder gets a
+    working config instead of a TLS handshake against a Do53 port.
+    """
+    ip, _, port = entry.strip().partition("@")
+    ip = ip.strip()
+    port = port.strip()
+    over_tls = _forward_over_tls(opts)
+    if not port.isdigit():
+        port = "853" if over_tls else ""
+    out = ip
+    if port:
+        out += f" port {port}"
+    if over_tls:
+        out += f" tls {_UPSTREAM_TLS_ID}"
+    return out
+
+
 def _lifetime(days: int) -> str:
     """BIND ``lifetime`` token — 0 ⇒ unlimited, else ``<days>d``."""
     return "unlimited" if not days else f"{int(days)}d"
@@ -354,9 +484,25 @@ class Bind9Driver(DriverBase):
         # disable validation when blocklists are present.
         if bundle.get("blocklists"):
             dnssec = "no"
+        # Encrypted transports (issue #50). ``has_cert`` gates the listeners
+        # on cert material actually being present in the bundle, not just on
+        # the operator's intent flag — see _render_tls_statements.
+        tls_cert = bundle.get("tls_cert") or None
+        has_cert = bool(
+            isinstance(tls_cert, dict) and tls_cert.get("cert_pem") and tls_cert.get("key_pem")
+        )
+        if (opts.get("dot_enabled") or opts.get("doh_enabled")) and not has_cert:
+            log.warning(
+                "bind9_encrypted_listener_skipped_no_cert",
+                dot_enabled=bool(opts.get("dot_enabled")),
+                doh_enabled=bool(opts.get("doh_enabled")),
+            )
+
         fwd_block = ""
         if forwarders:
-            fwd_block = "    forwarders {{ {fs}; }};\n".format(fs="; ".join(forwarders))
+            fwd_block = "    forwarders {{ {fs}; }};\n".format(
+                fs="; ".join(_format_forwarder(str(f), opts) for f in forwarders)
+            )
 
         tsig_keys = bundle.get("tsig_keys") or []
         tsig_key_name = tsig_keys[0]["name"] if tsig_keys else None
@@ -399,6 +545,8 @@ class Bind9Driver(DriverBase):
             rate_limit=_render_rate_limit_block(opts),
             logging_block=logging_block,
             tsig_include=tsig_include,
+            tls_statements=_render_tls_statements(opts, self.state_dir, has_cert),
+            encrypted_listeners=_render_encrypted_listeners(opts, has_cert),
         )
 
         # Explicit controls block keyed off the agent-generated rndc.key
@@ -437,8 +585,13 @@ class Bind9Driver(DriverBase):
                 return ""
             zone_type = zone.get("type", "primary")
             # Forward zones: just a forwarders block, no file / allow-update.
+            # Per-zone upstreams inherit the group's forward transport
+            # (issue #50) — a group forwarding over DoT shouldn't silently
+            # fall back to plaintext for its zone-scoped upstreams.
             if zone_type == "forward":
-                fwds = [str(f) for f in (zone.get("forwarders") or []) if f]
+                fwds = [
+                    _format_forwarder(str(f), opts) for f in (zone.get("forwarders") or []) if f
+                ]
                 if not fwds:
                     return ""
                 policy = "only" if bool(zone.get("forward_only", True)) else "first"
@@ -654,6 +807,54 @@ class Bind9Driver(DriverBase):
             finally:
                 os.close(fd)
             tsig_tmp.replace(tsig_file)
+
+        # DoT / DoH listener cert (issue #50) — written to the stable
+        # tls/ paths the ``tls`` statement above points at. Same atomic
+        # 0600 write as the TSIG key: the private key must never exist
+        # world-readable, not even for the window between create + chmod.
+        #
+        # Only the key is really secret, but both go through the same path
+        # so a partially-written pair can't be picked up by a reload racing
+        # this write.
+        self._write_listener_cert(tls_cert if has_cert else None)
+
+    def _write_listener_cert(self, tls_cert: dict[str, Any] | None) -> None:
+        """Write (or remove) the DoT/DoH listener cert pair.
+
+        ``None`` means no usable cert in the bundle — the listener was
+        disabled, or the certificate row was deleted (the FK is ON DELETE
+        SET NULL). Remove the pair rather than leaving it: a private key
+        that outlives the feature that put it there is exactly the kind of
+        thing that ends up in a backup or a hostPath snapshot long after
+        anyone remembers it exists.
+
+        Mirrors ``PowerDNSDriver._write_listener_cert``.
+        """
+        tls_dir = self.state_dir / TLS_DIR_NAME
+        if tls_cert is None:
+            for filename in (TLS_CERT_FILENAME, TLS_KEY_FILENAME):
+                stale = tls_dir / filename
+                if stale.exists():
+                    stale.unlink()
+            return
+
+        tls_dir.mkdir(parents=True, exist_ok=True)
+        for filename, material in (
+            (TLS_CERT_FILENAME, str(tls_cert.get("cert_pem") or "")),
+            (TLS_KEY_FILENAME, str(tls_cert.get("key_pem") or "")),
+        ):
+            dest = tls_dir / filename
+            tmp = dest.with_suffix(dest.suffix + ".new")
+            fd = os.open(
+                str(tmp),
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+                0o600,
+            )
+            try:
+                os.write(fd, material.encode())
+            finally:
+                os.close(fd)
+            tmp.replace(dest)
 
     def _write_catalog_zone_file(self, path: Path, catalog: dict[str, Any]) -> None:
         """Render a BIND9 catalog zone file per RFC 9432.

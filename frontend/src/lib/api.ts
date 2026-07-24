@@ -4735,6 +4735,19 @@ export interface DNSServerOptions {
   dnsdist_action: string;
   dnsdist_dynblock_qps: number | null;
   dnsdist_dynblock_seconds: number;
+  // Encrypted transports (issue #50). Inbound DoT/DoH listeners are
+  // additive — plain Do53 on :53 is unaffected. forward_transport is
+  // "do53" | "tls"; BIND has no client-side HTTP transport so there is no
+  // DoH-upstream option.
+  dot_enabled: boolean;
+  dot_port: number;
+  doh_enabled: boolean;
+  doh_port: number;
+  doh_path: string;
+  tls_certificate_id: string | null;
+  forward_transport: string;
+  forward_tls_hostname: string | null;
+  forward_tls_verify: boolean;
   trust_anchors: DNSTrustAnchor[];
   modified_at: string;
 }

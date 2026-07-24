@@ -233,6 +233,30 @@ Mixed-driver groups are rejected by the control plane for the
 PowerDNS-only features (DNSSEC sign/unsign, ALIAS, LUA, catalog
 zones); spin up a separate group per driver.
 
+### Encrypted transports — DoT / DoH (issue #50)
+
+Both listeners are **off by default** and configured per server group in
+the UI (DNS → Server Groups → Options → Encrypted transports), not in
+Kubernetes: the agent renders `named.conf` from the config bundle it
+long-polls, so nothing here turns them on.
+
+What the manifests *do* control is whether the listener is reachable —
+the containerPort + Service port have to be declared to route through the
+Service and to be visible to any NetworkPolicy. Set them to **match** the
+ports configured in the UI:
+
+```bash
+--set-json 'dnsAgents.servers=[{"name":"ns1","role":"primary","group":"internal-resolvers","dotPort":853,"dohPort":8443}]'
+```
+
+On the static-manifest path, uncomment the `dns-dot` / `dns-doh` blocks in
+both `k8s/dns/bind9-statefulset.yaml` and `k8s/dns/service-dns.yaml`.
+
+Prefer 8443 over the RFC 8484 default of 443 for DoH unless you know 443
+is free — an Ingress controller usually already holds it. BIND9 serves
+both protocols natively; on the PowerDNS flavor they run on the dnsdist
+front, which has no Kubernetes deployment yet (docker-compose only).
+
 ### How servers register
 
 On first boot each agent:

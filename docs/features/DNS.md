@@ -1273,3 +1273,168 @@ across every server in a group happens on the next full re-render, not
 instantly (ingested rows aren't re-shipped as per-server record ops). The
 record is durable + visible immediately; other servers converge on their
 next structural reload.
+
+---
+
+## 20. Encrypted transports — DoT / DoH + encrypted forwarding (issue #50)
+
+Two independent halves, each default-off so an existing install renders a
+byte-identical `named.conf` until an operator opts in:
+
+* **Inbound** — serve DNS-over-TLS (RFC 7858) and DNS-over-HTTPS
+  (RFC 8484) to local clients.
+* **Outbound** — forward to upstream resolvers over TLS instead of
+  plaintext port 53.
+
+Both are configured per **server group** under DNS → group → Options →
+*Encrypted transports*, and both are **additive**: the plain Do53 listener
+on :53 stays up, so turning DoT on never cuts off existing clients.
+
+### 20.1 Certificates
+
+The listeners serve a certificate from the existing
+`appliance_certificate` store — the same one behind the Web UI cert and
+the embedded ACME client (#438). Issue or upload once under
+Appliance → Web UI Certificate, then point the group at it
+(`dns_server_options.tls_certificate_id`).
+
+The FK is `ON DELETE SET NULL`, so deleting a certificate can never delete
+a group's options row. That leaves one state worth understanding: listener
+flags on, certificate gone. **Both agent renderers treat that as
+listener-off** and the server keeps serving Do53. This is deliberate — a
+`tls` block whose `cert-file` doesn't exist makes `named` refuse to start,
+which would take plain DNS down too. Degrading is the safe direction; the
+agent logs `bind9_encrypted_listener_skipped_no_cert`.
+
+Renewal rewrites `cert_pem` **in place** on the same row, so the group's
+pointer stays valid. The cert material rides inside the hashed config
+bundle, which means a rotation shifts the ETag and the long-poll delivers
+it; `app.services.dns.cert_rotation.wake_dns_groups_serving_cert` publishes
+an advisory wake from both the ACME renewal task and the manual
+paste-back-signed-cert path so it lands in seconds rather than on the
+safety tick.
+
+### 20.2 Ports
+
+| Knob | Default | Notes |
+|---|---|---|
+| `dot_port` | 853 | RFC 7858. |
+| `doh_port` | 443 | RFC 8484 — but see below. |
+| `doh_path` | `/dns-query` | Must be absolute; enforced by BIND's `endpoints`. |
+
+The API rejects a listener on port 53 (the Do53 listener already binds
+it), DoT and DoH sharing a port, and — **on appliance installs only** —
+DoH on 443, where the web UI already serves HTTPS and the DNS workload
+runs with `hostNetwork`. Use 8443 there and publish it in the DoH URL you
+hand clients. Docker / Kubernetes operators own their own topology, so
+443 is allowed there.
+
+Firewall: DoT/DoH ports are operator-chosen, so unlike Do53's fixed 53
+they can't live in the supervisor's static per-role port table. The
+control plane derives the live ports from the assigned group's options
+(only when a certificate is actually linked) and ships them on the role
+assignment as `dns_encrypted_tcp_ports`; the supervisor opens exactly
+those, so turning a listener off closes its port on the next apply.
+
+### 20.2.1 Reaching the listener — per deployment
+
+The listener port lives in the **database**. Everything below is about
+making that port reachable from outside the DNS process, and each
+topology needs a different thing:
+
+| Deployment | What to change | 443 conflict? |
+|---|---|---|
+| **Appliance (k3s)** | Nothing — the DNS workload is `hostNetwork`, so it binds the host directly. The supervisor opens the port automatically (above). | **Yes** — the web UI owns 80/443. The API rejects either listener on those ports here; use 8443. |
+| **Docker Compose (main stack)** | Add the `docker-compose.dns-encrypted.yml` overlay. | **No** — the frontend publishes `${HTTP_PORT:-8077}:80` and never binds 443. Container-side 443 is private to the DNS container. |
+| **Compose (standalone agent files)** | Uncomment the two port lines in `docker-compose.agent-dns-bind9.yml`. PowerDNS's standalone file has no dnsdist front, so DoT/DoH is unavailable there. | No. |
+| **Kubernetes / Helm** | Set `dnsBind9.dotPort` / `dohPort` (appliance chart) or per-server `dotPort` / `dohPort` (umbrella chart) to declare the containerPort + Service port. Raw manifests: uncomment the blocks in `k8s/dns/`. | Depends on your Ingress/LoadBalancer — you own the topology, so 443 is allowed. |
+
+```bash
+docker compose -f docker-compose.yml \
+               -f docker-compose.dns-encrypted.yml \
+               --profile dns-bind9 up -d
+```
+
+The ports are an **overlay**, not part of the base compose file, because
+Compose cannot publish conditionally: binding 853 / 443 unconditionally
+would break `up -d` on any host already using them — for a feature that
+ships off by default. Opting in keeps the base stack a true no-op, the
+same discipline the rest of #50 follows.
+
+The vars split host and container side deliberately:
+
+```
+- "${DNS_DOT_HOST_PORT:-1853}:${DNS_DOT_PORT:-853}/tcp"
+- "${DNS_DOH_HOST_PORT:-8443}:${DNS_DOH_PORT:-443}/tcp"
+```
+
+The **container** side must match the port configured in the UI — the
+agent renders `named.conf` from the DB, not from these variables, so a
+mismatch publishes a mapping to a port nothing is listening on. The
+**host** side is just where it lands; the DoH default is 8443 so nothing
+has to bind a privileged port. All six variables are documented in
+`.env.example`.
+
+### 20.3 Upstream forwarding
+
+`forward_transport` is `do53` (default) or `tls`. There is deliberately no
+`https` value: **BIND has no client-side HTTP transport**, so DoH-upstream
+is not expressible on the BIND9 driver.
+
+With `tls`, forwarders default to port 853 unless an entry pins its own
+(`ip@port`), and each renders with the generated `tls spatium-upstream-tls`
+statement. Per-zone forwarders on `type forward` zones inherit the same
+transport — a group forwarding over DoT shouldn't silently fall back to
+plaintext for its zone-scoped upstreams.
+
+`forward_tls_verify` (default on) adds `ca-file` + `remote-hostname` for
+strict validation, and the API refuses verification-on without a hostname
+— there would be no name to check the upstream certificate against.
+Verification failures **fail closed** (SERVFAIL), never a silent downgrade
+to plaintext. Turning verification off gives opportunistic DoT: encrypted
+against a passive observer, but not against an active on-path attacker.
+
+One hostname applies to every forwarder in the group, because the common
+case is a single provider's anycast pair (1.1.1.1 + 1.0.0.1 both present
+`cloudflare-dns.com`). Mixing providers means one of them fails
+validation — use one group per provider.
+
+### 20.4 Driver support
+
+| Driver | Inbound DoT / DoH | Outbound over TLS |
+|---|---|---|
+| **BIND9** | Native (`tls` + `http` statements) | Yes (`forwarders { … tls … }`) |
+| **PowerDNS** | Via the dnsdist front (#146 Phase 2) | N/A — pdns Authoritative doesn't recurse or forward |
+| Windows DNS, cloud drivers | Not supported — we don't run their listeners | — |
+
+On PowerDNS the listeners are `addTLSLocal` / `addDOHLocal` on the dnsdist
+sidecar, which terminates TLS and forwards plaintext to pdns over the
+container network. That front is **docker-compose-only** today (see
+`charts/spatiumddi-appliance/values.yaml`), so DoT/DoH on the PowerDNS
+driver is docker-compose-only too. BIND9 needs no sidecar.
+
+One dnsdist-specific hazard worth recording: `dnsdist --check-config`
+reports OK for a config whose `addTLSLocal` cert path doesn't exist, and
+the daemon then dies *fatally* on real startup. Because the front's reload
+loop stops the running instance before starting the new one, trusting
+`--check-config` alone would take the whole front down — Do53 included —
+on nothing worse than a half-written cert. The entrypoint therefore
+pre-flights every `*.crt` / `*.key` path referenced by the rendered rules
+and keeps the current instance serving if any is unreadable.
+
+### 20.5 Verifying
+
+```bash
+# DoT, with strict validation
+kdig +tls @dns.example.com -p 853 www.example.com A
+dig +tls +tls-hostname=dns.example.com @<ip> -p 853 www.example.com A
+
+# DoH
+dig +https=/dns-query @<ip> -p 8443 www.example.com A
+curl -H 'accept: application/dns-message' \
+     'https://dns.example.com:8443/dns-query?dns=<base64url-query>'
+
+# Upstream is genuinely encrypted — capture on the upstream link and
+# confirm no plaintext :53 leaves the box
+tcpdump -ni any 'port 53'
+```

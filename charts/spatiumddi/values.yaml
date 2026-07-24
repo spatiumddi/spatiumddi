@@ -613,6 +613,15 @@ dnsAgents:
     #   resources:
     #     requests: { cpu: 100m, memory: 128Mi }
     #     limits:   { cpu: 500m, memory: 512Mi }
+    #   # Encrypted transports — DoT / DoH (issue #50). Both OFF by default.
+    #   # The listener ports are configured in the DATABASE (DNS → Server
+    #   # Groups → Options → Encrypted transports) — the agent renders
+    #   # named.conf from the config bundle, not from these values. Set
+    #   # these to MATCH the ports you chose there; they only declare the
+    #   # containerPort + Service port so the listener is routable through
+    #   # the Service and visible to NetworkPolicy. Omit = not declared.
+    #   dotPort: 853
+    #   dohPort: 8443            # 443 usually collides with an Ingress
     # - name: ns1-pdns
     #   flavor: powerdns         # PowerDNS group; LMDB-backed zone storage
     #   role: primary

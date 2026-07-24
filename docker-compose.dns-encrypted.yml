@@ -1,0 +1,51 @@
+# Encrypted DNS transports — DoT / DoH host-port publishing (issue #50).
+#
+# Overlay for operators who have turned DoT and/or DoH on for a server
+# group under DNS → Server Groups → Options → Encrypted transports.
+#
+#   docker compose -f docker-compose.yml \
+#                  -f docker-compose.dns-encrypted.yml \
+#                  --profile dns-bind9 up -d
+#
+# Why an overlay rather than ports in the base file: Compose cannot publish
+# a port conditionally, so binding 853 / 443 unconditionally would break
+# `up -d` on any host already using them — for a feature that ships off by
+# default. Opting in here keeps the base stack a true no-op (the same
+# discipline the rest of #50 follows: an untouched install renders a
+# byte-identical named.conf).
+#
+# ── The one rule that matters ────────────────────────────────────────────
+# The CONTAINER-side port must match what the group is configured for in
+# the UI. The agent renders named.conf from the database, not from these
+# variables — set DNS_DOT_PORT / DNS_DOH_PORT to whatever you chose there,
+# or the published mapping points at a port nothing is listening on.
+#
+# The HOST side is just where it lands; change it freely if the default is
+# taken. DoH defaults to host 8443 rather than 443 so nothing has to bind a
+# privileged port, and because 443 is usually already spoken for.
+#
+#   DNS_DOT_PORT            container port for DoT   (UI value, default 853)
+#   DNS_DOH_PORT            container port for DoH   (UI value, default 443)
+#   DNS_DOT_HOST_PORT       host port for DoT        (default 1853)
+#   DNS_DOH_HOST_PORT       host port for DoH        (default 8443)
+#   DNS_DOT_HOST_PORT_PDNS  host port, PowerDNS path (default 5853)
+#   DNS_DOH_HOST_PORT_PDNS  host port, PowerDNS path (default 5444)
+#
+# Compose MERGES port lists across files, so these add to the base :53
+# mappings rather than replacing them — do not repeat the :53 entries here.
+
+services:
+  # BIND9 serves DoT + DoH natively.
+  dns-bind9:
+    ports:
+      - "${DNS_DOT_HOST_PORT:-1853}:${DNS_DOT_PORT:-853}/tcp"
+      - "${DNS_DOH_HOST_PORT:-8443}:${DNS_DOH_PORT:-443}/tcp"
+
+  # PowerDNS Authoritative speaks neither protocol, so on that driver the
+  # listeners run on the dnsdist front, which terminates TLS and forwards
+  # plaintext to pdns:53. Nothing to publish on dns-powerdns itself.
+  # Requires the dns-powerdns-with-dnsdist profile.
+  dns-dnsdist:
+    ports:
+      - "${DNS_DOT_HOST_PORT_PDNS:-5853}:${DNS_DOT_PORT:-853}/tcp"
+      - "${DNS_DOH_HOST_PORT_PDNS:-5444}:${DNS_DOH_PORT:-443}/tcp"

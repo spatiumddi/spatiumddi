@@ -70,6 +70,16 @@ dnsBind9:
   # (wiped on restart → loses the cache). The old /var/named/{data,keys}
   # mounts were dropped — bind9 never wrote to them. No size knob —
   # hostPath grows with /var.
+  #
+  # #50 — encrypted transports. The listeners are configured in the DB
+  # (DNS → group → options), NOT here: the agent renders named.conf from
+  # the config bundle, and this pod is hostNetwork so it binds the host
+  # regardless of what the manifest declares. Set these to MATCH the
+  # group's configured ports so they show up in `kubectl get svc`, get
+  # routed by the MetalLB VIP Service, and are visible to any
+  # NetworkPolicy. Empty = not declared (the default: DoT/DoH are off).
+  dotPort: ""   # e.g. 853
+  dohPort: ""   # e.g. 8443 — 443 collides with the appliance web UI
 
 # DNS — PowerDNS backend. Same shape as dnsBind9.
 dnsPowerdns:
@@ -83,6 +93,9 @@ dnsPowerdns:
   # The dnsdist front (#146 Phase 2) is docker-compose-only for now — see the
   # note in templates/dns-powerdns.yaml. k8s/appliance support (a dnsdist
   # Deployment fronting the hostNetwork pdns DaemonSet) is a follow-up.
+  # #50 — that same gap means DoT/DoH on the PowerDNS driver is
+  # docker-compose-only too: pdns auth speaks neither protocol, so the
+  # listeners live on the dnsdist front. BIND9 needs no such sidecar.
 
 # DHCP — Kea backend. DaemonSet (single node) with ``hostNetwork:
 # true`` + ``CAP_NET_BIND_SERVICE`` so Kea sees DHCP-discover

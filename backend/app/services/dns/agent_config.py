@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.crypto import decrypt_str
+from app.models.appliance import ApplianceCertificate
 from app.models.dns import (
     DNSAcl,
     DNSRecord,
@@ -418,6 +419,19 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
         "dnsdist_dynblock_seconds": (
             int(getattr(opts, "dnsdist_dynblock_seconds", 60)) if opts else 60
         ),
+        # Encrypted transports (issue #50). The listener flags below are the
+        # operator's *intent*; the renderer additionally requires cert
+        # material to actually be present (see ``tls_cert``) before it emits
+        # a listener, so a deleted cert degrades to Do53-only rather than to
+        # a daemon that won't start.
+        "dot_enabled": (bool(getattr(opts, "dot_enabled", False)) if opts else False),
+        "dot_port": int(getattr(opts, "dot_port", 853)) if opts else 853,
+        "doh_enabled": (bool(getattr(opts, "doh_enabled", False)) if opts else False),
+        "doh_port": int(getattr(opts, "doh_port", 443)) if opts else 443,
+        "doh_path": (getattr(opts, "doh_path", "/dns-query") if opts else "/dns-query"),
+        "forward_transport": (getattr(opts, "forward_transport", "do53") if opts else "do53"),
+        "forward_tls_hostname": (getattr(opts, "forward_tls_hostname", None) if opts else None),
+        "forward_tls_verify": (bool(getattr(opts, "forward_tls_verify", True)) if opts else True),
     }
     # Built from the unified descriptor list so operator split-horizon
     # views (issue #24), synthesized geo views + the geo catch-all
@@ -588,6 +602,52 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
         if p.name != "default" and p.name in _referenced_policy_names
     ]
 
+    # TLS cert material for the DoT / DoH listeners (issue #50). Loaded only
+    # when a listener is actually on, so a group that never enabled encrypted
+    # transports keeps a cert-free bundle (and an unchanged etag) even if an
+    # operator later points ``tls_certificate_id`` at something.
+    #
+    # The PEM + key ride inside the bundle body — same trust model as the
+    # TSIG secrets already shipped above — and land in the structural
+    # fingerprint below so a cert ROTATION shifts the etag and the long-poll
+    # actually delivers the new material. Without that, a renewed cert would
+    # sit in the DB while the agent kept serving the expired one.
+    #
+    # ``populate_existing=True`` is load-bearing, not a style choice: the
+    # long-poll holds ONE session across its whole wait and re-builds the
+    # bundle on every wake, and the sessionmaker sets expire_on_commit=False.
+    # A plain ``db.get()`` would hand back the identity-mapped instance with
+    # the pre-renewal PEM and emit no SQL, so the etag wouldn't move and the
+    # rotation wake would buy nothing.
+    tls_cert_block: dict[str, Any] | None = None
+    if opts is not None and (opts.dot_enabled or opts.doh_enabled) and opts.tls_certificate_id:
+        cert_row = (
+            await db.execute(
+                select(ApplianceCertificate)
+                .where(ApplianceCertificate.id == opts.tls_certificate_id)
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        # cert_pem IS NULL is the canonical "CSR pending" sentinel — the
+        # operator generated a CSR but hasn't pasted the signed cert back
+        # yet, so there is nothing to serve.
+        if cert_row is not None and cert_row.cert_pem:
+            try:
+                key_pem = decrypt_str(cert_row.key_encrypted)
+            except ValueError:
+                # Same posture as the TSIG loop above: skip rather than ship
+                # a half-populated block the agent would render into an
+                # unloadable ``tls`` statement. Operator visibility is via
+                # the cert page (the row still lists) + agent logs.
+                key_pem = ""
+            if key_pem:
+                tls_cert_block = {
+                    "name": cert_row.name,
+                    "cert_pem": cert_row.cert_pem,
+                    "key_pem": key_pem,
+                    "fingerprint_sha256": cert_row.fingerprint_sha256,
+                }
+
     bundle_body: dict[str, Any] = {
         "server_id": str(server.id),
         "driver": server.driver,
@@ -604,6 +664,7 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
         "snmp_settings": snmp_block,
         "ntp_settings": ntp_block,
         "dnssec_policies": dnssec_policies_block,
+        "tls_cert": tls_cert_block,
     }
 
     # Structural fingerprint excludes records and pending ops so record-only
@@ -633,6 +694,10 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
         # Catalog membership / mode changes also rewrite named.conf and
         # the catalog zone file, so they belong in the structural set.
         "catalog": catalog_block,
+        # A cert rotation rewrites the on-disk PEM the ``tls`` statement
+        # points at; named only picks that up on reload, so the cert MUST
+        # be structural (issue #50).
+        "tls_cert": tls_cert_block,
     }
     structural_etag = _compute_etag(structural)
     bundle_body["structural_etag"] = structural_etag

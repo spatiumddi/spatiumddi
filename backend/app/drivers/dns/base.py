@@ -206,6 +206,18 @@ class ServerOptions:
     dnsdist_action: str = "truncate"
     dnsdist_dynblock_qps: int | None = None
     dnsdist_dynblock_seconds: int = 60
+    # Encrypted transports (issue #50). Inbound DoT / DoH listeners are
+    # additive — the plain :53 listener is unaffected. Outbound
+    # ``forward_transport`` is do53 | tls (BIND has no client-side HTTP
+    # transport, so DoH-upstream is not expressible here). Default-off no-op.
+    dot_enabled: bool = False
+    dot_port: int = 853
+    doh_enabled: bool = False
+    doh_port: int = 443
+    doh_path: str = "/dns-query"
+    forward_transport: str = "do53"
+    forward_tls_hostname: str | None = None
+    forward_tls_verify: bool = True
 
 
 @dataclass(frozen=True)

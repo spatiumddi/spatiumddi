@@ -167,6 +167,17 @@ def compile_firewall_body(
     for role in roles:
         role_tcp.update(_ROLE_PORTS_TCP.get(role, []))
         role_udp.update(_ROLE_PORTS_UDP.get(role, []))
+    # Issue #50 — operator-chosen DoT / DoH ports ride the role assignment
+    # rather than the static table above. Keep this block byte-identical to
+    # ``firewall_renderer.render_drop_in``.
+    if any(r in roles for r in ("dns-bind9", "dns-powerdns")):
+        for raw in role_assignment.get("dns_encrypted_tcp_ports") or []:
+            try:
+                port = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if 1 <= port <= 65535:
+                role_tcp.add(port)
     if role_udp or role_tcp:
         lines.append("")
         lines.append("# ── Per-role service ports ─────────────────────────────")

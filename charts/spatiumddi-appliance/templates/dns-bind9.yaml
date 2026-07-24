@@ -107,6 +107,23 @@ spec:
             - name: dns-tcp
               containerPort: 53
               protocol: TCP
+            {{- /* #50 — encrypted transports. The listener ports live in the
+                   DB (dns_server_options), not here: the agent renders
+                   named.conf from the config bundle, and this pod is
+                   hostNetwork so it binds the host directly regardless of
+                   what's declared. These entries exist so the ports are
+                   visible to kubectl / Service routing / network policy —
+                   set them to match the group's configured ports. */}}
+            {{- with .Values.dnsBind9.dotPort }}
+            - name: dns-dot
+              containerPort: {{ . }}
+              protocol: TCP
+            {{- end }}
+            {{- with .Values.dnsBind9.dohPort }}
+            - name: dns-doh
+              containerPort: {{ . }}
+              protocol: TCP
+            {{- end }}
           # #296 Phase A2 — readiness gates the per-node Phase 8 rolling
           # upgrade's uncordon step. A kubernetes-Ready node briefly
           # served no DNS while the new pod pulled its image + warmed
@@ -192,4 +209,14 @@ spec:
     - name: dns-tcp
       port: 53
       protocol: TCP
+    {{- with .Values.dnsBind9.dotPort }}
+    - name: dns-dot
+      port: {{ . }}
+      protocol: TCP
+    {{- end }}
+    {{- with .Values.dnsBind9.dohPort }}
+    - name: dns-doh
+      port: {{ . }}
+      protocol: TCP
+    {{- end }}
 {{- end }}

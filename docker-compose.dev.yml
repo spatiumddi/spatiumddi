@@ -246,6 +246,10 @@ services:
       - dns_bind9_state:/var/lib/spatium-dns-agent
       - dns_bind9_cache:/var/cache/bind
     ports:
+      # Compose MERGES port lists across files rather than replacing them,
+      # so the #50 DoT/DoH mappings in docker-compose.dns-encrypted.yml add
+      # to these — do NOT repeat them here, or the duplicate host port
+      # conflicts with itself and the container fails to start.
       - "1053:53/udp"
       - "1053:53/tcp"
     depends_on:

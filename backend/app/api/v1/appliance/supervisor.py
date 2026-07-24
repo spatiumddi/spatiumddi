@@ -1241,6 +1241,12 @@ class SupervisorRoleAssignment(BaseModel):
     # drive it). The supervisor's firewall renderer emits one
     # ``ip saddr { ... } tcp dport 6443 accept`` rule per heartbeat.
     kubeapi_expose_cidrs: list[str] = Field(default_factory=list)
+    # Issue #50 — TCP ports of the assigned DNS group's live DoT / DoH
+    # listeners. Operator-chosen, so they can't live in the supervisor's
+    # static per-role port table the way Do53's 53 does. Empty = no
+    # encrypted listener (or no usable cert), and the renderer opens
+    # nothing extra.
+    dns_encrypted_tcp_ports: list[int] = Field(default_factory=list)
 
 
 class SupervisorHeartbeatResponse(BaseModel):
@@ -2346,7 +2352,7 @@ async def _build_role_assignment(db: DB, row: Appliance) -> SupervisorRoleAssign
     role" (idle on the affected service)."""
     from app.config import settings as app_settings
     from app.models.dhcp import DHCPServerGroup
-    from app.models.dns import DNSServerGroup
+    from app.models.dns import DNSServerGroup, DNSServerOptions
 
     assigned_roles = list(row.assigned_roles or [])
     dns_role_assigned = "dns-bind9" in assigned_roles or "dns-powerdns" in assigned_roles
@@ -2360,10 +2366,34 @@ async def _build_role_assignment(db: DB, row: Appliance) -> SupervisorRoleAssign
         dns_engine = "powerdns"
 
     dns_group_name: str | None = None
+    # #50 — DoT / DoH listen on operator-chosen ports, so the firewall can't
+    # use a static per-role list the way Do53 does. Derive the live ports
+    # from the assigned group's options and ship them with the assignment;
+    # the supervisor's renderer opens exactly these and nothing more, so
+    # turning a listener off closes its port on the next apply.
+    dns_encrypted_tcp_ports: list[int] = []
     if row.assigned_dns_group_id is not None:
         dns_group = await db.get(DNSServerGroup, row.assigned_dns_group_id)
         if dns_group is not None:
             dns_group_name = dns_group.name
+        if dns_role_assigned:
+            dns_opts = (
+                await db.execute(
+                    select(DNSServerOptions).where(
+                        DNSServerOptions.group_id == row.assigned_dns_group_id
+                    )
+                )
+            ).scalar_one_or_none()
+            if dns_opts is not None:
+                # Gate on tls_certificate_id too: without a cert the agent
+                # renderers skip the listener entirely, so opening the port
+                # would advertise a service that isn't there.
+                if dns_opts.tls_certificate_id is not None:
+                    if dns_opts.dot_enabled:
+                        dns_encrypted_tcp_ports.append(int(dns_opts.dot_port))
+                    if dns_opts.doh_enabled:
+                        dns_encrypted_tcp_ports.append(int(dns_opts.doh_port))
+            dns_encrypted_tcp_ports = sorted(set(dns_encrypted_tcp_ports))
 
     dhcp_group_name: str | None = None
     dhcp_network_mode: str | None = None
@@ -2401,6 +2431,7 @@ async def _build_role_assignment(db: DB, row: Appliance) -> SupervisorRoleAssign
         lg_agent_key=lg_agent_key,
         firewall_extra=row.firewall_extra,
         kubeapi_expose_cidrs=list(row.kubeapi_expose_cidrs or []),
+        dns_encrypted_tcp_ports=dns_encrypted_tcp_ports,
     )
 
 

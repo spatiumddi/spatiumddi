@@ -64,6 +64,16 @@ services:
       # ``DNS_HOST_PORT=5353`` in .env.
       - "${DNS_HOST_PORT:-1053}:53/udp"
       - "${DNS_HOST_PORT:-1053}:53/tcp"
+      # Encrypted transports (#50) — DoT + DoH. NOT published by default:
+      # Compose can't publish conditionally, and binding 853 / 443 on a host
+      # that already uses them would break `up -d` for a feature that ships
+      # off. Uncomment these two lines once you've enabled a listener under
+      # DNS → Options → Encrypted transports, and make the CONTAINER side
+      # match the port you chose there (the agent renders named.conf from
+      # the database, not from these variables). As with :53 above, a real
+      # deployment usually wants ``network_mode: host`` instead.
+      # - "${DNS_DOT_HOST_PORT:-1853}:${DNS_DOT_PORT:-853}/tcp"
+      # - "${DNS_DOH_HOST_PORT:-8443}:${DNS_DOH_PORT:-443}/tcp"
 
 networks:
   spatiumddi-agent:

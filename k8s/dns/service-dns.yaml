@@ -22,6 +22,18 @@ spec:
       port: 53
       targetPort: 53
       protocol: TCP
+    # Encrypted transports — DoT / DoH (issue #50). Off by default; the
+    # ports live in the database, not here. Uncomment to match the ports
+    # configured under DNS → Server Groups → Options, and add the matching
+    # containerPorts in bind9-statefulset.yaml.
+    # - name: dns-dot
+    #   port: 853
+    #   targetPort: 853
+    #   protocol: TCP
+    # - name: dns-doh
+    #   port: 8443
+    #   targetPort: 8443
+    #   protocol: TCP
 ---
 apiVersion: v1
 kind: Service
