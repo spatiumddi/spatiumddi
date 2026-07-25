@@ -8088,6 +8088,68 @@ export interface DNSQueryAnalyticsResponse {
   top_views?: DNSQueryAnalyticsRow[];
 }
 
+/** One scored per-client DNS behaviour window (issue #699). */
+export interface DNSClientWindow {
+  id: string;
+  client_ip: string;
+  window_start: string;
+  window_end: string;
+  query_count: number;
+  distinct_qnames: number;
+  distinct_parents: number;
+  top_parent: string | null;
+  top_parent_subdomains: number;
+  max_label_length: number;
+  mean_label_entropy: number;
+  payload_qtype_count: number;
+  tunnel_score: number;
+  tunnel_signals: DNSTunnelSignal[];
+  allowlisted: boolean;
+  server_count: number;
+}
+
+export interface DNSTunnelSignal {
+  name: string;
+  value: number;
+  contribution: number;
+  detail: string;
+}
+
+export interface DNSThreatSummary {
+  windows_scored: number;
+  clients_seen: number;
+  suspicious_clients: number;
+  peak_score: number;
+  worst_client_ip: string | null;
+  worst_client_score: number | null;
+  worst_client_parent: string | null;
+  since: string;
+  /** False when the rollup has produced nothing — "no data" is not "no threats". */
+  has_data: boolean;
+}
+
+/**
+ * DNS threat analytics (#699). The whole prefix 404s unless the
+ * default-off ``security.dns_threat`` module is enabled, so callers
+ * must treat a 404 as "feature off", not as an error.
+ */
+export const dnsThreatApi = {
+  listWindows: (params?: {
+    client_ip?: string;
+    hours?: number;
+    min_score?: number;
+    include_allowlisted?: boolean;
+    limit?: number;
+  }) =>
+    api
+      .get<DNSClientWindow[]>("/dns-threat/windows", { params })
+      .then((r) => r.data),
+  summary: (params?: { hours?: number; min_score?: number }) =>
+    api
+      .get<DNSThreatSummary>("/dns-threat/summary", { params })
+      .then((r) => r.data),
+};
+
 export const logsApi = {
   listSources: () => api.get<LogSource[]>("/logs/sources").then((r) => r.data),
   listAgentSources: () =>

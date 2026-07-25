@@ -12,6 +12,7 @@ import {
   RefreshCw,
   Search,
   ScrollText,
+  ShieldAlert,
   Server,
   XCircle,
 } from "lucide-react";
@@ -26,6 +27,7 @@ import {
   type LogSource,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { DNSThreatTab } from "./logs/DNSThreatTab";
 
 /**
  * Logs page — central log viewer.
@@ -62,7 +64,7 @@ import { cn } from "@/lib/utils";
  * DC, 5 s for the agent tabs since their backing rows update live.
  */
 
-type Tab = "dns-queries" | "dhcp-activity" | "events" | "audit";
+type Tab = "dns-queries" | "dns-threat" | "dhcp-activity" | "events" | "audit";
 
 export function LogsPage() {
   const [tab, setTab] = useState<Tab>("dns-queries");
@@ -160,6 +162,13 @@ export function LogsPage() {
             count={dnsAgentSources.length || undefined}
           />
           <TabButton
+            active={tab === "dns-threat"}
+            onClick={() => setTab("dns-threat")}
+            icon={ShieldAlert}
+            label="DNS Threat"
+            hint="Per-client tunneling / exfiltration scoring over the query log. Requires the security.dns_threat module (default off — it reads query content)."
+          />
+          <TabButton
             active={tab === "dhcp-activity"}
             onClick={() => setTab("dhcp-activity")}
             icon={Activity}
@@ -190,6 +199,7 @@ export function LogsPage() {
       </div>
 
       {tab === "dns-queries" && <DNSQueriesTab sources={dnsAgentSources} />}
+      {tab === "dns-threat" && <DNSThreatTab />}
       {tab === "dhcp-activity" && (
         <DHCPActivityTab sources={dhcpAgentSources} />
       )}

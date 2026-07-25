@@ -63,6 +63,7 @@ import {
   alertsApi,
   conformityApi,
   dashboardsApi,
+  dnsThreatApi,
   tlsCertsApi,
   newDeviceApi,
   lookingGlassApi,
@@ -3957,6 +3958,91 @@ function IntegrationCard({ panel }: { panel: IntegrationsDashboardPanel }) {
 
 // ── Security dashboard tab (issue #109) ─────────────────────────────
 //
+/**
+ * DNS tunneling rollup card on the Security tab (#699).
+ *
+ * Deliberately silent when the feature module is off (the endpoint
+ * 404s), and deliberately LOUD when it is on but has scored nothing —
+ * "no data" and "no threats" look identical on a dashboard unless you
+ * say which one you mean, and only one of them is reassuring.
+ */
+function DNSThreatCard() {
+  const { data, isLoading, error } = useQuery({
+    queryKey: ["dashboards", "dns-threat"],
+    queryFn: () => dnsThreatApi.summary({ hours: 24 }),
+    refetchInterval: 60_000,
+    retry: false,
+  });
+
+  const moduleOff =
+    (error as { response?: { status?: number } } | null)?.response?.status ===
+    404;
+  if (moduleOff || isLoading) return null;
+  if (!data) return null;
+
+  const tone: Tone = !data.has_data
+    ? "warn"
+    : data.suspicious_clients > 0
+      ? "bad"
+      : "good";
+
+  return (
+    <div className="rounded-lg border bg-card p-4">
+      <div className="flex items-start justify-between gap-2">
+        <div className="min-w-0">
+          <h3 className="text-sm font-semibold">DNS tunneling (24 h)</h3>
+          <p className="mt-0.5 text-xs text-muted-foreground">
+            Clients scored for exfiltration-shaped DNS behaviour
+          </p>
+        </div>
+        <Link
+          to="/logs"
+          className="shrink-0 text-xs text-primary hover:underline"
+        >
+          View →
+        </Link>
+      </div>
+
+      {!data.has_data ? (
+        <p className="mt-3 text-xs text-amber-600 dark:text-amber-400">
+          Nothing scored yet — this is <strong>not</strong> an all-clear. The
+          rollup needs query logging enabled on a DNS server group.
+        </p>
+      ) : (
+        <>
+          <div className="mt-3 flex items-baseline gap-2">
+            <span
+              className={
+                tone === "bad"
+                  ? "text-2xl font-semibold text-rose-600 dark:text-rose-400"
+                  : "text-2xl font-semibold text-emerald-600 dark:text-emerald-400"
+              }
+            >
+              {data.suspicious_clients}
+            </span>
+            <span className="text-xs text-muted-foreground">
+              suspicious of {data.clients_seen} client(s) scored
+            </span>
+          </div>
+          {data.worst_client_ip && data.worst_client_score != null && (
+            <p className="mt-2 break-words text-xs text-muted-foreground">
+              Worst: <span className="font-mono">{data.worst_client_ip}</span>{" "}
+              at {data.worst_client_score.toFixed(0)}/100
+              {data.worst_client_parent && (
+                <>
+                  {" "}
+                  on{" "}
+                  <span className="font-mono">{data.worst_client_parent}</span>
+                </>
+              )}
+            </p>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
 // MFA coverage / API token expiry / failed-login bursts / recent
 // permission changes. Single rollup endpoint at
 // /dashboards/security/summary to keep the front end down to one
@@ -3986,6 +4072,7 @@ function SecurityPanel() {
 
   return (
     <div className="space-y-5">
+      <DNSThreatCard />
       <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
         <Link
           to="/admin/users"
