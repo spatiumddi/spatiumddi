@@ -27,6 +27,7 @@ try:
 except ImportError:  # pragma: no cover - runtime-optional
     dns = None  # type: ignore[assignment]
 
+from ._process import find_running_daemon, is_zombie
 from .base import DriverBase
 
 log = structlog.get_logger(__name__)
@@ -460,33 +461,6 @@ def _render_dnssec_policies(policies: list[dict[str, Any]]) -> str:
     return out
 
 
-
-def _find_running_named() -> int | None:
-    """PID of an already-running ``named``, if any.
-
-    Reads ``/proc`` directly rather than shelling to ``pgrep``: the
-    agent image is Alpine-based and busybox ``pgrep`` semantics differ
-    from procps, and this runs on the startup path where a missing
-    binary must not be able to wedge the daemon launch.
-
-    Only the agent's own children are relevant, but ownership isn't
-    checked — any ``named`` on this PID namespace is the one serving
-    :53, and spawning a second is never the right answer.
-    """
-    try:
-        pids = [entry for entry in os.listdir("/proc") if entry.isdigit()]
-    except OSError:
-        return None
-    for pid in pids:
-        try:
-            with open(f"/proc/{pid}/comm", encoding="utf-8") as fh:
-                if fh.read().strip() == "named":
-                    return int(pid)
-        except (OSError, ValueError):
-            # Process exited between listdir and open, or /proc is not
-            # available (non-Linux dev box) — neither is fatal.
-            continue
-    return None
 
 class Bind9Driver(DriverBase):
     rendered_dir_name = "rendered"
@@ -1295,7 +1269,7 @@ class Bind9Driver(DriverBase):
         # ``rndc status`` land on either. Enabling query logging then
         # appears to do nothing, which silently breaks the Logs → DNS
         # Queries surface and anything built on it.
-        existing = _find_running_named()
+        existing = find_running_daemon("named")
         if existing is not None:
             self.daemon_pid = existing
             log.info(
@@ -1313,13 +1287,15 @@ class Bind9Driver(DriverBase):
         # the running daemon, and answering "not running" would spawn a
         # duplicate (see start_daemon).
         if self.daemon_pid is None:
-            found = _find_running_named()
+            found = find_running_daemon("named")
             if found is None:
                 return False
             self.daemon_pid = found
             return True
         try:
             os.kill(self.daemon_pid, 0)
-            return True
         except OSError:
             return False
+        # A zombie still answers signal 0, so the state check is what
+        # actually distinguishes "running" from "dead but unreaped".
+        return not is_zombie(str(self.daemon_pid))

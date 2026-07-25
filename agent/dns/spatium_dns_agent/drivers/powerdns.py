@@ -39,6 +39,7 @@ from typing import Any
 import httpx
 import structlog
 
+from ._process import find_running_daemon, is_zombie
 from .base import DriverBase
 
 log = structlog.get_logger(__name__)
@@ -567,8 +568,11 @@ class PowerDNSDriver(DriverBase):
 
         # Cold-boot fix: kick start_daemon now that pdns.conf exists.
         # ``daemon_running`` is the simplest "is pdns alive?" probe.
-        # On warm reload the daemon is already up and start_daemon's
-        # internal guard makes this a no-op.
+        # On warm reload the daemon is already up; start_daemon's
+        # already-running check (added in #704) makes this a no-op.
+        # Before that check existed this comment was simply wrong —
+        # start_daemon only verified the config file and the binary,
+        # and would happily spawn a second daemon.
         if not self.daemon_running():
             log.info("powerdns_daemon_starting_after_first_render")
             self.start_daemon()
@@ -919,6 +923,26 @@ class PowerDNSDriver(DriverBase):
         if not shutil.which("pdns_server"):
             log.error("pdns_server_binary_missing")
             return
+        # Idempotent against the SYSTEM, not this object's state (#704).
+        # ``daemon_pid`` is per-instance, so a second driver object sees
+        # ``daemon_running() is False`` and spawns a duplicate. Unlike
+        # BIND9 — which uses SO_REUSEPORT and quietly runs two servers —
+        # pdns_server has no ``reuseport`` set, so the duplicate fails to
+        # bind :53 and exits. The damage is subtler for it: the ``Popen``
+        # handle is discarded, so the corpse is never reaped, and
+        # ``daemon_pid`` is left pointing at a ZOMBIE. Because
+        # ``os.kill(zombie, 0)`` succeeds, the driver then reports a
+        # healthy daemon while tracking a dead process, and any signal it
+        # sends goes nowhere.
+        existing = find_running_daemon("pdns_server")
+        if existing is not None:
+            self.daemon_pid = existing
+            log.info(
+                "pdns_already_running_adopted",
+                pid=existing,
+                note="did not spawn a second daemon",
+            )
+            return
         # ``--daemon=no`` + foreground; pdns logs to stderr.
         # All flags use ``--name=value`` form — pdns_server rejects
         # space-separated args with "perhaps a '--setting=123'
@@ -960,13 +984,25 @@ class PowerDNSDriver(DriverBase):
         )
 
     def daemon_running(self) -> bool:
+        # Falls back to a system-wide look-up when this object has no pid
+        # of its own — another driver instance may legitimately own the
+        # running daemon, and answering "not running" spawns a duplicate.
+        # The shared helper skips zombies, so a corpse is never mistaken
+        # for a live daemon (#704).
         if self.daemon_pid is None:
-            return False
+            found = find_running_daemon("pdns_server")
+            if found is None:
+                return False
+            self.daemon_pid = found
+            return True
         try:
             os.kill(self.daemon_pid, 0)
-            return True
         except OSError:
             return False
+        # ``os.kill(pid, 0)`` succeeds for a zombie, so liveness needs
+        # the state check too — this is exactly how a dead pdns_server
+        # was being reported as healthy.
+        return not is_zombie(str(self.daemon_pid))
 
     # ── Internals ───────────────────────────────────────────────────────────
 
