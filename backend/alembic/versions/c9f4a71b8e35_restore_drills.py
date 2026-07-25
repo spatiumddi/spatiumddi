@@ -116,8 +116,13 @@ def upgrade() -> None:
         sa.Column("finished_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("duration_ms", sa.Integer(), nullable=True),
     )
-    op.create_index("ix_restore_drill_target_id", "restore_drill", ["target_id"])
-    # The drilldown query is always "latest runs for this target".
+    # Both real access patterns are per-target-newest-first: the list
+    # endpoint scoped to a target, and the alert matcher's
+    # ``row_number() OVER (PARTITION BY target_id ORDER BY started_at
+    # DESC)``. A separate single-column index on ``target_id`` would be
+    # redundant — Postgres serves ``WHERE target_id = ?`` from this
+    # index's leading column at effectively the same cost, and the
+    # second index would just add a write on every insert.
     op.create_index(
         "ix_restore_drill_target_started",
         "restore_drill",
@@ -127,7 +132,6 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.drop_index("ix_restore_drill_target_started", table_name="restore_drill")
-    op.drop_index("ix_restore_drill_target_id", table_name="restore_drill")
     op.drop_table("restore_drill")
     op.drop_column("backup_target", "drill_last_at")
     op.drop_column("backup_target", "drill_last_status")

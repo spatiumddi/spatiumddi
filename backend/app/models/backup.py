@@ -108,11 +108,14 @@ class RestoreDrill(Base):
     __tablename__ = "restore_drill"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    # No ``index=True``: the composite ``ix_restore_drill_target_started``
+    # in the migration leads with this column and serves single-column
+    # lookups just as well. A second index here would only cost an extra
+    # write per insert (and autogenerate would keep recreating it).
     target_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("backup_target.id", ondelete="CASCADE"),
         nullable=False,
-        index=True,
     )
 
     # "running" → terminal "passed" / "failed" / "error".

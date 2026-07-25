@@ -421,8 +421,11 @@ class RestoreDrillReadinessArgs(BaseModel):
         "proof is. Answers the question an operator actually cares "
         "about — 'can I currently restore this install, and how do I "
         "know?' — without reading the whole drill history. Targets "
-        "with drills disabled are reported as unverified rather than "
-        "healthy: an untested backup is an unknown, not a pass."
+        "that proof is. A target that has never passed a drill is "
+        "reported as unverified rather than healthy — an untested "
+        "backup is an unknown, not a pass — while a target whose most "
+        "recent drill merely errored (destination unreachable) keeps "
+        "its previous verdict, because an error disproves nothing."
     ),
     args_model=RestoreDrillReadinessArgs,
     category="admin",
@@ -433,34 +436,11 @@ async def get_restore_drill_readiness(
     gate = _superadmin_gate(user)
     if gate:
         return gate
-    targets = (
-        (await db.execute(select(BackupTarget).order_by(BackupTarget.name.asc()))).scalars().all()
-    )
-    now = datetime.now(UTC)
-    out: list[dict[str, Any]] = []
-    for t in targets:
-        last_pass = await db.scalar(
-            select(RestoreDrill.finished_at)
-            .where(RestoreDrill.target_id == t.id, RestoreDrill.state == "passed")
-            .order_by(desc(RestoreDrill.finished_at))
-            .limit(1)
-        )
-        age_hours = round((now - last_pass).total_seconds() / 3600, 1) if last_pass else None
-        out.append(
-            {
-                "target_id": str(t.id),
-                "target_name": t.name,
-                "kind": t.kind,
-                "enabled": t.enabled,
-                "drills_scheduled": bool(t.drill_enabled and t.drill_cron),
-                "drill_cron": t.drill_cron,
-                "latest_verdict": t.drill_last_status,
-                "latest_drill_at": t.drill_last_at.isoformat() if t.drill_last_at else None,
-                "last_passed_at": last_pass.isoformat() if last_pass else None,
-                "hours_since_last_pass": age_hours,
-                "verified": t.drill_last_status == "passed",
-            }
-        )
+    # Shared with the REST readiness endpoint and the admin UI so all
+    # three give the same answer to the same question.
+    from app.services.backup.drill import compute_drill_readiness  # noqa: PLC0415
+
+    out = await compute_drill_readiness(db)
     verified = sum(1 for r in out if r["verified"])
     return {
         "targets": out,

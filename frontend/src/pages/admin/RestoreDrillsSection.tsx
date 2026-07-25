@@ -148,6 +148,16 @@ export function RestoreDrillsSection() {
     queryKey: ["backup-targets"],
     queryFn: () => backupTargetsApi.list(),
   });
+  // "Last proven" must come from a per-target server-side lookup, not
+  // from scanning the drill list: that list is globally capped, so on
+  // an install with several targets a genuine pass scrolls out of the
+  // window and the column would claim "never" for a target that
+  // demonstrably passed — the exact opposite of what this card exists
+  // to tell you.
+  const readinessQ = useQuery({
+    queryKey: ["restore-drill-readiness"],
+    queryFn: () => backupTargetsApi.drillReadiness(),
+  });
   const drillsQ = useQuery({
     queryKey: ["restore-drills"],
     queryFn: () => backupTargetsApi.listDrills({ limit: 50 }),
@@ -162,11 +172,15 @@ export function RestoreDrillsSection() {
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: ["restore-drills"] });
       void qc.invalidateQueries({ queryKey: ["backup-targets"] });
+      void qc.invalidateQueries({ queryKey: ["restore-drill-readiness"] });
     },
   });
 
   const targets = targetsQ.data ?? [];
   const drills = drillsQ.data ?? [];
+  const readinessByTarget = new Map(
+    (readinessQ.data?.targets ?? []).map((r) => [r.target_id, r]),
+  );
 
   return (
     <div className="flex flex-col gap-6">
@@ -185,6 +199,9 @@ export function RestoreDrillsSection() {
             onClick={() => {
               void qc.invalidateQueries({ queryKey: ["backup-targets"] });
               void qc.invalidateQueries({ queryKey: ["restore-drills"] });
+              void qc.invalidateQueries({
+                queryKey: ["restore-drill-readiness"],
+              });
             }}
             className="inline-flex shrink-0 items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm hover:bg-accent"
           >
@@ -217,9 +234,7 @@ export function RestoreDrillsSection() {
               </thead>
               <tbody>
                 {targets.map((t) => {
-                  const lastPass = drills.find(
-                    (d) => d.target_id === t.id && d.state === "passed",
-                  );
+                  const readiness = readinessByTarget.get(t.id);
                   const busy =
                     t.drill_last_status === "in_progress" ||
                     (runDrill.isPending && runDrill.variables === t.id);
@@ -245,12 +260,23 @@ export function RestoreDrillsSection() {
                       <td className="px-4 py-2">
                         <StateChip state={t.drill_last_status} />
                       </td>
-                      <td className="px-4 py-2 text-xs text-muted-foreground">
-                        {lastPass
-                          ? relativeAge(lastPass.finished_at)
-                          : t.drill_last_status === "passed"
-                            ? relativeAge(t.drill_last_at)
-                            : "never"}
+                      <td className="px-4 py-2 text-xs">
+                        {readinessQ.isLoading ? (
+                          <span className="text-muted-foreground">&hellip;</span>
+                        ) : readiness?.last_passed_at ? (
+                          <span
+                            className={
+                              readiness.verified
+                                ? "text-muted-foreground"
+                                : "text-amber-600 dark:text-amber-400"
+                            }
+                          >
+                            {relativeAge(readiness.last_passed_at)}
+                            {!readiness.verified && " (superseded by a failure)"}
+                          </span>
+                        ) : (
+                          <span className="text-muted-foreground">never</span>
+                        )}
                       </td>
                       <td className="px-4 py-2">
                         <div className="flex justify-end gap-1.5">

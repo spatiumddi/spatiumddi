@@ -14,7 +14,7 @@ manual "run one now" kick.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
@@ -24,9 +24,12 @@ from sqlalchemy import desc, select
 from app.api.deps import DB, CurrentUser
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.permissions import is_effective_superadmin
-from app.models.audit import AuditLog
 from app.models.backup import BackupTarget, RestoreDrill
-from app.services.backup.drill import run_drill_for_target
+from app.services.backup.drill import (
+    compute_drill_readiness,
+    drill_mutex_is_stale,
+    run_drill_for_target,
+)
 
 router = APIRouter()
 
@@ -99,6 +102,28 @@ async def list_drills(
     return [_to_response(row, target_name=name) for row, name in rows]
 
 
+@router.get("/readiness")
+async def get_readiness(db: DB, current_user: CurrentUser) -> dict[str, Any]:
+    """Per-target recovery readiness — "can I restore this, and how do
+    I know?".
+
+    Registered before ``/{drill_id}`` so the literal path isn't
+    swallowed by the UUID route. Shares
+    :func:`compute_drill_readiness` with the Operator Copilot tool, so
+    the UI and the assistant can't disagree about whether a backup is
+    proven.
+    """
+    _require_superadmin(current_user)
+    rows = await compute_drill_readiness(db)
+    verified = sum(1 for r in rows if r["verified"])
+    return {
+        "targets": rows,
+        "total_targets": len(rows),
+        "verified_targets": verified,
+        "unverified_targets": len(rows) - verified,
+    }
+
+
 @router.get("/{drill_id}", response_model=RestoreDrillResponse)
 async def get_drill(drill_id: uuid.UUID, db: DB, current_user: CurrentUser) -> RestoreDrillResponse:
     _require_superadmin(current_user)
@@ -137,31 +162,24 @@ async def run_drill_now(
     row = await db.get(BackupTarget, target_id)
     if row is None:
         raise HTTPException(status_code=404, detail="backup target not found")
-    if row.drill_last_status == "in_progress":
+    # Same staleness escape the sweep applies. Without it, a mutex
+    # stranded by an api restart or a client disconnect would 409 this
+    # endpoint forever with no operator-reachable way to clear the flag
+    # (``drill_last_status`` isn't writable through the target API).
+    if row.drill_last_status == "in_progress" and not drill_mutex_is_stale(row, datetime.now(UTC)):
         raise HTTPException(
             status_code=409,
             detail="a drill is already running against this target",
         )
 
-    drill = await run_drill_for_target(db, target=row, triggered_by="manual")
-    db.add(
-        AuditLog(
-            action="backup_restore_drill",
-            resource_type="backup_target",
-            resource_id=str(row.id),
-            resource_display=row.name,
-            user_id=current_user.id,
-            user_display_name=current_user.username,
-            result="success" if drill.state == "passed" else "failure",
-            error_detail=drill.error,
-            new_value={
-                "drill_id": str(drill.id),
-                "state": drill.state,
-                "filename": drill.filename,
-                "duration_ms": drill.duration_ms,
-                "assertions": drill.assertions,
-            },
-        )
+    # The runner writes the audit row itself so scheduled drills are
+    # audited on the same path — see ``run_drill_for_target``.
+    drill = await run_drill_for_target(
+        db,
+        target=row,
+        triggered_by="manual",
+        actor_id=current_user.id,
+        actor_display=current_user.username,
     )
     await db.commit()
     await db.refresh(drill)

@@ -911,6 +911,15 @@ async def _matching_restore_drill_failed_subjects(
     the previous verdict was standing, which is the honest reading:
     we still don't know any more than we did.
 
+    Restricted to targets that are **enabled with drills scheduled**.
+    The manual run-now endpoint will drill a target whose drills are
+    off, so without this filter a single ad-hoc failure could open a
+    critical event that nothing can ever resolve: the documented
+    resolution is "the target's next drill passes", and a target with
+    no schedule has no next drill. Switching drills (or the target)
+    off now resolves the event on the following tick, which also gives
+    operators a reachable way out.
+
     When the latest finished drill passes, the target stops matching
     and the shared evaluator loop auto-resolves its open event.
     """
@@ -943,7 +952,12 @@ async def _matching_restore_drill_failed_subjects(
                 BackupTarget.name,
             )
             .join(BackupTarget, BackupTarget.id == ranked.c.target_id)
-            .where(ranked.c.rn == 1, ranked.c.state == "failed")
+            .where(
+                ranked.c.rn == 1,
+                ranked.c.state == "failed",
+                BackupTarget.enabled.is_(True),
+                BackupTarget.drill_enabled.is_(True),
+            )
         )
     ).all()
 
@@ -956,12 +970,24 @@ async def _matching_restore_drill_failed_subjects(
         ]
         detail = ", ".join(failed) if failed else "no assertion detail recorded"
         when = finished_at.isoformat() if finished_at is not None else "unknown time"
-        message = (
-            f"Restore drill FAILED for backup target '{target_name}': the newest "
-            f"archive ({filename or 'unknown'}) did not survive a test restore at "
-            f"{when}. Failed checks: {detail}. This archive is not a reliable "
-            f"recovery path — investigate before you need it."
-        )
+        # "the archive didn't survive" is the wrong story when the
+        # failing check is that there IS no archive — the operator
+        # would go hunting for corruption instead of finding an empty
+        # destination. Branch on the actual finding.
+        if "archive_available" in failed:
+            message = (
+                f"Restore drill FAILED for backup target '{target_name}': the "
+                f"destination holds no archives to restore from (checked at "
+                f"{when}). There is currently no recovery path from this "
+                f"target — confirm its backups are running."
+            )
+        else:
+            message = (
+                f"Restore drill FAILED for backup target '{target_name}': the newest "
+                f"archive ({filename or 'unknown'}) did not survive a test restore at "
+                f"{when}. Failed checks: {detail}. This archive is not a reliable "
+                f"recovery path — investigate before you need it."
+            )
         matches.append((str(target_id), target_name, message))
     return matches
 
@@ -4046,9 +4072,9 @@ async def seed_ip_blocklisted_alert_rule() -> None:
 async def seed_restore_drill_failed_alert_rule() -> None:
     """Seed the ``restore_drill_failed`` rule (#702), ENABLED by default.
 
-    The odd one out among the seeds: enabled rather than opt-in. It can
-    only ever fire on a target the operator explicitly turned drills on
-    for, so it is silent on every install that doesn't use the feature —
+    The odd one out among the seeds: enabled rather than opt-in. The
+    matcher only considers enabled targets with drills scheduled, so
+    the rule is silent on every install that doesn't use the feature —
     and an operator who went to the trouble of scheduling drills wants
     to hear the answer. Keyed on ``rule_type``; an operator who disables
     or renames it is never overridden.

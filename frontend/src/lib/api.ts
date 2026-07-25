@@ -2875,6 +2875,32 @@ export interface RestoreDrill {
   duration_ms: number | null;
 }
 
+/** One target's recovery-readiness row (issue #702). */
+export interface RestoreDrillReadinessTarget {
+  target_id: string;
+  target_name: string;
+  kind: string;
+  enabled: boolean;
+  drills_scheduled: boolean;
+  drill_cron: string | null;
+  /** Raw latest status, including "error" / "in_progress". */
+  latest_verdict: string;
+  /** Latest terminal verdict, i.e. "passed" | "failed" | null. */
+  latest_finished_verdict: string | null;
+  latest_drill_at: string | null;
+  last_passed_at: string | null;
+  hours_since_last_pass: number | null;
+  /** Has passed at some point AND the latest finished verdict isn't a failure. */
+  verified: boolean;
+}
+
+export interface RestoreDrillReadiness {
+  targets: RestoreDrillReadinessTarget[];
+  total_targets: number;
+  verified_targets: number;
+  unverified_targets: number;
+}
+
 export interface BackupArchiveListing {
   filename: string;
   size_bytes: number;
@@ -2936,6 +2962,17 @@ export const backupTargetsApi = {
     limit?: number;
   }) =>
     api.get<RestoreDrill[]>("/backup/drills", { params }).then((r) => r.data),
+  /**
+   * Per-target recovery readiness. Backed by the same server-side
+   * computation the Operator Copilot uses, so the UI and the assistant
+   * can't disagree about whether a backup is proven — and so
+   * "last proven" doesn't depend on how far back the drill history
+   * page happens to reach.
+   */
+  drillReadiness: () =>
+    api
+      .get<RestoreDrillReadiness>("/backup/drills/readiness")
+      .then((r) => r.data),
   deleteArchive: (id: string, filename: string) =>
     api
       .delete<void>(

@@ -28,40 +28,34 @@ import structlog
 from sqlalchemy import select
 
 from app.celery_app import celery_app
+from app.config import settings
 from app.db import task_session
 from app.models.backup import BackupTarget
-from app.services.backup.drill import STALE_IN_PROGRESS_SECONDS, run_drill_for_target
+from app.services.backup.drill import (
+    DrillError,
+    drill_mutex_is_stale,
+    reap_orphaned_scratch_dbs,
+    run_drill_for_target,
+)
 
 logger = structlog.get_logger(__name__)
-
-
-def _mutex_is_stale(target: BackupTarget, now: datetime) -> bool:
-    """True when an ``in_progress`` drill mutex was stranded rather
-    than being genuinely held.
-
-    A worker killed mid-drill never stamps a terminal state, and the
-    row would otherwise stop drilling forever. ``drill_last_at``
-    carries the running drill's start time, so its age is the mutex's
-    age. A NULL means the row was never stamped at all — also stale.
-    """
-    if target.drill_last_at is None:
-        return True
-    age = (now - target.drill_last_at).total_seconds()
-    if age < STALE_IN_PROGRESS_SECONDS:
-        return False
-    logger.warning(
-        "restore_drill_stale_mutex_cleared",
-        target_id=str(target.id),
-        age_seconds=int(age),
-    )
-    return True
 
 
 async def _sweep() -> dict[str, int]:
     fired = 0
     skipped_in_progress = 0
+    reaped = 0
     async with task_session() as db:
         now = datetime.now(UTC)
+        # Drop scratch databases left behind by drills that were killed
+        # before their cleanup ran. Cheap when there is nothing to do
+        # (one indexed catalogue query), and the only thing standing
+        # between a SIGKILLed drill and a permanent full-size copy of
+        # the production database sitting on the same volume.
+        try:
+            reaped = len(await reap_orphaned_scratch_dbs(live_db_url=str(settings.database_url)))
+        except DrillError as exc:
+            logger.warning("restore_drill_reap_failed", error=str(exc))
         rows = (
             (
                 await db.execute(
@@ -78,7 +72,7 @@ async def _sweep() -> dict[str, int]:
             .all()
         )
         for target in rows:
-            if target.drill_last_status == "in_progress" and not _mutex_is_stale(target, now):
+            if target.drill_last_status == "in_progress" and not drill_mutex_is_stale(target, now):
                 skipped_in_progress += 1
                 continue
             try:
@@ -97,12 +91,16 @@ async def _sweep() -> dict[str, int]:
                     target_id=str(target.id),
                     error=str(exc),
                 )
-    return {"fired": fired, "skipped_in_progress": skipped_in_progress}
+    return {
+        "fired": fired,
+        "skipped_in_progress": skipped_in_progress,
+        "reaped_scratch_dbs": reaped,
+    }
 
 
 @celery_app.task(name="app.tasks.backup_drill.sweep_restore_drills")
 def sweep_restore_drills() -> dict[str, int]:
     result = asyncio.run(_sweep())
-    if result["fired"] or result["skipped_in_progress"]:
+    if any(result.values()):
         logger.info("restore_drill_sweep_tick", **result)
     return result

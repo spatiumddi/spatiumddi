@@ -407,6 +407,14 @@ postgresql:
   affinity: {}
   # CNPG-specific topology (only used when ``kind: cnpg``).
   cnpg:
+    # Grant CREATEDB to the application role (#702). Restore-verification
+    # drills create a throwaway database, replay the newest backup archive
+    # into it, assert against the result, and drop it. The role initdb
+    # creates has no CREATEDB and superuser access is off, so drills cannot
+    # run at all without this. Applied via ``managed.roles`` so it also
+    # reaches clusters created before #702. Set false to withhold the
+    # privilege — drills then report a clear "role lacks CREATEDB" error.
+    appRoleCreateDb: true
     # Replica count. 3 is the smallest etcd-quorum-friendly default
     # (primary + sync replica + async replica). 5 / 7 for larger
     # clusters. CNPG enforces odd counts implicitly via its leader-

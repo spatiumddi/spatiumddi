@@ -40,18 +40,20 @@ import asyncio
 import os
 import secrets as secrets_mod
 import tempfile
+import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import structlog
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from app.config import settings
 from app.core.crypto import decrypt_str
+from app.models.audit import AuditLog
 from app.models.backup import BackupTarget, RestoreDrill
 from app.services.backup.archive import (
     BackupArchiveError,
@@ -60,6 +62,7 @@ from app.services.backup.archive import (
     extract_archive_members,
 )
 from app.services.backup.crypto import BackupCryptoError, decrypt_secrets
+from app.services.backup.restore import SUPPORTED_FORMAT_VERSIONS
 from app.services.backup.targets import (
     BackupDestinationError,
     SecretFieldError,
@@ -76,18 +79,110 @@ SCRATCH_DB_PREFIX = "spatiumddi_drill_"
 # DATABASE) are fast and get a much tighter bound.
 _REPLAY_TIMEOUT_SECONDS = 30 * 60
 _MAINTENANCE_TIMEOUT_SECONDS = 120
+# Fetching the archive off the destination is unbounded by the driver
+# (an S3 pull over a slow WAN can run long), so the drill bounds it
+# itself. Without this the total runtime has no ceiling and
+# STALE_IN_PROGRESS_SECONDS below would be a fiction.
+_DOWNLOAD_TIMEOUT_SECONDS = 30 * 60
+# The post-replay assertions open a session on the scratch database
+# and walk the audit chain. Bounded for the same reason.
+_ASSERT_TIMEOUT_SECONDS = 10 * 60
 
 # How long a ``drill_last_status="in_progress"`` mutex is believed
 # before the sweep treats it as stranded. A worker killed mid-drill
 # never gets to stamp a terminal state, and without this the target
-# would silently stop drilling forever. Comfortably above the replay
-# timeout so a genuinely slow drill is never stolen from itself.
-STALE_IN_PROGRESS_SECONDS = _REPLAY_TIMEOUT_SECONDS + 15 * 60
+# would silently stop drilling forever.
+#
+# Derived from EVERY bounded phase, not just the replay: download +
+# replay + assertions + slack for the un-timed glue between them. Set
+# it below the real worst case and the sweep would start a second
+# drill against a target that is still legitimately working, giving
+# two concurrent scratch databases and a verdict race.
+STALE_IN_PROGRESS_SECONDS = (
+    _DOWNLOAD_TIMEOUT_SECONDS + _REPLAY_TIMEOUT_SECONDS + _ASSERT_TIMEOUT_SECONDS + 15 * 60
+)
+
+# The audit-chain walk materialises one ORM object per row, and it runs
+# while the archive bytes and the dump bytes are both still referenced.
+# On a multi-million-row audit log that is an OOM-kill mid-drill — which
+# stranding the mutex and leaking the scratch database on the way out.
+# Cap the walk: a break in the first 250k rows is plenty to prove the
+# chain is damaged, and the nightly audit_chain_verify task does the
+# exhaustive pass against the live table.
+_CHAIN_VERIFY_MAX_ROWS = 250_000
+
+# A drill puts a full second copy of the database on the SAME Postgres
+# instance. On the appliance's default 8Gi CNPG volume a 6 GB install
+# would fill the volume and take the production primary down with it —
+# an outage caused by a read-only verification job. There is no portable
+# way to ask Postgres how much free space its data volume has, so the
+# risk is bounded from the other end: refuse to drill when the copy
+# would exceed this size unless the operator raises the ceiling
+# deliberately (``SPATIUM_DRILL_MAX_DB_BYTES``).
+_DEFAULT_MAX_DB_BYTES = 20 * 1024**3
 
 # Assertion verdicts.
 PASS = "pass"
 FAIL = "fail"
 SKIP = "skip"
+
+
+def _human_bytes(n: int) -> str:
+    """Size for an operator-facing message.
+
+    Integer GiB alone renders anything under a gigabyte as "0 GiB",
+    which reads as a bug in the message rather than a small database.
+    """
+    for unit, scale in (("GiB", 1024**3), ("MiB", 1024**2), ("KiB", 1024)):
+        if n >= scale:
+            return f"{n / scale:.1f} {unit}"
+    return f"{n} bytes"
+
+
+def drill_mutex_is_stale(target: BackupTarget, now: datetime) -> bool:
+    """True when an ``in_progress`` drill mutex was stranded rather
+    than being genuinely held.
+
+    A worker killed mid-drill — or an api pod restarted under a
+    synchronous manual run — never stamps a terminal state, and the
+    target would otherwise stop drilling forever and 409 every manual
+    retry. ``drill_last_at`` carries the running drill's start time, so
+    its age is the mutex's age. A NULL means the row was never stamped
+    at all, which is also stale.
+
+    Shared by the beat sweep and the manual run-now endpoint: both need
+    the identical rule, and letting them drift would mean the scheduler
+    recovers a target the operator still can't touch by hand.
+    """
+    if target.drill_last_at is None:
+        return True
+    age = (now - target.drill_last_at).total_seconds()
+    if age < STALE_IN_PROGRESS_SECONDS:
+        return False
+    logger.warning(
+        "restore_drill_stale_mutex_cleared",
+        target_id=str(target.id),
+        age_seconds=int(age),
+    )
+    return True
+
+
+def _max_scratch_db_bytes() -> int:
+    """Ceiling on the live database size a drill will copy.
+
+    Env-overridable rather than a settings column: it is a safety
+    property of the host's disk, not per-target configuration, and an
+    operator raising it is making a deliberate statement about their
+    volume. ``0`` disables the guard.
+    """
+    raw = os.environ.get("SPATIUM_DRILL_MAX_DB_BYTES")
+    if not raw:
+        return _DEFAULT_MAX_DB_BYTES
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        logger.warning("restore_drill_bad_max_db_bytes", value=raw)
+        return _DEFAULT_MAX_DB_BYTES
 
 
 class DrillError(Exception):
@@ -135,6 +230,94 @@ def _scratch_db_name(live_dbname: str) -> str:
     if name == live_dbname:
         raise DrillError("generated scratch database name collided with the live database")
     return name
+
+
+async def _query_scalar(sql: str, *, live_db_url: str, timeout: float) -> str:
+    """Run a single read-only query against the live database and
+    return the first column of the first row as text."""
+    pg_env, _dbname = _pg_env_from_url(live_db_url)
+    proc = await asyncio.create_subprocess_exec(
+        "psql",
+        "--no-align",
+        "--tuples-only",
+        "--set=ON_ERROR_STOP=1",
+        f"--command={sql}",
+        env=_pg_subprocess_env(pg_env),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except TimeoutError as exc:
+        proc.kill()
+        await proc.wait()
+        raise DrillError(f"query exceeded {timeout}s timeout") from exc
+    if proc.returncode != 0:
+        msg = (stderr.decode(errors="replace") or stdout.decode(errors="replace"))[:800]
+        raise DrillError(f"query failed (exit {proc.returncode}): {msg}")
+    return stdout.decode(errors="replace").strip()
+
+
+async def preflight(*, live_db_url: str) -> None:
+    """Prove a drill *can* run before it starts creating things.
+
+    Two gates, both raising :class:`DrillError` (→ ``state="error"``,
+    which correctly says nothing about the archive):
+
+    1. **CREATEDB.** The appliance's permanent Postgres shape is
+       CloudNativePG, whose ``initdb.owner`` is a plain LOGIN role with
+       no CREATEDB and superuser access switched off. Without the
+       privilege every drill dies inside ``CREATE DATABASE`` with a
+       bare "permission denied", which reads as a mysterious
+       infrastructure fault rather than a one-line fix. Checked up
+       front so the message can name the privilege, the role, and the
+       remedy.
+    2. **Size.** The scratch database is a full second copy on the same
+       instance. Postgres exposes no portable free-space query, so the
+       exposure is bounded by refusing to copy a database larger than
+       the operator has agreed to.
+    """
+    role_can_create = await _query_scalar(
+        "SELECT rolcreatedb OR rolsuper FROM pg_roles WHERE rolname = current_user",
+        live_db_url=live_db_url,
+        timeout=_MAINTENANCE_TIMEOUT_SECONDS,
+    )
+    if role_can_create.lower() not in ("t", "true"):
+        _pg_env, dbname = _pg_env_from_url(live_db_url)
+        raise DrillError(
+            "the database role SpatiumDDI connects as lacks CREATEDB, so a "
+            "throwaway database cannot be created. On Kubernetes / appliance "
+            "installs set `postgresql.cnpg.appRoleCreateDb: true` (the chart "
+            "default) and let CloudNativePG reconcile the role; on "
+            "docker-compose grant it directly with "
+            f"`ALTER ROLE <user> CREATEDB;` against {dbname}. Restore drills "
+            "cannot run until then."
+        )
+
+    ceiling = _max_scratch_db_bytes()
+    if ceiling <= 0:
+        return
+    raw_size = await _query_scalar(
+        "SELECT pg_database_size(current_database())",
+        live_db_url=live_db_url,
+        timeout=_MAINTENANCE_TIMEOUT_SECONDS,
+    )
+    try:
+        size = int(raw_size)
+    except ValueError:
+        # Couldn't measure — don't block the drill on a probe failure,
+        # but say so, because the size guard is silently not applying.
+        logger.warning("restore_drill_size_probe_unreadable", value=raw_size[:120])
+        return
+    if size > ceiling:
+        raise DrillError(
+            f"the live database is {_human_bytes(size)} and a drill copies it "
+            f"in full onto the same Postgres instance, which would risk filling "
+            f"the volume the production database is running on. The ceiling is "
+            f"{_human_bytes(ceiling)}. Raise SPATIUM_DRILL_MAX_DB_BYTES "
+            f"(bytes, 0 disables the guard) once you have confirmed the data "
+            f"volume has room for a second copy."
+        )
 
 
 async def _run_maintenance_sql(sql: str, *, live_db_url: str, timeout: float) -> None:
@@ -195,6 +378,49 @@ async def _drop_scratch_db(name: str, *, live_db_url: str) -> None:
         # Leaves a stray database behind. Surfaced loudly because it
         # needs manual cleanup, but never fatal to the drill result.
         logger.error("restore_drill_scratch_drop_failed", dbname=name, error=str(exc))
+
+
+async def reap_orphaned_scratch_dbs(*, live_db_url: str) -> list[str]:
+    """Drop ``spatiumddi_drill_*`` databases left behind by a drill that
+    never reached its ``finally``.
+
+    The in-process cleanup covers every path the drill can *return*
+    through, but not a SIGKILL — a pod eviction, an OOM kill, or a node
+    drain mid-replay leaves a full-size copy of the production database
+    on the instance forever. Nothing else would ever remove it, and the
+    stale-mutex path re-drills under a *fresh* random name, so each
+    killed drill would permanently add another copy until the volume
+    filled. The fixed prefix exists precisely so this sweep is possible.
+
+    Liveness, not age, is the safety signal: a drill holds a connection
+    to its scratch database for the whole replay-and-assert window, so
+    "carries the prefix AND has no backend attached" cannot match a
+    drill that is still working. That avoids having to guess a safe age
+    threshold, and it stays correct however long a legitimate drill
+    runs.
+    """
+    listing = await _query_scalar(
+        "SELECT string_agg(d.datname, ',') FROM pg_database d "
+        "WHERE d.datname LIKE 'spatiumddi\\_drill\\_%' "
+        "AND NOT EXISTS (SELECT 1 FROM pg_stat_activity a WHERE a.datname = d.datname)",
+        live_db_url=live_db_url,
+        timeout=_MAINTENANCE_TIMEOUT_SECONDS,
+    )
+    names = [n.strip() for n in listing.split(",") if n.strip()]
+    reaped: list[str] = []
+    for name in names:
+        if not name.startswith(SCRATCH_DB_PREFIX):
+            continue
+        await _drop_scratch_db(name, live_db_url=live_db_url)
+        reaped.append(name)
+    if reaped:
+        logger.warning(
+            "restore_drill_reaped_orphans",
+            count=len(reaped),
+            databases=reaped,
+            note="left behind by drills that were killed before cleanup",
+        )
+    return reaped
 
 
 def _scratch_url(live_db_url: str, scratch_db: str) -> str:
@@ -449,7 +675,7 @@ async def _assert_audit_chain(
         return
 
     try:
-        result = await verify_chain(session)
+        result = await verify_chain(session, max_rows=_CHAIN_VERIFY_MAX_ROWS)
     except Exception as exc:  # noqa: BLE001
         out.append(
             Assertion("audit_chain_intact", SKIP, f"chain verification could not run: {exc}")
@@ -457,13 +683,83 @@ async def _assert_audit_chain(
         return
 
     if result.ok:
-        out.append(Assertion("audit_chain_intact", PASS, f"{result.rows_checked} rows verified"))
+        capped = (
+            f" (capped at {_CHAIN_VERIFY_MAX_ROWS}; the nightly verify task walks the full table)"
+            if result.rows_checked >= _CHAIN_VERIFY_MAX_ROWS
+            else ""
+        )
+        out.append(
+            Assertion("audit_chain_intact", PASS, f"{result.rows_checked} rows verified{capped}")
+        )
         return
     first = result.breaks[0] if result.breaks else None
     detail = f"{len(result.breaks)} break(s) across {result.rows_checked} rows" + (
         f"; first at seq {first.seq} ({first.reason})" if first is not None else ""
     )
     out.append(Assertion("audit_chain_intact", FAIL, detail))
+
+
+# ── readiness rollup ──────────────────────────────────────────────────
+
+
+async def compute_drill_readiness(db: AsyncSession) -> list[dict[str, Any]]:
+    """Per-target recovery readiness: *can this be restored, and how do
+    we know?*
+
+    Shared by the REST endpoint, the Operator Copilot tool, and the
+    admin UI so all three answer identically — the question is too
+    load-bearing to have three implementations that can drift.
+
+    ``verified`` is deliberately NOT "the last drill passed":
+
+    * A target whose latest drill hit ``error`` (destination briefly
+      unreachable) has not been disproven — the alert path treats an
+      error as leaving the previous verdict standing, and this must
+      agree, or a transient S3 blip would report a backup proven 24 h
+      ago as unverified.
+    * A target that has never passed is unverified regardless of what
+      else it has done. An untested backup is an unknown, not a pass.
+
+    So: verified = has passed at some point AND the most recent
+    *finished* verdict is not a failure. ``hours_since_last_pass``
+    carries the staleness so callers can judge how old the proof is.
+    """
+    targets = (
+        (await db.execute(select(BackupTarget).order_by(BackupTarget.name.asc()))).scalars().all()
+    )
+    now = datetime.now(UTC)
+    out: list[dict[str, Any]] = []
+    for t in targets:
+        last_pass = await db.scalar(
+            select(RestoreDrill.finished_at)
+            .where(RestoreDrill.target_id == t.id, RestoreDrill.state == "passed")
+            .order_by(RestoreDrill.finished_at.desc())
+            .limit(1)
+        )
+        latest_finished = await db.scalar(
+            select(RestoreDrill.state)
+            .where(RestoreDrill.target_id == t.id, RestoreDrill.state.in_(("passed", "failed")))
+            .order_by(RestoreDrill.started_at.desc())
+            .limit(1)
+        )
+        age_hours = round((now - last_pass).total_seconds() / 3600, 1) if last_pass else None
+        out.append(
+            {
+                "target_id": str(t.id),
+                "target_name": t.name,
+                "kind": t.kind,
+                "enabled": t.enabled,
+                "drills_scheduled": bool(t.drill_enabled and t.drill_cron),
+                "drill_cron": t.drill_cron,
+                "latest_verdict": t.drill_last_status,
+                "latest_finished_verdict": latest_finished,
+                "latest_drill_at": t.drill_last_at.isoformat() if t.drill_last_at else None,
+                "last_passed_at": last_pass.isoformat() if last_pass else None,
+                "hours_since_last_pass": age_hours,
+                "verified": last_pass is not None and latest_finished != "failed",
+            }
+        )
+    return out
 
 
 # ── orchestration ─────────────────────────────────────────────────────
@@ -474,12 +770,21 @@ async def run_drill_for_target(
     *,
     target: BackupTarget,
     triggered_by: str = "manual",
+    actor_id: uuid.UUID | None = None,
+    actor_display: str = "system (schedule)",
 ) -> RestoreDrill:
     """Run one restore-verification drill against ``target``.
 
     Persists a ``running`` row up front so a long drill is visible
     in the UI while it works, then stamps the terminal state. The
     caller commits; the row is returned attached to ``db``.
+
+    The audit row is written *here* rather than in the API handler so
+    scheduled drills are audited too — this function mutates
+    ``backup_target`` and inserts a ``restore_drill`` row on every run,
+    and non-negotiable #4 admits no "unless a cron did it" exception.
+    Mirrors ``run_backup_for_target``, which audits from the runner for
+    the same reason.
     """
     started = datetime.now(UTC)
     row = RestoreDrill(target_id=target.id, state="running", triggered_by=triggered_by)
@@ -524,6 +829,27 @@ async def run_drill_for_target(
             )
             target.drill_next_run_at = None
 
+    db.add(
+        AuditLog(
+            action="backup_restore_drill",
+            resource_type="backup_target",
+            resource_id=str(target.id),
+            resource_display=target.name,
+            user_id=actor_id,
+            user_display_name=actor_display,
+            result="success" if outcome.state == "passed" else "failure",
+            error_detail=outcome.error,
+            new_value={
+                "drill_id": str(row.id),
+                "state": outcome.state,
+                "triggered_by": triggered_by,
+                "filename": outcome.filename,
+                "duration_ms": row.duration_ms,
+                "assertions": row.assertions,
+            },
+        )
+    )
+
     logger.info(
         "restore_drill_finished",
         target_id=str(target.id),
@@ -541,6 +867,14 @@ async def _execute(target: BackupTarget, *, live_db_url: str) -> DrillOutcome:
     persist.
     """
     assertions: list[Assertion] = []
+
+    # 0. Prove the drill can run at all before creating anything. Both
+    #    gates are infrastructure facts, so a failure is ``error`` —
+    #    it says nothing about the archive.
+    try:
+        await preflight(live_db_url=live_db_url)
+    except DrillError as exc:
+        return DrillOutcome(state="error", error=str(exc))
 
     # 1. Fetch the newest archive from the destination.
     try:
@@ -566,7 +900,24 @@ async def _execute(target: BackupTarget, *, live_db_url: str) -> DrillOutcome:
     )
 
     try:
-        archive_bytes = await driver.download(config=plain_config, filename=newest.filename)
+        # Bounded explicitly: the destination drivers impose no ceiling
+        # of their own, and an unbounded fetch would make the sweep's
+        # stale-mutex threshold meaningless (see
+        # STALE_IN_PROGRESS_SECONDS).
+        archive_bytes = await asyncio.wait_for(
+            driver.download(config=plain_config, filename=newest.filename),
+            timeout=_DOWNLOAD_TIMEOUT_SECONDS,
+        )
+    except TimeoutError:
+        return DrillOutcome(
+            state="error",
+            filename=newest.filename,
+            assertions=assertions,
+            error=(
+                f"downloading {newest.filename} from the destination exceeded "
+                f"{_DOWNLOAD_TIMEOUT_SECONDS}s"
+            ),
+        )
     except BackupDestinationError as exc:
         return DrillOutcome(
             state="error",
@@ -594,11 +945,28 @@ async def _execute(target: BackupTarget, *, live_db_url: str) -> DrillOutcome:
         assertions.append(Assertion("archive_readable", FAIL, str(exc)))
         return base
     base.manifest = manifest
+    # The real restore path refuses an archive whose format_version this
+    # build doesn't support, so a drill that waved it through would
+    # report "restorable" for something restore would reject outright —
+    # the one failure mode this whole feature exists to catch. Checked
+    # against the same constant restore.apply_backup_restore uses.
+    fmt_version = manifest.get("format_version")
+    if fmt_version not in SUPPORTED_FORMAT_VERSIONS:
+        assertions.append(
+            Assertion(
+                "archive_readable",
+                FAIL,
+                f"unsupported backup format_version {fmt_version!r} — this build "
+                f"restores {sorted(SUPPORTED_FORMAT_VERSIONS)}. The archive was "
+                f"written by a newer SpatiumDDI; a restore would refuse it.",
+            )
+        )
+        return base
     assertions.append(
         Assertion(
             "archive_readable",
             PASS,
-            f"format_version={manifest.get('format_version')} dump_format={dump_format}",
+            f"format_version={fmt_version} dump_format={dump_format}",
         )
     )
 
@@ -678,7 +1046,22 @@ async def _execute(target: BackupTarget, *, live_db_url: str) -> DrillOutcome:
         assertions.append(Assertion("dump_replays_cleanly", PASS, f"replayed into {scratch_db}"))
 
         try:
-            assertions.extend(await _assert_against_scratch(_scratch_url(live_db_url, scratch_db)))
+            assertions.extend(
+                await asyncio.wait_for(
+                    _assert_against_scratch(_scratch_url(live_db_url, scratch_db)),
+                    timeout=_ASSERT_TIMEOUT_SECONDS,
+                )
+            )
+        except TimeoutError:
+            return DrillOutcome(
+                state="error",
+                filename=newest.filename,
+                archive_bytes=len(archive_bytes),
+                manifest=manifest,
+                scratch_db=scratch_db,
+                assertions=assertions,
+                error=f"post-replay assertions exceeded {_ASSERT_TIMEOUT_SECONDS}s",
+            )
         except Exception as exc:  # noqa: BLE001
             return DrillOutcome(
                 state="error",

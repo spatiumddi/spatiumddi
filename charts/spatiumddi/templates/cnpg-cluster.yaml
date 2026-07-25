@@ -89,6 +89,29 @@ spec:
       secret:
         name: {{ include "spatiumddi.postgresSecretName" . }}
 
+  {{- if .Values.postgresql.cnpg.appRoleCreateDb }}
+  # Restore-verification drills (#702) create a throwaway
+  # ``spatiumddi_drill_*`` database, replay the newest backup archive
+  # into it, assert, and drop it again. ``initdb.owner`` is a plain
+  # LOGIN role with no CREATEDB and ``enableSuperuserAccess`` is off,
+  # so without this grant every drill dies at "permission denied to
+  # create database" and the feature can never run on an appliance.
+  #
+  # ``managed.roles`` reconciles attributes on EXISTING clusters too
+  # (unlike ``initdb.postInitSQL``, which only fires on first
+  # bootstrap), so this grant reaches installs that predate #702.
+  #
+  # Set ``postgresql.cnpg.appRoleCreateDb: false`` to withhold it —
+  # drills then report a clear "role lacks CREATEDB" error rather
+  # than failing obscurely.
+  managed:
+    roles:
+      - name: {{ .Values.postgresql.auth.username | quote }}
+        ensure: present
+        login: true
+        createdb: true
+  {{- end }}
+
   storage:
     size: {{ .Values.postgresql.persistence.size | quote }}
     {{- with .Values.postgresql.persistence.storageClass }}
