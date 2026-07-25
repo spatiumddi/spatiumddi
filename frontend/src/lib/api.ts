@@ -8112,6 +8112,8 @@ export interface DNSTunnelSignal {
   name: string;
   value: number;
   contribution: number;
+  /** This signal's maximum possible contribution — weights differ per signal. */
+  max_contribution: number;
   detail: string;
 }
 

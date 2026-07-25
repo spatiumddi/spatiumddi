@@ -14,22 +14,24 @@ disappear when the feature is off.
 
 from __future__ import annotations
 
+import ipaddress
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from pydantic import BaseModel, Field
-from sqlalchemy import desc, func, select
+from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.auth import User
 from app.models.dns_threat import DNSClientWindow
 from app.services.ai.tools.base import register_tool
+from app.services.dns_threat.aggregate import INTERESTING_SCORE
 
 
 class FindSuspiciousDNSClientsArgs(BaseModel):
     hours: int = Field(default=24, ge=1, le=24 * 30, description="Trailing window to consider.")
     min_score: float = Field(
-        default=20.0,
+        default=INTERESTING_SCORE,
         ge=0,
         le=100,
         description=(
@@ -64,6 +66,12 @@ class FindSuspiciousDNSClientsArgs(BaseModel):
     args_model=FindSuspiciousDNSClientsArgs,
     category="dns",
     module="security.dns_threat",
+    # Explicit per non-negotiable #13. Enabled: the surface exposes no
+    # secrets and makes no off-prem call, and it is already behind a
+    # default-off module that an operator had to turn on knowing it
+    # reads query content — gating it twice would just hide the tool
+    # from the person who opted in.
+    default_enabled=True,
 )
 async def find_suspicious_dns_clients(
     db: AsyncSession, user: User, args: FindSuspiciousDNSClientsArgs
@@ -79,7 +87,22 @@ async def find_suspicious_dns_clients(
         .limit(args.limit)
     )
     if args.client_ip:
-        stmt = stmt.where(DNSClientWindow.client_ip == args.client_ip)
+        # An LLM will cheerfully pass a hostname or a CIDR here; against
+        # an INET column that is a 500 and an internal_error row rather
+        # than an answer.
+        try:
+            ip = str(ipaddress.ip_address(args.client_ip.strip()))
+        except ValueError:
+            return [
+                {
+                    "error": (
+                        f"client_ip must be a single IP address, got "
+                        f"{args.client_ip!r}. Resolve the hostname first, or drop "
+                        f"the filter to see the worst-scoring clients."
+                    )
+                }
+            ]
+        stmt = stmt.where(DNSClientWindow.client_ip == ip)
     else:
         stmt = stmt.where(DNSClientWindow.tunnel_score >= args.min_score)
     rows = (await db.execute(stmt)).scalars().all()
@@ -131,59 +154,23 @@ class DNSThreatSummaryArgs(BaseModel):
     args_model=DNSThreatSummaryArgs,
     category="dns",
     module="security.dns_threat",
+    default_enabled=True,
 )
 async def get_dns_threat_summary(
     db: AsyncSession, user: User, args: DNSThreatSummaryArgs
 ) -> dict[str, Any]:
-    since = datetime.now(UTC) - timedelta(hours=args.hours)
-    totals = (
-        await db.execute(
-            select(
-                func.count().label("windows"),
-                func.count(func.distinct(DNSClientWindow.client_ip)).label("clients"),
-                func.coalesce(func.max(DNSClientWindow.tunnel_score), 0.0).label("peak"),
-            ).where(DNSClientWindow.window_start >= since)
+    # Shared with the REST endpoint and the dashboard card so the
+    # copilot can't answer against a different "suspicious" threshold
+    # than the UI is showing.
+    from app.services.dns_threat.aggregate import compute_threat_summary  # noqa: PLC0415
+
+    out = await compute_threat_summary(db, hours=args.hours)
+    out["since"] = out["since"].isoformat()
+    if not out["has_data"]:
+        out["note"] = (
+            "No client windows have been scored in this period. The rollup "
+            "requires the security.dns_threat module enabled and query "
+            "logging on at least one DNS server group — an empty result "
+            "here is NOT an all-clear."
         )
-    ).one()
-    if not totals.windows:
-        return {
-            "has_data": False,
-            "note": (
-                "No client windows have been scored in this period. The rollup "
-                "requires the security.dns_threat module enabled and query "
-                "logging on at least one DNS server group — an empty result "
-                "here is NOT an all-clear."
-            ),
-            "since": since.isoformat(),
-        }
-    worst = (
-        await db.execute(
-            select(DNSClientWindow)
-            .where(
-                DNSClientWindow.window_start >= since,
-                DNSClientWindow.allowlisted.is_(False),
-            )
-            .order_by(desc(DNSClientWindow.tunnel_score))
-            .limit(1)
-        )
-    ).scalar_one_or_none()
-    suspicious = (
-        await db.execute(
-            select(func.count(func.distinct(DNSClientWindow.client_ip))).where(
-                DNSClientWindow.window_start >= since,
-                DNSClientWindow.allowlisted.is_(False),
-                DNSClientWindow.tunnel_score >= 20.0,
-            )
-        )
-    ).scalar_one()
-    return {
-        "has_data": True,
-        "since": since.isoformat(),
-        "windows_scored": totals.windows,
-        "clients_seen": totals.clients,
-        "suspicious_clients": suspicious or 0,
-        "peak_score": round(float(totals.peak or 0.0), 1),
-        "worst_client_ip": str(worst.client_ip) if worst else None,
-        "worst_client_score": round(worst.tunnel_score, 1) if worst else None,
-        "worst_client_parent": worst.top_parent if worst else None,
-    }
+    return out

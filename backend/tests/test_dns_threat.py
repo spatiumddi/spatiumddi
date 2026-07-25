@@ -78,10 +78,16 @@ def test_entropy_separates_encoded_payload_from_words() -> None:
     assert shannon_entropy(encoded) > shannon_entropy("intranet")
 
 
-def test_split_qname_handles_two_part_public_suffixes() -> None:
-    assert split_qname("a.b.example.co.uk") == ("a", "example.co.uk")
-    assert split_qname("x.example.com") == ("x", "example.com")
-    assert split_qname("single.com") == ("", "single.com")
+def test_split_qname_returns_every_subdomain_label() -> None:
+    """All labels above the parent, not just the leftmost.
+
+    dnscat2 and dnsteal chunk payload across several labels; scoring
+    only ``labels[0]`` let them evade the length and entropy signals
+    entirely while still fanning out.
+    """
+    assert split_qname("a.b.example.co.uk") == (["a", "b"], "example.co.uk")
+    assert split_qname("x.example.com") == (["x"], "example.com")
+    assert split_qname("single.com") == ([], "single.com")
 
 
 def test_allowlist_matches_full_name_not_derived_parent() -> None:
@@ -157,6 +163,63 @@ def test_score_is_bounded() -> None:
     """Weights sum to 100; nothing may exceed it however extreme."""
     extreme = [(f"{'z' * 63}.{i}.evil.example", "NULL", "s") for i in range(5000)]
     assert score_tunneling(extract_features(extreme)).score <= 100.0
+
+
+def test_multi_label_payload_is_not_evaded() -> None:
+    """Payload split across labels must still register on length."""
+    name = "_acme-challenge.some-really-long-generated-hostname-123456.corp.example.com"
+    feats = extract_features([(name, "TXT", "s")] * 40)
+    assert feats.max_label_length == 42, "must measure the longest SUBDOMAIN label"
+
+
+def test_benign_padding_cannot_dilute_the_signal() -> None:
+    """Ratios divide by scoreable queries, not the raw total.
+
+    Otherwise an attacker suppresses their own payload-qtype ratio for
+    free by emitting DNSBL-shaped noise alongside the tunnel.
+    """
+    tunnel = _tunnel_rows(200)
+    alone = extract_features(tunnel)
+    padded = extract_features(tunnel + _dnsbl_rows(400))
+    assert alone.payload_qtype_ratio == padded.payload_qtype_ratio == 1.0
+    assert score_tunneling(alone).score == score_tunneling(padded).score
+
+
+def test_minimum_sample_gate_counts_only_scoreable_queries() -> None:
+    """24 real queries padded with 1000 benign ones is still 24 samples."""
+    rows = _tunnel_rows(MIN_QUERIES_TO_SCORE - 1) + _dnsbl_rows(1000)
+    verdict = score_tunneling(extract_features(rows))
+    assert verdict.score == 0.0
+    assert verdict.signals[0].name == "insufficient_data"
+
+
+def test_unparseable_queries_never_read_as_cleared() -> None:
+    """A query-log parser regression must not render as a clean bill of
+    health — every surface hides allowlisted rows by default."""
+    feats = extract_features([(None, "A", "s")] * 100)
+    assert feats.allowlisted is False, "unparseable is a data problem, not a clearance"
+    verdict = score_tunneling(feats)
+    assert verdict.score == 0.0
+    assert verdict.signals[0].name == "unparseable_queries"
+
+
+def test_kubernetes_service_discovery_is_allowlisted() -> None:
+    """SpatiumDDI's own appliance is a k3s cluster; without this the
+    platform flags its own nodes."""
+    rows = [(f"pod-{i}-abc123def456.svc.cluster.local", "A", "s") for i in range(900)]
+    feats = extract_features(rows)
+    assert feats.allowlisted is True
+    assert score_tunneling(feats).score == 0.0
+
+
+def test_signals_carry_their_own_ceiling() -> None:
+    """The UI draws each bar against its signal's maximum, and weights
+    differ (30/25/30/15)."""
+    verdict = score_tunneling(extract_features(_tunnel_rows()))
+    for sig in verdict.signals:
+        assert sig.max_contribution > 0
+        assert sig.contribution <= sig.max_contribution + 1e-9
+    assert sum(s.max_contribution for s in verdict.signals) == 100.0
 
 
 # ── rollup ────────────────────────────────────────────────────────────

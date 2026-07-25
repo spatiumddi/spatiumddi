@@ -12,17 +12,18 @@ rollup of them.
 
 from __future__ import annotations
 
+import ipaddress
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
-from sqlalchemy import desc, func, select
+from sqlalchemy import desc, select
 
 from app.api.deps import DB, CurrentUser
 from app.core.permissions import require_permission
 from app.models.dns_threat import DNSClientWindow
-from app.services.dns_threat.aggregate import INTERESTING_SCORE
+from app.services.dns_threat.aggregate import INTERESTING_SCORE, compute_threat_summary
 
 # Same gate the Logs router uses: this is a rollup of the DNS query
 # log, so whoever may read raw queries may read a summary of them.
@@ -63,6 +64,18 @@ class ThreatSummary(BaseModel):
     # difference between "no threats" and "not actually running" — the
     # UI needs to say which, or an idle card reads as an all-clear.
     has_data: bool
+
+
+def _validated_ip(value: str) -> str:
+    """Reject anything that isn't a bare IP before it reaches an INET
+    comparison."""
+    try:
+        return str(ipaddress.ip_address(value.strip()))
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"client_ip must be a single IP address, got {value!r}",
+        ) from exc
 
 
 def _to_row(w: DNSClientWindow) -> ClientWindowRow:
@@ -111,7 +124,10 @@ async def list_windows(
         .limit(limit)
     )
     if client_ip:
-        stmt = stmt.where(DNSClientWindow.client_ip == client_ip)
+        # The column is INET; an unvalidated string reaches Postgres as
+        # `client_ip = 'web-01'` and raises `invalid input syntax for
+        # type inet`, surfacing as a 500 rather than a 422.
+        stmt = stmt.where(DNSClientWindow.client_ip == _validated_ip(client_ip))
         # A per-client drilldown wants the client's whole history, not
         # just its interesting hours.
         stmt = stmt.order_by(None).order_by(desc(DNSClientWindow.window_start))
@@ -130,48 +146,4 @@ async def threat_summary(
     hours: int = Query(default=24, ge=1, le=24 * 30),
     min_score: float = Query(default=INTERESTING_SCORE, ge=0, le=100),
 ) -> ThreatSummary:
-    since = datetime.now(UTC) - timedelta(hours=hours)
-
-    totals = (
-        await db.execute(
-            select(
-                func.count().label("windows"),
-                func.count(func.distinct(DNSClientWindow.client_ip)).label("clients"),
-                func.coalesce(func.max(DNSClientWindow.tunnel_score), 0.0).label("peak"),
-            ).where(DNSClientWindow.window_start >= since)
-        )
-    ).one()
-
-    suspicious = (
-        await db.execute(
-            select(func.count(func.distinct(DNSClientWindow.client_ip))).where(
-                DNSClientWindow.window_start >= since,
-                DNSClientWindow.allowlisted.is_(False),
-                DNSClientWindow.tunnel_score >= min_score,
-            )
-        )
-    ).scalar_one()
-
-    worst = (
-        await db.execute(
-            select(DNSClientWindow)
-            .where(
-                DNSClientWindow.window_start >= since,
-                DNSClientWindow.allowlisted.is_(False),
-            )
-            .order_by(desc(DNSClientWindow.tunnel_score))
-            .limit(1)
-        )
-    ).scalar_one_or_none()
-
-    return ThreatSummary(
-        windows_scored=totals.windows or 0,
-        clients_seen=totals.clients or 0,
-        suspicious_clients=suspicious or 0,
-        peak_score=float(totals.peak or 0.0),
-        worst_client_ip=str(worst.client_ip) if worst else None,
-        worst_client_score=worst.tunnel_score if worst else None,
-        worst_client_parent=worst.top_parent if worst else None,
-        since=since,
-        has_data=(totals.windows or 0) > 0,
-    )
+    return ThreatSummary(**await compute_threat_summary(db, hours=hours, min_score=min_score))

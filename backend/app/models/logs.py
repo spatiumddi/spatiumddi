@@ -49,6 +49,11 @@ class DNSQueryLogEntry(Base):
     __table_args__ = (
         Index("ix_dns_query_log_server_ts", "server_id", "ts"),
         Index("ix_dns_query_log_ts", "ts"),
+        # Serves the #699 threat rollup's per-client hourly scan. Must
+        # stay declared here as well as in the migration: autogenerate
+        # diffs against the models, so an undeclared index gets emitted
+        # as a drop into the next revision.
+        Index("ix_dns_query_log_client_ts", "client_ip", "ts"),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)

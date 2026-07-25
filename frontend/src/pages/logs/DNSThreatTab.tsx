@@ -75,9 +75,14 @@ function ScoreCell({ score }: { score: number }) {
 }
 
 function SignalBar({ signal }: { signal: DNSTunnelSignal }) {
-  // Contributions are already weighted out of 100 in total, so the bar
-  // is drawn against the signal's own ceiling rather than the score.
-  const pct = Math.max(0, Math.min(100, signal.contribution * 3));
+  // Against the signal's OWN ceiling, which the backend reports:
+  // weights differ (30/25/30/15), so scaling every bar by the same
+  // factor made a fully-saturated payload-qtype signal render at 45%
+  // and nothing ever reach 100%.
+  const ceiling = signal.max_contribution || 0;
+  const pct = ceiling
+    ? Math.max(0, Math.min(100, (signal.contribution / ceiling) * 100))
+    : 0;
   return (
     <li className="py-1">
       <div className="flex items-baseline justify-between gap-2">
@@ -105,11 +110,21 @@ export function DNSThreatTab() {
   const [hours, setHours] = useState(24);
   const [minScore, setMinScore] = useState(20);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  // Allowlisted windows are hidden by default but reachable: the
+  // rollup keeps them so an operator can confirm "we looked at this
+  // client and cleared it" rather than wondering why a chatty host
+  // never appears at all.
+  const [showAllowlisted, setShowAllowlisted] = useState(false);
 
   const q = useQuery({
-    queryKey: ["dns-threat-windows", hours, minScore],
+    queryKey: ["dns-threat-windows", hours, minScore, showAllowlisted],
     queryFn: () =>
-      dnsThreatApi.listWindows({ hours, min_score: minScore, limit: 200 }),
+      dnsThreatApi.listWindows({
+        hours,
+        min_score: minScore,
+        include_allowlisted: showAllowlisted,
+        limit: 200,
+      }),
     retry: false,
   });
   const summaryQ = useQuery({
@@ -180,6 +195,14 @@ export function DNSThreatTab() {
             <option value={60}>60 — likely tunnel</option>
           </select>
         </div>
+        <label className="flex items-center gap-1.5 text-xs">
+          <input
+            type="checkbox"
+            checked={showAllowlisted}
+            onChange={(e) => setShowAllowlisted(e.target.checked)}
+          />
+          Show cleared (allowlisted)
+        </label>
         <button
           type="button"
           onClick={() => {

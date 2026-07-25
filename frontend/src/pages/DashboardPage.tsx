@@ -3996,7 +3996,7 @@ function DNSThreatCard() {
           </p>
         </div>
         <Link
-          to="/logs"
+          to="/logs?tab=dns-threat"
           className="shrink-0 text-xs text-primary hover:underline"
         >
           View →

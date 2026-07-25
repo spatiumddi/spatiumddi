@@ -89,9 +89,15 @@ class DNSClientWindow(Base):
     tunnel_signals: Mapped[list[dict[str, Any]]] = mapped_column(
         JSONB, nullable=False, default=list
     )
-    # Set when every parent domain in the window matched the benign
-    # allowlist. Kept as a column rather than dropping the row so the
-    # Threat tab can show "we looked and cleared it" instead of silence.
+    # Set when every parseable name in the window matched the benign
+    # allowlist — genuinely cleared. NOT set when nothing was parseable,
+    # which is a data problem and must stay visible, because every
+    # surface filters allowlisted rows out by default.
+    #
+    # Kept as a column rather than dropping the row so the Threat tab's
+    # "Show cleared (allowlisted)" toggle can answer "we looked at this
+    # client and cleared it" instead of the client simply never
+    # appearing.
     allowlisted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
     created_at: Mapped[datetime] = mapped_column(

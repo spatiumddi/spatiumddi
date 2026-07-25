@@ -100,8 +100,23 @@ def upgrade() -> None:
         ["client_ip", "ts"],
     )
 
+    # feature_module seed (non-negotiable #14), default-OFF. The module
+    # resolves to disabled from the catalog fallback either way, but the
+    # table is meant to enumerate the catalog and tooling is entitled to
+    # assume it does.
+    op.execute(
+        sa.text(
+            """
+            INSERT INTO feature_module (id, enabled)
+            VALUES ('security.dns_threat', FALSE)
+            ON CONFLICT (id) DO NOTHING
+            """
+        )
+    )
+
 
 def downgrade() -> None:
+    op.execute(sa.text("DELETE FROM feature_module WHERE id = 'security.dns_threat'"))
     op.drop_index("ix_dns_query_log_client_ts", table_name="dns_query_log_entry")
     op.drop_index("ix_dns_client_window_ip", table_name="dns_client_window")
     op.drop_index("ix_dns_client_window_score", table_name="dns_client_window")

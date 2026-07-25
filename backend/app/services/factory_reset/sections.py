@@ -123,6 +123,7 @@ FACTORY_SECTIONS: tuple[FactorySection, ...] = (
             "dns_tsig_key",
             "dns_trust_anchor",
             "dns_query_log_entry",
+            "dns_client_window",
             "dns_metric_sample",
             "subnet_domain",
             "domain",
@@ -273,6 +274,10 @@ FACTORY_SECTIONS: tuple[FactorySection, ...] = (
         tables=(
             "audit_log",
             "dns_query_log_entry",
+            # Query-derived behavioural data about clients — an operator
+            # wiping observability before handing an appliance on
+            # reasonably expects this gone too (#699).
+            "dns_client_window",
             "dhcp_log_entry",
             "internal_error",
         ),

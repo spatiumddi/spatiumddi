@@ -51,6 +51,11 @@ WINDOW_RETENTION_DAYS = 30
 # isn't running".
 INTERESTING_SCORE = 20.0
 
+# How far back the raw query log is kept (``prune_log_entries``). The
+# backfill sweep can't recover anything older, because the evidence is
+# gone.
+RAW_LOG_RETENTION_HOURS = 24
+
 
 def floor_hour(ts: datetime) -> datetime:
     return ts.replace(minute=0, second=0, microsecond=0)
@@ -183,6 +188,41 @@ async def run_aggregation(
     rows_current = await aggregate_window(db, window_start=current, allowlist=allowlist)
     rows_previous = await aggregate_window(db, window_start=previous, allowlist=allowlist)
 
+    # Backfill. A worker outage longer than two hours (a node drain
+    # during a rolling upgrade, an OOM, a Celery/Redis blip) would
+    # otherwise leave a permanent hole: the raw rows are still on disk
+    # for 24 h but nothing ever looks that far back, and then they are
+    # pruned. Bounded by the raw-log retention and skipped where a
+    # bucket already has rows, so the steady-state cost is one indexed
+    # query per tick.
+    backfilled = 0
+    covered = set(
+        (
+            await db.execute(
+                select(DNSClientWindow.window_start)
+                .where(
+                    DNSClientWindow.window_start >= now - timedelta(hours=RAW_LOG_RETENTION_HOURS)
+                )
+                .distinct()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for back in range(2, RAW_LOG_RETENTION_HOURS):
+        bucket = current - timedelta(hours=back)
+        if bucket in covered:
+            continue
+        written = await aggregate_window(db, window_start=bucket, allowlist=allowlist)
+        if written:
+            backfilled += written
+            logger.info(
+                "dns_threat_backfilled_bucket",
+                bucket=bucket.isoformat(),
+                clients=written,
+                note="gap recovered from raw query log — worker was likely down",
+            )
+
     cutoff = now - timedelta(days=WINDOW_RETENTION_DAYS)
     pruned = await db.execute(delete(DNSClientWindow).where(DNSClientWindow.window_start < cutoff))
     await db.commit()
@@ -190,5 +230,68 @@ async def run_aggregation(
     return {
         "windows_current": rows_current,
         "windows_previous": rows_previous,
+        "backfilled": backfilled,
         "pruned": pruned.rowcount or 0,
+    }
+
+
+async def compute_threat_summary(
+    db: AsyncSession, *, hours: int = 24, min_score: float = INTERESTING_SCORE
+) -> dict[str, Any]:
+    """Trailing-window rollup shared by the REST endpoint, the Security
+    dashboard card and the Operator Copilot.
+
+    One implementation on purpose: the threshold is expected to be
+    retuned once this meets real traffic, and three copies of the query
+    would leave the copilot answering against a different definition of
+    "suspicious" than the UI shows.
+    """
+    from sqlalchemy import func
+
+    since = datetime.now(UTC) - timedelta(hours=hours)
+    totals = (
+        await db.execute(
+            select(
+                func.count().label("windows"),
+                func.count(func.distinct(DNSClientWindow.client_ip)).label("clients"),
+                func.coalesce(func.max(DNSClientWindow.tunnel_score), 0.0).label("peak"),
+            ).where(DNSClientWindow.window_start >= since)
+        )
+    ).one()
+    suspicious = (
+        await db.execute(
+            select(func.count(func.distinct(DNSClientWindow.client_ip))).where(
+                DNSClientWindow.window_start >= since,
+                DNSClientWindow.allowlisted.is_(False),
+                DNSClientWindow.tunnel_score >= min_score,
+            )
+        )
+    ).scalar_one()
+    # Thresholded so a clean install never names an innocent host as
+    # "worst" at 0/100.
+    worst = (
+        await db.execute(
+            select(DNSClientWindow)
+            .where(
+                DNSClientWindow.window_start >= since,
+                DNSClientWindow.allowlisted.is_(False),
+                DNSClientWindow.tunnel_score >= min_score,
+            )
+            .order_by(DNSClientWindow.tunnel_score.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    return {
+        "windows_scored": totals.windows or 0,
+        "clients_seen": totals.clients or 0,
+        "suspicious_clients": suspicious or 0,
+        "peak_score": float(totals.peak or 0.0),
+        "worst_client_ip": str(worst.client_ip) if worst else None,
+        "worst_client_score": worst.tunnel_score if worst else None,
+        "worst_client_parent": worst.top_parent if worst else None,
+        "since": since,
+        # "No data" and "no threats" must stay distinguishable on every
+        # surface — an idle feature rendering as an all-clear is the
+        # failure this whole feature exists to avoid.
+        "has_data": (totals.windows or 0) > 0,
     }

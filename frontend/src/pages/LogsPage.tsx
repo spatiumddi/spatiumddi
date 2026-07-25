@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { useSearchParams } from "react-router-dom";
 import {
   Activity,
   AlertTriangle,
@@ -66,8 +67,29 @@ import { DNSThreatTab } from "./logs/DNSThreatTab";
 
 type Tab = "dns-queries" | "dns-threat" | "dhcp-activity" | "events" | "audit";
 
+const TABS: readonly Tab[] = [
+  "dns-queries",
+  "dns-threat",
+  "dhcp-activity",
+  "events",
+  "audit",
+] as const;
+
 export function LogsPage() {
-  const [tab, setTab] = useState<Tab>("dns-queries");
+  // ``?tab=`` entry point so other surfaces can deep-link a specific
+  // tab — the Security dashboard's DNS-tunneling card needs to land on
+  // DNS Threat, and without this it silently opened DNS Queries
+  // instead. Kept in the URL (not just state) so the link is
+  // shareable and survives a refresh.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const requested = searchParams.get("tab") as Tab | null;
+  const tab: Tab =
+    requested && TABS.includes(requested) ? requested : "dns-queries";
+  const setTab = (next: Tab) => {
+    const params = new URLSearchParams(searchParams);
+    params.set("tab", next);
+    setSearchParams(params, { replace: true });
+  };
 
   // Two source lists: Windows servers (Event Log + DHCP Audit) and
   // agent-driven servers (DNS Queries + DHCP Activity). They're

@@ -91,6 +91,23 @@ DEFAULT_BENIGN_PARENTS: frozenset[str] = frozenset(
         # entirely ordinary.
         "in-addr.arpa",
         "ip6.arpa",
+        # Internal service discovery. Kubernetes pod/service names are
+        # high-entropy, high-fan-out and concentrated under one parent
+        # by construction — and SpatiumDDI's own appliance IS a k3s
+        # cluster, so without these the platform flags its own nodes.
+        "svc.cluster.local",
+        "pod.cluster.local",
+        "cluster.local",
+        "consul",
+        "internal",
+        "in-addr.arpa.local",
+        # Active Directory locator records: many machine-named SRV/A
+        # lookups under one zone.
+        "_msdcs.local",
+        "_tcp.local",
+        "_udp.local",
+        # mDNS / Bonjour.
+        "local.arpa",
     }
 )
 
@@ -152,8 +169,8 @@ def is_benign_parent(name: str, allowlist: frozenset[str] | set[str]) -> bool:
     return any(n == b or n.endswith(f".{b}") for b in allowlist)
 
 
-def split_qname(qname: str) -> tuple[str, str]:
-    """Split into (leftmost label, parent domain).
+def split_qname(qname: str) -> tuple[list[str], str]:
+    """Split into (subdomain labels, parent domain).
 
     "Parent" is the registrable-ish remainder — the last two labels for
     a plain TLD, three when the name sits under a two-part public
@@ -164,14 +181,18 @@ def split_qname(qname: str) -> tuple[str, str]:
     """
     labels = [label for label in qname.lower().rstrip(".").split(".") if label]
     if len(labels) <= 2:
-        return ("", ".".join(labels))
+        return ([], ".".join(labels))
     tail = labels[-2:]
     # Two-part public suffixes we actually see in practice.
     if len(labels) >= 3 and tail[0] in {"co", "com", "net", "org", "ac", "gov", "edu"}:
         if len(tail[-1]) == 2:  # country-code TLD, e.g. co.uk / com.au
             tail = labels[-3:]
     parent = ".".join(tail)
-    return (labels[0], parent)
+    # EVERY label above the parent, not just the leftmost: dnscat2 and
+    # dnsteal chunk payload across several labels, and scoring only
+    # ``labels[0]`` would let them evade the length and entropy signals
+    # entirely while still fanning out.
+    return (labels[: -len(tail)], parent)
 
 
 def _ramp(value: float, floor: float, ceil: float) -> float:
@@ -192,6 +213,17 @@ class ClientFeatures:
     """Detection-agnostic description of one client's window."""
 
     query_count: int = 0
+    # Queries that actually reached the signal maths: a parseable name
+    # under a non-allowlisted parent. Every ratio and the minimum-sample
+    # gate divide by THIS, not ``query_count`` — otherwise padding with
+    # benign lookups dilutes the ratios, which is a suppression channel
+    # an attacker controls for free.
+    scored_query_count: int = 0
+    # Rows whose ``qname`` was NULL/empty. The query-log column is
+    # nullable by design (the parser keeps lines it doesn't fully
+    # understand), so a parser regression shows up here rather than
+    # masquerading as a clean result.
+    unparseable_count: int = 0
     distinct_qnames: int = 0
     distinct_parents: int = 0
     top_parent: str | None = None
@@ -205,7 +237,9 @@ class ClientFeatures:
 
     @property
     def payload_qtype_ratio(self) -> float:
-        return self.payload_qtype_count / self.query_count if self.query_count else 0.0
+        return (
+            self.payload_qtype_count / self.scored_query_count if self.scored_query_count else 0.0
+        )
 
 
 def extract_features(
@@ -220,10 +254,12 @@ def extract_features(
     rather than hydrating whole ORM objects for what may be tens of
     thousands of log lines.
 
-    Allowlisted parents are excluded from the *signal* maths but still
-    counted in ``query_count``, so a host that does one suspicious
-    thing amid a torrent of DNSBL lookups doesn't have its ratio
-    diluted into invisibility.
+    Allowlisted and unparseable rows are excluded from every ratio and
+    from the minimum-sample gate, via ``scored_query_count``. Counting
+    them (as an earlier version did) meant a host could suppress its own
+    payload-qtype ratio simply by emitting DNSBL-shaped noise alongside
+    the tunnel, and could clear the 25-query floor on 24 real samples.
+    ``query_count`` keeps the raw total for display.
     """
     feats = ClientFeatures()
     qnames: set[str] = set()
@@ -231,34 +267,49 @@ def extract_features(
     per_parent: dict[str, set[str]] = defaultdict(set)
     label_lengths: list[int] = []
     entropies: list[float] = []
-    scored_any = False
 
     for qname, qtype, server_id in rows:
         feats.query_count += 1
         if server_id is not None:
             servers.add(server_id)
         if not qname:
+            feats.unparseable_count += 1
             continue
         qnames.add(qname.lower())
         # Allowlist against the full name before deriving the parent —
         # entries are routinely deeper than the two-label parent.
         if is_benign_parent(qname, allowlist):
             continue
-        label, parent = split_qname(qname)
+        sub_labels, parent = split_qname(qname)
         if not parent:
             continue
-        scored_any = True
-        per_parent[parent].add(label)
+        feats.scored_query_count += 1
+        # The whole subdomain path is the fan-out key, so a tunnel that
+        # chunks payload across labels still counts as one unique name
+        # per packet rather than collapsing onto a shared first label.
+        per_parent[parent].add(".".join(sub_labels))
         if (qtype or "").upper() in _PAYLOAD_QTYPES:
             feats.payload_qtype_count += 1
-        if label:
+        for label in sub_labels:
             label_lengths.append(len(label))
-            entropies.append(shannon_entropy(label))
+        if sub_labels:
+            # Entropy over the joined payload region rather than per
+            # label: multi-label encodings are one payload split by
+            # dots, and averaging per label would understate them.
+            entropies.append(shannon_entropy("".join(sub_labels)))
 
     feats.distinct_qnames = len(qnames)
     feats.distinct_parents = len(per_parent)
     feats.server_count = len(servers) or 1
-    feats.allowlisted = feats.query_count > 0 and not scored_any
+    # "Everything this client asked for was benign" — genuinely cleared.
+    # Distinct from "nothing was parseable", which is a data problem and
+    # must NOT read as cleared, because every surface filters allowlisted
+    # rows out of view.
+    feats.allowlisted = (
+        feats.query_count > 0
+        and feats.scored_query_count == 0
+        and feats.unparseable_count < feats.query_count
+    )
 
     if per_parent:
         top_parent, subs = max(per_parent.items(), key=lambda kv: len(kv[1]))
@@ -278,12 +329,19 @@ class Signal:
     value: float
     contribution: float
     detail: str
+    # This signal's maximum possible contribution. Carried through to
+    # the UI so a bar can be drawn as a true percentage of what the
+    # signal could contribute — weights differ (30/25/30/15), so a
+    # fully-saturated payload-qtype signal and a fully-saturated
+    # label-length signal must both render as full.
+    max_contribution: float = 0.0
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "name": self.name,
             "value": round(self.value, 3),
             "contribution": round(self.contribution, 1),
+            "max_contribution": round(self.max_contribution, 1),
             "detail": self.detail,
         }
 
@@ -318,16 +376,36 @@ def score_tunneling(feats: ClientFeatures) -> TunnelVerdict:
                 )
             ],
         )
-    if feats.query_count < MIN_QUERIES_TO_SCORE:
+    if feats.query_count > 0 and feats.unparseable_count == feats.query_count:
+        # NOT a clean bill of health: we could not read a single name.
+        # Left un-allowlisted on purpose so it stays visible — every
+        # surface hides allowlisted rows, and a parser regression that
+        # rendered as "all clear" is the exact failure this feature
+        # exists to avoid.
+        return TunnelVerdict(
+            score=0.0,
+            signals=[
+                Signal(
+                    "unparseable_queries",
+                    float(feats.unparseable_count),
+                    0.0,
+                    f"none of this client's {feats.query_count} logged queries had a "
+                    f"readable name, so nothing could be scored — check the query-log "
+                    f"parser rather than reading this as clear",
+                )
+            ],
+        )
+    if feats.scored_query_count < MIN_QUERIES_TO_SCORE:
         return TunnelVerdict(
             score=0.0,
             signals=[
                 Signal(
                     "insufficient_data",
-                    float(feats.query_count),
+                    float(feats.scored_query_count),
                     0.0,
-                    f"{feats.query_count} queries in the window; "
-                    f"{MIN_QUERIES_TO_SCORE} needed before the ratios mean anything",
+                    f"{feats.scored_query_count} scoreable queries in the window "
+                    f"(of {feats.query_count} total); {MIN_QUERIES_TO_SCORE} needed "
+                    f"before the ratios mean anything",
                 )
             ],
         )
@@ -342,15 +420,17 @@ def score_tunneling(feats: ClientFeatures) -> TunnelVerdict:
             "max_label_length",
             float(feats.max_label_length),
             length_r * _W_LABEL_LENGTH,
-            f"longest label {feats.max_label_length} chars "
+            f"longest subdomain label {feats.max_label_length} chars "
             f"(payload has to live somewhere; 63 is the protocol maximum)",
+            max_contribution=_W_LABEL_LENGTH,
         ),
         Signal(
             "label_entropy",
             feats.mean_label_entropy,
             entropy_r * _W_ENTROPY,
-            f"mean {feats.mean_label_entropy:.2f} bits/char "
-            f"(encoded payload approaches 4.5; ordinary names sit near 3)",
+            f"mean {feats.mean_label_entropy:.2f} bits/char across the subdomain "
+            f"payload (encoded data approaches 4.5; ordinary names sit near 3)",
+            max_contribution=_W_ENTROPY,
         ),
         Signal(
             "subdomain_fanout",
@@ -359,13 +439,16 @@ def score_tunneling(feats: ClientFeatures) -> TunnelVerdict:
             f"{feats.top_parent_subdomains} distinct subdomains under "
             f"{feats.top_parent or 'n/a'} (a tunnel needs a unique name per "
             f"packet or the cache would answer it)",
+            max_contribution=_W_FANOUT,
         ),
         Signal(
             "payload_qtypes",
             feats.payload_qtype_ratio,
             payload_r * _W_PAYLOAD_QTYPE,
-            f"{feats.payload_qtype_ratio:.0%} TXT/NULL/CNAME "
+            f"{feats.payload_qtype_ratio:.0%} TXT/NULL/CNAME of "
+            f"{feats.scored_query_count} scoreable queries "
             f"(these carry the most bytes per response)",
+            max_contribution=_W_PAYLOAD_QTYPE,
         ),
     ]
     return TunnelVerdict(score=sum(s.contribution for s in signals), signals=signals)
