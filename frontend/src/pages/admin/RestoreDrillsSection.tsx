@@ -33,10 +33,13 @@ import { Modal } from "@/components/ui/modal";
  *
  * 1. **Readiness** — one row per backup target: is a drill
  *    scheduled, what did the last one say, how long ago did this
- *    target last *prove* it could be restored. A target with
- *    drills off reads as "never verified" rather than healthy,
+ *    target last *prove* it could be restored. A target that has
+ *    never passed a drill reads as "never" rather than healthy,
  *    which is the honest framing: an untested backup is an
- *    unknown, not a pass.
+ *    unknown, not a pass. A target whose most recent drill merely
+ *    errored keeps its previous proof — an error disproves
+ *    nothing — but the row flags it as superseded once a real
+ *    failure lands.
  *
  * 2. **History** — recent drills, expandable to the per-check
  *    verdicts.
@@ -262,7 +265,9 @@ export function RestoreDrillsSection() {
                       </td>
                       <td className="px-4 py-2 text-xs">
                         {readinessQ.isLoading ? (
-                          <span className="text-muted-foreground">&hellip;</span>
+                          <span className="text-muted-foreground">
+                            &hellip;
+                          </span>
                         ) : readiness?.last_passed_at ? (
                           <span
                             className={
@@ -272,7 +277,8 @@ export function RestoreDrillsSection() {
                             }
                           >
                             {relativeAge(readiness.last_passed_at)}
-                            {!readiness.verified && " (superseded by a failure)"}
+                            {!readiness.verified &&
+                              " (superseded by a failure)"}
                           </span>
                         ) : (
                           <span className="text-muted-foreground">never</span>
