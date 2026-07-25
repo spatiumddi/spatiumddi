@@ -1,7 +1,7 @@
 """Backup + factory-reset read tools for the Operator Copilot
-(issues #117 + #116).
+(issues #117 + #116 + #702).
 
-Three read-only tools, all superadmin-only because the surface
+Five read-only tools, all superadmin-only because the surface
 exposes destination configs (even with secrets redacted, the
 target name + kind + path/bucket/host is sensitive metadata):
 
@@ -18,6 +18,12 @@ target name + kind + path/bucket/host is sensitive metadata):
   audit rows with their per-row counters / sizes / errors.
   Useful for "when did backup last fail?" or "show me last
   week's reset history".
+* ``find_restore_drills`` — restore-verification drill history
+  (#702): did the archive actually survive a test restore, and
+  which checks failed if not.
+* ``get_restore_drill_readiness`` — the rollup that answers "can
+  I restore this install right now, and how do I know?" per
+  target, without reading the whole history.
 
 Deliberately NO ``propose_*`` write tools. The factory-reset and
 restore paths are password-gated + confirm-phrase-gated by design;
@@ -41,7 +47,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.permissions import is_effective_superadmin
 from app.models.audit import AuditLog
 from app.models.auth import User
-from app.models.backup import BackupTarget
+from app.models.backup import BackupTarget, RestoreDrill
 from app.services.ai.tools.base import register_tool
 
 
@@ -309,3 +315,156 @@ async def find_backup_audit_history(
         }
         for r in rows
     ]
+
+
+# ── find_restore_drills ───────────────────────────────────────────────
+
+
+class FindRestoreDrillsArgs(BaseModel):
+    target: str | None = Field(
+        default=None,
+        description="Restrict to one target — id (UUID) or exact name.",
+    )
+    state: Literal["running", "passed", "failed", "error"] | None = Field(
+        default=None,
+        description=(
+            "Filter by verdict. 'failed' means the archive did not "
+            "survive a test restore (a real finding). 'error' means the "
+            "drill could not run at all and says nothing about the "
+            "archive."
+        ),
+    )
+    failed_only: bool = Field(
+        default=False,
+        description="Shorthand for state='failed'. Ignored when state is set.",
+    )
+    since_hours: int | None = Field(
+        default=None, ge=1, le=24 * 365, description="Only drills started within this window."
+    )
+    limit: int = Field(default=50, ge=1, le=500)
+
+
+@register_tool(
+    name="find_restore_drills",
+    description=(
+        "Return restore-verification drill history (superadmin only). "
+        "A drill replays a backup target's newest archive into a "
+        "throwaway database and asserts against the result, proving "
+        "the archive is actually restorable. Each row carries target / "
+        "state / filename / duration / the per-check assertion verdicts "
+        "and any error. Use for 'did my backups pass verification?', "
+        "'which archive failed its drill?', or 'show me the failed "
+        "checks on the corp-vault drill'. Note 'failed' (the archive is "
+        "bad) and 'error' (the drill could not run) mean different "
+        "things and should not be conflated."
+    ),
+    args_model=FindRestoreDrillsArgs,
+    category="admin",
+)
+async def find_restore_drills(
+    db: AsyncSession, user: User, args: FindRestoreDrillsArgs
+) -> list[dict[str, Any]]:
+    gate = _superadmin_gate(user)
+    if gate:
+        return [gate]
+    stmt = select(RestoreDrill, BackupTarget.name).join(
+        BackupTarget, BackupTarget.id == RestoreDrill.target_id
+    )
+    if args.target:
+        as_uuid = _try_uuid(args.target)
+        stmt = stmt.where(
+            RestoreDrill.target_id == as_uuid
+            if as_uuid is not None
+            else BackupTarget.name == args.target
+        )
+    state = args.state or ("failed" if args.failed_only else None)
+    if state:
+        stmt = stmt.where(RestoreDrill.state == state)
+    if args.since_hours is not None:
+        stmt = stmt.where(
+            RestoreDrill.started_at >= datetime.now(UTC) - timedelta(hours=args.since_hours)
+        )
+    stmt = stmt.order_by(desc(RestoreDrill.started_at)).limit(args.limit)
+    rows = (await db.execute(stmt)).all()
+    return [
+        {
+            "id": str(d.id),
+            "target_id": str(d.target_id),
+            "target_name": name,
+            "state": d.state,
+            "triggered_by": d.triggered_by,
+            "filename": d.filename,
+            "archive_bytes": d.archive_bytes,
+            "assertions": d.assertions or [],
+            "error": d.error,
+            "started_at": d.started_at.isoformat() if d.started_at else None,
+            "finished_at": d.finished_at.isoformat() if d.finished_at else None,
+            "duration_ms": d.duration_ms,
+        }
+        for d, name in rows
+    ]
+
+
+# ── get_restore_drill_readiness ───────────────────────────────────────
+
+
+class RestoreDrillReadinessArgs(BaseModel):
+    pass
+
+
+@register_tool(
+    name="get_restore_drill_readiness",
+    description=(
+        "One-shot recovery-readiness rollup across every backup target "
+        "(superadmin only). Per target: whether drills are scheduled, "
+        "the latest verdict, when it last passed, and how stale that "
+        "proof is. Answers the question an operator actually cares "
+        "about — 'can I currently restore this install, and how do I "
+        "know?' — without reading the whole drill history. Targets "
+        "with drills disabled are reported as unverified rather than "
+        "healthy: an untested backup is an unknown, not a pass."
+    ),
+    args_model=RestoreDrillReadinessArgs,
+    category="admin",
+)
+async def get_restore_drill_readiness(
+    db: AsyncSession, user: User, args: RestoreDrillReadinessArgs
+) -> dict[str, Any]:
+    gate = _superadmin_gate(user)
+    if gate:
+        return gate
+    targets = (
+        (await db.execute(select(BackupTarget).order_by(BackupTarget.name.asc()))).scalars().all()
+    )
+    now = datetime.now(UTC)
+    out: list[dict[str, Any]] = []
+    for t in targets:
+        last_pass = await db.scalar(
+            select(RestoreDrill.finished_at)
+            .where(RestoreDrill.target_id == t.id, RestoreDrill.state == "passed")
+            .order_by(desc(RestoreDrill.finished_at))
+            .limit(1)
+        )
+        age_hours = round((now - last_pass).total_seconds() / 3600, 1) if last_pass else None
+        out.append(
+            {
+                "target_id": str(t.id),
+                "target_name": t.name,
+                "kind": t.kind,
+                "enabled": t.enabled,
+                "drills_scheduled": bool(t.drill_enabled and t.drill_cron),
+                "drill_cron": t.drill_cron,
+                "latest_verdict": t.drill_last_status,
+                "latest_drill_at": t.drill_last_at.isoformat() if t.drill_last_at else None,
+                "last_passed_at": last_pass.isoformat() if last_pass else None,
+                "hours_since_last_pass": age_hours,
+                "verified": t.drill_last_status == "passed",
+            }
+        )
+    verified = sum(1 for r in out if r["verified"])
+    return {
+        "targets": out,
+        "total_targets": len(out),
+        "verified_targets": verified,
+        "unverified_targets": len(out) - verified,
+    }

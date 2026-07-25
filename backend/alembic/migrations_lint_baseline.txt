@@ -432,6 +432,12 @@ backend/alembic/versions/c9f2e1a4d7b6_dnsbl_monitoring.py:drop_column:207
 backend/alembic/versions/c9f2e1a4d7b6_dnsbl_monitoring.py:drop_table:199
 backend/alembic/versions/c9f2e1a4d7b6_dnsbl_monitoring.py:drop_table:201
 backend/alembic/versions/c9f2e1a4d7b6_dnsbl_monitoring.py:drop_table:203
+backend/alembic/versions/c9f4a71b8e35_restore_drills.py:drop_column:132
+backend/alembic/versions/c9f4a71b8e35_restore_drills.py:drop_column:133
+backend/alembic/versions/c9f4a71b8e35_restore_drills.py:drop_column:134
+backend/alembic/versions/c9f4a71b8e35_restore_drills.py:drop_column:135
+backend/alembic/versions/c9f4a71b8e35_restore_drills.py:drop_column:136
+backend/alembic/versions/c9f4a71b8e35_restore_drills.py:drop_table:131
 backend/alembic/versions/cb279a6afd70_bgp_looking_glass_collector_peers_.py:drop_table:292
 backend/alembic/versions/cb279a6afd70_bgp_looking_glass_collector_peers_.py:drop_table:298
 backend/alembic/versions/cb279a6afd70_bgp_looking_glass_collector_peers_.py:drop_table:305

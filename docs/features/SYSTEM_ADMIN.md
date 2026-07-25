@@ -253,7 +253,7 @@ Dashboard tiles showing platform-wide stats:
 
 ### 2.9 Backup and Restore
 
-The Backup admin page (`/admin/backup`) ships three tabs: **Manual** (build-and-download / restore-from-file), **Destinations** (configured remote targets, scheduling, restore-from-destination), and **Factory Reset** (per-section wipe back to defaults). Everything described here is reachable from the UI; the same surface is exposed via REST under `/api/v1/backup` and `/api/v1/backup/targets` so operators can drive it from automation.
+The Backup admin page (`/admin/backup`) ships four tabs: **Manual** (build-and-download / restore-from-file), **Destinations** (configured remote targets, scheduling, restore-from-destination), **Restore Drills** (scheduled proof that an archive is actually restorable), and **Factory Reset** (per-section wipe back to defaults). Everything described here is reachable from the UI; the same surface is exposed via REST under `/api/v1/backup`, `/api/v1/backup/targets`, and `/api/v1/backup/drills` so operators can drive it from automation.
 
 #### What's in the archive
 
@@ -369,6 +369,28 @@ Same-install restores return `{"same_install": true, ...counters all zero}`. The
 | nmap scan history | Often huge, regenerable. Sectioned as `nmap_history` (volatile). |
 | Metric samples | Volatile, short retention. Sectioned as `metrics` (volatile). |
 | Uploaded asset directory | Phase 2 polish — uploaded files (custom-field attachments, future logo overrides) aren't a separately-tracked path yet. |
+
+#### Restore drills (issue #702)
+
+A backup you have never restored is a hypothesis. The **Restore Drills** tab turns it into a fact: on its own schedule, SpatiumDDI downloads a target's newest archive, replays it into a throwaway database, runs a fixed assertion set against the result, and drops the throwaway database again.
+
+**The live database is never written to.** The scratch database name is generated from a fixed `spatiumddi_drill_` prefix plus random hex — never from operator input — and is checked against the live database name before anything runs. The drill deliberately does not reuse the operator-facing restore path, which takes a safety dump and disposes the live connection pool; those behaviours are right for a real restore and wrong for an unattended background check.
+
+| Check | What a failure means |
+|---|---|
+| `archive_available` | The destination holds no archives — there is nothing to restore from. |
+| `archive_readable` | The zip is malformed, or its `format_version` is newer than this build. |
+| `passphrase_opens_secrets` | The passphrase stored on the target does not open the archive's `secrets.enc`. A restore from it would be impossible. |
+| `dump_replays_cleanly` | `pg_restore` / `psql` aborted — the dump is truncated or corrupt. |
+| `alembic_version_present` | No single schema revision, or one this build has never heard of (the archive came from a newer SpatiumDDI). An archive *behind* the bundled head passes: a real restore migrates it forward. |
+| `core_tables_populated` | The archive restored but came back with no users — an install restored from it would have no way in. |
+| `audit_chain_intact` | The restored audit log's tamper-evident hash chain does not verify. Skipped when the restored schema isn't at the bundled head, because the ORM-based verifier would misread schema skew as tampering. |
+
+**`failed` and `error` mean different things.** `failed` is a verdict about the archive — a real finding. `error` means the drill could not run at all (destination unreachable, scratch database couldn't be created) and says nothing about the backup. Only `failed` opens the `restore_drill_failed` alert; an `error` leaves whatever the previous verdict was standing, which is the honest reading — you know no more than you did before.
+
+Drills carry their own cron (`drill_enabled` / `drill_cron` on the backup target), separate from the backup schedule, because replaying a full dump costs far more than taking a backup. Weekly drills against nightly backups is the expected shape. The `restore_drill_failed` alert keys on the **target**, so a target failing every night holds one open event rather than opening a new one per drill, and auto-resolves when the target's next drill passes.
+
+Two Operator Copilot tools cover the surface: `find_restore_drills` (history, filterable by verdict) and `get_restore_drill_readiness` (the per-target rollup answering "can I restore this install right now, and how do I know?"). A target with drills switched off reports as *unverified* rather than healthy — an untested backup is an unknown, not a pass.
 
 ---
 

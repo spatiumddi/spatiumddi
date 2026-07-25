@@ -2813,6 +2813,11 @@ export interface BackupTarget {
   last_run_duration_ms: number | null;
   last_run_error: string | null;
   next_run_at: string | null;
+  drill_enabled: boolean;
+  drill_cron: string | null;
+  drill_next_run_at: string | null;
+  drill_last_status: string;
+  drill_last_at: string | null;
   created_at: string;
   modified_at: string;
 }
@@ -2840,6 +2845,34 @@ export interface BackupTargetUpdate {
   schedule_cron?: string | null;
   retention_keep_last_n?: number | null;
   retention_keep_days?: number | null;
+  drill_enabled?: boolean;
+  drill_cron?: string | null;
+}
+
+/** One check inside a restore drill's verdict (issue #702). */
+export interface RestoreDrillAssertion {
+  name: string;
+  /** "pass" | "fail" | "skip" */
+  status: string;
+  detail: string;
+}
+
+export interface RestoreDrill {
+  id: string;
+  target_id: string;
+  target_name: string | null;
+  /** "running" | "passed" | "failed" | "error" */
+  state: string;
+  triggered_by: string;
+  filename: string | null;
+  archive_bytes: number | null;
+  manifest: Record<string, unknown> | null;
+  scratch_db: string | null;
+  assertions: RestoreDrillAssertion[];
+  error: string | null;
+  started_at: string;
+  finished_at: string | null;
+  duration_ms: number | null;
 }
 
 export interface BackupArchiveListing {
@@ -2889,6 +2922,20 @@ export const backupTargetsApi = {
     api
       .get<BackupArchiveListing[]>(`/backup/targets/${id}/archives`)
       .then((r) => r.data),
+  /**
+   * Restore-verification drills (issue #702) — replay this target's
+   * newest archive into a throwaway database and assert against the
+   * result. Synchronous like ``runNow``; the request is held open
+   * for the whole replay.
+   */
+  runDrill: (id: string) =>
+    api.post<RestoreDrill>(`/backup/drills/run/${id}`).then((r) => r.data),
+  listDrills: (params?: {
+    target_id?: string;
+    state?: string;
+    limit?: number;
+  }) =>
+    api.get<RestoreDrill[]>("/backup/drills", { params }).then((r) => r.data),
   deleteArchive: (id: string, filename: string) =>
     api
       .delete<void>(

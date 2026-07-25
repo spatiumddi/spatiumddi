@@ -25,6 +25,7 @@ celery_app = Celery(
         "app.tasks.heartbeat",
         "app.tasks.oui_update",
         "app.tasks.backup_sweep",
+        "app.tasks.backup_drill",
         "app.tasks.prune_internal_errors",
         "app.tasks.prune_logs",
         "app.tasks.prune_metrics",
@@ -98,6 +99,7 @@ celery_app.conf.update(
         "app.tasks.heartbeat.*": {"queue": "default"},
         "app.tasks.oui_update.*": {"queue": "default"},
         "app.tasks.backup_sweep.*": {"queue": "default"},
+        "app.tasks.backup_drill.*": {"queue": "default"},
         "app.tasks.prune_internal_errors.*": {"queue": "default"},
         "app.tasks.prune_logs.*": {"queue": "default"},
         "app.tasks.prune_metrics.*": {"queue": "default"},
@@ -589,6 +591,16 @@ celery_app.conf.update(
         # next tick.
         "backup-target-sweep": {
             "task": "app.tasks.backup_sweep.sweep_backup_targets",
+            "schedule": schedule(run_every=60.0),
+        },
+        # Every 60 s, fire any restore-verification drill whose
+        # ``drill_next_run_at`` is now in the past (issue #702).
+        # Same sweep + per-target mutex shape as the backup sweep
+        # above; drills carry their own cron because replaying a
+        # full dump into a scratch database costs far more than
+        # taking a backup does.
+        "restore-drill-sweep": {
+            "task": "app.tasks.backup_drill.sweep_restore_drills",
             "schedule": schedule(run_every=60.0),
         },
         # Every 60 s, fire any Scheduled Wake-on-LAN schedule whose
