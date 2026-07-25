@@ -295,6 +295,17 @@ RULE_TYPE_TLS_CERT_ISSUER_CHANGED = "tls_cert_issuer_changed"
 # public-facing IP is listed on ≥1 enabled blocklist, auto-resolves when the
 # sweep finds it delisted (the shared open/resolve loop handles both).
 RULE_TYPE_IP_BLOCKLISTED = "ip_blocklisted"
+
+# ``restore_drill_failed`` (issue #702) — a restore-verification drill
+# replayed a target's newest archive into a scratch database and an
+# assertion did not hold. Subject is the **backup target**, so a target
+# failing every night holds one open event instead of opening a new one
+# per drill. Deliberately matches only ``state="failed"`` (the archive
+# is not restorable), never ``state="error"`` (the drill couldn't run —
+# says nothing about the backup, and paging on it would train operators
+# to ignore the rule). Auto-resolves when the target's next drill
+# passes.
+RULE_TYPE_RESTORE_DRILL_FAILED = "restore_drill_failed"
 # Unreachable only pages after a couple of consecutive failures so a
 # single transient handshake blip doesn't fire.
 _TLS_CERT_UNREACHABLE_MIN_FAILURES = 2
@@ -349,6 +360,7 @@ RULE_TYPES = frozenset(
         RULE_TYPE_TLS_CERT_CHANGED,
         RULE_TYPE_TLS_CERT_ISSUER_CHANGED,
         RULE_TYPE_IP_BLOCKLISTED,
+        RULE_TYPE_RESTORE_DRILL_FAILED,
     }
 )
 
@@ -879,6 +891,104 @@ async def _matching_rogue_ra_subjects(
             f"router, or acknowledge it if expected."
         )
         matches.append((str(r.id), display, message))
+    return matches
+
+
+async def _matching_restore_drill_failed_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+) -> list[tuple[str, str, str]]:
+    """Backup targets whose most recent finished drill failed.
+
+    Subject is the **target**, not the drill run, so a target failing
+    every night holds one open event rather than opening a fresh one
+    per drill.
+
+    Only the latest *finished* drill counts. ``running`` rows are
+    skipped so a drill in flight neither opens nor resolves anything,
+    and ``error`` rows are skipped so an unreachable destination
+    doesn't masquerade as a bad archive — an ``error`` leaves whatever
+    the previous verdict was standing, which is the honest reading:
+    we still don't know any more than we did.
+
+    Restricted to targets that are **enabled with drills scheduled**.
+    The manual run-now endpoint will drill a target whose drills are
+    off, so without this filter a single ad-hoc failure could open a
+    critical event that nothing can ever resolve: the documented
+    resolution is "the target's next drill passes", and a target with
+    no schedule has no next drill. Switching drills (or the target)
+    off now resolves the event on the following tick, which also gives
+    operators a reachable way out.
+
+    When the latest finished drill passes, the target stops matching
+    and the shared evaluator loop auto-resolves its open event.
+    """
+    from app.models.backup import BackupTarget, RestoreDrill  # noqa: PLC0415
+
+    rn = func.row_number().over(
+        partition_by=RestoreDrill.target_id,
+        order_by=RestoreDrill.started_at.desc(),
+    )
+    ranked = (
+        select(
+            RestoreDrill.target_id.label("target_id"),
+            RestoreDrill.state.label("state"),
+            RestoreDrill.filename.label("filename"),
+            RestoreDrill.assertions.label("assertions"),
+            RestoreDrill.finished_at.label("finished_at"),
+            rn.label("rn"),
+        )
+        .where(RestoreDrill.state.in_(("passed", "failed")))
+        .subquery()
+    )
+    rows = (
+        await db.execute(
+            select(
+                ranked.c.target_id,
+                ranked.c.state,
+                ranked.c.filename,
+                ranked.c.assertions,
+                ranked.c.finished_at,
+                BackupTarget.name,
+            )
+            .join(BackupTarget, BackupTarget.id == ranked.c.target_id)
+            .where(
+                ranked.c.rn == 1,
+                ranked.c.state == "failed",
+                BackupTarget.enabled.is_(True),
+                BackupTarget.drill_enabled.is_(True),
+            )
+        )
+    ).all()
+
+    matches: list[tuple[str, str, str]] = []
+    for target_id, _state, filename, assertions, finished_at, target_name in rows:
+        failed = [
+            a.get("name", "?")
+            for a in (assertions or [])
+            if isinstance(a, dict) and a.get("status") == "fail"
+        ]
+        detail = ", ".join(failed) if failed else "no assertion detail recorded"
+        when = finished_at.isoformat() if finished_at is not None else "unknown time"
+        # "the archive didn't survive" is the wrong story when the
+        # failing check is that there IS no archive — the operator
+        # would go hunting for corruption instead of finding an empty
+        # destination. Branch on the actual finding.
+        if "archive_available" in failed:
+            message = (
+                f"Restore drill FAILED for backup target '{target_name}': the "
+                f"destination holds no archives to restore from (checked at "
+                f"{when}). There is currently no recovery path from this "
+                f"target — confirm its backups are running."
+            )
+        else:
+            message = (
+                f"Restore drill FAILED for backup target '{target_name}': the newest "
+                f"archive ({filename or 'unknown'}) did not survive a test restore at "
+                f"{when}. Failed checks: {detail}. This archive is not a reliable "
+                f"recovery path — investigate before you need it."
+            )
+        matches.append((str(target_id), target_name, message))
     return matches
 
 
@@ -3959,6 +4069,48 @@ async def seed_ip_blocklisted_alert_rule() -> None:
         await session.commit()
 
 
+async def seed_restore_drill_failed_alert_rule() -> None:
+    """Seed the ``restore_drill_failed`` rule (#702), ENABLED by default.
+
+    The odd one out among the seeds: enabled rather than opt-in. The
+    matcher only considers enabled targets with drills scheduled, so
+    the rule is silent on every install that doesn't use the feature —
+    and an operator who went to the trouble of scheduling drills wants
+    to hear the answer. Keyed on ``rule_type``; an operator who disables
+    or renames it is never overridden.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    async with AsyncSessionLocal() as session:
+        existing = await session.scalar(
+            select(AlertRule).where(AlertRule.rule_type == RULE_TYPE_RESTORE_DRILL_FAILED)
+        )
+        if existing is not None:
+            return
+        session.add(
+            AlertRule(
+                name="Backup restore drill failed",
+                description=(
+                    "Fires when a restore-verification drill replays a backup "
+                    "target's newest archive into a scratch database and an "
+                    "assertion does not hold — the archive is not restorable. "
+                    "Drills that could not run at all (destination unreachable) "
+                    "are NOT covered; those are infrastructure faults, not "
+                    "findings about the backup. Auto-resolves when the target's "
+                    "next drill passes."
+                ),
+                rule_type=RULE_TYPE_RESTORE_DRILL_FAILED,
+                severity="critical",
+                enabled=True,
+                notify_syslog=True,
+                notify_webhook=True,
+                notify_smtp=False,
+            )
+        )
+        await session.commit()
+
+
 async def evaluate_all(db: AsyncSession) -> dict[str, int]:
     """Evaluate every enabled rule; open / resolve events as needed.
 
@@ -4045,6 +4197,10 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 base = await _matching_wol_wake_failed_subjects(db, rule)
                 matches = [(sid, disp, msg, None) for sid, disp, msg in base]
                 subject_type = "wol_schedule"
+            elif rule.rule_type == RULE_TYPE_RESTORE_DRILL_FAILED:
+                base = await _matching_restore_drill_failed_subjects(db, rule)
+                matches = [(sid, disp, msg, None) for sid, disp, msg in base]
+                subject_type = "backup_target"
             elif rule.rule_type == RULE_TYPE_NEW_MAC_SEEN:
                 base = await _matching_new_mac_seen_subjects(db, rule)
                 matches = [(sid, disp, msg, None) for sid, disp, msg in base]

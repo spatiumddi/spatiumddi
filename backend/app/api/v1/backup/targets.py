@@ -108,6 +108,8 @@ class BackupTargetUpdate(BaseModel):
     schedule_cron: str | None = None
     retention_keep_last_n: int | None = Field(default=None, ge=0, le=10_000)
     retention_keep_days: int | None = Field(default=None, ge=0, le=10_000)
+    drill_enabled: bool | None = None
+    drill_cron: str | None = None
 
 
 class BackupTargetResponse(BaseModel):
@@ -129,6 +131,11 @@ class BackupTargetResponse(BaseModel):
     last_run_duration_ms: int | None
     last_run_error: str | None
     next_run_at: datetime | None
+    drill_enabled: bool
+    drill_cron: str | None
+    drill_next_run_at: datetime | None
+    drill_last_status: str
+    drill_last_at: datetime | None
     created_at: datetime
     modified_at: datetime
 
@@ -164,6 +171,11 @@ def _to_response(t: BackupTarget) -> BackupTargetResponse:
         last_run_duration_ms=t.last_run_duration_ms,
         last_run_error=t.last_run_error,
         next_run_at=t.next_run_at,
+        drill_enabled=t.drill_enabled,
+        drill_cron=t.drill_cron,
+        drill_next_run_at=t.drill_next_run_at,
+        drill_last_status=t.drill_last_status,
+        drill_last_at=t.drill_last_at,
         created_at=t.created_at,
         modified_at=t.modified_at,
     )
@@ -325,6 +337,24 @@ async def update_target(
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
             row.schedule_cron = payload["schedule_cron"]
 
+    if "drill_cron" in payload:
+        if payload["drill_cron"] is None or payload["drill_cron"] == "":
+            row.drill_cron = None
+            row.drill_next_run_at = None
+        else:
+            try:
+                validate_cron(payload["drill_cron"])
+                row.drill_next_run_at = compute_next_run(payload["drill_cron"])
+            except InvalidCronExpression as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            row.drill_cron = payload["drill_cron"]
+
+    if payload.get("drill_enabled") and not (payload.get("drill_cron") or row.drill_cron):
+        raise HTTPException(
+            status_code=422,
+            detail="drill_enabled requires drill_cron — set a drill schedule first",
+        )
+
     if "passphrase" in payload and payload["passphrase"] is not None:
         row.passphrase_encrypted = encrypt_str(payload["passphrase"])
 
@@ -335,6 +365,7 @@ async def update_target(
         "passphrase_hint",
         "retention_keep_last_n",
         "retention_keep_days",
+        "drill_enabled",
     ):
         if key in payload:
             setattr(row, key, payload[key])
