@@ -460,6 +460,34 @@ def _render_dnssec_policies(policies: list[dict[str, Any]]) -> str:
     return out
 
 
+
+def _find_running_named() -> int | None:
+    """PID of an already-running ``named``, if any.
+
+    Reads ``/proc`` directly rather than shelling to ``pgrep``: the
+    agent image is Alpine-based and busybox ``pgrep`` semantics differ
+    from procps, and this runs on the startup path where a missing
+    binary must not be able to wedge the daemon launch.
+
+    Only the agent's own children are relevant, but ownership isn't
+    checked — any ``named`` on this PID namespace is the one serving
+    :53, and spawning a second is never the right answer.
+    """
+    try:
+        pids = [entry for entry in os.listdir("/proc") if entry.isdigit()]
+    except OSError:
+        return None
+    for pid in pids:
+        try:
+            with open(f"/proc/{pid}/comm", encoding="utf-8") as fh:
+                if fh.read().strip() == "named":
+                    return int(pid)
+        except (OSError, ValueError):
+            # Process exited between listdir and open, or /proc is not
+            # available (non-Linux dev box) — neither is fatal.
+            continue
+    return None
+
 class Bind9Driver(DriverBase):
     rendered_dir_name = "rendered"
     daemon_pid: int | None = None
@@ -1251,12 +1279,45 @@ class Bind9Driver(DriverBase):
         # running unprivileged as ``spatium`` (entrypoint dropped privs
         # via su-exec), so don't pass ``-u`` — named would try to
         # setgid() to a different user and fail.
+        # Idempotent against the SYSTEM, not just this object's state.
+        #
+        # ``daemon_pid`` is per-instance, so any second driver object
+        # sees ``daemon_running() is False`` and spawns another named.
+        # That is not hypothetical: the agent was observed logging two
+        # ``named_started`` events 118 ms apart at boot (pids 14 and 32,
+        # same parent, same config).
+        #
+        # Two named processes do not fail loudly — BIND uses
+        # SO_REUSEPORT, so both bind :53 and :953 and the kernel
+        # load-balances between them. The visible symptom is that
+        # ``rndc`` becomes unreliable: ``rndc querylog on`` flips the
+        # flag on whichever instance answered, while queries and
+        # ``rndc status`` land on either. Enabling query logging then
+        # appears to do nothing, which silently breaks the Logs → DNS
+        # Queries surface and anything built on it.
+        existing = _find_running_named()
+        if existing is not None:
+            self.daemon_pid = existing
+            log.info(
+                "named_already_running_adopted",
+                pid=existing,
+                note="did not spawn a second daemon",
+            )
+            return
         self.daemon_pid = subprocess.Popen(["named", "-f", "-c", str(conf_path)]).pid
         log.info("named_started", pid=self.daemon_pid)
 
     def daemon_running(self) -> bool:
+        # Falls back to a system-wide look-up when this object has no
+        # pid of its own: another driver instance may legitimately own
+        # the running daemon, and answering "not running" would spawn a
+        # duplicate (see start_daemon).
         if self.daemon_pid is None:
-            return False
+            found = _find_running_named()
+            if found is None:
+                return False
+            self.daemon_pid = found
+            return True
         try:
             os.kill(self.daemon_pid, 0)
             return True
