@@ -19,7 +19,7 @@ from app.models.audit import AuditLog
 from app.models.audit_forward import AuditForwardTarget
 from app.models.auth import APIToken, Group, Role, User, UserSession, user_group
 from app.models.auth_provider import AuthGroupMapping, AuthProvider
-from app.models.backup import BackupTarget
+from app.models.backup import BackupTarget, RestoreDrill
 from app.models.base import Base
 from app.models.bgp_looking_glass import BGPLGPeer, BGPLGRoute, LookingGlassCollector
 from app.models.bgp_monitor import BGPHijackDetection, BGPTrackedPrefix
@@ -58,6 +58,7 @@ from app.models.dns import (
     DNSView,
     DNSZone,
 )
+from app.models.dns_threat import DNSClientWindow
 from app.models.dnsbl import DNSBLList, DNSBLListing, DNSBLPinnedIP
 from app.models.docker import DockerHost
 from app.models.domain import Domain
@@ -220,6 +221,7 @@ __all__ = [
     "NATMapping",
     "DNSMetricSample",
     "DHCPMetricSample",
+    "DNSClientWindow",
     "DNSQueryLogEntry",
     "DHCPLogEntry",
     "CloudEndpoint",
@@ -272,6 +274,7 @@ __all__ = [
     "FirewallRule",
     "InternalError",
     "BackupTarget",
+    "RestoreDrill",
     "TimeBoundGrant",
     "ApprovalPolicy",
     "ChangeRequest",
