@@ -1,11 +1,12 @@
 import { useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
   ChevronDown,
   ChevronRight,
   Loader2,
   RefreshCw,
+  BellOff,
   Search,
   ShieldCheck,
   ShieldQuestion,
@@ -118,6 +119,16 @@ export function DNSThreatTab() {
   // never appears at all.
   const [showAllowlisted, setShowAllowlisted] = useState(false);
   const [inspecting, setInspecting] = useState<string | null>(null);
+  const [muting, setMuting] = useState<string | null>(null);
+  const qc = useQueryClient();
+  const refreshAll = () => {
+    void qc.invalidateQueries({ queryKey: ["dns-threat-windows"] });
+    void qc.invalidateQueries({ queryKey: ["dns-threat-summary"] });
+  };
+  const unmute = useMutation({
+    mutationFn: (ip: string) => dnsThreatApi.unmute(ip),
+    onSuccess: refreshAll,
+  });
 
   const q = useQuery({
     queryKey: ["dns-threat-windows", hours, minScore, showAllowlisted],
@@ -302,11 +313,21 @@ export function DNSThreatTab() {
                     })
                   }
                   onInspect={() => setInspecting(w.client_ip)}
+                  onMute={() => setMuting(w.client_ip)}
+                  onUnmute={() => unmute.mutate(w.client_ip)}
                 />
               ))}
             </tbody>
           </table>
         </div>
+      )}
+
+      {muting && (
+        <MuteModal
+          clientIp={muting}
+          onClose={() => setMuting(null)}
+          onDone={refreshAll}
+        />
       )}
 
       {inspecting && (
@@ -325,11 +346,15 @@ function Row({
   open,
   onToggle,
   onInspect,
+  onMute,
+  onUnmute,
 }: {
   w: DNSClientWindow;
   open: boolean;
   onToggle: () => void;
   onInspect: () => void;
+  onMute: () => void;
+  onUnmute: () => void;
 }) {
   const Chevron = open ? ChevronDown : ChevronRight;
   return (
@@ -340,12 +365,25 @@ function Row({
           stays as the visible affordance that the row does something. */}
       <tr
         onClick={onToggle}
-        className="cursor-pointer border-b last:border-0 hover:bg-accent/40"
+        className={`cursor-pointer border-b last:border-0 hover:bg-accent/40 ${
+          w.muted ? "opacity-50" : ""
+        }`}
       >
         <td className="px-4 py-2">
           <ScoreCell score={w.tunnel_score} />
         </td>
-        <td className="px-4 py-2 font-mono text-xs">{w.client_ip}</td>
+        <td className="px-4 py-2 font-mono text-xs">
+          {w.client_ip}
+          {w.muted && (
+            <span
+              className="ml-1.5 inline-flex items-center gap-1 rounded bg-muted px-1 py-0.5 font-sans text-[10px] text-muted-foreground"
+              title={w.mute_reason ?? undefined}
+            >
+              <BellOff className="h-2.5 w-2.5" />
+              muted
+            </span>
+          )}
+        </td>
         <td className="px-4 py-2 text-xs text-muted-foreground">
           {new Date(w.window_start).toLocaleString()}
         </td>
@@ -371,6 +409,24 @@ function Row({
             toggle, or opening the modal would leave the panel flapping. */}
         <td className="px-4 py-2" onClick={(e) => e.stopPropagation()}>
           <div className="flex justify-end gap-1.5">
+            {w.muted ? (
+              <button
+                type="button"
+                onClick={onUnmute}
+                className="inline-flex items-center gap-1 rounded-md border px-2.5 py-1 text-xs hover:bg-accent"
+              >
+                Unmute
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={onMute}
+                className="inline-flex items-center gap-1 rounded-md border px-2.5 py-1 text-xs hover:bg-accent"
+              >
+                <BellOff className="h-3 w-3" />
+                Mute
+              </button>
+            )}
             <button
               type="button"
               onClick={onInspect}
@@ -393,6 +449,13 @@ function Row({
       {open && (
         <tr className="border-b last:border-0">
           <td colSpan={6} className="bg-muted/30 px-4 py-3">
+            {w.muted && w.mute_reason && (
+              <p className="mb-2 rounded border border-dashed px-2 py-1 text-xs text-muted-foreground">
+                <strong>Muted:</strong> {w.mute_reason}
+                {w.mute_until &&
+                  ` (until ${new Date(w.mute_until).toLocaleDateString()})`}
+              </p>
+            )}
             <p className="mb-2 text-xs text-muted-foreground">
               Every signal is listed, including those contributing nothing —
               what was <em>ruled out</em> matters as much as what fired.
@@ -536,5 +599,120 @@ function Stat({ label, value }: { label: string; value: string }) {
       <div className="text-xs text-muted-foreground">{label}</div>
       <div className="text-lg font-semibold">{value}</div>
     </div>
+  );
+}
+
+/**
+ * Clear a reviewed finding.
+ *
+ * A mute on the CLIENT, not a delete of the rows — deleting wouldn't
+ * stick (the aggregator recomputes recent hours and upserts) and would
+ * destroy evidence of what may be an exfiltration event. The reason is
+ * required, because an unexplained mute is how a real incident gets
+ * buried by someone tidying a dashboard.
+ */
+function MuteModal({
+  clientIp,
+  onClose,
+  onDone,
+}: {
+  clientIp: string;
+  onClose: () => void;
+  onDone: () => void;
+}) {
+  const [reason, setReason] = useState("");
+  // Default to an expiring mute: a snap "this is fine" should age out
+  // and get re-examined rather than silently outlive whoever made it.
+  const [days, setDays] = useState<number | "forever">(30);
+
+  const save = useMutation({
+    mutationFn: () =>
+      dnsThreatApi.mute({
+        client_ip: clientIp,
+        reason,
+        muted_until:
+          days === "forever"
+            ? null
+            : new Date(Date.now() + days * 86400_000).toISOString(),
+      }),
+    onSuccess: () => {
+      onDone();
+      onClose();
+    },
+  });
+
+  return (
+    <Modal title={`Mute findings for ${clientIp}`} onClose={onClose}>
+      <div className="flex flex-col gap-3">
+        <p className="text-xs text-muted-foreground">
+          Hides this client from the Threat tab and stops the{" "}
+          <strong>DNS tunneling suspected</strong> alert firing for it. The
+          scored windows and their evidence are kept — muting records a
+          decision, it doesn&rsquo;t delete anything.
+        </p>
+
+        <div>
+          <label className="mb-1 block text-xs font-medium">
+            Why is this expected? <span className="text-rose-500">*</span>
+          </label>
+          <textarea
+            value={reason}
+            onChange={(e) => setReason(e.target.value)}
+            rows={3}
+            placeholder="e.g. Veeam backup agent — chunks payload into subdomains by design"
+            className="w-full rounded-md border bg-background px-2 py-1.5 text-sm"
+          />
+          <p className="mt-1 text-xs text-muted-foreground">
+            Required. The next person to look at this host reads this instead of
+            re-investigating it.
+          </p>
+        </div>
+
+        <div>
+          <label className="mb-1 block text-xs font-medium">Mute for</label>
+          <select
+            value={String(days)}
+            onChange={(e) =>
+              setDays(
+                e.target.value === "forever"
+                  ? "forever"
+                  : Number(e.target.value),
+              )
+            }
+            className="w-full rounded-md border bg-background px-2 py-1.5 text-sm"
+          >
+            <option value={7}>7 days</option>
+            <option value={30}>30 days</option>
+            <option value={90}>90 days</option>
+            <option value="forever">Indefinitely</option>
+          </select>
+        </div>
+
+        {save.isError && (
+          <p className="text-xs text-rose-600 dark:text-rose-400">
+            {(save.error as Error).message}
+          </p>
+        )}
+
+        <div className="flex justify-end gap-2 pt-1">
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-md border px-3 py-1.5 text-sm hover:bg-accent"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            disabled={reason.trim().length < 3 || save.isPending}
+            onClick={() => save.mutate()}
+            className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+          >
+            {save.isPending && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+            Mute client
+          </button>
+        </div>
+      </div>
+    </Modal>
   );
 }

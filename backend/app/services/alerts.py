@@ -1026,6 +1026,7 @@ async def _matching_dns_tunneling_subjects(
     intent readable when someone later tunes the threshold down.
     """
     from app.models.dns_threat import DNSClientWindow  # noqa: PLC0415
+    from app.models.dns_threat_mute import DNSThreatMute  # noqa: PLC0415
 
     threshold = (
         rule.threshold_percent if rule.threshold_percent is not None else _DNS_TUNNEL_SCORE_DEFAULT
@@ -1043,6 +1044,19 @@ async def _matching_dns_tunneling_subjects(
                 DNSClientWindow.window_start >= since,
                 DNSClientWindow.allowlisted.is_(False),
                 DNSClientWindow.tunnel_score >= threshold,
+                # Operator-muted clients don't page. A host someone has
+                # already reviewed and cleared shouldn't keep waking
+                # people up — and without this the only way to stop it
+                # is disabling the rule, which silences every OTHER
+                # client too.
+                DNSClientWindow.client_ip.not_in(
+                    select(DNSThreatMute.client_ip).where(
+                        or_(
+                            DNSThreatMute.muted_until.is_(None),
+                            DNSThreatMute.muted_until > datetime.now(UTC),
+                        )
+                    )
+                ),
             )
             .group_by(DNSClientWindow.client_ip)
         )

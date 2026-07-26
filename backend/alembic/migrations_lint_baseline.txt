@@ -603,6 +603,7 @@ backend/alembic/versions/e5b21a8f0d94_release_check_state.py:drop_column:57
 backend/alembic/versions/e5b21a8f0d94_release_check_state.py:drop_column:58
 backend/alembic/versions/e5b21a8f0d94_release_check_state.py:drop_column:59
 backend/alembic/versions/e5b21a8f0d94_release_check_state.py:drop_column:60
+backend/alembic/versions/e5b2f09c71a4_dns_threat_mute.py:drop_table:71
 backend/alembic/versions/e5b831f02db9_subnet_block_id_not_null.py:drop_constraint_fk:81
 backend/alembic/versions/e5b831f02db9_subnet_block_id_not_null.py:drop_constraint_fk:93
 backend/alembic/versions/e5c1b3d8f29a_ddns_inheritance.py:drop_column:100

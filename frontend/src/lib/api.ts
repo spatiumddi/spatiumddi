@@ -8106,6 +8106,21 @@ export interface DNSClientWindow {
   tunnel_signals: DNSTunnelSignal[];
   allowlisted: boolean;
   server_count: number;
+  /** An operator reviewed this client and cleared it (#699). */
+  muted: boolean;
+  mute_reason: string | null;
+  mute_until: string | null;
+}
+
+export interface DNSThreatMute {
+  id: string;
+  client_ip: string;
+  reason: string;
+  muted_until: string | null;
+  muted_by_display: string;
+  created_at: string;
+  /** False once an expiring mute has lapsed — the row is kept for audit. */
+  active: boolean;
 }
 
 export interface DNSTunnelSignal {
@@ -8149,6 +8164,18 @@ export const dnsThreatApi = {
   summary: (params?: { hours?: number; min_score?: number }) =>
     api
       .get<DNSThreatSummary>("/dns-threat/summary", { params })
+      .then((r) => r.data),
+  listMutes: () =>
+    api.get<DNSThreatMute[]>("/dns-threat/mutes").then((r) => r.data),
+  /** Muting a client hides its findings AND stops the alert firing. */
+  mute: (body: {
+    client_ip: string;
+    reason: string;
+    muted_until?: string | null;
+  }) => api.post<DNSThreatMute>("/dns-threat/mutes", body).then((r) => r.data),
+  unmute: (clientIp: string) =>
+    api
+      .delete<void>(`/dns-threat/mutes/${encodeURIComponent(clientIp)}`)
       .then((r) => r.data),
 };
 

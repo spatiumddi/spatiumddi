@@ -59,6 +59,7 @@ from app.models.dns import (
     DNSZone,
 )
 from app.models.dns_threat import DNSClientWindow
+from app.models.dns_threat_mute import DNSThreatMute
 from app.models.dnsbl import DNSBLList, DNSBLListing, DNSBLPinnedIP
 from app.models.docker import DockerHost
 from app.models.domain import Domain
@@ -222,6 +223,7 @@ __all__ = [
     "DNSMetricSample",
     "DHCPMetricSample",
     "DNSClientWindow",
+    "DNSThreatMute",
     "DNSQueryLogEntry",
     "DHCPLogEntry",
     "CloudEndpoint",

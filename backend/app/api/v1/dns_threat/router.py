@@ -17,12 +17,14 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import desc, select
 
 from app.api.deps import DB, CurrentUser
 from app.core.permissions import require_permission
+from app.models.audit import AuditLog
 from app.models.dns_threat import DNSClientWindow
+from app.models.dns_threat_mute import DNSThreatMute
 from app.services.dns_threat.aggregate import INTERESTING_SCORE, compute_threat_summary
 
 # Same gate the Logs router uses: this is a rollup of the DNS query
@@ -47,6 +49,11 @@ class ClientWindowRow(BaseModel):
     tunnel_signals: list[dict[str, Any]]
     allowlisted: bool
     server_count: int
+    # Populated per row so the tab can dim a muted client and show who
+    # cleared it, without a second request.
+    muted: bool = False
+    mute_reason: str | None = None
+    mute_until: datetime | None = None
 
 
 class ThreatSummary(BaseModel):
@@ -136,7 +143,19 @@ async def list_windows(
     if not include_allowlisted:
         stmt = stmt.where(DNSClientWindow.allowlisted.is_(False))
     rows = (await db.execute(stmt)).scalars().all()
-    return [_to_row(w) for w in rows]
+    # One lookup for the whole page rather than per row.
+    now = datetime.now(UTC)
+    mutes = {str(m.client_ip): m for m in (await db.execute(select(DNSThreatMute))).scalars().all()}
+    out: list[ClientWindowRow] = []
+    for w in rows:
+        row = _to_row(w)
+        mute = mutes.get(row.client_ip)
+        if mute is not None and mute.is_active(now):
+            row.muted = True
+            row.mute_reason = mute.reason
+            row.mute_until = mute.muted_until
+        out.append(row)
+    return out
 
 
 @router.get("/summary", response_model=ThreatSummary)
@@ -147,3 +166,120 @@ async def threat_summary(
     min_score: float = Query(default=INTERESTING_SCORE, ge=0, le=100),
 ) -> ThreatSummary:
     return ThreatSummary(**await compute_threat_summary(db, hours=hours, min_score=min_score))
+
+
+class MuteBody(BaseModel):
+    client_ip: str
+    # Required, not optional: an unexplained mute is how a real incident
+    # gets buried by someone tidying a dashboard.
+    reason: str = Field(min_length=3, max_length=2000)
+    # NULL = indefinite. The UI defaults to a dated mute so a snap
+    # decision ages out and gets re-examined rather than silently
+    # outliving the person who made it.
+    muted_until: datetime | None = None
+
+
+class MuteRow(BaseModel):
+    id: str
+    client_ip: str
+    reason: str
+    muted_until: datetime | None
+    muted_by_display: str
+    created_at: datetime
+    active: bool
+
+
+def _to_mute_row(m: DNSThreatMute, now: datetime) -> MuteRow:
+    return MuteRow(
+        id=str(m.id),
+        client_ip=str(m.client_ip),
+        reason=m.reason,
+        muted_until=m.muted_until,
+        muted_by_display=m.muted_by_display,
+        created_at=m.created_at,
+        active=m.is_active(now),
+    )
+
+
+@router.get("/mutes", response_model=list[MuteRow])
+async def list_mutes(db: DB, current_user: CurrentUser) -> list[MuteRow]:
+    """Every mute, expired ones included.
+
+    Expired mutes are kept rather than deleted — "we muted this host for
+    30 days in March" is part of the audit trail and explains why a
+    client reappeared.
+    """
+    now = datetime.now(UTC)
+    rows = (
+        (await db.execute(select(DNSThreatMute).order_by(desc(DNSThreatMute.created_at))))
+        .scalars()
+        .all()
+    )
+    return [_to_mute_row(m, now) for m in rows]
+
+
+@router.post("/mutes", response_model=MuteRow, status_code=201)
+async def create_mute(body: MuteBody, db: DB, current_user: CurrentUser) -> MuteRow:
+    """Mute a client, or update the existing mute for it.
+
+    Upsert rather than insert: re-muting an already-muted client should
+    revise the decision (new expiry, better reason), not stack rows that
+    disagree about when the mute ends.
+
+    Audited — muting a finding is a security-relevant judgement call,
+    and the audit row is what makes it reviewable later.
+    """
+    ip = _validated_ip(body.client_ip)
+    existing = (
+        await db.execute(select(DNSThreatMute).where(DNSThreatMute.client_ip == ip))
+    ).scalar_one_or_none()
+    action = "update" if existing is not None else "create"
+    row = existing or DNSThreatMute(client_ip=ip)
+    row.reason = body.reason
+    row.muted_until = body.muted_until
+    row.muted_by = current_user.id
+    row.muted_by_display = current_user.username
+    db.add(row)
+    db.add(
+        AuditLog(
+            action=f"dns_threat_mute_{action}",
+            resource_type="dns_client",
+            resource_id=ip,
+            resource_display=ip,
+            user_id=current_user.id,
+            user_display_name=current_user.username,
+            result="success",
+            new_value={
+                "reason": body.reason,
+                "muted_until": body.muted_until.isoformat() if body.muted_until else None,
+            },
+        )
+    )
+    await db.commit()
+    await db.refresh(row)
+    return _to_mute_row(row, datetime.now(UTC))
+
+
+@router.delete("/mutes/{client_ip}", status_code=204)
+async def delete_mute(client_ip: str, db: DB, current_user: CurrentUser) -> None:
+    """Un-mute a client so its findings surface again."""
+    ip = _validated_ip(client_ip)
+    row = (
+        await db.execute(select(DNSThreatMute).where(DNSThreatMute.client_ip == ip))
+    ).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="no mute for that client")
+    await db.delete(row)
+    db.add(
+        AuditLog(
+            action="dns_threat_mute_delete",
+            resource_type="dns_client",
+            resource_id=ip,
+            resource_display=ip,
+            user_id=current_user.id,
+            user_display_name=current_user.username,
+            result="success",
+            old_value={"reason": row.reason},
+        )
+    )
+    await db.commit()

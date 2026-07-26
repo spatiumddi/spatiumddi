@@ -26,8 +26,10 @@ import base64
 import os
 import uuid
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import pytest
+from httpx import AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -225,6 +227,24 @@ def test_signals_carry_their_own_ceiling() -> None:
 # ── rollup ────────────────────────────────────────────────────────────
 
 
+async def _make_user(db: AsyncSession, *, username: str) -> tuple[Any, str]:
+    from app.core.security import create_access_token, hash_password
+    from app.models.auth import User
+
+    user = User(
+        username=username,
+        email=f"{username}@example.test",
+        display_name=username,
+        hashed_password=hash_password("x"),
+        auth_source="local",
+        is_superadmin=True,
+    )
+    user.groups = []  # mark loaded — is_effective_superadmin walks .groups (#351)
+    db.add(user)
+    await db.flush()
+    return user, create_access_token(str(user.id))
+
+
 async def _make_dns_server(db: AsyncSession) -> DNSServer:
     g = DNSServerGroup(name=f"g-{uuid.uuid4().hex[:8]}", description="")
     db.add(g)
@@ -312,3 +332,109 @@ async def test_aggregate_ignores_queries_outside_the_bucket(
     )
     written = await aggregate_window(db_session, window_start=bucket)
     assert written == 0
+
+
+# ── mute (operator triage) ────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_muted_client_does_not_alert(db_session: AsyncSession) -> None:
+    """A reviewed-and-cleared host must stop paging.
+
+    Without this the only way to silence one noisy client is disabling
+    the rule, which silences every other client too.
+    """
+    from app.models.alerts import AlertRule
+    from app.models.dns_threat_mute import DNSThreatMute
+    from app.services.alerts import (
+        RULE_TYPE_DNS_TUNNELING,
+        _matching_dns_tunneling_subjects,
+    )
+
+    server = await _make_dns_server(db_session)
+    bucket = floor_hour(datetime.now(UTC))
+    await _seed_queries(db_session, server.id, _tunnel_rows(200), ts=bucket, client="10.9.9.9")
+    await aggregate_window(db_session, window_start=bucket)
+
+    rule = AlertRule(
+        name="tunnel",
+        rule_type=RULE_TYPE_DNS_TUNNELING,
+        severity="critical",
+        enabled=True,
+    )
+    assert [d for _, d, _ in await _matching_dns_tunneling_subjects(db_session, rule)] == [
+        "10.9.9.9"
+    ]
+
+    db_session.add(DNSThreatMute(client_ip="10.9.9.9", reason="backup agent", muted_until=None))
+    await db_session.flush()
+    assert await _matching_dns_tunneling_subjects(db_session, rule) == []
+
+
+@pytest.mark.asyncio
+async def test_expired_mute_alerts_again(db_session: AsyncSession) -> None:
+    """An expiring mute is a decision that ages out — the point of
+    offering a dated mute at all."""
+    from app.models.alerts import AlertRule
+    from app.models.dns_threat_mute import DNSThreatMute
+    from app.services.alerts import (
+        RULE_TYPE_DNS_TUNNELING,
+        _matching_dns_tunneling_subjects,
+    )
+
+    server = await _make_dns_server(db_session)
+    bucket = floor_hour(datetime.now(UTC))
+    await _seed_queries(db_session, server.id, _tunnel_rows(200), ts=bucket, client="10.9.9.8")
+    await aggregate_window(db_session, window_start=bucket)
+    db_session.add(
+        DNSThreatMute(
+            client_ip="10.9.9.8",
+            reason="temporary",
+            muted_until=datetime.now(UTC) - timedelta(hours=1),
+        )
+    )
+    await db_session.flush()
+
+    rule = AlertRule(
+        name="tunnel",
+        rule_type=RULE_TYPE_DNS_TUNNELING,
+        severity="critical",
+        enabled=True,
+    )
+    assert [d for _, d, _ in await _matching_dns_tunneling_subjects(db_session, rule)] == [
+        "10.9.9.8"
+    ], "a lapsed mute must not keep suppressing"
+
+
+def test_mute_is_active_semantics() -> None:
+    from app.models.dns_threat_mute import DNSThreatMute
+
+    now = datetime.now(UTC)
+    assert DNSThreatMute(client_ip="1.1.1.1", muted_until=None).is_active(now) is True
+    assert (
+        DNSThreatMute(client_ip="1.1.1.1", muted_until=now + timedelta(days=1)).is_active(now)
+        is True
+    )
+    assert (
+        DNSThreatMute(client_ip="1.1.1.1", muted_until=now - timedelta(days=1)).is_active(now)
+        is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_mute_requires_a_reason(client: AsyncClient, db_session: AsyncSession) -> None:
+    """An unexplained mute is how a real incident gets buried by someone
+    tidying a dashboard."""
+    from app.models.feature_module import FeatureModule
+
+    # The whole /dns-threat prefix is module-gated and the module is
+    # default-off, so without this the request 404s before validation.
+    db_session.add(FeatureModule(id="security.dns_threat", enabled=True))
+    _, token = await _make_user(db_session, username="mutereason")
+    await db_session.flush()
+    res = await client.post(
+        "/api/v1/dns-threat/mutes",
+        json={"client_ip": "10.0.0.5", "reason": ""},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert res.status_code == 422
