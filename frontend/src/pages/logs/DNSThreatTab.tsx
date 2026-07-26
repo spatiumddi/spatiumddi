@@ -118,16 +118,21 @@ export function DNSThreatTab() {
   // client and cleared it" rather than wondering why a chatty host
   // never appears at all.
   const [showAllowlisted, setShowAllowlisted] = useState(false);
+  const [showMutes, setShowMutes] = useState(false);
   const [inspecting, setInspecting] = useState<string | null>(null);
   const [muting, setMuting] = useState<string | null>(null);
   const qc = useQueryClient();
   const refreshAll = () => {
     void qc.invalidateQueries({ queryKey: ["dns-threat-windows"] });
     void qc.invalidateQueries({ queryKey: ["dns-threat-summary"] });
+    void qc.invalidateQueries({ queryKey: ["dns-threat-mutes"] });
   };
   const unmute = useMutation({
     mutationFn: (ip: string) => dnsThreatApi.unmute(ip),
-    onSuccess: refreshAll,
+    onSuccess: () => {
+      refreshAll();
+      void qc.invalidateQueries({ queryKey: ["dns-threat-mutes"] });
+    },
   });
 
   const q = useQuery({
@@ -209,6 +214,14 @@ export function DNSThreatTab() {
             <option value={60}>60 — likely tunnel</option>
           </select>
         </div>
+        <button
+          type="button"
+          onClick={() => setShowMutes((v) => !v)}
+          className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm hover:bg-accent"
+        >
+          <BellOff className="h-4 w-4" />
+          Muted clients
+        </button>
         <label className="flex items-center gap-1.5 text-xs">
           <input
             type="checkbox"
@@ -320,6 +333,13 @@ export function DNSThreatTab() {
             </tbody>
           </table>
         </div>
+      )}
+
+      {showMutes && (
+        <MutedClientsPanel
+          onUnmute={(ip) => unmute.mutate(ip)}
+          error={unmute.error as Error | null}
+        />
       )}
 
       {muting && (
@@ -714,5 +734,90 @@ function MuteModal({
         </div>
       </div>
     </Modal>
+  );
+}
+
+/**
+ * The muted-clients list.
+ *
+ * Without it, the only Unmute affordance was a button on a listed
+ * window row — so an indefinite mute became unreachable the moment the
+ * client stopped scoring (or its windows aged past the 30-day prune),
+ * permanently suppressing a critical alert with no way to discover or
+ * revoke it short of a psql session.
+ */
+function MutedClientsPanel({
+  onUnmute,
+  error,
+}: {
+  onUnmute: (ip: string) => void;
+  error: Error | null;
+}) {
+  const q = useQuery({
+    queryKey: ["dns-threat-mutes"],
+    queryFn: () => dnsThreatApi.listMutes(),
+    retry: false,
+  });
+  const rows = q.data ?? [];
+
+  return (
+    <section className="rounded-lg border bg-card">
+      <div className="border-b px-4 py-3">
+        <h3 className="text-sm font-semibold">Muted clients</h3>
+        <p className="mt-0.5 text-xs text-muted-foreground">
+          Reviewed and cleared. These do not appear in the findings list and do
+          not fire the tunneling alert. Expired mutes are kept — they explain
+          why a client started appearing again.
+        </p>
+      </div>
+      {error && (
+        <p className="border-b px-4 py-2 text-xs text-rose-600 dark:text-rose-400">
+          Could not un-mute: {error.message}
+        </p>
+      )}
+      {q.isLoading ? (
+        <p className="px-4 py-4 text-sm text-muted-foreground">
+          Loading&hellip;
+        </p>
+      ) : rows.length === 0 ? (
+        <p className="px-4 py-4 text-sm text-muted-foreground">
+          No clients are muted.
+        </p>
+      ) : (
+        <ul className="divide-y">
+          {rows.map((m) => (
+            <li
+              key={m.id}
+              className="flex flex-wrap items-center gap-2 px-4 py-2 text-xs"
+            >
+              <span className="font-mono">{m.client_ip}</span>
+              {!m.active && (
+                <span className="rounded bg-muted px-1 py-0.5 text-[10px] text-muted-foreground">
+                  expired
+                </span>
+              )}
+              <span className="min-w-0 flex-1 break-words text-muted-foreground">
+                {m.reason}
+              </span>
+              <span className="shrink-0 text-muted-foreground">
+                {m.muted_until
+                  ? `until ${new Date(m.muted_until).toLocaleDateString()}`
+                  : "indefinite"}
+                {m.muted_by_display && ` · ${m.muted_by_display}`}
+              </span>
+              {m.active && (
+                <button
+                  type="button"
+                  onClick={() => onUnmute(m.client_ip)}
+                  className="shrink-0 rounded-md border px-2.5 py-1 hover:bg-accent"
+                >
+                  Unmute
+                </button>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
   );
 }

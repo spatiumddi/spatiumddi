@@ -1255,11 +1255,13 @@ class Bind9Driver(DriverBase):
         # setgid() to a different user and fail.
         # Idempotent against the SYSTEM, not just this object's state.
         #
-        # ``daemon_pid`` is per-instance, so any second driver object
-        # sees ``daemon_running() is False`` and spawns another named.
-        # That is not hypothetical: the agent was observed logging two
-        # ``named_started`` events 118 ms apart at boot (pids 14 and 32,
-        # same parent, same config).
+        # ``daemon_pid`` is per-instance state, and only
+        # ``daemon_running()`` stands between the two ``start_daemon()``
+        # call sites and a duplicate spawn. Observed on a real agent:
+        # two ``named_started`` events 118 ms apart at boot (pids 14 and
+        # 32, same parent, same config). The precise race is not fully
+        # established — see ``_process`` — but consulting the system
+        # rather than instance state fixes it either way.
         #
         # Two named processes do not fail loudly — BIND uses
         # SO_REUSEPORT, so both bind :53 and :953 and the kernel

@@ -1,7 +1,10 @@
 """DNS threat analytics read surface (issue #699).
 
-Read-only: the detections write themselves via the rollup task, and
-there is nothing here an operator mutates. Gated behind the default-off
+Read-mostly: the detections write themselves via the rollup task. The
+one mutation is the per-client mute (operator triage), which carries a
+``write`` permission gate of its own because suppressing a critical
+security finding must not be something a read-only account can do.
+Gated behind the default-off
 ``security.dns_threat`` feature module at the router include, so the
 whole prefix 404s on installs that haven't opted in.
 
@@ -18,7 +21,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import desc, select
+from sqlalchemy import desc, or_, select
 
 from app.api.deps import DB, CurrentUser
 from app.core.permissions import require_permission
@@ -114,6 +117,7 @@ async def list_windows(
     hours: int = Query(default=24, ge=1, le=24 * 30),
     min_score: float = Query(default=INTERESTING_SCORE, ge=0, le=100),
     include_allowlisted: bool = Query(default=False),
+    include_muted: bool = Query(default=False),
     limit: int = Query(default=100, ge=1, le=1000),
 ) -> list[ClientWindowRow]:
     """Scored client windows, worst first.
@@ -142,6 +146,21 @@ async def list_windows(
         stmt = stmt.where(DNSClientWindow.tunnel_score >= min_score)
     if not include_allowlisted:
         stmt = stmt.where(DNSClientWindow.allowlisted.is_(False))
+    if not include_muted and not client_ip:
+        # A muted client is one an operator reviewed and cleared, so it
+        # drops out of the default view — that is what the mute dialog
+        # promises. Still reachable via the toggle, and a per-client
+        # lookup always shows everything so the drilldown stays honest.
+        stmt = stmt.where(
+            DNSClientWindow.client_ip.not_in(
+                select(DNSThreatMute.client_ip).where(
+                    or_(
+                        DNSThreatMute.muted_until.is_(None),
+                        DNSThreatMute.muted_until > datetime.now(UTC),
+                    )
+                )
+            )
+        )
     rows = (await db.execute(stmt)).scalars().all()
     # One lookup for the whole page rather than per row.
     now = datetime.now(UTC)
@@ -218,7 +237,16 @@ async def list_mutes(db: DB, current_user: CurrentUser) -> list[MuteRow]:
     return [_to_mute_row(m, now) for m in rows]
 
 
-@router.post("/mutes", response_model=MuteRow, status_code=201)
+@router.post(
+    "/mutes",
+    response_model=MuteRow,
+    status_code=201,
+    # The router-level gate is ``read`` because this surface is
+    # read-mostly — but muting SUPPRESSES A CRITICAL SECURITY ALERT, so
+    # it cannot inherit it. Without this a Viewer (read:*) could silence
+    # an exfiltration finding. Non-negotiable #3.
+    dependencies=[Depends(require_permission("write", "server"))],
+)
 async def create_mute(body: MuteBody, db: DB, current_user: CurrentUser) -> MuteRow:
     """Mute a client, or update the existing mute for it.
 
@@ -260,7 +288,11 @@ async def create_mute(body: MuteBody, db: DB, current_user: CurrentUser) -> Mute
     return _to_mute_row(row, datetime.now(UTC))
 
 
-@router.delete("/mutes/{client_ip}", status_code=204)
+@router.delete(
+    "/mutes/{client_ip}",
+    status_code=204,
+    dependencies=[Depends(require_permission("write", "server"))],
+)
 async def delete_mute(client_ip: str, db: DB, current_user: CurrentUser) -> None:
     """Un-mute a client so its findings surface again."""
     ip = _validated_ip(client_ip)

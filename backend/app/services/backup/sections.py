@@ -321,9 +321,11 @@ SECTIONS: tuple[Section, ...] = (
             "whole point of the rollup is that the summary outlives "
             "the raw lines, so a restore that dropped it would lose "
             "the only record that a host looked like an exfil tunnel "
-            "last week."
+            "last week. Includes the per-client mutes — losing those on "
+            "restore would start paging about hosts an operator already "
+            "reviewed and cleared."
         ),
-        tables=("dns_client_window",),
+        tables=("dns_client_window", "dns_threat_mute"),
     ),
     Section(
         key="metrics",

@@ -1,10 +1,14 @@
 """DNS threat analytics tools for the Operator Copilot (issue #699).
 
-Two read-only tools over the per-client tunneling rollup. No
-``propose_*`` writes: there is nothing to mutate here — the rollup
-writes itself, and the operator action a finding calls for (isolate the
-host, pull a packet capture, check what it's running) lives behind
-other tools with their own gates.
+Three read-only tools over the per-client tunneling rollup.
+
+**No ``propose_mute_dns_client``** — an explicit decision, not an
+oversight (non-negotiable #13). Muting suppresses a ``critical``
+exfiltration alert and requires a written justification that outlives
+the person who gave it; that belongs in a deliberate UI action with a
+typed reason, not a chat turn, even an Apply-gated one. What the
+copilot does need is to *see* mutes, so it stops re-reporting hosts an
+operator already triaged — hence ``find_dns_threat_mutes``.
 
 Not superadmin-gated, unlike the backup tools: this is a summary of the
 DNS query log, and the permission model already decides who may read
@@ -173,4 +177,61 @@ async def get_dns_threat_summary(
             "logging on at least one DNS server group — an empty result "
             "here is NOT an all-clear."
         )
+    return out
+
+
+class FindDNSThreatMutesArgs(BaseModel):
+    include_expired: bool = Field(
+        default=False,
+        description=(
+            "Include mutes that have lapsed. Expired mutes are kept for "
+            "audit and explain why a client started appearing again."
+        ),
+    )
+
+
+@register_tool(
+    name="find_dns_threat_mutes",
+    description=(
+        "List DNS clients an operator has reviewed and muted, with the "
+        "reason, who muted them and when it expires. Use before "
+        "reporting a tunneling finding — a muted client has already "
+        "been triaged and saying so ('10.0.0.5 is muted: Veeam backup "
+        "agent') is more useful than re-reporting it as a threat. Also "
+        "answers 'what have we cleared?' and 'why is this host not "
+        "alerting?'."
+    ),
+    args_model=FindDNSThreatMutesArgs,
+    category="dns",
+    module="security.dns_threat",
+    default_enabled=True,
+)
+async def find_dns_threat_mutes(
+    db: AsyncSession, user: User, args: FindDNSThreatMutesArgs
+) -> list[dict[str, Any]]:
+    from app.models.dns_threat_mute import DNSThreatMute  # noqa: PLC0415
+
+    now = datetime.now(UTC)
+    rows = (
+        (await db.execute(select(DNSThreatMute).order_by(desc(DNSThreatMute.created_at))))
+        .scalars()
+        .all()
+    )
+    out = []
+    for m in rows:
+        active = m.is_active(now)
+        if not active and not args.include_expired:
+            continue
+        out.append(
+            {
+                "client_ip": str(m.client_ip),
+                "reason": m.reason,
+                "active": active,
+                "muted_until": m.muted_until.isoformat() if m.muted_until else None,
+                "muted_by": m.muted_by_display,
+                "created_at": m.created_at.isoformat() if m.created_at else None,
+            }
+        )
+    if not out:
+        return [{"result": "no muted clients"}]
     return out

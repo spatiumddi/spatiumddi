@@ -282,6 +282,14 @@ def extract_features(
             continue
         sub_labels, parent = split_qname(qname)
         if not parent:
+            # Root / single-label / otherwise unsplittable. Counted as
+            # unparseable rather than silently skipped: skipping left
+            # scored_query_count at 0 with unparseable_count also 0,
+            # which the allowlisted guard below reads as "everything was
+            # benign" — hiding the client from every surface, which is
+            # precisely the failure the unparseable branch exists to
+            # prevent.
+            feats.unparseable_count += 1
             continue
         feats.scored_query_count += 1
         # The whole subdomain path is the fan-out key, so a tunnel that
@@ -410,7 +418,16 @@ def score_tunneling(feats: ClientFeatures) -> TunnelVerdict:
             ],
         )
 
-    length_r = _ramp(feats.max_label_length, _LABEL_LENGTH_FLOOR, _LABEL_LENGTH_CEIL)
+    # Blend max with mean. On max alone a SINGLE long lookup — one
+    # _acme-challenge TXT, a DKIM selector, an un-allowlisted CDN
+    # hostname — handed a client the full 30 points for the hour no
+    # matter how ordinary its other 10,000 queries were. A tunnel's
+    # labels are long *on average*; a false positive's are long once.
+    # Keeping some weight on max means a short-label tunnel padded with
+    # normal traffic still registers.
+    length_r = 0.4 * _ramp(
+        feats.max_label_length, _LABEL_LENGTH_FLOOR, _LABEL_LENGTH_CEIL
+    ) + 0.6 * _ramp(feats.avg_label_length, _LABEL_LENGTH_FLOOR, _LABEL_LENGTH_CEIL)
     entropy_r = _ramp(feats.mean_label_entropy, _ENTROPY_FLOOR, _ENTROPY_CEIL)
     fanout_r = _ramp(feats.top_parent_subdomains, _FANOUT_FLOOR, _FANOUT_CEIL)
     payload_r = _ramp(feats.payload_qtype_ratio, _PAYLOAD_RATIO_FLOOR, _PAYLOAD_RATIO_CEIL)
@@ -420,8 +437,10 @@ def score_tunneling(feats: ClientFeatures) -> TunnelVerdict:
             "max_label_length",
             float(feats.max_label_length),
             length_r * _W_LABEL_LENGTH,
-            f"longest subdomain label {feats.max_label_length} chars "
-            f"(payload has to live somewhere; 63 is the protocol maximum)",
+            f"longest subdomain label {feats.max_label_length} chars, mean "
+            f"{feats.avg_label_length:.0f} (payload has to live somewhere; 63 is "
+            f"the protocol maximum — the mean is weighted higher so one long "
+            f"lookup can't carry the signal)",
             max_contribution=_W_LABEL_LENGTH,
         ),
         Signal(

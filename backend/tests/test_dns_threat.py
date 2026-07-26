@@ -438,3 +438,130 @@ async def test_mute_requires_a_reason(client: AsyncClient, db_session: AsyncSess
         headers={"Authorization": f"Bearer {token}"},
     )
     assert res.status_code == 422
+
+
+async def _enable_module(db: AsyncSession) -> None:
+    """The /dns-threat prefix is module-gated and default-off."""
+    from app.models.feature_module import FeatureModule
+
+    db.add(FeatureModule(id="security.dns_threat", enabled=True))
+    await db.flush()
+
+
+@pytest.mark.asyncio
+async def test_mute_create_then_update_is_an_upsert(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Re-muting revises the decision rather than stacking rows that
+    disagree about when the mute ends."""
+    from app.models.dns_threat_mute import DNSThreatMute
+
+    await _enable_module(db_session)
+    _, token = await _make_user(db_session, username="muteupsert")
+    h = {"Authorization": f"Bearer {token}"}
+
+    r1 = await client.post(
+        "/api/v1/dns-threat/mutes",
+        json={"client_ip": "10.0.0.5", "reason": "first pass"},
+        headers=h,
+    )
+    assert r1.status_code == 201
+    r2 = await client.post(
+        "/api/v1/dns-threat/mutes",
+        json={"client_ip": "10.0.0.5", "reason": "actually the backup agent"},
+        headers=h,
+    )
+    assert r2.status_code == 201
+    rows = (await db_session.execute(select(DNSThreatMute))).scalars().all()
+    assert len(rows) == 1, "second mute must update, not stack"
+    assert rows[0].reason == "actually the backup agent"
+
+
+@pytest.mark.asyncio
+async def test_mute_and_unmute_are_audited(client: AsyncClient, db_session: AsyncSession) -> None:
+    """Non-negotiable #4 — muting suppresses a critical alert, so the
+    decision has to be reviewable afterwards."""
+    from app.models.audit import AuditLog
+
+    await _enable_module(db_session)
+    _, token = await _make_user(db_session, username="muteaudit")
+    h = {"Authorization": f"Bearer {token}"}
+
+    await client.post(
+        "/api/v1/dns-threat/mutes",
+        json={"client_ip": "10.0.0.6", "reason": "reviewed, benign"},
+        headers=h,
+    )
+    await client.delete("/api/v1/dns-threat/mutes/10.0.0.6", headers=h)
+
+    actions = (
+        (
+            await db_session.execute(
+                select(AuditLog.action).where(AuditLog.resource_type == "dns_client")
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert "dns_threat_mute_create" in actions
+    assert "dns_threat_mute_delete" in actions
+
+
+@pytest.mark.asyncio
+async def test_unmute_missing_returns_404(client: AsyncClient, db_session: AsyncSession) -> None:
+    await _enable_module(db_session)
+    _, token = await _make_user(db_session, username="mutemissing")
+    res = await client.delete(
+        "/api/v1/dns-threat/mutes/10.0.0.7",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert res.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_mute_rejects_a_hostname(client: AsyncClient, db_session: AsyncSession) -> None:
+    """The column is INET; an unvalidated string is a 500, not a 422."""
+    await _enable_module(db_session)
+    _, token = await _make_user(db_session, username="mutehostname")
+    res = await client.post(
+        "/api/v1/dns-threat/mutes",
+        json={"client_ip": "web-01.corp.example.com", "reason": "not an ip"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert res.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_muted_client_drops_out_of_summary_and_windows(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Muting must clear the client everywhere an operator looks, not
+    only in the alert — the mute dialog promises exactly that."""
+    await _enable_module(db_session)
+    _, token = await _make_user(db_session, username="mutesurfaces")
+    h = {"Authorization": f"Bearer {token}"}
+
+    server = await _make_dns_server(db_session)
+    bucket = floor_hour(datetime.now(UTC))
+    await _seed_queries(db_session, server.id, _tunnel_rows(200), ts=bucket, client="10.0.0.8")
+    await aggregate_window(db_session, window_start=bucket)
+
+    before = (await client.get("/api/v1/dns-threat/summary", headers=h)).json()
+    assert before["suspicious_clients"] >= 1
+    assert before["worst_client_ip"] == "10.0.0.8"
+
+    await client.post(
+        "/api/v1/dns-threat/mutes",
+        json={"client_ip": "10.0.0.8", "reason": "reviewed"},
+        headers=h,
+    )
+
+    after = (await client.get("/api/v1/dns-threat/summary", headers=h)).json()
+    assert after["worst_client_ip"] != "10.0.0.8"
+    listed = (await client.get("/api/v1/dns-threat/windows", headers=h)).json()
+    assert all(
+        w["client_ip"] != "10.0.0.8" for w in listed
+    ), "a muted client must not appear in the default findings list"
+    # ...but stays reachable when explicitly asked for.
+    shown = (await client.get("/api/v1/dns-threat/windows?include_muted=true", headers=h)).json()
+    assert any(w["client_ip"] == "10.0.0.8" and w["muted"] for w in shown)

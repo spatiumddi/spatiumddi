@@ -1,9 +1,20 @@
 """Process look-up shared by the DNS daemon drivers (issue #704).
 
-Both drivers track their daemon with a per-instance ``daemon_pid``, and
-both call ``start_daemon()`` from two places (``supervisor.py`` at boot
-and the config-apply path). A second driver object therefore sees
-``daemon_running() is False`` and spawns a duplicate daemon.
+Both drivers track their daemon with a per-instance ``daemon_pid`` and
+call ``start_daemon()`` from two places — ``supervisor.py`` at boot and
+the config-apply path — with only ``daemon_running()`` between them and
+a duplicate spawn.
+
+**The exact trigger is not fully established.** An earlier version of
+this docstring blamed a second driver object; that is wrong —
+``supervisor.run()`` builds exactly one driver and hands that same
+object to the sync loop. What was observed on a real agent is two
+``named_started`` events 118 ms apart from one process, which most
+plausibly means the boot-path daemon had not yet been reflected in
+``daemon_pid`` (or had already exited) when the first config apply ran
+its check. Whatever the precise race, the fix is the same and does not
+depend on knowing it: consult the system rather than instance state
+before spawning.
 
 The two failure modes look nothing alike, which is why this went
 unnoticed for so long:

@@ -314,11 +314,12 @@ RULE_TYPE_RESTORE_DRILL_FAILED = "restore_drill_failed"
 # windows drop back below the threshold, which is what makes it safe to
 # leave armed: a one-off spike closes itself on the next tick.
 RULE_TYPE_DNS_TUNNELING = "dns_tunneling_suspected"
-# Score out of 100. 60 puts it comfortably above ordinary traffic
-# (validation had busy many-parent traffic at 18 and mail-server TXT at
-# 15) while still catching the shorter-label dnscat2 shape near 50 when
-# an operator lowers it. Overridable per-rule via ``threshold_percent``.
-_DNS_TUNNEL_SCORE_DEFAULT = 60.0
+# The alerting bar lives in ``dns_threat.aggregate`` next to
+# ``INTERESTING_SCORE`` so the two stay a visible pair rather than
+# drifting apart in separate modules — "worth a look on a dashboard"
+# and "page me at 03:00" are deliberately different bars. Resolved via
+# a function-local import in the matcher below (module-level would drag
+# the aggregator into every alerts import).
 # Only consider windows this recent, so a finding from last week doesn't
 # keep an event open after the behaviour stopped.
 _DNS_TUNNEL_WINDOW = timedelta(hours=6)
@@ -1027,10 +1028,9 @@ async def _matching_dns_tunneling_subjects(
     """
     from app.models.dns_threat import DNSClientWindow  # noqa: PLC0415
     from app.models.dns_threat_mute import DNSThreatMute  # noqa: PLC0415
+    from app.services.dns_threat.aggregate import ALERTING_SCORE  # noqa: PLC0415
 
-    threshold = (
-        rule.threshold_percent if rule.threshold_percent is not None else _DNS_TUNNEL_SCORE_DEFAULT
-    )
+    threshold = rule.threshold_percent if rule.threshold_percent is not None else ALERTING_SCORE
     since = datetime.now(UTC) - _DNS_TUNNEL_WINDOW
     rows = (
         await db.execute(
@@ -1066,28 +1066,47 @@ async def _matching_dns_tunneling_subjects(
 
     # Fetch the worst window per matching client for the message detail —
     # a score with no "why" is not actionable at 03:00.
+    # One statement for the worst window per matching client, instead of
+    # a SELECT per client inside the 60 s tick. An operator who lowers
+    # the threshold to survey their estate turns that loop into 1 + N
+    # with N = every client over the threshold — hundreds of serialised
+    # round-trips a minute on a busy resolver, inside evaluate_all,
+    # which is also running every other rule type.
+    ids = [r[0] for r in rows]
+    ranked = (
+        select(
+            DNSClientWindow.client_ip.label("ip"),
+            DNSClientWindow.top_parent.label("top_parent"),
+            DNSClientWindow.tunnel_signals.label("signals"),
+            func.row_number()
+            .over(
+                partition_by=DNSClientWindow.client_ip,
+                order_by=DNSClientWindow.tunnel_score.desc(),
+            )
+            .label("rn"),
+        )
+        .where(
+            DNSClientWindow.client_ip.in_(ids),
+            DNSClientWindow.window_start >= since,
+        )
+        .subquery()
+    )
+    worst_by_ip = {
+        str(r.ip): r for r in (await db.execute(select(ranked).where(ranked.c.rn == 1))).all()
+    }
+
     matches: list[tuple[str, str, str]] = []
     for client_ip, peak, queries, windows in rows:
         ip = str(client_ip)
-        worst = (
-            await db.execute(
-                select(DNSClientWindow)
-                .where(
-                    DNSClientWindow.client_ip == client_ip,
-                    DNSClientWindow.window_start >= since,
-                )
-                .order_by(DNSClientWindow.tunnel_score.desc())
-                .limit(1)
-            )
-        ).scalar_one_or_none()
+        worst = worst_by_ip.get(ip)
         top_signals = ""
-        if worst is not None and worst.tunnel_signals:
-            ranked = sorted(
-                (s for s in worst.tunnel_signals if isinstance(s, dict)),
-                key=lambda s: s.get("contribution", 0),
+        if worst is not None and worst.signals:
+            top = sorted(
+                (sig for sig in worst.signals if isinstance(sig, dict)),
+                key=lambda sig: sig.get("contribution", 0),
                 reverse=True,
             )[:2]
-            top_signals = "; ".join(str(s.get("detail", "")) for s in ranked if s.get("detail"))
+            top_signals = "; ".join(str(sig.get("detail", "")) for sig in top if sig.get("detail"))
         parent = worst.top_parent if worst is not None else None
         message = (
             f"DNS client {ip} scored {peak:.0f}/100 for tunneling behaviour across "

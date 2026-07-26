@@ -924,8 +924,9 @@ class PowerDNSDriver(DriverBase):
             log.error("pdns_server_binary_missing")
             return
         # Idempotent against the SYSTEM, not this object's state (#704).
-        # ``daemon_pid`` is per-instance, so a second driver object sees
-        # ``daemon_running() is False`` and spawns a duplicate. Unlike
+        # ``daemon_pid`` is per-instance and only ``daemon_running()``
+        # guards the two ``start_daemon()`` call sites from racing into
+        # a duplicate spawn. Unlike
         # BIND9 — which uses SO_REUSEPORT and quietly runs two servers —
         # pdns_server has no ``reuseport`` set, so the duplicate fails to
         # bind :53 and exits. The damage is subtler for it: the ``Popen``

@@ -19,11 +19,14 @@ Two pieces:
   bucket as late log lines arrive. Deliberately not per-server: a host
   splitting queries across two resolvers is one suspicious host, not
   two half-suspicious ones.
-* ``ix_dns_query_log_client_ts`` on ``dns_query_log_entry`` — the
-  aggregator scans by (client_ip, ts) every run, and the existing
-  indexes lead with ``server_id`` or ``ts`` alone, so without this the
-  rollup degrades to a full scan of a table that can hold a busy
-  resolver's entire day.
+No new index on ``dns_query_log_entry``. An earlier draft added
+``(client_ip, ts)`` on the theory that the aggregator scans per client;
+it does not — it scans a *time range* across all clients and sorts, so
+``EXPLAIN`` shows the planner using the existing ``ix_dns_query_log_ts``
+and ignoring the new index entirely. Even the Logs client-IP filter
+prefers the ``ts`` index because of its ``ORDER BY ts DESC LIMIT``.
+Left out rather than carried: it is a third index to maintain on the
+highest-insert-rate table in the schema for no measured read benefit.
 
 Additive and inert on upgrade: nothing writes to the new table until an
 operator enables the default-off ``security.dns_threat`` module, which
@@ -91,15 +94,6 @@ def upgrade() -> None:
     # Per-client history drilldown.
     op.create_index("ix_dns_client_window_ip", "dns_client_window", ["client_ip"])
 
-    # The aggregator's scan pattern. Without it the rollup full-scans
-    # dns_query_log_entry, whose existing indexes lead with server_id
-    # or ts and so can't serve "this client, this hour".
-    op.create_index(
-        "ix_dns_query_log_client_ts",
-        "dns_query_log_entry",
-        ["client_ip", "ts"],
-    )
-
     # feature_module seed (non-negotiable #14), default-OFF. The module
     # resolves to disabled from the catalog fallback either way, but the
     # table is meant to enumerate the catalog and tooling is entitled to
@@ -117,7 +111,6 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.execute(sa.text("DELETE FROM feature_module WHERE id = 'security.dns_threat'"))
-    op.drop_index("ix_dns_query_log_client_ts", table_name="dns_query_log_entry")
     op.drop_index("ix_dns_client_window_ip", table_name="dns_client_window")
     op.drop_index("ix_dns_client_window_score", table_name="dns_client_window")
     op.drop_table("dns_client_window")

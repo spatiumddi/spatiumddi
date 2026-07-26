@@ -51,10 +51,21 @@ WINDOW_RETENTION_DAYS = 30
 # isn't running".
 INTERESTING_SCORE = 20.0
 
+# The score at which a finding is worth waking someone for. Distinct
+# from INTERESTING_SCORE on purpose — "worth a look on a dashboard" and
+# "page me at 03:00" are different bars — but defined HERE, next to it,
+# so the two are visibly a pair rather than drifting apart in separate
+# modules. The alert rule imports this; a per-rule threshold_percent
+# still overrides it.
+ALERTING_SCORE = 60.0
+
 # How far back the raw query log is kept (``prune_log_entries``). The
 # backfill sweep can't recover anything older, because the evidence is
 # gone.
 RAW_LOG_RETENTION_HOURS = 24
+
+# Set after the first backfill sweep of this process. See run_aggregation.
+_backfill_attempted = False
 
 
 def floor_hour(ts: datetime) -> datetime:
@@ -196,6 +207,26 @@ async def run_aggregation(
     # bucket already has rows, so the steady-state cost is one indexed
     # query per tick.
     backfilled = 0
+    # Once per process, not every tick. The gap this recovers from is a
+    # worker/beat outage — which means a process restart, so the first
+    # tick after coming back is exactly when it matters. Running it on
+    # every tick instead re-scanned every legitimately-quiet hour
+    # forever, because a bucket with no clients never gets a row and so
+    # can never become "covered".
+    global _backfill_attempted
+    if _backfill_attempted:
+        cutoff = now - timedelta(days=WINDOW_RETENTION_DAYS)
+        pruned = await db.execute(
+            delete(DNSClientWindow).where(DNSClientWindow.window_start < cutoff)
+        )
+        await db.commit()
+        return {
+            "windows_current": rows_current,
+            "windows_previous": rows_previous,
+            "backfilled": 0,
+            "pruned": pruned.rowcount or 0,
+        }
+    _backfill_attempted = True
     covered = set(
         (
             await db.execute(
@@ -246,16 +277,32 @@ async def compute_threat_summary(
     would leave the copilot answering against a different definition of
     "suspicious" than the UI shows.
     """
-    from sqlalchemy import func
+    from sqlalchemy import func, or_
+
+    from app.models.dns_threat_mute import DNSThreatMute
 
     since = datetime.now(UTC) - timedelta(hours=hours)
+    # Muting is a decision that a client has been reviewed and cleared,
+    # so it has to clear the client everywhere an operator looks — not
+    # just stop the alert. Otherwise the Security dashboard card stays
+    # red and the copilot keeps reporting a host someone already
+    # triaged, which is exactly what the mute UI promises it won't do.
+    muted = select(DNSThreatMute.client_ip).where(
+        or_(
+            DNSThreatMute.muted_until.is_(None),
+            DNSThreatMute.muted_until > datetime.now(UTC),
+        )
+    )
     totals = (
         await db.execute(
             select(
                 func.count().label("windows"),
                 func.count(func.distinct(DNSClientWindow.client_ip)).label("clients"),
                 func.coalesce(func.max(DNSClientWindow.tunnel_score), 0.0).label("peak"),
-            ).where(DNSClientWindow.window_start >= since)
+            ).where(
+                DNSClientWindow.window_start >= since,
+                DNSClientWindow.client_ip.not_in(muted),
+            )
         )
     ).one()
     suspicious = (
@@ -264,6 +311,7 @@ async def compute_threat_summary(
                 DNSClientWindow.window_start >= since,
                 DNSClientWindow.allowlisted.is_(False),
                 DNSClientWindow.tunnel_score >= min_score,
+                DNSClientWindow.client_ip.not_in(muted),
             )
         )
     ).scalar_one()
@@ -276,6 +324,7 @@ async def compute_threat_summary(
                 DNSClientWindow.window_start >= since,
                 DNSClientWindow.allowlisted.is_(False),
                 DNSClientWindow.tunnel_score >= min_score,
+                DNSClientWindow.client_ip.not_in(muted),
             )
             .order_by(DNSClientWindow.tunnel_score.desc())
             .limit(1)

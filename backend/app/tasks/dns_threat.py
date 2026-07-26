@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 
 import structlog
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.celery_app import celery_app
 from app.db import task_session
@@ -40,7 +41,11 @@ async def _run() -> dict[str, object]:
 @celery_app.task(
     name="app.tasks.dns_threat.aggregate_dns_client_windows",
     bind=True,
-    autoretry_for=(OSError, ConnectionError),
+    # SQLAlchemyError included because this task is entirely DB-bound:
+    # a CNPG failover or pool exhaustion raises OperationalError, which
+    # without this loses the tick outright. Matches the set standardised
+    # across the other beat tasks in #221/#222.
+    autoretry_for=(SQLAlchemyError, ConnectionError, OSError),
     retry_backoff=True,
     retry_backoff_max=600,
     max_retries=3,
