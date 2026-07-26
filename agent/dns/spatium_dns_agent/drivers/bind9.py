@@ -27,6 +27,7 @@ try:
 except ImportError:  # pragma: no cover - runtime-optional
     dns = None  # type: ignore[assignment]
 
+from ._process import find_running_daemon, is_zombie
 from .base import DriverBase
 
 log = structlog.get_logger(__name__)
@@ -458,6 +459,7 @@ def _render_dnssec_policies(policies: list[dict[str, Any]]) -> str:
         block += "};\n"
         out += block
     return out
+
 
 
 class Bind9Driver(DriverBase):
@@ -1251,14 +1253,51 @@ class Bind9Driver(DriverBase):
         # running unprivileged as ``spatium`` (entrypoint dropped privs
         # via su-exec), so don't pass ``-u`` — named would try to
         # setgid() to a different user and fail.
+        # Idempotent against the SYSTEM, not just this object's state.
+        #
+        # ``daemon_pid`` is per-instance state, and only
+        # ``daemon_running()`` stands between the two ``start_daemon()``
+        # call sites and a duplicate spawn. Observed on a real agent:
+        # two ``named_started`` events 118 ms apart at boot (pids 14 and
+        # 32, same parent, same config). The precise race is not fully
+        # established — see ``_process`` — but consulting the system
+        # rather than instance state fixes it either way.
+        #
+        # Two named processes do not fail loudly — BIND uses
+        # SO_REUSEPORT, so both bind :53 and :953 and the kernel
+        # load-balances between them. The visible symptom is that
+        # ``rndc`` becomes unreliable: ``rndc querylog on`` flips the
+        # flag on whichever instance answered, while queries and
+        # ``rndc status`` land on either. Enabling query logging then
+        # appears to do nothing, which silently breaks the Logs → DNS
+        # Queries surface and anything built on it.
+        existing = find_running_daemon("named")
+        if existing is not None:
+            self.daemon_pid = existing
+            log.info(
+                "named_already_running_adopted",
+                pid=existing,
+                note="did not spawn a second daemon",
+            )
+            return
         self.daemon_pid = subprocess.Popen(["named", "-f", "-c", str(conf_path)]).pid
         log.info("named_started", pid=self.daemon_pid)
 
     def daemon_running(self) -> bool:
+        # Falls back to a system-wide look-up when this object has no
+        # pid of its own: another driver instance may legitimately own
+        # the running daemon, and answering "not running" would spawn a
+        # duplicate (see start_daemon).
         if self.daemon_pid is None:
-            return False
+            found = find_running_daemon("named")
+            if found is None:
+                return False
+            self.daemon_pid = found
+            return True
         try:
             os.kill(self.daemon_pid, 0)
-            return True
         except OSError:
             return False
+        # A zombie still answers signal 0, so the state check is what
+        # actually distinguishes "running" from "dead but unreaped".
+        return not is_zombie(str(self.daemon_pid))

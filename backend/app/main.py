@@ -529,6 +529,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_restore_drill_failed_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("restore_drill_alert_rule_seed_skipped", reason=str(exc))
+    try:
+        from app.services.alerts import seed_dns_tunneling_alert_rule  # noqa: PLC0415
+
+        await seed_dns_tunneling_alert_rule()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("dns_tunneling_alert_rule_seed_skipped", reason=str(exc))
     # Appliance Web UI cert bootstrap (issue #134, Phase 4b.5). On
     # appliance installs without an active row in appliance_certificate,
     # generate a self-signed default + deploy it to /etc/nginx/certs

@@ -441,6 +441,7 @@ backend/alembic/versions/c9f4a71b8e35_restore_drills.py:drop_table:135
 backend/alembic/versions/cb279a6afd70_bgp_looking_glass_collector_peers_.py:drop_table:292
 backend/alembic/versions/cb279a6afd70_bgp_looking_glass_collector_peers_.py:drop_table:298
 backend/alembic/versions/cb279a6afd70_bgp_looking_glass_collector_peers_.py:drop_table:305
+backend/alembic/versions/d1a7c34e9b60_dns_client_window.py:drop_table:116
 backend/alembic/versions/d1a8f3c704e9_proxmox_integration.py:drop_column:107
 backend/alembic/versions/d1a8f3c704e9_proxmox_integration.py:drop_column:110
 backend/alembic/versions/d1a8f3c704e9_proxmox_integration.py:drop_table:112
@@ -602,6 +603,7 @@ backend/alembic/versions/e5b21a8f0d94_release_check_state.py:drop_column:57
 backend/alembic/versions/e5b21a8f0d94_release_check_state.py:drop_column:58
 backend/alembic/versions/e5b21a8f0d94_release_check_state.py:drop_column:59
 backend/alembic/versions/e5b21a8f0d94_release_check_state.py:drop_column:60
+backend/alembic/versions/e5b2f09c71a4_dns_threat_mute.py:drop_table:71
 backend/alembic/versions/e5b831f02db9_subnet_block_id_not_null.py:drop_constraint_fk:81
 backend/alembic/versions/e5b831f02db9_subnet_block_id_not_null.py:drop_constraint_fk:93
 backend/alembic/versions/e5c1b3d8f29a_ddns_inheritance.py:drop_column:100

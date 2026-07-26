@@ -306,6 +306,23 @@ RULE_TYPE_IP_BLOCKLISTED = "ip_blocklisted"
 # to ignore the rule). Auto-resolves when the target's next drill
 # passes.
 RULE_TYPE_RESTORE_DRILL_FAILED = "restore_drill_failed"
+
+# ``dns_tunneling_suspected`` (issue #699) — a client's DNS behaviour
+# scored above the tunneling threshold in a recent hourly window.
+# Subject is the **client IP**, so a host tunnelling for six hours holds
+# one open event rather than six. Auto-resolves when the client's recent
+# windows drop back below the threshold, which is what makes it safe to
+# leave armed: a one-off spike closes itself on the next tick.
+RULE_TYPE_DNS_TUNNELING = "dns_tunneling_suspected"
+# The alerting bar lives in ``dns_threat.aggregate`` next to
+# ``INTERESTING_SCORE`` so the two stay a visible pair rather than
+# drifting apart in separate modules — "worth a look on a dashboard"
+# and "page me at 03:00" are deliberately different bars. Resolved via
+# a function-local import in the matcher below (module-level would drag
+# the aggregator into every alerts import).
+# Only consider windows this recent, so a finding from last week doesn't
+# keep an event open after the behaviour stopped.
+_DNS_TUNNEL_WINDOW = timedelta(hours=6)
 # Unreachable only pages after a couple of consecutive failures so a
 # single transient handshake blip doesn't fire.
 _TLS_CERT_UNREACHABLE_MIN_FAILURES = 2
@@ -361,6 +378,7 @@ RULE_TYPES = frozenset(
         RULE_TYPE_TLS_CERT_ISSUER_CHANGED,
         RULE_TYPE_IP_BLOCKLISTED,
         RULE_TYPE_RESTORE_DRILL_FAILED,
+        RULE_TYPE_DNS_TUNNELING,
     }
 )
 
@@ -989,6 +1007,117 @@ async def _matching_restore_drill_failed_subjects(
                 f"recovery path — investigate before you need it."
             )
         matches.append((str(target_id), target_name, message))
+    return matches
+
+
+async def _matching_dns_tunneling_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+) -> list[tuple[str, str, str]]:
+    """Clients whose recent DNS behaviour scored as tunneling (#699).
+
+    Subject is the **client IP**, not the window: a host tunnelling for
+    six hours should hold one open event, not six. The matcher looks at
+    the client's highest-scoring window inside the trailing window, so
+    the event auto-resolves once the behaviour stops and the recent
+    windows fall back below threshold — no bespoke resolve path.
+
+    ``allowlisted`` windows are excluded structurally rather than by
+    score: they are already scored 0, but being explicit keeps the
+    intent readable when someone later tunes the threshold down.
+    """
+    from app.models.dns_threat import DNSClientWindow  # noqa: PLC0415
+    from app.models.dns_threat_mute import DNSThreatMute  # noqa: PLC0415
+    from app.services.dns_threat.aggregate import ALERTING_SCORE  # noqa: PLC0415
+
+    threshold = rule.threshold_percent if rule.threshold_percent is not None else ALERTING_SCORE
+    since = datetime.now(UTC) - _DNS_TUNNEL_WINDOW
+    rows = (
+        await db.execute(
+            select(
+                DNSClientWindow.client_ip,
+                func.max(DNSClientWindow.tunnel_score).label("peak"),
+                func.sum(DNSClientWindow.query_count).label("queries"),
+                func.count().label("windows"),
+            )
+            .where(
+                DNSClientWindow.window_start >= since,
+                DNSClientWindow.allowlisted.is_(False),
+                DNSClientWindow.tunnel_score >= threshold,
+                # Operator-muted clients don't page. A host someone has
+                # already reviewed and cleared shouldn't keep waking
+                # people up — and without this the only way to stop it
+                # is disabling the rule, which silences every OTHER
+                # client too.
+                DNSClientWindow.client_ip.not_in(
+                    select(DNSThreatMute.client_ip).where(
+                        or_(
+                            DNSThreatMute.muted_until.is_(None),
+                            DNSThreatMute.muted_until > datetime.now(UTC),
+                        )
+                    )
+                ),
+            )
+            .group_by(DNSClientWindow.client_ip)
+        )
+    ).all()
+    if not rows:
+        return []
+
+    # Fetch the worst window per matching client for the message detail —
+    # a score with no "why" is not actionable at 03:00.
+    # One statement for the worst window per matching client, instead of
+    # a SELECT per client inside the 60 s tick. An operator who lowers
+    # the threshold to survey their estate turns that loop into 1 + N
+    # with N = every client over the threshold — hundreds of serialised
+    # round-trips a minute on a busy resolver, inside evaluate_all,
+    # which is also running every other rule type.
+    ids = [r[0] for r in rows]
+    ranked = (
+        select(
+            DNSClientWindow.client_ip.label("ip"),
+            DNSClientWindow.top_parent.label("top_parent"),
+            DNSClientWindow.tunnel_signals.label("signals"),
+            func.row_number()
+            .over(
+                partition_by=DNSClientWindow.client_ip,
+                order_by=DNSClientWindow.tunnel_score.desc(),
+            )
+            .label("rn"),
+        )
+        .where(
+            DNSClientWindow.client_ip.in_(ids),
+            DNSClientWindow.window_start >= since,
+        )
+        .subquery()
+    )
+    worst_by_ip = {
+        str(r.ip): r for r in (await db.execute(select(ranked).where(ranked.c.rn == 1))).all()
+    }
+
+    matches: list[tuple[str, str, str]] = []
+    for client_ip, peak, queries, windows in rows:
+        ip = str(client_ip)
+        worst = worst_by_ip.get(ip)
+        top_signals = ""
+        if worst is not None and worst.signals:
+            top = sorted(
+                (sig for sig in worst.signals if isinstance(sig, dict)),
+                key=lambda sig: sig.get("contribution", 0),
+                reverse=True,
+            )[:2]
+            top_signals = "; ".join(str(sig.get("detail", "")) for sig in top if sig.get("detail"))
+        parent = worst.top_parent if worst is not None else None
+        message = (
+            f"DNS client {ip} scored {peak:.0f}/100 for tunneling behaviour across "
+            f"{windows} hourly window(s) ({queries} queries)"
+            + (f", concentrated on {parent}" if parent else "")
+            + ". "
+            + (f"{top_signals}. " if top_signals else "")
+            + "DNS tunneling is an exfiltration path that firewalls do not see — "
+            "check what this host is running before assuming it is benign."
+        )
+        matches.append((ip, ip, message))
     return matches
 
 
@@ -4111,6 +4240,52 @@ async def seed_restore_drill_failed_alert_rule() -> None:
         await session.commit()
 
 
+async def seed_dns_tunneling_alert_rule() -> None:
+    """Seed the ``dns_tunneling_suspected`` rule (#699), ENABLED.
+
+    Enabled is safe here despite the severity: the matcher reads
+    ``dns_client_window``, which only has rows when the default-off
+    ``security.dns_threat`` module is on AND a DNS group has query
+    logging enabled. On an install that hasn't opted into either, the
+    rule matches nothing and costs one indexed query per tick. An
+    operator who turned both on wants to hear the answer.
+
+    Keyed on ``rule_type``; an operator who disables, renames or
+    re-thresholds it is never overridden.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    async with AsyncSessionLocal() as session:
+        existing = await session.scalar(
+            select(AlertRule).where(AlertRule.rule_type == RULE_TYPE_DNS_TUNNELING)
+        )
+        if existing is not None:
+            return
+        session.add(
+            AlertRule(
+                name="DNS tunneling suspected",
+                description=(
+                    "Fires when a client's DNS behaviour scores above the tunneling "
+                    "threshold — long high-entropy labels, many unique subdomains "
+                    "under one parent domain, and payload-bearing qtypes, sustained "
+                    "over an hour. This is the shape of iodine / dnscat2-style "
+                    "exfiltration, which firewalls do not inspect. Subject is the "
+                    "client IP; auto-resolves when recent windows fall back below "
+                    "the threshold. Requires the security.dns_threat module and "
+                    "query logging on a DNS server group."
+                ),
+                rule_type=RULE_TYPE_DNS_TUNNELING,
+                severity="critical",
+                enabled=True,
+                notify_syslog=True,
+                notify_webhook=True,
+                notify_smtp=False,
+            )
+        )
+        await session.commit()
+
+
 async def evaluate_all(db: AsyncSession) -> dict[str, int]:
     """Evaluate every enabled rule; open / resolve events as needed.
 
@@ -4201,6 +4376,10 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 base = await _matching_restore_drill_failed_subjects(db, rule)
                 matches = [(sid, disp, msg, None) for sid, disp, msg in base]
                 subject_type = "backup_target"
+            elif rule.rule_type == RULE_TYPE_DNS_TUNNELING:
+                base = await _matching_dns_tunneling_subjects(db, rule)
+                matches = [(sid, disp, msg, None) for sid, disp, msg in base]
+                subject_type = "dns_client"
             elif rule.rule_type == RULE_TYPE_NEW_MAC_SEEN:
                 base = await _matching_new_mac_seen_subjects(db, rule)
                 matches = [(sid, disp, msg, None) for sid, disp, msg in base]

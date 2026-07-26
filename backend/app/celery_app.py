@@ -26,6 +26,7 @@ celery_app = Celery(
         "app.tasks.oui_update",
         "app.tasks.backup_sweep",
         "app.tasks.backup_drill",
+        "app.tasks.dns_threat",
         "app.tasks.prune_internal_errors",
         "app.tasks.prune_logs",
         "app.tasks.prune_metrics",
@@ -100,6 +101,7 @@ celery_app.conf.update(
         "app.tasks.oui_update.*": {"queue": "default"},
         "app.tasks.backup_sweep.*": {"queue": "default"},
         "app.tasks.backup_drill.*": {"queue": "default"},
+        "app.tasks.dns_threat.*": {"queue": "default"},
         "app.tasks.prune_internal_errors.*": {"queue": "default"},
         "app.tasks.prune_logs.*": {"queue": "default"},
         "app.tasks.prune_metrics.*": {"queue": "default"},
@@ -602,6 +604,17 @@ celery_app.conf.update(
         "restore-drill-sweep": {
             "task": "app.tasks.backup_drill.sweep_restore_drills",
             "schedule": schedule(run_every=60.0),
+        },
+        # Every 15 min, roll DNS query-log lines into per-client hourly
+        # windows and score them for tunneling (#699). Recomputes the
+        # current + previous bucket by upsert, so running far more often
+        # than the bucket width keeps the picture near-live without
+        # adding rows. Self-gates on the default-off
+        # ``security.dns_threat`` module, so this cron is a no-op on
+        # installs that haven't opted in.
+        "dns-threat-rollup": {
+            "task": "app.tasks.dns_threat.aggregate_dns_client_windows",
+            "schedule": schedule(run_every=900.0),
         },
         # Every 60 s, fire any Scheduled Wake-on-LAN schedule whose
         # ``next_run_at`` (denormalised UTC) is now in the past (issue #586

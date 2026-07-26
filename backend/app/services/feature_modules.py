@@ -413,6 +413,28 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         description="Alert the moment a previously-unseen MAC address appears on the network (arpwatch-style), across DHCP leases, SNMP ARP/FDB, and an opt-in L2 sniffer. Maintain an allowlist of trusted MACs (or OUI prefixes for VMs/containers), acknowledge or block from a review queue, and fire a real-time device.first_seen event. Default-off: enable, run a baseline import to mark the existing fleet as known, then arm.",
         default_enabled=False,
     ),
+    # Security — DNS threat analytics (#699). Default-off on privacy
+    # grounds, not on noise grounds: scoring reads query *content*
+    # (the names clients look up), which is a posture operators should
+    # opt into deliberately rather than inherit from an upgrade. It is
+    # additionally inert until a DNS group turns on query logging.
+    ModuleSpec(
+        id="security.dns_threat",
+        label="DNS threat analytics",
+        group="Security",
+        description=(
+            "Score DNS clients for tunneling/exfiltration behaviour (iodine / "
+            "dnscat2-shaped traffic that walks past a firewall untouched) from "
+            "the query log SpatiumDDI already collects — long high-entropy "
+            "labels, many unique subdomains under one parent, elevated "
+            "TXT/NULL/CNAME ratio. Findings surface as an alert, a Threat tab "
+            "on Logs, and a Security dashboard card, and deep-link to the IP so "
+            "the device profile is one click away. Default-off: this reads the "
+            "names clients look up. Requires query logging enabled on a DNS "
+            "server group."
+        ),
+        default_enabled=False,
+    ),
     # Security — active block sync / write-back enforcement (#601). The
     # deliberate, guarded exception to the read-only-mirror stance: pushes
     # SpatiumDDI-owned IP/MAC blocks into OPNsense (firewall table alias)

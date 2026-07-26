@@ -313,6 +313,21 @@ SECTIONS: tuple[Section, ...] = (
         volatile=True,
     ),
     Section(
+        key="dns_threat",
+        label="DNS threat analytics",
+        description=(
+            "Per-client DNS tunneling rollups (issue #699). NOT "
+            "volatile despite deriving from the 24 h query log: the "
+            "whole point of the rollup is that the summary outlives "
+            "the raw lines, so a restore that dropped it would lose "
+            "the only record that a host looked like an exfil tunnel "
+            "last week. Includes the per-client mutes — losing those on "
+            "restore would start paging about hosts an operator already "
+            "reviewed and cleared."
+        ),
+        tables=("dns_client_window", "dns_threat_mute"),
+    ),
+    Section(
         key="metrics",
         label="Metric samples",
         description=(

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { useSearchParams } from "react-router-dom";
 import {
   Activity,
   AlertTriangle,
@@ -12,6 +13,7 @@ import {
   RefreshCw,
   Search,
   ScrollText,
+  ShieldAlert,
   Server,
   XCircle,
 } from "lucide-react";
@@ -26,6 +28,7 @@ import {
   type LogSource,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { DNSThreatTab } from "./logs/DNSThreatTab";
 
 /**
  * Logs page — central log viewer.
@@ -62,10 +65,31 @@ import { cn } from "@/lib/utils";
  * DC, 5 s for the agent tabs since their backing rows update live.
  */
 
-type Tab = "dns-queries" | "dhcp-activity" | "events" | "audit";
+type Tab = "dns-queries" | "dns-threat" | "dhcp-activity" | "events" | "audit";
+
+const TABS: readonly Tab[] = [
+  "dns-queries",
+  "dns-threat",
+  "dhcp-activity",
+  "events",
+  "audit",
+] as const;
 
 export function LogsPage() {
-  const [tab, setTab] = useState<Tab>("dns-queries");
+  // ``?tab=`` entry point so other surfaces can deep-link a specific
+  // tab — the Security dashboard's DNS-tunneling card needs to land on
+  // DNS Threat, and without this it silently opened DNS Queries
+  // instead. Kept in the URL (not just state) so the link is
+  // shareable and survives a refresh.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const requested = searchParams.get("tab") as Tab | null;
+  const tab: Tab =
+    requested && TABS.includes(requested) ? requested : "dns-queries";
+  const setTab = (next: Tab) => {
+    const params = new URLSearchParams(searchParams);
+    params.set("tab", next);
+    setSearchParams(params, { replace: true });
+  };
 
   // Two source lists: Windows servers (Event Log + DHCP Audit) and
   // agent-driven servers (DNS Queries + DHCP Activity). They're
@@ -160,6 +184,13 @@ export function LogsPage() {
             count={dnsAgentSources.length || undefined}
           />
           <TabButton
+            active={tab === "dns-threat"}
+            onClick={() => setTab("dns-threat")}
+            icon={ShieldAlert}
+            label="DNS Threat"
+            hint="Per-client tunneling / exfiltration scoring over the query log. Requires the security.dns_threat module (default off — it reads query content)."
+          />
+          <TabButton
             active={tab === "dhcp-activity"}
             onClick={() => setTab("dhcp-activity")}
             icon={Activity}
@@ -190,6 +221,7 @@ export function LogsPage() {
       </div>
 
       {tab === "dns-queries" && <DNSQueriesTab sources={dnsAgentSources} />}
+      {tab === "dns-threat" && <DNSThreatTab />}
       {tab === "dhcp-activity" && (
         <DHCPActivityTab sources={dhcpAgentSources} />
       )}
