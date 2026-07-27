@@ -119,6 +119,11 @@ export function DNSThreatTab() {
   // never appears at all.
   const [showAllowlisted, setShowAllowlisted] = useState(false);
   const [showMutes, setShowMutes] = useState(false);
+  // Which detection to rank by. Explicit rather than a combined score:
+  // tunneling and beaconing answer different questions, and an
+  // operator hunting exfil shouldn't have their list reordered by a
+  // chatty monitoring agent.
+  const [detection, setDetection] = useState<"tunnel" | "beacon">("tunnel");
   const [inspecting, setInspecting] = useState<string | null>(null);
   const [muting, setMuting] = useState<string | null>(null);
   const qc = useQueryClient();
@@ -136,11 +141,18 @@ export function DNSThreatTab() {
   });
 
   const q = useQuery({
-    queryKey: ["dns-threat-windows", hours, minScore, showAllowlisted],
+    queryKey: [
+      "dns-threat-windows",
+      hours,
+      minScore,
+      showAllowlisted,
+      detection,
+    ],
     queryFn: () =>
       dnsThreatApi.listWindows({
         hours,
         min_score: minScore,
+        detection,
         include_allowlisted: showAllowlisted,
         limit: 200,
       }),
@@ -186,6 +198,19 @@ export function DNSThreatTab() {
   return (
     <div className="flex flex-col gap-4">
       <div className="flex flex-wrap items-end gap-3 rounded-lg border bg-card px-4 py-3">
+        <div>
+          <label className="mb-1 block text-xs font-medium">Detection</label>
+          <select
+            value={detection}
+            onChange={(e) =>
+              setDetection(e.target.value as "tunnel" | "beacon")
+            }
+            className="rounded-md border bg-background px-2 py-1.5 text-sm"
+          >
+            <option value="tunnel">Tunneling (name content)</option>
+            <option value="beacon">Beaconing (timing)</option>
+          </select>
+        </div>
         <div>
           <label className="mb-1 block text-xs font-medium">Window</label>
           <select
@@ -326,6 +351,7 @@ export function DNSThreatTab() {
                     })
                   }
                   onInspect={() => setInspecting(w.client_ip)}
+                  detection={detection}
                   onMute={() => setMuting(w.client_ip)}
                   onUnmute={() => unmute.mutate(w.client_ip)}
                 />
@@ -368,9 +394,11 @@ function Row({
   onInspect,
   onMute,
   onUnmute,
+  detection,
 }: {
   w: DNSClientWindow;
   open: boolean;
+  detection: "tunnel" | "beacon";
   onToggle: () => void;
   onInspect: () => void;
   onMute: () => void;
@@ -390,7 +418,9 @@ function Row({
         }`}
       >
         <td className="px-4 py-2">
-          <ScoreCell score={w.tunnel_score} />
+          <ScoreCell
+            score={detection === "beacon" ? w.beacon_score : w.tunnel_score}
+          />
         </td>
         <td className="px-4 py-2 font-mono text-xs">
           {w.client_ip}
@@ -476,10 +506,39 @@ function Row({
                   ` (until ${new Date(w.mute_until).toLocaleDateString()})`}
               </p>
             )}
-            <p className="mb-2 text-xs text-muted-foreground">
-              Every signal is listed, including those contributing nothing —
-              what was <em>ruled out</em> matters as much as what fired.
-            </p>
+            {detection === "beacon" ? (
+              <>
+                <p className="mb-2 text-xs text-muted-foreground">
+                  {w.beacon_detail ||
+                    "No name repeated on a regular cadence in this window."}
+                </p>
+                {w.beacon_candidates.length > 0 && (
+                  <ul className="mb-2">
+                    {w.beacon_candidates.map((c) => (
+                      <li key={c.qname} className="py-0.5 text-xs">
+                        <span className="font-mono">{c.qname}</span>
+                        <span className="ml-2 text-muted-foreground">
+                          every {c.period_seconds}s · {c.samples} samples ·
+                          variation {(c.cv * 100).toFixed(0)}% · scored{" "}
+                          {c.score.toFixed(0)}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                <p className="mb-2 text-xs text-amber-600 dark:text-amber-400">
+                  Periodic lookups are frequently benign — monitoring agents,
+                  health checks and update checkers all look like this. Check
+                  the name against what the host runs before treating it as a
+                  callback.
+                </p>
+              </>
+            ) : (
+              <p className="mb-2 text-xs text-muted-foreground">
+                Every signal is listed, including those contributing nothing —
+                what was <em>ruled out</em> matters as much as what fired.
+              </p>
+            )}
             <ul className="max-w-3xl">
               {w.tunnel_signals.map((s) => (
                 <SignalBar key={s.name} signal={s} />

@@ -1,6 +1,7 @@
 """DNS threat analytics tools for the Operator Copilot (issue #699).
 
-Three read-only tools over the per-client tunneling rollup.
+Four read-only tools over the per-client threat rollup — tunneling
+(content) and beaconing (timing) score onto the same windows.
 
 **No ``propose_mute_dns_client``** — an explicit decision, not an
 oversight (non-negotiable #13). Muting suppresses a ``critical``
@@ -235,3 +236,82 @@ async def find_dns_threat_mutes(
     if not out:
         return [{"result": "no muted clients"}]
     return out
+
+
+class FindBeaconingClientsArgs(BaseModel):
+    hours: int = Field(default=24, ge=1, le=24 * 30)
+    min_score: float = Field(
+        default=60.0,
+        ge=0,
+        le=100,
+        description=(
+            "Minimum beaconing score. Note that legitimate pollers "
+            "(monitoring agents, health checks, update checkers) score "
+            "as high as real callbacks — the query name is what "
+            "distinguishes them, not the number."
+        ),
+    )
+    limit: int = Field(default=25, ge=1, le=200)
+
+
+@register_tool(
+    name="find_beaconing_clients",
+    description=(
+        "Find DNS clients querying one name on a metronomic cadence — "
+        "the rhythm of a C2 callback (issue #699). Each row carries the "
+        "query name, the period in seconds, how many samples, and the "
+        "variation, because **the name is what makes the finding "
+        "actionable**: a monitoring agent and a beacon are "
+        "indistinguishable by timing alone, and 'queries "
+        "metrics.corp.example.com every 30s' is an instant dismissal "
+        "where a bare score is not. ALWAYS report the name and period, "
+        "never just the score, and say plainly that periodic lookups "
+        "are frequently benign infrastructure. Distinct from "
+        "find_suspicious_dns_clients, which scores name *content* for "
+        "tunneling rather than timing."
+    ),
+    args_model=FindBeaconingClientsArgs,
+    category="dns",
+    module="security.dns_threat",
+    default_enabled=True,
+)
+async def find_beaconing_clients(
+    db: AsyncSession, user: User, args: FindBeaconingClientsArgs
+) -> list[dict[str, Any]]:
+    since = datetime.now(UTC) - timedelta(hours=args.hours)
+    rows = (
+        (
+            await db.execute(
+                select(DNSClientWindow)
+                .where(
+                    DNSClientWindow.window_start >= since,
+                    DNSClientWindow.beacon_score >= args.min_score,
+                )
+                .order_by(desc(DNSClientWindow.beacon_score))
+                .limit(args.limit)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not rows:
+        return [
+            {
+                "result": "no clients showing periodic callback behaviour",
+                "note": (
+                    "Either nothing is beaconing above the threshold, or the "
+                    "rollup has no data — security.dns_threat must be enabled "
+                    "AND a DNS group must have query logging on."
+                ),
+            }
+        ]
+    return [
+        {
+            "client_ip": str(w.client_ip),
+            "beacon_score": round(w.beacon_score, 1),
+            "window_start": w.window_start.isoformat(),
+            "candidates": w.beacon_candidates or [],
+            "detail": w.beacon_detail,
+        }
+        for w in rows
+    ]

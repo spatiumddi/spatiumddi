@@ -8104,6 +8104,10 @@ export interface DNSClientWindow {
   payload_qtype_count: number;
   tunnel_score: number;
   tunnel_signals: DNSTunnelSignal[];
+  /** Timing-based C2 callback score (#699) — independent of tunneling. */
+  beacon_score: number;
+  beacon_candidates: DNSBeaconCandidate[];
+  beacon_detail: string;
   allowlisted: boolean;
   server_count: number;
   /** An operator reviewed this client and cleared it (#699). */
@@ -8132,6 +8136,19 @@ export interface DNSTunnelSignal {
   detail: string;
 }
 
+/**
+ * One (client, name) pair that repeated on a regular cadence. The
+ * qname matters more than the score: monitoring agents and C2
+ * callbacks are indistinguishable by timing alone.
+ */
+export interface DNSBeaconCandidate {
+  qname: string;
+  samples: number;
+  period_seconds: number;
+  cv: number;
+  score: number;
+}
+
 export interface DNSThreatSummary {
   windows_scored: number;
   clients_seen: number;
@@ -8155,7 +8172,10 @@ export const dnsThreatApi = {
     client_ip?: string;
     hours?: number;
     min_score?: number;
+    /** Rank and filter by "tunnel" (content) or "beacon" (timing). */
+    detection?: "tunnel" | "beacon";
     include_allowlisted?: boolean;
+    include_muted?: boolean;
     limit?: number;
   }) =>
     api
