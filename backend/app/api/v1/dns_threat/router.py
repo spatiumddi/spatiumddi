@@ -50,6 +50,9 @@ class ClientWindowRow(BaseModel):
     payload_qtype_count: int
     tunnel_score: float
     tunnel_signals: list[dict[str, Any]]
+    beacon_score: float
+    beacon_candidates: list[dict[str, Any]]
+    beacon_detail: str
     allowlisted: bool
     server_count: int
     # Populated per row so the tab can dim a muted client and show who
@@ -104,6 +107,9 @@ def _to_row(w: DNSClientWindow) -> ClientWindowRow:
         payload_qtype_count=w.payload_qtype_count,
         tunnel_score=w.tunnel_score,
         tunnel_signals=w.tunnel_signals or [],
+        beacon_score=w.beacon_score,
+        beacon_candidates=w.beacon_candidates or [],
+        beacon_detail=w.beacon_detail,
         allowlisted=w.allowlisted,
         server_count=w.server_count,
     )
@@ -116,6 +122,11 @@ async def list_windows(
     client_ip: str | None = Query(default=None),
     hours: int = Query(default=24, ge=1, le=24 * 30),
     min_score: float = Query(default=INTERESTING_SCORE, ge=0, le=100),
+    # Which detection to rank and filter by. Kept explicit rather than
+    # scoring on max(tunnel, beacon): the two mean different things and
+    # an operator hunting exfil should not have their list reordered by
+    # a chatty monitoring agent.
+    detection: str = Query(default="tunnel", pattern="^(tunnel|beacon)$"),
     include_allowlisted: bool = Query(default=False),
     include_muted: bool = Query(default=False),
     limit: int = Query(default=100, ge=1, le=1000),
@@ -131,7 +142,14 @@ async def list_windows(
     stmt = (
         select(DNSClientWindow)
         .where(DNSClientWindow.window_start >= since)
-        .order_by(desc(DNSClientWindow.tunnel_score), desc(DNSClientWindow.window_start))
+        .order_by(
+            desc(
+                DNSClientWindow.beacon_score
+                if detection == "beacon"
+                else DNSClientWindow.tunnel_score
+            ),
+            desc(DNSClientWindow.window_start),
+        )
         .limit(limit)
     )
     if client_ip:
@@ -142,6 +160,8 @@ async def list_windows(
         # A per-client drilldown wants the client's whole history, not
         # just its interesting hours.
         stmt = stmt.order_by(None).order_by(desc(DNSClientWindow.window_start))
+    elif detection == "beacon":
+        stmt = stmt.where(DNSClientWindow.beacon_score >= min_score)
     else:
         stmt = stmt.where(DNSClientWindow.tunnel_score >= min_score)
     if not include_allowlisted:

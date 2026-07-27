@@ -314,6 +314,17 @@ RULE_TYPE_RESTORE_DRILL_FAILED = "restore_drill_failed"
 # windows drop back below the threshold, which is what makes it safe to
 # leave armed: a one-off spike closes itself on the next tick.
 RULE_TYPE_DNS_TUNNELING = "dns_tunneling_suspected"
+
+# ``dns_beaconing_suspected`` (issue #699) — a client queried one name
+# on a metronomic cadence. Subject is the client, like tunneling.
+#
+# Seeded DISABLED, unlike tunneling: a health check every 30 s is
+# beaconing by any timing measure and scores ~100, so on a typical
+# network this rule fires on monitoring infrastructure the moment it is
+# switched on. It is genuinely useful once an operator has muted their
+# known pollers — which is exactly the workflow the mute feature
+# provides — but arriving pre-armed would teach people to ignore it.
+RULE_TYPE_DNS_BEACONING = "dns_beaconing_suspected"
 # The alerting bar lives in ``dns_threat.aggregate`` next to
 # ``INTERESTING_SCORE`` so the two stay a visible pair rather than
 # drifting apart in separate modules — "worth a look on a dashboard"
@@ -379,6 +390,7 @@ RULE_TYPES = frozenset(
         RULE_TYPE_IP_BLOCKLISTED,
         RULE_TYPE_RESTORE_DRILL_FAILED,
         RULE_TYPE_DNS_TUNNELING,
+        RULE_TYPE_DNS_BEACONING,
     }
 )
 
@@ -1116,6 +1128,71 @@ async def _matching_dns_tunneling_subjects(
             + (f"{top_signals}. " if top_signals else "")
             + "DNS tunneling is an exfiltration path that firewalls do not see — "
             "check what this host is running before assuming it is benign."
+        )
+        matches.append((ip, ip, message))
+    return matches
+
+
+async def _matching_dns_beaconing_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+) -> list[tuple[str, str, str]]:
+    """Clients that queried one name on a metronomic cadence (#699).
+
+    Same subject and windowing as the tunneling matcher — the client,
+    over the trailing window — so a host beaconing for hours holds one
+    open event and it auto-resolves when the pattern stops. Muted
+    clients are excluded for the same reason they are there: this rule
+    needs the mute workflow more than tunneling does, because
+    legitimate pollers score just as high as callbacks.
+
+    The message leads with the NAME and the period, not the score. A
+    monitoring agent and a C2 beacon are indistinguishable by timing,
+    so the only thing that makes a finding actionable is letting the
+    operator recognise their own infrastructure at a glance.
+    """
+    from app.models.dns_threat import DNSClientWindow  # noqa: PLC0415
+    from app.models.dns_threat_mute import DNSThreatMute  # noqa: PLC0415
+    from app.services.dns_threat.aggregate import (  # noqa: PLC0415
+        BEACON_ALERTING_SCORE,
+    )
+
+    threshold = (
+        rule.threshold_percent if rule.threshold_percent is not None else BEACON_ALERTING_SCORE
+    )
+    since = datetime.now(UTC) - _DNS_TUNNEL_WINDOW
+    rn = func.row_number().over(
+        partition_by=DNSClientWindow.client_ip,
+        order_by=DNSClientWindow.beacon_score.desc(),
+    )
+    ranked = (
+        select(
+            DNSClientWindow.client_ip.label("ip"),
+            DNSClientWindow.beacon_score.label("score"),
+            DNSClientWindow.beacon_detail.label("detail"),
+            rn.label("rn"),
+        )
+        .where(
+            DNSClientWindow.window_start >= since,
+            DNSClientWindow.beacon_score >= threshold,
+            DNSClientWindow.client_ip.not_in(
+                select(DNSThreatMute.client_ip).where(
+                    or_(
+                        DNSThreatMute.muted_until.is_(None),
+                        DNSThreatMute.muted_until > datetime.now(UTC),
+                    )
+                )
+            ),
+        )
+        .subquery()
+    )
+    rows = (await db.execute(select(ranked).where(ranked.c.rn == 1))).all()
+
+    matches: list[tuple[str, str, str]] = []
+    for r in rows:
+        ip = str(r.ip)
+        message = (
+            f"DNS client {ip} shows periodic callback behaviour " f"({r.score:.0f}/100). {r.detail}"
         )
         matches.append((ip, ip, message))
     return matches
@@ -4286,6 +4363,49 @@ async def seed_dns_tunneling_alert_rule() -> None:
         await session.commit()
 
 
+async def seed_dns_beaconing_alert_rule() -> None:
+    """Seed ``dns_beaconing_suspected`` (#699), DISABLED by default.
+
+    The opposite call from the tunneling rule, and deliberately so. A
+    health check every 30 s is beaconing by any timing measure and
+    scores ~100, so on a typical network this fires on the operator's
+    own monitoring the moment it is armed. It becomes genuinely useful
+    once they have muted their known pollers — which is what the mute
+    workflow is for — but shipping it pre-armed would train people to
+    ignore it, and an ignored detector is worse than none.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    async with AsyncSessionLocal() as session:
+        existing = await session.scalar(
+            select(AlertRule).where(AlertRule.rule_type == RULE_TYPE_DNS_BEACONING)
+        )
+        if existing is not None:
+            return
+        session.add(
+            AlertRule(
+                name="DNS beaconing suspected",
+                description=(
+                    "Fires when a client queries one name on a metronomic "
+                    "cadence — the rhythm of a C2 callback. Disabled by "
+                    "default: legitimate pollers (monitoring agents, health "
+                    "checks, update checkers) are indistinguishable from a "
+                    "beacon by timing alone and score just as high. Enable "
+                    "after muting your known pollers from the DNS Threat tab. "
+                    "Requires the security.dns_threat module and query logging."
+                ),
+                rule_type=RULE_TYPE_DNS_BEACONING,
+                severity="warning",
+                enabled=False,
+                notify_syslog=True,
+                notify_webhook=True,
+                notify_smtp=False,
+            )
+        )
+        await session.commit()
+
+
 async def evaluate_all(db: AsyncSession) -> dict[str, int]:
     """Evaluate every enabled rule; open / resolve events as needed.
 
@@ -4378,6 +4498,10 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 subject_type = "backup_target"
             elif rule.rule_type == RULE_TYPE_DNS_TUNNELING:
                 base = await _matching_dns_tunneling_subjects(db, rule)
+                matches = [(sid, disp, msg, None) for sid, disp, msg in base]
+                subject_type = "dns_client"
+            elif rule.rule_type == RULE_TYPE_DNS_BEACONING:
+                base = await _matching_dns_beaconing_subjects(db, rule)
                 matches = [(sid, disp, msg, None) for sid, disp, msg in base]
                 subject_type = "dns_client"
             elif rule.rule_type == RULE_TYPE_NEW_MAC_SEEN:

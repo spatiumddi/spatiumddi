@@ -13,8 +13,9 @@ detection-agnostic — they describe what a client's DNS behaviour
 beaconing detections deferred out of #699's first slice can score off
 the same rollup without a second aggregation pass.
 
-``tunnel_score`` and ``tunnel_signals`` are the one detection that
-ships in this slice. The signals blob carries each contributing
+``tunnel_score`` / ``tunnel_signals`` and ``beacon_score`` /
+``beacon_candidates`` are the two detections that score off this
+rollup. The signals blob carries each contributing
 signal's raw value and weighted contribution, so an operator (and a
 support thread) can see *why* a host scored 82 rather than being
 handed a bare number.
@@ -33,6 +34,7 @@ from sqlalchemy import (
     Index,
     Integer,
     String,
+    Text,
     UniqueConstraint,
     func,
 )
@@ -53,6 +55,7 @@ class DNSClientWindow(Base):
         # "Worst offenders in the recent past" — the query behind both
         # the alert matcher and the Threat tab.
         Index("ix_dns_client_window_score", "window_start", "tunnel_score"),
+        Index("ix_dns_client_window_beacon", "window_start", "beacon_score"),
         Index("ix_dns_client_window_ip", "client_ip"),
     )
 
@@ -89,6 +92,21 @@ class DNSClientWindow(Base):
     tunnel_signals: Mapped[list[dict[str, Any]]] = mapped_column(
         JSONB, nullable=False, default=list
     )
+    # ── beaconing verdict (issue #699) ───────────────────────────────
+    # Scored separately from tunneling because it asks a different
+    # question — timing rather than content — and the two are genuinely
+    # independent: a beacon can use one short ordinary name and score 0
+    # for tunneling.
+    beacon_score: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    # The (name, period, sample-count, variation) tuples that scored.
+    # Carrying the NAME is the whole point: a monitoring agent and a C2
+    # callback are indistinguishable by timing alone, so the evidence
+    # has to let an operator recognise their own infrastructure.
+    beacon_candidates: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB, nullable=False, default=list
+    )
+    beacon_detail: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
     # Set when every parseable name in the window matched the benign
     # allowlist — genuinely cleared. NOT set when nothing was parseable,
     # which is a data problem and must stay visible, because every
