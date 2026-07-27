@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.celery_app import celery_app
 from app.db import task_session
+from app.models.dns_rpz_hit import DNSRPZHit
 from app.models.logs import DHCPLogEntry, DNSQueryLogEntry
 
 logger = structlog.get_logger(__name__)
@@ -30,6 +31,20 @@ logger = structlog.get_logger(__name__)
 # stand up Loki / a SIEM and ship there in addition to (or instead
 # of) the agent push.
 DEFAULT_RETENTION_HOURS = 24
+
+# RPZ policy hits (issue #699) are kept far longer than raw queries and
+# swept here rather than in their own task, so all agent-shipped log
+# retention stays in one place.
+#
+# They earn the longer window: a hit is a *summary-shaped* event, not a
+# firehose. A busy resolver emits tens of thousands of queries a second
+# and a handful of blocklist hits a minute, so 30 days of hits is a
+# fraction of a day of queries. And the question they answer — "has this
+# host been reaching for blocked domains all week?" — is unanswerable
+# inside a 24 h window, which is the whole reason the table exists.
+# Matches the threat rollup's WINDOW_RETENTION_DAYS deliberately: both
+# are behavioural evidence about clients and should age out together.
+RPZ_HIT_RETENTION_DAYS = 30
 
 
 async def _sweep_with_session(db: AsyncSession) -> dict[str, int]:
@@ -42,11 +57,15 @@ async def _sweep_with_session(db: AsyncSession) -> dict[str, int]:
     cutoff = datetime.now(UTC) - timedelta(hours=DEFAULT_RETENTION_HOURS)
     dns_del = await db.execute(delete(DNSQueryLogEntry).where(DNSQueryLogEntry.ts < cutoff))
     dhcp_del = await db.execute(delete(DHCPLogEntry).where(DHCPLogEntry.ts < cutoff))
+    rpz_cutoff = datetime.now(UTC) - timedelta(days=RPZ_HIT_RETENTION_DAYS)
+    rpz_del = await db.execute(delete(DNSRPZHit).where(DNSRPZHit.ts < rpz_cutoff))
     await db.commit()
     return {
         "dns_query_log_removed": dns_del.rowcount or 0,
         "dhcp_log_removed": dhcp_del.rowcount or 0,
+        "dns_rpz_hit_removed": rpz_del.rowcount or 0,
         "retention_hours": DEFAULT_RETENTION_HOURS,
+        "rpz_retention_days": RPZ_HIT_RETENTION_DAYS,
     }
 
 

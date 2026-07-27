@@ -234,6 +234,13 @@ class ClientFeatures:
     payload_qtype_count: int = 0
     server_count: int = 1
     allowlisted: bool = False
+    # Each distinct non-allowlisted parent domain this client queried,
+    # mapped to its registrable label (``xkqjfhwbz.com`` →
+    # ``xkqjfhwbz``). Populated here because this walk already derives
+    # every parent, so the DGA scorer costs no second pass over what can
+    # be tens of thousands of log lines. Not persisted as a column — the
+    # DGA verdict it produces is.
+    parent_labels: dict[str, str] = field(default_factory=dict)
 
     @property
     def payload_qtype_ratio(self) -> float:
@@ -318,6 +325,12 @@ def extract_features(
         and feats.scored_query_count == 0
         and feats.unparseable_count < feats.query_count
     )
+
+    # The parent's leftmost label is the registrable one — the part a
+    # DGA actually generates. ``split_qname`` has already trimmed the
+    # public suffix, so ``example.co.uk`` yields ``example`` rather than
+    # ``co``.
+    feats.parent_labels = {parent: parent.split(".")[0] for parent in per_parent}
 
     if per_parent:
         top_parent, subs = max(per_parent.items(), key=lambda kv: len(kv[1]))

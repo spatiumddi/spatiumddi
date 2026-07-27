@@ -123,7 +123,9 @@ export function DNSThreatTab() {
   // tunneling and beaconing answer different questions, and an
   // operator hunting exfil shouldn't have their list reordered by a
   // chatty monitoring agent.
-  const [detection, setDetection] = useState<"tunnel" | "beacon">("tunnel");
+  const [detection, setDetection] = useState<"tunnel" | "beacon" | "dga">(
+    "tunnel",
+  );
   const [inspecting, setInspecting] = useState<string | null>(null);
   const [muting, setMuting] = useState<string | null>(null);
   const qc = useQueryClient();
@@ -203,12 +205,13 @@ export function DNSThreatTab() {
           <select
             value={detection}
             onChange={(e) =>
-              setDetection(e.target.value as "tunnel" | "beacon")
+              setDetection(e.target.value as "tunnel" | "beacon" | "dga")
             }
             className="rounded-md border bg-background px-2 py-1.5 text-sm"
           >
             <option value="tunnel">Tunneling (name content)</option>
             <option value="beacon">Beaconing (timing)</option>
+            <option value="dga">DGA (name plausibility)</option>
           </select>
         </div>
         <div>
@@ -398,7 +401,7 @@ function Row({
 }: {
   w: DNSClientWindow;
   open: boolean;
-  detection: "tunnel" | "beacon";
+  detection: "tunnel" | "beacon" | "dga";
   onToggle: () => void;
   onInspect: () => void;
   onMute: () => void;
@@ -419,7 +422,13 @@ function Row({
       >
         <td className="px-4 py-2">
           <ScoreCell
-            score={detection === "beacon" ? w.beacon_score : w.tunnel_score}
+            score={
+              detection === "beacon"
+                ? w.beacon_score
+                : detection === "dga"
+                  ? w.dga_score
+                  : w.tunnel_score
+            }
           />
         </td>
         <td className="px-4 py-2 font-mono text-xs">
@@ -533,6 +542,33 @@ function Row({
                   callback.
                 </p>
               </>
+            ) : detection === "dga" ? (
+              <>
+                <p className="mb-2 text-xs text-muted-foreground">
+                  {w.dga_detail ||
+                    "No crop of generated-looking domains in this window."}
+                </p>
+                {w.dga_candidates.length > 0 && (
+                  <ul className="mb-2">
+                    {w.dga_candidates.map((c) => (
+                      <li key={c.parent} className="py-0.5 text-xs">
+                        <span className="font-mono">{c.parent}</span>
+                        <span className="ml-2 text-muted-foreground">
+                          {(c.implausibility * 100).toFixed(0)}% implausible
+                          bigrams · {(c.vowel_ratio * 100).toFixed(0)}% vowels
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                <p className="mb-2 text-xs text-amber-600 dark:text-amber-400">
+                  Scored on name plausibility alone — the BIND9 query log
+                  carries no rcode, so there is no NXDOMAIN prior to corroborate
+                  it. Hashed-CDN buckets, shortlink services and odd brand names
+                  share the shape, so confirm the domains above before treating
+                  this as an infection.
+                </p>
+              </>
             ) : (
               <p className="mb-2 text-xs text-muted-foreground">
                 Every signal is listed, including those contributing nothing —
@@ -540,9 +576,11 @@ function Row({
               </p>
             )}
             <ul className="max-w-3xl">
-              {w.tunnel_signals.map((s) => (
-                <SignalBar key={s.name} signal={s} />
-              ))}
+              {(detection === "dga" ? w.dga_signals : w.tunnel_signals).map(
+                (s) => (
+                  <SignalBar key={s.name} signal={s} />
+                ),
+              )}
             </ul>
             <p className="mt-2 text-xs text-muted-foreground">
               Longest label {w.max_label_length} chars · mean entropy{" "}

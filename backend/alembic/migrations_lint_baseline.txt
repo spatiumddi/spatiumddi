@@ -136,6 +136,10 @@ backend/alembic/versions/a3f7c1e92b48_decom_date_awareness.py:drop_column:41
 backend/alembic/versions/a4b8c2d619e7_ai_provider.py:drop_table:92
 backend/alembic/versions/a4d92f61c08b_drop_discovery_scan_settings.py:drop_column:31
 backend/alembic/versions/a4d92f61c08b_drop_discovery_scan_settings.py:drop_column:32
+backend/alembic/versions/a4e91c7b3d82_dns_dga.py:drop_column:83
+backend/alembic/versions/a4e91c7b3d82_dns_dga.py:drop_column:84
+backend/alembic/versions/a4e91c7b3d82_dns_dga.py:drop_column:85
+backend/alembic/versions/a4e91c7b3d82_dns_dga.py:drop_column:86
 backend/alembic/versions/a4f9c2e8b316_appliance_supervisor_identity.py:drop_column:153
 backend/alembic/versions/a4f9c2e8b316_appliance_supervisor_identity.py:drop_table:156
 backend/alembic/versions/a5b8e9c31f42_ipspace_color.py:drop_column:31
@@ -272,6 +276,7 @@ backend/alembic/versions/b7e4d1a92c30_ipv6_ra_management.py:drop_column:196
 backend/alembic/versions/b7e4d1a92c30_ipv6_ra_management.py:drop_column:197
 backend/alembic/versions/b7e4d1a92c30_ipv6_ra_management.py:drop_table:185
 backend/alembic/versions/b7e4d1a92c30_ipv6_ra_management.py:drop_table:188
+backend/alembic/versions/b7f24d1e9a35_dns_rpz_hit.py:drop_table:64
 backend/alembic/versions/b8c3f2a9e147_appliance_lldp_settings.py:drop_column:109
 backend/alembic/versions/b8e3f1c47a92_packet_capture.py:drop_column:110
 backend/alembic/versions/b8e3f1c47a92_packet_capture.py:drop_table:115

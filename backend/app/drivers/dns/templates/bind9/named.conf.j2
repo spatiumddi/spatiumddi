@@ -138,6 +138,15 @@ logging {
     };
     category queries { queries_channel; };
     category query-errors { queries_channel; };
+    {#- RPZ hit attribution (issue #699). named logs policy rewrites to
+        its own ``rpz`` category, NOT to ``queries`` — without this line
+        a blocked lookup is invisible to us, which is why "which machine
+        keeps hitting the blocklist" was unanswerable. Routed to the
+        existing queries_channel rather than a second file on purpose:
+        the agent already tails this one, so no new shipper thread, log
+        file or bind mount is needed. The control plane tells the two
+        line shapes apart at ingest. #}
+    category rpz { queries_channel; };
 };
 {%- endif %}
 

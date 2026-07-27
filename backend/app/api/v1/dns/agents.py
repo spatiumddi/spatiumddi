@@ -35,6 +35,7 @@ from app.models.dns import (
     DNSServerZoneState,
     DNSZone,
 )
+from app.models.dns_rpz_hit import DNSRPZHit
 from app.models.logs import DNSQueryLogEntry
 from app.models.metrics import DNSMetricSample
 from app.services.dns.agent_config import build_config_bundle
@@ -902,7 +903,37 @@ async def agent_query_log_entries(
     dropped = max(0, len(body.lines) - len(capped))
     now = datetime.now(UTC)
     inserted = 0
+    rpz_inserted = 0
     for raw in capped:
+        # RPZ policy hits (issue #699) ride the same channel as queries —
+        # named logs them under its own ``rpz`` category, which the
+        # BIND9 template points at ``queries_channel`` so no second
+        # shipper is needed. They are tried FIRST because they do not
+        # contain the ``: query: `` separator the query parser splits
+        # on, so they would otherwise be dropped by the ``qname is
+        # None`` guard below and the hit lost.
+        #
+        # PowerDNS has no equivalent category, so this is BIND9-only;
+        # the parser returns None for every non-RPZ line, which makes
+        # running it against pdns output harmless rather than
+        # conditional.
+        if server.driver != "powerdns":
+            rpz = bind9_parser.parse_rpz_line(raw, fallback_ts=now)
+            if rpz is not None:
+                db.add(
+                    DNSRPZHit(
+                        server_id=server.id,
+                        ts=rpz.ts,
+                        client_ip=rpz.client_ip,
+                        qname=rpz.qname,
+                        trigger=rpz.trigger,
+                        policy=rpz.policy,
+                        rpz_zone=rpz.rpz_zone,
+                        raw=rpz.raw,
+                    )
+                )
+                rpz_inserted += 1
+                continue
         parsed = parse_fn(raw, fallback_ts=now)
         if parsed is None or parsed.qname is None:
             continue
@@ -922,7 +953,12 @@ async def agent_query_log_entries(
         )
         inserted += 1
     await db.commit()
-    return {"status": "ok", "inserted": inserted, "dropped": dropped}
+    return {
+        "status": "ok",
+        "inserted": inserted,
+        "rpz_inserted": rpz_inserted,
+        "dropped": dropped,
+    }
 
 
 # ── Admin runtime-state push (rendered config + rndc status) ─────────
