@@ -135,6 +135,8 @@ def score_beaconing(
     candidates: list[BeaconCandidate] = []
 
     for qname, stamps in timings.items():
+        if not _is_beaconable_name(qname):
+            continue
         if len(stamps) < min_samples:
             continue
         ordered = sorted(stamps)
@@ -180,6 +182,26 @@ def score_beaconing(
             f"host runs before treating it as malicious"
         ),
     )
+
+
+def _is_beaconable_name(qname: str) -> bool:
+    """False for names a callback could never use.
+
+    A beacon has to resolve to something the attacker controls, so it
+    queries a real FQDN. The root zone (``.``) and bare single labels
+    cannot be that — but they ARE queried on a metronomic cadence by
+    health checks and resolver priming.
+
+    This is not hypothetical: SpatiumDDI's own BIND9 container
+    healthcheck queries ``.`` every 30 s from loopback, which scored a
+    perfect 100 the first time this ran against the dev stack. Same
+    class of self-inflicted false positive as the DNSBL sweep in the
+    tunneling scorer, and worth excluding structurally rather than by
+    threshold — no amount of tuning separates "every 30 s exactly" from
+    "every 30 s exactly".
+    """
+    name = qname.strip().rstrip(".")
+    return bool(name) and "." in name
 
 
 def _humanise_period(seconds: float) -> str:

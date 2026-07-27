@@ -648,6 +648,9 @@ backend/alembic/versions/ee86cea94cf5_appliance_role_assignment.py:drop_column:1
 backend/alembic/versions/ee86cea94cf5_appliance_role_assignment.py:drop_column:103
 backend/alembic/versions/ee86cea94cf5_appliance_role_assignment.py:drop_column:104
 backend/alembic/versions/ee86cea94cf5_appliance_role_assignment.py:drop_column:105
+backend/alembic/versions/f0c3a81d5e27_dns_beaconing.py:drop_column:69
+backend/alembic/versions/f0c3a81d5e27_dns_beaconing.py:drop_column:70
+backend/alembic/versions/f0c3a81d5e27_dns_beaconing.py:drop_column:71
 backend/alembic/versions/f1a3b8c52d04_subnet_role.py:drop_column:39
 backend/alembic/versions/f1a4c7b2e9d6_cp_ha_dataplane_vip_etcd_restore.py:drop_column:71
 backend/alembic/versions/f1a4c7b2e9d6_cp_ha_dataplane_vip_etcd_restore.py:drop_column:72
