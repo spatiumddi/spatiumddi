@@ -105,9 +105,17 @@ def test_monitoring_agent_also_scores() -> None:
     operator recognises it instantly, the alert ships disabled, and the
     mute workflow exists to clear known pollers.
     """
-    v = score_beaconing({"metrics.corp.example.com": _stamps(30, 60)})
+    poller = "metrics.corp.example.com"
+    v = score_beaconing({poller: _stamps(30, 60)})
     assert v.score >= 85, "monitoring genuinely scores — see the docstring"
-    assert "metrics.corp.example.com" in v.detail
+    # Assert on the structured evidence and on the detail's leading
+    # token rather than substring-matching the prose: it pins the
+    # contract more precisely (the name must BE the candidate and must
+    # LEAD the message, not merely appear somewhere), and a bare
+    # `"host.name" in text` is the broken-host-check idiom CodeQL flags
+    # as py/incomplete-url-substring-sanitization.
+    assert v.candidates[0].qname == poller
+    assert v.detail.split(" ", 1)[0] == poller
     assert "monitoring agents" in v.detail, "the detail must warn about this class"
 
 
