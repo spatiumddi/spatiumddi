@@ -20,10 +20,13 @@ separate table from ``dns_query_log_entry`` rather than a flag on it:
 * Mixing them would make the query log's own retention sweep either
   drop the hits early or keep the queries too long.
 
-``rpz_zone`` is what makes a hit *attributable to a feed*: "blocked by
-the malware list" and "blocked by the ad list" are very different
-findings about the same host, and an aggregate that lost the
-distinction would be much weaker evidence.
+``rpz_zone`` records which RPZ zone matched. Note the resolution limit:
+``dns/agent_config.py`` merges every enabled blocklist into ONE rendered
+zone per view, so for SpatiumDDI-managed lists this distinguishes
+*views*, not individual feeds — "which of my 14 lists fired" needs
+either per-list zones or a qname join back to ``DNSBlockListEntry``, and
+is follow-up work on #699. It does separate our zone from any
+hand-rolled ``response-policy`` zone an operator runs alongside.
 """
 
 from __future__ import annotations
@@ -44,8 +47,7 @@ class DNSRPZHit(Base):
     __tablename__ = "dns_rpz_hit"
     __table_args__ = (
         # "Who has been hitting the blocklist recently" — the query
-        # behind the attribution report, the alert matcher and the
-        # Threat tab's RPZ view.
+        # behind the attribution report and the Threat tab's RPZ panel.
         Index("ix_dns_rpz_hit_client_ts", "client_ip", "ts"),
         # Retention sweep + the "what got blocked lately" ordering.
         Index("ix_dns_rpz_hit_ts", "ts"),

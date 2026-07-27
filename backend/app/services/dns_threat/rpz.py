@@ -37,6 +37,16 @@ PASSTHRU = "PASSTHRU"
 NOISY_CLIENT_HITS = 50
 
 
+def _blocked(since: datetime) -> tuple[Any, ...]:
+    """The predicate every "what was blocked" query shares.
+
+    Defined once because it was restated six times across this module
+    and a single missed ``policy != PASSTHRU`` silently turns an
+    explicit ALLOW into a reported block.
+    """
+    return (DNSRPZHit.ts >= since, DNSRPZHit.policy != PASSTHRU)
+
+
 async def top_offending_clients(
     db: AsyncSession,
     *,
@@ -52,7 +62,10 @@ async def top_offending_clients(
     would be noise. :func:`summary` keeps it.
     """
     since = datetime.now(UTC) - timedelta(hours=hours)
-    stmt = (
+    base = _blocked(since)
+
+    # Per-client totals.
+    totals = (
         select(
             DNSRPZHit.client_ip.label("client_ip"),
             func.count().label("hits"),
@@ -60,51 +73,70 @@ async def top_offending_clients(
             func.count(func.distinct(DNSRPZHit.rpz_zone)).label("distinct_feeds"),
             func.max(DNSRPZHit.ts).label("last_seen"),
         )
-        .where(
-            DNSRPZHit.ts >= since,
-            DNSRPZHit.client_ip.is_not(None),
-            DNSRPZHit.policy != PASSTHRU,
-        )
+        .where(*base, DNSRPZHit.client_ip.is_not(None))
         .group_by(DNSRPZHit.client_ip)
         .having(func.count() >= min_hits)
         .order_by(func.count().desc())
         .limit(limit)
+        .subquery()
     )
-    rows = (await db.execute(stmt)).all()
 
-    out: list[dict[str, Any]] = []
-    for r in rows:
-        ip = str(r.client_ip)
-        # The single name this client hit hardest — the detail that
-        # turns "10.0.0.5 made 4,000 blocked lookups" into something an
-        # operator can actually chase.
-        worst = (
-            await db.execute(
-                select(DNSRPZHit.qname, func.count().label("n"))
-                .where(
-                    DNSRPZHit.ts >= since,
-                    DNSRPZHit.client_ip == ip,
-                    DNSRPZHit.policy != PASSTHRU,
-                    DNSRPZHit.qname.is_not(None),
-                )
-                .group_by(DNSRPZHit.qname)
-                .order_by(func.count().desc())
-                .limit(1)
-            )
-        ).first()
-        out.append(
-            {
-                "client_ip": ip,
-                "hits": r.hits,
-                "distinct_names": r.distinct_names,
-                "distinct_feeds": r.distinct_feeds,
-                "last_seen": r.last_seen,
-                "top_qname": worst.qname if worst else None,
-                "top_qname_hits": worst.n if worst else 0,
-                "noisy": r.hits >= NOISY_CLIENT_HITS,
-            }
+    # Worst name per client, ranked in ONE pass. This was a per-client
+    # SELECT inside the result loop — 1+N, so 201 serialised round trips
+    # at the endpoint's limit=200 ceiling, on a 30-day-retention table,
+    # and the cost scaled with how noisy the client was (i.e. worst for
+    # exactly the host this feature exists to surface). Same
+    # ``row_number() OVER (PARTITION BY ...)`` idiom the tunneling alert
+    # matcher already uses for the same shape.
+    per_name = (
+        select(
+            DNSRPZHit.client_ip.label("client_ip"),
+            DNSRPZHit.qname.label("qname"),
+            func.count().label("n"),
         )
-    return out
+        .where(*base, DNSRPZHit.client_ip.is_not(None), DNSRPZHit.qname.is_not(None))
+        .group_by(DNSRPZHit.client_ip, DNSRPZHit.qname)
+        .subquery()
+    )
+    ranked = select(
+        per_name.c.client_ip,
+        per_name.c.qname,
+        per_name.c.n,
+        func.row_number()
+        .over(partition_by=per_name.c.client_ip, order_by=per_name.c.n.desc())
+        .label("rn"),
+    ).subquery()
+    # Materialised ONCE — calling .subquery() per reference mints a
+    # distinct alias each time, which Postgres rejects with "missing
+    # FROM-clause entry".
+    worst = (
+        select(ranked.c.client_ip, ranked.c.qname, ranked.c.n).where(ranked.c.rn == 1).subquery()
+    )
+
+    stmt = select(
+        totals.c.client_ip,
+        totals.c.hits,
+        totals.c.distinct_names,
+        totals.c.distinct_feeds,
+        totals.c.last_seen,
+        worst.c.qname.label("top_qname"),
+        worst.c.n.label("top_qname_hits"),
+    ).select_from(totals.outerjoin(worst, totals.c.client_ip == worst.c.client_ip))
+    rows = (await db.execute(stmt.order_by(totals.c.hits.desc()))).all()
+
+    return [
+        {
+            "client_ip": str(r.client_ip),
+            "hits": r.hits,
+            "distinct_names": r.distinct_names,
+            "distinct_feeds": r.distinct_feeds,
+            "last_seen": r.last_seen,
+            "top_qname": r.top_qname,
+            "top_qname_hits": r.top_qname_hits or 0,
+            "noisy": r.hits >= NOISY_CLIENT_HITS,
+        }
+        for r in rows
+    ]
 
 
 async def top_blocked_names(
@@ -120,11 +152,7 @@ async def top_blocked_names(
                 func.count(func.distinct(DNSRPZHit.client_ip)).label("clients"),
                 func.min(DNSRPZHit.rpz_zone).label("rpz_zone"),
             )
-            .where(
-                DNSRPZHit.ts >= since,
-                DNSRPZHit.qname.is_not(None),
-                DNSRPZHit.policy != PASSTHRU,
-            )
+            .where(*_blocked(since), DNSRPZHit.qname.is_not(None))
             .group_by(DNSRPZHit.qname)
             .order_by(func.count().desc())
             .limit(limit)
@@ -142,12 +170,22 @@ async def top_blocked_names(
 
 
 async def feed_effectiveness(db: AsyncSession, *, hours: int = 24) -> list[dict[str, Any]]:
-    """Hits per blocklist feed — which lists are actually earning their keep.
+    """Hits per RPZ zone.
 
-    Operators subscribe to feeds and never learn which ones fire. A feed
-    with zero hits over a month is a candidate for removal; one carrying
-    most of the blocking is a candidate for keeping through a
-    consolidation.
+    **Resolution caveat.** ``dns/agent_config.py`` merges every enabled
+    blocklist into ONE rendered RPZ zone per view
+    (``spatium-blocklist[-<view>].rpz``), dropping the per-entry
+    ``list_id``/``list_name`` that ``EffectiveEntry`` carries. So for
+    SpatiumDDI-managed blocklists this returns one row per *view*, not
+    one per subscribed feed — it cannot currently answer "which of my 14
+    lists is firing". Splitting that apart needs either one rendered zone
+    per list or a join from the blocked qname back to
+    ``DNSBlockListEntry`` at report time; both are follow-up work,
+    tracked on #699.
+
+    It IS meaningful for operators running additional hand-rolled
+    ``response-policy`` zones alongside ours, and for separating hits
+    per view on a split-horizon install.
     """
     since = datetime.now(UTC) - timedelta(hours=hours)
     rows = (
@@ -158,9 +196,15 @@ async def feed_effectiveness(db: AsyncSession, *, hours: int = 24) -> list[dict[
                 func.count(func.distinct(DNSRPZHit.client_ip)).label("clients"),
                 func.count(func.distinct(DNSRPZHit.qname)).label("distinct_names"),
             )
-            .where(DNSRPZHit.ts >= since, DNSRPZHit.policy != PASSTHRU)
+            # ``rpz_zone IS NOT NULL`` keeps this consistent with
+            # summary()'s ``count(distinct rpz_zone)``, which skips NULLs
+            # by SQL semantics. Without it the card and the drilldown
+            # disagreed on the feed count whenever a ``via`` clause
+            # failed to parse.
+            .where(*_blocked(since), DNSRPZHit.rpz_zone.is_not(None))
             .group_by(DNSRPZHit.rpz_zone)
             .order_by(func.count().desc())
+            .limit(50)
         )
     ).all()
     return [
@@ -192,7 +236,7 @@ async def summary(db: AsyncSession, *, hours: int = 24) -> dict[str, Any]:
                 func.count(func.distinct(DNSRPZHit.client_ip)).label("clients"),
                 func.count(func.distinct(DNSRPZHit.qname)).label("names"),
                 func.count(func.distinct(DNSRPZHit.rpz_zone)).label("feeds"),
-            ).where(DNSRPZHit.ts >= since, DNSRPZHit.policy != PASSTHRU)
+            ).where(*_blocked(since))
         )
     ).one()
     # Counted separately rather than filtered out entirely: an operator

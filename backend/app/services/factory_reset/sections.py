@@ -124,6 +124,7 @@ FACTORY_SECTIONS: tuple[FactorySection, ...] = (
             "dns_trust_anchor",
             "dns_query_log_entry",
             "dns_client_window",
+            "dns_rpz_hit",
             "dns_threat_mute",
             "dns_metric_sample",
             "subnet_domain",
@@ -280,6 +281,7 @@ FACTORY_SECTIONS: tuple[FactorySection, ...] = (
             # operator names) — someone wiping an appliance before
             # handing it on reasonably expects all of this gone (#699).
             "dns_client_window",
+            "dns_rpz_hit",
             "dns_threat_mute",
             "dhcp_log_entry",
             "internal_error",

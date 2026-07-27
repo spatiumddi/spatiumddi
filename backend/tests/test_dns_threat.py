@@ -579,8 +579,15 @@ async def test_muted_client_drops_out_of_summary_and_windows(
 # NOT fire on the other's traffic.
 
 
-def _dga_labels(n: int = 60, tld: str = "com") -> dict[str, str]:
-    """A DGA crop: many distinct consonant-heavy fixed-width domains.
+def _dga_labels(n: int = 60, tld: str = "com", length: int = 12) -> dict[str, str]:
+    """A DGA crop: many distinct fixed-width random-alphabet domains.
+
+    Uses the FULL a-z alphabet, not consonants only. That distinction
+    caught a real calibration bug: a consonants-only fixture measures
+    0.80 bigram implausibility where a genuine Conficker/Necurs-shaped
+    label measures 0.60, and the original thresholds were set against
+    the fixture — so the scorer passed its tests while being unable to
+    reach its own alerting threshold on real traffic.
 
     Deterministic rather than random so a failure is reproducible — a
     flaky security detector is one nobody trusts.
@@ -588,10 +595,10 @@ def _dga_labels(n: int = 60, tld: str = "com") -> dict[str, str]:
     import random
 
     rng = random.Random(1337)
-    consonants = "bcdfghjklmnpqrstvwxz"
+    alphabet = "abcdefghijklmnopqrstuvwxyz"
     out: dict[str, str] = {}
     while len(out) < n:
-        label = "".join(rng.choice(consonants) for _ in range(12))
+        label = "".join(rng.choice(alphabet) for _ in range(length))
         out[f"{label}.{tld}"] = label
     return out
 
@@ -630,8 +637,28 @@ def _human_labels(n: int = 60) -> dict[str, str]:
 
 
 def test_bigram_implausibility_separates_gibberish_from_words() -> None:
-    assert bigram_implausibility("newsletter") < 0.4
+    assert bigram_implausibility("newsletter") < 0.2
     assert bigram_implausibility("xkqjfhwbzvmp") > 0.8
+
+
+def test_a_real_dga_crop_clears_the_alerting_threshold() -> None:
+    """The calibration guard. The first cut of these thresholds put
+    _NGRAM_FLOOR (0.55) ABOVE where a random a-z label actually measures
+    (0.60) and _NGRAM_CEIL at an unreachable 0.92, so a genuine crop
+    scored ~64 against an alert bar of 80 — the detection could not fire
+    on the thing it exists to detect, while its tests passed."""
+    from app.services.dns_threat.aggregate import DGA_ALERTING_SCORE
+
+    assert score_dga(_dga_labels(250)).score >= DGA_ALERTING_SCORE
+
+
+def test_busy_but_innocent_client_does_not_score() -> None:
+    """Fan-out alone must not score. A build server, a mail gateway or a
+    downstream forwarder collapsing a whole office onto one client_ip
+    legitimately touches hundreds of parents an hour; when the fan-out
+    weight was additive such a client scored 36/100 with ZERO implausible
+    names and outranked genuine smaller crops."""
+    assert score_dga(_human_labels(300)).score < 10.0
 
 
 def test_bigram_implausibility_ignores_digits() -> None:
@@ -642,10 +669,10 @@ def test_bigram_implausibility_ignores_digits() -> None:
 
 def test_dga_crop_outranks_ordinary_domains() -> None:
     """The ordering is the contract; absolute numbers will be retuned."""
-    crop = score_dga(_dga_labels())
-    human = score_dga(_human_labels())
+    crop = score_dga(_dga_labels(120))
+    human = score_dga(_human_labels(120))
     assert crop.score > human.score
-    assert human.score < 20.0, "ordinary browsing must sit near zero"
+    assert human.score < 10.0, "ordinary browsing must sit near zero"
 
 
 def test_few_domains_never_score() -> None:
@@ -656,7 +683,7 @@ def test_few_domains_never_score() -> None:
     """
     verdict = score_dga(dict(list(_dga_labels().items())[:5]))
     assert verdict.score == 0.0
-    assert verdict.signals[0]["name"] == "insufficient_domains"
+    assert verdict.signals[0].name == "insufficient_domains"
 
 
 def test_short_labels_do_not_dilute_a_real_crop() -> None:
@@ -666,7 +693,7 @@ def test_short_labels_do_not_dilute_a_real_crop() -> None:
     implementation and it let a crop hide behind a pile of short
     legitimate domains.
     """
-    crop = _dga_labels()
+    crop = _dga_labels(120)
     padded = {**crop, **{f"a{i}.com": f"a{i}" for i in range(200)}}
     assert score_dga(padded).score == pytest.approx(score_dga(crop).score, abs=1.0)
 
@@ -682,7 +709,7 @@ def test_tunneling_traffic_does_not_score_as_dga() -> None:
 def test_dga_traffic_does_not_score_as_tunneling() -> None:
     """...and the converse. A crop fans out across parents, so the
     tunneling scorer's subdomain-fan-out signal never lights up."""
-    rows = [(parent, "A", "server-1") for parent in _dga_labels(80)]
+    rows = [(parent, "A", "server-1") for parent in _dga_labels(120)]
     verdict = score_tunneling(extract_features(rows))
     assert verdict.score < 20.0
 
@@ -691,10 +718,17 @@ def test_dga_score_is_bounded() -> None:
     assert 0.0 <= score_dga(_dga_labels(500)).score <= 100.0
 
 
+def test_min_parents_zero_does_not_crash_the_rollup() -> None:
+    """A caller lowering the gate must not reach fmean() on an empty
+    set — StatisticsError would propagate out of the aggregator's flush
+    and abort the hourly rollup for EVERY client, not just this one."""
+    assert score_dga({}, min_parents=0).score == 0.0
+
+
 def test_dga_evidence_names_the_domains() -> None:
     """A bare score is not actionable — hashed-CDN traffic shares the
     shape, so an operator has to see WHICH domains scored."""
-    verdict = score_dga(_dga_labels())
+    verdict = score_dga(_dga_labels(120))
     assert verdict.candidates_json(), "evidence must carry the domains"
     assert len(verdict.candidates_json()) <= 10, "evidence is capped for triage"
     assert verdict.detail
@@ -704,7 +738,7 @@ def test_dga_evidence_names_the_domains() -> None:
 def test_dga_signals_carry_their_own_ceiling() -> None:
     """Same wire shape as tunnel_signals so one UI component renders
     both detections' evidence."""
-    for sig in score_dga(_dga_labels()).signals:
+    for sig in score_dga(_dga_labels(120)).signals_json():
         assert set(sig) >= {"name", "value", "contribution", "max_contribution", "detail"}
         assert sig["contribution"] <= sig["max_contribution"] + 1e-9
 
@@ -715,7 +749,7 @@ async def test_aggregate_persists_dga_verdict(db_session: AsyncSession) -> None:
     scored, evidenced row."""
     server = await _make_dns_server(db_session)
     bucket = floor_hour(datetime.now(UTC))
-    rows = [(parent, "A", str(server.id)) for parent in _dga_labels(80)]
+    rows = [(parent, "A", str(server.id)) for parent in _dga_labels(120)]
     await _seed_queries(db_session, server.id, rows, ts=bucket, client="10.0.0.44")
     await aggregate_window(db_session, window_start=bucket)
 
@@ -774,17 +808,91 @@ def test_query_parser_still_handles_query_lines_after_rpz_category_added() -> No
     assert parsed.qname == "www.example.com"
 
 
-def test_rpz_drop_policy_without_rewrite_or_via_still_parses() -> None:
-    """DROP logs the action alone — no ``rewrite``, no ``via``. Losing
-    those hits would silently under-count the most aggressive policy."""
+def test_rpz_drop_policy_parses() -> None:
+    """DROP logs ``rewrite``/``via`` like every other policy on BIND
+    9.20 — an earlier fixture here asserted a bare-action shape named
+    never emits, so the test passed against invented input."""
     line = (
         "27-Jul-2026 22:15:03.123 rpz: info: client @0x7f8 192.0.2.9#5 "
-        "(bad.example): view default: rpz QNAME DROP"
+        "(bad.example): view default: rpz QNAME DROP rewrite bad.example/A/IN "
+        "via bad.example.spatium-blocklist.rpz"
     )
     hit = parse_rpz_line(line)
     assert hit is not None
     assert hit.policy == "DROP"
-    assert hit.rpz_zone is None
+    assert hit.rpz_zone == "spatium-blocklist.rpz"
+
+
+def test_rewrite_operand_strips_qtype_and_qclass() -> None:
+    """BIND logs ``rewrite bad.example/A/IN``. Storing the raw operand
+    put ``bad.example/a/in`` in the qname — a name matching no real
+    domain, which would group as its own row in the blocked-names
+    report and render that way to operators."""
+    line = (
+        "27-Jul-2026 22:15:03.123 rpz: info: rpz QNAME NXDOMAIN "
+        "rewrite evil.example/AAAA/IN via evil.example.spatium-blocklist.rpz"
+    )
+    hit = parse_rpz_line(line)
+    assert hit is not None
+    assert hit.qname == "evil.example"
+
+
+def test_tcp_only_policy_uses_the_underscore_log_form() -> None:
+    """``tcp-only`` is the named.conf keyword; the LOG string is
+    ``TCP_ONLY``. Matching only the hyphen silently dropped every hit
+    from the most aggressive rate-limiting policy."""
+    line = (
+        "27-Jul-2026 22:15:03.123 rpz: info: rpz QNAME TCP_ONLY "
+        "rewrite x.example/A/IN via x.example.spatium-blocklist.rpz"
+    )
+    hit = parse_rpz_line(line)
+    assert hit is not None
+    assert hit.policy == "TCP_ONLY"
+
+
+def test_log_only_dry_run_hits_are_not_counted_as_blocks() -> None:
+    """named prefixes ``disabled `` when a policy zone runs with
+    ``policy disabled`` — the standard way to trial a new feed. Nothing
+    was blocked, so counting it would fabricate hits for an operator who
+    is explicitly evaluating rather than enforcing."""
+    line = (
+        "27-Jul-2026 22:15:03.123 rpz: info: client @0x7f8 192.0.2.9#5 "
+        "(x.example): view default: disabled rpz QNAME NXDOMAIN rewrite "
+        "x.example/A/IN via x.example.spatium-blocklist.rpz"
+    )
+    assert parse_rpz_line(line) is None
+
+
+def test_passthru_category_prefix_is_stripped() -> None:
+    """PASSTHRU rides its own ``rpz-passthru`` category. If the prefix
+    is not stripped, ``_HEAD_RE``'s ``^client`` anchor fails and the hit
+    lands unattributable — which is what the offender report filters
+    out, so the allow would be invisible twice over."""
+    line = (
+        "27-Jul-2026 22:15:03.123 rpz-passthru: info: client @0x7f8 "
+        "192.0.2.7#5 (ok.example): view default: rpz QNAME PASSTHRU "
+        "rewrite ok.example/A/IN via ok.example.spatium-blocklist.rpz"
+    )
+    hit = parse_rpz_line(line)
+    assert hit is not None
+    assert hit.policy == "PASSTHRU"
+    assert hit.client_ip == "192.0.2.7"
+    assert hit.qname == "ok.example"
+
+
+def test_rpz_zone_is_bounded_to_the_column_width() -> None:
+    """An unbounded ``via`` fallback could exceed String(255); the ingest
+    commits the whole batch in one statement, so one overlong value
+    would abort every query-log row in the same POST."""
+    long_name = ".".join(["a" * 60] * 5)
+    line = (
+        f"27-Jul-2026 22:15:03.123 rpz: info: rpz QNAME NXDOMAIN "
+        f"rewrite x/A/IN via {long_name}.blocklist.local"
+    )
+    hit = parse_rpz_line(line)
+    assert hit is not None
+    assert hit.rpz_zone is not None
+    assert len(hit.rpz_zone) <= 255
 
 
 @pytest.mark.asyncio

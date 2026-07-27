@@ -48,7 +48,11 @@ _ISO_TS_RE: Final = re.compile(
 # the same channel (issue #699) and carry their own category name — a
 # prefix left unstripped would push the client/qname head out of reach
 # of ``_HEAD_RE`` and cost us the attribution the feature exists for.
-_CAT_SEV_RE: Final = re.compile(r"^(?:(?:queries|rpz):\s+)?(?:info:\s+)?")
+# ``rpz-passthru`` is listed before ``rpz`` — alternation is ordered,
+# and ``rpz`` would otherwise match the prefix of ``rpz-passthru:``
+# and leave ``-passthru: `` in front of the ``client`` head, which is
+# ``^``-anchored and would then fail to parse.
+_CAT_SEV_RE: Final = re.compile(r"^(?:(?:queries|rpz-passthru|rpz):\s+)?(?:info:\s+)?")
 
 # BIND9 query lines are split on the hard ``: query: `` separator
 # rather than matched by one big regex. The combined pattern (client
@@ -290,7 +294,12 @@ def parse_query_line(line: str, *, fallback_ts: datetime | None = None) -> Parse
     )
 
 
-__all__ = ["ParsedQueryLine", "parse_query_line"]
+__all__ = [
+    "ParsedQueryLine",
+    "ParsedRPZLine",
+    "parse_query_line",
+    "parse_rpz_line",
+]
 
 
 # ── RPZ policy hits (issue #699) ──────────────────────────────────────
@@ -319,16 +328,23 @@ __all__ = ["ParsedQueryLine", "parse_query_line"]
 # being mistaken for an RPZ hit, and every segment's character class is
 # disjoint from its neighbours' so matching stays linear.
 _RPZ_TRIGGERS: Final = "QNAME|CLIENT-IP|IP|NSDNAME|NSIP"
-_RPZ_POLICIES: Final = "NXDOMAIN|NODATA|PASSTHRU|DROP|TCP-ONLY|CNAME|Local-Data"
+# ``TCP_ONLY`` carries an UNDERSCORE: the hyphenated ``tcp-only`` is
+# the named.conf keyword, but dns_rpz_policy2str() emits the
+# underscore form to the log. Both are accepted so a config-shaped
+# line from a future named release still parses.
+_RPZ_POLICIES: Final = "NXDOMAIN|NODATA|PASSTHRU|DROP|TCP_ONLY|TCP-ONLY|CNAME|Local-Data"
 
 _RPZ_RE: Final = re.compile(
     r"\brpz\s+(?P<trigger>" + _RPZ_TRIGGERS + r")"
     r"\s+(?P<policy>" + _RPZ_POLICIES + r")"
-    # ``rewrite <name>`` is present for every policy except DROP, which
-    # logs the action alone — hence both halves optional.
+    # ``rewrite <qname>/<qtype>/<qclass>`` — note the operand carries the
+    # type and class, so it is NOT a bare name (verified against BIND
+    # 9.20: ``rewrite bad.example/A/IN``). Both halves stay optional to
+    # tolerate format drift across releases rather than because any
+    # current policy omits them — BIND 9.20 emits ``rewrite``/``via`` for
+    # every policy including DROP, contrary to a common reading of the
+    # docs.
     r"(?:\s+rewrite\s+(?P<rewritten>[^\s]+))?"
-    # ``via <entry>.<rpz-zone>`` names the blocklist zone that matched.
-    # Optional for the same reason.
     r"(?:\s+via\s+(?P<via>[^\s]+))?",
 )
 
@@ -369,8 +385,22 @@ def parse_rpz_line(line: str, *, fallback_ts: datetime | None = None) -> ParsedR
     if len(line) > _MAX_LINE_LEN:
         line = line[:_MAX_LINE_LEN]
 
+    # Cheap reject before the regex. Every ingested query-log line pays
+    # this probe, and ``_RPZ_RE`` requires a literal ``rpz`` token, so the
+    # substring test is behaviour-preserving and ~50x cheaper on the miss
+    # path (which is almost every line).
+    if "rpz" not in line:
+        return None
+
     rpz_m = _RPZ_RE.search(line)
     if rpz_m is None:
+        return None
+    # named prefixes the message with ``disabled `` when the policy zone
+    # is running with ``policy disabled`` — the standard way to trial a
+    # new feed in log-only mode. Nothing was actually blocked, so
+    # counting it would fabricate hits for an operator who is explicitly
+    # evaluating rather than enforcing.
+    if line[: rpz_m.start()].rstrip().endswith("disabled"):
         return None
 
     ts: datetime | None = None
@@ -397,8 +427,8 @@ def parse_rpz_line(line: str, *, fallback_ts: datetime | None = None) -> ParsedR
     # name; the fallback matters because a DROP policy logs no
     # ``rewrite``, and the paren form matters because a head that failed
     # to parse leaves only the clause.
-    qname = _rpz_qname_from_head(head_m.group("rest") if head_m else None) or rpz_m.group(
-        "rewritten"
+    qname = _rpz_qname_from_head(head_m.group("rest") if head_m else None) or _bare_qname(
+        rpz_m.group("rewritten")
     )
 
     return ParsedRPZLine(
@@ -434,14 +464,21 @@ def _rpz_zone_from_via(via: str | None) -> str | None:
         return None
     cleaned = via.rstrip(".").lower()
     labels = cleaned.split(".")
-    # Rightmost ``rpz`` label — the zone's terminal label by convention.
-    for i in range(len(labels) - 1, -1, -1):
-        if labels[i] == "rpz":
-            # The label before it carries the feed identity
-            # (``spatium-blocklist``, ``spatium-blocklist-internal``).
-            start = max(0, i - 1)
-            return ".".join(labels[start:])
-    return cleaned
+    # SpatiumDDI's own zones are the case that must be exact, so match
+    # the rendered prefix directly rather than inferring from label
+    # position. Guessing by position mis-sliced any zone with a
+    # non-terminal ``rpz`` label — ``bad.example.rpz.local`` yielded
+    # ``example.rpz.local``, gluing the blocked name onto the zone and
+    # turning every distinct name into its own phantom "feed".
+    for i, label in enumerate(labels):
+        if label.startswith(_RENDERED_RPZ_PREFIX):
+            return ".".join(labels[i:])[:_RPZ_ZONE_MAX_LEN]
+    # Hand-rolled / imported zone. Take the last two labels as a
+    # best-effort feed identity; returning the whole ``via`` (as an
+    # earlier cut did) made the value vary per blocked name AND could
+    # exceed the String(255) column, which aborts the entire ingest
+    # batch on commit — losing every query-log row in the same POST.
+    return ".".join(labels[-2:])[:_RPZ_ZONE_MAX_LEN] if len(labels) >= 2 else cleaned
 
 
 # The ``(<qname>)`` BIND puts between the client address and the colon.
@@ -449,21 +486,39 @@ def _rpz_zone_from_via(via: str | None) -> str | None:
 # rest of the line, keeping the match linear.
 _RPZ_HEAD_QNAME_RE: Final = re.compile(r"\((?P<qname>[^)\s]+)\)")
 
+# ``dns_rpz_hit.rpz_zone`` is String(255). The ``via`` token is
+# unbounded, and one overlong value fails the single commit that covers
+# the whole ingest batch, so clamp here rather than at the call site.
+_RPZ_ZONE_MAX_LEN: Final = 255
+
+# What ``dns/agent_config.py`` renders: ``spatium-blocklist.rpz.`` and
+# ``spatium-blocklist-<view>.rpz.``.
+_RENDERED_RPZ_PREFIX: Final = "spatium-blocklist"
+
 
 def _rpz_qname_from_head(rest: str | None) -> str | None:
-    """Pull the queried name out of an RPZ line's head.
+    r"""Pull the queried name out of an RPZ line's head.
 
-    ``rest`` is everything ``_HEAD_RE`` left after the client port. The
-    first parenthesised token there is the qname — except on lines that
-    carry the ``(view <name>)`` form instead, which is why a match
-    starting with ``view`` is rejected rather than returned as a
-    hostname.
+    ``rest`` is everything ``_HEAD_RE`` left after the client port; the
+    first parenthesised token there is the qname. The ``(view <name>)``
+    form cannot be confused with it — that contains a space, which
+    ``_RPZ_HEAD_QNAME_RE``'s ``[^)\s]+`` excludes by construction.
     """
     if not rest:
         return None
-    for m in _RPZ_HEAD_QNAME_RE.finditer(rest):
-        candidate = m.group("qname")
-        if candidate.lower() == "view":
-            continue
-        return candidate
-    return None
+    m = _RPZ_HEAD_QNAME_RE.search(rest)
+    return m.group("qname") if m else None
+
+
+def _bare_qname(operand: str | None) -> str | None:
+    """Strip the ``/<qtype>/<qclass>`` suffix off a ``rewrite`` operand.
+
+    BIND logs ``rewrite bad.example/A/IN``, not a bare name. Storing the
+    raw operand put ``bad.example/a/in`` in ``dns_rpz_hit.qname``, which
+    matches no real domain — it would group as its own row in
+    ``top_blocked_names`` and render that way in the UI and in copilot
+    answers.
+    """
+    if not operand:
+        return None
+    return operand.split("/", 1)[0] or None

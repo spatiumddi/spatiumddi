@@ -44,6 +44,8 @@ import statistics
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.services.dns_threat.scoring import Signal, ramp
+
 # Bigrams that turn up constantly in English words and in the brandable
 # labels people actually register. Deliberately a coarse membership set
 # rather than a trained frequency model: the job is separating
@@ -72,24 +74,40 @@ _W_PARENT_FANOUT = 30.0
 _W_PRONOUNCEABILITY = 20.0
 _W_LENGTH_UNIFORMITY = 15.0
 
-# Fraction of a label's bigrams absent from _COMMON_BIGRAMS. Real
-# brandable labels still miss plenty (brand names are odd on purpose),
-# so the floor is high — this only starts contributing well past what
-# ordinary domains score.
-_NGRAM_FLOOR = 0.55
-_NGRAM_CEIL = 0.92
+# Fraction of a label's bigrams absent from _COMMON_BIGRAMS.
+#
+# MEASURED against the shipped bigram set rather than guessed, because
+# the first cut of these numbers made the detection mathematically
+# unable to reach its own alerting threshold:
+#
+#   real word-shaped labels   0.06   (northwind, warehouse, logistics)
+#   random a-z 12-char        0.60   (Conficker / Necurs shape)
+#   random alphanumeric       0.61
+#
+# A uniformly random label tops out near 0.60, not 1.0, because 259 of
+# the 676 possible bigrams are in the common set and turn up by chance.
+# The old ceiling of 0.92 was therefore unreachable and the old floor
+# of 0.55 sat above where real domains land, so a genuine crop scored
+# ~7 of a possible 35. The separation between the two populations is
+# enormous (0.06 vs 0.60) — the thresholds just have to sit inside it.
+_NGRAM_FLOOR = 0.30
+_NGRAM_CEIL = 0.58
 
-# Distinct non-allowlisted parent domains in the hour. A browsing human
-# comfortably clears 50; a DGA crop is typically tried in bulk. Set so
-# ordinary traffic scores ~0 on this signal and only genuine spraying
-# registers.
-_FANOUT_FLOOR = 40
-_FANOUT_CEIL = 250
+# Distinct non-allowlisted parent domains in the hour. Floor matches
+# MIN_PARENTS_TO_SCORE so the signal starts exactly where scoring does.
+#
+# Fan-out ALONE means nothing — a build server, a mail gateway or a
+# proxy legitimately touches hundreds of domains an hour — which is why
+# this signal is conditioned on the n-gram signal below rather than
+# added independently. See score_dga.
+_FANOUT_FLOOR = 12
+_FANOUT_CEIL = 120
 
 # Vowel fraction of the label. Human-chosen labels sit near 0.35-0.40;
 # consonant soup sits far below. Inverted ramp — LOW is the signal.
-_VOWEL_RATIO_IMPLAUSIBLE = 0.12
-_VOWEL_RATIO_NORMAL = 0.34
+# Measured: random a-z sits at 0.22, real word labels at 0.40.
+_VOWEL_RATIO_IMPLAUSIBLE = 0.20
+_VOWEL_RATIO_NORMAL = 0.38
 
 # Coefficient of variation of label lengths across the client's parents.
 # Many DGA families emit a fixed or narrow length (all 12 chars, all
@@ -139,21 +157,16 @@ def vowel_ratio(label: str) -> float:
     return sum(1 for ch in letters if ch in _VOWELS) / len(letters)
 
 
-def _ramp(value: float, floor: float, ceil: float) -> float:
-    if ceil <= floor:
-        return 0.0
-    return max(0.0, min(1.0, (value - floor) / (ceil - floor)))
-
-
 def _inverse_ramp(value: float, low: float, high: float) -> float:
     """1.0 at or below ``low``, 0.0 at or above ``high``.
 
     For signals where a SMALL number is the suspicious one (vowel
-    deficiency, length uniformity).
+    deficiency, length uniformity). Expressed via the shared
+    :func:`~app.services.dns_threat.scoring.ramp` rather than its own
+    clamp so the three scorers cannot drift apart on the curve they all
+    document as producing comparable 0-100 numbers.
     """
-    if high <= low:
-        return 0.0
-    return max(0.0, min(1.0, (high - value) / (high - low)))
+    return 1.0 - ramp(value, low, high)
 
 
 @dataclass
@@ -179,7 +192,12 @@ class DGAVerdict:
     score: float = 0.0
     candidates: list[DGACandidate] = field(default_factory=list)
     detail: str = ""
-    signals: list[dict[str, Any]] = field(default_factory=list)
+    signals: list[Signal] = field(default_factory=list)
+
+    def signals_json(self) -> list[dict[str, Any]]:
+        """Mirrors ``TunnelVerdict.signals_json`` — one wire shape, one
+        ``SignalBar`` component rendering both detections' evidence."""
+        return [s.as_dict() for s in self.signals]
 
     def candidates_json(self) -> list[dict[str, Any]]:
         # Worst first, capped. The evidence blob is for an operator
@@ -187,20 +205,6 @@ class DGAVerdict:
         # bury the point rather than make it.
         ranked = sorted(self.candidates, key=lambda c: c.implausibility, reverse=True)
         return [c.as_dict() for c in ranked[:10]]
-
-
-def _signal(
-    name: str, value: float, contribution: float, max_contribution: float, detail: str
-) -> dict[str, Any]:
-    """Same wire shape as the tunneling scorer's ``Signal.as_dict`` so the
-    UI renders both detections' evidence with one component."""
-    return {
-        "name": name,
-        "value": round(value, 3),
-        "contribution": round(contribution, 1),
-        "max_contribution": round(max_contribution, 1),
-        "detail": detail,
-    }
 
 
 def score_dga(
@@ -226,7 +230,12 @@ def score_dga(
     judged = {
         parent: label for parent, label in parent_labels.items() if len(label) >= _MIN_LABEL_LENGTH
     }
-    if len(judged) < min_parents:
+    # ``max(1, ...)``: a caller passing min_parents=0 would otherwise
+    # skip this guard with an empty ``judged`` and reach
+    # statistics.fmean() on an empty sequence, raising StatisticsError
+    # out of aggregate_window's _flush and aborting the hourly rollup
+    # for EVERY client, not just this one.
+    if len(judged) < max(1, min_parents):
         return DGAVerdict(
             score=0.0,
             detail=(
@@ -235,10 +244,9 @@ def score_dga(
                 f"ordinary browsing"
             ),
             signals=[
-                _signal(
+                Signal(
                     "insufficient_domains",
                     float(len(judged)),
-                    0.0,
                     0.0,
                     "a DGA is identifiable by the size of its crop, not by any one name",
                 )
@@ -254,48 +262,62 @@ def score_dga(
     mean_len = statistics.fmean(lengths)
     length_cv = (statistics.pstdev(lengths) / mean_len) if mean_len > 0 else 1.0
 
-    ngram_r = _ramp(mean_implaus, _NGRAM_FLOOR, _NGRAM_CEIL)
-    fanout_r = _ramp(float(len(judged)), _FANOUT_FLOOR, _FANOUT_CEIL)
+    ngram_r = ramp(mean_implaus, _NGRAM_FLOOR, _NGRAM_CEIL)
+    fanout_r = ramp(float(len(judged)), _FANOUT_FLOOR, _FANOUT_CEIL)
     vowel_r = _inverse_ramp(mean_vowel, _VOWEL_RATIO_IMPLAUSIBLE, _VOWEL_RATIO_NORMAL)
     uniform_r = _inverse_ramp(length_cv, _LENGTH_CV_UNIFORM, _LENGTH_CV_ORGANIC)
 
+    # Fan-out and length-uniformity are CONDITIONED on the n-gram
+    # signal rather than added independently. Both are really proxies
+    # for "this client queried a lot of domains", and a build server, a
+    # mail gateway or (very commonly) a downstream forwarder that
+    # collapses a whole office onto one client_ip legitimately touches
+    # hundreds of parents an hour. Additive, they handed such a client
+    # 36/100 with ZERO implausible names, which both outranked genuine
+    # smaller crops and contradicted this module's own docstring
+    # ("the fan-out gate means a client has to be spraying *many*
+    # IMPLAUSIBLE parents"). Multiplying by ngram_r makes that sentence
+    # true: nothing gibberish-looking, nothing scored. Pronounceability
+    # stays independent because it measures plausibility directly.
     signals = [
-        _signal(
+        Signal(
             "ngram_implausibility",
             mean_implaus,
             ngram_r * _W_NGRAM,
-            _W_NGRAM,
             f"{mean_implaus:.0%} of character pairs across {len(judged)} domains are "
-            f"not word-shaped (algorithmic labels score high; brandable ones, even "
-            f"odd ones, sit well below)",
+            f"not word-shaped (algorithmic labels measure ~0.60, real ones ~0.06)",
+            max_contribution=_W_NGRAM,
         ),
-        _signal(
+        Signal(
             "domain_fanout",
             float(len(judged)),
-            fanout_r * _W_PARENT_FANOUT,
-            _W_PARENT_FANOUT,
+            fanout_r * ngram_r * _W_PARENT_FANOUT,
             f"{len(judged)} distinct registrable domains in one hour (a DGA tries a "
             f"whole crop; this is the signal that separates it from tunneling, which "
-            f"concentrates under one parent)",
+            f"concentrates under one parent). Scaled by the implausibility signal — "
+            f"a busy host querying ordinary domains scores nothing here.",
+            max_contribution=_W_PARENT_FANOUT,
         ),
-        _signal(
+        Signal(
             "pronounceability",
             mean_vowel,
             vowel_r * _W_PRONOUNCEABILITY,
-            _W_PRONOUNCEABILITY,
             f"mean vowel fraction {mean_vowel:.0%} (human-chosen labels sit near 34%; "
             f"consonant soup sits far below)",
+            max_contribution=_W_PRONOUNCEABILITY,
         ),
-        _signal(
+        Signal(
             "length_uniformity",
             length_cv,
-            uniform_r * _W_LENGTH_UNIFORMITY,
-            _W_LENGTH_UNIFORMITY,
+            uniform_r * ngram_r * _W_LENGTH_UNIFORMITY,
             f"label lengths vary by {length_cv:.0%} around a mean of {mean_len:.0f} "
-            f"chars (many DGA families emit a fixed width; organic browsing does not)",
+            f"chars (many DGA families emit a fixed width). Scaled by the "
+            f"implausibility signal — real browsing has a modest spread too, so "
+            f"uniformity alone must not add points.",
+            max_contribution=_W_LENGTH_UNIFORMITY,
         ),
     ]
-    score = sum(s["contribution"] for s in signals)
+    score = sum(sig.contribution for sig in signals)
 
     candidates = [
         DGACandidate(

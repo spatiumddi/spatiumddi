@@ -195,7 +195,7 @@ def split_qname(qname: str) -> tuple[list[str], str]:
     return (labels[: -len(tail)], parent)
 
 
-def _ramp(value: float, floor: float, ceil: float) -> float:
+def ramp(value: float, floor: float, ceil: float) -> float:
     """Linear 0→1 ramp between floor and ceiling, clamped.
 
     A ramp rather than a threshold so a host just over the line scores
@@ -438,12 +438,12 @@ def score_tunneling(feats: ClientFeatures) -> TunnelVerdict:
     # labels are long *on average*; a false positive's are long once.
     # Keeping some weight on max means a short-label tunnel padded with
     # normal traffic still registers.
-    length_r = 0.4 * _ramp(
+    length_r = 0.4 * ramp(
         feats.max_label_length, _LABEL_LENGTH_FLOOR, _LABEL_LENGTH_CEIL
-    ) + 0.6 * _ramp(feats.avg_label_length, _LABEL_LENGTH_FLOOR, _LABEL_LENGTH_CEIL)
-    entropy_r = _ramp(feats.mean_label_entropy, _ENTROPY_FLOOR, _ENTROPY_CEIL)
-    fanout_r = _ramp(feats.top_parent_subdomains, _FANOUT_FLOOR, _FANOUT_CEIL)
-    payload_r = _ramp(feats.payload_qtype_ratio, _PAYLOAD_RATIO_FLOOR, _PAYLOAD_RATIO_CEIL)
+    ) + 0.6 * ramp(feats.avg_label_length, _LABEL_LENGTH_FLOOR, _LABEL_LENGTH_CEIL)
+    entropy_r = ramp(feats.mean_label_entropy, _ENTROPY_FLOOR, _ENTROPY_CEIL)
+    fanout_r = ramp(feats.top_parent_subdomains, _FANOUT_FLOOR, _FANOUT_CEIL)
+    payload_r = ramp(feats.payload_qtype_ratio, _PAYLOAD_RATIO_FLOOR, _PAYLOAD_RATIO_CEIL)
 
     signals = [
         Signal(

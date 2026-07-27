@@ -211,7 +211,7 @@ async def _upsert(
         "beacon_detail": beacon.detail,
         "dga_score": dga.score,
         "dga_candidates": dga.candidates_json(),
-        "dga_signals": dga.signals,
+        "dga_signals": dga.signals_json(),
         "dga_detail": dga.detail,
         "allowlisted": feats.allowlisted,
     }
