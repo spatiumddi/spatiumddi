@@ -28,6 +28,7 @@ from app.core.dns_names import contains_control_chars
 from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.dns import DNSRecord, DNSServerGroup, DNSView, DNSZone
+from app.services.dns.record_ops import enqueue_record_ops_bulk, record_op_payload
 
 from .canonical import (
     ConflictAction,
@@ -153,10 +154,12 @@ async def _build_records_for_zone(
     parsed: ImportedZone,
     source: ImportSource,
     now: datetime,
-) -> tuple[int, list[str]]:
+) -> tuple[list[DNSRecord], list[str]]:
     """Create the DNSRecord rows for one parsed zone.
 
-    Returns ``(records_created, skipped_reasons)``. Skips the SOA (its
+    Returns ``(created_rows, skipped_reasons)``. The caller needs the rows
+    themselves (not just a count) to enqueue the matching record ops — see
+    :func:`_create_zone_at`. Skips the SOA (its
     fields live as columns on the parent zone) and, per issue #597, any
     record whose owner name or rdata carries a control character / newline
     — those can't be safely rendered into a zone-file line, so the row is
@@ -198,7 +201,7 @@ async def _build_records_for_zone(
         )
     if rows:
         db.add_all(rows)
-    return len(rows), skipped
+    return rows, skipped
 
 
 def _zone_kwargs_from_parsed(
@@ -277,7 +280,7 @@ async def _create_zone_at(
     db.add(zone)
     await db.flush()  # populate zone.id for the FK
 
-    records_created, skipped_records = await _build_records_for_zone(
+    record_rows, skipped_records = await _build_records_for_zone(
         db,
         zone_id=zone.id,
         zone_fqdn=target_name,
@@ -285,6 +288,42 @@ async def _create_zone_at(
         source=source,
         now=now,
     )
+    records_created = len(record_rows)
+
+    # Issue #707 — writing DNSRecord rows is NOT enough to make imported
+    # records resolvable. Records are deliberately excluded from the agent
+    # bundle's ``structural_etag`` (``agent_config.py`` drops the ``records``
+    # key from ``zones_structural`` unless the group has views), so a
+    # record-only change never triggers the agent's re-render/reload path.
+    # The only route from a committed record to the live daemon is a
+    # ``DNSRecordOp`` row, which the agent drains via nsupdate/RFC 2136
+    # (BIND9) or the zone API (PowerDNS).
+    #
+    # This bites hardest on BIND9 overwrites: named already has the zone
+    # loaded with a journal (zones render with ``allow-update``), so the
+    # re-rendered master file is ignored on ``rndc reload`` and the records
+    # stay invisible until an operator edits each one by hand. PowerDNS
+    # recovers on the next unrelated structural reload (``_reconcile_zones``
+    # PATCHes REPLACE rrsets) but is equally stale until then.
+    #
+    # ``target_serial`` is the zone's own serial rather than a bump: the
+    # importer always creates the zone fresh (overwrites delete + recreate),
+    # so ``last_serial`` was just seeded from the parsed SOA and already
+    # describes the state these records belong to.
+    if record_rows:
+        await db.flush()  # populate record PKs before snapshotting payloads
+        await enqueue_record_ops_bulk(
+            db,
+            zone,
+            [
+                {
+                    "op": "create",
+                    "record": record_op_payload(rec),
+                    "target_serial": zone.last_serial or None,
+                }
+                for rec in record_rows
+            ],
+        )
 
     audit_meta: dict[str, Any] = {
         "import_source": source,
