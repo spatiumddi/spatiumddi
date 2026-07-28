@@ -427,9 +427,33 @@ The shipped image (`ghcr.io/spatiumddi/dns-powerdns`) bundles `pdns 5.0.x` with 
 
 The agent never reads `pdns.conf` to figure out what to do — it queries PowerDNS over REST and reconciles against the `ConfigBundle` shipped from the control plane. This is the same conceptual loop as the BIND9 driver, but the wire protocol is HTTP+JSON instead of RFC 2136+rndc.
 
+> ⚠️ **Never write zones with `pdnsutil` against a running daemon** (issue #132).
+> `pdnsutil` writes straight to LMDB, behind `pdns_server`'s back.
+> `pdns_server` caches the set of zones it is authoritative for
+> (`zone-cache-refresh-interval`, default **300 s**), so a zone created
+> after startup by `pdnsutil` is missing from that cache and the daemon
+> answers as **non-authoritative** — the records are genuinely in the
+> database and `dig` still returns nothing, with no error anywhere.
+> `pdns_control purge` does *not* help: it flushes the query/packet
+> cache, not the zone cache. Reproduced identically on 4.9.5 and 5.0.5.
+>
+> Writes through the REST API go through `pdns_server` itself, so the
+> zone cache updates as a side effect and the zone is served immediately
+> — no purge, no `rediscover`, no restart. That is why every write path
+> in the agent is REST, and why the `agent-e2e.yml` DNSSEC smoke was
+> rewritten onto the API in #132 (it had driven `pdnsutil`, and had
+> therefore never passed since the day it was added).
+>
+> `pdnsutil` remains fine for **read-only** inspection (`list-zone`,
+> `show-zone`) — which is exactly what makes it useful as a failure
+> diagnostic: if `list-zone` shows a record that `dig` won't return,
+> you are looking at this cache.
+
 ### 4.2 PowerDNS API key
 
-PowerDNS gates its REST API with a static API key (`api-key=...` in `pdns.conf`). The container's entrypoint generates a fresh key on first boot, writes it into the local `pdns.conf`, and exports it to the agent via a tmpfs-mounted env file. **Operators never touch this key.** The agent reads it on startup and rotates it on every container restart.
+PowerDNS gates its REST API with a static API key (`api-key=...` in `pdns.conf`). The container's entrypoint generates a key on first boot into **`/var/lib/spatium-dns-agent/pdns-api.key`** (mode `0600`, owned `spatium:spatium`) and the agent renders it into `pdns.conf` on every config sync. **Operators never touch this key.**
+
+The key **persists** in the agent state dir — the entrypoint only generates when the file is absent (`if [ ! -f "$API_KEY_FILE" ]`), so it survives container restarts and is stable for the life of the volume. The agent's `_load_or_generate_api_key` reads the same path and refuses to overwrite a file it cannot read, rather than silently minting a second key while `pdns_server` is already running with the first (issue #253). Anything that needs to talk to the local API — including the `agent-e2e` DNSSEC smoke — reads that file rather than inventing a key.
 
 The control plane has no knowledge of the API key — the trust boundary is between the agent and its co-located PowerDNS daemon, not between the control plane and PowerDNS.
 
