@@ -36,18 +36,40 @@ class HeartbeatClient:
         # a HeartbeatClient without a driver.
         self.driver = driver
         self._daemon_version_cached: str | None = None
+        self._daemon_version_attempts = 0
+
+    # A failing probe must not be retried forever. Unlike the DHCP agent's
+    # ``_kea_version``, which polls a control socket that is legitimately down
+    # during cold start, this probe execs the daemon BINARY — if it can't
+    # answer, it almost certainly never will. A couple of retries cover a
+    # transient fork failure; after that we stop, because the probe is a
+    # blocking subprocess on the thread that carries our liveness signal.
+    _DAEMON_VERSION_MAX_ATTEMPTS = 3
 
     def _daemon_version(self) -> str | None:
-        """DNS daemon version, probed once and cached.
+        """DNS daemon version, probed once (at most a few times) and cached.
 
-        Same reasoning as the DHCP agent's ``_kea_version`` (#637): the daemon
+        Same purpose as the DHCP agent's ``_kea_version`` (#637): the daemon
         binary cannot change while this process lives, because a new image
-        means a new container and a restarted agent. So probe until it answers,
-        then stop — the probe forks a subprocess, and doing that every 30 s on
-        the thread that carries our liveness signal buys nothing.
+        means a new container and a restarted agent — so there is nothing to
+        gain from re-probing on every heartbeat.
+
+        Returns None once the attempt budget is spent; the control plane treats
+        that as UNKNOWN.
         """
-        if self._daemon_version_cached is None and self.driver is not None:
+        if (
+            self._daemon_version_cached is None
+            and self.driver is not None
+            and self._daemon_version_attempts < self._DAEMON_VERSION_MAX_ATTEMPTS
+        ):
+            self._daemon_version_attempts += 1
             self._daemon_version_cached = self.driver.daemon_version()
+            if self._daemon_version_cached is None:
+                log.debug(
+                    "dns_daemon_version_probe_failed",
+                    attempt=self._daemon_version_attempts,
+                    max_attempts=self._DAEMON_VERSION_MAX_ATTEMPTS,
+                )
         return self._daemon_version_cached
 
     def stop(self) -> None:

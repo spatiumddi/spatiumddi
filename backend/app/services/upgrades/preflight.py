@@ -818,15 +818,30 @@ async def check_powerdns_lmdb_migration() -> PreflightResult:
     operator, beforehand, that their rollback plan now has a second step. That
     is this check's whole job.
 
-    Scoping mirrors ``check_kea_ha_version_skew``:
+    Scoping:
 
-    * **Only appliance nodes.** The orchestrator only ever slot-swaps appliance
-      nodes; docker / k8s PowerDNS agents upgrade through the manual path and
-      are never touched by this run. ``deployment_kind`` is matched strictly
-      against ``appliance`` so a row that has not checked in yet cannot make an
-      unrelated cluster upgrade look hazardous.
     * **Only the PowerDNS driver.** BIND9 nodes keep zone data as text on disk
       and have no equivalent hazard.
+    * **Only appliance nodes**, because the orchestrator only ever slot-swaps
+      those; docker / k8s PowerDNS agents upgrade through the manual path and
+      are never touched by this run.
+
+      Identifying them is the subtle part. The obvious predicate —
+      ``deployment_kind = 'appliance'``, which is what ``check_kea_ha_version_skew``
+      uses — is a **trap on ``dns_server``**: #170 Wave C1 moved slot /
+      deployment telemetry off the service containers onto the supervisor's
+      heartbeat, so the DNS agent no longer sends ``deployment_kind`` at all
+      and the column is NULL on every post-#170 appliance. Filtering on it
+      would match nothing and report a cheerful "no PowerDNS nodes" on exactly
+      the fleet this check exists for.
+
+      So match the way ``_cascade_delete_appliance_children`` already does
+      (#305): the FK when it is set, else the agent-reported ``host``, which
+      ``register`` fills with the appliance's hostname. ``deployment_kind``
+      stays in the OR for any agent that does still report it. The host match
+      can in principle over-match an off-fleet server an operator labelled
+      with an appliance's hostname — acceptable for a warn-only check, and the
+      same trade #305 accepted for a *destructive* one.
 
     **This check never returns ``fail``.** A ``fail`` sets ``can_start=False``,
     and blocking would be wrong twice over: the migration is a supported,
@@ -840,7 +855,14 @@ async def check_powerdns_lmdb_migration() -> PreflightResult:
                                    s.daemon_version AS daemon_version
                             FROM dns_server s
                             WHERE s.driver = 'powerdns'
-                              AND s.deployment_kind = 'appliance'
+                              AND (
+                                    s.appliance_id IS NOT NULL
+                                 OR s.deployment_kind = 'appliance'
+                                 OR EXISTS (
+                                        SELECT 1 FROM appliance a
+                                        WHERE a.hostname = s.host
+                                    )
+                              )
                             ORDER BY s.name
                             """))).mappings().all()
     except Exception as e:  # pragma: no cover - DB unavailable is its own signal
@@ -890,7 +912,10 @@ async def check_powerdns_lmdb_migration() -> PreflightResult:
 
     if pre_5 or unknown:
         affected = pre_5 + unknown
-        qualifier = "" if not unknown else " (version unreported for some, so treat them as 4.x)"
+        # "unknown" covers both never-reported and unparseable. It stays
+        # UNKNOWN — the warning is about the possibility, not a claim that
+        # those nodes are old.
+        qualifier = "" if not unknown else " (version unknown for some of them)"
         return PreflightResult(
             name="powerdns_lmdb_migration",
             level="warn",

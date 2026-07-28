@@ -90,6 +90,15 @@ dnsPowerdns:
   inClusterApiUrl: ""  # #292 — see dnsBind9.inClusterApiUrl
   agentKey: ""
   serverGroupName: ""
+  # #638 — LMDB rollback lever. Empty (the default) means "don't restore".
+  # PowerDNS 5.0 migrates the LMDB schema one way on first open, and the A/B
+  # slot rollback swaps only the rootfs while /var is shared — so rolling a
+  # PowerDNS node back to a pdns 4.x image ALSO needs the database restored.
+  # Set to ``latest``, or to a specific snapshot name from
+  # ``spatium-pdns-lmdb-guard list``, at the same time you pin the older
+  # image. Safe to leave set: the guard records what it restored from and
+  # subsequent restarts are a no-op. See docs/drivers/DNS_DRIVERS.md §4.9.
+  lmdbRestore: ""
   # The dnsdist front (#146 Phase 2) is docker-compose-only for now — see the
   # note in templates/dns-powerdns.yaml. k8s/appliance support (a dnsdist
   # Deployment fronting the hostNetwork pdns DaemonSet) is a follow-up.

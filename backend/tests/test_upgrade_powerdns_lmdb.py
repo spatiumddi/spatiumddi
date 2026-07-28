@@ -10,6 +10,13 @@ that before they press Start.
 The tests that matter are the scoping ones — the check is only useful if it
 fires for exactly the nodes this upgrade will slot-swap:
 
+* An appliance node must be RECOGNISED as one. ``dns_server.deployment_kind``
+  looks like the obvious predicate and is a trap: #170 Wave C1 moved that
+  telemetry onto the supervisor's heartbeat, so the DNS agent stopped sending
+  it and the column is NULL on every post-#170 appliance. A check filtered on
+  it alone matches nothing and reports "no PowerDNS nodes" for the exact fleet
+  it exists to warn about, which is worse than not shipping it. Hence
+  ``test_appliance_matched_by_hostname``.
 * Docker / k8s PowerDNS agents upgrade through the manual path and are never
   touched by the orchestrator. Counting them would make an unrelated container
   turn every appliance upgrade amber.
@@ -29,13 +36,16 @@ from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.dns.agents import AgentHeartbeatRequest
+from app.models.appliance import Appliance
 from app.models.dns import DNSServer, DNSServerGroup
 from app.services.upgrades.preflight import check_powerdns_lmdb_migration
 
 
 async def _servers(
     db: AsyncSession,
-    members: list[tuple[str, str | None, str]],
+    members: list[tuple[str, str | None, str | None]],
+    *,
+    host: str = "127.0.0.1",
 ) -> list[str]:
     """Create servers described by (driver, daemon_version, deployment_kind)."""
     g = DNSServerGroup(name=f"grp-{uuid.uuid4().hex[:8]}")
@@ -49,7 +59,7 @@ async def _servers(
             DNSServer(
                 name=name,
                 driver=driver,
-                host="127.0.0.1",
+                host=host,
                 port=53,
                 group_id=g.id,
                 daemon_version=daemon_version,
@@ -82,12 +92,36 @@ async def test_kubernetes_powerdns_is_ignored(db_session: AsyncSession) -> None:
     assert r.level == "ok"
 
 
-async def test_unchecked_in_node_is_ignored(db_session: AsyncSession) -> None:
-    """``deployment_kind`` NULL means the row has never checked in. Matching it
-    as an appliance would warn about a node the upgrade will never touch."""
-    await _servers(db_session, [("powerdns", "4.9.5", None)])  # type: ignore[list-item]
+async def test_unlinked_node_is_ignored(db_session: AsyncSession) -> None:
+    """A row with no appliance link at all — no FK, no deployment_kind, and a
+    host that matches no appliance — is not something this upgrade touches."""
+    await _servers(db_session, [("powerdns", "4.9.5", None)])
     r = await check_powerdns_lmdb_migration()
     assert r.level == "ok"
+
+
+async def test_appliance_matched_by_hostname(db_session: AsyncSession) -> None:
+    """THE regression test for the scoping bug this check shipped with.
+
+    On a real post-#170 appliance the DNS agent sends no ``deployment_kind``
+    and nothing writes ``dns_server.appliance_id``, so both direct signals are
+    NULL and only the host match identifies the node. Filtering on
+    ``deployment_kind = 'appliance'`` alone made the check silently inert on
+    every deployment shape it was written for.
+    """
+    hostname = f"ddi-{uuid.uuid4().hex[:8]}"
+    db_session.add(
+        Appliance(
+            hostname=hostname,
+            public_key_der=b"x",
+            public_key_fingerprint=uuid.uuid4().hex,
+        )
+    )
+    await db_session.flush()
+    names = await _servers(db_session, [("powerdns", "4.9.5", None)], host=hostname)
+    r = await check_powerdns_lmdb_migration()
+    assert r.level == "warn"
+    assert r.detail["pre_5_0"] == names
 
 
 async def test_pre_5_appliance_node_warns(db_session: AsyncSession) -> None:

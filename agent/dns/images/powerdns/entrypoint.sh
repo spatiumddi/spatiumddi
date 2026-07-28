@@ -51,13 +51,21 @@ fi
 # ``PDNS_LMDB_RESTORE`` is the operator's rollback lever: set it to ``latest``
 # (or a specific snapshot name from ``spatium-pdns-lmdb-guard list``) when
 # redeploying an older image, and the database is put back to the schema that
-# image understands before the daemon starts. It is deliberately one-shot in
-# spirit — leaving it set means every restart re-restores and discards live
-# changes — so the guard logs loudly and the docs say to unset it after the
-# node is healthy.
+# image understands before the daemon starts. The guard records which snapshot
+# it restored from, so leaving the variable set is harmless — subsequent
+# restarts are a no-op rather than re-restoring over live changes.
+#
+# A failure here does NOT stop the container. The likeliest cause is a
+# mistyped snapshot name, and refusing to boot over that would crash-loop a
+# node whose database is perfectly fine — with no shell to fix the typo from.
+# The snapshot step below still protects the database either way.
 if [ -n "${PDNS_LMDB_RESTORE:-}" ]; then
     echo "PDNS_LMDB_RESTORE=${PDNS_LMDB_RESTORE} — restoring the LMDB before start" >&2
-    /usr/local/bin/spatium-pdns-lmdb-guard restore "$PDNS_LMDB_RESTORE"
+    if ! /usr/local/bin/spatium-pdns-lmdb-guard restore "$PDNS_LMDB_RESTORE"; then
+        echo "WARNING: PDNS_LMDB_RESTORE=${PDNS_LMDB_RESTORE} did not restore." >&2
+        echo "WARNING: check 'spatium-pdns-lmdb-guard list' for the exact name." >&2
+        echo "WARNING: continuing to start with the database as-is." >&2
+    fi
 fi
 
 # Snapshots the database when the pdns major version changed since the last
