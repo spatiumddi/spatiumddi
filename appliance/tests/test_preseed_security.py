@@ -454,8 +454,8 @@ def test_secret_env_sourced_with_xtrace_off():
     """Regression guard: PRESEED_SECRET_ENV carries the admin password
     hash and the pairing code."""
     fn = extract_fn("load_preseed")
-    idx = fn.find("PRESEED_SECRET_ENV")
-    # First mention is the parser argv; the SOURCE of it is what matters.
+    # Anchor on the SOURCE of the secret env, not the first mention of the
+    # name — that one is the parser argv, which is fine to trace.
     src_idx = fn.find('. "$PRESEED_SECRET_ENV"')
     assert src_idx > 0
     assert "set +x" in fn[:src_idx], "secret env must be sourced with xtrace off"
