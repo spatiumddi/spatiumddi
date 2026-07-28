@@ -435,9 +435,15 @@ export function DNSThreatTab() {
       {/* Blocklist attribution. Rendered as its own section rather than a
           fourth detection mode because it is ground truth, not a score:
           named matched a policy and logged it, so there is nothing to
-          threshold and nothing to rank by confidence. */}
+          threshold and nothing to rank by confidence.
+
+          Carries the same card treatment as every sibling above — the
+          root is a bare `flex flex-col gap-4`, so the horizontal inset
+          comes from each child's own `px-4`, not from the container. A
+          bare <section> here rendered flush against the left edge and
+          visibly out of line with the rest of the tab. */}
       {!moduleOff && (
-        <section className="mt-8 border-t pt-6">
+        <section className="rounded-lg border bg-card px-4 py-3">
           <h3 className="mb-1 text-sm font-semibold">Blocklist hits (RPZ)</h3>
           <p className="mb-3 text-xs text-muted-foreground">
             Which machines keep reaching for domains the blocklists block.
@@ -1016,7 +1022,7 @@ function RPZPanel({ hours }: { hours: number }) {
   // UI must not have to guess. Same contract the threat summary carries.
   if (!s?.has_data) {
     return (
-      <div className="rounded border border-dashed p-4 text-sm text-muted-foreground">
+      <div className="text-sm text-muted-foreground">
         <p className="mb-1 font-medium text-foreground">
           No blocklist activity recorded yet
         </p>
