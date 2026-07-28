@@ -1301,3 +1301,29 @@ class Bind9Driver(DriverBase):
         # A zombie still answers signal 0, so the state check is what
         # actually distinguishes "running" from "dead but unreaped".
         return not is_zombie(str(self.daemon_pid))
+
+    def daemon_version(self) -> str | None:
+        """Running ``named`` version, e.g. ``"9.20.26"``.
+
+        ``named -v`` prints ``BIND 9.20.26 (Stable Release) <id:5a605f8>``.
+        Reported so the control plane knows what every DNS node is actually
+        running, the same way ``kea_version`` is reported for DHCP (#637).
+        BIND has no equivalent of PowerDNS's one-way LMDB migration (#638) —
+        zone data is text on disk — so this is inventory, not a hazard signal.
+        """
+        exe = shutil.which("named")
+        if exe is None:
+            return None
+        try:
+            proc = subprocess.run(  # noqa: S603
+                [exe, "-v"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError) as e:
+            log.debug("named_version_probe_failed", error=str(e))
+            return None
+        m = re.search(r"BIND\s+([0-9]+(?:\.[0-9]+)*)", f"{proc.stdout}\n{proc.stderr}")
+        return m.group(1) if m else None

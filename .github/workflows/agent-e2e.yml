@@ -289,6 +289,16 @@ jobs:
         # normal operator workflow (zones flow control plane → agent
         # → daemon, not pdnsutil → daemon). Marked continue-on-error
         # so the rest of the smoke matrix still gates the workflow.
+        #
+        # #638 asked whether the pdns 4.9.5 → 5.0.5 bump fixes this so the
+        # gate could be flipped to ``false``. It does not: reproduced
+        # side-by-side on both majors (create-zone → add-record →
+        # secure-zone → rectify-zone → pdns_control purge → dig), and
+        # ``dig`` returns no answer and no RRSIG on 5.0.5 exactly as on
+        # 4.9.5. The argv itself is fine — 5.0 still accepts the flat
+        # subcommands via an internal translation map, with no deprecation
+        # warning — so this stays continue-on-error until #132 replaces the
+        # pdnsutil path with the agent's REST API.
         continue-on-error: true
         run: |
           # Phase 5 extension of the Phase 4c smoke test: prove that

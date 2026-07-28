@@ -183,7 +183,8 @@ class DNSServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         index=True,
     )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
-    # driver: bind9 (only supported backend)
+    # driver: bind9 | powerdns | windows | cloudflare | route53 | azuredns |
+    # googledns — see app/drivers/dns/ for the registry.
     driver: Mapped[str] = mapped_column(String(50), nullable=False, default="bind9")
     host: Mapped[str] = mapped_column(String(255), nullable=False)
     port: Mapped[int] = mapped_column(Integer, nullable=False, default=53)
@@ -226,6 +227,14 @@ class DNSServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # (the operator-set ``host``/``name`` is just a label; a NAT'd
     # agent in a different subnet would otherwise be invisible).
     last_seen_ip: Mapped[str | None] = mapped_column(String(45), nullable=True)
+    # #638 — the running DNS DAEMON's version (e.g. "5.0.5" for pdns,
+    # "9.20.26" for BIND), reported on each agent heartbeat. Distinct from the
+    # python agent's own version. The rolling-upgrade preflight reads it:
+    # PowerDNS 5.0 performs a one-way LMDB schema migration on first open, so
+    # a fleet still on pdns 4.x has to be warned before a rolling upgrade
+    # crosses that boundary. NULL = not reported yet (agentless drivers never
+    # report one) and must be treated as UNKNOWN, never as "old".
+    daemon_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
     # Issue #197 — link back to the parent Application appliance
     # (when the row was registered through the supervisor's role-

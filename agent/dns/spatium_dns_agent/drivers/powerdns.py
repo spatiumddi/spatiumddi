@@ -28,6 +28,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import secrets
 import shutil
 import signal
@@ -424,9 +425,9 @@ class PowerDNSDriver(DriverBase):
         # Catalog zones (RFC 9432, Phase 3d). Producer mode renders the
         # catalog itself as a regular zone with the canonical record
         # structure; PowerDNS authoritative serves it like any other
-        # zone, and operators can stand up secondaries via AXFR (the
-        # PowerDNS-native catalog-consumer mode lands in pdns 4.10+ and
-        # needs additional config we'll add in a follow-up).
+        # zone, and operators can stand up secondaries via AXFR
+        # (PowerDNS-native catalog-consumer mode needs additional config
+        # we'll add in a follow-up — see the warning branch below).
         catalog = bundle.get("catalog") or None
         if catalog and catalog.get("mode") == "producer":
             zones_payload.append(_render_catalog_zone_payload(catalog))
@@ -435,9 +436,9 @@ class PowerDNSDriver(DriverBase):
                 "powerdns_catalog_consumer_unsupported",
                 zone=catalog.get("zone_name"),
                 hint=(
-                    "PowerDNS 4.9 (current image) does not consume "
-                    "catalog zones automatically. Use AXFR-based "
-                    "secondaries against the producer instead."
+                    "This agent does not wire up PowerDNS catalog-consumer "
+                    "mode. Use AXFR-based secondaries against the producer "
+                    "instead."
                 ),
             )
 
@@ -742,11 +743,12 @@ class PowerDNSDriver(DriverBase):
         # LUA records: the global ``enable-lua-records=yes`` knob in
         # pdns.conf (set in ``_render_conf`` above) makes every LUA
         # rrset live at query time. We deliberately do NOT set the
-        # per-zone ``ENABLE-LUA-RECORDS`` metadata here — pdns 4.9's
-        # REST API rejects that key as "Unsupported metadata kind"
-        # via its ``isValidMetadataKind`` filter, even though the docs
-        # claim it works. The global flag is portable across versions
-        # and zero-cost for non-LUA zones.
+        # per-zone ``ENABLE-LUA-RECORDS`` metadata here — the REST API
+        # rejects that key as "Unsupported metadata kind" via its
+        # ``isValidMetadataKind`` filter, even though the docs claim it
+        # works. Re-verified against pdns 5.0.5 while bumping the image
+        # in #638: still HTTP 422, so the global flag stays. It is
+        # portable across versions and zero-cost for non-LUA zones.
         log.info(
             "powerdns_record_op_applied",
             zone=zone,
@@ -816,9 +818,10 @@ class PowerDNSDriver(DriverBase):
             # ``dnssec-signzone``) and loaded as already-signed; for
             # online signing pdns derives signing intent from the
             # presence of cryptokeys + active/published flags. Setting
-            # it actually trips the API's metadata-kind filter on
-            # pdns 4.9 ("Unsupported metadata kind 'PRESIGNED'"), and
-            # the resulting warning is misleading.
+            # it actually trips the API's metadata-kind filter
+            # ("Unsupported metadata kind 'PRESIGNED'"), and the
+            # resulting warning is misleading. Re-verified against pdns
+            # 5.0.5 while bumping the image in #638: still HTTP 422.
             self._rectify(client, headers, zone)
 
             # Re-fetch after creation so we get the freshly-rendered DS
@@ -1005,6 +1008,40 @@ class PowerDNSDriver(DriverBase):
         # was being reported as healthy.
         return not is_zombie(str(self.daemon_pid))
 
+    def daemon_version(self) -> str | None:
+        """Running ``pdns_server`` version, e.g. ``"5.0.5"``.
+
+        Read off the binary rather than the REST API on purpose: the version
+        matters most when the daemon is NOT healthy (a pdns that just refused
+        to open a migrated LMDB answers no API calls, and that is exactly the
+        situation #638's preflight is trying to warn about beforehand).
+
+        The output format differs between majors — 4.9 prefixes a syslog-style
+        timestamp, 5.0 does not — so match on the product string, not position:
+
+            Jul 28 12:56:47 PowerDNS Authoritative Server 4.9.5 (C) …
+            PowerDNS Authoritative Server 5.0.5 (C) …
+        """
+        exe = shutil.which("pdns_server")
+        if exe is None:
+            return None
+        try:
+            proc = subprocess.run(  # noqa: S603
+                [exe, "--version"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError) as e:
+            log.debug("pdns_version_probe_failed", error=str(e))
+            return None
+        m = re.search(
+            r"Authoritative Server\s+([0-9]+(?:\.[0-9]+)*)",
+            f"{proc.stdout}\n{proc.stderr}",
+        )
+        return m.group(1) if m else None
+
     # ── Internals ───────────────────────────────────────────────────────────
 
     def _api_key_path(self) -> Path:
@@ -1127,8 +1164,9 @@ class PowerDNSDriver(DriverBase):
                 # ``pickrandom`` / ``ifportup`` / ``createReverse`` etc.)
                 # are GLOBALLY enabled here rather than per-zone via
                 # ENABLE-LUA-RECORDS metadata. The per-zone metadata
-                # path is rejected by the pdns 4.9 REST filter as an
-                # "unsupported kind"; enabling globally is portable
+                # path is rejected by the pdns REST filter as an
+                # "unsupported kind" (re-verified on 5.0.5 in #638);
+                # enabling globally is portable
                 # across versions and harmless for non-LUA zones (zones
                 # with zero LUA records simply don't trigger the LUA
                 # engine at query time).
@@ -1228,8 +1266,9 @@ class PowerDNSDriver(DriverBase):
                 # ``enable-lua-records=yes`` in pdns.conf (see
                 # ``_render_conf``). Earlier code attempted a per-zone
                 # ``ENABLE-LUA-RECORDS`` metadata PUT here, but pdns
-                # 4.9 rejects that key via ``isValidMetadataKind`` as
-                # "Unsupported metadata kind" — which spammed a
+                # rejects that key via ``isValidMetadataKind`` as
+                # "Unsupported metadata kind" (still true on 5.0.5,
+                # re-verified in #638) — which spammed a
                 # ``powerdns_lua_metadata_failed`` warning on every
                 # bulk reconcile of a LUA-bearing zone. The global
                 # knob makes the per-zone PUT unnecessary.

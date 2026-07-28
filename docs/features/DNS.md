@@ -31,7 +31,7 @@ SpatiumDDI ships three authoritative DNS drivers. Pick **per server group** — 
 | LUA records (computed responses) | — | ✅ | — |
 | Online DNSSEC signing | ✅ inline-signing (#49) | ✅ one-toggle | manual |
 | Catalog zones (RFC 9432) — producer | ✅ | ✅ | — |
-| Catalog zones (RFC 9432) — consumer | ✅ | — (waits for pdns 4.10+) | — |
+| Catalog zones (RFC 9432) — consumer | ✅ | — (not wired up in the agent) | — |
 | First-class views / split-horizon | ✅ | tag-based, not surfaced as views in UI | — (replication scope) |
 | RPZ blocklists | ✅ | — (recursor feature only) | — |
 | AD-integrated zones | — | — | ✅ |
@@ -39,7 +39,7 @@ SpatiumDDI ships three authoritative DNS drivers. Pick **per server group** — 
 
 **Default driver: BIND9.** It is the reference implementation, ubiquitous in operator muscle memory, and runs the catalog-zone consumer + RPZ paths SpatiumDDI ships.
 
-**Pick PowerDNS when** you need ALIAS records (CNAME-at-apex without the BIND-side workaround), LUA records (geo-routing / weighted answers / `pickrandom` / `ifportup`), or the simpler one-toggle online DNSSEC story. The shipped image (`ghcr.io/spatiumddi/dns-powerdns`) bundles `pdns 4.9 + pdns-backend-lmdb` for an agent-isolated zone store with no external Postgres dependency. See [issue #127](https://github.com/spatiumddi/spatiumddi/issues/127) for the full driver rationale.
+**Pick PowerDNS when** you need ALIAS records (CNAME-at-apex without the BIND-side workaround), LUA records (geo-routing / weighted answers / `pickrandom` / `ifportup`), or the simpler one-toggle online DNSSEC story. The shipped image (`ghcr.io/spatiumddi/dns-powerdns`) bundles `pdns 5.0 + pdns-backend-lmdb` for an agent-isolated zone store with no external Postgres dependency. See [issue #127](https://github.com/spatiumddi/spatiumddi/issues/127) for the full driver rationale.
 
 **Pick Windows DNS when** the zone is AD-integrated and operators expect to keep using DNS Manager / `Add-DnsServerResourceRecord` directly. Path A (RFC 2136 + AXFR) works without admin credentials; Path B (WinRM + PowerShell) unlocks zone CRUD and a JSON record-pull that sidesteps AXFR ACL configuration.
 

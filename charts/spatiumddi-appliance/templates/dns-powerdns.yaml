@@ -67,6 +67,18 @@ spec:
               value: {{ .Values.dnsPowerdns.agentKey | quote }}
             - name: AGENT_GROUP
               value: {{ .Values.dnsPowerdns.serverGroupName | quote }}
+            {{- if .Values.dnsPowerdns.lmdbRestore }}
+            # #638 — the LMDB rollback lever. PowerDNS 5.0 migrates the LMDB
+            # schema one way on first open, and the A/B slot rollback swaps
+            # only the rootfs, so rolling a node back also needs the DATABASE
+            # put back. Set this to ``latest`` (or a name from
+            # ``spatium-pdns-lmdb-guard list``) alongside pinning the older
+            # image. The guard records what it restored from, so leaving the
+            # value set is a no-op on later restarts rather than a repeated
+            # restore over live changes.
+            - name: PDNS_LMDB_RESTORE
+              value: {{ .Values.dnsPowerdns.lmdbRestore | quote }}
+            {{- end }}
             {{- with .Values.global.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

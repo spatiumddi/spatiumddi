@@ -610,20 +610,30 @@ jobs:
         id: bundled
         # Pulls the just-published DNS + DHCP agent images and reads the
         # ``/etc/spatiumddi-versions`` file each Dockerfile writes at build
-        # time (post ``apk add bind`` / ``apk add kea …``). Surfaces the
-        # exact BIND9 + Kea + Alpine package versions in the release notes
-        # so operators can map a release tag to the bytes inside.
+        # time (post ``apk add bind`` / ``apk add pdns`` / ``apk add kea …``).
+        # Surfaces the exact BIND9 + PowerDNS + Kea + Alpine package versions
+        # in the release notes so operators can map a release tag to the bytes
+        # inside.
+        #
+        # PowerDNS was added in #638: it is the one bundled component whose
+        # MAJOR version change is operationally load-bearing (5.0 performs a
+        # one-way LMDB schema migration), so "which pdns does this tag ship"
+        # has to be answerable from the release notes without pulling the image.
         run: |
           set -euo pipefail
           VERSION="${{ needs.meta.outputs.version }}"
           DNS_IMG="${{ env.IMAGE_PREFIX }}/dns-bind9:${VERSION}"
+          PDNS_IMG="${{ env.IMAGE_PREFIX }}/dns-powerdns:${VERSION}"
           DHCP_IMG="${{ env.IMAGE_PREFIX }}/dhcp-kea:${VERSION}"
 
           docker pull --platform linux/amd64 "$DNS_IMG"
+          docker pull --platform linux/amd64 "$PDNS_IMG"
           docker pull --platform linux/amd64 "$DHCP_IMG"
 
           BIND_VERSIONS=$(docker run --rm --platform linux/amd64 --entrypoint cat \
             "$DNS_IMG" /etc/spatiumddi-versions)
+          PDNS_VERSIONS=$(docker run --rm --platform linux/amd64 --entrypoint cat \
+            "$PDNS_IMG" /etc/spatiumddi-versions)
           KEA_VERSIONS=$(docker run --rm --platform linux/amd64 --entrypoint cat \
             "$DHCP_IMG" /etc/spatiumddi-versions)
 
@@ -631,6 +641,9 @@ jobs:
             echo "BIND_VERSIONS<<BV_EOF"
             printf '%s\n' "$BIND_VERSIONS"
             echo "BV_EOF"
+            echo "PDNS_VERSIONS<<PV_EOF"
+            printf '%s\n' "$PDNS_VERSIONS"
+            echo "PV_EOF"
             echo "KEA_VERSIONS<<KV_EOF"
             printf '%s\n' "$KEA_VERSIONS"
             echo "KV_EOF"
@@ -761,6 +774,11 @@ jobs:
             **DNS agent image** (`dns-bind9:${{ needs.meta.outputs.version }}`)
             ```
             ${{ env.BIND_VERSIONS }}
+            ```
+
+            **DNS agent image** (`dns-powerdns:${{ needs.meta.outputs.version }}`)
+            ```
+            ${{ env.PDNS_VERSIONS }}
             ```
 
             **DHCP agent image** (`dhcp-kea:${{ needs.meta.outputs.version }}`)
