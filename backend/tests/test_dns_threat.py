@@ -995,3 +995,28 @@ async def test_rpz_hits_survive_the_query_log_retention_window(
         .all()
     )
     assert len(remaining) == 1, "a 3-day-old hit must outlive the 24 h query-log sweep"
+
+
+def test_rpz_head_qname_regex_is_linear_on_adversarial_input() -> None:
+    """CodeQL py/polynomial-redos regression pin.
+
+    The head regex runs under ``search`` against agent-supplied log
+    lines, so a quadratic shape is reachable from untrusted input. The
+    first cut excluded only ``)``, which let the inner run consume ``(``
+    and backtrack at every start position — 39 ms on 4k parens, versus
+    sub-millisecond once ``(`` is excluded too.
+    """
+    import time
+
+    line = "27-Jul-2026 22:15:03.123 rpz: info: client @0x1 1.2.3.4#5 " + "(" * 4000
+    start = time.perf_counter()
+    parse_rpz_line(line)
+    assert (time.perf_counter() - start) < 0.5, "parser must stay linear on paren floods"
+
+
+def test_rpz_head_qname_still_extracted_after_redos_fix() -> None:
+    """The hardening must not cost the attribution it exists for."""
+    hit = parse_rpz_line(_RPZ_LINE)
+    assert hit is not None
+    assert hit.qname == "ads.tracker.example"
+    assert hit.client_ip == "192.0.2.5"

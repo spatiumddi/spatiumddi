@@ -482,9 +482,17 @@ def _rpz_zone_from_via(via: str | None) -> str | None:
 
 
 # The ``(<qname>)`` BIND puts between the client address and the colon.
-# Anchored to a non-paren, non-whitespace run so it cannot span into the
-# rest of the line, keeping the match linear.
-_RPZ_HEAD_QNAME_RE: Final = re.compile(r"\((?P<qname>[^)\s]+)\)")
+#
+# CodeQL py/polynomial-redos, same family as alerts #16 and #18 on this
+# file: the first cut used ``[^)\s]+``, which still admits ``(``. Run
+# under ``search``, input like ``((((((`` makes the engine consume every
+# ``(`` at each candidate start position, fail the closing ``\)``, and
+# backtrack one character at a time — O(n) work at O(n) offsets. Adding
+# ``(`` to the excluded set makes the inner run unable to cross a paren
+# in either direction, so a failing start position fails immediately and
+# the total stays linear. It is also strictly more correct: a DNS name
+# can contain neither parenthesis, so nothing legitimate is excluded.
+_RPZ_HEAD_QNAME_RE: Final = re.compile(r"\((?P<qname>[^()\s]+)\)")
 
 # ``dns_rpz_hit.rpz_zone`` is String(255). The ``via`` token is
 # unbounded, and one overlong value fails the single commit that covers
