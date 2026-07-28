@@ -278,37 +278,39 @@ jobs:
           exit 1
 
       - name: PowerDNS DNSSEC online signing smoke (Phase 5 / #127)
-        # FIXME(#132): The pdnsutil-based smoke path can't observe
-        # its own writes through pdns_server even with
-        # ``pdns_control purge``. Repro: ``pdnsutil add-record``
-        # succeeds, the LMDB row exists ("Zone … secured"), but
-        # ``dig www.${ZONE}`` returns nothing. Probably needs a
-        # different invalidation path (rediscover, restart-zone, or
-        # going through the agent's REST API instead of pdnsutil).
-        # Tracked separately — this synthetic path doesn't reflect
-        # normal operator workflow (zones flow control plane → agent
-        # → daemon, not pdnsutil → daemon). Marked continue-on-error
-        # so the rest of the smoke matrix still gates the workflow.
+        # Phase 5 extension of the Phase 4c smoke: prove the daemon signs a
+        # zone end-to-end and serves RRSIG-bearing answers.
         #
-        # #638 asked whether the pdns 4.9.5 → 5.0.5 bump fixes this so the
-        # gate could be flipped to ``false``. It does not: reproduced
-        # side-by-side on both majors (create-zone → add-record →
-        # secure-zone → rectify-zone → pdns_control purge → dig), and
-        # ``dig`` returns no answer and no RRSIG on 5.0.5 exactly as on
-        # 4.9.5. The argv itself is fine — 5.0 still accepts the flat
-        # subcommands via an internal translation map, with no deprecation
-        # warning — so this stays continue-on-error until #132 replaces the
-        # pdnsutil path with the agent's REST API.
-        continue-on-error: true
+        # #132 — this step was ``continue-on-error: true`` from the day it
+        # was added and had never once passed, so the only PowerDNS
+        # regression gate had a permanent hole in it. Root cause: it drove
+        # ``pdnsutil``, which writes straight to LMDB and bypasses the
+        # running daemon. ``pdns_server`` caches the set of zones it is
+        # authoritative for (``zone-cache-refresh-interval``, default 300 s),
+        # so a zone created after startup by pdnsutil is absent from that
+        # cache and the daemon answers as non-authoritative — the record is
+        # genuinely in the database and ``dig`` still returns nothing.
+        # ``pdns_control purge`` never helped because it flushes the
+        # query/packet cache, not the zone cache.
+        #
+        # Reproduced locally against both majors (4.9.5 and 5.0.5) — the
+        # pdnsutil path fails identically on each, so the #638 image bump
+        # was never going to fix it.
+        #
+        # The fix is to drive the REST API, which is what the agent's driver
+        # actually does (``_reconcile_zones`` / ``_dnssec_sign`` in
+        # agent/dns/spatium_dns_agent/drivers/powerdns.py). Writes through
+        # the API go through ``pdns_server`` itself, so the zone cache is
+        # updated as a side effect and the zone is served immediately — no
+        # purge, no rediscover, no restart. That also makes this a gate on
+        # the path operators exercise (control plane → agent → API → daemon)
+        # rather than a synthetic one nothing uses, which is the whole point
+        # of having it green before the next pdns major bump.
+        #
+        # Verified end-to-end on 4.9.5 and 5.0.5 before re-enabling the
+        # gate: A answer + RRSIG + DNSKEY present, and the script is
+        # idempotent across re-runs on a surviving pod.
         run: |
-          # Phase 5 extension of the Phase 4c smoke test: prove that
-          # the daemon can actually sign a zone end-to-end and that
-          # ``dig +dnssec`` returns AD-flagged answers from the local
-          # resolver-that-isn't, just to confirm the signing pipeline
-          # is wired. Uses ``pdnsutil`` inside the pod so we don't
-          # have to wrangle the agent-generated REST API key — direct
-          # LMDB writes via the same binary the agent shells out to
-          # for cryptokey ops are a faithful equivalent.
           POD=$(kubectl -n spatiumddi get pod \
             -l app.kubernetes.io/component=dns-agent,spatiumddi.org/dns-flavor=powerdns \
             -o jsonpath='{.items[0].metadata.name}')
@@ -317,29 +319,106 @@ jobs:
             exit 1
           fi
           ZONE="dnssec-smoke.test."
-          echo "→ creating zone $ZONE inside $POD"
-          kubectl -n spatiumddi exec "$POD" -- pdnsutil --config-dir=/var/lib/spatium-dns-agent/rendered create-zone "$ZONE" || {
-            echo "pdnsutil create-zone failed; dumping logs:"
+          echo "→ creating + signing $ZONE via the PowerDNS REST API inside $POD"
+          # python3 + httpx are both in the image (the agent runs on them);
+          # curl is NOT, which is why this drives the API from Python. The
+          # API only listens on 127.0.0.1 (webserver-allow-from), so this
+          # has to run inside the pod.
+          if ! kubectl -n spatiumddi exec -i "$POD" -- python3 - <<'PYEOF'
+          import json
+          import sys
+
+          import httpx
+
+          API = "http://127.0.0.1:8081/api/v1/servers/localhost"
+          KEY_PATH = "/var/lib/spatium-dns-agent/pdns-api.key"
+          ZONE = "dnssec-smoke.test."
+
+          try:
+              api_key = open(KEY_PATH).read().strip()
+          except OSError as exc:
+              sys.exit(f"FAIL: cannot read the agent's API key at {KEY_PATH}: {exc}")
+
+          H = {"X-API-Key": api_key, "Content-Type": "application/json"}
+          c = httpx.Client(timeout=15)
+
+
+          def check(resp, ok, what):
+              if resp.status_code not in ok:
+                  sys.exit(f"FAIL: {what} -> HTTP {resp.status_code}: {resp.text[:300]}")
+              print(f"  ok: {what} -> {resp.status_code}")
+              return resp
+
+
+          # Clean slate first so a re-run on a surviving pod can't trip on 409.
+          c.delete(f"{API}/zones/{ZONE}", headers=H)
+
+          check(
+              c.post(
+                  f"{API}/zones",
+                  headers=H,
+                  json={
+                      "name": ZONE,
+                      "kind": "Native",
+                      "rrsets": [
+                          {
+                              "name": f"www.{ZONE}",
+                              "type": "A",
+                              "ttl": 3600,
+                              "records": [{"content": "192.0.2.42", "disabled": False}],
+                          }
+                      ],
+                  },
+              ),
+              (201,),
+              "create zone + A rrset",
+          )
+
+          # KSK + ZSK pinned to ECDSAP256SHA256 exactly as _dnssec_sign does:
+          # the ZSK default-picker resolves to algorithm -1 and is rejected.
+          for keytype in ("ksk", "zsk"):
+              check(
+                  c.post(
+                      f"{API}/zones/{ZONE}/cryptokeys",
+                      headers=H,
+                      json={
+                          "keytype": keytype,
+                          "active": True,
+                          "published": True,
+                          "algorithm": "ecdsa256",
+                      },
+                  ),
+                  (201,),
+                  f"create {keytype.upper()}",
+              )
+
+          check(c.put(f"{API}/zones/{ZONE}/rectify", headers=H), (200,), "rectify zone")
+
+          keys = check(
+              c.get(f"{API}/zones/{ZONE}/cryptokeys", headers=H), (200,), "list cryptokeys"
+          ).json()
+          kinds = sorted(k.get("keytype") for k in keys)
+          if kinds != ["ksk", "zsk"]:
+              sys.exit(f"FAIL: expected a KSK and a ZSK, got {kinds}: {json.dumps(keys)[:300]}")
+
+          # The DS is the agent's actual return value from _dnssec_sign — what
+          # the operator pastes at their registrar. Count varies by pdns version
+          # (3 digests on 4.9.5, 2 on 5.0.5), so assert presence, not a number.
+          ds = [d for k in keys if k.get("keytype") == "ksk" for d in (k.get("ds") or [])]
+          if not ds:
+              sys.exit(f"FAIL: KSK carries no DS records: {json.dumps(keys)[:300]}")
+          print(f"  ok: KSK exposes {len(ds)} DS record(s)")
+          print("API signing sequence OK")
+          PYEOF
+          then
+            echo "API signing sequence failed; dumping logs:"
             kubectl -n spatiumddi logs "$POD" --tail=120
             exit 1
-          }
-          kubectl -n spatiumddi exec "$POD" -- pdnsutil --config-dir=/var/lib/spatium-dns-agent/rendered add-record "$ZONE" www A 192.0.2.42
-          echo "→ signing $ZONE"
-          kubectl -n spatiumddi exec "$POD" -- pdnsutil --config-dir=/var/lib/spatium-dns-agent/rendered secure-zone "$ZONE"
-          kubectl -n spatiumddi exec "$POD" -- pdnsutil --config-dir=/var/lib/spatium-dns-agent/rendered rectify-zone "$ZONE"
-          # pdns_server caches zone contents on the LMDB backend —
-          # pdnsutil writes go into the database but the running
-          # daemon's in-memory state lags. Purge the daemon's cache
-          # via the control socket so the next dig sees fresh data.
-          # The control socket is in the agent's rendered config dir
-          # (same dir as pdns.conf) when pdns_server was launched
-          # with --config-dir.
-          kubectl -n spatiumddi exec "$POD" -- pdns_control --config-dir=/var/lib/spatium-dns-agent/rendered purge || true
-          # Verify the signed answer comes back with RRSIG records.
-          # We don't expect AD here — pdns_server is authoritative,
-          # not a validating resolver — but RRSIG presence proves the
-          # zone is signed and the rrsets carry signatures. AD-flag
-          # validation belongs in a downstream resolver test.
+          fi
+          # Independent verification over the DNS protocol — the API
+          # reporting success is not the same as the daemon serving it.
+          # No AD flag expected: pdns_server is authoritative, not a
+          # validating resolver. RRSIG presence is what proves signing.
           OUT=$(kubectl -n spatiumddi exec "$POD" -- dig +dnssec +short www.${ZONE} @127.0.0.1)
           echo "$OUT"
           if echo "$OUT" | grep -q "192.0.2.42"; then
@@ -349,8 +428,7 @@ jobs:
             kubectl -n spatiumddi logs "$POD" --tail=120
             exit 1
           fi
-          # Inspect the rrset directly for RRSIG presence — +short
-          # strips RRSIG by design, so re-issue without it.
+          # +short strips RRSIG by design, so re-issue without it.
           if kubectl -n spatiumddi exec "$POD" -- dig +dnssec www.${ZONE} @127.0.0.1 | grep -q "RRSIG"; then
             echo "RRSIG present in answer — signing pipeline confirmed"
           else
@@ -359,10 +437,30 @@ jobs:
             kubectl -n spatiumddi logs "$POD" --tail=120
             exit 1
           fi
-          # Cleanup so a re-run on the same pod doesn't trip on a
-          # pre-existing zone (kind clusters are ephemeral but be
-          # explicit anyway).
-          kubectl -n spatiumddi exec "$POD" -- pdnsutil --config-dir=/var/lib/spatium-dns-agent/rendered delete-zone "$ZONE" || true
+          # The apex DNSKEY rrset is what a validating resolver fetches to
+          # verify the RRSIGs above — its absence would mean the keys exist
+          # in the database but are not being published.
+          if kubectl -n spatiumddi exec "$POD" -- dig +short DNSKEY ${ZONE} @127.0.0.1 | grep -q "."; then
+            echo "DNSKEY published at the apex"
+          else
+            echo "no DNSKEY at the zone apex — keys not published"
+            kubectl -n spatiumddi logs "$POD" --tail=120
+            exit 1
+          fi
+          # Cleanup via the API for the same reason the test uses it: a
+          # ``pdnsutil delete-zone`` drops the row from LMDB but leaves the
+          # running daemon's zone cache pointing at it, so the zone would
+          # keep being served to any later step. (The script above also
+          # deletes first, so a re-run is safe even if this is skipped.)
+          kubectl -n spatiumddi exec -i "$POD" -- python3 - <<'PYEOF' || true
+          import httpx
+
+          key = open("/var/lib/spatium-dns-agent/pdns-api.key").read().strip()
+          httpx.Client(timeout=15).delete(
+              "http://127.0.0.1:8081/api/v1/servers/localhost/zones/dnssec-smoke.test.",
+              headers={"X-API-Key": key},
+          )
+          PYEOF
 
       - name: DNS agents registered with control plane
         run: |
