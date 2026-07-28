@@ -55,7 +55,7 @@ Summary:
 | `confirm_wipe` | **Must be `true`** to auto-wipe a disk unattended |
 | `target_disk` | Prefer `/dev/disk/by-id/…` or `by-path/…` (stable). Absent / unresolvable ⇒ interactive picker |
 | `hostname` | RFC 1123 (alnum + hyphen, ≤ 63) |
-| `admin_user` | default `admin` |
+| `admin_user` | default `admin`. Must match `[a-z_][a-z0-9_-]*$?`, ≤ 32 chars, and not be an existing system account (`root`, `www-data`, …) |
 | `admin_password` **or** `admin_password_hash` | plaintext, or a crypt(3) hash from `openssl passwd -6` |
 | `timezone` | IANA name, default `UTC` |
 | `network.mode` | `dhcp`, or `static` with `interface` + `ip` + `prefix` + `gateway` all required (IPv4 only; optional `dns`) |
@@ -85,7 +85,9 @@ first match wins:
 
 1. **Kernel cmdline** — `spatium.preseed=<url|path>` (best for PXE /
    IPMI). A `http(s)://` value is fetched with curl; anything else is a
-   path on the installer rootfs.
+   path on the installer rootfs. **A plain `http://` URL is refused
+   unless it is pinned with `spatium.preseed.sha256=<64-hex>`** — see
+   [URL integrity](#url-integrity-http-and-sha256-pinning) below.
 2. **NoCloud CIDATA volume** — a disk labelled `CIDATA` carrying
    `spatium-preseed.yaml` (or `.yml`, or a cloud-init `user-data`
    document with an embedded `spatium_preseed:` block). Best for VM /
@@ -125,6 +127,32 @@ Append to the installer boot cmdline (alongside `spatium-mode=install`):
 ```
 spatium.preseed=https://provision.example.net/spatium/ddi-control-1.yaml
 ```
+
+#### URL integrity (http and sha256 pinning)
+
+The cmdline URL is the only transport that arrives over the network
+from a party the installer cannot authenticate, and the answer file it
+delivers authorises an unattended disk wipe and carries the admin
+password (plus the pairing code on `role: appliance`). So a plain
+`http://` URL with **no** integrity pin is refused before the fetch,
+with a message naming both remedies:
+
+```
+# Option A — TLS authenticates the origin (preferred)
+spatium.preseed=https://provision.example.net/spatium/ddi-control-1.yaml
+
+# Option B — content-pinned, so the transport need not be trusted.
+# For air-gapped / internal-CA PXE where https isn't practical.
+spatium.preseed=http://pxe.internal/spatium/ddi-control-1.yaml
+spatium.preseed.sha256=9f2c...64-hex-digest
+```
+
+Get the digest with `sha256sum spatium-preseed.yaml`. The pin is
+verified whenever it is supplied (https or not); a mismatch halts the
+install rather than acting on content that may have been modified in
+transit, and a pin that cannot be checked fails closed. The `CIDATA`
+and install-medium transports are physically attached and are not
+subject to this gate.
 
 Serve a per-host answer file from any HTTP server. This pairs well with
 the console-redirect cmdline the appliance already sets
