@@ -47,7 +47,9 @@ from app.services.appliance.syslog import validate_syslog_filter, validate_syslo
 # Re-declared here (tiny) rather than imported from the routers, so this
 # module doesn't drag the whole router import graph in at load time.
 _CONFORMITY_SEVERITIES = frozenset({"info", "warning", "critical"})
-_CONFORMITY_TARGET_KINDS = frozenset({"platform", "subnet", "ip_address", "dns_zone", "dhcp_scope"})
+_CONFORMITY_TARGET_KINDS = frozenset(
+    {"platform", "subnet", "ip_address", "dns_zone", "dhcp_scope", "multicast_group"}
+)
 _CONFORMITY_BUILTIN_MUTABLE = frozenset(
     {"enabled", "eval_interval_hours", "severity", "fail_alert_rule_id", "description"}
 )
@@ -65,11 +67,22 @@ def _clip(text: str, n: int = 80) -> str:
 class CreateConformityPolicyArgs(BaseModel):
     name: str = Field(description="Policy name (unique-ish label).")
     target_kind: str = Field(
-        description="One of platform / subnet / ip_address / dns_zone / dhcp_scope."
+        description=(
+            "One of platform / subnet / ip_address / dns_zone / dhcp_scope / " "multicast_group."
+        )
     )
+    # Deliberately not an inline list of kinds: this description is
+    # LLM-visible prompt text, and the hand-maintained enumeration that
+    # used to live here drifted out of date (it named 6 kinds while the
+    # registry had grown to 9). Point at the live catalog instead —
+    # GET /conformity/checks renders CHECK_CATALOG, which is generated
+    # from the same registry that validates this field.
     check_kind: str = Field(
-        description="Check kind from the catalog (has_field / in_separate_vrf / "
-        "no_open_ports / alert_rule_covers / last_seen_within / audit_log_immutable)."
+        description=(
+            "Check kind, which must be one of the names returned by "
+            "GET /api/v1/conformity/checks (the live check catalog). "
+            "Call that endpoint first if you are unsure which kinds exist."
+        )
     )
     framework: str = Field(default="custom", description="Framework label, e.g. PCI-DSS.")
     severity: str = Field(default="warning", description="info / warning / critical.")

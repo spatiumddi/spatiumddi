@@ -45,6 +45,7 @@ Always read the relevant spec doc(s) before writing code for a feature area.
 | `docs/features/INTEGRATIONS.md` | Read-only Kubernetes + Docker mirror integrations; setup, semantics, dashboard surface |
 | `docs/features/MIGRATION.md` | One-shot importers — DNS (BIND9 / Windows DNS / PowerDNS) + DHCP (Kea / Windows DHCP / ISC dhcpd.conf) into native rows; preview → commit, provenance, IPAM linkage |
 | `docs/features/LOOKING_GLASS.md` | BGP Looking Glass — receive-only GoBGP collector peering with operator routers; Sessions + Routes grid, IPAM/ASN/VRF linkage at ingest, `bgp_lg_*` alerts, as-path Query tab + collector-vantage tools; distinct from the #527 public-table hijack monitor. The MetalLB BGP-mode VIP advertiser (#566 D1) ships alongside it, opt-in (`bgp.enabled=false`, `frrk8s.enabled=false` by default; enabling pulls in FRRouting / GPL-2.0) |
+| `docs/features/VERTICALS.md` | Vertical network awareness — AV-over-IP (Dante / AES67 / SMPTE 2110) flow descriptors + reserved multicast ranges, BACnet/IP device-instance registry + BBMD conformity, Industrial-OT device inventory + Purdue zoning. Three default-on Network feature modules (`network.av` / `network.bacnet` / `network.ot`); registry + conformity only, no network probing (and why each discovery phase is deferred) |
 | `docs/PERMISSIONS.md` | RBAC permission grammar (`{action, resource_type, resource_id?}`), builtin roles, wildcards |
 | `docs/features/SYSTEM_ADMIN.md` | System config, health dashboard, notifications, backup/restore, service control |
 | `docs/deployment/APPLIANCE.md` | OS appliance build, base OS selection, licensing |
@@ -337,9 +338,48 @@ sub-headings.
 #### Discovery & network awareness
 
 - ⬜ [**NetFlow / sFlow ingestion**](https://github.com/spatiumddi/spatiumddi/issues/39)
-- ⬜ [**mDNS / Bonjour / WSD passive discovery**](https://github.com/spatiumddi/spatiumddi/issues/40)
+- ❌ [**mDNS / Bonjour / WSD passive discovery**](https://github.com/spatiumddi/spatiumddi/issues/40)
+  — **closed as not planned** (feasibility + merit review). Link-local
+  multicast is only audible to a host-networked, on-segment agent, and
+  the agent↔subnet binding that needs isn't modelled. Kept listed
+  because #540/#541/#542 named it as their shared discovery primitive;
+  its closure is why every one of their discovery phases is deferred.
 - ⬜ [**Reverse-DNS auto-population**](https://github.com/spatiumddi/spatiumddi/issues/41)
 - ⬜ [**CGNAT (RFC 6598) awareness**](https://github.com/spatiumddi/spatiumddi/issues/42)
+
+#### Vertical network awareness
+
+Umbrella [#543](https://github.com/spatiumddi/spatiumddi/issues/543) —
+three IP-native domains a generic IPAM doesn't speak, built on the same
+DDI primitives (uniqueness registry + segmentation documentation +
+conformity). See [`docs/features/VERTICALS.md`](docs/features/VERTICALS.md).
+
+- 🟡 [**AV / Audio-Video-over-IP — Dante · AES67 · SMPTE 2110 · NDI**](https://github.com/spatiumddi/spatiumddi/issues/540)
+  — Phase 1 + Copilot tools implemented (pending release cut):
+  `network.av` module, `av_flow_profile` 1:1 AV descriptor on
+  `multicast_group` + operator-declared `av_reserved_range` per
+  protocol, allocation-conflict preview, 2 conformity checks, 3 MCP
+  tools. **Phase 2 (Dante mDNS) blocked** — #40 closed not-planned.
+  **Phase 3 (NMOS IS-04 mirror) deferred** — a full pull integration
+  with both dashboard surfaces, separable into its own change.
+- 🟡 [**BACnet/IP building automation**](https://github.com/spatiumddi/spatiumddi/issues/541)
+  — Phase 1 + Copilot tools implemented (pending release cut):
+  `network.bacnet` module, `bacnet_device` with the internetwork-wide
+  `uq_bacnet_device_instance` constraint (the differentiating hook),
+  BBMD flag + BDT/FDT snapshots, 3 conformity checks incl.
+  `bbmd_one_per_subnet` failing in both directions, 3 MCP tools.
+  **Phase 2 (`Who-Is` sweep) deferred** — needs a UDP broadcast
+  carrying a real payload; the only generic prober sends an empty
+  datagram.
+- 🟡 [**Industrial / OT — PROFINET · EtherNet/IP · Modbus TCP · OPC UA**](https://github.com/spatiumddi/spatiumddi/issues/542)
+  — Phase 1 + Phase 4 implemented (pending release cut): `network.ot`
+  module, `ot_device` 1:1 descriptor + `ot_zone` Purdue zoning
+  (`Numeric(2,1)` so level 3.5 / the DMZ is representable), CSV import
+  of engineering-tool exports, 2 conformity checks, 3 MCP tools.
+  Read-only identification only — control-protocol writes are
+  permanently out of scope. **Phase 2 (routable probes) deferred** —
+  nmap runs NSE but nothing parses `<script>` output. **Phase 3
+  (PROFINET DCP) deferred** — raw L2, needs a container capability grant.
 
 #### Reporting & analytics
 

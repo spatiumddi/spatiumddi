@@ -3,6 +3,9 @@ import { NavLink, useLocation } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import {
   Activity,
+  AudioLines,
+  Building2,
+  Factory,
   Power,
   Network,
   Globe,
@@ -166,6 +169,18 @@ const networkInfrastructureNav = [
     module: "network.asn",
   },
   {
+    label: "AV over IP",
+    icon: AudioLines,
+    to: "/network/av",
+    module: "network.av",
+  },
+  {
+    label: "BACnet Devices",
+    icon: Building2,
+    to: "/network/bacnet",
+    module: "network.bacnet",
+  },
+  {
     label: "Certificates",
     icon: ShieldCheck,
     to: "/network/certificates",
@@ -194,6 +209,12 @@ const networkInfrastructureNav = [
     icon: Radio,
     to: "/network/multicast",
     module: "network.multicast",
+  },
+  {
+    label: "OT Devices",
+    icon: Factory,
+    to: "/network/ot",
+    module: "network.ot",
   },
   {
     label: "Overlays",

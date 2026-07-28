@@ -46,10 +46,19 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.alerts import AlertRule
 from app.models.appliance import APPLIANCE_STATE_APPROVED, Appliance
 from app.models.audit import AuditLog
+from app.models.av import AVFlowProfile, AVReservedRange
+from app.models.bacnet import BACnetDevice
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
 from app.models.multicast import MulticastGroup
 from app.models.nmap import NmapScan
+from app.models.ot import OTDevice, OTZone
 from app.services import alerts as alert_service
+from app.services.av.ranges import check_allocation_conflict
+from app.services.ot.zones import (
+    effective_zone_for_address,
+    purdue_mismatch,
+    purdue_to_str,
+)
 
 # ── Outcome dataclass ───────────────────────────────────────────────
 
@@ -723,6 +732,424 @@ async def check_no_lanwide_control_plane_ports(
     )
 
 
+# ── Checks: AV / Audio-Video-over-IP (#540) ─────────────────────────
+
+
+@register("av_flow_outside_reserved_range")
+async def check_av_flow_outside_reserved_range(
+    db: AsyncSession,
+    *,
+    target: object | None,
+    target_kind: str,
+    args: dict[str, Any],
+    now: datetime,
+) -> CheckOutcome:
+    """An AV flow lives inside a range declared for its protocol.
+
+    Dante ships transmit flows in ``239.69.0.0/16``; AES67 and
+    RAVENNA plants pick a block inside the administratively-scoped
+    ``239.0.0.0/8``; SMPTE 2110 studios hand-carve their own. Static
+    multicast assignment is the AoIP best practice precisely because
+    address drift is what breaks a plant, so a flow that has wandered
+    outside its declared range is worth surfacing.
+
+    Absence of policy is deliberately NOT a violation: when the
+    operator has declared no range for that protocol there is nothing
+    to check against, and failing every flow in that situation would
+    train operators to ignore the check. Same for a group carrying no
+    AV descriptor — that is a plain multicast group, not an AV flow.
+    """
+    _ = args, now
+    if target is None or not isinstance(target, MulticastGroup):
+        return CheckOutcome.not_applicable(
+            "Target row missing or wrong kind for av_flow_outside_reserved_range"
+        )
+    profile = (
+        await db.execute(select(AVFlowProfile).where(AVFlowProfile.group_id == target.id))
+    ).scalar_one_or_none()
+    if profile is None:
+        return CheckOutcome.not_applicable("Group carries no AV descriptor")
+
+    # Delegates to the same service the REST allocation-preview calls, so
+    # the conformity verdict and the preview an operator saw before
+    # allocating cannot disagree about one flow. That also picks up the
+    # longest-prefix rule (a Dante /16 carved out of an exclusive AES67
+    # /8 resolves to Dante) and the asyncpg CIDR-vs-str coercion, both of
+    # which a second hand-rolled containment loop would miss.
+    report = await check_allocation_conflict(
+        db, target.space_id, str(target.address), profile.av_protocol
+    )
+
+    if report.own_ranges:
+        matched = report.own_ranges[0]
+        return CheckOutcome.passed(
+            f"{profile.av_protocol} flow {target.address} is inside " f"{matched.cidr} as declared",
+            {
+                "address": str(target.address),
+                "av_protocol": profile.av_protocol,
+                "matched_range": matched.cidr,
+            },
+        )
+
+    if not report.outside_declared_range:
+        return CheckOutcome.not_applicable(
+            f"No reserved range declared for {profile.av_protocol} in this IPSpace"
+        )
+
+    # Only on the failure path: name the ranges the flow *should* have
+    # landed in. That is the actionable half of the finding, and it is
+    # one extra query on the rare branch rather than on every group.
+    declared = [
+        str(c)
+        for c in (
+            await db.execute(
+                select(AVReservedRange.cidr).where(
+                    AVReservedRange.space_id == target.space_id,
+                    AVReservedRange.av_protocol == profile.av_protocol,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    ]
+    return CheckOutcome.fail(
+        detail=(
+            f"{profile.av_protocol} flow {target.address} sits outside every "
+            f"declared {profile.av_protocol} range "
+            f"({', '.join(declared[:20])})"
+        ),
+        diagnostic={
+            "address": str(target.address),
+            "av_protocol": profile.av_protocol,
+            "declared_ranges": declared[:20],
+            "suggested_range": report.suggested_range,
+        },
+    )
+
+
+@register("av_flow_no_ptp_domain")
+async def check_av_flow_no_ptp_domain(
+    db: AsyncSession,
+    *,
+    target: object | None,
+    target_kind: str,
+    args: dict[str, Any],
+    now: datetime,
+) -> CheckOutcome:
+    """An AV flow records the PTP clock domain it rides.
+
+    Advisory (warn, never fail). PTP misconfiguration is the most
+    common AoIP failure mode, and "which clock domain is this flow
+    on?" is the first question asked when audio drops — but a missing
+    value is undocumented state, not a broken network, so it does not
+    warrant a compliance failure.
+
+    Applied uniformly across AV protocols. NDI is the arguable
+    exception (it is not PTP-locked the way AES67/2110 are), but the
+    module records the domain as documentation rather than asserting
+    the flow is clocked, and special-casing one protocol here would
+    encode a claim about NDI's timing model that this registry has no
+    way to verify.
+    """
+    _ = args, now
+    if target is None or not isinstance(target, MulticastGroup):
+        return CheckOutcome.not_applicable(
+            "Target row missing or wrong kind for av_flow_no_ptp_domain"
+        )
+    profile = (
+        await db.execute(select(AVFlowProfile).where(AVFlowProfile.group_id == target.id))
+    ).scalar_one_or_none()
+    if profile is None:
+        return CheckOutcome.not_applicable("Group carries no AV descriptor")
+    if profile.ptp_domain is not None:
+        return CheckOutcome.passed(
+            f"{profile.av_protocol} flow records PTP domain {profile.ptp_domain}",
+            {"av_protocol": profile.av_protocol, "ptp_domain": profile.ptp_domain},
+        )
+    return CheckOutcome.warn(
+        detail=(f"{profile.av_protocol} flow {target.address} has no PTP clock " "domain recorded"),
+        diagnostic={"address": str(target.address), "av_protocol": profile.av_protocol},
+    )
+
+
+# ── Checks: BACnet/IP building automation (#541) ────────────────────
+
+
+@register("bbmd_one_per_subnet")
+async def check_bbmd_one_per_subnet(
+    db: AsyncSession,
+    *,
+    target: object | None,
+    target_kind: str,
+    args: dict[str, Any],
+    now: datetime,
+) -> CheckOutcome:
+    """Each BACnet-bearing subnet has exactly one BBMD.
+
+    BACnet broadcasts (``Who-Is`` / ``I-Am``) do not cross IP routers,
+    so every IP subnet in a multi-subnet BACnet/IP internetwork needs
+    exactly one BACnet Broadcast Management Device. Zero leaves the
+    subnet's devices invisible to the rest of the internetwork; two or
+    more produces duplicated broadcast traffic and duplicate ``I-Am``
+    responses. "Exactly one" is the rule every BAS integration guide
+    states, and it is cheaply checkable from the registry.
+
+    A subnet with no BACnet devices at all is NOT_APPLICABLE rather
+    than a failure — most subnets in a mixed estate are not BACnet
+    subnets, and flagging them would bury the real findings.
+    """
+    _ = args, now
+    if target is None or not isinstance(target, Subnet):
+        return CheckOutcome.not_applicable(
+            "Target row missing or wrong kind for bbmd_one_per_subnet"
+        )
+    rows = list(
+        (
+            await db.execute(
+                select(BACnetDevice.device_instance, BACnetDevice.is_bbmd).where(
+                    BACnetDevice.subnet_id == target.id
+                )
+            )
+        ).all()
+    )
+    if not rows:
+        return CheckOutcome.not_applicable("Subnet carries no BACnet devices")
+
+    bbmds = [r._mapping["device_instance"] for r in rows if r._mapping["is_bbmd"]]
+    if len(bbmds) == 1:
+        return CheckOutcome.passed(
+            f"Exactly one BBMD (device instance {bbmds[0]}) on this subnet",
+            {"bbmd_instances": bbmds, "bacnet_device_count": len(rows)},
+        )
+    if not bbmds:
+        return CheckOutcome.fail(
+            detail=(
+                f"No BBMD on a subnet with {len(rows)} BACnet device(s) — "
+                "its devices cannot be reached across IP routers"
+            ),
+            diagnostic={"bbmd_count": 0, "bacnet_device_count": len(rows)},
+        )
+    return CheckOutcome.fail(
+        detail=(
+            f"{len(bbmds)} BBMDs on one subnet (device instances "
+            f"{', '.join(str(i) for i in sorted(bbmds)[:20])}) — expected exactly one; "
+            "multiple BBMDs duplicate broadcast traffic"
+        ),
+        diagnostic={
+            "bbmd_count": len(bbmds),
+            "bbmd_instances": sorted(bbmds)[:20],
+            "bacnet_device_count": len(rows),
+        },
+    )
+
+
+@register("bacnet_duplicate_device_instance")
+async def check_bacnet_duplicate_device_instance(
+    db: AsyncSession,
+    *,
+    target: object | None,
+    target_kind: str,
+    args: dict[str, Any],
+    now: datetime,
+) -> CheckOutcome:
+    """No two BACnet devices share a device instance number.
+
+    Platform-level, because instance uniqueness is an
+    internetwork-wide property rather than a per-row one.
+
+    ``uq_bacnet_device_instance`` should make a duplicate impossible,
+    so a finding here means data arrived by a path that bypassed the
+    ORM — a direct SQL load, a restore from a backup taken before the
+    constraint existed, or a future bulk importer that disables
+    constraints. That is exactly when an operator most needs to be
+    told, which is why the check exists despite the constraint.
+    """
+    _ = target, args, now
+    if target_kind != "platform":
+        return CheckOutcome.not_applicable(f"requires target_kind=platform (got {target_kind})")
+    dupes = list(
+        (
+            await db.execute(
+                select(BACnetDevice.device_instance, func.count(BACnetDevice.id).label("n"))
+                .group_by(BACnetDevice.device_instance)
+                .having(func.count(BACnetDevice.id) > 1)
+            )
+        ).all()
+    )
+    if not dupes:
+        return CheckOutcome.passed("Every BACnet device instance is unique")
+    return CheckOutcome.fail(
+        detail=(
+            f"{len(dupes)} BACnet device instance(s) are held by more than one "
+            f"device: {', '.join(str(r._mapping['device_instance']) for r in dupes[:20])}"
+        ),
+        diagnostic={
+            "duplicate_instances": [int(r._mapping["device_instance"]) for r in dupes[:20]],
+        },
+    )
+
+
+@register("bacnet_vendor_id_unknown")
+async def check_bacnet_vendor_id_unknown(
+    db: AsyncSession,
+    *,
+    target: object | None,
+    target_kind: str,
+    args: dict[str, Any],
+    now: datetime,
+) -> CheckOutcome:
+    """BACnet devices report a plausible ASHRAE vendor id.
+
+    Advisory. Vendor id 0 is legitimately ASHRAE itself, but on a real
+    plant a device reporting 0 — or reporting nothing at all — is
+    almost always a misconfigured, cloned, or counterfeit controller.
+    Warn rather than fail: this is a "go look at these" signal, not a
+    compliance breach.
+    """
+    _ = target, args, now
+    if target_kind != "platform":
+        return CheckOutcome.not_applicable(f"requires target_kind=platform (got {target_kind})")
+    rows = list(
+        (
+            await db.execute(
+                select(BACnetDevice.device_instance, BACnetDevice.vendor_id).where(
+                    (BACnetDevice.vendor_id.is_(None)) | (BACnetDevice.vendor_id == 0)
+                )
+            )
+        ).all()
+    )
+    if not rows:
+        return CheckOutcome.passed("Every BACnet device reports a non-zero vendor id")
+    return CheckOutcome.warn(
+        detail=(
+            f"{len(rows)} BACnet device(s) report vendor id 0 or none — "
+            "commonly a misconfigured or cloned controller"
+        ),
+        diagnostic={
+            "device_instances": [int(r._mapping["device_instance"]) for r in rows[:20]],
+        },
+    )
+
+
+# ── Checks: Industrial / OT (#542) ──────────────────────────────────
+
+
+@register("ot_device_crosses_purdue_boundary")
+async def check_ot_device_crosses_purdue_boundary(
+    db: AsyncSession,
+    *,
+    target: object | None,
+    target_kind: str,
+    args: dict[str, Any],
+    now: datetime,
+) -> CheckOutcome:
+    """An OT device sits at the Purdue level its subnet is zoned for.
+
+    OT networks are organised by the Purdue model, and the whole point
+    of that segmentation is that a Level-1 controller does not live in
+    a Level-4 enterprise subnet. A mismatch is the finding an auditor
+    asks for and that nobody can produce today without a spreadsheet.
+
+    NOT_APPLICABLE when either side is unset: an unrecorded level is
+    missing documentation, not a segmentation violation, and treating
+    unknown as guilty would make the check unusable during rollout.
+    """
+    _ = args, now
+    if target is None or not isinstance(target, IPAddress):
+        return CheckOutcome.not_applicable(
+            "Target row missing or wrong kind for ot_device_crosses_purdue_boundary"
+        )
+    device = (
+        await db.execute(select(OTDevice).where(OTDevice.ip_address_id == target.id))
+    ).scalar_one_or_none()
+    if device is None:
+        return CheckOutcome.not_applicable("Address carries no OT descriptor")
+
+    # Zone resolution and the level comparison both live in
+    # ``services.ot.zones`` — the by-address REST endpoint calls the same
+    # pair, so the conformity verdict and what an operator sees on the IP
+    # detail panel cannot disagree about the same device.
+    zone = await effective_zone_for_address(db, target.id)
+    mismatch = purdue_mismatch(device, zone)
+    device_level = purdue_to_str(device.purdue_level)
+    zone_level = purdue_to_str(zone.purdue_level) if zone is not None else None
+
+    if mismatch is None:
+        # Tri-state: an unrecorded level on either side is missing
+        # documentation, not a segmentation violation.
+        if zone is None:
+            return CheckOutcome.not_applicable("Subnet has no OT zone declared")
+        return CheckOutcome.not_applicable("OT device has no Purdue level recorded")
+
+    if not mismatch:
+        return CheckOutcome.passed(
+            f"Device and subnet agree at Purdue level {zone_level}",
+            {"device_purdue_level": device_level, "zone_purdue_level": zone_level},
+        )
+    cell = zone.cell_area if zone is not None else ""
+    return CheckOutcome.fail(
+        detail=(
+            f"OT device is Purdue level {device_level} but its subnet is "
+            f"zoned level {zone_level}"
+            f"{f' ({cell})' if cell else ''}"
+        ),
+        diagnostic={
+            "device_purdue_level": device_level,
+            "zone_purdue_level": zone_level,
+            "ot_protocol": device.ot_protocol,
+            "ot_role": device.ot_role,
+            "cell_area": cell,
+        },
+    )
+
+
+@register("ot_zone_missing_purdue_level")
+async def check_ot_zone_missing_purdue_level(
+    db: AsyncSession,
+    *,
+    target: object | None,
+    target_kind: str,
+    args: dict[str, Any],
+    now: datetime,
+) -> CheckOutcome:
+    """A subnet carrying OT devices declares an OT zone.
+
+    Advisory. Without a zone row the Purdue-boundary check above has
+    nothing to compare against, so this is the check that tells an
+    operator why their segmentation report is empty.
+    """
+    _ = args, now
+    if target is None or not isinstance(target, Subnet):
+        return CheckOutcome.not_applicable(
+            "Target row missing or wrong kind for ot_zone_missing_purdue_level"
+        )
+    device_count = (
+        await db.execute(
+            select(func.count(OTDevice.id))
+            .select_from(OTDevice)
+            .join(IPAddress, IPAddress.id == OTDevice.ip_address_id)
+            .where(IPAddress.subnet_id == target.id)
+        )
+    ).scalar_one()
+    if not device_count:
+        return CheckOutcome.not_applicable("Subnet carries no OT devices")
+    zone = (
+        await db.execute(select(OTZone).where(OTZone.subnet_id == target.id))
+    ).scalar_one_or_none()
+    if zone is not None:
+        return CheckOutcome.passed(
+            f"Subnet is zoned at Purdue level {zone.purdue_level}",
+            {"purdue_level": str(zone.purdue_level), "ot_device_count": int(device_count)},
+        )
+    return CheckOutcome.warn(
+        detail=(
+            f"Subnet carries {device_count} OT device(s) but declares no OT zone, "
+            "so Purdue-boundary conformity cannot be evaluated for it"
+        ),
+        diagnostic={"ot_device_count": int(device_count)},
+    )
+
+
 CHECK_CATALOG: list[dict[str, Any]] = [
     {
         "name": "has_field",
@@ -834,6 +1261,48 @@ CHECK_CATALOG: list[dict[str, Any]] = [
                 "label": "Treat a node's report as stale after N minutes (PASS-stale, never FAIL)",
             }
         ],
+    },
+    {
+        "name": "av_flow_outside_reserved_range",
+        "label": "AV flow sits inside a declared range for its protocol",
+        "supports": ["multicast_group"],
+        "args": [],
+    },
+    {
+        "name": "av_flow_no_ptp_domain",
+        "label": "AV flow records a PTP clock domain (advisory)",
+        "supports": ["multicast_group"],
+        "args": [],
+    },
+    {
+        "name": "bbmd_one_per_subnet",
+        "label": "Exactly one BACnet BBMD per subnet",
+        "supports": ["subnet"],
+        "args": [],
+    },
+    {
+        "name": "bacnet_duplicate_device_instance",
+        "label": "BACnet device instance numbers are unique internetwork-wide",
+        "supports": ["platform"],
+        "args": [],
+    },
+    {
+        "name": "bacnet_vendor_id_unknown",
+        "label": "BACnet devices report a plausible vendor id (advisory)",
+        "supports": ["platform"],
+        "args": [],
+    },
+    {
+        "name": "ot_device_crosses_purdue_boundary",
+        "label": "OT device matches its subnet's Purdue level",
+        "supports": ["ip_address"],
+        "args": [],
+    },
+    {
+        "name": "ot_zone_missing_purdue_level",
+        "label": "Subnet with OT devices declares an OT zone (advisory)",
+        "supports": ["subnet"],
+        "args": [],
     },
 ]
 

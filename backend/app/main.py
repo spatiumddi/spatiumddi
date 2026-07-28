@@ -231,8 +231,10 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
         "on-demand nmap scans, the ASN registry, VRFs, WAN circuits, "
         "SD-WAN overlay topology + routing policies + the application "
         "catalog (#95), the customer-deliverable services (#94) those "
-        "resources bundle into, and the logical ownership tags (customer "
-        "/ site / provider) those entities reference.",
+        "resources bundle into, the vertical network-awareness registries "
+        "(AV-over-IP flows, BACnet/IP devices, industrial-OT devices), and "
+        "the logical ownership tags (customer / site / provider) those "
+        "entities reference.",
         [
             {"action": "admin", "resource_type": "manage_network_devices"},
             {"action": "admin", "resource_type": "manage_nmap_scans"},
@@ -243,6 +245,9 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
             {"action": "admin", "resource_type": "vrf"},
             {"action": "admin", "resource_type": "circuit"},
             {"action": "admin", "resource_type": "multicast"},
+            {"action": "admin", "resource_type": "av_flow"},
+            {"action": "admin", "resource_type": "bacnet_device"},
+            {"action": "admin", "resource_type": "ot_device"},
             {"action": "admin", "resource_type": "network_service"},
             {"action": "admin", "resource_type": "overlay_network"},
             {"action": "admin", "resource_type": "routing_policy"},

@@ -173,6 +173,30 @@ SECTIONS: tuple[Section, ...] = (
         ),
     ),
     Section(
+        key="verticals",
+        label="Vertical network awareness (multicast / AV / BACnet / OT)",
+        description=(
+            "The multicast stream registry (groups + PIM domains + "
+            "ports + memberships) and the vertical descriptors layered "
+            "on it: AV-over-IP flow profiles + reserved ranges "
+            "(Dante / AES67 / SMPTE 2110), BACnet/IP devices with "
+            "their internetwork-unique device instance numbers and "
+            "BBMD tables, and industrial-OT devices + Purdue zoning. "
+            "References IPAM (space / subnet / address) and VLANs."
+        ),
+        tables=(
+            "multicast_domain",
+            "multicast_group",
+            "multicast_group_port",
+            "multicast_membership",
+            "av_flow_profile",
+            "av_reserved_range",
+            "bacnet_device",
+            "ot_device",
+            "ot_zone",
+        ),
+    ),
+    Section(
         key="dns",
         label="DNS (groups / servers / zones / records / pools)",
         description=(

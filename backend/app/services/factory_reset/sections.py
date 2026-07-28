@@ -249,6 +249,31 @@ FACTORY_SECTIONS: tuple[FactorySection, ...] = (
         ),
     ),
     FactorySection(
+        key="verticals",
+        label="Vertical network awareness",
+        description=(
+            "The multicast stream registry (groups, PIM domains, "
+            "ports, memberships) and the vertical descriptors layered "
+            "on it — AV-over-IP flow profiles + reserved ranges, "
+            "BACnet/IP devices + BBMD tables, industrial-OT devices + "
+            "Purdue zoning. The underlying IPAM addresses and subnets "
+            "are untouched; only the vertical metadata is destroyed."
+        ),
+        phrase="DESTROY-VERTICALS",
+        kind="truncate",
+        tables=(
+            "av_flow_profile",
+            "av_reserved_range",
+            "bacnet_device",
+            "ot_device",
+            "ot_zone",
+            "multicast_membership",
+            "multicast_group_port",
+            "multicast_group",
+            "multicast_domain",
+        ),
+    ),
+    FactorySection(
         key="tools",
         label="Tools",
         description=(

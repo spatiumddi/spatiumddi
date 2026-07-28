@@ -646,6 +646,19 @@ function SeverityBadge({ severity }: { severity: ConformitySeverity }) {
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
 
+// Target kinds whose backend resolver actually honours
+// `target_filter.classification`. `platform` has no rows to filter, and
+// the multicast resolver (`_resolve_multicast_groups`) deliberately
+// ignores target_filter entirely — offering the control for those would
+// render a picker whose value is silently discarded. Rendering and the
+// request payload share this list so the two can't drift apart.
+const CLASSIFIABLE_TARGET_KINDS = [
+  "subnet",
+  "ip_address",
+  "dns_zone",
+  "dhcp_scope",
+];
+
 function Field({
   label,
   hint,
@@ -713,9 +726,7 @@ function PolicyEditorModal({
         throw new Error("check_args must be valid JSON");
       }
       const targetFilter: Record<string, unknown> = {};
-      if (
-        ["subnet", "ip_address", "dns_zone", "dhcp_scope"].includes(targetKind)
-      ) {
+      if (CLASSIFIABLE_TARGET_KINDS.includes(targetKind)) {
         if (classification) {
           targetFilter.classification = classification;
         }
@@ -855,9 +866,10 @@ function PolicyEditorModal({
               <option value="ip_address">IP address</option>
               <option value="dns_zone">DNS zone</option>
               <option value="dhcp_scope">DHCP scope</option>
+              <option value="multicast_group">Multicast group</option>
             </select>
           </Field>
-          {targetKind !== "platform" && (
+          {CLASSIFIABLE_TARGET_KINDS.includes(targetKind) && (
             <Field label="Classification filter">
               <select
                 className={cn(inputCls, isBuiltin && "opacity-60")}
