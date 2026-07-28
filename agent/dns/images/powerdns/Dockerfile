@@ -44,23 +44,29 @@ FROM alpine:3.23 AS runtime
 # but silently fails on the privileged-port bind).
 #
 # ``apk upgrade --no-cache`` runs BEFORE ``apk add`` so the package
-# database is fresh and any previously-baked layer carrying an older
-# bind-libs version (CVE-2026-3593, CVE-2026-3039, CVE-2026-5946 all
-# fixed in 9.20.23-r0 — pdns drags bind-libs transitively for the
-# DNS-name parser) gets re-resolved against the current alpine 3.23
-# index. GitHub Actions Docker layer cache (the ``cache-from:
-# type=gha`` on the build workflow) is otherwise happy to serve a
-# 30-day-old ``apk add`` layer that Trivy will then flag.
+# database is fresh and any previously-baked layer gets re-resolved
+# against the current alpine 3.23 index. GitHub Actions Docker layer
+# cache (the ``cache-from: type=gha`` on the build workflow) is
+# otherwise happy to serve a 30-day-old ``apk add`` layer that Trivy
+# will then flag.
 #
-# ``libcrypto3``/``libssl3`` pinned ``>=3.5.7-r0`` for CVE-2026-45447
-# (HIGH, OpenSSL). The 3.23 base already satisfies it, so the bound is
-# a no-op on a cold build — it is kept because it also busts the
-# ``cache-from`` layer, which is what actually stops a stale apk add
-# from reintroducing 3.5.6-r0 from the pre-3.23 cache.
+# ``apk upgrade`` alone is NOT enough: if the whole RUN layer is a cache
+# hit, neither the upgrade nor the add executes. Only a change to the
+# command STRING busts it, so security-relevant floors are written as
+# explicit lower bounds — they pin the fixed version AND guarantee the
+# rebuild. Bump the bound when a new CVE lands.
+#
+# * ``bind-tools`` ``>=9.20.26-r0`` — 7 HIGH CVEs fixed in that release
+#   (see the bind9 image's Dockerfile for the list). Only ``dig`` is
+#   wanted here, but pdns also drags ``bind-libs`` transitively for the
+#   DNS-name parser, and both come from the same source package.
+# * ``libcrypto3`` / ``libssl3`` ``>=3.5.7-r0`` — CVE-2026-45447 (HIGH,
+#   OpenSSL). The 3.23 base already satisfies it; the bound is kept
+#   because it still busts a pre-3.23 cache layer.
 RUN apk upgrade --no-cache \
  && apk add --no-cache \
       pdns pdns-backend-lmdb \
-      bind-tools \
+      'bind-tools>=9.20.26-r0' \
       tini su-exec \
       python3 py3-pip \
       libcap \
