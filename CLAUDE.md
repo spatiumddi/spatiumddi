@@ -451,7 +451,8 @@ suggestion, free-space treemap.
 
 #### Workflow & RBAC
 
-- 🟡 [**Approval workflows for risky ops**](https://github.com/spatiumddi/spatiumddi/issues/62) — **P1 shipped 2026.06.25-1** (two-person rule over the 6 delete handlers behind the default-off `governance.approvals` module + a self-governance lock; lifecycle API + Change Requests admin page + 4 MCP tools + Change Approver builtin role). P2 (bulk ops / factory reset / import gating + approval notifications) still ⬜ — but the issue itself was **closed on P1**, so P2 is not tracked on GitHub anywhere; re-file it before picking it up.
+- ✅ [**Approval workflows for risky ops — P1**](https://github.com/spatiumddi/spatiumddi/issues/62) — shipped `2026.06.25-1`: two-person rule over the 6 delete handlers behind the default-off `governance.approvals` module + a self-governance lock; lifecycle API + Change Requests admin page + 4 MCP tools + Change Approver builtin role. The issue closed on P1, so its P2 scope was re-filed ↓.
+- ⬜ [**Approval workflows — P2 (bulk ops / factory reset / import gating + approval notifications)**](https://github.com/spatiumddi/spatiumddi/issues/717) — build on the shipped `governance.approvals` module + change-request lifecycle, not a parallel mechanism.
 - ⬜ [**Resource locking**](https://github.com/spatiumddi/spatiumddi/issues/63)
 - ⬜ [**Per-resource ACLs**](https://github.com/spatiumddi/spatiumddi/issues/64)
 - ✅ [**Time-bound permissions**](https://github.com/spatiumddi/spatiumddi/issues/65) — shipped `2026.06.11-1`: a `time_bound_grant` table of auto-expiring *additive* RBAC grants (`{action, resource_type, resource_id?}` to a group until `expires_at`), consulted live by `user_has_permission` and soft-revoked by a 60 s beat sweep. Migration `d5e9b2c14a07`.
@@ -476,7 +477,7 @@ suggestion, free-space treemap.
 - ⬜ [**Field-level history**](https://github.com/spatiumddi/spatiumddi/issues/79)
 - ⬜ [**Recent items / favourites sidebar**](https://github.com/spatiumddi/spatiumddi/issues/80)
 - ⬜ [**Keyboard shortcut help overlay**](https://github.com/spatiumddi/spatiumddi/issues/81)
-- ⬜ [**Print / PDF export for IPAM tree + subnet detail**](https://github.com/spatiumddi/spatiumddi/issues/82) — **still pending despite GitHub showing it closed.** PR [#446](https://github.com/spatiumddi/spatiumddi/pull/446) was titled `fix(supervisor): … (CodeQL #82)`, referring to CodeQL *alert* 82; GitHub read the `#82` as an issue reference and auto-closed this issue on 2026-06-18. Nothing IPAM-print-related shipped — the only `reportlab` surfaces are the conformity (`/conformity/export.pdf`) and audit-change (`/audit/export.pdf`) reports. **Reopen it.** Related: shares PDF infrastructure with the shipped #48.
+- ⬜ [**Print / PDF export for IPAM tree + subnet detail**](https://github.com/spatiumddi/spatiumddi/issues/82) — GitHub auto-closed this on 2026-06-18 in error: PR [#446](https://github.com/spatiumddi/spatiumddi/pull/446) was titled `fix(supervisor): … (CodeQL #82)`, referring to CodeQL *alert* 82, and the `#82` was read as an issue reference. Nothing IPAM-print-related shipped — the only `reportlab` surfaces are the conformity (`/conformity/export.pdf`) and audit-change (`/audit/export.pdf`) reports. **Reopened 2026-07-28**; shares PDF infrastructure with the shipped #48.
 
 #### CLI tool
 

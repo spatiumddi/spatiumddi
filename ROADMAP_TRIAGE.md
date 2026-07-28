@@ -1,5 +1,14 @@
 # SpatiumDDI — Open-Issue Roadmap Triage
 
+> ⚠️ **Point-in-time snapshot — 2026-06-07. Do not treat as current.**
+> This is the record of one triage pass, kept for its reasoning, not as
+> a live tracker. Much of what it calls build-ready has since shipped
+> (#44 #46 #47 #48 #57 #58 #60 #61 #65 #67 #76 #29 #30 #28 …), and the
+> `CLAUDE.md:<line>` citations throughout no longer resolve — that file
+> was halved by #713 and its roadmap markers re-swept by #534. For
+> current status read the roadmap sections in
+> [`CLAUDE.md`](CLAUDE.md) and `gh issue list`, never this file.
+
 Multi-agent triage of all **90 open issues** (99 agents). For each: *already implemented?* / *can it be built?* / *should it be built?*, plus effort, a suggested disposition, related issues, and an adversarial re-check of every "already-done"/"duplicate" claim (6 of 8 were refuted & corrected).
 
 **Legend** — Disposition: shipped · superseded · decline · ready to implement · needs design decisions first. Should: 👍 rec / ⏸ defer / 👎 decline. Effort: S/M/L/XL.
