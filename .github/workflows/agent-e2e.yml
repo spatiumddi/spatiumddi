@@ -324,7 +324,7 @@ jobs:
           # curl is NOT, which is why this drives the API from Python. The
           # API only listens on 127.0.0.1 (webserver-allow-from), so this
           # has to run inside the pod.
-          if ! kubectl -n spatiumddi exec -i "$POD" -- python3 - <<'PYEOF'
+          if ! kubectl -n spatiumddi exec -i "$POD" -- python3 - "$ZONE" <<'PYEOF'
           import json
           import sys
 
@@ -332,7 +332,12 @@ jobs:
 
           API = "http://127.0.0.1:8081/api/v1/servers/localhost"
           KEY_PATH = "/var/lib/spatium-dns-agent/pdns-api.key"
-          ZONE = "dnssec-smoke.test."
+          # Zone comes from the shell's $ZONE via argv — the heredoc is
+          # quoted (so the shell can't expand into it), and duplicating the
+          # literal here would let a rename drift between the signing half
+          # and the dig assertions: the run would go green through signing
+          # and then fail with a misleading "no A answer", leaking a zone.
+          ZONE = sys.argv[1]
 
           try:
               api_key = open(KEY_PATH).read().strip()
@@ -452,12 +457,14 @@ jobs:
           # running daemon's zone cache pointing at it, so the zone would
           # keep being served to any later step. (The script above also
           # deletes first, so a re-run is safe even if this is skipped.)
-          kubectl -n spatiumddi exec -i "$POD" -- python3 - <<'PYEOF' || true
+          kubectl -n spatiumddi exec -i "$POD" -- python3 - "$ZONE" <<'PYEOF' || true
+          import sys
+
           import httpx
 
           key = open("/var/lib/spatium-dns-agent/pdns-api.key").read().strip()
           httpx.Client(timeout=15).delete(
-              "http://127.0.0.1:8081/api/v1/servers/localhost/zones/dnssec-smoke.test.",
+              f"http://127.0.0.1:8081/api/v1/servers/localhost/zones/{sys.argv[1]}",
               headers={"X-API-Key": key},
           )
           PYEOF

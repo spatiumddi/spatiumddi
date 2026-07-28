@@ -451,7 +451,9 @@ The agent never reads `pdns.conf` to figure out what to do — it queries PowerD
 
 ### 4.2 PowerDNS API key
 
-PowerDNS gates its REST API with a static API key (`api-key=...` in `pdns.conf`). The container's entrypoint generates a fresh key on first boot, writes it into the local `pdns.conf`, and exports it to the agent via a tmpfs-mounted env file. **Operators never touch this key.** The agent reads it on startup and rotates it on every container restart.
+PowerDNS gates its REST API with a static API key (`api-key=...` in `pdns.conf`). The container's entrypoint generates a key on first boot into **`/var/lib/spatium-dns-agent/pdns-api.key`** (mode `0600`, owned `spatium:spatium`) and the agent renders it into `pdns.conf` on every config sync. **Operators never touch this key.**
+
+The key **persists** in the agent state dir — the entrypoint only generates when the file is absent (`if [ ! -f "$API_KEY_FILE" ]`), so it survives container restarts and is stable for the life of the volume. The agent's `_load_or_generate_api_key` reads the same path and refuses to overwrite a file it cannot read, rather than silently minting a second key while `pdns_server` is already running with the first (issue #253). Anything that needs to talk to the local API — including the `agent-e2e` DNSSEC smoke — reads that file rather than inventing a key.
 
 The control plane has no knowledge of the API key — the trust boundary is between the agent and its co-located PowerDNS daemon, not between the control plane and PowerDNS.
 
