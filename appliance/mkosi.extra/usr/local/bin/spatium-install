@@ -64,6 +64,13 @@ BACKTITLE="SpatiumDDI Appliance Installer 0.1.0"
 # /var/log isn't writable by the caller.
 INSTALL_LOG="${SPATIUM_INSTALL_LOG:-/var/log/spatium-install.log}"
 MOUNT=/mnt/target
+# Test-only seams (issue #581), same idea as spatium-preseed-parse's
+# SPATIUM_FAKE_DISK_BYTES: the preseed-URL integrity gate and the
+# live-boot-disk exclusion are pure text processing over two kernel
+# files, but a pytest host cannot write either one. Never set on a real
+# install, where both resolve to the real /proc paths.
+PROC_CMDLINE="${SPATIUM_CMDLINE_FILE:-/proc/cmdline}"
+PROC_MOUNTS="${SPATIUM_MOUNTS_FILE:-/proc/mounts}"
 
 mkdir -p /var/log 2>/dev/null || true
 if ! : 2>/dev/null > "$INSTALL_LOG"; then
@@ -377,23 +384,20 @@ ask_application_config() {
     log "Application paired against $CONTROL_PLANE_URL with an 8-digit pairing code"
 }
 
-pick_disk() {
-    log "Step: pick_disk"
-    if [ -n "${PRESEED_HAS_DISK:-}" ]; then
-        log "Preseed: target_disk=$TARGET_DISK (confirm_wipe authorised; skipping picker)"
-        return 0
-    fi
-    local options=()
-    # #554 — exclude EVERY disk backing the live boot medium, not just the
-    # one findmnt resolves. The old code checked only ``findmnt -no SOURCE
-    # /run/live/medium``; with ``boot=live toram`` (or a layout that
-    # unmounts the medium) that returns empty, so the boot USB — an ``sd*``
-    # device the ``grep -vE "^(sr|loop|fd|ram|zram)"`` filter does NOT
-    # exclude — appeared as a wipe target and picking it destroyed the
-    # running install media mid-install. Scan /proc/mounts for every
-    # /run/live // /lib/live mount and map each source back to its parent
-    # disk, keeping the findmnt-derived one too as belt-and-braces.
-    local -A live_disks=()
+# #554 — every disk backing the live boot medium, one /dev/<disk> per
+# line. The old inline code checked only ``findmnt -no SOURCE
+# /run/live/medium``; with ``boot=live toram`` (or a layout that unmounts
+# the medium) that returns empty, so the boot USB — an ``sd*`` device the
+# ``grep -vE "^(sr|loop|fd|ram|zram)"`` filter does NOT exclude —
+# appeared as a wipe target and picking it destroyed the running install
+# media mid-install. Scan /proc/mounts for every /run/live // /lib/live
+# mount and map each source back to its parent disk, keeping the
+# findmnt-derived one too as belt-and-braces.
+#
+# Split out of pick_disk (issue #581) so the pre-wipe guard in do_install
+# applies the SAME exclusion to a preseeded target_disk, which never goes
+# through the picker. One implementation, so the two can't drift.
+_live_boot_disks() {
     local _src _mnt _rest _pk
     while read -r _src _mnt _rest; do
         case "$_mnt" in
@@ -402,20 +406,36 @@ pick_disk() {
                     /dev/*)
                         _pk=$(lsblk -no PKNAME "$_src" 2>/dev/null | head -n1)
                         [ -z "$_pk" ] && _pk=$(basename "$_src")
-                        [ -n "$_pk" ] && live_disks["/dev/$_pk"]=1
+                        [ -n "$_pk" ] && echo "/dev/$_pk"
                         ;;
                 esac
                 ;;
         esac
-    done < /proc/mounts
-    local live_src
+    done < "$PROC_MOUNTS"
+    local live_src live_disk
     live_src=$(findmnt -no SOURCE /run/live/medium 2>/dev/null || \
                findmnt -no SOURCE /lib/live/mount/medium 2>/dev/null || true)
     if [ -n "$live_src" ]; then
-        local live_disk
         live_disk=$(lsblk -no PKNAME "$live_src" 2>/dev/null | head -n1 || true)
-        [ -n "$live_disk" ] && live_disks["/dev/$live_disk"]=1
+        [ -n "$live_disk" ] && echo "/dev/$live_disk"
     fi
+}
+
+pick_disk() {
+    log "Step: pick_disk"
+    if [ -n "${PRESEED_HAS_DISK:-}" ]; then
+        # Skipping the picker also skips its live-medium exclusion and
+        # size floor — _assert_safe_wipe_target re-applies both (plus the
+        # whole-disk check) immediately before the wipe (#581).
+        log "Preseed: target_disk=$TARGET_DISK (confirm_wipe authorised; skipping picker — pre-wipe guard still applies)"
+        return 0
+    fi
+    local options=()
+    local -A live_disks=()
+    local _d
+    while IFS= read -r _d; do
+        [ -n "$_d" ] && live_disks["$_d"]=1
+    done < <(_live_boot_disks)
 
     while IFS= read -r line; do
         local name size model
@@ -641,17 +661,26 @@ ask_user_password() {
         return 0
     fi
 
+    # Tracing OFF for the whole prompt loop (issue #581). The preseed
+    # path already suppressed set -x around the secret env (load_preseed)
+    # and around chpasswd (do_install), but the INTERACTIVE path did not:
+    # `ADMIN_PASSWORD="$p1"` and `[ "$p1" = "$p2" ]` are argv, so xtrace
+    # wrote the operator's plaintext password into the trace log — which
+    # on_failure tails 30 lines of to the console on any non-zero exit.
+    # Re-enabled at the end of the loop on EVERY exit path (both `return
+    # 1`s restore it first).
+    { set +x; } 2>/dev/null
     while true; do
         local p1 p2
         p1=$(whiptail --backtitle "$BACKTITLE" --title "Admin password" \
             --cancel-button "Back" \
             --passwordbox "Password for '$ADMIN_USER' (and root):" 10 60 \
             3>&1 1>&2 2>&3) \
-            || return 1
+            || { set -x; return 1; }
         p2=$(whiptail --backtitle "$BACKTITLE" --title "Confirm password" \
             --cancel-button "Back" \
             --passwordbox "Repeat:" 10 60 3>&1 1>&2 2>&3) \
-            || return 1
+            || { set -x; return 1; }
         if [ "$p1" = "$p2" ] && [ -n "$p1" ]; then
             ADMIN_PASSWORD="$p1"
             break
@@ -660,6 +689,7 @@ ask_user_password() {
             --msgbox "Passwords don't match or are empty. Try again." 8 50 \
             || true
     done
+    set -x
 }
 
 # #554 — validate the static-IP fields with Python's ``ipaddress`` (same
@@ -1027,7 +1057,78 @@ partition_node() {
     esac
 }
 
+# Last-line defence immediately before the irreversible wipe (issue
+# #581). Everything below is re-checked here rather than trusted from
+# whichever path set TARGET_DISK, because the two paths do NOT validate
+# equally:
+#
+#   * interactive — pick_disk builds the menu from lsblk minus the live
+#     boot disks and enforces the size floor in its pick-and-validate
+#     loop, so the value is already known-good.
+#   * preseed — pick_disk returns EARLY on PRESEED_HAS_DISK and never
+#     runs any of that. The parser checks the disk exists, is a whole
+#     disk, and clears the size floor, but it has NO notion of the live
+#     boot medium: a preseed naming the install USB reintroduced exactly
+#     the #554 "wipe the media you are booted from" failure through the
+#     preseed door, mid-install and unattended.
+#
+# Re-validating for BOTH paths also covers the gap between validation
+# and use — the parser ran before NetworkManager and udev settled, and
+# on a bare sdX name (which the parser explicitly permits, only noting
+# the risk) the device can renumber onto a different physical disk in
+# between.
+#
+# Aborts via preseed_halt on an unattended run (loud, non-zero, no
+# guessing) and via a whiptail message + on_cancel when there is an
+# operator to tell.
+_assert_safe_wipe_target() {
+    local why="" real
+    real=$(readlink -f "$TARGET_DISK" 2>/dev/null || echo "$TARGET_DISK")
+
+    if [ -z "$TARGET_DISK" ]; then
+        why="No target disk was selected."
+    elif [ ! -b "$real" ]; then
+        why="Target disk $TARGET_DISK ($real) is not a block device."
+    elif [ ! -d "/sys/block/$(basename "$real")" ]; then
+        why="Target disk $TARGET_DISK resolves to $real, which is a partition, not a whole disk."
+    else
+        local _d
+        while IFS= read -r _d; do
+            [ -z "$_d" ] && continue
+            if [ "$(readlink -f "$_d" 2>/dev/null || echo "$_d")" = "$real" ]; then
+                why="Target disk $TARGET_DISK ($real) is the live install medium this installer is running from. Wiping it would destroy the running system mid-install."
+                break
+            fi
+        done < <(_live_boot_disks)
+    fi
+
+    if [ -z "$why" ]; then
+        local bytes min
+        bytes=$(blockdev --getsize64 "$real" 2>/dev/null || echo 0)
+        min=$((MIN_DISK_GIB * 1024 * 1024 * 1024))
+        if [ "$bytes" -lt "$min" ]; then
+            why="Target disk $TARGET_DISK is $((bytes / 1024 / 1024 / 1024)) GiB — below the ${MIN_DISK_GIB} GiB minimum for the A/B partition layout."
+        fi
+    fi
+
+    [ -z "$why" ] && { log "Pre-wipe guard OK: $TARGET_DISK ($real)"; return 0; }
+
+    log "Pre-wipe guard REFUSED $TARGET_DISK: $why"
+    if [ "$FULLY_UNATTENDED" = "1" ]; then
+        preseed_halt "Refusing to wipe the preseeded target disk:"$'\n\n'"$why"
+    fi
+    set +x
+    whiptail --backtitle "$BACKTITLE" --title "Unsafe target disk" \
+        --msgbox "$why"$'\n\n'"Nothing has been written. Pick a different disk." 14 72 \
+        || true
+    on_cancel "pre-wipe safety check ($TARGET_DISK)"
+}
+
 do_install() {
+    # Re-validate the wipe target before anything destructive (#581).
+    # Runs BEFORE `set -e` so its own probes can fail harmlessly.
+    _assert_safe_wipe_target
+
     # Now we're past all the prompts — enable -e so any failure
     # inside the partitioning / rsync / chroot block aborts cleanly
     # and the EXIT trap drops the operator to a shell with the log.
@@ -1938,6 +2039,70 @@ _fetch_preseed_url() {
     return 1
 }
 
+# Optional integrity pin for a cmdline preseed URL (issue #581):
+#   spatium.preseed.sha256=<64 hex>
+# Read once, here, so both the scheme gate and the post-fetch verify use
+# the same value.
+_preseed_url_sha256() {
+    sed -n 's/.*spatium\.preseed\.sha256=\([0-9a-fA-F]*\).*/\1/p' \
+        "$PROC_CMDLINE" 2>/dev/null | tr 'A-F' 'a-f'
+}
+
+# Integrity gate for the kernel-cmdline URL transport (issue #581).
+#
+# The URL transport is the ONE preseed source that arrives over the
+# network from a party we cannot authenticate: file / CIDATA transports
+# are physically attached, but a PXE/IPMI-supplied `spatium.preseed=`
+# URL is fetched over whatever the DHCP-advertised path offers. That
+# answer file carries `confirm_wipe: true` and a `target_disk` — so
+# whoever controls the bytes on the wire controls a full unattended disk
+# wipe, the admin password, and (appliance role) the pairing code that
+# enrols the box into a control plane. Plain http gives an on-path
+# attacker all three for free.
+#
+# Accept a URL only when its integrity is established one of two ways:
+#   * https:// — TLS authenticates the origin and protects the body.
+#   * a sha256 pin on the cmdline — content-addressed, so the transport
+#     no longer has to be trusted (this is the escape hatch for the
+#     air-gapped / internal-CA PXE setups where https isn't practical).
+# A sha256 pin is verified whenever it is supplied, https or not.
+#
+# Returns 0 to proceed with $1 (the URL), 1 to refuse it.
+_preseed_url_allowed() {
+    local url="$1" pin
+    pin=$(_preseed_url_sha256)
+    case "$url" in
+        https://*) return 0 ;;
+    esac
+    if [ -n "$pin" ]; then
+        log "Preseed: plain-http URL accepted — pinned to sha256 $pin"
+        return 0
+    fi
+    return 1
+}
+
+# Verify a fetched preseed against the cmdline sha256 pin, if one was
+# given. Returns 0 when there is no pin (nothing to check) or the digest
+# matches; 1 on mismatch or when no sha256 tool is available to check a
+# pin that WAS supplied (fail closed — a pin the installer cannot verify
+# must not be treated as verified).
+_preseed_url_verified() {
+    local file="$1" pin got
+    pin=$(_preseed_url_sha256)
+    [ -n "$pin" ] || return 0
+    if ! command -v sha256sum >/dev/null 2>&1; then
+        log "Preseed: sha256 pin supplied but sha256sum is unavailable — refusing"
+        return 1
+    fi
+    got=$(sha256sum "$file" 2>/dev/null | awk '{print $1}')
+    if [ "$got" = "$pin" ]; then
+        log "Preseed: sha256 pin verified ($got)"
+        return 0
+    fi
+    log "Preseed: sha256 MISMATCH — expected $pin, got ${got:-<unreadable>}"
+    return 1
+}
+
 # Append a discovered candidate to the parallel arrays.
 #   $1 local file path, $2 human source description, $3 kind
 _add_preseed_cand() {
@@ -1957,13 +2122,51 @@ _add_preseed_cand() {
 # Returns 0 if at least one candidate was found; 1 otherwise.
 discover_preseed() {
     local cmdval
-    cmdval=$(sed -n 's/.*spatium\.preseed=\([^ ]*\).*/\1/p' /proc/cmdline 2>/dev/null)
+    cmdval=$(sed -n 's/.*spatium\.preseed=\([^ ]*\).*/\1/p' "$PROC_CMDLINE" 2>/dev/null)
     if [ -n "$cmdval" ]; then
         case "$cmdval" in
             http://*|https://*)
                 local dest=/run/spatium-cand-cmdline.yaml
+                # Integrity gate BEFORE the fetch (issue #581) — refuse
+                # an unauthenticated source outright rather than pulling
+                # it and hoping. Halt rather than silently dropping to
+                # the interactive wizard: the operator explicitly asked
+                # for a headless install from this URL, and a fleet
+                # rollout that quietly waits at a whiptail prompt looks
+                # identical to one that hung.
+                if ! _preseed_url_allowed "$cmdval"; then
+                    PRESEED_SOURCE="kernel cmdline URL $cmdval"
+                    preseed_halt \
+"Refusing preseed URL over plain http with no integrity pin:
+
+  $cmdval
+
+An answer file authorises an unattended disk wipe and carries the
+admin password (and, for the appliance role, the pairing code), so
+it must come from a source that cannot be tampered with in transit.
+
+Use either:
+  * an https:// URL, or
+  * spatium.preseed.sha256=<64-hex-digest> on the kernel cmdline
+    alongside spatium.preseed=<url>  (content-pinned, so plain
+    http is fine — for air-gapped / internal-CA PXE setups)"
+                fi
                 if _fetch_preseed_url "$cmdval" "$dest"; then
-                    _add_preseed_cand "$dest" "kernel cmdline URL $cmdval" explicit
+                    if _preseed_url_verified "$dest"; then
+                        _add_preseed_cand "$dest" "kernel cmdline URL $cmdval" explicit
+                    else
+                        rm -f "$dest"
+                        PRESEED_SOURCE="kernel cmdline URL $cmdval"
+                        preseed_halt \
+"Preseed URL failed its sha256 integrity check:
+
+  $cmdval
+
+The fetched answer file does not match the spatium.preseed.sha256
+digest on the kernel cmdline. The install has stopped rather than
+act on content that may have been modified in transit.
+See $INSTALL_LOG for the expected and actual digests."
+                    fi
                 else
                     log "Preseed: gave up fetching $cmdval from cmdline after retries"
                 fi
