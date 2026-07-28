@@ -38,7 +38,7 @@ class ListConformityPoliciesArgs(BaseModel):
     )
     target_kind: str | None = Field(
         default=None,
-        description="Filter to one target kind (``subnet`` / ``ip_address`` / ``dns_zone`` / ``dhcp_scope`` / ``platform``).",
+        description="Filter to one target kind (``subnet`` / ``ip_address`` / ``dns_zone`` / ``dhcp_scope`` / ``multicast_group`` / ``platform``).",
     )
     limit: int = Field(default=200, ge=1, le=500)
 

@@ -45,7 +45,9 @@ router = APIRouter()
 
 CONFORMITY_RESOURCE = "conformity"
 
-_TARGET_KINDS = frozenset({"platform", "subnet", "ip_address", "dns_zone", "dhcp_scope"})
+_TARGET_KINDS = frozenset(
+    {"platform", "subnet", "ip_address", "dns_zone", "dhcp_scope", "multicast_group"}
+)
 _SEVERITIES = frozenset({"info", "warning", "critical"})
 _STATUSES = frozenset({"pass", "fail", "warn", "not_applicable"})
 

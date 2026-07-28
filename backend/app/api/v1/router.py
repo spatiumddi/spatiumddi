@@ -19,7 +19,9 @@ from app.api.v1.asns import router as asns_router
 from app.api.v1.audit.router import router as audit_router
 from app.api.v1.auth.router import router as auth_router
 from app.api.v1.auth_providers.router import router as auth_providers_router
+from app.api.v1.av import router as av_router
 from app.api.v1.backup import router as backup_router
+from app.api.v1.bacnet import router as bacnet_router
 from app.api.v1.bgp import router as bgp_router
 from app.api.v1.block_sync import router as block_sync_router
 from app.api.v1.change_requests import router as change_requests_router
@@ -61,6 +63,7 @@ from app.api.v1.network import router as network_router
 from app.api.v1.new_devices import router as new_devices_router
 from app.api.v1.nmap import router as nmap_router
 from app.api.v1.opnsense import router as opnsense_router
+from app.api.v1.ot import router as ot_router
 from app.api.v1.overlays import router as overlays_router
 from app.api.v1.ownership import (
     customers_router,
@@ -145,7 +148,23 @@ api_v1_router.include_router(auth_router, prefix="/auth", tags=["auth"])
 api_v1_router.include_router(
     auth_providers_router, prefix="/auth-providers", tags=["auth-providers"]
 )
+# Vertical-awareness surfaces (#543): AV (#540), BACnet (#541), OT (#542).
+# NO wake_publishing on any of the three — they enrich multicast / IPAM rows
+# and touch neither the DNS nor the DHCP ConfigBundle, so there is no parked
+# agent long-poll to wake (same reasoning as the netbox_import include below).
+api_v1_router.include_router(
+    av_router,
+    prefix="/av",
+    tags=["av"],
+    dependencies=[Depends(require_module("network.av"))],
+)
 api_v1_router.include_router(backup_router, prefix="/backup", tags=["backup"])
+api_v1_router.include_router(
+    bacnet_router,
+    prefix="/bacnet",
+    tags=["bacnet"],
+    dependencies=[Depends(require_module("network.bacnet"))],
+)
 api_v1_router.include_router(
     bgp_router,
     prefix="/bgp",
@@ -358,6 +377,13 @@ api_v1_router.include_router(
     prefix="/opnsense",
     tags=["opnsense"],
     dependencies=[Depends(require_module("integrations.opnsense"))],
+)
+# OT / industrial devices (#542). No wake_publishing — see the /av include.
+api_v1_router.include_router(
+    ot_router,
+    prefix="/ot",
+    tags=["ot"],
+    dependencies=[Depends(require_module("network.ot"))],
 )
 api_v1_router.include_router(
     overlays_router,

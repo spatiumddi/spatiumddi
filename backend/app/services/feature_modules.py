@@ -125,6 +125,30 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         group="Network",
         description="Multicast group registry — addresses + producer/consumer memberships for SMPTE 2110 / Dante / NDI / market-data deployments. Niche but high-value when operators need it.",
     ),
+    # Vertical-awareness modules (#543). All three are registry-only in
+    # phase 1 — no probes, no device I/O, no off-prem calls — so they are
+    # default-ENABLED for discovery (non-negotiable #13/#14): an operator
+    # can't turn on what they never knew shipped, and there is nothing to
+    # blast-radius here. AV rides the existing multicast plane; BACnet and
+    # OT enrich existing IPAM addresses.
+    ModuleSpec(
+        id="network.av",
+        label="AV over IP",
+        group="Network",
+        description="Audio/video-over-IP descriptors on top of the multicast registry — Dante / AES67 / SMPTE ST 2110 / NDI / RAVENNA flow labels, PTP clock domain, and operator-declared reserved ranges so allocations can be checked against the studio address plan. Registry only; no media monitoring, no NMOS connection control.",
+    ),
+    ModuleSpec(
+        id="network.bacnet",
+        label="BACnet/IP devices",
+        group="Network",
+        description="Building-automation device registry — internetwork-unique device instance numbers, BACnet network numbers, and per-subnet BBMD designation, each attached to an existing IPAM address. Documents the BACnet topology (including the exactly-one-BBMD-per-subnet rule); never reads or writes device objects.",
+    ),
+    ModuleSpec(
+        id="network.ot",
+        label="OT / industrial devices",
+        group="Network",
+        description="Industrial device descriptors and Purdue-level zoning for OT networks — PROFINET / EtherNet-IP / Modbus TCP / OPC UA role + vendor + criticality per address, per-subnet zone records, and CSV import of engineering-tool exports. Read-only identification: no tag reads, no control-protocol writes, ever.",
+    ),
     # BGP Looking Glass (#566) — a receive-only GoBGP collector peers with the
     # operator's routers and mirrors the live Adj-RIB-In, linking every learned
     # prefix / origin ASN / community back into IPAM. Default-ENABLED for

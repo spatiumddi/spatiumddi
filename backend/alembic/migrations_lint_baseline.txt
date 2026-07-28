@@ -597,6 +597,11 @@ backend/alembic/versions/e4c1a8f63b29_dhcp_scope_v6_mode.py:drop_column:61
 backend/alembic/versions/e4d8c2a91f7b_phone_profiles.py:drop_table:100
 backend/alembic/versions/e4d8c2a91f7b_phone_profiles.py:drop_table:98
 backend/alembic/versions/e5a18c40729b_ai_tool_catalog.py:drop_column:47
+backend/alembic/versions/e5a1c39d78b2_vertical_awareness_modules.py:drop_table:365
+backend/alembic/versions/e5a1c39d78b2_vertical_awareness_modules.py:drop_table:370
+backend/alembic/versions/e5a1c39d78b2_vertical_awareness_modules.py:drop_table:376
+backend/alembic/versions/e5a1c39d78b2_vertical_awareness_modules.py:drop_table:381
+backend/alembic/versions/e5a1c39d78b2_vertical_awareness_modules.py:drop_table:385
 backend/alembic/versions/e5a3f17b2d8c_device_profiling_phase2.py:drop_column:108
 backend/alembic/versions/e5a3f17b2d8c_device_profiling_phase2.py:drop_column:109
 backend/alembic/versions/e5a3f17b2d8c_device_profiling_phase2.py:drop_column:110

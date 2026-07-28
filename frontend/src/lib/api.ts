@@ -8548,7 +8548,8 @@ export type ConformityTargetKind =
   | "subnet"
   | "ip_address"
   | "dns_zone"
-  | "dhcp_scope";
+  | "dhcp_scope"
+  | "multicast_group";
 export type ConformityStatus = "pass" | "fail" | "warn" | "not_applicable";
 export type ConformitySeverity = "info" | "warning" | "critical";
 
@@ -16881,5 +16882,631 @@ export const blockSyncApi = {
         `/block-sync/targets/${targetKind}/${targetId}/reveal`,
         { password, totp_code: totpCode },
       )
+      .then((r) => r.data),
+};
+
+// ── Vertical network awareness (issue #543) ──────────────────────────
+//
+// Three sibling registries that annotate rows the platform already
+// owns rather than introducing a parallel inventory:
+//
+//   * AV over IP (#540)  — a 1:1 sidecar on a ``multicast_group``,
+//     plus operator-declared reserved ranges per protocol.
+//   * BACnet/IP (#541)   — building-automation devices anchored to an
+//     IPAM address, keyed by an internetwork-unique device instance.
+//   * OT / industrial (#542) — a 1:1 sidecar on an IPAM address, plus
+//     one Purdue zone per subnet.
+//
+// Each family sits behind its own default-on feature module
+// (``network.av`` / ``network.bacnet`` / ``network.ot``), so callers
+// must gate their queries on ``ready && enabled(id)`` from
+// ``useFeatureModules`` — the routers 404 when the module is off.
+//
+// None of these surfaces talk to a device: every value is operator-
+// entered or imported. There is no probe, scan or control-protocol
+// write anywhere behind them.
+
+// ── AV over IP (#540) ────────────────────────────────────────────────
+
+export type AVProtocol =
+  | "dante"
+  | "aes67"
+  | "smpte2110_video"
+  | "smpte2110_audio"
+  | "smpte2110_anc"
+  | "ndi"
+  | "ravenna"
+  | "other";
+
+export type AVFlowSource = "manual" | "mdns" | "nmos";
+
+export interface AVReservedRange {
+  id: string;
+  space_id: string;
+  cidr: string;
+  av_protocol: string;
+  name: string;
+  description: string;
+  /** Exclusive ranges conflict with other protocols; shared ones only advise. */
+  exclusive: boolean;
+  vlan_id: string | null;
+  tags: Record<string, unknown>;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface AVReservedRangeCreate {
+  space_id: string;
+  cidr: string;
+  av_protocol: AVProtocol;
+  name?: string;
+  description?: string;
+  exclusive?: boolean;
+  vlan_id?: string | null;
+  tags?: Record<string, unknown>;
+}
+
+/** Partial update. ``space_id`` is intentionally absent — re-homing a
+ *  range to another IPSpace is a delete + create on the backend. */
+export interface AVReservedRangeUpdate {
+  cidr?: string;
+  av_protocol?: AVProtocol;
+  name?: string;
+  description?: string;
+  exclusive?: boolean;
+  vlan_id?: string | null;
+  tags?: Record<string, unknown>;
+}
+
+export interface AVFlow {
+  id: string;
+  group_id: string;
+  av_protocol: string;
+  av_flow_label: string;
+  /** PTP (IEEE 1588) clock domain, 0–255. ``null`` is the finding the
+   *  ``av_flow_no_ptp_domain`` conformity check surfaces. */
+  ptp_domain: number | null;
+  seen_via: string;
+  notes: string;
+  custom_fields: Record<string, unknown>;
+  created_at: string;
+  modified_at: string;
+  // Denormalised from the parent multicast group.
+  group_address: string;
+  group_name: string;
+  group_application: string;
+  space_id: string;
+  vlan_id: string | null;
+}
+
+export interface AVFlowListResponse {
+  items: AVFlow[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+/** Full-document upsert (``PUT /av/flows/{group_id}``): an omitted
+ *  ``ptp_domain`` clears the stored one rather than leaving it alone. */
+export interface AVFlowUpsert {
+  av_protocol: AVProtocol;
+  av_flow_label?: string;
+  ptp_domain?: number | null;
+  seen_via?: AVFlowSource;
+  notes?: string;
+  custom_fields?: Record<string, unknown>;
+}
+
+export interface AVFlowListQuery {
+  limit?: number;
+  offset?: number;
+  av_protocol?: string;
+  ptp_domain?: number;
+  space_id?: string;
+  vlan_id?: string;
+  q?: string;
+}
+
+export interface AVReservedRangeMatch {
+  range_id: string;
+  cidr: string;
+  av_protocol: string;
+  exclusive: boolean;
+  name: string;
+  /** ``inside`` when wholly within the range, ``overlaps`` when it straddles. */
+  relation: string;
+}
+
+export interface AVAllocationPreviewRequest {
+  space_id: string;
+  address_or_cidr: string;
+  av_protocol: AVProtocol;
+}
+
+export interface AVAllocationPreviewResponse {
+  space_id: string;
+  target: string;
+  av_protocol: string;
+  /** ``ok`` | ``informational`` | ``conflict``. */
+  status: string;
+  conflicts: AVReservedRangeMatch[];
+  advisories: AVReservedRangeMatch[];
+  own_ranges: AVReservedRangeMatch[];
+  outside_declared_range: boolean;
+  suggested_range: string | null;
+  detail: string;
+}
+
+export interface AVProtocolPreset {
+  av_protocol: string;
+  label: string;
+  /** ``null`` where the protocol has no vendor default (SMPTE 2110, NDI). */
+  default_cidr: string | null;
+}
+
+export interface AVPresetsResponse {
+  protocols: AVProtocolPreset[];
+  flow_sources: string[];
+  ptp_domain_min: number;
+  ptp_domain_max: number;
+}
+
+export const avApi = {
+  listReservedRanges: (params?: {
+    space_id?: string;
+    av_protocol?: string;
+    vlan_id?: string;
+    exclusive?: boolean;
+    tag?: string[];
+  }) =>
+    api
+      .get<AVReservedRange[]>("/av/reserved-ranges", { params })
+      .then((r) => r.data),
+  createReservedRange: (data: AVReservedRangeCreate) =>
+    api.post<AVReservedRange>("/av/reserved-ranges", data).then((r) => r.data),
+  updateReservedRange: (id: string, data: AVReservedRangeUpdate) =>
+    api
+      .put<AVReservedRange>(`/av/reserved-ranges/${id}`, data)
+      .then((r) => r.data),
+  removeReservedRange: (id: string) => api.delete(`/av/reserved-ranges/${id}`),
+
+  listFlows: (params?: AVFlowListQuery) =>
+    api.get<AVFlowListResponse>("/av/flows", { params }).then((r) => r.data),
+  // Keyed on the multicast group id, not the profile id — the caller is
+  // looking at a group and declaring "this is a Dante flow".
+  upsertFlow: (groupId: string, data: AVFlowUpsert) =>
+    api.put<AVFlow>(`/av/flows/${groupId}`, data).then((r) => r.data),
+  // Drops the AV identity; the multicast group itself survives.
+  removeFlow: (groupId: string) => api.delete(`/av/flows/${groupId}`),
+
+  allocationPreview: (data: AVAllocationPreviewRequest) =>
+    api
+      .post<AVAllocationPreviewResponse>("/av/allocation-preview", data)
+      .then((r) => r.data),
+  presets: () => api.get<AVPresetsResponse>("/av/presets").then((r) => r.data),
+};
+
+// ── BACnet/IP devices (#541) ─────────────────────────────────────────
+
+export type BACnetSegmentation =
+  | "both"
+  | "transmit"
+  | "receive"
+  | "no-segmentation";
+
+export type BACnetDeviceSource = "manual" | "whois" | "mirror" | "import";
+
+export interface BACnetDevice {
+  id: string;
+  ip_address_id: string;
+  subnet_id: string | null;
+  /** Joined from the IPAM anchor so a list row needs no second request. */
+  address: string | null;
+  hostname: string | null;
+  /** Unique across the whole BACnet internetwork — the identifier
+   *  operators actually search by. */
+  device_instance: number;
+  vendor_id: number | null;
+  vendor_name: string;
+  /** ASHRAE vendor-id lookup, falling back to ``vendor_name``. */
+  vendor_label: string | null;
+  device_name: string;
+  model_name: string;
+  firmware_rev: string;
+  location: string;
+  max_apdu: number | null;
+  segmentation_supported: string | null;
+  network_number: number | null;
+  udp_port: number;
+  is_bbmd: boolean;
+  is_foreign_device: boolean;
+  bdt: unknown[];
+  fdt: unknown[];
+  seen_via: string;
+  last_seen_at: string | null;
+  notes: string;
+  tags: Record<string, unknown>;
+  custom_fields: Record<string, unknown>;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface BACnetDeviceCreate {
+  ip_address_id: string;
+  device_instance: number;
+  vendor_id?: number | null;
+  vendor_name?: string;
+  device_name?: string;
+  model_name?: string;
+  firmware_rev?: string;
+  location?: string;
+  max_apdu?: number | null;
+  segmentation_supported?: BACnetSegmentation | null;
+  network_number?: number | null;
+  udp_port?: number;
+  is_bbmd?: boolean;
+  is_foreign_device?: boolean;
+  bdt?: unknown[];
+  fdt?: unknown[];
+  seen_via?: BACnetDeviceSource;
+  last_seen_at?: string | null;
+  notes?: string;
+  tags?: Record<string, unknown>;
+  custom_fields?: Record<string, unknown>;
+}
+
+/** PATCH body. ``ip_address_id`` is re-parentable — a readdressed
+ *  controller keeps its device instance and moves to the new IPAM row. */
+export interface BACnetDeviceUpdate {
+  ip_address_id?: string;
+  device_instance?: number;
+  vendor_id?: number | null;
+  vendor_name?: string;
+  device_name?: string;
+  model_name?: string;
+  firmware_rev?: string;
+  location?: string;
+  max_apdu?: number | null;
+  segmentation_supported?: BACnetSegmentation | null;
+  network_number?: number | null;
+  udp_port?: number;
+  is_bbmd?: boolean;
+  is_foreign_device?: boolean;
+  bdt?: unknown[];
+  fdt?: unknown[];
+  seen_via?: BACnetDeviceSource;
+  last_seen_at?: string | null;
+  notes?: string;
+  tags?: Record<string, unknown>;
+  custom_fields?: Record<string, unknown>;
+}
+
+export interface BACnetDeviceListResponse {
+  items: BACnetDevice[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface BACnetDeviceListQuery {
+  limit?: number;
+  offset?: number;
+  subnet_id?: string;
+  ip_address_id?: string;
+  vendor_id?: number;
+  is_bbmd?: boolean;
+  seen_via?: BACnetDeviceSource;
+  q?: string;
+}
+
+/** One Broadcast Distribution Device with the subnet it serves.
+ *  ``subnet_id`` repeats when a subnet has two BBMDs — the
+ *  misconfiguration this list exists to make visible. */
+export interface BACnetBBMD {
+  id: string;
+  ip_address_id: string;
+  address: string | null;
+  device_instance: number;
+  device_name: string;
+  vendor_label: string | null;
+  udp_port: number;
+  subnet_id: string | null;
+  subnet_network: string | null;
+  subnet_name: string | null;
+  bdt_entries: number;
+  fdt_entries: number;
+  last_seen_at: string | null;
+}
+
+export interface BACnetNextInstance {
+  start: number;
+  /** ``null`` when every number from ``start`` upwards is taken. */
+  device_instance: number | null;
+}
+
+export const bacnetApi = {
+  listDevices: (params?: BACnetDeviceListQuery) =>
+    api
+      .get<BACnetDeviceListResponse>("/bacnet/devices", { params })
+      .then((r) => r.data),
+  getDevice: (id: string) =>
+    api.get<BACnetDevice>(`/bacnet/devices/${id}`).then((r) => r.data),
+  createDevice: (data: BACnetDeviceCreate) =>
+    api.post<BACnetDevice>("/bacnet/devices", data).then((r) => r.data),
+  updateDevice: (id: string, data: BACnetDeviceUpdate) =>
+    api.patch<BACnetDevice>(`/bacnet/devices/${id}`, data).then((r) => r.data),
+  removeDevice: (id: string) => api.delete(`/bacnet/devices/${id}`),
+
+  listBbmds: () => api.get<BACnetBBMD[]>("/bacnet/bbmds").then((r) => r.data),
+  // 404 = "this IP isn't a BACnet device" — a normal answer, not a failure.
+  byAddress: (ipAddressId: string) =>
+    api
+      .get<BACnetDevice>(`/bacnet/by-address/${ipAddressId}`)
+      .then((r) => r.data),
+  nextInstance: (start?: number) =>
+    api
+      .get<BACnetNextInstance>("/bacnet/next-instance", {
+        params: start === undefined ? undefined : { start },
+      })
+      .then((r) => r.data),
+};
+
+// ── OT / industrial devices (#542) ───────────────────────────────────
+
+export type OTProtocol =
+  | "profinet"
+  | "ethernet_ip"
+  | "modbus_tcp"
+  | "opc_ua"
+  | "s7comm"
+  | "bacnet_ip"
+  | "dnp3"
+  | "iec61850"
+  | "other";
+
+export type OTRole =
+  | "plc"
+  | "io_device"
+  | "hmi"
+  | "drive"
+  | "gateway"
+  | "sensor"
+  | "historian"
+  | "ews"
+  | "switch"
+  | "other";
+
+export type OTDeviceSource =
+  | "manual"
+  | "import"
+  | "enip"
+  | "dcp"
+  | "modbus"
+  | "opcua"
+  | "profiling";
+
+/** Purdue model level. Travels the wire as a canonical **string** because
+ *  3.5 (the manufacturing / enterprise DMZ) is a real level and the column
+ *  is ``Numeric(2, 1)`` — never parse it as a JS number for display. */
+export type PurdueLevel = "0" | "1" | "2" | "3" | "3.5" | "4" | "5";
+
+export interface OTDevice {
+  id: string;
+  ip_address_id: string;
+  /** Joined from the IPAM anchor — an OT inventory is read by IP first. */
+  address: string;
+  subnet_id: string;
+  ot_protocol: string;
+  ot_role: string | null;
+  profinet_device_name: string;
+  ot_vendor: string;
+  ot_product: string;
+  ot_serial: string;
+  firmware_rev: string;
+  /** Canonical string ("3.5"), not a number — see ``PurdueLevel``. */
+  purdue_level: string | null;
+  cell_area: string;
+  seen_via: string;
+  last_seen_at: string | null;
+  notes: string;
+  tags: Record<string, unknown>;
+  custom_fields: Record<string, unknown>;
+  created_at: string;
+  modified_at: string;
+}
+
+/** By-address view: the descriptor plus its zone verdict.
+ *  ``purdue_mismatch`` is tri-state — ``null`` when either the device or
+ *  its zone has no declared level, because an unknown is not a violation. */
+export interface OTDeviceDescriptor extends OTDevice {
+  zone_id: string | null;
+  zone_name: string;
+  zone_cell_area: string;
+  zone_purdue_level: string | null;
+  purdue_mismatch: boolean | null;
+}
+
+export interface OTDeviceCreate {
+  ip_address_id: string;
+  ot_protocol: OTProtocol;
+  ot_role?: OTRole | null;
+  profinet_device_name?: string;
+  ot_vendor?: string;
+  ot_product?: string;
+  ot_serial?: string;
+  firmware_rev?: string;
+  purdue_level?: PurdueLevel | null;
+  cell_area?: string;
+  seen_via?: OTDeviceSource;
+  last_seen_at?: string | null;
+  notes?: string;
+  tags?: Record<string, unknown>;
+  custom_fields?: Record<string, unknown>;
+}
+
+/** Partial update. ``ip_address_id`` is absent on purpose — the descriptor
+ *  *is* the OT identity of one address; moving it is a delete + create. */
+export interface OTDeviceUpdate {
+  ot_protocol?: OTProtocol;
+  ot_role?: OTRole | null;
+  profinet_device_name?: string;
+  ot_vendor?: string;
+  ot_product?: string;
+  ot_serial?: string;
+  firmware_rev?: string;
+  purdue_level?: PurdueLevel | null;
+  cell_area?: string;
+  seen_via?: OTDeviceSource;
+  last_seen_at?: string | null;
+  notes?: string;
+  tags?: Record<string, unknown>;
+  custom_fields?: Record<string, unknown>;
+}
+
+export interface OTDeviceListResponse {
+  items: OTDevice[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface OTDeviceListQuery {
+  limit?: number;
+  offset?: number;
+  ot_protocol?: string;
+  ot_role?: string;
+  purdue_level?: string;
+  cell_area?: string;
+  subnet_id?: string;
+  q?: string;
+  tag?: string[];
+}
+
+export interface OTZone {
+  id: string;
+  subnet_id: string;
+  subnet_network: string;
+  /** Canonical string, always present — a zone with no level is not a zone. */
+  purdue_level: string;
+  cell_area: string;
+  name: string;
+  description: string;
+  tags: Record<string, unknown>;
+  device_count: number;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface OTZoneCreate {
+  subnet_id: string;
+  purdue_level: PurdueLevel;
+  cell_area?: string;
+  name?: string;
+  description?: string;
+  tags?: Record<string, unknown>;
+}
+
+/** Partial update. ``subnet_id`` is absent — the zone is a property of its
+ *  subnet, so re-pointing it would mislabel two subnets in one PUT. */
+export interface OTZoneUpdate {
+  purdue_level?: PurdueLevel;
+  cell_area?: string;
+  name?: string;
+  description?: string;
+  tags?: Record<string, unknown>;
+}
+
+/** Which CSV header feeds which descriptor field. ``address`` is the only
+ *  required mapping; a mapped column missing from the file is a hard 422. */
+export interface OTDeviceImportColumnMap {
+  address: string;
+  ot_protocol?: string;
+  ot_role?: string;
+  profinet_device_name?: string;
+  ot_vendor?: string;
+  ot_product?: string;
+  ot_serial?: string;
+  firmware_rev?: string;
+  purdue_level?: string;
+  cell_area?: string;
+  notes?: string;
+}
+
+/** Same body for preview and commit — the server keeps no state between
+ *  the two calls, so there is no preview token to expire. */
+export interface OTDeviceImportRequest {
+  csv_text: string;
+  column_map: OTDeviceImportColumnMap;
+  delimiter?: "," | ";" | "\t" | "|";
+  default_ot_protocol?: OTProtocol | null;
+  default_cell_area?: string;
+  overwrite_existing?: boolean;
+  space_id?: string | null;
+}
+
+export interface OTDeviceImportRow {
+  line: number;
+  address: string;
+  action: "create" | "update" | "skip" | "error";
+  reason: string;
+  ip_address_id: string | null;
+  fields: Record<string, unknown>;
+}
+
+export interface OTDeviceImportPreviewResponse {
+  rows: OTDeviceImportRow[];
+  create_count: number;
+  update_count: number;
+  skip_count: number;
+  error_count: number;
+  max_rows: number;
+}
+
+export interface OTDeviceImportCommitResponse {
+  rows: OTDeviceImportRow[];
+  created: number;
+  updated: number;
+  skipped: number;
+  errors: number;
+  device_ids: string[];
+}
+
+export const otApi = {
+  listDevices: (params?: OTDeviceListQuery) =>
+    api
+      .get<OTDeviceListResponse>("/ot/devices", { params })
+      .then((r) => r.data),
+  getDevice: (id: string) =>
+    api.get<OTDevice>(`/ot/devices/${id}`).then((r) => r.data),
+  createDevice: (data: OTDeviceCreate) =>
+    api.post<OTDevice>("/ot/devices", data).then((r) => r.data),
+  updateDevice: (id: string, data: OTDeviceUpdate) =>
+    api.put<OTDevice>(`/ot/devices/${id}`, data).then((r) => r.data),
+  removeDevice: (id: string) => api.delete(`/ot/devices/${id}`),
+  // 404 = "this IP has no OT descriptor" — a normal answer, not a failure.
+  byAddress: (ipAddressId: string) =>
+    api
+      .get<OTDeviceDescriptor>(`/ot/by-address/${ipAddressId}`)
+      .then((r) => r.data),
+
+  listZones: (params?: { purdue_level?: string; cell_area?: string }) =>
+    api.get<OTZone[]>("/ot/zones", { params }).then((r) => r.data),
+  getZone: (id: string) =>
+    api.get<OTZone>(`/ot/zones/${id}`).then((r) => r.data),
+  zoneBySubnet: (subnetId: string) =>
+    api.get<OTZone>(`/ot/zones/by-subnet/${subnetId}`).then((r) => r.data),
+  createZone: (data: OTZoneCreate) =>
+    api.post<OTZone>("/ot/zones", data).then((r) => r.data),
+  updateZone: (id: string, data: OTZoneUpdate) =>
+    api.put<OTZone>(`/ot/zones/${id}`, data).then((r) => r.data),
+  removeZone: (id: string) => api.delete(`/ot/zones/${id}`),
+
+  importPreview: (data: OTDeviceImportRequest) =>
+    api
+      .post<OTDeviceImportPreviewResponse>("/ot/devices/import/preview", data)
+      .then((r) => r.data),
+  importCommit: (data: OTDeviceImportRequest) =>
+    api
+      .post<OTDeviceImportCommitResponse>("/ot/devices/import/commit", data)
       .then((r) => r.data),
 };

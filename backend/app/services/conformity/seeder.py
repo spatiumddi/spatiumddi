@@ -214,6 +214,124 @@ _BUILTIN_POLICIES: list[dict[str, object]] = [
         "check_kind": "no_lanwide_control_plane_ports",
         "check_args": {"stale_minutes": 30},
     },
+    # ── AV / Audio-Video-over-IP (issue #540) ───────────────────────
+    {
+        "name": "AV flows stay inside their declared multicast range",
+        "description": (
+            "Every AV flow (Dante / AES67 / SMPTE 2110 / NDI) sits inside a "
+            "reserved range declared for its protocol. Static multicast "
+            "assignment is the AoIP best practice, so a flow outside its "
+            "declared range is address drift worth catching. Not applicable "
+            "until the operator declares a range for that protocol — with "
+            "nothing declared there is nothing to check against."
+        ),
+        "framework": "custom",
+        "reference": None,
+        "severity": "warning",
+        "target_kind": "multicast_group",
+        "target_filter": {},
+        "check_kind": "av_flow_outside_reserved_range",
+        "check_args": {},
+    },
+    {
+        "name": "AV flows record their PTP clock domain",
+        "description": (
+            "Advisory. PTP misconfiguration is the most common AoIP failure "
+            "mode, and the clock domain is the first thing asked for when "
+            "audio drops. Warns rather than fails — a missing domain is "
+            "undocumented state, not a broken network."
+        ),
+        "framework": "custom",
+        "reference": None,
+        "severity": "info",
+        "target_kind": "multicast_group",
+        "target_filter": {},
+        "check_kind": "av_flow_no_ptp_domain",
+        "check_args": {},
+    },
+    # ── BACnet/IP building automation (issue #541) ──────────────────
+    {
+        "name": "Exactly one BACnet BBMD per subnet",
+        "description": (
+            "BACnet broadcasts do not cross IP routers, so each subnet in a "
+            "multi-subnet BACnet/IP internetwork needs exactly one Broadcast "
+            "Management Device. Zero leaves that subnet's devices invisible "
+            "across the internetwork; two or more duplicate broadcast "
+            "traffic and I-Am responses. Subnets with no BACnet devices are "
+            "not applicable."
+        ),
+        "framework": "custom",
+        "reference": "ASHRAE 135 Annex J",
+        "severity": "warning",
+        "target_kind": "subnet",
+        "target_filter": {},
+        "check_kind": "bbmd_one_per_subnet",
+        "check_args": {},
+    },
+    {
+        "name": "BACnet device instance numbers are unique",
+        "description": (
+            "Device instance numbers must be unique across the entire BACnet "
+            "internetwork. A database constraint already enforces this, so a "
+            "finding means rows arrived by a path that bypassed the ORM — a "
+            "restore from an older backup, or direct SQL."
+        ),
+        "framework": "custom",
+        "reference": "ASHRAE 135",
+        "severity": "critical",
+        "target_kind": "platform",
+        "target_filter": {},
+        "check_kind": "bacnet_duplicate_device_instance",
+        "check_args": {},
+    },
+    {
+        "name": "BACnet devices report a plausible vendor id",
+        "description": (
+            "Advisory. Vendor id 0 is legitimately ASHRAE itself, but on a "
+            "real plant a controller reporting 0 or nothing is usually "
+            "misconfigured, cloned, or counterfeit."
+        ),
+        "framework": "custom",
+        "reference": None,
+        "severity": "info",
+        "target_kind": "platform",
+        "target_filter": {},
+        "check_kind": "bacnet_vendor_id_unknown",
+        "check_args": {},
+    },
+    # ── Industrial / OT segmentation (issue #542) ───────────────────
+    {
+        "name": "OT devices match their subnet's Purdue level",
+        "description": (
+            "Purdue-model segmentation exists so a Level-1 controller does "
+            "not live in a Level-4 enterprise subnet. Fails when a device's "
+            "recorded level differs from the level its subnet is zoned for. "
+            "Not applicable when either level is unrecorded — unknown is "
+            "missing documentation, not a violation."
+        ),
+        "framework": "custom",
+        "reference": "ISA-95 / Purdue Enterprise Reference Architecture",
+        "severity": "warning",
+        "target_kind": "ip_address",
+        "target_filter": {},
+        "check_kind": "ot_device_crosses_purdue_boundary",
+        "check_args": {},
+    },
+    {
+        "name": "Subnets with OT devices declare an OT zone",
+        "description": (
+            "Advisory. Without a zone row the Purdue-boundary check has "
+            "nothing to compare against, so this is what explains an empty "
+            "segmentation report."
+        ),
+        "framework": "custom",
+        "reference": None,
+        "severity": "info",
+        "target_kind": "subnet",
+        "target_filter": {},
+        "check_kind": "ot_zone_missing_purdue_level",
+        "check_args": {},
+    },
 ]
 
 
