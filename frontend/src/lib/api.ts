@@ -8108,6 +8108,15 @@ export interface DNSClientWindow {
   beacon_score: number;
   beacon_candidates: DNSBeaconCandidate[];
   beacon_detail: string;
+  /**
+   * Domain-generation-algorithm score (#699). Structurally the inverse
+   * of tunneling — a tunnel concentrates subdomains under one parent,
+   * a DGA sprays across many — so the two never fire together.
+   */
+  dga_score: number;
+  dga_candidates: DNSDGACandidate[];
+  dga_signals: DNSTunnelSignal[];
+  dga_detail: string;
   allowlisted: boolean;
   server_count: number;
   /** An operator reviewed this client and cleared it (#699). */
@@ -8149,6 +8158,60 @@ export interface DNSBeaconCandidate {
   score: number;
 }
 
+/**
+ * One implausible registrable domain from a DGA crop. The domains
+ * matter more than the score: hashed-CDN buckets and shortlink
+ * services share the shape, so an operator needs to see which names
+ * actually scored before acting.
+ */
+export interface DNSDGACandidate {
+  parent: string;
+  label: string;
+  implausibility: number;
+  vowel_ratio: number;
+}
+
+/** A client ranked by how many blocked lookups it made (#699). */
+export interface RPZOffender {
+  client_ip: string;
+  hits: number;
+  distinct_names: number;
+  distinct_feeds: number;
+  last_seen: string;
+  top_qname: string | null;
+  top_qname_hits: number;
+  /** Past the "worth chasing" bar; set server-side so UI and copilot agree. */
+  noisy: boolean;
+}
+
+export interface RPZBlockedName {
+  qname: string;
+  hits: number;
+  clients: number;
+  rpz_zone: string | null;
+}
+
+export interface RPZFeedRow {
+  rpz_zone: string | null;
+  hits: number;
+  clients: number;
+  distinct_names: number;
+}
+
+export interface RPZSummary {
+  blocked_hits: number;
+  clients_blocked: number;
+  distinct_names: number;
+  feeds_firing: number;
+  /** PASSTHRU is an explicit ALLOW, not a block — counted separately. */
+  passthru_hits: number;
+  worst_client_ip: string | null;
+  worst_client_hits: number | null;
+  since: string;
+  /** Zero blocks is a plausible real answer; this says whether anything ran. */
+  has_data: boolean;
+}
+
 export interface DNSThreatSummary {
   windows_scored: number;
   clients_seen: number;
@@ -8172,8 +8235,14 @@ export const dnsThreatApi = {
     client_ip?: string;
     hours?: number;
     min_score?: number;
-    /** Rank and filter by "tunnel" (content) or "beacon" (timing). */
-    detection?: "tunnel" | "beacon";
+    /**
+     * Rank and filter by "tunnel" (name content), "beacon" (timing) or
+     * "dga" (name plausibility). Kept explicit rather than a combined
+     * max: the three mean different things, and an operator hunting
+     * exfil should not have their list reordered by a chatty
+     * monitoring agent.
+     */
+    detection?: "tunnel" | "beacon" | "dga";
     include_allowlisted?: boolean;
     include_muted?: boolean;
     limit?: number;
@@ -8196,6 +8265,31 @@ export const dnsThreatApi = {
   unmute: (clientIp: string) =>
     api
       .delete<void>(`/dns-threat/mutes/${encodeURIComponent(clientIp)}`)
+      .then((r) => r.data),
+  /**
+   * RPZ hit attribution (#699). Ground truth rather than a heuristic —
+   * named matched a policy and logged it — so these need no score or
+   * threshold, only ranking.
+   */
+  rpzSummary: (params?: { hours?: number }) =>
+    api
+      .get<RPZSummary>("/dns-threat/rpz/summary", { params })
+      .then((r) => r.data),
+  rpzClients: (params?: {
+    hours?: number;
+    limit?: number;
+    min_hits?: number;
+  }) =>
+    api
+      .get<RPZOffender[]>("/dns-threat/rpz/clients", { params })
+      .then((r) => r.data),
+  rpzNames: (params?: { hours?: number; limit?: number }) =>
+    api
+      .get<RPZBlockedName[]>("/dns-threat/rpz/names", { params })
+      .then((r) => r.data),
+  rpzFeeds: (params?: { hours?: number }) =>
+    api
+      .get<RPZFeedRow[]>("/dns-threat/rpz/feeds", { params })
       .then((r) => r.data),
 };
 

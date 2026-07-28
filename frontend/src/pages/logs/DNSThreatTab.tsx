@@ -10,6 +10,7 @@ import {
   Search,
   ShieldCheck,
   ShieldQuestion,
+  Ban,
 } from "lucide-react";
 
 import { Modal } from "@/components/ui/modal";
@@ -46,8 +47,50 @@ import {
  * an ``?ip=`` entry point on IPAMPage first.
  */
 
+type Detection = "tunnel" | "beacon" | "dga";
+
+/**
+ * One table driving every per-detection difference: which score the row
+ * shows, which signals its evidence panel renders, and — critically —
+ * what the score is CALLED. The top band used to be hard-coded "Likely
+ * tunnel" for all three, so a DGA finding rendered as the one structural
+ * conclusion it is not (a tunnel concentrates under one parent, a DGA
+ * sprays across many).
+ */
+const DETECTIONS: Record<
+  Detection,
+  {
+    label: string;
+    topBand: string;
+    score: (w: DNSClientWindow) => number;
+    signals: (w: DNSClientWindow) => DNSTunnelSignal[];
+  }
+> = {
+  tunnel: {
+    label: "Tunneling (content)",
+    topBand: "Likely tunnel",
+    score: (w) => w.tunnel_score,
+    signals: (w) => w.tunnel_signals,
+  },
+  beacon: {
+    label: "Beaconing (timing)",
+    topBand: "Likely beacon",
+    score: (w) => w.beacon_score,
+    // Beaconing reports per-name candidates rather than weighted
+    // signals, so its panel renders those instead; showing the tunnel
+    // signals here (the previous fallthrough) was actively misleading.
+    signals: () => [],
+  },
+  dga: {
+    label: "DGA (name plausibility)",
+    topBand: "Likely DGA",
+    score: (w) => w.dga_score,
+    signals: (w) => w.dga_signals,
+  },
+};
+
 const SCORE_BANDS = [
-  { min: 60, label: "Likely tunnel", cls: "text-rose-600 dark:text-rose-400" },
+  { min: 60, label: null, cls: "text-rose-600 dark:text-rose-400" },
   { min: 40, label: "Suspicious", cls: "text-amber-600 dark:text-amber-400" },
   {
     min: 20,
@@ -56,17 +99,22 @@ const SCORE_BANDS = [
   },
 ] as const;
 
-function band(score: number) {
-  return (
-    SCORE_BANDS.find((b) => score >= b.min) ?? {
-      label: "Low",
-      cls: "text-muted-foreground",
-    }
-  );
+function band(score: number, detection: Detection) {
+  const b = SCORE_BANDS.find((x) => score >= x.min);
+  if (!b) return { label: "Low", cls: "text-muted-foreground" };
+  // `label: null` on the top band means "name the detection" — that is
+  // the only band whose wording is detection-specific.
+  return { label: b.label ?? DETECTIONS[detection].topBand, cls: b.cls };
 }
 
-function ScoreCell({ score }: { score: number }) {
-  const b = band(score);
+function ScoreCell({
+  score,
+  detection = "tunnel",
+}: {
+  score: number;
+  detection?: Detection;
+}) {
+  const b = band(score, detection);
   return (
     <div className="flex items-center gap-2">
       <span className={`font-mono text-sm font-semibold ${b.cls}`}>
@@ -123,7 +171,7 @@ export function DNSThreatTab() {
   // tunneling and beaconing answer different questions, and an
   // operator hunting exfil shouldn't have their list reordered by a
   // chatty monitoring agent.
-  const [detection, setDetection] = useState<"tunnel" | "beacon">("tunnel");
+  const [detection, setDetection] = useState<Detection>("tunnel");
   const [inspecting, setInspecting] = useState<string | null>(null);
   const [muting, setMuting] = useState<string | null>(null);
   const qc = useQueryClient();
@@ -202,13 +250,12 @@ export function DNSThreatTab() {
           <label className="mb-1 block text-xs font-medium">Detection</label>
           <select
             value={detection}
-            onChange={(e) =>
-              setDetection(e.target.value as "tunnel" | "beacon")
-            }
+            onChange={(e) => setDetection(e.target.value as Detection)}
             className="rounded-md border bg-background px-2 py-1.5 text-sm"
           >
             <option value="tunnel">Tunneling (name content)</option>
             <option value="beacon">Beaconing (timing)</option>
+            <option value="dga">DGA (name plausibility)</option>
           </select>
         </div>
         <div>
@@ -378,10 +425,33 @@ export function DNSThreatTab() {
 
       {inspecting && (
         <ClientDetailModal
+          detection={detection}
           clientIp={inspecting}
           hours={hours}
           onClose={() => setInspecting(null)}
         />
+      )}
+
+      {/* Blocklist attribution. Rendered as its own section rather than a
+          fourth detection mode because it is ground truth, not a score:
+          named matched a policy and logged it, so there is nothing to
+          threshold and nothing to rank by confidence.
+
+          Carries the same card treatment as every sibling above — the
+          root is a bare `flex flex-col gap-4`, so the horizontal inset
+          comes from each child's own `px-4`, not from the container. A
+          bare <section> here rendered flush against the left edge and
+          visibly out of line with the rest of the tab. */}
+      {!moduleOff && (
+        <section className="rounded-lg border bg-card px-4 py-3">
+          <h3 className="mb-1 text-sm font-semibold">Blocklist hits (RPZ)</h3>
+          <p className="mb-3 text-xs text-muted-foreground">
+            Which machines keep reaching for domains the blocklists block.
+            Unlike the scores above this is not a heuristic — every row is a
+            policy that actually fired.
+          </p>
+          <RPZPanel hours={hours} />
+        </section>
       )}
     </div>
   );
@@ -398,7 +468,7 @@ function Row({
 }: {
   w: DNSClientWindow;
   open: boolean;
-  detection: "tunnel" | "beacon";
+  detection: Detection;
   onToggle: () => void;
   onInspect: () => void;
   onMute: () => void;
@@ -419,7 +489,8 @@ function Row({
       >
         <td className="px-4 py-2">
           <ScoreCell
-            score={detection === "beacon" ? w.beacon_score : w.tunnel_score}
+            score={DETECTIONS[detection].score(w)}
+            detection={detection}
           />
         </td>
         <td className="px-4 py-2 font-mono text-xs">
@@ -533,6 +604,33 @@ function Row({
                   callback.
                 </p>
               </>
+            ) : detection === "dga" ? (
+              <>
+                <p className="mb-2 text-xs text-muted-foreground">
+                  {w.dga_detail ||
+                    "No crop of generated-looking domains in this window."}
+                </p>
+                {w.dga_candidates.length > 0 && (
+                  <ul className="mb-2">
+                    {w.dga_candidates.map((c) => (
+                      <li key={c.parent} className="py-0.5 text-xs">
+                        <span className="font-mono">{c.parent}</span>
+                        <span className="ml-2 text-muted-foreground">
+                          {(c.implausibility * 100).toFixed(0)}% implausible
+                          bigrams · {(c.vowel_ratio * 100).toFixed(0)}% vowels
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                <p className="mb-2 text-xs text-amber-600 dark:text-amber-400">
+                  Scored on name plausibility alone — the BIND9 query log
+                  carries no rcode, so there is no NXDOMAIN prior to corroborate
+                  it. Hashed-CDN buckets, shortlink services and odd brand names
+                  share the shape, so confirm the domains above before treating
+                  this as an infection.
+                </p>
+              </>
             ) : (
               <p className="mb-2 text-xs text-muted-foreground">
                 Every signal is listed, including those contributing nothing —
@@ -540,7 +638,7 @@ function Row({
               </p>
             )}
             <ul className="max-w-3xl">
-              {w.tunnel_signals.map((s) => (
+              {DETECTIONS[detection].signals(w).map((s) => (
                 <SignalBar key={s.name} signal={s} />
               ))}
             </ul>
@@ -567,14 +665,17 @@ function Row({
  * retained history, newest first, so the shape is visible at a glance.
  */
 function ClientDetailModal({
+  detection,
   clientIp,
   hours,
   onClose,
 }: {
+  detection: Detection;
   clientIp: string;
   hours: number;
   onClose: () => void;
 }) {
+  const scoreOf = DETECTIONS[detection].score;
   const q = useQuery({
     queryKey: ["dns-threat-client", clientIp],
     // Per-client fetch returns that client's full history regardless of
@@ -588,9 +689,9 @@ function ClientDetailModal({
       }),
   });
   const rows = q.data ?? [];
-  const peak = rows.reduce((m, r) => Math.max(m, r.tunnel_score), 0);
+  const peak = rows.reduce((m, r) => Math.max(m, scoreOf(r)), 0);
   const totalQueries = rows.reduce((n, r) => n + r.query_count, 0);
-  const scored = rows.filter((r) => r.tunnel_score > 0);
+  const scored = rows.filter((r) => scoreOf(r) > 0);
 
   return (
     <Modal title={`DNS behaviour — ${clientIp}`} onClose={onClose} wide>
@@ -606,7 +707,10 @@ function ClientDetailModal({
       ) : (
         <div className="flex flex-col gap-4">
           <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-            <Stat label="Peak score" value={peak.toFixed(0)} />
+            <Stat
+              label={`Peak ${DETECTIONS[detection].label.split(" ")[0].toLowerCase()} score`}
+              value={peak.toFixed(0)}
+            />
             <Stat label="Windows retained" value={String(rows.length)} />
             <Stat label="Windows scoring" value={String(scored.length)} />
             <Stat label="Queries seen" value={totalQueries.toLocaleString()} />
@@ -630,17 +734,17 @@ function ClientDetailModal({
                   <span className="h-1.5 flex-1 overflow-hidden rounded bg-muted">
                     <span
                       className={
-                        r.tunnel_score >= 60
+                        scoreOf(r) >= 60
                           ? "block h-full bg-rose-500"
-                          : r.tunnel_score >= 20
+                          : scoreOf(r) >= 20
                             ? "block h-full bg-amber-500"
                             : "block h-full bg-emerald-500/50"
                       }
-                      style={{ width: `${Math.max(2, r.tunnel_score)}%` }}
+                      style={{ width: `${Math.max(2, scoreOf(r))}%` }}
                     />
                   </span>
                   <span className="w-8 shrink-0 text-right font-mono">
-                    {r.tunnel_score.toFixed(0)}
+                    {scoreOf(r).toFixed(0)}
                   </span>
                   <span className="w-40 shrink-0 truncate text-muted-foreground">
                     {r.allowlisted ? "cleared (allowlisted)" : r.top_parent}
@@ -878,5 +982,133 @@ function MutedClientsPanel({
         </ul>
       )}
     </section>
+  );
+}
+
+/**
+ * RPZ hit attribution (#699).
+ *
+ * The other three surfaces on this tab are heuristics with a score. This
+ * one is ground truth: named matched a response-policy rule and logged
+ * it, so there is nothing to infer and nothing to threshold — only to
+ * attribute and rank. That difference is why it renders as its own
+ * panel rather than a fourth entry in the detection dropdown.
+ *
+ * PASSTHRU is reported separately, never inside the blocked count: it is
+ * an explicit ALLOW (a blocklist exception firing), and folding it in
+ * would make a correctly-tuned allowlist read as an infection.
+ */
+function RPZPanel({ hours }: { hours: number }) {
+  const summary = useQuery({
+    queryKey: ["dns-threat-rpz-summary", hours],
+    queryFn: () => dnsThreatApi.rpzSummary({ hours }),
+  });
+  const clients = useQuery({
+    queryKey: ["dns-threat-rpz-clients", hours],
+    queryFn: () => dnsThreatApi.rpzClients({ hours, limit: 20 }),
+  });
+
+  if (summary.isLoading) {
+    return (
+      <div className="flex items-center gap-2 py-6 text-sm text-muted-foreground">
+        <Loader2 className="h-4 w-4 animate-spin" />
+        Loading blocklist activity&hellip;
+      </div>
+    );
+  }
+  const s = summary.data;
+  // "Nothing was blocked" and "this never ran" must stay distinguishable
+  // — zero blocks is a plausible real answer on a quiet network, so the
+  // UI must not have to guess. Same contract the threat summary carries.
+  if (!s?.has_data) {
+    return (
+      <div className="text-sm text-muted-foreground">
+        <p className="mb-1 font-medium text-foreground">
+          No blocklist activity recorded yet
+        </p>
+        <p>
+          RPZ attribution needs a BIND9 group with query logging enabled and at
+          least one blocklist assigned. This reads &quot;not running yet&quot;
+          rather than &quot;nothing was blocked&quot; — once the pipeline is
+          live, a genuinely quiet network shows zeroes here instead of this
+          message.
+        </p>
+      </div>
+    );
+  }
+
+  const rows = clients.data ?? [];
+  return (
+    <div className="flex flex-col gap-4">
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+        <Stat label="Blocked lookups" value={s.blocked_hits.toLocaleString()} />
+        <Stat label="Clients blocked" value={String(s.clients_blocked)} />
+        <Stat label="Distinct names" value={String(s.distinct_names)} />
+        <Stat
+          label="Allowed (passthru)"
+          value={s.passthru_hits.toLocaleString()}
+        />
+      </div>
+
+      <div>
+        <h4 className="mb-1 text-xs font-semibold">
+          Clients reaching for blocked domains
+        </h4>
+        <p className="mb-2 text-xs text-muted-foreground">
+          A single blocked lookup is an ad on a web page. Hundreds from one host
+          is a machine with something running on it — which is the question the
+          blocklists could always answer and never did.
+        </p>
+        {rows.length === 0 ? (
+          <p className="py-3 text-sm text-muted-foreground">
+            Nothing was blocked in this window.
+          </p>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full min-w-[40rem] text-sm">
+              <thead className="border-b text-left text-xs text-muted-foreground">
+                <tr>
+                  <th className="py-1.5 pr-3 font-medium">Client</th>
+                  <th className="py-1.5 pr-3 font-medium">Blocked</th>
+                  <th className="py-1.5 pr-3 font-medium">Names</th>
+                  <th className="py-1.5 pr-3 font-medium">Most blocked</th>
+                  <th className="py-1.5 font-medium">Last seen</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((r) => (
+                  <tr key={r.client_ip} className="border-b last:border-0">
+                    <td className="py-1.5 pr-3 font-mono text-xs">
+                      <span className="inline-flex items-center gap-1.5">
+                        {r.noisy && (
+                          <Ban className="h-3.5 w-3.5 text-rose-500" />
+                        )}
+                        {r.client_ip}
+                      </span>
+                    </td>
+                    <td
+                      className={`py-1.5 pr-3 font-mono ${
+                        r.noisy ? "font-semibold text-rose-600" : ""
+                      }`}
+                    >
+                      {r.hits.toLocaleString()}
+                    </td>
+                    <td className="py-1.5 pr-3 font-mono text-xs">
+                      {r.distinct_names}
+                    </td>
+                    <td className="py-1.5 pr-3 font-mono text-xs break-all">
+                      {r.top_qname ?? "—"}
+                    </td>
+                    <td className="py-1.5 text-xs text-muted-foreground">
+                      {new Date(r.last_seen).toLocaleString()}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </div>
   );
 }

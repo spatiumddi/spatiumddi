@@ -6,6 +6,7 @@ See docs/deployment/DNS_AGENT.md §§2-5 for the full protocol.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hmac
 import os
 import uuid
@@ -25,6 +26,7 @@ from app.core.agent_wake import (
     dns_wake_channels,
     wake_subscription,
 )
+from app.drivers.dns import get_driver as get_dns_driver
 from app.models.audit import AuditLog
 from app.models.dns import (
     DNSKey,
@@ -35,6 +37,7 @@ from app.models.dns import (
     DNSServerZoneState,
     DNSZone,
 )
+from app.models.dns_rpz_hit import DNSRPZHit
 from app.models.logs import DNSQueryLogEntry
 from app.models.metrics import DNSMetricSample
 from app.services.dns.agent_config import build_config_bundle
@@ -45,6 +48,7 @@ from app.services.dns.agent_token import (
     verify_agent_token,
 )
 from app.services.dns.record_ops import ack_op
+from app.services.feature_modules import is_module_enabled
 
 logger = structlog.get_logger(__name__)
 router = APIRouter(prefix="/agents", tags=["dns-agents"])
@@ -898,11 +902,59 @@ async def agent_query_log_entries(
         # parse and end up as noise rows the operator can ignore.
         parse_fn = bind9_parser.parse_query_line
 
+    # RPZ hits are per-client domain-lookup history kept for 30 days —
+    # longer than the 24 h query log they are carved out of — so they are
+    # gated on the SAME default-off module that gates every reader
+    # (``require_module`` on the router include, ``module=`` on every MCP
+    # tool, the rollup task's own check). That module is default-off on
+    # privacy grounds; without this check a default install would silently
+    # accumulate data the operator never opted into and cannot view,
+    # because the whole /dns-threat prefix 404s while it is disabled.
+    #
+    # Capability comes from the driver ABC rather than a driver-name
+    # string (non-negotiable #10): bind9 advertises ``rpz: True`` and
+    # powerdns ``False``, so a future agent-based driver is not silently
+    # opted into BIND9 regex matching against its own log format.
+    rpz_capable = False
+    if await is_module_enabled(db, "security.dns_threat"):
+        with contextlib.suppress(Exception):
+            rpz_capable = bool(get_dns_driver(server.driver).capabilities().get("rpz"))
+
     capped = body.lines[:1000]
     dropped = max(0, len(body.lines) - len(capped))
     now = datetime.now(UTC)
     inserted = 0
+    rpz_inserted = 0
     for raw in capped:
+        # RPZ policy hits (issue #699) ride the same channel as queries —
+        # named logs them under its own ``rpz`` category, which the
+        # BIND9 template points at ``queries_channel`` so no second
+        # shipper is needed. They are tried FIRST because they do not
+        # contain the ``: query: `` separator the query parser splits
+        # on, so they would otherwise be dropped by the ``qname is
+        # None`` guard below and the hit lost.
+        #
+        # PowerDNS has no equivalent category, so this is BIND9-only;
+        # the parser returns None for every non-RPZ line, which makes
+        # running it against pdns output harmless rather than
+        # conditional.
+        if rpz_capable:
+            rpz = bind9_parser.parse_rpz_line(raw, fallback_ts=now)
+            if rpz is not None:
+                db.add(
+                    DNSRPZHit(
+                        server_id=server.id,
+                        ts=rpz.ts,
+                        client_ip=rpz.client_ip,
+                        qname=rpz.qname,
+                        trigger=rpz.trigger,
+                        policy=rpz.policy,
+                        rpz_zone=rpz.rpz_zone,
+                        raw=rpz.raw,
+                    )
+                )
+                rpz_inserted += 1
+                continue
         parsed = parse_fn(raw, fallback_ts=now)
         if parsed is None or parsed.qname is None:
             continue
@@ -922,7 +974,12 @@ async def agent_query_log_entries(
         )
         inserted += 1
     await db.commit()
-    return {"status": "ok", "inserted": inserted, "dropped": dropped}
+    return {
+        "status": "ok",
+        "inserted": inserted,
+        "rpz_inserted": rpz_inserted,
+        "dropped": dropped,
+    }
 
 
 # ── Admin runtime-state push (rendered config + rndc status) ─────────

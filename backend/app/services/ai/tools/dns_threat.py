@@ -315,3 +315,166 @@ async def find_beaconing_clients(
         }
         for w in rows
     ]
+
+
+class FindDGAClientsArgs(BaseModel):
+    hours: int = Field(default=24, ge=1, le=24 * 30)
+    limit: int = Field(default=25, ge=1, le=200)
+    min_score: float = Field(
+        default=60.0,
+        ge=0,
+        le=100,
+        description=(
+            "Minimum DGA score. Scoring is on name plausibility alone — "
+            "the BIND9 query log carries no rcode, so there is no "
+            "NXDOMAIN prior — which makes this weaker evidence than the "
+            "tunneling score and worth reporting with that caveat."
+        ),
+    )
+
+
+@register_tool(
+    name="find_dga_clients",
+    description=(
+        "Find DNS clients that queried a crop of algorithmically-"
+        "generated domain names — how malware locates its "
+        "command-and-control server (issue #699). Each row carries the "
+        "implausible domains themselves, which is what makes the "
+        "finding actionable: hashed-CDN buckets, shortlink services "
+        "and odd brand names share the shape, so ALWAYS report the "
+        "sample domains and say plainly that the score rests on name "
+        "plausibility alone (no NXDOMAIN prior is available). Distinct "
+        "from find_suspicious_dns_clients: a tunnel concentrates many "
+        "subdomains under ONE parent, a DGA sprays across MANY parents."
+    ),
+    args_model=FindDGAClientsArgs,
+    category="dns",
+    module="security.dns_threat",
+    default_enabled=True,
+)
+async def find_dga_clients(
+    db: AsyncSession, user: User, args: FindDGAClientsArgs
+) -> list[dict[str, Any]]:
+    since = datetime.now(UTC) - timedelta(hours=args.hours)
+    rows = (
+        (
+            await db.execute(
+                select(DNSClientWindow)
+                .where(
+                    DNSClientWindow.window_start >= since,
+                    DNSClientWindow.dga_score >= args.min_score,
+                )
+                .order_by(desc(DNSClientWindow.dga_score))
+                .limit(args.limit)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not rows:
+        return [
+            {
+                "result": "no clients querying generated-looking domain crops",
+                "note": (
+                    "Either nothing scored above the threshold, or the rollup "
+                    "has no data — security.dns_threat must be enabled AND a "
+                    "DNS group must have query logging on."
+                ),
+            }
+        ]
+    return [
+        {
+            "client_ip": str(w.client_ip),
+            "dga_score": round(w.dga_score, 1),
+            "window_start": w.window_start.isoformat(),
+            "distinct_parents": w.distinct_parents,
+            "sample_domains": w.dga_candidates or [],
+            "signals": w.dga_signals or [],
+            "detail": w.dga_detail,
+        }
+        for w in rows
+    ]
+
+
+class FindRPZOffendersArgs(BaseModel):
+    hours: int = Field(default=24, ge=1, le=24 * 30)
+    limit: int = Field(default=20, ge=1, le=200)
+    min_hits: int = Field(
+        default=1,
+        ge=1,
+        description="Only clients with at least this many blocked lookups.",
+    )
+
+
+@register_tool(
+    name="find_rpz_offenders",
+    description=(
+        "Find which clients keep reaching for domains the blocklists "
+        "block (issue #699). This is ground truth, NOT a heuristic — "
+        "named matched a response-policy rule and logged it — so it is "
+        "much stronger evidence than the tunneling / beaconing / DGA "
+        "scores. A single blocked lookup is an ad on a web page; "
+        "hundreds from one host is a machine with something running on "
+        "it. Rows carry the worst domain and the number of distinct "
+        "feeds that fired. PASSTHRU (an explicit allow) is excluded "
+        "from the counts by design."
+    ),
+    args_model=FindRPZOffendersArgs,
+    category="dns",
+    module="security.dns_threat",
+    default_enabled=True,
+)
+async def find_rpz_offenders(
+    db: AsyncSession, user: User, args: FindRPZOffendersArgs
+) -> list[dict[str, Any]]:
+    from app.services.dns_threat import rpz as rpz_service  # noqa: PLC0415
+
+    rows = await rpz_service.top_offending_clients(
+        db, hours=args.hours, limit=args.limit, min_hits=args.min_hits
+    )
+    if not rows:
+        return [
+            {
+                "result": "no clients hit the blocklists in this window",
+                "note": (
+                    "This can legitimately mean nothing was blocked. It can "
+                    "also mean the pipeline is not running: RPZ attribution "
+                    "needs security.dns_threat enabled, query logging on for "
+                    "a BIND9 group, and at least one blocklist assigned."
+                ),
+            }
+        ]
+    return [
+        {
+            **r,
+            "last_seen": r["last_seen"].isoformat() if r.get("last_seen") else None,
+        }
+        for r in rows
+    ]
+
+
+@register_tool(
+    name="get_rpz_block_summary",
+    description=(
+        "Blocklist activity rollup: how many lookups were blocked, how "
+        "many distinct clients and names, which feeds fired, and the "
+        "worst offending client (issue #699). Use to answer 'are the "
+        "blocklists doing anything' and 'which feed is earning its "
+        "keep'. Check has_data — zero blocks is a plausible real answer "
+        "on a quiet network, so a zero WITHOUT has_data means the "
+        "pipeline is not running rather than that nothing was blocked."
+    ),
+    args_model=DNSThreatSummaryArgs,
+    category="dns",
+    module="security.dns_threat",
+    default_enabled=True,
+)
+async def get_rpz_block_summary(
+    db: AsyncSession, user: User, args: DNSThreatSummaryArgs
+) -> dict[str, Any]:
+    from app.services.dns_threat import rpz as rpz_service  # noqa: PLC0415
+
+    out = await rpz_service.summary(db, hours=args.hours)
+    out["since"] = out["since"].isoformat()
+    out["feeds"] = await rpz_service.feed_effectiveness(db, hours=args.hours)
+    return out

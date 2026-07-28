@@ -56,6 +56,7 @@ class DNSClientWindow(Base):
         # the alert matcher and the Threat tab.
         Index("ix_dns_client_window_score", "window_start", "tunnel_score"),
         Index("ix_dns_client_window_beacon", "window_start", "beacon_score"),
+        Index("ix_dns_client_window_dga", "window_start", "dga_score"),
         Index("ix_dns_client_window_ip", "client_ip"),
     )
 
@@ -106,6 +107,22 @@ class DNSClientWindow(Base):
         JSONB, nullable=False, default=list
     )
     beacon_detail: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
+    # ── DGA verdict (issue #699) ─────────────────────────────────────
+    # Structurally the inverse of tunneling: a tunnel concentrates
+    # thousands of subdomains under ONE parent, a DGA sprays one or two
+    # lookups across MANY parents. Scored separately for that reason —
+    # each detection's strongest signal is the other's evidence of
+    # innocence, so a single weighted sum could not express both.
+    dga_score: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    # The implausible registrable domains that made up the crop. Carrying
+    # them is what lets an operator recognise their own hashed-CDN or
+    # shortlink traffic instead of being handed a bare number.
+    dga_candidates: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB, nullable=False, default=list
+    )
+    dga_signals: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list)
+    dga_detail: Mapped[str] = mapped_column(Text, nullable=False, default="")
 
     # Set when every parseable name in the window matched the benign
     # allowlist — genuinely cleared. NOT set when nothing was parseable,

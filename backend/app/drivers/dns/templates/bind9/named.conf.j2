@@ -138,6 +138,21 @@ logging {
     };
     category queries { queries_channel; };
     category query-errors { queries_channel; };
+    {#- RPZ hit attribution (issue #699). named logs policy rewrites to
+        its own ``rpz`` category, NOT to ``queries`` — without this line
+        a blocked lookup is invisible to us, which is why "which machine
+        keeps hitting the blocklist" was unanswerable. Routed to the
+        existing queries_channel rather than a second file on purpose:
+        the agent already tails this one, so no new shipper thread, log
+        file or bind mount is needed. The control plane tells the two
+        line shapes apart at ingest. #}
+    category rpz { queries_channel; };
+    {#- PASSTHRU (an explicit ALLOW — a blocklist exception firing)
+        is logged to its OWN category, not to `rpz`. Without this the
+        entire passthru half of the attribution is invisible and the
+        `policy != PASSTHRU` filters in services/dns_threat/rpz.py are
+        dead code. Verified against BIND 9.20. #}
+    category rpz-passthru { queries_channel; };
 };
 {%- endif %}
 

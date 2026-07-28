@@ -325,7 +325,7 @@ SECTIONS: tuple[Section, ...] = (
             "restore would start paging about hosts an operator already "
             "reviewed and cleared."
         ),
-        tables=("dns_client_window", "dns_threat_mute"),
+        tables=("dns_client_window", "dns_threat_mute", "dns_rpz_hit"),
     ),
     Section(
         key="metrics",

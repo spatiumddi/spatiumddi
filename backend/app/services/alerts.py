@@ -325,6 +325,19 @@ RULE_TYPE_DNS_TUNNELING = "dns_tunneling_suspected"
 # known pollers — which is exactly the workflow the mute feature
 # provides — but arriving pre-armed would teach people to ignore it.
 RULE_TYPE_DNS_BEACONING = "dns_beaconing_suspected"
+
+# ``dns_dga_suspected`` (issue #699) — a client queried a crop of
+# algorithmically-generated domain names. Subject is the client, like
+# the other two.
+#
+# Seeded DISABLED, for a reason specific to this detection rather than
+# beaconing's: the issue originally specified scoring NXDOMAIN-heavy
+# clients, and the BIND9 query log carries no rcode, so the score rests
+# on name plausibility alone (see ``services/dns_threat/dga.py``). That
+# is a weaker basis than tunneling's four independent signals, and
+# hashed-CDN / shortlink traffic shares the shape — so it wants an
+# operator who has looked at their own baseline first.
+RULE_TYPE_DNS_DGA = "dns_dga_suspected"
 # The alerting bar lives in ``dns_threat.aggregate`` next to
 # ``INTERESTING_SCORE`` so the two stay a visible pair rather than
 # drifting apart in separate modules — "worth a look on a dashboard"
@@ -391,6 +404,7 @@ RULE_TYPES = frozenset(
         RULE_TYPE_RESTORE_DRILL_FAILED,
         RULE_TYPE_DNS_TUNNELING,
         RULE_TYPE_DNS_BEACONING,
+        RULE_TYPE_DNS_DGA,
     }
 )
 
@@ -1193,6 +1207,67 @@ async def _matching_dns_beaconing_subjects(
         ip = str(r.ip)
         message = (
             f"DNS client {ip} shows periodic callback behaviour " f"({r.score:.0f}/100). {r.detail}"
+        )
+        matches.append((ip, ip, message))
+    return matches
+
+
+async def _matching_dns_dga_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+) -> list[tuple[str, str, str]]:
+    """Clients that queried a crop of generated domain names (#699).
+
+    Same subject and windowing as the tunneling and beaconing matchers —
+    the client, over the trailing window — so a host running a DGA for
+    hours holds one open event and it auto-resolves when the crop stops.
+    Muted clients are excluded, as with the other two.
+
+    The message leads with the domain count and a sample of the worst
+    names rather than the score alone. "212 domains, worst
+    xkqjfhwbz.com" is something an operator can act on; a bare 84 is
+    not, and this detection in particular needs the evidence visible
+    because hashed-CDN and shortlink traffic shares the shape.
+    """
+    from app.models.dns_threat import DNSClientWindow  # noqa: PLC0415
+    from app.models.dns_threat_mute import DNSThreatMute  # noqa: PLC0415
+    from app.services.dns_threat.aggregate import DGA_ALERTING_SCORE  # noqa: PLC0415
+
+    threshold = rule.threshold_percent if rule.threshold_percent is not None else DGA_ALERTING_SCORE
+    since = datetime.now(UTC) - _DNS_TUNNEL_WINDOW
+    rn = func.row_number().over(
+        partition_by=DNSClientWindow.client_ip,
+        order_by=DNSClientWindow.dga_score.desc(),
+    )
+    ranked = (
+        select(
+            DNSClientWindow.client_ip.label("ip"),
+            DNSClientWindow.dga_score.label("score"),
+            DNSClientWindow.dga_detail.label("detail"),
+            rn.label("rn"),
+        )
+        .where(
+            DNSClientWindow.window_start >= since,
+            DNSClientWindow.dga_score >= threshold,
+            DNSClientWindow.client_ip.not_in(
+                select(DNSThreatMute.client_ip).where(
+                    or_(
+                        DNSThreatMute.muted_until.is_(None),
+                        DNSThreatMute.muted_until > datetime.now(UTC),
+                    )
+                )
+            ),
+        )
+        .subquery()
+    )
+    rows = (await db.execute(select(ranked).where(ranked.c.rn == 1))).all()
+
+    matches: list[tuple[str, str, str]] = []
+    for r in rows:
+        ip = str(r.ip)
+        message = (
+            f"DNS client {ip} queried a crop of algorithmically-generated domain "
+            f"names ({r.score:.0f}/100). {r.detail}"
         )
         matches.append((ip, ip, message))
     return matches
@@ -4406,6 +4481,53 @@ async def seed_dns_beaconing_alert_rule() -> None:
         await session.commit()
 
 
+async def seed_dns_dga_alert_rule() -> None:
+    """Seed ``dns_dga_suspected`` (#699), DISABLED by default.
+
+    Disabled for a reason specific to this detection rather than
+    beaconing's. The issue specified scoring NXDOMAIN-heavy clients;
+    the BIND9 query log carries no rcode, so the score rests on name
+    plausibility alone. That is a weaker basis than tunneling's four
+    independent signals, and hashed-CDN buckets, shortlink services and
+    any brand that bought a consonant cluster all share the shape. It
+    wants an operator who has looked at their own baseline on the DNS
+    Threat tab first — which is exactly what leaving it disarmed
+    encourages.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    async with AsyncSessionLocal() as session:
+        existing = await session.scalar(
+            select(AlertRule).where(AlertRule.rule_type == RULE_TYPE_DNS_DGA)
+        )
+        if existing is not None:
+            return
+        session.add(
+            AlertRule(
+                name="DNS DGA suspected",
+                description=(
+                    "Fires when a client queries a crop of "
+                    "algorithmically-generated domain names — how malware "
+                    "finds its command-and-control server. Disabled by "
+                    "default: scoring is on name plausibility alone (the "
+                    "BIND9 query log carries no rcode, so there is no "
+                    "NXDOMAIN prior), and hashed-CDN and shortlink traffic "
+                    "shares the shape. Review your baseline on the DNS "
+                    "Threat tab before enabling. Requires the "
+                    "security.dns_threat module and query logging."
+                ),
+                rule_type=RULE_TYPE_DNS_DGA,
+                severity="warning",
+                enabled=False,
+                notify_syslog=True,
+                notify_webhook=True,
+                notify_smtp=False,
+            )
+        )
+        await session.commit()
+
+
 async def evaluate_all(db: AsyncSession) -> dict[str, int]:
     """Evaluate every enabled rule; open / resolve events as needed.
 
@@ -4502,6 +4624,10 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 subject_type = "dns_client"
             elif rule.rule_type == RULE_TYPE_DNS_BEACONING:
                 base = await _matching_dns_beaconing_subjects(db, rule)
+                matches = [(sid, disp, msg, None) for sid, disp, msg in base]
+                subject_type = "dns_client"
+            elif rule.rule_type == RULE_TYPE_DNS_DGA:
+                base = await _matching_dns_dga_subjects(db, rule)
                 matches = [(sid, disp, msg, None) for sid, disp, msg in base]
                 subject_type = "dns_client"
             elif rule.rule_type == RULE_TYPE_NEW_MAC_SEEN:

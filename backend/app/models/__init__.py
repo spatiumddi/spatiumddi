@@ -58,6 +58,7 @@ from app.models.dns import (
     DNSView,
     DNSZone,
 )
+from app.models.dns_rpz_hit import DNSRPZHit
 from app.models.dns_threat import DNSClientWindow
 from app.models.dns_threat_mute import DNSThreatMute
 from app.models.dnsbl import DNSBLList, DNSBLListing, DNSBLPinnedIP
@@ -285,4 +286,5 @@ __all__ = [
     "WolRunTarget",
     "WolCalendar",
     "WolCalendarEvent",
+    "DNSRPZHit",
 ]

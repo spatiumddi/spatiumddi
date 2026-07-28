@@ -28,6 +28,7 @@ from app.core.permissions import require_permission
 from app.models.audit import AuditLog
 from app.models.dns_threat import DNSClientWindow
 from app.models.dns_threat_mute import DNSThreatMute
+from app.services.dns_threat import rpz as rpz_service
 from app.services.dns_threat.aggregate import INTERESTING_SCORE, compute_threat_summary
 
 # Same gate the Logs router uses: this is a rollup of the DNS query
@@ -53,6 +54,10 @@ class ClientWindowRow(BaseModel):
     beacon_score: float
     beacon_candidates: list[dict[str, Any]]
     beacon_detail: str
+    dga_score: float
+    dga_candidates: list[dict[str, Any]]
+    dga_signals: list[dict[str, Any]]
+    dga_detail: str
     allowlisted: bool
     server_count: int
     # Populated per row so the tab can dim a muted client and show who
@@ -91,6 +96,24 @@ def _validated_ip(value: str) -> str:
         ) from exc
 
 
+def _score_column(detection: str) -> Any:
+    """Map the ``detection`` query param to the column it ranks by.
+
+    One lookup rather than a chain of ternaries at each use site: the
+    ordering and the threshold filter must agree on which score they
+    mean, and keeping them keyed off the same table is what guarantees
+    it. The caller's ``pattern=`` constraint means an unknown value
+    never reaches here, but the fallback is tunneling — the default —
+    rather than a raise, so a future detection added to the pattern and
+    forgotten here degrades to the old behaviour instead of 500ing.
+    """
+    return {
+        "tunnel": DNSClientWindow.tunnel_score,
+        "beacon": DNSClientWindow.beacon_score,
+        "dga": DNSClientWindow.dga_score,
+    }.get(detection, DNSClientWindow.tunnel_score)
+
+
 def _to_row(w: DNSClientWindow) -> ClientWindowRow:
     return ClientWindowRow(
         id=str(w.id),
@@ -110,6 +133,10 @@ def _to_row(w: DNSClientWindow) -> ClientWindowRow:
         beacon_score=w.beacon_score,
         beacon_candidates=w.beacon_candidates or [],
         beacon_detail=w.beacon_detail,
+        dga_score=w.dga_score,
+        dga_candidates=w.dga_candidates or [],
+        dga_signals=w.dga_signals or [],
+        dga_detail=w.dga_detail,
         allowlisted=w.allowlisted,
         server_count=w.server_count,
     )
@@ -123,10 +150,10 @@ async def list_windows(
     hours: int = Query(default=24, ge=1, le=24 * 30),
     min_score: float = Query(default=INTERESTING_SCORE, ge=0, le=100),
     # Which detection to rank and filter by. Kept explicit rather than
-    # scoring on max(tunnel, beacon): the two mean different things and
-    # an operator hunting exfil should not have their list reordered by
-    # a chatty monitoring agent.
-    detection: str = Query(default="tunnel", pattern="^(tunnel|beacon)$"),
+    # scoring on max(tunnel, beacon, dga): the three mean different
+    # things and an operator hunting exfil should not have their list
+    # reordered by a chatty monitoring agent.
+    detection: str = Query(default="tunnel", pattern="^(tunnel|beacon|dga)$"),
     include_allowlisted: bool = Query(default=False),
     include_muted: bool = Query(default=False),
     limit: int = Query(default=100, ge=1, le=1000),
@@ -143,11 +170,7 @@ async def list_windows(
         select(DNSClientWindow)
         .where(DNSClientWindow.window_start >= since)
         .order_by(
-            desc(
-                DNSClientWindow.beacon_score
-                if detection == "beacon"
-                else DNSClientWindow.tunnel_score
-            ),
+            desc(_score_column(detection)),
             desc(DNSClientWindow.window_start),
         )
         .limit(limit)
@@ -160,10 +183,8 @@ async def list_windows(
         # A per-client drilldown wants the client's whole history, not
         # just its interesting hours.
         stmt = stmt.order_by(None).order_by(desc(DNSClientWindow.window_start))
-    elif detection == "beacon":
-        stmt = stmt.where(DNSClientWindow.beacon_score >= min_score)
     else:
-        stmt = stmt.where(DNSClientWindow.tunnel_score >= min_score)
+        stmt = stmt.where(_score_column(detection) >= min_score)
     if not include_allowlisted:
         stmt = stmt.where(DNSClientWindow.allowlisted.is_(False))
     if not include_muted and not client_ip:
@@ -335,3 +356,105 @@ async def delete_mute(client_ip: str, db: DB, current_user: CurrentUser) -> None
         )
     )
     await db.commit()
+
+
+# ── RPZ hit attribution (issue #699) ──────────────────────────────────
+#
+# Pure reporting, unlike the three scored detections above: a hit is
+# ground truth (named matched a policy and logged it), so there is
+# nothing to infer and nothing to threshold. These endpoints only
+# attribute and rank.
+
+
+class RPZOffender(BaseModel):
+    client_ip: str
+    hits: int
+    distinct_names: int
+    distinct_feeds: int
+    last_seen: datetime
+    top_qname: str | None
+    top_qname_hits: int
+    # True once the client is over the "worth chasing" bar. Carried from
+    # the service so the UI and the copilot agree on what counts as
+    # noisy rather than each inventing a threshold.
+    noisy: bool
+
+
+class RPZBlockedName(BaseModel):
+    qname: str
+    hits: int
+    clients: int
+    rpz_zone: str | None
+
+
+class RPZFeedRow(BaseModel):
+    rpz_zone: str | None
+    hits: int
+    clients: int
+    distinct_names: int
+
+
+class RPZSummary(BaseModel):
+    blocked_hits: int
+    clients_blocked: int
+    distinct_names: int
+    feeds_firing: int
+    # PASSTHRU is an explicit allow, not a block — reported separately
+    # so an operator tuning an allowlist can see it working, and so the
+    # blocked count never silently includes it.
+    passthru_hits: int
+    worst_client_ip: str | None
+    worst_client_hits: int | None
+    since: datetime
+    has_data: bool
+
+
+@router.get("/rpz/summary", response_model=RPZSummary)
+async def rpz_summary(
+    db: DB,
+    current_user: CurrentUser,
+    hours: int = Query(default=24, ge=1, le=24 * 30),
+) -> RPZSummary:
+    """Blocklist activity rollup for the Security dashboard card."""
+    return RPZSummary(**await rpz_service.summary(db, hours=hours))
+
+
+@router.get("/rpz/clients", response_model=list[RPZOffender])
+async def rpz_clients(
+    db: DB,
+    current_user: CurrentUser,
+    hours: int = Query(default=24, ge=1, le=24 * 30),
+    limit: int = Query(default=20, ge=1, le=200),
+    min_hits: int = Query(default=1, ge=1),
+) -> list[RPZOffender]:
+    """Clients ranked by blocked-lookup count — "which machine is infected".
+
+    This is the question the blocklists could always have answered and
+    never did.
+    """
+    rows = await rpz_service.top_offending_clients(db, hours=hours, limit=limit, min_hits=min_hits)
+    return [RPZOffender(**r) for r in rows]
+
+
+@router.get("/rpz/names", response_model=list[RPZBlockedName])
+async def rpz_names(
+    db: DB,
+    current_user: CurrentUser,
+    hours: int = Query(default=24, ge=1, le=24 * 30),
+    limit: int = Query(default=20, ge=1, le=200),
+) -> list[RPZBlockedName]:
+    """The blocked names themselves, ranked by hit count."""
+    return [
+        RPZBlockedName(**r)
+        for r in await rpz_service.top_blocked_names(db, hours=hours, limit=limit)
+    ]
+
+
+@router.get("/rpz/feeds", response_model=list[RPZFeedRow])
+async def rpz_feeds(
+    db: DB,
+    current_user: CurrentUser,
+    hours: int = Query(default=24, ge=1, le=24 * 30),
+) -> list[RPZFeedRow]:
+    """Hits per blocklist feed — which subscriptions are earning their keep."""
+    return [RPZFeedRow(**r) for r in await rpz_service.feed_effectiveness(db, hours=hours)]
