@@ -41,5 +41,30 @@ if [ -f /var/lib/powerdns/pdns.lmdb ] \
     rm -f /var/lib/powerdns/pdns.lmdb /var/lib/powerdns/pdns.lmdb-lock
 fi
 
+# Issue #638 — LMDB schema guard. PowerDNS 5.0 silently and irreversibly
+# migrates the LMDB schema (v5 → v6) the first time it opens the database, so
+# a plain image rollback afterwards leaves the older pdns crash-looping on a
+# database it can no longer read. Both steps below run BEFORE the exec below,
+# because the agent spawns pdns_server and that spawn is the point of no
+# return.
+#
+# ``PDNS_LMDB_RESTORE`` is the operator's rollback lever: set it to ``latest``
+# (or a specific snapshot name from ``spatium-pdns-lmdb-guard list``) when
+# redeploying an older image, and the database is put back to the schema that
+# image understands before the daemon starts. It is deliberately one-shot in
+# spirit — leaving it set means every restart re-restores and discards live
+# changes — so the guard logs loudly and the docs say to unset it after the
+# node is healthy.
+if [ -n "${PDNS_LMDB_RESTORE:-}" ]; then
+    echo "PDNS_LMDB_RESTORE=${PDNS_LMDB_RESTORE} — restoring the LMDB before start" >&2
+    /usr/local/bin/spatium-pdns-lmdb-guard restore "$PDNS_LMDB_RESTORE"
+fi
+
+# Snapshots the database when the pdns major version changed since the last
+# start. Fails closed: a container that refuses to start can be recovered by
+# redeploying the previous image, a migrated database cannot.
+/usr/local/bin/spatium-pdns-lmdb-guard snapshot
+chown -R spatium:spatium /var/lib/powerdns || true
+
 # Supervise: agent process manages pdns_server lifecycle.
 exec su-exec spatium:spatium /usr/local/bin/spatium-dns-agent

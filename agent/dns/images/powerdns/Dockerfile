@@ -3,38 +3,39 @@
 # Issue #127, Phase 1 — LMDB backend, no external DB dependency.
 # Multi-arch: linux/amd64, linux/arm64 (non-negotiable #11)
 #
-# ⚠️ DELIBERATELY HELD ON alpine:3.22 — DO NOT BUMP TO 3.23 (issue #638).
+# ⚠️ alpine:3.23 ships pdns 5.0.5 (3.22 shipped 4.9.5) — READ THIS BEFORE
+# TOUCHING THE BASE OR THE ENTRYPOINT (issue #638).
 #
-# Every other agent image moved to alpine:3.23 in #637. This one did not,
-# because 3.23 ships pdns 5.0.5 (3.22 ships 4.9.5) and PowerDNS 5.0 performs
-# an AUTOMATIC, SILENT, IRREVERSIBLE LMDB schema upgrade (v5 → v6) on the
-# first open of the database — a read is enough to trigger it, and there is
-# no opt-out (the documented ``lmdb-schema-version=5`` escape hatch is an
-# upstream docs bug: it makes pdns refuse to boot outright).
-#
-# Once 5.0 has opened the LMDB, pdns 4.9 can no longer read it at all:
+# PowerDNS 5.0 performs an AUTOMATIC, SILENT, IRREVERSIBLE LMDB schema
+# upgrade (v5 → v6) on the first open of the database. A read is enough to
+# trigger it, and there is no opt-out (the documented
+# ``lmdb-schema-version=5`` escape hatch is an upstream docs bug: setting it
+# makes pdns refuse to boot outright). Once 5.0 has opened the LMDB, pdns 4.9
+# can no longer read it at all:
 #     Error: Somehow, we are not at schema version 5. Giving up
 #
 # Our LMDB is persisted in every deployment shape (compose named volume /
 # appliance hostPath / chart PVC), and the appliance A/B slot rollback swaps
 # the ROOTFS while /var — where the database lives — is the shared persistent
-# partition. So an upgrade-then-rollback leaves pdns 4.9 crash-looping on a
-# schema-6 database: DNS down, and the rollback cannot recover it.
+# partition. So an upgrade-then-rollback would leave pdns 4.9 crash-looping on
+# a schema-6 database: DNS down, with the rollback unable to recover it.
 #
-# Pinning ``pdns=4.9.*`` on a 3.23 base is NOT an option — the 3.23 index has
-# no 4.9 package at all. The image therefore stays on 3.22 (a supported Alpine
-# branch; ``apk upgrade`` below still pulls 3.22 security fixes) until #638
-# lands the pre-upgrade LMDB snapshot + restore path.
+# This image is only safe on 3.23 because of the LMDB guard installed below:
+# the entrypoint snapshots the database whenever the pdns MAJOR version
+# changed since the last start, BEFORE the agent spawns pdns_server, and fails
+# closed if it cannot. Rolling back means redeploying the older image AND
+# running ``spatium-pdns-lmdb-guard restore latest`` — see lmdb-guard.sh and
+# docs/deployment/DNS_AGENT.md. Do not bypass the guard call in entrypoint.sh.
 ARG PYTHON_VERSION=3.12
 
-FROM alpine:3.22 AS agent-build
+FROM alpine:3.23 AS agent-build
 RUN apk add --no-cache python3 py3-pip py3-wheel
 WORKDIR /src
 COPY agent/dns/pyproject.toml /src/pyproject.toml
 COPY agent/dns/spatium_dns_agent /src/spatium_dns_agent
 RUN python3 -m pip install --prefix=/install --no-cache-dir --break-system-packages .
 
-FROM alpine:3.22 AS runtime
+FROM alpine:3.23 AS runtime
 # pdns + the LMDB backend; bind-tools only for `dig` so the smoke test
 # in agent-e2e.yml works against the PowerDNS pod the same way it
 # does against the BIND pod. ``libcap`` brings in ``setcap`` so we
@@ -46,15 +47,16 @@ FROM alpine:3.22 AS runtime
 # database is fresh and any previously-baked layer carrying an older
 # bind-libs version (CVE-2026-3593, CVE-2026-3039, CVE-2026-5946 all
 # fixed in 9.20.23-r0 — pdns drags bind-libs transitively for the
-# DNS-name parser) gets re-resolved against the current alpine 3.22
+# DNS-name parser) gets re-resolved against the current alpine 3.23
 # index. GitHub Actions Docker layer cache (the ``cache-from:
 # type=gha`` on the build workflow) is otherwise happy to serve a
 # 30-day-old ``apk add`` layer that Trivy will then flag.
 #
 # ``libcrypto3``/``libssl3`` pinned ``>=3.5.7-r0`` for CVE-2026-45447
-# (HIGH, OpenSSL — alpine 3.22 base ships 3.5.6-r0, fixed in 3.5.7-r0):
-# the explicit lower bound installs the patched openssl libs AND busts
-# the ``cache-from`` layer so a stale apk add can't reintroduce 3.5.6-r0.
+# (HIGH, OpenSSL). The 3.23 base already satisfies it, so the bound is
+# a no-op on a cold build — it is kept because it also busts the
+# ``cache-from`` layer, which is what actually stops a stale apk add
+# from reintroducing 3.5.6-r0 from the pre-3.23 cache.
 RUN apk upgrade --no-cache \
  && apk add --no-cache \
       pdns pdns-backend-lmdb \
@@ -87,7 +89,11 @@ RUN apk upgrade --no-cache \
 
 COPY --from=agent-build /install /usr/local
 COPY agent/dns/images/powerdns/entrypoint.sh /usr/local/bin/spatium-dns-entrypoint
-RUN chmod +x /usr/local/bin/spatium-dns-entrypoint
+# #638 — the LMDB schema guard. Installed as a first-class command (not an
+# entrypoint-internal helper) because the operator needs to run ``list`` /
+# ``restore`` by hand from a shell in a node whose DNS is currently down.
+COPY agent/dns/images/powerdns/lmdb-guard.sh /usr/local/bin/spatium-pdns-lmdb-guard
+RUN chmod +x /usr/local/bin/spatium-dns-entrypoint /usr/local/bin/spatium-pdns-lmdb-guard
 
 ENV AGENT_DRIVER=powerdns \
     AGENT_STATE_DIR=/var/lib/spatium-dns-agent \

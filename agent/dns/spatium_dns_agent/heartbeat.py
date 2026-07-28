@@ -12,12 +12,18 @@ import structlog
 from . import __version__
 from .cache import save_token
 from .config import AgentConfig
+from .drivers.base import DriverBase
 
 log = structlog.get_logger(__name__)
 
 
 class HeartbeatClient:
-    def __init__(self, cfg: AgentConfig, token_ref: list[str]):
+    def __init__(
+        self,
+        cfg: AgentConfig,
+        token_ref: list[str],
+        driver: DriverBase | None = None,
+    ):
         # token_ref is a 1-element list so the sync loop can swap the token in place
         self.cfg = cfg
         self.token_ref = token_ref
@@ -25,6 +31,24 @@ class HeartbeatClient:
         self.pending_acks: list[dict[str, Any]] = []
         self.daemon_status: dict[str, Any] = {}
         self.failed_ops_count = 0
+        # #638 — the driver is only used to probe the DNS daemon's version.
+        # Optional so tests (and any caller that just wants liveness) can build
+        # a HeartbeatClient without a driver.
+        self.driver = driver
+        self._daemon_version_cached: str | None = None
+
+    def _daemon_version(self) -> str | None:
+        """DNS daemon version, probed once and cached.
+
+        Same reasoning as the DHCP agent's ``_kea_version`` (#637): the daemon
+        binary cannot change while this process lives, because a new image
+        means a new container and a restarted agent. So probe until it answers,
+        then stop — the probe forks a subprocess, and doing that every 30 s on
+        the thread that carries our liveness signal buys nothing.
+        """
+        if self._daemon_version_cached is None and self.driver is not None:
+            self._daemon_version_cached = self.driver.daemon_version()
+        return self._daemon_version_cached
 
     def stop(self) -> None:
         self._stop.set()
@@ -42,6 +66,13 @@ class HeartbeatClient:
     def send_once(self) -> None:
         body: dict[str, Any] = {
             "agent_version": __version__,
+            # #638 — the DNS DAEMON's version (e.g. "5.0.5" / "9.20.26"),
+            # distinct from ``agent_version`` (this python agent). The
+            # rolling-upgrade preflight needs it: crossing PowerDNS 4.x → 5.x
+            # performs a one-way LMDB schema migration, so the operator has to
+            # be told before they press Start. None = probe failed; the control
+            # plane must treat that as "unknown", never as a specific version.
+            "daemon_version": self._daemon_version(),
             "daemon": self.daemon_status,
             "config": {},
             "ops_ack": self.pending_acks,

@@ -398,9 +398,9 @@ them nor manages that transfer.
 
 ### Base
 
-**Alpine 3.23** for every agent image — *except* `dns-powerdns`, which is deliberately held on **Alpine 3.22** (see below). Multi-arch: `linux/amd64`, `linux/arm64/v8` via `docker buildx`.
+**Alpine 3.23** for every agent image. Multi-arch: `linux/amd64`, `linux/arm64/v8` via `docker buildx`.
 
-> **Why `dns-powerdns` is pinned back.** Alpine 3.23 ships pdns 5.0.5 (3.22 ships 4.9.5), and PowerDNS 5.0 performs an automatic, silent, **irreversible** LMDB schema upgrade (v5 → v6) the first time it opens the database — a read is enough, and there is no opt-out. Afterwards pdns 4.9 cannot open the database at all (`Somehow, we are not at schema version 5. Giving up`). Because the LMDB is persisted on `/var` in every deployment shape, and the appliance A/B slot rollback swaps only the *rootfs*, an upgrade-then-rollback would leave pdns crash-looping with DNS down and no automatic recovery. The image stays on 3.22 (a supported branch; `apk upgrade` still pulls its security fixes) until [#638](https://github.com/spatiumddi/spatiumddi/issues/638) lands the pre-upgrade LMDB snapshot + restore path.
+> **`dns-powerdns` carries an LMDB schema guard.** Alpine 3.23 ships pdns 5.0.5 (3.22 shipped 4.9.5), and PowerDNS 5.0 performs an automatic, silent, **irreversible** LMDB schema upgrade (v5 → v6) the first time it opens the database — a read is enough, and there is no opt-out. Afterwards pdns 4.9 cannot open the database at all (`Somehow, we are not at schema version 5. Giving up`). Because the LMDB is persisted on `/var` in every deployment shape, and the appliance A/B slot rollback swaps only the *rootfs*, an upgrade-then-rollback would otherwise leave pdns crash-looping with DNS down and no automatic recovery. [#638](https://github.com/spatiumddi/spatiumddi/issues/638) closed that: the entrypoint runs `spatium-pdns-lmdb-guard snapshot` before the agent spawns `pdns_server`, copying the database aside whenever the pdns major version changed and failing closed if it cannot. **Rolling a PowerDNS node back is therefore a two-step operation — redeploy the old image AND run `spatium-pdns-lmdb-guard restore latest`.** Full mechanics in [DNS_DRIVERS.md §4.9](../drivers/DNS_DRIVERS.md).
 
 ### `dns-bind9` image
 

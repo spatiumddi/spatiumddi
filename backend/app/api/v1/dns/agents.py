@@ -88,6 +88,10 @@ class AgentHeartbeatRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     agent_version: str | None = None
+    # #638 — running DNS daemon version, e.g. "5.0.5" / "9.20.26". MUST be
+    # declared here: this model is extra="forbid", so an undeclared field would
+    # 422 every heartbeat from a current agent.
+    daemon_version: str | None = None
     daemon: dict[str, Any] = {}
     config: dict[str, Any] = {}
     # Bound the ACK list so a malformed/hostile heartbeat can't pin memory.
@@ -388,6 +392,13 @@ async def agent_heartbeat(
     # distributed deployments.
     if request.client is not None:
         server.last_seen_ip = request.client.host
+
+    # #638 — only overwrite when the agent actually reported a version. A probe
+    # that failed answers None, and clobbering a known-good value with NULL
+    # would make the PowerDNS LMDB preflight fall back to "unknown" for no
+    # reason.
+    if body.daemon_version:
+        server.daemon_version = body.daemon_version
 
     # Phase 8f-2 — persist whatever slot state the agent reported. Only
     # overwrite when the agent actually sent a value (older agents

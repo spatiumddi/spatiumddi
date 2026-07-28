@@ -24,6 +24,11 @@ Checks shipped in Phase A:
   warn the operator before they start. Scoped to appliance nodes and to
   real HA pairs only, and never returns ``fail`` (blocking would strand a
   broken pair in its broken state). See issue #637.
+* ``check_powerdns_lmdb_migration`` — crossing PowerDNS 4.x → 5.x performs a
+  one-way LMDB schema migration that an A/B slot rollback cannot undo, because
+  ``/var`` is the shared persistent partition. The agent snapshots the database
+  automatically, but recovering means restoring that snapshot, not just
+  redeploying the old image — so say so before Start. Warn-only. See #638.
 * ``check_quorum`` — cluster size is odd + ≥ 3 + every node currently
   Ready (so we don't start a rolling upgrade with a node already down).
 
@@ -581,6 +586,7 @@ async def run_all(
         check_version_path(target_version=target_version),
         check_quorum(),
         await check_kea_ha_version_skew(),
+        await check_powerdns_lmdb_migration(),
     ]
     levels = {r.level for r in results}
     if "fail" in levels:
@@ -769,5 +775,145 @@ async def check_kea_ha_version_skew() -> PreflightResult:
         name="kea_ha_version_skew",
         level="ok",
         message=f"All {len(ha_groups)} Kea HA group(s) already on Kea ≥ 3.0.",
+        detail=detail,
+    )
+
+
+# PowerDNS 5.0's LMDB backend migrates the on-disk schema from v5 to v6 the
+# first time it opens the database. Any pdns below this major writes/reads v5
+# and cannot open a v6 database at all ("Somehow, we are not at schema version
+# 5. Giving up").
+_PDNS_LMDB_SCHEMA6_MAJOR = 5
+
+
+def _pdns_major(version: str | None) -> int | None:
+    """Major version from a pdns version string ("5.0.5" → 5). None if unknown."""
+    if not version:
+        return None
+    head = version.strip().split(".", 1)[0]
+    try:
+        return int(head)
+    except ValueError:
+        return None
+
+
+async def check_powerdns_lmdb_migration() -> PreflightResult:
+    """Warn that a PowerDNS 4.x → 5.x upgrade is one-way for the database (#638).
+
+    PowerDNS 5.0 silently and irreversibly migrates the LMDB schema (v5 → v6)
+    the first time it opens the database — a read is enough, there is no
+    opt-out, and upstream ships no downgrade. Afterwards pdns 4.9 cannot open
+    the database at all.
+
+    That interacts badly with everything the rolling upgrade relies on for
+    recovery. The A/B slot rollback swaps the ROOTFS, while ``/var`` — where
+    the LMDB lives — is the shared persistent partition and is untouched. So
+    "roll back the node" leaves the older pdns crash-looping on a database it
+    can no longer read, and Phase 8c's health-gated auto-revert drives straight
+    into that state on its own.
+
+    The agent image handles the data half: its entrypoint snapshots the
+    database before the first 5.x start and fails closed if it cannot (see
+    ``agent/dns/images/powerdns/lmdb-guard.sh``). What it cannot do is tell the
+    operator, beforehand, that their rollback plan now has a second step. That
+    is this check's whole job.
+
+    Scoping mirrors ``check_kea_ha_version_skew``:
+
+    * **Only appliance nodes.** The orchestrator only ever slot-swaps appliance
+      nodes; docker / k8s PowerDNS agents upgrade through the manual path and
+      are never touched by this run. ``deployment_kind`` is matched strictly
+      against ``appliance`` so a row that has not checked in yet cannot make an
+      unrelated cluster upgrade look hazardous.
+    * **Only the PowerDNS driver.** BIND9 nodes keep zone data as text on disk
+      and have no equivalent hazard.
+
+    **This check never returns ``fail``.** A ``fail`` sets ``can_start=False``,
+    and blocking would be wrong twice over: the migration is a supported,
+    data-preserving upgrade, and the snapshot makes it recoverable. The
+    operator needs to be *informed*, not stopped.
+    """
+    try:
+        async with AsyncSessionLocal() as db:
+            rows = (await db.execute(text("""
+                            SELECT s.name           AS server_name,
+                                   s.daemon_version AS daemon_version
+                            FROM dns_server s
+                            WHERE s.driver = 'powerdns'
+                              AND s.deployment_kind = 'appliance'
+                            ORDER BY s.name
+                            """))).mappings().all()
+    except Exception as e:  # pragma: no cover - DB unavailable is its own signal
+        logger.warning("preflight_powerdns_lmdb_query_failed", error=str(e))
+        return PreflightResult(
+            name="powerdns_lmdb_migration",
+            level="warn",
+            message=(
+                "Could not determine PowerDNS versions — if any appliance node runs "
+                "PowerDNS 4.x, this upgrade migrates its database one-way."
+            ),
+            detail={"error": str(e)},
+        )
+
+    if not rows:
+        return PreflightResult(
+            name="powerdns_lmdb_migration",
+            level="ok",
+            message="No PowerDNS nodes on this appliance cluster — no LMDB migration to perform.",
+            detail={"powerdns_nodes": 0},
+        )
+
+    servers = [dict(r) for r in rows]
+    # Classification is mutually exclusive so a node appears under exactly one
+    # heading: a reported major below 5, or nothing reported at all. A node
+    # that reports an unparseable version counts as unknown, not as "old".
+    pre_5: list[str] = []
+    unknown: list[str] = []
+    for s in servers:
+        major = _pdns_major(s["daemon_version"])
+        if major is None:
+            unknown.append(s["server_name"])
+        elif major < _PDNS_LMDB_SCHEMA6_MAJOR:
+            pre_5.append(s["server_name"])
+
+    detail: dict[str, Any] = {
+        "powerdns_nodes": len(servers),
+        "pre_5_0": pre_5,
+        "unknown_version": unknown,
+        "servers": [
+            {"server": s["server_name"], "daemon_version": s["daemon_version"]} for s in servers
+        ],
+        # Repeated in the detail blob so it survives into audit / MCP output,
+        # where the operator may never see the rendered message.
+        "rollback_command": "spatium-pdns-lmdb-guard restore latest",
+    }
+
+    if pre_5 or unknown:
+        affected = pre_5 + unknown
+        qualifier = "" if not unknown else " (version unreported for some, so treat them as 4.x)"
+        return PreflightResult(
+            name="powerdns_lmdb_migration",
+            level="warn",
+            message=(
+                f"PowerDNS {'nodes' if len(affected) > 1 else 'node'} "
+                f"{', '.join(affected)} may still run pdns 4.x{qualifier}. "
+                "PowerDNS 5.0 performs a ONE-WAY LMDB schema migration on first "
+                "start — the A/B slot rollback swaps the rootfs but /var, where the "
+                "database lives, is shared and is not reverted. The agent snapshots "
+                "the database automatically before migrating; rolling a node back "
+                "therefore means redeploying the old image AND running "
+                "'spatium-pdns-lmdb-guard restore latest' in the DNS container. "
+                "Zone data is preserved either way."
+            ),
+            detail=detail,
+        )
+
+    return PreflightResult(
+        name="powerdns_lmdb_migration",
+        level="ok",
+        message=(
+            f"All {len(servers)} PowerDNS node(s) already on pdns ≥ 5.0 — "
+            "the LMDB schema migration has already happened."
+        ),
         detail=detail,
     )
