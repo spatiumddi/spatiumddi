@@ -413,9 +413,7 @@ async def ping(
 async def traceroute(
     body: HostRequest, db: DB, current_user: CurrentUser, _rl=RateLimitDefault
 ) -> CommandResult:
-    await _guard_probe(
-        db, current_user, body=body, tool="traceroute", action_label="Tracing a route to"
-    )
+    await _guard_probe(db, current_user, body=body, tool="traceroute", action_label="Route tracing")
     dispatched = await _dispatch_reachability(
         tool="traceroute",
         body=body,
@@ -441,7 +439,7 @@ async def mtr(
     # ping/traceroute). Reject a non-server target rather than silently
     # running on the server.
     _reject_non_server("mtr", body.target)
-    await _guard_probe(db, current_user, body=body, tool="mtr", action_label="Running mtr against")
+    await _guard_probe(db, current_user, body=body, tool="mtr", action_label="Running mtr")
     try:
         return await run_mtr(body.host)
     except NetToolArgError as exc:

@@ -139,6 +139,47 @@ def test_invalid_ae_titles_are_rejected(raw: str, fragment: str) -> None:
     assert fragment in str(exc.value)
 
 
+async def test_padded_16_byte_title_is_accepted_over_the_api(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A 16-byte title carrying legal pad space must survive the API.
+
+    Regression: a ``max_length=16`` on the pydantic field counted
+    *characters* on the *untrimmed* value, so ``"QRSTUVWXYZABCDEF "`` —
+    16 significant chars plus one pad space — was rejected before the
+    validator ever trimmed it. Spaces are non-significant padding per
+    PS3.5, so the ceiling has to be applied after trimming, in bytes.
+    That failure is the exact "strict in the wrong direction" mode this
+    registry exists to avoid: a title real devices use, refused.
+    """
+    _, token = await _make_superadmin(db_session)
+    await db_session.commit()
+    resp = await client.post(
+        "/api/v1/dicom/aes",
+        headers=_auth(token),
+        json={"ae_title": "QRSTUVWXYZABCDEF "},
+    )
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["ae_title"] == "QRSTUVWXYZABCDEF"
+
+
+async def test_over_length_title_reports_bytes_over_the_api(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The refusal has to come from the byte validator, so its message
+    says "bytes" — an operator counting characters on a multi-byte title
+    cannot otherwise see why 15 characters is too long."""
+    _, token = await _make_superadmin(db_session)
+    await db_session.commit()
+    resp = await client.post(
+        "/api/v1/dicom/aes",
+        headers=_auth(token),
+        json={"ae_title": "ÄÖÜÄÖÜÄÖÜÄÖÜÄÖÜ"},
+    )
+    assert resp.status_code == 422, resp.text
+    assert "bytes" in resp.text
+
+
 def test_length_ceiling_is_bytes_not_characters() -> None:
     """The VR caps at 16 *bytes*. A 16-character title with a non-ASCII
     character in it is over the limit, and an operator counting

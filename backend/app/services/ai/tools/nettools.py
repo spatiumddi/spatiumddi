@@ -138,7 +138,7 @@ async def network_traceroute(
     user: User,  # noqa: ARG001
     args: NetworkTracerouteArgs,
 ) -> dict[str, Any]:
-    refusal = await _probe_refusal(db, args.host, action="Tracing a route to")
+    refusal = await _probe_refusal(db, args.host, action="Route tracing")
     if refusal is not None:
         return refusal
     try:

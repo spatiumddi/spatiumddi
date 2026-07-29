@@ -95,6 +95,11 @@ class ProbeVerdict:
         the operator's reason when there is one. Callers use this for
         the 422 detail and for the skip note in a run summary, so the
         same wording shows up wherever the refusal surfaces.
+
+        ``action`` is interpolated as the subject of "… is suppressed
+        for <scope>", so it must be a bare gerund phrase: "Pinging",
+        "Port scanning", "Route tracing". A trailing preposition
+        ("Tracing a route to") strands mid-sentence.
         """
         where = self.scope_label or self.source or "this scope"
         base = f"{action} is suppressed for {where}: it is marked do-not-probe"

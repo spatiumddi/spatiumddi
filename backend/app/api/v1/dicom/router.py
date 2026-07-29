@@ -61,7 +61,6 @@ from app.models.auth import User
 from app.models.dicom import (
     DICOM_AE_ROLES,
     DICOM_AE_SOURCES,
-    DICOM_AE_TITLE_MAX_BYTES,
     DICOM_DEFAULT_PORT,
     DICOM_DEVICE_CLASSES,
     DICOMApplicationEntity,
@@ -103,6 +102,14 @@ DICOMDeviceClass = Literal[
 DICOMAESource = Literal["manual", "import", "echo"]
 ImportAction = Literal["create", "update", "skip", "error"]
 
+# Raw-input ceiling for ``ae_title`` before validation. Generous: the
+# real rule is 16 bytes *after* trimming padding, enforced by
+# ``validate_ae_title``. This only stops an unbounded string from
+# reaching it, and is loose enough that a title made entirely of legal
+# pad space still gets the specific "empty or all spaces" message rather
+# than a generic length one.
+_MAX_TITLE_INPUT = 128
+
 # Network-configuration notes. Named in the field description too — an
 # unlabelled free-text box is the surest way to end up storing PHI.
 _NOTES_DESCRIPTION = (
@@ -129,7 +136,15 @@ def _validated_title(v: str) -> str:
 
 
 class DICOMAECreate(BaseModel):
-    ae_title: str = Field(..., min_length=1, max_length=DICOM_AE_TITLE_MAX_BYTES)
+    # Deliberately NO ``max_length``: pydantic's length check counts
+    # *characters* and runs on the *untrimmed* value, so a legal
+    # 16-byte title carrying pad space ("QRSTUVWXYZABCDEF ") would be
+    # rejected before ``_validated_title`` ever trimmed it. Spaces are
+    # non-significant padding per PS3.5, so the ceiling has to be
+    # measured after trimming and in bytes — which is exactly what
+    # ``validate_ae_title`` does. ``_MAX_TITLE_INPUT`` still bounds the
+    # raw input so an unbounded string can't reach the validator.
+    ae_title: str = Field(..., min_length=1, max_length=_MAX_TITLE_INPUT)
     # Nullable on purpose: an AE with no address is a *reservation* — a
     # title still in peer configuration whose host is gone. Registering
     # those is the point, not an edge case.
@@ -192,7 +207,8 @@ class DICOMAEUpdate(BaseModel):
     tinguishable from not mentioning it.
     """
 
-    ae_title: str | None = Field(default=None, max_length=DICOM_AE_TITLE_MAX_BYTES)
+    # See DICOMAECreate.ae_title on why this is not bounded at 16.
+    ae_title: str | None = Field(default=None, max_length=_MAX_TITLE_INPUT)
     ip_address_id: uuid.UUID | None = None
     port: int | None = Field(default=None, ge=1, le=65535)
     tls_enabled: bool | None = None
