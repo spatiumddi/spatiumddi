@@ -54,6 +54,11 @@ jobs:
         with:
           context: ./backend
           file: ./backend/Dockerfile
+          # #732 — MUST be pinned. ``dev`` is the LAST stage in
+          # backend/Dockerfile, so an unpinned build silently publishes an api
+          # image carrying pytest + pytest-xdist + coverage (installed as root),
+          # and diverges from what trivy-scheduled.yml scans.
+          target: runtime
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |

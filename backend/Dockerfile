@@ -141,8 +141,16 @@ CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--worker
 # Adds the ``[dev]`` extras (pytest + pytest-asyncio + pytest-xdist +
 # pytest-cov) on top of the runtime stage so ``make test`` can run pytest
 # inside the api container without bloating the production image. The dev
-# compose's ``build.target: dev`` selects this stage; the release pipeline
-# stops at ``runtime``.
+# compose's ``build.target: dev`` selects this stage.
+#
+# ⚠️  This is the LAST stage, so ``docker build`` with no ``--target`` lands
+# HERE, not on ``runtime``. Nothing in this file can prevent that — every
+# ship path must pin the stage explicitly, and all of them do:
+# ``.github/workflows/release.yml`` (``target: runtime``), the appliance bake
+# in ``Makefile`` (``--target runtime``), and ``trivy-scheduled.yml``. That
+# was not always true: until #732 release.yml had no ``target:``, so every
+# published api image shipped the test tooling below. If you append a stage
+# after this one, you inherit the same trap.
 #
 # We install as root (the runtime stage's USER app would block site-packages
 # writes), then switch back to ``app`` so the runtime CMD stays unchanged.
