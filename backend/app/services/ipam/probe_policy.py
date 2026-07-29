@@ -115,6 +115,28 @@ class ProbeVerdict:
 ALLOWED = ProbeVerdict(blocked=False)
 
 
+async def _get_including_deleted[RowT](
+    db: AsyncSession, model: type[RowT], row_id: uuid.UUID | None
+) -> RowT | None:
+    """Load one row by primary key, soft-deleted rows included.
+
+    ``app.db._filter_soft_deleted`` injects ``deleted_at IS NULL`` into
+    every SELECT — including the one behind ``db.get()`` — unless the
+    statement opts out with ``include_deleted=True``. For this module
+    that default is backwards: a trashed ancestor would silently
+    disappear from the walk and the guard would fail *open*, which is
+    the one direction a safety flag must never fail.
+    """
+    if row_id is None:
+        return None
+    stmt = (
+        select(model)
+        .where(model.id == row_id)  # type: ignore[attr-defined]
+        .execution_options(include_deleted=True)
+    )
+    return (await db.execute(stmt)).scalars().first()
+
+
 async def resolve_probe_policy(db: AsyncSession, subnet: Subnet) -> ProbeVerdict:
     """Effective do-not-probe verdict for one subnet.
 
@@ -126,7 +148,11 @@ async def resolve_probe_policy(db: AsyncSession, subnet: Subnet) -> ProbeVerdict
     Soft-deleted ancestors are honoured rather than skipped: a block in
     the trash still describes the gear that is physically there, and
     resuming probes because someone deleted a container row would be the
-    wrong way for this to fail.
+    wrong way for this to fail. That is why every load here goes through
+    :func:`_get_including_deleted` — the session-wide ``deleted_at IS
+    NULL`` filter (``app.db._filter_soft_deleted``) applies to
+    ``db.get()`` too, so a plain fetch would return ``None`` for a
+    trashed block, truncate the walk, and fail *open*.
     """
     if subnet.do_not_probe:
         return ProbeVerdict(
@@ -137,7 +163,9 @@ async def resolve_probe_policy(db: AsyncSession, subnet: Subnet) -> ProbeVerdict
         )
 
     seen: set[uuid.UUID] = set()
-    current = await db.get(IPBlock, subnet.block_id) if subnet.block_id else None
+    current = (
+        await _get_including_deleted(db, IPBlock, subnet.block_id) if subnet.block_id else None
+    )
     depth = 0
     while current is not None and depth < _MAX_BLOCK_DEPTH:
         if current.id in seen:
@@ -152,10 +180,12 @@ async def resolve_probe_policy(db: AsyncSession, subnet: Subnet) -> ProbeVerdict
                 scope_label=str(current.network),
             )
         current = (
-            await db.get(IPBlock, current.parent_block_id) if current.parent_block_id else None
+            await _get_including_deleted(db, IPBlock, current.parent_block_id)
+            if current.parent_block_id
+            else None
         )
 
-    space = await db.get(IPSpace, subnet.space_id) if subnet.space_id else None
+    space = await _get_including_deleted(db, IPSpace, subnet.space_id) if subnet.space_id else None
     if space is not None and space.do_not_probe:
         return ProbeVerdict(
             blocked=True,
@@ -191,9 +221,10 @@ async def _subnets_covering_ip(db: AsyncSession, addr: str) -> list[Subnet]:
     reading, and the one that matches what the flag is asserting ("this
     address hosts fragile gear").
     """
-    stmt = select(Subnet).where(
-        Subnet.deleted_at.is_(None),
-        Subnet.network.op(">>=")(sa_func.inet(addr)),
+    stmt = (
+        select(Subnet)
+        .where(Subnet.network.op(">>=")(sa_func.inet(addr)))
+        .execution_options(include_deleted=True)
     )
     return list((await db.execute(stmt)).scalars().all())
 
@@ -205,13 +236,22 @@ async def _subnets_overlapping_network(db: AsyncSession, cidr: str) -> list[Subn
     reaches the hosts of a flagged ``10.1.7.0/24`` inside it, and
     scanning ``10.1.7.128/25`` reaches hosts of a flagged ``10.1.0.0/16``
     around it. Either way packets land on suppressed addresses.
+
+    ``cidr`` must already be masked to its network address — the caller
+    normalises it, because Postgres's ``cidr()`` cast rejects a value
+    with host bits set (``cidr('10.0.0.5/24')`` is an error, not a
+    coercion) and nmap happily accepts one. Raising a DataError out of a
+    guard would turn a mistyped target into a 500.
     """
-    stmt = select(Subnet).where(
-        Subnet.deleted_at.is_(None),
-        or_(
-            Subnet.network.op(">>=")(sa_func.cidr(cidr)),
-            Subnet.network.op("<<=")(sa_func.cidr(cidr)),
-        ),
+    stmt = (
+        select(Subnet)
+        .where(
+            or_(
+                Subnet.network.op(">>=")(sa_func.cidr(cidr)),
+                Subnet.network.op("<<=")(sa_func.cidr(cidr)),
+            )
+        )
+        .execution_options(include_deleted=True)
     )
     return list((await db.execute(stmt)).scalars().all())
 
@@ -239,11 +279,9 @@ async def _subnets_for_hostname(db: AsyncSession, name: str) -> list[Subnet]:
     stmt = (
         select(Subnet)
         .join(IPAddress, IPAddress.subnet_id == Subnet.id)
-        .where(
-            Subnet.deleted_at.is_(None),
-            sa_func.lower(IPAddress.hostname).in_(candidates),
-        )
+        .where(sa_func.lower(IPAddress.hostname).in_(candidates))
         .distinct()
+        .execution_options(include_deleted=True)
     )
     return list((await db.execute(stmt)).scalars().all())
 
@@ -268,11 +306,14 @@ async def check_probe_target(db: AsyncSession, target: str) -> ProbeVerdict:
         ipaddress.ip_address(raw)
     except ValueError:
         try:
-            ipaddress.ip_network(raw, strict=False)
+            # ``strict=False`` because operators type ``10.1.7.5/24``;
+            # the masked ``network`` form is what reaches Postgres, whose
+            # ``cidr()`` cast rejects host bits outright.
+            network = ipaddress.ip_network(raw, strict=False)
         except ValueError:
             subnets = await _subnets_for_hostname(db, raw)
         else:
-            subnets = await _subnets_overlapping_network(db, raw)
+            subnets = await _subnets_overlapping_network(db, str(network))
     else:
         subnets = await _subnets_covering_ip(db, raw)
 

@@ -148,7 +148,11 @@ _CLASS_ALIASES: dict[str, str] = {
 # encrypted" is a question the ``dicom_ae_no_tls`` check reports on, so
 # guessing would put a wrong answer into a compliance report.
 _TRUE_CELLS: frozenset[str] = frozenset({"1", "true", "t", "yes", "y", "on", "tls", "enabled"})
-_FALSE_CELLS: frozenset[str] = frozenset({"0", "false", "f", "no", "n", "off", "", "none"})
+_FALSE_CELLS: frozenset[str] = frozenset({"0", "false", "f", "no", "n", "off", "none"})
+# Empty is deliberately NOT in ``_FALSE_CELLS``: "the operator left this
+# blank" and "the operator wrote no" are different statements, and only
+# the second should overwrite a stored ``true``.
+_BLANK_CELLS: frozenset[str] = frozenset({""})
 
 
 class DICOMImportError(ValueError):
@@ -319,12 +323,24 @@ def _parse_one(
                 error=f"port {port} is outside 1-65535",
             )
         fields["port"] = port
-    else:
+    elif "port" in headers:
+        # Column mapped but this row's cell is blank — fall back to the
+        # request default, which is what the default is for.
         fields["port"] = default_port
+    # No port column mapped at all: leave the key out entirely so an
+    # ``overwrite_existing`` re-import cannot silently reset every AE to
+    # 11112. The create path fills it from the model default instead.
 
     tls_cell = _normalize_token(_cell(raw_row, headers, "tls_enabled"))
     if tls_cell in _TRUE_CELLS:
         fields["tls_enabled"] = True
+    elif "tls_enabled" not in headers or tls_cell in _BLANK_CELLS:
+        # Same reasoning as ``port``, and it matters more here: a blank
+        # or absent TLS column re-importing as ``false`` would flip every
+        # encrypted AE to plaintext in the registry and poison
+        # ``dicom_ae_no_tls`` — a compliance report reading worse than
+        # reality is its own kind of wrong answer.
+        pass
     elif tls_cell in _FALSE_CELLS:
         fields["tls_enabled"] = False
     else:
@@ -408,10 +424,11 @@ def parse_rows(
     Only cells the operator mapped *and* filled land in
     ``ParsedRow.fields`` — a blank cell means "no opinion", not "clear
     this value", so re-importing a partial export cannot wipe a vendor
-    string someone typed in the UI. ``port`` is the one exception: it
-    always lands, defaulting to the request's ``default_port``, because
-    an AE with no port is not addressable and there is a conventional
-    answer.
+    string someone typed in the UI. That rule is what makes
+    ``overwrite_existing`` safe to re-run against a table that is missing
+    columns, and it is why ``port`` falls back to ``default_port`` only
+    when a port column was actually mapped, and why a blank
+    ``tls_enabled`` cell is left alone rather than read as ``false``.
 
     Raises :class:`DICOMImportError` for whole-request problems (empty
     body, missing mapped column, over the row cap). Per-row problems are

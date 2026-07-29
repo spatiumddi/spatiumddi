@@ -462,6 +462,28 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
+def _integrity_error(exc: IntegrityError, *, ae_title: str) -> HTTPException:
+    """Map a flush failure to the right status, not just to 409.
+
+    ``uq_dicom_ae_title`` is the constraint this surface expects to trip,
+    but it is not the only one on the table — a NOT NULL or a CHECK
+    (port range, AE-title length) can fail here too, and reporting those
+    as "AE Title already registered" sends the operator hunting for a
+    duplicate that does not exist. Match on the constraint name and fall
+    back to a 422 that says what actually happened.
+    """
+    detail = str(getattr(exc, "orig", exc))
+    if "uq_dicom_ae_title" in detail:
+        return HTTPException(
+            status_code=409,
+            detail=f"AE Title {ae_title!r} is already registered",
+        )
+    return HTTPException(
+        status_code=422,
+        detail=f"The application entity could not be saved: {detail}",
+    )
+
+
 def _title_conflict(exc: AETitleConflict) -> HTTPException:
     """409 naming the AE that already holds the title.
 
@@ -704,10 +726,7 @@ async def create_ae(body: DICOMAECreate, db: DB, user: CurrentUser) -> DICOMAERe
         # real guard; answer with the same 409 the pre-check would have
         # produced rather than leaking a 500.
         await db.rollback()
-        raise HTTPException(
-            status_code=409,
-            detail=f"AE Title {body.ae_title!r} is already registered",
-        ) from exc
+        raise _integrity_error(exc, ae_title=body.ae_title) from exc
 
     write_audit(
         db,
@@ -761,6 +780,11 @@ async def update_ae(
 
     for key, value in changes.items():
         setattr(row, key, value)
+    # Snapshot before the flush: the failure path rolls back, which
+    # expires every ORM instance, so reading ``row.ae_title`` inside the
+    # handler would trigger a lazy refresh and raise MissingGreenlet
+    # instead of the intended response.
+    new_title = row.ae_title
 
     if reparented:
         await sync_subnet_id(db, row)
@@ -769,10 +793,7 @@ async def update_ae(
         await db.flush()
     except IntegrityError as exc:
         await db.rollback()
-        raise HTTPException(
-            status_code=409,
-            detail=f"AE Title {row.ae_title!r} is already registered",
-        ) from exc
+        raise _integrity_error(exc, ae_title=new_title) from exc
 
     write_audit(
         db,

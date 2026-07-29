@@ -525,6 +525,74 @@ async def test_import_errors_an_unknown_address_but_keeps_good_rows(
     assert resp.json()["errors"] == 1
 
 
+async def test_reimport_without_tls_column_does_not_reset_tls(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """An overwrite re-import from a table lacking TLS / port columns
+    must leave those alone. Flipping every encrypted AE to plaintext
+    would poison ``dicom_ae_no_tls`` — a compliance report reading worse
+    than reality is its own wrong answer."""
+    _, token = await _make_superadmin(db_session)
+    db_session.add(DICOMApplicationEntity(ae_title="MR1", port=2762, tls_enabled=True))
+    await db_session.commit()
+    headers = _auth(token)
+
+    resp = await client.post(
+        "/api/v1/dicom/aes/import/commit",
+        headers=headers,
+        json={
+            "csv_text": "AE Title,Vendor\nMR1,Philips\n",
+            "column_map": {"ae_title": "AE Title", "vendor": "Vendor"},
+            "overwrite_existing": True,
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["updated"] == 1
+
+    row = (await client.get("/api/v1/dicom/aes", headers=headers)).json()["items"][0]
+    assert row["vendor"] == "Philips"
+    assert row["tls_enabled"] is True, "a missing TLS column must not mean 'false'"
+    assert row["port"] == 2762, "a missing port column must not mean 'the default'"
+
+
+async def test_blank_tls_cell_does_not_clear_a_stored_true(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """ "The operator left this blank" and "the operator wrote no" are
+    different statements; only the second overwrites."""
+    _, token = await _make_superadmin(db_session)
+    db_session.add(DICOMApplicationEntity(ae_title="CT9", tls_enabled=True))
+    await db_session.commit()
+    headers = _auth(token)
+
+    resp = await client.post(
+        "/api/v1/dicom/aes/import/commit",
+        headers=headers,
+        json={
+            "csv_text": "AE Title,TLS\nCT9,\n",
+            "column_map": {"ae_title": "AE Title", "tls_enabled": "TLS"},
+            "overwrite_existing": True,
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    row = (await client.get("/api/v1/dicom/aes", headers=headers)).json()["items"][0]
+    assert row["tls_enabled"] is True
+
+    # An explicit "no" *does* overwrite.
+    resp = await client.post(
+        "/api/v1/dicom/aes/import/commit",
+        headers=headers,
+        json={
+            "csv_text": "AE Title,TLS\nCT9,no\n",
+            "column_map": {"ae_title": "AE Title", "tls_enabled": "TLS"},
+            "overwrite_existing": True,
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    row = (await client.get("/api/v1/dicom/aes", headers=headers)).json()["items"][0]
+    assert row["tls_enabled"] is False
+
+
 # ── Permissions + module gate ────────────────────────────────────────
 
 

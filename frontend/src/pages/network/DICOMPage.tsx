@@ -7,6 +7,7 @@ import {
   Scan,
   ShieldAlert,
   Trash2,
+  Upload,
   Waypoints,
 } from "lucide-react";
 
@@ -15,10 +16,15 @@ import {
   formatApiError,
   ipamApi,
   type DICOMAECreate,
+  type DICOMAEImportColumnMap,
+  type DICOMAEImportCommit,
+  type DICOMAEImportPreview,
+  type DICOMAEImportRequest,
   type DICOMAESource,
   type DICOMAEUpdate,
   type DICOMApplicationEntity,
   type DICOMDeviceClass,
+  type DICOMPeer,
   type DICOMRole,
 } from "@/lib/api";
 import { HeaderButton } from "@/components/ui/header-button";
@@ -89,6 +95,9 @@ export function DICOMPage() {
   >(null);
   const [del, setDel] = useState<DICOMApplicationEntity | null>(null);
   const [impactOf, setImpactOf] = useState<DICOMApplicationEntity | null>(null);
+  const [peerModal, setPeerModal] = useState(false);
+  const [delPeer, setDelPeer] = useState<DICOMPeer | null>(null);
+  const [importOpen, setImportOpen] = useState(false);
 
   const subnetsQ = useQuery({
     queryKey: ["subnets", "all"],
@@ -138,6 +147,15 @@ export function DICOMPage() {
     },
   });
 
+  const delPeerMut = useMutation({
+    mutationFn: (id: string) => dicomApi.removePeer(id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["dicom-peers"] });
+      qc.invalidateQueries({ queryKey: ["dicom-impact"] });
+      setDelPeer(null);
+    },
+  });
+
   return (
     <div className="flex h-full flex-col overflow-hidden">
       <div className="border-b bg-card px-6 py-4">
@@ -174,6 +192,16 @@ export function DICOMPage() {
               }}
             >
               Refresh
+            </HeaderButton>
+            <HeaderButton
+              icon={Upload}
+              disabled={!canWrite}
+              title={
+                canWrite ? undefined : "Requires write permission on DICOM AEs"
+              }
+              onClick={() => setImportOpen(true)}
+            >
+              Import
             </HeaderButton>
             <HeaderButton
               variant="primary"
@@ -384,6 +412,20 @@ export function DICOMPage() {
               sending when the source moves, an inbound one stops being able to
               reach the target.
             </p>
+            <HeaderButton
+              icon={Plus}
+              disabled={!canWrite || aes.length < 2}
+              title={
+                !canWrite
+                  ? "Requires write permission on DICOM AEs"
+                  : aes.length < 2
+                    ? "Register at least two application entities first"
+                    : undefined
+              }
+              onClick={() => setPeerModal(true)}
+            >
+              Add association
+            </HeaderButton>
           </div>
           <div className="rounded-lg border">
             {peers.length === 0 ? (
@@ -407,6 +449,7 @@ export function DICOMPage() {
                         Services
                       </th>
                       <th className="px-3 py-2 text-left font-medium">Notes</th>
+                      <th className="px-3 py-2"></th>
                     </tr>
                   </thead>
                   <tbody>
@@ -423,6 +466,17 @@ export function DICOMPage() {
                         </td>
                         <td className="px-3 py-2 text-muted-foreground">
                           {p.notes || "—"}
+                        </td>
+                        <td className="whitespace-nowrap px-3 py-2 text-right">
+                          <button
+                            type="button"
+                            disabled={!canDelete}
+                            onClick={() => setDelPeer(p)}
+                            className="rounded p-1 text-muted-foreground hover:text-destructive disabled:opacity-40"
+                            title="Delete association"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </button>
                         </td>
                       </tr>
                     ))}
@@ -444,6 +498,27 @@ export function DICOMPage() {
       {impactOf && (
         <ImpactModal ae={impactOf} onClose={() => setImpactOf(null)} />
       )}
+      {peerModal && <PeerModal aes={aes} onClose={() => setPeerModal(false)} />}
+      {importOpen && <ImportModal onClose={() => setImportOpen(false)} />}
+      <ConfirmModal
+        open={delPeer !== null}
+        title="Delete association"
+        message={
+          <>
+            Remove the documented association{" "}
+            <span className="font-mono font-semibold">
+              {delPeer?.source_ae_title} &rarr; {delPeer?.target_ae_title}
+            </span>
+            ? Neither application entity is touched — only the record that they
+            talk to each other, which is what the impact view reads.
+          </>
+        }
+        tone="destructive"
+        confirmLabel="Delete"
+        loading={delPeerMut.isPending}
+        onConfirm={() => delPeer && delPeerMut.mutate(delPeer.id)}
+        onClose={() => setDelPeer(null)}
+      />
       <ConfirmModal
         open={del !== null}
         title="Delete DICOM application entity"
@@ -587,6 +662,368 @@ function ImpactModal({
   );
 }
 
+// ── Peer association ─────────────────────────────────────────────────
+
+function PeerModal({
+  aes,
+  onClose,
+}: {
+  aes: DICOMApplicationEntity[];
+  onClose: () => void;
+}) {
+  const qc = useQueryClient();
+  const [sourceId, setSourceId] = useState(aes[0]?.id ?? "");
+  const [targetId, setTargetId] = useState(aes[1]?.id ?? "");
+  const [services, setServices] = useState("");
+  const [notes, setNotes] = useState("");
+  const [error, setError] = useState("");
+
+  const mut = useMutation({
+    mutationFn: () =>
+      dicomApi.createPeer({
+        source_ae_id: sourceId,
+        target_ae_id: targetId,
+        // Free-form on purpose: SOP class support is open-ended, and an
+        // operator documenting their estate should never be blocked on
+        // our list being complete.
+        services: services
+          .split(",")
+          .map((x) => x.trim())
+          .filter(Boolean),
+        notes,
+      }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["dicom-peers"] });
+      qc.invalidateQueries({ queryKey: ["dicom-impact"] });
+      onClose();
+    },
+    onError: (e) => setError(formatApiError(e, "Failed to save association")),
+  });
+
+  const sameEndpoints = sourceId !== "" && sourceId === targetId;
+  const canSubmit =
+    !!sourceId && !!targetId && !sameEndpoints && !mut.isPending;
+
+  return (
+    <Modal title="Document a DICOM association" onClose={onClose} wide>
+      <form
+        onSubmit={(e) => {
+          e.preventDefault();
+          if (canSubmit) mut.mutate();
+        }}
+        className="space-y-3"
+      >
+        <p className="text-xs text-muted-foreground">
+          Direction matters: record which AE <em>initiates</em> the association.
+          The impact view reads outbound and inbound edges separately, because
+          they break in different ways when a host moves.
+        </p>
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+          <Field label="Source AE (initiator)">
+            <select
+              className={`${inputCls} font-mono`}
+              value={sourceId}
+              onChange={(e) => setSourceId(e.target.value)}
+            >
+              {aes.map((ae) => (
+                <option key={ae.id} value={ae.id}>
+                  {ae.ae_title}
+                </option>
+              ))}
+            </select>
+          </Field>
+          <Field label="Target AE (responder)">
+            <select
+              className={`${inputCls} font-mono`}
+              value={targetId}
+              onChange={(e) => setTargetId(e.target.value)}
+            >
+              {aes.map((ae) => (
+                <option key={ae.id} value={ae.id}>
+                  {ae.ae_title}
+                </option>
+              ))}
+            </select>
+          </Field>
+        </div>
+        {sameEndpoints && (
+          <p className="text-xs text-destructive">
+            An AE cannot be configured as a peer of itself.
+          </p>
+        )}
+        <Field label="Services">
+          <input
+            className={inputCls}
+            value={services}
+            onChange={(e) => setServices(e.target.value)}
+            placeholder="C-STORE, C-FIND, C-MOVE, MPPS"
+          />
+          <p className="text-[11px] text-muted-foreground">
+            Comma-separated. Whatever this association actually carries.
+          </p>
+        </Field>
+        <Field label="Notes">
+          <textarea
+            className={`${inputCls} min-h-[60px]`}
+            value={notes}
+            onChange={(e) => setNotes(e.target.value)}
+            placeholder="Network configuration notes"
+          />
+        </Field>
+        {error && <p className="text-xs text-destructive">{error}</p>}
+        <div className="flex justify-end gap-2 pt-2">
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-md border px-3 py-1.5 text-sm hover:bg-accent"
+          >
+            Cancel
+          </button>
+          <button
+            type="submit"
+            disabled={!canSubmit}
+            className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+          >
+            {mut.isPending ? "Saving…" : "Save"}
+          </button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
+// ── AE-table import ──────────────────────────────────────────────────
+
+// Fields an operator can map a CSV column onto. Mirrors
+// app.services.dicom.importer.IMPORTABLE_FIELDS; ae_title is the join
+// key and is the only mandatory one.
+const IMPORT_FIELDS: {
+  key: keyof DICOMAEImportColumnMap;
+  label: string;
+  required?: boolean;
+}[] = [
+  { key: "ae_title", label: "AE Title", required: true },
+  { key: "address", label: "IP address" },
+  { key: "port", label: "Port" },
+  { key: "tls_enabled", label: "TLS enabled" },
+  { key: "role", label: "Role" },
+  { key: "device_class", label: "Device class" },
+  { key: "vendor", label: "Vendor" },
+  { key: "model_name", label: "Model" },
+  { key: "department", label: "Department" },
+  { key: "location", label: "Location" },
+  { key: "notes", label: "Notes" },
+];
+
+const ACTION_CLS: Record<string, string> = {
+  create: "text-emerald-700 dark:text-emerald-400",
+  update: "text-sky-700 dark:text-sky-400",
+  skip: "text-muted-foreground",
+  error: "text-destructive",
+};
+
+function ImportModal({ onClose }: { onClose: () => void }) {
+  const qc = useQueryClient();
+  const [csvText, setCsvText] = useState("");
+  const [columnMap, setColumnMap] = useState<Record<string, string>>({
+    ae_title: "AE Title",
+  });
+  const [overwrite, setOverwrite] = useState(false);
+  const [error, setError] = useState("");
+  const [preview, setPreview] = useState<DICOMAEImportPreview | null>(null);
+  const [committed, setCommitted] = useState<DICOMAEImportCommit | null>(null);
+
+  const body = (): DICOMAEImportRequest => ({
+    csv_text: csvText,
+    column_map: Object.fromEntries(
+      Object.entries(columnMap).filter(([, v]) => v.trim() !== ""),
+    ) as unknown as DICOMAEImportColumnMap,
+    overwrite_existing: overwrite,
+  });
+
+  const previewMut = useMutation({
+    mutationFn: () => dicomApi.importPreview(body()),
+    onSuccess: (res) => {
+      setPreview(res);
+      setCommitted(null);
+      setError("");
+    },
+    onError: (e) => {
+      setPreview(null);
+      setError(formatApiError(e, "Preview failed"));
+    },
+  });
+
+  const commitMut = useMutation({
+    mutationFn: () => dicomApi.importCommit(body()),
+    onSuccess: (res) => {
+      setCommitted(res);
+      setError("");
+      qc.invalidateQueries({ queryKey: ["dicom-aes"] });
+    },
+    onError: (e) => setError(formatApiError(e, "Import failed")),
+  });
+
+  const rows = committed?.rows ?? preview?.rows ?? [];
+
+  return (
+    <Modal title="Import DICOM AE table" onClose={onClose} wide>
+      <div className="space-y-3">
+        <p className="text-xs text-muted-foreground">
+          Paste the estate&rsquo;s existing AE table. Rows key on the{" "}
+          <strong>AE Title</strong>, not the address — that is the identity
+          DICOM cares about. A blank address registers the title as a
+          reservation rather than failing; a <em>supplied</em> address IPAM does
+          not know is reported as a row error. Nothing is written until you
+          commit.
+        </p>
+
+        <Field label="CSV">
+          <textarea
+            className={`${inputCls} min-h-[140px] font-mono text-xs`}
+            value={csvText}
+            onChange={(e) => setCsvText(e.target.value)}
+            placeholder={"AE Title,IP,Port,Class\nCT1_RAD,10.30.0.5,104,CT"}
+          />
+        </Field>
+
+        <div>
+          <p className="mb-1 text-xs font-medium text-muted-foreground">
+            Column mapping — the header text in your file for each field
+          </p>
+          <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+            {IMPORT_FIELDS.map((f) => (
+              <label key={f.key} className="block space-y-1 text-xs">
+                <span className="block text-muted-foreground">
+                  {f.label}
+                  {f.required ? " *" : ""}
+                </span>
+                <input
+                  className="w-full rounded-md border bg-background px-2 py-1 text-sm"
+                  value={columnMap[f.key] ?? ""}
+                  onChange={(e) =>
+                    setColumnMap((m) => ({ ...m, [f.key]: e.target.value }))
+                  }
+                  placeholder={f.required ? "required" : "leave blank to skip"}
+                />
+              </label>
+            ))}
+          </div>
+        </div>
+
+        <label className="flex cursor-pointer items-start gap-2 rounded-md border p-3 text-sm">
+          <input
+            type="checkbox"
+            checked={overwrite}
+            onChange={(e) => setOverwrite(e.target.checked)}
+            className="mt-0.5"
+          />
+          <span>
+            Overwrite existing AE Titles
+            <span className="block text-[11px] text-muted-foreground">
+              Off by default: an already-registered title is skipped. On, its
+              mapped fields are updated — columns your file doesn&rsquo;t have
+              are left alone, so a partial export can&rsquo;t blank them.
+            </span>
+          </span>
+        </label>
+
+        {(preview || committed) && (
+          <div className="rounded-md border">
+            <div className="flex flex-wrap gap-3 border-b px-3 py-2 text-xs">
+              {committed ? (
+                <>
+                  <span className={ACTION_CLS.create}>
+                    {committed.created} created
+                  </span>
+                  <span className={ACTION_CLS.update}>
+                    {committed.updated} updated
+                  </span>
+                  <span className={ACTION_CLS.skip}>
+                    {committed.skipped} skipped
+                  </span>
+                  <span className={ACTION_CLS.error}>
+                    {committed.errors} errors
+                  </span>
+                </>
+              ) : (
+                preview && (
+                  <>
+                    <span className={ACTION_CLS.create}>
+                      {preview.create_count} to create
+                    </span>
+                    <span className={ACTION_CLS.update}>
+                      {preview.update_count} to update
+                    </span>
+                    <span className={ACTION_CLS.skip}>
+                      {preview.skip_count} to skip
+                    </span>
+                    <span className={ACTION_CLS.error}>
+                      {preview.error_count} errors
+                    </span>
+                  </>
+                )
+              )}
+            </div>
+            <div className="max-h-56 overflow-auto">
+              <table className="w-full text-xs">
+                <tbody>
+                  {rows.map((r) => (
+                    <tr key={r.line} className="border-b last:border-0">
+                      <td className="px-3 py-1 text-muted-foreground">
+                        {r.line}
+                      </td>
+                      <td className="px-3 py-1 font-mono">{r.ae_title}</td>
+                      <td className="px-3 py-1 font-mono text-muted-foreground">
+                        {r.address || "—"}
+                      </td>
+                      <td className={`px-3 py-1 ${ACTION_CLS[r.action] ?? ""}`}>
+                        {r.action}
+                      </td>
+                      <td className="px-3 py-1 text-muted-foreground">
+                        {r.reason}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+
+        {error && <p className="text-xs text-destructive">{error}</p>}
+
+        <div className="flex justify-end gap-2 pt-2">
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-md border px-3 py-1.5 text-sm hover:bg-accent"
+          >
+            {committed ? "Close" : "Cancel"}
+          </button>
+          <button
+            type="button"
+            onClick={() => previewMut.mutate()}
+            disabled={!csvText.trim() || previewMut.isPending}
+            className="rounded-md border px-3 py-1.5 text-sm hover:bg-accent disabled:opacity-50"
+          >
+            {previewMut.isPending ? "Previewing…" : "Preview"}
+          </button>
+          <button
+            type="button"
+            onClick={() => commitMut.mutate()}
+            disabled={!preview || !!committed || commitMut.isPending}
+            className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+            title={preview ? undefined : "Preview first"}
+          >
+            {commitMut.isPending ? "Importing…" : "Import"}
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
 // ── Create / edit ────────────────────────────────────────────────────
 
 function AEModal({
@@ -620,7 +1057,10 @@ function AEModal({
     mutationFn: () => {
       const shared = {
         ae_title: aeTitle.trim(),
-        port: Number(port.trim() || DICOM_DEFAULT_PORT),
+        // Parse defensively: a non-numeric field would otherwise become
+        // NaN, serialise to null, and hit the column's NOT NULL as an
+        // opaque server error rather than a fixable form message.
+        port: parsedPort ?? DICOM_DEFAULT_PORT,
         tls_enabled: tlsEnabled,
         role: role as DICOMRole,
         device_class: deviceClass as DICOMDeviceClass,
@@ -655,7 +1095,11 @@ function AEModal({
   // character costs more than one — so measure bytes, like the server.
   const titleBytes = new TextEncoder().encode(aeTitle.trim()).length;
   const titleValid = titleBytes >= 1 && titleBytes <= 16;
-  const canSubmit = titleValid && !mut.isPending;
+  const parsedPort = /^\d+$/.test(port.trim()) ? Number(port.trim()) : null;
+  const portValid =
+    port.trim() === "" ||
+    (parsedPort !== null && parsedPort >= 1 && parsedPort <= 65535);
+  const canSubmit = titleValid && portValid && !mut.isPending;
 
   return (
     <Modal

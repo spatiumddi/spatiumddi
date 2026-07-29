@@ -11075,6 +11075,8 @@ function EditSpaceModal({
         vrf_id: vrfId,
         asn_id: asnId,
         customer_id: customerId,
+        do_not_probe: doNotProbe,
+        do_not_probe_reason: doNotProbeReason,
       });
     },
     onSuccess: () => {

@@ -33,6 +33,7 @@ from app.db import task_session
 from app.models.audit import AuditLog
 from app.models.settings import PlatformSettings
 from app.models.tls_cert import TLSCertProbe, TLSCertTarget
+from app.services.ipam.probe_policy import check_probe_target
 from app.services.tls_cert.discovery import reconcile_discovered_targets
 from app.services.tls_cert.probe import probe_one
 
@@ -82,9 +83,19 @@ async def _probe_due_async() -> dict[str, Any]:
         )
 
         scanned = changed = unreachable = 0
+        suppressed = 0
         errors: list[str] = []
         for t in rows:
             label = t.display_name or t.host
+            # Fragile-device suppression (#722). A TLS handshake is an
+            # active probe like any other, and a BMC / imaging console
+            # that answers 443 is exactly the class the flag protects.
+            # Skipped silently — a scheduled sweep withheld on purpose is
+            # not an error, and logging one per target every 6 h would
+            # bury the real failures.
+            if (await check_probe_target(db, t.host)).blocked:
+                suppressed += 1
+                continue
             try:
                 result = await probe_one(db, t, default_interval_hours=interval, now=now)
                 if not result.ok:
@@ -164,6 +175,7 @@ async def _probe_due_async() -> dict[str, Any]:
             "scanned": scanned,
             "changed": changed,
             "unreachable": unreachable,
+            "suppressed": suppressed,
             "interval_hours": interval,
             "errors": len(errors),
         }
@@ -247,6 +259,11 @@ async def _probe_one_by_id_async(target_id: str) -> dict[str, Any]:
         t = await db.get(TLSCertTarget, uuid.UUID(target_id))
         if t is None:
             return {"status": "missing", "target_id": target_id}
+        # Same gate as the sweep (#722) — this fires on target create, so
+        # without it the very first probe of a flagged host still goes out.
+        verdict = await check_probe_target(db, t.host)
+        if verdict.blocked:
+            return {"status": "suppressed", "reason": verdict.reason, "source": verdict.source}
         ps = await db.get(PlatformSettings, _SINGLETON_ID)
         interval = _clamp_interval(ps.tls_cert_check_interval_hours if ps is not None else None)
         result = await probe_one(db, t, default_interval_hours=interval)

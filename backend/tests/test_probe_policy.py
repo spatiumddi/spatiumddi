@@ -400,6 +400,101 @@ async def test_override_is_per_request_not_a_mode(
     assert second.status_code == 422, second.text
 
 
+async def test_reprofile_now_refuses_flagged_subnet(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """ "Re-profile now" bypasses the refresh window on purpose — it must
+    not bypass this. The operator who clicked it is usually not the one
+    who wrote the vendor bulletin onto the subnet."""
+    _, token = await _make_superadmin(db_session)
+    _, _, subnet = await _make_chain(db_session)
+    subnet.do_not_probe = True
+    subnet.do_not_probe_reason = "CT console"
+    ip = IPAddress(subnet_id=subnet.id, address="10.20.30.11", status="allocated")
+    db_session.add(ip)
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/v1/ipam/addresses/{ip.id}/profile", headers=_auth(token), json={}
+    )
+    assert resp.status_code == 422, resp.text
+    assert "CT console" in resp.json()["detail"]
+    assert (await db_session.scalar(select(func.count()).select_from(NmapScan))) == 0
+
+
+async def test_copilot_nmap_apply_refuses_flagged_target(
+    db_session: AsyncSession,
+) -> None:
+    """The Copilot's apply path is a separate surface from the REST
+    route; a proposal the operator approved is still a scan."""
+    from app.services.ai.operations import RunNmapScanArgs, _apply_run_nmap_scan
+
+    user, _ = await _make_superadmin(db_session)
+    _, _, subnet = await _make_chain(db_session)
+    subnet.do_not_probe = True
+    subnet.do_not_probe_reason = "infusion pumps"
+    await db_session.flush()
+
+    with pytest.raises(ValueError) as exc:
+        await _apply_run_nmap_scan(
+            db_session, user, RunNmapScanArgs(target_ip="10.20.30.7", preset="quick")
+        )
+    assert "infusion pumps" in str(exc.value)
+    assert (await db_session.scalar(select(func.count()).select_from(NmapScan))) == 0
+
+
+async def test_mcp_network_ping_refuses_flagged_target(
+    db_session: AsyncSession,
+) -> None:
+    """MCP tools call the runners directly, so they need the gate too —
+    otherwise the copilot is the one surface that still probes."""
+    from app.services.ai.tools.nettools import NetworkPingArgs, network_ping
+
+    user, _ = await _make_superadmin(db_session)
+    _, _, subnet = await _make_chain(db_session)
+    subnet.do_not_probe = True
+    subnet.do_not_probe_reason = "patient monitors"
+    await db_session.flush()
+
+    result = await network_ping(db_session, user, NetworkPingArgs(host="10.20.30.7"))
+    assert "patient monitors" in (result.get("error") or "")
+    # A refusal, not a probe result — no exit code was ever produced.
+    assert "exit_code" not in result
+
+
+async def test_cidr_target_with_host_bits_does_not_error(
+    db_session: AsyncSession,
+) -> None:
+    """nmap accepts ``10.20.30.5/24``; Postgres's ``cidr()`` cast does
+    not. The guard has to normalise rather than raise a DataError, or a
+    mistyped target becomes a 500."""
+    _, _, subnet = await _make_chain(db_session)
+    subnet.do_not_probe = True
+    await db_session.flush()
+
+    verdict = await check_probe_target(db_session, "10.20.30.5/24")
+    assert verdict.blocked is True
+
+
+async def test_soft_deleted_ancestor_still_suppresses(
+    db_session: AsyncSession,
+) -> None:
+    """The session-wide ``deleted_at IS NULL`` filter applies to
+    ``db.get()`` too, so a trashed block would truncate the walk and the
+    guard would fail OPEN — the one direction it must never fail."""
+    from datetime import UTC, datetime
+
+    _, block, subnet = await _make_chain(db_session)
+    block.do_not_probe = True
+    block.do_not_probe_reason = "OT cell"
+    block.deleted_at = datetime.now(UTC)
+    await db_session.flush()
+
+    verdict = await resolve_probe_policy(db_session, subnet)
+    assert verdict.blocked is True
+    assert verdict.source == f"block:{block.id}"
+
+
 # ── Discovery sweep ──────────────────────────────────────────────────
 
 

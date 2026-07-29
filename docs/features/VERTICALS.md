@@ -348,6 +348,11 @@ explanation an operator wrote.
 | `tools.nmap` | 422 before the scan row is persisted. Covers CIDR targets in both directions — a `/16` sweep reaches a flagged `/24` inside it, and a `/25` inside a flagged `/16` is equally covered. |
 | `tools.nmap` auto-profile on DHCP lease | Checked before the refresh window, so it cannot be bypassed by tuning the other guards. |
 | `tools.network` ping / traceroute / mtr / port-test / tls-cert | 422 with the operator's reason quoted back. Gated before the vantage branch, so an appliance-vantage run is refused identically — the hazard is packets reaching the device, not which host emits them. |
+| "Re-profile now" on an IP | 422. It bypasses the refresh window on purpose; it does not bypass this, because the operator who clicked it is usually not the one who wrote the vendor bulletin onto the subnet. |
+| Operator Copilot | Both the `run_nmap_scan` apply path and the `network_ping` / `network_traceroute` / `network_port_test` / `network_tls_cert` MCP tools. A proposal the operator approved is still a scan, and the copilot must not be the one surface that still probes. No override on either — clearing the flag is a deliberate superadmin action on the tools page, not something to talk a copilot into. |
+| TLS certificate probes (#118) | The 6-hourly sweep skips flagged targets, and so does the probe dispatched on target create. A TLS handshake is an active probe, and a BMC or imaging console answering 443 is exactly the protected class. |
+| SNMP polling | Skipped, with `next_poll_at` deliberately left where it was — the poll did not happen, so nothing about its schedule should move. A GET is still a packet we originated. |
+| Scheduled Wake-on-LAN verification (#586) | The **active** chain only. Passive verification still runs, so a suppressed host is still verified — from sightings that already happened, without a packet being sent at it. Waking a fragile device is fine; poking it to confirm is not. |
 
 `dig`, `whois`, DNS-propagation and mac-vendor are **not** gated: they query a
 resolver or an off-prem service about a name, they do not probe the name's host.

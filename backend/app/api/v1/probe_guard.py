@@ -66,8 +66,16 @@ async def enforce_probe_target(
     suppressed; we are proceeding anyway). Callers that just want the
     guard can ignore the return value.
 
-    Does not commit. The audit row joins whatever transaction the caller
-    already owns, matching every other mutation on these surfaces.
+    **Commits the override audit row itself.** The obvious alternative —
+    leave it in the caller's transaction — silently loses it on the
+    stateless ``/tools/*`` handlers, which run their probe inline and
+    never commit at all (``mtr`` is server-only, so its override would
+    never have been auditable). Committing here also gets the ordering
+    right everywhere else: the auditable event is the *decision to
+    proceed*, so it must be durable before any packet leaves, whatever
+    the probe then does or fails to do. This runs at the top of a
+    handler, before any other mutation, so there is nothing half-written
+    to sweep into the commit.
     """
     verdict = await check_probe_target(db, target)
     if not verdict.blocked:
@@ -107,6 +115,7 @@ async def enforce_probe_target(
             new_value={"tool": tool, "target": target, **verdict.as_dict()},
         )
     )
+    await db.commit()
     return verdict
 
 

@@ -7376,10 +7376,19 @@ async def profile_address(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP address not found")
     _enforce_subnet_token_scope(current_user, ip.subnet_id)
 
-    from app.services.profiling.auto_profile import enqueue_now
+    from app.services.profiling.auto_profile import ProbeSuppressed, enqueue_now
 
     try:
         scan = await enqueue_now(db, ipam_row=ip, preset=body.preset)
+    except ProbeSuppressed as exc:
+        # Fragile-device suppression (#722) — a standing refusal, not a
+        # transient one, so 422 rather than the cap's 429. There is
+        # deliberately no override on this endpoint: an operator who
+        # genuinely must scan a suppressed host has the audited
+        # superadmin path on /nmap/scans.
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+        ) from exc
     except ValueError as exc:
         # Concurrency cap reached — surfaced as 429 so the UI can show
         # a "try again in a moment" message rather than treating this

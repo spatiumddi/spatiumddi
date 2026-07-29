@@ -29,6 +29,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.auth import User
 from app.models.settings import PlatformSettings
 from app.services.ai.tools.base import register_tool
+from app.services.ipam.probe_policy import check_probe_target
 from app.services.nettools import (
     inspect_tls_cert,
     run_dig,
@@ -54,6 +55,26 @@ def _trim(text: str) -> str:
     return text[:_STDOUT_CHARS] + f"\n… (truncated, {len(text)} chars total)"
 
 
+async def _probe_refusal(db: AsyncSession, host: str, *, action: str) -> dict[str, Any] | None:
+    """Refusal payload when ``host`` is inside a do-not-probe scope (#722).
+
+    These tools drive the runners directly rather than going through the
+    ``/tools/*`` handlers, so they need the gate applied here or the
+    copilot becomes the one surface that still probes flagged devices.
+
+    Returns a plain error dict rather than raising: every other refusal
+    in this module answers that way, and it puts the operator's own
+    reason in front of the model so it can explain *why* instead of
+    retrying. There is no override — clearing the flag is a deliberate
+    superadmin action on the tools page, not something to talk a copilot
+    into.
+    """
+    verdict = await check_probe_target(db, host)
+    if not verdict.blocked:
+        return None
+    return {"host": host, "error": verdict.message(action=action)}
+
+
 # ── network_ping ────────────────────────────────────────────────────
 
 
@@ -73,10 +94,13 @@ class NetworkPingArgs(BaseModel):
     args_model=NetworkPingArgs,
 )
 async def network_ping(
-    db: AsyncSession,  # noqa: ARG001 — stateless
+    db: AsyncSession,
     user: User,  # noqa: ARG001
     args: NetworkPingArgs,
 ) -> dict[str, Any]:
+    refusal = await _probe_refusal(db, args.host, action="Pinging")
+    if refusal is not None:
+        return refusal
     try:
         res = await run_ping(args.host)
     except NetToolArgError as exc:
@@ -110,10 +134,13 @@ class NetworkTracerouteArgs(BaseModel):
     args_model=NetworkTracerouteArgs,
 )
 async def network_traceroute(
-    db: AsyncSession,  # noqa: ARG001
+    db: AsyncSession,
     user: User,  # noqa: ARG001
     args: NetworkTracerouteArgs,
 ) -> dict[str, Any]:
+    refusal = await _probe_refusal(db, args.host, action="Tracing a route to")
+    if refusal is not None:
+        return refusal
     try:
         res = await run_traceroute(args.host)
     except NetToolArgError as exc:
@@ -208,10 +235,13 @@ class NetworkPortTestArgs(BaseModel):
     args_model=NetworkPortTestArgs,
 )
 async def network_port_test(
-    db: AsyncSession,  # noqa: ARG001
+    db: AsyncSession,
     user: User,  # noqa: ARG001
     args: NetworkPortTestArgs,
 ) -> dict[str, Any]:
+    refusal = await _probe_refusal(db, args.host, action="Port testing")
+    if refusal is not None:
+        return refusal
     proto = args.protocol.strip().lower()
     if proto not in {"tcp", "udp"}:
         return {"error": "protocol must be 'tcp' or 'udp'"}
@@ -248,10 +278,13 @@ class NetworkTlsCertArgs(BaseModel):
     args_model=NetworkTlsCertArgs,
 )
 async def network_tls_cert(
-    db: AsyncSession,  # noqa: ARG001
+    db: AsyncSession,
     user: User,  # noqa: ARG001
     args: NetworkTlsCertArgs,
 ) -> dict[str, Any]:
+    refusal = await _probe_refusal(db, args.host, action="TLS probing")
+    if refusal is not None:
+        return refusal
     res = await inspect_tls_cert(args.host, args.port, args.server_name)
     return {
         "host": res.host,
