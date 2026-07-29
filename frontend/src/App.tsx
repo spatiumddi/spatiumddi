@@ -38,6 +38,7 @@ import { AsnsPage } from "@/pages/network/AsnsPage";
 import { AsnDetailPage } from "@/pages/network/AsnDetailPage";
 import { AVFlowsPage } from "@/pages/network/AVFlowsPage";
 import { BACnetDevicesPage } from "@/pages/network/BACnetDevicesPage";
+import { DICOMPage } from "@/pages/network/DICOMPage";
 import { OTDevicesPage } from "@/pages/network/OTDevicesPage";
 import { CertificatesPage } from "@/pages/network/CertificatesPage";
 import { CircuitsPage } from "@/pages/network/CircuitsPage";
@@ -150,6 +151,7 @@ export default function App() {
             BACnet/IP (#541), OT / industrial (#542). */}
         <Route path="network/av" element={<AVFlowsPage />} />
         <Route path="network/bacnet" element={<BACnetDevicesPage />} />
+        <Route path="network/dicom" element={<DICOMPage />} />
         <Route path="network/ot" element={<OTDevicesPage />} />
         <Route path="network/certificates" element={<CertificatesPage />} />
         <Route path="network/circuits" element={<CircuitsPage />} />

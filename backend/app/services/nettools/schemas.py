@@ -227,6 +227,12 @@ class HostRequest(BaseModel):
     # Optional run-from vantage. None ⇒ run on the api container (server),
     # i.e. exactly today's behaviour. See NetToolTarget above.
     target: NetToolTarget | None = None
+    # Proceed against a scope marked do-not-probe (#722). Superadmin
+    # only, audited, per-request. Routing-only like ``target`` — it is
+    # stripped before the params are shipped to an appliance vantage,
+    # because the decision is made here and the supervisor has no
+    # business re-deciding it.
+    override_do_not_probe: bool = False
 
     @field_validator("host")
     @classmethod
@@ -333,6 +339,8 @@ class PortTestRequest(BaseModel):
     timeout_seconds: float = Field(default=5.0, ge=0.5, le=15.0)
     # Optional run-from vantage. None ⇒ server. See NetToolTarget.
     target: NetToolTarget | None = None
+    # See HostRequest.override_do_not_probe (#722).
+    override_do_not_probe: bool = False
 
     @field_validator("host")
     @classmethod
@@ -373,6 +381,8 @@ class TlsCertRequest(BaseModel):
     timeout_seconds: float = Field(default=8.0, ge=0.5, le=15.0)
     # Optional run-from vantage. None ⇒ server. See NetToolTarget.
     target: NetToolTarget | None = None
+    # See HostRequest.override_do_not_probe (#722).
+    override_do_not_probe: bool = False
 
     @field_validator("host")
     @classmethod

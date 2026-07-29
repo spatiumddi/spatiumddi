@@ -13,6 +13,7 @@ import {
   Radio,
   RefreshCw,
   Route as RouteIcon,
+  Scan,
   ShieldAlert,
   ShieldCheck,
   Trash2,
@@ -21,6 +22,7 @@ import {
 
 import {
   bacnetApi,
+  dicomApi,
   dnsblApi,
   ipamApi,
   lookingGlassApi,
@@ -580,11 +582,12 @@ export function IPDetailModal({
               the network.multicast feature module is disabled. */}
           <MulticastMembershipsSection addressId={addr.id} />
 
-          {/* BACnet/IP device (issue #541) + OT descriptor (issue #542).
-              Both self-hide when their module is off or the address
-              carries no such sidecar. */}
+          {/* BACnet/IP device (issue #541), OT descriptor (issue #542)
+              and DICOM AE (issue #723). Each self-hides when its module
+              is off or the address carries no such sidecar. */}
           <BACnetDeviceSection addressId={addr.id} />
           <OTDeviceSection addressId={addr.id} />
+          <DICOMAESection addressId={addr.id} />
 
           {/* Covering BGP route (issue #566 Phase 3). Hidden when the
               network.looking_glass module is off or nothing in the
@@ -872,6 +875,73 @@ function BACnetDeviceSection({ addressId }: { addressId: string }) {
           UDP {device.udp_port}
           {device.network_number !== null &&
             ` · BACnet network ${device.network_number}`}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── DICOM application entity (issue #723) ─────────────────────────
+//
+// The DICOM identity of this address, if it has one. A PACS host can
+// front several AE Titles; this shows the lowest-titled one, which is
+// enough to answer "is this an imaging node" — the full set is on the
+// DICOM page. 404 means "not a DICOM node", a normal answer here.
+//
+// Network identity only: nothing rendered here is patient data, because
+// the registry stores none.
+
+function DICOMAESection({ addressId }: { addressId: string }) {
+  const { enabled, ready } = useFeatureModules();
+  const dicomEnabled = ready && enabled("network.dicom");
+
+  const q = useQuery({
+    queryKey: ["dicom-ae-by-ip", addressId],
+    queryFn: () => dicomApi.byAddress(addressId),
+    enabled: dicomEnabled,
+    staleTime: 30_000,
+    // 404 = "this address has no DICOM AE", the common case.
+    retry: false,
+  });
+
+  if (!dicomEnabled) return null;
+  const ae = q.data;
+  if (!ae) return null;
+
+  return (
+    <div>
+      <div className="mb-1 flex items-center gap-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+        <Scan className="h-3 w-3" /> DICOM application entity
+      </div>
+      <div className="space-y-1 rounded-md border px-3 py-2 text-xs">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="font-mono text-[13px] font-semibold">
+            {ae.ae_title}
+          </span>
+          {ae.is_vendor_default && (
+            <span
+              className="inline-flex rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider text-amber-700 dark:bg-amber-950/30 dark:text-amber-400"
+              title="Still a vendor default — the most common cause of institution-wide AE Title collisions"
+            >
+              default
+            </span>
+          )}
+          {!ae.tls_enabled && (
+            <span
+              className="inline-flex rounded bg-rose-100 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider text-rose-700 dark:bg-rose-950/30 dark:text-rose-400"
+              title="Not recorded as TLS-enabled — plaintext DICOM carries ePHI in the clear"
+            >
+              plaintext
+            </span>
+          )}
+        </div>
+        <div className="text-muted-foreground">
+          {[ae.vendor, ae.model_name, ae.department, ae.location]
+            .filter(Boolean)
+            .join(" · ") || "No vendor / department recorded"}
+        </div>
+        <div className="text-muted-foreground">
+          Port {ae.port} · {ae.role} · {ae.device_class}
         </div>
       </div>
     </div>

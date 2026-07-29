@@ -41,6 +41,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB, CurrentUser
+from app.api.v1.probe_guard import enforce_probe_target
 from app.core.permissions import require_permission, user_has_permission
 from app.core.security import decode_access_token
 from app.db import get_db
@@ -153,6 +154,19 @@ async def create_scan(body: NmapScanCreate, db: DB, current_user: CurrentUser) -
 
     if not target_ip:
         raise HTTPException(status_code=422, detail="target_ip is required")
+
+    # Fragile-device suppression (#722) — refuse a target inside a
+    # do-not-probe scope before anything is persisted or dispatched.
+    # nmap targets can be a CIDR, so the check covers overlap in both
+    # directions (see services/ipam/probe_policy).
+    await enforce_probe_target(
+        db,
+        target=target_ip,
+        tool="nmap",
+        user=current_user,
+        override=body.override_do_not_probe,
+        action_label="Port scanning",
+    )
 
     # Pre-validate by building the argv now — surfaces NmapArgError
     # before we persist a doomed row.

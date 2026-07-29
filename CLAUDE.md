@@ -45,7 +45,7 @@ Always read the relevant spec doc(s) before writing code for a feature area.
 | `docs/features/INTEGRATIONS.md` | Read-only Kubernetes + Docker mirror integrations; setup, semantics, dashboard surface |
 | `docs/features/MIGRATION.md` | One-shot importers — DNS (BIND9 / Windows DNS / PowerDNS) + DHCP (Kea / Windows DHCP / ISC dhcpd.conf) into native rows; preview → commit, provenance, IPAM linkage |
 | `docs/features/LOOKING_GLASS.md` | BGP Looking Glass — receive-only GoBGP collector peering with operator routers; Sessions + Routes grid, IPAM/ASN/VRF linkage at ingest, `bgp_lg_*` alerts, as-path Query tab + collector-vantage tools; distinct from the #527 public-table hijack monitor. The MetalLB BGP-mode VIP advertiser (#566 D1) ships alongside it, opt-in (`bgp.enabled=false`, `frrk8s.enabled=false` by default; enabling pulls in FRRouting / GPL-2.0) |
-| `docs/features/VERTICALS.md` | Vertical network awareness — AV-over-IP (Dante / AES67 / SMPTE 2110) flow descriptors + reserved multicast ranges, BACnet/IP device-instance registry + BBMD conformity, Industrial-OT device inventory + Purdue zoning. Three default-on Network feature modules (`network.av` / `network.bacnet` / `network.ot`); registry + conformity only, no network probing (and why each discovery phase is deferred) |
+| `docs/features/VERTICALS.md` | Vertical network awareness — AV-over-IP (Dante / AES67 / SMPTE 2110) flow descriptors + reserved multicast ranges, BACnet/IP device-instance registry + BBMD conformity, Industrial-OT device inventory + Purdue zoning, DICOM AE Title registry + peer-association map. Four default-on Network feature modules (`network.av` / `network.bacnet` / `network.ot` / `network.dicom`); registry + conformity only, no network probing (and why each discovery phase is deferred). Also the un-gated fragile-device `do_not_probe` flag (#722) that suppresses SpatiumDDI's own active probes |
 | `docs/PERMISSIONS.md` | RBAC permission grammar (`{action, resource_type, resource_id?}`), builtin roles, wildcards |
 | `docs/features/SYSTEM_ADMIN.md` | System config, health dashboard, notifications, backup/restore, service control |
 | `docs/deployment/APPLIANCE.md` | OS appliance build, base OS selection, licensing |
@@ -359,11 +359,14 @@ sub-headings.
 #### Vertical network awareness
 
 Umbrella [#543](https://github.com/spatiumddi/spatiumddi/issues/543) —
-three IP-native domains a generic IPAM doesn't speak, built on the same
+four IP-native domains a generic IPAM doesn't speak, built on the same
 DDI primitives (uniqueness registry + segmentation documentation +
 conformity). See [`docs/features/VERTICALS.md`](docs/features/VERTICALS.md).
-All three children closed 2026-07-28; the umbrella stays open for the
-deferred discovery phases listed per-item below.
+The first three children closed 2026-07-28; the umbrella stays open for
+the deferred discovery phases listed per-item below. The healthcare pass
+concluded there is **no** `network.healthcare` catch-all — it splits into
+separable pieces, of which DICOM (#723) is the anchor and the
+probe-safety fix (#722) is not a vertical at all.
 
 - ✅ [**AV / Audio-Video-over-IP — Dante · AES67 · SMPTE 2110 · NDI**](https://github.com/spatiumddi/spatiumddi/issues/540)
   — Phase 1 + Copilot tools merged to `main` (#714), pending release cut:
@@ -391,6 +394,37 @@ deferred discovery phases listed per-item below.
   permanently out of scope. **Phase 2 (routable probes) deferred** —
   nmap runs NSE but nothing parses `<script>` output. **Phase 3
   (PROFINET DCP) deferred** — raw L2, needs a container capability grant.
+- 🟡 [**DICOM AE Title registry + peer-association map**](https://github.com/spatiumddi/spatiumddi/issues/723)
+  — Phase 1 merged to a branch, pending PR/release: `network.dicom`
+  module, `dicom_ae` with the institution-wide `uq_dicom_ae_title`
+  constraint (the differentiating hook — PS3.15 Annex H specifies a
+  registry for exactly this and nobody deploys one), `dicom_peer`
+  directed AE→AE edges + a renumber-impact view, CSV import of the
+  estate's AE table, 4 conformity checks, 3 MCP tools. `ip_address_id`
+  is **nullable / SET NULL**, deliberately unlike BACnet's CASCADE: an
+  AE Title outlives its host, so decommissioning demotes it to a
+  reservation rather than freeing a name peers still send to. AE-title
+  validation follows PS3.5 exactly — 16 **bytes**, spaces legal as
+  padding, all-space forbidden, no backslash / control chars. **No PHI,
+  ever** — network identity only, or SpatiumDDI becomes a HIPAA
+  Business Associate. **C-ECHO verification probe deferred** to its own
+  issue: it is the one probe in the family that does *not* inherit the
+  agent↔subnet blocker (routable unicast TCP), but it must respect #722.
+- 🟡 [**Fragile-device "do not probe" flag**](https://github.com/spatiumddi/spatiumddi/issues/722)
+  — merged to a branch, pending PR/release. **Not a vertical and not
+  behind a feature module**: a constraint on our own behaviour and a
+  correctness fix to three shipped features (#23 sweeps, `tools.nmap`,
+  `tools.network`), so hiding it behind a default-off module would leave
+  the sites that need it unprotected. `do_not_probe` +
+  `do_not_probe_reason` on `IPSpace` / `IPBlock` / `Subnet` **OR down**
+  the chain with no per-level inherit toggle — deliberately unlike the
+  DDNS fields they mirror, because a descendant must not be able to opt
+  a clinical space back into being swept. One resolver
+  (`services/ipam/probe_policy.py`) that every prober consults; audited
+  superadmin-only per-request override; `fragile_subnet_probed`
+  conformity check working backwards from the `ot_device` / `dicom_ae` /
+  `role="bmc"` registries; `bmc` added to `IP_ROLES`. Migration
+  `b1e7c04a93df`.
 
 #### Reporting & analytics
 

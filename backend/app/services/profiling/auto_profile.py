@@ -33,6 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.ipam import IPAddress, Subnet
 from app.models.nmap import NmapScan
+from app.services.ipam.probe_policy import resolve_probe_policy
 from app.services.nmap.runner import PRESETS
 
 logger = structlog.get_logger(__name__)
@@ -100,6 +101,20 @@ async def maybe_enqueue_for_lease(
     """
     try:
         if not getattr(subnet, "auto_profile_on_dhcp_lease", False):
+            return None
+
+        # Fragile-device suppression (#722). Checked before the refresh
+        # window, not after: this is the one guard that must not be
+        # bypassable by tuning the others, and a suppressed subnet should
+        # never reach the "how recently did we scan" question at all.
+        probe = await resolve_probe_policy(db, subnet)
+        if probe.blocked:
+            logger.info(
+                "auto_profile_skip_do_not_probe",
+                subnet=str(subnet.id),
+                ip=str(ipam_row.address),
+                source=probe.source,
+            )
             return None
 
         if _within_refresh_window(ipam_row.last_profiled_at, subnet.auto_profile_refresh_days):

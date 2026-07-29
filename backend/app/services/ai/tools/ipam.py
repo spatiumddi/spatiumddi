@@ -40,6 +40,7 @@ from app.models.network_service import NetworkService
 from app.models.overlay import OverlayNetwork
 from app.models.vrf import VRF
 from app.services.ai.tools.base import register_tool
+from app.services.ipam.probe_policy import resolve_probe_policy
 from app.services.oui import bulk_lookup_vendors, is_voip_phone_vendor, normalize_mac_key
 from app.services.tags import apply_tag_filter
 
@@ -384,6 +385,11 @@ async def get_subnet_summary(
     )
     counts_rows = (await db.execute(counts_stmt)).all()
     by_status = {row[0]: int(row[1]) for row in counts_rows}
+    # Fragile-device probe suppression (#722). Surfaced here rather than
+    # as its own tool because the flag is a *field*, not a resource
+    # family — and because the copilot most needs it exactly when it is
+    # about to suggest a scan of a subnet it just looked up.
+    probe = await resolve_probe_policy(db, subnet)
     return {
         "id": str(subnet.id),
         "network": str(subnet.network),
@@ -395,6 +401,9 @@ async def get_subnet_summary(
         "total_ips": int(subnet.total_ips or 0),
         "allocated_ips": int(subnet.allocated_ips or 0),
         "by_status": by_status,
+        "do_not_probe": probe.blocked,
+        "do_not_probe_reason": probe.reason,
+        "do_not_probe_source": probe.source or None,
     }
 
 

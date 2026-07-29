@@ -256,7 +256,8 @@ FACTORY_SECTIONS: tuple[FactorySection, ...] = (
             "ports, memberships) and the vertical descriptors layered "
             "on it — AV-over-IP flow profiles + reserved ranges, "
             "BACnet/IP devices + BBMD tables, industrial-OT devices + "
-            "Purdue zoning. The underlying IPAM addresses and subnets "
+            "Purdue zoning, and the DICOM AE Title registry + peer "
+            "map. The underlying IPAM addresses and subnets "
             "are untouched; only the vertical metadata is destroyed."
         ),
         phrase="DESTROY-VERTICALS",
@@ -265,6 +266,8 @@ FACTORY_SECTIONS: tuple[FactorySection, ...] = (
             "av_flow_profile",
             "av_reserved_range",
             "bacnet_device",
+            "dicom_peer",
+            "dicom_ae",
             "ot_device",
             "ot_zone",
             "multicast_membership",

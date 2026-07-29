@@ -48,6 +48,7 @@ from app.api.v1.dns_tools import (
     PropagationCheckResult,
     _query_one,
 )
+from app.api.v1.probe_guard import enforce_probe_target
 from app.api.v1.tools.schemas import (
     CommandResult,
     DigRequest,
@@ -177,9 +178,12 @@ async def _dispatch_to_appliance[ResultT: BaseModel](
         validated = request_model.model_validate(params)
     except ValidationError as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
-    # Strip the routing-only ``target`` before shipping — the supervisor
-    # always runs locally; a nested target would be meaningless there.
-    wire_params = validated.model_dump(mode="json", exclude={"target"})
+    # Strip the routing-only fields before shipping. ``target`` would be
+    # meaningless on a supervisor that always runs locally, and
+    # ``override_do_not_probe`` (#722) is an authorization decision this
+    # layer has already made — re-sending it would invite the agent to
+    # re-evaluate a call it has no data to make.
+    wire_params = validated.model_dump(mode="json", exclude={"target", "override_do_not_probe"})
 
     target_host = str(params.get("host") or params.get("name") or "")
     ready = agent_cmd.appliance_ready(
@@ -356,10 +360,39 @@ def _reject_non_server(tool: str, target: NetToolTarget | None) -> None:
         )
 
 
+async def _guard_probe(
+    db: DB,
+    current_user: CurrentUser,
+    *,
+    body: Any,
+    tool: str,
+    action_label: str,
+) -> None:
+    """Refuse a target inside a do-not-probe scope (#722).
+
+    Applied before the vantage branch, so an appliance-vantage run is
+    gated identically to a server-vantage one — the hazard is packets
+    reaching the device, and which of our hosts emits them is
+    irrelevant. Reads ``host`` because every gated tool here targets a
+    single host; ``dig`` is deliberately not gated (it queries a
+    resolver about a name, it does not probe the name's host), nor are
+    whois / dns-propagation / mac-vendor, which reach nothing on-prem.
+    """
+    await enforce_probe_target(
+        db,
+        target=getattr(body, "host", "") or "",
+        tool=tool,
+        user=current_user,
+        override=bool(getattr(body, "override_do_not_probe", False)),
+        action_label=action_label,
+    )
+
+
 @router.post("/ping", response_model=CommandResult, dependencies=[_RequirePerm])
 async def ping(
     body: HostRequest, db: DB, current_user: CurrentUser, _rl=RateLimitDefault
 ) -> CommandResult:
+    await _guard_probe(db, current_user, body=body, tool="ping", action_label="Pinging")
     dispatched = await _dispatch_reachability(
         tool="ping",
         body=body,
@@ -380,6 +413,9 @@ async def ping(
 async def traceroute(
     body: HostRequest, db: DB, current_user: CurrentUser, _rl=RateLimitDefault
 ) -> CommandResult:
+    await _guard_probe(
+        db, current_user, body=body, tool="traceroute", action_label="Tracing a route to"
+    )
     dispatched = await _dispatch_reachability(
         tool="traceroute",
         body=body,
@@ -397,12 +433,15 @@ async def traceroute(
 
 
 @router.post("/mtr", response_model=CommandResult, dependencies=[_RequirePerm])
-async def mtr(body: HostRequest, _rl=RateLimitDefault) -> CommandResult:
+async def mtr(
+    body: HostRequest, db: DB, current_user: CurrentUser, _rl=RateLimitDefault
+) -> CommandResult:
     # mtr is intentionally NOT in the appliance reachability set (it
     # needs CAP_NET_RAW and the per-vantage value is covered by
     # ping/traceroute). Reject a non-server target rather than silently
     # running on the server.
     _reject_non_server("mtr", body.target)
+    await _guard_probe(db, current_user, body=body, tool="mtr", action_label="Running mtr against")
     try:
         return await run_mtr(body.host)
     except NetToolArgError as exc:
@@ -447,6 +486,7 @@ async def whois(body: WhoisRequest, _rl=RateLimitOffprem) -> CommandResult:
 async def port_test(
     body: PortTestRequest, db: DB, current_user: CurrentUser, _rl=RateLimitDefault
 ) -> PortTestResult:
+    await _guard_probe(db, current_user, body=body, tool="port-test", action_label="Port testing")
     dispatched = await _dispatch_reachability(
         tool="port-test",
         body=body,
@@ -464,6 +504,7 @@ async def port_test(
 async def tls_cert(
     body: TlsCertRequest, db: DB, current_user: CurrentUser, _rl=RateLimitDefault
 ) -> TlsCertResult:
+    await _guard_probe(db, current_user, body=body, tool="tls-cert", action_label="TLS probing")
     dispatched = await _dispatch_reachability(
         tool="tls-cert",
         body=body,

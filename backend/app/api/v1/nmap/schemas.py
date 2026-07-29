@@ -73,6 +73,10 @@ class NmapScanCreate(BaseModel):
     port_spec: str | None = None
     extra_args: str | None = None
     ip_address_id: uuid.UUID | None = None
+    # Proceed against a scope marked do-not-probe (#722). Superadmin
+    # only, audited, and per-request — nothing is remembered, so the
+    # next scan of the same target is refused again.
+    override_do_not_probe: bool = False
 
     @field_validator("port_spec", "extra_args")
     @classmethod

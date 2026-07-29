@@ -26,6 +26,7 @@ from app.services.ai.tools import (  # noqa: F401, E402
     copilot,
     dhcp,
     diagnostics,
+    dicom,
     dns,
     dns_threat,
     dnsbl,
