@@ -34,6 +34,7 @@ from app.api.v1.dhcp import router as dhcp_router
 from app.api.v1.dhcp.ra_routers import router as ra_routers_router
 from app.api.v1.dhcp_import.router import router as dhcp_import_router
 from app.api.v1.diagnostics import router as diagnostics_router
+from app.api.v1.dicom import router as dicom_router
 from app.api.v1.dns.agents import router as dns_agents_router
 from app.api.v1.dns.blocklist_router import router as dns_blocklist_router
 from app.api.v1.dns.pool_router import router as dns_pool_router
@@ -242,6 +243,16 @@ api_v1_router.include_router(
     ],
 )
 api_v1_router.include_router(diagnostics_router, prefix="/diagnostics", tags=["diagnostics"])
+# DICOM AE registry (#723) — the healthcare member of the #543 vertical
+# family. No wake_publishing: it enriches IPAM rows and touches neither
+# the DNS nor the DHCP ConfigBundle, so there is no parked agent
+# long-poll to wake (same reasoning as the /av include above).
+api_v1_router.include_router(
+    dicom_router,
+    prefix="/dicom",
+    tags=["dicom"],
+    dependencies=[Depends(require_module("network.dicom"))],
+)
 api_v1_router.include_router(
     dns_router,
     prefix="/dns",

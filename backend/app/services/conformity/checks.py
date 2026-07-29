@@ -35,6 +35,7 @@ require a target should defensively short-circuit to
 from __future__ import annotations
 
 import ipaddress
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -48,12 +49,15 @@ from app.models.appliance import APPLIANCE_STATE_APPROVED, Appliance
 from app.models.audit import AuditLog
 from app.models.av import AVFlowProfile, AVReservedRange
 from app.models.bacnet import BACnetDevice
+from app.models.dicom import DICOMApplicationEntity
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
 from app.models.multicast import MulticastGroup
 from app.models.nmap import NmapScan
 from app.models.ot import OTDevice, OTZone
 from app.services import alerts as alert_service
 from app.services.av.ranges import check_allocation_conflict
+from app.services.dicom.titles import is_vendor_default
+from app.services.ipam.probe_policy import resolve_probe_policy
 from app.services.ot.zones import (
     effective_zone_for_address,
     purdue_mismatch,
@@ -1150,6 +1154,331 @@ async def check_ot_zone_missing_purdue_level(
     )
 
 
+# ── Check: fragile-device probe safety (#722) ───────────────────────
+
+
+@register("fragile_subnet_probed")
+async def check_fragile_subnet_probed(
+    db: AsyncSession,
+    *,
+    target: object | None,
+    target_kind: str,
+    args: dict[str, Any],
+    now: datetime,
+) -> CheckOutcome:
+    """A subnet full of fragile gear is marked do-not-probe.
+
+    The ``do_not_probe`` flag (#722) is opt-in, which means the failure
+    mode it exists to prevent — SpatiumDDI sweeping a VLAN whose vendor
+    explicitly said not to — survives right up until somebody remembers
+    to set it. This check closes that gap by working backwards from the
+    registries: if an operator has told us a subnet holds OT devices,
+    DICOM modalities, or BMC / IPMI endpoints, they have already told us
+    it is fragile. Being asked "should this be do-not-probe?" beats
+    finding out from a stalled infusion pump.
+
+    Three signals, any one of which makes the subnet in scope:
+
+    * ``ot_device`` rows (#542) — PLCs, RTUs, HMIs. The class that
+      motivated the flag.
+    * ``dicom_ae`` rows (#723) — imaging modalities and PACS nodes. A CT
+      console that drops its network stack mid-study is a clinical
+      incident, not an inconvenience.
+    * ``IPAddress.role == "bmc"`` — management-plane controllers on
+      embedded stacks, and a routine casualty of nmap.
+
+    A subnet with none of those is NOT_APPLICABLE rather than a pass:
+    most subnets in a mixed estate are ordinary, and flagging them all
+    would bury the handful that matter. Suppression inherited from a
+    parent block or space counts — the check asks whether probes are
+    actually withheld, not whether this particular row holds the flag.
+    """
+    _ = args, now, target_kind
+    if target is None or not isinstance(target, Subnet):
+        return CheckOutcome.not_applicable(
+            "Target row missing or wrong kind for fragile_subnet_probed"
+        )
+
+    ot_count = (
+        await db.execute(
+            select(func.count(OTDevice.id))
+            .select_from(OTDevice)
+            .join(IPAddress, IPAddress.id == OTDevice.ip_address_id)
+            .where(IPAddress.subnet_id == target.id)
+        )
+    ).scalar_one()
+    dicom_count = (
+        await db.execute(
+            select(func.count(DICOMApplicationEntity.id))
+            .select_from(DICOMApplicationEntity)
+            .join(IPAddress, IPAddress.id == DICOMApplicationEntity.ip_address_id)
+            .where(IPAddress.subnet_id == target.id)
+        )
+    ).scalar_one()
+    bmc_count = (
+        await db.execute(
+            select(func.count(IPAddress.id)).where(
+                IPAddress.subnet_id == target.id,
+                IPAddress.role == "bmc",
+            )
+        )
+    ).scalar_one()
+
+    signals = {
+        "ot_devices": int(ot_count),
+        "dicom_aes": int(dicom_count),
+        "bmc_addresses": int(bmc_count),
+    }
+    if not any(signals.values()):
+        return CheckOutcome.not_applicable(
+            "Subnet carries no registered fragile devices (OT / DICOM / BMC)"
+        )
+
+    verdict = await resolve_probe_policy(db, target)
+    if verdict.blocked:
+        return CheckOutcome.passed(
+            f"Subnet is marked do-not-probe ({verdict.source})",
+            {**signals, "source": verdict.source, "reason": verdict.reason},
+        )
+
+    present = ", ".join(f"{count} {label}" for label, count in signals.items() if count)
+    return CheckOutcome.fail(
+        detail=(
+            f"Subnet carries fragile devices ({present}) but is not marked "
+            "do-not-probe — discovery sweeps, nmap and the reachability tools "
+            "will target it"
+        ),
+        diagnostic=signals,
+    )
+
+
+# ── Checks: DICOM AE registry (#723) ────────────────────────────────
+
+
+@register("dicom_ae_default_title")
+async def check_dicom_ae_default_title(
+    db: AsyncSession,
+    *,
+    target: object | None,
+    target_kind: str,
+    args: dict[str, Any],
+    now: datetime,
+) -> CheckOutcome:
+    """No AE is still using a vendor default title.
+
+    Platform-level, because the harm is estate-wide: two vendors' factory
+    defaults collide long before an institution runs out of names, and a
+    duplicate AE Title breaks C-MOVE, Storage Commitment and Modality
+    Worklist in ways that take days to trace. ``uq_dicom_ae_title``
+    prevents two rows sharing ``DCM4CHEE``, but it cannot prevent the
+    *devices* from doing so — which is why "has anyone changed this from
+    the box" is a check rather than a constraint.
+
+    Warns rather than fails: a default title is not invalid, and an
+    institution mid-migration may legitimately still have some.
+    """
+    _ = args, now, target, target_kind
+    rows = list(
+        (await db.execute(select(DICOMApplicationEntity.id, DICOMApplicationEntity.ae_title))).all()
+    )
+    if not rows:
+        return CheckOutcome.not_applicable("No DICOM application entities registered")
+
+    offenders = [title for _id, title in rows if is_vendor_default(title)]
+    if not offenders:
+        return CheckOutcome.passed(
+            f"All {len(rows)} AE Titles have been changed from vendor defaults",
+            {"ae_count": len(rows)},
+        )
+    return CheckOutcome.warn(
+        detail=(
+            f"{len(offenders)} AE Title(s) are still vendor defaults "
+            f"({', '.join(sorted(offenders)[:20])}) — defaults are the most "
+            "common cause of institution-wide AE Title collisions"
+        ),
+        diagnostic={"default_titles": sorted(offenders)[:20], "ae_count": len(rows)},
+    )
+
+
+@register("dicom_ae_title_convention")
+async def check_dicom_ae_title_convention(
+    db: AsyncSession,
+    *,
+    target: object | None,
+    target_kind: str,
+    args: dict[str, Any],
+    now: datetime,
+) -> CheckOutcome:
+    """AE Titles match the institution's naming convention.
+
+    The convention arrives as a **check argument** (``pattern``), not as
+    a table. Every institution has a different one — ``SITE_MODALITY_NN``
+    here, ``DEPT-VENDOR-N`` there — and modelling a convention registry
+    would be a schema for a value that is one regular expression per
+    site. Supplying it per-policy also lets an estate run two policies at
+    once during a rename programme, scoped by whatever ``target_filter``
+    the operator sets.
+
+    Not applicable when no pattern is configured — a policy with no
+    convention has nothing to assert, and failing it would just teach
+    operators to disable the check.
+    """
+    _ = now, target, target_kind
+    pattern = str(args.get("pattern") or "").strip()
+    if not pattern:
+        return CheckOutcome.not_applicable(
+            "No naming convention configured — set the 'pattern' check argument"
+        )
+    try:
+        matcher = re.compile(pattern)
+    except re.error as exc:
+        # A bad pattern is a policy configuration error, not an estate
+        # finding. Warn so it surfaces on the dashboard instead of
+        # silently passing every AE.
+        return CheckOutcome.warn(
+            detail=f"AE Title convention pattern is not a valid regular expression: {exc}",
+            diagnostic={"pattern": pattern},
+        )
+
+    titles = list((await db.execute(select(DICOMApplicationEntity.ae_title))).scalars().all())
+    if not titles:
+        return CheckOutcome.not_applicable("No DICOM application entities registered")
+
+    # ``search`` rather than ``fullmatch``: operators write conventions
+    # with their own anchors (``^CT\\d{2}$``), and silently anchoring for
+    # them would make a deliberately-unanchored pattern behave
+    # differently here than everywhere else they test it.
+    offenders = [t for t in titles if not matcher.search(t)]
+    if not offenders:
+        return CheckOutcome.passed(
+            f"All {len(titles)} AE Titles match {pattern!r}",
+            {"pattern": pattern, "ae_count": len(titles)},
+        )
+    return CheckOutcome.fail(
+        detail=(
+            f"{len(offenders)} of {len(titles)} AE Title(s) do not match the "
+            f"convention {pattern!r} ({', '.join(sorted(offenders)[:20])})"
+        ),
+        diagnostic={
+            "pattern": pattern,
+            "non_conforming": sorted(offenders)[:20],
+            "ae_count": len(titles),
+        },
+    )
+
+
+@register("dicom_ae_outside_hipaa_scope")
+async def check_dicom_ae_outside_hipaa_scope(
+    db: AsyncSession,
+    *,
+    target: object | None,
+    target_kind: str,
+    args: dict[str, Any],
+    now: datetime,
+) -> CheckOutcome:
+    """Every bound AE sits in a subnet flagged ``hipaa_scope``.
+
+    DICOM associations carry ePHI. If an imaging device is addressable
+    from a subnet nobody has declared in scope, then either the scope
+    declaration is wrong or the device is somewhere it should not be —
+    both are findings, and neither is visible without cross-referencing
+    the two registries, which is what this does.
+
+    Unbound reservations are excluded rather than counted as failures: a
+    title with no host is not carrying anything. Rows whose subnet is
+    unknown are excluded for the same reason — an unknown is an unknown,
+    and treating it as a violation would flood the report with missing
+    data (the same tri-state discipline as ``purdue_mismatch``).
+    """
+    _ = args, now, target, target_kind
+    rows = list(
+        (
+            await db.execute(
+                select(
+                    DICOMApplicationEntity.ae_title,
+                    Subnet.network,
+                    Subnet.hipaa_scope,
+                ).join(Subnet, Subnet.id == DICOMApplicationEntity.subnet_id)
+            )
+        ).all()
+    )
+    if not rows:
+        return CheckOutcome.not_applicable(
+            "No DICOM application entities are bound to a known subnet"
+        )
+
+    offenders = [
+        {"ae_title": title, "subnet": str(network)}
+        for title, network, in_scope in rows
+        if not in_scope
+    ]
+    if not offenders:
+        return CheckOutcome.passed(
+            f"All {len(rows)} bound AE(s) sit in HIPAA-scope subnets",
+            {"bound_ae_count": len(rows)},
+        )
+    return CheckOutcome.fail(
+        detail=(
+            f"{len(offenders)} AE(s) are bound to subnets not flagged hipaa_scope "
+            f"({', '.join(o['ae_title'] for o in offenders[:20])}) — DICOM "
+            "associations carry ePHI, so either the scope flag or the device "
+            "placement is wrong"
+        ),
+        diagnostic={"out_of_scope": offenders[:20], "bound_ae_count": len(rows)},
+    )
+
+
+@register("dicom_ae_no_tls")
+async def check_dicom_ae_no_tls(
+    db: AsyncSession,
+    *,
+    target: object | None,
+    target_kind: str,
+    args: dict[str, Any],
+    now: datetime,
+) -> CheckOutcome:
+    """AEs are recorded as using TLS.
+
+    Plaintext DICOM puts ePHI on the wire in the clear. This reports what
+    the *registry* records, not what the wire does — nothing here probes
+    an association, and it never will without going through the
+    do-not-probe gate (#722) first. That distinction matters when reading
+    the result: a fail here means "nobody has recorded this AE as
+    encrypted", which in practice is how an un-encrypted estate looks,
+    but the evidence is documentation rather than observation.
+
+    Warns by default because remediating this is a device-by-device
+    project with real clinical downtime, and a hard fail on day one would
+    put every hospital's dashboard permanently red. Operators who have
+    finished that project can raise the policy's severity.
+    """
+    _ = args, now, target, target_kind
+    rows = list(
+        (
+            await db.execute(
+                select(DICOMApplicationEntity.ae_title, DICOMApplicationEntity.tls_enabled)
+            )
+        ).all()
+    )
+    if not rows:
+        return CheckOutcome.not_applicable("No DICOM application entities registered")
+
+    plaintext = [title for title, tls in rows if not tls]
+    if not plaintext:
+        return CheckOutcome.passed(
+            f"All {len(rows)} AE(s) are recorded as TLS-enabled",
+            {"ae_count": len(rows)},
+        )
+    return CheckOutcome.warn(
+        detail=(
+            f"{len(plaintext)} of {len(rows)} AE(s) are not recorded as TLS-enabled "
+            f"({', '.join(sorted(plaintext)[:20])}) — plaintext DICOM carries ePHI "
+            "in the clear"
+        ),
+        diagnostic={"plaintext_aes": sorted(plaintext)[:20], "ae_count": len(rows)},
+    )
+
+
 CHECK_CATALOG: list[dict[str, Any]] = [
     {
         "name": "has_field",
@@ -1302,6 +1631,43 @@ CHECK_CATALOG: list[dict[str, Any]] = [
         "name": "ot_zone_missing_purdue_level",
         "label": "Subnet with OT devices declares an OT zone (advisory)",
         "supports": ["subnet"],
+        "args": [],
+    },
+    {
+        "name": "fragile_subnet_probed",
+        "label": "Subnet with fragile devices is marked do-not-probe",
+        "supports": ["subnet"],
+        "args": [],
+    },
+    {
+        "name": "dicom_ae_default_title",
+        "label": "No DICOM AE is still on a vendor default title",
+        "supports": ["platform"],
+        "args": [],
+    },
+    {
+        "name": "dicom_ae_title_convention",
+        "label": "DICOM AE Titles match the institution naming convention",
+        "supports": ["platform"],
+        "args": [
+            {
+                "name": "pattern",
+                "type": "string",
+                "required": True,
+                "label": "Regular expression every AE Title must match",
+            }
+        ],
+    },
+    {
+        "name": "dicom_ae_outside_hipaa_scope",
+        "label": "DICOM AEs sit in subnets flagged hipaa_scope",
+        "supports": ["platform"],
+        "args": [],
+    },
+    {
+        "name": "dicom_ae_no_tls",
+        "label": "DICOM AEs are recorded as TLS-enabled",
+        "supports": ["platform"],
         "args": [],
     },
 ]

@@ -230,6 +230,12 @@ export interface IPSpace {
   ddns_hostname_policy?: DdnsHostnamePolicy;
   ddns_domain_override?: string | null;
   ddns_ttl?: number | null;
+  // Fragile-device probe suppression (#722). ORs down the
+  // space → block → subnet chain — any level setting it suppresses
+  // every level below, and a descendant cannot un-set it. Reason
+  // travels with the flag and is quoted back in every refusal.
+  do_not_probe?: boolean;
+  do_not_probe_reason?: string;
   // VRF / routing annotation — pure metadata; address allocation
   // ignores these. ``route_targets`` is an array of strings so the
   // operator can encode the inline import:A:B; export:C:D convention
@@ -274,6 +280,12 @@ export interface IPBlock {
   ddns_domain_override?: string | null;
   ddns_ttl?: number | null;
   ddns_inherit_settings?: boolean;
+  // Fragile-device probe suppression (#722). ORs down the
+  // space → block → subnet chain — any level setting it suppresses
+  // every level below, and a descendant cannot un-set it. Reason
+  // travels with the flag and is quoted back in every refusal.
+  do_not_probe?: boolean;
+  do_not_probe_reason?: string;
   vrf_id?: string | null;
   asn_id?: string | null;
   customer_id?: string | null;
@@ -398,6 +410,21 @@ export interface PlanApplyResult {
   block_ids: string[];
   subnet_ids: string[];
   applied_at: string;
+}
+
+/** Effective fragile-device probe verdict for a subnet (#722).
+ *
+ * ``inherited`` distinguishes "this subnet is flagged" from "an ancestor
+ * flagged it" — i.e. whether clearing the subnet's own checkbox would
+ * actually re-enable probing. */
+export interface ProbePolicy {
+  do_not_probe: boolean;
+  reason: string;
+  /** ``subnet:<id>`` / ``block:<id>`` / ``space:<id>``; null when
+   *  nothing is suppressing. */
+  source: string | null;
+  scope: string | null;
+  inherited: boolean;
 }
 
 export interface EffectiveDns {
@@ -580,6 +607,12 @@ export interface Subnet {
   discovery_enabled?: boolean;
   discovery_interval_minutes?: number;
   last_discovery_at?: string | null;
+  // Fragile-device probe suppression (#722). This is the subnet's OWN
+  // flag — an ancestor block / space can suppress a subnet whose own
+  // flag is false. Resolve the effective answer with
+  // ``ipamApi.probePolicy(subnetId)``.
+  do_not_probe?: boolean;
+  do_not_probe_reason?: string;
   // Compliance / classification flags. First-class booleans (rather
   // than freeform tags) so auditor queries — "show me every PCI
   // subnet" — are clean indexed predicates. Default false on every
@@ -699,7 +732,8 @@ export type IPRole =
   | "vip"
   | "vrrp"
   | "secondary"
-  | "gateway";
+  | "gateway"
+  | "bmc";
 
 export const IP_ROLE_OPTIONS: IPRole[] = [
   "host",
@@ -709,6 +743,12 @@ export const IP_ROLE_OPTIONS: IPRole[] = [
   "vrrp",
   "secondary",
   "gateway",
+  // Baseboard management controller — iDRAC / iLO / IPMI / Redfish
+  // (#722). A management-plane endpoint on a fragile embedded stack,
+  // and a routine casualty of ping sweeps: naming the class is what
+  // lets an operator find them all and decide whether their subnet
+  // belongs behind the do-not-probe flag.
+  "bmc",
 ];
 
 export const IP_ROLES_SHARED: ReadonlySet<IPRole> = new Set([
@@ -1365,6 +1405,8 @@ export const ipamApi = {
         | "vrf_id"
         | "customer_id"
         | "site_id"
+        | "do_not_probe"
+        | "do_not_probe_reason"
       >
     >,
   ) => api.put<IPBlock>(`/ipam/blocks/${id}`, data).then((r) => r.data),
@@ -1436,6 +1478,13 @@ export const ipamApi = {
     api.post<PlanApplyResult>(`/ipam/plans/${id}/apply`).then((r) => r.data),
   reopenSubnetPlan: (id: string) =>
     api.post<SubnetPlanRead>(`/ipam/plans/${id}/reopen`).then((r) => r.data),
+  // Effective do-not-probe verdict for a subnet (#722). A separate call
+  // rather than a field on the list rows: resolving it walks the block
+  // chain, which is cheap once but N walks on a list page.
+  getSubnetProbePolicy: (subnetId: string) =>
+    api
+      .get<ProbePolicy>(`/ipam/subnets/${subnetId}/probe-policy`)
+      .then((r) => r.data),
   getEffectiveBlockDns: (blockId: string) =>
     api
       .get<EffectiveDns>(`/ipam/blocks/${blockId}/effective-dns`)
@@ -17351,6 +17400,239 @@ export const bacnetApi = {
       .get<BACnetNextInstance>("/bacnet/next-instance", {
         params: start === undefined ? undefined : { start },
       })
+      .then((r) => r.data),
+};
+
+// ── DICOM AE registry (#723) ─────────────────────────────────────────
+
+export type DICOMRole = "scp" | "scu" | "both";
+
+export type DICOMDeviceClass =
+  | "modality"
+  | "pacs"
+  | "workstation"
+  | "archive"
+  | "router"
+  | "worklist"
+  | "printer"
+  | "other";
+
+export type DICOMAESource = "manual" | "import" | "echo";
+
+export interface DICOMApplicationEntity {
+  id: string;
+  /** Unique institution-wide by specification (PS3.15 Annex H). Case is
+   *  significant — peers match titles exactly. */
+  ae_title: string;
+  /** Null for a *reservation*: a title still burned into peer config
+   *  whose host was decommissioned. Not an error state. */
+  ip_address_id: string | null;
+  subnet_id: string | null;
+  address: string | null;
+  hostname: string | null;
+  port: number;
+  tls_enabled: boolean;
+  role: string;
+  device_class: string;
+  vendor: string;
+  model_name: string;
+  department: string;
+  location: string;
+  seen_via: string;
+  last_seen_at: string | null;
+  /** Network-configuration notes. Never patient data — the registry
+   *  stores none. */
+  notes: string;
+  tags: Record<string, unknown>;
+  custom_fields: Record<string, unknown>;
+  /** Still a known vendor default (DCM4CHEE, ANY-SCP, …) — advisory,
+   *  and the most common cause of estate-wide title collisions. */
+  is_vendor_default: boolean;
+  is_reservation: boolean;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface DICOMAECreate {
+  ae_title: string;
+  ip_address_id?: string | null;
+  port?: number;
+  tls_enabled?: boolean;
+  role?: DICOMRole;
+  device_class?: DICOMDeviceClass;
+  vendor?: string;
+  model_name?: string;
+  department?: string;
+  location?: string;
+  seen_via?: DICOMAESource;
+  last_seen_at?: string | null;
+  notes?: string;
+  tags?: Record<string, unknown>;
+  custom_fields?: Record<string, unknown>;
+}
+
+/** PATCH body. ``ip_address_id: null`` explicitly demotes the AE to a
+ *  reservation — the normal lifecycle event when a host is retired. */
+export interface DICOMAEUpdate {
+  ae_title?: string;
+  ip_address_id?: string | null;
+  port?: number;
+  tls_enabled?: boolean;
+  role?: DICOMRole;
+  device_class?: DICOMDeviceClass;
+  vendor?: string;
+  model_name?: string;
+  department?: string;
+  location?: string;
+  seen_via?: DICOMAESource;
+  last_seen_at?: string | null;
+  notes?: string;
+  tags?: Record<string, unknown>;
+  custom_fields?: Record<string, unknown>;
+}
+
+export interface DICOMAEListResponse {
+  items: DICOMApplicationEntity[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface DICOMAEListQuery {
+  limit?: number;
+  offset?: number;
+  subnet_id?: string;
+  ip_address_id?: string;
+  device_class?: DICOMDeviceClass;
+  role?: DICOMRole;
+  tls_enabled?: boolean;
+  unbound?: boolean;
+  q?: string;
+}
+
+/** A configured, directed AE→AE association. Documented by the operator
+ *  or imported — never inferred from traffic, which would carry PHI. */
+export interface DICOMPeer {
+  id: string;
+  source_ae_id: string;
+  source_ae_title: string;
+  target_ae_id: string;
+  target_ae_title: string;
+  services: string[];
+  notes: string;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface DICOMPeerCreate {
+  source_ae_id: string;
+  target_ae_id: string;
+  services?: string[];
+  notes?: string;
+}
+
+/** Blast radius of renumbering or retiring one AE. Split by direction:
+ *  outbound edges stop sending, inbound edges stop being able to reach
+ *  it — different remediation lists. */
+export interface DICOMImpact {
+  ae_id: string;
+  ae_title: string;
+  address: string | null;
+  outbound: DICOMPeer[];
+  inbound: DICOMPeer[];
+  total_peers: number;
+}
+
+export interface DICOMAEImportColumnMap {
+  ae_title: string;
+  address?: string | null;
+  port?: string | null;
+  tls_enabled?: string | null;
+  role?: string | null;
+  device_class?: string | null;
+  vendor?: string | null;
+  model_name?: string | null;
+  department?: string | null;
+  location?: string | null;
+  notes?: string | null;
+}
+
+export interface DICOMAEImportRequest {
+  csv_text: string;
+  column_map: DICOMAEImportColumnMap;
+  delimiter?: "," | ";" | "\t" | "|";
+  default_port?: number;
+  default_department?: string;
+  overwrite_existing?: boolean;
+  space_id?: string | null;
+}
+
+export interface DICOMAEImportRow {
+  line: number;
+  ae_title: string;
+  action: "create" | "update" | "skip" | "error";
+  reason: string;
+  address: string;
+  ip_address_id: string | null;
+  fields: Record<string, unknown>;
+}
+
+export interface DICOMAEImportPreview {
+  rows: DICOMAEImportRow[];
+  create_count: number;
+  update_count: number;
+  skip_count: number;
+  error_count: number;
+  max_rows: number;
+}
+
+export interface DICOMAEImportCommit {
+  rows: DICOMAEImportRow[];
+  created: number;
+  updated: number;
+  skipped: number;
+  errors: number;
+  ae_ids: string[];
+}
+
+export const dicomApi = {
+  listAes: (params?: DICOMAEListQuery) =>
+    api.get<DICOMAEListResponse>("/dicom/aes", { params }).then((r) => r.data),
+  getAe: (id: string) =>
+    api.get<DICOMApplicationEntity>(`/dicom/aes/${id}`).then((r) => r.data),
+  createAe: (data: DICOMAECreate) =>
+    api.post<DICOMApplicationEntity>("/dicom/aes", data).then((r) => r.data),
+  updateAe: (id: string, data: DICOMAEUpdate) =>
+    api
+      .patch<DICOMApplicationEntity>(`/dicom/aes/${id}`, data)
+      .then((r) => r.data),
+  removeAe: (id: string) => api.delete(`/dicom/aes/${id}`),
+  impact: (id: string) =>
+    api.get<DICOMImpact>(`/dicom/aes/${id}/impact`).then((r) => r.data),
+
+  listPeers: (aeId?: string) =>
+    api
+      .get<DICOMPeer[]>("/dicom/peers", {
+        params: aeId ? { ae_id: aeId } : undefined,
+      })
+      .then((r) => r.data),
+  createPeer: (data: DICOMPeerCreate) =>
+    api.post<DICOMPeer>("/dicom/peers", data).then((r) => r.data),
+  removePeer: (id: string) => api.delete(`/dicom/peers/${id}`),
+
+  // 404 = "this IP isn't a DICOM node" — a normal answer, not a failure.
+  byAddress: (ipAddressId: string) =>
+    api
+      .get<DICOMApplicationEntity>(`/dicom/by-address/${ipAddressId}`)
+      .then((r) => r.data),
+
+  importPreview: (data: DICOMAEImportRequest) =>
+    api
+      .post<DICOMAEImportPreview>("/dicom/aes/import/preview", data)
+      .then((r) => r.data),
+  importCommit: (data: DICOMAEImportRequest) =>
+    api
+      .post<DICOMAEImportCommit>("/dicom/aes/import/commit", data)
       .then((r) => r.data),
 };
 

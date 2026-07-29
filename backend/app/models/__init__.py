@@ -45,6 +45,7 @@ from app.models.dhcp import (
 )
 from app.models.dhcp_fingerprint import DHCPFingerprint
 from app.models.diagnostics import InternalError
+from app.models.dicom import DICOMApplicationEntity, DICOMPeer
 from app.models.dns import (
     DNSAcl,
     DNSAclEntry,
@@ -165,6 +166,8 @@ __all__ = [
     "AVFlowProfile",
     "AVReservedRange",
     "BACnetDevice",
+    "DICOMApplicationEntity",
+    "DICOMPeer",
     "OTDevice",
     "OTZone",
     "ASN",

@@ -865,6 +865,22 @@ range import above. See `docs/features/MIGRATION.md` § "NetBox → IPAM importe
 > because a sweep is only meaningful for subnets the SpatiumDDI worker
 > can actually route to, and unsolicited probes can trip an IDS.
 
+> **Fragile devices: `do_not_probe` (issue #722).** Medical- and
+> OT-device vendors instruct sites *not* to scan their VLANs, and
+> fragile IP stacks genuinely fault under a sweep. Marking a space,
+> block or subnet **Do not probe** (Edit → *Advanced* / *Networking*)
+> suppresses every active probe SpatiumDDI originates against it: this
+> sweep, `tools.nmap` including auto-profile-on-lease, and the
+> ping / traceroute / mtr / port-test / tls-cert tools. The flag **ORs
+> down** the space → block → subnet chain and a descendant cannot
+> un-set it — deliberately unlike the DDNS fields it otherwise mirrors,
+> because a safety constraint must not be overridable from below. A
+> superadmin can proceed per-request with `override_do_not_probe`,
+> which is audited. Passive collection (PCAP, DHCP fingerprinting, ARP
+> reads) is unaffected. Resolve the effective verdict with
+> `GET /api/v1/ipam/subnets/{id}/probe-policy`; the full design is in
+> `docs/features/VERTICALS.md` § "Fragile-device probe suppression".
+
 ### IP Discovery
 
 A per-subnet-opt-in Celery sweep discovers IPs that are live but not

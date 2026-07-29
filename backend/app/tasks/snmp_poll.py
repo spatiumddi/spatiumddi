@@ -36,6 +36,7 @@ from app.models.network import (
     NetworkInterface,
     NetworkNeighbour,
 )
+from app.services.ipam.probe_policy import check_probe_target
 from app.services.snmp import (
     cross_reference_arp,
     test_connection,
@@ -293,6 +294,25 @@ async def _poll_device_async(device_id: str) -> dict[str, Any]:
             ).scalar_one_or_none()
             if row is None:
                 summary["status"] = "locked_or_missing"
+                return summary
+
+            # Fragile-device suppression (#722). An SNMP poll is a
+            # unicast request we originate at the device, so it belongs
+            # under the same flag as ping and nmap — the fact that the
+            # payload is a GET rather than an echo is not what makes a
+            # fragile stack fall over. ``next_poll_at`` is deliberately
+            # NOT advanced: the poll did not happen, so nothing about
+            # its schedule should move.
+            verdict = await check_probe_target(db, str(row.ip_address))
+            if verdict.blocked:
+                logger.info(
+                    "snmp_poll_skipped_do_not_probe",
+                    device_id=device_id,
+                    host=str(row.ip_address),
+                    source=verdict.source,
+                )
+                summary["status"] = "do_not_probe"
+                summary["reason"] = verdict.reason
                 return summary
 
             now = datetime.now(UTC)

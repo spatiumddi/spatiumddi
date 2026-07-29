@@ -332,6 +332,26 @@ _BUILTIN_POLICIES: list[dict[str, object]] = [
         "check_kind": "ot_zone_missing_purdue_level",
         "check_args": {},
     },
+    # ── Fragile-device probe safety (issue #722) ────────────────────
+    {
+        "name": "Subnets with fragile devices are marked do-not-probe",
+        "description": (
+            "Medical- and OT-device vendors instruct sites not to scan their "
+            "VLANs, and fragile IP stacks genuinely fault under a sweep. Fails "
+            "when a subnet carries registered OT devices, DICOM application "
+            "entities, or BMC / IPMI addresses but is not covered by the "
+            "do-not-probe flag — meaning discovery sweeps, nmap and the "
+            "reachability tools will still target it. Suppression inherited "
+            "from a parent block or space counts as covered."
+        ),
+        "framework": "custom",
+        "reference": None,
+        "severity": "warning",
+        "target_kind": "subnet",
+        "target_filter": {},
+        "check_kind": "fragile_subnet_probed",
+        "check_args": {},
+    },
 ]
 
 

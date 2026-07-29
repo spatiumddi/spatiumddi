@@ -36,6 +36,7 @@ from app.config import settings
 from app.models.audit import AuditLog
 from app.models.ipam import Subnet
 from app.services.ipam.discovery import reconcile_subnet, sweep_subnet
+from app.services.ipam.probe_policy import resolve_probe_policy
 
 logger = structlog.get_logger(__name__)
 
@@ -74,6 +75,46 @@ async def _run_subnet_discovery_async(subnet_id_str: str) -> dict[str, Any]:
             subnet = await db.get(Subnet, subnet_id)
             if subnet is None or subnet.deleted_at is not None:
                 return {"status": "skipped", "reason": "subnet_missing"}
+
+            # Fragile-device suppression (#722). Checked here rather than
+            # only in the dispatcher because on-demand runs and re-tried
+            # tasks reach this function directly — the sweep must not be
+            # reachable by any path that skipped the gate. Stamp
+            # last_discovery_at so a flagged-but-still-enabled subnet
+            # doesn't get re-queued every 60 s tick, and record the
+            # reason on the audit row so the operator can see the sweep
+            # is being deliberately withheld rather than silently failing.
+            probe = await resolve_probe_policy(db, subnet)
+            if probe.blocked:
+                subnet.last_discovery_at = datetime.now(UTC)
+                db.add(
+                    AuditLog(
+                        user_id=None,
+                        user_display_name="system",
+                        auth_source="system",
+                        action="discover",
+                        resource_type="subnet",
+                        resource_id=str(subnet.id),
+                        resource_display=str(subnet.network),
+                        result="skipped",
+                        new_value={"skipped": "do_not_probe", **probe.as_dict()},
+                    )
+                )
+                await db.commit()
+                logger.info(
+                    "ipam.discovery.skipped_do_not_probe",
+                    subnet_id=subnet_id_str,
+                    network=str(subnet.network),
+                    source=probe.source,
+                )
+                # ``reason`` stays the machine-readable skip code, as on
+                # every other skip path here; the verdict rides in its own
+                # key so its free-text ``reason`` cannot shadow it.
+                return {
+                    "status": "skipped",
+                    "reason": "do_not_probe",
+                    "do_not_probe": probe.as_dict(),
+                }
 
             sweep = await sweep_subnet(str(subnet.network))
             if sweep is None:
@@ -138,6 +179,7 @@ async def _dispatch_due_async() -> int:
     engine = create_async_engine(settings.database_url, future=True)
     factory = async_sessionmaker(engine, expire_on_commit=False)
     queued = 0
+    skipped_do_not_probe = 0
     try:
         async with factory() as db:
             now = datetime.now(UTC)
@@ -160,12 +202,25 @@ async def _dispatch_due_async() -> int:
                 )
                 if not due:
                     continue
+                # Don't even queue a suppressed subnet (#722). The task
+                # re-checks and would bail anyway; skipping here keeps a
+                # flagged estate from generating a worker task per subnet
+                # per interval forever, and leaves last_discovery_at
+                # untouched so nothing looks like it ran.
+                if (await resolve_probe_policy(db, s)).blocked:
+                    skipped_do_not_probe += 1
+                    continue
                 try:
                     run_subnet_discovery.delay(str(s.id))
                     queued += 1
                 except Exception as exc:  # noqa: BLE001 — broker down? give up quietly
                     logger.warning("ipam.discovery.dispatch_enqueue_failed", error=str(exc))
                     break
+        if skipped_do_not_probe:
+            logger.info(
+                "ipam.discovery.dispatch_skipped_do_not_probe",
+                skipped=skipped_do_not_probe,
+            )
         return queued
     finally:
         await engine.dispose()

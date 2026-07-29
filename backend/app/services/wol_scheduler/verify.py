@@ -90,6 +90,7 @@ from app.models.wol_schedule import WolRunTarget
 # Same connect/RST probe + port set the IPAM discovery sweep uses, so a host that
 # reads as alive to a discovery scan reads as alive to a wake verify.
 from app.services.ipam.discovery import _TCP_PROBE_PORTS, _tcp_alive
+from app.services.ipam.probe_policy import check_probe_target
 from app.services.nettools.runner import run_ping
 
 if TYPE_CHECKING:
@@ -391,6 +392,31 @@ async def verify_run_targets(
         )
         return []
 
+    # Fragile-device suppression (#722). Resolved up front, before the
+    # fan-out, because the gather is deliberately DB-free — and it has to
+    # be a *set of addresses* rather than a per-row check for the same
+    # reason. Only the ACTIVE chain is suppressed: the passive path below
+    # reads sightings that already happened, so a suppressed host can
+    # still be verified without a packet being sent at it. Waking a
+    # fragile device is fine; poking it to confirm is not.
+    suppressed_addresses: set[str] = set()
+    if active_chain:
+        for row in probeable:
+            if not row.address:
+                continue
+            address = str(row.address)
+            if address in suppressed_addresses:
+                continue
+            if (await check_probe_target(db, address)).blocked:
+                suppressed_addresses.add(address)
+    if suppressed_addresses:
+        logger.info(
+            "wol_verify_active_suppressed",
+            run_id=str(run.id),
+            attempt=attempt,
+            suppressed=len(suppressed_addresses),
+        )
+
     # Fan out the active probes (network-bound); no DB access inside the gather.
     sem = asyncio.Semaphore(_PROBE_CONCURRENCY)
 
@@ -406,6 +432,11 @@ async def verify_run_targets(
         """
         trail: list[dict[str, Any]] = []
         if not row.address or not active_chain:
+            return row, False, None, trail
+        if str(row.address) in suppressed_addresses:
+            # Not "down" — unprobed. Falls through to the passive read
+            # with an empty trail, which is the honest record: we never
+            # asked, so we have no active evidence either way.
             return row, False, None, trail
         async with sem:
             for m in active_chain:

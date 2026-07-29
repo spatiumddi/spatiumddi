@@ -174,14 +174,16 @@ SECTIONS: tuple[Section, ...] = (
     ),
     Section(
         key="verticals",
-        label="Vertical network awareness (multicast / AV / BACnet / OT)",
+        label="Vertical network awareness (multicast / AV / BACnet / OT / DICOM)",
         description=(
             "The multicast stream registry (groups + PIM domains + "
             "ports + memberships) and the vertical descriptors layered "
             "on it: AV-over-IP flow profiles + reserved ranges "
             "(Dante / AES67 / SMPTE 2110), BACnet/IP devices with "
             "their internetwork-unique device instance numbers and "
-            "BBMD tables, and industrial-OT devices + Purdue zoning. "
+            "BBMD tables, industrial-OT devices + Purdue zoning, and "
+            "the DICOM AE Title registry with its configured "
+            "peer-association map. "
             "References IPAM (space / subnet / address) and VLANs."
         ),
         tables=(
@@ -194,6 +196,8 @@ SECTIONS: tuple[Section, ...] = (
             "bacnet_device",
             "ot_device",
             "ot_zone",
+            "dicom_ae",
+            "dicom_peer",
         ),
     ),
     Section(

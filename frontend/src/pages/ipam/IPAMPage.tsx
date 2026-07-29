@@ -29,6 +29,7 @@ import {
   Lock,
   Search,
   Radar,
+  ShieldAlert,
   Wrench,
   Sparkles,
   HelpCircle,
@@ -1690,6 +1691,91 @@ function DiscoverySettingsSection({
 }
 
 /**
+ * Fragile-device probe suppression (issue #722).
+ *
+ * Medical- and OT-device vendors instruct sites not to scan their
+ * VLANs, and fragile IP stacks genuinely fault under a sweep. This
+ * flag is what an operator sets to say so, and it suppresses every
+ * active probe SpatiumDDI can originate against the scope.
+ *
+ * Used at all three levels of the hierarchy (space / block / subnet),
+ * so the copy is deliberately level-agnostic and the caller passes
+ * ``inherited`` when an ancestor is already suppressing — clearing the
+ * local checkbox in that case changes nothing, and the UI has to say
+ * so rather than let an operator think they re-enabled probing.
+ */
+function DoNotProbeSection({
+  enabled,
+  reason,
+  onEnabledChange,
+  onReasonChange,
+  inherited,
+  inheritedFrom,
+}: {
+  enabled: boolean;
+  reason: string;
+  onEnabledChange: (v: boolean) => void;
+  onReasonChange: (v: string) => void;
+  inherited?: boolean;
+  inheritedFrom?: string | null;
+}) {
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-1.5">
+          <ShieldAlert className="h-3.5 w-3.5 text-muted-foreground" />
+          <span className="text-xs font-medium">
+            Do not probe (fragile devices)
+          </span>
+        </div>
+        <label className="flex cursor-pointer select-none items-center gap-1.5 text-xs">
+          <input
+            type="checkbox"
+            checked={enabled}
+            onChange={(e) => onEnabledChange(e.target.checked)}
+            className="h-3.5 w-3.5"
+          />
+          Suppress probes
+        </label>
+      </div>
+      {inherited && (
+        <p className="rounded-md border border-amber-500/30 bg-amber-500/5 px-2 py-1.5 text-[11px] text-amber-700 dark:text-amber-400">
+          Already suppressed by {inheritedFrom ?? "a parent scope"}. The flag
+          ORs down the hierarchy, so clearing it here will not re-enable probing
+          — clear it on the parent instead.
+        </p>
+      )}
+      <p className="text-xs italic text-muted-foreground">
+        Suppresses every active probe SpatiumDDI originates against this scope:
+        the scheduled discovery sweep, nmap (including auto-profile on DHCP
+        lease), and the ping / traceroute / port-test tools. Passive collection
+        (packet capture, DHCP fingerprinting, ARP reads) is unaffected — it was
+        never the hazard. A superadmin can override per request, and every
+        override is audited.
+      </p>
+      {enabled && (
+        <label className="block space-y-1 border-l-2 border-muted pl-5 text-xs">
+          <span className="block text-muted-foreground">
+            Reason (quoted back in every refusal)
+          </span>
+          <input
+            value={reason}
+            onChange={(e) => onReasonChange(e.target.value)}
+            placeholder="e.g. Alaris infusion pumps — vendor bulletin VB-2024-11 forbids scanning"
+            className="w-full rounded-md border bg-background px-2 py-1 text-sm"
+          />
+          <span className="block text-[11px] text-muted-foreground">
+            Worth filling in: a refusal that just says &ldquo;marked
+            do-not-probe&rdquo; is the kind an operator overrides without
+            thinking.
+          </span>
+        </label>
+      )}
+    </div>
+  );
+}
+
+/**
  * Compliance classification — first-class boolean flags on the
  * subnet for PCI / HIPAA / internet-facing scope. Used by the
  * Compliance dashboard at /admin/compliance to answer auditor
@@ -2386,6 +2472,13 @@ function CreateSubnetModal({
   // IP discovery (issue #23) — opt-in scheduled ping/ARP sweep.
   const [discoveryEnabled, setDiscoveryEnabled] = useState(false);
   const [discoveryIntervalMinutes, setDiscoveryIntervalMinutes] = useState(360);
+  // Fragile-device probe suppression (issue #722). On create there is
+  // no subnet row to resolve an effective verdict against yet, so the
+  // inherited hint is only shown on edit.
+  const [doNotProbe, setDoNotProbe] = useState(false);
+  const [doNotProbeReason, setDoNotProbeReason] = useState("");
+  const probeInherited = false;
+  const probeInheritedFrom: string | null = null;
   // Compliance / classification flags (issue #75).
   const [pciScope, setPciScope] = useState(false);
   const [hipaaScope, setHipaaScope] = useState(false);
@@ -2511,6 +2604,8 @@ function CreateSubnetModal({
         auto_profile_refresh_days: autoProfileRefreshDays,
         discovery_enabled: discoveryEnabled,
         discovery_interval_minutes: discoveryIntervalMinutes,
+        do_not_probe: doNotProbe,
+        do_not_probe_reason: doNotProbeReason,
         pci_scope: pciScope,
         hipaa_scope: hipaaScope,
         internet_facing: internetFacing,
@@ -2840,6 +2935,16 @@ function CreateSubnetModal({
               intervalMinutes={discoveryIntervalMinutes}
               onEnabledChange={setDiscoveryEnabled}
               onIntervalChange={setDiscoveryIntervalMinutes}
+            />
+          </div>
+          <div className="border-t pt-4">
+            <DoNotProbeSection
+              enabled={doNotProbe}
+              reason={doNotProbeReason}
+              onEnabledChange={setDoNotProbe}
+              onReasonChange={setDoNotProbeReason}
+              inherited={probeInherited}
+              inheritedFrom={probeInheritedFrom}
             />
           </div>
           <div className="border-t pt-4">
@@ -4494,6 +4599,15 @@ function SubnetDetail({
     for (const z of subnetZonesQuery.data ?? []) m[z.id] = z.name;
     return m;
   }, [subnetZonesQuery.data]);
+  // Effective do-not-probe verdict (#722). Resolved server-side because
+  // an ancestor block or space can suppress a subnet whose own flag is
+  // false — the case the badge most needs to catch.
+  const probePolicyQuery = useQuery({
+    queryKey: ["subnet-probe-policy", subnet.id],
+    queryFn: () => ipamApi.getSubnetProbePolicy(subnet.id),
+    staleTime: 30_000,
+  });
+  const probePolicy = probePolicyQuery.data;
   const [showAddModal, setShowAddModal] = useState(false);
   // Optional seed for ``AddAddressModal`` — set when the operator clicks
   // a gap-marker row so the modal opens in manual mode constrained to
@@ -5315,6 +5429,23 @@ function SubnetDetail({
               title="CGNAT space (RFC 6598, 100.64.0.0/10) — carrier-grade NAT, also the range overlays like Tailscale allocate. Not publicly routable; double-check before using for a normal on-prem LAN."
             >
               CGNAT
+            </span>
+          )}
+          {/* Fragile-device probe suppression (#722). Resolved, not the
+              subnet's own flag: a suppressing ancestor is exactly the
+              case an operator would otherwise miss. */}
+          {probePolicy?.do_not_probe && (
+            <span
+              className="inline-flex items-center rounded bg-rose-100 px-2 py-0.5 text-[11px] font-medium uppercase tracking-wider text-rose-700 dark:bg-rose-950/30 dark:text-rose-400"
+              title={
+                (probePolicy.inherited
+                  ? `Probes suppressed by ${probePolicy.scope ?? "a parent scope"}`
+                  : "Probes suppressed on this subnet") +
+                (probePolicy.reason ? ` — ${probePolicy.reason}` : "") +
+                ". Discovery sweeps, nmap and the reachability tools refuse targets in here."
+              }
+            >
+              do not probe
             </span>
           )}
           {subnet.name && (
@@ -7574,6 +7705,20 @@ function EditSubnetModal({
   const [discoveryIntervalMinutes, setDiscoveryIntervalMinutes] = useState(
     subnet.discovery_interval_minutes ?? 360,
   );
+  // Fragile-device probe suppression (issue #722). This is the subnet's
+  // OWN flag; the effective verdict (which an ancestor may be supplying)
+  // comes from the probe-policy query below.
+  const [doNotProbe, setDoNotProbe] = useState(subnet.do_not_probe ?? false);
+  const [doNotProbeReason, setDoNotProbeReason] = useState(
+    subnet.do_not_probe_reason ?? "",
+  );
+  const probePolicyQ = useQuery({
+    queryKey: ["subnet-probe-policy", subnet.id],
+    queryFn: () => ipamApi.getSubnetProbePolicy(subnet.id),
+    staleTime: 30_000,
+  });
+  const probeInherited = probePolicyQ.data?.inherited ?? false;
+  const probeInheritedFrom = probePolicyQ.data?.scope ?? null;
   // Compliance / classification flags (issue #75). First-class
   // booleans rather than freeform tags so the Compliance dashboard
   // queries hit indexed predicates.
@@ -7701,6 +7846,8 @@ function EditSubnetModal({
         auto_profile_refresh_days: autoProfileRefreshDays,
         discovery_enabled: discoveryEnabled,
         discovery_interval_minutes: discoveryIntervalMinutes,
+        do_not_probe: doNotProbe,
+        do_not_probe_reason: doNotProbeReason,
         pci_scope: pciScope,
         hipaa_scope: hipaaScope,
         internet_facing: internetFacing,
@@ -8069,6 +8216,16 @@ function EditSubnetModal({
               intervalMinutes={discoveryIntervalMinutes}
               onEnabledChange={setDiscoveryEnabled}
               onIntervalChange={setDiscoveryIntervalMinutes}
+            />
+          </div>
+          <div className="border-t pt-4">
+            <DoNotProbeSection
+              enabled={doNotProbe}
+              reason={doNotProbeReason}
+              onEnabledChange={setDoNotProbe}
+              onReasonChange={setDoNotProbeReason}
+              inherited={probeInherited}
+              inheritedFrom={probeInheritedFrom}
             />
           </div>
           <div className="border-t pt-4">
@@ -10893,6 +11050,14 @@ function EditSpaceModal({
   const [customerId, setCustomerId] = useState<string | null>(
     space.customer_id ?? null,
   );
+  // Fragile-device probe suppression (issue #722). Set at the space
+  // level it covers every block and subnet underneath, which is the
+  // shape a hospital or plant with a whole clinical/OT routing domain
+  // actually wants.
+  const [doNotProbe, setDoNotProbe] = useState(space.do_not_probe ?? false);
+  const [doNotProbeReason, setDoNotProbeReason] = useState(
+    space.do_not_probe_reason ?? "",
+  );
   const [tab, setTab] = useState<"dns" | "dhcp" | "networking" | "danger">(
     "dns",
   );
@@ -10910,6 +11075,8 @@ function EditSpaceModal({
         vrf_id: vrfId,
         asn_id: asnId,
         customer_id: customerId,
+        do_not_probe: doNotProbe,
+        do_not_probe_reason: doNotProbeReason,
       });
     },
     onSuccess: () => {
@@ -11148,6 +11315,14 @@ function EditSpaceModal({
               onChange={setCustomerId}
             />
           </Field>
+          <div className="border-t pt-4">
+            <DoNotProbeSection
+              enabled={doNotProbe}
+              reason={doNotProbeReason}
+              onEnabledChange={setDoNotProbe}
+              onReasonChange={setDoNotProbeReason}
+            />
+          </div>
         </div>
       )}
 
@@ -11597,6 +11772,12 @@ function EditBlockModal({
     block.customer_id ?? null,
   );
   const [siteId, setSiteId] = useState<string | null>(block.site_id ?? null);
+  // Fragile-device probe suppression (issue #722). Suppresses every
+  // subnet under this block; a descendant cannot un-set it.
+  const [doNotProbe, setDoNotProbe] = useState(block.do_not_probe ?? false);
+  const [doNotProbeReason, setDoNotProbeReason] = useState(
+    block.do_not_probe_reason ?? "",
+  );
   const [tab, setTab] = useState<
     "general" | "dns" | "dhcp" | "networking" | "danger"
   >("general");
@@ -11666,6 +11847,8 @@ function EditBlockModal({
         vrf_id: vrfId,
         customer_id: customerId,
         site_id: siteId,
+        do_not_probe: doNotProbe,
+        do_not_probe_reason: doNotProbeReason,
       }),
     onSuccess: (updated) => {
       qc.invalidateQueries({ queryKey: ["blocks", block.space_id] });
@@ -11888,6 +12071,14 @@ function EditBlockModal({
               onChange={setSiteId}
             />
           </Field>
+          <div className="border-t pt-4">
+            <DoNotProbeSection
+              enabled={doNotProbe}
+              reason={doNotProbeReason}
+              onEnabledChange={setDoNotProbe}
+              onReasonChange={setDoNotProbeReason}
+            />
+          </div>
         </div>
       )}
 

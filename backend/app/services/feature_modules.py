@@ -144,6 +144,12 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         description="Building-automation device registry — internetwork-unique device instance numbers, BACnet network numbers, and per-subnet BBMD designation, each attached to an existing IPAM address. Documents the BACnet topology (including the exactly-one-BBMD-per-subnet rule); never reads or writes device objects.",
     ),
     ModuleSpec(
+        id="network.dicom",
+        label="DICOM AE registry",
+        group="Network",
+        description="Medical-imaging Application Entity registry — the institution-wide-unique AE Titles that PS3.15 Annex H specifies a registry for and that in practice live in a spreadsheet, plus the configured AE→AE association map behind 'what breaks if I renumber this host'. Network identity only: no patient data, ever, and no DICOM traffic is read or generated.",
+    ),
+    ModuleSpec(
         id="network.ot",
         label="OT / industrial devices",
         group="Network",

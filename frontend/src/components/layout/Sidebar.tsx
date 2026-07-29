@@ -5,6 +5,7 @@ import {
   Activity,
   AudioLines,
   Building2,
+  Scan,
   Factory,
   Power,
   Network,
@@ -201,6 +202,12 @@ const networkInfrastructureNav = [
     icon: Waypoints,
     to: "/network/circuits",
     module: "network.circuit",
+  },
+  {
+    label: "DICOM AEs",
+    icon: Scan,
+    to: "/network/dicom",
+    module: "network.dicom",
   },
   {
     label: "Devices",

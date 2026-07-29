@@ -85,6 +85,7 @@ Each entry in `Role.permissions` (JSONB) is an object with this shape:
 | `wol_calendar`    | Subscribed iCal / CalDAV calendars whose all-day spans gate scheduled wakes (#586) |
 | `av_flow`         | AV-over-IP flow descriptors + operator-declared reserved multicast ranges (#540) — the Dante / AES67 / SMPTE 2110 layer over the multicast registry |
 | `bacnet_device`   | BACnet/IP device registry (#541) — internetwork-unique device instance numbers, vendor/model metadata, BBMD flag + BDT/FDT snapshots |
+| `dicom_ae`        | DICOM Application Entity registry (#723) — institution-wide-unique AE Titles, their host/port bindings, and the configured AE→AE association map. Network identity only; this permission never grants access to imaging data, which SpatiumDDI does not store |
 | `ot_device`       | Industrial / OT device inventory + Purdue zoning (#542) — read-only identification; this permission never grants control-protocol access, which is out of scope entirely |
 | `*`               | Wildcard — match any resource type                    |
 
@@ -146,7 +147,7 @@ on inactive.
 | `IPAM Editor`  | `admin` on `ip_space`, `ip_block`, `subnet`, `ip_address`, `address_set`, `vlan`, `nat_mapping`, `custom_field`, `manage_ipam_templates`, `customer`, `site`, `provider`, `network_service` |
 | `DNS Editor`   | `admin` on `dns_zone`, `dns_record`, `dns_group`, `dns_blocklist`, `manage_dns_pools` |
 | `DHCP Editor`  | `admin` on `dhcp_server`, `dhcp_scope`, `dhcp_pool`, `dhcp_static`, `dhcp_client_class`, `dhcp_option_template`, `dhcp_mac_block` |
-| `Network Editor` | `admin` on `manage_network_devices`, `manage_nmap_scans`, `manage_packet_capture`, `manage_block_sync`, `use_network_tools`, `manage_asns`, `vrf`, `circuit`, `multicast`, `av_flow`, `bacnet_device`, `ot_device`, `network_service`, `overlay_network`, `routing_policy`, `application_category`, `customer`, `site`, `provider`, `tls_cert` |
+| `Network Editor` | `admin` on `manage_network_devices`, `manage_nmap_scans`, `manage_packet_capture`, `manage_block_sync`, `use_network_tools`, `manage_asns`, `vrf`, `circuit`, `multicast`, `av_flow`, `bacnet_device`, `dicom_ae`, `ot_device`, `network_service`, `overlay_network`, `routing_policy`, `application_category`, `customer`, `site`, `provider`, `tls_cert` |
 | `Auditor`        | `read` on `conformity`, `audit`, `subnet`, `ip_address`, `dns_zone`, `dhcp_scope`, `tls_cert` — external auditor account, can view conformity dashboard + pull the auditor PDF + verify supporting evidence without making changes |
 | `Compliance Editor` | `admin` on `conformity`, `read` on `audit`, `subnet`, `ip_address`, `dns_zone`, `dhcp_scope` — for the team that authors / tunes conformity policies without touching operational config |
 | `Address Set Editor` | `admin` on `address_set` (#103) — delegated edit of a named IP slice within a subnet without subnet-wide write. Grant on a specific address-set id to scope a department admin to just their slice. Creating / resizing a set still requires write on the parent subnet. |

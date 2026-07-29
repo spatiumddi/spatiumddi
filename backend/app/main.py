@@ -246,7 +246,8 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
         "SD-WAN overlay topology + routing policies + the application "
         "catalog (#95), the customer-deliverable services (#94) those "
         "resources bundle into, the vertical network-awareness registries "
-        "(AV-over-IP flows, BACnet/IP devices, industrial-OT devices), and "
+        "(AV-over-IP flows, BACnet/IP devices, industrial-OT devices, "
+        "DICOM application entities), and "
         "the logical ownership tags (customer / site / provider) those "
         "entities reference.",
         [
@@ -261,6 +262,7 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
             {"action": "admin", "resource_type": "multicast"},
             {"action": "admin", "resource_type": "av_flow"},
             {"action": "admin", "resource_type": "bacnet_device"},
+            {"action": "admin", "resource_type": "dicom_ae"},
             {"action": "admin", "resource_type": "ot_device"},
             {"action": "admin", "resource_type": "network_service"},
             {"action": "admin", "resource_type": "overlay_network"},

@@ -68,6 +68,7 @@ from app.services.ipam.address_set_gate import (
 from app.services.ipam.address_set_gate import (
     user_can_write_ip as _user_can_write_ip,
 )
+from app.services.ipam.probe_policy import resolve_probe_policy
 from app.services.oui import bulk_lookup_vendors, is_voip_phone_vendor, normalize_mac_key
 from app.services.tags import apply_tag_filter
 
@@ -1692,6 +1693,11 @@ class IPSpaceCreate(BaseModel):
     ddns_hostname_policy: str = "client_or_generated"
     ddns_domain_override: DDNSDomainOverride = None
     ddns_ttl: int | None = None
+    # Fragile-device probe suppression (#722). Set at any level of the
+    # space → block → subnet chain; ORs downward and cannot be
+    # overridden from below.
+    do_not_probe: bool = False
+    do_not_probe_reason: str = ""
     # VRF / routing annotation. Pure metadata; address allocation
     # ignores these. ``route_targets`` is a list of strings rather
     # than a structured object so the inline ``import:A:B; export:C:D``
@@ -1737,6 +1743,8 @@ class IPSpaceUpdate(BaseModel):
     ddns_hostname_policy: str | None = None
     ddns_domain_override: DDNSDomainOverride = None
     ddns_ttl: int | None = None
+    do_not_probe: bool | None = None
+    do_not_probe_reason: str | None = None
     vrf_id: uuid.UUID | None = None
     vrf_name: str | None = None
     route_distinguisher: str | None = None
@@ -1774,6 +1782,8 @@ class IPSpaceResponse(BaseModel):
     ddns_hostname_policy: str = "client_or_generated"
     ddns_domain_override: str | None = None
     ddns_ttl: int | None = None
+    do_not_probe: bool = False
+    do_not_probe_reason: str = ""
     vrf_id: uuid.UUID | None = None
     vrf_name: str | None = None
     route_distinguisher: str | None = None
@@ -1814,6 +1824,9 @@ class IPBlockCreate(BaseModel):
     ddns_domain_override: DDNSDomainOverride = None
     ddns_ttl: int | None = None
     ddns_inherit_settings: bool = True
+    # Fragile-device probe suppression (#722) — see IPSpaceCreate.
+    do_not_probe: bool = False
+    do_not_probe_reason: str = ""
     asn_id: uuid.UUID | None = None
     vrf_id: uuid.UUID | None = None
     # Logical ownership (issue #91).
@@ -1862,6 +1875,8 @@ class IPBlockUpdate(BaseModel):
     ddns_domain_override: DDNSDomainOverride = None
     ddns_ttl: int | None = None
     ddns_inherit_settings: bool | None = None
+    do_not_probe: bool | None = None
+    do_not_probe_reason: str | None = None
     asn_id: uuid.UUID | None = None
     vrf_id: uuid.UUID | None = None
     customer_id: uuid.UUID | None = None
@@ -1897,6 +1912,8 @@ class IPBlockResponse(BaseModel):
     ddns_domain_override: str | None = None
     ddns_ttl: int | None = None
     ddns_inherit_settings: bool = True
+    do_not_probe: bool = False
+    do_not_probe_reason: str = ""
     vrf_id: uuid.UUID | None = None
     # Non-blocking warning when the block's VRF differs from its
     # parent space's VRF — intentional in some hub-and-spoke designs
@@ -1969,6 +1986,11 @@ class SubnetCreate(BaseModel):
     # IP discovery (issue #23) — opt-in scheduled ping/ARP sweep.
     discovery_enabled: bool = False
     discovery_interval_minutes: int = 360
+    # Fragile-device probe suppression (#722). Orthogonal to
+    # ``discovery_enabled``: a subnet can be opted into discovery and
+    # still be suppressed by an ancestor, in which case no sweep runs.
+    do_not_probe: bool = False
+    do_not_probe_reason: str = ""
     ipv6_allocation_policy: str = "random"
     # Compliance / classification flags — see Subnet model.
     pci_scope: bool = False
@@ -2104,6 +2126,8 @@ class SubnetUpdate(BaseModel):
     auto_profile_refresh_days: int | None = None
     discovery_enabled: bool | None = None
     discovery_interval_minutes: int | None = None
+    do_not_probe: bool | None = None
+    do_not_probe_reason: str | None = None
     ipv6_allocation_policy: str | None = None
     pci_scope: bool | None = None
     hipaa_scope: bool | None = None
@@ -2252,6 +2276,13 @@ class SubnetResponse(BaseModel):
     discovery_enabled: bool = False
     discovery_interval_minutes: int = 360
     last_discovery_at: datetime | None = None
+    # The subnet's OWN flag (#722), not the effective verdict — an
+    # ancestor can suppress a subnet whose own flag is False. The
+    # resolved answer is a separate call
+    # (``GET /ipam/subnets/{id}/probe-policy``) because resolving it
+    # per-row would put a hierarchy walk inside every list page.
+    do_not_probe: bool = False
+    do_not_probe_reason: str = ""
     ipv6_allocation_policy: str = "random"
     pci_scope: bool = False
     hipaa_scope: bool = False
@@ -2299,6 +2330,23 @@ class SubnetResponse(BaseModel):
                     },
                 }
         return data
+
+
+class ProbePolicyResponse(BaseModel):
+    """Effective do-not-probe verdict for a subnet (#722).
+
+    ``inherited`` distinguishes "this subnet is flagged" from "an
+    ancestor flagged it", which is what tells the UI whether clearing
+    the subnet's own checkbox would actually re-enable probing.
+    """
+
+    do_not_probe: bool
+    reason: str = ""
+    # ``"subnet:<id>"`` / ``"block:<id>"`` / ``"space:<id>"``; null when
+    # nothing is suppressing.
+    source: str | None = None
+    scope: str | None = None
+    inherited: bool = False
 
 
 class EffectiveDnsResponse(BaseModel):
@@ -4552,6 +4600,35 @@ async def deprecate_stale_ips(
         deprecated_count=deprecated,
         skipped=skipped,
         capped=capped,
+    )
+
+
+@router.get("/subnets/{subnet_id}/probe-policy", response_model=ProbePolicyResponse)
+async def get_subnet_probe_policy(
+    subnet_id: uuid.UUID, current_user: CurrentUser, db: DB
+) -> ProbePolicyResponse:
+    """Resolve the effective do-not-probe verdict for a subnet (#722).
+
+    A separate call rather than a field on ``SubnetResponse`` because
+    resolving it walks the block chain: cheap once, but N walks on a
+    list page for information only the detail view renders.
+
+    ``do_not_probe`` on the subnet row itself answers "did *this* row
+    set the flag"; this answers "will a probe actually be refused",
+    which is the question an operator staring at a greyed-out Discovery
+    toggle is asking.
+    """
+    _ = current_user
+    subnet = await db.get(Subnet, subnet_id)
+    if subnet is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+    verdict = await resolve_probe_policy(db, subnet)
+    return ProbePolicyResponse(
+        do_not_probe=verdict.blocked,
+        reason=verdict.reason,
+        source=verdict.source or None,
+        scope=verdict.scope_label or None,
+        inherited=verdict.blocked and not subnet.do_not_probe,
     )
 
 
@@ -7299,10 +7376,19 @@ async def profile_address(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP address not found")
     _enforce_subnet_token_scope(current_user, ip.subnet_id)
 
-    from app.services.profiling.auto_profile import enqueue_now
+    from app.services.profiling.auto_profile import ProbeSuppressed, enqueue_now
 
     try:
         scan = await enqueue_now(db, ipam_row=ip, preset=body.preset)
+    except ProbeSuppressed as exc:
+        # Fragile-device suppression (#722) — a standing refusal, not a
+        # transient one, so 422 rather than the cap's 429. There is
+        # deliberately no override on this endpoint: an operator who
+        # genuinely must scan a suppressed host has the audited
+        # superadmin path on /nmap/scans.
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+        ) from exc
     except ValueError as exc:
         # Concurrency cap reached — surfaced as 429 so the UI can show
         # a "try again in a moment" message rather than treating this

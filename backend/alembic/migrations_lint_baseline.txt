@@ -193,6 +193,8 @@ backend/alembic/versions/a9b3c7d5e2f1_add_vlans_module.py:drop_table:96
 backend/alembic/versions/ac3e1f0d8b42_acme_account.py:drop_table:104
 backend/alembic/versions/b1d4c9e57f02_appliance_id_fk_on_dns_dhcp_server.py:drop_column:81
 backend/alembic/versions/b1d4c9e57f02_appliance_id_fk_on_dns_dhcp_server.py:drop_column:83
+backend/alembic/versions/b1e7c04a93df_fragile_device_do_not_probe.py:drop_column:88
+backend/alembic/versions/b1e7c04a93df_fragile_device_do_not_probe.py:drop_column:89
 backend/alembic/versions/b2c84f7a91d3_unifi_integration.py:drop_column:168
 backend/alembic/versions/b2c84f7a91d3_unifi_integration.py:drop_column:171
 backend/alembic/versions/b2c84f7a91d3_unifi_integration.py:drop_table:173
@@ -420,6 +422,8 @@ backend/alembic/versions/c9a2f61e740b_wol_run_verify_params.py:drop_column:59
 backend/alembic/versions/c9a4e1f7b820_netbird_integration.py:drop_column:126
 backend/alembic/versions/c9a4e1f7b820_netbird_integration.py:drop_column:129
 backend/alembic/versions/c9a4e1f7b820_netbird_integration.py:drop_table:131
+backend/alembic/versions/c9a4f2e81b56_dicom_ae_registry.py:drop_table:176
+backend/alembic/versions/c9a4f2e81b56_dicom_ae_registry.py:drop_table:181
 backend/alembic/versions/c9d4a1e8b672_appliance_unattended_upgrades_policy.py:drop_column:75
 backend/alembic/versions/c9d4a1e8b672_appliance_unattended_upgrades_policy.py:drop_column:76
 backend/alembic/versions/c9d4a1e8b672_appliance_unattended_upgrades_policy.py:drop_column:77
