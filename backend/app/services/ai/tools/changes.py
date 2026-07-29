@@ -121,7 +121,10 @@ class FindChangeRequestsArgs(BaseModel):
 async def find_change_requests(
     db: AsyncSession, user: User, args: FindChangeRequestsArgs
 ) -> dict[str, Any]:
-    stmt = select(ChangeRequest)
+    # #696 — this tool is the GATE queue's. Self-service portal rows share the
+    # table under origin='portal' and have their own tool; without the pin the
+    # two surfaces would bleed into each other.
+    stmt = select(ChangeRequest).where(ChangeRequest.origin == "gate")
     if args.state is not None:
         stmt = stmt.where(ChangeRequest.state == args.state)
     if args.resource_type is not None:
@@ -163,7 +166,11 @@ class CountChangeRequestsArgs(BaseModel):
 async def count_change_requests(
     db: AsyncSession, user: User, args: CountChangeRequestsArgs
 ) -> dict[str, Any]:
-    stmt = select(ChangeRequest.state, func.count(ChangeRequest.id)).group_by(ChangeRequest.state)
+    stmt = (
+        select(ChangeRequest.state, func.count(ChangeRequest.id))
+        # #696 — gate rows only; portal rows are counted by count_provisioning_requests.
+        .where(ChangeRequest.origin == "gate").group_by(ChangeRequest.state)
+    )
     # READ RULE (#1): a non-superadmin / non-approve-holder may only count
     # their own requests — counting the whole queue leaks backlog size + (via
     # find) row contents. Force own-scope regardless of the ``mine`` arg.

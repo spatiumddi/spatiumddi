@@ -85,6 +85,7 @@ import { ConformityPage } from "@/pages/admin/ConformityPage";
 import { TrashPage } from "@/pages/admin/TrashPage";
 import { WebhooksPage } from "@/pages/admin/WebhooksPage";
 import { ChangeRequestsPage } from "@/pages/admin/ChangeRequestsPage";
+import RequestsPage from "@/pages/RequestsPage";
 import { PlatformInsightsPage } from "@/pages/admin/PlatformInsightsPage";
 import { SettingsPage } from "@/pages/SettingsPage";
 import { useAuth } from "@/hooks/useAuth";
@@ -238,6 +239,9 @@ export default function App() {
         <Route path="admin/domains/:id" element={<DomainDetailPage />} />
         <Route path="admin/webhooks" element={<WebhooksPage />} />
         <Route path="admin/change-requests" element={<ChangeRequestsPage />} />
+        {/* #696 self-service portal — deliberately top-level, not under
+            admin/: requesters are ordinary users, not administrators. */}
+        <Route path="requests" element={<RequestsPage />} />
         <Route path="admin/compliance" element={<CompliancePage />} />
         <Route path="admin/conformity" element={<ConformityPage />} />
         <Route path="admin/trash" element={<TrashPage />} />

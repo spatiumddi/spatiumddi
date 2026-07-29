@@ -49,6 +49,7 @@ from app.services.ai.tools import (  # noqa: F401, E402
     pairing,
     pcap,
     proposals,
+    provisioning_requests,
     radvd,
     redis,
     reports,
