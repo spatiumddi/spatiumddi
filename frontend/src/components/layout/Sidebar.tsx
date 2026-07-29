@@ -9,6 +9,7 @@ import {
   Power,
   Network,
   Globe,
+  Inbox,
   LayoutDashboard,
   Server,
   Router as RouterIcon,
@@ -92,6 +93,15 @@ const baseMainNav = [
   { label: "IPAM", icon: Network, to: "/ipam", end: true },
   { label: "DHCP", icon: Server, to: "/dhcp" },
   { label: "DNS", icon: Globe, to: "/dns", end: true },
+  // #696 — top-level rather than under Administration on purpose: the
+  // audience is ordinary users asking for a resource, and most of them will
+  // never see the admin section at all.
+  {
+    label: "Requests",
+    icon: Inbox,
+    to: "/requests",
+    module: "governance.requests",
+  },
 ];
 // IPAM-family children (all route under /ipam/*). Alphabetised, matching the
 // Network/Administration sub-group convention.
@@ -682,7 +692,11 @@ export function Sidebar({
       ? [{ label: "UniFi", icon: Wifi, to: "/unifi" }]
       : []),
   ].sort((a, b) => a.label.localeCompare(b.label));
-  const mainNav = baseMainNav;
+  // #696 — baseMainNav now carries a module-gated entry (Requests), so it
+  // has to go through the same filter every other nav group uses. Without
+  // this the item renders on every install even though governance.requests
+  // is default-off, and clicking it lands on a page whose API 404s.
+  const mainNav = filterByModule(baseMainNav);
 
   return (
     <>

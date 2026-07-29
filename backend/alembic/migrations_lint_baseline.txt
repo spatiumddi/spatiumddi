@@ -140,6 +140,8 @@ backend/alembic/versions/a4e91c7b3d82_dns_dga.py:drop_column:83
 backend/alembic/versions/a4e91c7b3d82_dns_dga.py:drop_column:84
 backend/alembic/versions/a4e91c7b3d82_dns_dga.py:drop_column:85
 backend/alembic/versions/a4e91c7b3d82_dns_dga.py:drop_column:86
+backend/alembic/versions/a4f81c26b9e3_self_service_requests.py:drop_column:88
+backend/alembic/versions/a4f81c26b9e3_self_service_requests.py:drop_column:89
 backend/alembic/versions/a4f9c2e8b316_appliance_supervisor_identity.py:drop_column:153
 backend/alembic/versions/a4f9c2e8b316_appliance_supervisor_identity.py:drop_table:156
 backend/alembic/versions/a5b8e9c31f42_ipspace_color.py:drop_column:31

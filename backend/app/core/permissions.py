@@ -78,6 +78,30 @@ RESOURCE_TYPE_APPLIANCE = "appliance"
 # not the requester.
 RESOURCE_TYPE_CHANGE_REQUEST = "change_request"
 
+# Self-service request portal surface (issue #696). The /api/v1/requests/*
+# router gates ``write`` (submit a request) and ``read`` (see your own
+# requests) against this resource_type.
+#
+# ``write`` rather than a bespoke ``create`` verb: the grammar's
+# ``_ADMIN_IMPLIES`` covers only read/write/delete/admin, so a ``create``
+# action would silently NOT be conferred by an ``admin`` grant on this type —
+# an operator granting ``admin,provisioning_request`` would get 403 on submit,
+# which is the opposite of what they asked for.
+#
+# This is the LOW-privilege half of the workflow and is meant to be granted
+# broadly — the "Requester" builtin role grants exactly these two and nothing
+# else. Holding it confers no ability to provision anything: a submitted
+# request only ever becomes a change to the platform when a *different*
+# operator who holds the underlying operation's own permission approves it,
+# enforced by the shared #62 approve spine.
+#
+# Deciding a portal request reuses ``approve,change_request`` rather than
+# introducing a second approve capability — an operator who is trusted to
+# approve is trusted to approve, and one queue permission is easier to reason
+# about than two. The catalog allow-list (services/requests/catalog.py) is
+# what bounds which operations can reach that approver at all.
+RESOURCE_TYPE_PROVISIONING_REQUEST = "provisioning_request"
+
 
 def _action_matches(granted: str, requested: str) -> bool:
     """Return True if a granted `action` string covers the requested action."""

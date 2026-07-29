@@ -74,6 +74,7 @@ from app.api.v1.panos import router as panos_router
 from app.api.v1.pcap import router as pcap_router
 from app.api.v1.proxmox import router as proxmox_router
 from app.api.v1.reports import router as reports_router
+from app.api.v1.requests import router as requests_router
 from app.api.v1.roles.router import router as roles_router
 from app.api.v1.saved_views import router as saved_views_router
 from app.api.v1.search.router import router as search_router
@@ -179,6 +180,12 @@ api_v1_router.include_router(
     prefix="/change-requests",
     tags=["change-requests"],
     dependencies=[Depends(require_module("governance.approvals"))],
+)
+api_v1_router.include_router(
+    requests_router,
+    prefix="/requests",
+    tags=["requests"],
+    dependencies=[Depends(require_module("governance.requests"))],
 )
 api_v1_router.include_router(
     circuits_router,

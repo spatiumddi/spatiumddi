@@ -203,6 +203,20 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
             {"action": "read", "resource_type": "change_request"},
         ],
     ),
+    "Requester": (
+        "Submit self-service requests for IP addresses, subnets, DNS records and "
+        "DHCP reservations (#696). This is the LOW-privilege half of the workflow "
+        "and is meant to be granted broadly — to a whole department, not just the "
+        "network team. Holding it confers no ability to provision anything: a "
+        "submitted request only becomes a change when a *different* operator who "
+        "holds the underlying operation's own permission (e.g. ``write,subnet`` to "
+        "approve a subnet request) approves it, enforced server-side by the shared "
+        "#62 approve spine. Requesters see only their own requests.",
+        [
+            {"action": "write", "resource_type": "provisioning_request"},
+            {"action": "read", "resource_type": "provisioning_request"},
+        ],
+    ),
     "DNS Editor": (
         "Full CRUD on DNS zones, records, server groups, blocklists, and pools.",
         [

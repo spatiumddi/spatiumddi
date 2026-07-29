@@ -421,6 +421,23 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         description="Two-person approval gating for high-blast-radius operations (deletes, bulk ops, factory reset, large imports). A risky action submitted by one operator is queued as a change request and only executes after a *different* eligible approver accepts it — the operation then runs under the approver's identity with the audit log carrying both user IDs. Default-off: when disabled (or no policy matches) every covered handler executes inline exactly as today.",
         default_enabled=False,
     ),
+    ModuleSpec(
+        id="governance.requests",
+        label="Self-service request portal",
+        group="Security",
+        description=(
+            "Lets low-privilege users request IP addresses, subnets, DNS records and "
+            "DHCP reservations they cannot create themselves. A request provisions "
+            "nothing on its own: it queues a pending row that a different operator — "
+            "who must hold the underlying operation's own permission — reviews with a "
+            "live preview and approves, at which point the SAME service-layer call a "
+            "manual create would make runs under the approver's identity. Reuses the "
+            "#62 approval lifecycle rather than a second state machine, so every "
+            "transition is audited and the expiry sweep is shared. Default-off: the "
+            "portal is a delegation model, and an operator should opt into delegating."
+        ),
+        default_enabled=False,
+    ),
     # UI — cross-cutting personalisation surfaces. Per-user, never shared.
     ModuleSpec(
         id="ui.saved_views",

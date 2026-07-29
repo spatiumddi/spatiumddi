@@ -9270,6 +9270,109 @@ export const changeRequestsApi = {
     api.delete<ChangeRequestQueued | "">(`/change-requests/policies/${id}`),
 };
 
+// ── Self-service request portal (#696) ──────────────────────────────────
+// The #62 approval lifecycle pointed the other way: a requester asks for
+// something they can't create themselves, and approving PROVISIONS it. Rows
+// share the change_request table under origin='portal', so the state
+// vocabulary is identical — but the two queues are served by different
+// endpoints and never show each other's rows.
+
+export const REQUEST_KINDS = [
+  "subnet",
+  "ip_address",
+  "dns_record",
+  "dhcp_reservation",
+] as const;
+export type RequestKindId = (typeof REQUEST_KINDS)[number];
+
+export interface RequestKind {
+  kind: RequestKindId;
+  label: string;
+  description: string;
+  category: string;
+  operation: string;
+  // JSON Schema of the backing operation's args model — the form is rendered
+  // from this, so there is no second client-side schema to drift.
+  args_schema: {
+    properties?: Record<string, Record<string, unknown>>;
+    required?: string[];
+    [k: string]: unknown;
+  };
+}
+
+export interface ProvisioningRequest {
+  id: string;
+  operation: string;
+  resource_type: string;
+  resource_display: string;
+  args: Record<string, unknown>;
+  preview_text: string;
+  justification: string | null;
+  state: ChangeRequestState;
+  requested_by_user_id: string | null;
+  requested_by_display: string;
+  decided_by_user_id: string | null;
+  decided_by_display: string | null;
+  decision_note: string | null;
+  result: Record<string, unknown> | null;
+  error: string | null;
+  expires_at: string;
+  decided_at: string | null;
+  executed_at: string | null;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface ProvisioningRequestListParams {
+  state?: ChangeRequestState;
+  mine?: boolean;
+  limit?: number;
+  offset?: number;
+}
+
+export interface SubmitRequestBody {
+  kind: RequestKindId;
+  args: Record<string, unknown>;
+  justification?: string | null;
+}
+
+export const requestsApi = {
+  catalog: () =>
+    api.get<RequestKind[]>("/requests/catalog").then((r) => r.data),
+  list: (params: ProvisioningRequestListParams = {}) =>
+    api.get<ProvisioningRequest[]>("/requests", { params }).then((r) => r.data),
+  get: (id: string) =>
+    api.get<ProvisioningRequest>(`/requests/${id}`).then((r) => r.data),
+  submit: (body: SubmitRequestBody) =>
+    api.post<ProvisioningRequest>("/requests", body).then((r) => r.data),
+  // No dedicated count endpoint — same reasoning as changeRequestsApi: the
+  // pending queue is small by construction, so a state=pending list is cheap.
+  countPending: () =>
+    api
+      .get<ProvisioningRequest[]>("/requests", {
+        params: { state: "pending", limit: 500 },
+      })
+      .then((r) => r.data.length),
+  approve: (id: string, decisionNote?: string) =>
+    api
+      .post<ProvisioningRequest>(`/requests/${id}/approve`, {
+        decision_note: decisionNote ?? null,
+      })
+      .then((r) => r.data),
+  reject: (id: string, decisionNote?: string) =>
+    api
+      .post<ProvisioningRequest>(`/requests/${id}/reject`, {
+        decision_note: decisionNote ?? null,
+      })
+      .then((r) => r.data),
+  cancel: (id: string, decisionNote?: string) =>
+    api
+      .post<ProvisioningRequest>(`/requests/${id}/cancel`, {
+        decision_note: decisionNote ?? null,
+      })
+      .then((r) => r.data),
+};
+
 export type MetricsWindow = "1h" | "6h" | "24h" | "7d";
 
 export interface DNSMetricsPoint {
