@@ -98,6 +98,11 @@ def _hint(exc: BaseException, port: int) -> str:
     )
 
 
+# Signing artefacts the authoritative server generates and owns. Never
+# modelled as SpatiumDDI records, so they must not surface as drift.
+_DNSSEC_ARTEFACTS = frozenset({"RRSIG", "NSEC", "NSEC3", "NSEC3PARAM", "DNSKEY", "CDS", "CDNSKEY"})
+
+
 async def axfr_zone_records(
     *,
     host: str,
@@ -112,7 +117,8 @@ async def axfr_zone_records(
     Apex SOA and NS are filtered out — SpatiumDDI manages those at the zone
     level, so importing them as user records would create duplicate control
     surfaces. Out-of-zone glue (an NS target living in a different zone) is
-    also skipped.
+    also skipped, as are DNSSEC signing artefacts (RRSIG / NSEC* / DNSKEY /
+    CDS / CDNSKEY), which the signing server owns and rotates itself.
     """
     import dns.name  # noqa: PLC0415
     import dns.query  # noqa: PLC0415
@@ -185,6 +191,14 @@ async def axfr_zone_records(
             if rtype == "SOA":
                 continue
             if rtype == "NS" and rel_label == "@":
+                continue
+            if rtype in _DNSSEC_ARTEFACTS:
+                # The daemon owns these — it mints them when the zone is
+                # signed and rotates them on its own schedule. They exist
+                # on the wire but never as SpatiumDDI records, so a drift
+                # report would list every signature as "extra on server"
+                # and a signed zone could never read as in sync. Affects
+                # every AXFR caller, not one driver.
                 continue
             for rdata in rdataset:
                 priority: int | None = None

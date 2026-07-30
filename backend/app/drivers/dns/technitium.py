@@ -259,6 +259,53 @@ class TechnitiumDriver(DNSDriver):
             zone=zone_name,
         )
 
+    async def pull_zone_records(self, server: Any, zone_name: str) -> list[RecordData]:
+        """AXFR the zone off the Technitium host, for the #61 drift report.
+
+        Technitium's own REST API would be the more natural source — it is
+        exactly what the live-pull importer reads — but that API listens on
+        loopback :5380 inside the agent's container and is reachable only
+        by the co-located agent. The control plane can only talk to the
+        server over DNS, so drift goes over AXFR, the same path BIND9 uses.
+
+        **This requires the zone to permit transfer to the control plane.**
+        Zone-transfer policy is derived from the group's ``allow_transfer``
+        (see ``_zone_options_payload`` in the agent driver), which defaults
+        to ``["none"]`` → ``Deny``. On a default install the AXFR is
+        REFUSED and the drift row surfaces that rather than silently
+        reporting "no drift" — an empty diff from a refused transfer would
+        be far worse than an error, because it reads as "in sync".
+        """
+        from app.drivers.dns._axfr import axfr_zone_records  # noqa: PLC0415
+
+        host = getattr(server, "host", None)
+        if not host:
+            raise RuntimeError("TechnitiumDriver.pull_zone_records: server.host is required")
+        port = getattr(server, "port", None) or 53
+        try:
+            return await axfr_zone_records(
+                host=host,
+                port=port,
+                zone_name=zone_name,
+                log_driver="technitium",
+                server_id=str(getattr(server, "id", "")),
+            )
+        except Exception as exc:
+            # A bare "REFUSED" tells the operator nothing about what to do.
+            # Name the setting that governs it.
+            if "REFUSED" in str(exc).upper():
+                raise RuntimeError(
+                    f"{host} refused the zone transfer for {zone_name!r}. Drift "
+                    "reads the live zone over AXFR, which needs two things on "
+                    "the group: 'allow transfer' must permit the control plane "
+                    "(it defaults to none), AND the group must have no TSIG "
+                    "keys — Technitium requires a SIGNED transfer once any key "
+                    "is named on the zone, and the control plane does not yet "
+                    "sign its AXFR (the same limitation as issue #734 for "
+                    "BIND9)."
+                ) from exc
+            raise
+
     # ── Validation / capabilities ─────────────────────────────────────────
 
     def validate_config(self, bundle: ConfigBundle) -> tuple[bool, list[str]]:

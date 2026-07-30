@@ -767,6 +767,19 @@ The difference from those is the record shape. PowerDNS hands back `content` str
 
 Only `Primary` zones are imported. Secondary / Stub / Forwarder / Catalog are reported as warnings — a secondary is a copy of someone else's data, and importing it would mint rows SpatiumDDI then serves authoritatively. Disabled records are skipped too, since importing one would resurrect something the operator had turned off. And because Technitium answers HTTP 200 even on failure, `_unwrap` checks the body's `status` — that is the only place an expired token surfaces.
 
+### 4B.3e Config drift (issue #61)
+
+`pull_zone_records` AXFRs the zone off the Technitium host, the same path BIND9's drift uses. Technitium's own REST API would be the more natural source — it is exactly what the live-pull importer reads — but that API listens on loopback `:5380` inside the agent's container and only the co-located agent can reach it, so the control plane goes over DNS.
+
+**Two prerequisites, and the second is a real limitation:**
+
+1. The group's `allow transfer` must permit the control plane. It defaults to `none`, which renders as Technitium `zoneTransfer: Deny`.
+2. **The group must have no TSIG keys.** `_zone_options_payload` names every group TSIG key on the zone once transfer is permitted, and Technitium then requires a *signed* transfer — an unsigned AXFR is REFUSED. The control plane does not yet sign its AXFR, which is exactly the limitation [#734](https://github.com/spatiumddi/spatiumddi/issues/734) tracks for BIND9. Verified both ways on a live daemon: with key names attached the transfer is REFUSED, and clearing them makes the same AXFR return NOERROR.
+
+The refusal is surfaced as an error on the drift row rather than an empty diff — an empty diff from a refused transfer would read as "in sync", which is the worst possible answer.
+
+Closing this properly means teaching the shared AXFR path to TSIG-sign, which fixes #734 for BIND9 at the same time. It is deliberately not done here: it touches shared infrastructure and secret decryption in the drift path, and deserves its own change.
+
 ### 4B.4 Record type mapping
 
 Technitium's API takes structured per-type params rather than PowerDNS's single wire-format `content` string — e.g. `ipAddress` for A/AAAA, `cname` for CNAME, `exchange`+`preference` for MX, `target`+`priority`+`weight`+`port` for SRV. SVCB/HTTPS are best-effort: the driver parses the BIND-zone-file-style rdata string SpatiumDDI stores (`'1 . alpn="h2,h3"'`) into Technitium's `svcPriority`/`svcTargetName`/`svcParams` (`key|value` pairs) — confirmed empirically that Technitium's `svcParams` wire format does **not** accept a comma-separated multi-value single param the way BIND's rdata does, so only the first value of a multi-value param carries through (logged as a warning); single-value params round-trip exactly.

@@ -493,3 +493,23 @@ def test_forward_zone_gate_is_driver_scoped() -> None:
     assert "technitium" in src
     # BIND9 must remain able to omit forwarders.
     assert "BIND9 groups may omit it" in src
+
+
+def test_technitium_supports_drift_pull() -> None:
+    """#61 drift needs a ``pull_zone_records``. Technitium's REST API is
+    agent-local (loopback :5380), so the control plane goes over AXFR —
+    the same path BIND9 uses."""
+    assert hasattr(TechnitiumDriver(), "pull_zone_records")
+
+
+def test_axfr_filters_dnssec_artefacts() -> None:
+    """Signing artefacts are minted and rotated by the authoritative
+    server and never modelled as SpatiumDDI records. Unfiltered, drift
+    lists every signature as "extra on server" and a signed zone can
+    never read as in sync — verified live before the fix. Shared helper,
+    so this affects BIND9 too, not just Technitium."""
+    from app.drivers.dns._axfr import _DNSSEC_ARTEFACTS
+
+    assert {"RRSIG", "NSEC", "NSEC3", "DNSKEY"} <= _DNSSEC_ARTEFACTS
+    # SOA/NS are handled separately (apex-scoped), not via this set.
+    assert "SOA" not in _DNSSEC_ARTEFACTS
