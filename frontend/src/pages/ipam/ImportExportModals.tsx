@@ -7,6 +7,7 @@ import {
   CheckCircle2,
   FileWarning,
   ChevronDown,
+  Printer,
 } from "lucide-react";
 import {
   ipamIoApi,
@@ -331,8 +332,11 @@ export function ExportButton({
   const [busy, setBusy] = useState(false);
   const [includeAddrs, setIncludeAddrs] = useState(false);
 
+  const [error, setError] = useState<string | null>(null);
+
   async function run(format: "csv" | "json" | "xlsx") {
     setBusy(true);
+    setError(null);
     try {
       await ipamIoApi.download({
         ...scope,
@@ -340,6 +344,27 @@ export function ExportButton({
         include_addresses: includeAddrs,
       });
       setOpen(false);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // #82 — the tree report. This is the larger half of the issue (a whole
+  // space or block as a handover document), so it has to be reachable
+  // from the space/block header, not just the subnet one. Honours the
+  // "include IP addresses" checkbox, which appends a scope-wide address
+  // table to the PDF.
+  async function runPdf() {
+    setBusy(true);
+    setError(null);
+    try {
+      await ipamIoApi.downloadPdf({
+        ...scope,
+        include_addresses: includeAddrs,
+      });
+      setOpen(false);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "PDF export failed");
     } finally {
       setBusy(false);
     }
@@ -376,6 +401,19 @@ export function ExportButton({
               </button>
             ))}
           </div>
+          <div className="my-1 border-t" />
+          <button
+            disabled={busy}
+            onClick={runPdf}
+            title="Print-ready report of this subtree"
+            className="flex w-full items-center gap-2 rounded px-2 py-1 text-left text-xs hover:bg-muted disabled:opacity-50"
+          >
+            <Printer className="h-3.5 w-3.5" />
+            Print / PDF…
+          </button>
+          {error && (
+            <p className="mt-1 px-2 text-[11px] text-destructive">{error}</p>
+          )}
         </div>
       )}
     </div>
@@ -595,8 +633,11 @@ export function SubnetImportExportButton({
   const [includeAddrs, setIncludeAddrs] = useState(true);
   const [showImport, setShowImport] = useState(false);
 
+  const [error, setError] = useState<string | null>(null);
+
   async function download(format: "csv" | "json" | "xlsx") {
     setBusy(true);
+    setError(null);
     try {
       await ipamIoApi.download({
         subnet_id: subnet.id,
@@ -604,6 +645,22 @@ export function SubnetImportExportButton({
         include_addresses: includeAddrs,
       });
       setOpen(false);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // #82 — the subnet detail report. Ignores the "include IP addresses"
+  // checkbox on purpose: a subnet PDF with no addresses is a page of
+  // metadata nobody asked for, so the backend always includes them here.
+  async function downloadPdf() {
+    setBusy(true);
+    setError(null);
+    try {
+      await ipamIoApi.downloadPdf({ subnet_id: subnet.id });
+      setOpen(false);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "PDF export failed");
     } finally {
       setBusy(false);
     }
@@ -654,6 +711,19 @@ export function SubnetImportExportButton({
                 </button>
               ))}
             </div>
+            <div className="my-1 border-t" />
+            <button
+              disabled={busy}
+              onClick={downloadPdf}
+              title="Print-ready report of this subnet and its addresses"
+              className="flex w-full items-center gap-2 rounded px-2 py-1 text-left text-xs hover:bg-muted disabled:opacity-50"
+            >
+              <Printer className="h-3.5 w-3.5" />
+              Print / PDF…
+            </button>
+            {error && (
+              <p className="mt-1 px-2 text-[11px] text-destructive">{error}</p>
+            )}
           </div>
         )}
       </div>

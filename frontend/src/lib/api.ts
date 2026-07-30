@@ -2276,6 +2276,75 @@ export const ipamIoApi = {
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
   },
+
+  /** Print / PDF export (#82) — the handover deliverable, as opposed to the
+   *  machine-readable formats above. A `subnet_id` scope renders the subnet
+   *  detail report (always includes its addresses); a `space_id` / `block_id`
+   *  scope renders the tree report. */
+  downloadPdf: async (params: {
+    space_id?: string;
+    block_id?: string;
+    subnet_id?: string;
+    include_addresses?: boolean;
+  }) => {
+    const qs = new URLSearchParams();
+    if (params.space_id) qs.set("space_id", params.space_id);
+    if (params.block_id) qs.set("block_id", params.block_id);
+    if (params.subnet_id) qs.set("subnet_id", params.subnet_id);
+    if (params.include_addresses) qs.set("include_addresses", "true");
+    let res;
+    try {
+      res = await api.get(`/ipam/export.pdf?${qs.toString()}`, {
+        responseType: "blob",
+      });
+    } catch (err) {
+      // With responseType "blob" an error body arrives as a Blob too, so the
+      // usual `response.data.detail` is unreadable — unwrap it to text and
+      // re-throw something the caller can actually display.
+      const data = (err as { response?: { data?: unknown } })?.response?.data;
+      if (data instanceof Blob) {
+        const text = await data.text();
+        let detail = text || "PDF export failed";
+        try {
+          const parsed = JSON.parse(text)?.detail;
+          // FastAPI returns a string for HTTPException but an *array* of
+          // {loc, msg, type} objects for a 422 validation error. Passing
+          // that array to new Error() stringifies to "[object Object]",
+          // so flatten it into something an operator can read.
+          if (typeof parsed === "string") {
+            detail = parsed;
+          } else if (Array.isArray(parsed)) {
+            detail =
+              parsed
+                .map((d) => (typeof d === "string" ? d : d?.msg))
+                .filter(Boolean)
+                .join("; ") || detail;
+          }
+        } catch {
+          // body wasn't JSON — fall back to the raw text
+        }
+        throw new Error(detail);
+      }
+      throw err;
+    }
+    const disp = (res.headers["content-disposition"] as string) || "";
+    const match = disp.match(/filename="?([^";]+)"?/i);
+    const ts = new Date()
+      .toISOString()
+      .slice(0, 19)
+      .replace(/[-:]/g, "")
+      .replace("T", "-");
+    const filename = match ? match[1] : `spatiumddi-ipam-${ts}.pdf`;
+    const blob = new Blob([res.data as BlobPart], { type: "application/pdf" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  },
 };
 
 export interface LoginResponse {
