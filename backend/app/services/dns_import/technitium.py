@@ -107,6 +107,21 @@ def _enum_num(table: dict[str, int], value: Any) -> str:
     return str(table.get(str(value), value))
 
 
+def _int_or(value: Any, default: int) -> int:
+    """``int(x or default)`` silently rewrites a legitimate ZERO to the
+    default, which matters here: SVCB/HTTPS priority 0 means AliasMode
+    (not ServiceMode), MX preference 0 is the highest priority, and URI
+    priority/weight 0 are valid. Only a genuinely absent or unparseable
+    value falls back.
+    """
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _normalize_fqdn(name: str) -> str:
     return name if name.endswith(".") else name + "."
 
@@ -148,16 +163,16 @@ def _rdata_to_value(rtype: str, rdata: dict[str, Any]) -> tuple[str, dict[str, i
     if rtype == "TXT":
         return str(rdata.get("text") or ""), extra
     if rtype == "MX":
-        extra["priority"] = int(rdata.get("preference") or 10)
+        extra["priority"] = _int_or(rdata.get("preference"), 10)
         return str(rdata.get("exchange") or ""), extra
     if rtype == "SRV":
-        extra["priority"] = int(rdata.get("priority") or 0)
-        extra["weight"] = int(rdata.get("weight") or 0)
-        extra["port"] = int(rdata.get("port") or 0)
+        extra["priority"] = _int_or(rdata.get("priority"), 0)
+        extra["weight"] = _int_or(rdata.get("weight"), 0)
+        extra["port"] = _int_or(rdata.get("port"), 0)
         return str(rdata.get("target") or ""), extra
     if rtype == "CAA":
         return (
-            f"{int(rdata.get('flags') or 0)} {rdata.get('tag') or 'issue'} "
+            f"{_int_or(rdata.get('flags'), 0)} {rdata.get('tag') or 'issue'} "
             f"\"{rdata.get('value') or ''}\"",
             extra,
         )
@@ -193,7 +208,8 @@ def _rdata_to_value(rtype: str, rdata: dict[str, Any]) -> tuple[str, dict[str, i
         )
     if rtype == "URI":
         return (
-            f"{rdata.get('priority') or 1} {rdata.get('weight') or 1} " f"{rdata.get('uri') or ''}",
+            f"{_int_or(rdata.get('priority'), 1)} "
+            f"{_int_or(rdata.get('weight'), 1)} {rdata.get('uri') or ''}",
             extra,
         )
     if rtype in ("SVCB", "HTTPS"):
@@ -201,7 +217,8 @@ def _rdata_to_value(rtype: str, rdata: dict[str, Any]) -> tuple[str, dict[str, i
         rendered = " ".join(f'{k}="{v}"' for k, v in sorted(params.items()))
         target = rdata.get("svcTargetName") or "."
         return (
-            f"{rdata.get('svcPriority') or 1} {target}" + (f" {rendered}" if rendered else ""),
+            f"{_int_or(rdata.get('svcPriority'), 1)} {target}"
+            + (f" {rendered}" if rendered else ""),
             extra,
         )
     # Unreachable for the supported set, but keeps the function total.
@@ -212,11 +229,11 @@ def _soa_from_rdata(rdata: dict[str, Any], ttl: int) -> ImportedSOA:
     return ImportedSOA(
         primary_ns=_normalize_fqdn(str(rdata.get("primaryNameServer") or "")),
         admin_email=_normalize_fqdn(str(rdata.get("responsiblePerson") or "")),
-        serial=int(rdata.get("serial") or 0),
-        refresh=int(rdata.get("refresh") or 86400),
-        retry=int(rdata.get("retry") or 7200),
-        expire=int(rdata.get("expire") or 3600000),
-        minimum=int(rdata.get("minimum") or 3600),
+        serial=_int_or(rdata.get("serial"), 0),
+        refresh=_int_or(rdata.get("refresh"), 86400),
+        retry=_int_or(rdata.get("retry"), 7200),
+        expire=_int_or(rdata.get("expire"), 3600000),
+        minimum=_int_or(rdata.get("minimum"), 3600),
         ttl=ttl,
     )
 
@@ -231,7 +248,7 @@ def _build_imported_zone(zone_name: str, records_payload: list[dict[str, Any]]) 
     for rec in records_payload:
         rtype = str(rec.get("type") or "").upper()
         rdata = rec.get("rData") or {}
-        ttl = int(rec.get("ttl") or 3600)
+        ttl = _int_or(rec.get("ttl"), 3600)
 
         if rtype == "SOA":
             soa = _soa_from_rdata(rdata, ttl)
@@ -333,7 +350,18 @@ async def parse_technitium_server(
 
     async with httpx.AsyncClient(timeout=timeout) as client:
         try:
-            resp = await client.get(_api_url(api_url, "zones/list"), params={"token": api_token})
+            resp = await client.get(
+                _api_url(api_url, "zones/list"),
+                params={
+                    "token": api_token,
+                    # 15.4.0 returns every zone and ignores these, but a
+                    # version that paginated would hand back page 1 and we
+                    # would silently import a fraction of the estate. Ask
+                    # for one big page, then assert nothing was held back.
+                    "pageNumber": 1,
+                    "zonesPerPage": _MAX_ZONES_PER_PULL,
+                },
+            )
         except httpx.HTTPError as exc:
             raise TechnitiumImportError(
                 f"Could not reach the Technitium API at {api_url!r}: {exc}"
@@ -351,6 +379,17 @@ async def parse_technitium_server(
         listing = _unwrap(body, "zone list")
 
         summaries = listing.get("zones") or []
+        # Refuse a truncated view. ``totalPages`` is absent on 15.4.0 (that
+        # endpoint is unpaginated there), so this guards against a future
+        # version quietly changing the contract, not today's behaviour.
+        total_pages = listing.get("totalPages")
+        if isinstance(total_pages, int) and total_pages > 1:
+            raise TechnitiumImportError(
+                f"The Technitium API paginated the zone list ({total_pages} pages) "
+                "and this importer reads one page. Importing now would silently "
+                "migrate only part of the estate — please report this, it means "
+                "the server's API contract has changed."
+            )
         if len(summaries) > _MAX_ZONES_PER_PULL:
             raise TechnitiumImportError(
                 f"Source has {len(summaries)} zones — over the "
@@ -367,6 +406,15 @@ async def parse_technitium_server(
                 warnings.append(
                     f"Skipped {name!r}: {ztype} zones aren't imported — only a "
                     "Primary holds authoritative data of its own."
+                )
+                continue
+            # A disabled zone is one the operator turned OFF on the source
+            # server. Importing it would bring it back live here — the same
+            # outcome the per-record disabled guard prevents, one level up.
+            if summary.get("disabled"):
+                warnings.append(
+                    f"Skipped {name!r}: disabled on the source server. Re-enable "
+                    "it there first if it should be imported."
                 )
                 continue
 

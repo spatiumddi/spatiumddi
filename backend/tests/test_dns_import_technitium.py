@@ -175,3 +175,32 @@ def test_unwrap_surfaces_body_level_failure() -> None:
     with pytest.raises(TechnitiumImportError, match="invalid-token"):
         _unwrap({"status": "invalid-token", "errorMessage": "token expired"}, "zone list")
     assert _unwrap({"status": "ok", "response": {"zones": []}}, "zone list") == {"zones": []}
+
+
+def test_int_or_preserves_legitimate_zero() -> None:
+    """``int(x or default)`` silently rewrites 0 to the default. That
+    matters: SVCB/HTTPS priority 0 is AliasMode (not ServiceMode), MX
+    preference 0 is the highest priority, and URI priority/weight 0 are
+    valid."""
+    from app.services.dns_import.technitium import _int_or
+
+    assert _int_or(0, 10) == 0
+    assert _int_or(None, 10) == 10
+    assert _int_or("", 10) == 10
+    assert _int_or("garbage", 10) == 10
+
+    value, extra = _rdata_to_value("MX", {"exchange": "mail.example.net", "preference": 0})
+    assert extra["priority"] == 0
+
+    value, _ = _rdata_to_value(
+        "HTTPS", {"svcPriority": 0, "svcTargetName": "svc.example.net", "svcParams": {}}
+    )
+    assert value.startswith("0 "), value
+
+
+def test_build_imported_zone_preserves_zero_ttl() -> None:
+    zone = _build_imported_zone(
+        "example.com",
+        [{"name": "www.example.com", "type": "A", "ttl": 0, "rData": {"ipAddress": "10.0.0.1"}}],
+    )
+    assert zone.records[0].ttl == 0

@@ -1001,14 +1001,22 @@ def test_write_tls_cert_returns_none_on_garbage(tmp_path: Path) -> None:
     assert d._write_tls_cert({"cert_pem": "", "key_pem": ""}) is None
 
 
-def test_transport_settings_never_enable_listener_without_cert(tmp_path: Path) -> None:
+def test_transport_settings_force_listeners_off_without_cert(tmp_path: Path) -> None:
     """Technitium accepts enableDnsOverTls=true even when the cert path in
-    the SAME call is rejected, which would leave a listener up with no
-    certificate. So nothing is enabled unless the cert landed first."""
+    the SAME call is rejected, so a listener must never be enabled without
+    a cert. Crucially it must also be actively turned OFF: bailing out
+    would leave an already-enabled listener up on a stale certificate,
+    which is the opposite of "every path degrades to Do53"."""
     d = TechnitiumDriver(state_dir=tmp_path)
     calls = _install_fake_request(d, lambda *_: {"status": "ok"})
     d._apply_transport_settings("t", {"dot_enabled": True, "dot_port": 853}, None)
-    assert calls == []
+    assert len(calls) == 1
+    params = calls[0][3]
+    assert params["enableDnsOverTls"] == "false"
+    assert params["enableDnsOverHttps"] == "false"
+    assert params["enableDnsOverQuic"] == "false"
+    # No port is pinned for a listener being turned off.
+    assert "dnsOverTlsPort" not in params
 
 
 def test_transport_settings_send_cert_path_before_enabling(tmp_path: Path) -> None:
@@ -1043,7 +1051,10 @@ def test_transport_settings_abort_when_cert_path_rejected(tmp_path: Path) -> Non
     d._apply_transport_settings(
         "t", {"dot_enabled": True}, {"cert_pem": cert_pem, "key_pem": key_pem}
     )
-    assert len(calls) == 1  # never reached the enable call
+    # Cert attempt, then an explicit disable — not a bail-out that would
+    # strand an already-running listener on a stale cert.
+    assert [c[2] for c in calls] == ["settings/set", "settings/set"]
+    assert calls[1][3]["enableDnsOverTls"] == "false"
 
 
 def test_forwarders_and_protocol_are_sent_together(tmp_path: Path) -> None:
@@ -1307,3 +1318,62 @@ def test_apply_blocking_falls_back_when_custom_address_missing(tmp_path: Path) -
          "custom_addresses": []},
     )
     assert calls[0][3]["blockingType"] == "NxDomain"
+
+
+# ── Second code-review pass ─────────────────────────────────────────────
+
+
+def test_master_port_translated_to_technitium_form() -> None:
+    """SpatiumDDI validates masters as BIND's ``ip@port``; Technitium
+    rejects the ``@`` outright ("invalid character [64]") and wants
+    ``ip:port``. Untranslated, the zone create fails every pass."""
+    from spatium_dns_agent.drivers.technitium import _technitium_master
+
+    assert _technitium_master("192.0.2.1") == "192.0.2.1"
+    assert _technitium_master("192.0.2.1@5353") == "192.0.2.1:5353"
+    assert _technitium_master(" 192.0.2.1 ") == "192.0.2.1"
+
+
+def test_existing_zone_upstream_is_reapplied(tmp_path: Path) -> None:
+    """zones/create is a no-op once the zone exists, and it is what
+    carries the upstream — so retargeting a secondary would otherwise be
+    a permanent silent no-op."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+
+    def responder(path, params, n):
+        if path == "zones/create":
+            return {"status": "error", "errorMessage": "Zone already exists."}
+        return {"status": "ok"}
+
+    calls = _install_fake_request(d, responder)
+    d._ensure_zone_exists(
+        "t", {"zone": "s.test", "type": "Secondary", "masters": ["192.0.2.9@5353"]}
+    )
+    opts = [c for c in calls if c[2] == "zones/options/set"]
+    assert opts and opts[0][3]["primaryNameServerAddresses"] == "192.0.2.9:5353"
+
+
+def test_empty_tsig_key_set_is_pushed(tmp_path: Path) -> None:
+    """A revoked key that is never cleared stays installed and signed
+    transfers keep working — same bug class as the forwarders path."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    d._sync_tsig_keys("t", [])
+    assert calls and calls[0][3]["tsigKeys"] == ""
+
+
+def test_doh_path_override_warns_because_it_is_unsupported(tmp_path: Path) -> None:
+    """Technitium serves DoH on a fixed path and exposes no setting for
+    it, so an operator who changed doh_path would be handed a URL the
+    daemon never answers on."""
+    cert_pem, key_pem = _self_signed_pem()
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    d._apply_transport_settings(
+        "t",
+        {"doh_enabled": True, "doh_port": 8443, "doh_path": "/custom"},
+        {"cert_pem": cert_pem, "key_pem": key_pem},
+    )
+    # The path is not sent — there is no parameter for it.
+    assert not any("Path" in k and k != "dnsTlsCertificatePath"
+                   for c in calls for k in c[3])

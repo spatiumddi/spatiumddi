@@ -331,6 +331,18 @@ def _normalize_rdata(rtype: str, flat: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _technitium_master(entry: str) -> str:
+    """Translate a neutral ``masters`` entry into Technitium's form.
+
+    SpatiumDDI validates masters as ``ip`` or ``ip@port`` — BIND's
+    ``masters { ip port n; }`` shape. Technitium wants ``ip:port`` and
+    rejects the ``@`` outright ("Invalid domain name … invalid character
+    [64]"), which would fail the zone create on every reconcile pass.
+    """
+    host, sep, port = str(entry).strip().partition("@")
+    return f"{host}:{port}" if sep and port else host
+
+
 def _tsig_key_names(bundle: dict[str, Any]) -> list[str]:
     """Bundle TSIG key names, root dot stripped.
 
@@ -762,8 +774,9 @@ class TechnitiumDriver(DriverBase):
                 )
                 continue
             tokens.extend([name, secret, algorithm])
-        if not tokens:
-            return
+        # An empty set is a real desired state, not "nothing to do": a
+        # revoked key that is never cleared stays installed and signed
+        # transfers keep working. Same bug class as the forwarders path.
         resp = self._call(token, "POST", "settings/set", {"tsigKeys": "|".join(tokens)})
         body = resp.json()
         if body.get("status") != "ok":
@@ -1105,21 +1118,32 @@ class TechnitiumDriver(DriverBase):
             or options.get("doq_enabled")
         )
 
+        cert_ok = True
         if wants_tls:
             if not cert_path:
                 log.error("technitium_encrypted_transport_skipped_no_cert")
-                return
-            resp = self._call(
-                token, "POST", "settings/set", {"dnsTlsCertificatePath": cert_path}
-            )
-            body = resp.json()
-            if body.get("status") != "ok":
-                log.error(
-                    "technitium_tls_cert_path_rejected",
-                    path=cert_path,
-                    error=body.get("errorMessage"),
-                )
-                return
+                cert_ok = False
+            else:
+                body = self._call(
+                    token, "POST", "settings/set", {"dnsTlsCertificatePath": cert_path}
+                ).json()
+                if body.get("status") != "ok":
+                    log.error(
+                        "technitium_tls_cert_path_rejected",
+                        path=cert_path,
+                        error=body.get("errorMessage"),
+                    )
+                    cert_ok = False
+
+        if wants_tls and not cert_ok:
+            # Returning here would leave an ALREADY-ENABLED listener up on
+            # a stale certificate, which is the opposite of the "every
+            # path degrades to Do53" promise (#50). Fall through with
+            # every listener forced off instead, so the daemon actually
+            # drops back to plain :53.
+            log.warning("technitium_encrypted_transport_disabled_degrading_to_do53")
+            options = {**options, "dot_enabled": False, "doh_enabled": False,
+                       "doq_enabled": False}
 
         params: dict[str, Any] = {
             "enableDnsOverTls": "true" if options.get("dot_enabled") else "false",
@@ -1130,6 +1154,17 @@ class TechnitiumDriver(DriverBase):
             params["dnsOverTlsPort"] = int(options.get("dot_port") or 853)
         if options.get("doh_enabled"):
             params["dnsOverHttpsPort"] = int(options.get("doh_port") or 443)
+            # Technitium serves DoH on a FIXED path and exposes no setting
+            # for it (verified: no path key in settings/get). An operator
+            # who changed doh_path would otherwise be handed a URL the
+            # daemon does not answer on.
+            doh_path = str(options.get("doh_path") or "/dns-query")
+            if doh_path != "/dns-query":
+                log.warning(
+                    "technitium_doh_path_not_configurable",
+                    requested=doh_path,
+                    served="/dns-query",
+                )
         if options.get("doq_enabled"):
             params["dnsOverQuicPort"] = int(options.get("doq_port") or 853)
 
@@ -1466,7 +1501,9 @@ class TechnitiumDriver(DriverBase):
         ztype = entry.get("type", "Primary")
         params: dict[str, Any] = {"zone": zone, "type": ztype}
         if ztype in ("Secondary", "Stub", "SecondaryCatalog"):
-            params["primaryNameServerAddresses"] = ",".join(entry.get("masters") or [])
+            params["primaryNameServerAddresses"] = ",".join(
+                _technitium_master(m) for m in entry.get("masters") or []
+            )
         elif ztype == "Forwarder":
             forwarders = entry.get("forwarders") or []
             # Technitium's Forwarder zone takes a single upstream; BIND's
@@ -1485,9 +1522,37 @@ class TechnitiumDriver(DriverBase):
         body = resp.json()
         if body.get("status") == "error":
             if "already exists" in (body.get("errorMessage") or "").lower():
+                # The create params carry the zone's UPSTREAM (a
+                # secondary/stub's primaries, a forwarder's target), and
+                # create is a no-op once the zone exists. Without this,
+                # retargeting a secondary at a new primary would be a
+                # permanent silent no-op: the operator edits it, the
+                # bundle changes, and the daemon keeps transferring from
+                # the old address forever.
+                self._reapply_zone_upstream(token, zone, ztype, params)
                 return
             log.error(
                 "technitium_zone_create_failed",
+                zone=zone,
+                zone_type=ztype,
+                error=body.get("errorMessage"),
+            )
+
+    def _reapply_zone_upstream(
+        self, token: str, zone: str, ztype: str, params: dict[str, Any]
+    ) -> None:
+        """Push a existing zone's upstream through ``zones/options/set``."""
+        opts: dict[str, Any] = {"zone": zone}
+        if "primaryNameServerAddresses" in params:
+            opts["primaryNameServerAddresses"] = params["primaryNameServerAddresses"]
+        elif "forwarder" in params:
+            opts["forwarder"] = params["forwarder"]
+        else:
+            return
+        body = self._call(token, "POST", "zones/options/set", opts).json()
+        if body.get("status") != "ok":
+            log.warning(
+                "technitium_zone_upstream_reapply_failed",
                 zone=zone,
                 zone_type=ztype,
                 error=body.get("errorMessage"),
