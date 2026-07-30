@@ -8,7 +8,7 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.drivers.dns.base import RecordData
-from app.models.dns import DNSRecord, DNSServer, DNSServerGroup, DNSZone
+from app.models.dns import DNSRecord, DNSServer, DNSServerGroup, DNSView, DNSZone
 from app.services.dns import drift as drift_mod
 
 
@@ -92,3 +92,59 @@ async def test_zone_drift_pull_failure_is_surfaced(
     assert s.status == "error"
     assert "AXFR refused" in (s.error or "")
     assert s.drift_count == 0
+
+
+async def test_no_warning_for_a_plain_zone(db_session: AsyncSession, monkeypatch: Any) -> None:
+    """A zone with no views must not carry the split-horizon caveat."""
+    group, _server, zone = await _group_server_zone(
+        db_session, server_name="ns1", zone_name="plain.example.com."
+    )
+    db_session.add(DNSRecord(zone_id=zone.id, name="www", record_type="A", value="10.0.0.1"))
+    await db_session.commit()
+    monkeypatch.setattr(drift_mod, "get_driver", lambda _d: _FakeDriver([]))
+
+    report = await drift_mod.compute_zone_drift(db_session, group_id=group.id, zone=zone)
+    assert report.warnings == []
+
+
+async def test_view_scoped_zone_is_flagged(db_session: AsyncSession, monkeypatch: Any) -> None:
+    """A view-scoped zone warns that the transfer may answer from another view.
+
+    An AXFR is addressed by zone *name*, and under split-horizon several zone
+    rows share one name — so the diff can compare this row against a different
+    view's content. Report that rather than let an operator "fix" it.
+    """
+    group, _server, zone = await _group_server_zone(
+        db_session, server_name="ns1", zone_name="split.example.com."
+    )
+    view = DNSView(group_id=group.id, name="internal", match_clients=["10.0.0.0/8"])
+    db_session.add(view)
+    await db_session.flush()
+    zone.view_id = view.id
+    await db_session.commit()
+    monkeypatch.setattr(drift_mod, "get_driver", lambda _d: _FakeDriver([]))
+
+    report = await drift_mod.compute_zone_drift(db_session, group_id=group.id, zone=zone)
+    assert len(report.warnings) == 1
+    assert "view" in report.warnings[0].lower()
+
+
+async def test_view_scoped_records_are_flagged(db_session: AsyncSession, monkeypatch: Any) -> None:
+    """Records pinned to a view aren't served to every client — say so."""
+    group, _server, zone = await _group_server_zone(
+        db_session, server_name="ns1", zone_name="partial.example.com."
+    )
+    view = DNSView(group_id=group.id, name="internal", match_clients=["10.0.0.0/8"])
+    db_session.add(view)
+    await db_session.flush()
+    db_session.add(
+        DNSRecord(
+            zone_id=zone.id, view_id=view.id, name="secret", record_type="A", value="10.0.0.7"
+        )
+    )
+    await db_session.commit()
+    monkeypatch.setattr(drift_mod, "get_driver", lambda _d: _FakeDriver([]))
+
+    report = await drift_mod.compute_zone_drift(db_session, group_id=group.id, zone=zone)
+    assert len(report.warnings) == 1
+    assert "scoped to a specific DNS view" in report.warnings[0]

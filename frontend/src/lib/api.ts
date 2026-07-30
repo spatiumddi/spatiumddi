@@ -4997,6 +4997,52 @@ export interface ZoneServerState {
   in_sync: boolean;
 }
 
+// ── Zone config drift (#61) ──────────────────────────────────────────────────
+//
+// Record-level diff between the DB (source of truth) and what each server in
+// the group is actually serving, obtained by AXFR / driver pull. Strictly
+// read-only — the report never applies anything. Distinct from
+// `ZoneServerState` above, which compares SOA *serials* only: a server can sit
+// on the right serial and still be serving the wrong records if someone edited
+// the host by hand.
+
+export interface ZoneDriftRecord {
+  name: string;
+  record_type: string;
+  value: string;
+  ttl: number | null;
+}
+
+export interface ZoneDriftServer {
+  server_id: string;
+  server_name: string;
+  driver: string;
+  // "ok" — pulled and diffed. "error" — the pull failed (unreachable, paused,
+  // AXFR refused); counts are meaningless. "unsupported" — the driver has no
+  // `pull_zone_records`, so drift can't be computed for it at all.
+  status: "ok" | "error" | "unsupported";
+  error: string | null;
+  in_sync: number;
+  // `extra_on_server.length + missing_on_server.length` — the backend derives
+  // it, so don't recompute it in the UI.
+  drift_count: number;
+  // Served by the host but absent from the DB — typically a manual on-host edit.
+  extra_on_server: ZoneDriftRecord[];
+  // In the DB but not being served — the change never reached this host.
+  missing_on_server: ZoneDriftRecord[];
+}
+
+export interface ZoneDrift {
+  zone_id: string;
+  zone_name: string;
+  db_record_count: number;
+  servers: ZoneDriftServer[];
+  // Caveats that make the diff less trustworthy — chiefly split-horizon
+  // views, where an AXFR is answered by whichever view matches the control
+  // plane's source address rather than the one this zone row belongs to.
+  warnings: string[];
+}
+
 // Pending records the delegation wizard would land in the parent zone.
 // `existing_*` lists are already-present rows the wizard would skip on apply.
 export interface DelegationRecord {
@@ -5496,6 +5542,13 @@ export const dnsApi = {
       .get<ZoneServerState>(
         `/dns/groups/${groupId}/zones/${zoneId}/server-state`,
       )
+      .then((r) => r.data),
+  // #61 — AXFRs every server in the group and diffs it against the DB.
+  // One request fans out to every host, so this is slow and deliberately
+  // NOT auto-fetched; the Drift tab loads it on demand.
+  getZoneDrift: (groupId: string, zoneId: string) =>
+    api
+      .get<ZoneDrift>(`/dns/groups/${groupId}/zones/${zoneId}/drift`)
       .then((r) => r.data),
 
   // DNSSEC — PowerDNS online signing (#127) + BIND9 inline-signing (#49)
