@@ -322,8 +322,10 @@ def test_validate_config_blocklists_are_warned_not_errored(zone: ZoneData) -> No
 def test_capabilities_scope() -> None:
     caps = TechnitiumDriver().capabilities()
     assert set(caps["zone_types"]) == {"primary", "secondary", "stub", "forward"}
-    # Still deferred — issues #740 and #744 respectively.
-    assert caps["dnssec_inline_signing"] is False
+    # Online signing landed in #740.
+    assert caps["dnssec_inline_signing"] is True
+    # ALIAS/LUA stay unsupported: Technitium's ANAME/APP are a different
+    # shape, not a drop-in equivalent.
     assert caps["alias_records"] is False
     assert caps["lua_records"] is False
     assert caps["catalog_zones"] is True
@@ -417,3 +419,19 @@ def test_capabilities_report_zone_types_and_catalog() -> None:
     caps = TechnitiumDriver().capabilities()
     assert set(caps["zone_types"]) == {"primary", "secondary", "stub", "forward"}
     assert caps["catalog_zones"] is True
+
+
+def test_capabilities_report_dnssec_online_signing() -> None:
+    """Issue #740 — Technitium signs online via /api/zones/dnssec/*, so it
+    joins PowerDNS and BIND9 on the sign/unsign gate."""
+    assert TechnitiumDriver().capabilities()["dnssec_inline_signing"] is True
+
+
+def test_dnssec_operations_are_gated_to_technitium() -> None:
+    from app.api.v1.dns.router import _DRIVER_GATED_OPERATIONS
+
+    assert "technitium" in _DRIVER_GATED_OPERATIONS["dnssec_sign"]
+    assert "technitium" in _DRIVER_GATED_OPERATIONS["dnssec_unsign"]
+    # Manual rollover stays BIND9-only: Technitium rolls on its own
+    # schedule (dnssecPrivateKeys carries rolloverDays), like PowerDNS.
+    assert "technitium" not in _DRIVER_GATED_OPERATIONS["dnssec_rollover"]

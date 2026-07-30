@@ -115,6 +115,30 @@ _ZONE_TRANSFER_VALUES = frozenset(
     }
 )
 
+# ── DNSSEC (issue #740) ─────────────────────────────────────────────────
+#
+# Signing artefacts the daemon owns. They show up in ``zones/records/get``
+# the moment a zone is signed, so the reconciler MUST filter them: they
+# are not in the bundle, so every pass would otherwise try to delete the
+# zone's own signatures.
+_DNSSEC_RECORD_TYPES = frozenset(
+    {"DNSKEY", "RRSIG", "NSEC", "NSEC3", "NSEC3PARAM", "DS"}
+)
+
+# Defaults for ``zones/dnssec/sign``. The neutral op carries no algorithm
+# (it is a bare "sign this zone" from the UI), and BIND expresses the
+# choice through a dnssec-policy name that means nothing here — so pick
+# the same modern default PowerDNS's one-toggle story lands on.
+# Verified live: ECDSA/P256/RSA/EDDSA and NSEC/NSEC3 all sign successfully.
+_DNSSEC_SIGN_DEFAULTS = {"algorithm": "ECDSA", "curve": "P256", "nxProof": "NSEC"}
+
+# DS digest-type name → the number that goes in a DS record's presentation
+# form (RFC 4034 §5.1.3 / RFC 8624).
+_DS_DIGEST_TYPES = {"SHA1": 1, "SHA256": 2, "GOST": 3, "SHA384": 4}
+
+# Technitium key-type names → the ksk/zsk/csk vocabulary DNSKeyReport uses.
+_DNSSEC_KEY_TYPES = {"KeySigningKey": "ksk", "ZoneSigningKey": "zsk"}
+
 # Technitium's supported TSIG algorithms, as its settings API spells them.
 _TSIG_ALGORITHMS = frozenset(
     {
@@ -721,6 +745,15 @@ class TechnitiumDriver(DriverBase):
 
         zone = op["zone_name"].rstrip(".")
         op_kind = op["op"]
+
+        # DNSSEC ops (issue #740) are zone-level, not rrset-shaped. They
+        # ride the same record-op queue but branch off before any of the
+        # record machinery below, exactly as the PowerDNS driver does.
+        if op_kind == "dnssec_sign":
+            return {"dnssec_state": self._dnssec_sign(token, zone)}
+        if op_kind == "dnssec_unsign":
+            return {"dnssec_state": self._dnssec_unsign(token, zone)}
+
         rec = op["record"]
         rtype = (rec.get("type") or "").upper()
         name = _qualified_name(zone, rec.get("name") or "@")
@@ -765,6 +798,113 @@ class TechnitiumDriver(DriverBase):
             "technitium_record_op_applied", zone=zone, name=name, type=rtype, op=op_kind
         )
         return None
+
+    # ── DNSSEC (issue #740) ─────────────────────────────────────────────
+
+    def _dnssec_sign(self, token: str, zone: str) -> dict[str, Any]:
+        """Sign the zone, then report its DS rrset + per-key state.
+
+        Idempotent by the same reasoning as PowerDNS's: repeated "Sign
+        zone" clicks should converge on "signed", not error. Technitium
+        answers an already-signed zone with ``Cannot sign zone: the zone
+        is already signed.`` (verified live), which is treated as success
+        so the collect below still reports current state.
+        """
+        resp = self._call(
+            token, "POST", "zones/dnssec/sign", {"zone": zone, **_DNSSEC_SIGN_DEFAULTS}
+        )
+        body = resp.json()
+        if body.get("status") != "ok":
+            msg = (body.get("errorMessage") or "").lower()
+            if "already signed" not in msg:
+                raise RuntimeError(
+                    f"Technitium sign {zone} failed: {body.get('errorMessage')}"
+                )
+            log.info("technitium_dnssec_already_signed", zone=zone)
+        else:
+            log.info("technitium_dnssec_signed", zone=zone)
+        return self._collect_dnssec_state(token, zone)
+
+    def _dnssec_unsign(self, token: str, zone: str) -> dict[str, Any]:
+        """Unsign, and report empty DS + no keys so the control plane
+        clears its cache — a stale DS left on display is one the parent
+        zone no longer trusts."""
+        resp = self._call(token, "POST", "zones/dnssec/unsign", {"zone": zone})
+        body = resp.json()
+        if body.get("status") != "ok":
+            msg = (body.get("errorMessage") or "").lower()
+            if "not signed" not in msg and "unsigned" not in msg:
+                raise RuntimeError(
+                    f"Technitium unsign {zone} failed: {body.get('errorMessage')}"
+                )
+        log.info("technitium_dnssec_unsigned", zone=zone)
+        return {"zone_name": zone, "ds_records": [], "keys": []}
+
+    def _collect_dnssec_state(self, token: str, zone: str) -> dict[str, Any]:
+        """Build the control plane's DNSSEC report for one zone.
+
+        Two calls, because Technitium splits the information:
+
+        * ``zones/dnssec/properties/get`` has the key inventory (tag, type,
+          algorithm number, rollover state) but **no DS records at all**.
+        * The DS material lives on the zone's own DNSKEY records, under
+          ``rData.computedDigests`` — and only on the KSK, since a DS
+          attests the key-signing key to the parent. Each KSK yields one
+          digest per supported type (SHA256 + SHA384 observed), all of
+          which the operator should publish to cover validators of
+          differing sophistication.
+
+        Unlike PowerDNS's agent this reports ``keys`` as well as
+        ``ds_records``, because Technitium exposes per-key state and the
+        control plane already models it (issue #49's ``DNSKey`` rows).
+        """
+        props = self._call(
+            token, "GET", "zones/dnssec/properties/get", {"zone": zone}
+        ).json()
+        priv = (props.get("response") or {}).get("dnssecPrivateKeys") or []
+        algo_by_tag = {
+            k.get("keyTag"): int(k.get("algorithmNumber") or 0) for k in priv
+        }
+
+        ds_records: list[str] = []
+        keys: list[dict[str, Any]] = []
+        recs = self._call(
+            token,
+            "GET",
+            "zones/records/get",
+            {"domain": zone, "zone": zone, "listZone": "true"},
+        ).json()
+        for rec in (recs.get("response") or {}).get("records") or []:
+            if rec.get("type") != "DNSKEY":
+                continue
+            rdata = rec.get("rData") or {}
+            key_tag = rdata.get("computedKeyTag")
+            algorithm = int(rdata.get("algorithmNumber") or algo_by_tag.get(key_tag) or 0)
+            for digest in rdata.get("computedDigests") or []:
+                digest_num = _DS_DIGEST_TYPES.get(str(digest.get("digestType")).upper())
+                value = digest.get("digest")
+                if not (key_tag and digest_num and value):
+                    continue
+                ds_records.append(f"{key_tag} {algorithm} {digest_num} {value}")
+
+        for k in priv:
+            keys.append(
+                {
+                    "key_tag": int(k.get("keyTag") or 0),
+                    "key_type": _DNSSEC_KEY_TYPES.get(str(k.get("keyType")), "zsk"),
+                    "algorithm": int(k.get("algorithmNumber") or 0),
+                    "state": str(k.get("state") or "unknown").lower(),
+                    "timing": {
+                        key: k[src]
+                        for key, src in (
+                            ("state_changed_on", "stateChangedOn"),
+                            ("state_ready_by", "stateReadyBy"),
+                        )
+                        if k.get(src)
+                    },
+                }
+            )
+        return {"zone_name": zone, "ds_records": ds_records, "keys": keys}
 
     def _reconcile_zones(self, token: str, payload: list[dict[str, Any]]) -> None:
         """Bring each zone's record set in line with ``payload`` via a
@@ -979,6 +1119,12 @@ class TechnitiumDriver(DriverBase):
         for rec in body.get("response", {}).get("records") or []:
             rtype = rec.get("type")
             if rtype in _DAEMON_MANAGED_APEX_TYPES:
+                continue
+            # Signing artefacts belong to the daemon, not the bundle. A
+            # signed zone serves DNSKEY/RRSIG/NSEC* that no bundle
+            # describes, so without this the reconciler tries to delete
+            # the zone's own signatures on every pass.
+            if rtype in _DNSSEC_RECORD_TYPES:
                 continue
             # Apex NS is daemon-managed too (Technitium stamps one pointing
             # at its own hostname at zone-create). Filter it HERE rather

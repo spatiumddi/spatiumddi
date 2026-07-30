@@ -160,10 +160,11 @@ _DRIVER_GATED_RECORD_TYPES: dict[str, frozenset[str]] = {
 # online via REST and BIND9 needs the manual ``dnssec-keygen``
 # dance that's #49's umbrella scope.
 _DRIVER_GATED_OPERATIONS: dict[str, frozenset[str]] = {
-    # Both PowerDNS (online signing) and BIND9 (inline-signing via
-    # dnssec-policy, issue #49) support sign/unsign. Windows DNS does not.
-    "dnssec_sign": frozenset({"powerdns", "bind9"}),
-    "dnssec_unsign": frozenset({"powerdns", "bind9"}),
+    # PowerDNS (online signing), BIND9 (inline-signing via dnssec-policy,
+    # issue #49) and Technitium (online signing, issue #740) all support
+    # sign/unsign. Windows DNS does not.
+    "dnssec_sign": frozenset({"powerdns", "bind9", "technitium"}),
+    "dnssec_unsign": frozenset({"powerdns", "bind9", "technitium"}),
     # Manual key rollover is BIND9-only (rndc dnssec -rollover); PowerDNS
     # rolls on its own schedule + Windows DNS isn't supported.
     "dnssec_rollover": frozenset({"bind9"}),

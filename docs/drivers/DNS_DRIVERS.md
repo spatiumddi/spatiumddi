@@ -660,7 +660,7 @@ The token never reaches the control plane — same agent-local trust boundary as
     "name": "technitium",
     "views": False,
     "rpz": False,
-    "dnssec_inline_signing": False,   # fast-follow — issue #740
+    "dnssec_inline_signing": True,
     "incremental_updates": "rest_api",
     "zone_types": ["forward", "primary", "secondary", "stub"],
     "record_types": [...],            # A/AAAA/CNAME/MX/TXT/NS/PTR/SRV/CAA/
@@ -698,6 +698,37 @@ Three behaviours worth knowing, all confirmed against a live daemon:
 **TSIG keys** live in *global* settings, not per zone. The wire format is a **flat pipe-delimited token list read in triples** — `name|secret|algorithm|name2|secret2|algorithm2|…`. Not JSON, and not `name|algorithm|secret` (that fails with "TSIG algorithm is not supported", because it reads the secret as the algorithm). `settings/set` **replaces the whole list**, so keys an operator added directly in the Technitium console are dropped on the next sync — the same control-plane-is-truth stance the rest of the driver takes, but worth knowing. Note also that `zoneTransferTsigKeyNames` accepts a key the server does not have, so keys are pushed *before* anything references them.
 
 **Catalog zones (RFC 9432)** work as producer: the agent creates the `Catalog` zone and sets `catalog=<name>` on each primary it owns. A consumer joins by creating a `SecondaryCatalog` zone pointed at the producer, which arrives through the normal zone list rather than as a per-member option.
+
+### 4B.3b DNSSEC (issue #740)
+
+Online signing, op-driven — the same shape as PowerDNS, not BIND9's config-rendered `dnssec-policy`. `dnssec_sign` / `dnssec_unsign` ride the record-op queue and branch out before any rrset machinery.
+
+```
+POST /api/zones/dnssec/sign?zone=<z>&algorithm=ECDSA&curve=P256&nxProof=NSEC
+POST /api/zones/dnssec/unsign?zone=<z>
+```
+
+The neutral op carries no algorithm — it is a bare "sign this zone" from the UI, and BIND expresses the choice through a `dnssec-policy` name that means nothing here — so the driver picks **ECDSA P256 / NSEC**. RSA (with `hashAlgorithm` + `kskKeySize`/`zskKeySize`), ECDSA P384, EDDSA ED25519, and NSEC3 (`nxProof=NSEC3` + `iterations`/`saltLength`) all sign successfully if that default ever needs to become operator-selectable.
+
+Signing is idempotent: an already-signed zone answers `Cannot sign zone: the zone is already signed.`, which is treated as success so repeated "Sign zone" clicks converge on signed rather than erroring.
+
+**Getting the DS records out is the non-obvious part.** Technitium splits the information across two calls:
+
+- `zones/dnssec/properties/get` has the key inventory — `keyTag`, `keyType`, `algorithmNumber`, `state`, rollover timings — and **no DS records at all**.
+- The DS material lives on the zone's own DNSKEY records, at `rData.computedDigests`, and only on the KSK (a DS attests the key-signing key to the parent). Each KSK yields one digest per type — SHA256 and SHA384 observed — all of which the operator should publish to cover validators of differing sophistication.
+
+The driver joins the two into standard presentation form, `<keyTag> <algorithm> <digestType> <digest>`, mapping Technitium's digest-type *names* back to their RFC 4034 numbers:
+
+```
+34619 13 2 DD98135E57B56C0EAB…
+34619 13 4 309DB47A617B7E122C…
+```
+
+Unlike the PowerDNS agent, this driver reports `keys` as well as `ds_records` — Technitium exposes per-key state and the control plane already models it as #49's `DNSKey` rows.
+
+> ⚠️ A signed zone serves DNSKEY / RRSIG / NSEC / NSEC3 / NSEC3PARAM records that **no bundle describes**. `_DNSSEC_RECORD_TYPES` filters them out of `_get_zone_records`; without that, the full-zone reconcile treats every signing artefact as an extra record and tries to delete the zone's own signatures on every single pass. There is a regression test for exactly this.
+
+Manual key rollover stays BIND9-only. Technitium rolls on its own schedule — `dnssecPrivateKeys` carries `rolloverDays` per key — so `dnssec_rollover` is deliberately *not* widened to technitium.
 
 ### 4B.4 Record type mapping
 

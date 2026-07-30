@@ -29,8 +29,6 @@ Scope (this driver):
 
 Deferred to fast-follow phases (tracked in the roadmap, not this driver):
 
-* DNSSEC online signing — issue #740. Technitium's ``/api/zones/dnssec/*``
-  surface is close in shape to PowerDNS's.
 * Native DNS-over-TLS/HTTPS/QUIC listener wiring — issue #741. A real
   differentiator over PowerDNS (no dnsdist sidecar needed); it also
   supports encrypted *upstream* forwarding, which BIND9 cannot do.
@@ -315,7 +313,7 @@ class TechnitiumDriver(DNSDriver):
             "name": "technitium",
             "views": False,
             "rpz": False,
-            "dnssec_inline_signing": False,  # fast-follow
+            "dnssec_inline_signing": True,  # issue #740 — online signing
             "incremental_updates": "rest_api",
             "zone_types": sorted(_SUPPORTED_ZONE_TYPES),
             "record_types": sorted(_SUPPORTED_RECORD_TYPES),

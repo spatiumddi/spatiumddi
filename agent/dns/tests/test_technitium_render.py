@@ -811,3 +811,144 @@ def test_get_zone_records_filters_daemon_managed_apex(tmp_path: Path) -> None:
     # Off-apex NS is a real delegation and must survive.
     assert ("sub.z.test", "NS") in got
     assert ("www.z.test", "A") in got
+
+
+# ── DNSSEC (issue #740) ─────────────────────────────────────────────────
+
+
+_SIGNED_PROPS = {
+    "status": "ok",
+    "response": {
+        "dnssecStatus": "SignedWithNSEC",
+        "dnssecPrivateKeys": [
+            {"keyTag": 34619, "keyType": "KeySigningKey", "algorithmNumber": 13,
+             "state": "Published", "stateChangedOn": "2026-07-30T15:30:08Z",
+             "stateReadyBy": "2026-07-30T20:05:08Z"},
+            {"keyTag": 44648, "keyType": "ZoneSigningKey", "algorithmNumber": 13,
+             "state": "Active", "stateChangedOn": "2026-07-30T15:30:08Z"},
+        ],
+    },
+}
+_SIGNED_RECORDS = {
+    "status": "ok",
+    "response": {
+        "records": [
+            {"name": "z.test", "type": "DNSKEY", "ttl": 3600, "rData": {
+                "computedKeyTag": 34619, "algorithmNumber": 13,
+                "computedDigests": [
+                    {"digestType": "SHA256", "digest": "DD98"},
+                    {"digestType": "SHA384", "digest": "309D"},
+                ]}},
+            # ZSK carries no computedDigests — a DS attests the KSK only.
+            {"name": "z.test", "type": "DNSKEY", "ttl": 3600, "rData": {
+                "computedKeyTag": 44648, "algorithmNumber": 13}},
+        ]
+    },
+}
+
+
+def _dnssec_responder(path, params, n):
+    if path == "zones/dnssec/properties/get":
+        return _SIGNED_PROPS
+    if path == "zones/records/get":
+        return _SIGNED_RECORDS
+    return {"status": "ok"}
+
+
+def test_collect_dnssec_state_builds_ds_presentation_format(tmp_path: Path) -> None:
+    """DS presentation form is ``<keyTag> <algorithm> <digestType> <digest>``.
+    Technitium reports the digest TYPE by name, so it has to be mapped back
+    to its RFC 4034 number."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    _install_fake_request(d, _dnssec_responder)
+    state = d._collect_dnssec_state("t", "z.test")
+    assert state["ds_records"] == [
+        "34619 13 2 DD98",
+        "34619 13 4 309D",
+    ]
+
+
+def test_collect_dnssec_state_reports_per_key_state(tmp_path: Path) -> None:
+    """Unlike the PowerDNS agent, Technitium exposes per-key state, and the
+    control plane already models it (#49's DNSKey rows)."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    _install_fake_request(d, _dnssec_responder)
+    keys = {k["key_tag"]: k for k in d._collect_dnssec_state("t", "z.test")["keys"]}
+    assert keys[34619]["key_type"] == "ksk"
+    assert keys[44648]["key_type"] == "zsk"
+    assert keys[34619]["state"] == "published"
+    assert keys[44648]["state"] == "active"
+    assert keys[34619]["algorithm"] == 13
+    assert keys[34619]["timing"]["state_ready_by"] == "2026-07-30T20:05:08Z"
+
+
+def test_dnssec_sign_is_idempotent(tmp_path: Path) -> None:
+    """Repeated 'Sign zone' clicks should converge on signed, not error."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+
+    def responder(path, params, n):
+        if path == "zones/dnssec/sign":
+            return {"status": "error", "errorMessage":
+                    "Cannot sign zone: the zone is already signed."}
+        return _dnssec_responder(path, params, n)
+
+    _install_fake_request(d, responder)
+    state = d._dnssec_sign("t", "z.test")
+    assert state["ds_records"]
+
+
+def test_dnssec_sign_raises_on_real_failure(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    _install_fake_request(
+        d, lambda *_: {"status": "error", "errorMessage": "Access denied."}
+    )
+    try:
+        d._dnssec_sign("t", "z.test")
+    except RuntimeError as exc:
+        assert "Access denied" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("expected RuntimeError")
+
+
+def test_dnssec_unsign_clears_ds_and_keys(tmp_path: Path) -> None:
+    """A stale DS left on display is one the parent zone no longer trusts."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    _install_fake_request(d, lambda *_: {"status": "ok"})
+    state = d._dnssec_unsign("t", "z.test")
+    assert state == {"zone_name": "z.test", "ds_records": [], "keys": []}
+
+
+def test_apply_record_op_routes_dnssec_ops(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    _seed_token(d)
+    _install_fake_request(d, _dnssec_responder)
+    out = d.apply_record_op(
+        {"zone_name": "z.test.", "op": "dnssec_sign",
+         "record": {"name": "@", "type": "DNSSEC_OP"}}
+    )
+    assert out is not None and out["dnssec_state"]["ds_records"]
+
+
+def test_get_zone_records_filters_signing_artefacts(tmp_path: Path) -> None:
+    """A signed zone serves DNSKEY/RRSIG/NSEC* that no bundle describes.
+    Left unfiltered, the reconciler tries to delete the zone's own
+    signatures on every pass."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    _install_fake_request(
+        d,
+        lambda *_: {
+            "status": "ok",
+            "response": {
+                "records": [
+                    {"name": "z.test", "type": "DNSKEY", "ttl": 3600, "rData": {}},
+                    {"name": "z.test", "type": "RRSIG", "ttl": 3600, "rData": {}},
+                    {"name": "z.test", "type": "NSEC", "ttl": 3600, "rData": {}},
+                    {"name": "z.test", "type": "NSEC3PARAM", "ttl": 3600, "rData": {}},
+                    {"name": "www.z.test", "type": "A", "ttl": 300,
+                     "rData": {"ipAddress": "10.0.0.1"}},
+                ]
+            },
+        },
+    )
+    got = d._get_zone_records("t", "z.test")
+    assert [r["type"] for r in got] == ["A"]
