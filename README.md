@@ -1349,6 +1349,25 @@ Contributions are welcome.
 
 ---
 
+## Contributors
+
+Thanks to everyone who has opened a pull request against SpatiumDDI.
+
+| | Contributor | Area |
+|---|---|---|
+| <img src="https://github.com/mzac.png" width="48" alt=""> | [@mzac](https://github.com/mzac) | Maintainer |
+| <img src="https://github.com/amoona6.png" width="48" alt=""> | [@amoona6](https://github.com/amoona6) | Appliance unattended installer, firewall sole-etcd-member fix, control-plane node-loss HA recovery |
+| <img src="https://github.com/tristanbob.png" width="48" alt=""> | [@tristanbob](https://github.com/tristanbob) | `authlib.jose` → `joserfc` migration, pairing-code prune fix |
+| <img src="https://github.com/Cmonnich.png" width="48" alt=""> | [@Cmonnich](https://github.com/Cmonnich) | Technitium DNS driver |
+| <img src="https://github.com/waza-ari.png" width="48" alt=""> | [@waza-ari](https://github.com/waza-ari) | Agentless FortiGate cloud DHCP driver |
+
+Opened a PR and not listed? That is an oversight, not a judgement — please
+say so on the [issue tracker](https://github.com/spatiumddi/spatiumddi/issues)
+and it will be fixed. This list is maintained by hand, so it is added to as
+part of merging each contributor's first PR.
+
+---
+
 ## License
 
 Released under the [Apache 2.0 License](LICENSE).
