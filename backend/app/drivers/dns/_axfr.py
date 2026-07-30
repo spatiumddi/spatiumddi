@@ -68,6 +68,36 @@ def resolve_server_address(host: str, port: int, *, what: str) -> list[str]:
     return addrs
 
 
+def _hint(exc: BaseException, port: int) -> str:
+    """Return a next-step hint matched to *why* the transfer failed.
+
+    An unconditional "check allow-transfer" is worse than no hint at all when
+    the real problem is that the host is unreachable — it sends the operator
+    to the DNS config of a box they can't even open a socket to. Only mention
+    the transfer ACL when the server actually answered and said no.
+    """
+    text = str(exc).upper()
+    if isinstance(exc, TimeoutError) or "TIMED OUT" in text or "TIMEOUT" in text:
+        return (
+            f" The server did not answer in time — check that it is running and that "
+            f"TCP/{port} is open (a transfer needs TCP, not just UDP)."
+        )
+    if isinstance(exc, OSError):
+        # Connection refused / no route / network unreachable: we never got a
+        # DNS-level answer, so the transfer ACL is not what's in the way.
+        return f" The server could not be reached on TCP/{port} — check the address and firewall."
+    if "REFUSED" in text or "NOTAUTH" in text:
+        return (
+            " The server answered but declined the transfer — check that its "
+            "allow-transfer permits the SpatiumDDI control plane, and that it is "
+            "authoritative for this zone."
+        )
+    return (
+        f" Check that the server's allow-transfer permits the SpatiumDDI control "
+        f"plane and that TCP/{port} is reachable."
+    )
+
+
 async def axfr_zone_records(
     *,
     host: str,
@@ -121,9 +151,7 @@ async def axfr_zone_records(
         # both surface this string verbatim.
         detail = str(exc).strip() or type(exc).__name__
         raise RuntimeError(
-            f"{what} from {host}:{port} failed: {detail}. "
-            f"Check that the server's allow-transfer permits the SpatiumDDI "
-            f"control plane and that TCP/{port} is reachable."
+            f"{what} from {host}:{port} failed: {detail}.{_hint(exc, port)}"
         ) from exc
 
     def _absolutize(target: Any) -> str:

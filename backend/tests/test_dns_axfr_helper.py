@@ -174,3 +174,36 @@ async def test_message_less_exception_never_surfaces_blank(
     assert msg.strip()
     assert "ValueError" in msg
     assert "192.0.2.10" in msg
+
+
+@pytest.mark.parametrize(
+    ("exc", "expect_present", "expect_absent"),
+    [
+        # A routing/connection failure means we never got a DNS answer, so
+        # pointing at the transfer ACL sends the operator to the wrong box.
+        (OSError(113, "No route to host"), "could not be reached", "allow-transfer"),
+        (TimeoutError("timed out"), "did not answer in time", "allow-transfer"),
+        # The server DID answer and said no — now the ACL is the right hint.
+        (ValueError("Zone transfer error: REFUSED"), "allow-transfer", "could not be reached"),
+    ],
+)
+async def test_hint_matches_the_failure_cause(
+    exc: Exception,
+    expect_present: str,
+    expect_absent: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The next-step hint must match why it failed, not be boilerplate."""
+    import dns.query
+
+    def _raise(*_a: Any, **_kw: Any) -> Any:
+        raise exc
+
+    monkeypatch.setattr(dns.query, "xfr", _raise)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        await axfr_zone_records(host="192.0.2.10", port=53, zone_name="example.com.")
+
+    msg = str(excinfo.value)
+    assert expect_present in msg
+    assert expect_absent not in msg
