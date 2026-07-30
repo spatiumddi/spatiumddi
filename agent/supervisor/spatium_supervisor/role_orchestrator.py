@@ -47,7 +47,7 @@ log = structlog.get_logger(__name__)
 # ``looking-glass`` (#566) joined DNS/DHCP here — the BGP Looking
 # Glass collector is a real service container (GoBGP), not a
 # supervisor-side-only role like observer.
-_SERVICE_ROLES = {"dns-bind9", "dns-powerdns", "dhcp", "looking-glass"}
+_SERVICE_ROLES = {"dns-bind9", "dns-powerdns", "dns-technitium", "dhcp", "looking-glass"}
 
 
 # Issue #237 — values from the heartbeat response land in a docker-
@@ -147,7 +147,7 @@ def compute_target_env(role_assignment: dict[str, Any] | None) -> TargetEnv:
     dns_agent_key = _safe_env_value(
         "dns_agent_key", role_assignment.get("dns_agent_key"), _AGENT_KEY_RE
     )
-    if any(r in roles for r in ("dns-bind9", "dns-powerdns")):
+    if any(r in roles for r in ("dns-bind9", "dns-powerdns", "dns-technitium")):
         if dns_group:
             env_lines.append(f"AGENT_GROUP={dns_group}")
         if dns_engine:

@@ -630,6 +630,68 @@ Each driver's `capabilities()` returns the same dict shape Windows / PowerDNS us
 
 ---
 
+## 4B. Technitium Driver (v1)
+
+Third authoritative driver, alongside BIND9 and PowerDNS. Same agent-colocated shape as PowerDNS (control-plane driver is a thin/no-op translator; the real work — reconcile, auth, lifecycle — lives in the agent-side driver talking to the daemon over loopback), but even thinner: Technitium has **no config file for zone/record state at all**. The daemon persists its own config under `/etc/dns` and is configured entirely through its HTTP API (`http://127.0.0.1:5380/api/...`).
+
+### 4B.1 Update Strategy: REST API, full-zone diff reconcile
+
+Unlike PowerDNS's rrset-REPLACE PATCH semantics, Technitium's `/api/zones/records/add` **appends** at a given `(name, type)` by default (round-robin A records coexist without a GET-merge-PATCH dance) and only wipes the rrset when `overwrite=true` is passed explicitly. The agent driver exploits this:
+
+- **Bulk reconcile** (`swap_and_reload`, fired on structural config changes): fetch the zone's full record set via `GET /api/zones/records/get?listZone=true`, diff by `(domain, type, params)` fingerprint against the desired bundle state, then `POST` deletes for what's extra and adds for what's missing. No `update` endpoint call needed — a changed value is just delete-old + add-new, computed from the full diff.
+- **Incremental ops** (`apply_record_op`, fired per live edit): `create`/`update` → `add` with `overwrite=false`; `delete` → `delete` with the exact matching value. Same "update leaves a stale value until an explicit delete" caveat PowerDNS's driver documents for the identical reason (the op payload carries only the new value).
+- Zone apex `NS`/`SOA` are **daemon-managed** — Technitium auto-creates its own SOA + one NS pointing at its own hostname on `/api/zones/create`, so the bundle's apex NS/SOA are intentionally excluded from every reconcile pass (pushing them would create duplicate/foreign records). Off-apex `NS` (delegations) reconcile normally.
+
+### 4B.2 Auth — agent-provisioned bearer token
+
+Technitium has no static local secret file the entrypoint pre-seeds (unlike PowerDNS's API key). Instead:
+
+1. The agent generates a random admin bootstrap password once, persisted the same atomic `O_NOFOLLOW`/0600 way as PowerDNS's API key.
+2. `start_daemon()` passes it via the `DNS_SERVER_ADMIN_PASSWORD` env var on every daemon start — Technitium only consumes it the very first time `/etc/dns` is empty, so this is a harmless no-op on every subsequent start.
+3. On first-ever config apply, the driver calls `GET /api/user/createToken?user=admin&pass=<bootstrap-pw>&tokenName=spatiumddi-agent` **exactly once** and persists the resulting bearer token. Confirmed empirically: `createToken` is **not idempotent on tokenName** — calling it again mints a brand-new token and leaves the old one orphaned on the server — so the local token file's mere presence is the "already provisioned" signal, not an API-side check.
+4. All subsequent calls carry `Authorization: Bearer <token>`. **Auth failure surfaces as HTTP 200** with `{"status": "invalid-token", ...}` in the body — confirmed empirically — so every caller must inspect the JSON `status` field, never the HTTP status code alone.
+
+The token never reaches the control plane — same agent-local trust boundary as PowerDNS's API key and BIND9's TSIG/rndc key.
+
+### 4B.3 Capabilities (v1)
+
+```python
+{
+    "name": "technitium",
+    "views": False,
+    "rpz": False,
+    "dnssec_inline_signing": False,   # fast-follow — see §4B.5
+    "incremental_updates": "rest_api",
+    "zone_types": ["primary"],        # secondary/stub/forward deferred
+    "record_types": [...],            # A/AAAA/CNAME/MX/TXT/NS/PTR/SRV/CAA/
+                                       # TLSA/SSHFP/NAPTR/URI/SOA/SVCB/HTTPS/DNAME
+    "alias_records": False,           # Technitium has ANAME/APP instead —
+                                       # a different shape, not a drop-in
+    "lua_records": False,
+    "catalog_zones": False,
+}
+```
+
+`dynamic_update_caps` is the all-False default (no RFC 2136 client-facing UPDATE listener wired in v1 — all mutation flows through the agent's queued record-op reconciler).
+
+### 4B.4 Record type mapping
+
+Technitium's API takes structured per-type params rather than PowerDNS's single wire-format `content` string — e.g. `ipAddress` for A/AAAA, `cname` for CNAME, `exchange`+`preference` for MX, `target`+`priority`+`weight`+`port` for SRV. SVCB/HTTPS are best-effort: the driver parses the BIND-zone-file-style rdata string SpatiumDDI stores (`'1 . alpn="h2,h3"'`) into Technitium's `svcPriority`/`svcTargetName`/`svcParams` (`key|value` pairs) — confirmed empirically that Technitium's `svcParams` wire format does **not** accept a comma-separated multi-value single param the way BIND's rdata does, so only the first value of a multi-value param carries through (logged as a warning); single-value params round-trip exactly.
+
+### 4B.5 Deferred to fast-follow (not v1)
+
+- **DNSSEC online signing** — Technitium's `/api/zones/dnssec/*` surface is close in shape to PowerDNS's (`sign`/`unsign`/key rollover), should port quickly once picked up.
+- **Native DoT/DoH/DoQ listeners** — Technitium's real differentiator over PowerDNS: it speaks all three natively, so no dnsdist-style sidecar is needed (contrast §9.2). Needs a settings-API spike to confirm the exact `/api/settings/set` shape, which isn't covered by the public zone/record API docs.
+- **Catalog zones, secondary/stub zones + TSIG-authenticated zone transfer.**
+- **Query-log shipping** — Technitium's query logging is API/DB-backed (`/api/logs/query*`), not a tailable text file like BIND9's `query_log_file` or PowerDNS's redirected stderr capture, so it needs a poll-and-diff shipper rather than the existing file-tailing `QueryLogShipper`.
+- **Live-pull `dns_import` importer** for existing Technitium installs (mirrors `services/dns_import/powerdns.py`).
+
+### 4B.6 Image
+
+`ghcr.io/spatiumddi/dns-technitium` builds `FROM technitium/dns-server:<pinned>` (Ubuntu 24.04 + .NET 10, **not Alpine** — see `docs/deployment/DNS_AGENT.md` §7 for why) with the `spatium_dns_agent` wheel layered on top. Healthcheck queries the RFC 6761 reserved `invalid.` TLD rather than a CHAOS-class query — confirmed empirically that Technitium REFUSES `id.server`/`version.bind` CH TXT entirely, unlike BIND9/PowerDNS.
+
+---
+
 ## 5. Driver Selection and Registration
 
 Drivers are registered by name and instantiated by the service layer:
@@ -639,6 +701,7 @@ Drivers are registered by name and instantiated by the service layer:
 _DRIVERS: dict[str, type[DNSDriver]] = {
     "bind9": BIND9Driver,
     "powerdns": PowerDNSDriver,
+    "technitium": TechnitiumDriver,
     "windows_dns": WindowsDNSDriver,
     # Agentless cloud-hosted DNS providers (issue #37, Part B).
     "cloudflare": CloudflareDNSDriver,
@@ -672,12 +735,13 @@ def get_driver(server_type: str) -> DNSDriver:
 
 ### 5.1 Per-group driver homogeneity
 
-Each `DNSServerGroup` is **single-driver**. The control plane rejects mixed BIND + PowerDNS within one group because catalog-zone semantics, AXFR/IXFR shape, and the gate logic for PowerDNS-only features (ALIAS / LUA / online DNSSEC) all assume every member of the group runs the same driver.
+Each `DNSServerGroup` is **single-driver**. The control plane rejects mixing drivers within one group because catalog-zone semantics, AXFR/IXFR shape, and the gate logic for driver-only features (PowerDNS's ALIAS / LUA / online DNSSEC) all assume every member of the group runs the same driver.
 
 Mixed installs work via multiple groups:
 
 - "Internal-zones" group runs PowerDNS (LMDB-backed, fast apply, ALIAS records for apex)
 - "External-zones" group runs BIND9 (battle-tested, RPZ for outbound blocklists, well-known operator surface)
+- "Edge-technitium" group runs Technitium (REST-API driven like PowerDNS, native DoT/DoH/DoQ support once wired — see §4B.5)
 
 ### 5.2 Decision tree — when to pick which driver
 
@@ -689,11 +753,13 @@ Mixed installs work via multiple groups:
 | One-toggle online DNSSEC with auto NSEC3 | **PowerDNS** |
 | Manual NSEC3 + KSK / ZSK rollover control | **BIND9** |
 | First-class views / split-horizon (issue #24) | **BIND9** |
-| Catalog zones as **producer** | Either — same wire bytes |
+| Catalog zones as **producer** | BIND9 or PowerDNS — same wire bytes |
 | Catalog zones as **consumer** | **BIND9** today (not wired up on the PowerDNS agent) |
+| Native DoT/DoH/DoQ with no sidecar (once wired, §4B.5) | **Technitium** |
+| Simple REST-driven primary zones, minimal footprint | **PowerDNS** or **Technitium** |
 | Active Directory-integrated DNS | **Windows DNS** (separate path) |
 
-Both BIND9 and PowerDNS drivers are supported indefinitely. PowerDNS landed in issue #127 as a second driver, not a replacement.
+BIND9, PowerDNS, and Technitium drivers are all supported indefinitely. PowerDNS landed in issue #127 as a second driver; Technitium landed as a third, not a replacement for either.
 
 ---
 

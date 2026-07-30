@@ -1302,6 +1302,7 @@ function ServerModal({
             >
               <option value="bind9">BIND9 (agent-managed)</option>
               <option value="powerdns">PowerDNS (agent-managed)</option>
+              <option value="technitium">Technitium (agent-managed)</option>
               <option value="windows_dns">
                 Windows DNS (agentless, RFC 2136 + optional WinRM)
               </option>
@@ -1337,6 +1338,18 @@ function ServerModal({
             storage; no external DB needed). Records apply via the local
             PowerDNS REST API on port 8081 (loopback only). The agent generates
             and rotates the API key automatically — leave the field below blank.
+          </div>
+        )}
+        {driver === "technitium" && (
+          <div className="rounded-md border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-800 dark:text-emerald-300">
+            <strong>Technitium:</strong> agent-managed. Run the{" "}
+            <code className="rounded bg-emerald-500/20 px-1">
+              ghcr.io/spatiumddi/dns-technitium
+            </code>{" "}
+            container alongside this server. v1 supports primary zones +
+            standard record types; DNSSEC, native DoT/DoH/DoQ listeners, and
+            secondary zones are on the roadmap. The agent provisions and rotates
+            its own API token automatically — leave the field below blank.
           </div>
         )}
         {cloudDriver && (
@@ -1380,13 +1393,15 @@ function ServerModal({
                   placeholder={
                     driver === "powerdns"
                       ? "8081 (PowerDNS REST, loopback)"
-                      : driver === "bind9"
-                        ? "953 (rndc)"
-                        : "953 / 8081"
+                      : driver === "technitium"
+                        ? "5380 (Technitium API, loopback)"
+                        : driver === "bind9"
+                          ? "953 (rndc)"
+                          : "953 / 8081"
                   }
                 />
               </Field>
-              {driver === "powerdns" ? (
+              {driver === "powerdns" || driver === "technitium" ? (
                 <Field label="API Key">
                   <input
                     className={`${inputCls} bg-muted/50 cursor-not-allowed`}

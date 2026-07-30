@@ -150,7 +150,9 @@ class FindApplianceFleetArgs(BaseModel):
         default=None,
         description="Filter by appliance state. Omit for all states.",
     )
-    role: Literal["dns-bind9", "dns-powerdns", "dhcp", "observer", "custom"] | None = Field(
+    role: (
+        Literal["dns-bind9", "dns-powerdns", "dns-technitium", "dhcp", "observer", "custom"] | None
+    ) = Field(
         default=None,
         description=(
             "Filter by an assigned role. Returns rows whose "
@@ -758,9 +760,9 @@ class ProposeAssignRoleArgs(BaseModel):
     appliance_id: str = Field(description="UUID of the approved appliance row.")
     roles: list[str] = Field(
         description=(
-            "Subset of dns-bind9 / dns-powerdns / dhcp / observer / "
-            "custom. dns-bind9 + dns-powerdns are mutually exclusive. "
-            "Empty list = idle (no service containers will run)."
+            "Subset of dns-bind9 / dns-powerdns / dns-technitium / dhcp / "
+            "observer / custom. The three dns-* roles are mutually "
+            "exclusive. Empty list = idle (no service containers will run)."
         )
     )
     dns_group_id: str | None = Field(
@@ -787,9 +789,9 @@ class ProposeAssignRoleArgs(BaseModel):
         "operator clicks Apply for the supervisor to actually start / "
         "stop service containers on the next heartbeat. Server-side "
         "validation rejects roles the supervisor doesn't advertise "
-        "capability for, and rejects the dns-bind9 + dns-powerdns "
-        "combo (one engine per appliance). For tags or firewall "
-        "edits, point the operator at the Fleet tab drilldown."
+        "capability for, and rejects combining more than one dns-* role "
+        "(one engine per appliance). For tags or firewall edits, point "
+        "the operator at the Fleet tab drilldown."
     ),
     args_model=ProposeAssignRoleArgs,
     category="admin",

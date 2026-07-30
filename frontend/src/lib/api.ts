@@ -10589,6 +10589,7 @@ export type ApplianceState =
 export interface SupervisorCapabilities {
   can_run_dns_bind9?: boolean;
   can_run_dns_powerdns?: boolean;
+  can_run_dns_technitium?: boolean;
   can_run_dhcp?: boolean;
   can_run_looking_glass?: boolean;
   can_run_observer?: boolean;
@@ -10739,7 +10740,8 @@ export interface ApplianceRow {
   role_switch_reason: string | null;
   // #170 Wave E — supervisor's service-container watchdog. Free-form
   // map keyed by compose service name (``dns-bind9`` / ``dns-powerdns``
-  // / ``dhcp-kea``); each value carries the per-service health verdict.
+  // / ``dns-technitium`` / ``dhcp-kea``); each value carries the
+  // per-service health verdict.
   // Empty when the supervisor hasn't run a watchdog probe yet or the
   // appliance is idle (no roles assigned).
   role_health: Record<

@@ -51,6 +51,7 @@ IMAGES=(
     "ghcr.io/spatiumddi/spatium-supervisor"
     "ghcr.io/spatiumddi/dns-bind9"
     "ghcr.io/spatiumddi/dns-powerdns"
+    "ghcr.io/spatiumddi/dns-technitium"
     "ghcr.io/spatiumddi/dhcp-kea"
     # Issue #566 — BGP Looking Glass collector (GoBGP). Baked into
     # every slot per decision D3 (can_run_looking_glass hardcodes

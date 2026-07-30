@@ -241,6 +241,7 @@ def test_builtin_set_shape() -> None:
     assert set(ps.roles) == {
         "dns-bind9",
         "dns-powerdns",
+        "dns-technitium",
         "dhcp",
         "control-plane",
         "observer",
@@ -252,24 +253,35 @@ def test_builtin_set_shape() -> None:
     assert cp.rules[2].render_guard == _BUILTIN_GUARD
 
 
-def _load_seed_migration():
-    path = (
-        pathlib.Path(__file__).resolve().parents[1]
-        / "alembic/versions/f5b8d2c91a06_firewall_builtin_seed.py"
-    )
-    spec = importlib.util.spec_from_file_location("_fw_seed_mig", path)
+def _load_migration_module(filename: str):
+    path = pathlib.Path(__file__).resolve().parents[1] / "alembic/versions" / filename
+    spec = importlib.util.spec_from_file_location(f"_fw_seed_mig_{filename}", path)
     assert spec and spec.loader
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
 
 
+# Every migration that seeds a builtin firewall policy row, in the order
+# they apply against a fresh DB. A new DNS driver's role policy lands in
+# its OWN migration (append-only — f5b8d2c91a06 already shipped), so the
+# drift guard below concatenates all of them rather than assuming a single
+# file holds the whole set. Add new migrations here alongside their driver.
+_SEED_MIGRATION_FILES = [
+    "f5b8d2c91a06_firewall_builtin_seed.py",
+    "6a668dd451d5_dns_technitium_firewall_seed.py",
+]
+
+
 def test_builtin_seed_matches_migration() -> None:
     """The in-code canonical builtins (the render source on an unseeded DB)
-    must match the seed migration row-for-row, else a node renders one set
+    must match the seed migrations row-for-row, else a node renders one set
     while the DB holds another."""
-    mig = _load_seed_migration()
-    assert mig._GUARD == _BUILTIN_GUARD
+    migs = [_load_migration_module(f) for f in _SEED_MIGRATION_FILES]
+    for mig in migs:
+        guard = getattr(mig, "_GUARD", None)
+        if guard is not None:
+            assert guard == _BUILTIN_GUARD
 
     def norm_merge(entry):
         sk, sr, enabled, rules = entry
@@ -289,4 +301,5 @@ def test_builtin_seed_matches_migration() -> None:
             [(s, a, p, tuple(po), k, f, c, g) for (s, a, p, po, k, f, c, g) in rules],
         )  # noqa: E501
 
-    assert [norm_merge(e) for e in _BUILTIN_SEED] == [norm_mig(e) for e in mig._POLICIES]
+    mig_policies = [e for mig in migs for e in mig._POLICIES]
+    assert [norm_merge(e) for e in _BUILTIN_SEED] == [norm_mig(e) for e in mig_policies]

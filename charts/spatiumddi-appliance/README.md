@@ -26,6 +26,7 @@ appliance's *local* k3s, deploying the per-role service workloads:
 
 - `dnsBind9` — Deployment + Service. BIND9 authoritative DNS.
 - `dnsPowerdns` — Deployment + Service. PowerDNS alternative.
+- `dnsTechnitium` — Deployment + Service. Technitium alternative.
 - `dhcpKea` — DaemonSet with `hostNetwork: true`. Kea DHCPv4/v6.
 - `lookingGlass` — DaemonSet with `hostNetwork: true`. Receive-only
   BGP collector (GoBGP, issue #566) — see
@@ -33,9 +34,9 @@ appliance's *local* k3s, deploying the per-role service workloads:
 - `supervisor` — DaemonSet, privileged. The reconciler itself.
 
 Each role is gated on a `<role>.enabled` flag. Mutual exclusion
-between DNS engines (bind9 vs powerdns) is enforced upstream by the
-supervisor's CRD reconciler — at the chart level both blocks can
-render side-by-side if values.yaml says so.
+across the three DNS engines (bind9 / powerdns / technitium) is
+enforced upstream by the supervisor's CRD reconciler — at the chart
+level all three blocks can render side-by-side if values.yaml says so.
 
 ## Air-gap defaults
 

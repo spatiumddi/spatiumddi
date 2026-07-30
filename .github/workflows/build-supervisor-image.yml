@@ -43,6 +43,15 @@ jobs:
             type=ref,event=tag
             type=sha,format=short
 
+      # Rotates weekly so the Dockerfile's apk layer cannot be served
+      # from the GHA layer cache indefinitely — see APK_SNAPSHOT in
+      # agent/supervisor/images/supervisor/Dockerfile for why that
+      # matters (a cached layer kept shipping a known-vulnerable bind
+      # for days after Alpine had published the fix).
+      - name: Compute apk snapshot key
+        id: apk
+        run: echo "snapshot=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
+
       - name: Build (PR — single-arch, load locally for Trivy)
         if: github.event_name == 'pull_request'
         uses: docker/build-push-action@v5
@@ -54,6 +63,8 @@ jobs:
           load: true
           tags: ghcr.io/spatiumddi/spatium-supervisor:pr-scan
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            APK_SNAPSHOT=${{ steps.apk.outputs.snapshot }}
           cache-from: type=gha,scope=spatium-supervisor
           cache-to: type=gha,mode=max,scope=spatium-supervisor
 
@@ -67,6 +78,8 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            APK_SNAPSHOT=${{ steps.apk.outputs.snapshot }}
           cache-from: type=gha,scope=spatium-supervisor
           cache-to: type=gha,mode=max,scope=spatium-supervisor
 

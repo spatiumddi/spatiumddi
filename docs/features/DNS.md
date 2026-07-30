@@ -17,35 +17,38 @@ SpatiumDDI manages DNS servers as first-class resources. It acts as the **author
 
 ---
 
-## 0. Driver choice — BIND9, PowerDNS, or Windows DNS
+## 0. Driver choice — BIND9, PowerDNS, Technitium, or Windows DNS
 
-SpatiumDDI ships three authoritative DNS drivers. Pick **per server group** — every server inside a group runs the same driver, but mixed installs (one group on BIND, another on PowerDNS, a third on Windows) are first-class. The driver registry is in [`drivers/dns/__init__.py`](../../backend/app/drivers/dns/__init__.py); the per-driver internals are in [`docs/drivers/DNS_DRIVERS.md`](../drivers/DNS_DRIVERS.md).
+SpatiumDDI ships four authoritative DNS drivers. Pick **per server group** — every server inside a group runs the same driver, but mixed installs (one group on BIND, another on PowerDNS, a third on Technitium, a fourth on Windows) are first-class. The driver registry is in [`drivers/dns/__init__.py`](../../backend/app/drivers/dns/__init__.py); the per-driver internals are in [`docs/drivers/DNS_DRIVERS.md`](../drivers/DNS_DRIVERS.md).
 
-| Capability | BIND9 | PowerDNS | Windows DNS |
-|---|:---:|:---:|:---:|
-| Authoritative zone serving | ✅ | ✅ | ✅ |
-| Recursive resolver | ✅ | — (recursor is a separate daemon) | ✅ |
-| Record CRUD wire protocol | RFC 2136 + rndc | REST API (PATCH rrsets) | RFC 2136 (Path A) / WinRM (Path B) |
-| Zone CRUD wire protocol | rndc addzone / delzone | REST API | WinRM (Path B only) |
-| ALIAS records (CNAME at apex) | — | ✅ | — |
-| LUA records (computed responses) | — | ✅ | — |
-| Online DNSSEC signing | ✅ inline-signing (#49) | ✅ one-toggle | manual |
-| Catalog zones (RFC 9432) — producer | ✅ | ✅ | — |
-| Catalog zones (RFC 9432) — consumer | ✅ | — (not wired up in the agent) | — |
-| First-class views / split-horizon | ✅ | tag-based, not surfaced as views in UI | — (replication scope) |
-| RPZ blocklists | ✅ | — (recursor feature only) | — |
-| AD-integrated zones | — | — | ✅ |
-| Agent shape | sidecar agent + named | sidecar agent + pdns_server | agentless (control plane → WinRM) |
+| Capability | BIND9 | PowerDNS | Technitium | Windows DNS |
+|---|:---:|:---:|:---:|:---:|
+| Authoritative zone serving | ✅ | ✅ | ✅ | ✅ |
+| Recursive resolver | ✅ | — (recursor is a separate daemon) | ✅ (own daemon, not exposed in v1) | ✅ |
+| Record CRUD wire protocol | RFC 2136 + rndc | REST API (PATCH rrsets) | REST API (per-record add/delete) | RFC 2136 (Path A) / WinRM (Path B) |
+| Zone CRUD wire protocol | rndc addzone / delzone | REST API | REST API | WinRM (Path B only) |
+| ALIAS records (CNAME at apex) | — | ✅ | — (has ANAME/APP instead — deferred) | — |
+| LUA records (computed responses) | — | ✅ | — | — |
+| Online DNSSEC signing | ✅ inline-signing (#49) | ✅ one-toggle | — (fast-follow) | manual |
+| Native DoT / DoH (no sidecar) | ✅ (issue #50) | — (needs dnsdist sidecar) | — (fast-follow — daemon supports DoT/DoH/DoQ natively) | — |
+| Catalog zones (RFC 9432) — producer | ✅ | ✅ | — (fast-follow) | — |
+| Catalog zones (RFC 9432) — consumer | ✅ | — (not wired up in the agent) | — | — |
+| First-class views / split-horizon | ✅ | tag-based, not surfaced as views in UI | — | — (replication scope) |
+| RPZ blocklists | ✅ | — (recursor feature only) | — | — |
+| AD-integrated zones | — | — | — | ✅ |
+| Agent shape | sidecar agent + named | sidecar agent + pdns_server | sidecar agent + DnsServerApp.dll | agentless (control plane → WinRM) |
 
 **Default driver: BIND9.** It is the reference implementation, ubiquitous in operator muscle memory, and runs the catalog-zone consumer + RPZ paths SpatiumDDI ships.
 
 **Pick PowerDNS when** you need ALIAS records (CNAME-at-apex without the BIND-side workaround), LUA records (geo-routing / weighted answers / `pickrandom` / `ifportup`), or the simpler one-toggle online DNSSEC story. The shipped image (`ghcr.io/spatiumddi/dns-powerdns`) bundles `pdns 5.0 + pdns-backend-lmdb` for an agent-isolated zone store with no external Postgres dependency. See [issue #127](https://github.com/spatiumddi/spatiumddi/issues/127) for the full driver rationale.
 
+**Pick Technitium when** you want a minimal-footprint REST-driven primary-zone host and don't (yet) need DNSSEC or ALIAS/LUA — v1 covers primary zones + standard record types (A/AAAA/CNAME/MX/TXT/NS/PTR/SRV/CAA/TLSA/SSHFP/NAPTR/URI/SVCB/HTTPS/DNAME). Its real long-term differentiator is native DNS-over-TLS/HTTPS/QUIC support with no dnsdist-style sidecar (PowerDNS's approach) — that wiring is a fast-follow, tracked in [`docs/drivers/DNS_DRIVERS.md` §4B.5](../drivers/DNS_DRIVERS.md).
+
 **Pick Windows DNS when** the zone is AD-integrated and operators expect to keep using DNS Manager / `Add-DnsServerResourceRecord` directly. Path A (RFC 2136 + AXFR) works without admin credentials; Path B (WinRM + PowerShell) unlocks zone CRUD and a JSON record-pull that sidesteps AXFR ACL configuration.
 
-PowerDNS-only features (ALIAS / LUA / online DNSSEC sign+unsign) are server-side gated by the API's `_DRIVER_GATED_RECORD_TYPES` and `_DRIVER_GATED_OPERATIONS` maps. Calling them against a BIND9 / Windows / mixed group returns 422 with a remediation message — move the zone to a PowerDNS-only group, or add a PowerDNS server to the group, before retrying.
+PowerDNS-only features (ALIAS / LUA / online DNSSEC sign+unsign) are server-side gated by the API's `_DRIVER_GATED_RECORD_TYPES` and `_DRIVER_GATED_OPERATIONS` maps. Calling them against a group without a PowerDNS member returns 422 with a remediation message — move the zone to a PowerDNS-only group, or add a PowerDNS server to the group, before retrying. SVCB / HTTPS / DNAME are gated to BIND9, PowerDNS, and Technitium (all three serve them natively).
 
-The Operator Copilot's `propose_create_dns_zone` tool accepts an explicit `driver_hint` argument (`bind9` / `powerdns` / `windows_dns`) so the LLM can route DNSSEC-required zones to PowerDNS groups without operators having to specify the group UUID by hand. See `app.services.ai.operations.CreateDNSZoneArgs`.
+The Operator Copilot's `propose_create_dns_zone` tool accepts an explicit `driver_hint` argument (`bind9` / `powerdns` / `technitium` / `windows_dns`) so the LLM can route DNSSEC-required zones to PowerDNS groups without operators having to specify the group UUID by hand. See `app.services.ai.operations.CreateDNSZoneArgs`.
 
 ### 0a. Cloud DNS providers — Cloudflare / Route 53 / Azure DNS / Google Cloud DNS (issue #37)
 
@@ -1405,6 +1408,7 @@ validation — use one group per provider.
 |---|---|---|
 | **BIND9** | Native (`tls` + `http` statements) | Yes (`forwarders { … tls … }`) |
 | **PowerDNS** | Via the dnsdist front (#146 Phase 2) | N/A — pdns Authoritative doesn't recurse or forward |
+| **Technitium** | Not wired yet — daemon supports DoT/DoH/DoQ natively, no sidecar needed (fast-follow, see [`docs/drivers/DNS_DRIVERS.md` §4B.5](../drivers/DNS_DRIVERS.md)) | N/A — v1 driver is authoritative-only |
 | Windows DNS, cloud drivers | Not supported — we don't run their listeners | — |
 
 On PowerDNS the listeners are `addTLSLocal` / `addDOHLocal` on the dnsdist

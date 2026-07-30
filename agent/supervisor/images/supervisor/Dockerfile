@@ -45,7 +45,21 @@ FROM alpine:3.23 AS runtime
 # packages (openssl / libcrypto3 / libssl3, …) are pulled forward to their
 # fixed versions — keeps the Trivy HIGH/CRITICAL gate clean. Same pattern as
 # the DNS/DHCP agent images (agent/{dns,dhcp}/images/*/Dockerfile).
-RUN apk upgrade --no-cache \
+#
+# ``APK_SNAPSHOT`` exists to make that actually happen in CI. BuildKit keys
+# a layer on its RUN command text, so ``--no-cache`` (which only tells apk
+# not to keep its own index) does nothing to stop the whole layer being
+# restored from the ``type=gha`` cache — the image then keeps shipping
+# whatever package set the layer was FIRST built with, indefinitely.
+# That is how this image was still shipping bind 9.20.23-r0 days after
+# Alpine published the 9.20.26-r0 fix, failing the PR Trivy gate on a
+# change that had nothing to do with it. The workflow passes the current
+# ISO year-week, so the package layer rebuilds weekly — matching the
+# cadence of trivy-scheduled.yml, and bounding how long a published fix
+# can sit unapplied. Everything above this line still caches normally.
+ARG APK_SNAPSHOT=dev
+RUN echo "apk snapshot ${APK_SNAPSHOT}" >/dev/null \
+ && apk upgrade --no-cache \
  && apk add --no-cache \
       tini su-exec \
       python3 py3-pip \

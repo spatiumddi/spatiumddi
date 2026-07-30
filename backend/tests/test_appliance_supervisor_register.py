@@ -229,6 +229,66 @@ async def test_register_happy_path(db_session: AsyncSession, client: AsyncClient
 
 
 @pytest.mark.asyncio
+async def test_register_capabilities_round_trip_every_known_flag(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    """Regression test (bug caught live testing the Technitium driver,
+    2026-07): ``SupervisorCapabilities`` is a STRICT Pydantic model, not
+    a passthrough dict — despite the class docstring's "ignores keys it
+    doesn't recognise" framing, Pydantic v2 silently DROPS any field the
+    model doesn't explicitly declare. A capability the supervisor sends
+    but this model doesn't list never reaches the stored
+    ``Appliance.capabilities`` JSONB, which makes the Fleet UI's role
+    picker report "supervisor doesn't advertise can_run_X=true" even
+    though the real supervisor is sending it. Every ``can_run_dns_*``
+    flag must be explicitly declared here — this test locks the full
+    set so adding a fourth DNS driver without updating the model fails
+    loudly instead of silently misreporting capabilities in the field.
+    """
+    await _enable_supervisor_registration(db_session)
+    code_row = await _make_pairing_code(db_session, code="33333333")
+    await db_session.commit()
+
+    _, _, _, pubkey_b64 = _new_keypair()
+
+    resp = await client.post(
+        "/api/v1/appliance/supervisor/register",
+        json={
+            "pairing_code": "33333333",
+            "hostname": "dns-cap-test",
+            "public_key_der_b64": pubkey_b64,
+            "supervisor_version": "2026.07.28-1",
+            "capabilities": {
+                "can_run_dns_bind9": True,
+                "can_run_dns_powerdns": True,
+                "can_run_dns_technitium": True,
+                "can_run_dhcp": True,
+                "can_run_looking_glass": True,
+                "can_run_observer": True,
+                "has_baked_images": True,
+            },
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    appliance_id = uuid.UUID(resp.json()["appliance_id"])
+    del code_row
+
+    appliance = await db_session.get(Appliance, appliance_id)
+    assert appliance is not None
+    caps = appliance.capabilities
+    for flag in (
+        "can_run_dns_bind9",
+        "can_run_dns_powerdns",
+        "can_run_dns_technitium",
+        "can_run_dhcp",
+        "can_run_looking_glass",
+        "can_run_observer",
+        "has_baked_images",
+    ):
+        assert caps.get(flag) is True, f"{flag} did not survive SupervisorCapabilities round-trip"
+
+
+@pytest.mark.asyncio
 async def test_register_is_idempotent_for_same_pubkey(
     db_session: AsyncSession, client: AsyncClient
 ) -> None:

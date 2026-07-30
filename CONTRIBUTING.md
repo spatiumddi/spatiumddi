@@ -38,6 +38,21 @@ docker compose up -d
    plan, and migration notes. Fill those in, don't leave them blank.
 5. Link any related issues (`Closes #123`, `Refs #456`).
 
+> **Note for maintainers:** the Contributors table at the bottom of
+> [README.md](README.md) is maintained by hand. Add a first-time
+> contributor to it as part of merging their PR — nobody's first
+> contribution should land unacknowledged.
+
+### A note on forks
+
+Fork PRs currently **cannot** satisfy this repo's required `code_quality`
+check: GitHub does not create CodeQL `dynamic` runs for pull requests from
+forks, so the gate stays pending indefinitely and the PR is unmergeable
+through no fault of the contribution. That is a limitation of the setup,
+not a signal about your work — a maintainer will re-push the branch
+in-repo and credit you via `Co-Authored-By`. Open the fork PR as normal;
+it is still the right way to contribute.
+
 ## Reporting Bugs
 
 Use the [GitHub Issues](https://github.com/spatiumddi/spatiumddi/issues)

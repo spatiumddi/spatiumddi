@@ -91,11 +91,20 @@ class FirewallApplyState(Base):
 
 # Allowed scope_role values. NOTE: ``control-plane`` is NOT a node role
 # (the node-label taxonomy is _VALID_ROLES = dns-bind9 / dns-powerdns /
-# dhcp / observer / custom). It is a MERGE-INTERNAL scope key the compiler
-# matches onto a node via the ``is_cp`` predicate (peer/pod/service
-# presence), mirroring the Phase-2 renderer — never via "control-plane in
-# node.roles". Do not add a CHECK tying scope_role to the node-role set.
-_POLICY_ROLES = ("dns-bind9", "dns-powerdns", "dhcp", "observer", "custom", "control-plane")
+# dns-technitium / dhcp / observer / custom). It is a MERGE-INTERNAL scope
+# key the compiler matches onto a node via the ``is_cp`` predicate (peer/
+# pod/service presence), mirroring the Phase-2 renderer — never via
+# "control-plane in node.roles". Do not add a CHECK tying scope_role to
+# the node-role set.
+_POLICY_ROLES = (
+    "dns-bind9",
+    "dns-powerdns",
+    "dns-technitium",
+    "dhcp",
+    "observer",
+    "custom",
+    "control-plane",
+)
 
 
 class FirewallPolicy(UUIDPrimaryKeyMixin, TimestampMixin, Base):

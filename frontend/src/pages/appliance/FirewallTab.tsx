@@ -56,6 +56,7 @@ import { cn } from "@/lib/utils";
 const ROLE_OPTIONS = [
   "dns-bind9",
   "dns-powerdns",
+  "dns-technitium",
   "dhcp",
   "observer",
   "custom",

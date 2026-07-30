@@ -203,6 +203,30 @@ server {
         proxy_send_timeout       1800s;
     }
 
+    # Appliance upgrade-image upload (air-gapped slot-image upload, e.g.
+    # dns-technitium / dns-bind9 / dhcp-kea A/B slot images). Same shape
+    # as the backup location above but sized to the backend's own
+    # ``MAX_UPLOAD_BYTES`` cap (4 GiB, app/api/v1/appliance/
+    # upgrade_images.py) — appliance slot images run ~1.8-2 GB, so the
+    # 2g backup limit isn't enough. Without this override the request
+    # falls through to the generic /api/ location below and nginx's
+    # ~1 MB default silently 413s the upload before it ever reaches
+    # FastAPI's own (more informative) size-check error.
+    location /api/v1/appliance/upgrade-images {
+        set $api_upstream http://${API_UPSTREAM_HOST}:${API_UPSTREAM_PORT};
+        proxy_pass               $api_upstream;
+        proxy_set_header         Host $http_host;
+        proxy_set_header         X-Real-IP $remote_addr;
+        proxy_set_header         X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header         X-Forwarded-Proto $scheme;
+        proxy_http_version       1.1;
+        proxy_set_header         Connection "";
+        client_max_body_size     4g;
+        proxy_request_buffering  off;
+        proxy_read_timeout       1800s;
+        proxy_send_timeout       1800s;
+    }
+
     # Proxy API calls to the backend. Using a variable for proxy_pass
     # forces nginx to re-resolve the upstream on each request via the
     # resolver above (instead of binding at config-load time).

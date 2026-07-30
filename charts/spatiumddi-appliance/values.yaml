@@ -28,10 +28,10 @@ global:
   # operator override).
   extraEnv: []
 
-# DNS — bind9 backend. Exactly one of dnsBind9 / dnsPowerdns runs
-# per appliance; the supervisor enforces mutual-exclusion at the
-# CRD reconciler level so flipping both ``enabled: true`` is a
-# server-side validation error.
+# DNS — bind9 backend. Exactly one of dnsBind9 / dnsPowerdns /
+# dnsTechnitium runs per appliance; the supervisor enforces mutual-
+# exclusion at the CRD reconciler level so flipping more than one
+# ``enabled: true`` is a server-side validation error.
 dnsBind9:
   enabled: false
   image:
@@ -105,6 +105,20 @@ dnsPowerdns:
   # #50 — that same gap means DoT/DoH on the PowerDNS driver is
   # docker-compose-only too: pdns auth speaks neither protocol, so the
   # listeners live on the dnsdist front. BIND9 needs no such sidecar.
+
+# DNS — Technitium backend. Same shape as dnsBind9. v1 supports primary
+# zones + standard record CRUD; DNSSEC and native DoT/DoH/DoQ listener
+# wiring (a real differentiator — Technitium needs no dnsdist-style
+# sidecar, unlike PowerDNS) are fast-follow, so no dotPort/dohPort knobs
+# here yet.
+dnsTechnitium:
+  enabled: false
+  image:
+    repository: ghcr.io/spatiumddi/dns-technitium
+  controlPlaneUrl: ""
+  inClusterApiUrl: ""  # #292 — see dnsBind9.inClusterApiUrl
+  agentKey: ""
+  serverGroupName: ""
 
 # DHCP — Kea backend. DaemonSet (single node) with ``hostNetwork:
 # true`` + ``CAP_NET_BIND_SERVICE`` so Kea sees DHCP-discover

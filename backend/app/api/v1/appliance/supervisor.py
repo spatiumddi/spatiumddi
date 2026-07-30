@@ -205,6 +205,7 @@ class SupervisorCapabilities(BaseModel):
 
     can_run_dns_bind9: bool = False
     can_run_dns_powerdns: bool = False
+    can_run_dns_technitium: bool = False
     can_run_dhcp: bool = False
     can_run_looking_glass: bool = False
     can_run_observer: bool = False
@@ -1082,7 +1083,7 @@ class SupervisorHeartbeatRequest(BaseModel):
     role_switch_reason: str | None = None
     # #170 Wave E — service-container watchdog. Free-form dict keyed
     # by compose service name (``dns-bind9`` / ``dns-powerdns`` /
-    # ``dhcp-kea``); each value carries ``{role, status, since,
+    # ``dns-technitium`` / ``dhcp-kea``); each value carries ``{role, status, since,
     # container_id}`` where status ∈ {healthy, missing, unhealthy,
     # starting}. The supervisor probes every 5 min and ships the
     # cached verdict on every heartbeat; the Fleet drilldown surfaces
@@ -1303,8 +1304,8 @@ class SupervisorHeartbeatResponse(BaseModel):
     ca_chain_pem: str | None = None
     cert_expires_at: datetime | None = None
     # #170 Wave C2 — assigned roles + group config. The supervisor
-    # uses this to bring up dns-bind9 / dns-powerdns / dhcp-kea
-    # service containers via docker compose. Empty roles list = idle
+    # uses this to bring up dns-bind9 / dns-powerdns / dns-technitium /
+    # dhcp-kea service containers via docker compose. Empty roles list = idle
     # (approved but no service running).
     role_assignment: SupervisorRoleAssignment = Field(default_factory=SupervisorRoleAssignment)
     # #272 Phase 7 — control-plane promote/demote desired state.
@@ -2355,7 +2356,7 @@ async def _build_role_assignment(db: DB, row: Appliance) -> SupervisorRoleAssign
     from app.models.dns import DNSServerGroup, DNSServerOptions
 
     assigned_roles = list(row.assigned_roles or [])
-    dns_role_assigned = "dns-bind9" in assigned_roles or "dns-powerdns" in assigned_roles
+    dns_role_assigned = any(r in assigned_roles for r in _DNS_ROLES)
     dhcp_role_assigned = "dhcp" in assigned_roles
     lg_role_assigned = "looking-glass" in assigned_roles
 
@@ -2364,6 +2365,8 @@ async def _build_role_assignment(db: DB, row: Appliance) -> SupervisorRoleAssign
         dns_engine = "bind9"
     elif "dns-powerdns" in assigned_roles:
         dns_engine = "powerdns"
+    elif "dns-technitium" in assigned_roles:
+        dns_engine = "technitium"
 
     dns_group_name: str | None = None
     # #50 — DoT / DoH listen on operator-chosen ports, so the firewall can't
@@ -2523,7 +2526,7 @@ class ApplianceRow(BaseModel):
     # #170 Wave E — service-container watchdog. Per-service health
     # the supervisor reports every 5 min via heartbeat. Keys are
     # compose service names (``dns-bind9`` / ``dns-powerdns`` /
-    # ``dhcp-kea``); values carry ``{role, status, since,
+    # ``dns-technitium`` / ``dhcp-kea``); values carry ``{role, status, since,
     # container_id}``.
     role_health: dict[str, dict[str, Any]]
     # #387 — per-plane host-config apply health (snmp / ntp / lldp /
@@ -3324,8 +3327,16 @@ async def rekey_appliance(
 # ── Admin: role assignment + tags (#170 Wave C2) ──────────────────
 
 
-_VALID_ROLES = {"dns-bind9", "dns-powerdns", "dhcp", "looking-glass", "observer", "custom"}
-_DNS_ROLES = {"dns-bind9", "dns-powerdns"}
+_VALID_ROLES = {
+    "dns-bind9",
+    "dns-powerdns",
+    "dns-technitium",
+    "dhcp",
+    "looking-glass",
+    "observer",
+    "custom",
+}
+_DNS_ROLES = {"dns-bind9", "dns-powerdns", "dns-technitium"}
 
 
 class ApplianceRolesUpdate(BaseModel):
@@ -3340,8 +3351,9 @@ class ApplianceRolesUpdate(BaseModel):
     roles: list[str] | None = Field(
         default=None,
         description=(
-            "Subset of dns-bind9 / dns-powerdns / dhcp / looking-glass / "
-            "observer / custom. dns-bind9 and dns-powerdns are mutually exclusive."
+            "Subset of dns-bind9 / dns-powerdns / dns-technitium / dhcp / "
+            "looking-glass / observer / custom. The three dns-* roles are "
+            "mutually exclusive — one engine per appliance."
         ),
     )
     dns_group_id: uuid.UUID | None = None
@@ -3370,8 +3382,9 @@ async def update_appliance_roles(
     """Validate + persist a role assignment. Refuses to assign a role
     the supervisor doesn't advertise the capability for (BIND9 needs
     ``can_run_dns_bind9``, PowerDNS needs ``can_run_dns_powerdns``,
-    DHCP needs ``can_run_dhcp``). Refuses the dns-bind9 + dns-powerdns
-    combo (one engine per box). 422 on validation failure.
+    Technitium needs ``can_run_dns_technitium``, DHCP needs
+    ``can_run_dhcp``). Refuses combining more than one dns-* role (one
+    engine per box). 422 on validation failure.
 
     The supervisor's next heartbeat picks up the change via
     ``role_assignment`` in the response. Service-container lifecycle
@@ -3403,7 +3416,7 @@ async def update_appliance_roles(
         if len(dns_engines) > 1:
             raise HTTPException(
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
-                "dns-bind9 and dns-powerdns are mutually exclusive — one engine per appliance.",
+                f"{sorted(dns_engines)} are mutually exclusive — one DNS engine per appliance.",
             )
         # Capability gate. Each requested role must be backed by the
         # supervisor's advertised cap. Skips for ``observer`` / ``custom``
@@ -3413,6 +3426,7 @@ async def update_appliance_roles(
             cap_key = {
                 "dns-bind9": "can_run_dns_bind9",
                 "dns-powerdns": "can_run_dns_powerdns",
+                "dns-technitium": "can_run_dns_technitium",
                 "dhcp": "can_run_dhcp",
                 "looking-glass": "can_run_looking_glass",
                 "observer": "can_run_observer",

@@ -606,6 +606,9 @@ dnsAgents:
     powerdns:
       repository: ghcr.io/spatiumddi/dns-powerdns
       tag: ""                    # empty → use Chart.appVersion
+    technitium:
+      repository: ghcr.io/spatiumddi/dns-technitium
+      tag: ""                    # empty → use Chart.appVersion
   # PSK carrying DNS_AGENT_KEY. Prefer `existingSecret`; `value` lives here
   # only to make lab walk-throughs runnable in one command.
   agentKey:
@@ -613,7 +616,7 @@ dnsAgents:
     value: ""
   servers: []
     # - name: ns1
-    #   flavor: bind9            # bind9 (default) | powerdns
+    #   flavor: bind9            # bind9 (default) | powerdns | technitium
     #   role: primary            # primary | secondary
     #   group: internal-resolvers
     #   storage: { agentState: 1Gi, dnsState: 2Gi }

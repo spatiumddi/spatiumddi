@@ -19,7 +19,7 @@ The appliance runs **k3s** as its container orchestrator. Pre-#183 it ran `docke
 **#272 — two install roles** (the installer wizard collapsed from the earlier three; the old `full-stack` / `frontend-core` distinction is now a runtime DNS/DHCP role toggle, not an install choice — and legacy variant strings are still accepted from a not-yet-reinstalled box):
 
 - **Control plane** (the default; the required FIRST install) — control plane (api / frontend / worker / beat / migrate / Postgres / Redis) + the supervisor, all on a single-node k3s that is also the etcd seed. **DNS + DHCP are OFF at install** — the operator enables them per node from the `/appliance → Fleet` role toggle (so the data plane is always a deliberate fleet decision). The umbrella chart deploys the control plane; the supervisor owns the per-role node labels. More control-plane nodes are made by **promoting** Appliances in the Fleet UI (#272 Phase 7), not installed as this role.
-- **Appliance** — supervisor + agent-landing nginx. Pairs against a remote control plane via 8-digit pairing code; roles (`dns-bind9` / `dns-powerdns` / `dhcp`) are assigned post-approval from the control plane's `/appliance → Fleet` tab. Can later be promoted to join the control-plane cluster.
+- **Appliance** — supervisor + agent-landing nginx. Pairs against a remote control plane via 8-digit pairing code; roles (`dns-bind9` / `dns-powerdns` / `dns-technitium` / `dhcp`) are assigned post-approval from the control plane's `/appliance → Fleet` tab. Can later be promoted to join the control-plane cluster.
 
 The historical AIO / Core-only / Application narrative below documents the pre-#272 three-role world; the firstboot dispatch still handles those strings as aliases.
 
@@ -36,7 +36,7 @@ The historical AIO / Core-only / Application narrative below documents the pre-#
    spatium-supervisor pod (DaemonSet, privileged, hostNetwork: false)   ← all roles
         ↓ (registers + heartbeats to control plane)
         ↓ (on role assignment: labels node → DaemonSet schedules)
-   role pods: dns-bind9 / dns-powerdns / dhcp-kea (hostNetwork: true)
+   role pods: dns-bind9 / dns-powerdns / dns-technitium / dhcp-kea (hostNetwork: true)
    always-on: agent-landing nginx on :80                                 ← Appliance only
    control plane pods (api / frontend / db / redis / worker / beat /     ← Control plane
                        migrate, frontend on hostNetwork :80 + :443)
@@ -48,7 +48,7 @@ mkosi bakes everything the appliance needs to come up fully air-gapped:
 
 - **k3s static binary** (~70 MB) at `/usr/local/bin/k3s`; `kubectl` / `crictl` / `ctr` symlink to it.
 - **k3s airgap images** (CoreDNS / local-path / pause / metrics-server) as zst-compressed tarballs at `/var/lib/rancher/k3s/agent/images/*.tar.zst`. k3s auto-imports them into containerd at boot.
-- **SpatiumDDI container images** as zst tarballs at `/usr/lib/spatiumddi/images/`. firstboot imports them into k3s containerd via `ctr -n k8s.io images import`. Includes api / frontend / worker / beat / migrate / dns-bind9 / dns-powerdns / dhcp-kea / supervisor / nginx + postgres:16-alpine + redis:8.8-alpine for the Control plane role.
+- **SpatiumDDI container images** as zst tarballs at `/usr/lib/spatiumddi/images/`. firstboot imports them into k3s containerd via `ctr -n k8s.io images import`. Includes api / frontend / worker / beat / migrate / dns-bind9 / dns-powerdns / dns-technitium / dhcp-kea / supervisor / nginx + postgres:16-alpine + redis:8.8-alpine for the Control plane role.
 - **Helm chart tarballs** at `/usr/lib/spatiumddi/charts/`. The appliance chart drives Appliance installs (and the supervisor on the Control plane); the umbrella chart drives the Control plane. Built at release time + signed.
 - **bash-completion + `k` alias** for kubectl — operator SSHing in for triage drops straight into a usable shell.
 
@@ -57,7 +57,7 @@ A fresh appliance boot never reaches out to ghcr.io or any external registry. Th
 ### Two HelmChart CRs
 
 - **`spatium-bootstrap`** — written by `spatiumddi-firstboot` into k3s's auto-deploy directory on every boot. Content depends on install role (Control plane / Appliance). Owns the always-on resources (supervisor on every role; agent-landing on Appliance; control plane pods on Control plane).
-- **`spatiumddi-appliance`** — written by the supervisor on its first successful heartbeat (every role runs a supervisor). Deploys the three role DaemonSets (dns-bind9 / dns-powerdns / dhcp-kea). After #183 Phase 10, this release is installed once and never re-PATCHed for role changes — role swaps happen through node labels (`spatium.io/role-<role>=true`); the DaemonSet's matching-nodes semantics mean an unassigned role produces zero pods rather than a Pending one.
+- **`spatiumddi-appliance`** — written by the supervisor on its first successful heartbeat (every role runs a supervisor). Deploys the role DaemonSets (dns-bind9 / dns-powerdns / dns-technitium / dhcp-kea). After #183 Phase 10, this release is installed once and never re-PATCHed for role changes — role swaps happen through node labels (`spatium.io/role-<role>=true`); the DaemonSet's matching-nodes semantics mean an unassigned role produces zero pods rather than a Pending one.
 
 ### Why k3s
 
@@ -319,7 +319,7 @@ trigger-file → `spatium-firewall-reload` plane. Full design + risk register:
    to it, so flipping the switch never re-fires a node's trigger.
 
 **Policy model.** Three additive scopes merge per node: a **fleet** singleton
-baseline → **per-role** overlays (`dns-bind9` / `dns-powerdns` / `dhcp` /
+baseline → **per-role** overlays (`dns-bind9` / `dns-powerdns` / `dns-technitium` / `dhcp` /
 `observer` / `custom` + the merge-internal `control-plane` key, resolved by the
 `is_cp` predicate, not a node label) → a **per-appliance** override. The merge
 is `explode → deny-wins → source-union`; `source_kind` carries derived scopes
@@ -423,7 +423,7 @@ The fix:
 `/appliance` → **Fleet** tab is the primary management surface. Operators see every Application appliance with state (pending / approved), advertised capabilities, assigned roles, deployment kind, slot info, last-seen. A pending row pins at the top with Approve / Reject. A drilldown modal on each approved row carries:
 
 - Identity (hostname, full cert fingerprint, paired-at + paired-from-ip, last-seen).
-- **Role assignment** — pick a subset of `dns-bind9` / `dns-powerdns` / `dhcp` / `observer`. DNS engines are mutually exclusive; chips for capabilities the supervisor doesn't advertise dim with a tooltip. DNS / DHCP group dropdowns appear conditionally on the selection.
+- **Role assignment** — pick a subset of `dns-bind9` / `dns-powerdns` / `dns-technitium` / `dhcp` / `observer`. DNS engines are mutually exclusive; chips for capabilities the supervisor doesn't advertise dim with a tooltip. DNS / DHCP group dropdowns appear conditionally on the selection.
 - **Firewall preview + operator override** — live preview of the role-driven profile (idle / dns-only / dhcp-only / dns-and-dhcp), always-open + per-role port summary, raw-nft textarea for operator overrides.
 - **OS & lifecycle** — installed appliance version, running + durable-default slots (with trial-boot chip), last upgrade state, Schedule OS upgrade form, Cancel pending upgrade, Reboot host (with a double-confirm modal requiring an "I understand this will go offline" checkbox).
 - **Certificate** — serial, issued/expires timestamps. Re-key + Delete actions on the modal footer.

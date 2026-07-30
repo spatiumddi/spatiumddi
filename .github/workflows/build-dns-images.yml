@@ -23,9 +23,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # dnsdist (#146 Phase 2) follows the same image path convention
-        # (agent/dns/images/<flavor>/Dockerfile → ghcr.io/spatiumddi/dns-<flavor>).
-        flavor: [bind9, powerdns, dnsdist]
+        # dnsdist (#146 Phase 2) and technitium follow the same image path
+        # convention (agent/dns/images/<flavor>/Dockerfile →
+        # ghcr.io/spatiumddi/dns-<flavor>).
+        flavor: [bind9, powerdns, technitium, dnsdist]
     steps:
       - uses: actions/checkout@v4
 

@@ -1,15 +1,20 @@
 name: Agent E2E (kind)
 
-# Spins up a kind cluster, installs the umbrella Helm chart with both
-# DNS-agent flavors (BIND9 + PowerDNS) enabled side by side, and
-# verifies:
+# Spins up a kind cluster, installs the umbrella Helm chart with all three
+# DNS-agent flavors (BIND9 + PowerDNS + Technitium) enabled side by side,
+# and verifies:
 #   1. Every deployment + statefulset reaches Ready.
 #   2. The API's /health/live returns 200 via a port-forward.
 #   3. The BIND9 agent answers ``dig version.bind CH TXT`` — cheap
 #      "daemon is alive" probe that doesn't need pre-seeded zone data.
 #   4. The PowerDNS agent answers ``dig id.server CH TXT`` — pdns's
 #      CHAOS-class equivalent.
-#   5. Both pods register and stay stable (low restart count).
+#   5. The Technitium agent answers a query for the RFC 6761 reserved
+#      "invalid." TLD — Technitium REFUSES CHAOS-class queries entirely
+#      (confirmed empirically), so it has no id.server/version.bind
+#      equivalent; querying "invalid." is answered locally and instantly
+#      (NXDOMAIN, no recursion) regardless of zone state instead.
+#   6. All three pods register and stay stable (low restart count).
 #
 # Tag selection — control-plane vs agent images publish on different
 # cadences, so they need different tags:
@@ -97,7 +102,7 @@ jobs:
         run: |
           set -euxo pipefail
           docker buildx create --use --name e2e-builder >/dev/null 2>&1 || docker buildx use e2e-builder
-          for flavor in bind9 powerdns; do
+          for flavor in bind9 powerdns technitium; do
             docker buildx build \
               --platform linux/amd64 \
               --file "agent/dns/images/${flavor}/Dockerfile" \
@@ -150,12 +155,12 @@ jobs:
           # deployment operators pre-create an external secret; the
           # inline value here is only safe because the cluster dies
           # with the workflow run.
-          # Both flavors get pinned to the same TAG so the test
+          # All three flavors get pinned to the same TAG so the test
           # exercises a coherent build cohort. Mixed flavor list
-          # makes the chart render two StatefulSets that live in
-          # different DNSServerGroups (e2e-bind9 + e2e-powerdns) —
-          # mirrors the production "split groups by driver" model
-          # the control plane gates rely on.
+          # makes the chart render three StatefulSets that live in
+          # different DNSServerGroups (e2e-bind9 + e2e-powerdns +
+          # e2e-technitium) — mirrors the production "split groups by
+          # driver" model the control plane gates rely on.
           helm install ddi charts/spatiumddi \
             --namespace spatiumddi --create-namespace \
             --wait --timeout 10m \
@@ -170,7 +175,8 @@ jobs:
             --set dnsAgents.agentKey.value=e2e-dns-key \
             --set dnsAgents.image.tag="${AGENT_TAG}" \
             --set dnsAgents.flavors.powerdns.tag="${AGENT_TAG}" \
-            --set-json 'dnsAgents.servers=[{"name":"ns1","flavor":"bind9","role":"primary","group":"e2e-bind9","service":{"type":"ClusterIP"}},{"name":"pdns1","flavor":"powerdns","role":"primary","group":"e2e-powerdns","service":{"type":"ClusterIP"}}]'
+            --set dnsAgents.flavors.technitium.tag="${AGENT_TAG}" \
+            --set-json 'dnsAgents.servers=[{"name":"ns1","flavor":"bind9","role":"primary","group":"e2e-bind9","service":{"type":"ClusterIP"}},{"name":"pdns1","flavor":"powerdns","role":"primary","group":"e2e-powerdns","service":{"type":"ClusterIP"}},{"name":"tdx1","flavor":"technitium","role":"primary","group":"e2e-technitium","service":{"type":"ClusterIP"}}]'
 
       - name: Dump pod state
         if: always()
@@ -274,6 +280,39 @@ jobs:
             sleep 5
           done
           echo "pdns dig never succeeded — dumping logs:"
+          kubectl -n spatiumddi logs "$POD" --tail=120
+          exit 1
+
+      - name: Technitium daemon smoke (dig healthcheck.invalid A)
+        run: |
+          POD=$(kubectl -n spatiumddi get pod \
+            -l app.kubernetes.io/component=dns-agent,spatiumddi.org/dns-flavor=technitium \
+            -o jsonpath='{.items[0].metadata.name}')
+          if [ -z "$POD" ]; then
+            echo "no Technitium agent pod found"
+            kubectl -n spatiumddi get pods --show-labels
+            exit 1
+          fi
+          echo "→ probing DnsServerApp.dll in pod $POD"
+          # Technitium REFUSES CHAOS-class queries entirely (confirmed
+          # empirically — id.server/version.bind both come back REFUSED,
+          # not answered), so there's no BIND/PowerDNS-style CHAOS probe
+          # here. Query the RFC 6761 reserved "invalid." TLD instead —
+          # answered locally and instantly (NXDOMAIN, no recursion)
+          # regardless of zone state, which is exactly the "daemon loaded
+          # and listening on :53" signal this smoke needs. Allow a few
+          # retries for first-boot admin-account + API-token provisioning
+          # (the agent's first apply_config waits on the daemon's web
+          # server before it can even start the config reconcile).
+          for i in 1 2 3 4 5 6; do
+            if kubectl -n spatiumddi exec "$POD" -- dig +time=5 +tries=1 healthcheck.invalid A @127.0.0.1 | grep -q "status: NXDOMAIN"; then
+              echo "Technitium answered on attempt $i"
+              exit 0
+            fi
+            echo "attempt $i: Technitium not ready yet; sleeping…"
+            sleep 5
+          done
+          echo "Technitium dig never succeeded — dumping logs:"
           kubectl -n spatiumddi logs "$POD" --tail=120
           exit 1
 
@@ -478,12 +517,12 @@ jobs:
           # Without an admin token we can only hit unauthenticated
           # endpoints; the agent register endpoint is open (trusts the
           # PSK). A "server registered" signal is that each agent pod
-          # isn't restarting — crude but useful, and we now check both
-          # flavors so a powerdns-side regression doesn't slip past
-          # because the bind9 pod looks fine.
+          # isn't restarting — crude but useful, and we now check all
+          # three flavors so a driver-side regression doesn't slip past
+          # because the other pods look fine.
           set -u
           fail=0
-          for flavor in bind9 powerdns; do
+          for flavor in bind9 powerdns technitium; do
             RESTARTS=$(kubectl -n spatiumddi get pod \
               -l app.kubernetes.io/component=dns-agent,spatiumddi.org/dns-flavor=${flavor} \
               -o jsonpath='{.items[0].status.containerStatuses[0].restartCount}')

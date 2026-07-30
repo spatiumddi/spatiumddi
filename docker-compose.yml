@@ -265,6 +265,37 @@ services:
       api:
         condition: service_started
 
+  # ── DNS agent (Technitium) ───────────────────────────────────────────
+  # Enable with: docker compose --profile dns-technitium up -d
+  # Third DNS driver, alongside bind9/powerdns. Distinct profile + host
+  # port (6053, avoiding 1053/5453) so all three can run side-by-side in
+  # a dev/migration setup. Technitium's web console + API listen on
+  # loopback :5380 inside the container only — the agent is the only
+  # caller (same trust boundary as PowerDNS's local API key).
+  dns-technitium:
+    profiles: ["dns-technitium"]
+    image: ghcr.io/spatiumddi/dns-technitium:${SPATIUMDDI_VERSION:-latest}
+    restart: unless-stopped
+    networks:
+      - spatiumddi
+    environment:
+      CONTROL_PLANE_URL: http://api:8000
+      DNS_AGENT_KEY: ${DNS_AGENT_KEY:-changeme-dns-agent-key}
+      SERVER_NAME: dns-technitium
+      AGENT_GROUP: default-technitium
+      AGENT_ROLES: authoritative
+      SPATIUM_INSECURE_SKIP_TLS_VERIFY: "1"
+    volumes:
+      - dns_technitium_state:/var/lib/spatium-dns-agent
+      - dns_technitium_config:/etc/dns
+      - dns_technitium_logs:/var/log/technitium
+    ports:
+      - "6053:53/udp"
+      - "6053:53/tcp"
+    depends_on:
+      api:
+        condition: service_started
+
   # ── dnsdist front for PowerDNS (issue #146 Phase 2) ───────────────────
   # Opt-in rate-limit / DDoS front for the authoritative PowerDNS agent
   # (pdns auth has no RRL of its own). A SEPARATE container (its own netns)
@@ -465,6 +496,9 @@ volumes:
   dns_bind9_cache:
   dns_powerdns_state:
   dns_powerdns_lmdb:
+  dns_technitium_state:
+  dns_technitium_config:
+  dns_technitium_logs:
   dhcp_kea_state:
   dhcp_kea_leases:
   dhcp_kea_state_2:
