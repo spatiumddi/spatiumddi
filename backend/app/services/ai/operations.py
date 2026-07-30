@@ -2134,7 +2134,7 @@ register(
 # ── create_dns_zone (issue #127 Phase 4e) ─────────────────────────────
 
 
-_DNS_DRIVER_HINTS = {"bind9", "powerdns", "windows_dns"}
+_DNS_DRIVER_HINTS = {"bind9", "powerdns", "technitium", "windows_dns"}
 # DNSSEC online signing + ALIAS + LUA records require the PowerDNS
 # driver — the preview rejects when ``dnssec_enabled=true`` lands in a
 # group whose servers don't include any PowerDNS member, since signing
@@ -3358,16 +3358,23 @@ class AssignApplianceRoleArgs(BaseModel):
     appliance_id: str = Field(description="UUID of the approved appliance row.")
     roles: list[str] = Field(
         description=(
-            "Subset of dns-bind9 / dns-powerdns / dhcp / observer / "
-            "custom. dns-bind9 + dns-powerdns are mutually exclusive."
+            "Subset of dns-bind9 / dns-powerdns / dns-technitium / dhcp / "
+            "observer / custom. The three dns-* roles are mutually exclusive."
         )
     )
     dns_group_id: str | None = None
     dhcp_group_id: str | None = None
 
 
-_APPL_VALID_ROLES = {"dns-bind9", "dns-powerdns", "dhcp", "observer", "custom"}
-_APPL_DNS_ROLES = {"dns-bind9", "dns-powerdns"}
+_APPL_VALID_ROLES = {
+    "dns-bind9",
+    "dns-powerdns",
+    "dns-technitium",
+    "dhcp",
+    "observer",
+    "custom",
+}
+_APPL_DNS_ROLES = {"dns-bind9", "dns-powerdns", "dns-technitium"}
 
 
 async def _preview_assign_appliance_role(
@@ -3397,10 +3404,11 @@ async def _preview_assign_appliance_role(
             return PreviewResult(
                 ok=False, detail=f"Unknown role {r!r}. Valid: {sorted(_APPL_VALID_ROLES)}."
             )
-    if len(_APPL_DNS_ROLES.intersection(args.roles)) > 1:
+    dns_engines = _APPL_DNS_ROLES.intersection(args.roles)
+    if len(dns_engines) > 1:
         return PreviewResult(
             ok=False,
-            detail="dns-bind9 + dns-powerdns are mutually exclusive — one engine per appliance.",
+            detail=f"{sorted(dns_engines)} are mutually exclusive — one DNS engine per appliance.",
         )
     caps = row.capabilities or {}
     for r in args.roles:

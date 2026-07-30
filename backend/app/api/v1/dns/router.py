@@ -147,11 +147,11 @@ _DRIVER_GATED_RECORD_TYPES: dict[str, frozenset[str]] = {
     # SVCB / HTTPS (RFC 9460) + DNAME (RFC 6672) are served natively only by
     # our self-hosted authoritative backends. The hosted-DNS providers vary
     # (and would fail at apply rather than create), so gate to bind9 + pdns
-    # and let a follow-up widen the set once a provider's apply path is
-    # verified. issue #338.
-    "SVCB": frozenset({"bind9", "powerdns"}),
-    "HTTPS": frozenset({"bind9", "powerdns"}),
-    "DNAME": frozenset({"bind9", "powerdns"}),
+    # + technitium and let a follow-up widen the set once a provider's apply
+    # path is verified. issue #338.
+    "SVCB": frozenset({"bind9", "powerdns", "technitium"}),
+    "HTTPS": frozenset({"bind9", "powerdns", "technitium"}),
+    "DNAME": frozenset({"bind9", "powerdns", "technitium"}),
 }
 
 # Zone-level operations only some drivers support. Same shape as

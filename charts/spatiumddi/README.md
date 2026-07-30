@@ -142,6 +142,13 @@ dnsAgents:
       role: primary
       group: powerdns-edge
       service: { type: LoadBalancer }
+    # Technitium (third DNS driver — primary zones + standard records in
+    # v1; DNSSEC and native DoT/DoH/DoQ listeners are fast-follow).
+    - name: tdx1
+      flavor: technitium
+      role: primary
+      group: technitium-edge
+      service: { type: LoadBalancer }
 ```
 
 Each server picks its image from `dnsAgents.image` (default,
@@ -226,8 +233,9 @@ subcharts verbatim — any option those charts accept works here. See:
 | `dnsAgents.enabled` | `false` |  |
 | `dnsAgents.image.repository` | `ghcr.io/spatiumddi/dns-bind9` | Default image (BIND9 flavor) |
 | `dnsAgents.flavors.powerdns.repository` | `ghcr.io/spatiumddi/dns-powerdns` | Per-flavor image override (issue #127) |
+| `dnsAgents.flavors.technitium.repository` | `ghcr.io/spatiumddi/dns-technitium` | Per-flavor image override |
 | `dnsAgents.agentKey.existingSecret` | `""` | Carries `DNS_AGENT_KEY` (shared between flavors) |
-| `dnsAgents.servers` | `[]` | One entry → one StatefulSet + Services. `flavor: bind9` (default) or `powerdns` |
+| `dnsAgents.servers` | `[]` | One entry → one StatefulSet + Services. `flavor: bind9` (default), `powerdns`, or `technitium` |
 | `dhcpAgents.enabled` | `false` |  |
 | `dhcpAgents.image.repository` | `ghcr.io/spatiumddi/dhcp-kea` |  |
 | `dhcpAgents.agentKey.existingSecret` | `""` | Carries `SPATIUM_AGENT_KEY` |

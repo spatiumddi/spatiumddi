@@ -59,6 +59,7 @@ jobs:
             "kea|agent/dhcp/images/kea/Dockerfile|.|"
             "bind9|agent/dns/images/bind9/Dockerfile|.|"
             "powerdns|agent/dns/images/powerdns/Dockerfile|.|"
+            "technitium|agent/dns/images/technitium/Dockerfile|.|"
             "dnsdist|agent/dns/images/dnsdist/Dockerfile|.|"
             "supervisor|agent/supervisor/images/supervisor/Dockerfile|.|"
             "looking-glass|agent/looking-glass/images/gobgp/Dockerfile|.|"

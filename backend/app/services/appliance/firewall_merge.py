@@ -163,6 +163,21 @@ _BUILTIN_SEED: list[tuple[str, str | None, bool, list[tuple]]] = [
     ),
     ("role", "observer", False, []),
     ("role", "custom", True, []),
+    # dns-technitium ships in its own seed migration (6a668dd451d5) —
+    # f5b8d2c91a06 already shipped before Technitium existed (append-only
+    # migration rule) — so this entry is appended at the END to match the
+    # chronological order the two migrations actually apply in against a
+    # fresh DB. test_builtin_seed_matches_migration compares this list
+    # against the concatenation of every seed migration's ``_POLICIES``.
+    (
+        "role",
+        "dns-technitium",
+        True,
+        [
+            (10, "accept", "udp", (53,), "any", "both", None, None),
+            (20, "accept", "tcp", (53,), "any", "both", None, None),
+        ],
+    ),
 ]
 
 

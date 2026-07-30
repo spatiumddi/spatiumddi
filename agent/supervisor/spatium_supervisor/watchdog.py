@@ -65,6 +65,7 @@ log = structlog.get_logger(__name__)
 _PROFILE_TO_SERVICE: dict[str, str] = {
     "dns-bind9": "dns-bind9",
     "dns-powerdns": "dns-powerdns",
+    "dns-technitium": "dns-technitium",
     "dhcp": "dhcp-kea",
     "looking-glass": "looking-glass",
 }

@@ -30,11 +30,16 @@ stringData:
 {{- $imgTag := $flavorImg.tag | default $tag -}}
 {{- /* Volume mount path for the driver's zone-state volume. BIND9 caches
        zone files under /var/cache/bind; PowerDNS LMDB lives at
-       /var/lib/powerdns. The volume claim itself ("dns-state") is the
-       same; only the mount path changes. */ -}}
+       /var/lib/powerdns; Technitium's own config + zone store lives at
+       /etc/dns (its query/error log dir, /var/log/technitium, is NOT
+       persisted here — it's daemon-internal logging, not zone state, and
+       lives fine on the pod's ephemeral writable layer). The volume claim
+       itself ("dns-state") is the same; only the mount path changes. */ -}}
 {{- $dnsStatePath := "/var/cache/bind" -}}
 {{- if eq $flavor "powerdns" -}}
   {{- $dnsStatePath = "/var/lib/powerdns" -}}
+{{- else if eq $flavor "technitium" -}}
+  {{- $dnsStatePath = "/etc/dns" -}}
 {{- end }}
 apiVersion: apps/v1
 kind: StatefulSet

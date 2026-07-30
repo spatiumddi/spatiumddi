@@ -225,13 +225,13 @@ helm install ddi oci://ghcr.io/spatiumddi/charts/spatiumddi \
 
 Declare each DNS server under `.dnsAgents.servers[]` in `values.yaml`.
 The chart renders a StatefulSet + LoadBalancer Service per entry.
-Set `flavor: powerdns` on a server to pull the
-`ghcr.io/spatiumddi/dns-powerdns` image instead of BIND9 — same
-`DNS_AGENT_KEY` bootstrap, image-baked driver, mount path
-auto-switches to `/var/lib/powerdns` for the LMDB store.
-Mixed-driver groups are rejected by the control plane for the
-PowerDNS-only features (DNSSEC sign/unsign, ALIAS, LUA, catalog
-zones); spin up a separate group per driver.
+Set `flavor: powerdns` or `flavor: technitium` on a server to pull the
+`ghcr.io/spatiumddi/dns-powerdns` / `ghcr.io/spatiumddi/dns-technitium`
+image instead of BIND9 — same `DNS_AGENT_KEY` bootstrap, image-baked
+driver, mount path auto-switches to `/var/lib/powerdns` or `/etc/dns`
+respectively. Mixed-driver groups are rejected by the control plane for
+driver-specific features (PowerDNS: DNSSEC sign/unsign, ALIAS, LUA,
+catalog zones); spin up a separate group per driver.
 
 ### Encrypted transports — DoT / DoH (issue #50)
 

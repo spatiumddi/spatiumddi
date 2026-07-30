@@ -73,6 +73,7 @@ class LifecycleResult:
 SUPERVISED_SERVICES: tuple[str, ...] = (
     "dns-bind9",
     "dns-powerdns",
+    "dns-technitium",
     "dhcp-kea",
     "looking-glass",
 )
@@ -98,6 +99,7 @@ _TARGET_NAMESPACE = "spatium"
 _PROFILE_TO_HELM_KEY = {
     "dns-bind9": "dnsBind9",
     "dns-powerdns": "dnsPowerdns",
+    "dns-technitium": "dnsTechnitium",
     "dhcp": "dhcpKea",
     "looking-glass": "lookingGlass",
 }
@@ -115,6 +117,7 @@ _PROFILE_TO_HELM_KEY = {
 _ROLE_LABEL_KEYS = {
     "dns-bind9": "spatium.io/role-dns-bind9",
     "dns-powerdns": "spatium.io/role-dns-powerdns",
+    "dns-technitium": "spatium.io/role-dns-technitium",
     "dhcp": "spatium.io/role-dhcp",
     # #566 — BGP Looking Glass collector (GoBGP). Same per-role
     # node-label gating shape as DNS/DHCP (non-negotiable #16).
@@ -238,6 +241,12 @@ def _build_values(profiles: list[str], env_vars: dict[str, str]) -> dict[str, ob
             "serverGroupName": env_vars.get("AGENT_GROUP", ""),
         },
         "dnsPowerdns": {
+            "enabled": True,
+            "controlPlaneUrl": control_plane_url,
+            "agentKey": env_vars.get("DNS_AGENT_KEY", ""),
+            "serverGroupName": env_vars.get("AGENT_GROUP", ""),
+        },
+        "dnsTechnitium": {
             "enabled": True,
             "controlPlaneUrl": control_plane_url,
             "agentKey": env_vars.get("DNS_AGENT_KEY", ""),

@@ -19,6 +19,7 @@ from .config import AgentConfig
 from .drivers.base import DriverBase
 from .drivers.bind9 import Bind9Driver
 from .drivers.powerdns import PowerDNSDriver
+from .drivers.technitium import TechnitiumDriver
 from .heartbeat import HeartbeatClient
 from .ingest import IngestWorker
 from .metrics import MetricsPoller
@@ -33,6 +34,8 @@ def _select_driver(cfg: AgentConfig) -> DriverBase:
         return Bind9Driver(state_dir=cfg.state_dir)
     if cfg.driver == "powerdns":
         return PowerDNSDriver(state_dir=cfg.state_dir)
+    if cfg.driver == "technitium":
+        return TechnitiumDriver(state_dir=cfg.state_dir)
     raise RuntimeError(f"Unknown driver: {cfg.driver}")
 
 
@@ -94,6 +97,11 @@ def run(cfg: AgentConfig) -> int:
         threads.append(
             threading.Thread(target=query_log.run, name="query-log", daemon=True),
         )
+    # technitium: no query-log thread in v1 — Technitium's query logging is
+    # API/DB-backed (``/api/logs/query*``), not a tailable text file like
+    # BIND9's query_log_file or PowerDNS's redirected stderr capture. Wiring
+    # it needs a poll-and-diff shipper, not the existing file-tailing
+    # QueryLogShipper — deferred to a fast-follow phase.
 
     for t in threads:
         t.start()
@@ -118,10 +126,10 @@ def run(cfg: AgentConfig) -> int:
     signal.signal(signal.SIGINT, _sig)
 
     # Every supported driver in this image manages its own daemon
-    # process (BIND9, PowerDNS). If the daemon dies, we exit non-zero
-    # so the orchestrator restarts the container — agent + daemon are
-    # bound lifecycle-wise.
-    daemon_managed_drivers = {"bind9", "powerdns"}
+    # process (BIND9, PowerDNS, Technitium). If the daemon dies, we exit
+    # non-zero so the orchestrator restarts the container — agent + daemon
+    # are bound lifecycle-wise.
+    daemon_managed_drivers = {"bind9", "powerdns", "technitium"}
     while not stopping.is_set():
         time.sleep(1.0)
         if cfg.driver in daemon_managed_drivers and not driver.daemon_running():

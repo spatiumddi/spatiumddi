@@ -618,11 +618,11 @@ class Appliance(Base):
     desired_default_slot: Mapped[str | None] = mapped_column(String(16), nullable=True)
 
     # Role assignment — #170 Wave C2. Operator picks a subset of
-    # ``dns-bind9`` / ``dns-powerdns`` / ``dhcp`` / ``observer`` /
-    # ``custom``. Mutually-exclusive pairs (one DNS engine per box)
-    # enforced at the role-assignment endpoint, not via a CHECK
-    # constraint (operator intent should be a one-line API error,
-    # not a Postgres exception).
+    # ``dns-bind9`` / ``dns-powerdns`` / ``dns-technitium`` / ``dhcp`` /
+    # ``observer`` / ``custom``. The dns-* roles are mutually exclusive
+    # (one DNS engine per box), enforced at the role-assignment endpoint,
+    # not via a CHECK constraint (operator intent should be a one-line
+    # API error, not a Postgres exception).
     assigned_roles: Mapped[list[str]] = mapped_column(
         JSONB, nullable=False, default=list, server_default=sa.text("'[]'::jsonb")
     )

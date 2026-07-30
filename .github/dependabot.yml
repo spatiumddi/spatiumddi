@@ -59,6 +59,7 @@ updates:
       - "/agent/dhcp/images/kea"
       - "/agent/dns/images/bind9"
       - "/agent/dns/images/powerdns"
+      - "/agent/dns/images/technitium"
       - "/agent/dns/images/dnsdist"
       - "/agent/supervisor/images/supervisor"
       - "/agent/looking-glass/images/gobgp"

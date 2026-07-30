@@ -1,0 +1,152 @@
+{{- /* Third DNS agent option (alongside BIND9 + PowerDNS).
+       Phase 10 wave 2 — ``.enabled`` is release-ownership scope
+       (bootstrap=false, appliance=true), NOT role-scope. Scheduling
+       is gated by the ``spatium.io/role-dns-technitium=true`` node
+       label. Mutual exclusion across all three DNS engines is enforced
+       supervisor-side: it sets at most one of ``role-dns-bind9`` /
+       ``role-dns-powerdns`` / ``role-dns-technitium`` labels on any
+       heartbeat. */}}
+{{- if .Values.dnsTechnitium.enabled }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: dns-technitium
+  labels:
+    {{- include "spatiumddi-appliance.labels" . | nindent 4 }}
+    app.kubernetes.io/component: dns-technitium
+spec:
+  # DaemonSet for symmetry with dns-bind9 / dns-powerdns / dhcp-kea —
+  # DESIRED=0 when the node lacks ``spatium.io/role-dns-technitium=true``,
+  # so ``kubectl get pods`` stays silent on unscheduled roles.
+  # #292 — RollingUpdate (not OnDelete): OnDelete strands a pod on its
+  # creation-time spec when CONTROL_PLANE_URL is populated after first
+  # render. See dns-bind9.yaml for the full rationale.
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: dns-technitium
+  template:
+    metadata:
+      labels:
+        {{- include "spatiumddi-appliance.labels" . | nindent 8 }}
+        app.kubernetes.io/name: dns-technitium
+        app.kubernetes.io/component: dns-technitium
+    spec:
+      {{- if not .Values.dns.useMetalLBVIP }}
+      # #272 Phase 5 — default path: bind :53 on the node IP. A DNS VIP
+      # drops hostNetwork in favour of the LoadBalancer Service below.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      {{- end }}
+      # #296 Phase A2 — see dns-bind9.yaml for the rationale. The
+      # Technitium daemon flushes in-flight queries on SIGTERM; 30 s
+      # matches BIND9 / PowerDNS.
+      terminationGracePeriodSeconds: 30
+      nodeSelector:
+        {{- toYaml .Values.global.nodeSelector | nindent 8 }}
+        # Phase 10 (#183) — per-role scheduling label.
+        spatium.io/role-dns-technitium: "true"
+      containers:
+        - name: dns-technitium
+          image: {{ include "spatiumddi-appliance.imageRef" (dict "global" .Values.global "repository" .Values.dnsTechnitium.image.repository) }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          env:
+            # #292 / #409 — in-cluster API Service over HTTP by default;
+            # prefer the supervisor-supplied external controlPlaneUrl when
+            # set (Application appliance with its own k3s — no in-cluster
+            # control Service), skipping TLS verify on that self-signed
+            # path. See dns-bind9.yaml for the full rationale.
+            - name: CONTROL_PLANE_URL
+              value: {{ .Values.dnsTechnitium.controlPlaneUrl | default .Values.dnsTechnitium.inClusterApiUrl | default (printf "http://spatium-control-spatiumddi-api.%s.svc:8000" .Release.Namespace) | quote }}
+            {{- if .Values.dnsTechnitium.controlPlaneUrl }}
+            - name: SPATIUM_INSECURE_SKIP_TLS_VERIFY
+              value: "1"
+            {{- end }}
+            - name: DNS_AGENT_KEY
+              value: {{ .Values.dnsTechnitium.agentKey | quote }}
+            - name: AGENT_GROUP
+              value: {{ .Values.dnsTechnitium.serverGroupName | quote }}
+            {{- with .Values.global.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: dns-udp
+              containerPort: 53
+              protocol: UDP
+            - name: dns-tcp
+              containerPort: 53
+              protocol: TCP
+          # #296 Phase A2 — marker + a live query, same shape as bind9/
+          # powerdns's readiness probe. Technitium REFUSES CHAOS-class
+          # queries entirely (confirmed empirically — id.server/
+          # version.bind both come back REFUSED, not answered), so this
+          # queries the RFC 6761 reserved "invalid." TLD instead —
+          # answered locally and instantly (NXDOMAIN, no recursion)
+          # regardless of zone state. See dns-bind9.yaml for the full
+          # rationale on why the marker gate matters for rolling upgrade.
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - "test -f /var/lib/spatium-dns-agent/.ready && dig @127.0.0.1 -p 53 healthcheck.invalid A +timeout=2 +tries=1 >/dev/null"
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+            timeoutSeconds: 3
+          livenessProbe:
+            tcpSocket:
+              port: 53
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          volumeMounts:
+            # #292 — persistent agent config-bundle cache (#5); see
+            # dns-bind9.yaml.
+            - name: agent-state
+              mountPath: /var/lib/spatium-dns-agent
+            - name: data
+              mountPath: /etc/dns
+      # #292 — per-node hostPath (not shared PVC, not emptyDir); see
+      # dns-bind9.yaml for the rationale.
+      volumes:
+        - name: agent-state
+          hostPath:
+            path: /var/lib/spatiumddi/agents/dns-technitium/state
+            type: DirectoryOrCreate
+        - name: data
+          hostPath:
+            path: /var/lib/spatiumddi/agents/dns-technitium/data
+            type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dns-technitium
+  labels:
+    {{- include "spatiumddi-appliance.labels" . | nindent 4 }}
+    app.kubernetes.io/component: dns-technitium
+  {{- if .Values.dns.useMetalLBVIP }}
+  annotations:
+    # #272 Phase 5 — pin the DNS resolver VIP from the MetalLB pool.
+    metallb.universe.tf/address-pool: {{ .Values.dns.vipPool | quote }}
+    metallb.universe.tf/loadBalancerIPs: {{ .Values.dns.vip | quote }}
+  {{- end }}
+spec:
+  {{- if .Values.dns.useMetalLBVIP }}
+  type: LoadBalancer
+  {{- else }}
+  type: ClusterIP
+  {{- end }}
+  selector:
+    app.kubernetes.io/name: dns-technitium
+  ports:
+    - name: dns-udp
+      port: 53
+      protocol: UDP
+    - name: dns-tcp
+      port: 53
+      protocol: TCP
+{{- end }}

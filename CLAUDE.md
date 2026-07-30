@@ -87,7 +87,7 @@ backend/app/            FastAPI app
   api/v1/               HTTP route handlers (ipam/, dns/, dhcp/, auth/, ...)
   models/               SQLAlchemy 2.x async models
   services/             Business logic (dns/, dhcp/, dns_io/, ipam_io/)
-  drivers/dns/          DNS backend abstraction + BIND9 / PowerDNS / Windows DNS impls
+  drivers/dns/          DNS backend abstraction + BIND9 / PowerDNS / Technitium / Windows DNS impls
   drivers/dhcp/         DHCP backend abstraction + Kea impl
   tasks/                Celery tasks (dns_health, dhcp_health, sweep_expired_leases, …)
   core/, db.py, config.py, celery_app.py

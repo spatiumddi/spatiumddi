@@ -153,6 +153,7 @@ class FirewallProfile:
 _ROLE_PORTS_TCP: dict[str, list[int]] = {
     "dns-bind9": [53],
     "dns-powerdns": [53],
+    "dns-technitium": [53],
     # BGP (#566). The collector normally DIALS the router (outbound, allowed
     # by default egress), but opening inbound tcp/179 lets the router initiate
     # the session (passive collector) and keeps firewall drift-detection aware
@@ -162,6 +163,7 @@ _ROLE_PORTS_TCP: dict[str, list[int]] = {
 _ROLE_PORTS_UDP: dict[str, list[int]] = {
     "dns-bind9": [53],
     "dns-powerdns": [53],
+    "dns-technitium": [53],
     "dhcp": [67, 68],
 }
 
@@ -180,7 +182,7 @@ _METALLB_MEMBERLIST = 7946
 
 
 def _profile_name(roles: list[str]) -> str:
-    has_dns = any(r in roles for r in ("dns-bind9", "dns-powerdns"))
+    has_dns = any(r in roles for r in ("dns-bind9", "dns-powerdns", "dns-technitium"))
     has_dhcp = "dhcp" in roles
     if has_dns and has_dhcp:
         return "dns-and-dhcp"

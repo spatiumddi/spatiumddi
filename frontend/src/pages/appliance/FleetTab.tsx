@@ -138,6 +138,8 @@ function capabilityChips(caps: SupervisorCapabilities): {
   if (caps.can_run_dns_bind9) out.push({ key: "bind9", label: "BIND9" });
   if (caps.can_run_dns_powerdns)
     out.push({ key: "powerdns", label: "PowerDNS" });
+  if (caps.can_run_dns_technitium)
+    out.push({ key: "technitium", label: "Technitium" });
   if (caps.can_run_dhcp) out.push({ key: "dhcp", label: "DHCP" });
   if (caps.can_run_looking_glass)
     out.push({ key: "looking-glass", label: "Looking Glass" });
@@ -178,6 +180,12 @@ function serviceChips(row: ApplianceRow): {
     out.push({
       key: "dns-powerdns",
       label: "DNS · PowerDNS",
+      status: serviceStatus,
+    });
+  if (roles.includes("dns-technitium"))
+    out.push({
+      key: "dns-technitium",
+      label: "DNS · Technitium",
       status: serviceStatus,
     });
   if (roles.includes("dhcp"))
@@ -2496,6 +2504,10 @@ function ApplianceDrilldownModal({
           <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-2">
             <CapRow label="DNS — BIND9" on={!!caps.can_run_dns_bind9} />
             <CapRow label="DNS — PowerDNS" on={!!caps.can_run_dns_powerdns} />
+            <CapRow
+              label="DNS — Technitium"
+              on={!!caps.can_run_dns_technitium}
+            />
             <CapRow label="DHCP" on={!!caps.can_run_dhcp} />
             <CapRow label="Looking Glass" on={!!caps.can_run_looking_glass} />
             <CapRow label="Observer" on={!!caps.can_run_observer} />
@@ -2713,6 +2725,11 @@ const ROLE_OPTIONS: { value: string; label: string; capKey?: string }[] = [
     label: "DNS · PowerDNS",
     capKey: "can_run_dns_powerdns",
   },
+  {
+    value: "dns-technitium",
+    label: "DNS · Technitium",
+    capKey: "can_run_dns_technitium",
+  },
   { value: "dhcp", label: "DHCP", capKey: "can_run_dhcp" },
   {
     value: "looking-glass",
@@ -2721,6 +2738,12 @@ const ROLE_OPTIONS: { value: string; label: string; capKey?: string }[] = [
   },
   { value: "observer", label: "Observer", capKey: "can_run_observer" },
 ];
+
+// Mutually-exclusive DNS engine roles — at most one may be active at a
+// time (one DNS daemon per appliance). Used by the role toggle handler
+// and every "is a DNS role assigned" check below instead of an
+// enumerated pairwise comparison, so a fourth driver is a one-line add.
+const DNS_ROLES = new Set(["dns-bind9", "dns-powerdns", "dns-technitium"]);
 
 // ── Service-container watchdog section (#170 Wave E) ───────────
 //
@@ -3699,17 +3722,18 @@ function ApplianceRoleAssignmentSection({
       if (next.has(role)) {
         next.delete(role);
       } else {
-        // Mutually-exclusive DNS engines — selecting one clears the
-        // other so the operator can't submit an invalid combo.
-        if (role === "dns-bind9") next.delete("dns-powerdns");
-        if (role === "dns-powerdns") next.delete("dns-bind9");
+        // Mutually-exclusive DNS engines — selecting one clears every
+        // other dns-* role so the operator can't submit an invalid combo.
+        if (DNS_ROLES.has(role)) {
+          for (const r of DNS_ROLES) next.delete(r);
+        }
         next.add(role);
       }
       return next;
     });
   }
 
-  const dnsRoleActive = roles.has("dns-bind9") || roles.has("dns-powerdns");
+  const dnsRoleActive = Array.from(roles).some((r) => DNS_ROLES.has(r));
   const dhcpRoleActive = roles.has("dhcp");
   // ``dirty`` compares the live form state against the latest
   // server-side row (the row prop refreshes after save), not the
@@ -3727,7 +3751,7 @@ function ApplianceRoleAssignmentSection({
   // service ports. Mirrors the supervisor's firewall_renderer.py
   // logic so operators see what will actually land on the host.
   const firewallProfile = (() => {
-    const hasDns = roles.has("dns-bind9") || roles.has("dns-powerdns");
+    const hasDns = Array.from(roles).some((r) => DNS_ROLES.has(r));
     const hasDhcp = roles.has("dhcp");
     if (hasDns && hasDhcp) return "dns-and-dhcp";
     if (hasDns) return "dns-only";
@@ -3735,7 +3759,7 @@ function ApplianceRoleAssignmentSection({
     return "idle";
   })();
   const firewallOpenPorts: string[] = [];
-  if (roles.has("dns-bind9") || roles.has("dns-powerdns")) {
+  if (Array.from(roles).some((r) => DNS_ROLES.has(r))) {
     firewallOpenPorts.push("UDP/53", "TCP/53");
   }
   if (roles.has("dhcp")) {
@@ -5131,6 +5155,7 @@ function UpgradeImageManager() {
 const _ROLE_PORT_KEYS: Record<string, string[]> = {
   "dns-bind9": ["udp_53", "tcp_53"],
   "dns-powerdns": ["udp_53", "tcp_53"],
+  "dns-technitium": ["udp_53", "tcp_53"],
   dhcp: ["udp_67"],
   "looking-glass": ["tcp_179"],
 };

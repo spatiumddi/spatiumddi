@@ -94,6 +94,7 @@ build: build-supervisor
 	docker build -t spatiumddi-api:dev --target runtime $(BACKEND_DIR)
 	docker build -t spatiumddi-dns-bind9:dev -f agent/dns/images/bind9/Dockerfile .
 	docker build -t spatiumddi-dns-powerdns:dev -f agent/dns/images/powerdns/Dockerfile .
+	docker build -t spatiumddi-dns-technitium:dev -f agent/dns/images/technitium/Dockerfile .
 	docker build -t spatiumddi-dhcp-kea:dev -f agent/dhcp/images/kea/Dockerfile .
 	# #573 — the BGP Looking Glass collector (#566) is in bake-images.sh's
 	# IMAGES set but the PROD compose pins its ``image:`` with no ``build:``,
@@ -126,6 +127,7 @@ build: build-supervisor
 	    "frontend:spatiumddi-frontend" \
 	    "dns-bind9:dns-bind9" \
 	    "dns-powerdns:dns-powerdns" \
+	    "dns-technitium:dns-technitium" \
 	    "dhcp-kea:dhcp-kea" \
 	    "looking-glass:looking-glass"; do \
 	  compose="$${pair%%:*}"; target="$${pair##*:}"; \
@@ -216,12 +218,13 @@ test-one:
 # gobgpd itself and Trivy flags it against the `gobinary` target. No package
 # patch or `apk upgrade` can fix it — only rebuilding on a newer golang base.
 #
-# IMAGE=<name> scans one image; omit to scan all six.
+# IMAGE=<name> scans one image; omit to scan all seven.
 TRIVY_CACHE ?= $(CURDIR)/.trivy-cache
 TRIVY_IMAGES ?= \
 	agent/dhcp/images/kea/Dockerfile:kea \
 	agent/dns/images/bind9/Dockerfile:bind9 \
 	agent/dns/images/powerdns/Dockerfile:powerdns \
+	agent/dns/images/technitium/Dockerfile:technitium \
 	agent/dns/images/dnsdist/Dockerfile:dnsdist \
 	agent/supervisor/images/supervisor/Dockerfile:supervisor \
 	agent/looking-glass/images/gobgp/Dockerfile:looking-glass

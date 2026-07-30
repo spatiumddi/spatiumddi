@@ -151,6 +151,7 @@ def _effective_control_plane_url(cfg: SupervisorConfig) -> str:
 _CAPABILITY_FLAGS = (
     "can_run_dns_bind9",
     "can_run_dns_powerdns",
+    "can_run_dns_technitium",
     "can_run_dhcp",
     "can_run_looking_glass",
 )
@@ -234,7 +235,8 @@ def _capabilities_payload() -> dict[str, Any]:
     capability reporting"):
 
     * ``can_run_dns_bind9`` / ``can_run_dns_powerdns`` /
-      ``can_run_dhcp`` / ``can_run_looking_glass`` — hardcoded
+      ``can_run_dns_technitium`` / ``can_run_dhcp`` /
+      ``can_run_looking_glass`` — hardcoded
       ``True`` post-Phase-7 (looking-glass joins under #566). The
       slot's containerd content store is preloaded with every
       service image; if we're heartbeating, the images are there.

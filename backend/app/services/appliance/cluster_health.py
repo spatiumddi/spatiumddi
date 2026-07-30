@@ -39,6 +39,7 @@ _COMPONENT_ORDER = [
     "supervisor",
     "dns-bind9",
     "dns-powerdns",
+    "dns-technitium",
     "dhcp-kea",
 ]
 

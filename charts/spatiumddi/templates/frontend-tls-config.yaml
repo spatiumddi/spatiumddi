@@ -106,6 +106,26 @@ data:
             proxy_send_timeout       1800s;
         }
 
+        # Appliance upgrade-image upload — sized to the backend's own
+        # MAX_UPLOAD_BYTES cap (4 GiB); the 2g backup limit above isn't
+        # enough for a ~1.8-2 GB appliance slot image. Without this,
+        # nginx's default body-size limit 413s the upload before
+        # FastAPI's own size-check ever runs.
+        location /api/v1/appliance/upgrade-images {
+            set $api_upstream http://${API_UPSTREAM_HOST}:${API_UPSTREAM_PORT};
+            proxy_pass               $api_upstream;
+            proxy_set_header         Host $http_host;
+            proxy_set_header         X-Real-IP $remote_addr;
+            proxy_set_header         X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header         X-Forwarded-Proto $scheme;
+            proxy_http_version       1.1;
+            proxy_set_header         Connection "";
+            client_max_body_size     4g;
+            proxy_request_buffering  off;
+            proxy_read_timeout       1800s;
+            proxy_send_timeout       1800s;
+        }
+
         location /api/ {
             set $api_upstream http://${API_UPSTREAM_HOST}:${API_UPSTREAM_PORT};
             proxy_pass         $api_upstream;

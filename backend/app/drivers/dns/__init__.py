@@ -3,10 +3,10 @@
 Per CLAUDE.md non-negotiable #10, the service layer obtains a driver via
 ``get_driver(server_type)`` and speaks only to the abstract interface.
 
-SpatiumDDI ships three authoritative DNS drivers: BIND9 (default), PowerDNS
-(issue #127, Phase 1 — agent-managed alongside BIND9), and Windows DNS
-(WinRM-driven, agentless). New drivers register here without touching the
-service layer.
+SpatiumDDI ships four authoritative DNS drivers: BIND9 (default), PowerDNS
+(issue #127, Phase 1 — agent-managed alongside BIND9), Technitium
+(agent-managed, REST-API driven), and Windows DNS (WinRM-driven, agentless).
+New drivers register here without touching the service layer.
 """
 
 from __future__ import annotations
@@ -30,12 +30,14 @@ from app.drivers.dns.hetzner import HetznerDNSDriver
 from app.drivers.dns.linode import LinodeDNSDriver
 from app.drivers.dns.powerdns import PowerDNSDriver
 from app.drivers.dns.route53 import Route53DNSDriver
+from app.drivers.dns.technitium import TechnitiumDriver
 from app.drivers.dns.vultr import VultrDNSDriver
 from app.drivers.dns.windows import WindowsDNSDriver
 
 _DRIVERS: dict[str, type[DNSDriver]] = {
     "bind9": BIND9Driver,
     "powerdns": PowerDNSDriver,
+    "technitium": TechnitiumDriver,
     "windows_dns": WindowsDNSDriver,
     # Agentless cloud-hosted DNS providers (issue #37, Part B). The
     # control plane calls the provider REST/SDK API directly — same
