@@ -1,4 +1,4 @@
-"""Technitium DNS Server agent driver (v1 — primary zones + record CRUD).
+"""Technitium DNS Server agent driver.
 
 Runs alongside the Technitium ``DnsServerApp`` process inside the
 dns-technitium container. Unlike BIND9 (named.conf + RFC 1035 zone files +
@@ -26,17 +26,27 @@ own config under ``/etc/dns`` and is configured entirely over its HTTP API
   the bundle's NS/SOA as authoritative would just create duplicate/foreign
   NS records alongside Technitium's own.
 
-v1 scope: primary zones only. Record types: A, AAAA, CNAME, MX, TXT, NS
-(zone-referral records off-apex only — apex NS is daemon-managed), PTR, SRV,
-CAA, TLSA, SSHFP, NAPTR, URI, DNAME, SVCB, HTTPS (SVCB/HTTPS best-effort —
-see ``_svcb_params`` for the one documented limitation: multi-value params
-like ``alpn="h2,h3"`` only carry the first value through, logged as a
-warning).
+Zone types (issue #743): primary, secondary, stub and forward, plus
+catalog-zone membership for the primaries this server owns. Only a
+*primary*'''s records are reconciled — a secondary and a stub fill
+themselves from the zone transfer and a forwarder holds none, so diffing
+them would delete whatever the daemon just pulled down.
 
-Deferred to fast-follow phases: DNSSEC (``/api/zones/dnssec/*`` — same
-shape as PowerDNS's, should port quickly), native DoT/DoH/DoQ listener
-wiring (Technitium's real differentiator — no dnsdist-style sidecar needed,
-unlike PowerDNS), catalog zones, secondary/stub zones.
+Record types: A, AAAA, CNAME, MX, TXT, NS (zone-referral records off-apex
+only — apex NS is daemon-managed), PTR, SRV, CAA, TLSA, SSHFP, NAPTR, URI,
+DNAME, SVCB, HTTPS.
+
+Two Technitium behaviours this driver exists to paper over, both verified
+against a live daemon and both silent if you get them wrong:
+
+* Record GET does not echo the params record ADD takes — see
+  ``_normalize_rdata``.
+* ``zones/options/set`` answers ``ok`` for a value it does not recognise
+  and keeps the old one — see ``_ZONE_TRANSFER_VALUES``.
+
+Deferred to fast-follow phases: DNSSEC (#740), native DoT/DoH/DoQ
+listeners + encrypted upstream forwarding (#741), query-log shipping
+(#742), ``dns_import`` live-pull + blocklist wiring (#744).
 """
 
 from __future__ import annotations
@@ -70,6 +80,52 @@ _TOKEN_NAME = "spatiumddi-agent"
 # at the apex — an off-apex NS is a legitimate delegation record and IS
 # reconciled normally).
 _DAEMON_MANAGED_APEX_TYPES = frozenset({"SOA"})
+
+# ── Zone types (issue #743) ─────────────────────────────────────────────
+#
+# SpatiumDDI's neutral ``zone_type`` → Technitium's ``/api/zones/create``
+# ``type`` param. Verified against a live technitium/dns-server:15.4.0.
+_ZONE_TYPE_MAP = {
+    "primary": "Primary",
+    "master": "Primary",  # legacy alias used in a few older bundles
+    "secondary": "Secondary",
+    "slave": "Secondary",
+    "stub": "Stub",
+    "forward": "Forwarder",
+}
+
+# Only a primary's records are ours to manage. A secondary's and a stub's
+# come from the transfer, and a forwarder has none — reconciling any of
+# them would fight the daemon and delete records it just pulled.
+_RECORD_MANAGED_ZONE_TYPES = frozenset({"Primary"})
+
+# ``zones/options/set`` SILENTLY IGNORES a value it does not recognise —
+# verified live: setting zoneTransfer="Bogus" returns {"status":"ok"} and
+# leaves the previous value in place. So an unvalidated typo here would
+# not fail loudly, it would leave zone transfer at whatever it was before
+# (quite possibly wide open). Validate driver-side against these sets and
+# refuse to send anything else.
+_ZONE_TRANSFER_VALUES = frozenset(
+    {
+        "Deny",
+        "Allow",
+        "AllowOnlyZoneNameServers",
+        "UseSpecifiedNetworkACL",
+        "AllowOnlyZoneNameServersAndUseSpecifiedNetworkACL",
+    }
+)
+
+# Technitium's supported TSIG algorithms, as its settings API spells them.
+_TSIG_ALGORITHMS = frozenset(
+    {
+        "hmac-md5",
+        "hmac-sha1",
+        "hmac-sha256",
+        "hmac-sha256-128",
+        "hmac-sha384",
+        "hmac-sha512",
+    }
+)
 
 
 def _qualified_name(zone_name: str, name: str) -> str:
@@ -207,6 +263,60 @@ def _normalize_rdata(rtype: str, flat: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _tsig_key_names(bundle: dict[str, Any]) -> list[str]:
+    """Bundle TSIG key names, root dot stripped.
+
+    Technitium stores names un-dotted (verified: sending ``spatium-xfer.``
+    reads back as ``spatium-xfer``), so normalise here or every options
+    comparison sees a difference that isn't one.
+    """
+    out = []
+    for k in bundle.get("tsig_keys") or []:
+        name = (k.get("name") or "").rstrip(".")
+        if name:
+            out.append(name)
+    return sorted(set(out))
+
+
+def _zone_options_payload(ztype: str, bundle: dict[str, Any]) -> dict[str, Any]:
+    """Map the bundle's server-level transfer policy onto Technitium's
+    per-zone transfer options.
+
+    BIND expresses ``allow-transfer`` once for the whole server; Technitium
+    has no global equivalent, so the same policy is stamped onto each zone
+    we own. Only meaningful for zones this server is authoritative for —
+    a Secondary/Stub transfers *in*, and re-serving it is a separate
+    decision we do not make on the operator's behalf.
+
+    The list follows BIND's vocabulary: ``["none"]`` (or empty) denies,
+    ``any`` allows, anything else is treated as a network ACL.
+    """
+    if ztype != "Primary":
+        return {}
+    opts = bundle.get("options") or {}
+    acl = [str(a) for a in (opts.get("allow_transfer") or []) if a]
+    lowered = {a.lower() for a in acl}
+
+    payload: dict[str, Any] = {}
+    if not acl or lowered == {"none"}:
+        payload["zoneTransfer"] = "Deny"
+    elif "any" in lowered:
+        payload["zoneTransfer"] = "Allow"
+    else:
+        payload["zoneTransfer"] = "UseSpecifiedNetworkACL"
+        payload["zoneTransferNetworkACL"] = [a for a in acl if a.lower() != "none"]
+
+    # Naming keys here is what makes a transfer TSIG-*authenticated* rather
+    # than merely address-filtered. Only attach them where transfer is
+    # actually permitted — pinning key names onto a Deny zone reads as if
+    # signed transfer were enabled when nothing can transfer at all.
+    if payload["zoneTransfer"] != "Deny":
+        names = _tsig_key_names(bundle)
+        if names:
+            payload["zoneTransferTsigKeyNames"] = names
+    return payload
+
+
 def _record_params(rtype: str, value: str, rec: dict[str, Any]) -> dict[str, Any]:
     """Build the type-specific param dict for
     ``/api/zones/records/{add,delete}`` — shared by both endpoints since
@@ -317,34 +427,69 @@ class TechnitiumDriver(DriverBase):
             zname = (zone.get("name") or "").rstrip(".")
             if not zname:
                 continue
-            ztype = zone.get("type", "primary")
-            if ztype != "primary":
+            raw_type = (zone.get("type") or "primary").lower()
+            ztype = _ZONE_TYPE_MAP.get(raw_type)
+            if ztype is None:
                 log.warning(
-                    "technitium_zone_type_unsupported_v1",
+                    "technitium_zone_type_unsupported",
                     zone=zname,
-                    zone_type=ztype,
+                    zone_type=raw_type,
+                    supported=sorted(_ZONE_TYPE_MAP),
                 )
                 continue
-            records = []
-            for rec in zone.get("records") or []:
-                rtype = (rec.get("type") or "").upper()
-                if rtype in _DAEMON_MANAGED_APEX_TYPES:
-                    continue
-                name = _qualified_name(zname, rec.get("name") or "@")
-                if rtype == "NS" and name == zname:
-                    # Apex NS is daemon-managed (created at zone-create
-                    # time, pointed at the container's own hostname).
-                    # Off-apex NS (delegations) are handled normally.
-                    continue
-                records.append(
-                    {
-                        "domain": name,
-                        "type": rtype,
-                        "ttl": rec.get("ttl") or zone.get("ttl") or 3600,
-                        **_record_params(rtype, rec.get("value") or "", rec),
-                    }
+            masters = [str(m) for m in (zone.get("masters") or []) if m]
+            forwarders = [str(f) for f in (zone.get("forwarders") or []) if f]
+            # Secondary/stub transfer FROM a primary, so with no address to
+            # transfer from there is nothing to create — Technitium rejects
+            # the create outright. Skip rather than fail the whole render.
+            if ztype in ("Secondary", "Stub") and not masters:
+                log.warning(
+                    "technitium_zone_missing_masters", zone=zname, zone_type=raw_type
                 )
-            zones_payload.append({"zone": zname, "type": "Primary", "records": records})
+                continue
+            if ztype == "Forwarder" and not forwarders:
+                log.warning("technitium_zone_missing_forwarders", zone=zname)
+                continue
+
+            records = []
+            # Only a primary's records are ours. A secondary/stub fills
+            # itself from the transfer and a forwarder holds none, so
+            # rendering records for them would make the reconciler delete
+            # whatever the daemon just pulled down.
+            if ztype in _RECORD_MANAGED_ZONE_TYPES:
+                for rec in zone.get("records") or []:
+                    rtype = (rec.get("type") or "").upper()
+                    if rtype in _DAEMON_MANAGED_APEX_TYPES:
+                        continue
+                    name = _qualified_name(zname, rec.get("name") or "@")
+                    if rtype == "NS" and name == zname:
+                        # Apex NS is daemon-managed (created at zone-create
+                        # time, pointed at the container's own hostname).
+                        # Off-apex NS (delegations) are handled normally.
+                        continue
+                    records.append(
+                        {
+                            "domain": name,
+                            "type": rtype,
+                            "ttl": rec.get("ttl") or zone.get("ttl") or 3600,
+                            **_record_params(rtype, rec.get("value") or "", rec),
+                        }
+                    )
+
+            entry: dict[str, Any] = {
+                "zone": zname,
+                "type": ztype,
+                "records": records,
+                # Drives ``zones/options/set``. Absent/empty values are not
+                # sent at all, so the daemon default stands rather than us
+                # stamping an opinion onto every zone.
+                "options": _zone_options_payload(ztype, bundle),
+            }
+            if masters:
+                entry["masters"] = masters
+            if forwarders:
+                entry["forwarders"] = forwarders
+            zones_payload.append(entry)
 
         if bundle.get("blocklists"):
             log.warning(
@@ -357,6 +502,26 @@ class TechnitiumDriver(DriverBase):
             )
 
         (new_dir / "zones.json").write_text(json.dumps(zones_payload, indent=2))
+
+        # Server-scoped state the zone loop can't express (issue #743).
+        # Written to its own file, and 0600: unlike zones.json this one
+        # carries TSIG shared secrets.
+        catalog = bundle.get("catalog") or bundle.get("catalog_block") or None
+        server_payload = {
+            "tsig_keys": [
+                {
+                    "name": (k.get("name") or "").rstrip("."),
+                    "secret": k.get("secret") or "",
+                    "algorithm": (k.get("algorithm") or "hmac-sha256").lower(),
+                }
+                for k in (bundle.get("tsig_keys") or [])
+                if (k.get("name") or "").rstrip(".")
+            ],
+            "catalog": catalog,
+        }
+        self._write_secret(
+            new_dir / "server.json", json.dumps(server_payload, indent=2)
+        )
 
     def validate(self) -> None:
         new_dir = self.state_dir / "rendered.new"
@@ -404,7 +569,98 @@ class TechnitiumDriver(DriverBase):
         if token is None:
             log.error("technitium_reconcile_skipped_no_token")
             return
+
+        # TSIG keys first: a zone's ``zoneTransferTsigKeyNames`` is accepted
+        # even when it names a key the server does not have (verified — the
+        # API stores it happily), and the failure only shows up later as a
+        # refused transfer. Push the keys before anything references them.
+        server_path = current / "server.json"
+        server_state: dict[str, Any] = {}
+        if server_path.exists():
+            try:
+                server_state = json.loads(server_path.read_text())
+            except ValueError as exc:
+                log.error("technitium_server_payload_unreadable", error=str(exc))
+        if server_state.get("tsig_keys"):
+            self._sync_tsig_keys(token, server_state["tsig_keys"])
+
         self._reconcile_zones(token, payload)
+        self._apply_catalog(token, server_state.get("catalog"), payload)
+
+    def _sync_tsig_keys(self, token: str, keys: list[dict[str, Any]]) -> None:
+        """Publish the bundle's TSIG keys into Technitium's global settings.
+
+        Wire format is a FLAT pipe-delimited token list read in triples —
+        ``name|secret|algorithm|name2|secret2|algorithm2|…`` — not one
+        pipe-joined record per key and not JSON. Both of those were tried
+        against a live daemon: JSON and a 2-token record fail with "Offset
+        and length were out of bounds for the array", which is the arity
+        check complaining, and a ``name|algorithm|secret`` ordering fails
+        with "TSIG algorithm is not supported" because it reads the secret
+        as the algorithm.
+
+        ``settings/set`` REPLACES the whole key list, so anything an
+        operator added directly in the Technitium console is dropped on the
+        next sync. That is the same "control plane is the source of truth"
+        stance the rest of the driver takes, but it is worth knowing.
+        """
+        tokens: list[str] = []
+        for k in keys:
+            name = (k.get("name") or "").rstrip(".")
+            secret = k.get("secret") or ""
+            algorithm = (k.get("algorithm") or "hmac-sha256").lower()
+            if not name or not secret:
+                continue
+            if algorithm not in _TSIG_ALGORITHMS:
+                log.warning(
+                    "technitium_tsig_algorithm_unsupported",
+                    key=name,
+                    algorithm=algorithm,
+                    supported=sorted(_TSIG_ALGORITHMS),
+                )
+                continue
+            tokens.extend([name, secret, algorithm])
+        if not tokens:
+            return
+        resp = self._call(token, "POST", "settings/set", {"tsigKeys": "|".join(tokens)})
+        body = resp.json()
+        if body.get("status") != "ok":
+            log.error(
+                "technitium_tsig_keys_apply_failed", error=body.get("errorMessage")
+            )
+        else:
+            log.info("technitium_tsig_keys_applied", count=len(tokens) // 3)
+
+    def _apply_catalog(
+        self, token: str, catalog: dict[str, Any] | None, payload: list[dict[str, Any]]
+    ) -> None:
+        """Create the catalog zone and enrol this server's primaries in it.
+
+        Producer only. A consumer joins by creating a ``SecondaryCatalog``
+        zone pointed at the producer, which is a zone-create rather than a
+        per-member option, so it arrives through the normal zone list.
+        """
+        if not catalog or catalog.get("mode") != "producer":
+            return
+        cat_name = (catalog.get("zone_name") or "").rstrip(".")
+        if not cat_name:
+            return
+        self._ensure_zone_exists(token, {"zone": cat_name, "type": "Catalog"})
+        for entry in payload:
+            if entry.get("type") != "Primary":
+                continue
+            zone = entry["zone"]
+            resp = self._call(
+                token, "POST", "zones/options/set", {"zone": zone, "catalog": cat_name}
+            )
+            body = resp.json()
+            if body.get("status") != "ok":
+                log.warning(
+                    "technitium_catalog_membership_failed",
+                    zone=zone,
+                    catalog=cat_name,
+                    error=body.get("errorMessage"),
+                )
 
     def _wait_for_api_up(self, *, timeout_s: float = 15.0) -> None:
         deadline = time.monotonic() + timeout_s
@@ -523,7 +779,14 @@ class TechnitiumDriver(DriverBase):
         """
         for zone_payload in payload:
             zone = zone_payload["zone"]
-            self._ensure_zone_exists(token, zone)
+            self._ensure_zone_exists(token, zone_payload)
+            self._apply_zone_options(token, zone, zone_payload.get("options") or {})
+
+            # Records belong to us only on a Primary. A Secondary/Stub is
+            # filled by the transfer and a Forwarder holds none, so diffing
+            # them would delete whatever the daemon just pulled down.
+            if zone_payload.get("type", "Primary") not in _RECORD_MANAGED_ZONE_TYPES:
+                continue
 
             existing = self._get_zone_records(token, zone)
             desired = zone_payload.get("records") or []
@@ -559,11 +822,8 @@ class TechnitiumDriver(DriverBase):
             to_delete = [r for fp, r in existing_by_fp.items() if fp not in desired_by_fp]
             to_add = [r for fp, r in desired_by_fp.items() if fp not in existing_by_fp]
 
+            deleted = 0
             for rec in to_delete:
-                if rec.get("type") in _DAEMON_MANAGED_APEX_TYPES:
-                    continue
-                if rec.get("type") == "NS" and rec.get("domain") == zone:
-                    continue
                 resp = self._call(
                     token,
                     "POST",
@@ -589,7 +849,10 @@ class TechnitiumDriver(DriverBase):
                         record=rec,
                         error=body.get("errorMessage"),
                     )
+                else:
+                    deleted += 1
 
+            added = 0
             for rec in to_add:
                 resp = self._call(
                     token,
@@ -608,24 +871,95 @@ class TechnitiumDriver(DriverBase):
                         error=body.get("errorMessage"),
                     )
                     continue
-            if to_add or to_delete:
+                added += 1
+            if added or deleted:
                 log.info(
                     "technitium_zone_reconciled",
                     zone=zone,
-                    added=len(to_add),
-                    deleted=len(to_delete),
+                    added=added,
+                    deleted=deleted,
                 )
 
-    def _ensure_zone_exists(self, token: str, zone: str) -> None:
-        resp = self._call(
-            token, "POST", "zones/create", {"zone": zone, "type": "Primary"}
-        )
+    def _ensure_zone_exists(self, token: str, entry: dict[str, Any]) -> None:
+        """Create the zone if absent, with the params its type requires.
+
+        Unlike a Primary, a Secondary/Stub create is **not** guaranteed to
+        succeed and is **not** safely retryable-forever: Technitium resolves
+        SOA against the configured primaries at create time and errors if
+        none answer (verified live — "DNS Server did not receive SOA record
+        in response from any of the primary name servers"). So an
+        unreachable or misconfigured primary fails here on every reconcile
+        pass. Logged at error, deliberately loudly, because the zone simply
+        will not exist until the operator fixes the far end.
+        """
+        zone = entry["zone"]
+        ztype = entry.get("type", "Primary")
+        params: dict[str, Any] = {"zone": zone, "type": ztype}
+        if ztype in ("Secondary", "Stub", "SecondaryCatalog"):
+            params["primaryNameServerAddresses"] = ",".join(entry.get("masters") or [])
+        elif ztype == "Forwarder":
+            forwarders = entry.get("forwarders") or []
+            # Technitium's Forwarder zone takes a single upstream; BIND's
+            # takes a list. Use the first and say so, rather than silently
+            # dropping the rest.
+            params["forwarder"] = forwarders[0]
+            if len(forwarders) > 1:
+                log.warning(
+                    "technitium_forwarder_extra_upstreams_ignored",
+                    zone=zone,
+                    used=forwarders[0],
+                    ignored=forwarders[1:],
+                )
+
+        resp = self._call(token, "POST", "zones/create", params)
         body = resp.json()
         if body.get("status") == "error":
             if "already exists" in (body.get("errorMessage") or "").lower():
                 return
             log.error(
-                "technitium_zone_create_failed", zone=zone, error=body.get("errorMessage")
+                "technitium_zone_create_failed",
+                zone=zone,
+                zone_type=ztype,
+                error=body.get("errorMessage"),
+            )
+
+    def _apply_zone_options(
+        self, token: str, zone: str, options: dict[str, Any]
+    ) -> None:
+        """Push per-zone options, validating enums before we send them.
+
+        ``zones/options/set`` answers ``{"status": "ok"}`` for a value it
+        does not recognise and leaves the existing setting untouched
+        (verified live with ``zoneTransfer="Bogus"``). So an unvalidated
+        typo would not fail — it would quietly leave zone transfer at
+        whatever it was, which for a zone we meant to lock down is a
+        security regression that no log line would report. Refuse to send
+        anything not in the known set.
+        """
+        if not options:
+            return
+        transfer = options.get("zoneTransfer")
+        if transfer is not None and transfer not in _ZONE_TRANSFER_VALUES:
+            log.error(
+                "technitium_zone_transfer_value_invalid",
+                zone=zone,
+                value=transfer,
+                supported=sorted(_ZONE_TRANSFER_VALUES),
+            )
+            return
+
+        params: dict[str, Any] = {"zone": zone}
+        for key, value in options.items():
+            # List-valued options go over the wire comma-joined.
+            params[key] = ",".join(str(v) for v in value) if isinstance(value, list) else value
+
+        resp = self._call(token, "POST", "zones/options/set", params)
+        body = resp.json()
+        if body.get("status") != "ok":
+            log.warning(
+                "technitium_zone_options_failed",
+                zone=zone,
+                error=body.get("errorMessage"),
             )
 
     def _get_zone_records(self, token: str, zone: str) -> list[dict[str, Any]]:
@@ -645,6 +979,14 @@ class TechnitiumDriver(DriverBase):
         for rec in body.get("response", {}).get("records") or []:
             rtype = rec.get("type")
             if rtype in _DAEMON_MANAGED_APEX_TYPES:
+                continue
+            # Apex NS is daemon-managed too (Technitium stamps one pointing
+            # at its own hostname at zone-create). Filter it HERE rather
+            # than skipping it later in the delete loop: left in, it lands
+            # in ``to_delete`` on every pass, gets skipped, and still gets
+            # counted — reporting a deletion that never happened and making
+            # a steady-state zone look like it churns its apex NS forever.
+            if rtype == "NS" and (rec.get("name") or "") == zone:
                 continue
             flat = {"domain": rec.get("name"), "type": rtype, "ttl": rec.get("ttl")}
             flat.update(rec.get("rData") or {})

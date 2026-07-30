@@ -476,7 +476,16 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
     # the same producer payload — the catalog zone format is RFC 9432
     # canonical, so the rendering driver doesn't need to fork.
     catalog_block: dict[str, Any] | None = None
-    if grp and grp.catalog_zones_enabled and server.driver in ("bind9", "powerdns"):
+    if (
+        grp
+        and grp.catalog_zones_enabled
+        and server.driver
+        in (
+            "bind9",
+            "powerdns",
+            "technitium",
+        )
+    ):
         producer = (
             await db.execute(
                 select(DNSServer).where(

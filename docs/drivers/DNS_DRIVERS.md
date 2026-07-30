@@ -653,26 +653,51 @@ Technitium has no static local secret file the entrypoint pre-seeds (unlike Powe
 
 The token never reaches the control plane — same agent-local trust boundary as PowerDNS's API key and BIND9's TSIG/rndc key.
 
-### 4B.3 Capabilities (v1)
+### 4B.3 Capabilities
 
 ```python
 {
     "name": "technitium",
     "views": False,
     "rpz": False,
-    "dnssec_inline_signing": False,   # fast-follow — see §4B.5
+    "dnssec_inline_signing": False,   # fast-follow — issue #740
     "incremental_updates": "rest_api",
-    "zone_types": ["primary"],        # secondary/stub/forward deferred
+    "zone_types": ["forward", "primary", "secondary", "stub"],
     "record_types": [...],            # A/AAAA/CNAME/MX/TXT/NS/PTR/SRV/CAA/
                                        # TLSA/SSHFP/NAPTR/URI/SOA/SVCB/HTTPS/DNAME
     "alias_records": False,           # Technitium has ANAME/APP instead —
                                        # a different shape, not a drop-in
     "lua_records": False,
-    "catalog_zones": False,
+    "catalog_zones": True,
 }
 ```
 
 `dynamic_update_caps` is the all-False default (no RFC 2136 client-facing UPDATE listener wired in v1 — all mutation flows through the agent's queued record-op reconciler).
+
+### 4B.3a Zone types, transfer and catalog (issue #743)
+
+Neutral `zone_type` → Technitium's `/api/zones/create` `type`:
+
+| SpatiumDDI | Technitium | Extra create param |
+|---|---|---|
+| `primary` | `Primary` | — |
+| `secondary` | `Secondary` | `primaryNameServerAddresses` (comma-joined `masters`) |
+| `stub` | `Stub` | `primaryNameServerAddresses` |
+| `forward` | `Forwarder` | `forwarder` — **one** upstream only |
+
+Three behaviours worth knowing, all confirmed against a live daemon:
+
+- **Only a primary's records are reconciled.** A secondary and a stub fill themselves from the transfer and a forwarder holds none, so diffing them would delete whatever the daemon just pulled down. `_RECORD_MANAGED_ZONE_TYPES` gates this on both the render and the reconcile side.
+- **A secondary/stub create is not guaranteed to succeed, and is not safely retryable-forever.** Technitium resolves SOA against the configured primaries at create time and errors if none answer (`DNS Server did not receive SOA record in response from any of the primary name servers`). An unreachable primary therefore fails on *every* reconcile pass. The control-plane driver rejects a secondary/stub with no `masters` up front so the operator gets a 422 on save instead of a zone that silently never appears.
+- **A Forwarder zone takes a single upstream** where BIND's takes a list. The first is used and the rest are dropped with a `technitium_forwarder_extra_upstreams_ignored` warning, rather than silently.
+
+**Zone transfer.** BIND declares `allow-transfer` once per server; Technitium has no global equivalent, so the same policy is stamped onto each primary. `["none"]`/empty → `Deny`, `any` → `Allow`, anything else → `UseSpecifiedNetworkACL` plus the CIDR list. TSIG key names are attached only where transfer is actually permitted — naming keys on a `Deny` zone would read as if signed transfer were enabled when nothing can transfer at all.
+
+> ⚠️ **`zones/options/set` silently ignores values it does not recognise.** Setting `zoneTransfer="Bogus"` returns `{"status":"ok"}` and leaves the previous value in place. A typo therefore does not fail — it leaves transfer at whatever it was, which for a zone you meant to lock down is a security regression no log line would report. The driver validates against `_ZONE_TRANSFER_VALUES` and refuses to send anything else. Do not remove that check.
+
+**TSIG keys** live in *global* settings, not per zone. The wire format is a **flat pipe-delimited token list read in triples** — `name|secret|algorithm|name2|secret2|algorithm2|…`. Not JSON, and not `name|algorithm|secret` (that fails with "TSIG algorithm is not supported", because it reads the secret as the algorithm). `settings/set` **replaces the whole list**, so keys an operator added directly in the Technitium console are dropped on the next sync — the same control-plane-is-truth stance the rest of the driver takes, but worth knowing. Note also that `zoneTransferTsigKeyNames` accepts a key the server does not have, so keys are pushed *before* anything references them.
+
+**Catalog zones (RFC 9432)** work as producer: the agent creates the `Catalog` zone and sets `catalog=<name>` on each primary it owns. A consumer joins by creating a `SecondaryCatalog` zone pointed at the producer, which arrives through the normal zone list rather than as a per-member option.
 
 ### 4B.4 Record type mapping
 
@@ -682,7 +707,6 @@ Technitium's API takes structured per-type params rather than PowerDNS's single 
 
 - **DNSSEC online signing** — Technitium's `/api/zones/dnssec/*` surface is close in shape to PowerDNS's (`sign`/`unsign`/key rollover), should port quickly once picked up.
 - **Native DoT/DoH/DoQ listeners** — Technitium's real differentiator over PowerDNS: it speaks all three natively, so no dnsdist-style sidecar is needed (contrast §9.2). Needs a settings-API spike to confirm the exact `/api/settings/set` shape, which isn't covered by the public zone/record API docs.
-- **Catalog zones, secondary/stub zones + TSIG-authenticated zone transfer.**
 - **Query-log shipping** — Technitium's query logging is API/DB-backed (`/api/logs/query*`), not a tailable text file like BIND9's `query_log_file` or PowerDNS's redirected stderr capture, so it needs a poll-and-diff shipper rather than the existing file-tailing `QueryLogShipper`.
 - **Live-pull `dns_import` importer** for existing Technitium installs (mirrors `services/dns_import/powerdns.py`).
 

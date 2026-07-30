@@ -31,8 +31,8 @@ SpatiumDDI ships four authoritative DNS drivers. Pick **per server group** — e
 | LUA records (computed responses) | — | ✅ | — | — |
 | Online DNSSEC signing | ✅ inline-signing (#49) | ✅ one-toggle | — (fast-follow) | manual |
 | Native DoT / DoH (no sidecar) | ✅ (issue #50) | — (needs dnsdist sidecar) | — (fast-follow — daemon supports DoT/DoH/DoQ natively) | — |
-| Catalog zones (RFC 9432) — producer | ✅ | ✅ | — (fast-follow) | — |
-| Catalog zones (RFC 9432) — consumer | ✅ | — (not wired up in the agent) | — | — |
+| Catalog zones (RFC 9432) — producer | ✅ | ✅ | ✅ | — |
+| Catalog zones (RFC 9432) — consumer | ✅ | — (not wired up in the agent) | ✅ | — |
 | First-class views / split-horizon | ✅ | tag-based, not surfaced as views in UI | — | — (replication scope) |
 | RPZ blocklists | ✅ | — (recursor feature only) | — | — |
 | AD-integrated zones | — | — | — | ✅ |
@@ -42,7 +42,7 @@ SpatiumDDI ships four authoritative DNS drivers. Pick **per server group** — e
 
 **Pick PowerDNS when** you need ALIAS records (CNAME-at-apex without the BIND-side workaround), LUA records (geo-routing / weighted answers / `pickrandom` / `ifportup`), or the simpler one-toggle online DNSSEC story. The shipped image (`ghcr.io/spatiumddi/dns-powerdns`) bundles `pdns 5.0 + pdns-backend-lmdb` for an agent-isolated zone store with no external Postgres dependency. See [issue #127](https://github.com/spatiumddi/spatiumddi/issues/127) for the full driver rationale.
 
-**Pick Technitium when** you want a minimal-footprint REST-driven primary-zone host and don't (yet) need DNSSEC or ALIAS/LUA — v1 covers primary zones + standard record types (A/AAAA/CNAME/MX/TXT/NS/PTR/SRV/CAA/TLSA/SSHFP/NAPTR/URI/SVCB/HTTPS/DNAME). Its real long-term differentiator is native DNS-over-TLS/HTTPS/QUIC support with no dnsdist-style sidecar (PowerDNS's approach) — that wiring is a fast-follow, tracked in [`docs/drivers/DNS_DRIVERS.md` §4B.5](../drivers/DNS_DRIVERS.md).
+**Pick Technitium when** you want a minimal-footprint REST-driven authoritative host and don't (yet) need DNSSEC or ALIAS/LUA. It covers primary / secondary / stub / forward zones, catalog zones (producer and consumer), TSIG-authenticated zone transfer, and the standard record types (A/AAAA/CNAME/MX/TXT/NS/PTR/SRV/CAA/TLSA/SSHFP/NAPTR/URI/SVCB/HTTPS/DNAME) — see [`docs/drivers/DNS_DRIVERS.md` §4B.3a](../drivers/DNS_DRIVERS.md). Its real long-term differentiator is native DNS-over-TLS/HTTPS/QUIC with no dnsdist-style sidecar (PowerDNS's approach), *and* encrypted upstream forwarding, which BIND9 cannot do — that wiring is tracked in [#741](https://github.com/spatiumddi/spatiumddi/issues/741).
 
 **Pick Windows DNS when** the zone is AD-integrated and operators expect to keep using DNS Manager / `Add-DnsServerResourceRecord` directly. Path A (RFC 2136 + AXFR) works without admin credentials; Path B (WinRM + PowerShell) unlocks zone CRUD and a JSON record-pull that sidesteps AXFR ACL configuration.
 

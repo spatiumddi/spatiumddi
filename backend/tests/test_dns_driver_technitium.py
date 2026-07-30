@@ -181,7 +181,11 @@ def test_validate_config_rejects_views(bundle: ConfigBundle) -> None:
     assert any("does not support views" in e for e in errors)
 
 
-def test_validate_config_rejects_non_primary_zone(zone: ZoneData) -> None:
+def test_validate_config_accepts_secondary_with_masters(zone: ZoneData) -> None:
+    """Superseded issue #743: a secondary used to be rejected outright.
+    It is now valid as long as it carries somewhere to transfer from —
+    see test_validate_rejects_secondary_without_masters for the other half.
+    """
     secondary = ZoneData(
         name=zone.name,
         zone_type="secondary",
@@ -210,8 +214,7 @@ def test_validate_config_rejects_non_primary_zone(zone: ZoneData) -> None:
         generated_at=datetime(2026, 7, 27, 12, 0, tzinfo=UTC),
     )
     ok, errors = TechnitiumDriver().validate_config(bundle)
-    assert ok is False
-    assert any("not supported by the v1 Technitium driver" in e for e in errors)
+    assert ok is True, errors
 
 
 def test_validate_config_rejects_unsupported_record_types(zone: ZoneData) -> None:
@@ -316,13 +319,14 @@ def test_validate_config_blocklists_are_warned_not_errored(zone: ZoneData) -> No
 # ── Capabilities ──────────────────────────────────────────────────────────
 
 
-def test_capabilities_v1_scope() -> None:
+def test_capabilities_scope() -> None:
     caps = TechnitiumDriver().capabilities()
-    assert caps["zone_types"] == ["primary"]
+    assert set(caps["zone_types"]) == {"primary", "secondary", "stub", "forward"}
+    # Still deferred — issues #740 and #744 respectively.
     assert caps["dnssec_inline_signing"] is False
     assert caps["alias_records"] is False
     assert caps["lua_records"] is False
-    assert caps["catalog_zones"] is False
+    assert caps["catalog_zones"] is True
     assert "SVCB" in caps["record_types"]
     assert "HTTPS" in caps["record_types"]
     assert "DNAME" in caps["record_types"]
@@ -332,3 +336,84 @@ def test_dynamic_update_caps_unsupported() -> None:
     caps = TechnitiumDriver().dynamic_update_caps
     assert caps.supports_ip_acl is False
     assert caps.supports_tsig_acl is False
+
+
+# ── Zone types + capabilities (issue #743) ──────────────────────────────
+
+
+def _zone(name: str, zone_type: str, **over: object) -> ZoneData:
+    base = dict(
+        name=name,
+        zone_type=zone_type,
+        kind="forward",
+        ttl=3600,
+        refresh=86400,
+        retry=7200,
+        expire=3600000,
+        minimum=3600,
+        primary_ns="ns1.example.com.",
+        admin_email="hostmaster.example.com.",
+        serial=1,
+        records=(),
+    )
+    base.update(over)
+    return ZoneData(**base)  # type: ignore[arg-type]
+
+
+def _bundle_with(*zones: ZoneData) -> ConfigBundle:
+    return ConfigBundle(
+        server_id=str(uuid.uuid4()),
+        server_name="technitium1",
+        driver="technitium",
+        roles=("authoritative",),
+        options=ServerOptions(),
+        acls=(),
+        views=(),
+        zones=zones,
+        tsig_keys=(),
+        blocklists=(),
+        generated_at=datetime(2026, 7, 30, 12, 0, tzinfo=UTC),
+    )
+
+
+def test_validate_accepts_every_supported_zone_type() -> None:
+    d = TechnitiumDriver()
+    ok, errors = d.validate_config(
+        _bundle_with(
+            _zone("p.example.com.", "primary"),
+            _zone("s.example.com.", "secondary", masters=("192.0.2.1",)),
+            _zone("st.example.com.", "stub", masters=("192.0.2.1",)),
+            _zone("f.example.com.", "forward", forwarders=("8.8.8.8",)),
+        )
+    )
+    assert ok, errors
+
+
+def test_validate_rejects_secondary_without_masters() -> None:
+    """Technitium resolves SOA against the primaries at create time, so a
+    secondary with nowhere to transfer from can never be created. Better a
+    422 on save than a zone that silently never appears."""
+    d = TechnitiumDriver()
+    ok, errors = d.validate_config(_bundle_with(_zone("s.example.com.", "secondary")))
+    assert not ok
+    assert any("primary name-server address" in e for e in errors)
+
+
+def test_validate_rejects_forward_without_forwarders() -> None:
+    d = TechnitiumDriver()
+    ok, errors = d.validate_config(_bundle_with(_zone("f.example.com.", "forward")))
+    assert not ok
+    assert any("forwarder" in e for e in errors)
+
+
+def test_validate_rejects_unknown_zone_type() -> None:
+    d = TechnitiumDriver()
+    ok, errors = d.validate_config(_bundle_with(_zone("x.example.com.", "mirror")))
+    assert not ok
+    assert any("not supported" in e for e in errors)
+
+
+def test_capabilities_report_zone_types_and_catalog() -> None:
+    caps = TechnitiumDriver().capabilities()
+    assert set(caps["zone_types"]) == {"primary", "secondary", "stub", "forward"}
+    assert caps["catalog_zones"] is True

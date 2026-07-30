@@ -26,6 +26,8 @@ from spatium_dns_agent.drivers.technitium import (
     _qualified_name,
     _record_params,
     _svcb_params,
+    _tsig_key_names,
+    _zone_options_payload,
 )
 
 
@@ -575,3 +577,237 @@ def test_svcb_target_root_dot_is_stripped() -> None:
     assert target == "svc.example.test"
     # A bare apex target must survive as "." rather than becoming "".
     assert _svcb_params("1 .")[1] == "."
+
+
+# ── Zone types, transfer options, TSIG, catalog (issue #743) ────────────
+
+
+def _zone_bundle(**over):
+    base = {
+        "options": {"allow_transfer": ["none"]},
+        "tsig_keys": [],
+        "zones": [],
+    }
+    base.update(over)
+    return base
+
+
+def test_render_emits_every_supported_zone_type(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    d.render(
+        _zone_bundle(
+            zones=[
+                {"name": "p.test.", "type": "primary", "records": []},
+                {"name": "s.test.", "type": "secondary", "masters": ["192.0.2.1"]},
+                {"name": "st.test.", "type": "stub", "masters": ["192.0.2.1"]},
+                {"name": "f.test.", "type": "forward", "forwarders": ["8.8.8.8"]},
+            ]
+        )
+    )
+    import json as _json
+
+    payload = _json.loads((tmp_path / "rendered.new" / "zones.json").read_text())
+    assert {z["zone"]: z["type"] for z in payload} == {
+        "p.test": "Primary",
+        "s.test": "Secondary",
+        "st.test": "Stub",
+        "f.test": "Forwarder",
+    }
+
+
+def test_render_skips_zones_that_cannot_be_created(tmp_path: Path) -> None:
+    """A secondary/stub with no primary to transfer from, or a forward zone
+    with no upstream, cannot be created at all — Technitium rejects the
+    call. Skip them rather than fail the whole render."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    d.render(
+        _zone_bundle(
+            zones=[
+                {"name": "nomaster.test.", "type": "secondary", "masters": []},
+                {"name": "nofwd.test.", "type": "forward", "forwarders": []},
+                {"name": "bogus.test.", "type": "not-a-zone-type"},
+                {"name": "ok.test.", "type": "primary", "records": []},
+            ]
+        )
+    )
+    import json as _json
+
+    payload = _json.loads((tmp_path / "rendered.new" / "zones.json").read_text())
+    assert [z["zone"] for z in payload] == ["ok.test"]
+
+
+def test_render_omits_records_for_non_primary_zones(tmp_path: Path) -> None:
+    """A secondary fills itself from the transfer. Rendering records for it
+    would make the reconciler delete what the daemon just pulled down."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    d.render(
+        _zone_bundle(
+            zones=[
+                {
+                    "name": "s.test.",
+                    "type": "secondary",
+                    "masters": ["192.0.2.1"],
+                    "records": [{"name": "www", "type": "A", "value": "10.0.0.1"}],
+                }
+            ]
+        )
+    )
+    import json as _json
+
+    payload = _json.loads((tmp_path / "rendered.new" / "zones.json").read_text())
+    assert payload[0]["records"] == []
+
+
+def test_zone_options_transfer_policy_mapping() -> None:
+    assert _zone_options_payload("Primary", _zone_bundle())["zoneTransfer"] == "Deny"
+    assert (
+        _zone_options_payload("Primary", _zone_bundle(options={"allow_transfer": []}))[
+            "zoneTransfer"
+        ]
+        == "Deny"
+    )
+    assert (
+        _zone_options_payload(
+            "Primary", _zone_bundle(options={"allow_transfer": ["any"]})
+        )["zoneTransfer"]
+        == "Allow"
+    )
+    acl = _zone_options_payload(
+        "Primary", _zone_bundle(options={"allow_transfer": ["10.0.0.0/8"]})
+    )
+    assert acl["zoneTransfer"] == "UseSpecifiedNetworkACL"
+    assert acl["zoneTransferNetworkACL"] == ["10.0.0.0/8"]
+
+
+def test_zone_options_only_for_primary() -> None:
+    """A secondary transfers IN. Whether it re-serves is a separate
+    decision we don't make on the operator's behalf."""
+    for ztype in ("Secondary", "Stub", "Forwarder"):
+        assert _zone_options_payload(ztype, _zone_bundle()) == {}
+
+
+def test_tsig_key_names_only_attached_when_transfer_permitted() -> None:
+    """Pinning key names onto a Deny zone reads as if signed transfer were
+    enabled when nothing can transfer at all."""
+    keys = [{"name": "k1.", "secret": "s", "algorithm": "hmac-sha256"}]
+    denied = _zone_options_payload("Primary", _zone_bundle(tsig_keys=keys))
+    assert denied["zoneTransfer"] == "Deny"
+    assert "zoneTransferTsigKeyNames" not in denied
+
+    allowed = _zone_options_payload(
+        "Primary", _zone_bundle(tsig_keys=keys, options={"allow_transfer": ["any"]})
+    )
+    assert allowed["zoneTransferTsigKeyNames"] == ["k1"]
+
+
+def test_tsig_key_names_strip_root_dot() -> None:
+    """Technitium stores names un-dotted, so a dotted name would compare
+    as different forever."""
+    assert _tsig_key_names(
+        {"tsig_keys": [{"name": "a."}, {"name": "b"}, {"name": ""}]}
+    ) == ["a", "b"]
+
+
+def test_ensure_zone_exists_sends_type_specific_params(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+
+    d._ensure_zone_exists("t", {"zone": "s.test", "type": "Secondary",
+                                "masters": ["192.0.2.1", "192.0.2.2"]})
+    assert calls[-1][3]["primaryNameServerAddresses"] == "192.0.2.1,192.0.2.2"
+
+    d._ensure_zone_exists("t", {"zone": "f.test", "type": "Forwarder",
+                                "forwarders": ["8.8.8.8", "9.9.9.9"]})
+    # Technitium's Forwarder zone takes ONE upstream; extras are dropped
+    # with a warning rather than silently.
+    assert calls[-1][3]["forwarder"] == "8.8.8.8"
+    assert "forwarders" not in calls[-1][3]
+
+
+def test_apply_zone_options_refuses_unknown_transfer_value(tmp_path: Path) -> None:
+    """zones/options/set answers ok for a value it doesn't recognise and
+    keeps the OLD one — so an unvalidated typo silently leaves transfer at
+    whatever it was, which for a zone meant to be locked down is a security
+    regression no log line would report."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    d._apply_zone_options("t", "z.test", {"zoneTransfer": "Bogus"})
+    assert calls == []
+
+
+def test_apply_zone_options_joins_list_values(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    d._apply_zone_options(
+        "t",
+        "z.test",
+        {
+            "zoneTransfer": "UseSpecifiedNetworkACL",
+            "zoneTransferNetworkACL": ["10.0.0.0/8", "192.168.0.0/16"],
+            "zoneTransferTsigKeyNames": ["k1"],
+        },
+    )
+    params = calls[0][3]
+    assert params["zoneTransferNetworkACL"] == "10.0.0.0/8,192.168.0.0/16"
+    assert params["zoneTransferTsigKeyNames"] == "k1"
+
+
+def test_sync_tsig_keys_wire_format(tmp_path: Path) -> None:
+    """FLAT pipe-delimited token list read in triples — name|secret|alg|…
+    Not JSON, not one pipe-joined record per key, and not name|alg|secret
+    (that one fails with "TSIG algorithm is not supported", because it
+    reads the secret as the algorithm)."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    d._sync_tsig_keys(
+        "t",
+        [
+            {"name": "k1.", "secret": "s1", "algorithm": "hmac-sha256"},
+            {"name": "k2", "secret": "s2", "algorithm": "HMAC-SHA512"},
+        ],
+    )
+    assert calls[0][2] == "settings/set"
+    assert calls[0][3]["tsigKeys"] == "k1|s1|hmac-sha256|k2|s2|hmac-sha512"
+
+
+def test_sync_tsig_keys_drops_unsupported_algorithm(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    d._sync_tsig_keys(
+        "t",
+        [
+            {"name": "bad", "secret": "s", "algorithm": "hmac-sha3"},
+            {"name": "good", "secret": "s", "algorithm": "hmac-sha256"},
+        ],
+    )
+    assert calls[0][3]["tsigKeys"] == "good|s|hmac-sha256"
+
+
+def test_get_zone_records_filters_daemon_managed_apex(tmp_path: Path) -> None:
+    """Apex NS/SOA are stamped by the daemon at zone create. Left in, the
+    apex NS lands in to_delete every pass, gets skipped, and is still
+    counted — reporting a deletion that never happened."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    _install_fake_request(
+        d,
+        lambda *_: {
+            "status": "ok",
+            "response": {
+                "records": [
+                    {"name": "z.test", "type": "SOA", "ttl": 900, "rData": {}},
+                    {"name": "z.test", "type": "NS", "ttl": 3600,
+                     "rData": {"nameServer": "self."}},
+                    {"name": "sub.z.test", "type": "NS", "ttl": 3600,
+                     "rData": {"nameServer": "ns.other."}},
+                    {"name": "www.z.test", "type": "A", "ttl": 300,
+                     "rData": {"ipAddress": "10.0.0.1"}},
+                ]
+            },
+        },
+    )
+    got = {(r["domain"], r["type"]) for r in d._get_zone_records("t", "z.test")}
+    assert ("z.test", "SOA") not in got
+    assert ("z.test", "NS") not in got
+    # Off-apex NS is a real delegation and must survive.
+    assert ("sub.z.test", "NS") in got
+    assert ("www.z.test", "A") in got
