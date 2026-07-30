@@ -481,7 +481,7 @@ suggestion, free-space treemap.
 - ✅ [**Built-in network tools page**](https://github.com/spatiumddi/spatiumddi/issues/58) — shipped `2026.06.11-1`: a `/tools` page (ping / traceroute / mtr / dig / whois over sandboxed argv, port-test / TLS-cert over sockets, DNS-propagation, MAC-vendor), permission-gated + Redis rate-limited, with 7 MCP tools.
 - ✅ [**PCAP capture trigger**](https://github.com/spatiumddi/spatiumddi/issues/59) — shipped `2026.06.15-1`: on-demand tcpdump as an RBAC-gated/audited Tools page, both server-container and appliance-host (real-NIC) vantages, keep-partial-on-Stop, `.pcap` download, 4 Operator Copilot tools.
 - ❌ [**ACL / prefix-list generator**](https://github.com/spatiumddi/spatiumddi/issues/60) — **closed as not planned** 2026-06-17, in the same triage pass that closed #40. No rationale was recorded on the issue; re-open it rather than re-filing if the need comes back.
-- 🟡 [**Config-drift report (full record diff)**](https://github.com/spatiumddi/spatiumddi/issues/61) — **backend shipped `2026.06.11-1`**: `GET …/zones/{id}/drift` AXFRs the live zone from every server in the group and diffs it against the DB — extra-on-server (manual host change) / missing-on-server / in-sync, per server, read-only — plus a `find_dns_zone_drift` MCP tool. **UI still ⬜.**
+- ✅ [**Config-drift report (full record diff)**](https://github.com/spatiumddi/spatiumddi/issues/61) — **backend shipped `2026.06.11-1`**: `GET …/zones/{id}/drift` AXFRs the live zone from every server in the group and diffs it against the DB — extra-on-server (manual host change) / missing-on-server / in-sync, per server, read-only — plus a `find_dns_zone_drift` MCP tool. **UI merged to `main` (#735), pending release cut** — a Drift tab on the zone detail, fetched on demand because one call fans out an AXFR to every server in the group. That PR also fixed the reason nothing had ever consumed the endpoint: `dns.query.xfr` takes an IP *literal* and raises a bare, message-less `ValueError` for a hostname before sending a packet, so every hostname-addressed server failed 100% of the time reporting `""` as the error. **Known gap — [#734](https://github.com/spatiumddi/spatiumddi/issues/734):** agent-managed BIND9 now reaches the server and gets `REFUSED`, because the control plane doesn't TSIG-sign its AXFR and the agent grants `allow-transfer` only to the group key on dynamic zones. The tab works today for Windows Path B + the cloud drivers (API pulls, not AXFR), not for BIND9.
 
 #### Workflow & RBAC
 
@@ -511,7 +511,18 @@ suggestion, free-space treemap.
 - ⬜ [**Personal pinned dashboard**](https://github.com/spatiumddi/spatiumddi/issues/78)
 - ⬜ [**Field-level history**](https://github.com/spatiumddi/spatiumddi/issues/79)
 - ⬜ [**Recent items / favourites sidebar**](https://github.com/spatiumddi/spatiumddi/issues/80)
-- ⬜ [**Keyboard shortcut help overlay**](https://github.com/spatiumddi/spatiumddi/issues/81)
+- ✅ [**Keyboard shortcut help overlay**](https://github.com/spatiumddi/spatiumddi/issues/81)
+  — merged to `main` (#737), pending release cut: `?` opens a modal
+  listing every binding, from a new `frontend/src/lib/shortcuts.ts`
+  mounted via `Header`. The map is deliberately **load-bearing rather
+  than a parallel list** — `GlobalSearch`'s Cmd/Ctrl+K listener matches
+  against it and its trigger keycap renders from it, so retuning a combo
+  moves the handler, the keycap and the help together. That coupling
+  reaches exactly two shortcuts today (Cmd/Ctrl+K, `?`); the other ten
+  are flagged `describedOnly` because their handlers live in components
+  that don't consult the map, and are the rows that can still drift.
+  Note for anyone adding a binding: declare it here and match via
+  `matchesShortcut` rather than adding another described-only row.
 - ⬜ [**Print / PDF export for IPAM tree + subnet detail**](https://github.com/spatiumddi/spatiumddi/issues/82) — GitHub auto-closed this on 2026-06-18 in error: PR [#446](https://github.com/spatiumddi/spatiumddi/pull/446) was titled `fix(supervisor): … (CodeQL #82)`, referring to CodeQL *alert* 82, and the `#82` was read as an issue reference. Nothing IPAM-print-related shipped — the only `reportlab` surfaces are the conformity (`/conformity/export.pdf`) and audit-change (`/audit/export.pdf`) reports. **Reopened 2026-07-28**; shares PDF infrastructure with the shipped #48.
 
 #### CLI tool
