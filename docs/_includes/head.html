@@ -1,0 +1,32 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% if page.title and page.url != "/" %}{{ page.title }} · {{ site.title }}{% else %}{{ site.title }}{% endif %}</title>
+<meta name="description" content="{{ page.description | default: site.description }}">
+<meta name="theme-color" content="#0f172a">
+
+<link rel="icon" type="image/svg+xml" href="{{ include.root }}assets/logo-icon.svg">
+<link rel="stylesheet" href="{{ include.root }}assets/css/site.css">
+
+<meta property="og:type" content="website">
+<meta property="og:title" content="{% if page.title and page.url != '/' %}{{ page.title }} · {{ site.title }}{% else %}{{ site.title }}{% endif %}">
+<meta property="og:description" content="{{ page.description | default: site.description }}">
+<!-- og:image must be an absolute URL and a raster format — SVG is not rendered
+     as an unfurl preview by Slack, X or LinkedIn, so the logo cannot serve
+     here. The canonical org site is the target regardless of which of the two
+     Pages sites this page is being served from. -->
+<meta property="og:image" content="https://spatiumddi.github.io/assets/screenshots/dashboard.png">
+<meta property="og:url" content="https://spatiumddi.github.io/">
+<meta name="twitter:card" content="summary_large_image">
+
+<!-- Applied before first paint so an explicitly-chosen theme does not flash
+     the other one. Falls through to prefers-color-scheme when unset. -->
+<script>
+  try {
+    var t = localStorage.getItem("theme");
+    if (t === "dark" || t === "light") {
+      document.documentElement.setAttribute("data-theme", t);
+    }
+  } catch (e) {
+    /* private mode / storage disabled — prefers-color-scheme still applies */
+  }
+</script>

@@ -1,0 +1,51 @@
+<!doctype html>
+{%- comment -%}
+  Docs page layout — single column, top nav, no sidebar.
+
+  `root` is a relative prefix ("", "../", "../../") computed from the page's
+  own depth, used for every asset and nav link.
+
+  Why not site.baseurl: this tree is served from two Pages sites at different
+  mount points (the org site at "/" and the project site at "/spatiumddi/").
+  GitHub Pages does inject the right baseurl per build, so baseurl would work
+  in production — but it is empty for a local `jekyll build`, which would then
+  emit root-absolute links that only resolve if you happen to serve the output
+  at "/". Relative prefixes are correct at any mount point, production or
+  local, which is what makes the site previewable before it is published.
+{%- endcomment -%}
+{%- comment -%}
+  Depth = number of '/' separators after the leading one. The 'x' sentinel is
+  load-bearing: Liquid's split drops trailing empty strings, so a directory URL
+  like "/deployment/" would otherwise measure the same as a top-level page and
+  pull assets from the wrong prefix. Appending a character gives the trailing
+  segment something to be, making "features/DNS.html" and "deployment/" both
+  measure depth 1.
+{%- endcomment -%}
+{%- assign _path = page.url | remove_first: '/' | append: 'x' -%}
+{%- assign _depth = _path | split: '/' | size | minus: 1 -%}
+{%- capture root -%}
+{%- if _depth > 0 -%}{%- for i in (1.._depth) -%}../{%- endfor -%}{%- endif -%}
+{%- endcapture -%}
+<html lang="en">
+<head>
+  {% include head.html root=root %}
+</head>
+<body>
+  {% include nav.html root=root %}
+
+  <main class="doc">
+    <div class="doc-crumb">
+      <a href="{{ root }}index.html">Home</a> ›
+      <a href="{{ root }}docs.html">Docs</a>
+      {%- if page.title %} › {{ page.title }}{%- endif %}
+    </div>
+
+    <article class="doc-body">
+      {{ content }}
+    </article>
+  </main>
+
+  {% include lightbox.html %}
+  {% include footer.html root=root %}
+</body>
+</html>

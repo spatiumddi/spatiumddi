@@ -1291,7 +1291,7 @@ EOF
 
 ## Documentation
 
-Full docs at **[spatiumddi.github.io](https://spatiumddi.github.io)** (coming soon).
+Full docs at **[spatiumddi.github.io](https://spatiumddi.github.io)** — published on every release. For documentation tracking `main` ahead of the current release, see [spatiumddi.github.io/spatiumddi](https://spatiumddi.github.io/spatiumddi/).
 
 | Document | Description |
 |---|---|

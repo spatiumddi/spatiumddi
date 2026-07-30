@@ -1,0 +1,142 @@
+# Publish docs/ to the org-root Pages site on every release tag.
+#
+# The documentation is served from TWO GitHub Pages sites:
+#
+#   * https://spatiumddi.github.io/spatiumddi/  — project site, built by
+#     GitHub directly from this repo's `main` branch, `/docs` path. Always
+#     current with `main`; needs no workflow.
+#   * https://spatiumddi.github.io/            — organization site, which
+#     GitHub only ever serves from a repo named `<org>.github.io`. That repo
+#     holds no source of its own — this workflow mirrors `docs/` into it.
+#
+# The root site therefore tracks the last RELEASE, while the project site
+# tracks `main`. That is deliberate: the root URL is what the README badge,
+# docs/sitemap.xml and docs/robots.txt advertise to users and search engines,
+# so it should show released documentation, not unreleased work in flight.
+#
+# Auth: GITHUB_TOKEN is scoped to the repo running the workflow and cannot
+# push to another repo, so this uses an SSH deploy key registered on
+# spatiumddi.github.io with write access. The private half lives in the
+# DOCS_DEPLOY_KEY secret. To rotate: generate a new ed25519 pair, replace the
+# deploy key on the target repo, then update the secret here.
+name: Publish docs site
+
+on:
+  push:
+    tags:
+      - "[0-9][0-9][0-9][0-9].[0-9][0-9].[0-9][0-9]-*" # e.g. 2026.04.13-1
+  # Manual re-run, e.g. after fixing the site repo by hand or rotating the key.
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Tag or ref to publish docs from (default: current ref)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+# Never let two releases race each other into the site repo.
+concurrency:
+  group: docs-publish
+  cancel-in-progress: false
+
+env:
+  TARGET_REPO: git@github.com:spatiumddi/spatiumddi.github.io.git
+  # The branch GitHub Pages is configured to serve on the site repo.
+  TARGET_BRANCH: main
+
+jobs:
+  publish:
+    name: Mirror docs/ to spatiumddi.github.io
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Resolve version label
+        id: meta
+        # Values reach the shell as env vars, never as ${{ }} interpolated into
+        # the script text: a workflow_dispatch input is attacker-supplied, and
+        # inlining it would let `$(...)` execute inside the job that holds
+        # DOCS_DEPLOY_KEY.
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          if [ "$REF_TYPE" = "tag" ]; then
+            echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${INPUT_REF:-$GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Configure deploy key
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.DOCS_DEPLOY_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -t rsa,ecdsa,ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Clone site repo
+        # --branch is explicit rather than relying on the remote's default, so
+        # this cannot quietly commit onto one branch and push to another.
+        run: git clone --depth 1 --branch "$TARGET_BRANCH" "$TARGET_REPO" site
+
+      - name: Mirror docs/ into the site tree
+        run: |
+          # --delete so files removed from docs/ disappear from the site too;
+          # the site repo holds no sources of its own, only generated content.
+          # Excluded paths are also protected from --delete on the receiving
+          # side, which is the point for all three:
+          #   .git    — the clone itself
+          #   .github — the "generated, do not edit" notice, rewritten below
+          #             and invisible to Jekyll (it ignores dot-directories)
+          #   CNAME   — written by GitHub when a custom domain is configured on
+          #             the site repo. It has no counterpart in docs/, so
+          #             without this the first release after setting a custom
+          #             domain would delete it and silently unset the domain.
+          rsync -a --delete \
+            --exclude '.git' \
+            --exclude '.github' \
+            --exclude 'CNAME' \
+            docs/ site/
+
+          mkdir -p site/.github
+          cat > site/.github/README.md <<'EOF'
+          # spatiumddi.github.io
+
+          **Generated — do not edit this repository directly.**
+
+          This repo serves the SpatiumDDI documentation site at
+          <https://spatiumddi.github.io>.
+
+          Its entire contents are mirrored from the `docs/` directory of
+          [spatiumddi/spatiumddi](https://github.com/spatiumddi/spatiumddi) by
+          the `docs-publish` workflow, which runs on every release tag. Any
+          commit made here by hand will be overwritten by the next release.
+
+          To change the documentation, edit `docs/` in the main repository.
+          EOF
+
+      - name: Commit and push
+        working-directory: site
+        # As above: VERSION derives from a tag name / dispatch input, so it
+        # goes through the environment rather than into the script text.
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          git config user.name "spatiumddi-ci"
+          git config user.email "ci@spatiumddi.invalid"
+          git add -A
+          # A release with no docs changes is normal, not a failure.
+          if git diff --cached --quiet; then
+            echo "No documentation changes for ${VERSION} — nothing to publish."
+            exit 0
+          fi
+          git commit -m "docs: publish ${VERSION}" -m \
+            "Mirrored from spatiumddi/spatiumddi@${SOURCE_SHA} by the docs-publish workflow. Do not edit this repository directly."
+          git push origin "HEAD:refs/heads/${TARGET_BRANCH}"
+          echo "Published ${VERSION} to https://spatiumddi.github.io/"

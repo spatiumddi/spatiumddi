@@ -1,0 +1,805 @@
+/* ============================================================================
+   SpatiumDDI site styles
+   ----------------------------------------------------------------------------
+   Replaces jekyll-theme-minimal. That theme put a fixed 270px sidebar beside a
+   500px content column, which is why reference docs rendered into a narrow
+   strip with empty screen next to it. This is a single-column layout with a
+   top nav instead — no side-by-side at any width.
+
+   Palette is taken from assets/logo.svg so the site and the mark agree:
+     slate  #0f172a / #1e293b      teal  #134e4a / #0d9488 / #2dd4bf
+
+   Plain CSS, not SCSS, deliberately: it is copied verbatim by Jekyll, so there
+   is no Sass compile step that can fail a Pages build.
+   ========================================================================= */
+
+:root {
+  --bg: #ffffff;
+  --bg-soft: #f8fafc;
+  --bg-code: #f1f5f9;
+  --fg: #0f172a;
+  --fg-muted: #475569;
+  --fg-faint: #64748b;
+  --border: #e2e8f0;
+  --accent: #0d9488;
+  --accent-hover: #0f766e;
+  --accent-bright: #2dd4bf;
+  --brand-dark: #0f172a;
+  --brand-dark-2: #1e293b;
+  --shadow: 0 1px 2px rgb(15 23 42 / 6%), 0 8px 24px -12px rgb(15 23 42 / 18%);
+  --radius: 12px;
+  --page: 78rem; /* outer container */
+}
+
+/* Dark palette. Declared twice on purpose — plain CSS has no way to share one
+   block between a media query and an attribute selector:
+     1. the media query is the default for anyone who has not chosen, and is
+        suppressed once they explicitly pick light;
+     2. the attribute selector is the explicit choice, set by the toggle and
+        persisted in localStorage. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0b1220;
+    --bg-soft: #111c2e;
+    --bg-code: #16223a;
+    --fg: #e8eefc;
+    --fg-muted: #a3b3cc;
+    --fg-faint: #8497b5;
+    --border: #22304a;
+    --accent: #2dd4bf;
+    --accent-hover: #5eead4;
+    --shadow: 0 1px 2px rgb(0 0 0 / 40%), 0 8px 24px -12px rgb(0 0 0 / 60%);
+  }
+}
+
+:root[data-theme="dark"] {
+  --bg: #0b1220;
+  --bg-soft: #111c2e;
+  --bg-code: #16223a;
+  --fg: #e8eefc;
+  --fg-muted: #a3b3cc;
+  --fg-faint: #8497b5;
+  --border: #22304a;
+  --accent: #2dd4bf;
+  --accent-hover: #5eead4;
+  --shadow: 0 1px 2px rgb(0 0 0 / 40%), 0 8px 24px -12px rgb(0 0 0 / 60%);
+}
+
+/* The toggle swaps icons rather than duplicating markup visibility logic. */
+.theme-toggle .icon-dark {
+  display: none;
+}
+:root[data-theme="dark"] .theme-toggle .icon-dark,
+.theme-toggle .icon-light {
+  display: block;
+}
+:root[data-theme="dark"] .theme-toggle .icon-light {
+  display: none;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .theme-toggle .icon-light {
+    display: none;
+  }
+  :root:not([data-theme="light"]) .theme-toggle .icon-dark {
+    display: block;
+  }
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+  -webkit-text-size-adjust: 100%;
+  /* The nav is sticky and 62px tall, so an un-offset anchor jump parks the
+     target underneath it. Applies to #features / #install and to every doc
+     heading deep-link. */
+  scroll-padding-top: 78px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+  font-size: 17px;
+  line-height: 1.65;
+  -webkit-font-smoothing: antialiased;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+a:hover {
+  color: var(--accent-hover);
+  text-decoration: underline;
+}
+
+code,
+pre,
+kbd {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+    "Liberation Mono", monospace;
+}
+
+/* ─── Top navigation ─────────────────────────────────────────────────────── */
+
+.nav {
+  position: sticky;
+  top: 0;
+  z-index: 50;
+  /* Opaque fallback first: where color-mix() is unsupported the declaration
+     below is dropped, and without this the nav would be transparent with page
+     text scrolling illegibly beneath it. */
+  background: var(--bg);
+  background: color-mix(in srgb, var(--bg) 88%, transparent);
+  backdrop-filter: saturate(180%) blur(12px);
+  border-bottom: 1px solid var(--border);
+}
+
+.nav-inner {
+  max-width: var(--page);
+  margin: 0 auto;
+  padding: 0 24px;
+  height: 62px;
+  display: flex;
+  align-items: center;
+  gap: 28px;
+}
+
+.nav-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  font-weight: 700;
+  font-size: 1.05rem;
+  letter-spacing: -0.02em;
+  color: var(--fg);
+}
+.nav-brand:hover {
+  text-decoration: none;
+  color: var(--fg);
+}
+.nav-brand img {
+  width: 28px;
+  height: 28px;
+  border-radius: 7px;
+  display: block;
+}
+.nav-brand .ddi {
+  color: var(--accent);
+  font-weight: 500;
+  letter-spacing: 0.14em;
+  font-size: 0.78em;
+}
+
+.nav-links {
+  display: flex;
+  align-items: center;
+  gap: 22px;
+  margin-left: auto;
+  font-size: 0.94rem;
+}
+.nav-links a {
+  color: var(--fg-muted);
+  white-space: nowrap;
+}
+.nav-links a:hover {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.nav-cta {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--fg) !important;
+  background: var(--bg-soft);
+}
+.nav-cta:hover {
+  border-color: var(--accent);
+  color: var(--accent) !important;
+}
+
+.theme-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-soft);
+  color: var(--fg-muted);
+  cursor: pointer;
+  flex: none;
+}
+.theme-toggle:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.theme-toggle svg {
+  display: block;
+}
+
+@media (max-width: 820px) {
+  .nav-links .hide-sm {
+    display: none;
+  }
+}
+
+/* ─── Utilities ──────────────────────────────────────────────────────────── */
+
+.center {
+  text-align: center;
+}
+.center-block {
+  text-align: center;
+  margin-top: 32px;
+}
+.muted {
+  color: var(--fg-muted);
+}
+
+/* ─── Hero (landing) ─────────────────────────────────────────────────────── */
+
+.hero {
+  background:
+    radial-gradient(
+      1200px 500px at 50% -180px,
+      rgb(45 212 191 / 22%),
+      transparent 70%
+    ),
+    linear-gradient(180deg, var(--brand-dark), var(--brand-dark-2));
+  color: #f1f5f9;
+  border-bottom: 1px solid var(--border);
+  padding: 92px 24px 84px;
+  text-align: center;
+  position: relative;
+  overflow: hidden;
+}
+
+.hero::after {
+  /* faint grid, evoking subnets without being loud about it */
+  content: "";
+  position: absolute;
+  inset: 0;
+  background-image: linear-gradient(
+      rgb(148 163 184 / 7%) 1px,
+      transparent 1px
+    ),
+    linear-gradient(90deg, rgb(148 163 184 / 7%) 1px, transparent 1px);
+  background-size: 48px 48px;
+  mask-image: radial-gradient(700px 340px at 50% 30%, #000, transparent 75%);
+  pointer-events: none;
+}
+
+.hero > * {
+  position: relative;
+  z-index: 1;
+}
+
+.hero-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 13px;
+  border-radius: 999px;
+  border: 1px solid rgb(45 212 191 / 35%);
+  background: rgb(45 212 191 / 10%);
+  color: var(--accent-bright);
+  font-size: 0.82rem;
+  font-weight: 500;
+  margin-bottom: 26px;
+}
+
+.hero h1 {
+  margin: 0 0 18px;
+  font-size: clamp(2.2rem, 5.2vw, 3.6rem);
+  line-height: 1.08;
+  letter-spacing: -0.033em;
+  font-weight: 800;
+  color: #fff;
+  border: 0;
+}
+
+.hero h1 .accent {
+  background: linear-gradient(96deg, var(--accent-bright), #5eead4);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.hero p.lede {
+  margin: 0 auto 34px;
+  max-width: 40rem;
+  font-size: clamp(1.02rem, 1.9vw, 1.2rem);
+  color: #cbd5e1;
+}
+
+.hero-actions {
+  display: flex;
+  gap: 12px;
+  justify-content: center;
+  flex-wrap: wrap;
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 22px;
+  border-radius: 10px;
+  font-weight: 600;
+  font-size: 0.98rem;
+  border: 1px solid transparent;
+  transition: transform 0.12s ease, background 0.12s ease,
+    border-color 0.12s ease;
+}
+.btn:hover {
+  text-decoration: none;
+  transform: translateY(-1px);
+}
+.btn-primary {
+  background: var(--accent);
+  color: #04201d !important;
+}
+.btn-primary:hover {
+  background: var(--accent-bright);
+}
+.btn-ghost {
+  border-color: rgb(203 213 225 / 28%);
+  color: #e2e8f0 !important;
+  background: rgb(255 255 255 / 4%);
+}
+.btn-ghost:hover {
+  border-color: var(--accent-bright);
+  color: #fff !important;
+}
+
+.hero-meta {
+  margin-top: 30px;
+  font-size: 0.85rem;
+  color: #94a3b8;
+}
+.hero-meta code {
+  background: rgb(255 255 255 / 8%);
+  padding: 2px 7px;
+  border-radius: 5px;
+  color: #cbd5e1;
+}
+
+/* ─── Sections ───────────────────────────────────────────────────────────── */
+
+.section {
+  max-width: var(--page);
+  margin: 0 auto;
+  padding: 76px 24px;
+}
+.section-alt {
+  background: var(--bg-soft);
+  border-block: 1px solid var(--border);
+  max-width: none;
+}
+.section-alt > .section-inner {
+  max-width: var(--page);
+  margin: 0 auto;
+}
+
+.section-head {
+  text-align: center;
+  max-width: 42rem;
+  margin: 0 auto 46px;
+}
+.section-head h2 {
+  font-size: clamp(1.6rem, 3vw, 2.1rem);
+  letter-spacing: -0.025em;
+  margin: 0 0 12px;
+  border: 0;
+  padding: 0;
+}
+.section-head p {
+  color: var(--fg-muted);
+  margin: 0;
+}
+
+.eyebrow {
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  font-size: 0.74rem;
+  font-weight: 700;
+  color: var(--accent);
+  margin-bottom: 10px;
+}
+
+/* ─── Cards ──────────────────────────────────────────────────────────────── */
+
+.grid {
+  display: grid;
+  gap: 20px;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 290px), 1fr));
+}
+
+.card {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 24px;
+  transition: border-color 0.14s ease, transform 0.14s ease,
+    box-shadow 0.14s ease;
+}
+.card:hover {
+  border-color: var(--accent);
+  transform: translateY(-2px);
+  box-shadow: var(--shadow);
+}
+.card h3 {
+  margin: 0 0 8px;
+  font-size: 1.06rem;
+  letter-spacing: -0.015em;
+  border: 0;
+  padding: 0;
+}
+.card p {
+  margin: 0;
+  color: var(--fg-muted);
+  font-size: 0.94rem;
+}
+.card .ico {
+  font-size: 1.5rem;
+  line-height: 1;
+  display: block;
+  margin-bottom: 14px;
+}
+a.card,
+a.card:hover {
+  text-decoration: none;
+  color: inherit;
+  display: block;
+}
+
+/* ─── Split (quick start) ────────────────────────────────────────────────── */
+
+.split {
+  display: grid;
+  gap: 24px;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 340px), 1fr));
+  align-items: start;
+}
+
+.panel {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: var(--bg);
+}
+.panel-head {
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-soft);
+}
+.panel-head h3 {
+  margin: 0;
+  font-size: 1rem;
+  border: 0;
+  padding: 0;
+}
+.panel-head p {
+  margin: 4px 0 0;
+  font-size: 0.86rem;
+  color: var(--fg-faint);
+}
+.panel pre {
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+  background: var(--bg-code);
+}
+
+/* ─── Screenshots ────────────────────────────────────────────────────────── */
+
+.shots {
+  display: grid;
+  gap: 18px;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 380px), 1fr));
+}
+.shot {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: var(--bg-soft);
+}
+.shot img {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+.shot-link {
+  display: block;
+  cursor: zoom-in;
+  position: relative;
+}
+.shot-link::after {
+  /* Affordance — the screenshots previously looked interactive but were not.
+     Kept subtle and revealed on hover rather than always-on. */
+  content: "⤢";
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  border-radius: 7px;
+  background: rgb(15 23 42 / 72%);
+  color: #fff;
+  font-size: 0.95rem;
+  opacity: 0;
+  transition: opacity 0.14s ease;
+}
+.shot-link:hover::after,
+.shot-link:focus-visible::after {
+  opacity: 1;
+}
+
+.doc-body img.zoomable {
+  cursor: zoom-in;
+}
+
+/* ─── Lightbox ───────────────────────────────────────────────────────────── */
+
+.lightbox {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  max-width: min(94vw, 1500px);
+  max-height: 94vh;
+  overflow: visible;
+}
+.lightbox::backdrop {
+  background: rgb(2 6 23 / 82%);
+  backdrop-filter: blur(3px);
+}
+.lightbox img {
+  display: block;
+  max-width: 100%;
+  max-height: 86vh;
+  width: auto;
+  height: auto;
+  border-radius: 10px;
+  background: var(--bg);
+  box-shadow: 0 24px 70px -18px rgb(0 0 0 / 70%);
+}
+.lightbox-caption {
+  margin: 12px 2px 0;
+  color: #cbd5e1;
+  font-size: 0.9rem;
+  text-align: center;
+}
+.lightbox-close {
+  position: absolute;
+  top: -14px;
+  right: -14px;
+  width: 34px;
+  height: 34px;
+  border-radius: 999px;
+  border: 1px solid rgb(148 163 184 / 45%);
+  background: #0f172a;
+  color: #e2e8f0;
+  font-size: 1.35rem;
+  line-height: 1;
+  cursor: pointer;
+}
+.lightbox-close:hover {
+  border-color: var(--accent-bright);
+  color: var(--accent-bright);
+}
+
+@media (max-width: 640px) {
+  .lightbox-close {
+    top: 6px;
+    right: 6px;
+  }
+}
+.shot figcaption {
+  padding: 11px 16px;
+  font-size: 0.86rem;
+  color: var(--fg-muted);
+  border-top: 1px solid var(--border);
+}
+
+/* ─── Docs page ──────────────────────────────────────────────────────────── */
+
+.doc {
+  max-width: var(--page);
+  margin: 0 auto;
+  padding: 44px 24px 90px;
+}
+
+.doc-crumb {
+  font-size: 0.86rem;
+  color: var(--fg-faint);
+  margin-bottom: 26px;
+}
+.doc-crumb a {
+  color: var(--fg-muted);
+}
+
+.doc-body {
+  /* One column, one right edge.
+     This previously capped every direct child at --measure (46rem) while
+     exempting headings, rules, tables and code at 62rem. The result was two
+     competing right edges down the page: h2 underlines and <hr> ran a long
+     way past the paragraphs they belonged to, and each table or code block
+     visibly jutted out past the prose above it. A single width for everything
+     is what makes the page read as aligned. Content too wide to fit scrolls
+     inside its own box (see table/pre below) rather than widening the column. */
+  max-width: 58rem;
+}
+
+.doc-body h1 {
+  font-size: clamp(1.9rem, 3.4vw, 2.5rem);
+  letter-spacing: -0.03em;
+  line-height: 1.15;
+  margin: 0 0 8px;
+}
+.doc-body h2 {
+  font-size: 1.5rem;
+  letter-spacing: -0.02em;
+  margin: 2.3em 0 0.7em;
+  padding-bottom: 0.3em;
+  border-bottom: 1px solid var(--border);
+}
+.doc-body h3 {
+  font-size: 1.16rem;
+  margin: 1.9em 0 0.6em;
+}
+.doc-body h4 {
+  font-size: 1rem;
+  margin: 1.6em 0 0.5em;
+  color: var(--fg-muted);
+}
+
+.doc-body img,
+.doc-body svg {
+  max-width: 100%;
+  height: auto;
+}
+
+.doc-body pre {
+  background: var(--bg-code);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px 16px;
+  overflow-x: auto;
+  font-size: 0.875rem;
+  line-height: 1.5;
+}
+.doc-body :not(pre) > code {
+  background: var(--bg-code);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 0.12em 0.38em;
+  font-size: 0.88em;
+}
+
+.doc-body table {
+  display: block;
+  width: max-content;
+  max-width: 100%;
+  overflow-x: auto;
+  border-collapse: collapse;
+  font-size: 0.92rem;
+  margin: 1.2em 0;
+}
+.doc-body th,
+.doc-body td {
+  border: 1px solid var(--border);
+  padding: 8px 13px;
+  text-align: left;
+  vertical-align: top;
+}
+.doc-body th {
+  background: var(--bg-soft);
+  font-weight: 600;
+}
+
+.doc-body blockquote {
+  margin: 1.3em 0;
+  padding: 2px 18px;
+  border-left: 3px solid var(--accent);
+  background: var(--bg-soft);
+  border-radius: 0 8px 8px 0;
+  color: var(--fg-muted);
+}
+.doc-body blockquote > :first-child {
+  margin-top: 0.7em;
+}
+.doc-body blockquote > :last-child {
+  margin-bottom: 0.7em;
+}
+
+.doc-body hr {
+  border: 0;
+  border-top: 1px solid var(--border);
+  margin: 2.4em 0;
+}
+
+.doc-body ul,
+.doc-body ol {
+  padding-left: 1.35em;
+}
+.doc-body li + li {
+  margin-top: 0.3em;
+}
+
+/* ─── Footer ─────────────────────────────────────────────────────────────── */
+
+.footer {
+  border-top: 1px solid var(--border);
+  background: var(--bg-soft);
+  padding: 46px 24px;
+  font-size: 0.9rem;
+  color: var(--fg-muted);
+}
+.footer-inner {
+  max-width: var(--page);
+  margin: 0 auto;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 18px 34px;
+  align-items: center;
+}
+.footer-links {
+  display: flex;
+  gap: 20px;
+  flex-wrap: wrap;
+  /* margin-left:auto pushes the links right on one line, but once the footer
+     wraps that auto margin still applies and strands them mid-row. Pairing it
+     with a flexible basis keeps them left-aligned under the brand instead. */
+  margin-left: auto;
+}
+@media (max-width: 640px) {
+  .footer-links {
+    margin-left: 0;
+  }
+}
+.ddi-mark {
+  color: var(--accent);
+}
+.footer a {
+  color: var(--fg-muted);
+}
+.footer a:hover {
+  color: var(--accent);
+}
+
+@media (max-width: 640px) {
+  body {
+    font-size: 16px;
+  }
+  .hero {
+    padding: 66px 20px 60px;
+  }
+  .section {
+    padding: 56px 20px;
+  }
+  .doc {
+    padding: 28px 20px 70px;
+  }
+}
