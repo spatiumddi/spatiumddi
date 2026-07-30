@@ -451,3 +451,29 @@ def test_forward_transports_are_driver_gated() -> None:
     # do53 + tls stay ungated — every agent-managed driver can do both.
     assert "do53" not in _TRANSPORT_DRIVER_GATE
     assert "tls" not in _TRANSPORT_DRIVER_GATE
+
+
+def test_doq_is_exposed_on_the_options_api() -> None:
+    """Regression: doq_enabled/doq_port existed on the model and in
+    validation but on neither API schema, so DoQ could not be set or read
+    at all and the validation was unreachable."""
+    from app.api.v1.dns.router import ServerOptionsResponse, ServerOptionsUpdate
+
+    assert "doq_enabled" in ServerOptionsUpdate.model_fields
+    assert "doq_port" in ServerOptionsUpdate.model_fields
+    assert "doq_enabled" in ServerOptionsResponse.model_fields
+    assert "doq_port" in ServerOptionsResponse.model_fields
+
+
+def test_encrypted_transport_ports_reach_the_firewall_for_technitium() -> None:
+    """Regression: all three firewall renderers gated the operator-chosen
+    DoT/DoH ports on bind9/powerdns, so a Technitium listener came up
+    behind a closed nftables port. DoQ additionally needs the UDP list."""
+    import inspect
+
+    from app.services.appliance import firewall, firewall_merge
+
+    for mod in (firewall, firewall_merge):
+        src = inspect.getsource(mod)
+        assert "dns-technitium" in src, mod.__name__
+        assert "dns_encrypted_udp_ports" in src, mod.__name__

@@ -692,31 +692,62 @@ class TechnitiumDriver(DriverBase):
     def _apply_catalog(
         self, token: str, catalog: dict[str, Any] | None, payload: list[dict[str, Any]]
     ) -> None:
-        """Create the catalog zone and enrol this server's primaries in it.
+        """Apply the group's catalog-zone role.
 
-        Producer only. A consumer joins by creating a ``SecondaryCatalog``
-        zone pointed at the producer, which is a zone-create rather than a
-        per-member option, so it arrives through the normal zone list.
+        **Producer** creates the ``Catalog`` zone and stamps
+        ``catalog=<name>`` onto each primary this server owns.
+
+        **Consumer** creates a ``SecondaryCatalog`` zone pointed at the
+        producer. That zone is NOT in the bundle's zone list — the control
+        plane ships it as a catalog block, not as a zone row — so it has to
+        be created here or a consumer silently does nothing at all.
+
+        **Neither** (catalog turned off) clears membership. Without that,
+        disabling catalog zones would leave every member permanently
+        enrolled, because nothing else ever touches the option.
         """
-        if not catalog or catalog.get("mode") != "producer":
+        cat_name = (catalog or {}).get("zone_name") or ""
+        cat_name = cat_name.rstrip(".")
+        mode = (catalog or {}).get("mode")
+
+        if mode == "consumer":
+            producer = (catalog or {}).get("producer_addr")
+            if not (cat_name and producer):
+                log.warning(
+                    "technitium_catalog_consumer_incomplete",
+                    zone=cat_name or None,
+                    producer=producer,
+                )
+                return
+            self._ensure_zone_exists(
+                token,
+                {
+                    "zone": cat_name,
+                    "type": "SecondaryCatalog",
+                    "masters": [str(producer)],
+                },
+            )
             return
-        cat_name = (catalog.get("zone_name") or "").rstrip(".")
-        if not cat_name:
-            return
-        self._ensure_zone_exists(token, {"zone": cat_name, "type": "Catalog"})
+
+        if mode == "producer" and cat_name:
+            self._ensure_zone_exists(token, {"zone": cat_name, "type": "Catalog"})
+
+        # Producer stamps the name on; disabled clears it. Empty string is
+        # how Technitium clears the field (verified — it reads back null).
+        desired = cat_name if (mode == "producer" and cat_name) else ""
         for entry in payload:
             if entry.get("type") != "Primary":
                 continue
             zone = entry["zone"]
             resp = self._call(
-                token, "POST", "zones/options/set", {"zone": zone, "catalog": cat_name}
+                token, "POST", "zones/options/set", {"zone": zone, "catalog": desired}
             )
             body = resp.json()
             if body.get("status") != "ok":
                 log.warning(
                     "technitium_catalog_membership_failed",
                     zone=zone,
-                    catalog=cat_name,
+                    catalog=desired or None,
                     error=body.get("errorMessage"),
                 )
 
@@ -968,7 +999,22 @@ class TechnitiumDriver(DriverBase):
         if protocol is None:
             log.warning("technitium_forward_transport_unsupported", transport=transport)
             return
+
         if not forwarders:
+            # Clearing has to be an explicit empty write, not an early
+            # return: removing every forwarder in the UI would otherwise
+            # leave the daemon resolving through the old upstreams forever,
+            # because nothing else ever touches the setting.
+            resp = self._call(
+                token, "POST", "settings/set", {"forwarders": "", "forwarderProtocol": "Udp"}
+            )
+            body = resp.json()
+            if body.get("status") != "ok":
+                log.error(
+                    "technitium_forwarders_clear_failed", error=body.get("errorMessage")
+                )
+            else:
+                log.info("technitium_forwarders_cleared")
             return
 
         if transport != "do53":
@@ -1190,15 +1236,18 @@ class TechnitiumDriver(DriverBase):
                     },
                 )
                 body = resp.json()
-                if body.get("status") == "error" and "no such record" not in (
-                    body.get("errorMessage") or ""
-                ).lower():
-                    log.warning(
-                        "technitium_reconcile_delete_failed",
-                        zone=zone,
-                        record=rec,
-                        error=body.get("errorMessage"),
-                    )
+                if body.get("status") == "error":
+                    # "no such record" means it was already gone — a no-op,
+                    # not a deletion. Counting it (or the failure case) would
+                    # report churn that never happened, which is the same
+                    # phantom the apex-NS filter above exists to prevent.
+                    if "no such record" not in (body.get("errorMessage") or "").lower():
+                        log.warning(
+                            "technitium_reconcile_delete_failed",
+                            zone=zone,
+                            record=rec,
+                            error=body.get("errorMessage"),
+                        )
                 else:
                     deleted += 1
 
@@ -1211,15 +1260,16 @@ class TechnitiumDriver(DriverBase):
                     {**rec, "zone": zone, "overwrite": "false"},
                 )
                 body = resp.json()
-                if body.get("status") == "error" and "already exists" not in (
-                    body.get("errorMessage") or ""
-                ).lower():
-                    log.error(
-                        "technitium_reconcile_add_failed",
-                        zone=zone,
-                        record=rec,
-                        error=body.get("errorMessage"),
-                    )
+                if body.get("status") == "error":
+                    # "already exists" is a no-op, not an add — same
+                    # reasoning as the delete branch above.
+                    if "already exists" not in (body.get("errorMessage") or "").lower():
+                        log.error(
+                            "technitium_reconcile_add_failed",
+                            zone=zone,
+                            record=rec,
+                            error=body.get("errorMessage"),
+                        )
                     continue
                 added += 1
             if added or deleted:

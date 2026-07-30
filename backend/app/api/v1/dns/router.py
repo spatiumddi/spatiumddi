@@ -527,6 +527,10 @@ class ServerOptionsUpdate(BaseModel):
     # over-long value 422s at the boundary instead of 500-ing on asyncpg's
     # StringDataRightTruncation at commit.
     doh_path: str | None = Field(default=None, max_length=128)
+    # DNS-over-QUIC (#741) — Technitium-only, and UDP, so it may share a
+    # port number with DoT without colliding.
+    doq_enabled: bool | None = None
+    doq_port: int | None = Field(default=None, ge=1, le=65535)
     tls_certificate_id: uuid.UUID | None = None
     forward_transport: str | None = None
     forward_tls_hostname: str | None = Field(default=None, max_length=255)
@@ -661,6 +665,8 @@ class ServerOptionsResponse(BaseModel):
     doh_enabled: bool
     doh_port: int
     doh_path: str
+    doq_enabled: bool
+    doq_port: int
     tls_certificate_id: uuid.UUID | None
     forward_transport: str
     forward_tls_hostname: str | None
@@ -2404,11 +2410,11 @@ async def _assert_encrypted_transport_sane(opts: DNSServerOptions, db: DB) -> No
     port bind that would fail at runtime. Catching it on the API boundary
     turns an agent that won't start into a 422 the operator can read.
     """
-    if opts.dot_enabled or opts.doh_enabled:
+    if opts.dot_enabled or opts.doh_enabled or opts.doq_enabled:
         if opts.tls_certificate_id is None:
             raise HTTPException(
                 422,
-                "A TLS certificate is required to enable DoT or DoH. "
+                "A TLS certificate is required to enable DoT, DoH or DoQ. "
                 "Upload or issue one under Appliance → Web UI Certificate first.",
             )
         cert = await db.get(ApplianceCertificate, opts.tls_certificate_id)
@@ -2467,23 +2473,50 @@ async def _assert_encrypted_transport_sane(opts: DNSServerOptions, db: DB) -> No
                 )
 
     # Driver gates for the transports only Technitium speaks (#741).
+    #
+    # EVERY driver in the group has to support the setting, not merely one
+    # of them — same subset semantics as ``_check_driver_gated_record_type``.
+    # An "any driver matches" test would let a mixed bind9 + technitium
+    # group save forward_transport="https", and bind9 would then quietly
+    # keep forwarding in cleartext on :53 while the UI claimed DoH.
     drivers = set(await _group_driver_names(db, opts.group_id))
     allowed = _TRANSPORT_DRIVER_GATE.get(opts.forward_transport)
-    if allowed is not None and drivers and not (drivers & allowed):
-        raise HTTPException(
-            422,
-            f"forward_transport {opts.forward_transport!r} is only supported by "
-            f"{', '.join(sorted(allowed))} — this group runs "
-            f"{', '.join(sorted(drivers))}. BIND9 has no client-side HTTP or "
-            "QUIC transport, so it can only forward over do53 or tls.",
-        )
-    if opts.doq_enabled and drivers and "technitium" not in drivers:
-        raise HTTPException(
-            422,
-            "DNS-over-QUIC is only supported by the Technitium driver — this "
-            f"group runs {', '.join(sorted(drivers))}.",
-        )
+    if allowed is not None and drivers:
+        incompatible = drivers - allowed
+        if incompatible:
+            raise HTTPException(
+                422,
+                f"forward_transport {opts.forward_transport!r} is not supported by "
+                f"{', '.join(sorted(incompatible))} in this group. BIND9 has no "
+                "client-side HTTP or QUIC transport, so it can only forward over "
+                "do53 or tls — move those servers to their own group, or pick a "
+                "transport every driver in this group can speak.",
+            )
+    if opts.doq_enabled and drivers:
+        incompatible = drivers - {"technitium"}
+        if incompatible:
+            raise HTTPException(
+                422,
+                "DNS-over-QUIC is only supported by the Technitium driver, but "
+                f"this group also runs {', '.join(sorted(incompatible))}.",
+            )
 
+    # Every encrypted transport needs a name, not just DoT.
+    #
+    # For bind9 (tls) it is what ``remote-hostname`` validates against, so
+    # the requirement is conditional on verification being on. For
+    # technitium it is stricter: the daemon rejects an IP outright
+    # ("Address must be a domain name") for tls/https/quic, so without a
+    # hostname the agent has nothing to send and skips the forwarder apply
+    # entirely — leaving whatever forwarders were there before. Requiring
+    # it up front turns that silent staleness into a 422.
+    if opts.forward_transport in ("https", "quic") and not opts.forward_tls_hostname:
+        raise HTTPException(
+            422,
+            f"forward_tls_hostname is required when forwarding over "
+            f"{opts.forward_transport} — the upstream is addressed by name, not "
+            "by IP. Set the provider's hostname (e.g. cloudflare-dns.com).",
+        )
     if (
         opts.forward_transport == "tls"
         and opts.forward_tls_verify
@@ -2578,7 +2611,15 @@ async def update_options(
     # per-appliance desired-state change wakes the appliance channel too.
     if any(
         f in changes
-        for f in ("dot_enabled", "dot_port", "doh_enabled", "doh_port", "tls_certificate_id")
+        for f in (
+            "dot_enabled",
+            "dot_port",
+            "doh_enabled",
+            "doh_port",
+            "doq_enabled",
+            "doq_port",
+            "tls_certificate_id",
+        )
     ):
         await _collect_appliance_wakes_for_dns_group(db, group_id)
     await db.commit()

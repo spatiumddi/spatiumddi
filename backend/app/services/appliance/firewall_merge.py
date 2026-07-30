@@ -550,7 +550,7 @@ def compile_firewall_from_policies(
     # derives them from the assigned DNS group's options and ships them on the
     # role assignment. Keep byte-identical to ``firewall.compile_firewall_body``
     # + the supervisor's ``firewall_renderer.render_drop_in``.
-    if any(r in ctx.roles for r in ("dns-bind9", "dns-powerdns")):
+    if any(r in ctx.roles for r in ("dns-bind9", "dns-powerdns", "dns-technitium")):
         for raw in ra.get("dns_encrypted_tcp_ports") or []:
             try:
                 port = int(raw)
@@ -558,6 +558,16 @@ def compile_firewall_from_policies(
                 continue
             if 1 <= port <= 65535:
                 role_tcp.add(port)
+        # #741 — DoQ is UDP. Same operator-chosen shape, different table:
+        # adding it to role_tcp would leave the listener unreachable while
+        # the rendered ruleset looked correct.
+        for raw in ra.get("dns_encrypted_udp_ports") or []:
+            try:
+                port = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if 1 <= port <= 65535:
+                role_udp.add(port)
     if role_udp or role_tcp:
         lines.append("")
         lines.append("# ── Per-role service ports ─────────────────────────────")

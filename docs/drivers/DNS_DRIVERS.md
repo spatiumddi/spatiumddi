@@ -697,7 +697,7 @@ Three behaviours worth knowing, all confirmed against a live daemon:
 
 **TSIG keys** live in *global* settings, not per zone. The wire format is a **flat pipe-delimited token list read in triples** — `name|secret|algorithm|name2|secret2|algorithm2|…`. Not JSON, and not `name|algorithm|secret` (that fails with "TSIG algorithm is not supported", because it reads the secret as the algorithm). `settings/set` **replaces the whole list**, so keys an operator added directly in the Technitium console are dropped on the next sync — the same control-plane-is-truth stance the rest of the driver takes, but worth knowing. Note also that `zoneTransferTsigKeyNames` accepts a key the server does not have, so keys are pushed *before* anything references them.
 
-**Catalog zones (RFC 9432)** work as producer: the agent creates the `Catalog` zone and sets `catalog=<name>` on each primary it owns. A consumer joins by creating a `SecondaryCatalog` zone pointed at the producer, which arrives through the normal zone list rather than as a per-member option.
+**Catalog zones (RFC 9432)** work in both roles. As **producer** the agent creates the `Catalog` zone and stamps `catalog=<name>` onto each primary it owns. As **consumer** it creates a `SecondaryCatalog` zone pointed at the producer — note that zone is *not* in the bundle's zone list (the control plane ships it as a catalog block, not a zone row), so `_apply_catalog` has to create it or a consumer silently does nothing at all. Turning catalog zones off clears membership by writing `catalog=""`, which is how Technitium unsets the field; without that, disabling the feature would leave every member permanently enrolled.
 
 ### 4B.3b DNSSEC (issue #740)
 

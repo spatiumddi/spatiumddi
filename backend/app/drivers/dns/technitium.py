@@ -293,7 +293,7 @@ class TechnitiumDriver(DNSDriver):
                 if rtype not in _SUPPORTED_RECORD_TYPES:
                     errors.append(
                         f"zone {z.name!r}: record type {rtype!r} not supported "
-                        f"by the v1 Technitium driver"
+                        f"by the Technitium driver"
                     )
         if bundle.views:
             errors.append(

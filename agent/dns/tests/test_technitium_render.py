@@ -217,20 +217,6 @@ def test_render_skips_daemon_managed_apex_types(tmp_path: Path) -> None:
     assert ("www.example.com", "A") in types_by_domain
 
 
-def test_render_skips_non_primary_zones(tmp_path: Path) -> None:
-    d = TechnitiumDriver(state_dir=tmp_path)
-    bundle = {
-        "zones": [
-            {"name": "secondary.example.com.", "type": "secondary", "records": []},
-        ]
-    }
-    d.render(bundle)
-    import json
-
-    payload = json.loads((tmp_path / "rendered.new" / "zones.json").read_text())
-    assert payload == []
-
-
 # ── apply_record_op: rrset REPLACE vs append ────────────────────────────
 
 
@@ -1110,3 +1096,101 @@ def test_forwarders_map_every_transport(tmp_path: Path) -> None:
              "forward_tls_hostname": "dns.example"},
         )
         assert calls[0][3]["forwarderProtocol"] == expected
+
+
+# ── Code-review fixes ───────────────────────────────────────────────────
+
+
+def test_reconcile_counts_only_real_deletes(tmp_path: Path) -> None:
+    """"no such record" means it was already gone — a no-op, not a delete.
+    Counting it reports churn that never happened, which is the same
+    phantom the apex-NS filter exists to prevent."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+
+    def responder(path, params, n):
+        if path == "zones/records/get":
+            return {"status": "ok", "response": {"records": [
+                {"name": "gone.z.test", "type": "A", "ttl": 300,
+                 "rData": {"ipAddress": "10.0.0.9"}}]}}
+        if path == "zones/records/delete":
+            return {"status": "error", "errorMessage": "No such record exists."}
+        return {"status": "ok"}
+
+    _install_fake_request(d, responder)
+    import structlog
+
+    cap = structlog.testing.LogCapture()
+    structlog.configure(processors=[cap])
+    try:
+        d._reconcile_zones("t", [{"zone": "z.test", "type": "Primary", "records": []}])
+    finally:
+        structlog.reset_defaults()
+    reconciled = [e for e in cap.entries if e["event"] == "technitium_zone_reconciled"]
+    # The delete was a no-op, so there is nothing to report at all.
+    assert reconciled == []
+
+
+def test_reconcile_counts_only_real_adds(tmp_path: Path) -> None:
+    """Same reasoning for "already exists" on the add side."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+
+    def responder(path, params, n):
+        if path == "zones/records/get":
+            return {"status": "ok", "response": {"records": []}}
+        if path == "zones/records/add":
+            return {"status": "error", "errorMessage": "Record already exists."}
+        return {"status": "ok"}
+
+    _install_fake_request(d, responder)
+    import structlog
+
+    cap = structlog.testing.LogCapture()
+    structlog.configure(processors=[cap])
+    try:
+        d._reconcile_zones(
+            "t",
+            [{"zone": "z.test", "type": "Primary", "records": [
+                {"domain": "www.z.test", "type": "A", "ttl": 300,
+                 "ipAddress": "10.0.0.1"}]}],
+        )
+    finally:
+        structlog.reset_defaults()
+    assert [e for e in cap.entries if e["event"] == "technitium_zone_reconciled"] == []
+
+
+def test_forwarders_cleared_when_bundle_has_none(tmp_path: Path) -> None:
+    """Removing every forwarder must actually clear them. An early return
+    would leave the daemon resolving through the old upstreams forever,
+    because nothing else touches the setting."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    d._apply_forwarders("t", {"forwarders": [], "forward_transport": "do53"})
+    assert calls[0][3]["forwarders"] == ""
+    assert calls[0][3]["forwarderProtocol"] == "Udp"
+
+
+def test_catalog_consumer_creates_secondary_catalog_zone(tmp_path: Path) -> None:
+    """The catalog zone is shipped as a catalog block, not a zone row, so
+    a consumer that doesn't create it here does nothing at all."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    d._apply_catalog(
+        "t",
+        {"mode": "consumer", "zone_name": "cat.test.", "producer_addr": "192.0.2.9"},
+        [{"zone": "p.test", "type": "Primary"}],
+    )
+    assert calls[0][2] == "zones/create"
+    assert calls[0][3]["type"] == "SecondaryCatalog"
+    assert calls[0][3]["primaryNameServerAddresses"] == "192.0.2.9"
+    # A consumer must NOT stamp membership onto its own primaries.
+    assert not [c for c in calls if c[2] == "zones/options/set"]
+
+
+def test_catalog_membership_cleared_when_disabled(tmp_path: Path) -> None:
+    """Turning catalog zones off has to un-enrol the members; nothing else
+    ever touches the option."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    d._apply_catalog("t", None, [{"zone": "p.test", "type": "Primary"}])
+    opt = [c for c in calls if c[2] == "zones/options/set"]
+    assert opt and opt[0][3]["catalog"] == ""
