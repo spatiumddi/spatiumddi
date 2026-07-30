@@ -39,7 +39,7 @@ Always read the relevant spec doc(s) before writing code for a feature area.
 | `docs/TROUBLESHOOTING.md` | Recovery recipes: accidentally deleted agent rows, password reset, subnet delete refused |
 | `docs/features/IPAM.md` | IP Space/Block/Subnet/Address management, VLAN/VXLAN, custom fields, import/export, tree UI |
 | `docs/features/DHCP.md` | DHCP servers, scopes, pools, static assignments, DDNS, caching, Windows DHCP (Path A) |
-| `docs/features/DNS.md` | DNS servers, zones, records, views, server groups, blocking lists, DDNS, zone tree, Windows DNS (Path A + B), sync-with-servers reconciliation |
+| `docs/features/DNS.md` | DNS servers, zones, records, views, server groups, blocking lists, DDNS, zone tree, Windows DNS (Path A + B), Technitium, encrypted transports (DoT / DoH / DoQ), DNS threat analytics, sync-with-servers reconciliation |
 | `docs/features/AUTH.md` | Authentication, LDAP/OIDC/SAML, roles, group-scoped permissions, API tokens |
 | `docs/features/ACME.md` | ACME DNS-01 provider — acme-dns-compatible HTTP surface for LE / public-CA cert issuance |
 | `docs/features/INTEGRATIONS.md` | Read-only Kubernetes + Docker mirror integrations; setup, semantics, dashboard surface |
@@ -59,7 +59,7 @@ Always read the relevant spec doc(s) before writing code for a feature area.
 | `k8s/base/` | Core K8s manifests (namespace, API, worker, frontend, migrate job) |
 | `k8s/ha/` | HA add-ons: CloudNativePG cluster, Redis Sentinel, Patroni Compose |
 | `docs/drivers/DHCP_DRIVERS.md` | Kea + Windows DHCP driver internals |
-| `docs/drivers/DNS_DRIVERS.md` | BIND9 + PowerDNS + Windows DNS (Path A + B) driver internals, incremental update strategy |
+| `docs/drivers/DNS_DRIVERS.md` | BIND9 + PowerDNS + Technitium + Windows DNS (Path A + B) driver internals, incremental update strategy |
 
 ---
 
@@ -378,16 +378,15 @@ separable pieces, of which DICOM (#723) is the anchor and the
 probe-safety fix (#722) is not a vertical at all.
 
 - ✅ [**AV / Audio-Video-over-IP — Dante · AES67 · SMPTE 2110 · NDI**](https://github.com/spatiumddi/spatiumddi/issues/540)
-  — Phase 1 + Copilot tools merged to `main` (#714), pending release cut:
-  `network.av` module, `av_flow_profile` 1:1 AV descriptor on
-  `multicast_group` + operator-declared `av_reserved_range` per
+  — shipped `2026.07.30-1` (#714): `network.av` module,
+  `av_flow_profile` 1:1 AV descriptor on `multicast_group` + operator-declared `av_reserved_range` per
   protocol, allocation-conflict preview, 2 conformity checks, 3 MCP
   tools. **Phase 2 (Dante mDNS) blocked** — #40 closed not-planned.
   **Phase 3 (NMOS IS-04 mirror) deferred** — a full pull integration
   with both dashboard surfaces, separable into its own change.
 - ✅ [**BACnet/IP building automation**](https://github.com/spatiumddi/spatiumddi/issues/541)
-  — Phase 1 + Copilot tools merged to `main` (#714), pending release cut:
-  `network.bacnet` module, `bacnet_device` with the internetwork-wide
+  — shipped `2026.07.30-1` (#714): `network.bacnet` module,
+  `bacnet_device` with the internetwork-wide
   `uq_bacnet_device_instance` constraint (the differentiating hook),
   BBMD flag + BDT/FDT snapshots, 3 conformity checks incl.
   `bbmd_one_per_subnet` failing in both directions, 3 MCP tools.
@@ -395,18 +394,16 @@ probe-safety fix (#722) is not a vertical at all.
   carrying a real payload; the only generic prober sends an empty
   datagram.
 - ✅ [**Industrial / OT — PROFINET · EtherNet/IP · Modbus TCP · OPC UA**](https://github.com/spatiumddi/spatiumddi/issues/542)
-  — Phase 1 + Phase 4 merged to `main` (#714), pending release cut: `network.ot`
-  module, `ot_device` 1:1 descriptor + `ot_zone` Purdue zoning
-  (`Numeric(2,1)` so level 3.5 / the DMZ is representable), CSV import
+  — shipped `2026.07.30-1` (#714): `network.ot` module, `ot_device`
+  1:1 descriptor + `ot_zone` Purdue zoning (`Numeric(2,1)` so level 3.5 / the DMZ is representable), CSV import
   of engineering-tool exports, 2 conformity checks, 3 MCP tools.
   Read-only identification only — control-protocol writes are
   permanently out of scope. **Phase 2 (routable probes) deferred** —
   nmap runs NSE but nothing parses `<script>` output. **Phase 3
   (PROFINET DCP) deferred** — raw L2, needs a container capability grant.
-- 🟡 [**DICOM AE Title registry + peer-association map**](https://github.com/spatiumddi/spatiumddi/issues/723)
-  — Phase 1 merged to a branch, pending PR/release: `network.dicom`
-  module, `dicom_ae` with the institution-wide `uq_dicom_ae_title`
-  constraint (the differentiating hook — PS3.15 Annex H specifies a
+- ✅ [**DICOM AE Title registry + peer-association map**](https://github.com/spatiumddi/spatiumddi/issues/723)
+  — Phase 1 shipped `2026.07.30-1` (#731): `network.dicom` module,
+  `dicom_ae` with the institution-wide `uq_dicom_ae_title` constraint (the differentiating hook — PS3.15 Annex H specifies a
   registry for exactly this and nobody deploys one), `dicom_peer`
   directed AE→AE edges + a renumber-impact view, CSV import of the
   estate's AE table, 4 conformity checks, 3 MCP tools. `ip_address_id`
@@ -419,8 +416,8 @@ probe-safety fix (#722) is not a vertical at all.
   Business Associate. **C-ECHO verification probe deferred** to its own
   issue: it is the one probe in the family that does *not* inherit the
   agent↔subnet blocker (routable unicast TCP), but it must respect #722.
-- 🟡 [**Fragile-device "do not probe" flag**](https://github.com/spatiumddi/spatiumddi/issues/722)
-  — merged to a branch, pending PR/release. **Not a vertical and not
+- ✅ [**Fragile-device "do not probe" flag**](https://github.com/spatiumddi/spatiumddi/issues/722)
+  — shipped `2026.07.30-1` (#731). **Not a vertical and not
   behind a feature module**: a constraint on our own behaviour and a
   correctness fix to three shipped features (#23 sweeps, `tools.nmap`,
   `tools.network`), so hiding it behind a default-off module would leave
@@ -455,8 +452,8 @@ suggestion, free-space treemap.
 
 - ✅ [**DNSSEC**](https://github.com/spatiumddi/spatiumddi/issues/49) — shipped `2026.06.04-1`: BIND9 inline-signing, policies, DS export, rollover. `DNSSECPolicy` (reusable `dnssec-policy`) + `DNSKey` (public per-zone key state — no private-key custody; BIND owns + auto-rotates keys), config-driven `dnssec-policy { … }` + per-zone `inline-signing yes;`. Migration `f2b6d4a91c37`. PowerDNS online-signing landed separately in `2026.05.11-1`.
 - ✅ [**DoT / DoH — inbound listener + encrypted upstream forwarding**](https://github.com/spatiumddi/spatiumddi/issues/50) —
-  merged to `main` (#692), pending release cut. Serves DoT (853) / DoH
-  (`/dns-query`) to local clients *and* forwards to upstream resolvers
+  shipped `2026.07.30-1` (#692). Serves DoT (853) / DoH (`/dns-query`)
+  to local clients *and* forwards to upstream resolvers
   over TLS instead of plaintext 53. Both halves are per-group, default-off
   (existing installs render a byte-identical `named.conf`), and additive —
   the Do53 listener is unaffected. **BIND9** renders `tls` / `http`
@@ -490,13 +487,13 @@ suggestion, free-space treemap.
 - ✅ [**Built-in network tools page**](https://github.com/spatiumddi/spatiumddi/issues/58) — shipped `2026.06.11-1`: a `/tools` page (ping / traceroute / mtr / dig / whois over sandboxed argv, port-test / TLS-cert over sockets, DNS-propagation, MAC-vendor), permission-gated + Redis rate-limited, with 7 MCP tools.
 - ✅ [**PCAP capture trigger**](https://github.com/spatiumddi/spatiumddi/issues/59) — shipped `2026.06.15-1`: on-demand tcpdump as an RBAC-gated/audited Tools page, both server-container and appliance-host (real-NIC) vantages, keep-partial-on-Stop, `.pcap` download, 4 Operator Copilot tools.
 - ❌ [**ACL / prefix-list generator**](https://github.com/spatiumddi/spatiumddi/issues/60) — **closed as not planned** 2026-06-17, in the same triage pass that closed #40. No rationale was recorded on the issue; re-open it rather than re-filing if the need comes back.
-- ✅ [**Config-drift report (full record diff)**](https://github.com/spatiumddi/spatiumddi/issues/61) — **backend shipped `2026.06.11-1`**: `GET …/zones/{id}/drift` AXFRs the live zone from every server in the group and diffs it against the DB — extra-on-server (manual host change) / missing-on-server / in-sync, per server, read-only — plus a `find_dns_zone_drift` MCP tool. **UI merged to `main` (#735), pending release cut** — a Drift tab on the zone detail, fetched on demand because one call fans out an AXFR to every server in the group. That PR also fixed the reason nothing had ever consumed the endpoint: `dns.query.xfr` takes an IP *literal* and raises a bare, message-less `ValueError` for a hostname before sending a packet, so every hostname-addressed server failed 100% of the time reporting `""` as the error. **Known gap — [#734](https://github.com/spatiumddi/spatiumddi/issues/734):** agent-managed BIND9 now reaches the server and gets `REFUSED`, because the control plane doesn't TSIG-sign its AXFR and the agent grants `allow-transfer` only to the group key on dynamic zones. The tab works today for Windows Path B + the cloud drivers (API pulls, not AXFR), not for BIND9.
+- ✅ [**Config-drift report (full record diff)**](https://github.com/spatiumddi/spatiumddi/issues/61) — **backend shipped `2026.06.11-1`**: `GET …/zones/{id}/drift` AXFRs the live zone from every server in the group and diffs it against the DB — extra-on-server (manual host change) / missing-on-server / in-sync, per server, read-only — plus a `find_dns_zone_drift` MCP tool. **UI shipped `2026.07.30-1` (#735)** — a Drift tab on the zone detail, fetched on demand because one call fans out an AXFR to every server in the group. That PR also fixed the reason nothing had ever consumed the endpoint: `dns.query.xfr` takes an IP *literal* and raises a bare, message-less `ValueError` for a hostname before sending a packet, so every hostname-addressed server failed 100% of the time reporting `""` as the error. **Known gap — [#734](https://github.com/spatiumddi/spatiumddi/issues/734):** agent-managed BIND9 now reaches the server and gets `REFUSED`, because the control plane doesn't TSIG-sign its AXFR and the agent grants `allow-transfer` only to the group key on dynamic zones. The tab works today for Windows Path B + the cloud drivers (API pulls, not AXFR), not for BIND9.
 
 #### Workflow & RBAC
 
 - ✅ [**Approval workflows for risky ops — P1**](https://github.com/spatiumddi/spatiumddi/issues/62) — shipped `2026.06.25-1`: two-person rule over the 6 delete handlers behind the default-off `governance.approvals` module + a self-governance lock; lifecycle API + Change Requests admin page + 4 MCP tools + Change Approver builtin role. The issue closed on P1, so its P2 scope was re-filed ↓.
 - ⬜ [**Approval workflows — P2 (bulk ops / factory reset / import gating + approval notifications)**](https://github.com/spatiumddi/spatiumddi/issues/717) — build on the shipped `governance.approvals` module + change-request lifecycle, not a parallel mechanism.
-- ✅ [**Self-service request portal — IP / subnet / DNS / DHCP requests with approve-and-provision**](https://github.com/spatiumddi/spatiumddi/issues/696) — the Phase 5 "IP request workflows" item. #62's approval engine pointed the other way: a low-privilege user asks for something they cannot do themselves, an approver reviews it with the operation's own preview, and approving **provisions** it. Deliberately **not** a second state machine — portal rows live in `change_request` under `origin="portal"` and reuse the entire #62 approve spine (FOR UPDATE guard, self-approval block, approver must hold the operation's own permission, re-preview stale guard, `apply()` under the approver, audit rows, expiry sweep), so provisioning behaves identically to a manual create. A catalog allow-list (`services/requests/catalog.py`) maps four kinds onto existing `Operation`s — that allow-list is load-bearing security, because submit intentionally skips the operation's permission check. Behind the default-off `governance.requests` module; new `provisioning_request` permission (`write` + `read`) + `Requester` builtin role; 3 MCP tools. **Auto-approve rules are designed for but not built** — the seam is in `submit_request`. Pairs with multi-tenancy and #64.
+- ✅ [**Self-service request portal — IP / subnet / DNS / DHCP requests with approve-and-provision**](https://github.com/spatiumddi/spatiumddi/issues/696) — shipped `2026.07.30-1` (#721): the Phase 5 "IP request workflows" item. #62's approval engine pointed the other way: a low-privilege user asks for something they cannot do themselves, an approver reviews it with the operation's own preview, and approving **provisions** it. Deliberately **not** a second state machine — portal rows live in `change_request` under `origin="portal"` and reuse the entire #62 approve spine (FOR UPDATE guard, self-approval block, approver must hold the operation's own permission, re-preview stale guard, `apply()` under the approver, audit rows, expiry sweep), so provisioning behaves identically to a manual create. A catalog allow-list (`services/requests/catalog.py`) maps four kinds onto existing `Operation`s — that allow-list is load-bearing security, because submit intentionally skips the operation's permission check. Behind the default-off `governance.requests` module; new `provisioning_request` permission (`write` + `read`) + `Requester` builtin role; 3 MCP tools. **Auto-approve rules are designed for but not built** — the seam is in `submit_request`. Pairs with multi-tenancy and #64.
 - ⬜ [**Resource locking**](https://github.com/spatiumddi/spatiumddi/issues/63)
 - ⬜ [**Per-resource ACLs**](https://github.com/spatiumddi/spatiumddi/issues/64)
 - ✅ [**Time-bound permissions**](https://github.com/spatiumddi/spatiumddi/issues/65) — shipped `2026.06.11-1`: a `time_bound_grant` table of auto-expiring *additive* RBAC grants (`{action, resource_type, resource_id?}` to a group until `expires_at`), consulted live by `user_has_permission` and soft-revoked by a 60 s beat sweep. Migration `d5e9b2c14a07`.
@@ -521,8 +518,8 @@ suggestion, free-space treemap.
 - ⬜ [**Field-level history**](https://github.com/spatiumddi/spatiumddi/issues/79)
 - ⬜ [**Recent items / favourites sidebar**](https://github.com/spatiumddi/spatiumddi/issues/80)
 - ✅ [**Keyboard shortcut help overlay**](https://github.com/spatiumddi/spatiumddi/issues/81)
-  — merged to `main` (#737), pending release cut: `?` opens a modal
-  listing every binding, from a new `frontend/src/lib/shortcuts.ts`
+  — shipped `2026.07.30-1` (#737): `?` opens a modal listing every
+  binding, from a new `frontend/src/lib/shortcuts.ts`
   mounted via `Header`. The map is deliberately **load-bearing rather
   than a parallel list** — `GlobalSearch`'s Cmd/Ctrl+K listener matches
   against it and its trigger keycap renders from it, so retuning a combo
@@ -532,7 +529,7 @@ suggestion, free-space treemap.
   that don't consult the map, and are the rows that can still drift.
   Note for anyone adding a binding: declare it here and match via
   `matchesShortcut` rather than adding another described-only row.
-- ✅ [**Print / PDF export for IPAM tree + subnet detail**](https://github.com/spatiumddi/spatiumddi/issues/82) — merged to `main` (#739), pending release cut: `GET /ipam/export.pdf` takes the same scope selector as the CSV/JSON/XLSX exporter (and reuses its `_collect`, so the two can't disagree about the subtree) and renders one of two shapes — a **tree** report for a space / block, or a **detail** report for a subnet. Surfaced as *Print / PDF* in both Export dropdowns. **reportlab, not the weasyprint the issue text proposed** — two reportlab PDFs already ship and a second engine would add Cairo / Pango to every image for no new capability. Unlike #48 and the conformity report, this one paginates: `repeatRows=1` plus a two-pass `_NumberedCanvas` for "Page N of M". Two things worth knowing if you touch it: reportlab's `Paragraph` parses mini-XML, so **all** DB-sourced text must go through `_para()` (an unescaped `a<b>c` space name 500s the export, and `<legacy> net` silently renders as "net"); and the tree indent must stay inside WinAnsiEncoding, or reportlab swaps in ZapfDingbats and nested blocks render as `■■`. Both have regression tests. *(GitHub auto-closed this issue on 2026-06-18 in error — PR [#446](https://github.com/spatiumddi/spatiumddi/pull/446) said `CodeQL #82`, meaning alert 82. Reopened 2026-07-28, genuinely shipped now.)*
+- ✅ [**Print / PDF export for IPAM tree + subnet detail**](https://github.com/spatiumddi/spatiumddi/issues/82) — shipped `2026.07.30-1` (#739): `GET /ipam/export.pdf` takes the same scope selector as the CSV/JSON/XLSX exporter (and reuses its `_collect`, so the two can't disagree about the subtree) and renders one of two shapes — a **tree** report for a space / block, or a **detail** report for a subnet. Surfaced as *Print / PDF* in both Export dropdowns. **reportlab, not the weasyprint the issue text proposed** — two reportlab PDFs already ship and a second engine would add Cairo / Pango to every image for no new capability. Unlike #48 and the conformity report, this one paginates: `repeatRows=1` plus a two-pass `_NumberedCanvas` for "Page N of M". Two things worth knowing if you touch it: reportlab's `Paragraph` parses mini-XML, so **all** DB-sourced text must go through `_para()` (an unescaped `a<b>c` space name 500s the export, and `<legacy> net` silently renders as "net"); and the tree indent must stay inside WinAnsiEncoding, or reportlab swaps in ZapfDingbats and nested blocks render as `■■`. Both have regression tests. *(GitHub auto-closed this issue on 2026-06-18 in error — PR [#446](https://github.com/spatiumddi/spatiumddi/pull/446) said `CodeQL #82`, meaning alert 82. Reopened 2026-07-28, genuinely shipped now.)*
 
 #### CLI tool
 
