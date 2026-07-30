@@ -20,6 +20,536 @@ the formatter handles the rest.
 
 ---
 
+## 2026.07.30-1 — 2026-07-30
+
+**The Technitium + DNS threat-analytics release.** Two headline
+additions, both of which change what the platform can serve and what
+it can see. **Technitium DNS Server joins BIND9 and PowerDNS as a
+third fully agent-managed driver** (#746, #743, #740, #741, #744, #745)
+— and not a minimal third option: all four zone types, catalog zones,
+TSIG-authenticated transfer, online DNSSEC signing with DS export,
+native DoT / DoH / **DoQ** listeners, encrypted upstream
+forwarding over TLS *and HTTPS and QUIC* (which neither other
+agent-managed driver can do — BIND 9.20 has no client-side HTTP or
+QUIC transport at all), native blocklists, a live-pull importer, and
+config drift. Every API shape was probed against a live
+`technitium/dns-server:15.4.0` rather than inferred, because several
+are not what you would guess — a TSIG key list is a flat
+pipe-delimited token stream read in triples, `zones/options/set` answers
+`{"status":"ok"}` to a value it does not recognise and silently keeps
+the old one, and the cert must be PKCS #12 as a file path. Alongside
+it, **DNS threat analytics** (#699) closes with all four detections
+over the query log SpatiumDDI already collects — tunneling, DGA, C2
+beaconing and RPZ hit attribution — plus per-client mutes, so a
+reviewed finding stays reviewed. Also landing: **DoT / DoH listeners
+and encrypted upstream forwarding** for BIND9 and PowerDNS (#50), the
+**AV / BACnet / OT / DICOM vertical-awareness** modules (#543, #723)
+together with the fragile-device **do-not-probe** flag (#722) that
+constrains SpatiumDDI's *own* probes, a **self-service request
+portal** (#696), **restore drills** that prove backup archives are
+actually restorable (#702), and the **config-drift report UI** (#61).
+On the safety side, a **PowerDNS 5.0 LMDB schema guard** (#638) makes
+the Alpine 3.23 pdns 4.9 → 5.0 jump survivable and reversible, and the
+published `spatiumddi-api` image no longer ships the Dockerfile's
+`dev` stage (#732).
+
+### Added
+
+- **Technitium DNS Server as a third agent-managed DNS driver
+  (#746, #743, #740, #741, #744, #745).** Control-plane driver
+  (`backend/app/drivers/dns/technitium.py`) + agent driver
+  (`agent/dns/spatium_dns_agent/drivers/technitium.py`) reconciling
+  zones and records against Technitium's REST API with
+  agent-provisioned bearer-token auth, a new
+  `ghcr.io/spatiumddi/dns-technitium` container image (upstream base
+  pinned by multi-arch index digest), and full appliance integration —
+  supervisor role tables, firewall policy layer, umbrella + appliance
+  Helm charts, Fleet UI, Docker Compose profile, CI build matrix,
+  Trivy and kind e2e.
+  - **Zone types (#743).** Primary / secondary / stub / forward, with
+    `masters` translated to Technitium's `ip:port` wire shape (the
+    BIND `ip@port` form is rejected outright). Only a *primary's*
+    records are reconciled — a secondary and a stub fill themselves
+    from the transfer and a forwarder holds none, so diffing them
+    would delete what the daemon just pulled down. A masters-less
+    secondary/stub and a forwarders-less forward zone are refused at
+    the API with a 422 rather than becoming a zone that silently never
+    appears on the server.
+  - **Zone transfer + TSIG (#743).** Transfer policy is stamped per
+    primary (Technitium has no global `allow-transfer` equivalent);
+    TSIG key names attach only where transfer is permitted. Keys are
+    pushed before anything references them.
+  - **Catalog zones (#743).** Producer (create the Catalog zone, set
+    `catalog=` on each owned primary) and consumer (a
+    `SecondaryCatalog` zone).
+  - **Online DNSSEC signing (#740).** `dnssec_sign` / `dnssec_unsign`
+    ride the record-op queue, same shape as PowerDNS. Defaults to
+    ECDSA P256 / NSEC. DS records are joined from the KSK's own
+    DNSKEY `rData.computedDigests` — the properties endpoint you would
+    reach for first carries the key inventory and no DS at all — and
+    rendered in standard presentation form. Per-key state is reported,
+    because Technitium exposes it and #49 already models it.
+  - **DoT / DoH / DoQ listeners + encrypted forwarding (#741).**
+    `doq_enabled` / `doq_port` join #50's DoT/DoH knobs;
+    `forward_transport` widens to `https` and `quic`. `doq_port`
+    defaults to 853 alongside DoT deliberately — DoQ is UDP and DoT is
+    TCP, so they do not collide, which is why the firewall layer
+    carries a separate UDP channel. PEM certs are converted to a 0600
+    PKCS #12 on the agent; a cert that will not parse leaves every
+    listener down rather than taking the daemon with it.
+  - **Blocklists + live-pull importer (#744).** Effective blocklist
+    entries map onto Technitium's native per-domain block set and
+    exceptions onto its *allowed* set (which is exactly an RPZ
+    passthru); the apply is flush-then-rewrite, because `blocked/list`
+    is a one-level tree browser rather than a flat list and deleting
+    an intermediate node removes the whole subtree beneath it. The
+    importer feeds the same canonical IR and preview → commit pipeline
+    as the BIND9 / Windows / PowerDNS importers, reversing
+    Technitium's enum-named rdata back to numbers.
+  - **Config drift (#61).** `pull_zone_records` AXFRs the zone off the
+    host. Documented limitation: drift needs the group's transfer
+    policy to permit the control plane *and* the group to hold no TSIG
+    keys, because the control plane does not yet sign transfers — the
+    same limitation #734 tracks for BIND9. A refused transfer surfaces
+    as an error on the drift row, never as an empty (in-sync) diff.
+- **DNS threat analytics — four detections over the query log (#699).**
+  Behind the default-off `security.dns_threat` feature module (off on
+  privacy grounds, not noise: scoring reads query *content*), and
+  inert until a DNS group enables query logging. A shared
+  `dns_client_window` per-client hourly rollup with
+  detection-agnostic feature columns backs all four, so each scores
+  off one pass over what can be tens of thousands of log lines.
+  - **Tunneling** — weighted 0–100 over label length, label entropy,
+    subdomain fan-out under one parent, and payload-qtype ratio.
+    Validated against synthetic traffic: iodine-shaped 92,
+    dnscat2-shaped 50, ordinary office traffic 0. A tunnel hidden
+    among allowlisted traffic still scores 72, so the allowlist cannot
+    be used as cover.
+  - **DGA** — structurally the *inverse* of tunneling (a tunnel
+    concentrates thousands of subdomains under one parent; a DGA
+    sprays one or two lookups across many), so it is a separate scorer
+    rather than more weights on the existing one. Bigram
+    implausibility, domain fan-out, pronounceability and label-length
+    uniformity, with fan-out multiplied by the n-gram signal so a mail
+    gateway or downstream forwarder cannot score on volume alone.
+    Seeded **disabled** at a threshold of 80.
+  - **C2 beaconing** — coefficient of variation of a (client, name)
+    pair's inter-arrival intervals, which is scale-free where raw
+    stddev is not. A client scores its *worst* name, because one
+    metronomic callback among a thousand ordinary lookups is exactly
+    what should surface. Seeded **disabled**: a health check every
+    30 s is beaconing by any timing measure, so the verdict carries
+    the qname and period rather than a bare score.
+  - **RPZ hit attribution** — named's policy rewrites are now routed
+    to the existing query-log channel and parsed into `dns_rpz_hit`
+    (30-day retention against the query log's 24 h). Answers "which
+    machine keeps reaching for blocked domains" and "which feed
+    subscription earns its keep". `PASSTHRU` is an explicit allow and
+    is reported alongside the blocked count, never inside it.
+  - **Per-client mutes** — a mute on the client, not a delete of the
+    window rows (the aggregator would refill them within the quarter
+    hour, and the rows are evidence). Reason required, both directions
+    audited, defaults to 30 days so a snap "this is fine" ages out.
+    The alert matcher, the summary and the default listing all honour
+    it.
+  - Threat tab on Logs with a detection selector, per-row evidence,
+    a per-client history modal and a muted-clients panel; Security
+    dashboard card; `dns_tunneling_suspected` (enabled),
+    `dns_dga_suspected` + `dns_beaconing_suspected` (disabled) alerts;
+    6 Copilot tools. Every surface distinguishes "no findings" from
+    "not running" — a security feature that renders a reassuring blank
+    while switched off is worse than no feature.
+- **DoT / DoH listeners + encrypted upstream forwarding (#50).**
+  Serve DNS-over-TLS (RFC 7858) and DNS-over-HTTPS (RFC 8484) to local
+  clients, and forward upstream over DoT instead of plaintext 53 with
+  `remote-hostname` validation that fails closed (SERVFAIL, never a
+  silent downgrade). BIND9 renders `tls` / `http` statements natively;
+  PowerDNS gets inbound-only via the existing dnsdist front. Per
+  group, default-off and additive — an install that never opts in
+  renders a byte-identical `named.conf`. Certificates come from the
+  existing `appliance_certificate` store shared with the Web UI cert
+  and the embedded ACME client, ride inside the hashed config bundle
+  so a renewal shifts the ETag, and degrade to Do53 (never a dead
+  daemon) if deleted out from under a live listener. Operator-chosen
+  ports flow to the appliance firewall via `dns_encrypted_tcp_ports`
+  on the supervisor role assignment.
+- **Vertical network awareness — AV / BACnet / OT
+  (#543: #540, #541, #542).** Three togglable, default-enabled
+  Network feature modules built on existing DDI primitives —
+  registry, segmentation documentation and conformity, with no
+  network probing.
+  - `network.av` — `av_flow_profile`, a 1:1 AV descriptor on a
+    multicast group (protocol / flow label / PTP domain) plus
+    `av_reserved_range` for operator-declared per-protocol ranges. A
+    Dante flow *is* a multicast group, so this specializes the #126
+    registry rather than adding a parallel address plane.
+  - `network.bacnet` — `bacnet_device`, whose internetwork-wide
+    `uq_bacnet_device_instance` constraint is the whole point: BACnet
+    instance numbers are a second uniqueness namespace no IPAM tracks,
+    and duplicates are a classic BAS failure. Plus BBMD topology with
+    BDT / FDT snapshots and a `bbmd_one_per_subnet` check that fails
+    in both directions.
+  - `network.ot` — `ot_device` + `ot_zone` Purdue-level segmentation
+    (`Numeric(2,1)`, so level 3.5 — the DMZ — is representable) and
+    CSV import of engineering-tool exports. Read-only identification
+    only; control-protocol writes are permanently out of scope.
+  - Plus 7 conformity checks, 9 Copilot tools, 3 list pages, two
+    `IPDetailModal` sections, and the verticals backup /
+    factory-reset catalog entries.
+- **DICOM AE Title registry + peer-association map (#723).** Behind
+  `network.dicom`. An AE Title is institution-wide unique by
+  specification — PS3.15 Annex H defines a registry object whose only
+  job is allocating them, it is essentially undeployed, and the
+  namespace lives in a spreadsheet — so `uq_dicom_ae_title` is the
+  point of the table and a collision answers 409 naming the AE that
+  holds it. `dicom_ae.ip_address_id` is nullable / `SET NULL`,
+  deliberately unlike `bacnet_device`'s CASCADE: an AE Title outlives
+  its host because it is burned into peer config across the estate, so
+  decommissioning an IP demotes the title to a reservation rather than
+  freeing a name a dozen modalities still send to. `dicom_peer` is a
+  directed AE→AE edge of *configured* associations, which makes
+  renumber blast-radius answerable in both directions. Title
+  validation follows PS3.5 exactly — 16 **bytes**, spaces legal as
+  padding, all-space forbidden, no backslash or control characters.
+  Plus 4 conformity checks, 3 Copilot tools, a CSV importer, and the
+  list / peer / impact UI. **No PHI, ever** — network identity only.
+- **Fragile-device "do not probe" flag (#722).** Medical- and
+  OT-device vendors explicitly instruct sites not to scan their
+  VLANs, and fragile IP stacks fault under a sweep; SpatiumDDI shipped
+  three features that violate that instruction and no way to say so.
+  `do_not_probe` + `do_not_probe_reason` on `IPSpace` / `IPBlock` /
+  `Subnet`, resolved by one service (`services/ipam/probe_policy.py`)
+  every prober consults — the #23 discovery sweep, `tools.nmap`
+  including auto-profile-on-lease, the `tools.network` reachability
+  tools, the TLS-cert sweep, the SNMP poller, the WoL verifier's
+  active chain, and the Copilot's own scan tools. The flag **ORs down**
+  the chain with no per-level inherit toggle, deliberately unlike the
+  DDNS fields it otherwise mirrors: a site that marks its clinical
+  space do-not-probe must not have one subnet quietly opt back in.
+  Not behind a feature module — it constrains our own behaviour, so
+  hiding it default-off would leave the sites that need it
+  unprotected. The escape hatch is narrow: superadmin only, per
+  request, with an audit row committed *before* the probe runs. Also
+  adds the `fragile_subnet_probed` check (working backwards from the
+  `ot_device` / `dicom_ae` / `role="bmc"` registries) and `bmc` to
+  `IP_ROLES`.
+- **Self-service request portal (#696).** The Phase 5 "IP request
+  workflows" item. #62 shipped the approval engine as a *brake*; this
+  points the same machinery the other way — a low-privilege user asks
+  for something they cannot do themselves, an approver reviews it with
+  the operation's own preview, and approving **provisions** it.
+  Deliberately **not** a second state machine: portal rows live in
+  `change_request` under `origin="portal"` and reuse the entire #62
+  approve spine (FOR UPDATE guard, self-approval block, approver must
+  hold the operation's own permission, re-preview stale guard,
+  `apply()` under the approver, audit rows, expiry sweep), so
+  provisioning behaves identically to a manual create. The catalog
+  (`services/requests/catalog.py`) mapping four kinds — subnet / IP /
+  DNS record / DHCP reservation — onto existing `Operation`s is
+  load-bearing security, because submit intentionally skips the
+  operation's permission check. New `provisioning_request` permission
+  + `Requester` builtin role, default-off `governance.requests`
+  module, 3 Copilot tools, and a request form rendered from the
+  operation's own JSON Schema so the fields *are* the server contract.
+- **Restore drills — prove backup archives are actually restorable
+  (#702).** The backup subsystem could write to eight destination
+  kinds and never proved any of them could be restored; the common
+  real-world failure is not a lost site but discovering at recovery
+  time that the archives were bad all along. A drill downloads a
+  target's newest archive, replays it into a throwaway scratch
+  database, runs a fixed assertion set (archive readable, stored
+  passphrase opens `secrets.enc`, dump replays, alembic head known,
+  core tables populated, audit chain verifies), then drops the scratch
+  database. The live database is never written to. Deliberately not
+  built on `apply_backup_restore`, which takes a pre-restore safety
+  dump and disposes the live engine's pool — correct for an
+  operator-initiated restore, wrong for an unattended background
+  check. Drill cadence is separate from the backup schedule (weekly
+  drills against nightly backups is the expected shape), with a 60 s
+  beat sweep, a stale-mutex escape, an orphan-database reaper, a size
+  ceiling so a verification job cannot fill the production volume, a
+  `restore_drill_failed` alert that fires only on a verdict about the
+  archive (never on "the drill could not run"), a Restore Drills tab,
+  and 2 Copilot tools. A target with drills switched off reports as
+  **unverified**, not healthy.
+- **Config-drift report UI (#61).** A Drift tab on the zone detail,
+  deep-linkable via `?subtab=drift`, rendering per-server
+  extra-on-server / missing-on-server / in-sync counts with the record
+  tables behind each. Mounted only while active and fetched with
+  `retry: false`, because one call fans out an AXFR to every server in
+  the group. Carries `warnings[]` for the split-horizon ambiguity — an
+  AXFR is addressed by zone *name*, so under views several zone rows
+  share one — rather than silently changing the diff semantics.
+- **Keyboard shortcut help overlay (#81).** `?` opens a modal listing
+  every binding, rendered from a new `frontend/src/lib/shortcuts.ts`.
+  The map is load-bearing rather than a parallel list: `GlobalSearch`'s
+  Cmd/Ctrl+K listener matches against it and its trigger keycap
+  renders from it, so retuning a combo moves the handler, the keycap
+  and the help together. `?` stands down inside inputs, textareas,
+  selects and contenteditable, and will not open over an existing
+  dialog.
+- **Print / PDF export for the IPAM tree + subnet detail (#82).**
+  `GET /ipam/export.pdf` takes the same scope selector as the existing
+  CSV / JSON / XLSX exporter — and reuses its `_collect`, so the two
+  cannot disagree about what a subtree contains — and renders either a
+  **tree** report for a space or block or a **detail** report for a
+  subnet. Reachable as *Print / PDF* in both Export dropdowns. Unlike
+  the two reportlab PDFs already shipping, this one paginates:
+  `repeatRows=1` keeps column headers on every page and a two-pass
+  `_NumberedCanvas` stamps "Page N of M".
+- **PowerDNS 5.0 LMDB schema guard (#638).** Alpine 3.23 moves pdns
+  4.9.5 → 5.0.5, and PowerDNS 5.0 migrates the LMDB schema v5 → v6 the
+  first time it opens the database: silently, on a read, with no
+  opt-out and no downgrade. Because `/var` is the shared persistent
+  partition an appliance A/B rollback does *not* swap, upgrade →
+  problem → roll back left pdns 4.9 crash-looping with DNS down, and
+  the health-gated auto-revert drove into that state on its own. New
+  `spatium-pdns-lmdb-guard` snapshots the database before the daemon
+  starts when the major changes, with `list` / `restore` (itself
+  reversible via a pre-restore copy) and a `PDNS_LMDB_RESTORE` env
+  path for a node already crash-looping. Plus
+  `dns_server.daemon_version` reported on every DNS agent heartbeat,
+  and a warn-only `powerdns_lmdb_migration` rolling-upgrade preflight
+  naming the restore command.
+- **6 new feature modules** — `network.av`, `network.bacnet`,
+  `network.ot`, `network.dicom` (default on), `governance.requests`
+  and `security.dns_threat` (default off) — and **25 new Operator
+  Copilot tools**.
+
+### Changed
+
+- **Docs are published to the org-root Pages site (#751).**
+  `https://spatiumddi.github.io` returned a 404 while the docs served
+  only from `/spatiumddi/`: an org's root Pages site comes exclusively
+  from a repo named `<org>.github.io`, and that repo did not exist —
+  so the README badge, body link and footer, plus `sitemap.xml` and
+  `robots.txt`, all fed search engines a 404. A new
+  `docs-publish.yml` workflow now mirrors `docs/` into the site repo
+  on every release tag over an SSH deploy key (`GITHUB_TOKEN` cannot
+  push cross-repo). The project site at `/spatiumddi/` is untouched
+  and still tracks `main`, so both URLs resolve and no existing link
+  breaks. The site itself is rebuilt as a product landing page plus a
+  single-column docs layout with its own layouts, brand palette, dark
+  mode and click-to-enlarge screenshots, replacing
+  `jekyll-theme-minimal`'s 270 px sidebar beside a 500 px column.
+- **The PowerDNS DNSSEC smoke is a real CI gate again (#132).** The
+  step had been `continue-on-error: true` since the day it was added
+  and had never once passed. Root cause: it drove `pdnsutil`, which
+  writes straight to LMDB behind the running daemon's back, and
+  `pdns_server` caches the set of zones it is authoritative for — so a
+  zone created after startup was absent from that cache and the daemon
+  answered as non-authoritative while the record sat in the database.
+  The step now drives the REST API, which is the path the agent's
+  driver actually uses, so the zone cache updates as a side effect.
+  Verified against both 4.9.5 and 5.0.5, including negative tests
+  proving the gate can go red.
+- **The appliance test suite runs in CI (#581).** All 194 cases in
+  `appliance/tests` had never executed — the same gap #640 fixed for
+  the agent suites, and it undercut the point of testing a
+  disk-wiping feature. New hermetic `Appliance — Tests` job, ~10 s.
+- **`CLAUDE.md` halved, and its roadmap swept against live issue state
+  (#713, #534).** One line was 52% of the file: a 73,251-character
+  "current state" paragraph that release prep never updated (it
+  updates `CHANGELOG.md` and the roadmap markers) and that buried
+  every `grep` hit because it named nearly every identifier in the
+  project. Replaced with a lookup table pointing at the sources that
+  *are* kept current. Separately, 23 of the 44 pending roadmap entries
+  pointed at issues that had already closed; all 63 markers were
+  verified against live issue state and now agree, with an explicit
+  marker key and a "flip it in the same edit" rule. Also documents the
+  `make test` trap — `-n auto` on a small box fails as thousands of
+  fixture-setup errors on unrelated files, which reads exactly like a
+  regression in your own diff.
+- **README swept against what actually shipped (#133).** Whole
+  features were missing (vertical awareness, DNS threat analytics,
+  do-not-probe, the request portal, saved views) and several counts
+  were stale (conformity check kinds 16 → 21, seed policies 18 → 19).
+  The BIND9 / PowerDNS driver difference is now stated explicitly
+  rather than implying parity that does not exist.
+- **Contributors section in the README.** Everyone who has opened a PR
+  against the repo, with what they worked on — including contributors
+  whose PR was closed rather than merged. Hand-maintained rather than
+  bot-generated so it stays a deliberate act at merge time, which
+  `CONTRIBUTING.md` now says.
+- **Frontend dependency bumps (#706)** — `@radix-ui/react-context-menu`
+  2.3.4 → 2.3.7, `@tanstack/react-query` (+ devtools) 5.101.3 →
+  5.101.4, `recharts` 3.10.0 → 3.10.1, `@vitejs/plugin-react` 6.0.3 →
+  6.0.4, `postcss` 8.5.20 → 8.5.23.
+
+### Fixed
+
+- **DNS imports never reached the daemon (#707).** The importer wrote
+  `DNSRecord` rows and stopped, but records are deliberately excluded
+  from the agent bundle's `structural_etag`, so a record-only change
+  never triggers the re-render/reload path — the only route from a
+  committed record to the live daemon is a `DNSRecordOp`, and the
+  commit path enqueued none. BIND9 never recovered (zones render with
+  `allow-update`, so named holds a journal and ignores the re-rendered
+  master file on reload): records were on disk and NXDOMAIN on the
+  wire until an operator edited each one by hand. PowerDNS self-healed
+  on the next *unrelated* structural reload, which made it harder to
+  notice. Both fixed by enqueuing a `create` op per imported record
+  through the existing bulk fast-path.
+- **The BIND9 and PowerDNS agents were starting their daemon twice
+  (#704).** `daemon_running()` trusted a per-instance `daemon_pid`, so
+  a second driver object always answered "not running" and spawned
+  another daemon. BIND9 hid it with `SO_REUSEPORT` — both instances
+  bind :53 and :953 and the kernel load-balances, so `rndc` reached
+  whichever answered and query logging looked like a toggle that did
+  nothing; `rndc reload` / `reconfig` / `notify` reached one instance
+  while the other kept serving stale zone state, and DNSSEC operations
+  could be applied to one and read back from the other. PowerDNS has
+  no `reuseport`, so the duplicate failed to bind and exited — but
+  nothing ever `wait()`ed, so the corpse became a **zombie** that
+  `daemon_pid` then pointed at, and every signal the driver sent went
+  to it. Both drivers now share a `/proc`-based lookup that adopts a
+  live daemon and skips zombies.
+- **The DNS drift endpoint could never return data (#61).**
+  `dns.query.xfr` takes an IP *literal* and raises a bare,
+  message-less `ValueError` for a hostname before sending a packet —
+  so every `DNSServer.host` holding a hostname (every containerised
+  deployment, and most others) failed 100% of the time and reported
+  `""` as the error. Now resolved first, with the same fix at the two
+  RFC 2136 *write* call sites, which had it identically. Failure hints
+  are also matched to the actual cause — a timeout, an unreachable
+  socket and a REFUSED no longer all tell the operator to go check
+  `allow-transfer` on a box they cannot open a socket to.
+- **Signing artefacts were reported as config drift.**
+  `axfr_zone_records` filtered apex SOA/NS but not RRSIG / NSEC* /
+  DNSKEY / CDS / CDNSKEY, which are minted and rotated by the
+  authoritative server and never exist as SpatiumDDI records — so a
+  signed zone could never read as in sync (a freshly-signed zone
+  reported 6 phantom `@` records). **BIND9 shares the helper and had
+  the identical bug.** Fixed in the shared path; a record added
+  out-of-band is still detected.
+- **DoQ came up behind a closed firewall port.**
+  `_build_role_assignment` derived `dns_encrypted_udp_ports` and then
+  never passed it to the `SupervisorRoleAssignment` constructor, so
+  the renderer that reads it had nothing to open — while every layer
+  above reported success. Found on real appliance hardware, which is
+  the only place it could have been found.
+- **Slot-image uploads 413'd on the appliance.** nginx's
+  `client_max_body_size` override only covered `/api/v1/backup/`, so
+  the upgrade-image endpoint (backend-capped at 4 GiB) fell through to
+  nginx's ~1 MB default. Fixed in all three nginx config copies and
+  verified against a real 2.1 GB upload.
+- **`SupervisorCapabilities` silently dropped undeclared flags.** A
+  strict Pydantic model despite its docstring's "ignores unknown keys"
+  framing, so `can_run_dns_technitium` was reported as
+  "supervisor doesn't advertise" in the Fleet UI even though the real
+  supervisor was sending it. Field added plus a regression test
+  locking the full flag set.
+- **`powerdns_lmdb_migration` was inert on the fleet it targets.** It
+  matched `deployment_kind = 'appliance'`, which is NULL on every
+  post-#170 appliance, and reported "No PowerDNS nodes" while doing
+  it. Now matches the way `_cascade_delete_appliance_children` does.
+- **Threat-analytics mutes only half worked, and one was a privilege
+  hole.** The summary and listing never consulted `DNSThreatMute`, so
+  the Security card stayed red and the Copilot kept reporting a host
+  someone had already triaged, contradicting the dialog's own copy.
+  Separately, `POST`/`DELETE /mutes` inherited the router-level `read`
+  gate — anyone in the builtin Viewer role could silence a critical
+  exfiltration finding. Both now require `write`.
+- **Misc:** the DGA scorer could not reach its own alert threshold
+  (its test fixture used a consonants-only alphabet no DGA family
+  emits); a single long lookup — one `_acme-challenge` TXT — handed a
+  client all 30 length points for the hour; k8s `svc.cluster.local`
+  service discovery scored 46, which would have flagged SpatiumDDI's
+  own appliance nodes; unparseable and unsplittable query names were
+  written as "cleared" and hidden from every surface; `dns_rpz_hit`,
+  `dns_client_window` and `dns_threat_mute` were in neither the backup
+  nor the factory-reset catalog; and `multicast_group` was a
+  conformity target kind wired into the engine since #126 but absent
+  from the five downstream lists, so such a policy could only be
+  seeded.
+
+### Security
+
+- **The published API image shipped the Dockerfile's `dev` stage
+  (#732).** `release.yml`'s `build-api` job passed no `target:`, so
+  Docker built the last stage — `FROM runtime AS dev` — and every
+  published `spatiumddi-api` image carried 8 test packages installed
+  as root, including `execnet`, a library for spawning and driving
+  remote Python interpreters. Size was not the problem (~3%). The
+  problems were that `execnet` was importable in the production
+  container, and that the published artifact was **not the artifact
+  `trivy-scheduled.yml` scans**, since that job pins `runtime` — so a
+  CVE in any of those 8 packages was invisible to our own scheduled
+  scan by construction. The Dockerfile comment asserting "the release
+  pipeline stops at `runtime`" is replaced with the actual invariant.
+  Backend was the only affected image.
+- **Security pass on the unattended preseed installer (#581).** #549
+  wipes disks unattended, so each guard here stands between an answer
+  file and an irreversible mistake. The kernel-cmdline preseed URL —
+  the only answer-file transport arriving over the network from an
+  unauthenticated party, carrying `confirm_wipe`, the admin password
+  and the pairing code — was fetched over plain http with no integrity
+  check; plain http with no pin is now refused, with
+  `spatium.preseed.sha256=` as the air-gapped escape hatch. A
+  preseeded `target_disk` skipped the live-medium exclusion, so an
+  answer file naming the install USB destroyed the running media
+  mid-install; both paths now re-validate immediately before `wipefs`.
+  The interactive password prompt was written to the trace log, which
+  `on_failure` tails to the console. And `admin_user` reached
+  `useradd` and `chpasswd` unvalidated, where a colon split the line
+  and `root` failed halfway through — after the disk was already gone.
+- **`react-router-dom` 6.30.4 → 7.18.1 (#710).** Supersedes #708,
+  which Dependabot opened for GHSA-jjmj-jmhj-qwj2 (open redirect →
+  XSS) with no fix on the 6.x line. Dependabot targeted 7.0.0 — the
+  minimum version clearing that one alert — which is ~18 months stale
+  and a **net regression**: 8 high advisories against 6.30.4's zero,
+  including the turbo-stream RCE vector. 7.18.1 carries 1 high
+  (RSC-mode CSRF, unreachable here — this frontend uses no RSC or framework
+  mode) and drops turbo-stream from the tree entirely.
+- **7 HIGH CVEs from a stale build-cache layer.** BuildKit keys a layer
+  on its RUN command text, so the agent images' `apk` layer was
+  restored wholesale from the GHA cache and kept the package set it
+  was *first* built with — `apk upgrade --no-cache` cannot help,
+  because a cache hit means neither command executes. bind is now
+  pinned `>=9.20.26-r0` in both images that install it (fixing
+  CVE-2026-11331, -11605, -11622, -11721, -12617, -13204, -13321: RPZ
+  policy bypass, cache poisoning, DNSSEC validation bypass, two
+  remote-triggerable exits, unbounded memory), and the supervisor
+  image gained an `APK_SNAPSHOT` build-arg set to the ISO year-week so
+  its package layer rebuilds weekly.
+- **Polynomial ReDoS on the RPZ log regex.** `_RPZ_HEAD_QNAME_RE`
+  excluded only `)` from its inner run, so against agent-supplied log
+  lines input like `((((((` made the engine do O(n) work at O(n)
+  offsets. Measured on 4000 parens: 39.3 ms before, 0.0 ms after.
+- **Threat-analytics ingest gates on its module.** Without it a
+  default install silently accumulated query-content-derived data the
+  operator never opted into and could not view.
+- **Shell injection in the docs-publish workflow.** `${{ inputs.ref }}`
+  was interpolated into the job holding the deploy key. Found in
+  review before merge, along with a `CNAME` that `rsync --delete`
+  would have silently removed.
+
+### Migrations
+
+- `b7e2c40a9d18` — DoT / DoH listener + encrypted-forwarding options
+  on `dns_server_options`, and the certificate FK (#50).
+- `c9f4a71b8e35` — `restore_drill` history table + drill cadence
+  columns on `backup_target` (#702).
+- `d1a7c34e9b60` — `dns_client_window` per-client behaviour rollup +
+  seed the `security.dns_threat` feature module (#699).
+- `e5b2f09c71a4` — `dns_threat_mute` (#699).
+- `f0c3a81d5e27` — C2 beaconing score columns on the rollup (#699).
+- `a4e91c7b3d82` — DGA score columns on the rollup (#699).
+- `b7f24d1e9a35` — `dns_rpz_hit` policy-hit attribution (#699).
+- `e5a1c39d78b2` — AV / BACnet / OT tables + their three feature
+  modules (#540, #541, #542).
+- `a4f81c26b9e3` — `origin` + `justification` on `change_request` +
+  seed the `governance.requests` module (#696).
+- `b1e7c04a93df` — `do_not_probe` + `do_not_probe_reason` on
+  `ip_space` / `ip_block` / `subnet` (#722).
+- `c9a4f2e81b56` — `dicom_ae` + `dicom_peer` + the `network.dicom`
+  module (#723).
+- `f3b6d914c072` — `dns_server.daemon_version` (#638).
+- `6a668dd451d5` — `dns-technitium` builtin firewall policy seed
+  (#746).
+- `b2d47f1c8a30` — `doq_enabled` / `doq_port` on `dns_server_options`
+  (#741).
+
 ## 2026.07.21-1 — 2026-07-21
 
 **The dynamic-update ACL release** — with an agentless FortiGate DHCP
