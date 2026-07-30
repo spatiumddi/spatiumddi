@@ -28,12 +28,17 @@
   --brand-dark-2: #1e293b;
   --shadow: 0 1px 2px rgb(15 23 42 / 6%), 0 8px 24px -12px rgb(15 23 42 / 18%);
   --radius: 12px;
-  --measure: 46rem; /* readable line length for prose */
   --page: 78rem; /* outer container */
 }
 
+/* Dark palette. Declared twice on purpose — plain CSS has no way to share one
+   block between a media query and an attribute selector:
+     1. the media query is the default for anyone who has not chosen, and is
+        suppressed once they explicitly pick light;
+     2. the attribute selector is the explicit choice, set by the toggle and
+        persisted in localStorage. */
 @media (prefers-color-scheme: dark) {
-  :root {
+  :root:not([data-theme="light"]) {
     --bg: #0b1220;
     --bg-soft: #111c2e;
     --bg-code: #16223a;
@@ -47,6 +52,39 @@
   }
 }
 
+:root[data-theme="dark"] {
+  --bg: #0b1220;
+  --bg-soft: #111c2e;
+  --bg-code: #16223a;
+  --fg: #e8eefc;
+  --fg-muted: #a3b3cc;
+  --fg-faint: #8497b5;
+  --border: #22304a;
+  --accent: #2dd4bf;
+  --accent-hover: #5eead4;
+  --shadow: 0 1px 2px rgb(0 0 0 / 40%), 0 8px 24px -12px rgb(0 0 0 / 60%);
+}
+
+/* The toggle swaps icons rather than duplicating markup visibility logic. */
+.theme-toggle .icon-dark {
+  display: none;
+}
+:root[data-theme="dark"] .theme-toggle .icon-dark,
+.theme-toggle .icon-light {
+  display: block;
+}
+:root[data-theme="dark"] .theme-toggle .icon-light {
+  display: none;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .theme-toggle .icon-light {
+    display: none;
+  }
+  :root:not([data-theme="light"]) .theme-toggle .icon-dark {
+    display: block;
+  }
+}
+
 *,
 *::before,
 *::after {
@@ -56,6 +94,16 @@
 html {
   scroll-behavior: smooth;
   -webkit-text-size-adjust: 100%;
+  /* The nav is sticky and 62px tall, so an un-offset anchor jump parks the
+     target underneath it. Applies to #features / #install and to every doc
+     heading deep-link. */
+  scroll-padding-top: 78px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
 }
 
 body {
@@ -91,6 +139,10 @@ kbd {
   position: sticky;
   top: 0;
   z-index: 50;
+  /* Opaque fallback first: where color-mix() is unsupported the declaration
+     below is dropped, and without this the nav would be transparent with page
+     text scrolling illegibly beneath it. */
+  background: var(--bg);
   background: color-mix(in srgb, var(--bg) 88%, transparent);
   backdrop-filter: saturate(180%) blur(12px);
   border-bottom: 1px solid var(--border);
@@ -163,10 +215,45 @@ kbd {
   color: var(--accent) !important;
 }
 
+.theme-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-soft);
+  color: var(--fg-muted);
+  cursor: pointer;
+  flex: none;
+}
+.theme-toggle:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.theme-toggle svg {
+  display: block;
+}
+
 @media (max-width: 820px) {
   .nav-links .hide-sm {
     display: none;
   }
+}
+
+/* ─── Utilities ──────────────────────────────────────────────────────────── */
+
+.center {
+  text-align: center;
+}
+.center-block {
+  text-align: center;
+  margin-top: 32px;
+}
+.muted {
+  color: var(--fg-muted);
 }
 
 /* ─── Hero (landing) ─────────────────────────────────────────────────────── */
@@ -303,9 +390,6 @@ kbd {
   max-width: var(--page);
   margin: 0 auto;
   padding: 76px 24px;
-}
-.section + .section {
-  padding-top: 0;
 }
 .section-alt {
   background: var(--bg-soft);
@@ -470,22 +554,15 @@ a.card:hover {
 }
 
 .doc-body {
-  /* Single column. Wide enough for the reference tables, capped so prose
-     does not run to a 1400px measure on a big display. */
-  max-width: 62rem;
-}
-
-.doc-body > * {
-  max-width: var(--measure);
-}
-/* Wide content is exempt from the prose measure. */
-.doc-body > table,
-.doc-body > pre,
-.doc-body > .table-wrap,
-.doc-body > img,
-.doc-body > p > img,
-.doc-body > hr {
-  max-width: 100%;
+  /* One column, one right edge.
+     This previously capped every direct child at --measure (46rem) while
+     exempting headings, rules, tables and code at 62rem. The result was two
+     competing right edges down the page: h2 underlines and <hr> ran a long
+     way past the paragraphs they belonged to, and each table or code block
+     visibly jutted out past the prose above it. A single width for everything
+     is what makes the page read as aligned. Content too wide to fit scrolls
+     inside its own box (see table/pre below) rather than widening the column. */
+  max-width: 58rem;
 }
 
 .doc-body h1 {
@@ -500,7 +577,6 @@ a.card:hover {
   margin: 2.3em 0 0.7em;
   padding-bottom: 0.3em;
   border-bottom: 1px solid var(--border);
-  max-width: 100%;
 }
 .doc-body h3 {
   font-size: 1.16rem;
@@ -606,7 +682,18 @@ a.card:hover {
   display: flex;
   gap: 20px;
   flex-wrap: wrap;
+  /* margin-left:auto pushes the links right on one line, but once the footer
+     wraps that auto margin still applies and strands them mid-row. Pairing it
+     with a flexible basis keeps them left-aligned under the brand instead. */
   margin-left: auto;
+}
+@media (max-width: 640px) {
+  .footer-links {
+    margin-left: 0;
+  }
+}
+.ddi-mark {
+  color: var(--accent);
 }
 .footer a {
   color: var(--fg-muted);

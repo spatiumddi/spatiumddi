@@ -13,8 +13,16 @@
   at "/". Relative prefixes are correct at any mount point, production or
   local, which is what makes the site previewable before it is published.
 {%- endcomment -%}
-{%- assign _segs = page.url | split: '/' -%}
-{%- assign _depth = _segs | size | minus: 2 -%}
+{%- comment -%}
+  Depth = number of '/' separators after the leading one. The 'x' sentinel is
+  load-bearing: Liquid's split drops trailing empty strings, so a directory URL
+  like "/deployment/" would otherwise measure the same as a top-level page and
+  pull assets from the wrong prefix. Appending a character gives the trailing
+  segment something to be, making "features/DNS.html" and "deployment/" both
+  measure depth 1.
+{%- endcomment -%}
+{%- assign _path = page.url | remove_first: '/' | append: 'x' -%}
+{%- assign _depth = _path | split: '/' | size | minus: 1 -%}
 {%- capture root -%}
 {%- if _depth > 0 -%}{%- for i in (1.._depth) -%}../{%- endfor -%}{%- endif -%}
 {%- endcapture -%}

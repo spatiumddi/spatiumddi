@@ -43,6 +43,8 @@ concurrency:
 
 env:
   TARGET_REPO: git@github.com:spatiumddi/spatiumddi.github.io.git
+  # The branch GitHub Pages is configured to serve on the site repo.
+  TARGET_BRANCH: main
 
 jobs:
   publish:
@@ -56,11 +58,18 @@ jobs:
 
       - name: Resolve version label
         id: meta
+        # Values reach the shell as env vars, never as ${{ }} interpolated into
+        # the script text: a workflow_dispatch input is attacker-supplied, and
+        # inlining it would let `$(...)` execute inside the job that holds
+        # DOCS_DEPLOY_KEY.
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          INPUT_REF: ${{ inputs.ref }}
         run: |
-          if [ "${{ github.ref_type }}" = "tag" ]; then
+          if [ "$REF_TYPE" = "tag" ]; then
             echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
           else
-            echo "version=${{ inputs.ref || github.sha }}" >> "$GITHUB_OUTPUT"
+            echo "version=${INPUT_REF:-$GITHUB_SHA}" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Configure deploy key
@@ -71,18 +80,27 @@ jobs:
           ssh-keyscan -t rsa,ecdsa,ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
 
       - name: Clone site repo
-        run: git clone --depth 1 "$TARGET_REPO" site
+        # --branch is explicit rather than relying on the remote's default, so
+        # this cannot quietly commit onto one branch and push to another.
+        run: git clone --depth 1 --branch "$TARGET_BRANCH" "$TARGET_REPO" site
 
       - name: Mirror docs/ into the site tree
         run: |
           # --delete so files removed from docs/ disappear from the site too;
           # the site repo holds no sources of its own, only generated content.
-          # .git is excluded for the obvious reason; .github holds the
-          # "generated - do not edit" notice, which is regenerated below and
-          # is invisible to Jekyll (it ignores dot-directories).
+          # Excluded paths are also protected from --delete on the receiving
+          # side, which is the point for all three:
+          #   .git    — the clone itself
+          #   .github — the "generated, do not edit" notice, rewritten below
+          #             and invisible to Jekyll (it ignores dot-directories)
+          #   CNAME   — written by GitHub when a custom domain is configured on
+          #             the site repo. It has no counterpart in docs/, so
+          #             without this the first release after setting a custom
+          #             domain would delete it and silently unset the domain.
           rsync -a --delete \
             --exclude '.git' \
             --exclude '.github' \
+            --exclude 'CNAME' \
             docs/ site/
 
           mkdir -p site/.github
@@ -104,18 +122,21 @@ jobs:
 
       - name: Commit and push
         working-directory: site
+        # As above: VERSION derives from a tag name / dispatch input, so it
+        # goes through the environment rather than into the script text.
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          SOURCE_SHA: ${{ github.sha }}
         run: |
           git config user.name "spatiumddi-ci"
           git config user.email "ci@spatiumddi.invalid"
           git add -A
           # A release with no docs changes is normal, not a failure.
           if git diff --cached --quiet; then
-            echo "No documentation changes for ${{ steps.meta.outputs.version }} — nothing to publish."
+            echo "No documentation changes for ${VERSION} — nothing to publish."
             exit 0
           fi
-          git commit -m "docs: publish ${{ steps.meta.outputs.version }}
-
-          Mirrored from spatiumddi/spatiumddi@${{ github.sha }} by the
-          docs-publish workflow. Do not edit this repository directly."
-          git push origin HEAD:main
-          echo "Published ${{ steps.meta.outputs.version }} to https://spatiumddi.github.io/"
+          git commit -m "docs: publish ${VERSION}" -m \
+            "Mirrored from spatiumddi/spatiumddi@${SOURCE_SHA} by the docs-publish workflow. Do not edit this repository directly."
+          git push origin "HEAD:refs/heads/${TARGET_BRANCH}"
+          echo "Published ${VERSION} to https://spatiumddi.github.io/"

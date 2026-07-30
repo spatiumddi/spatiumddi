@@ -8,6 +8,10 @@ description: Self-hosted DNS, DHCP and IP Address Management — one control pla
 markdown: kramdown
 kramdown:
   input: GFM
+  # Pages forces this to false. Left at kramdown's `true` default, a local
+  # build would turn every hard-wrapped source line into a <br> — so the
+  # preview would not match what ships, defeating the point of previewing.
+  hard_wrap: false
 
 # Both are enabled by default on GitHub Pages; declaring them explicitly keeps
 # a local build faithful to what Pages produces.
