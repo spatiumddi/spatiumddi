@@ -415,6 +415,12 @@ class TechnitiumDriver(DriverBase):
                     if resp.status_code < 500:
                         return
                 except httpx.HTTPError:
+                    # Expected while the daemon is still starting: connect
+                    # refused / read timeout until its web server binds
+                    # :5380. That is precisely what this loop is polling
+                    # for, so swallow and retry until the deadline; the
+                    # timeout warning below is what surfaces a real
+                    # failure to come up.
                     pass
                 time.sleep(0.3)
         log.warning("technitium_api_wait_timeout", timeout_s=timeout_s)

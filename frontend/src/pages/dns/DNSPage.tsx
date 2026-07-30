@@ -1348,9 +1348,8 @@ function ServerModal({
             </code>{" "}
             container alongside this server. v1 supports primary zones +
             standard record types; DNSSEC, native DoT/DoH/DoQ listeners, and
-            secondary zones are on the roadmap. The agent provisions and
-            rotates its own API token automatically — leave the field below
-            blank.
+            secondary zones are on the roadmap. The agent provisions and rotates
+            its own API token automatically — leave the field below blank.
           </div>
         )}
         {cloudDriver && (
