@@ -108,11 +108,20 @@ k8s/{dns,dhcp}/         Per-service StatefulSets + services
 k8s/ha/                 CloudNativePG, Redis Sentinel, Patroni
 charts/spatiumddi/      Umbrella Helm chart (API + FE + worker + beat + migrate + Postgres/Redis subcharts + optional DNS/DHCP agents)
 scripts/seed_demo.py    Demo data seeder
-docs/                   Specs + Jekyll site (served at spatiumddi.github.io)
-website/                Marketing site source (designed in Claude Designer; deployed to spatiumddi.github.io / future custom domain — see Marketing Website note below)
+docs/                   Specs + Jekyll site (published to BOTH Pages sites — see Documentation sites note below)
+website/                Marketing site source (designed in Claude Designer; needs a custom domain — the github.io root now serves docs; see Marketing Website note below)
 ```
 
-> **Marketing website (`/website`).** Operator-facing landing page is authored in Claude Designer and lives in `website/`. The Jekyll docs at `docs/` (served on the `gh-pages` branch as `spatiumddi.github.io/spatiumddi/`) are technical and stay where they are. The marketing site will deploy as the **root** `spatiumddi.github.io` domain (or a registered custom domain via Cloudflare Pages). When editing the marketing site, leave the Jekyll docs alone; when editing the Jekyll docs, leave the marketing site alone. Both can ship in the same PR but never as the same artifact. Open questions: which static-site generator to lock in (raw HTML / Astro / Next.js static), whether to mirror the README screenshots / feature table here, and the CI pipeline (separate workflow that builds + publishes to a `marketing` branch / Cloudflare Pages on every `website/**` change). See `website/README.md` (once it lands) for the deployment recipe.
+> **Documentation sites (`/docs`).** The Jekyll docs in `docs/` are served from **two** GitHub Pages sites, and it matters which one you are looking at:
+>
+> | URL | Pages site type | Source | Tracks |
+> |---|---|---|---|
+> | `spatiumddi.github.io` | organization site | repo `spatiumddi/spatiumddi.github.io` | the last **release** |
+> | `spatiumddi.github.io/spatiumddi/` | project site | this repo, `main` branch, `/docs` path | **`main`** |
+>
+> There is **no `gh-pages` branch** — both sites build from a `/docs` path, and the project site needs no workflow at all. The org-root site exists because GitHub only ever serves an org's root Pages site from a repo named `<org>.github.io`; that repo holds **no sources of its own** and is mirrored from `docs/` by `.github/workflows/docs-publish.yml` on every release tag (auth: the `DOCS_DEPLOY_KEY` secret, an SSH deploy key with write access to the site repo — `GITHUB_TOKEN` cannot push cross-repo). Never hand-edit the site repo; the next release overwrites it. The root URL is the one the README badge, `docs/sitemap.xml` and `docs/robots.txt` advertise, which is why it tracks releases rather than `main`. `docs/_config.yml` deliberately sets **no `baseurl`** — that is what lets one tree serve correctly at both `/` and `/spatiumddi/`; adding one would break the other site, so keep intra-doc links relative. See [#751](https://github.com/spatiumddi/spatiumddi/issues/751).
+
+> **Marketing website (`/website`).** Operator-facing landing page is authored in Claude Designer and lives in `website/`. It is **not yet built**, and the deployment target it was originally sketched against is gone: the **root `spatiumddi.github.io` domain now serves the docs** (above), so the marketing site needs a registered custom domain via Cloudflare Pages — which can build straight from `website/` in this monorepo, needing no second repo and no cross-repo sync. If a custom domain lands, revisit whether the docs move to a `docs.` subdomain and what the github.io root should then redirect to. When editing the marketing site, leave the Jekyll docs alone; when editing the Jekyll docs, leave the marketing site alone. Both can ship in the same PR but never as the same artifact. Open questions: which static-site generator to lock in (raw HTML / Astro / Next.js static), whether to mirror the README screenshots / feature table here, and the CI pipeline (separate workflow that builds + publishes to a `marketing` branch / Cloudflare Pages on every `website/**` change). See `website/README.md` (once it lands) for the deployment recipe.
 
 ---
 
