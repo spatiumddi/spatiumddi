@@ -151,8 +151,7 @@ class FindApplianceFleetArgs(BaseModel):
         description="Filter by appliance state. Omit for all states.",
     )
     role: (
-        Literal["dns-bind9", "dns-powerdns", "dns-technitium", "dhcp", "observer", "custom"]
-        | None
+        Literal["dns-bind9", "dns-powerdns", "dns-technitium", "dhcp", "observer", "custom"] | None
     ) = Field(
         default=None,
         description=(
