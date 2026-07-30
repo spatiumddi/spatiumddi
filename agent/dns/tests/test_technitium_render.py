@@ -22,6 +22,7 @@ from typing import Any
 
 from spatium_dns_agent.drivers.technitium import (
     TechnitiumDriver,
+    _normalize_rdata,
     _qualified_name,
     _record_params,
     _svcb_params,
@@ -157,13 +158,10 @@ def test_svcb_params_single_value() -> None:
 def test_svcb_params_no_params() -> None:
     priority, target, params = _svcb_params("1 svc.example.com.")
     assert priority == 1
-    assert target == "svc.example.com."
+    # Root dot stripped — the daemon stores the target un-dotted. See
+    # test_svcb_target_root_dot_is_stripped.
+    assert target == "svc.example.com"
     assert params == ""
-
-
-def test_svcb_params_multivalue_truncates_first() -> None:
-    priority, target, params = _svcb_params('1 . alpn="h2,h3"')
-    assert params == "alpn|h2"
 
 
 def test_record_params_svcb() -> None:
@@ -462,3 +460,118 @@ def test_reconcile_never_deletes_daemon_managed_apex(tmp_path: Path) -> None:
         desired=[],
     )
     assert [c[2] for c in calls if c[2] == "zones/records/delete"] == []
+
+
+# ── rData read-back normalisation ───────────────────────────────────────
+#
+# Technitium's record GET does not echo the params its record ADD takes:
+# it renames keys for NAPTR/URI, translates TLSA/SSHFP numeric fields to
+# enum NAMES, returns svcParams as a dict, and mutates a few values. Every
+# expectation below was captured from a live technitium/dns-server:15.4.0.
+
+
+def test_normalize_rdata_tlsa_enum_names() -> None:
+    out = _normalize_rdata(
+        "TLSA",
+        {
+            "certificateUsage": "DANE-EE",
+            "selector": "SPKI",
+            "matchingType": "SHA2-256",
+            "certificateAssociationData": "ABCD",
+        },
+    )
+    assert out == {
+        "tlsaCertificateUsage": "3",
+        "tlsaSelector": "1",
+        "tlsaMatchingType": "1",
+        "tlsaCertificateAssociationData": "abcd",
+    }
+
+
+def test_normalize_rdata_sshfp_enum_names() -> None:
+    out = _normalize_rdata(
+        "SSHFP",
+        {"algorithm": "Ed25519", "fingerprintType": "SHA256", "fingerprint": "AB12"},
+    )
+    assert out == {
+        "sshfpAlgorithm": "4",
+        "sshfpFingerprintType": "2",
+        "sshfpFingerprint": "ab12",
+    }
+
+
+def test_normalize_rdata_unknown_enum_passes_through() -> None:
+    """Technitium echoes an algorithm it has no name for back as its own
+    number. A future enum member must degrade to a comparison mismatch on
+    one record, never a KeyError that kills the whole reconcile."""
+    out = _normalize_rdata("SSHFP", {"algorithm": "5"})
+    assert out == {"sshfpAlgorithm": "5"}
+
+
+def test_normalize_rdata_naptr_and_uri_key_renames() -> None:
+    assert _normalize_rdata(
+        "NAPTR",
+        {"order": 100, "preference": 10, "flags": "U", "services": "E2U+sip",
+         "regexp": "!x!", "replacement": "."},
+    ) == {
+        "naptrOrder": 100, "naptrPreference": 10, "naptrFlags": "U",
+        "naptrServices": "E2U+sip", "naptrRegexp": "!x!", "naptrReplacement": ".",
+    }
+    # Technitium appends "/" to a bare-authority URI when it stores it.
+    assert _normalize_rdata(
+        "URI", {"priority": 1, "weight": 1, "uri": "https://example.test/"}
+    ) == {"uriPriority": 1, "uriWeight": 1, "uri": "https://example.test"}
+
+
+def test_normalize_rdata_svcb_params_dict_and_apex_target() -> None:
+    out = _normalize_rdata(
+        "SVCB", {"svcPriority": 1, "svcTargetName": "", "svcParams": {"alpn": "h2,h3"}}
+    )
+    assert out == {"svcPriority": 1, "svcTargetName": ".", "svcParams": "alpn|h2,h3"}
+
+
+def test_normalize_rdata_leaves_matching_types_alone() -> None:
+    for rtype, rdata in [
+        ("A", {"ipAddress": "10.0.0.1"}),
+        ("MX", {"exchange": "mail.example.test", "preference": 10}),
+        ("SRV", {"priority": 10, "weight": 20, "port": 5060, "target": "s.example.test"}),
+        ("CAA", {"flags": 0, "tag": "issue", "value": "letsencrypt.org"}),
+    ]:
+        assert _normalize_rdata(rtype, rdata) == rdata
+
+
+def test_reconcile_no_churn_on_enum_translated_types() -> None:
+    """The bug this guards: desired TLSA params never equalled the
+    daemon's enum-name rData, so every pass issued a delete built from
+    key names the API rejects, then re-added the record. Forever."""
+    desired = _record_params("TLSA", "3 1 1 " + "AB" * 32, {})
+    from_daemon = _normalize_rdata(
+        "TLSA",
+        {
+            "certificateUsage": "DANE-EE",
+            "selector": "SPKI",
+            "matchingType": "SHA2-256",
+            "certificateAssociationData": ("AB" * 32).upper(),
+        },
+    )
+    assert desired == from_daemon
+
+
+# ── SVCB multi-value params (issue #745) ────────────────────────────────
+
+
+def test_svcb_multivalue_param_is_preserved() -> None:
+    """Technitium accepts a comma-joined value for a single param
+    (`alpn|h2,h3`) — verified live. What it rejects is splitting into
+    separate pairs. So nothing needs truncating."""
+    _, _, params = _svcb_params('1 . alpn="h2,h3"')
+    assert params == "alpn|h2,h3"
+
+
+def test_svcb_target_root_dot_is_stripped() -> None:
+    """The daemon stores the target un-dotted; leaving the root dot on
+    made every SVCB/HTTPS record read as changed on every reconcile."""
+    _, target, _ = _svcb_params('1 svc.example.test. alpn="h3"')
+    assert target == "svc.example.test"
+    # A bare apex target must survive as "." rather than becoming "".
+    assert _svcb_params("1 .")[1] == "."

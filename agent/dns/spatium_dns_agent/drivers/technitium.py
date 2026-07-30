@@ -90,32 +90,121 @@ def _svcb_params(value: str) -> tuple[int, str, str]:
     e.g. ``'1 . alpn="h2,h3"'``): priority, target, then space-separated
     ``key=value`` params with optionally-quoted values.
 
-    Known limitation: Technitium's ``svcParams`` wire format
-    (``key|value`` pairs) does not accept a comma-separated multi-value
-    single param the way BIND's zone-file rdata does (confirmed
-    empirically — ``alpn|h2,h3`` errors). Only the first value of a
-    multi-value param is carried through; the rest are dropped with a
-    warning. Single-value params (the common case) round-trip exactly.
+    Multi-value params pass through intact: Technitium's ``svcParams``
+    wire format is ``key|value`` pairs comma-joined, and a single param
+    whose value itself contains commas (``alpn|h2,h3``) is accepted and
+    stored as ``{"alpn": "h2,h3"}`` — verified against a live
+    ``technitium/dns-server:15.4.0``. What it rejects is splitting the
+    values into separate pairs (``alpn|h2|h3`` and ``alpn|h2,alpn|h3``
+    both fail with "Requested value 'h3' was not found"), so join on
+    the value, never on the key. Issue #745.
     """
     tokens = shlex.split(value)
     if len(tokens) < 2:
         return (1, ".", "")
     priority = int(tokens[0]) if tokens[0].isdigit() else 1
-    target = tokens[1]
+    # The caller's leading ``value.rstrip(".")`` cannot reach this target —
+    # it is mid-string, with the svcParams after it — so strip the root dot
+    # here. Technitium stores the target un-dotted, and leaving it on makes
+    # every SVCB/HTTPS record read as changed on every reconcile. ``or "."``
+    # keeps a bare apex target from becoming the empty string.
+    target = tokens[1].rstrip(".") or "."
     parts = []
     for tok in tokens[2:]:
         if "=" not in tok:
             continue
         key, _, raw_val = tok.partition("=")
-        first_val = raw_val.split(",", 1)[0]
-        if "," in raw_val:
-            log.warning(
-                "technitium_svcb_multivalue_param_truncated",
-                key=key,
-                dropped=raw_val.split(",", 1)[1],
-            )
-        parts.append(f"{key}|{first_val}")
+        parts.append(f"{key}|{raw_val}")
     return (priority, target, ",".join(parts))
+
+
+# ── rData → add-param normalisation ────────────────────────────────────
+#
+# Technitium's record GET does NOT echo back the params its record ADD
+# takes. For several types it renames the keys, and for TLSA/SSHFP it
+# translates the numeric rdata fields into enum NAMES. Verified against a
+# live technitium/dns-server:15.4.0 — e.g. adding a TLSA with
+# ``tlsaCertificateUsage=3, tlsaSelector=1, tlsaMatchingType=1`` reads
+# back as ``{"certificateUsage": "DANE-EE", "selector": "SPKI",
+# "matchingType": "SHA2-256"}``.
+#
+# Without translating that back, ``_reconcile_zones`` compares desired
+# add-params against daemon rData and concludes EVERY record of these
+# types differs, on every single pass, forever: it issues a delete built
+# from the daemon's own key names (which the delete endpoint does not
+# accept, so it errors and logs a warning) and then re-adds the record.
+# Permanent churn, permanent warning spam, and the zone never reads as
+# converged.
+#
+# Types whose rData already matches the add params — A, AAAA, CNAME,
+# DNAME, PTR, NS, MX, SRV, TXT, CAA — are deliberately absent here and
+# pass through untouched.
+
+_TLSA_USAGE = {"PKIX-TA": "0", "PKIX-EE": "1", "DANE-TA": "2", "DANE-EE": "3"}
+_TLSA_SELECTOR = {"Cert": "0", "SPKI": "1"}
+_TLSA_MATCHING = {"Full": "0", "SHA2-256": "1", "SHA2-512": "2"}
+# Note 5 is absent upstream: Technitium echoes an unmapped algorithm back
+# as its own number-as-string, which the ``str(v)`` fallback already
+# handles correctly.
+_SSHFP_ALGO = {"RSA": "1", "DSA": "2", "ECDSA": "3", "Ed25519": "4", "Ed448": "6"}
+_SSHFP_FP_TYPE = {"SHA1": "1", "SHA256": "2"}
+
+
+def _unmap(table: dict[str, str], value: Any) -> str:
+    """Reverse an enum-name → number mapping, passing unknown values
+    through as strings so a Technitium version that adds an enum member
+    degrades to a comparison mismatch on that one record rather than a
+    KeyError that kills the whole reconcile."""
+    return table.get(str(value), str(value))
+
+
+def _normalize_rdata(rtype: str, flat: dict[str, Any]) -> dict[str, Any]:
+    """Rewrite one record's daemon-returned rData into the same shape
+    ``_record_params`` produces, so the two are comparable and so a
+    delete built from it uses param names the API accepts."""
+    out = dict(flat)
+
+    def _move(src: str, dst: str, conv: Any = None) -> None:
+        if src in out:
+            val = out.pop(src)
+            out[dst] = conv(val) if conv else val
+
+    if rtype == "TLSA":
+        _move("certificateUsage", "tlsaCertificateUsage", lambda v: _unmap(_TLSA_USAGE, v))
+        _move("selector", "tlsaSelector", lambda v: _unmap(_TLSA_SELECTOR, v))
+        _move("matchingType", "tlsaMatchingType", lambda v: _unmap(_TLSA_MATCHING, v))
+        # Technitium upper-cases the hex; our renderer passes through
+        # whatever the operator typed.
+        _move("certificateAssociationData", "tlsaCertificateAssociationData",
+              lambda v: str(v).lower())
+    elif rtype == "SSHFP":
+        _move("algorithm", "sshfpAlgorithm", lambda v: _unmap(_SSHFP_ALGO, v))
+        _move("fingerprintType", "sshfpFingerprintType", lambda v: _unmap(_SSHFP_FP_TYPE, v))
+        _move("fingerprint", "sshfpFingerprint", lambda v: str(v).lower())
+    elif rtype == "NAPTR":
+        _move("order", "naptrOrder")
+        _move("preference", "naptrPreference")
+        _move("flags", "naptrFlags")
+        _move("services", "naptrServices")
+        _move("regexp", "naptrRegexp")
+        _move("replacement", "naptrReplacement")
+    elif rtype == "URI":
+        _move("priority", "uriPriority")
+        _move("weight", "uriWeight")
+        # Technitium normalises a bare-authority URI by appending "/".
+        # Strip a single trailing slash on both sides rather than let
+        # that one character churn the record on every pass.
+        if "uri" in out:
+            out["uri"] = str(out["uri"]).rstrip("/")
+    elif rtype in ("SVCB", "HTTPS"):
+        # svcParams goes out as "k|v,k|v" and comes back as a dict.
+        params = out.get("svcParams")
+        if isinstance(params, dict):
+            out["svcParams"] = ",".join(f"{k}|{v}" for k, v in sorted(params.items()))
+        # An apex target "." is stored as the empty string.
+        if out.get("svcTargetName") == "":
+            out["svcTargetName"] = "."
+    return out
 
 
 def _record_params(rtype: str, value: str, rec: dict[str, Any]) -> dict[str, Any]:
@@ -158,14 +247,18 @@ def _record_params(rtype: str, value: str, rec: dict[str, Any]) -> dict[str, Any
             "tlsaCertificateUsage": tokens[0] if len(tokens) > 0 else "0",
             "tlsaSelector": tokens[1] if len(tokens) > 1 else "0",
             "tlsaMatchingType": tokens[2] if len(tokens) > 2 else "0",
-            "tlsaCertificateAssociationData": tokens[3] if len(tokens) > 3 else "",
+            # Lower-cased to match _normalize_rdata's read-back side —
+            # Technitium upper-cases the stored hex.
+            "tlsaCertificateAssociationData": (
+                tokens[3].lower() if len(tokens) > 3 else ""
+            ),
         }
     if rtype == "SSHFP":
         tokens = shlex.split(value)
         return {
             "sshfpAlgorithm": tokens[0] if len(tokens) > 0 else "0",
             "sshfpFingerprintType": tokens[1] if len(tokens) > 1 else "0",
-            "sshfpFingerprint": tokens[2] if len(tokens) > 2 else "",
+            "sshfpFingerprint": tokens[2].lower() if len(tokens) > 2 else "",
         }
     if rtype == "NAPTR":
         tokens = shlex.split(value)
@@ -182,7 +275,9 @@ def _record_params(rtype: str, value: str, rec: dict[str, Any]) -> dict[str, Any
         return {
             "uriPriority": tokens[0] if len(tokens) > 0 else "1",
             "uriWeight": tokens[1] if len(tokens) > 1 else "1",
-            "uri": tokens[2] if len(tokens) > 2 else "",
+            # Trailing slash stripped on both sides — Technitium appends
+            # one to a bare-authority URI when it stores the record.
+            "uri": tokens[2].rstrip("/") if len(tokens) > 2 else "",
         }
     if rtype in ("SVCB", "HTTPS"):
         priority, target, params = _svcb_params(value)
@@ -329,29 +424,34 @@ class TechnitiumDriver(DriverBase):
     def apply_record_op(self, op: dict[str, Any]) -> dict[str, Any] | None:
         """Apply a single record op via the Technitium REST API.
 
-        ``create``/``update`` both map to ``/api/zones/records/add`` with
-        ``overwrite=false`` — Technitium's op payload only carries the NEW
-        value (never the old one), so a value *change* on ``update``
-        has to be expressed as an rrset REPLACE, not an append —
-        exactly what BIND9's driver does with
-        ``dns.update.Update.replace`` and PowerDNS's does with an
-        rrset ``REPLACE`` PATCH. Technitium's equivalent is
-        ``overwrite=true`` on ``/api/zones/records/add``, which wipes
-        the rrset at ``(domain, type)`` and writes the new value + TTL.
+        ``create``/``update`` map to ``/api/zones/records/add`` with
+        ``overwrite=true``. The op payload only ever carries the NEW
+        value, never the old one, so a value *change* has to be
+        expressed as an rrset REPLACE — exactly what BIND9's driver does
+        with ``dns.update.Update.replace`` and PowerDNS's with an rrset
+        ``REPLACE`` PATCH. ``overwrite=true`` is Technitium's
+        equivalent: it wipes the rrset at ``(domain, type)`` and writes
+        the new value + TTL.
+
+        Do NOT revert this to ``overwrite=false``. Technitium *appends*
+        at that setting, so an edited record ends up served alongside
+        its own previous value — verified against a live
+        ``technitium/dns-server:15.4.0``: adding ``www A 10.0.0.2``
+        over an existing ``www A 10.0.0.1`` leaves the zone answering
+        both, round-robin. That does not self-heal, because record CRUD
+        bumps the bundle's ``etag`` but not its ``structural_etag``, so
+        ``swap_and_reload``'s full-zone reconcile never runs on a record
+        edit (see ``sync.py``).
+
+        (A TTL-only edit is *not* affected either way — ``overwrite=false``
+        updates the TTL of a value-identical record rather than erroring.
+        Only the value-change case needs the REPLACE.)
 
         ``rrset_action`` is the project-wide per-op override for that
         default (see ``bind9.py``): DNS pools set ``"add"`` because N
         A records share one name there and a REPLACE would clobber
         siblings every time a member is added. Honour it here too, or
         pool members would delete each other.
-
-        Do NOT revert this to an unconditional ``overwrite=false``:
-        appending on every ``update`` makes an edited record serve the
-        OLD and NEW values simultaneously, and makes a TTL-only edit a
-        silent no-op ("already exists"). Neither self-heals, because
-        record CRUD bumps the bundle's ``etag`` but not its
-        ``structural_etag``, so ``swap_and_reload``'s full-zone
-        reconcile never runs on a record edit (see ``sync.py``).
         """
         token = self._get_api_token()
         if token is None:
@@ -556,7 +656,7 @@ class TechnitiumDriver(DriverBase):
                 "autoIpv6Hint",
             ):
                 flat.pop(extra_key, None)
-            out.append(flat)
+            out.append(_normalize_rdata(rtype, flat))
         return out
 
     # ── Auth (permanent API token) ──────────────────────────────────────────
