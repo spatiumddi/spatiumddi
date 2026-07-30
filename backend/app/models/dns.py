@@ -183,8 +183,8 @@ class DNSServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         index=True,
     )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
-    # driver: bind9 | powerdns | windows | cloudflare | route53 | azuredns |
-    # googledns — see app/drivers/dns/ for the registry.
+    # driver: bind9 | powerdns | technitium | windows | cloudflare | route53 |
+    # azuredns | googledns — see app/drivers/dns/ for the registry.
     driver: Mapped[str] = mapped_column(String(50), nullable=False, default="bind9")
     host: Mapped[str] = mapped_column(String(255), nullable=False)
     port: Mapped[int] = mapped_column(Integer, nullable=False, default=53)

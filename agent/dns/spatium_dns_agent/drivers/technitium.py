@@ -331,12 +331,27 @@ class TechnitiumDriver(DriverBase):
 
         ``create``/``update`` both map to ``/api/zones/records/add`` with
         ``overwrite=false`` — Technitium's op payload only carries the NEW
-        value (never the old one), so a genuine value *change* on
-        ``update`` leaves the stale value in place until an explicit
-        delete op fires for it. This is the same documented limitation
-        the PowerDNS driver accepts for the same reason; the full-bundle
-        reconcile path (``swap_and_reload``) is what actually converges
-        a zone to exact desired state via delete-extras + add-missing.
+        value (never the old one), so a value *change* on ``update``
+        has to be expressed as an rrset REPLACE, not an append —
+        exactly what BIND9's driver does with
+        ``dns.update.Update.replace`` and PowerDNS's does with an
+        rrset ``REPLACE`` PATCH. Technitium's equivalent is
+        ``overwrite=true`` on ``/api/zones/records/add``, which wipes
+        the rrset at ``(domain, type)`` and writes the new value + TTL.
+
+        ``rrset_action`` is the project-wide per-op override for that
+        default (see ``bind9.py``): DNS pools set ``"add"`` because N
+        A records share one name there and a REPLACE would clobber
+        siblings every time a member is added. Honour it here too, or
+        pool members would delete each other.
+
+        Do NOT revert this to an unconditional ``overwrite=false``:
+        appending on every ``update`` makes an edited record serve the
+        OLD and NEW values simultaneously, and makes a TTL-only edit a
+        silent no-op ("already exists"). Neither self-heals, because
+        record CRUD bumps the bundle's ``etag`` but not its
+        ``structural_etag``, so ``swap_and_reload``'s full-zone
+        reconcile never runs on a record edit (see ``sync.py``).
         """
         token = self._get_api_token()
         if token is None:
@@ -355,10 +370,14 @@ class TechnitiumDriver(DriverBase):
             **_record_params(rtype, rec.get("value") or "", rec),
         }
 
+        rrset_action = (rec.get("rrset_action") or "").lower()
         endpoint = "delete" if op_kind == "delete" else "add"
         if op_kind != "delete":
             params["ttl"] = ttl
-            params["overwrite"] = "false"
+            # REPLACE the rrset by default (matches bind9's ``upd.replace``
+            # and PowerDNS's rrset REPLACE); append only when the caller
+            # explicitly asks for sibling-preserving semantics.
+            params["overwrite"] = "false" if rrset_action == "add" else "true"
 
         resp = self._call(token, "POST", f"zones/records/{endpoint}", params)
         body = resp.json()
@@ -406,12 +425,27 @@ class TechnitiumDriver(DriverBase):
             def _fingerprint(rec: dict[str, Any]) -> tuple[Any, ...]:
                 extra = tuple(
                     sorted(
-                        (k, v)
+                        (k, str(v))
                         for k, v in rec.items()
                         if k not in ("domain", "type", "ttl", "zone")
                     )
                 )
-                return (rec.get("domain"), rec.get("type"), extra)
+                # TTL participates: a TTL-only edit is a real desired-state
+                # change, and this reconcile is the only path that can
+                # converge it (the incremental op path can't see the old
+                # value). Compared as int so a JSON "300" from the daemon
+                # doesn't read as different from a rendered 300. Values are
+                # str()-normalised for the same reason — Technitium returns
+                # some rdata fields as numbers/enums where our add-params
+                # are strings, and a bare type mismatch would make every
+                # such record look "changed" on every single pass.
+                ttl = rec.get("ttl")
+                return (
+                    rec.get("domain"),
+                    rec.get("type"),
+                    int(ttl) if ttl is not None else None,
+                    extra,
+                )
 
             existing_by_fp = {_fingerprint(r): r for r in existing}
             desired_by_fp = {_fingerprint(r): r for r in desired}
@@ -621,11 +655,60 @@ class TechnitiumDriver(DriverBase):
         (confirmed empirically: ``{"status": "invalid-token", ...}`` at
         HTTP 200). Callers must inspect ``.json()["status"]``, not the
         HTTP status code, to detect auth failure.
+
+        On ``invalid-token`` the cached token is re-provisioned and the
+        call retried once. The state dir (which holds the token) and
+        ``/etc/dns`` (which holds the daemon's admin account) are
+        SEPARATE volumes in every deployment shape, so they can desync —
+        wipe the daemon's config to reset zones and the cached token now
+        points at an account that no longer exists. Without this the
+        agent wedges permanently: every call 200s with ``invalid-token``,
+        ``_get_zone_records`` reads it as an empty zone, every add fails,
+        and nothing ever re-bootstraps. Mirrors the agent↔control-plane
+        401/404 re-bootstrap contract (CLAUDE.md cross-cutting #3).
         """
+        resp = self._request(token, method, path, params)
+        if self._is_invalid_token(resp):
+            fresh = self._reprovision_token(token)
+            if fresh is not None:
+                log.info("technitium_api_token_reprovisioned", path=path)
+                resp = self._request(fresh, method, path, params)
+        return resp
+
+    def _request(
+        self, token: str, method: str, path: str, params: dict[str, Any]
+    ) -> httpx.Response:
         with httpx.Client(timeout=_API_TIMEOUT) as client:
+            headers = self._auth_header(token)
             if method == "GET":
-                return client.get(f"{_API_BASE}/{path}", params=params, headers=self._auth_header(token))
-            return client.post(f"{_API_BASE}/{path}", data=params, headers=self._auth_header(token))
+                return client.get(f"{_API_BASE}/{path}", params=params, headers=headers)
+            return client.post(f"{_API_BASE}/{path}", data=params, headers=headers)
+
+    @staticmethod
+    def _is_invalid_token(resp: httpx.Response) -> bool:
+        try:
+            return bool(resp.json().get("status") == "invalid-token")
+        except ValueError:
+            # Non-JSON body — not an auth answer; let the caller surface it.
+            return False
+
+    def _reprovision_token(self, stale: str) -> str | None:
+        """Drop the cached token and mint a fresh one.
+
+        Re-reads the file first: several calls in one reconcile pass hold
+        the same stale token in a local, so without this each would mint
+        its own replacement and orphan the rest server-side
+        (``createToken`` is not idempotent on ``tokenName``).
+        """
+        path = self._api_token_path()
+        try:
+            current = path.read_text().strip() if path.exists() else None
+        except OSError:
+            current = None
+        if current is not None and current != stale:
+            return current
+        path.unlink(missing_ok=True)
+        return self._create_api_token()
 
     @staticmethod
     def _auth_header(token: str) -> dict[str, str]:
