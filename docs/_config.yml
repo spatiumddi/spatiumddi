@@ -1,4 +1,54 @@
-title: SpatiumDDI Docs
-description: Open-source DDI platform — DNS, DHCP, and IP Address Management
-theme: jekyll-theme-minimal
-markdown: GFM
+title: SpatiumDDI
+description: Self-hosted DNS, DHCP and IP Address Management — one control plane, real servers underneath.
+
+# Kramdown with GFM input is what GitHub Pages actually uses. The previous
+# `markdown: GFM` was not a valid Jekyll setting at all: Pages silently
+# overrode it, but it hard-failed any local `jekyll build`, so the site could
+# not be previewed before publishing.
+markdown: kramdown
+kramdown:
+  input: GFM
+
+# Both are enabled by default on GitHub Pages; declaring them explicitly keeps
+# a local build faithful to what Pages produces.
+#   optional-front-matter — renders .md files that have no YAML front matter
+#                           (almost every doc here). Without it Jekyll treats
+#                           them as static files and the browser downloads them
+#                           instead of rendering them.
+#   relative-links        — rewrites in-repo links like features/DNS.md to the
+#                           generated .html, so the docs stay browsable both on
+#                           GitHub and on the site.
+plugins:
+  - jekyll-optional-front-matter
+  - jekyll-relative-links
+
+# Every page gets the docs chrome unless it opts out (index.md uses `home`).
+defaults:
+  - scope:
+      path: ""
+    values:
+      layout: default
+
+links:
+  github: https://github.com/spatiumddi/spatiumddi
+  releases: https://github.com/spatiumddi/spatiumddi/releases
+  issues: https://github.com/spatiumddi/spatiumddi/issues
+  discord: https://discord.com/invite/ANJAnvg2Dd
+
+# No `theme:` — the site ships its own _layouts + assets/css/site.css. It used
+# to use jekyll-theme-minimal, whose fixed 270px sidebar beside a 500px content
+# column rendered reference docs into a narrow strip.
+
+# No `baseurl` — deliberately, and do not add one. This tree is served from two
+# Pages sites at different mount points (spatiumddi.github.io/ and
+# .../spatiumddi/), and GitHub Pages injects the correct baseurl per build --
+# empty for the org site, "/spatiumddi" for the project site. Hardcoding either
+# value here would override that and break the other site. (The layouts address
+# assets by relative prefix rather than baseurl anyway, so a local `jekyll
+# build`, which gets no injected value, still produces working links.)
+
+exclude:
+  - Gemfile
+  - Gemfile.lock
+  - vendor
+  - .gems

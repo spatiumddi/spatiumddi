@@ -1,0 +1,212 @@
+<!doctype html>
+{%- comment -%}
+  Product landing page. See _layouts/default.html for why `root` is computed
+  relatively rather than using site.baseurl.
+{%- endcomment -%}
+{%- assign root = "" -%}
+<html lang="en">
+<head>
+  {% include head.html root=root %}
+</head>
+<body>
+  {% include nav.html root=root %}
+
+  <header class="hero">
+    <span class="hero-chip">● Beta · Apache 2.0 · self-hosted</span>
+    <h1>DNS, DHCP and IPAM<br><span class="accent">in one control plane</span></h1>
+    <p class="lede">
+      SpatiumDDI doesn't just configure your DDI servers — it <strong>runs</strong> them.
+      BIND9, PowerDNS and Kea ship as first-class service containers the control
+      plane owns, and they keep serving even when it doesn't.
+    </p>
+    <div class="hero-actions">
+      <a class="btn btn-primary" href="#install">Get started</a>
+      <a class="btn btn-ghost" href="{{ site.links.github }}">View on GitHub</a>
+    </div>
+    <p class="hero-meta">
+      A modern open-source alternative to commercial DDI platforms ·
+      <code>linux/amd64</code> + <code>linux/arm64</code>
+    </p>
+  </header>
+
+  <!-- ── Why ─────────────────────────────────────────────────────────── -->
+  <section class="section" id="features">
+    <div class="section-head">
+      <div class="eyebrow">Why SpatiumDDI</div>
+      <h2>One source of truth, three surfaces</h2>
+      <p>
+        IPAM tree, DNS zones, DHCP scopes — one UI, one REST API. Hostname
+        changes in IPAM propagate to DNS; reservations propagate to DHCP. No
+        more three-tab reconciliation.
+      </p>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <span class="ico">🗂</span>
+        <h3>Hierarchical IPAM</h3>
+        <p>
+          Spaces, blocks and subnets with full IPv4 <em>and</em> IPv6 —
+          EUI-64, random or sequential allocation. Split, merge, resize,
+          find-free, plus a CIDR planner that previews before it commits.
+        </p>
+      </div>
+      <div class="card">
+        <span class="ico">🌐</span>
+        <h3>DNS you actually run</h3>
+        <p>
+          BIND9 or PowerDNS per server group, auto-registering. RFC 2136
+          dynamic updates, DNSSEC inline signing, split-horizon views, RPZ
+          blocklists and record-level drift detection against the live zone.
+        </p>
+      </div>
+      <div class="card">
+        <span class="ico">🔄</span>
+        <h3>DHCP with real HA</h3>
+        <p>
+          Kea with group-centric high availability — load-balanced or
+          hot-standby, with self-healing peer drift. DHCPv6, prefix
+          delegation, PXE/iPXE boot profiles and a 95-entry option library.
+        </p>
+      </div>
+      <div class="card">
+        <span class="ico">🪟</span>
+        <h3>Agentless Windows &amp; cloud</h3>
+        <p>
+          Point it at existing Windows DCs over WinRM — nothing installed on
+          the Windows side. Cloudflare, Route 53, Azure DNS and Google Cloud
+          DNS are first-class drivers too.
+        </p>
+      </div>
+      <div class="card">
+        <span class="ico">💿</span>
+        <h3>Ships as an OS appliance</h3>
+        <p>
+          Boot one ISO, answer a few prompts, and you're on HTTPS with the
+          full stack in minutes. Atomic A/B upgrades, health-gated rollback,
+          and a fleet view for every node.
+        </p>
+      </div>
+      <div class="card">
+        <span class="ico">🔐</span>
+        <h3>Built for delegation</h3>
+        <p>
+          Group-based RBAC with LDAP, OIDC, SAML, RADIUS and TACACS+. Hand a
+          subnet or a zone to a department without handing over root. Every
+          mutation lands in an append-only audit log.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Screenshots ─────────────────────────────────────────────────── -->
+  <section class="section-alt">
+    <div class="section-inner section">
+      <div class="section-head">
+        <div class="eyebrow">The interface</div>
+        <h2>Built for people who run networks</h2>
+        <p>Every screen is a REST call underneath — if you can click it, you can automate it.</p>
+      </div>
+      <div class="shots">
+        <figure class="shot">
+          <img src="{{ root }}assets/screenshots/dashboard.png" alt="SpatiumDDI dashboard" loading="lazy">
+          <figcaption>Dashboard — utilization heatmap, live activity, service health</figcaption>
+        </figure>
+        <figure class="shot">
+          <img src="{{ root }}assets/screenshots/ipam.png" alt="IPAM subnet tree" loading="lazy">
+          <figcaption>IPAM — space / block / subnet tree with inline pool boundaries</figcaption>
+        </figure>
+        <figure class="shot">
+          <img src="{{ root }}assets/screenshots/dns.png" alt="DNS zones and records" loading="lazy">
+          <figcaption>DNS — zones, records, views and per-server serial drift</figcaption>
+        </figure>
+        <figure class="shot">
+          <img src="{{ root }}assets/screenshots/dhcp.png" alt="DHCP scopes and leases" loading="lazy">
+          <figcaption>DHCP — scopes, pools, reservations and live leases</figcaption>
+        </figure>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Install ─────────────────────────────────────────────────────── -->
+  <section class="section" id="install">
+    <div class="section-head">
+      <div class="eyebrow">Install</div>
+      <h2>Two ways to run it</h2>
+      <p>Both give you the whole stack — control plane, workers, and the DNS / DHCP service containers.</p>
+    </div>
+
+    <div class="split">
+      <div class="panel">
+        <div class="panel-head">
+          <h3>💿 OS appliance ISO <em>(recommended)</em></h3>
+          <p>Debian 13 + embedded k3s. HTTPS in 2–5 minutes, no Docker or Kubernetes setup.</p>
+        </div>
+        <pre><code>1. Download the ISO from the releases page
+2. Boot it on a VM or bare metal
+3. Answer the installer wizard
+4. Browse to https://&lt;your-ip&gt;</code></pre>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h3>🐳 Docker Compose</h3>
+          <p>The developer-friendly path. Bring your own host.</p>
+        </div>
+        <pre><code>git clone https://github.com/spatiumddi/spatiumddi
+cd spatiumddi
+cp .env.example .env   # set POSTGRES_PASSWORD + SECRET_KEY
+make build
+make migrate
+make up</code></pre>
+      </div>
+    </div>
+
+    <p style="text-align:center;margin-top:32px;color:var(--fg-muted)">
+      Default login is <code>admin</code> / <code>admin</code>, and it forces a password change on first use.
+      Full walkthrough in <a href="{{ root }}GETTING_STARTED.html">Getting Started</a>.
+    </p>
+  </section>
+
+  <!-- ── Docs ────────────────────────────────────────────────────────── -->
+  <section class="section-alt">
+    <div class="section-inner section" id="docs">
+      <div class="section-head">
+        <div class="eyebrow">Documentation</div>
+        <h2>Read the details</h2>
+      </div>
+      <div class="grid">
+        <a class="card" href="{{ root }}GETTING_STARTED.html">
+          <h3>Getting Started →</h3>
+          <p>The recommended setup order: server groups → zones / scopes → subnets → addresses.</p>
+        </a>
+        <a class="card" href="{{ root }}ARCHITECTURE.html">
+          <h3>Architecture →</h3>
+          <p>System topology, component relationships and the HA design.</p>
+        </a>
+        <a class="card" href="{{ root }}features/IPAM.html">
+          <h3>IPAM →</h3>
+          <p>Spaces, blocks, subnets, VLAN / VXLAN, custom fields, import and export.</p>
+        </a>
+        <a class="card" href="{{ root }}features/DNS.html">
+          <h3>DNS →</h3>
+          <p>Zones, records, views, server groups, blocklists, DDNS and Windows DNS.</p>
+        </a>
+        <a class="card" href="{{ root }}features/DHCP.html">
+          <h3>DHCP →</h3>
+          <p>Servers, scopes, pools, static assignments, DDNS and Windows DHCP.</p>
+        </a>
+        <a class="card" href="{{ root }}deployment/DOCKER.html">
+          <h3>Deployment →</h3>
+          <p>Docker Compose, Kubernetes, bare metal and the OS appliance image.</p>
+        </a>
+      </div>
+      <p style="text-align:center;margin-top:32px">
+        <a class="btn btn-primary" href="{{ root }}docs.html">Browse all documentation</a>
+      </p>
+    </div>
+  </section>
+
+  {% include footer.html root=root %}
+</body>
+</html>
