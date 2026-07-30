@@ -513,3 +513,20 @@ def test_axfr_filters_dnssec_artefacts() -> None:
     assert {"RRSIG", "NSEC", "NSEC3", "DNSKEY"} <= _DNSSEC_ARTEFACTS
     # SOA/NS are handled separately (apex-scoped), not via this set.
     assert "SOA" not in _DNSSEC_ARTEFACTS
+
+
+@pytest.mark.asyncio
+async def test_role_assignment_ships_doq_udp_port(db_session, client) -> None:
+    """Found on real hardware: the DoQ UDP port was DERIVED correctly and
+    then never passed to SupervisorRoleAssignment, so it defaulted to []
+    and the appliance firewall never opened udp/<doq_port> — the listener
+    came up unreachable while the config read as correct. Ruff can't catch
+    it: the variable IS used, just not where it matters."""
+    import inspect
+
+    from app.api.v1.appliance import supervisor as sup
+
+    src = inspect.getsource(sup._build_role_assignment)
+    # It must be both derived AND handed to the model.
+    assert "dns_encrypted_udp_ports.append" in src
+    assert "dns_encrypted_udp_ports=dns_encrypted_udp_ports" in src

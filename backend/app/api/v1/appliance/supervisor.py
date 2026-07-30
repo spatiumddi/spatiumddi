@@ -2445,6 +2445,7 @@ async def _build_role_assignment(db: DB, row: Appliance) -> SupervisorRoleAssign
         firewall_extra=row.firewall_extra,
         kubeapi_expose_cidrs=list(row.kubeapi_expose_cidrs or []),
         dns_encrypted_tcp_ports=dns_encrypted_tcp_ports,
+        dns_encrypted_udp_ports=dns_encrypted_udp_ports,
     )
 
 
