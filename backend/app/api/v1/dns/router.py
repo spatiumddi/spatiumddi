@@ -3219,11 +3219,43 @@ async def list_zones(
     return list(result.scalars().all())
 
 
+async def _assert_forward_zone_serviceable(
+    group_id: uuid.UUID, zone_type: str, forwarders: list[str] | None, db: DB
+) -> None:
+    """Reject a forwarders-less forward zone on a Technitium group.
+
+    BIND9 treats ``type forward;`` with no ``forwarders`` as legal — it
+    falls back to the global forwarder list — so the shared ZoneCreate
+    validator deliberately allows it. Technitium does not: its
+    ``zones/create type=Forwarder`` requires a ``forwarder`` param, so the
+    agent has nothing to send and skips the zone with a warning. Without
+    this check the operator gets a 201 and a zone that silently never
+    exists on the daemon, which is the same failure mode the
+    secondary/stub masters check exists to prevent (issue #743).
+    """
+    if zone_type != "forward" or forwarders:
+        return
+    drivers = set(await _group_driver_names(db, group_id))
+    if "technitium" in drivers:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "a forward zone on a Technitium group requires at least one "
+                "forwarder — Technitium has no global-forwarder fallback for "
+                "forward zones, so the zone would never be created on the "
+                "server. BIND9 groups may omit it."
+            ),
+        )
+
+
 @router.post("/groups/{group_id}/zones", response_model=ZoneResponse, status_code=201)
 async def create_zone(
     group_id: uuid.UUID, body: ZoneCreate, db: DB, current_user: SuperAdmin
 ) -> DNSZone:
     await _require_group(group_id, db)
+    await _assert_forward_zone_serviceable(
+        group_id, body.zone_type, list(body.forwarders or []), db
+    )
     existing = await db.execute(
         select(DNSZone).where(
             DNSZone.group_id == group_id,
@@ -3815,6 +3847,12 @@ async def update_zone(
     if "masters" in changes:
         changes["masters"] = [m.strip() for m in changes["masters"] if m and m.strip()]
     effective_zone_type = changes.get("zone_type", zone.zone_type)
+    await _assert_forward_zone_serviceable(
+        zone.group_id,
+        effective_zone_type,
+        list(changes.get("forwarders", zone.forwarders) or []),
+        db,
+    )
     if effective_zone_type in {"secondary", "stub"}:
         effective_masters = changes.get("masters", zone.masters) or []
         if not effective_masters:

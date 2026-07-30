@@ -477,3 +477,19 @@ def test_encrypted_transport_ports_reach_the_firewall_for_technitium() -> None:
         src = inspect.getsource(mod)
         assert "dns-technitium" in src, mod.__name__
         assert "dns_encrypted_udp_ports" in src, mod.__name__
+
+
+def test_forward_zone_gate_is_driver_scoped() -> None:
+    """Found by end-to-end testing: a forward zone with no forwarders was
+    accepted (201) and then silently skipped by the agent, because
+    Technitium's zones/create requires a forwarder while BIND9 legally
+    falls back to the global list. The gate has to be driver-scoped, not
+    global, or it would break valid BIND9 configs."""
+    import inspect
+
+    from app.api.v1.dns import router
+
+    src = inspect.getsource(router._assert_forward_zone_serviceable)
+    assert "technitium" in src
+    # BIND9 must remain able to omit forwarders.
+    assert "BIND9 groups may omit it" in src
