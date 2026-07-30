@@ -15,7 +15,23 @@
 #
 # Pin the exact upstream tag (not :latest) for reproducible builds — bump
 # deliberately, the same way the pdns/bind package versions are pinned.
+#
+# Pinned by DIGEST as well as tag. Unlike bind9/powerdns — whose bases are
+# distro images from a first-party registry and whose daemons come from
+# apk with its own signature chain — this runtime is a third-party Docker
+# Hub account's image, and it lands in the appliance ISO's baked image set
+# on every install. A tag is mutable: a retag upstream would silently
+# change what ships in a release without any diff here. The digest is the
+# image INDEX (multi-arch manifest list), so buildx still selects
+# amd64/arm64 per platform (non-negotiable #11).
+#
+# To bump: set the new tag, then
+#   docker buildx imagetools inspect technitium/dns-server:<tag> \
+#     --format '{{.Manifest.Digest}}'
+# and paste the result below. Both must move together — a mismatched pair
+# fails the pull outright rather than silently preferring one.
 ARG TECHNITIUM_VERSION=15.4.0
+ARG TECHNITIUM_DIGEST=sha256:df7d90ef0f7b6fff6916d291a7022cd902290cc31c3141d4158b6c375a641b41
 ARG PYTHON_VERSION=3.12
 
 # Builder matches the RUNTIME's libc family (glibc/Debian), not Alpine —
@@ -28,7 +44,7 @@ COPY agent/dns/pyproject.toml /src/pyproject.toml
 COPY agent/dns/spatium_dns_agent /src/spatium_dns_agent
 RUN pip install --prefix=/install --no-cache-dir .
 
-FROM technitium/dns-server:${TECHNITIUM_VERSION} AS runtime
+FROM technitium/dns-server:${TECHNITIUM_VERSION}@${TECHNITIUM_DIGEST} AS runtime
 
 # `dig` already ships in the upstream image (dnsutils, installed for
 # troubleshooting) — reused here for the HEALTHCHECK. Add python3 for the
