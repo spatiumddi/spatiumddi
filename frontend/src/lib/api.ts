@@ -4937,15 +4937,22 @@ export interface DNSServerOptions {
   dnsdist_action: string;
   dnsdist_dynblock_qps: number | null;
   dnsdist_dynblock_seconds: number;
-  // Encrypted transports (issue #50). Inbound DoT/DoH listeners are
-  // additive — plain Do53 on :53 is unaffected. forward_transport is
-  // "do53" | "tls"; BIND has no client-side HTTP transport so there is no
-  // DoH-upstream option.
+  // Encrypted transports (issue #50, extended by #741). Inbound listeners
+  // are additive — plain Do53 on :53 is unaffected.
+  //
+  // forward_transport is "do53" | "tls" | "https" | "quic". BIND has no
+  // client-side HTTP or QUIC transport, so the API gates https/quic (and
+  // DoQ) to Technitium-only groups and 422s otherwise.
   dot_enabled: boolean;
   dot_port: number;
   doh_enabled: boolean;
   doh_port: number;
+  // Technitium serves DoH on a fixed /dns-query and ignores this.
   doh_path: string;
+  // DNS-over-QUIC (#741) — Technitium only. UDP, so doq_port may share a
+  // number with dot_port without colliding.
+  doq_enabled: boolean;
+  doq_port: number;
   tls_certificate_id: string | null;
   forward_transport: string;
   forward_tls_hostname: string | null;
@@ -5982,7 +5989,11 @@ export interface BlocklistCatalogResponse {
 
 // ── DNS configuration importer (issue #128) ─────────────────────────
 
-export type DNSImportSource = "bind9" | "windows_dns" | "powerdns";
+export type DNSImportSource =
+  | "bind9"
+  | "windows_dns"
+  | "powerdns"
+  | "technitium";
 export type DNSImportConflictAction = "skip" | "overwrite" | "rename";
 
 export interface DNSImportedRecord {
@@ -6165,6 +6176,34 @@ export const dnsImportApi = {
       .post<DNSImportCommitResult>("/dns/import/powerdns/commit", body)
       .then((r) => r.data),
 
+  // Technitium — REST API live pull (issue #744). Only Primary zones are
+  // imported; the rest come back as preview warnings.
+  technitiumTestConnection: (body: { api_url: string; api_token: string }) =>
+    api
+      .post<TechnitiumConnectionInfo>(
+        "/dns/import/technitium/test-connection",
+        body,
+      )
+      .then((r) => r.data),
+  technitiumPreview: (body: {
+    api_url: string;
+    api_token: string;
+    target_group_id: string;
+    target_view_id?: string | null;
+  }) =>
+    api
+      .post<DNSImportPreview>("/dns/import/technitium/preview", body)
+      .then((r) => r.data),
+  technitiumCommit: (body: {
+    target_group_id: string;
+    target_view_id?: string | null;
+    plan: DNSImportPreview;
+    conflict_actions: Record<string, DNSImportConflictDecision>;
+  }) =>
+    api
+      .post<DNSImportCommitResult>("/dns/import/technitium/commit", body)
+      .then((r) => r.data),
+
   // Cloud DNS (issue #37, Part B) — live pull of hosted zones + records
   // from a cloud DNS provider. Also the engine behind "Sync from
   // provider" on a cloud DNS server.
@@ -6197,6 +6236,14 @@ export interface PowerDNSConnectionInfo {
   daemon_type: string;
   version: string;
   url: string;
+}
+
+export interface TechnitiumConnectionInfo {
+  ok: boolean;
+  zone_count: number;
+  // Only Primary zones can be imported — a server that is mostly
+  // secondaries has far less to migrate than its raw zone count suggests.
+  importable_zone_count: number;
 }
 
 // ── DHCP configuration importer (issue #129) ────────────────────────

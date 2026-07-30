@@ -160,10 +160,11 @@ _DRIVER_GATED_RECORD_TYPES: dict[str, frozenset[str]] = {
 # online via REST and BIND9 needs the manual ``dnssec-keygen``
 # dance that's #49's umbrella scope.
 _DRIVER_GATED_OPERATIONS: dict[str, frozenset[str]] = {
-    # Both PowerDNS (online signing) and BIND9 (inline-signing via
-    # dnssec-policy, issue #49) support sign/unsign. Windows DNS does not.
-    "dnssec_sign": frozenset({"powerdns", "bind9"}),
-    "dnssec_unsign": frozenset({"powerdns", "bind9"}),
+    # PowerDNS (online signing), BIND9 (inline-signing via dnssec-policy,
+    # issue #49) and Technitium (online signing, issue #740) all support
+    # sign/unsign. Windows DNS does not.
+    "dnssec_sign": frozenset({"powerdns", "bind9", "technitium"}),
+    "dnssec_unsign": frozenset({"powerdns", "bind9", "technitium"}),
     # Manual key rollover is BIND9-only (rndc dnssec -rollover); PowerDNS
     # rolls on its own schedule + Windows DNS isn't supported.
     "dnssec_rollover": frozenset({"bind9"}),
@@ -176,7 +177,16 @@ VALID_DNSDIST_ACTIONS = {"truncate", "drop"}
 # client-side HTTP transport, so DoH-upstream isn't expressible on the BIND9
 # driver. The dnsdist front used by PowerDNS can do it and gets its own knob
 # if/when that's wired.
-VALID_FORWARD_TRANSPORTS = {"do53", "tls"}
+VALID_FORWARD_TRANSPORTS = {"do53", "tls", "https", "quic"}
+# Transports only some drivers can actually speak. BIND 9.20 forwards
+# over DoT but has no client-side HTTP or QUIC transport, so https /
+# quic are refused for a bind9 group rather than rendered into a
+# named.conf that would not load. Technitium does all four (verified
+# live against 15.4.0). Issue #741.
+_TRANSPORT_DRIVER_GATE: dict[str, frozenset[str]] = {
+    "https": frozenset({"technitium"}),
+    "quic": frozenset({"technitium"}),
+}
 # Ports a DoT / DoH listener may never claim (issue #50). The listeners bind
 # ``any``, which includes loopback, so they collide with the fixed ports the
 # agent hardcodes into every rendered named.conf. Value is the operator-facing
@@ -517,6 +527,10 @@ class ServerOptionsUpdate(BaseModel):
     # over-long value 422s at the boundary instead of 500-ing on asyncpg's
     # StringDataRightTruncation at commit.
     doh_path: str | None = Field(default=None, max_length=128)
+    # DNS-over-QUIC (#741) — Technitium-only, and UDP, so it may share a
+    # port number with DoT without colliding.
+    doq_enabled: bool | None = None
+    doq_port: int | None = Field(default=None, ge=1, le=65535)
     tls_certificate_id: uuid.UUID | None = None
     forward_transport: str | None = None
     forward_tls_hostname: str | None = Field(default=None, max_length=255)
@@ -651,6 +665,8 @@ class ServerOptionsResponse(BaseModel):
     doh_enabled: bool
     doh_port: int
     doh_path: str
+    doq_enabled: bool
+    doq_port: int
     tls_certificate_id: uuid.UUID | None
     forward_transport: str
     forward_tls_hostname: str | None
@@ -2394,11 +2410,11 @@ async def _assert_encrypted_transport_sane(opts: DNSServerOptions, db: DB) -> No
     port bind that would fail at runtime. Catching it on the API boundary
     turns an agent that won't start into a 422 the operator can read.
     """
-    if opts.dot_enabled or opts.doh_enabled:
+    if opts.dot_enabled or opts.doh_enabled or opts.doq_enabled:
         if opts.tls_certificate_id is None:
             raise HTTPException(
                 422,
-                "A TLS certificate is required to enable DoT or DoH. "
+                "A TLS certificate is required to enable DoT, DoH or DoQ. "
                 "Upload or issue one under Appliance → Web UI Certificate first.",
             )
         cert = await db.get(ApplianceCertificate, opts.tls_certificate_id)
@@ -2430,6 +2446,14 @@ async def _assert_encrypted_transport_sane(opts: DNSServerOptions, db: DB) -> No
     if opts.dot_enabled and opts.doh_enabled and opts.dot_port == opts.doh_port:
         raise HTTPException(422, "dot_port and doh_port must differ")
 
+    # DoQ (#741) is UDP where DoT/DoH are TCP, so it may legitimately share
+    # a port number with DoT — 853 is the RFC-default for both. Only the
+    # reserved-port check applies.
+    if opts.doq_enabled:
+        reason = _RESERVED_DNS_PORTS.get(opts.doq_port)
+        if reason:
+            raise HTTPException(422, f"doq_port cannot be {opts.doq_port} — {reason}")
+
     # On an appliance the frontend already serves HTTPS on 443/80, and the
     # DNS workload runs with hostNetwork — so a listener there would fight
     # the web UI for the port. Applies to BOTH listeners: nothing stops an
@@ -2448,6 +2472,51 @@ async def _assert_encrypted_transport_sane(opts: DNSServerOptions, db: DB) -> No
                     "publish it to clients via DoH bootstrap configuration.",
                 )
 
+    # Driver gates for the transports only Technitium speaks (#741).
+    #
+    # EVERY driver in the group has to support the setting, not merely one
+    # of them — same subset semantics as ``_check_driver_gated_record_type``.
+    # An "any driver matches" test would let a mixed bind9 + technitium
+    # group save forward_transport="https", and bind9 would then quietly
+    # keep forwarding in cleartext on :53 while the UI claimed DoH.
+    drivers = set(await _group_driver_names(db, opts.group_id))
+    allowed = _TRANSPORT_DRIVER_GATE.get(opts.forward_transport)
+    if allowed is not None and drivers:
+        incompatible = drivers - allowed
+        if incompatible:
+            raise HTTPException(
+                422,
+                f"forward_transport {opts.forward_transport!r} is not supported by "
+                f"{', '.join(sorted(incompatible))} in this group. BIND9 has no "
+                "client-side HTTP or QUIC transport, so it can only forward over "
+                "do53 or tls — move those servers to their own group, or pick a "
+                "transport every driver in this group can speak.",
+            )
+    if opts.doq_enabled and drivers:
+        incompatible = drivers - {"technitium"}
+        if incompatible:
+            raise HTTPException(
+                422,
+                "DNS-over-QUIC is only supported by the Technitium driver, but "
+                f"this group also runs {', '.join(sorted(incompatible))}.",
+            )
+
+    # Every encrypted transport needs a name, not just DoT.
+    #
+    # For bind9 (tls) it is what ``remote-hostname`` validates against, so
+    # the requirement is conditional on verification being on. For
+    # technitium it is stricter: the daemon rejects an IP outright
+    # ("Address must be a domain name") for tls/https/quic, so without a
+    # hostname the agent has nothing to send and skips the forwarder apply
+    # entirely — leaving whatever forwarders were there before. Requiring
+    # it up front turns that silent staleness into a 422.
+    if opts.forward_transport in ("https", "quic") and not opts.forward_tls_hostname:
+        raise HTTPException(
+            422,
+            f"forward_tls_hostname is required when forwarding over "
+            f"{opts.forward_transport} — the upstream is addressed by name, not "
+            "by IP. Set the provider's hostname (e.g. cloudflare-dns.com).",
+        )
     if (
         opts.forward_transport == "tls"
         and opts.forward_tls_verify
@@ -2542,7 +2611,15 @@ async def update_options(
     # per-appliance desired-state change wakes the appliance channel too.
     if any(
         f in changes
-        for f in ("dot_enabled", "dot_port", "doh_enabled", "doh_port", "tls_certificate_id")
+        for f in (
+            "dot_enabled",
+            "dot_port",
+            "doh_enabled",
+            "doh_port",
+            "doq_enabled",
+            "doq_port",
+            "tls_certificate_id",
+        )
     ):
         await _collect_appliance_wakes_for_dns_group(db, group_id)
     await db.commit()
@@ -3142,11 +3219,43 @@ async def list_zones(
     return list(result.scalars().all())
 
 
+async def _assert_forward_zone_serviceable(
+    group_id: uuid.UUID, zone_type: str, forwarders: list[str] | None, db: DB
+) -> None:
+    """Reject a forwarders-less forward zone on a Technitium group.
+
+    BIND9 treats ``type forward;`` with no ``forwarders`` as legal — it
+    falls back to the global forwarder list — so the shared ZoneCreate
+    validator deliberately allows it. Technitium does not: its
+    ``zones/create type=Forwarder`` requires a ``forwarder`` param, so the
+    agent has nothing to send and skips the zone with a warning. Without
+    this check the operator gets a 201 and a zone that silently never
+    exists on the daemon, which is the same failure mode the
+    secondary/stub masters check exists to prevent (issue #743).
+    """
+    if zone_type != "forward" or forwarders:
+        return
+    drivers = set(await _group_driver_names(db, group_id))
+    if "technitium" in drivers:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "a forward zone on a Technitium group requires at least one "
+                "forwarder — Technitium has no global-forwarder fallback for "
+                "forward zones, so the zone would never be created on the "
+                "server. BIND9 groups may omit it."
+            ),
+        )
+
+
 @router.post("/groups/{group_id}/zones", response_model=ZoneResponse, status_code=201)
 async def create_zone(
     group_id: uuid.UUID, body: ZoneCreate, db: DB, current_user: SuperAdmin
 ) -> DNSZone:
     await _require_group(group_id, db)
+    await _assert_forward_zone_serviceable(
+        group_id, body.zone_type, list(body.forwarders or []), db
+    )
     existing = await db.execute(
         select(DNSZone).where(
             DNSZone.group_id == group_id,
@@ -3738,6 +3847,12 @@ async def update_zone(
     if "masters" in changes:
         changes["masters"] = [m.strip() for m in changes["masters"] if m and m.strip()]
     effective_zone_type = changes.get("zone_type", zone.zone_type)
+    await _assert_forward_zone_serviceable(
+        zone.group_id,
+        effective_zone_type,
+        list(changes.get("forwarders", zone.forwarders) or []),
+        db,
+    )
     if effective_zone_type in {"secondary", "stub"}:
         effective_masters = changes.get("masters", zone.masters) or []
         if not effective_masters:

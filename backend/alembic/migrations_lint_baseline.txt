@@ -198,6 +198,8 @@ backend/alembic/versions/b1e7c04a93df_fragile_device_do_not_probe.py:drop_column
 backend/alembic/versions/b2c84f7a91d3_unifi_integration.py:drop_column:168
 backend/alembic/versions/b2c84f7a91d3_unifi_integration.py:drop_column:171
 backend/alembic/versions/b2c84f7a91d3_unifi_integration.py:drop_table:173
+backend/alembic/versions/b2d47f1c8a30_dns_over_quic_options.py:drop_column:58
+backend/alembic/versions/b2d47f1c8a30_dns_over_quic_options.py:drop_column:59
 backend/alembic/versions/b2e5d8a41c67_static_ipam_metadata_snapshot.py:drop_column:37
 backend/alembic/versions/b2f5a9c41e07_acme_manual_dns.py:drop_column:55
 backend/alembic/versions/b2f5a9c41e07_acme_manual_dns.py:drop_column:56

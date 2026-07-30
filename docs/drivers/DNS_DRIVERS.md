@@ -653,26 +653,132 @@ Technitium has no static local secret file the entrypoint pre-seeds (unlike Powe
 
 The token never reaches the control plane — same agent-local trust boundary as PowerDNS's API key and BIND9's TSIG/rndc key.
 
-### 4B.3 Capabilities (v1)
+### 4B.3 Capabilities
 
 ```python
 {
     "name": "technitium",
     "views": False,
     "rpz": False,
-    "dnssec_inline_signing": False,   # fast-follow — see §4B.5
+    "dnssec_inline_signing": True,
     "incremental_updates": "rest_api",
-    "zone_types": ["primary"],        # secondary/stub/forward deferred
+    "zone_types": ["forward", "primary", "secondary", "stub"],
     "record_types": [...],            # A/AAAA/CNAME/MX/TXT/NS/PTR/SRV/CAA/
                                        # TLSA/SSHFP/NAPTR/URI/SOA/SVCB/HTTPS/DNAME
     "alias_records": False,           # Technitium has ANAME/APP instead —
                                        # a different shape, not a drop-in
     "lua_records": False,
-    "catalog_zones": False,
+    "catalog_zones": True,
 }
 ```
 
 `dynamic_update_caps` is the all-False default (no RFC 2136 client-facing UPDATE listener wired in v1 — all mutation flows through the agent's queued record-op reconciler).
+
+### 4B.3a Zone types, transfer and catalog (issue #743)
+
+Neutral `zone_type` → Technitium's `/api/zones/create` `type`:
+
+| SpatiumDDI | Technitium | Extra create param |
+|---|---|---|
+| `primary` | `Primary` | — |
+| `secondary` | `Secondary` | `primaryNameServerAddresses` (comma-joined `masters`) |
+| `stub` | `Stub` | `primaryNameServerAddresses` |
+| `forward` | `Forwarder` | `forwarder` — **one** upstream only |
+
+Three behaviours worth knowing, all confirmed against a live daemon:
+
+- **Only a primary's records are reconciled.** A secondary and a stub fill themselves from the transfer and a forwarder holds none, so diffing them would delete whatever the daemon just pulled down. `_RECORD_MANAGED_ZONE_TYPES` gates this on both the render and the reconcile side.
+- **A secondary/stub create is not guaranteed to succeed, and is not safely retryable-forever.** Technitium resolves SOA against the configured primaries at create time and errors if none answer (`DNS Server did not receive SOA record in response from any of the primary name servers`). An unreachable primary therefore fails on *every* reconcile pass. The control-plane driver rejects a secondary/stub with no `masters` up front so the operator gets a 422 on save instead of a zone that silently never appears.
+- **A Forwarder zone takes a single upstream** where BIND's takes a list. The first is used and the rest are dropped with a `technitium_forwarder_extra_upstreams_ignored` warning, rather than silently.
+
+**Zone transfer.** BIND declares `allow-transfer` once per server; Technitium has no global equivalent, so the same policy is stamped onto each primary. `["none"]`/empty → `Deny`, `any` → `Allow`, anything else → `UseSpecifiedNetworkACL` plus the CIDR list. TSIG key names are attached only where transfer is actually permitted — naming keys on a `Deny` zone would read as if signed transfer were enabled when nothing can transfer at all.
+
+> ⚠️ **`zones/options/set` silently ignores values it does not recognise.** Setting `zoneTransfer="Bogus"` returns `{"status":"ok"}` and leaves the previous value in place. A typo therefore does not fail — it leaves transfer at whatever it was, which for a zone you meant to lock down is a security regression no log line would report. The driver validates against `_ZONE_TRANSFER_VALUES` and refuses to send anything else. Do not remove that check.
+
+**TSIG keys** live in *global* settings, not per zone. The wire format is a **flat pipe-delimited token list read in triples** — `name|secret|algorithm|name2|secret2|algorithm2|…`. Not JSON, and not `name|algorithm|secret` (that fails with "TSIG algorithm is not supported", because it reads the secret as the algorithm). `settings/set` **replaces the whole list**, so keys an operator added directly in the Technitium console are dropped on the next sync — the same control-plane-is-truth stance the rest of the driver takes, but worth knowing. Note also that `zoneTransferTsigKeyNames` accepts a key the server does not have, so keys are pushed *before* anything references them.
+
+**Catalog zones (RFC 9432)** work in both roles. As **producer** the agent creates the `Catalog` zone and stamps `catalog=<name>` onto each primary it owns. As **consumer** it creates a `SecondaryCatalog` zone pointed at the producer — note that zone is *not* in the bundle's zone list (the control plane ships it as a catalog block, not a zone row), so `_apply_catalog` has to create it or a consumer silently does nothing at all. Turning catalog zones off clears membership by writing `catalog=""`, which is how Technitium unsets the field; without that, disabling the feature would leave every member permanently enrolled.
+
+### 4B.3b DNSSEC (issue #740)
+
+Online signing, op-driven — the same shape as PowerDNS, not BIND9's config-rendered `dnssec-policy`. `dnssec_sign` / `dnssec_unsign` ride the record-op queue and branch out before any rrset machinery.
+
+```
+POST /api/zones/dnssec/sign?zone=<z>&algorithm=ECDSA&curve=P256&nxProof=NSEC
+POST /api/zones/dnssec/unsign?zone=<z>
+```
+
+The neutral op carries no algorithm — it is a bare "sign this zone" from the UI, and BIND expresses the choice through a `dnssec-policy` name that means nothing here — so the driver picks **ECDSA P256 / NSEC**. RSA (with `hashAlgorithm` + `kskKeySize`/`zskKeySize`), ECDSA P384, EDDSA ED25519, and NSEC3 (`nxProof=NSEC3` + `iterations`/`saltLength`) all sign successfully if that default ever needs to become operator-selectable.
+
+Signing is idempotent: an already-signed zone answers `Cannot sign zone: the zone is already signed.`, which is treated as success so repeated "Sign zone" clicks converge on signed rather than erroring.
+
+**Getting the DS records out is the non-obvious part.** Technitium splits the information across two calls:
+
+- `zones/dnssec/properties/get` has the key inventory — `keyTag`, `keyType`, `algorithmNumber`, `state`, rollover timings — and **no DS records at all**.
+- The DS material lives on the zone's own DNSKEY records, at `rData.computedDigests`, and only on the KSK (a DS attests the key-signing key to the parent). Each KSK yields one digest per type — SHA256 and SHA384 observed — all of which the operator should publish to cover validators of differing sophistication.
+
+The driver joins the two into standard presentation form, `<keyTag> <algorithm> <digestType> <digest>`, mapping Technitium's digest-type *names* back to their RFC 4034 numbers:
+
+```
+34619 13 2 DD98135E57B56C0EAB…
+34619 13 4 309DB47A617B7E122C…
+```
+
+Unlike the PowerDNS agent, this driver reports `keys` as well as `ds_records` — Technitium exposes per-key state and the control plane already models it as #49's `DNSKey` rows.
+
+> ⚠️ A signed zone serves DNSKEY / RRSIG / NSEC / NSEC3 / NSEC3PARAM records that **no bundle describes**. `_DNSSEC_RECORD_TYPES` filters them out of `_get_zone_records`; without that, the full-zone reconcile treats every signing artefact as an extra record and tries to delete the zone's own signatures on every single pass. There is a regression test for exactly this.
+
+Manual key rollover stays BIND9-only. Technitium rolls on its own schedule — `dnssecPrivateKeys` carries `rolloverDays` per key — so `dnssec_rollover` is deliberately *not* widened to technitium.
+
+### 4B.3c Encrypted transports (issue #741)
+
+Technitium serves **DoT, DoH and DoQ natively** and forwards over all of them — no dnsdist-style sidecar, and no BIND-style "we can receive it but not send it" gap. Everything is driven through `settings/set`.
+
+| Setting | Purpose |
+|---|---|
+| `enableDnsOverTls` / `dnsOverTlsPort` | inbound DoT (TCP, default 853) |
+| `enableDnsOverHttps` / `dnsOverHttpsPort` | inbound DoH (TCP, default 443) |
+| `enableDnsOverQuic` / `dnsOverQuicPort` | inbound DoQ (**UDP**, default 853) |
+| `dnsTlsCertificatePath` | cert served by all three |
+| `forwarderProtocol` | `Udp` / `Tcp` / `Tls` / `Https` / `Quic` |
+
+DoQ is UDP where DoT is TCP, so `doq_port` may legitimately equal `dot_port` — 853 is the RFC default for both, and they do not collide. The firewall layer must open **udp**/`doq_port`, not tcp.
+
+Four behaviours to know, all verified live and all silent if you get them wrong:
+
+- **The certificate must be PKCS #12**, supplied as a file path. PEM is rejected with `DNS Server TLS certificate file must be PKCS #12 formatted`. The bundle ships PEM (that is what `ApplianceCertificate` holds and what BIND9 consumes), so `_write_tls_cert` converts and writes a 0600 `.pfx` into the agent state dir. A cert that fails to parse returns `None` and the listeners stay down — degrade to Do53, never take the daemon with it.
+- **Enabling a listener and setting the cert path are independent.** `enableDnsOverTls=true` lands even when the `dnsTlsCertificatePath` in the *same call* is rejected, which would leave a listener enabled with no certificate. So the cert path goes first, in its own call, and the listeners are only enabled once it succeeds.
+- **`forwarderProtocol` is silently ignored unless `forwarders` is set in the same call.** Setting the protocol alone returns `{"status":"ok"}` and leaves it at `Udp`. The two are always sent together.
+- **Encrypted forwarding needs a domain name, not an IP.** `1.1.1.1` is rejected with `Address must be a domain name` — there would be nothing to validate the upstream certificate against. The neutral model carries a list of forwarder IPs plus a single `forward_tls_hostname`, so over `tls`/`https`/`quic` the hostname wins and the IPs are dropped with a log line naming what went. Technitium then normalises a bare hostname into the transport's canonical form (`cloudflare-dns.com` → `cloudflare-dns.com:853` for DoT, `https://cloudflare-dns.com/dns-query` for DoH).
+
+`forward_transport` accepts `do53` / `tls` / `https` / `quic`, but `https` and `quic` are gated to technitium groups at the API boundary (`_TRANSPORT_DRIVER_GATE`) — BIND 9.20 has no client-side HTTP or QUIC transport, so allowing them on a bind9 group would render a `named.conf` that will not load. `doq_enabled` is gated the same way.
+
+### 4B.3d Blocklists and the live-pull importer (issue #744)
+
+**Blocklists.** Technitium has no RPZ. It blocks natively, from subscribed URL lists or from a per-domain *blocked zones* set, so SpatiumDDI's effective blocklist entries map onto the latter and its exceptions onto the *allowed* set — Technitium's allowed set is exactly an RPZ passthru. `blockingType` derives from the entries' block modes (`nxdomain` → `NxDomain`, `sinkhole`/`redirect` → `CustomAddress`), and it has the same silent-ignore trap as `zoneTransfer`, so it is validated before sending.
+
+Per-view blocklists **collapse into one flat set**: Technitium's native blocking is server-wide with no view concept, and the driver declines views outright. Collapsing is the honest reading of "block these names on this server" — the alternative would be silently applying one view's list to every client. `is_wildcard` is likewise dropped: Technitium blocks a domain *and* its subdomains by default, so exact-match and wildcard land identically.
+
+The apply is **flush-then-rewrite, not a diff**, and that is deliberate. `blocked/list` is a one-level *tree browser*: `domain=""` returns top-level nodes, `domain="foo.test"` returns its children, and only a leaf carries the actual block under `records`. Intermediate nodes therefore appear in a listing without being blocked domains, and deleting one removes the whole subtree beneath it — reconciling against a flat read of the root wiped every entry in testing. Flush-and-rewrite needs no read model, so it cannot be subtly wrong that way; the cost is a brief window with no blocking on each structural apply, which record CRUD does not trigger.
+
+**Live-pull importer** (`services/dns_import/technitium.py`) — one-shot migration off an existing Technitium install, feeding the same canonical IR and commit pipeline as the BIND9 / Windows / PowerDNS importers.
+
+The difference from those is the record shape. PowerDNS hands back `content` strings that parse straight into a value; Technitium hands back structured `rData` whose field names do not match its own *write* API and which renders numeric rdata as enum names. `_rdata_to_value` is the inverse of the agent's `_normalize_rdata` — `{"certificateUsage": "DANE-EE", "selector": "SPKI", "matchingType": "SHA2-256"}` becomes `3 1 1 <hex>`. Unknown enum members pass through unchanged so a future Technitium release degrades to one odd record rather than an exception mid-import.
+
+Only `Primary` zones are imported. Secondary / Stub / Forwarder / Catalog are reported as warnings — a secondary is a copy of someone else's data, and importing it would mint rows SpatiumDDI then serves authoritatively. Disabled records are skipped too, since importing one would resurrect something the operator had turned off. And because Technitium answers HTTP 200 even on failure, `_unwrap` checks the body's `status` — that is the only place an expired token surfaces.
+
+### 4B.3e Config drift (issue #61)
+
+`pull_zone_records` AXFRs the zone off the Technitium host, the same path BIND9's drift uses. Technitium's own REST API would be the more natural source — it is exactly what the live-pull importer reads — but that API listens on loopback `:5380` inside the agent's container and only the co-located agent can reach it, so the control plane goes over DNS.
+
+**Two prerequisites, and the second is a real limitation:**
+
+1. The group's `allow transfer` must permit the control plane. It defaults to `none`, which renders as Technitium `zoneTransfer: Deny`.
+2. **The group must have no TSIG keys.** `_zone_options_payload` names every group TSIG key on the zone once transfer is permitted, and Technitium then requires a *signed* transfer — an unsigned AXFR is REFUSED. The control plane does not yet sign its AXFR, which is exactly the limitation [#734](https://github.com/spatiumddi/spatiumddi/issues/734) tracks for BIND9. Verified both ways on a live daemon: with key names attached the transfer is REFUSED, and clearing them makes the same AXFR return NOERROR.
+
+The refusal is surfaced as an error on the drift row rather than an empty diff — an empty diff from a refused transfer would read as "in sync", which is the worst possible answer.
+
+Closing this properly means teaching the shared AXFR path to TSIG-sign, which fixes #734 for BIND9 at the same time. It is deliberately not done here: it touches shared infrastructure and secret decryption in the drift path, and deserves its own change.
 
 ### 4B.4 Record type mapping
 
@@ -682,7 +788,6 @@ Technitium's API takes structured per-type params rather than PowerDNS's single 
 
 - **DNSSEC online signing** — Technitium's `/api/zones/dnssec/*` surface is close in shape to PowerDNS's (`sign`/`unsign`/key rollover), should port quickly once picked up.
 - **Native DoT/DoH/DoQ listeners** — Technitium's real differentiator over PowerDNS: it speaks all three natively, so no dnsdist-style sidecar is needed (contrast §9.2). Needs a settings-API spike to confirm the exact `/api/settings/set` shape, which isn't covered by the public zone/record API docs.
-- **Catalog zones, secondary/stub zones + TSIG-authenticated zone transfer.**
 - **Query-log shipping** — Technitium's query logging is API/DB-backed (`/api/logs/query*`), not a tailable text file like BIND9's `query_log_file` or PowerDNS's redirected stderr capture, so it needs a poll-and-diff shipper rather than the existing file-tailing `QueryLogShipper`.
 - **Live-pull `dns_import` importer** for existing Technitium installs (mirrors `services/dns_import/powerdns.py`).
 

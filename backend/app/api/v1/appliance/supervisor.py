@@ -1248,6 +1248,9 @@ class SupervisorRoleAssignment(BaseModel):
     # encrypted listener (or no usable cert), and the renderer opens
     # nothing extra.
     dns_encrypted_tcp_ports: list[int] = Field(default_factory=list)
+    # #741 — DoQ is UDP, so it needs its own channel: opening its port on
+    # tcp would leave the listener unreachable while looking configured.
+    dns_encrypted_udp_ports: list[int] = Field(default_factory=list)
 
 
 class SupervisorHeartbeatResponse(BaseModel):
@@ -2375,6 +2378,7 @@ async def _build_role_assignment(db: DB, row: Appliance) -> SupervisorRoleAssign
     # the supervisor's renderer opens exactly these and nothing more, so
     # turning a listener off closes its port on the next apply.
     dns_encrypted_tcp_ports: list[int] = []
+    dns_encrypted_udp_ports: list[int] = []
     if row.assigned_dns_group_id is not None:
         dns_group = await db.get(DNSServerGroup, row.assigned_dns_group_id)
         if dns_group is not None:
@@ -2396,7 +2400,13 @@ async def _build_role_assignment(db: DB, row: Appliance) -> SupervisorRoleAssign
                         dns_encrypted_tcp_ports.append(int(dns_opts.dot_port))
                     if dns_opts.doh_enabled:
                         dns_encrypted_tcp_ports.append(int(dns_opts.doh_port))
+                    # DoQ rides UDP (#741). It may share a port number with
+                    # DoT — 853 is the RFC default for both — which is why
+                    # the two lists are separate rather than one merged set.
+                    if getattr(dns_opts, "doq_enabled", False):
+                        dns_encrypted_udp_ports.append(int(dns_opts.doq_port))
             dns_encrypted_tcp_ports = sorted(set(dns_encrypted_tcp_ports))
+            dns_encrypted_udp_ports = sorted(set(dns_encrypted_udp_ports))
 
     dhcp_group_name: str | None = None
     dhcp_network_mode: str | None = None
@@ -2435,6 +2445,7 @@ async def _build_role_assignment(db: DB, row: Appliance) -> SupervisorRoleAssign
         firewall_extra=row.firewall_extra,
         kubeapi_expose_cidrs=list(row.kubeapi_expose_cidrs or []),
         dns_encrypted_tcp_ports=dns_encrypted_tcp_ports,
+        dns_encrypted_udp_ports=dns_encrypted_udp_ports,
     )
 
 

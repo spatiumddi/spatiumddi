@@ -15,23 +15,25 @@ internal store, managed exclusively through the API), so this driver's
 real reconcile-against-API logic lives in the agent-side driver under
 ``agent/dns/spatium_dns_agent/drivers/technitium.py``.
 
-v1 scope (this driver):
+Scope (this driver):
 
-* Primary zones + standard record CRUD via the Technitium REST API. The
-  agent generates a permanent API token on first boot
+* Primary / secondary / stub / forward zones, standard record CRUD, and
+  catalog-zone membership via the Technitium REST API. The agent
+  generates a permanent API token on first boot
   (``POST /api/user/createToken``) and is the only caller — the control
   plane formulates ``RecordChange`` ops and the agent translates them to
   ``/api/zones/records/{add,update,delete}`` calls.
 * Validate the bundle (zone names end with ".", record types from the
-  supported set, primary zones only, no views).
+  supported set, zone types from ``_SUPPORTED_ZONE_TYPES``, secondary /
+  stub zones carry primaries to transfer from, no views).
 
 Deferred to fast-follow phases (tracked in the roadmap, not this driver):
 
-* DNSSEC online signing (Technitium's ``/api/zones/dnssec/*`` surface is
-  close in shape to PowerDNS's — should port quickly once picked up).
-* Native DNS-over-TLS/HTTPS/QUIC listener wiring — a real differentiator
-  over PowerDNS (no dnsdist sidecar needed), needs a settings-API spike.
-* Catalog zones, secondary/stub/forward zones + TSIG zone transfer.
+* Native DNS-over-TLS/HTTPS/QUIC listener wiring — issue #741. A real
+  differentiator over PowerDNS (no dnsdist sidecar needed); it also
+  supports encrypted *upstream* forwarding, which BIND9 cannot do.
+* Query-log shipping — issue #742.
+* ``dns_import`` live-pull + blocklist wiring — issue #744.
 * ANAME / APP / FWD record types (Technitium-proprietary, different shape
   than PowerDNS's ALIAS/LUA — not a drop-in equivalent).
 
@@ -60,6 +62,12 @@ from app.drivers.dns.base import (
 
 logger = structlog.get_logger(__name__)
 
+
+# Zone types the driver can create (issue #743). Technitium's own names
+# are Primary / Secondary / Stub / Forwarder; the mapping lives agent-side
+# in ``_ZONE_TYPE_MAP``. Catalog zones are handled out-of-band via the
+# group's catalog block, not as a per-zone type an operator picks.
+_SUPPORTED_ZONE_TYPES = frozenset({"primary", "secondary", "stub", "forward"})
 
 # Record types the Technitium driver supports in v1, taken from Technitium's
 # documented `/api/zones/records/add` type list. ANAME / FWD / APP are
@@ -251,6 +259,53 @@ class TechnitiumDriver(DNSDriver):
             zone=zone_name,
         )
 
+    async def pull_zone_records(self, server: Any, zone_name: str) -> list[RecordData]:
+        """AXFR the zone off the Technitium host, for the #61 drift report.
+
+        Technitium's own REST API would be the more natural source — it is
+        exactly what the live-pull importer reads — but that API listens on
+        loopback :5380 inside the agent's container and is reachable only
+        by the co-located agent. The control plane can only talk to the
+        server over DNS, so drift goes over AXFR, the same path BIND9 uses.
+
+        **This requires the zone to permit transfer to the control plane.**
+        Zone-transfer policy is derived from the group's ``allow_transfer``
+        (see ``_zone_options_payload`` in the agent driver), which defaults
+        to ``["none"]`` → ``Deny``. On a default install the AXFR is
+        REFUSED and the drift row surfaces that rather than silently
+        reporting "no drift" — an empty diff from a refused transfer would
+        be far worse than an error, because it reads as "in sync".
+        """
+        from app.drivers.dns._axfr import axfr_zone_records  # noqa: PLC0415
+
+        host = getattr(server, "host", None)
+        if not host:
+            raise RuntimeError("TechnitiumDriver.pull_zone_records: server.host is required")
+        port = getattr(server, "port", None) or 53
+        try:
+            return await axfr_zone_records(
+                host=host,
+                port=port,
+                zone_name=zone_name,
+                log_driver="technitium",
+                server_id=str(getattr(server, "id", "")),
+            )
+        except Exception as exc:
+            # A bare "REFUSED" tells the operator nothing about what to do.
+            # Name the setting that governs it.
+            if "REFUSED" in str(exc).upper():
+                raise RuntimeError(
+                    f"{host} refused the zone transfer for {zone_name!r}. Drift "
+                    "reads the live zone over AXFR, which needs two things on "
+                    "the group: 'allow transfer' must permit the control plane "
+                    "(it defaults to none), AND the group must have no TSIG "
+                    "keys — Technitium requires a SIGNED transfer once any key "
+                    "is named on the zone, and the control plane does not yet "
+                    "sign its AXFR (the same limitation as issue #734 for "
+                    "BIND9)."
+                ) from exc
+            raise
+
     # ── Validation / capabilities ─────────────────────────────────────────
 
     def validate_config(self, bundle: ConfigBundle) -> tuple[bool, list[str]]:
@@ -263,18 +318,29 @@ class TechnitiumDriver(DNSDriver):
             if key in seen:
                 errors.append(f"duplicate zone {z.name!r} in view {z.view_name!r}")
             seen.add(key)
-            if z.zone_type != "primary":
+            if z.zone_type not in _SUPPORTED_ZONE_TYPES:
                 errors.append(
                     f"zone {z.name!r}: zone_type {z.zone_type!r} not supported by "
-                    "the v1 Technitium driver (primary zones only — secondary/"
-                    "stub/forward are a fast-follow)"
+                    f"the Technitium driver (supported: "
+                    f"{', '.join(sorted(_SUPPORTED_ZONE_TYPES))})"
                 )
+            # A secondary/stub with nowhere to transfer from cannot be
+            # created at all — Technitium resolves SOA against the primaries
+            # at create time. Catch it here so the operator gets a 422 on
+            # save rather than a zone that silently never appears.
+            if z.zone_type in ("secondary", "stub") and not z.masters:
+                errors.append(
+                    f"zone {z.name!r}: zone_type {z.zone_type!r} requires at least "
+                    "one primary name-server address to transfer from"
+                )
+            if z.zone_type == "forward" and not z.forwarders:
+                errors.append(f"zone {z.name!r}: forward zones require at least one forwarder")
             for r in z.records:
                 rtype = r.record_type.upper()
                 if rtype not in _SUPPORTED_RECORD_TYPES:
                     errors.append(
                         f"zone {z.name!r}: record type {rtype!r} not supported "
-                        f"by the v1 Technitium driver"
+                        f"by the Technitium driver"
                     )
         if bundle.views:
             errors.append(
@@ -294,13 +360,13 @@ class TechnitiumDriver(DNSDriver):
             "name": "technitium",
             "views": False,
             "rpz": False,
-            "dnssec_inline_signing": False,  # fast-follow
+            "dnssec_inline_signing": True,  # issue #740 — online signing
             "incremental_updates": "rest_api",
-            "zone_types": ["primary"],
+            "zone_types": sorted(_SUPPORTED_ZONE_TYPES),
             "record_types": sorted(_SUPPORTED_RECORD_TYPES),
             "alias_records": False,
             "lua_records": False,
-            "catalog_zones": False,
+            "catalog_zones": True,
         }
 
     @property

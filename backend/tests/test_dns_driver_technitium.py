@@ -181,7 +181,11 @@ def test_validate_config_rejects_views(bundle: ConfigBundle) -> None:
     assert any("does not support views" in e for e in errors)
 
 
-def test_validate_config_rejects_non_primary_zone(zone: ZoneData) -> None:
+def test_validate_config_accepts_secondary_with_masters(zone: ZoneData) -> None:
+    """Superseded issue #743: a secondary used to be rejected outright.
+    It is now valid as long as it carries somewhere to transfer from —
+    see test_validate_rejects_secondary_without_masters for the other half.
+    """
     secondary = ZoneData(
         name=zone.name,
         zone_type="secondary",
@@ -210,8 +214,7 @@ def test_validate_config_rejects_non_primary_zone(zone: ZoneData) -> None:
         generated_at=datetime(2026, 7, 27, 12, 0, tzinfo=UTC),
     )
     ok, errors = TechnitiumDriver().validate_config(bundle)
-    assert ok is False
-    assert any("not supported by the v1 Technitium driver" in e for e in errors)
+    assert ok is True, errors
 
 
 def test_validate_config_rejects_unsupported_record_types(zone: ZoneData) -> None:
@@ -316,13 +319,16 @@ def test_validate_config_blocklists_are_warned_not_errored(zone: ZoneData) -> No
 # ── Capabilities ──────────────────────────────────────────────────────────
 
 
-def test_capabilities_v1_scope() -> None:
+def test_capabilities_scope() -> None:
     caps = TechnitiumDriver().capabilities()
-    assert caps["zone_types"] == ["primary"]
-    assert caps["dnssec_inline_signing"] is False
+    assert set(caps["zone_types"]) == {"primary", "secondary", "stub", "forward"}
+    # Online signing landed in #740.
+    assert caps["dnssec_inline_signing"] is True
+    # ALIAS/LUA stay unsupported: Technitium's ANAME/APP are a different
+    # shape, not a drop-in equivalent.
     assert caps["alias_records"] is False
     assert caps["lua_records"] is False
-    assert caps["catalog_zones"] is False
+    assert caps["catalog_zones"] is True
     assert "SVCB" in caps["record_types"]
     assert "HTTPS" in caps["record_types"]
     assert "DNAME" in caps["record_types"]
@@ -332,3 +338,195 @@ def test_dynamic_update_caps_unsupported() -> None:
     caps = TechnitiumDriver().dynamic_update_caps
     assert caps.supports_ip_acl is False
     assert caps.supports_tsig_acl is False
+
+
+# ── Zone types + capabilities (issue #743) ──────────────────────────────
+
+
+def _zone(name: str, zone_type: str, **over: object) -> ZoneData:
+    base = dict(
+        name=name,
+        zone_type=zone_type,
+        kind="forward",
+        ttl=3600,
+        refresh=86400,
+        retry=7200,
+        expire=3600000,
+        minimum=3600,
+        primary_ns="ns1.example.com.",
+        admin_email="hostmaster.example.com.",
+        serial=1,
+        records=(),
+    )
+    base.update(over)
+    return ZoneData(**base)  # type: ignore[arg-type]
+
+
+def _bundle_with(*zones: ZoneData) -> ConfigBundle:
+    return ConfigBundle(
+        server_id=str(uuid.uuid4()),
+        server_name="technitium1",
+        driver="technitium",
+        roles=("authoritative",),
+        options=ServerOptions(),
+        acls=(),
+        views=(),
+        zones=zones,
+        tsig_keys=(),
+        blocklists=(),
+        generated_at=datetime(2026, 7, 30, 12, 0, tzinfo=UTC),
+    )
+
+
+def test_validate_accepts_every_supported_zone_type() -> None:
+    d = TechnitiumDriver()
+    ok, errors = d.validate_config(
+        _bundle_with(
+            _zone("p.example.com.", "primary"),
+            _zone("s.example.com.", "secondary", masters=("192.0.2.1",)),
+            _zone("st.example.com.", "stub", masters=("192.0.2.1",)),
+            _zone("f.example.com.", "forward", forwarders=("8.8.8.8",)),
+        )
+    )
+    assert ok, errors
+
+
+def test_validate_rejects_secondary_without_masters() -> None:
+    """Technitium resolves SOA against the primaries at create time, so a
+    secondary with nowhere to transfer from can never be created. Better a
+    422 on save than a zone that silently never appears."""
+    d = TechnitiumDriver()
+    ok, errors = d.validate_config(_bundle_with(_zone("s.example.com.", "secondary")))
+    assert not ok
+    assert any("primary name-server address" in e for e in errors)
+
+
+def test_validate_rejects_forward_without_forwarders() -> None:
+    d = TechnitiumDriver()
+    ok, errors = d.validate_config(_bundle_with(_zone("f.example.com.", "forward")))
+    assert not ok
+    assert any("forwarder" in e for e in errors)
+
+
+def test_validate_rejects_unknown_zone_type() -> None:
+    d = TechnitiumDriver()
+    ok, errors = d.validate_config(_bundle_with(_zone("x.example.com.", "mirror")))
+    assert not ok
+    assert any("not supported" in e for e in errors)
+
+
+def test_capabilities_report_zone_types_and_catalog() -> None:
+    caps = TechnitiumDriver().capabilities()
+    assert set(caps["zone_types"]) == {"primary", "secondary", "stub", "forward"}
+    assert caps["catalog_zones"] is True
+
+
+def test_capabilities_report_dnssec_online_signing() -> None:
+    """Issue #740 — Technitium signs online via /api/zones/dnssec/*, so it
+    joins PowerDNS and BIND9 on the sign/unsign gate."""
+    assert TechnitiumDriver().capabilities()["dnssec_inline_signing"] is True
+
+
+def test_dnssec_operations_are_gated_to_technitium() -> None:
+    from app.api.v1.dns.router import _DRIVER_GATED_OPERATIONS
+
+    assert "technitium" in _DRIVER_GATED_OPERATIONS["dnssec_sign"]
+    assert "technitium" in _DRIVER_GATED_OPERATIONS["dnssec_unsign"]
+    # Manual rollover stays BIND9-only: Technitium rolls on its own
+    # schedule (dnssecPrivateKeys carries rolloverDays), like PowerDNS.
+    assert "technitium" not in _DRIVER_GATED_OPERATIONS["dnssec_rollover"]
+
+
+def test_forward_transports_are_driver_gated() -> None:
+    """BIND 9.20 forwards over DoT but has no client-side HTTP or QUIC
+    transport, so https/quic are Technitium-only (issue #741)."""
+    from app.api.v1.dns.router import (
+        _TRANSPORT_DRIVER_GATE,
+        VALID_FORWARD_TRANSPORTS,
+    )
+
+    assert VALID_FORWARD_TRANSPORTS == {"do53", "tls", "https", "quic"}
+    assert _TRANSPORT_DRIVER_GATE["https"] == frozenset({"technitium"})
+    assert _TRANSPORT_DRIVER_GATE["quic"] == frozenset({"technitium"})
+    # do53 + tls stay ungated — every agent-managed driver can do both.
+    assert "do53" not in _TRANSPORT_DRIVER_GATE
+    assert "tls" not in _TRANSPORT_DRIVER_GATE
+
+
+def test_doq_is_exposed_on_the_options_api() -> None:
+    """Regression: doq_enabled/doq_port existed on the model and in
+    validation but on neither API schema, so DoQ could not be set or read
+    at all and the validation was unreachable."""
+    from app.api.v1.dns.router import ServerOptionsResponse, ServerOptionsUpdate
+
+    assert "doq_enabled" in ServerOptionsUpdate.model_fields
+    assert "doq_port" in ServerOptionsUpdate.model_fields
+    assert "doq_enabled" in ServerOptionsResponse.model_fields
+    assert "doq_port" in ServerOptionsResponse.model_fields
+
+
+def test_encrypted_transport_ports_reach_the_firewall_for_technitium() -> None:
+    """Regression: all three firewall renderers gated the operator-chosen
+    DoT/DoH ports on bind9/powerdns, so a Technitium listener came up
+    behind a closed nftables port. DoQ additionally needs the UDP list."""
+    import inspect
+
+    from app.services.appliance import firewall, firewall_merge
+
+    for mod in (firewall, firewall_merge):
+        src = inspect.getsource(mod)
+        assert "dns-technitium" in src, mod.__name__
+        assert "dns_encrypted_udp_ports" in src, mod.__name__
+
+
+def test_forward_zone_gate_is_driver_scoped() -> None:
+    """Found by end-to-end testing: a forward zone with no forwarders was
+    accepted (201) and then silently skipped by the agent, because
+    Technitium's zones/create requires a forwarder while BIND9 legally
+    falls back to the global list. The gate has to be driver-scoped, not
+    global, or it would break valid BIND9 configs."""
+    import inspect
+
+    from app.api.v1.dns import router
+
+    src = inspect.getsource(router._assert_forward_zone_serviceable)
+    assert "technitium" in src
+    # BIND9 must remain able to omit forwarders.
+    assert "BIND9 groups may omit it" in src
+
+
+def test_technitium_supports_drift_pull() -> None:
+    """#61 drift needs a ``pull_zone_records``. Technitium's REST API is
+    agent-local (loopback :5380), so the control plane goes over AXFR —
+    the same path BIND9 uses."""
+    assert hasattr(TechnitiumDriver(), "pull_zone_records")
+
+
+def test_axfr_filters_dnssec_artefacts() -> None:
+    """Signing artefacts are minted and rotated by the authoritative
+    server and never modelled as SpatiumDDI records. Unfiltered, drift
+    lists every signature as "extra on server" and a signed zone can
+    never read as in sync — verified live before the fix. Shared helper,
+    so this affects BIND9 too, not just Technitium."""
+    from app.drivers.dns._axfr import _DNSSEC_ARTEFACTS
+
+    assert {"RRSIG", "NSEC", "NSEC3", "DNSKEY"} <= _DNSSEC_ARTEFACTS
+    # SOA/NS are handled separately (apex-scoped), not via this set.
+    assert "SOA" not in _DNSSEC_ARTEFACTS
+
+
+@pytest.mark.asyncio
+async def test_role_assignment_ships_doq_udp_port(db_session, client) -> None:
+    """Found on real hardware: the DoQ UDP port was DERIVED correctly and
+    then never passed to SupervisorRoleAssignment, so it defaulted to []
+    and the appliance firewall never opened udp/<doq_port> — the listener
+    came up unreachable while the config read as correct. Ruff can't catch
+    it: the variable IS used, just not where it matters."""
+    import inspect
+
+    from app.api.v1.appliance import supervisor as sup
+
+    src = inspect.getsource(sup._build_role_assignment)
+    # It must be both derived AND handed to the model.
+    assert "dns_encrypted_udp_ports.append" in src
+    assert "dns_encrypted_udp_ports=dns_encrypted_udp_ports" in src

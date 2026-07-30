@@ -5211,6 +5211,9 @@ function OptionsTab({ groupId }: { groupId: string }) {
   const [dohEnabled, setDohEnabled] = useState(false);
   const [dohPort, setDohPort] = useState(443);
   const [dohPath, setDohPath] = useState("/dns-query");
+  // DoQ (#741) — Technitium only. UDP, so it may share dot_port's number.
+  const [doqEnabled, setDoqEnabled] = useState(false);
+  const [doqPort, setDoqPort] = useState(853);
   const [tlsCertificateId, setTlsCertificateId] = useState("");
   const [forwardTransport, setForwardTransport] = useState("do53");
   const [forwardTlsHostname, setForwardTlsHostname] = useState("");
@@ -5253,6 +5256,8 @@ function OptionsTab({ groupId }: { groupId: string }) {
     setDotPort(opts.dot_port);
     setDohEnabled(opts.doh_enabled);
     setDohPort(opts.doh_port);
+    setDoqEnabled(opts.doq_enabled ?? false);
+    setDoqPort(opts.doq_port ?? 853);
     setDohPath(opts.doh_path);
     setTlsCertificateId(opts.tls_certificate_id ?? "");
     setForwardTransport(opts.forward_transport);
@@ -5330,6 +5335,8 @@ function OptionsTab({ groupId }: { groupId: string }) {
       doh_enabled: dohEnabled,
       doh_port: dohPort,
       doh_path: dohPath.trim() || "/dns-query",
+      doq_enabled: doqEnabled,
+      doq_port: doqPort,
       // "" is the "no cert linked" shape; send explicit null so the server's
       // exclude_none re-injection clears the column instead of dropping it.
       tls_certificate_id: tlsCertificateId || null,
@@ -5778,6 +5785,48 @@ function OptionsTab({ groupId }: { groupId: string }) {
             )}
           </>
         )}
+        <div className="flex items-center justify-between">
+          <div>
+            <div className="text-sm font-medium">DNS-over-QUIC (DoQ)</div>
+            <div className="text-xs text-muted-foreground">
+              RFC 9250. Technitium groups only — BIND9 has no DoQ listener and
+              PowerDNS speaks none of the encrypted transports.
+            </div>
+          </div>
+          <label className="flex items-center gap-2 cursor-pointer text-sm">
+            <input
+              type="checkbox"
+              checked={doqEnabled}
+              onChange={(e) => {
+                setDoqEnabled(e.target.checked);
+                setDirty(true);
+              }}
+              className="h-4 w-4"
+            />
+            Enable
+          </label>
+        </div>
+        {doqEnabled && (
+          <>
+            <Field label="DoQ port">
+              <input
+                type="number"
+                min={1}
+                max={65535}
+                className={inputCls}
+                value={doqPort}
+                onChange={(e) => {
+                  setDoqPort(numOrDefault(e.target.value, 853));
+                  setDirty(true);
+                }}
+              />
+            </Field>
+            <p className="text-xs text-muted-foreground">
+              DoQ is UDP where DoT is TCP, so sharing port 853 with DoT is
+              expected and does not collide.
+            </p>
+          </>
+        )}
         <p className="text-xs text-muted-foreground">
           On PowerDNS groups the listeners run on the dnsdist front below (pdns
           speaks neither protocol), so DoT/DoH there needs that front deployed.
@@ -5800,6 +5849,12 @@ function OptionsTab({ groupId }: { groupId: string }) {
               <option value="tls">
                 tls — DNS-over-TLS to the forwarders above
               </option>
+              <option value="https">
+                https — DNS-over-HTTPS (Technitium groups only)
+              </option>
+              <option value="quic">
+                quic — DNS-over-QUIC (Technitium groups only)
+              </option>
             </select>
           </Field>
           {forwardTransport === "tls" && (
@@ -5807,8 +5862,9 @@ function OptionsTab({ groupId }: { groupId: string }) {
               <p className="text-xs text-muted-foreground">
                 Applies to the forwarders configured above, and to per-zone
                 forwarders. Forwarders default to port 853 unless one pins its
-                own. BIND cannot forward over DoH, so there is no HTTPS option
-                here.
+                own. BIND has no client-side HTTP or QUIC transport, so the
+                https and quic options are rejected for a group containing a
+                BIND9 server — use a Technitium-only group for those.
               </p>
               <label className="flex items-center gap-2 cursor-pointer text-sm">
                 <input

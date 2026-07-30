@@ -27,7 +27,6 @@ from __future__ import annotations
 import random
 import threading
 from datetime import UTC, datetime
-from typing import Any
 from xml.etree import ElementTree as ET
 
 import httpx
