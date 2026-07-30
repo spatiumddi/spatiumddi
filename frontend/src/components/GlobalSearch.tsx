@@ -14,6 +14,11 @@ import {
 import { useQuery } from "@tanstack/react-query";
 import { searchApi, type SearchResult } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import {
+  formatCombo,
+  matchesShortcut,
+  OPEN_GLOBAL_SEARCH,
+} from "@/lib/shortcuts";
 import { askAI } from "@/components/copilot/askAI";
 import { useAiAvailable } from "@/components/copilot/useAiAvailable";
 
@@ -188,10 +193,12 @@ export function GlobalSearch() {
     setActiveIdx(0);
   }, [debouncedQuery]);
 
-  // Cmd+K / Ctrl+K to open
+  // Cmd+K / Ctrl+K to open. The combo comes from ``lib/shortcuts.ts``
+  // (issue #81) so the help overlay and this listener can't disagree —
+  // retuning the binding there retunes both.
   useEffect(() => {
     function handler(e: KeyboardEvent) {
-      if ((e.metaKey || e.ctrlKey) && e.key === "k") {
+      if (matchesShortcut(e, OPEN_GLOBAL_SEARCH)) {
         e.preventDefault();
         setOpen((v) => !v);
       }
@@ -289,8 +296,11 @@ export function GlobalSearch() {
       >
         <Search className="h-3.5 w-3.5 flex-shrink-0" />
         <span className="flex-1 text-left">Search IP, zone, record…</span>
+        {/* Rendered from the shortcut definition, not hardcoded — this
+            used to read "⌘K" on every platform, so Linux / Windows
+            operators were shown a key their keyboard doesn't have. */}
         <kbd className="hidden rounded bg-muted px-1 py-0.5 text-[10px] font-mono sm:inline-block flex-shrink-0">
-          ⌘K
+          {formatCombo(OPEN_GLOBAL_SEARCH.combos[0])}
         </kbd>
       </button>
 

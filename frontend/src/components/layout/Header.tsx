@@ -3,6 +3,7 @@ import { useTheme } from "@/hooks/useTheme";
 import { Link, useNavigate } from "react-router-dom";
 import { Code2, LogOut, Menu, Moon, Sun, UserCircle2 } from "lucide-react";
 import { GlobalSearch } from "@/components/GlobalSearch";
+import { KeyboardShortcutsHelp } from "@/components/KeyboardShortcutsOverlay";
 
 export function Header({ onMobileMenu }: { onMobileMenu?: () => void }) {
   const { logout } = useAuth();
@@ -28,6 +29,10 @@ export function Header({ onMobileMenu }: { onMobileMenu?: () => void }) {
       <div className="flex-1" />
       <GlobalSearch />
       <div className="flex items-center gap-1">
+        {/* Issue #81 — the ``?`` overlay's discoverable affordance. Same
+            reasoning as the API-docs link below: the keyboard route
+            exists, this is how you find out it exists. */}
+        <KeyboardShortcutsHelp />
         {/* Issue #96 — discoverable API docs link for power users.
             Sidebar has the labeled entry; this is the muscle-memory
             shortcut. ReDoc is the primary surface (cleaner browsing);
