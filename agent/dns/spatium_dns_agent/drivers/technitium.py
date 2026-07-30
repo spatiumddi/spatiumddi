@@ -160,6 +160,29 @@ _FORWARDER_PROTOCOLS = {
     "quic": "Quic",
 }
 
+# ── Blocklists (issue #744) ─────────────────────────────────────────────
+#
+# Technitium has no RPZ. It blocks natively, either from subscribed URL
+# lists or from a per-domain "blocked zones" set, so SpatiumDDI's
+# effective blocklist entries map onto the latter (``blocked/add`` /
+# ``blocked/delete``) and its exceptions onto the allowed set.
+#
+# ``blockingType`` decides what a blocked name answers with. Like
+# ``zoneTransfer`` it SILENTLY IGNORES an unrecognised value — verified:
+# ``blockingType="Bogus"`` returns ok and leaves the previous mode — so it
+# is validated here rather than trusted to fail loudly.
+_BLOCKING_TYPES = frozenset({"NxDomain", "AnyAddress", "CustomAddress"})
+
+# Neutral block_mode → Technitium blocking type. ``sinkhole`` / ``redirect``
+# both answer with an operator-chosen address, which is CustomAddress;
+# ``passthru`` is not a blocking mode at all (it is an exception, handled
+# through the allowed set).
+_BLOCK_MODE_TYPES = {
+    "nxdomain": "NxDomain",
+    "sinkhole": "CustomAddress",
+    "redirect": "CustomAddress",
+}
+
 # Technitium's supported TSIG algorithms, as its settings API spells them.
 _TSIG_ALGORITHMS = frozenset(
     {
@@ -362,6 +385,69 @@ def _zone_options_payload(ztype: str, bundle: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def _blocking_payload(bundle: dict[str, Any]) -> dict[str, Any]:
+    """Flatten the bundle's effective blocklists into Technitium's shape.
+
+    SpatiumDDI models blocking as RPZ zones with per-entry actions;
+    Technitium has a flat blocked-domain set plus an allowed set that
+    overrides it. So:
+
+    * ``action="block"`` entries become blocked domains.
+    * ``action="allow"`` / ``block_mode="passthru"`` entries, and each
+      list's ``exceptions``, become allowed domains — Technitium's
+      allowed set is exactly an RPZ passthru.
+
+    Per-view blocklists collapse into the same flat set: Technitium's
+    native blocking is server-wide with no view concept, and the driver
+    already declines views outright. Collapsing is the honest reading of
+    "block these names on this server" — the alternative would be to
+    silently apply one view's list to every client.
+
+    ``is_wildcard`` is dropped deliberately: Technitium blocks a domain
+    *and its subdomains* by default, so an exact-match entry and a
+    wildcard entry land the same way. Flagged in the driver docs rather
+    than silently pretending the distinction survives.
+    """
+    blocked: set[str] = set()
+    allowed: set[str] = set()
+    modes: set[str] = set()
+    custom_addresses: set[str] = set()
+
+    for bl in bundle.get("blocklists") or []:
+        for exc in bl.get("exceptions") or []:
+            if exc:
+                allowed.add(str(exc).rstrip(".").lower())
+        for entry in bl.get("entries") or []:
+            domain = str(entry.get("domain") or "").rstrip(".").lower()
+            if not domain:
+                continue
+            action = str(entry.get("action") or "block").lower()
+            mode = str(entry.get("block_mode") or "nxdomain").lower()
+            if action != "block" or mode == "passthru":
+                allowed.add(domain)
+                continue
+            blocked.add(domain)
+            mapped = _BLOCK_MODE_TYPES.get(mode)
+            if mapped:
+                modes.add(mapped)
+            if mode in ("sinkhole", "redirect") and entry.get("target"):
+                custom_addresses.add(str(entry["target"]))
+
+    # One server-wide blocking type has to cover every entry. If the lists
+    # disagree, prefer the address-answering mode: it is the more specific
+    # intent (an operator asked for a sinkhole), and NxDomain would drop
+    # the sinkhole silently.
+    blocking_type = "CustomAddress" if "CustomAddress" in modes else "NxDomain"
+
+    return {
+        "enabled": bool(blocked),
+        "blocked": sorted(blocked),
+        "allowed": sorted(allowed),
+        "blocking_type": blocking_type,
+        "custom_addresses": sorted(custom_addresses),
+    }
+
+
 def _record_params(rtype: str, value: str, rec: dict[str, Any]) -> dict[str, Any]:
     """Build the type-specific param dict for
     ``/api/zones/records/{add,delete}`` — shared by both endpoints since
@@ -536,15 +622,6 @@ class TechnitiumDriver(DriverBase):
                 entry["forwarders"] = forwarders
             zones_payload.append(entry)
 
-        if bundle.get("blocklists"):
-            log.warning(
-                "technitium_blocklists_unsupported",
-                blocklist_count=len(bundle["blocklists"]),
-                hint=(
-                    "Wiring SpatiumDDI's blocklist model to Technitium's "
-                    "native blocking apps is a fast-follow, not v1 scope."
-                ),
-            )
 
         (new_dir / "zones.json").write_text(json.dumps(zones_payload, indent=2))
 
@@ -557,6 +634,9 @@ class TechnitiumDriver(DriverBase):
             # swap_and_reload can apply them without re-reading the bundle.
             "options": bundle.get("options") or {},
             "tls_cert": bundle.get("tls_cert") or None,
+            # Blocklists (#744). Flattened here rather than in the apply
+            # path so the rendered snapshot is the whole desired state.
+            "blocking": _blocking_payload(bundle),
             "tsig_keys": [
                 {
                     "name": (k.get("name") or "").rstrip("."),
@@ -641,6 +721,10 @@ class TechnitiumDriver(DriverBase):
                 token, server_options, server_state.get("tls_cert")
             )
             self._apply_forwarders(token, server_options)
+
+        # Blocklists (#744). Always applied, even when empty — an emptied
+        # list has to actually clear on the daemon.
+        self._apply_blocking(token, server_state.get("blocking") or {})
 
         self._reconcile_zones(token, payload)
         self._apply_catalog(token, server_state.get("catalog"), payload)
@@ -863,6 +947,92 @@ class TechnitiumDriver(DriverBase):
             "technitium_record_op_applied", zone=zone, name=name, type=rtype, op=op_kind
         )
         return None
+
+    # ── Blocklists (issue #744) ─────────────────────────────────────────
+
+    def _apply_blocking(self, token: str, blocking: dict[str, Any]) -> None:
+        """Converge Technitium's blocked / allowed domain sets.
+
+        Implemented as flush-then-rewrite rather than a diff, and that is
+        a deliberate trade.
+
+        ``blocked/list`` is a **one-level tree browser**, not a flat list:
+        ``domain=""`` returns the top-level nodes, ``domain="foo.test"``
+        returns *its* children, and a node only holds the actual block
+        under ``records`` at the leaf. So intermediate nodes appear in the
+        listing without themselves being blocked domains. A naive
+        one-level read therefore returns names that were never blocked,
+        and deleting one of them removes the whole subtree beneath it —
+        verified: reading the root and reconciling against it wiped every
+        entry. A correct diff needs a recursive descent plus a
+        node-vs-leaf test on every level.
+
+        Flush-and-rewrite needs no read model at all, so it cannot be
+        subtly wrong in that way. The cost is a brief window with no
+        blocking on each structural apply — real, but structural applies
+        are infrequent (record CRUD does not trigger one), and a window
+        beats silently un-blocking names the operator still expects to be
+        blocked. Revisit if the window ever matters more than the
+        correctness does.
+        """
+        if not blocking:
+            return
+
+        blocking_type = blocking.get("blocking_type") or "NxDomain"
+        if blocking_type not in _BLOCKING_TYPES:
+            log.error(
+                "technitium_blocking_type_invalid",
+                value=blocking_type,
+                supported=sorted(_BLOCKING_TYPES),
+            )
+            return
+
+        settings: dict[str, Any] = {
+            "enableBlocking": "true" if blocking.get("enabled") else "false",
+            "blockingType": blocking_type,
+        }
+        if blocking_type == "CustomAddress":
+            addresses = blocking.get("custom_addresses") or []
+            if not addresses:
+                # CustomAddress with nothing to answer would blackhole the
+                # name in a way the operator did not ask for. Fall back to
+                # NxDomain and say so.
+                log.warning("technitium_blocking_custom_address_missing")
+                settings["blockingType"] = "NxDomain"
+            else:
+                settings["customBlockingAddresses"] = ",".join(addresses)
+        body = self._call(token, "POST", "settings/set", settings).json()
+        if body.get("status") != "ok":
+            log.error(
+                "technitium_blocking_settings_failed", error=body.get("errorMessage")
+            )
+            return
+
+        for kind in ("blocked", "allowed"):
+            flushed = self._call(token, "POST", f"{kind}/flush", {}).json()
+            if flushed.get("status") != "ok":
+                log.error(
+                    f"technitium_{kind}_flush_failed",
+                    error=flushed.get("errorMessage"),
+                )
+                continue
+            for domain in blocking.get(kind) or []:
+                added = self._call(
+                    token, "POST", f"{kind}/add", {"domain": domain}
+                ).json()
+                if added.get("status") != "ok":
+                    log.warning(
+                        f"technitium_{kind}_add_failed",
+                        domain=domain,
+                        error=added.get("errorMessage"),
+                    )
+        log.info(
+            "technitium_blocking_applied",
+            enabled=bool(blocking.get("enabled")),
+            blocking_type=settings["blockingType"],
+            blocked=len(blocking.get("blocked") or []),
+            allowed=len(blocking.get("allowed") or []),
+        )
 
     # ── Encrypted transports (issue #741) ───────────────────────────────
 

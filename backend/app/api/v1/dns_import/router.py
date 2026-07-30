@@ -31,12 +31,15 @@ from app.services.dns_import import (
     CommitResult,
     ImportSourceError,
     PowerDNSImportError,
+    TechnitiumImportError,
     WindowsDNSImportError,
     parse_bind9_archive,
     parse_powerdns_server,
+    parse_technitium_server,
     parse_windows_dns_server,
     preview_cloud_import,
     test_powerdns_connection,
+    test_technitium_connection,
 )
 from app.services.dns_import.canonical import (
     ConflictAction,
@@ -108,6 +111,7 @@ class PreviewOut(BaseModel):
         "bind9",
         "windows_dns",
         "powerdns",
+        "technitium",
         "cloudflare",
         "route53",
         "azure_dns",
@@ -214,6 +218,36 @@ class PowerDNSTestIn(BaseModel):
     api_url: str
     api_key: str
     server_name: str = "localhost"
+
+
+class TechnitiumPreviewIn(BaseModel):
+    """Body shape for ``POST /dns/import/technitium/preview``."""
+
+    api_url: str
+    api_token: str
+    target_group_id: uuid.UUID
+    target_view_id: uuid.UUID | None = None
+
+
+class TechnitiumTestIn(BaseModel):
+    """Body shape for ``POST /dns/import/technitium/test-connection``."""
+
+    api_url: str
+    api_token: str
+
+
+class TechnitiumTestOut(BaseModel):
+    """Response from ``POST /dns/import/technitium/test-connection``.
+
+    ``importable_zone_count`` is deliberately reported separately from
+    ``zone_count``: only a Primary carries authoritative data of its own,
+    so a server that is mostly secondaries has far less to import than
+    its raw zone count suggests.
+    """
+
+    ok: bool
+    zone_count: int
+    importable_zone_count: int
 
 
 class PowerDNSTestOut(BaseModel):
@@ -741,6 +775,123 @@ async def powerdns_commit(
 
     logger.info(
         "dns_import_powerdns_commit",
+        target_group_id=str(body.target_group_id),
+        zones_created=result.total_zones_created,
+        zones_overwrote=result.total_zones_overwrote,
+        zones_renamed=result.total_zones_renamed,
+        zones_skipped=result.total_zones_skipped,
+        zones_failed=result.total_zones_failed,
+        records_created=result.total_records_created,
+        user=current_user.display_name,
+    )
+    return _commit_result_to_pydantic(result)
+
+
+# ── Technitium endpoints (issue #744) ────────────────────────────────
+
+
+@router.post("/technitium/test-connection", response_model=TechnitiumTestOut)
+async def technitium_test_connection(
+    _: SuperAdmin,
+    body: TechnitiumTestIn = Body(...),
+) -> TechnitiumTestOut:
+    """Probe a Technitium server before kicking off a full pull."""
+
+    # SECURITY (#400, L5): advisory SSRF guard, same posture as the
+    # PowerDNS path — a LAN Technitium daemon is a legitimate import
+    # source, so the resolved target is logged rather than hard-blocked.
+    assert_safe_target(body.api_url, label="dns_import_technitium")
+
+    try:
+        info = await test_technitium_connection(api_url=body.api_url, api_token=body.api_token)
+    except TechnitiumImportError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    return TechnitiumTestOut(**info)
+
+
+@router.post("/technitium/preview", response_model=PreviewOut)
+async def technitium_preview(
+    current_user: SuperAdmin,
+    db: DB,
+    body: TechnitiumPreviewIn = Body(...),
+) -> PreviewOut:
+    """Live-pull every primary zone + record from a Technitium server.
+
+    The token lives in the body and is never persisted. Non-primary
+    zones are reported as warnings rather than imported — a secondary is
+    a copy of someone else's data.
+    """
+
+    assert_safe_target(body.api_url, label="dns_import_technitium")
+
+    try:
+        preview = await parse_technitium_server(api_url=body.api_url, api_token=body.api_token)
+    except TechnitiumImportError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+    zone_names = [(z.name if z.name.endswith(".") else z.name + ".").lower() for z in preview.zones]
+    preview.conflicts = await detect_conflicts(
+        db,
+        zone_names=zone_names,
+        target_group_id=body.target_group_id,
+        target_view_id=body.target_view_id,
+    )
+
+    logger.info(
+        "dns_import_technitium_preview",
+        api_url=body.api_url,
+        zone_count=len(preview.zones),
+        record_count=preview.total_records,
+        conflict_count=len(preview.conflicts),
+        warning_count=len(preview.warnings),
+        target_group_id=str(body.target_group_id),
+        target_view_id=str(body.target_view_id) if body.target_view_id else None,
+        user=current_user.display_name,
+    )
+    return _preview_to_pydantic(preview)
+
+
+@router.post("/technitium/commit", response_model=CommitOut)
+async def technitium_commit(
+    current_user: SuperAdmin,
+    db: DB,
+    body: CommitIn = Body(...),
+) -> CommitOut:
+    """Apply a previously-previewed Technitium import.
+
+    Same shared pipeline as every other source — the canonical IR reuse
+    keeps audit, per-zone savepoints and RBAC in lock-step.
+    """
+
+    if body.plan.source != "technitium":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Plan source mismatch: endpoint=technitium plan={body.plan.source}",
+        )
+
+    preview = _preview_from_pydantic(body.plan)
+    actions: dict[str, tuple[ConflictAction, str | None]] = {
+        zone_name: (decision.action, decision.rename_to)
+        for zone_name, decision in body.conflict_actions.items()
+    }
+
+    try:
+        result = await commit_import(
+            db,
+            preview=preview,
+            target_group_id=body.target_group_id,
+            target_view_id=body.target_view_id,
+            conflict_actions=actions,
+            current_user=current_user,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    # #358 — imported zones land under target_group_id; wake its agents.
+    collect_wake(dns_group_channel(body.target_group_id))
+
+    logger.info(
+        "dns_import_technitium_commit",
         target_group_id=str(body.target_group_id),
         zones_created=result.total_zones_created,
         zones_overwrote=result.total_zones_overwrote,

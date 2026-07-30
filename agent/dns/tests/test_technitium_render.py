@@ -22,6 +22,7 @@ from typing import Any
 
 from spatium_dns_agent.drivers.technitium import (
     TechnitiumDriver,
+    _blocking_payload,
     _normalize_rdata,
     _qualified_name,
     _record_params,
@@ -1194,3 +1195,115 @@ def test_catalog_membership_cleared_when_disabled(tmp_path: Path) -> None:
     d._apply_catalog("t", None, [{"zone": "p.test", "type": "Primary"}])
     opt = [c for c in calls if c[2] == "zones/options/set"]
     assert opt and opt[0][3]["catalog"] == ""
+
+
+# ── Blocklists (issue #744) ─────────────────────────────────────────────
+
+
+def _bl(entries, exceptions=()):
+    return {"blocklists": [{"exceptions": list(exceptions), "entries": entries}]}
+
+
+def test_blocking_payload_splits_block_from_allow() -> None:
+    """Technitium's allowed set is exactly an RPZ passthru, so passthru
+    entries and each list's exceptions both land there."""
+    out = _blocking_payload(
+        _bl(
+            [
+                {"domain": "ads.example.test", "action": "block", "block_mode": "nxdomain"},
+                {"domain": "pass.example.test", "action": "block", "block_mode": "passthru"},
+                {"domain": "allow.example.test", "action": "allow", "block_mode": "nxdomain"},
+            ],
+            ["exc.example.test"],
+        )
+    )
+    assert out["blocked"] == ["ads.example.test"]
+    assert out["allowed"] == [
+        "allow.example.test",
+        "exc.example.test",
+        "pass.example.test",
+    ]
+    assert out["enabled"] is True
+
+
+def test_blocking_payload_disabled_when_nothing_blocked() -> None:
+    assert _blocking_payload({"blocklists": []})["enabled"] is False
+    passthru_only = _blocking_payload(
+        _bl([{"domain": "a.test", "action": "block", "block_mode": "passthru"}])
+    )
+    assert passthru_only["enabled"] is False
+
+
+def test_blocking_payload_prefers_custom_address_when_modes_disagree() -> None:
+    """One server-wide blocking type has to cover every entry. NxDomain
+    would silently drop an operator's sinkhole, so the address-answering
+    mode wins."""
+    out = _blocking_payload(
+        _bl(
+            [
+                {"domain": "a.test", "action": "block", "block_mode": "nxdomain"},
+                {"domain": "b.test", "action": "block", "block_mode": "sinkhole",
+                 "target": "10.0.0.1"},
+            ]
+        )
+    )
+    assert out["blocking_type"] == "CustomAddress"
+    assert out["custom_addresses"] == ["10.0.0.1"]
+
+
+def test_blocking_payload_collapses_per_view_lists() -> None:
+    """Technitium's native blocking is server-wide with no view concept,
+    and the driver declines views outright — so collapsing is the honest
+    reading rather than applying one view's list to every client."""
+    out = _blocking_payload(
+        {
+            "blocklists": [
+                {"view_name": "internal", "exceptions": [],
+                 "entries": [{"domain": "a.test", "action": "block",
+                              "block_mode": "nxdomain"}]},
+                {"view_name": None, "exceptions": [],
+                 "entries": [{"domain": "b.test", "action": "block",
+                              "block_mode": "nxdomain"}]},
+            ]
+        }
+    )
+    assert out["blocked"] == ["a.test", "b.test"]
+
+
+def test_apply_blocking_flushes_before_rewriting(tmp_path: Path) -> None:
+    """Flush-then-rewrite, not diff: ``blocked/list`` is a one-level tree
+    browser whose intermediate nodes are not themselves blocked domains,
+    so reconciling against a flat read of it deletes whole subtrees."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    d._apply_blocking(
+        "t",
+        {"enabled": True, "blocked": ["a.test"], "allowed": ["b.test"],
+         "blocking_type": "NxDomain", "custom_addresses": []},
+    )
+    paths = [c[2] for c in calls]
+    assert paths[0] == "settings/set"
+    assert paths.index("blocked/flush") < paths.index("blocked/add")
+    assert paths.index("allowed/flush") < paths.index("allowed/add")
+
+
+def test_apply_blocking_rejects_unknown_blocking_type(tmp_path: Path) -> None:
+    """blockingType silently ignores values it doesn't recognise — same
+    trap as zoneTransfer — so it is validated before sending."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    d._apply_blocking("t", {"enabled": True, "blocked": [], "blocking_type": "Bogus"})
+    assert calls == []
+
+
+def test_apply_blocking_falls_back_when_custom_address_missing(tmp_path: Path) -> None:
+    """CustomAddress with nothing to answer would blackhole the name in a
+    way the operator never asked for."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    d._apply_blocking(
+        "t",
+        {"enabled": True, "blocked": ["a.test"], "blocking_type": "CustomAddress",
+         "custom_addresses": []},
+    )
+    assert calls[0][3]["blockingType"] == "NxDomain"

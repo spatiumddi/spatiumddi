@@ -32,6 +32,11 @@ from .powerdns import (
     parse_powerdns_server,
     test_powerdns_connection,
 )
+from .technitium import (
+    TechnitiumImportError,
+    parse_technitium_server,
+    test_technitium_connection,
+)
 from .windows_dns import WindowsDNSImportError, parse_windows_dns_server
 
 __all__ = [
@@ -47,6 +52,7 @@ __all__ = [
     "ImportSource",
     "ImportSourceError",
     "PowerDNSImportError",
+    "TechnitiumImportError",
     "WindowsDNSImportError",
     "ZoneConflict",
     "commit_cloud_import",
@@ -55,6 +61,8 @@ __all__ = [
     "parse_bind9_archive",
     "preview_cloud_import",
     "parse_powerdns_server",
+    "parse_technitium_server",
     "parse_windows_dns_server",
     "test_powerdns_connection",
+    "test_technitium_connection",
 ]

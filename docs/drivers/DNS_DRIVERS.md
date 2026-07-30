@@ -753,6 +753,20 @@ Four behaviours to know, all verified live and all silent if you get them wrong:
 
 `forward_transport` accepts `do53` / `tls` / `https` / `quic`, but `https` and `quic` are gated to technitium groups at the API boundary (`_TRANSPORT_DRIVER_GATE`) — BIND 9.20 has no client-side HTTP or QUIC transport, so allowing them on a bind9 group would render a `named.conf` that will not load. `doq_enabled` is gated the same way.
 
+### 4B.3d Blocklists and the live-pull importer (issue #744)
+
+**Blocklists.** Technitium has no RPZ. It blocks natively, from subscribed URL lists or from a per-domain *blocked zones* set, so SpatiumDDI's effective blocklist entries map onto the latter and its exceptions onto the *allowed* set — Technitium's allowed set is exactly an RPZ passthru. `blockingType` derives from the entries' block modes (`nxdomain` → `NxDomain`, `sinkhole`/`redirect` → `CustomAddress`), and it has the same silent-ignore trap as `zoneTransfer`, so it is validated before sending.
+
+Per-view blocklists **collapse into one flat set**: Technitium's native blocking is server-wide with no view concept, and the driver declines views outright. Collapsing is the honest reading of "block these names on this server" — the alternative would be silently applying one view's list to every client. `is_wildcard` is likewise dropped: Technitium blocks a domain *and* its subdomains by default, so exact-match and wildcard land identically.
+
+The apply is **flush-then-rewrite, not a diff**, and that is deliberate. `blocked/list` is a one-level *tree browser*: `domain=""` returns top-level nodes, `domain="foo.test"` returns its children, and only a leaf carries the actual block under `records`. Intermediate nodes therefore appear in a listing without being blocked domains, and deleting one removes the whole subtree beneath it — reconciling against a flat read of the root wiped every entry in testing. Flush-and-rewrite needs no read model, so it cannot be subtly wrong that way; the cost is a brief window with no blocking on each structural apply, which record CRUD does not trigger.
+
+**Live-pull importer** (`services/dns_import/technitium.py`) — one-shot migration off an existing Technitium install, feeding the same canonical IR and commit pipeline as the BIND9 / Windows / PowerDNS importers.
+
+The difference from those is the record shape. PowerDNS hands back `content` strings that parse straight into a value; Technitium hands back structured `rData` whose field names do not match its own *write* API and which renders numeric rdata as enum names. `_rdata_to_value` is the inverse of the agent's `_normalize_rdata` — `{"certificateUsage": "DANE-EE", "selector": "SPKI", "matchingType": "SHA2-256"}` becomes `3 1 1 <hex>`. Unknown enum members pass through unchanged so a future Technitium release degrades to one odd record rather than an exception mid-import.
+
+Only `Primary` zones are imported. Secondary / Stub / Forwarder / Catalog are reported as warnings — a secondary is a copy of someone else's data, and importing it would mint rows SpatiumDDI then serves authoritatively. Disabled records are skipped too, since importing one would resurrect something the operator had turned off. And because Technitium answers HTTP 200 even on failure, `_unwrap` checks the body's `status` — that is the only place an expired token surfaces.
+
 ### 4B.4 Record type mapping
 
 Technitium's API takes structured per-type params rather than PowerDNS's single wire-format `content` string — e.g. `ipAddress` for A/AAAA, `cname` for CNAME, `exchange`+`preference` for MX, `target`+`priority`+`weight`+`port` for SRV. SVCB/HTTPS are best-effort: the driver parses the BIND-zone-file-style rdata string SpatiumDDI stores (`'1 . alpn="h2,h3"'`) into Technitium's `svcPriority`/`svcTargetName`/`svcParams` (`key|value` pairs) — confirmed empirically that Technitium's `svcParams` wire format does **not** accept a comma-separated multi-value single param the way BIND's rdata does, so only the first value of a multi-value param carries through (logged as a warning); single-value params round-trip exactly.

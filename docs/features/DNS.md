@@ -35,7 +35,7 @@ SpatiumDDI ships four authoritative DNS drivers. Pick **per server group** — e
 | Catalog zones (RFC 9432) — producer | ✅ | ✅ | ✅ | — |
 | Catalog zones (RFC 9432) — consumer | ✅ | — (not wired up in the agent) | ✅ | — |
 | First-class views / split-horizon | ✅ | tag-based, not surfaced as views in UI | — | — (replication scope) |
-| RPZ blocklists | ✅ | — (recursor feature only) | — | — |
+| RPZ blocklists | ✅ | — (recursor feature only) | native blocking, not RPZ (#744) | — |
 | AD-integrated zones | — | — | — | ✅ |
 | Agent shape | sidecar agent + named | sidecar agent + pdns_server | sidecar agent + DnsServerApp.dll | agentless (control plane → WinRM) |
 

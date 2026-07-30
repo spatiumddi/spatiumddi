@@ -24,6 +24,7 @@ ImportSource = Literal[
     "bind9",
     "windows_dns",
     "powerdns",
+    "technitium",
     "cloudflare",
     "route53",
     "azure_dns",
