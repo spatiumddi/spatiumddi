@@ -46,6 +46,7 @@ from app.drivers._winrm import (
 from app.drivers._winrm import (
     run_ps as _winrm_run_ps,
 )
+from app.drivers.dns._axfr import resolve_server_address
 from app.drivers.dns.base import (
     ConfigBundle,
     DNSDriver,
@@ -289,7 +290,12 @@ class WindowsDNSDriver(DNSDriver):
             type=rtype,
             signed=keyring is not None,
         )
-        await asyncio.to_thread(dns.query.tcp, update, host, port=port, timeout=10)
+        # Resolve first — dns.query.tcp needs an IP literal and dies on a
+        # hostname with a bare ValueError (see resolve_server_address). Unlike
+        # the AXFR path we take only the first address: this is a WRITE, and
+        # retrying it against a second address risks applying it twice.
+        addr = resolve_server_address(host, port, what=f"RFC 2136 update of {change.zone_name}")[0]
+        await asyncio.to_thread(dns.query.tcp, update, addr, port=port, timeout=10)
 
     async def _apply_record_change_winrm(self, server: Any, change: RecordChange) -> None:
         """Record create/update/delete via ``*-DnsServerResourceRecord``."""

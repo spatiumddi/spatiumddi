@@ -3351,6 +3351,9 @@ class ZoneDriftResponse(BaseModel):
     zone_name: str
     db_record_count: int
     servers: list[ServerDriftEntry]
+    # Caveats that make the diff less trustworthy (e.g. split-horizon views);
+    # the UI renders these above the per-server results.
+    warnings: list[str] = []
 
 
 @router.get(
@@ -3377,6 +3380,7 @@ async def get_zone_drift(
         zone_id=report.zone_id,
         zone_name=report.zone_name,
         db_record_count=report.db_record_count,
+        warnings=list(report.warnings),
         servers=[
             ServerDriftEntry(
                 server_id=s.server_id,
