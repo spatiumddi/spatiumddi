@@ -1,0 +1,146 @@
+---
+# Front matter (even empty) is required — it tells Jekyll to process this file
+# through Sass rather than copying it verbatim.
+---
+
+@import "{{ site.theme }}";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Layout overrides for jekyll-theme-minimal.
+//
+// The stock theme hardcodes `.wrapper { width: 860px }` with a 270px fixed
+// sidebar and `section { width: 500px }`. That leaves reference docs rendering
+// in a 500px column on any modern display: prose wraps every few words, wide
+// tables clip, and the fenced code blocks in GETTING_STARTED / API scroll
+// horizontally even though there is empty screen to the right of them.
+//
+// This replaces the float + `position: fixed` construction with a two-column
+// grid. `minmax(0, 1fr)` on the content column is load-bearing: grid and flex
+// children default to `min-width: auto`, which refuses to shrink below their
+// contents, so without it a long unbroken line inside <pre> widens the whole
+// column and reintroduces the clipping this file exists to fix.
+// ─────────────────────────────────────────────────────────────────────────────
+
+$sidebar-width: 260px;
+$column-gap: 56px;
+$content-measure: 940px; // readable line length for prose; wide enough for tables
+$breakpoint: 960px;
+
+@media screen and (min-width: #{$breakpoint + 1px}) {
+  .wrapper {
+    display: grid;
+    grid-template-columns: $sidebar-width minmax(0, 1fr);
+    grid-template-rows: auto 1fr;
+    column-gap: $column-gap;
+    width: auto;
+    max-width: $sidebar-width + $column-gap + $content-measure;
+    margin: 0 auto;
+    padding: 50px 40px;
+    box-sizing: border-box;
+  }
+
+  header {
+    grid-column: 1;
+    grid-row: 1;
+    // Stock theme pins this with `position: fixed`, which detaches it from the
+    // wrapper and misaligns as soon as the wrapper is no longer a fixed width.
+    // Sticky keeps the nav visible while scrolling without leaving the grid.
+    position: sticky;
+    top: 40px;
+    float: none;
+    width: auto;
+    padding-right: 0;
+  }
+
+  footer {
+    grid-column: 1;
+    grid-row: 2;
+    position: sticky;
+    top: 260px;
+    float: none;
+    width: auto;
+    align-self: start;
+  }
+
+  section {
+    grid-column: 2;
+    grid-row: 1 / span 2;
+    float: none;
+    width: auto;
+    min-width: 0; // see note above — without this, <pre> blows out the column
+    max-width: none;
+    border-left: 1px solid #e5e5e5;
+    padding: 0 0 50px $column-gap;
+  }
+}
+
+// Below the breakpoint the theme already stacks; make sure nothing we set
+// above leaks into that layout.
+@media screen and (max-width: #{$breakpoint}) {
+  .wrapper {
+    display: block;
+  }
+
+  header,
+  section,
+  footer {
+    position: static;
+    float: none;
+    width: auto;
+    border-left: 0;
+    padding-left: 0;
+  }
+}
+
+// ─── Readability ─────────────────────────────────────────────────────────────
+
+section {
+  line-height: 1.65;
+
+  // Nothing in the content column may force the page itself to scroll
+  // sideways; wide things scroll inside their own box instead.
+  img,
+  svg {
+    max-width: 100%;
+    height: auto;
+  }
+
+  pre {
+    overflow-x: auto;
+    max-width: 100%;
+    padding: 12px 16px;
+    line-height: 1.45;
+  }
+
+  code {
+    word-wrap: normal;
+  }
+
+  // The docs lean on wide reference tables (option maps, driver capability
+  // matrices). Let them use the full column and scroll if still too wide.
+  table {
+    display: block;
+    width: 100%;
+    overflow-x: auto;
+    border-collapse: collapse;
+  }
+
+  th,
+  td {
+    padding: 6px 13px;
+  }
+
+  h2 {
+    margin-top: 1.6em;
+    padding-top: 0.3em;
+    border-bottom: 1px solid #eee;
+  }
+
+  h3 {
+    margin-top: 1.4em;
+  }
+
+  blockquote {
+    margin-left: 0;
+  }
+}
