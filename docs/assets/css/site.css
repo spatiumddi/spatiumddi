@@ -529,6 +529,93 @@ a.card:hover {
   width: 100%;
   height: auto;
 }
+.shot-link {
+  display: block;
+  cursor: zoom-in;
+  position: relative;
+}
+.shot-link::after {
+  /* Affordance — the screenshots previously looked interactive but were not.
+     Kept subtle and revealed on hover rather than always-on. */
+  content: "⤢";
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  border-radius: 7px;
+  background: rgb(15 23 42 / 72%);
+  color: #fff;
+  font-size: 0.95rem;
+  opacity: 0;
+  transition: opacity 0.14s ease;
+}
+.shot-link:hover::after,
+.shot-link:focus-visible::after {
+  opacity: 1;
+}
+
+.doc-body img.zoomable {
+  cursor: zoom-in;
+}
+
+/* ─── Lightbox ───────────────────────────────────────────────────────────── */
+
+.lightbox {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  max-width: min(94vw, 1500px);
+  max-height: 94vh;
+  overflow: visible;
+}
+.lightbox::backdrop {
+  background: rgb(2 6 23 / 82%);
+  backdrop-filter: blur(3px);
+}
+.lightbox img {
+  display: block;
+  max-width: 100%;
+  max-height: 86vh;
+  width: auto;
+  height: auto;
+  border-radius: 10px;
+  background: var(--bg);
+  box-shadow: 0 24px 70px -18px rgb(0 0 0 / 70%);
+}
+.lightbox-caption {
+  margin: 12px 2px 0;
+  color: #cbd5e1;
+  font-size: 0.9rem;
+  text-align: center;
+}
+.lightbox-close {
+  position: absolute;
+  top: -14px;
+  right: -14px;
+  width: 34px;
+  height: 34px;
+  border-radius: 999px;
+  border: 1px solid rgb(148 163 184 / 45%);
+  background: #0f172a;
+  color: #e2e8f0;
+  font-size: 1.35rem;
+  line-height: 1;
+  cursor: pointer;
+}
+.lightbox-close:hover {
+  border-color: var(--accent-bright);
+  color: var(--accent-bright);
+}
+
+@media (max-width: 640px) {
+  .lightbox-close {
+    top: 6px;
+    right: 6px;
+  }
+}
 .shot figcaption {
   padding: 11px 16px;
   font-size: 0.86rem;

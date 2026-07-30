@@ -109,19 +109,27 @@
       </div>
       <div class="shots">
         <figure class="shot">
-          <img src="{{ root }}assets/screenshots/dashboard.png" alt="SpatiumDDI dashboard" loading="lazy">
+          <a class="shot-link" data-zoom href="{{ root }}assets/screenshots/dashboard.png">
+            <img src="{{ root }}assets/screenshots/dashboard.png" alt="SpatiumDDI dashboard" loading="lazy">
+          </a>
           <figcaption>Dashboard — utilization heatmap, live activity, service health</figcaption>
         </figure>
         <figure class="shot">
-          <img src="{{ root }}assets/screenshots/ipam.png" alt="IPAM subnet tree" loading="lazy">
+          <a class="shot-link" data-zoom href="{{ root }}assets/screenshots/ipam.png">
+            <img src="{{ root }}assets/screenshots/ipam.png" alt="IPAM subnet tree" loading="lazy">
+          </a>
           <figcaption>IPAM — space / block / subnet tree with inline pool boundaries</figcaption>
         </figure>
         <figure class="shot">
-          <img src="{{ root }}assets/screenshots/dns.png" alt="DNS zones and records" loading="lazy">
+          <a class="shot-link" data-zoom href="{{ root }}assets/screenshots/dns.png">
+            <img src="{{ root }}assets/screenshots/dns.png" alt="DNS zones and records" loading="lazy">
+          </a>
           <figcaption>DNS — zones, records, views and per-server serial drift</figcaption>
         </figure>
         <figure class="shot">
-          <img src="{{ root }}assets/screenshots/dhcp.png" alt="DHCP scopes and leases" loading="lazy">
+          <a class="shot-link" data-zoom href="{{ root }}assets/screenshots/dhcp.png">
+            <img src="{{ root }}assets/screenshots/dhcp.png" alt="DHCP scopes and leases" loading="lazy">
+          </a>
           <figcaption>DHCP — scopes, pools, reservations and live leases</figcaption>
         </figure>
       </div>
@@ -207,6 +215,7 @@ make up</code></pre>
     </div>
   </section>
 
+  {% include lightbox.html %}
   {% include footer.html root=root %}
 </body>
 </html>

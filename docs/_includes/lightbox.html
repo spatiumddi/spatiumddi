@@ -1,0 +1,73 @@
+<dialog class="lightbox" id="lightbox" aria-label="Image viewer">
+  <button class="lightbox-close" type="button" aria-label="Close image">&times;</button>
+  <img id="lightbox-img" src="" alt="">
+  <p class="lightbox-caption" id="lightbox-caption"></p>
+</dialog>
+
+<script>
+  // Click-to-enlarge for screenshots and diagrams.
+  //
+  // Uses <dialog>.showModal(), which gives Esc-to-close, focus trapping and
+  // inertness of the page behind for free — all things a hand-rolled overlay
+  // has to reimplement and usually gets wrong.
+  //
+  // Landing-page screenshots are wrapped in a real <a href> to the image, so
+  // without JS they still open full size; this only intercepts that click.
+  // Docs images are bare <img> (markdown emits no wrapper), so they get a
+  // handler directly.
+  (function () {
+    var dlg = document.getElementById("lightbox");
+    if (!dlg || typeof dlg.showModal !== "function") return;
+
+    var img = document.getElementById("lightbox-img");
+    var cap = document.getElementById("lightbox-caption");
+
+    function open(src, alt, caption) {
+      img.src = src;
+      img.alt = alt || "";
+      cap.textContent = caption || "";
+      cap.hidden = !caption;
+      dlg.showModal();
+    }
+
+    // Landing-page figures.
+    document.querySelectorAll("a[data-zoom]").forEach(function (a) {
+      a.addEventListener("click", function (e) {
+        e.preventDefault();
+        var fig = a.closest("figure");
+        var figcap = fig && fig.querySelector("figcaption");
+        var inner = a.querySelector("img");
+        open(a.getAttribute("href"), inner && inner.alt, figcap && figcap.textContent);
+      });
+    });
+
+    // Docs diagrams. Images already inside a link are skipped — those are
+    // badges and inline links, where enlarging is not the intent.
+    document.querySelectorAll(".doc-body img").forEach(function (el) {
+      if (el.closest("a")) return;
+      el.classList.add("zoomable");
+      el.addEventListener("click", function () {
+        open(el.currentSrc || el.src, el.alt, el.alt);
+      });
+    });
+
+    dlg.querySelector(".lightbox-close").addEventListener("click", function () {
+      dlg.close();
+    });
+
+    // Backdrop click. Clicks on the image bubble to the dialog too, so compare
+    // against the dialog's own box rather than trusting event.target.
+    dlg.addEventListener("click", function (e) {
+      var r = dlg.getBoundingClientRect();
+      var inside =
+        e.clientX >= r.left && e.clientX <= r.right &&
+        e.clientY >= r.top && e.clientY <= r.bottom;
+      if (!inside) dlg.close();
+    });
+
+    // Release the (potentially large) image once closed.
+    dlg.addEventListener("close", function () {
+      img.src = "";
+    });
+  })();
+</script>
