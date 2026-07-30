@@ -30,7 +30,7 @@ from app.core.permissions import is_effective_superadmin
 from app.core.request_meta import clean_user_agent, client_ip
 from app.models.audit import AuditLog
 from app.models.auth import User
-from app.models.change_request import ChangeRequest
+from app.models.change_request import CHANGE_REQUEST_ORIGINS, ChangeRequest
 
 logger = structlog.get_logger(__name__)
 
@@ -116,6 +116,8 @@ async def create_change_request(
     preview_text: str,
     risk_reason: str,
     ttl_hours: int,
+    origin: str = "gate",
+    justification: str | None = None,
 ) -> ChangeRequest:
     """Persist a new ``pending`` change request + its ``requested`` audit row.
 
@@ -125,6 +127,16 @@ async def create_change_request(
     #8: refuses (429) when the requester already holds ``_MAX_PENDING_PER_USER``
     pending requests — a per-user cap that bounds table + sweep growth.
     """
+    # #696 — reject an unknown origin rather than persisting a row that would
+    # be invisible on BOTH queues (each filters by origin) yet still
+    # executable through the spine. Cheap guard; the column has no CHECK
+    # because the value is service-assigned, never user-supplied.
+    if origin not in CHANGE_REQUEST_ORIGINS:
+        raise ValueError(
+            f"invalid change_request origin {origin!r}; "
+            f"expected one of {sorted(CHANGE_REQUEST_ORIGINS)}"
+        )
+
     # #8: per-user pending quota — fail before persisting anything.
     pending_count = (
         await db.execute(
@@ -153,6 +165,8 @@ async def create_change_request(
         args=args,
         preview_text=preview_text,
         risk_reason=risk_reason,
+        origin=origin,
+        justification=justification,
         state="pending",
         requested_by_user_id=user.id,
         requested_by_display=user.display_name,
@@ -172,6 +186,7 @@ async def create_change_request(
             "resource_type": resource_type,
             "resource_id": resource_id,
             "risk_reason": risk_reason,
+            "origin": origin,
             "state": "pending",
         },
     )
@@ -203,11 +218,19 @@ async def list_change_requests(
     state: str | None = None,
     resource_type: str | None = None,
     requested_by_user_id: UUID | None = None,
+    origin: str | None = None,
     limit: int = 100,
     offset: int = 0,
 ) -> list[ChangeRequest]:
-    """List change requests newest-first with optional filters."""
+    """List change requests newest-first with optional filters.
+
+    ``origin`` splits the #62 gate queue from the #696 portal queue — both
+    live in this table, and each surface passes its own value so neither
+    ever renders the other's rows.
+    """
     stmt = select(ChangeRequest)
+    if origin is not None:
+        stmt = stmt.where(ChangeRequest.origin == origin)
     if state is not None:
         stmt = stmt.where(ChangeRequest.state == state)
     if resource_type is not None:
@@ -717,7 +740,26 @@ async def approve_change_request(
     #     a scope larger than the one they reviewed. Treat any drift as stale;
     #     the requester must cancel and re-submit to capture the new scope.
     #     This closes the TOCTOU for both soft and permanent paths via one rule.
-    if preview.preview_text != cr.preview_text:
+    #
+    #     GATE ROWS ONLY (#696). The rule assumes the preview describes a
+    #     blast radius over EXISTING state, which is true for a delete: if it
+    #     moved, the approver is being asked to sign off on more than they
+    #     read. A self-service provisioning request is the opposite shape —
+    #     nothing exists yet, and the preview embeds the answer the allocator
+    #     WOULD pick right now (e.g. the lowest free /26 in a block). Any
+    #     unrelated carve elsewhere in that block changes that string, so a
+    #     byte comparison would make the request permanently un-approvable
+    #     through no fault of anyone's — and with a 14-day TTL that is the
+    #     common case, not the edge case.
+    #
+    #     What actually protects a portal row is that its ``args`` are frozen
+    #     and re-validated, and its preview is re-run and must still succeed
+    #     (step 5a above) — so a request that has become impossible still
+    #     fails. The approver is deciding "may this person have a /26 from
+    #     this block", not "must it be 10.20.0.0/26"; which one they get is
+    #     the same race-safe carve a manual create performs. The fresh text is
+    #     written back below so the executed record shows what was really done.
+    if cr.origin == "gate" and preview.preview_text != cr.preview_text:
         logger.info(
             "change_request.scope_drift",
             change_request_id=str(cr.id),
@@ -734,9 +776,12 @@ async def approve_change_request(
     requester_id = cr.requested_by_user_id
 
     # #3b transparency: surface the freshly-rendered preview on the returned
-    # row. On the success path it equals the frozen text (drift would have
-    # 409'd above), but persisting it makes the executed row reflect exactly
-    # what was re-validated at approve time.
+    # row, so the executed record reflects exactly what was re-validated at
+    # approve time. For a GATE row this equals the frozen text (any drift
+    # 409'd above). For a PORTAL row (#696) it may legitimately differ — the
+    # drift guard is skipped there — and this write-back is what records the
+    # answer the allocator actually chose rather than the one previewed at
+    # submit time.
     cr.preview_text = preview.preview_text
 
     # Record the approval transition (pending → approved, audited).

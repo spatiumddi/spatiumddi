@@ -35,6 +35,7 @@ require a target should defensively short-circuit to
 from __future__ import annotations
 
 import ipaddress
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -46,10 +47,22 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.alerts import AlertRule
 from app.models.appliance import APPLIANCE_STATE_APPROVED, Appliance
 from app.models.audit import AuditLog
+from app.models.av import AVFlowProfile, AVReservedRange
+from app.models.bacnet import BACnetDevice
+from app.models.dicom import DICOMApplicationEntity
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
 from app.models.multicast import MulticastGroup
 from app.models.nmap import NmapScan
+from app.models.ot import OTDevice, OTZone
 from app.services import alerts as alert_service
+from app.services.av.ranges import check_allocation_conflict
+from app.services.dicom.titles import is_vendor_default
+from app.services.ipam.probe_policy import resolve_probe_policy
+from app.services.ot.zones import (
+    effective_zone_for_address,
+    purdue_mismatch,
+    purdue_to_str,
+)
 
 # ── Outcome dataclass ───────────────────────────────────────────────
 
@@ -723,6 +736,749 @@ async def check_no_lanwide_control_plane_ports(
     )
 
 
+# ── Checks: AV / Audio-Video-over-IP (#540) ─────────────────────────
+
+
+@register("av_flow_outside_reserved_range")
+async def check_av_flow_outside_reserved_range(
+    db: AsyncSession,
+    *,
+    target: object | None,
+    target_kind: str,
+    args: dict[str, Any],
+    now: datetime,
+) -> CheckOutcome:
+    """An AV flow lives inside a range declared for its protocol.
+
+    Dante ships transmit flows in ``239.69.0.0/16``; AES67 and
+    RAVENNA plants pick a block inside the administratively-scoped
+    ``239.0.0.0/8``; SMPTE 2110 studios hand-carve their own. Static
+    multicast assignment is the AoIP best practice precisely because
+    address drift is what breaks a plant, so a flow that has wandered
+    outside its declared range is worth surfacing.
+
+    Absence of policy is deliberately NOT a violation: when the
+    operator has declared no range for that protocol there is nothing
+    to check against, and failing every flow in that situation would
+    train operators to ignore the check. Same for a group carrying no
+    AV descriptor — that is a plain multicast group, not an AV flow.
+    """
+    _ = args, now
+    if target is None or not isinstance(target, MulticastGroup):
+        return CheckOutcome.not_applicable(
+            "Target row missing or wrong kind for av_flow_outside_reserved_range"
+        )
+    profile = (
+        await db.execute(select(AVFlowProfile).where(AVFlowProfile.group_id == target.id))
+    ).scalar_one_or_none()
+    if profile is None:
+        return CheckOutcome.not_applicable("Group carries no AV descriptor")
+
+    # Delegates to the same service the REST allocation-preview calls, so
+    # the conformity verdict and the preview an operator saw before
+    # allocating cannot disagree about one flow. That also picks up the
+    # longest-prefix rule (a Dante /16 carved out of an exclusive AES67
+    # /8 resolves to Dante) and the asyncpg CIDR-vs-str coercion, both of
+    # which a second hand-rolled containment loop would miss.
+    report = await check_allocation_conflict(
+        db, target.space_id, str(target.address), profile.av_protocol
+    )
+
+    if report.own_ranges:
+        matched = report.own_ranges[0]
+        return CheckOutcome.passed(
+            f"{profile.av_protocol} flow {target.address} is inside " f"{matched.cidr} as declared",
+            {
+                "address": str(target.address),
+                "av_protocol": profile.av_protocol,
+                "matched_range": matched.cidr,
+            },
+        )
+
+    if not report.outside_declared_range:
+        return CheckOutcome.not_applicable(
+            f"No reserved range declared for {profile.av_protocol} in this IPSpace"
+        )
+
+    # Only on the failure path: name the ranges the flow *should* have
+    # landed in. That is the actionable half of the finding, and it is
+    # one extra query on the rare branch rather than on every group.
+    declared = [
+        str(c)
+        for c in (
+            await db.execute(
+                select(AVReservedRange.cidr).where(
+                    AVReservedRange.space_id == target.space_id,
+                    AVReservedRange.av_protocol == profile.av_protocol,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    ]
+    return CheckOutcome.fail(
+        detail=(
+            f"{profile.av_protocol} flow {target.address} sits outside every "
+            f"declared {profile.av_protocol} range "
+            f"({', '.join(declared[:20])})"
+        ),
+        diagnostic={
+            "address": str(target.address),
+            "av_protocol": profile.av_protocol,
+            "declared_ranges": declared[:20],
+            "suggested_range": report.suggested_range,
+        },
+    )
+
+
+@register("av_flow_no_ptp_domain")
+async def check_av_flow_no_ptp_domain(
+    db: AsyncSession,
+    *,
+    target: object | None,
+    target_kind: str,
+    args: dict[str, Any],
+    now: datetime,
+) -> CheckOutcome:
+    """An AV flow records the PTP clock domain it rides.
+
+    Advisory (warn, never fail). PTP misconfiguration is the most
+    common AoIP failure mode, and "which clock domain is this flow
+    on?" is the first question asked when audio drops — but a missing
+    value is undocumented state, not a broken network, so it does not
+    warrant a compliance failure.
+
+    Applied uniformly across AV protocols. NDI is the arguable
+    exception (it is not PTP-locked the way AES67/2110 are), but the
+    module records the domain as documentation rather than asserting
+    the flow is clocked, and special-casing one protocol here would
+    encode a claim about NDI's timing model that this registry has no
+    way to verify.
+    """
+    _ = args, now
+    if target is None or not isinstance(target, MulticastGroup):
+        return CheckOutcome.not_applicable(
+            "Target row missing or wrong kind for av_flow_no_ptp_domain"
+        )
+    profile = (
+        await db.execute(select(AVFlowProfile).where(AVFlowProfile.group_id == target.id))
+    ).scalar_one_or_none()
+    if profile is None:
+        return CheckOutcome.not_applicable("Group carries no AV descriptor")
+    if profile.ptp_domain is not None:
+        return CheckOutcome.passed(
+            f"{profile.av_protocol} flow records PTP domain {profile.ptp_domain}",
+            {"av_protocol": profile.av_protocol, "ptp_domain": profile.ptp_domain},
+        )
+    return CheckOutcome.warn(
+        detail=(f"{profile.av_protocol} flow {target.address} has no PTP clock " "domain recorded"),
+        diagnostic={"address": str(target.address), "av_protocol": profile.av_protocol},
+    )
+
+
+# ── Checks: BACnet/IP building automation (#541) ────────────────────
+
+
+@register("bbmd_one_per_subnet")
+async def check_bbmd_one_per_subnet(
+    db: AsyncSession,
+    *,
+    target: object | None,
+    target_kind: str,
+    args: dict[str, Any],
+    now: datetime,
+) -> CheckOutcome:
+    """Each BACnet-bearing subnet has exactly one BBMD.
+
+    BACnet broadcasts (``Who-Is`` / ``I-Am``) do not cross IP routers,
+    so every IP subnet in a multi-subnet BACnet/IP internetwork needs
+    exactly one BACnet Broadcast Management Device. Zero leaves the
+    subnet's devices invisible to the rest of the internetwork; two or
+    more produces duplicated broadcast traffic and duplicate ``I-Am``
+    responses. "Exactly one" is the rule every BAS integration guide
+    states, and it is cheaply checkable from the registry.
+
+    A subnet with no BACnet devices at all is NOT_APPLICABLE rather
+    than a failure — most subnets in a mixed estate are not BACnet
+    subnets, and flagging them would bury the real findings.
+    """
+    _ = args, now
+    if target is None or not isinstance(target, Subnet):
+        return CheckOutcome.not_applicable(
+            "Target row missing or wrong kind for bbmd_one_per_subnet"
+        )
+    rows = list(
+        (
+            await db.execute(
+                select(BACnetDevice.device_instance, BACnetDevice.is_bbmd).where(
+                    BACnetDevice.subnet_id == target.id
+                )
+            )
+        ).all()
+    )
+    if not rows:
+        return CheckOutcome.not_applicable("Subnet carries no BACnet devices")
+
+    bbmds = [r._mapping["device_instance"] for r in rows if r._mapping["is_bbmd"]]
+    if len(bbmds) == 1:
+        return CheckOutcome.passed(
+            f"Exactly one BBMD (device instance {bbmds[0]}) on this subnet",
+            {"bbmd_instances": bbmds, "bacnet_device_count": len(rows)},
+        )
+    if not bbmds:
+        return CheckOutcome.fail(
+            detail=(
+                f"No BBMD on a subnet with {len(rows)} BACnet device(s) — "
+                "its devices cannot be reached across IP routers"
+            ),
+            diagnostic={"bbmd_count": 0, "bacnet_device_count": len(rows)},
+        )
+    return CheckOutcome.fail(
+        detail=(
+            f"{len(bbmds)} BBMDs on one subnet (device instances "
+            f"{', '.join(str(i) for i in sorted(bbmds)[:20])}) — expected exactly one; "
+            "multiple BBMDs duplicate broadcast traffic"
+        ),
+        diagnostic={
+            "bbmd_count": len(bbmds),
+            "bbmd_instances": sorted(bbmds)[:20],
+            "bacnet_device_count": len(rows),
+        },
+    )
+
+
+@register("bacnet_duplicate_device_instance")
+async def check_bacnet_duplicate_device_instance(
+    db: AsyncSession,
+    *,
+    target: object | None,
+    target_kind: str,
+    args: dict[str, Any],
+    now: datetime,
+) -> CheckOutcome:
+    """No two BACnet devices share a device instance number.
+
+    Platform-level, because instance uniqueness is an
+    internetwork-wide property rather than a per-row one.
+
+    ``uq_bacnet_device_instance`` should make a duplicate impossible,
+    so a finding here means data arrived by a path that bypassed the
+    ORM — a direct SQL load, a restore from a backup taken before the
+    constraint existed, or a future bulk importer that disables
+    constraints. That is exactly when an operator most needs to be
+    told, which is why the check exists despite the constraint.
+    """
+    _ = target, args, now
+    if target_kind != "platform":
+        return CheckOutcome.not_applicable(f"requires target_kind=platform (got {target_kind})")
+    dupes = list(
+        (
+            await db.execute(
+                select(BACnetDevice.device_instance, func.count(BACnetDevice.id).label("n"))
+                .group_by(BACnetDevice.device_instance)
+                .having(func.count(BACnetDevice.id) > 1)
+            )
+        ).all()
+    )
+    if not dupes:
+        return CheckOutcome.passed("Every BACnet device instance is unique")
+    return CheckOutcome.fail(
+        detail=(
+            f"{len(dupes)} BACnet device instance(s) are held by more than one "
+            f"device: {', '.join(str(r._mapping['device_instance']) for r in dupes[:20])}"
+        ),
+        diagnostic={
+            "duplicate_instances": [int(r._mapping["device_instance"]) for r in dupes[:20]],
+        },
+    )
+
+
+@register("bacnet_vendor_id_unknown")
+async def check_bacnet_vendor_id_unknown(
+    db: AsyncSession,
+    *,
+    target: object | None,
+    target_kind: str,
+    args: dict[str, Any],
+    now: datetime,
+) -> CheckOutcome:
+    """BACnet devices report a plausible ASHRAE vendor id.
+
+    Advisory. Vendor id 0 is legitimately ASHRAE itself, but on a real
+    plant a device reporting 0 — or reporting nothing at all — is
+    almost always a misconfigured, cloned, or counterfeit controller.
+    Warn rather than fail: this is a "go look at these" signal, not a
+    compliance breach.
+    """
+    _ = target, args, now
+    if target_kind != "platform":
+        return CheckOutcome.not_applicable(f"requires target_kind=platform (got {target_kind})")
+    rows = list(
+        (
+            await db.execute(
+                select(BACnetDevice.device_instance, BACnetDevice.vendor_id).where(
+                    (BACnetDevice.vendor_id.is_(None)) | (BACnetDevice.vendor_id == 0)
+                )
+            )
+        ).all()
+    )
+    if not rows:
+        return CheckOutcome.passed("Every BACnet device reports a non-zero vendor id")
+    return CheckOutcome.warn(
+        detail=(
+            f"{len(rows)} BACnet device(s) report vendor id 0 or none — "
+            "commonly a misconfigured or cloned controller"
+        ),
+        diagnostic={
+            "device_instances": [int(r._mapping["device_instance"]) for r in rows[:20]],
+        },
+    )
+
+
+# ── Checks: Industrial / OT (#542) ──────────────────────────────────
+
+
+@register("ot_device_crosses_purdue_boundary")
+async def check_ot_device_crosses_purdue_boundary(
+    db: AsyncSession,
+    *,
+    target: object | None,
+    target_kind: str,
+    args: dict[str, Any],
+    now: datetime,
+) -> CheckOutcome:
+    """An OT device sits at the Purdue level its subnet is zoned for.
+
+    OT networks are organised by the Purdue model, and the whole point
+    of that segmentation is that a Level-1 controller does not live in
+    a Level-4 enterprise subnet. A mismatch is the finding an auditor
+    asks for and that nobody can produce today without a spreadsheet.
+
+    NOT_APPLICABLE when either side is unset: an unrecorded level is
+    missing documentation, not a segmentation violation, and treating
+    unknown as guilty would make the check unusable during rollout.
+    """
+    _ = args, now
+    if target is None or not isinstance(target, IPAddress):
+        return CheckOutcome.not_applicable(
+            "Target row missing or wrong kind for ot_device_crosses_purdue_boundary"
+        )
+    device = (
+        await db.execute(select(OTDevice).where(OTDevice.ip_address_id == target.id))
+    ).scalar_one_or_none()
+    if device is None:
+        return CheckOutcome.not_applicable("Address carries no OT descriptor")
+
+    # Zone resolution and the level comparison both live in
+    # ``services.ot.zones`` — the by-address REST endpoint calls the same
+    # pair, so the conformity verdict and what an operator sees on the IP
+    # detail panel cannot disagree about the same device.
+    zone = await effective_zone_for_address(db, target.id)
+    mismatch = purdue_mismatch(device, zone)
+    device_level = purdue_to_str(device.purdue_level)
+    zone_level = purdue_to_str(zone.purdue_level) if zone is not None else None
+
+    if mismatch is None:
+        # Tri-state: an unrecorded level on either side is missing
+        # documentation, not a segmentation violation.
+        if zone is None:
+            return CheckOutcome.not_applicable("Subnet has no OT zone declared")
+        return CheckOutcome.not_applicable("OT device has no Purdue level recorded")
+
+    if not mismatch:
+        return CheckOutcome.passed(
+            f"Device and subnet agree at Purdue level {zone_level}",
+            {"device_purdue_level": device_level, "zone_purdue_level": zone_level},
+        )
+    cell = zone.cell_area if zone is not None else ""
+    return CheckOutcome.fail(
+        detail=(
+            f"OT device is Purdue level {device_level} but its subnet is "
+            f"zoned level {zone_level}"
+            f"{f' ({cell})' if cell else ''}"
+        ),
+        diagnostic={
+            "device_purdue_level": device_level,
+            "zone_purdue_level": zone_level,
+            "ot_protocol": device.ot_protocol,
+            "ot_role": device.ot_role,
+            "cell_area": cell,
+        },
+    )
+
+
+@register("ot_zone_missing_purdue_level")
+async def check_ot_zone_missing_purdue_level(
+    db: AsyncSession,
+    *,
+    target: object | None,
+    target_kind: str,
+    args: dict[str, Any],
+    now: datetime,
+) -> CheckOutcome:
+    """A subnet carrying OT devices declares an OT zone.
+
+    Advisory. Without a zone row the Purdue-boundary check above has
+    nothing to compare against, so this is the check that tells an
+    operator why their segmentation report is empty.
+    """
+    _ = args, now
+    if target is None or not isinstance(target, Subnet):
+        return CheckOutcome.not_applicable(
+            "Target row missing or wrong kind for ot_zone_missing_purdue_level"
+        )
+    device_count = (
+        await db.execute(
+            select(func.count(OTDevice.id))
+            .select_from(OTDevice)
+            .join(IPAddress, IPAddress.id == OTDevice.ip_address_id)
+            .where(IPAddress.subnet_id == target.id)
+        )
+    ).scalar_one()
+    if not device_count:
+        return CheckOutcome.not_applicable("Subnet carries no OT devices")
+    zone = (
+        await db.execute(select(OTZone).where(OTZone.subnet_id == target.id))
+    ).scalar_one_or_none()
+    if zone is not None:
+        return CheckOutcome.passed(
+            f"Subnet is zoned at Purdue level {zone.purdue_level}",
+            {"purdue_level": str(zone.purdue_level), "ot_device_count": int(device_count)},
+        )
+    return CheckOutcome.warn(
+        detail=(
+            f"Subnet carries {device_count} OT device(s) but declares no OT zone, "
+            "so Purdue-boundary conformity cannot be evaluated for it"
+        ),
+        diagnostic={"ot_device_count": int(device_count)},
+    )
+
+
+# ── Check: fragile-device probe safety (#722) ───────────────────────
+
+
+@register("fragile_subnet_probed")
+async def check_fragile_subnet_probed(
+    db: AsyncSession,
+    *,
+    target: object | None,
+    target_kind: str,
+    args: dict[str, Any],
+    now: datetime,
+) -> CheckOutcome:
+    """A subnet full of fragile gear is marked do-not-probe.
+
+    The ``do_not_probe`` flag (#722) is opt-in, which means the failure
+    mode it exists to prevent — SpatiumDDI sweeping a VLAN whose vendor
+    explicitly said not to — survives right up until somebody remembers
+    to set it. This check closes that gap by working backwards from the
+    registries: if an operator has told us a subnet holds OT devices,
+    DICOM modalities, or BMC / IPMI endpoints, they have already told us
+    it is fragile. Being asked "should this be do-not-probe?" beats
+    finding out from a stalled infusion pump.
+
+    Three signals, any one of which makes the subnet in scope:
+
+    * ``ot_device`` rows (#542) — PLCs, RTUs, HMIs. The class that
+      motivated the flag.
+    * ``dicom_ae`` rows (#723) — imaging modalities and PACS nodes. A CT
+      console that drops its network stack mid-study is a clinical
+      incident, not an inconvenience.
+    * ``IPAddress.role == "bmc"`` — management-plane controllers on
+      embedded stacks, and a routine casualty of nmap.
+
+    A subnet with none of those is NOT_APPLICABLE rather than a pass:
+    most subnets in a mixed estate are ordinary, and flagging them all
+    would bury the handful that matter. Suppression inherited from a
+    parent block or space counts — the check asks whether probes are
+    actually withheld, not whether this particular row holds the flag.
+    """
+    _ = args, now, target_kind
+    if target is None or not isinstance(target, Subnet):
+        return CheckOutcome.not_applicable(
+            "Target row missing or wrong kind for fragile_subnet_probed"
+        )
+
+    ot_count = (
+        await db.execute(
+            select(func.count(OTDevice.id))
+            .select_from(OTDevice)
+            .join(IPAddress, IPAddress.id == OTDevice.ip_address_id)
+            .where(IPAddress.subnet_id == target.id)
+        )
+    ).scalar_one()
+    dicom_count = (
+        await db.execute(
+            select(func.count(DICOMApplicationEntity.id))
+            .select_from(DICOMApplicationEntity)
+            .join(IPAddress, IPAddress.id == DICOMApplicationEntity.ip_address_id)
+            .where(IPAddress.subnet_id == target.id)
+        )
+    ).scalar_one()
+    bmc_count = (
+        await db.execute(
+            select(func.count(IPAddress.id)).where(
+                IPAddress.subnet_id == target.id,
+                IPAddress.role == "bmc",
+            )
+        )
+    ).scalar_one()
+
+    signals = {
+        "ot_devices": int(ot_count),
+        "dicom_aes": int(dicom_count),
+        "bmc_addresses": int(bmc_count),
+    }
+    if not any(signals.values()):
+        return CheckOutcome.not_applicable(
+            "Subnet carries no registered fragile devices (OT / DICOM / BMC)"
+        )
+
+    verdict = await resolve_probe_policy(db, target)
+    if verdict.blocked:
+        return CheckOutcome.passed(
+            f"Subnet is marked do-not-probe ({verdict.source})",
+            {**signals, "source": verdict.source, "reason": verdict.reason},
+        )
+
+    present = ", ".join(f"{count} {label}" for label, count in signals.items() if count)
+    return CheckOutcome.fail(
+        detail=(
+            f"Subnet carries fragile devices ({present}) but is not marked "
+            "do-not-probe — discovery sweeps, nmap and the reachability tools "
+            "will target it"
+        ),
+        diagnostic=signals,
+    )
+
+
+# ── Checks: DICOM AE registry (#723) ────────────────────────────────
+
+
+@register("dicom_ae_default_title")
+async def check_dicom_ae_default_title(
+    db: AsyncSession,
+    *,
+    target: object | None,
+    target_kind: str,
+    args: dict[str, Any],
+    now: datetime,
+) -> CheckOutcome:
+    """No AE is still using a vendor default title.
+
+    Platform-level, because the harm is estate-wide: two vendors' factory
+    defaults collide long before an institution runs out of names, and a
+    duplicate AE Title breaks C-MOVE, Storage Commitment and Modality
+    Worklist in ways that take days to trace. ``uq_dicom_ae_title``
+    prevents two rows sharing ``DCM4CHEE``, but it cannot prevent the
+    *devices* from doing so — which is why "has anyone changed this from
+    the box" is a check rather than a constraint.
+
+    Warns rather than fails: a default title is not invalid, and an
+    institution mid-migration may legitimately still have some.
+    """
+    _ = args, now, target, target_kind
+    rows = list(
+        (await db.execute(select(DICOMApplicationEntity.id, DICOMApplicationEntity.ae_title))).all()
+    )
+    if not rows:
+        return CheckOutcome.not_applicable("No DICOM application entities registered")
+
+    offenders = [title for _id, title in rows if is_vendor_default(title)]
+    if not offenders:
+        return CheckOutcome.passed(
+            f"All {len(rows)} AE Titles have been changed from vendor defaults",
+            {"ae_count": len(rows)},
+        )
+    return CheckOutcome.warn(
+        detail=(
+            f"{len(offenders)} AE Title(s) are still vendor defaults "
+            f"({', '.join(sorted(offenders)[:20])}) — defaults are the most "
+            "common cause of institution-wide AE Title collisions"
+        ),
+        diagnostic={"default_titles": sorted(offenders)[:20], "ae_count": len(rows)},
+    )
+
+
+@register("dicom_ae_title_convention")
+async def check_dicom_ae_title_convention(
+    db: AsyncSession,
+    *,
+    target: object | None,
+    target_kind: str,
+    args: dict[str, Any],
+    now: datetime,
+) -> CheckOutcome:
+    """AE Titles match the institution's naming convention.
+
+    The convention arrives as a **check argument** (``pattern``), not as
+    a table. Every institution has a different one — ``SITE_MODALITY_NN``
+    here, ``DEPT-VENDOR-N`` there — and modelling a convention registry
+    would be a schema for a value that is one regular expression per
+    site. Supplying it per-policy also lets an estate run two policies at
+    once during a rename programme, scoped by whatever ``target_filter``
+    the operator sets.
+
+    Not applicable when no pattern is configured — a policy with no
+    convention has nothing to assert, and failing it would just teach
+    operators to disable the check.
+    """
+    _ = now, target, target_kind
+    pattern = str(args.get("pattern") or "").strip()
+    if not pattern:
+        return CheckOutcome.not_applicable(
+            "No naming convention configured — set the 'pattern' check argument"
+        )
+    try:
+        matcher = re.compile(pattern)
+    except re.error as exc:
+        # A bad pattern is a policy configuration error, not an estate
+        # finding. Warn so it surfaces on the dashboard instead of
+        # silently passing every AE.
+        return CheckOutcome.warn(
+            detail=f"AE Title convention pattern is not a valid regular expression: {exc}",
+            diagnostic={"pattern": pattern},
+        )
+
+    titles = list((await db.execute(select(DICOMApplicationEntity.ae_title))).scalars().all())
+    if not titles:
+        return CheckOutcome.not_applicable("No DICOM application entities registered")
+
+    # ``search`` rather than ``fullmatch``: operators write conventions
+    # with their own anchors (``^CT\\d{2}$``), and silently anchoring for
+    # them would make a deliberately-unanchored pattern behave
+    # differently here than everywhere else they test it.
+    offenders = [t for t in titles if not matcher.search(t)]
+    if not offenders:
+        return CheckOutcome.passed(
+            f"All {len(titles)} AE Titles match {pattern!r}",
+            {"pattern": pattern, "ae_count": len(titles)},
+        )
+    return CheckOutcome.fail(
+        detail=(
+            f"{len(offenders)} of {len(titles)} AE Title(s) do not match the "
+            f"convention {pattern!r} ({', '.join(sorted(offenders)[:20])})"
+        ),
+        diagnostic={
+            "pattern": pattern,
+            "non_conforming": sorted(offenders)[:20],
+            "ae_count": len(titles),
+        },
+    )
+
+
+@register("dicom_ae_outside_hipaa_scope")
+async def check_dicom_ae_outside_hipaa_scope(
+    db: AsyncSession,
+    *,
+    target: object | None,
+    target_kind: str,
+    args: dict[str, Any],
+    now: datetime,
+) -> CheckOutcome:
+    """Every bound AE sits in a subnet flagged ``hipaa_scope``.
+
+    DICOM associations carry ePHI. If an imaging device is addressable
+    from a subnet nobody has declared in scope, then either the scope
+    declaration is wrong or the device is somewhere it should not be —
+    both are findings, and neither is visible without cross-referencing
+    the two registries, which is what this does.
+
+    Unbound reservations are excluded rather than counted as failures: a
+    title with no host is not carrying anything. Rows whose subnet is
+    unknown are excluded for the same reason — an unknown is an unknown,
+    and treating it as a violation would flood the report with missing
+    data (the same tri-state discipline as ``purdue_mismatch``).
+    """
+    _ = args, now, target, target_kind
+    rows = list(
+        (
+            await db.execute(
+                select(
+                    DICOMApplicationEntity.ae_title,
+                    Subnet.network,
+                    Subnet.hipaa_scope,
+                ).join(Subnet, Subnet.id == DICOMApplicationEntity.subnet_id)
+            )
+        ).all()
+    )
+    if not rows:
+        return CheckOutcome.not_applicable(
+            "No DICOM application entities are bound to a known subnet"
+        )
+
+    offenders = [
+        {"ae_title": title, "subnet": str(network)}
+        for title, network, in_scope in rows
+        if not in_scope
+    ]
+    if not offenders:
+        return CheckOutcome.passed(
+            f"All {len(rows)} bound AE(s) sit in HIPAA-scope subnets",
+            {"bound_ae_count": len(rows)},
+        )
+    return CheckOutcome.fail(
+        detail=(
+            f"{len(offenders)} AE(s) are bound to subnets not flagged hipaa_scope "
+            f"({', '.join(o['ae_title'] for o in offenders[:20])}) — DICOM "
+            "associations carry ePHI, so either the scope flag or the device "
+            "placement is wrong"
+        ),
+        diagnostic={"out_of_scope": offenders[:20], "bound_ae_count": len(rows)},
+    )
+
+
+@register("dicom_ae_no_tls")
+async def check_dicom_ae_no_tls(
+    db: AsyncSession,
+    *,
+    target: object | None,
+    target_kind: str,
+    args: dict[str, Any],
+    now: datetime,
+) -> CheckOutcome:
+    """AEs are recorded as using TLS.
+
+    Plaintext DICOM puts ePHI on the wire in the clear. This reports what
+    the *registry* records, not what the wire does — nothing here probes
+    an association, and it never will without going through the
+    do-not-probe gate (#722) first. That distinction matters when reading
+    the result: a fail here means "nobody has recorded this AE as
+    encrypted", which in practice is how an un-encrypted estate looks,
+    but the evidence is documentation rather than observation.
+
+    Warns by default because remediating this is a device-by-device
+    project with real clinical downtime, and a hard fail on day one would
+    put every hospital's dashboard permanently red. Operators who have
+    finished that project can raise the policy's severity.
+    """
+    _ = args, now, target, target_kind
+    rows = list(
+        (
+            await db.execute(
+                select(DICOMApplicationEntity.ae_title, DICOMApplicationEntity.tls_enabled)
+            )
+        ).all()
+    )
+    if not rows:
+        return CheckOutcome.not_applicable("No DICOM application entities registered")
+
+    plaintext = [title for title, tls in rows if not tls]
+    if not plaintext:
+        return CheckOutcome.passed(
+            f"All {len(rows)} AE(s) are recorded as TLS-enabled",
+            {"ae_count": len(rows)},
+        )
+    return CheckOutcome.warn(
+        detail=(
+            f"{len(plaintext)} of {len(rows)} AE(s) are not recorded as TLS-enabled "
+            f"({', '.join(sorted(plaintext)[:20])}) — plaintext DICOM carries ePHI "
+            "in the clear"
+        ),
+        diagnostic={"plaintext_aes": sorted(plaintext)[:20], "ae_count": len(rows)},
+    )
+
+
 CHECK_CATALOG: list[dict[str, Any]] = [
     {
         "name": "has_field",
@@ -834,6 +1590,85 @@ CHECK_CATALOG: list[dict[str, Any]] = [
                 "label": "Treat a node's report as stale after N minutes (PASS-stale, never FAIL)",
             }
         ],
+    },
+    {
+        "name": "av_flow_outside_reserved_range",
+        "label": "AV flow sits inside a declared range for its protocol",
+        "supports": ["multicast_group"],
+        "args": [],
+    },
+    {
+        "name": "av_flow_no_ptp_domain",
+        "label": "AV flow records a PTP clock domain (advisory)",
+        "supports": ["multicast_group"],
+        "args": [],
+    },
+    {
+        "name": "bbmd_one_per_subnet",
+        "label": "Exactly one BACnet BBMD per subnet",
+        "supports": ["subnet"],
+        "args": [],
+    },
+    {
+        "name": "bacnet_duplicate_device_instance",
+        "label": "BACnet device instance numbers are unique internetwork-wide",
+        "supports": ["platform"],
+        "args": [],
+    },
+    {
+        "name": "bacnet_vendor_id_unknown",
+        "label": "BACnet devices report a plausible vendor id (advisory)",
+        "supports": ["platform"],
+        "args": [],
+    },
+    {
+        "name": "ot_device_crosses_purdue_boundary",
+        "label": "OT device matches its subnet's Purdue level",
+        "supports": ["ip_address"],
+        "args": [],
+    },
+    {
+        "name": "ot_zone_missing_purdue_level",
+        "label": "Subnet with OT devices declares an OT zone (advisory)",
+        "supports": ["subnet"],
+        "args": [],
+    },
+    {
+        "name": "fragile_subnet_probed",
+        "label": "Subnet with fragile devices is marked do-not-probe",
+        "supports": ["subnet"],
+        "args": [],
+    },
+    {
+        "name": "dicom_ae_default_title",
+        "label": "No DICOM AE is still on a vendor default title",
+        "supports": ["platform"],
+        "args": [],
+    },
+    {
+        "name": "dicom_ae_title_convention",
+        "label": "DICOM AE Titles match the institution naming convention",
+        "supports": ["platform"],
+        "args": [
+            {
+                "name": "pattern",
+                "type": "string",
+                "required": True,
+                "label": "Regular expression every AE Title must match",
+            }
+        ],
+    },
+    {
+        "name": "dicom_ae_outside_hipaa_scope",
+        "label": "DICOM AEs sit in subnets flagged hipaa_scope",
+        "supports": ["platform"],
+        "args": [],
+    },
+    {
+        "name": "dicom_ae_no_tls",
+        "label": "DICOM AEs are recorded as TLS-enabled",
+        "supports": ["platform"],
+        "args": [],
     },
 ]
 

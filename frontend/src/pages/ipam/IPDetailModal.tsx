@@ -1,8 +1,10 @@
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  Building2,
   Copy,
   ExternalLink,
+  Factory,
   Loader2,
   Pencil,
   Phone,
@@ -11,6 +13,7 @@ import {
   Radio,
   RefreshCw,
   Route as RouteIcon,
+  Scan,
   ShieldAlert,
   ShieldCheck,
   Trash2,
@@ -18,11 +21,14 @@ import {
 } from "lucide-react";
 
 import {
+  bacnetApi,
+  dicomApi,
   dnsblApi,
   ipamApi,
   lookingGlassApi,
   multicastApi,
   nmapApi,
+  otApi,
   tlsCertsApi,
   type DHCPFingerprintResponse,
   type IPAddress,
@@ -31,6 +37,7 @@ import {
   type Subnet,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { OT_PROTOCOL_LABELS, OT_ROLE_LABELS } from "@/lib/otLabels";
 import { CertsCompactTable } from "@/pages/network/CertificatesPage";
 import {
   MODAL_BACKDROP_CLS,
@@ -575,6 +582,13 @@ export function IPDetailModal({
               the network.multicast feature module is disabled. */}
           <MulticastMembershipsSection addressId={addr.id} />
 
+          {/* BACnet/IP device (issue #541), OT descriptor (issue #542)
+              and DICOM AE (issue #723). Each self-hides when its module
+              is off or the address carries no such sidecar. */}
+          <BACnetDeviceSection addressId={addr.id} />
+          <OTDeviceSection addressId={addr.id} />
+          <DICOMAESection addressId={addr.id} />
+
           {/* Covering BGP route (issue #566 Phase 3). Hidden when the
               network.looking_glass module is off or nothing in the
               active RIB covers this address. */}
@@ -790,6 +804,217 @@ function MulticastMembershipsSection({ addressId }: { addressId: string }) {
             ))}
           </tbody>
         </table>
+      </div>
+    </div>
+  );
+}
+
+// ── BACnet/IP device (issue #541) ─────────────────────────────────
+//
+// The BACnet identity of this address, if it has one. Most IPs are not
+// building-automation controllers, so the section renders nothing at
+// all rather than empty chrome — and the endpoint answers 404 for
+// "not a BACnet device", which is a normal answer here, not a failure.
+
+function BACnetDeviceSection({ addressId }: { addressId: string }) {
+  // Gate on `ready &&`: enabled() answers optimistically true while the
+  // module list is still loading, so without it a hard page load fires
+  // one request that 404s when the module is off.
+  const { enabled, ready } = useFeatureModules();
+  const bacnetEnabled = ready && enabled("network.bacnet");
+
+  const q = useQuery({
+    queryKey: ["bacnet-device-by-ip", addressId],
+    queryFn: () => bacnetApi.byAddress(addressId),
+    enabled: bacnetEnabled,
+    staleTime: 30_000,
+    // A 404 is the expected answer for most addresses; retrying it just
+    // burns three round-trips to learn the same thing.
+    retry: false,
+  });
+
+  if (!bacnetEnabled) return null;
+  const device = q.data;
+  if (!device) return null;
+
+  return (
+    <div>
+      <div className="mb-1 flex items-center gap-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+        <Building2 className="h-3 w-3" /> BACnet/IP device
+      </div>
+      <div className="space-y-1 rounded-md border px-3 py-2 text-xs">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="font-mono text-[13px] font-semibold tabular-nums">
+            {device.device_instance}
+          </span>
+          <span>{device.device_name || "unnamed device"}</span>
+          {device.is_bbmd && (
+            <span
+              className="inline-flex rounded bg-emerald-100 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider text-emerald-700 dark:bg-emerald-950/30 dark:text-emerald-400"
+              title="Broadcast Distribution Device — forwards BACnet broadcasts between subnets"
+            >
+              BBMD
+            </span>
+          )}
+          {device.is_foreign_device && (
+            <span className="inline-flex rounded bg-sky-100 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider text-sky-700 dark:bg-sky-950/30 dark:text-sky-400">
+              foreign
+            </span>
+          )}
+        </div>
+        <div className="text-muted-foreground">
+          {[
+            device.vendor_label || device.vendor_name,
+            device.model_name,
+            device.location,
+          ]
+            .filter(Boolean)
+            .join(" · ") || "No vendor / model recorded"}
+        </div>
+        <div className="text-muted-foreground">
+          UDP {device.udp_port}
+          {device.network_number !== null &&
+            ` · BACnet network ${device.network_number}`}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── DICOM application entity (issue #723) ─────────────────────────
+//
+// The DICOM identity of this address, if it has one. A PACS host can
+// front several AE Titles; this shows the lowest-titled one, which is
+// enough to answer "is this an imaging node" — the full set is on the
+// DICOM page. 404 means "not a DICOM node", a normal answer here.
+//
+// Network identity only: nothing rendered here is patient data, because
+// the registry stores none.
+
+function DICOMAESection({ addressId }: { addressId: string }) {
+  const { enabled, ready } = useFeatureModules();
+  const dicomEnabled = ready && enabled("network.dicom");
+
+  const q = useQuery({
+    queryKey: ["dicom-ae-by-ip", addressId],
+    queryFn: () => dicomApi.byAddress(addressId),
+    enabled: dicomEnabled,
+    staleTime: 30_000,
+    // 404 = "this address has no DICOM AE", the common case.
+    retry: false,
+  });
+
+  if (!dicomEnabled) return null;
+  const ae = q.data;
+  if (!ae) return null;
+
+  return (
+    <div>
+      <div className="mb-1 flex items-center gap-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+        <Scan className="h-3 w-3" /> DICOM application entity
+      </div>
+      <div className="space-y-1 rounded-md border px-3 py-2 text-xs">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="font-mono text-[13px] font-semibold">
+            {ae.ae_title}
+          </span>
+          {ae.is_vendor_default && (
+            <span
+              className="inline-flex rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider text-amber-700 dark:bg-amber-950/30 dark:text-amber-400"
+              title="Still a vendor default — the most common cause of institution-wide AE Title collisions"
+            >
+              default
+            </span>
+          )}
+          {!ae.tls_enabled && (
+            <span
+              className="inline-flex rounded bg-rose-100 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider text-rose-700 dark:bg-rose-950/30 dark:text-rose-400"
+              title="Not recorded as TLS-enabled — plaintext DICOM carries ePHI in the clear"
+            >
+              plaintext
+            </span>
+          )}
+        </div>
+        <div className="text-muted-foreground">
+          {[ae.vendor, ae.model_name, ae.department, ae.location]
+            .filter(Boolean)
+            .join(" · ") || "No vendor / department recorded"}
+        </div>
+        <div className="text-muted-foreground">
+          Port {ae.port} · {ae.role} · {ae.device_class}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── OT / industrial descriptor (issue #542) ───────────────────────
+//
+// The industrial identity of this address plus the Purdue verdict from
+// its subnet's zone. ``purdue_mismatch`` is tri-state: null means one
+// side has no declared level, which is an unknown rather than a
+// violation, so only an explicit ``true`` is flagged.
+
+function OTDeviceSection({ addressId }: { addressId: string }) {
+  const { enabled, ready } = useFeatureModules();
+  const otEnabled = ready && enabled("network.ot");
+
+  const q = useQuery({
+    queryKey: ["ot-device-by-ip", addressId],
+    queryFn: () => otApi.byAddress(addressId),
+    enabled: otEnabled,
+    staleTime: 30_000,
+    // 404 = "this address has no OT descriptor", the common case.
+    retry: false,
+  });
+
+  if (!otEnabled) return null;
+  const device = q.data;
+  if (!device) return null;
+
+  return (
+    <div>
+      <div className="mb-1 flex items-center gap-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+        <Factory className="h-3 w-3" /> OT device
+      </div>
+      <div className="space-y-1 rounded-md border px-3 py-2 text-xs">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="font-medium">
+            {device.profinet_device_name || "unnamed device"}
+          </span>
+          <span className="text-muted-foreground">
+            {OT_PROTOCOL_LABELS[device.ot_protocol] ?? device.ot_protocol}
+          </span>
+          {device.ot_role && (
+            <span className="inline-flex rounded bg-zinc-100 px-1.5 py-0.5 text-[10px] font-medium text-zinc-700 dark:bg-zinc-800/50 dark:text-zinc-300">
+              {OT_ROLE_LABELS[device.ot_role] ?? device.ot_role}
+            </span>
+          )}
+          {device.purdue_level !== null && (
+            <span className="inline-flex rounded bg-indigo-100 px-1.5 py-0.5 text-[10px] font-medium tabular-nums text-indigo-700 dark:bg-indigo-950/30 dark:text-indigo-400">
+              Purdue L{device.purdue_level}
+            </span>
+          )}
+          {device.purdue_mismatch === true && (
+            <span
+              className="inline-flex rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider text-amber-700 dark:bg-amber-950/30 dark:text-amber-400"
+              title={`The subnet's zone declares Purdue ${device.zone_purdue_level}`}
+            >
+              zone mismatch
+            </span>
+          )}
+        </div>
+        <div className="text-muted-foreground">
+          {[device.ot_vendor, device.ot_product, device.ot_serial]
+            .filter(Boolean)
+            .join(" · ") || "No vendor / product recorded"}
+        </div>
+        <div className="text-muted-foreground">
+          {device.zone_id
+            ? `Zone: ${device.zone_name || device.zone_cell_area || "unnamed"} (Purdue L${device.zone_purdue_level})`
+            : "Subnet has no Purdue zone declared"}
+          {device.cell_area && ` · Cell ${device.cell_area}`}
+        </div>
       </div>
     </div>
   );

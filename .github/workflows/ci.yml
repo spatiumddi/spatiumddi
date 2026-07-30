@@ -247,6 +247,40 @@ jobs:
         # ``tests/test_acceptance.py``.
         run: python -m pytest tests -q
 
+  # ── Appliance ────────────────────────────────────────────────────────────────
+  # ``appliance/tests`` has ~194 host-portable cases covering the installer's
+  # GRUB rendering, host migration, slot upgrades, cluster-join guards, the
+  # ``--check-preseed`` linter (#581) and the preseed security guards (#581) —
+  # and none of them ran in CI. Same gap #640 found for the agent suites: a
+  # suite nobody runs is a suite that goes red unnoticed, and #549 is a
+  # disk-*wiping* feature, so its guards are exactly the ones that must not
+  # regress silently.
+  #
+  # Deliberately hermetic: no root, no block devices, no Docker, no database.
+  # The only runtime dependency beyond pytest is PyYAML, which
+  # ``spatium-preseed-parse`` imports (the appliance image ships
+  # python3-yaml). Whole suite is ~10 s.
+  #
+  # Like the agent job above, this runs *tests only* — appliance scripts are
+  # not under ruff/black (Backend Lint scopes to ``backend/``), and the two
+  # pre-existing shellcheck findings in ``spatium-install`` (SC2010 / SC2034)
+  # are out of scope here.
+  appliance-test:
+    name: Appliance — Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install pytest pyyaml
+
+      - name: Run tests
+        run: python -m pytest appliance/tests -q
+
   # Required-status-check aggregator: branch protection can gate on the stable
   # name "Agent — Tests"; this job passes only if all three agent suites did.
   # Keep this name (and the matrix above) in sync with the required check.

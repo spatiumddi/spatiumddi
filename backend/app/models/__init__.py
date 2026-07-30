@@ -19,7 +19,9 @@ from app.models.audit import AuditLog
 from app.models.audit_forward import AuditForwardTarget
 from app.models.auth import APIToken, Group, Role, User, UserSession, user_group
 from app.models.auth_provider import AuthGroupMapping, AuthProvider
+from app.models.av import AVFlowProfile, AVReservedRange
 from app.models.backup import BackupTarget, RestoreDrill
+from app.models.bacnet import BACnetDevice
 from app.models.base import Base
 from app.models.bgp_looking_glass import BGPLGPeer, BGPLGRoute, LookingGlassCollector
 from app.models.bgp_monitor import BGPHijackDetection, BGPTrackedPrefix
@@ -43,6 +45,7 @@ from app.models.dhcp import (
 )
 from app.models.dhcp_fingerprint import DHCPFingerprint
 from app.models.diagnostics import InternalError
+from app.models.dicom import DICOMApplicationEntity, DICOMPeer
 from app.models.dns import (
     DNSAcl,
     DNSAclEntry,
@@ -58,6 +61,7 @@ from app.models.dns import (
     DNSView,
     DNSZone,
 )
+from app.models.dns_rpz_hit import DNSRPZHit
 from app.models.dns_threat import DNSClientWindow
 from app.models.dns_threat_mute import DNSThreatMute
 from app.models.dnsbl import DNSBLList, DNSBLListing, DNSBLPinnedIP
@@ -106,6 +110,7 @@ from app.models.network import (
 from app.models.network_service import NetworkService, NetworkServiceResource
 from app.models.nmap import NmapScan
 from app.models.opnsense import OPNsenseRouter
+from app.models.ot import OTDevice, OTZone
 from app.models.oui import OUIVendor
 from app.models.overlay import (
     ApplicationCategory,
@@ -158,6 +163,13 @@ __all__ = [
     "APPLIANCE_STATES",
     "PairingClaim",
     "PairingCode",
+    "AVFlowProfile",
+    "AVReservedRange",
+    "BACnetDevice",
+    "DICOMApplicationEntity",
+    "DICOMPeer",
+    "OTDevice",
+    "OTZone",
     "ASN",
     "ASNRpkiRoa",
     "BGPCommunity",
@@ -285,4 +297,5 @@ __all__ = [
     "WolRunTarget",
     "WolCalendar",
     "WolCalendarEvent",
+    "DNSRPZHit",
 ]

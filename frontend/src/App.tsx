@@ -36,6 +36,10 @@ import { NetworkPage } from "@/pages/network/NetworkPage";
 import { DeviceDetailView } from "@/pages/network/DeviceDetailView";
 import { AsnsPage } from "@/pages/network/AsnsPage";
 import { AsnDetailPage } from "@/pages/network/AsnDetailPage";
+import { AVFlowsPage } from "@/pages/network/AVFlowsPage";
+import { BACnetDevicesPage } from "@/pages/network/BACnetDevicesPage";
+import { DICOMPage } from "@/pages/network/DICOMPage";
+import { OTDevicesPage } from "@/pages/network/OTDevicesPage";
 import { CertificatesPage } from "@/pages/network/CertificatesPage";
 import { CircuitsPage } from "@/pages/network/CircuitsPage";
 import { LookingGlassPage } from "@/pages/network/looking-glass/LookingGlassPage";
@@ -82,6 +86,7 @@ import { ConformityPage } from "@/pages/admin/ConformityPage";
 import { TrashPage } from "@/pages/admin/TrashPage";
 import { WebhooksPage } from "@/pages/admin/WebhooksPage";
 import { ChangeRequestsPage } from "@/pages/admin/ChangeRequestsPage";
+import RequestsPage from "@/pages/RequestsPage";
 import { PlatformInsightsPage } from "@/pages/admin/PlatformInsightsPage";
 import { SettingsPage } from "@/pages/SettingsPage";
 import { useAuth } from "@/hooks/useAuth";
@@ -142,6 +147,12 @@ export default function App() {
         <Route path="network/vrfs/:id" element={<VRFDetailPage />} />
         <Route path="network/asns" element={<AsnsPage />} />
         <Route path="network/asns/:id" element={<AsnDetailPage />} />
+        {/* Vertical network-awareness surfaces (#543): AV over IP (#540),
+            BACnet/IP (#541), OT / industrial (#542). */}
+        <Route path="network/av" element={<AVFlowsPage />} />
+        <Route path="network/bacnet" element={<BACnetDevicesPage />} />
+        <Route path="network/dicom" element={<DICOMPage />} />
+        <Route path="network/ot" element={<OTDevicesPage />} />
         <Route path="network/certificates" element={<CertificatesPage />} />
         <Route path="network/circuits" element={<CircuitsPage />} />
         <Route path="network/customers" element={<CustomersPage />} />
@@ -230,6 +241,9 @@ export default function App() {
         <Route path="admin/domains/:id" element={<DomainDetailPage />} />
         <Route path="admin/webhooks" element={<WebhooksPage />} />
         <Route path="admin/change-requests" element={<ChangeRequestsPage />} />
+        {/* #696 self-service portal — deliberately top-level, not under
+            admin/: requesters are ordinary users, not administrators. */}
+        <Route path="requests" element={<RequestsPage />} />
         <Route path="admin/compliance" element={<CompliancePage />} />
         <Route path="admin/conformity" element={<ConformityPage />} />
         <Route path="admin/trash" element={<TrashPage />} />

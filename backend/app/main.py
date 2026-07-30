@@ -203,6 +203,20 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
             {"action": "read", "resource_type": "change_request"},
         ],
     ),
+    "Requester": (
+        "Submit self-service requests for IP addresses, subnets, DNS records and "
+        "DHCP reservations (#696). This is the LOW-privilege half of the workflow "
+        "and is meant to be granted broadly — to a whole department, not just the "
+        "network team. Holding it confers no ability to provision anything: a "
+        "submitted request only becomes a change when a *different* operator who "
+        "holds the underlying operation's own permission (e.g. ``write,subnet`` to "
+        "approve a subnet request) approves it, enforced server-side by the shared "
+        "#62 approve spine. Requesters see only their own requests.",
+        [
+            {"action": "write", "resource_type": "provisioning_request"},
+            {"action": "read", "resource_type": "provisioning_request"},
+        ],
+    ),
     "DNS Editor": (
         "Full CRUD on DNS zones, records, server groups, blocklists, and pools.",
         [
@@ -231,8 +245,11 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
         "on-demand nmap scans, the ASN registry, VRFs, WAN circuits, "
         "SD-WAN overlay topology + routing policies + the application "
         "catalog (#95), the customer-deliverable services (#94) those "
-        "resources bundle into, and the logical ownership tags (customer "
-        "/ site / provider) those entities reference.",
+        "resources bundle into, the vertical network-awareness registries "
+        "(AV-over-IP flows, BACnet/IP devices, industrial-OT devices, "
+        "DICOM application entities), and "
+        "the logical ownership tags (customer / site / provider) those "
+        "entities reference.",
         [
             {"action": "admin", "resource_type": "manage_network_devices"},
             {"action": "admin", "resource_type": "manage_nmap_scans"},
@@ -243,6 +260,10 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
             {"action": "admin", "resource_type": "vrf"},
             {"action": "admin", "resource_type": "circuit"},
             {"action": "admin", "resource_type": "multicast"},
+            {"action": "admin", "resource_type": "av_flow"},
+            {"action": "admin", "resource_type": "bacnet_device"},
+            {"action": "admin", "resource_type": "dicom_ae"},
+            {"action": "admin", "resource_type": "ot_device"},
             {"action": "admin", "resource_type": "network_service"},
             {"action": "admin", "resource_type": "overlay_network"},
             {"action": "admin", "resource_type": "routing_policy"},
@@ -535,6 +556,18 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_dns_tunneling_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("dns_tunneling_alert_rule_seed_skipped", reason=str(exc))
+    try:
+        from app.services.alerts import seed_dns_beaconing_alert_rule  # noqa: PLC0415
+
+        await seed_dns_beaconing_alert_rule()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("dns_beaconing_alert_rule_seed_skipped", reason=str(exc))
+    try:
+        from app.services.alerts import seed_dns_dga_alert_rule  # noqa: PLC0415
+
+        await seed_dns_dga_alert_rule()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("dns_dga_alert_rule_seed_skipped", reason=str(exc))
     # Appliance Web UI cert bootstrap (issue #134, Phase 4b.5). On
     # appliance installs without an active row in appliance_certificate,
     # generate a self-signed default + deploy it to /etc/nginx/certs

@@ -410,7 +410,7 @@ Located at [`app/drivers/dns/powerdns.py`](../../backend/app/drivers/dns/powerdn
 
 PowerDNS is a second authoritative driver running side-by-side with BIND9. It is **agent-managed** the same way BIND9 is — there is one DNS agent per server, the agent owns the local PowerDNS daemon (`pdns_server`), and the control plane never opens a connection to PowerDNS directly. The agent talks to PowerDNS's REST API on `127.0.0.1:8081`; the control plane talks to the agent through the existing long-poll `/config` channel.
 
-The shipped image (`ghcr.io/spatiumddi/dns-powerdns`) bundles `pdns 4.9.x` with the `pdns-backend-lmdb` backend. LMDB is a single-file embedded zone store — no external Postgres, no shared credentials, full operational symmetry with BIND9's "zone files on local disk" model. A `gpgsql`-backend image variant is on the Phase 5+ wishlist for operators who want PowerDNS-pod-replicas-against-shared-Postgres HA, but is not the default.
+The shipped image (`ghcr.io/spatiumddi/dns-powerdns`) bundles `pdns 5.0.x` with the `pdns-backend-lmdb` backend. **Upgrading this image across the 4.x → 5.x boundary migrates the LMDB schema one way** — see §4.9. LMDB is a single-file embedded zone store — no external Postgres, no shared credentials, full operational symmetry with BIND9's "zone files on local disk" model. A `gpgsql`-backend image variant is on the Phase 5+ wishlist for operators who want PowerDNS-pod-replicas-against-shared-Postgres HA, but is not the default.
 
 ### 4.1 Update Strategy: REST API (never daemon restart)
 
@@ -422,14 +422,38 @@ The shipped image (`ghcr.io/spatiumddi/dns-powerdns`) bundles `pdns 4.9.x` with 
 | Reconcile zone (full sync) | `PUT /api/v1/servers/localhost/zones/<zone>` with full rrset list | Used on first sync or on detected drift. |
 | Online DNSSEC sign | `POST .../zones/<zone>/cryptokeys` (KSK + ZSK) + `PUT .../zones/<zone>/rectify` | Idempotent — re-sign skips when keys exist. No `PRESIGNED` metadata (see §4.5). |
 | Online DNSSEC unsign | `DELETE .../cryptokeys/<id>` per key | Same idempotent shape. |
-| Catalog zone (RFC 9432) producer | Render apex SOA + NS + `version` TXT + per-member SHA-1-hashed PTR via the same rrset PATCH path | Producer-only; consumer waits for pdns 4.10+ (Phase 5 polish). |
+| Catalog zone (RFC 9432) producer | Render apex SOA + NS + `version` TXT + per-member SHA-1-hashed PTR via the same rrset PATCH path | Producer-only; consumer mode is not wired up in the agent (Phase 5 polish). |
 | **Full daemon restart** | ❌ NEVER for normal operations | Only for: image bump, zone-storage backend swap (LMDB → gpgsql). |
 
 The agent never reads `pdns.conf` to figure out what to do — it queries PowerDNS over REST and reconciles against the `ConfigBundle` shipped from the control plane. This is the same conceptual loop as the BIND9 driver, but the wire protocol is HTTP+JSON instead of RFC 2136+rndc.
 
+> ⚠️ **Never write zones with `pdnsutil` against a running daemon** (issue #132).
+> `pdnsutil` writes straight to LMDB, behind `pdns_server`'s back.
+> `pdns_server` caches the set of zones it is authoritative for
+> (`zone-cache-refresh-interval`, default **300 s**), so a zone created
+> after startup by `pdnsutil` is missing from that cache and the daemon
+> answers as **non-authoritative** — the records are genuinely in the
+> database and `dig` still returns nothing, with no error anywhere.
+> `pdns_control purge` does *not* help: it flushes the query/packet
+> cache, not the zone cache. Reproduced identically on 4.9.5 and 5.0.5.
+>
+> Writes through the REST API go through `pdns_server` itself, so the
+> zone cache updates as a side effect and the zone is served immediately
+> — no purge, no `rediscover`, no restart. That is why every write path
+> in the agent is REST, and why the `agent-e2e.yml` DNSSEC smoke was
+> rewritten onto the API in #132 (it had driven `pdnsutil`, and had
+> therefore never passed since the day it was added).
+>
+> `pdnsutil` remains fine for **read-only** inspection (`list-zone`,
+> `show-zone`) — which is exactly what makes it useful as a failure
+> diagnostic: if `list-zone` shows a record that `dig` won't return,
+> you are looking at this cache.
+
 ### 4.2 PowerDNS API key
 
-PowerDNS gates its REST API with a static API key (`api-key=...` in `pdns.conf`). The container's entrypoint generates a fresh key on first boot, writes it into the local `pdns.conf`, and exports it to the agent via a tmpfs-mounted env file. **Operators never touch this key.** The agent reads it on startup and rotates it on every container restart.
+PowerDNS gates its REST API with a static API key (`api-key=...` in `pdns.conf`). The container's entrypoint generates a key on first boot into **`/var/lib/spatium-dns-agent/pdns-api.key`** (mode `0600`, owned `spatium:spatium`) and the agent renders it into `pdns.conf` on every config sync. **Operators never touch this key.**
+
+The key **persists** in the agent state dir — the entrypoint only generates when the file is absent (`if [ ! -f "$API_KEY_FILE" ]`), so it survives container restarts and is stable for the life of the volume. The agent's `_load_or_generate_api_key` reads the same path and refuses to overwrite a file it cannot read, rather than silently minting a second key while `pdns_server` is already running with the first (issue #253). Anything that needs to talk to the local API — including the `agent-e2e` DNSSEC smoke — reads that file rather than inventing a key.
 
 The control plane has no knowledge of the API key — the trust boundary is between the agent and its co-located PowerDNS daemon, not between the control plane and PowerDNS.
 
@@ -443,7 +467,7 @@ class PowerDNSDriver(DNSDriver):
             "alias_records": True,         # CNAME-at-apex via PATCH
             "lua_records": True,           # ENABLE-LUA-RECORDS=1 zone metadata auto-set
             "dnssec_inline_signing": True, # online sign / unsign / re-sign
-            "catalog_zones": "producer-only",  # consumer needs pdns 4.10+
+            "catalog_zones": "producer-only",  # consumer not wired up in the agent
             "views": False,                # tag-based; not surfaced as views in UI yet
             "rpz": False,                  # authoritative-only — RPZ is a recursor feature
         }
@@ -463,7 +487,7 @@ PowerDNS does the full DNSSEC dance internally:
 
 1. `POST /cryptokeys` with `keytype: ksk` (Algorithm 13 / ECDSAP256SHA256, pinned explicitly). PowerDNS generates the key and starts publishing DNSKEY rrsets.
 2. `POST /cryptokeys` with `keytype: zsk` (same algorithm). PowerDNS now signs all rrsets in the zone with the ZSK on every query.
-3. `PUT /zones/<zone>/rectify` — recomputes NSEC / NSEC3 chain. The agent deliberately does **not** set the `PRESIGNED` zone metadata: that flag is for externally-signed zones loaded as already-signed, whereas pdns derives online-signing intent from the presence of active/published cryptokeys (and pdns 4.9 rejects setting `PRESIGNED` with "Unsupported metadata kind").
+3. `PUT /zones/<zone>/rectify` — recomputes NSEC / NSEC3 chain. The agent deliberately does **not** set the `PRESIGNED` zone metadata: that flag is for externally-signed zones loaded as already-signed, whereas pdns derives online-signing intent from the presence of active/published cryptokeys (and pdns rejects setting `PRESIGNED` with "Unsupported metadata kind" — re-verified on 5.0.5 in #638).
 
 After signing, the agent enumerates DS records via `GET /cryptokeys` and POSTs them back to the control plane through the new `POST /api/v1/dns/agents/dnssec-state` endpoint. The control plane caches them in `dns_zone.dnssec_ds_records` (JSONB) so the operator-facing zone-edit page renders them without round-tripping the agent.
 
@@ -477,7 +501,7 @@ Producer-side only. When `DNSServerGroup.catalog_zones_enabled` is on and this s
 - `version` TXT pinned to `"2"` (RFC 9432 §4.1)
 - One PTR per primary zone under `<sha1>.zones.<catalog-zone>.` using the canonical RFC 9432 wire-format hash. **Identical bytes to BIND9's catalog renderer** — a SpatiumDDI catalog can be served from either driver and consumed by either.
 
-Consumer mode logs a structured warning at agent startup: pdns 4.9 (the shipped image) does not auto-consume catalog zones. Operators with PowerDNS secondaries pull via plain AXFR against the producer; full consumer-side support waits for an image bump to pdns 4.10+.
+Consumer mode logs a structured warning at agent startup: the agent does not wire up PowerDNS catalog-consumer mode. Operators with PowerDNS secondaries pull via plain AXFR against the producer; full consumer-side support is still a Phase 5 polish item.
 
 ### 4.7 PowerDNSDriver Configuration
 
@@ -514,6 +538,39 @@ services:
 On a fresh install the LMDB backend **self-initialises on first `pdns_server` start** — the daemon mmaps the configured `lmdb-filename` (and its sharded siblings) and writes the env header itself, so the entrypoint deliberately does **not** pre-create the file (an empty 0-byte `pdns.lmdb` would be rejected by `mdb_env_open`; the entrypoint only removes a stale 0-byte leftover from a prior bad start). Once pdns is up, the long-poll picks up the first ConfigBundle and reconciles the zones. If the LMDB file is already populated (restart on existing volume), `pdns_server` boots straight into serving and the agent reconciles any DB drift on the next ConfigBundle ETag flip.
 
 LMDB cache survives control-plane outages — non-negotiable #5 in `CLAUDE.md`. The daemon keeps answering queries from the on-disk LMDB store regardless of whether the agent can reach the control plane.
+
+### 4.9 The LMDB schema guard — rollback is a two-step operation (issue #638)
+
+**PowerDNS 5.0 migrates the LMDB schema from v5 to v6 the first time it opens the database.** A read is enough to trigger it, it is silent, and upstream ships no downgrade. The documented `lmdb-schema-version=5` escape hatch is a docs bug — setting it makes pdns refuse to boot outright. Afterwards, pdns 4.9 cannot open the database at all:
+
+```
+Caught an exception instantiating a backend (lmdb), cleaning up
+Error: Somehow, we are not at schema version 5. Giving up
+```
+
+This matters because **rolling back the image does not roll back the database.** The LMDB is persisted in every deployment shape (Compose named volume / appliance hostPath / chart PVC), and the appliance A/B slot rollback swaps the *rootfs* while `/var` — where the database lives — is the shared persistent partition and is untouched. Phase 8c's health-gated auto-revert lands in that state on its own, without an operator ever choosing it.
+
+**What the image does about it.** `agent/dns/images/powerdns/lmdb-guard.sh` is installed as `spatium-pdns-lmdb-guard` and the entrypoint runs `snapshot` before the agent spawns `pdns_server`:
+
+1. It records which pdns version last owned the database in `/var/lib/powerdns/.pdns-version`.
+2. When the running binary's **major** is *higher* than the recorded one, it copies the database — the main env plus the lazily-created shards, but **not** the `-lock` reader tables, which LMDB recreates on open — into `/var/lib/powerdns/snapshots/<UTC>-pdns<from>-to-<to>/` with a `MANIFEST`, **before** the daemon can open, and therefore migrate, anything. The timestamp leads the directory name so that lexical order is always chronological. A *downgrade* is deliberately not snapshotted: the database is already at the newer schema, so the copy would be worthless and would sort ahead of the real pre-upgrade snapshot.
+3. It **fails closed.** If the snapshot cannot be taken (no free space, copy error), the container refuses to start. That is deliberate: a container that won't start is recoverable by redeploying the previous image, while a migrated database is not. `PDNS_LMDB_ALLOW_UNPROTECTED_UPGRADE=1` overrides for operators who have their own backup.
+4. Both kinds of snapshot — automatic pre-upgrade copies and the `pre-restore-*` undo copies a restore leaves behind — are independently pruned to the newest `PDNS_LMDB_SNAPSHOT_KEEP` (default 3). Neither is exempt: the undo copies are generated by exactly the recovery path most likely to be retried, and an unbounded pile of them fills the partition the daemon needs to write to.
+
+**Rolling a node back.** Two steps, not one:
+
+```sh
+# 1. redeploy the older dns-powerdns image (slot rollback / image tag / helm)
+# 2. put the database back, from a shell in the DNS container:
+spatium-pdns-lmdb-guard list                 # inspect available snapshots
+spatium-pdns-lmdb-guard restore latest       # daemon must be stopped
+```
+
+`restore` stages the incoming copy before touching the live database and saves the current one to a `pre-restore-*` snapshot first, so a failed or wrong restore is itself recoverable. For a node whose pdns is already crash-looping, set `PDNS_LMDB_RESTORE=latest` in the container environment instead — the entrypoint restores before starting the agent (`dnsPowerdns.lmdbRestore` in the appliance chart). It is safe to leave set: the guard records which snapshot the database came from, so later restarts are a no-op rather than a repeated restore over live changes.
+
+**Multi-node rolling upgrades are safe.** During a #296 rolling upgrade node A can be on pdns 5.0 while node B is still on 4.9. They do not share a database: post-#170 every agent renders its zones as `type master` (an independent authoritative copy) and record ops fan out per-server, so each node migrates its own LMDB independently and neither can see the other's schema. A mixed-major window is a normal steady state for the duration of the run.
+
+**The operator is warned before Start.** The rolling-upgrade preflight check `powerdns_lmdb_migration` (`backend/app/services/upgrades/preflight.py`) warns — never fails — when any appliance node still reports pdns 4.x, and names the restore command in the message. It reads `dns_server.daemon_version`, which the agent reports on every heartbeat. Once every node reports ≥ 5.0 the check goes green and stops firing.
 
 ---
 
@@ -697,7 +754,7 @@ Mixed installs work via multiple groups:
 | Manual NSEC3 + KSK / ZSK rollover control | **BIND9** |
 | First-class views / split-horizon (issue #24) | **BIND9** |
 | Catalog zones as **producer** | BIND9 or PowerDNS — same wire bytes |
-| Catalog zones as **consumer** | **BIND9** today (PowerDNS waits for 4.10+) |
+| Catalog zones as **consumer** | **BIND9** today (not wired up on the PowerDNS agent) |
 | Native DoT/DoH/DoQ with no sidecar (once wired, §4B.5) | **Technitium** |
 | Simple REST-driven primary zones, minimal footprint | **PowerDNS** or **Technitium** |
 | Active Directory-integrated DNS | **Windows DNS** (separate path) |

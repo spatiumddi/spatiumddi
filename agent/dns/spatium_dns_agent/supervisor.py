@@ -45,7 +45,7 @@ def run(cfg: AgentConfig) -> int:
     token_ref = [token]
 
     driver = _select_driver(cfg)
-    heartbeat = HeartbeatClient(cfg, token_ref)
+    heartbeat = HeartbeatClient(cfg, token_ref, driver=driver)
     syncer = SyncLoop(cfg, token_ref, driver, heartbeat)
 
     # Spawn daemon before threads so the first poll can reload it if needed

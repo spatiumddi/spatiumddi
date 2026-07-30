@@ -317,6 +317,10 @@ async def list_requests(
         state=state,
         resource_type=resource_type,
         requested_by_user_id=scope_user_id,
+        # #696 — this queue is the GATE's. Self-service portal rows live in
+        # the same table under origin='portal' and are served by /requests;
+        # without this pin they would leak into the #62 admin page.
+        origin="gate",
         limit=max(1, min(limit, 500)),
         offset=max(0, offset),
     )
@@ -509,12 +513,34 @@ async def get_request(cr_id: uuid.UUID, current_user: CurrentUser, db: DB) -> Ch
     # READ RULE (#1): 404 (not 403) unless the caller is the requester, holds
     # approve, or is a superadmin — so a non-eligible caller can't even confirm
     # a given change-request id EXISTS, let alone read its contents.
-    if cr is None or (
-        not _can_see_all_change_requests(current_user)
-        and cr.requested_by_user_id != current_user.id
+    # #696 — a portal row is not part of this queue; 404 it here so the two
+    # surfaces stay disjoint (it is readable via /requests/{id} instead).
+    if (
+        cr is None
+        or cr.origin != "gate"
+        or (
+            not _can_see_all_change_requests(current_user)
+            and cr.requested_by_user_id != current_user.id
+        )
     ):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
     return _cr_to_response(cr)
+
+
+async def _assert_gate_row(db: DB, cr_id: uuid.UUID) -> None:
+    """404 unless ``cr_id`` is a GATE row (#696).
+
+    The decision endpoints below drive the shared approve spine, which is
+    origin-agnostic by design. Without this check they are a side door into
+    the self-service portal: a portal request could be approved — and
+    therefore PROVISIONED — through /change-requests even when the
+    ``governance.requests`` module that owns it is disabled, bypassing its
+    feature gate entirely. The list/get endpoints already pin origin; the
+    decision endpoints need the same pin.
+    """
+    cr = await get_change_request(db, cr_id)
+    if cr is None or cr.origin != "gate":
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
 
 
 @router.post("/{cr_id}/approve", response_model=ChangeRequestResponse)
@@ -549,6 +575,7 @@ async def approve_request(
        leaves the row ``pending`` and surfaces the status; a server fault
        marks it ``failed``.
     """
+    await _assert_gate_row(db, cr_id)
     note = body.decision_note if body is not None else None
 
     # Delegate to the single two-person spine (services/approvals/service.py)
@@ -577,6 +604,7 @@ async def reject_request(
     """Decline a pending request. Needs ``approve,change_request``; like
     approve, the rejecter may not be the requester (a self-reject is just a
     cancel — use that)."""
+    await _assert_gate_row(db, cr_id)
     note = body.decision_note if body is not None else None
     try:
         cr = await reject_change_request(
@@ -598,7 +626,8 @@ async def cancel_request(
     """Withdraw a pending request. Only the original requester or a
     superadmin may cancel."""
     cr = await get_change_request(db, cr_id, for_update=True)
-    if cr is None:
+    # #696 — gate rows only; a portal row is cancelled via /requests.
+    if cr is None or cr.origin != "gate":
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
     is_requester = (
         cr.requested_by_user_id is not None and current_user.id == cr.requested_by_user_id

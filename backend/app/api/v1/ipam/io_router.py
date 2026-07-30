@@ -221,6 +221,50 @@ async def import_addresses_commit(
     return result.as_dict()
 
 
+@router.get("/export.pdf")
+async def export_pdf_endpoint(
+    current_user: CurrentUser,
+    db: DB,
+    space_id: uuid.UUID | None = Query(default=None),
+    block_id: uuid.UUID | None = Query(default=None),
+    subnet_id: uuid.UUID | None = Query(default=None),
+    include_addresses: bool = Query(default=False),
+) -> Response:
+    """Print-ready PDF of an IPAM subtree (#82) — the handover / auditor
+    deliverable, as opposed to ``/export``'s machine-readable formats.
+
+    Same scope selector: exactly one of space_id / block_id / subnet_id.
+    A subnet scope renders the detail report (facts + address table);
+    a space or block scope renders the tree report. A subnet report
+    always includes its addresses — it exists to show them — so
+    ``include_addresses`` is only meaningful on the tree shape, where it
+    appends a scope-wide address table. Read-gated by the IPAM
+    router-level permission dependency, same as every other route here.
+    """
+    from app.services.ipam_io.pdf import generate_ipam_pdf  # noqa: PLC0415
+
+    data, filename = await generate_ipam_pdf(
+        db,
+        space_id=space_id,
+        block_id=block_id,
+        subnet_id=subnet_id,
+        include_addresses=include_addresses,
+    )
+    logger.info(
+        "ipam_export_pdf",
+        space_id=str(space_id) if space_id else None,
+        block_id=str(block_id) if block_id else None,
+        subnet_id=str(subnet_id) if subnet_id else None,
+        bytes=len(data),
+        user=current_user.display_name,
+    )
+    return Response(
+        content=data,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @router.get("/export")
 async def export_endpoint(
     current_user: CurrentUser,

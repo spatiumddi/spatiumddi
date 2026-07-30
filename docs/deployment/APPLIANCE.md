@@ -839,7 +839,13 @@ invalid, `2` usage error.
 file is the usual preseed tradeoff. Use `admin_password_hash` (crypt(3),
 e.g. `openssl passwd -6`) to keep the cleartext out of the file, and
 mint a fresh single-use pairing code per install. Neither is echoed to
-the console dashboard, the install log, or the trace log.
+the console dashboard, the install log, or the trace log — the secret
+env is sourced and `chpasswd` is fed with `set +x`, and **since #581 the
+interactive password prompt is too** (it previously wrote the operator's
+plaintext password into the trace log, which `on_failure` tails to the
+console on any non-zero exit). `/var/log/*` is excluded from the rsync
+onto the target, so no install-time log follows the secret into the
+installed system.
 
 **Transports** (first match wins): kernel cmdline
 `spatium.preseed=<url|path>` (PXE/IPMI), a NoCloud `CIDATA`-labelled
@@ -848,6 +854,50 @@ volume carrying `spatium-preseed.yaml` (VM/Proxmox), or a
 `spatium_preseed:` block can be embedded in a cloud-init `user-data`
 document, which is how the **AWS** (`--user-data`) and **Azure**
 (`--custom-data`) cloud-image recipes deliver it.
+
+**URL transport integrity (#581).** The cmdline URL is the only
+transport that arrives over the network from a party the installer
+cannot authenticate — and the file it delivers authorises a full disk
+wipe and carries the admin password (plus, on the appliance role, the
+pairing code). A **plain `http://` URL with no integrity pin is
+refused**, loudly, before the fetch. Use either:
+
+- an **`https://`** URL — TLS authenticates the origin; or
+- a content pin alongside it, for air-gapped / internal-CA PXE setups
+  where https isn't practical:
+
+  ```
+  spatium.preseed=http://pxe.internal/spatium-preseed.yaml
+  spatium.preseed.sha256=<64-hex-digest>
+  ```
+
+  (`sha256sum spatium-preseed.yaml` produces the digest.) A pin is
+  verified whenever supplied, https or not, and a mismatch halts the
+  install rather than acting on modified content. If a pin is supplied
+  but cannot be checked, the installer fails closed.
+
+  The `file` and `CIDATA` transports are physically attached and are
+  unaffected by this gate.
+
+**Pre-wipe safety check (#581).** Immediately before `wipefs`,
+`spatium-install` re-validates `target_disk`: it must still be a
+present, whole block device, clear the 32 GiB floor, and **not** be a
+disk backing the live install medium. The interactive picker already
+excluded the boot USB (#554), but a preseeded `target_disk` skips the
+picker entirely — so without this, an answer file naming the install
+USB destroyed the running media mid-install, unattended. The check
+runs on both paths (it also covers a bare `sdX` name renumbering onto a
+different disk between parse and wipe). On an unattended run it halts
+non-zero with the reason; interactively it explains and returns you to
+the picker. There is no `target_disk: auto` mode — the disk must be
+named explicitly, and `confirm_wipe: true` is required on top of it.
+
+**`admin_user` shape (#581).** Validated at parse time: 32 chars max,
+must match `[a-z_][a-z0-9_-]*\$?` (Debian's `NAME_REGEX`), and must not
+be a reserved system account that already exists in the image (`root`,
+`www-data`, `nobody`, …). An unvalidated value would otherwise fail
+`useradd` *after* the disk was already wiped — or, with a colon in it,
+split the `user:password` line piped to `chpasswd`.
 
 Once the installed system reboots, `spatiumddi-firstboot.service`
 runs as normal (identical to the interactive path): generates

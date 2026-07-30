@@ -91,6 +91,13 @@ IP_ROLES: frozenset[str] = frozenset(
         "vrrp",
         "secondary",
         "gateway",
+        # Baseboard management controller — iDRAC / iLO / IPMI / Redfish
+        # (#722). Worth its own role rather than a tag: a BMC is a
+        # management-plane endpoint on a fragile embedded stack, and it
+        # is a routine casualty of ping sweeps and nmap runs. Naming the
+        # class is what lets an operator find every one of them and
+        # decide whether their subnet belongs behind ``do_not_probe``.
+        "bmc",
         # TLS-serving classifications (#118 Phase 2) — an IP in one of these
         # roles is auto-added as a TLS cert probe target by the discovery
         # reconciler (see TLS_SERVING_ROLES).
@@ -167,6 +174,18 @@ class IPSpace(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     )
     ddns_domain_override: Mapped[str | None] = mapped_column(String(255), nullable=True)
     ddns_ttl: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # ── Fragile-device probe suppression (issue #722) ────────────────────
+    # Root of the space → block → subnet chain. See ``Subnet`` for the
+    # full semantics; the short version is that this flag ORs downward
+    # (a space marked do-not-probe suppresses probes on every subnet
+    # under it, and no descendant can un-set it).
+    do_not_probe: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+    do_not_probe_reason: Mapped[str] = mapped_column(
+        Text, nullable=False, default="", server_default=sa_text("''")
+    )
 
     # ── VRF / routing annotation ─────────────────────────────────────────
     # First-class VRF binding (added by issue #86). The freeform
@@ -415,6 +434,17 @@ class IPBlock(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
         Boolean, nullable=False, default=True, server_default=sa_text("true")
     )
 
+    # ── Fragile-device probe suppression (issue #722) ─────────────────────
+    # Mid-chain link. Deliberately has NO ``*_inherit_settings`` toggle:
+    # unlike DDNS, this is a safety constraint, so it ORs downward rather
+    # than being overridable by a descendant. See ``Subnet``.
+    do_not_probe: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+    do_not_probe_reason: Mapped[str] = mapped_column(
+        Text, nullable=False, default="", server_default=sa_text("''")
+    )
+
     # ── VRF binding (issue #86) ───────────────────────────────────────────
     # Optional. NULL means "inherit from the parent block (recurse) or
     # ultimately from the IPSpace". Pinning a non-NULL value lets a
@@ -486,6 +516,16 @@ class Subnet(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
             "ix_subnet_bgp_should_advertise",
             "bgp_should_advertise",
             postgresql_where=sa_text("bgp_should_advertise = true"),
+        ),
+        # Fragile-device probe suppression (#722). Partial because the
+        # flagged rows are a small minority in any real estate, so the
+        # index is tiny and turns the discovery dispatcher's per-tick
+        # question into an index scan. Declared here as well as in the
+        # migration so autogenerate sees it and reports no drift.
+        Index(
+            "ix_subnet_do_not_probe",
+            "do_not_probe",
+            postgresql_where=sa_text("do_not_probe"),
         ),
         # Subnets cannot overlap within the same IP space (enforced at application layer)
     )
@@ -651,6 +691,47 @@ class Subnet(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     )
     last_discovery_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
+    )
+
+    # ── Fragile-device probe suppression (issue #722) ─────────────────
+    # "Do not send SpatiumDDI's own active probes at anything in here."
+    #
+    # Medical- and OT-device vendors explicitly instruct sites not to
+    # scan their VLANs — Swisslog's pneumatic-tube guide says to omit
+    # ping sweeps and nmap of any range supporting the PTS, and the same
+    # hazard covers patient monitors and the PLC / RTU class ``network.ot``
+    # already registers. Fragile IP stacks fault or drop off the network
+    # under a sweep. Until this flag existed there was no way to say so.
+    #
+    # Three properties of these two columns are load-bearing:
+    #
+    # 1. **It ORs down the space → block → subnet chain, and there is no
+    #    per-level inherit toggle.** DDNS resolves to the first
+    #    non-inheriting ancestor, so a descendant can override its
+    #    parent. That shape is wrong for a safety constraint: a hospital
+    #    that marks the clinical IPSpace do-not-probe must not have a
+    #    single subnet quietly opt back in. Any level saying "do not
+    #    probe" wins, and nothing downstream can un-say it. See
+    #    ``app.services.ipam.probe_policy``.
+    # 2. **It is not gated behind a vertical feature module.** It is a
+    #    constraint on *our* behaviour and a correctness fix to three
+    #    already-shipped features (#23 discovery sweeps, ``tools.nmap``,
+    #    ``tools.network``), so hiding it behind a default-off module
+    #    would leave the sites that need it unprotected by default.
+    # 3. **The reason travels with the flag.** Every refusal quotes it
+    #    back, because "422 — subnet marked do-not-probe" without "these
+    #    are Alaris pumps, per vendor bulletin X" just gets overridden by
+    #    the next operator who hits it.
+    #
+    # The flag suppresses probes; it does not hide the subnet, block
+    # allocation, or affect passive collection (PCAP #59, DHCP
+    # fingerprinting, ARP-table reads) — passive observation was never
+    # the hazard.
+    do_not_probe: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+    do_not_probe_reason: Mapped[str] = mapped_column(
+        Text, nullable=False, default="", server_default=sa_text("''")
     )
 
     # IPv6 auto-allocation policy (ignored for IPv4 subnets — those use

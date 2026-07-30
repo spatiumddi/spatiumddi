@@ -50,6 +50,18 @@ CHANGE_REQUEST_STATES: frozenset[str] = frozenset(
     {"pending", "approved", "rejected", "executed", "failed", "expired", "cancelled"}
 )
 
+# Where the row came from (issue #696).
+#
+# ``gate``   — the #62 gate intercepted a risky operation a permitted operator
+#              was already performing. Approval *unblocks* it.
+# ``portal`` — a requester submitted through the #696 self-service portal for
+#              something they cannot do themselves. Approval *provisions* it.
+#
+# Same lifecycle, same approve spine, opposite direction of privilege. The two
+# queues are filtered apart by this column so neither surface shows the other's
+# rows.
+CHANGE_REQUEST_ORIGINS: frozenset[str] = frozenset({"gate", "portal"})
+
 # Actions an approval policy can gate. Coarse on purpose (resource_type +
 # action [+ count threshold]); per-resource_id scoping is a later
 # enhancement that rides #64.
@@ -70,6 +82,15 @@ class ChangeRequest(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         Index("ix_change_request_requested_by", "requested_by_user_id"),
         # "what's queued against this resource" lookup.
         Index("ix_change_request_resource", "resource_type", "resource_id"),
+        # #696 — both queues read one origin at a time, usually pending-only.
+        Index("ix_change_request_origin_state", "origin", "state"),
+    )
+
+    # #696 — which surface produced this row. See CHANGE_REQUEST_ORIGINS.
+    # Defaulted in the DB as well as here so the #62 gate's inserts, which
+    # never pass it, keep landing as 'gate' unchanged.
+    origin: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="gate", server_default="gate"
     )
 
     # Operation registry key to replay (e.g. ``delete_subnet``).
@@ -86,6 +107,10 @@ class ChangeRequest(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     args: Mapped[dict] = mapped_column(JSONB, nullable=False)
     preview_text: Mapped[str] = mapped_column(Text, nullable=False)
     risk_reason: Mapped[str] = mapped_column(String(255), nullable=False)
+
+    # #696 — the requester's own "why". NULL on gate rows, which carry the
+    # policy-derived ``risk_reason`` instead; the portal asks a human.
+    justification: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     state: Mapped[str] = mapped_column(
         String(16), nullable=False, default="pending", server_default="pending"
@@ -155,6 +180,7 @@ class ApprovalPolicy(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
 __all__ = [
     "APPROVAL_POLICY_ACTIONS",
+    "CHANGE_REQUEST_ORIGINS",
     "CHANGE_REQUEST_STATES",
     "ApprovalPolicy",
     "ChangeRequest",

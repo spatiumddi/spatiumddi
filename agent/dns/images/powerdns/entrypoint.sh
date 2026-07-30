@@ -41,5 +41,38 @@ if [ -f /var/lib/powerdns/pdns.lmdb ] \
     rm -f /var/lib/powerdns/pdns.lmdb /var/lib/powerdns/pdns.lmdb-lock
 fi
 
+# Issue #638 — LMDB schema guard. PowerDNS 5.0 silently and irreversibly
+# migrates the LMDB schema (v5 → v6) the first time it opens the database, so
+# a plain image rollback afterwards leaves the older pdns crash-looping on a
+# database it can no longer read. Both steps below run BEFORE the exec below,
+# because the agent spawns pdns_server and that spawn is the point of no
+# return.
+#
+# ``PDNS_LMDB_RESTORE`` is the operator's rollback lever: set it to ``latest``
+# (or a specific snapshot name from ``spatium-pdns-lmdb-guard list``) when
+# redeploying an older image, and the database is put back to the schema that
+# image understands before the daemon starts. The guard records which snapshot
+# it restored from, so leaving the variable set is harmless — subsequent
+# restarts are a no-op rather than re-restoring over live changes.
+#
+# A failure here does NOT stop the container. The likeliest cause is a
+# mistyped snapshot name, and refusing to boot over that would crash-loop a
+# node whose database is perfectly fine — with no shell to fix the typo from.
+# The snapshot step below still protects the database either way.
+if [ -n "${PDNS_LMDB_RESTORE:-}" ]; then
+    echo "PDNS_LMDB_RESTORE=${PDNS_LMDB_RESTORE} — restoring the LMDB before start" >&2
+    if ! /usr/local/bin/spatium-pdns-lmdb-guard restore "$PDNS_LMDB_RESTORE"; then
+        echo "WARNING: PDNS_LMDB_RESTORE=${PDNS_LMDB_RESTORE} did not restore." >&2
+        echo "WARNING: check 'spatium-pdns-lmdb-guard list' for the exact name." >&2
+        echo "WARNING: continuing to start with the database as-is." >&2
+    fi
+fi
+
+# Snapshots the database when the pdns major version changed since the last
+# start. Fails closed: a container that refuses to start can be recovered by
+# redeploying the previous image, a migrated database cannot.
+/usr/local/bin/spatium-pdns-lmdb-guard snapshot
+chown -R spatium:spatium /var/lib/powerdns || true
+
 # Supervise: agent process manages pdns_server lifecycle.
 exec su-exec spatium:spatium /usr/local/bin/spatium-dns-agent

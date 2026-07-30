@@ -3,9 +3,14 @@ import { NavLink, useLocation } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import {
   Activity,
+  AudioLines,
+  Building2,
+  Scan,
+  Factory,
   Power,
   Network,
   Globe,
+  Inbox,
   LayoutDashboard,
   Server,
   Router as RouterIcon,
@@ -89,6 +94,15 @@ const baseMainNav = [
   { label: "IPAM", icon: Network, to: "/ipam", end: true },
   { label: "DHCP", icon: Server, to: "/dhcp" },
   { label: "DNS", icon: Globe, to: "/dns", end: true },
+  // #696 — top-level rather than under Administration on purpose: the
+  // audience is ordinary users asking for a resource, and most of them will
+  // never see the admin section at all.
+  {
+    label: "Requests",
+    icon: Inbox,
+    to: "/requests",
+    module: "governance.requests",
+  },
 ];
 // IPAM-family children (all route under /ipam/*). Alphabetised, matching the
 // Network/Administration sub-group convention.
@@ -166,6 +180,18 @@ const networkInfrastructureNav = [
     module: "network.asn",
   },
   {
+    label: "AV over IP",
+    icon: AudioLines,
+    to: "/network/av",
+    module: "network.av",
+  },
+  {
+    label: "BACnet Devices",
+    icon: Building2,
+    to: "/network/bacnet",
+    module: "network.bacnet",
+  },
+  {
     label: "Certificates",
     icon: ShieldCheck,
     to: "/network/certificates",
@@ -176,6 +202,12 @@ const networkInfrastructureNav = [
     icon: Waypoints,
     to: "/network/circuits",
     module: "network.circuit",
+  },
+  {
+    label: "DICOM AEs",
+    icon: Scan,
+    to: "/network/dicom",
+    module: "network.dicom",
   },
   {
     label: "Devices",
@@ -194,6 +226,12 @@ const networkInfrastructureNav = [
     icon: Radio,
     to: "/network/multicast",
     module: "network.multicast",
+  },
+  {
+    label: "OT Devices",
+    icon: Factory,
+    to: "/network/ot",
+    module: "network.ot",
   },
   {
     label: "Overlays",
@@ -661,7 +699,11 @@ export function Sidebar({
       ? [{ label: "UniFi", icon: Wifi, to: "/unifi" }]
       : []),
   ].sort((a, b) => a.label.localeCompare(b.label));
-  const mainNav = baseMainNav;
+  // #696 — baseMainNav now carries a module-gated entry (Requests), so it
+  // has to go through the same filter every other nav group uses. Without
+  // this the item renders on every install even though governance.requests
+  // is default-off, and clicking it lands on a page whose API 404s.
+  const mainNav = filterByModule(baseMainNav);
 
   return (
     <>

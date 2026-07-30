@@ -124,6 +124,7 @@ FACTORY_SECTIONS: tuple[FactorySection, ...] = (
             "dns_trust_anchor",
             "dns_query_log_entry",
             "dns_client_window",
+            "dns_rpz_hit",
             "dns_threat_mute",
             "dns_metric_sample",
             "subnet_domain",
@@ -248,6 +249,34 @@ FACTORY_SECTIONS: tuple[FactorySection, ...] = (
         ),
     ),
     FactorySection(
+        key="verticals",
+        label="Vertical network awareness",
+        description=(
+            "The multicast stream registry (groups, PIM domains, "
+            "ports, memberships) and the vertical descriptors layered "
+            "on it — AV-over-IP flow profiles + reserved ranges, "
+            "BACnet/IP devices + BBMD tables, industrial-OT devices + "
+            "Purdue zoning, and the DICOM AE Title registry + peer "
+            "map. The underlying IPAM addresses and subnets "
+            "are untouched; only the vertical metadata is destroyed."
+        ),
+        phrase="DESTROY-VERTICALS",
+        kind="truncate",
+        tables=(
+            "av_flow_profile",
+            "av_reserved_range",
+            "bacnet_device",
+            "dicom_peer",
+            "dicom_ae",
+            "ot_device",
+            "ot_zone",
+            "multicast_membership",
+            "multicast_group_port",
+            "multicast_group",
+            "multicast_domain",
+        ),
+    ),
+    FactorySection(
         key="tools",
         label="Tools",
         description=(
@@ -280,6 +309,7 @@ FACTORY_SECTIONS: tuple[FactorySection, ...] = (
             # operator names) — someone wiping an appliance before
             # handing it on reasonably expects all of this gone (#699).
             "dns_client_window",
+            "dns_rpz_hit",
             "dns_threat_mute",
             "dhcp_log_entry",
             "internal_error",

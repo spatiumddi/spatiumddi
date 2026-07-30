@@ -195,7 +195,7 @@ def split_qname(qname: str) -> tuple[list[str], str]:
     return (labels[: -len(tail)], parent)
 
 
-def _ramp(value: float, floor: float, ceil: float) -> float:
+def ramp(value: float, floor: float, ceil: float) -> float:
     """Linear 0→1 ramp between floor and ceiling, clamped.
 
     A ramp rather than a threshold so a host just over the line scores
@@ -234,6 +234,13 @@ class ClientFeatures:
     payload_qtype_count: int = 0
     server_count: int = 1
     allowlisted: bool = False
+    # Each distinct non-allowlisted parent domain this client queried,
+    # mapped to its registrable label (``xkqjfhwbz.com`` →
+    # ``xkqjfhwbz``). Populated here because this walk already derives
+    # every parent, so the DGA scorer costs no second pass over what can
+    # be tens of thousands of log lines. Not persisted as a column — the
+    # DGA verdict it produces is.
+    parent_labels: dict[str, str] = field(default_factory=dict)
 
     @property
     def payload_qtype_ratio(self) -> float:
@@ -318,6 +325,12 @@ def extract_features(
         and feats.scored_query_count == 0
         and feats.unparseable_count < feats.query_count
     )
+
+    # The parent's leftmost label is the registrable one — the part a
+    # DGA actually generates. ``split_qname`` has already trimmed the
+    # public suffix, so ``example.co.uk`` yields ``example`` rather than
+    # ``co``.
+    feats.parent_labels = {parent: parent.split(".")[0] for parent in per_parent}
 
     if per_parent:
         top_parent, subs = max(per_parent.items(), key=lambda kv: len(kv[1]))
@@ -425,12 +438,12 @@ def score_tunneling(feats: ClientFeatures) -> TunnelVerdict:
     # labels are long *on average*; a false positive's are long once.
     # Keeping some weight on max means a short-label tunnel padded with
     # normal traffic still registers.
-    length_r = 0.4 * _ramp(
+    length_r = 0.4 * ramp(
         feats.max_label_length, _LABEL_LENGTH_FLOOR, _LABEL_LENGTH_CEIL
-    ) + 0.6 * _ramp(feats.avg_label_length, _LABEL_LENGTH_FLOOR, _LABEL_LENGTH_CEIL)
-    entropy_r = _ramp(feats.mean_label_entropy, _ENTROPY_FLOOR, _ENTROPY_CEIL)
-    fanout_r = _ramp(feats.top_parent_subdomains, _FANOUT_FLOOR, _FANOUT_CEIL)
-    payload_r = _ramp(feats.payload_qtype_ratio, _PAYLOAD_RATIO_FLOOR, _PAYLOAD_RATIO_CEIL)
+    ) + 0.6 * ramp(feats.avg_label_length, _LABEL_LENGTH_FLOOR, _LABEL_LENGTH_CEIL)
+    entropy_r = ramp(feats.mean_label_entropy, _ENTROPY_FLOOR, _ENTROPY_CEIL)
+    fanout_r = ramp(feats.top_parent_subdomains, _FANOUT_FLOOR, _FANOUT_CEIL)
+    payload_r = ramp(feats.payload_qtype_ratio, _PAYLOAD_RATIO_FLOOR, _PAYLOAD_RATIO_CEIL)
 
     signals = [
         Signal(

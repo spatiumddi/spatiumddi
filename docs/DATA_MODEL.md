@@ -453,13 +453,29 @@ Files: [`conformity.py`](../backend/app/models/conformity.py),
 | `ConformityResult` | `conformity_result` | append-only; one row per (policy, resource) per pass; no `modified_at` |
 | `AlertRule` | `alert_rule` | operator-authored alert definition |
 | `AlertEvent` | `alert_event` | one firing per subject; open while condition matches, closed on a later clear |
-| `ChangeRequest` | `change_request` | risky operation queued for second-person approval |
+| `ChangeRequest` | `change_request` | risky operation queued for second-person approval (#62) **and** self-service provisioning requests (#696), discriminated by `origin` |
 | `ApprovalPolicy` | `approval_policy` | rule deciding whether an operation needs approval |
 
 A `ConformityPolicy` pass→fail transition can emit an `AlertEvent`
 against the policy's wired `AlertRule`. The two-person-rule governance
 flow (default-off `governance.approvals` module) gates the six delete
 handlers through `ChangeRequest` + `ApprovalPolicy`.
+
+`change_request` carries **both** governance flows, split by `origin`:
+
+| `origin` | Surface | Direction | Approving… |
+|---|---|---|---|
+| `gate` (default) | `/change-requests` — #62 | a permitted operator's risky action is intercepted | *unblocks* the delete |
+| `portal` | `/requests` — #696 | a low-privilege user asks for something they cannot do | *provisions* the resource |
+
+One table and one state machine on purpose: the lifecycle, the approver
+checks (approver ≠ requester, approver holds the operation's own
+permission), the re-preview stale guard, the execution under the
+approver's identity, the audit rows and the expiry sweep are identical
+for both. Only the direction of privilege differs. Every query on either
+surface filters by `origin`, so neither queue ever renders the other's
+rows. `justification` is the requester's free-text "why" and is NULL on
+gate rows, which carry the policy-derived `risk_reason` instead.
 
 ---
 

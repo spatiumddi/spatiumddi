@@ -21,6 +21,7 @@ import structlog
 from jinja2 import Environment, FileSystemLoader, StrictUndefined, select_autoescape
 
 from app.core.dns_names import strip_control_chars
+from app.drivers.dns._axfr import resolve_server_address
 from app.drivers.dns.base import (
     ConfigBundle,
     DNSDriver,
@@ -322,7 +323,10 @@ class BIND9Driver(DNSDriver):
         # thread executor. The control plane never reaches this code path.
         import asyncio
 
-        await asyncio.to_thread(dns.query.tcp, update, host, port=port, timeout=10)
+        # See the Windows driver's matching call: dns.query.tcp takes an IP
+        # literal, and a write must not be retried across addresses.
+        addr = resolve_server_address(host, port, what=f"RFC 2136 update of {change.zone_name}")[0]
+        await asyncio.to_thread(dns.query.tcp, update, addr, port=port, timeout=10)
 
     async def reload_config(self, server: Any) -> None:
         """Surface for the agent's ``rndc reconfig``. Control plane no-op."""

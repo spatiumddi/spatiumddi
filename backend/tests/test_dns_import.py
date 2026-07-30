@@ -603,3 +603,90 @@ async def test_commit_missing_group_returns_422(
     )
     assert commit_resp.status_code == 422
     assert "does not exist" in commit_resp.json()["detail"]
+
+
+@pytest.mark.parametrize("driver", ["bind9", "powerdns"])
+@pytest.mark.asyncio
+async def test_commit_enqueues_record_ops_for_agent_servers(
+    db_session: AsyncSession, client: AsyncClient, driver: str
+) -> None:
+    """Issue #707 — imported records must reach the RUNNING daemon.
+
+    The commit path writes ``DNSRecord`` rows and stops. For an
+    agent-based group (BIND9 / PowerDNS) that is not enough: records
+    are deliberately excluded from ``structural_etag`` (see
+    ``agent_config.py`` — ``zones_structural`` drops the ``records``
+    key unless the group has views), so a record-only change never
+    triggers the agent's re-render/reload path. The ONLY route from a
+    committed record to the live daemon is a ``DNSRecordOp`` row,
+    which the agent drains via RFC 2136 (BIND9) or the zone API
+    (PowerDNS).
+
+    Import enqueues none, so imported records are invisible on the
+    wire until an operator edits each one by hand — which is exactly
+    the reported symptom.
+
+    Note the pre-existing tests in this module all use ``_make_group``,
+    which creates a group with NO servers; ``enqueue_record_op``
+    no-ops without a primary, so the gap never surfaced.
+    """
+    import uuid as _uuid
+
+    from app.models.dns import DNSRecordOp, DNSServer
+
+    _, token = await _make_admin(db_session)
+    group = await _make_group(db_session)
+    server = DNSServer(
+        name=f"s-{_uuid.uuid4().hex[:8]}",
+        host="127.0.0.1",
+        port=53,
+        driver=driver,
+        group_id=group.id,
+        is_primary=True,
+        is_enabled=True,
+    )
+    db_session.add(server)
+    await db_session.commit()
+
+    archive = _build_tar(
+        [
+            ("etc/named.conf", _BASIC_NAMED),
+            ("var/named/example.com.zone", _BASIC_ZONE),
+        ]
+    )
+    preview_resp = await client.post(
+        "/api/v1/dns/import/bind9/preview",
+        headers={"Authorization": f"Bearer {token}"},
+        files={"file": ("bind.tar.gz", archive, "application/gzip")},
+        data={"target_group_id": str(group.id)},
+    )
+    assert preview_resp.status_code == 200
+    commit_resp = await client.post(
+        "/api/v1/dns/import/bind9/commit",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "target_group_id": str(group.id),
+            "plan": preview_resp.json(),
+            "conflict_actions": {},
+        },
+    )
+    assert commit_resp.status_code == 200, commit_resp.text
+    assert commit_resp.json()["total_records_created"] == 4
+
+    zone = (
+        await db_session.execute(select(DNSZone).where(DNSZone.name == "example.com."))
+    ).scalar_one()
+    records = (
+        (await db_session.execute(select(DNSRecord).where(DNSRecord.zone_id == zone.id)))
+        .scalars()
+        .all()
+    )
+    ops = (
+        (await db_session.execute(select(DNSRecordOp).where(DNSRecordOp.server_id == server.id)))
+        .scalars()
+        .all()
+    )
+    assert len(ops) == len(records), (
+        f"{driver}: import created {len(records)} records but enqueued "
+        f"{len(ops)} record ops — imported records never reach the live daemon"
+    )

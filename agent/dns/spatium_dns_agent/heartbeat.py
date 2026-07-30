@@ -12,12 +12,18 @@ import structlog
 from . import __version__
 from .cache import save_token
 from .config import AgentConfig
+from .drivers.base import DriverBase
 
 log = structlog.get_logger(__name__)
 
 
 class HeartbeatClient:
-    def __init__(self, cfg: AgentConfig, token_ref: list[str]):
+    def __init__(
+        self,
+        cfg: AgentConfig,
+        token_ref: list[str],
+        driver: DriverBase | None = None,
+    ):
         # token_ref is a 1-element list so the sync loop can swap the token in place
         self.cfg = cfg
         self.token_ref = token_ref
@@ -25,6 +31,46 @@ class HeartbeatClient:
         self.pending_acks: list[dict[str, Any]] = []
         self.daemon_status: dict[str, Any] = {}
         self.failed_ops_count = 0
+        # #638 — the driver is only used to probe the DNS daemon's version.
+        # Optional so tests (and any caller that just wants liveness) can build
+        # a HeartbeatClient without a driver.
+        self.driver = driver
+        self._daemon_version_cached: str | None = None
+        self._daemon_version_attempts = 0
+
+    # A failing probe must not be retried forever. Unlike the DHCP agent's
+    # ``_kea_version``, which polls a control socket that is legitimately down
+    # during cold start, this probe execs the daemon BINARY — if it can't
+    # answer, it almost certainly never will. A couple of retries cover a
+    # transient fork failure; after that we stop, because the probe is a
+    # blocking subprocess on the thread that carries our liveness signal.
+    _DAEMON_VERSION_MAX_ATTEMPTS = 3
+
+    def _daemon_version(self) -> str | None:
+        """DNS daemon version, probed once (at most a few times) and cached.
+
+        Same purpose as the DHCP agent's ``_kea_version`` (#637): the daemon
+        binary cannot change while this process lives, because a new image
+        means a new container and a restarted agent — so there is nothing to
+        gain from re-probing on every heartbeat.
+
+        Returns None once the attempt budget is spent; the control plane treats
+        that as UNKNOWN.
+        """
+        if (
+            self._daemon_version_cached is None
+            and self.driver is not None
+            and self._daemon_version_attempts < self._DAEMON_VERSION_MAX_ATTEMPTS
+        ):
+            self._daemon_version_attempts += 1
+            self._daemon_version_cached = self.driver.daemon_version()
+            if self._daemon_version_cached is None:
+                log.debug(
+                    "dns_daemon_version_probe_failed",
+                    attempt=self._daemon_version_attempts,
+                    max_attempts=self._DAEMON_VERSION_MAX_ATTEMPTS,
+                )
+        return self._daemon_version_cached
 
     def stop(self) -> None:
         self._stop.set()
@@ -42,6 +88,13 @@ class HeartbeatClient:
     def send_once(self) -> None:
         body: dict[str, Any] = {
             "agent_version": __version__,
+            # #638 — the DNS DAEMON's version (e.g. "5.0.5" / "9.20.26"),
+            # distinct from ``agent_version`` (this python agent). The
+            # rolling-upgrade preflight needs it: crossing PowerDNS 4.x → 5.x
+            # performs a one-way LMDB schema migration, so the operator has to
+            # be told before they press Start. None = probe failed; the control
+            # plane must treat that as "unknown", never as a specific version.
+            "daemon_version": self._daemon_version(),
             "daemon": self.daemon_status,
             "config": {},
             "ops_ack": self.pending_acks,

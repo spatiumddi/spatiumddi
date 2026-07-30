@@ -37,6 +37,7 @@
 
 import ipaddress
 import os
+import re
 import shlex
 import stat
 import sys
@@ -296,10 +297,56 @@ if hostname:
         env["PRESEED_HAS_HOSTNAME"] = "1"
 
 # ── Admin user + password ─────────────────────────────────────────────
+# ── Admin OS user (issue #581) ────────────────────────────────────────
+# The value flows unquoted-in-spirit into `chroot useradd -m -G sudo -s
+# /bin/bash "$ADMIN_USER"` and into the `user:password` line piped to
+# `chpasswd`. The interactive path can only produce something sane (the
+# operator types into a whiptail box and useradd rejects the rest with a
+# visible error); a preseed is applied with no human watching, so an
+# unvalidated value either fails the install halfway through — after the
+# disk is already wiped — or, with a colon in it, splits the chpasswd
+# line and sets a password for the wrong account.
+#
+# Rules are the POSIX-portable useradd shape Debian's adduser enforces
+# (NAME_REGEX in /etc/adduser.conf): start with a lowercase letter or
+# underscore, then lowercase / digits / underscore / hyphen, with an
+# optional trailing '$' for Samba machine accounts. 32-char limit is
+# useradd's own (utmp).
+_ADMIN_USER_RE = re.compile(r"^[a-z_][a-z0-9_-]*\$?$")
+# Accounts the base image already ships. Handing one of these to
+# `useradd -m` fails ("user already exists") mid-install; `root` is
+# doubly wrong because do_install sets the root password separately
+# from the same secret, so a root admin_user silently means "the
+# useradd step fails and the install aborts after the wipe".
+_RESERVED_USERS = {
+    "root", "daemon", "bin", "sys", "sync", "games", "man", "lp", "mail",
+    "news", "uucp", "proxy", "www-data", "backup", "list", "irc", "nobody",
+    "systemd-network", "systemd-resolve", "messagebus", "sshd",
+}
+
 admin_user = as_str(ps.get("admin_user"))
 if admin_user:
-    env["ADMIN_USER"] = admin_user
-    env["PRESEED_HAS_ADMIN_USER"] = "1"
+    if len(admin_user) > 32:
+        fail(
+            f"admin_user {admin_user!r} is longer than 32 characters "
+            "(useradd's limit)"
+        )
+    elif not _ADMIN_USER_RE.match(admin_user):
+        fail(
+            f"admin_user {admin_user!r} is not a valid Linux username — must "
+            "start with a lowercase letter or underscore and contain only "
+            "lowercase letters, digits, underscore or hyphen (optionally "
+            "ending in '$')"
+        )
+    elif admin_user in _RESERVED_USERS:
+        fail(
+            f"admin_user {admin_user!r} is a reserved system account that "
+            "already exists in the image — pick a different name (the root "
+            "password is set from admin_password separately)"
+        )
+    else:
+        env["ADMIN_USER"] = admin_user
+        env["PRESEED_HAS_ADMIN_USER"] = "1"
 
 pw = as_str(ps.get("admin_password"))
 pw_hash = as_str(ps.get("admin_password_hash"))

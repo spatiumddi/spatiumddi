@@ -22,6 +22,7 @@ everything else.
 
 from __future__ import annotations
 
+from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -32,6 +33,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.dns_threat import DNSClientWindow
 from app.models.logs import DNSQueryLogEntry
+from app.services.dns_threat.beaconing import score_beaconing
+from app.services.dns_threat.dga import score_dga
 from app.services.dns_threat.scoring import (
     DEFAULT_BENIGN_PARENTS,
     extract_features,
@@ -58,6 +61,21 @@ INTERESTING_SCORE = 20.0
 # modules. The alert rule imports this; a per-rule threshold_percent
 # still overrides it.
 ALERTING_SCORE = 60.0
+
+# Beaconing alerts higher than tunneling. Legitimate software polls on
+# a timer constantly — monitoring agents, health checks, update
+# checkers — and they are indistinguishable from a callback by timing
+# alone, so a lower bar would page operators about their own
+# infrastructure until they turned the rule off.
+BEACON_ALERTING_SCORE = 85.0
+
+# DGA alerts higher than tunneling for the same reason beaconing does,
+# plus one specific to this detection: without the NXDOMAIN prior the
+# issue originally specified (the query log carries no rcode — see
+# ``dga.py``), the score rests on name plausibility alone. That is a
+# weaker basis than tunneling's four independent signals, so the bar to
+# wake someone is set correspondingly higher.
+DGA_ALERTING_SCORE = 80.0
 
 # How far back the raw query log is kept (``prune_log_entries``). The
 # backfill sweep can't recover anything older, because the evidence is
@@ -89,6 +107,9 @@ async def aggregate_window(
             DNSQueryLogEntry.qname,
             DNSQueryLogEntry.qtype,
             DNSQueryLogEntry.server_id,
+            # Beaconing scores off arrival times, so the rollup needs
+            # ts as well as content.
+            DNSQueryLogEntry.ts,
         ).where(
             DNSQueryLogEntry.ts >= window_start,
             DNSQueryLogEntry.ts < window_end,
@@ -103,13 +124,20 @@ async def aggregate_window(
     written = 0
     current_ip: str | None = None
     batch: list[tuple[str | None, str | None, Any]] = []
+    # Arrival times per name, for the beaconing measure. Reset with the
+    # batch so only one client's timings are ever held.
+    timings: dict[str, list[datetime]] = defaultdict(list)
 
     async def _flush() -> None:
-        nonlocal written, batch
+        nonlocal written, batch, timings
         if current_ip is None or not batch:
             return
         feats = extract_features(batch, allowlist=allowlist)
         verdict = score_tunneling(feats)
+        beacon = score_beaconing(timings)
+        # Scores off the parent map ``extract_features`` already built,
+        # so no second walk over the client's rows.
+        dga = score_dga(feats.parent_labels)
         await _upsert(
             db,
             client_ip=current_ip,
@@ -118,17 +146,26 @@ async def aggregate_window(
             feats=feats,
             score=verdict.score,
             signals=verdict.signals_json(),
+            beacon=beacon,
+            dga=dga,
         )
         written += 1
         batch = []
+        timings = defaultdict(list)
 
     result = await db.stream(stmt)
-    async for client_ip, qname, qtype, server_id in result:
+    async for client_ip, qname, qtype, server_id, ts in result:
         ip = str(client_ip)
         if ip != current_ip:
             await _flush()
             current_ip = ip
         batch.append((qname, qtype, server_id))
+        if qname and ts is not None:
+            # Allowlisted names are deliberately INCLUDED here, unlike
+            # the tunneling ratios: a beacon to a CDN-hosted callback is
+            # still a beacon, and the qname in the evidence is what lets
+            # an operator judge it.
+            timings[qname.lower()].append(ts)
     await _flush()
 
     await db.commit()
@@ -144,6 +181,8 @@ async def _upsert(
     feats: Any,
     score: float,
     signals: list[dict[str, Any]],
+    beacon: Any,
+    dga: Any,
 ) -> None:
     """Insert or refresh one client's bucket.
 
@@ -167,6 +206,13 @@ async def _upsert(
         "payload_qtype_count": feats.payload_qtype_count,
         "tunnel_score": score,
         "tunnel_signals": signals,
+        "beacon_score": beacon.score,
+        "beacon_candidates": beacon.candidates_json(),
+        "beacon_detail": beacon.detail,
+        "dga_score": dga.score,
+        "dga_candidates": dga.candidates_json(),
+        "dga_signals": dga.signals_json(),
+        "dga_detail": dga.detail,
         "allowlisted": feats.allowlisted,
     }
     stmt = pg_insert(DNSClientWindow).values(**values)

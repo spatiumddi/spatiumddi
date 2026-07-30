@@ -230,6 +230,12 @@ export interface IPSpace {
   ddns_hostname_policy?: DdnsHostnamePolicy;
   ddns_domain_override?: string | null;
   ddns_ttl?: number | null;
+  // Fragile-device probe suppression (#722). ORs down the
+  // space → block → subnet chain — any level setting it suppresses
+  // every level below, and a descendant cannot un-set it. Reason
+  // travels with the flag and is quoted back in every refusal.
+  do_not_probe?: boolean;
+  do_not_probe_reason?: string;
   // VRF / routing annotation — pure metadata; address allocation
   // ignores these. ``route_targets`` is an array of strings so the
   // operator can encode the inline import:A:B; export:C:D convention
@@ -274,6 +280,12 @@ export interface IPBlock {
   ddns_domain_override?: string | null;
   ddns_ttl?: number | null;
   ddns_inherit_settings?: boolean;
+  // Fragile-device probe suppression (#722). ORs down the
+  // space → block → subnet chain — any level setting it suppresses
+  // every level below, and a descendant cannot un-set it. Reason
+  // travels with the flag and is quoted back in every refusal.
+  do_not_probe?: boolean;
+  do_not_probe_reason?: string;
   vrf_id?: string | null;
   asn_id?: string | null;
   customer_id?: string | null;
@@ -398,6 +410,21 @@ export interface PlanApplyResult {
   block_ids: string[];
   subnet_ids: string[];
   applied_at: string;
+}
+
+/** Effective fragile-device probe verdict for a subnet (#722).
+ *
+ * ``inherited`` distinguishes "this subnet is flagged" from "an ancestor
+ * flagged it" — i.e. whether clearing the subnet's own checkbox would
+ * actually re-enable probing. */
+export interface ProbePolicy {
+  do_not_probe: boolean;
+  reason: string;
+  /** ``subnet:<id>`` / ``block:<id>`` / ``space:<id>``; null when
+   *  nothing is suppressing. */
+  source: string | null;
+  scope: string | null;
+  inherited: boolean;
 }
 
 export interface EffectiveDns {
@@ -580,6 +607,12 @@ export interface Subnet {
   discovery_enabled?: boolean;
   discovery_interval_minutes?: number;
   last_discovery_at?: string | null;
+  // Fragile-device probe suppression (#722). This is the subnet's OWN
+  // flag — an ancestor block / space can suppress a subnet whose own
+  // flag is false. Resolve the effective answer with
+  // ``ipamApi.probePolicy(subnetId)``.
+  do_not_probe?: boolean;
+  do_not_probe_reason?: string;
   // Compliance / classification flags. First-class booleans (rather
   // than freeform tags) so auditor queries — "show me every PCI
   // subnet" — are clean indexed predicates. Default false on every
@@ -699,7 +732,8 @@ export type IPRole =
   | "vip"
   | "vrrp"
   | "secondary"
-  | "gateway";
+  | "gateway"
+  | "bmc";
 
 export const IP_ROLE_OPTIONS: IPRole[] = [
   "host",
@@ -709,6 +743,12 @@ export const IP_ROLE_OPTIONS: IPRole[] = [
   "vrrp",
   "secondary",
   "gateway",
+  // Baseboard management controller — iDRAC / iLO / IPMI / Redfish
+  // (#722). A management-plane endpoint on a fragile embedded stack,
+  // and a routine casualty of ping sweeps: naming the class is what
+  // lets an operator find them all and decide whether their subnet
+  // belongs behind the do-not-probe flag.
+  "bmc",
 ];
 
 export const IP_ROLES_SHARED: ReadonlySet<IPRole> = new Set([
@@ -1365,6 +1405,8 @@ export const ipamApi = {
         | "vrf_id"
         | "customer_id"
         | "site_id"
+        | "do_not_probe"
+        | "do_not_probe_reason"
       >
     >,
   ) => api.put<IPBlock>(`/ipam/blocks/${id}`, data).then((r) => r.data),
@@ -1436,6 +1478,13 @@ export const ipamApi = {
     api.post<PlanApplyResult>(`/ipam/plans/${id}/apply`).then((r) => r.data),
   reopenSubnetPlan: (id: string) =>
     api.post<SubnetPlanRead>(`/ipam/plans/${id}/reopen`).then((r) => r.data),
+  // Effective do-not-probe verdict for a subnet (#722). A separate call
+  // rather than a field on the list rows: resolving it walks the block
+  // chain, which is cheap once but N walks on a list page.
+  getSubnetProbePolicy: (subnetId: string) =>
+    api
+      .get<ProbePolicy>(`/ipam/subnets/${subnetId}/probe-policy`)
+      .then((r) => r.data),
   getEffectiveBlockDns: (blockId: string) =>
     api
       .get<EffectiveDns>(`/ipam/blocks/${blockId}/effective-dns`)
@@ -2218,6 +2267,75 @@ export const ipamIoApi = {
       .replace("T", "-");
     const filename = match ? match[1] : `ipam-export-${ts}.${params.format}`;
     const blob = new Blob([res.data as BlobPart]);
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  },
+
+  /** Print / PDF export (#82) — the handover deliverable, as opposed to the
+   *  machine-readable formats above. A `subnet_id` scope renders the subnet
+   *  detail report (always includes its addresses); a `space_id` / `block_id`
+   *  scope renders the tree report. */
+  downloadPdf: async (params: {
+    space_id?: string;
+    block_id?: string;
+    subnet_id?: string;
+    include_addresses?: boolean;
+  }) => {
+    const qs = new URLSearchParams();
+    if (params.space_id) qs.set("space_id", params.space_id);
+    if (params.block_id) qs.set("block_id", params.block_id);
+    if (params.subnet_id) qs.set("subnet_id", params.subnet_id);
+    if (params.include_addresses) qs.set("include_addresses", "true");
+    let res;
+    try {
+      res = await api.get(`/ipam/export.pdf?${qs.toString()}`, {
+        responseType: "blob",
+      });
+    } catch (err) {
+      // With responseType "blob" an error body arrives as a Blob too, so the
+      // usual `response.data.detail` is unreadable — unwrap it to text and
+      // re-throw something the caller can actually display.
+      const data = (err as { response?: { data?: unknown } })?.response?.data;
+      if (data instanceof Blob) {
+        const text = await data.text();
+        let detail = text || "PDF export failed";
+        try {
+          const parsed = JSON.parse(text)?.detail;
+          // FastAPI returns a string for HTTPException but an *array* of
+          // {loc, msg, type} objects for a 422 validation error. Passing
+          // that array to new Error() stringifies to "[object Object]",
+          // so flatten it into something an operator can read.
+          if (typeof parsed === "string") {
+            detail = parsed;
+          } else if (Array.isArray(parsed)) {
+            detail =
+              parsed
+                .map((d) => (typeof d === "string" ? d : d?.msg))
+                .filter(Boolean)
+                .join("; ") || detail;
+          }
+        } catch {
+          // body wasn't JSON — fall back to the raw text
+        }
+        throw new Error(detail);
+      }
+      throw err;
+    }
+    const disp = (res.headers["content-disposition"] as string) || "";
+    const match = disp.match(/filename="?([^";]+)"?/i);
+    const ts = new Date()
+      .toISOString()
+      .slice(0, 19)
+      .replace(/[-:]/g, "")
+      .replace("T", "-");
+    const filename = match ? match[1] : `spatiumddi-ipam-${ts}.pdf`;
+    const blob = new Blob([res.data as BlobPart], { type: "application/pdf" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
@@ -4948,6 +5066,52 @@ export interface ZoneServerState {
   in_sync: boolean;
 }
 
+// ── Zone config drift (#61) ──────────────────────────────────────────────────
+//
+// Record-level diff between the DB (source of truth) and what each server in
+// the group is actually serving, obtained by AXFR / driver pull. Strictly
+// read-only — the report never applies anything. Distinct from
+// `ZoneServerState` above, which compares SOA *serials* only: a server can sit
+// on the right serial and still be serving the wrong records if someone edited
+// the host by hand.
+
+export interface ZoneDriftRecord {
+  name: string;
+  record_type: string;
+  value: string;
+  ttl: number | null;
+}
+
+export interface ZoneDriftServer {
+  server_id: string;
+  server_name: string;
+  driver: string;
+  // "ok" — pulled and diffed. "error" — the pull failed (unreachable, paused,
+  // AXFR refused); counts are meaningless. "unsupported" — the driver has no
+  // `pull_zone_records`, so drift can't be computed for it at all.
+  status: "ok" | "error" | "unsupported";
+  error: string | null;
+  in_sync: number;
+  // `extra_on_server.length + missing_on_server.length` — the backend derives
+  // it, so don't recompute it in the UI.
+  drift_count: number;
+  // Served by the host but absent from the DB — typically a manual on-host edit.
+  extra_on_server: ZoneDriftRecord[];
+  // In the DB but not being served — the change never reached this host.
+  missing_on_server: ZoneDriftRecord[];
+}
+
+export interface ZoneDrift {
+  zone_id: string;
+  zone_name: string;
+  db_record_count: number;
+  servers: ZoneDriftServer[];
+  // Caveats that make the diff less trustworthy — chiefly split-horizon
+  // views, where an AXFR is answered by whichever view matches the control
+  // plane's source address rather than the one this zone row belongs to.
+  warnings: string[];
+}
+
 // Pending records the delegation wizard would land in the parent zone.
 // `existing_*` lists are already-present rows the wizard would skip on apply.
 export interface DelegationRecord {
@@ -5447,6 +5611,13 @@ export const dnsApi = {
       .get<ZoneServerState>(
         `/dns/groups/${groupId}/zones/${zoneId}/server-state`,
       )
+      .then((r) => r.data),
+  // #61 — AXFRs every server in the group and diffs it against the DB.
+  // One request fans out to every host, so this is slow and deliberately
+  // NOT auto-fetched; the Drift tab loads it on demand.
+  getZoneDrift: (groupId: string, zoneId: string) =>
+    api
+      .get<ZoneDrift>(`/dns/groups/${groupId}/zones/${zoneId}/drift`)
       .then((r) => r.data),
 
   // DNSSEC — PowerDNS online signing (#127) + BIND9 inline-signing (#49)
@@ -8104,6 +8275,19 @@ export interface DNSClientWindow {
   payload_qtype_count: number;
   tunnel_score: number;
   tunnel_signals: DNSTunnelSignal[];
+  /** Timing-based C2 callback score (#699) — independent of tunneling. */
+  beacon_score: number;
+  beacon_candidates: DNSBeaconCandidate[];
+  beacon_detail: string;
+  /**
+   * Domain-generation-algorithm score (#699). Structurally the inverse
+   * of tunneling — a tunnel concentrates subdomains under one parent,
+   * a DGA sprays across many — so the two never fire together.
+   */
+  dga_score: number;
+  dga_candidates: DNSDGACandidate[];
+  dga_signals: DNSTunnelSignal[];
+  dga_detail: string;
   allowlisted: boolean;
   server_count: number;
   /** An operator reviewed this client and cleared it (#699). */
@@ -8132,6 +8316,73 @@ export interface DNSTunnelSignal {
   detail: string;
 }
 
+/**
+ * One (client, name) pair that repeated on a regular cadence. The
+ * qname matters more than the score: monitoring agents and C2
+ * callbacks are indistinguishable by timing alone.
+ */
+export interface DNSBeaconCandidate {
+  qname: string;
+  samples: number;
+  period_seconds: number;
+  cv: number;
+  score: number;
+}
+
+/**
+ * One implausible registrable domain from a DGA crop. The domains
+ * matter more than the score: hashed-CDN buckets and shortlink
+ * services share the shape, so an operator needs to see which names
+ * actually scored before acting.
+ */
+export interface DNSDGACandidate {
+  parent: string;
+  label: string;
+  implausibility: number;
+  vowel_ratio: number;
+}
+
+/** A client ranked by how many blocked lookups it made (#699). */
+export interface RPZOffender {
+  client_ip: string;
+  hits: number;
+  distinct_names: number;
+  distinct_feeds: number;
+  last_seen: string;
+  top_qname: string | null;
+  top_qname_hits: number;
+  /** Past the "worth chasing" bar; set server-side so UI and copilot agree. */
+  noisy: boolean;
+}
+
+export interface RPZBlockedName {
+  qname: string;
+  hits: number;
+  clients: number;
+  rpz_zone: string | null;
+}
+
+export interface RPZFeedRow {
+  rpz_zone: string | null;
+  hits: number;
+  clients: number;
+  distinct_names: number;
+}
+
+export interface RPZSummary {
+  blocked_hits: number;
+  clients_blocked: number;
+  distinct_names: number;
+  feeds_firing: number;
+  /** PASSTHRU is an explicit ALLOW, not a block — counted separately. */
+  passthru_hits: number;
+  worst_client_ip: string | null;
+  worst_client_hits: number | null;
+  since: string;
+  /** Zero blocks is a plausible real answer; this says whether anything ran. */
+  has_data: boolean;
+}
+
 export interface DNSThreatSummary {
   windows_scored: number;
   clients_seen: number;
@@ -8155,7 +8406,16 @@ export const dnsThreatApi = {
     client_ip?: string;
     hours?: number;
     min_score?: number;
+    /**
+     * Rank and filter by "tunnel" (name content), "beacon" (timing) or
+     * "dga" (name plausibility). Kept explicit rather than a combined
+     * max: the three mean different things, and an operator hunting
+     * exfil should not have their list reordered by a chatty
+     * monitoring agent.
+     */
+    detection?: "tunnel" | "beacon" | "dga";
     include_allowlisted?: boolean;
+    include_muted?: boolean;
     limit?: number;
   }) =>
     api
@@ -8176,6 +8436,31 @@ export const dnsThreatApi = {
   unmute: (clientIp: string) =>
     api
       .delete<void>(`/dns-threat/mutes/${encodeURIComponent(clientIp)}`)
+      .then((r) => r.data),
+  /**
+   * RPZ hit attribution (#699). Ground truth rather than a heuristic —
+   * named matched a policy and logged it — so these need no score or
+   * threshold, only ranking.
+   */
+  rpzSummary: (params?: { hours?: number }) =>
+    api
+      .get<RPZSummary>("/dns-threat/rpz/summary", { params })
+      .then((r) => r.data),
+  rpzClients: (params?: {
+    hours?: number;
+    limit?: number;
+    min_hits?: number;
+  }) =>
+    api
+      .get<RPZOffender[]>("/dns-threat/rpz/clients", { params })
+      .then((r) => r.data),
+  rpzNames: (params?: { hours?: number; limit?: number }) =>
+    api
+      .get<RPZBlockedName[]>("/dns-threat/rpz/names", { params })
+      .then((r) => r.data),
+  rpzFeeds: (params?: { hours?: number }) =>
+    api
+      .get<RPZFeedRow[]>("/dns-threat/rpz/feeds", { params })
       .then((r) => r.data),
 };
 
@@ -8434,7 +8719,8 @@ export type ConformityTargetKind =
   | "subnet"
   | "ip_address"
   | "dns_zone"
-  | "dhcp_scope";
+  | "dhcp_scope"
+  | "multicast_group";
 export type ConformityStatus = "pass" | "fail" | "warn" | "not_applicable";
 export type ConformitySeverity = "info" | "warning" | "critical";
 
@@ -9153,6 +9439,109 @@ export const changeRequestsApi = {
     ),
   deletePolicy: (id: string) =>
     api.delete<ChangeRequestQueued | "">(`/change-requests/policies/${id}`),
+};
+
+// ── Self-service request portal (#696) ──────────────────────────────────
+// The #62 approval lifecycle pointed the other way: a requester asks for
+// something they can't create themselves, and approving PROVISIONS it. Rows
+// share the change_request table under origin='portal', so the state
+// vocabulary is identical — but the two queues are served by different
+// endpoints and never show each other's rows.
+
+export const REQUEST_KINDS = [
+  "subnet",
+  "ip_address",
+  "dns_record",
+  "dhcp_reservation",
+] as const;
+export type RequestKindId = (typeof REQUEST_KINDS)[number];
+
+export interface RequestKind {
+  kind: RequestKindId;
+  label: string;
+  description: string;
+  category: string;
+  operation: string;
+  // JSON Schema of the backing operation's args model — the form is rendered
+  // from this, so there is no second client-side schema to drift.
+  args_schema: {
+    properties?: Record<string, Record<string, unknown>>;
+    required?: string[];
+    [k: string]: unknown;
+  };
+}
+
+export interface ProvisioningRequest {
+  id: string;
+  operation: string;
+  resource_type: string;
+  resource_display: string;
+  args: Record<string, unknown>;
+  preview_text: string;
+  justification: string | null;
+  state: ChangeRequestState;
+  requested_by_user_id: string | null;
+  requested_by_display: string;
+  decided_by_user_id: string | null;
+  decided_by_display: string | null;
+  decision_note: string | null;
+  result: Record<string, unknown> | null;
+  error: string | null;
+  expires_at: string;
+  decided_at: string | null;
+  executed_at: string | null;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface ProvisioningRequestListParams {
+  state?: ChangeRequestState;
+  mine?: boolean;
+  limit?: number;
+  offset?: number;
+}
+
+export interface SubmitRequestBody {
+  kind: RequestKindId;
+  args: Record<string, unknown>;
+  justification?: string | null;
+}
+
+export const requestsApi = {
+  catalog: () =>
+    api.get<RequestKind[]>("/requests/catalog").then((r) => r.data),
+  list: (params: ProvisioningRequestListParams = {}) =>
+    api.get<ProvisioningRequest[]>("/requests", { params }).then((r) => r.data),
+  get: (id: string) =>
+    api.get<ProvisioningRequest>(`/requests/${id}`).then((r) => r.data),
+  submit: (body: SubmitRequestBody) =>
+    api.post<ProvisioningRequest>("/requests", body).then((r) => r.data),
+  // No dedicated count endpoint — same reasoning as changeRequestsApi: the
+  // pending queue is small by construction, so a state=pending list is cheap.
+  countPending: () =>
+    api
+      .get<ProvisioningRequest[]>("/requests", {
+        params: { state: "pending", limit: 500 },
+      })
+      .then((r) => r.data.length),
+  approve: (id: string, decisionNote?: string) =>
+    api
+      .post<ProvisioningRequest>(`/requests/${id}/approve`, {
+        decision_note: decisionNote ?? null,
+      })
+      .then((r) => r.data),
+  reject: (id: string, decisionNote?: string) =>
+    api
+      .post<ProvisioningRequest>(`/requests/${id}/reject`, {
+        decision_note: decisionNote ?? null,
+      })
+      .then((r) => r.data),
+  cancel: (id: string, decisionNote?: string) =>
+    api
+      .post<ProvisioningRequest>(`/requests/${id}/cancel`, {
+        decision_note: decisionNote ?? null,
+      })
+      .then((r) => r.data),
 };
 
 export type MetricsWindow = "1h" | "6h" | "24h" | "7d";
@@ -16769,5 +17158,864 @@ export const blockSyncApi = {
         `/block-sync/targets/${targetKind}/${targetId}/reveal`,
         { password, totp_code: totpCode },
       )
+      .then((r) => r.data),
+};
+
+// ── Vertical network awareness (issue #543) ──────────────────────────
+//
+// Three sibling registries that annotate rows the platform already
+// owns rather than introducing a parallel inventory:
+//
+//   * AV over IP (#540)  — a 1:1 sidecar on a ``multicast_group``,
+//     plus operator-declared reserved ranges per protocol.
+//   * BACnet/IP (#541)   — building-automation devices anchored to an
+//     IPAM address, keyed by an internetwork-unique device instance.
+//   * OT / industrial (#542) — a 1:1 sidecar on an IPAM address, plus
+//     one Purdue zone per subnet.
+//
+// Each family sits behind its own default-on feature module
+// (``network.av`` / ``network.bacnet`` / ``network.ot``), so callers
+// must gate their queries on ``ready && enabled(id)`` from
+// ``useFeatureModules`` — the routers 404 when the module is off.
+//
+// None of these surfaces talk to a device: every value is operator-
+// entered or imported. There is no probe, scan or control-protocol
+// write anywhere behind them.
+
+// ── AV over IP (#540) ────────────────────────────────────────────────
+
+export type AVProtocol =
+  | "dante"
+  | "aes67"
+  | "smpte2110_video"
+  | "smpte2110_audio"
+  | "smpte2110_anc"
+  | "ndi"
+  | "ravenna"
+  | "other";
+
+export type AVFlowSource = "manual" | "mdns" | "nmos";
+
+export interface AVReservedRange {
+  id: string;
+  space_id: string;
+  cidr: string;
+  av_protocol: string;
+  name: string;
+  description: string;
+  /** Exclusive ranges conflict with other protocols; shared ones only advise. */
+  exclusive: boolean;
+  vlan_id: string | null;
+  tags: Record<string, unknown>;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface AVReservedRangeCreate {
+  space_id: string;
+  cidr: string;
+  av_protocol: AVProtocol;
+  name?: string;
+  description?: string;
+  exclusive?: boolean;
+  vlan_id?: string | null;
+  tags?: Record<string, unknown>;
+}
+
+/** Partial update. ``space_id`` is intentionally absent — re-homing a
+ *  range to another IPSpace is a delete + create on the backend. */
+export interface AVReservedRangeUpdate {
+  cidr?: string;
+  av_protocol?: AVProtocol;
+  name?: string;
+  description?: string;
+  exclusive?: boolean;
+  vlan_id?: string | null;
+  tags?: Record<string, unknown>;
+}
+
+export interface AVFlow {
+  id: string;
+  group_id: string;
+  av_protocol: string;
+  av_flow_label: string;
+  /** PTP (IEEE 1588) clock domain, 0–255. ``null`` is the finding the
+   *  ``av_flow_no_ptp_domain`` conformity check surfaces. */
+  ptp_domain: number | null;
+  seen_via: string;
+  notes: string;
+  custom_fields: Record<string, unknown>;
+  created_at: string;
+  modified_at: string;
+  // Denormalised from the parent multicast group.
+  group_address: string;
+  group_name: string;
+  group_application: string;
+  space_id: string;
+  vlan_id: string | null;
+}
+
+export interface AVFlowListResponse {
+  items: AVFlow[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+/** Full-document upsert (``PUT /av/flows/{group_id}``): an omitted
+ *  ``ptp_domain`` clears the stored one rather than leaving it alone. */
+export interface AVFlowUpsert {
+  av_protocol: AVProtocol;
+  av_flow_label?: string;
+  ptp_domain?: number | null;
+  seen_via?: AVFlowSource;
+  notes?: string;
+  custom_fields?: Record<string, unknown>;
+}
+
+export interface AVFlowListQuery {
+  limit?: number;
+  offset?: number;
+  av_protocol?: string;
+  ptp_domain?: number;
+  space_id?: string;
+  vlan_id?: string;
+  q?: string;
+}
+
+export interface AVReservedRangeMatch {
+  range_id: string;
+  cidr: string;
+  av_protocol: string;
+  exclusive: boolean;
+  name: string;
+  /** ``inside`` when wholly within the range, ``overlaps`` when it straddles. */
+  relation: string;
+}
+
+export interface AVAllocationPreviewRequest {
+  space_id: string;
+  address_or_cidr: string;
+  av_protocol: AVProtocol;
+}
+
+export interface AVAllocationPreviewResponse {
+  space_id: string;
+  target: string;
+  av_protocol: string;
+  /** ``ok`` | ``informational`` | ``conflict``. */
+  status: string;
+  conflicts: AVReservedRangeMatch[];
+  advisories: AVReservedRangeMatch[];
+  own_ranges: AVReservedRangeMatch[];
+  outside_declared_range: boolean;
+  suggested_range: string | null;
+  detail: string;
+}
+
+export interface AVProtocolPreset {
+  av_protocol: string;
+  label: string;
+  /** ``null`` where the protocol has no vendor default (SMPTE 2110, NDI). */
+  default_cidr: string | null;
+}
+
+export interface AVPresetsResponse {
+  protocols: AVProtocolPreset[];
+  flow_sources: string[];
+  ptp_domain_min: number;
+  ptp_domain_max: number;
+}
+
+export const avApi = {
+  listReservedRanges: (params?: {
+    space_id?: string;
+    av_protocol?: string;
+    vlan_id?: string;
+    exclusive?: boolean;
+    tag?: string[];
+  }) =>
+    api
+      .get<AVReservedRange[]>("/av/reserved-ranges", { params })
+      .then((r) => r.data),
+  createReservedRange: (data: AVReservedRangeCreate) =>
+    api.post<AVReservedRange>("/av/reserved-ranges", data).then((r) => r.data),
+  updateReservedRange: (id: string, data: AVReservedRangeUpdate) =>
+    api
+      .put<AVReservedRange>(`/av/reserved-ranges/${id}`, data)
+      .then((r) => r.data),
+  removeReservedRange: (id: string) => api.delete(`/av/reserved-ranges/${id}`),
+
+  listFlows: (params?: AVFlowListQuery) =>
+    api.get<AVFlowListResponse>("/av/flows", { params }).then((r) => r.data),
+  // Keyed on the multicast group id, not the profile id — the caller is
+  // looking at a group and declaring "this is a Dante flow".
+  upsertFlow: (groupId: string, data: AVFlowUpsert) =>
+    api.put<AVFlow>(`/av/flows/${groupId}`, data).then((r) => r.data),
+  // Drops the AV identity; the multicast group itself survives.
+  removeFlow: (groupId: string) => api.delete(`/av/flows/${groupId}`),
+
+  allocationPreview: (data: AVAllocationPreviewRequest) =>
+    api
+      .post<AVAllocationPreviewResponse>("/av/allocation-preview", data)
+      .then((r) => r.data),
+  presets: () => api.get<AVPresetsResponse>("/av/presets").then((r) => r.data),
+};
+
+// ── BACnet/IP devices (#541) ─────────────────────────────────────────
+
+export type BACnetSegmentation =
+  | "both"
+  | "transmit"
+  | "receive"
+  | "no-segmentation";
+
+export type BACnetDeviceSource = "manual" | "whois" | "mirror" | "import";
+
+export interface BACnetDevice {
+  id: string;
+  ip_address_id: string;
+  subnet_id: string | null;
+  /** Joined from the IPAM anchor so a list row needs no second request. */
+  address: string | null;
+  hostname: string | null;
+  /** Unique across the whole BACnet internetwork — the identifier
+   *  operators actually search by. */
+  device_instance: number;
+  vendor_id: number | null;
+  vendor_name: string;
+  /** ASHRAE vendor-id lookup, falling back to ``vendor_name``. */
+  vendor_label: string | null;
+  device_name: string;
+  model_name: string;
+  firmware_rev: string;
+  location: string;
+  max_apdu: number | null;
+  segmentation_supported: string | null;
+  network_number: number | null;
+  udp_port: number;
+  is_bbmd: boolean;
+  is_foreign_device: boolean;
+  bdt: unknown[];
+  fdt: unknown[];
+  seen_via: string;
+  last_seen_at: string | null;
+  notes: string;
+  tags: Record<string, unknown>;
+  custom_fields: Record<string, unknown>;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface BACnetDeviceCreate {
+  ip_address_id: string;
+  device_instance: number;
+  vendor_id?: number | null;
+  vendor_name?: string;
+  device_name?: string;
+  model_name?: string;
+  firmware_rev?: string;
+  location?: string;
+  max_apdu?: number | null;
+  segmentation_supported?: BACnetSegmentation | null;
+  network_number?: number | null;
+  udp_port?: number;
+  is_bbmd?: boolean;
+  is_foreign_device?: boolean;
+  bdt?: unknown[];
+  fdt?: unknown[];
+  seen_via?: BACnetDeviceSource;
+  last_seen_at?: string | null;
+  notes?: string;
+  tags?: Record<string, unknown>;
+  custom_fields?: Record<string, unknown>;
+}
+
+/** PATCH body. ``ip_address_id`` is re-parentable — a readdressed
+ *  controller keeps its device instance and moves to the new IPAM row. */
+export interface BACnetDeviceUpdate {
+  ip_address_id?: string;
+  device_instance?: number;
+  vendor_id?: number | null;
+  vendor_name?: string;
+  device_name?: string;
+  model_name?: string;
+  firmware_rev?: string;
+  location?: string;
+  max_apdu?: number | null;
+  segmentation_supported?: BACnetSegmentation | null;
+  network_number?: number | null;
+  udp_port?: number;
+  is_bbmd?: boolean;
+  is_foreign_device?: boolean;
+  bdt?: unknown[];
+  fdt?: unknown[];
+  seen_via?: BACnetDeviceSource;
+  last_seen_at?: string | null;
+  notes?: string;
+  tags?: Record<string, unknown>;
+  custom_fields?: Record<string, unknown>;
+}
+
+export interface BACnetDeviceListResponse {
+  items: BACnetDevice[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface BACnetDeviceListQuery {
+  limit?: number;
+  offset?: number;
+  subnet_id?: string;
+  ip_address_id?: string;
+  vendor_id?: number;
+  is_bbmd?: boolean;
+  seen_via?: BACnetDeviceSource;
+  q?: string;
+}
+
+/** One Broadcast Distribution Device with the subnet it serves.
+ *  ``subnet_id`` repeats when a subnet has two BBMDs — the
+ *  misconfiguration this list exists to make visible. */
+export interface BACnetBBMD {
+  id: string;
+  ip_address_id: string;
+  address: string | null;
+  device_instance: number;
+  device_name: string;
+  vendor_label: string | null;
+  udp_port: number;
+  subnet_id: string | null;
+  subnet_network: string | null;
+  subnet_name: string | null;
+  bdt_entries: number;
+  fdt_entries: number;
+  last_seen_at: string | null;
+}
+
+export interface BACnetNextInstance {
+  start: number;
+  /** ``null`` when every number from ``start`` upwards is taken. */
+  device_instance: number | null;
+}
+
+export const bacnetApi = {
+  listDevices: (params?: BACnetDeviceListQuery) =>
+    api
+      .get<BACnetDeviceListResponse>("/bacnet/devices", { params })
+      .then((r) => r.data),
+  getDevice: (id: string) =>
+    api.get<BACnetDevice>(`/bacnet/devices/${id}`).then((r) => r.data),
+  createDevice: (data: BACnetDeviceCreate) =>
+    api.post<BACnetDevice>("/bacnet/devices", data).then((r) => r.data),
+  updateDevice: (id: string, data: BACnetDeviceUpdate) =>
+    api.patch<BACnetDevice>(`/bacnet/devices/${id}`, data).then((r) => r.data),
+  removeDevice: (id: string) => api.delete(`/bacnet/devices/${id}`),
+
+  listBbmds: () => api.get<BACnetBBMD[]>("/bacnet/bbmds").then((r) => r.data),
+  // 404 = "this IP isn't a BACnet device" — a normal answer, not a failure.
+  byAddress: (ipAddressId: string) =>
+    api
+      .get<BACnetDevice>(`/bacnet/by-address/${ipAddressId}`)
+      .then((r) => r.data),
+  nextInstance: (start?: number) =>
+    api
+      .get<BACnetNextInstance>("/bacnet/next-instance", {
+        params: start === undefined ? undefined : { start },
+      })
+      .then((r) => r.data),
+};
+
+// ── DICOM AE registry (#723) ─────────────────────────────────────────
+
+export type DICOMRole = "scp" | "scu" | "both";
+
+export type DICOMDeviceClass =
+  | "modality"
+  | "pacs"
+  | "workstation"
+  | "archive"
+  | "router"
+  | "worklist"
+  | "printer"
+  | "other";
+
+export type DICOMAESource = "manual" | "import" | "echo";
+
+export interface DICOMApplicationEntity {
+  id: string;
+  /** Unique institution-wide by specification (PS3.15 Annex H). Case is
+   *  significant — peers match titles exactly. */
+  ae_title: string;
+  /** Null for a *reservation*: a title still burned into peer config
+   *  whose host was decommissioned. Not an error state. */
+  ip_address_id: string | null;
+  subnet_id: string | null;
+  address: string | null;
+  hostname: string | null;
+  port: number;
+  tls_enabled: boolean;
+  role: string;
+  device_class: string;
+  vendor: string;
+  model_name: string;
+  department: string;
+  location: string;
+  seen_via: string;
+  last_seen_at: string | null;
+  /** Network-configuration notes. Never patient data — the registry
+   *  stores none. */
+  notes: string;
+  tags: Record<string, unknown>;
+  custom_fields: Record<string, unknown>;
+  /** Still a known vendor default (DCM4CHEE, ANY-SCP, …) — advisory,
+   *  and the most common cause of estate-wide title collisions. */
+  is_vendor_default: boolean;
+  is_reservation: boolean;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface DICOMAECreate {
+  ae_title: string;
+  ip_address_id?: string | null;
+  port?: number;
+  tls_enabled?: boolean;
+  role?: DICOMRole;
+  device_class?: DICOMDeviceClass;
+  vendor?: string;
+  model_name?: string;
+  department?: string;
+  location?: string;
+  seen_via?: DICOMAESource;
+  last_seen_at?: string | null;
+  notes?: string;
+  tags?: Record<string, unknown>;
+  custom_fields?: Record<string, unknown>;
+}
+
+/** PATCH body. ``ip_address_id: null`` explicitly demotes the AE to a
+ *  reservation — the normal lifecycle event when a host is retired. */
+export interface DICOMAEUpdate {
+  ae_title?: string;
+  ip_address_id?: string | null;
+  port?: number;
+  tls_enabled?: boolean;
+  role?: DICOMRole;
+  device_class?: DICOMDeviceClass;
+  vendor?: string;
+  model_name?: string;
+  department?: string;
+  location?: string;
+  seen_via?: DICOMAESource;
+  last_seen_at?: string | null;
+  notes?: string;
+  tags?: Record<string, unknown>;
+  custom_fields?: Record<string, unknown>;
+}
+
+export interface DICOMAEListResponse {
+  items: DICOMApplicationEntity[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface DICOMAEListQuery {
+  limit?: number;
+  offset?: number;
+  subnet_id?: string;
+  ip_address_id?: string;
+  device_class?: DICOMDeviceClass;
+  role?: DICOMRole;
+  tls_enabled?: boolean;
+  unbound?: boolean;
+  q?: string;
+}
+
+/** A configured, directed AE→AE association. Documented by the operator
+ *  or imported — never inferred from traffic, which would carry PHI. */
+export interface DICOMPeer {
+  id: string;
+  source_ae_id: string;
+  source_ae_title: string;
+  target_ae_id: string;
+  target_ae_title: string;
+  services: string[];
+  notes: string;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface DICOMPeerCreate {
+  source_ae_id: string;
+  target_ae_id: string;
+  services?: string[];
+  notes?: string;
+}
+
+/** Blast radius of renumbering or retiring one AE. Split by direction:
+ *  outbound edges stop sending, inbound edges stop being able to reach
+ *  it — different remediation lists. */
+export interface DICOMImpact {
+  ae_id: string;
+  ae_title: string;
+  address: string | null;
+  outbound: DICOMPeer[];
+  inbound: DICOMPeer[];
+  total_peers: number;
+}
+
+export interface DICOMAEImportColumnMap {
+  ae_title: string;
+  address?: string | null;
+  port?: string | null;
+  tls_enabled?: string | null;
+  role?: string | null;
+  device_class?: string | null;
+  vendor?: string | null;
+  model_name?: string | null;
+  department?: string | null;
+  location?: string | null;
+  notes?: string | null;
+}
+
+export interface DICOMAEImportRequest {
+  csv_text: string;
+  column_map: DICOMAEImportColumnMap;
+  delimiter?: "," | ";" | "\t" | "|";
+  default_port?: number;
+  default_department?: string;
+  overwrite_existing?: boolean;
+  space_id?: string | null;
+}
+
+export interface DICOMAEImportRow {
+  line: number;
+  ae_title: string;
+  action: "create" | "update" | "skip" | "error";
+  reason: string;
+  address: string;
+  ip_address_id: string | null;
+  fields: Record<string, unknown>;
+}
+
+export interface DICOMAEImportPreview {
+  rows: DICOMAEImportRow[];
+  create_count: number;
+  update_count: number;
+  skip_count: number;
+  error_count: number;
+  max_rows: number;
+}
+
+export interface DICOMAEImportCommit {
+  rows: DICOMAEImportRow[];
+  created: number;
+  updated: number;
+  skipped: number;
+  errors: number;
+  ae_ids: string[];
+}
+
+export const dicomApi = {
+  listAes: (params?: DICOMAEListQuery) =>
+    api.get<DICOMAEListResponse>("/dicom/aes", { params }).then((r) => r.data),
+  getAe: (id: string) =>
+    api.get<DICOMApplicationEntity>(`/dicom/aes/${id}`).then((r) => r.data),
+  createAe: (data: DICOMAECreate) =>
+    api.post<DICOMApplicationEntity>("/dicom/aes", data).then((r) => r.data),
+  updateAe: (id: string, data: DICOMAEUpdate) =>
+    api
+      .patch<DICOMApplicationEntity>(`/dicom/aes/${id}`, data)
+      .then((r) => r.data),
+  removeAe: (id: string) => api.delete(`/dicom/aes/${id}`),
+  impact: (id: string) =>
+    api.get<DICOMImpact>(`/dicom/aes/${id}/impact`).then((r) => r.data),
+
+  listPeers: (aeId?: string) =>
+    api
+      .get<DICOMPeer[]>("/dicom/peers", {
+        params: aeId ? { ae_id: aeId } : undefined,
+      })
+      .then((r) => r.data),
+  createPeer: (data: DICOMPeerCreate) =>
+    api.post<DICOMPeer>("/dicom/peers", data).then((r) => r.data),
+  removePeer: (id: string) => api.delete(`/dicom/peers/${id}`),
+
+  // 404 = "this IP isn't a DICOM node" — a normal answer, not a failure.
+  byAddress: (ipAddressId: string) =>
+    api
+      .get<DICOMApplicationEntity>(`/dicom/by-address/${ipAddressId}`)
+      .then((r) => r.data),
+
+  importPreview: (data: DICOMAEImportRequest) =>
+    api
+      .post<DICOMAEImportPreview>("/dicom/aes/import/preview", data)
+      .then((r) => r.data),
+  importCommit: (data: DICOMAEImportRequest) =>
+    api
+      .post<DICOMAEImportCommit>("/dicom/aes/import/commit", data)
+      .then((r) => r.data),
+};
+
+// ── OT / industrial devices (#542) ───────────────────────────────────
+
+export type OTProtocol =
+  | "profinet"
+  | "ethernet_ip"
+  | "modbus_tcp"
+  | "opc_ua"
+  | "s7comm"
+  | "bacnet_ip"
+  | "dnp3"
+  | "iec61850"
+  | "other";
+
+export type OTRole =
+  | "plc"
+  | "io_device"
+  | "hmi"
+  | "drive"
+  | "gateway"
+  | "sensor"
+  | "historian"
+  | "ews"
+  | "switch"
+  | "other";
+
+export type OTDeviceSource =
+  | "manual"
+  | "import"
+  | "enip"
+  | "dcp"
+  | "modbus"
+  | "opcua"
+  | "profiling";
+
+/** Purdue model level. Travels the wire as a canonical **string** because
+ *  3.5 (the manufacturing / enterprise DMZ) is a real level and the column
+ *  is ``Numeric(2, 1)`` — never parse it as a JS number for display. */
+export type PurdueLevel = "0" | "1" | "2" | "3" | "3.5" | "4" | "5";
+
+export interface OTDevice {
+  id: string;
+  ip_address_id: string;
+  /** Joined from the IPAM anchor — an OT inventory is read by IP first. */
+  address: string;
+  subnet_id: string;
+  ot_protocol: string;
+  ot_role: string | null;
+  profinet_device_name: string;
+  ot_vendor: string;
+  ot_product: string;
+  ot_serial: string;
+  firmware_rev: string;
+  /** Canonical string ("3.5"), not a number — see ``PurdueLevel``. */
+  purdue_level: string | null;
+  cell_area: string;
+  seen_via: string;
+  last_seen_at: string | null;
+  notes: string;
+  tags: Record<string, unknown>;
+  custom_fields: Record<string, unknown>;
+  created_at: string;
+  modified_at: string;
+}
+
+/** By-address view: the descriptor plus its zone verdict.
+ *  ``purdue_mismatch`` is tri-state — ``null`` when either the device or
+ *  its zone has no declared level, because an unknown is not a violation. */
+export interface OTDeviceDescriptor extends OTDevice {
+  zone_id: string | null;
+  zone_name: string;
+  zone_cell_area: string;
+  zone_purdue_level: string | null;
+  purdue_mismatch: boolean | null;
+}
+
+export interface OTDeviceCreate {
+  ip_address_id: string;
+  ot_protocol: OTProtocol;
+  ot_role?: OTRole | null;
+  profinet_device_name?: string;
+  ot_vendor?: string;
+  ot_product?: string;
+  ot_serial?: string;
+  firmware_rev?: string;
+  purdue_level?: PurdueLevel | null;
+  cell_area?: string;
+  seen_via?: OTDeviceSource;
+  last_seen_at?: string | null;
+  notes?: string;
+  tags?: Record<string, unknown>;
+  custom_fields?: Record<string, unknown>;
+}
+
+/** Partial update. ``ip_address_id`` is absent on purpose — the descriptor
+ *  *is* the OT identity of one address; moving it is a delete + create. */
+export interface OTDeviceUpdate {
+  ot_protocol?: OTProtocol;
+  ot_role?: OTRole | null;
+  profinet_device_name?: string;
+  ot_vendor?: string;
+  ot_product?: string;
+  ot_serial?: string;
+  firmware_rev?: string;
+  purdue_level?: PurdueLevel | null;
+  cell_area?: string;
+  seen_via?: OTDeviceSource;
+  last_seen_at?: string | null;
+  notes?: string;
+  tags?: Record<string, unknown>;
+  custom_fields?: Record<string, unknown>;
+}
+
+export interface OTDeviceListResponse {
+  items: OTDevice[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface OTDeviceListQuery {
+  limit?: number;
+  offset?: number;
+  ot_protocol?: string;
+  ot_role?: string;
+  purdue_level?: string;
+  cell_area?: string;
+  subnet_id?: string;
+  q?: string;
+  tag?: string[];
+}
+
+export interface OTZone {
+  id: string;
+  subnet_id: string;
+  subnet_network: string;
+  /** Canonical string, always present — a zone with no level is not a zone. */
+  purdue_level: string;
+  cell_area: string;
+  name: string;
+  description: string;
+  tags: Record<string, unknown>;
+  device_count: number;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface OTZoneCreate {
+  subnet_id: string;
+  purdue_level: PurdueLevel;
+  cell_area?: string;
+  name?: string;
+  description?: string;
+  tags?: Record<string, unknown>;
+}
+
+/** Partial update. ``subnet_id`` is absent — the zone is a property of its
+ *  subnet, so re-pointing it would mislabel two subnets in one PUT. */
+export interface OTZoneUpdate {
+  purdue_level?: PurdueLevel;
+  cell_area?: string;
+  name?: string;
+  description?: string;
+  tags?: Record<string, unknown>;
+}
+
+/** Which CSV header feeds which descriptor field. ``address`` is the only
+ *  required mapping; a mapped column missing from the file is a hard 422. */
+export interface OTDeviceImportColumnMap {
+  address: string;
+  ot_protocol?: string;
+  ot_role?: string;
+  profinet_device_name?: string;
+  ot_vendor?: string;
+  ot_product?: string;
+  ot_serial?: string;
+  firmware_rev?: string;
+  purdue_level?: string;
+  cell_area?: string;
+  notes?: string;
+}
+
+/** Same body for preview and commit — the server keeps no state between
+ *  the two calls, so there is no preview token to expire. */
+export interface OTDeviceImportRequest {
+  csv_text: string;
+  column_map: OTDeviceImportColumnMap;
+  delimiter?: "," | ";" | "\t" | "|";
+  default_ot_protocol?: OTProtocol | null;
+  default_cell_area?: string;
+  overwrite_existing?: boolean;
+  space_id?: string | null;
+}
+
+export interface OTDeviceImportRow {
+  line: number;
+  address: string;
+  action: "create" | "update" | "skip" | "error";
+  reason: string;
+  ip_address_id: string | null;
+  fields: Record<string, unknown>;
+}
+
+export interface OTDeviceImportPreviewResponse {
+  rows: OTDeviceImportRow[];
+  create_count: number;
+  update_count: number;
+  skip_count: number;
+  error_count: number;
+  max_rows: number;
+}
+
+export interface OTDeviceImportCommitResponse {
+  rows: OTDeviceImportRow[];
+  created: number;
+  updated: number;
+  skipped: number;
+  errors: number;
+  device_ids: string[];
+}
+
+export const otApi = {
+  listDevices: (params?: OTDeviceListQuery) =>
+    api
+      .get<OTDeviceListResponse>("/ot/devices", { params })
+      .then((r) => r.data),
+  getDevice: (id: string) =>
+    api.get<OTDevice>(`/ot/devices/${id}`).then((r) => r.data),
+  createDevice: (data: OTDeviceCreate) =>
+    api.post<OTDevice>("/ot/devices", data).then((r) => r.data),
+  updateDevice: (id: string, data: OTDeviceUpdate) =>
+    api.put<OTDevice>(`/ot/devices/${id}`, data).then((r) => r.data),
+  removeDevice: (id: string) => api.delete(`/ot/devices/${id}`),
+  // 404 = "this IP has no OT descriptor" — a normal answer, not a failure.
+  byAddress: (ipAddressId: string) =>
+    api
+      .get<OTDeviceDescriptor>(`/ot/by-address/${ipAddressId}`)
+      .then((r) => r.data),
+
+  listZones: (params?: { purdue_level?: string; cell_area?: string }) =>
+    api.get<OTZone[]>("/ot/zones", { params }).then((r) => r.data),
+  getZone: (id: string) =>
+    api.get<OTZone>(`/ot/zones/${id}`).then((r) => r.data),
+  zoneBySubnet: (subnetId: string) =>
+    api.get<OTZone>(`/ot/zones/by-subnet/${subnetId}`).then((r) => r.data),
+  createZone: (data: OTZoneCreate) =>
+    api.post<OTZone>("/ot/zones", data).then((r) => r.data),
+  updateZone: (id: string, data: OTZoneUpdate) =>
+    api.put<OTZone>(`/ot/zones/${id}`, data).then((r) => r.data),
+  removeZone: (id: string) => api.delete(`/ot/zones/${id}`),
+
+  importPreview: (data: OTDeviceImportRequest) =>
+    api
+      .post<OTDeviceImportPreviewResponse>("/ot/devices/import/preview", data)
+      .then((r) => r.data),
+  importCommit: (data: OTDeviceImportRequest) =>
+    api
+      .post<OTDeviceImportCommitResponse>("/ot/devices/import/commit", data)
       .then((r) => r.data),
 };

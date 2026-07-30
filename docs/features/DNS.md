@@ -30,9 +30,9 @@ SpatiumDDI ships four authoritative DNS drivers. Pick **per server group** — e
 | ALIAS records (CNAME at apex) | — | ✅ | — (has ANAME/APP instead — deferred) | — |
 | LUA records (computed responses) | — | ✅ | — | — |
 | Online DNSSEC signing | ✅ inline-signing (#49) | ✅ one-toggle | — (fast-follow) | manual |
-| Native DoT/DoH/DoQ (no sidecar) | — | — (needs dnsdist sidecar) | — (fast-follow — daemon supports it natively) | — |
+| Native DoT / DoH (no sidecar) | ✅ (issue #50) | — (needs dnsdist sidecar) | — (fast-follow — daemon supports DoT/DoH/DoQ natively) | — |
 | Catalog zones (RFC 9432) — producer | ✅ | ✅ | — (fast-follow) | — |
-| Catalog zones (RFC 9432) — consumer | ✅ | — (waits for pdns 4.10+) | — | — |
+| Catalog zones (RFC 9432) — consumer | ✅ | — (not wired up in the agent) | — | — |
 | First-class views / split-horizon | ✅ | tag-based, not surfaced as views in UI | — | — (replication scope) |
 | RPZ blocklists | ✅ | — (recursor feature only) | — | — |
 | AD-integrated zones | — | — | — | ✅ |
@@ -40,7 +40,7 @@ SpatiumDDI ships four authoritative DNS drivers. Pick **per server group** — e
 
 **Default driver: BIND9.** It is the reference implementation, ubiquitous in operator muscle memory, and runs the catalog-zone consumer + RPZ paths SpatiumDDI ships.
 
-**Pick PowerDNS when** you need ALIAS records (CNAME-at-apex without the BIND-side workaround), LUA records (geo-routing / weighted answers / `pickrandom` / `ifportup`), or the simpler one-toggle online DNSSEC story. The shipped image (`ghcr.io/spatiumddi/dns-powerdns`) bundles `pdns 4.9 + pdns-backend-lmdb` for an agent-isolated zone store with no external Postgres dependency. See [issue #127](https://github.com/spatiumddi/spatiumddi/issues/127) for the full driver rationale.
+**Pick PowerDNS when** you need ALIAS records (CNAME-at-apex without the BIND-side workaround), LUA records (geo-routing / weighted answers / `pickrandom` / `ifportup`), or the simpler one-toggle online DNSSEC story. The shipped image (`ghcr.io/spatiumddi/dns-powerdns`) bundles `pdns 5.0 + pdns-backend-lmdb` for an agent-isolated zone store with no external Postgres dependency. See [issue #127](https://github.com/spatiumddi/spatiumddi/issues/127) for the full driver rationale.
 
 **Pick Technitium when** you want a minimal-footprint REST-driven primary-zone host and don't (yet) need DNSSEC or ALIAS/LUA — v1 covers primary zones + standard record types (A/AAAA/CNAME/MX/TXT/NS/PTR/SRV/CAA/TLSA/SSHFP/NAPTR/URI/SVCB/HTTPS/DNAME). Its real long-term differentiator is native DNS-over-TLS/HTTPS/QUIC support with no dnsdist-style sidecar (PowerDNS's approach) — that wiring is a fast-follow, tracked in [`docs/drivers/DNS_DRIVERS.md` §4B.5](../drivers/DNS_DRIVERS.md).
 

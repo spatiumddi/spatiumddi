@@ -33,9 +33,21 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.ipam import IPAddress, Subnet
 from app.models.nmap import NmapScan
+from app.services.ipam.probe_policy import resolve_probe_policy
 from app.services.nmap.runner import PRESETS
 
 logger = structlog.get_logger(__name__)
+
+
+class ProbeSuppressed(Exception):
+    """The target subnet is marked do-not-probe (#722).
+
+    Distinct from the concurrency-cap ``ValueError`` because the two
+    mean opposite things to a caller: the cap is transient and worth
+    retrying, this is a deliberate standing refusal. The message is the
+    resolved verdict's, so the operator's own reason reaches the UI.
+    """
+
 
 # Cap on simultaneous active profile scans per subnet. A small number
 # is intentional — these are background scans triggered by lease
@@ -100,6 +112,20 @@ async def maybe_enqueue_for_lease(
     """
     try:
         if not getattr(subnet, "auto_profile_on_dhcp_lease", False):
+            return None
+
+        # Fragile-device suppression (#722). Checked before the refresh
+        # window, not after: this is the one guard that must not be
+        # bypassable by tuning the others, and a suppressed subnet should
+        # never reach the "how recently did we scan" question at all.
+        probe = await resolve_probe_policy(db, subnet)
+        if probe.blocked:
+            logger.info(
+                "auto_profile_skip_do_not_probe",
+                subnet=str(subnet.id),
+                ip=str(ipam_row.address),
+                source=probe.source,
+            )
             return None
 
         if _within_refresh_window(ipam_row.last_profiled_at, subnet.auto_profile_refresh_days):
@@ -189,12 +215,24 @@ async def enqueue_now(
     Caller owns the commit.
 
     Raises ``ValueError`` if the cap is exceeded so the API endpoint
-    can return a 429-style response. Picks the subnet's configured
-    preset by default; an override can be passed for ad-hoc scans.
+    can return a 429-style response, and :class:`ProbeSuppressed` when
+    the subnet is marked do-not-probe (#722) — a distinct type because
+    that one is not a "try again in a moment" condition. Picks the
+    subnet's configured preset by default; an override can be passed for
+    ad-hoc scans.
+
+    "The operator just told us to scan again" is why the refresh window
+    is bypassed, and exactly why the do-not-probe flag is *not*: the
+    operator who clicked Re-profile is usually not the one who wrote the
+    vendor bulletin onto the subnet.
     """
     subnet = await db.get(Subnet, ipam_row.subnet_id)
     if subnet is None:
         raise ValueError(f"subnet {ipam_row.subnet_id} not found")
+
+    probe = await resolve_probe_policy(db, subnet)
+    if probe.blocked:
+        raise ProbeSuppressed(probe.message(action="Profiling"))
 
     in_flight = await _count_in_flight_profiles(db, subnet.id)
     if in_flight >= MAX_CONCURRENT_PROFILES_PER_SUBNET:
@@ -232,6 +270,7 @@ async def enqueue_now(
 
 __all__ = [
     "MAX_CONCURRENT_PROFILES_PER_SUBNET",
+    "ProbeSuppressed",
     "enqueue_now",
     "maybe_enqueue_for_lease",
 ]

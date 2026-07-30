@@ -38,6 +38,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.address_set import AddressSet, validate_address_set_shape
 from app.models.auth import User
 from app.models.ipam import IPAddress, IPBlock, Subnet
+from app.services.ipam.probe_policy import check_probe_target
 from app.services.nmap import NmapArgError, build_argv
 from app.services.pcap import (
     PcapArgError,
@@ -439,6 +440,16 @@ async def _apply_run_nmap_scan(
     enforce_operation_permission(user, _OPERATIONS["run_nmap_scan"])
 
     target = args.target_ip.strip()
+    # Fragile-device suppression (#722). The REST route refuses these
+    # targets, so this path has to as well — a proposal the operator
+    # approved is still a scan, and the flag is a statement about the
+    # devices, not about which surface asked. Deliberately no override
+    # here: clearing the flag is a superadmin action taken deliberately
+    # on the tools page, not something to slip through an approval.
+    probe = await check_probe_target(db, target)
+    if probe.blocked:
+        raise ValueError(probe.message(action="Port scanning"))
+
     # Re-validate at apply time too — argv builder gates dangerous flags.
     try:
         build_argv(target, args.preset, args.port_spec, args.extra_args)

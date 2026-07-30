@@ -93,7 +93,7 @@ Mirrors CLAUDE.md's three mixed sections:
   | 3b | `5f8875f` | LUA records (computed responses — `pickrandom` / `ifportup` / `createReverse` …) |
   | 3c.1 | `d967556` | DNSSEC online-signing backend (sign/unsign endpoints, agent dispatch via cryptokey API) |
   | 3c.fe | `f8c5208` | DNSSEC frontend (`DnssecCard`, DS-rrset list with copy-to-clipboard); migration `e7f94b21c8d5` adds `dnssec_ds_records` + `dnssec_synced_at` |
-  | 3d | `c32bf0d` | RFC 9432 catalog zones, **producer-only** (consumer waits for pdns 4.10+) |
+  | 3d | `c32bf0d` | RFC 9432 catalog zones, **producer-only** (consumer mode not wired up in the agent) |
   | 4a | `2e1901c` | Standalone-VM compose plumbing — new `docker-compose.agent-dns-powerdns.yml`; renamed `agent-dns.yml` → `agent-dns-bind9.yml` |
   | 4b | `494f5d6` | Helm chart per-flavor StatefulSet — `dnsAgents.flavors.powerdns.{repository,tag}`; mount path swaps to `/var/lib/powerdns` for LMDB |
   | 4c | `be5579d` | Kind-cluster smoke test extension — both bind9 + powerdns flavors install side-by-side; `dig id.server CH TXT` on the powerdns pod |
@@ -117,8 +117,8 @@ Mirrors CLAUDE.md's three mixed sections:
 
   **Operator-elective tail (deferred — open separate issues if
   needed):** gpgsql-backend image variant (LMDB stays the
-  default); pdns 4.10+ catalog-zone consumer support (waiting on
-  upstream image bump); bundled-Postgres subchart for the gpgsql
+  default); catalog-zone consumer support on the PowerDNS agent;
+  bundled-Postgres subchart for the gpgsql
   variant. Plus a known soft-delete-on-PowerDNS limitation: the
   soft-delete + trash-purge paths don't enqueue a `record_op` for
   PowerDNS-driver groups (only `?permanent=true` deletes do), so

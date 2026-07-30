@@ -50,6 +50,7 @@ import { ZoneTemplateModal } from "./ZoneTemplateModal";
 import { ServerDetailModal } from "./ServerDetailModal";
 import { PauseServerModal } from "@/components/ui/pause-server-modal";
 import { PoolsView } from "./PoolsView";
+import { DriftView } from "./DriftView";
 import {
   CertsCompactTable,
   TLSStatePill,
@@ -2791,6 +2792,10 @@ function ZoneSyncPill({ state }: { state: ZoneServerState }) {
   );
 }
 
+// Sub-tabs on the zone detail surface. Mirrored in the ``subtab`` URL param
+// (``records`` is the default and is left out of the URL entirely).
+type ZoneSubtab = "records" | "pools" | "certs" | "drift";
+
 function ZoneDetailView({
   group,
   zone,
@@ -2981,16 +2986,16 @@ function ZoneDetailView({
   // surface; otherwise default to Records.
   const [zoneSearchParams, setZoneSearchParams] = useSearchParams();
   const subtabParam = zoneSearchParams.get("subtab");
-  const initialSubtab: "records" | "pools" | "certs" =
+  const initialSubtab: ZoneSubtab =
     subtabParam === "pools"
       ? "pools"
       : subtabParam === "certs"
         ? "certs"
-        : "records";
-  const [zoneView, _setZoneView] = useState<"records" | "pools" | "certs">(
-    initialSubtab,
-  );
-  const setZoneView = (v: "records" | "pools" | "certs") => {
+        : subtabParam === "drift"
+          ? "drift"
+          : "records";
+  const [zoneView, _setZoneView] = useState<ZoneSubtab>(initialSubtab);
+  const setZoneView = (v: ZoneSubtab) => {
     _setZoneView(v);
     // Keep the URL in sync so a refresh / back-navigation lands on
     // the same tab. ``subtab=records`` is the default state — drop
@@ -3324,12 +3329,33 @@ function ZoneDetailView({
               Certificates ({tlsCerts?.items.length ?? 0})
             </button>
           )}
+          {/* No count — the drift report AXFRs every server in the group, so
+              it's only fetched once the operator opens the tab (#61). */}
+          <button
+            type="button"
+            onClick={() => setZoneView("drift")}
+            title="Compare what each server is actually serving against the database"
+            className={
+              "border-b-2 px-3 py-2 text-xs font-medium transition-colors " +
+              (zoneView === "drift"
+                ? "border-primary text-foreground"
+                : "border-transparent text-muted-foreground hover:text-foreground")
+            }
+          >
+            Drift
+          </button>
         </div>
       )}
 
       {/* Pools sub-view */}
       {!isForward && !zone.tailscale_tenant_id && zoneView === "pools" && (
         <PoolsView group={group} zone={zone} />
+      )}
+
+      {/* Drift sub-view (#61) — mounted only while the tab is active so the
+          expensive per-server AXFR fan-out isn't fired on every zone open. */}
+      {!isForward && !zone.tailscale_tenant_id && zoneView === "drift" && (
+        <DriftView group={group} zone={zone} />
       )}
 
       {/* Certificates sub-view */}

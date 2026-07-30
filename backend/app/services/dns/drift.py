@@ -62,6 +62,9 @@ class ZoneDriftReport:
     zone_name: str
     db_record_count: int
     servers: list[ServerDrift] = field(default_factory=list)
+    # Conditions that make the diff below less trustworthy than it looks.
+    # Rendered verbatim by the UI — keep them operator-readable.
+    warnings: list[str] = field(default_factory=list)
 
 
 def _to_drift_record(r: RecordData | DNSRecord) -> DriftRecord:
@@ -98,6 +101,26 @@ async def compute_zone_drift(
     report = ZoneDriftReport(
         zone_id=str(zone.id), zone_name=zone.name, db_record_count=len(db_rows)
     )
+
+    # Split-horizon caveat. Under views (#24) each view gets its own zone row
+    # and its own rendered zone file, but an AXFR is addressed by zone *name*
+    # — the server answers with whichever view matches the control plane's
+    # source IP, which is not necessarily the view this row belongs to. The
+    # diff would then report the other view's content as drift in both
+    # directions. We can't tell from the wire which view answered, so say so
+    # rather than let an operator "fix" a difference that isn't one.
+    if zone.view_id is not None:
+        report.warnings.append(
+            "This zone belongs to a DNS view. A zone transfer is answered by "
+            "whichever view matches the control plane's source address, so "
+            "differences below may reflect a different view rather than real drift."
+        )
+    elif any(r.view_id is not None for r in db_rows):
+        report.warnings.append(
+            "Some records in this zone are scoped to a specific DNS view and are "
+            "only served to clients matching it. They may appear as missing here "
+            "even when the server is correct."
+        )
 
     async def _drift_for_server(srv: DNSServer) -> ServerDrift:
         entry = ServerDrift(

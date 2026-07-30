@@ -50,6 +50,21 @@ class DriverBase(ABC):
     def daemon_running(self) -> bool:
         ...
 
+    def daemon_version(self) -> str | None:
+        """Version of the DNS daemon binary, e.g. ``"5.0.5"`` / ``"9.20.26"``.
+
+        Reported on each heartbeat and persisted to ``dns_server.daemon_version``
+        so the control plane can reason about what the fleet is actually
+        running — the rolling-upgrade preflight needs it to tell an operator
+        that crossing PowerDNS 4.x → 5.x performs a one-way LMDB schema
+        migration (#638).
+
+        ``None`` means "could not determine", which the control plane must
+        treat as UNKNOWN — never as a specific version. Not abstract: a driver
+        that has no cheap version probe simply doesn't report one.
+        """
+        return None
+
     def apply_config(self, bundle: dict[str, Any]) -> None:
         """Default orchestration: render → validate → swap+reload."""
         self.render(bundle)
