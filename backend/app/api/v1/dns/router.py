@@ -177,7 +177,16 @@ VALID_DNSDIST_ACTIONS = {"truncate", "drop"}
 # client-side HTTP transport, so DoH-upstream isn't expressible on the BIND9
 # driver. The dnsdist front used by PowerDNS can do it and gets its own knob
 # if/when that's wired.
-VALID_FORWARD_TRANSPORTS = {"do53", "tls"}
+VALID_FORWARD_TRANSPORTS = {"do53", "tls", "https", "quic"}
+# Transports only some drivers can actually speak. BIND 9.20 forwards
+# over DoT but has no client-side HTTP or QUIC transport, so https /
+# quic are refused for a bind9 group rather than rendered into a
+# named.conf that would not load. Technitium does all four (verified
+# live against 15.4.0). Issue #741.
+_TRANSPORT_DRIVER_GATE: dict[str, frozenset[str]] = {
+    "https": frozenset({"technitium"}),
+    "quic": frozenset({"technitium"}),
+}
 # Ports a DoT / DoH listener may never claim (issue #50). The listeners bind
 # ``any``, which includes loopback, so they collide with the fixed ports the
 # agent hardcodes into every rendered named.conf. Value is the operator-facing
@@ -2431,6 +2440,14 @@ async def _assert_encrypted_transport_sane(opts: DNSServerOptions, db: DB) -> No
     if opts.dot_enabled and opts.doh_enabled and opts.dot_port == opts.doh_port:
         raise HTTPException(422, "dot_port and doh_port must differ")
 
+    # DoQ (#741) is UDP where DoT/DoH are TCP, so it may legitimately share
+    # a port number with DoT — 853 is the RFC-default for both. Only the
+    # reserved-port check applies.
+    if opts.doq_enabled:
+        reason = _RESERVED_DNS_PORTS.get(opts.doq_port)
+        if reason:
+            raise HTTPException(422, f"doq_port cannot be {opts.doq_port} — {reason}")
+
     # On an appliance the frontend already serves HTTPS on 443/80, and the
     # DNS workload runs with hostNetwork — so a listener there would fight
     # the web UI for the port. Applies to BOTH listeners: nothing stops an
@@ -2448,6 +2465,24 @@ async def _assert_encrypted_transport_sane(opts: DNSServerOptions, db: DB) -> No
                     "install. Pick another port (8443 is the usual choice) and "
                     "publish it to clients via DoH bootstrap configuration.",
                 )
+
+    # Driver gates for the transports only Technitium speaks (#741).
+    drivers = set(await _group_driver_names(db, opts.group_id))
+    allowed = _TRANSPORT_DRIVER_GATE.get(opts.forward_transport)
+    if allowed is not None and drivers and not (drivers & allowed):
+        raise HTTPException(
+            422,
+            f"forward_transport {opts.forward_transport!r} is only supported by "
+            f"{', '.join(sorted(allowed))} — this group runs "
+            f"{', '.join(sorted(drivers))}. BIND9 has no client-side HTTP or "
+            "QUIC transport, so it can only forward over do53 or tls.",
+        )
+    if opts.doq_enabled and drivers and "technitium" not in drivers:
+        raise HTTPException(
+            422,
+            "DNS-over-QUIC is only supported by the Technitium driver — this "
+            f"group runs {', '.join(sorted(drivers))}.",
+        )
 
     if (
         opts.forward_transport == "tls"

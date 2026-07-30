@@ -730,6 +730,29 @@ Unlike the PowerDNS agent, this driver reports `keys` as well as `ds_records` �
 
 Manual key rollover stays BIND9-only. Technitium rolls on its own schedule — `dnssecPrivateKeys` carries `rolloverDays` per key — so `dnssec_rollover` is deliberately *not* widened to technitium.
 
+### 4B.3c Encrypted transports (issue #741)
+
+Technitium serves **DoT, DoH and DoQ natively** and forwards over all of them — no dnsdist-style sidecar, and no BIND-style "we can receive it but not send it" gap. Everything is driven through `settings/set`.
+
+| Setting | Purpose |
+|---|---|
+| `enableDnsOverTls` / `dnsOverTlsPort` | inbound DoT (TCP, default 853) |
+| `enableDnsOverHttps` / `dnsOverHttpsPort` | inbound DoH (TCP, default 443) |
+| `enableDnsOverQuic` / `dnsOverQuicPort` | inbound DoQ (**UDP**, default 853) |
+| `dnsTlsCertificatePath` | cert served by all three |
+| `forwarderProtocol` | `Udp` / `Tcp` / `Tls` / `Https` / `Quic` |
+
+DoQ is UDP where DoT is TCP, so `doq_port` may legitimately equal `dot_port` — 853 is the RFC default for both, and they do not collide. The firewall layer must open **udp**/`doq_port`, not tcp.
+
+Four behaviours to know, all verified live and all silent if you get them wrong:
+
+- **The certificate must be PKCS #12**, supplied as a file path. PEM is rejected with `DNS Server TLS certificate file must be PKCS #12 formatted`. The bundle ships PEM (that is what `ApplianceCertificate` holds and what BIND9 consumes), so `_write_tls_cert` converts and writes a 0600 `.pfx` into the agent state dir. A cert that fails to parse returns `None` and the listeners stay down — degrade to Do53, never take the daemon with it.
+- **Enabling a listener and setting the cert path are independent.** `enableDnsOverTls=true` lands even when the `dnsTlsCertificatePath` in the *same call* is rejected, which would leave a listener enabled with no certificate. So the cert path goes first, in its own call, and the listeners are only enabled once it succeeds.
+- **`forwarderProtocol` is silently ignored unless `forwarders` is set in the same call.** Setting the protocol alone returns `{"status":"ok"}` and leaves it at `Udp`. The two are always sent together.
+- **Encrypted forwarding needs a domain name, not an IP.** `1.1.1.1` is rejected with `Address must be a domain name` — there would be nothing to validate the upstream certificate against. The neutral model carries a list of forwarder IPs plus a single `forward_tls_hostname`, so over `tls`/`https`/`quic` the hostname wins and the IPs are dropped with a log line naming what went. Technitium then normalises a bare hostname into the transport's canonical form (`cloudflare-dns.com` → `cloudflare-dns.com:853` for DoT, `https://cloudflare-dns.com/dns-query` for DoH).
+
+`forward_transport` accepts `do53` / `tls` / `https` / `quic`, but `https` and `quic` are gated to technitium groups at the API boundary (`_TRANSPORT_DRIVER_GATE`) — BIND 9.20 has no client-side HTTP or QUIC transport, so allowing them on a bind9 group would render a `named.conf` that will not load. `doq_enabled` is gated the same way.
+
 ### 4B.4 Record type mapping
 
 Technitium's API takes structured per-type params rather than PowerDNS's single wire-format `content` string — e.g. `ipAddress` for A/AAAA, `cname` for CNAME, `exchange`+`preference` for MX, `target`+`priority`+`weight`+`port` for SRV. SVCB/HTTPS are best-effort: the driver parses the BIND-zone-file-style rdata string SpatiumDDI stores (`'1 . alpn="h2,h3"'`) into Technitium's `svcPriority`/`svcTargetName`/`svcParams` (`key|value` pairs) — confirmed empirically that Technitium's `svcParams` wire format does **not** accept a comma-separated multi-value single param the way BIND's rdata does, so only the first value of a multi-value param carries through (logged as a warning); single-value params round-trip exactly.

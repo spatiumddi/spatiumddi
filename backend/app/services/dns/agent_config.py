@@ -429,6 +429,9 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
         "doh_enabled": (bool(getattr(opts, "doh_enabled", False)) if opts else False),
         "doh_port": int(getattr(opts, "doh_port", 443)) if opts else 443,
         "doh_path": (getattr(opts, "doh_path", "/dns-query") if opts else "/dns-query"),
+        # DoQ (#741) — Technitium-only, and UDP where DoT/DoH are TCP.
+        "doq_enabled": (bool(getattr(opts, "doq_enabled", False)) if opts else False),
+        "doq_port": int(getattr(opts, "doq_port", 853)) if opts else 853,
         "forward_transport": (getattr(opts, "forward_transport", "do53") if opts else "do53"),
         "forward_tls_hostname": (getattr(opts, "forward_tls_hostname", None) if opts else None),
         "forward_tls_verify": (bool(getattr(opts, "forward_tls_verify", True)) if opts else True),
@@ -629,7 +632,11 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
     # the pre-renewal PEM and emit no SQL, so the etag wouldn't move and the
     # rotation wake would buy nothing.
     tls_cert_block: dict[str, Any] | None = None
-    if opts is not None and (opts.dot_enabled or opts.doh_enabled) and opts.tls_certificate_id:
+    if (
+        opts is not None
+        and (opts.dot_enabled or opts.doh_enabled or opts.doq_enabled)
+        and opts.tls_certificate_id
+    ):
         cert_row = (
             await db.execute(
                 select(ApplianceCertificate)

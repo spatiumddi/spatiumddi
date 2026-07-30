@@ -456,6 +456,12 @@ class DNSServerOptions(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # ``_assert_encrypted_transport_sane``) and operators pick another port.
     doh_port: Mapped[int] = mapped_column(Integer, nullable=False, default=443)
     doh_path: Mapped[str] = mapped_column(String(128), nullable=False, default="/dns-query")
+    # DNS-over-QUIC (RFC 9250), issue #741. Technitium-only: BIND9 has no
+    # DoQ listener and pdns-auth speaks none of these, so the API gates
+    # this to technitium groups. UDP, unlike DoT/DoH — the firewall layer
+    # has to open udp/<doq_port>, not tcp.
+    doq_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    doq_port: Mapped[int] = mapped_column(Integer, nullable=False, default=853)
 
     # Cert served by BOTH listeners. SET NULL rather than CASCADE: deleting a
     # certificate must not delete the whole options row. A NULL id with a
@@ -469,10 +475,13 @@ class DNSServerOptions(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         index=True,
     )
 
-    # Outbound forwarding transport — do53 | tls. BIND 9.20 can forward over
-    # DoT but NOT over DoH (there is no client-side HTTP transport), so
-    # "https" is deliberately not a value here; the PowerDNS/dnsdist path
-    # gets DoH-upstream separately.
+    # Outbound forwarding transport — do53 | tls | https | quic.
+    #
+    # BIND 9.20 can forward over DoT but NOT over DoH (no client-side HTTP
+    # transport), so for a bind9 group the API still refuses anything past
+    # "tls". Technitium forwards over all four (verified live), which is a
+    # capability neither other agent-managed driver has — hence the wider
+    # column with a per-driver gate rather than a wider column for everyone.
     forward_transport: Mapped[str] = mapped_column(String(10), nullable=False, default="do53")
     # ``remote-hostname`` for strict upstream cert validation. Group-level
     # rather than per-forwarder because the common case is one provider's

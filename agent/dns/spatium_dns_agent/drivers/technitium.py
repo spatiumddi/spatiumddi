@@ -28,7 +28,7 @@ own config under ``/etc/dns`` and is configured entirely over its HTTP API
 
 Zone types (issue #743): primary, secondary, stub and forward, plus
 catalog-zone membership for the primaries this server owns. Only a
-*primary*'''s records are reconciled — a secondary and a stub fill
+*primary's* records are reconciled — a secondary and a stub fill
 themselves from the zone transfer and a forwarder holds none, so diffing
 them would delete whatever the daemon just pulled down.
 
@@ -44,9 +44,13 @@ against a live daemon and both silent if you get them wrong:
 * ``zones/options/set`` answers ``ok`` for a value it does not recognise
   and keeps the old one — see ``_ZONE_TRANSFER_VALUES``.
 
-Deferred to fast-follow phases: DNSSEC (#740), native DoT/DoH/DoQ
-listeners + encrypted upstream forwarding (#741), query-log shipping
-(#742), ``dns_import`` live-pull + blocklist wiring (#744).
+Encrypted transports (issue #741): native DoT / DoH / DoQ listeners and
+encrypted *upstream* forwarding. Both are Technitium capabilities the
+other agent-managed drivers lack — BIND9 has no client-side HTTP or QUIC
+transport at all, and pdns-auth speaks none of them.
+
+Deferred to fast-follow phases: query-log shipping (#742), ``dns_import``
+live-pull + blocklist wiring (#744).
 """
 
 from __future__ import annotations
@@ -138,6 +142,23 @@ _DS_DIGEST_TYPES = {"SHA1": 1, "SHA256": 2, "GOST": 3, "SHA384": 4}
 
 # Technitium key-type names → the ksk/zsk/csk vocabulary DNSKeyReport uses.
 _DNSSEC_KEY_TYPES = {"KeySigningKey": "ksk", "ZoneSigningKey": "zsk"}
+
+# ── Encrypted transports (issue #741) ───────────────────────────────────
+#
+# Technitium wants the TLS cert as a FILE PATH, and specifically as
+# PKCS #12 — feeding it PEM fails with "DNS Server TLS certificate file
+# must be PKCS #12 formatted". The bundle ships PEM (that is what BIND9
+# and the ApplianceCertificate store use), so the agent converts and
+# writes a .pfx into its own state dir.
+_TLS_CERT_FILE = "technitium-tls.pfx"
+
+# Neutral forward_transport → Technitium's ``forwarderProtocol``.
+_FORWARDER_PROTOCOLS = {
+    "do53": "Udp",
+    "tls": "Tls",
+    "https": "Https",
+    "quic": "Quic",
+}
 
 # Technitium's supported TSIG algorithms, as its settings API spells them.
 _TSIG_ALGORITHMS = frozenset(
@@ -532,6 +553,10 @@ class TechnitiumDriver(DriverBase):
         # carries TSIG shared secrets.
         catalog = bundle.get("catalog") or bundle.get("catalog_block") or None
         server_payload = {
+            # Encrypted transports + forwarders (#741). Carried verbatim so
+            # swap_and_reload can apply them without re-reading the bundle.
+            "options": bundle.get("options") or {},
+            "tls_cert": bundle.get("tls_cert") or None,
             "tsig_keys": [
                 {
                     "name": (k.get("name") or "").rstrip("."),
@@ -607,6 +632,15 @@ class TechnitiumDriver(DriverBase):
                 log.error("technitium_server_payload_unreadable", error=str(exc))
         if server_state.get("tsig_keys"):
             self._sync_tsig_keys(token, server_state["tsig_keys"])
+
+        # Encrypted listeners + upstream forwarding (#741). Before the zone
+        # reconcile so a slow zone pass cannot delay bringing a listener up.
+        server_options = server_state.get("options") or {}
+        if server_options:
+            self._apply_transport_settings(
+                token, server_options, server_state.get("tls_cert")
+            )
+            self._apply_forwarders(token, server_options)
 
         self._reconcile_zones(token, payload)
         self._apply_catalog(token, server_state.get("catalog"), payload)
@@ -798,6 +832,182 @@ class TechnitiumDriver(DriverBase):
             "technitium_record_op_applied", zone=zone, name=name, type=rtype, op=op_kind
         )
         return None
+
+    # ── Encrypted transports (issue #741) ───────────────────────────────
+
+    def _write_tls_cert(self, cert: dict[str, Any]) -> str | None:
+        """Convert the bundle's PEM cert+key to PKCS #12 on disk.
+
+        Technitium takes the TLS material as a ``dnsTlsCertificatePath``
+        pointing at a **PKCS #12** file; handing it PEM fails with "DNS
+        Server TLS certificate file must be PKCS #12 formatted". The
+        bundle ships PEM, because that is what the ApplianceCertificate
+        store holds and what BIND9 consumes, so the conversion lives here.
+
+        Written 0600 through the same atomic path as the other secrets —
+        the .pfx embeds the private key.
+        """
+        cert_pem = (cert.get("cert_pem") or "").encode()
+        key_pem = (cert.get("key_pem") or "").encode()
+        if not cert_pem or not key_pem:
+            return None
+        try:
+            from cryptography.hazmat.primitives import serialization
+            from cryptography.hazmat.primitives.serialization import pkcs12
+            from cryptography.x509 import load_pem_x509_certificates
+
+            chain = load_pem_x509_certificates(cert_pem)
+            if not chain:
+                raise ValueError("no certificate found in cert_pem")
+            private_key = serialization.load_pem_private_key(key_pem, password=None)
+            blob = pkcs12.serialize_key_and_certificates(
+                name=(cert.get("name") or "spatiumddi").encode(),
+                key=private_key,  # type: ignore[arg-type]
+                cert=chain[0],
+                cas=chain[1:] or None,
+                encryption_algorithm=serialization.NoEncryption(),
+            )
+        except Exception as exc:  # noqa: BLE001 — any parse failure is fatal
+            # Degrade to Do53 rather than take the daemon down: an
+            # unreadable cert must not stop the plain :53 listener, which
+            # is the whole "every path degrades to Do53" promise (#50).
+            log.error("technitium_tls_cert_convert_failed", error=str(exc))
+            return None
+
+        path = self.state_dir / _TLS_CERT_FILE
+        tmp = path.with_suffix(path.suffix + ".new")
+        fd = os.open(
+            str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600
+        )
+        try:
+            os.write(fd, blob)
+        finally:
+            os.close(fd)
+        tmp.replace(path)
+        return str(path)
+
+    def _apply_transport_settings(
+        self, token: str, options: dict[str, Any], cert: dict[str, Any] | None
+    ) -> None:
+        """Push the encrypted-listener + forwarder settings.
+
+        Ordering matters. Technitium accepts ``enableDnsOverTls=true`` even
+        when the certificate path in the SAME call is rejected (verified —
+        the flag lands, the path does not), which would leave a listener
+        enabled with no cert. So the cert path goes first, in its own call,
+        and the listeners are only enabled if that call succeeded.
+        """
+        cert_path = self._write_tls_cert(cert) if cert else None
+        wants_tls = bool(
+            options.get("dot_enabled")
+            or options.get("doh_enabled")
+            or options.get("doq_enabled")
+        )
+
+        if wants_tls:
+            if not cert_path:
+                log.error("technitium_encrypted_transport_skipped_no_cert")
+                return
+            resp = self._call(
+                token, "POST", "settings/set", {"dnsTlsCertificatePath": cert_path}
+            )
+            body = resp.json()
+            if body.get("status") != "ok":
+                log.error(
+                    "technitium_tls_cert_path_rejected",
+                    path=cert_path,
+                    error=body.get("errorMessage"),
+                )
+                return
+
+        params: dict[str, Any] = {
+            "enableDnsOverTls": "true" if options.get("dot_enabled") else "false",
+            "enableDnsOverHttps": "true" if options.get("doh_enabled") else "false",
+            "enableDnsOverQuic": "true" if options.get("doq_enabled") else "false",
+        }
+        if options.get("dot_enabled"):
+            params["dnsOverTlsPort"] = int(options.get("dot_port") or 853)
+        if options.get("doh_enabled"):
+            params["dnsOverHttpsPort"] = int(options.get("doh_port") or 443)
+        if options.get("doq_enabled"):
+            params["dnsOverQuicPort"] = int(options.get("doq_port") or 853)
+
+        resp = self._call(token, "POST", "settings/set", params)
+        body = resp.json()
+        if body.get("status") != "ok":
+            log.error(
+                "technitium_transport_settings_failed", error=body.get("errorMessage")
+            )
+            return
+        log.info(
+            "technitium_transport_settings_applied",
+            dot=bool(options.get("dot_enabled")),
+            doh=bool(options.get("doh_enabled")),
+            doq=bool(options.get("doq_enabled")),
+        )
+
+    def _apply_forwarders(self, token: str, options: dict[str, Any]) -> None:
+        """Set the upstream forwarders and the protocol to reach them with.
+
+        ``forwarderProtocol`` is SILENTLY IGNORED unless ``forwarders`` is
+        set in the SAME call (verified: setting the protocol alone returns
+        ok and leaves it at Udp). So the two always go together, or not at
+        all.
+
+        For DoT/DoH/DoQ, Technitium wants a **domain name** — an IP address
+        is rejected outright ("Address must be a domain name"), because
+        there would be no name to validate the upstream certificate
+        against. That is a real mismatch with the neutral model, which
+        carries a list of forwarder IPs plus one ``forward_tls_hostname``:
+        over an encrypted transport the hostname is the only usable
+        address, so it wins and the IPs are dropped with a warning.
+        """
+        forwarders = [str(f) for f in (options.get("forwarders") or []) if f]
+        transport = str(options.get("forward_transport") or "do53")
+        protocol = _FORWARDER_PROTOCOLS.get(transport)
+        if protocol is None:
+            log.warning("technitium_forward_transport_unsupported", transport=transport)
+            return
+        if not forwarders:
+            return
+
+        if transport != "do53":
+            hostname = options.get("forward_tls_hostname")
+            if hostname:
+                if forwarders != [hostname]:
+                    log.info(
+                        "technitium_forwarder_hostname_substituted",
+                        transport=transport,
+                        hostname=hostname,
+                        dropped=forwarders,
+                        reason="encrypted transports need a name to validate against",
+                    )
+                forwarders = [str(hostname)]
+            else:
+                log.error(
+                    "technitium_forwarder_hostname_missing",
+                    transport=transport,
+                    hint="forward_tls_hostname is required for tls/https/quic",
+                )
+                return
+
+        resp = self._call(
+            token,
+            "POST",
+            "settings/set",
+            {"forwarders": ",".join(forwarders), "forwarderProtocol": protocol},
+        )
+        body = resp.json()
+        if body.get("status") != "ok":
+            log.error(
+                "technitium_forwarders_failed",
+                protocol=protocol,
+                error=body.get("errorMessage"),
+            )
+            return
+        log.info(
+            "technitium_forwarders_applied", protocol=protocol, count=len(forwarders)
+        )
 
     # ── DNSSEC (issue #740) ─────────────────────────────────────────────
 

@@ -435,3 +435,19 @@ def test_dnssec_operations_are_gated_to_technitium() -> None:
     # Manual rollover stays BIND9-only: Technitium rolls on its own
     # schedule (dnssecPrivateKeys carries rolloverDays), like PowerDNS.
     assert "technitium" not in _DRIVER_GATED_OPERATIONS["dnssec_rollover"]
+
+
+def test_forward_transports_are_driver_gated() -> None:
+    """BIND 9.20 forwards over DoT but has no client-side HTTP or QUIC
+    transport, so https/quic are Technitium-only (issue #741)."""
+    from app.api.v1.dns.router import (
+        _TRANSPORT_DRIVER_GATE,
+        VALID_FORWARD_TRANSPORTS,
+    )
+
+    assert VALID_FORWARD_TRANSPORTS == {"do53", "tls", "https", "quic"}
+    assert _TRANSPORT_DRIVER_GATE["https"] == frozenset({"technitium"})
+    assert _TRANSPORT_DRIVER_GATE["quic"] == frozenset({"technitium"})
+    # do53 + tls stay ungated — every agent-managed driver can do both.
+    assert "do53" not in _TRANSPORT_DRIVER_GATE
+    assert "tls" not in _TRANSPORT_DRIVER_GATE

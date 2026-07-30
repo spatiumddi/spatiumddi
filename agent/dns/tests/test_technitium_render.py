@@ -952,3 +952,161 @@ def test_get_zone_records_filters_signing_artefacts(tmp_path: Path) -> None:
     )
     got = d._get_zone_records("t", "z.test")
     assert [r["type"] for r in got] == ["A"]
+
+
+# ── Encrypted transports (issue #741) ───────────────────────────────────
+
+
+def _self_signed_pem() -> tuple[str, str]:
+    import datetime
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "dns.test")])
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(datetime.datetime(2026, 1, 1))
+        .not_valid_after(datetime.datetime(2027, 1, 1))
+        .sign(key, hashes.SHA256())
+    )
+    return (
+        cert.public_bytes(serialization.Encoding.PEM).decode(),
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        ).decode(),
+    )
+
+
+def test_write_tls_cert_emits_loadable_pkcs12(tmp_path: Path) -> None:
+    """Technitium takes the cert as a PKCS #12 file path; handing it PEM
+    fails with "must be PKCS #12 formatted". The bundle ships PEM, so the
+    conversion happens here."""
+    from cryptography.hazmat.primitives.serialization import pkcs12
+
+    cert_pem, key_pem = _self_signed_pem()
+    d = TechnitiumDriver(state_dir=tmp_path)
+    path = d._write_tls_cert({"name": "spatium", "cert_pem": cert_pem, "key_pem": key_pem})
+    assert path is not None
+    blob = Path(path).read_bytes()
+    # Round-trips through a real PKCS#12 loader, so this is not just "some
+    # bytes were written".
+    key, cert, _ = pkcs12.load_key_and_certificates(blob, None)
+    assert key is not None and cert is not None
+    # Embeds a private key — must not be world-readable.
+    assert oct(Path(path).stat().st_mode)[-3:] == "600"
+
+
+def test_write_tls_cert_returns_none_on_garbage(tmp_path: Path) -> None:
+    """An unreadable cert must degrade to Do53, never take the daemon
+    down — the whole point of #50's 'every path degrades to Do53'."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    assert d._write_tls_cert({"cert_pem": "not a cert", "key_pem": "nope"}) is None
+    assert d._write_tls_cert({"cert_pem": "", "key_pem": ""}) is None
+
+
+def test_transport_settings_never_enable_listener_without_cert(tmp_path: Path) -> None:
+    """Technitium accepts enableDnsOverTls=true even when the cert path in
+    the SAME call is rejected, which would leave a listener up with no
+    certificate. So nothing is enabled unless the cert landed first."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    d._apply_transport_settings("t", {"dot_enabled": True, "dot_port": 853}, None)
+    assert calls == []
+
+
+def test_transport_settings_send_cert_path_before_enabling(tmp_path: Path) -> None:
+    cert_pem, key_pem = _self_signed_pem()
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    d._apply_transport_settings(
+        "t",
+        {"dot_enabled": True, "dot_port": 8853, "doq_enabled": True, "doq_port": 8853},
+        {"name": "s", "cert_pem": cert_pem, "key_pem": key_pem},
+    )
+    assert "dnsTlsCertificatePath" in calls[0][3]
+    enable = calls[1][3]
+    assert enable["enableDnsOverTls"] == "true"
+    assert enable["dnsOverTlsPort"] == 8853
+    # DoT and DoQ may share a port number: one is TCP, the other UDP.
+    assert enable["enableDnsOverQuic"] == "true"
+    assert enable["dnsOverQuicPort"] == 8853
+    assert enable["enableDnsOverHttps"] == "false"
+
+
+def test_transport_settings_abort_when_cert_path_rejected(tmp_path: Path) -> None:
+    cert_pem, key_pem = _self_signed_pem()
+    d = TechnitiumDriver(state_dir=tmp_path)
+
+    def responder(path, params, n):
+        if "dnsTlsCertificatePath" in params:
+            return {"status": "error", "errorMessage": "file does not exists"}
+        return {"status": "ok"}
+
+    calls = _install_fake_request(d, responder)
+    d._apply_transport_settings(
+        "t", {"dot_enabled": True}, {"cert_pem": cert_pem, "key_pem": key_pem}
+    )
+    assert len(calls) == 1  # never reached the enable call
+
+
+def test_forwarders_and_protocol_are_sent_together(tmp_path: Path) -> None:
+    """forwarderProtocol is silently ignored unless forwarders is set in
+    the SAME call — verified live: setting it alone returns ok and leaves
+    the protocol at Udp."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    d._apply_forwarders(
+        "t", {"forwarders": ["8.8.8.8", "8.8.4.4"], "forward_transport": "do53"}
+    )
+    params = calls[0][3]
+    assert params["forwarders"] == "8.8.8.8,8.8.4.4"
+    assert params["forwarderProtocol"] == "Udp"
+
+
+def test_forwarders_substitute_hostname_for_encrypted_transports(tmp_path: Path) -> None:
+    """Technitium rejects an IP for DoT/DoH/DoQ ("Address must be a domain
+    name") — there'd be no name to validate the upstream cert against. The
+    neutral model carries IPs plus one hostname, so the hostname wins."""
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    d._apply_forwarders(
+        "t",
+        {
+            "forwarders": ["1.1.1.1", "1.0.0.1"],
+            "forward_transport": "tls",
+            "forward_tls_hostname": "cloudflare-dns.com",
+        },
+    )
+    assert calls[0][3]["forwarders"] == "cloudflare-dns.com"
+    assert calls[0][3]["forwarderProtocol"] == "Tls"
+
+
+def test_forwarders_refuse_encrypted_transport_without_hostname(tmp_path: Path) -> None:
+    d = TechnitiumDriver(state_dir=tmp_path)
+    calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+    d._apply_forwarders("t", {"forwarders": ["1.1.1.1"], "forward_transport": "https"})
+    assert calls == []
+
+
+def test_forwarders_map_every_transport(tmp_path: Path) -> None:
+    for transport, expected in [
+        ("do53", "Udp"), ("tls", "Tls"), ("https", "Https"), ("quic", "Quic")
+    ]:
+        d = TechnitiumDriver(state_dir=tmp_path)
+        calls = _install_fake_request(d, lambda *_: {"status": "ok"})
+        d._apply_forwarders(
+            "t",
+            {"forwarders": ["1.1.1.1"], "forward_transport": transport,
+             "forward_tls_hostname": "dns.example"},
+        )
+        assert calls[0][3]["forwarderProtocol"] == expected
