@@ -372,10 +372,29 @@ the per-node `:80/:443` accept in the nftables drop-in (every renderer emits an
 un-scoped accept when empty, a family-split `ip saddr { … }` accept when set),
 and the MetalLB control-plane VIP via `loadBalancerSourceRanges` (threaded onto
 the frontend Service through the supervisor's `apply_control_plane_overrides`
-HelmChartConfig overlay). Because the drop-in is now the *sole* source of the
-`80/443` accept (the base `/etc/nftables.conf` no longer opens it), the
-supervisor renders it on **every** appliance heartbeat — including idle / non-CP
-nodes — so the rule is always present. `PUT /appliance/firewall/web-ui-access`
+HelmChartConfig overlay). Because the base `/etc/nftables.conf` no longer opens
+`80/443`, the supervisor renders the drop-in accept on **every** appliance
+heartbeat — including idle / non-CP nodes — so the rule is always present.
+
+**Cold-boot reachability (#769).** The drop-in alone was not enough: the
+supervisor can only render it after its first successful heartbeat, and on a
+control-plane appliance that heartbeat goes to the *local* api — so `:80/:443`
+stayed filtered until the api was already serving. Measured on a clean install:
+boot 20:57:02, api `Ready` 20:59:39, drop-in applied **21:00:20**. An operator
+browsing a booting box got a ~3-minute connection timeout, and the "SpatiumDDI
+is initialising" page (#767 / #299) — which exists for exactly that window — was
+unreachable for all of it. So a baked sentinel
+`/etc/nftables.d/00-spatium-webui.nft` opens `80/443` from first boot, before
+the supervisor exists. It is the Web-UI twin of `00-spatium-k3s-bootstrap.nft`
+and shares its lifecycle: it lives in `/etc` (rides the overlay, survives A/B
+slot swaps) and the renderers stamp `# spatium-webui: retire|keep` in the
+drop-in header for `spatium-firewall-reload` to act on. **Retire happens exactly
+when a scope is set** — the sentinel's un-scoped accept sorts earlier in the
+`/etc/nftables.d/*.nft` glob and nftables accepts on first match, so leaving it
+would silently defeat `web_ui_allowed_cidrs`; clearing the scope restores it.
+Unscoped, both rules say the same thing and the sentinel simply stays.
+
+`PUT /appliance/firewall/web-ui-access`
 carries an **anti-lockout guard**: a non-empty set that doesn't cover the
 operator's current source IP is rejected 422 unless `override_lockout=true`
 (the UI surfaces an "Add my IP" button + the override checkbox). SSH on :22

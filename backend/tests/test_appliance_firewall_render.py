@@ -255,3 +255,38 @@ def test_web_ui_scoped_drops_open_accept() -> None:
             'ip6 saddr { 2001:db8:f00d::/64 } tcp dport { 80, 443 } accept comment "web-ui-v6"'
             in body
         )
+
+
+# ── Web-UI bootstrap sentinel directive (#769) ───────────────────────
+
+
+def test_webui_sentinel_directive_all_renderers() -> None:
+    """The ``# spatium-webui:`` host-runner directive, in every renderer.
+
+    The baked ``00-spatium-webui.nft`` opens 80/443 from first boot so the
+    "still initialising" page (#767) is reachable before the supervisor
+    has ever heartbeated — measured on a clean install, the port otherwise
+    opened 41 s AFTER the api was already serving, so the page was
+    unreachable for the entire window it exists for.
+
+    Retire it exactly when a scope is configured: the sentinel's
+    unconditional accept sorts EARLIER in the ``/etc/nftables.d/*.nft``
+    include glob, and nftables accepts on first match, so leaving it in
+    place would silently defeat the operator's ``web_ui_allowed_cidrs``.
+    """
+    sup = _load_supervisor_renderer()
+
+    unscoped = {"role_assignment": {"roles": []}}
+    scoped = {
+        "role_assignment": {"roles": []},
+        "web_ui_allowed_cidrs": ["192.168.0.0/24"],
+    }
+
+    for case, expected in ((unscoped, "keep"), (scoped, "retire")):
+        other = "retire" if expected == "keep" else "keep"
+        bodies = [_call(compile_firewall_body, case), _call_merge(case)]
+        if sup is not None:
+            bodies.append(_call(sup.render_drop_in, case).body)
+        for body in bodies:
+            assert f"# spatium-webui: {expected}" in body
+            assert f"# spatium-webui: {other}" not in body
