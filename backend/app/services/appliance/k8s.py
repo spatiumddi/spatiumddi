@@ -377,6 +377,42 @@ def delete_pod(name: str, namespace: str | None = None) -> tuple[bool, str | Non
     return False, f"kubeapi status {status}: {body[:200]!r}"
 
 
+def get_secret(name: str, namespace: str | None = None) -> tuple[int, dict[str, str] | None]:
+    """Read a Secret's ``data`` block, base64-decoded to str.
+
+    Returns ``(status, decoded_data_or_None)``. ``status`` is 0 when the
+    ServiceAccount isn't mounted or the kubeapi is unreachable, so a
+    caller can tell "not on k8s" from "Secret genuinely absent" (404).
+
+    Values that aren't valid UTF-8 after the base64 decode are dropped —
+    every caller here reads PEM, which is ASCII.
+    """
+    import base64  # noqa: PLC0415
+
+    cfg = get_config()
+    if cfg is None:
+        return 0, None
+    ns = namespace or cfg.namespace
+    path = f"/api/v1/namespaces/{quote(ns)}/secrets/{quote(name)}"
+    try:
+        status, body = _request("GET", path)
+    except KubeapiUnavailableError:
+        return 0, None
+    if status != 200:
+        return status, None
+    try:
+        secret = json.loads(body)
+    except (json.JSONDecodeError, ValueError):
+        return status, None
+    out: dict[str, str] = {}
+    for key, encoded in (secret.get("data") or {}).items():
+        try:
+            out[key] = base64.b64decode(encoded).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            continue
+    return status, out
+
+
 def patch_secret(
     name: str, data: dict[str, str], namespace: str | None = None
 ) -> tuple[bool, str | None]:

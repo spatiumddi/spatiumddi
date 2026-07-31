@@ -70,7 +70,7 @@ data:
 
         resolver ${NGINX_LOCAL_RESOLVERS} valid=10s ipv6=off;
 
-        # Issue #299 phase 2 — same friendly "still booting" page the
+        # Issue #299 phase 2 — the friendly "still booting" page the
         # non-TLS image template serves, mirrored here for the
         # appliance's TLS-fronted shape. Only 502 + 504 (upstream
         # connect refused / upstream timeout); 503 stays as-is so
@@ -154,7 +154,37 @@ data:
             proxy_set_header Host $http_host;
         }
 
+        # Boot gate for the SPA fallback (issue #767). Mirrors
+        # frontend/default.conf.template — the two must not diverge.
+        # ``location /`` serves index.html off local disk, so it has no
+        # upstream to fail on and the error_page above could never fire
+        # for it: an operator browsing a cold-booting appliance got the
+        # SPA shell plus failing XHRs instead of the initialising page.
+        # The auth_request sub-request gives it an upstream to fail on,
+        # and hits the api SERVICE, so an api that is up but not READY
+        # (migrations still landing) correctly reads as "not yet".
+        location = /_api_up {
+            internal;
+            set $api_upstream http://${API_UPSTREAM_HOST}:${API_UPSTREAM_PORT};
+            proxy_pass              $api_upstream/health/live;
+            proxy_pass_request_body off;
+            proxy_set_header        Content-Length "";
+            proxy_set_header        Host $http_host;
+            # resolver_timeout is not covered by the proxy_* timeouts and
+            # defaults to 30 s — without it an unreachable DNS server
+            # would stall every SPA page load for half a minute.
+            resolver_timeout        2s;
+            proxy_connect_timeout   2s;
+            proxy_read_timeout      2s;
+        }
+
         location / {
+            auth_request /_api_up;
+            # auth_request collapses "upstream unreachable" into a 500,
+            # so 500 is in the list. Location-scoped — it replaces the
+            # server-level error_page here only. Re-coded to 503: the
+            # control plane isn't erroring, it isn't up yet.
+            error_page 500 502 504 =503 @starting;
             try_files $uri $uri/ /index.html;
         }
 

@@ -107,9 +107,11 @@ server {
     # status-preservation only matters for programmatic clients.
     error_page 502 504 @starting;
 
-    # The error_page is inherited into every location below, including
-    # ``/api/*``, ``/health/*``, ``/metrics``, and the SPA fallback at
-    # ``/``. Direct GET /_starting.html bypasses the upstream entirely.
+    # The error_page is inherited into every location below that talks
+    # to an upstream — ``/api/*``, ``/health/*``, ``/metrics``. The SPA
+    # fallback at ``/`` serves a static file and so can never 502 on its
+    # own; it gets there via the ``auth_request`` boot gate further down
+    # (#767). Direct GET /_starting.html bypasses the upstream entirely.
 
     location @starting {
         # Static file under root — Vite copies frontend/public/_starting.html
@@ -249,8 +251,48 @@ server {
         proxy_set_header Host $http_host;
     }
 
+    # Boot gate for the SPA fallback (issue #767). ``location /``
+    # resolves index.html straight off local disk, so it has no upstream
+    # to fail on and the ``error_page`` above can never fire for it —
+    # which meant an operator browsing a cold-booting appliance got the
+    # SPA shell plus a wall of failing XHRs instead of the "still
+    # initialising" page. A cheap auth_request sub-request gives this
+    # location an upstream to fail on.
+    #
+    # Deliberately proxies to the api SERVICE, not a pod: an api that is
+    # up but not READY (migrations still landing) is not in the Service's
+    # endpoint set, so this reports "not serving yet" rather than the
+    # weaker "process alive" that /health/live means on its own.
+    location = /_api_up {
+        internal;
+        set $api_upstream http://${API_UPSTREAM_HOST}:${API_UPSTREAM_PORT};
+        proxy_pass              $api_upstream/health/live;
+        proxy_pass_request_body off;
+        proxy_set_header        Content-Length "";
+        proxy_set_header        Host $http_host;
+        # Short — this runs in front of every SPA page load, and a
+        # wedged api should fall back to the starting page fast rather
+        # than hang the browser for the default 60 s. resolver_timeout
+        # is NOT covered by the proxy_* timeouts and defaults to 30 s;
+        # without it an unreachable DNS server (rather than an
+        # unreachable api) would stall every page load for half a
+        # minute.
+        resolver_timeout        2s;
+        proxy_connect_timeout   2s;
+        proxy_read_timeout      2s;
+    }
+
     # SPA fallback — all other paths serve index.html
     location / {
+        auth_request /_api_up;
+        # auth_request collapses "upstream unreachable / timed out" into
+        # a 500, so 500 has to be in this list. Location-scoped, so it
+        # REPLACES the server-level error_page here only — a genuine 500
+        # from /api/ elsewhere is untouched. Re-coded to 503: the control
+        # plane isn't erroring, it just isn't up yet. Hashed assets match
+        # the regex location below, which wins over this prefix location,
+        # so they never pay for the sub-request.
+        error_page 500 502 504 =503 @starting;
         try_files $uri $uri/ /index.html;
     }
 

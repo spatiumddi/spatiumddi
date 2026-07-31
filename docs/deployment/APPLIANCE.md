@@ -83,8 +83,9 @@ The api pod's ServiceAccount keeps minimal RBAC: namespace-scoped pods + pods/lo
 2. Installer partitions (BIOS Boot + ESP + root_A + root_B + var), writes fstab + grub menuentries, runs postinst hardening, reboots.
 3. First-boot: `spatiumddi-firstboot` generates `/etc/spatiumddi/.env` with secrets, bakes the self-signed cert, writes the HelmChart bootstrap manifest, starts k3s.
 4. k3s comes up + imports baked images + helm-controller installs the bootstrap release. 30-90 s for control plane pods to reach Ready; another 15-30 s for migrate Job to complete schema migrations.
-5. Operator browses to `https://<appliance-ip>/`, accepts the self-signed cert, signs in `admin / admin`, sets a real password.
-6. (Appliance role, or a Control-plane node enabling DNS/DHCP) Operator approves the appliance from the control plane's `/appliance → Fleet` tab + picks roles. DaemonSet schedules role pods within ~30 s.
+5. Operator browses to `https://<appliance-ip>/`. Until the api is serving, the frontend nginx answers every page with the **"SpatiumDDI is initialising"** page (`frontend/public/_starting.html`, auto-refreshing every 5 s) instead of the SPA shell — `location /` gates on an `auth_request` probe of the api Service, so a cold boot reads as "still coming up" rather than a wall of failed XHRs (#767).
+6. Operator accepts the self-signed cert **once** and signs in `admin / admin`, then sets a real password. The cert firstboot minted in step 3 is the only one the operator ever sees: the api's startup bootstrap *adopts* it as the active `appliance_certificate` row rather than generating a rival (#767), so the fingerprint doesn't change mid-boot and the frontend isn't rolled underneath the operator.
+7. (Appliance role, or a Control-plane node enabling DNS/DHCP) Operator approves the appliance from the control plane's `/appliance → Fleet` tab + picks roles. DaemonSet schedules role pods within ~30 s.
 
 For a step-by-step user-facing version, see the README's
 ["Quick start with the OS appliance ISO" section](../../README.md#quick-start-with-the-os-appliance-iso-recommended).
@@ -133,10 +134,12 @@ the reference topologies are in
   Provides the control-plane VIP; BGP templates render spec-only for the
   anycast-DNS follow-up.
 - **One TLS cert, cluster-wide**, in the `spatium-appliance-tls` Secret,
-  mounted by every frontend replica. The self-signed default uses stable
-  host identity (never the pod) and **auto-grows its SANs to cover every
-  member's hostname + node IP + the VIP** — an operator-uploaded / CSR
-  cert is never auto-replaced.
+  mounted by every frontend replica. The self-signed default is the one
+  firstboot wrote — the api's startup bootstrap adopts it rather than
+  minting a rival, so an operator is never asked to trust a second cert
+  mid-boot (#767). It uses stable host identity (never the pod) and
+  **auto-grows its SANs to cover every member's hostname + node IP + the
+  VIP** — an operator-uploaded / CSR cert is never auto-replaced.
 
 ### How a promote settles (per-tick, hands-off)
 

@@ -1,17 +1,26 @@
 """Self-signed cert bootstrap — Phase 4b.5 (issue #134).
 
-Runs on appliance api startup. If the ``appliance_certificate`` table
-has no active row, generate a self-signed certificate valid 5 years
-with the appliance's hostname + every detected non-loopback IP as
-SANs, insert it as ``source=self-signed`` + ``is_active=true``, and
-deploy it to the cert volume so nginx has something to serve from
-the very first request.
+Runs on appliance api startup, and settles on ONE active
+``appliance_certificate`` row by trying three things in order:
 
-If an active row already exists (operator-uploaded cert, CSR-signed,
-or a previous self-signed bootstrap), we still re-deploy it to the
-cert volume — handles the case where the volume was wiped (fresh
-upgrade, factory reset, manual ``docker volume rm``) but the DB
-row survived. nginx then reloads via deployer.
+1. **An active row already exists** (operator-uploaded, CSR-signed, or
+   a previous bootstrap) — re-deploy it to the TLS Secret. Handles the
+   case where the Secret was wiped (fresh upgrade, factory reset) but
+   the DB row survived. nginx then reloads via the deployer.
+
+2. **No active row, but the TLS Secret already holds a usable cert** —
+   adopt it (#767). On a fresh appliance, firstboot mints a self-signed
+   cert into ``spatium-appliance-tls`` via a k3s auto-deploy manifest
+   *before* the chart bootstraps, so the frontend nginx has been serving
+   it since its first request. Adopting records it as the active row and
+   deploys nothing: the Secret is already correct, the frontend must not
+   roll, and the operator must not be asked to trust a second cert
+   halfway through a boot they are watching.
+
+3. **Neither** — generate a self-signed cert valid 5 years with the
+   appliance's hostname + every detected non-loopback IP as SANs, insert
+   it ``source=self-signed`` + ``is_active=true``, and deploy it so nginx
+   has something to serve.
 """
 
 from __future__ import annotations
@@ -32,8 +41,13 @@ from app.config import settings
 from app.core.crypto import decrypt_str, encrypt_str
 from app.db import AsyncSessionLocal
 from app.models.appliance import CERT_SOURCE_SELF_SIGNED, ApplianceCertificate
-from app.services.appliance.deployment import deploy_and_reload
-from app.services.appliance.tls import _format_fingerprint
+from app.services.appliance.deployment import deploy_and_reload, read_deployed_cert
+from app.services.appliance.tls import (
+    TLSValidationError,
+    _format_fingerprint,
+    parse_pem_certificate,
+    validate_key_matches_cert,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -52,7 +66,13 @@ async def ensure_self_signed_cert() -> None:
         edge cases) and reload nginx. Cheap and idempotent: the file
         write is atomic + the SIGHUP costs ~50ms.
 
-    Path B — no active row:
+    Path B — no active row, but the TLS Secret holds a usable cert
+    covering every desired SAN (the fresh-appliance case: firstboot
+    put it there before the chart bootstrapped):
+        Adopt it as the active row. Deploys NOTHING — see
+        ``_adopt_deployed_cert``.
+
+    Path C — no active row and nothing adoptable:
         Generate a fresh RSA-2048 self-signed cert. CN = appliance
         hostname; SANs = hostname + every non-loopback IPv4/IPv6
         bound to a local interface. Insert as is_active=true,
@@ -139,8 +159,94 @@ async def ensure_self_signed_cert() -> None:
             )
             return
 
-        # Path B — no active row: generate a self-signed default.
+        # Path B — no active row. Before minting anything, try to ADOPT
+        # the cert already sitting in the spatium-appliance-tls Secret
+        # (#767). On a fresh appliance firstboot writes a self-signed
+        # cert there via a k3s auto-deploy manifest BEFORE the chart
+        # bootstraps, so the frontend nginx has been serving it since
+        # its very first request — including on the "still initialising"
+        # page the operator is looking at right now. Generating a rival
+        # cert here would swap it out, roll the frontend Deployment
+        # mid-boot, and force a SECOND browser trust prompt.
+        if await _adopt_deployed_cert(db, desired_sans):
+            return
+
         await _generate_activate_deploy(db, hostname, ips, extra_sans)
+
+
+async def _adopt_deployed_cert(db: AsyncSession, desired_sans: list[str]) -> bool:
+    """Adopt the cert already in the TLS Secret as the active row.
+
+    Returns True when adoption succeeded — in which case the caller must
+    NOT generate or deploy anything: the Secret already holds this cert,
+    so there is deliberately no ``deploy_and_reload`` call (no Secret
+    PATCH, no rollout annotation bump, no frontend restart).
+
+    Returns False — leaving the caller to generate a fresh cert — when
+    there is nothing to adopt: not on k8s, Secret absent, cert or key
+    unparseable, the key doesn't match the cert, or the cert's real SANs
+    don't cover everything this appliance needs.
+
+    Startup has no advisory lock (unlike ``reconcile_cluster_cert_sans``),
+    so N api replicas can race here. Adoption makes that race benign in a
+    way generating never was: every replica adopts the SAME bytes out of
+    the shared Secret, so the cert actually served is identical whoever
+    wins, where before each replica minted a different one.
+    """
+    deployed = read_deployed_cert()
+    if deployed is None:
+        return False
+    cert_pem, key_pem = deployed
+
+    # Same two validators the operator-upload path runs, so an adopted
+    # cert is held to exactly the standard an uploaded one is.
+    try:
+        validate_key_matches_cert(cert_pem, key_pem)
+        info = parse_pem_certificate(cert_pem)
+    except TLSValidationError as exc:
+        logger.warning("appliance_deployed_cert_unusable", error=str(exc))
+        return False
+
+    if not _sans_cover(info.sans, desired_sans):
+        logger.info(
+            "appliance_deployed_cert_sans_insufficient",
+            deployed_sans=info.sans,
+            desired_sans=desired_sans,
+        )
+        return False
+
+    row = ApplianceCertificate(
+        name=_unique_name("self-signed-firstboot"),
+        source=CERT_SOURCE_SELF_SIGNED,
+        cert_pem=cert_pem,
+        key_encrypted=encrypt_str(key_pem),
+        is_active=True,
+        activated_at=_dt.datetime.now(_dt.UTC),
+        subject_cn=info.subject_cn,
+        sans_json=info.sans,
+        issuer_cn=info.issuer_cn,
+        fingerprint_sha256=info.fingerprint_sha256,
+        valid_from=info.valid_from,
+        valid_to=info.valid_to,
+        notes=(
+            "Adopted from the appliance TLS Secret on first api start — "
+            "this is the cert the OS wrote at first boot, kept so the "
+            "appliance presents one cert identity across the whole boot. "
+            "Replace it with an uploaded cert, a CSR-signed cert, or a "
+            "Let's Encrypt cert via the Appliance → Web UI Certificate tab."
+        ),
+    )
+    db.add(row)
+    await db.commit()
+    await db.refresh(row)
+    logger.info(
+        "appliance_deployed_cert_adopted",
+        cert_id=str(row.id),
+        subject_cn=info.subject_cn,
+        sans=info.sans,
+        fingerprint=info.fingerprint_sha256[:23] + "…",
+    )
+    return True
 
 
 async def _generate_activate_deploy(
