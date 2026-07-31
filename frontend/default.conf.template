@@ -111,7 +111,10 @@ server {
     # to an upstream — ``/api/*``, ``/health/*``, ``/metrics``. The SPA
     # fallback at ``/`` serves a static file and so can never 502 on its
     # own; it gets there via the ``auth_request`` boot gate further down
-    # (#767). Direct GET /_starting.html bypasses the upstream entirely.
+    # (#767). Note that gate also covers a direct GET /_starting.html
+    # (it matches ``location /``): previewing the page against a live api
+    # still serves it 200, but with the api down it comes back 503 — the
+    # same body either way.
 
     location @starting {
         # Static file under root — Vite copies frontend/public/_starting.html

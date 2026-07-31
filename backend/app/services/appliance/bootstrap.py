@@ -40,7 +40,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.core.crypto import decrypt_str, encrypt_str
 from app.db import AsyncSessionLocal
-from app.models.appliance import CERT_SOURCE_SELF_SIGNED, ApplianceCertificate
+from app.models.appliance import (
+    CERT_SOURCE_SELF_SIGNED,
+    CERT_SOURCE_UPLOADED,
+    ApplianceCertificate,
+)
 from app.services.appliance.deployment import deploy_and_reload, read_deployed_cert
 from app.services.appliance.tls import (
     TLSValidationError,
@@ -215,9 +219,23 @@ async def _adopt_deployed_cert(db: AsyncSession, desired_sans: list[str]) -> boo
         )
         return False
 
+    # Only a genuinely self-signed cert may be recorded as such. A DB
+    # reprovision (factory reset, restore into an empty schema) can leave
+    # a real CA-issued cert — an operator upload, or an ACME one from
+    # #438 — sitting in the Secret with no row describing it. Labelling
+    # that "self-signed" would hand it to two loops that must never touch
+    # an operator's cert: reconcile_cluster_cert_sans only auto-replaces
+    # self-signed rows, so the next SAN growth would overwrite it. So
+    # adopt it as ``uploaded`` — the "operator owns this" bucket, which
+    # every auto-replace path already skips. It won't auto-renew (the
+    # ACME account + order state died with the DB, so it couldn't
+    # anyway), but the secret_expiring alert covers appliance_cert_tls,
+    # so an operator gets warned rather than silently expiring.
+    self_signed = info.issuer_cn == info.subject_cn
+    source = CERT_SOURCE_SELF_SIGNED if self_signed else CERT_SOURCE_UPLOADED
     row = ApplianceCertificate(
-        name=_unique_name("self-signed-firstboot"),
-        source=CERT_SOURCE_SELF_SIGNED,
+        name=_unique_name("self-signed-firstboot" if self_signed else "adopted-from-secret"),
+        source=source,
         cert_pem=cert_pem,
         key_encrypted=encrypt_str(key_pem),
         is_active=True,
@@ -229,11 +247,23 @@ async def _adopt_deployed_cert(db: AsyncSession, desired_sans: list[str]) -> boo
         valid_from=info.valid_from,
         valid_to=info.valid_to,
         notes=(
-            "Adopted from the appliance TLS Secret on first api start — "
-            "this is the cert the OS wrote at first boot, kept so the "
-            "appliance presents one cert identity across the whole boot. "
-            "Replace it with an uploaded cert, a CSR-signed cert, or a "
-            "Let's Encrypt cert via the Appliance → Web UI Certificate tab."
+            (
+                "Adopted from the appliance TLS Secret on first api start — "
+                "this is the cert the OS wrote at first boot, kept so the "
+                "appliance presents one cert identity across the whole boot. "
+                "Replace it with an uploaded cert, a CSR-signed cert, or a "
+                "Let's Encrypt cert via the Appliance → Web UI Certificate tab."
+            )
+            if self_signed
+            else (
+                "Adopted from the appliance TLS Secret, which held a "
+                f"CA-issued cert (issuer: {info.issuer_cn}) with no matching "
+                "database row — most likely a factory reset or a restore into "
+                "an empty schema. Recorded as operator-owned so nothing "
+                "auto-replaces it. It will NOT auto-renew: re-issue or "
+                "re-upload it via the Appliance → Web UI Certificate tab "
+                "before it expires."
+            )
         ),
     )
     db.add(row)
@@ -242,7 +272,9 @@ async def _adopt_deployed_cert(db: AsyncSession, desired_sans: list[str]) -> boo
     logger.info(
         "appliance_deployed_cert_adopted",
         cert_id=str(row.id),
+        source=source,
         subject_cn=info.subject_cn,
+        issuer_cn=info.issuer_cn,
         sans=info.sans,
         fingerprint=info.fingerprint_sha256[:23] + "…",
     )

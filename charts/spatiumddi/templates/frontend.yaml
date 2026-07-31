@@ -129,12 +129,21 @@ spec:
             # build that somehow loses the COPY still works.
             - name: NGINX_ENTRYPOINT_LOCAL_RESOLVERS
               value: "1"
+          # Probe nginx's OWN health, not ``/`` (#767). ``/`` is the SPA
+          # fallback, which now gates on an auth_request probe of the api
+          # and answers 503 while the api is unreachable. Probing it would
+          # mark the frontend NotReady during exactly the cold-boot window
+          # the initialising page exists to cover — pulling the pod out of
+          # the Service so the page can't be reached through it at all —
+          # and then CrashLoop it on liveness ~45 s later. ``/nginx-health``
+          # is answered by nginx alone and touches no upstream, which is
+          # what this container's health actually is.
           livenessProbe:
-            httpGet: { path: /, port: http }
+            httpGet: { path: /nginx-health, port: http }
             initialDelaySeconds: 5
             periodSeconds: 15
           readinessProbe:
-            httpGet: { path: /, port: http }
+            httpGet: { path: /nginx-health, port: http }
             initialDelaySeconds: 3
             periodSeconds: 10
           resources:

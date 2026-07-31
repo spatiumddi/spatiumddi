@@ -80,9 +80,16 @@ def read_deployed_cert() -> tuple[str, str] | None:
     if not data:
         logger.info("appliance_deployed_cert_unreadable", status=status)
         return None
-    cert_pem = (data.get(_TLS_CRT_KEY) or "").strip()
-    key_pem = (data.get(_TLS_KEY_KEY) or "").strip()
-    if not cert_pem or not key_pem:
+    cert_pem = data.get(_TLS_CRT_KEY) or ""
+    key_pem = data.get(_TLS_KEY_KEY) or ""
+    # Emptiness is judged on the stripped value, but the ORIGINAL bytes
+    # are what we return. Persisting a stripped copy would make the row
+    # differ from the Secret by a trailing newline, so the next api start
+    # would take Path A, re-deploy it, genuinely change the Secret data,
+    # shift the rollout checksum, and roll the frontend (Recreate — ~5 s
+    # with no Web UI). That is the mid-boot roll this whole path exists
+    # to avoid, merely deferred by one restart.
+    if not cert_pem.strip() or not key_pem.strip():
         return None
     return cert_pem, key_pem
 

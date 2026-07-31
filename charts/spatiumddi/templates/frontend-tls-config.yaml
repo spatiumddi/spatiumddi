@@ -45,6 +45,17 @@ data:
             proxy_set_header   Connection "";
         }
 
+        # nginx-local healthcheck — the frontend Deployment's liveness +
+        # readiness probes target this (#767). Declared explicitly rather
+        # than leaning on the 301 below happening to count as a probe
+        # success: this container's health is nginx's, and it must stay
+        # answerable while the api is down.
+        location = /nginx-health {
+            access_log off;
+            default_type text/plain;
+            return 200 "ok\n";
+        }
+
         location / {
             return 301 https://$host$request_uri;
         }
@@ -69,6 +80,14 @@ data:
         ssl_prefer_server_ciphers off;
 
         resolver ${NGINX_LOCAL_RESOLVERS} valid=10s ipv6=off;
+
+        # Same nginx-local healthcheck as the :80 block, so a probe
+        # pointed at either port answers without touching an upstream.
+        location = /nginx-health {
+            access_log off;
+            default_type text/plain;
+            return 200 "ok\n";
+        }
 
         # Issue #299 phase 2 — the friendly "still booting" page the
         # non-TLS image template serves, mirrored here for the

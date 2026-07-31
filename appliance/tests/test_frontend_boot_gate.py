@@ -108,3 +108,49 @@ def test_both_configs_serve_the_same_starting_file() -> None:
     """The two copies must not drift on which file they fall back to."""
     for path in (IMAGE_TEMPLATE, APPLIANCE_TEMPLATE):
         assert "try_files /_starting.html" in _text(path), path.name
+
+
+# ── The gate must not take the frontend down with it (#767 review) ──────
+
+CHART_DEPLOYMENT = REPO / "charts" / "spatiumddi" / "templates" / "frontend.yaml"
+BASE_DEPLOYMENT = REPO / "k8s" / "base" / "frontend.yaml"
+
+DEPLOYMENTS = pytest.mark.parametrize(
+    "path", [CHART_DEPLOYMENT, BASE_DEPLOYMENT], ids=["helm-chart", "k8s-base"]
+)
+
+
+@DEPLOYMENTS
+def test_frontend_probes_do_not_target_the_gated_root(path: Path) -> None:
+    """Probing ``/`` would make the gate self-defeating.
+
+    ``/`` answers 503 while the api is unreachable, so a probe pointed at
+    it marks the frontend NotReady during exactly the cold-boot window
+    the initialising page exists to cover — pulling the pod out of the
+    Service so the page can't be reached through it — and then CrashLoops
+    it on liveness. Probes must hit nginx's own health route.
+    """
+    text = _text(path)
+    probes = re.findall(r"(liveness|readiness)Probe:(.*?)(?=\n\s{10}\w|\Z)", text, re.S)
+    assert probes, f"{path.name}: no probes found — did the shape change?"
+    for kind, block in probes:
+        assert "/nginx-health" in block, (
+            f"{path.name}: {kind}Probe must target /nginx-health, not the "
+            f"auth_request-gated SPA fallback. Got: {block.strip()[:120]}"
+        )
+
+
+@CONFIGS
+def test_nginx_health_answered_by_every_listener(path: Path) -> None:
+    """Every ``server`` block must answer the probe route without an upstream.
+
+    The appliance config listens on both :80 and :443; a probe pointed at
+    either has to succeed on nginx alone.
+    """
+    text = _text(path)
+    n_servers = len(re.findall(r"^\s*server\s*\{", text, re.M))
+    n_health = len(re.findall(r"location\s+=\s+/nginx-health\s*\{", text))
+    assert n_health == n_servers, (
+        f"{path.name}: {n_servers} server block(s) but {n_health} "
+        "`location = /nginx-health` — every listener must answer the probe"
+    )
