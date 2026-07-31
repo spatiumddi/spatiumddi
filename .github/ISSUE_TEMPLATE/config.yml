@@ -1,7 +1,7 @@
 blank_issues_enabled: false
 contact_links:
   - name: Documentation
-    url: https://spatiumddi.github.io/spatiumddi/
+    url: https://www.spatiumddi.com/
     about: Feature specs, API reference, and deployment guides
   - name: Security vulnerability
     url: https://github.com/spatiumddi/spatiumddi/security/advisories/new

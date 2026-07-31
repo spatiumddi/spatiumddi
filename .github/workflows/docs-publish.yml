@@ -2,10 +2,10 @@
 #
 # The documentation is served from TWO GitHub Pages sites:
 #
-#   * https://spatiumddi.github.io/spatiumddi/  — project site, built by
+#   * https://www.spatiumddi.com/spatiumddi/  — project site, built by
 #     GitHub directly from this repo's `main` branch, `/docs` path. Always
 #     current with `main`; needs no workflow.
-#   * https://spatiumddi.github.io/            — organization site, which
+#   * https://www.spatiumddi.com/            — organization site, which
 #     GitHub only ever serves from a repo named `<org>.github.io`. That repo
 #     holds no source of its own — this workflow mirrors `docs/` into it.
 #
@@ -15,8 +15,8 @@
 # so it should show released documentation, not unreleased work in flight.
 #
 # Auth: GITHUB_TOKEN is scoped to the repo running the workflow and cannot
-# push to another repo, so this uses an SSH deploy key registered on
-# spatiumddi.github.io with write access. The private half lives in the
+# push to another repo, so this uses an SSH deploy key registered on the
+# spatiumddi.github.io repo with write access. The private half lives in the
 # DOCS_DEPLOY_KEY secret. To rotate: generate a new ed25519 pair, replace the
 # deploy key on the target repo, then update the secret here.
 name: Publish docs site
@@ -42,13 +42,16 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  # The repo must keep the <org>.github.io name — that is what makes GitHub
+  # serve it as the organization site. www.spatiumddi.com is the custom
+  # domain configured on top of it, not the repo's name.
   TARGET_REPO: git@github.com:spatiumddi/spatiumddi.github.io.git
   # The branch GitHub Pages is configured to serve on the site repo.
   TARGET_BRANCH: main
 
 jobs:
   publish:
-    name: Mirror docs/ to spatiumddi.github.io
+    name: Mirror docs/ to the site repo
     runs-on: ubuntu-latest
     steps:
       - name: Check out source ref
@@ -110,7 +113,7 @@ jobs:
           **Generated — do not edit this repository directly.**
 
           This repo serves the SpatiumDDI documentation site at
-          <https://spatiumddi.github.io>.
+          <https://www.spatiumddi.com>.
 
           Its entire contents are mirrored from the `docs/` directory of
           [spatiumddi/spatiumddi](https://github.com/spatiumddi/spatiumddi) by
@@ -139,4 +142,4 @@ jobs:
           git commit -m "docs: publish ${VERSION}" -m \
             "Mirrored from spatiumddi/spatiumddi@${SOURCE_SHA} by the docs-publish workflow. Do not edit this repository directly."
           git push origin "HEAD:refs/heads/${TARGET_BRANCH}"
-          echo "Published ${VERSION} to https://spatiumddi.github.io/"
+          echo "Published ${VERSION} to https://www.spatiumddi.com/"

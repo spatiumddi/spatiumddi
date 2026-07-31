@@ -29,7 +29,7 @@ Found a bug or want to request a feature? Open an
 
 ## 📚 Docs
 
-The full documentation lives at **https://spatiumddi.github.io/spatiumddi/**.
+The full documentation lives at **https://www.spatiumddi.com/**.
 
 ---
 

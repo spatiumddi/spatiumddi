@@ -1,4 +1,9 @@
 title: SpatiumDDI
+# Canonical public domain. Used for the absolute URLs that og: tags and the
+# sitemap require; every in-page link stays relative (see the baseurl note
+# below). The domain is configured as a CNAME on the org-site repo, so it
+# fronts both Pages sites.
+url: https://www.spatiumddi.com
 description: Self-hosted DNS, DHCP and IP Address Management — one control plane, real servers underneath.
 
 # Kramdown with GFM input is what GitHub Pages actually uses. The previous
@@ -44,7 +49,7 @@ links:
 # column rendered reference docs into a narrow strip.
 
 # No `baseurl` — deliberately, and do not add one. This tree is served from two
-# Pages sites at different mount points (spatiumddi.github.io/ and
+# Pages sites at different mount points (www.spatiumddi.com/ and
 # .../spatiumddi/), and GitHub Pages injects the correct baseurl per build --
 # empty for the org site, "/spatiumddi" for the project site. Hardcoding either
 # value here would override that and break the other site. (The layouts address

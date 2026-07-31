@@ -8,10 +8,10 @@ type: application
 version: 0.1.0
 appVersion: "0.0.0-dev"
 kubeVersion: ">=1.26.0-0"
-home: https://spatiumddi.github.io/spatiumddi/
+home: https://www.spatiumddi.com/
 sources:
   - https://github.com/spatiumddi
-icon: https://spatiumddi.github.io/spatiumddi/assets/logo-icon.svg
+icon: https://www.spatiumddi.com/assets/logo-icon.svg
 keywords:
   - ipam
   - dns

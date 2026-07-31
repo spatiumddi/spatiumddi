@@ -237,7 +237,7 @@ class ACMEClient:
         self._nonce: str | None = None
         self._http = httpx.AsyncClient(
             timeout=_HTTP_TIMEOUT,
-            headers={"User-Agent": "spatiumddi-acme-client/1 (+https://spatiumddi.github.io)"},
+            headers={"User-Agent": "spatiumddi-acme-client/1 (+https://www.spatiumddi.com)"},
         )
 
     async def __aenter__(self) -> ACMEClient:
