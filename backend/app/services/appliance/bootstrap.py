@@ -4,9 +4,12 @@ Runs on appliance api startup, and settles on ONE active
 ``appliance_certificate`` row by trying three things in order:
 
 1. **An active row already exists** (operator-uploaded, CSR-signed, or
-   a previous bootstrap) — re-deploy it to the TLS Secret. Handles the
-   case where the Secret was wiped (fresh upgrade, factory reset) but
-   the DB row survived. nginx then reloads via the deployer.
+   a previous bootstrap) — re-deploy it to the TLS Secret, but ONLY if
+   the Secret doesn't already hold exactly it. Handles the case where the
+   Secret was wiped (fresh upgrade, factory reset) but the DB row
+   survived; nginx then reloads via the deployer. In the steady state
+   this is a no-op, because re-pushing an identical cert would still roll
+   the frontend via the rollout annotation.
 
 2. **No active row, but the TLS Secret already holds a usable cert** —
    adopt it (#767). On a fresh appliance, firstboot mints a self-signed
@@ -66,9 +69,9 @@ async def ensure_self_signed_cert() -> None:
     """Idempotent: ensure an active cert exists + is materialised on disk.
 
     Path A — active row already exists:
-        Re-deploy the cert to the cert volume (handles wipe-of-volume
-        edge cases) and reload nginx. Cheap and idempotent: the file
-        write is atomic + the SIGHUP costs ~50ms.
+        Re-deploy the cert to the TLS Secret and roll the frontend so it
+        re-reads — but ONLY when the Secret doesn't already hold this
+        exact cert. Covers wipe-of-Secret edge cases; a no-op otherwise.
 
     Path B — no active row, but the TLS Secret holds a usable cert
     covering every desired SAN (the fresh-appliance case: firstboot
@@ -154,6 +157,27 @@ async def ensure_self_signed_cert() -> None:
                     source=active_row.source,
                     missing=[s for s in desired_sans if not _sans_cover(active_row.sans_json, [s])],
                 )
+            # Only deploy when the Secret doesn't ALREADY hold exactly this
+            # cert (#767). Path A exists to recover a wiped Secret, not to
+            # re-push a cert that is already deployed — and re-pushing is
+            # not free: ``reload_frontend_nginx`` writes the
+            # ``tls-secret-checksum`` pod-template annotation, and on a
+            # fresh appliance that annotation does not exist yet (adoption
+            # deploys nothing), so setting it the first time is itself a
+            # template change and rolls the frontend. Observed live on the
+            # #767 test appliance: the first api restart after adoption
+            # rolled the frontend to a new ReplicaSet for no reason. An
+            # unchanged Secret means the mounted copy is already correct,
+            # so there is nothing for a reload to pick up.
+            if read_deployed_cert() == (active_row.cert_pem, key_pem):
+                logger.info(
+                    "appliance_active_cert_already_deployed",
+                    cert_id=str(active_row.id),
+                    name=active_row.name,
+                    source=active_row.source,
+                )
+                return
+
             deploy_and_reload(active_row.cert_pem, key_pem, name=active_row.name)
             logger.info(
                 "appliance_active_cert_redeployed",

@@ -290,6 +290,77 @@ async def test_read_deployed_cert_rejects_blank_values(
 
 
 @pytest.mark.asyncio
+async def test_path_a_does_not_redeploy_an_already_deployed_cert(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An api restart must not roll the frontend (observed on the #767 VM).
+
+    Adoption deploys nothing, so the ``tls-secret-checksum`` pod-template
+    annotation doesn't exist yet. If Path A re-pushes the identical cert
+    on the next api start, ``reload_frontend_nginx`` writes that
+    annotation for the FIRST time — a template change — and the frontend
+    rolls for no reason. Live repro: the first api restart after a fresh
+    install moved the frontend to a new ReplicaSet.
+    """
+    _appliance_settings(monkeypatch)
+    cert_pem, key_pem = _firstboot_cert()
+    from app.core.crypto import encrypt_str
+
+    db_session.add(
+        ApplianceCertificate(
+            name="self-signed-firstboot-abcd1234",
+            source=CERT_SOURCE_SELF_SIGNED,
+            cert_pem=cert_pem,
+            key_encrypted=encrypt_str(key_pem),
+            is_active=True,
+            subject_cn="ddi1",
+            sans_json=["ddi1", "192.168.0.199", "localhost", "127.0.0.1"],
+        )
+    )
+    await db_session.commit()
+
+    spy = _DeploySpy()
+    # The Secret already holds exactly this cert — the steady state.
+    monkeypatch.setattr(bootstrap, "read_deployed_cert", lambda: (cert_pem, key_pem))
+    monkeypatch.setattr(bootstrap, "deploy_and_reload", spy)
+
+    await ensure_self_signed_cert()
+
+    assert spy.calls == [], "an already-deployed cert must not be re-pushed"
+
+
+@pytest.mark.asyncio
+async def test_path_a_still_recovers_a_wiped_secret(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The skip must not break what Path A exists for."""
+    _appliance_settings(monkeypatch)
+    cert_pem, key_pem = _firstboot_cert()
+    from app.core.crypto import encrypt_str
+
+    db_session.add(
+        ApplianceCertificate(
+            name="self-signed-firstboot-abcd1234",
+            source=CERT_SOURCE_SELF_SIGNED,
+            cert_pem=cert_pem,
+            key_encrypted=encrypt_str(key_pem),
+            is_active=True,
+            subject_cn="ddi1",
+            sans_json=["ddi1", "192.168.0.199", "localhost", "127.0.0.1"],
+        )
+    )
+    await db_session.commit()
+
+    spy = _DeploySpy()
+    monkeypatch.setattr(bootstrap, "read_deployed_cert", lambda: None)  # Secret wiped
+    monkeypatch.setattr(bootstrap, "deploy_and_reload", spy)
+
+    await ensure_self_signed_cert()
+
+    assert spy.calls == [(cert_pem, key_pem)]
+
+
+@pytest.mark.asyncio
 async def test_existing_active_row_still_wins_over_the_secret(
     db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
