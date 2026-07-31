@@ -57,17 +57,27 @@ MIN_FONT_SIZE = 9.5
 # hairline overhang is invisible; a genuine overflow is several px.
 EDGE_TOLERANCE = 1.0
 
-# The measuring script. Runs inside the page, walks every text node,
-# and reports geometry plus the tightest enclosing rect. Chromium's
-# --dump-dom gives us the post-script DOM, so results come back in a
-# <pre> we can parse.
+# The measuring script. Runs inside the page, walks every text node, and
+# reports geometry plus the tightest enclosing rect. Chromium's --dump-dom
+# gives us the post-script DOM, so results come back in a <pre> we can parse.
+#
+# Every diagram is measured in ONE page load. Launching a browser per file
+# meant ~30 cold starts, which is slow locally and times out on a CI runner
+# whose Chromium starts far slower than a developer's. Batching is safe here
+# because the only cross-document hazard would be duplicate element ids, and
+# these diagrams carry none and use no <use> references — and text metrics
+# depend on font and content, not on which gradient a fill resolved to.
 MEASURE_JS = r"""
 (function () {
-  var out = { texts: [], rects: [], root: null, error: null };
-  try {
-    var svg = document.querySelector('svg');
-    if (!svg) { out.error = 'no <svg> element'; return out; }
+  var all = [];
+  document.querySelectorAll('svg[data-diagram]').forEach(function (svg) {
+    all.push(measureOne(svg, +svg.getAttribute('data-diagram')));
+  });
+  return all;
 
+  function measureOne(svg, idx) {
+  var out = { idx: idx, texts: [], rects: [], root: null, error: null };
+  try {
     var vb = svg.viewBox.baseVal;
     out.root = { x: vb.x, y: vb.y, w: vb.width, h: vb.height };
 
@@ -112,6 +122,7 @@ MEASURE_JS = r"""
     out.error = String(e && e.message || e);
   }
   return out;
+  }
 })()
 """
 
@@ -152,7 +163,10 @@ class Result:
 
 
 def _chromium() -> str:
-    for name in ("chromium", "chromium-browser", "google-chrome", "chrome"):
+    # google-chrome first: it is preinstalled on GitHub's ubuntu runners and
+    # starts noticeably faster there than a Chromium pulled from apt, which
+    # may be a snap wrapper. Falls back to whatever a developer has locally.
+    for name in ("google-chrome", "chromium", "chromium-browser", "chrome"):
         found = shutil.which(name)
         if found:
             return found
@@ -164,55 +178,94 @@ def _chromium() -> str:
     raise SystemExit(2)
 
 
-def measure(svg_path: Path, browser: str) -> dict:
-    """Render one SVG headless and return the measurement payload."""
+def _inline(svg_path: Path, idx: int) -> str:
+    """Prepare one SVG for inlining into the measurement page."""
     svg = svg_path.read_text(encoding="utf-8")
     # Strip the XML prolog — it is invalid partway through an HTML document
     # and Chromium's parser will bail on the rest of the file.
     if svg.lstrip().startswith("<?xml"):
         svg = svg.split("?>", 1)[1]
+    # Tag the root element so the measuring script can attribute results back
+    # to the right file. Only the first <svg> is the root; nested ones (there
+    # are none today) would be measured as part of their parent.
+    return svg.replace("<svg", f'<svg data-diagram="{idx}"', 1)
 
-    html = HTML_TEMPLATE.format(svg=svg, measure=MEASURE_JS)
+
+def measure_all(paths: list[Path], browser: str) -> dict[int, dict]:
+    """Render every SVG in a single headless page and return measurements
+    keyed by index into ``paths``.
+
+    One launch rather than one-per-file: browser startup dominates the
+    runtime, and a CI runner's Chromium is slow enough that per-file launches
+    blow past any sane timeout.
+    """
+    parts, failed = [], {}
+    for i, p in enumerate(paths):
+        try:
+            parts.append(_inline(p, i))
+        except OSError as exc:
+            failed[i] = {"error": f"unreadable: {exc}"}
+
+    html = HTML_TEMPLATE.format(svg="\n".join(parts), measure=MEASURE_JS)
 
     with tempfile.TemporaryDirectory() as tmp:
         page = Path(tmp) / "page.html"
         page.write_text(html, encoding="utf-8")
-        proc = subprocess.run(
-            [
-                browser,
-                "--headless",
-                "--no-sandbox",
-                "--disable-gpu",
-                "--hide-scrollbars",
-                f"--user-data-dir={tmp}/profile",
-                "--virtual-time-budget=5000",
-                "--dump-dom",
-                page.as_uri(),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
+        try:
+            proc = subprocess.run(
+                [
+                    browser,
+                    "--headless",
+                    "--no-sandbox",
+                    "--disable-gpu",
+                    "--hide-scrollbars",
+                    f"--user-data-dir={tmp}/profile",
+                    "--virtual-time-budget=8000",
+                    "--dump-dom",
+                    page.as_uri(),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+        except subprocess.TimeoutExpired:
+            return {i: {"error": "renderer timed out"} for i in range(len(paths))}
 
     dom = proc.stdout
     marker = '<pre id="__result">'
     start = dom.find(marker)
     if start == -1:
-        return {"error": "renderer produced no measurement block"}
+        return {
+            i: {"error": "renderer produced no measurement block"}
+            for i in range(len(paths))
+        }
     start += len(marker)
-    end = dom.find("</pre>", start)
-    raw = dom[start:end]
+    raw = dom[start : dom.find("</pre>", start)]
     # The DOM dump HTML-escapes the JSON payload.
-    raw = raw.replace("&quot;", '"').replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+    raw = (
+        raw.replace("&quot;", '"')
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+    )
     try:
-        return json.loads(raw)
+        payload = json.loads(raw)
     except json.JSONDecodeError as exc:
-        return {"error": f"unparseable measurement payload: {exc}"}
+        return {
+            i: {"error": f"unparseable measurement payload: {exc}"}
+            for i in range(len(paths))
+        }
+
+    out = dict(failed)
+    for entry in payload:
+        out[entry["idx"]] = entry
+    for i in range(len(paths)):
+        out.setdefault(i, {"error": "diagram did not render"})
+    return out
 
 
-def check(svg_path: Path, browser: str) -> Result:
+def check(svg_path: Path, data: dict) -> Result:
     result = Result(path=svg_path)
-    data = measure(svg_path, browser)
 
     if data.get("error"):
         result.findings.append(Finding("malformed", data["error"]))
@@ -231,7 +284,9 @@ def check(svg_path: Path, browser: str) -> Result:
         short = label if len(label) <= 48 else label[:45] + "..."
 
         if t.get("dropped"):
-            result.findings.append(Finding("malformed", f"renderer dropped text {short!r}"))
+            result.findings.append(
+                Finding("malformed", f"renderer dropped text {short!r}")
+            )
             continue
 
         # 1. Clipped by the canvas.
@@ -324,7 +379,8 @@ def main() -> int:
         print("no SVG diagrams found", file=sys.stderr)
         return 1
 
-    results = [check(p, browser) for p in paths]
+    measurements = measure_all(paths, browser)
+    results = [check(p, measurements[i]) for i, p in enumerate(paths)]
     failed = [r for r in results if not r.ok]
 
     if args.json:
@@ -335,7 +391,9 @@ def main() -> int:
                         "path": str(r.path.relative_to(REPO_ROOT)),
                         "ok": r.ok,
                         "texts": r.text_count,
-                        "findings": [{"kind": f.kind, "detail": f.detail} for f in r.findings],
+                        "findings": [
+                            {"kind": f.kind, "detail": f.detail} for f in r.findings
+                        ],
                     }
                     for r in results
                 ],
@@ -345,7 +403,11 @@ def main() -> int:
         return 1 if failed else 0
 
     for r in results:
-        rel = r.path.relative_to(REPO_ROOT) if r.path.is_relative_to(REPO_ROOT) else r.path
+        rel = (
+            r.path.relative_to(REPO_ROOT)
+            if r.path.is_relative_to(REPO_ROOT)
+            else r.path
+        )
         if r.ok:
             print(f"  ok    {rel}  ({r.text_count} labels)")
         else:
