@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="550" viewBox="0 0 920 550"
+     preserveAspectRatio="xMidYMid meet"
+     font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+  <title>PowerDNS-primary with BIND-secondary hybrid</title>
+  <desc>Operators drive the SpatiumDDI control plane, which owns two single-driver server groups: internal-pdns on PowerDNS, whose primary signs DNSSEC, and edge-bind on BIND9, whose members consume the catalog zone by AXFR.</desc>
+  <defs>
+    <linearGradient id="tpd-surface" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#f1f5f9"/>
+      <stop offset="100%" stop-color="#e2e8f0"/>
+    </linearGradient>
+    <linearGradient id="tpd-cp" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#8b5cf6"/>
+      <stop offset="100%" stop-color="#6d28d9"/>
+    </linearGradient>
+    <linearGradient id="tpd-agent" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#fb923c"/>
+      <stop offset="100%" stop-color="#ea580c"/>
+    </linearGradient>
+    <marker id="tpd-arrow" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/>
+    </marker>
+  </defs>
+
+  <!-- Operators -->
+  <g>
+    <rect x="380" y="24" width="160" height="48" rx="24" fill="#1e293b"/>
+    <text x="460" y="54" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">operators</text>
+  </g>
+  <path d="M 460 72 V 104" stroke="#475569" stroke-width="2" fill="none" marker-end="url(#tpd-arrow)"/>
+
+  <!-- Control plane -->
+  <g>
+    <rect x="330" y="104" width="260" height="64" rx="8" fill="url(#tpd-cp)"/>
+    <text x="460" y="132" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">SpatiumDDI control plane</text>
+    <text x="460" y="152" text-anchor="middle" font-size="11" fill="#ddd6fe">source of truth for both groups</text>
+  </g>
+  <path d="M 460 168 V 200 H 250 V 230" stroke="#475569" stroke-width="2" fill="none" marker-end="url(#tpd-arrow)"/>
+  <path d="M 460 168 V 200 H 670 V 230" stroke="#475569" stroke-width="2" fill="none" marker-end="url(#tpd-arrow)"/>
+
+  <!-- internal-pdns group -->
+  <g>
+    <rect x="60" y="230" width="380" height="232" rx="12" fill="url(#tpd-surface)" stroke="#94a3b8" stroke-width="2"/>
+    <text x="82" y="258" font-size="14" font-weight="600" fill="#0f172a">DNSServerGroup “internal-pdns”</text>
+    <text x="82" y="278" font-size="11" fill="#475569">driver = powerdns</text>
+
+    <rect x="84" y="296" width="330" height="64" rx="8" fill="url(#tpd-agent)"/>
+    <text x="249" y="322" text-anchor="middle" font-size="13" font-weight="600" fill="#ffffff">pdns1.corp</text>
+    <text x="249" y="342" text-anchor="middle" font-size="11" fill="#fed7aa">primary · signs DNSSEC</text>
+
+    <rect x="84" y="376" width="330" height="64" rx="8" fill="url(#tpd-agent)"/>
+    <text x="249" y="402" text-anchor="middle" font-size="13" font-weight="600" fill="#ffffff">pdns2.corp</text>
+    <text x="249" y="422" text-anchor="middle" font-size="11" fill="#fed7aa">secondary</text>
+  </g>
+
+  <!-- edge-bind group -->
+  <g>
+    <rect x="480" y="230" width="380" height="232" rx="12" fill="url(#tpd-surface)" stroke="#94a3b8" stroke-width="2"/>
+    <text x="502" y="258" font-size="14" font-weight="600" fill="#0f172a">DNSServerGroup “edge-bind”</text>
+    <text x="502" y="278" font-size="11" fill="#475569">driver = bind9</text>
+
+    <rect x="504" y="296" width="330" height="64" rx="8" fill="url(#tpd-agent)"/>
+    <text x="669" y="322" text-anchor="middle" font-size="13" font-weight="600" fill="#ffffff">bind1.edge</text>
+    <text x="669" y="342" text-anchor="middle" font-size="11" fill="#fed7aa">catalog consumer of internal-pdns</text>
+
+    <rect x="504" y="376" width="330" height="64" rx="8" fill="url(#tpd-agent)"/>
+    <text x="669" y="402" text-anchor="middle" font-size="13" font-weight="600" fill="#ffffff">bind2.edge</text>
+    <text x="669" y="422" text-anchor="middle" font-size="11" fill="#fed7aa">catalog consumer of internal-pdns</text>
+  </g>
+
+  <!-- Catalog-zone AXFR between the groups -->
+  <path d="M 250 462 V 500 H 670 V 464" stroke="#475569" stroke-width="2" stroke-dasharray="6 4" fill="none" marker-end="url(#tpd-arrow)"/>
+  <text x="460" y="522" text-anchor="middle" font-size="11" fill="#475569">catalog-zone-driven AXFR keeps both drivers in sync (NOTIFY → IXFR)</text>
+</svg>

@@ -24,22 +24,9 @@ plane** that is the single source of truth, plus a set of **data-plane
 service containers** (DNS and DHCP daemons) that the control plane
 deploys, configures, and runs.
 
-```
-Clients                Control plane                      Data plane
-┌──────────┐           ┌──────────────────────────┐      ┌─────────────────┐
-│ Browser  │──HTTP────▶│ frontend (nginx + SPA)   │      │ DNS agent       │
-│ (React)  │           ├──────────────────────────┤      │  └ BIND9 /      │
-├──────────┤           │ api (FastAPI/uvicorn)    │◀─────│    PowerDNS     │
-│ CLI /    │──REST────▶│   • REST + OpenAPI       │ long │ DHCP agent      │
-│ API /    │           │   • /api/v1/ai/mcp (MCP) │ poll │  └ Kea          │
-│ MCP      │           ├──────────────────────────┤      │ supervisor      │
-└──────────┘           │ worker (Celery)          │      │  (appliance)    │
-                       │ beat   (Celery schedule) │      └─────────────────┘
-                       ├──────────────────────────┤              ▲
-                       │ PostgreSQL 16  (truth)   │              │
-                       │ Redis 7  (broker + wake) │──────pub/sub──┘
-                       └──────────────────────────┘
-```
+<p align="center">
+  <img src="assets/diagrams/architecture-planes.svg" alt="SpatiumDDI control plane and data plane" width="900"/>
+</p>
 
 Three properties define the design and are enforced everywhere
 (see [`../CLAUDE.md`](../CLAUDE.md) "Absolute Non-Negotiables"):

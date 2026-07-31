@@ -1,0 +1,115 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="640" viewBox="0 0 920 640"
+     preserveAspectRatio="xMidYMid meet"
+     font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+  <title>Simulated DHCP client per-device state machine</title>
+  <desc>Each simulated device walks OFFLINE, DISCOVERING, ONLINE, RENEWING, REBINDING, DEPARTING and LEFT, driven by the diurnal arrival curve and the T1/T2 lease timers.</desc>
+  <defs>
+    <linearGradient id="perfs-surface" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#f1f5f9"/>
+      <stop offset="100%" stop-color="#e2e8f0"/>
+    </linearGradient>
+    <linearGradient id="perfs-control" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#8b5cf6"/>
+      <stop offset="100%" stop-color="#6d28d9"/>
+    </linearGradient>
+    <linearGradient id="perfs-worker" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#a78bfa"/>
+      <stop offset="100%" stop-color="#7c3aed"/>
+    </linearGradient>
+    <linearGradient id="perfs-store" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#34d399"/>
+      <stop offset="100%" stop-color="#059669"/>
+    </linearGradient>
+    <linearGradient id="perfs-agent" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#fb923c"/>
+      <stop offset="100%" stop-color="#ea580c"/>
+    </linearGradient>
+    <linearGradient id="perfs-accent" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#22d3ee"/>
+      <stop offset="100%" stop-color="#0891b2"/>
+    </linearGradient>
+    <marker id="perfs-arrow" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/>
+    </marker>
+  </defs>
+
+  <rect x="20" y="20" width="880" height="600" rx="16"
+        fill="url(#perfs-surface)" stroke="#94a3b8" stroke-width="2"/>
+  <text x="44" y="52" font-size="18" font-weight="600" fill="#0f172a">Simulated DHCP client — per-device state machine</text>
+  <text x="44" y="74" font-size="12" fill="#475569">250–300k independent FSMs in the asyncio orchestrator, driven by the diurnal curve</text>
+
+  <!-- entry -->
+  <text x="195" y="98" text-anchor="middle" font-size="12" fill="#475569">arrival (diurnal-scheduled)</text>
+  <circle cx="195" cy="110" r="5" fill="#64748b"/>
+  <path d="M 195 115 V 138" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#perfs-arrow)"/>
+
+  <!-- OFFLINE -->
+  <rect x="120" y="142" width="150" height="52" rx="12" fill="#64748b"/>
+  <text x="195" y="173" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">OFFLINE</text>
+
+  <path d="M 270 168 H 336" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#perfs-arrow)"/>
+  <text x="303" y="158" text-anchor="middle" font-size="11" fill="#475569">boot</text>
+
+  <!-- DISCOVERING -->
+  <rect x="340" y="142" width="170" height="52" rx="12" fill="url(#perfs-agent)"/>
+  <text x="425" y="173" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">DISCOVERING</text>
+
+  <path d="M 510 168 H 576" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#perfs-arrow)"/>
+  <text x="543" y="158" text-anchor="middle" font-size="11" fill="#475569">(DORA)</text>
+
+  <!-- ONLINE -->
+  <rect x="580" y="142" width="200" height="52" rx="12" fill="url(#perfs-store)"/>
+  <text x="680" y="165" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">ONLINE</text>
+  <text x="680" y="183" text-anchor="middle" font-size="11" fill="#a7f3d0">lease held</text>
+
+  <!-- ONLINE → RENEWING -->
+  <path d="M 640 194 V 270" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#perfs-arrow)"/>
+  <text x="652" y="236" font-size="11" fill="#475569">at T1 = 900s</text>
+
+  <!-- RENEWING -->
+  <rect x="580" y="274" width="200" height="52" rx="12" fill="url(#perfs-control)"/>
+  <text x="680" y="305" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">RENEWING</text>
+
+  <!-- RENEWING → REBINDING -->
+  <path d="M 640 326 V 404" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#perfs-arrow)"/>
+  <text x="652" y="356" font-size="11" fill="#475569">(T1 fails)</text>
+  <text x="652" y="374" font-size="11" fill="#475569">at T2 = 1800s</text>
+
+  <!-- REBINDING -->
+  <rect x="580" y="408" width="200" height="52" rx="12" fill="url(#perfs-worker)"/>
+  <text x="680" y="439" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">REBINDING</text>
+
+  <!-- ACK returns to ONLINE -->
+  <path d="M 780 300 H 820 V 180 H 784" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#perfs-arrow)"/>
+  <text x="826" y="250" font-size="11" fill="#475569">ACK</text>
+  <path d="M 780 434 H 862 V 160 H 784" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#perfs-arrow)"/>
+  <text x="868" y="340" font-size="11" fill="#475569">ACK</text>
+
+  <!-- REBINDING → DEPARTING -->
+  <path d="M 680 460 V 542" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#perfs-arrow)"/>
+  <text x="692" y="500" font-size="11" fill="#475569">(rebind fails / lapse)</text>
+
+  <!-- DEPARTING -->
+  <rect x="620" y="546" width="200" height="52" rx="12" fill="url(#perfs-accent)"/>
+  <text x="720" y="577" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">DEPARTING</text>
+
+  <!-- external departure event -->
+  <circle cx="872" cy="572" r="5" fill="#64748b"/>
+  <path d="M 867 572 H 826" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#perfs-arrow)"/>
+  <text x="896" y="534" text-anchor="end" font-size="11" fill="#475569">departure</text>
+  <text x="896" y="550" text-anchor="end" font-size="11" fill="#475569">(diurnal / dwell-time)</text>
+
+  <!-- DEPARTING → LEFT -->
+  <path d="M 620 572 H 484" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#perfs-arrow)"/>
+  <text x="552" y="562" text-anchor="middle" font-size="11" fill="#475569">release</text>
+
+  <!-- LEFT -->
+  <rect x="330" y="546" width="150" height="52" rx="12" fill="#64748b"/>
+  <text x="405" y="577" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">LEFT</text>
+
+  <!-- LEFT → OFFLINE -->
+  <path d="M 330 572 H 60 V 168 H 116" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#perfs-arrow)"/>
+  <text x="72" y="372" font-size="11" fill="#475569">re-arrival</text>
+</svg>

@@ -10,14 +10,9 @@ The IPAM module is the core of SpatiumDDI. It manages the hierarchy of IP space 
 
 ## 1. IP Hierarchy
 
-```
-IPSpace  (VRF / routing domain)
-  └── IPBlock  (aggregate/supernet, e.g., 10.0.0.0/8)
-        └── IPBlock  (nested, e.g., 10.1.0.0/16)
-              └── Subnet  (routable network, e.g., 10.1.2.0/24)  ← primary managed unit
-                    ├── IPAddress  (individual host IP)
-                    └── DHCPScope → DHCPPool(s)
-```
+<p align="center">
+  <img src="../assets/diagrams/ipam-containment.svg" alt="IP hierarchy — containment model" width="900"/>
+</p>
 
 ### IP Space
 - Represents a **VRF** or isolated routing domain (e.g., "Corporate", "Internet", "OOB")
@@ -41,18 +36,9 @@ IPSpace  (VRF / routing domain)
 
 Both IP blocks and subnets are displayed in a **tree view** in the UI, mirroring the network hierarchy.
 
-```
-Corporate (IPSpace)
-├── 10.0.0.0/8  [IPBlock — 42% used]
-│   ├── 10.0.0.0/16  [IPBlock — HQ]
-│   │   ├── 10.0.1.0/24  [Subnet — Servers VLAN 10]
-│   │   ├── 10.0.2.0/24  [Subnet — Workstations VLAN 20]
-│   │   └── 10.0.3.0/24  [Subnet — VoIP VLAN 30]
-│   └── 10.1.0.0/16  [IPBlock — Branch Office]
-│       └── 10.1.1.0/24  [Subnet — Branch LAN VLAN 100]
-└── 10.128.0.0/9  [IPBlock — DMZ]
-    └── 10.128.0.0/24  [Subnet — Public Services]
-```
+<p align="center">
+  <img src="../assets/diagrams/ipam-example-tree.svg" alt="IPAM tree — worked example" width="900"/>
+</p>
 
 ### Tree Features
 - Expand/collapse nodes
@@ -1083,17 +1069,9 @@ Search is implemented via PostgreSQL full-text search + `inet` operators, not a 
 
 The left-side IPAM menu expands into a unified tree view. There are no separate "IP Spaces" and "Subnets" pages — everything is a single hierarchical tree:
 
-```
-IPAM
-├── Corporate (IPSpace)
-│   ├── 10.0.0.0/8  [IPBlock]
-│   │   ├── 10.0.1.0/24  [Subnet — Servers VLAN 10]  ← click → IP list
-│   │   └── 10.0.2.0/24  [Subnet — Workstations]
-│   └── (free: 10.1.0.0/8 – 10.255.0.0/8)
-└── OOB (IPSpace)
-    └── 192.168.0.0/16  [IPBlock]
-        └── 192.168.1.0/24  [Subnet]
-```
+<p align="center">
+  <img src="../assets/diagrams/ipam-tree-ui.svg" alt="Combined IPAM tree navigator" width="900"/>
+</p>
 
 Clicking a subnet opens its IP address list panel on the right. The IP address list is **collapsible** — useful for large subnets (e.g., WiFi /16) where listing every IP is slow. A toggle "Show IP list" defaults based on subnet size (auto-collapse if > 1000 IPs).
 

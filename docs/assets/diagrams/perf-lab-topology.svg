@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="580" viewBox="0 0 920 580"
+     preserveAspectRatio="xMidYMid meet"
+     font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+  <title>Performance lab topology</title>
+  <desc>The spddi-perf controller and its worker generators run on separate load-gen boxes and drive a clean k3s appliance under test, with a read-only war-room poller alongside.</desc>
+  <defs>
+    <linearGradient id="perft-surface" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#f1f5f9"/>
+      <stop offset="100%" stop-color="#e2e8f0"/>
+    </linearGradient>
+    <linearGradient id="perft-control" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#8b5cf6"/>
+      <stop offset="100%" stop-color="#6d28d9"/>
+    </linearGradient>
+    <linearGradient id="perft-store" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#34d399"/>
+      <stop offset="100%" stop-color="#059669"/>
+    </linearGradient>
+    <linearGradient id="perft-agent" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#fb923c"/>
+      <stop offset="100%" stop-color="#ea580c"/>
+    </linearGradient>
+    <marker id="perft-arrow" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/>
+    </marker>
+  </defs>
+
+  <text x="36" y="48" font-size="18" font-weight="600" fill="#0f172a">Perf lab topology — runner architecture + the setpoint bus</text>
+  <text x="36" y="70" font-size="12" fill="#475569">Generators never run on the appliance — co-locating them contaminates every criterion</text>
+
+  <text x="40" y="100" font-size="13" font-weight="600" fill="#334155">load-gen boxes</text>
+  <text x="560" y="100" font-size="13" font-weight="600" fill="#334155">SUT — clean appliance</text>
+
+  <!-- ================= load-gen panel ================= -->
+  <rect x="36" y="112" width="400" height="446" rx="16"
+        fill="url(#perft-surface)" stroke="#94a3b8" stroke-width="2"/>
+
+  <rect x="52" y="140" width="368" height="50" rx="8" fill="url(#perft-control)"/>
+  <text x="68" y="162" font-size="14" font-weight="600" fill="#ffffff">spddi-perf CONTROLLER</text>
+  <text x="68" y="180" font-size="11" fill="#ddd6fe">lg-0 · owns the run lifecycle, no protocol I/O</text>
+
+  <rect x="68" y="200" width="336" height="32" rx="6" fill="#ffffff" stroke="#cbd5e1" stroke-width="1"/>
+  <text x="84" y="221" font-size="12" fill="#334155">Phase engine (diurnal)</text>
+
+  <rect x="68" y="240" width="336" height="32" rx="6" fill="#ffffff" stroke="#cbd5e1" stroke-width="1"/>
+  <text x="84" y="261" font-size="12" fill="#334155">Setpoint bus (rate targets)</text>
+
+  <rect x="68" y="280" width="336" height="32" rx="6" fill="#ffffff" stroke="#cbd5e1" stroke-width="1"/>
+  <text x="84" y="301" font-size="12" fill="#334155">Watchdog (health + abort)</text>
+
+  <rect x="68" y="320" width="336" height="32" rx="6" fill="#ffffff" stroke="#cbd5e1" stroke-width="1"/>
+  <text x="84" y="341" font-size="12" fill="#334155">Checkpointer (state / events)</text>
+
+  <rect x="68" y="360" width="336" height="32" rx="6" fill="#ffffff" stroke="#cbd5e1" stroke-width="1"/>
+  <text x="84" y="381" font-size="12" fill="#334155">Collector (artifacts)</text>
+
+  <text x="68" y="420" font-size="13" font-weight="600" fill="#334155">WORKERS</text>
+
+  <rect x="68" y="430" width="336" height="32" rx="6" fill="url(#perft-agent)"/>
+  <text x="84" y="451" font-size="12" fill="#ffffff">perfdhcp shards (lg-1)</text>
+
+  <rect x="68" y="470" width="336" height="32" rx="6" fill="url(#perft-agent)"/>
+  <text x="84" y="491" font-size="12" fill="#ffffff">dnsperf / flamethrower (lg-1)</text>
+
+  <rect x="68" y="510" width="336" height="32" rx="6" fill="url(#perft-agent)"/>
+  <text x="84" y="531" font-size="12" fill="#ffffff">orchestrator shards (lg-2)</text>
+
+  <!-- ================= link arrows ================= -->
+  <path d="M 440 240 H 552" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#perft-arrow)"/>
+  <text x="496" y="230" text-anchor="middle" font-size="11" fill="#475569">L2 / relay</text>
+
+  <path d="M 440 300 H 552" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#perft-arrow)"/>
+  <text x="496" y="290" text-anchor="middle" font-size="11" fill="#475569">API</text>
+
+  <!-- ================= SUT panel ================= -->
+  <rect x="556" y="112" width="344" height="240" rx="16"
+        fill="url(#perft-surface)" stroke="#94a3b8" stroke-width="2"/>
+  <text x="572" y="140" font-size="14" font-weight="600" fill="#0f172a">k3s AIO node IP</text>
+
+  <rect x="572" y="152" width="312" height="40" rx="8" fill="url(#perft-agent)"/>
+  <text x="588" y="177" font-size="12" fill="#ffffff">:67 kea (hostNetwork)</text>
+
+  <rect x="572" y="200" width="312" height="40" rx="8" fill="url(#perft-agent)"/>
+  <text x="588" y="225" font-size="12" fill="#ffffff">:53 bind9 (hostNetwork)</text>
+
+  <rect x="572" y="248" width="312" height="40" rx="8" fill="url(#perft-control)"/>
+  <text x="588" y="273" font-size="12" fill="#ffffff">:443 frontend → api</text>
+
+  <rect x="572" y="296" width="312" height="40" rx="8" fill="url(#perft-store)"/>
+  <text x="588" y="321" font-size="12" fill="#ffffff">CNPG 1 / Redis 1 / worker 1</text>
+
+  <!-- ================= war-room poller ================= -->
+  <path d="M 728 400 V 358" stroke="#64748b" stroke-width="1.5" stroke-dasharray="5 4"
+        fill="none" marker-end="url(#perft-arrow)"/>
+  <rect x="556" y="400" width="344" height="100" rx="12"
+        fill="#ffffff" stroke="#cbd5e1" stroke-dasharray="4 4" stroke-width="1.5"/>
+  <text x="572" y="428" font-size="13" font-weight="600" fill="#334155">WAR-ROOM POLLER — lg-0, read-only</text>
+  <text x="572" y="452" font-size="11" fill="#475569">/health/platform · /admin/* · /metrics/*</text>
+  <text x="572" y="472" font-size="11" fill="#475569">+ direct psql for pg_locks / deadlocks</text>
+</svg>

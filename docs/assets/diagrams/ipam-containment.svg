@@ -1,0 +1,100 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="528" viewBox="0 0 920 528"
+     preserveAspectRatio="xMidYMid meet"
+     font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+  <title>IPAM hierarchy — containment model</title>
+  <desc>An IPSpace contains IPBlocks, which nest inside one another and contain Subnets; a Subnet is the primary managed unit and holds individual IPAddresses plus a DHCPScope with its pools.</desc>
+
+  <defs>
+    <linearGradient id="ipamc-surface" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#f1f5f9"/>
+      <stop offset="100%" stop-color="#e2e8f0"/>
+    </linearGradient>
+    <linearGradient id="ipamc-space" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#8b5cf6"/>
+      <stop offset="100%" stop-color="#6d28d9"/>
+    </linearGradient>
+    <linearGradient id="ipamc-block" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#a78bfa"/>
+      <stop offset="100%" stop-color="#7c3aed"/>
+    </linearGradient>
+    <linearGradient id="ipamc-subnet" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#22d3ee"/>
+      <stop offset="100%" stop-color="#0891b2"/>
+    </linearGradient>
+    <linearGradient id="ipamc-addr" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#34d399"/>
+      <stop offset="100%" stop-color="#059669"/>
+    </linearGradient>
+    <linearGradient id="ipamc-dhcp" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#fb923c"/>
+      <stop offset="100%" stop-color="#ea580c"/>
+    </linearGradient>
+    <marker id="ipamc-arrow" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/>
+    </marker>
+  </defs>
+
+  <text x="32" y="36" font-size="18" font-weight="600" fill="#0f172a">IP hierarchy — containment model</text>
+  <text x="32" y="58" font-size="12" fill="#475569">Each level contains the one below it; a subnet is the primary unit of management and the only level IP addresses attach to.</text>
+
+  <rect x="32" y="72" width="856" height="420" rx="16" fill="url(#ipamc-surface)" stroke="#94a3b8" stroke-width="1.5"/>
+
+  <!-- connectors -->
+  <g stroke="#cbd5e1" stroke-width="1.5" fill="none" stroke-linecap="round">
+    <path d="M 76 140 V 180"/>
+    <path d="M 76 180 H 100"/>
+    <path d="M 120 204 V 244"/>
+    <path d="M 120 244 H 144"/>
+    <path d="M 164 268 V 308"/>
+    <path d="M 164 308 H 188"/>
+    <path d="M 208 332 V 436"/>
+    <path d="M 208 372 H 232"/>
+    <path d="M 208 436 H 232"/>
+  </g>
+
+  <!-- IPSpace -->
+  <rect x="56" y="92" width="280" height="48" rx="8" fill="url(#ipamc-space)"/>
+  <text x="70" y="113" font-size="14" font-weight="600" fill="#ffffff">IPSpace</text>
+  <text x="70" y="129" font-size="11" fill="#ddd6fe">VRF / routing domain</text>
+
+  <!-- IPBlock (aggregate) -->
+  <rect x="100" y="156" width="280" height="48" rx="8" fill="url(#ipamc-block)"/>
+  <text x="114" y="177" font-size="14" font-weight="600" fill="#ffffff">IPBlock</text>
+  <text x="114" y="193" font-size="11" fill="#ddd6fe">aggregate / supernet</text>
+  <rect x="274" y="164" width="92" height="24" rx="6" fill="#ffffff" fill-opacity="0.18"/>
+  <text x="320" y="181" text-anchor="middle" font-size="12" font-weight="600" fill="#ffffff"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace">10.0.0.0/8</text>
+
+  <!-- IPBlock (nested) -->
+  <rect x="144" y="220" width="280" height="48" rx="8" fill="url(#ipamc-block)"/>
+  <text x="158" y="241" font-size="14" font-weight="600" fill="#ffffff">IPBlock</text>
+  <text x="158" y="257" font-size="11" fill="#ddd6fe">nested inside the /8</text>
+  <rect x="310" y="228" width="100" height="24" rx="6" fill="#ffffff" fill-opacity="0.18"/>
+  <text x="360" y="245" text-anchor="middle" font-size="12" font-weight="600" fill="#ffffff"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace">10.1.0.0/16</text>
+
+  <!-- Subnet -->
+  <rect x="188" y="284" width="280" height="48" rx="8" fill="url(#ipamc-subnet)" stroke="#0e7490" stroke-width="2"/>
+  <text x="202" y="305" font-size="14" font-weight="600" fill="#ffffff">Subnet</text>
+  <text x="202" y="321" font-size="11" fill="#cffafe">routable network</text>
+  <rect x="354" y="292" width="100" height="24" rx="6" fill="#ffffff" fill-opacity="0.22"/>
+  <text x="404" y="309" text-anchor="middle" font-size="12" font-weight="600" fill="#ffffff"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace">10.1.2.0/24</text>
+
+  <path d="M 560 308 H 478" stroke="#0e7490" stroke-width="2" fill="none" marker-end="url(#ipamc-arrow)"/>
+  <text x="570" y="312" font-size="12" font-weight="600" fill="#0e7490">primary managed unit</text>
+
+  <!-- IPAddress -->
+  <rect x="232" y="348" width="280" height="48" rx="8" fill="url(#ipamc-addr)"/>
+  <text x="246" y="369" font-size="14" font-weight="600" fill="#ffffff">IPAddress</text>
+  <text x="246" y="385" font-size="11" fill="#a7f3d0">individual host IP</text>
+
+  <!-- DHCPScope -> DHCPPool(s) -->
+  <rect x="232" y="414" width="150" height="44" rx="8" fill="url(#ipamc-dhcp)"/>
+  <text x="307" y="441" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">DHCPScope</text>
+  <path d="M 390 436 H 414" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#ipamc-arrow)"/>
+  <rect x="422" y="414" width="150" height="44" rx="8" fill="url(#ipamc-dhcp)"/>
+  <text x="497" y="441" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">DHCPPool(s)</text>
+</svg>

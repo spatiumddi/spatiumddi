@@ -30,7 +30,7 @@
   </defs>
 
   <!-- Operators / agents -->
-  <rect x="360" y="16" width="200" height="42" rx="21" fill="#1e293b"/>
+  <rect x="339" y="16" width="242" height="42" rx="21" fill="#1e293b"/>
   <text x="460" y="42" text-anchor="middle" font-size="13" font-weight="600" fill="#ffffff">operators / DNS · DHCP agents</text>
 
   <!-- MetalLB control-plane VIP -->

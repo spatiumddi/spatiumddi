@@ -1,0 +1,85 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="670" viewBox="0 0 920 670"
+     preserveAspectRatio="xMidYMid meet"
+     font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+  <title>DNS agent bootstrap handshake</title>
+  <desc>A fresh DNS container exchanges its pre-shared DNS_AGENT_KEY for a rotating JWT at the control plane, persists the token to disk, and then heartbeats every 30 seconds with a bearer token.</desc>
+  <defs>
+    <linearGradient id="dnsb-agent" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#fb923c"/>
+      <stop offset="100%" stop-color="#ea580c"/>
+    </linearGradient>
+    <linearGradient id="dnsb-cp" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#8b5cf6"/>
+      <stop offset="100%" stop-color="#6d28d9"/>
+    </linearGradient>
+    <linearGradient id="dnsb-surface" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#f1f5f9"/>
+      <stop offset="100%" stop-color="#e2e8f0"/>
+    </linearGradient>
+    <marker id="dnsb-arrow" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/>
+    </marker>
+  </defs>
+
+  <text x="460" y="38" text-anchor="middle" font-size="18" font-weight="600" fill="#0f172a">DNS agent bootstrap — PSK exchanged for a rotating JWT</text>
+
+  <!-- Lifelines -->
+  <line x1="210" y1="120" x2="210" y2="636" stroke="#cbd5e1" stroke-width="2" stroke-dasharray="4 4"/>
+  <line x1="710" y1="120" x2="710" y2="636" stroke="#cbd5e1" stroke-width="2" stroke-dasharray="4 4"/>
+
+  <!-- Actors -->
+  <g>
+    <rect x="100" y="64" width="220" height="56" rx="8" fill="url(#dnsb-agent)"/>
+    <text x="210" y="90" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">DNS container</text>
+    <text x="210" y="110" text-anchor="middle" font-size="11" fill="#fed7aa">fresh boot</text>
+  </g>
+  <g>
+    <rect x="600" y="64" width="220" height="56" rx="8" fill="url(#dnsb-cp)"/>
+    <text x="710" y="90" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">Control plane</text>
+    <text x="710" y="110" text-anchor="middle" font-size="11" fill="#ddd6fe">FastAPI</text>
+  </g>
+
+  <!-- 1. Read env -->
+  <g>
+    <rect x="48" y="146" width="330" height="76" rx="8" fill="url(#dnsb-surface)" stroke="#94a3b8" stroke-width="1.5"/>
+    <text x="66" y="170" font-size="12" font-weight="600" fill="#0f172a">1 · Read env</text>
+    <text x="66" y="190" font-size="11" fill="#475569">CONTROL_PLANE_URL · DNS_AGENT_KEY</text>
+    <text x="66" y="208" font-size="11" fill="#475569">AGENT_ID — persisted in /var/lib</text>
+  </g>
+
+  <!-- 2. Bootstrap register -->
+  <text x="460" y="246" text-anchor="middle" font-size="12" font-weight="600" fill="#334155">2 · POST /dns/agents/register</text>
+  <text x="460" y="266" text-anchor="middle" font-size="11" fill="#475569">header  X-DNS-Agent-Key: &lt;bootstrap PSK&gt;</text>
+  <text x="460" y="284" text-anchor="middle" font-size="11" fill="#475569">body  {hostname, driver, roles, version, group_name, fingerprint}</text>
+  <path d="M 212 298 H 708" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#dnsb-arrow)"/>
+  <text x="460" y="316" text-anchor="middle" font-size="11" font-style="italic" fill="#64748b">sent only when no cached agent_token.jwt exists</text>
+
+  <!-- 3. Validate + mint -->
+  <g>
+    <rect x="560" y="336" width="330" height="114" rx="8" fill="url(#dnsb-surface)" stroke="#94a3b8" stroke-width="1.5"/>
+    <text x="578" y="360" font-size="12" font-weight="600" fill="#0f172a">3 · Validate PSK</text>
+    <text x="578" y="380" font-size="11" fill="#475569">create / update DNSServer row</text>
+    <text x="578" y="398" font-size="11" fill="#475569">pending_approval = true if</text>
+    <text x="578" y="416" font-size="11" fill="#475569">settings.require_agent_approval</text>
+    <text x="578" y="434" font-size="11" fill="#475569">mint agent_token (JWT, 24 h)</text>
+  </g>
+
+  <!-- Response -->
+  <text x="460" y="472" text-anchor="middle" font-size="12" font-weight="600" fill="#334155">200 {server_id, agent_token, config_etag, …}</text>
+  <path d="M 708 486 H 212" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#dnsb-arrow)"/>
+
+  <!-- 4. Persist token -->
+  <g>
+    <rect x="48" y="510" width="330" height="76" rx="8" fill="url(#dnsb-surface)" stroke="#94a3b8" stroke-width="1.5"/>
+    <text x="66" y="534" font-size="12" font-weight="600" fill="#0f172a">4 · Persist token</text>
+    <text x="66" y="554" font-size="11" fill="#475569">/var/lib/spatium-dns-agent/agent_token.jwt</text>
+    <text x="66" y="572" font-size="11" fill="#475569">mode 0600, owned by the agent user</text>
+  </g>
+
+  <!-- 5. Steady state -->
+  <text x="460" y="616" text-anchor="middle" font-size="12" font-weight="600" fill="#334155">5 · Heartbeat every 30 s — Authorization: Bearer &lt;agent_token&gt;</text>
+  <path d="M 212 630 H 708" stroke="#64748b" stroke-width="2" stroke-dasharray="6 4" fill="none" marker-end="url(#dnsb-arrow)"/>
+  <text x="460" y="650" text-anchor="middle" font-size="11" font-style="italic" fill="#64748b">token rotated on the 12 h rotation window via the heartbeat response</text>
+</svg>

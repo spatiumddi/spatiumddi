@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="470" viewBox="0 0 920 470"
+     preserveAspectRatio="xMidYMid meet"
+     font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+  <title>SpatiumDDI login flow</title>
+  <desc>A browser posts to /auth/login, which branches into local password, LDAP/RADIUS/TACACS+ and OIDC/SAML redirect paths that all converge on sync_external_user before access and refresh tokens return to the browser.</desc>
+  <defs>
+    <linearGradient id="auth-surface" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#f1f5f9"/>
+      <stop offset="100%" stop-color="#e2e8f0"/>
+    </linearGradient>
+    <linearGradient id="auth-cp" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#8b5cf6"/>
+      <stop offset="100%" stop-color="#6d28d9"/>
+    </linearGradient>
+    <linearGradient id="auth-worker" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#a78bfa"/>
+      <stop offset="100%" stop-color="#7c3aed"/>
+    </linearGradient>
+    <marker id="auth-arrow" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/>
+    </marker>
+  </defs>
+
+  <text x="40" y="42" font-size="18" font-weight="600" fill="#0f172a">Login flow</text>
+  <text x="40" y="64" font-size="12" fill="#475569">One entry point, three authentication paths, one unified identity sync.</text>
+
+  <!-- Browser -->
+  <rect x="40" y="112" width="160" height="88" rx="8" fill="#1e293b"/>
+  <text x="120" y="162" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">browser</text>
+
+  <!-- /auth/login panel -->
+  <rect x="340" y="88" width="290" height="200" rx="12"
+        fill="url(#auth-surface)" stroke="#94a3b8" stroke-width="2"/>
+  <text x="360" y="115" font-size="14" font-weight="600" fill="#0f172a">/auth/login</text>
+
+  <rect x="360" y="126" width="250" height="44" rx="8" fill="url(#auth-cp)"/>
+  <text x="485" y="153" text-anchor="middle" font-size="12" font-weight="600" fill="#ffffff">local password</text>
+
+  <rect x="360" y="178" width="250" height="44" rx="8" fill="url(#auth-cp)"/>
+  <text x="485" y="205" text-anchor="middle" font-size="12" font-weight="600" fill="#ffffff">LDAP / RADIUS / TACACS+</text>
+
+  <rect x="360" y="230" width="250" height="44" rx="8" fill="url(#auth-worker)"/>
+  <text x="485" y="257" text-anchor="middle" font-size="12" font-weight="600" fill="#ffffff">OIDC / SAML: 302</text>
+
+  <!-- Handlers -->
+  <rect x="670" y="126" width="210" height="44" rx="8" fill="#ffffff" stroke="#cbd5e1" stroke-width="2"/>
+  <text x="775" y="153" text-anchor="middle" font-size="12" font-weight="600" fill="#334155">verify_password</text>
+
+  <rect x="670" y="178" width="210" height="44" rx="8" fill="#ffffff" stroke="#cbd5e1" stroke-width="2"/>
+  <text x="775" y="205" text-anchor="middle" font-size="12" font-weight="600" fill="#334155">authenticate_*</text>
+
+  <rect x="670" y="230" width="210" height="44" rx="8" fill="#ffffff" stroke="#cbd5e1" stroke-width="2"/>
+  <text x="775" y="257" text-anchor="middle" font-size="12" font-weight="600" fill="#334155">redirect to IdP</text>
+
+  <path d="M 610 148 H 668" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#auth-arrow)"/>
+  <path d="M 610 200 H 668" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#auth-arrow)"/>
+  <path d="M 610 252 H 668" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#auth-arrow)"/>
+
+  <!-- Browser to login and back -->
+  <path d="M 200 146 H 338" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#auth-arrow)"/>
+  <text x="270" y="138" text-anchor="middle" font-size="11" fill="#475569">1. login</text>
+
+  <path d="M 340 196 H 202" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#auth-arrow)"/>
+  <text x="270" y="188" text-anchor="middle" font-size="11" fill="#475569">2. access + refresh</text>
+
+  <!-- Converge on sync_external_user -->
+  <path d="M 485 288 V 328" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#auth-arrow)"/>
+
+  <rect x="310" y="330" width="350" height="112" rx="8" fill="url(#auth-worker)"/>
+  <text x="485" y="358" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">sync_external_user</text>
+  <path d="M 326 376 l 8 4 l -8 4 z" fill="#ddd6fe"/>
+  <text x="342" y="384" font-size="11" fill="#ddd6fe">upsert User</text>
+  <path d="M 326 396 l 8 4 l -8 4 z" fill="#ddd6fe"/>
+  <text x="342" y="404" font-size="11" fill="#ddd6fe">replace group membership</text>
+  <path d="M 326 416 l 8 4 l -8 4 z" fill="#fecaca"/>
+  <text x="342" y="424" font-size="11" fill="#fecaca">reject if no mapping match</text>
+</svg>

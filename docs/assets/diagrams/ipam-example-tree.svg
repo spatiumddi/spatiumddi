@@ -1,0 +1,135 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="588" viewBox="0 0 920 588"
+     preserveAspectRatio="xMidYMid meet"
+     font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+  <title>IPAM block and subnet tree — worked example</title>
+  <desc>The Corporate IP space holds a 10.0.0.0/8 block at 42 percent utilization, which nests HQ and Branch Office /16 blocks with their VLAN-tagged subnets, alongside a separate 10.128.0.0/9 DMZ block.</desc>
+
+  <defs>
+    <linearGradient id="ipame-surface" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#f1f5f9"/>
+      <stop offset="100%" stop-color="#e2e8f0"/>
+    </linearGradient>
+  </defs>
+
+  <text x="32" y="36" font-size="18" font-weight="600" fill="#0f172a">IPAM tree — worked example</text>
+  <text x="32" y="58" font-size="12" fill="#475569">Blocks nest inside blocks; subnets are the leaves. Blocks carry a rolled-up utilization bar, subnets carry their VLAN.</text>
+
+  <rect x="32" y="72" width="856" height="480" rx="16" fill="url(#ipame-surface)" stroke="#94a3b8" stroke-width="1.5"/>
+
+  <!-- connectors -->
+  <g stroke="#cbd5e1" stroke-width="1.5" fill="none" stroke-linecap="round">
+    <path d="M 68 127 V 432"/>
+    <path d="M 68 152 H 88"/>
+    <path d="M 68 432 H 88"/>
+    <path d="M 104 167 V 352"/>
+    <path d="M 104 192 H 124"/>
+    <path d="M 104 352 H 124"/>
+    <path d="M 140 207 V 312"/>
+    <path d="M 140 232 H 160"/>
+    <path d="M 140 272 H 160"/>
+    <path d="M 140 312 H 160"/>
+    <path d="M 140 367 V 392"/>
+    <path d="M 140 392 H 160"/>
+    <path d="M 104 447 V 472"/>
+    <path d="M 104 472 H 124"/>
+  </g>
+
+  <!-- Corporate (IPSpace) -->
+  <rect x="52" y="97" width="208" height="30" rx="8" fill="#1e293b"/>
+  <text x="64" y="116" font-size="13" font-weight="600" fill="#ffffff">Corporate</text>
+  <rect x="180" y="103" width="68" height="18" rx="9" fill="#ffffff" fill-opacity="0.2"/>
+  <text x="214" y="116" text-anchor="middle" font-size="11" font-weight="600" fill="#ffffff">IPSpace</text>
+
+  <!-- 10.0.0.0/8 -->
+  <rect x="88" y="137" width="404" height="30" rx="8" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+  <text x="100" y="156" font-size="13" font-weight="600" fill="#0f172a"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace">10.0.0.0/8</text>
+  <rect x="216" y="143" width="68" height="18" rx="9" fill="#ede9fe"/>
+  <text x="250" y="156" text-anchor="middle" font-size="11" font-weight="600" fill="#6d28d9">IPBlock</text>
+  <rect x="296" y="148" width="110" height="8" rx="4" fill="#e2e8f0"/>
+  <rect x="296" y="148" width="46" height="8" rx="4" fill="#10b981"/>
+  <text x="418" y="156" font-size="11" font-weight="600" fill="#334155">42% used</text>
+
+  <!-- 10.0.0.0/16 — HQ -->
+  <rect x="124" y="177" width="260" height="30" rx="8" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+  <text x="136" y="196" font-size="13" font-weight="600" fill="#0f172a"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace">10.0.0.0/16</text>
+  <rect x="252" y="183" width="68" height="18" rx="9" fill="#ede9fe"/>
+  <text x="286" y="196" text-anchor="middle" font-size="11" font-weight="600" fill="#6d28d9">IPBlock</text>
+  <text x="332" y="196" font-size="11" fill="#475569">HQ</text>
+
+  <!-- 10.0.1.0/24 — Servers -->
+  <rect x="160" y="217" width="404" height="30" rx="8" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+  <text x="172" y="236" font-size="13" font-weight="600" fill="#0f172a"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace">10.0.1.0/24</text>
+  <rect x="288" y="223" width="68" height="18" rx="9" fill="#cffafe"/>
+  <text x="322" y="236" text-anchor="middle" font-size="11" font-weight="600" fill="#0e7490">Subnet</text>
+  <text x="368" y="236" font-size="11" fill="#475569">Servers</text>
+  <rect x="476" y="223" width="76" height="18" rx="9" fill="#f1f5f9" stroke="#cbd5e1" stroke-width="1"/>
+  <text x="514" y="236" text-anchor="middle" font-size="11" font-weight="600" fill="#475569">VLAN 10</text>
+
+  <!-- 10.0.2.0/24 — Workstations -->
+  <rect x="160" y="257" width="404" height="30" rx="8" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+  <text x="172" y="276" font-size="13" font-weight="600" fill="#0f172a"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace">10.0.2.0/24</text>
+  <rect x="288" y="263" width="68" height="18" rx="9" fill="#cffafe"/>
+  <text x="322" y="276" text-anchor="middle" font-size="11" font-weight="600" fill="#0e7490">Subnet</text>
+  <text x="368" y="276" font-size="11" fill="#475569">Workstations</text>
+  <rect x="476" y="263" width="76" height="18" rx="9" fill="#f1f5f9" stroke="#cbd5e1" stroke-width="1"/>
+  <text x="514" y="276" text-anchor="middle" font-size="11" font-weight="600" fill="#475569">VLAN 20</text>
+
+  <!-- 10.0.3.0/24 — VoIP -->
+  <rect x="160" y="297" width="404" height="30" rx="8" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+  <text x="172" y="316" font-size="13" font-weight="600" fill="#0f172a"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace">10.0.3.0/24</text>
+  <rect x="288" y="303" width="68" height="18" rx="9" fill="#cffafe"/>
+  <text x="322" y="316" text-anchor="middle" font-size="11" font-weight="600" fill="#0e7490">Subnet</text>
+  <text x="368" y="316" font-size="11" fill="#475569">VoIP</text>
+  <rect x="476" y="303" width="76" height="18" rx="9" fill="#f1f5f9" stroke="#cbd5e1" stroke-width="1"/>
+  <text x="514" y="316" text-anchor="middle" font-size="11" font-weight="600" fill="#475569">VLAN 30</text>
+
+  <!-- 10.1.0.0/16 — Branch Office -->
+  <rect x="124" y="337" width="296" height="30" rx="8" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+  <text x="136" y="356" font-size="13" font-weight="600" fill="#0f172a"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace">10.1.0.0/16</text>
+  <rect x="252" y="343" width="68" height="18" rx="9" fill="#ede9fe"/>
+  <text x="286" y="356" text-anchor="middle" font-size="11" font-weight="600" fill="#6d28d9">IPBlock</text>
+  <text x="332" y="356" font-size="11" fill="#475569">Branch Office</text>
+
+  <!-- 10.1.1.0/24 — Branch LAN -->
+  <rect x="160" y="377" width="404" height="30" rx="8" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+  <text x="172" y="396" font-size="13" font-weight="600" fill="#0f172a"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace">10.1.1.0/24</text>
+  <rect x="288" y="383" width="68" height="18" rx="9" fill="#cffafe"/>
+  <text x="322" y="396" text-anchor="middle" font-size="11" font-weight="600" fill="#0e7490">Subnet</text>
+  <text x="368" y="396" font-size="11" fill="#475569">Branch LAN</text>
+  <rect x="476" y="383" width="76" height="18" rx="9" fill="#f1f5f9" stroke="#cbd5e1" stroke-width="1"/>
+  <text x="514" y="396" text-anchor="middle" font-size="11" font-weight="600" fill="#475569">VLAN 100</text>
+
+  <!-- 10.128.0.0/9 — DMZ -->
+  <rect x="88" y="417" width="256" height="30" rx="8" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+  <text x="100" y="436" font-size="13" font-weight="600" fill="#0f172a"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace">10.128.0.0/9</text>
+  <rect x="216" y="423" width="68" height="18" rx="9" fill="#ede9fe"/>
+  <text x="250" y="436" text-anchor="middle" font-size="11" font-weight="600" fill="#6d28d9">IPBlock</text>
+  <text x="296" y="436" font-size="11" fill="#475569">DMZ</text>
+
+  <!-- 10.128.0.0/24 — Public Services -->
+  <rect x="124" y="457" width="304" height="30" rx="8" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+  <text x="136" y="476" font-size="13" font-weight="600" fill="#0f172a"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace">10.128.0.0/24</text>
+  <rect x="252" y="463" width="68" height="18" rx="9" fill="#cffafe"/>
+  <text x="286" y="476" text-anchor="middle" font-size="11" font-weight="600" fill="#0e7490">Subnet</text>
+  <text x="332" y="476" font-size="11" fill="#475569">Public Services</text>
+
+  <!-- legend -->
+  <path d="M 52 508 H 868" stroke="#cbd5e1" stroke-width="1.5"/>
+  <text x="52" y="532" font-size="11" fill="#475569">Utilization bar colour:</text>
+  <rect x="184" y="524" width="18" height="8" rx="4" fill="#10b981"/>
+  <text x="210" y="532" font-size="11" fill="#475569">&lt; 70%</text>
+  <rect x="262" y="524" width="18" height="8" rx="4" fill="#f59e0b"/>
+  <text x="288" y="532" font-size="11" fill="#475569">70–90%</text>
+  <rect x="352" y="524" width="18" height="8" rx="4" fill="#ef4444"/>
+  <text x="378" y="532" font-size="11" fill="#475569">&gt; 90%</text>
+</svg>

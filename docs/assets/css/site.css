@@ -681,6 +681,28 @@ a.card:hover {
   height: auto;
 }
 
+/* Architecture diagrams are authored on a light surface. Left bare on the
+   dark theme they read as a bright slab dropped into the page, so give them
+   a rounded plate that matches the code-block and figure treatment. Scoped
+   to .svg because screenshots (PNG) carry their own chrome already. */
+.doc-body img[src$=".svg"] {
+  display: block;
+  margin: 1.25em auto;
+  border-radius: 12px;
+}
+:root[data-theme="dark"] .doc-body img[src$=".svg"] {
+  background: #f8fafc;
+  padding: 12px;
+  border: 1px solid var(--border);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .doc-body img[src$=".svg"] {
+    background: #f8fafc;
+    padding: 12px;
+    border: 1px solid var(--border);
+  }
+}
+
 .doc-body pre {
   background: var(--bg-code);
   border: 1px solid var(--border);

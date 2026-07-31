@@ -26,23 +26,9 @@ SpatiumDDI's auth stack has three layers:
    role with a matching permission entry. See [PERMISSIONS.md](../PERMISSIONS.md)
    for the grammar.
 
-```
-┌────────────┐  1. login          ┌──────────────────────┐
-│  browser   │──────────────────▶ │   /auth/login        │
-└────────────┘                    │                      │
-      ▲                           │  local password ──▶  │  verify_password
-      │                           │  LDAP / RADIUS /     │──▶ authenticate_*
-      │                           │    TACACS+           │
-      │ 2. access + refresh       │                      │
-      └───────────────────────────│  OIDC / SAML: 302    │──▶ redirect to IdP
-                                   └──────────────────────┘
-                                            │
-                                            ▼
-                                   sync_external_user
-                                   → upsert User
-                                   → replace group membership
-                                   → reject if no mapping match
-```
+<p align="center">
+  <img src="../assets/diagrams/auth-login-flow.svg" alt="Login flow — three authentication paths, one identity sync" width="900"/>
+</p>
 
 ## Local auth
 

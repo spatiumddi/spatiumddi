@@ -346,17 +346,9 @@ SpatiumDDI ships two authoritative DNS drivers: BIND9 (default) and PowerDNS. Ea
 
 **Shape A — PowerDNS-primary + BIND-secondary on the same zones.** PowerDNS handles writes (online DNSSEC signing, ALIAS records, LUA records); BIND fans the zones out to a battle-tested edge. Catalog-zone-driven AXFR keeps both drivers in sync because the producer-side catalog renderer emits identical wire bytes from either driver (issue #127 Phase 3d).
 
-```
-Operators ─→ SpatiumDDI control plane
-                │
-                ├── DNSServerGroup "internal-pdns" (driver=powerdns)
-                │     ├── pdns1.corp  (primary, signs DNSSEC)
-                │     └── pdns2.corp  (secondary)
-                │
-                └── DNSServerGroup "edge-bind"  (driver=bind9)
-                      ├── bind1.edge  (catalog consumer of internal-pdns)
-                      └── bind2.edge  (catalog consumer of internal-pdns)
-```
+<p align="center">
+  <img src="../assets/diagrams/topology-powerdns-group.svg" alt="PowerDNS and BIND9 server groups under one control plane" width="900"/>
+</p>
 
 Wire it up:
 

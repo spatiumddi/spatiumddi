@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="490" viewBox="0 0 920 490"
+     preserveAspectRatio="xMidYMid meet"
+     font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+  <title>DHCP server host internals</title>
+  <desc>Inside the DHCP server host a SpatiumDDI agent keeps a local config cache on disk, applies config to the Kea or ISC daemon, and pulls config from and pushes lease events to the SpatiumDDI control plane API.</desc>
+  <defs>
+    <linearGradient id="dhcph-surface" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#f1f5f9"/>
+      <stop offset="100%" stop-color="#e2e8f0"/>
+    </linearGradient>
+    <linearGradient id="dhcph-agentbox" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#fb923c"/>
+      <stop offset="100%" stop-color="#ea580c"/>
+    </linearGradient>
+    <linearGradient id="dhcph-accent" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#22d3ee"/>
+      <stop offset="100%" stop-color="#0891b2"/>
+    </linearGradient>
+    <linearGradient id="dhcph-cp" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#8b5cf6"/>
+      <stop offset="100%" stop-color="#6d28d9"/>
+    </linearGradient>
+    <marker id="dhcph-arrow" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/>
+    </marker>
+  </defs>
+
+  <text x="40" y="42" font-size="18" font-weight="600" fill="#0f172a">DHCP agent host internals</text>
+  <text x="40" y="64" font-size="12" fill="#475569">The agent caches the last-known-good config on local disk and keeps serving when the control plane is unreachable.</text>
+
+  <!-- Host boundary -->
+  <rect x="140" y="92" width="640" height="232" rx="16"
+        fill="url(#dhcph-surface)" stroke="#94a3b8" stroke-width="2"/>
+  <text x="170" y="124" font-size="15" font-weight="600" fill="#0f172a">DHCP Server Host / Container</text>
+
+  <!-- DHCP daemon -->
+  <rect x="170" y="160" width="190" height="76" rx="8" fill="url(#dhcph-agentbox)"/>
+  <text x="265" y="190" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">DHCP daemon</text>
+  <text x="265" y="212" text-anchor="middle" font-size="11" fill="#fed7aa">Kea / ISC</text>
+
+  <!-- Agent -->
+  <rect x="460" y="146" width="290" height="156" rx="12" fill="#475569"/>
+  <text x="605" y="176" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">SpatiumDDI Agent</text>
+  <text x="605" y="196" text-anchor="middle" font-size="11" fill="#cbd5e1">polls /config every 30s</text>
+
+  <rect x="486" y="212" width="238" height="72" rx="8" fill="url(#dhcph-accent)"/>
+  <text x="605" y="242" text-anchor="middle" font-size="13" font-weight="600" fill="#ffffff">config cache</text>
+  <text x="605" y="262" text-anchor="middle" font-size="11" fill="#cffafe">local disk</text>
+
+  <!-- Agent applies config to the daemon -->
+  <path d="M 458 198 H 364" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#dhcph-arrow)"/>
+  <text x="411" y="186" text-anchor="middle" font-size="11" fill="#475569">apply config</text>
+
+  <!-- Agent to control plane -->
+  <path d="M 605 304 V 384" stroke="#64748b" stroke-width="2" fill="none"
+        marker-start="url(#dhcph-arrow)" marker-end="url(#dhcph-arrow)"/>
+  <text x="619" y="336" font-size="11" fill="#475569">pull / push</text>
+  <text x="619" y="354" font-size="11" fill="#475569">config in, lease events out</text>
+
+  <!-- Control plane -->
+  <rect x="485" y="386" width="240" height="76" rx="8" fill="url(#dhcph-cp)"/>
+  <text x="605" y="416" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">SpatiumDDI API</text>
+  <text x="605" y="438" text-anchor="middle" font-size="11" fill="#ddd6fe">control plane</text>
+</svg>

@@ -1,0 +1,98 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="520" viewBox="0 0 920 520"
+     preserveAspectRatio="xMidYMid meet"
+     font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+  <title>DNS data model — the group-centric hierarchy</title>
+  <desc>DNSServerGroup owns DNSServer, DNSView, DNSZone and DNSPool rows; DNSRecord rows hang off a zone.</desc>
+  <defs>
+    <linearGradient id="dmd-surface" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#f1f5f9"/>
+      <stop offset="100%" stop-color="#e2e8f0"/>
+    </linearGradient>
+    <linearGradient id="dmd-group" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#8b5cf6"/>
+      <stop offset="100%" stop-color="#6d28d9"/>
+    </linearGradient>
+    <linearGradient id="dmd-server" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#fb923c"/>
+      <stop offset="100%" stop-color="#ea580c"/>
+    </linearGradient>
+    <linearGradient id="dmd-view" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#22d3ee"/>
+      <stop offset="100%" stop-color="#0891b2"/>
+    </linearGradient>
+    <linearGradient id="dmd-zone" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#a78bfa"/>
+      <stop offset="100%" stop-color="#7c3aed"/>
+    </linearGradient>
+    <linearGradient id="dmd-record" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#34d399"/>
+      <stop offset="100%" stop-color="#059669"/>
+    </linearGradient>
+  </defs>
+
+  <text x="40" y="42" font-size="18" font-weight="600" fill="#0f172a">DNS — the group-centric hierarchy</text>
+  <text x="40" y="64" font-size="12" fill="#475569">Configuration lives on the group; servers are members, and zones and records hang off the group.</text>
+
+  <!-- Group panel -->
+  <rect x="40" y="88" width="840" height="404" rx="16"
+        fill="url(#dmd-surface)" stroke="#94a3b8" stroke-width="2"/>
+  <rect x="64" y="104" width="200" height="36" rx="8" fill="url(#dmd-group)"/>
+  <text x="164" y="127" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">DNSServerGroup</text>
+  <text x="288" y="118" font-size="12" font-weight="600" fill="#334155"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">dns_server_group</text>
+  <text x="288" y="136" font-size="12" fill="#475569">logical cluster — holds the shared config and TSIG key</text>
+
+  <!-- Tree spine -->
+  <path d="M 76 148 V 446" stroke="#cbd5e1" stroke-width="2" fill="none"/>
+  <path d="M 76 186 H 100" stroke="#cbd5e1" stroke-width="2" fill="none"/>
+  <path d="M 76 250 H 100" stroke="#cbd5e1" stroke-width="2" fill="none"/>
+  <path d="M 76 314 H 100" stroke="#cbd5e1" stroke-width="2" fill="none"/>
+  <path d="M 76 446 H 100" stroke="#cbd5e1" stroke-width="2" fill="none"/>
+
+  <!-- DNSServer -->
+  <rect x="100" y="160" width="756" height="52" rx="10"
+        fill="#ffffff" stroke="#e2e8f0" stroke-width="1.5"/>
+  <rect x="120" y="170" width="150" height="32" rx="8" fill="url(#dmd-server)"/>
+  <text x="195" y="191" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">DNSServer</text>
+  <text x="290" y="182" font-size="12" font-weight="600" fill="#334155"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">dns_server</text>
+  <text x="290" y="200" font-size="12" fill="#475569">an individual BIND9 / PowerDNS / Windows / agentless server</text>
+
+  <!-- DNSView -->
+  <rect x="100" y="224" width="756" height="52" rx="10"
+        fill="#ffffff" stroke="#e2e8f0" stroke-width="1.5"/>
+  <rect x="120" y="234" width="150" height="32" rx="8" fill="url(#dmd-view)"/>
+  <text x="195" y="255" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">DNSView</text>
+  <text x="290" y="246" font-size="12" font-weight="600" fill="#334155"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">dns_view</text>
+  <text x="290" y="264" font-size="12" fill="#475569">a split-horizon view</text>
+
+  <!-- DNSZone (contains DNSRecord) -->
+  <rect x="100" y="288" width="756" height="120" rx="10"
+        fill="#f8fafc" stroke="#e2e8f0" stroke-width="1.5"/>
+  <rect x="120" y="298" width="150" height="32" rx="8" fill="url(#dmd-zone)"/>
+  <text x="195" y="319" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">DNSZone</text>
+  <text x="290" y="310" font-size="12" font-weight="600" fill="#334155"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">dns_zone</text>
+  <text x="290" y="328" font-size="12" fill="#475569">authoritative / secondary / stub / forward</text>
+
+  <path d="M 118 336 V 370" stroke="#cbd5e1" stroke-width="2" fill="none"/>
+  <path d="M 118 370 H 136" stroke="#cbd5e1" stroke-width="2" fill="none"/>
+  <rect x="136" y="344" width="700" height="52" rx="10"
+        fill="#ffffff" stroke="#e2e8f0" stroke-width="1.5"/>
+  <rect x="156" y="354" width="150" height="32" rx="8" fill="url(#dmd-record)"/>
+  <text x="231" y="375" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">DNSRecord</text>
+  <text x="326" y="366" font-size="12" font-weight="600" fill="#334155"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">dns_record</text>
+  <text x="326" y="384" font-size="12" fill="#475569">a resource record within a zone</text>
+
+  <!-- DNSPool -->
+  <rect x="100" y="420" width="756" height="52" rx="10"
+        fill="#ffffff" stroke="#e2e8f0" stroke-width="1.5"/>
+  <rect x="120" y="430" width="150" height="32" rx="8" fill="url(#dmd-view)"/>
+  <text x="195" y="451" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">DNSPool</text>
+  <text x="290" y="442" font-size="12" font-weight="600" fill="#334155"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">dns_pool</text>
+  <text x="290" y="460" font-size="12" fill="#475569">health-checked A / AAAA set rendered as records</text>
+</svg>

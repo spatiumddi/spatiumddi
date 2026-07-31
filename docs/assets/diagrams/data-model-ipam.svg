@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="480" viewBox="0 0 920 480"
+     preserveAspectRatio="xMidYMid meet"
+     font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+  <title>IPAM containment hierarchy</title>
+  <desc>IPSpace contains IPBlock, which contains Subnet, which contains IPAddress — a strict four-level containment tree with the backing table name at each level.</desc>
+  <defs>
+    <linearGradient id="dmi-surface" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#f1f5f9"/>
+      <stop offset="100%" stop-color="#e2e8f0"/>
+    </linearGradient>
+    <linearGradient id="dmi-space" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#8b5cf6"/>
+      <stop offset="100%" stop-color="#6d28d9"/>
+    </linearGradient>
+    <linearGradient id="dmi-block" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#a78bfa"/>
+      <stop offset="100%" stop-color="#7c3aed"/>
+    </linearGradient>
+    <linearGradient id="dmi-subnet" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#34d399"/>
+      <stop offset="100%" stop-color="#059669"/>
+    </linearGradient>
+    <linearGradient id="dmi-addr" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#22d3ee"/>
+      <stop offset="100%" stop-color="#0891b2"/>
+    </linearGradient>
+    <marker id="dmi-arrow" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/>
+    </marker>
+  </defs>
+
+  <text x="40" y="42" font-size="18" font-weight="600" fill="#0f172a">IPAM — the address-space tree</text>
+  <text x="40" y="64" font-size="12" fill="#475569">A strict containment tree — each level nests inside the one above it.</text>
+
+  <!-- Level 1 — IPSpace -->
+  <rect x="40" y="88" width="840" height="360" rx="16"
+        fill="url(#dmi-surface)" stroke="#94a3b8" stroke-width="2"/>
+  <rect x="64" y="104" width="150" height="34" rx="8" fill="url(#dmi-space)"/>
+  <text x="139" y="127" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">IPSpace</text>
+  <text x="234" y="116" font-size="12" font-weight="600" fill="#334155"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">ip_space</text>
+  <text x="234" y="134" font-size="12" fill="#475569">a VRF / routing domain — addresses may overlap across spaces</text>
+  <path d="M 139 138 V 156" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#dmi-arrow)"/>
+
+  <!-- Level 2 — IPBlock -->
+  <rect x="76" y="160" width="768" height="264" rx="12"
+        fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+  <rect x="100" y="176" width="150" height="34" rx="8" fill="url(#dmi-block)"/>
+  <text x="175" y="199" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">IPBlock</text>
+  <text x="270" y="188" font-size="12" font-weight="600" fill="#334155"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">ip_block</text>
+  <text x="270" y="206" font-size="12" fill="#475569">aggregate / supernet — nests into itself via parent_block_id</text>
+  <path d="M 175 210 V 228" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#dmi-arrow)"/>
+
+  <!-- Level 3 — Subnet -->
+  <rect x="112" y="232" width="696" height="168" rx="12"
+        fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.5"/>
+  <rect x="136" y="248" width="150" height="34" rx="8" fill="url(#dmi-subnet)"/>
+  <text x="211" y="271" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">Subnet</text>
+  <text x="306" y="260" font-size="12" font-weight="600" fill="#334155"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">subnet</text>
+  <text x="306" y="278" font-size="12" fill="#475569">the primary managed unit — a routable network</text>
+  <path d="M 211 282 V 300" stroke="#94a3b8" stroke-width="2" fill="none" marker-end="url(#dmi-arrow)"/>
+
+  <!-- Level 4 — IPAddress -->
+  <rect x="148" y="304" width="624" height="72" rx="12"
+        fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+  <rect x="172" y="320" width="150" height="34" rx="8" fill="url(#dmi-addr)"/>
+  <text x="247" y="343" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">IPAddress</text>
+  <text x="342" y="332" font-size="12" font-weight="600" fill="#334155"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">ip_address</text>
+  <text x="342" y="350" font-size="12" fill="#475569">an individual host IP</text>
+</svg>
