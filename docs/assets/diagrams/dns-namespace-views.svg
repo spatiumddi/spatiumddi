@@ -1,0 +1,114 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="616" viewBox="0 0 920 616"
+     preserveAspectRatio="xMidYMid meet"
+     font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+  <title>DNS zone tree — namespace hierarchy with view scoping</title>
+  <desc>Zones are managed as a tree mirroring the DNS namespace, from the root through com. and in-addr.arpa.; split-horizon zones carry a badge showing whether they render into one view or every view.</desc>
+
+  <defs>
+    <linearGradient id="dnsv-surface" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#f1f5f9"/>
+      <stop offset="100%" stop-color="#e2e8f0"/>
+    </linearGradient>
+    <linearGradient id="dnsv-internal" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#22d3ee"/>
+      <stop offset="100%" stop-color="#0891b2"/>
+    </linearGradient>
+    <linearGradient id="dnsv-allviews" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#34d399"/>
+      <stop offset="100%" stop-color="#059669"/>
+    </linearGradient>
+  </defs>
+
+  <text x="32" y="36" font-size="18" font-weight="600" fill="#0f172a">DNS zone tree — namespace hierarchy with view scoping</text>
+  <text x="32" y="58" font-size="12" fill="#475569">Zones are managed in a tree that mirrors the DNS namespace; split-horizon zones are scoped to a view.</text>
+
+  <rect x="32" y="72" width="856" height="512" rx="16" fill="url(#dnsv-surface)" stroke="#94a3b8" stroke-width="1.5"/>
+
+  <!-- connectors -->
+  <g stroke="#cbd5e1" stroke-width="1.5" fill="none" stroke-linecap="round">
+    <!-- root -> com. / net. / in-addr.arpa. -->
+    <path d="M 72 132 V 368"/>
+    <path d="M 72 158 H 94"/>
+    <path d="M 72 326 H 94"/>
+    <path d="M 72 368 H 94"/>
+    <!-- com. -> example. -->
+    <path d="M 110 174 V 200"/>
+    <path d="M 110 200 H 132"/>
+    <!-- example. -> two view-scoped zones -->
+    <path d="M 148 216 V 284"/>
+    <path d="M 148 242 H 170"/>
+    <path d="M 148 284 H 170"/>
+    <!-- in-addr.arpa. -> 10. / 192. -->
+    <path d="M 110 384 V 494"/>
+    <path d="M 110 410 H 132"/>
+    <path d="M 110 494 H 132"/>
+    <!-- 10.in-addr.arpa. -> 1.10.in-addr.arpa. -->
+    <path d="M 148 426 V 452"/>
+    <path d="M 148 452 H 170"/>
+  </g>
+
+  <!-- root -->
+  <rect x="56" y="100" width="100" height="32" rx="8" fill="#1e293b"/>
+  <text x="70" y="121" font-size="13" font-weight="600" fill="#ffffff"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace">. (root)</text>
+
+  <!-- com. -->
+  <rect x="94" y="142" width="90" height="32" rx="8" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+  <text x="108" y="163" font-size="13" font-weight="600" fill="#334155"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace">com.</text>
+
+  <!-- example. -->
+  <rect x="132" y="184" width="92" height="32" rx="8" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+  <text x="146" y="205" font-size="13" font-weight="600" fill="#334155"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace">example.</text>
+
+  <!-- internal.example.com. — internal view only -->
+  <rect x="170" y="226" width="344" height="32" rx="8" fill="#ecfeff" stroke="#67e8f9" stroke-width="1.5"/>
+  <text x="184" y="247" font-size="13" font-weight="600" fill="#155e75"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace">internal.example.com.</text>
+  <rect x="364" y="232" width="136" height="20" rx="10" fill="url(#dnsv-internal)"/>
+  <text x="432" y="246" text-anchor="middle" font-size="11" font-weight="600" fill="#ffffff">internal view only</text>
+
+  <!-- example.com. — all views -->
+  <rect x="170" y="268" width="216" height="32" rx="8" fill="#ecfdf5" stroke="#6ee7b7" stroke-width="1.5"/>
+  <text x="184" y="289" font-size="13" font-weight="600" fill="#065f46"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace">example.com.</text>
+  <rect x="294" y="274" width="78" height="20" rx="10" fill="url(#dnsv-allviews)"/>
+  <text x="333" y="288" text-anchor="middle" font-size="11" font-weight="600" fill="#ffffff">all views</text>
+
+  <!-- net. -->
+  <rect x="94" y="310" width="90" height="32" rx="8" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+  <text x="108" y="331" font-size="13" font-weight="600" fill="#334155"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace">net.</text>
+
+  <!-- in-addr.arpa. -->
+  <rect x="94" y="352" width="130" height="32" rx="8" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+  <text x="108" y="373" font-size="13" font-weight="600" fill="#334155"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace">in-addr.arpa.</text>
+
+  <!-- 10.in-addr.arpa. -->
+  <rect x="132" y="394" width="154" height="32" rx="8" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+  <text x="146" y="415" font-size="13" font-weight="600" fill="#334155"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace">10.in-addr.arpa.</text>
+
+  <!-- 1.10.in-addr.arpa. -->
+  <rect x="170" y="436" width="170" height="32" rx="8" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+  <text x="184" y="457" font-size="13" font-weight="600" fill="#334155"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace">1.10.in-addr.arpa.</text>
+
+  <!-- 192.in-addr.arpa. -->
+  <rect x="132" y="478" width="162" height="32" rx="8" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/>
+  <text x="146" y="499" font-size="13" font-weight="600" fill="#334155"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace">192.in-addr.arpa.</text>
+
+  <!-- legend -->
+  <path d="M 56 524 H 864" stroke="#cbd5e1" stroke-width="1.5"/>
+  <rect x="56" y="530" width="136" height="20" rx="10" fill="url(#dnsv-internal)"/>
+  <text x="124" y="544" text-anchor="middle" font-size="11" font-weight="600" fill="#ffffff">internal view only</text>
+  <text x="204" y="544" font-size="11" fill="#475569">— the zone is rendered only into the internal view's zone file</text>
+
+  <rect x="56" y="556" width="78" height="20" rx="10" fill="url(#dnsv-allviews)"/>
+  <text x="95" y="570" text-anchor="middle" font-size="11" font-weight="600" fill="#ffffff">all views</text>
+  <text x="204" y="570" font-size="11" fill="#475569">— view_id is NULL, so the zone renders into every view</text>
+</svg>

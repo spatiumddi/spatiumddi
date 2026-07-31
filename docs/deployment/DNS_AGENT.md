@@ -127,36 +127,9 @@ pairing-code workflow.
 
 ### Flow
 
-```
-┌────────────────┐                                   ┌──────────────────┐
-│ DNS container  │                                   │  Control plane   │
-│  (fresh boot)  │                                   │   (FastAPI)      │
-└───────┬────────┘                                   └────────┬─────────┘
-        │                                                     │
-        │ 1. Read env: CONTROL_PLANE_URL, DNS_AGENT_KEY,      │
-        │              AGENT_ID (persisted in /var/lib)       │
-        │                                                     │
-        │ 2. If no cached agent_token.jwt → bootstrap:        │
-        │    POST /dns/agents/register                        │
-        │      Headers: X-DNS-Agent-Key: <bootstrap>          │
-        │      Body: {hostname, driver, roles, version,       │
-        │             group_name, fingerprint}                │
-        │───────────────────────────────────────────────────► │
-        │                                                     │ 3. Validate PSK
-        │                                                     │    Create/update DNSServer row
-        │                                                     │    Mark pending_approval=true
-        │                                                     │      if settings.require_agent_approval
-        │                                                     │    Mint agent_token (JWT, 24h)
-        │  ◄────────────────────────────────────────────────  │
-        │    200 {server_id, agent_token, config_etag, ...}   │
-        │                                                     │
-        │ 4. Persist token to /var/lib/spatium-dns-agent/     │
-        │    agent_token.jwt (0600, owned by agent user)      │
-        │                                                     │
-        │ 5. From here on: Authorization: Bearer <agent_token>│
-        │    Heartbeat every 30s — token rotated on rotation  │
-        │    window (every 12h) via heartbeat response.       │
-```
+<p align="center">
+  <img src="../assets/diagrams/dns-agent-bootstrap.svg" alt="DNS agent bootstrap — PSK exchanged for a rotating JWT" width="900"/>
+</p>
 
 ### Identity
 
@@ -298,32 +271,9 @@ ops/
 
 ### Record lifecycle end-to-end
 
-```
-UI / API mutation (e.g. POST /dns/zones/{id}/records)
-        │
-        ▼
-Service layer: validate, write DNSRecord row, compute delta
-        │
-        ▼
-Enqueue RecordOp rows:
-  { id, server_id, zone_name, op: create|update|delete, record: {...},
-    serial_strategy: bump, created_at, state: pending }
-        │
-        ▼
-Response returned to caller (HTTP 2xx) — the write is durable in Postgres.
-        │
-        ▼
-Agents holding a long-poll on /config are released with op list.
-(Or: next long-poll picks it up within ≤30 s; idempotent by op_id.)
-        │
-        ▼
-Agent executes via loopback:
-  BIND9   → nsupdate ‹signed with local TSIG›
-        │
-        ▼
-Agent ACKs on next heartbeat → RecordOp.state = applied
-If failed after N retries (default 5, expo-backoff): state=failed, alert.
-```
+<p align="center">
+  <img src="../assets/diagrams/dns-record-propagation.svg" alt="DNS record change — end-to-end propagation" width="900"/>
+</p>
 
 ### Serial bump responsibility
 

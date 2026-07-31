@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="400" viewBox="0 0 920 400"
+     preserveAspectRatio="xMidYMid meet"
+     font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+  <title>DHCP driver shapes</title>
+  <desc>The three shapes today's DHCP drivers take: agented and write-capable (Kea), agentless and read-only (Windows DHCP Path A), and agentless but write-capable over a cloud REST API (FortiGate).</desc>
+  <defs>
+    <linearGradient id="dhcpd-agent" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#fb923c"/>
+      <stop offset="100%" stop-color="#ea580c"/>
+    </linearGradient>
+    <linearGradient id="dhcpd-accent" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#22d3ee"/>
+      <stop offset="100%" stop-color="#0891b2"/>
+    </linearGradient>
+    <linearGradient id="dhcpd-surface" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#f1f5f9"/>
+      <stop offset="100%" stop-color="#e2e8f0"/>
+    </linearGradient>
+  </defs>
+
+  <text x="460" y="36" text-anchor="middle" font-size="18" font-weight="600" fill="#0f172a">DHCP driver shapes</text>
+  <text x="460" y="58" text-anchor="middle" font-size="12" fill="#475569">the registry classifies every driver on two axes — agented vs agentless, read-only vs write-capable</text>
+
+  <!-- Card 1 — Agented + write (Kea) -->
+  <g>
+    <rect x="40" y="84" width="264" height="286" rx="12" fill="url(#dhcpd-surface)" stroke="#94a3b8" stroke-width="1.5"/>
+    <rect x="54" y="98" width="236" height="54" rx="8" fill="url(#dhcpd-agent)"/>
+    <text x="172" y="122" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">Agented + write</text>
+    <text x="172" y="141" text-anchor="middle" font-size="11" fill="#fed7aa">Kea</text>
+
+    <text x="58" y="180" font-size="13" font-weight="600" fill="#0f172a">Control plane</text>
+    <text x="58" y="202" font-size="11" fill="#334155">render_config()</text>
+    <text x="58" y="220" font-size="11" fill="#334155">ETag long-poll → ConfigBundle</text>
+
+    <rect x="54" y="252" width="236" height="100" rx="8" fill="#fff7ed" stroke="#fed7aa" stroke-width="1.5"/>
+    <text x="68" y="276" font-size="13" font-weight="600" fill="#9a3412">Agent (sidecar)</text>
+    <text x="68" y="298" font-size="11" fill="#9a3412">fetch bundle</text>
+    <text x="68" y="316" font-size="11" fill="#9a3412">apply_config()</text>
+    <text x="68" y="334" font-size="11" fill="#9a3412">reload / restart</text>
+  </g>
+
+  <!-- Card 2 — Agentless + read-only (Windows DHCP, Path A) -->
+  <g>
+    <rect x="328" y="84" width="264" height="286" rx="12" fill="url(#dhcpd-surface)" stroke="#94a3b8" stroke-width="1.5"/>
+    <rect x="342" y="98" width="236" height="54" rx="8" fill="url(#dhcpd-accent)"/>
+    <text x="460" y="122" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">Agentless + read-only</text>
+    <text x="460" y="141" text-anchor="middle" font-size="11" fill="#cffafe">Windows DHCP — Path A</text>
+
+    <text x="346" y="180" font-size="13" font-weight="600" fill="#0f172a">Control plane</text>
+    <text x="346" y="202" font-size="11" fill="#334155">get_leases()  WinRM</text>
+    <text x="346" y="220" font-size="11" fill="#334155">get_scopes()  WinRM</text>
+
+    <rect x="342" y="252" width="236" height="100" rx="8" fill="#fef2f2" stroke="#fecaca" stroke-width="1.5"/>
+    <text x="356" y="276" font-size="13" font-weight="600" fill="#b91c1c">No agent</text>
+    <text x="356" y="298" font-size="11" fill="#b91c1c">writes raise</text>
+    <text x="356" y="316" font-size="11" fill="#b91c1c">NotImplementedError</text>
+  </g>
+
+  <!-- Card 3 — Agentless + write (FortiGate, cloud) -->
+  <g>
+    <rect x="616" y="84" width="264" height="286" rx="12" fill="url(#dhcpd-surface)" stroke="#94a3b8" stroke-width="1.5"/>
+    <rect x="630" y="98" width="236" height="54" rx="8" fill="url(#dhcpd-accent)"/>
+    <text x="748" y="122" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">Agentless + write</text>
+    <text x="748" y="141" text-anchor="middle" font-size="11" fill="#cffafe">FortiGate — cloud</text>
+
+    <text x="634" y="180" font-size="13" font-weight="600" fill="#0f172a">Control plane</text>
+    <text x="634" y="202" font-size="11" fill="#334155">apply_scope_full()</text>
+    <text x="634" y="220" font-size="11" fill="#334155">   → REST PUT / POST</text>
+    <text x="634" y="238" font-size="11" fill="#334155">get_leases()  REST</text>
+
+    <rect x="630" y="252" width="236" height="100" rx="8" fill="#ecfeff" stroke="#a5f3fc" stroke-width="1.5"/>
+    <text x="644" y="276" font-size="13" font-weight="600" fill="#0e7490">No agent</text>
+    <text x="644" y="298" font-size="11" fill="#0e7490">whole-scope push,</text>
+    <text x="644" y="316" font-size="11" fill="#0e7490">synchronous,</text>
+    <text x="644" y="334" font-size="11" fill="#0e7490">before-commit.</text>
+  </g>
+</svg>

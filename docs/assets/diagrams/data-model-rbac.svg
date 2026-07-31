@@ -1,0 +1,100 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="470" viewBox="0 0 920 470"
+     preserveAspectRatio="xMidYMid meet"
+     font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+  <title>Auth and RBAC — the permission chain</title>
+  <desc>User links to Group through the user_group association table and Group links to Role through group_role; a Role carries its permissions as a JSONB list of action, resource_type and optional resource_id.</desc>
+  <defs>
+    <linearGradient id="dmr-user" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#8b5cf6"/>
+      <stop offset="100%" stop-color="#6d28d9"/>
+    </linearGradient>
+    <linearGradient id="dmr-group" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#a78bfa"/>
+      <stop offset="100%" stop-color="#7c3aed"/>
+    </linearGradient>
+    <linearGradient id="dmr-role" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#34d399"/>
+      <stop offset="100%" stop-color="#059669"/>
+    </linearGradient>
+    <marker id="dmr-crow" viewBox="0 0 12 12" refX="0" refY="6"
+            markerWidth="12" markerHeight="12" markerUnits="userSpaceOnUse" orient="auto">
+      <path d="M 0 6 L 12 0 M 0 6 L 12 6 M 0 6 L 12 12"
+            stroke="#64748b" stroke-width="1.6" fill="none"/>
+    </marker>
+    <marker id="dmr-one" viewBox="0 0 8 12" refX="4" refY="6"
+            markerWidth="8" markerHeight="12" markerUnits="userSpaceOnUse" orient="auto">
+      <path d="M 4 1 V 11" stroke="#64748b" stroke-width="1.6" fill="none"/>
+    </marker>
+    <marker id="dmr-arrow" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/>
+    </marker>
+  </defs>
+
+  <text x="40" y="44" font-size="18" font-weight="600" fill="#0f172a">Auth + RBAC — the permission chain</text>
+  <text x="40" y="68" font-size="12" fill="#475569">User and Group are linked many-to-many through user_group; Group and Role through group_role.</text>
+  <text x="40" y="86" font-size="12" fill="#475569">Both association tables carry composite primary keys and CASCADE on both sides.</text>
+
+  <!-- User -->
+  <rect x="26" y="150" width="160" height="84" rx="8" fill="url(#dmr-user)"/>
+  <text x="106" y="180" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">User</text>
+  <text x="106" y="200" text-anchor="middle" font-size="11" fill="#ddd6fe"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">user</text>
+  <text x="106" y="218" text-anchor="middle" font-size="11" fill="#ddd6fe">unique username / email</text>
+
+  <!-- user_group -->
+  <rect x="218" y="162" width="130" height="60" rx="8"
+        fill="#f1f5f9" stroke="#cbd5e1" stroke-width="1.5" stroke-dasharray="4 4"/>
+  <text x="283" y="188" text-anchor="middle" font-size="12" font-weight="600" fill="#334155"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">user_group</text>
+  <text x="283" y="206" text-anchor="middle" font-size="11" fill="#475569">composite PK</text>
+
+  <!-- Group -->
+  <rect x="380" y="150" width="160" height="84" rx="8" fill="url(#dmr-group)"/>
+  <text x="460" y="180" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">Group</text>
+  <text x="460" y="200" text-anchor="middle" font-size="11" fill="#ddd6fe"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">group</text>
+  <text x="460" y="218" text-anchor="middle" font-size="11" fill="#ddd6fe">membership container</text>
+
+  <!-- group_role -->
+  <rect x="572" y="162" width="130" height="60" rx="8"
+        fill="#f1f5f9" stroke="#cbd5e1" stroke-width="1.5" stroke-dasharray="4 4"/>
+  <text x="637" y="188" text-anchor="middle" font-size="12" font-weight="600" fill="#334155"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">group_role</text>
+  <text x="637" y="206" text-anchor="middle" font-size="11" fill="#475569">composite PK</text>
+
+  <!-- Role -->
+  <rect x="734" y="150" width="160" height="84" rx="8" fill="url(#dmr-role)"/>
+  <text x="814" y="180" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">Role</text>
+  <text x="814" y="200" text-anchor="middle" font-size="11" fill="#a7f3d0"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">role</text>
+  <text x="814" y="218" text-anchor="middle" font-size="11" fill="#a7f3d0">is_builtin flag</text>
+
+  <!-- Relationships -->
+  <path d="M 186 192 H 214" stroke="#64748b" stroke-width="2" fill="none"
+        marker-start="url(#dmr-one)" marker-end="url(#dmr-crow)"/>
+  <path d="M 380 192 H 352" stroke="#64748b" stroke-width="2" fill="none"
+        marker-start="url(#dmr-one)" marker-end="url(#dmr-crow)"/>
+  <path d="M 540 192 H 568" stroke="#64748b" stroke-width="2" fill="none"
+        marker-start="url(#dmr-one)" marker-end="url(#dmr-crow)"/>
+  <path d="M 734 192 H 706" stroke="#64748b" stroke-width="2" fill="none"
+        marker-start="url(#dmr-one)" marker-end="url(#dmr-crow)"/>
+
+  <!-- Role → permissions -->
+  <path d="M 814 234 V 296" stroke="#64748b" stroke-width="2" fill="none"
+        marker-end="url(#dmr-arrow)"/>
+
+  <rect x="414" y="300" width="480" height="120" rx="12"
+        fill="#ffffff" stroke="#94a3b8" stroke-width="2"/>
+  <text x="438" y="332" font-size="13" font-weight="600" fill="#0f172a">permissions — a JSONB list on Role</text>
+  <text x="438" y="358" font-size="12" fill="#334155"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">{ action, resource_type, resource_id? }</text>
+  <text x="438" y="382" font-size="11" fill="#475569">wildcard * is accepted for action and resource_type</text>
+  <text x="438" y="400" font-size="11" fill="#475569">resource_id scopes a permission to a single resource</text>
+
+  <!-- Legend -->
+  <path d="M 40 438 H 62" stroke="#64748b" stroke-width="2" fill="none"
+        marker-start="url(#dmr-one)" marker-end="url(#dmr-crow)"/>
+  <text x="82" y="442" font-size="11" fill="#475569">The crow's foot marks the many side; the tick marks the one side.</text>
+</svg>

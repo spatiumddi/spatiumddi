@@ -133,12 +133,9 @@ Files: [`ipam.py`](../backend/app/models/ipam.py),
 
 The core hierarchy is a strict containment tree:
 
-```
-IPSpace  (ip_space — a VRF / routing domain; addresses may overlap across spaces)
-  └── IPBlock  (ip_block — aggregate/supernet; nests via parent_block_id)
-        └── Subnet  (subnet — the primary managed unit; routable network)
-              └── IPAddress  (ip_address — individual host IP)
-```
+<p align="center">
+  <img src="assets/diagrams/data-model-ipam.svg" alt="IPAM data model — the address-space containment tree" width="900"/>
+</p>
 
 | Model | Table | Key FKs |
 |---|---|---|
@@ -205,14 +202,9 @@ File: [`dns.py`](../backend/app/models/dns.py). Feature spec:
 The DNS hierarchy is group-centric — configuration lives on the group,
 servers are members, zones and records hang off the group:
 
-```
-DNSServerGroup  (dns_server_group — logical cluster; holds shared config + TSIG)
-  ├── DNSServer  (dns_server — individual BIND9 / PowerDNS / Windows / agentless server)
-  ├── DNSView    (dns_view — split-horizon view)
-  ├── DNSZone    (dns_zone — authoritative / secondary / stub / forward)
-  │     └── DNSRecord  (dns_record — RR within a zone)
-  └── DNSPool    (dns_pool — health-checked A/AAAA set rendered as records)
-```
+<p align="center">
+  <img src="assets/diagrams/data-model-dns.svg" alt="DNS data model — the group-centric hierarchy" width="900"/>
+</p>
 
 | Model | Table | Key FKs |
 |---|---|---|
@@ -258,15 +250,9 @@ on the **group**, not on individual servers (a 2-member Kea group is an
 HA pair). Leases are per-server because each Kea instance owns its own
 memfile.
 
-```
-DHCPServerGroup  (dhcp_server_group — primary config container; HA tuning)
-  ├── DHCPServer  (dhcp_server — Kea instance or Windows DHCP)
-  │     └── DHCPLease  (dhcp_lease — per-server active/historical lease)
-  ├── DHCPScope  (dhcp_scope — one subnet served by the group)
-  │     ├── DHCPPool             (dhcp_pool — dynamic / excluded / reserved range)
-  │     └── DHCPStaticAssignment (dhcp_static_assignment — MAC → IP reservation)
-  └── DHCPClientClass  (dhcp_client_class — conditional option delivery)
-```
+<p align="center">
+  <img src="assets/diagrams/data-model-dhcp.svg" alt="DHCP data model — the group-centric hierarchy" width="900"/>
+</p>
 
 | Model | Table | Key FKs / constraints |
 |---|---|---|
@@ -355,11 +341,9 @@ File: [`auth.py`](../backend/app/models/auth.py),
 [`time_bound_grant.py`](../backend/app/models/time_bound_grant.py).
 Permission grammar: [PERMISSIONS.md](PERMISSIONS.md).
 
-```
-User ──< user_group >── Group ──< group_role >── Role
-                                                  └── permissions (JSONB list of
-                                                      {action, resource_type, resource_id?})
-```
+<p align="center">
+  <img src="assets/diagrams/data-model-rbac.svg" alt="Auth and RBAC — the permission chain" width="900"/>
+</p>
 
 | Model | Table | Notes |
 |---|---|---|

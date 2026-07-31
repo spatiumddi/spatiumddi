@@ -71,12 +71,9 @@ This is the most granular part of the DHCP model. Within a **subnet**, you can d
 
 ### Hierarchy
 
-```
-Subnet
-  └── DHCPScope (one per subnet per DHCP server group)
-        ├── DHCPPool (one or more dynamic ranges)
-        └── DHCPStaticAssignment (zero or many)
-```
+<p align="center">
+  <img src="../assets/diagrams/dhcp-scope-containment.svg" alt="DHCP scope hierarchy" width="900"/>
+</p>
 
 ### DHCPScope Model
 
@@ -580,25 +577,9 @@ different MAC, or got swept on absence-delete — gives operators a
 
 Each DHCP server is managed by an **SpatiumDDI Agent** — a lightweight sidecar process running on or near the DHCP server.
 
-```
-┌─────────────────────────────────────────┐
-│   DHCP Server Host / Container           │
-│                                         │
-│   ┌─────────────┐    ┌───────────────┐  │
-│   │  DHCP daemon │←── │  SpatiumDDI     │  │
-│   │  (Kea/ISC)  │    │  Agent        │  │
-│   └─────────────┘    │               │  │
-│                       │  config cache │  │
-│                       │  (local disk) │  │
-│                       └──────┬────────┘  │
-│                              │ pull/push │
-└──────────────────────────────┼───────────┘
-                               │
-                      ┌────────▼────────┐
-                      │  SpatiumDDI API   │
-                      │  (control plane)│
-                      └─────────────────┘
-```
+<p align="center">
+  <img src="../assets/diagrams/dhcp-host-internals.svg" alt="DHCP agent host internals" width="900"/>
+</p>
 
 ### Agent Behavior
 

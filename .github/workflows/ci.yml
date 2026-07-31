@@ -160,6 +160,36 @@ jobs:
           echo "all 8 backend test shards passed"
 
   # ── Frontend ───────────────────────────────────────────────────────────────
+  # ── Docs ───────────────────────────────────────────────────────────────────
+  # The published docs embed hand-authored SVG diagrams. Their text is placed
+  # by absolute coordinate, so a relabelled box silently spills out of its
+  # container or off the canvas — invisible in a diff, obvious on the site.
+  # This renders each one in headless Chrome and measures real text metrics.
+  docs-diagrams:
+    name: Docs — Diagram Geometry
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # ubuntu-latest ships Google Chrome preinstalled, which the script
+      # finds on its own. Install chromium only if that ever stops being
+      # true — apt on a runner without it would otherwise fail the job for
+      # a reason unrelated to the diagrams.
+      - name: Ensure a headless browser is present
+        run: |
+          if ! command -v google-chrome >/dev/null 2>&1 \
+             && ! command -v chromium >/dev/null 2>&1 \
+             && ! command -v chromium-browser >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y chromium
+          fi
+
+      - name: Verify diagram geometry
+        run: python3 scripts/verify_svg_diagrams.py
+
   frontend-lint:
     name: Frontend — Lint & Type Check
     runs-on: ubuntu-latest

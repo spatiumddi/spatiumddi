@@ -66,19 +66,9 @@ The main **Health Overview** page gives a single-pane-of-glass view of the entir
 
 Each managed component shows a status card:
 
-```
-┌────────────────────────────────────────────────────────────┐
-│ SYSTEM HEALTH                              Last updated: 2s │
-├──────────────┬──────────────┬──────────────┬───────────────┤
-│ API Backend  │  Database    │    Redis     │  Celery       │
-│  ● ONLINE    │  ● PRIMARY   │  ● ONLINE    │  ● 3 workers  │
-│  3 replicas  │  + 2 replicas│  Sentinel ✓  │  0 pending    │
-├──────────────┼──────────────┼──────────────┼───────────────┤
-│ DHCP Servers │ DNS Servers  │  Log Store    │               │
-│  2/2 online  │  3/4 online  │  ● ONLINE     │               │
-│  ⚠ kea-02   │  ⚠ bind-03  │  12.4 GB used │               │
-└──────────────┴──────────────┴──────────────┴───────────────┘
-```
+<p align="center">
+  <img src="../assets/diagrams/system-health-grid.svg" alt="System health — component status grid" width="900"/>
+</p>
 
 ### Per-Component Detail
 

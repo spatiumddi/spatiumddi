@@ -30,7 +30,7 @@
   </defs>
 
   <!-- Operators -->
-  <rect x="370" y="20" width="180" height="42" rx="21" fill="#1e293b"/>
+  <rect x="354" y="20" width="212" height="42" rx="21" fill="#1e293b"/>
   <text x="460" y="46" text-anchor="middle" font-size="13" font-weight="600" fill="#ffffff">operators / API consumers</text>
 
   <!-- LB -->
@@ -61,7 +61,7 @@
   </g>
 
   <!-- Beat singleton -->
-  <rect x="365" y="200" width="190" height="60" rx="8" fill="url(#t4-cp)"/>
+  <rect x="354" y="200" width="212" height="60" rx="8" fill="url(#t4-cp)"/>
   <text x="460" y="226" text-anchor="middle" font-size="13" font-weight="600" fill="#ffffff">vm-beat (single)</text>
   <text x="460" y="246" text-anchor="middle" font-size="10" fill="#ddd6fe">celery beat — not horizontally scalable</text>
 

@@ -407,18 +407,9 @@ The driver is responsible for generating the correct BIND9 config that reflects 
 
 Zones are displayed and managed in a **tree hierarchy** that mirrors the DNS namespace naturally.
 
-```
-. (root)
-├── com.
-│   └── example.
-│       ├── internal.example.com.   [internal view only]
-│       └── example.com.            [all views]
-├── net.
-└── in-addr.arpa.
-    ├── 10.in-addr.arpa.
-    │   └── 1.10.in-addr.arpa.
-    └── 192.in-addr.arpa.
-```
+<p align="center">
+  <img src="../assets/diagrams/dns-namespace-views.svg" alt="DNS zone tree — namespace hierarchy with view scoping" width="900"/>
+</p>
 
 ### Zone Model
 
@@ -518,30 +509,9 @@ async def apply_record_change(
 
 DDNS is a thin layer on top of the IPAM → DNS sync pipeline. The DNS side is identical to what a static allocation produces; the only DDNS-specific logic is picking a hostname from the lease.
 
-```
-┌──────────────────────────┐
-│  Lease source            │
-│  ─ agentless pull        │  → upserts DHCPLease + mirrors into IPAM
-│    (Windows DHCP)         │    as auto_from_lease=True
-│  ─ agent lease event      │  → Kea (POST /agents/lease-events)
-│    (Kea)                  │
-└───────────┬──────────────┘
-            │ ipam_row
-            ▼
-┌──────────────────────────┐
-│  services/dns/ddns.py    │
-│  apply_ddns_for_lease()  │  → resolves hostname per subnet policy,
-│                          │    writes it onto ipam_row.hostname,
-│                          │    calls _sync_dns_record(..., "create")
-└───────────┬──────────────┘
-            │
-            ▼
-┌──────────────────────────┐
-│  _sync_dns_record        │  → unchanged — drives A/AAAA + PTR via
-│  (IPAM router)           │    RFC 2136 for BIND9 / Windows Path A,
-│                          │    or WinRM for Windows Path B
-└──────────────────────────┘
-```
+<p align="center">
+  <img src="../assets/diagrams/dns-ddns-lease-flow.svg" alt="DDNS — DHCP lease to DNS record" width="900"/>
+</p>
 
 On lease expiry, `dhcp_lease_cleanup` sweeps the DHCPLease row past its grace period; before deleting the mirrored `auto_from_lease` IPAM row it calls `revoke_ddns_for_lease`, which fires `_sync_dns_record(..., action="delete")` to tear down the A/AAAA + PTR.
 

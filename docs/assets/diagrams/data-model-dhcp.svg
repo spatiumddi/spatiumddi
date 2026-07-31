@@ -1,0 +1,108 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="584" viewBox="0 0 920 584"
+     preserveAspectRatio="xMidYMid meet"
+     font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+  <title>DHCP data model — the group-centric hierarchy</title>
+  <desc>DHCPServerGroup owns DHCPServer, DHCPScope and DHCPClientClass rows; leases hang off a server, while pools and static assignments hang off a scope.</desc>
+  <defs>
+    <linearGradient id="dmh-surface" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#f1f5f9"/>
+      <stop offset="100%" stop-color="#e2e8f0"/>
+    </linearGradient>
+    <linearGradient id="dmh-group" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#8b5cf6"/>
+      <stop offset="100%" stop-color="#6d28d9"/>
+    </linearGradient>
+    <linearGradient id="dmh-server" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#fb923c"/>
+      <stop offset="100%" stop-color="#ea580c"/>
+    </linearGradient>
+    <linearGradient id="dmh-lease" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#34d399"/>
+      <stop offset="100%" stop-color="#059669"/>
+    </linearGradient>
+    <linearGradient id="dmh-scope" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#a78bfa"/>
+      <stop offset="100%" stop-color="#7c3aed"/>
+    </linearGradient>
+    <linearGradient id="dmh-leaf" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#22d3ee"/>
+      <stop offset="100%" stop-color="#0891b2"/>
+    </linearGradient>
+  </defs>
+
+  <text x="40" y="42" font-size="18" font-weight="600" fill="#0f172a">DHCP — the group-centric hierarchy</text>
+  <text x="40" y="64" font-size="12" fill="#475569">Scopes, pools, statics and classes live on the group; leases are per-server, because each Kea instance owns its own memfile.</text>
+
+  <!-- Group panel -->
+  <rect x="40" y="88" width="840" height="468" rx="16"
+        fill="url(#dmh-surface)" stroke="#94a3b8" stroke-width="2"/>
+  <rect x="64" y="104" width="210" height="36" rx="8" fill="url(#dmh-group)"/>
+  <text x="169" y="127" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">DHCPServerGroup</text>
+  <text x="296" y="118" font-size="12" font-weight="600" fill="#334155"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">dhcp_server_group</text>
+  <text x="296" y="136" font-size="12" fill="#475569">the primary config container — holds the HA tuning</text>
+
+  <!-- Tree spine -->
+  <path d="M 76 148 V 510" stroke="#cbd5e1" stroke-width="2" fill="none"/>
+  <path d="M 76 186 H 100" stroke="#cbd5e1" stroke-width="2" fill="none"/>
+  <path d="M 76 318 H 100" stroke="#cbd5e1" stroke-width="2" fill="none"/>
+  <path d="M 76 510 H 100" stroke="#cbd5e1" stroke-width="2" fill="none"/>
+
+  <!-- DHCPServer (contains DHCPLease) -->
+  <rect x="100" y="160" width="756" height="120" rx="10"
+        fill="#f8fafc" stroke="#e2e8f0" stroke-width="1.5"/>
+  <rect x="120" y="170" width="210" height="32" rx="8" fill="url(#dmh-server)"/>
+  <text x="225" y="191" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">DHCPServer</text>
+  <text x="352" y="182" font-size="12" font-weight="600" fill="#334155"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">dhcp_server</text>
+  <text x="352" y="200" font-size="12" fill="#475569">a Kea instance or a Windows DHCP server</text>
+
+  <path d="M 118 208 V 242" stroke="#cbd5e1" stroke-width="2" fill="none"/>
+  <path d="M 118 242 H 136" stroke="#cbd5e1" stroke-width="2" fill="none"/>
+  <rect x="136" y="216" width="700" height="52" rx="10"
+        fill="#ffffff" stroke="#e2e8f0" stroke-width="1.5"/>
+  <rect x="156" y="226" width="210" height="32" rx="8" fill="url(#dmh-lease)"/>
+  <text x="261" y="247" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">DHCPLease</text>
+  <text x="388" y="238" font-size="12" font-weight="600" fill="#334155"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">dhcp_lease</text>
+  <text x="388" y="256" font-size="12" fill="#475569">a per-server active or historical lease</text>
+
+  <!-- DHCPScope (contains DHCPPool + DHCPStaticAssignment) -->
+  <rect x="100" y="292" width="756" height="180" rx="10"
+        fill="#f8fafc" stroke="#e2e8f0" stroke-width="1.5"/>
+  <rect x="120" y="302" width="210" height="32" rx="8" fill="url(#dmh-scope)"/>
+  <text x="225" y="323" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">DHCPScope</text>
+  <text x="352" y="314" font-size="12" font-weight="600" fill="#334155"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">dhcp_scope</text>
+  <text x="352" y="332" font-size="12" fill="#475569">one subnet served by the group</text>
+
+  <path d="M 118 340 V 434" stroke="#cbd5e1" stroke-width="2" fill="none"/>
+  <path d="M 118 374 H 136" stroke="#cbd5e1" stroke-width="2" fill="none"/>
+  <path d="M 118 434 H 136" stroke="#cbd5e1" stroke-width="2" fill="none"/>
+
+  <rect x="136" y="348" width="700" height="52" rx="10"
+        fill="#ffffff" stroke="#e2e8f0" stroke-width="1.5"/>
+  <rect x="156" y="358" width="210" height="32" rx="8" fill="url(#dmh-leaf)"/>
+  <text x="261" y="379" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">DHCPPool</text>
+  <text x="388" y="370" font-size="12" font-weight="600" fill="#334155"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">dhcp_pool</text>
+  <text x="388" y="388" font-size="12" fill="#475569">a dynamic / excluded / reserved range</text>
+
+  <rect x="136" y="408" width="700" height="52" rx="10"
+        fill="#ffffff" stroke="#e2e8f0" stroke-width="1.5"/>
+  <rect x="156" y="418" width="210" height="32" rx="8" fill="url(#dmh-leaf)"/>
+  <text x="261" y="439" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">DHCPStaticAssignment</text>
+  <text x="388" y="430" font-size="12" font-weight="600" fill="#334155"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">dhcp_static_assignment</text>
+  <text x="388" y="448" font-size="12" fill="#475569">a MAC → IP reservation</text>
+
+  <!-- DHCPClientClass -->
+  <rect x="100" y="484" width="756" height="52" rx="10"
+        fill="#ffffff" stroke="#e2e8f0" stroke-width="1.5"/>
+  <rect x="120" y="494" width="210" height="32" rx="8" fill="url(#dmh-leaf)"/>
+  <text x="225" y="515" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">DHCPClientClass</text>
+  <text x="352" y="506" font-size="12" font-weight="600" fill="#334155"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">dhcp_client_class</text>
+  <text x="352" y="524" font-size="12" fill="#475569">conditional option delivery</text>
+</svg>

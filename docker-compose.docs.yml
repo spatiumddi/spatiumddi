@@ -1,0 +1,22 @@
+# Local preview of the documentation site.
+#
+#   docker compose -f docker-compose.docs.yml up      → http://localhost:4000
+#
+# Renders docs/ with the same Jekyll plugin set GitHub Pages uses, so a page
+# can be checked before it ships. Edits to docs/ rebuild automatically.
+#
+# The build output goes to /tmp/_site *inside* the container rather than to
+# docs/_site, so a preview run never drops an untracked build directory into
+# the working tree.
+services:
+  docs:
+    build:
+      context: ./docs
+    image: spatiumddi-docs:local
+    ports:
+      - "${DOCS_PORT:-4000}:4000"
+      # livereload — the browser reconnects here for auto-refresh on save.
+      - "35729:35729"
+    volumes:
+      - ./docs:/srv/jekyll:ro
+    restart: unless-stopped

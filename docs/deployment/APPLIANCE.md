@@ -23,24 +23,9 @@ The appliance runs **k3s** as its container orchestrator. Pre-#183 it ran `docke
 
 The historical AIO / Core-only / Application narrative below documents the pre-#272 three-role world; the firstboot dispatch still handles those strings as aliases.
 
-```
-[appliance: single-node k3s]
-   ├─ /usr/local/bin/k3s (static binary, pinned via K3S_VERSION)
-   ├─ /var/lib/rancher/k3s/agent/images/*.tar.zst   ← air-gap-preloaded
-   ├─ /usr/lib/spatiumddi/charts/spatiumddi-appliance.tgz   ← appliance chart
-   ├─ /usr/lib/spatiumddi/charts/spatiumddi.tgz             ← umbrella chart (Control plane)
-   └─ /var/lib/rancher/k3s/server/manifests/spatium-bootstrap.yaml
-        ↓ (firstboot writes on every boot, content depends on variant)
-   helm-controller reconciles → installs `spatium-bootstrap` release
-        ↓
-   spatium-supervisor pod (DaemonSet, privileged, hostNetwork: false)   ← all roles
-        ↓ (registers + heartbeats to control plane)
-        ↓ (on role assignment: labels node → DaemonSet schedules)
-   role pods: dns-bind9 / dns-powerdns / dns-technitium / dhcp-kea (hostNetwork: true)
-   always-on: agent-landing nginx on :80                                 ← Appliance only
-   control plane pods (api / frontend / db / redis / worker / beat /     ← Control plane
-                       migrate, frontend on hostNetwork :80 + :443)
-```
+<p align="center">
+  <img src="../assets/diagrams/appliance-k3s-layout.svg" alt="Appliance — single-node k3s on-disk layout and boot sequence" width="900"/>
+</p>
 
 ### What's bundled in the slot rootfs
 

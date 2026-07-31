@@ -23,21 +23,9 @@ All other drivers (currently just `kea`) are agented: the control plane renders 
 
 Today's drivers split into three shapes:
 
-```
-┌────────────────────────┐  ┌────────────────────────┐  ┌────────────────────────┐
-│  Agented + write       │  │  Agentless + read-only │  │  Agentless + write     │
-│  (Kea)                 │  │  (Windows DHCP—Path A) │  │  (FortiGate — cloud)   │
-│                        │  │                        │  │                        │
-│  Control plane:        │  │  Control plane:        │  │  Control plane:        │
-│    render_config()     │  │    get_leases() WinRM  │  │    apply_scope_full()  │
-│    ETag long-poll      │  │    get_scopes() WinRM  │  │      → REST PUT/POST   │
-│                        │  │                        │  │    get_leases() REST   │
-│  Agent (sidecar):      │  │  No agent.             │  │  No agent.             │
-│    fetch bundle        │  │  Writes raise          │  │  Whole-scope push,     │
-│    apply_config()      │  │    NotImplementedError.│  │    synchronous,        │
-│    reload / restart    │  │                        │  │    before-commit.      │
-└────────────────────────┘  └────────────────────────┘  └────────────────────────┘
-```
+<p align="center">
+  <img src="../assets/diagrams/dhcp-driver-shapes.svg" alt="DHCP driver shapes — agented vs agentless, read-only vs write" width="900"/>
+</p>
 
 The abstract base (`DHCPDriver`) has methods for both halves. Read-only agentless drivers (Windows) implement only the read methods + a stub `apply_config` / `reload` / `restart` / `validate_config` that raises; the API layer consults `READ_ONLY_DRIVERS` before offering write endpoints. Cloud agentless drivers (FortiGate) are write-capable but push the **whole scope object** synchronously over a REST API instead of rendering a daemon config bundle — see §5.
 

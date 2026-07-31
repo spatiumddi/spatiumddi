@@ -1,0 +1,112 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="448" viewBox="0 0 920 448"
+     preserveAspectRatio="xMidYMid meet"
+     font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+  <title>Combined IPAM tree navigator</title>
+  <desc>A single left-hand tree lists every IP space, block and subnet — including free-space rows — and clicking a subnet row opens its IP address list panel on the right.</desc>
+
+  <defs>
+    <marker id="ipamu-arrow" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#6d28d9"/>
+    </marker>
+  </defs>
+
+  <text x="32" y="36" font-size="18" font-weight="600" fill="#0f172a">Combined IPAM tree navigator</text>
+  <text x="32" y="58" font-size="12" fill="#475569">One tree replaces separate “IP Spaces” and “Subnets” pages — every space, block and subnet is a node.</text>
+
+  <!-- sidebar panel -->
+  <rect x="32" y="80" width="488" height="312" rx="12" fill="#ffffff" stroke="#e2e8f0" stroke-width="1.5"/>
+
+  <!-- selected row -->
+  <rect x="36" y="189" width="480" height="30" rx="6" fill="#eef2ff"/>
+  <rect x="36" y="189" width="3" height="30" rx="1.5" fill="#6d28d9"/>
+
+  <!-- indent guides -->
+  <g stroke="#e2e8f0" stroke-width="1.5" fill="none" stroke-linecap="round">
+    <path d="M 53 124 V 300"/>
+    <path d="M 53 140 H 68"/>
+    <path d="M 53 300 H 68"/>
+    <path d="M 75 156 V 268"/>
+    <path d="M 75 172 H 90"/>
+    <path d="M 75 268 H 90"/>
+    <path d="M 97 188 V 236"/>
+    <path d="M 97 204 H 112"/>
+    <path d="M 97 236 H 112"/>
+    <path d="M 75 316 V 332"/>
+    <path d="M 75 332 H 90"/>
+    <path d="M 97 348 V 364"/>
+    <path d="M 97 364 H 112"/>
+  </g>
+
+  <!-- IPAM (root) -->
+  <path d="M 50 105 L 60 105 L 55 112 Z" fill="#64748b"/>
+  <text x="66" y="113" font-size="13" font-weight="600" fill="#0f172a">IPAM</text>
+
+  <!-- Corporate (IPSpace) -->
+  <path d="M 72 137 L 82 137 L 77 144 Z" fill="#64748b"/>
+  <text x="88" y="145" font-size="13" font-weight="600" fill="#0f172a">Corporate</text>
+  <rect x="170" y="131" width="66" height="18" rx="9" fill="#ede9fe"/>
+  <text x="203" y="144" text-anchor="middle" font-size="11" font-weight="600" fill="#6d28d9">IPSpace</text>
+
+  <!-- 10.0.0.0/8 (IPBlock) -->
+  <path d="M 94 169 L 104 169 L 99 176 Z" fill="#64748b"/>
+  <text x="110" y="177" font-size="12" font-weight="600" fill="#0f172a"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace">10.0.0.0/8</text>
+  <rect x="224" y="163" width="66" height="18" rx="9" fill="#ede9fe"/>
+  <text x="257" y="176" text-anchor="middle" font-size="11" font-weight="600" fill="#6d28d9">IPBlock</text>
+
+  <!-- 10.0.1.0/24 (Subnet) — selected -->
+  <rect x="118" y="203" width="6" height="2" rx="1" fill="#94a3b8"/>
+  <text x="132" y="209" font-size="12" font-weight="600" fill="#0f172a"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace">10.0.1.0/24</text>
+  <rect x="246" y="195" width="66" height="18" rx="9" fill="#cffafe"/>
+  <text x="279" y="208" text-anchor="middle" font-size="11" font-weight="600" fill="#0e7490">Subnet</text>
+  <text x="324" y="209" font-size="11" fill="#475569">Servers · VLAN 10</text>
+
+  <!-- 10.0.2.0/24 (Subnet) -->
+  <rect x="118" y="235" width="6" height="2" rx="1" fill="#94a3b8"/>
+  <text x="132" y="241" font-size="12" font-weight="600" fill="#0f172a"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace">10.0.2.0/24</text>
+  <rect x="246" y="227" width="66" height="18" rx="9" fill="#cffafe"/>
+  <text x="279" y="240" text-anchor="middle" font-size="11" font-weight="600" fill="#0e7490">Subnet</text>
+  <text x="324" y="241" font-size="11" fill="#475569">Workstations</text>
+
+  <!-- free space row -->
+  <rect x="96" y="267" width="6" height="2" rx="1" fill="#cbd5e1"/>
+  <text x="110" y="273" font-size="11" font-style="italic" fill="#94a3b8"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace">(free: 10.1.0.0/8 – 10.255.0.0/8)</text>
+
+  <!-- OOB (IPSpace) -->
+  <path d="M 72 297 L 82 297 L 77 304 Z" fill="#64748b"/>
+  <text x="88" y="305" font-size="13" font-weight="600" fill="#0f172a">OOB</text>
+  <rect x="170" y="291" width="66" height="18" rx="9" fill="#ede9fe"/>
+  <text x="203" y="304" text-anchor="middle" font-size="11" font-weight="600" fill="#6d28d9">IPSpace</text>
+
+  <!-- 192.168.0.0/16 (IPBlock) -->
+  <path d="M 94 329 L 104 329 L 99 336 Z" fill="#64748b"/>
+  <text x="110" y="337" font-size="12" font-weight="600" fill="#0f172a"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace">192.168.0.0/16</text>
+  <rect x="224" y="323" width="66" height="18" rx="9" fill="#ede9fe"/>
+  <text x="257" y="336" text-anchor="middle" font-size="11" font-weight="600" fill="#6d28d9">IPBlock</text>
+
+  <!-- 192.168.1.0/24 (Subnet) -->
+  <rect x="118" y="363" width="6" height="2" rx="1" fill="#94a3b8"/>
+  <text x="132" y="369" font-size="12" font-weight="600" fill="#0f172a"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace">192.168.1.0/24</text>
+  <rect x="246" y="355" width="66" height="18" rx="9" fill="#cffafe"/>
+  <text x="279" y="368" text-anchor="middle" font-size="11" font-weight="600" fill="#0e7490">Subnet</text>
+
+  <!-- click -> IP list -->
+  <path d="M 528 204 H 570" stroke="#6d28d9" stroke-width="2" fill="none" marker-end="url(#ipamu-arrow)"/>
+  <text x="550" y="196" text-anchor="middle" font-size="11" font-weight="600" fill="#6d28d9">click</text>
+
+  <rect x="580" y="164" width="308" height="80" rx="12" fill="#ffffff" stroke="#cbd5e1"
+        stroke-width="1.5" stroke-dasharray="4 4"/>
+  <text x="600" y="192" font-size="14" font-weight="600" fill="#0f172a">IP address list</text>
+  <text x="600" y="212" font-size="12" font-weight="600" fill="#0e7490"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace">10.0.1.0/24</text>
+  <text x="600" y="232" font-size="11" fill="#475569">collapsible · auto-collapse above 1000 IPs</text>
+
+  <text x="32" y="418" font-size="12" fill="#475569">Muted rows mark unallocated free space inside a block; clicking a subnet opens its IP address list on the right.</text>
+</svg>

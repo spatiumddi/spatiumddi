@@ -1,0 +1,110 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="560" viewBox="0 0 920 560"
+     preserveAspectRatio="xMidYMid meet"
+     font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+  <title>SpatiumDDI clients, control plane and data plane</title>
+  <desc>Browsers and CLI/MCP clients call the control plane over HTTP and REST; the data-plane agents long-poll the api for config bundles, and Redis publishes wake events to the appliance supervisor.</desc>
+  <defs>
+    <linearGradient id="arch-surface" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#f1f5f9"/>
+      <stop offset="100%" stop-color="#e2e8f0"/>
+    </linearGradient>
+    <linearGradient id="arch-cp" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#8b5cf6"/>
+      <stop offset="100%" stop-color="#6d28d9"/>
+    </linearGradient>
+    <linearGradient id="arch-worker" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#a78bfa"/>
+      <stop offset="100%" stop-color="#7c3aed"/>
+    </linearGradient>
+    <linearGradient id="arch-store" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#34d399"/>
+      <stop offset="100%" stop-color="#059669"/>
+    </linearGradient>
+    <linearGradient id="arch-agent" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#fb923c"/>
+      <stop offset="100%" stop-color="#ea580c"/>
+    </linearGradient>
+    <linearGradient id="arch-client" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#22d3ee"/>
+      <stop offset="100%" stop-color="#0891b2"/>
+    </linearGradient>
+    <marker id="arch-arrow" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/>
+    </marker>
+  </defs>
+
+  <text x="40" y="40" font-size="18" font-weight="600" fill="#0f172a">Control plane and data plane</text>
+  <text x="40" y="62" font-size="12" fill="#475569">One control plane is the source of truth; the data-plane containers are projections of it.</text>
+
+  <text x="40" y="94" font-size="13" font-weight="600" fill="#334155">Clients</text>
+  <text x="300" y="94" font-size="13" font-weight="600" fill="#334155">Control plane</text>
+  <text x="720" y="94" font-size="13" font-weight="600" fill="#334155">Data plane</text>
+
+  <!-- Clients -->
+  <rect x="40" y="110" width="180" height="180" rx="16"
+        fill="url(#arch-surface)" stroke="#94a3b8" stroke-width="2"/>
+  <rect x="58" y="140" width="144" height="56" rx="8" fill="url(#arch-client)"/>
+  <text x="130" y="164" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">Browser</text>
+  <text x="130" y="182" text-anchor="middle" font-size="11" fill="#cffafe">React SPA</text>
+  <rect x="58" y="216" width="144" height="56" rx="8" fill="url(#arch-client)"/>
+  <text x="130" y="240" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">CLI / API / MCP</text>
+  <text x="130" y="258" text-anchor="middle" font-size="11" fill="#cffafe">REST + MCP clients</text>
+
+  <!-- Control plane -->
+  <rect x="300" y="110" width="340" height="422" rx="16"
+        fill="url(#arch-surface)" stroke="#94a3b8" stroke-width="2"/>
+  <rect x="318" y="140" width="304" height="56" rx="8" fill="url(#arch-cp)"/>
+  <text x="470" y="164" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">frontend</text>
+  <text x="470" y="182" text-anchor="middle" font-size="11" fill="#ddd6fe">nginx + SPA</text>
+
+  <rect x="318" y="212" width="304" height="84" rx="8" fill="url(#arch-cp)"/>
+  <text x="470" y="236" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">api — FastAPI / uvicorn</text>
+  <text x="470" y="258" text-anchor="middle" font-size="11" fill="#ddd6fe">REST + OpenAPI</text>
+  <text x="470" y="276" text-anchor="middle" font-size="11" fill="#ddd6fe">/api/v1/ai/mcp — MCP surface</text>
+
+  <rect x="318" y="312" width="146" height="56" rx="8" fill="url(#arch-worker)"/>
+  <text x="391" y="336" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">worker</text>
+  <text x="391" y="354" text-anchor="middle" font-size="11" fill="#ddd6fe">Celery</text>
+  <rect x="476" y="312" width="146" height="56" rx="8" fill="url(#arch-worker)"/>
+  <text x="549" y="336" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">beat</text>
+  <text x="549" y="354" text-anchor="middle" font-size="11" fill="#ddd6fe">Celery schedule</text>
+
+  <rect x="318" y="384" width="304" height="56" rx="8" fill="url(#arch-store)"/>
+  <text x="470" y="408" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">PostgreSQL 16</text>
+  <text x="470" y="426" text-anchor="middle" font-size="11" fill="#a7f3d0">the source of truth</text>
+  <rect x="318" y="456" width="304" height="56" rx="8" fill="url(#arch-store)"/>
+  <text x="470" y="480" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">Redis 7</text>
+  <text x="470" y="498" text-anchor="middle" font-size="11" fill="#a7f3d0">broker + wake pub/sub</text>
+
+  <!-- Data plane -->
+  <rect x="720" y="110" width="176" height="288" rx="16"
+        fill="url(#arch-surface)" stroke="#94a3b8" stroke-width="2"/>
+  <rect x="738" y="140" width="140" height="68" rx="8" fill="url(#arch-agent)"/>
+  <text x="808" y="166" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">DNS agent</text>
+  <text x="808" y="184" text-anchor="middle" font-size="11" fill="#fed7aa">BIND9 / PowerDNS</text>
+  <rect x="738" y="224" width="140" height="68" rx="8" fill="url(#arch-agent)"/>
+  <text x="808" y="250" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">DHCP agent</text>
+  <text x="808" y="268" text-anchor="middle" font-size="11" fill="#fed7aa">Kea</text>
+  <rect x="738" y="308" width="140" height="68" rx="8" fill="url(#arch-agent)"/>
+  <text x="808" y="334" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">supervisor</text>
+  <text x="808" y="352" text-anchor="middle" font-size="11" fill="#fed7aa">appliance host</text>
+
+  <!-- Client traffic -->
+  <path d="M 202 168 H 312" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#arch-arrow)"/>
+  <text x="257" y="160" text-anchor="middle" font-size="11" fill="#475569">HTTP</text>
+  <path d="M 202 244 H 312" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#arch-arrow)"/>
+  <text x="257" y="236" text-anchor="middle" font-size="11" fill="#475569">REST</text>
+
+  <!-- Agents long-poll the api -->
+  <path d="M 714 254 H 628" stroke="#ea580c" stroke-width="2" stroke-dasharray="6 4"
+        fill="none" marker-end="url(#arch-arrow)"/>
+  <text x="671" y="246" text-anchor="middle" font-size="11" fill="#475569">long poll</text>
+  <text x="671" y="272" text-anchor="middle" font-size="11" fill="#475569">(ETag)</text>
+
+  <!-- Redis wake bus -->
+  <path d="M 626 484 H 808 V 404" stroke="#059669" stroke-width="2" stroke-dasharray="6 4"
+        fill="none" marker-end="url(#arch-arrow)"/>
+  <text x="798" y="476" text-anchor="end" font-size="11" fill="#475569">pub/sub</text>
+</svg>

@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="616" viewBox="0 0 920 616"
+     preserveAspectRatio="xMidYMid meet"
+     font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+  <title>DDNS — DHCP lease to DNS record</title>
+  <desc>A lease arriving from the agentless Windows DHCP pull or a Kea agent lease event upserts a DHCPLease row and mirrors it into IPAM, then apply_ddns_for_lease resolves a hostname and calls _sync_dns_record to publish A, AAAA and PTR records.</desc>
+
+  <defs>
+    <linearGradient id="ddns-surface" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#f1f5f9"/>
+      <stop offset="100%" stop-color="#e2e8f0"/>
+    </linearGradient>
+    <linearGradient id="ddns-source" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#fb923c"/>
+      <stop offset="100%" stop-color="#ea580c"/>
+    </linearGradient>
+    <linearGradient id="ddns-cp" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#8b5cf6"/>
+      <stop offset="100%" stop-color="#6d28d9"/>
+    </linearGradient>
+    <linearGradient id="ddns-worker" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#a78bfa"/>
+      <stop offset="100%" stop-color="#7c3aed"/>
+    </linearGradient>
+    <marker id="ddns-arrow" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/>
+    </marker>
+  </defs>
+
+  <text x="24" y="36" font-size="18" font-weight="600" fill="#0f172a">DDNS — DHCP lease to DNS record</text>
+  <text x="24" y="58" font-size="12" fill="#475569">Either lease source upserts DHCPLease and mirrors it into IPAM; DDNS then publishes A/AAAA + PTR through the static-allocation path.</text>
+
+  <rect x="24" y="68" width="872" height="522" rx="16" fill="url(#ddns-surface)" stroke="#94a3b8" stroke-width="1.5"/>
+
+  <!-- Stage 1 — lease source -->
+  <rect x="48" y="84" width="330" height="124" rx="8" fill="url(#ddns-source)"/>
+  <text x="66" y="110" font-size="14" font-weight="600" fill="#ffffff">Lease source</text>
+  <path d="M 66 122 H 360" stroke="#fed7aa" stroke-width="1" opacity="0.6"/>
+  <rect x="66" y="145" width="8" height="2" rx="1" fill="#fed7aa"/>
+  <text x="80" y="150" font-size="13" font-weight="600" fill="#ffffff">agentless pull</text>
+  <text x="193" y="150" font-size="11" fill="#fed7aa">(Windows DHCP)</text>
+  <rect x="66" y="181" width="8" height="2" rx="1" fill="#fed7aa"/>
+  <text x="80" y="186" font-size="13" font-weight="600" fill="#ffffff">agent lease event</text>
+  <text x="222" y="186" font-size="11" fill="#fed7aa">(Kea)</text>
+
+  <path d="M 386 150 H 426" stroke="#64748b" stroke-width="1.5" fill="none" marker-end="url(#ddns-arrow)"/>
+  <text x="436" y="144" font-size="12" fill="#475569">upserts DHCPLease + mirrors into IPAM</text>
+  <text x="436" y="160" font-size="12" fill="#475569"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace">as auto_from_lease=True</text>
+
+  <path d="M 386 186 H 426" stroke="#64748b" stroke-width="1.5" fill="none" marker-end="url(#ddns-arrow)"/>
+  <text x="436" y="190" font-size="12" fill="#475569">Kea (POST /agents/lease-events)</text>
+
+  <!-- 1 -> 2 -->
+  <path d="M 213 208 V 246" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#ddns-arrow)"/>
+  <text x="224" y="233" font-size="11" font-weight="600" fill="#475569"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace">ipam_row</text>
+
+  <!-- Stage 2 — ddns resolver -->
+  <rect x="48" y="250" width="330" height="80" rx="8" fill="url(#ddns-cp)"/>
+  <text x="66" y="282" font-size="14" font-weight="600" fill="#ffffff"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace">services/dns/ddns.py</text>
+  <text x="66" y="302" font-size="12" fill="#ddd6fe"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace">apply_ddns_for_lease()</text>
+
+  <path d="M 386 290 H 426" stroke="#64748b" stroke-width="1.5" fill="none" marker-end="url(#ddns-arrow)"/>
+  <text x="436" y="274" font-size="12" fill="#475569">resolves hostname per subnet policy,</text>
+  <text x="436" y="292" font-size="12" fill="#475569">writes it onto ipam_row.hostname,</text>
+  <text x="436" y="310" font-size="12" fill="#475569">calls _sync_dns_record(..., "create")</text>
+
+  <!-- 2 -> 3 -->
+  <path d="M 213 330 V 380" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#ddns-arrow)"/>
+
+  <!-- Stage 3 — record sync -->
+  <rect x="48" y="384" width="330" height="80" rx="8" fill="url(#ddns-worker)"/>
+  <text x="66" y="416" font-size="14" font-weight="600" fill="#ffffff"
+        font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', monospace">_sync_dns_record</text>
+  <text x="66" y="436" font-size="12" fill="#ddd6fe">(IPAM router)</text>
+
+  <path d="M 386 424 H 426" stroke="#64748b" stroke-width="1.5" fill="none" marker-end="url(#ddns-arrow)"/>
+  <text x="436" y="408" font-size="12" fill="#475569">unchanged — drives A/AAAA + PTR via</text>
+  <text x="436" y="426" font-size="12" fill="#475569">RFC 2136 for BIND9 / Windows Path A,</text>
+  <text x="436" y="444" font-size="12" fill="#475569">or WinRM for Windows Path B</text>
+
+  <!-- expiry footnote -->
+  <rect x="48" y="496" width="824" height="70" rx="12" fill="#ffffff" stroke="#cbd5e1"
+        stroke-width="1.5" stroke-dasharray="4 4"/>
+  <text x="66" y="522" font-size="12" font-weight="600" fill="#0f172a">On lease expiry</text>
+  <text x="66" y="542" font-size="11" fill="#475569">dhcp_lease_cleanup sweeps the DHCPLease row past its grace period; before deleting the mirrored</text>
+  <text x="66" y="558" font-size="11" fill="#475569">auto_from_lease IPAM row it calls revoke_ddns_for_lease, which fires _sync_dns_record(..., action="delete").</text>
+</svg>

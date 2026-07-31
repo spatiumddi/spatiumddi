@@ -606,21 +606,9 @@ exercised as production would.
 
 **Per-device FSM:**
 
-```
-            arrival (diurnal-scheduled)
-                 │
-                 ▼
-   ┌──────► OFFLINE ──boot──► DISCOVERING ──(DORA)──► ONLINE (lease held)
-   │                                                       │ at T1 = 900s
-   │                                                       ▼
-   │                                                  RENEWING ──ACK──► ONLINE
-   │                                                       │ (T1 fails) at T2 = 1800s
-   │                                                       ▼
-   │                                                  REBINDING ──ACK──► ONLINE
-   │                                                       │ (rebind fails / lapse)
-   │                                                       ▼
-   └────────── LEFT ◄──release── DEPARTING ◄── departure (diurnal/dwell-time)
-```
+<p align="center">
+  <img src="assets/diagrams/perf-client-state-machine.svg" alt="Simulated DHCP client — per-device state machine" width="900"/>
+</p>
 
 - **DORA on arrival** → first `dhcp_lease` INSERT + `ip_address` mirror INSERT +
   DDNS publish (A+PTR). Record `(IP, lease_time, T1=900, T2=1800)`.
@@ -1447,21 +1435,9 @@ against the live API during provisioning (response schemas in
 
 ### 7.1 Runner architecture + the setpoint bus
 
-```
-       load-gen boxes                                SUT (clean appliance)
- ┌───────────────────────────────┐           ┌──────────────────────────────┐
- │ spddi-perf CONTROLLER (lg-0)   │           │ k3s AIO node IP              │
- │  ├ Phase engine (diurnal)      │           │  :67 kea (hostNetwork)       │
- │  ├ Setpoint bus (rate targets) │  L2/relay │  :53 bind9 (hostNetwork)     │
- │  ├ Watchdog (health + abort)   │ ────────► │  :443 frontend→api           │
- │  ├ Checkpointer (state/events) │   API     │  CNPG 1 / Redis 1 / worker 1 │
- │  └ Collector (artifacts)       │ ────────► │                              │
- │ WORKERS:                       │           └──────────────────────────────┘
- │  • perfdhcp shards (lg-1)      │
- │  • dnsperf/flamethrower (lg-1) │           WAR-ROOM POLLER (lg-0, read-only):
- │  • orchestrator shards (lg-2)  │            /health/platform, /admin/*, /metrics/*
- └───────────────────────────────┘            + direct psql for pg_locks/deadlocks
-```
+<p align="center">
+  <img src="assets/diagrams/perf-lab-topology.svg" alt="Perf lab topology — runner architecture and the setpoint bus" width="900"/>
+</p>
 
 **Setpoint bus.** The diurnal curve is sampled on a **60s tick** (matched to the
 appliance's native 60s metric buckets), publishing a setpoint record to

@@ -1,0 +1,114 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="840" viewBox="0 0 920 840"
+     preserveAspectRatio="xMidYMid meet"
+     font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+  <title>DNS record change — end-to-end propagation</title>
+  <desc>A record mutation is validated and written in the service layer, enqueued as RecordOp rows, returned to the caller, released to agents holding a config long-poll, applied over loopback nsupdate on BIND9, and acknowledged on the next heartbeat.</desc>
+  <defs>
+    <linearGradient id="dnsp-cp" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#8b5cf6"/>
+      <stop offset="100%" stop-color="#6d28d9"/>
+    </linearGradient>
+    <linearGradient id="dnsp-worker" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#a78bfa"/>
+      <stop offset="100%" stop-color="#7c3aed"/>
+    </linearGradient>
+    <linearGradient id="dnsp-store" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#34d399"/>
+      <stop offset="100%" stop-color="#059669"/>
+    </linearGradient>
+    <linearGradient id="dnsp-accent" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#22d3ee"/>
+      <stop offset="100%" stop-color="#0891b2"/>
+    </linearGradient>
+    <linearGradient id="dnsp-agent" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#fb923c"/>
+      <stop offset="100%" stop-color="#ea580c"/>
+    </linearGradient>
+    <linearGradient id="dnsp-danger" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#f87171"/>
+      <stop offset="100%" stop-color="#dc2626"/>
+    </linearGradient>
+    <linearGradient id="dnsp-surface" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#f1f5f9"/>
+      <stop offset="100%" stop-color="#e2e8f0"/>
+    </linearGradient>
+    <marker id="dnsp-arrow" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#475569"/>
+    </marker>
+  </defs>
+
+  <text x="460" y="38" text-anchor="middle" font-size="18" font-weight="600" fill="#0f172a">DNS record change — end-to-end propagation</text>
+
+  <!-- 1. UI / API mutation -->
+  <g>
+    <rect x="180" y="66" width="560" height="62" rx="8" fill="url(#dnsp-cp)"/>
+    <text x="460" y="92" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">UI / API mutation</text>
+    <text x="460" y="112" text-anchor="middle" font-size="11" fill="#ddd6fe">e.g. POST /dns/zones/{id}/records</text>
+  </g>
+  <path d="M 460 128 V 156" stroke="#475569" stroke-width="2" fill="none" marker-end="url(#dnsp-arrow)"/>
+
+  <!-- 2. Service layer -->
+  <g>
+    <rect x="180" y="156" width="560" height="62" rx="8" fill="url(#dnsp-worker)"/>
+    <text x="460" y="182" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">Service layer</text>
+    <text x="460" y="202" text-anchor="middle" font-size="11" fill="#ddd6fe">validate · write DNSRecord row · compute delta</text>
+  </g>
+  <path d="M 460 218 V 246" stroke="#475569" stroke-width="2" fill="none" marker-end="url(#dnsp-arrow)"/>
+
+  <!-- 3. Enqueue RecordOp rows -->
+  <g>
+    <rect x="180" y="246" width="560" height="104" rx="8" fill="url(#dnsp-store)"/>
+    <text x="460" y="272" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">Enqueue RecordOp rows</text>
+    <text x="204" y="296" font-size="11" fill="#a7f3d0">{ id, server_id, zone_name, op: create | update | delete,</text>
+    <text x="204" y="314" font-size="11" fill="#a7f3d0">  record: {…}, serial_strategy: bump, created_at,</text>
+    <text x="204" y="332" font-size="11" fill="#a7f3d0">  state: pending }</text>
+  </g>
+  <path d="M 460 350 V 378" stroke="#475569" stroke-width="2" fill="none" marker-end="url(#dnsp-arrow)"/>
+
+  <!-- 4. Response to caller -->
+  <g>
+    <rect x="180" y="378" width="560" height="58" rx="8" fill="url(#dnsp-surface)" stroke="#94a3b8" stroke-width="1.5"/>
+    <text x="460" y="402" text-anchor="middle" font-size="13" font-weight="600" fill="#0f172a">Response returned to caller (HTTP 2xx)</text>
+    <text x="460" y="422" text-anchor="middle" font-size="11" fill="#475569">the write is already durable in Postgres</text>
+  </g>
+  <path d="M 460 436 V 464" stroke="#475569" stroke-width="2" fill="none" marker-end="url(#dnsp-arrow)"/>
+
+  <!-- 5. Long-poll released -->
+  <g>
+    <rect x="180" y="464" width="560" height="68" rx="8" fill="url(#dnsp-accent)"/>
+    <text x="460" y="490" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">Agents holding a long-poll on /config are released</text>
+    <text x="460" y="512" text-anchor="middle" font-size="11" fill="#cffafe">or the next long-poll picks it up within ≤ 30 s — idempotent by op_id</text>
+  </g>
+  <path d="M 460 532 V 560" stroke="#475569" stroke-width="2" fill="none" marker-end="url(#dnsp-arrow)"/>
+
+  <!-- 6. Agent applies -->
+  <g>
+    <rect x="180" y="560" width="560" height="68" rx="8" fill="url(#dnsp-agent)"/>
+    <text x="460" y="586" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">Agent executes via loopback</text>
+    <text x="460" y="608" text-anchor="middle" font-size="11" fill="#fed7aa">BIND9 → nsupdate ‹signed with the local TSIG key›</text>
+  </g>
+  <path d="M 460 628 V 656" stroke="#475569" stroke-width="2" fill="none" marker-end="url(#dnsp-arrow)"/>
+
+  <!-- 7. ACK -->
+  <g>
+    <rect x="180" y="656" width="560" height="50" rx="8" fill="#475569"/>
+    <text x="460" y="686" text-anchor="middle" font-size="13" font-weight="600" fill="#ffffff">Agent ACKs on the next heartbeat</text>
+  </g>
+  <path d="M 310 706 V 736" stroke="#475569" stroke-width="2" fill="none" marker-end="url(#dnsp-arrow)"/>
+  <path d="M 600 706 V 736" stroke="#475569" stroke-width="2" fill="none" marker-end="url(#dnsp-arrow)"/>
+
+  <!-- Outcomes -->
+  <g>
+    <rect x="180" y="736" width="260" height="76" rx="8" fill="url(#dnsp-store)"/>
+    <text x="310" y="762" text-anchor="middle" font-size="13" font-weight="600" fill="#ffffff">RecordOp.state = applied</text>
+    <text x="310" y="782" text-anchor="middle" font-size="11" fill="#a7f3d0">op complete on this server</text>
+  </g>
+  <g>
+    <rect x="460" y="736" width="280" height="76" rx="8" fill="url(#dnsp-danger)"/>
+    <text x="600" y="758" text-anchor="middle" font-size="13" font-weight="600" fill="#ffffff">state = failed → alert</text>
+    <text x="600" y="777" text-anchor="middle" font-size="11" fill="#fee2e2">after N retries</text>
+    <text x="600" y="794" text-anchor="middle" font-size="11" fill="#fee2e2">(default 5, expo-backoff)</text>
+  </g>
+</svg>
