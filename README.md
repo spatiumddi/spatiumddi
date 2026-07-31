@@ -13,7 +13,7 @@
   <a href="https://github.com/spatiumddi/spatiumddi/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/spatiumddi/spatiumddi/ci.yml?branch=main&label=CI" alt="CI"/></a>
   <a href="https://github.com/spatiumddi/spatiumddi/security/code-scanning"><img src="https://img.shields.io/badge/security-CodeQL-1f6feb" alt="CodeQL"/></a>
   <a href="https://github.com/spatiumddi/spatiumddi/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"/></a>
-  <a href="https://spatiumddi.github.io"><img src="https://img.shields.io/badge/docs-github.io-informational" alt="Docs"/></a>
+  <a href="https://www.spatiumddi.com"><img src="https://img.shields.io/badge/docs-spatiumddi.com-informational" alt="Docs"/></a>
   <img src="https://img.shields.io/badge/status-beta-blue" alt="Status"/>
 </p>
 
@@ -1302,7 +1302,7 @@ EOF
 
 ## Documentation
 
-Full docs at **[spatiumddi.github.io](https://spatiumddi.github.io)** — published on every release. For documentation tracking `main` ahead of the current release, see [spatiumddi.github.io/spatiumddi](https://spatiumddi.github.io/spatiumddi/).
+Full docs at **[www.spatiumddi.com](https://www.spatiumddi.com)** — republished automatically on every push to `main`.
 
 | Document | Description |
 |---|---|
@@ -1388,5 +1388,5 @@ Bundled components (BIND9, ISC Kea) are distributed under their own licenses. Se
 ---
 
 <p align="center">
-  Built with ❤️ by the SpatiumDDI community · <a href="https://spatiumddi.github.io">spatiumddi.github.io</a>
+  Built with ❤️ by the SpatiumDDI community · <a href="https://www.spatiumddi.com">www.spatiumddi.com</a>
 </p>

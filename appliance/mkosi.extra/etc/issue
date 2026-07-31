@@ -19,6 +19,6 @@
      sudo systemctl status spatiumddi-firstboot     boot orchestrator state
      sudo tail -f /var/log/spatiumddi/firstboot.log
 
-   Docs:  https://spatiumddi.github.io/spatiumddi/
+   Docs:  https://www.spatiumddi.com/
 
 

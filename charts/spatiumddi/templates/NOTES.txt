@@ -61,4 +61,4 @@ Chart:      {{ .Chart.Name }}-{{ .Chart.Version }} (app {{ .Chart.AppVersion }})
 {{- end }}
 {{- end }}
 
-Docs: https://spatiumddi.github.io/spatiumddi/
+Docs: https://www.spatiumddi.com/
