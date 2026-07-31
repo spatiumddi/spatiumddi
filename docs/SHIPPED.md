@@ -1597,10 +1597,9 @@ Mirrors CLAUDE.md's three mixed sections:
   `mode=consumer` ships the producer's IP. The agent renders
   the catalog zone file per RFC 9432 §4.1 — SOA + NS at apex,
   `version IN TXT "2"`, and one `<sha1-of-wire-name>.zones IN
-  PTR <member>` per primary zone — and on consumers injects a
-  single `catalog-zones { zone "<catalog>." default-masters {
-  <producer-ip>; } in-memory yes; };` directive into the
-  options block. The catalog block is part of the structural
+  PTR <member>` per primary zone — and on consumers injects a single
+  `catalog-zones { zone "<catalog>." default-masters { <producer-ip>; } in-memory yes; };`
+  directive into the options block. The catalog block is part of the structural
   ETag so membership changes trigger a daemon reload, and SHA-1
   hashing uses the proper wire format (length-prefixed labels +
   null terminator) so consumer BINDs find the same labels.

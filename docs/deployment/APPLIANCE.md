@@ -808,9 +808,10 @@ one whole disk. Prefer a stable `/dev/disk/by-id/…` or `by-path/…` id
 (a bare `sda` can renumber). A supplied-but-unresolvable disk drops to
 the interactive picker rather than guessing.
 
-**Lint a preseed offline (#581).** `spatium-install --check-preseed
-<preseed.yaml>` dry-runs the answer file **without installing
-anything** — it is unprivileged, read-only, and host-portable (runs
+**Lint a preseed offline (#581).**
+`spatium-install --check-preseed <preseed.yaml>` dry-runs the answer
+file **without installing anything** — it is unprivileged, read-only,
+and host-portable (runs
 identically on a dev laptop and the appliance). It parses the file via
 the same `spatium-preseed-parse` helper a real headless install uses,
 then re-runs the wizard's own validators (hostname RFC 1123; k3s CIDR
