@@ -1302,7 +1302,7 @@ EOF
 
 ## Documentation
 
-Full docs at **[www.spatiumddi.com](https://www.spatiumddi.com)** — published on every release. For documentation tracking `main` ahead of the current release, see [www.spatiumddi.com/spatiumddi](https://www.spatiumddi.com/spatiumddi/).
+Full docs at **[www.spatiumddi.com](https://www.spatiumddi.com)** — republished automatically on every push to `main`.
 
 | Document | Description |
 |---|---|

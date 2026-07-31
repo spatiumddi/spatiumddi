@@ -2,17 +2,20 @@
 #
 # The documentation is served from TWO GitHub Pages sites:
 #
-#   * https://www.spatiumddi.com/spatiumddi/  — project site, built by
-#     GitHub directly from this repo's `main` branch, `/docs` path. Always
-#     current with `main`; needs no workflow.
 #   * https://www.spatiumddi.com/            — organization site, which
 #     GitHub only ever serves from a repo named `<org>.github.io`. That repo
 #     holds no source of its own — this workflow mirrors `docs/` into it.
+#   * https://www.spatiumddi.com/spatiumddi/  — project site, built by
+#     GitHub directly from this repo's `main` branch, `/docs` path. Needs no
+#     workflow.
 #
-# The root site therefore tracks the last RELEASE, while the project site
-# tracks `main`. That is deliberate: the root URL is what the README badge,
-# docs/sitemap.xml and docs/robots.txt advertise to users and search engines,
-# so it should show released documentation, not unreleased work in flight.
+# Both track `main`. The root site was originally release-pinned so users saw
+# released documentation, but that meant a docs fix could sit unpublished for
+# weeks behind the release cadence, which is the wrong trade for a docs site:
+# a correction nobody can read is worse than documentation slightly ahead of
+# the release. The two sites now serve the same content, and the root is the
+# canonical one — it is what the README badge, sitemap.xml and robots.txt
+# advertise.
 #
 # Auth: GITHUB_TOKEN is scoped to the repo running the workflow and cannot
 # push to another repo, so this uses an SSH deploy key registered on the
@@ -23,8 +26,19 @@ name: Publish docs site
 
 on:
   push:
+    # Every main push, so the published site is never staler than the branch.
+    branches:
+      - main
+    # Release tags too. Redundant in the common case (the tagged commit was
+    # already published when it landed on main) but it makes a release
+    # deterministically republish, and the job no-ops when nothing changed.
     tags:
       - "[0-9][0-9][0-9][0-9].[0-9][0-9].[0-9][0-9]-*" # e.g. 2026.04.13-1
+    # NOTE: deliberately no `paths:` filter. A paths filter applies to tag
+    # pushes as well, and a tag push carries no changed-file list, so the
+    # filter would never match and releases would silently stop publishing.
+    # Filtering is unnecessary anyway: the job exits early and green when
+    # docs/ produced no diff.
   # Manual re-run, e.g. after fixing the site repo by hand or rotating the key.
   workflow_dispatch:
     inputs:
@@ -71,8 +85,12 @@ jobs:
         run: |
           if [ "$REF_TYPE" = "tag" ]; then
             echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          elif [ -n "$INPUT_REF" ]; then
+            echo "version=${INPUT_REF}" >> "$GITHUB_OUTPUT"
           else
-            echo "version=${INPUT_REF:-$GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+            # Branch push: label with branch@short-sha so the site history says
+            # which commit produced it rather than a bare 40-char sha.
+            echo "version=${GITHUB_REF_NAME}@$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Configure deploy key
