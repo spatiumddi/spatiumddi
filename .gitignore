@@ -67,3 +67,9 @@ scratchpad-*.md
 
 # Trivy vulnerability-DB cache (make trivy)
 .trivy-cache/
+
+# Jekyll local docs preview (make docs writes inside the container, but a
+# bare `jekyll build` in docs/ would drop these into the tree).
+docs/_site/
+docs/.jekyll-cache/
+docs/.jekyll-metadata

@@ -1,5 +1,6 @@
 .PHONY: help up down dev build build-supervisor migrate lint test lint-backend lint-frontend test-backend \
         ci ci-backend-lint ci-frontend-lint ci-frontend-build screenshots \
+        docs docs-down docs-verify \
         trivy \
         appliance appliance-builder appliance-iso appliance-clean \
         appliance-bake-images appliance-clean-baked-images appliance-dev-iso \
@@ -52,6 +53,9 @@ help:
 	@echo "  make test        Run backend tests against a live DB"
 	@echo "  make ci          Run the exact same lint + typecheck + build jobs CI runs"
 	@echo "  make screenshots Re-capture docs/assets/screenshots/ via headless chromium"
+	@echo "  make docs        Serve the documentation site locally on :4000 (Jekyll)"
+	@echo "  make docs-down   Stop the local documentation site"
+	@echo "  make docs-verify Check every docs SVG diagram for overflow / clipping"
 	@echo "  make appliance      Build the OS-appliance qcow2 (Phase 1 — Debian 13 amd64)"
 	@echo "  make appliance-iso  Wrap the Phase 1 raw image as a hybrid USB/CD ISO (Phase 2)"
 	@echo ""
@@ -296,6 +300,24 @@ screenshots:
 	@test -d scripts/screenshots/node_modules || \
 	  (cd scripts/screenshots && npm install --no-audit --no-fund)
 	node scripts/screenshots/capture.mjs $(SCREENSHOT_ARGS)
+
+# ── Docs site ──────────────────────────────────────────────────────────────────
+# Renders docs/ with the same Jekyll plugin set GitHub Pages uses, so a page can
+# be reviewed before it ships. Override the port with DOCS_PORT=8081.
+docs:
+	docker compose -f docker-compose.docs.yml up -d --build
+	@echo "docs site → http://localhost:$${DOCS_PORT:-4000}  (make docs-down to stop)"
+
+docs-down:
+	docker compose -f docker-compose.docs.yml down
+
+# Diagram geometry gate — the same check CI runs. Measures real text metrics in
+# headless Chromium, so a relabelled box that now spills out of its container
+# fails here instead of on the published site.
+docs-verify:
+	@test -x /usr/bin/chromium || command -v google-chrome >/dev/null || \
+	  (echo "chromium missing — apt-get install -y chromium"; exit 1)
+	python3 scripts/verify_svg_diagrams.py
 
 # ── OS Appliance (Phase 1: Debian 13 amd64 qcow2 MVP) ──────────────────────────
 # See appliance/README.md for the full design + prereqs.
