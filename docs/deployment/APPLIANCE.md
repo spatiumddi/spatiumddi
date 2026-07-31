@@ -83,8 +83,9 @@ The api pod's ServiceAccount keeps minimal RBAC: namespace-scoped pods + pods/lo
 2. Installer partitions (BIOS Boot + ESP + root_A + root_B + var), writes fstab + grub menuentries, runs postinst hardening, reboots.
 3. First-boot: `spatiumddi-firstboot` generates `/etc/spatiumddi/.env` with secrets, bakes the self-signed cert, writes the HelmChart bootstrap manifest, starts k3s.
 4. k3s comes up + imports baked images + helm-controller installs the bootstrap release. 30-90 s for control plane pods to reach Ready; another 15-30 s for migrate Job to complete schema migrations.
-5. Operator browses to `https://<appliance-ip>/`, accepts the self-signed cert, signs in `admin / admin`, sets a real password.
-6. (Appliance role, or a Control-plane node enabling DNS/DHCP) Operator approves the appliance from the control plane's `/appliance → Fleet` tab + picks roles. DaemonSet schedules role pods within ~30 s.
+5. Operator browses to `https://<appliance-ip>/`. Until the api is serving, the frontend nginx answers every page with the **"SpatiumDDI is initialising"** page (`frontend/public/_starting.html`, auto-refreshing every 5 s) instead of the SPA shell — `location /` gates on an `auth_request` probe of the api Service, so a cold boot reads as "still coming up" rather than a wall of failed XHRs (#767).
+6. Operator accepts the self-signed cert **once** and signs in `admin / admin`, then sets a real password. The cert firstboot minted in step 3 is the only one the operator ever sees: the api's startup bootstrap *adopts* it as the active `appliance_certificate` row rather than generating a rival (#767), so the fingerprint doesn't change mid-boot and the frontend isn't rolled underneath the operator.
+7. (Appliance role, or a Control-plane node enabling DNS/DHCP) Operator approves the appliance from the control plane's `/appliance → Fleet` tab + picks roles. DaemonSet schedules role pods within ~30 s.
 
 For a step-by-step user-facing version, see the README's
 ["Quick start with the OS appliance ISO" section](../../README.md#quick-start-with-the-os-appliance-iso-recommended).
@@ -133,10 +134,12 @@ the reference topologies are in
   Provides the control-plane VIP; BGP templates render spec-only for the
   anycast-DNS follow-up.
 - **One TLS cert, cluster-wide**, in the `spatium-appliance-tls` Secret,
-  mounted by every frontend replica. The self-signed default uses stable
-  host identity (never the pod) and **auto-grows its SANs to cover every
-  member's hostname + node IP + the VIP** — an operator-uploaded / CSR
-  cert is never auto-replaced.
+  mounted by every frontend replica. The self-signed default is the one
+  firstboot wrote — the api's startup bootstrap adopts it rather than
+  minting a rival, so an operator is never asked to trust a second cert
+  mid-boot (#767). It uses stable host identity (never the pod) and
+  **auto-grows its SANs to cover every member's hostname + node IP + the
+  VIP** — an operator-uploaded / CSR cert is never auto-replaced.
 
 ### How a promote settles (per-tick, hands-off)
 
@@ -369,10 +372,29 @@ the per-node `:80/:443` accept in the nftables drop-in (every renderer emits an
 un-scoped accept when empty, a family-split `ip saddr { … }` accept when set),
 and the MetalLB control-plane VIP via `loadBalancerSourceRanges` (threaded onto
 the frontend Service through the supervisor's `apply_control_plane_overrides`
-HelmChartConfig overlay). Because the drop-in is now the *sole* source of the
-`80/443` accept (the base `/etc/nftables.conf` no longer opens it), the
-supervisor renders it on **every** appliance heartbeat — including idle / non-CP
-nodes — so the rule is always present. `PUT /appliance/firewall/web-ui-access`
+HelmChartConfig overlay). Because the base `/etc/nftables.conf` no longer opens
+`80/443`, the supervisor renders the drop-in accept on **every** appliance
+heartbeat — including idle / non-CP nodes — so the rule is always present.
+
+**Cold-boot reachability (#769).** The drop-in alone was not enough: the
+supervisor can only render it after its first successful heartbeat, and on a
+control-plane appliance that heartbeat goes to the *local* api — so `:80/:443`
+stayed filtered until the api was already serving. Measured on a clean install:
+boot 20:57:02, api `Ready` 20:59:39, drop-in applied **21:00:20**. An operator
+browsing a booting box got a ~3-minute connection timeout, and the "SpatiumDDI
+is initialising" page (#767 / #299) — which exists for exactly that window — was
+unreachable for all of it. So a baked sentinel
+`/etc/nftables.d/00-spatium-webui.nft` opens `80/443` from first boot, before
+the supervisor exists. It is the Web-UI twin of `00-spatium-k3s-bootstrap.nft`
+and shares its lifecycle: it lives in `/etc` (rides the overlay, survives A/B
+slot swaps) and the renderers stamp `# spatium-webui: retire|keep` in the
+drop-in header for `spatium-firewall-reload` to act on. **Retire happens exactly
+when a scope is set** — the sentinel's un-scoped accept sorts earlier in the
+`/etc/nftables.d/*.nft` glob and nftables accepts on first match, so leaving it
+would silently defeat `web_ui_allowed_cidrs`; clearing the scope restores it.
+Unscoped, both rules say the same thing and the sentinel simply stays.
+
+`PUT /appliance/firewall/web-ui-access`
 carries an **anti-lockout guard**: a non-empty set that doesn't cover the
 operator's current source IP is rejected 422 unless `override_lockout=true`
 (the UI surfaces an "Add my IP" button + the override checkbox). SSH on :22

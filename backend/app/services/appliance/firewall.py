@@ -148,6 +148,16 @@ def compile_firewall_body(
     lines.append(f"# roles: {','.join(roles) if roles else '(idle)'}")
     bootstrap_action = "retire" if cp_member_count >= 2 else "keep"
     lines.append(f"# spatium-bootstrap: {bootstrap_action}")
+    # #769 — host-runner directive for the baked Web-UI sentinel
+    # (00-spatium-webui.nft), which opens 80/443 from first boot so the
+    # "still initialising" page is reachable before the supervisor has
+    # ever heartbeated. Retire it once a source scope is configured: the
+    # sentinel's unconditional accept sorts EARLIER in the include glob
+    # and nftables accepts on first match, so leaving it would silently
+    # defeat the scoped rule emitted below. Unscoped → keep (both rules
+    # say the same thing); clearing a scope restores it.
+    webui_action = "retire" if web_ui_allowed_cidrs else "keep"
+    lines.append(f"# spatium-webui: {webui_action}")
     lines.append("")
     lines.append("# ── Management (always open) ────────────────────────────────")
     lines.append('tcp dport 22 accept comment "ssh"')

@@ -64,6 +64,36 @@ _DEFAULT_FRONTEND_DEPLOYMENT = "spatium-control-spatiumddi-frontend"
 _ROLLOUT_ANNOTATION = "spatiumddi.io/tls-secret-checksum"
 
 
+def read_deployed_cert() -> tuple[str, str] | None:
+    """Return the ``(cert_pem, key_pem)`` currently in the TLS Secret.
+
+    ``None`` when the api isn't on k8s, the Secret is absent, or either
+    key is missing/empty. Used by the startup bootstrap (#767) to ADOPT
+    the cert firstboot minted rather than replacing it with a rival
+    self-signed one — an appliance must present exactly one cert
+    identity across a cold boot, or the operator gets a second browser
+    trust prompt the moment the api finishes starting.
+    """
+    if not settings.appliance_mode:
+        return None
+    status, data = k8s.get_secret(_TLS_SECRET_NAME)
+    if not data:
+        logger.info("appliance_deployed_cert_unreadable", status=status)
+        return None
+    cert_pem = data.get(_TLS_CRT_KEY) or ""
+    key_pem = data.get(_TLS_KEY_KEY) or ""
+    # Emptiness is judged on the stripped value, but the ORIGINAL bytes
+    # are what we return. Persisting a stripped copy would make the row
+    # differ from the Secret by a trailing newline, so the next api start
+    # would take Path A, re-deploy it, genuinely change the Secret data,
+    # shift the rollout checksum, and roll the frontend (Recreate — ~5 s
+    # with no Web UI). That is the mid-boot roll this whole path exists
+    # to avoid, merely deferred by one restart.
+    if not cert_pem.strip() or not key_pem.strip():
+        return None
+    return cert_pem, key_pem
+
+
 def deploy_active_cert(cert_pem: str, key_pem: str, *, name: str = "") -> bool:
     """PATCH the appliance TLS Secret with the active cert + key.
 

@@ -146,9 +146,10 @@ class ApiClient:
         """Scheme+host of the appliance (api_base minus the ``/api`` suffix).
 
         ``/health/*`` and ``/metrics/*`` are mounted at the backend root, NOT
-        under ``/api/v1`` (backend/app/main.py:638 mounts health with no prefix;
-        nginx routes ``^/(health|metrics)`` straight to the api upstream —
-        appliance nginx-appliance.conf:152). So they live at the bare origin.
+        under ``/api/v1`` (backend/app/main.py mounts health with no prefix;
+        the frontend nginx routes ``^/(health|metrics)`` straight to the api
+        upstream — see charts/spatiumddi/templates/frontend-tls-config.yaml).
+        So they live at the bare origin.
         """
         u = httpx.URL(self.base_url)
         host = f"{u.scheme}://{u.host}"

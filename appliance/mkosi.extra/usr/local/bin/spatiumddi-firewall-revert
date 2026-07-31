@@ -35,12 +35,16 @@ REVERT_DEADLINE=$STATE/firewall-revert-deadline
 CONFIRM_FILE=$STATE/firewall-confirm
 LAST_GOOD=$STATE/firewall-role.nft.last-good
 LAST_GOOD_SENTINEL=$STATE/firewall-sentinel.last-good
+LAST_GOOD_WEBUI_SENTINEL=$STATE/firewall-webui-sentinel.last-good
 LOCK=$STATE/firewall.lock
 APPLIED_HASH=$STATE/firewall-applied-hash
 APPLIED_STATUS=$STATE/firewall-applied-status
 DROP_IN=/etc/nftables.d/spatium-role.nft
 SENTINEL=/etc/nftables.d/00-spatium-k3s-bootstrap.nft
 SENTINEL_RETIRED="$SENTINEL.retired"
+# #769 — Web-UI bootstrap sentinel (80/443 open from first boot).
+WEBUI_SENTINEL=/etc/nftables.d/00-spatium-webui.nft
+WEBUI_SENTINEL_RETIRED="$WEBUI_SENTINEL.retired"
 NFT_MAIN=/etc/nftables.conf
 
 log() { printf '[spatiumddi-firewall-revert] %s\n' "$*"; }
@@ -86,23 +90,32 @@ rm -f "$REVERT_DEADLINE"
 log "test-apply NOT confirmed before deadline — reverting to last-good"
 
 cp -f "$LAST_GOOD" "$DROP_IN"
-# Restore the sentinel state captured at test time (re-opens 6443 if the
-# test had retired it). On a CP node, .last-good contains the scoped
-# etcd/6443 peer rules by construction, so a revert never yields a node
-# with no path to etcd/apiserver.
-sentinel_state=$(cat "$LAST_GOOD_SENTINEL" 2>/dev/null || echo "")
-case "$sentinel_state" in
-    present)
-        if [ ! -f "$SENTINEL" ] && [ -f "$SENTINEL_RETIRED" ]; then
-            mv "$SENTINEL_RETIRED" "$SENTINEL"
-        fi
-        ;;
-    retired)
-        if [ -f "$SENTINEL" ]; then
-            mv "$SENTINEL" "$SENTINEL_RETIRED"
-        fi
-        ;;
-esac
+# Restore one sentinel to the state captured at test time.
+restore_sentinel_state() {
+    _state=$(cat "$1" 2>/dev/null || echo "")
+    _file="$2"; _retired="$3"
+    case "$_state" in
+        present)
+            if [ ! -f "$_file" ] && [ -f "$_retired" ]; then
+                mv "$_retired" "$_file"
+            fi
+            ;;
+        retired)
+            if [ -f "$_file" ]; then
+                mv "$_file" "$_retired"
+            fi
+            ;;
+    esac
+}
+
+# Re-opens 6443 if the test had retired the k3s sentinel. On a CP node,
+# .last-good contains the scoped etcd/6443 peer rules by construction, so a
+# revert never yields a node with no path to etcd/apiserver.
+restore_sentinel_state "$LAST_GOOD_SENTINEL" "$SENTINEL" "$SENTINEL_RETIRED"
+# #769 — the Web-UI sentinel rides the same revert. A test-apply that
+# retired it must not survive a revert whose whole purpose is undoing a
+# lockout: that would leave the Web UI narrower than before the test.
+restore_sentinel_state "$LAST_GOOD_WEBUI_SENTINEL" "$WEBUI_SENTINEL" "$WEBUI_SENTINEL_RETIRED"
 
 if nft -c -f "$NFT_MAIN" 2>/tmp/nft-revert.err && nft -f "$NFT_MAIN" 2>>/tmp/nft-revert.err; then
     sha256sum "$DROP_IN" | cut -d' ' -f1 > "$APPLIED_HASH" 2>/dev/null || true
@@ -113,4 +126,4 @@ else
     log "REVERT FAILED on nft apply — manual intervention needed:"
     sed 's/^/[spatiumddi-firewall-revert]  /' /tmp/nft-revert.err 2>/dev/null || true
 fi
-rm -f "$LAST_GOOD_SENTINEL"
+rm -f "$LAST_GOOD_SENTINEL" "$LAST_GOOD_WEBUI_SENTINEL"

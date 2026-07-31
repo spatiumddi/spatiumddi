@@ -38,15 +38,23 @@ spec:
           ports:
             - name: http
               containerPort: 80
+          # Probe nginx's OWN health, not ``/`` (#767). ``/`` is the SPA
+          # fallback, which now gates on an auth_request probe of the api
+          # and answers 503 while the api is unreachable — probing it
+          # would mark the frontend NotReady during exactly the cold-boot
+          # window the initialising page exists to cover (pulling the pod
+          # out of the Service so the page can't be reached at all), then
+          # CrashLoop it on liveness. ``/nginx-health`` is served by
+          # nginx alone and touches no upstream.
           livenessProbe:
             httpGet:
-              path: /
+              path: /nginx-health
               port: 80
             initialDelaySeconds: 5
             periodSeconds: 15
           readinessProbe:
             httpGet:
-              path: /
+              path: /nginx-health
               port: 80
             initialDelaySeconds: 3
             periodSeconds: 10

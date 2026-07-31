@@ -182,3 +182,32 @@ def test_deterministic() -> None:
         render_drop_in({"roles": ["dns-bind9"]}, _PEERS_V4, **kw).body
         == render_drop_in({"roles": ["dns-bind9"]}, _PEERS_V4, **kw).body
     )
+
+
+# ── Web-UI sentinel retire/keep directive (#769) ─────────────────────
+#
+# The baked 00-spatium-webui.nft opens 80/443 from first boot, before the
+# supervisor has ever heartbeated — without it the Web UI port stays
+# filtered for the whole cold-boot window and the "still initialising"
+# page (#767) is unreachable exactly when it is wanted. It has to be
+# retired once a source scope is configured: an unconditional accept in a
+# 00- file sorts EARLIER in the include glob than the scoped rule here,
+# and nftables accepts on first match, so leaving it would silently
+# defeat the operator's scope.
+
+
+def test_webui_directive_keep_when_unscoped() -> None:
+    p = render_drop_in({"roles": []}, [])
+    assert "# spatium-webui: keep" in p.body
+    assert "# spatium-webui: retire" not in p.body
+    # ...and the drop-in's own rule is the open one.
+    assert 'tcp dport { 80, 443 } accept comment "web-ui"' in p.body
+
+
+def test_webui_directive_retire_when_scoped() -> None:
+    p = render_drop_in({"roles": []}, [], web_ui_allowed_cidrs=["192.168.0.0/24"])
+    assert "# spatium-webui: retire" in p.body
+    assert "# spatium-webui: keep" not in p.body
+    # The scoped rule must be the only path to 80/443 in this body.
+    assert 'tcp dport { 80, 443 } accept comment "web-ui"' not in p.body
+    assert "192.168.0.0/24" in p.body

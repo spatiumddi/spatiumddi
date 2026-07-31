@@ -516,6 +516,12 @@ def compile_firewall_from_policies(
     lines.append(f"# roles: {','.join(ctx.roles) if ctx.roles else '(idle)'}")
     bootstrap_action = "retire" if ctx.cp_member_count >= 2 else "keep"
     lines.append(f"# spatium-bootstrap: {bootstrap_action}")
+    # #769 — retire the baked Web-UI sentinel (00-spatium-webui.nft) once a
+    # source scope is configured; its unconditional accept sorts earlier in
+    # the include glob and would otherwise defeat the scoped rule below.
+    # Byte-identical to compile_firewall_body + render_drop_in.
+    webui_action = "retire" if web_ui_allowed_cidrs else "keep"
+    lines.append(f"# spatium-webui: {webui_action}")
     lines.append("")
     lines.append("# ── Management (always open) ────────────────────────────────")
     lines.extend(_MGMT_FLOOR)

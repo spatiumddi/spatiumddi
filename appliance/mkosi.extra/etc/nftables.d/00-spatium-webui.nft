@@ -1,0 +1,45 @@
+# SpatiumDDI Web UI bootstrap sentinel (#769).
+#
+# Keeps the Web UI (80/443) reachable from the very first boot, BEFORE
+# the supervisor exists.
+#
+# Why this is needed. #285 Phase 6 made the supervisor-rendered
+# spatium-role.nft authoritative for 80/443 and removed the accept from
+# the base /etc/nftables.conf. But the supervisor can only render that
+# drop-in after its first successful heartbeat — and on a control-plane
+# appliance that heartbeat goes to the LOCAL api, so the port cannot open
+# until the api is already serving. Measured on a clean install of
+# dev-f3ca07f2-d796: boot 20:57:02, api Ready 20:59:39, drop-in applied
+# 21:00:20 — the Web UI port opened 41 s AFTER the control plane was up.
+#
+# The practical effect was that an operator browsing a booting appliance
+# got a ~3-minute connection timeout, and the "SpatiumDDI is initialising"
+# page (#767 / #299) — which exists precisely for that window — was
+# unreachable for the whole of it. Every probe from another host returned
+# a filtered-port timeout; the first connection that succeeded already
+# served the logged-in UI.
+#
+# The Web UI port is management surface, in the same category as :22,
+# which the base config opens unconditionally. Role service ports (DNS /
+# DHCP) correctly stay closed until a role is assigned; the Web UI should
+# not.
+#
+# Retirement. The supervisor's spatium-role.nft carries the authoritative
+# web-ui rule, and when the operator sets ``web_ui_allowed_cidrs`` (#285
+# Phase 6) that rule is SOURCE-SCOPED. This file's unconditional accept
+# sits earlier in the include glob (00- sorts first) and nftables accepts
+# on first match, so leaving it in place would silently defeat that
+# scoping. The renderers therefore stamp ``# spatium-webui: retire`` in
+# the drop-in header whenever a scope is configured, and
+# spatium-firewall-reload moves this file aside to ``.retired``. Clearing
+# the scope stamps ``keep`` and restores it. Unscoped (the default), both
+# rules say the same thing, so the sentinel simply stays.
+#
+# Same lifecycle as 00-spatium-k3s-bootstrap.nft: lives in /etc so it
+# rides the /etc overlay onto /var and survives A/B slot swaps, and its
+# ``.retired`` form persists the same way.
+#
+# This fragment is included INSIDE `chain input` by the
+# `include "/etc/nftables.d/*.nft"` glob in /etc/nftables.conf, so it is
+# a bare rule (no table/chain wrapper).
+tcp dport { 80, 443 } accept comment "web-ui-bootstrap"
