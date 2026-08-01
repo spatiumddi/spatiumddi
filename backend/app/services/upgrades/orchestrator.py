@@ -51,6 +51,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.audit import AuditLog
 from app.models.system_upgrade import LIFECYCLE_STATES, SystemUpgradeRun
 from app.services.appliance import k8s
+from app.services.appliance.slot_image_target import SlotImageTarget
 from app.services.upgrades import (
     alerts as upgrade_alerts,
 )
@@ -127,7 +128,7 @@ async def plan_upgrade(
     db: AsyncSession,
     *,
     target_version: str,
-    slot_image_url: str,
+    slot_image: SlotImageTarget,
     cnpg_cluster_name: str = "",
     cnpg_namespace: str | None = None,
     started_by_user_id: uuid.UUID | None = None,
@@ -204,7 +205,10 @@ async def plan_upgrade(
         source_versions=source_versions,
         plan={
             "node_order": order,
-            "slot_image_url": slot_image_url,
+            # url + sha256 + tls_insecure together — a plan carrying only
+            # the URL is what left every per-node apply fetching our own
+            # self-signed cert with verification on (#787 / #386).
+            **slot_image.as_plan_fields(),
             "cnpg_cluster_name": cnpg_cluster_name,
             "cnpg_namespace": cnpg_namespace,
             "preflight_at_plan": [
@@ -518,7 +522,7 @@ async def _drive_loop(
     * On halt/abort signal: exits cleanly without further work.
     """
     plan_order: list[str] = run.plan.get("node_order") or []
-    slot_image_url: str = run.plan.get("slot_image_url") or ""
+    slot_image = SlotImageTarget.from_plan_fields(run.plan)
     cnpg_name: str = run.plan.get("cnpg_cluster_name") or ""
     cnpg_namespace: str | None = run.plan.get("cnpg_namespace")
 
@@ -698,7 +702,7 @@ async def _drive_loop(
             db,
             node_name=next_node,
             target_version=run.target_version,
-            slot_image_url=slot_image_url,
+            slot_image=slot_image,
             cnpg_cluster_name=cnpg_name,
             cnpg_namespace=cnpg_namespace,
         )

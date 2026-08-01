@@ -116,6 +116,16 @@ fi
 # its in-pod uid.
 mkdir -p /var/lib/spatiumddi/release-state /var/log/spatiumddi
 chmod 1777 /var/lib/spatiumddi/release-state
+# #786 — the slot-upgrade sidecars are written by the ROOT host runner but
+# must be resettable by the UNPRIVILEGED supervisor container. In a sticky
+# 1777 directory a non-owner can neither overwrite a root-owned 0644 file
+# nor unlink it, so every supervisor-side reset of a failed upgrade
+# silently no-op'd. The runner now publishes them 0666; backfill any that
+# predate that so an upgraded appliance is repaired on its first boot.
+for _sc in /var/lib/spatiumddi/release-state/slot-upgrade-pending.state \
+           /var/lib/spatiumddi/release-state/slot-upgrade.progress; do
+    [ -e "$_sc" ] && chmod 0666 "$_sc" 2>/dev/null || true
+done
 chmod 0755 /var/log/spatiumddi
 
 # /var/lib/spatiumddi/slot-images — OS A/B upgrade images uploaded /

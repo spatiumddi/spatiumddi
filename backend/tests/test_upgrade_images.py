@@ -336,3 +336,32 @@ async def test_find_available_upgrade_images_tool(
     assert out["github_reachable"] is True
     assert out["count"] == 1
     assert out["available"][0]["tag"] == "2026.05.14-1"
+
+
+# ── imported-row filename (#789) ─────────────────────────────────────
+
+
+async def test_imported_row_records_the_asset_actually_downloaded() -> None:
+    """A GitHub-imported row used to be stamped with the STABLE asset name
+    no matter which asset was fetched. ``_pick_upgrade_assets`` resolves the
+    versioned one (the stable name is pruned from every non-latest release,
+    #392), so the Fleet picker showed a filename matching no asset on the
+    release it came from."""
+    from app.api.v1.appliance.upgrade_images import _github_asset_filename
+
+    assert (
+        _github_asset_filename(
+            "https://github.com/o/r/releases/download/2026.07.30-1/"
+            "spatiumddi-appliance-slot-2026.07.30-1-amd64.raw.xz"
+        )
+        == "spatiumddi-appliance-slot-2026.07.30-1-amd64.raw.xz"
+    )
+
+
+async def test_imported_row_filename_falls_back_on_an_unrecognisable_url() -> None:
+    from app.api.v1.appliance.upgrade_images import (
+        _GITHUB_IMAGE_FILENAME,
+        _github_asset_filename,
+    )
+
+    assert _github_asset_filename("https://example.test/download?id=7") == _GITHUB_IMAGE_FILENAME

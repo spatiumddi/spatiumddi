@@ -37,6 +37,17 @@ set -euo pipefail
 # as spatium-host-migrate's SPATIUM_HOST_* overrides.
 TRIGGER="${SPATIUM_SLOT_TRIGGER:-/var/lib/spatiumddi/release-state/slot-upgrade-pending}"
 PROGRESS="${SPATIUM_SLOT_PROGRESS:-/var/lib/spatiumddi/release-state/slot-upgrade.progress}"
+
+# The supervisor container runs unprivileged (``su-exec spatium``) while
+# these sidecars are written by THIS script as root, into a mode-1777
+# (sticky) directory. A non-owner therefore gets EACCES overwriting a
+# root-owned 0644 file and EPERM unlinking it — so every supervisor-side
+# reset of a failed upgrade silently no-op'd (#786). Publish them 0666 so
+# an in-place overwrite works. Content is non-secret state the api already
+# republishes to the operator; the sticky bit still stops unlink-by-others.
+publish_sidecar() {  # $1 = path
+    chmod 0666 "$1" 2>/dev/null || true
+}
 LOG_DIR="${SPATIUM_SLOT_LOG_DIR:-/var/log/spatiumddi}"
 LOG="$LOG_DIR/slot-upgrade.log"
 UPGRADE_SLOT_BIN="${SPATIUM_UPGRADE_SLOT_BIN:-/usr/local/bin/spatium-upgrade-slot}"
@@ -73,6 +84,7 @@ write_progress() {  # $1 = step, $2 = human detail
     printf '{"step":"%s","pct":null,"detail":"%s","at":"%s"}' \
         "$1" "$detail" "$(date -Iseconds)" > "${PROGRESS}.new" 2>/dev/null \
         && mv "${PROGRESS}.new" "$PROGRESS" 2>/dev/null || true
+    publish_sidecar "$PROGRESS"
 }
 
 # #421 — keep the coarse in-flight stamp fresh while we work. Best-effort:
@@ -80,6 +92,7 @@ write_progress() {  # $1 = step, $2 = human detail
 # (a dead ticker would let the supervisor falsely reap a live apply).
 mark_inflight() {
     echo "in-flight $(date -Iseconds)" > "${TRIGGER}.state" 2>/dev/null || true
+    publish_sidecar "${TRIGGER}.state"
 }
 
 # Background loop that re-stamps in-flight every $INFLIGHT_TICK_SECONDS
@@ -112,6 +125,7 @@ fail() {  # $1 = human reason
     echo
     echo "  ✗ $1"
     echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
+    publish_sidecar "${TRIGGER}.state"
     write_progress "failed" "$1"
     mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)" 2>/dev/null || true
     exit 1
@@ -134,6 +148,7 @@ on_exit() {
             echo
             echo "  ✗ runner exited (rc=$rc) without writing a terminal state"
             echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
+    publish_sidecar "${TRIGGER}.state"
             write_progress "failed" "runner exited (rc=$rc) without completing"
             [ -f "$TRIGGER" ] && mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)" 2>/dev/null || true
         fi
@@ -251,6 +266,7 @@ if [ "$apply_rc" -eq 0 ]; then
         echo "  ✓ next-boot armed. Operator needs to reboot to switch slots."
         stop_inflight_ticker  # before the terminal write so it can't be reverted
         echo "done $(date -Iseconds)" > "${TRIGGER}.state"
+        publish_sidecar "${TRIGGER}.state"
         write_progress "reboot-pending" "upgrade staged — reboot to boot the new slot"
         # Parity with every other terminal mv: never let a rename race
         # (e.g. supervisor already reaped the trigger) abort under set -e

@@ -42,6 +42,7 @@ import ipaddress
 import re
 import secrets
 import uuid
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
@@ -103,6 +104,12 @@ from app.services.appliance.firewall import firewall_bundle
 from app.services.appliance.lldp import lldp_bundle
 from app.services.appliance.ntp import ntp_bundle
 from app.services.appliance.resolver import resolver_bundle
+from app.services.appliance.slot_image_target import (
+    SlotImageResolutionError,
+    new_refire_nonce,
+    resolve_slot_image_target,
+    stamp_desired_slot_image,
+)
 from app.services.appliance.snmp import snmp_bundle
 from app.services.appliance.ssh import ssh_bundle
 from app.services.appliance.syslog import syslog_bundle
@@ -141,27 +148,6 @@ def _client_ip(request: Request) -> str | None:
 _HOST_ROLE_CONFIG = Path("/etc/spatiumddi-host/role-config")
 _SELF_BOOTSTRAP_VARIANTS = frozenset({"control-plane", "full-stack", "frontend-core"})
 _SELF_BOOTSTRAP_CODE_TTL = timedelta(minutes=10)
-
-# The slot-upgrade host runner only strips a URL ``#fragment`` before
-# fetching as of #386 (shipped 2026-06-12). An appliance on an older
-# supervisor hands the fragment straight to the downloader and the apply
-# wedges at "in-flight" forever (#419). Gate the re-fire nonce on the
-# target supervisor's reported version so older fleets get a clean URL.
-_URL_FRAGMENT_STRIP_MIN_VERSION = "2026.06.12"
-
-
-def _supervisor_strips_url_fragment(row: Appliance) -> bool:
-    """True if the appliance's supervisor / slot-upgrade runner strips a URL
-    ``#fragment`` before fetching (≥ 2026.06.12, i.e. has the #386 strip).
-
-    CalVer (``YYYY.MM.DD-N``) sorts lexicographically, so a string compare is
-    correct. A dev / unknown / pre-CalVer version stays on the safe clean-URL
-    path — losing only auto-re-fire of the *same* image (a new version already
-    changes the URL), never the ability to upgrade (#419)."""
-    ver = row.supervisor_version or row.installed_appliance_version or ""
-    return (
-        re.match(r"\d{4}\.\d{2}\.\d{2}", ver) is not None and ver >= _URL_FRAGMENT_STRIP_MIN_VERSION
-    )
 
 
 def _read_host_role() -> str | None:
@@ -1295,6 +1281,10 @@ class SupervisorHeartbeatResponse(BaseModel):
     desired_next_boot_slot: Literal["slot_a", "slot_b"] | None = None
     desired_default_slot: Literal["slot_a", "slot_b"] | None = None
     reboot_requested: bool = False
+    # #786 — one-shot: reset the host's slot-upgrade sidecars + drop any
+    # stranded trigger, so a cleared failure stays cleared instead of
+    # being re-published on the next heartbeat.
+    clear_upgrade_requested: bool = False
     # #170 Wave D follow-up — supervisor's signed cert + CA chain.
     # Populated when the appliance has been approved + the supervisor
     # hasn't picked them up yet. The supervisor saves them to
@@ -1501,6 +1491,15 @@ async def _ingest_lldp_neighbours(
 
 # #358 Phase 1b — server-side cap on how long the heartbeat long-poll holds
 # the connection. Must stay under the supervisor's client timeout
+# #786 — how long the control plane keeps re-sending a clear-upgrade
+# command before giving up on it. Not a delivery window: the command is
+# retired the moment the host acknowledges by reporting a non-``failed``
+# state. This is only the backstop for a host that can NEVER comply — a
+# trigger it does not own is unlinkable out of the sticky release-state
+# directory — so the flag can't pin the heartbeat long-poll off forever.
+_CLEAR_UPGRADE_GIVE_UP_SECONDS = 600.0
+
+
 # (heartbeat_interval + 10 s) so the hold returns before the client gives up.
 _HEARTBEAT_HOLD_CAP_S = 28.0
 
@@ -1652,17 +1651,29 @@ async def supervisor_heartbeat(
         row.slot_b_version = body.slot_b_version
     if body.is_trial_boot is not None:
         row.is_trial_boot = body.is_trial_boot
-    if body.last_upgrade_state is not None:
-        row.last_upgrade_state = body.last_upgrade_state
-    if body.last_upgrade_state_at is not None:
-        row.last_upgrade_state_at = body.last_upgrade_state_at
-    # #386 Part C — empty string is a meaningful value here ("no
-    # in-flight upgrade, clear any stale tail"), so persist on
-    # ``is not None`` rather than truthiness.
-    if body.last_upgrade_log_tail is not None:
-        row.last_upgrade_log_tail = body.last_upgrade_log_tail or None
-    if body.last_upgrade_progress is not None:
-        row.last_upgrade_progress = body.last_upgrade_progress or None
+    # #786 — while a clear is outstanding, drop ONLY a report that still
+    # carries the dismissed failure. The supervisor collected it before it
+    # saw the command, so ingesting it would re-stamp the row we cleared
+    # and the red card would never go away.
+    #
+    # Scoped to ``failed`` on purpose. Blanket-suppressing every
+    # ``last_upgrade_*`` for the whole window also threw away the host's
+    # post-reset ``ready`` — the very acknowledgement this waits for — and
+    # any progress from an upgrade the operator retried straight after
+    # clearing, which is the normal recovery gesture.
+    suppress_stale_failure = row.clear_upgrade_requested and body.last_upgrade_state == "failed"
+    if not suppress_stale_failure:
+        if body.last_upgrade_state is not None:
+            row.last_upgrade_state = body.last_upgrade_state
+        if body.last_upgrade_state_at is not None:
+            row.last_upgrade_state_at = body.last_upgrade_state_at
+        # #386 Part C — empty string is a meaningful value here ("no
+        # in-flight upgrade, clear any stale tail"), so persist on
+        # ``is not None`` rather than truthiness.
+        if body.last_upgrade_log_tail is not None:
+            row.last_upgrade_log_tail = body.last_upgrade_log_tail or None
+        if body.last_upgrade_progress is not None:
+            row.last_upgrade_progress = body.last_upgrade_progress or None
     if body.snmpd_running is not None:
         row.snmpd_running = body.snmpd_running
     if body.lldpd_running is not None:
@@ -1996,6 +2007,47 @@ async def supervisor_heartbeat(
         row.reboot_requested = False
         row.reboot_requested_at = None
 
+    # Retire clear_upgrade_requested on ACKNOWLEDGEMENT, not on a clock
+    # (#786). The host's compliance is already observable: the clear's
+    # whole job is to turn a ``failed`` sidecar into ``ready``, so the
+    # first heartbeat reporting anything other than ``failed`` IS the ack.
+    # Until then the command keeps riding every response, so a supervisor
+    # that was offline, restarting, or simply slow still receives it.
+    #
+    # This replaces a 15 s stopwatch that could expire before the command
+    # was ever delivered: a wedged appliance keeps ``desired_appliance_
+    # version`` set, which suppresses the long-poll, so its heartbeats
+    # arrive a full interval apart and landed past the window about half
+    # the time. No clock comparison between host and control plane is
+    # involved either, so appliance clock skew cannot strand the flag.
+    #
+    # ``deliver_clear_upgrade`` is still captured BEFORE the retire,
+    # because the response is built from the row ~300 lines below and the
+    # acknowledging heartbeat must carry the command one last time (it is
+    # idempotent host-side, and the alternative is dropping it).
+    deliver_clear_upgrade = row.clear_upgrade_requested
+    if row.clear_upgrade_requested:
+        acknowledged = body.last_upgrade_state is not None and body.last_upgrade_state != "failed"
+        # Backstop so a host that can never comply — e.g. a trigger it does
+        # not own, which it can never unlink out of the sticky release-state
+        # directory — cannot pin the flag on forever and permanently
+        # suppress this appliance's heartbeat long-poll.
+        stalled = (
+            row.clear_upgrade_requested_at is not None
+            and (datetime.now(UTC) - row.clear_upgrade_requested_at).total_seconds()
+            >= _CLEAR_UPGRADE_GIVE_UP_SECONDS
+        )
+        if acknowledged or stalled:
+            if stalled and not acknowledged:
+                logger.warning(
+                    "appliance_clear_upgrade_unacknowledged",
+                    appliance_id=str(row.id),
+                    hostname=row.hostname,
+                    last_upgrade_state=body.last_upgrade_state,
+                )
+            row.clear_upgrade_requested = False
+            row.clear_upgrade_requested_at = None
+
     await db.commit()
 
     # #358 Phase 1b — heartbeat long-poll. When the supervisor opts in
@@ -2023,6 +2075,13 @@ async def supervisor_heartbeat(
         has_pending_command = (
             row.desired_appliance_version is not None
             or row.reboot_requested
+            # ``deliver_clear_upgrade``, not the row: the auto-expiry above
+            # may have just cleared the flag while the response below still
+            # carries the command. Reading the row here would make this look
+            # idle — and a clear also nulls ``desired_appliance_version``, so
+            # nothing else keeps it pending — so we would hold the very
+            # response that delivers the clear for up to the hold cap.
+            or deliver_clear_upgrade
             or row.desired_next_boot_slot is not None
             or row.desired_default_slot is not None
         )
@@ -2272,6 +2331,7 @@ async def supervisor_heartbeat(
         desired_next_boot_slot=row.desired_next_boot_slot,  # type: ignore[arg-type]
         desired_default_slot=row.desired_default_slot,  # type: ignore[arg-type]
         reboot_requested=row.reboot_requested,
+        clear_upgrade_requested=deliver_clear_upgrade,
         cert_pem=row.cert_pem,
         ca_chain_pem=ca_chain_pem,
         cert_expires_at=row.cert_expires_at,
@@ -4861,80 +4921,32 @@ async def schedule_appliance_upgrade(
             ),
         )
 
-    # Resolve slot_image_id → internal URL. We compose the URL
-    # relative to the request's host so the supervisor can reach it
-    # from the same network it reaches the control plane on; the
-    # request's base_url is the operator-facing scheme + host the
-    # frontend is already using.
-    from app.models.appliance import ApplianceUpgradeImage  # noqa: PLC0415
-
-    resolved_url: str
-    # Issue #386 Part A — integrity + transport hints stamped alongside
-    # the URL. For an internal (self-served) image we know the sha256 and
-    # that the URL points at our own self-signed cert; for an external
-    # operator-pasted URL we trust public-CA TLS and have no hash.
-    image_sha256: str | None = None
-    tls_insecure = False
-    if body.slot_image_id is not None:
-        image = await db.get(ApplianceUpgradeImage, body.slot_image_id)
-        if image is None:
-            raise HTTPException(
-                status.HTTP_422_UNPROCESSABLE_ENTITY,
-                f"Upgrade image {body.slot_image_id} not found.",
-            )
-        # ``request.base_url`` ends with ``/`` and carries the scheme
-        # + host the frontend reached us on (X-Forwarded-Host /
-        # X-Forwarded-Proto, when nginx is in front). The supervisor
-        # is the only thing that resolves this URL, so as long as the
-        # frontend host is reachable from the appliance subnet (which
-        # it must be — that's where the supervisor already
-        # heartbeats), this lines up.
-        #
-        # ``?t=<hmac>`` token authorises the host-side
-        # ``spatium-upgrade-slot`` runner — it does an unauthenticated
-        # ``urllib.request.urlopen`` because it has no operator
-        # session and no mTLS material. The token is HMAC'd against
-        # the image_id + SECRET_KEY, so a leaked URL can't be replayed
-        # against a different image.
-        from app.api.v1.appliance.upgrade_images import (  # noqa: PLC0415
-            slot_image_download_token,
+    # Resolve slot_image_id → internal URL + integrity/transport hints,
+    # then stamp all four desired-state columns. Both live in
+    # ``services.appliance.slot_image_target`` so this surface and the
+    # multi-node rolling orchestrator cannot drift apart on what the host
+    # is told to fetch (#787) — the drift that re-introduced #386 there.
+    #
+    # The URL is composed against ``request.base_url``: the operator-facing
+    # scheme + host the frontend reached us on (X-Forwarded-Host / -Proto
+    # when nginx is in front), which is necessarily reachable from the
+    # appliance subnet because that is where the supervisor already
+    # heartbeats.
+    try:
+        target = await resolve_slot_image_target(
+            db,
+            base_url=str(request.base_url),
+            slot_image_id=body.slot_image_id,
+            slot_image_url=body.desired_slot_image_url,
         )
+        # A fresh nonce per click: re-applying the SAME image from the Fleet
+        # button is an explicit retry and must re-fire the host trigger.
+        target = replace(target, nonce=new_refire_nonce())
+    except SlotImageResolutionError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
 
-        token = slot_image_download_token(image.id)
-        resolved_url = (
-            f"{str(request.base_url).rstrip('/')}"
-            f"/api/v1/appliance/upgrade-images/{image.id}/raw.xz?t={token}"
-        )
-        # The image is served by our OWN control plane behind the
-        # self-signed web cert, so the host runner's bare urllib fetch
-        # would fail TLS verify (#386). Hand it the stored sha256 to
-        # verify bytes against + flag the self-served URL so it skips
-        # cert-verify for this fetch only.
-        image_sha256 = image.sha256
-        tls_insecure = True
-    else:
-        assert body.desired_slot_image_url is not None
-        resolved_url = body.desired_slot_image_url
-
-    # Issue #386 Part B — append a per-apply nonce as a URL *fragment* so
-    # each schedule yields a distinct ``desired_slot_image_url`` and the
-    # supervisor re-fires the trigger on a fresh apply of the same image
-    # (it fires once per distinct URL — no silent re-fire loop on failure).
-    # The host runner strips the fragment before fetching, but only since
-    # #386 (2026-06-12); an older appliance passes it straight to the
-    # downloader and the apply wedges at "in-flight" forever (#419). So only
-    # add the nonce when the target supervisor is known to strip it — older
-    # / unknown supervisors get a clean URL (a new version already changes
-    # the URL, so re-fire still works; only re-applying the *same* version
-    # loses auto-re-fire on those boxes).
-    if _supervisor_strips_url_fragment(row):
-        nonce = uuid.uuid4().hex[:12]
-        resolved_url = f"{resolved_url}#a={nonce}"
-
-    row.desired_appliance_version = body.desired_appliance_version
-    row.desired_slot_image_url = resolved_url
-    row.desired_slot_image_sha256 = image_sha256
-    row.desired_slot_image_tls_insecure = tls_insecure
+    stamp_desired_slot_image(row, target, desired_version=body.desired_appliance_version)
+    resolved_url = row.desired_slot_image_url or target.url
     db.add(
         AuditLog(
             user_id=current_user.id,
@@ -4975,19 +4987,43 @@ async def schedule_appliance_upgrade(
 async def clear_appliance_upgrade(
     appliance_id: uuid.UUID, current_user: CurrentUser, db: DB
 ) -> ApplianceRow:
-    """Drops ``desired_appliance_version`` + ``desired_slot_image_url``.
-    Once the supervisor has already fired the trigger file the host
-    runner won't notice this — the slot apply is in flight. The clear
-    is most useful when an upgrade was scheduled by mistake and the
-    supervisor hasn't heartbeat-polled yet."""
+    """Cancel a pending upgrade and dismiss a failed one.
+
+    Clears the desired slot-image state AND the ``last_upgrade_*`` columns
+    the Fleet failure card renders from, then raises a one-shot host
+    command (``clear_upgrade_requested``) that makes the supervisor reset
+    its own sidecars and drop a stranded ``slot-upgrade-pending`` trigger.
+
+    Clearing our copy alone is not enough: the host re-publishes those
+    columns verbatim on every heartbeat, so without the command the next
+    heartbeat restores the failure — and rebooting does not help, because
+    those sidecars live on the persistent /var (#786).
+    """
     _require_superadmin(current_user)
     row = await db.get(Appliance, appliance_id)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
+    # Raising a host command on a row that can never consume it would strand
+    # the flag set — which permanently suppresses that appliance's heartbeat
+    # long-poll. Same gate the other host-command mutators apply.
+    _check_appliance_slot_action_allowed(row)
     row.desired_appliance_version = None
     row.desired_slot_image_url = None
     row.desired_slot_image_sha256 = None
     row.desired_slot_image_tls_insecure = False
+    # #786 — clearing the desired state alone left the appliance sitting in
+    # the red "Upgrade failed" card forever. That card renders from the
+    # ``last_upgrade_*`` columns, which the heartbeat re-publishes verbatim
+    # from host sidecars every ~30 s, so the host has to be told to forget
+    # too. Clear our copy for an immediate UI response AND raise the
+    # command that makes the host reset its own state; without the second
+    # half the next heartbeat simply restores what we just cleared.
+    row.last_upgrade_state = None
+    row.last_upgrade_state_at = None
+    row.last_upgrade_progress = None
+    row.last_upgrade_log_tail = None
+    row.clear_upgrade_requested = True
+    row.clear_upgrade_requested_at = datetime.now(UTC)
     db.add(
         AuditLog(
             user_id=current_user.id,

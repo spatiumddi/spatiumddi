@@ -808,6 +808,91 @@ def clear_fleet_upgrade_marker() -> None:
         pass
 
 
+def apply_clear_upgrade_command() -> bool:
+    """#786 — the operator pressed "Clear failed upgrade"; make the host forget.
+
+    ``clear_fleet_upgrade_marker`` above is the *passive* heal, and it
+    deliberately returns early when a trigger file is still on disk so it
+    can't disturb an apply that is genuinely running. That guard is also
+    what made a wedged appliance unrecoverable: any failure that strands an
+    unconsumed ``slot-upgrade-pending`` — the path/service unit failing to
+    exec, the runner dying before its EXIT trap is armed, a missed rename
+    by the stale-in-flight reaper — blocks both the heal AND
+    ``maybe_fire_fleet_upgrade``, so the box could neither clear nor
+    re-apply, and no operator action could break the deadlock.
+
+    This is the explicit counterpart: the operator has *asked* for the
+    stranded state to go, so the trigger is removed rather than deferred
+    to. Returns True when anything was actually reset (for the log line).
+
+    Deliberately does NOT stop a running apply: it only removes the
+    trigger + resets the sidecars. A live ``spatiumddi-slot-upgrade``
+    process re-stamps its own progress as it goes, so a clear raced
+    against a real apply loses to the apply rather than corrupting it.
+    """
+    if detect_deployment_kind() != "appliance":
+        return False
+
+    reset = False
+    for path in (_TRIGGER_FILE, _FIRED_URL_MARKER):
+        try:
+            if path.exists():
+                path.unlink(missing_ok=True)
+                reset = True
+        except OSError as exc:
+            # Surfaced rather than swallowed: if the stranded trigger
+            # survives, the operator's clear silently didn't take and the
+            # box stays wedged — exactly the failure this exists to fix.
+            log.warning("supervisor.clear_upgrade.unlink_failed", path=str(path), error=str(exc))
+
+    # Only rewrite a state that is actually stuck. Two reasons: a healthy
+    # box would otherwise report "cleared" on every heartbeat inside the
+    # flag's lifetime, and clobbering a live ``in-flight`` stamp would blind
+    # BOTH crash detectors that key on that literal — the runner's exit trap
+    # and the supervisor's stale-in-flight reaper — so a mid-apply Cancel
+    # could leave a truncated image with nothing recording the failure.
+    try:
+        if _HOST_SLOT_STATE.exists():
+            current = _HOST_SLOT_STATE.read_text(encoding="utf-8").split(maxsplit=1)
+            if current and current[0] == "failed":
+                _HOST_SLOT_STATE.write_text(
+                    f"ready {datetime.now(UTC).isoformat()}\n", encoding="utf-8"
+                )
+                reset = True
+    except OSError as exc:
+        log.warning("supervisor.clear_upgrade.state_reset_failed", error=str(exc))
+
+    # OVERWRITE rather than unlink. release-state is mode 1777 (sticky) and
+    # this file is root-owned (the host runner writes it); a non-owner can
+    # never unlink it, but the runner now publishes it 0666 so an in-place
+    # write succeeds. An empty object reads as "no progress" to every
+    # consumer, which is what a cleared upgrade should show.
+    try:
+        if _SLOT_UPGRADE_PROGRESS.exists():
+            _SLOT_UPGRADE_PROGRESS.write_text("{}\n", encoding="utf-8")
+            reset = True
+    except OSError as exc:
+        log.warning("supervisor.clear_upgrade.progress_reset_failed", error=str(exc))
+
+    _prune_failed_sidecars(keep=0)
+
+    # A trigger we could not remove leaves the box exactly as wedged as it
+    # was — it still blocks both the passive heal and maybe_fire_fleet_
+    # upgrade. Field-observed: a root-owned trigger (this directory is
+    # sticky, so a non-owner can never unlink one) failed here while the
+    # state/progress resets succeeded, and the command still reported
+    # success. Say so instead, or the operator is told a clear worked when
+    # the appliance is still stuck.
+    if _TRIGGER_FILE.exists():
+        log.error(
+            "supervisor.clear_upgrade.trigger_survived",
+            path=str(_TRIGGER_FILE),
+            hint="not owned by the supervisor; remove it from the host to unwedge",
+        )
+        return False
+    return reset
+
+
 def _prune_host_config_sidecars(trigger_file: Path, keep: int = 5) -> None:
     """(#387) Keep only the newest ``.failed.<ts>`` / ``.done.<ts>`` /
     ``.invalid.<ts>`` sidecars for ONE trigger family, so a (pre-fix)
@@ -819,7 +904,10 @@ def _prune_host_config_sidecars(trigger_file: Path, keep: int = 5) -> None:
         parent = trigger_file.parent
         for suffix in ("failed", "done", "invalid"):
             stale = sorted(parent.glob(f"{trigger_file.name}.{suffix}.*"))
-            for path in stale[:-keep]:
+            # ``stale[:-0]`` is the EMPTY slice, not the whole list, so a
+            # plain slice would make keep=0 ("remove them all", used by the
+            # #786 explicit clear) silently prune nothing.
+            for path in stale if keep <= 0 else stale[:-keep]:
                 path.unlink(missing_ok=True)
     except OSError:
         # Best-effort housekeeping — leftover sidecars are cosmetic; a

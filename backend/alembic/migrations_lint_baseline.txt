@@ -140,10 +140,10 @@ backend/alembic/versions/a4e91c7b3d82_dns_dga.py:drop_column:83
 backend/alembic/versions/a4e91c7b3d82_dns_dga.py:drop_column:84
 backend/alembic/versions/a4e91c7b3d82_dns_dga.py:drop_column:85
 backend/alembic/versions/a4e91c7b3d82_dns_dga.py:drop_column:86
-backend/alembic/versions/a4f1c93d7e28_windows_cutover_plans.py:drop_table:222
-backend/alembic/versions/a4f1c93d7e28_windows_cutover_plans.py:drop_table:225
-backend/alembic/versions/a4f1c93d7e28_windows_cutover_plans.py:drop_table:230
-backend/alembic/versions/a4f1c93d7e28_windows_cutover_plans.py:drop_table:237
+backend/alembic/versions/a4f1c93d7e28_windows_cutover_plans.py:drop_table:218
+backend/alembic/versions/a4f1c93d7e28_windows_cutover_plans.py:drop_table:221
+backend/alembic/versions/a4f1c93d7e28_windows_cutover_plans.py:drop_table:226
+backend/alembic/versions/a4f1c93d7e28_windows_cutover_plans.py:drop_table:233
 backend/alembic/versions/a4f81c26b9e3_self_service_requests.py:drop_column:88
 backend/alembic/versions/a4f81c26b9e3_self_service_requests.py:drop_column:89
 backend/alembic/versions/a4f9c2e8b316_appliance_supervisor_identity.py:drop_column:153
@@ -579,6 +579,8 @@ backend/alembic/versions/e1f2a3b4c5d6_subnet_ddns_fields.py:drop_column:66
 backend/alembic/versions/e2a6f3b8c1d4_add_auto_from_lease_to_ipaddress.py:drop_column:33
 backend/alembic/versions/e2b9c4f1a7d6_address_sets.py:drop_table:102
 backend/alembic/versions/e2c91d5f7a48_appliance_pairing_codes.py:drop_table:126
+backend/alembic/versions/e3b7a1c25d94_clear_upgrade_command.py:drop_column:55
+backend/alembic/versions/e3b7a1c25d94_clear_upgrade_command.py:drop_column:56
 backend/alembic/versions/e3f1c92a4d68_compliance_change_alerts.py:drop_column:59
 backend/alembic/versions/e3f1c92a4d68_compliance_change_alerts.py:drop_column:60
 backend/alembic/versions/e3f1c92a4d68_compliance_change_alerts.py:drop_column:61

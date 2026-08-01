@@ -384,7 +384,7 @@ function PlanFormPanel() {
           ) : (
             <input
               type="text"
-              placeholder="https://github.com/.../spatiumddi-appliance-slot-amd64.raw.xz"
+              placeholder="https://github.com/.../spatiumddi-appliance-slot-<VERSION>-amd64.raw.xz"
               value={slotImageUrl}
               onChange={(e) => setSlotImageUrl(e.target.value)}
               className="rounded-md border bg-background px-2 py-1 text-sm"

@@ -601,6 +601,25 @@ class Appliance(Base):
     reboot_requested_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # #786 — operator asked to clear a failed upgrade. The visible failure
+    # state (the ``last_upgrade_*`` columns above) is re-published from
+    # host sidecar files on every heartbeat, so clearing the DB alone does
+    # nothing: the next heartbeat restores it, and rebooting doesn't help
+    # because those files live on the persistent /var. This flag is the
+    # command that makes the *host* forget — the supervisor deletes any
+    # stranded slot-upgrade trigger and resets its state/progress sidecars.
+    #
+    # Unlike ``reboot_requested`` this is retired by ACKNOWLEDGEMENT rather
+    # than a timer: the command rides every heartbeat response until the
+    # host reports a non-``failed`` state, which is exactly what a
+    # successful reset produces. ``_at`` exists only for the give-up
+    # backstop, not as a delivery window.
+    clear_upgrade_requested: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa.text("false")
+    )
+    clear_upgrade_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     # Per-slot boot control. Operator sets one of these via the Fleet
     # UI; supervisor reads from the heartbeat response + writes the
     # matching trigger file the host runners watch.
