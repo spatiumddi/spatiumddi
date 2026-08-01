@@ -794,6 +794,16 @@ def heartbeat_once(
     desired_next_boot_slot = body_out.get("desired_next_boot_slot")
     desired_default_slot = body_out.get("desired_default_slot")
     reboot_requested = bool(body_out.get("reboot_requested"))
+    clear_upgrade_requested = bool(body_out.get("clear_upgrade_requested"))
+
+    # #786 — an explicit "Clear failed upgrade" outranks everything below.
+    # Handled BEFORE the desired-upgrade branch so a clear issued while a
+    # failed desired-state is still on the row resets the host in the same
+    # heartbeat, and before the passive heal because only this path is
+    # allowed to remove a stranded trigger file.
+    if clear_upgrade_requested:
+        if appliance_state.apply_clear_upgrade_command():
+            log.info("supervisor.heartbeat.clear_upgrade_applied")
 
     if desired_version and desired_url:
         if appliance_state.maybe_fire_fleet_upgrade(

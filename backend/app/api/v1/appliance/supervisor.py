@@ -1279,6 +1279,10 @@ class SupervisorHeartbeatResponse(BaseModel):
     desired_next_boot_slot: Literal["slot_a", "slot_b"] | None = None
     desired_default_slot: Literal["slot_a", "slot_b"] | None = None
     reboot_requested: bool = False
+    # #786 — one-shot: reset the host's slot-upgrade sidecars + drop any
+    # stranded trigger, so a cleared failure stays cleared instead of
+    # being re-published on the next heartbeat.
+    clear_upgrade_requested: bool = False
     # #170 Wave D follow-up — supervisor's signed cert + CA chain.
     # Populated when the appliance has been approved + the supervisor
     # hasn't picked them up yet. The supervisor saves them to
@@ -1636,17 +1640,24 @@ async def supervisor_heartbeat(
         row.slot_b_version = body.slot_b_version
     if body.is_trial_boot is not None:
         row.is_trial_boot = body.is_trial_boot
-    if body.last_upgrade_state is not None:
-        row.last_upgrade_state = body.last_upgrade_state
-    if body.last_upgrade_state_at is not None:
-        row.last_upgrade_state_at = body.last_upgrade_state_at
-    # #386 Part C — empty string is a meaningful value here ("no
-    # in-flight upgrade, clear any stale tail"), so persist on
-    # ``is not None`` rather than truthiness.
-    if body.last_upgrade_log_tail is not None:
-        row.last_upgrade_log_tail = body.last_upgrade_log_tail or None
-    if body.last_upgrade_progress is not None:
-        row.last_upgrade_progress = body.last_upgrade_progress or None
+    # #786 — while a clear is outstanding, ignore the upgrade state this
+    # heartbeat carries. The supervisor collected it BEFORE it saw the
+    # clear command, so it still describes the failure the operator just
+    # dismissed; ingesting it would re-stamp the row we cleared and the
+    # red card would never go away. The heartbeat after the host resets
+    # its sidecars reports ``ready`` and is ingested normally.
+    if not row.clear_upgrade_requested:
+        if body.last_upgrade_state is not None:
+            row.last_upgrade_state = body.last_upgrade_state
+        if body.last_upgrade_state_at is not None:
+            row.last_upgrade_state_at = body.last_upgrade_state_at
+        # #386 Part C — empty string is a meaningful value here ("no
+        # in-flight upgrade, clear any stale tail"), so persist on
+        # ``is not None`` rather than truthiness.
+        if body.last_upgrade_log_tail is not None:
+            row.last_upgrade_log_tail = body.last_upgrade_log_tail or None
+        if body.last_upgrade_progress is not None:
+            row.last_upgrade_progress = body.last_upgrade_progress or None
     if body.snmpd_running is not None:
         row.snmpd_running = body.snmpd_running
     if body.lldpd_running is not None:
@@ -1980,6 +1991,19 @@ async def supervisor_heartbeat(
         row.reboot_requested = False
         row.reboot_requested_at = None
 
+    # Auto-clear clear_upgrade_requested on the same 15 s rule (#786). By
+    # then the supervisor has had the command and reset its sidecars, and
+    # the report it just sent — handled above — no longer carries the
+    # failure. Leaving the flag set would make every later heartbeat redo
+    # a no-op reset.
+    if (
+        row.clear_upgrade_requested
+        and row.clear_upgrade_requested_at is not None
+        and (datetime.now(UTC) - row.clear_upgrade_requested_at).total_seconds() >= 15
+    ):
+        row.clear_upgrade_requested = False
+        row.clear_upgrade_requested_at = None
+
     await db.commit()
 
     # #358 Phase 1b — heartbeat long-poll. When the supervisor opts in
@@ -2007,6 +2031,7 @@ async def supervisor_heartbeat(
         has_pending_command = (
             row.desired_appliance_version is not None
             or row.reboot_requested
+            or row.clear_upgrade_requested
             or row.desired_next_boot_slot is not None
             or row.desired_default_slot is not None
         )
@@ -2256,6 +2281,7 @@ async def supervisor_heartbeat(
         desired_next_boot_slot=row.desired_next_boot_slot,  # type: ignore[arg-type]
         desired_default_slot=row.desired_default_slot,  # type: ignore[arg-type]
         reboot_requested=row.reboot_requested,
+        clear_upgrade_requested=row.clear_upgrade_requested,
         cert_pem=row.cert_pem,
         ca_chain_pem=ca_chain_pem,
         cert_expires_at=row.cert_expires_at,
@@ -4921,6 +4947,19 @@ async def clear_appliance_upgrade(
     row.desired_slot_image_url = None
     row.desired_slot_image_sha256 = None
     row.desired_slot_image_tls_insecure = False
+    # #786 — clearing the desired state alone left the appliance sitting in
+    # the red "Upgrade failed" card forever. That card renders from the
+    # ``last_upgrade_*`` columns, which the heartbeat re-publishes verbatim
+    # from host sidecars every ~30 s, so the host has to be told to forget
+    # too. Clear our copy for an immediate UI response AND raise the
+    # command that makes the host reset its own state; without the second
+    # half the next heartbeat simply restores what we just cleared.
+    row.last_upgrade_state = None
+    row.last_upgrade_state_at = None
+    row.last_upgrade_progress = None
+    row.last_upgrade_log_tail = None
+    row.clear_upgrade_requested = True
+    row.clear_upgrade_requested_at = datetime.now(UTC)
     db.add(
         AuditLog(
             user_id=current_user.id,
