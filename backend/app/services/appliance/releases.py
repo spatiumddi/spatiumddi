@@ -48,7 +48,11 @@ _CACHE_TTL_SECONDS = 60
 #   spatiumddi-appliance-slot-amd64.raw.xz            (stable)
 #   spatiumddi-appliance-slot-<VERSION>-amd64.raw.xz  (versioned)
 # plus a matching ``.sha256`` sibling for each. Both names point at the
-# same bytes; either works for download.
+# same bytes — but only on the CURRENT latest release: the stable pair
+# exists solely to back ``releases/latest/download/<name>`` and #392's
+# retention prunes it from every release the moment a newer one is cut.
+# So a per-tag URL must use the versioned name, which is why the picker
+# below sorts longest-first.
 _UPGRADE_IMAGE_ASSET_RE = re.compile(r"^spatiumddi-appliance-slot.*-amd64\.raw\.xz$")
 
 
@@ -166,8 +170,15 @@ def _pick_upgrade_assets(assets: list[dict]) -> tuple[str, str, int | None] | No
     """Pick the ``.raw.xz`` upgrade-image asset + its ``.sha256`` sibling.
 
     Returns ``(image_url, checksum_url, size_bytes)`` or ``None`` when a
-    release doesn't carry a matched pair. Prefers the versioned asset
-    name (longer) but either points at the same bytes.
+    release doesn't carry a matched pair. Prefers the versioned asset name
+    (the longer one) — and that preference is load-bearing, not cosmetic:
+    the stable name is pruned from every non-latest release (#392), so a
+    URL built from it would 404 for anything but the newest cut.
+
+    Returning ``None`` on a half-pruned release is also deliberate. #392's
+    Tier 2 keeps the tiny ``.sha256`` provenance sidecar after dropping the
+    heavy ``.raw.xz``; requiring the matched PAIR is what makes such a
+    release disappear from the picker instead of offering a dead link.
     """
     by_name = {(a.get("name") or ""): a for a in assets}
     raws = [n for n in by_name if _UPGRADE_IMAGE_ASSET_RE.match(n)]

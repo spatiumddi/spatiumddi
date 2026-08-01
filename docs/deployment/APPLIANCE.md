@@ -1280,11 +1280,14 @@ so a first-time operator never gets stuck looking for the upload.
 **Air-gap operator workflow (TL;DR):**
 
 ```
-1. On a workstation with internet:
+1. On a workstation with internet — note the VERSIONED asset names.
+   The un-versioned `…-slot-amd64.raw.xz` name exists only to back the
+   `releases/latest/download/…` URLs and is pruned from every release
+   once a newer one is cut (#392), so pinning a tag to it 404s.
    wget https://github.com/spatiumddi/spatiumddi/releases/download/
-        2026.06.01-1/spatiumddi-appliance-slot-amd64.raw.xz
+        2026.06.01-1/spatiumddi-appliance-slot-2026.06.01-1-amd64.raw.xz
    wget https://github.com/spatiumddi/spatiumddi/releases/download/
-        2026.06.01-1/spatiumddi-appliance-slot-amd64.sha256
+        2026.06.01-1/spatiumddi-appliance-slot-2026.06.01-1-amd64.sha256
 
 2. Copy both files to the airgap LAN (USB stick, SCP through a jump
    host, whatever your security team approves).

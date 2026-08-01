@@ -58,6 +58,7 @@ import uuid
 from collections.abc import AsyncIterator
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 import httpx
 import structlog
@@ -107,10 +108,20 @@ MAX_UPLOAD_BYTES = 4 * 1024 * 1024 * 1024
 # coroutine yields between chunks) + large enough to avoid syscall
 # overhead.
 _CHUNK_BYTES = 4 * 1024 * 1024
-# Asset name convention the release workflow attaches to every cut
-# (see .github/workflows/release.yml). Both the stable + versioned
-# names point at the same bytes; either works for download.
+# Fallback display name for a GitHub-imported image, used only when the
+# asset URL doesn't end in a recognisable filename. Normally the row
+# records the asset actually downloaded — which is the VERSIONED name,
+# since that is what ``_pick_upgrade_assets`` resolves (the stable name is
+# pruned from every non-latest release, #392). Stamping the stable name
+# unconditionally used to leave the Fleet picker showing a filename that
+# matched no asset on the release it came from.
 _GITHUB_IMAGE_FILENAME = "spatiumddi-appliance-slot-amd64.raw.xz"
+
+
+def _github_asset_filename(asset_url: str) -> str:
+    """Last path segment of a release-asset URL, minus any query string."""
+    tail = urlparse(asset_url).path.rsplit("/", 1)[-1]
+    return tail if tail.endswith(".raw.xz") else _GITHUB_IMAGE_FILENAME
 
 
 def _require_superadmin(user: CurrentUser) -> None:
@@ -739,7 +750,7 @@ async def import_upgrade_image_from_github(
 
     row = ApplianceUpgradeImage(
         id=image_id,
-        filename=_GITHUB_IMAGE_FILENAME,
+        filename=_github_asset_filename(spec.image_asset_url),
         size_bytes=bytes_written,
         sha256=expected_sha,
         appliance_version=tag,
