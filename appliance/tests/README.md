@@ -8,8 +8,18 @@ require a database, Docker, or an appliance ISO.
 
 | File | What it tests |
 |---|---|
+| `test_cluster_join_failure_reason.py` | `spatium-cluster-join`'s failure-reason classifier (#590) |
+| `test_cluster_join_identity.py` | `spatium-cluster-join`'s cluster-identity wipe (#590) |
+| `test_firewall_webui_sentinel.py` | Web UI reachability before the supervisor exists (#769) |
+| `test_firstboot_member_guard.py` | `spatiumddi-firstboot` not re-seeding manifests on a joined member (#590) |
+| `test_frontend_boot_gate.py` | SPA fallback landing on the initialising page (#767) |
 | `test_grub_render.py` | `spatium-grub-render` renderer via `--print` (DRY-RUN) |
 | `test_host_migrate.py` | `spatium-host-migrate` orchestrator via a patched subprocess |
+| `test_install_done_gate.py` | The headless-install Done-screen gate |
+| `test_preseed_lint.py` | `spatium-install --check-preseed` linter |
+| `test_preseed_security.py` | The #549 preseed installer's security guards (#581) |
+| `test_slot_status_active_version.py` | `spatium-upgrade-slot status` reading the active slot's version without a mount (#788) |
+| `test_slot_upgrade_runner.py` | `spatiumddi-slot-upgrade` dead/stalled-apply guards (#421) |
 
 ## How to run
 

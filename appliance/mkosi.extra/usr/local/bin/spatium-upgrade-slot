@@ -142,9 +142,14 @@ def slot_version_label(slot: dict[str, str]) -> str:
         try:
             mountpoint.rmdir()
         except OSError:
-            # Same: cleanup-only. Leaving the empty tmpdir behind is
-            # cosmetic — it's under /tmp and tmpfs reclaims on reboot.
+            # Same: cleanup-only. Leaving the empty probe dir behind is
+            # cosmetic — it's under /run, a tmpfs reclaimed on reboot.
             pass
+
+
+def slot_versions_key(slot: dict[str, str]) -> str:
+    """Map a slot dict to its key in ``slot-versions.json``."""
+    return "slot_a" if slot["partlabel"].lower() == "root_a" else "slot_b"
 
 
 def cmd_status(_args) -> int:
@@ -154,8 +159,16 @@ def cmd_status(_args) -> int:
               file=sys.stderr)
         return 2
     active, inactive = pair
-    print(f"Active slot:    {active['partlabel']:8}  {active['device']:14}  version={slot_version_label(active)}")
-    print(f"Inactive slot:  {inactive['partlabel']:8}  {inactive['device']:14}  version={slot_version_label(inactive)}")
+    # Both versions come from sync_slot_versions(), never from calling
+    # slot_version_label() on the active slot: that device is already
+    # mounted rw at /, so a second read-only mount of it is refused and
+    # the active slot would always render "unreadable" (#788). Syncing
+    # here also refreshes the sidecar the api + console read.
+    versions = sync_slot_versions()
+    print(f"Active slot:    {active['partlabel']:8}  {active['device']:14}  "
+          f"version={versions.get(slot_versions_key(active), 'unknown')}")
+    print(f"Inactive slot:  {inactive['partlabel']:8}  {inactive['device']:14}  "
+          f"version={versions.get(slot_versions_key(inactive), 'unknown')}")
     return 0
 
 
@@ -667,10 +680,8 @@ def sync_slot_versions() -> dict[str, str]:
     active, inactive = pair
 
     versions: dict[str, str] = {}
-    active_slot = "slot_a" if active["partlabel"].lower() == "root_a" else "slot_b"
-    inactive_slot = "slot_a" if active_slot == "slot_b" else "slot_b"
-    versions[active_slot] = _read_active_appliance_version()
-    versions[inactive_slot] = slot_version_label(inactive)
+    versions[slot_versions_key(active)] = _read_active_appliance_version()
+    versions[slot_versions_key(inactive)] = slot_version_label(inactive)
 
     try:
         _SLOT_VERSIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
