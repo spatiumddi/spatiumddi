@@ -237,9 +237,116 @@ kbd {
   display: block;
 }
 
+.nav-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: none;
+}
+
+/* Hamburger. Hidden above the breakpoint; the rule that shows it lives in the
+   media query below so the desktop bar is unchanged. */
+.nav-toggle {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-soft);
+  color: var(--fg-muted);
+  cursor: pointer;
+  flex: none;
+}
+.nav-toggle:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.nav-toggle svg {
+  display: block;
+}
+/* One button, two glyphs: which one shows is driven by the same
+   ``data-nav-open`` attribute the panel reads, so they cannot disagree. */
+.nav-toggle .icon-close,
+.nav[data-nav-open="true"] .nav-toggle .icon-open {
+  display: none;
+}
+.nav[data-nav-open="true"] .nav-toggle .icon-close {
+  display: block;
+}
+
 @media (max-width: 820px) {
-  .nav-links .hide-sm {
+  .nav-inner {
+    gap: 12px;
+  }
+
+  /* Push the controls to the right edge. On desktop that happens for free —
+     .nav-links carries margin-left:auto and sits before .nav-actions in the
+     flow. Here .nav-links is taken out of flow (it becomes the dropdown panel
+     below), so nothing is left to push, and the buttons would otherwise sit
+     tucked against the brand with the whole right half of the bar empty. */
+  .nav-actions {
+    margin-left: auto;
+  }
+
+  .nav-toggle {
+    display: inline-flex;
+  }
+
+  /* Collapsed panel. Gated on ``data-nav-enhanced``, which the nav script sets
+     on load: without JavaScript the links stay a plain wrapping row under the
+     brand rather than being hidden behind a button that cannot open. */
+  .nav[data-nav-enhanced="true"] .nav-links {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    right: 0;
+    margin-left: 0;
     display: none;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 0;
+    padding: 8px 16px 14px;
+    background: var(--bg);
+    border-bottom: 1px solid var(--border);
+    /* The bar itself is translucent; the panel is not. Text scrolling under a
+       see-through dropdown is unreadable, and this one covers real content. */
+    box-shadow: 0 10px 24px rgb(0 0 0 / 12%);
+    /* Long menus stay reachable on a short landscape viewport. */
+    max-height: calc(100dvh - 62px);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
+
+  .nav[data-nav-enhanced="true"][data-nav-open="true"] .nav-links {
+    display: flex;
+  }
+
+  /* Comfortable tap targets — 44px is the usual floor, and these are the only
+     way to reach Features / Install / Community on a phone. */
+  .nav[data-nav-enhanced="true"] .nav-links a {
+    padding: 12px 4px;
+    border-bottom: 1px solid var(--border);
+    font-size: 1rem;
+  }
+  .nav[data-nav-enhanced="true"] .nav-links a:last-child {
+    border-bottom: 0;
+  }
+
+  .nav[data-nav-enhanced="true"] .nav-links .nav-cta {
+    justify-content: center;
+    margin-top: 12px;
+    padding: 11px 14px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+
+  /* The bar needs a positioning context for the panel, and must sit above it
+     so the shadow falls behind the bar rather than across it. */
+  .nav-inner {
+    position: relative;
   }
 }
 
