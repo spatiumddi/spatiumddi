@@ -1258,3 +1258,101 @@ async def test_ttl_restore_sends_the_zone_default_for_inheriting_records(
     # ...and the wire carries the zone's own default, not the agent's 3600.
     restore_ops = captured[-1]
     assert [o["record"]["ttl"] for o in restore_ops] == [7200]
+
+
+async def test_failed_commit_during_cutover_puts_the_windows_scope_back(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The commit is sequenced inside the switch, so a commit failure is
+    compensated like any other.
+
+    The Windows scope is already down by the time the transaction is sealed. If
+    sealing fails, the database rolls back to "managed inactive" and the subnet
+    would have no DHCP at all — so the same compensation that covers a failed
+    flush has to cover a failed commit.
+    """
+    user = await _user(db_session)
+    group, source, scope, _subnet = await _dhcp_side(db_session, is_active=False)
+    plan, item = await _plan_with_item(
+        db_session,
+        kind="dhcp_scope",
+        source_ref="10.20.0.0",
+        user=user,
+        source_dhcp=source,
+        dhcp_group_id=group.id,
+        scope=scope,
+        parity_ok=True,
+    )
+    await db_session.commit()
+
+    driver = _FakeDHCPDriver(scopes=[_windows_scope()])
+    monkeypatch.setattr(switch_mod, "WindowsDHCPReadOnlyDriver", lambda: driver)
+    monkeypatch.setattr(readiness_mod, "get_dhcp_driver", lambda _d: driver)
+
+    async def _boom() -> None:
+        raise RuntimeError("commit failed")
+
+    with pytest.raises(RuntimeError, match="commit failed"):
+        await switch_mod.execute_cutover(
+            db_session,
+            plan=plan,
+            item=item,
+            current_user=user,
+            force=True,
+            finalize=_boom,
+        )
+    await db_session.rollback()
+
+    # Down, then back up — never left with no DHCP server on the subnet.
+    assert driver.state_calls == [("10.20.0.0", False), ("10.20.0.0", True)]
+
+
+async def test_rollback_commits_before_reactivating_windows(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The managed-side deactivation must be sealed *before* Windows comes back.
+
+    Committing afterwards would mean a failed commit rolls the managed scope
+    back to active while Windows is already active — both answering for one
+    subnet, which is the single outcome the switch ordering exists to prevent.
+    """
+    user = await _user(db_session)
+    group, source, scope, _subnet = await _dhcp_side(db_session, is_active=True)
+    plan, item = await _plan_with_item(
+        db_session,
+        kind="dhcp_scope",
+        source_ref="10.20.0.0",
+        user=user,
+        source_dhcp=source,
+        dhcp_group_id=group.id,
+        scope=scope,
+        stage="cut_over",
+        parity_ok=True,
+    )
+    await db_session.commit()
+
+    driver = _FakeDHCPDriver(scopes=[_windows_scope(is_active=False)])
+    monkeypatch.setattr(switch_mod, "WindowsDHCPReadOnlyDriver", lambda: driver)
+
+    order: list[str] = []
+
+    async def _finalize() -> None:
+        order.append(f"commit(managed_active={scope.is_active})")
+        await db_session.commit()
+
+    original = driver.set_scope_state
+
+    async def _tracked(server: Any, scope_id: str, *, active: bool) -> None:
+        order.append(f"winrm(active={active})")
+        await original(server, scope_id, active=active)
+
+    monkeypatch.setattr(driver, "set_scope_state", _tracked)
+
+    await switch_mod.execute_rollback(
+        db_session, plan=plan, item=item, current_user=user, finalize=_finalize
+    )
+
+    assert order == ["commit(managed_active=False)", "winrm(active=True)"], order
+    assert scope.is_active is False
+    assert item.stage == "rolled_back"
+    assert item.cut_over_at is None

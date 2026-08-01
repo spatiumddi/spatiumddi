@@ -17,6 +17,14 @@ least clever code in the package:
   answering for one subnet hand out conflicting addresses within seconds, so a
   window where both are live is worse than a window where neither is. If the
   managed side then fails to come up, the Windows scope is put back.
+* **The commit is sequenced by this module, not by the caller.** Both DHCP
+  paths pair an irreversible WinRM call with a database write, so *where* the
+  transaction commits relative to that call decides what a crash leaves behind.
+  The router hands in a ``finalize`` callable (write the audit row, commit) and
+  this module decides when to invoke it — see ``_cutover_dhcp`` /
+  ``_rollback_dhcp``. Committing at the wrong point is how a failed transaction
+  ends with both servers answering, which is the one outcome the ordering above
+  exists to prevent.
 * **DNS is not switched here at all.** There is no server-side flag we own:
   which server answers for a zone is decided by the delegation at the parent
   (or by what the resolvers forward to), and both live outside SpatiumDDI. So
@@ -27,6 +35,7 @@ least clever code in the package:
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -179,6 +188,10 @@ async def execute_cutover(
     item: CutoverItem,
     current_user: User,
     force: bool = False,
+    #: Called once the module has reached the point where the transaction is
+    #: safe to seal — writes the audit row and commits. Sequencing it is this
+    #: module's job, not the caller's; see the module docstring.
+    finalize: Callable[[], Awaitable[None]] | None = None,
 ) -> dict[str, Any]:
     """Cut one item over from Windows to SpatiumDDI.
 
@@ -218,11 +231,21 @@ async def execute_cutover(
 
     if item.kind == "dhcp_scope":
         return await _cutover_dhcp(
-            db, plan=plan, item=item, current_user=current_user, acknowledged=warnings
+            db,
+            plan=plan,
+            item=item,
+            current_user=current_user,
+            acknowledged=warnings,
+            finalize=finalize,
         )
     if item.kind == "dns_zone":
         return await _cutover_dns(
-            db, plan=plan, item=item, current_user=current_user, acknowledged=warnings
+            db,
+            plan=plan,
+            item=item,
+            current_user=current_user,
+            acknowledged=warnings,
+            finalize=finalize,
         )
     raise ValueError(f"Unsupported cutover item kind {item.kind!r}")
 
@@ -234,6 +257,7 @@ async def _cutover_dhcp(
     item: CutoverItem,
     current_user: User,
     acknowledged: list[Blocker],
+    finalize: Callable[[], Awaitable[None]] | None = None,
 ) -> dict[str, Any]:
     """Deactivate the Windows scope, then activate the managed one.
 
@@ -262,6 +286,13 @@ async def _cutover_dhcp(
         scope.is_active = True
         await db.flush()
         collect_wake(dhcp_group_channel(scope.group_id))
+        # Commit here, inside the guard. The Windows scope is already down; if
+        # sealing the managed scope's activation fails, the database rolls back
+        # to "managed inactive" while the subnet has no DHCP at all — so the
+        # compensation below has to cover a failed commit exactly as it covers a
+        # failed flush.
+        if finalize is not None:
+            await finalize()
     except Exception:
         # Compensate: the Windows scope is already down and the managed one did
         # not come up, so the subnet currently has no DHCP at all. Put the old
@@ -331,6 +362,7 @@ async def _cutover_dns(
     item: CutoverItem,
     current_user: User,
     acknowledged: list[Blocker],
+    finalize: Callable[[], Awaitable[None]] | None = None,
 ) -> dict[str, Any]:
     """Record the DNS transition and hand back the operator instructions.
 
@@ -384,6 +416,12 @@ async def _cutover_dns(
         item_id=str(item.id),
         zone=zone.name,
     )
+    # No external side effect on the DNS side — the switch is a delegation
+    # change the operator makes elsewhere — so the commit point is simply after
+    # the DB writes.
+    if finalize is not None:
+        await finalize()
+
     return result
 
 
@@ -396,6 +434,10 @@ async def execute_rollback(
     plan: CutoverPlan,
     item: CutoverItem,
     current_user: User,
+    #: Called once the module has reached the point where the transaction is
+    #: safe to seal — writes the audit row and commits. Sequencing it is this
+    #: module's job, not the caller's; see the module docstring.
+    finalize: Callable[[], Awaitable[None]] | None = None,
 ) -> dict[str, Any]:
     """Reverse a cutover.
 
@@ -407,9 +449,13 @@ async def execute_rollback(
     :class:`CutoverEvent` is appended.
     """
     if item.kind == "dhcp_scope":
-        return await _rollback_dhcp(db, plan=plan, item=item, current_user=current_user)
+        return await _rollback_dhcp(
+            db, plan=plan, item=item, current_user=current_user, finalize=finalize
+        )
     if item.kind == "dns_zone":
-        return await _rollback_dns(db, plan=plan, item=item, current_user=current_user)
+        return await _rollback_dns(
+            db, plan=plan, item=item, current_user=current_user, finalize=finalize
+        )
     raise ValueError(f"Unsupported cutover item kind {item.kind!r}")
 
 
@@ -419,6 +465,7 @@ async def _rollback_dhcp(
     plan: CutoverPlan,
     item: CutoverItem,
     current_user: User,
+    finalize: Callable[[], Awaitable[None]] | None = None,
 ) -> dict[str, Any]:
     """Deactivate the managed scope, then re-activate the Windows one.
 
@@ -430,10 +477,30 @@ async def _rollback_dhcp(
     driver = WindowsDHCPReadOnlyDriver()
     actions: list[str] = []
 
+    now = datetime.now(UTC)
     scope.is_active = False
+    item.stage = "rolled_back"
+    item.rolled_back_at = now
+    # Clear the cutover stamp. ``readiness._is_cut_over`` short-circuits on it to
+    # stop a completed item looking permanently unready, so leaving it set on a
+    # rolled-back item would suppress the pre-switch blockers for good — most
+    # importantly ``managed_scope_active``, the one that refuses a retry while
+    # both servers are live on the same subnet. Mirrors the cutover path, which
+    # clears ``rolled_back_at`` for the same reason.
+    item.cut_over_at = None
     await db.flush()
     collect_wake(dhcp_group_channel(scope.group_id))
     actions.append("Deactivated the managed scope in SpatiumDDI")
+
+    # Seal the managed-side deactivation BEFORE touching Windows. This ordering
+    # is the whole point: if the commit fails now, nothing has been done to
+    # Windows and the database rolls back to the cut-over state — consistent. If
+    # we committed after the WinRM call instead, a failed commit would leave the
+    # database saying "managed active" while Windows had already been brought
+    # back up, and both would answer for the subnet. A brief window with no DHCP
+    # is survivable; an overlap is not.
+    if finalize is not None:
+        await finalize()
 
     try:
         await driver.set_scope_state(source_server, item.source_ref, active=True)
@@ -444,6 +511,10 @@ async def _rollback_dhcp(
         try:
             scope.is_active = True
             await db.flush()
+            # The managed-side deactivation was already committed above, so this
+            # correction is a new transaction and needs its own commit — a flush
+            # alone would be discarded when the request unwinds.
+            await db.commit()
             collect_wake(dhcp_group_channel(scope.group_id))
             logger.warning(
                 "cutover_rollback_compensated",
@@ -464,17 +535,6 @@ async def _rollback_dhcp(
         raise
 
     actions.append(f"Re-activated scope {item.source_ref} on {source_server.name}")
-
-    now = datetime.now(UTC)
-    item.stage = "rolled_back"
-    item.rolled_back_at = now
-    # Clear the cutover stamp. ``readiness._is_cut_over`` short-circuits on it to
-    # stop a completed item looking permanently unready, so leaving it set on a
-    # rolled-back item would suppress the pre-switch blockers for good — most
-    # importantly ``managed_scope_active``, the one that refuses a retry while
-    # both servers are live on the same subnet. Mirrors the cutover path, which
-    # clears ``rolled_back_at`` for the same reason.
-    item.cut_over_at = None
 
     result: dict[str, Any] = {
         "kind": item.kind,
@@ -510,6 +570,7 @@ async def _rollback_dns(
     plan: CutoverPlan,
     item: CutoverItem,
     current_user: User,
+    finalize: Callable[[], Awaitable[None]] | None = None,
 ) -> dict[str, Any]:
     """Restore the pre-flight TTLs and hand back the revert instructions.
 
@@ -566,4 +627,10 @@ async def _rollback_dns(
         zone=zone.name,
         records_restored=restored,
     )
+    # No external side effect on the DNS side — the switch is a delegation
+    # change the operator makes elsewhere — so the commit point is simply after
+    # the DB writes.
+    if finalize is not None:
+        await finalize()
+
     return result

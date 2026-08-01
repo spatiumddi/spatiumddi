@@ -1038,9 +1038,27 @@ async def cut_item_over(
     """
     plan = await _require_plan(db, plan_id)
     item = await _require_item(db, plan, item_id)
+
+    # The switch pairs an irreversible WinRM call with a database write, so
+    # WHERE the commit lands relative to that call decides what a crash leaves
+    # behind. That sequencing knowledge belongs with the ordering rules in
+    # ``switch.py``, so the transaction boundary is handed in rather than
+    # applied here — see that module's docstring.
+    async def _finalize() -> None:
+        if plan.status in ("draft", "verifying", "parallel"):
+            plan.status = "cutting_over"
+        _audit(
+            db,
+            user,
+            action="cutover_item",
+            plan=plan,
+            detail={"source_ref": item.source_ref, "kind": item.kind, "force": body.force},
+        )
+        await db.commit()
+
     try:
         result = await switch_svc.execute_cutover(
-            db, plan=plan, item=item, current_user=user, force=body.force
+            db, plan=plan, item=item, current_user=user, force=body.force, finalize=_finalize
         )
     except switch_svc.CutoverBlocked as exc:
         # Persist the refusal rather than rolling it away. ``execute_cutover``
@@ -1073,16 +1091,6 @@ async def cut_item_over(
         await db.rollback()
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    if plan.status in ("draft", "verifying", "parallel"):
-        plan.status = "cutting_over"
-    _audit(
-        db,
-        user,
-        action="cutover_item",
-        plan=plan,
-        detail={"source_ref": item.source_ref, "kind": item.kind, "force": body.force},
-    )
-    await db.commit()
     return result
 
 
@@ -1092,20 +1100,28 @@ async def roll_item_back(
 ) -> dict[str, Any]:
     plan = await _require_plan(db, plan_id)
     item = await _require_item(db, plan, item_id)
+
+    # Same reasoning as the cutover above: the rollback commits the managed-side
+    # deactivation BEFORE re-activating Windows, so a failed commit can never
+    # leave both servers answering. ``switch.py`` owns that ordering.
+    async def _finalize() -> None:
+        _audit(
+            db,
+            user,
+            action="rollback_cutover_item",
+            plan=plan,
+            detail={"source_ref": item.source_ref, "kind": item.kind},
+        )
+        await db.commit()
+
     try:
-        result = await switch_svc.execute_rollback(db, plan=plan, item=item, current_user=user)
+        result = await switch_svc.execute_rollback(
+            db, plan=plan, item=item, current_user=user, finalize=_finalize
+        )
     except ValueError as exc:
         await db.rollback()
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    _audit(
-        db,
-        user,
-        action="rollback_cutover_item",
-        plan=plan,
-        detail={"source_ref": item.source_ref, "kind": item.kind},
-    )
-    await db.commit()
     return result
 
 
