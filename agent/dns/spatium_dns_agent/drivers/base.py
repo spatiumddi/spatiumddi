@@ -11,6 +11,12 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
 
+# Record-op kinds that describe an RRset, and so can carry the complete
+# desired ``record["rrset"]`` the control plane stamps on them (#773).
+# Everything else on the queue is zone-level (the ``dnssec_*`` ops) and
+# branches off before any of the record machinery runs.
+RRSET_OP_KINDS = frozenset({"create", "update", "delete"})
+
 
 class DriverBase(ABC):
     def __init__(self, state_dir: Path):

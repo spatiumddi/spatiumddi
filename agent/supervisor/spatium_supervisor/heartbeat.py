@@ -1085,10 +1085,13 @@ def heartbeat_once(
         # longer than the whole recovery budget. Re-converged every
         # heartbeat because k3s re-applies its bundled manifest (replicas
         # back to 1) on every restart.
-        dns_changed, dns_err = k8s_api.ensure_coredns_ha()
-        if dns_changed:
-            log.info("supervisor.heartbeat.coredns_ha_applied")
-        elif dns_err:
+        #
+        # #750 — the reconciler now targets the HA shape only once a second
+        # node exists, and reverts a single-node box to stock; applying it to
+        # one node deadlocked the rollout permanently. So a "changed" here can
+        # mean either direction, and the reconciler logs which.
+        _dns_changed, dns_err = k8s_api.ensure_coredns_ha()
+        if dns_err:
             log.warning("supervisor.heartbeat.coredns_ha_failed", error=dns_err)
 
     # #170 Wave C2 — render the role-driven compose env. C3 will

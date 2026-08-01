@@ -127,6 +127,65 @@ class DNSDriver(ABC):
 | Update RPZ (blocking) | `rndc reload <rpz-zone>` after writing RPZ zone file | Zone-level reload only |
 | **Full daemon restart** | ❌ NEVER for normal operations | Only for: initial install, major version upgrade |
 
+### Record ops carry the whole RRset ([#773](https://github.com/spatiumddi/spatiumddi/issues/773))
+
+A record op names one record, but none of the three agent wire protocols
+can express "change this RR and leave its siblings alone" from a payload
+that only carries the NEW value. Each driver therefore had to perform a
+whole-RRset write, and each lost the siblings doing it: BIND9 used
+`upd.replace(...)`, Technitium `overwrite=true`, and PowerDNS — which
+read-merged and so kept siblings — could not remove the *old* value on an
+edit. A name with several values at one type (round-robin A, a backup MX,
+SPF beside a verification TXT, multiple apex NS) ended up serving only
+whichever op landed last.
+
+The control plane is the only place that knows the complete set, so it
+ships it. Every agent-bound `create` / `update` / `delete` op payload
+carries:
+
+```json
+"rrset": {"ttl": 3600,
+          "members": [{"value": "10.20.7.21"},
+                      {"value": "10.20.7.22"}]}
+```
+
+`members` is the desired state **after** the op — an empty list means the
+RRset should not exist. Members carry `priority` / `weight` / `port` so
+each driver composes their wire form exactly as it composes the op's own.
+Per RFC 2181 an RRset has one TTL, resolved control-plane-side (lowest of
+the members, with a NULL falling back to the zone default rather than a
+hardcoded 3600).
+
+Each driver applies it atomically where it can: BIND9 as a single
+`upd.replace(name, ttl, rtype, *values)` — dnspython emits one
+delete-RRset plus N adds in ONE update message — and PowerDNS as one
+`REPLACE` PATCH with no preceding GET. Technitium's REST API is one
+record per call, so a create/update is N calls (member 0 with
+`overwrite=true`, the rest `false`) while a delete stays a single
+value-scoped call. Ops are therefore idempotent: replaying one converges
+the server to the database rather than depending on what ran before it.
+
+Ops enqueued together all carry the RRset as it should be once the WHOLE
+batch has landed, not a running prefix — so they are order-independent
+too. That matters because `bulk_delete_records` builds its ops from live
+rows and only removes them once the wire result comes back: reconciling
+each op against the raw snapshot in isolation would have two deletes at
+one name ship contradictory sets, and whichever landed last would
+reinstate a value the operator deleted.
+
+`rrset_action` (`add` / `delete_value`) is the older per-op override.
+Setting it **opts an op out** of the stamping above, and it remains the
+fallback for an op enqueued by a control plane that predates `rrset`. Two
+callers use it: DNS pools and the Windows-cutover TTL pre-flight. Pools
+opt out deliberately — a pool re-points a member as a `delete_value` plus
+an `add` across two separate enqueue calls on one serial, and whole-RRset
+writes would make that pair order-dependent, since the delete's set is
+computed before the row is mutated.
+
+Not covered: the **agentless** Windows DNS driver
+(`backend/app/drivers/dns/windows.py`) has the same collapse in its own
+PowerShell path and is not fixed by this — it never receives the field.
+
 ### TSIG Authentication
 
 All RFC 2136 updates are TSIG-signed:
@@ -639,7 +698,7 @@ Third authoritative driver, alongside BIND9 and PowerDNS. Same agent-colocated s
 Unlike PowerDNS's rrset-REPLACE PATCH semantics, Technitium's `/api/zones/records/add` **appends** at a given `(name, type)` by default (round-robin A records coexist without a GET-merge-PATCH dance) and only wipes the rrset when `overwrite=true` is passed explicitly. The agent driver exploits this:
 
 - **Bulk reconcile** (`swap_and_reload`, fired on structural config changes): fetch the zone's full record set via `GET /api/zones/records/get?listZone=true`, diff by `(domain, type, params)` fingerprint against the desired bundle state, then `POST` deletes for what's extra and adds for what's missing. No `update` endpoint call needed — a changed value is just delete-old + add-new, computed from the full diff.
-- **Incremental ops** (`apply_record_op`, fired per live edit): `create`/`update` → `add` with `overwrite=false`; `delete` → `delete` with the exact matching value. Same "update leaves a stale value until an explicit delete" caveat PowerDNS's driver documents for the identical reason (the op payload carries only the new value).
+- **Incremental ops** (`apply_record_op`, fired per live edit): the op carries the complete desired `rrset` (see §2, [#773](https://github.com/spatiumddi/spatiumddi/issues/773)), so `create`/`update` is member 0 with `overwrite=true` — which clears — followed by an `add` per remaining member with `overwrite=false`, and `delete` is a single value-scoped `delete` of the op's own value (the survivors are already on the server; wiping and rebuilding them would open a window where the name serves less than it should). Before #773 this path was one `add` with `overwrite=true`, which is what collapsed every multi-value RRset to its last value.
 - Zone apex `NS`/`SOA` are **daemon-managed** — Technitium auto-creates its own SOA + one NS pointing at its own hostname on `/api/zones/create`, so the bundle's apex NS/SOA are intentionally excluded from every reconcile pass (pushing them would create duplicate/foreign records). Off-apex `NS` (delegations) reconcile normally.
 
 ### 4B.2 Auth — agent-provisioned bearer token

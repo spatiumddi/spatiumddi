@@ -7,12 +7,13 @@ from __future__ import annotations
 
 import ipaddress
 import uuid
+from collections.abc import Callable
 from datetime import datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
@@ -49,6 +50,7 @@ NULLABLE_CLEARABLE_SCOPE_FIELDS = {
 }
 # DHCPv6 operating modes (issue #52). Only meaningful for ipv6 scopes.
 VALID_V6_MODES = {"stateful", "stateless", "slaac"}
+
 
 _CODE_TO_NAME: dict[int, str] = {
     2: "time-offset",
@@ -147,6 +149,72 @@ def _normalize_sync_mode(v: str | None) -> str:
     return legacy.get(v, v)
 
 
+# Fields the scope write models accept under two names, as
+# ``(name ScopeResponse emits, alias also accepted, comparison normaliser)``.
+# Both aliases are the underlying column name, which is why they are accepted
+# and why a script reaches for them first: they are what the model, the DHCP
+# services layer and docs/features/DHCP.md all call the field.
+_SCOPE_FIELD_ALIASES: tuple[tuple[str, str, Callable[[Any], Any]], ...] = (
+    ("enabled", "is_active", lambda v: v),
+    ("hostname_sync_mode", "hostname_to_ipam_sync", _normalize_sync_mode),
+)
+
+
+def _assert_aliases_agree(values: dict[str, Any], fields_set: set[str]) -> None:
+    """Refuse a body that sets one field twice, under both its names, and
+    disagrees with itself (#774).
+
+    ``ScopeResponse`` emits only one name of each pair, so the natural
+    read-modify-write — GET, edit, PUT the whole representation back — produces
+    a body carrying BOTH as soon as the caller reaches for the column name.
+    Whichever name the handler happened to prefer then won, and for the active
+    flag that was the stale one the GET supplied: "deactivate this scope"
+    answering 200 while the scope kept handing out addresses.
+
+    A precedence rule *could* be built — the response never emits the alias, so
+    an ``is_active`` in a body is always a deliberate keystroke while an
+    ``enabled`` may be GET residue. We refuse anyway: silently picking between
+    two contradictory instructions is the wrong posture for the flag that
+    decides whether a DHCP server hands out addresses, and the entire cost of
+    this bug was that it was silent. A refusal names the problem where it
+    happens. Sending exactly one name is unambiguous, is what every client in
+    the repo already does, and still works untouched.
+
+    Nothing counts as a disagreement unless both names carry a real value:
+    ``null`` and ``""`` mean "not supplied", and values that normalise to the
+    same thing — ``learned`` and ``on_lease`` — agree. ``False`` is a real
+    value and is compared as one.
+
+    The empty-string carve-out exists because ``create_scope`` resolves this
+    pair with ``a or b``, so an empty ``hostname_sync_mode`` has always fallen
+    through to the other name and must not start 422-ing. ``update_scope``
+    branches on key presence instead, so there an empty string still wins and
+    resolves to the default — pre-existing, and unreachable from the flow this
+    guard is about, because ``ScopeResponse`` reads the field from a NOT-NULL
+    column that only ever holds a canonical value, so a fetched body cannot
+    carry an empty one.
+    """
+
+    def _unsupplied(value: Any) -> bool:
+        return value is None or (isinstance(value, str) and not value)
+
+    for public, alias, normalize in _SCOPE_FIELD_ALIASES:
+        if public not in fields_set or alias not in fields_set:
+            continue
+        public_value, alias_value = values.get(public), values.get(alias)
+        if _unsupplied(public_value) or _unsupplied(alias_value):
+            continue
+        if normalize(public_value) == normalize(alias_value):
+            continue
+        raise ValueError(
+            f"{public!r} and {alias!r} are two names for the same field and this "
+            f"request sets them to different values ({public}={public_value!r}, "
+            f"{alias}={alias_value!r}). Send only one of them — {public!r} is the "
+            f"name the scope endpoints return, so a read-modify-write should edit "
+            f"that one."
+        )
+
+
 def _validate_relay_addresses(v: list[str] | None) -> list[str]:
     """Validate + de-dupe relay-agent IPs (issue #337).
 
@@ -201,6 +269,11 @@ class ScopeCreate(BaseModel):
     group_id: uuid.UUID | None = None
     name: str = ""
     description: str = ""
+    # Two names for one column — see ``_SCOPE_FIELD_ALIASES``. ``enabled`` is
+    # the public one (it is what ``ScopeResponse`` emits) and ``is_active`` is
+    # the accepted alias, kept because it is the column / model-attribute name
+    # and therefore the one scripts reach for first. Sending both with
+    # different values is refused rather than silently resolved (#774).
     is_active: bool = True
     enabled: bool | None = None
     lease_time: int = 86400
@@ -235,6 +308,19 @@ class ScopeCreate(BaseModel):
     relay_addresses: list[str] = Field(default_factory=list)
     tags: dict[str, Any] = Field(default_factory=dict)
 
+    @model_validator(mode="after")
+    def _field_aliases(self) -> ScopeCreate:
+        _assert_aliases_agree(
+            {
+                "enabled": self.enabled,
+                "is_active": self.is_active,
+                "hostname_sync_mode": self.hostname_sync_mode,
+                "hostname_to_ipam_sync": self.hostname_to_ipam_sync,
+            },
+            self.model_fields_set,
+        )
+        return self
+
     @field_validator("relay_addresses")
     @classmethod
     def _relay(cls, v: list[str] | None) -> list[str]:
@@ -266,6 +352,9 @@ class ScopeUpdate(BaseModel):
 
     name: str | None = None
     description: str | None = None
+    # See ScopeCreate: ``enabled`` is the public name, ``is_active`` the
+    # accepted alias for the same column, and a body that sets both to
+    # different values is refused instead of silently resolved (#774).
     is_active: bool | None = None
     enabled: bool | None = None
     lease_time: int | None = None
@@ -276,6 +365,8 @@ class ScopeUpdate(BaseModel):
     options: Any = None
     ddns_enabled: bool | None = None
     ddns_hostname_policy: str | None = None
+    # The second dual-named field (#774): ``hostname_sync_mode`` is what
+    # ``ScopeResponse`` emits, ``hostname_to_ipam_sync`` is the column name.
     hostname_to_ipam_sync: str | None = None
     hostname_sync_mode: str | None = None
     dns_track_dynamic_leases: bool | None = None
@@ -306,6 +397,19 @@ class ScopeUpdate(BaseModel):
     # scope's relay set (empty list clears it); omit to leave unchanged.
     relay_addresses: list[str] | None = None
     tags: dict[str, Any] | None = None
+
+    @model_validator(mode="after")
+    def _field_aliases(self) -> ScopeUpdate:
+        _assert_aliases_agree(
+            {
+                "enabled": self.enabled,
+                "is_active": self.is_active,
+                "hostname_sync_mode": self.hostname_sync_mode,
+                "hostname_to_ipam_sync": self.hostname_to_ipam_sync,
+            },
+            self.model_fields_set,
+        )
+        return self
 
     @field_validator("v6_address_mode")
     @classmethod
@@ -488,6 +592,8 @@ async def create_scope(
     sync_mode = _normalize_sync_mode(body.hostname_sync_mode or body.hostname_to_ipam_sync)
     if sync_mode not in VALID_SYNC_MODES - {"ipam", "learned"}:
         raise HTTPException(status_code=422, detail=f"invalid hostname sync mode: {sync_mode}")
+    # Same alias resolution as update: ``enabled`` wins when supplied, and
+    # ``ScopeCreate`` has already refused a body where the two disagree (#774).
     is_active = body.enabled if body.enabled is not None else body.is_active
     try:
         _net = ipaddress.ip_network(str(subnet.network), strict=False)
@@ -590,8 +696,15 @@ async def update_scope(
         for k, v in body.model_dump(exclude_unset=True).items()
         if v is not None or k in NULLABLE_CLEARABLE_SCOPE_FIELDS
     }
+    # ``enabled`` is the public alias for the ``is_active`` column. Safe to let
+    # it win unconditionally now: ``ScopeUpdate`` refuses a body that sets both
+    # to different values, so this can no longer overwrite a deliberate
+    # ``is_active`` with the stale ``enabled`` a GET supplied (#774).
     if "enabled" in changes:
         changes["is_active"] = changes.pop("enabled")
+    # Same alias resolution, same guarantee: the write model refuses a body
+    # where the two names disagree, so preferring one can no longer shadow a
+    # deliberate edit to the other (#774).
     if "hostname_sync_mode" in changes:
         changes["hostname_to_ipam_sync"] = _normalize_sync_mode(changes.pop("hostname_sync_mode"))
     elif "hostname_to_ipam_sync" in changes:

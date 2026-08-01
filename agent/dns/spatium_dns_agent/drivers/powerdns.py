@@ -41,7 +41,7 @@ import httpx
 import structlog
 
 from ._process import find_running_daemon, is_zombie
-from .base import DriverBase
+from .base import RRSET_OP_KINDS, DriverBase
 
 log = structlog.get_logger(__name__)
 
@@ -661,7 +661,11 @@ class PowerDNSDriver(DriverBase):
         rec = op["record"]
         name = _qualified_name(zone, rec.get("name") or "@")
         rtype = rec["type"].upper()
-        ttl = rec.get("ttl") or 3600
+        # Absence, not falsiness — a TTL of 0 is legal ("never cache this") and
+        # ``or`` silently turned it into an hour. Matches bind9's driver, which
+        # has always tested for None here.
+        _op_ttl = rec.get("ttl")
+        ttl = 3600 if _op_ttl is None else _op_ttl
 
         url = f"{_PDNS_API_BASE}/zones/{zone}"
         headers = {"X-API-Key": api_key, "Content-Type": "application/json"}
@@ -671,12 +675,71 @@ class PowerDNSDriver(DriverBase):
         # rrset contents and ``DELETE`` drops it. There is no
         # ``INSERT`` / ``REMOVE-MEMBER`` granularity. Multiple records
         # at the same (name, type) — round-robin A pools, multi-MX
-        # priorities, multi-NS apex — therefore require a
-        # GET-merge-PATCH dance: read the current rrset, splice the
-        # new content in (or out), and PATCH the merged set back.
-        # Without this, two consecutive ``create www A`` calls
-        # collide (the second overwrites the first), which broke
-        # GSLB pool fan-out among other things.
+        # priorities, multi-NS apex — therefore need the whole set in
+        # hand before the PATCH.
+        #
+        # #773 — the control plane now ships that set on the op, because it
+        # is the only place the complete desired state is known. When it is
+        # present the write is one PATCH, no read: no zone GET, no merge, and
+        # an ``update`` that CHANGES a value no longer strands the old one
+        # (the fallback below could not remove it, and says so).
+        #
+        # Every member goes out as ``disabled: False``. The control plane has
+        # no notion of a disabled record, so its desired set means "these
+        # values, served" — a record an operator disabled in PowerDNS's own UI
+        # is re-enabled by the next write to that name. The merge below used to
+        # preserve the flag on members it did not touch; a full-zone reconcile
+        # would have clobbered it regardless, so this makes the behaviour
+        # consistent rather than introducing a new way to lose it.
+        rrset_payload = rec.get("rrset") if isinstance(rec.get("rrset"), dict) else None
+        rrset_members = (
+            rrset_payload.get("members") if rrset_payload is not None else None
+        )
+        if (
+            rrset_payload is not None
+            and rrset_members is not None
+            and op_kind in RRSET_OP_KINDS
+        ):
+            if rrset_members:
+                # Absence, not falsiness — a TTL of 0 is legal and meaningful.
+                _rrset_ttl = rrset_payload.get("ttl")
+                desired: dict[str, Any] = {
+                    "name": name,
+                    "type": rtype,
+                    "ttl": int(ttl if _rrset_ttl is None else _rrset_ttl),
+                    "changetype": "REPLACE",
+                    "records": [
+                        {
+                            "content": _record_content({**m, "type": rtype}),
+                            "disabled": False,
+                        }
+                        for m in rrset_members
+                    ],
+                }
+            else:
+                desired = {"name": name, "type": rtype, "changetype": "DELETE"}
+            with httpx.Client(timeout=_PDNS_API_TIMEOUT) as client:
+                resp = client.patch(url, headers=headers, json={"rrsets": [desired]})
+            if resp.status_code >= 400:
+                raise RuntimeError(
+                    f"PowerDNS PATCH {zone}/{name}/{rtype} returned "
+                    f"{resp.status_code}: {resp.text[:200]}"
+                )
+            log.info(
+                "powerdns_rrset_applied",
+                zone=zone,
+                name=name,
+                type=rtype,
+                op=op_kind,
+                members=len(rrset_members),
+            )
+            return None
+
+        # Fallback for an op enqueued by a control plane that predates the
+        # ``rrset`` payload: read the current rrset, splice the new content in
+        # (or out), and PATCH the merged set back. Without this, two
+        # consecutive ``create www A`` calls collide (the second overwrites
+        # the first), which broke GSLB pool fan-out among other things.
         with httpx.Client(timeout=_PDNS_API_TIMEOUT) as client:
             zone_resp = client.get(url, headers=headers)
             existing_records: list[dict[str, Any]] = []
@@ -696,15 +759,13 @@ class PowerDNSDriver(DriverBase):
                                     }
                                 )
                         break
-            # update = delete-the-old-content + add-the-new-content;
-            # we don't know the previous value here so update is
-            # treated as "ensure the new value is present + remove
-            # any duplicate of the same content". A separate explicit
-            # remove for the OLD value would need the upstream op
-            # payload to carry it; today the control plane sends
-            # update as a fresh-value-only payload, so if the operator
-            # *changes* the value we leave the old IP in the rrset
-            # until a delete op fires for the prior content.
+            # update = delete-the-old-content + add-the-new-content; we don't
+            # know the previous value here so update is treated as "ensure the
+            # new value is present + remove any duplicate of the same
+            # content". A separate explicit remove for the OLD value would
+            # need the op payload to carry it, so without ``rrset`` a value
+            # *change* leaves the old IP in the rrset until a delete op fires
+            # for the prior content.
             merged: list[dict[str, Any]] = []
             if op_kind == "delete":
                 merged = [r for r in existing_records if r["content"] != new_content]

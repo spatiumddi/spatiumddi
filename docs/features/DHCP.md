@@ -957,6 +957,18 @@ rule here has been surfaced to an operator, not just silently logged.
   modes are not selectable from the API. `422`.
 - **DDNS hostname policy enum.** `ddns_hostname_policy` must match one
   of the documented values (see §13). Pydantic validator.
+- **A field must not be set twice, under both its names, to different
+  values.** Two scope fields are accepted under two names: `enabled`
+  (what the response emits) is the same column as `is_active` (what
+  the model, the services layer and this document call it), and
+  `hostname_sync_mode` is the same as `hostname_to_ipam_sync`. Sending
+  both names of a pair with values that disagree is a `422`; sending
+  either name alone works as it always has. This closes a silent
+  no-op: a read-modify-write — `GET`, edit `is_active`, `PUT` the whole
+  representation back — used to resolve in favour of the `enabled` the
+  `GET` supplied and answer `200` while the scope kept handing out
+  addresses. A `null` or empty string on either name counts as "not
+  supplied", not as a disagreement.  `422`, [#774](https://github.com/spatiumddi/spatiumddi/issues/774).
 
 ### Pools
 

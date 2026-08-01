@@ -198,12 +198,17 @@ rules:
   - apiGroups: ["k3s.cattle.io"]
     resources: ["etcdsnapshotfiles"]
     verbs: ["get", "list", "watch"]
-    # #590 — ensure_coredns_ha: the seed's heartbeat keeps the k3s-bundled
-    # CoreDNS at >=2 replicas with fast-evict tolerations (k3s resets it to
-    # a single 300s-toleration replica on every restart; a single replica
-    # deterministically sits on the seed, so a hard seed kill silences all
-    # Service/pod-FQDN resolution — api readiness's Postgres + Redis
-    # lookups included — for 5 minutes). resourceNames-pinned to coredns.
+    # #590 / #750 — ensure_coredns_ha: the seed's heartbeat matches the
+    # k3s-bundled CoreDNS to the cluster's node count. Two or more nodes get
+    # 2 replicas + fast-evict tolerations + required anti-affinity (k3s resets
+    # it to a single 300s-toleration replica on every restart; a single
+    # replica deterministically sits on the seed, so a hard seed kill silences
+    # all Service/pod-FQDN resolution — api readiness's Postgres + Redis
+    # lookups included — for 5 minutes). A single-node box is held at the
+    # stock shape instead, because the HA pod template cannot schedule there
+    # and deadlocks the rollout. resourceNames-pinned to coredns; the node
+    # count reads through the ``nodes`` LIST verb granted earlier in this rule
+    # list.
   - apiGroups: ["apps"]
     resources: ["deployments"]
     resourceNames: ["coredns"]

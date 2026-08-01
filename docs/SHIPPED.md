@@ -1791,7 +1791,13 @@ Mirrors CLAUDE.md's three mixed sections:
     delete every existing RR at the name+type before adding
     the new one, silently clobbering siblings — for an N-
     member pool, only the most-recently-applied member
-    would survive in BIND9's running zone.
+    would survive in BIND9's running zone. **Superseded but
+    kept** by [#773](https://github.com/spatiumddi/spatiumddi/issues/773):
+    every agent-bound op now carries the complete desired
+    `rrset`, which is what a current agent acts on. Pools
+    were the only caller that ever set `rrset_action`
+    correctly, and the field remains their fallback for an
+    agent running an image older than that change.
   - Rename / type-change branch in `apply_pool_state`:
     when `record_name` or `record_type` shifts on an
     existing pool, emit a `delete_value` op for the old
