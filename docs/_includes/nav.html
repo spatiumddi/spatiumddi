@@ -4,15 +4,17 @@
       <img src="{{ include.root }}assets/logo-icon.svg" alt="">
       <span>Spatium<span class="ddi">DDI</span></span>
     </a>
-    <div class="nav-links">
-      <a class="hide-sm" href="{{ include.root }}index.html#features">Features</a>
+    <div class="nav-links" id="nav-links">
+      <a href="{{ include.root }}index.html#features">Features</a>
       <a href="{{ include.root }}docs.html">Docs</a>
-      <a class="hide-sm" href="{{ include.root }}index.html#install">Install</a>
-      <a class="hide-sm" href="{{ site.links.discord }}">Community</a>
+      <a href="{{ include.root }}index.html#install">Install</a>
+      <a href="{{ site.links.discord }}">Community</a>
       <a class="nav-cta" href="{{ site.links.github }}">
         <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
         GitHub
       </a>
+    </div>
+    <div class="nav-actions">
       <button class="theme-toggle" type="button" id="theme-toggle"
               aria-label="Toggle dark mode" title="Toggle dark mode">
         <svg class="icon-light" width="17" height="17" viewBox="0 0 24 24" fill="none"
@@ -24,6 +26,22 @@
              stroke="currentColor" stroke-width="2" stroke-linecap="round"
              stroke-linejoin="round" aria-hidden="true">
           <path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z"/>
+        </svg>
+      </button>
+      <!-- Shown only under the nav breakpoint (see site.css). Rendered
+           unconditionally rather than injected by script so the control exists
+           for a reader with JavaScript disabled; the script below is what makes
+           it do anything, and the links stay reachable either way because the
+           panel is only hidden once the script marks the nav as enhanced. -->
+      <button class="nav-toggle" type="button" id="nav-toggle"
+              aria-label="Menu" aria-expanded="false" aria-controls="nav-links">
+        <svg class="icon-open" width="20" height="20" viewBox="0 0 24 24" fill="none"
+             stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+          <path d="M3 6h18M3 12h18M3 18h18"/>
+        </svg>
+        <svg class="icon-close" width="20" height="20" viewBox="0 0 24 24" fill="none"
+             stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+          <path d="M6 6l12 12M18 6L6 18"/>
         </svg>
       </button>
     </div>
@@ -52,5 +70,59 @@
         // this page view, it just will not survive navigation.
       }
     });
+  })();
+
+  // Mobile nav. Before this runs the links are a plain wrapping row, which is
+  // usable without JavaScript; `data-nav-enhanced` is what switches the CSS to
+  // the collapsed panel, so the menu can only be hidden once something exists
+  // to open it again.
+  (function () {
+    var nav = document.querySelector(".nav");
+    var toggle = document.getElementById("nav-toggle");
+    var links = document.getElementById("nav-links");
+    if (!nav || !toggle || !links) return;
+
+    nav.setAttribute("data-nav-enhanced", "true");
+
+    function setOpen(open) {
+      nav.setAttribute("data-nav-open", open ? "true" : "false");
+      toggle.setAttribute("aria-expanded", open ? "true" : "false");
+    }
+    setOpen(false);
+
+    toggle.addEventListener("click", function (e) {
+      e.stopPropagation();
+      setOpen(nav.getAttribute("data-nav-open") !== "true");
+    });
+
+    // Following a link closes the panel. Same-page anchors (#features,
+    // #install) do not reload, so without this the panel would stay open over
+    // the section the reader just jumped to.
+    links.addEventListener("click", function (e) {
+      if (e.target.closest("a")) setOpen(false);
+    });
+
+    document.addEventListener("click", function (e) {
+      if (!e.target.closest(".nav")) setOpen(false);
+    });
+
+    document.addEventListener("keydown", function (e) {
+      if (e.key !== "Escape") return;
+      if (nav.getAttribute("data-nav-open") !== "true") return;
+      setOpen(false);
+      toggle.focus();
+    });
+
+    // Leaving the breakpoint while open would otherwise strand the panel state:
+    // the desktop rules ignore data-nav-open, so the menu would silently
+    // reappear expanded on the next rotation back to a narrow viewport.
+    if (window.matchMedia) {
+      var wide = window.matchMedia("(min-width: 821px)");
+      var onChange = function (ev) {
+        if (ev.matches) setOpen(false);
+      };
+      if (wide.addEventListener) wide.addEventListener("change", onChange);
+      else if (wide.addListener) wide.addListener(onChange);
+    }
   })();
 </script>
