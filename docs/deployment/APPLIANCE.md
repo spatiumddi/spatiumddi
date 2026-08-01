@@ -1221,10 +1221,11 @@ control-plane cluster itself, not the registered agent fleet.
    > specifically, on whichever api replica served the upload. That is
    > correct for a single-node appliance and wrong for every other shape:
    > the host's download round-robins across api replicas and any replica
-   > without the bytes answers 404. Scheduling an uploaded-image upgrade
-   > on a multi-node control plane with the mirror off is refused up
-   > front, with the same instruction (#787). Upgrading from an external
-   > image URL needs no mirror.
+   > without the bytes answers 404 ("bytes missing on disk — re-upload
+   > required", which is misleading: the bytes exist, on a node you cannot
+   > see). Turn the mirror on before upgrading a multi-node control plane
+   > from an uploaded image, or upgrade from an external image URL, which
+   > needs no mirror (#787).
 2. **URL** (connected install). Operator pastes the GitHub release
    asset URL — same `https://github.com/.../spatiumddi-appliance-
    slot-amd64.raw.xz` shape the per-box flow uses. Each node fetches
@@ -1291,6 +1292,9 @@ so a first-time operator never gets stuck looking for the upload.
 
 2. Copy both files to the airgap LAN (USB stick, SCP through a jump
    host, whatever your security team approves).
+   NOTE on a MULTI-NODE control plane: set `slotImageMirror.enabled=true`
+   first, or the uploaded bytes stay on one api replica and the other
+   nodes' downloads 404 (#787).
 
 3. In the SpatiumDDI UI (control-plane node, any operator browser
    that can reach the cluster):

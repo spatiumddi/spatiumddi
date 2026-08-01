@@ -106,83 +106,6 @@ async def test_exactly_one_source_required(kwargs) -> None:
         await resolve_slot_image_target(_FakeDB(), base_url="https://cp.local/", **kwargs)
 
 
-# ── multi-node reachability guard ────────────────────────────────────
-
-
-def _patch_nodes(monkeypatch: pytest.MonkeyPatch, count: int) -> None:
-    """Pretend the control plane spans ``count`` appliance nodes."""
-    from app.services.appliance import k8s
-
-    monkeypatch.setattr(k8s, "list_nodes", lambda **_kw: (200, [{}] * count))
-
-
-@pytest.mark.asyncio
-async def test_uploaded_image_refused_on_multi_node_without_a_mirror(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """#787: uploaded bytes are node-local, so on a multi-node control plane
-    the host's download 404s from every replica that didn't serve the
-    upload. Refuse at schedule time with something actionable instead."""
-    from app.services.appliance import slot_image_target as sit
-
-    monkeypatch.setattr(sit.settings, "slot_image_mirror_url", "")
-    _patch_nodes(monkeypatch, 3)
-    image = SimpleNamespace(id=uuid.uuid4(), sha256="ab" * 32)
-
-    with pytest.raises(SlotImageResolutionError, match="slotImageMirror"):
-        await resolve_slot_image_target(
-            _FakeDB(image), base_url="https://cp.local/", slot_image_id=image.id
-        )
-
-
-@pytest.mark.asyncio
-async def test_uploaded_image_allowed_when_the_mirror_is_on(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from app.services.appliance import slot_image_target as sit
-
-    monkeypatch.setattr(sit.settings, "slot_image_mirror_url", "http://mirror:8000")
-    _patch_nodes(monkeypatch, 3)
-    image = SimpleNamespace(id=uuid.uuid4(), sha256="ab" * 32)
-
-    target = await resolve_slot_image_target(
-        _FakeDB(image), base_url="https://cp.local/", slot_image_id=image.id
-    )
-    assert target.sha256 == "ab" * 32
-
-
-@pytest.mark.asyncio
-async def test_uploaded_image_allowed_on_a_single_node(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from app.services.appliance import slot_image_target as sit
-
-    monkeypatch.setattr(sit.settings, "slot_image_mirror_url", "")
-    _patch_nodes(monkeypatch, 1)
-    image = SimpleNamespace(id=uuid.uuid4(), sha256="ab" * 32)
-
-    target = await resolve_slot_image_target(
-        _FakeDB(image), base_url="https://cp.local/", slot_image_id=image.id
-    )
-    assert target.tls_insecure is True
-
-
-@pytest.mark.asyncio
-async def test_external_url_skips_the_reachability_guard(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Nothing of ours serves an external URL, so node count is irrelevant."""
-    from app.services.appliance import slot_image_target as sit
-
-    monkeypatch.setattr(sit.settings, "slot_image_mirror_url", "")
-    _patch_nodes(monkeypatch, 3)
-
-    target = await resolve_slot_image_target(
-        _FakeDB(), base_url="https://cp.local/", slot_image_url="https://github.com/x.raw.xz"
-    )
-    assert target.url == "https://github.com/x.raw.xz"
-
-
 # ── stamp_desired_slot_image ─────────────────────────────────────────
 
 
@@ -217,9 +140,32 @@ def test_stamp_clears_stale_integrity_hints() -> None:
 def test_stamp_adds_refire_nonce_for_a_capable_runner() -> None:
     row = _fake_appliance(supervisor_version="2026.07.30-1")
     stamp_desired_slot_image(
+        row,
+        SlotImageTarget(url="https://cp.local/x.raw.xz", nonce="abc123"),
+        desired_version="2026.07.30-1",
+    )
+    assert row.desired_slot_image_url == "https://cp.local/x.raw.xz#a=abc123"
+
+
+def test_restamping_the_same_target_reproduces_the_same_url() -> None:
+    """An orchestrator resume re-drives an incomplete node from step 1. If
+    the nonce were minted per stamp the node would get a URL it has never
+    fired and re-run a full slot apply of an image it already staged."""
+    target = SlotImageTarget(url="https://cp.local/x.raw.xz", nonce="stable99")
+    first, second = _fake_appliance(supervisor_version="2026.07.30-1"), _fake_appliance(
+        supervisor_version="2026.07.30-1"
+    )
+    stamp_desired_slot_image(first, target, desired_version="2026.07.30-1")
+    stamp_desired_slot_image(second, target, desired_version="2026.07.30-1")
+    assert first.desired_slot_image_url == second.desired_slot_image_url
+
+
+def test_stamp_omits_nonce_when_the_target_carries_none() -> None:
+    row = _fake_appliance(supervisor_version="2026.07.30-1")
+    stamp_desired_slot_image(
         row, SlotImageTarget(url="https://cp.local/x.raw.xz"), desired_version="2026.07.30-1"
     )
-    assert row.desired_slot_image_url.startswith("https://cp.local/x.raw.xz#a=")
+    assert row.desired_slot_image_url == "https://cp.local/x.raw.xz"
 
 
 def test_stamp_omits_nonce_for_a_pre_386_runner() -> None:
@@ -227,7 +173,9 @@ def test_stamp_omits_nonce_for_a_pre_386_runner() -> None:
     the apply wedges at in-flight forever (#419)."""
     row = _fake_appliance(supervisor_version="2026.06.11-1")
     stamp_desired_slot_image(
-        row, SlotImageTarget(url="https://cp.local/x.raw.xz"), desired_version="2026.07.30-1"
+        row,
+        SlotImageTarget(url="https://cp.local/x.raw.xz", nonce="abc123"),
+        desired_version="2026.07.30-1",
     )
     assert row.desired_slot_image_url == "https://cp.local/x.raw.xz"
 

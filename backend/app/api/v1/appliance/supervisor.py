@@ -42,6 +42,7 @@ import ipaddress
 import re
 import secrets
 import uuid
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
@@ -105,6 +106,7 @@ from app.services.appliance.ntp import ntp_bundle
 from app.services.appliance.resolver import resolver_bundle
 from app.services.appliance.slot_image_target import (
     SlotImageResolutionError,
+    new_refire_nonce,
     resolve_slot_image_target,
     stamp_desired_slot_image,
 )
@@ -1991,11 +1993,18 @@ async def supervisor_heartbeat(
         row.reboot_requested = False
         row.reboot_requested_at = None
 
-    # Auto-clear clear_upgrade_requested on the same 15 s rule (#786). By
-    # then the supervisor has had the command and reset its sidecars, and
-    # the report it just sent — handled above — no longer carries the
-    # failure. Leaving the flag set would make every later heartbeat redo
-    # a no-op reset.
+    # Auto-clear clear_upgrade_requested on the same 15 s rule (#786).
+    #
+    # ``deliver_clear_upgrade`` is captured BEFORE this expiry because the
+    # response is built from the row ~300 lines below: expiring here and
+    # serialising the post-expiry value would let a single heartbeat both
+    # consume the flag AND report False, so the supervisor never resets
+    # and the failure card returns. The appliance this fires on always has
+    # ``desired_appliance_version`` still set, which suppresses the
+    # long-poll — so its heartbeats arrive a full interval apart and land
+    # past the 15 s window about half the time. The expiring heartbeat
+    # must therefore still carry the command.
+    deliver_clear_upgrade = row.clear_upgrade_requested
     if (
         row.clear_upgrade_requested
         and row.clear_upgrade_requested_at is not None
@@ -2281,7 +2290,7 @@ async def supervisor_heartbeat(
         desired_next_boot_slot=row.desired_next_boot_slot,  # type: ignore[arg-type]
         desired_default_slot=row.desired_default_slot,  # type: ignore[arg-type]
         reboot_requested=row.reboot_requested,
-        clear_upgrade_requested=row.clear_upgrade_requested,
+        clear_upgrade_requested=deliver_clear_upgrade,
         cert_pem=row.cert_pem,
         ca_chain_pem=ca_chain_pem,
         cert_expires_at=row.cert_expires_at,
@@ -4889,6 +4898,9 @@ async def schedule_appliance_upgrade(
             slot_image_id=body.slot_image_id,
             slot_image_url=body.desired_slot_image_url,
         )
+        # A fresh nonce per click: re-applying the SAME image from the Fleet
+        # button is an explicit retry and must re-fire the host trigger.
+        target = replace(target, nonce=new_refire_nonce())
     except SlotImageResolutionError as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
 
@@ -4934,15 +4946,26 @@ async def schedule_appliance_upgrade(
 async def clear_appliance_upgrade(
     appliance_id: uuid.UUID, current_user: CurrentUser, db: DB
 ) -> ApplianceRow:
-    """Drops ``desired_appliance_version`` + ``desired_slot_image_url``.
-    Once the supervisor has already fired the trigger file the host
-    runner won't notice this — the slot apply is in flight. The clear
-    is most useful when an upgrade was scheduled by mistake and the
-    supervisor hasn't heartbeat-polled yet."""
+    """Cancel a pending upgrade and dismiss a failed one.
+
+    Clears the desired slot-image state AND the ``last_upgrade_*`` columns
+    the Fleet failure card renders from, then raises a one-shot host
+    command (``clear_upgrade_requested``) that makes the supervisor reset
+    its own sidecars and drop a stranded ``slot-upgrade-pending`` trigger.
+
+    Clearing our copy alone is not enough: the host re-publishes those
+    columns verbatim on every heartbeat, so without the command the next
+    heartbeat restores the failure — and rebooting does not help, because
+    those sidecars live on the persistent /var (#786).
+    """
     _require_superadmin(current_user)
     row = await db.get(Appliance, appliance_id)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
+    # Raising a host command on a row that can never consume it would strand
+    # the flag set — which permanently suppresses that appliance's heartbeat
+    # long-poll. Same gate the other host-command mutators apply.
+    _check_appliance_slot_action_allowed(row)
     row.desired_appliance_version = None
     row.desired_slot_image_url = None
     row.desired_slot_image_sha256 = None

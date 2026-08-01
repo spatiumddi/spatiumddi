@@ -8,10 +8,11 @@ second read-only mount of it and the helper returned the literal string
 unreadable, on every appliance and every release. Operators read that as
 a failed upgrade right after a successful one.
 
-The fix routes both versions through ``sync_slot_versions()``, which
-reads the active slot from the booted ``/etc/spatiumddi/appliance-release``
-directly (no mount) and mounts only the inactive slot — the behaviour
-APPLIANCE.md already documented.
+The fix reads the active slot from the booted
+``/etc/spatiumddi/appliance-release`` directly (no mount) and mounts only
+the inactive slot — the split APPLIANCE.md already documented. `status`
+also stays READ-ONLY: persisting the probe would let a run issued during
+an apply clobber the `slot-versions.json` the UI reads.
 
 These tests import the CLI as a module and stub the two discovery
 helpers, so they need no root, no partitions and no appliance.
@@ -25,7 +26,6 @@ No database, no Docker, no appliance ISO required.
 from __future__ import annotations
 
 import importlib.util
-import json
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
@@ -99,14 +99,16 @@ def test_status_never_mounts_the_active_slot(slot_cli, stubbed, capsys):
     assert probed == [inactive["device"]]
 
 
-def test_status_refreshes_the_sidecar_the_ui_reads(slot_cli, stubbed, capsys):
-    _active, _inactive, _probed = stubbed
-
+def test_status_never_writes_the_sidecar_the_ui_reads(slot_cli, stubbed, capsys):
+    """`status` is what operators run to check on an in-flight upgrade. If
+    it persisted its probe, a mount of a half-written slot would overwrite
+    the good `slot-versions.json` with "unreadable" — the string this whole
+    fix exists to stop showing — and that file feeds the Fleet card, the
+    console and the GRUB menu titles. `sync-versions` is the writer."""
     slot_cli.cmd_status(None)
     capsys.readouterr()
 
-    written = json.loads(slot_cli._SLOT_VERSIONS_FILE.read_text())
-    assert written == {"slot_a": INACTIVE_VERSION, "slot_b": ACTIVE_VERSION}
+    assert not slot_cli._SLOT_VERSIONS_FILE.exists()
 
 
 def test_status_exits_2_when_slots_are_undetectable(slot_cli, monkeypatch, capsys):

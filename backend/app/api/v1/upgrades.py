@@ -30,6 +30,7 @@ All mutations are gated on ``admin appliance``; reads on
 from __future__ import annotations
 
 import uuid
+from dataclasses import replace
 from typing import Any
 
 import structlog
@@ -41,6 +42,7 @@ from app.core.permissions import require_permission
 from app.services.appliance.slot_image_target import (
     SlotImageResolutionError,
     SlotImageTarget,
+    new_refire_nonce,
     resolve_slot_image_target,
 )
 from app.services.upgrades import mutex, orchestrator, preflight
@@ -331,12 +333,15 @@ async def _resolve_slot_image_target(
     divergence that left this path re-creating #386 (see #787).
     """
     try:
-        return await resolve_slot_image_target(
+        target = await resolve_slot_image_target(
             db,
             base_url=str(request.base_url),
             slot_image_id=body.slot_image_id,
             slot_image_url=body.slot_image_url,
         )
+        # One nonce for the whole run, persisted in the plan, so a resume
+        # re-stamps the identical URL and the fire-once marker still holds.
+        return replace(target, nonce=new_refire_nonce())
     except SlotImageResolutionError as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
 

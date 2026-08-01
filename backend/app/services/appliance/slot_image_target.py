@@ -27,7 +27,6 @@ from dataclasses import dataclass
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import settings
 from app.models.appliance import Appliance, ApplianceUpgradeImage
 
 # The host runner only learned to strip a URL ``#fragment`` before
@@ -55,6 +54,15 @@ class SlotImageTarget:
     url: str
     sha256: str | None = None
     tls_insecure: bool = False
+    # #386 Part B re-fire nonce, appended to the URL as ``#a=<nonce>`` so a
+    # fresh apply of the same image is a distinct desired-state and the
+    # supervisor's fire-once marker doesn't suppress it. It lives on the
+    # TARGET, not minted per stamp, because the rolling orchestrator
+    # re-drives an incomplete node from step 1 on resume: a nonce minted
+    # per call would hand that node a URL it has never fired and trigger a
+    # second full slot apply of an image it already staged. Carried in the
+    # run plan so every node in a run, and every resume of it, agrees.
+    nonce: str | None = None
 
     def as_plan_fields(self) -> dict[str, object]:
         """Serialise into an ``UpgradeRun.plan`` JSON blob."""
@@ -62,6 +70,7 @@ class SlotImageTarget:
             "slot_image_url": self.url,
             "slot_image_sha256": self.sha256,
             "slot_image_tls_insecure": self.tls_insecure,
+            "slot_image_nonce": self.nonce,
         }
 
     @classmethod
@@ -75,6 +84,7 @@ class SlotImageTarget:
             url=plan.get("slot_image_url") or "",
             sha256=plan.get("slot_image_sha256"),
             tls_insecure=bool(plan.get("slot_image_tls_insecure", False)),
+            nonce=plan.get("slot_image_nonce"),
         )
 
 
@@ -89,45 +99,6 @@ def supervisor_strips_url_fragment(row: Appliance) -> bool:
     ver = row.supervisor_version or row.installed_appliance_version or ""
     return (
         re.match(r"\d{4}\.\d{2}\.\d{2}", ver) is not None and ver >= URL_FRAGMENT_STRIP_MIN_VERSION
-    )
-
-
-def _assert_self_served_bytes_are_reachable() -> None:
-    """Refuse to point a host at an uploaded image it may not be able to fetch.
-
-    Uploaded bytes land on the api replica that served the upload, on a
-    node-local hostPath. The slot-image mirror is what makes them readable
-    from every replica — and it is off by default. So on a multi-node
-    control plane (api runs 2 replicas with hard anti-affinity), the host's
-    download round-robins through the Service and roughly half the time
-    reaches a replica without the bytes, which answers 404 "bytes missing
-    on disk — re-upload required". That message is actively misleading:
-    the bytes exist, just on a node the operator cannot see (#787).
-
-    Fail here instead, where we can say what to do about it. External URLs
-    are unaffected — nothing of ours serves those.
-
-    Silent no-op off Kubernetes (docker compose): one api process, so the
-    bytes are always local to whoever serves the download.
-    """
-    if settings.slot_image_mirror_url:
-        return  # bytes are reachable cluster-wide through the mirror
-
-    from app.services.appliance import k8s  # noqa: PLC0415
-
-    try:
-        status_code, nodes = k8s.list_nodes(label_selector="spatium.io/role=appliance")
-    except k8s.KubeapiUnavailableError:
-        return  # not on k8s — single api process
-    if status_code != 200 or len(nodes) <= 1:
-        return
-
-    raise SlotImageResolutionError(
-        f"This control plane spans {len(nodes)} nodes, and uploaded upgrade-image "
-        "bytes live on whichever node served the upload — the other api replicas "
-        "would answer the host's download with a 404. Either enable the slot-image "
-        "mirror (Helm value 'slotImageMirror.enabled=true', which gives the images a "
-        "shared PVC) or schedule this upgrade from an external image URL instead."
     )
 
 
@@ -162,8 +133,6 @@ async def resolve_slot_image_target(
     if image is None:
         raise SlotImageResolutionError(f"Upgrade image {slot_image_id} not found.")
 
-    _assert_self_served_bytes_are_reachable()
-
     # Imported locally: the token mint lives on the API router that also
     # serves the bytes, and importing it at module scope would cycle back
     # through the router package.
@@ -182,24 +151,27 @@ async def resolve_slot_image_target(
     )
 
 
+def new_refire_nonce() -> str:
+    """Mint one ``#a=`` re-fire nonce. Call once per scheduling decision."""
+    return uuid.uuid4().hex[:12]
+
+
 def stamp_desired_slot_image(
     row: Appliance,
     target: SlotImageTarget,
     *,
     desired_version: str,
-    nonce: str | None = None,
 ) -> None:
     """Write all four desired-state columns onto ``row``.
 
-    ``nonce`` (#386 Part B) makes each schedule yield a distinct URL so the
-    supervisor's fire-once marker re-fires on a fresh apply of the same
-    image instead of treating it as already-fired. Pass ``None`` to let
-    this generate one; it is applied only when the appliance's runner is
-    known to strip the fragment.
+    The re-fire nonce comes from ``target``, so re-stamping the same target
+    (an orchestrator resume re-driving a node) reproduces the identical URL
+    and the supervisor's fire-once marker still suppresses it. Appended
+    only when the appliance's runner is known to strip the fragment (#419).
     """
     url = target.url
-    if supervisor_strips_url_fragment(row):
-        url = f"{url}#a={nonce or uuid.uuid4().hex[:12]}"
+    if target.nonce and supervisor_strips_url_fragment(row):
+        url = f"{url}#a={target.nonce}"
 
     row.desired_appliance_version = desired_version
     row.desired_slot_image_url = url
@@ -211,6 +183,7 @@ __all__ = [
     "URL_FRAGMENT_STRIP_MIN_VERSION",
     "SlotImageResolutionError",
     "SlotImageTarget",
+    "new_refire_nonce",
     "resolve_slot_image_target",
     "stamp_desired_slot_image",
     "supervisor_strips_url_fragment",

@@ -338,8 +338,7 @@ async def test_step_trigger_slot_apply_adds_refire_nonce_only_when_supported() -
     it; an older appliance must get a clean URL (#419)."""
     db = MagicMock()
     db.flush = AsyncMock()
-    target = SlotImageTarget(url="https://cp.local/raw.xz")
-
+    target = SlotImageTarget(url="https://cp.local/raw.xz", nonce="n1")
     modern = _FakeAppliance(supervisor_version="2026.07.30-1")
     with patch.object(per_node, "_resolve_appliance", AsyncMock(return_value=modern)):
         await per_node._step_trigger_slot_apply(db, "node-1", "2026.07.30-1", target)

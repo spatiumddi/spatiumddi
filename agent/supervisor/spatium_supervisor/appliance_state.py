@@ -845,16 +845,31 @@ def apply_clear_upgrade_command() -> bool:
             # box stays wedged — exactly the failure this exists to fix.
             log.warning("supervisor.clear_upgrade.unlink_failed", path=str(path), error=str(exc))
 
+    # Only rewrite a state that is actually stuck. Two reasons: a healthy
+    # box would otherwise report "cleared" on every heartbeat inside the
+    # flag's lifetime, and clobbering a live ``in-flight`` stamp would blind
+    # BOTH crash detectors that key on that literal — the runner's exit trap
+    # and the supervisor's stale-in-flight reaper — so a mid-apply Cancel
+    # could leave a truncated image with nothing recording the failure.
     try:
         if _HOST_SLOT_STATE.exists():
-            _HOST_SLOT_STATE.write_text(f"ready {datetime.now(UTC).isoformat()}\n", encoding="utf-8")
-            reset = True
+            current = _HOST_SLOT_STATE.read_text(encoding="utf-8").split(maxsplit=1)
+            if current and current[0] == "failed":
+                _HOST_SLOT_STATE.write_text(
+                    f"ready {datetime.now(UTC).isoformat()}\n", encoding="utf-8"
+                )
+                reset = True
     except OSError as exc:
         log.warning("supervisor.clear_upgrade.state_reset_failed", error=str(exc))
 
+    # OVERWRITE rather than unlink. release-state is mode 1777 (sticky) and
+    # this file is root-owned (the host runner writes it); a non-owner can
+    # never unlink it, but the runner now publishes it 0666 so an in-place
+    # write succeeds. An empty object reads as "no progress" to every
+    # consumer, which is what a cleared upgrade should show.
     try:
         if _SLOT_UPGRADE_PROGRESS.exists():
-            _SLOT_UPGRADE_PROGRESS.unlink(missing_ok=True)
+            _SLOT_UPGRADE_PROGRESS.write_text("{}\n", encoding="utf-8")
             reset = True
     except OSError as exc:
         log.warning("supervisor.clear_upgrade.progress_reset_failed", error=str(exc))

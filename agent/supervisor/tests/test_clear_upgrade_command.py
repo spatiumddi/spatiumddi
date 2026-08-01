@@ -55,8 +55,22 @@ def test_clear_resets_every_sidecar_and_removes_the_trigger(paths: dict[str, Pat
 
     assert not paths["trigger"].exists(), "a stranded trigger must be removed, not deferred to"
     assert not paths["marker"].exists()
-    assert not paths["progress"].exists()
+    # Overwritten, not unlinked: release-state is sticky and this file is
+    # root-owned, so a non-owner can never unlink it.
+    assert paths["progress"].read_text(encoding="utf-8").strip() == "{}"
     assert paths["state"].read_text(encoding="utf-8").startswith("ready ")
+
+
+def test_clear_leaves_a_live_in_flight_apply_alone(paths: dict[str, Path]) -> None:
+    """Cancelling mid-apply must not stamp `ready` over `in-flight`: both
+    crash detectors — the runner's exit trap and the stale-in-flight reaper
+    — key on that literal, so clobbering it would let a killed `dd` leave a
+    truncated image with nothing recording the failure."""
+    paths["state"].write_text("in-flight 2026-08-01T00:00:00+00:00\n", encoding="utf-8")
+
+    appliance_state.apply_clear_upgrade_command()
+
+    assert paths["state"].read_text(encoding="utf-8").startswith("in-flight")
 
 
 def test_clear_removes_the_trigger_the_passive_heal_refuses_to_touch(
@@ -88,7 +102,10 @@ def test_clear_prunes_every_failed_sidecar(paths: dict[str, Path]) -> None:
 
 def test_clear_is_idempotent_on_an_already_clean_host(paths: dict[str, Path]) -> None:
     """Nothing to reset → False, so the heartbeat doesn't log a reset that
-    didn't happen. Must not raise on the missing files."""
+    didn't happen. A `ready` state file is the norm on any appliance that
+    has ever applied an upgrade, so it must not by itself count as a reset."""
+    paths["state"].write_text("ready 2026-08-01T00:00:00+00:00\n", encoding="utf-8")
+
     assert appliance_state.apply_clear_upgrade_command() is False
 
 

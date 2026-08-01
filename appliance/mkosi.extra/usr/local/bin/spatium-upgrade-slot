@@ -159,16 +159,23 @@ def cmd_status(_args) -> int:
               file=sys.stderr)
         return 2
     active, inactive = pair
-    # Both versions come from sync_slot_versions(), never from calling
-    # slot_version_label() on the active slot: that device is already
-    # mounted rw at /, so a second read-only mount of it is refused and
-    # the active slot would always render "unreadable" (#788). Syncing
-    # here also refreshes the sidecar the api + console read.
-    versions = sync_slot_versions()
+    # The ACTIVE slot's version is read from the booted
+    # /etc/spatiumddi/appliance-release directly. Never probe it with
+    # slot_version_label(): that device is already mounted rw at /, so a
+    # second read-only mount of it is refused and the slot would always
+    # render "unreadable" (#788).
+    #
+    # Deliberately does NOT call sync_slot_versions(): ``status`` is the
+    # command operators run to check on an upgrade, and it must stay
+    # read-only. Persisting a probe taken while an apply is mid-dd would
+    # overwrite the good slot-versions.json with "unreadable" — the very
+    # string this fix exists to stop showing — and that sidecar feeds the
+    # Fleet card, the console and the GRUB menu titles. Use
+    # ``sync-versions`` to refresh it.
     print(f"Active slot:    {active['partlabel']:8}  {active['device']:14}  "
-          f"version={versions.get(slot_versions_key(active), 'unknown')}")
+          f"version={_read_active_appliance_version()}")
     print(f"Inactive slot:  {inactive['partlabel']:8}  {inactive['device']:14}  "
-          f"version={versions.get(slot_versions_key(inactive), 'unknown')}")
+          f"version={slot_version_label(inactive)}")
     return 0
 
 
