@@ -118,3 +118,25 @@ def test_clear_is_a_noop_off_appliance(
     assert appliance_state.apply_clear_upgrade_command() is False
     assert paths["trigger"].exists()
     assert paths["state"].read_text(encoding="utf-8").startswith("failed")
+
+
+def test_clear_reports_failure_when_the_trigger_survives(
+    paths: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Field-observed on ddi1: the sticky directory means a trigger the
+    supervisor does not own can never be unlinked. The state/progress
+    resets still succeed, so the command used to report success while the
+    box stayed exactly as wedged — the trigger keeps blocking both the
+    passive heal and `maybe_fire_fleet_upgrade`."""
+    _wedged(paths)
+    real_unlink = Path.unlink
+
+    def _refuse_trigger(self, *a, **kw):
+        if self.name == "slot-upgrade-pending":
+            raise PermissionError(1, "Operation not permitted")
+        return real_unlink(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "unlink", _refuse_trigger)
+
+    assert appliance_state.apply_clear_upgrade_command() is False
+    assert paths["trigger"].exists()

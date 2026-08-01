@@ -875,6 +875,21 @@ def apply_clear_upgrade_command() -> bool:
         log.warning("supervisor.clear_upgrade.progress_reset_failed", error=str(exc))
 
     _prune_failed_sidecars(keep=0)
+
+    # A trigger we could not remove leaves the box exactly as wedged as it
+    # was — it still blocks both the passive heal and maybe_fire_fleet_
+    # upgrade. Field-observed: a root-owned trigger (this directory is
+    # sticky, so a non-owner can never unlink one) failed here while the
+    # state/progress resets succeeded, and the command still reported
+    # success. Say so instead, or the operator is told a clear worked when
+    # the appliance is still stuck.
+    if _TRIGGER_FILE.exists():
+        log.error(
+            "supervisor.clear_upgrade.trigger_survived",
+            path=str(_TRIGGER_FILE),
+            hint="not owned by the supervisor; remove it from the host to unwedge",
+        )
+        return False
     return reset
 
 
