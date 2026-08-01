@@ -195,6 +195,36 @@ async def test_heartbeat_ingests_normally_once_no_clear_is_pending(
 
 
 @pytest.mark.asyncio
+async def test_expiring_clear_is_delivered_immediately_not_long_polled(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The heartbeat that expires the flag still carries the command, so it
+    must not be treated as idle and held. A clear also nulls
+    ``desired_appliance_version``, so nothing else keeps the request pending
+    — reading the post-expiry row here would hold the very response that
+    delivers the clear for up to the hold cap."""
+    appliance, token = await _heartbeat_ready(db_session)
+    appliance.desired_appliance_version = None
+    appliance.desired_slot_image_url = None
+    appliance.clear_upgrade_requested = True
+    appliance.clear_upgrade_requested_at = datetime.now(UTC) - timedelta(seconds=16)
+    await db_session.commit()
+
+    resp = await client.post(
+        "/api/v1/appliance/supervisor/heartbeat",
+        json={
+            "appliance_id": str(appliance.id),
+            "session_token": token,
+            "wait_seconds": 25,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["clear_upgrade_requested"] is True, "the expiring heartbeat still delivers it"
+    assert body["long_poll"] is False, "a pending command must not be held"
+
+
+@pytest.mark.asyncio
 async def test_clear_flag_auto_clears_after_the_grace_window(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:

@@ -75,8 +75,6 @@ def stubbed(slot_cli, monkeypatch, tmp_path):
 
 
 def test_status_reports_the_active_slot_version(slot_cli, stubbed, capsys):
-    _active, _inactive, _probed = stubbed
-
     assert slot_cli.cmd_status(None) == 0
 
     out = capsys.readouterr().out

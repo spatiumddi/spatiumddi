@@ -2040,7 +2040,13 @@ async def supervisor_heartbeat(
         has_pending_command = (
             row.desired_appliance_version is not None
             or row.reboot_requested
-            or row.clear_upgrade_requested
+            # ``deliver_clear_upgrade``, not the row: the auto-expiry above
+            # may have just cleared the flag while the response below still
+            # carries the command. Reading the row here would make this look
+            # idle — and a clear also nulls ``desired_appliance_version``, so
+            # nothing else keeps it pending — so we would hold the very
+            # response that delivers the clear for up to the hold cap.
+            or deliver_clear_upgrade
             or row.desired_next_boot_slot is not None
             or row.desired_default_slot is not None
         )
