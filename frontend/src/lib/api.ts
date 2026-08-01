@@ -6626,6 +6626,448 @@ export const netboxImportApi = {
       .then((r) => r.data),
 };
 
+// ── Windows → SpatiumDDI cutover (issue #756) ──────────────────────────
+//
+// The migration family's guided workflow: a plan holds one item per Windows
+// zone / scope and walks it through four phases — parity (does SpatiumDDI
+// hold what Windows holds?), parallel run (do both sides answer the same?),
+// the switch (TTL pre-flight / DHCP lease handover / cut over / roll back),
+// and the decommission checklist. Every endpoint is superadmin-gated and
+// lives behind the ``migration.cutover`` feature module.
+//
+// Wire shapes match backend/app/api/v1/cutover/router.py; the JSONB payloads
+// that ride inside the item columns (last_parity, last_shadow, …) match the
+// ``as_dict()`` of the dataclasses in
+// backend/app/services/cutover/canonical.py.
+
+export type CutoverItemKind = "dns_zone" | "dhcp_scope";
+
+/** ``block`` refuses the switch outright; ``warn`` can be acknowledged with
+ *  ``force``. Messages are written to state the fix — render them verbatim. */
+export interface CutoverBlocker {
+  code: string;
+  severity: "block" | "warn";
+  message: string;
+}
+
+/** One explained difference between SpatiumDDI and the live Windows object.
+ *  ``classification`` is a DiffClass: in_sync | value_mismatch |
+ *  drifted_since_import | never_imported | intentionally_diverged. */
+export interface CutoverParityDifference {
+  classification: string;
+  name: string;
+  detail: string;
+  source_value: string | null;
+  target_value: string | null;
+  record_type: string | null;
+}
+
+export interface CutoverParityReport {
+  kind: string;
+  source_ref: string;
+  // ok | unmatched | error | unverified
+  status: string;
+  error: string | null;
+  in_sync: number;
+  not_compared: number;
+  difference_count: number;
+  is_parity: boolean;
+  counts_by_class: Record<string, number>;
+  differences: CutoverParityDifference[];
+  warnings: string[];
+}
+
+export interface CutoverShadowSample {
+  name: string;
+  qtype: string;
+  source_answers: string[];
+  // Keyed by target server label.
+  target_answers: Record<string, string[]>;
+  // match | mismatch | source_error | target_error
+  verdict: string;
+  error: string | null;
+}
+
+export interface CutoverShadowReport {
+  zone_name: string;
+  source: string;
+  targets: string[];
+  // "query_log" = replayed production traffic; "zone_records" = our own rows.
+  sample_source: string;
+  sampled: number;
+  matched: number;
+  mismatched: number;
+  errors: number;
+  samples: CutoverShadowSample[];
+  warnings: string[];
+}
+
+export interface CutoverTTLRecordChange {
+  record_id: string;
+  name: string;
+  record_type: string;
+  current_ttl: number | null;
+  new_ttl: number;
+}
+
+export interface CutoverTTLPreflightPlan {
+  target_ttl: number;
+  zone_current: Record<string, number>;
+  zone_after: Record<string, number>;
+  records: CutoverTTLRecordChange[];
+  changed: number;
+  unchanged: number;
+  warnings: string[];
+  // PowerShell the operator runs on the Windows side — SpatiumDDI never
+  // writes TTLs there, and an unexplained one-sided drop is worse than none.
+  source_side_instructions: string;
+}
+
+export interface CutoverLeaseEntry {
+  ip_address: string;
+  mac_address: string;
+  hostname: string;
+  action: "create" | "skip" | "conflict";
+  reason: string;
+  // Set on commit: created | skipped | failed.
+  result: string | null;
+  error: string | null;
+}
+
+/** What ``CutoverItem.lease_handover`` actually holds after a commit. */
+export interface CutoverLeaseHandoverSummary {
+  created: number;
+  skipped: number;
+  failed: number;
+  at: string;
+}
+
+export interface CutoverLeaseHandoverPlan {
+  scope_cidr: string;
+  source_scope_id: string;
+  entries: CutoverLeaseEntry[];
+  create_count: number;
+  skip_count: number;
+  conflict_count: number;
+  created: number;
+  skipped: number;
+  failed: number;
+  warnings: string[];
+}
+
+export interface CutoverItem {
+  id: string;
+  plan_id: string;
+  kind: string;
+  source_ref: string;
+  zone_id: string | null;
+  scope_id: string | null;
+  // pending | parity_checked | preflight_done | cut_over | rolled_back
+  stage: string;
+  blockers: CutoverBlocker[];
+  last_parity: CutoverParityReport | null;
+  last_parity_at: string | null;
+  last_shadow: CutoverShadowReport | null;
+  last_shadow_at: string | null;
+  ttl_snapshot: Record<string, unknown> | null;
+  ttl_lowered_at: string | null;
+  /**
+   * The persisted *summary* of the last handover, NOT a full plan — the backend
+   * stores only ``{created, skipped, failed, at}`` on the item
+   * (``services/cutover/leases.commit_lease_handover``). Typing it as the full
+   * plan would let a component reach for ``.entries`` / ``.warnings`` that are
+   * never there.
+   */
+  lease_handover: CutoverLeaseHandoverSummary | null;
+  cut_over_at: string | null;
+  rolled_back_at: string | null;
+  notes: string;
+}
+
+export interface CutoverPlan {
+  id: string;
+  name: string;
+  description: string;
+  // draft | verifying | parallel | cutting_over | completed | rolled_back |
+  // abandoned
+  status: string;
+  source_dns_server_id: string | null;
+  source_dhcp_server_id: string | null;
+  target_dns_group_id: string | null;
+  target_dhcp_group_id: string | null;
+  notes: string;
+  created_at: string;
+  modified_at: string;
+  completed_at: string | null;
+  rolled_back_at: string | null;
+  item_count: number;
+  stage_counts: Record<string, number>;
+  blocked_count: number;
+}
+
+export interface CutoverPlanDetail extends CutoverPlan {
+  items: CutoverItem[];
+}
+
+export interface CutoverPlanCreate {
+  name: string;
+  description?: string;
+  source_dns_server_id?: string | null;
+  source_dhcp_server_id?: string | null;
+  target_dns_group_id?: string | null;
+  target_dhcp_group_id?: string | null;
+  notes?: string;
+}
+
+export interface CutoverChecklistItem {
+  key: string;
+  // dns | dhcp | ad | general
+  category: string;
+  label: string;
+  description: string;
+  applies_to: string;
+  is_done: boolean;
+  done_at: string | null;
+  notes: string;
+  sort_order: number;
+  // ok | attention | not_applicable | manual — advisory only, never ticks.
+  auto_state: string;
+  auto_detail: string;
+}
+
+export interface CutoverEvent {
+  id: string;
+  item_id: string | null;
+  at: string;
+  kind: string;
+  summary: string;
+  detail: Record<string, unknown> | null;
+  user_display_name: string;
+}
+
+export interface CutoverCandidate {
+  kind: CutoverItemKind;
+  source_ref: string;
+  display_name: string;
+  matched_id: string | null;
+  matched_display: string | null;
+  already_in_plan: boolean;
+  blockers: CutoverBlocker[];
+  source: Record<string, unknown>;
+}
+
+// One half of the discover result. ``available: false`` means the plan simply
+// has no source server of that kind — a DNS-only plan is not an error state.
+export interface CutoverDiscoverSide {
+  available: boolean;
+  error: string | null;
+  source_server: string | null;
+  target_group_id: string | null;
+  candidates: CutoverCandidate[];
+}
+
+export interface CutoverDiscoverResult {
+  dns: CutoverDiscoverSide;
+  dhcp: CutoverDiscoverSide;
+}
+
+export interface CutoverItemIn {
+  kind: CutoverItemKind;
+  source_ref: string;
+  zone_id?: string | null;
+  scope_id?: string | null;
+  notes?: string;
+}
+
+// Per-item row of the whole-plan parity run: the report fields inlined, or
+// ``status: "error"`` with the wiring problem that stopped it.
+export type CutoverPlanParityRow = Partial<CutoverParityReport> & {
+  item_id: string;
+  source_ref: string;
+  kind: string;
+  status: string;
+  error?: string | null;
+};
+
+export interface CutoverPlanParityResult {
+  items: CutoverPlanParityRow[];
+  in_parity: number;
+  total: number;
+}
+
+// Result of a cutover / rollback. ``actions`` is what SpatiumDDI did;
+// ``instructions`` is what the operator still has to do (for DNS, the
+// delegation change — which lives outside SpatiumDDI entirely).
+export interface CutoverSwitchResult {
+  kind: string;
+  source_ref: string;
+  stage: string;
+  cut_over_at?: string;
+  rolled_back_at?: string;
+  actions: string[];
+  instructions: string[];
+  recovery_estimate_seconds: number | null;
+  acknowledged_warnings?: CutoverBlocker[];
+  records_restored?: number;
+  ttl_lowered_at?: string | null;
+  warnings?: string[];
+}
+
+// 409 body of POST …/cutover — ``CutoverBlocked.as_dict()``. Note the key is
+// ``error``, not ``message``.
+export interface CutoverBlockedDetail {
+  error: string;
+  blockers: CutoverBlocker[];
+}
+
+const CUTOVER_BASE = "/migration/cutover";
+
+export const cutoverApi = {
+  listPlans: () =>
+    api.get<CutoverPlan[]>(`${CUTOVER_BASE}/plans`).then((r) => r.data),
+  createPlan: (body: CutoverPlanCreate) =>
+    api
+      .post<CutoverPlanDetail>(`${CUTOVER_BASE}/plans`, body)
+      .then((r) => r.data),
+  getPlan: (planId: string) =>
+    api
+      .get<CutoverPlanDetail>(`${CUTOVER_BASE}/plans/${planId}`)
+      .then((r) => r.data),
+  updatePlan: (
+    planId: string,
+    body: Partial<CutoverPlanCreate> & {
+      status?: string;
+    },
+  ) =>
+    api
+      .patch<CutoverPlanDetail>(`${CUTOVER_BASE}/plans/${planId}`, body)
+      .then((r) => r.data),
+  deletePlan: (planId: string) => api.delete(`${CUTOVER_BASE}/plans/${planId}`),
+
+  // Live WinRM pull of the source estate — read-only, matches each Windows
+  // object against the target group and pre-computes its blockers.
+  discover: (planId: string) =>
+    api
+      .post<CutoverDiscoverResult>(`${CUTOVER_BASE}/plans/${planId}/discover`)
+      .then((r) => r.data),
+  addItems: (planId: string, items: CutoverItemIn[]) =>
+    api
+      .post<CutoverItem[]>(`${CUTOVER_BASE}/plans/${planId}/items`, { items })
+      .then((r) => r.data),
+  deleteItem: (planId: string, itemId: string) =>
+    api.delete(`${CUTOVER_BASE}/plans/${planId}/items/${itemId}`),
+
+  // Phase 1 — parity.
+  runItemParity: (planId: string, itemId: string) =>
+    api
+      .post<{
+        report: CutoverParityReport;
+        blockers: CutoverBlocker[];
+      }>(`${CUTOVER_BASE}/plans/${planId}/items/${itemId}/parity`)
+      .then((r) => r.data),
+  runPlanParity: (planId: string) =>
+    api
+      .post<CutoverPlanParityResult>(`${CUTOVER_BASE}/plans/${planId}/parity`)
+      .then((r) => r.data),
+
+  // Phase 2 — parallel run (DNS items only; a dhcp_scope item 422s).
+  runShadow: (planId: string, itemId: string, sampleSize: number) =>
+    api
+      .post<CutoverShadowReport>(
+        `${CUTOVER_BASE}/plans/${planId}/items/${itemId}/shadow`,
+        { sample_size: sampleSize },
+      )
+      .then((r) => r.data),
+
+  // Phase 3a — TTL pre-flight (DNS items only).
+  previewTtl: (planId: string, itemId: string, targetTtl: number) =>
+    api
+      .post<CutoverTTLPreflightPlan>(
+        `${CUTOVER_BASE}/plans/${planId}/items/${itemId}/ttl-preflight/preview`,
+        { target_ttl: targetTtl },
+      )
+      .then((r) => r.data),
+  commitTtl: (planId: string, itemId: string, targetTtl: number) =>
+    api
+      .post<CutoverTTLPreflightPlan>(
+        `${CUTOVER_BASE}/plans/${planId}/items/${itemId}/ttl-preflight/commit`,
+        { target_ttl: targetTtl },
+      )
+      .then((r) => r.data),
+  restoreTtl: (planId: string, itemId: string) =>
+    api
+      .post<{
+        records_restored: number;
+        zone: string;
+      }>(
+        `${CUTOVER_BASE}/plans/${planId}/items/${itemId}/ttl-preflight/restore`,
+      )
+      .then((r) => r.data),
+
+  // Phase 3b — DHCP lease handover (DHCP items only). Stateless between
+  // preview and commit: the previewed entries are handed straight back, and
+  // the server re-classifies every one against live DB state.
+  previewLeases: (planId: string, itemId: string) =>
+    api
+      .post<CutoverLeaseHandoverPlan>(
+        `${CUTOVER_BASE}/plans/${planId}/items/${itemId}/lease-handover/preview`,
+      )
+      .then((r) => r.data),
+  commitLeases: (
+    planId: string,
+    itemId: string,
+    entries: CutoverLeaseEntry[],
+  ) =>
+    api
+      .post<CutoverLeaseHandoverPlan>(
+        `${CUTOVER_BASE}/plans/${planId}/items/${itemId}/lease-handover/commit`,
+        { entries },
+      )
+      .then((r) => r.data),
+
+  // Phase 3c — the switch. 409 carries CutoverBlockedDetail; ``force`` only
+  // ever acknowledges warn-severity blockers.
+  cutOver: (planId: string, itemId: string, force = false) =>
+    api
+      .post<CutoverSwitchResult>(
+        `${CUTOVER_BASE}/plans/${planId}/items/${itemId}/cutover`,
+        { force },
+      )
+      .then((r) => r.data),
+  rollback: (planId: string, itemId: string) =>
+    api
+      .post<CutoverSwitchResult>(
+        `${CUTOVER_BASE}/plans/${planId}/items/${itemId}/rollback`,
+      )
+      .then((r) => r.data),
+
+  // Phase 4 — decommission checklist. The GET seeds on first read.
+  getChecklist: (planId: string) =>
+    api
+      .get<CutoverChecklistItem[]>(`${CUTOVER_BASE}/plans/${planId}/checklist`)
+      .then((r) => r.data),
+  patchChecklistItem: (
+    planId: string,
+    key: string,
+    body: { is_done?: boolean; notes?: string },
+  ) =>
+    api
+      .patch<CutoverChecklistItem>(
+        `${CUTOVER_BASE}/plans/${planId}/checklist/${key}`,
+        body,
+      )
+      .then((r) => r.data),
+
+  listEvents: (planId: string, params?: { limit?: number; offset?: number }) =>
+    api
+      .get<CutoverEvent[]>(`${CUTOVER_BASE}/plans/${planId}/events`, { params })
+      .then((r) => r.data),
+  runbook: (planId: string) =>
+    api
+      .get<{ markdown: string }>(`${CUTOVER_BASE}/plans/${planId}/runbook`)
+      .then((r) => r.data),
+};
+
 export const dnsBlocklistApi = {
   list: () => api.get<DNSBlockList[]>("/dns/blocklists").then((r) => r.data),
   catalog: () =>

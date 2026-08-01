@@ -221,6 +221,10 @@ export default function App() {
           path="admin/netbox-import"
           element={<ImportPage initialTab="netbox" />}
         />
+        <Route
+          path="admin/cutover"
+          element={<ImportPage initialTab="cutover" />}
+        />
         <Route path="admin/backup" element={<BackupPage />} />
         <Route
           path="admin/diagnostics/errors"

@@ -383,6 +383,28 @@ Remove-DhcpServerv4Scope -ScopeId {_ps_literal(scope_id)} -Force
         creds = _load_credentials(server)
         await asyncio.to_thread(_run_ps, server, creds, script)
 
+    async def set_scope_state(self, server: Any, scope_id: str, *, active: bool) -> None:
+        """Activate or deactivate an existing scope, changing nothing else.
+
+        ``Set-DhcpServerv4Scope -ScopeId <id> -State Active|InActive``.
+
+        Deliberately narrow rather than routed through ``apply_scope``: that
+        method would need the full mask / range / option set re-supplied just to
+        flip this one flag, and re-applying a scope we have only ever *read* is
+        how an operator's hand-tuned Windows config gets overwritten. The #756
+        cutover uses this to take the Windows scope out of service immediately
+        before the managed scope starts answering, so the two never serve the
+        same subnet at once — and to put it back on a rollback.
+        """
+        state = "Active" if active else "InActive"
+        script = f"""
+$ErrorActionPreference = 'Stop'
+Set-DhcpServerv4Scope -ScopeId {_ps_literal(scope_id)} -State {_ps_literal(state)}
+"OK"
+"""
+        creds = _load_credentials(server)
+        await asyncio.to_thread(_run_ps, server, creds, script)
+
     async def apply_reservation(
         self,
         server: Any,

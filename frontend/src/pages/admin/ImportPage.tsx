@@ -3,6 +3,7 @@ import { useEffect } from "react";
 import { cn } from "@/lib/utils";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { useSessionState } from "@/lib/useSessionState";
+import { CutoverPage } from "./CutoverPage";
 import { DHCPImportPage } from "./DHCPImportPage";
 import { DNSImportPage } from "./DNSImportPage";
 import { NetBoxImportPage } from "./NetBoxImportPage";
@@ -11,18 +12,20 @@ import { NetBoxImportPage } from "./NetBoxImportPage";
  * Configuration → Import hub.
  *
  * Consolidates the three one-shot importers (DHCP #129 / DNS #128 / NetBox
- * #36) under a single Configuration nav entry with a left sub-nav, mirroring
- * the Appliance → Fleet left-sidebar pattern. Each importer keeps its own
- * page component (and its own source sub-tabs); this shell just picks which
- * family is active and gates each section on its feature module.
+ * #36) plus the guided Windows cutover (#756) under a single Configuration
+ * nav entry with a left sub-nav, mirroring the Appliance → Fleet left-sidebar
+ * pattern. Each section keeps its own page component (and its own source
+ * sub-tabs); this shell just picks which family is active and gates each
+ * section on its feature module.
  *
  * Mounted at /admin/import plus the legacy per-importer routes
- * (/admin/{dhcp,dns,netbox}-import) so existing deep-links — notably the DNS
- * page's "Sync from provider" navigate("/admin/dns-import", {state}) — keep
- * working: the legacy route renders this shell with the matching initialTab,
- * and the embedded page still reads its router state.
+ * (/admin/{dhcp,dns,netbox}-import, /admin/cutover) so existing deep-links —
+ * notably the DNS page's "Sync from provider"
+ * navigate("/admin/dns-import", {state}) — keep working: the legacy route
+ * renders this shell with the matching initialTab, and the embedded page still
+ * reads its router state.
  */
-export type ImportTab = "dhcp" | "dns" | "netbox";
+export type ImportTab = "dhcp" | "dns" | "netbox" | "cutover";
 
 const SECTIONS: {
   key: ImportTab;
@@ -47,6 +50,12 @@ const SECTIONS: {
     label: "NetBox",
     summary: "One-shot IPAM migration from a NetBox install",
     module: "ipam.import.netbox",
+  },
+  {
+    key: "cutover",
+    label: "Windows cutover",
+    summary: "Guided migration off Windows DNS / DHCP",
+    module: "migration.cutover",
   },
 ];
 
@@ -111,6 +120,8 @@ export function ImportPage({ initialTab }: { initialTab?: ImportTab }) {
           <DNSImportPage />
         ) : active?.key === "netbox" ? (
           <NetBoxImportPage />
+        ) : active?.key === "cutover" ? (
+          <CutoverPage />
         ) : null}
       </main>
     </div>

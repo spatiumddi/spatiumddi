@@ -164,6 +164,29 @@ FACTORY_SECTIONS: tuple[FactorySection, ...] = (
         ),
     ),
     FactorySection(
+        key="migration",
+        label="Migration plans",
+        description=(
+            "Windows → SpatiumDDI cutover plans and everything hanging "
+            "off them: per-zone / per-scope items with their parity and "
+            "shadow reports, pre-flight TTL snapshots, lease-handover "
+            "results, the decommission checklist, and the plan timeline. "
+            "The zones, scopes and reservations the plans point at are "
+            "NOT touched — only the migration bookkeeping is destroyed. "
+            "Note that a plan's TTL snapshot is the only record of the "
+            "pre-migration TTLs, so destroying an in-flight plan gives up "
+            "the ability to roll its cutover back."
+        ),
+        phrase="DESTROY-MIGRATION-PLANS",
+        kind="truncate",
+        tables=(
+            "cutover_event",
+            "cutover_checklist_item",
+            "cutover_item",
+            "cutover_plan",
+        ),
+    ),
+    FactorySection(
         key="network_modeling",
         label="Network modeling",
         description=(

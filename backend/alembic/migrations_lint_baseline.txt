@@ -140,6 +140,10 @@ backend/alembic/versions/a4e91c7b3d82_dns_dga.py:drop_column:83
 backend/alembic/versions/a4e91c7b3d82_dns_dga.py:drop_column:84
 backend/alembic/versions/a4e91c7b3d82_dns_dga.py:drop_column:85
 backend/alembic/versions/a4e91c7b3d82_dns_dga.py:drop_column:86
+backend/alembic/versions/a4f1c93d7e28_windows_cutover_plans.py:drop_table:222
+backend/alembic/versions/a4f1c93d7e28_windows_cutover_plans.py:drop_table:225
+backend/alembic/versions/a4f1c93d7e28_windows_cutover_plans.py:drop_table:230
+backend/alembic/versions/a4f1c93d7e28_windows_cutover_plans.py:drop_table:237
 backend/alembic/versions/a4f81c26b9e3_self_service_requests.py:drop_column:88
 backend/alembic/versions/a4f81c26b9e3_self_service_requests.py:drop_column:89
 backend/alembic/versions/a4f9c2e8b316_appliance_supervisor_identity.py:drop_column:153

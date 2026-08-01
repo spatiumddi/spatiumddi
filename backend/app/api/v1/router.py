@@ -29,6 +29,7 @@ from app.api.v1.circuits import router as circuits_router
 from app.api.v1.cloud import router as cloud_router
 from app.api.v1.conformity import router as conformity_router
 from app.api.v1.custom_fields.router import router as custom_fields_router
+from app.api.v1.cutover import router as cutover_router
 from app.api.v1.dashboards import router as dashboards_router
 from app.api.v1.dhcp import router as dhcp_router
 from app.api.v1.dhcp.ra_routers import router as ra_routers_router
@@ -354,6 +355,16 @@ api_v1_router.include_router(
     prefix="/netbird",
     tags=["netbird"],
     dependencies=[Depends(require_module("integrations.netbird"))],
+)
+api_v1_router.include_router(
+    cutover_router,
+    prefix="/migration/cutover",
+    tags=["cutover"],
+    # 404 when the module is off. wake_publishing because the cutover DOES
+    # touch agent config: the TTL pre-flight rewrites records (shifting the DNS
+    # bundle ETag) and the switch flips DHCPScope.is_active — parked agents
+    # should re-poll on commit rather than wait out the safety tick.
+    dependencies=[Depends(require_module("migration.cutover")), Depends(wake_publishing)],
 )
 api_v1_router.include_router(
     netbox_import_router,

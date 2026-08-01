@@ -344,15 +344,20 @@ const adminConfigurationNav = [
   },
   { label: "Custom Fields", icon: Tags, to: "/admin/custom-fields" },
   // Import hub (#36) — the one-shot DHCP (#129) / DNS (#128) / NetBox (#36)
-  // importers share a single Configuration entry with a left sub-nav (see
-  // ImportPage), mirroring Appliance → Fleet. ``anyModule`` hides the entry
-  // only when ALL three importer modules are off; the sub-nav inside gates
-  // each family individually.
+  // importers plus the guided Windows cutover (#756) share a single
+  // Configuration entry with a left sub-nav (see ImportPage), mirroring
+  // Appliance → Fleet. ``anyModule`` hides the entry only when ALL of those
+  // modules are off; the sub-nav inside gates each family individually.
   {
     label: "Import",
     icon: Upload,
     to: "/admin/import",
-    anyModule: ["dhcp.import", "dns.import", "ipam.import.netbox"],
+    anyModule: [
+      "dhcp.import",
+      "dns.import",
+      "ipam.import.netbox",
+      "migration.cutover",
+    ],
   },
   // ``Features`` lives in the footer next to Settings — it's a
   // platform-wide control, not a per-area config, and ops teams expect
