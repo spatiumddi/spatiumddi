@@ -44,6 +44,7 @@ the caller owns the transaction.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Any
 
 import structlog
 from sqlalchemy import select
@@ -123,6 +124,37 @@ async def _assert_target_is_not_the_source(db: AsyncSession, zone: DNSZone) -> N
         "(BIND9 / PowerDNS / Technitium), and lower the source's TTLs with the "
         "PowerShell in the pre-flight preview instead."
     )
+
+
+def _ttl_ops(records: list[DNSRecord]) -> list[dict[str, Any]]:
+    """Build the record-op batch for a TTL rewrite, RRset-aware.
+
+    The BIND9 agent turns a ``create`` / ``update`` op into an RFC 2136
+    ``replace`` by default, which swaps the **whole RRset** for the single value
+    in that op. That is right for the one-value-per-name case the record CRUD
+    path was written for, and silently destructive for anything else: a name
+    with three round-robin A records would be rewritten three times and end up
+    serving only the last one. Lowering a TTL must not cost the operator two
+    thirds of their addresses.
+
+    So ops are grouped by ``(name, type)``. The first op in a group keeps the
+    default ``replace`` — which clears the old RRset — and every sibling carries
+    ``rrset_action="add"`` to append onto it. The result is one RRset with every
+    original value at the new TTL. Groups of one are unchanged, so the common
+    case emits exactly what it did before.
+    """
+    grouped: dict[tuple[str, str], list[DNSRecord]] = {}
+    for rec in records:
+        grouped.setdefault(((rec.name or "@").lower(), rec.record_type.upper()), []).append(rec)
+
+    ops: list[dict[str, Any]] = []
+    for group in grouped.values():
+        for index, rec in enumerate(group):
+            payload = record_op_payload(rec)
+            if index:
+                payload["rrset_action"] = "add"
+            ops.append({"op": "update", "record": payload})
+    return ops
 
 
 def _needs_lowering(record: DNSRecord, target_ttl: int) -> bool:
@@ -342,14 +374,10 @@ async def apply_ttl_preflight(
         # secondary transfer the zone N times for a single logical change.
         target_serial = bump_zone_serial(zone)
         if changed:
-            await enqueue_record_ops_batch(
-                db,
-                zone,
-                [
-                    {"op": "update", "record": record_op_payload(r), "target_serial": target_serial}
-                    for r in changed
-                ],
-            )
+            ops = _ttl_ops(changed)
+            for op in ops:
+                op["target_serial"] = target_serial
+            await enqueue_record_ops_batch(db, zone, ops)
         # The SOA change alone shifts the rendered config bundle, and the
         # record-op path only wakes the group when there were record ops.
         collect_wake(dns_group_channel(zone.group_id))
@@ -421,14 +449,10 @@ async def restore_ttl_preflight(
     if restored or zone_changed:
         target_serial = bump_zone_serial(zone)
         if restored:
-            await enqueue_record_ops_batch(
-                db,
-                zone,
-                [
-                    {"op": "update", "record": record_op_payload(r), "target_serial": target_serial}
-                    for r in restored
-                ],
-            )
+            ops = _ttl_ops(restored)
+            for op in ops:
+                op["target_serial"] = target_serial
+            await enqueue_record_ops_batch(db, zone, ops)
         collect_wake(dns_group_channel(zone.group_id))
 
     item.ttl_snapshot = None

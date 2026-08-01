@@ -1112,3 +1112,65 @@ def test_runbook_and_preflight_share_one_powershell_generator() -> None:
     assert "-ComputerName" not in inline
     for marker in ("MinimumTimeToLive", "Set-DnsServerResourceRecord", "$NewTtl"):
         assert marker in body and marker in inline
+
+
+async def test_ttl_preflight_does_not_collapse_a_multi_value_rrset(
+    db_session: AsyncSession,
+) -> None:
+    """Three A records at one name must survive a TTL change.
+
+    The BIND9 agent renders a record op as an RFC 2136 ``replace``, which swaps
+    the whole RRset for that op's single value. Emitting one plain update per
+    record would therefore leave the zone serving only the last one — a TTL
+    change silently costing the operator two thirds of their addresses.
+    """
+    user = await _user(db_session)
+    group, source, _managed, zone = await _dns_side(db_session)
+    for addr in ("10.0.0.1", "10.0.0.2", "10.0.0.3"):
+        db_session.add(
+            DNSRecord(zone_id=zone.id, name="pool", record_type="A", value=addr, ttl=3600)
+        )
+    db_session.add(DNSRecord(zone_id=zone.id, name="solo", record_type="A", value="10.0.0.9"))
+    _plan, item = await _plan_with_item(
+        db_session,
+        kind="dns_zone",
+        source_ref="corp.example",
+        user=user,
+        source_dns=source,
+        dns_group_id=group.id,
+        zone=zone,
+    )
+    await db_session.commit()
+
+    captured: list[list[dict[str, Any]]] = []
+
+    async def _capture(db: Any, z: Any, ops: list[dict[str, Any]]) -> list[Any]:
+        captured.append(ops)
+        return [None] * len(ops)
+
+    import pytest as _pytest
+
+    monkeypatch = _pytest.MonkeyPatch()
+    monkeypatch.setattr(preflight_mod, "enqueue_record_ops_batch", _capture)
+    try:
+        await preflight_mod.apply_ttl_preflight(
+            db_session, zone=zone, item=item, target_ttl=300, current_user=user
+        )
+    finally:
+        monkeypatch.undo()
+
+    ops = captured[0]
+    pool_ops = [o for o in ops if o["record"]["name"] == "pool"]
+    solo_ops = [o for o in ops if o["record"]["name"] == "solo"]
+
+    assert len(pool_ops) == 3
+    # First clears the RRset, the other two append onto it — so all three values
+    # end up served at the new TTL.
+    assert "rrset_action" not in pool_ops[0]["record"]
+    assert [o["record"].get("rrset_action") for o in pool_ops[1:]] == ["add", "add"]
+    assert {o["record"]["value"] for o in pool_ops} == {"10.0.0.1", "10.0.0.2", "10.0.0.3"}
+    assert all(o["record"]["ttl"] == 300 for o in pool_ops)
+
+    # A single-value RRset is emitted exactly as before.
+    assert len(solo_ops) == 1
+    assert "rrset_action" not in solo_ops[0]["record"]
