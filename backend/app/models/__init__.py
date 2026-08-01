@@ -30,6 +30,12 @@ from app.models.change_request import ApprovalPolicy, ChangeRequest
 from app.models.circuit import Circuit
 from app.models.cloud import CloudEndpoint
 from app.models.conformity import ConformityPolicy, ConformityResult
+from app.models.cutover import (
+    CutoverChecklistItem,
+    CutoverEvent,
+    CutoverItem,
+    CutoverPlan,
+)
 from app.models.dhcp import (
     DHCPClientClass,
     DHCPConfigOp,
@@ -298,4 +304,8 @@ __all__ = [
     "WolCalendar",
     "WolCalendarEvent",
     "DNSRPZHit",
+    "CutoverPlan",
+    "CutoverItem",
+    "CutoverChecklistItem",
+    "CutoverEvent",
 ]

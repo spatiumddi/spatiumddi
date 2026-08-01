@@ -931,6 +931,12 @@ Full config-push to Windows DHCP (analogous to Windows DNS Path B) would unlock:
 
 The per-object CRUD methods are already in place (`apply_scope`, `apply_reservation`, `apply_exclusion`) — what's missing is the API-side wiring that routes write events from the scope / pool / static endpoints into those methods for agentless drivers.
 
+### 15.7 Migrating off Windows DHCP entirely (issue #756)
+
+Everything above treats Windows as a supported *backend*. When the goal is to stop using it, the guided **Windows cutover** surface (feature module `migration.cutover`, default-on, `/api/v1/migration/cutover`, superadmin) drives the switch per scope: parity against the live server (lease time, pools, reservations, options), the lease handover, the switch itself, and a decommission checklist.
+
+Two things matter here. The **lease handover** exists because the DHCP importer (§8) deliberately skips live leases — so a naive switch hands clients to a Kea with an empty lease database, and the first renewal offers a fresh pool address to a client still using the one Windows gave it. The handover promotes each live Windows lease to a reservation (stamped `import_source="windows_cutover"`) so a renewing client keeps the address it already holds. And the **switch is ordered**: the Windows scope is deactivated *before* the managed scope is activated, so the two never answer the same subnet at once; if the managed side then fails to come up, the Windows scope is re-activated. Rollback reverses it, with the recovery-time expectation stated as the scope's lease time. See [MIGRATION.md](MIGRATION.md#windows--spatiumddi-cutover-756).
+
 ## 16. Rules & constraints
 
 Server-side validations that reject requests with a human-readable

@@ -775,6 +775,12 @@ If AXFR is refused, the per-zone sync in step 4 of "Sync with Servers" shows `Zo
 
 See [WINDOWS.md](../deployment/WINDOWS.md) for full Windows-side prerequisites including WinRM enablement, service account creation, and firewall rules.
 
+### 13.6 Migrating off Windows DNS entirely (issue #756)
+
+Path A / B make Windows a supported *backend*. When the goal is to stop using it, the guided **Windows cutover** surface (feature module `migration.cutover`, default-on, `/api/v1/migration/cutover`, superadmin) walks the four phases: per-zone parity against the live server, a shadow-query parallel run replaying real BIND9 query-log traffic at both sides, a TTL pre-flight plus the switch with per-zone rollback, and a decommission checklist.
+
+Note especially that it **refuses** any zone whose Windows dynamic-update mode is AD "Secure only" — a hard block `force` cannot bypass, for the reason in §13.4: GSS-TSIG is unimplemented ([#444](https://github.com/spatiumddi/spatiumddi/issues/444)), and a DC that cannot register its SRV records breaks AD itself. See [MIGRATION.md](MIGRATION.md#windows--spatiumddi-cutover-756).
+
 ---
 
 ## 14. IPAM ↔ DNS synchronization jobs

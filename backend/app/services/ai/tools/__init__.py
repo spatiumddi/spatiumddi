@@ -24,6 +24,7 @@ from app.services.ai.tools import (  # noqa: F401, E402
     changes,
     conformity,
     copilot,
+    cutover,
     dhcp,
     diagnostics,
     dicom,

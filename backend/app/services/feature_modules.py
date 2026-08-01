@@ -293,6 +293,26 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
     # Default-enabled — same rationale as the DNS / DHCP importers: no
     # blast radius from the toggle (endpoints are RBAC-gated + superadmin
     # separately), operators flip it off to hide the surface.
+    # Windows → SpatiumDDI cutover (issue #756). The one-shot importers get an
+    # operator's Windows estate INTO SpatiumDDI; this is the rest of the
+    # journey — parity verification, the parallel run, the per-zone/per-scope
+    # switch, and the decommission checklist.
+    #
+    # Group is "Tools", not "DNS" or "DHCP": one plan covers both protocols
+    # (a single item list holds zones and scopes), so either protocol group
+    # would be a lie about half the surface. "Tools" is where the operator
+    # workflows live.
+    #
+    # Default-enabled, same rationale as the three importers it extends: the
+    # surface is read-mostly and every mutating step behind it is separately
+    # superadmin-gated, so there is no blast radius from the toggle being on —
+    # and an operator cannot turn off what they never knew shipped.
+    ModuleSpec(
+        id="migration.cutover",
+        label="Windows cutover",
+        group="Tools",
+        description="Guided migration from Windows DNS / DHCP onto managed BIND9 / PowerDNS / Kea — parity verification, parallel-run shadow queries, per-zone and per-scope cutover with rollback, and the decommission checklist. Configuration → Import → Windows cutover; superadmin-only.",
+    ),
     ModuleSpec(
         id="ipam.import.netbox",
         label="NetBox import",

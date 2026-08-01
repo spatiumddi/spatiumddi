@@ -268,6 +268,28 @@ SECTIONS: tuple[Section, ...] = (
         ),
     ),
     Section(
+        key="migration",
+        label="Migration (Windows cutover plans)",
+        description=(
+            "Windows → SpatiumDDI cutover plans, their per-zone / "
+            "per-scope items (parity + shadow reports, pre-flight TTL "
+            "snapshots, lease-handover results), the decommission "
+            "checklist, and the plan timeline. Its own section rather "
+            "than a DNS or DHCP one because a single plan spans both. "
+            "The zones, scopes and reservations a plan points at are "
+            "owned by the DNS / DHCP sections — this is the "
+            "bookkeeping around them, and the pre-flight TTL snapshot "
+            "is the only copy of the pre-migration TTLs, so a restore "
+            "without it loses the ability to roll a cutover back."
+        ),
+        tables=(
+            "cutover_plan",
+            "cutover_item",
+            "cutover_checklist_item",
+            "cutover_event",
+        ),
+    ),
+    Section(
         key="integrations",
         label="Integrations + network discovery",
         description=(
