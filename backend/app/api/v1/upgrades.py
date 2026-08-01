@@ -38,6 +38,11 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.api.deps import DB, CurrentUser
 from app.core.permissions import require_permission
+from app.services.appliance.slot_image_target import (
+    SlotImageResolutionError,
+    SlotImageTarget,
+    resolve_slot_image_target,
+)
 from app.services.upgrades import mutex, orchestrator, preflight
 
 logger = structlog.get_logger(__name__)
@@ -287,12 +292,12 @@ async def post_plan(
     → mirror path. Operators on connected installs keep using
     ``slot_image_url`` directly.
     """
-    resolved_url = await _resolve_slot_image_url(db, request, body)
+    target = await _resolve_slot_image_target(db, request, body)
     try:
         plan = await orchestrator.plan_upgrade(
             db,
             target_version=body.target_version,
-            slot_image_url=resolved_url,
+            slot_image=target,
             cnpg_cluster_name=body.cnpg_cluster_name,
             cnpg_namespace=body.cnpg_namespace,
             started_by_user_id=current_user.id,
@@ -313,45 +318,27 @@ async def post_plan(
     )
 
 
-async def _resolve_slot_image_url(
+async def _resolve_slot_image_target(
     db: DB,
     request: Request,
     body: PlanRequest,
-) -> str:
-    """Return the URL spatium-upgrade-slot apply will pull from.
+) -> SlotImageTarget:
+    """Resolve what every per-node runner in this run will fetch + verify.
 
-    Mirrors the resolution logic in supervisor.py's
-    ``schedule_appliance_upgrade`` — same HMAC token, same URL shape,
-    same operator-facing semantics. Centralised here so the rolling
-    upgrade flow + the per-box flow can't diverge on token shape
-    without both surfaces breaking together.
-
-    * ``slot_image_url`` → returned verbatim (operator-provided
-      external URL).
-    * ``slot_image_id`` → composed as
-      ``{request.base_url}/api/v1/appliance/upgrade-images/{id}/raw.xz
-      ?t={hmac}`` where the HMAC comes from
-      ``slot_image_download_token``.
+    Delegates to the same resolver the per-box ``schedule_appliance_
+    upgrade`` uses, so the two surfaces cannot diverge on URL shape, token
+    scheme, or the integrity/transport hints that ride alongside — the
+    divergence that left this path re-creating #386 (see #787).
     """
-    if body.slot_image_url is not None:
-        return body.slot_image_url
-    assert body.slot_image_id is not None  # ruled out by model_validator
-    from app.api.v1.appliance.upgrade_images import (  # noqa: PLC0415
-        slot_image_download_token,
-    )
-    from app.models.appliance import ApplianceUpgradeImage  # noqa: PLC0415
-
-    image = await db.get(ApplianceUpgradeImage, body.slot_image_id)
-    if image is None:
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY,
-            f"Upgrade image {body.slot_image_id} not found.",
+    try:
+        return await resolve_slot_image_target(
+            db,
+            base_url=str(request.base_url),
+            slot_image_id=body.slot_image_id,
+            slot_image_url=body.slot_image_url,
         )
-    token = slot_image_download_token(image.id)
-    return (
-        f"{str(request.base_url).rstrip('/')}"
-        f"/api/v1/appliance/upgrade-images/{image.id}/raw.xz?t={token}"
-    )
+    except SlotImageResolutionError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
 
 
 @router.post(

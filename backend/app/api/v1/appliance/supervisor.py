@@ -103,6 +103,11 @@ from app.services.appliance.firewall import firewall_bundle
 from app.services.appliance.lldp import lldp_bundle
 from app.services.appliance.ntp import ntp_bundle
 from app.services.appliance.resolver import resolver_bundle
+from app.services.appliance.slot_image_target import (
+    SlotImageResolutionError,
+    resolve_slot_image_target,
+    stamp_desired_slot_image,
+)
 from app.services.appliance.snmp import snmp_bundle
 from app.services.appliance.ssh import ssh_bundle
 from app.services.appliance.syslog import syslog_bundle
@@ -141,27 +146,6 @@ def _client_ip(request: Request) -> str | None:
 _HOST_ROLE_CONFIG = Path("/etc/spatiumddi-host/role-config")
 _SELF_BOOTSTRAP_VARIANTS = frozenset({"control-plane", "full-stack", "frontend-core"})
 _SELF_BOOTSTRAP_CODE_TTL = timedelta(minutes=10)
-
-# The slot-upgrade host runner only strips a URL ``#fragment`` before
-# fetching as of #386 (shipped 2026-06-12). An appliance on an older
-# supervisor hands the fragment straight to the downloader and the apply
-# wedges at "in-flight" forever (#419). Gate the re-fire nonce on the
-# target supervisor's reported version so older fleets get a clean URL.
-_URL_FRAGMENT_STRIP_MIN_VERSION = "2026.06.12"
-
-
-def _supervisor_strips_url_fragment(row: Appliance) -> bool:
-    """True if the appliance's supervisor / slot-upgrade runner strips a URL
-    ``#fragment`` before fetching (≥ 2026.06.12, i.e. has the #386 strip).
-
-    CalVer (``YYYY.MM.DD-N``) sorts lexicographically, so a string compare is
-    correct. A dev / unknown / pre-CalVer version stays on the safe clean-URL
-    path — losing only auto-re-fire of the *same* image (a new version already
-    changes the URL), never the ability to upgrade (#419)."""
-    ver = row.supervisor_version or row.installed_appliance_version or ""
-    return (
-        re.match(r"\d{4}\.\d{2}\.\d{2}", ver) is not None and ver >= _URL_FRAGMENT_STRIP_MIN_VERSION
-    )
 
 
 def _read_host_role() -> str | None:
@@ -4861,80 +4845,29 @@ async def schedule_appliance_upgrade(
             ),
         )
 
-    # Resolve slot_image_id → internal URL. We compose the URL
-    # relative to the request's host so the supervisor can reach it
-    # from the same network it reaches the control plane on; the
-    # request's base_url is the operator-facing scheme + host the
-    # frontend is already using.
-    from app.models.appliance import ApplianceUpgradeImage  # noqa: PLC0415
-
-    resolved_url: str
-    # Issue #386 Part A — integrity + transport hints stamped alongside
-    # the URL. For an internal (self-served) image we know the sha256 and
-    # that the URL points at our own self-signed cert; for an external
-    # operator-pasted URL we trust public-CA TLS and have no hash.
-    image_sha256: str | None = None
-    tls_insecure = False
-    if body.slot_image_id is not None:
-        image = await db.get(ApplianceUpgradeImage, body.slot_image_id)
-        if image is None:
-            raise HTTPException(
-                status.HTTP_422_UNPROCESSABLE_ENTITY,
-                f"Upgrade image {body.slot_image_id} not found.",
-            )
-        # ``request.base_url`` ends with ``/`` and carries the scheme
-        # + host the frontend reached us on (X-Forwarded-Host /
-        # X-Forwarded-Proto, when nginx is in front). The supervisor
-        # is the only thing that resolves this URL, so as long as the
-        # frontend host is reachable from the appliance subnet (which
-        # it must be — that's where the supervisor already
-        # heartbeats), this lines up.
-        #
-        # ``?t=<hmac>`` token authorises the host-side
-        # ``spatium-upgrade-slot`` runner — it does an unauthenticated
-        # ``urllib.request.urlopen`` because it has no operator
-        # session and no mTLS material. The token is HMAC'd against
-        # the image_id + SECRET_KEY, so a leaked URL can't be replayed
-        # against a different image.
-        from app.api.v1.appliance.upgrade_images import (  # noqa: PLC0415
-            slot_image_download_token,
+    # Resolve slot_image_id → internal URL + integrity/transport hints,
+    # then stamp all four desired-state columns. Both live in
+    # ``services.appliance.slot_image_target`` so this surface and the
+    # multi-node rolling orchestrator cannot drift apart on what the host
+    # is told to fetch (#787) — the drift that re-introduced #386 there.
+    #
+    # The URL is composed against ``request.base_url``: the operator-facing
+    # scheme + host the frontend reached us on (X-Forwarded-Host / -Proto
+    # when nginx is in front), which is necessarily reachable from the
+    # appliance subnet because that is where the supervisor already
+    # heartbeats.
+    try:
+        target = await resolve_slot_image_target(
+            db,
+            base_url=str(request.base_url),
+            slot_image_id=body.slot_image_id,
+            slot_image_url=body.desired_slot_image_url,
         )
+    except SlotImageResolutionError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
 
-        token = slot_image_download_token(image.id)
-        resolved_url = (
-            f"{str(request.base_url).rstrip('/')}"
-            f"/api/v1/appliance/upgrade-images/{image.id}/raw.xz?t={token}"
-        )
-        # The image is served by our OWN control plane behind the
-        # self-signed web cert, so the host runner's bare urllib fetch
-        # would fail TLS verify (#386). Hand it the stored sha256 to
-        # verify bytes against + flag the self-served URL so it skips
-        # cert-verify for this fetch only.
-        image_sha256 = image.sha256
-        tls_insecure = True
-    else:
-        assert body.desired_slot_image_url is not None
-        resolved_url = body.desired_slot_image_url
-
-    # Issue #386 Part B — append a per-apply nonce as a URL *fragment* so
-    # each schedule yields a distinct ``desired_slot_image_url`` and the
-    # supervisor re-fires the trigger on a fresh apply of the same image
-    # (it fires once per distinct URL — no silent re-fire loop on failure).
-    # The host runner strips the fragment before fetching, but only since
-    # #386 (2026-06-12); an older appliance passes it straight to the
-    # downloader and the apply wedges at "in-flight" forever (#419). So only
-    # add the nonce when the target supervisor is known to strip it — older
-    # / unknown supervisors get a clean URL (a new version already changes
-    # the URL, so re-fire still works; only re-applying the *same* version
-    # loses auto-re-fire on those boxes).
-    if _supervisor_strips_url_fragment(row):
-        nonce = uuid.uuid4().hex[:12]
-        resolved_url = f"{resolved_url}#a={nonce}"
-
-    row.desired_appliance_version = body.desired_appliance_version
-    row.desired_slot_image_url = resolved_url
-    row.desired_slot_image_sha256 = image_sha256
-    row.desired_slot_image_tls_insecure = tls_insecure
+    stamp_desired_slot_image(row, target, desired_version=body.desired_appliance_version)
+    resolved_url = row.desired_slot_image_url or target.url
     db.add(
         AuditLog(
             user_id=current_user.id,

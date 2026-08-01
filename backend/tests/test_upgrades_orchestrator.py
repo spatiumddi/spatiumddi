@@ -27,6 +27,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from app.services.appliance.slot_image_target import SlotImageTarget
 from app.services.upgrades import node_order, orchestrator, per_node
 
 # ── Node ordering ─────────────────────────────────────────────────────
@@ -129,7 +130,7 @@ async def test_plan_upgrade_refuses_on_preflight_fail() -> None:
             await orchestrator.plan_upgrade(
                 db,
                 target_version="2026.06.01-1",
-                slot_image_url="http://mirror/x.raw.xz",
+                slot_image=SlotImageTarget(url="http://mirror/x.raw.xz"),
             )
 
 
@@ -142,7 +143,7 @@ async def test_plan_upgrade_refuses_on_existing_run() -> None:
             await orchestrator.plan_upgrade(
                 db,
                 target_version="2026.06.01-1",
-                slot_image_url="http://mirror/x.raw.xz",
+                slot_image=SlotImageTarget(url="http://mirror/x.raw.xz"),
             )
 
 
@@ -157,7 +158,7 @@ async def test_plan_upgrade_refuses_on_zero_nodes() -> None:
             await orchestrator.plan_upgrade(
                 db,
                 target_version="2026.06.01-1",
-                slot_image_url="http://mirror/x.raw.xz",
+                slot_image=SlotImageTarget(url="http://mirror/x.raw.xz"),
             )
 
 
@@ -177,7 +178,7 @@ async def test_plan_upgrade_persists_node_order_and_sources() -> None:
         plan = await orchestrator.plan_upgrade(
             db,
             target_version="2026.06.01-1",
-            slot_image_url="http://mirror/x.raw.xz",
+            slot_image=SlotImageTarget(url="http://mirror/x.raw.xz"),
         )
     # Alphabetical.
     assert plan.node_order == ["node-a", "node-b"]

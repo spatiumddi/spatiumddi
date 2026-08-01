@@ -4,8 +4,10 @@ The control plane appends a per-apply nonce as a URL ``#fragment`` so a fresh
 apply of the same image re-fires the supervisor trigger. The host runner only
 strips that fragment before fetching as of #386 (2026-06-12); an older
 appliance hands it straight to the downloader and the apply wedges at
-"in-flight" forever. ``_supervisor_strips_url_fragment`` gates the nonce so
-only known-capable supervisors get it.
+"in-flight" forever. ``supervisor_strips_url_fragment`` gates the nonce so
+only known-capable supervisors get it. It lives in
+``services.appliance.slot_image_target`` alongside the resolver + stamper both
+scheduling surfaces share (#787).
 """
 
 from __future__ import annotations
@@ -14,7 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.api.v1.appliance import supervisor as sup
+from app.services.appliance.slot_image_target import supervisor_strips_url_fragment
 
 
 @pytest.mark.parametrize(
@@ -49,4 +51,4 @@ def test_supervisor_strips_url_fragment(
         supervisor_version=supervisor_version,
         installed_appliance_version=installed_version,
     )
-    assert sup._supervisor_strips_url_fragment(row) is expected  # type: ignore[arg-type]
+    assert supervisor_strips_url_fragment(row) is expected  # type: ignore[arg-type]

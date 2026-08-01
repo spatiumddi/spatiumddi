@@ -40,7 +40,6 @@ from __future__ import annotations
 
 import asyncio
 import time
-import uuid
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -50,6 +49,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.appliance import Appliance
 from app.services.appliance import k8s
+from app.services.appliance.slot_image_target import (
+    SlotImageTarget,
+    stamp_desired_slot_image,
+)
 from app.services.upgrades import preflight
 
 logger = structlog.get_logger(__name__)
@@ -399,7 +402,7 @@ async def _step_trigger_slot_apply(
     db: AsyncSession,
     node_name: str,
     target_version: str,
-    slot_image_url: str,
+    slot_image: SlotImageTarget,
 ) -> StepResult:
     step = StepResult(
         name="trigger_slot_apply",
@@ -409,8 +412,12 @@ async def _step_trigger_slot_apply(
     appliance = await _resolve_appliance(db, node_name)
     if appliance is None:
         return step.finish(False, error=f"no Appliance row with hostname={node_name!r}")
-    appliance.desired_appliance_version = target_version
-    appliance.desired_slot_image_url = slot_image_url
+    # Stamps all four desired_* columns, not just version + URL. Setting
+    # only those two is what made every per-node apply of an uploaded
+    # image fetch our own self-signed cert with verification on, and left
+    # any stale sha256 from an earlier per-box schedule to fail the new
+    # image as corrupt (#787).
+    stamp_desired_slot_image(appliance, slot_image, desired_version=target_version)
     await db.flush()
     # NB: db.commit is the orchestrator's responsibility — Phase D will
     # commit at every step transition. For testing in Phase C the
@@ -606,7 +613,7 @@ async def single_node_upgrade(
     *,
     node_name: str,
     target_version: str,
-    slot_image_url: str,
+    slot_image: SlotImageTarget,
     cnpg_cluster_name: str = "",
     cnpg_namespace: str | None = None,
     start_step: StepName | None = None,
@@ -701,7 +708,7 @@ async def single_node_upgrade(
         return _failed(node_name, target_version, "drain", results)
     if not await _run(
         "trigger_slot_apply",
-        _step_trigger_slot_apply(db, node_name, target_version, slot_image_url),
+        _step_trigger_slot_apply(db, node_name, target_version, slot_image),
     ):
         return _failed(node_name, target_version, "trigger_slot_apply", results)
     if not await _run("health_gate", _step_health_gate(db, node_name, target_version)):
@@ -739,27 +746,12 @@ def _failed(
     )
 
 
-# Resolve the upstream slot-image URL for a given image_id. Phase B
-# wired ``SLOT_IMAGE_MIRROR_URL`` for in-cluster proxying, but the
-# host-side runner needs the operator-facing URL (the api endpoint
-# with the HMAC ?t= token). Re-use the existing
-# ``slot_image_download_token`` mint that ``apply_upgrade`` already
-# calls — exposed here as a helper so an orchestrator-driven start
-# doesn't have to import from the appliance router.
-def build_slot_image_url(*, request_base_url: str, image_id: uuid.UUID) -> str:
-    """Build the ``desired_slot_image_url`` value for an uploaded image.
-
-    Mirrors the path the existing ``apply_upgrade`` endpoint takes —
-    same HMAC ?t= scheme so the host runner's unauthenticated GET
-    works. The Phase D orchestrator will call this when scheduling
-    each node's apply.
-    """
-    from app.api.v1.appliance.upgrade_images import slot_image_download_token  # noqa: PLC0415
-
-    token = slot_image_download_token(image_id)
-    base = request_base_url.rstrip("/")
-    return f"{base}/api/v1/appliance/upgrade-images/{image_id}/raw.xz?t={token}"
-
+# ``build_slot_image_url`` used to live here so an orchestrator-driven
+# start didn't have to import from the appliance router. It composed only
+# the URL, which is precisely how this path lost the sha256 + tls_insecure
+# hints (#787). Both surfaces now go through
+# ``services.appliance.slot_image_target.resolve_slot_image_target``,
+# which returns all three together.
 
 __all__ = [
     "DEFAULT_CONVERGENCE_TIMEOUT_S",
@@ -768,6 +760,5 @@ __all__ = [
     "DEFAULT_SWITCHOVER_TIMEOUT_S",
     "SingleNodeResult",
     "StepResult",
-    "build_slot_image_url",
     "single_node_upgrade",
 ]

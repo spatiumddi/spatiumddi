@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from app.services.appliance.slot_image_target import SlotImageTarget
 from app.services.upgrades import per_node, preflight
 
 # ── Step 1: preflight ────────────────────────────────────────────────
@@ -245,6 +246,20 @@ async def test_step_drain_timeout_reports_blocked(monkeypatch: pytest.MonkeyPatc
 # ── Step 7: trigger slot apply ───────────────────────────────────────
 
 
+class _FakeAppliance:
+    """Minimal stand-in carrying every column the stamper writes."""
+
+    def __init__(self, *, supervisor_version: str | None = None) -> None:
+        self.id = uuid.uuid4()
+        self.hostname = "node-1"
+        self.supervisor_version = supervisor_version
+        self.installed_appliance_version: str | None = None
+        self.desired_appliance_version: str | None = None
+        self.desired_slot_image_url: str | None = None
+        self.desired_slot_image_sha256: str | None = None
+        self.desired_slot_image_tls_insecure: bool = False
+
+
 @pytest.mark.asyncio
 async def test_step_trigger_slot_apply_missing_appliance() -> None:
     """No Appliance row for the node name → step fails with a clear
@@ -253,7 +268,7 @@ async def test_step_trigger_slot_apply_missing_appliance() -> None:
     # _resolve_appliance returns None → step fails.
     with patch.object(per_node, "_resolve_appliance", AsyncMock(return_value=None)):
         step = await per_node._step_trigger_slot_apply(
-            db, "ghost-node", "2026.06.01-1", "http://mirror/x.raw.xz"
+            db, "ghost-node", "2026.06.01-1", SlotImageTarget(url="http://mirror/x.raw.xz")
         )
     assert step.ok is False
     assert "ghost-node" in step.error
@@ -264,24 +279,76 @@ async def test_step_trigger_slot_apply_stamps_desired_fields() -> None:
     """Happy path: the Appliance row's ``desired_*`` fields get
     stamped + flush is called. The supervisor's heartbeat picks them
     up from there + writes the trigger file."""
-
-    class _FakeAppliance:
-        id = uuid.uuid4()
-        hostname = "node-1"
-        desired_appliance_version: str | None = None
-        desired_slot_image_url: str | None = None
-
     appliance = _FakeAppliance()
     db = MagicMock()
     db.flush = AsyncMock()
     with patch.object(per_node, "_resolve_appliance", AsyncMock(return_value=appliance)):
         step = await per_node._step_trigger_slot_apply(
-            db, "node-1", "2026.06.01-1", "http://mirror/x.raw.xz"
+            db, "node-1", "2026.06.01-1", SlotImageTarget(url="http://mirror/x.raw.xz")
         )
     assert step.ok is True
     assert appliance.desired_appliance_version == "2026.06.01-1"
     assert appliance.desired_slot_image_url == "http://mirror/x.raw.xz"
     db.flush.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_step_trigger_slot_apply_carries_integrity_hints() -> None:
+    """#787 regression: an uploaded (self-served) image must arrive at the
+    host with BOTH its sha256 and the insecure-TLS flag.
+
+    Stamping only version + URL — what this step used to do — leaves the
+    runner fetching our own self-signed cert with verification on, which
+    is the #386 failure it was supposed to have fixed.
+    """
+    appliance = _FakeAppliance()
+    db = MagicMock()
+    db.flush = AsyncMock()
+    target = SlotImageTarget(
+        url="https://cp.local/raw.xz?t=abc", sha256="ab" * 32, tls_insecure=True
+    )
+    with patch.object(per_node, "_resolve_appliance", AsyncMock(return_value=appliance)):
+        step = await per_node._step_trigger_slot_apply(db, "node-1", "2026.06.01-1", target)
+    assert step.ok is True
+    assert appliance.desired_slot_image_sha256 == "ab" * 32
+    assert appliance.desired_slot_image_tls_insecure is True
+
+
+@pytest.mark.asyncio
+async def test_step_trigger_slot_apply_clears_a_stale_sha256() -> None:
+    """An external URL has no hash — any sha256 left on the row from an
+    earlier per-box schedule must be cleared, or the new image is verified
+    against the old one's digest and fails as corrupt."""
+    appliance = _FakeAppliance()
+    appliance.desired_slot_image_sha256 = "cd" * 32
+    appliance.desired_slot_image_tls_insecure = True
+    db = MagicMock()
+    db.flush = AsyncMock()
+    with patch.object(per_node, "_resolve_appliance", AsyncMock(return_value=appliance)):
+        await per_node._step_trigger_slot_apply(
+            db, "node-1", "2026.06.01-1", SlotImageTarget(url="https://github.com/x.raw.xz")
+        )
+    assert appliance.desired_slot_image_sha256 is None
+    assert appliance.desired_slot_image_tls_insecure is False
+
+
+@pytest.mark.asyncio
+async def test_step_trigger_slot_apply_adds_refire_nonce_only_when_supported() -> None:
+    """The ``#a=`` re-fire nonce is gated on the runner being able to strip
+    it; an older appliance must get a clean URL (#419)."""
+    db = MagicMock()
+    db.flush = AsyncMock()
+    target = SlotImageTarget(url="https://cp.local/raw.xz")
+
+    modern = _FakeAppliance(supervisor_version="2026.07.30-1")
+    with patch.object(per_node, "_resolve_appliance", AsyncMock(return_value=modern)):
+        await per_node._step_trigger_slot_apply(db, "node-1", "2026.07.30-1", target)
+    assert "#a=" in (modern.desired_slot_image_url or "")
+
+    legacy = _FakeAppliance(supervisor_version="2026.06.11-1")
+    with patch.object(per_node, "_resolve_appliance", AsyncMock(return_value=legacy)):
+        await per_node._step_trigger_slot_apply(db, "node-1", "2026.07.30-1", target)
+    assert legacy.desired_slot_image_url == "https://cp.local/raw.xz"
 
 
 # ── Step 8: health gate ──────────────────────────────────────────────
@@ -473,7 +540,7 @@ async def test_single_node_upgrade_happy_path(monkeypatch: pytest.MonkeyPatch) -
         MagicMock(),
         node_name="node-1",
         target_version="2026.06.01-1",
-        slot_image_url="http://mirror/x.raw.xz",
+        slot_image=SlotImageTarget(url="http://mirror/x.raw.xz"),
         cnpg_cluster_name="pg-cluster",
         cnpg_namespace="spatium",
     )
@@ -528,7 +595,7 @@ async def test_single_node_upgrade_halts_on_cordon_failure(
         MagicMock(),
         node_name="node-1",
         target_version="2026.06.01-1",
-        slot_image_url="http://mirror/x.raw.xz",
+        slot_image=SlotImageTarget(url="http://mirror/x.raw.xz"),
         cnpg_cluster_name="pg-cluster",
     )
     assert result.ok is False
@@ -562,29 +629,8 @@ async def test_single_node_upgrade_step_crash_caught(
         MagicMock(),
         node_name="node-1",
         target_version="2026.06.01-1",
-        slot_image_url="http://mirror/x.raw.xz",
+        slot_image=SlotImageTarget(url="http://mirror/x.raw.xz"),
     )
     assert result.ok is False
     assert result.failed_at == "preflight"
     assert "kubeapi unreachable" in result.error
-
-
-# ── build_slot_image_url helper ──────────────────────────────────────
-
-
-def test_build_slot_image_url_format(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The URL the orchestrator stamps into ``desired_slot_image_url``
-    follows the same ``?t=<hmac>`` shape the existing ``apply_upgrade``
-    endpoint uses, so the host-side runner's unauthenticated GET
-    works."""
-    image_id = uuid.UUID("11111111-2222-3333-4444-555555555555")
-    url = per_node.build_slot_image_url(
-        request_base_url="https://fleet.example.com/", image_id=image_id
-    )
-    assert url.startswith(
-        f"https://fleet.example.com/api/v1/appliance/upgrade-images/{image_id}/raw.xz?t="
-    )
-    # Token is 64-char hex.
-    token = url.split("?t=")[1]
-    assert len(token) == 64
-    assert all(c in "0123456789abcdef" for c in token)
