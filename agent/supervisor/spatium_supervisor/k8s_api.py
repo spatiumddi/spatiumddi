@@ -844,43 +844,178 @@ def patch_node_labels(
     return False, f"kubeapi status {status}: {resp[:200]!r}"
 
 
-def ensure_coredns_ha(replicas: int = 2) -> tuple[bool, str | None]:
-    """Keep the k3s-bundled CoreDNS able to survive a node loss —
-    returns (changed, error); ``(False, None)`` means already converged.
+def count_nodes(timeout: float = 5.0) -> tuple[int, int, str | None]:
+    """``(registered, ready_and_schedulable, error)`` over ``/api/v1/nodes``.
+
+    Two counts because they answer two different questions.
+
+    ``registered`` counts every Node object regardless of condition — it is
+    how many ``kubernetes.io/hostname`` domains a required anti-affinity can
+    ever spread over. A Node object survives NotReady; it only disappears on
+    an explicit :func:`delete_node` (the #272 eviction path) or a cluster
+    reset. Sizing the replica target off it is what stops a node *outage*
+    from scaling cluster DNS down at the exact moment #590 needs it up, and
+    it does not flap the way a Ready count does across a kubelet restart.
+
+    ``ready_and_schedulable`` (Ready=True, not cordoned) is the stricter
+    count, used only to decide whether a pod-template rollout can land right
+    now. It may defer a change; it never shrinks one.
+    """
+    try:
+        status, body = _request("GET", "/api/v1/nodes", timeout=timeout)
+    except (RuntimeError, OSError) as exc:
+        # OSError is NOT redundant: _request builds its HTTPSConnection (and
+        # reads the CA via _ssl_context) OUTSIDE the try that converts
+        # transport errors to RuntimeError, so a missing/unreadable ca.crt
+        # raises straight through. Same catch as its sibling readers in
+        # firewall_peer_audit.
+        return 0, 0, str(exc)
+    if status != 200:
+        return 0, 0, f"kubeapi status {status}: {body[:200]!r}"
+    try:
+        data = json.loads(body)
+    except (json.JSONDecodeError, ValueError):
+        return 0, 0, "unparseable node list"
+    if not isinstance(data, dict):
+        return 0, 0, "unparseable node list"
+    items = data.get("items") or []
+    schedulable = 0
+    for node in items:
+        if (node.get("spec") or {}).get("unschedulable"):
+            continue
+        for cond in (node.get("status") or {}).get("conditions") or []:
+            if cond.get("type") == "Ready" and cond.get("status") == "True":
+                schedulable += 1
+                break
+    return len(items), schedulable, None
+
+
+_COREDNS_PATH = "/apis/apps/v1/namespaces/kube-system/deployments/coredns"
+_FAST_EVICT_KEYS = ("node.kubernetes.io/unreachable", "node.kubernetes.io/not-ready")
+_FAST_EVICT_TOLERATIONS = [
+    {"key": "node.kubernetes.io/unreachable", "operator": "Exists",
+     "effect": "NoExecute", "tolerationSeconds": 20},
+    {"key": "node.kubernetes.io/not-ready", "operator": "Exists",
+     "effect": "NoExecute", "tolerationSeconds": 20},
+]
+_COREDNS_SPREAD = {
+    "podAntiAffinity": {
+        "requiredDuringSchedulingIgnoredDuringExecution": [{
+            "topologyKey": "kubernetes.io/hostname",
+            "labelSelector": {"matchLabels": {"k8s-app": "kube-dns"}},
+        }],
+    },
+}
+
+
+def _merge_patch(target: Any, patch: Any) -> Any:
+    """Apply an RFC 7386 JSON merge-patch and return the result.
+
+    Only used to predict what a PATCH would produce, so the reconciler can tell
+    a real pod-template rewrite (which starts a rollout, and on one node is how
+    #750 happens) from a no-op patch. Objects merge key by key and a ``null``
+    member DELETES its key — the two behaviours the coredns affinity patch
+    depends on.
+    """
+    if not isinstance(patch, dict):
+        return patch
+    merged = dict(target) if isinstance(target, dict) else {}
+    for key, value in patch.items():
+        if value is None:
+            merged.pop(key, None)
+        else:
+            merged[key] = _merge_patch(merged.get(key), value)
+    return merged
+
+
+def ensure_coredns_ha(max_replicas: int = 2) -> tuple[bool, str | None]:
+    """Match the k3s-bundled CoreDNS to the cluster's NODE COUNT — returns
+    (changed, error); ``(False, None)`` means converged or deferred.
 
     #590 — k3s ships CoreDNS as a SINGLE replica with the default 300 s
-    unreachable toleration, and on an appliance it deterministically
-    lands on the seed (single-node install; members join later; the pod
-    never moves). Hard-kill the seed and cluster DNS is gone for 5
-    minutes — and *everything* the api readiness gate touches resolves
-    through it (the Postgres ``-rw`` Service, the Redis sentinel
-    FQDNs), so every api pod goes NotReady cluster-wide until CoreDNS
-    finally reschedules. Observed live 2026-07-12: kill_leader failed
-    identically across four builds while postgres/redis fixes landed,
-    because DNS was the common upstream casualty.
+    unreachable toleration, and on an appliance it deterministically lands on
+    the seed. Hard-kill the seed and cluster DNS is gone for 5 minutes — and
+    *everything* the api readiness gate touches resolves through it (the
+    Postgres ``-rw`` Service, the Redis sentinel FQDNs), so every api pod
+    goes NotReady cluster-wide until CoreDNS finally reschedules. Hence 2
+    replicas + fast-evict tolerations + REQUIRED (not preferred)
+    anti-affinity on a real cluster; #633 has the live evidence for why
+    preferred was wrong — it parked BOTH replicas on the seed, and
+    Kubernetes never rebalances running pods, so the "HA" DNS died with the
+    seed anyway.
 
-    Reconciled from the seed's heartbeat (idempotent GET-then-patch):
-    k3s re-applies its bundled manifest on every restart, which resets
-    replicas to 1 — a one-shot patch would silently regress, the
-    heartbeat re-converges it. The toleration list is REPLACED by the
-    merge-patch, so the stock entries ride along with the fast-evict
-    pair (same 20 s rationale as api/frontend/worker/postgresql/redis).
+    #750 — but that shape is only correct once a SECOND NODE EXISTS.
+    Applying it to a single-node box deadlocks the rollout permanently: the
+    patch rewrites the pod template, so a NEW ReplicaSet is created whose
+    pods can never schedule (required anti-affinity, one node, occupied),
+    while the old ReplicaSet's pod can never drain (``maxUnavailable: 1`` at
+    ``replicas: 2`` ⇒ minAvailable 1, and zero new pods are Ready). Three
+    coredns pods forever, and every later coredns change queues behind a
+    rollout that cannot finish. The previous docstring anticipated a single
+    Pending *spare* and judged it harmless; that is true of the steady state
+    but not of the transition, which is where the template rewrite bites.
 
-    REQUIRED (not preferred) anti-affinity, deliberately: the reconciler
-    first fires while the appliance is still a single node (firstboot —
-    members join minutes later), and preferred anti-affinity happily
-    parked BOTH replicas on the seed; Kubernetes never rebalances
-    running pods, so the "HA" DNS died with the seed anyway (observed
-    live 2026-07-12: both coredns replicas Terminating in the same
-    kill_leader window the fix was meant to survive). Under required
-    anti-affinity the second replica sits Pending until a member joins
-    and then schedules there — a Pending spare on a genuinely
-    single-node box is harmless (the first replica serves), a
-    co-located spare is worthless."""
-    path = "/apis/apps/v1/namespaces/kube-system/deployments/coredns"
+    So the target is a function of the node count, with two states:
+
+    * **1 registered node → STOCK.** replicas 1, fast-evict tolerations
+      REMOVED, pod anti-affinity REMOVED. Both buy exactly nothing with one
+      hostname domain — worse, a 20 s unreachable toleration means a kubelet
+      blip evicts the only DNS pod with nowhere to put it.
+    * **≥2 registered nodes → HA.** ``min(registered, max_replicas)``
+      replicas + fast-evict + required spread. The cap is 2 by default
+      because required anti-affinity places at most one pod per node, and
+      two is what surviving a node loss needs — a third on a 3-node cluster
+      costs memory for no extra failure tolerance.
+
+    The count is *registered* Node objects, deliberately, and deliberately
+    NOT the ``control_plane_size`` that sizes every other appliance workload
+    (the ``# spatium:cp-size`` markers in ``spatiumddi-firstboot``). That
+    number is the COMMITTED member count and can lead reality — a member
+    committed but not yet joined would give a target of 2 against one real
+    node, which is precisely this bug. Node objects are ground truth for how
+    many hostname domains exist, and they survive NotReady, so a node
+    *outage* cannot scale cluster DNS down at the moment #590 needs it up.
+
+    Consequences worth knowing:
+
+    * A fresh single-node install is now a total no-op. Stock already *is*
+      the target, so there is no patch, no second ReplicaSet and no pod
+      churn — which is also why the deadlock cannot be re-created.
+    * An appliance already stuck in the deadlock heals in one patch, usually
+      with no DNS gap: the pod still Running is normally the one from the
+      stock-template ReplicaSet, so reverting the template makes that
+      ReplicaSet current again and the unschedulable one is scaled to zero
+      underneath it. Worst case the hash does not match — a reboot let an
+      HA-ReplicaSet pod win the single node and the stock ReplicaSet was
+      garbage-collected — and it degrades to an ordinary ``replicas: 1``
+      rollout, where ``maxUnavailable: 1`` leaves minAvailable 0 so the old
+      pod drains immediately. A few seconds of gap, still converged.
+    * The replica check moved from ``>=`` (a ratchet that could only ever
+      raise the count, which is why nothing could undo the deadlock) to
+      equality. The supervisor now owns this field in both directions: a
+      manual ``kubectl scale deploy/coredns`` is reverted on the next
+      heartbeat.
+
+    Still reconciled from every seed heartbeat rather than once, because k3s
+    re-applies its bundled manifest on restart and would silently revert an
+    HA cluster to a single replica.
+    """
+    registered, schedulable, node_err = count_nodes()
+    if node_err is not None:
+        return False, f"node count unavailable: {node_err}"
+    if registered <= 0:
+        # A cluster we are running inside always has at least one Node. A
+        # zero here means an authorization or field-selector surprise, not a
+        # nodeless cluster — patching to the single-node target off a
+        # reading we do not trust is how you turn a bad read into an outage.
+        return False, "kubeapi reported no nodes"
+
+    want_ha = registered >= 2
+    desired = min(registered, max_replicas) if want_ha else 1
+
     try:
-        status, resp = _request("GET", path)
-    except RuntimeError as exc:
+        status, resp = _request("GET", _COREDNS_PATH)
+    except (RuntimeError, OSError) as exc:
         return False, str(exc)
     if status != 200:
         return False, f"kubeapi status {status}: {resp[:200]!r}"
@@ -888,55 +1023,91 @@ def ensure_coredns_ha(replicas: int = 2) -> tuple[bool, str | None]:
         dep = json.loads(resp)
     except ValueError:
         return False, "unparseable coredns deployment"
+    if not isinstance(dep, dict):
+        return False, "unparseable coredns deployment"
     spec = dep.get("spec") or {}
     tmpl_spec = (spec.get("template") or {}).get("spec") or {}
     tolerations = tmpl_spec.get("tolerations") or []
-    has_fast_evict = any(
-        t.get("key") == "node.kubernetes.io/unreachable"
-        and (t.get("tolerationSeconds") or 10**9) <= 30
-        for t in tolerations
-    )
-    has_required_spread = bool(
-        ((tmpl_spec.get("affinity") or {}).get("podAntiAffinity") or {})
-        .get("requiredDuringSchedulingIgnoredDuringExecution")
-    )
-    if (int(spec.get("replicas") or 0) >= replicas and has_fast_evict
-            and has_required_spread):
+    affinity = tmpl_spec.get("affinity") or {}
+    current_replicas = int(spec.get("replicas") or 0)
+
+    # Convergence is decided by comparing the template we WOULD send against
+    # the one that is live, rather than by a set of "close enough" predicates.
+    # That makes the reconciler own this template outright: a half-applied
+    # toleration pair, a leftover preferred anti-affinity from a pre-#633
+    # build, and a fast-evict entry someone hand-edited to 25 s are all just
+    # "not what we send", and all get repaired. Tolerations we do not manage
+    # ride along in ``keep``, so this never fights another controller.
+    keep = [t for t in tolerations if t.get("key") not in _FAST_EVICT_KEYS]
+    if want_ha:
+        affinity_patch: Any = _COREDNS_SPREAD
+    elif set(affinity) <= {"podAntiAffinity"}:
+        # ``null`` DELETES the key under a JSON merge-patch, restoring the
+        # stock pod template exactly — which is what lets the still-Running
+        # stock-hash ReplicaSet become current again and heal without a DNS
+        # gap. Only safe when podAntiAffinity is all there is.
+        affinity_patch = None
+    else:
+        # A merge-patch recurses into objects, so nulling one key removes just
+        # that key and leaves the siblings (a stock nodeAffinity, say) intact —
+        # which is also the stock shape, so this heals as cleanly as the branch
+        # above. Nulling the whole ``affinity`` here would take the operator's
+        # other scheduling constraints with it.
+        affinity_patch = {"podAntiAffinity": None}
+    want_tolerations = (keep + _FAST_EVICT_TOLERATIONS) if want_ha else keep
+
+    # Whether the PATCH would actually rewrite the pod template, computed from
+    # the body we are about to send rather than from ``template_ok``. The two
+    # are not the same question: ``template_ok`` accepts any fast-evict
+    # toleration at <=30 s, so a template sitting at 25 s satisfies it while
+    # still differing from the canonical body — and that difference is a new
+    # pod-template hash, i.e. a rollout. Deciding the gate on the loose
+    # predicate would let exactly that rollout skip the guard it exists to be.
+    want_affinity = None if affinity_patch is None else _merge_patch(affinity, affinity_patch)
+    rewrites_template = want_tolerations != tolerations or want_affinity != (affinity or None)
+
+    if current_replicas == desired and not rewrites_template:
         return False, None
-    fast = [
-        {"key": "node.kubernetes.io/unreachable", "operator": "Exists",
-         "effect": "NoExecute", "tolerationSeconds": 20},
-        {"key": "node.kubernetes.io/not-ready", "operator": "Exists",
-         "effect": "NoExecute", "tolerationSeconds": 20},
-    ]
-    keep = [t for t in tolerations
-            if t.get("key") not in ("node.kubernetes.io/unreachable",
-                                    "node.kubernetes.io/not-ready")]
-    spread = {
-        "podAntiAffinity": {
-            "requiredDuringSchedulingIgnoredDuringExecution": [{
-                "topologyKey": "kubernetes.io/hostname",
-                "labelSelector": {"matchLabels": {"k8s-app": "kube-dns"}},
-            }],
-        },
-    }
+
+    if rewrites_template and schedulable < desired:
+        # Defer while fewer nodes are Ready+uncordoned than the target: a
+        # pod-template change there is how the #750 deadlock is authored in
+        # the first place. A coarse proxy — it does not model taints or
+        # coredns' own nodeSelector — but it catches the case that actually
+        # occurs on an appliance, a peer that is registered and down. Not an
+        # error: nothing is wrong, it retries next heartbeat, and reporting a
+        # failure every 30 s across a node reboot would be noise.
+        log.info(
+            "supervisor.k8s_api.coredns_deferred",
+            registered_nodes=registered,
+            schedulable_nodes=schedulable,
+            desired_replicas=desired,
+        )
+        return False, None
+
     payload = json.dumps({
         "spec": {
-            "replicas": replicas,
+            "replicas": desired,
             "template": {"spec": {
-                "tolerations": keep + fast,
-                "affinity": spread,
+                "tolerations": want_tolerations,
+                "affinity": affinity_patch,
             }},
         },
     }).encode("utf-8")
     try:
         status, resp = _request(
-            "PATCH", path, body=payload,
+            "PATCH", _COREDNS_PATH, body=payload,
             content_type="application/merge-patch+json",
         )
-    except RuntimeError as exc:
+    except (RuntimeError, OSError) as exc:
         return False, str(exc)
     if status in (200, 201):
+        log.info(
+            "supervisor.k8s_api.coredns_reconciled",
+            registered_nodes=registered,
+            replicas=desired,
+            shape="ha" if want_ha else "stock",
+        )
         return True, None
     return False, f"kubeapi status {status}: {resp[:200]!r}"
 
