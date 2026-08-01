@@ -1208,14 +1208,23 @@ control-plane cluster itself, not the registered agent fleet.
    its sha256 sidecar out-of-band (air-gap), or — on a connected
    install — **import from GitHub** straight from the release-asset
    picker, where the control plane downloads + sha256-verifies the
-   image for you (no out-of-band round trip). Either way the bytes are
-   stored on the in-cluster mirror PVC (`slot-image-mirror` Deployment +
-   PVC, gated behind `slotImageMirror.enabled` — the mirror infra keeps
-   the historical name). On the Rolling Upgrade tab the operator picks
-   it from the dropdown — the control plane composes an authenticated
-   download URL with an HMAC token, every per-node host runner pulls
-   bytes through the same control-plane → mirror pipe. No node ever
+   image for you (no out-of-band round trip). On the Rolling Upgrade tab
+   the operator picks it from the dropdown — the control plane composes
+   an authenticated download URL with an HMAC token, and every per-node
+   host runner pulls bytes back through the control plane. No node ever
    talks to github.com.
+
+   > **Multi-node needs the mirror turned on.** Where those bytes live
+   > depends on `slotImageMirror.enabled` (`slot-image-mirror` Deployment
+   > + PVC — the mirror infra keeps the historical name). It is **off by
+   > default**, and with it off the bytes sit on a node-local hostPath —
+   > specifically, on whichever api replica served the upload. That is
+   > correct for a single-node appliance and wrong for every other shape:
+   > the host's download round-robins across api replicas and any replica
+   > without the bytes answers 404. Scheduling an uploaded-image upgrade
+   > on a multi-node control plane with the mirror off is refused up
+   > front, with the same instruction (#787). Upgrading from an external
+   > image URL needs no mirror.
 2. **URL** (connected install). Operator pastes the GitHub release
    asset URL — same `https://github.com/.../spatiumddi-appliance-
    slot-amd64.raw.xz` shape the per-box flow uses. Each node fetches

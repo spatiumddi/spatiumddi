@@ -27,6 +27,7 @@ from dataclasses import dataclass
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.models.appliance import Appliance, ApplianceUpgradeImage
 
 # The host runner only learned to strip a URL ``#fragment`` before
@@ -91,6 +92,45 @@ def supervisor_strips_url_fragment(row: Appliance) -> bool:
     )
 
 
+def _assert_self_served_bytes_are_reachable() -> None:
+    """Refuse to point a host at an uploaded image it may not be able to fetch.
+
+    Uploaded bytes land on the api replica that served the upload, on a
+    node-local hostPath. The slot-image mirror is what makes them readable
+    from every replica — and it is off by default. So on a multi-node
+    control plane (api runs 2 replicas with hard anti-affinity), the host's
+    download round-robins through the Service and roughly half the time
+    reaches a replica without the bytes, which answers 404 "bytes missing
+    on disk — re-upload required". That message is actively misleading:
+    the bytes exist, just on a node the operator cannot see (#787).
+
+    Fail here instead, where we can say what to do about it. External URLs
+    are unaffected — nothing of ours serves those.
+
+    Silent no-op off Kubernetes (docker compose): one api process, so the
+    bytes are always local to whoever serves the download.
+    """
+    if settings.slot_image_mirror_url:
+        return  # bytes are reachable cluster-wide through the mirror
+
+    from app.services.appliance import k8s  # noqa: PLC0415
+
+    try:
+        status_code, nodes = k8s.list_nodes(label_selector="spatium.io/role=appliance")
+    except k8s.KubeapiUnavailableError:
+        return  # not on k8s — single api process
+    if status_code != 200 or len(nodes) <= 1:
+        return
+
+    raise SlotImageResolutionError(
+        f"This control plane spans {len(nodes)} nodes, and uploaded upgrade-image "
+        "bytes live on whichever node served the upload — the other api replicas "
+        "would answer the host's download with a 404. Either enable the slot-image "
+        "mirror (Helm value 'slotImageMirror.enabled=true', which gives the images a "
+        "shared PVC) or schedule this upgrade from an external image URL instead."
+    )
+
+
 async def resolve_slot_image_target(
     db: AsyncSession,
     *,
@@ -121,6 +161,8 @@ async def resolve_slot_image_target(
     image = await db.get(ApplianceUpgradeImage, slot_image_id)
     if image is None:
         raise SlotImageResolutionError(f"Upgrade image {slot_image_id} not found.")
+
+    _assert_self_served_bytes_are_reachable()
 
     # Imported locally: the token mint lives on the API router that also
     # serves the bytes, and importing it at module scope would cycle back

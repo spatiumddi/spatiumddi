@@ -156,6 +156,14 @@ api:
 # that also use the slot-image upload feature (= multi-node appliance
 # installs). Single-instance docker-compose / plain k8s installs that
 # just helm-upgrade through standard rolling updates don't need it.
+#
+# TURN THIS ON for a multi-node control plane that upgrades from UPLOADED
+# images. It stays off by default because the PVC is real storage the
+# single-node appliance (whose /var is the remainder of a 32 GiB minimum
+# disk) should not be asked to reserve. Leaving it off on multi-node used
+# to surface as a 404 mid-download on whichever replica hadn't served the
+# upload; scheduling now refuses up front with that instruction instead
+# (#787). Upgrading from an external image URL needs no mirror at all.
 slotImageMirror:
   enabled: false
   storage:

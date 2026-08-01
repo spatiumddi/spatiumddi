@@ -106,6 +106,83 @@ async def test_exactly_one_source_required(kwargs) -> None:
         await resolve_slot_image_target(_FakeDB(), base_url="https://cp.local/", **kwargs)
 
 
+# ── multi-node reachability guard ────────────────────────────────────
+
+
+def _patch_nodes(monkeypatch: pytest.MonkeyPatch, count: int) -> None:
+    """Pretend the control plane spans ``count`` appliance nodes."""
+    from app.services.appliance import k8s
+
+    monkeypatch.setattr(k8s, "list_nodes", lambda **_kw: (200, [{}] * count))
+
+
+@pytest.mark.asyncio
+async def test_uploaded_image_refused_on_multi_node_without_a_mirror(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#787: uploaded bytes are node-local, so on a multi-node control plane
+    the host's download 404s from every replica that didn't serve the
+    upload. Refuse at schedule time with something actionable instead."""
+    from app.services.appliance import slot_image_target as sit
+
+    monkeypatch.setattr(sit.settings, "slot_image_mirror_url", "")
+    _patch_nodes(monkeypatch, 3)
+    image = SimpleNamespace(id=uuid.uuid4(), sha256="ab" * 32)
+
+    with pytest.raises(SlotImageResolutionError, match="slotImageMirror"):
+        await resolve_slot_image_target(
+            _FakeDB(image), base_url="https://cp.local/", slot_image_id=image.id
+        )
+
+
+@pytest.mark.asyncio
+async def test_uploaded_image_allowed_when_the_mirror_is_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services.appliance import slot_image_target as sit
+
+    monkeypatch.setattr(sit.settings, "slot_image_mirror_url", "http://mirror:8000")
+    _patch_nodes(monkeypatch, 3)
+    image = SimpleNamespace(id=uuid.uuid4(), sha256="ab" * 32)
+
+    target = await resolve_slot_image_target(
+        _FakeDB(image), base_url="https://cp.local/", slot_image_id=image.id
+    )
+    assert target.sha256 == "ab" * 32
+
+
+@pytest.mark.asyncio
+async def test_uploaded_image_allowed_on_a_single_node(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services.appliance import slot_image_target as sit
+
+    monkeypatch.setattr(sit.settings, "slot_image_mirror_url", "")
+    _patch_nodes(monkeypatch, 1)
+    image = SimpleNamespace(id=uuid.uuid4(), sha256="ab" * 32)
+
+    target = await resolve_slot_image_target(
+        _FakeDB(image), base_url="https://cp.local/", slot_image_id=image.id
+    )
+    assert target.tls_insecure is True
+
+
+@pytest.mark.asyncio
+async def test_external_url_skips_the_reachability_guard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Nothing of ours serves an external URL, so node count is irrelevant."""
+    from app.services.appliance import slot_image_target as sit
+
+    monkeypatch.setattr(sit.settings, "slot_image_mirror_url", "")
+    _patch_nodes(monkeypatch, 3)
+
+    target = await resolve_slot_image_target(
+        _FakeDB(), base_url="https://cp.local/", slot_image_url="https://github.com/x.raw.xz"
+    )
+    assert target.url == "https://github.com/x.raw.xz"
+
+
 # ── stamp_desired_slot_image ─────────────────────────────────────────
 
 
