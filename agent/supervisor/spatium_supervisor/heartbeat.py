@@ -98,8 +98,16 @@ _NFT_APPLIED_HASH_PATH = Path(
 # CONTROL_PLANE_URL — ideally the MetalLB VIP — since they have no
 # in-cluster DNS to resolve the .svc name. See
 # ``_effective_control_plane_url`` for the member-vs-remote split.
+# Trailing dot is load-bearing (#777). Without it the name has 4 dots, which
+# is under the pod's ``ndots:5``, so the resolver walks its search list first —
+# and kubelet appends the NODE's own DHCP search domain to every pod's list. If
+# that domain's zone answers NOERROR/NODATA (rather than NXDOMAIN) for a
+# nonexistent name — Cloudflare-hosted zones do, among others — musl stops the
+# walk there and returns EAI_NODATA without ever trying the bare name. The
+# supervisor then never registers, on a network it has no control over. The dot
+# makes the name absolute and skips the search list entirely.
 _IN_CLUSTER_CONTROL_PLANE_URL = (
-    "http://spatium-control-spatiumddi-api.spatium.svc.cluster.local:8000"
+    "http://spatium-control-spatiumddi-api.spatium.svc.cluster.local.:8000"
 )
 
 

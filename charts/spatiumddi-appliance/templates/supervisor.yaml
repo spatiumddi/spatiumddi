@@ -26,6 +26,26 @@ spec:
     spec:
       nodeSelector:
         {{- toYaml .Values.global.nodeSelector | nindent 8 }}
+      # Pin the resolver so the supervisor's own bootstrap can't be broken by
+      # the network the appliance happens to be plugged into (#777).
+      #
+      # kubelet appends the NODE's DHCP-supplied search domains to every pod's
+      # resolv.conf. With the default ndots:5, any in-cluster name shorter than
+      # five dots is resolved by walking that list first — and if the inherited
+      # domain's zone answers NOERROR/NODATA instead of NXDOMAIN for a name that
+      # does not exist (Cloudflare-hosted zones do), musl stops the walk there
+      # and reports EAI_NODATA without ever trying the bare name. The supervisor
+      # then retries forever and the appliance never registers itself.
+      #
+      # ndots:1 means the four-dot Service names resolve as absolute on the
+      # first try, so the inherited domain is never consulted. The URLs are also
+      # written with a trailing dot, which fixes the same thing at the caller;
+      # this is the belt to that pair of braces, and covers every other name the
+      # supervisor may come to resolve.
+      dnsConfig:
+        options:
+          - name: ndots
+            value: "1"
       # Issue #183 Phase 3 — in-cluster auth via the SA the matching
       # supervisor-rbac template provisions. The auto-mounted SA
       # token + ca.crt give the supervisor's k8s_api module enough
