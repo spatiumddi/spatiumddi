@@ -22,13 +22,16 @@ import structlog
 
 try:
     import dns.query
+    import dns.rdata
+    import dns.rdataclass
+    import dns.rdatatype
     import dns.tsigkeyring
     import dns.update
 except ImportError:  # pragma: no cover - runtime-optional
     dns = None  # type: ignore[assignment]
 
 from ._process import find_running_daemon, is_zombie
-from .base import DriverBase
+from .base import RRSET_OP_KINDS, DriverBase
 
 log = structlog.get_logger(__name__)
 
@@ -359,6 +362,47 @@ def _format_master(entry: str) -> str:
             return f"{ip} port {port}"
         return ip
     return entry
+
+
+def _parses_as_rdata(rtype: str, wire: str) -> bool:
+    """Whether dnspython can read ``wire`` as rdata of ``rtype``.
+
+    Used to keep one unreadable sibling from failing a whole-RRset write. Any
+    exception counts as "no" — ``from_text`` raises a different type per rdata
+    class (SyntaxError, ValueError, dns.exception.*), and the only thing worth
+    knowing here is whether the value is usable.
+    """
+    try:
+        dns.rdata.from_text(dns.rdataclass.IN, dns.rdatatype.from_text(rtype), wire)
+    except Exception:  # noqa: BLE001 — see docstring: any failure means unusable
+        return False
+    return True
+
+
+def _wire_value(rtype: str, value: str, fields: dict[str, Any]) -> str:
+    """Compose one RR's presentation form from a record-op payload.
+
+    MX / SRV wire-format requires the priority (and weight+port) to appear
+    inline before the target. The control plane stores those as separate
+    columns and, historically, only forwarded ``value``. Prefer the explicit
+    fields; fall back to the raw value if an already-composed wire string came
+    through (legacy path + future-proofing).
+
+    Shared by the op's own record and by every member of the RRset that op
+    carries (#773), so a multi-value MX or SRV composes identically either way.
+    """
+    rtype_u = rtype.upper()
+    if rtype_u == "MX":
+        pri = fields.get("priority")
+        if pri is not None and not value.lstrip().split(" ", 1)[0].isdigit():
+            return f"{pri} {value}"
+    elif rtype_u == "SRV":
+        pri = fields.get("priority")
+        wt = fields.get("weight")
+        prt = fields.get("port")
+        if pri is not None and wt is not None and prt is not None and len(value.split()) < 4:
+            return f"{pri} {wt} {prt} {value}"
+    return value
 
 
 # DNSSEC algorithm name → IANA number (issue #49). Used when parsing
@@ -1073,59 +1117,87 @@ class Bind9Driver(DriverBase):
             if m:
                 keyring = dns.tsigkeyring.from_text({m.group(1): m.group(2)})
 
-        # MX / SRV wire-format requires the priority (and weight+port) to
-        # appear inline before the target. The control plane stores those
-        # as separate columns and, historically, only forwarded `value`.
-        # Prefer explicit fields; fall back to the raw value if an already-
-        # composed wire string came through (legacy path + future-proofing).
-        wire_value = value
-        rtype_u = rtype.upper()
-        if rtype_u == "MX":
-            pri = rec.get("priority")
-            if pri is not None and not value.lstrip().split(" ", 1)[0].isdigit():
-                wire_value = f"{pri} {value}"
-        elif rtype_u == "SRV":
-            pri = rec.get("priority")
-            wt = rec.get("weight")
-            prt = rec.get("port")
-            if (
-                pri is not None
-                and wt is not None
-                and prt is not None
-                and len(value.split()) < 4
-            ):
-                wire_value = f"{pri} {wt} {prt} {value}"
+        wire_value = _wire_value(rtype, value, rec)
 
-        # ``rrset_action`` is set by callers that need precise multi-RR
-        # semantics (most notably DNS pools, where N A records share a
-        # single name and ``replace`` would clobber siblings every time
-        # a member is added). When unset (the legacy default) the
-        # existing replace/wildcard-delete behaviour applies, matching
-        # the single-RR-per-name case the operator-facing record CRUD
-        # path was originally written for.
-        rrset_action = (rec.get("rrset_action") or "").lower()
+        # #773 — the control plane ships the complete desired RRset for the
+        # (name, type) this op touches, so the update is expressed as one
+        # atomic whole-RRset write: dnspython's ``replace`` with N rdatas emits
+        # a single delete-RRset followed by N adds in ONE message. That is what
+        # makes a name with several values — round-robin A, a backup MX, SPF
+        # beside a verification TXT — survive. Applying the same RRset twice is
+        # a no-op, so ops are idempotent and replay-safe rather than
+        # order-dependent.
+        #
+        # An empty member list means the RRset should not exist at all (the op
+        # deleted its last value).
+        rrset = rec.get("rrset") if isinstance(rec.get("rrset"), dict) else None
+        members = rrset.get("members") if rrset is not None else None
 
         upd = dns.update.Update(zone, keyring=keyring)
-        if op["op"] in ("create", "update"):
-            if rrset_action == "add":
-                upd.add(name, ttl, rtype, wire_value)
+        if rrset is not None and members is not None and op["op"] in RRSET_OP_KINDS:
+            # ``or ttl`` would swallow a legitimate TTL of 0 (RFC 2181 allows
+            # it and it is how "never cache this" is expressed), so test for
+            # absence rather than falsiness.
+            rrset_ttl = rrset.get("ttl")
+            # Parse each member on its own before handing the list to
+            # ``replace``, which parses internally and would fail the WHOLE op
+            # on one bad value. That matters because the members are siblings
+            # the op did not ask about: one legacy or imported row dnspython
+            # cannot read would otherwise block every future write to the name,
+            # not just its own. Skip it with a warning instead — an rdata that
+            # will not parse cannot be served either way, and the value the
+            # operator is actually changing still lands. The op's OWN value is
+            # not skipped: a failure there is the operator's edit failing, and
+            # must surface as one.
+            own_wire = wire_value
+            wire_members: list[str] = []
+            for m in members:
+                candidate = _wire_value(rtype, m.get("value") or "", m)
+                if candidate == own_wire or _parses_as_rdata(rtype, candidate):
+                    wire_members.append(candidate)
+                else:
+                    log.warning(
+                        "rrset_member_unparseable_skipped",
+                        zone=zone,
+                        name=name,
+                        type=rtype,
+                        value=candidate,
+                    )
+            if wire_members:
+                upd.replace(
+                    name,
+                    int(ttl if rrset_ttl is None else rrset_ttl),
+                    rtype,
+                    *wire_members,
+                )
             else:
-                upd.replace(name, ttl, rtype, wire_value)
-        elif op["op"] == "delete":
-            if rrset_action == "delete_value":
-                # Remove the specific RR only; sibling RRs at the same
-                # (name, rtype) survive. Used by pool member removal so
-                # taking one member out doesn't drop the rest.
-                upd.delete(name, rtype, wire_value)
-            else:
-                # Some BIND configurations reject the RR-specific delete
-                # form (value must exactly match a live RR) when the
-                # running daemon has drifted from the zone file. Delete
-                # by (name, rtype) so any matching RR gets cleared.
-                # Idempotent.
                 upd.delete(name, rtype)
         else:
-            raise ValueError(f"unknown op: {op['op']}")
+            # Fallback for an op enqueued by a control plane that predates the
+            # ``rrset`` payload. ``rrset_action`` is the older, per-op override
+            # for these semantics — DNS pools set it because N A records share
+            # one name there and a bare ``replace`` clobbers siblings.
+            rrset_action = (rec.get("rrset_action") or "").lower()
+            if op["op"] in ("create", "update"):
+                if rrset_action == "add":
+                    upd.add(name, ttl, rtype, wire_value)
+                else:
+                    upd.replace(name, ttl, rtype, wire_value)
+            elif op["op"] == "delete":
+                if rrset_action == "delete_value":
+                    # Remove the specific RR only; sibling RRs at the same
+                    # (name, rtype) survive. Used by pool member removal so
+                    # taking one member out doesn't drop the rest.
+                    upd.delete(name, rtype, wire_value)
+                else:
+                    # Some BIND configurations reject the RR-specific delete
+                    # form (value must exactly match a live RR) when the
+                    # running daemon has drifted from the zone file. Delete
+                    # by (name, rtype) so any matching RR gets cleared.
+                    # Idempotent.
+                    upd.delete(name, rtype)
+            else:
+                raise ValueError(f"unknown op: {op['op']}")
         resp = dns.query.tcp(upd, "127.0.0.1", timeout=10)
         rcode = resp.rcode()
         if rcode != 0:  # NOERROR

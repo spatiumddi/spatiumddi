@@ -22,6 +22,7 @@ from app.core.agent_wake import collect_wake, dns_group_channel
 from app.drivers.dns import get_driver, is_agentless
 from app.drivers.dns.base import RecordChange, RecordData
 from app.models.dns import DNSRecord, DNSRecordOp, DNSServer, DNSZone
+from app.services.dns.rrset import stamp_rrsets_for_ops
 from app.services.dns.serial import bump_zone_serial
 
 logger = structlog.get_logger(__name__)
@@ -218,6 +219,17 @@ async def enqueue_record_op(
         )
         return None
 
+    # #773 — ship the complete desired RRset alongside the op. Every agent
+    # driver has to apply a record change as a whole-RRset write, so without
+    # this a second value at an existing (name, type) silently retired the
+    # first. Skipped when the payload already carries one, because the batch
+    # path folds and stamps its whole list in a single query before delegating
+    # here — restamping per op would undo the fold. (An op carrying an explicit
+    # ``rrset_action`` opts out entirely; ``stamp_rrsets_for_ops`` handles it.)
+    if "rrset" not in record:
+        record = dict(record)
+        await stamp_rrsets_for_ops(db, zone, [{"op": op, "record": record}])
+
     primary_op: DNSRecordOp | None = None
     first_op: DNSRecordOp | None = None
     for srv in agent_servers:
@@ -331,6 +343,12 @@ async def enqueue_record_ops_batch(
     # Agent-based: DB rows only; agent will batch at poll time. Delegates to
     # enqueue_record_op per op, which fans out to every ENABLED agent-based
     # server regardless of whether the designated primary is disabled (#481).
+    # The RRsets are resolved for the whole batch first (#773) — one query
+    # instead of one per op, and every op at a shared (name, type) then carries
+    # the same complete set, so none of them depends on the order the agent
+    # drains them in.
+    ops = [{**o, "record": dict(o["record"])} for o in ops]
+    await stamp_rrsets_for_ops(db, zone, ops)
     return [
         await enqueue_record_op(db, zone, o["op"], o["record"], o.get("target_serial")) for o in ops
     ]
@@ -400,6 +418,10 @@ async def enqueue_record_ops_bulk(
     agent_servers = [s for s in agent_rows if not is_agentless(s.driver)]
     if not agent_servers:
         return 0
+    # #773 — one query resolves every touched RRset for the whole batch, so the
+    # seed/import fast-path stays a fast path.
+    ops = [{**o, "record": dict(o["record"])} for o in ops]
+    await stamp_rrsets_for_ops(db, zone, ops)
     for srv in agent_servers:
         db.add_all(
             [

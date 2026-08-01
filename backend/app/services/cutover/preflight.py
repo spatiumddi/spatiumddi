@@ -129,13 +129,20 @@ async def _assert_target_is_not_the_source(db: AsyncSession, zone: DNSZone) -> N
 def _ttl_ops(records: list[DNSRecord], zone: DNSZone) -> list[dict[str, Any]]:
     """Build the record-op batch for a TTL rewrite, RRset-aware.
 
-    The BIND9 agent turns a ``create`` / ``update`` op into an RFC 2136
-    ``replace`` by default, which swaps the **whole RRset** for the single value
-    in that op. That is right for the one-value-per-name case the record CRUD
-    path was written for, and silently destructive for anything else: a name
-    with three round-robin A records would be rewritten three times and end up
-    serving only the last one. Lowering a TTL must not cost the operator two
-    thirds of their addresses.
+    #773 stamps the complete desired RRset onto ordinary record ops, which
+    would cover this too — but setting ``rrset_action`` opts an op out of that
+    stamping, and this path keeps doing so on purpose. The grouping below is
+    what protects an agent that predates the ``rrset`` field, and agents deploy
+    on their own schedule; this is the one path where getting it wrong costs
+    the operator addresses at exactly the moment they are migrating.
+
+    The hazard it guards: an agent that knows only ``rrset_action`` turns a
+    ``create`` / ``update`` op into an RFC 2136 ``replace``, which swaps the
+    **whole RRset** for the single value in that op. That is right for the
+    one-value-per-name case the record CRUD path was written for, and silently
+    destructive for anything else: a name with three round-robin A records
+    would be rewritten three times and end up serving only the last one.
+    Lowering a TTL must not cost the operator two thirds of their addresses.
 
     So ops are grouped by ``(name, type)``. The first op in a group keeps the
     default ``replace`` — which clears the old RRset — and every sibling carries
@@ -145,10 +152,12 @@ def _ttl_ops(records: list[DNSRecord], zone: DNSZone) -> list[dict[str, Any]]:
 
     A ``None`` TTL is resolved to ``zone.ttl`` **on the wire**. The row keeps its
     NULL — that is how "inherit the zone default" is stored, and the restore path
-    depends on it — but the agent's record-op branch falls back to a hardcoded
-    3600 rather than the zone's own default, so shipping the null would silently
-    write 3600 onto every inheriting record of a zone whose default is anything
-    else. Resolving here keeps the wire honest without touching the row.
+    depends on it — but an older agent's record-op branch falls back to a
+    hardcoded 3600 rather than the zone's own default, so shipping the null
+    would silently write 3600 onto every inheriting record of a zone whose
+    default is anything else. Resolving here keeps the wire honest without
+    touching the row — and since these ops opt out of #773's stamping, this
+    is still the only place it happens for them.
     """
     grouped: dict[tuple[str, str], list[DNSRecord]] = {}
     for rec in records:

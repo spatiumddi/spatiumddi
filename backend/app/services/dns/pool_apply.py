@@ -219,6 +219,12 @@ async def _delete_pool_record(db: AsyncSession, zone: DNSZone, rec: DNSRecord) -
     # ``delete_value`` removes only this specific RR — sibling pool
     # members at the same (name, rtype) survive. Without this, removing
     # one unhealthy member would wipe every healthy member's record too.
+    # #773 ships the complete desired RRset on ordinary record ops, but pool
+    # ops opt out by carrying this flag: a pool re-points a member as a
+    # delete-then-create pair on ONE serial, and a whole-RRset write would make
+    # that pair order-dependent (the delete's set is computed before the row is
+    # mutated, so applying it after the create would drop the new address).
+    # Per-RR semantics are order-independent, which is what this path needs.
     snapshot = {
         "name": rec.name,
         "type": rec.record_type,
@@ -238,6 +244,9 @@ def _record_payload(pool: DNSPool, member: DNSPoolMember, ttl: int | None) -> di
     # The default RFC 2136 ``replace`` would clobber siblings on every
     # create, so the BIND9 driver only ever has one record live at the
     # pool's name regardless of how many members exist.
+    # Setting it also opts these ops out of #773's whole-RRset stamping, which
+    # is deliberate — see ``_delete_pool_record`` for why per-RR semantics are
+    # the right shape for the delete-then-create pair this module emits.
     return {
         "name": pool.record_name,
         "type": pool.record_type,

@@ -69,7 +69,7 @@ import httpx
 import structlog
 
 from ._process import find_running_daemon, is_zombie
-from .base import DriverBase
+from .base import RRSET_OP_KINDS, DriverBase
 
 log = structlog.get_logger(__name__)
 
@@ -895,11 +895,20 @@ class TechnitiumDriver(DriverBase):
         updates the TTL of a value-identical record rather than erroring.
         Only the value-change case needs the REPLACE.)
 
-        ``rrset_action`` is the project-wide per-op override for that
-        default (see ``bind9.py``): DNS pools set ``"add"`` because N
-        A records share one name there and a REPLACE would clobber
-        siblings every time a member is added. Honour it here too, or
-        pool members would delete each other.
+        The op payload now carries the complete desired ``rrset`` (#773) —
+        the control plane knows the whole set, which is the only place that
+        knowledge exists — so the normal path replays it as N calls: member 0
+        with ``overwrite=true`` to clear, the rest with ``overwrite=false`` to
+        append. That is a whole-RRset replace expressed in the vocabulary this
+        API has, and it is what keeps a name with several values (round-robin
+        A, a backup MX, SPF beside a verification TXT) from collapsing to
+        whichever op landed last.
+
+        ``rrset_action`` is the older project-wide per-op override (see
+        ``bind9.py``) and remains the fallback for an op enqueued by a control
+        plane that predates ``rrset``: DNS pools set ``"add"`` because N A
+        records share one name there and a REPLACE would clobber siblings
+        every time a member is added.
         """
         token = self._get_api_token()
         if token is None:
@@ -919,7 +928,11 @@ class TechnitiumDriver(DriverBase):
         rec = op["record"]
         rtype = (rec.get("type") or "").upper()
         name = _qualified_name(zone, rec.get("name") or "@")
-        ttl = rec.get("ttl") or 3600
+        # Absence, not falsiness — a TTL of 0 is legal ("never cache this") and
+        # ``or`` silently turned it into an hour. Matches bind9's driver, which
+        # has always tested for None here.
+        _op_ttl = rec.get("ttl")
+        ttl = 3600 if _op_ttl is None else _op_ttl
         params = {
             "domain": name,
             "zone": zone,
@@ -927,6 +940,67 @@ class TechnitiumDriver(DriverBase):
             **_record_params(rtype, rec.get("value") or "", rec),
         }
 
+        # #773 — the control plane ships the complete desired RRset. Technitium's
+        # REST API is one record per call, so there is no way to install N
+        # values atomically; the shape below picks the least destructive
+        # sequence available for each op kind.
+        #
+        # A ``delete`` is expressed as a value-scoped delete of the op's OWN
+        # value — the survivors in ``members`` are already on the server, so
+        # touching them would be a wipe-and-rebuild with a window where the
+        # name serves less than it should. One call, nothing at risk. (Rebuilding
+        # from the set would be more self-healing, and is not worth trading a
+        # guaranteed-safe delete for.)
+        #
+        # A ``create`` / ``update`` has no such option: the op may be changing a
+        # value, and this API cannot say "replace THIS RR" — so it is member 0
+        # with ``overwrite=true`` (which clears) followed by appends. Member 0
+        # always lands, so a mid-sequence failure leaves a subset containing it
+        # rather than an empty name, and the op is replayed. A member the server
+        # permanently rejects strands the rest of the set once the retry budget
+        # runs out — still strictly more than the single value the pre-#773 path
+        # left behind.
+        rrset = rec.get("rrset") if isinstance(rec.get("rrset"), dict) else None
+        members = rrset.get("members") if rrset is not None else None
+        if rrset is not None and members is not None and op_kind in RRSET_OP_KINDS:
+            # Absence, not falsiness — a TTL of 0 is legal and meaningful.
+            _rrset_ttl = rrset.get("ttl")
+            rrset_ttl = int(ttl if _rrset_ttl is None else _rrset_ttl)
+            if op_kind == "delete":
+                # Both the "siblings survive" and the "last value gone" cases:
+                # the op's own params identify exactly the RR to remove, and
+                # Technitium drops the rrset once its last record goes.
+                self._record_call(token, "delete", params, zone, name, rtype, op_kind)
+            else:
+                for index, member in enumerate(members):
+                    self._record_call(
+                        token,
+                        "add",
+                        {
+                            "domain": name,
+                            "zone": zone,
+                            "type": rtype,
+                            "ttl": rrset_ttl,
+                            "overwrite": "true" if index == 0 else "false",
+                            **_record_params(rtype, member.get("value") or "", member),
+                        },
+                        zone,
+                        name,
+                        rtype,
+                        op_kind,
+                    )
+            log.info(
+                "technitium_rrset_applied",
+                zone=zone,
+                name=name,
+                type=rtype,
+                op=op_kind,
+                members=len(members),
+            )
+            return None
+
+        # Fallback for an op enqueued by a control plane that predates the
+        # ``rrset`` payload. ``rrset_action`` is the older per-op override.
         rrset_action = (rec.get("rrset_action") or "").lower()
         endpoint = "delete" if op_kind == "delete" else "add"
         if op_kind != "delete":
@@ -936,30 +1010,57 @@ class TechnitiumDriver(DriverBase):
             # explicitly asks for sibling-preserving semantics.
             params["overwrite"] = "false" if rrset_action == "add" else "true"
 
-        resp = self._call(token, "POST", f"zones/records/{endpoint}", params)
-        body = resp.json()
-        if body.get("status") == "error":
-            msg = (body.get("errorMessage") or "").lower()
-            # Idempotent no-ops: retried create of an identical record, or
-            # a delete of a record that's already gone.
-            if "already exists" in msg or "no such record" in msg:
-                log.info(
-                    "technitium_record_op_idempotent_noop",
-                    zone=zone,
-                    name=name,
-                    type=rtype,
-                    op=op_kind,
-                    detail=body.get("errorMessage"),
-                )
-                return None
-            raise RuntimeError(
-                f"Technitium {endpoint} {zone}/{name}/{rtype} failed: "
-                f"{body.get('errorMessage')}"
+        if self._record_call(token, endpoint, params, zone, name, rtype, op_kind):
+            log.info(
+                "technitium_record_op_applied",
+                zone=zone,
+                name=name,
+                type=rtype,
+                op=op_kind,
             )
-        log.info(
-            "technitium_record_op_applied", zone=zone, name=name, type=rtype, op=op_kind
-        )
         return None
+
+    def _record_call(
+        self,
+        token: str,
+        endpoint: str,
+        params: dict[str, Any],
+        zone: str,
+        name: str,
+        rtype: str,
+        op_kind: str,
+    ) -> bool:
+        """POST one ``zones/records/{add,delete}`` call, raising on a real error.
+
+        Returns False for an idempotent no-op so a caller can skip its
+        "applied" log line, True when the server accepted the change.
+
+        Technitium answers HTTP 200 with ``{"status": "error"}`` for a rejected
+        record, so the body has to be inspected. Two of those are not failures:
+        a retried create of an identical record, and a delete of a record that
+        is already gone — both mean the server is already in the state the op
+        asks for, which is exactly what a replayed op should find. Crucially
+        they must NOT abort a multi-member RRset write half way — one member
+        the server already has does not make the remaining members optional.
+        """
+        body = self._call(token, "POST", f"zones/records/{endpoint}", params).json()
+        if body.get("status") != "error":
+            return True
+        msg = (body.get("errorMessage") or "").lower()
+        if "already exists" in msg or "no such record" in msg:
+            log.info(
+                "technitium_record_op_idempotent_noop",
+                zone=zone,
+                name=name,
+                type=rtype,
+                op=op_kind,
+                detail=body.get("errorMessage"),
+            )
+            return False
+        raise RuntimeError(
+            f"Technitium {endpoint} {zone}/{name}/{rtype} failed: "
+            f"{body.get('errorMessage')}"
+        )
 
     # ── Blocklists (issue #744) ─────────────────────────────────────────
 
