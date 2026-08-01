@@ -16,8 +16,11 @@ carries it: the supervisor removes any stranded ``slot-upgrade-pending``
 trigger and resets its ``.state`` / ``.progress`` sidecars, then reports
 ``ready`` — at which point the cleared DB state stops being overwritten.
 
-Same fire-once shape as ``reboot_requested``, including the auto-clear on
-a later heartbeat, so nothing new is introduced to reason about.
+The flag is retired when the host ACKNOWLEDGES — the first heartbeat
+reporting a state other than ``failed``, which is what a successful reset
+produces. ``clear_upgrade_requested_at`` backs only a give-up timeout for
+a host that can never comply, so the flag cannot pin that appliance's
+heartbeat long-poll off forever.
 
 Revision ID: e3b7a1c25d94
 Revises: a4f1c93d7e28

@@ -1491,6 +1491,15 @@ async def _ingest_lldp_neighbours(
 
 # #358 Phase 1b — server-side cap on how long the heartbeat long-poll holds
 # the connection. Must stay under the supervisor's client timeout
+# #786 — how long the control plane keeps re-sending a clear-upgrade
+# command before giving up on it. Not a delivery window: the command is
+# retired the moment the host acknowledges by reporting a non-``failed``
+# state. This is only the backstop for a host that can NEVER comply — a
+# trigger it does not own is unlinkable out of the sticky release-state
+# directory — so the flag can't pin the heartbeat long-poll off forever.
+_CLEAR_UPGRADE_GIVE_UP_SECONDS = 600.0
+
+
 # (heartbeat_interval + 10 s) so the hold returns before the client gives up.
 _HEARTBEAT_HOLD_CAP_S = 28.0
 
@@ -1642,13 +1651,18 @@ async def supervisor_heartbeat(
         row.slot_b_version = body.slot_b_version
     if body.is_trial_boot is not None:
         row.is_trial_boot = body.is_trial_boot
-    # #786 — while a clear is outstanding, ignore the upgrade state this
-    # heartbeat carries. The supervisor collected it BEFORE it saw the
-    # clear command, so it still describes the failure the operator just
-    # dismissed; ingesting it would re-stamp the row we cleared and the
-    # red card would never go away. The heartbeat after the host resets
-    # its sidecars reports ``ready`` and is ingested normally.
-    if not row.clear_upgrade_requested:
+    # #786 — while a clear is outstanding, drop ONLY a report that still
+    # carries the dismissed failure. The supervisor collected it before it
+    # saw the command, so ingesting it would re-stamp the row we cleared
+    # and the red card would never go away.
+    #
+    # Scoped to ``failed`` on purpose. Blanket-suppressing every
+    # ``last_upgrade_*`` for the whole window also threw away the host's
+    # post-reset ``ready`` — the very acknowledgement this waits for — and
+    # any progress from an upgrade the operator retried straight after
+    # clearing, which is the normal recovery gesture.
+    suppress_stale_failure = row.clear_upgrade_requested and body.last_upgrade_state == "failed"
+    if not suppress_stale_failure:
         if body.last_upgrade_state is not None:
             row.last_upgrade_state = body.last_upgrade_state
         if body.last_upgrade_state_at is not None:
@@ -1993,25 +2007,46 @@ async def supervisor_heartbeat(
         row.reboot_requested = False
         row.reboot_requested_at = None
 
-    # Auto-clear clear_upgrade_requested on the same 15 s rule (#786).
+    # Retire clear_upgrade_requested on ACKNOWLEDGEMENT, not on a clock
+    # (#786). The host's compliance is already observable: the clear's
+    # whole job is to turn a ``failed`` sidecar into ``ready``, so the
+    # first heartbeat reporting anything other than ``failed`` IS the ack.
+    # Until then the command keeps riding every response, so a supervisor
+    # that was offline, restarting, or simply slow still receives it.
     #
-    # ``deliver_clear_upgrade`` is captured BEFORE this expiry because the
-    # response is built from the row ~300 lines below: expiring here and
-    # serialising the post-expiry value would let a single heartbeat both
-    # consume the flag AND report False, so the supervisor never resets
-    # and the failure card returns. The appliance this fires on always has
-    # ``desired_appliance_version`` still set, which suppresses the
-    # long-poll — so its heartbeats arrive a full interval apart and land
-    # past the 15 s window about half the time. The expiring heartbeat
-    # must therefore still carry the command.
+    # This replaces a 15 s stopwatch that could expire before the command
+    # was ever delivered: a wedged appliance keeps ``desired_appliance_
+    # version`` set, which suppresses the long-poll, so its heartbeats
+    # arrive a full interval apart and landed past the window about half
+    # the time. No clock comparison between host and control plane is
+    # involved either, so appliance clock skew cannot strand the flag.
+    #
+    # ``deliver_clear_upgrade`` is still captured BEFORE the retire,
+    # because the response is built from the row ~300 lines below and the
+    # acknowledging heartbeat must carry the command one last time (it is
+    # idempotent host-side, and the alternative is dropping it).
     deliver_clear_upgrade = row.clear_upgrade_requested
-    if (
-        row.clear_upgrade_requested
-        and row.clear_upgrade_requested_at is not None
-        and (datetime.now(UTC) - row.clear_upgrade_requested_at).total_seconds() >= 15
-    ):
-        row.clear_upgrade_requested = False
-        row.clear_upgrade_requested_at = None
+    if row.clear_upgrade_requested:
+        acknowledged = body.last_upgrade_state is not None and body.last_upgrade_state != "failed"
+        # Backstop so a host that can never comply — e.g. a trigger it does
+        # not own, which it can never unlink out of the sticky release-state
+        # directory — cannot pin the flag on forever and permanently
+        # suppress this appliance's heartbeat long-poll.
+        stalled = (
+            row.clear_upgrade_requested_at is not None
+            and (datetime.now(UTC) - row.clear_upgrade_requested_at).total_seconds()
+            >= _CLEAR_UPGRADE_GIVE_UP_SECONDS
+        )
+        if acknowledged or stalled:
+            if stalled and not acknowledged:
+                logger.warning(
+                    "appliance_clear_upgrade_unacknowledged",
+                    appliance_id=str(row.id),
+                    hostname=row.hostname,
+                    last_upgrade_state=body.last_upgrade_state,
+                )
+            row.clear_upgrade_requested = False
+            row.clear_upgrade_requested_at = None
 
     await db.commit()
 

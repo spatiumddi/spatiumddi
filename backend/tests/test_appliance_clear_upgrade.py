@@ -8,9 +8,14 @@ reboot didn't help because those sidecars live on the persistent /var.
 
 So the endpoint now (a) clears our copy for an immediate UI response,
 (b) raises a one-shot command telling the supervisor to reset the host,
-and (c) ignores the upgrade state arriving on heartbeats until it has.
-Without (c) the very next heartbeat — collected before the supervisor
-ever saw the command — would re-stamp the failure we just cleared.
+and (c) drops a heartbeat report that still carries the dismissed
+failure. Without (c) the very next heartbeat — collected before the
+supervisor ever saw the command — would re-stamp what we just cleared.
+
+The flag is retired on ACKNOWLEDGEMENT: the first heartbeat reporting a
+state other than ``failed`` is exactly what a successful host reset
+produces, so the command rides every response until the host has actually
+complied. A wall-clock window could expire before it was ever delivered.
 """
 
 from __future__ import annotations
@@ -167,6 +172,38 @@ async def test_pending_clear_suppresses_the_stale_heartbeat_report(
 
 
 @pytest.mark.asyncio
+async def test_pending_clear_does_not_swallow_a_retrys_progress(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Clear-then-retry is the normal recovery gesture. Suppression is
+    scoped to the dismissed ``failed`` report, so an upgrade started right
+    after the clear still reports its progress."""
+    appliance, token = await _heartbeat_ready(db_session)
+    appliance.clear_upgrade_requested = True
+    appliance.clear_upgrade_requested_at = datetime.now(UTC)
+    appliance.last_upgrade_state = None
+    await db_session.commit()
+
+    resp = await client.post(
+        "/api/v1/appliance/supervisor/heartbeat",
+        json={
+            "appliance_id": str(appliance.id),
+            "session_token": token,
+            "last_upgrade_state": "in-flight",
+            "last_upgrade_progress": {"step": "downloading", "pct": 12},
+        },
+    )
+    assert resp.status_code == 200, resp.text
+
+    refreshed = (
+        await db_session.execute(select(Appliance).where(Appliance.id == appliance.id))
+    ).scalar_one()
+    await db_session.refresh(refreshed)
+    assert refreshed.last_upgrade_state == "in-flight"
+    assert refreshed.last_upgrade_progress == {"step": "downloading", "pct": 12}
+
+
+@pytest.mark.asyncio
 async def test_heartbeat_ingests_normally_once_no_clear_is_pending(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
@@ -225,19 +262,23 @@ async def test_expiring_clear_is_delivered_immediately_not_long_polled(
 
 
 @pytest.mark.asyncio
-async def test_clear_flag_auto_clears_after_the_grace_window(
+async def test_clear_is_retired_by_the_hosts_acknowledgement(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    """Same fire-once shape as ``reboot_requested``: the flag must not stick
-    around re-running a no-op reset on every later heartbeat."""
+    """A non-``failed`` report is the ack — that is precisely what a
+    successful host reset produces — and it retires the command."""
     appliance, token = await _heartbeat_ready(db_session)
     appliance.clear_upgrade_requested = True
-    appliance.clear_upgrade_requested_at = datetime.now(UTC) - timedelta(seconds=16)
+    appliance.clear_upgrade_requested_at = datetime.now(UTC)
     await db_session.commit()
 
     resp = await client.post(
         "/api/v1/appliance/supervisor/heartbeat",
-        json={"appliance_id": str(appliance.id), "session_token": token},
+        json={
+            "appliance_id": str(appliance.id),
+            "session_token": token,
+            "last_upgrade_state": "ready",
+        },
     )
     assert resp.status_code == 200, resp.text
 
@@ -247,3 +288,70 @@ async def test_clear_flag_auto_clears_after_the_grace_window(
     await db_session.refresh(refreshed)
     assert refreshed.clear_upgrade_requested is False
     assert refreshed.clear_upgrade_requested_at is None
+    # …and the ack itself is ingested, not swallowed: blanket suppression
+    # used to drop the host's post-reset ``ready`` and leave the chip blank.
+    assert refreshed.last_upgrade_state == "ready"
+
+
+@pytest.mark.asyncio
+async def test_clear_keeps_riding_until_the_host_complies(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The failure this replaces: a stopwatch could retire the command
+    before a slow, restarting or offline supervisor ever received it. An
+    unacknowledged clear must still be pending, and still be delivered."""
+    appliance, token = await _heartbeat_ready(db_session)
+    appliance.clear_upgrade_requested = True
+    appliance.clear_upgrade_requested_at = datetime.now(UTC) - timedelta(minutes=2)
+    # The endpoint nulls these; start from that state so the assertion
+    # below proves suppression rather than re-reading the seed.
+    appliance.last_upgrade_state = None
+    appliance.last_upgrade_progress = None
+    await db_session.commit()
+
+    resp = await client.post(
+        "/api/v1/appliance/supervisor/heartbeat",
+        json={
+            "appliance_id": str(appliance.id),
+            "session_token": token,
+            "last_upgrade_state": "failed",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["clear_upgrade_requested"] is True
+
+    refreshed = (
+        await db_session.execute(select(Appliance).where(Appliance.id == appliance.id))
+    ).scalar_one()
+    await db_session.refresh(refreshed)
+    assert refreshed.clear_upgrade_requested is True, "still unacknowledged"
+    assert refreshed.last_upgrade_state is None, "the stale failure stays suppressed"
+
+
+@pytest.mark.asyncio
+async def test_clear_gives_up_on_a_host_that_can_never_comply(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Backstop: a host that cannot unlink a trigger it does not own would
+    otherwise pin the flag on forever, permanently suppressing this
+    appliance's heartbeat long-poll."""
+    appliance, token = await _heartbeat_ready(db_session)
+    appliance.clear_upgrade_requested = True
+    appliance.clear_upgrade_requested_at = datetime.now(UTC) - timedelta(minutes=11)
+    await db_session.commit()
+
+    resp = await client.post(
+        "/api/v1/appliance/supervisor/heartbeat",
+        json={
+            "appliance_id": str(appliance.id),
+            "session_token": token,
+            "last_upgrade_state": "failed",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+
+    refreshed = (
+        await db_session.execute(select(Appliance).where(Appliance.id == appliance.id))
+    ).scalar_one()
+    await db_session.refresh(refreshed)
+    assert refreshed.clear_upgrade_requested is False
