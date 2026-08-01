@@ -273,15 +273,19 @@ def _blocker_block(item: CutoverItem) -> list[str]:
     if has_block:
         out += [
             "",
-            "The `BLOCK` entries above are refused by the API and cannot be forced. "
-            "Clear them before the window; `force` only acknowledges warnings.",
+            (
+                "The `BLOCK` entries above are refused by the API and cannot be forced. "
+                "Clear them before the window; `force` only acknowledges warnings."
+            ),
         ]
     else:
         out += [
             "",
-            "Warnings do not stop the cutover, but the API asks you to acknowledge "
-            "them with `force`. Read each one first — that is the entire point of "
-            "making you pass the flag.",
+            (
+                "Warnings do not stop the cutover, but the API asks you to acknowledge "
+                "them with `force`. Read each one first — that is the entire point of "
+                "making you pass the flag."
+            ),
         ]
     out.append("")
     return out
@@ -290,8 +294,10 @@ def _blocker_block(item: CutoverItem) -> list[str]:
 def _parity_block(facts: dict[str, Any] | None) -> list[str]:
     if facts is None:
         return [
-            "**Parity** — never checked. Run the parity check before the window; a "
-            "cutover from an unverified copy is a guess.",
+            (
+                "**Parity** — never checked. Run the parity check before the window; a "
+                "cutover from an unverified copy is a guess."
+            ),
             "",
         ]
     status = facts.get("status")
@@ -312,8 +318,10 @@ def _parity_block(facts: dict[str, Any] | None) -> list[str]:
     if detail:
         out += [f"Breakdown: {detail}.", ""]
     out += [
-        "Reconcile these before cutting over, or accept them explicitly — each one is "
-        "an answer that changes the moment traffic moves.",
+        (
+            "Reconcile these before cutting over, or accept them explicitly — each one is "
+            "an answer that changes the moment traffic moves."
+        ),
         "",
     ]
     return out
@@ -438,19 +446,27 @@ def _dns_section(
         )
     out += [
         step5,
-        "6. Run the shadow comparison and confirm the managed servers answer identically "
-        "to Windows for real production query names.",
+        (
+            "6. Run the shadow comparison and confirm the managed servers answer identically "
+            "to Windows for real production query names."
+        ),
         "",
         "#### The switch",
         "",
-        "SpatiumDDI owns no server-side switch for DNS — the switch is the delegation "
-        "or forwarder change, and it lives on the parent zone or on the resolvers.",
+        (
+            "SpatiumDDI owns no server-side switch for DNS — the switch is the delegation "
+            "or forwarder change, and it lives on the parent zone or on the resolvers."
+        ),
         "",
-        "1. Point the delegation (parent-zone NS records) or the resolver forwarders at "
-        "the SpatiumDDI servers for this zone.",
-        "2. Record the transition in SpatiumDDI (the item's **Cut over** action). It "
-        "stamps the item, writes the audit + timeline rows, and refuses if any blocking "
-        "readiness issue is still present.",
+        (
+            "1. Point the delegation (parent-zone NS records) or the resolver forwarders at "
+            "the SpatiumDDI servers for this zone."
+        ),
+        (
+            "2. Record the transition in SpatiumDDI (the item's **Cut over** action). It "
+            "stamps the item, writes the audit + timeline rows, and refuses if any blocking "
+            "readiness issue is still present."
+        ),
         "3. Verify from a client subnet, not just from the DNS host:",
         "",
         "```bash",
@@ -507,14 +523,20 @@ def _dhcp_section(
     handover = item.lease_handover if isinstance(item.lease_handover, dict) else None
     out += ["#### Pre-flight", ""]
     out += [
-        "1. Confirm parity (above): pools, exclusions, reservations, lease time and "
-        "options must all match before any client is asked to renew against Kea.",
-        "2. Confirm the managed scope is still **inactive**. During the parallel run the "
-        "SpatiumDDI scope must be structurally unreachable — two DHCP servers answering "
-        "on one broadcast domain is a coin flip, not a migration.",
-        "3. Run the **lease handover**. It turns every live Windows lease into a "
-        "reservation on the managed scope, so a client renewing against Kea gets back the "
-        "address it already holds instead of a fresh one from an empty pool.",
+        (
+            "1. Confirm parity (above): pools, exclusions, reservations, lease time and "
+            "options must all match before any client is asked to renew against Kea."
+        ),
+        (
+            "2. Confirm the managed scope is still **inactive**. During the parallel run the "
+            "SpatiumDDI scope must be structurally unreachable — two DHCP servers answering "
+            "on one broadcast domain is a coin flip, not a migration."
+        ),
+        (
+            "3. Run the **lease handover**. It turns every live Windows lease into a "
+            "reservation on the managed scope, so a client renewing against Kea gets back the "
+            "address it already holds instead of a fresh one from an empty pool."
+        ),
         "",
     ]
     if handover:
@@ -537,14 +559,18 @@ def _dhcp_section(
         f"1. Deactivate the scope on the Windows server (`{host}`).",
         "2. Activate the managed scope and wake the DHCP agents.",
         "",
-        "The order is the whole point — the old server stops answering before the new one "
-        "starts, so the two never race. If step 2 fails, step 1 is reversed automatically.",
+        (
+            "The order is the whole point — the old server stops answering before the new one "
+            "starts, so the two never race. If step 2 fails, step 1 is reversed automatically."
+        ),
         "",
     ]
     out += _ps_scope_state(host, scope, active=False)
     out += [
-        "Verify by watching a real client renew (`ipconfig /renew`, or `dhclient -v`), and "
-        "confirm the offered address matches the reservation carried over in pre-flight.",
+        (
+            "Verify by watching a real client renew (`ipconfig /renew`, or `dhclient -v`), and "
+            "confirm the offered address matches the reservation carried over in pre-flight."
+        ),
         "",
         "#### Rollback",
         "",
@@ -570,8 +596,10 @@ def _decommission_section(dns_host: str, dhcp_host: str, *, has_dhcp: bool) -> l
     out = [
         "## After the window — decommission",
         "",
-        "Work the plan's decommission checklist in the UI; it tracks the ticks and notes "
-        "per plan. Two steps are worth having the exact command for.",
+        (
+            "Work the plan's decommission checklist in the UI; it tracks the ticks and notes "
+            "per plan. Two steps are worth having the exact command for."
+        ),
         "",
         "### Deauthorize the Windows DHCP server in AD",
         "",
@@ -587,8 +615,10 @@ def _decommission_section(dns_host: str, dhcp_host: str, *, has_dhcp: bool) -> l
         "# Stop and disable rather than uninstall — the role, its zone data and its",
         "# scope database stay on disk, which is what makes a late rollback possible.",
         "Stop-Service -Name DNS -Force ; Set-Service -Name DNS -StartupType Disabled",
-        "Stop-Service -Name DHCPServer -Force ; Set-Service -Name DHCPServer "
-        "-StartupType Disabled",
+        (
+            "Stop-Service -Name DHCPServer -Force ; Set-Service -Name DHCPServer "
+            "-StartupType Disabled"
+        ),
         "```",
         "",
         f"Run those on `{dns_host}` / `{dhcp_host}` respectively. Do not uninstall the "
@@ -638,9 +668,11 @@ def render_runbook(
 
     if not ordered:
         lines += [
-            "This plan has no items yet. Run **Discover** against the source Windows "
-            "servers and add the zones / scopes you intend to migrate, then regenerate "
-            "this runbook.",
+            (
+                "This plan has no items yet. Run **Discover** against the source Windows "
+                "servers and add the zones / scopes you intend to migrate, then regenerate "
+                "this runbook."
+            ),
             "",
         ]
         return "\n".join(lines).rstrip() + "\n"

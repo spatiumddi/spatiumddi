@@ -127,16 +127,38 @@ def _server_label(server: DNSServer) -> str:
     return f"{server.name} ({server.host})"
 
 
-def normalise_answers(rendered: Iterable[str]) -> list[str]:
-    """Canonical form for comparing two answer sets.
+#: Types whose RDATA is entirely case- and trailing-dot-insensitive, so folding
+#: both is safe. These are the name-valued types (DNS names compare
+#: case-insensitively per RFC 4343, and implementations disagree about rendering
+#: the root dot on a target) plus the address types, where hex case in an IPv6
+#: literal carries no meaning.
+#:
+#: Everything NOT listed here is compared verbatim. TXT is the one that matters:
+#: DKIM public keys, `google-site-verification=` tokens and the like are
+#: case-sensitive payloads, and folding them would let the shadow run report a
+#: "match" between two records a resolver would treat as different. CAA tags,
+#: NAPTR flags and regexps are case-bearing for the same reason.
+_CASE_FOLDED_QTYPES: frozenset[str] = frozenset(
+    {"A", "AAAA", "CNAME", "NS", "PTR", "MX", "SRV", "SOA"}
+)
 
-    Sorted, de-duplicated, lower-cased, trailing dot removed. RRset order is
-    not meaningful on the wire (and round-robin makes it actively unstable), so
-    comparing sorted sets is the only comparison that does not produce false
-    mismatches. The trailing dot is stripped because implementations disagree
-    about whether to render it on a CNAME/MX/NS/SRV target.
+
+def normalise_answers(rendered: Iterable[str], qtype: str) -> list[str]:
+    """Canonical form for comparing two answer sets of type ``qtype``.
+
+    Always sorted and de-duplicated: RRset order is not meaningful on the wire
+    (and round-robin makes it actively unstable), so comparing sorted sets is
+    the only comparison that does not produce false mismatches.
+
+    Case and the trailing dot are folded **only** for the types in
+    :data:`_CASE_FOLDED_QTYPES`. For anything else the RDATA is compared as the
+    server rendered it — see that constant for why folding a TXT record would be
+    a correctness bug rather than a convenience.
     """
-    return sorted({r.strip().rstrip(".").lower() for r in rendered if r.strip()})
+    values = (r.strip() for r in rendered)
+    if qtype.strip().upper() in _CASE_FOLDED_QTYPES:
+        return sorted({v.rstrip(".").lower() for v in values if v})
+    return sorted({v for v in values if v})
 
 
 async def _resolve_to_ip(host: str, port: int, *, what: str) -> str:
@@ -178,7 +200,7 @@ async def _query(ip: str, qname: str, qtype: str, timeout: float) -> _QueryOutco
         return _QueryOutcome(error=f"network error: {exc}")
 
     rendered = [str(rr) for rr in answer] if answer.rrset else []
-    return _QueryOutcome(answers=normalise_answers(rendered))
+    return _QueryOutcome(answers=normalise_answers(rendered, qtype))
 
 
 async def _sample_from_query_log(

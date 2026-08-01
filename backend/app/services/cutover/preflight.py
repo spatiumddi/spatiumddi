@@ -126,7 +126,7 @@ async def _assert_target_is_not_the_source(db: AsyncSession, zone: DNSZone) -> N
     )
 
 
-def _ttl_ops(records: list[DNSRecord]) -> list[dict[str, Any]]:
+def _ttl_ops(records: list[DNSRecord], zone: DNSZone) -> list[dict[str, Any]]:
     """Build the record-op batch for a TTL rewrite, RRset-aware.
 
     The BIND9 agent turns a ``create`` / ``update`` op into an RFC 2136
@@ -142,6 +142,13 @@ def _ttl_ops(records: list[DNSRecord]) -> list[dict[str, Any]]:
     ``rrset_action="add"`` to append onto it. The result is one RRset with every
     original value at the new TTL. Groups of one are unchanged, so the common
     case emits exactly what it did before.
+
+    A ``None`` TTL is resolved to ``zone.ttl`` **on the wire**. The row keeps its
+    NULL — that is how "inherit the zone default" is stored, and the restore path
+    depends on it — but the agent's record-op branch falls back to a hardcoded
+    3600 rather than the zone's own default, so shipping the null would silently
+    write 3600 onto every inheriting record of a zone whose default is anything
+    else. Resolving here keeps the wire honest without touching the row.
     """
     grouped: dict[tuple[str, str], list[DNSRecord]] = {}
     for rec in records:
@@ -151,6 +158,8 @@ def _ttl_ops(records: list[DNSRecord]) -> list[dict[str, Any]]:
     for group in grouped.values():
         for index, rec in enumerate(group):
             payload = record_op_payload(rec)
+            if payload.get("ttl") is None:
+                payload["ttl"] = zone.ttl
             if index:
                 payload["rrset_action"] = "add"
             ops.append({"op": "update", "record": payload})
@@ -374,7 +383,7 @@ async def apply_ttl_preflight(
         # secondary transfer the zone N times for a single logical change.
         target_serial = bump_zone_serial(zone)
         if changed:
-            ops = _ttl_ops(changed)
+            ops = _ttl_ops(changed, zone)
             for op in ops:
                 op["target_serial"] = target_serial
             await enqueue_record_ops_batch(db, zone, ops)
@@ -449,7 +458,7 @@ async def restore_ttl_preflight(
     if restored or zone_changed:
         target_serial = bump_zone_serial(zone)
         if restored:
-            ops = _ttl_ops(restored)
+            ops = _ttl_ops(restored, zone)
             for op in ops:
                 op["target_serial"] = target_serial
             await enqueue_record_ops_batch(db, zone, ops)

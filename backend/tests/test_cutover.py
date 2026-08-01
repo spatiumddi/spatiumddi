@@ -1174,3 +1174,87 @@ async def test_ttl_preflight_does_not_collapse_a_multi_value_rrset(
     # A single-value RRset is emitted exactly as before.
     assert len(solo_ops) == 1
     assert "rrset_action" not in solo_ops[0]["record"]
+
+
+# =========================================================================== #
+# 8. Regressions from the PR #775 review.
+# =========================================================================== #
+
+
+def test_shadow_does_not_case_fold_txt_rdata() -> None:
+    """Folding case on a TXT record would report a match between two values a
+    resolver treats as different — DKIM keys and verification tokens are
+    case-bearing payloads, not names."""
+    from app.services.cutover import shadow as shadow_mod
+
+    lower = shadow_mod.normalise_answers(['"google-site-verification=abc123"'], "TXT")
+    upper = shadow_mod.normalise_answers(['"google-site-verification=AbC123"'], "TXT")
+    assert lower != upper, "TXT rdata must be compared verbatim"
+
+    # Name-valued and address types still fold, so a rendering difference in
+    # case or the root dot is not reported as drift.
+    assert shadow_mod.normalise_answers(["Mail.Example.COM."], "CNAME") == (
+        shadow_mod.normalise_answers(["mail.example.com"], "CNAME")
+    )
+    assert shadow_mod.normalise_answers(["2001:DB8::1"], "AAAA") == (
+        shadow_mod.normalise_answers(["2001:db8::1"], "AAAA")
+    )
+    # Order is never meaningful.
+    assert shadow_mod.normalise_answers(["10.0.0.2", "10.0.0.1"], "A") == ["10.0.0.1", "10.0.0.2"]
+
+
+async def test_ttl_restore_sends_the_zone_default_for_inheriting_records(
+    db_session: AsyncSession,
+) -> None:
+    """A record whose TTL is NULL inherits ``zone.ttl``. The BIND9 agent's
+    record-op branch falls back to a hardcoded 3600 rather than the zone's own
+    default, so shipping the null would write 3600 onto every inheriting record
+    of a zone whose default is anything else. The row must stay NULL; the wire
+    must carry the resolved value."""
+    user = await _user(db_session)
+    group, source, _managed, zone = await _dns_side(db_session)
+    zone.ttl = 7200  # deliberately NOT the agent's 3600 fallback
+    zone.minimum = 7200
+    inherited = DNSRecord(zone_id=zone.id, name="app", record_type="A", value="10.0.0.1", ttl=None)
+    db_session.add(inherited)
+    _plan, item = await _plan_with_item(
+        db_session,
+        kind="dns_zone",
+        source_ref="corp.example",
+        user=user,
+        source_dns=source,
+        dns_group_id=group.id,
+        zone=zone,
+    )
+    await db_session.commit()
+
+    captured: list[list[dict[str, Any]]] = []
+
+    async def _capture(db: Any, z: Any, ops: list[dict[str, Any]]) -> list[Any]:
+        captured.append(ops)
+        return [None] * len(ops)
+
+    import pytest as _pytest
+
+    monkeypatch = _pytest.MonkeyPatch()
+    monkeypatch.setattr(preflight_mod, "enqueue_record_ops_batch", _capture)
+    try:
+        await preflight_mod.apply_ttl_preflight(
+            db_session, zone=zone, item=item, target_ttl=300, current_user=user
+        )
+        await db_session.commit()
+        assert inherited.ttl == 300
+
+        await preflight_mod.restore_ttl_preflight(
+            db_session, zone=zone, item=item, current_user=user
+        )
+        await db_session.commit()
+    finally:
+        monkeypatch.undo()
+
+    # The row is back to NULL, so inheritance is preserved...
+    assert inherited.ttl is None
+    assert zone.ttl == 7200
+    # ...and the wire carries the zone's own default, not the agent's 3600.
+    restore_ops = captured[-1]
+    assert [o["record"]["ttl"] for o in restore_ops] == [7200]
