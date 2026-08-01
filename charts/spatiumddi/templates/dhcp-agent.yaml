@@ -66,7 +66,11 @@ spec:
           imagePullPolicy: {{ $root.Values.dhcpAgents.image.pullPolicy }}
           env:
             - name: SPATIUM_API_URL
-              value: "http://{{ include "spatiumddi.fullname" $root }}-api.{{ $root.Release.Namespace }}.svc.cluster.local:{{ $root.Values.api.service.port }}"
+              # Trailing dot on the Service name: the pod inherits the node's
+              # DHCP search domains, and under ndots:5 a NODATA-answering
+              # inherited zone aborts the resolver's search walk before the
+              # bare name is ever tried (#777). Absolute skips the list.
+              value: "http://{{ include "spatiumddi.fullname" $root }}-api.{{ $root.Release.Namespace }}.svc.cluster.local.:{{ $root.Values.api.service.port }}"
             - name: SPATIUM_SERVER_NAME
               valueFrom:
                 fieldRef:

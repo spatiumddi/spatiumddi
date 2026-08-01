@@ -114,7 +114,15 @@ def _self_bootstrap_or_skip(
     # Hardcoded here so the supervisor doesn't need an extra env var
     # for the discovery URL — multi-node HA (#272 later phases) can
     # generalise this when we add real promotion-flow plumbing.
-    api_url = "http://spatium-control-spatiumddi-api.spatium.svc.cluster.local:8000"
+    # Trailing dot is load-bearing (#777). Without it the name has 4 dots, which
+    # is under the pod's ``ndots:5``, so the resolver walks its search list first —
+    # and kubelet appends the NODE's own DHCP search domain to every pod's list. If
+    # that domain's zone answers NOERROR/NODATA (rather than NXDOMAIN) for a
+    # nonexistent name — Cloudflare-hosted zones do, among others — musl stops the
+    # walk there and returns EAI_NODATA without ever trying the bare name. The
+    # supervisor then never registers, on a network it has no control over. The dot
+    # makes the name absolute and skips the search list entirely.
+    api_url = "http://spatium-control-spatiumddi-api.spatium.svc.cluster.local.:8000"
     log.info("supervisor.self_bootstrap.attempting", variant=variant, api_url=api_url)
     try:
         with httpx.Client(timeout=10.0) as client:
