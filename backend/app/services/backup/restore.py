@@ -47,7 +47,12 @@ from app.services.backup.migrations import (
     maybe_upgrade_after_restore,
     schema_direction_error,
 )
-from app.services.backup.rewrap import RewrapOutcome, rewrap_secrets
+from app.services.backup.rewrap import (
+    ENCRYPTED_COLUMNS,
+    JSONB_ENCRYPTED_FIELDS,
+    RewrapOutcome,
+    rewrap_secrets,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -590,8 +595,16 @@ async def apply_backup_restore(
         # the data is in. Log loudly + surface in the response so
         # the operator knows to apply the recovered SECRET_KEY
         # manually.
+        #
+        # ``rewrap_secrets`` now absorbs walk failures itself and returns
+        # a partial outcome with ``aborted=True``, precisely so the
+        # counters survive; this branch is the backstop for something
+        # raised before it could (a bad key pair, say). A fresh
+        # ``RewrapOutcome()`` is honest HERE — nothing was walked — but it
+        # was NOT honest when it also swallowed a mid-walk abort (#781).
         logger.error("backup_restore_rewrap_failed", error=str(exc))
         rewrap_outcome = RewrapOutcome()
+        rewrap_outcome.aborted = True
         rewrap_outcome.failures.append({"reason": f"rewrap-aborted: {exc}"})
 
     # Phase 4d (issue #127): scan the restored DB for PowerDNS
@@ -602,6 +615,22 @@ async def apply_backup_restore(
     except Exception as exc:  # noqa: BLE001
         logger.warning("backup_restore_warning_scan_failed", error=str(exc))
         post_warnings = []
+
+    # A half-migrated credential store is the one restore outcome an
+    # operator must act on immediately, so it rides the same amber
+    # warnings channel the DNSSEC-republish advisory uses rather than
+    # sitting in a counter nobody reads (#781).
+    if rewrap_outcome.aborted:
+        total = len(ENCRYPTED_COLUMNS) + len(JSONB_ENCRYPTED_FIELDS)
+        post_warnings.append(
+            "Secret rewrap stopped part-way through: "
+            f"{rewrap_outcome.columns_visited} of {total} encrypted columns were "
+            f"visited and {rewrap_outcome.rewrapped_rows} row(s) were re-encrypted "
+            "under this install's key. The remaining columns are still encrypted "
+            "with the SOURCE install's key and will fail to decrypt. Recover the "
+            "source key from the archive's secrets.enc and re-run the restore, or "
+            "the affected credentials must be re-entered by hand."
+        )
 
     duration_ms = int((datetime.now(UTC) - started).total_seconds() * 1000)
     logger.info(
@@ -619,6 +648,7 @@ async def apply_backup_restore(
         rewrap_jsonb=rewrap_outcome.rewrapped_jsonb_fields,
         rewrap_idempotent=rewrap_outcome.skipped_idempotent_rows,
         rewrap_failed=rewrap_outcome.failed_rows,
+        rewrap_aborted=rewrap_outcome.aborted,
         warning_count=len(post_warnings),
     )
     return RestoreOutcome(

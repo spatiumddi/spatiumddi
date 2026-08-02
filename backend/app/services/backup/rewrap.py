@@ -195,6 +195,11 @@ class RewrapOutcome:
     rewrapped_jsonb_fields: int = 0
     columns_visited: int = 0
     failures: list[dict[str, Any]] = field(default_factory=list)
+    # True when the walk stopped early. The counters above then describe
+    # what DID get rewrapped before the abort — the credential store is
+    # half-migrated, which is materially different from "nothing happened"
+    # and is the state the operator has to act on (#781).
+    aborted: bool = False
 
 
 def _fernet_from_keys(secret_key: str, credential_encryption_key: str) -> Fernet:
@@ -345,7 +350,23 @@ async def rewrap_secrets(
     # the dialect suffix.
     pg_url = db_url.replace("postgresql+asyncpg://", "postgresql://", 1)
 
-    conn = await asyncpg.connect(dsn=pg_url)
+    # Every per-column rewrap commits on its own, so an abort part-way
+    # through leaves the credential store HALF-migrated: the columns
+    # already walked are under the destination key, the rest are still
+    # under the source key. Returning the partial outcome rather than
+    # raising is what makes that state reportable — the caller used to
+    # discard the accumulated counters and substitute a fresh
+    # ``RewrapOutcome()``, so the audit row claimed ``rewrapped_rows=0``
+    # on a database where dozens of columns had in fact been rewrapped
+    # (#781). ``aborted=True`` plus real counters is the honest answer.
+    try:
+        conn = await asyncpg.connect(dsn=pg_url)
+    except Exception as exc:  # noqa: BLE001
+        outcome.aborted = True
+        outcome.failures.append({"reason": f"rewrap-aborted: connect failed: {exc}"})
+        logger.error("backup_rewrap_connect_failed", error=str(exc))
+        return outcome
+
     try:
         for table, pk_col, enc_col in ENCRYPTED_COLUMNS:
             outcome.columns_visited += 1
@@ -371,6 +392,21 @@ async def rewrap_secrets(
                 dest=dest_fernet,
                 outcome=outcome,
             )
+    except Exception as exc:  # noqa: BLE001
+        outcome.aborted = True
+        outcome.failures.append(
+            {
+                "reason": f"rewrap-aborted: {exc}",
+                "columns_visited": outcome.columns_visited,
+                "columns_total": len(ENCRYPTED_COLUMNS) + len(JSONB_ENCRYPTED_FIELDS),
+            }
+        )
+        logger.error(
+            "backup_rewrap_aborted",
+            error=str(exc),
+            columns_visited=outcome.columns_visited,
+            rewrapped_rows=outcome.rewrapped_rows,
+        )
     finally:
         await conn.close()
 

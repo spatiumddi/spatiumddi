@@ -356,12 +356,48 @@ async def _seed_builtin_roles() -> None:
             logger.debug("builtin_roles_seed_skipped", reason=str(exc))
 
 
+def _log_backup_section_catalog_gap() -> None:
+    """Report tables the selective-restore section catalog doesn't classify.
+
+    ``assert_catalog_covers_models`` was written to run here and never wired
+    up, so the catalog silently fell behind the models — a table nobody
+    classified can't be chosen for a selective restore, and (worse) it can be
+    cascade-truncated by one that is. ``tests/test_rewrap_coverage.py`` keeps
+    the gap from *growing*; this makes the current gap visible to an operator
+    reading the logs rather than only to someone running the suite (#781).
+
+    Synchronous + non-fatal on purpose: it reads mapped metadata only, touches
+    no database, and must never be able to keep the api from starting.
+    """
+    try:
+        from app.models.base import Base  # noqa: PLC0415
+        from app.services.backup.sections import (  # noqa: PLC0415
+            assert_catalog_covers_models,
+        )
+
+        missing = assert_catalog_covers_models({t.name for t in Base.metadata.sorted_tables})
+        if missing:
+            logger.warning(
+                "backup_section_catalog_incomplete",
+                missing_count=len(missing),
+                missing=missing,
+                impact=(
+                    "these tables cannot be selected for a selective restore, and are "
+                    "cascade-truncated without being repopulated when a section they "
+                    "reference is restored"
+                ),
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("backup_section_catalog_check_skipped", reason=str(exc))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     configure_logging()
     logger.info("startup", service="api", version="0.1.0", debug=settings.debug)
     await _seed_default_admin()
     await _seed_builtin_roles()
+    _log_backup_section_catalog_gap()
     # Standard / well-known BGP communities (RFC 1997 / 7611 / 7999).
     # Idempotent; failure-tolerant.
     try:

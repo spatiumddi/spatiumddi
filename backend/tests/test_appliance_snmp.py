@@ -221,3 +221,145 @@ def test_disabled_master_toggle_renders_no_config() -> None:
 
     bundle = snmp_bundle(s)
     assert bundle["snmpd_conf"] == ""
+
+
+# ── Undecryptable v3 passphrases must not downgrade the user ─────────
+#
+# #781 flagged this as an unverified claim while reviewing the secret
+# rewrap; it is real. ``_decrypt_v3_pass`` returns ``None`` for both
+# "absent" and "undecryptable", and the renderer's level ladder gated on
+# ``auth_proto != "none" and auth_pass``. A user configured for authPriv
+# whose passphrase could not be decrypted therefore fell all the way
+# through to ``rouser <name> noauth`` — an unauthenticated read-only
+# SNMPv3 user reachable by anyone the firewall lets in.
+#
+# That is a silent security downgrade, and strictly worse than an
+# outage: nothing fails, so nobody looks. The trigger is any key
+# mismatch — a rotated SECRET_KEY, or a cross-install restore whose
+# rewrap did not cover these JSONB-embedded fields (which it did not,
+# before #796).
+
+
+def _undecryptable() -> str:
+    """A syntactically valid Fernet token this install cannot decrypt.
+
+    Encrypted under a different key, so ``decrypt_str`` raises
+    ``InvalidToken`` exactly as it would after a key rotation — rather
+    than raising some other error a garbage string would produce.
+    """
+    import base64
+    import os
+
+    from cryptography.fernet import Fernet
+
+    other = Fernet(base64.urlsafe_b64encode(os.urandom(32)))
+    return other.encrypt(b"the-real-passphrase").decode("ascii")
+
+
+def test_v3_user_with_undecryptable_auth_pass_is_omitted_not_downgraded() -> None:
+    s = _bare_settings()
+    s.snmp_enabled = True
+    s.snmp_version = "v3"
+    s.snmp_v3_users = [
+        {
+            "username": "authpriv_user",
+            "auth_protocol": "SHA",
+            "auth_pass_enc": _undecryptable(),
+            "priv_protocol": "AES",
+            "priv_pass_enc": encrypt_str("priv-pass").decode("ascii"),
+        }
+    ]
+
+    text = render_snmpd_conf(s)
+
+    # The critical assertion: the user is NOT published unauthenticated.
+    assert "rouser authpriv_user noauth" not in text
+    # ...and not published at all.
+    assert "createUser authpriv_user" not in text
+    assert "rouser authpriv_user" not in text
+    # The config says why, so an operator reading snmpd.conf isn't left
+    # wondering where their user went.
+    assert "OMITTED" in text
+    assert "authpriv_user" in text
+
+
+def test_v3_user_with_undecryptable_priv_pass_is_omitted_not_left_unencrypted() -> None:
+    """One rung down the ladder: auth decrypts, privacy doesn't.
+
+    Publishing at ``auth`` would authenticate the poller but leave every
+    response in cleartext on the wire — not what an operator who
+    configured authPriv asked for.
+    """
+    s = _bare_settings()
+    s.snmp_enabled = True
+    s.snmp_version = "v3"
+    s.snmp_v3_users = [
+        {
+            "username": "halfbroken_user",
+            "auth_protocol": "SHA",
+            "auth_pass_enc": encrypt_str("auth-pass").decode("ascii"),
+            "priv_protocol": "AES",
+            "priv_pass_enc": _undecryptable(),
+        }
+    ]
+
+    text = render_snmpd_conf(s)
+
+    assert "rouser halfbroken_user auth" not in text
+    assert "rouser halfbroken_user noauth" not in text
+    assert "createUser halfbroken_user" not in text
+    assert "OMITTED" in text
+
+
+def test_a_deliberate_noauth_user_still_renders() -> None:
+    """The guard keys off ``auth_protocol``, not off a missing passphrase.
+
+    An operator who genuinely configured noAuthNoPriv has no passphrase
+    to decrypt, and must not be caught by the new check.
+    """
+    s = _bare_settings()
+    s.snmp_enabled = True
+    s.snmp_version = "v3"
+    s.snmp_v3_users = [
+        {
+            "username": "intentional_noauth",
+            "auth_protocol": "none",
+            "auth_pass_enc": None,
+            "priv_protocol": "none",
+            "priv_pass_enc": None,
+        }
+    ]
+
+    text = render_snmpd_conf(s)
+
+    assert "createUser intentional_noauth" in text
+    assert "rouser intentional_noauth noauth .1" in text
+    assert "OMITTED" not in text
+
+
+def test_a_broken_user_does_not_suppress_a_healthy_one() -> None:
+    s = _bare_settings()
+    s.snmp_enabled = True
+    s.snmp_version = "v3"
+    s.snmp_v3_users = [
+        {
+            "username": "broken_user",
+            "auth_protocol": "SHA",
+            "auth_pass_enc": _undecryptable(),
+            "priv_protocol": "none",
+            "priv_pass_enc": None,
+        },
+        {
+            "username": "healthy_user",
+            "auth_protocol": "SHA",
+            "auth_pass_enc": encrypt_str("good-pass").decode("ascii"),
+            "priv_protocol": "none",
+            "priv_pass_enc": None,
+        },
+    ]
+
+    text = render_snmpd_conf(s)
+
+    assert "rouser broken_user" not in text
+    assert 'createUser healthy_user SHA "good-pass"' in text
+    assert "rouser healthy_user auth .1" in text

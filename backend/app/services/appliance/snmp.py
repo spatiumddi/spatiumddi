@@ -38,8 +38,12 @@ from __future__ import annotations
 import hashlib
 from typing import Any
 
+import structlog
+
 from app.core.crypto import decrypt_str
 from app.models.settings import PlatformSettings
+
+logger = structlog.get_logger(__name__)
 
 # The first cut emits IPv4 + IPv6 listeners on the standard SNMP UDP
 # port. Operators who want to bind to a specific interface can
@@ -158,6 +162,29 @@ def _render_v3(settings: PlatformSettings, sources: list[str]) -> list[str]:
         auth_pass = _decrypt_v3_pass(u.get("auth_pass_enc"))
         priv_pass = _decrypt_v3_pass(u.get("priv_pass_enc"))
 
+        # A user configured WITH an auth protocol whose passphrase we
+        # cannot decrypt must not be emitted. Falling through to the
+        # ``noauth`` branch below would publish an unauthenticated
+        # read-only SNMPv3 user reachable by anyone the firewall lets in
+        # — a silent security downgrade rather than the outage an
+        # operator would notice. ``_decrypt_v3_pass`` returns None for
+        # both "absent" and "undecryptable", and the latter is exactly
+        # what a key rotation or a half-finished cross-install restore
+        # produces (#781). Skip the user and say so in the config.
+        if auth_proto != "none" and not auth_pass:
+            logger.error(
+                "snmp_v3_user_skipped_undecryptable_auth_pass",
+                username=username,
+                auth_protocol=auth_proto,
+            )
+            out.append(
+                f"# SNMPv3 user {username!r} OMITTED — its {auth_proto} passphrase "
+                "could not be decrypted (wrong key, or a restore that did not "
+                "rewrap it). Re-enter the passphrase; the user is NOT published "
+                "unauthenticated."
+            )
+            continue
+
         # Build the createUser line. Each arg is required-or-not
         # based on the security level the user expects.
         create_parts: list[str] = ["createUser", username]
@@ -165,6 +192,21 @@ def _render_v3(settings: PlatformSettings, sources: list[str]) -> list[str]:
         if auth_proto != "none" and auth_pass:
             create_parts.extend([auth_proto, _quote(auth_pass)])
             access_level = "auth"
+            # Same reasoning one level down: a user asking for authPriv
+            # whose privacy passphrase won't decrypt gets published at
+            # ``auth`` — authenticated but UNENCRYPTED on the wire.
+            if priv_proto != "none" and not priv_pass:
+                logger.error(
+                    "snmp_v3_user_skipped_undecryptable_priv_pass",
+                    username=username,
+                    priv_protocol=priv_proto,
+                )
+                out.append(
+                    f"# SNMPv3 user {username!r} OMITTED — its {priv_proto} privacy "
+                    "passphrase could not be decrypted. Re-enter it; the user is "
+                    "NOT published without encryption."
+                )
+                continue
             if priv_proto != "none" and priv_pass:
                 create_parts.extend([priv_proto, _quote(priv_pass)])
                 access_level = "priv"

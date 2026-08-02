@@ -468,10 +468,16 @@ def assert_catalog_covers_models(known_tables: set[str]) -> list[str]:
     declared by the SQLAlchemy models. Returns a list of tables
     the catalog is missing — empty list = catalog is complete.
 
-    NOT wired into startup — the name is aspirational and predates any
-    caller. ``tests/test_rewrap_coverage.py`` is what actually consults it,
-    pinning today's gap so it cannot grow silently; see #781 for why the
-    56 currently-unclassified tables are a baseline rather than a fix.
+    Two callers, deliberately different in kind:
+
+    * ``app.main._log_backup_section_catalog_gap`` logs the gap at api
+      startup, so an operator can see it without running the test suite.
+    * ``tests/test_rewrap_coverage.py`` pins today's gap against a frozen
+      baseline, so a newly added table has to be classified or explicitly
+      accepted rather than slipping in unnoticed.
+
+    See #781 for why the currently-unclassified tables are a baseline
+    rather than a fix.
     """
     catalog = all_section_tables()
     missing = sorted(known_tables - catalog)
