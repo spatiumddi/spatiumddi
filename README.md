@@ -1338,6 +1338,7 @@ Full docs at **[www.spatiumddi.com](https://www.spatiumddi.com)** — republishe
 | [Bare Metal](docs/deployment/BAREMETAL.md) | Bare-metal / VM paths — Docker Compose on a host, Patroni HA Postgres overlay, OS appliance |
 | [Appliance Deployment](docs/deployment/APPLIANCE.md) | OS appliance ISO — base OS selection, build pipeline, first-boot orchestration, `/appliance` management hub spec |
 | [Troubleshooting](docs/TROUBLESHOOTING.md) | Recovery recipes — deleted agent rows, password reset, subnet-delete refused |
+| [Third-Party Components](docs/THIRD_PARTY.md) | Every bundled engine, library and OS package — license, artifact it ships in, and why it's there |
 
 ---
 
@@ -1389,7 +1390,7 @@ part of merging each contributor's first PR.
 
 Released under the [Apache 2.0 License](LICENSE).
 
-Bundled components (BIND9, ISC Kea) are distributed under their own licenses. See [NOTICE](NOTICE) for the full list.
+Bundled components (BIND9, PowerDNS, Technitium, ISC Kea, k3s, and the appliance's Debian userland) are distributed under their own licenses. See [NOTICE](NOTICE) for the attribution manifest, and [Third-Party Components](https://www.spatiumddi.com/THIRD_PARTY.html) for the full catalogue — what each component is, which artifact it ships in, and what its license means in practice.
 
 ---
 

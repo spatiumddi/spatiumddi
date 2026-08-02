@@ -46,5 +46,9 @@ Every specification, deployment guide and driver internal, grouped by what you'r
 
 ## Driver Internals
 
-- [DNS Drivers](drivers/DNS_DRIVERS.md) — BIND9 + Windows DNS driver internals
+- [DNS Drivers](drivers/DNS_DRIVERS.md) — BIND9 + PowerDNS + Technitium + Windows DNS driver internals
 - [DHCP Drivers](drivers/DHCP_DRIVERS.md) — Kea + Windows DHCP driver internals
+
+## Project
+
+- [Third-Party Components](THIRD_PARTY.md) — every bundled engine, library and OS package, with licenses and which artifact each ships in
