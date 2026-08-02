@@ -234,6 +234,79 @@ Branch protection on `main` gates on these checks. `make ci` reproduces
 the two lint jobs and the frontend build locally; `make test` reproduces
 the backend test job (single-runner rather than sharded).
 
+### What runs when — the trigger policy
+
+Every workflow trigger should answer "what would we miss without it?".
+Three of the four events have distinct jobs:
+
+| Event | Runs | Why |
+|---|---|---|
+| **Pull request** | `ci.yml`, the per-image builds (single-arch + **Trivy**), `agent-e2e.yml` | Where correctness is gated. Nothing merges without it. |
+| **Push to `main`** | `ci.yml`, `docs-publish.yml`, `build-appliance-builder.yml` | Post-merge safety net + the two things that must be *published* from `main`. |
+| **Release tag** | `release.yml` only | Builds and publishes every image multi-arch, the chart, and the appliance ISO. |
+| **Schedule** | `nightly.yml`, `trivy-scheduled.yml`, `prune-release-assets.yml` | Work that is about *elapsed time*, not about a change. |
+
+Two rules follow, and both were violations once:
+
+- **Per-image build workflows do not trigger on push.** On a tag they raced
+  `release.yml`, which builds the same image and pushes the same
+  `:<VERSION>` tag — two concurrent multi-arch builds of identical source,
+  with the winner decided by whichever finished last, on a release
+  artifact. On `main` they published `:main` and `:sha-<short>` that
+  nothing consumes (no chart, compose file or manifest pins them, and
+  `agent-e2e.yml` deliberately builds from PR source instead) *and* skipped
+  Trivy on that path. Both jobs are covered better elsewhere: releases by
+  `release.yml`, "build `main` periodically" by `nightly.yml` — which
+  scans before it publishes.
+- **`build-appliance-builder.yml` is the exception and must stay on
+  `main`.** `release.yml`'s ISO job and the `APPLIANCE_BUILDER` default in
+  the Makefile both pull `appliance-builder:latest`; that tag is how the
+  builder image gets published at all.
+
+`ci.yml` stays on push to `main` on purpose. It is redundant with the PR
+run in the common case — GitHub tests the merge result — but it validates
+the actual squashed commit, and it is the only check that covers a direct
+push or a merge made with `--admin` while shards were still pending.
+
+### Nightly builds
+
+[`.github/workflows/nightly.yml`](../.github/workflows/nightly.yml) builds
+and publishes every image from `main` at 02:23 UTC. It exists because
+nothing else builds the *release* image except a release — which is how
+[#732](https://github.com/spatiumddi/spatiumddi/issues/732) shipped an api
+image carrying pytest as root, undetected until the next release cut it.
+The nightly also runs the same Trivy gate CI uses on PRs, so a base-image
+CVE surfaces the night the Dockerfile changes rather than at the next tag.
+
+To run current `main` without cutting a release:
+
+```bash
+docker pull ghcr.io/spatiumddi/spatiumddi-api:nightly
+```
+
+| Tag | Meaning |
+|---|---|
+| `:nightly` | The most recent successful nightly. Mutable — it moves. |
+| `:nightly-YYYYMMDD` | Immutable snapshot of that build. The newest **7** are kept, the rest pruned in the same run. |
+
+The dated ring exists so "nightly broke X" is answerable: without it the
+pointer has already rolled and there is nothing to compare against, and a
+broken nightly leaves no fallback. Seven is deliberately small — anyone
+pulling `:nightly` never sees the rest.
+
+A run is **skipped entirely when `main` has not moved** since the last
+nightly, so the seven tags cover seven *changed* days rather than seven
+calendar days. The last built commit is recorded as `built-from:` in the
+body of the reused `nightly` pre-release, which is also where the appliance
+ISO will be published once that lands (deferred — see the workflow header
+for why). A failing nightly opens or comments on a single reused tracking
+issue rather than one per night.
+
+`workflow_dispatch` takes `force` (build anyway) and `dry_run` (build and
+scan, push and prune nothing).
+
+**Nightly is never tagged `:latest`.** That tag means "latest release".
+
 ---
 
 ## 7. Repo Layout

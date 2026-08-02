@@ -366,3 +366,216 @@ def test_clamped_rows_are_reported_not_silently_dropped(m) -> None:
     # 21 visible (the Succeeded job is filtered out), 3 shown → 18 hidden.
     assert "+18 more pods" in text
     assert "F3 to list" in text
+
+
+# ── #803 — dashboard rendering polish ─────────────────────────────────
+
+
+def test_node_column_hidden_on_a_single_node_cluster(m) -> None:
+    """It was the same hostname repeated down every row, while NAME — the
+    one flexible column — got squeezed to ellipsis behind 12 fixed ones."""
+    rows = [_pod592(f"pod-{i}", "ddi1") for i in range(4)]
+    text = _panel_text(m, rows)
+    assert "NODE" not in text
+    assert "ddi1" not in text
+
+
+def test_node_column_returns_when_there_is_more_than_one_node(m) -> None:
+    rows = [_pod592("a", "ddi1"), _pod592("b", "ddi2")]
+    text = _panel_text(m, rows)
+    assert "NODE" in text
+    assert "ddi2" in text
+
+
+def test_long_pod_names_survive_on_a_wide_console(m) -> None:
+    """Two CloudNativePG replicas differ only in their pod hash; the old
+    22-char cap cut exactly there and rendered them identically."""
+    rows = [
+        _pod592("cloudnative-pg-8cc7b886c-g5svx", "ddi1"),
+        _pod592("cloudnative-pg-8cc7b886c-r4mgt", "ddi1"),
+    ]
+    text = _panel_text(m, rows)
+    assert "g5svx" in text and "r4mgt" in text
+
+
+def test_human_cpu_keeps_sub_centicore_readings_honest(m) -> None:
+    """``f"{c:.2f}"`` renders 0.00 for every idle pod, which is most of an
+    appliance — indistinguishable from truly zero."""
+    assert m._human_cpu(1.25) == "1.25"
+    assert m._human_cpu(0.30) == "0.30"
+    assert m._human_cpu(0.004) == "4m"
+    assert m._human_cpu(0.0) == "0"
+
+
+def test_sanitize_strips_ansi_and_control_bytes(m) -> None:
+    """Pod stdout is arbitrary; the console font has 256 glyphs, so an
+    escape sequence renders as mojibake."""
+    assert m._sanitize_console_text("\x1b[31mred\x1b[0m") == "red"
+    assert m._sanitize_console_text("a\x00b\x07c") == "abc"
+    assert m._sanitize_console_text("a\tb") == "a b"
+    assert m._sanitize_console_text("plain text") == "plain text"
+
+
+def test_celery_prefix_compaction_returns_the_payload(m) -> None:
+    raw = (
+        "[2026-08-02 16:55:49,504: INFO/ForkPoolWorker-4] "
+        "Task app.tasks.dns_health.probe"
+        "[3f2a1b4c-1111-2222-3333-444455556666] succeeded in 0.31s: {'ok': 3}"
+    )
+    out = m.AppLogTail._compact(raw)
+    assert out.startswith("16:55:49 INFO")
+    assert "ForkPoolWorker" not in out
+    assert "3f2a1b4c" not in out
+    assert "{'ok': 3}" in out  # the part worth reading survives
+    assert len(out) < len(raw) - 50
+
+
+NOISE_LINES = [
+    "Scheduler: Sending due task app.tasks.x",
+    "Task app.tasks.foo received",
+    "Task app.tasks.x succeeded in 0.02s: {'status': 'disabled'}",
+    # The majority case on a real box: enabled sweeps with nothing to do.
+    # Kept to one source line — a wrapped string inside a list reads as a
+    # missing comma, which is exactly the mistake the lint guards against.
+    # (The four-key form and the `failed`-key veto interaction have their
+    # own test below.)
+    "Task app.tasks.event_outbox.process succeeded in 0.02s: {'delivered': 0, 'failed': 0}",
+    "Task app.tasks.dns.check_all succeeded in 0.02s: None",
+    "Task app.tasks.snmp.dispatch succeeded in 0.02s: 0",
+    'INFO:   10.42.0.1:8742 - "GET /metrics HTTP/1.1" 200 OK',
+    'INFO:   10.42.0.52:1 - "POST /api/v1/appliance/supervisor/heartbeat HTTP/1.1" 200 OK',
+]
+
+SIGNAL_LINES = [
+    "Task app.tasks.ipam_discovery.dispatch succeeded in 0.04s: 3",
+    "Task app.tasks.x succeeded in 0.1s: {'created': 4, 'deleted': 0}",
+    "Task app.tasks.x succeeded in 0.02s: {'claimed': 0, 'failed': 2}",
+    "Task app.tasks.x received but Failed to connect",
+    "Task app.tasks.x succeeded in 0.02s: {'status': 'error'}",
+    'INFO:   10.42.0.1 - "GET /api/v1/ipam/subnets HTTP/1.1" 200 OK',
+    'INFO:   10.42.0.1 - "GET /metrics HTTP/1.1" 500 Internal Server Error',
+    "Task app.tasks.x raised unexpected: ValueError()",
+]
+
+
+@pytest.mark.parametrize("line", NOISE_LINES)
+def test_app_log_noise_is_dropped(m, line: str) -> None:
+    assert m.AppLogTail._is_noise(line), line
+
+
+@pytest.mark.parametrize("line", SIGNAL_LINES)
+def test_app_log_signal_always_survives(m, line: str) -> None:
+    """The filter must fail toward showing too much. A single non-zero
+    count, an unrecognised status, or any error marker keeps the line."""
+    assert not m.AppLogTail._is_noise(line), line
+
+
+def test_all_zero_result_beats_the_error_veto_on_a_key_named_failed(m) -> None:
+    """``_REAL_ERROR_RE`` matches the bare word "failed", which appears as a
+    dict KEY in half these payloads. Having parsed every value and found
+    them zero, the line is proof of its own uneventfulness — so the parse
+    is checked before the keyword scan, or a key that says nothing failed
+    would veto its own filtering."""
+    line = "Task app.tasks.x succeeded in 0.02s: {'delivered': 0, 'failed': 0}"
+    assert m.AppLogTail._is_noop_result(line)
+    assert m.AppLogTail._is_noise(line)
+
+
+def test_unparseable_result_is_treated_as_interesting(m) -> None:
+    """Nested structures aren't parsed; assume they matter."""
+    assert not m.AppLogTail._is_noop_result(
+        "Task app.tasks.x succeeded in 0.02s: {'rows': [{'a': 0}]}"
+    )
+
+
+# ── #803 code-review follow-ups ───────────────────────────────────────
+
+
+def test_boolean_false_makes_a_result_interesting(m) -> None:
+    """A boolean field is an ASSERTION, not a count. ``{'ok': False}`` is a
+    health check reporting a problem; treating False as "nothing" would drop
+    it — and since the no-op parse runs ahead of the error veto, nothing
+    downstream would rescue it."""
+    line = "Task app.tasks.x succeeded in 0.02s: {'ok': False, 'rows_checked': 0, 'broken': 0}"
+    assert not m.AppLogTail._is_noop_result(line)
+    assert not m.AppLogTail._is_noise(line)
+    # And the same shape reporting success stays visible too — polarity
+    # must not be the thing that decides.
+    assert not m.AppLogTail._is_noise(
+        "Task app.tasks.x succeeded in 0.02s: {'ok': True, 'checked': 0}"
+    )
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/v1/appliance/supervisor/poll",
+        "/api/v1/appliance/supervisor/heartbeat",
+        "/api/v1/appliance/supervisor/pcap/poll",
+        "/api/v1/appliance/supervisor/k8s-proxy/poll",
+    ],
+)
+def test_every_supervisor_poll_shape_is_filtered(m, path: str) -> None:
+    """The bare ``/poll`` has no sub-path, and sub-paths are kebab-case —
+    both missed by a naive ``\\w+/poll``."""
+    assert m.AppLogTail._is_noise(f'INFO:   10.42.0.52:1 - "POST {path} HTTP/1.1" 200 OK')
+
+
+def test_level_padding_survives_compaction(m) -> None:
+    """A blanket double-space collapse would undo the ``:<5`` padding and
+    leave INFO and WARNING ragged against each other."""
+    info = m.AppLogTail._compact("[2026-08-02 16:55:49,504: INFO/ForkPoolWorker-4] hello")
+    warn = m.AppLogTail._compact("[2026-08-02 16:55:49,504: WARNING/ForkPoolWorker-4] hello")
+    assert info.index("hello") == warn.index("hello")
+
+
+def test_compaction_preserves_column_aligned_payload(m) -> None:
+    """``_sanitize_console_text`` deliberately keeps runs of spaces so
+    structlog's column-aligned output stays readable."""
+    out = m.AppLogTail._compact(
+        "[2026-08-02 16:55:49,504: WARNING/MainProcess] "
+        "[warning ] alert_unknown_rule_type    rule=abc type=x"
+    )
+    assert "rule=abc" in out
+    assert "    rule=abc" in out  # the alignment run survived
+
+
+def test_long_component_name_does_not_leak_into_the_body(m) -> None:
+    """The prefix used to be re-sliced off the FORMATTED string at a
+    hardcoded offset that encoded the padding width, so a component longer
+    than it would render its tail twice."""
+    line = m.AppLogTail._compact("some message")
+    assert line == "some message"
+    # The formatting path itself: component and body stay separate.
+    for comp in ("api", "spatium-supervisor-extra-long"):
+        rendered = f"{comp:<9} {m.AppLogTail._compact('payload here')}"
+        assert rendered.endswith("payload here")
+        assert rendered.count("payload here") == 1
+
+
+def test_node_column_uses_the_cluster_node_count_not_pod_placement(m) -> None:
+    """A two-node cluster that just lost a node has its pods Pending with no
+    Node value — exactly when the operator needs to see WHERE things are.
+    Deriving multi-node from pod placement would hide the column then."""
+    rows = [_pod592("a", ""), _pod592("b", "")]
+    for r in rows:
+        r["K8sState"] = "Pending"
+        r["Node"] = ""
+    text = _panel_text_nodes(m, rows, node_count=2)
+    assert "NODE" in text
+
+
+def _panel_text_nodes(m, rows: list[dict], node_count: int) -> str:
+    buf = Console(width=200, record=True, file=io.StringIO())
+    buf.print(m.render_services("control-plane", rows, node_count=node_count))
+    return _ANSI.sub("", buf.export_text())
+
+
+def test_bare_scalar_result_is_boring_like_the_dict_form(m) -> None:
+    """``beat_tick`` returns ``'ok'`` every 30s; that says exactly as
+    little as ``{'status': 'ok'}``, which was already filtered."""
+    assert m.AppLogTail._is_noise("Task app.tasks.heartbeat.beat_tick succeeded in 0.004s: 'ok'")
+    # A scalar that reports actual work still shows.
+    assert not m.AppLogTail._is_noise(
+        "Task app.tasks.ipam_discovery.dispatch succeeded in 0.04s: 7"
+    )

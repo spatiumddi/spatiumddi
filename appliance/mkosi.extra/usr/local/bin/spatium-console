@@ -1546,6 +1546,29 @@ _KLOG_HEADER_RE = re.compile(
 )
 
 
+# Escape sequences + control bytes. Pod stdout is arbitrary — a coloured
+# library, a progress spinner, a stray \r — and it lands in ``Text(line)``
+# verbatim. The console font carries 256 glyphs, so anything outside it
+# renders as mojibake: one screenshot showed a line as
+# ``…INFO/MainProcess¿?±? Task'app¿?±s?±oden…``. Strip CSI/OSC sequences and
+# any remaining C0/C1 control character before the line reaches Rich.
+_ANSI_RE = re.compile(r"\x1b(?:\[[0-9;?]*[A-Za-z]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])")
+_CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def _sanitize_console_text(line: str) -> str:
+    """Make an arbitrary log line safe for the 256-glyph console font.
+
+    Applied to BOTH log sources — journal lines can carry colour from a
+    unit that thinks it has a TTY, and pod stdout can carry anything at
+    all. Tabs are expanded rather than dropped so column-aligned output
+    doesn't run together.
+    """
+    line = _ANSI_RE.sub("", line)
+    line = line.replace("\t", " ")
+    return _CTRL_RE.sub("", line)
+
+
 def _compact_journal_line(line: str) -> str:
     """Trim the journal date+host+pid prefix + klog's redundant
     duplicate timestamp/pid header.
@@ -1553,6 +1576,7 @@ def _compact_journal_line(line: str) -> str:
     Lines that don't match the short-iso format are returned as-is
     so a journalctl format change doesn't blank the log pane.
     """
+    line = _sanitize_console_text(line)
     m = _JOURNAL_ISO_RE.match(line)
     if not m:
         return line
@@ -1578,6 +1602,139 @@ class AppLogTail(threading.Thread):
     _SELECTOR = "app.kubernetes.io/instance=spatium-control"
     _PROBE_RE = re.compile(r"/health/(ready|live)|/healthz|kube-probe")
     _PREFIX_RE = re.compile(r"^\[pod/\S*?spatiumddi-([a-z0-9]+)-\S*?\]\s*")
+
+    # Celery beat/worker sweep churn. Every enabled-or-not integration gets
+    # a periodic sweep task, and each one emits three lines per tick —
+    # "Sending due task" → "received" → "succeeded ... {'status':
+    # 'disabled'}". With ~15 integrations disabled that is ~45 lines per
+    # tick of pure bookkeeping, which filled the 200-line deque and left
+    # nothing else visible: on the screenshot that opened #803, EVERY line
+    # of the Live log was this. Same failure mode P0.10 fixed for k3s/etcd
+    # internals, and filtered the same way — vetoed by ``_REAL_ERROR_RE``,
+    # so a task that fails, retries, or succeeds with real work survives.
+    # Only a *disabled* sweep completing is zero-information.
+    _APP_NOISE_PATTERNS = (
+        re.compile(r"Scheduler: Sending due task"),
+        re.compile(r"Task app\.tasks\.\S+ received"),
+        # Prometheus scrapes and the supervisor's own long-polls. Both are
+        # by-design periodic traffic against endpoints whose whole job is
+        # to be hit constantly; `_PROBE_RE` already drops /health*, and
+        # these are the same category. Field-checking on a live appliance
+        # (#803) showed them at 16 of 38 visible log lines.
+        re.compile(r'"GET /metrics HTTP'),
+        # ``[\w-]+`` because sub-paths are kebab-case (``k8s-proxy/poll``),
+        # and the ``(…/)?`` because the bare ``/supervisor/poll`` — the
+        # endpoint this comment names — has no sub-path at all.
+        re.compile(r'"(GET|POST) /api/v1/appliance/supervisor/'
+                   r'(heartbeat|([\w-]+/)?poll)\b'),
+    )
+
+    # A completed task whose result reports no work done. ``'status':
+    # 'disabled'`` — the case #803 named — turns out to be the minority on
+    # a real box: most sweeps are ENABLED and simply had nothing to do, so
+    # they return ``{'checked': 0, 'revoked': 0}`` or ``None``. Those carry
+    # exactly as little information, and field-checking showed 18 of 38
+    # visible lines were this shape. Dropping only the literal 'disabled'
+    # string left the pane just as drowned as before.
+    _TASK_RESULT_RE = re.compile(r"Task \S+ succeeded in [\d.e-]+s?: (.*)$")
+    # Values that mean "nothing happened". Anything else — a non-zero
+    # count, an unrecognised status — makes the whole result interesting.
+    # NOTE ``false`` is deliberately absent. It reads like "nothing", but a
+    # boolean field is almost always an ASSERTION — ``{'ok': False,
+    # 'rows_checked': 0, 'broken': 0}`` is a health check reporting a
+    # problem, and treating False as boring would classify it as
+    # nothing-happened and drop it. Since this predicate runs ahead of the
+    # error veto, nothing downstream would rescue it. The polarity is also
+    # backwards from ``True``, which is (correctly) not boring and keeps
+    # the line. Booleans of either value make a result interesting.
+    _BORING_VALUES = {"0", "0.0", "none", "[]", "{}", "''", '""',
+                      "'ok'", "'idle'", "'disabled'", "'skipped'"}
+
+    @classmethod
+    def _is_noop_result(cls, line: str) -> bool:
+        """True when a task-succeeded line reports that nothing happened.
+
+        Parsed rather than pattern-matched because the interesting case is
+        defined by the VALUES: every field zero/absent means no work, and a
+        single non-zero count anywhere means the line is worth showing.
+        Anything unparseable is treated as interesting — the filter must
+        fail toward showing too much, never toward hiding a real event.
+        """
+        m = cls._TASK_RESULT_RE.search(line)
+        if not m:
+            return False
+        payload = m.group(1).strip()
+        if payload.lower() in {"none", "0", "[]", "{}"}:
+            return True
+        # A bare scalar result gets the same treatment as the same value
+        # inside a dict — ``beat_tick`` returning ``'ok'`` every 30 s says
+        # exactly as little as ``{'status': 'ok'}`` does.
+        if payload.lower() in cls._BORING_VALUES:
+            return True
+        if not (payload.startswith("{") and payload.endswith("}")):
+            return False
+        inner = payload[1:-1].strip()
+        if not inner:
+            return True
+        for part in inner.split(","):
+            if ":" not in part:
+                return False  # nested/unparseable — assume interesting
+            value = part.split(":", 1)[1].strip().lower()
+            if value not in cls._BORING_VALUES:
+                return False
+        return True
+
+    # Celery's default worker prefix — ``[2026-08-02 16:55:49,504:
+    # INFO/ForkPoolWorker-4]`` — spends ~33 columns before the message
+    # starts. ``render_log`` renders no_wrap + ellipsis, so those 33
+    # columns are paid for out of the payload: what got cut was the task
+    # RESULT, the only part worth reading. The date duplicates the header
+    # clock and the pool-worker id is noise, so compact to ``HH:MM:SS LVL``.
+    _CELERY_PREFIX_RE = re.compile(
+        r"^\[\d{4}-\d{2}-\d{2} (\d{2}:\d{2}:\d{2}),\d+: "
+        r"([A-Z]+)/[A-Za-z0-9-]+\]\s*"
+    )
+    # Task UUIDs are 36 chars of pure noise on a 100-col line.
+    _TASK_UUID_RE = re.compile(
+        r"\[[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\]"
+    )
+
+    @classmethod
+    def _is_noise(cls, line: str) -> bool:
+        # A fully-parsed all-zero result is checked FIRST, and deliberately
+        # ahead of the error veto. ``_REAL_ERROR_RE`` matches the bare word
+        # "failed", which appears as a dict KEY in half these payloads —
+        # ``{'claimed': 0, 'delivered': 0, 'failed': 0, 'dead': 0}`` would
+        # be vetoed by a key that explicitly says nothing failed. Having
+        # parsed every value and found them all zero, the line is proof of
+        # its own uneventfulness; no keyword scan can add to that.
+        if cls._is_noop_result(line):
+            return True
+        # Pattern-based drops keep the veto: those are matched on shape, not
+        # parsed, so a real error mentioning /metrics must still survive.
+        if JournalTail._REAL_ERROR_RE.search(line):
+            return False
+        return any(p.search(line) for p in cls._APP_NOISE_PATTERNS)
+
+    @classmethod
+    def _compact(cls, line: str) -> str:
+        """Strip the Celery prefix down to ``HH:MM:SS LVL`` and drop the
+        task UUID, returning ~55 columns of payload per line."""
+        line = _sanitize_console_text(line)
+        m = cls._CELERY_PREFIX_RE.match(line)
+        if m:
+            # Width 8, not 5: the level set runs DEBUG / INFO / WARNING /
+            # ERROR / CRITICAL, so a narrower field leaves the two that
+            # matter most unaligned against the rest and the message column
+            # ragged. Three columns for a scannable left edge, out of the
+            # ~73 this compaction reclaims.
+            line = f"{m.group(1)} {m.group(2):<8} {line[m.end():]}"
+        # Only the UUID is removed. A blanket ``.replace("  ", " ")`` here
+        # would immediately undo the ``:<5`` level padding above (INFO and
+        # WARNING would render ragged against each other) and would collapse
+        # column-aligned payload text that ``_sanitize_console_text``
+        # deliberately preserved.
+        return cls._TASK_UUID_RE.sub("", line).rstrip()
 
     def __init__(self, sink: "deque[str]"):
         super().__init__(daemon=True)
@@ -1616,9 +1773,18 @@ class AppLogTail(threading.Thread):
                 line = line.rstrip("\n")
                 if not line or self._PROBE_RE.search(line):
                     continue
+                # Split the component prefix off ONCE and keep the two parts
+                # separate, rather than re-slicing the formatted string at a
+                # hardcoded offset — that offset silently encodes the ``:<9``
+                # width above, so a component name longer than it would leak
+                # its tail into the body and render twice.
                 comp = self._PREFIX_RE.match(line)
-                if comp:
-                    line = f"{comp.group(1):<9} {line[comp.end():]}"
+                component = comp.group(1) if comp else ""
+                body = line[comp.end():] if comp else line
+                if self._is_noise(body):
+                    continue
+                body = self._compact(body)
+                line = f"{component:<9} {body}" if component else body
                 self.lines.append("app  " + line[:240])
             self._proc = None
             if self._stop.is_set():
@@ -2399,6 +2565,7 @@ def render_services(
     ps_rows: list[dict],
     cap: int | None = None,
     overflow: int = 0,
+    node_count: int | None = None,
 ) -> Panel:
     """Render the Pods panel — every pod on the local k3s cluster
     with status + node + ports (the image column was dropped — on an
@@ -2424,12 +2591,32 @@ def render_services(
     """
     _ = role  # signature kept for compatibility
 
+    # Only show NODE when there is more than one to distinguish. On a
+    # single-node appliance — the common case — it was the same hostname
+    # repeated down all 11 rows, while NAME (the one flexible column) got
+    # squeezed to ellipsis because the 12 fixed columns already eat ~97
+    # cols.
+    #
+    # ``node_count`` is the CLUSTER's node count, which is the actual
+    # question. Counting distinct Node values across the pods instead would
+    # answer a different one: pods that are Pending or being rescheduled
+    # carry no node, so a two-node cluster that has just lost one — exactly
+    # when an operator needs to see WHERE things are — would render as
+    # single-node and hide the column. ``render_top_pods`` uses
+    # ``len(state.nodes)`` for the same reason; the pod-derived fallback is
+    # only for callers that have no cluster view to pass (tests, and any
+    # future embedding).
+    if node_count is None:
+        node_count = len({(r.get("Node") or "") for r in ps_rows if r.get("Node")})
+    multi_node = node_count > 1
+
     tbl = Table.grid(padding=(0, 1), expand=True)
     tbl.add_column(width=1, no_wrap=True)          # health glyph
     tbl.add_column(width=11, no_wrap=True)         # namespace
     tbl.add_column(min_width=16, no_wrap=False)    # pod name (prefix-stripped)
     tbl.add_column(width=8, no_wrap=True)          # workload type (Deploy/Daemon/…)
-    tbl.add_column(width=8, no_wrap=True)          # node (#272 multi-node)
+    if multi_node:
+        tbl.add_column(width=8, no_wrap=True)      # node (#272 multi-node)
     tbl.add_column(width=5, no_wrap=True)          # ready (n/m)
     tbl.add_column(width=4, no_wrap=True, justify="right")  # restarts
     tbl.add_column(width=7, no_wrap=True, justify="right")  # restart age
@@ -2444,12 +2631,15 @@ def render_services(
     # with bold-dim styling — same shape as the bottom-row F-key
     # footer.
     header_style = "bold dim"
-    tbl.add_row(
+    header_cells = [
         Text("", style=header_style),
         Text("NAMESPACE", style=header_style),
         Text("NAME", style=header_style),
         Text("TYPE", style=header_style),
-        Text("NODE", style=header_style),
+    ]
+    if multi_node:
+        header_cells.append(Text("NODE", style=header_style))
+    header_cells += [
         Text("READY", style=header_style),
         Text("RST", style=header_style),
         Text("RST-AGE", style=header_style),
@@ -2457,7 +2647,8 @@ def render_services(
         Text("STATE", style=header_style),
         Text("IP", style=header_style),
         Text("PORTS", style=header_style),
-    )
+    ]
+    tbl.add_row(*header_cells)
 
     # #284 — drop completed one-shot pods (``Succeeded`` Jobs). Shares
     # the ``visible_pods`` filter with the SVC_ROWS panel-height calc in
@@ -2599,12 +2790,15 @@ def render_services(
             row.get("LastExitReason") or "", row.get("LastExitCode"),
         )
 
-        tbl.add_row(
+        cells = [
             Text(glyph, style=style),
             Text(row.get("Namespace") or "—", style="dim"),
             Text(_pod_display_name(row), style="bold"),
             Text(row.get("Type") or "—", style="dim"),
-            Text(row.get("Node") or "—", style="dim"),
+        ]
+        if multi_node:
+            cells.append(Text(row.get("Node") or "—", style="dim"))
+        cells += [
             Text(ready, style=ready_style),
             Text(rst_text, style=rst_style),
             Text(rage, style="dim"),
@@ -2612,7 +2806,8 @@ def render_services(
             Text(state_cell, style=state_style),
             Text(pod_ip, style="dim"),
             Text(ports or "—", style=ports_style),
-        )
+        ]
+        tbl.add_row(*cells)
 
     # Phase 2 (§3c) — overflow indicator in the SUBTITLE (bottom border)
     # rather than a table row (see the clamp comment above for why). F3
@@ -3115,10 +3310,12 @@ def render_log(tail: JournalTail, height: int) -> Panel:
             Text(line, style=_log_line_style(line), overflow="ellipsis", no_wrap=True)
             for line in list(tail.lines)[-(max(height - 2, 1)):]
         ))
-    # P0.10 — honest title: this pane tails the k3s system journal (the
-    # SpatiumDDI app pods log to pod stdout, surfaced via F3, not here).
-    # The "· k3s system" suffix stops the operator from expecting app
-    # events until the P1 app-log tail lands.
+    # Honest title: this pane carries BOTH sources. ``JournalTail`` feeds
+    # the k3s system journal and ``AppLogTail`` feeds the SpatiumDDI app
+    # pods' stdout into the same deque, hence "k3s + app". (The P0.10
+    # comment here used to say app pods were "surfaced via F3, not here",
+    # which the P1 app-log tail made untrue — and the title two lines down
+    # had already been updated to say so.)
     return Panel(body, box=SQUARE, border_style="cyan",
                  title="[bold]Live log[/bold] · k3s + app", title_align="left")
 
@@ -3328,6 +3525,24 @@ def _human_bytes(b: float) -> str:
     return f"{b:.0f}"
 
 
+def _human_cpu(c: float) -> str:
+    """Compact CPU cores -> ``1.25`` / ``0.30`` / ``4m``.
+
+    Below a centicore, ``f"{c:.2f}"`` renders ``0.00`` for everything —
+    a pod using 4 millicores looks identical to one using none, which on
+    an idle appliance is most of the column. Fall back to ``kubectl
+    top``-style millicores there so the reading stays honest, and to a
+    plain ``0`` only when it really is zero. Same spirit as
+    ``_human_bytes`` on the memory side.
+    """
+    if c >= 0.01:
+        return f"{c:.2f}"
+    milli = c * 1000.0
+    if milli >= 0.5:
+        return f"{milli:.0f}m"
+    return "0"
+
+
 def render_top_pods(state: "DashboardState", height: int) -> Panel:
     """Top pods by CPU with cpu + mem bar-fills, from the kubelet stats API.
     On a multi-node cluster this is CLUSTER-WIDE (INC 9) with a NODE column;
@@ -3343,9 +3558,18 @@ def render_top_pods(state: "DashboardState", height: int) -> Panel:
         cpu, mem = val[0], val[1]
         node = val[2] if len(val) > 2 else ""
         rows.append((cpu, mem, ns, nm, node))
-    rows.sort(reverse=True)
-    total = len(state.ps_rows)
-    running = sum(1 for r in state.ps_rows if (r.get("K8sState") or "") == "Running")
+    # Descending by usage, ascending a→z on ties. A bare ``reverse=True``
+    # on the whole tuple also reverses the name, so equal-usage pods sat in
+    # reverse-alphabetical order AND swapped places whenever a reading
+    # wobbled — motion the eye tracks for nothing.
+    rows.sort(key=lambda r: (-r[0], -r[1], r[2], r[3]))
+    # Count what the operator can actually see. ``ps_rows`` includes the
+    # Succeeded one-shot Jobs that ``visible_pods`` hides (#284), so
+    # counting it here put "15 pods" next to a Pods panel listing 11, with
+    # nothing on screen to explain the gap.
+    visible = visible_pods(state.ps_rows)
+    total = len(visible)
+    running = sum(1 for r in visible if (r.get("K8sState") or "") == "Running")
     head = Text()
     head.append(f"{total} pods", style="bold")
     if running:
@@ -3353,8 +3577,13 @@ def render_top_pods(state: "DashboardState", height: int) -> Panel:
         head.append(f"{running} Running", style="bold green")
     maxcpu = max((r[0] for r in rows), default=0.0) or 1.0
     maxmem = max((r[1] for r in rows), default=0) or 1
-    tbl = Table.grid(padding=(0, 1))
-    tbl.add_column(no_wrap=True)                              # pod
+    # ``expand=True`` + a ratio pod column. Without it the grid sizes to its
+    # content and leaves 10-15 dead columns to the right of the mem bar while
+    # names ellipsize on the left — which cost real identity: two
+    # CloudNativePG pods both rendered as ``cloudnative-pg-8cc7b88``, the cut
+    # falling exactly on the hash that tells them apart.
+    tbl = Table.grid(padding=(0, 1), expand=True)
+    tbl.add_column(ratio=1, overflow="ellipsis", no_wrap=True)  # pod
     if multi:
         tbl.add_column(no_wrap=True)                         # node
     tbl.add_column(justify="right", no_wrap=True)            # cpu
@@ -3368,11 +3597,13 @@ def render_top_pods(state: "DashboardState", height: int) -> Panel:
     tbl.add_row(*header)
     cap = max(height - 4, 1)
     for cpu, mem, _ns, nm, node in rows[:cap]:
-        cells = [Text(_short_pod_name(nm)[:22], style="cyan")]
+        # No hard slice — the ratio column ellipsizes to whatever the TTY
+        # actually has, so a wide console shows the full name.
+        cells = [Text(_short_pod_name(nm), style="cyan")]
         if multi:
             cells.append(Text((node or "")[:8], style="dim"))
         cells += [
-            Text(f"{cpu:.2f}", style="bold"),
+            Text(_human_cpu(cpu), style="bold"),
             Text(_bar_gauge(cpu, maxcpu, 6), style="bold green"),
             Text(_human_bytes(mem), style="bold"),
             Text(_bar_gauge(mem, maxmem, 6), style="bold cyan"),
@@ -3785,6 +4016,7 @@ def render_frame(state: "DashboardState", mono_t: float) -> Layout:
         layout["header"].update(render_header(state, mono_t, compact=True))
         layout["main"].update(
             render_services(state.role, pod_rows, cap=max_pod_rows,
+                            node_count=len(state.nodes),
                             overflow=pods_overflow)
         )
         layout["log"].update(render_log(state.tail, log_h))
@@ -3840,6 +4072,7 @@ def render_frame(state: "DashboardState", mono_t: float) -> Layout:
 
     layout["main"]["pods"].update(
         render_services(state.role, pod_rows, cap=max_pod_rows,
+                        node_count=len(state.nodes),
                         overflow=pods_overflow)
     )
     layout["main"]["top"].update(render_top_pods(state, main_h))
