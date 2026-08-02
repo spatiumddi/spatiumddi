@@ -236,3 +236,29 @@ def test_scrub_list_still_redacts_operator_re_enterable_credentials() -> None:
         ("dns_server", "credentials_encrypted"),
     ):
         assert pair in scrubbed
+
+
+def test_schema_gate_fails_closed_when_it_cannot_verify() -> None:
+    """A safety gate that cannot perform its check must refuse, not proceed.
+
+    Returning None ("direction is fine") when the local head is unreadable
+    silently disabled the whole #781 protection — the failure mode is the
+    destructive one, so an unverifiable archive is refused instead."""
+    from app.services.backup import migrations
+
+    original = migrations._local_head
+    try:
+        migrations._local_head = lambda: None  # type: ignore[assignment]
+        err = migrations.schema_direction_error("ffffffffffff")
+    finally:
+        migrations._local_head = original  # type: ignore[assignment]
+
+    assert err is not None
+    assert "Cannot verify" in err
+    # …but an archive that declares no head at all still passes: there is
+    # nothing to compare, and refusing every pre-v2 archive would be wrong.
+    try:
+        migrations._local_head = lambda: None  # type: ignore[assignment]
+        assert migrations.schema_direction_error(None) is None
+    finally:
+        migrations._local_head = original  # type: ignore[assignment]

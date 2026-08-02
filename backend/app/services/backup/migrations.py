@@ -171,7 +171,20 @@ def schema_direction_error(source_head: str | None) -> str | None:
     if not source_head:
         return None  # pre-format_version-2 archive; nothing to compare
     local_head = _local_head()
-    if local_head is None or source_head == local_head:
+    if local_head is None:
+        # FAIL CLOSED. This gate exists to protect the database that is
+        # already here, and the archive has told us it carries a specific
+        # schema. If we cannot read our own head — alembic.ini unlocatable,
+        # or a multi-head tree we will not disambiguate — we cannot know the
+        # direction, and proceeding is the outcome that destroys data.
+        return (
+            "Cannot verify this archive's schema direction: this install's own "
+            "alembic head is unreadable (alembic.ini not found, or the migration "
+            f"tree has multiple heads), while the archive declares {source_head!r}. "
+            "Refusing rather than risk overwriting the database with a schema this "
+            "build cannot migrate."
+        )
+    if source_head == local_head:
         return None
     ini = _alembic_ini()
     if ini is None:
