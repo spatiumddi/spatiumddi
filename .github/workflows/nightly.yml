@@ -1,0 +1,367 @@
+name: Nightly
+
+# Nightly build of `main` (#805).
+#
+# WHY THIS EXISTS. Every published image and ISO comes from release.yml,
+# which fires only on a CalVer tag — so nothing builds the *release* image
+# except a release. That is how #732 survived: the api image shipped its
+# `dev` stage (pytest, as root) and nobody noticed until a release cut it.
+# It is also why a base-image CVE introduced by a Dockerfile change sits
+# undetected until the next release publishes something for
+# trivy-scheduled.yml to scan.
+#
+# RETENTION, split by artifact because they fail differently:
+#
+#   Images — `:nightly` is the mutable pointer everyone pulls, plus a ring
+#     of `:nightly-YYYYMMDD` pruned to the newest 7. Keeping literally one
+#     would mean that when somebody reports "nightly broke X" the tag has
+#     already rolled and there is nothing to compare against, and a broken
+#     nightly would leave no fallback. Seven dated tags prune in the same
+#     run and cost nothing; anyone pulling `:nightly` never sees them.
+#
+# THE APPLIANCE ISO IS DEFERRED, deliberately. Its retention answer is easy
+# (~1.5 GB each, so exactly one, assets replaced in place on the reused
+# pre-release below) but its BUILD is not: release.yml assembles it over 223
+# lines of sequenced steps — fetch-k3s, three chart bakes, an image bake with
+# BAKE_SOURCE=ghcr behind `sudo -E` and a DOCKER_CONFIG redirect for the
+# private registry, mkosi in a privileged builder container, then ISO wrap and
+# slot-image compression. The `make appliance-baked-iso` shortcut does NOT
+# work here: it chains `appliance-stamp-dev` (stamps a dev version) and
+# defaults to BAKE_SOURCE=local (no local tags on a runner).
+#
+# Copying those steps would leave two divergent copies of the most
+# safety-critical workflow in the repo, and no way to test the copy short of
+# cutting a release. The right fix is to extract that job into a
+# `workflow_call` reusable workflow that both release.yml and this file
+# invoke — a change that deserves its own PR and its own release to verify,
+# not a ride-along on a new nightly. Tracked as a follow-up on #805.
+#
+# NIGHTLY IS NEVER `:latest`. That tag means "latest release" and has to
+# keep meaning that. There is also no GitHub Release per nightly — one
+# reused pre-release — so the Releases page stays a list of real releases.
+
+on:
+  schedule:
+    # 02:23 UTC. Off-the-hour minute for the same reason
+    # prune-release-assets.yml uses one: the top-of-hour cron stampede
+    # delays runner scheduling on GitHub's shared infrastructure.
+    - cron: "23 2 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Build even if main has not moved since the last nightly"
+        type: boolean
+        required: false
+        default: false
+      dry_run:
+        description: "Build and scan, but push nothing and prune nothing"
+        type: boolean
+        required: false
+        default: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ghcr.io/${{ github.repository_owner }}
+  # A reused pre-release used purely as the RECORD of which commit the last
+  # nightly was built from. It carries no assets today; when the ISO lands
+  # (see the header) it is where those assets go.
+  NIGHTLY_TAG: nightly
+
+permissions:
+  contents: read
+
+# A manual dispatch must never race the scheduled run onto the same tags.
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+jobs:
+  # ── Should this run at all, and what is it building? ──────────────────
+  gate:
+    name: Decide
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      should_build: ${{ steps.decide.outputs.should_build }}
+      date_tag: ${{ steps.decide.outputs.date_tag }}
+      version: ${{ steps.decide.outputs.version }}
+      last_sha: ${{ steps.decide.outputs.last_sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - id: decide
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE: ${{ github.event.inputs.force || 'false' }}
+        run: |
+          set -euo pipefail
+
+          DATE_TAG="nightly-$(date -u +%Y%m%d)"
+          echo "date_tag=${DATE_TAG}" >> "$GITHUB_OUTPUT"
+          # Informational version string baked into the frontend build and
+          # the appliance release stamp. Deliberately NOT CalVer-shaped, so
+          # it can never be mistaken for a release by a human or a sort.
+          echo "version=0.0.0-${DATE_TAG}+${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+          # The last nightly's commit is recorded in the reused pre-release's
+          # body. One source of truth, and a human can read it.
+          LAST_SHA=$(gh release view "$NIGHTLY_TAG" --json body \
+                       --jq '.body' 2>/dev/null \
+                     | sed -n 's/^built-from: \([0-9a-f]\{40\}\).*/\1/p' | head -1 || true)
+          LAST_SHA="${LAST_SHA:-}"
+          echo "last_sha=${LAST_SHA}" >> "$GITHUB_OUTPUT"
+          echo "last nightly commit: ${LAST_SHA:-<none>}"
+          echo "current main commit: ${GITHUB_SHA}"
+
+          # Skip when main has not moved. Republishing byte-identical images
+          # over a quiet weekend burns runner time and, worse, makes the
+          # 7-tag ring cover 7 calendar days instead of 7 CHANGED days —
+          # which is the thing the ring is for.
+          if [ "$FORCE" = "true" ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "→ forced by dispatch"
+          elif [ -n "$LAST_SHA" ] && [ "$LAST_SHA" = "$GITHUB_SHA" ]; then
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            echo "→ main unchanged since the last nightly; skipping"
+          else
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+
+  # ── Build + push every image release.yml publishes ────────────────────
+  # A matrix over IMAGES (never over platforms — see the note in
+  # release.yml: a platform matrix pushes each arch to the same tag and the
+  # second push overwrites the first, yielding a single-arch image wearing
+  # a multi-arch tag).
+  images:
+    name: ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    needs: gate
+    if: needs.gate.outputs.should_build == 'true'
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: spatiumddi-api
+            context: ./backend
+            file: ./backend/Dockerfile
+            # #732 — MUST stay pinned. ``dev`` is the LAST stage in
+            # backend/Dockerfile, so an unpinned build publishes an api
+            # image carrying pytest + coverage installed as root.
+            target: runtime
+          - image: spatiumddi-frontend
+            context: ./frontend
+            file: ./frontend/Dockerfile
+            target: ""
+          - image: dns-bind9
+            context: .
+            file: ./agent/dns/images/bind9/Dockerfile
+            target: ""
+          - image: dns-powerdns
+            context: .
+            file: ./agent/dns/images/powerdns/Dockerfile
+            target: ""
+          - image: dns-technitium
+            context: .
+            file: ./agent/dns/images/technitium/Dockerfile
+            target: ""
+          - image: dns-dnsdist
+            context: .
+            file: ./agent/dns/images/dnsdist/Dockerfile
+            target: ""
+          - image: dhcp-kea
+            context: .
+            file: ./agent/dhcp/images/kea/Dockerfile
+            target: ""
+          - image: spatium-supervisor
+            context: .
+            file: ./agent/supervisor/images/supervisor/Dockerfile
+            target: ""
+          - image: looking-glass
+            context: .
+            file: ./agent/looking-glass/images/gobgp/Dockerfile
+            target: ""
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        if: github.event.inputs.dry_run != 'true'
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build + push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
+          target: ${{ matrix.target }}
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event.inputs.dry_run != 'true' }}
+          # `:nightly` is the mutable pointer; the dated tag is the
+          # immutable snapshot the ring keeps.
+          tags: |
+            ${{ env.IMAGE_PREFIX }}/${{ matrix.image }}:nightly
+            ${{ env.IMAGE_PREFIX }}/${{ matrix.image }}:${{ needs.gate.outputs.date_tag }}
+          build-args: |
+            VITE_APP_VERSION=${{ needs.gate.outputs.version }}
+          cache-from: type=gha,scope=nightly-${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=nightly-${{ matrix.image }}
+
+      # Load the amd64 image locally and scan it with the SAME gate CI uses
+      # on PRs. This is the cheapest fix for the detection gap in the header
+      # comment: a base-image CVE gets caught the night the Dockerfile
+      # changes, not at the next release.
+      - name: Build amd64 for scanning
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
+          target: ${{ matrix.target }}
+          platforms: linux/amd64
+          load: true
+          tags: scan-target:${{ matrix.image }}
+          build-args: |
+            VITE_APP_VERSION=${{ needs.gate.outputs.version }}
+          cache-from: type=gha,scope=nightly-${{ matrix.image }}
+
+      - name: Trivy
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          image-ref: scan-target:${{ matrix.image }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          format: table
+
+  # ── Prune the dated tag ring ──────────────────────────────────────────
+  prune:
+    name: Prune old nightly tags
+    runs-on: ubuntu-latest
+    needs: [gate, images]
+    if: needs.gate.outputs.should_build == 'true' && github.event.inputs.dry_run != 'true'
+    permissions:
+      packages: write
+    steps:
+      - name: Keep the newest 7 dated tags per image
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          KEEP=7
+          IMAGES="spatiumddi-api spatiumddi-frontend dns-bind9 dns-powerdns \
+                  dns-technitium dns-dnsdist dhcp-kea spatium-supervisor looking-glass"
+
+          for img in $IMAGES; do
+            echo "── $img"
+            # A version is a prune candidate ONLY when every tag it carries
+            # is a dated nightly tag. That is what protects `latest`, the
+            # CalVer release tags, and the `:nightly` pointer — the pointer
+            # shares a version with the newest dated tag, which the sort
+            # keeps anyway, but the all-tags-match rule means we would never
+            # delete it even if it did not.
+            # Distinguish "no candidates" from "the API call failed". A
+            # silently-empty list would print "nothing to prune" and read as
+            # success while the ring grew without bound — the same
+            # silence-as-success failure this whole workflow exists to catch.
+            if ! raw=$(gh api --paginate \
+              "/orgs/${OWNER}/packages/container/${img}/versions" 2>&1); then
+              echo "   ! could not list versions — skipping (is ${OWNER} an org?)"
+              echo "     ${raw}" | head -3
+              continue
+            fi
+            versions=$(printf '%s' "$raw" | jq -r '.[] | select(
+                      (.metadata.container.tags | length) > 0 and
+                      (.metadata.container.tags | all(test("^nightly-[0-9]{8}$")))
+                    ) | "\(.created_at)\t\(.id)\t\(.metadata.container.tags | join(","))"' \
+              | sort -r)
+
+            total=$(printf '%s' "$versions" | grep -c . || true)
+            if [ "${total:-0}" -le "$KEEP" ]; then
+              echo "   ${total:-0} dated tag(s) — nothing to prune"
+              continue
+            fi
+            echo "   ${total} dated tag(s) — pruning $((total - KEEP))"
+
+            printf '%s\n' "$versions" | tail -n +$((KEEP + 1)) | while IFS=$'\t' read -r created id tags; do
+              [ -n "$id" ] || continue
+              echo "   deleting $tags (created $created)"
+              gh api -X DELETE \
+                "/orgs/${OWNER}/packages/container/${img}/versions/${id}" || \
+                echo "   ! delete failed for $id — continuing"
+            done
+          done
+
+  # ── Record what was built, and make a failure impossible to miss ──────
+  finalize:
+    name: Finalize
+    runs-on: ubuntu-latest
+    needs: [gate, images, prune]
+    # `always()` so this runs even when a build job failed — recording the
+    # outcome, and surfacing a failure, is the whole point.
+    if: always() && needs.gate.outputs.should_build == 'true'
+    permissions:
+      contents: write
+      issues: write
+    steps:
+      - name: Update the nightly pre-release record
+        if: needs.images.result == 'success' && github.event.inputs.dry_run != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "$NIGHTLY_TAG" >/dev/null 2>&1; then
+            gh release create "$NIGHTLY_TAG" --title "Nightly build" --prerelease --notes "init"
+          fi
+          # `built-from:` is parsed by the gate job on the next run. Keep the
+          # 40-hex shape; the sed there anchors on it.
+          gh release edit "$NIGHTLY_TAG" --notes "$(cat <<EOF
+          Automated nightly build of \`main\`. **Not a release** — no support, no upgrade path.
+
+          built-from: ${GITHUB_SHA}
+          date-tag: ${{ needs.gate.outputs.date_tag }}
+
+          Pull the images:
+          \`\`\`
+          docker pull ghcr.io/${{ github.repository_owner }}/spatiumddi-api:nightly
+          \`\`\`
+          The dated tag \`${{ needs.gate.outputs.date_tag }}\` pins this exact build;
+          the newest 7 are kept.
+          EOF
+          )"
+
+      - name: Open or update a tracking issue on failure
+        # A nightly that fails silently is worth nothing — that is the whole
+        # reason for a scheduled build. One issue, reused, so a broken week
+        # doesn't open seven.
+        if: needs.images.result == 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TITLE="Nightly build failing"
+          BODY="Nightly build failed on \`main\` @ \`${GITHUB_SHA::12}\`.
+
+          - images: ${{ needs.images.result }}
+
+          Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+
+          This issue is reused by every failing nightly — close it once the
+          build is green again."
+          EXISTING=$(gh issue list --state open --search "$TITLE in:title" \
+                       --json number --jq '.[0].number' 2>/dev/null || true)
+          if [ -n "${EXISTING:-}" ] && [ "${EXISTING}" != "null" ]; then
+            gh issue comment "$EXISTING" --body "$BODY"
+          else
+            gh issue create --title "$TITLE" --body "$BODY" --label "area:ops" || \
+              gh issue create --title "$TITLE" --body "$BODY"
+          fi
