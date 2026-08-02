@@ -366,3 +366,120 @@ def test_clamped_rows_are_reported_not_silently_dropped(m) -> None:
     # 21 visible (the Succeeded job is filtered out), 3 shown → 18 hidden.
     assert "+18 more pods" in text
     assert "F3 to list" in text
+
+
+# ── #803 — dashboard rendering polish ─────────────────────────────────
+
+
+def test_node_column_hidden_on_a_single_node_cluster(m) -> None:
+    """It was the same hostname repeated down every row, while NAME — the
+    one flexible column — got squeezed to ellipsis behind 12 fixed ones."""
+    rows = [_pod592(f"pod-{i}", "ddi1") for i in range(4)]
+    text = _panel_text(m, rows)
+    assert "NODE" not in text
+    assert "ddi1" not in text
+
+
+def test_node_column_returns_when_there_is_more_than_one_node(m) -> None:
+    rows = [_pod592("a", "ddi1"), _pod592("b", "ddi2")]
+    text = _panel_text(m, rows)
+    assert "NODE" in text
+    assert "ddi2" in text
+
+
+def test_long_pod_names_survive_on_a_wide_console(m) -> None:
+    """Two CloudNativePG replicas differ only in their pod hash; the old
+    22-char cap cut exactly there and rendered them identically."""
+    rows = [
+        _pod592("cloudnative-pg-8cc7b886c-g5svx", "ddi1"),
+        _pod592("cloudnative-pg-8cc7b886c-r4mgt", "ddi1"),
+    ]
+    text = _panel_text(m, rows)
+    assert "g5svx" in text and "r4mgt" in text
+
+
+def test_human_cpu_keeps_sub_centicore_readings_honest(m) -> None:
+    """``f"{c:.2f}"`` renders 0.00 for every idle pod, which is most of an
+    appliance — indistinguishable from truly zero."""
+    assert m._human_cpu(1.25) == "1.25"
+    assert m._human_cpu(0.30) == "0.30"
+    assert m._human_cpu(0.004) == "4m"
+    assert m._human_cpu(0.0) == "0"
+
+
+def test_sanitize_strips_ansi_and_control_bytes(m) -> None:
+    """Pod stdout is arbitrary; the console font has 256 glyphs, so an
+    escape sequence renders as mojibake."""
+    assert m._sanitize_console_text("\x1b[31mred\x1b[0m") == "red"
+    assert m._sanitize_console_text("a\x00b\x07c") == "abc"
+    assert m._sanitize_console_text("a\tb") == "a b"
+    assert m._sanitize_console_text("plain text") == "plain text"
+
+
+def test_celery_prefix_compaction_returns_the_payload(m) -> None:
+    raw = (
+        "[2026-08-02 16:55:49,504: INFO/ForkPoolWorker-4] "
+        "Task app.tasks.dns_health.probe"
+        "[3f2a1b4c-1111-2222-3333-444455556666] succeeded in 0.31s: {'ok': 3}"
+    )
+    out = m.AppLogTail._compact(raw)
+    assert out.startswith("16:55:49 INFO")
+    assert "ForkPoolWorker" not in out
+    assert "3f2a1b4c" not in out
+    assert "{'ok': 3}" in out  # the part worth reading survives
+    assert len(out) < len(raw) - 50
+
+
+NOISE_LINES = [
+    "Scheduler: Sending due task app.tasks.x",
+    "Task app.tasks.foo received",
+    "Task app.tasks.x succeeded in 0.02s: {'status': 'disabled'}",
+    # The majority case on a real box: enabled sweeps with nothing to do.
+    "Task app.tasks.event_outbox.process succeeded in 0.02s: "
+    "{'claimed': 0, 'delivered': 0, 'failed': 0, 'dead': 0}",
+    "Task app.tasks.dns.check_all succeeded in 0.02s: None",
+    "Task app.tasks.snmp.dispatch succeeded in 0.02s: 0",
+    'INFO:   10.42.0.1:8742 - "GET /metrics HTTP/1.1" 200 OK',
+    'INFO:   10.42.0.52:1 - "POST /api/v1/appliance/supervisor/heartbeat HTTP/1.1" 200 OK',
+]
+
+SIGNAL_LINES = [
+    "Task app.tasks.ipam_discovery.dispatch succeeded in 0.04s: 3",
+    "Task app.tasks.x succeeded in 0.1s: {'created': 4, 'deleted': 0}",
+    "Task app.tasks.x succeeded in 0.02s: {'claimed': 0, 'failed': 2}",
+    "Task app.tasks.x received but Failed to connect",
+    "Task app.tasks.x succeeded in 0.02s: {'status': 'error'}",
+    'INFO:   10.42.0.1 - "GET /api/v1/ipam/subnets HTTP/1.1" 200 OK',
+    'INFO:   10.42.0.1 - "GET /metrics HTTP/1.1" 500 Internal Server Error',
+    "Task app.tasks.x raised unexpected: ValueError()",
+]
+
+
+@pytest.mark.parametrize("line", NOISE_LINES)
+def test_app_log_noise_is_dropped(m, line: str) -> None:
+    assert m.AppLogTail._is_noise(line), line
+
+
+@pytest.mark.parametrize("line", SIGNAL_LINES)
+def test_app_log_signal_always_survives(m, line: str) -> None:
+    """The filter must fail toward showing too much. A single non-zero
+    count, an unrecognised status, or any error marker keeps the line."""
+    assert not m.AppLogTail._is_noise(line), line
+
+
+def test_all_zero_result_beats_the_error_veto_on_a_key_named_failed(m) -> None:
+    """``_REAL_ERROR_RE`` matches the bare word "failed", which appears as a
+    dict KEY in half these payloads. Having parsed every value and found
+    them zero, the line is proof of its own uneventfulness — so the parse
+    is checked before the keyword scan, or a key that says nothing failed
+    would veto its own filtering."""
+    line = "Task app.tasks.x succeeded in 0.02s: {'delivered': 0, 'failed': 0}"
+    assert m.AppLogTail._is_noop_result(line)
+    assert m.AppLogTail._is_noise(line)
+
+
+def test_unparseable_result_is_treated_as_interesting(m) -> None:
+    """Nested structures aren't parsed; assume they matter."""
+    assert not m.AppLogTail._is_noop_result(
+        "Task app.tasks.x succeeded in 0.02s: {'rows': [{'a': 0}]}"
+    )
