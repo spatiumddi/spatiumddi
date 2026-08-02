@@ -435,8 +435,11 @@ NOISE_LINES = [
     "Task app.tasks.foo received",
     "Task app.tasks.x succeeded in 0.02s: {'status': 'disabled'}",
     # The majority case on a real box: enabled sweeps with nothing to do.
-    "Task app.tasks.event_outbox.process succeeded in 0.02s: "
-    "{'claimed': 0, 'delivered': 0, 'failed': 0, 'dead': 0}",
+    # Kept to one source line — a wrapped string inside a list reads as a
+    # missing comma, which is exactly the mistake the lint guards against.
+    # (The four-key form and the `failed`-key veto interaction have their
+    # own test below.)
+    "Task app.tasks.event_outbox.process succeeded in 0.02s: {'delivered': 0, 'failed': 0}",
     "Task app.tasks.dns.check_all succeeded in 0.02s: None",
     "Task app.tasks.snmp.dispatch succeeded in 0.02s: 0",
     'INFO:   10.42.0.1:8742 - "GET /metrics HTTP/1.1" 200 OK',
