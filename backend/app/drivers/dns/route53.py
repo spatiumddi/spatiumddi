@@ -228,19 +228,33 @@ class Route53DNSDriver(CloudDNSDriverBase):
         # merge so siblings survive; update keeps the single-value replace
         # (see below).
         if change.op == "update":
-            # Replace the rrset with this single value. The update op carries
-            # only the NEW value (no old value), so a correct multi-value
-            # merge is impossible at this per-row→RRset layer — replace is
-            # correct for the common single-value rrset (CNAME, SOA, a host
-            # with one A/TXT). Multi-value value-edits are an inherent
-            # per-row→RRset limitation tracked in #29.
+            # #783 — UPSERT the COMPLETE desired rrset when the control plane
+            # resolved one. This used to write only the op's own value, which
+            # is a whole-rrset replace against an API that has no other kind
+            # of write: editing one of two A records at a name retired the
+            # other. The comment here used to call that an inherent
+            # per-row→RRset limitation; it was only inherent while the op
+            # carried a single value.
+            #
+            # Without a resolved set (a caller that opted out via
+            # ``rrset_action``) the single-value replace is kept — correct for
+            # the common single-value rrset (CNAME, a host with one A/TXT),
+            # and unchanged from before.
+            values = (
+                [{"Value": m.value} for m in change.rrset.members]
+                if change.rrset is not None and change.rrset.members
+                # MX / SRV: ``value`` already carries the priority/target, so
+                # a single ResourceRecords entry is correct.
+                else [{"Value": rr.value}]
+            )
+            ttl = int(
+                (change.rrset.ttl if change.rrset else None) or (rr.ttl if rr.ttl else 0) or 300
+            )
             rrset: dict[str, Any] = {
                 "Name": absolute,
                 "Type": rtype,
-                "TTL": default_ttl,
-                # MX / SRV: ``value`` already carries the priority/target, so
-                # a single ResourceRecords entry is correct.
-                "ResourceRecords": [{"Value": rr.value}],
+                "TTL": ttl,
+                "ResourceRecords": values,
             }
             await self._submit_change(server, client, zone_id, "UPSERT", rrset, change)
             return

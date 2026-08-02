@@ -30,8 +30,8 @@ What each test guards:
   order-independent and an op replay-safe
 * DNSSEC ops carry no RRset (they have no record to reason about) and must not
   blow up on the way past
-* agentless drivers are NOT stamped — they never read the field, so a row
-  claiming an RRset write nobody performed is a lie in the audit trail
+* agentless drivers ARE stamped too (#783), and the change handed to the
+  driver carries the set as a neutral ``RRsetData``
 """
 
 from __future__ import annotations
@@ -163,9 +163,22 @@ class _RecordingDriver:
 
     def __init__(self) -> None:
         self.changes: list[tuple[str, str, str]] = []
+        self.full_changes: list[Any] = []
 
     async def apply_record_change(self, _server: Any, change: Any) -> None:
         self.changes.append((change.op, change.record.name, change.record.record_type))
+        self.full_changes.append(change)
+
+    async def apply_record_changes(self, server: Any, changes: Any) -> list[Any]:
+        from app.drivers.dns.base import RecordChangeResult  # noqa: PLC0415
+
+        for change in changes:
+            await self.apply_record_change(server, change)
+        return [RecordChangeResult(ok=True, change=c) for c in changes]
+
+    @property
+    def last_change(self) -> Any:
+        return self.full_changes[-1] if self.full_changes else None
 
 
 # ── 1. the #773 regression ──────────────────────────────────────────────────
@@ -635,14 +648,21 @@ async def test_dnssec_ops_carry_no_rrset(db_session: AsyncSession) -> None:
     assert op.op == "dnssec_sign"
 
 
-async def test_agentless_ops_are_not_stamped(
+async def test_agentless_ops_are_stamped_and_reach_the_driver(
     db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Windows DNS and the cloud providers apply immediately from the control
-    plane and never read the field. Stamping their rows would put an RRset in
-    the audit trail that no driver ever wrote — a record-ops dashboard claiming
-    a convergence that did not happen. (Windows DNS has its own whole-RRset
-    collapse; that is a separate fix, and it must not be papered over here.)"""
+    """#783 — the agentless path gets the same set, as a neutral ``RRsetData``.
+
+    This test used to assert the opposite. The reasoning behind that was that
+    an agentless row must not claim an RRset write nobody performed — sound in
+    itself, and the wrong conclusion, because the agentless drivers were
+    performing whole-RRset writes the whole time. Windows' PowerShell
+    ``Get-DnsServerResourceRecord … | Remove-…`` takes out every RR at the
+    ``(name, type)`` no matter which value the op named, and only the op's own
+    value went back; Route 53 / Azure / Google replace the RRset on update.
+    So the write was always whole-RRset — it just had one value in it, which
+    is what silently retired the siblings. Now the row and the write agree.
+    """
     _grp, _server, zone = await _group_and_zone(db_session, driver="windows_dns")
     await _add_record(db_session, zone, name="www", value="10.0.0.1")
     await db_session.commit()
@@ -656,4 +676,42 @@ async def test_agentless_ops_are_not_stamped(
     assert op is not None
     assert op.state == "applied", "the agentless branch really ran"
     assert recorder.changes == [("create", "www", "A")]
-    assert "rrset" not in op.record
+    # The row records the desired end state...
+    assert {m["value"] for m in op.record["rrset"]["members"]} == {"10.0.0.1", "10.0.0.2"}
+    # ...and the driver was handed it, not just the one new value.
+    assert recorder.last_change is not None
+    assert recorder.last_change.rrset is not None
+    assert {m.value for m in recorder.last_change.rrset.members} == {"10.0.0.1", "10.0.0.2"}
+
+
+async def test_agentless_batch_folds_before_stamping(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bulk delete of two of three values must not have the ops contradict.
+
+    Both ops resolve against the same pre-delete snapshot, so reconciling each
+    in isolation would ship ``[B, C]`` for one and ``[A, C]`` for the other and
+    whichever landed last would reinstate a value the operator deleted. The
+    whole batch is folded first, so both carry the survivor.
+    """
+    _grp, _server, zone = await _group_and_zone(db_session, driver="windows_dns")
+    for value in ("10.0.0.1", "10.0.0.2", "10.0.0.3"):
+        await _add_record(db_session, zone, name="www", value=value)
+    await db_session.commit()
+
+    recorder = _RecordingDriver()
+    monkeypatch.setattr("app.services.dns.record_ops.get_driver", lambda _name: recorder)
+
+    await enqueue_record_ops_batch(
+        db_session,
+        zone,
+        [
+            {"op": "delete", "record": {"name": "www", "type": "A", "value": "10.0.0.1"}},
+            {"op": "delete", "record": {"name": "www", "type": "A", "value": "10.0.0.2"}},
+        ],
+    )
+
+    sets = [
+        {m.value for m in c.rrset.members} for c in recorder.full_changes if c.rrset is not None
+    ]
+    assert sets == [{"10.0.0.3"}, {"10.0.0.3"}]
