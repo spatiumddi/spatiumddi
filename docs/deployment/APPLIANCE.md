@@ -1248,6 +1248,28 @@ control-plane cluster itself, not the registered agent fleet.
    > set `slotImageMirror.enabled=true` itself; nothing there tracks the
    > replica count. Upgrading from an external image URL needs no mirror
    > either way.
+   >
+   > ⚠️ **Upgrading *to* `2026.07.30-1` from `2026.07.21-1` or earlier: do
+   > not use upload.** The nginx `location /api/v1/appliance/upgrade-images`
+   > block that raises `client_max_body_size` to 4 GiB — matching the
+   > backend's own `MAX_UPLOAD_BYTES` — first shipped **in** `2026.07.30-1`.
+   > On any earlier release the request falls through to the generic
+   > `/api/` location and nginx's ~1 MB default returns **413** before
+   > FastAPI ever sees it, so a ~1.8–2 GB `.raw.xz` cannot be staged at all.
+   >
+   > This is a chicken-and-egg: the fix only exists once you are already on
+   > the release you are trying to install. Use the **URL** source (mode 2
+   > below) or the host CLI over SSH instead — neither goes through that
+   > nginx location:
+   >
+   > ```bash
+   > sudo spatium-upgrade-slot apply \
+   >   https://github.com/spatiumddi/spatiumddi/releases/download/2026.07.30-1/spatiumddi-appliance-slot-2026.07.30-1-amd64.raw.xz \
+   >   --checksum https://github.com/spatiumddi/spatiumddi/releases/download/2026.07.30-1/spatiumddi-appliance-slot-2026.07.30-1-amd64.sha256
+   > ```
+   >
+   > Upload works normally once the appliance is on `2026.07.30-1` or
+   > later. See [#787](https://github.com/spatiumddi/spatiumddi/issues/787).
 2. **URL** (connected install). Operator pastes the GitHub release
    asset URL — same `https://github.com/.../spatiumddi-appliance-
    slot-amd64.raw.xz` shape the per-box flow uses. Each node fetches
