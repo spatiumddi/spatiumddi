@@ -20,13 +20,16 @@ Two things are pinned here:
 * the registry cannot drift. Since there is no metadata to diff against, the
   guard diffs against the SOURCE: every ``encrypt_str(...).decode(...)`` call
   in the app — the exact idiom for "embed Fernet ciphertext as a JSON-friendly
-  string" — must be at a site that has been reviewed against the registry.
+  string" — must be at a call site that has been reviewed against the
+  registry. It walks the AST rather than matching text, because the argument
+  is an arbitrary expression and a guard that quietly fails to see a site is
+  worse than no guard.
 """
 
 from __future__ import annotations
 
+import ast
 import json
-import re
 from pathlib import Path
 
 import pytest
@@ -40,26 +43,95 @@ from app.services.backup.rewrap import (
 )
 
 # Every source location that writes Fernet ciphertext into a JSON-friendly
-# string, with the registry entry that covers it. A new call site fails the
-# drift test below until it is either registered in JSONB_ENCRYPTED_FIELDS or
-# listed here with a reason — which is the review this file exists to force.
+# string, mapped to the registry entry that covers it. A new call site fails
+# the drift test below until it is either registered in
+# JSONB_ENCRYPTED_FIELDS or listed here with a reason — which is the review
+# this file exists to force.
+#
+# Keyed per CALL SITE (``file::enclosing_function``), not per file: four of
+# these live in one module, so a file-level key would let a fifth be added
+# there without anyone noticing. Function names are stable across
+# reformatting in a way line numbers are not.
 _KNOWN_ENC_STR_SITES: dict[str, str] = {
-    # platform_settings.syslog_targets[].ca_cert_pem
-    "app/api/v1/settings/router.py": "platform_settings JSONB (syslog / snmp / apt)",
-    # Same field, written by the Operator Copilot's settings write path.
-    "app/services/ai/operations_writes.py": "platform_settings.syslog_targets[].ca_cert_pem",
-    # backup_target.config, via the __enc__: prefix.
-    "app/services/backup/targets/secrets_config.py": "backup_target.config",
+    "app/api/v1/settings/router.py::_merge_syslog_targets": (
+        "platform_settings.syslog_targets[].ca_cert_pem"
+    ),
+    "app/api/v1/settings/router.py::_merge_snmp_v3_users::_resolve": (
+        "platform_settings.snmp_v3_users[].{auth,priv}_pass_enc"
+    ),
+    "app/api/v1/settings/router.py::_merge_apt_gpg_keys": (
+        "platform_settings.apt_gpg_keys[].armoured_text_enc"
+    ),
+    "app/api/v1/settings/router.py::_merge_apt_auth": ("platform_settings.apt_auth[].password_enc"),
+    "app/services/ai/operations_writes.py::_apply_update_syslog_settings": (
+        "platform_settings.syslog_targets[].ca_cert_pem, via the Operator Copilot"
+    ),
+    "app/services/backup/targets/secrets_config.py::encrypt_config_secrets": (
+        "backup_target.config, via the __enc__: prefix"
+    ),
 }
 
-# Real calls only — the negative lookahead skips ``encrypt_str(...)`` written
-# as prose in a docstring or comment, which this module's own registry does.
-_ENC_STR_CALL = re.compile(r"encrypt_str\((?!\s*\.\.\.\s*\))[^)]*\)\s*\.decode\(")
+
+class _EncryptStrVisitor(ast.NodeVisitor):
+    """Find ``encrypt_str(...).decode(...)`` and name its enclosing scope.
+
+    An AST walk rather than a regex, because the argument is an arbitrary
+    expression: ``encrypt_str((x or "").strip()).decode("ascii")`` has nested
+    parentheses that no simple pattern matches, and a guard that silently
+    fails to see a call site is worse than no guard.
+    """
+
+    def __init__(self) -> None:
+        self.scope: list[str] = []
+        self.sites: list[str] = []
+
+    def _scoped(self, node: ast.AST) -> None:
+        self.scope.append(node.name)  # type: ignore[attr-defined]
+        self.generic_visit(node)
+        self.scope.pop()
+
+    # ``ast.NodeVisitor`` dispatches on these exact CamelCase names, so the
+    # naming rule doesn't apply here.
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:  # noqa: N802
+        self._scoped(node)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:  # noqa: N802
+        self._scoped(node)
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:  # noqa: N802
+        self._scoped(node)
+
+    def visit_Call(self, node: ast.Call) -> None:  # noqa: N802
+        func = node.func
+        if (
+            isinstance(func, ast.Attribute)
+            and func.attr == "decode"
+            and isinstance(func.value, ast.Call)
+            and isinstance(func.value.func, ast.Name)
+            and func.value.func.id == "encrypt_str"
+        ):
+            self.sites.append("::".join(self.scope) or "<module>")
+        self.generic_visit(node)
 
 
 def _app_root() -> Path:
     # tests/ sits beside app/ in the backend image and in the repo.
     return Path(__file__).resolve().parent.parent / "app"
+
+
+def _inline_encrypt_sites() -> set[str]:
+    root = _app_root()
+    out: set[str] = set()
+    for path in sorted(root.rglob("*.py")):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except SyntaxError:  # pragma: no cover — a broken file fails elsewhere
+            continue
+        visitor = _EncryptStrVisitor()
+        visitor.visit(tree)
+        rel = path.relative_to(root.parent)
+        out.update(f"{rel}::{site}" for site in visitor.sites)
+    return out
 
 
 def test_every_inline_encrypt_site_is_registered() -> None:
@@ -71,11 +143,7 @@ def test_every_inline_encrypt_site_is_registered() -> None:
     this registry has to cover, and a new one appearing is exactly the moment
     a human should check whether the rewrap still spans everything.
     """
-    root = _app_root()
-    found: set[str] = set()
-    for path in root.rglob("*.py"):
-        if _ENC_STR_CALL.search(path.read_text(encoding="utf-8")):
-            found.add(str(path.relative_to(root.parent)))
+    found = _inline_encrypt_sites()
 
     unregistered = found - set(_KNOWN_ENC_STR_SITES)
     assert not unregistered, (
@@ -83,7 +151,7 @@ def test_every_inline_encrypt_site_is_registered() -> None:
         "string is invisible to the ENCRYPTED_COLUMNS metadata guard, so it "
         "will silently survive a cross-install restore under the SOURCE key "
         "unless it is added to JSONB_ENCRYPTED_FIELDS (#781). Add the field "
-        "to the registry, then register the site in _KNOWN_ENC_STR_SITES: "
+        "to the registry, then register the site here: "
         f"{sorted(unregistered)}"
     )
 
@@ -91,6 +159,32 @@ def test_every_inline_encrypt_site_is_registered() -> None:
     # implying coverage that no longer has anything to cover.
     stale = set(_KNOWN_ENC_STR_SITES) - found
     assert not stale, f"_KNOWN_ENC_STR_SITES lists sites that no longer exist: {sorted(stale)}"
+
+
+def test_the_guard_sees_through_nested_parentheses() -> None:
+    """The regex this replaced could not, and would have gone quiet.
+
+    A guard that misses a call site is worse than no guard, because it reads
+    as a passing check.
+    """
+    tree = ast.parse('def f():\n    return encrypt_str((x or "").strip()).decode("ascii")\n')
+    visitor = _EncryptStrVisitor()
+    visitor.visit(tree)
+
+    assert visitor.sites == ["f"]
+
+
+def test_the_guard_distinguishes_sites_within_one_file() -> None:
+    # Four of the six real sites share a module, so a file-level key would
+    # let a fifth be added there unnoticed.
+    tree = ast.parse(
+        "def a():\n    return encrypt_str(v).decode()\n"
+        "def b():\n    return encrypt_str(v).decode()\n"
+    )
+    visitor = _EncryptStrVisitor()
+    visitor.visit(tree)
+
+    assert sorted(visitor.sites) == ["a", "b"]
 
 
 def test_registry_covers_the_known_platform_settings_secrets() -> None:

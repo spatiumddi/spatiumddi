@@ -346,7 +346,7 @@ The restore response carries a `rewrap` block:
   "rewrapped_jsonb_fields": 0,      // JSONB-embedded secret rewraps
   "skipped_idempotent_rows": 0,     // already-dest-key-decryptable (re-run / post-restore-created)
   "failed_rows": 0,                 // couldn't decrypt with either key — operator re-enters by hand
-  "columns_visited": 19,
+  "columns_visited": 52,            // every ENCRYPTED_COLUMNS entry + every JSONB_ENCRYPTED_FIELDS entry
   "failures": []                    // first 10 failures with table / column / pk / reason
 }
 ```
