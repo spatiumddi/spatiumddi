@@ -391,6 +391,17 @@ def _interfaces_from_overview(data: Any) -> list[_OPNInterface]:
     alongside the addresses.
     """
     rows = _unwrap_rows(data)
+    # #430 — a firewall always has interfaces, so an empty or non-list /
+    # non-dict 200 (proxy error body, envelope change) is a degraded read,
+    # never a legitimate zero. Returning [] here would diff against an
+    # empty desired set and absence-delete every mirrored subnet. The
+    # ifconfig fallback carries the same guard; this endpoint needs its
+    # own because ``_unwrap_rows`` turns any of those bodies into [].
+    if not rows:
+        raise OPNsenseClientError(
+            "interfaces/overview/export returned no interface entries — "
+            "treating as a degraded read, not zero interfaces"
+        )
     out: list[_OPNInterface] = []
     saw_any_container = False
     for cfg in rows:

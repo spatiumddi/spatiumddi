@@ -147,8 +147,23 @@ def _opnsense() -> OPNsenseClient:
 
 @pytest.mark.asyncio
 async def test_opnsense_interfaces_real_data_parses() -> None:
+    # The payload here was invented when this guard was written, and it was
+    # wrong: it used flat ipaddr/subnet string keys that no OPNsense
+    # endpoint returns. #797 replaced it with the real shape — addresses in
+    # an ipv4[] array of {ipaddr, subnetbits} — which is what both the
+    # overview and ifconfig endpoints actually emit.
     client = _opnsense()
-    _stub_get(client, {"lan": {"device": "igb0", "ipaddr": "10.0.0.1", "subnet": "24"}})
+    _stub_get(
+        client,
+        [
+            {
+                "identifier": "lan",
+                "device": "igb0",
+                "ipv4": [{"ipaddr": "10.0.0.1", "subnetbits": 24}],
+                "ipv6": [],
+            }
+        ],
+    )
     out = await client.list_interfaces()
     assert len(out) == 1 and out[0].cidr == "10.0.0.0/24"
 
@@ -156,12 +171,35 @@ async def test_opnsense_interfaces_real_data_parses() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("body", [{}, [], None, "oops"])
 async def test_opnsense_interfaces_degraded_200_raises(body: Any) -> None:
-    # getInterfaceConfig always returns a non-empty keyed dict; empty/non-dict
+    # A firewall always has interfaces, so an empty or non-list/non-dict 200
     # is a degraded read that would otherwise delete every interface subnet.
+    # Both the overview endpoint and the ifconfig fallback must hold this;
+    # ``_stub_get`` answers whichever one the client reaches.
     client = _opnsense()
     _stub_get(client, body)
     with pytest.raises(OPNsenseClientError):
         await client.list_interfaces()
+
+
+@pytest.mark.asyncio
+async def test_opnsense_interfaces_all_filtered_is_not_degraded() -> None:
+    # The counterpart to the guard above: entries that ARE the right shape
+    # but get skipped for a reason we understand (WAN on DHCP here) are a
+    # legitimate zero, and must reach the reconciler's zero-interface
+    # warning rather than aborting the pass as a degraded read (#797).
+    client = _opnsense()
+    _stub_get(
+        client,
+        [
+            {
+                "identifier": "wan",
+                "device": "igb0",
+                "link_type": "dhcp",
+                "ipv4": [{"ipaddr": "198.51.100.2", "subnetbits": 29}],
+            }
+        ],
+    )
+    assert await client.list_interfaces() == []
 
 
 @pytest.mark.asyncio
