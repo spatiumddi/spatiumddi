@@ -42,7 +42,11 @@ from app.services.backup.archive import (
     extract_archive_members,
 )
 from app.services.backup.crypto import BackupCryptoError, decrypt_secrets
-from app.services.backup.migrations import MigrationOutcome, maybe_upgrade_after_restore
+from app.services.backup.migrations import (
+    MigrationOutcome,
+    maybe_upgrade_after_restore,
+    schema_direction_error,
+)
 from app.services.backup.rewrap import RewrapOutcome, rewrap_secrets
 
 logger = structlog.get_logger(__name__)
@@ -442,6 +446,20 @@ async def apply_backup_restore(
         secrets_payload = decrypt_secrets(secrets_enc, passphrase=passphrase)
     except BackupCryptoError as exc:
         raise BackupRestoreError(str(exc)) from exc
+
+    # Phase 2b: refuse a schema we cannot migrate forward, while the
+    # database is still intact. The same test runs post-replay inside
+    # ``maybe_upgrade_after_restore``, but by then the data is already
+    # overwritten and "refusing" only reports the damage (#781).
+    # Prefer the manifest, fall back to secrets.enc — which carries the same
+    # head and is already decrypted by Phase 2. Reading only the manifest let
+    # an archive with no recorded schema_version slip past the gate entirely,
+    # even though the head was recoverable a few lines up.
+    direction_error = schema_direction_error(
+        manifest.get("schema_version") or secrets_payload.get("schema_version")
+    )
+    if direction_error:
+        raise BackupRestoreError(direction_error)
 
     # Phase 3: pre-restore safety dump. Soft-fails — if the api
     # container can't write to ``/var/lib/spatiumddi/backups`` (no
