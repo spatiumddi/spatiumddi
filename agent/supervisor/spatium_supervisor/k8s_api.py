@@ -672,41 +672,57 @@ def _deep_merge(base: dict, overlay: dict) -> dict:
 def _helmchartconfig_doc(name: str, *, namespace: str = "kube-system") -> dict | None:
     """Current ``spec.valuesContent`` of the HelmChartConfig, parsed.
 
-    Returns ``{}`` when the CR genuinely has no values yet — it does not
-    exist (404), or it exists carrying an empty / unparseable document. That
-    is a real answer: there is nothing there to preserve.
+    Returns ``{}`` only when there is genuinely nothing to preserve: the CR
+    does not exist (404), or it exists with an empty ``valuesContent``.
 
-    Returns ``None`` when the answer is UNKNOWN — the kubeapi could not be
-    reached or gave a status we cannot interpret. The distinction is
-    load-bearing, and conflating the two is how #792 comes back. A caller
-    that merges onto ``{}`` writes a document containing only the keys it
-    owns; if the read failed but the write then succeeds (a blip between two
-    calls a few milliseconds apart), that write DELETES ``image.tag`` — the
-    exact key a cluster rolling upgrade is depending on mid-flight. So an
-    unknown current state must abort the write, not proceed on a guess. The
-    supervisor retries every heartbeat; a promote is delayed by ~30 s rather
-    than a control-plane version being silently rolled back."""
+    Returns ``None`` for every other non-answer — kubeapi unreachable, an
+    unexpected status, a body we cannot parse, or a document that is not a
+    mapping. "There is a document and I cannot read it" is NOT the same
+    claim as "there is no document", and conflating them is how #792 comes
+    back: a caller that merges onto ``{}`` writes a document containing only
+    the keys it owns, so if the read failed but the write then succeeds (a
+    blip between two calls milliseconds apart, or a CR whose YAML we choked
+    on), that write DELETES ``image.tag`` — the exact key a cluster rolling
+    upgrade is depending on mid-flight.
+
+    So an unknown current state aborts the write. The supervisor retries
+    every heartbeat, which costs ~30 s on a transient failure; a CR that
+    stays unparseable needs an operator to fix or delete it, and the
+    warning below is how they find out, rather than discovering it as a
+    silently rolled-back control-plane version."""
     path = (
         f"/apis/helm.cattle.io/v1/namespaces/{quote(namespace)}"
         f"/helmchartconfigs/{quote(name)}"
     )
     try:
         st, resp = _request("GET", path)
-    except (RuntimeError, OSError):
+    except (RuntimeError, OSError) as exc:
+        log.warning("supervisor.helmchartconfig.read_failed", chart=name, error=str(exc))
         return None
     if st == 404:
         return {}
     if st != 200:
+        log.warning("supervisor.helmchartconfig.read_failed", chart=name, status=st)
         return None
     try:
         raw = (json.loads(resp).get("spec") or {}).get("valuesContent") or ""
     except (json.JSONDecodeError, ValueError):
+        log.warning("supervisor.helmchartconfig.unparseable_body", chart=name)
+        return None
+    if not str(raw).strip():
         return {}
     try:
-        doc = yaml.safe_load(raw) if str(raw).strip() else None
-    except yaml.YAMLError:
-        return {}
-    return doc if isinstance(doc, dict) else {}
+        doc = yaml.safe_load(raw)
+    except yaml.YAMLError as exc:
+        log.warning("supervisor.helmchartconfig.unparseable_values", chart=name, error=str(exc))
+        return None
+    if not isinstance(doc, dict):
+        # A list or scalar at the top level is not something we can merge
+        # into. Refusing beats replacing it with our own keys and calling
+        # the operator's document a typo.
+        log.warning("supervisor.helmchartconfig.values_not_a_mapping", chart=name)
+        return None
+    return doc
 
 
 def _slot_image_mirror_enabled(cp_size: int, current_doc: dict) -> bool:

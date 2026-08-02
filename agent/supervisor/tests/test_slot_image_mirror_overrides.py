@@ -231,3 +231,66 @@ def test_owned_scaling_still_lands_on_every_workload(monkeypatch) -> None:
     assert doc["redis"]["sentinel"]["replicas"] == 3
     assert doc["frontend"]["controlPlaneVIP"] == "10.0.0.9"
     assert doc["frontend"]["loadBalancerSourceRanges"] == ["10.0.0.0/8"]
+
+
+# ── unknown current state vs genuinely-empty current state ───────────
+#
+# The whole #792 fix rests on this distinction, so each branch is pinned
+# individually rather than through one happy-path call.
+
+
+def _reader(monkeypatch, status: int, body: str):
+    def _fake(method, path, body_=None, content_type=None):
+        return (status, body)
+
+    monkeypatch.setattr(k8s_api, "_request", _fake)
+
+
+def test_absent_cr_reads_as_empty(monkeypatch) -> None:
+    _reader(monkeypatch, 404, "")
+    assert k8s_api._helmchartconfig_doc("spatium-control") == {}
+
+
+def test_empty_values_read_as_empty(monkeypatch) -> None:
+    _reader(monkeypatch, 200, json.dumps({"spec": {"valuesContent": "   "}}))
+    assert k8s_api._helmchartconfig_doc("spatium-control") == {}
+
+
+def test_unexpected_status_reads_as_unknown(monkeypatch) -> None:
+    _reader(monkeypatch, 500, "boom")
+    assert k8s_api._helmchartconfig_doc("spatium-control") is None
+
+
+def test_unparseable_body_reads_as_unknown(monkeypatch) -> None:
+    _reader(monkeypatch, 200, "{not json")
+    assert k8s_api._helmchartconfig_doc("spatium-control") is None
+
+
+def test_unparseable_values_read_as_unknown(monkeypatch) -> None:
+    # "there is a document and I cannot read it" is not "there is no
+    # document" — merging onto {} here would delete the operator's keys.
+    _reader(monkeypatch, 200, json.dumps({"spec": {"valuesContent": "a: [unclosed"}}))
+    assert k8s_api._helmchartconfig_doc("spatium-control") is None
+
+
+def test_non_mapping_values_read_as_unknown(monkeypatch) -> None:
+    _reader(monkeypatch, 200, json.dumps({"spec": {"valuesContent": "- a\n- b\n"}}))
+    assert k8s_api._helmchartconfig_doc("spatium-control") is None
+
+
+def test_unparseable_values_abort_the_write(monkeypatch) -> None:
+    writes: list[str] = []
+
+    def _fake(method, path, body=None, content_type=None):
+        if method == "GET":
+            return (200, json.dumps({"spec": {"valuesContent": "a: [unclosed"}}))
+        writes.append(method)
+        return (200, "{}")
+
+    monkeypatch.setattr(k8s_api, "_request", _fake)
+
+    ok, err = k8s_api.apply_control_plane_overrides(2, "")
+
+    assert ok is False
+    assert err is not None
+    assert writes == [], "a document we cannot read must not be overwritten"
