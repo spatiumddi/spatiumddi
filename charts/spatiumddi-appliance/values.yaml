@@ -106,11 +106,10 @@ dnsPowerdns:
   # docker-compose-only too: pdns auth speaks neither protocol, so the
   # listeners live on the dnsdist front. BIND9 needs no such sidecar.
 
-# DNS — Technitium backend. Same shape as dnsBind9. v1 supports primary
-# zones + standard record CRUD; DNSSEC and native DoT/DoH/DoQ listener
-# wiring (a real differentiator — Technitium needs no dnsdist-style
-# sidecar, unlike PowerDNS) are fast-follow, so no dotPort/dohPort knobs
-# here yet.
+# DNS — Technitium backend. Same shape as dnsBind9. Supports primary
+# zones + standard record CRUD, online DNSSEC signing (#740) and native
+# DoT / DoH / DoQ listeners (#741) — a real differentiator, since
+# Technitium needs no dnsdist-style sidecar the way PowerDNS does.
 dnsTechnitium:
   enabled: false
   image:
@@ -119,6 +118,24 @@ dnsTechnitium:
   inClusterApiUrl: ""  # #292 — see dnsBind9.inClusterApiUrl
   agentKey: ""
   serverGroupName: ""
+  #
+  # #741 / #799 — encrypted transports. Same contract as
+  # dnsBind9.dotPort/dohPort above: the listeners are configured in the
+  # DB (DNS → group → options), NOT here. The agent renders the daemon
+  # config from the bundle, and this pod is hostNetwork so it binds the
+  # host regardless of what the manifest declares. Set these to MATCH
+  # the group's configured ports so they show up in `kubectl get svc`,
+  # get routed by the MetalLB VIP Service, and are visible to any
+  # NetworkPolicy. Empty = not declared (the default: all three off).
+  #
+  # doqPort is UDP where the other two are TCP, and 853 is the RFC
+  # default for BOTH DoT and DoQ — so doqPort == dotPort is normal and
+  # correct, not a misconfiguration. DoQ has no dnsBind9 equivalent
+  # because BIND has no QUIC transport; the API refuses doq_enabled on
+  # any group with a non-Technitium member.
+  dotPort: ""   # e.g. 853
+  dohPort: ""   # e.g. 8443 — 443 collides with the appliance web UI
+  doqPort: ""   # e.g. 853  — UDP; may equal dotPort
 
 # DHCP — Kea backend. DaemonSet (single node) with ``hostNetwork:
 # true`` + ``CAP_NET_BIND_SERVICE`` so Kea sees DHCP-discover

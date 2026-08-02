@@ -1,11 +1,17 @@
-# Encrypted DNS transports — DoT / DoH host-port publishing (issue #50).
+# Encrypted DNS transports — DoT / DoH / DoQ host-port publishing
+# (issues #50, #741, #799).
 #
-# Overlay for operators who have turned DoT and/or DoH on for a server
+# Overlay for operators who have turned DoT, DoH and/or DoQ on for a server
 # group under DNS → Server Groups → Options → Encrypted transports.
 #
 #   docker compose -f docker-compose.yml \
 #                  -f docker-compose.dns-encrypted.yml \
 #                  --profile dns-bind9 up -d
+#
+# Substitute --profile dns-technitium or --profile dns-powerdns-with-dnsdist
+# for the other two paths. Only the service belonging to the profile you
+# start is affected; Compose ignores port entries for services that never
+# come up.
 #
 # Why an overlay rather than ports in the base file: Compose cannot publish
 # a port conditionally, so binding 853 / 443 unconditionally would break
@@ -24,27 +30,58 @@
 # taken. DoH defaults to host 8443 rather than 443 so nothing has to bind a
 # privileged port, and because 443 is usually already spoken for.
 #
-#   DNS_DOT_PORT            container port for DoT   (UI value, default 853)
-#   DNS_DOH_PORT            container port for DoH   (UI value, default 443)
-#   DNS_DOT_HOST_PORT       host port for DoT        (default 1853)
-#   DNS_DOH_HOST_PORT       host port for DoH        (default 8443)
-#   DNS_DOT_HOST_PORT_PDNS  host port, PowerDNS path (default 5853)
-#   DNS_DOH_HOST_PORT_PDNS  host port, PowerDNS path (default 5444)
+#   DNS_DOT_PORT             container port for DoT    (UI value, default 853)
+#   DNS_DOH_PORT             container port for DoH    (UI value, default 443)
+#   DNS_DOQ_PORT             container port for DoQ    (UI value, default 853)
+#   DNS_DOT_HOST_PORT        host port for DoT, BIND9  (default 1853)
+#   DNS_DOH_HOST_PORT        host port for DoH, BIND9  (default 8443)
+#   DNS_DOT_HOST_PORT_PDNS   host port, PowerDNS path  (default 5853)
+#   DNS_DOH_HOST_PORT_PDNS   host port, PowerDNS path  (default 5444)
+#   DNS_DOT_HOST_PORT_TECHNITIUM  host port, Technitium path (default 6853)
+#   DNS_DOH_HOST_PORT_TECHNITIUM  host port, Technitium path (default 6444)
+#   DNS_DOQ_HOST_PORT_TECHNITIUM  host port, Technitium path (default 6853/udp)
+#
+# ── DoQ shares DoT's port NUMBER, not its port ───────────────────────────
+# 853 is the RFC default for both DoT (TCP) and DoQ (UDP), so the defaults
+# below deliberately collide on the number and differ on the protocol. That
+# is correct and is why `doq_port` is a separate field from `dot_port` in
+# the UI — do not "fix" it by moving DoQ to another number unless you also
+# change it in the group's options.
 #
 # Compose MERGES port lists across files, so these add to the base :53
 # mappings rather than replacing them — do not repeat the :53 entries here.
 
 services:
-  # BIND9 serves DoT + DoH natively.
+  # BIND9 serves DoT + DoH natively. It has no client- or server-side QUIC
+  # transport, so there is no DoQ entry here — the group's doq_enabled
+  # toggle is refused for a bind9 group (#741).
   dns-bind9:
     ports:
       - "${DNS_DOT_HOST_PORT:-1853}:${DNS_DOT_PORT:-853}/tcp"
       - "${DNS_DOH_HOST_PORT:-8443}:${DNS_DOH_PORT:-443}/tcp"
 
-  # PowerDNS Authoritative speaks neither protocol, so on that driver the
+  # Technitium serves all three natively (#741), so unlike PowerDNS it needs
+  # no sidecar. HOST ports sit in the 6xxx band to match its base 6053:53
+  # mapping, so all three drivers can be up at once without colliding there.
+  #
+  # The CONTAINER side is a different story: DNS_DOT_PORT / DNS_DOH_PORT are
+  # shared by every service in this file, because each is "the port the
+  # listener is on", and there is only one such value per variable. Running
+  # two drivers whose GROUPS are configured for different listener ports is
+  # therefore not expressible here — one of the published mappings would
+  # point at a port nothing is listening on. Give the two groups the same
+  # listener port, or publish the odd one out by hand.
+  dns-technitium:
+    ports:
+      - "${DNS_DOT_HOST_PORT_TECHNITIUM:-6853}:${DNS_DOT_PORT:-853}/tcp"
+      - "${DNS_DOH_HOST_PORT_TECHNITIUM:-6444}:${DNS_DOH_PORT:-443}/tcp"
+      - "${DNS_DOQ_HOST_PORT_TECHNITIUM:-6853}:${DNS_DOQ_PORT:-853}/udp"
+
+  # PowerDNS Authoritative speaks none of the three, so on that driver the
   # listeners run on the dnsdist front, which terminates TLS and forwards
   # plaintext to pdns:53. Nothing to publish on dns-powerdns itself.
-  # Requires the dns-powerdns-with-dnsdist profile.
+  # Requires the dns-powerdns-with-dnsdist profile. No DoQ: the shipped
+  # dnsdist front is configured for DoT + DoH only.
   dns-dnsdist:
     ports:
       - "${DNS_DOT_HOST_PORT_PDNS:-5853}:${DNS_DOT_PORT:-853}/tcp"

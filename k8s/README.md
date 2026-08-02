@@ -269,12 +269,16 @@ work the same on either flavor; on the PowerDNS flavor they run on the
 dnsdist front, which has no Kubernetes deployment yet (docker-compose
 only).
 
-> **DoQ has no chart knob yet.** Technitium also serves DNS-over-QUIC,
-> which is UDP and therefore shares :853 with DoT without colliding —
-> but `dotPort` renders `protocol: TCP` and there is no `doqPort`, so
-> the UDP listener cannot be declared on the Pod or routed through the
-> Service. It still answers on a `hostNetwork` node. Tracked in
-> [#799](https://github.com/spatiumddi/spatiumddi/issues/799).
+**DoQ** (`doqPort`, issue #799) is Technitium-only: BIND has no QUIC
+transport, and the API refuses `doq_enabled` on any group with a
+non-Technitium member. It renders `protocol: UDP`, which is why it may
+carry the **same number** as `dotPort` — 853 is the RFC default for both
+DoT (TCP) and DoQ (UDP), and Kubernetes permits the repeat because the
+port *names* differ:
+
+```bash
+--set-json 'dnsAgents.servers=[{"name":"ns1","flavor":"technitium","group":"tech","dotPort":853,"doqPort":853,"dohPort":8443}]'
+```
 
 ### How servers register
 

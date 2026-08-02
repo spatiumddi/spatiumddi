@@ -106,15 +106,25 @@ spec:
           ports:
             - { name: dns-udp, containerPort: 53, protocol: UDP }
             - { name: dns-tcp, containerPort: 53, protocol: TCP }
-            {{- /* #50 — encrypted transports. Listener ports are configured
-                   in the DB (DNS -> group -> options); these declarations
-                   only make them routable + visible. Set per server to
-                   match. */}}
+            {{- /* #50 / #799 — encrypted transports. Listener ports are
+                   configured in the DB (DNS -> group -> options); these
+                   declarations only make them routable + visible. Set per
+                   server to match.
+
+                   doqPort is UDP and applies to flavor: technitium only —
+                   BIND has no QUIC transport and the API refuses
+                   doq_enabled on any group with a non-Technitium member.
+                   It may carry the SAME number as dotPort: 853 is the RFC
+                   default for both DoT (TCP) and DoQ (UDP), and Kubernetes
+                   allows the repeat because the port NAMES differ. */}}
             {{- with $server.dotPort }}
             - { name: dns-dot, containerPort: {{ . }}, protocol: TCP }
             {{- end }}
             {{- with $server.dohPort }}
             - { name: dns-doh, containerPort: {{ . }}, protocol: TCP }
+            {{- end }}
+            {{- with $server.doqPort }}
+            - { name: dns-doq, containerPort: {{ . }}, protocol: UDP }
             {{- end }}
           readinessProbe:
             tcpSocket: { port: 53 }
@@ -161,6 +171,9 @@ spec:
     {{- with $server.dohPort }}
     - { name: dns-doh, port: {{ . }}, targetPort: {{ . }}, protocol: TCP }
     {{- end }}
+    {{- with $server.doqPort }}
+    - { name: dns-doq, port: {{ . }}, targetPort: {{ . }}, protocol: UDP }
+    {{- end }}
 ---
 apiVersion: v1
 kind: Service
@@ -183,6 +196,9 @@ spec:
     {{- end }}
     {{- with $server.dohPort }}
     - { name: dns-doh, port: {{ . }}, protocol: TCP }
+    {{- end }}
+    {{- with $server.doqPort }}
+    - { name: dns-doq, port: {{ . }}, protocol: UDP }
     {{- end }}
 ---
 {{- end }}
