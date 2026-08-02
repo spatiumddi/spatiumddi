@@ -249,13 +249,28 @@ class AzureDNSDriver(CloudDNSDriverBase):
             await self._apply_create(client, rg, zone_label, relative, rtype, change.record)
             return
 
-        # update — keep the single-value replace-the-RRset behaviour. The
-        # update op carries only the NEW value (no old value to match
-        # against), so a correct multi-value merge is impossible at this
-        # layer. Replace is right for the common single-value RRset (CNAME,
-        # a host with one A/TXT). Multi-value value-edits are an inherent
-        # per-row→RRset limitation tracked in issue #29.
-        params = self._build_record_set_params(change.record)
+        # update — replace the RRset. #783: with a resolved RRset the
+        # replacement is the COMPLETE desired set, so editing one of two A
+        # records at a name no longer retires the other. That used to be
+        # described here as an inherent per-row→RRset limitation; it was
+        # only inherent while the op carried a single value.
+        #
+        # Without a resolved set (a caller that opted out via
+        # ``rrset_action``), or for a single-valued type with no typed list
+        # to fill, the previous single-value replace is kept — right for the
+        # common single-value RRset (CNAME, a host with one A/TXT).
+        attr = _RECORD_TYPE_TO_AZURE_ATTR.get(rtype)
+        if change.rrset is not None and change.rrset.members and attr is not None:
+            params = {
+                "ttl": (
+                    change.rrset.ttl
+                    if change.rrset.ttl is not None
+                    else (change.record.ttl if change.record.ttl is not None else 3600)
+                ),
+                attr: [self._build_record_entry(r) for r in change.rrset.as_records(change.record)],
+            }
+        else:
+            params = self._build_record_set_params(change.record)
 
         def _put() -> None:
             client.record_sets.create_or_update(rg, zone_label, relative, rtype, params)
