@@ -145,6 +145,17 @@ def _format_rdata(r: RecordData) -> str:
     return r.value
 
 
+def _rrset_members_or_self(change: RecordChange) -> list[RecordData] | None:
+    """The records this change should leave at its ``(name, type)`` (#783).
+
+    ``None`` means "no RRset was resolved" — the caller keeps its previous
+    per-value behaviour. An empty list means the RRset should not exist.
+    """
+    if change.rrset is None:
+        return None
+    return change.rrset.as_records(change.record)
+
+
 def _pack_record_chunks(
     eligible: list[tuple[int, RecordChange]],
 ) -> list[list[tuple[int, RecordChange]]]:
@@ -271,7 +282,25 @@ class WindowsDNSDriver(DNSDriver):
         rel_name = "@" if rr.name in ("", "@") else rr.name
         rdtype = dns.rdatatype.from_text(rtype)
 
-        if change.op == "delete":
+        if change.rrset is not None:
+            # #783 — one whole-RRset write of the complete desired set.
+            # ``replace`` is RFC 2136's "delete the RRset, then add these",
+            # which is exactly the semantics, and an empty member list
+            # degenerates to a bare delete. Without this, every op below
+            # named a single value while the wire operation addressed the
+            # whole RRset, so the siblings the op never mentioned were lost.
+            members = change.rrset.members
+            ttl = change.rrset.ttl or rr.ttl or 3600
+            if not members:
+                update.delete(rel_name, rdtype)
+            else:
+                update.replace(
+                    rel_name,
+                    ttl,
+                    rtype,
+                    *[_format_rdata(r) for r in change.rrset.as_records(rr)],
+                )
+        elif change.op == "delete":
             update.delete(rel_name, rdtype)
         else:  # create | update
             if change.op == "update":
@@ -889,32 +918,25 @@ if (Get-DnsServerZone -Name '{name}' -ErrorAction SilentlyContinue) {{
     raise ValueError(f"windows_dns._ps_apply_zone: bad op {op!r}")
 
 
-def _ps_apply_record(change: RecordChange) -> str:
-    """PowerShell script for ``apply_record_change`` create/update/delete.
+def _ps_add_record(zone: str, name: str, record: RecordData, ttl: int) -> str:
+    """The ``Add-DnsServerResourceRecord*`` call for ONE value.
 
-    Zone + record names, rdata, and TTL all flow through
-    ``_ps_escape_single_quoted`` so any PS metacharacter is neutered.
-    Update maps to delete+create on the target ``{name, type}`` since
-    Windows' PS cmdlets don't offer an atomic ``Set-…`` for all types.
-    That matches the ``_apply_record_change_rfc2136`` logic too.
+    ``zone`` and ``name`` arrive already escaped; the value + structured
+    fields are escaped here. Split out of ``_ps_apply_record`` so a
+    whole-RRset write can emit one of these per member without a second
+    copy of the per-type dispatch drifting from this one (#783).
     """
-    zone = _ps_escape_single_quoted((change.zone_name or "").rstrip("."))
-    rtype = change.record.record_type.upper()
-    rel_name = change.record.name if change.record.name not in ("", "@") else "@"
-    name = _ps_escape_single_quoted(rel_name)
-    ttl = int(change.record.ttl or 3600)
-    value = _ps_escape_single_quoted(change.record.value)
+    rtype = record.record_type.upper()
+    value = _ps_escape_single_quoted(record.value)
     # TXT: strip zone-file-style surrounding quotes so the WinRM path
     # publishes the same literal text as the RFC-2136 path (#426).
-    txt_value = _ps_escape_single_quoted(_strip_txt_quotes(change.record.value))
+    txt_value = _ps_escape_single_quoted(_strip_txt_quotes(record.value))
+    priority = int(record.priority or 0)
+    weight = int(record.weight or 0)
+    port = int(record.port or 0)
 
-    # Per-type create script. ``-AllowUpdateAny`` isn't a real switch — we
-    # use ``-ErrorAction Stop`` so any duplicate surfaces a clean failure
-    # rather than silently lying. The update op strips the old RR first.
-    priority = int(change.record.priority or 0)
-    weight = int(change.record.weight or 0)
-    port = int(change.record.port or 0)
-
+    # ``-AllowUpdateAny`` isn't a real switch — we use ``-ErrorAction Stop``
+    # so any duplicate surfaces a clean failure rather than silently lying.
     if rtype == "A":
         create = (
             f"Add-DnsServerResourceRecordA -ZoneName '{zone}' -Name '{name}' "
@@ -968,6 +990,43 @@ def _ps_apply_record(change: RecordChange) -> str:
         # ``apply_record_change`` before reaching this method; anything
         # that still lands here is a bug in dispatch.
         raise ValueError(f"windows_dns._ps_apply_record: unsupported type {rtype!r}")
+    return create
+
+
+def _ps_apply_record(change: RecordChange) -> str:
+    """PowerShell script for ``apply_record_change`` create/update/delete.
+
+    Zone + record names, rdata, and TTL all flow through
+    ``_ps_escape_single_quoted`` so any PS metacharacter is neutered.
+
+    #783 — when the change carries a resolved RRset, this renders ONE
+    whole-RRset write: remove every RR at the ``(name, type)``, then add
+    back each desired member. That is what the cmdlets can actually
+    express. The previous shape asked them for something narrower than
+    they do — ``Get-DnsServerResourceRecord … | Remove-…`` takes out the
+    whole RRset no matter which value the op named, and only the op's own
+    value was added back — so a second A record, a backup MX or an SPF
+    beside a verification TXT was silently retired by any write to the
+    name. Every op becomes idempotent as a side effect: replaying one
+    converges the server to the database.
+
+    Without an RRset (a caller that opted out via ``rrset_action``) the
+    previous per-value behaviour is kept: update maps to delete+create on
+    the target ``{name, type}``, since Windows' PS cmdlets don't offer an
+    atomic ``Set-…`` for all types, and that matches
+    ``_apply_record_change_rfc2136``.
+    """
+    zone = _ps_escape_single_quoted((change.zone_name or "").rstrip("."))
+    rtype = change.record.record_type.upper()
+    rel_name = change.record.name if change.record.name not in ("", "@") else "@"
+    name = _ps_escape_single_quoted(rel_name)
+    members = _rrset_members_or_self(change)
+    ttl = int((change.rrset.ttl if change.rrset else None) or change.record.ttl or 3600)
+    create = (
+        "\n".join(_ps_add_record(zone, name, m, ttl) for m in members)
+        if members
+        else _ps_add_record(zone, name, change.record, ttl)
+    )
 
     # Delete is idempotent: no-op if the zone or the record is already
     # absent. Without these guards, Get-DnsServerResourceRecord's
@@ -1004,16 +1063,27 @@ if (-not (Get-DnsServerZone -Name '{zone}' -ErrorAction SilentlyContinue)) {{
 {create}
 """.strip()
 
+    if change.op not in ("create", "update", "delete"):
+        raise ValueError(f"windows_dns._ps_apply_record: bad op {change.op!r}")
+
+    if members is not None:
+        # #783 — whole-RRset write. The op verb stops mattering: what the
+        # server should end up with is the resolved set, and every verb
+        # reaches it the same way. An empty set is a plain delete, which is
+        # what a delete op that removed the last value resolves to.
+        if not members:
+            return delete
+        return f"{delete}\n{create_with_zone_guard}"
+
+    # No resolved set — previous per-value behaviour.
     if change.op == "create":
         return create_with_zone_guard
     if change.op == "delete":
         return delete
-    if change.op == "update":
-        # Replace: wipe the existing RR(s) at (name, type) — idempotent —
-        # then add the new rdata guarded on zone existence. Matches what
-        # the RFC 2136 path does with update.delete(...) + update.add(...).
-        return f"{delete}\n{create_with_zone_guard}"
-    raise ValueError(f"windows_dns._ps_apply_record: bad op {change.op!r}")
+    # Replace: wipe the existing RR(s) at (name, type) — idempotent — then
+    # add the new rdata guarded on zone existence. Matches what the RFC 2136
+    # path does with update.delete(...) + update.add(...).
+    return f"{delete}\n{create_with_zone_guard}"
 
 
 def _ps_apply_record_batch(changes: Sequence[RecordChange]) -> str:
@@ -1043,11 +1113,41 @@ def _ps_apply_record_batch(changes: Sequence[RecordChange]) -> str:
     for i, change in enumerate(changes):
         rtype = change.record.record_type.upper()
         name = change.record.name if change.record.name not in ("", "@") else "@"
-        value = change.record.value or ""
-        # TXT: strip zone-file-style surrounding quotes for parity with the
-        # singular WinRM path + the RFC-2136 path (#426).
-        if rtype == "TXT":
-            value = _strip_txt_quotes(value)
+
+        def _member(rec: RecordData, rt: str = rtype) -> dict[str, Any]:
+            v = rec.value or ""
+            # TXT: strip zone-file-style surrounding quotes for parity with
+            # the singular WinRM path + the RFC-2136 path (#426).
+            if rt == "TXT":
+                v = _strip_txt_quotes(v)
+            return {
+                "v": v,
+                "pr": int(rec.priority or 0),
+                "w": int(rec.weight or 0),
+                "p": int(rec.port or 0),
+            }
+
+        # #783 — the wrapper is now one uniform "maybe clear the RRset, then
+        # add these values" body, and the two flags below say what each op
+        # means in those terms. That keeps a single copy of the per-type
+        # cmdlet dispatch while still expressing both semantics:
+        #
+        # * With a resolved RRset, ``m`` is the COMPLETE desired set, so the
+        #   clear-then-add IS the whole-RRset write. An empty ``m`` means the
+        #   RRset should not exist — which is what a delete of the last value
+        #   resolves to.
+        # * Without one (a caller that opted out via ``rrset_action``), the
+        #   previous per-value semantics are preserved exactly: create ADDS to
+        #   whatever is there (``rm=0``), update replaces, delete clears and
+        #   adds nothing. Getting this wrong turns a legacy delete into a
+        #   remove-then-re-add, i.e. a silent no-op.
+        members = _rrset_members_or_self(change)
+        if members is not None:
+            to_add, remove_first = members, True
+        elif change.op == "delete":
+            to_add, remove_first = [], True
+        else:
+            to_add, remove_first = [change.record], change.op == "update"
         ops.append(
             {
                 "i": i,
@@ -1055,11 +1155,11 @@ def _ps_apply_record_batch(changes: Sequence[RecordChange]) -> str:
                 "z": (change.zone_name or "").rstrip("."),
                 "n": name,
                 "t": rtype,
-                "v": value,
-                "ttl": int(change.record.ttl or 3600),
-                "pr": int(change.record.priority or 0),
-                "w": int(change.record.weight or 0),
-                "p": int(change.record.port or 0),
+                "m": [_member(r) for r in to_add],
+                "rm": 1 if remove_first else 0,
+                "ttl": int(
+                    (change.rrset.ttl if change.rrset else None) or change.record.ttl or 3600
+                ),
             }
         )
     blob = json.dumps(ops, separators=(",", ":")).encode("utf-8")
@@ -1086,18 +1186,25 @@ def _ps_apply_record_batch(changes: Sequence[RecordChange]) -> str:
         ' $e=[ordered]@{change_index=[int]$_.i;name="$($_.n)";'
         'type="$($_.t)";op="$($_.op)";ok=$false;error=$null}\n'
         " try{\n"
-        "  $z=$_.z;$n=$_.n;$t=$_.t;$v=$_.v;"
+        "  $z=$_.z;$n=$_.n;$t=$_.t;$m=$_.m;"
         "$tl=[TimeSpan]::FromSeconds([int]$_.ttl)\n"
         "  $ze=[bool](Get-DnsServerZone -Name $z -EA SilentlyContinue)\n"
-        "  if($_.op -eq 'delete'){\n"
-        "   if($ze){$x=Get-DnsServerResourceRecord -ZoneName $z -Name $n"
+        '  if($_.op -notin @("create","update","delete")){throw "Unsupported op"}\n'
+        # #783 — one body for every op: clear the RRset if asked, then add
+        # each value in ``m``. The caller encodes the op's meaning into those
+        # two fields (see _ps_apply_record_batch), so this holds exactly one
+        # copy of the per-type cmdlet dispatch.
+        #
+        # The zone guard stays keyed to "is there anything to add": a delete
+        # against a zone the server doesn't have is a no-op (reverse-zone
+        # drift is the common trigger), while a create/update there is a real
+        # error the operator fixes with Sync with Servers.
+        '  if($m.Count -gt 0 -and !$ze){throw "Zone $z not found"}\n'
+        "  if($ze -and [int]$_.rm -eq 1){$x=Get-DnsServerResourceRecord -ZoneName $z -Name $n"
         " -RRType $t -EA SilentlyContinue;"
         "if($x){$x|Remove-DnsServerResourceRecord -ZoneName $z -Force -EA Stop}}\n"
-        "  }elseif($_.op -eq 'create' -or $_.op -eq 'update'){\n"
-        '   if(!$ze){throw "Zone $z not found"}\n'
-        "   if($_.op -eq 'update'){$x=Get-DnsServerResourceRecord -ZoneName $z"
-        " -Name $n -RRType $t -EA SilentlyContinue;"
-        "if($x){$x|Remove-DnsServerResourceRecord -ZoneName $z -Force -EA Stop}}\n"
+        "  foreach($mm in $m){\n"
+        "   $v=$mm.v\n"
         "   switch($t){\n"
         "    'A'{Add-DnsServerResourceRecordA -ZoneName $z -Name $n"
         " -IPv4Address $v -TimeToLive $tl -EA Stop}\n"
@@ -1108,17 +1215,17 @@ def _ps_apply_record_batch(changes: Sequence[RecordChange]) -> str:
         "    'PTR'{Add-DnsServerResourceRecordPtr -ZoneName $z -Name $n"
         " -PtrDomainName $v -TimeToLive $tl -EA Stop}\n"
         "    'MX'{Add-DnsServerResourceRecordMX -ZoneName $z -Name $n"
-        " -MailExchange $v -Preference([int]$_.pr) -TimeToLive $tl -EA Stop}\n"
+        " -MailExchange $v -Preference([int]$mm.pr) -TimeToLive $tl -EA Stop}\n"
         "    'SRV'{Add-DnsServerResourceRecord -ZoneName $z -Name $n -Srv"
-        " -DomainName $v -Priority([int]$_.pr) -Weight([int]$_.w)"
-        " -Port([int]$_.p) -TimeToLive $tl -EA Stop}\n"
+        " -DomainName $v -Priority([int]$mm.pr) -Weight([int]$mm.w)"
+        " -Port([int]$mm.p) -TimeToLive $tl -EA Stop}\n"
         "    'NS'{Add-DnsServerResourceRecord -ZoneName $z -Name $n -NS"
         " -NameServer $v -TimeToLive $tl -EA Stop}\n"
         "    'TXT'{Add-DnsServerResourceRecord -ZoneName $z -Name $n -Txt"
         " -DescriptiveText $v -TimeToLive $tl -EA Stop}\n"
         '    default{throw "Unsupported type $t"}\n'
         "   }\n"
-        '  }else{throw "Unsupported op"}\n'
+        "  }\n"
         "  $e.ok=$true\n"
         ' }catch{$e.error="$($_.Exception.Message)"}\n'
         " $r+=(New-Object PSObject -Property $e)\n"

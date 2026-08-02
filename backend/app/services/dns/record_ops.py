@@ -20,7 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.agent_wake import collect_wake, dns_group_channel
 from app.drivers.dns import get_driver, is_agentless
-from app.drivers.dns.base import RecordChange, RecordData
+from app.drivers.dns.base import RecordChange, RecordData, RRsetData, RRsetMember
 from app.models.dns import DNSRecord, DNSRecordOp, DNSServer, DNSZone
 from app.services.dns.rrset import stamp_rrsets_for_ops
 from app.services.dns.serial import bump_zone_serial
@@ -38,6 +38,36 @@ async def resolve_primary_server(db: AsyncSession, zone: DNSZone) -> DNSServer |
     return res.scalar_one_or_none()
 
 
+def _rrset_from_payload(record: dict[str, Any]) -> RRsetData | None:
+    """Lift the stamped ``record["rrset"]`` payload into the neutral type.
+
+    #783 — the agentless drivers consume dataclasses, not the wire dict the
+    agent bundle ships, so the two representations meet here. Returns
+    ``None`` when the op carries no set (an ``rrset_action`` caller opted
+    out), which every driver reads as "keep your previous per-value
+    behaviour".
+    """
+    raw = record.get("rrset")
+    if not isinstance(raw, dict):
+        return None
+    members = raw.get("members")
+    if not isinstance(members, list):
+        return None
+    return RRsetData(
+        ttl=raw.get("ttl"),
+        members=tuple(
+            RRsetMember(
+                value=m.get("value", ""),
+                priority=m.get("priority"),
+                weight=m.get("weight"),
+                port=m.get("port"),
+            )
+            for m in members
+            if isinstance(m, dict)
+        ),
+    )
+
+
 async def _apply_agentless(
     db: AsyncSession,
     server: DNSServer,
@@ -51,7 +81,19 @@ async def _apply_agentless(
     Writes a DNSRecordOp row marked ``applied`` on success or ``failed`` on
     error. The request path continues either way — a failure is visible in
     the record-ops dashboard and via the existing IPAM↔DNS sync-check.
+
+    #783 — the op is stamped with its complete desired RRset first, the same
+    way the agent path is (#773). This used to be deliberately skipped here,
+    on the reasoning that an agentless op row must not claim an RRset write
+    nobody performed; that reasoning was sound and the conclusion was the
+    bug, because the agentless drivers were performing whole-RRset writes
+    anyway — just with one value in them, which is what silently retired the
+    siblings. Now they perform the write the row describes.
     """
+    if "rrset" not in record:
+        record = dict(record)
+        await stamp_rrsets_for_ops(db, zone, [{"op": op, "record": record}])
+
     op_row = DNSRecordOp(
         server_id=server.id,
         zone_name=zone.name,
@@ -76,6 +118,7 @@ async def _apply_agentless(
             port=record.get("port"),
         ),
         target_serial=target_serial or 0,
+        rrset=_rrset_from_payload(record),
     )
 
     try:
@@ -457,8 +500,17 @@ async def _apply_agentless_batch(
     (WinRM auth failure, PS parse error in the generated script) marks
     every row failed with the same error — per-op failures (a bad
     record type for example) only mark their own row.
+
+    #783 — the whole batch is folded and stamped with its desired RRsets in
+    ONE query before any row is written, exactly as the agent batch path
+    does. Folding matters here for the same reason it does there: a bulk
+    delete of two of three values at one name resolves both ops against the
+    same pre-delete snapshot, so reconciling each in isolation would ship
+    two contradictory sets and whichever landed last would reinstate a value
+    the operator deleted.
     """
-    from app.drivers.dns.base import RecordChange, RecordData  # noqa: PLC0415
+    ops = [{**o, "record": dict(o["record"])} for o in ops]
+    await stamp_rrsets_for_ops(db, zone, ops)
 
     op_rows: list[DNSRecordOp] = []
     for o in ops:
@@ -488,6 +540,7 @@ async def _apply_agentless_batch(
                 port=o["record"].get("port"),
             ),
             target_serial=o.get("target_serial") or 0,
+            rrset=_rrset_from_payload(o["record"]),
         )
         for o in ops
     ]

@@ -182,9 +182,16 @@ an `add` across two separate enqueue calls on one serial, and whole-RRset
 writes would make that pair order-dependent, since the delete's set is
 computed before the row is mutated.
 
-Not covered: the **agentless** Windows DNS driver
-(`backend/app/drivers/dns/windows.py`) has the same collapse in its own
-PowerShell path and is not fixed by this — it never receives the field.
+The **agentless** drivers get the same set (#783), through
+`RecordChange.rrset` rather than the wire payload — `record_ops` stamps the
+op, then lifts it into the neutral `RRsetData` the drivers consume. Windows
+DNS applies it as one remove-all-then-add-each-member write on both its
+PowerShell paths and as an RFC 2136 `replace` on its Path A path; Route 53,
+Azure DNS and Google Cloud DNS apply it on their `update` path, which
+previously replaced the whole RRset with the op's single value (their
+create/delete paths already read-merged and were never affected).
+Cloudflare addresses individual records by provider id and never collapsed.
+A driver that sees `rrset=None` keeps its previous per-value behaviour.
 
 ### TSIG Authentication
 
