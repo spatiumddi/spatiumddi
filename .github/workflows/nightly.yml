@@ -211,7 +211,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=nightly-${{ matrix.image }}
 
       - name: Trivy
-        uses: aquasecurity/trivy-action@0.33.1
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: scan-target:${{ matrix.image }}
           severity: HIGH,CRITICAL
