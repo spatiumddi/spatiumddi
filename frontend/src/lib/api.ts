@@ -7496,7 +7496,8 @@ export interface DHCPScope {
   lease_cache_max_age: number | null;
   ddns_enabled: boolean;
   ddns_hostname_policy: string | null;
-  ddns_domain_override: string | null;
+  // #784 — no ddns_domain_override. It never existed as a column; the DDNS
+  // domain is resolved from the IPAM chain (space -> block -> subnet).
   hostname_sync_mode: string;
   // When false, this scope's dynamic-pool lease mirrors are excluded from the
   // IPAM↔DNS drift check, so ephemeral pulled leases don't read as "out of sync".
