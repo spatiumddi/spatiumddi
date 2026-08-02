@@ -112,18 +112,44 @@ def test_latch_is_explicit_not_an_omission(monkeypatch) -> None:
     assert "slotImageMirror" in rec.doc
 
 
-def test_unreadable_current_state_falls_back_to_the_node_count(monkeypatch) -> None:
-    # A kubeapi blip must not turn the latch into a guess. Reading the live
-    # document fails closed to "{}", so the decision falls back to cp_size
-    # rather than to an invented previous state. (The WRITE still fails on
-    # an unreachable kubeapi — that is the upsert's own pre-existing
-    # behaviour, and it retries on the next heartbeat.)
+def test_an_unreadable_current_state_aborts_the_write(monkeypatch) -> None:
+    """Unknown != empty, and conflating them is how #792 comes back.
+
+    Merging onto ``{}`` produces a document holding only supervisor-owned
+    keys. If the READ failed but the WRITE then succeeds — a blip between
+    two calls milliseconds apart — that write deletes ``image.tag``, the one
+    key a cluster rolling upgrade is depending on mid-flight. So the write
+    is abandoned and retried on the next heartbeat.
+    """
+
     def _boom(method, path, body=None, content_type=None):
-        raise RuntimeError("kubeapi down")
+        if method == "GET":
+            raise RuntimeError("kubeapi down")
+        raise AssertionError("must not write when the current state is unknown")
 
     monkeypatch.setattr(k8s_api, "_request", _boom)
 
+    ok, err = k8s_api.apply_control_plane_overrides(2, "")
+
+    assert ok is False
+    assert err is not None
+
+
+def test_an_absent_cr_is_empty_not_unknown(monkeypatch) -> None:
+    # A 404 is a real answer — there is no document to preserve — so the
+    # first write on a fresh install must still go through.
+    rec = _Recorder()
+    monkeypatch.setattr(k8s_api, "_request", rec)
+
     assert k8s_api._helmchartconfig_doc("spatium-control") == {}
+
+    ok, err = k8s_api.apply_control_plane_overrides(2, "")
+    assert (ok, err) == (True, None)
+
+
+def test_the_latch_still_derives_from_the_node_count_when_nothing_is_written(
+    monkeypatch,
+) -> None:
     assert k8s_api._slot_image_mirror_enabled(2, {}) is True
     assert k8s_api._slot_image_mirror_enabled(1, {}) is False
 

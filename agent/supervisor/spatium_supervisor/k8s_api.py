@@ -669,18 +669,23 @@ def _deep_merge(base: dict, overlay: dict) -> dict:
     return out
 
 
-def _helmchartconfig_doc(name: str, *, namespace: str = "kube-system") -> dict:
+def _helmchartconfig_doc(name: str, *, namespace: str = "kube-system") -> dict | None:
     """Current ``spec.valuesContent`` of the HelmChartConfig, parsed.
 
-    Absent CR, unreadable kubeapi, unparseable JSON and unparseable YAML all
-    collapse to ``{}`` on purpose: every caller is asking "what is already
-    written here?", and for all four the honest answer is "nothing we can
-    rely on". Callers therefore fail OPEN — they recompute from cluster
-    state rather than inventing a state they cannot see. The one cost is
-    that a kubeapi blip can drop a foreign key (``image.tag``) on that
-    heartbeat; chart_bump re-stamps it, and the alternative — refusing to
-    write the control-plane overrides at all when the CR cannot be read —
-    would strand a promote."""
+    Returns ``{}`` when the CR genuinely has no values yet — it does not
+    exist (404), or it exists carrying an empty / unparseable document. That
+    is a real answer: there is nothing there to preserve.
+
+    Returns ``None`` when the answer is UNKNOWN — the kubeapi could not be
+    reached or gave a status we cannot interpret. The distinction is
+    load-bearing, and conflating the two is how #792 comes back. A caller
+    that merges onto ``{}`` writes a document containing only the keys it
+    owns; if the read failed but the write then succeeds (a blip between two
+    calls a few milliseconds apart), that write DELETES ``image.tag`` — the
+    exact key a cluster rolling upgrade is depending on mid-flight. So an
+    unknown current state must abort the write, not proceed on a guess. The
+    supervisor retries every heartbeat; a promote is delayed by ~30 s rather
+    than a control-plane version being silently rolled back."""
     path = (
         f"/apis/helm.cattle.io/v1/namespaces/{quote(namespace)}"
         f"/helmchartconfigs/{quote(name)}"
@@ -688,9 +693,11 @@ def _helmchartconfig_doc(name: str, *, namespace: str = "kube-system") -> dict:
     try:
         st, resp = _request("GET", path)
     except (RuntimeError, OSError):
+        return None
+    if st == 404:
         return {}
     if st != 200:
-        return {}
+        return None
     try:
         raw = (json.loads(resp).get("spec") or {}).get("valuesContent") or ""
     except (json.JSONDecodeError, ValueError):
@@ -821,6 +828,10 @@ def apply_control_plane_overrides(
         "tolerations": _CONTROL_PLANE_FAST_EVICT,
     }
     current_doc = _helmchartconfig_doc("spatium-control")
+    if current_doc is None:
+        # Unknown current state — see _helmchartconfig_doc. Writing here
+        # would merge onto {} and delete every key we do not own.
+        return False, "could not read the current spatium-control values"
     owned: dict[str, Any] = {
         "api": dict(scaled),
         "frontend": dict(scaled)
