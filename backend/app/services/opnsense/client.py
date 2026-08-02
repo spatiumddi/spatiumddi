@@ -177,6 +177,20 @@ _KEA_LEASE_STATE = {
 }
 
 
+def _kea_lease_state(raw: Any) -> str:
+    """Map Kea's numeric lease state, whether it arrives as ``0`` or ``"0"``.
+
+    The obvious ``str(raw or "")`` is wrong here and quietly so: ``0`` is
+    falsy, so an integer 0 — the ACTIVE state, and the one that matters —
+    collapses to ``""`` and every live lease reads as ``unknown``. The API
+    currently serialises these as strings, but nothing guarantees that,
+    and the failure would be silent rather than loud.
+    """
+    if raw is None:
+        return "unknown"
+    return _KEA_LEASE_STATE.get(str(raw).strip(), "unknown")
+
+
 @dataclass
 class _OPNArpEntry:
     """An ARP-table row from ``diagnostics/interface/getArp``."""
@@ -297,9 +311,7 @@ def _addresses_from_arrays(cfg: dict[str, Any]) -> tuple[list[tuple[str, str]], 
             addr = str(entry.get("ipaddr") or "").strip()
             if not addr:
                 continue
-            # Link-local addresses are per-link, not a routable subnet
-            # worth mirroring; they also collide across every interface.
-            if addr.lower().startswith("fe80:"):
+            if not _is_mirrorable_address(addr):
                 continue
             # A tunnel endpoint's "subnet" is the peer address, not a
             # LAN — mirroring it would invent a subnet that isn't one.
@@ -311,6 +323,34 @@ def _addresses_from_arrays(cfg: dict[str, Any]) -> tuple[list[tuple[str, str]], 
             out.append((addr, cidr))
             break  # primary only
     return out, saw_container
+
+
+def _is_mirrorable_address(addr: str) -> bool:
+    """Whether an interface address describes a subnet worth mirroring.
+
+    ``ifconfig`` reports every interface the kernel has, including ones
+    that are not networks anybody administers. Without this filter the
+    fallback parser mirrors ``lo0`` — producing a 16.7-million-address
+    ``127.0.0.0/8`` subnet, an auto-created wrapper block for it, and a
+    "gateway" reservation for 127.0.0.1 — plus ``::1/128`` beside it.
+
+    Excluded:
+
+    * **loopback** — not a network, and identical on every firewall, so
+      two mirrored routers would collide on the same CIDR.
+    * **link-local** (169.254/16, fe80::/10) — per-link by definition,
+      and likewise identical across interfaces and hosts.
+    * **unspecified** (0.0.0.0, ::) — an unconfigured placeholder.
+
+    Anything else, including RFC 1918 and public space, is mirrored:
+    deciding which *routable* ranges an operator cares about is their
+    call, not ours.
+    """
+    try:
+        ip = ipaddress.ip_address(addr.split("%", 1)[0])  # strip any zone id
+    except ValueError:
+        return False
+    return not (ip.is_loopback or ip.is_link_local or ip.is_unspecified)
 
 
 def _assert_interface_shape(entries: int, saw_any_container: bool, source: str) -> None:
@@ -354,6 +394,15 @@ def _interfaces_from_overview(data: Any) -> list[_OPNInterface]:
     out: list[_OPNInterface] = []
     saw_any_container = False
     for cfg in rows:
+        # Shape detection runs on EVERY row, before any policy filter.
+        # Accumulating it after the filters would conflate "we don't
+        # recognise this payload" with "every interface was skipped for a
+        # reason we understand" — so a WAN-only DHCP box, or one whose
+        # link_type vocabulary we don't know, would raise the degraded-read
+        # error and abort the pass instead of reaching the zero-interface
+        # warning that exists for exactly that case.
+        pairs, saw_container = _addresses_from_arrays(cfg)
+        saw_any_container = saw_any_container or saw_container
         # ``enabled`` absent means "not reported" — mirror it rather than
         # assume disabled, since only some firmwares emit the key.
         if "enabled" in cfg and not _truthy(cfg.get("enabled")):
@@ -362,8 +411,6 @@ def _interfaces_from_overview(data: Any) -> list[_OPNInterface]:
         # describe a subnet this IPAM should own.
         if str(cfg.get("link_type") or "").strip().lower() in {"dhcp", "none"}:
             continue
-        pairs, saw_container = _addresses_from_arrays(cfg)
-        saw_any_container = saw_any_container or saw_container
         device = str(cfg.get("device") or "")
         name = str(cfg.get("identifier") or "") or device
         for addr, cidr in pairs:
@@ -553,11 +600,21 @@ class OPNsenseClient:
         try:
             data = await self._get("/api/interfaces/overview/export")
         except OPNsenseClientError as exc:
-            if exc.status_code != 404:
+            if exc.status_code not in (404, 403):
                 raise
-            # Endpoint absent (very old firmware). Fall back to the
-            # diagnostics passthrough, which every supported release has.
-            logger.debug("opnsense_overview_export_absent", error=str(exc))
+            # 404 — endpoint absent (very old firmware).
+            # 403 — the API user predates this endpoint being required.
+            #   Existing installs were set up against the previous docs,
+            #   which only called for Diagnostics + DHCPv4 + Interfaces
+            #   privileges, so upgrading must not turn a working mirror
+            #   into a hard failure. Fall back rather than fail; the
+            #   operator gets poorer subnet names until they widen the
+            #   privilege, which beats an outage.
+            logger.info(
+                "opnsense_overview_export_unavailable",
+                status=exc.status_code,
+                error=str(exc),
+            )
             return await self._list_interfaces_via_diagnostics()
         return _interfaces_from_overview(data)
 
@@ -687,7 +744,7 @@ class OPNsenseClient:
                     address=addr,
                     mac=_normalise_mac(r.get("hwaddr")),
                     hostname=str(r.get("hostname") or "").strip(),
-                    state=_KEA_LEASE_STATE.get(str(r.get("state") or "").strip(), "unknown"),
+                    state=_kea_lease_state(r.get("state")),
                 )
             )
         return out
@@ -729,8 +786,19 @@ class OPNsenseClient:
                 json={"current": 1, "rowCount": 5000, "searchPhrase": ""},
             )
         except OPNsenseClientError as exc:
+            # Same 404/403 treatment as the Kea and Dnsmasq readers. This
+            # path is a POST so it can't use ``_get_optional``, but it
+            # must not be stricter: a user scoped to the least-privilege
+            # table in the docs gets 403 here, and failing the whole pass
+            # for one absent backend is the behaviour #797 was about.
             if exc.status_code == 404:
                 logger.debug("opnsense_leases_backend_absent", backend="isc", error=str(exc))
+                return None
+            if exc.status_code == 403:
+                logger.warning(
+                    "opnsense_dhcp_backend_forbidden", source="isc leases", error=str(exc)
+                )
+                self._forbidden.append("isc leases")
                 return None
             raise
         out: list[_OPNLease] = []
@@ -832,13 +900,9 @@ class OPNsenseClient:
         firmware and a ``rows[]`` wrapper on newer ones; both are
         flattened here.
         """
-        try:
-            body = await self._get("/api/dhcpv4/settings/getReservation")
-        except OPNsenseClientError as exc:
-            if exc.status_code == 404:
-                logger.debug("opnsense_reservations_backend_absent", backend="isc", error=str(exc))
-                return None
-            raise
+        body = await self._get_optional("/api/dhcpv4/settings/getReservation", "isc reservations")
+        if body is None:
+            return None
         rows: list[dict[str, Any]] = []
         if isinstance(body, dict) and "dhcpd" in body and isinstance(body["dhcpd"], dict):
             # ISC tree shape: dhcpd → <iface> → staticmap → {uuid|idx: {...}}

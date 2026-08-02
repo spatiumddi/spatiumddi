@@ -9455,6 +9455,8 @@ export interface IntegrationsDashboardTargetRow {
   sync_interval_seconds: number;
   last_synced_at: string | null;
   last_sync_error: string | null;
+  // #797 — non-fatal findings; null for integrations that don't compute them.
+  last_sync_warning: string | null;
   is_stale: boolean;
 }
 export interface IntegrationsDashboardPanel {
@@ -9465,6 +9467,7 @@ export interface IntegrationsDashboardPanel {
   healthy_count: number;
   stale_count: number;
   error_count: number;
+  warning_count: number;
   targets: IntegrationsDashboardTargetRow[];
 }
 export interface IntegrationsDashboardErrorRow {

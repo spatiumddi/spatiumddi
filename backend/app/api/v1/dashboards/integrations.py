@@ -52,6 +52,12 @@ class IntegrationTargetRow(BaseModel):
     sync_interval_seconds: int
     last_synced_at: datetime | None
     last_sync_error: str | None
+    # #797 — non-fatal findings from the last pass. A reconcile can be on
+    # time and error-free and still mirror nothing; without this the tab
+    # shows such a target green while the IPAM-tab panel shows it amber,
+    # which is the "both surfaces" rule (non-negotiable #15) broken.
+    # ``None`` for integrations that don't compute warnings.
+    last_sync_warning: str | None
     is_stale: bool  # last_synced_at older than 2× sync_interval, or never
 
 
@@ -63,6 +69,7 @@ class IntegrationPanel(BaseModel):
     healthy_count: int
     stale_count: int
     error_count: int
+    warning_count: int
     targets: list[IntegrationTargetRow]
 
 
@@ -127,15 +134,24 @@ def _build_panel(
     healthy = 0
     stale = 0
     errors = 0
+    warnings = 0
     for t in targets:
         last = getattr(t, "last_synced_at", None)
         interval = int(getattr(t, "sync_interval_seconds", 60) or 60)
         last_err = getattr(t, "last_sync_error", None)
+        # getattr default — only integrations that compute non-fatal
+        # findings carry the column; the rest report None.
+        last_warn = getattr(t, "last_sync_warning", None)
         is_stale = _is_stale(last, interval, now)
         if last_err:
             errors += 1
         elif is_stale:
             stale += 1
+        elif last_warn:
+            # Warned targets are counted separately rather than folded
+            # into healthy: the sync IS working, but it is not producing
+            # what the operator configured it to produce.
+            warnings += 1
         else:
             healthy += 1
         rows.append(
@@ -145,6 +161,7 @@ def _build_panel(
                 sync_interval_seconds=interval,
                 last_synced_at=last,
                 last_sync_error=last_err,
+                last_sync_warning=last_warn,
                 is_stale=is_stale,
             )
         )
@@ -156,6 +173,7 @@ def _build_panel(
         healthy_count=healthy,
         stale_count=stale,
         error_count=errors,
+        warning_count=warnings,
         targets=rows[:_TARGET_LIMIT],
     )
 

@@ -367,7 +367,8 @@ async def test_interfaces_fall_back_to_ifconfig_on_404() -> None:
         _routes({"/api/diagnostics/interface/getInterfaceConfig": _IFCONFIG_26_1})
     )
     ifaces = await _run(client, "list_interfaces")
-    assert {i.cidr for i in ifaces} == {"172.20.1.0/24", "198.51.100.0/29", "127.0.0.0/8"}
+    # lo0 is in the payload and deliberately not mirrored.
+    assert {i.cidr for i in ifaces} == {"172.20.1.0/24", "198.51.100.0/29"}
 
 
 # ── DHCP backend matrix (#797 cause 2) ────────────────────────────────
@@ -651,3 +652,152 @@ async def test_arp_parsed_from_bare_list() -> None:
     assert arp[0].address == "10.0.0.50"
     assert arp[0].mac == "bc:24:11:e8:4a:3f"
     assert arp[1].mac is None
+
+
+# ── Code-review follow-ups on the #797 fix ────────────────────────────
+
+
+def test_ifconfig_skips_loopback() -> None:
+    """``ifconfig`` reports every kernel interface, ``lo0`` included.
+
+    Without a filter the fallback parser mirrors 127.0.0.0/8 — a
+    16.7-million-address subnet, an auto-created wrapper block for it, and
+    a "gateway" reservation for 127.0.0.1 — on every firewall, and every
+    firewall would collide on the same CIDR.
+    """
+    cidrs = {i.cidr for i in _interfaces_from_ifconfig(_IFCONFIG_26_1)}
+    assert "127.0.0.0/8" not in cidrs
+    assert cidrs == {"172.20.1.0/24", "198.51.100.0/29"}
+
+
+def test_addresses_skip_ipv4_link_local_too() -> None:
+    """169.254/16 is as per-link as fe80::/10 and equally uninteresting."""
+    ifaces = _interfaces_from_ifconfig(
+        {"igc9": {"device": "igc9", "ipv4": [{"ipaddr": "169.254.1.5", "subnetbits": 16}]}}
+    )
+    assert ifaces == []
+
+
+def test_addresses_skip_unspecified() -> None:
+    ifaces = _interfaces_from_ifconfig(
+        {"igc9": {"device": "igc9", "ipv4": [{"ipaddr": "0.0.0.0", "subnetbits": 0}]}}
+    )
+    assert ifaces == []
+
+
+def test_overview_all_rows_filtered_is_a_clean_zero_not_a_shape_error() -> None:
+    """A WAN-only DHCP box parses to zero for a reason we understand.
+
+    Shape detection must therefore run before the enabled/link_type
+    filters — otherwise this raises the degraded-read error and aborts
+    the pass, instead of reaching the zero-interface warning that exists
+    for exactly this case.
+    """
+    rows = [
+        {
+            "identifier": "wan",
+            "device": "igc0",
+            "link_type": "dhcp",
+            "ipv4": [{"ipaddr": "198.51.100.2", "subnetbits": 29}],
+            "ipv6": [],
+        },
+        {
+            "identifier": "opt1",
+            "device": "igc1",
+            "enabled": False,
+            "ipv4": [{"ipaddr": "10.0.0.1", "subnetbits": 24}],
+            "ipv6": [],
+        },
+    ]
+    assert _interfaces_from_overview(rows) == []
+
+
+def test_overview_unknown_link_type_vocabulary_does_not_raise() -> None:
+    """An unrecognised link_type is skipped, not treated as shape drift."""
+    rows = [
+        {
+            "identifier": "opt9",
+            "device": "igc9",
+            "link_type": "some-future-mode",
+            "ipv4": [],
+            "ipv6": [],
+        }
+    ]
+    assert _interfaces_from_overview(rows) == []
+
+
+@pytest.mark.asyncio
+async def test_interfaces_fall_back_to_ifconfig_on_403_not_just_404() -> None:
+    """An API user provisioned against the OLD docs has no Interfaces:
+    Overview privilege. Upgrading must degrade to the fallback, not turn
+    a working mirror into a hard failure."""
+    client = _client_with_handler(
+        _routes(
+            {"/api/diagnostics/interface/getInterfaceConfig": _IFCONFIG_26_1},
+            status={"/api/interfaces/overview/export": 403},
+        )
+    )
+    ifaces = await _run(client, "list_interfaces")
+    assert {i.cidr for i in ifaces} == {"172.20.1.0/24", "198.51.100.0/29"}
+
+
+@pytest.mark.asyncio
+async def test_interfaces_5xx_on_overview_still_aborts() -> None:
+    """Only 404/403 fall back; a transient failure must propagate."""
+    client = _client_with_handler(_routes({}, status={"/api/interfaces/overview/export": 503}))
+    with pytest.raises(OPNsenseClientError, match="503"):
+        await _run(client, "list_interfaces")
+
+
+@pytest.mark.asyncio
+async def test_isc_lease_403_degrades_like_the_other_backends() -> None:
+    """The ISC reader is a POST so it can't use ``_get_optional``, but it
+    must not be stricter than the readers that can."""
+    client = _client_with_handler(
+        _routes(
+            {"/api/dnsmasq/leases/search": _DNSMASQ_LEASES},
+            status={"/api/dhcpv4/leases/searchLease": 403},
+        )
+    )
+    result = await _run(client, "list_leases")
+    assert result.sources_found == ["dnsmasq"]
+    assert "isc leases" in result.sources_forbidden
+
+
+@pytest.mark.asyncio
+async def test_isc_reservation_403_degrades_too() -> None:
+    client = _client_with_handler(_routes({}, status={"/api/dhcpv4/settings/getReservation": 403}))
+    result = await _run(client, "list_reservations")
+    assert result.reservations == []
+    assert "isc reservations" in result.sources_forbidden
+
+
+@pytest.mark.asyncio
+async def test_kea_numeric_zero_state_is_active_not_unknown() -> None:
+    """``str(0 or "")`` is ``""`` — so an integer 0, which is Kea's ACTIVE
+    state, would collapse to "unknown" and mark every live lease stale."""
+    client = _client_with_handler(
+        _routes(
+            {
+                "/api/kea/leases4/search": {
+                    "rows": [
+                        {"address": "172.20.1.50", "hwaddr": "aa:bb:cc:dd:ee:ff", "state": 0},
+                        {"address": "172.20.1.51", "hwaddr": "aa:bb:cc:dd:ee:01", "state": 2},
+                    ]
+                }
+            }
+        )
+    )
+    result = await _run(client, "list_leases")
+    by_addr = {x.address: x for x in result.leases}
+    assert by_addr["172.20.1.50"].state == "active"
+    assert by_addr["172.20.1.51"].state == "expired"
+
+
+@pytest.mark.asyncio
+async def test_kea_missing_state_is_unknown() -> None:
+    client = _client_with_handler(
+        _routes({"/api/kea/leases4/search": {"rows": [{"address": "172.20.1.52"}]}})
+    )
+    result = await _run(client, "list_leases")
+    assert result.leases[0].state == "unknown"

@@ -3901,8 +3901,15 @@ function IntegrationsDashboardTabPanel() {
 }
 
 function IntegrationCard({ panel }: { panel: IntegrationsDashboardPanel }) {
+  // #797 — a warned target syncs on time and without error but isn't
+  // producing what it was configured to produce, so it must not read as
+  // green here while the IPAM-tab panel shows it amber.
   const tone: Tone =
-    panel.error_count > 0 ? "bad" : panel.stale_count > 0 ? "warn" : "good";
+    panel.error_count > 0
+      ? "bad"
+      : panel.stale_count > 0 || panel.warning_count > 0
+        ? "warn"
+        : "good";
   const cls = TONE_CLASS[tone];
   return (
     <div className="rounded-lg border bg-card p-3">
@@ -3927,6 +3934,14 @@ function IntegrationCard({ panel }: { panel: IntegrationsDashboardPanel }) {
             </span>
           </>
         )}
+        {panel.warning_count > 0 && (
+          <>
+            {" · "}
+            <span className="text-amber-600 dark:text-amber-400">
+              {panel.warning_count} warning
+            </span>
+          </>
+        )}
         {panel.error_count > 0 && (
           <>
             {" · "}
@@ -3943,7 +3958,10 @@ function IntegrationCard({ panel }: { panel: IntegrationsDashboardPanel }) {
               key={t.id}
               className="flex items-baseline justify-between gap-2"
             >
-              <span className="truncate" title={t.display}>
+              <span
+                className="truncate"
+                title={t.last_sync_warning ?? t.display}
+              >
                 {t.display}
               </span>
               <span
@@ -3951,10 +3969,11 @@ function IntegrationCard({ panel }: { panel: IntegrationsDashboardPanel }) {
                   "shrink-0 tabular-nums",
                   t.last_sync_error
                     ? "text-red-600 dark:text-red-400"
-                    : t.is_stale
+                    : t.is_stale || t.last_sync_warning
                       ? "text-amber-600 dark:text-amber-400"
                       : "text-muted-foreground",
                 )}
+                title={t.last_sync_error ?? t.last_sync_warning ?? undefined}
               >
                 {t.last_synced_at ? humanTime(t.last_synced_at) : "never"}
               </span>
