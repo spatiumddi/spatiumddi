@@ -2146,11 +2146,29 @@ register(
 
 
 _DNS_DRIVER_HINTS = {"bind9", "powerdns", "technitium", "windows_dns"}
-# DNSSEC online signing + ALIAS + LUA records require the PowerDNS
-# driver — the preview rejects when ``dnssec_enabled=true`` lands in a
-# group whose servers don't include any PowerDNS member, since signing
-# would fail at apply time and confuse the operator.
-_POWERDNS_ONLY_FEATURES = ("dnssec_enabled",)
+
+# ``CreateDNSZoneArgs`` fields only some drivers can honour, mapped to
+# ``(REST operation whose driver gate governs them, operator-facing label)``.
+#
+# The driver set is NOT restated here — it is read from the DNS router's
+# ``_DRIVER_GATED_OPERATIONS`` at preview time. Issue #798: this used to be a
+# hardcoded ``_POWERDNS_ONLY_FEATURES = ("dnssec_enabled",)`` tuple tested with
+# ``"powerdns" not in drivers``, written when PowerDNS was the only online
+# signer. BIND9 inline-signing (#49) and Technitium online signing (#740)
+# widened the REST gate; this constant was not widened with it, so the Copilot
+# spent two releases refusing work the REST API accepted. Seeding from the
+# single source of truth is the fix — do not inline the driver names again.
+_DRIVER_GATED_ZONE_ARGS: dict[str, tuple[str, str]] = {
+    "dnssec_enabled": ("dnssec_sign", "online DNSSEC signing"),
+}
+
+
+def _drivers_for_gated_arg(arg: str) -> frozenset[str]:
+    """Return the drivers allowed to use ``arg``, read from the REST gate."""
+    from app.api.v1.dns.router import _DRIVER_GATED_OPERATIONS  # noqa: PLC0415
+
+    op, _label = _DRIVER_GATED_ZONE_ARGS[arg]
+    return _DRIVER_GATED_OPERATIONS[op]
 
 
 class CreateDNSZoneArgs(BaseModel):
@@ -2158,8 +2176,8 @@ class CreateDNSZoneArgs(BaseModel):
 
     ``driver_hint`` (issue #127 Phase 4e) lets the model express the
     operator's intent — "I need DNSSEC online signing, so this zone
-    has to land on a PowerDNS group" — without forcing it to know the
-    exact group UUID. When supplied, the preview either:
+    has to land on a group that can sign" — without forcing it to know
+    the exact group UUID. When supplied, the preview either:
 
     * uses ``driver_hint`` to select a matching group when
       ``group_id`` is omitted, OR
@@ -2188,10 +2206,12 @@ class CreateDNSZoneArgs(BaseModel):
         default=None,
         description=(
             "Preferred backend driver — one of ``bind9``, "
-            "``powerdns``, or ``windows_dns``. Required for "
-            "``dnssec_enabled=true`` (only PowerDNS supports online "
-            "signing). When ``group_id`` is set, this is validated "
-            "against the group's actual driver mix."
+            "``powerdns``, ``technitium``, or ``windows_dns``. Pair it "
+            "with ``dnssec_enabled=true`` to auto-select a group whose "
+            "driver can sign online (``bind9``, ``powerdns`` and "
+            "``technitium`` all can; ``windows_dns`` cannot). When "
+            "``group_id`` is set, this is validated against the group's "
+            "actual driver mix."
         ),
     )
     zone_type: str = Field(
@@ -2213,10 +2233,11 @@ class CreateDNSZoneArgs(BaseModel):
     dnssec_enabled: bool = Field(
         default=False,
         description=(
-            "Turn on DNSSEC for this zone. Requires a PowerDNS group "
-            "(BIND9 + Windows DNS don't support online signing here). "
-            'Pair with ``driver_hint="powerdns"`` to auto-select a '
-            "compatible group."
+            "Turn on DNSSEC for this zone. Requires a group with a "
+            "server whose driver signs online — ``bind9`` "
+            "(inline-signing), ``powerdns`` or ``technitium``. "
+            "``windows_dns`` and the cloud drivers cannot. Pair with a "
+            "matching ``driver_hint`` to auto-select a compatible group."
         ),
     )
     ttl: int = Field(
@@ -2338,19 +2359,32 @@ async def _preview_create_dns_zone(
     if grp is None:
         return PreviewResult(ok=False, detail=err)
 
-    # PowerDNS-only features (currently DNSSEC) — reject if the
-    # selected group has no PowerDNS member. Without this guard the
-    # apply would land the row but the agent would refuse to sign.
-    for feat in _POWERDNS_ONLY_FEATURES:
-        if getattr(args, feat) and "powerdns" not in drivers:
+    # Driver-gated zone features (currently DNSSEC). Semantics are copied
+    # from ``_check_driver_gated_operation`` in the DNS router, deliberately
+    # and exactly:
+    #
+    #   * SUBSET, not intersection — EVERY server in the group has to support
+    #     the feature, not merely one of them. An "any member matches" test
+    #     would pass a bind9 + windows_dns group here, land a zone flagged
+    #     dnssec_enabled, and then the sign/unsign endpoints would 422 it:
+    #     signed according to the UI, unsigned on the wire, and unfixable
+    #     through the API.
+    #   * Empty groups fail SOFT — a group with no servers yet has nobody to
+    #     disagree, and the REST gate re-runs once a driver is known.
+    for feat, (_op, label) in _DRIVER_GATED_ZONE_ARGS.items():
+        if not getattr(args, feat) or not drivers:
+            continue
+        allowed = _drivers_for_gated_arg(feat)
+        incompatible = drivers - allowed
+        if incompatible:
             return PreviewResult(
                 ok=False,
                 detail=(
-                    f"{feat}=true requires a PowerDNS-driver server in "
-                    f"the group, but {grp.name!r} has drivers "
-                    f"{sorted(drivers) or ['(none)']}. Add a PowerDNS "
-                    f"server to the group, pick a different group, or "
-                    f'set driver_hint="powerdns" without group_id.'
+                    f"{feat}=true requires every server in the group to support "
+                    f"{label} ({', '.join(sorted(allowed))}), but {grp.name!r} "
+                    f"also has {sorted(incompatible)}. Move those servers to "
+                    f"their own group, pick a different group, or set "
+                    f"driver_hint to one of {sorted(allowed)} without group_id."
                 ),
             )
 
@@ -2374,7 +2408,23 @@ async def _preview_create_dns_zone(
     parts.append(f"drivers={sorted(drivers) or ['(none)']}")
     parts.append(f"type={args.zone_type}/{args.kind}")
     if args.dnssec_enabled:
-        parts.append("DNSSEC=on (PowerDNS online signing)")
+        # Zone-create records INTENT. BIND9 converges from that alone — it
+        # signs inline from the rendered config bundle — but PowerDNS and
+        # Technitium sign only in response to the ``dnssec_sign`` record op,
+        # which neither this path nor the REST ``create_zone`` enqueues
+        # (issue #811). Say which of the two the operator is getting rather
+        # than implying the zone comes up signed everywhere. Once #811 lands
+        # this branch collapses back to a plain "DNSSEC=on".
+        deferred = sorted(drivers - {"bind9"})
+        if not drivers:
+            parts.append("DNSSEC=on (no servers in the group yet)")
+        elif deferred:
+            parts.append(
+                "DNSSEC=on — flag only; run the zone's DNSSEC Sign action to "
+                f"sign on {', '.join(deferred)}"
+            )
+        else:
+            parts.append("DNSSEC=on (bind9 signs inline from the config bundle)")
     return PreviewResult(ok=True, detail="ready", preview_text=", ".join(parts))
 
 
@@ -2446,8 +2496,9 @@ register(
         name="create_dns_zone",
         description=(
             "Create a new DNS zone. Honors driver_hint to route the "
-            "zone onto a PowerDNS / BIND9 / Windows DNS group; "
-            "DNSSEC zones require a PowerDNS group."
+            "zone onto a BIND9 / PowerDNS / Technitium / Windows DNS "
+            "group; DNSSEC zones require a group whose driver signs "
+            "online (bind9, powerdns or technitium)."
         ),
         args_model=CreateDNSZoneArgs,
         preview=_preview_create_dns_zone,

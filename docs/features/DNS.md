@@ -60,7 +60,9 @@ Manual rollover stays BIND9-only on purpose: PowerDNS and Technitium each roll o
 
 The Operator Copilot's `propose_create_dns_zone` tool accepts an explicit `driver_hint` argument (`bind9` / `powerdns` / `technitium` / `windows_dns`) so the LLM can route a zone to a matching group without operators having to specify the group UUID by hand. See `app.services.ai.operations.CreateDNSZoneArgs`.
 
-> **Known gap.** That tool's `dnssec_enabled=true` path is stricter than the REST gate above: `_POWERDNS_ONLY_FEATURES` still rejects a signed zone unless the group has a **PowerDNS** member, so the Copilot refuses on a BIND9 or Technitium group that the REST API would accept. Use the zone page (or the REST endpoint) to sign on those drivers until it is widened.
+Its `dnssec_enabled=true` path reads the same `dnssec_sign` row of the table above rather than restating it, with the same subset rule — *every* server in the group must run a signing driver, and an empty group passes — so the tool accepts exactly the groups the REST API accepts (issue #798; a test asserts the two agree for every driver, because they had drifted once).
+
+Note that creating a zone with `dnssec_enabled=true` records **intent**. BIND9 converges from that alone, signing inline from the rendered config; PowerDNS and Technitium sign in response to the `dnssec_sign` record op, which only the zone's **Sign** action enqueues. This is true of `POST /api/v1/dns/groups/{id}/zones` as well as the Copilot tool — on those two drivers, create-then-sign is two steps today, tracked in [#811](https://github.com/spatiumddi/spatiumddi/issues/811).
 
 ### 0a. Cloud DNS providers — Cloudflare / Route 53 / Azure DNS / Google Cloud DNS (issue #37)
 
@@ -1338,9 +1340,9 @@ topology needs a different thing:
 | Deployment | What to change | 443 conflict? |
 |---|---|---|
 | **Appliance (k3s)** | Nothing — the DNS workload is `hostNetwork`, so it binds the host directly. The supervisor opens the port automatically (above). | **Yes** — the web UI owns 80/443. The API rejects either listener on those ports here; use 8443. |
-| **Docker Compose (main stack)** | Add the `docker-compose.dns-encrypted.yml` overlay. | **No** — the frontend publishes `${HTTP_PORT:-8077}:80` and never binds 443. Container-side 443 is private to the DNS container. |
-| **Compose (standalone agent files)** | Uncomment the two port lines in `docker-compose.agent-dns-bind9.yml`. PowerDNS's standalone file has no dnsdist front, so DoT/DoH is unavailable there. | No. |
-| **Kubernetes / Helm** | Set `dnsBind9.dotPort` / `dohPort` (appliance chart) or per-server `dotPort` / `dohPort` (umbrella chart) to declare the containerPort + Service port. Raw manifests: uncomment the blocks in `k8s/dns/`. | Depends on your Ingress/LoadBalancer — you own the topology, so 443 is allowed. |
+| **Docker Compose (main stack)** | Add the `docker-compose.dns-encrypted.yml` overlay. It carries entries for `dns-bind9`, `dns-technitium` and `dns-dnsdist`; only the service in the profile you start comes up. | **No** — the frontend publishes `${HTTP_PORT:-8077}:80` and never binds 443. Container-side 443 is private to the DNS container. |
+| **Compose (standalone agent files)** | Uncomment the port lines in `docker-compose.agent-dns-bind9.yml` / `-technitium.yml`. The overlay does **not** apply to these files — it names the main stack's services, and merging it here would try to create image-less `dns-bind9` / `dns-dnsdist` services. PowerDNS's standalone file has no dnsdist front, so DoT/DoH is unavailable there. | No. |
+| **Kubernetes / Helm** | Set `dnsBind9.dotPort` / `dohPort` or `dnsTechnitium.dotPort` / `dohPort` / `doqPort` (appliance chart), or the same per-server keys (umbrella chart), to declare the containerPort + Service port. Raw manifests: uncomment the blocks in `k8s/dns/`. | Depends on your Ingress/LoadBalancer — you own the topology, so 443 is allowed. |
 
 ```bash
 docker compose -f docker-compose.yml \
@@ -1362,11 +1364,25 @@ The vars split host and container side deliberately:
 ```
 
 The **container** side must match the port configured in the UI — the
-agent renders `named.conf` from the DB, not from these variables, so a
-mismatch publishes a mapping to a port nothing is listening on. The
+agent renders the daemon config from the DB, not from these variables, so
+a mismatch publishes a mapping to a port nothing is listening on. The
 **host** side is just where it lands; the DoH default is 8443 so nothing
-has to bind a privileged port. All six variables are documented in
+has to bind a privileged port. Every variable is documented in
 `.env.example`.
+
+Technitium gets its own host-port band (`DNS_DOT_HOST_PORT_TECHNITIUM` and
+friends, defaulting to 6853 / 6444 to match its 6053:53 base mapping) so
+all three drivers can run side by side, plus a third mapping the other two
+don't have:
+
+```
+- "${DNS_DOQ_HOST_PORT_TECHNITIUM:-6853}:${DNS_DOQ_PORT:-853}/udp"
+```
+
+DoQ shares DoT's port **number** and differs in protocol — 853 is the RFC
+default for both — which is why `doq_port` is a separate field from
+`dot_port` rather than a checkbox on the DoT listener, and why the two
+defaults above collide on purpose.
 
 ### 20.3 Upstream forwarding
 

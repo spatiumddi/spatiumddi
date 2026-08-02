@@ -80,9 +80,13 @@ services:
       # will listen on whatever the group is configured for in the UI,
       # but Compose cannot publish a port conditionally, so binding them
       # unconditionally would break ``up -d`` on any host already using
-      # them — for a feature that ships off by default. Add the mappings
-      # by hand (container-side ports must MATCH the UI values, since the
-      # agent configures the daemon from the database, not from here):
+      # them — for a feature that ships off by default.
+      #
+      # This file is the STANDALONE agent, so it can't use the
+      # ``docker-compose.dns-encrypted.yml`` overlay (that one targets the
+      # full-stack file's service names). Add the mappings by hand instead
+      # — container-side ports must MATCH the UI values, since the agent
+      # configures the daemon from the database, not from here:
       #   - "${DNS_DOT_HOST_PORT:-1853}:853/tcp"   # DoT
       #   - "${DNS_DOQ_HOST_PORT:-1853}:853/udp"   # DoQ — UDP, so no clash
       #   - "${DNS_DOH_HOST_PORT:-8443}:443/tcp"   # DoH

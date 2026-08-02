@@ -79,6 +79,37 @@ spec:
             - name: dns-tcp
               containerPort: 53
               protocol: TCP
+            {{- /* #741 / #799 — encrypted transports. The listener ports
+                   live in the DB (dns_server_options), not here: the agent
+                   configures the daemon from the config bundle, and this pod
+                   is hostNetwork so it binds the host directly regardless of
+                   what's declared. These entries exist so the ports are
+                   visible to kubectl / Service routing / network policy —
+                   set them to match the group's configured ports.
+
+                   They stop being cosmetic under dns.useMetalLBVIP: the pod
+                   drops hostNetwork and sits behind an L2 LoadBalancer that
+                   forwards only what the Service declares, so an undeclared
+                   port means encrypted DNS simply stops answering. */}}
+            {{- with .Values.dnsTechnitium.dotPort }}
+            - name: dns-dot
+              containerPort: {{ . }}
+              protocol: TCP
+            {{- end }}
+            {{- with .Values.dnsTechnitium.dohPort }}
+            - name: dns-doh
+              containerPort: {{ . }}
+              protocol: TCP
+            {{- end }}
+            {{- /* DoQ is UDP, and 853 is the RFC default for both it and
+                   DoT — so this may legitimately repeat dotPort's number
+                   under a different protocol. Kubernetes allows that; the
+                   port NAMES are what must stay unique. */}}
+            {{- with .Values.dnsTechnitium.doqPort }}
+            - name: dns-doq
+              containerPort: {{ . }}
+              protocol: UDP
+            {{- end }}
           # #296 Phase A2 — marker + a live query, same shape as bind9/
           # powerdns's readiness probe. Technitium REFUSES CHAOS-class
           # queries entirely (confirmed empirically — id.server/
@@ -149,4 +180,19 @@ spec:
     - name: dns-tcp
       port: 53
       protocol: TCP
+    {{- with .Values.dnsTechnitium.dotPort }}
+    - name: dns-dot
+      port: {{ . }}
+      protocol: TCP
+    {{- end }}
+    {{- with .Values.dnsTechnitium.dohPort }}
+    - name: dns-doh
+      port: {{ . }}
+      protocol: TCP
+    {{- end }}
+    {{- with .Values.dnsTechnitium.doqPort }}
+    - name: dns-doq
+      port: {{ . }}
+      protocol: UDP
+    {{- end }}
 {{- end }}
