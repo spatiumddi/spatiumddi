@@ -271,9 +271,17 @@ async def _run_pg_dump_plain(out_path: Path) -> None:
 
 
 def _scrub_dump_text(dump_text: str) -> str:
-    """Walk a plain-format pg_dump and replace every Fernet-
-    encrypted column's value (and every ``__enc__:`` JSONB field
-    in ``backup_target.config``) with an empty placeholder.
+    """Walk a plain-format pg_dump and replace REDACTABLE Fernet-encrypted
+    column values (and every ``__enc__:`` JSONB field in
+    ``backup_target.config``) with an empty placeholder.
+
+    Not every encrypted column: ``redactable_columns()`` withholds machine
+    identity an operator cannot re-enter — the appliance CA and Web-UI TLS
+    private keys, k3s join tokens, pairing-code reveals, the ACME account
+    key. An empty bytea satisfies their NOT NULL constraints, so blanking
+    them yields an archive whose restore SUCCEEDS and then permanently
+    breaks supervisor approval, with no rotate endpoint (#781). What IS
+    scrubbed is the credentials an operator can simply type back in.
 
     Inside a ``COPY public.foo (col1, col2, ...) FROM stdin;`` →
     ``\\.`` block, columns are tab-separated and bytea values are
