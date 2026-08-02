@@ -272,8 +272,10 @@ async def _run_pg_dump_plain(out_path: Path) -> None:
 
 def _scrub_dump_text(dump_text: str) -> str:
     """Walk a plain-format pg_dump and replace REDACTABLE Fernet-encrypted
-    column values (and every ``__enc__:`` JSONB field in
-    ``backup_target.config``) with an empty placeholder.
+    values with an empty placeholder — both the ``LargeBinary`` columns and
+    the JSONB-embedded secrets registered in ``JSONB_ENCRYPTED_FIELDS``
+    (backup-driver credentials, SNMPv3 passphrases, syslog TLS CAs, APT GPG
+    keys + mirror passwords).
 
     Not every encrypted column: ``redactable_columns()`` withholds machine
     identity an operator cannot re-enter — the appliance CA and Web-UI TLS
@@ -294,9 +296,18 @@ def _scrub_dump_text(dump_text: str) -> str:
     import re  # noqa: PLC0415
 
     from app.services.backup.rewrap import (  # noqa: PLC0415
-        _ENC_PREFIX,
+        JSONB_ENCRYPTED_FIELDS,
+        _jsonb_secret_sites,
         redactable_columns,
     )
+
+    # JSONB-embedded secrets, keyed by table → column → spec (#781). All of
+    # them are operator-re-enterable (SNMPv3 passphrases, a syslog CA PEM,
+    # APT GPG keys, a mirror password), so unlike the machine-identity
+    # columns above they are safe to blank.
+    jsonb_by_table: dict[str, dict[str, Any]] = {}
+    for spec in JSONB_ENCRYPTED_FIELDS:
+        jsonb_by_table.setdefault(spec.table.strip('"'), {})[spec.column] = spec
 
     by_table: dict[str, set[str]] = {}
     # NOT ENCRYPTED_COLUMNS: machine identity (appliance CA / TLS keys,
@@ -314,7 +325,7 @@ def _scrub_dump_text(dump_text: str) -> str:
     out: list[str] = []
     in_copy_table: str | None = None
     cols_to_scrub: list[int] = []
-    config_idx: int = -1
+    jsonb_cols: list[tuple[int, Any]] = []
 
     for line in dump_text.splitlines(keepends=False):
         if in_copy_table is None:
@@ -324,58 +335,64 @@ def _scrub_dump_text(dump_text: str) -> str:
                 cols_list = [c.strip().strip('"') for c in m.group(2).split(",")]
                 scrub_set = by_table.get(table, set())
                 cols_to_scrub = [i for i, c in enumerate(cols_list) if c in scrub_set]
-                config_idx = (
-                    cols_list.index("config")
-                    if (table == "backup_target" and "config" in cols_list)
-                    else -1
-                )
-                if cols_to_scrub or config_idx >= 0:
+                jsonb_cols = [
+                    (i, spec)
+                    for i, c in enumerate(cols_list)
+                    if (spec := jsonb_by_table.get(table, {}).get(c)) is not None
+                ]
+                if cols_to_scrub or jsonb_cols:
                     in_copy_table = table
             out.append(line)
         elif line == r"\.":
             in_copy_table = None
             cols_to_scrub = []
-            config_idx = -1
+            jsonb_cols = []
             out.append(line)
         else:
             parts = line.split("\t")
             for i in cols_to_scrub:
                 if i < len(parts) and parts[i] != r"\N":
                     parts[i] = r"\\x"
-            if 0 <= config_idx < len(parts):
-                raw = parts[config_idx]
-                if raw not in (r"\N", ""):
-                    try:
-                        # COPY plain-text escapes:
-                        #   ``\\`` → backslash
-                        #   ``\t`` / ``\n`` / ``\r`` → tab/newline/cr
-                        # Decode to original JSON, scrub
-                        # ``__enc__:`` strings, re-encode.
-                        unescaped = (
-                            raw.replace(r"\\", "\x00")
-                            .replace(r"\t", "\t")
-                            .replace(r"\n", "\n")
-                            .replace(r"\r", "\r")
-                            .replace("\x00", "\\")
-                        )
-                        cfg = json.loads(unescaped)
-                        mutated = False
-                        if isinstance(cfg, dict):
-                            for k, v in list(cfg.items()):
-                                if isinstance(v, str) and v.startswith(_ENC_PREFIX):
-                                    cfg[k] = ""
-                                    mutated = True
-                        if mutated:
-                            new_json = json.dumps(cfg, separators=(",", ":"))
-                            new_escaped = (
-                                new_json.replace("\\", r"\\")
-                                .replace("\t", r"\t")
-                                .replace("\n", r"\n")
-                                .replace("\r", r"\r")
-                            )
-                            parts[config_idx] = new_escaped
-                    except (json.JSONDecodeError, ValueError):
-                        pass
+            for idx, spec in jsonb_cols:
+                if not (0 <= idx < len(parts)):
+                    continue
+                raw = parts[idx]
+                if raw in (r"\N", ""):
+                    continue
+                try:
+                    # COPY plain-text escapes:
+                    #   ``\\`` → backslash
+                    #   ``\t`` / ``\n`` / ``\r`` → tab/newline/cr
+                    # Decode to the original JSON, blank every registered
+                    # secret, re-encode.
+                    unescaped = (
+                        raw.replace(r"\\", "\x00")
+                        .replace(r"\t", "\t")
+                        .replace(r"\n", "\n")
+                        .replace(r"\r", "\r")
+                        .replace("\x00", "\\")
+                    )
+                    doc = json.loads(unescaped)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                sites = _jsonb_secret_sites(spec, doc)
+                if not sites:
+                    continue
+                for holder, key, _ciphertext in sites:
+                    # ``None`` rather than ``""`` for the keyed entries: that
+                    # is what the settings writers store when an operator
+                    # clears a passphrase, so a scrubbed archive restores to
+                    # "not configured" instead of "configured as empty".
+                    # ``backup_target.config`` keeps ``""``, which is what it
+                    # has always used and what its reader expects.
+                    holder[key] = "" if spec.prefix else None
+                new_json = json.dumps(doc, separators=(",", ":"))
+                parts[idx] = (
+                    new_json.replace("\\", r"\\")
+                    .replace("\t", r"\t")
+                    .replace("\n", r"\n")
+                    .replace("\r", r"\r")
+                )
             out.append("\t".join(parts))
     # pg_dump's plain output ends with a trailing newline; preserve
     # that so the round-trip is byte-clean.
