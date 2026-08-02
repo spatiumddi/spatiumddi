@@ -157,13 +157,21 @@ api:
 # installs). Single-instance docker-compose / plain k8s installs that
 # just helm-upgrade through standard rolling updates don't need it.
 #
-# TURN THIS ON for a multi-node control plane that upgrades from UPLOADED
-# images. It stays off by default because the PVC is real storage the
-# single-node appliance (whose /var is the remainder of a 32 GiB minimum
-# disk) should not be asked to reserve. With it off on multi-node, uploaded
-# bytes live on whichever api replica served the upload, and the host's
-# download 404s from every other one (#787). Upgrading from an external
-# image URL needs no mirror at all.
+# REQUIRED whenever api.replicas > 1 AND you upgrade from UPLOADED images.
+# With it off, uploaded bytes live on whichever api replica served the
+# upload and the host's download 404s from every other one (#787). It
+# stays off by DEFAULT because the PVC is real storage the single-node
+# appliance (whose /var is the remainder of a 32 GiB minimum disk) should
+# not be asked to reserve. Upgrading from an external image URL needs no
+# mirror at all.
+#
+# ON THE APPLIANCE THIS IS AUTOMATIC and you should not set it here: the
+# seed supervisor derives it from the control-plane size and writes it to
+# the spatium-control HelmChartConfig on every promote/demote, so a
+# multi-node appliance turns the mirror on by itself and a demote releases
+# the PVC (agent/supervisor/spatium_supervisor/k8s_api.py,
+# _slot_image_mirror_values). This knob is for BYO-Kubernetes installs,
+# where nothing tracks the replica count for you.
 slotImageMirror:
   enabled: false
   storage:

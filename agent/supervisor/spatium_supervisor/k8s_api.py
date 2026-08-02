@@ -634,6 +634,51 @@ def _helmchartconfig_upsert(
     )
 
 
+def _slot_image_mirror_values(cp_size: int) -> str:
+    """The ``slotImageMirror`` stanza for the spatium-control overrides.
+
+    #787 — an uploaded / GitHub-imported upgrade image lands on a
+    node-local hostPath: on whichever api replica served the upload. The
+    host runner's download then round-robins through the api Service, so
+    on any control plane with more than one replica roughly half the
+    downloads hit a replica without the bytes and get a 404 that reads
+    "bytes missing on disk — re-upload required". Re-uploading cannot fix
+    it; the bytes exist, on a node the operator cannot see.
+
+    The mirror (a single-replica Deployment on its own node-pinned PVC,
+    which every api replica proxies byte ops to) is the fix, and it
+    shipped in #296 Phase B — but it defaults off and nothing on the
+    appliance ever turned it on, so the feature was unreachable from the
+    only deployment shape that needs it.
+
+    Deriving it from ``cp_size`` here rather than defaulting it on in the
+    chart is what makes that safe:
+
+    * ``cp_size`` IS the api replica count (set from the same number a few
+      lines below), so this tracks the actual invariant — "can a download
+      land on a replica that did not serve the upload?" — and not a proxy
+      for it. A schedule-time refusal keyed to appliance-node count, which
+      an earlier revision of this branch tried, gets both directions
+      wrong.
+    * A single-node appliance stays on the hostPath and never reserves the
+      PVC. That was the stated reason the chart default is off, and it
+      still holds — /var on a single box is the remainder of a 32 GiB
+      minimum disk.
+    * It is written on promote AND demote, so a cluster that shrinks back
+      to one node releases the PVC. The value is emitted in both states
+      rather than only when true, because omitting it would let the
+      enabled-once state persist through a demote (helm-controller merges,
+      it does not diff).
+
+    The transition still strands bytes uploaded BEFORE a promote: they sit
+    on the seed's hostPath and the mirror's PVC starts empty. The api's
+    download handler falls back to local FS on a mirror miss for exactly
+    that case (see ``download_upgrade_image``), which recovers it on the
+    seed; off the seed the operator re-uploads, and the mirror then holds
+    it for good."""
+    return f"slotImageMirror:\n  enabled: {'true' if cp_size >= 2 else 'false'}\n"
+
+
 def apply_control_plane_overrides(
     cp_size: int,
     control_plane_vip: str,
@@ -647,7 +692,11 @@ def apply_control_plane_overrides(
     #285 Phase 6 — ``web_ui_allowed_cidrs`` (empty = open) also lands on the
     frontend as ``loadBalancerSourceRanges``, so the MetalLB VIP path is
     source-scoped by the same setting that scopes the per-node hostPort door
-    via nftables. Belt (VIP) + braces (hostPort) from one operator control."""
+    via nftables. Belt (VIP) + braces (hostPort) from one operator control.
+
+    #787 — the slot-image mirror is enabled from the same number, because
+    it is a function of exactly one thing: whether more than one api replica
+    can serve an upgrade-image download. See ``_slot_image_mirror_values``."""
     if cp_size < 1:
         return False, "cp_size < 1"
     vip = (control_plane_vip or "").strip()
@@ -693,6 +742,7 @@ def apply_control_plane_overrides(
         f'  controlPlaneVIP: "{vip}"\n'
         f"  loadBalancerSourceRanges: {src_json}\n"
         f"worker:\n  replicas: {cp_size}\n  podAntiAffinity: hard\n{fast_evict}"
+        f"{_slot_image_mirror_values(cp_size)}"
         f"postgresql:\n  cnpg:\n    instances: {cp_size}\n"
         f"redis:\n  sentinel:\n    replicas: {cp_size}\n"
     )

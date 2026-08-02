@@ -1214,18 +1214,28 @@ control-plane cluster itself, not the registered agent fleet.
    host runner pulls bytes back through the control plane. No node ever
    talks to github.com.
 
-   > **Multi-node needs the mirror turned on.** Where those bytes live
-   > depends on `slotImageMirror.enabled` (`slot-image-mirror` Deployment
-   > + PVC — the mirror infra keeps the historical name). It is **off by
-   > default**, and with it off the bytes sit on a node-local hostPath —
-   > specifically, on whichever api replica served the upload. That is
-   > correct for a single-node appliance and wrong for every other shape:
-   > the host's download round-robins across api replicas and any replica
-   > without the bytes answers 404 ("bytes missing on disk — re-upload
-   > required", which is misleading: the bytes exist, on a node you cannot
-   > see). Turn the mirror on before upgrading a multi-node control plane
-   > from an uploaded image, or upgrade from an external image URL, which
-   > needs no mirror (#787).
+   > **Multi-node uses the mirror, and turns it on for you.** Where those
+   > bytes live depends on `slotImageMirror.enabled` (`slot-image-mirror`
+   > Deployment + PVC — the mirror infra keeps the historical name). With
+   > it off the bytes sit on a node-local hostPath — specifically, on
+   > whichever api replica served the upload. That is correct for a
+   > single-node appliance and wrong for every other shape: the host's
+   > download round-robins across api replicas and any replica without the
+   > bytes answers 404 ("bytes missing on disk — re-upload required", which
+   > is misleading: the bytes exist, on a node you cannot see).
+   >
+   > On the appliance you do not configure this (#787). The seed supervisor
+   > derives it from the control-plane size and writes it to the
+   > `spatium-control` HelmChartConfig on every promote/demote, so growing
+   > past one node enables the mirror and shrinking back releases the PVC.
+   > One caveat at the transition: an image uploaded **before** the promote
+   > is on the seed's hostPath, not on the mirror's fresh PVC. The api
+   > falls back to local disk when the mirror misses, which recovers it if
+   > the download lands on the seed — re-upload it after promoting to stop
+   > depending on that. A **BYO-Kubernetes** control plane with
+   > `api.replicas > 1` still has to set `slotImageMirror.enabled=true`
+   > itself; nothing there tracks the replica count. Upgrading from an
+   > external image URL needs no mirror either way.
 2. **URL** (connected install). Operator pastes the GitHub release
    asset URL — same `https://github.com/.../spatiumddi-appliance-
    slot-amd64.raw.xz` shape the per-box flow uses. Each node fetches
@@ -1292,9 +1302,10 @@ so a first-time operator never gets stuck looking for the upload.
 
 2. Copy both files to the airgap LAN (USB stick, SCP through a jump
    host, whatever your security team approves).
-   NOTE on a MULTI-NODE control plane: set `slotImageMirror.enabled=true`
-   first, or the uploaded bytes stay on one api replica and the other
-   nodes' downloads 404 (#787).
+   NOTE on a MULTI-NODE appliance the mirror is already on (the supervisor
+   enables it at promote), so uploaded bytes are reachable from every api
+   replica. Upload AFTER promoting — an image staged while the box was
+   still single-node sits on the seed's hostPath, not the mirror (#787).
 
 3. In the SpatiumDDI UI (control-plane node, any operator browser
    that can reach the cluster):

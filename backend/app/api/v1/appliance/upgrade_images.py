@@ -888,9 +888,34 @@ async def download_upgrade_image(
 
     if settings.slot_image_mirror_url:
         # #296 Phase B — bytes live on the mirror Deployment. Stream
-        # through. The mirror's 404 surfaces as 404 here; transport
-        # errors as 502.
-        return await _stream_download_from_mirror(row.id, filename=row.filename)
+        # through. Transport errors surface as 502.
+        try:
+            return await _stream_download_from_mirror(row.id, filename=row.filename)
+        except HTTPException as exc:
+            # #787 — a mirror MISS (404) is not necessarily "these bytes are
+            # gone". The appliance turns the mirror on at promote, so an image
+            # uploaded while the control plane was single-node sits on this
+            # node's hostPath while the mirror's PVC starts empty. Fall back to
+            # local FS for that window; on any other node the file is absent
+            # and the operator gets the same 404 they would have anyway.
+            #
+            # Only 404 falls through — a 502 means the mirror is unreachable or
+            # erroring, and serving a local copy there would silently mask a
+            # broken mirror on whichever replica happens to hold a stale file.
+            if exc.status_code != status.HTTP_404_NOT_FOUND:
+                raise
+            local = _image_path(row.id)
+            if not local.exists():
+                raise
+            logger.info(
+                "appliance.upgrade_image.served_from_local_after_mirror_miss",
+                image_id=str(row.id),
+            )
+            return FileResponse(
+                local,
+                media_type="application/octet-stream",
+                filename=row.filename,
+            )
 
     path = _image_path(row.id)
     if not path.exists():
