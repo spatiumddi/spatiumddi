@@ -138,6 +138,14 @@ class OPNsenseRouter(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # ── Sync state ──────────────────────────────────────────────────
     last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_sync_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Non-fatal findings from the last pass, newline-joined (#797). A
+    # sync can succeed end-to-end and still mirror nothing useful —
+    # no DHCP backend detected, a subnet already owned by another
+    # integration, an address we declined to claim. Those were computed
+    # into ``ReconcileSummary.warnings`` and then dropped on the floor,
+    # so the only operator-visible signal was a green "ok" with zero
+    # counts. NULL / empty = clean pass.
+    last_sync_warning: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # Populated by the test-connection probe / reconciler — shown in
     # the UI.

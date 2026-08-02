@@ -25,7 +25,9 @@ from app.services.opnsense.client import (
     _OPNFirmwareInfo,
     _OPNInterface,
     _OPNLease,
+    _OPNLeaseResult,
     _OPNReservation,
+    _OPNReservationResult,
     _OPNVlan,
 )
 from app.services.opnsense.reconcile import reconcile_router
@@ -82,13 +84,24 @@ class _FakeClient:
         leases: list[_OPNLease] | None = None,
         reservations: list[_OPNReservation] | None = None,
         arp: list[_OPNArpEntry] | None = None,
+        lease_sources: list[str] | None = None,
+        reservation_sources: list[str] | None = None,
+        forbidden: list[str] | None = None,
     ) -> None:
-        self.firmware = firmware or _OPNFirmwareInfo(version="OPNsense 24.7")
+        self.firmware = firmware or _OPNFirmwareInfo(version="OPNsense 26.1")
         self.interfaces = interfaces or []
         self.vlans = vlans or []
         self.leases = leases or []
         self.reservations = reservations or []
         self.arp = arp or []
+        # #797 — the real client reports WHICH DHCP backends answered, so
+        # the reconciler can tell "DHCP is off" from "we asked a firmware
+        # that no longer has these endpoints". Default to a backend having
+        # answered, so existing tests exercise the normal path; the
+        # no-backend case is asserted explicitly in its own test.
+        self.lease_sources = ["kea"] if lease_sources is None else lease_sources
+        self.reservation_sources = ["kea"] if reservation_sources is None else reservation_sources
+        self.forbidden = forbidden or []
 
     async def __aenter__(self):
         return self
@@ -106,10 +119,18 @@ class _FakeClient:
         return self.vlans
 
     async def list_leases(self):
-        return self.leases
+        return _OPNLeaseResult(
+            leases=self.leases,
+            sources_found=self.lease_sources,
+            sources_forbidden=self.forbidden,
+        )
 
     async def list_reservations(self):
-        return self.reservations
+        return _OPNReservationResult(
+            reservations=self.reservations,
+            sources_found=self.reservation_sources,
+            sources_forbidden=self.forbidden,
+        )
 
     async def list_arp(self):
         return self.arp
@@ -575,7 +596,11 @@ async def test_list_leases_swallows_404_but_reraises_5xx(db_session: AsyncSessio
         base_url="https://fw.test:443", transport=httpx.MockTransport(_handler_404)
     )
     try:
-        assert await client.list_leases() == []
+        result = await client.list_leases()
+        assert result.leases == []
+        # #797 — and no backend claimed to have answered, which is what
+        # lets the reconciler warn instead of reporting a clean zero.
+        assert result.sources_found == []
     finally:
         await client._client.aclose()
 
@@ -695,3 +720,132 @@ async def test_no_api_secret_records_error(db_session: AsyncSession) -> None:
     assert router.last_synced_at is not None
     # Watermark is recent.
     assert (datetime.now(UTC) - router.last_synced_at).total_seconds() < 60
+
+
+# ── #797 — a green sync that mirrors nothing must say why ─────────────
+
+
+@pytest.mark.asyncio
+async def test_no_dhcp_backend_warns_instead_of_reporting_a_clean_zero(
+    db_session: AsyncSession,
+) -> None:
+    """The reported bug, asserted at the reconcile level.
+
+    OPNsense 25.7+ retired the ISC endpoints this integration used to be
+    the only consumer of. Every request succeeded, the counts were all
+    zero, and ``last_sync_error`` stayed NULL — so the UI showed a
+    healthy integration that had never mirrored a single row. The pass
+    still succeeds (nothing is wrong with the firewall), but it now
+    carries a warning that names the cause.
+    """
+    space = await _make_space(db_session)
+    router = await _make_router(db_session, space)
+    fake = _FakeClient(
+        interfaces=[_iface("lan", "igc0", "172.20.1.1", "172.20.1.0/24")],
+        leases=[],
+        reservations=[],
+        lease_sources=[],  # no Kea, no Dnsmasq, no ISC
+        reservation_sources=[],
+    )
+    with _patch_client(fake):
+        summary = await reconcile_router(db_session, router)
+
+    assert summary.ok  # not an error — the firewall is fine
+    assert any("no DHCP backend responded" in w for w in summary.warnings)
+    await db_session.refresh(router)
+    assert router.last_sync_error is None
+    assert router.last_sync_warning is not None
+    assert "no DHCP backend responded" in router.last_sync_warning
+
+
+@pytest.mark.asyncio
+async def test_backend_present_with_zero_leases_does_not_warn(
+    db_session: AsyncSession,
+) -> None:
+    """A backend that answered and had nothing to say is a real zero.
+
+    This is the other half of the distinction — without it the warning
+    would fire on every quiet firewall and be trained away as noise.
+    """
+    space = await _make_space(db_session)
+    router = await _make_router(db_session, space)
+    fake = _FakeClient(
+        interfaces=[_iface("lan", "igc0", "172.20.1.1", "172.20.1.0/24")],
+        leases=[],
+        reservations=[],
+        lease_sources=["kea"],
+        reservation_sources=["kea"],
+    )
+    with _patch_client(fake):
+        summary = await reconcile_router(db_session, router)
+
+    assert summary.ok
+    assert not any("no DHCP backend" in w for w in summary.warnings)
+    await db_session.refresh(router)
+    assert router.last_sync_warning is None
+
+
+@pytest.mark.asyncio
+async def test_forbidden_backend_warns_about_the_privilege_not_the_firmware(
+    db_session: AsyncSession,
+) -> None:
+    """Kea's lease endpoints carry their own ACL (opnsense/core#7770).
+
+    A 403 there has a different remedy from a 404 — add a privilege, not
+    upgrade a firmware — so it gets its own message rather than being
+    folded into "no backend responded".
+    """
+    space = await _make_space(db_session)
+    router = await _make_router(db_session, space)
+    fake = _FakeClient(
+        interfaces=[_iface("lan", "igc0", "172.20.1.1", "172.20.1.0/24")],
+        lease_sources=["dnsmasq"],
+        reservation_sources=["dnsmasq"],
+        forbidden=["kea leases"],
+    )
+    with _patch_client(fake):
+        summary = await reconcile_router(db_session, router)
+
+    assert summary.ok
+    assert any("refused by kea leases" in w for w in summary.warnings)
+    # A backend DID answer, so the no-backend warning must not also fire.
+    assert not any("no DHCP backend responded" in w for w in summary.warnings)
+
+
+@pytest.mark.asyncio
+async def test_zero_interfaces_warns_that_nothing_can_be_mirrored(
+    db_session: AsyncSession,
+) -> None:
+    """Subnets come only from interfaces, and addresses need an enclosing
+    subnet — so zero interfaces silently zeroes the entire mirror."""
+    space = await _make_space(db_session)
+    router = await _make_router(db_session, space)
+    fake = _FakeClient(interfaces=[], lease_sources=["kea"], reservation_sources=["kea"])
+    with _patch_client(fake):
+        summary = await reconcile_router(db_session, router)
+
+    assert summary.ok
+    assert any("no addressed interfaces found" in w for w in summary.warnings)
+
+
+@pytest.mark.asyncio
+async def test_warning_clears_once_the_condition_is_resolved(
+    db_session: AsyncSession,
+) -> None:
+    """A stale amber chip is its own bug — the field is set to NULL on a
+    clean pass rather than left at its last value."""
+    space = await _make_space(db_session)
+    router = await _make_router(db_session, space)
+    iface = _iface("lan", "igc0", "172.20.1.1", "172.20.1.0/24")
+
+    with _patch_client(_FakeClient(interfaces=[iface], lease_sources=[], reservation_sources=[])):
+        await reconcile_router(db_session, router)
+    await db_session.refresh(router)
+    assert router.last_sync_warning is not None
+
+    with _patch_client(
+        _FakeClient(interfaces=[iface], lease_sources=["kea"], reservation_sources=["kea"])
+    ):
+        await reconcile_router(db_session, router)
+    await db_session.refresh(router)
+    assert router.last_sync_warning is None

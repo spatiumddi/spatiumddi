@@ -2340,9 +2340,15 @@ function integrationDotCls(
   lastSyncedAt: string | null,
   lastSyncError: string | null,
   intervalSeconds: number,
+  lastSyncWarning?: string | null,
 ): string {
   if (lastSyncError) return "bg-red-500";
   if (!lastSyncedAt) return "bg-muted-foreground/40";
+  // #797 — a pass can be on time and error-free and still mirror nothing
+  // (no DHCP backend on the firmware, credentials refused by one backend).
+  // Amber rather than green, or the dashboard vouches for an integration
+  // that has never produced a row.
+  if (lastSyncWarning) return "bg-amber-500";
   const age = (Date.now() - new Date(lastSyncedAt).getTime()) / 1000;
   // Amber when the last sync is older than ~3 intervals — implies the
   // reconcile beat sweep is stalled or the target is unreachable.
@@ -2619,6 +2625,7 @@ function IntegrationsPanel({
                       }
                       lastSyncedAt={r.last_synced_at}
                       lastSyncError={r.last_sync_error}
+                      lastSyncWarning={r.last_sync_warning}
                       intervalSeconds={r.sync_interval_seconds}
                       enabled={r.enabled}
                     />
@@ -2951,6 +2958,7 @@ function IntegrationRow({
   meta,
   lastSyncedAt,
   lastSyncError,
+  lastSyncWarning,
   intervalSeconds,
   enabled,
 }: {
@@ -2960,17 +2968,24 @@ function IntegrationRow({
   meta: string;
   lastSyncedAt: string | null;
   lastSyncError: string | null;
+  // Optional — only integrations that compute non-fatal findings pass it.
+  lastSyncWarning?: string | null;
   intervalSeconds: number;
   enabled: boolean;
 }) {
   const dotCls = !enabled
     ? "bg-muted-foreground/40"
-    : integrationDotCls(lastSyncedAt, lastSyncError, intervalSeconds);
+    : integrationDotCls(
+        lastSyncedAt,
+        lastSyncError,
+        intervalSeconds,
+        lastSyncWarning,
+      );
   return (
     <Link
       to={to}
       className="flex items-center gap-3 px-4 py-2 text-[11px] hover:bg-muted/30"
-      title={lastSyncError ?? undefined}
+      title={lastSyncError ?? lastSyncWarning ?? undefined}
     >
       <span className={cn("h-1.5 w-1.5 flex-shrink-0 rounded-full", dotCls)} />
       <span className="w-28 truncate font-semibold" title={name}>
@@ -3886,8 +3901,15 @@ function IntegrationsDashboardTabPanel() {
 }
 
 function IntegrationCard({ panel }: { panel: IntegrationsDashboardPanel }) {
+  // #797 — a warned target syncs on time and without error but isn't
+  // producing what it was configured to produce, so it must not read as
+  // green here while the IPAM-tab panel shows it amber.
   const tone: Tone =
-    panel.error_count > 0 ? "bad" : panel.stale_count > 0 ? "warn" : "good";
+    panel.error_count > 0
+      ? "bad"
+      : panel.stale_count > 0 || panel.warning_count > 0
+        ? "warn"
+        : "good";
   const cls = TONE_CLASS[tone];
   return (
     <div className="rounded-lg border bg-card p-3">
@@ -3912,6 +3934,14 @@ function IntegrationCard({ panel }: { panel: IntegrationsDashboardPanel }) {
             </span>
           </>
         )}
+        {panel.warning_count > 0 && (
+          <>
+            {" · "}
+            <span className="text-amber-600 dark:text-amber-400">
+              {panel.warning_count} warning
+            </span>
+          </>
+        )}
         {panel.error_count > 0 && (
           <>
             {" · "}
@@ -3928,7 +3958,10 @@ function IntegrationCard({ panel }: { panel: IntegrationsDashboardPanel }) {
               key={t.id}
               className="flex items-baseline justify-between gap-2"
             >
-              <span className="truncate" title={t.display}>
+              <span
+                className="truncate"
+                title={t.last_sync_warning ?? t.display}
+              >
                 {t.display}
               </span>
               <span
@@ -3936,10 +3969,11 @@ function IntegrationCard({ panel }: { panel: IntegrationsDashboardPanel }) {
                   "shrink-0 tabular-nums",
                   t.last_sync_error
                     ? "text-red-600 dark:text-red-400"
-                    : t.is_stale
+                    : t.is_stale || t.last_sync_warning
                       ? "text-amber-600 dark:text-amber-400"
                       : "text-muted-foreground",
                 )}
+                title={t.last_sync_error ?? t.last_sync_warning ?? undefined}
               >
                 {t.last_synced_at ? humanTime(t.last_synced_at) : "never"}
               </span>
