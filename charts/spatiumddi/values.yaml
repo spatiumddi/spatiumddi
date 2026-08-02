@@ -135,7 +135,10 @@ api:
     # (SPATIUM_SLOT_IMAGE_DIR, default /var/lib/spatiumddi/slot-images).
     # Persists uploaded / GitHub-imported images across api restarts so
     # they don't 404 with "bytes missing on disk" on the next upgrade.
-    # Only mounted when the multi-node slot-image mirror is off.
+    # Mounted even when the mirror is on (#787): the mirror is enabled at
+    # promote, so an image staged while the box was single-node is still
+    # here when the mirror's PVC comes up empty, and the download handler
+    # falls back to it.
     slotImagesDir: /var/lib/spatiumddi/slot-images
     # #59 — host dir backing packet-capture .pcap artifacts
     # (SPATIUM_PCAP_DIR). Shared by api (reads on download) + worker
