@@ -451,7 +451,13 @@ async def apply_backup_restore(
     # database is still intact. The same test runs post-replay inside
     # ``maybe_upgrade_after_restore``, but by then the data is already
     # overwritten and "refusing" only reports the damage (#781).
-    direction_error = schema_direction_error(manifest.get("schema_version"))
+    # Prefer the manifest, fall back to secrets.enc — which carries the same
+    # head and is already decrypted by Phase 2. Reading only the manifest let
+    # an archive with no recorded schema_version slip past the gate entirely,
+    # even though the head was recoverable a few lines up.
+    direction_error = schema_direction_error(
+        manifest.get("schema_version") or secrets_payload.get("schema_version")
+    )
     if direction_error:
         raise BackupRestoreError(direction_error)
 

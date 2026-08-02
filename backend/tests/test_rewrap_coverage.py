@@ -266,3 +266,19 @@ def test_schema_gate_fails_closed_when_it_cannot_verify() -> None:
         assert migrations.schema_direction_error(None) is None
     finally:
         migrations._local_head = original  # type: ignore[assignment]
+
+
+def test_schema_gate_reads_the_head_from_either_source() -> None:
+    """`secrets.enc` carries the same head as the manifest and is already
+    decrypted by the time the gate runs, so an archive whose manifest never
+    recorded one is still checked rather than slipping past."""
+    from app.services.backup.migrations import _local_head, schema_direction_error
+
+    manifest: dict[str, str] = {}
+    secrets_payload = {"schema_version": "ffffffffffff"}
+
+    err = schema_direction_error(
+        manifest.get("schema_version") or secrets_payload.get("schema_version")
+    )
+    assert err is not None, "the head from secrets.enc must still be checked"
+    assert (_local_head() or "") in err
