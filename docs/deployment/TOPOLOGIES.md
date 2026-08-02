@@ -84,7 +84,8 @@ machines. Agents long-poll the control plane's API.
 **The two compose files:**
 
 ```bash
-# On vm-dns (BIND9 — pick `agent-dns-powerdns.yml` instead for PowerDNS):
+# On vm-dns (BIND9 — swap in `agent-dns-powerdns.yml` or
+# `agent-dns-technitium.yml` for those drivers):
 export CONTROL_PLANE_URL=https://spatium-cp.corp.local
 export DNS_AGENT_KEY=<paste-from-Settings→Security→Agent bootstrap keys>
 export DNS_HOSTNAME=vm-dns.corp.local
@@ -342,7 +343,7 @@ the appliance internals are in [`APPLIANCE.md`](APPLIANCE.md#control-plane-high-
 
 ## PowerDNS-primary + BIND-secondary hybrid (driver crossover)
 
-SpatiumDDI ships two authoritative DNS drivers: BIND9 (default) and PowerDNS. Each `DNSServerGroup` is single-driver — but **multiple groups, each on a different driver, can serve overlapping namespaces** via plain AXFR or RFC 9432 catalog zones. Two operator-relevant shapes:
+SpatiumDDI ships three agent-managed authoritative DNS drivers: BIND9 (default), PowerDNS and Technitium. Each `DNSServerGroup` is single-driver — but **multiple groups, each on a different driver, can serve overlapping namespaces** via plain AXFR or RFC 9432 catalog zones. The two shapes below use PowerDNS + BIND9 as the worked example; a Technitium group substitutes for either side, since it does catalog zones as both producer and consumer and transfers over TSIG the same way.
 
 **Shape A — PowerDNS-primary + BIND-secondary on the same zones.** PowerDNS handles writes (online DNSSEC signing, ALIAS records, LUA records); BIND fans the zones out to a battle-tested edge. Catalog-zone-driven AXFR keeps both drivers in sync because the producer-side catalog renderer emits identical wire bytes from either driver (issue #127 Phase 3d).
 
@@ -356,15 +357,17 @@ Wire it up:
 2. In `edge-bind`, create each fanned-out zone as `zone_type=secondary` (or `stub`) with its per-zone `masters` list pointing at the PowerDNS primary (an `ip` or `ip@port` string, issue #336). BIND loads each as `type slave;` and AXFRs from the master; a `catalog_zones_enabled=true` + `catalog_zone_name=catalog.example.com.` setting on the `edge-bind` group additionally distributes the member list across every BIND member of the group via one RFC 9432 catalog (BIND 9.18+).
 3. Operator changes land via the SpatiumDDI UI → write-through to PowerDNS REST → PowerDNS bumps zone serial → BIND notices via NOTIFY-then-IXFR.
 
-**Shape B — Per-zone driver placement (not crossover).** Some zones live on PowerDNS (those with ALIAS / LUA / DNSSEC needs), some on BIND9 (those with first-class views or RPZ blocklists). Each zone is owned by exactly one group; the operator picks the right group at zone-create time. The Operator Copilot's `propose_create_dns_zone` tool accepts a `driver_hint` arg that picks a matching group automatically — `dnssec_enabled=true` requires `driver_hint=powerdns` and rejects against any group with no PowerDNS member.
+**Shape B — Per-zone driver placement (not crossover).** Some zones live on PowerDNS (those needing ALIAS / LUA), some on BIND9 (those needing first-class views or RPZ blocklists), some on Technitium (those serving or forwarding encrypted DNS, especially DoQ or DoH-upstream, which neither of the others can do). Each zone is owned by exactly one group; the operator picks the right group at zone-create time. The Operator Copilot's `propose_create_dns_zone` tool accepts a `driver_hint` arg that picks a matching group automatically.
 
-The driver-feature gate (server-side, `_DRIVER_GATED_RECORD_TYPES` + `_DRIVER_GATED_OPERATIONS`) means a PowerDNS-only feature called against a BIND group returns 422 with a remediation message ("move the zone to a PowerDNS-only group"). Mixed-driver groups are also rejected — an "internal-pdns" group cannot have one PowerDNS plus one BIND9 server, by design.
+The driver-feature gate (server-side, `_DRIVER_GATED_RECORD_TYPES` + `_DRIVER_GATED_OPERATIONS`) means a driver-specific feature called against a group on the wrong driver returns 422 with a remediation message ("move the zone to a PowerDNS-only group"). Mixed-driver groups are also rejected — an "internal-pdns" group cannot have one PowerDNS plus one BIND9 server, by design. The full gate table is in [`docs/features/DNS.md` §0](../features/DNS.md).
 
 ---
 
 ## Migrating a BIND9 group to PowerDNS without DNS downtime
 
 Replacing a BIND9 group with a PowerDNS group on the same zones is a four-step recipe. The IPAM ↔ DNS sync, RBAC, and DDNS pipeline don't change — only the driver underneath the zones.
+
+> The same four steps migrate to a **Technitium** group, with two differences: substitute `--profile dns-technitium` / `dnsAgents.servers[].flavor: technitium` / `docker-compose.agent-dns-technitium.yml` in step 1, and note that Technitium resolves SOA against the configured primaries when it *creates* a secondary — an unreachable primary fails the create outright rather than retrying, so bring the source group up first. Signing in step 4 works the same way (Technitium does online sign / unsign), but manual key rollover stays BIND9-only: Technitium rolls on its own `rolloverDays` schedule.
 
 **Pre-flight check.** Inventory zones with PowerDNS-incompatible features: classic views (PowerDNS does views via tags — no auto-translation today), RPZ blocklists (recursor-only, not authoritative). If any zone in the group uses these, leave that zone on BIND9 and only migrate the others. The control plane allows mixed installs precisely so you can split the unmigratable zones off into a separate group.
 
@@ -393,7 +396,8 @@ Replacing a BIND9 group with a PowerDNS group on the same zones is a four-step r
 | Branch offices feeding back to a HQ control plane | Topology 5 |
 | Anything K8s-native | Topology 6 |
 | **HA control plane from the OS appliance, no Patroni/kubectl** | **Topology 7** |
-| Need ALIAS / LUA / one-toggle DNSSEC | Add a PowerDNS group to any of the above |
+| Need ALIAS / LUA records | Add a PowerDNS group to any of the above |
+| Need DNS-over-QUIC, or encrypted upstream forwarding over DoH / DoQ | Add a Technitium group to any of the above |
 
 You can move between topologies without re-installing. Going from
 Topology 1 → 2 → 3 → 4 is purely additive: new VMs join the existing

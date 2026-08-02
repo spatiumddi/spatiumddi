@@ -43,19 +43,30 @@ SpatiumDDI ships four authoritative DNS drivers. Pick **per server group** — e
 
 **Pick PowerDNS when** you need ALIAS records (CNAME-at-apex without the BIND-side workaround), LUA records (geo-routing / weighted answers / `pickrandom` / `ifportup`), or the simpler one-toggle online DNSSEC story. The shipped image (`ghcr.io/spatiumddi/dns-powerdns`) bundles `pdns 5.0 + pdns-backend-lmdb` for an agent-isolated zone store with no external Postgres dependency. See [issue #127](https://github.com/spatiumddi/spatiumddi/issues/127) for the full driver rationale.
 
-**Pick Technitium when** you want a minimal-footprint REST-driven authoritative host and don't need ALIAS/LUA. It covers primary / secondary / stub / forward zones, catalog zones (producer and consumer), TSIG-authenticated zone transfer, and the standard record types (A/AAAA/CNAME/MX/TXT/NS/PTR/SRV/CAA/TLSA/SSHFP/NAPTR/URI/SVCB/HTTPS/DNAME) — see [`docs/drivers/DNS_DRIVERS.md` §4B.3a](../drivers/DNS_DRIVERS.md). Its real long-term differentiator is native DNS-over-TLS/HTTPS/QUIC with no dnsdist-style sidecar (PowerDNS's approach), *and* encrypted upstream forwarding, which BIND9 cannot do — that wiring is tracked in [#741](https://github.com/spatiumddi/spatiumddi/issues/741).
+**Pick Technitium when** you want a minimal-footprint REST-driven authoritative host and don't need ALIAS/LUA. It covers primary / secondary / stub / forward zones, catalog zones (producer and consumer), TSIG-authenticated zone transfer, and the standard record types (A/AAAA/CNAME/MX/TXT/NS/PTR/SRV/CAA/TLSA/SSHFP/NAPTR/URI/SVCB/HTTPS/DNAME) — see [`docs/drivers/DNS_DRIVERS.md` §4B.3a](../drivers/DNS_DRIVERS.md). Its real differentiator is native DNS-over-TLS/HTTPS/QUIC with no dnsdist-style sidecar (PowerDNS's approach), *and* encrypted upstream forwarding over all three — BIND9 forwards over DoT only, and PowerDNS does not forward at all. That wiring shipped in [#741](https://github.com/spatiumddi/spatiumddi/issues/741); see §20 below. Online DNSSEC signing ([#740](https://github.com/spatiumddi/spatiumddi/issues/740)) and the live-pull importer ([#744](https://github.com/spatiumddi/spatiumddi/issues/744)) shipped too. The one thing still outstanding is query-log shipping — [#742](https://github.com/spatiumddi/spatiumddi/issues/742) — so a Technitium group's queries don't reach the Logs page's DNS Queries tab yet.
 
 **Pick Windows DNS when** the zone is AD-integrated and operators expect to keep using DNS Manager / `Add-DnsServerResourceRecord` directly. Path A (RFC 2136 + AXFR) works without admin credentials; Path B (WinRM + PowerShell) unlocks zone CRUD and a JSON record-pull that sidesteps AXFR ACL configuration.
 
-PowerDNS-only features (ALIAS / LUA / online DNSSEC sign+unsign) are server-side gated by the API's `_DRIVER_GATED_RECORD_TYPES` and `_DRIVER_GATED_OPERATIONS` maps. Calling them against a group without a PowerDNS member returns 422 with a remediation message — move the zone to a PowerDNS-only group, or add a PowerDNS server to the group, before retrying. SVCB / HTTPS / DNAME are gated to BIND9, PowerDNS, and Technitium (all three serve them natively).
+Driver-gated features are enforced server-side by the API's `_DRIVER_GATED_RECORD_TYPES` and `_DRIVER_GATED_OPERATIONS` maps. Calling one against a group with no member on a supporting driver returns 422 with a remediation message — move the zone to a group on a supporting driver, or add such a server to the group, before retrying. The current gates:
 
-The Operator Copilot's `propose_create_dns_zone` tool accepts an explicit `driver_hint` argument (`bind9` / `powerdns` / `technitium` / `windows_dns`) so the LLM can route DNSSEC-required zones to PowerDNS groups without operators having to specify the group UUID by hand. See `app.services.ai.operations.CreateDNSZoneArgs`.
+| Gated thing | Allowed drivers |
+|---|---|
+| `ALIAS`, `LUA` records | `powerdns` |
+| `SVCB`, `HTTPS`, `DNAME` records | `bind9`, `powerdns`, `technitium` |
+| `dnssec_sign` / `dnssec_unsign` | `bind9`, `powerdns`, `technitium` |
+| `dnssec_rollover` (manual key rollover) | `bind9` |
+
+Manual rollover stays BIND9-only on purpose: PowerDNS and Technitium each roll on their own schedule (Technitium carries `rolloverDays` per key), so exposing a manual rollover against them would fight the daemon.
+
+The Operator Copilot's `propose_create_dns_zone` tool accepts an explicit `driver_hint` argument (`bind9` / `powerdns` / `technitium` / `windows_dns`) so the LLM can route a zone to a matching group without operators having to specify the group UUID by hand. See `app.services.ai.operations.CreateDNSZoneArgs`.
+
+> **Known gap.** That tool's `dnssec_enabled=true` path is stricter than the REST gate above: `_POWERDNS_ONLY_FEATURES` still rejects a signed zone unless the group has a **PowerDNS** member, so the Copilot refuses on a BIND9 or Technitium group that the REST API would accept. Use the zone page (or the REST endpoint) to sign on those drivers until it is widened.
 
 ### 0a. Cloud DNS providers — Cloudflare / Route 53 / Azure DNS / Google Cloud DNS (issue #37)
 
-**Add DNS server** also offers four cloud-hosted authoritative-DNS providers as driver choices: **Cloudflare**, **Amazon Route 53**, **Azure DNS**, and **Google Cloud DNS**. Once added, their zones and records are managed exactly like a local BIND9 / PowerDNS zone — same Zones / Records / group surfaces, same CRUD — but the control plane drives the provider's REST/SDK API directly instead of an agent (an *agentless* driver, the same shape as Windows DNS Path B). A cloud DNS server lives in a normal `DNSServerGroup`; credentials are a provider-specific dict (Cloudflare API token, Route 53 access keys, an Azure service-principal triple + subscription / resource group, or a GCP service-account JSON + project id) entered in the Add DNS server modal and Fernet-encrypted in `DNSServer.credentials_encrypted`.
+**Add DNS server** also offers four cloud-hosted authoritative-DNS providers as driver choices: **Cloudflare**, **Amazon Route 53**, **Azure DNS**, and **Google Cloud DNS**. Once added, their zones and records are managed exactly like a local BIND9 / PowerDNS / Technitium zone — same Zones / Records / group surfaces, same CRUD — but the control plane drives the provider's REST/SDK API directly instead of an agent (an *agentless* driver, the same shape as Windows DNS Path B). A cloud DNS server lives in a normal `DNSServerGroup`; credentials are a provider-specific dict (Cloudflare API token, Route 53 access keys, an Azure service-principal triple + subscription / resource group, or a GCP service-account JSON + project id) entered in the Add DNS server modal and Fernet-encrypted in `DNSServer.credentials_encrypted`.
 
-The modal renders a per-driver **in-modal setup guide** for the required credential fields and a **Test** button that does a cheap auth + list-zones probe before save. No cloud driver advertises *online* DNSSEC sign/unsign — cloud DNSSEC is a provider-level zone toggle, not the per-record online signing SpatiumDDI's `dnssec_sign`/`unsign` ops model, so those operations stay gated to BIND9 / PowerDNS (#29 follow-up). Full per-driver internals (credential shapes, capability matrix, per-provider wrinkles) are in [DNS_DRIVERS.md §4A](../drivers/DNS_DRIVERS.md).
+The modal renders a per-driver **in-modal setup guide** for the required credential fields and a **Test** button that does a cheap auth + list-zones probe before save. No cloud driver advertises *online* DNSSEC sign/unsign — cloud DNSSEC is a provider-level zone toggle, not the per-record online signing SpatiumDDI's `dnssec_sign`/`unsign` ops model, so those operations stay gated to BIND9 / PowerDNS / Technitium (#29 follow-up). Full per-driver internals (credential shapes, capability matrix, per-provider wrinkles) are in [DNS_DRIVERS.md §4A](../drivers/DNS_DRIVERS.md).
 
 **Bringing existing zones in.** A cloud account that already hosts zones imports through the DNS importer's cloud source (preview → commit; see [MIGRATION.md](MIGRATION.md)). After that, ongoing drift is reconciled the same way as any other server — the **sync-from-server** path pulls the provider's live zone/record state via the driver's `pull_zones_from_server` / `pull_zone_records` reads.
 
@@ -688,10 +699,12 @@ BIND_TSIG_ALGORITHM=hmac-sha256
 
 Every DNS server group has a **Sync with Servers** button on its detail header. It iterates every enabled server in the group and runs a four-step reconciliation per server:
 
-1. **List zones on the wire** — for Windows servers with credentials, `Get-DnsServerZone | Where { -not $_.IsAutoCreated }` over WinRM; for BIND9, the server's zone list from the agent's last-known config.
+1. **List zones on the wire** — only the drivers that can enumerate zones from the authoritative side do this: Windows DNS with WinRM credentials (`Get-DnsServerZone | Where { -not $_.IsAutoCreated }`) and the cloud drivers (the provider's hosted-zone API). The agent-based drivers (BIND9 / PowerDNS / Technitium) have no topology read here, so steps 1–3 are no-ops for them and only step 4 runs.
 2. **Auto-import server-only zones** — any zone present on the wire but missing from SpatiumDDI is created as `is_auto_generated=False`. System-only zones (TrustAnchors, RootHints, Cache, anything without a dot) are skipped.
 3. **Push DB-only zones back to the server** — any SpatiumDDI zone not present on the wire is created via the driver's `apply_zone_change`. For Windows Path B, this is `Add-DnsServerPrimaryZone -ReplicationScope Domain -DynamicUpdate Secure`.
-4. **Per-zone record sync** — for each zone, pull all records (AXFR for BIND9 or RFC 2136-capable servers, `Get-DnsServerResourceRecord` over WinRM for Windows Path B), reconcile against DB records, and apply the delta. Additive-only — never deletes.
+4. **Per-zone record sync** — for each zone, `pull_zone_records` reads what the server actually serves (AXFR for BIND9 / PowerDNS / Technitium, `Get-DnsServerResourceRecord` over WinRM for Windows Path B, the provider API for cloud), reconciles against DB records, and applies the delta. Additive-only — never deletes.
+
+> **AXFR against an agent-managed BIND9 or Technitium group is refused once the group has TSIG keys.** The control plane does not TSIG-sign its own transfer, and both agents grant `allow-transfer` only to the group's key names once any key is attached. The refusal surfaces as an error rather than an empty diff — an empty diff would read as "in sync", which is the worst possible answer. Tracked in [#734](https://github.com/spatiumddi/spatiumddi/issues/734); the record-level drift report is blocked on the same thing.
 
 The UI surfaces per-server results with zones-imported / zones-pushed / errors, plus a per-zone table.
 
@@ -940,7 +953,7 @@ DNS **pools** (GSLB-lite) map one DNS name (e.g. `www` →
 target in / out of the served record set based on a periodic health
 check. Members render as regular `DNSRecord` rows (one per healthy +
 enabled member, carrying `pool_member_id`) so BIND9 / PowerDNS /
-Windows DNS render unchanged. Config lives on `DNSPool` +
+Technitium / Windows DNS render unchanged. Config lives on `DNSPool` +
 `DNSPoolMember`; the reconciler is `app.services.dns.pool_apply`.
 
 A pool's DNS name must live in a **forward** zone. Reverse
@@ -1103,10 +1116,10 @@ drop a lease. Call sites: `backend/app/api/v1/dhcp/agents.py:166` and
 
 ### 18.2 Defense in depth at the render boundary
 
-The BIND9 and PowerDNS drivers run **every** rendered name and rdata value
-through `strip_control_chars` before it reaches a zone-file master line or
-the pdns API (`backend/app/drivers/dns/bind9.py:71` /
-`backend/app/drivers/dns/powerdns.py:117`). A raw newline is the one
+The BIND9, PowerDNS and Technitium drivers run **every** rendered name and
+rdata value through `strip_control_chars` before it reaches a zone-file
+master line or the daemon's REST API (`backend/app/drivers/dns/bind9.py:71`
+/ `powerdns.py:117` / `technitium.py:117`). A raw newline is the one
 character that can inject a *second* record into a zone-file line, and no
 legitimate name or rdata ever contains a control byte. This catches values
 that never passed a field validator — an importer row, a legacy row, a

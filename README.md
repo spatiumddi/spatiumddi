@@ -58,7 +58,7 @@
   - [Try the demo in GitHub Codespaces](#try-the-demo-in-github-codespaces) — one-click full stack with seeded data, browser-only, free 60 h/month
   - [Quick start with the OS appliance ISO](#quick-start-with-the-os-appliance-iso-recommended) — easiest deploy: Debian 13 + embedded k3s + atomic A/B upgrades, guided installer
   - [Quick start with Docker Compose](#quick-start-with-docker-compose) — `docker compose up` on any Docker host, full control
-  - Plus: [demo seed](#seeding-demo-data) · [in-place upgrade flow](#upgrading) · [built-in DNS/DHCP containers](#running-the-built-in-bind9--powerdns--kea-containers) · [API docs](#api--interactive-docs)
+  - Plus: [demo seed](#seeding-demo-data) · [in-place upgrade flow](#upgrading) · [built-in DNS/DHCP containers](#running-the-built-in-bind9--powerdns--technitium--kea-containers) · [API docs](#api--interactive-docs)
 - [Deployment Options](#deployment-options)
 - [Documentation](#documentation)
 - [Project Status](#project-status)
@@ -71,7 +71,7 @@
 
 I'm a network engineer. I've spent years working with enterprise DDI platforms, and while they're solid pieces of software, the licensing puts them out of reach for smaller teams, homelabs, and folks who just want to learn how this stuff fits together.
 
-The open source world has excellent standalone tools — NetBox for IPAM, BIND9 and PowerDNS for DNS, Kea for DHCP — but nothing that pulls them into a single control plane the way the commercial platforms do. So I started building one on nights and weekends.
+The open source world has excellent standalone tools — NetBox for IPAM, BIND9 / PowerDNS / Technitium for DNS, Kea for DHCP — but nothing that pulls them into a single control plane the way the commercial platforms do. So I started building one on nights and weekends.
 
 If SpatiumDDI ends up being useful to you, that's the whole point. If you want to file an issue, send a PR, or just tell me what's broken, I'd genuinely appreciate it.
 
@@ -381,14 +381,15 @@ The tables above are the elevator pitch. The bullets here are the same surface w
   - No software installed on the Windows side
 
 - 📥 **DNS configuration importer** — one-shot migration tool that turns existing zone data into native SpatiumDDI zones + records.
-  - Three sources, one canonical IR + commit pipeline:
-    - **BIND9** — upload a `.zip` / `.tar.gz` of the `named.conf` tree; the parser walks `include` directives, resolves zone files via four strategies (relative path, absolute path, `directory` option, search), tolerates `view {}` blocks, and feeds the same canonical-zone shape the other two sources do
+  - Four sources, one canonical IR + commit pipeline:
+    - **BIND9** — upload a `.zip` / `.tar.gz` of the `named.conf` tree; the parser walks `include` directives, resolves zone files via four strategies (relative path, absolute path, `directory` option, search), tolerates `view {}` blocks, and feeds the same canonical-zone shape the other sources do
     - **Windows DNS** — live pull over WinRM via the existing `WindowsDNSDriver`; honours system zones (TrustAnchors / `_msdcs.*`) by routing them through a dedicated branch instead of trying to migrate them
     - **PowerDNS** — live pull over the authoritative REST API (`X-API-Key` auth, hard cap of 5000 zones / 60 s socket timeout); hoists SOA from rrset content, splits MX / SRV priority into the dedicated columns, drops disabled records + DNSSEC + LUA / ALIAS with distinct warnings
+    - **Technitium** — live pull over the console REST API (token auth); only `Primary` zones import, with secondary / stub / forwarder / catalog reported as warnings rather than minted as rows SpatiumDDI would then serve authoritatively. Technitium returns structured `rData` whose field names differ from its own *write* API and which renders numeric rdata as enum names, so the importer inverts that back to wire values (`DANE-EE` / `SPKI` / `SHA2-256` → `3 1 1 <hex>`), passing unknown enum members through unchanged
   - Preview-before-commit on every source — operator sees the conflict picker (overwrite / skip / merge) before any rows are written
   - Per-zone savepoint commit so a failure on zone N rolls back N but keeps zones 1..N-1 — no all-or-nothing import abort
   - Provenance stamping — `import_source` + `imported_at` columns on `dns_zone` + `dns_record` flag everything that came in from the importer (UI surfaces a chip)
-  - Three-tab admin page at `/admin/dns/import` — one tab per source, all three rendered by a shared preview panel + commit-result panel
+  - Tabbed admin page at `/admin/dns/import` — one tab per source (plus a Cloud tab that pulls from a registered cloud-DNS server row), all rendered by a shared preview panel + commit-result panel
   - Once imported, SpatiumDDI is the source of truth — there is no continuous two-way mirror
 
 - 📡 **Multicast group registry** — IPv4 + IPv6 multicast groups as first-class entities.
@@ -777,7 +778,7 @@ _Click any image to open the full-size version._
 
 **Data plane — four independent shapes (mix freely):**
 
-- **Agented, on-prem** (BIND9 *or* PowerDNS, plus Kea) — one container per service. Each bakes in a sidecar agent (`spatium-dns-agent` / `spatium-dhcp-agent`) that (1) bootstraps with a PSK or pairing code → rotating JWT, (2) long-polls `/config` with an ETag (woken over a Redis pub/sub channel), (3) caches the last-known-good bundle on disk so the service keeps serving if the control plane is unreachable, (4) drains record / config ops over loopback (nsupdate + TSIG for BIND9; REST Control Agent for PowerDNS / Kea). Structural changes reload the daemon; record changes do not. The DNS engine is mutually exclusive per server group.
+- **Agented, on-prem** (BIND9 *or* PowerDNS *or* Technitium, plus Kea) — one container per service. Each bakes in a sidecar agent (`spatium-dns-agent` / `spatium-dhcp-agent`) that (1) bootstraps with a PSK or pairing code → rotating JWT, (2) long-polls `/config` with an ETag (woken over a Redis pub/sub channel), (3) caches the last-known-good bundle on disk so the service keeps serving if the control plane is unreachable, (4) drains record / config ops over loopback (nsupdate + TSIG for BIND9; REST API for PowerDNS / Technitium; REST Control Agent for Kea). Structural changes reload the daemon; record changes do not. The DNS engine is mutually exclusive per server group.
 
 - **Agentless, on-prem** (Windows DNS, Windows DHCP) — no software on the Windows side. The control plane speaks directly: RFC 2136 over UDP/TCP 53 (DNS record writes + AXFR), WinRM + PowerShell over 5985/5986 (DNS zone CRUD, DHCP lease / scope reads). Credentials are Fernet-encrypted on the server row.
 
@@ -787,7 +788,7 @@ _Click any image to open the full-size version._
 
 On the **OS appliance**, a host-side **`spatium-supervisor`** (Ed25519 identity, pairing-code onboarding, heartbeat long-poll) orchestrates the local k3s node — it picks up role assignments, atomic A/B OS upgrades, and firewall + host-config (SNMP / NTP / LLDP / syslog / SSH) from the control plane and enforces them on the host.
 
-The driver abstraction is backend-neutral — services speak to `DNSDriver` / `DHCPDriver`, never to BIND9 / PowerDNS / Kea / PowerShell / cloud-SDK specifics.
+The driver abstraction is backend-neutral — services speak to `DNSDriver` / `DHCPDriver`, never to BIND9 / PowerDNS / Technitium / Kea / PowerShell / cloud-SDK specifics.
 
 **Tech stack**: Python 3.12 · FastAPI · SQLAlchemy 2.x (async) · PostgreSQL 16 · Redis 7 · Celery · React 18 · TypeScript · Tailwind · shadcn/ui · pywinrm · dnspython · cloud provider SDKs · Docker · Kubernetes + Helm · k3s (appliance)
 
@@ -972,8 +973,9 @@ red with a regenerate-the-code hint on failure.
 
 Once paired, the agent shows up on **Appliance → Fleet**.
 The operator approves the row (signs the agent's cert),
-then picks roles (`dns-bind9` / `dns-powerdns` / `dhcp` —
-DNS engines are mutually exclusive). The supervisor on the
+then picks roles (`dns-bind9` / `dns-powerdns` /
+`dns-technitium` / `dhcp` — DNS engines are mutually
+exclusive). The supervisor on the
 agent labels the k3s node (`spatium.io/role-<role>=true`)
 and the matching DaemonSet schedules the role pod. Total
 time from click to running pod: typically 25-35 s.
@@ -1172,7 +1174,7 @@ Bump the pinned version when you're ready to upgrade and re-run the same three c
 - Watch the **CHANGELOG.md** entry for your target version for any release-specific upgrade notes (e.g. "operators on Kea HA must read this before upgrading").
 - The sidebar shows the running version in the bottom-left corner and surfaces an `update available` badge when a newer GitHub release exists — the version probe runs hourly.
 
-### Running the built-in BIND9 / PowerDNS / Kea containers
+### Running the built-in BIND9 / PowerDNS / Technitium / Kea containers
 
 The managed-service containers ship under Compose profiles — opt in when you want them:
 
@@ -1246,8 +1248,12 @@ dig +https=/dns-query +tls-hostname=dns.example.com @127.0.0.1 -p 8443 www.examp
 on the dnsdist front — bring up both the `dns-powerdns` and
 `dns-powerdns-with-dnsdist` profiles and point clients at the front
 (`5853` / `5444`). The standalone `docker-compose.agent-dns-powerdns.yml`
-has no front, so encrypted transports aren't available there. BIND9 needs
-no sidecar. Upstream-over-TLS is BIND9-only — pdns doesn't forward at all.
+has no front, so encrypted transports aren't available there.
+
+**BIND9 and Technitium** need no sidecar — both serve natively. Upstream
+forwarding is where they part: BIND9 forwards over DoT only (9.20 has no
+client-side HTTP or QUIC transport), Technitium forwards over **DoT, DoH
+and DoQ**, and pdns doesn't forward at all.
 
 ### API & interactive docs
 

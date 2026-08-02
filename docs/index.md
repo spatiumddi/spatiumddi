@@ -1,7 +1,7 @@
 ---
 layout: home
 title: Self-hosted DNS, DHCP and IPAM
-description: SpatiumDDI is an open-source DDI platform that runs BIND9, PowerDNS and Kea as first-class service containers — one control plane for DNS, DHCP and IP Address Management.
+description: SpatiumDDI is an open-source DDI platform that runs BIND9, PowerDNS, Technitium and Kea as first-class service containers — one control plane for DNS, DHCP and IP Address Management.
 ---
 
 <!--

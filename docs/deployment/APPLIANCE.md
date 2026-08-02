@@ -169,7 +169,8 @@ state on its heartbeat:
   The VIP also auto-threads into the api's `APPLIANCE_EXTRA_CERT_SANS` so
   the served cert validates on it.
 - **Data-plane VIPs (Phase 10).** Two optional resolver VIPs share the
-  same pool: `dns_vip` (one floating :53 the bind9/powerdns DaemonSets
+  same pool: `dns_vip` (one floating :53 the bind9 / powerdns /
+  technitium DaemonSets
   drop `hostNetwork` to sit behind, an L2 LoadBalancer Service) and
   `dhcp_relay_vip` (an additional :67 LoadBalancer fronting the Kea
   relay→server unicast forward — Kea keeps `hostNetwork` for
@@ -732,7 +733,7 @@ trigger: tag push (CalVer)
 1. Reuse the existing image-build workflows
    - ghcr.io/spatiumddi/spatiumddi-api:<calver>
    - ghcr.io/spatiumddi/spatiumddi-frontend:<calver>
-   - ghcr.io/spatiumddi/dns-{bind9,powerdns}:<calver>
+   - ghcr.io/spatiumddi/dns-{bind9,powerdns,technitium}:<calver>
    - ghcr.io/spatiumddi/dhcp-kea:<calver>
   ↓
 2. Build appliance images via the builder container
@@ -1126,7 +1127,7 @@ drives upgrades for all of them from a single screen.
 
 **How it works:**
 
-* Each registered agent (DNS-BIND / DNS-PowerDNS / DHCP) reports
+* Each registered agent (DNS-BIND9 / DNS-PowerDNS / DNS-Technitium / DHCP) reports
   its slot state on every heartbeat — `deployment_kind`
   (appliance / docker / k8s / unknown), `installed_appliance_version`,
   `current_slot`, `durable_default`, `is_trial_boot`,

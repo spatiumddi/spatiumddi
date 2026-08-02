@@ -3,7 +3,7 @@
 > SpatiumDDI ships an umbrella Helm chart (`charts/spatiumddi`) that stands up
 > the entire control plane — API, frontend, Celery worker, Celery beat, the
 > Alembic migrate Job, plus in-chart PostgreSQL and Redis — and can optionally
-> deploy managed DNS (BIND9 / PowerDNS) and DHCP (Kea) agent StatefulSets
+> deploy managed DNS (BIND9 / PowerDNS / Technitium) and DHCP (Kea) agent StatefulSets
 > alongside it. This page is the operator-facing walkthrough; the two
 > reference docs it leans on are
 > [`charts/spatiumddi/README.md`](../../charts/spatiumddi/README.md) (full
@@ -168,13 +168,21 @@ dnsAgents:
       role: primary
       group: internal-resolvers
       service: { type: LoadBalancer }
-    # PowerDNS (issue #127 — online DNSSEC, ALIAS, LUA, catalog zones).
+    # PowerDNS (issue #127 — ALIAS, LUA, online DNSSEC, catalog zones).
     # Lives in its own group: the control plane rejects mixed-driver
     # groups for those PowerDNS-only features.
     - name: pdns1
       flavor: powerdns
       role: primary
       group: powerdns-edge
+      service: { type: LoadBalancer }
+    # Technitium (issue #746 — native DoT / DoH / DoQ with no sidecar,
+    # encrypted upstream forwarding, online DNSSEC, catalog zones both
+    # ways). Also its own group, same single-driver rule.
+    - name: tech1
+      flavor: technitium
+      role: primary
+      group: technitium-edge
       service: { type: LoadBalancer }
 
 dhcpAgents:
@@ -201,7 +209,9 @@ Each server entry renders a StatefulSet + a Service (default type
 `LoadBalancer` for DNS). The image is selected by `flavor`: the default
 `dnsAgents.image` configures BIND9; `flavor: powerdns` pulls
 `ghcr.io/spatiumddi/dns-powerdns` and switches the state-volume mount path to
-`/var/lib/powerdns` for the LMDB store. The agent reads `CONTROL_PLANE_URL`
+`/var/lib/powerdns` for the LMDB store; `flavor: technitium` pulls
+`ghcr.io/spatiumddi/dns-technitium` and mounts it at `/etc/dns`, where
+Technitium keeps its own config + zone store. The agent reads `CONTROL_PLANE_URL`
 (set by the chart to the in-cluster api Service), exchanges its PSK for a
 rotating JWT, and long-polls the config bundle — the full bootstrap +
 registration flow is in [`DNS_AGENT.md`](DNS_AGENT.md) and summarised in
@@ -422,9 +432,10 @@ the `controlPlaneNodeSelector` helper is in
 
 Per-role node-label gating for the **managed-service workloads**
 (`spatium.io/role-dns-bind9`, `spatium.io/role-dns-powerdns`,
-`spatium.io/role-dhcp`) is part of the appliance chart
-(`charts/spatiumddi-appliance/`), per project non-negotiable #16 — its
-`dns-bind9.yaml` / `dhcp-kea.yaml` templates are the reference pattern. On the
+`spatium.io/role-dns-technitium`, `spatium.io/role-dhcp`) is part of the
+appliance chart (`charts/spatiumddi-appliance/`), per project
+non-negotiable #16 — its `dns-bind9.yaml` / `dns-technitium.yaml` /
+`dhcp-kea.yaml` templates are the reference pattern. On the
 umbrella chart, DNS/DHCP agent placement is controlled per-server through the
 `storage` / `service` / `resources` fields and standard scheduling primitives.
 

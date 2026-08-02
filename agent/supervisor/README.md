@@ -8,7 +8,7 @@ appliances. See [#170] for the umbrella design.
 - **Identity** — Ed25519 keypair, control-plane-signed cert, persistent
   on `/var` so it survives slot swaps.
 - **Service container orchestration** — pulls + starts + stops the
-  `dns-bind9` / `dns-powerdns` / `dhcp-kea` images per the role the
+  `dns-bind9` / `dns-powerdns` / `dns-technitium` / `dhcp-kea` images per the role the
   control plane assigns; never bakes them into the appliance image.
 - **Firewall** — renders an `nftables` drop-in per active role
   (always-open SSH/ICMP/loopback + per-role service ports + operator
