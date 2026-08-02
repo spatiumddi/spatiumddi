@@ -1226,16 +1226,23 @@ control-plane cluster itself, not the registered agent fleet.
    >
    > On the appliance you do not configure this (#787). The seed supervisor
    > derives it from the control-plane size and writes it to the
-   > `spatium-control` HelmChartConfig on every promote/demote, so growing
-   > past one node enables the mirror and shrinking back releases the PVC.
-   > One caveat at the transition: an image uploaded **before** the promote
-   > is on the seed's hostPath, not on the mirror's fresh PVC. The api
-   > falls back to local disk when the mirror misses, which recovers it if
-   > the download lands on the seed — re-upload it after promoting to stop
-   > depending on that. A **BYO-Kubernetes** control plane with
-   > `api.replicas > 1` still has to set `slotImageMirror.enabled=true`
-   > itself; nothing there tracks the replica count. Upgrading from an
-   > external image URL needs no mirror either way.
+   > `spatium-control` HelmChartConfig, so growing past one node enables the
+   > mirror. It **latches**: a later demote leaves it on, because turning it
+   > off would reclaim nothing (the PVC and its Secret are
+   > `helm.sh/resource-policy: keep`, so Helm never deletes them) while
+   > making every mirror-only image unreachable.
+   >
+   > One caveat at the transition: an image staged **before** the promote is
+   > on the seed's hostPath, not on the mirror's fresh PVC. Two things cover
+   > it — the api falls back to local disk when the mirror cannot serve, and
+   > re-uploading (or re-importing) the same image now genuinely re-stores
+   > the bytes instead of short-circuiting on the duplicate checksum. Either
+   > recovers it; the re-upload is the one that fixes it for every node.
+   >
+   > A **BYO-Kubernetes** control plane with `api.replicas > 1` still has to
+   > set `slotImageMirror.enabled=true` itself; nothing there tracks the
+   > replica count. Upgrading from an external image URL needs no mirror
+   > either way.
 2. **URL** (connected install). Operator pastes the GitHub release
    asset URL — same `https://github.com/.../spatiumddi-appliance-
    slot-amd64.raw.xz` shape the per-box flow uses. Each node fetches

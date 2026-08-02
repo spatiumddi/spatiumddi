@@ -32,6 +32,7 @@ from typing import Any
 from urllib.parse import quote
 
 import structlog
+import yaml
 
 log = structlog.get_logger(__name__)
 
@@ -147,8 +148,6 @@ def _parse_host_kubeconfig(path: Path) -> KubeConfig:
     pre-podification (legacy compose where someone still wants
     introspection).
     """
-    import yaml  # noqa: PLC0415 — lazy import; only on host-kubeconfig path.
-
     data = yaml.safe_load(path.read_text(encoding="utf-8"))
     contexts = {c["name"]: c["context"] for c in data.get("contexts") or []}
     current = data.get("current-context")
@@ -377,8 +376,6 @@ def apply_helmchart(
     same content is a no-op for k3s's helm-controller (Helm tracks
     revision diffs internally).
     """
-    import yaml  # noqa: PLC0415 — lazy; only on apply path.
-
     values_yaml = yaml.safe_dump(values, default_flow_style=False, sort_keys=False)
     body = {
         "apiVersion": "helm.cattle.io/v1",
@@ -634,8 +631,79 @@ def _helmchartconfig_upsert(
     )
 
 
-def _slot_image_mirror_values(cp_size: int) -> str:
-    """The ``slotImageMirror`` stanza for the spatium-control overrides.
+# Fast-evict tolerations for the CONTROL-PLANE workloads (api / frontend /
+# worker). Deliberately a separate constant from ``_FAST_EVICT_TOLERATIONS``,
+# which coredns uses: the two are the same 20 s today but answer different
+# questions (how fast must a control-plane replica leave a dead node, vs how
+# fast must cluster DNS), and collapsing them would make a future retune of
+# one silently retune the other.
+_CONTROL_PLANE_FAST_EVICT = [
+    {
+        "key": "node.kubernetes.io/unreachable",
+        "operator": "Exists",
+        "effect": "NoExecute",
+        "tolerationSeconds": 20,
+    },
+    {
+        "key": "node.kubernetes.io/not-ready",
+        "operator": "Exists",
+        "effect": "NoExecute",
+        "tolerationSeconds": 20,
+    },
+]
+
+
+def _deep_merge(base: dict, overlay: dict) -> dict:
+    """``overlay`` wins, recursing into dicts so sibling keys survive.
+
+    Lists and scalars are replaced wholesale — a partial merge of
+    ``tolerations`` or ``loadBalancerSourceRanges`` would be meaningless.
+    Neither input is mutated."""
+    out = dict(base)
+    for key, value in overlay.items():
+        existing = out.get(key)
+        if isinstance(value, dict) and isinstance(existing, dict):
+            out[key] = _deep_merge(existing, value)
+        else:
+            out[key] = value
+    return out
+
+
+def _helmchartconfig_doc(name: str, *, namespace: str = "kube-system") -> dict:
+    """Current ``spec.valuesContent`` of the HelmChartConfig, parsed.
+
+    Absent CR, unreadable kubeapi, unparseable JSON and unparseable YAML all
+    collapse to ``{}`` on purpose: every caller is asking "what is already
+    written here?", and for all four the honest answer is "nothing we can
+    rely on". Callers therefore fail OPEN — they recompute from cluster
+    state rather than inventing a state they cannot see. The one cost is
+    that a kubeapi blip can drop a foreign key (``image.tag``) on that
+    heartbeat; chart_bump re-stamps it, and the alternative — refusing to
+    write the control-plane overrides at all when the CR cannot be read —
+    would strand a promote."""
+    path = (
+        f"/apis/helm.cattle.io/v1/namespaces/{quote(namespace)}"
+        f"/helmchartconfigs/{quote(name)}"
+    )
+    try:
+        st, resp = _request("GET", path)
+    except (RuntimeError, OSError):
+        return {}
+    if st != 200:
+        return {}
+    try:
+        raw = (json.loads(resp).get("spec") or {}).get("valuesContent") or ""
+    except (json.JSONDecodeError, ValueError):
+        return {}
+    try:
+        doc = yaml.safe_load(raw) if str(raw).strip() else None
+    except yaml.YAMLError:
+        return {}
+    return doc if isinstance(doc, dict) else {}
+
+
+def _slot_image_mirror_enabled(cp_size: int, current_doc: dict) -> bool:
+    """Whether ``slotImageMirror.enabled`` belongs in the overrides.
 
     #787 — an uploaded / GitHub-imported upgrade image lands on a
     node-local hostPath: on whichever api replica served the upload. The
@@ -660,23 +728,46 @@ def _slot_image_mirror_values(cp_size: int) -> str:
       for it. A schedule-time refusal keyed to appliance-node count, which
       an earlier revision of this branch tried, gets both directions
       wrong.
-    * A single-node appliance stays on the hostPath and never reserves the
-      PVC. That was the stated reason the chart default is off, and it
-      still holds — /var on a single box is the remainder of a 32 GiB
-      minimum disk.
-    * It is written on promote AND demote, so a cluster that shrinks back
-      to one node releases the PVC. The value is emitted in both states
-      rather than only when true, because omitting it would let the
-      enabled-once state persist through a demote (helm-controller merges,
-      it does not diff).
+    * A single-node appliance that has never been promoted stays on the
+      hostPath and never reserves the PVC. That was the stated reason the
+      chart default is off, and it still holds — /var on a single box is
+      the remainder of a 32 GiB minimum disk.
 
-    The transition still strands bytes uploaded BEFORE a promote: they sit
-    on the seed's hostPath and the mirror's PVC starts empty. The api's
-    download handler falls back to local FS on a mirror miss for exactly
-    that case (see ``download_upgrade_image``), which recovers it on the
-    seed; off the seed the operator re-uploads, and the mirror then holds
-    it for good."""
-    return f"slotImageMirror:\n  enabled: {'true' if cp_size >= 2 else 'false'}\n"
+    It LATCHES: once enabled, a later demote leaves it on. That is not
+    laziness, it is the only correct direction, for two independent
+    reasons:
+
+    * Turning it back off would not reclaim anything. The mirror's PVC and
+      auth Secret both carry ``helm.sh/resource-policy: keep``, so Helm
+      skips deleting them on the release update, and nothing else reaps
+      them — ``reclaim_stranded_redis_storage`` only matches ``-redis-``
+      claims. The disk stays committed either way.
+    * It would strand every image the mirror holds. With
+      ``SLOT_IMAGE_MIRROR_URL`` unset the api reads local FS only, so
+      images that were staged after the promote — the ones that exist
+      solely on the PVC — become unreachable, producing exactly the "bytes
+      missing on disk" 404 this whole change exists to remove.
+
+    So the answer is ``True`` if the cluster is multi-node OR the override
+    already says true. It is written as an explicit value in BOTH states
+    rather than omitted when false, because helm-controller MERGES a
+    HelmChartConfig instead of diffing it — an absent key keeps whatever
+    was written last, so a latch cannot be expressed by omission.
+
+    ``current_doc`` is the parsed live ``valuesContent``; passing it in
+    (rather than re-reading here) keeps this a pure function and the
+    kubeapi read in one place.
+
+    One transition remains, and it is handled outside this function: bytes
+    uploaded BEFORE a promote sit on the seed's hostPath while the mirror's
+    PVC starts empty. The api's download handler falls back to local FS
+    when the mirror cannot serve, which recovers it on the seed, and
+    re-uploading (or re-importing) now genuinely re-stores the bytes rather
+    than short-circuiting on the duplicate hash."""
+    if cp_size >= 2:
+        return True
+    block = current_doc.get("slotImageMirror")
+    return bool(isinstance(block, dict) and block.get("enabled") is True)
 
 
 def apply_control_plane_overrides(
@@ -696,17 +787,16 @@ def apply_control_plane_overrides(
 
     #787 — the slot-image mirror is enabled from the same number, because
     it is a function of exactly one thing: whether more than one api replica
-    can serve an upgrade-image download. See ``_slot_image_mirror_values``."""
+    can serve an upgrade-image download. It latches on rather than tracking
+    the size in both directions; see ``_slot_image_mirror_values``."""
     if cp_size < 1:
         return False, "cp_size < 1"
     vip = (control_plane_vip or "").strip()
-    # Flow-style JSON list is valid YAML; empty list = open (field omitted by
-    # the chart template). The supervisor already validates these CIDRs at the
-    # control plane, but they arrive here as plain strings — json.dumps keeps
-    # them quoted so a malformed entry can't break the YAML overlay.
-    src_json = json.dumps(
-        [c.strip() for c in (web_ui_allowed_cidrs or []) if c and c.strip()]
-    )
+    # Empty list = open (the field is omitted by the chart template). These
+    # arrive as plain strings the control plane has already validated; going
+    # through the YAML dumper below is what keeps a malformed entry from
+    # breaking the document, so no hand-quoting is needed here.
+    cidrs = [c.strip() for c in (web_ui_allowed_cidrs or []) if c and c.strip()]
     # #590 — pin api/frontend/worker to one replica per control-plane node,
     # and evict them from a dead node in seconds rather than the k8s default
     # 300 s. ``replicas`` here IS the node count, so hard
@@ -725,27 +815,43 @@ def apply_control_plane_overrides(
     # suppresses the DefaultTolerationSeconds admission plugin, which a
     # BYO-Kubernetes install still wants. They belong to the appliance,
     # where the control-plane node count is fixed.
-    fast_evict = (
-        "  tolerations:\n"
-        "    - key: node.kubernetes.io/unreachable\n"
-        "      operator: Exists\n"
-        "      effect: NoExecute\n"
-        "      tolerationSeconds: 20\n"
-        "    - key: node.kubernetes.io/not-ready\n"
-        "      operator: Exists\n"
-        "      effect: NoExecute\n"
-        "      tolerationSeconds: 20\n"
-    )
-    values = (
-        f"api:\n  replicas: {cp_size}\n  podAntiAffinity: hard\n{fast_evict}"
-        f"frontend:\n  replicas: {cp_size}\n  podAntiAffinity: hard\n{fast_evict}"
-        f'  controlPlaneVIP: "{vip}"\n'
-        f"  loadBalancerSourceRanges: {src_json}\n"
-        f"worker:\n  replicas: {cp_size}\n  podAntiAffinity: hard\n{fast_evict}"
-        f"{_slot_image_mirror_values(cp_size)}"
-        f"postgresql:\n  cnpg:\n    instances: {cp_size}\n"
-        f"redis:\n  sentinel:\n    replicas: {cp_size}\n"
-    )
+    scaled = {
+        "replicas": cp_size,
+        "podAntiAffinity": "hard",
+        "tolerations": _CONTROL_PLANE_FAST_EVICT,
+    }
+    current_doc = _helmchartconfig_doc("spatium-control")
+    owned: dict[str, Any] = {
+        "api": dict(scaled),
+        "frontend": dict(scaled)
+        | {
+            "controlPlaneVIP": vip,
+            "loadBalancerSourceRanges": cidrs,
+        },
+        "worker": dict(scaled),
+        "slotImageMirror": {"enabled": _slot_image_mirror_enabled(cp_size, current_doc)},
+        "postgresql": {"cnpg": {"instances": cp_size}},
+        "redis": {"sentinel": {"replicas": cp_size}},
+    }
+    # MERGE onto what is already there rather than replacing the document.
+    #
+    # This used to be a hand-concatenated string assigned wholesale to
+    # ``spec.valuesContent``, which silently deleted every key the
+    # supervisor does not own. One of those keys is load-bearing:
+    # ``chart_bump._patch_image_tag`` stamps ``image.tag`` onto this very
+    # CR to roll the control plane to a new version, and it re-dumps the
+    # document with ``yaml.safe_dump(sort_keys=True)``. That output could
+    # never equal the supervisor's hand-rolled rendering, so the next
+    # heartbeat — at most 30 s later, i.e. mid-upgrade — always saw a
+    # difference, PATCHed its own string back, and took ``image.tag`` with
+    # it. helm-controller then re-applied the chart at its default tag.
+    #
+    # Merging fixes the deletion; dumping through the SAME normalisation
+    # chart_bump uses fixes the churn, because two agents writing the same
+    # logical document now produce byte-identical strings and the upsert's
+    # idempotent compare finally holds.
+    merged = _deep_merge(current_doc, owned)
+    values = yaml.safe_dump(merged, sort_keys=True, default_flow_style=False)
     return _helmchartconfig_upsert("spatium-control", values)
 
 

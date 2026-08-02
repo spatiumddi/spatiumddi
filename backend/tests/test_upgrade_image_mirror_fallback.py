@@ -7,12 +7,23 @@ hostPath while the mirror's PVC comes up empty. Without a fallback the
 first multi-node upgrade after a promote fails on a download the operator
 cannot diagnose — the bytes are right there on the node.
 
-The fallback is deliberately narrow, and these tests pin both halves:
+Both mirror failure modes fall back when this replica holds the bytes:
 
-* a mirror **404** falls through to local disk when the file is there;
-* a mirror **502** does not, because serving a local copy would mask an
-  unreachable or erroring mirror on whichever replica happens to hold a
-  stale file.
+* **404** — the image predates the promote that enabled the mirror.
+* **502** — the mirror is unreachable. Its PVC is RWO local-path, so the
+  single mirror pod is pinned to one node; losing that node would
+  otherwise block every upgrade in the fleet, including the one that
+  repairs it.
+
+Serving local bytes is safe because the host runner verifies them against
+the stamped sha256 and ``delete_upgrade_image`` now clears local copies
+too, so a deleted image cannot resurface. What must not happen is a
+degraded mirror looking healthy — hence the warning-level log, asserted
+here.
+
+Also covers the two halves that make "re-upload it" a real remedy rather
+than a no-op: both ingest paths re-store when the active store has lost
+the bytes, and delete cleans local FS even in mirror mode.
 """
 
 from __future__ import annotations
@@ -26,7 +37,9 @@ from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.appliance import upgrade_images
+from app.core.security import create_access_token, hash_password
 from app.models.appliance import ApplianceUpgradeImage
+from app.models.auth import User
 
 pytestmark = pytest.mark.asyncio
 
@@ -108,17 +121,46 @@ async def test_mirror_miss_with_no_local_copy_still_404s(
     assert resp.status_code == 404
 
 
-async def test_mirror_transport_error_is_not_masked_by_a_local_copy(
+async def test_unreachable_mirror_falls_back_and_warns(
     client: AsyncClient,
     db_session: AsyncSession,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    # A 502 means the mirror is broken, not that the image is absent from
-    # it. Falling back here would let a whole fleet upgrade off stale local
-    # copies while the real store is down and nobody is told.
+    # The mirror pod is pinned to one node by its RWO PVC. Losing that node
+    # must not block an upgrade on a replica that has the exact bytes — but
+    # the degradation has to be visible, not silent.
     image = await _seed_image(db_session)
     _stage_local(monkeypatch, tmp_path, image.id)
+    _mirror_raises(
+        monkeypatch,
+        HTTPException(status.HTTP_502_BAD_GATEWAY, "Mirror download failed: boom"),
+    )
+    warnings: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        upgrade_images.logger,
+        "warning",
+        lambda event, **kw: warnings.append((event, kw)),
+    )
+
+    resp = await client.get(_url(image))
+
+    assert resp.status_code == 200
+    assert resp.content == _BYTES
+    assert [e for e, _ in warnings] == ["appliance_upgrade_image_served_from_local_mirror_degraded"]
+
+
+async def test_unreachable_mirror_with_no_local_copy_still_502s(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # Nothing to serve — the mirror's own error is the honest answer, and
+    # must not be flattened into a 404 ("re-upload required") that would
+    # send the operator down the wrong path.
+    image = await _seed_image(db_session)
+    monkeypatch.setattr(upgrade_images, "_image_path", lambda _id: tmp_path / f"{_id}.raw.xz")
     _mirror_raises(
         monkeypatch,
         HTTPException(status.HTTP_502_BAD_GATEWAY, "Mirror download failed: boom"),
@@ -163,3 +205,125 @@ async def test_fallback_does_not_bypass_the_download_token(
 
     assert (await client.get(f"{_BASE}/{image.id}/raw.xz")).status_code == 401
     assert (await client.get(f"{_BASE}/{image.id}/raw.xz?t=nope")).status_code == 403
+
+
+# ── "Re-upload it" has to actually re-store ──────────────────────────
+
+
+async def _superadmin_headers(db: AsyncSession) -> dict[str, str]:
+    user = User(
+        username=f"admin-{uuid.uuid4().hex[:8]}",
+        email=f"{uuid.uuid4().hex[:8]}@example.com",
+        display_name="Test Admin",
+        hashed_password=hash_password("test-pw-787"),
+        is_superadmin=True,
+    )
+    db.add(user)
+    await db.flush()
+    return {"Authorization": f"Bearer {create_access_token(str(user.id))}"}
+
+
+def _upload_files() -> dict:
+    return {"file": ("image.raw.xz", _BYTES, "application/octet-stream")}
+
+
+def _upload_form(image: ApplianceUpgradeImage) -> dict[str, str]:
+    return {
+        "sha256": image.sha256,
+        "appliance_version": image.appliance_version,
+    }
+
+
+async def test_duplicate_upload_restores_bytes_missing_from_the_store(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The documented post-promote remedy, which used to be a no-op.
+
+    The row exists (same sha256) but the mirror's PVC came up empty, so the
+    duplicate short-circuit returned success while storing nothing — the
+    operator could re-upload forever and change nothing.
+    """
+    image = await _seed_image(db_session)
+    headers = await _superadmin_headers(db_session)
+    monkeypatch.setattr(upgrade_images.settings, "slot_image_mirror_url", "http://mirror")
+
+    async def _absent(_id):
+        return False
+
+    stored: dict[str, uuid.UUID] = {}
+
+    async def _store(image_id, source, expected_sha):
+        written = 0
+        async for chunk in source:
+            written += len(chunk)
+        stored["id"] = image_id
+        return written
+
+    monkeypatch.setattr(upgrade_images, "_bytes_present_in_active_store", _absent)
+    monkeypatch.setattr(upgrade_images, "_store_verified_image", _store)
+
+    resp = await client.post(
+        _BASE, headers=headers, files=_upload_files(), data=_upload_form(image)
+    )
+
+    assert resp.status_code == 200
+    # Re-stored under the EXISTING id — a fresh one would leave any
+    # already-stamped desired_slot_image_url pointing at nothing.
+    assert stored["id"] == image.id
+    assert resp.json()["id"] == str(image.id)
+
+
+async def test_duplicate_upload_still_short_circuits_when_bytes_are_present(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The idempotent path is the common one and must stay cheap: no re-store
+    # of a 1-4 GiB body just because the operator clicked upload twice.
+    image = await _seed_image(db_session)
+    headers = await _superadmin_headers(db_session)
+    monkeypatch.setattr(upgrade_images.settings, "slot_image_mirror_url", "http://mirror")
+
+    async def _present(_id):
+        return True
+
+    async def _never(*_args, **_kwargs):
+        raise AssertionError("must not re-store when the bytes are already there")
+
+    monkeypatch.setattr(upgrade_images, "_bytes_present_in_active_store", _present)
+    monkeypatch.setattr(upgrade_images, "_store_verified_image", _never)
+
+    resp = await client.post(
+        _BASE, headers=headers, files=_upload_files(), data=_upload_form(image)
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["id"] == str(image.id)
+
+
+async def test_delete_clears_the_local_copy_in_mirror_mode(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # The hostPath stays mounted with the mirror on, so a local copy can
+    # exist. Leaving it behind would strand gigabytes per deleted image AND
+    # let the download fallback serve something the operator deleted.
+    image = await _seed_image(db_session)
+    headers = await _superadmin_headers(db_session)
+    local = _stage_local(monkeypatch, tmp_path, image.id)
+    monkeypatch.setattr(upgrade_images.settings, "slot_image_mirror_url", "http://mirror")
+
+    async def _noop_delete(_id):
+        return None
+
+    monkeypatch.setattr(upgrade_images, "_delete_from_mirror", _noop_delete)
+
+    resp = await client.delete(f"{_BASE}/{image.id}", headers=headers)
+
+    assert resp.status_code == 204
+    assert not local.exists()
