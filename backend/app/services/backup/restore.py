@@ -85,6 +85,11 @@ class RestoreOutcome:
     selective: bool = False
     restored_sections: list[str] | None = None
     restored_tables: list[str] | None = None
+    # Tables restored because ``TRUNCATE … CASCADE`` would have emptied
+    # them, not because the operator selected their section. Empty on a
+    # full restore. Surfaced so the operator can see that a selective
+    # restore necessarily reached past the sections they ticked (#781).
+    cascade_widened_tables: list[str] = field(default_factory=list)
     migration: MigrationOutcome | None = None
     rewrap: RewrapOutcome | None = None
     # Operator-actionable post-restore advisories that don't block
@@ -405,6 +410,7 @@ async def apply_backup_restore(
     confirmation_phrase: str,
     db_url: str,
     sections: list[str] | None = None,
+    allow_newer_schema: bool = False,
 ) -> RestoreOutcome:
     """Validate, decrypt-check, take a safety dump, then replay the
     archive via psql (Phase 1 plain dumps) or pg_restore (Phase 2+
@@ -433,6 +439,7 @@ async def apply_backup_restore(
         raise BackupRestoreError("passphrase is required")
 
     started = datetime.now(UTC)
+    schema_override_warning: str | None = None
 
     # Phase 1: parse + validate the archive, fail fast if it's
     # malformed, before taking the destructive safety dump path.
@@ -463,8 +470,32 @@ async def apply_backup_restore(
     direction_error = schema_direction_error(
         manifest.get("schema_version") or secrets_payload.get("schema_version")
     )
-    if direction_error:
+    if direction_error and not allow_newer_schema:
         raise BackupRestoreError(direction_error)
+    if direction_error and allow_newer_schema:
+        # The refusal exists because ``alembic_version`` ending up ahead
+        # of the running code trips the api's strict schema-head
+        # readiness gate. That is a real failure — but making it
+        # absolute removed the A/B-rollback path, where an operator who
+        # rolled back *because* the new build broke is told to upgrade
+        # into the build they just escaped (#781).
+        #
+        # It also catches more than it means to: ``_is_ancestor``
+        # returns False on ANY exception, so a forked, squashed or
+        # renamed revision is indistinguishable from a genuinely newer
+        # one. This override covers that case too.
+        logger.warning(
+            "backup_restore_newer_schema_override",
+            detail=direction_error,
+            manifest_schema_version=manifest.get("schema_version"),
+        )
+        schema_override_warning = (
+            "Schema-direction check OVERRIDDEN: " + direction_error + " Restoring "
+            "anyway because allow_newer_schema was set. The database's "
+            "alembic_version may now be ahead of this build, which the api's "
+            "schema-head readiness gate rejects — upgrade to a build at or past "
+            "the archive's head, or expect /health/ready to fail."
+        )
 
     # Phase 3: pre-restore safety dump. Soft-fails — if the api
     # container can't write to ``/var/lib/spatiumddi/backups`` (no
@@ -497,6 +528,7 @@ async def apply_backup_restore(
     selective = bool(sections)
     restored_sections: list[str] | None = None
     restored_tables: list[str] | None = None
+    cascade_widened: list[str] = []
 
     if selective and dump_format != "custom":
         raise BackupRestoreError(
@@ -511,6 +543,7 @@ async def apply_backup_restore(
             # touch selective.
             from app.services.backup.sections import (  # noqa: PLC0415
                 SECTIONS_BY_KEY,
+                cascade_closure,
                 tables_for_sections,
             )
 
@@ -529,16 +562,38 @@ async def apply_backup_restore(
             effective = list(requested)
             if "platform_internal" not in effective:
                 effective.append("platform_internal")
-            restored_tables = tables_for_sections(effective)
+            selected_tables = tables_for_sections(effective)
             restored_sections = effective
+
+            # The TRUNCATE below is CASCADE, so it also empties every
+            # table holding a foreign key into a selected one —
+            # catalogued or not, chosen or not. Restoring only the
+            # selection therefore DELETED the difference: measured on
+            # the shipped catalog, "auth" cascades into 130 tables and
+            # refilled 11 (#781). Restore the whole closure instead, so
+            # everything the operation touches ends consistent with the
+            # archive. Deliberately wider than the operator ticked —
+            # but the alternative is not "narrower", it is "emptied".
+            closure = cascade_closure(selected_tables)
+            cascade_widened = sorted(closure - set(selected_tables))
+            # Preserve the catalog's ordering for the selection, then
+            # append the widened set; pg_restore resolves its own
+            # dependency order, so this only affects readability.
+            restored_tables = selected_tables + cascade_widened
+            if cascade_widened:
+                logger.info(
+                    "backup_restore_cascade_widened",
+                    selected_sections=effective,
+                    selected_table_count=len(selected_tables),
+                    widened_table_count=len(cascade_widened),
+                    widened_tables=cascade_widened,
+                )
 
             dump_path = Path(tmpdir) / "database.dump"
             dump_path.write_bytes(db_bytes)
-            # Step 1: wipe the selected sections' tables CASCADE
-            # (cross-section FK rows in non-selected sections also
-            # get cleared — this is documented in the operator UI).
+            # Step 1: wipe the selection + everything CASCADE reaches.
             await _truncate_tables(restored_tables, db_url)
-            # Step 2: data-only re-load from the archive.
+            # Step 2: data-only re-load of that same closure.
             await _run_pg_restore_data_only(dump_path, db_url, restored_tables)
         elif dump_format == "custom":
             dump_path = Path(tmpdir) / "database.dump"
@@ -616,6 +671,24 @@ async def apply_backup_restore(
         logger.warning("backup_restore_warning_scan_failed", error=str(exc))
         post_warnings = []
 
+    # The override is the first thing an operator should read back.
+    if schema_override_warning:
+        post_warnings.insert(0, schema_override_warning)
+
+    # Say plainly that the restore reached past the ticked sections.
+    # An operator who picked "DNS" and finds their IPAM rows reverted
+    # should learn it here, not by noticing later.
+    if cascade_widened:
+        post_warnings.append(
+            f"Selective restore also restored {len(cascade_widened)} table(s) outside "
+            "the sections you selected, because a foreign key from them into the "
+            "selected data means PostgreSQL's TRUNCATE ... CASCADE would otherwise "
+            "have emptied them without repopulating: "
+            + ", ".join(cascade_widened[:12])
+            + (f", and {len(cascade_widened) - 12} more" if len(cascade_widened) > 12 else "")
+            + "."
+        )
+
     # A half-migrated credential store is the one restore outcome an
     # operator must act on immediately, so it rides the same amber
     # warnings channel the DNSSEC-republish advisory uses rather than
@@ -659,6 +732,7 @@ async def apply_backup_restore(
         selective=selective,
         restored_sections=restored_sections,
         restored_tables=restored_tables,
+        cascade_widened_tables=cascade_widened,
         migration=migration_outcome,
         rewrap=rewrap_outcome,
         warnings=post_warnings,

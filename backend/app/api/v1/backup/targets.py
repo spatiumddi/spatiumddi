@@ -604,6 +604,12 @@ class RestoreFromArchiveBody(BaseModel):
     #: for selective restore. Empty / None → full hard-overwrite
     #: restore (Phase 1 behaviour).
     sections: list[str] | None = None
+    #: Override the refusal to restore an archive whose schema head this
+    #: build doesn't know. Exists for the A/B-rollback case, where the
+    #: operator rolled back *because* the newer build broke and would
+    #: otherwise be told to upgrade into it (#781). Audited; the response
+    #: warns that the schema-head readiness gate may then fail.
+    allow_newer_schema: bool = False
 
 
 @router.post("/{target_id}/archives/restore")
@@ -657,6 +663,7 @@ async def restore_from_archive(
             confirmation_phrase=body.confirmation_phrase,
             db_url=str(settings.database_url),
             sections=body.sections or None,
+            allow_newer_schema=body.allow_newer_schema,
         )
     except (BackupArchiveError, BackupCryptoError, BackupRestoreError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
