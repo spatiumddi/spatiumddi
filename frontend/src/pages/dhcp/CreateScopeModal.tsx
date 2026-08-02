@@ -85,9 +85,6 @@ export function CreateScopeModal({
   const [ddnsPolicy, setDdnsPolicy] = useState(
     scope?.ddns_hostname_policy ?? "client",
   );
-  const [ddnsDomain, setDdnsDomain] = useState(
-    scope?.ddns_domain_override ?? "",
-  );
   // When off, this scope's dynamic-pool lease mirrors are excluded from the
   // IPAM↔DNS drift check (ephemeral pulled leases don't read as "out of sync").
   const [dnsTrackDynamicLeases, setDnsTrackDynamicLeases] = useState(
@@ -304,7 +301,6 @@ export function CreateScopeModal({
         lease_cache_max_age: parsedCacheMaxAge,
         ddns_enabled: ddnsEnabled,
         ddns_hostname_policy: ddnsEnabled ? ddnsPolicy : null,
-        ddns_domain_override: ddnsDomain || null,
         hostname_sync_mode: hostnameSync,
         dns_track_dynamic_leases: dnsTrackDynamicLeases,
         options,
@@ -778,7 +774,7 @@ export function CreateScopeModal({
             <span>DDNS — push lease updates to DNS</span>
           </label>
           {ddnsEnabled && (
-            <div className="grid grid-cols-2 gap-3 pl-6">
+            <div className="space-y-2 pl-6">
               <Field label="Hostname Policy">
                 <select
                   className={inputCls}
@@ -790,16 +786,16 @@ export function CreateScopeModal({
                   <option value="generate">Generate</option>
                 </select>
               </Field>
-              <Field
-                label="Domain Override"
-                hint="Blank = use subnet DNS zone."
-              >
-                <input
-                  className={inputCls}
-                  value={ddnsDomain}
-                  onChange={(e) => setDdnsDomain(e.target.value)}
-                />
-              </Field>
+              {/* #784 — a "Domain Override" input used to sit here. Nothing
+                  stored it: no column, no field on the create/update models,
+                  and the response hardcoded null, so a typed value was
+                  silently discarded. The setting is real one level up, on the
+                  subnet, which is where the DDNS resolution chain reads it. */}
+              <p className="text-xs text-muted-foreground">
+                The DDNS domain comes from the subnet (inherited from its block
+                or IP space unless overridden). Set it in IPAM → the subnet's
+                DDNS settings.
+              </p>
             </div>
           )}
         </div>
