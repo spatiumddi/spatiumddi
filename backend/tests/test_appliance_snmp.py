@@ -221,3 +221,273 @@ def test_disabled_master_toggle_renders_no_config() -> None:
 
     bundle = snmp_bundle(s)
     assert bundle["snmpd_conf"] == ""
+
+
+# ── Undecryptable v3 passphrases must not downgrade the user ─────────
+#
+# #781 flagged this as an unverified claim while reviewing the secret
+# rewrap; it is real. ``_decrypt_v3_pass`` returns ``None`` for both
+# "absent" and "undecryptable", and the renderer's level ladder gated on
+# ``auth_proto != "none" and auth_pass``. A user configured for authPriv
+# whose passphrase could not be decrypted therefore fell all the way
+# through to ``rouser <name> noauth`` — an unauthenticated read-only
+# SNMPv3 user reachable by anyone the firewall lets in.
+#
+# That is a silent security downgrade, and strictly worse than an
+# outage: nothing fails, so nobody looks. The trigger is any key
+# mismatch — a rotated SECRET_KEY, or a cross-install restore whose
+# rewrap did not cover these JSONB-embedded fields (which it did not,
+# before #796).
+
+
+def _undecryptable() -> str:
+    """A syntactically valid Fernet token this install cannot decrypt.
+
+    Encrypted under a different key, so ``decrypt_str`` raises
+    ``InvalidToken`` exactly as it would after a key rotation — rather
+    than raising some other error a garbage string would produce.
+    """
+    import base64
+    import os
+
+    from cryptography.fernet import Fernet
+
+    other = Fernet(base64.urlsafe_b64encode(os.urandom(32)))
+    return other.encrypt(b"the-real-passphrase").decode("ascii")
+
+
+def test_v3_user_with_undecryptable_auth_pass_is_omitted_not_downgraded() -> None:
+    s = _bare_settings()
+    s.snmp_enabled = True
+    s.snmp_version = "v3"
+    s.snmp_v3_users = [
+        {
+            "username": "authpriv_user",
+            "auth_protocol": "SHA",
+            "auth_pass_enc": _undecryptable(),
+            "priv_protocol": "AES",
+            "priv_pass_enc": encrypt_str("priv-pass").decode("ascii"),
+        }
+    ]
+
+    text = render_snmpd_conf(s)
+
+    # The critical assertion: the user is NOT published unauthenticated.
+    assert "rouser authpriv_user noauth" not in text
+    # ...and not published at all.
+    assert "createUser authpriv_user" not in text
+    assert "rouser authpriv_user" not in text
+    # The config says why, so an operator reading snmpd.conf isn't left
+    # wondering where their user went.
+    assert "OMITTED" in text
+    assert "authpriv_user" in text
+
+
+def test_v3_user_with_undecryptable_priv_pass_is_omitted_not_left_unencrypted() -> None:
+    """One rung down the ladder: auth decrypts, privacy doesn't.
+
+    Publishing at ``auth`` would authenticate the poller but leave every
+    response in cleartext on the wire — not what an operator who
+    configured authPriv asked for.
+    """
+    s = _bare_settings()
+    s.snmp_enabled = True
+    s.snmp_version = "v3"
+    s.snmp_v3_users = [
+        {
+            "username": "halfbroken_user",
+            "auth_protocol": "SHA",
+            "auth_pass_enc": encrypt_str("auth-pass").decode("ascii"),
+            "priv_protocol": "AES",
+            "priv_pass_enc": _undecryptable(),
+        }
+    ]
+
+    text = render_snmpd_conf(s)
+
+    assert "rouser halfbroken_user auth" not in text
+    assert "rouser halfbroken_user noauth" not in text
+    assert "createUser halfbroken_user" not in text
+    assert "OMITTED" in text
+
+
+def test_a_deliberate_noauth_user_still_renders() -> None:
+    """The guard keys off ``auth_protocol``, not off a missing passphrase.
+
+    An operator who genuinely configured noAuthNoPriv has no passphrase
+    to decrypt, and must not be caught by the new check.
+    """
+    s = _bare_settings()
+    s.snmp_enabled = True
+    s.snmp_version = "v3"
+    s.snmp_v3_users = [
+        {
+            "username": "intentional_noauth",
+            "auth_protocol": "none",
+            "auth_pass_enc": None,
+            "priv_protocol": "none",
+            "priv_pass_enc": None,
+        }
+    ]
+
+    text = render_snmpd_conf(s)
+
+    assert "createUser intentional_noauth" in text
+    assert "rouser intentional_noauth noauth .1" in text
+    assert "OMITTED" not in text
+
+
+def test_a_broken_user_does_not_suppress_a_healthy_one() -> None:
+    s = _bare_settings()
+    s.snmp_enabled = True
+    s.snmp_version = "v3"
+    s.snmp_v3_users = [
+        {
+            "username": "broken_user",
+            "auth_protocol": "SHA",
+            "auth_pass_enc": _undecryptable(),
+            "priv_protocol": "none",
+            "priv_pass_enc": None,
+        },
+        {
+            "username": "healthy_user",
+            "auth_protocol": "SHA",
+            "auth_pass_enc": encrypt_str("good-pass").decode("ascii"),
+            "priv_protocol": "none",
+            "priv_pass_enc": None,
+        },
+    ]
+
+    text = render_snmpd_conf(s)
+
+    assert "rouser broken_user" not in text
+    assert 'createUser healthy_user SHA "good-pass"' in text
+    assert "rouser healthy_user auth .1" in text
+
+
+# ── snmpd.conf injection via the v3 username ─────────────────────────
+#
+# Raised on the #802 review as token-splitting; it is worse than that.
+# snmpd.conf is whitespace-delimited and does not quote the username
+# token, so a username carrying a NEWLINE ends the directive and starts
+# a new one. ``ops\nrwuser evil .1`` renders as:
+#
+#     createUser ops
+#     rwuser evil .1 SHA "pass"
+#
+# i.e. an operator who can edit SNMP settings can inject arbitrary
+# snmpd.conf directives, including a READ-WRITE user. Superadmin-only,
+# so not remote-unauthenticated — but it is still a privilege escalation
+# from "edits a settings form" to "writes the daemon's config".
+#
+# Fixed in two places on purpose: the settings router rejects it at the
+# API boundary (the right place, and where the operator sees the error),
+# and the renderer re-checks because rows written before that validator
+# existed are still in the database and this renderer is the last thing
+# between stored state and the file snmpd loads.
+
+
+def test_v3_username_with_a_newline_cannot_inject_a_directive() -> None:
+    s = _bare_settings()
+    s.snmp_enabled = True
+    s.snmp_version = "v3"
+    s.snmp_v3_users = [
+        {
+            "username": "ops\nrwuser evil .1",
+            "auth_protocol": "SHA",
+            "auth_pass_enc": encrypt_str("pass").decode("ascii"),
+            "priv_protocol": "none",
+            "priv_pass_enc": None,
+        }
+    ]
+
+    text = render_snmpd_conf(s)
+
+    # The injected directive must not appear anywhere.
+    assert "rwuser" not in text
+    assert "evil" not in text
+    # And the user is not published under any name.
+    assert "createUser ops" not in text
+    assert "OMITTED" in text
+
+
+def test_v3_username_with_internal_whitespace_is_omitted() -> None:
+    """Not an injection, but still unrenderable: the extra token would
+    be read as the auth protocol."""
+    s = _bare_settings()
+    s.snmp_enabled = True
+    s.snmp_version = "v3"
+    s.snmp_v3_users = [
+        {
+            "username": "ops ro",
+            "auth_protocol": "SHA",
+            "auth_pass_enc": encrypt_str("pass").decode("ascii"),
+            "priv_protocol": "none",
+            "priv_pass_enc": None,
+        }
+    ]
+
+    text = render_snmpd_conf(s)
+
+    assert "createUser ops ro" not in text
+    assert "rouser ops ro" not in text
+    assert "OMITTED" in text
+
+
+def test_a_normal_username_is_unaffected_by_the_guard() -> None:
+    """Guard against over-correcting — the usual shapes must still render."""
+    s = _bare_settings()
+    s.snmp_enabled = True
+    s.snmp_version = "v3"
+    s.snmp_v3_users = [
+        {
+            "username": "monitoring-ro_1",
+            "auth_protocol": "SHA",
+            "auth_pass_enc": encrypt_str("pass").decode("ascii"),
+            "priv_protocol": "none",
+            "priv_pass_enc": None,
+        }
+    ]
+
+    text = render_snmpd_conf(s)
+
+    assert 'createUser monitoring-ro_1 SHA "pass"' in text
+    assert "rouser monitoring-ro_1 auth .1" in text
+    assert "OMITTED" not in text
+
+
+# ── API-boundary rejection of the same shapes ────────────────────────
+#
+# The renderer guard above is the backstop for rows already in the
+# database. This is the primary fix: the operator's own PUT is the error
+# site, so they find out at the form rather than via a daemon that
+# quietly reloaded a config they didn't write.
+
+
+def test_settings_validator_rejects_a_newline_username() -> None:
+    import pytest
+    from pydantic import ValidationError
+
+    from app.api.v1.settings.router import SNMPV3UserUpdate
+
+    with pytest.raises(ValidationError) as exc:
+        SNMPV3UserUpdate(username="ops\nrwuser evil .1")
+    assert "whitespace or control characters" in str(exc.value)
+
+
+def test_settings_validator_rejects_internal_whitespace() -> None:
+    import pytest
+    from pydantic import ValidationError
+
+    from app.api.v1.settings.router import SNMPV3UserUpdate
+
+    with pytest.raises(ValidationError):
+        SNMPV3UserUpdate(username="ops ro")
+
+
+def test_settings_validator_still_trims_and_accepts_normal_names() -> None:
+    """Surrounding whitespace is trimmed, as before — only INTERNAL
+    whitespace is a problem, and the trim must not be mistaken for it."""
+    from app.api.v1.settings.router import SNMPV3UserUpdate
+
+    assert SNMPV3UserUpdate(username="  monitoring-ro_1  ").username == "monitoring-ro_1"

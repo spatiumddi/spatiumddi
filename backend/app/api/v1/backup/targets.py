@@ -604,6 +604,12 @@ class RestoreFromArchiveBody(BaseModel):
     #: for selective restore. Empty / None → full hard-overwrite
     #: restore (Phase 1 behaviour).
     sections: list[str] | None = None
+    #: Override the refusal to restore an archive whose schema head this
+    #: build doesn't know. Exists for the A/B-rollback case, where the
+    #: operator rolled back *because* the newer build broke and would
+    #: otherwise be told to upgrade into it (#781). Audited; the response
+    #: warns that the schema-head readiness gate may then fail.
+    allow_newer_schema: bool = False
 
 
 @router.post("/{target_id}/archives/restore")
@@ -657,6 +663,7 @@ async def restore_from_archive(
             confirmation_phrase=body.confirmation_phrase,
             db_url=str(settings.database_url),
             sections=body.sections or None,
+            allow_newer_schema=body.allow_newer_schema,
         )
     except (BackupArchiveError, BackupCryptoError, BackupRestoreError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -705,11 +712,20 @@ async def restore_from_archive(
                             "skipped_idempotent_rows": (outcome.rewrap.skipped_idempotent_rows),
                             "failed_rows": outcome.rewrap.failed_rows,
                             "columns_visited": outcome.rewrap.columns_visited,
+                            "aborted": outcome.rewrap.aborted,
                             "failures": outcome.rewrap.failures,
                         }
                         if outcome.rewrap is not None
                         else None
                     ),
+                    # Both change what the operator got versus what they
+                    # asked for, so the trail has to carry them — and this
+                    # endpoint has to match POST /backup/restore or a
+                    # destination-based restore is the less auditable of
+                    # two paths doing the same thing (#781).
+                    "cascade_widened_tables": outcome.cascade_widened_tables,
+                    "allow_newer_schema": body.allow_newer_schema,
+                    "warnings": outcome.warnings,
                 },
             )
         )
@@ -723,6 +739,7 @@ async def restore_from_archive(
         "pre_restore_safety_path": outcome.pre_restore_path,
         "selective": outcome.selective,
         "restored_sections": outcome.restored_sections,
+        "cascade_widened_tables": outcome.cascade_widened_tables,
         "migration": (
             {
                 "state": outcome.migration.state,
@@ -742,11 +759,18 @@ async def restore_from_archive(
                 "skipped_idempotent_rows": outcome.rewrap.skipped_idempotent_rows,
                 "failed_rows": outcome.rewrap.failed_rows,
                 "columns_visited": outcome.rewrap.columns_visited,
+                "aborted": outcome.rewrap.aborted,
                 "failures": outcome.rewrap.failures,
             }
             if outcome.rewrap is not None
             else None
         ),
+        # This response omitted ``warnings`` entirely, so a
+        # destination-based restore never surfaced the DNSSEC
+        # registrar-republish advisory. Pre-existing, but it matters more
+        # now: the cascade-widening, half-migrated-rewrap and
+        # schema-override notices all ride this channel (#781).
+        "warnings": outcome.warnings,
     }
 
 

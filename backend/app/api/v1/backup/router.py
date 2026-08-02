@@ -186,6 +186,10 @@ class RewrapOutcomeResponse(BaseModel):
     skipped_idempotent_rows: int
     failed_rows: int
     columns_visited: int
+    # True when the walk stopped early — the counters above then
+    # describe a HALF-migrated credential store, not a clean pass
+    # (#781). Read this before reading the counters.
+    aborted: bool = False
     failures: list[dict[str, Any]] = []
 
 
@@ -221,6 +225,9 @@ class RestoreOutcomeResponse(BaseModel):
     note: str
     selective: bool = False
     restored_sections: list[str] | None = None
+    # Tables restored because TRUNCATE ... CASCADE would otherwise have
+    # emptied them, not because their section was selected (#781).
+    cascade_widened_tables: list[str] = []
     migration: MigrationOutcomeResponse | None = None
     rewrap: RewrapOutcomeResponse | None = None
     # Operator-actionable post-restore advisories (issue #127
@@ -238,6 +245,7 @@ async def restore_backup(
     passphrase: str = Form(..., min_length=8, max_length=512),
     confirmation_phrase: str = Form(...),
     sections: str = Form(default=""),
+    allow_newer_schema: bool = Form(default=False),
 ) -> RestoreOutcomeResponse:
     """Apply a backup archive — hard overwrite OR selective per
     sections. The operator must type the literal phrase
@@ -250,7 +258,20 @@ async def restore_backup(
     full restore. Pass a comma-separated list of section keys
     (from ``GET /backup/sections``) for a selective restore;
     those sections' tables are TRUNCATEd CASCADE and re-loaded
-    from the archive while the rest stay untouched.
+    from the archive.
+
+    A selective restore necessarily reaches past the sections you
+    pick: ``TRUNCATE … CASCADE`` empties every table holding a foreign
+    key into a selected one, so those are restored from the archive
+    too rather than left empty (#781). ``cascade_widened_tables`` on
+    the response lists exactly which, and a warning repeats it.
+
+    ``allow_newer_schema`` overrides the refusal to restore an archive
+    whose schema head this build does not know. It exists for the
+    A/B-rollback case — an operator who rolled back *because* the new
+    build broke would otherwise be told to upgrade into it. The
+    override is audited, and the response warns that the api's
+    schema-head readiness gate may now fail.
     """
     _require_superadmin(current_user)
     # #296 Phase H — restoring a backup mid-upgrade would rip the
@@ -279,6 +300,7 @@ async def restore_backup(
             confirmation_phrase=confirmation_phrase,
             db_url=str(settings.database_url),
             sections=sections_list,
+            allow_newer_schema=allow_newer_schema,
         )
     except (BackupArchiveError, BackupCryptoError, BackupRestoreError) as exc:
         # Same shape for archive / crypto / restore errors — the
@@ -339,11 +361,20 @@ async def restore_backup(
                             "skipped_idempotent_rows": (outcome.rewrap.skipped_idempotent_rows),
                             "failed_rows": outcome.rewrap.failed_rows,
                             "columns_visited": outcome.rewrap.columns_visited,
+                            "aborted": outcome.rewrap.aborted,
                             "failures": outcome.rewrap.failures,
                         }
                         if outcome.rewrap is not None
                         else None
                     ),
+                    "selective": outcome.selective,
+                    "restored_sections": outcome.restored_sections,
+                    "cascade_widened_tables": outcome.cascade_widened_tables,
+                    # Both of these change what the operator got versus
+                    # what they asked for, so the trail has to carry them
+                    # (#781): the override bypassed a safety refusal, and
+                    # the widening restored tables outside the selection.
+                    "allow_newer_schema": allow_newer_schema,
                     "warnings": outcome.warnings,
                 },
             )
@@ -371,6 +402,7 @@ async def restore_backup(
             skipped_idempotent_rows=rewrap.skipped_idempotent_rows,
             failed_rows=rewrap.failed_rows,
             columns_visited=rewrap.columns_visited,
+            aborted=rewrap.aborted,
             failures=rewrap.failures,
         )
 
@@ -447,6 +479,7 @@ async def restore_backup(
         note=note,
         selective=outcome.selective,
         restored_sections=outcome.restored_sections,
+        cascade_widened_tables=outcome.cascade_widened_tables,
         migration=migration_resp,
         rewrap=rewrap_resp,
         warnings=outcome.warnings,

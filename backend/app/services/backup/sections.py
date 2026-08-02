@@ -13,9 +13,14 @@ The catalog is the single source of truth for these three flows.
 Adding a new table that needs to be backed up means adding it to
 the right :class:`Section` here. Forgetting to do so means the
 table is silently excluded from selective backups + restores —
-:func:`assert_catalog_covers_models` reports this — consulted from the
-test suite, not at startup (see its docstring) — so
-the gap surfaces immediately.
+:func:`assert_catalog_covers_models` reports this, from the api's startup
+hook and from the test suite (see its docstring).
+
+Membership is not the whole story for restore, though: a selective
+restore TRUNCATEs CASCADE, which reaches every table holding a foreign
+key into a selected one whether or not it is catalogued. That set is
+computed from the FK graph by :func:`cascade_closure`, and restored
+alongside the selection so the difference isn't silently deleted (#781).
 
 Design notes:
 
@@ -37,6 +42,7 @@ Design notes:
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 
@@ -463,15 +469,59 @@ def tables_for_sections(keys: list[str]) -> list[str]:
     return out
 
 
+def cascade_closure(tables: Iterable[str]) -> set[str]:
+    """Every table a ``TRUNCATE … CASCADE`` of ``tables`` would also empty.
+
+    Postgres cascades a TRUNCATE to any table holding a foreign key into a
+    truncated one, transitively. Selective restore truncates the selected
+    sections' tables CASCADE and then repopulates **only those tables**, so
+    without this the difference is silently deleted: measured on the shipped
+    catalog, restoring ``auth`` alone cascades into 130 tables and refills
+    11 (#781).
+
+    Returned set INCLUDES the input, so callers can hand it straight to the
+    truncate + ``pg_restore --table=`` pair and get a database consistent
+    with the archive for everything the operation touched.
+
+    Derived from mapped metadata rather than a hand-maintained list — the
+    FK graph is the thing Postgres actually walks, and any hand-copy of it
+    is one migration away from being wrong.
+    """
+    from app.models.base import Base  # noqa: PLC0415
+
+    # parent table -> tables that FK into it (the ones CASCADE reaches).
+    dependents: dict[str, set[str]] = {}
+    for name, table in Base.metadata.tables.items():
+        for fk in table.foreign_keys:
+            parent = fk.column.table.name
+            if parent != name:
+                dependents.setdefault(parent, set()).add(name)
+
+    out = set(tables)
+    stack = list(out)
+    while stack:
+        for child in dependents.get(stack.pop(), ()):
+            if child not in out:
+                out.add(child)
+                stack.append(child)
+    return out
+
+
 def assert_catalog_covers_models(known_tables: set[str]) -> list[str]:
     """Compare the catalog against the set of tables actually
     declared by the SQLAlchemy models. Returns a list of tables
     the catalog is missing — empty list = catalog is complete.
 
-    NOT wired into startup — the name is aspirational and predates any
-    caller. ``tests/test_rewrap_coverage.py`` is what actually consults it,
-    pinning today's gap so it cannot grow silently; see #781 for why the
-    56 currently-unclassified tables are a baseline rather than a fix.
+    Two callers, deliberately different in kind:
+
+    * ``app.main._log_backup_section_catalog_gap`` logs the gap at api
+      startup, so an operator can see it without running the test suite.
+    * ``tests/test_rewrap_coverage.py`` pins today's gap against a frozen
+      baseline, so a newly added table has to be classified or explicitly
+      accepted rather than slipping in unnoticed.
+
+    See #781 for why the currently-unclassified tables are a baseline
+    rather than a fix.
     """
     catalog = all_section_tables()
     missing = sorted(known_tables - catalog)
