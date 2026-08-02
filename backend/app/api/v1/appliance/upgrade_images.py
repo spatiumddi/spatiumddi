@@ -216,6 +216,25 @@ async def _stream_upload_through_mirror(
         )
 
 
+class MirrorUnavailable(Exception):
+    """The mirror could not be reached at all — connect / read failure.
+
+    Deliberately distinct from an HTTP error the mirror itself returned
+    (#787). Those two say very different things about the fleet:
+
+    * unreachable — the mirror pod is gone. Its PVC is RWO local-path, so
+      the single replica is pinned to one node, and losing that node leaves
+      it Pending indefinitely. Nothing about the stored image is wrong.
+    * answered with an error — the mirror is alive and refusing or failing.
+      A mismatched ``X-Mirror-Auth`` secret is the likely cause, and it is a
+      configuration fault that will never self-heal.
+
+    The download handler serves a local copy for the first and surfaces the
+    second, which is only expressible if the two do not collapse into one
+    status code.
+    """
+
+
 async def _stream_download_from_mirror(
     image_id: uuid.UUID,
     *,
@@ -226,6 +245,11 @@ async def _stream_download_from_mirror(
     The mirror serves a FileResponse; we open a streaming GET against
     it and pass the chunks through. The mirror's content-length passes
     through too, so the host runner's progress bar still works.
+
+    Raises :class:`MirrorUnavailable` when the mirror cannot be reached,
+    a 404 ``HTTPException`` when it reports the bytes absent, and a 502
+    ``HTTPException`` when it answers with anything else — three outcomes
+    the caller has to tell apart (#787).
 
     ``filename`` controls the ``Content-Disposition`` header so the
     browser / host runner sees the same filename as the local-FS path
@@ -246,10 +270,7 @@ async def _stream_download_from_mirror(
         upstream = await client.send(request, stream=True)
     except httpx.HTTPError as exc:
         await client.aclose()
-        raise HTTPException(
-            status.HTTP_502_BAD_GATEWAY,
-            f"Mirror download failed: {exc}",
-        ) from exc
+        raise MirrorUnavailable(str(exc)) from exc
     if upstream.status_code == 404:
         await upstream.aclose()
         await client.aclose()
@@ -977,49 +998,61 @@ async def download_upgrade_image(
 
     if settings.slot_image_mirror_url:
         # #296 Phase B — bytes live on the mirror Deployment. Stream through.
+        #
+        # #787 — two of the three ways that can fail mean "the mirror cannot
+        # answer right now", not "this image is wrong", and this replica may
+        # be holding the exact bytes. Both are real now that the mirror is on
+        # the mandatory upgrade path of every multi-node appliance:
+        #
+        # * 404 — the image predates the promote that enabled the mirror, so
+        #   it is on this node's hostPath while the mirror's PVC is empty.
+        # * unreachable — the mirror's PVC is RWO local-path, so the single
+        #   pod is pinned to one node; losing that node leaves it Pending
+        #   indefinitely. Refusing to serve a local copy would make an
+        #   unrelated node loss block every upgrade in the fleet, including
+        #   the one that repairs it.
+        #
+        # A mirror that ANSWERS with an error is the third case and is NOT
+        # covered. It is alive and refusing or failing — a mismatched
+        # X-Mirror-Auth secret being the likely cause — which is a
+        # configuration fault that never self-heals. Falling back there would
+        # let nodes holding a stale local copy quietly succeed while the rest
+        # of the fleet 502s, so the fault would be discovered as an
+        # inexplicably half-working upgrade instead of an error. It surfaces.
+        #
+        # Serving local bytes in the two covered cases is not a correctness
+        # risk: the host runner verifies them against the sha256 stamped
+        # alongside the URL, and delete_upgrade_image now clears local copies
+        # too, so a deleted image cannot resurface here.
         try:
             return await _stream_download_from_mirror(row.id, filename=row.filename)
+        except MirrorUnavailable as exc:
+            local = _image_path(row.id)
+            if not local.exists():
+                raise HTTPException(
+                    status.HTTP_502_BAD_GATEWAY,
+                    f"Mirror download failed: {exc}",
+                ) from exc
+            logger.warning(
+                "appliance_upgrade_image_served_from_local_mirror_unreachable",
+                image_id=str(row.id),
+                error=str(exc)[:200],
+            )
         except HTTPException as exc:
-            # #787 — the mirror failing is not the same as the image being
-            # gone, and this replica may be holding the exact bytes. Two
-            # distinct cases land here, both real now that the mirror is on
-            # the mandatory upgrade path of every multi-node appliance:
-            #
-            # * 404 — the image predates the promote that enabled the mirror,
-            #   so it is on this node's hostPath while the mirror's PVC is
-            #   empty.
-            # * 502 — the mirror is unreachable. Its PVC is RWO local-path,
-            #   so the single mirror pod is pinned to one node; losing that
-            #   node leaves it Pending indefinitely. Refusing to serve a
-            #   local copy would make an unrelated node loss block every
-            #   upgrade in the fleet, including the one that repairs it.
-            #
-            # Serving local bytes is not a correctness risk: the host runner
-            # verifies them against the sha256 stamped alongside the URL, and
-            # delete_upgrade_image now clears local copies too, so a deleted
-            # image cannot resurface here. The one thing worth protecting is
-            # visibility — a degraded mirror must not look healthy, hence the
-            # warning log on the non-404 path.
+            if exc.status_code != status.HTTP_404_NOT_FOUND:
+                raise
             local = _image_path(row.id)
             if not local.exists():
                 raise
-            if exc.status_code == status.HTTP_404_NOT_FOUND:
-                logger.info(
-                    "appliance_upgrade_image_served_from_local_after_mirror_miss",
-                    image_id=str(row.id),
-                )
-            else:
-                logger.warning(
-                    "appliance_upgrade_image_served_from_local_mirror_degraded",
-                    image_id=str(row.id),
-                    mirror_status=exc.status_code,
-                    detail=str(exc.detail)[:200],
-                )
-            return FileResponse(
-                local,
-                media_type="application/octet-stream",
-                filename=row.filename,
+            logger.info(
+                "appliance_upgrade_image_served_from_local_after_mirror_miss",
+                image_id=str(row.id),
             )
+        return FileResponse(
+            local,
+            media_type="application/octet-stream",
+            filename=row.filename,
+        )
 
     path = _image_path(row.id)
     if not path.exists():

@@ -7,19 +7,24 @@ hostPath while the mirror's PVC comes up empty. Without a fallback the
 first multi-node upgrade after a promote fails on a download the operator
 cannot diagnose — the bytes are right there on the node.
 
-Both mirror failure modes fall back when this replica holds the bytes:
+Two of the three ways the mirror can fail mean "it cannot answer right
+now", and both fall back when this replica holds the bytes:
 
 * **404** — the image predates the promote that enabled the mirror.
-* **502** — the mirror is unreachable. Its PVC is RWO local-path, so the
-  single mirror pod is pinned to one node; losing that node would
-  otherwise block every upgrade in the fleet, including the one that
-  repairs it.
+* **unreachable** — the mirror's PVC is RWO local-path, so the single pod
+  is pinned to one node; losing that node would otherwise block every
+  upgrade in the fleet, including the one that repairs it.
 
-Serving local bytes is safe because the host runner verifies them against
-the stamped sha256 and ``delete_upgrade_image`` now clears local copies
-too, so a deleted image cannot resurface. What must not happen is a
-degraded mirror looking healthy — hence the warning-level log, asserted
-here.
+The third — a mirror that ANSWERS with an error — does **not** fall back.
+It is alive and refusing or failing, most likely a mismatched
+``X-Mirror-Auth`` secret, which never self-heals. Falling back there would
+let nodes holding a stale local copy quietly succeed while the rest of the
+fleet 502s, so the fault would surface as an inexplicably half-working
+upgrade rather than an error.
+
+Serving local bytes in the two covered cases is safe because the host
+runner verifies them against the stamped sha256 and ``delete_upgrade_image``
+now clears local copies too, so a deleted image cannot resurface.
 
 Also covers the two halves that make "re-upload it" a real remedy rather
 than a no-op: both ingest paths re-store when the active store has lost
@@ -68,7 +73,7 @@ def _stage_local(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, image_id: uuid
     return path
 
 
-def _mirror_raises(monkeypatch: pytest.MonkeyPatch, exc: HTTPException) -> None:
+def _mirror_raises(monkeypatch: pytest.MonkeyPatch, exc: Exception) -> None:
     monkeypatch.setattr(upgrade_images.settings, "slot_image_mirror_url", "http://mirror")
 
     async def _boom(*_args, **_kwargs):
@@ -132,10 +137,7 @@ async def test_unreachable_mirror_falls_back_and_warns(
     # the degradation has to be visible, not silent.
     image = await _seed_image(db_session)
     _stage_local(monkeypatch, tmp_path, image.id)
-    _mirror_raises(
-        monkeypatch,
-        HTTPException(status.HTTP_502_BAD_GATEWAY, "Mirror download failed: boom"),
-    )
+    _mirror_raises(monkeypatch, upgrade_images.MirrorUnavailable("connect timeout"))
     warnings: list[tuple[str, dict]] = []
     monkeypatch.setattr(
         upgrade_images.logger,
@@ -147,7 +149,9 @@ async def test_unreachable_mirror_falls_back_and_warns(
 
     assert resp.status_code == 200
     assert resp.content == _BYTES
-    assert [e for e, _ in warnings] == ["appliance_upgrade_image_served_from_local_mirror_degraded"]
+    assert [e for e, _ in warnings] == [
+        "appliance_upgrade_image_served_from_local_mirror_unreachable"
+    ]
 
 
 async def test_unreachable_mirror_with_no_local_copy_still_502s(
@@ -161,14 +165,38 @@ async def test_unreachable_mirror_with_no_local_copy_still_502s(
     # send the operator down the wrong path.
     image = await _seed_image(db_session)
     monkeypatch.setattr(upgrade_images, "_image_path", lambda _id: tmp_path / f"{_id}.raw.xz")
+    _mirror_raises(monkeypatch, upgrade_images.MirrorUnavailable("connect timeout"))
+
+    resp = await client.get(_url(image))
+
+    assert resp.status_code == 502
+
+
+async def test_a_mirror_that_answers_with_an_error_is_not_masked(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The case that made the fallback too broad.
+
+    A mismatched ``X-Mirror-Auth`` secret makes the mirror answer 401, which
+    the proxy wraps as a 502. Serving the local copy there would let every
+    node holding one succeed while the rest of the fleet 502s — so the
+    operator meets a half-working upgrade instead of a configuration error,
+    and the mirror stays misconfigured because nothing ever complained.
+    """
+    image = await _seed_image(db_session)
+    _stage_local(monkeypatch, tmp_path, image.id)
     _mirror_raises(
         monkeypatch,
-        HTTPException(status.HTTP_502_BAD_GATEWAY, "Mirror download failed: boom"),
+        HTTPException(status.HTTP_502_BAD_GATEWAY, "Mirror returned 401: b'forbidden'"),
     )
 
     resp = await client.get(_url(image))
 
     assert resp.status_code == 502
+    assert "401" in resp.text
 
 
 async def test_no_mirror_configured_still_serves_local_directly(

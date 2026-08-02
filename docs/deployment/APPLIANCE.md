@@ -1234,10 +1234,14 @@ control-plane cluster itself, not the registered agent fleet.
    >
    > One caveat at the transition: an image staged **before** the promote is
    > on the seed's hostPath, not on the mirror's fresh PVC. Two things cover
-   > it — the api falls back to local disk when the mirror cannot serve, and
-   > re-uploading (or re-importing) the same image now genuinely re-stores
-   > the bytes instead of short-circuiting on the duplicate checksum. Either
-   > recovers it; the re-upload is the one that fixes it for every node.
+   > it — the api falls back to local disk when the mirror reports the image
+   > missing or cannot be reached at all, and re-uploading (or re-importing)
+   > the same image now genuinely re-stores the bytes instead of
+   > short-circuiting on the duplicate checksum. Either recovers it; the
+   > re-upload is the one that fixes it for every node. A mirror that
+   > *answers* with an error is deliberately not covered — that is a fault
+   > (usually a mismatched `X-Mirror-Auth` secret) worth surfacing rather
+   > than papering over on whichever nodes happen to hold a local copy.
    >
    > A **BYO-Kubernetes** control plane with `api.replicas > 1` still has to
    > set `slotImageMirror.enabled=true` itself; nothing there tracks the
