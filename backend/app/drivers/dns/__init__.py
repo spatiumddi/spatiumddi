@@ -3,10 +3,12 @@
 Per CLAUDE.md non-negotiable #10, the service layer obtains a driver via
 ``get_driver(server_type)`` and speaks only to the abstract interface.
 
-SpatiumDDI ships four authoritative DNS drivers: BIND9 (default), PowerDNS
+SpatiumDDI ships five authoritative DNS drivers: BIND9 (default), PowerDNS
 (issue #127, Phase 1 — agent-managed alongside BIND9), Technitium
-(agent-managed, REST-API driven), and Windows DNS (WinRM-driven, agentless).
-New drivers register here without touching the service layer.
+(agent-managed, REST-API driven), Technitium over its remote API (issue
+#810 — agentless, for a server the operator already runs), and Windows DNS
+(WinRM-driven, agentless). New drivers register here without touching the
+service layer.
 """
 
 from __future__ import annotations
@@ -31,6 +33,7 @@ from app.drivers.dns.linode import LinodeDNSDriver
 from app.drivers.dns.powerdns import PowerDNSDriver
 from app.drivers.dns.route53 import Route53DNSDriver
 from app.drivers.dns.technitium import TechnitiumDriver
+from app.drivers.dns.technitium_api import TechnitiumAPIDriver
 from app.drivers.dns.vultr import VultrDNSDriver
 from app.drivers.dns.windows import WindowsDNSDriver
 
@@ -38,6 +41,11 @@ _DRIVERS: dict[str, type[DNSDriver]] = {
     "bind9": BIND9Driver,
     "powerdns": PowerDNSDriver,
     "technitium": TechnitiumDriver,
+    # Agentless Technitium (#810) — an install the operator already runs,
+    # driven over its HTTP API from the control plane. Distinct from
+    # ``technitium`` above, which is the container we deploy with an agent
+    # beside it; the two coexist, one group each.
+    "technitium_api": TechnitiumAPIDriver,
     "windows_dns": WindowsDNSDriver,
     # Agentless cloud-hosted DNS providers (issue #37, Part B). The
     # control plane calls the provider REST/SDK API directly — same
@@ -62,6 +70,7 @@ _DRIVERS: dict[str, type[DNSDriver]] = {
 AGENTLESS_DRIVERS: frozenset[str] = frozenset(
     {
         "windows_dns",
+        "technitium_api",
         "cloudflare",
         "route53",
         "azure_dns",
@@ -91,9 +100,42 @@ CLOUD_DNS_DRIVERS: frozenset[str] = frozenset(
 )
 
 
+# Agentless drivers that keep an operator-supplied credential dict in
+# ``DNSServer.credentials_encrypted``. Superset of CLOUD_DNS_DRIVERS: the
+# cloud providers plus ``technitium_api`` (#810), which is operator-hosted
+# and so is NOT a cloud driver, but has exactly the same credential
+# lifecycle on create / update / clear. Used by the DNS server CRUD path so
+# adding another self-hosted agentless driver doesn't mean widening a
+# `driver in CLOUD_DNS_DRIVERS` test that then reads as a lie.
+CREDENTIALED_DNS_DRIVERS: frozenset[str] = CLOUD_DNS_DRIVERS | {"technitium_api"}
+
+# Drivers implementing ``pull_zones_from_server`` — i.e. able to enumerate
+# zones from the authoritative side, which is what the "import existing
+# zones" and sync-from-server paths need. Windows DNS does it over WinRM
+# (Path B), the cloud drivers over the provider API, technitium_api over
+# Technitium's own REST API. Agent-managed drivers are absent: the control
+# plane has no channel to their daemon.
+TOPOLOGY_PULL_DRIVERS: frozenset[str] = CREDENTIALED_DNS_DRIVERS | {"windows_dns"}
+
+
 def is_agentless(driver_name: str) -> bool:
     """True if the driver runs from the control plane without an agent."""
     return driver_name in AGENTLESS_DRIVERS
+
+
+def supports_topology_pull(driver_name: str) -> bool:
+    """True if the driver can list zones from the authoritative side.
+
+    Consults :data:`TOPOLOGY_PULL_DRIVERS`, which two call sites in the DNS
+    router previously spelled out inline as ``driver == "windows_dns" or
+    driver in CLOUD_DNS_DRIVERS``. Every new agentless driver had to
+    remember to appear in both, and #810 would have made it three.
+
+    Note this answers "can this driver read zone topology at all", not "can
+    this *server*" — the callers additionally require stored credentials,
+    which is a per-row fact rather than a per-driver one.
+    """
+    return driver_name in TOPOLOGY_PULL_DRIVERS
 
 
 def get_driver(server_type: str) -> DNSDriver:
@@ -112,6 +154,8 @@ def register_driver(name: str, driver_cls: type[DNSDriver]) -> None:
 __all__ = [
     "AGENTLESS_DRIVERS",
     "CLOUD_DNS_DRIVERS",
+    "CREDENTIALED_DNS_DRIVERS",
+    "TOPOLOGY_PULL_DRIVERS",
     "ConfigBundle",
     "DNSDriver",
     "EffectiveBlocklistData",
@@ -121,5 +165,7 @@ __all__ = [
     "ServerOptions",
     "ZoneData",
     "get_driver",
+    "is_agentless",
     "register_driver",
+    "supports_topology_pull",
 ]

@@ -873,6 +873,107 @@ What is left:
 
 ---
 
+## 4C. Technitium — agentless (`technitium_api`), issue [#810](https://github.com/spatiumddi/spatiumddi/issues/810)
+
+Two Technitium drivers ship, and the difference is **who owns the daemon**:
+
+| | `technitium` (§4B) | `technitium_api` (this section) |
+|---|---|---|
+| Who runs the daemon | SpatiumDDI — we deploy the container | The operator, wherever they already have it |
+| Who talks to the API | The co-located agent, over loopback `:5380` | The control plane, over the network |
+| Auth | Agent mints its own token on first boot | Operator pastes a permanent token |
+| Config channel | ConfigBundle long-poll | None — writes are synchronous |
+| Deploy step | Run a container | None |
+
+They coexist. A `DNSServerGroup` is single-driver (§5.1), so a mixed estate is one group each.
+
+### 4C.1 Why it exists
+
+Technitium was the only backend SpatiumDDI supported in *one* shape. BIND9 has the agent path and RFC 2136; Windows DNS has Path A and Path B; the cloud providers are agentless-only. An operator with an existing Technitium install had to migrate off it with the #744 importer, stand up a second one under our agent, or not use SpatiumDDI — for the backend whose entire control surface is a plain HTTP API and is therefore the *easiest* one to drive remotely.
+
+### 4C.2 Shape — agentless, but not cloud
+
+`TechnitiumAPIDriver` subclasses `CloudDNSDriverBase` (§4A.1), which despite the name is really "agentless driver that keeps a credential dict". What does **not** carry over is membership of `CLOUD_DNS_DRIVERS`, the set that gates the cloud-import flow and the hosted-provider UI. The registry therefore has three sets, not two:
+
+| Set | Members | What it gates |
+|---|---|---|
+| `AGENTLESS_DRIVERS` | windows_dns, technitium_api, 8 cloud | Synchronous record-op apply |
+| `CREDENTIALED_DNS_DRIVERS` | technitium_api, 8 cloud | `cloud_credentials` on server create/update |
+| `TOPOLOGY_PULL_DRIVERS` | the above + windows_dns | `pull-zones` + sync-from-server |
+
+`supports_topology_pull()` replaced two inline `driver == "windows_dns" or driver in CLOUD_DNS_DRIVERS` comparisons in `api/v1/dns/router.py` that had to be kept in step by hand.
+
+### 4C.3 Credentials
+
+```json
+{"api_url": "https://dns.example.com:53443",
+ "api_token": "<permanent API token>",
+ "verify_tls": true}
+```
+
+Fernet-encrypted into `DNSServer.credentials_encrypted`, the same column every other credentialed driver uses — **no migration**. `host` / `port` on the row stay meaningful: they are the DNS service address, not the API's.
+
+`api_url` is the web-service root, not the `/api` path; the driver strips back to `scheme://host[:port]` so pasting either works. A bare hostname with no scheme is **refused rather than guessed** — defaulting to `http://` would put the bearer token on the wire in cleartext.
+
+`verify_tls` defaults to true and only an explicit `false` turns it off, so a credential blob written before the field existed stays strict.
+
+Auth is `Authorization: Bearer`, required for everything since Technitium 15.0. The operator mints the token at Administration → Sessions → Create Token. Technitium's own docs recommend a dedicated limited user for token use, and SpatiumDDI only needs **Zones: Modify** and **DnsClient: View** — not Administrator. The token inherits that user's permissions, including Technitium's per-zone ACLs.
+
+SECURITY: the URL is operator-supplied and the *server* dials it, so create/update runs it through `app.core.ssrf.assert_safe_target`. Advisory, not blocking, per that module's contract — a co-located Technitium on the appliance's own loopback is a legitimate target.
+
+### 4C.4 The trap: errors arrive as HTTP 200
+
+Technitium answers `{"status": "error" | "invalid-token" | "2fa-required", …}` with a **200 status line**. A driver that trusts `raise_for_status()` reads every auth failure as an empty success — and an empty zone list handed to a sync diff is exactly the [#430](https://github.com/spatiumddi/spatiumddi/issues/430) shape that proposes deleting everything SpatiumDDI knows about. Non-negotiable #5 in one sentence.
+
+`_unwrap` is the only path responses are read through, and it distinguishes:
+
+- `invalid-token` → names the console page that fixes it. The single most common operator error; a generic "error" sends people reading zone config instead.
+- `2fa-required` → says to use a permanent token rather than a session one.
+- no envelope at all → reports the HTTP status. A reverse proxy's error page must raise, never read as zero zones.
+
+### 4C.5 rdata translation is shared, three ways
+
+Technitium's read API does not echo back the params its write API takes: it renames keys, and renders TLSA/SSHFP numeric fields as enum *names* (`tlsaSelector=1` reads back as `selector: "SPKI"`). Both directions live in `app/services/technitium/rdata.py`, consumed by this driver *and* the #744 importer.
+
+The agent driver (`agent/dns/spatium_dns_agent/drivers/technitium.py`) keeps a **third copy** it cannot share: it ships in the agent image as a separate Python package and cannot import from `app`. Do not delete either side thinking it is dead code.
+
+Two details are worth knowing before touching either.
+
+**Value params are load-bearing on `delete`.** That is how Technitium identifies which member of an rrset to remove, and SpatiumDDI keys records per value — so dropping them takes out a sibling round-robin A record rather than the intended one.
+
+**`overwrite=false` on a create/update is a bug, not a style choice.** Technitium *appends* at that setting, so editing `www A 10.0.0.1` to `10.0.0.2` leaves the zone answering both, round-robin. That is documented at length in the agent driver, verified live against 15.4.0 — and it is worse here, because there is no structural reload to eventually re-converge it.
+
+The write path therefore mirrors the agent's:
+
+| op | shape |
+|---|---|
+| `create` / `update` with `change.rrset` (#783) | replay the whole set — member 0 with `overwrite=true` to clear, the rest appended |
+| `create` / `update` without it (`rrset is None`) | single-value REPLACE, per the `RRsetData` contract's fallback rule |
+| empty `members` | the RRset should not exist → value-scoped delete |
+| `delete` | value-scoped, always. The survivors are already correct on the server; a wipe-and-rebuild would open a window where the name serves less than it should |
+
+Two error strings are **not** failures: `already exists` on a replayed create, and `no such record` on a delete of something already gone. Both mean the server is already in the state the op asks for, which is what a replayed op should find (non-negotiable #9). Crucially they must not abort a multi-member RRset write partway — one member the server already has does not make the rest optional. `_is_idempotent_noop` matches the same two substrings the agent driver does, deliberately.
+
+### 4C.6 Zone types
+
+`pull_zones_from_server` preserves Technitium's own zone type rather than reporting everything as `Primary` the way the cloud base does — a hosted provider serves nothing else, Technitium serves Secondary / Stub / Forwarder too. Non-Primary zones come back with `manageable: false`, and the sync-from-server auto-import path skips those rather than adopting them: importing a Secondary as `zone_type="primary"` would claim authority over a zone this server only transfers. They land in the result's `zones_skipped_system` list alongside SpatiumDDI's own reserved names. The key is absent for every other driver, and absent means adoptable.
+
+Zone **create** is Primary-only, matching `capabilities()["zone_types"]`, and refuses anything else rather than defaulting. Silently creating a Primary for a secondary/stub/forward zone would mint an *empty* authoritative zone on the operator's live server — the whole domain would start answering NXDOMAIN from a server that used to transfer or forward it. Delete is unrestricted: refusing to remove a secondary SpatiumDDI tracks would strand it.
+
+Technitium's own internal zones (`localhost`, the RFC 1918 reverse stubs) carry `internal: true` and are dropped.
+
+### 4C.7 Probe — and the endpoint that finally calls one
+
+`probe()` uses `/api/dnsClient/healthCheck`, which Technitium documents as the automated-health-check call: it confirms the process is up *and* that it resolves, and generates **no query-log entries**, which matters because a UI polls it. A failure counting zones afterwards downgrades the message but keeps the probe green — auth is already proven, and a token legitimately scoped to a subset of zones must not render as a red X on a working connection.
+
+`CloudDNSDriverBase.probe` has existed since #37 with **no caller**: nothing in the API, tasks or services invoked it, so the answer to "did that token work?" was "wait for the next sync to fail". #810 adds `POST /api/v1/dns/groups/{gid}/servers/{sid}/test-connection`, which probes a saved server with its stored credentials and returns `{ok, message}`. It covers every driver in `CREDENTIALED_DNS_DRIVERS`, so the eight cloud drivers get it too. Post-save only — the credentials come from the row, unlike `/test-windows-credentials`, which also accepts plaintext for a pre-save dry run.
+
+### 4C.8 Not in scope for this driver
+
+DNSSEC signing, forwarders and the native blocklists stay on the agent-managed driver. `capabilities()` advertises `dnssec_online: false` and `technitium_api` is absent from `_DRIVER_GATED_OPERATIONS["dnssec_sign"]`, so the sign/unsign endpoints refuse it rather than half-working. Also deferred: query-log polling (`/api/logs/query` is paginated with time filters, so a control-plane poll-and-diff shipper is straightforward here in a way it is not on the agent path — see [#742](https://github.com/spatiumddi/spatiumddi/issues/742)), Technitium's DHCP API (a separate driver, not part of this one), clustering (`node` param on most calls), and DNS Apps.
+
+---
+
 ## 5. Driver Selection and Registration
 
 Drivers are registered by name and instantiated by the service layer:
@@ -941,8 +1042,16 @@ Mixed installs work via multiple groups:
 | Query logs on the Logs page | **BIND9** or **PowerDNS** (Technitium pending, §4B.5) |
 | Simple REST-driven primary zones, minimal footprint | **PowerDNS** or **Technitium** |
 | Active Directory-integrated DNS | **Windows DNS** (separate path) |
+| A Technitium server that **already exists** and should stay where it is | **`technitium_api`** (agentless, §4C) — nothing deployed, no agent, no migration |
 
 BIND9, PowerDNS, and Technitium drivers are all supported indefinitely. PowerDNS landed in issue #127 as a second driver; Technitium landed as a third, not a replacement for either.
+
+**Picking between the two Technitium drivers** comes down to one question — do you want SpatiumDDI to *run* the daemon?
+
+- Yes → `technitium` (§4B). Full feature set: DNSSEC, encrypted transports, forwarders, blocklists, catalog zones.
+- No, it's already running → `technitium_api` (§4C). Zones and records only; the rest stays managed in Technitium's own console.
+
+A group is single-driver, so servers of the two kinds live in separate groups.
 
 ---
 

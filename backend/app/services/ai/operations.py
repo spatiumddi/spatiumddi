@@ -2145,7 +2145,17 @@ register(
 # ── create_dns_zone (issue #127 Phase 4e) ─────────────────────────────
 
 
-_DNS_DRIVER_HINTS = {"bind9", "powerdns", "technitium", "windows_dns"}
+_DNS_DRIVER_HINTS = {
+    "bind9",
+    "powerdns",
+    "technitium",
+    # Agentless Technitium against an install the operator already runs
+    # (#810). Distinct from ``technitium``, which is the agent-managed
+    # container — a group is single-driver, so the hint has to be able to
+    # tell them apart.
+    "technitium_api",
+    "windows_dns",
+}
 
 # ``CreateDNSZoneArgs`` fields only some drivers can honour, mapped to
 # ``(REST operation whose driver gate governs them, operator-facing label)``.
@@ -2206,12 +2216,14 @@ class CreateDNSZoneArgs(BaseModel):
         default=None,
         description=(
             "Preferred backend driver — one of ``bind9``, "
-            "``powerdns``, ``technitium``, or ``windows_dns``. Pair it "
-            "with ``dnssec_enabled=true`` to auto-select a group whose "
-            "driver can sign online (``bind9``, ``powerdns`` and "
-            "``technitium`` all can; ``windows_dns`` cannot). When "
-            "``group_id`` is set, this is validated against the group's "
-            "actual driver mix."
+            "``powerdns``, ``technitium`` (agent-managed), "
+            "``technitium_api`` (agentless, an install the operator "
+            "already runs), or ``windows_dns``. Pair it with "
+            "``dnssec_enabled=true`` to auto-select a group whose driver "
+            "can sign online (``bind9``, ``powerdns`` and ``technitium`` "
+            "all can; ``windows_dns`` and ``technitium_api`` cannot). "
+            "When ``group_id`` is set, this is validated against the "
+            "group's actual driver mix."
         ),
     )
     zone_type: str = Field(
