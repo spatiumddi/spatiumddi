@@ -642,7 +642,7 @@ spatium-pdns-lmdb-guard restore latest       # daemon must be stopped
 
 ## 4A. Cloud DNS drivers (agentless) — issue #37 Part B
 
-Cloud-hosted authoritative-DNS providers ship as a driver family. The four SDK-backed ones documented in detail here are **Cloudflare**, **Amazon Route 53** (`route53`), **Azure DNS** (`azure_dns`), and **Google Cloud DNS** (`google_dns`); a token-only tier (**DigitalOcean**, **Hetzner**, **Linode**, **Vultr**) followed in issue #327 with the same agentless `CloudDNSDriverBase` shape. SpatiumDDI manages their zones and records exactly like a local BIND9 / PowerDNS / Windows zone — same Zones / Records / group surfaces — except the control plane calls the provider's REST/SDK API directly. There is **no agent**.
+Cloud-hosted authoritative-DNS providers ship as a driver family. The four SDK-backed ones documented in detail here are **Cloudflare**, **Amazon Route 53** (`route53`), **Azure DNS** (`azure_dns`), and **Google Cloud DNS** (`google_dns`); a token-only tier (**DigitalOcean**, **Hetzner**, **Linode**, **Vultr**) followed in issue #327 with the same agentless `CloudDNSDriverBase` shape. SpatiumDDI manages their zones and records exactly like a local BIND9 / PowerDNS / Technitium / Windows zone — same Zones / Records / group surfaces — except the control plane calls the provider's REST/SDK API directly. There is **no agent**.
 
 These are infrastructure-DNS drivers, distinct from the *Cloud (AWS / Azure / GCP)* read-only infrastructure mirror (issue #37 Part A, in [INTEGRATIONS.md](../features/INTEGRATIONS.md)). A cloud DNS server is added through the normal Add DNS server flow and lives in a `DNSServerGroup`; it has no `CloudEndpoint` row.
 
@@ -681,7 +681,7 @@ Each driver's `capabilities()` returns the same dict shape Windows / PowerDNS us
 | ALIAS records | apex CNAME auto-flattened | read-only (`AliasTarget`, null TTL; authoring deferred) | deferred | — |
 | Apex handling | Cloudflare flattens CNAME-at-apex | apex SOA / NS provider-managed | apex SOA Azure-managed (skipped on read) | apex SOA provider-managed |
 
-**No cloud driver advertises online DNSSEC sign/unsign (#29).** Cloud DNSSEC is a zone-level *provider* toggle — Route 53 needs a KMS asymmetric key, Cloudflare/Google a managed-zone enable — not the per-record online signing the `dnssec_sign`/`unsign` ops model, so every cloud driver's capability dict carries `dnssec_online: False` and the DNSSEC sign/unsign/rollover operations stay gated server-side by `_DRIVER_GATED_OPERATIONS` to PowerDNS / BIND9. Likewise **cloud ALIAS authoring is deferred** — Route 53 / Azure alias targets need a provider resource id the generic `ALIAS` record type can't express (so `alias_records: False` and `ALIAS` is gated to PowerDNS), though existing alias rrsets are still read back. Wiring real cloud DNSSEC (provider enable + DS retrieval) and cloud ALIAS authoring is a #29 follow-up.
+**No cloud driver advertises online DNSSEC sign/unsign (#29).** Cloud DNSSEC is a zone-level *provider* toggle — Route 53 needs a KMS asymmetric key, Cloudflare/Google a managed-zone enable — not the per-record online signing the `dnssec_sign`/`unsign` ops model, so every cloud driver's capability dict carries `dnssec_online: False` and the DNSSEC sign/unsign operations stay gated server-side by `_DRIVER_GATED_OPERATIONS` to BIND9 / PowerDNS / Technitium (rollover to BIND9 alone). Likewise **cloud ALIAS authoring is deferred** — Route 53 / Azure alias targets need a provider resource id the generic `ALIAS` record type can't express (so `alias_records: False` and `ALIAS` is gated to PowerDNS), though existing alias rrsets are still read back. Wiring real cloud DNSSEC (provider enable + DS retrieval) and cloud ALIAS authoring is a #29 follow-up.
 
 ### 4A.4 Provider-specific wrinkles the hooks paper over
 
@@ -850,12 +850,22 @@ Closing this properly means teaching the shared AXFR path to TSIG-sign, which fi
 
 Technitium's API takes structured per-type params rather than PowerDNS's single wire-format `content` string — e.g. `ipAddress` for A/AAAA, `cname` for CNAME, `exchange`+`preference` for MX, `target`+`priority`+`weight`+`port` for SRV. SVCB/HTTPS are best-effort: the driver parses the BIND-zone-file-style rdata string SpatiumDDI stores (`'1 . alpn="h2,h3"'`) into Technitium's `svcPriority`/`svcTargetName`/`svcParams` (`key|value` pairs) — confirmed empirically that Technitium's `svcParams` wire format does **not** accept a comma-separated multi-value single param the way BIND's rdata does, so only the first value of a multi-value param carries through (logged as a warning); single-value params round-trip exactly.
 
-### 4B.5 Deferred to fast-follow (not v1)
+### 4B.5 Still outstanding
 
-- **DNSSEC online signing** — Technitium's `/api/zones/dnssec/*` surface is close in shape to PowerDNS's (`sign`/`unsign`/key rollover), should port quickly once picked up.
-- **Native DoT/DoH/DoQ listeners** — Technitium's real differentiator over PowerDNS: it speaks all three natively, so no dnsdist-style sidecar is needed (contrast §9.2). Needs a settings-API spike to confirm the exact `/api/settings/set` shape, which isn't covered by the public zone/record API docs.
-- **Query-log shipping** — Technitium's query logging is API/DB-backed (`/api/logs/query*`), not a tailable text file like BIND9's `query_log_file` or PowerDNS's redirected stderr capture, so it needs a poll-and-diff shipper rather than the existing file-tailing `QueryLogShipper`.
-- **Live-pull `dns_import` importer** for existing Technitium installs (mirrors `services/dns_import/powerdns.py`).
+The v1 fast-follow list has been worked off. **Shipped since:** online DNSSEC
+signing ([#740](https://github.com/spatiumddi/spatiumddi/issues/740), §4B.3b),
+native DoT/DoH/DoQ listeners plus encrypted upstream forwarding
+([#741](https://github.com/spatiumddi/spatiumddi/issues/741), §4B.3c),
+secondary / stub / catalog zones and TSIG transfer
+([#743](https://github.com/spatiumddi/spatiumddi/issues/743), §4B.3a), and the
+live-pull importer + native blocklist wiring
+([#744](https://github.com/spatiumddi/spatiumddi/issues/744), §4B.3d).
+
+What is left:
+
+- **Query-log shipping** ([#742](https://github.com/spatiumddi/spatiumddi/issues/742)) — Technitium's query logging is API/DB-backed (`/api/logs/query*`), not a tailable text file like BIND9's `query_log_file` or PowerDNS's redirected stderr capture, so it needs a poll-and-diff shipper rather than the existing file-tailing `QueryLogShipper`. Until it lands, a Technitium group's queries do not reach the Logs page's **DNS Queries** tab.
+- **ANAME / APP / FWD record types** — Technitium-proprietary, and a different shape than PowerDNS's ALIAS/LUA rather than a drop-in equivalent, so they need their own design pass.
+- **Views** — declined outright, not deferred. Technitium has no view concept, which is also why per-view blocklists collapse into one flat set (§4B.3d).
 
 ### 4B.6 Image
 
@@ -906,13 +916,13 @@ def get_driver(server_type: str) -> DNSDriver:
 
 ### 5.1 Per-group driver homogeneity
 
-Each `DNSServerGroup` is **single-driver**. The control plane rejects mixing drivers within one group because catalog-zone semantics, AXFR/IXFR shape, and the gate logic for driver-only features (PowerDNS's ALIAS / LUA / online DNSSEC) all assume every member of the group runs the same driver.
+Each `DNSServerGroup` is **single-driver**. The control plane rejects mixing drivers within one group because catalog-zone semantics, AXFR/IXFR shape, and the gate logic for driver-only features (PowerDNS's ALIAS / LUA, BIND9's views and RPZ, Technitium's DoQ and encrypted forwarding) all assume every member of the group runs the same driver.
 
 Mixed installs work via multiple groups:
 
 - "Internal-zones" group runs PowerDNS (LMDB-backed, fast apply, ALIAS records for apex)
 - "External-zones" group runs BIND9 (battle-tested, RPZ for outbound blocklists, well-known operator surface)
-- "Edge-technitium" group runs Technitium (REST-API driven like PowerDNS, native DoT/DoH/DoQ support once wired — see §4B.5)
+- "Edge-technitium" group runs Technitium (REST-API driven like PowerDNS, native DoT/DoH/DoQ listeners and encrypted upstream forwarding — see §4B.3c)
 
 ### 5.2 Decision tree — when to pick which driver
 
@@ -921,12 +931,14 @@ Mixed installs work via multiple groups:
 | Reference impl, BIND muscle memory, RPZ blocking | **BIND9** |
 | ALIAS records (CNAME at apex) | **PowerDNS** |
 | LUA records (computed responses, geo-routing) | **PowerDNS** |
-| One-toggle online DNSSEC with auto NSEC3 | **PowerDNS** |
+| One-toggle online DNSSEC | **PowerDNS** or **Technitium** |
 | Manual NSEC3 + KSK / ZSK rollover control | **BIND9** |
 | First-class views / split-horizon (issue #24) | **BIND9** |
-| Catalog zones as **producer** | BIND9 or PowerDNS — same wire bytes |
-| Catalog zones as **consumer** | **BIND9** today (not wired up on the PowerDNS agent) |
-| Native DoT/DoH/DoQ with no sidecar (once wired, §4B.5) | **Technitium** |
+| Catalog zones as **producer** | BIND9, PowerDNS or Technitium — same wire bytes |
+| Catalog zones as **consumer** | **BIND9** or **Technitium** (not wired up on the PowerDNS agent) |
+| Native DoT / DoH with no sidecar | **BIND9** or **Technitium** |
+| DNS-over-QUIC, or encrypted *upstream* forwarding over DoH / DoQ | **Technitium** (BIND 9.20 has no client-side HTTP or QUIC transport; pdns doesn't forward at all) |
+| Query logs on the Logs page | **BIND9** or **PowerDNS** (Technitium pending, §4B.5) |
 | Simple REST-driven primary zones, minimal footprint | **PowerDNS** or **Technitium** |
 | Active Directory-integrated DNS | **Windows DNS** (separate path) |
 

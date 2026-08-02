@@ -16,8 +16,8 @@
     <h1>DNS, DHCP and IPAM<br><span class="accent">in one control plane</span></h1>
     <p class="lede">
       SpatiumDDI doesn't just configure your DDI servers — it <strong>runs</strong> them.
-      BIND9, PowerDNS and Kea ship as first-class service containers the control
-      plane owns, and they keep serving even when it doesn't.
+      BIND9, PowerDNS, Technitium and Kea ship as first-class service containers
+      the control plane owns, and they keep serving even when it doesn't.
     </p>
     <div class="hero-actions">
       <a class="btn btn-primary" href="#install">Get started</a>
@@ -55,9 +55,10 @@
         <span class="ico">🌐</span>
         <h3>DNS you actually run</h3>
         <p>
-          BIND9 or PowerDNS per server group, auto-registering. RFC 2136
-          dynamic updates, DNSSEC inline signing, split-horizon views, RPZ
-          blocklists and record-level drift detection against the live zone.
+          BIND9, PowerDNS or Technitium per server group, auto-registering.
+          Online DNSSEC and catalog zones on all three — plus what only one
+          of them can do: split-horizon views and RPZ blocklists on BIND9,
+          ALIAS and LUA on PowerDNS, DNS-over-QUIC on Technitium.
         </p>
       </div>
       <div class="card">

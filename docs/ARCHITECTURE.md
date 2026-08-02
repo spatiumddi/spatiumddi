@@ -151,6 +151,7 @@ control plane, pulls config, and applies it. Available service images
 |---|---|---|
 | `dns-bind9` | BIND9 | `bind9` |
 | `dns-powerdns` | PowerDNS (+ optional `dns-dnsdist`) | `powerdns` |
+| `dns-technitium` | Technitium DNS Server | `technitium` |
 | `dhcp-kea` | Kea DHCPv4/DHCPv6 | `kea` |
 
 The DNS agent lives in [`../agent/dns/spatium_dns_agent/`](../agent/dns/spatium_dns_agent/),
@@ -162,7 +163,8 @@ Both are multi-arch (`linux/amd64` + `linux/arm64`).
 Backend-specific logic never leaks into the service layer.
 `backend/app/drivers/{dns,dhcp}/base.py` defines an ABC plus neutral
 dataclasses (`ConfigBundle`, `ZoneData`, `ServerOptions`, scope/pool
-shapes, etc.). Concrete drivers (`bind9.py`, `powerdns.py`, `kea.py`)
+shapes, etc.). Concrete drivers (`bind9.py`, `powerdns.py`,
+`technitium.py`, `kea.py`)
 render backend-specific config from those dataclasses; the services
 layer only ever speaks to the ABC. There are also **agentless**
 drivers — Windows DNS/DHCP over WinRM, cloud DNS (Cloudflare / Route 53
@@ -296,8 +298,8 @@ through a control-plane outage (#292).
 ### Incremental DNS updates (non-negotiable #8)
 
 DNS record changes are applied incrementally — RFC 2136 `nsupdate` over
-TSIG (BIND9) or the driver API (PowerDNS / cloud) — never a full server
-restart. Per-record ops are queued as `DNSRecordOp` rows fanned out to
+TSIG (BIND9) or the driver API (PowerDNS / Technitium / cloud) — never a
+full server restart. Per-record ops are queued as `DNSRecordOp` rows fanned out to
 every agent-based server in the group and shipped on the config
 long-poll. See [`drivers/DNS_DRIVERS.md`](drivers/DNS_DRIVERS.md).
 
@@ -313,8 +315,9 @@ sizing matrix and the "you have X → start with topology Y" picker).
 
 DNS and DHCP are made HA by running **multiple agents per group**.
 Every DNS agent renders its group's zones as an independent
-authoritative copy, so adding a second BIND9/PowerDNS agent to a group
-gives you a redundant authoritative server with no extra coordination.
+authoritative copy, so adding a second BIND9 / PowerDNS / Technitium
+agent to a group gives you a redundant authoritative server with no
+extra coordination.
 For DHCP, two or more Kea members in a server group form a Kea HA pair
 (scopes/pools/statics live on the group;
 `agent/dhcp/spatium_dhcp_agent/peer_resolve.py` self-heals peer IP

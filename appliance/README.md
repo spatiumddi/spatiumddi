@@ -59,7 +59,7 @@ of." Concretely:
   plane.
 
 - **Roles are labels, not file edits.** Which services a node runs
-  (control plane / DNS-BIND9 / DNS-PowerDNS / DHCP) is decided by a
+  (control plane / DNS-BIND9 / DNS-PowerDNS / DNS-Technitium / DHCP) is decided by a
   per-node Kubernetes label. Flipping a role from the web UI is a single
   `kubectl label node` — the workload schedules or drains as a
   *consequence* of the label. No editing compose files on the box, no

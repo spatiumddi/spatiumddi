@@ -26,7 +26,7 @@ effective_node_ruleset =
   ⊕ RAW_EXTRA          (Appliance.firewall_extra, LINTED at write time, appended last)
 ```
 
-`⊕` is the **explosion + deny-wins + source-union merge** defined concretely in §3.7 — not a loose "set union." The role taxonomy (`control-plane`, `dns-bind9`, `dns-powerdns`, `dhcp`, `observer`, `custom`) is the *same* token set the chart uses for `spatium.io/role-*` node labels (#16), so firewall scope and pod scheduling share one source of truth.
+`⊕` is the **explosion + deny-wins + source-union merge** defined concretely in §3.7 — not a loose "set union." The role taxonomy (`control-plane`, `dns-bind9`, `dns-powerdns`, `dns-technitium`, `dhcp`, `observer`, `custom`) is the *same* token set the chart uses for `spatium.io/role-*` node labels (#16), so firewall scope and pod scheduling share one source of truth.
 
 ### 2.2 New tables — `backend/app/models/firewall.py`
 
@@ -136,7 +136,7 @@ firewall_apply_lag_intervals:  Mapped[int]  = 5            # rendered≠applied 
 ### 2.5 Seeded builtins (migration — idempotent data seed, split from schema; see Phase 3)
 
 - One `fleet` policy (`is_builtin=True`, empty — operators add fleet-wide rules here).
-- Five `role` policies: `control-plane` (80/443+vip; 2379/2380/10250 cluster_peers; 6443 peers∪pod∪svc; memberlist 7946 **tcp+udp** cluster_peers), `dns-bind9`/`dns-powerdns` (53 tcp+udp), `dhcp` (67 udp + 68 return), `observer` (9100→scraper-CIDR, default-disabled rule), `custom` (empty).
+- Six `role` policies: `control-plane` (80/443+vip; 2379/2380/10250 cluster_peers; 6443 peers∪pod∪svc; memberlist 7946 **tcp+udp** cluster_peers), `dns-bind9`/`dns-powerdns`/`dns-technitium` (53 tcp+udp), `dhcp` (67 udp + 68 return), `observer` (9100→scraper-CIDR, default-disabled rule), `custom` (empty). The three DNS-engine policies are byte-identical; `dns-technitium` ships in its own seed migration (`6a668dd451d5`) rather than as an edit to the already-shipped `f5b8d2c91a06`, per the append-only migration rule.
 - Builtin aliases: `@k3s_peer_ports`, `@dns_ports`, `@dhcp_ports`, `@web_ports`.
 
 ### 2.6 Two new derived inputs the supervisor must report (verified absent today)
@@ -356,19 +356,19 @@ tcp dport 443 drop comment "appliance:close-web"                          # …b
 
 ## 4. Per-role scoping
 
-A node's posture is the union of **two orthogonal axes** (verified roles-and-topologies model): cluster role (`Appliance.cluster_role ∈ {primary,member,None}` → `control-plane` overlay) and service roles (`Appliance.assigned_roles ⊆ {dns-bind9,dns-powerdns,dhcp,observer,custom}`).
+A node's posture is the union of **two orthogonal axes** (verified roles-and-topologies model): cluster role (`Appliance.cluster_role ∈ {primary,member,None}` → `control-plane` overlay) and service roles (`Appliance.assigned_roles ⊆ {dns-bind9,dns-powerdns,dns-technitium,dhcp,observer,custom}`).
 
 | Node shape (user vocabulary) | cluster_role | service roles | Inbound the compiler emits (balanced) |
 |---|---|---|---|
 | **Frontend / control node** | primary/member | — | floor + dataplane; 80/443 (+VIP daddr); 6443 (peers∪pod∪svc∪kubeapi, join-window); 2379/2380/10250 (peers); 7946 tcp+udp memberlist (peers, if ≥2+VIP) |
-| **DNS worker** | None | dns-bind9 \| dns-powerdns | floor + dataplane; 53 tcp+udp. **No k3s ports** — the exact #16 misplacement risk, closed by absence (etcd/kubelet never opened here) |
+| **DNS worker** | None | dns-bind9 \| dns-powerdns \| dns-technitium | floor + dataplane; 53 tcp+udp. **No k3s ports** — the exact #16 misplacement risk, closed by absence (etcd/kubelet never opened here) |
 | **DHCP worker** | None | dhcp | floor + dataplane; udp/67 broadcast (`any`); udp/68 return via floor; relay-VIP (`daddr=relayVIP`, relay CIDRs) in bridged mode |
 | **Combined DNS+DHCP worker** | None | dns-* ∪ dhcp | floor + dataplane; 53; 67/68 — union |
 | **Promoted CP also serving DNS** | member | dns-bind9 | union of frontend-node + DNS-worker |
 | **Observer** | any | observer | floor + dataplane; node-exporter 9100 scoped to scraper CIDR (default-disabled rule) |
 | **Custom** | any | custom | floor + dataplane; custom role policy + `firewall_extra` |
 
-Composition is the §3.7 merge, de-duplicated so two roles opening 53 emit it once. DNS engines (`dns-bind9` XOR `dns-powerdns`) map to the same 53 overlay. The drop-in header `profile:` reflects both axes.
+Composition is the §3.7 merge, de-duplicated so two roles opening 53 emit it once. The DNS engines (`dns-bind9` XOR `dns-powerdns` XOR `dns-technitium`) map to the same 53 overlay. The drop-in header `profile:` reflects both axes.
 
 **DHCP/67 honesty (verified Kea hostNetwork).** `udp/67` is opened from `any` because broadcast DISCOVER has no useful `saddr` to scope; relayed unicast from a giaddr is therefore *already* covered by the same `any` rule (no extra scoping needed). The `locked` posture **cannot** scope DHCP/67 — broadcast is unscopeable — and the UI says so explicitly so an operator does not believe they have locked it down. The host's own DHCP-client return (`udp sport 67 dport 68`) lives in the floor (§3.2) so a DHCP-server appliance that is itself DHCP-addressed keeps renewing its lease; this is verified by an explicit Phase-1 test.
 

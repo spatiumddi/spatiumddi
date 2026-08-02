@@ -1,9 +1,9 @@
 """PowerDNS Authoritative driver.
 
 PowerDNS-Authoritative is the second authoritative driver SpatiumDDI
-ships, alongside BIND9. The two drivers run side-by-side: each
-``DNSServerGroup`` is single-driver, mixed installs work via multiple
-groups (issue #127).
+ships, alongside BIND9 and (since issue #746) Technitium. They run
+side-by-side: each ``DNSServerGroup`` is single-driver, mixed installs
+work via multiple groups (issue #127).
 
 Phase 1 scope (this driver):
 

@@ -142,8 +142,9 @@ dnsAgents:
       role: primary
       group: powerdns-edge
       service: { type: LoadBalancer }
-    # Technitium (third DNS driver — primary zones + standard records in
-    # v1; DNSSEC and native DoT/DoH/DoQ listeners are fast-follow).
+    # Technitium (third DNS driver — online DNSSEC, catalog zones both
+    # ways, and native DoT/DoH/DoQ listeners plus encrypted upstream
+    # forwarding with no dnsdist-style sidecar). Own group, same rule.
     - name: tdx1
       flavor: technitium
       role: primary
@@ -153,9 +154,10 @@ dnsAgents:
 
 Each server picks its image from `dnsAgents.image` (default,
 configures BIND9) or `dnsAgents.flavors.<flavor>` per-driver
-override (`powerdns` is pre-set out of the box). The `dns-state`
-volume mounts under `/var/cache/bind` for BIND9 and
-`/var/lib/powerdns` for PowerDNS LMDB — same volume claim, the
+override (`powerdns` and `technitium` are both pre-set out of the
+box). The `dns-state` volume mounts under `/var/cache/bind` for
+BIND9, `/var/lib/powerdns` for PowerDNS LMDB, and `/etc/dns` for
+Technitium's own config + zone store — same volume claim, the
 template picks the path based on `flavor`.
 
 Pre-create the PSK secret (or use `agentKey.value` inline for lab use only):

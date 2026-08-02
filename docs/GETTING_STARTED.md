@@ -146,12 +146,13 @@ Zones live under server groups, so this has to come before zones.
    **Choosing a backend — two questions.** If you'd rather read the full matrix, it follows below unchanged.
 
    1. **Does your org already run DNS on Windows Server / Active Directory?** If yes, keep it — register the DC as a `windows_dns` server rather than migrating anything. Provide WinRM credentials if your Windows admins allow it (**Path B** — full experience: zone create/delete, server-side reads without [AXFR](#axfr)); without credentials you still get record-level writes via [RFC 2136](#rfc-2136) dynamic updates (**Path A**). If no, use a built-in container — question 2.
-   2. **Using the built-in stack: do you need online DNSSEC signing with one-button sign-zone, ALIAS records (CNAME-at-apex), or LUA computed records?** If yes, run **PowerDNS**. Otherwise run **BIND9**, the default choice — it brings the BIND ecosystem (RPZ, full views support).
+   2. **Using the built-in stack: which of the three?** Take **PowerDNS** if you need ALIAS records (CNAME-at-apex) or LUA computed records — nothing else serves them. Take **Technitium** if you want to serve or forward encrypted DNS without a sidecar; it is the only backend that forwards over DoH and DoQ, not just DoT. Otherwise take **BIND9**, the default — it is the only one with split-horizon views and RPZ blocklists. All three do online DNSSEC and catalog zones, so those no longer pick for you.
 
    | Backend | Setup | When to choose |
    |---|---|---|
-   | **Built-in BIND9** (`bind9`) | Run `docker compose --profile dns-bind9 up -d` (legacy `--profile dns` also works). The container auto-registers using `DNS_AGENT_KEY` and shows up in the group automatically. | New deployments; you want SpatiumDDI to own the whole DNS plane and the BIND ecosystem (RPZ, full views support). |
-   | **Built-in PowerDNS** (`powerdns`, issue #127) | Run `docker compose --profile dns-powerdns up -d`. Same `DNS_AGENT_KEY` bootstrap; auto-registers under group `default-powerdns`. | You want online DNSSEC with one-button sign-zone, ALIAS records (CNAME-at-apex), LUA computed records, or PowerDNS's REST-native operational model. |
+   | **Built-in BIND9** (`bind9`) | Run `docker compose --profile dns-bind9 up -d` (legacy `--profile dns` also works). The container auto-registers using `DNS_AGENT_KEY` and shows up in the group automatically. | New deployments; you want SpatiumDDI to own the whole DNS plane and the BIND ecosystem. The only backend with split-horizon **views** and **RPZ** blocklists. |
+   | **Built-in PowerDNS** (`powerdns`, issue #127) | Run `docker compose --profile dns-powerdns up -d`. Same `DNS_AGENT_KEY` bootstrap; auto-registers under group `default-powerdns`. | You want ALIAS records (CNAME-at-apex), LUA computed records, or PowerDNS's REST-native operational model. |
+   | **Built-in Technitium** (`technitium`, issue #746) | Run `docker compose --profile dns-technitium up -d`. Same `DNS_AGENT_KEY` bootstrap; auto-registers under group `default-technitium`. | You want DoT / DoH / **DoQ** served natively with no dnsdist-style sidecar, encrypted *upstream* forwarding over any of the three, or the smallest footprint — Technitium keeps zone state in its own store, so there is no config file and no external database. No views, no RPZ (it blocks natively from a per-domain set instead), no ALIAS / LUA. |
    | **Windows DNS — Path A** (`windows_dns`, no credentials) | Point at an existing Windows DC. Enable "Secure and Nonsecure" dynamic updates on each zone in Windows DNS Manager and allow AXFR to SpatiumDDI's host. | You have an AD-integrated DNS already and just want record-level writes from SpatiumDDI. |
    | **Windows DNS — Path B** (`windows_dns` + credentials) | Same as above, but also provide WinRM credentials. Unlocks zone create/delete and lets SpatiumDDI list + pull zones without relying on AXFR. | You want the full experience without giving up Windows DNS Manager. Best for AD environments. |
 
@@ -162,7 +163,7 @@ Zones live under server groups, so this has to come before zones.
 <details markdown="1">
 <summary>Background: how the built-in containers register themselves</summary>
 
-The BIND9 / PowerDNS / Kea containers are [agents](#agent-and-agentless): each starts with a pre-shared key from its environment (`DNS_AGENT_KEY` / `DHCP_AGENT_KEY`), exchanges it with the control plane for a rotating token, and appears as a registered server without manual entry. From then on the agent polls for configuration changes and keeps a local copy of its last-known-good config, so DNS and DHCP keep answering even if the control plane is down. Details in [DNS_AGENT.md](deployment/DNS_AGENT.md).
+The BIND9 / PowerDNS / Technitium / Kea containers are [agents](#agent-and-agentless): each starts with a pre-shared key from its environment (`DNS_AGENT_KEY` / `DHCP_AGENT_KEY`), exchanges it with the control plane for a rotating token, and appears as a registered server without manual entry. From then on the agent polls for configuration changes and keeps a local copy of its last-known-good config, so DNS and DHCP keep answering even if the control plane is down. Details in [DNS_AGENT.md](deployment/DNS_AGENT.md).
 
 </details>
 
@@ -466,7 +467,7 @@ Windows Remote Management — the remote-management channel (remote PowerShell) 
 
 #### Agent and agentless
 
-An **agent** backend is a container SpatiumDDI deploys and configures itself (built-in BIND9, PowerDNS, Kea). An **agentless** backend is an existing server SpatiumDDI drives remotely over that server's own protocols ([WinRM](#winrm), [RFC 2136](#rfc-2136), cloud provider APIs) with nothing installed on it.
+An **agent** backend is a container SpatiumDDI deploys and configures itself (built-in BIND9, PowerDNS, Technitium, Kea). An **agentless** backend is an existing server SpatiumDDI drives remotely over that server's own protocols ([WinRM](#winrm), [RFC 2136](#rfc-2136), cloud provider APIs) with nothing installed on it.
 
 ---
 

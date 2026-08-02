@@ -214,13 +214,22 @@ helm install ddi oci://ghcr.io/spatiumddi/charts/spatiumddi \
   --set dnsAgents.agentKey.existingSecret=spatium-dns-agent-key \
   --set-json 'dnsAgents.servers=[{"name":"ns1","role":"primary","group":"internal-resolvers"}]'
 
-# PowerDNS (issue #127 — adds online DNSSEC, ALIAS, LUA, catalog zones)
+# PowerDNS (issue #127 — adds ALIAS, LUA, online DNSSEC, catalog zones)
 helm install ddi oci://ghcr.io/spatiumddi/charts/spatiumddi \
   --version <CHART_VERSION> \
   --namespace spatiumddi --create-namespace \
   --set dnsAgents.enabled=true \
   --set dnsAgents.agentKey.existingSecret=spatium-dns-agent-key \
   --set-json 'dnsAgents.servers=[{"name":"ns1","flavor":"powerdns","role":"primary","group":"powerdns-edge"}]'
+
+# Technitium (issue #746 — adds native DoT/DoH/DoQ with no sidecar,
+# encrypted upstream forwarding, online DNSSEC, catalog zones both ways)
+helm install ddi oci://ghcr.io/spatiumddi/charts/spatiumddi \
+  --version <CHART_VERSION> \
+  --namespace spatiumddi --create-namespace \
+  --set dnsAgents.enabled=true \
+  --set dnsAgents.agentKey.existingSecret=spatium-dns-agent-key \
+  --set-json 'dnsAgents.servers=[{"name":"ns1","flavor":"technitium","role":"primary","group":"technitium-edge"}]'
 ```
 
 Declare each DNS server under `.dnsAgents.servers[]` in `values.yaml`.
@@ -230,8 +239,9 @@ Set `flavor: powerdns` or `flavor: technitium` on a server to pull the
 image instead of BIND9 — same `DNS_AGENT_KEY` bootstrap, image-baked
 driver, mount path auto-switches to `/var/lib/powerdns` or `/etc/dns`
 respectively. Mixed-driver groups are rejected by the control plane for
-driver-specific features (PowerDNS: DNSSEC sign/unsign, ALIAS, LUA,
-catalog zones); spin up a separate group per driver.
+driver-specific features (PowerDNS: ALIAS, LUA · BIND9: views, RPZ ·
+Technitium: DoQ and encrypted DoH/DoQ forwarding); spin up a separate
+group per driver.
 
 ### Encrypted transports — DoT / DoH (issue #50)
 
@@ -253,9 +263,18 @@ On the static-manifest path, uncomment the `dns-dot` / `dns-doh` blocks in
 both `k8s/dns/bind9-statefulset.yaml` and `k8s/dns/service-dns.yaml`.
 
 Prefer 8443 over the RFC 8484 default of 443 for DoH unless you know 443
-is free — an Ingress controller usually already holds it. BIND9 serves
-both protocols natively; on the PowerDNS flavor they run on the dnsdist
-front, which has no Kubernetes deployment yet (docker-compose only).
+is free — an Ingress controller usually already holds it. BIND9 and
+Technitium both serve DoT and DoH natively, and `dotPort` / `dohPort`
+work the same on either flavor; on the PowerDNS flavor they run on the
+dnsdist front, which has no Kubernetes deployment yet (docker-compose
+only).
+
+> **DoQ has no chart knob yet.** Technitium also serves DNS-over-QUIC,
+> which is UDP and therefore shares :853 with DoT without colliding —
+> but `dotPort` renders `protocol: TCP` and there is no `doqPort`, so
+> the UDP listener cannot be declared on the Pod or routed through the
+> Service. It still answers on a `hostNetwork` node. Tracked in
+> [#799](https://github.com/spatiumddi/spatiumddi/issues/799).
 
 ### How servers register
 

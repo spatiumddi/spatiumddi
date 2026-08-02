@@ -268,6 +268,7 @@ For real production use you generally don't want the Kea DHCP agent and the BIND
 | `docker-compose.agent-dhcp.yml`           | Kea DHCP agent(s) only — no control plane |
 | `docker-compose.agent-dns-bind9.yml`      | BIND9 DNS agent only — no control plane (renamed from `docker-compose.agent-dns.yml` in `2026.05.11-1`) |
 | `docker-compose.agent-dns-powerdns.yml`   | PowerDNS DNS agent only — no control plane (issue #127) |
+| `docker-compose.agent-dns-technitium.yml` | Technitium DNS agent only — no control plane (issue #746) |
 | `docker-compose.agent-looking-glass.yml`  | Receive-only BGP Looking Glass collector only — no control plane (issue #566) |
 
 The agent containers long-poll the remote control plane's API and cache the last-known-good config locally (non-negotiable #5), so the DHCP / DNS services keep serving even if the control plane is briefly unreachable.
@@ -377,19 +378,26 @@ export DNS_HOSTNAME=dns-bind9-east
 docker compose -f docker-compose.agent-dns-bind9.yml up -d
 
 # PowerDNS (issue #127, native REST API + LMDB embedded backend,
-# unlocks ALIAS / LUA / online DNSSEC / catalog zones in
-# PowerDNS-only groups):
+# unlocks ALIAS / LUA in PowerDNS-only groups):
 export DNS_HOSTNAME=dns-powerdns-east
 docker compose -f docker-compose.agent-dns-powerdns.yml up -d
+
+# Technitium (issue #746, REST API + its own embedded store — no config
+# file and no external database; native DoT / DoH / DoQ listeners and
+# encrypted upstream forwarding over all three):
+export DNS_HOSTNAME=dns-technitium-east
+docker compose -f docker-compose.agent-dns-technitium.yml up -d
 ```
 
-Both compose files share the same `DNS_AGENT_KEY` bootstrap shape and
-register against `CONTROL_PLANE_URL` the same way; the only difference
-is the image (`dns-bind9` vs `dns-powerdns`) and the driver baked into
-the image's `AGENT_DRIVER` env. The control plane gates PowerDNS-only
-features (DNSSEC sign/unsign, ALIAS, LUA, catalog zones) on **every
-server in the group running the powerdns driver** — to run BIND9 +
-PowerDNS side-by-side, create two separate `DNSServerGroup`s.
+All three compose files share the same `DNS_AGENT_KEY` bootstrap shape
+and register against `CONTROL_PLANE_URL` the same way; the only
+difference is the image (`dns-bind9` / `dns-powerdns` /
+`dns-technitium`) and the driver baked into the image's `AGENT_DRIVER`
+env. The control plane gates driver-specific features on **every server
+in the group running that driver** — ALIAS / LUA need an all-PowerDNS
+group, views and RPZ an all-BIND9 one, DoQ and encrypted-DoH/DoQ
+forwarding an all-Technitium one. To run more than one side-by-side,
+create a separate `DNSServerGroup` per driver.
 
 For authoritative + secondary pairs, run the same compose file on each
 additional DNS VM with a unique `DNS_HOSTNAME` and the same

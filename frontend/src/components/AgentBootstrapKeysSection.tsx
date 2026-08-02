@@ -120,7 +120,7 @@ export function AgentBootstrapKeysSection() {
         <div className="space-y-3">
           <KeyCard
             label="DNS_AGENT_KEY"
-            description="DNS agents (BIND9 / PowerDNS) paste this at install time."
+            description="DNS agents (BIND9 / PowerDNS / Technitium) paste this at install time."
             envVar="DNS_AGENT_KEY"
             configured={data.dns_agent_configured}
             value={data.dns_agent_key}

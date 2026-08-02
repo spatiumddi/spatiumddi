@@ -593,10 +593,11 @@ function MetalLBConfigCard() {
                       className="w-full rounded-md border bg-background px-2 py-1 font-mono text-xs"
                     />
                     <span className="text-[11px] text-muted-foreground">
-                      One floating IP for BIND9 / PowerDNS so clients use a
-                      single resolver address that follows whichever node is up
-                      (the resolver Pods drop <code>hostNetwork</code> behind an
-                      L2 LoadBalancer). Must differ from the control-plane VIP.
+                      One floating IP for BIND9 / PowerDNS / Technitium so
+                      clients use a single resolver address that follows
+                      whichever node is up (the resolver Pods drop{" "}
+                      <code>hostNetwork</code> behind an L2 LoadBalancer). Must
+                      differ from the control-plane VIP.
                     </span>
                   </div>
                   <div className="flex flex-col gap-1">

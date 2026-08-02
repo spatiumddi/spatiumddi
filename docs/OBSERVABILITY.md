@@ -212,7 +212,7 @@ server reads:
 
 | Tab | Source | Transport | Detail |
 |---|---|---|---|
-| **DNS Queries** | BIND9 / PowerDNS query log | agent push → DB | § 4½.1 |
+| **DNS Queries** | BIND9 / PowerDNS query log (not Technitium — [#742](https://github.com/spatiumddi/spatiumddi/issues/742)) | agent push → DB | § 4½.1 |
 | **DHCP Activity** | Kea DHCPv4 activity | agent push → DB | § 4½.2 |
 | **Event Log** | Windows DNS / DHCP Event Log | WinRM read-through | § 4.1 |
 | **DHCP Audit** | Windows DHCP per-lease CSV trail | WinRM read-through | § 4.2 |
@@ -318,7 +318,15 @@ Two additional tabs on the same Logs page, sourced from in-container agents inst
 
 ### 4½.1 DNS Queries tab
 
-**Source.** BIND9's `query-log` channel. The control-plane template (`backend/app/drivers/dns/templates/bind9/named.conf.j2`) renders a `logging { channel queries_channel { file "/var/log/named/queries.log" versions 5 size 50m; ... }; category queries { queries_channel; }; };` block when `DNSServerOptions.query_log_enabled` is on.
+**Source.** BIND9's `query-log` channel. The control-plane template (`backend/app/drivers/dns/templates/bind9/named.conf.j2`) renders a `logging { channel queries_channel { file "/var/log/named/queries.log" versions 5 size 50m; ... }; category queries { queries_channel; }; };` block when `DNSServerOptions.query_log_enabled` is on. PowerDNS feeds the same pipeline, but from a **different file**: the agent's `start_daemon` redirects `pdns_server`'s stderr into `<state_dir>/pdns.log` (inside the agent's own state dir, so the unprivileged `spatium` user can write it) and passes that explicit path to `QueryLogShipper`, gated on `log-dns-queries=yes` + `loglevel` ≥ 6. That is the file to inspect, mount or override with `DNS_QUERY_LOG_PATH` on a PowerDNS agent — not `/var/log/named/queries.log`. The control plane dispatches parsing by `server.driver`, so the one ingest endpoint accepts either format.
+
+> **Not Technitium.** Technitium's query logging is API/DB-backed
+> (`/api/logs/query*`) rather than a tailable text file, so the
+> file-tailing `QueryLogShipper` cannot reach it — it needs a
+> poll-and-diff shipper instead. Tracked in
+> [#742](https://github.com/spatiumddi/spatiumddi/issues/742); until it
+> lands, a Technitium group's queries are visible in Technitium's own
+> console but not on this tab.
 
 **Pipeline.**
 

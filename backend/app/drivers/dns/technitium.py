@@ -27,13 +27,19 @@ Scope (this driver):
   supported set, zone types from ``_SUPPORTED_ZONE_TYPES``, secondary /
   stub zones carry primaries to transfer from, no views).
 
-Deferred to fast-follow phases (tracked in the roadmap, not this driver):
+Landed after the v1 cut, so the sections below are no longer "deferred":
+online DNSSEC signing (#740), native DNS-over-TLS/HTTPS/QUIC listeners plus
+encrypted *upstream* forwarding over all three (#741 — a real differentiator
+over both PowerDNS, which needs a dnsdist sidecar and cannot forward at all,
+and BIND9, which forwards over DoT only), secondary / stub / catalog zones
+and TSIG transfer (#743), and the ``dns_import`` live-pull + native blocklist
+wiring (#744).
 
-* Native DNS-over-TLS/HTTPS/QUIC listener wiring — issue #741. A real
-  differentiator over PowerDNS (no dnsdist sidecar needed); it also
-  supports encrypted *upstream* forwarding, which BIND9 cannot do.
-* Query-log shipping — issue #742.
-* ``dns_import`` live-pull + blocklist wiring — issue #744.
+Still outstanding (tracked in the roadmap, not this driver):
+
+* Query-log shipping — issue #742. Technitium's query log is API/DB-backed
+  (``/api/logs/query*``) rather than a tailable file, so it needs a
+  poll-and-diff shipper instead of the file-tailing ``QueryLogShipper``.
 * ANAME / APP / FWD record types (Technitium-proprietary, different shape
   than PowerDNS's ALIAS/LUA — not a drop-in equivalent).
 

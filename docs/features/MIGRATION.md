@@ -26,7 +26,7 @@ preview → commit idiom, so it sits in the same table.
 |---|---|---|---|---|
 | Feature module | `dns.import` | `dhcp.import` | `ipam.import.netbox` | `migration.cutover` |
 | Admin surface | DNS Import (sidebar) | DHCP Import (sidebar) | Import → NetBox | Import → Windows cutover |
-| Sources | BIND9 archive · Windows DNS live-pull · PowerDNS REST · Cloud DNS live-pull (Cloudflare / Route 53 / Azure DNS / Google Cloud DNS) | Kea JSON file · Windows DHCP live-pull · ISC `dhcpd.conf` | NetBox REST live-pull (v3.x–4.6+) | live Windows DNS + Windows DHCP over WinRM |
+| Sources | BIND9 archive · Windows DNS live-pull · PowerDNS REST · Technitium REST · Cloud DNS live-pull (Cloudflare / Route 53 / Azure DNS / Google Cloud DNS) | Kea JSON file · Windows DHCP live-pull · ISC `dhcpd.conf` | NetBox REST live-pull (v3.x–4.6+) | live Windows DNS + Windows DHCP over WinRM |
 | Target | DNS server group (+ optional view) | DHCP server group (+ IPAM linkage) | native IPAM rows (space / block / subnet / address + VRF / VLAN / Customer / Site) | zones + scopes that already exist here — it creates none |
 | Provenance columns | `dns_zone` / `dns_record` `import_source` + `imported_at` | `dhcp_scope` / `dhcp_pool` / `dhcp_static_assignment` / `dhcp_client_class` `import_source` + `imported_at` | IPAM / network rows `import_source` + `imported_at` + `netbox_id` (in `custom_fields` / `tags`) | `dhcp_static_assignment` `import_source="windows_cutover"` + `imported_at` (lease handover only) |
 | Conflict actions | skip / overwrite / rename (per zone) | skip / overwrite (per scope) | skip / overwrite (per entity) | — parity report + readiness blockers instead |
@@ -43,8 +43,8 @@ never claims ownership of a row it didn't create.
 
 1. **Configure source.** File upload (BIND9 archive, Kea JSON, ISC
    `dhcpd.conf`) or a connection (a pre-registered Windows server, a
-   PowerDNS REST endpoint). Plus the **target** — which server group
-   the import lands in.
+   PowerDNS or Technitium REST endpoint). Plus the **target** — which
+   server group the import lands in.
 2. **Preview.** `POST …/{source}/preview` parses the source into the
    canonical IR and returns the would-create plan plus per-object
    conflict status. Side-effect-free — no DB writes, no audit rows.
@@ -66,7 +66,7 @@ failover / TSIG keys, classifier DSL).
 
 ## DNS importer (#128)
 
-Three sources, all reducing to canonical `ImportedZone` + `ImportedRecord`:
+Five sources, all reducing to canonical `ImportedZone` + `ImportedRecord`:
 
 - **BIND9 archive** — upload a `.zip` / `.tar(.gz|.bz2|.xz)` containing
   `named.conf` + the referenced master files. The parser walks every
@@ -80,6 +80,22 @@ Three sources, all reducing to canonical `ImportedZone` + `ImportedRecord`:
   `Get-DnsServerResourceRecord`.
 - **PowerDNS REST** — paste an API URL + key (read once, never
   persisted); the importer walks `/api/v1/servers/{server}/zones`.
+- **Technitium REST** *(issue #744)* — paste a console URL + API token
+  (read once, never persisted); the importer walks `/api/zones/list`
+  and resolves each zone's full record set. Endpoints are
+  `POST /dns/import/technitium/{test-connection,preview,commit}`.
+  Two behaviours differ from the PowerDNS source and are deliberate:
+  **only `Primary` zones import** — secondary / stub / forwarder /
+  catalog zones are reported as warnings, because a secondary is a copy
+  of another server's data and importing one would mint rows SpatiumDDI
+  then serves authoritatively — and **disabled zones and records are
+  skipped** rather than silently re-enabled. Technitium also returns
+  structured `rData` whose field names do not match its own *write* API
+  and which renders numeric rdata as enum names, so the importer
+  inverts that back to wire form — a TLSA whose rdata comes back as
+  `DANE-EE` / `SPKI` / `SHA2-256` is stored as `3 1 1 <digest>`.
+  Unknown enum members pass through unchanged, so a future Technitium
+  release degrades to one odd record rather than an exception mid-import.
 - **Cloud DNS live-pull** *(issue #37)* — pick a registered cloud DNS
   server (driver in `{cloudflare, route53, azure_dns, google_dns}`)
   that has its provider credentials configured. The control plane
@@ -104,7 +120,7 @@ existing zone), **overwrite** (delete + recreate), **rename** (create
 under an operator-typed FQDN).
 
 **Per-provider provenance.** Unlike the other DNS sources (which stamp
-a single `bind9` / `windows_dns` / `powerdns` label), the cloud source
+a single `bind9` / `windows_dns` / `powerdns` / `technitium` label), the cloud source
 stamps the **provider name** — `cloudflare`, `route53`, `azure_dns`,
 or `google_dns` — into every created row's `import_source` column, so
 provenance stays queryable per provider. The plan's `source` field

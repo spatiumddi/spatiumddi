@@ -34,10 +34,9 @@ import {
 import { cn } from "@/lib/utils";
 import { HeaderButton } from "@/components/ui/header-button";
 
-// Tab metadata. Phase 1 ships only ``bind9``; Windows + PowerDNS
-// stay rendered (so the operator sees the roadmap) but are
-// click-disabled with a "Phase 2/3" badge. When those phases land,
-// flip ``available`` and add the matching tab body.
+// Tab metadata. Every source is live; ``available: false`` remains the
+// hook for rendering a not-yet-shipped source (so the operator sees the
+// roadmap) click-disabled with a phase badge.
 // ``cloud`` isn't a ``DNSImportSource`` (that union is the wire-level
 // importer type and lives in lib/api.ts); it's a UI-only tab that pulls
 // from a registered cloud-DNS server row via the dedicated endpoints.
@@ -52,7 +51,8 @@ interface TabDef {
   description: string;
 }
 
-// Tabs ordered alphabetically by label: BIND9 / Cloud / PowerDNS / Windows DNS.
+// Tabs ordered alphabetically by label: BIND9 / Cloud / PowerDNS /
+// Technitium / Windows DNS.
 const TABS: TabDef[] = [
   {
     id: "bind9",
