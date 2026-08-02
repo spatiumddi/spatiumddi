@@ -66,7 +66,7 @@ failover / TSIG keys, classifier DSL).
 
 ## DNS importer (#128)
 
-Three sources, all reducing to canonical `ImportedZone` + `ImportedRecord`:
+Five sources, all reducing to canonical `ImportedZone` + `ImportedRecord`:
 
 - **BIND9 archive** — upload a `.zip` / `.tar(.gz|.bz2|.xz)` containing
   `named.conf` + the referenced master files. The parser walks every

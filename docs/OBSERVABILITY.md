@@ -318,7 +318,7 @@ Two additional tabs on the same Logs page, sourced from in-container agents inst
 
 ### 4½.1 DNS Queries tab
 
-**Source.** BIND9's `query-log` channel. The control-plane template (`backend/app/drivers/dns/templates/bind9/named.conf.j2`) renders a `logging { channel queries_channel { file "/var/log/named/queries.log" versions 5 size 50m; ... }; category queries { queries_channel; }; };` block when `DNSServerOptions.query_log_enabled` is on. PowerDNS feeds the same pipeline via `log-dns-queries=yes` plus a redirected stderr capture the shipper tails at the same path.
+**Source.** BIND9's `query-log` channel. The control-plane template (`backend/app/drivers/dns/templates/bind9/named.conf.j2`) renders a `logging { channel queries_channel { file "/var/log/named/queries.log" versions 5 size 50m; ... }; category queries { queries_channel; }; };` block when `DNSServerOptions.query_log_enabled` is on. PowerDNS feeds the same pipeline, but from a **different file**: the agent's `start_daemon` redirects `pdns_server`'s stderr into `<state_dir>/pdns.log` (inside the agent's own state dir, so the unprivileged `spatium` user can write it) and passes that explicit path to `QueryLogShipper`, gated on `log-dns-queries=yes` + `loglevel` ≥ 6. That is the file to inspect, mount or override with `DNS_QUERY_LOG_PATH` on a PowerDNS agent — not `/var/log/named/queries.log`. The control plane dispatches parsing by `server.driver`, so the one ingest endpoint accepts either format.
 
 > **Not Technitium.** Technitium's query logging is API/DB-backed
 > (`/api/logs/query*`) rather than a tailable text file, so the
