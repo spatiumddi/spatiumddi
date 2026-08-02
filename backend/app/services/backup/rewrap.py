@@ -20,9 +20,12 @@ This module runs after the data-replay phase of restore. It:
 3. For every (table, column) in :data:`ENCRYPTED_COLUMNS`,
    walks every non-null row, decrypts with the source key,
    re-encrypts with the destination key, UPDATEs the row.
-4. Walks every ``__enc__:`` field inside ``backup_target.config``
-   — those are JSONB-embedded Fernet strings, separate from the
-   column-level table.
+4. Walks every JSONB-embedded Fernet string listed in
+   :data:`JSONB_ENCRYPTED_FIELDS` — the ``__enc__:`` fields inside
+   ``backup_target.config`` plus the SNMPv3 passphrases, syslog TLS
+   CAs, APT GPG keys and private-mirror passwords on
+   ``platform_settings``. Those are JSON strings rather than
+   ``LargeBinary`` columns, so the column sweep cannot see them.
 
 Idempotency: if a row is already encrypted with the destination
 key (rewrap re-run, or a row created post-restore via the API),
@@ -119,6 +122,66 @@ ENCRYPTED_COLUMNS: tuple[tuple[str, str, str], ...] = (
 # :mod:`app.services.backup.targets.secrets_config`). Anything
 # else inside the config blob is plaintext and stays put.
 _ENC_PREFIX = "__enc__:"
+
+
+@dataclass(frozen=True)
+class JsonbSecret:
+    """One JSONB location holding Fernet ciphertext as a STRING.
+
+    The second storage convention for secrets in this schema, and the
+    one #781's first pass was structurally blind to: these are not
+    ``LargeBinary`` columns and their names do not end in
+    ``_encrypted``, so a sweep of the mapped metadata cannot see them.
+    They still fail exactly the same way — a cross-install restore
+    leaves them readable only with the source key, which on an
+    appliance is gone the moment the box is reimaged.
+
+    ``shape``:
+
+    * ``"list"``  — the column is a JSON array of objects, and each
+      key in ``keys`` on each object may hold ciphertext.
+    * ``"dict"``  — the column is a single JSON object, and EVERY
+      string value carrying ``prefix`` is ciphertext (``keys`` unused).
+
+    ``prefix`` is stripped before decrypt and restored after encrypt.
+    Empty means the value is bare Fernet output, which is what the
+    ``platform_settings`` writers emit (``encrypt_str(...).decode()``).
+    """
+
+    table: str
+    pk_col: str
+    column: str
+    shape: str
+    keys: tuple[str, ...] = ()
+    prefix: str = ""
+
+
+# Every JSONB-embedded secret in the schema. Hand-maintained like
+# ENCRYPTED_COLUMNS, and guarded the same way — ``test_rewrap_jsonb.py``
+# fails when a new ``encrypt_str(...).decode(...)`` call site appears
+# anywhere in the app without being registered here, because that idiom
+# IS the act of embedding Fernet ciphertext in a JSON-friendly field.
+JSONB_ENCRYPTED_FIELDS: tuple[JsonbSecret, ...] = (
+    # Driver credentials (S3 secret_access_key, SCP private_key, Azure
+    # account_key, …). The row's own ``passphrase_encrypted`` column is
+    # covered by ENCRYPTED_COLUMNS; these are separate.
+    JsonbSecret("backup_target", "id", "config", shape="dict", prefix=_ENC_PREFIX),
+    # SNMPv3 auth/priv passphrases (#153).
+    JsonbSecret(
+        "platform_settings",
+        "id",
+        "snmp_v3_users",
+        shape="list",
+        keys=("auth_pass_enc", "priv_pass_enc"),
+    ),
+    # Syslog-forwarder TLS CA bundles (#159).
+    JsonbSecret("platform_settings", "id", "syslog_targets", shape="list", keys=("ca_cert_pem",)),
+    # APT armoured GPG key text + private-mirror passwords (#155).
+    JsonbSecret(
+        "platform_settings", "id", "apt_gpg_keys", shape="list", keys=("armoured_text_enc",)
+    ),
+    JsonbSecret("platform_settings", "id", "apt_auth", shape="list", keys=("password_enc",)),
+)
 
 
 @dataclass
@@ -257,9 +320,8 @@ async def rewrap_secrets(
     dest_secret_key: str,
     dest_credential_key: str,
 ) -> RewrapOutcome:
-    """Walk every Fernet-encrypted column + the
-    ``backup_target.config`` JSONB blob, rewrap each value from
-    ``source`` to ``dest`` keys.
+    """Walk every Fernet-encrypted column + every JSONB-embedded Fernet
+    string, rewrapping each value from ``source`` to ``dest``.
 
     No-ops cleanly when the source + destination keys are identical
     (same-install restore — counters return zero, ``same_install``
@@ -296,17 +358,19 @@ async def rewrap_secrets(
                 dest=dest_fernet,
                 outcome=outcome,
             )
-        # Walk backup_target.config JSONB last — its column was
-        # already covered above for the row's passphrase, but the
-        # config blob carries its own per-driver Fernet-wrapped
-        # secrets (S3 secret_access_key, SCP private_key, Azure
-        # account_key, etc.).
-        await _rewrap_backup_target_config(
-            conn=conn,
-            source=source_fernet,
-            dest=dest_fernet,
-            outcome=outcome,
-        )
+        # Then the JSONB-embedded secrets. These are a SECOND storage
+        # convention — Fernet ciphertext as a JSON string rather than a
+        # LargeBinary column — so nothing that sweeps the mapped metadata
+        # can find them, and the first pass at #781 missed all of them.
+        for spec in JSONB_ENCRYPTED_FIELDS:
+            outcome.columns_visited += 1
+            await _rewrap_jsonb_field(
+                conn=conn,
+                spec=spec,
+                source=source_fernet,
+                dest=dest_fernet,
+                outcome=outcome,
+            )
     finally:
         await conn.close()
 
@@ -388,60 +452,47 @@ async def _rewrap_column(
                 )
 
 
-async def _rewrap_backup_target_config(
+async def _rewrap_jsonb_field(
     *,
     conn: asyncpg.Connection,
+    spec: JsonbSecret,
     source: Fernet,
     dest: Fernet,
     outcome: RewrapOutcome,
 ) -> None:
-    """Rewrap every ``__enc__:``-prefixed string inside the
-    ``backup_target.config`` JSONB blob. Each driver embeds
-    secrets there at row-create time (see
-    :mod:`app.services.backup.targets.secrets_config`) so the
-    column-level rewrap above only handles ``passphrase_encrypted``;
-    the driver-side credentials live here.
+    """Rewrap every Fernet string inside one JSONB column.
 
-    JSONB rows are read, mutated in memory, then UPDATEd as a
-    whole — there's no UPDATE-by-jsonb-key shortcut that would
-    play nicely with multi-field rewrap.
+    Rows are read, mutated in memory, then UPDATEd whole — there is no
+    UPDATE-by-jsonb-key shortcut that plays nicely with rewrapping
+    several fields of one document at once.
+
+    A missing table or column is not an error: this list spans the whole
+    schema and a restore can legitimately land on an install whose
+    migrations predate one of them.
     """
     try:
-        rows = await conn.fetch("SELECT id, config FROM backup_target")
-    except asyncpg.UndefinedTableError:
+        rows = await conn.fetch(
+            f"SELECT {spec.pk_col} AS pk, {spec.column} AS doc FROM {spec.table}"  # noqa: S608
+        )
+    except (asyncpg.UndefinedTableError, asyncpg.UndefinedColumnError):
         return
-
     if not rows:
         return
 
     async with conn.transaction():
         for row in rows:
-            target_id = row["id"]
-            config_raw = row["config"]
-            if config_raw is None:
+            doc = _decode_jsonb(row["doc"])
+            if doc is None:
                 continue
-            # asyncpg returns JSONB as already-decoded Python types;
-            # if a future driver schema returns it as raw bytes we
-            # still defend with json.loads.
-            config: dict[str, Any]
-            if isinstance(config_raw, str):
-                config = json.loads(config_raw)
-            elif isinstance(config_raw, bytes):
-                config = json.loads(config_raw.decode("utf-8"))
-            else:
-                config = dict(config_raw)
             mutated = False
-            for key, value in list(config.items()):
-                if not isinstance(value, str) or not value.startswith(_ENC_PREFIX):
-                    continue
-                ciphertext = value[len(_ENC_PREFIX) :].encode("utf-8")
+            for holder, key, ciphertext in _jsonb_secret_sites(spec, doc):
                 new_value, status = _rewrap_value(source, dest, ciphertext)
                 if status == "rewrapped":
-                    # ``status == "rewrapped"`` ⇒ new_value is bytes
-                    # (see _rewrap_value), but mypy can't narrow
-                    # through the string literal.
+                    # ``status == "rewrapped"`` ⇒ new_value is bytes (see
+                    # _rewrap_value), but mypy can't narrow through the
+                    # string literal.
                     assert new_value is not None
-                    config[key] = _ENC_PREFIX + new_value.decode("utf-8")
+                    holder[key] = spec.prefix + new_value.decode("utf-8")
                     mutated = True
                     outcome.rewrapped_jsonb_fields += 1
                 elif status == "idempotent":
@@ -451,21 +502,70 @@ async def _rewrap_backup_target_config(
                     if len(outcome.failures) < 10:
                         outcome.failures.append(
                             {
-                                "table": "backup_target",
-                                "column": f"config.{key}",
-                                "pk": str(target_id),
+                                "table": spec.table,
+                                "column": f"{spec.column}.{key}",
+                                "pk": str(row["pk"]),
                                 "reason": status,
                             }
                         )
                     logger.warning(
                         "rewrap_jsonb_field_failed",
-                        target_id=str(target_id),
+                        table=spec.table,
+                        column=spec.column,
                         field=key,
+                        pk=str(row["pk"]),
                         reason=status,
                     )
             if mutated:
                 await conn.execute(
-                    "UPDATE backup_target SET config = $1::jsonb WHERE id = $2",
-                    json.dumps(config),
-                    target_id,
+                    f"UPDATE {spec.table} SET {spec.column} = $1::jsonb "  # noqa: S608
+                    f"WHERE {spec.pk_col} = $2",
+                    json.dumps(doc),
+                    row["pk"],
                 )
+
+
+def _decode_jsonb(raw: Any) -> Any:
+    """asyncpg usually hands back decoded Python types; a driver or codec
+    change could hand back the raw text instead, so accept both. Returns
+    ``None`` for a NULL or unusable document."""
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        return json.loads(raw)
+    if isinstance(raw, bytes):
+        return json.loads(raw.decode("utf-8"))
+    return raw
+
+
+def _jsonb_secret_sites(spec: JsonbSecret, doc: Any) -> list[tuple[dict[str, Any], str, bytes]]:
+    """Every ``(containing_dict, key, ciphertext_bytes)`` in ``doc``.
+
+    Returning the containing dict rather than a path lets the caller write
+    the new value straight back, which keeps discovery and mutation in one
+    shape for both document layouts.
+    """
+    out: list[tuple[dict[str, Any], str, bytes]] = []
+
+    def _consider(holder: dict[str, Any], key: str) -> None:
+        value = holder.get(key)
+        if not isinstance(value, str) or not value:
+            return
+        if spec.prefix and not value.startswith(spec.prefix):
+            return
+        out.append((holder, key, value[len(spec.prefix) :].encode("utf-8")))
+
+    if spec.shape == "dict":
+        if isinstance(doc, dict):
+            # Prefix-marked: every marked value is ciphertext whatever the
+            # key. Everything else in the blob is plaintext config.
+            for key in list(doc):
+                _consider(doc, key)
+        return out
+
+    if isinstance(doc, list):
+        for entry in doc:
+            if isinstance(entry, dict):
+                for key in spec.keys:
+                    _consider(entry, key)
+    return out
