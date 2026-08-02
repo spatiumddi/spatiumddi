@@ -455,10 +455,11 @@ class ScopeResponse(BaseModel):
     # field used to be declared and hardcoded to ``None``: no column backed
     # it, neither ScopeCreate nor ScopeUpdate accepted it, and the scope form
     # sent it on every save, so an operator typed a domain, got a 200, and
-    # read back null. The DDNS domain lives on the IPAM chain
-    # (space → block → subnet, resolved by ``services/dns/ddns.py``), which
-    # is where it actually works; a scope maps 1:1 to a subnet, so putting a
-    # second copy here would be a second source of truth for one setting.
+    # read back null. The DDNS domain lives on the IPAM chain, where it
+    # actually works: ``services/dns/ddns.resolve_effective_ddns`` resolves
+    # it most-specific-first — the subnet, then up through its blocks, then
+    # the IP space. A scope maps 1:1 to a subnet, so putting a second copy
+    # here would be a second source of truth for one setting.
     hostname_sync_mode: str
     dns_track_dynamic_leases: bool = True
     address_family: str = "ipv4"
