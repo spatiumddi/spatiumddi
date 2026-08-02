@@ -1249,8 +1249,8 @@ control-plane cluster itself, not the registered agent fleet.
    > replica count. Upgrading from an external image URL needs no mirror
    > either way.
    >
-   > ⚠️ **Upgrading *to* `2026.07.30-1` from `2026.07.21-1` or earlier: do
-   > not use upload.** The nginx `location /api/v1/appliance/upgrade-images`
+  > ⚠️ **Upgrading from `2026.07.21-1` or earlier: do not use upload to reach
+  > `2026.07.30-1` or later.** The nginx `location /api/v1/appliance/upgrade-images`
    > block that raises `client_max_body_size` to 4 GiB — matching the
    > backend's own `MAX_UPLOAD_BYTES` — first shipped **in** `2026.07.30-1`.
    > On any earlier release the request falls through to the generic
