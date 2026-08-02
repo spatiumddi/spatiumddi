@@ -37,6 +37,7 @@ Always read the relevant spec doc(s) before writing code for a feature area.
 | `docs/DEVELOPMENT.md` | Coding standards, test requirements, CI pipeline |
 | `docs/OBSERVABILITY.md` | Logging (centralized + UI viewer), metrics, health dashboard, alerting |
 | `docs/TROUBLESHOOTING.md` | Recovery recipes: accidentally deleted agent rows, password reset, subnet delete refused |
+| `docs/THIRD_PARTY.md` | Catalogue of every bundled/shipped third-party component — engine, library, OS package — with license, the artifact it ships in, and the rationale. Operator-facing companion to the root `NOTICE` (which stays authoritative for license text). **When you add a shipped component, update BOTH** |
 | `docs/features/IPAM.md` | IP Space/Block/Subnet/Address management, VLAN/VXLAN, custom fields, import/export, tree UI |
 | `docs/features/DHCP.md` | DHCP servers, scopes, pools, static assignments, DDNS, caching, Windows DHCP (Path A) |
 | `docs/features/DNS.md` | DNS servers, zones, records, views, server groups, blocking lists, DDNS, zone tree, Windows DNS (Path A + B), Technitium, encrypted transports (DoT / DoH / DoQ), DNS threat analytics, sync-with-servers reconciliation |
@@ -72,7 +73,7 @@ Always read the relevant spec doc(s) before writing code for a feature area.
 | Frontend | React 18 + TypeScript, Vite, shadcn/ui, Tailwind, React Query |
 | Database | PostgreSQL 16 (HA via Patroni or CloudNativePG) |
 | Cache / Sessions | Redis 7 |
-| Auth | python-jose + bcrypt (local), ldap3 (LDAP), authlib (OIDC), python3-saml (SAML), pyrad (RADIUS), tacacs_plus (TACACS+); Fernet for secrets at rest |
+| Auth | python-jose + bcrypt (local), ldap3 (LDAP), joserfc (OIDC ID-token / JWKS), python3-saml (SAML), pyrad (RADIUS), tacacs_plus (TACACS+); Fernet for secrets at rest |
 | Logging | structlog → JSON → centralized log store (Loki / Elasticsearch) |
 | Metrics | Prometheus + Grafana; InfluxDB v1/v2 push export |
 | Containerization | Docker (multi-stage, amd64+arm64), Docker Compose, Kubernetes + Helm |
