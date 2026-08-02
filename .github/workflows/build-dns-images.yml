@@ -1,13 +1,25 @@
 name: Build DNS Agent Images
 
+# TRIGGERS — deliberately PR-only. Neither `push` case earned its keep:
+#
+#   on a TAG, this raced release.yml's build-dns / build-dns-powerdns / build-dns-technitium / build-dns-dnsdist,
+#     which builds the same image and pushes the SAME `:<VERSION>` tag.
+#     Two multi-arch builds of identical source, concurrently, with the
+#     winner decided by whichever finished last — on a release artifact.
+#
+#   on `main`, it published `:main` and `:sha-<short>` that nothing
+#     consumes: no chart, no compose file, no k8s manifest pins them, and
+#     agent-e2e explicitly builds from PR source instead (see the comment
+#     in agent-e2e.yml). It also skipped Trivy on that path, so it was
+#     publishing unscanned multi-arch images for no reader.
+#
+# What replaced each: releases are built by release.yml, and "build main
+# periodically" is nightly.yml (#805) — which does it once a day with a
+# Trivy gate ahead of the push, rather than on every merge with none.
+#
+# The PR trigger below is the one that matters and is unchanged: it is the
+# CVE gate, and it still blocks the PR on any fixable HIGH/CRITICAL.
 on:
-  push:
-    branches: [main]
-    tags:
-      - "[0-9][0-9][0-9][0-9].[0-9][0-9].[0-9][0-9]-*"
-    paths:
-      - "agent/dns/**"
-      - ".github/workflows/build-dns-images.yml"
   pull_request:
     paths:
       - "agent/dns/**"

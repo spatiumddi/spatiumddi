@@ -234,6 +234,40 @@ Branch protection on `main` gates on these checks. `make ci` reproduces
 the two lint jobs and the frontend build locally; `make test` reproduces
 the backend test job (single-runner rather than sharded).
 
+### What runs when — the trigger policy
+
+Every workflow trigger should answer "what would we miss without it?".
+Three of the four events have distinct jobs:
+
+| Event | Runs | Why |
+|---|---|---|
+| **Pull request** | `ci.yml`, the per-image builds (single-arch + **Trivy**), `agent-e2e.yml` | Where correctness is gated. Nothing merges without it. |
+| **Push to `main`** | `ci.yml`, `docs-publish.yml`, `build-appliance-builder.yml` | Post-merge safety net + the two things that must be *published* from `main`. |
+| **Release tag** | `release.yml` only | Builds and publishes every image multi-arch, the chart, and the appliance ISO. |
+| **Schedule** | `nightly.yml`, `trivy-scheduled.yml`, `prune-release-assets.yml` | Work that is about *elapsed time*, not about a change. |
+
+Two rules follow, and both were violations once:
+
+- **Per-image build workflows do not trigger on push.** On a tag they raced
+  `release.yml`, which builds the same image and pushes the same
+  `:<VERSION>` tag — two concurrent multi-arch builds of identical source,
+  with the winner decided by whichever finished last, on a release
+  artifact. On `main` they published `:main` and `:sha-<short>` that
+  nothing consumes (no chart, compose file or manifest pins them, and
+  `agent-e2e.yml` deliberately builds from PR source instead) *and* skipped
+  Trivy on that path. Both jobs are covered better elsewhere: releases by
+  `release.yml`, "build `main` periodically" by `nightly.yml` — which
+  scans before it publishes.
+- **`build-appliance-builder.yml` is the exception and must stay on
+  `main`.** `release.yml`'s ISO job and the `APPLIANCE_BUILDER` default in
+  the Makefile both pull `appliance-builder:latest`; that tag is how the
+  builder image gets published at all.
+
+`ci.yml` stays on push to `main` on purpose. It is redundant with the PR
+run in the common case — GitHub tests the merge result — but it validates
+the actual squashed commit, and it is the only check that covers a direct
+push or a merge made with `--admin` while shards were still pending.
+
 ### Nightly builds
 
 [`.github/workflows/nightly.yml`](../.github/workflows/nightly.yml) builds
