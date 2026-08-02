@@ -216,6 +216,25 @@ async def _stream_upload_through_mirror(
         )
 
 
+class MirrorUnavailable(Exception):
+    """The mirror could not be reached at all — connect / read failure.
+
+    Deliberately distinct from an HTTP error the mirror itself returned
+    (#787). Those two say very different things about the fleet:
+
+    * unreachable — the mirror pod is gone. Its PVC is RWO local-path, so
+      the single replica is pinned to one node, and losing that node leaves
+      it Pending indefinitely. Nothing about the stored image is wrong.
+    * answered with an error — the mirror is alive and refusing or failing.
+      A mismatched ``X-Mirror-Auth`` secret is the likely cause, and it is a
+      configuration fault that will never self-heal.
+
+    The download handler serves a local copy for the first and surfaces the
+    second, which is only expressible if the two do not collapse into one
+    status code.
+    """
+
+
 async def _stream_download_from_mirror(
     image_id: uuid.UUID,
     *,
@@ -226,6 +245,11 @@ async def _stream_download_from_mirror(
     The mirror serves a FileResponse; we open a streaming GET against
     it and pass the chunks through. The mirror's content-length passes
     through too, so the host runner's progress bar still works.
+
+    Raises :class:`MirrorUnavailable` when the mirror cannot be reached,
+    a 404 ``HTTPException`` when it reports the bytes absent, and a 502
+    ``HTTPException`` when it answers with anything else — three outcomes
+    the caller has to tell apart (#787).
 
     ``filename`` controls the ``Content-Disposition`` header so the
     browser / host runner sees the same filename as the local-FS path
@@ -246,10 +270,7 @@ async def _stream_download_from_mirror(
         upstream = await client.send(request, stream=True)
     except httpx.HTTPError as exc:
         await client.aclose()
-        raise HTTPException(
-            status.HTTP_502_BAD_GATEWAY,
-            f"Mirror download failed: {exc}",
-        ) from exc
+        raise MirrorUnavailable(str(exc)) from exc
     if upstream.status_code == 404:
         await upstream.aclose()
         await client.aclose()
@@ -292,6 +313,49 @@ async def _stream_download_from_mirror(
         media_type="application/octet-stream",
         headers=resp_headers,
     )
+
+
+async def _bytes_present_in_active_store(image_id: uuid.UUID) -> bool:
+    """Does the store a download would actually read from hold these bytes?
+
+    #787 — this is what makes "re-upload the image" a real remedy instead
+    of a no-op. Both ingest paths short-circuit on a duplicate SHA-256, so
+    an operator whose bytes are missing from the active store could
+    re-upload forever and change nothing.
+
+    When the mirror is configured the answer is about the MIRROR only,
+    deliberately, even though the api may also hold a local copy: a local
+    copy is readable on exactly one node, which is the condition being
+    repaired. Saying "present" because this replica happens to have the
+    file would leave the fleet in the state the re-upload was meant to fix.
+
+    A mirror that cannot be reached raises rather than guessing. Guessing
+    "absent" would re-download gigabytes from GitHub into a PUT that is
+    about to fail anyway; guessing "present" would silently skip a repair
+    the operator asked for.
+    """
+    if not settings.slot_image_mirror_url:
+        return _image_path(image_id).exists()
+
+    headers = {"X-Mirror-Auth": mirror_auth_token("get", image_id)}
+    async with httpx.AsyncClient(timeout=_MIRROR_HTTP_TIMEOUT) as client:
+        try:
+            # Starlette routes a GET as HEAD too, so this costs headers
+            # rather than the 1-4 GiB body.
+            resp = await client.head(_mirror_url(image_id), headers=headers)
+        except httpx.HTTPError as exc:
+            raise HTTPException(
+                status.HTTP_502_BAD_GATEWAY,
+                f"Could not reach the upgrade-image mirror: {exc}",
+            ) from exc
+    if resp.status_code == 404:
+        return False
+    if resp.status_code != 200:
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            f"Upgrade-image mirror returned {resp.status_code} on a presence check.",
+        )
+    return True
 
 
 async def _delete_from_mirror(image_id: uuid.UUID) -> None:
@@ -547,7 +611,46 @@ async def upload_upgrade_image(
             select(ApplianceUpgradeImage).where(ApplianceUpgradeImage.sha256 == expected_sha)
         )
     ).scalar_one_or_none()
+
+    async def _file_iter() -> AsyncIterator[bytes]:
+        while True:
+            chunk = await file.read(_CHUNK_BYTES)
+            if not chunk:
+                return
+            yield chunk
+
     if existing is not None:
+        # ...unless the bytes are GONE from the active store, in which
+        # case the short-circuit is the bug (#787). Re-uploading is the
+        # documented remedy after a promote flips the mirror on and its
+        # PVC starts empty, and it has to actually store something.
+        if not await _bytes_present_in_active_store(existing.id):
+            # Re-store under the EXISTING id, not a new one: appliance
+            # rows may already carry a ``desired_slot_image_url`` built
+            # from it, and a fresh id would leave those pointing at
+            # nothing while the operator watches a "successful" upload.
+            repaired = await _store_verified_image(existing.id, _file_iter(), expected_sha)
+            db.add(
+                AuditLog(
+                    user_id=current_user.id,
+                    user_display_name=current_user.display_name,
+                    auth_source=current_user.auth_source,
+                    action="appliance.upgrade_image_bytes_restored",
+                    resource_type="appliance_upgrade_image",
+                    resource_id=str(existing.id),
+                    resource_display=f"{existing.filename} ({existing.appliance_version})",
+                    result="success",
+                    new_value={"size_bytes": repaired, "sha256": expected_sha},
+                )
+            )
+            await db.commit()
+            logger.info(
+                "appliance_upgrade_image_bytes_restored",
+                image_id=str(existing.id),
+                size_bytes=repaired,
+                user=current_user.username,
+            )
+            return _row_to_schema(existing)
         # Drain + discard the upload body so the client doesn't see a
         # half-read socket (httpx waits for the server's read before
         # closing the request — stalling here on a stale connection
@@ -557,13 +660,6 @@ async def upload_upgrade_image(
         return _row_to_schema(existing)
 
     image_id = uuid.uuid4()
-
-    async def _file_iter() -> AsyncIterator[bytes]:
-        while True:
-            chunk = await file.read(_CHUNK_BYTES)
-            if not chunk:
-                return
-            yield chunk
 
     bytes_written = await _store_verified_image(image_id, _file_iter(), expected_sha)
 
@@ -717,17 +813,23 @@ async def import_upgrade_image_from_github(
             f"The .sha256 sidecar for {tag} did not contain a 64-char hex digest.",
         )
 
-    # 2. Idempotent short-circuit — already imported/uploaded this hash.
+    # 2. Idempotent short-circuit — already imported/uploaded this hash
+    #    AND the bytes are still in the active store. #787: re-importing
+    #    is the connected-install equivalent of re-uploading, so when the
+    #    store has lost them (a promote moved it to a fresh mirror PVC)
+    #    the import has to re-fetch rather than report success and do
+    #    nothing. Re-stores under the existing id so any already-stamped
+    #    ``desired_slot_image_url`` keeps resolving.
     existing = (
         await db.execute(
             select(ApplianceUpgradeImage).where(ApplianceUpgradeImage.sha256 == expected_sha)
         )
     ).scalar_one_or_none()
-    if existing is not None:
+    if existing is not None and await _bytes_present_in_active_store(existing.id):
         return _row_to_schema(existing)
 
     # 3. Stream-download the .raw.xz + store with verification.
-    image_id = uuid.uuid4()
+    image_id = existing.id if existing is not None else uuid.uuid4()
     try:
         async with httpx.AsyncClient(timeout=_MIRROR_HTTP_TIMEOUT, follow_redirects=True) as client:
             async with client.stream("GET", spec.image_asset_url) as resp:
@@ -748,22 +850,30 @@ async def import_upgrade_image_from_github(
             f"Failed to download the {tag} upgrade image from GitHub: {exc}",
         ) from exc
 
-    row = ApplianceUpgradeImage(
-        id=image_id,
-        filename=_github_asset_filename(spec.image_asset_url),
-        size_bytes=bytes_written,
-        sha256=expected_sha,
-        appliance_version=tag,
-        uploaded_by_user_id=current_user.id,
-        notes=f"Imported from GitHub release {tag}",
-    )
-    db.add(row)
+    if existing is not None:
+        # Bytes-only repair of a row we already had — keep its metadata
+        # (filename / notes / who staged it) rather than rewriting the
+        # provenance of an image the operator staged some other way.
+        row = existing
+        action = "appliance.upgrade_image_bytes_restored"
+    else:
+        row = ApplianceUpgradeImage(
+            id=image_id,
+            filename=_github_asset_filename(spec.image_asset_url),
+            size_bytes=bytes_written,
+            sha256=expected_sha,
+            appliance_version=tag,
+            uploaded_by_user_id=current_user.id,
+            notes=f"Imported from GitHub release {tag}",
+        )
+        db.add(row)
+        action = "appliance.upgrade_image_imported"
     db.add(
         AuditLog(
             user_id=current_user.id,
             user_display_name=current_user.display_name,
             auth_source=current_user.auth_source,
-            action="appliance.upgrade_image_imported",
+            action=action,
             resource_type="appliance_upgrade_image",
             resource_id=str(row.id),
             resource_display=f"{row.filename} ({tag})",
@@ -887,10 +997,62 @@ async def download_upgrade_image(
         )
 
     if settings.slot_image_mirror_url:
-        # #296 Phase B — bytes live on the mirror Deployment. Stream
-        # through. The mirror's 404 surfaces as 404 here; transport
-        # errors as 502.
-        return await _stream_download_from_mirror(row.id, filename=row.filename)
+        # #296 Phase B — bytes live on the mirror Deployment. Stream through.
+        #
+        # #787 — two of the three ways that can fail mean "the mirror cannot
+        # answer right now", not "this image is wrong", and this replica may
+        # be holding the exact bytes. Both are real now that the mirror is on
+        # the mandatory upgrade path of every multi-node appliance:
+        #
+        # * 404 — the image predates the promote that enabled the mirror, so
+        #   it is on this node's hostPath while the mirror's PVC is empty.
+        # * unreachable — the mirror's PVC is RWO local-path, so the single
+        #   pod is pinned to one node; losing that node leaves it Pending
+        #   indefinitely. Refusing to serve a local copy would make an
+        #   unrelated node loss block every upgrade in the fleet, including
+        #   the one that repairs it.
+        #
+        # A mirror that ANSWERS with an error is the third case and is NOT
+        # covered. It is alive and refusing or failing — a mismatched
+        # X-Mirror-Auth secret being the likely cause — which is a
+        # configuration fault that never self-heals. Falling back there would
+        # let nodes holding a stale local copy quietly succeed while the rest
+        # of the fleet 502s, so the fault would be discovered as an
+        # inexplicably half-working upgrade instead of an error. It surfaces.
+        #
+        # Serving local bytes in the two covered cases is not a correctness
+        # risk: the host runner verifies them against the sha256 stamped
+        # alongside the URL, and delete_upgrade_image now clears local copies
+        # too, so a deleted image cannot resurface here.
+        try:
+            return await _stream_download_from_mirror(row.id, filename=row.filename)
+        except MirrorUnavailable as exc:
+            local = _image_path(row.id)
+            if not local.exists():
+                raise HTTPException(
+                    status.HTTP_502_BAD_GATEWAY,
+                    f"Mirror download failed: {exc}",
+                ) from exc
+            logger.warning(
+                "appliance_upgrade_image_served_from_local_mirror_unreachable",
+                image_id=str(row.id),
+                error=str(exc)[:200],
+            )
+        except HTTPException as exc:
+            if exc.status_code != status.HTTP_404_NOT_FOUND:
+                raise
+            local = _image_path(row.id)
+            if not local.exists():
+                raise
+            logger.info(
+                "appliance_upgrade_image_served_from_local_after_mirror_miss",
+                image_id=str(row.id),
+            )
+        return FileResponse(
+            local,
+            media_type="application/octet-stream",
+            filename=row.filename,
+        )
 
     path = _image_path(row.id)
     if not path.exists():
@@ -924,14 +1086,27 @@ async def delete_upgrade_image(image_id: uuid.UUID, current_user: CurrentUser, d
         # the DB row delete below is the authoritative signal; stale
         # bytes on the mirror get reaped by the future prune task.
         await _delete_from_mirror(row.id)
-    else:
-        path = _image_path(row.id)
-        try:
-            path.unlink(missing_ok=True)
-        except OSError:
-            # Disk-side cleanup is best-effort — the row delete below
-            # is the authoritative "this image is gone" signal.
-            pass
+    # #787 — always sweep local FS too, not just on the no-mirror branch.
+    # The appliance keeps the slot-images hostPath mounted even with the
+    # mirror on (so a pre-promote image is still readable), which means a
+    # local copy can exist in mirror mode. Skipping it here would strand
+    # 1-4 GiB per deleted image on the seed's /var forever — the "future
+    # prune task" the mirror branch defers to does not exist, and would
+    # not cover local FS anyway. It also removes the stale-bytes hazard
+    # the download fallback would otherwise inherit: without this, a
+    # deleted image could still be served from a node's local copy.
+    try:
+        _image_path(row.id).unlink(missing_ok=True)
+    except OSError as exc:
+        # Disk-side cleanup is best-effort — the row delete below is the
+        # authoritative "this image is gone" signal. Logged rather than
+        # swallowed so a permission / read-only-mount problem is visible
+        # instead of quietly accumulating gigabytes.
+        logger.warning(
+            "upgrade_image_local_unlink_failed",
+            image_id=str(row.id),
+            error=str(exc),
+        )
     filename = row.filename
     version = row.appliance_version
     await db.delete(row)
