@@ -223,10 +223,15 @@ def _compute_desired(
         seen_networks.add(cidr)
         label = iface.description or iface.name
         desc_bits = [f"OPNsense interface {iface.name} ({iface.device})"]
+        # ``interfaces/overview/export`` carries the VLAN tag on the
+        # interface itself, so prefer it and fall back to joining
+        # ``vlan_settings/get`` by device name — which is all the
+        # ifconfig fallback path can offer.
         vlan = vlan_by_device.get(iface.device)
-        if vlan is not None and vlan.tag is not None:
-            desc_bits.append(f"VLAN {vlan.tag}")
-            if vlan.description:
+        tag = iface.vlan_tag if iface.vlan_tag is not None else (vlan.tag if vlan else None)
+        if tag is not None:
+            desc_bits.append(f"VLAN {tag}")
+            if vlan is not None and vlan.description:
                 desc_bits.append(vlan.description)
         subnets.append(
             _DesiredSubnet(
@@ -633,6 +638,50 @@ async def _apply_addresses(
             await _recompute_subnet_utilization(db, subnet_id)
 
 
+def _warn_on_dhcp_backends(
+    router: OPNsenseRouter,
+    lease_result: Any | None,
+    reservation_result: Any | None,
+    summary: ReconcileSummary,
+) -> None:
+    """Warn when DHCP mirroring is armed but nothing answered.
+
+    This is the #797 case made visible. The operator turned
+    ``mirror_dhcp_leases`` / ``mirror_static_mappings`` on, every request
+    returned a well-formed response, and the mirror stayed empty forever
+    — because on OPNsense 25.7+ the ISC endpoints this client used to be
+    the only consumer of simply do not exist. Zero rows from a backend
+    that answered is a fact about the firewall; zero rows because no
+    backend answered is a fact about our configuration, and only the
+    second one warrants telling somebody.
+
+    ``sources_forbidden`` is reported separately because it has a
+    different remedy: the backend is there, but the API user needs a
+    privilege (the Kea lease endpoints carry their own ACL entries —
+    opnsense/core#7770).
+    """
+    checks = (
+        ("DHCP leases", router.mirror_dhcp_leases, lease_result),
+        ("static reservations", router.mirror_static_mappings, reservation_result),
+    )
+    for label, enabled, result in checks:
+        if not enabled or result is None:
+            continue
+        if result.sources_forbidden:
+            summary.warnings.append(
+                f"{label}: the API user was refused by "
+                f"{', '.join(sorted(set(result.sources_forbidden)))} — grant that "
+                f"backend's page/lease privileges to the read-only user, or those "
+                f"rows will never mirror"
+            )
+        if not result.sources_found:
+            summary.warnings.append(
+                f"{label}: no DHCP backend responded (Kea, Dnsmasq and the legacy "
+                f"ISC endpoints are all absent, disabled, or not permitted for this "
+                f"API user) — nothing can be mirrored while this is true"
+            )
+
+
 # ── Entry point ───────────────────────────────────────────────────────
 
 
@@ -668,8 +717,10 @@ async def reconcile_router(db: AsyncSession, router: OPNsenseRouter) -> Reconcil
             firmware = await client.get_firmware()
             interfaces = await client.list_interfaces()
             vlans = await client.list_vlans()
-            leases = await client.list_leases() if router.mirror_dhcp_leases else []
-            reservations = await client.list_reservations() if router.mirror_static_mappings else []
+            lease_result = await client.list_leases() if router.mirror_dhcp_leases else None
+            reservation_result = (
+                await client.list_reservations() if router.mirror_static_mappings else None
+            )
             arp = await client.list_arp() if router.mirror_arp else []
     except OPNsenseClientError as exc:
         summary.error = str(exc)
@@ -680,6 +731,21 @@ async def reconcile_router(db: AsyncSession, router: OPNsenseRouter) -> Reconcil
             "opnsense_reconcile_fetch_failed", router=str(router.id), error=summary.error
         )
         return summary
+
+    leases = lease_result.leases if lease_result is not None else []
+    reservations = reservation_result.reservations if reservation_result is not None else []
+    _warn_on_dhcp_backends(router, lease_result, reservation_result, summary)
+    if not interfaces:
+        # Every mirrored address needs an enclosing subnet, and subnets
+        # come only from interfaces — so zero interfaces silently zeroes
+        # the whole mirror downstream. (A malformed payload raises in the
+        # client; reaching here means the firewall really reported no
+        # addressed, enabled interface.)
+        summary.warnings.append(
+            "no addressed interfaces found — every mirrored address needs an "
+            "enclosing subnet, so nothing will be mirrored until at least one "
+            "interface reports a static IPv4/IPv6 address"
+        )
 
     summary.firmware_version = firmware.version
     summary.interface_count = len(interfaces)
@@ -696,6 +762,9 @@ async def reconcile_router(db: AsyncSession, router: OPNsenseRouter) -> Reconcil
 
     router.last_synced_at = datetime.now(UTC)
     router.last_sync_error = None
+    # #797 — persist the non-fatal findings. Cleared to NULL on a clean
+    # pass so a resolved warning doesn't linger as a stale amber chip.
+    router.last_sync_warning = "\n".join(summary.warnings) if summary.warnings else None
     router.firmware_version = summary.firmware_version
     router.interface_count = summary.interface_count
     router.lease_count = summary.lease_count
@@ -725,6 +794,7 @@ async def reconcile_router(db: AsyncSession, router: OPNsenseRouter) -> Reconcil
                     "deleted": summary.addresses_deleted,
                     "skipped_no_subnet": summary.skipped_no_subnet,
                 },
+                "warnings": summary.warnings,
             },
         )
     )
@@ -743,6 +813,12 @@ async def reconcile_router(db: AsyncSession, router: OPNsenseRouter) -> Reconcil
         addresses_created=summary.addresses_created,
         addresses_updated=summary.addresses_updated,
         addresses_deleted=summary.addresses_deleted,
+        # #797 — a pass that mirrors nothing used to log as an unqualified
+        # success. The warnings are the difference between "nothing to do"
+        # and "we asked the wrong endpoints", so they belong on the line an
+        # operator greps.
+        lease_sources=lease_result.sources_found if lease_result is not None else [],
+        warnings=summary.warnings,
     )
     return summary
 

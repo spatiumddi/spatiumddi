@@ -579,8 +579,8 @@ backend/alembic/versions/e1f2a3b4c5d6_subnet_ddns_fields.py:drop_column:66
 backend/alembic/versions/e2a6f3b8c1d4_add_auto_from_lease_to_ipaddress.py:drop_column:33
 backend/alembic/versions/e2b9c4f1a7d6_address_sets.py:drop_table:102
 backend/alembic/versions/e2c91d5f7a48_appliance_pairing_codes.py:drop_table:126
-backend/alembic/versions/e3b7a1c25d94_clear_upgrade_command.py:drop_column:55
-backend/alembic/versions/e3b7a1c25d94_clear_upgrade_command.py:drop_column:56
+backend/alembic/versions/e3b7a1c25d94_clear_upgrade_command.py:drop_column:58
+backend/alembic/versions/e3b7a1c25d94_clear_upgrade_command.py:drop_column:59
 backend/alembic/versions/e3f1c92a4d68_compliance_change_alerts.py:drop_column:59
 backend/alembic/versions/e3f1c92a4d68_compliance_change_alerts.py:drop_column:60
 backend/alembic/versions/e3f1c92a4d68_compliance_change_alerts.py:drop_column:61
@@ -725,6 +725,7 @@ backend/alembic/versions/f4a1c9e072d5_panos_integration.py:drop_table:213
 backend/alembic/versions/f4a1c9e7b2d8_appliance_host_config_health.py:drop_column:43
 backend/alembic/versions/f4a6c8b2e571_bgp_communities.py:drop_table:83
 backend/alembic/versions/f4a9c1b2d6e7_dns_zone_color.py:drop_column:33
+backend/alembic/versions/f4c81a37e0b2_opnsense_last_sync_warning.py:drop_column:36
 backend/alembic/versions/f4e1d2a09b75_lease_history_and_nat.py:drop_column:171
 backend/alembic/versions/f4e1d2a09b75_lease_history_and_nat.py:drop_table:169
 backend/alembic/versions/f4e1d2a09b75_lease_history_and_nat.py:drop_table:178

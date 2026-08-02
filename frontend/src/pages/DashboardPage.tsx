@@ -2340,9 +2340,15 @@ function integrationDotCls(
   lastSyncedAt: string | null,
   lastSyncError: string | null,
   intervalSeconds: number,
+  lastSyncWarning?: string | null,
 ): string {
   if (lastSyncError) return "bg-red-500";
   if (!lastSyncedAt) return "bg-muted-foreground/40";
+  // #797 — a pass can be on time and error-free and still mirror nothing
+  // (no DHCP backend on the firmware, credentials refused by one backend).
+  // Amber rather than green, or the dashboard vouches for an integration
+  // that has never produced a row.
+  if (lastSyncWarning) return "bg-amber-500";
   const age = (Date.now() - new Date(lastSyncedAt).getTime()) / 1000;
   // Amber when the last sync is older than ~3 intervals — implies the
   // reconcile beat sweep is stalled or the target is unreachable.
@@ -2619,6 +2625,7 @@ function IntegrationsPanel({
                       }
                       lastSyncedAt={r.last_synced_at}
                       lastSyncError={r.last_sync_error}
+                      lastSyncWarning={r.last_sync_warning}
                       intervalSeconds={r.sync_interval_seconds}
                       enabled={r.enabled}
                     />
@@ -2951,6 +2958,7 @@ function IntegrationRow({
   meta,
   lastSyncedAt,
   lastSyncError,
+  lastSyncWarning,
   intervalSeconds,
   enabled,
 }: {
@@ -2960,17 +2968,24 @@ function IntegrationRow({
   meta: string;
   lastSyncedAt: string | null;
   lastSyncError: string | null;
+  // Optional — only integrations that compute non-fatal findings pass it.
+  lastSyncWarning?: string | null;
   intervalSeconds: number;
   enabled: boolean;
 }) {
   const dotCls = !enabled
     ? "bg-muted-foreground/40"
-    : integrationDotCls(lastSyncedAt, lastSyncError, intervalSeconds);
+    : integrationDotCls(
+        lastSyncedAt,
+        lastSyncError,
+        intervalSeconds,
+        lastSyncWarning,
+      );
   return (
     <Link
       to={to}
       className="flex items-center gap-3 px-4 py-2 text-[11px] hover:bg-muted/30"
-      title={lastSyncError ?? undefined}
+      title={lastSyncError ?? lastSyncWarning ?? undefined}
     >
       <span className={cn("h-1.5 w-1.5 flex-shrink-0 rounded-full", dotCls)} />
       <span className="w-28 truncate font-semibold" title={name}>

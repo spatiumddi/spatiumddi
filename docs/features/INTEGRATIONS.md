@@ -470,12 +470,41 @@ OPNsense API keys are minted per-user under **System → Access → Users → AP
 
 ### Mirror semantics
 
-- **Interfaces are real LANs.** Unlike Kubernetes pod CIDRs (routed overlays with no broadcast), OPNsense LAN / OPT* / VLAN interfaces are genuine subnets: the firewall's interface IP is the gateway and the broadcast is real. So subnets are created with normal LAN semantics (gateway reserved, network + broadcast excluded from usable hosts). Interface config comes from `diagnostics/interface/getInterfaceConfig`; VLAN labels from `interfaces/vlan_settings/get` decorate the subnet description.
+- **Interfaces are real LANs.** Unlike Kubernetes pod CIDRs (routed overlays with no broadcast), OPNsense LAN / OPT* / VLAN interfaces are genuine subnets: the firewall's interface IP is the gateway and the broadcast is real. So subnets are created with normal LAN semantics (gateway reserved, network + broadcast excluded from usable hosts). Interface config comes from `interfaces/overview/export`, which carries the logical identifier, the operator's description and the VLAN tag in one payload; `diagnostics/interface/getInterfaceConfig` is the fallback on firmware that lacks it, and `interfaces/vlan_settings/get` still supplies VLAN labels on that path. Interfaces that are administratively disabled, or whose address is DHCP-assigned, are skipped — they don't describe a subnet this IPAM should own. Only the primary address per family is mirrored; secondaries and VIPs are ignored.
 - **Interface gateway IP** → one `reserved` `IPAddress` per subnet under the firewall's identity.
-- **DHCPv4 leases** (`dhcpv4/leases/searchLease`) → `IPAddress` with `status="dhcp"` + `auto_from_lease=True` (Kea-shape parity), description noting the lease state.
-- **Static reservations** (`dhcpv4/settings/getReservation`) → `IPAddress` with `status="reserved"`. Added before leases so an IP that has both prefers the richer reservation description.
+- **DHCPv4 leases** → `IPAddress` with `status="dhcp"` + `auto_from_lease=True` (Kea-shape parity), description noting the lease state. Sourced from every DHCP backend present (see below).
+- **Static reservations** → `IPAddress` with `status="reserved"`. Added before leases so an IP that has both prefers the richer reservation description.
 - **ARP table** (`diagnostics/interface/getArp`, opt-in) → `IPAddress` with `status="opnsense-arp"`, lowest priority.
 - **Smart parent block**: a mirrored CIDR with no enclosing operator block gets the canonical RFC 1918 / CGNAT supernet auto-created as an unowned top-level block (shared by all integrations).
+
+### DHCP backends
+
+OPNsense has shipped three DHCPv4 servers across the supported firmware range, and which one answers depends on both the version and what the operator configured. ISC `dhcpd` was deprecated through 24.x / 25.1 and **moved out of core to a plugin in 25.7** ([opnsense/core#9155](https://github.com/opnsense/core/issues/9155)), with Dnsmasq becoming the wizard default and Kea the advanced option.
+
+| Backend | Leases | Reservations | Present on |
+|---|---|---|---|
+| **Kea** | `kea/leases4/search` | `kea/dhcpv4/searchReservation` | 24.x+ when enabled |
+| **Dnsmasq** | `dnsmasq/leases/search` | `dnsmasq/settings/searchHost` (rows with a MAC) | 25.7+ default |
+| **ISC** (legacy) | `dhcpv4/leases/searchLease` | `dhcpv4/settings/getReservation` | core ≤25.1; 25.7+ only with the plugin |
+
+SpatiumDDI queries **all three every pass and unions the results** rather than making the operator pick — 25.7+ can genuinely run Kea and Dnsmasq side by side on different interfaces. A backend that 404s is simply absent and contributes nothing; a 5xx or timeout still aborts the pass, so a transient failure can never be mistaken for an empty lease table.
+
+A Dnsmasq "host" doubles as a static DNS entry, so only rows carrying a MAC are mirrored as reservations. Kea reports lease state numerically (`0` = active); it is normalised to the same vocabulary the ISC path produces.
+
+> **Why this is called out at such length.** Until [#797](https://github.com/spatiumddi/spatiumddi/issues/797) this integration queried the ISC endpoints *only*. On any 25.7+ firewall they 404, the client treated that as an empty table, and the sync reported success with zero leases on every pass — indefinitely, and with nothing in the UI to suggest anything was wrong.
+
+### When a sync succeeds but mirrors nothing
+
+`last_sync_warning` records non-fatal findings from the last pass and surfaces as an amber line beside the sync time (red `last_sync_error` still means the pass failed outright). It fires when:
+
+- **No DHCP backend responded** — Kea, Dnsmasq and ISC are all absent, disabled, or not permitted. Nothing can mirror while this is true.
+- **A backend refused the API user (403)** — the backend exists but the credentials lack its privilege. Different remedy: grant the privilege rather than change firmware.
+- **No addressed interfaces were found** — every mirrored address needs an enclosing subnet, so zero interfaces zeroes the whole mirror downstream.
+- **A subnet or address is owned by another integration** and was therefore not claimed.
+
+A backend that answered and had nothing to report is a genuine zero and does **not** warn — otherwise the signal would fire on every quiet firewall and be trained away as noise.
+
+Separately, a non-empty interface payload that parses to zero interfaces is treated as a **degraded read** and fails the pass rather than reporting an empty mirror. That combination means the response shape isn't the one this client parses, which is exactly how #797 stayed invisible.
 
 ### Lock semantics
 
@@ -486,8 +515,20 @@ Same ownership shape as the other integrations: pre-existing operator rows at a 
 The admin page at `/opnsense` ships a copy-paste guide (expand **Setup guide**). In the OPNsense web UI:
 
 1. Create a dedicated read-only user (**System → Access → Users → +**), e.g. `spatiumddi` with no shell access.
-2. Grant it read access — the built-in **GUI – All pages (read only)** privilege is simplest, or scope it to Diagnostics + DHCPv4 + Interfaces for least privilege.
+2. Grant it read access — the built-in **GUI – All pages (read only)** privilege is simplest, or scope it for least privilege (table below).
 3. Edit the user → **API keys → +** to generate a key / secret pair. OPNsense downloads an `apikey.txt` with `key=` and `secret=` lines.
+
+**Least-privilege scoping.** Grant the pages matching what you're mirroring:
+
+| Mirrors | Privileges needed |
+|---|---|
+| Interfaces → subnets | Interfaces: Overview, Interfaces: VLAN, Diagnostics: Interface |
+| DHCP leases + reservations (Kea) | Services: Kea DHCP, **plus Kea's own lease privileges** |
+| DHCP leases + reservations (Dnsmasq) | Services: Dnsmasq DNS/DHCP |
+| DHCP leases + reservations (ISC, legacy) | Services: DHCPv4 |
+| ARP table (opt-in) | Diagnostics: ARP Table |
+
+The Kea lease and service endpoints carry **separate ACL entries** from the Kea settings pages ([opnsense/core#7770](https://github.com/opnsense/core/issues/7770)), so a user granted only the Kea page still gets 403 on the leases. SpatiumDDI does not fail the pass for this — the interface mirror keeps working — but it raises a `last_sync_warning` naming the backend, because the alternative is leases that silently never appear.
 
 Paste `key` into **API Key** and `secret` into **API Secret**. **Test Connection** (`POST /routers/test`) verifies HTTPS reachability + auth + firmware version before save.
 

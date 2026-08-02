@@ -250,6 +250,19 @@ export function OpnsensePage() {
                               {r.last_sync_error}
                             </div>
                           )}
+                          {/* #797 — a pass can succeed and still mirror
+                              nothing. Amber, below any red error, with the
+                              full multi-line text on hover. */}
+                          {!r.last_sync_error && r.last_sync_warning && (
+                            <div
+                              className="text-[11px] text-amber-600 dark:text-amber-500 max-w-xs truncate"
+                              title={r.last_sync_warning}
+                            >
+                              {r.last_sync_warning.split("\n")[0]}
+                              {r.last_sync_warning.includes("\n") &&
+                                ` (+${r.last_sync_warning.split("\n").length - 1} more)`}
+                            </div>
+                          )}
                         </td>
                         <td className="whitespace-nowrap px-3 py-2">
                           <button

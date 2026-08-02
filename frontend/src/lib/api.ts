@@ -12435,6 +12435,11 @@ export interface OPNsenseRouter {
   sync_interval_seconds: number;
   last_synced_at: string | null;
   last_sync_error: string | null;
+  // #797 — non-fatal findings from the last pass, newline-joined. A sync
+  // can report ok and still mirror nothing (no DHCP backend on the
+  // firmware, a subnet another integration already owns); this is what
+  // distinguishes that from a genuinely idle firewall.
+  last_sync_warning: string | null;
   firmware_version: string | null;
   interface_count: number | null;
   lease_count: number | null;

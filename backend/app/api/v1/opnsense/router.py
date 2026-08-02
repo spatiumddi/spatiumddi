@@ -138,6 +138,9 @@ class RouterResponse(BaseModel):
     sync_interval_seconds: int
     last_synced_at: datetime | None
     last_sync_error: str | None
+    # #797 — non-fatal findings from the last pass, newline-joined.
+    # A sync can be green and still mirror nothing; this is what says why.
+    last_sync_warning: str | None
     firmware_version: str | None
     interface_count: int | None
     lease_count: int | None
@@ -184,6 +187,7 @@ def _to_response(r: OPNsenseRouter) -> RouterResponse:
         sync_interval_seconds=r.sync_interval_seconds,
         last_synced_at=r.last_synced_at,
         last_sync_error=r.last_sync_error,
+        last_sync_warning=r.last_sync_warning,
         firmware_version=r.firmware_version,
         interface_count=r.interface_count,
         lease_count=r.lease_count,
@@ -487,6 +491,12 @@ async def test_connection(
         if stored is not None:
             stored.firmware_version = result.firmware_version
             stored.last_sync_error = None
+            # last_sync_warning is deliberately NOT cleared here. The probe
+            # only proves the credentials reach the firmware endpoint; it
+            # says nothing about whether a DHCP backend exists or whether
+            # a subnet is claimable. Clearing it on a green Test Connection
+            # would hide exactly the #797 condition the field exists for,
+            # until the next reconcile pass re-derived it.
             await db.commit()
 
     return result

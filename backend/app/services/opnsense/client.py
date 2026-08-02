@@ -1,18 +1,22 @@
 """Minimal async OPNsense REST client.
 
-Endpoints consumed (all read-only):
+Endpoints consumed (all read-only unless noted):
 
 * ``GET  /api/core/firmware/status`` — sanity + firmware version.
-* ``POST /api/dhcpv4/leases/searchLease`` — DHCPv4 leases. OPNsense's
-  search endpoints return a ``{rows: [...], total, ...}`` envelope.
-* ``GET  /api/dhcpv4/settings/getReservation`` — static mappings (the
-  ISC ``dhcpd`` ``getReservation`` shape returns
-  ``{dhcpd: {<iface>: {staticmap: {...}}}}`` or a ``rows[]`` wrapper
-  on newer firmwares; we handle both defensively).
-* ``GET  /api/diagnostics/interface/getInterfaceConfig`` — per-interface
-  config keyed by interface name, each carrying addresses / CIDRs.
+* ``GET  /api/interfaces/overview/export`` — the primary interface read.
+  A list of interfaces carrying ``identifier`` (``lan`` / ``opt1``),
+  ``description``, ``device``, ``link_type``, ``vlan_tag`` and the
+  ``ipv4[]`` / ``ipv6[]`` address arrays.
+* ``GET  /api/diagnostics/interface/getInterfaceConfig`` — fallback
+  interface read. A passthrough of configd ``interface list ifconfig``,
+  so it is keyed by **OS device** with the same ``ipv4[]`` / ``ipv6[]``
+  arrays, but no logical name and no description.
 * ``GET  /api/interfaces/vlan_settings/get`` — VLAN definitions
-  (``vlan.vlan.<uuid>`` rows with parent / tag / description).
+  (``vlan.vlan.<uuid>`` rows with parent / tag / description). Only
+  needed for the fallback path now that the overview carries the tag.
+* DHCPv4 leases + reservations, unioned across three backends —
+  ``/api/kea/*``, ``/api/dnsmasq/*`` and the legacy ISC
+  ``/api/dhcpv4/*``. See the "DHCP backends" comment below.
 * ``GET  /api/diagnostics/interface/getArp`` — ARP table (secondary
   population, opt-in).
 
@@ -20,11 +24,26 @@ Auth is HTTP Basic: the API key is the username and the API secret is
 the password. OPNsense API keys are minted per-user under System →
 Access → Users → API keys.
 
-Defensive parsing throughout — OPNsense response shapes vary across
-firmware versions and we can't hit a real box in tests, so every
-accessor guards missing keys / unexpected types and the
-``rows[]``-wrapper convention is handled in one place
+Defensive parsing throughout — response shapes vary across firmware
+versions, so every accessor guards missing keys / unexpected types and
+the ``rows[]``-wrapper convention is handled in one place
 (``_unwrap_rows``).
+
+A word on why the parsers below are shaped the way they are (#797).
+This client was originally written without a live firewall to test
+against, and the interface parser was written against an invented
+response shape — flat ``ipaddr`` / ``subnet`` string keys on a
+logical-name-keyed dict — that ``getInterfaceConfig`` has never
+returned. The fiction was encoded in the unit-test fixtures too, so the
+tests passed while the integration mirrored nothing on every real box.
+Two rules came out of that and are worth keeping:
+
+1. Fixtures are copied from real firewalls, not imagined. The shapes in
+   ``tests/test_opnsense_client.py`` are captured payloads.
+2. A non-empty payload that parses to zero rows is treated as a
+   degraded read and raises, rather than being reported as a
+   legitimately-empty result. Silence is the failure mode that let the
+   original bug live indefinitely.
 """
 
 from __future__ import annotations
@@ -81,6 +100,11 @@ class _OPNInterface:
     description: str
     cidr: str  # network CIDR (10.0.0.0/24)
     address: str  # the firewall's own interface IP (10.0.0.1)
+    # Carried natively by ``interfaces/overview/export``; ``None`` when
+    # the interface isn't a VLAN, or when the fallback ifconfig parser
+    # supplied this row (it has no VLAN linkage). The reconciler prefers
+    # this over joining ``vlan_settings/get`` by device name.
+    vlan_tag: int | None = None
 
 
 @dataclass
@@ -95,7 +119,7 @@ class _OPNVlan:
 
 @dataclass
 class _OPNLease:
-    """A DHCPv4 lease row from ``dhcpv4/leases/searchLease``."""
+    """A DHCPv4 lease row, normalised across the three DHCP backends."""
 
     address: str
     mac: str | None
@@ -105,12 +129,52 @@ class _OPNLease:
 
 @dataclass
 class _OPNReservation:
-    """A static DHCP mapping from ``dhcpv4/settings/getReservation``."""
+    """A static DHCP mapping, normalised across the three DHCP backends."""
 
     address: str
     mac: str | None
     hostname: str
     description: str
+
+
+@dataclass
+class _OPNLeaseResult:
+    """Leases plus *which backends answered*.
+
+    The counts alone can't distinguish "DHCP is off" from "we asked a
+    firmware that no longer has these endpoints" — the ambiguity that
+    let #797 report a successful sync with zero results on every pass
+    for as long as the integration existed. ``sources_found`` empty
+    means no DHCP backend was reachable at all.
+
+    ``sources_forbidden`` lists backends that exist but returned 403.
+    The Kea lease endpoints carry their own ACL entries
+    (opnsense/core#7770), so a minimal read-only API user hits this and
+    needs a privilege added rather than a firmware change.
+    """
+
+    leases: list[_OPNLease]
+    sources_found: list[str]
+    sources_forbidden: list[str]
+
+
+@dataclass
+class _OPNReservationResult:
+    """Reservations plus which backends answered. See ``_OPNLeaseResult``."""
+
+    reservations: list[_OPNReservation]
+    sources_found: list[str]
+    sources_forbidden: list[str]
+
+
+# Kea reports lease state as a number (kea-dhcp4 lease states); map it to
+# the same vocabulary the ISC path yields so the reconciler has one
+# concept of "active" rather than a backend-specific digit.
+_KEA_LEASE_STATE = {
+    "0": "active",
+    "1": "declined",
+    "2": "expired",
+}
 
 
 @dataclass
@@ -193,6 +257,175 @@ def _network_cidr(address: str, prefix: Any) -> str | None:
         return None
 
 
+def _truthy(value: Any) -> bool:
+    """OPNsense mixes booleans, ``"1"``/``"0"`` and ``"yes"``/``"no"``
+    for the same field across endpoints. Treat all three uniformly.
+    """
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _addresses_from_arrays(cfg: dict[str, Any]) -> tuple[list[tuple[str, str]], bool]:
+    """Pull ``(address, network_cidr)`` pairs out of an interface entry.
+
+    Both ``interfaces/overview/export`` and the ``getInterfaceConfig``
+    passthrough carry addresses the same way — ``ipv4`` / ``ipv6`` lists
+    of ``{"ipaddr": "10.0.0.1", "subnetbits": 24}``. Only the first
+    usable entry per family is returned: on OPNsense the first is the
+    primary and the rest are VIPs / secondaries, which would otherwise
+    mirror as extra subnets nobody asked for.
+
+    The second return value reports whether this entry carried an
+    address *container* at all (an ``ipv4``/``ipv6`` key holding a
+    list), regardless of whether anything usable was inside it. The
+    caller uses it to tell "this firewall genuinely has no addressed
+    interfaces" apart from "the response shape is not what we parse" —
+    the distinction that #797 turned on, where a valid 200 parsed to
+    zero and the integration reported success forever.
+    """
+    out: list[tuple[str, str]] = []
+    saw_container = False
+    for family in ("ipv4", "ipv6"):
+        entries = cfg.get(family)
+        if not isinstance(entries, list):
+            continue
+        saw_container = True
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            addr = str(entry.get("ipaddr") or "").strip()
+            if not addr:
+                continue
+            # Link-local addresses are per-link, not a routable subnet
+            # worth mirroring; they also collide across every interface.
+            if addr.lower().startswith("fe80:"):
+                continue
+            # A tunnel endpoint's "subnet" is the peer address, not a
+            # LAN — mirroring it would invent a subnet that isn't one.
+            if _truthy(entry.get("tunnel")):
+                continue
+            cidr = _network_cidr(addr, entry.get("subnetbits"))
+            if cidr is None:
+                continue
+            out.append((addr, cidr))
+            break  # primary only
+    return out, saw_container
+
+
+def _assert_interface_shape(entries: int, saw_any_container: bool, source: str) -> None:
+    """Raise when a non-empty interface payload carried no address
+    container on any entry.
+
+    That combination means the response shape is not the one we parse —
+    the #797 failure, where ``getInterfaceConfig`` returned a full,
+    valid 200 keyed by device with ``ipv4[]`` arrays while the parser
+    looked for flat ``ipaddr``/``subnet`` string keys, matched nothing,
+    and reported a successful sync with zero interfaces on every pass
+    for as long as the integration existed.
+
+    Raising (rather than returning ``[]``) routes this into the same
+    degraded-read handling as #430/#426: the reconciler aborts the pass
+    and surfaces the error instead of diffing against an empty desired
+    set and absence-deleting every mirrored subnet.
+
+    A payload whose entries DO carry ``ipv4``/``ipv6`` lists that are
+    simply empty is a legitimate zero — a firewall with only DHCP/
+    unconfigured interfaces — and returns cleanly.
+    """
+    if entries and not saw_any_container:
+        raise OPNsenseClientError(
+            f"{source} returned {entries} interface entries but none carried an "
+            "ipv4/ipv6 address list — the response shape is not the one this "
+            "client parses. Treating as a degraded read rather than zero "
+            "interfaces."
+        )
+
+
+def _interfaces_from_overview(data: Any) -> list[_OPNInterface]:
+    """Parse ``GET /api/interfaces/overview/export``.
+
+    Returns one entry per addressed, enabled interface. This is the
+    richest source: it is the only one carrying the logical identifier
+    (``lan`` / ``opt1``), the operator's description and the VLAN tag
+    alongside the addresses.
+    """
+    rows = _unwrap_rows(data)
+    out: list[_OPNInterface] = []
+    saw_any_container = False
+    for cfg in rows:
+        # ``enabled`` absent means "not reported" — mirror it rather than
+        # assume disabled, since only some firmwares emit the key.
+        if "enabled" in cfg and not _truthy(cfg.get("enabled")):
+            continue
+        # Dynamically-addressed and unconfigured interfaces don't
+        # describe a subnet this IPAM should own.
+        if str(cfg.get("link_type") or "").strip().lower() in {"dhcp", "none"}:
+            continue
+        pairs, saw_container = _addresses_from_arrays(cfg)
+        saw_any_container = saw_any_container or saw_container
+        device = str(cfg.get("device") or "")
+        name = str(cfg.get("identifier") or "") or device
+        for addr, cidr in pairs:
+            out.append(
+                _OPNInterface(
+                    name=name,
+                    device=device or name,
+                    description=str(cfg.get("description") or ""),
+                    cidr=cidr,
+                    address=addr,
+                    vlan_tag=_coerce_vlan_tag(cfg.get("vlan_tag")),
+                )
+            )
+    _assert_interface_shape(len(rows), saw_any_container, "interfaces/overview/export")
+    return out
+
+
+def _interfaces_from_ifconfig(data: Any) -> list[_OPNInterface]:
+    """Parse ``GET /api/diagnostics/interface/getInterfaceConfig``.
+
+    A passthrough of the configd command ``interface list ifconfig``,
+    so the payload is keyed by **OS device** and carries no logical name
+    and no description. Only used when ``overview/export`` is absent;
+    subnet names fall back to the device.
+    """
+    if not isinstance(data, dict) or not data:
+        raise OPNsenseClientError(
+            "getInterfaceConfig returned no interfaces — treating as a "
+            "degraded read, not zero interfaces"
+        )
+    out: list[_OPNInterface] = []
+    saw_any_container = False
+    for device_key, cfg in data.items():
+        if not isinstance(cfg, dict):
+            continue
+        pairs, saw_container = _addresses_from_arrays(cfg)
+        saw_any_container = saw_any_container or saw_container
+        device = str(cfg.get("device") or device_key)
+        for addr, cidr in pairs:
+            out.append(
+                _OPNInterface(
+                    name=device,
+                    device=device,
+                    description="",
+                    cidr=cidr,
+                    address=addr,
+                    vlan_tag=None,
+                )
+            )
+    _assert_interface_shape(len(data), saw_any_container, "getInterfaceConfig")
+    return out
+
+
+def _coerce_vlan_tag(raw: Any) -> int | None:
+    if raw in (None, "", []):
+        return None
+    try:
+        return int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+
+
 class OPNsenseClient:
     """Per-firewall async client. One instance per reconcile pass.
 
@@ -215,6 +448,11 @@ class OPNsenseClient:
         self._verify_tls = verify_tls
         self._ca_bundle_pem = ca_bundle_pem.strip()
         self._client: httpx.AsyncClient | None = None
+        # Backends that answered 403 during the current list_* call.
+        # Reset at the top of each, read into the result so the
+        # reconciler can warn about a privilege gap rather than silently
+        # mirroring nothing.
+        self._forbidden: list[str] = []
 
     async def __aenter__(self) -> OPNsenseClient:
         verify: Any
@@ -298,49 +536,42 @@ class OPNsenseClient:
     async def list_interfaces(self) -> list[_OPNInterface]:
         """Configured interfaces that carry at least one IPv4/IPv6 CIDR.
 
-        ``getInterfaceConfig`` returns a dict keyed by logical interface
-        name. Each entry carries ``ipaddr`` / ``subnet`` (IPv4) and/or
-        ``ipaddr6`` / ``subnet6`` (IPv6), plus ``device`` + ``descr``.
-        Interfaces without an address (or set to ``dhcp`` / ``none``)
-        contribute nothing.
+        Primary source is ``GET /api/interfaces/overview/export``, which
+        is the only endpoint that carries the logical name (``lan`` /
+        ``opt1``), the operator's ``description`` and the ``vlan_tag`` in
+        the same payload as the addresses. Falls back to
+        ``diagnostics/interface/getInterfaceConfig`` (device-keyed, no
+        logical name) when the overview endpoint is absent.
+
+        Both shapes carry addresses as ``ipv4[]`` / ``ipv6[]`` arrays of
+        ``{ipaddr, subnetbits}``. The first entry is treated as the
+        primary address; secondaries / VIPs are ignored for now.
+
+        Raises rather than returning ``[]`` when a non-empty payload
+        parses to zero interfaces — see ``_interfaces_from_overview``.
+        """
+        try:
+            data = await self._get("/api/interfaces/overview/export")
+        except OPNsenseClientError as exc:
+            if exc.status_code != 404:
+                raise
+            # Endpoint absent (very old firmware). Fall back to the
+            # diagnostics passthrough, which every supported release has.
+            logger.debug("opnsense_overview_export_absent", error=str(exc))
+            return await self._list_interfaces_via_diagnostics()
+        return _interfaces_from_overview(data)
+
+    async def _list_interfaces_via_diagnostics(self) -> list[_OPNInterface]:
+        """Fallback interface read via ``getInterfaceConfig``.
+
+        This endpoint is a passthrough of the configd command
+        ``interface list ifconfig``, so it is keyed by **OS device**
+        (``igc0``) and carries no logical name and no description — the
+        mirrored subnet names are correspondingly poorer. Used only when
+        ``interfaces/overview/export`` 404s.
         """
         data = await self._get("/api/diagnostics/interface/getInterfaceConfig")
-        # #430 — getInterfaceConfig always returns a non-empty dict keyed by
-        # logical interface name; a non-dict or empty-dict 200 (proxy error
-        # body, envelope change) is a degraded read. Returning [] here would
-        # absence-delete every router-owned interface subnet. Matches the
-        # #426 reasoning already applied to list_leases/list_arp.
-        if not isinstance(data, dict) or not data:
-            raise OPNsenseClientError(
-                "getInterfaceConfig returned no interfaces — treating as a "
-                "degraded read, not zero interfaces"
-            )
-        out: list[_OPNInterface] = []
-        for logical, cfg in data.items():
-            if not isinstance(cfg, dict):
-                continue
-            device = str(cfg.get("device") or cfg.get("if") or logical)
-            descr = str(cfg.get("descr") or cfg.get("description") or "")
-            for addr_key, prefix_key in (("ipaddr", "subnet"), ("ipaddr6", "subnet6")):
-                addr = cfg.get(addr_key)
-                if not isinstance(addr, str) or not addr:
-                    continue
-                # Skip dynamic / unconfigured markers.
-                if addr.lower() in {"dhcp", "none", "dhcp6", "track6", "slaac"}:
-                    continue
-                cidr = _network_cidr(addr, cfg.get(prefix_key))
-                if cidr is None:
-                    continue
-                out.append(
-                    _OPNInterface(
-                        name=str(logical),
-                        device=device,
-                        description=descr,
-                        cidr=cidr,
-                        address=addr,
-                    )
-                )
-        return out
+        return _interfaces_from_ifconfig(data)
 
     async def list_vlans(self) -> list[_OPNVlan]:
         """VLAN definitions. Empty list on 404 / 403 / no VLANs.
@@ -387,15 +618,110 @@ class OPNsenseClient:
             )
         return out
 
-    async def list_leases(self) -> list[_OPNLease]:
-        """DHCPv4 leases via the ``searchLease`` POST endpoint.
+    # ── DHCP backends ────────────────────────────────────────────────
+    #
+    # OPNsense has had three DHCPv4 servers over the supported range, and
+    # which one answers depends on the firmware AND on what the operator
+    # configured:
+    #
+    #   ISC dhcpd  — core through 25.1, moved out to a plugin in 25.7
+    #                (opnsense/core#9155). ``/api/dhcpv4/*``.
+    #   Kea        — the "advanced" option from 24.x. ``/api/kea/*``.
+    #   Dnsmasq    — the factory/wizard default from 25.7. ``/api/dnsmasq/*``.
+    #
+    # 25.7+ can run Kea and Dnsmasq side by side on different interfaces,
+    # so this is a UNION, not first-hit-wins. Each source's absence (404)
+    # is normal and contributes nothing; anything else propagates, so a
+    # transient 5xx still aborts the pass rather than silently emptying
+    # the mirror (#5).
+    #
+    # ``sources_found`` on the result tells the reconciler whether any
+    # backend answered at all — the difference between "DHCP is off" and
+    # "we asked the wrong firewall version", which #797 could not express.
 
-        The POST body asks for a large page so we get the full table in
-        one call. Returns an empty list only on 404 (DHCP service not
-        enabled / endpoint absent). A 5xx / timeout / other failure is
-        re-raised so the reconciler aborts instead of mistaking a
-        transient error for an empty lease table and mass-deleting every
-        mirrored row (#5).
+    async def list_leases(self) -> _OPNLeaseResult:
+        """DHCPv4 leases, unioned across every backend present.
+
+        Deduplicated by address; the first backend to report an address
+        wins. Kea is queried first because it is the backend with the
+        richest row (interface name + description come back resolved).
+        """
+        by_address: dict[str, _OPNLease] = {}
+        sources: list[str] = []
+        self._forbidden = []
+        for source, fetch in (
+            ("kea", self._leases_kea),
+            ("dnsmasq", self._leases_dnsmasq),
+            ("isc", self._leases_isc),
+        ):
+            rows = await fetch()
+            if rows is None:
+                continue  # backend absent (or forbidden) on this firmware
+            sources.append(source)
+            for lease in rows:
+                by_address.setdefault(lease.address, lease)
+        return _OPNLeaseResult(
+            leases=list(by_address.values()),
+            sources_found=sources,
+            sources_forbidden=list(self._forbidden),
+        )
+
+    async def _leases_kea(self) -> list[_OPNLease] | None:
+        """``GET /api/kea/leases4/search``. ``None`` when Kea is absent.
+
+        Kea reports ``state`` numerically — ``0`` is active, ``1`` is
+        declined, ``2`` is expired-reclaimed — so it is mapped to the
+        same vocabulary the ISC path produces rather than passed through
+        as a digit the reconciler would not recognise.
+        """
+        body = await self._get_optional("/api/kea/leases4/search", "kea leases")
+        if body is None:
+            return None
+        out: list[_OPNLease] = []
+        for r in _unwrap_rows(body):
+            addr = str(r.get("address") or "").strip()
+            if not addr:
+                continue
+            out.append(
+                _OPNLease(
+                    address=addr,
+                    mac=_normalise_mac(r.get("hwaddr")),
+                    hostname=str(r.get("hostname") or "").strip(),
+                    state=_KEA_LEASE_STATE.get(str(r.get("state") or "").strip(), "unknown"),
+                )
+            )
+        return out
+
+    async def _leases_dnsmasq(self) -> list[_OPNLease] | None:
+        """``GET /api/dnsmasq/leases/search``. ``None`` when absent.
+
+        Dnsmasq does not report a lease state — a row in its lease file
+        is by definition a current lease, so they are all ``active``.
+        """
+        body = await self._get_optional("/api/dnsmasq/leases/search", "dnsmasq leases")
+        if body is None:
+            return None
+        out: list[_OPNLease] = []
+        for r in _unwrap_rows(body):
+            addr = str(r.get("address") or "").strip()
+            if not addr:
+                continue
+            out.append(
+                _OPNLease(
+                    address=addr,
+                    mac=_normalise_mac(r.get("hwaddr")),
+                    hostname=str(r.get("hostname") or "").strip(),
+                    state="active",
+                )
+            )
+        return out
+
+    async def _leases_isc(self) -> list[_OPNLease] | None:
+        """``POST /api/dhcpv4/leases/searchLease``. ``None`` when absent.
+
+        Legacy path — core ISC dhcpd on ≤25.1, and 25.7+ boxes that
+        installed the ISC plugin. The POST body asks for a large page so
+        the full table arrives in one call.
         """
         try:
             body = await self._post(
@@ -404,8 +730,8 @@ class OPNsenseClient:
             )
         except OPNsenseClientError as exc:
             if exc.status_code == 404:
-                logger.debug("opnsense_leases_unavailable", error=str(exc))
-                return []
+                logger.debug("opnsense_leases_backend_absent", backend="isc", error=str(exc))
+                return None
             raise
         out: list[_OPNLease] = []
         for r in _unwrap_rows(body):
@@ -423,23 +749,95 @@ class OPNsenseClient:
             )
         return out
 
-    async def list_reservations(self) -> list[_OPNReservation]:
-        """Static DHCP mappings.
+    async def list_reservations(self) -> _OPNReservationResult:
+        """Static DHCP mappings, unioned across every backend present.
 
-        ``getReservation`` returns the ISC ``dhcpd`` config tree on
-        older firmware (``{"dhcpd": {"<iface>": {"staticmap": {...}}}}``)
-        and a ``rows[]`` wrapper on newer ones. We flatten both shapes.
+        Deduplicated by address, first backend wins — same ordering
+        rationale as ``list_leases``.
+        """
+        by_address: dict[str, _OPNReservation] = {}
+        sources: list[str] = []
+        self._forbidden = []
+        for source, fetch in (
+            ("kea", self._reservations_kea),
+            ("dnsmasq", self._reservations_dnsmasq),
+            ("isc", self._reservations_isc),
+        ):
+            rows = await fetch()
+            if rows is None:
+                continue
+            sources.append(source)
+            for res in rows:
+                by_address.setdefault(res.address, res)
+        return _OPNReservationResult(
+            reservations=list(by_address.values()),
+            sources_found=sources,
+            sources_forbidden=list(self._forbidden),
+        )
 
-        Returns an empty list only on 404 (endpoint absent); a transient
-        5xx / timeout is re-raised so the reconciler doesn't diff against
-        an empty desired set and delete every mirrored reservation (#5).
+    async def _reservations_kea(self) -> list[_OPNReservation] | None:
+        """``GET /api/kea/dhcpv4/searchReservation``. ``None`` when absent."""
+        body = await self._get_optional("/api/kea/dhcpv4/searchReservation", "kea reservations")
+        if body is None:
+            return None
+        out: list[_OPNReservation] = []
+        for r in _unwrap_rows(body):
+            addr = str(r.get("ip_address") or "").strip()
+            if not addr:
+                continue
+            out.append(
+                _OPNReservation(
+                    address=addr,
+                    mac=_normalise_mac(r.get("hw_address")),
+                    hostname=str(r.get("hostname") or "").strip(),
+                    description=str(r.get("description") or "").strip(),
+                )
+            )
+        return out
+
+    async def _reservations_dnsmasq(self) -> list[_OPNReservation] | None:
+        """``GET /api/dnsmasq/settings/searchHost``. ``None`` when absent.
+
+        Dnsmasq "hosts" serve double duty — a host with no MAC is a
+        static DNS entry, and only one carrying a ``hwaddr`` is a DHCP
+        reservation. Rows without a MAC are dropped for that reason,
+        rather than mirrored as reservations they are not.
+        """
+        body = await self._get_optional("/api/dnsmasq/settings/searchHost", "dnsmasq reservations")
+        if body is None:
+            return None
+        out: list[_OPNReservation] = []
+        for r in _unwrap_rows(body):
+            addr = str(r.get("ip") or "").strip()
+            mac = _normalise_mac(r.get("hwaddr"))
+            if not addr or mac is None:
+                continue
+            host = str(r.get("host") or "").strip()
+            domain = str(r.get("domain") or "").strip()
+            out.append(
+                _OPNReservation(
+                    address=addr,
+                    mac=mac,
+                    hostname=f"{host}.{domain}" if host and domain else host,
+                    description=str(r.get("descr") or "").strip(),
+                )
+            )
+        return out
+
+    async def _reservations_isc(self) -> list[_OPNReservation] | None:
+        """``GET /api/dhcpv4/settings/getReservation``. ``None`` when absent.
+
+        Returns the ISC ``dhcpd`` config tree
+        (``{"dhcpd": {"<iface>": {"staticmap": {...}}}}``) on older
+        firmware and a ``rows[]`` wrapper on newer ones; both are
+        flattened here.
         """
         try:
             body = await self._get("/api/dhcpv4/settings/getReservation")
         except OPNsenseClientError as exc:
             if exc.status_code == 404:
-                logger.debug("opnsense_reservations_unavailable", error=str(exc))
-                return []
+                logger.debug("opnsense_reservations_backend_absent", backend="isc", error=str(exc))
+                return None
             raise
         rows: list[dict[str, Any]] = []
         if isinstance(body, dict) and "dhcpd" in body and isinstance(body["dhcpd"], dict):
@@ -469,6 +867,32 @@ class OPNsenseClient:
                 )
             )
         return out
+
+    async def _get_optional(self, path: str, label: str) -> Any | None:
+        """GET a path whose absence is expected on some firmwares.
+
+        Returns ``None`` on 404 (the module isn't installed / enabled) and
+        on 403 (the API user lacks the privilege — the Kea lease and
+        service endpoints carry their own ACL entries, opnsense/core#7770,
+        so a minimal read-only user will be refused there while the rest
+        of the mirror works). Everything else propagates, so a transient
+        5xx still aborts the pass instead of emptying the mirror.
+
+        The 403 case is logged at WARNING rather than DEBUG: unlike a 404
+        it means the operator has the backend but SpatiumDDI cannot read
+        it, which is a fixable misconfiguration they should see.
+        """
+        try:
+            return await self._get(path)
+        except OPNsenseClientError as exc:
+            if exc.status_code == 404:
+                logger.debug("opnsense_dhcp_backend_absent", source=label, error=str(exc))
+                return None
+            if exc.status_code == 403:
+                logger.warning("opnsense_dhcp_backend_forbidden", source=label, error=str(exc))
+                self._forbidden.append(label)
+                return None
+            raise
 
     # ── Write surface (active block sync #601, opt-in) ───────────────
     #
@@ -564,8 +988,13 @@ __all__ = [
     "_OPNFirmwareInfo",
     "_OPNInterface",
     "_OPNLease",
+    "_OPNLeaseResult",
     "_OPNReservation",
+    "_OPNReservationResult",
     "_OPNVlan",
+    "_addresses_from_arrays",
+    "_interfaces_from_ifconfig",
+    "_interfaces_from_overview",
     "_network_cidr",
     "_normalise_mac",
     "_unwrap_rows",
