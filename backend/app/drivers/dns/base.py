@@ -312,6 +312,76 @@ class ConfigBundle:
 
 
 @dataclass(frozen=True)
+class RRsetMember:
+    """One value within a desired RRset.
+
+    Carries the structured fields as well as the value so a driver composes
+    each member's wire form exactly as it composes the op's own record.
+    """
+
+    value: str
+    priority: int | None = None
+    weight: int | None = None
+    port: int | None = None
+
+
+@dataclass(frozen=True)
+class RRsetData:
+    """The COMPLETE desired set of values at one ``(name, type)`` (#783).
+
+    An empty ``members`` means the RRset should not exist at all.
+
+    This is the agentless twin of the ``record["rrset"]`` payload the agent
+    drivers consume (#773), and it exists for the same reason: none of the
+    backends can express "change this one value and leave its siblings
+    alone" from an op that names only the NEW value.
+
+    * **Windows** rendered `Get-DnsServerResourceRecord … | Remove-…`, which
+      removes every RR at the ``(name, type)``, then added back the single
+      value the op mentioned — so a name with two A records, a backup MX, or
+      SPF beside a verification TXT ended up serving one of them.
+    * **Route 53 / Azure DNS / Google Cloud DNS** are RRset-oriented APIs.
+      Their create/delete paths read-merge and are fine; their ``update``
+      paths replaced the whole RRset with the op's single value, and each
+      says so in a comment deferring the fix.
+
+    A driver that sees this applies it as ONE whole-RRset write, which also
+    makes ops idempotent and self-healing: replaying one converges the
+    server to the database instead of moving it to an earlier state.
+
+    ``None`` means the control plane did not resolve a set for this op —
+    either the caller opted out via ``rrset_action`` (DNS pools, the
+    Windows-cutover TTL pre-flight, both of which need precise per-RR
+    semantics) or the op predates the field. Drivers MUST fall back to
+    their previous per-value behaviour in that case.
+    """
+
+    ttl: int | None
+    members: tuple[RRsetMember, ...]
+
+    def as_records(self, base: RecordData) -> list[RecordData]:
+        """Each member wearing ``base``'s ``(name, type)`` and TTL.
+
+        Lets a driver reuse whatever it already has for composing one
+        ``RecordData`` — rdata formatters, per-type cmdlet dispatch, provider
+        entry builders — instead of growing a parallel set of member-shaped
+        builders that could drift from them.
+        """
+        return [
+            RecordData(
+                name=base.name,
+                record_type=base.record_type,
+                value=m.value,
+                ttl=self.ttl if self.ttl is not None else base.ttl,
+                priority=m.priority,
+                weight=m.weight,
+                port=m.port,
+            )
+            for m in self.members
+        ]
+
+
+@dataclass(frozen=True)
 class RecordChange:
     """A single record mutation to be applied incrementally.
 
@@ -324,6 +394,9 @@ class RecordChange:
     target_serial: int
     tsig_key_name: str | None = None
     op_id: str = ""  # caller-supplied UUID for ACK tracking
+    # #783 — the complete desired RRset this op resolves to. Set on the
+    # agentless path by ``record_ops``; ``None`` when the caller opted out.
+    rrset: RRsetData | None = None
 
 
 @dataclass(frozen=True)

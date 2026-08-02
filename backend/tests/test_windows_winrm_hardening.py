@@ -200,7 +200,9 @@ def test_dns_batch_txt_value_quote_stripped() -> None:
     m = _re.search(r"FromBase64String\('([^']+)'\)", script)
     assert m, "payload not found in batch script"
     ops = _json.loads(_b64.b64decode(m.group(1)).decode("utf-8"))
-    assert ops[0]["v"] == "hello world"
+    # #783 moved each op's value into a members list (``m``) so one op can
+    # carry a whole RRset; the quote-stripping this test guards is unchanged.
+    assert [member["v"] for member in ops[0]["m"]] == ["hello world"]
 
 
 # ── credential schema validators (#11) ─────────────────────────────────

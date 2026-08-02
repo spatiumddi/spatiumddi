@@ -278,17 +278,26 @@ class GoogleCloudDNSDriver(CloudDNSDriverBase):
                 changes.create()
                 return changes
 
-            # ``update`` carries only the NEW value (no old value), so a
-            # correct multi-value merge is impossible at this layer —
-            # replace the whole rrset with the single new value. Correct
-            # for the common single-value rrset (CNAME, SOA, a host with
-            # one A/TXT); multi-value value-edits are an inherent
-            # per-row→RRset limitation tracked in #29.
-            ttl = int(rr.ttl) if rr.ttl else 300
+            # ``update`` replaces the whole rrset — Cloud DNS has no in-place
+            # edit. #783: with a resolved RRset the replacement is the
+            # COMPLETE desired set, so editing one of two A records at a name
+            # no longer retires the other. This was described as an inherent
+            # per-row→RRset limitation; it was only inherent while the op
+            # carried a single value.
+            #
+            # Without a resolved set (a caller that opted out via
+            # ``rrset_action``) the single-value replace is kept — right for
+            # the common single-value rrset (CNAME, a host with one A/TXT).
+            if change.rrset is not None and change.rrset.members:
+                values = [m.value for m in change.rrset.members]
+                ttl = int(change.rrset.ttl or (rr.ttl if rr.ttl else 0) or 300)
+            else:
+                values = [rr.value]
+                ttl = int(rr.ttl) if rr.ttl else 300
             existing = self._find_rrset(zone, absolute, rtype)
             if existing is not None:
                 changes.delete_record_set(existing)
-            changes.add_record_set(zone.resource_record_set(absolute, rtype, ttl, [rr.value]))
+            changes.add_record_set(zone.resource_record_set(absolute, rtype, ttl, values))
             changes.create()
             return changes
 
