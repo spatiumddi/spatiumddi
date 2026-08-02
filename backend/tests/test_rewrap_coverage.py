@@ -221,7 +221,7 @@ def test_scrub_list_excludes_non_regenerable_machine_identity() -> None:
 
     scrubbed = {(t.strip('"'), c) for t, _pk, c in redactable_columns()}
     assert not (scrubbed & NON_REDACTABLE_COLUMNS)
-    assert ("appliance_ca", "key_encrypted") not in scrubbed
+    assert ("appliance_ca", "key_encrypted") not in scrubbed, "no CA rotate endpoint exists"
 
 
 def test_scrub_list_still_redacts_operator_re_enterable_credentials() -> None:
@@ -234,6 +234,10 @@ def test_scrub_list_still_redacts_operator_re_enterable_credentials() -> None:
         ("auth_provider", "secrets_encrypted"),
         ("panos_firewall", "api_key_encrypted"),
         ("dns_server", "credentials_encrypted"),
+        # A private key, but recoverable via POST /appliance/tls/upload
+        # or /csr + /import-cert — so leaving it in a "sanitized" archive
+        # would defeat the point of scrubbing.
+        ("appliance_certificate", "key_encrypted"),
     ):
         assert pair in scrubbed
 

@@ -216,12 +216,16 @@ def _rewrap_value(source: Fernet, dest: Fernet, ciphertext: bytes) -> tuple[byte
 # re-issue fails on ``decrypt_str(b"")`` forever, with no rotate
 # endpoint anywhere in the API.
 #
-# Operator-re-enterable credentials (integration API keys, auth-provider
-# secrets) are still scrubbed — that is the feature working as intended.
+# The bar is "can an operator put this back", not "is it important".
+# ``appliance_certificate.key_encrypted`` is deliberately NOT here even
+# though it is a private key: the Web-UI TLS cert has real recovery paths
+# (``POST /appliance/tls/upload`` and ``/csr`` + ``/import-cert``), and a
+# diagnostic archive that still carried it would defeat the point of
+# scrubbing. ``appliance_ca.key_encrypted`` has no equivalent — there is
+# no CA rotate endpoint anywhere in the API — which is what puts it here.
 NON_REDACTABLE_COLUMNS: frozenset[tuple[str, str]] = frozenset(
     {
         ("appliance_ca", "key_encrypted"),
-        ("appliance_certificate", "key_encrypted"),
         ("appliance", "k3s_join_token_encrypted"),
         ("appliance", "desired_k3s_join_token_encrypted"),
         ("appliance", "kubeconfig_encrypted"),
