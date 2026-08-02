@@ -32,6 +32,7 @@ from typing import Any
 from urllib.parse import quote
 
 import structlog
+import yaml
 
 log = structlog.get_logger(__name__)
 
@@ -147,8 +148,6 @@ def _parse_host_kubeconfig(path: Path) -> KubeConfig:
     pre-podification (legacy compose where someone still wants
     introspection).
     """
-    import yaml  # noqa: PLC0415 — lazy import; only on host-kubeconfig path.
-
     data = yaml.safe_load(path.read_text(encoding="utf-8"))
     contexts = {c["name"]: c["context"] for c in data.get("contexts") or []}
     current = data.get("current-context")
@@ -377,8 +376,6 @@ def apply_helmchart(
     same content is a no-op for k3s's helm-controller (Helm tracks
     revision diffs internally).
     """
-    import yaml  # noqa: PLC0415 — lazy; only on apply path.
-
     values_yaml = yaml.safe_dump(values, default_flow_style=False, sort_keys=False)
     body = {
         "apiVersion": "helm.cattle.io/v1",
@@ -634,6 +631,168 @@ def _helmchartconfig_upsert(
     )
 
 
+# Fast-evict tolerations for the CONTROL-PLANE workloads (api / frontend /
+# worker). Deliberately a separate constant from ``_FAST_EVICT_TOLERATIONS``,
+# which coredns uses: the two are the same 20 s today but answer different
+# questions (how fast must a control-plane replica leave a dead node, vs how
+# fast must cluster DNS), and collapsing them would make a future retune of
+# one silently retune the other.
+_CONTROL_PLANE_FAST_EVICT = [
+    {
+        "key": "node.kubernetes.io/unreachable",
+        "operator": "Exists",
+        "effect": "NoExecute",
+        "tolerationSeconds": 20,
+    },
+    {
+        "key": "node.kubernetes.io/not-ready",
+        "operator": "Exists",
+        "effect": "NoExecute",
+        "tolerationSeconds": 20,
+    },
+]
+
+
+def _deep_merge(base: dict, overlay: dict) -> dict:
+    """``overlay`` wins, recursing into dicts so sibling keys survive.
+
+    Lists and scalars are replaced wholesale — a partial merge of
+    ``tolerations`` or ``loadBalancerSourceRanges`` would be meaningless.
+    Neither input is mutated."""
+    out = dict(base)
+    for key, value in overlay.items():
+        existing = out.get(key)
+        if isinstance(value, dict) and isinstance(existing, dict):
+            out[key] = _deep_merge(existing, value)
+        else:
+            out[key] = value
+    return out
+
+
+def _helmchartconfig_doc(name: str, *, namespace: str = "kube-system") -> dict | None:
+    """Current ``spec.valuesContent`` of the HelmChartConfig, parsed.
+
+    Returns ``{}`` only when there is genuinely nothing to preserve: the CR
+    does not exist (404), or it exists with an empty ``valuesContent``.
+
+    Returns ``None`` for every other non-answer — kubeapi unreachable, an
+    unexpected status, a body we cannot parse, or a document that is not a
+    mapping. "There is a document and I cannot read it" is NOT the same
+    claim as "there is no document", and conflating them is how #792 comes
+    back: a caller that merges onto ``{}`` writes a document containing only
+    the keys it owns, so if the read failed but the write then succeeds (a
+    blip between two calls milliseconds apart, or a CR whose YAML we choked
+    on), that write DELETES ``image.tag`` — the exact key a cluster rolling
+    upgrade is depending on mid-flight.
+
+    So an unknown current state aborts the write. The supervisor retries
+    every heartbeat, which costs ~30 s on a transient failure; a CR that
+    stays unparseable needs an operator to fix or delete it, and the
+    warning below is how they find out, rather than discovering it as a
+    silently rolled-back control-plane version."""
+    path = (
+        f"/apis/helm.cattle.io/v1/namespaces/{quote(namespace)}"
+        f"/helmchartconfigs/{quote(name)}"
+    )
+    try:
+        st, resp = _request("GET", path)
+    except (RuntimeError, OSError) as exc:
+        log.warning("supervisor.helmchartconfig.read_failed", chart=name, error=str(exc))
+        return None
+    if st == 404:
+        return {}
+    if st != 200:
+        log.warning("supervisor.helmchartconfig.read_failed", chart=name, status=st)
+        return None
+    try:
+        raw = (json.loads(resp).get("spec") or {}).get("valuesContent") or ""
+    except (json.JSONDecodeError, ValueError):
+        log.warning("supervisor.helmchartconfig.unparseable_body", chart=name)
+        return None
+    if not str(raw).strip():
+        return {}
+    try:
+        doc = yaml.safe_load(raw)
+    except yaml.YAMLError as exc:
+        log.warning("supervisor.helmchartconfig.unparseable_values", chart=name, error=str(exc))
+        return None
+    if not isinstance(doc, dict):
+        # A list or scalar at the top level is not something we can merge
+        # into. Refusing beats replacing it with our own keys and calling
+        # the operator's document a typo.
+        log.warning("supervisor.helmchartconfig.values_not_a_mapping", chart=name)
+        return None
+    return doc
+
+
+def _slot_image_mirror_enabled(cp_size: int, current_doc: dict) -> bool:
+    """Whether ``slotImageMirror.enabled`` belongs in the overrides.
+
+    #787 — an uploaded / GitHub-imported upgrade image lands on a
+    node-local hostPath: on whichever api replica served the upload. The
+    host runner's download then round-robins through the api Service, so
+    on any control plane with more than one replica roughly half the
+    downloads hit a replica without the bytes and get a 404 that reads
+    "bytes missing on disk — re-upload required". Re-uploading cannot fix
+    it; the bytes exist, on a node the operator cannot see.
+
+    The mirror (a single-replica Deployment on its own node-pinned PVC,
+    which every api replica proxies byte ops to) is the fix, and it
+    shipped in #296 Phase B — but it defaults off and nothing on the
+    appliance ever turned it on, so the feature was unreachable from the
+    only deployment shape that needs it.
+
+    Deriving it from ``cp_size`` here rather than defaulting it on in the
+    chart is what makes that safe:
+
+    * ``cp_size`` IS the api replica count (set from the same number a few
+      lines below), so this tracks the actual invariant — "can a download
+      land on a replica that did not serve the upload?" — and not a proxy
+      for it. A schedule-time refusal keyed to appliance-node count, which
+      an earlier revision of this branch tried, gets both directions
+      wrong.
+    * A single-node appliance that has never been promoted stays on the
+      hostPath and never reserves the PVC. That was the stated reason the
+      chart default is off, and it still holds — /var on a single box is
+      the remainder of a 32 GiB minimum disk.
+
+    It LATCHES: once enabled, a later demote leaves it on. That is not
+    laziness, it is the only correct direction, for two independent
+    reasons:
+
+    * Turning it back off would not reclaim anything. The mirror's PVC and
+      auth Secret both carry ``helm.sh/resource-policy: keep``, so Helm
+      skips deleting them on the release update, and nothing else reaps
+      them — ``reclaim_stranded_redis_storage`` only matches ``-redis-``
+      claims. The disk stays committed either way.
+    * It would strand every image the mirror holds. With
+      ``SLOT_IMAGE_MIRROR_URL`` unset the api reads local FS only, so
+      images that were staged after the promote — the ones that exist
+      solely on the PVC — become unreachable, producing exactly the "bytes
+      missing on disk" 404 this whole change exists to remove.
+
+    So the answer is ``True`` if the cluster is multi-node OR the override
+    already says true. It is written as an explicit value in BOTH states
+    rather than omitted when false, because helm-controller MERGES a
+    HelmChartConfig instead of diffing it — an absent key keeps whatever
+    was written last, so a latch cannot be expressed by omission.
+
+    ``current_doc`` is the parsed live ``valuesContent``; passing it in
+    (rather than re-reading here) keeps this a pure function and the
+    kubeapi read in one place.
+
+    One transition remains, and it is handled outside this function: bytes
+    uploaded BEFORE a promote sit on the seed's hostPath while the mirror's
+    PVC starts empty. The api's download handler falls back to local FS
+    when the mirror cannot serve, which recovers it on the seed, and
+    re-uploading (or re-importing) now genuinely re-stores the bytes rather
+    than short-circuiting on the duplicate hash."""
+    if cp_size >= 2:
+        return True
+    block = current_doc.get("slotImageMirror")
+    return bool(isinstance(block, dict) and block.get("enabled") is True)
+
+
 def apply_control_plane_overrides(
     cp_size: int,
     control_plane_vip: str,
@@ -647,17 +806,20 @@ def apply_control_plane_overrides(
     #285 Phase 6 — ``web_ui_allowed_cidrs`` (empty = open) also lands on the
     frontend as ``loadBalancerSourceRanges``, so the MetalLB VIP path is
     source-scoped by the same setting that scopes the per-node hostPort door
-    via nftables. Belt (VIP) + braces (hostPort) from one operator control."""
+    via nftables. Belt (VIP) + braces (hostPort) from one operator control.
+
+    #787 — the slot-image mirror is enabled from the same number, because
+    it is a function of exactly one thing: whether more than one api replica
+    can serve an upgrade-image download. It latches on rather than tracking
+    the size in both directions; see ``_slot_image_mirror_enabled``."""
     if cp_size < 1:
         return False, "cp_size < 1"
     vip = (control_plane_vip or "").strip()
-    # Flow-style JSON list is valid YAML; empty list = open (field omitted by
-    # the chart template). The supervisor already validates these CIDRs at the
-    # control plane, but they arrive here as plain strings — json.dumps keeps
-    # them quoted so a malformed entry can't break the YAML overlay.
-    src_json = json.dumps(
-        [c.strip() for c in (web_ui_allowed_cidrs or []) if c and c.strip()]
-    )
+    # Empty list = open (the field is omitted by the chart template). These
+    # arrive as plain strings the control plane has already validated; going
+    # through the YAML dumper below is what keeps a malformed entry from
+    # breaking the document, so no hand-quoting is needed here.
+    cidrs = [c.strip() for c in (web_ui_allowed_cidrs or []) if c and c.strip()]
     # #590 — pin api/frontend/worker to one replica per control-plane node,
     # and evict them from a dead node in seconds rather than the k8s default
     # 300 s. ``replicas`` here IS the node count, so hard
@@ -676,26 +838,47 @@ def apply_control_plane_overrides(
     # suppresses the DefaultTolerationSeconds admission plugin, which a
     # BYO-Kubernetes install still wants. They belong to the appliance,
     # where the control-plane node count is fixed.
-    fast_evict = (
-        "  tolerations:\n"
-        "    - key: node.kubernetes.io/unreachable\n"
-        "      operator: Exists\n"
-        "      effect: NoExecute\n"
-        "      tolerationSeconds: 20\n"
-        "    - key: node.kubernetes.io/not-ready\n"
-        "      operator: Exists\n"
-        "      effect: NoExecute\n"
-        "      tolerationSeconds: 20\n"
-    )
-    values = (
-        f"api:\n  replicas: {cp_size}\n  podAntiAffinity: hard\n{fast_evict}"
-        f"frontend:\n  replicas: {cp_size}\n  podAntiAffinity: hard\n{fast_evict}"
-        f'  controlPlaneVIP: "{vip}"\n'
-        f"  loadBalancerSourceRanges: {src_json}\n"
-        f"worker:\n  replicas: {cp_size}\n  podAntiAffinity: hard\n{fast_evict}"
-        f"postgresql:\n  cnpg:\n    instances: {cp_size}\n"
-        f"redis:\n  sentinel:\n    replicas: {cp_size}\n"
-    )
+    scaled = {
+        "replicas": cp_size,
+        "podAntiAffinity": "hard",
+        "tolerations": _CONTROL_PLANE_FAST_EVICT,
+    }
+    current_doc = _helmchartconfig_doc("spatium-control")
+    if current_doc is None:
+        # Unknown current state — see _helmchartconfig_doc. Writing here
+        # would merge onto {} and delete every key we do not own.
+        return False, "could not read the current spatium-control values"
+    owned: dict[str, Any] = {
+        "api": dict(scaled),
+        "frontend": dict(scaled)
+        | {
+            "controlPlaneVIP": vip,
+            "loadBalancerSourceRanges": cidrs,
+        },
+        "worker": dict(scaled),
+        "slotImageMirror": {"enabled": _slot_image_mirror_enabled(cp_size, current_doc)},
+        "postgresql": {"cnpg": {"instances": cp_size}},
+        "redis": {"sentinel": {"replicas": cp_size}},
+    }
+    # MERGE onto what is already there rather than replacing the document.
+    #
+    # This used to be a hand-concatenated string assigned wholesale to
+    # ``spec.valuesContent``, which silently deleted every key the
+    # supervisor does not own. One of those keys is load-bearing:
+    # ``chart_bump._patch_image_tag`` stamps ``image.tag`` onto this very
+    # CR to roll the control plane to a new version, and it re-dumps the
+    # document with ``yaml.safe_dump(sort_keys=True)``. That output could
+    # never equal the supervisor's hand-rolled rendering, so the next
+    # heartbeat — at most 30 s later, i.e. mid-upgrade — always saw a
+    # difference, PATCHed its own string back, and took ``image.tag`` with
+    # it. helm-controller then re-applied the chart at its default tag.
+    #
+    # Merging fixes the deletion; dumping through the SAME normalisation
+    # chart_bump uses fixes the churn, because two agents writing the same
+    # logical document now produce byte-identical strings and the upsert's
+    # idempotent compare finally holds.
+    merged = _deep_merge(current_doc, owned)
+    values = yaml.safe_dump(merged, sort_keys=True, default_flow_style=False)
     return _helmchartconfig_upsert("spatium-control", values)
 
 

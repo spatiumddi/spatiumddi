@@ -135,7 +135,10 @@ api:
     # (SPATIUM_SLOT_IMAGE_DIR, default /var/lib/spatiumddi/slot-images).
     # Persists uploaded / GitHub-imported images across api restarts so
     # they don't 404 with "bytes missing on disk" on the next upgrade.
-    # Only mounted when the multi-node slot-image mirror is off.
+    # Mounted even when the mirror is on (#787): the mirror is enabled at
+    # promote, so an image staged while the box was single-node is still
+    # here when the mirror's PVC comes up empty, and the download handler
+    # falls back to it.
     slotImagesDir: /var/lib/spatiumddi/slot-images
     # #59 — host dir backing packet-capture .pcap artifacts
     # (SPATIUM_PCAP_DIR). Shared by api (reads on download) + worker
@@ -157,13 +160,23 @@ api:
 # installs). Single-instance docker-compose / plain k8s installs that
 # just helm-upgrade through standard rolling updates don't need it.
 #
-# TURN THIS ON for a multi-node control plane that upgrades from UPLOADED
-# images. It stays off by default because the PVC is real storage the
-# single-node appliance (whose /var is the remainder of a 32 GiB minimum
-# disk) should not be asked to reserve. With it off on multi-node, uploaded
-# bytes live on whichever api replica served the upload, and the host's
-# download 404s from every other one (#787). Upgrading from an external
-# image URL needs no mirror at all.
+# REQUIRED whenever api.replicas > 1 AND you upgrade from UPLOADED images.
+# With it off, uploaded bytes live on whichever api replica served the
+# upload and the host's download 404s from every other one (#787). It
+# stays off by DEFAULT because the PVC is real storage the single-node
+# appliance (whose /var is the remainder of a 32 GiB minimum disk) should
+# not be asked to reserve. Upgrading from an external image URL needs no
+# mirror at all.
+#
+# ON THE APPLIANCE THIS IS AUTOMATIC and you should not set it here: the
+# seed supervisor derives it from the control-plane size and writes it to
+# the spatium-control HelmChartConfig, so a multi-node appliance turns the
+# mirror on by itself (agent/supervisor/spatium_supervisor/k8s_api.py,
+# _slot_image_mirror_enabled). It LATCHES — a later demote leaves it on,
+# because switching back would reclaim nothing (the PVC + Secret below
+# carry helm.sh/resource-policy: keep, so Helm never deletes them) while
+# stranding every image that exists only on the mirror. This knob is for
+# BYO-Kubernetes installs, where nothing tracks the replica count for you.
 slotImageMirror:
   enabled: false
   storage:
