@@ -287,11 +287,15 @@ def _scrub_dump_text(dump_text: str) -> str:
 
     from app.services.backup.rewrap import (  # noqa: PLC0415
         _ENC_PREFIX,
-        ENCRYPTED_COLUMNS,
+        redactable_columns,
     )
 
     by_table: dict[str, set[str]] = {}
-    for table, _pk, enc_col in ENCRYPTED_COLUMNS:
+    # NOT ENCRYPTED_COLUMNS: machine identity (appliance CA / TLS keys,
+    # k3s tokens, pairing codes) is excluded, because blanking it yields
+    # an archive whose restore succeeds and then permanently breaks
+    # supervisor approval with no way to regenerate (#781).
+    for table, _pk, enc_col in redactable_columns():
         bare = table.strip('"')
         by_table.setdefault(bare, set()).add(enc_col)
 

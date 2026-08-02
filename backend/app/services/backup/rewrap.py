@@ -53,34 +53,65 @@ from cryptography.fernet import Fernet, InvalidToken
 
 logger = structlog.get_logger(__name__)
 
-# All (table, primary_key_column, encrypted_bytes_column) triples
-# in the schema. Sorted alphabetically by table for diffability.
-# When a new model adds a Fernet-encrypted ``LargeBinary`` column,
-# extend this list — there's no auto-discovery, on purpose, so a
-# rewrap-affecting schema change is an explicit code review.
+# All (table, primary_key_column, encrypted_bytes_column) triples in the
+# schema. Sorted alphabetically by table for diffability.
+#
+# Kept explicit rather than auto-discovered, so that adding a
+# Fernet-encrypted column is a deliberate review decision — but
+# ``test_rewrap_covers_every_encrypted_column`` asserts this list matches
+# the mapped metadata exactly, because "explicit" only works if drift is
+# caught. It wasn't: this list covered 21 of 47 columns and named one
+# table that does not exist, so a cross-install restore silently left
+# every other credential encrypted under the SOURCE key (#781). On an
+# appliance that is every restore, since firstboot mints fresh keys.
 ENCRYPTED_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("acme_client_account", "id", "account_key_encrypted"),
+    ("acme_client_account", "id", "eab_hmac_encrypted"),
     ("ai_provider", "id", "api_key_encrypted"),
+    ("appliance", "id", "desired_k3s_join_token_encrypted"),
+    ("appliance", "id", "k3s_join_token_encrypted"),
+    ("appliance", "id", "kubeconfig_encrypted"),
+    ("appliance_ca", "id", "key_encrypted"),
+    ("appliance_certificate", "id", "key_encrypted"),
     ("audit_forward_target", "id", "smtp_password_encrypted"),
     ("auth_provider", "id", "secrets_encrypted"),
     ("backup_target", "id", "passphrase_encrypted"),
+    ("bgp_lg_peer", "id", "md5_password_encrypted"),
+    ("cloud_endpoint", "id", "credentials_encrypted"),
     ("dhcp_server", "id", "credentials_encrypted"),
+    ("dns_server", "id", "api_key_encrypted"),
     ("dns_server", "id", "credentials_encrypted"),
     ("dns_tsig_key", "id", "secret_encrypted"),
     ("docker_host", "id", "client_key_encrypted"),
     ("event_subscription", "id", "secret_encrypted"),
+    ("firewall_feed", "id", "token_encrypted"),
+    ("fortinet_firewall", "id", "api_token_encrypted"),
     ("kubernetes_cluster", "id", "token_encrypted"),
+    ("meraki_org", "id", "api_key_encrypted"),
+    ("meraki_org", "id", "block_sync_api_key_encrypted"),
+    ("netbird_instance", "id", "api_key_encrypted"),
     ("network_device", "id", "community_encrypted"),
     ("network_device", "id", "v3_auth_key_encrypted"),
     ("network_device", "id", "v3_priv_key_encrypted"),
+    ("opnsense_router", "id", "api_secret_encrypted"),
+    ("opnsense_router", "id", "block_sync_api_secret_encrypted"),
+    ("pairing_code", "id", "code_encrypted"),
+    ("panos_firewall", "id", "api_key_encrypted"),
+    ("panos_firewall", "id", "block_sync_api_key_encrypted"),
     ("platform_settings", "id", "fingerbank_api_key_encrypted"),
+    ("platform_settings", "id", "snmp_community_encrypted"),
     ("proxmox_node", "id", "token_secret_encrypted"),
-    ("tailscale_target", "id", "api_key_encrypted"),
+    ("tailscale_tenant", "id", "api_key_encrypted"),
     ("unifi_controller", "id", "api_key_encrypted"),
-    ("unifi_controller", "id", "username_encrypted"),
+    ("unifi_controller", "id", "block_sync_api_key_encrypted"),
+    ("unifi_controller", "id", "block_sync_password_encrypted"),
+    ("unifi_controller", "id", "block_sync_username_encrypted"),
     ("unifi_controller", "id", "password_encrypted"),
-    ('"user"', "id", "totp_secret_encrypted"),
-    ('"user"', "id", "recovery_codes_encrypted"),
+    ("unifi_controller", "id", "username_encrypted"),
     ('"user"', "id", "password_history_encrypted"),
+    ('"user"', "id", "recovery_codes_encrypted"),
+    ('"user"', "id", "totp_secret_encrypted"),
+    ("wol_calendar", "id", "password_encrypted"),
 )
 
 # The same prefix the ``backup_target.config`` JSONB serializer
@@ -171,6 +202,47 @@ def _rewrap_value(source: Fernet, dest: Fernet, ciphertext: bytes) -> tuple[byte
         return dest.encrypt(plaintext), "rewrapped"
     except Exception as exc:  # noqa: BLE001
         return None, f"failed:re-encrypt:{exc}"
+
+
+# Columns the exclude-secrets diagnostic scrub must NOT blank (#781).
+#
+# ``archive.py:_scrub_dump_text`` shares ENCRYPTED_COLUMNS as its
+# redaction list, so widening the rewrap list widened what a diagnostic
+# archive destroys. These columns are machine identity with no
+# re-entry path: blanking them yields an empty bytea that satisfies
+# NOT NULL, so a restore of such an archive SUCCEEDS and then
+# permanently breaks the install — ``ensure_ca`` returns the existing
+# row without regenerating, and every supervisor approval and cert
+# re-issue fails on ``decrypt_str(b"")`` forever, with no rotate
+# endpoint anywhere in the API.
+#
+# Operator-re-enterable credentials (integration API keys, auth-provider
+# secrets) are still scrubbed — that is the feature working as intended.
+NON_REDACTABLE_COLUMNS: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("appliance_ca", "key_encrypted"),
+        ("appliance_certificate", "key_encrypted"),
+        ("appliance", "k3s_join_token_encrypted"),
+        ("appliance", "desired_k3s_join_token_encrypted"),
+        ("appliance", "kubeconfig_encrypted"),
+        ("pairing_code", "code_encrypted"),
+        ("acme_client_account", "account_key_encrypted"),
+    }
+)
+
+
+def redactable_columns() -> tuple[tuple[str, str, str], ...]:
+    """ENCRYPTED_COLUMNS minus the machine identity that cannot be re-entered.
+
+    The diagnostic-export scrubber consumes this, not ENCRYPTED_COLUMNS
+    directly, so the rewrap list can grow without silently widening what
+    an "exclude secrets" archive destroys.
+    """
+    return tuple(
+        (table, pk, column)
+        for table, pk, column in ENCRYPTED_COLUMNS
+        if (table.strip('"'), column) not in NON_REDACTABLE_COLUMNS
+    )
 
 
 async def rewrap_secrets(

@@ -13,7 +13,8 @@ The catalog is the single source of truth for these three flows.
 Adding a new table that needs to be backed up means adding it to
 the right :class:`Section` here. Forgetting to do so means the
 table is silently excluded from selective backups + restores —
-:func:`assert_catalog_covers_models` catches this at startup so
+:func:`assert_catalog_covers_models` reports this — consulted from the
+test suite, not at startup (see its docstring) — so
 the gap surfaces immediately.
 
 Design notes:
@@ -467,8 +468,10 @@ def assert_catalog_covers_models(known_tables: set[str]) -> list[str]:
     declared by the SQLAlchemy models. Returns a list of tables
     the catalog is missing — empty list = catalog is complete.
 
-    Called from the FastAPI lifespan so the gap surfaces at
-    startup, not on a restore-time mystery failure.
+    NOT wired into startup — the name is aspirational and predates any
+    caller. ``tests/test_rewrap_coverage.py`` is what actually consults it,
+    pinning today's gap so it cannot grow silently; see #781 for why the
+    56 currently-unclassified tables are a baseline rather than a fix.
     """
     catalog = all_section_tables()
     missing = sorted(known_tables - catalog)

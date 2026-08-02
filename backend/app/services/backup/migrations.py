@@ -50,7 +50,22 @@ from app.services.backup.archive import _pg_env_from_url
 
 logger = structlog.get_logger(__name__)
 
-_ALEMBIC_INI_PATH = Path("/app/alembic.ini")
+
+def _alembic_ini() -> Path | None:
+    """Locate ``alembic.ini`` for the running process.
+
+    Delegates to the shared locator rather than hardcoding ``/app``: the
+    file is at ``/app/alembic.ini`` in the container image but at
+    ``./alembic.ini`` under CI and a dev host venv. Hardcoding the
+    container path made `schema_direction_error` return None — i.e.
+    "direction is fine, proceed" — everywhere else, silently disabling
+    the #781 gate rather than erring toward refusal.
+    """
+    from app.core.schema_check import _locate_alembic_ini  # noqa: PLC0415
+
+    return _locate_alembic_ini()
+
+
 _ALEMBIC_TIMEOUT_SECONDS = 30 * 60
 
 MigrationState = Literal[
@@ -95,9 +110,10 @@ def _local_head() -> str | None:
     upgrade-on-restore flow doesn't try to disambiguate; operators
     on multi-head schemas resolve manually.
     """
-    if not _ALEMBIC_INI_PATH.is_file():
+    ini = _alembic_ini()
+    if ini is None:
         return None
-    cfg = Config(str(_ALEMBIC_INI_PATH))
+    cfg = Config(str(ini))
     script = ScriptDirectory.from_config(cfg)
     heads = script.get_heads()
     if len(heads) != 1:
@@ -138,6 +154,40 @@ def _migrations_between(script: ScriptDirectory, source: str, target: str) -> li
     return [r.revision for r in reversed(revs) if r.revision != source]
 
 
+def schema_direction_error(source_head: str | None) -> str | None:
+    """Return an error if this build cannot migrate ``source_head`` forward.
+
+    Callable BEFORE anything destructive happens. ``maybe_upgrade_after_
+    restore`` performs the same test, but only after the dump has already
+    been replayed — at which point refusing is theatre: the database has
+    been overwritten, ``alembic_version`` sits ahead of the running code,
+    and the api's schema-head readiness gate keeps the pod out of the
+    Service until someone upgrades or restores something older (#781).
+
+    Returns None when the direction is fine (same head, an ancestor we can
+    upgrade, or a manifest that never recorded one).
+    """
+    source_head = (str(source_head).strip() if source_head is not None else "") or None
+    if not source_head:
+        return None  # pre-format_version-2 archive; nothing to compare
+    local_head = _local_head()
+    if local_head is None or source_head == local_head:
+        return None
+    ini = _alembic_ini()
+    if ini is None:
+        return None
+    script = ScriptDirectory.from_config(Config(str(ini)))
+    if _is_ancestor(script, source_head, local_head):
+        return None
+    return (
+        f"This archive was taken on a NEWER schema than this install: its head "
+        f"{source_head!r} is not an ancestor of {local_head!r}. Restoring it would "
+        f"overwrite the database with data this build cannot migrate, leaving the "
+        f"api unable to start. Upgrade SpatiumDDI on this install first, then "
+        f"re-run the restore."
+    )
+
+
 async def maybe_upgrade_after_restore(
     *,
     manifest_schema_version: str | None,
@@ -174,7 +224,8 @@ async def maybe_upgrade_after_restore(
             migrations_applied=[],
         )
 
-    cfg = Config(str(_ALEMBIC_INI_PATH))
+    ini = _alembic_ini()
+    cfg = Config(str(ini) if ini else "alembic.ini")
     script = ScriptDirectory.from_config(cfg)
 
     if not _is_ancestor(script, source_head, local_head):
@@ -202,7 +253,7 @@ async def maybe_upgrade_after_restore(
     cmd = [
         "alembic",
         "-c",
-        str(_ALEMBIC_INI_PATH),
+        str(_alembic_ini() or "alembic.ini"),
         "upgrade",
         "head",
     ]
@@ -310,7 +361,7 @@ async def _try_alembic_stamp_head(db_url: str) -> tuple[bool, str | None]:
     """
     pg_env, _dbname = _pg_env_from_url(db_url)
     full_env = {**os.environ, **pg_env, "DATABASE_URL": db_url}
-    cmd = ["alembic", "-c", str(_ALEMBIC_INI_PATH), "stamp", "head"]
+    cmd = ["alembic", "-c", str(_alembic_ini() or "alembic.ini"), "stamp", "head"]
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         env=full_env,
