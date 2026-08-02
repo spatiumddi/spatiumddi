@@ -264,10 +264,17 @@ both `k8s/dns/bind9-statefulset.yaml` and `k8s/dns/service-dns.yaml`.
 
 Prefer 8443 over the RFC 8484 default of 443 for DoH unless you know 443
 is free — an Ingress controller usually already holds it. BIND9 and
-Technitium serve both protocols natively (Technitium adds DoQ, which is
-UDP and so shares :853 with DoT without colliding); on the PowerDNS
-flavor they run on the dnsdist front, which has no Kubernetes deployment
-yet (docker-compose only).
+Technitium both serve DoT and DoH natively, and `dotPort` / `dohPort`
+work the same on either flavor; on the PowerDNS flavor they run on the
+dnsdist front, which has no Kubernetes deployment yet (docker-compose
+only).
+
+> **DoQ has no chart knob yet.** Technitium also serves DNS-over-QUIC,
+> which is UDP and therefore shares :853 with DoT without colliding —
+> but `dotPort` renders `protocol: TCP` and there is no `doqPort`, so
+> the UDP listener cannot be declared on the Pod or routed through the
+> Service. It still answers on a `hostNetwork` node. Tracked in
+> [#799](https://github.com/spatiumddi/spatiumddi/issues/799).
 
 ### How servers register
 
