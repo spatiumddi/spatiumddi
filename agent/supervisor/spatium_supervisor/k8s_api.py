@@ -788,7 +788,7 @@ def apply_control_plane_overrides(
     #787 — the slot-image mirror is enabled from the same number, because
     it is a function of exactly one thing: whether more than one api replica
     can serve an upgrade-image download. It latches on rather than tracking
-    the size in both directions; see ``_slot_image_mirror_values``."""
+    the size in both directions; see ``_slot_image_mirror_enabled``."""
     if cp_size < 1:
         return False, "cp_size < 1"
     vip = (control_plane_vip or "").strip()
