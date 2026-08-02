@@ -712,11 +712,20 @@ async def restore_from_archive(
                             "skipped_idempotent_rows": (outcome.rewrap.skipped_idempotent_rows),
                             "failed_rows": outcome.rewrap.failed_rows,
                             "columns_visited": outcome.rewrap.columns_visited,
+                            "aborted": outcome.rewrap.aborted,
                             "failures": outcome.rewrap.failures,
                         }
                         if outcome.rewrap is not None
                         else None
                     ),
+                    # Both change what the operator got versus what they
+                    # asked for, so the trail has to carry them — and this
+                    # endpoint has to match POST /backup/restore or a
+                    # destination-based restore is the less auditable of
+                    # two paths doing the same thing (#781).
+                    "cascade_widened_tables": outcome.cascade_widened_tables,
+                    "allow_newer_schema": body.allow_newer_schema,
+                    "warnings": outcome.warnings,
                 },
             )
         )
@@ -730,6 +739,7 @@ async def restore_from_archive(
         "pre_restore_safety_path": outcome.pre_restore_path,
         "selective": outcome.selective,
         "restored_sections": outcome.restored_sections,
+        "cascade_widened_tables": outcome.cascade_widened_tables,
         "migration": (
             {
                 "state": outcome.migration.state,
@@ -749,11 +759,18 @@ async def restore_from_archive(
                 "skipped_idempotent_rows": outcome.rewrap.skipped_idempotent_rows,
                 "failed_rows": outcome.rewrap.failed_rows,
                 "columns_visited": outcome.rewrap.columns_visited,
+                "aborted": outcome.rewrap.aborted,
                 "failures": outcome.rewrap.failures,
             }
             if outcome.rewrap is not None
             else None
         ),
+        # This response omitted ``warnings`` entirely, so a
+        # destination-based restore never surfaced the DNSSEC
+        # registrar-republish advisory. Pre-existing, but it matters more
+        # now: the cascade-widening, half-migrated-rewrap and
+        # schema-override notices all ride this channel (#781).
+        "warnings": outcome.warnings,
     }
 
 

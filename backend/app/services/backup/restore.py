@@ -1,10 +1,16 @@
 """Apply a backup archive to the running install (issue #117 Phase
 1a).
 
-Phase 1a is **hard overwrite**: TRUNCATE every table, replay the
-archive's ``database.sql`` via ``psql --single-transaction``,
-re-validate the operator's passphrase against ``secrets.enc``.
-Selective restore + per-section toggles are deferred to Phase 2.
+Two shapes:
+
+* **Full restore** (no ``sections``) — hard overwrite. Replay the
+  archive over every table via ``pg_restore --clean`` (custom-format
+  archives) or ``psql`` (Phase 1 plain dumps).
+* **Selective restore** (``sections`` given) — TRUNCATE CASCADE + a
+  data-only reload, over the **FK-cascade closure** of the selected
+  sections' tables. The closure matters because CASCADE empties every
+  table holding a foreign key into a truncated one; restoring only the
+  selection deleted the difference (#781).
 
 Safety rails:
 
@@ -18,9 +24,16 @@ Safety rails:
 * Manifest version checks: the destination refuses archives whose
   ``format_version`` is newer than the running build (operators
   who downgraded need to upgrade first).
-* The whole apply runs inside ``psql --single-transaction`` —
-  failures roll back automatically; partial restores are
-  impossible.
+* The schema-direction check runs BEFORE anything destructive, so an
+  archive this build cannot migrate forward is refused with the
+  database still intact. ``allow_newer_schema`` overrides it for the
+  A/B-rollback case.
+* The data replay itself is atomic — ``--single-transaction`` on both
+  the psql and pg_restore paths. What is *not* atomic is the restore as
+  a whole: the post-replay secret rewrap walks 65 columns/fields
+  committing one at a time, so it can leave a half-migrated credential
+  store. That is reported rather than hidden — see ``RewrapOutcome``'s
+  ``aborted`` flag.
 """
 
 from __future__ import annotations
@@ -420,12 +433,27 @@ async def apply_backup_restore(
     overwrite of every table). When ``sections`` is a non-empty
     list of section keys (from
     :mod:`app.services.backup.sections`) → **selective restore**:
-    TRUNCATE the selected sections' tables CASCADE, then
-    ``pg_restore --data-only --disable-triggers --table=…`` for
-    just those tables. ``platform_internal`` is always included
+    TRUNCATE CASCADE followed by
+    ``pg_restore --data-only --disable-triggers --table=…``, over the
+    **FK-cascade closure** of the selected sections' tables rather than
+    the selection alone. ``platform_internal`` is always included
     (alembic_version + oui_vendor pin install state). Selective
     restore requires the archive to be in custom format —
     ``pg_restore --table=`` doesn't work on plain dumps.
+
+    The closure is not an optimisation: ``CASCADE`` empties every table
+    holding a foreign key into a truncated one, so restoring only the
+    selection *deleted* the difference (#781). Everything CASCADE reaches
+    is therefore restored from the same archive, and the tables that were
+    pulled in beyond the selection come back on
+    :attr:`RestoreOutcome.cascade_widened_tables` plus an operator-facing
+    warning — the restore is deliberately wider than what was ticked, so
+    it says so rather than doing it quietly.
+
+    ``allow_newer_schema`` overrides the pre-replay refusal to restore an
+    archive whose schema head this build does not know. It exists for the
+    A/B-rollback case; the override is logged and the outcome leads with a
+    warning that the api's schema-head readiness gate may now fail.
 
     The async ``db`` session is used only to pull the alembic head
     for the safety dump and to dispose of the connection pool

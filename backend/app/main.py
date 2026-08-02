@@ -360,11 +360,17 @@ def _log_backup_section_catalog_gap() -> None:
     """Report tables the selective-restore section catalog doesn't classify.
 
     ``assert_catalog_covers_models`` was written to run here and never wired
-    up, so the catalog silently fell behind the models — a table nobody
-    classified can't be chosen for a selective restore, and (worse) it can be
-    cascade-truncated by one that is. ``tests/test_rewrap_coverage.py`` keeps
-    the gap from *growing*; this makes the current gap visible to an operator
-    reading the logs rather than only to someone running the suite (#781).
+    up, so the catalog silently fell behind the models: a table nobody
+    classified cannot be *chosen* for a selective restore.
+    ``tests/test_rewrap_coverage.py`` keeps the gap from *growing*; this makes
+    the current gap visible to an operator reading the logs rather than only
+    to someone running the suite (#781).
+
+    Note this is now a usability gap, not a data-loss one. Uncatalogued
+    tables used to be cascade-truncated and left empty; since the same issue
+    taught selective restore to restore the whole FK-cascade closure, they
+    are repopulated from the archive — reverted along with the selection
+    rather than emptied.
 
     Synchronous + non-fatal on purpose: it reads mapped metadata only, touches
     no database, and must never be able to keep the api from starting.
@@ -382,9 +388,9 @@ def _log_backup_section_catalog_gap() -> None:
                 missing_count=len(missing),
                 missing=missing,
                 impact=(
-                    "these tables cannot be selected for a selective restore, and are "
-                    "cascade-truncated without being repopulated when a section they "
-                    "reference is restored"
+                    "these tables cannot be explicitly selected for a selective "
+                    "restore; they are still reverted to the archive's state "
+                    "whenever a selected section's FK-cascade closure reaches them"
                 ),
             )
     except Exception as exc:  # noqa: BLE001
