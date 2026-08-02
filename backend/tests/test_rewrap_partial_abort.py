@@ -1,10 +1,15 @@
 """#781 — a rewrap that dies part-way through must report what it did.
 
-``rewrap_secrets`` walks 47 ``LargeBinary`` columns and 18 JSONB fields,
-each in its own transaction, committing as it goes. If the walk dies at
-column 30, the credential store is genuinely half-migrated: 29 columns
-now decrypt under the DESTINATION key, the rest still only under the
-SOURCE key.
+``rewrap_secrets`` walks every entry in ``ENCRYPTED_COLUMNS`` and
+``JSONB_ENCRYPTED_FIELDS``, each in its own transaction, committing as
+it goes. If the walk dies part-way, the credential store is genuinely
+half-migrated: the locations already visited decrypt under the
+DESTINATION key, the rest still only under the SOURCE key.
+
+(Counts deliberately not quoted here. They grow every time a feature
+adds a secret, and a docstring pinning today's numbers is the same
+drift this PR exists to stop — the assertions below derive them from the
+registries instead.)
 
 The old shape lost exactly that information. ``rewrap_secrets`` raised,
 and ``restore.py`` answered with a fresh ``RewrapOutcome()`` — so the

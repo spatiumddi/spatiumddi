@@ -464,6 +464,19 @@ class SNMPV3UserUpdate(BaseModel):
         s = v.strip()
         if not s:
             raise ValueError("username may not be empty")
+        # snmpd.conf is whitespace-delimited and does not quote the
+        # username token, so INTERNAL whitespace splits the directive
+        # into extra arguments and a newline ends it outright:
+        # ``ops\nrwuser evil .1`` would inject a read-write user into
+        # the rendered config. Reject at the boundary rather than
+        # sanitising, so the operator sees the problem on their own PUT.
+        # ``services/appliance/snmp.py`` re-checks at render time for
+        # rows that predate this validator.
+        if any(c.isspace() for c in s) or any(ord(c) < 32 for c in s):
+            raise ValueError(
+                "username may not contain whitespace or control characters — "
+                "snmpd.conf is whitespace-delimited and cannot express them"
+            )
         return s
 
     @field_validator("auth_protocol")

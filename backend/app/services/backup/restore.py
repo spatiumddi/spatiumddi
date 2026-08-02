@@ -725,12 +725,13 @@ async def apply_backup_restore(
         total = len(ENCRYPTED_COLUMNS) + len(JSONB_ENCRYPTED_FIELDS)
         post_warnings.append(
             "Secret rewrap stopped part-way through: "
-            f"{rewrap_outcome.columns_visited} of {total} encrypted columns were "
-            f"visited and {rewrap_outcome.rewrapped_rows} row(s) were re-encrypted "
-            "under this install's key. The remaining columns are still encrypted "
-            "with the SOURCE install's key and will fail to decrypt. Recover the "
-            "source key from the archive's secrets.enc and re-run the restore, or "
-            "the affected credentials must be re-entered by hand."
+            f"{rewrap_outcome.columns_visited} of {total} encrypted locations "
+            f"(columns and JSONB fields) were visited and "
+            f"{rewrap_outcome.rewrapped_rows} row(s) were re-encrypted under this "
+            "install's key. The rest are still encrypted with the SOURCE install's "
+            "key and will fail to decrypt. Recover the source key from the "
+            "archive's secrets.enc and re-run the restore, or the affected "
+            "credentials must be re-entered by hand."
         )
 
     duration_ms = int((datetime.now(UTC) - started).total_seconds() * 1000)

@@ -157,6 +157,32 @@ def _render_v3(settings: PlatformSettings, sources: list[str]) -> list[str]:
         username = (u.get("username") or "").strip()
         if not username:
             continue
+
+        # snmpd.conf is whitespace-delimited with no quoting for the
+        # username token, so a username carrying internal whitespace
+        # splits into extra arguments — and one carrying a NEWLINE ends
+        # the directive and starts a new one. ``ops\nrwuser evil .1``
+        # would inject a READ-WRITE user into the daemon's config.
+        #
+        # ``_validate_v3_username`` on the settings router now rejects
+        # this at the API boundary, which is the right place. This check
+        # is deliberately kept as well: rows written before that
+        # validator existed are still in the database, and this renderer
+        # is the last thing standing between stored state and the file
+        # snmpd loads. Cheap, and the failure mode it prevents is a
+        # config-injection rather than a bad-looking line.
+        if any(c.isspace() for c in username) or any(ord(c) < 32 for c in username):
+            logger.error(
+                "snmp_v3_user_skipped_illegal_username",
+                username=repr(username),
+            )
+            out.append(
+                "# SNMPv3 user OMITTED — its username contains whitespace or "
+                "control characters, which snmpd.conf cannot express and which "
+                "could inject additional directives. Rename the user."
+            )
+            continue
+
         auth_proto = u.get("auth_protocol") or "none"
         priv_proto = u.get("priv_protocol") or "none"
         auth_pass = _decrypt_v3_pass(u.get("auth_pass_enc"))
