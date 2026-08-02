@@ -18,6 +18,10 @@ name: Nightly
 #     already rolled and there is nothing to compare against, and a broken
 #     nightly would leave no fallback. Seven dated tags prune in the same
 #     run and cost nothing; anyone pulling `:nightly` never sees them.
+#     What the prune bounds is the TAG ring — untagged multi-arch children
+#     are left alone because deleting them would break the tags that
+#     reference them (see the prune job). Orphaned layers are GHCR's
+#     untagged-retention policy to collect, not this workflow's.
 #
 # THE APPLIANCE ISO IS DEFERRED, deliberately. Its retention answer is easy
 # (~1.5 GB each, so exactly one, assets replaced in place on the reused
@@ -84,6 +88,7 @@ jobs:
       contents: read
     outputs:
       should_build: ${{ steps.decide.outputs.should_build }}
+      images: ${{ steps.decide.outputs.images }}
       date_tag: ${{ steps.decide.outputs.date_tag }}
       version: ${{ steps.decide.outputs.version }}
       last_sha: ${{ steps.decide.outputs.last_sha }}
@@ -98,6 +103,26 @@ jobs:
           FORCE: ${{ github.event.inputs.force || 'false' }}
         run: |
           set -euo pipefail
+
+          # ONE source of truth for which images exist. Both the build
+          # matrix and the prune job read this, because a hardcoded second
+          # copy fails in the worst direction: add an image to the matrix,
+          # forget the prune list, and its dated tags accumulate forever
+          # with nothing reporting a problem.
+          cat > /tmp/images.json <<'IMAGES_EOF'
+          [
+            {"image": "spatiumddi-api",      "context": "./backend",  "file": "./backend/Dockerfile",  "target": "runtime"},
+            {"image": "spatiumddi-frontend", "context": "./frontend", "file": "./frontend/Dockerfile", "target": ""},
+            {"image": "dns-bind9",           "context": ".", "file": "./agent/dns/images/bind9/Dockerfile",             "target": ""},
+            {"image": "dns-powerdns",        "context": ".", "file": "./agent/dns/images/powerdns/Dockerfile",          "target": ""},
+            {"image": "dns-technitium",      "context": ".", "file": "./agent/dns/images/technitium/Dockerfile",        "target": ""},
+            {"image": "dns-dnsdist",         "context": ".", "file": "./agent/dns/images/dnsdist/Dockerfile",           "target": ""},
+            {"image": "dhcp-kea",            "context": ".", "file": "./agent/dhcp/images/kea/Dockerfile",              "target": ""},
+            {"image": "spatium-supervisor",  "context": ".", "file": "./agent/supervisor/images/supervisor/Dockerfile", "target": ""},
+            {"image": "looking-glass",       "context": ".", "file": "./agent/looking-glass/images/gobgp/Dockerfile",   "target": ""}
+          ]
+          IMAGES_EOF
+          echo "images=$(jq -c . /tmp/images.json)" >> "$GITHUB_OUTPUT"
 
           DATE_TAG="nightly-$(date -u +%Y%m%d)"
           echo "date_tag=${DATE_TAG}" >> "$GITHUB_OUTPUT"
@@ -147,46 +172,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - image: spatiumddi-api
-            context: ./backend
-            file: ./backend/Dockerfile
-            # #732 — MUST stay pinned. ``dev`` is the LAST stage in
-            # backend/Dockerfile, so an unpinned build publishes an api
-            # image carrying pytest + coverage installed as root.
-            target: runtime
-          - image: spatiumddi-frontend
-            context: ./frontend
-            file: ./frontend/Dockerfile
-            target: ""
-          - image: dns-bind9
-            context: .
-            file: ./agent/dns/images/bind9/Dockerfile
-            target: ""
-          - image: dns-powerdns
-            context: .
-            file: ./agent/dns/images/powerdns/Dockerfile
-            target: ""
-          - image: dns-technitium
-            context: .
-            file: ./agent/dns/images/technitium/Dockerfile
-            target: ""
-          - image: dns-dnsdist
-            context: .
-            file: ./agent/dns/images/dnsdist/Dockerfile
-            target: ""
-          - image: dhcp-kea
-            context: .
-            file: ./agent/dhcp/images/kea/Dockerfile
-            target: ""
-          - image: spatium-supervisor
-            context: .
-            file: ./agent/supervisor/images/supervisor/Dockerfile
-            target: ""
-          - image: looking-glass
-            context: .
-            file: ./agent/looking-glass/images/gobgp/Dockerfile
-            target: ""
+        # From the gate job, so this list exists exactly once (see there).
+        # `target: runtime` on the api image is #732's guard: `dev` is the
+        # LAST stage in backend/Dockerfile, so an unpinned build publishes
+        # an image carrying pytest + coverage installed as root.
+        include: ${{ fromJSON(needs.gate.outputs.images) }}
     steps:
       - uses: actions/checkout@v7
       - uses: docker/setup-qemu-action@v3
@@ -198,6 +188,40 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # SCAN BEFORE PUSH. The scan is the gate, so it has to run while
+      # refusing to publish is still possible — otherwise `:nightly` (the
+      # tag DEVELOPMENT.md tells operators to pull) has already moved to
+      # the vulnerable image by the time the job goes red, and with
+      # `fail-fast: false` the registry is left holding a mixed set of
+      # some-new / some-old images. Cost is one extra amd64 build, which
+      # the shared buildx cache makes near-free.
+      - name: Build amd64 for scanning
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
+          target: ${{ matrix.target }}
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: scan-target:${{ matrix.image }}
+          build-args: |
+            VITE_APP_VERSION=${{ needs.gate.outputs.version }}
+          cache-from: type=gha,scope=nightly-${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=nightly-${{ matrix.image }}
+
+      - name: Trivy
+        uses: aquasecurity/trivy-action@0.33.1
+        with:
+          image-ref: scan-target:${{ matrix.image }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          format: table
+
+      # Only now, with the scan green, does anything reach the registry.
+      # The multi-arch build reuses the cache the scan build just warmed,
+      # so the amd64 half is a cache hit.
       - name: Build + push
         uses: docker/build-push-action@v6
         with:
@@ -216,32 +240,6 @@ jobs:
           cache-from: type=gha,scope=nightly-${{ matrix.image }}
           cache-to: type=gha,mode=max,scope=nightly-${{ matrix.image }}
 
-      # Load the amd64 image locally and scan it with the SAME gate CI uses
-      # on PRs. This is the cheapest fix for the detection gap in the header
-      # comment: a base-image CVE gets caught the night the Dockerfile
-      # changes, not at the next release.
-      - name: Build amd64 for scanning
-        uses: docker/build-push-action@v6
-        with:
-          context: ${{ matrix.context }}
-          file: ${{ matrix.file }}
-          target: ${{ matrix.target }}
-          platforms: linux/amd64
-          load: true
-          tags: scan-target:${{ matrix.image }}
-          build-args: |
-            VITE_APP_VERSION=${{ needs.gate.outputs.version }}
-          cache-from: type=gha,scope=nightly-${{ matrix.image }}
-
-      - name: Trivy
-        uses: aquasecurity/trivy-action@0.33.1
-        with:
-          image-ref: scan-target:${{ matrix.image }}
-          severity: HIGH,CRITICAL
-          ignore-unfixed: true
-          exit-code: "1"
-          format: table
-
   # ── Prune the dated tag ring ──────────────────────────────────────────
   prune:
     name: Prune old nightly tags
@@ -255,12 +253,14 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           OWNER: ${{ github.repository_owner }}
+          IMAGES_JSON: ${{ needs.gate.outputs.images }}
         run: |
           set -euo pipefail
           KEEP=7
-          IMAGES="spatiumddi-api spatiumddi-frontend dns-bind9 dns-powerdns \
-                  dns-technitium dns-dnsdist dhcp-kea spatium-supervisor looking-glass"
+          # Same list the build matrix used — see the gate job.
+          IMAGES=$(printf '%s' "$IMAGES_JSON" | jq -r '.[].image')
 
+          failures=0
           for img in $IMAGES; do
             echo "── $img"
             # A version is a prune candidate ONLY when every tag it carries
@@ -269,6 +269,21 @@ jobs:
             # shares a version with the newest dated tag, which the sort
             # keeps anyway, but the all-tags-match rule means we would never
             # delete it even if it did not.
+            #
+            # UNTAGGED versions are deliberately left alone, and this is a
+            # real limitation rather than an oversight. A multi-arch push
+            # creates one untagged child manifest per platform plus a
+            # provenance attestation, all referenced BY the tagged manifest
+            # — deleting them by "is it untagged" would break the very tags
+            # this job is protecting. Working out which untagged versions
+            # are orphaned by a prune means resolving each manifest's
+            # references, which is more machinery than the problem deserves
+            # here.
+            #
+            # So what is bounded is the TAG ring, not total storage: the
+            # children of pruned manifests become orphaned garbage. GHCR's
+            # own "delete untagged versions" retention policy is the right
+            # tool for that and is configured on the package, not here.
             # Distinguish "no candidates" from "the API call failed". A
             # silently-empty list would print "nothing to prune" and read as
             # success while the ring grew without bound — the same
@@ -292,23 +307,42 @@ jobs:
             fi
             echo "   ${total} dated tag(s) — pruning $((total - KEEP))"
 
+            # Failures are COUNTED, not just logged. A prune that 403s every
+            # night (GITHUB_TOKEN without delete:packages, say) would
+            # otherwise report green forever while the ring grew without
+            # bound — the same silence-as-success this job's list branch
+            # already guards against. Counted in a file because the loop
+            # body runs in a subshell.
+            : > /tmp/prune-failures
             printf '%s\n' "$versions" | tail -n +$((KEEP + 1)) | while IFS=$'\t' read -r created id tags; do
               [ -n "$id" ] || continue
               echo "   deleting $tags (created $created)"
-              gh api -X DELETE \
-                "/orgs/${OWNER}/packages/container/${img}/versions/${id}" || \
-                echo "   ! delete failed for $id — continuing"
+              if ! err=$(gh api -X DELETE \
+                   "/orgs/${OWNER}/packages/container/${img}/versions/${id}" 2>&1); then
+                echo "   ! delete FAILED for ${tags}: $(printf '%s' "$err" | head -1)"
+                echo "x" >> /tmp/prune-failures
+              fi
             done
+            failures=$((failures + $(wc -l < /tmp/prune-failures)))
           done
+
+          if [ "$failures" -gt 0 ]; then
+            echo "::error::${failures} prune operation(s) failed — the dated-tag"
+            echo "::error::ring is NOT bounded until this is fixed."
+            exit 1
+          fi
 
   # ── Record what was built, and make a failure impossible to miss ──────
   finalize:
     name: Finalize
     runs-on: ubuntu-latest
     needs: [gate, images, prune]
-    # `always()` so this runs even when a build job failed — recording the
-    # outcome, and surfacing a failure, is the whole point.
-    if: always() && needs.gate.outputs.should_build == 'true'
+    # `always()`, and NOT gated on `should_build` alone: a gate job that
+    # FAILS emits no outputs at all, so that condition would be false and
+    # this job would be skipped — the nightly would die without opening the
+    # tracking issue that is the only reason anyone finds out. Run whenever
+    # the gate didn't cleanly decide to skip.
+    if: always() && needs.gate.result != 'skipped' && needs.gate.outputs.should_build != 'false'
     permissions:
       contents: write
       issues: write
@@ -343,7 +377,7 @@ jobs:
         # A nightly that fails silently is worth nothing — that is the whole
         # reason for a scheduled build. One issue, reused, so a broken week
         # doesn't open seven.
-        if: needs.images.result == 'failure'
+        if: needs.gate.result == 'failure' || needs.images.result == 'failure' || needs.prune.result == 'failure'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -351,7 +385,9 @@ jobs:
           TITLE="Nightly build failing"
           BODY="Nightly build failed on \`main\` @ \`${GITHUB_SHA::12}\`.
 
+          - gate: ${{ needs.gate.result }}
           - images: ${{ needs.images.result }}
+          - prune: ${{ needs.prune.result }}
 
           Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
 

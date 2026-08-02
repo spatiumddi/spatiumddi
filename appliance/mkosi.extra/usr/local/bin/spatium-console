@@ -1622,8 +1622,11 @@ class AppLogTail(threading.Thread):
         # these are the same category. Field-checking on a live appliance
         # (#803) showed them at 16 of 38 visible log lines.
         re.compile(r'"GET /metrics HTTP'),
+        # ``[\w-]+`` because sub-paths are kebab-case (``k8s-proxy/poll``),
+        # and the ``(…/)?`` because the bare ``/supervisor/poll`` — the
+        # endpoint this comment names — has no sub-path at all.
         re.compile(r'"(GET|POST) /api/v1/appliance/supervisor/'
-                   r'(heartbeat|\w+/poll)\b'),
+                   r'(heartbeat|([\w-]+/)?poll)\b'),
     )
 
     # A completed task whose result reports no work done. ``'status':
@@ -1636,8 +1639,16 @@ class AppLogTail(threading.Thread):
     _TASK_RESULT_RE = re.compile(r"Task \S+ succeeded in [\d.e-]+s?: (.*)$")
     # Values that mean "nothing happened". Anything else — a non-zero
     # count, an unrecognised status — makes the whole result interesting.
+    # NOTE ``false`` is deliberately absent. It reads like "nothing", but a
+    # boolean field is almost always an ASSERTION — ``{'ok': False,
+    # 'rows_checked': 0, 'broken': 0}`` is a health check reporting a
+    # problem, and treating False as boring would classify it as
+    # nothing-happened and drop it. Since this predicate runs ahead of the
+    # error veto, nothing downstream would rescue it. The polarity is also
+    # backwards from ``True``, which is (correctly) not boring and keeps
+    # the line. Booleans of either value make a result interesting.
     _BORING_VALUES = {"0", "0.0", "none", "[]", "{}", "''", '""',
-                      "'ok'", "'idle'", "'disabled'", "'skipped'", "false"}
+                      "'ok'", "'idle'", "'disabled'", "'skipped'"}
 
     @classmethod
     def _is_noop_result(cls, line: str) -> bool:
@@ -1654,6 +1665,11 @@ class AppLogTail(threading.Thread):
             return False
         payload = m.group(1).strip()
         if payload.lower() in {"none", "0", "[]", "{}"}:
+            return True
+        # A bare scalar result gets the same treatment as the same value
+        # inside a dict — ``beat_tick`` returning ``'ok'`` every 30 s says
+        # exactly as little as ``{'status': 'ok'}`` does.
+        if payload.lower() in cls._BORING_VALUES:
             return True
         if not (payload.startswith("{") and payload.endswith("}")):
             return False
@@ -1707,8 +1723,18 @@ class AppLogTail(threading.Thread):
         line = _sanitize_console_text(line)
         m = cls._CELERY_PREFIX_RE.match(line)
         if m:
-            line = f"{m.group(1)} {m.group(2):<5} {line[m.end():]}"
-        return cls._TASK_UUID_RE.sub("", line).replace("  ", " ").strip()
+            # Width 8, not 5: the level set runs DEBUG / INFO / WARNING /
+            # ERROR / CRITICAL, so a narrower field leaves the two that
+            # matter most unaligned against the rest and the message column
+            # ragged. Three columns for a scannable left edge, out of the
+            # ~73 this compaction reclaims.
+            line = f"{m.group(1)} {m.group(2):<8} {line[m.end():]}"
+        # Only the UUID is removed. A blanket ``.replace("  ", " ")`` here
+        # would immediately undo the ``:<5`` level padding above (INFO and
+        # WARNING would render ragged against each other) and would collapse
+        # column-aligned payload text that ``_sanitize_console_text``
+        # deliberately preserved.
+        return cls._TASK_UUID_RE.sub("", line).rstrip()
 
     def __init__(self, sink: "deque[str]"):
         super().__init__(daemon=True)
@@ -1747,18 +1773,18 @@ class AppLogTail(threading.Thread):
                 line = line.rstrip("\n")
                 if not line or self._PROBE_RE.search(line):
                     continue
+                # Split the component prefix off ONCE and keep the two parts
+                # separate, rather than re-slicing the formatted string at a
+                # hardcoded offset — that offset silently encodes the ``:<9``
+                # width above, so a component name longer than it would leak
+                # its tail into the body and render twice.
                 comp = self._PREFIX_RE.match(line)
-                if comp:
-                    line = f"{comp.group(1):<9} {line[comp.end():]}"
-                    body = line[10:]
-                else:
-                    body = line
+                component = comp.group(1) if comp else ""
+                body = line[comp.end():] if comp else line
                 if self._is_noise(body):
                     continue
-                if comp:
-                    line = f"{comp.group(1):<9} {self._compact(body)}"
-                else:
-                    line = self._compact(line)
+                body = self._compact(body)
+                line = f"{component:<9} {body}" if component else body
                 self.lines.append("app  " + line[:240])
             self._proc = None
             if self._stop.is_set():
@@ -2539,6 +2565,7 @@ def render_services(
     ps_rows: list[dict],
     cap: int | None = None,
     overflow: int = 0,
+    node_count: int | None = None,
 ) -> Panel:
     """Render the Pods panel — every pod on the local k3s cluster
     with status + node + ports (the image column was dropped — on an
@@ -2568,11 +2595,20 @@ def render_services(
     # single-node appliance — the common case — it was the same hostname
     # repeated down all 11 rows, while NAME (the one flexible column) got
     # squeezed to ellipsis because the 12 fixed columns already eat ~97
-    # cols. Derived from the pods themselves rather than ``state.nodes`` so
-    # the signature stays put, and so the column reflects where pods
-    # actually are. ``render_top_pods`` has conditioned its node column
-    # this way since #272.
-    multi_node = len({(r.get("Node") or "") for r in ps_rows if r.get("Node")}) > 1
+    # cols.
+    #
+    # ``node_count`` is the CLUSTER's node count, which is the actual
+    # question. Counting distinct Node values across the pods instead would
+    # answer a different one: pods that are Pending or being rescheduled
+    # carry no node, so a two-node cluster that has just lost one — exactly
+    # when an operator needs to see WHERE things are — would render as
+    # single-node and hide the column. ``render_top_pods`` uses
+    # ``len(state.nodes)`` for the same reason; the pod-derived fallback is
+    # only for callers that have no cluster view to pass (tests, and any
+    # future embedding).
+    if node_count is None:
+        node_count = len({(r.get("Node") or "") for r in ps_rows if r.get("Node")})
+    multi_node = node_count > 1
 
     tbl = Table.grid(padding=(0, 1), expand=True)
     tbl.add_column(width=1, no_wrap=True)          # health glyph
@@ -3980,6 +4016,7 @@ def render_frame(state: "DashboardState", mono_t: float) -> Layout:
         layout["header"].update(render_header(state, mono_t, compact=True))
         layout["main"].update(
             render_services(state.role, pod_rows, cap=max_pod_rows,
+                            node_count=len(state.nodes),
                             overflow=pods_overflow)
         )
         layout["log"].update(render_log(state.tail, log_h))
@@ -4035,6 +4072,7 @@ def render_frame(state: "DashboardState", mono_t: float) -> Layout:
 
     layout["main"]["pods"].update(
         render_services(state.role, pod_rows, cap=max_pod_rows,
+                        node_count=len(state.nodes),
                         overflow=pods_overflow)
     )
     layout["main"]["top"].update(render_top_pods(state, main_h))

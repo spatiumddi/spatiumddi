@@ -483,3 +483,96 @@ def test_unparseable_result_is_treated_as_interesting(m) -> None:
     assert not m.AppLogTail._is_noop_result(
         "Task app.tasks.x succeeded in 0.02s: {'rows': [{'a': 0}]}"
     )
+
+
+# ── #803 code-review follow-ups ───────────────────────────────────────
+
+
+def test_boolean_false_makes_a_result_interesting(m) -> None:
+    """A boolean field is an ASSERTION, not a count. ``{'ok': False}`` is a
+    health check reporting a problem; treating False as "nothing" would drop
+    it — and since the no-op parse runs ahead of the error veto, nothing
+    downstream would rescue it."""
+    line = "Task app.tasks.x succeeded in 0.02s: {'ok': False, 'rows_checked': 0, 'broken': 0}"
+    assert not m.AppLogTail._is_noop_result(line)
+    assert not m.AppLogTail._is_noise(line)
+    # And the same shape reporting success stays visible too — polarity
+    # must not be the thing that decides.
+    assert not m.AppLogTail._is_noise(
+        "Task app.tasks.x succeeded in 0.02s: {'ok': True, 'checked': 0}"
+    )
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/v1/appliance/supervisor/poll",
+        "/api/v1/appliance/supervisor/heartbeat",
+        "/api/v1/appliance/supervisor/pcap/poll",
+        "/api/v1/appliance/supervisor/k8s-proxy/poll",
+    ],
+)
+def test_every_supervisor_poll_shape_is_filtered(m, path: str) -> None:
+    """The bare ``/poll`` has no sub-path, and sub-paths are kebab-case —
+    both missed by a naive ``\\w+/poll``."""
+    assert m.AppLogTail._is_noise(f'INFO:   10.42.0.52:1 - "POST {path} HTTP/1.1" 200 OK')
+
+
+def test_level_padding_survives_compaction(m) -> None:
+    """A blanket double-space collapse would undo the ``:<5`` padding and
+    leave INFO and WARNING ragged against each other."""
+    info = m.AppLogTail._compact("[2026-08-02 16:55:49,504: INFO/ForkPoolWorker-4] hello")
+    warn = m.AppLogTail._compact("[2026-08-02 16:55:49,504: WARNING/ForkPoolWorker-4] hello")
+    assert info.index("hello") == warn.index("hello")
+
+
+def test_compaction_preserves_column_aligned_payload(m) -> None:
+    """``_sanitize_console_text`` deliberately keeps runs of spaces so
+    structlog's column-aligned output stays readable."""
+    out = m.AppLogTail._compact(
+        "[2026-08-02 16:55:49,504: WARNING/MainProcess] "
+        "[warning ] alert_unknown_rule_type    rule=abc type=x"
+    )
+    assert "rule=abc" in out
+    assert "    rule=abc" in out  # the alignment run survived
+
+
+def test_long_component_name_does_not_leak_into_the_body(m) -> None:
+    """The prefix used to be re-sliced off the FORMATTED string at a
+    hardcoded offset that encoded the padding width, so a component longer
+    than it would render its tail twice."""
+    line = m.AppLogTail._compact("some message")
+    assert line == "some message"
+    # The formatting path itself: component and body stay separate.
+    for comp in ("api", "spatium-supervisor-extra-long"):
+        rendered = f"{comp:<9} {m.AppLogTail._compact('payload here')}"
+        assert rendered.endswith("payload here")
+        assert rendered.count("payload here") == 1
+
+
+def test_node_column_uses_the_cluster_node_count_not_pod_placement(m) -> None:
+    """A two-node cluster that just lost a node has its pods Pending with no
+    Node value — exactly when the operator needs to see WHERE things are.
+    Deriving multi-node from pod placement would hide the column then."""
+    rows = [_pod592("a", ""), _pod592("b", "")]
+    for r in rows:
+        r["K8sState"] = "Pending"
+        r["Node"] = ""
+    text = _panel_text_nodes(m, rows, node_count=2)
+    assert "NODE" in text
+
+
+def _panel_text_nodes(m, rows: list[dict], node_count: int) -> str:
+    buf = Console(width=200, record=True, file=io.StringIO())
+    buf.print(m.render_services("control-plane", rows, node_count=node_count))
+    return _ANSI.sub("", buf.export_text())
+
+
+def test_bare_scalar_result_is_boring_like_the_dict_form(m) -> None:
+    """``beat_tick`` returns ``'ok'`` every 30s; that says exactly as
+    little as ``{'status': 'ok'}``, which was already filtered."""
+    assert m.AppLogTail._is_noise("Task app.tasks.heartbeat.beat_tick succeeded in 0.004s: 'ok'")
+    # A scalar that reports actual work still shows.
+    assert not m.AppLogTail._is_noise(
+        "Task app.tasks.ipam_discovery.dispatch succeeded in 0.04s: 7"
+    )
