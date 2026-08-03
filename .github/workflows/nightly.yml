@@ -351,6 +351,11 @@ jobs:
         if: needs.images.result == 'success' && github.event.inputs.dry_run != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # This job has no checkout, so `gh` cannot infer the repo from git
+          # remotes — without GH_REPO every call dies with "not a git
+          # repository" (which is how the first nightly failed to report
+          # its own failure).
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           if ! gh release view "$NIGHTLY_TAG" >/dev/null 2>&1; then
@@ -380,6 +385,7 @@ jobs:
         if: needs.gate.result == 'failure' || needs.images.result == 'failure' || needs.prune.result == 'failure'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}  # no checkout in this job — see above
         run: |
           set -euo pipefail
           TITLE="Nightly build failing"
