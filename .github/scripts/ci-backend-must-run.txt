@@ -1,0 +1,32 @@
+# Paths OUTSIDE backend/ that must run the backend test suite (#821).
+#
+# ci-backend-relevant.sh checks these prefixes BEFORE its deny-list, so a
+# subtree can be denied wholesale (agent/, appliance/, .github/) while the
+# specific files the suite actually depends on keep running it.
+#
+# One prefix per line; a line ending in "/" matches the whole subtree,
+# otherwise it is a plain prefix (in practice: an exact file). Blank lines
+# and "#" comments are ignored.
+#
+# This file is enforced against reality in both directions by
+# backend/tests/test_ci_backend_relevant.py:
+#   - every entry must exist on disk (no stale carve-outs), and
+#   - every repo-root escape in backend/tests (a ``parents[2+]`` read) must
+#     be covered by an entry here — so a new cross-boundary read that nobody
+#     declared fails the suite loudly instead of silently losing coverage.
+# Editing THIS file runs the suite too (it lives under .github/scripts/).
+
+# test_spatium_console.py loads the console script directly — 52 tests.
+appliance/mkosi.extra/usr/local/bin/
+
+# test_appliance_firewall_render.py imports the renderer by path.
+agent/supervisor/spatium_supervisor/
+
+# The gate machinery itself: the script, this manifest, and the tests that
+# pin them. Any edit here must run the suite that contains those tests.
+.github/scripts/
+
+# The workflow that orchestrates the shards. Not a "read", but a change to
+# how the suite is invoked should exercise the suite. Other workflows are
+# denied — none of them runs backend tests.
+.github/workflows/ci.yml
