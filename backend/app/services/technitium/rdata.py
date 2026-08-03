@@ -1,0 +1,388 @@
+"""Technitium rdata translation, both directions.
+
+Technitium's record **read** API (``/api/zones/records/get``) does not echo
+back the parameters its record **write** API (``/api/zones/records/add``)
+takes. For several types it renames the keys, and for TLSA / SSHFP it
+renders the numeric rdata fields as enum *names*. Verified against a live
+``technitium/dns-server:15.4.0``: adding a TLSA with
+``tlsaCertificateUsage=3, tlsaSelector=1, tlsaMatchingType=1`` reads back as
+``{"certificateUsage": "DANE-EE", "selector": "SPKI",
+"matchingType": "SHA2-256"}``.
+
+So there are two translations, and this module owns both:
+
+``rdata_to_value``
+    read direction — structured ``rData`` → the presentation-format string
+    SpatiumDDI stores, plus the structured fields it keeps in their own
+    columns (MX/SRV priority, weight, port).
+
+``record_params``
+    write direction — a stored value → the type-specific params
+    ``/api/zones/records/{add,delete}`` wants. ``delete`` takes the same
+    value params as ``add`` because that is how it identifies which member
+    of an rrset to remove.
+
+Two consumers, one source of truth: the #744 live-pull importer (read only)
+and the #810 agentless ``technitium_api`` driver (both). They previously
+would have carried a copy each, which is exactly how the SSHFP enum table
+drifts.
+
+**The agent-side driver keeps its own copy** and always will:
+``agent/dns/spatium_dns_agent/drivers/technitium.py`` is a separate Python
+package that ships in the agent image and cannot import from ``app``. Its
+``_normalize_rdata`` / ``_record_params`` are the same translation written
+for a different runtime. Do not delete either side thinking it is dead code.
+
+Nothing mechanically enforces that the two agree — the agent package is not
+importable from the backend test-suite, so a shared assertion is not
+available. What exists instead is a shared corpus: the expectations in
+``backend/tests/test_dns_import_technitium.py`` and
+``agent/dns/tests/test_technitium_render.py`` were both captured from the
+same live ``technitium/dns-server:15.4.0``. If you change an enum table
+here, change it there and run both.
+"""
+
+from __future__ import annotations
+
+import shlex
+from typing import Any
+
+# Record types both directions model. Technitium-proprietary types
+# (ANAME / APP / FWD) are deliberately absent: they are not drop-in
+# equivalents of PowerDNS's ALIAS/LUA and need their own design pass.
+SUPPORTED_RECORD_TYPES = frozenset(
+    {
+        "A",
+        "AAAA",
+        "CNAME",
+        "MX",
+        "TXT",
+        "NS",
+        "PTR",
+        "SRV",
+        "CAA",
+        "TLSA",
+        "SSHFP",
+        "NAPTR",
+        "DNAME",
+        "URI",
+        "SVCB",
+        "HTTPS",
+    }
+)
+
+# Signing artefacts. Never imported and never written by hand — the zone is
+# re-signed at the destination instead of carrying signatures across.
+DNSSEC_RECORD_TYPES = frozenset({"DNSKEY", "RRSIG", "NSEC", "NSEC3", "NSEC3PARAM", "DS"})
+
+# Enum name → number. Technitium returns the name on read and takes the
+# number on write, so these are read in one direction only.
+_TLSA_USAGE = {"PKIX-TA": 0, "PKIX-EE": 1, "DANE-TA": 2, "DANE-EE": 3}
+_TLSA_SELECTOR = {"Cert": 0, "SPKI": 1}
+_TLSA_MATCHING = {"Full": 0, "SHA2-256": 1, "SHA2-512": 2}
+# 5 is absent upstream: Technitium echoes an unmapped algorithm back as its
+# own number-as-string, which the passthrough in ``_enum_num`` handles.
+_SSHFP_ALGO = {"RSA": 1, "DSA": 2, "ECDSA": 3, "Ed25519": 4, "Ed448": 6}
+_SSHFP_FP_TYPE = {"SHA1": 1, "SHA256": 2}
+
+
+def _enum_num(table: dict[str, int], value: Any) -> str:
+    """Map an enum name back to its number.
+
+    An unrecognised value passes through unchanged, so a Technitium release
+    that adds an enum member degrades to one odd-looking record rather than
+    an exception that kills a whole import or reconcile.
+    """
+    return str(table.get(str(value), value))
+
+
+def int_or(value: Any, default: int) -> int:
+    """Coerce to int, falling back only on genuinely absent input.
+
+    ``int(x or default)`` silently rewrites a legitimate **zero**, which
+    matters here: SVCB/HTTPS priority 0 means AliasMode (not ServiceMode),
+    MX preference 0 is the highest priority, and URI priority/weight 0 are
+    both valid.
+    """
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def normalize_fqdn(name: str) -> str:
+    """Ensure a single trailing dot."""
+    return name if name.endswith(".") else name + "."
+
+
+def classify_zone(name: str) -> str:
+    """``"reverse"`` for in-addr.arpa / ip6.arpa, else ``"forward"``."""
+    bare = name.rstrip(".").lower()
+    return "reverse" if bare.endswith((".in-addr.arpa", ".ip6.arpa")) else "forward"
+
+
+def rel_name(record_name: str, zone_fqdn: str) -> str:
+    """Relativise a record's full domain against its zone.
+
+    Technitium reports each record's absolute domain; SpatiumDDI stores a
+    label relative to the zone apex, with ``@`` for the apex itself.
+    """
+    rec = record_name.rstrip(".").lower()
+    zone = zone_fqdn.rstrip(".").lower()
+    if rec == zone or not rec:
+        return "@"
+    if rec.endswith("." + zone):
+        return rec[: -(len(zone) + 1)]
+    return rec
+
+
+def qualified_name(zone_name: str, name: str) -> str:
+    """Compose the bare (no trailing dot) FQDN Technitium's ``domain`` wants.
+
+    The inverse of :func:`rel_name`. Technitium stores and addresses records
+    by absolute name with no trailing dot — its own convention throughout
+    the API and console.
+    """
+    zone = zone_name.rstrip(".")
+    bare = (name or "@").strip().rstrip(".")
+    if bare in ("", "@") or bare.lower() == zone.lower():
+        return zone
+    if bare.lower().endswith("." + zone.lower()):
+        return bare
+    return f"{bare}.{zone}"
+
+
+def svcb_params(value: str) -> tuple[int, str, str]:
+    """Parse presentation-format SVCB/HTTPS rdata into Technitium's params.
+
+    Input shape is what SpatiumDDI stores and BIND9 renders, e.g.
+    ``'1 . alpn="h2,h3"'``: priority, target, then space-separated
+    ``key=value`` params with optionally-quoted values. Returns
+    ``(priority, target, svcParams)``.
+
+    Multi-value params pass through intact. Technitium's ``svcParams`` wire
+    format is ``key|value`` pairs comma-joined, and a single param whose
+    value itself contains commas (``alpn|h2,h3``) is accepted and stored as
+    ``{"alpn": "h2,h3"}`` — verified against a live 15.4.0. What it rejects
+    is splitting the values into separate pairs (``alpn|h2|h3`` and
+    ``alpn|h2,alpn|h3`` both fail with "Requested value 'h3' was not
+    found"), so join on the value, never on the key. Issue #745.
+    """
+    tokens = shlex.split(value)
+    if len(tokens) < 2:
+        return (1, ".", "")
+    priority = int(tokens[0]) if tokens[0].isdigit() else 1
+    # Technitium stores the target un-dotted; leaving a root dot on makes
+    # every SVCB/HTTPS record read as changed on every reconcile. ``or "."``
+    # keeps a bare apex target from collapsing to the empty string.
+    target = tokens[1].rstrip(".") or "."
+    parts = []
+    for tok in tokens[2:]:
+        if "=" not in tok:
+            continue
+        key, _, raw_val = tok.partition("=")
+        parts.append(f"{key}|{raw_val}")
+    return (priority, target, ",".join(parts))
+
+
+# ── Read direction: Technitium rData → stored value ────────────────────
+
+
+def rdata_to_value(rtype: str, rdata: dict[str, Any]) -> tuple[str, dict[str, int]]:
+    """Rebuild the presentation-format value from Technitium's rData.
+
+    Returns ``(value, extra)`` where ``extra`` carries the fields
+    SpatiumDDI stores in their own columns rather than in the value string
+    (MX/SRV ``priority``, SRV ``weight`` / ``port``).
+    """
+    extra: dict[str, int] = {}
+
+    if rtype in ("A", "AAAA"):
+        return str(rdata.get("ipAddress") or ""), extra
+    if rtype == "CNAME":
+        return str(rdata.get("cname") or ""), extra
+    if rtype == "DNAME":
+        return str(rdata.get("dname") or ""), extra
+    if rtype == "NS":
+        return str(rdata.get("nameServer") or ""), extra
+    if rtype == "PTR":
+        return str(rdata.get("ptrName") or ""), extra
+    if rtype == "TXT":
+        return str(rdata.get("text") or ""), extra
+    if rtype == "MX":
+        extra["priority"] = int_or(rdata.get("preference"), 10)
+        return str(rdata.get("exchange") or ""), extra
+    if rtype == "SRV":
+        extra["priority"] = int_or(rdata.get("priority"), 0)
+        extra["weight"] = int_or(rdata.get("weight"), 0)
+        extra["port"] = int_or(rdata.get("port"), 0)
+        return str(rdata.get("target") or ""), extra
+    if rtype == "CAA":
+        return (
+            f"{int_or(rdata.get('flags'), 0)} {rdata.get('tag') or 'issue'} "
+            f"\"{rdata.get('value') or ''}\"",
+            extra,
+        )
+    if rtype == "TLSA":
+        return (
+            " ".join(
+                [
+                    _enum_num(_TLSA_USAGE, rdata.get("certificateUsage")),
+                    _enum_num(_TLSA_SELECTOR, rdata.get("selector")),
+                    _enum_num(_TLSA_MATCHING, rdata.get("matchingType")),
+                    str(rdata.get("certificateAssociationData") or "").lower(),
+                ]
+            ),
+            extra,
+        )
+    if rtype == "SSHFP":
+        return (
+            " ".join(
+                [
+                    _enum_num(_SSHFP_ALGO, rdata.get("algorithm")),
+                    _enum_num(_SSHFP_FP_TYPE, rdata.get("fingerprintType")),
+                    str(rdata.get("fingerprint") or "").lower(),
+                ]
+            ),
+            extra,
+        )
+    if rtype == "NAPTR":
+        return (
+            f"{rdata.get('order') or 0} {rdata.get('preference') or 0} "
+            f"\"{rdata.get('flags') or ''}\" \"{rdata.get('services') or ''}\" "
+            f"\"{rdata.get('regexp') or ''}\" {rdata.get('replacement') or '.'}",
+            extra,
+        )
+    if rtype == "URI":
+        return (
+            f"{int_or(rdata.get('priority'), 1)} "
+            f"{int_or(rdata.get('weight'), 1)} {rdata.get('uri') or ''}",
+            extra,
+        )
+    if rtype in ("SVCB", "HTTPS"):
+        params = rdata.get("svcParams") or {}
+        rendered = " ".join(f'{k}="{v}"' for k, v in sorted(params.items()))
+        target = rdata.get("svcTargetName") or "."
+        return (
+            f"{int_or(rdata.get('svcPriority'), 1)} {target}"
+            + (f" {rendered}" if rendered else ""),
+            extra,
+        )
+    # Unreachable for SUPPORTED_RECORD_TYPES, but keeps the function total.
+    return str(rdata), extra
+
+
+# ── Write direction: stored value → Technitium add/delete params ───────
+
+
+def record_params(
+    rtype: str,
+    value: str,
+    *,
+    priority: int | None = None,
+    weight: int | None = None,
+    port: int | None = None,
+) -> dict[str, Any]:
+    """Build the type-specific params for ``/api/zones/records/{add,delete}``.
+
+    ``delete`` takes the same value params as ``add``: that is how
+    Technitium identifies *which* member of an rrset to remove, which
+    matters because SpatiumDDI keys records per value and supports
+    round-robin A records and multi-value MX / NS / TXT.
+
+    ``priority`` / ``weight`` / ``port`` come from SpatiumDDI's own columns.
+    They are defaulted with ``if x is None`` rather than ``or`` because zero
+    is legitimate for every one of them — MX preference 0 is the highest
+    priority, and SRV weight/port 0 are both meaningful.
+    """
+    value = value.rstrip(".")
+    if rtype in ("A", "AAAA"):
+        return {"ipAddress": value}
+    if rtype == "CNAME":
+        return {"cname": value}
+    if rtype == "DNAME":
+        return {"dname": value}
+    if rtype == "NS":
+        return {"nameServer": value}
+    if rtype == "PTR":
+        return {"ptrName": value}
+    if rtype == "MX":
+        return {"exchange": value, "preference": 10 if priority is None else priority}
+    if rtype == "SRV":
+        return {
+            "target": value,
+            "priority": 0 if priority is None else priority,
+            "weight": 0 if weight is None else weight,
+            "port": 0 if port is None else port,
+        }
+    if rtype == "TXT":
+        return {"text": value}
+    if rtype == "CAA":
+        # value shape: "<flags> <tag> <target>", e.g. '0 issue "letsencrypt.org"'
+        tokens = shlex.split(value)
+        flags = int(tokens[0]) if tokens and tokens[0].isdigit() else 0
+        tag = tokens[1] if len(tokens) > 1 else "issue"
+        target = tokens[2] if len(tokens) > 2 else ""
+        return {"flags": flags, "tag": tag, "value": target}
+    if rtype == "TLSA":
+        tokens = shlex.split(value)
+        return {
+            "tlsaCertificateUsage": tokens[0] if len(tokens) > 0 else "0",
+            "tlsaSelector": tokens[1] if len(tokens) > 1 else "0",
+            "tlsaMatchingType": tokens[2] if len(tokens) > 2 else "0",
+            # Lower-cased to match the read side — Technitium upper-cases
+            # the stored hex, so comparing raw would churn every record.
+            "tlsaCertificateAssociationData": (tokens[3].lower() if len(tokens) > 3 else ""),
+        }
+    if rtype == "SSHFP":
+        tokens = shlex.split(value)
+        return {
+            "sshfpAlgorithm": tokens[0] if len(tokens) > 0 else "0",
+            "sshfpFingerprintType": tokens[1] if len(tokens) > 1 else "0",
+            "sshfpFingerprint": tokens[2].lower() if len(tokens) > 2 else "",
+        }
+    if rtype == "NAPTR":
+        tokens = shlex.split(value)
+        return {
+            "naptrOrder": tokens[0] if len(tokens) > 0 else "0",
+            "naptrPreference": tokens[1] if len(tokens) > 1 else "0",
+            "naptrFlags": tokens[2] if len(tokens) > 2 else "",
+            "naptrServices": tokens[3] if len(tokens) > 3 else "",
+            "naptrRegexp": tokens[4] if len(tokens) > 4 else "",
+            "naptrReplacement": tokens[5] if len(tokens) > 5 else ".",
+        }
+    if rtype == "URI":
+        tokens = shlex.split(value)
+        return {
+            "uriPriority": tokens[0] if len(tokens) > 0 else "1",
+            "uriWeight": tokens[1] if len(tokens) > 1 else "1",
+            # Trailing slash stripped on both sides — Technitium appends one
+            # to a bare-authority URI when it stores the record.
+            "uri": tokens[2].rstrip("/") if len(tokens) > 2 else "",
+        }
+    if rtype in ("SVCB", "HTTPS"):
+        prio, target, params = svcb_params(value)
+        out: dict[str, Any] = {"svcPriority": prio, "svcTargetName": target}
+        if params:
+            out["svcParams"] = params
+        return out
+    # Unrecognised type — pass the raw value through under a best-guess key
+    # so the API's own error message says what's missing, rather than
+    # silently dropping the record.
+    return {"value": value}
+
+
+__all__ = [
+    "DNSSEC_RECORD_TYPES",
+    "SUPPORTED_RECORD_TYPES",
+    "classify_zone",
+    "int_or",
+    "normalize_fqdn",
+    "qualified_name",
+    "rdata_to_value",
+    "record_params",
+    "rel_name",
+    "svcb_params",
+]

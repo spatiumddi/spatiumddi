@@ -40,7 +40,13 @@ from app.core.permissions import (
     token_scope_allows,
 )
 from app.drivers.dns import _DRIVERS as _DNS_DRIVERS
-from app.drivers.dns import CLOUD_DNS_DRIVERS, get_driver, is_agentless
+from app.drivers.dns import (
+    CREDENTIALED_DNS_DRIVERS,
+    TOPOLOGY_PULL_DRIVERS,
+    get_driver,
+    is_agentless,
+    supports_topology_pull,
+)
 from app.drivers.dns.base import DynamicUpdateCaps, UpdateAclEntry
 from app.drivers.dns.windows import test_winrm_credentials
 from app.models.appliance import ApplianceCertificate
@@ -147,11 +153,16 @@ _DRIVER_GATED_RECORD_TYPES: dict[str, frozenset[str]] = {
     # SVCB / HTTPS (RFC 9460) + DNAME (RFC 6672) are served natively only by
     # our self-hosted authoritative backends. The hosted-DNS providers vary
     # (and would fail at apply rather than create), so gate to bind9 + pdns
-    # + technitium and let a follow-up widen the set once a provider's apply
+    # + Technitium and let a follow-up widen the set once a provider's apply
     # path is verified. issue #338.
-    "SVCB": frozenset({"bind9", "powerdns", "technitium"}),
-    "HTTPS": frozenset({"bind9", "powerdns", "technitium"}),
-    "DNAME": frozenset({"bind9", "powerdns", "technitium"}),
+    #
+    # Both Technitium drivers qualify — same daemon, so the same wire
+    # capability; the difference between them is who runs it (#810). The
+    # agentless one translates all three in both directions via
+    # ``app.services.technitium.rdata``.
+    "SVCB": frozenset({"bind9", "powerdns", "technitium", "technitium_api"}),
+    "HTTPS": frozenset({"bind9", "powerdns", "technitium", "technitium_api"}),
+    "DNAME": frozenset({"bind9", "powerdns", "technitium", "technitium_api"}),
 }
 
 # Zone-level operations only some drivers support. Same shape as
@@ -1411,6 +1422,51 @@ async def list_servers(group_id: uuid.UUID, db: DB, _: CurrentUser) -> list[Serv
     return [ServerResponse.from_model(s) for s in result.scalars().all()]
 
 
+async def _validate_driver_credentials(driver: str, creds: dict[str, Any]) -> None:
+    """Structurally validate a credential dict before it is encrypted.
+
+    Cheap, offline checks only — a real auth test is
+    ``POST …/servers/{id}/test-connection``, which needs a saved row and
+    which the operator may legitimately skip. The point here is to turn
+    "saved fine, then every sync fails" into a 422 on save.
+
+    ``technitium_api`` (#810) is the only driver with anything to check
+    today, and it has two things worth catching:
+
+    * the API URL must carry an explicit scheme. Guessing ``http`` for a
+      bare host would silently put the bearer token on the wire in
+      cleartext.
+    * SECURITY (#400 / L5): the URL is operator-supplied and the *server*
+      dials it, so it goes through the SSRF guard like every other
+      operator-supplied integration target. Advisory, not blocking — a
+      co-located Technitium on the appliance's own loopback is a legitimate
+      target, and this module's contract is to log those rather than refuse
+      them.
+    """
+    if driver != "technitium_api":
+        return
+
+    from app.core.ssrf import assert_safe_target  # noqa: PLC0415
+    from app.drivers.dns._cloud_base import CloudDNSError  # noqa: PLC0415
+    from app.drivers.dns.technitium_api import TechnitiumAPIDriver  # noqa: PLC0415
+
+    raw_url = str(creds.get("api_url") or "")
+    try:
+        api_url = TechnitiumAPIDriver.normalize_api_url(raw_url)
+    except CloudDNSError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if not str(creds.get("api_token") or "").strip():
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "technitium_api requires an api_token. Create one in the "
+                "Technitium console under Administration → Sessions → Create "
+                "Token; a session token from a login expires and will not do."
+            ),
+        )
+    assert_safe_target(api_url, label="technitium_api")
+
+
 @router.post(
     "/groups/{group_id}/servers",
     response_model=ServerResponse,
@@ -1466,15 +1522,17 @@ async def create_server(
         creds.setdefault("winrm_port", 5986 if creds.get("use_tls") else 5985)
         server.credentials_encrypted = encrypt_dict(creds)
 
-    # Cloud DNS driver credentials (issue #37) — provider-specific dict,
-    # Fernet-encrypted into the same column. Required on create for an
-    # agentless cloud driver (without them the driver can't reach the API).
-    if body.driver in CLOUD_DNS_DRIVERS:
+    # Credentialed agentless drivers — the cloud providers (issue #37) plus
+    # self-hosted technitium_api (issue #810). Driver-specific dict,
+    # Fernet-encrypted into the same column. Required on create: without it
+    # the driver has no way to reach the API at all.
+    if body.driver in CREDENTIALED_DNS_DRIVERS:
         if not body.cloud_credentials:
             raise HTTPException(
                 status_code=400,
                 detail=f"{body.driver} create requires cloud_credentials",
             )
+        await _validate_driver_credentials(body.driver, body.cloud_credentials)
         server.credentials_encrypted = encrypt_dict(body.cloud_credentials)
 
     db.add(server)
@@ -1559,28 +1617,45 @@ async def update_server(
             server.credentials_encrypted = None
             changes["windows_credentials_cleared"] = True
 
-    # Cloud DNS driver credentials (issue #37): None → leave alone,
-    # {} → clear, non-empty dict → full replace (the modal sends the
-    # complete provider cred set, so no partial-merge needed).
-    # ``server.driver`` here is the EFFECTIVE driver (the changes loop
-    # above already applied any driver change). Reject cloud_credentials
-    # on a non-cloud driver so we never clobber a Windows server's
+    # Credentialed-driver credentials (issue #37 cloud + #810 technitium_api):
+    # None → leave alone, {} → clear, non-empty dict → full replace (the modal
+    # sends the complete cred set, so no partial-merge needed).
+    # ``server.driver`` here is the EFFECTIVE driver (the changes loop above
+    # already applied any driver change). Reject cloud_credentials on a driver
+    # that doesn't take them so we never clobber a Windows server's
     # ``credentials_encrypted`` (or set a meaningless blob on bind9).
     if body.cloud_credentials is not None:
-        if server.driver not in CLOUD_DNS_DRIVERS:
+        if server.driver not in CREDENTIALED_DNS_DRIVERS:
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    "cloud_credentials is only valid for cloud DNS drivers "
-                    f"({', '.join(sorted(CLOUD_DNS_DRIVERS))}); this server's driver "
-                    f"is {server.driver!r}"
+                    "cloud_credentials is only valid for the credentialed "
+                    f"agentless drivers ({', '.join(sorted(CREDENTIALED_DNS_DRIVERS))}); "
+                    f"this server's driver is {server.driver!r}"
                 ),
             )
         if body.cloud_credentials == {}:
             server.credentials_encrypted = None
             changes["cloud_credentials_cleared"] = True
         else:
-            server.credentials_encrypted = encrypt_dict(body.cloud_credentials)
+            # MERGE over the stored blob rather than replacing it. The modal
+            # tells the operator that blank fields keep their stored value,
+            # and it renders every field blank on edit because credentials are
+            # never returned — so a full replace meant "change the API URL"
+            # silently wiped the token. Same decrypt-merge-reencrypt contract
+            # the windows_credentials block above already honours.
+            merged: dict[str, Any] = {}
+            if server.credentials_encrypted:
+                try:
+                    merged = decrypt_dict(server.credentials_encrypted)
+                except ValueError:
+                    # Unreadable stored blob (key rotation, restore without
+                    # rewrap): treat the submitted set as the whole truth
+                    # rather than refusing the edit that would fix it.
+                    merged = {}
+            merged.update(body.cloud_credentials)
+            await _validate_driver_credentials(server.driver, merged)
+            server.credentials_encrypted = encrypt_dict(merged)
             changes["cloud_credentials_set"] = True
 
     db.add(
@@ -1788,6 +1863,51 @@ async def test_windows_credentials_endpoint(
 
 
 @router.post(
+    "/groups/{group_id}/servers/{server_id}/test-connection",
+    response_model=TestResult,
+)
+async def test_server_connection(
+    group_id: uuid.UUID,
+    server_id: uuid.UUID,
+    db: DB,
+    _user: SuperAdmin,
+) -> TestResult:
+    """Probe a credentialed agentless server with its stored credentials.
+
+    Answers the question an operator has immediately after saving a token:
+    *did that work?* Every driver in ``CREDENTIALED_DNS_DRIVERS`` implements
+    ``probe()``; before #810 nothing called it, so the answer was "wait for
+    the next sync to fail".
+
+    Read-only and never raises for an expected failure — a bad token comes
+    back as ``ok=false`` with the provider's own message, which is the useful
+    thing to show. Post-save only: the credentials come from the row, so
+    there is no plaintext-credential mode like the Windows endpoint's
+    (that one predates the encrypted-column round trip being cheap).
+    """
+    server = await _require_server(group_id, server_id, db)
+    if server.driver not in CREDENTIALED_DNS_DRIVERS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"test-connection applies to the credentialed agentless drivers "
+                f"({', '.join(sorted(CREDENTIALED_DNS_DRIVERS))}); this server's "
+                f"driver is {server.driver!r}. Windows DNS uses "
+                f"/test-windows-credentials."
+            ),
+        )
+    if not server.credentials_encrypted:
+        raise HTTPException(status_code=400, detail="Server has no stored credentials to test")
+
+    driver = get_driver(server.driver)
+    probe = getattr(driver, "probe", None)
+    if probe is None:  # pragma: no cover — every credentialed driver has one
+        raise HTTPException(status_code=400, detail=f"{server.driver} has no probe")
+    result = await probe(server)
+    return TestResult(ok=bool(result.ok), message=str(result.message))
+
+
+@router.post(
     "/groups/{group_id}/servers/{server_id}/pull-zones-from-server",
     response_model=PullZonesResult,
 )
@@ -1805,14 +1925,18 @@ async def pull_zones_from_server(
     """
     server = await _require_server(group_id, server_id, db)
     # Zone-topology reads are supported by the agentless drivers that
-    # implement ``pull_zones_from_server`` — Windows DNS (WinRM) + the
-    # cloud DNS drivers (provider API, issue #37).
-    if server.driver != "windows_dns" and server.driver not in CLOUD_DNS_DRIVERS:
+    # implement ``pull_zones_from_server`` — Windows DNS (WinRM), the cloud
+    # DNS drivers (provider API, #37) and technitium_api (#810). The set
+    # lives in the driver registry so a new driver lands in one place; this
+    # used to be two inline driver-name comparisons that had to be kept in
+    # step with each other by hand.
+    if not supports_topology_pull(server.driver):
         raise HTTPException(
             status_code=400,
             detail=(
-                f"pull-zones is only supported on windows_dns + cloud DNS drivers "
-                f"(got {server.driver!r})"
+                f"pull-zones is only supported on drivers that can read zone "
+                f"topology ({', '.join(sorted(TOPOLOGY_PULL_DRIVERS))}); got "
+                f"{server.driver!r}"
             ),
         )
     if not server.credentials_encrypted:
@@ -1875,6 +1999,9 @@ class SyncFromServerResponse(BaseModel):
     # the DB before the AXFR loop runs, so records land in one pass.
     new_zones_on_server: list[str]
     zones_imported: list[str]
+    # Discovered but deliberately not adopted: SpatiumDDI's own reserved
+    # names, plus zones the driver reports as non-manageable (a Technitium
+    # Secondary / Stub / Forwarder — #810).
     zones_skipped_system: list[str]
     # Zones present in SpatiumDDI but not on the server, that we pushed
     # over WinRM during this sync. Only populated for windows_dns+creds —
@@ -1963,12 +2090,12 @@ async def _sync_single_server(
 
     group_id = server.group_id
     # Agentless drivers that can list zones from the authoritative side:
-    # Windows DNS (WinRM Path B) + the cloud DNS drivers (provider API).
-    topology_capable = (
-        server.driver == "windows_dns" or server.driver in CLOUD_DNS_DRIVERS
-    ) and bool(server.credentials_encrypted)
+    # Windows DNS (WinRM Path B), the cloud DNS drivers (provider API) and
+    # technitium_api (#810). Credentials are a per-ROW fact, so they stay a
+    # separate conjunct — the driver-level question is answered centrally.
+    topology_capable = supports_topology_pull(server.driver) and bool(server.credentials_encrypted)
 
-    # 1. Topology discovery (Path B for Windows / provider API for cloud).
+    # 1. Topology discovery (Path B for Windows / REST API for the rest).
     zones_on_server: list[str] = []
     zone_meta_by_name: dict[str, dict[str, Any]] = {}
     if topology_capable:
@@ -2001,6 +2128,15 @@ async def _sync_single_server(
                 zones_skipped_system.append(name)
                 continue
             meta = zone_meta_by_name.get(name, {})
+            # A driver may report a zone it can enumerate but that SpatiumDDI
+            # must not adopt as its own — Technitium (#810) serves Secondary /
+            # Stub / Forwarder zones alongside its primaries, and importing one
+            # as ``zone_type="primary"`` would claim authority over a zone this
+            # server only transfers or forwards. Absent key = adoptable, so
+            # every other driver is unaffected.
+            if meta.get("manageable") is False:
+                zones_skipped_system.append(name)
+                continue
             is_reverse = bool(meta.get("is_reverse_lookup"))
             kind = _infer_zone_kind(name, is_reverse)
             zone = DNSZone(
@@ -5017,13 +5153,13 @@ async def apply_delegation(
 async def _push_zone_to_agentless_servers(db: DB, zone: DNSZone, op: str) -> None:
     """Push ``create`` / ``delete`` to every agentless-with-creds server.
 
-    "Agentless" means ``windows_dns`` (WinRM Path B) + the cloud DNS
-    drivers (cloudflare / route53 / azure_dns / google_dns — issue #37),
-    each of which implements ``apply_zone_change``. "With creds" means a
-    credential blob is configured. Those are the servers with an admin
-    channel the control plane can drive directly — agent-based drivers
-    (bind9 / powerdns) get zone changes through the ConfigBundle
-    long-poll, not here.
+    "Agentless" means ``windows_dns`` (WinRM Path B), the cloud DNS drivers
+    (issue #37) and ``technitium_api`` (issue #810) — every driver in
+    ``AGENTLESS_DRIVERS`` implements ``apply_zone_change``. "With creds"
+    means a credential blob is configured. Those are the servers with an
+    admin channel the control plane can drive directly — agent-based
+    drivers (bind9 / powerdns / technitium) get zone changes through the
+    ConfigBundle long-poll, not here.
 
     Failure surfaces as a 502 so the caller's ``db.commit()`` never runs
     — the DB row stays in an uncommitted state and the session rollback

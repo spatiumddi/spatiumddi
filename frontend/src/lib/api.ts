@@ -5412,9 +5412,13 @@ export const dnsApi = {
     data: Partial<DNSServer> & {
       api_key?: string;
       windows_credentials?: WindowsDNSCredentials | Record<string, never>;
-      // Cloud DNS driver credentials (issue #37). Provider-specific dict
-      // (e.g. {api_token} for cloudflare); Fernet-encrypted server-side.
-      cloud_credentials?: Record<string, string>;
+      // Credentialed agentless driver credentials — the cloud providers
+      // (issue #37) and self-hosted technitium_api (issue #810).
+      // Driver-specific dict (e.g. {api_token} for cloudflare,
+      // {api_url, api_token, verify_tls} for technitium_api);
+      // Fernet-encrypted server-side. Booleans are allowed because
+      // verify_tls is a real boolean, not the string "false".
+      cloud_credentials?: Record<string, string | boolean>;
     },
   ) =>
     api
@@ -5429,7 +5433,9 @@ export const dnsApi = {
         | Partial<WindowsDNSCredentials>
         | Record<string, never>;
       // None = leave alone, {} = clear, dict = replace.
-      cloud_credentials?: Record<string, string> | Record<string, never>;
+      cloud_credentials?:
+        | Record<string, string | boolean>
+        | Record<string, never>;
     },
   ) =>
     api
@@ -5459,6 +5465,17 @@ export const dnsApi = {
         ok: boolean;
         message: string;
       }>("/dns/test-windows-credentials", body)
+      .then((r) => r.data),
+
+  // Probe a saved credentialed agentless server (cloud providers +
+  // technitium_api, issue #810) with its STORED credentials. Post-save only —
+  // there is no plaintext-credential mode, unlike the Windows endpoint.
+  testServerConnection: (groupId: string, serverId: string) =>
+    api
+      .post<{
+        ok: boolean;
+        message: string;
+      }>(`/dns/groups/${groupId}/servers/${serverId}/test-connection`)
       .then((r) => r.data),
 
   pullZonesFromServer: (groupId: string, serverId: string) =>

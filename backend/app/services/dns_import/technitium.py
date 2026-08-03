@@ -22,12 +22,15 @@ PowerDNS hands back ``content`` strings that parse straight into a
 record value; Technitium hands back per-type fields whose names do NOT
 match the ones its own *write* API takes, and which translate numeric
 rdata into enum names (``tlsaSelector=1`` reads back as
-``selector="SPKI"``). ``_rdata_to_value`` is the inverse: it rebuilds
-the presentation-format string SpatiumDDI stores. The agent driver
-solves the same problem in the other direction — see
-``_normalize_rdata`` in ``agent/dns/spatium_dns_agent/drivers/
-technitium.py``; the two share the enum tables' intent, and a
-round-trip test asserts they agree.
+``selector="SPKI"``). ``rdata_to_value`` is the inverse: it rebuilds
+the presentation-format string SpatiumDDI stores.
+
+That translation lives in :mod:`app.services.technitium.rdata` (issue
+#810) rather than here, because the agentless ``technitium_api`` driver
+needs the identical mapping — plus its inverse for writes. This module
+imports it under the old private names so the rest of the file reads
+unchanged. The agent driver keeps a third copy it cannot share, being a
+separate package; see that module's docstring.
 
 Auth: a bearer token, passed as a ``token`` query param (Technitium's
 own convention — it accepts ``Authorization: Bearer`` too, but the
@@ -40,6 +43,28 @@ from __future__ import annotations
 from typing import Any
 
 import httpx
+
+from app.services.technitium.rdata import (
+    DNSSEC_RECORD_TYPES as _DNSSEC_RECORDS,
+)
+from app.services.technitium.rdata import (
+    SUPPORTED_RECORD_TYPES as _SUPPORTED_RECORD_TYPES,
+)
+from app.services.technitium.rdata import (
+    classify_zone as _classify_zone,
+)
+from app.services.technitium.rdata import (
+    int_or as _int_or,
+)
+from app.services.technitium.rdata import (
+    normalize_fqdn as _normalize_fqdn,
+)
+from app.services.technitium.rdata import (
+    rdata_to_value as _rdata_to_value,
+)
+from app.services.technitium.rdata import (
+    rel_name as _rel_name,
+)
 
 from .canonical import (
     ImportedRecord,
@@ -61,168 +86,11 @@ _DEFAULT_TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0)
 
 _MAX_ZONES_PER_PULL = 5000
 
-# Record types the importer models. Technitium-proprietary types
-# (ANAME / APP / FWD) and DNSSEC artefacts drop out with a per-zone
-# warning rather than silently.
-_SUPPORTED_RECORD_TYPES = {
-    "A",
-    "AAAA",
-    "CNAME",
-    "MX",
-    "TXT",
-    "NS",
-    "PTR",
-    "SRV",
-    "CAA",
-    "TLSA",
-    "SSHFP",
-    "NAPTR",
-    "DNAME",
-    "URI",
-    "SVCB",
-    "HTTPS",
-}
-
-_DNSSEC_RECORDS = {"DNSKEY", "RRSIG", "NSEC", "NSEC3", "NSEC3PARAM", "DS"}
-
-# Only these can be imported as authoritative data. A Secondary holds a
-# copy of someone else's zone and a Forwarder holds no records at all,
-# so importing either would mint rows SpatiumDDI would then try to serve
-# as its own.
+# Only these zone types can be imported as authoritative data. A Secondary
+# holds a copy of someone else's zone and a Forwarder holds no records at
+# all, so importing either would mint rows SpatiumDDI would then try to
+# serve as its own.
 _IMPORTABLE_ZONE_TYPES = {"Primary"}
-
-# Inverse of the agent driver's enum translation. Technitium returns
-# these fields by NAME on read while its write API takes the number.
-_TLSA_USAGE = {"PKIX-TA": 0, "PKIX-EE": 1, "DANE-TA": 2, "DANE-EE": 3}
-_TLSA_SELECTOR = {"Cert": 0, "SPKI": 1}
-_TLSA_MATCHING = {"Full": 0, "SHA2-256": 1, "SHA2-512": 2}
-_SSHFP_ALGO = {"RSA": 1, "DSA": 2, "ECDSA": 3, "Ed25519": 4, "Ed448": 6}
-_SSHFP_FP_TYPE = {"SHA1": 1, "SHA256": 2}
-
-
-def _enum_num(table: dict[str, int], value: Any) -> str:
-    """Map an enum name back to its number, passing an unrecognised
-    value through unchanged so a future Technitium enum degrades to an
-    odd-looking record rather than an exception mid-import."""
-    return str(table.get(str(value), value))
-
-
-def _int_or(value: Any, default: int) -> int:
-    """``int(x or default)`` silently rewrites a legitimate ZERO to the
-    default, which matters here: SVCB/HTTPS priority 0 means AliasMode
-    (not ServiceMode), MX preference 0 is the highest priority, and URI
-    priority/weight 0 are valid. Only a genuinely absent or unparseable
-    value falls back.
-    """
-    if value is None or value == "":
-        return default
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _normalize_fqdn(name: str) -> str:
-    return name if name.endswith(".") else name + "."
-
-
-def _classify_zone(name: str) -> str:
-    bare = name.rstrip(".").lower()
-    return "reverse" if bare.endswith((".in-addr.arpa", ".ip6.arpa")) else "forward"
-
-
-def _rel_name(record_name: str, zone_fqdn: str) -> str:
-    """Technitium reports each record's full domain; SpatiumDDI stores a
-    label relative to the zone, with ``@`` for the apex."""
-    rec = record_name.rstrip(".").lower()
-    zone = zone_fqdn.rstrip(".").lower()
-    if rec == zone or not rec:
-        return "@"
-    if rec.endswith("." + zone):
-        return rec[: -(len(zone) + 1)]
-    return rec
-
-
-def _rdata_to_value(rtype: str, rdata: dict[str, Any]) -> tuple[str, dict[str, int]]:
-    """Rebuild the presentation-format value from Technitium's structured
-    rData, plus any structured fields SpatiumDDI stores separately
-    (MX/SRV priority, weight, port).
-    """
-    extra: dict[str, int] = {}
-
-    if rtype in ("A", "AAAA"):
-        return str(rdata.get("ipAddress") or ""), extra
-    if rtype == "CNAME":
-        return str(rdata.get("cname") or ""), extra
-    if rtype == "DNAME":
-        return str(rdata.get("dname") or ""), extra
-    if rtype == "NS":
-        return str(rdata.get("nameServer") or ""), extra
-    if rtype == "PTR":
-        return str(rdata.get("ptrName") or ""), extra
-    if rtype == "TXT":
-        return str(rdata.get("text") or ""), extra
-    if rtype == "MX":
-        extra["priority"] = _int_or(rdata.get("preference"), 10)
-        return str(rdata.get("exchange") or ""), extra
-    if rtype == "SRV":
-        extra["priority"] = _int_or(rdata.get("priority"), 0)
-        extra["weight"] = _int_or(rdata.get("weight"), 0)
-        extra["port"] = _int_or(rdata.get("port"), 0)
-        return str(rdata.get("target") or ""), extra
-    if rtype == "CAA":
-        return (
-            f"{_int_or(rdata.get('flags'), 0)} {rdata.get('tag') or 'issue'} "
-            f"\"{rdata.get('value') or ''}\"",
-            extra,
-        )
-    if rtype == "TLSA":
-        return (
-            " ".join(
-                [
-                    _enum_num(_TLSA_USAGE, rdata.get("certificateUsage")),
-                    _enum_num(_TLSA_SELECTOR, rdata.get("selector")),
-                    _enum_num(_TLSA_MATCHING, rdata.get("matchingType")),
-                    str(rdata.get("certificateAssociationData") or "").lower(),
-                ]
-            ),
-            extra,
-        )
-    if rtype == "SSHFP":
-        return (
-            " ".join(
-                [
-                    _enum_num(_SSHFP_ALGO, rdata.get("algorithm")),
-                    _enum_num(_SSHFP_FP_TYPE, rdata.get("fingerprintType")),
-                    str(rdata.get("fingerprint") or "").lower(),
-                ]
-            ),
-            extra,
-        )
-    if rtype == "NAPTR":
-        return (
-            f"{rdata.get('order') or 0} {rdata.get('preference') or 0} "
-            f"\"{rdata.get('flags') or ''}\" \"{rdata.get('services') or ''}\" "
-            f"\"{rdata.get('regexp') or ''}\" {rdata.get('replacement') or '.'}",
-            extra,
-        )
-    if rtype == "URI":
-        return (
-            f"{_int_or(rdata.get('priority'), 1)} "
-            f"{_int_or(rdata.get('weight'), 1)} {rdata.get('uri') or ''}",
-            extra,
-        )
-    if rtype in ("SVCB", "HTTPS"):
-        params = rdata.get("svcParams") or {}
-        rendered = " ".join(f'{k}="{v}"' for k, v in sorted(params.items()))
-        target = rdata.get("svcTargetName") or "."
-        return (
-            f"{_int_or(rdata.get('svcPriority'), 1)} {target}"
-            + (f" {rendered}" if rendered else ""),
-            extra,
-        )
-    # Unreachable for the supported set, but keeps the function total.
-    return str(rdata), extra
 
 
 def _soa_from_rdata(rdata: dict[str, Any], ttl: int) -> ImportedSOA:

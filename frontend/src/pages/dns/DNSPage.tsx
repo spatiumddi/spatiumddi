@@ -240,13 +240,20 @@ function isCloudDriver(d: string): d is CloudDNSDriver {
 }
 
 // One credential field rendered in the provider form. ``textarea`` is used
-// for the GCP service-account JSON blob.
+// for the GCP service-account JSON blob; ``checkbox`` for technitium_api's
+// verify_tls, which is the one credential field that is a real boolean.
 interface CloudCredField {
   key: string;
   label: string;
   placeholder?: string;
   secret?: boolean;
   textarea?: boolean;
+  checkbox?: boolean;
+  // Only meaningful with ``checkbox``. Defaults on, matching the driver:
+  // most self-hosted Technitium installs use a self-signed cert, so the
+  // opt-out has to exist — but it has to be a deliberate one.
+  checkboxDefault?: boolean;
+  help?: string;
 }
 
 const CLOUD_DNS_FIELDS: Record<CloudDNSDriver, CloudCredField[]> = {
@@ -335,6 +342,51 @@ const CLOUD_DNS_FIELDS: Record<CloudDNSDriver, CloudCredField[]> = {
       secret: true,
     },
   ],
+};
+
+// ── Self-hosted agentless drivers (issue #810) ────────────────────────
+//
+// Same credential lifecycle as the cloud providers — a driver-specific dict
+// Fernet-encrypted into the same column, sent over the same
+// ``cloud_credentials`` field — but NOT cloud drivers: the operator hosts
+// the server, so host/port stay meaningful and there is no provider setup
+// guide or hosted-zone import to link to.
+
+const SELF_HOSTED_CRED_FIELDS: Record<string, CloudCredField[]> = {
+  technitium_api: [
+    {
+      key: "api_url",
+      label: "Technitium API URL",
+      placeholder: "https://dns.example.com:53443",
+      help: "Web-service root, not the /api path. Technitium serves HTTP on 5380 and HTTPS on 53443 when TLS is enabled. A scheme is required.",
+    },
+    {
+      key: "api_token",
+      label: "API token",
+      placeholder: "permanent API token",
+      secret: true,
+      help: "Administration → Sessions → Create Token. Create it against a limited user (Zones: Modify + DnsClient: View), not the admin account — the token inherits that user's permissions.",
+    },
+    {
+      key: "verify_tls",
+      label: "Verify the TLS certificate",
+      checkbox: true,
+      checkboxDefault: true,
+      help: "Turn off only for a self-signed certificate you have no way to trust — the token is sent on every request. When editing, this shows the default rather than the stored value (credentials are never returned); the stored value is kept unless you tick or untick it.",
+    },
+  ],
+};
+
+// Every driver that takes a credential dict, cloud or self-hosted. Mirrors
+// the backend's CREDENTIALED_DNS_DRIVERS.
+const CRED_FIELDS_BY_DRIVER: Record<string, CloudCredField[]> = {
+  ...CLOUD_DNS_FIELDS,
+  ...SELF_HOSTED_CRED_FIELDS,
+};
+
+const CRED_DRIVER_LABELS: Record<string, string> = {
+  ...CLOUD_DNS_LABELS,
+  technitium_api: "Technitium (remote API)",
 };
 
 function CloudSetupGuide({ driver }: { driver: CloudDNSDriver }) {
@@ -1138,6 +1190,11 @@ function ServerModal({
   const hasExistingCreds = !!server?.has_credentials;
 
   const cloudDriver = isCloudDriver(driver) ? driver : null;
+  // Any driver that takes a credential dict — the cloud providers plus
+  // self-hosted technitium_api (#810). ``cloudDriver`` stays the narrower
+  // test for the bits that are genuinely cloud-only: the hosted-provider
+  // setup guide, the "no host/port" layout, and the hosted-zone import link.
+  const credFields = CRED_FIELDS_BY_DRIVER[driver] ?? null;
 
   const testMut = useMutation({
     mutationFn: () => {
@@ -1161,6 +1218,17 @@ function ServerModal({
         },
       });
     },
+    onSuccess: setTestResult,
+    onError: (e: ApiError) =>
+      setTestResult({ ok: false, message: formatApiError(e, "Test failed") }),
+  });
+
+  // Probe a saved credentialed agentless server with its STORED credentials
+  // (#810). Separate from testMut, which is the Windows/WinRM pre-save probe:
+  // this endpoint has no plaintext mode, so it needs a saved row — which is
+  // why the button only appears when editing.
+  const credTestMut = useMutation({
+    mutationFn: () => dnsApi.testServerConnection(groupId, server!.id),
     onSuccess: setTestResult,
     onError: (e: ApiError) =>
       setTestResult({ ok: false, message: formatApiError(e, "Test failed") }),
@@ -1203,38 +1271,60 @@ function ServerModal({
       ...(apiKey && !cloud ? { api_key: apiKey } : {}),
     };
 
-    if (cloud) {
+    if (credFields) {
+      const label = CRED_DRIVER_LABELS[driver] ?? driver;
       if (cloudClearCreds) {
         payload.cloud_credentials = {};
       } else {
-        const fields = CLOUD_DNS_FIELDS[driver as CloudDNSDriver];
-        const entered: Record<string, string> = {};
-        for (const f of fields) {
+        // Text fields and checkboxes are collected separately because
+        // "did the operator change this?" means different things for each.
+        // A text field is changed when it's non-empty; a checkbox always has
+        // a value, so it counts as changed only when it has been TOUCHED —
+        // `cloudCreds[key]` is undefined until the onChange fires. Treating
+        // an untouched checkbox as a change would submit a credential blob
+        // on every save; ignoring a touched one would make unticking
+        // "Verify the TLS certificate" a silent no-op.
+        const typed = credFields.filter((f) => !f.checkbox);
+        const boxes = credFields.filter((f) => f.checkbox);
+        const entered: Record<string, string | boolean> = {};
+        for (const f of typed) {
           const v = (cloudCreds[f.key] ?? "").trim();
           if (v) entered[f.key] = v;
         }
-        if (Object.keys(entered).length > 0) {
-          // First-time create requires every field — a partial cloud
-          // credential set can't authenticate. On edit a partial set merges
-          // server-side only when stored creds already exist.
-          const missing = fields.filter((f) => !entered[f.key]);
+        const touchedBoxes = boxes.filter(
+          (f) => cloudCreds[f.key] !== undefined,
+        );
+        const anyTyped = Object.keys(entered).length > 0;
+
+        if (anyTyped || touchedBoxes.length > 0) {
+          // First-time create requires every typed field — a partial
+          // credential set can't authenticate. On edit, the server merges the
+          // submitted keys over the stored blob, so a partial set is fine and
+          // untouched fields keep their stored values.
+          const missing = typed.filter((f) => !entered[f.key]);
           if (!editing && missing.length > 0) {
             setError(
-              `${CLOUD_DNS_LABELS[driver as CloudDNSDriver]} requires all credential fields: ${fields
+              `${label} requires all credential fields: ${typed
                 .map((f) => f.label)
                 .join(", ")}.`,
             );
             return;
           }
+          // On create every checkbox is sent (its rendered state is what the
+          // operator saw and accepted); on edit only the touched ones, so the
+          // rest keep whatever is stored.
+          for (const f of editing ? touchedBoxes : boxes) {
+            const raw = cloudCreds[f.key];
+            entered[f.key] =
+              raw === undefined ? (f.checkboxDefault ?? true) : raw === "true";
+          }
           payload.cloud_credentials = entered;
         } else if (!editing) {
-          setError(
-            `Enter ${CLOUD_DNS_LABELS[driver as CloudDNSDriver]} credentials to enable this server.`,
-          );
+          setError(`Enter ${label} credentials to enable this server.`);
           return;
         }
-        // editing + nothing entered → omit cloud_credentials entirely
-        // (None = leave stored creds alone).
+        // editing + nothing entered or touched → omit cloud_credentials
+        // entirely (None = leave stored creds alone).
       }
     }
 
@@ -1303,6 +1393,9 @@ function ServerModal({
               <option value="bind9">BIND9 (agent-managed)</option>
               <option value="powerdns">PowerDNS (agent-managed)</option>
               <option value="technitium">Technitium (agent-managed)</option>
+              <option value="technitium_api">
+                Technitium (agentless, remote API)
+              </option>
               <option value="windows_dns">
                 Windows DNS (agentless, RFC 2136 + optional WinRM)
               </option>
@@ -1352,6 +1445,18 @@ function ServerModal({
             its own API token automatically — leave the field below blank.
           </div>
         )}
+        {driver === "technitium_api" && (
+          <div className="rounded-md border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-800 dark:text-emerald-300">
+            <strong>Technitium (remote API):</strong> agentless. For a
+            Technitium server <em>you already run</em> — nothing is deployed,
+            and record CRUD runs from the SpatiumDDI control plane against its
+            HTTP API. Enter the API URL and a permanent token below; they're
+            stored Fernet-encrypted and never returned by the API. Use the
+            agent-managed <code>technitium</code> driver instead if you want
+            SpatiumDDI to run the daemon. DNSSEC, forwarders and the native
+            blocklists are agent-managed only for now.
+          </div>
+        )}
         {cloudDriver && (
           <div className="rounded-md border border-sky-500/30 bg-sky-500/10 px-3 py-2 text-xs text-sky-800 dark:text-sky-300">
             <strong>{CLOUD_DNS_LABELS[cloudDriver]}:</strong> agentless. Record
@@ -1384,48 +1489,55 @@ function ServerModal({
                 />
               </Field>
             </div>
-            <div className="grid grid-cols-2 gap-3">
-              <Field label="API Port (rndc / REST)">
-                <input
-                  className={inputCls}
-                  value={apiPort}
-                  onChange={(e) => setApiPort(e.target.value)}
-                  placeholder={
-                    driver === "powerdns"
-                      ? "8081 (PowerDNS REST, loopback)"
-                      : driver === "technitium"
-                        ? "5380 (Technitium API, loopback)"
-                        : driver === "bind9"
-                          ? "953 (rndc)"
-                          : "953 / 8081"
-                  }
-                />
-              </Field>
-              {driver === "powerdns" || driver === "technitium" ? (
-                <Field label="API Key">
+            {/* technitium_api addresses the daemon's HTTP API through the
+                credential block's api_url, not through api_port/api_key —
+                those two exist for the agent-managed drivers. Host + DNS
+                port above stay meaningful: they're the DNS service address
+                shown in the UI and used by health checks. */}
+            {driver !== "technitium_api" && (
+              <div className="grid grid-cols-2 gap-3">
+                <Field label="API Port (rndc / REST)">
                   <input
-                    className={`${inputCls} bg-muted/50 cursor-not-allowed`}
-                    value="(generated by agent on first boot)"
-                    disabled
-                    readOnly
-                  />
-                </Field>
-              ) : (
-                <Field
-                  label={
-                    server ? "New API Key (leave blank to keep)" : "API Key"
-                  }
-                >
-                  <input
-                    type="password"
                     className={inputCls}
-                    value={apiKey}
-                    onChange={(e) => setApiKey(e.target.value)}
-                    placeholder={server ? "unchanged" : "optional"}
+                    value={apiPort}
+                    onChange={(e) => setApiPort(e.target.value)}
+                    placeholder={
+                      driver === "powerdns"
+                        ? "8081 (PowerDNS REST, loopback)"
+                        : driver === "technitium"
+                          ? "5380 (Technitium API, loopback)"
+                          : driver === "bind9"
+                            ? "953 (rndc)"
+                            : "953 / 8081"
+                    }
                   />
                 </Field>
-              )}
-            </div>
+                {driver === "powerdns" || driver === "technitium" ? (
+                  <Field label="API Key">
+                    <input
+                      className={`${inputCls} bg-muted/50 cursor-not-allowed`}
+                      value="(generated by agent on first boot)"
+                      disabled
+                      readOnly
+                    />
+                  </Field>
+                ) : (
+                  <Field
+                    label={
+                      server ? "New API Key (leave blank to keep)" : "API Key"
+                    }
+                  >
+                    <input
+                      type="password"
+                      className={inputCls}
+                      value={apiKey}
+                      onChange={(e) => setApiKey(e.target.value)}
+                      placeholder={server ? "unchanged" : "optional"}
+                    />
+                  </Field>
+                )}
+              </div>
+            )}
           </>
         )}
         <Field label="Roles (comma-separated)">
@@ -1651,11 +1763,11 @@ function ServerModal({
           </div>
         )}
 
-        {cloudDriver && (
+        {credFields && (
           <div className="rounded-md border border-sky-500/40 bg-sky-500/5 p-3 space-y-3">
             <div className="text-xs">
               <div className="font-medium text-sky-600 dark:text-sky-400">
-                {CLOUD_DNS_LABELS[cloudDriver]} credentials
+                {CRED_DRIVER_LABELS[driver] ?? driver} credentials
               </div>
               <p className="mt-1 text-muted-foreground">
                 Stored Fernet-encrypted and never returned by the API.
@@ -1665,7 +1777,7 @@ function ServerModal({
               </p>
             </div>
 
-            <CloudSetupGuide driver={cloudDriver} />
+            {cloudDriver && <CloudSetupGuide driver={cloudDriver} />}
 
             {editing && hasExistingCreds && !cloudClearCreds && (
               <div className="flex items-center justify-between rounded border bg-background/50 px-3 py-2 text-xs">
@@ -1686,7 +1798,7 @@ function ServerModal({
               <div className="flex items-center justify-between rounded border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs">
                 <span className="text-destructive">
                   Credentials will be removed on save — this server won't be
-                  able to reach the provider until new credentials are set.
+                  able to reach its API until new credentials are set.
                 </span>
                 <button
                   type="button"
@@ -1701,50 +1813,85 @@ function ServerModal({
             <div
               className={`space-y-3 ${cloudClearCreds ? "opacity-40 pointer-events-none" : ""}`}
             >
-              {CLOUD_DNS_FIELDS[cloudDriver].map((f) => (
-                <Field key={f.key} label={f.label}>
-                  {f.textarea ? (
-                    <textarea
-                      className={`${inputCls} font-mono text-xs`}
-                      rows={6}
-                      value={cloudCreds[f.key] ?? ""}
-                      onChange={(e) =>
-                        setCloudCreds((c) => ({
-                          ...c,
-                          [f.key]: e.target.value,
-                        }))
-                      }
-                      placeholder={
-                        editing && hasExistingCreds
-                          ? "(unchanged)"
-                          : (f.placeholder ?? "")
-                      }
-                      autoComplete="off"
-                    />
-                  ) : (
+              {credFields.map((f) =>
+                f.checkbox ? (
+                  <label
+                    key={f.key}
+                    className="flex items-start gap-2 text-xs cursor-pointer"
+                  >
                     <input
-                      type={f.secret ? "password" : "text"}
-                      className={inputCls}
-                      value={cloudCreds[f.key] ?? ""}
+                      type="checkbox"
+                      className="mt-0.5"
+                      checked={
+                        (cloudCreds[f.key] ??
+                          String(f.checkboxDefault ?? true)) === "true"
+                      }
                       onChange={(e) =>
                         setCloudCreds((c) => ({
                           ...c,
-                          [f.key]: e.target.value,
+                          [f.key]: String(e.target.checked),
                         }))
                       }
-                      placeholder={
-                        editing && hasExistingCreds
-                          ? "(unchanged)"
-                          : (f.placeholder ?? "")
-                      }
-                      autoComplete="off"
                     />
-                  )}
-                </Field>
-              ))}
+                    <span>
+                      <span className="font-medium">{f.label}</span>
+                      {f.help && (
+                        <span className="block text-muted-foreground">
+                          {f.help}
+                        </span>
+                      )}
+                    </span>
+                  </label>
+                ) : (
+                  <Field key={f.key} label={f.label}>
+                    {f.textarea ? (
+                      <textarea
+                        className={`${inputCls} font-mono text-xs`}
+                        rows={6}
+                        value={cloudCreds[f.key] ?? ""}
+                        onChange={(e) =>
+                          setCloudCreds((c) => ({
+                            ...c,
+                            [f.key]: e.target.value,
+                          }))
+                        }
+                        placeholder={
+                          editing && hasExistingCreds
+                            ? "(unchanged)"
+                            : (f.placeholder ?? "")
+                        }
+                        autoComplete="off"
+                      />
+                    ) : (
+                      <input
+                        type={f.secret ? "password" : "text"}
+                        className={inputCls}
+                        value={cloudCreds[f.key] ?? ""}
+                        onChange={(e) =>
+                          setCloudCreds((c) => ({
+                            ...c,
+                            [f.key]: e.target.value,
+                          }))
+                        }
+                        placeholder={
+                          editing && hasExistingCreds
+                            ? "(unchanged)"
+                            : (f.placeholder ?? "")
+                        }
+                        autoComplete="off"
+                      />
+                    )}
+                    {f.help && (
+                      <p className="mt-1 text-[11px] text-muted-foreground">
+                        {f.help}
+                      </p>
+                    )}
+                  </Field>
+                ),
+              )}
             </div>
 
-            {editing && server && (
+            {cloudDriver && editing && server && (
               <button
                 type="button"
                 onClick={() =>
@@ -1757,6 +1904,33 @@ function ServerModal({
                 <ExternalLink className="h-3.5 w-3.5" />
                 Sync from provider (DNS Import → Cloud)
               </button>
+            )}
+
+            {editing && server && hasExistingCreds && (
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setTestResult(null);
+                    credTestMut.mutate();
+                  }}
+                  disabled={credTestMut.isPending}
+                  className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs hover:bg-accent disabled:opacity-50"
+                >
+                  {credTestMut.isPending ? "Testing…" : "Test Connection"}
+                </button>
+                <span className="text-[11px] text-muted-foreground">
+                  Uses the stored credentials — save any changes first.
+                </span>
+              </div>
+            )}
+            {testResult && (
+              <p
+                className={`text-xs ${testResult.ok ? "text-emerald-600 dark:text-emerald-400" : "text-destructive"}`}
+              >
+                {testResult.ok ? "✓ " : "✗ "}
+                {testResult.message}
+              </p>
             )}
           </div>
         )}
