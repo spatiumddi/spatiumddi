@@ -1,0 +1,292 @@
+name: Build appliance (reusable)
+
+# Reusable appliance ISO + slot-image build (#823).
+#
+# ONE copy of the most safety-critical assembly in the repo — fetch-k3s,
+# three chart bakes, the ghcr image bake, mkosi in the privileged builder
+# container, ISO wrap, slot compression — invoked by BOTH release.yml (on a
+# CalVer tag) and nightly.yml (daily from main). That sharing is the whole
+# point: before #823 these steps only ever ran when a release was cut, so a
+# regression in any of them sat invisible until the worst possible moment.
+# The nightly now exercises the exact code path the next release will run.
+#
+# Callers differ only in the inputs:
+#
+#   release: version = image_tag = the CalVer tag; stable_copies on, so the
+#            un-versioned spatiumddi-appliance-amd64.* names exist for the
+#            /releases/latest/download/ stable URLs.
+#   nightly: version is the gate's non-CalVer stamp string, image_tag is
+#            the immutable nightly-YYYYMMDD date tag (never the mutable
+#            :nightly pointer — the bake must record which bytes it baked);
+#            stable_copies off, short artifact retention, and the caller
+#            renames to its own nightly asset names at attach time.
+#
+# The GITHUB_TOKEN is implicitly available to a called workflow; its
+# permissions come from the CALLER's job (needs contents: read +
+# packages: read for the ghcr pulls).
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: >-
+          Version string stamped into /etc/spatiumddi/appliance-release
+          (surfaced by spatiumddi-firstboot / spatium-upgrade-slot /
+          spatium-console as APPLIANCE_VERSION).
+        required: true
+        type: string
+      image_tag:
+        description: >-
+          ghcr.io tag to pull for the baked container images, and the
+          version component of every artifact filename.
+        required: true
+        type: string
+      stable_copies:
+        description: >-
+          Also emit the un-versioned spatiumddi-appliance-amd64.* copies
+          that /releases/latest/download/ URLs point at.
+        required: false
+        type: boolean
+        default: true
+      artifact_retention_days:
+        description: Retention for the appliance-artifacts upload.
+        required: false
+        type: number
+        default: 7
+    outputs:
+      iso_name:
+        description: Filename of the versioned ISO.
+        value: ${{ jobs.build.outputs.iso_name }}
+      slot_name:
+        description: Filename of the versioned slot .raw.xz.
+        value: ${{ jobs.build.outputs.slot_name }}
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ghcr.io/${{ github.repository_owner }}
+
+jobs:
+  # #170 Phase A4 — the ISO is **fully baked**: every image the appliance
+  # can run is pulled from ghcr.io at ``image_tag``, saved as a zstd
+  # tarball under ``mkosi.extra/usr/local/share/spatiumddi/images/``
+  # BEFORE mkosi runs, and ends up inside the rootfs. Firstboot ``docker
+  # load``s them and skips ``docker pull`` entirely — air-gap support out
+  # of the box, container-version drift from the OS slot becomes
+  # structurally impossible. Callers therefore must not invoke this until
+  # every image exists at ``image_tag`` (both callers ``needs:`` their
+  # image-build jobs).
+  build:
+    name: Build appliance ISO
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      iso_name: ${{ steps.wrap.outputs.iso_name }}
+      slot_name: ${{ steps.slot.outputs.slot_name }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Stamp /etc/spatiumddi/appliance-release
+        run: |
+          set -euo pipefail
+          VERSION="${{ inputs.version }}"
+          # Drop the build-time version stamp into mkosi.extra so it
+          # gets baked into the rootfs at build. ``spatiumddi-firstboot``
+          # + ``spatium-upgrade-slot`` + ``spatium-console`` all read
+          # this file to surface APPLIANCE_VERSION. Without this stamp
+          # every built appliance reports the placeholder "0.1.0"
+          # regardless of which ISO it came from.
+          mkdir -p appliance/mkosi.extra/etc/spatiumddi
+          {
+              echo "APPLIANCE_VERSION=\"${VERSION}\""
+              echo "BUILD_TIME=\"$(date -u -Iseconds)\""
+              echo "GIT_SHA=\"${GITHUB_SHA}\""
+          } > appliance/mkosi.extra/etc/spatiumddi/appliance-release
+          echo "→ Stamped appliance-release:"
+          cat appliance/mkosi.extra/etc/spatiumddi/appliance-release
+      - name: Install zstd
+        run: sudo apt-get update && sudo apt-get install -y zstd
+      - name: Install helm
+        # Use the upstream-published azure/setup-helm action — it
+        # downloads the helm static binary from get.helm.sh (which
+        # resolves via the GitHub Releases CDN; reachable from the
+        # Azure runner). The Helm-stable apt repo at baltocdn.com is
+        # NOT reachable from GitHub Actions runners ("Could not resolve
+        # host: baltocdn.com" — Azure runner network policy).
+        # bake-chart.sh shells out to ``helm package`` so helm must be
+        # on PATH before the chart-bake step.
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.20.2
+      - name: Fetch k3s binary + airgap tarball
+        run: |
+          set -euo pipefail
+          # Issue #183 — without this step the slot rootfs ships zero
+          # k3s, ``/usr/local/bin/k3s`` is missing on every appliance,
+          # ``k3s.service`` crash-loops, firstboot wedges forever at
+          # "Waiting for k3s /readyz". Mirrors what
+          # ``make appliance-fetch-k3s`` does locally.
+          chmod +x appliance/scripts/fetch-k3s.sh
+          appliance/scripts/fetch-k3s.sh
+          ls -lh appliance/mkosi.extra/usr/local/bin/k3s
+          ls -lh appliance/mkosi.extra/var/lib/rancher/k3s/agent/images/k3s-airgap-images-*.tar.zst
+      - name: Bake helm charts (appliance + control)
+        run: |
+          set -euo pipefail
+          # Issue #183 — without these steps the slot rootfs ships an
+          # empty /usr/lib/spatiumddi/charts/ directory; firstboot's
+          # WARN "missing — control plane won't auto-deploy" fires and
+          # the appliance never installs anything via the HelmChart CR.
+          # Mirrors ``make appliance-bake-chart appliance-bake-control-chart
+          # appliance-bake-metallb-chart``.
+          chmod +x appliance/scripts/bake-chart.sh
+          appliance/scripts/bake-chart.sh
+          CHART_NAME=spatiumddi appliance/scripts/bake-chart.sh
+          # #272 — the control-plane VIP ships in its own spatiumddi-metallb
+          # chart (deployed to metallb-system); firstboot renders a
+          # spatium-metallb HelmChart that references this .tgz. Without it
+          # MetalLB never deploys on a built appliance.
+          CHART_NAME=spatiumddi-metallb appliance/scripts/bake-chart.sh
+          ls -lh appliance/mkosi.extra/usr/lib/spatiumddi/charts/*.tgz
+      - name: Bake container images into rootfs overlay
+        env:
+          SPATIUMDDI_VERSION: ${{ inputs.image_tag }}
+          BAKE_SOURCE: ghcr
+        run: |
+          set -euo pipefail
+          echo "→ Pulling every image at ${SPATIUMDDI_VERSION} + baking per-image tarballs"
+          chmod +x appliance/scripts/bake-images.sh
+          # Post-#183 bake script writes per-image zst tarballs to
+          # ``appliance/mkosi.extra/var/lib/rancher/k3s/agent/images/``
+          # which k3s auto-imports at startup. The pre-#183 path that
+          # built a single ``docker-overlay.img`` overlay file via a
+          # docker:dind sandbox is gone (no docker on the appliance
+          # post-Phase-7).
+          # ``sudo -E`` preserves SPATIUMDDI_VERSION + BAKE_SOURCE
+          # from the job env. Without ``-E``, sudo strips them and
+          # bake-images.sh falls back to its ``SPATIUMDDI_VERSION=dev``
+          # / ``BAKE_SOURCE=local`` defaults — which then fails on the
+          # runner with "no local image found" because no :dev tags
+          # exist (the runner pulls from ghcr, not local).
+          #
+          # ``DOCKER_CONFIG=$HOME/.docker`` re-points root's docker CLI
+          # at the runner-user's ``~/.docker/config.json`` where the
+          # docker/login-action step above stamped the GHCR creds. Our
+          # ghcr.io/spatiumddi/* images are private; without this redirect
+          # root would docker-pull anonymously and 401 on every image.
+          sudo DOCKER_CONFIG="$HOME/.docker" -E appliance/scripts/bake-images.sh
+          echo "→ Baked image tarballs:"
+          ls -lh appliance/mkosi.extra/var/lib/rancher/k3s/agent/images/*.tar.zst
+          echo "→ Total size:"
+          du -sh appliance/mkosi.extra/var/lib/rancher/k3s/agent/images/
+      - name: Build raw image (mkosi)
+        run: |
+          set -euo pipefail
+          BUILDER=${{ env.IMAGE_PREFIX }}/appliance-builder:latest
+          echo "→ Pulling $BUILDER"
+          docker pull "$BUILDER"
+          mkdir -p appliance/build
+          echo "→ Running mkosi build (this takes 5–10 min)"
+          docker run --rm --privileged \
+            -v "$PWD/appliance:/work" \
+            "$BUILDER" \
+            --output-directory=build --force build
+          ls -lh appliance/build/
+      - name: Wrap as hybrid USB/CD ISO
+        id: wrap
+        env:
+          TAG: ${{ inputs.image_tag }}
+          STABLE_COPIES: ${{ inputs.stable_copies }}
+        run: |
+          set -euo pipefail
+          BUILDER=${{ env.IMAGE_PREFIX }}/appliance-builder:latest
+          RAW=$(ls appliance/build/spatiumddi-appliance*.raw | head -1)
+          [ -f "$RAW" ] || { echo "✗ no raw image found"; exit 1; }
+          ISO_INTERIM="${RAW%.raw}.iso"
+          docker run --rm --privileged \
+            --entrypoint /work/scripts/wrap-iso.sh \
+            -v "$PWD/appliance:/work" \
+            "$BUILDER" \
+            "/work/build/$(basename "$RAW")" \
+            "/work/build/$(basename "$ISO_INTERIM")"
+          # Up to two copies emitted:
+          #   - Versioned (archive trail — for a release, of every release
+          #     ever cut)
+          #   - Stable filename (un-versioned, so the README can link to
+          #     https://.../releases/latest/download/spatiumddi-appliance-amd64.iso
+          #     and that URL always 302s to the current release's ISO).
+          #     Skipped when stable_copies is off — the nightly caller
+          #     names its own assets and a byte-identical duplicate would
+          #     only bloat the artifact.
+          # mkosi's own ImageVersion in mkosi.conf is ``0.1.0`` (internal
+          # scheme); we rename to the operator-visible tag here.
+          VERSIONED="appliance/build/spatiumddi-appliance-${TAG}.iso"
+          mv "$ISO_INTERIM" "$VERSIONED"
+          if [ "$STABLE_COPIES" = "true" ]; then
+            cp "$VERSIONED" "appliance/build/spatiumddi-appliance-amd64.iso"
+          fi
+          ls -lh appliance/build/spatiumddi-appliance-*.iso
+          echo "iso_name=spatiumddi-appliance-${TAG}.iso" >> "$GITHUB_OUTPUT"
+      # Phase 8b-4 — build the slot upgrade image alongside the ISO so
+      # operators can apply atomic OS upgrades from the /appliance UI
+      # without manually building images locally. Same docker invocation
+      # the local Makefile uses, just inlined for CI.
+      - name: Build slot-upgrade image (.raw.xz + sha256)
+        id: slot
+        env:
+          TAG: ${{ inputs.image_tag }}
+          STABLE_COPIES: ${{ inputs.stable_copies }}
+        run: |
+          set -euo pipefail
+          BUILDER=${{ env.IMAGE_PREFIX }}/appliance-builder:latest
+          RAW=$(ls appliance/build/spatiumddi-appliance*.raw | head -1)
+          [ -f "$RAW" ] || { echo "✗ no raw image found"; exit 1; }
+          chmod +x appliance/scripts/build-slot-image.sh
+          docker run --rm --privileged \
+            --entrypoint /work/scripts/build-slot-image.sh \
+            -v "$PWD/appliance:/work" \
+            "$BUILDER" \
+            "/work/build/$(basename "$RAW")" \
+            "/work/build"
+          # build-slot-image.sh writes spatiumddi-appliance-slot-<mkosi-
+          # ImageVersion>.{raw.xz,sha256}. Rename to operator-visible
+          # names: versioned (archive) + optional stable (latest-link
+          # target).
+          SRC_XZ=$(ls appliance/build/spatiumddi-appliance-slot-*.raw.xz | head -1)
+          [ -f "$SRC_XZ" ] || { echo "✗ no slot .raw.xz built"; exit 1; }
+          VERSIONED_XZ="appliance/build/spatiumddi-appliance-slot-${TAG}-amd64.raw.xz"
+          VERSIONED_SHA="appliance/build/spatiumddi-appliance-slot-${TAG}-amd64.sha256"
+          mv "$SRC_XZ" "$VERSIONED_XZ"
+          # Regenerate sha files so the hash inside them references the
+          # correct (renamed) filename — important for `sha256sum -c`.
+          ( cd appliance/build && sha256sum "$(basename "$VERSIONED_XZ")" > "$(basename "$VERSIONED_SHA")" )
+          if [ "$STABLE_COPIES" = "true" ]; then
+            STABLE_XZ="appliance/build/spatiumddi-appliance-slot-amd64.raw.xz"
+            STABLE_SHA="appliance/build/spatiumddi-appliance-slot-amd64.sha256"
+            cp "$VERSIONED_XZ" "$STABLE_XZ"
+            ( cd appliance/build && sha256sum "$(basename "$STABLE_XZ")" > "$(basename "$STABLE_SHA")" )
+          fi
+          # Drop the mkosi-ImageVersion-named sha sidecar that
+          # build-slot-image.sh wrote next to the original .raw.xz (e.g.
+          # spatiumddi-appliance-slot-0.1.0.sha256). The .raw.xz itself was
+          # renamed by the mv above; only this stray sha is left, and the
+          # upload globs below would otherwise attach the bogus 0.1.0 name
+          # to every release (#392).
+          SRC_SHA="${SRC_XZ%.raw.xz}.sha256"
+          rm -f "$SRC_SHA"
+          ls -lh appliance/build/spatiumddi-appliance-slot-*
+          echo "slot_name=spatiumddi-appliance-slot-${TAG}-amd64.raw.xz" >> "$GITHUB_OUTPUT"
+      - name: Upload appliance artifacts (ISO + slot image)
+        uses: actions/upload-artifact@v7
+        with:
+          name: appliance-artifacts
+          path: |
+            appliance/build/spatiumddi-appliance-*.iso
+            appliance/build/spatiumddi-appliance-slot-*.raw.xz
+            appliance/build/spatiumddi-appliance-slot-*.sha256
+          retention-days: ${{ inputs.artifact_retention_days }}
+          if-no-files-found: error

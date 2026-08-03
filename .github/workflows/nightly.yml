@@ -23,22 +23,16 @@ name: Nightly
 #     reference them (see the prune job). Orphaned layers are GHCR's
 #     untagged-retention policy to collect, not this workflow's.
 #
-# THE APPLIANCE ISO IS DEFERRED, deliberately. Its retention answer is easy
-# (~1.5 GB each, so exactly one, assets replaced in place on the reused
-# pre-release below) but its BUILD is not: release.yml assembles it over 223
-# lines of sequenced steps — fetch-k3s, three chart bakes, an image bake with
-# BAKE_SOURCE=ghcr behind `sudo -E` and a DOCKER_CONFIG redirect for the
-# private registry, mkosi in a privileged builder container, then ISO wrap and
-# slot-image compression. The `make appliance-baked-iso` shortcut does NOT
-# work here: it chains `appliance-stamp-dev` (stamps a dev version) and
-# defaults to BAKE_SOURCE=local (no local tags on a runner).
-#
-# Copying those steps would leave two divergent copies of the most
-# safety-critical workflow in the repo, and no way to test the copy short of
-# cutting a release. The right fix is to extract that job into a
-# `workflow_call` reusable workflow that both release.yml and this file
-# invoke — a change that deserves its own PR and its own release to verify,
-# not a ride-along on a new nightly. Tracked as a follow-up on #805.
+#   Appliance ISO + slot image — exactly ONE copy each (~1.5 GB), attached
+#     as assets on the reused pre-release below and replaced in place every
+#     build (#823). No dated ring: an older appliance build is reproducible
+#     from its dated image tags, and the asset budget must not grow by
+#     1.5 GB/night. The BUILD is the same `workflow_call` reusable workflow
+#     release.yml invokes (build-appliance.yml) — one copy of the most
+#     safety-critical assembly in the repo, exercised nightly so a
+#     regression in it surfaces the next morning instead of at the next
+#     release cut. (#805 deferred this exactly because a copied job would
+#     have been a second divergent copy, untestable short of a release.)
 #
 # NIGHTLY IS NEVER `:latest`. That tag means "latest release" and has to
 # keep meaning that. There is also no GitHub Release per nightly — one
@@ -66,9 +60,9 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_PREFIX: ghcr.io/${{ github.repository_owner }}
-  # A reused pre-release used purely as the RECORD of which commit the last
-  # nightly was built from. It carries no assets today; when the ISO lands
-  # (see the header) it is where those assets go.
+  # A reused pre-release: the RECORD of which commit the last nightly was
+  # built from, and the home of the appliance ISO + slot-image assets
+  # (replaced in place each build — see the header).
   NIGHTLY_TAG: nightly
 
 permissions:
@@ -240,6 +234,82 @@ jobs:
           cache-from: type=gha,scope=nightly-${{ matrix.image }}
           cache-to: type=gha,mode=max,scope=nightly-${{ matrix.image }}
 
+  # ── Build the appliance ISO + slot image ──────────────────────────────
+  # The same reusable workflow release.yml invokes (#823) — which is the
+  # point: this assembly used to run only when a release was cut, so a
+  # regression in it sat invisible until the worst moment. image_tag is
+  # the immutable dated tag, not `:nightly` — the bake must record which
+  # bytes it baked, and the mutable pointer could move under a re-run.
+  # Skipped on dry_run: the images job pushed nothing, so there is
+  # nothing at the dated tag to bake.
+  appliance:
+    name: Appliance
+    needs: [gate, images]
+    if: needs.gate.outputs.should_build == 'true' && github.event.inputs.dry_run != 'true'
+    permissions:
+      contents: read
+      packages: read
+    uses: ./.github/workflows/build-appliance.yml
+    with:
+      version: ${{ needs.gate.outputs.version }}
+      image_tag: ${{ needs.gate.outputs.date_tag }}
+      # The un-versioned spatiumddi-appliance-amd64.* names are the
+      # RELEASE's /releases/latest/download/ link targets; emitting them
+      # here would only bloat the artifact with byte-identical copies.
+      stable_copies: false
+      # The artifact only has to survive the hand-off to appliance-publish.
+      artifact_retention_days: 1
+
+  # ── Attach the appliance artifacts to the nightly pre-release ─────────
+  appliance-publish:
+    name: Attach appliance artifacts
+    runs-on: ubuntu-latest
+    needs: [gate, appliance]
+    if: needs.gate.outputs.should_build == 'true' && github.event.inputs.dry_run != 'true'
+    permissions:
+      contents: write
+    steps:
+      - name: Download appliance artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: appliance-artifacts
+          path: dist/
+      - name: Upload to the nightly pre-release (replace in place)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}  # no checkout in this job
+          DATE_TAG: ${{ needs.gate.outputs.date_tag }}
+        run: |
+          set -euo pipefail
+          # Rename the dated build outputs to STABLE nightly asset names so
+          # --clobber replaces yesterday's copy instead of accumulating a
+          # 1.5 GB/night ring (see the retention note in the header). The
+          # dated identity isn't lost — it lives in the release body's
+          # date-tag line and in /etc/spatiumddi/appliance-release inside
+          # the image.
+          ISO="dist/spatiumddi-appliance-${DATE_TAG}.iso"
+          XZ="dist/spatiumddi-appliance-slot-${DATE_TAG}-amd64.raw.xz"
+          [ -f "$ISO" ] || { echo "✗ expected $ISO"; ls -l dist/; exit 1; }
+          [ -f "$XZ" ]  || { echo "✗ expected $XZ";  ls -l dist/; exit 1; }
+          mv "$ISO" dist/spatiumddi-appliance-nightly-amd64.iso
+          mv "$XZ"  dist/spatiumddi-appliance-slot-nightly-amd64.raw.xz
+          # Regenerate the checksum so the filename inside it matches the
+          # renamed asset — important for `sha256sum -c`.
+          rm -f dist/spatiumddi-appliance-slot-*.sha256
+          ( cd dist && sha256sum spatiumddi-appliance-slot-nightly-amd64.raw.xz \
+              > spatiumddi-appliance-slot-nightly-amd64.sha256 )
+          ls -lh dist/
+
+          # First-ever run: finalize hasn't created the pre-release yet
+          # (it runs after this job). Same guard it uses.
+          if ! gh release view "$NIGHTLY_TAG" >/dev/null 2>&1; then
+            gh release create "$NIGHTLY_TAG" --title "Nightly build" --prerelease --notes "init"
+          fi
+          gh release upload "$NIGHTLY_TAG" --clobber \
+            dist/spatiumddi-appliance-nightly-amd64.iso \
+            dist/spatiumddi-appliance-slot-nightly-amd64.raw.xz \
+            dist/spatiumddi-appliance-slot-nightly-amd64.sha256
+
   # ── Prune the dated tag ring ──────────────────────────────────────────
   prune:
     name: Prune old nightly tags
@@ -336,7 +406,7 @@ jobs:
   finalize:
     name: Finalize
     runs-on: ubuntu-latest
-    needs: [gate, images, prune]
+    needs: [gate, images, appliance, appliance-publish, prune]
     # `always()`, and NOT gated on `should_build` alone: a gate job that
     # FAILS emits no outputs at all, so that condition would be false and
     # this job would be skipped — the nightly would die without opening the
@@ -348,7 +418,15 @@ jobs:
       issues: write
     steps:
       - name: Update the nightly pre-release record
-        if: needs.images.result == 'success' && github.event.inputs.dry_run != 'true'
+        # Appliance success is required too: `built-from:` is what makes the
+        # next run skip when main hasn't moved, so stamping it after a
+        # failed appliance build would leave the assets stale (or missing)
+        # with no retry until the next commit lands.
+        if: >-
+          needs.images.result == 'success' &&
+          needs.appliance.result == 'success' &&
+          needs['appliance-publish'].result == 'success' &&
+          github.event.inputs.dry_run != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # This job has no checkout, so `gh` cannot infer the repo from git
@@ -375,6 +453,10 @@ jobs:
           \`\`\`
           The dated tag \`${{ needs.gate.outputs.date_tag }}\` pins this exact build;
           the newest 7 are kept.
+
+          The appliance ISO (\`spatiumddi-appliance-nightly-amd64.iso\`) and slot
+          upgrade image (\`spatiumddi-appliance-slot-nightly-amd64.raw.xz\` +
+          \`.sha256\`) are attached below, replaced in place each build.
           EOF
           )"
 
@@ -382,7 +464,12 @@ jobs:
         # A nightly that fails silently is worth nothing — that is the whole
         # reason for a scheduled build. One issue, reused, so a broken week
         # doesn't open seven.
-        if: needs.gate.result == 'failure' || needs.images.result == 'failure' || needs.prune.result == 'failure'
+        if: >-
+          needs.gate.result == 'failure' ||
+          needs.images.result == 'failure' ||
+          needs.appliance.result == 'failure' ||
+          needs['appliance-publish'].result == 'failure' ||
+          needs.prune.result == 'failure'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}  # no checkout in this job — see above
@@ -393,6 +480,8 @@ jobs:
 
           - gate: ${{ needs.gate.result }}
           - images: ${{ needs.images.result }}
+          - appliance: ${{ needs.appliance.result }}
+          - appliance-publish: ${{ needs['appliance-publish'].result }}
           - prune: ${{ needs.prune.result }}
 
           Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
