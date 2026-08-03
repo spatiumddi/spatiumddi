@@ -29,6 +29,22 @@ export default defineConfig({
         target: "http://localhost:8000",
         changeOrigin: true,
       },
+      // Backend endpoints also live outside /api — notably
+      // /health/* (platform health) and /metrics. The production
+      // nginx config proxies these to the API (see
+      // default.conf.template → `location ~ ^/(health|metrics)`),
+      // but the Vite dev proxy only forwarded /api, so requests to
+      // /health/platform fell through to the SPA fallback and
+      // returned index.html — crashing the dashboard's platform
+      // health card. Mirror those two proxy entries here.
+      "/health": {
+        target: "http://localhost:8000",
+        changeOrigin: true,
+      },
+      "/metrics": {
+        target: "http://localhost:8000",
+        changeOrigin: true,
+      },
     },
   },
 });
