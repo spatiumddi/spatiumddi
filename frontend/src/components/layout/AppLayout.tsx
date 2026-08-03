@@ -1,5 +1,7 @@
 import { useState } from "react";
 import { Outlet } from "react-router-dom";
+
+import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { Sidebar } from "./Sidebar";
 import { Header } from "./Header";
 import { DemoBanner } from "./DemoBanner";
@@ -33,7 +35,25 @@ export function AppLayout() {
         <MaintenanceModeBanner />
         <Header onMobileMenu={() => setMobileOpen(true)} />
         <main className="flex-1 overflow-auto">
-          <Outlet />
+          <ErrorBoundary
+            fallback={
+              <div className="m-6 rounded-lg border bg-card p-6 text-center">
+                <h2 className="text-base font-semibold">This page failed to load</h2>
+                <p className="mt-2 text-sm text-muted-foreground">
+                  Something went wrong while rendering this page.
+                </p>
+                <button
+                  type="button"
+                  onClick={() => window.location.reload()}
+                  className="mt-4 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90"
+                >
+                  Reload
+                </button>
+              </div>
+            }
+          >
+            <Outlet />
+          </ErrorBoundary>
         </main>
       </div>
       {/* Issue #90 — Operator Copilot floating button. Hidden when no

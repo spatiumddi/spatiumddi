@@ -102,6 +102,7 @@ import { includeInUtilization } from "@/lib/utilization";
 import { useSessionState } from "@/lib/useSessionState";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { DHCPTrafficCard, DNSQueryRateCard } from "@/components/MetricsCharts";
+import { WidgetErrorBoundary } from "@/components/WidgetErrorBoundary";
 
 /**
  * Dashboard — the home page.
@@ -1533,29 +1534,51 @@ export function DashboardPage() {
               KPI row so the colour-coded health ribbon is the next
               thing the eye lands on after the headline counters). ──── */}
         {tab === "overview" && platformHealth && (
-          <PlatformHealthCard health={platformHealth} />
+          <WidgetErrorBoundary title="Platform health">
+            <PlatformHealthCard health={platformHealth} />
+          </WidgetErrorBoundary>
         )}
 
         {/* ── Network overview cards (Overview tab) ─────────────────── */}
         {tab === "overview" && (
           <div className="grid gap-3 grid-cols-1 sm:grid-cols-2 lg:grid-cols-4">
-            <AsnSummaryCard />
-            <VrfSummaryCard />
-            <DomainsSummaryCard />
-            <SubnetDecomCard />
-            <LookingGlassHealthCard />
+            <WidgetErrorBoundary title="ASN summary">
+              <AsnSummaryCard />
+            </WidgetErrorBoundary>
+            <WidgetErrorBoundary title="VRF summary">
+              <VrfSummaryCard />
+            </WidgetErrorBoundary>
+            <WidgetErrorBoundary title="Domain summary">
+              <DomainsSummaryCard />
+            </WidgetErrorBoundary>
+            <WidgetErrorBoundary title="Subnet decomposition">
+              <SubnetDecomCard />
+            </WidgetErrorBoundary>
+            <WidgetErrorBoundary title="Looking Glass health">
+              <LookingGlassHealthCard />
+            </WidgetErrorBoundary>
           </div>
         )}
 
         {/* ── DNS query rate (DNS tab only) ──────────────────────────── */}
-        {tab === "dns" && <DNSQueryRateCard dnsServers={allDnsServers} />}
+        {tab === "dns" && (
+          <WidgetErrorBoundary title="DNS query rate">
+            <DNSQueryRateCard dnsServers={allDnsServers} />
+          </WidgetErrorBoundary>
+        )}
 
         {/* ── DHCP traffic (DHCP tab only) ───────────────────────────── */}
-        {tab === "dhcp" && <DHCPTrafficCard dhcpServers={dhcpServers} />}
+        {tab === "dhcp" && (
+          <WidgetErrorBoundary title="DHCP traffic">
+            <DHCPTrafficCard dhcpServers={dhcpServers} />
+          </WidgetErrorBoundary>
+        )}
 
         {/* ── Heatmap (Overview + IPAM) ──────────────────────────────── */}
         {(tab === "overview" || tab === "ipam") && (
-          <SubnetHeatmap subnets={reporting} />
+          <WidgetErrorBoundary title="Subnet heatmap">
+            <SubnetHeatmap subnets={reporting} />
+          </WidgetErrorBoundary>
         )}
 
         {/* ── IPAM-specific summary cards ───────────────────────────── */}
