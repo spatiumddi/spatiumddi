@@ -53,9 +53,15 @@ RUN git clone --depth 1 --branch "v${GOBGP_VERSION}" https://github.com/osrg/gob
 # Bump vulnerable transitive deps above the versions gobgp pins so Trivy
 # (HIGH/CRITICAL) stays green. gobgp v4.7.0 pins golang.org/x/net v0.48,
 # which carries several HIGH CVEs (html XSS, IDNA punycode privilege
-# escalation, HTTP/2 DoS — fixed in 0.55). Re-check + drop/bump this pin
-# when GoBGP's own go.mod moves past it.
-RUN go get golang.org/x/net@v0.56.0
+# escalation, HTTP/2 DoS — fixed in 0.55); x/text v0.38 carries
+# CVE-2026-56852 (norm.Iter infinite loop, fixed in 0.39); grpc-go
+# v1.79.3 carries GHSA-hrxh-6v49-42gf (xDS RBAC + HTTP/2, fixed in
+# 1.82.1). Re-check + drop/bump these pins when GoBGP's own go.mod moves
+# past them.
+RUN go get \
+      golang.org/x/net@v0.57.0 \
+      golang.org/x/text@v0.40.0 \
+      google.golang.org/grpc@v1.83.0
 ENV CGO_ENABLED=0
 RUN GOOS="${TARGETOS:-linux}" GOARCH="${TARGETARCH}" \
       go build -trimpath -ldflags="-s -w" -o /out/gobgpd ./cmd/gobgpd \
