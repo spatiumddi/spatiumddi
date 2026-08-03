@@ -9,9 +9,14 @@ on:
   # don't post the required check-runs the ``protect-main`` ruleset
   # waits for, so docs-only PRs (CHANGELOG bumps, README polish,
   # release-prep PRs) sit BLOCKED forever even though every code
-  # check would be a no-op. Cheaper to spend ~7 min of free runner
-  # time on a docs PR than to maintain the bypass-actor dance on
-  # every release.
+  # check would be a no-op.
+  #
+  # #813 gets the runtime back without that trade: the workflow still
+  # ALWAYS runs and always posts every check, and the expensive part
+  # (8 backend test shards, each with its own Postgres + Redis) is
+  # gated per-JOB on change detection instead. A docs-only PR now
+  # posts a green "Backend — Tests" in seconds rather than minutes,
+  # and no ruleset knows the difference.
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -21,6 +26,74 @@ permissions:
   contents: read
 
 jobs:
+  # ── Change detection (issue #813) ──────────────────────────────────────────
+  # Cheap (~15 s) job whose only output decides whether the 8 backend test
+  # shards run. Everything else in this workflow is unconditional.
+  #
+  # Deliberately NOT ``dorny/paths-filter``: a plain git diff needs no
+  # third-party action in the supply chain for something this small, and it
+  # sidesteps that action's base-ref handling on non-PR events.
+  #
+  # The matching itself lives in ``.github/scripts/ci-backend-relevant.sh`` so
+  # it can be tested without pushing a branch — see
+  # ``backend/tests/test_ci_backend_relevant.py``. Read that script's header
+  # before changing the path list; the deny-list shape is load-bearing.
+  changes:
+    name: Detect changed paths
+    runs-on: ubuntu-latest
+    outputs:
+      backend: ${{ steps.detect.outputs.backend }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The diff is taken against the PR's merge base, so both sides of
+          # the history have to be present.
+          fetch-depth: 0
+
+      - id: detect
+        name: Does this change set need the backend suite?
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          # Push to main runs the full suite unconditionally: it is the
+          # post-merge safety net, and a squash-merge's diff is not the
+          # thing we filtered on when the PR was open.
+          if [ "$EVENT" != "pull_request" ]; then
+            echo "event=$EVENT — running the full backend suite"
+            echo "backend=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Three dots: changes on the head branch since the merge base, not
+          # everything main has moved on by.
+          #
+          # ``--no-renames`` is load-bearing. With rename detection on (the
+          # default) ``git mv backend/thing.py docs/thing.md`` reports ONLY
+          # the destination — so a PR that deletes a backend file by moving
+          # it out of the tree would look docs-only and skip the whole suite.
+          # We want both sides of every rename in the list.
+          changed="$RUNNER_TEMP/changed-files.txt"
+          if ! git diff --no-renames --name-only "$BASE_SHA...$HEAD_SHA" > "$changed"; then
+            echo "::warning::could not diff $BASE_SHA...$HEAD_SHA — running the full backend suite"
+            echo "backend=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Changed files:"
+          sed 's/^/  /' "$changed"
+
+          relevant="$(.github/scripts/ci-backend-relevant.sh < "$changed")"
+          echo "backend=$relevant" >> "$GITHUB_OUTPUT"
+          if [ "$relevant" = "true" ]; then
+            echo "→ backend suite WILL run"
+          else
+            echo "→ nothing the backend suite covers changed; shards will be skipped"
+          fi
+
   # ── Backend ────────────────────────────────────────────────────────────────
   backend-lint:
     name: Backend — Lint & Type Check
@@ -76,6 +149,13 @@ jobs:
   backend-test-shard:
     name: Backend — Tests (shard ${{ matrix.shard }}/8)
     runs-on: ubuntu-latest
+    # #813 — skipped when the PR touches nothing the suite covers. The
+    # aggregator below stays green in that case, so no required check
+    # notices. ``changes`` failing leaves this skipped too, and the
+    # aggregator treats THAT as a failure (it only accepts a skip that
+    # detection explicitly asked for).
+    needs: [changes]
+    if: needs.changes.outputs.backend == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -141,20 +221,41 @@ jobs:
         # 4 vCPUs, each xdist worker on its own ``spatiumddi_test_gw<N>`` DB.
         run: python -m pytest -n auto --splits 8 --group ${{ matrix.shard }}
 
-  # Required-status-check aggregator: branch protection gates on the stable
-  # name "Backend — Tests"; this job passes only if every shard did. Keep
-  # this name (and the shard count above) in sync with the required check.
+  # Aggregator that collapses the 8 shards into one stable check name,
+  # "Backend — Tests". Not currently in ``protect-main``'s required set (only
+  # the two Frontend jobs and Backend Lint are) but it is the name to point at
+  # if it ever is — which is precisely why the skip logic lives HERE and never
+  # on the shards' own check names.
+  #
+  # #813: a skip is a pass, but only the skip detection asked for.
   backend-test:
     name: Backend — Tests
     runs-on: ubuntu-latest
-    needs: [backend-test-shard]
+    needs: [changes, backend-test-shard]
     if: always()
     steps:
       - name: All shards passed
+        env:
+          SHARDS: ${{ needs.backend-test-shard.result }}
+          BACKEND_RELEVANT: ${{ needs.changes.outputs.backend }}
         run: |
-          result="${{ needs.backend-test-shard.result }}"
-          if [ "$result" != "success" ]; then
-            echo "::error::backend test shards did not all pass (result=$result)"
+          set -euo pipefail
+
+          if [ "$SHARDS" = "skipped" ]; then
+            # Only an explicit "false" justifies a skip. An empty value means
+            # the ``changes`` job itself failed or was cancelled, which took
+            # the shards down with it — that is a broken run, not a clean one,
+            # and must not report green.
+            if [ "$BACKEND_RELEVANT" != "false" ]; then
+              echo "::error::shards were skipped but change detection did not ask for it (backend='$BACKEND_RELEVANT')"
+              exit 1
+            fi
+            echo "no backend-relevant files changed — 8 shards skipped (#813)"
+            exit 0
+          fi
+
+          if [ "$SHARDS" != "success" ]; then
+            echo "::error::backend test shards did not all pass (result=$SHARDS)"
             exit 1
           fi
           echo "all 8 backend test shards passed"

@@ -241,7 +241,7 @@ Three of the four events have distinct jobs:
 
 | Event | Runs | Why |
 |---|---|---|
-| **Pull request** | `ci.yml`, the per-image builds (single-arch + **Trivy**), `agent-e2e.yml` | Where correctness is gated. Nothing merges without it. |
+| **Pull request** | `ci.yml` (backend shards gated on change detection — see below), the per-image builds (single-arch + **Trivy**), `agent-e2e.yml` | Where correctness is gated. Nothing merges without it. |
 | **Push to `main`** | `ci.yml`, `docs-publish.yml`, `build-appliance-builder.yml` | Post-merge safety net + the two things that must be *published* from `main`. |
 | **Release tag** | `release.yml` only | Builds and publishes every image multi-arch, the chart, and the appliance ISO. |
 | **Schedule** | `nightly.yml`, `trivy-scheduled.yml`, `prune-release-assets.yml` | Work that is about *elapsed time*, not about a change. |
@@ -267,6 +267,48 @@ Two rules follow, and both were violations once:
 run in the common case — GitHub tests the merge result — but it validates
 the actual squashed commit, and it is the only check that covers a direct
 push or a merge made with `--admin` while shards were still pending.
+
+### Skipping the backend shards on a PR that can't affect them
+
+The workflow has no `paths-ignore` and never will: a skipped workflow run
+posts none of the check-runs `protect-main` waits for, so a docs-only PR
+would sit blocked forever. What [#813](https://github.com/spatiumddi/spatiumddi/issues/813)
+added instead is **per-job** change detection, which keeps the workflow —
+and every check name — unconditional:
+
+1. A `changes` job diffs the PR against its merge base and pipes the file
+   list through [`.github/scripts/ci-backend-relevant.sh`](../.github/scripts/ci-backend-relevant.sh).
+2. The 8 `backend-test-shard` jobs are gated on its output.
+3. The `Backend — Tests` aggregator treats a skip as a pass — but **only a
+   skip that detection asked for**. An empty output (the `changes` job
+   itself failed, taking the shards with it) fails the aggregator.
+
+Push to `main` always runs the full suite; the filter applies to
+`pull_request` only.
+
+The path list is a **deny-list**, and that shape is the point. An
+allow-list (`run when backend/** changes`) fails silently in the worst
+direction — a new top-level directory nobody added stops running the
+tests, and the tell is a green PR that was never tested. A deny-list makes
+the cost of forgetting a few runner-minutes instead.
+
+Two directories look unrelated to the backend and are deliberately *not*
+deny-listed, because backend tests load files out of them by path:
+
+| Test | Reads |
+|---|---|
+| `test_spatium_console.py` (52 tests) | `appliance/mkosi.extra/usr/local/bin/spatium-console` |
+| `test_appliance_firewall_render.py` | `agent/supervisor/spatium_supervisor/firewall_renderer.py` |
+
+Check for new cross-boundary reads before widening the list.
+`backend/tests/test_ci_backend_relevant.py` pins the whole table, so
+edits to the script are exercised without pushing a branch.
+
+Not yet filtered, and each for a reason: the frontend jobs and
+`Backend — Lint` are `protect-main`'s **required** checks, and a skipped
+required check is exactly the blocked-PR failure mode above; `agent-test`
+and `appliance-test` are seconds each, so the detection would cost more
+than it saves.
 
 ### Nightly builds
 
