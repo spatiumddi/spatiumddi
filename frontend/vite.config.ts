@@ -3,7 +3,9 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import { readFileSync } from "fs";
 
-const pkg = JSON.parse(readFileSync(new URL("./package.json", import.meta.url), "utf-8")) as {
+const pkg = JSON.parse(
+  readFileSync(new URL("./package.json", import.meta.url), "utf-8"),
+) as {
   version: string;
 };
 
@@ -26,6 +28,22 @@ export default defineConfig({
     port: 5173,
     proxy: {
       "/api": {
+        target: "http://localhost:8000",
+        changeOrigin: true,
+      },
+      // Backend endpoints also live outside /api — notably
+      // /health/* (platform health) and /metrics. The production
+      // nginx config proxies these to the API (see
+      // default.conf.template → `location ~ ^/(health|metrics)`),
+      // but the Vite dev proxy only forwarded /api, so requests to
+      // /health/platform fell through to the SPA fallback and
+      // returned index.html — crashing the dashboard's platform
+      // health card. Mirror those two proxy entries here.
+      "/health": {
+        target: "http://localhost:8000",
+        changeOrigin: true,
+      },
+      "/metrics": {
         target: "http://localhost:8000",
         changeOrigin: true,
       },

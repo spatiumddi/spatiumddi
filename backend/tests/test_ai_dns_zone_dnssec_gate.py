@@ -170,15 +170,16 @@ async def test_dnssec_preview_fails_soft_on_an_empty_group(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("driver", sorted(_SIGNING_DRIVERS))
-async def test_preview_text_does_not_promise_signing_the_create_wont_do(
+async def test_preview_text_reflects_signing_at_create(
     db_session: AsyncSession, driver: str
 ) -> None:
     """Say what actually happens, per driver.
 
-    Zone-create records intent. BIND9 converges from that alone (it signs
-    inline from the config bundle); PowerDNS and Technitium sign only in
-    response to the ``dnssec_sign`` record op, which neither this path nor
-    the REST ``create_zone`` enqueues. The preview must not imply otherwise.
+    Since #811 the create paths enqueue the ``dnssec_sign`` op themselves,
+    so the preview no longer warns about a flag-only zone: BIND9 signs
+    inline from the config bundle, PowerDNS / Technitium sign in response
+    to the enqueued op. The old interim "flag only; run the zone's DNSSEC
+    Sign action" wording must be gone.
     """
     user = await _user(db_session)
     grp = await _group_with_driver(db_session, driver)
@@ -195,11 +196,11 @@ async def test_preview_text_does_not_promise_signing_the_create_wont_do(
     )
     assert preview.ok, preview.detail
     text = preview.preview_text or ""
+    assert "flag only" not in text
     if driver == "bind9":
         assert "signs inline" in text
     else:
-        assert "flag only" in text
-        assert driver in text
+        assert "sign op enqueued" in text
 
 
 @pytest.mark.asyncio
