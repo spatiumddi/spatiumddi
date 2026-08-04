@@ -12,7 +12,6 @@ currently tied to the blocked MAC.
 
 from __future__ import annotations
 
-import re
 import uuid
 from datetime import datetime
 from typing import Any, Literal
@@ -23,6 +22,7 @@ from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.v1.dhcp._audit import write_audit
+from app.api.v1.dhcp._mac import canonicalize_mac
 from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
 from app.models.dhcp import DHCPMACBlock, DHCPServerGroup
@@ -60,20 +60,13 @@ router = APIRouter(
 )
 
 # ── MAC normalization ────────────────────────────────────────────────
-# Accept the common operator-entered shapes and canonicalize to the
-# colon-separated lowercase form the DB stores. We reject anything that
-# doesn't parse to 12 hex chars rather than letting a malformed row
-# reach the agent and blow up its config.
+# The canonicalizer moved to `_mac.py` unchanged so the static-assignment
+# endpoint can apply the identical rule (it had none, and a malformed MAC
+# reached the MACADDR column as a 500). Re-bound under its original private
+# name so the schemas below read exactly as they did.
 
-_MAC_DELIMS = re.compile(r"[:\-.\s]")
+_canonicalize_mac = canonicalize_mac
 _VALID_REASONS = frozenset({"rogue", "lost_stolen", "quarantine", "policy", "other"})
-
-
-def _canonicalize_mac(raw: str) -> str:
-    cleaned = _MAC_DELIMS.sub("", raw.strip()).lower()
-    if len(cleaned) != 12 or not all(c in "0123456789abcdef" for c in cleaned):
-        raise ValueError("mac_address must be 12 hex chars (any common separator allowed)")
-    return ":".join(cleaned[i : i + 2] for i in range(0, 12, 2))
 
 
 # ── Pydantic schemas ────────────────────────────────────────────────
