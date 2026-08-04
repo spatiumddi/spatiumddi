@@ -19,6 +19,10 @@ on:
 
 jobs:
   build-and-publish:
+    # Forks inherit this workflow (#830); never push the builder image
+    # outside the canonical repo. PRs to us run here anyway (the base
+    # repo's owner matches), so contributor scan builds are unaffected.
+    if: github.repository_owner == 'spatiumddi'
     runs-on: ubuntu-latest
     permissions:
       contents: read
