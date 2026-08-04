@@ -66,6 +66,9 @@ env:
 jobs:
   publish:
     name: Mirror docs/ to the site repo
+    # Forks inherit this workflow (#830); never run the publisher outside
+    # the canonical repo. (Single-job workflow.)
+    if: github.repository_owner == 'spatiumddi'
     runs-on: ubuntu-latest
     steps:
       - name: Check out source ref

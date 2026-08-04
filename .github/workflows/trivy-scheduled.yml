@@ -37,6 +37,9 @@ permissions:
 jobs:
   scan:
     name: Trivy — all shipped images
+    # Forks inherit this workflow (#830); never run the publisher outside
+    # the canonical repo. (Single-job workflow.)
+    if: github.repository_owner == 'spatiumddi'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
