@@ -15,13 +15,14 @@ from datetime import UTC, datetime
 from typing import Any
 
 import structlog
+from sqlalchemy import delete as sa_delete
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.agent_wake import collect_wake, dns_group_channel
 from app.drivers.dns import get_driver, is_agentless
 from app.drivers.dns.base import RecordChange, RecordData, RRsetData, RRsetMember
-from app.models.dns import DNSRecord, DNSRecordOp, DNSServer, DNSZone
+from app.models.dns import DNSKey, DNSRecord, DNSRecordOp, DNSServer, DNSZone
 from app.services.dns.rrset import stamp_rrsets_for_ops
 from app.services.dns.serial import bump_zone_serial
 
@@ -154,23 +155,33 @@ async def _apply_agentless(
     return op_row
 
 
-# The synthetic "record" a DNSSEC state change rides the op queue as. BIND9
-# ignores it (it signs inline from the rendered config bundle); PowerDNS and
-# Technitium consume it to drive their online sign/unsign.
-_DNSSEC_OP_RECORD: dict[str, str] = {"name": "@", "type": "DNSSEC_OP"}
-
-
 async def enqueue_dnssec_op(db: AsyncSession, zone: DNSZone, op: str) -> None:
     """Queue the driver-side half of a DNSSEC state change.
 
-    ``op`` is ``dnssec_sign`` or ``dnssec_unsign``. One chokepoint for every
-    path that flips ``zone.dnssec_enabled`` — the sign/unsign endpoints, zone
-    create (REST + Copilot) and the update-zone flag flip — so they cannot
-    drift apart again (#811: create set the flag and never enqueued, leaving
-    PowerDNS / Technitium zones flagged-but-unsigned until a manual Sign).
-    The zone must have its id assigned (flush first on freshly-added rows).
+    ``op`` is ``dnssec_sign`` or ``dnssec_unsign``. The synthetic "record"
+    is the DNSSEC_OP sentinel: BIND9 ignores it (it signs inline from the
+    rendered config bundle); PowerDNS and Technitium consume it to drive
+    their online sign/unsign. One chokepoint for every path that flips
+    ``zone.dnssec_enabled`` — the sign/unsign endpoints (REST + Copilot),
+    zone create (REST + Copilot) and the update-zone flag flip — so they
+    cannot drift apart again (#811: create set the flag and never enqueued,
+    leaving PowerDNS / Technitium zones flagged-but-unsigned until a manual
+    Sign). Nothing here reads ``zone.id`` — ops key the zone by name — so a
+    freshly-added, not-yet-flushed zone row is fine.
     """
-    await enqueue_record_op(db, zone, op, dict(_DNSSEC_OP_RECORD))
+    await enqueue_record_op(db, zone, op, {"name": "@", "type": "DNSSEC_OP"})
+
+
+async def clear_dnssec_key_state(db: AsyncSession, zone: DNSZone) -> None:
+    """Clear the cached DS records + per-key mirror rows for a zone.
+
+    Companion to ``enqueue_dnssec_op("dnssec_unsign")`` — every flag-off
+    path (the unsign endpoints, the update-zone flip) must do this, because
+    the BIND9 agent only reports *signed* zones and will never send a
+    ``keys=[]`` report to clear them.
+    """
+    zone.dnssec_ds_records = None
+    await db.execute(sa_delete(DNSKey).where(DNSKey.zone_id == zone.id))
 
 
 async def enqueue_record_op(

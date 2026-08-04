@@ -964,7 +964,13 @@ async def _dnssec_lookup(
     """Fetch+gate the zone the way the DNS router does, translating its
     HTTPException into an operator-facing ValueError. The DNS router's
     sign/unsign endpoints are superadmin-only, so re-check that here —
-    a proposal approval must not bypass the REST authorization."""
+    a proposal approval must not bypass the REST authorization.
+
+    The driver gate applies only to the sign direction, matching REST
+    (#811 review): unsign is ungated because clearing the flag on a group
+    that could never have signed must stay possible — see the router's
+    ``_flip_dnssec_off``.
+    """
     _require_superadmin(user)
     from fastapi import HTTPException  # noqa: PLC0415
 
@@ -973,7 +979,8 @@ async def _dnssec_lookup(
     try:
         zone = await dns_router._require_zone(group_id, zone_id, db)  # noqa: SLF001
         dns_router._reject_if_synthesised_zone(zone, op)  # noqa: SLF001
-        await dns_router._check_driver_gated_operation(op, group_id, db)  # noqa: SLF001
+        if op == "dnssec_sign":
+            await dns_router._check_driver_gated_operation(op, group_id, db)  # noqa: SLF001
     except HTTPException as exc:
         raise ValueError(str(exc.detail)) from exc
     return zone
@@ -999,8 +1006,9 @@ async def _preview_sign_zone_dnssec(
 async def _apply_sign_zone_dnssec(
     db: AsyncSession, user: User, args: SignZoneDNSSECArgs
 ) -> dict[str, Any]:
-    from app.api.v1.dns import router as dns_router  # noqa: PLC0415
+    from app.core.agent_wake import dns_group_channel, publish_wake  # noqa: PLC0415
     from app.models.dns import DNSSECPolicy  # noqa: PLC0415
+    from app.services.dns.record_ops import enqueue_dnssec_op  # noqa: PLC0415
 
     zone = await _dnssec_lookup(db, user, args.group_id, args.zone_id, "dnssec_sign")
     zone.dnssec_enabled = True
@@ -1009,7 +1017,7 @@ async def _apply_sign_zone_dnssec(
         if pol is None:
             raise ValueError("DNSSEC policy not found")
         zone.dnssec_policy_id = args.policy_id
-    await dns_router.enqueue_record_op(db, zone, "dnssec_sign", {"name": "@", "type": "DNSSEC_OP"})
+    await enqueue_dnssec_op(db, zone, "dnssec_sign")
     write_audit(
         db,
         user=user,
@@ -1023,6 +1031,9 @@ async def _apply_sign_zone_dnssec(
         },
     )
     await db.commit()
+    # The /ai router mounts without wake_publishing, so the buffered wake
+    # never flushes here — publish directly, like _apply_create_dns_record.
+    await publish_wake(dns_group_channel(zone.group_id))
     await db.refresh(zone)
     return {"id": str(zone.id), "name": zone.name, "dnssec_enabled": True}
 
@@ -1047,18 +1058,13 @@ async def _preview_unsign_zone_dnssec(
 async def _apply_unsign_zone_dnssec(
     db: AsyncSession, user: User, args: UnsignZoneDNSSECArgs
 ) -> dict[str, Any]:
-    from sqlalchemy import delete as sa_delete  # noqa: PLC0415
-
     from app.api.v1.dns import router as dns_router  # noqa: PLC0415
-    from app.models.dns import DNSKey  # noqa: PLC0415
+    from app.core.agent_wake import dns_group_channel, publish_wake  # noqa: PLC0415
 
     zone = await _dnssec_lookup(db, user, args.group_id, args.zone_id, "dnssec_unsign")
-    zone.dnssec_enabled = False
-    zone.dnssec_ds_records = None
-    await db.execute(sa_delete(DNSKey).where(DNSKey.zone_id == zone.id))
-    await dns_router.enqueue_record_op(
-        db, zone, "dnssec_unsign", {"name": "@", "type": "DNSSEC_OP"}
-    )
+    # Flag + DS/key cleanup + conditional enqueue, shared with the REST
+    # unsign endpoint and the update-zone flip (#811 review).
+    await dns_router._flip_dnssec_off(db, zone)  # noqa: SLF001
     write_audit(
         db,
         user=user,
@@ -1069,6 +1075,8 @@ async def _apply_unsign_zone_dnssec(
         new_value={"via": "ai_proposal"},
     )
     await db.commit()
+    # See _apply_sign_zone_dnssec — the /ai router has no wake_publishing.
+    await publish_wake(dns_group_channel(zone.group_id))
     await db.refresh(zone)
     return {"id": str(zone.id), "name": zone.name, "dnssec_enabled": False}
 

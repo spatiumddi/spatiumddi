@@ -77,6 +77,7 @@ from app.services.dns.delegation import (
     preview_to_dict,
 )
 from app.services.dns.record_ops import (
+    clear_dnssec_key_state,
     enqueue_dnssec_op,
     enqueue_record_op,
     enqueue_record_ops_batch,
@@ -3430,7 +3431,6 @@ async def create_zone(
     # safe: the agent applies the structural bundle (creating the zone)
     # before draining pending ops in the same sync cycle.
     if body.dnssec_enabled:
-        await db.flush()
         await enqueue_dnssec_op(db, zone, "dnssec_sign")
 
     db.add(
@@ -4018,24 +4018,22 @@ async def update_zone(
                 ),
             )
     # DNSSEC flag flips through the generic update path (#811). Same
-    # gate + enqueue the dedicated sign/unsign endpoints do — before this,
+    # behaviour as the dedicated sign/unsign endpoints — before this,
     # PATCHing dnssec_enabled set the flag and nothing ever signed (or
-    # unsigned) on PowerDNS / Technitium. Gate before mutating so an
-    # incompatible group refuses the whole update.
+    # unsigned) on PowerDNS / Technitium. Only the ON direction is gated
+    # (before mutating, so an incompatible group refuses the whole update);
+    # the OFF direction is deliberately ungated — see _flip_dnssec_off.
     dnssec_flip: str | None = None
     if "dnssec_enabled" in changes and changes["dnssec_enabled"] != zone.dnssec_enabled:
         dnssec_flip = "dnssec_sign" if changes["dnssec_enabled"] else "dnssec_unsign"
-        await _check_driver_gated_operation(dnssec_flip, group_id, db)
+        if dnssec_flip == "dnssec_sign":
+            await _check_driver_gated_operation(dnssec_flip, group_id, db)
     for k, v in changes.items():
         setattr(zone, k, v)
-    if dnssec_flip is not None:
-        if dnssec_flip == "dnssec_unsign":
-            # Mirror the unsign endpoint: clear cached DS + per-key state now
-            # — the BIND9 agent only reports signed zones, so it won't send a
-            # keys=[] report to clear these.
-            zone.dnssec_ds_records = None
-            await db.execute(sa_delete(DNSKey).where(DNSKey.zone_id == zone.id))
-        await enqueue_dnssec_op(db, zone, dnssec_flip)
+    if dnssec_flip == "dnssec_sign":
+        await enqueue_dnssec_op(db, zone, "dnssec_sign")
+    elif dnssec_flip == "dnssec_unsign":
+        await _flip_dnssec_off(db, zone)
     db.add(
         AuditLog(
             user_id=current_user.id,
@@ -4728,6 +4726,33 @@ class DNSSECSignRequest(BaseModel):
     policy_id: uuid.UUID | None = None
 
 
+async def _flip_dnssec_off(db: DB, zone: DNSZone) -> None:
+    """Turn DNSSEC off for a zone: flag, cached key state, driver-side op.
+
+    Deliberately UNGATED (#811 review): a flip-off on a group whose drivers
+    could never have signed has nothing to unsign on the wire, and gating it
+    would permanently trap the pre-#811 zones whose flag was accepted on
+    e.g. a windows_dns group — "signed" in the UI, unsigned on the wire,
+    with this the only API path that can clear the lie. The driver-side
+    unsign op is enqueued only when every driver in the group can honour it
+    (same subset the sign gate uses); on any other group there is nothing
+    queued — the enqueue path's agentless immediate-apply could not process
+    the DNSSEC_OP sentinel anyway.
+
+    Shared by the unsign endpoint, the update-zone flag flip, and the
+    Copilot's unsign apply, so their choreography (flag + DS/key cleanup +
+    conditional enqueue) cannot drift apart.
+    """
+    zone.dnssec_enabled = False
+    # Clear cached DS + per-key state now — the BIND9 agent only reports
+    # signed zones, so it won't send a keys=[] report to clear these.
+    await clear_dnssec_key_state(db, zone)
+    res = await db.execute(select(DNSServer.driver).where(DNSServer.group_id == zone.group_id))
+    drivers = {d for d in res.scalars().all() if d}
+    if drivers and drivers <= _DRIVER_GATED_OPERATIONS["dnssec_unsign"]:
+        await enqueue_dnssec_op(db, zone, "dnssec_unsign")
+
+
 @router.post("/groups/{group_id}/zones/{zone_id}/dnssec/sign", response_model=ZoneResponse)
 async def sign_zone_dnssec(
     group_id: uuid.UUID,
@@ -4791,21 +4816,18 @@ async def unsign_zone_dnssec(
 ) -> DNSZone:
     """Disable PowerDNS DNSSEC signing for the zone (issue #127, Phase 3c).
 
-    Mirrors :func:`sign_zone_dnssec`. The agent deletes the cryptokeys via
-    REST, removes the ``PRESIGNED`` metadata, and the zone reverts to
-    unsigned answers. Operators with a parent registrar still pointing at
-    the old DS record will see SERVFAIL on validating resolvers — this
-    endpoint does NOT walk the parent zone for them.
+    Mirrors :func:`sign_zone_dnssec`, minus the driver gate: turning the
+    flag OFF is allowed on any group (see :func:`_flip_dnssec_off` — a hard
+    gate here would leave pre-#811 flagged-but-unsignable zones with no API
+    remediation). On signing-capable groups the agent deletes the
+    cryptokeys via REST, removes the ``PRESIGNED`` metadata, and the zone
+    reverts to unsigned answers. Operators with a parent registrar still
+    pointing at the old DS record will see SERVFAIL on validating
+    resolvers — this endpoint does NOT walk the parent zone for them.
     """
     zone = await _require_zone(group_id, zone_id, db)
     _reject_if_synthesised_zone(zone, "DNSSEC-unsign")
-    await _check_driver_gated_operation("dnssec_unsign", group_id, db)
-    zone.dnssec_enabled = False
-    # Clear cached DS + per-key state now — the BIND9 agent only reports
-    # signed zones, so it won't send a keys=[] report to clear these.
-    zone.dnssec_ds_records = None
-    await db.execute(sa_delete(DNSKey).where(DNSKey.zone_id == zone.id))
-    await enqueue_dnssec_op(db, zone, "dnssec_unsign")
+    await _flip_dnssec_off(db, zone)
     db.add(
         AuditLog(
             user_id=current_user.id,

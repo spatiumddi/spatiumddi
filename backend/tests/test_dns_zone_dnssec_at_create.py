@@ -275,6 +275,64 @@ async def test_update_without_flip_enqueues_nothing(
 
 
 @pytest.mark.asyncio
+async def test_update_flip_off_ungated_on_non_signing_group(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Clearing the flag must work on ANY group (#811 review).
+
+    The pre-#811 bug population is zones whose dnssec_enabled=true was
+    accepted on e.g. a windows_dns group. Sign 422s there; if flip-off were
+    gated the same way, those zones would be permanently stuck lying. So
+    flip-off is ungated — flag cleared, key state cleared, and no unsign op
+    queued (nothing was ever signed, and the agentless immediate-apply
+    couldn't process the DNSSEC_OP sentinel)."""
+    headers = await _headers(db_session)
+    grp = await _group(db_session, "windows_dns")
+    zone_id, zone_name = await _zone_via_api(client, db_session, headers, grp, dnssec=False)
+
+    # Recreate the legacy state directly — the (fixed) create path refuses it.
+    zone = await db_session.get(DNSZone, zone_id)
+    assert zone is not None
+    zone.dnssec_enabled = True
+    zone.dnssec_ds_records = ["12345 13 2 ab"]
+    await db_session.commit()
+
+    resp = await client.put(
+        f"/api/v1/dns/groups/{grp.id}/zones/{zone_id}",
+        json={"dnssec_enabled": False},
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["dnssec_enabled"] is False
+    await db_session.refresh(zone)
+    assert zone.dnssec_ds_records is None
+    assert await _dnssec_ops(db_session, zone_name) == []
+
+
+@pytest.mark.asyncio
+async def test_unsign_endpoint_ungated_on_non_signing_group(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The dedicated unsign endpoint clears the flag on any group too —
+    same _flip_dnssec_off path as the update flip."""
+    headers = await _headers(db_session)
+    grp = await _group(db_session, "windows_dns")
+    zone_id, zone_name = await _zone_via_api(client, db_session, headers, grp, dnssec=False)
+    zone = await db_session.get(DNSZone, zone_id)
+    assert zone is not None
+    zone.dnssec_enabled = True
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/v1/dns/groups/{grp.id}/zones/{zone_id}/dnssec/unsign",
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["dnssec_enabled"] is False
+    assert await _dnssec_ops(db_session, zone_name) == []
+
+
+@pytest.mark.asyncio
 async def test_update_flip_gated_like_create(client: AsyncClient, db_session: AsyncSession) -> None:
     headers = await _headers(db_session)
     grp = await _group(db_session, "windows_dns")
@@ -314,9 +372,10 @@ async def test_copilot_apply_enqueues_sign_op(db_session: AsyncSession) -> None:
 
 
 @pytest.mark.asyncio
-async def test_copilot_apply_regates_at_apply_time(db_session: AsyncSession) -> None:
-    """Servers can join the group between proposal and approval — apply must
-    re-run the gate rather than trusting a stale preview."""
+async def test_copilot_apply_enforces_driver_gate(db_session: AsyncSession) -> None:
+    """Apply runs the driver gate itself (not only preview) — the rationale
+    (servers can join a group between proposal and approval) lives on
+    _gated_zone_arg_conflict's docstring."""
     user = await _admin(db_session)
     grp = await _group(db_session, "windows_dns")
     op = get_operation("create_dns_zone")
