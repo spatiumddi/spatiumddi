@@ -2181,6 +2181,41 @@ def _drivers_for_gated_arg(arg: str) -> frozenset[str]:
     return _DRIVER_GATED_OPERATIONS[op]
 
 
+def _gated_zone_arg_conflict(args: CreateDNSZoneArgs, drivers: set[str]) -> str | None:
+    """Driver-gated zone features (currently DNSSEC). Semantics are copied
+    from ``_check_driver_gated_operation`` in the DNS router, deliberately
+    and exactly:
+
+    * SUBSET, not intersection — EVERY server in the group has to support
+      the feature, not merely one of them. An "any member matches" test
+      would pass a bind9 + windows_dns group here, land a zone flagged
+      dnssec_enabled, and then the sign/unsign endpoints would 422 it:
+      signed according to the UI, unsigned on the wire, and unfixable
+      through the API.
+    * Empty groups fail SOFT — a group with no servers yet has nobody to
+      disagree, and the REST gate re-runs once a driver is known.
+
+    Shared by preview AND apply (#811): apply re-checks because servers can
+    join the group between proposal and approval, and an unsignable zone
+    must not land just because the preview predates the new member.
+    """
+    for feat, (_op, label) in _DRIVER_GATED_ZONE_ARGS.items():
+        if not getattr(args, feat) or not drivers:
+            continue
+        allowed = _drivers_for_gated_arg(feat)
+        incompatible = drivers - allowed
+        if incompatible:
+            grp_note = f"({', '.join(sorted(allowed))})"
+            return (
+                f"{feat}=true requires every server in the group to support "
+                f"{label} {grp_note}, but the group also has "
+                f"{sorted(incompatible)}. Move those servers to their own "
+                f"group, pick a different group, or set driver_hint to one "
+                f"of {sorted(allowed)} without group_id."
+            )
+    return None
+
+
 class CreateDNSZoneArgs(BaseModel):
     """Args for the ``create_dns_zone`` operation.
 
@@ -2371,34 +2406,11 @@ async def _preview_create_dns_zone(
     if grp is None:
         return PreviewResult(ok=False, detail=err)
 
-    # Driver-gated zone features (currently DNSSEC). Semantics are copied
-    # from ``_check_driver_gated_operation`` in the DNS router, deliberately
-    # and exactly:
-    #
-    #   * SUBSET, not intersection — EVERY server in the group has to support
-    #     the feature, not merely one of them. An "any member matches" test
-    #     would pass a bind9 + windows_dns group here, land a zone flagged
-    #     dnssec_enabled, and then the sign/unsign endpoints would 422 it:
-    #     signed according to the UI, unsigned on the wire, and unfixable
-    #     through the API.
-    #   * Empty groups fail SOFT — a group with no servers yet has nobody to
-    #     disagree, and the REST gate re-runs once a driver is known.
-    for feat, (_op, label) in _DRIVER_GATED_ZONE_ARGS.items():
-        if not getattr(args, feat) or not drivers:
-            continue
-        allowed = _drivers_for_gated_arg(feat)
-        incompatible = drivers - allowed
-        if incompatible:
-            return PreviewResult(
-                ok=False,
-                detail=(
-                    f"{feat}=true requires every server in the group to support "
-                    f"{label} ({', '.join(sorted(allowed))}), but {grp.name!r} "
-                    f"also has {sorted(incompatible)}. Move those servers to "
-                    f"their own group, pick a different group, or set "
-                    f"driver_hint to one of {sorted(allowed)} without group_id."
-                ),
-            )
+    # Driver-gated zone features (currently DNSSEC) — see
+    # ``_gated_zone_arg_conflict`` for the subset / fail-soft semantics.
+    conflict = _gated_zone_arg_conflict(args, drivers)
+    if conflict is not None:
+        return PreviewResult(ok=False, detail=conflict)
 
     existing = (
         await db.execute(
@@ -2420,23 +2432,21 @@ async def _preview_create_dns_zone(
     parts.append(f"drivers={sorted(drivers) or ['(none)']}")
     parts.append(f"type={args.zone_type}/{args.kind}")
     if args.dnssec_enabled:
-        # Zone-create records INTENT. BIND9 converges from that alone — it
-        # signs inline from the rendered config bundle — but PowerDNS and
-        # Technitium sign only in response to the ``dnssec_sign`` record op,
-        # which neither this path nor the REST ``create_zone`` enqueues
-        # (issue #811). Say which of the two the operator is getting rather
-        # than implying the zone comes up signed everywhere. Once #811 lands
-        # this branch collapses back to a plain "DNSSEC=on".
-        deferred = sorted(drivers - {"bind9"})
+        # #811: create now enqueues the ``dnssec_sign`` op itself, so the
+        # preview no longer has to warn about a flag-only zone. BIND9
+        # ignores the op (it signs inline from the rendered config bundle);
+        # PowerDNS and Technitium consume it. The one caveat left is an
+        # empty group — no server means no primary to queue against, so the
+        # op is dropped and signing starts from a manual Sign later.
         if not drivers:
-            parts.append("DNSSEC=on (no servers in the group yet)")
-        elif deferred:
             parts.append(
-                "DNSSEC=on — flag only; run the zone's DNSSEC Sign action to "
-                f"sign on {', '.join(deferred)}"
+                "DNSSEC=on (no servers in the group yet — run the zone's "
+                "DNSSEC Sign action once servers join)"
             )
-        else:
+        elif drivers <= {"bind9"}:
             parts.append("DNSSEC=on (bind9 signs inline from the config bundle)")
+        else:
+            parts.append("DNSSEC=on (sign op enqueued at create)")
     return PreviewResult(ok=True, detail="ready", preview_text=", ".join(parts))
 
 
@@ -2451,11 +2461,18 @@ async def _apply_create_dns_zone(
     enforce_operation_permission(user, _OPERATIONS["create_dns_zone"])
 
     name = _normalize_zone_name(args.name)
-    grp, _drivers, err = await _resolve_group_for_zone(
+    grp, drivers, err = await _resolve_group_for_zone(
         db, group_id=args.group_id, driver_hint=args.driver_hint
     )
     if grp is None:
         raise ValueError(err)
+
+    # Re-run the driver gate at apply time (#811) — servers can join the
+    # group between proposal and approval, and an unsignable zone must not
+    # land just because the preview predates the new member.
+    conflict = _gated_zone_arg_conflict(args, drivers)
+    if conflict is not None:
+        raise ValueError(conflict)
 
     zone = DNSZone(
         group_id=grp.id,
@@ -2469,6 +2486,15 @@ async def _apply_create_dns_zone(
     )
     db.add(zone)
     await db.flush()
+
+    # #811: enqueue the sign op the same way the REST create does — the
+    # Copilot fronts the REST API and the two must stay in lockstep (#798).
+    # BIND9 ignores the op (signs inline from the config bundle); PowerDNS
+    # and Technitium sign in response to it.
+    if args.dnssec_enabled:
+        from app.services.dns.record_ops import enqueue_dnssec_op  # noqa: PLC0415
+
+        await enqueue_dnssec_op(db, zone, "dnssec_sign")
 
     db.add(
         AuditLog(

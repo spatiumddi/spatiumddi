@@ -154,6 +154,25 @@ async def _apply_agentless(
     return op_row
 
 
+# The synthetic "record" a DNSSEC state change rides the op queue as. BIND9
+# ignores it (it signs inline from the rendered config bundle); PowerDNS and
+# Technitium consume it to drive their online sign/unsign.
+_DNSSEC_OP_RECORD: dict[str, str] = {"name": "@", "type": "DNSSEC_OP"}
+
+
+async def enqueue_dnssec_op(db: AsyncSession, zone: DNSZone, op: str) -> None:
+    """Queue the driver-side half of a DNSSEC state change.
+
+    ``op`` is ``dnssec_sign`` or ``dnssec_unsign``. One chokepoint for every
+    path that flips ``zone.dnssec_enabled`` — the sign/unsign endpoints, zone
+    create (REST + Copilot) and the update-zone flag flip — so they cannot
+    drift apart again (#811: create set the flag and never enqueued, leaving
+    PowerDNS / Technitium zones flagged-but-unsigned until a manual Sign).
+    The zone must have its id assigned (flush first on freshly-added rows).
+    """
+    await enqueue_record_op(db, zone, op, dict(_DNSSEC_OP_RECORD))
+
+
 async def enqueue_record_op(
     db: AsyncSession,
     zone: DNSZone,

@@ -77,6 +77,7 @@ from app.services.dns.delegation import (
     preview_to_dict,
 )
 from app.services.dns.record_ops import (
+    enqueue_dnssec_op,
     enqueue_record_op,
     enqueue_record_ops_batch,
     enqueue_record_ops_bulk,
@@ -3405,6 +3406,13 @@ async def create_zone(
             detail="A zone with that name already exists in this group/view",
         )
 
+    # DNSSEC at create (#811). Gate first — without this the flag was
+    # accepted on e.g. a windows_dns group, where nothing will ever sign it
+    # and the sign/unsign endpoints both 422 (the gate lived two functions
+    # away). Same subset semantics as the sign endpoint.
+    if body.dnssec_enabled:
+        await _check_driver_gated_operation("dnssec_sign", group_id, db)
+
     zone = DNSZone(group_id=group_id, **body.model_dump())
     db.add(zone)
 
@@ -3414,6 +3422,16 @@ async def create_zone(
     # never heard of. BIND9 zones still get applied via the agent's next
     # ConfigBundle poll — that's a separate path and untouched here.
     await _push_zone_to_agentless_servers(db, zone, "create")
+
+    # ... and the sign op itself (#811). BIND9 signs inline from the config
+    # bundle and ignores this; PowerDNS + Technitium sign only in response
+    # to it — without the enqueue the zone read as DNSSEC-enabled in the UI
+    # and was unsigned on the wire until someone clicked Sign. Ordering is
+    # safe: the agent applies the structural bundle (creating the zone)
+    # before draining pending ops in the same sync cycle.
+    if body.dnssec_enabled:
+        await db.flush()
+        await enqueue_dnssec_op(db, zone, "dnssec_sign")
 
     db.add(
         AuditLog(
@@ -3999,8 +4017,25 @@ async def update_zone(
                     "(primary server IP) to transfer from"
                 ),
             )
+    # DNSSEC flag flips through the generic update path (#811). Same
+    # gate + enqueue the dedicated sign/unsign endpoints do — before this,
+    # PATCHing dnssec_enabled set the flag and nothing ever signed (or
+    # unsigned) on PowerDNS / Technitium. Gate before mutating so an
+    # incompatible group refuses the whole update.
+    dnssec_flip: str | None = None
+    if "dnssec_enabled" in changes and changes["dnssec_enabled"] != zone.dnssec_enabled:
+        dnssec_flip = "dnssec_sign" if changes["dnssec_enabled"] else "dnssec_unsign"
+        await _check_driver_gated_operation(dnssec_flip, group_id, db)
     for k, v in changes.items():
         setattr(zone, k, v)
+    if dnssec_flip is not None:
+        if dnssec_flip == "dnssec_unsign":
+            # Mirror the unsign endpoint: clear cached DS + per-key state now
+            # — the BIND9 agent only reports signed zones, so it won't send a
+            # keys=[] report to clear these.
+            zone.dnssec_ds_records = None
+            await db.execute(sa_delete(DNSKey).where(DNSKey.zone_id == zone.id))
+        await enqueue_dnssec_op(db, zone, dnssec_flip)
     db.add(
         AuditLog(
             user_id=current_user.id,
@@ -4729,12 +4764,7 @@ async def sign_zone_dnssec(
             if pol is None:
                 raise HTTPException(status_code=404, detail="DNSSEC policy not found")
             zone.dnssec_policy_id = body.policy_id
-    await enqueue_record_op(
-        db,
-        zone,
-        "dnssec_sign",
-        {"name": "@", "type": "DNSSEC_OP"},
-    )
+    await enqueue_dnssec_op(db, zone, "dnssec_sign")
     db.add(
         AuditLog(
             user_id=current_user.id,
@@ -4775,12 +4805,7 @@ async def unsign_zone_dnssec(
     # signed zones, so it won't send a keys=[] report to clear these.
     zone.dnssec_ds_records = None
     await db.execute(sa_delete(DNSKey).where(DNSKey.zone_id == zone.id))
-    await enqueue_record_op(
-        db,
-        zone,
-        "dnssec_unsign",
-        {"name": "@", "type": "DNSSEC_OP"},
-    )
+    await enqueue_dnssec_op(db, zone, "dnssec_unsign")
     db.add(
         AuditLog(
             user_id=current_user.id,
