@@ -1551,7 +1551,7 @@ export function DashboardPage() {
             <WidgetErrorBoundary title="Domain summary">
               <DomainsSummaryCard />
             </WidgetErrorBoundary>
-            <WidgetErrorBoundary title="Subnet decomposition">
+            <WidgetErrorBoundary title="Subnet decommissioning">
               <SubnetDecomCard />
             </WidgetErrorBoundary>
             <WidgetErrorBoundary title="Looking Glass health">

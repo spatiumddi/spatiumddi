@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Outlet } from "react-router-dom";
+import { Outlet, useLocation } from "react-router-dom";
 
 import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { Sidebar } from "./Sidebar";
@@ -22,6 +22,13 @@ export function AppLayout() {
   const { enabled } = useFeatureModules();
   const copilotEnabled = enabled("ai.copilot");
 
+  // Keys the route-level error boundary below. Without it the boundary's
+  // hasError state survives navigation: a crashed page would keep showing
+  // the fallback for every route the user clicks to next, making the whole
+  // app look broken until a full reload. Remounting on path change gives
+  // each page a fresh boundary.
+  const { pathname } = useLocation();
+
   return (
     <div className="flex h-screen overflow-hidden bg-background">
       <Sidebar
@@ -36,9 +43,12 @@ export function AppLayout() {
         <Header onMobileMenu={() => setMobileOpen(true)} />
         <main className="flex-1 overflow-auto">
           <ErrorBoundary
+            key={pathname}
             fallback={
               <div className="m-6 rounded-lg border bg-card p-6 text-center">
-                <h2 className="text-base font-semibold">This page failed to load</h2>
+                <h2 className="text-base font-semibold">
+                  This page failed to load
+                </h2>
                 <p className="mt-2 text-sm text-muted-foreground">
                   Something went wrong while rendering this page.
                 </p>
