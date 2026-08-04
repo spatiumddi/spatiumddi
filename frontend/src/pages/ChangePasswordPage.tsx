@@ -3,6 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { isAxiosError } from "axios";
 import { authApi } from "@/lib/api";
+import { cn } from "@/lib/utils";
 
 interface PolicyDetail {
   reason?: string;
@@ -23,6 +24,13 @@ export function ChangePasswordPage() {
     queryFn: () => authApi.passwordPolicy(),
     staleTime: 60_000,
   });
+
+  // Live mismatch feedback (#814) — same pattern as admin/UsersPage. Only
+  // flagged once the confirm field is non-empty, so the user isn't yelled
+  // at mid-typing on the first character. The submit-time guard below
+  // stays as a backstop; it also covers the empty-confirm case.
+  const mismatch =
+    confirmPassword.length > 0 && newPassword !== confirmPassword;
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
@@ -122,8 +130,14 @@ export function ChangePasswordPage() {
               required
               value={confirmPassword}
               onChange={(e) => setConfirmPassword(e.target.value)}
-              className="w-full rounded-md border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+              className={cn(
+                "w-full rounded-md border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring",
+                mismatch && "border-destructive",
+              )}
             />
+            {mismatch && (
+              <p className="text-sm text-destructive">Passwords do not match</p>
+            )}
           </div>
           {error && <p className="text-sm text-destructive">{error}</p>}
           {policyErrors.length > 0 && (
@@ -135,7 +149,7 @@ export function ChangePasswordPage() {
           )}
           <button
             type="submit"
-            disabled={loading}
+            disabled={loading || mismatch}
             className="w-full rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             {loading ? "Updating…" : "Set New Password"}
