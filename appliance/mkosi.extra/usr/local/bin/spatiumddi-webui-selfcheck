@@ -1,0 +1,273 @@
+#!/usr/bin/env python3
+"""Confirm the Web UI (80/443) is reachable through the firewall (#779).
+
+When a fresh appliance's Web UI is unreachable, nothing on the box says
+so — #776 was a full diagnostic session (pods, services, ss, curl,
+Test-NetConnection) to arrive at "one nftables accept rule is missing",
+and every intermediate step confirmed something healthy. This check makes
+the appliance volunteer that answer: it reasons about the kernel-active
+ruleset and surfaces a verdict on the console dashboard.
+
+Independence is the point. The supervisor's own 5-minute firewall drift
+check verifies its rendered drop-in against its own expectations — it
+cannot run before the supervisor registers (#777), and it answers "did my
+drop-in apply", not "can anyone reach the management surface". This
+script runs from firstboot + a systemd timer, reads the live ruleset via
+``nft -j``, and never touches the supervisor. (It is Python rather than
+the watchdog's bash-only posture because the reasoning needs real JSON
+walking; host python3 is baked into the OS image — spatium-console
+depends on it — and is independent of the supervisor's container
+runtime, which is the dependency #779 routes around.)
+
+Why not just curl ourselves: ``curl https://<own-lan-ip>/`` from the
+appliance succeeds even when the port is firewalled, because
+locally-originated traffic to a local address is delivered via ``lo``
+and hits ``iif "lo" accept`` — the exact trap #776 walked into. A
+genuinely off-box probe needs a second host; reasoning about the
+ruleset does not.
+
+The traffic model (documented limits, kept honest):
+
+* We evaluate a NEW inbound TCP connection to dport 443 (and 80) from a
+  non-loopback source against ``inet filter input``.
+* Rules that constrain ``tcp dport`` to include the port decide the
+  verdict, first match wins (accept → reachable, drop/reject → blocked).
+* Rules that cannot match that packet are skipped: ``iif lo`` guarded
+  rules (we are off-box), ``ct state established,related`` accepts and
+  ``ct state invalid`` drops (we are NEW), and rules for other
+  ports/protocols.
+* No matching rule → the chain policy decides.
+* An accept carrying a ``saddr`` restriction is REACHABLE-SCOPED: once
+  ``web_ui_allowed_cidrs`` (#285 Phase 6) is set, unreachable-from-
+  arbitrary-sources is the *correct* state, and reporting a hardened
+  appliance as broken would be worse than no check. The scope prefixes
+  ride along in the verdict detail.
+
+Verdict lands in ``/run/spatiumddi/webui-selfcheck.json`` (ephemeral by
+design — a verdict must never outlive the ruleset it describes, and
+/run resets per boot) where spatium-console renders it as a Web UI chip
+next to the Watchdog line. Exit 0 reachable / 1 blocked / 2
+indeterminate (nft unavailable etc. — the timer must not cry wolf on a
+transient).
+
+Searchable log tag: ``spatiumddi-webui-selfcheck``.
+"""
+
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+STATE_PATH = Path("/run/spatiumddi/webui-selfcheck.json")
+WEB_PORTS = (443, 80)
+
+# Chains hooked at input for the inet/ip/ip6 families all filter our
+# packet; the appliance base config uses exactly one: inet filter input.
+_INPUT_HOOK = "input"
+
+
+def _as_list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else [value]
+
+
+def _match_parts(rule_exprs: list[dict[str, Any]]) -> dict[str, Any]:
+    """Split a rule's expressions into the aspects the model cares about."""
+    parts: dict[str, Any] = {
+        "dports": None,  # set[int] | None — None means no dport constraint
+        "iif_lo": False,
+        "ct_state": None,  # list[str] | None
+        "saddr": None,  # list[str] rendered prefixes | None
+        "l4proto_tcp": None,  # True / False / None (unconstrained)
+        "verdict": None,  # "accept" | "drop" | "reject" | None
+    }
+    for expr in rule_exprs:
+        if not isinstance(expr, dict):
+            continue
+        if "accept" in expr:
+            parts["verdict"] = "accept"
+        elif "drop" in expr:
+            parts["verdict"] = "drop"
+        elif "reject" in expr:
+            parts["verdict"] = "reject"
+        match = expr.get("match")
+        if not isinstance(match, dict):
+            continue
+        left, right = match.get("left"), match.get("right")
+        if not isinstance(left, dict):
+            continue
+        if "payload" in left:
+            payload = left["payload"]
+            proto = payload.get("protocol")
+            field = payload.get("field")
+            if field == "dport":
+                parts["l4proto_tcp"] = proto == "tcp"
+                parts["dports"] = _extract_ports(right)
+            elif field == "saddr":
+                parts["saddr"] = _render_prefixes(right)
+        elif "meta" in left:
+            key = left["meta"].get("key")
+            if key in ("iif", "iifname") and right in ("lo", 1):
+                parts["iif_lo"] = True
+            elif key == "l4proto":
+                protos = {p for p in _as_list(right) if isinstance(p, str)}
+                if protos:
+                    parts["l4proto_tcp"] = "tcp" in protos
+        elif "ct" in left and left["ct"].get("key") == "state":
+            states: list[str] = []
+            for item in _as_list(right):
+                if isinstance(item, str):
+                    states.append(item)
+                elif isinstance(item, dict) and "set" in item:
+                    states.extend(s for s in _as_list(item["set"]) if isinstance(s, str))
+            parts["ct_state"] = states
+    return parts
+
+
+def _extract_ports(right: Any) -> set[int]:
+    """Flatten a dport match RHS (int, set, range) into concrete ports.
+
+    Ranges are expanded only for membership testing against WEB_PORTS, so
+    an 1-65535 range costs two containment checks, not 65k inserts.
+    """
+    ports: set[int] = set()
+    for item in _as_list(right):
+        if isinstance(item, int):
+            ports.add(item)
+        elif isinstance(item, dict):
+            if "set" in item:
+                ports |= _extract_ports(item["set"])
+            elif "range" in item:
+                lo, hi = item["range"]
+                ports |= {p for p in WEB_PORTS if lo <= p <= hi}
+    return ports
+
+
+def _render_prefixes(right: Any) -> list[str]:
+    out: list[str] = []
+    for item in _as_list(right):
+        if isinstance(item, str):
+            out.append(item)
+        elif isinstance(item, dict):
+            if "set" in item:
+                out.extend(_render_prefixes(item["set"]))
+            elif "prefix" in item:
+                pfx = item["prefix"]
+                out.append(f"{pfx.get('addr')}/{pfx.get('len')}")
+    return out
+
+
+def evaluate_port(nft_doc: dict[str, Any], port: int) -> tuple[str, str]:
+    """Return ``(status, detail)`` for a NEW off-box TCP connection to ``port``.
+
+    status: ``open`` | ``scoped`` | ``blocked`` | ``indeterminate``.
+    """
+    entries = nft_doc.get("nftables")
+    if not isinstance(entries, list):
+        return ("indeterminate", "nft output has no ruleset")
+
+    input_chains: dict[tuple[str, str], str] = {}  # (table, name) -> policy
+    for entry in entries:
+        chain = entry.get("chain") if isinstance(entry, dict) else None
+        if isinstance(chain, dict) and chain.get("hook") == _INPUT_HOOK:
+            input_chains[(chain.get("table"), chain.get("name"))] = chain.get(
+                "policy", "accept"
+            )
+    if not input_chains:
+        # No input-hooked chain at all: nothing filters inbound traffic.
+        return ("open", "no input-hooked chain (unfiltered)")
+
+    for entry in entries:
+        rule = entry.get("rule") if isinstance(entry, dict) else None
+        if not isinstance(rule, dict):
+            continue
+        if (rule.get("table"), rule.get("chain")) not in input_chains:
+            continue
+        parts = _match_parts(_as_list(rule.get("expr") or []))
+        if parts["verdict"] is None:
+            continue
+        if parts["iif_lo"]:
+            continue  # cannot match: our packet arrives off-box
+        ct = parts["ct_state"]
+        if ct is not None and "new" not in ct:
+            continue  # established/related accepts, invalid drops: not NEW
+        dports = parts["dports"]
+        if dports is None:
+            continue  # no dport constraint — the base config's blanket
+            # rules (ssh, icmp) name their ports/protocols; a truly
+            # unconditional verdict would be policy-shaped and is out of
+            # the model (documented limit)
+        if parts["l4proto_tcp"] is False or port not in dports:
+            continue
+        if parts["verdict"] in ("drop", "reject"):
+            return ("blocked", f"explicit {parts['verdict']} rule for {port}")
+        if parts["saddr"]:
+            return ("scoped", "accept scoped to " + ", ".join(parts["saddr"]))
+        return ("open", f"accept rule for {port}")
+
+    policies = set(input_chains.values())
+    if policies == {"accept"}:
+        return ("open", "no matching rule; chain policy accept")
+    return ("blocked", "no accept rule matches; chain policy drop")
+
+
+def run_check() -> dict[str, Any]:
+    try:
+        proc = subprocess.run(
+            ["nft", "-j", "list", "ruleset"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=True,
+        )
+        doc = json.loads(proc.stdout)
+    except Exception as exc:  # noqa: BLE001 — any failure here is "can't tell",
+        # never "blocked": a missing nft binary or a transient must not alert
+        return {
+            "status": "indeterminate",
+            "detail": f"could not read ruleset: {exc}",
+            "ports": {},
+            "checked_at": int(time.time()),
+        }
+
+    ports = {str(p): dict(zip(("status", "detail"), evaluate_port(doc, p))) for p in WEB_PORTS}
+    https = ports[str(WEB_PORTS[0])]["status"]
+    overall = https if https != "indeterminate" else "indeterminate"
+    return {
+        "status": overall,  # verdict keys off 443 — the UI's real front door
+        "detail": ports[str(WEB_PORTS[0])]["detail"],
+        "ports": ports,
+        "checked_at": int(time.time()),
+    }
+
+
+def main() -> int:
+    result = run_check()
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(result), encoding="utf-8")
+    tmp.replace(STATE_PATH)
+
+    line = (
+        f"spatiumddi-webui-selfcheck: {result['status']} — {result['detail']} "
+        f"(ports: {json.dumps(result['ports'])})"
+    )
+    if result["status"] == "blocked":
+        print(line, file=sys.stderr)
+        print(
+            "spatiumddi-webui-selfcheck: the Web UI would NOT be reachable "
+            "from the LAN. Inspect 'nft list chain inet filter input' — "
+            "expected an accept for tcp dport { 80, 443 } (the "
+            "00-spatium-webui.nft sentinel or the supervisor drop-in).",
+            file=sys.stderr,
+        )
+        return 1
+    print(line)
+    return 0 if result["status"] in ("open", "scoped") else 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

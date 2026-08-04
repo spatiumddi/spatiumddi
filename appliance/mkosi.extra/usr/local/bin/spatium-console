@@ -178,6 +178,48 @@ def supervisor_watchdog_status() -> tuple[str, str] | None:
     return (f"Loop ticking · {age}s ago", "bold green")
 
 
+# Web UI firewall reachability self-check (#779) — host-side script +
+# timer that reasons about the kernel-active nftables ruleset and asks
+# "would a NEW off-box TCP connection to 443 be accepted?". Independent
+# of the supervisor by design: the supervisor's own drift check can't
+# run before it registers (#777), and it verifies its drop-in, not
+# reachability. The script writes its verdict to /run (ephemeral — a
+# verdict must never outlive the ruleset it describes).
+_WEBUI_SELFCHECK_STATE = Path("/run/spatiumddi/webui-selfcheck.json")
+# The timer re-checks every 5 min; a verdict older than 3 timer periods
+# means the timer itself is broken — say nothing rather than alert on
+# information that may predate a fixed firewall.
+_WEBUI_SELFCHECK_MAX_AGE_S = 900
+
+
+def webui_selfcheck_status() -> tuple[str, str] | None:
+    """Return a ``(label, rich-style)`` chip when the last Web UI
+    self-check verdict is ``blocked`` and fresh; ``None`` otherwise.
+
+    Deliberately red-only: ``open`` / ``scoped`` (hardened via
+    web_ui_allowed_cidrs) / ``indeterminate`` / missing / stale all
+    return ``None``. The check exists to volunteer the one answer
+    nothing else on the box will (#776 took a full diagnostic session
+    to find a missing accept rule) — not to add a green light.
+    """
+    try:
+        raw = json.loads(_WEBUI_SELFCHECK_STATE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(raw, dict) or raw.get("status") != "blocked":
+        return None
+    checked = raw.get("checked_at")
+    if not isinstance(checked, (int, float)):
+        return None
+    if time.time() - checked > _WEBUI_SELFCHECK_MAX_AGE_S:
+        return None
+    return (
+        "Web UI unreachable from LAN — no accept for tcp/443 "
+        "(nft list chain inet filter input)",
+        "bold red",
+    )
+
+
 def watchdog_expected_services() -> list[str]:
     """Read the supervisor's role-compose.env to discover which
     service containers the watchdog expects to be running.
@@ -2226,6 +2268,7 @@ def overall_verdict(
     state: "DashboardState",
     k3s_state: tuple[str, str] | None = None,
     wd_status: tuple[str, str] | None = None,
+    webui_status: tuple[str, str] | None = None,
 ) -> tuple[str, str]:
     """P0.3 — roll the per-panel signals up into one box-level verdict.
 
@@ -2242,6 +2285,7 @@ def overall_verdict(
       * a red-tier pod: flapping now (``_rst_verdict``) or in a broken
         k8s state — CRITICAL
       * a degraded (failing) host-config plane — CRITICAL
+      * Web UI self-check verdict `blocked` (#779) — CRITICAL
       * k3s unit failed — CRITICAL
       * disk >90% on any mount — CRITICAL
       * k3s not yet ready / starting — DEGRADED
@@ -2265,6 +2309,13 @@ def overall_verdict(
     failing = list(hh.get("failing") or [])  # type: ignore[arg-type]
     if failing:
         return ("CRITICAL", f"host config failing: {failing[0]}")
+    # #779 — the management surface itself is firewalled off. Everything
+    # else on this dashboard can be green while the operator's browser
+    # times out (#776); the self-check chip is non-None only for a fresh
+    # `blocked` verdict, so this never fires on a scoped (hardened) or
+    # indeterminate state.
+    if webui_status is not None:
+        return ("CRITICAL", "Web UI blocked by firewall (tcp/443)")
     # Phase 2 INC 3 — etcd quorum. Multi-node only: a single-node etcd is
     # always its own leader (has_leader=1), so this never false-fires on a
     # single-node appliance; an empty state.etcd (sqlite backend) is skipped.
@@ -2511,7 +2562,9 @@ def render_header(
     # the ``wd_status`` file-stat computed above so overall_verdict adds
     # no subprocess. A red border is visible across a room on a VGA
     # console; uniform cyan never was. (Unchanged from Phase 1.)
-    verdict, offender = overall_verdict(state, state.k3s_state, wd_status)
+    verdict, offender = overall_verdict(
+        state, state.k3s_state, wd_status, webui_selfcheck_status()
+    )
     vglyph, vcolor = _VERDICT_STYLES.get(verdict, ("●", "cyan"))
     if verdict == "HEALTHY":
         title = "[bold]SpatiumDDI[/bold]  [green]● HEALTHY[/green]"
@@ -4851,7 +4904,7 @@ def _render_health_screen(
     ``state`` plus the already-fetched ``events``."""
     console.clear()
     wd = supervisor_watchdog_status() if state.role in ("appliance", "application") else None
-    verdict, offender = overall_verdict(state, state.k3s_state, wd)
+    verdict, offender = overall_verdict(state, state.k3s_state, wd, webui_selfcheck_status())
     vglyph, vcolor = _VERDICT_STYLES.get(verdict, ("●", "cyan"))
     banner = Text()
     banner.append(f" {vglyph} {verdict} ", style=f"bold {vcolor}")

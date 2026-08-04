@@ -579,3 +579,88 @@ def test_bare_scalar_result_is_boring_like_the_dict_form(m) -> None:
     assert not m.AppLogTail._is_noise(
         "Task app.tasks.ipam_discovery.dispatch succeeded in 0.04s: 7"
     )
+
+
+# ── #779 — Web UI firewall self-check chip ──────────────────────────────────
+# webui_selfcheck_status() reads the verdict spatiumddi-webui-selfcheck
+# writes to /run and returns a red chip ONLY for a fresh `blocked` — every
+# other state (open / scoped-hardened / indeterminate / stale / missing /
+# garbage) is None, so a correctly-hardened or merely-unchecked appliance
+# never shows a false alarm.
+
+
+def _selfcheck_state(m, monkeypatch, tmp_path, payload):
+    import json as _json
+
+    p = tmp_path / "webui-selfcheck.json"
+    p.write_text(_json.dumps(payload))
+    monkeypatch.setattr(m, "_WEBUI_SELFCHECK_STATE", p)
+    return p
+
+
+def test_webui_selfcheck_fresh_blocked_is_red(m, monkeypatch, tmp_path):
+    import time as _time
+
+    _selfcheck_state(
+        m,
+        monkeypatch,
+        tmp_path,
+        {"status": "blocked", "detail": "x", "checked_at": int(_time.time())},
+    )
+    chip = m.webui_selfcheck_status()
+    assert chip is not None
+    label, style = chip
+    assert "Web UI" in label
+    assert style == "bold red"
+
+
+@pytest.mark.parametrize("status", ["open", "scoped", "indeterminate"])
+def test_webui_selfcheck_non_blocked_is_none(m, monkeypatch, tmp_path, status):
+    import time as _time
+
+    _selfcheck_state(
+        m,
+        monkeypatch,
+        tmp_path,
+        {"status": status, "detail": "x", "checked_at": int(_time.time())},
+    )
+    assert m.webui_selfcheck_status() is None
+
+
+def test_webui_selfcheck_stale_blocked_is_none(m, monkeypatch, tmp_path):
+    import time as _time
+
+    # 3 missed timer periods: the checker itself is broken; a verdict that
+    # may predate a fixed firewall must not keep alerting.
+    _selfcheck_state(
+        m,
+        monkeypatch,
+        tmp_path,
+        {
+            "status": "blocked",
+            "detail": "x",
+            "checked_at": int(_time.time()) - (m._WEBUI_SELFCHECK_MAX_AGE_S + 60),
+        },
+    )
+    assert m.webui_selfcheck_status() is None
+
+
+def test_webui_selfcheck_missing_or_garbage_is_none(m, monkeypatch, tmp_path):
+    monkeypatch.setattr(m, "_WEBUI_SELFCHECK_STATE", tmp_path / "nope.json")
+    assert m.webui_selfcheck_status() is None
+    bad = tmp_path / "bad.json"
+    bad.write_text("{not json")
+    monkeypatch.setattr(m, "_WEBUI_SELFCHECK_STATE", bad)
+    assert m.webui_selfcheck_status() is None
+
+
+def test_overall_verdict_webui_blocked_is_critical(m):
+    from types import SimpleNamespace
+
+    # Minimal state: healthy up to the #779 branch (no restore, no red
+    # pods, no failing host-config plane) — the webui chip alone must
+    # flip the verdict.
+    state = SimpleNamespace(host_health={}, ps_rows=[])
+    verdict, offender = m.overall_verdict(state, None, None, ("Web UI unreachable", "bold red"))
+    assert verdict == "CRITICAL"
+    assert "Web UI" in offender
