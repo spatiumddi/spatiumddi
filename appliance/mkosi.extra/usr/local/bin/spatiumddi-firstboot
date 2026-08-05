@@ -1184,9 +1184,11 @@ if [ "$ready" = 1 ]; then
     # #779 — immediate first verdict on Web UI firewall reachability, so a
     # missing accept rule (#776's failure) is volunteered right here in the
     # firstboot log next to the URL we just promised, instead of surfacing
-    # as a silent browser timeout. The systemd timer re-checks every 5 min;
-    # the console renders the verdict as a chip. Never fails firstboot —
-    # the finding lands in the state file + log either way.
+    # as a silent browser timeout. The systemd timer re-checks every 5 min
+    # (plus after every firewall apply); the console shows a blocked
+    # verdict on the identity row's Web UI URL and in the health verdict.
+    # Never fails firstboot — the finding lands in the state file + log
+    # either way.
     /usr/local/bin/spatiumddi-webui-selfcheck || true
     exit 0
 fi

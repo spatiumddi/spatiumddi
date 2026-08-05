@@ -12,4 +12,10 @@ Requires=etc.mount
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/spatium-firewall-reload
+# #779 — re-run the Web UI reachability self-check after every firewall
+# apply, so the console's verdict follows the ruleset immediately instead
+# of lagging up to one 5-min timer period (in both directions: a fix
+# clears the red banner now; a bad re-render raises it now). `-` prefix:
+# a self-check failure must never mark the firewall apply failed.
+ExecStartPost=-/usr/local/bin/spatiumddi-webui-selfcheck
 # No Install — only invoked by the matching .path unit.
