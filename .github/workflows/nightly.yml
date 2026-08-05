@@ -177,9 +177,9 @@ jobs:
         include: ${{ fromJSON(needs.gate.outputs.images) }}
     steps:
       - uses: actions/checkout@v7
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
         if: github.event.inputs.dry_run != 'true'
         with:
           registry: ${{ env.REGISTRY }}
@@ -194,7 +194,7 @@ jobs:
       # some-new / some-old images. Cost is one extra amd64 build, which
       # the shared buildx cache makes near-free.
       - name: Build amd64 for scanning
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.file }}
@@ -221,7 +221,7 @@ jobs:
       # The multi-arch build reuses the cache the scan build just warmed,
       # so the amd64 half is a cache hit.
       - name: Build + push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.file }}
