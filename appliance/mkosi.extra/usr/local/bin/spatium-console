@@ -195,26 +195,27 @@ _WEBUI_SELFCHECK_DEFAULT_TTL_S = 900
 # mtime-memoized parse so the 0.5 s render loop pays one stat() per tick,
 # not a read+parse — same tier discipline as supervisor_watchdog_status
 # (see the P1.2 comment on DashboardState). Keyed by (path, mtime): the
-# path is constant in production but monkeypatched per-test.
-_webui_state_cache: tuple[str, float, dict | None] = ("", -1.0, None)
+# path is constant in production but monkeypatched per-test. Mutated in
+# place (no rebinding) so no `global` statement is needed.
+_WEBUI_STATE_CACHE: dict[str, object] = {"path": "", "mtime": -1.0, "raw": None}
 
 
 def _webui_selfcheck_raw() -> dict | None:
-    global _webui_state_cache
     path = str(_WEBUI_SELFCHECK_STATE)
     try:
         mtime = _WEBUI_SELFCHECK_STATE.stat().st_mtime
     except OSError:
         return None
-    if (path, mtime) == _webui_state_cache[:2]:
-        return _webui_state_cache[2]
+    if path == _WEBUI_STATE_CACHE["path"] and mtime == _WEBUI_STATE_CACHE["mtime"]:
+        cached = _WEBUI_STATE_CACHE["raw"]
+        return cached if isinstance(cached, dict) else None
     try:
         raw = json.loads(_WEBUI_SELFCHECK_STATE.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         raw = None
     if not isinstance(raw, dict):
         raw = None
-    _webui_state_cache = (path, mtime, raw)
+    _WEBUI_STATE_CACHE.update(path=path, mtime=mtime, raw=raw)
     return raw
 
 

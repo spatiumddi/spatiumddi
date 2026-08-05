@@ -498,7 +498,7 @@ def test_main_writes_state_and_exits_by_verdict(m, monkeypatch, tmp_path) -> Non
     assert isinstance(saved["checked_at"], int)
     assert saved["ttl_s"] == m.TTL_S
 
-    monkeypatch.setattr(m, "_read_ruleset", lambda: _doc())
+    monkeypatch.setattr(m, "_read_ruleset", _doc)
     assert m.main() == 1
     assert json.loads(state.read_text())["status"] == "blocked"
 
