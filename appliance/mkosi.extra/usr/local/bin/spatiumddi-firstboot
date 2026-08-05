@@ -1181,6 +1181,15 @@ if [ "$ready" = 1 ]; then
     echo "Ready: k3s up on ${IP:-<appliance-ip>}; supervisor pod auto-deploys via $BOOTSTRAP_MANIFEST"
     place_deferred_control_manifest
     commit_slot_if_healthy
+    # #779 — immediate first verdict on Web UI firewall reachability, so a
+    # missing accept rule (#776's failure) is volunteered right here in the
+    # firstboot log next to the URL we just promised, instead of surfacing
+    # as a silent browser timeout. The systemd timer re-checks every 5 min
+    # (plus after every firewall apply); the console shows a blocked
+    # verdict on the identity row's Web UI URL and in the health verdict.
+    # Never fails firstboot — the finding lands in the state file + log
+    # either way.
+    /usr/local/bin/spatiumddi-webui-selfcheck || true
     exit 0
 fi
 echo "WARN: k3s /readyz did not respond within 5 minutes." >&2

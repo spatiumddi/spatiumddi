@@ -516,6 +516,23 @@ The script is intentionally `bash` + stdlib (no Python, no docker SDK, no compos
 
 Per heartbeat the supervisor compared the live `/etc/nftables.d/spatium-role.nft` body against the desired body — but that only proves the FILE is right, not that the kernel-active ruleset includes those rules (e.g. an operator `nft flush ruleset` during a debugging session, or the master conf's `include` directive stops matching the drop-in path). Every 5 min the supervisor now reads the live ruleset via `nft -j list chain inet filter input`, confirms each expected per-role service port is present, and forces a re-apply if anything's missing. Logs `supervisor.firewall.drift_detected` with the missing tcp/udp port set. `FirewallProfile` now carries `expected_tcp_ports` + `expected_udp_ports` frozensets so the comparison is straightforward.
 
+### Web UI reachability self-check (#779)
+
+The supervisor's drift check answers "did my drop-in apply" — it cannot answer "can anyone actually reach the management surface", and it cannot run at all before the supervisor registers (#777). The Web UI self-check is the independent complement, born from #776 (a full diagnostic session to find one missing nftables accept rule that the appliance could have volunteered): a host-side script reasons about the kernel-active ruleset and answers *would a NEW off-box TCP connection to 443 (and 80) be accepted?* — a question a self-`curl` cannot answer, because locally-originated traffic to the box's own LAN IP rides `iif lo accept` and succeeds against a firewalled port.
+
+| Piece | Path | Role |
+| --- | --- | --- |
+| Script | `/usr/local/bin/spatiumddi-webui-selfcheck` | Reads input-hooked chains via `nft -j` (two-phase: `list chains`, then only the input-hooked ones — never the full kube-proxy ruleset), evaluates every chain independently and combines worst-wins. Exit 0 reachable / 1 blocked / 2 indeterminate |
+| Verdict file | `/run/spatiumddi/webui-selfcheck.json` | `{status, detail, ports, checked_at, ttl_s, consecutive_indeterminate}` — ephemeral by design; a verdict never outlives the ruleset it describes |
+| Service unit | `/etc/systemd/system/spatiumddi-webui-selfcheck.service` | Oneshot; `SuccessExitStatus=1 2` so a *finding* doesn't double-report as a failed unit |
+| Timer unit | `/etc/systemd/system/spatiumddi-webui-selfcheck.timer` | 45 s after boot, then every 5 min |
+| Apply hook | `spatium-firewall-reload.service` `ExecStartPost` | Re-checks immediately after every firewall apply, so the verdict follows the ruleset instead of lagging a timer period |
+| First-boot hook | `spatiumddi-firstboot` | Runs the check right after printing the Ready URL, so a blocked verdict lands next to the promise it breaks |
+
+The verdict is deliberately conservative in both directions. A `saddr`-scoped accept (`web_ui_allowed_cidrs`, #285 Phase 6) reports **scoped** — a hardened appliance is never reported as broken. Qualified drops (one subnet, one interface, a rate limiter) are not treated as blocks. Constructs outside the model — negated matches, named sets, dport vmaps, jumps in drop-policy chains (all legal in operator drop-ins / `firewall_extra`) — degrade the verdict to **indeterminate** rather than risk a confident wrong answer.
+
+Surfacing: a fresh `blocked` verdict renders in bold red on the console identity row, appended to the Web UI URL it invalidates, and flips the box-level health verdict to `CRITICAL — Web UI blocked by firewall (tcp/443)`. Three consecutive `indeterminate` runs render a dim-yellow `firewall self-check unavailable` note (a broken checker must not die silently). Everything else — open, scoped, fresh single indeterminate, stale, missing — renders nothing: the check exists to volunteer the one answer nothing else on the box will, not to add a green light.
+
 ### Console dashboard polish
 
 The Talos-style console got a wave of usability fixes:

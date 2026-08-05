@@ -63,6 +63,7 @@ for unit in chrony.service ssh.service \
             spatium-firewall-reload.path \
             spatiumddi-firewall-revert.timer \
             spatiumddi-image-prune.timer \
+            spatiumddi-webui-selfcheck.timer \
             spatium-install.service \
             spatium-live-banner.service \
             spatium-live-bootstrap.service \
@@ -299,6 +300,10 @@ chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-firewall-reload.service"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-firewall-revert"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-firewall-revert.timer"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-firewall-revert.service"
+# #779 — Web UI firewall reachability self-check (script + timer).
+chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-webui-selfcheck"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-webui-selfcheck.timer"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-webui-selfcheck.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-reboot.path"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-reboot.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-console.service"

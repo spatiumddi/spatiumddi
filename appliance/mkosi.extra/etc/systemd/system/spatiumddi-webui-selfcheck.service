@@ -1,0 +1,19 @@
+[Unit]
+Description=Check the Web UI is reachable through the firewall (issue #779)
+Documentation=https://github.com/spatiumddi/spatiumddi/issues/779
+# Reasons about the kernel-active ruleset, so the base config must have
+# been applied. Deliberately NOT ordered after the supervisor or k3s —
+# independence from the supervisor is the whole point (#777 is a live
+# example of a heartbeat that never happens).
+After=nftables.service
+# Don't run in the live installer environment.
+ConditionKernelCommandLine=!boot=live
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/spatiumddi-webui-selfcheck
+# Exit 1 (blocked) is a *finding*, not a unit failure — the verdict
+# surfaces on the console via the state file, and a red failed unit
+# would double-report it into systemctl --failed noise.
+SuccessExitStatus=1 2
+# Driven by spatiumddi-webui-selfcheck.timer — no [Install].
