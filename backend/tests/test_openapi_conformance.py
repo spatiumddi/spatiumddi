@@ -70,8 +70,9 @@ def test_every_page_parameter_declares_an_upper_bound() -> None:
                     continue
                 if not any("maximum" in a for a in numeric):
                     unbounded.append(f"{method.upper()} {path}")
-    assert not unbounded, (
-        "page query parameters with no maximum — each one is an overflow 500:\n  "
-        + "\n  ".join(sorted(unbounded))
-    )
+    if unbounded:
+        listing = "\n  ".join(sorted(unbounded))
+        raise AssertionError(
+            f"page query parameters with no maximum — each one is an overflow 500:\n  {listing}"
+        )
     assert MAX_PAGE * 1000 < 2**63 - 1, "MAX_PAGE * MAX_PAGE_SIZE must stay inside a bigint"
