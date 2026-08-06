@@ -19,7 +19,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import selectinload
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
-from app.api.pagination import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, Page, paginate
+from app.api.pagination import DEFAULT_PAGE_SIZE, MAX_PAGE, MAX_PAGE_SIZE, Page, paginate
 from app.config import settings
 from app.core.agent_wake import (
     appliance_channel,
@@ -5293,7 +5293,7 @@ async def list_group_records(
         None, description="substring over name / fqdn / value / type / zone"
     ),
     record_type: str | None = Query(None, description="exact record type filter (A, MX, …)"),
-    page: int = Query(1, ge=1),
+    page: int = Query(1, ge=1, le=MAX_PAGE),
     page_size: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
 ) -> Page[GroupRecordResponse]:
     """Every record across every zone in the group, with zone + view context,
@@ -5378,7 +5378,7 @@ async def list_records(
     tag: list[str] = Query(default_factory=list),
     search: str | None = Query(None, description="substring over name / fqdn / value / type"),
     record_type: str | None = Query(None, description="exact record type filter (A, MX, …)"),
-    page: int = Query(1, ge=1),
+    page: int = Query(1, ge=1, le=MAX_PAGE),
     page_size: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
 ) -> Page[RecordResponse]:
     """Records in a zone, server-side paginated (#455).

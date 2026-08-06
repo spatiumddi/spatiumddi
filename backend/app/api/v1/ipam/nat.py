@@ -34,6 +34,7 @@ from sqlalchemy import String, and_, cast, func, or_, select
 from sqlalchemy.dialects.postgresql import INET
 
 from app.api.deps import DB, CurrentUser
+from app.api.pagination import MAX_PAGE
 from app.api.v1.dhcp._audit import write_audit
 from app.core.permissions import require_resource_permission
 from app.models.ipam import IPAddress, NATMapping, Subnet
@@ -351,7 +352,7 @@ async def list_nat_mappings(
     internal_ip: str | None = Query(None),
     external_ip: str | None = Query(None),
     q: str | None = Query(None, description="Substring match on name / description"),
-    page: int = Query(1, ge=1),
+    page: int = Query(1, ge=1, le=MAX_PAGE),
     per_page: int = Query(50, ge=1, le=500),
 ) -> NATMappingPage:
     base = select(NATMapping)

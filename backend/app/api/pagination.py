@@ -22,6 +22,21 @@ DEFAULT_PAGE_SIZE = 100
 # Upper bound a client may request. Bounded so "fetch all" can't sneak back in
 # through an enormous page_size — bulk export has its own dedicated endpoint.
 MAX_PAGE_SIZE = 1000
+# Upper bound on the page NUMBER. ``page_size`` was bounded from the start and
+# ``page`` was not, which left every list endpoint one query parameter away from
+# a 500: the offset is ``(page - 1) * page_size``, SQL ``OFFSET`` is a bigint,
+# and a large enough ``page`` overflows it before Postgres ever sees a row.
+# Measured on a live appliance at DEFAULT_PAGE_SIZE — page 92233720368547759
+# gives offset 9223372036854775800 and returns 200; page 92233720368547760
+# gives 9223372036854775900, past 2**63-1, and returns 500.
+#
+# A million pages is past any real client (a million pages of MAX_PAGE_SIZE is
+# a billion rows) while leaving the largest reachable offset — 10**9 — nine
+# orders of magnitude below the bigint ceiling, so no page_size can climb back
+# over it. Declared rather than clamped: the bound belongs in the OpenAPI
+# document next to page_size's, and an out-of-range page is a client error that
+# deserves the same 422 an out-of-range page_size already gets.
+MAX_PAGE = 1_000_000
 
 
 class Page[T](BaseModel):
