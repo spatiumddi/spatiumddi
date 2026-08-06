@@ -40,7 +40,12 @@ from typing import Any
 import httpx
 import structlog
 
-from ._process import find_running_daemon, is_zombie
+from ._process import (
+    find_running_daemon,
+    is_zombie,
+    spawn_guard,
+    wait_for_daemon,
+)
 from .base import RRSET_OP_KINDS, DriverBase
 
 log = structlog.get_logger(__name__)
@@ -999,46 +1004,53 @@ class PowerDNSDriver(DriverBase):
         # ``os.kill(zombie, 0)`` succeeds, the driver then reports a
         # healthy daemon while tracking a dead process, and any signal it
         # sends goes nowhere.
-        existing = find_running_daemon("pdns_server")
-        if existing is not None:
-            self.daemon_pid = existing
-            log.info(
-                "pdns_already_running_adopted",
-                pid=existing,
-                note="did not spawn a second daemon",
-            )
-            return
-        # ``--daemon=no`` + foreground; pdns logs to stderr.
-        # All flags use ``--name=value`` form — pdns_server rejects
-        # space-separated args with "perhaps a '--setting=123'
-        # statement missed the '='?".
-        #
-        # We redirect pdns_server stderr into a file the agent's
-        # ``QueryLogShipper`` thread can tail, gated on
-        # ``log-dns-queries=yes`` being set in pdns.conf. The file
-        # lives inside the agent's own state dir
-        # (``/var/lib/spatium-dns-agent/pdns.log``) — the ``spatium``
-        # user owns that path, which avoids the permission denied
-        # we'd hit trying to write to ``/var/log/pdns/`` (owned by
-        # root inside the container). The supervisor's
-        # ``QueryLogShipper`` is configured against the same path
-        # in ``supervisor.run``.
-        log_path = self.state_dir / "pdns.log"
-        # Open append-mode so log rotates are non-destructive and the
-        # tail can resume across daemon restarts (the shipper handles
-        # inode-change rotation separately).
-        log_fh = log_path.open("ab", buffering=0)
-        self.daemon_pid = subprocess.Popen(
-            [
-                "pdns_server",
-                "--daemon=no",
-                "--guardian=no",
-                f"--config-dir={current}",
-                "--config-name=",
-            ],
-            stdout=log_fh,
-            stderr=subprocess.STDOUT,
-        ).pid
+        # The system look-up is necessary but not sufficient: it matches on
+        # ``/proc/<pid>/comm``, and a forked-but-not-yet-``execve``'d child
+        # still carries the parent's name, so a concurrent caller sees no
+        # daemon and spawns a duplicate anyway. Serialise check-and-spawn on
+        # an exclusive lock instead (see ``_process.spawn_guard``).
+        with spawn_guard(self.state_dir, "pdns_server"):
+            existing = find_running_daemon("pdns_server")
+            if existing is not None:
+                self.daemon_pid = existing
+                log.info(
+                    "pdns_already_running_adopted",
+                    pid=existing,
+                    note="did not spawn a second daemon",
+                )
+                return
+            # ``--daemon=no`` + foreground; pdns logs to stderr.
+            # All flags use ``--name=value`` form — pdns_server rejects
+            # space-separated args with "perhaps a '--setting=123'
+            # statement missed the '='?".
+            #
+            # We redirect pdns_server stderr into a file the agent's
+            # ``QueryLogShipper`` thread can tail, gated on
+            # ``log-dns-queries=yes`` being set in pdns.conf. The file
+            # lives inside the agent's own state dir
+            # (``/var/lib/spatium-dns-agent/pdns.log``) — the ``spatium``
+            # user owns that path, which avoids the permission denied
+            # we'd hit trying to write to ``/var/log/pdns/`` (owned by
+            # root inside the container). The supervisor's
+            # ``QueryLogShipper`` is configured against the same path
+            # in ``supervisor.run``.
+            log_path = self.state_dir / "pdns.log"
+            # Open append-mode so log rotates are non-destructive and the
+            # tail can resume across daemon restarts (the shipper handles
+            # inode-change rotation separately).
+            log_fh = log_path.open("ab", buffering=0)
+            self.daemon_pid = subprocess.Popen(
+                [
+                    "pdns_server",
+                    "--daemon=no",
+                    "--guardian=no",
+                    f"--config-dir={current}",
+                    "--config-name=",
+                ],
+                stdout=log_fh,
+                stderr=subprocess.STDOUT,
+            ).pid
+            wait_for_daemon("pdns_server", self.daemon_pid)
         # Track the path so a future health-check / observability
         # surface can find it without re-deriving.
         self._daemon_log_path = log_path

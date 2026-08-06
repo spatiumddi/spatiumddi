@@ -36,7 +36,12 @@ exactly the PowerDNS failure it exists to prevent.
 
 from __future__ import annotations
 
+import contextlib
+import errno
+import fcntl
 import os
+import time
+from collections.abc import Iterator
 
 
 def is_zombie(pid: str) -> bool:
@@ -87,3 +92,63 @@ def find_running_daemon(comm: str) -> int | None:
         except ValueError:
             continue
     return None
+
+
+@contextlib.contextmanager
+def spawn_guard(state_dir, name: str) -> Iterator[None]:
+    """Serialise check-then-spawn across every caller in this container.
+
+    ``find_running_daemon`` alone does not close the race it was written for,
+    and the reason is that it matches on ``/proc/<pid>/comm``: between
+    ``Popen(["named", ...])`` returning and the child completing ``execve``,
+    the new process is still named after the FORKING program, so a concurrent
+    caller looking for ``named`` sees nothing and spawns a second one. That is
+    precisely the 118 ms window this module's docstring describes as "not
+    fully established", and it still fires — observed live on a QA appliance
+    2026-08-06 with two ``named`` processes (pids 14 and 24), same parent,
+    same config, both holding :53 and :953 under SO_REUSEPORT, which made
+    every subsequent ``rndc`` a coin flip between one daemon holding the
+    current zones and one serving stale ones.
+
+    An exclusive flock held across check AND spawn removes the window
+    regardless of which caller wins. It is released on exit, so a crash
+    mid-spawn cannot wedge the next start.
+    """
+    lock_path = os.path.join(str(state_dir), f".{name}.spawn.lock")
+    fd = None
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except OSError as exc:
+        # No writable state dir / no flock (some sandboxes). Fall back to the
+        # unguarded path, which is the pre-existing behaviour.
+        if exc.errno not in (errno.EACCES, errno.EPERM, errno.EROFS, errno.ENOSYS):
+            raise
+        if fd is not None:
+            os.close(fd)
+        fd = None
+    try:
+        yield
+    finally:
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                os.close(fd)
+
+
+def wait_for_daemon(comm: str, pid: int, timeout_s: float = 5.0) -> None:
+    """Block until ``pid`` is visible under ``comm``, or the timeout expires.
+
+    Held inside :func:`spawn_guard`, this is what makes the NEXT caller's
+    ``find_running_daemon`` see the daemon we just started: it does not return
+    while the child is still pre-``execve``.
+    """
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            with open(f"/proc/{pid}/comm", encoding="utf-8") as fh:
+                if fh.read().strip() == comm:
+                    return
+        except OSError:
+            return  # exited, or not Linux — nothing to wait for
+        time.sleep(0.02)
