@@ -17,6 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
 from app.api.deps import DB, CurrentUser
+from app.config import settings
 from app.core.permissions import require_permission
 from app.models.audit import AuditLog
 from app.services.appliance.slot import (
@@ -34,6 +35,17 @@ router = APIRouter()
 
 
 class SlotStatusResponse(BaseModel):
+    # WHICH NODE THIS ANSWER IS ABOUT. Every other field here is read from
+    # the responding pod's own host mounts, and the api Deployment runs one
+    # replica per control-plane node behind a Service with no session
+    # affinity — so on a cluster consecutive polls of this endpoint are
+    # answered by different nodes, even when the caller addressed one node's
+    # own IP. Without this field that is invisible: each response is a
+    # well-formed 200 describing a machine the caller never named.
+    #
+    # Empty string on non-appliance deploys (no downward API, and only one
+    # place the answer could have come from).
+    node: str
     appliance_mode: bool
     current_slot: str | None
     durable_default: str | None
@@ -69,6 +81,7 @@ class ApplyResponse(BaseModel):
 
 def _serialise(s: SlotStatus) -> SlotStatusResponse:
     return SlotStatusResponse(
+        node=settings.node_name,
         appliance_mode=s.appliance_mode,
         current_slot=s.current_slot,
         durable_default=s.durable_default,

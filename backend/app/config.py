@@ -186,6 +186,14 @@ class Settings(BaseSettings):
     appliance_mode: bool = False
     appliance_version: str = ""
     appliance_hostname: str = ""
+    # The k8s node this api pod runs on, from the downward API
+    # (spec.nodeName) in the api Deployment. The api runs one replica per
+    # control-plane node under hard anti-affinity, and several endpoints
+    # read the HOST filesystem through node-local hostPath mounts — so on
+    # a cluster their answer is about whichever node served the request.
+    # Empty on docker-compose / non-appliance deploys, where there is only
+    # one place the answer could have come from.
+    node_name: str = ""
     # Comma-separated list of the host's real IPv4/IPv6 addresses,
     # detected by spatiumddi-firstboot via `ip -o addr show scope global`
     # and threaded through .env. Used by the self-signed cert bootstrap
