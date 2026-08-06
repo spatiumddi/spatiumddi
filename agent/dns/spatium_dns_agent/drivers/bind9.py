@@ -30,7 +30,12 @@ try:
 except ImportError:  # pragma: no cover - runtime-optional
     dns = None  # type: ignore[assignment]
 
-from ._process import find_running_daemon, is_zombie
+from ._process import (
+    find_running_daemon,
+    is_zombie,
+    spawn_guard,
+    wait_for_daemon,
+)
 from .base import RRSET_OP_KINDS, DriverBase
 
 log = structlog.get_logger(__name__)
@@ -1419,16 +1424,26 @@ class Bind9Driver(DriverBase):
         # ``rndc status`` land on either. Enabling query logging then
         # appears to do nothing, which silently breaks the Logs → DNS
         # Queries surface and anything built on it.
-        existing = find_running_daemon("named")
-        if existing is not None:
-            self.daemon_pid = existing
-            log.info(
-                "named_already_running_adopted",
-                pid=existing,
-                note="did not spawn a second daemon",
-            )
-            return
-        self.daemon_pid = subprocess.Popen(["named", "-f", "-c", str(conf_path)]).pid
+        # The system look-up alone does NOT close the race: it matches on
+        # ``/proc/<pid>/comm``, and a child that has been forked but has not
+        # yet ``execve``'d still carries the PARENT's name, so a concurrent
+        # caller sees no daemon and spawns a second one. Hold an exclusive
+        # lock across the check, the spawn, and the wait for the new process
+        # to become visible under its own name — then the window has no
+        # interior. (Observed live 2026-08-06: pids 14 and 24, same parent,
+        # same config, both bound to :53 and :953.)
+        with spawn_guard(self.state_dir, "named"):
+            existing = find_running_daemon("named")
+            if existing is not None:
+                self.daemon_pid = existing
+                log.info(
+                    "named_already_running_adopted",
+                    pid=existing,
+                    note="did not spawn a second daemon",
+                )
+                return
+            self.daemon_pid = subprocess.Popen(["named", "-f", "-c", str(conf_path)]).pid
+            wait_for_daemon("named", self.daemon_pid)
         log.info("named_started", pid=self.daemon_pid)
 
     def daemon_running(self) -> bool:
