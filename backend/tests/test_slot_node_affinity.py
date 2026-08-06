@@ -50,8 +50,7 @@ async def _superadmin(db: AsyncSession) -> dict[str, str]:
     return {"Authorization": f"Bearer {create_access_token(str(user.id))}"}
 
 
-async def _approve(db: AsyncSession, hostname: str,
-                   cluster_role: str | None = None) -> Appliance:
+async def _approve(db: AsyncSession, hostname: str, cluster_role: str | None = None) -> Appliance:
     """An approved appliance. `cluster_role` None models a data-plane
     appliance or an unpromoted single node — approved, but NOT part of the
     control plane, and therefore not a source of node ambiguity."""
@@ -108,9 +107,11 @@ async def test_apply_refuses_on_a_cluster(
 ) -> None:
     headers = await _superadmin(db_session)
     monkeypatch.setattr(settings, "node_name", "ddipg-member-1")
-    for host, role in (("ddipg-seed", CLUSTER_ROLE_PRIMARY),
-                       ("ddipg-member-1", CLUSTER_ROLE_MEMBER),
-                       ("ddipg-member-2", CLUSTER_ROLE_MEMBER)):
+    for host, role in (
+        ("ddipg-seed", CLUSTER_ROLE_PRIMARY),
+        ("ddipg-member-1", CLUSTER_ROLE_MEMBER),
+        ("ddipg-member-2", CLUSTER_ROLE_MEMBER),
+    ):
         await _approve(db_session, host, role)
     await db_session.commit()
 
@@ -139,18 +140,16 @@ async def test_rollback_refuses_on_a_cluster(
     client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     headers = await _superadmin(db_session)
-    for host, role in (("ddipg-seed", CLUSTER_ROLE_PRIMARY),
-                       ("ddipg-member-1", CLUSTER_ROLE_MEMBER)):
+    for host, role in (
+        ("ddipg-seed", CLUSTER_ROLE_PRIMARY),
+        ("ddipg-member-1", CLUSTER_ROLE_MEMBER),
+    ):
         await _approve(db_session, host, role)
     await db_session.commit()
     fired: list[str] = []
-    monkeypatch.setattr(
-        slot_api, "schedule_rollback", lambda *a, **k: fired.append("rollback")
-    )
+    monkeypatch.setattr(slot_api, "schedule_rollback", lambda *a, **k: fired.append("rollback"))
 
-    r = await client.post(
-        "/api/v1/appliance/slot-upgrade/rollback", headers=headers, json={}
-    )
+    r = await client.post("/api/v1/appliance/slot-upgrade/rollback", headers=headers, json={})
     assert r.status_code == 409
     assert fired == []
 
