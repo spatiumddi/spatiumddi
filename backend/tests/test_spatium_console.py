@@ -579,3 +579,168 @@ def test_bare_scalar_result_is_boring_like_the_dict_form(m) -> None:
     assert not m.AppLogTail._is_noise(
         "Task app.tasks.ipam_discovery.dispatch succeeded in 0.04s: 7"
     )
+
+
+# ── #779 — Web UI firewall self-check warning ───────────────────────────────
+# webui_selfcheck_status() reads the verdict spatiumddi-webui-selfcheck
+# writes to /run and returns an identity-row warning for exactly two
+# states: a fresh `blocked` (bold red, carrying the script's own detail)
+# and a persistent-indeterminate streak (dim yellow — the checker itself
+# is broken and must not die silently). Everything else — open,
+# scoped-hardened, a single indeterminate, stale, missing, garbage — is
+# None, so a healthy or merely-unchecked appliance never shows a false
+# alarm. Freshness follows the ttl_s the script ships in the file.
+
+
+def _selfcheck_state(m, monkeypatch, tmp_path, payload):
+    import json as _json
+
+    p = tmp_path / "webui-selfcheck.json"
+    p.write_text(_json.dumps(payload))
+    monkeypatch.setattr(m, "_WEBUI_SELFCHECK_STATE", p)
+    return p
+
+
+def test_webui_selfcheck_fresh_blocked_is_red_with_detail(m, monkeypatch, tmp_path):
+    import time as _time
+
+    _selfcheck_state(
+        m,
+        monkeypatch,
+        tmp_path,
+        {
+            "status": "blocked",
+            "detail": "explicit drop rule for 443",
+            "checked_at": int(_time.time()),
+            "ttl_s": 900,
+        },
+    )
+    chip = m.webui_selfcheck_status()
+    assert chip is not None
+    label, style = chip
+    assert label.startswith("BLOCKED by firewall")
+    # The script's own detail rides along — an explicit drop rule and a
+    # missing accept read differently to the operator.
+    assert "explicit drop rule for 443" in label
+    assert style == "bold red"
+
+
+@pytest.mark.parametrize("status", ["open", "scoped"])
+def test_webui_selfcheck_healthy_states_are_none(m, monkeypatch, tmp_path, status):
+    import time as _time
+
+    _selfcheck_state(
+        m,
+        monkeypatch,
+        tmp_path,
+        {"status": status, "detail": "x", "checked_at": int(_time.time()), "ttl_s": 900},
+    )
+    assert m.webui_selfcheck_status() is None
+
+
+def test_webui_selfcheck_single_indeterminate_is_none(m, monkeypatch, tmp_path):
+    import time as _time
+
+    _selfcheck_state(
+        m,
+        monkeypatch,
+        tmp_path,
+        {
+            "status": "indeterminate",
+            "detail": "x",
+            "checked_at": int(_time.time()),
+            "ttl_s": 900,
+            "consecutive_indeterminate": 1,
+        },
+    )
+    assert m.webui_selfcheck_status() is None
+
+
+def test_webui_selfcheck_persistent_indeterminate_is_yellow(m, monkeypatch, tmp_path):
+    import time as _time
+
+    _selfcheck_state(
+        m,
+        monkeypatch,
+        tmp_path,
+        {
+            "status": "indeterminate",
+            "detail": "x",
+            "checked_at": int(_time.time()),
+            "ttl_s": 900,
+            "consecutive_indeterminate": 3,
+        },
+    )
+    chip = m.webui_selfcheck_status()
+    assert chip is not None
+    assert chip[1] == "yellow"
+
+
+def test_webui_selfcheck_stale_blocked_is_none(m, monkeypatch, tmp_path):
+    import time as _time
+
+    # Older than the file's own ttl: the checker is broken; a verdict that
+    # may predate a fixed firewall must not keep alerting.
+    _selfcheck_state(
+        m,
+        monkeypatch,
+        tmp_path,
+        {
+            "status": "blocked",
+            "detail": "x",
+            "checked_at": int(_time.time()) - 961,
+            "ttl_s": 900,
+        },
+    )
+    assert m.webui_selfcheck_status() is None
+
+
+def test_webui_selfcheck_ttl_comes_from_the_file(m, monkeypatch, tmp_path):
+    import time as _time
+
+    # A slower timer ships a bigger ttl_s and stays alertable; the console
+    # must follow the file, not a hardcoded constant (a cadence change in
+    # the timer unit must not silently suppress the alarm).
+    _selfcheck_state(
+        m,
+        monkeypatch,
+        tmp_path,
+        {
+            "status": "blocked",
+            "detail": "x",
+            "checked_at": int(_time.time()) - 1200,
+            "ttl_s": 3600,
+        },
+    )
+    assert m.webui_selfcheck_status() is not None
+
+
+def test_webui_selfcheck_missing_or_garbage_is_none(m, monkeypatch, tmp_path):
+    monkeypatch.setattr(m, "_WEBUI_SELFCHECK_STATE", tmp_path / "nope.json")
+    assert m.webui_selfcheck_status() is None
+    bad = tmp_path / "bad.json"
+    bad.write_text("{not json")
+    monkeypatch.setattr(m, "_WEBUI_SELFCHECK_STATE", bad)
+    assert m.webui_selfcheck_status() is None
+
+
+def test_overall_verdict_webui_blocked_is_critical(m):
+    state = m.DashboardState({}, _FakeTail(), "/dev/tty1")
+    verdict, offender = m.overall_verdict(
+        state, None, None, ("BLOCKED by firewall — x", "bold red")
+    )
+    assert verdict == "CRITICAL"
+    assert "Web UI" in offender
+
+
+def test_overall_verdict_webui_yellow_note_is_not_critical(m):
+    # The persistent-indeterminate note renders on the identity row but
+    # must not flip the box CRITICAL. host_health retrying gives the
+    # traversal a deterministic DEGRADED exit before the slot probe.
+    state = m.DashboardState({}, _FakeTail(), "/dev/tty1")
+    state.host_health = {"verdict": "ok", "failing": [], "retrying": ["ntp"], "restore": False}
+    verdict, offender = m.overall_verdict(
+        state, None, None, ("firewall self-check unavailable", "yellow")
+    )
+    assert verdict == "DEGRADED"
+    assert "Web UI" not in offender

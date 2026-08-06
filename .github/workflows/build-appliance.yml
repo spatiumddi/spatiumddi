@@ -85,7 +85,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -119,7 +119,7 @@ jobs:
         # host: baltocdn.com" — Azure runner network policy).
         # bake-chart.sh shells out to ``helm package`` so helm must be
         # on PATH before the chart-bake step.
-        uses: azure/setup-helm@v4
+        uses: azure/setup-helm@v5
         with:
           version: v3.20.2
       - name: Fetch k3s binary + airgap tarball

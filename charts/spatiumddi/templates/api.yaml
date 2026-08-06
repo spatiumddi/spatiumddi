@@ -154,6 +154,22 @@ spec:
             # chowns it 1000:1000). Always mounted (not mirror-gated).
             - name: pcaps
               mountPath: /var/lib/spatiumddi/pcaps
+            # Slot detection. The slot-status/rollback handlers resolve the
+            # ACTIVE slot from host state: _current_slot_from_cmdline()
+            # matches /proc/cmdline's root UUID against /run/udev/data
+            # records, and the durable default comes from grubenv. Without
+            # these two mounts current_slot/durable_default/is_trial_boot are
+            # null/false on every appliance and POST /slot-upgrade/rollback
+            # refuses with 409 ("active slot couldn't be detected"), so the
+            # documented recovery path cannot be driven through the API. The
+            # supervisor already mounts both (supervisor.yaml); api only
+            # READS.
+            - name: run-udev
+              mountPath: /run/udev
+              readOnly: true
+            - name: boot-efi
+              mountPath: /boot/efi-host
+              readOnly: true
           {{- end }}
       {{- if .Values.api.applianceHostMounts.enabled }}
       volumes:
@@ -182,6 +198,19 @@ spec:
           hostPath:
             path: {{ .Values.api.applianceHostMounts.pcapsDir }}
             type: DirectoryOrCreate
+        # Slot detection (see the volumeMount comment). `Directory`, not
+        # DirectoryOrCreate, matching supervisor.yaml: both paths always
+        # exist on an appliance, and creating an empty /boot/efi or
+        # /run/udev on a mispointed deploy would only mask the
+        # misconfiguration behind null slot fields.
+        - name: run-udev
+          hostPath:
+            path: {{ .Values.api.applianceHostMounts.runUdevDir }}
+            type: Directory
+        - name: boot-efi
+          hostPath:
+            path: {{ .Values.api.applianceHostMounts.bootEfiDir }}
+            type: Directory
       {{- end }}
       {{- include "spatiumddi.controlPlaneNodeSelector" (merge (dict "componentNodeSelector" .Values.api.nodeSelector) .) | nindent 6 }}
       {{- with .Values.api.tolerations }}

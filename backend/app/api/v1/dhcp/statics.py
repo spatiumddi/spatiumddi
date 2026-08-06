@@ -13,6 +13,7 @@ from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.v1.dhcp._audit import write_audit
+from app.api.v1.dhcp._mac import canonicalize_mac
 from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.dns_names import validate_hostname
 from app.core.permissions import require_resource_permission
@@ -84,6 +85,17 @@ class StaticCreate(BaseModel):
     def _hostname(cls, v: str) -> str:
         return _validate_optional_hostname(v) or ""
 
+    @field_validator("mac_address")
+    @classmethod
+    def _mac(cls, v: str) -> str:
+        # The column is MACADDR and ``_conflict_check`` compares against it, so
+        # an unvalidated value reached Postgres as a cast failure and surfaced
+        # to the operator as a 500 "Internal Server Error" in the reservation
+        # form — for a typo. Same canonicalization the MAC-blocklist endpoint
+        # has always applied, so ``AA-BB-CC-DD-EE-01`` is accepted and stored
+        # as ``aa:bb:cc:dd:ee:01``.
+        return canonicalize_mac(v)
+
 
 class StaticUpdate(BaseModel):
     ip_address: str | None = None
@@ -110,6 +122,12 @@ class StaticUpdate(BaseModel):
     @classmethod
     def _hostname(cls, v: str | None) -> str | None:
         return _validate_optional_hostname(v)
+
+    @field_validator("mac_address")
+    @classmethod
+    def _mac(cls, v: str | None) -> str | None:
+        # ``None`` means "not being changed" on a PATCH-shaped update body.
+        return canonicalize_mac(v) if v is not None else None
 
 
 class StaticResponse(BaseModel):

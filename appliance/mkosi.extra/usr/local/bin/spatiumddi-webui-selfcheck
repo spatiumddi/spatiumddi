@@ -1,0 +1,462 @@
+#!/usr/bin/env python3
+"""Confirm the Web UI (80/443) is reachable through the firewall (#779).
+
+When a fresh appliance's Web UI is unreachable, nothing on the box says
+so — #776 was a full diagnostic session (pods, services, ss, curl,
+Test-NetConnection) to arrive at "one nftables accept rule is missing",
+and every intermediate step confirmed something healthy. This check makes
+the appliance volunteer that answer: it reasons about the kernel-active
+ruleset and surfaces the verdict on the console (identity-row warning on
+the Web UI URL + the box-level health verdict).
+
+Independence is the point. The supervisor's firewall handling verifies
+its rendered drop-in — it cannot run before the supervisor registers
+(#777), and it answers "did my drop-in apply", not "can anyone reach the
+management surface". This script runs from firstboot, a systemd timer,
+and after every firewall apply (spatium-firewall-reload ExecStartPost);
+it never touches the supervisor. (It is Python rather than the
+watchdog's bash-only posture because the reasoning needs real JSON
+walking; host python3 is baked into the OS image — spatium-console
+depends on it — and is independent of the supervisor's container
+runtime, which is the dependency #779 routes around.)
+
+Why not just curl ourselves: ``curl https://<own-lan-ip>/`` from the
+appliance succeeds even when the port is firewalled, because
+locally-originated traffic to a local address is delivered via ``lo``
+and hits ``iif "lo" accept`` — the exact trap #776 walked into. A
+genuinely off-box probe needs a second host; reasoning about the
+ruleset does not.
+
+The traffic model (documented limits, kept honest):
+
+* We evaluate a NEW inbound TCP connection to dport 443 (and 80) from a
+  non-loopback source against EVERY input-hooked chain, independently —
+  kernel semantics: the packet is delivered only if no input-hook chain
+  drops it, so per-chain verdicts are combined worst-wins
+  (blocked > indeterminate > scoped > open). This matters on a live
+  appliance: k3s's iptables-nft layer keeps ``ip``/``ip6 filter INPUT``
+  chains alongside our ``inet filter input``, and an accept in one chain
+  must never mask a drop in another.
+* Within a chain, rules whose ``tcp dport`` provably includes the port
+  decide first-match: an unqualified drop/reject → blocked; an accept →
+  open, or REACHABLE-SCOPED when it carries a ``saddr`` restriction
+  (``web_ui_allowed_cidrs``, #285 Phase 6 — a hardened appliance must
+  not be reported as broken; the scope prefixes ride in the detail).
+* Rules that cannot match the modelled packet are skipped: ``iif lo``
+  guards (we are off-box), ``ct state established,related`` accepts and
+  ``ct state invalid`` drops (we are NEW), other ports/protocols.
+* QUALIFIED drops are skipped, not treated as blocks: a drop scoped by
+  ``saddr`` (one abusive subnet), a non-lo interface guard, or a
+  ``limit rate over`` flood protector does not make the UI unreachable
+  from the LAN at large — treating it as blocked would cry wolf on a
+  healthy box, the failure mode #779 names as worse than no check.
+* UNMODELED constructs degrade to honesty instead of confidence.
+  Negated matches (``op !=``), named-set references (``@webports``) and
+  dport vmaps are legal in operator drop-ins / ``firewall_extra`` but
+  outside the model: a chain whose decision would depend on one reports
+  ``indeterminate`` (say nothing) rather than a wrong verdict in either
+  direction. Likewise a drop-policy chain whose accept might live behind
+  a ``jump``/``goto`` we do not follow. Sub-chain contents are never
+  evaluated; k3s's dport-less jumps sit in accept-policy chains and are
+  skipped (service-layer rejects are the pods panel's frame, not this
+  check's).
+
+Verdict lands in ``/run/spatiumddi/webui-selfcheck.json`` (ephemeral by
+design — a verdict must never outlive the ruleset it describes, and /run
+resets per boot) where spatium-console reads it. The payload carries
+``ttl_s`` so the console's freshness window follows this file, not a
+constant duplicated in another repo path, and ``consecutive_indeterminate``
+so a permanently-broken checker (nft output format change, missing
+binary) surfaces as a console note instead of dying silently. Exit 0
+reachable / 1 blocked / 2 indeterminate.
+
+Searchable log tag: ``spatiumddi-webui-selfcheck``.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+STATE_PATH = Path("/run/spatiumddi/webui-selfcheck.json")
+WEB_PORTS = (443, 80)
+# Freshness contract shipped WITH the verdict: 3 timer periods (5 min) —
+# if the console sees a verdict older than this, the checker itself is
+# broken and the verdict may predate a fixed (or re-broken) firewall.
+TTL_S = 900
+
+_MODELED_OPS = {None, "==", "in"}
+
+# Combined worst-wins across chains: a packet must survive every
+# input-hooked chain, so any chain's block is the packet's fate, and an
+# uncertain chain caps our confidence below "open".
+_SEVERITY = {"blocked": 3, "indeterminate": 2, "scoped": 1, "open": 0}
+
+
+def _as_list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else [value]
+
+
+class _PortSpec:
+    """A rule's dport constraint: concrete ints + ranges, or unmodeled."""
+
+    __slots__ = ("ints", "ranges", "unmodeled")
+
+    def __init__(self) -> None:
+        self.ints: set[int] = set()
+        self.ranges: list[tuple[int, int]] = []
+        self.unmodeled = False
+
+    def contains(self, port: int) -> bool:
+        return port in self.ints or any(lo <= port <= hi for lo, hi in self.ranges)
+
+
+def _extract_ports(right: Any, spec: _PortSpec) -> None:
+    for item in _as_list(right):
+        if isinstance(item, int):
+            spec.ints.add(item)
+        elif isinstance(item, dict):
+            if "set" in item:
+                _extract_ports(item["set"], spec)
+            elif "range" in item:
+                lo, hi = item["range"]
+                spec.ranges.append((int(lo), int(hi)))
+            else:
+                spec.unmodeled = True
+        else:
+            # e.g. "@webports" — a named-set reference we don't resolve.
+            spec.unmodeled = True
+
+
+def _render_prefixes(right: Any) -> list[str]:
+    out: list[str] = []
+    for item in _as_list(right):
+        if isinstance(item, str):
+            out.append(item)
+        elif isinstance(item, dict):
+            if "set" in item:
+                out.extend(_render_prefixes(item["set"]))
+            elif "prefix" in item:
+                pfx = item["prefix"]
+                out.append(f"{pfx.get('addr')}/{pfx.get('len')}")
+    return out
+
+
+def _match_parts(rule_exprs: list[dict[str, Any]]) -> dict[str, Any]:
+    """Split a rule's expressions into the aspects the model cares about."""
+    parts: dict[str, Any] = {
+        "dports": None,  # _PortSpec | None — None means no dport constraint
+        "iif_lo": False,
+        "iif_other": False,  # constrained to a specific non-lo interface
+        "ct_state": None,  # list[str] | None
+        "saddr": None,  # list[str] rendered prefixes | None
+        "l4proto_tcp": None,  # True / False / None (unconstrained)
+        "verdict": None,  # "accept" | "drop" | "reject" | None
+        "has_jump": False,  # jump/goto — sub-chain we do not follow
+        "has_limit": False,  # rate limiter (e.g. `limit rate over ... drop`)
+        "unmodeled_op": False,  # any match op outside ==/in (e.g. !=)
+    }
+    for expr in rule_exprs:
+        if not isinstance(expr, dict):
+            continue
+        if "accept" in expr:
+            parts["verdict"] = "accept"
+        elif "drop" in expr:
+            parts["verdict"] = "drop"
+        elif "reject" in expr:
+            parts["verdict"] = "reject"
+        elif "jump" in expr or "goto" in expr:
+            parts["has_jump"] = True
+        elif "limit" in expr:
+            parts["has_limit"] = True
+        match = expr.get("match")
+        if not isinstance(match, dict):
+            continue
+        if match.get("op") not in _MODELED_OPS:
+            parts["unmodeled_op"] = True
+        left, right = match.get("left"), match.get("right")
+        # A dport vmap ({"vmap": ...} on the right of a payload dport
+        # match) carries verdicts we do not follow — mark unmodeled.
+        if isinstance(right, dict) and "vmap" in right:
+            parts["unmodeled_op"] = True
+        if not isinstance(left, dict):
+            continue
+        if "payload" in left:
+            payload = left["payload"]
+            proto = payload.get("protocol")
+            field = payload.get("field")
+            if field == "dport":
+                # ``th`` (transport header) is protocol-agnostic — it must
+                # not overwrite a tcp/udp answer derived from a preceding
+                # ``meta l4proto`` expression.
+                if proto in ("tcp", "udp", "sctp", "dccp"):
+                    parts["l4proto_tcp"] = proto == "tcp"
+                spec = _PortSpec()
+                _extract_ports(right, spec)
+                parts["dports"] = spec
+            elif field == "saddr":
+                parts["saddr"] = _render_prefixes(right)
+        elif "meta" in left:
+            key = left["meta"].get("key")
+            if key in ("iif", "iifname"):
+                if right in ("lo", 1):
+                    parts["iif_lo"] = True
+                else:
+                    parts["iif_other"] = True
+            elif key == "l4proto":
+                protos: set[str] = set()
+                for item in _as_list(right):
+                    if isinstance(item, str):
+                        protos.add(item)
+                    elif isinstance(item, dict) and "set" in item:
+                        protos |= {s for s in _as_list(item["set"]) if isinstance(s, str)}
+                if protos:
+                    parts["l4proto_tcp"] = "tcp" in protos
+        elif "ct" in left and left["ct"].get("key") == "state":
+            states: list[str] = []
+            for item in _as_list(right):
+                if isinstance(item, str):
+                    states.append(item)
+                elif isinstance(item, dict) and "set" in item:
+                    states.extend(s for s in _as_list(item["set"]) if isinstance(s, str))
+            parts["ct_state"] = states
+    return parts
+
+
+def _evaluate_chain(rules: list[dict[str, Any]], policy: str, port: int) -> tuple[str, str]:
+    """Verdict for one input-hooked chain: does IT let the packet through?"""
+    maybe_accepted = False  # an unmodeled rule that might accept the port
+    maybe_dropped = False  # an unmodeled rule that might drop the port
+    jumps_seen = False
+    for parts in rules:
+        if parts["iif_lo"]:
+            continue  # cannot match: our packet arrives off-box
+        ct = parts["ct_state"]
+        if ct is not None and "new" not in ct:
+            continue  # established/related accepts, invalid drops: not NEW
+        if parts["has_jump"] and parts["dports"] is None:
+            jumps_seen = True
+            continue
+        spec = parts["dports"]
+        unmodeled = parts["unmodeled_op"] or (spec is not None and spec.unmodeled)
+        if unmodeled and (spec is not None or parts["verdict"] is not None):
+            # A rule we can't reason about that carries (or gates) a
+            # verdict: it MIGHT have matched this port first. Record which
+            # direction it could push and keep scanning — a modeled
+            # decision found later is only trustworthy if no unmodeled
+            # rule could have pre-empted it in that direction.
+            if parts["verdict"] == "accept" or parts["has_jump"]:
+                maybe_accepted = True
+            if parts["verdict"] in ("drop", "reject") or parts["has_jump"]:
+                maybe_dropped = True
+            if parts["verdict"] is None and not parts["has_jump"]:
+                # A verdict map (vmap) — the verdicts live inside the map
+                # we don't follow, so it could push either way.
+                maybe_accepted = True
+                maybe_dropped = True
+            continue
+        if parts["verdict"] is None:
+            continue
+        if spec is None:
+            # No dport constraint. The base config's blanket verdicts all
+            # name their protocol/ports; a truly unconditional accept/drop
+            # here would be policy-shaped and is out of the model
+            # (documented limit).
+            continue
+        if parts["l4proto_tcp"] is False or not spec.contains(port):
+            continue
+        if parts["verdict"] in ("drop", "reject"):
+            if parts["saddr"] or parts["iif_other"] or parts["has_limit"]:
+                # Qualified drop: blocks one subnet / NIC / flood rate, not
+                # the LAN at large — treating it as "blocked" would cry
+                # wolf on a healthy box.
+                continue
+            if maybe_accepted:
+                return ("indeterminate", f"unmodeled rule may accept {port} before its drop")
+            return ("blocked", f"explicit {parts['verdict']} rule for {port}")
+        # accept
+        if maybe_dropped:
+            return ("indeterminate", f"unmodeled rule may drop {port} before its accept")
+        if parts["saddr"]:
+            return ("scoped", "accept scoped to " + ", ".join(parts["saddr"]))
+        return ("open", f"accept rule for {port}")
+
+    if policy == "accept":
+        if maybe_dropped:
+            # e.g. ``tcp dport != 80 drop`` — really drops this port, but
+            # we can't model the negation; don't claim open.
+            return ("indeterminate", "unmodeled rule may drop before policy accept")
+        return ("open", "no matching rule; chain policy accept")
+    if maybe_accepted or jumps_seen:
+        # The accept might live in a rule/sub-chain we can't follow —
+        # say nothing rather than a confident wrong "blocked".
+        return ("indeterminate", "policy drop, but unmodeled/jumped rules present")
+    return ("blocked", "no accept rule matches; chain policy drop")
+
+
+def evaluate_ports(nft_doc: dict[str, Any], ports: tuple[int, ...]) -> dict[int, tuple[str, str]]:
+    """Per-port ``(status, detail)`` for a NEW off-box TCP connection.
+
+    One parse pass shared across ports; every input-hooked chain is
+    evaluated independently and combined worst-wins (see module
+    docstring for the model).
+    """
+    entries = nft_doc.get("nftables")
+    if not isinstance(entries, list):
+        return {p: ("indeterminate", "nft output has no ruleset") for p in ports}
+
+    # (family, table, name) -> policy. Keyed WITH family: k3s's
+    # iptables-nft layer keeps same-named INPUT chains in ip and ip6.
+    input_chains: dict[tuple[str, str, str], str] = {}
+    for entry in entries:
+        chain = entry.get("chain") if isinstance(entry, dict) else None
+        if isinstance(chain, dict) and chain.get("hook") == "input":
+            key = (chain.get("family"), chain.get("table"), chain.get("name"))
+            input_chains[key] = chain.get("policy", "accept")
+    if not input_chains:
+        # No input-hooked chain at all: nothing filters inbound traffic.
+        return {p: ("open", "no input-hooked chain (unfiltered)") for p in ports}
+
+    chain_rules: dict[tuple[str, str, str], list[dict[str, Any]]] = {
+        k: [] for k in input_chains
+    }
+    for entry in entries:
+        rule = entry.get("rule") if isinstance(entry, dict) else None
+        if not isinstance(rule, dict):
+            continue
+        key = (rule.get("family"), rule.get("table"), rule.get("chain"))
+        if key in chain_rules:
+            chain_rules[key].append(_match_parts(_as_list(rule.get("expr") or [])))
+
+    results: dict[int, tuple[str, str]] = {}
+    for port in ports:
+        worst: tuple[str, str] | None = None
+        for key, policy in input_chains.items():
+            status, detail = _evaluate_chain(chain_rules[key], policy, port)
+            if len(input_chains) > 1:
+                detail = f"{detail} ({'/'.join(str(k) for k in key)})"
+            if worst is None or _SEVERITY[status] > _SEVERITY[worst[0]]:
+                worst = (status, detail)
+        assert worst is not None  # input_chains is non-empty here
+        results[port] = worst
+    return results
+
+
+def evaluate_port(nft_doc: dict[str, Any], port: int) -> tuple[str, str]:
+    """Single-port convenience wrapper over :func:`evaluate_ports`."""
+    return evaluate_ports(nft_doc, (port,))[port]
+
+
+def _read_ruleset() -> dict[str, Any]:
+    """Fetch input-hooked chains only, merged into one nft-shaped doc.
+
+    ``nft -j list ruleset`` would work but serialises every kube-proxy /
+    flannel table on a k3s appliance — potentially megabytes parsed each
+    run just to be skipped. Two phases keep it cheap AND correct across
+    families: enumerate chains (tiny), then fetch only the input-hooked
+    ones.
+    """
+
+    def _nft(*args: str) -> dict[str, Any]:
+        proc = subprocess.run(
+            ["nft", "-j", *args],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=True,
+        )
+        return json.loads(proc.stdout)
+
+    chains_doc = _nft("list", "chains")
+    merged: list[dict[str, Any]] = []
+    for entry in chains_doc.get("nftables") or []:
+        chain = entry.get("chain") if isinstance(entry, dict) else None
+        if not (isinstance(chain, dict) and chain.get("hook") == "input"):
+            continue
+        chain_doc = _nft(
+            "list", "chain", chain["family"], chain["table"], chain["name"]
+        )
+        merged.extend(chain_doc.get("nftables") or [])
+    return {"nftables": merged}
+
+
+def run_check(previous: dict[str, Any] | None = None) -> dict[str, Any]:
+    try:
+        doc = _read_ruleset()
+        results = evaluate_ports(doc, WEB_PORTS)
+    except Exception as exc:  # noqa: BLE001 — any failure here is "can't tell",
+        # never "blocked": a missing nft binary or a transient must not alert
+        prev_streak = int((previous or {}).get("consecutive_indeterminate") or 0)
+        return {
+            "status": "indeterminate",
+            "detail": f"could not read ruleset: {exc}",
+            "ports": {},
+            "checked_at": int(time.time()),
+            "ttl_s": TTL_S,
+            "consecutive_indeterminate": prev_streak + 1,
+        }
+
+    https_status, https_detail = results[443]
+    if https_status == "indeterminate":
+        prev_streak = int((previous or {}).get("consecutive_indeterminate") or 0)
+        streak = prev_streak + 1
+    else:
+        streak = 0
+    return {
+        # The verdict keys off 443 — the UI's real front door. The
+        # per-port map below (including 80) is triage payload for the
+        # log/state file only; nothing branches on it.
+        "status": https_status,
+        "detail": https_detail,
+        "ports": {
+            str(p): {"status": results[p][0], "detail": results[p][1]} for p in WEB_PORTS
+        },
+        "checked_at": int(time.time()),
+        "ttl_s": TTL_S,
+        "consecutive_indeterminate": streak,
+    }
+
+
+def _read_previous_state() -> dict[str, Any] | None:
+    try:
+        raw = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        return raw if isinstance(raw, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def main() -> int:
+    result = run_check(previous=_read_previous_state())
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    # PID-suffixed tmp: firstboot's inline run and the timer's first fire
+    # can overlap on first boot; a shared tmp name could rename a
+    # partially-written file into place.
+    tmp = STATE_PATH.with_name(f"{STATE_PATH.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(result), encoding="utf-8")
+    tmp.replace(STATE_PATH)
+
+    line = (
+        f"spatiumddi-webui-selfcheck: {result['status']} — {result['detail']} "
+        f"(ports: {json.dumps(result['ports'])})"
+    )
+    if result["status"] == "blocked":
+        print(line, file=sys.stderr)
+        print(
+            "spatiumddi-webui-selfcheck: the Web UI would NOT be reachable "
+            "from the LAN. Inspect 'nft list chain inet filter input' — "
+            "expected an accept for tcp dport { 80, 443 } (the "
+            "00-spatium-webui.nft sentinel or the supervisor drop-in).",
+            file=sys.stderr,
+        )
+        return 1
+    print(line)
+    return 0 if result["status"] in ("open", "scoped") else 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
