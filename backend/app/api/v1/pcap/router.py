@@ -37,6 +37,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB, CurrentUser
+from app.api.pagination import MAX_PAGE
 from app.core.permissions import require_permission
 from app.models.appliance import APPLIANCE_STATE_APPROVED, Appliance
 from app.models.audit import AuditLog
@@ -315,7 +316,7 @@ async def list_captures(
     status_filter: str | None = Query(None, alias="status"),
     vantage: str | None = Query(None),
     appliance_id: uuid.UUID | None = Query(None),
-    page: int = Query(1, ge=1),
+    page: int = Query(1, ge=1, le=MAX_PAGE),
     page_size: int = Query(50, ge=1, le=500),
 ) -> PcapCaptureListResponse:
     base = select(PacketCapture)

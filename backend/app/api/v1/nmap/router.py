@@ -41,6 +41,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB, CurrentUser
+from app.api.pagination import MAX_PAGE
 from app.api.v1.probe_guard import enforce_probe_target
 from app.core.permissions import require_permission, user_has_permission
 from app.core.security import decode_access_token
@@ -226,7 +227,7 @@ async def list_scans(
     ip_address_id: uuid.UUID | None = Query(None),
     target_ip: str | None = Query(None),
     status_filter: str | None = Query(None, alias="status"),
-    page: int = Query(1, ge=1),
+    page: int = Query(1, ge=1, le=MAX_PAGE),
     page_size: int = Query(50, ge=1, le=500),
 ) -> NmapScanListResponse:
     base = select(NmapScan)

@@ -19,7 +19,7 @@ from sqlalchemy import String, and_, cast, func, or_, select
 from sqlalchemy.exc import IntegrityError
 
 from app.api.deps import DB
-from app.api.pagination import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, Page
+from app.api.pagination import DEFAULT_PAGE_SIZE, MAX_PAGE, MAX_PAGE_SIZE, Page
 from app.api.v1.dhcp._audit import write_audit
 from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_permission
@@ -186,7 +186,7 @@ async def list_sightings(
     since_hours: int | None = Query(None, ge=1, le=24 * 365),
     include_randomized: bool = False,
     search: str | None = None,
-    page: int = Query(1, ge=1),
+    page: int = Query(1, ge=1, le=MAX_PAGE),
     page_size: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
 ) -> Page[SightingOut]:
     """Paginated review queue. Defaults to unacknowledged new devices."""
