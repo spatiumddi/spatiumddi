@@ -1063,23 +1063,99 @@ class Bind9Driver(DriverBase):
         # fall back to SIGHUP which named handles as a config + zone reload.
         rndc_ok = False
         if shutil.which("rndc"):
-            cmd = ["rndc"]
-            agent_conf = self.state_dir / "rndc.conf"
-            if agent_conf.exists():
-                cmd += ["-c", str(agent_conf)]
-            cmd.append("reconfig")
-            res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            base = self._rndc_base()
+            # ``reconfig`` picks up config changes and zones that were ADDED or
+            # REMOVED — but by BIND's documented definition it "does not reload
+            # existing zone files even if they have changed". That was fine
+            # while a record edit rode the RFC 2136 path. Under split-horizon
+            # (issue #24) it is not: the control plane deliberately stops
+            # dispatching record ops for a group with views — an nsupdate to
+            # loopback cannot target a view — and propagates record changes by
+            # RE-RENDERING the zone file instead
+            # (backend/app/services/dns/agent_config.py, has_views branch).
+            # ``reconfig`` never reads that file back, so on any group with a
+            # view every record created after the zone's first load was written
+            # to disk and never served: the API returned 201 and the wire
+            # answered NXDOMAIN forever. Proven live on a 3-node QA rig
+            # 2026-08-06 — the record was present in
+            # rendered/zones/<view>/<zone>.db while dig returned NXDOMAIN, and
+            # the zone's own ``rndc zonestatus`` still showed the serial and
+            # node count from the previous load.
+            res = subprocess.run(
+                [*base, "reconfig"], capture_output=True, text=True, check=False
+            )
             rndc_ok = res.returncode == 0
             if not rndc_ok:
                 log.warning(
                     "rndc_failed_falling_back_to_sighup", stderr=res.stderr.strip()
                 )
+            else:
+                self._reload_rendered_zones(base)
         if not rndc_ok and self.daemon_pid:
             try:
                 os.kill(self.daemon_pid, signal.SIGHUP)
                 log.info("named_sighup_sent", pid=self.daemon_pid)
             except OSError as e:
                 log.error("named_sighup_failed", error=str(e))
+
+    def rendered_zone_views(self) -> list[tuple[str, str | None]]:
+        """``(zone_name, view_name)`` for every zone file we just rendered.
+
+        Read back off the rendered tree rather than threaded down from
+        ``render()`` so it cannot drift from what is actually on disk — the
+        layout is ``rendered/zones/<view>/<zone>.db`` under split-horizon and
+        ``rendered/zones/<zone>.db`` without views, which is exactly the
+        ``file_prefix`` contract ``_zone_stanza`` writes.
+        """
+        root = self.state_dir / self.rendered_dir_name / "zones"
+        out: list[tuple[str, str | None]] = []
+        try:
+            entries = sorted(root.iterdir())
+        except OSError:
+            return out
+        for entry in entries:
+            if entry.is_dir():
+                for zf in sorted(entry.glob("*.db")):
+                    out.append((zf.name[: -len(".db")], entry.name))
+            elif entry.name.endswith(".db"):
+                out.append((entry.name[: -len(".db")], None))
+        return out
+
+    def _reload_rendered_zones(self, base: list[str]) -> None:
+        """Make named re-read the zone files ``reconfig`` just ignored.
+
+        Every primary zone we render carries an ``allow-update`` clause — the
+        group's loopback TSIG grant is ALWAYS included so control-plane record
+        ops can flow (see ``_render_allow_update``), which makes the zone
+        DYNAMIC as far as named is concerned. named will not re-read a dynamic
+        zone's file on a plain reload, because doing so would silently discard
+        journal contents; it has to be frozen first. So: freeze → reload →
+        thaw, per zone, per view. ``freeze``/``thaw`` fail harmlessly on a zone
+        that is not dynamic, and the plain ``reload`` covers that case, so one
+        sequence is correct for both.
+
+        Best-effort by design: a zone that will not reload must not stop the
+        rest from reloading, and it is already reported through the daemon's
+        own status channel.
+        """
+        for zname, view in self.rendered_zone_views():
+            scope = [zname] + (["in", view] if view else [])
+            for verb in ("freeze", "reload", "thaw"):
+                res = subprocess.run(
+                    [*base, verb, *scope],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if res.returncode != 0 and verb == "reload":
+                    log.warning(
+                        "bind9_zone_reload_failed",
+                        zone=zname,
+                        view=view,
+                        stderr=res.stderr.strip()[:200],
+                    )
+        log.info("bind9_rendered_zones_reloaded",
+                 zones=len(self.rendered_zone_views()))
 
     # ── Record ops (RFC 2136 over loopback) ─────────────────────────────────
 
