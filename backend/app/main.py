@@ -925,6 +925,59 @@ def create_app() -> FastAPI:
             content={"detail": "Internal Server Error"},
         )
 
+    # The 422 the document declares is not the only 422 the API returns.
+    #
+    # FastAPI auto-declares ``HTTPValidationError`` (detail: array of
+    # ValidationError) on every operation that validates a parameter, and that
+    # is honest for the 422s its own request validation produces. But 270 call
+    # sites across ``backend/app/api/v1`` — 57 router files, led by
+    # ipam/router.py (24), dns/router.py (22), cutover/router.py (18) — raise
+    # ``HTTPException(status_code=422, detail="...")`` by hand for semantic
+    # validation a signature cannot express ("invalid classification"), and
+    # FastAPI serialises those as ``{"detail": "<string>"}``. The document said
+    # array, the wire said string, and nothing reconciled them: every one of
+    # those responses violated the API's own published contract.
+    #
+    # Found by the conformance fuzz, which validates live responses against
+    # this very document —
+    #   GET /api/v1/new-devices/sightings?classification=null
+    #   -> 422 {"detail":"invalid classification"}
+    # — where the declared schema demands an array. 29 of 39 red conformance
+    # rows on one build were this single defect.
+    #
+    # Widening the DOCUMENT rather than rewriting the BODIES is deliberate. The
+    # string form is the established contract: the frontend's ``formatApiError``
+    # normalises string, array and object shapes (issues #31 / #186), so both
+    # already render correctly. Rewriting 270 response bodies to chase the
+    # schema would break clients outside this repo in order to fix what is a
+    # documentation defect.
+    #
+    # Wraps FastAPI's own ``openapi()`` rather than re-deriving the document
+    # with ``get_openapi``, so every generation setting the app carries
+    # (webhooks, separate input/output schemas, servers) keeps applying. That
+    # call caches into ``app.openapi_schema`` and returns the cached object, so
+    # this patches in place — the ``anyOf`` guard keeps it idempotent.
+    _generate_openapi = app.openapi
+
+    def _openapi_with_string_validation_detail() -> dict:
+        schema = _generate_openapi()
+        props = (
+            schema.get("components", {})
+            .get("schemas", {})
+            .get("HTTPValidationError", {})
+            .get("properties", {})
+        )
+        detail = props.get("detail")
+        # Absent when no operation validates anything — nothing to widen.
+        if isinstance(detail, dict) and "anyOf" not in detail:
+            props["detail"] = {
+                "anyOf": [detail, {"type": "string"}],
+                "title": detail.get("title", "Detail"),
+            }
+        return schema
+
+    app.openapi = _openapi_with_string_validation_detail  # type: ignore[method-assign]
+
     return app
 
 
