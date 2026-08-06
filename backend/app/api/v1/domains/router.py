@@ -26,6 +26,7 @@ from sqlalchemy import delete as sa_delete
 from sqlalchemy import func, or_, select
 
 from app.api.deps import DB, CurrentUser
+from app.api.pagination import MAX_PAGE
 from app.core.permissions import require_permission, user_has_permission
 from app.models.audit import AuditLog
 from app.models.auth import User
@@ -244,7 +245,7 @@ async def list_domains(
     customer_id: uuid.UUID | None = Query(None),
     registrar_provider_id: uuid.UUID | None = Query(None),
     search: str | None = Query(None, min_length=1, max_length=255),
-    page: int = Query(1, ge=1),
+    page: int = Query(1, ge=1, le=MAX_PAGE),
     page_size: int = Query(50, ge=1, le=500),
     tag: list[str] = Query(default_factory=list),
 ) -> DomainListResponse:

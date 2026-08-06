@@ -25,6 +25,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, select
 
 from app.api.deps import DB, CurrentUser
+from app.api.pagination import MAX_PAGE
 from app.core.crypto import encrypt_str
 from app.core.permissions import require_permission, user_has_permission
 from app.models.audit import AuditLog
@@ -176,7 +177,7 @@ async def list_devices(
     device_type: str | None = Query(None),
     last_poll_status: str | None = Query(None),
     site_id: uuid.UUID | None = Query(None),
-    page: int = Query(1, ge=1),
+    page: int = Query(1, ge=1, le=MAX_PAGE),
     page_size: int = Query(50, ge=1, le=500),
     tag: list[str] = Query(default_factory=list),
 ) -> NetworkDeviceListResponse:
@@ -455,7 +456,7 @@ async def list_interfaces(
     device_id: uuid.UUID,
     db: DB,
     current_user: CurrentUser,
-    page: int = Query(1, ge=1),
+    page: int = Query(1, ge=1, le=MAX_PAGE),
     page_size: int = Query(50, ge=1, le=2000),
 ) -> NetworkInterfaceListResponse:
     if not user_has_permission(current_user, "read", PERMISSION):
@@ -490,7 +491,7 @@ async def list_arp(
     mac: str | None = Query(None),
     vrf: str | None = Query(None),
     state: str | None = Query(None),
-    page: int = Query(1, ge=1),
+    page: int = Query(1, ge=1, le=MAX_PAGE),
     page_size: int = Query(50, ge=1, le=2000),
 ) -> NetworkArpListResponse:
     if not user_has_permission(current_user, "read", PERMISSION):
@@ -545,7 +546,7 @@ async def list_fdb(
     mac: str | None = Query(None),
     vlan_id: int | None = Query(None),
     interface_id: uuid.UUID | None = Query(None),
-    page: int = Query(1, ge=1),
+    page: int = Query(1, ge=1, le=MAX_PAGE),
     page_size: int = Query(50, ge=1, le=2000),
 ) -> NetworkFdbListResponse:
     if not user_has_permission(current_user, "read", PERMISSION):
@@ -597,7 +598,7 @@ async def list_neighbours(
     sys_name: str | None = Query(None),
     chassis_id: str | None = Query(None),
     interface_id: uuid.UUID | None = Query(None),
-    page: int = Query(1, ge=1),
+    page: int = Query(1, ge=1, le=MAX_PAGE),
     page_size: int = Query(50, ge=1, le=2000),
 ) -> NetworkNeighbourListResponse:
     """List LLDP neighbours discovered on this device.

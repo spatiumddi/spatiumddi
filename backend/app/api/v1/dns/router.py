@@ -19,7 +19,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import selectinload
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
-from app.api.pagination import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, Page, paginate
+from app.api.pagination import DEFAULT_PAGE_SIZE, MAX_PAGE, MAX_PAGE_SIZE, Page, paginate
 from app.config import settings
 from app.core.agent_wake import (
     appliance_channel,
@@ -77,6 +77,8 @@ from app.services.dns.delegation import (
     preview_to_dict,
 )
 from app.services.dns.record_ops import (
+    clear_dnssec_key_state,
+    enqueue_dnssec_op,
     enqueue_record_op,
     enqueue_record_ops_batch,
     enqueue_record_ops_bulk,
@@ -3405,6 +3407,13 @@ async def create_zone(
             detail="A zone with that name already exists in this group/view",
         )
 
+    # DNSSEC at create (#811). Gate first — without this the flag was
+    # accepted on e.g. a windows_dns group, where nothing will ever sign it
+    # and the sign/unsign endpoints both 422 (the gate lived two functions
+    # away). Same subset semantics as the sign endpoint.
+    if body.dnssec_enabled:
+        await _check_driver_gated_operation("dnssec_sign", group_id, db)
+
     zone = DNSZone(group_id=group_id, **body.model_dump())
     db.add(zone)
 
@@ -3414,6 +3423,15 @@ async def create_zone(
     # never heard of. BIND9 zones still get applied via the agent's next
     # ConfigBundle poll — that's a separate path and untouched here.
     await _push_zone_to_agentless_servers(db, zone, "create")
+
+    # ... and the sign op itself (#811). BIND9 signs inline from the config
+    # bundle and ignores this; PowerDNS + Technitium sign only in response
+    # to it — without the enqueue the zone read as DNSSEC-enabled in the UI
+    # and was unsigned on the wire until someone clicked Sign. Ordering is
+    # safe: the agent applies the structural bundle (creating the zone)
+    # before draining pending ops in the same sync cycle.
+    if body.dnssec_enabled:
+        await enqueue_dnssec_op(db, zone, "dnssec_sign")
 
     db.add(
         AuditLog(
@@ -3999,8 +4017,23 @@ async def update_zone(
                     "(primary server IP) to transfer from"
                 ),
             )
+    # DNSSEC flag flips through the generic update path (#811). Same
+    # behaviour as the dedicated sign/unsign endpoints — before this,
+    # PATCHing dnssec_enabled set the flag and nothing ever signed (or
+    # unsigned) on PowerDNS / Technitium. Only the ON direction is gated
+    # (before mutating, so an incompatible group refuses the whole update);
+    # the OFF direction is deliberately ungated — see _flip_dnssec_off.
+    dnssec_flip: str | None = None
+    if "dnssec_enabled" in changes and changes["dnssec_enabled"] != zone.dnssec_enabled:
+        dnssec_flip = "dnssec_sign" if changes["dnssec_enabled"] else "dnssec_unsign"
+        if dnssec_flip == "dnssec_sign":
+            await _check_driver_gated_operation(dnssec_flip, group_id, db)
     for k, v in changes.items():
         setattr(zone, k, v)
+    if dnssec_flip == "dnssec_sign":
+        await enqueue_dnssec_op(db, zone, "dnssec_sign")
+    elif dnssec_flip == "dnssec_unsign":
+        await _flip_dnssec_off(db, zone)
     db.add(
         AuditLog(
             user_id=current_user.id,
@@ -4693,6 +4726,33 @@ class DNSSECSignRequest(BaseModel):
     policy_id: uuid.UUID | None = None
 
 
+async def _flip_dnssec_off(db: DB, zone: DNSZone) -> None:
+    """Turn DNSSEC off for a zone: flag, cached key state, driver-side op.
+
+    Deliberately UNGATED (#811 review): a flip-off on a group whose drivers
+    could never have signed has nothing to unsign on the wire, and gating it
+    would permanently trap the pre-#811 zones whose flag was accepted on
+    e.g. a windows_dns group — "signed" in the UI, unsigned on the wire,
+    with this the only API path that can clear the lie. The driver-side
+    unsign op is enqueued only when every driver in the group can honour it
+    (same subset the sign gate uses); on any other group there is nothing
+    queued — the enqueue path's agentless immediate-apply could not process
+    the DNSSEC_OP sentinel anyway.
+
+    Shared by the unsign endpoint, the update-zone flag flip, and the
+    Copilot's unsign apply, so their choreography (flag + DS/key cleanup +
+    conditional enqueue) cannot drift apart.
+    """
+    zone.dnssec_enabled = False
+    # Clear cached DS + per-key state now — the BIND9 agent only reports
+    # signed zones, so it won't send a keys=[] report to clear these.
+    await clear_dnssec_key_state(db, zone)
+    res = await db.execute(select(DNSServer.driver).where(DNSServer.group_id == zone.group_id))
+    drivers = {d for d in res.scalars().all() if d}
+    if drivers and drivers <= _DRIVER_GATED_OPERATIONS["dnssec_unsign"]:
+        await enqueue_dnssec_op(db, zone, "dnssec_unsign")
+
+
 @router.post("/groups/{group_id}/zones/{zone_id}/dnssec/sign", response_model=ZoneResponse)
 async def sign_zone_dnssec(
     group_id: uuid.UUID,
@@ -4729,12 +4789,7 @@ async def sign_zone_dnssec(
             if pol is None:
                 raise HTTPException(status_code=404, detail="DNSSEC policy not found")
             zone.dnssec_policy_id = body.policy_id
-    await enqueue_record_op(
-        db,
-        zone,
-        "dnssec_sign",
-        {"name": "@", "type": "DNSSEC_OP"},
-    )
+    await enqueue_dnssec_op(db, zone, "dnssec_sign")
     db.add(
         AuditLog(
             user_id=current_user.id,
@@ -4761,26 +4816,18 @@ async def unsign_zone_dnssec(
 ) -> DNSZone:
     """Disable PowerDNS DNSSEC signing for the zone (issue #127, Phase 3c).
 
-    Mirrors :func:`sign_zone_dnssec`. The agent deletes the cryptokeys via
-    REST, removes the ``PRESIGNED`` metadata, and the zone reverts to
-    unsigned answers. Operators with a parent registrar still pointing at
-    the old DS record will see SERVFAIL on validating resolvers — this
-    endpoint does NOT walk the parent zone for them.
+    Mirrors :func:`sign_zone_dnssec`, minus the driver gate: turning the
+    flag OFF is allowed on any group (see :func:`_flip_dnssec_off` — a hard
+    gate here would leave pre-#811 flagged-but-unsignable zones with no API
+    remediation). On signing-capable groups the agent deletes the
+    cryptokeys via REST, removes the ``PRESIGNED`` metadata, and the zone
+    reverts to unsigned answers. Operators with a parent registrar still
+    pointing at the old DS record will see SERVFAIL on validating
+    resolvers — this endpoint does NOT walk the parent zone for them.
     """
     zone = await _require_zone(group_id, zone_id, db)
     _reject_if_synthesised_zone(zone, "DNSSEC-unsign")
-    await _check_driver_gated_operation("dnssec_unsign", group_id, db)
-    zone.dnssec_enabled = False
-    # Clear cached DS + per-key state now — the BIND9 agent only reports
-    # signed zones, so it won't send a keys=[] report to clear these.
-    zone.dnssec_ds_records = None
-    await db.execute(sa_delete(DNSKey).where(DNSKey.zone_id == zone.id))
-    await enqueue_record_op(
-        db,
-        zone,
-        "dnssec_unsign",
-        {"name": "@", "type": "DNSSEC_OP"},
-    )
+    await _flip_dnssec_off(db, zone)
     db.add(
         AuditLog(
             user_id=current_user.id,
@@ -5246,7 +5293,7 @@ async def list_group_records(
         None, description="substring over name / fqdn / value / type / zone"
     ),
     record_type: str | None = Query(None, description="exact record type filter (A, MX, …)"),
-    page: int = Query(1, ge=1),
+    page: int = Query(1, ge=1, le=MAX_PAGE),
     page_size: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
 ) -> Page[GroupRecordResponse]:
     """Every record across every zone in the group, with zone + view context,
@@ -5331,7 +5378,7 @@ async def list_records(
     tag: list[str] = Query(default_factory=list),
     search: str | None = Query(None, description="substring over name / fqdn / value / type"),
     record_type: str | None = Query(None, description="exact record type filter (A, MX, …)"),
-    page: int = Query(1, ge=1),
+    page: int = Query(1, ge=1, le=MAX_PAGE),
     page_size: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
 ) -> Page[RecordResponse]:
     """Records in a zone, server-side paginated (#455).

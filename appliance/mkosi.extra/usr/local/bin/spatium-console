@@ -178,6 +178,89 @@ def supervisor_watchdog_status() -> tuple[str, str] | None:
     return (f"Loop ticking · {age}s ago", "bold green")
 
 
+# Web UI firewall reachability self-check (#779) — host-side script +
+# timer that reasons about the kernel-active nftables ruleset and asks
+# "would a NEW off-box TCP connection to 443 be accepted?". Independent
+# of the supervisor by design: the supervisor's own drift check can't
+# run before it registers (#777), and it verifies its drop-in, not
+# reachability. The script writes its verdict to /run (ephemeral — a
+# verdict must never outlive the ruleset it describes). Surfaced in two
+# places: a warning appended to the identity row's Web UI URL (the URL
+# the verdict invalidates), and the box-level health verdict.
+_WEBUI_SELFCHECK_STATE = Path("/run/spatiumddi/webui-selfcheck.json")
+# Fallback freshness window when the state file predates the ttl_s field;
+# the authoritative value ships IN the file so a timer-cadence change
+# can't silently outrun a constant hardcoded here.
+_WEBUI_SELFCHECK_DEFAULT_TTL_S = 900
+# mtime-memoized parse so the 0.5 s render loop pays one stat() per tick,
+# not a read+parse — same tier discipline as supervisor_watchdog_status
+# (see the P1.2 comment on DashboardState). Keyed by (path, mtime): the
+# path is constant in production but monkeypatched per-test. Mutated in
+# place (no rebinding) so no `global` statement is needed.
+_WEBUI_STATE_CACHE: dict[str, object] = {"path": "", "mtime": -1.0, "raw": None}
+
+
+def _webui_selfcheck_raw() -> dict | None:
+    path = str(_WEBUI_SELFCHECK_STATE)
+    try:
+        mtime = _WEBUI_SELFCHECK_STATE.stat().st_mtime
+    except OSError:
+        return None
+    if path == _WEBUI_STATE_CACHE["path"] and mtime == _WEBUI_STATE_CACHE["mtime"]:
+        cached = _WEBUI_STATE_CACHE["raw"]
+        return cached if isinstance(cached, dict) else None
+    try:
+        raw = json.loads(_WEBUI_SELFCHECK_STATE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raw = None
+    if not isinstance(raw, dict):
+        raw = None
+    _WEBUI_STATE_CACHE.update(path=path, mtime=mtime, raw=raw)
+    return raw
+
+
+def webui_selfcheck_status() -> tuple[str, str] | None:
+    """Return a ``(label, rich-style)`` warning for the identity row, or
+    ``None`` when there is nothing worth saying.
+
+    Two states speak, everything else is silent:
+
+    * fresh ``blocked`` → bold red, carrying the script's own detail (an
+      explicit drop rule and a missing accept read differently, and the
+      operator should see which one it is). ``overall_verdict`` keys the
+      box-level CRITICAL off this style, mirroring how it reads
+      ``wd_status``.
+    * ``indeterminate`` for 3+ consecutive runs → dim yellow note that
+      the checker itself can't read the firewall — otherwise a broken
+      nft / changed JSON format would disable this safety net silently,
+      forever.
+
+    ``open`` / ``scoped`` (hardened via web_ui_allowed_cidrs) / missing /
+    stale return ``None``: the check exists to volunteer the one answer
+    nothing else on the box will (#776 took a full diagnostic session to
+    find a missing accept rule) — not to add a green light. Freshness
+    uses the ``ttl_s`` the script writes alongside the verdict.
+    """
+    raw = _webui_selfcheck_raw()
+    if raw is None:
+        return None
+    checked = raw.get("checked_at")
+    if not isinstance(checked, (int, float)):
+        return None
+    ttl = raw.get("ttl_s")
+    if not isinstance(ttl, (int, float)) or ttl <= 0:
+        ttl = _WEBUI_SELFCHECK_DEFAULT_TTL_S
+    if time.time() - checked > ttl:
+        return None
+    status = raw.get("status")
+    if status == "blocked":
+        detail = raw.get("detail") or "no accept rule for tcp/443"
+        return (f"BLOCKED by firewall — {detail}", "bold red")
+    if status == "indeterminate" and int(raw.get("consecutive_indeterminate") or 0) >= 3:
+        return ("firewall self-check unavailable", "yellow")
+    return None
+
+
 def watchdog_expected_services() -> list[str]:
     """Read the supervisor's role-compose.env to discover which
     service containers the watchdog expects to be running.
@@ -2226,6 +2309,7 @@ def overall_verdict(
     state: "DashboardState",
     k3s_state: tuple[str, str] | None = None,
     wd_status: tuple[str, str] | None = None,
+    webui_status: tuple[str, str] | None = None,
 ) -> tuple[str, str]:
     """P0.3 — roll the per-panel signals up into one box-level verdict.
 
@@ -2242,6 +2326,7 @@ def overall_verdict(
       * a red-tier pod: flapping now (``_rst_verdict``) or in a broken
         k8s state — CRITICAL
       * a degraded (failing) host-config plane — CRITICAL
+      * Web UI self-check verdict `blocked` (#779) — CRITICAL
       * k3s unit failed — CRITICAL
       * disk >90% on any mount — CRITICAL
       * k3s not yet ready / starting — DEGRADED
@@ -2265,6 +2350,13 @@ def overall_verdict(
     failing = list(hh.get("failing") or [])  # type: ignore[arg-type]
     if failing:
         return ("CRITICAL", f"host config failing: {failing[0]}")
+    # #779 — the management surface itself is firewalled off. Everything
+    # else on this dashboard can be green while the operator's browser
+    # times out (#776). Style-gated like wd_status below: bold red means
+    # a fresh `blocked` verdict; the yellow persistent-indeterminate note
+    # renders on the identity row but must not flip the box CRITICAL.
+    if webui_status is not None and webui_status[1] == "bold red":
+        return ("CRITICAL", "Web UI blocked by firewall (tcp/443)")
     # Phase 2 INC 3 — etcd quorum. Multi-node only: a single-node etcd is
     # always its own leader (has_leader=1), so this never false-fires on a
     # single-node appliance; an empty state.etcd (sqlite backend) is skipped.
@@ -2390,6 +2482,14 @@ def render_header(
         identity.append(f"https://{webui_host}", style="bold bright_cyan")
     else:
         identity.append("—", style="dim")
+    # #779 — firewall self-check warning, rendered ON the URL it
+    # invalidates (same shape as the #556 CP-reachability chip below).
+    # None in the healthy / hardened / unchecked cases, so this adds
+    # nothing to a green box.
+    webui_check = webui_selfcheck_status()
+    if webui_check is not None:
+        identity.append("  ", style="dim")
+        identity.append(webui_check[0], style=webui_check[1])
     identity.append("   ·   ", style="dim")
     identity.append("IPs ", style="dim")
     if v4_ips:
@@ -2511,7 +2611,9 @@ def render_header(
     # the ``wd_status`` file-stat computed above so overall_verdict adds
     # no subprocess. A red border is visible across a room on a VGA
     # console; uniform cyan never was. (Unchanged from Phase 1.)
-    verdict, offender = overall_verdict(state, state.k3s_state, wd_status)
+    verdict, offender = overall_verdict(
+        state, state.k3s_state, wd_status, webui_selfcheck_status()
+    )
     vglyph, vcolor = _VERDICT_STYLES.get(verdict, ("●", "cyan"))
     if verdict == "HEALTHY":
         title = "[bold]SpatiumDDI[/bold]  [green]● HEALTHY[/green]"
@@ -4851,7 +4953,7 @@ def _render_health_screen(
     ``state`` plus the already-fetched ``events``."""
     console.clear()
     wd = supervisor_watchdog_status() if state.role in ("appliance", "application") else None
-    verdict, offender = overall_verdict(state, state.k3s_state, wd)
+    verdict, offender = overall_verdict(state, state.k3s_state, wd, webui_selfcheck_status())
     vglyph, vcolor = _VERDICT_STYLES.get(verdict, ("●", "cyan"))
     banner = Text()
     banner.append(f" {vglyph} {verdict} ", style=f"bold {vcolor}")

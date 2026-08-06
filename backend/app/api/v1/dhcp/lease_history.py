@@ -23,6 +23,7 @@ from pydantic import BaseModel, field_validator
 from sqlalchemy import String, cast, func, select
 
 from app.api.deps import DB, CurrentUser
+from app.api.pagination import MAX_PAGE
 from app.core.permissions import require_resource_permission
 from app.models.dhcp import DHCPLeaseHistory, DHCPServer
 
@@ -75,7 +76,7 @@ async def list_lease_history(
     ip: str | None = Query(None, description="IP or CIDR — exact / containment match"),
     hostname: str | None = Query(None, description="Hostname substring match"),
     lease_state: str | None = Query(None, description="Filter by lease_state"),
-    page: int = Query(1, ge=1),
+    page: int = Query(1, ge=1, le=MAX_PAGE),
     per_page: int = Query(50, ge=1, le=500),
 ) -> LeaseHistoryPage:
     server = await db.get(DHCPServer, server_id)

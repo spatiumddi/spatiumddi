@@ -1,0 +1,18 @@
+[Unit]
+Description=Recheck Web UI firewall reachability (issue #779)
+Documentation=https://github.com/spatiumddi/spatiumddi/issues/779
+# Don't run in the live installer environment.
+ConditionKernelCommandLine=!boot=live
+
+[Timer]
+# First run shortly after boot (firstboot also runs the check inline for
+# an immediate first verdict; this catches non-first boots), then every
+# 5 min — the supervisor rewrites the drop-in on role/scope changes and
+# the verdict must follow it. /run state resets per boot, so a stale
+# verdict can never outlive the ruleset it described.
+OnBootSec=45s
+OnUnitActiveSec=5min
+Persistent=false
+
+[Install]
+WantedBy=timers.target

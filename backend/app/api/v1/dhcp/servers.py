@@ -12,7 +12,7 @@ from pydantic import BaseModel, field_validator
 from sqlalchemy import String, cast, func, or_, select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
-from app.api.pagination import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, Page, paginate
+from app.api.pagination import DEFAULT_PAGE_SIZE, MAX_PAGE, MAX_PAGE_SIZE, Page, paginate
 from app.api.v1.dhcp._audit import write_audit
 from app.core.agent_wake import (
     collect_wake,
@@ -1408,7 +1408,7 @@ async def list_leases(
     search: str | None = Query(None, description="substring over ip / mac / hostname"),
     state: str | None = Query(None, description="exact lease state filter"),
     device_class: str | None = None,
-    page: int = Query(1, ge=1),
+    page: int = Query(1, ge=1, le=MAX_PAGE),
     page_size: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
 ) -> Page[LeaseResponse]:
     """Leases for a server, server-side paginated (#455), enriched with OUI
