@@ -146,6 +146,15 @@ api:
     # capture needs the mirror-proxy (a tracked follow-up); appliance is
     # single-node so the shared hostPath is correct.
     pcapsDir: /var/lib/spatiumddi/pcaps
+    # Slot detection — the api's slot-status/rollback handlers resolve the
+    # ACTIVE slot from /proc/cmdline + udev's /run/udev/data records and
+    # read the durable default from grubenv (mounted at /boot/efi-host in
+    # the container, like the supervisor). Without these the api reports
+    # current_slot/durable_default as null and refuses rollback (409) on
+    # every appliance, even though the host-side rollback path works.
+    # Both mounts are read-only.
+    runUdevDir: /run/udev
+    bootEfiDir: /boot/efi
 
 # ── Slot-image mirror (#296 Phase B) ────────────────────────────────────────
 # A single-replica Deployment + node-pinned local-path PVC + ClusterIP
