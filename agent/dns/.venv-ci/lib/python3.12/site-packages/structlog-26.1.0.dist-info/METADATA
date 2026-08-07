@@ -1,0 +1,180 @@
+Metadata-Version: 2.4
+Name: structlog
+Version: 26.1.0
+Summary: Structured Logging for Python
+Project-URL: Documentation, https://www.structlog.org/
+Project-URL: Changelog, https://github.com/hynek/structlog/blob/main/CHANGELOG.md
+Project-URL: GitHub, https://github.com/hynek/structlog
+Project-URL: Funding, https://github.com/sponsors/hynek
+Project-URL: Tidelift, https://tidelift.com?utm_source=lifter&utm_medium=referral&utm_campaign=hynek
+Project-URL: Mastodon, https://mastodon.social/@hynek
+Project-URL: Bluesky, https://bsky.app/profile/hynek.me
+Project-URL: Twitter, https://twitter.com/hynek
+Author-email: Hynek Schlawack <hs@ox.cx>
+License-Expression: MIT OR Apache-2.0
+License-File: LICENSE-APACHE
+License-File: LICENSE-MIT
+License-File: NOTICE
+Keywords: log,logging,structure,structured
+Classifier: Development Status :: 5 - Production/Stable
+Classifier: License :: OSI Approved :: Apache Software License
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Programming Language :: Python :: 3.13
+Classifier: Programming Language :: Python :: 3.14
+Classifier: Programming Language :: Python :: 3.15
+Classifier: Topic :: System :: Logging
+Classifier: Typing :: Typed
+Requires-Python: >=3.10
+Requires-Dist: typing-extensions; python_version < '3.11'
+Description-Content-Type: text/markdown
+
+<p align="center">
+    <img
+        src="https://www.structlog.org/en/stable/_static/structlog_logo_small.png"
+        alt="structlog mascot"
+    />
+</p>
+
+*structlog* is *the* production-ready logging solution for Python:
+
+- **Simple**: Everything is about **functions** that take and return **dictionaries** – all hidden behind **familiar APIs**.
+- **Powerful**: Functions and dictionaries aren’t just simple but also powerful.
+  *structlog* leaves *you* in control.
+- **Fast**: *structlog* is not hamstrung by designs of yore.
+  Its flexibility comes not at the price of performance.
+
+Thanks to its flexible design, *you* choose whether you want *structlog* to take care of the **output** of your log entries or whether you prefer to **forward** them to an existing logging system like the standard library's `logging` module.
+
+The output format is just as flexible and *structlog* comes with support for JSON, [*logfmt*](https://brandur.org/logfmt), as well as pretty console output out-of-the-box:
+
+[![Screenshot of colorful structlog output with ConsoleRenderer](https://github.com/hynek/structlog/blob/main/docs/_static/console_renderer.png?raw=true)](https://github.com/hynek/structlog/blob/main/docs/_static/console_renderer.png?raw=true)
+
+
+## Sponsors
+
+*structlog* would not be possible without our [amazing sponsors](https://github.com/sponsors/hynek).
+Especially those generously supporting us at the *The Organization* tier and higher:
+
+<!-- pause-short -->
+
+<p align="center">
+
+<!-- [[[cog
+import pathlib, tomllib
+
+for sponsor in tomllib.loads(pathlib.Path("pyproject.toml").read_text())["tool"]["sponcon"]["sponsors"]:
+      print(f'<a href="{sponsor["url"]}"><img title="{sponsor["title"]}" src="https://www.structlog.org/en/26.1.0/_static/sponsors/{sponsor["img"]}" width="190" /></a>')
+]]] -->
+<a href="https://www.variomedia.de/"><img title="Variomedia AG" src="https://www.structlog.org/en/26.1.0/_static/sponsors/Variomedia.svg" width="190" /></a>
+<a href="https://tidelift.com/?utm_source=lifter&utm_medium=referral&utm_campaign=hynek"><img title="Tidelift" src="https://www.structlog.org/en/26.1.0/_static/sponsors/Tidelift.svg" width="190" /></a>
+<a href="https://kraken.tech/"><img title="Kraken Tech" src="https://www.structlog.org/en/26.1.0/_static/sponsors/Kraken.svg" width="190" /></a>
+<a href="https://privacy-solutions.org/"><img title="Privacy Solutions" src="https://www.structlog.org/en/26.1.0/_static/sponsors/Privacy-Solutions.svg" width="190" /></a>
+<a href="https://klaviyo.com/"><img title="Klaviyo" src="https://www.structlog.org/en/26.1.0/_static/sponsors/Klaviyo.svg" width="190" /></a>
+<a href="https://filepreviews.io/"><img title="FilePreviews" src="https://www.structlog.org/en/26.1.0/_static/sponsors/FilePreviews.svg" width="190" /></a>
+<a href="https://www.testmuai.com/?utm_medium=sponsor&utm_source=structlog"><img title="TestMu AI" src="https://www.structlog.org/en/26.1.0/_static/sponsors/TestMu-AI.svg" width="190" /></a>
+<a href="https://polar.sh/"><img title="Polar" src="https://www.structlog.org/en/26.1.0/_static/sponsors/Polar.svg" width="190" /></a>
+<!-- [[[end]]] -->
+
+</p>
+
+<!-- continue-short -->
+
+<p align="center">
+   <strong>Please consider <a href="https://github.com/sponsors/hynek">joining them</a> to help make <em>structlog</em>’s maintenance more sustainable!</strong>
+</p>
+
+## Introduction
+
+*structlog* has been successfully used in production at every scale since **2013**, while embracing cutting-edge technologies like *asyncio*, context variables, or type hints as they emerged.
+Its paradigms proved influential enough to [help design](https://twitter.com/sirupsen/status/638330548361019392) structured logging [packages across ecosystems](https://github.com/sirupsen/logrus).
+
+## Project Links
+
+- [**Get Help**](https://stackoverflow.com/questions/tagged/structlog) (use the *structlog* tag on Stack Overflow)
+- [**PyPI**](https://pypi.org/project/structlog/)
+- [**GitHub**](https://github.com/hynek/structlog)
+- [**Documentation**](https://www.structlog.org/)
+- [**Changelog**](https://github.com/hynek/structlog/tree/main/CHANGELOG.md)
+- [**Third-party Extensions**](https://github.com/hynek/structlog/wiki/Third-party-Extensions)
+
+
+## *structlog* for Enterprise
+
+Available as part of the [Tidelift Subscription](https://tidelift.com/?utm_source=lifter&utm_medium=referral&utm_campaign=hynek).
+
+The maintainers of *structlog* and thousands of other packages are working with Tidelift to deliver commercial support and maintenance for the open source packages you use to build your applications.
+Save time, reduce risk, and improve code health, while paying the maintainers of the exact packages you use.
+
+
+## Release Information
+
+### Removed
+
+- Python 3.8 and 3.9 support.
+
+
+### Deprecated
+
+- Support for *better-exceptions* is deprecated and will be removed within a year.
+  Use our Rich integration or copy-paste the [one line of code you need](https://github.com/hynek/structlog/blob/2c059a0dc029d9370e1e4a6e9683063205bbb68f/src/structlog/dev.py#L488-L498).
+  [#802](https://github.com/hynek/structlog/pull/802)
+
+
+### Added
+
+- Python 3.15 support.
+  [#813](https://github.com/hynek/structlog/pull/813)
+
+- `structlog.dev.rich_monochrome_traceback` for Rich-based monochrome exception rendering and add support for it throughout `structlog.dev.ConsoleRenderer` when the user asks for no colors.
+  [#794](https://github.com/hynek/structlog/pull/794)
+
+- `structlog.BytesLogger` now has a `name` attribute which allows you to use it with the `structlog.stdlib.add_logger_name()` processor *without* using the standard library integration.
+  [#786](https://github.com/hynek/structlog/pull/786)
+
+- `structlog.processors.CallsiteParameterAdder` now supports `CallsiteParameter.QUAL_MODULE` that adds the qualified import name of the module of the callsite, or `__main__` if the module is the entry point.
+  This is only available for *structlog*-originated events since the standard library has no equivalent (except for the convention of setting the logger's name to `__name__`).
+  [#812](https://github.com/hynek/structlog/pull/812)
+
+- `structlog.stdlib.BoundLogger` now has `is_enabled_for()` and `get_effective_level()` methods that are snake_case aliases for its `isEnabledFor()` and `getEffectiveLevel()` methods.
+  This makes it more compatible with the native `structlog.typing.FilteringBoundLogger`, so you can swap configurations without changing your call sites.
+  [#818](https://github.com/hynek/structlog/pull/818)
+
+
+### Changed
+
+- `structlog.dev.ConsoleRenderer` does not warn anymore when the `exception` key has a rendered value despite having a fancy formatter configured.
+  [#790](https://github.com/hynek/structlog/pull/790)
+
+
+### Fixed
+
+- `structlog.BytesLogger`, `structlog.PrintLogger`, and `structlog.WriteLogger` now hold *weak* references to the files they use for output.
+  This prevents their leakage in long-running processes that open many logfiles, such as task executors that create a per-task `BytesLogger` or `WriteLogger`.
+  [#807](https://github.com/hynek/structlog/pull/807)
+
+- `structlog.WriteLogger` is usable after unpickling.
+  [#787](https://github.com/hynek/structlog/pull/787)
+
+- `structlog.processors.CallsiteParameterAdder` now reports the calling thread's id and name for async log methods, instead of the thread from the executor pool that runs the underlying sync logger.
+  [#710](https://github.com/hynek/structlog/issues/710)
+  [#805](https://github.com/hynek/structlog/pull/805)
+
+
+---
+
+[Full Changelog →](https://www.structlog.org/en/stable/changelog.html)
+
+
+## Credits
+
+*structlog* is written and maintained by [Hynek Schlawack](https://hynek.me/).
+The idea of bound loggers is inspired by previous work by [Jean-Paul Calderone](https://github.com/exarkun) and [David Reid](https://github.com/dreid).
+
+The development is kindly supported by my employer [Variomedia AG](https://www.variomedia.de/), *structlog*’s [Tidelift subscribers](https://tidelift.com/?utm_source=lifter&utm_medium=referral&utm_campaign=hynek), and all my amazing [GitHub Sponsors](https://github.com/sponsors/hynek).
+
+The logs-loving beaver logo has been contributed by [Lynn Root](https://www.roguelynn.com).
+
+

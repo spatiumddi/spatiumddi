@@ -1095,7 +1095,7 @@ class Bind9Driver(DriverBase):
                     "rndc_failed_falling_back_to_sighup", stderr=res.stderr.strip()
                 )
             else:
-                self._reload_rendered_zones(base)
+                self._reload_rendered_zones(base, self._changed_zones(backup))
         if not rndc_ok and self.daemon_pid:
             try:
                 os.kill(self.daemon_pid, signal.SIGHUP)
@@ -1126,7 +1126,40 @@ class Bind9Driver(DriverBase):
                 out.append((entry.name[: -len(".db")], None))
         return out
 
-    def _reload_rendered_zones(self, base: list[str]) -> None:
+    def _changed_zones(self, prev_dir: Path) -> set[tuple[str, str | None]] | None:
+        """Which rendered zones differ from the previous render.
+
+        ``None`` means "cannot tell — reload everything": no previous tree (first
+        render after a cold start), or a read error. Returning the empty set is
+        therefore meaningfully different from ``None`` and must stay that way.
+
+        This is what keeps the reload proportional to the edit. A group with
+        views re-renders on EVERY record change (records are folded into the
+        structural etag there), so reloading the whole tree each time turns one
+        record edit into an rndc freeze/reload/thaw storm across every zone —
+        with the deep test tiers mutating records continuously, that is a real
+        load amplification on an 8-12 GiB appliance, not a theoretical one.
+        Comparing the rendered bytes costs one read per zone and collapses it to
+        the zones that actually moved.
+        """
+        if not prev_dir.exists():
+            return None
+        changed: set[tuple[str, str | None]] = set()
+        try:
+            for zname, view in self.rendered_zone_views():
+                rel = f"zones/{view}/{zname}.db" if view else f"zones/{zname}.db"
+                new_p = self.state_dir / self.rendered_dir_name / rel
+                old_p = prev_dir / rel
+                if not old_p.exists() or new_p.read_bytes() != old_p.read_bytes():
+                    changed.add((zname, view))
+        except OSError:
+            return None
+        return changed
+
+    def _reload_rendered_zones(
+        self, base: list[str],
+        only: set[tuple[str, str | None]] | None = None,
+    ) -> None:
         """Make named re-read the zone files ``reconfig`` just ignored.
 
         Every primary zone we render carries an ``allow-update`` clause — the
@@ -1143,7 +1176,9 @@ class Bind9Driver(DriverBase):
         rest from reloading, and it is already reported through the daemon's
         own status channel.
         """
-        for zname, view in self.rendered_zone_views():
+        all_zones = self.rendered_zone_views()
+        targets = all_zones if only is None else [z for z in all_zones if z in only]
+        for zname, view in targets:
             scope = [zname] + (["in", view] if view else [])
             for verb in ("freeze", "reload", "thaw"):
                 res = subprocess.run(
@@ -1160,7 +1195,8 @@ class Bind9Driver(DriverBase):
                         stderr=res.stderr.strip()[:200],
                     )
         log.info("bind9_rendered_zones_reloaded",
-                 zones=len(self.rendered_zone_views()))
+                 zones=len(targets), of=len(all_zones),
+                 selective=only is not None)
 
     # ── Record ops (RFC 2136 over loopback) ─────────────────────────────────
 
