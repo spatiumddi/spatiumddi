@@ -1759,6 +1759,11 @@ function ServerPoolsOrStaticsTab({
           onConfirm={() => delMut.mutate(delStatic)}
           onClose={() => setDelStatic(null)}
           isPending={delMut.isPending}
+          error={
+            delMut.isError
+              ? formatApiError(delMut.error, "Delete failed")
+              : null
+          }
         />
       )}
     </div>
