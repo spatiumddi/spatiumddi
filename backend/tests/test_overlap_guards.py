@@ -22,7 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.security import create_access_token, hash_password
 from app.models.auth import User
 from app.models.dhcp import DHCPScope, DHCPServer, DHCPServerGroup
-from app.models.dns import DNSRecord, DNSServerGroup
+from app.models.dns import DNSRecord, DNSServerGroup, DNSZone
 from app.models.ipam import IPBlock, IPSpace, Subnet
 from app.services.dhcp.config_bundle import build_config_bundle
 from app.services.dhcp.pull_leases import _find_containing_subnet
@@ -173,6 +173,7 @@ async def test_bundle_ships_one_scope_per_prefix_oldest_wins(
         group_id=grp.id,
         name="older",
         is_active=True,
+        lease_time=1111,
         created_at=datetime(2026, 1, 1, tzinfo=UTC),
     )
     newer = DHCPScope(
@@ -180,16 +181,56 @@ async def test_bundle_ships_one_scope_per_prefix_oldest_wins(
         group_id=grp.id,
         name="newer",
         is_active=True,
+        lease_time=2222,
         created_at=datetime(2026, 6, 1, tzinfo=UTC),
     )
     db_session.add_all([srv, older, newer])
     await db_session.flush()
 
     bundle = await build_config_bundle(db_session, srv)
-    cidrs = [s.subnet_cidr for s in bundle.scopes]
-    assert cidrs.count(CIDR) == 1, cidrs
-    # Oldest scope's subnet is the one shipped.
     assert len(bundle.scopes) == 1
+    # The OLDEST scope survives — the newer one is the interloper.
+    assert bundle.scopes[0].lease_time == 1111
+
+
+@pytest.mark.asyncio
+async def test_bundle_also_drops_overlapping_unequal_prefix(
+    db_session: AsyncSession,
+) -> None:
+    """A resize can produce a partial overlap the API guard never saw; the
+    bundle must not ship both (Kea overlap behavior is not worth gambling
+    the whole config on)."""
+    sub_a = await _space_subnet(db_session)  # /24
+    sub_b = await _space_subnet(db_session, cidr="192.168.1.0/25")
+    grp = DHCPServerGroup(name=f"g-{uuid.uuid4().hex[:6]}")
+    db_session.add(grp)
+    await db_session.flush()
+    srv = DHCPServer(
+        name=f"kea-{uuid.uuid4().hex[:6]}",
+        driver="kea",
+        host="127.0.0.1",
+        port=67,
+        server_group_id=grp.id,
+    )
+    a = DHCPScope(
+        subnet_id=sub_a.id,
+        group_id=grp.id,
+        name="a",
+        is_active=True,
+        created_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    b = DHCPScope(
+        subnet_id=sub_b.id,
+        group_id=grp.id,
+        name="b",
+        is_active=True,
+        created_at=datetime(2026, 6, 1, tzinfo=UTC),
+    )
+    db_session.add_all([srv, a, b])
+    await db_session.flush()
+
+    bundle = await build_config_bundle(db_session, srv)
+    assert [s.subnet_cidr for s in bundle.scopes] == [CIDR]
 
 
 # ── Guard 3: lease→subnet resolution prefers the server's own subnets ───────
@@ -269,12 +310,14 @@ async def test_resolve_reverse_zone_skips_other_space_zone(
 
     # Subnet B resolves DNS through the same group (the MSP misconfig).
     sub_b.dns_group_ids = [str(g.id)]
+    sub_b.dns_inherit_settings = False  # make the subnet-level groups effective
     await db_session.flush()
 
     ip = ipaddress.ip_address("192.168.1.10")
     assert await _resolve_reverse_zone(db_session, sub_b, ip) is None
     # The owning space still resolves its own zone.
     sub_a.dns_group_ids = [str(g.id)]
+    sub_a.dns_inherit_settings = False
     await db_session.flush()
     got = await _resolve_reverse_zone(db_session, sub_a, ip)
     assert got is not None and got.id == zone_a.id
@@ -293,7 +336,10 @@ async def test_ptr_collision_warning_on_manual_record(
     await db_session.flush()
     zone = await ensure_reverse_zone_for_subnet(db_session, sub_a, None, dns_group_id=g.id)
     assert zone is not None
+    fwd = DNSZone(group_id=g.id, name="corp.example.test.", zone_type="primary")
+    db_session.add(fwd)
     sub_a.dns_group_ids = [str(g.id)]
+    sub_a.dns_inherit_settings = False
     db_session.add(
         DNSRecord(
             zone_id=zone.id,
@@ -308,10 +354,52 @@ async def test_ptr_collision_warning_on_manual_record(
     warnings = await _check_ip_collisions(
         db_session,
         hostname="mine",
-        forward_zone_id=None,
+        forward_zone_id=fwd.id,
         mac_address=None,
         subnet=sub_a,
         address="192.168.1.10",
     )
     kinds = [w["kind"] for w in warnings]
     assert "ptr_collision" in kinds, warnings
+
+    # No forward zone → no DNS would publish → the PTR check must not fire.
+    warnings = await _check_ip_collisions(
+        db_session,
+        hostname="mine",
+        forward_zone_id=None,
+        mac_address=None,
+        subnet=sub_a,
+        address="192.168.1.10",
+    )
+    assert warnings == []
+
+
+# ── F1 regression: NON-overlapping subnets may share an aggregated zone ─────
+
+
+@pytest.mark.asyncio
+async def test_non_overlapping_subnets_share_aggregated_zone_across_spaces(
+    db_session: AsyncSession,
+) -> None:
+    """IPv4 reverse zones aggregate to /24, so two disjoint /26es — even in
+    different IP spaces — legitimately share one zone: their PTR names are
+    disjoint and nothing can leak. The cross-space guard must key on CIDR
+    overlap, not on a bare space-id mismatch."""
+    from app.api.v1.ipam.router import _resolve_reverse_zone
+
+    sub_a = await _space_subnet(db_session, cidr="10.1.2.0/26")
+    sub_b = await _space_subnet(db_session, cidr="10.1.2.64/26")
+    g = DNSServerGroup(name=f"dg-{uuid.uuid4().hex[:6]}")
+    db_session.add(g)
+    await db_session.flush()
+
+    zone_a = await ensure_reverse_zone_for_subnet(db_session, sub_a, None, dns_group_id=g.id)
+    assert zone_a is not None
+    zone_b = await ensure_reverse_zone_for_subnet(db_session, sub_b, None, dns_group_id=g.id)
+    assert zone_b is not None and zone_b.id == zone_a.id
+
+    sub_b.dns_group_ids = [str(g.id)]
+    sub_b.dns_inherit_settings = False  # make the subnet-level groups effective
+    await db_session.flush()
+    got = await _resolve_reverse_zone(db_session, sub_b, ipaddress.ip_address("10.1.2.70"))
+    assert got is not None and got.id == zone_a.id

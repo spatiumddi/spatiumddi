@@ -13,6 +13,7 @@ Mirrors ``app.services.dns.config_bundle``.
 
 from __future__ import annotations
 
+import ipaddress
 from datetime import UTC, datetime
 
 import structlog
@@ -48,6 +49,10 @@ from app.services.dhcp.radvd import build_ra_config, render_radvd_conf
 from app.services.feature_modules import is_module_enabled
 
 log = structlog.get_logger(__name__)
+
+# #844 — log-dedupe for the duplicate-prefix drop below (see comment at the
+# call site). Log suppression only — never consulted for logic.
+_dup_prefix_logged: set[tuple[str, str]] = set()
 
 
 async def _resolve_failover(
@@ -203,43 +208,55 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
     # and if two such subnets both carry an active scope in this group the
     # rendered config holds two identical subnet4/subnet6 entries — Kea
     # rejects the WHOLE config at load, taking down every scope on the
-    # server. The API refuses new collisions (create/activate 409 in
-    # scopes.py); this guard keeps a pre-existing or raced-in collision from
-    # reaching agents: ship the oldest scope per prefix, drop the rest, and
-    # log loudly so the operator sees which customer isn't being served.
-    seen_prefix: dict[str, DHCPScope] = {}
-    for sc in scope_rows:
+    # server. Overlapping-but-unequal prefixes (a subnet resize can produce
+    # them — resize has no scope-aware guard) are dropped too, so the last
+    # line of defense is at least as wide as the API guard. The API refuses
+    # new collisions (create/activate 409 in scopes.py); this keeps a
+    # pre-existing or raced-in collision from reaching agents: ship the
+    # oldest scope per overlap cluster, drop the rest, and log so the
+    # operator sees which subnet isn't being served.
+    kept_nets: list[tuple[DHCPScope, ipaddress.IPv4Network | ipaddress.IPv6Network]] = []
+    dropped: list[tuple[DHCPScope, DHCPScope]] = []
+    # Oldest row wins — deterministic across rebuilds, and the newer scope
+    # is the one that slipped in against the API guard.
+    for sc in sorted(
+        scope_rows,
+        key=lambda s: (s.created_at or datetime.max.replace(tzinfo=UTC), str(s.id)),
+    ):
         subnet = subnet_map.get(sc.subnet_id)
         if subnet is None or not subnet.network:
             continue
-        prefix = str(subnet.network)
-        cur = seen_prefix.get(prefix)
-        # Oldest row wins — deterministic across rebuilds, and the newer
-        # scope is the one that slipped in against the API guard.
-        if cur is None or (
-            (sc.created_at or datetime.max.replace(tzinfo=UTC), str(sc.id))
-            < (cur.created_at or datetime.max.replace(tzinfo=UTC), str(cur.id))
-        ):
-            seen_prefix[prefix] = sc
-    dropped = [
-        sc
-        for sc in scope_rows
-        if (subnet := subnet_map.get(sc.subnet_id)) is not None
-        and subnet.network
-        and seen_prefix.get(str(subnet.network)) is not sc
-    ]
+        try:
+            net = ipaddress.ip_network(str(subnet.network), strict=False)
+        except ValueError:
+            continue
+        winner = next(
+            (k for k, knet in kept_nets if knet.version == net.version and knet.overlaps(net)),
+            None,
+        )
+        if winner is None:
+            kept_nets.append((sc, net))
+        else:
+            dropped.append((sc, winner))
     if dropped:
-        for sc in dropped:
-            log.error(
+        for sc, winner in dropped:
+            # This runs inside the agent /config long-poll loop, so an
+            # unfixed pre-existing collision would emit ERROR every wake /
+            # safety tick forever. Error once per pair per process, then
+            # demote to debug. Log suppression only — never drives logic.
+            key = (str(sc.id), str(winner.id))
+            log_fn = log.debug if key in _dup_prefix_logged else log.error
+            _dup_prefix_logged.add(key)
+            log_fn(
                 "dhcp_bundle_duplicate_prefix_dropped",
                 group_id=str(group.id) if group else None,
                 scope_id=str(sc.id),
                 subnet_id=str(sc.subnet_id),
                 prefix=str(subnet_map[sc.subnet_id].network),
-                kept_scope_id=str(seen_prefix[str(subnet_map[sc.subnet_id].network)].id),
-                note="duplicate prefix would make Kea reject the whole config",
+                kept_scope_id=str(winner.id),
+                note="duplicate/overlapping prefix would make Kea reject " "the whole config",
             )
-        dropped_ids = {sc.id for sc in dropped}
+        dropped_ids = {sc.id for sc, _ in dropped}
         scope_rows = [sc for sc in scope_rows if sc.id not in dropped_ids]
 
     scopes: list[ScopeDef] = []

@@ -32,6 +32,29 @@ if TYPE_CHECKING:
 
 logger = structlog.get_logger(__name__)
 
+# #844 — log-dedupe for the cross-space refusal below. The ensure path runs
+# per IP allocation, so an unfixed misconfig would otherwise emit one warning
+# per allocation forever; warn once per (subnet, zone) pair per process, and
+# demote repeats to debug. Log suppression only — never consulted for logic.
+_cross_space_warned: set[tuple[str, str]] = set()
+
+
+def cidrs_overlap(a: object, b: object) -> bool:
+    """True when two CIDR strings are the same address family and overlap.
+
+    #844 uses this instead of a bare space-id comparison: IPv4 reverse zones
+    aggregate to /24 (``compute_reverse_zone_name``), so two NON-overlapping
+    subnets in different spaces legitimately share one reverse zone — their
+    PTR names are disjoint and nothing leaks. Only an actual CIDR overlap
+    can fold two tenants' PTRs onto the same names.
+    """
+    try:
+        na = ipaddress.ip_network(str(a), strict=False)
+        nb = ipaddress.ip_network(str(b), strict=False)
+    except (ValueError, TypeError):
+        return False
+    return na.version == nb.version and na.overlaps(nb)
+
 
 def compute_reverse_zone_name(network: str) -> str:
     """Return the canonical reverse-zone FQDN (with trailing dot) for ``network``.
@@ -156,29 +179,51 @@ async def ensure_reverse_zone_for_subnet(
     )
     existing = existing_q.scalar_one_or_none()
     if existing is not None:
-        # #844 — same CIDR in two IP spaces computes the same reverse zone
-        # name, and the (group_id, view_id, name) unique constraint means a
-        # second zone can't exist. Silently reusing the other space's zone
-        # would merge two tenants' PTRs into one zone (cross-tenant hostname
-        # disclosure), so refuse: this subnet's IPs simply get no PTR until
-        # the operator gives the overlapping space its own DNS group.
+        # #844 — an OVERLAPPING CIDR in another IP space computes the same
+        # reverse zone name, and the (group_id, view_id, name) unique
+        # constraint means a second zone can't exist. Silently reusing the
+        # other space's zone would merge two tenants' PTRs onto the same
+        # names (cross-tenant hostname disclosure), so refuse: this subnet's
+        # IPs simply get no PTR until the operator gives the overlapping
+        # space its own DNS group. Non-overlapping subnets sharing an
+        # aggregated /24 zone (even across spaces) keep working — their PTR
+        # names are disjoint, so there is nothing to leak.
         if existing.linked_subnet_id is not None and existing.linked_subnet_id != subnet.id:
-            linked_space_id = (
+            linked = (
                 await db.execute(
-                    select(Subnet.space_id).where(Subnet.id == existing.linked_subnet_id)
+                    select(Subnet.space_id, Subnet.network).where(
+                        Subnet.id == existing.linked_subnet_id
+                    )
                 )
-            ).scalar_one_or_none()
-            if linked_space_id is not None and linked_space_id != subnet.space_id:
-                logger.warning(
+            ).first()
+            if linked is None:
+                # Dangling link — the owning subnet was deleted but its zone
+                # survived (linked_subnet_id is ondelete=SET NULL on hard
+                # delete, but a stale id can linger). Re-link to the live
+                # subnet so the zone is attributable again instead of
+                # becoming permanently "shared with everyone".
+                existing.linked_subnet_id = subnet.id
+                await db.flush()
+                logger.info(
+                    "reverse_zone_relinked",
+                    zone_id=str(existing.id),
+                    subnet_id=str(subnet.id),
+                    name=reverse_name,
+                )
+            elif linked[0] != subnet.space_id and cidrs_overlap(linked[1], subnet.network):
+                key = (str(subnet.id), str(existing.id))
+                log_fn = logger.debug if key in _cross_space_warned else logger.warning
+                _cross_space_warned.add(key)
+                log_fn(
                     "reverse_zone_cross_space_conflict",
                     subnet_id=str(subnet.id),
                     space_id=str(subnet.space_id),
                     zone_id=str(existing.id),
                     name=reverse_name,
                     linked_subnet_id=str(existing.linked_subnet_id),
-                    note="reverse zone already owned by a subnet in another "
-                    "IP space; refusing to share it — use a separate DNS "
-                    "server group per overlapping IP space (#844)",
+                    note="reverse zone owned by an overlapping subnet in "
+                    "another IP space; refusing to share it — use a separate "
+                    "DNS server group per overlapping IP space (#844)",
                 )
                 return None
         logger.debug(

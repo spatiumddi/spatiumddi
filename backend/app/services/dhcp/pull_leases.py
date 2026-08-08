@@ -215,6 +215,9 @@ async def pull_leases_from_server(
     # resolve a stale lease's owning subnet straight from its scope FK,
     # without an extra query per stale row.
     scope_subnet_ids = {scope_id: subnet_id for subnet_id, scope_id in scope_cache.items()}
+    # #844 — subnet ids this server's group actually serves; hoisted out of
+    # the per-lease loops (rebuilding the set per lease is O(scopes) each).
+    preferred_subnet_ids = set(scope_cache)
 
     now = datetime.now(UTC)
 
@@ -224,7 +227,7 @@ async def pull_leases_from_server(
         if not ip or not mac:
             continue
 
-        containing = _find_containing_subnet(ip, subnets, preferred_subnet_ids=set(scope_cache))
+        containing = _find_containing_subnet(ip, subnets, preferred_subnet_ids=preferred_subnet_ids)
         scope_id = scope_cache.get(containing.id) if containing else None
 
         existing = (
@@ -459,7 +462,7 @@ async def pull_leases_from_server(
         stale_subnet_id = scope_subnet_ids.get(stale.scope_id) if stale.scope_id else None
         if stale_subnet_id is None:
             stale_containing = _find_containing_subnet(
-                stale.ip_address, subnets, preferred_subnet_ids=set(scope_cache)
+                stale.ip_address, subnets, preferred_subnet_ids=preferred_subnet_ids
             )
             stale_subnet_id = stale_containing.id if stale_containing else None
         if apply:
