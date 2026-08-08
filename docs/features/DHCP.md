@@ -948,6 +948,17 @@ rule here has been surfaced to an operator, not just silently logged.
 - **Scope already exists for this group + subnet.** A subnet may host
   at most one scope per server group. `409` at
   `backend/app/api/v1/dhcp/scopes.py`.
+- **Overlapping CIDR from another IP space (#844).** IPAM allows the
+  same CIDR in different IP spaces (VRF semantics), but one Kea server
+  renders one `subnet4`/`subnet6` entry per scope and rejects the whole
+  config at load on a duplicate prefix — an outage for every scope on
+  the group. Creating or *activating* a scope whose subnet overlaps
+  another active scope's subnet in the same group is refused. `409` at
+  `backend/app/api/v1/dhcp/scopes.py`; the bundle build additionally
+  drops any raced-in duplicate (oldest scope wins, logged as
+  `dhcp_bundle_duplicate_prefix_dropped`) so a bad combination can never
+  reach an agent. **Overlapping IP spaces need a separate DHCP server
+  group per space.**
 - **`group_id` required when multiple groups are registered.** If
   more than one DHCP server group is defined, scope-create must name
   one explicitly; single-group deployments can omit the field.

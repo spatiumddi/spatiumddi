@@ -23,12 +23,12 @@ from sqlalchemy import select
 
 from app.models.audit import AuditLog
 from app.models.dns import DNSServerGroup, DNSZone
+from app.models.ipam import Subnet
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
     from app.models.auth import User
-    from app.models.ipam import Subnet
 
 logger = structlog.get_logger(__name__)
 
@@ -156,6 +156,31 @@ async def ensure_reverse_zone_for_subnet(
     )
     existing = existing_q.scalar_one_or_none()
     if existing is not None:
+        # #844 — same CIDR in two IP spaces computes the same reverse zone
+        # name, and the (group_id, view_id, name) unique constraint means a
+        # second zone can't exist. Silently reusing the other space's zone
+        # would merge two tenants' PTRs into one zone (cross-tenant hostname
+        # disclosure), so refuse: this subnet's IPs simply get no PTR until
+        # the operator gives the overlapping space its own DNS group.
+        if existing.linked_subnet_id is not None and existing.linked_subnet_id != subnet.id:
+            linked_space_id = (
+                await db.execute(
+                    select(Subnet.space_id).where(Subnet.id == existing.linked_subnet_id)
+                )
+            ).scalar_one_or_none()
+            if linked_space_id is not None and linked_space_id != subnet.space_id:
+                logger.warning(
+                    "reverse_zone_cross_space_conflict",
+                    subnet_id=str(subnet.id),
+                    space_id=str(subnet.space_id),
+                    zone_id=str(existing.id),
+                    name=reverse_name,
+                    linked_subnet_id=str(existing.linked_subnet_id),
+                    note="reverse zone already owned by a subnet in another "
+                    "IP space; refusing to share it — use a separate DNS "
+                    "server group per overlapping IP space (#844)",
+                )
+                return None
         logger.debug(
             "reverse_zone_already_exists",
             subnet_id=str(subnet.id),

@@ -15,6 +15,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import select
+from sqlalchemy import text as sa_text
 from sqlalchemy.exc import IntegrityError
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
@@ -559,6 +560,64 @@ async def list_scopes_for_group(
     return [_scope_to_response(s) for s in res.unique().scalars().all()]
 
 
+async def _assert_no_overlapping_group_cidr(
+    db: DB,
+    group_id: uuid.UUID,
+    subnet: Subnet,
+    *,
+    exclude_scope_id: uuid.UUID | None = None,
+) -> None:
+    """Refuse a scope whose subnet CIDR overlaps another ACTIVE scope's subnet
+    in the same group (#844).
+
+    IPAM deliberately allows the same CIDR in different IP spaces (VRF
+    semantics), but a Kea server renders one ``subnet4``/``subnet6`` entry per
+    scope and rejects the entire config at load on a duplicate prefix — so two
+    overlapping-space subnets converging on one group takes DHCP down for
+    every scope on that group. Same failure class as the out-of-CIDR
+    reservation guard (#619): refuse at the API instead of shipping a config
+    the daemon will refuse. Overlap within one space is already impossible
+    (IPAM validates), so a hit here means two IP spaces — the fix is a
+    separate DHCP server group per overlapping space.
+
+    Raw SQL for the ``&&`` cidr operator (mirrors the IPAM overlap checks);
+    that bypasses the ORM soft-delete filter, hence the explicit
+    ``deleted_at IS NULL``.
+    """
+    res = await db.execute(
+        sa_text("""
+            SELECT s.network FROM subnet s
+            JOIN dhcp_scope sc ON sc.subnet_id = s.id
+            WHERE sc.group_id = CAST(:gid AS uuid)
+              AND sc.subnet_id != CAST(:sid AS uuid)
+              AND sc.is_active
+              AND sc.deleted_at IS NULL
+              AND s.network && CAST(:net AS cidr)
+              AND (CAST(:excl AS uuid) IS NULL OR sc.id != CAST(:excl AS uuid))
+            LIMIT 1
+            """),
+        {
+            "gid": str(group_id),
+            "sid": str(subnet.id),
+            "net": str(subnet.network),
+            "excl": str(exclude_scope_id) if exclude_scope_id else None,
+        },
+    )
+    row = res.first()
+    if row:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"An active scope in this DHCP server group already covers "
+                f"{row[0]}, which overlaps {subnet.network} (another IP "
+                f"space). Duplicate or overlapping prefixes on one Kea "
+                f"server reject the whole config at load, taking down DHCP "
+                f"for every scope in the group — use a separate DHCP server "
+                f"group per overlapping IP space (#844)."
+            ),
+        )
+
+
 @router.post(
     "/subnets/{subnet_id}/dhcp-scopes",
     response_model=ScopeResponse,
@@ -597,6 +656,11 @@ async def create_scope(
         )
 
     sync_mode = _normalize_sync_mode(body.hostname_sync_mode or body.hostname_to_ipam_sync)
+    # #844 — only an ACTIVE scope reaches the rendered config, so an inactive
+    # create is allowed and the guard re-fires on activation (update_scope).
+    _will_be_active = body.enabled if body.enabled is not None else body.is_active
+    if _will_be_active:
+        await _assert_no_overlapping_group_cidr(db, group_id, subnet)
     if sync_mode not in VALID_SYNC_MODES - {"ipam", "learned"}:
         raise HTTPException(status_code=422, detail=f"invalid hostname sync mode: {sync_mode}")
     # Same alias resolution as update: ``enabled`` wins when supplied, and
@@ -743,6 +807,15 @@ async def update_scope(
         # Family must match the scope's (subnet-derived) address_family;
         # address_family itself is immutable on update (#337).
         _validate_relay_family(changes["relay_addresses"], scope.address_family or "ipv4")
+    # #844 — activation is the other door into the rendered config: a scope
+    # created inactive (or deactivated to dodge the create-time guard) must
+    # pass the same overlapping-CIDR check before it starts rendering.
+    if changes.get("is_active") is True and not scope.is_active:
+        subnet = await db.get(Subnet, scope.subnet_id)
+        if subnet is not None:
+            await _assert_no_overlapping_group_cidr(
+                db, scope.group_id, subnet, exclude_scope_id=scope.id
+            )
     for k, v in changes.items():
         setattr(scope, k, v)
     await db.flush()
