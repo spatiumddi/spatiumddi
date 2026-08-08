@@ -25,8 +25,13 @@ FortiGate device + VDOM):
 
 The write unit is the **whole DHCP-server object per scope**: any
 scope/pool/static/option edit rebuilds the full desired object and PUTs it
-(create-if-absent). This makes "replace-all per interface" atomic. The
-interface name is the natural key — one DHCP server per interface.
+(create-if-absent). The interface name is the natural key — one DHCP server
+per interface. FortiOS applies a parent PUT to child tables **per entry
+id**, not as an atomic replace, so before an update PUT the driver pins
+each child entry to the id it already holds on the device and issues
+explicit child-endpoint DELETEs for removed entries (see
+``_reconcile_child_ids``) — without that, deleting a non-last reservation
+renumbers the table mid-apply and FortiOS aborts partway, scrambling it.
 
 **Ownership (#630).** So the driver never silently overwrites or deletes a
 DHCP server the operator hand-managed on the FortiGate, the control plane
@@ -105,6 +110,38 @@ _OPTIONS_HANDLED_ELSEWHERE: frozenset[str] = frozenset(
         "broadcast-address",
     }
 )
+
+# Child tables of ``system.dhcp.server`` whose entry ``id``s must stay STABLE
+# across pushes, mapped to the content key that identifies an entry across
+# renumbering. FortiOS applies a parent PUT per child ``id`` — it is not an
+# atomic replace — so if a delete shifts every later entry down one id, the
+# update of id k to id k+1's old content transiently collides with the entry
+# still sitting at id k+1 (duplicate MAC / overlapping range), FortiOS aborts
+# partway, and the table is left scrambled: the *wrong* reservations vanish
+# and the API returns an error. Keying each entry to the id it already holds
+# on the device makes every push a pure per-entry upsert; removals are issued
+# as explicit child-endpoint DELETEs (see ``_reconcile_child_ids``).
+_CHILD_TABLE_KEYS: dict[str, Any] = {
+    "reserved-address": lambda e: _norm_mac(e.get("mac")),
+    "ip-range": lambda e: (str(e.get("start-ip") or ""), str(e.get("end-ip") or "")),
+    "exclude-range": lambda e: (str(e.get("start-ip") or ""), str(e.get("end-ip") or "")),
+    "options": lambda e: e.get("code"),
+}
+
+# Stale-entry deletes run in this order so no transient state violates a
+# FortiOS cross-table constraint (an exclude-range must lie within an
+# ip-range, so excludes go before the ranges they depend on).
+_CHILD_TABLE_DELETE_ORDER: tuple[str, ...] = (
+    "exclude-range",
+    "reserved-address",
+    "options",
+    "ip-range",
+)
+
+
+def _norm_mac(value: Any) -> str:
+    """Canonicalise a MAC for cross-system comparison (lowercase, no separators)."""
+    return "".join(c for c in str(value or "").lower() if c in "0123456789abcdef")
 
 
 def _as_list(value: Any) -> list[str]:
@@ -409,9 +446,14 @@ class FortiGateDHCPDriver(AgentlessDHCPDriverBase):
         # the API silently store the reserved ``ip`` as ``0.0.0.0`` (verified
         # live on 7.4.12; a ``{type, ip, mac}`` body stores the IP correctly,
         # adding ``action`` zeroes it). ``assign`` is the default action
-        # anyway, so omitting it yields the intended reservation. A
-        # whole-object PUT with this list fully replaces the reserved-address
-        # table (stale rows are dropped), so replace-all holds.
+        # anyway, so omitting it yields the intended reservation.
+        #
+        # The positional ids assigned here are provisional: before an update
+        # PUT, ``_reconcile_child_ids`` rewrites them to match the ids already
+        # on the device (keyed by MAC) and issues explicit deletes for removed
+        # entries — FortiOS applies a parent PUT per child id, not as an
+        # atomic table replace, so shifting ids on a delete scrambles the
+        # table (see ``_CHILD_TABLE_KEYS``).
         reserved: list[dict[str, Any]] = []
         for i, st in enumerate(scope.statics, start=1):
             reserved.append(
@@ -496,13 +538,6 @@ class FortiGateDHCPDriver(AgentlessDHCPDriverBase):
                 return srv if isinstance(srv, dict) else None
         return None
 
-    async def _find_server_id(self, client: httpx.AsyncClient, interface: str) -> int | None:
-        """Return the mkey of the DHCP-server object on ``interface``, or None."""
-        srv = await self._find_server(client, interface)
-        if srv is None:
-            return None
-        return self._coerce_mkey(srv.get("id"))
-
     @staticmethod
     def _coerce_mkey(raw: Any) -> int | None:
         """Best-effort int() of a FortiOS mkey field; None on missing/garbage."""
@@ -534,24 +569,25 @@ class FortiGateDHCPDriver(AgentlessDHCPDriverBase):
         async with self._client(server, creds) as client:
             interface = await self._match_interface(client, scope.subnet_cidr)
             body = self._build_server_body(interface, scope)
-            existing_id = await self._find_server_id(client, interface)
+            existing = await self._find_server(client, interface)
+            existing_id = self._coerce_mkey(existing.get("id")) if existing else None
             owned_mkey = self._mkey_of(provider_ref)
 
             if owned_mkey is not None:
                 # This scope+server already owns an object on this interface.
                 # Overwriting it is safe. If it was deleted out from under us,
                 # recreate; otherwise PUT the object that's actually there.
-                target = existing_id if existing_id is not None else None
-                if target is None:
+                if existing_id is None or existing is None:
                     resp = await client.post("/cmdb/system.dhcp/server", json=body)
                     new_id = self._new_mkey(resp)
                     return {"mkey": new_id, "interface": interface}
-                resp = await client.put(f"/cmdb/system.dhcp/server/{target}", json=body)
+                await self._reconcile_child_ids(client, existing_id, existing, body)
+                resp = await client.put(f"/cmdb/system.dhcp/server/{existing_id}", json=body)
                 self._unwrap(resp)
-                return {"mkey": target, "interface": interface}
+                return {"mkey": existing_id, "interface": interface}
 
             # We hold no ownership marker for this interface.
-            if existing_id is None:
+            if existing_id is None or existing is None:
                 # Nothing here — create it and claim ownership.
                 resp = await client.post("/cmdb/system.dhcp/server", json=body)
                 new_id = self._new_mkey(resp)
@@ -572,9 +608,72 @@ class FortiGateDHCPDriver(AgentlessDHCPDriverBase):
                 interface=interface,
                 mkey=existing_id,
             )
+            await self._reconcile_child_ids(client, existing_id, existing, body)
             resp = await client.put(f"/cmdb/system.dhcp/server/{existing_id}", json=body)
             self._unwrap(resp)
             return {"mkey": existing_id, "interface": interface}
+
+    async def _reconcile_child_ids(
+        self,
+        client: httpx.AsyncClient,
+        mkey: int,
+        existing: dict[str, Any],
+        body: dict[str, Any],
+    ) -> None:
+        """Make an update PUT safe: stable child ids + explicit stale deletes.
+
+        FortiOS applies a parent PUT to each child table **per entry id**, not
+        as an atomic replace. The positional ids ``_build_server_body`` assigns
+        therefore break deletion: removing a non-last entry shifts every later
+        entry onto a different id, the per-id update transiently duplicates a
+        MAC (or overlaps a range) that still exists at the next id, and FortiOS
+        aborts mid-apply — the wrong entries end up deleted and the API errors
+        out. (Observed live on 7.4.x; deleting the highest-id entry shifts
+        nothing, which is why it only failed *sometimes*.)
+
+        For each managed child table this rewrites the desired entries' ids to
+        the id the same logical entry (matched by ``_CHILD_TABLE_KEYS``)
+        already holds on the device, assigns fresh ids above every id in play
+        to genuinely new entries, and explicitly ``DELETE``s device entries
+        that are no longer desired via the child endpoint — which removes them
+        correctly regardless of whether the firmware treats the parent PUT as
+        replace or merge. A failed stale delete with FortiOS "entry not found"
+        (HTTP 404) is tolerated as already-gone.
+        """
+        for table in _CHILD_TABLE_DELETE_ORDER:
+            key_of = _CHILD_TABLE_KEYS[table]
+            current = [e for e in (existing.get(table) or []) if isinstance(e, dict)]
+            desired = list(body.get(table) or [])
+
+            current_by_key: dict[Any, int] = {}
+            for entry in current:
+                cur_id = self._coerce_mkey(entry.get("id"))
+                if cur_id is None:
+                    continue
+                # Duplicate keys on the device (residue of a previously
+                # scrambled table) — keep the first, the rest become stale.
+                current_by_key.setdefault(key_of(entry), cur_id)
+
+            used_ids = {
+                cur_id
+                for entry in current
+                if (cur_id := self._coerce_mkey(entry.get("id"))) is not None
+            }
+            kept_ids: set[int] = set()
+            next_id = max(used_ids, default=0)
+            for entry in desired:
+                cur_id = current_by_key.get(key_of(entry))
+                if cur_id is not None and cur_id not in kept_ids:
+                    entry["id"] = cur_id
+                    kept_ids.add(cur_id)
+                else:
+                    next_id += 1
+                    entry["id"] = next_id
+
+            for stale_id in sorted(used_ids - kept_ids):
+                resp = await client.delete(f"/cmdb/system.dhcp/server/{mkey}/{table}/{stale_id}")
+                if resp.status_code != 404:
+                    self._unwrap(resp)
 
     def _new_mkey(self, resp: httpx.Response) -> int | None:
         """Extract the mkey FortiOS assigned to a freshly-POSTed object."""

@@ -353,6 +353,191 @@ async def test_apply_scope_adopts_when_opted_in(monkeypatch: pytest.MonkeyPatch)
     assert ref == {"mkey": 7, "interface": "port2"}
 
 
+# ── Child-table id stability on update (reservation-delete scramble) ─────
+#
+# FortiOS applies a parent PUT per child entry id, NOT as an atomic table
+# replace. If a delete renumbers the surviving entries (positional ids), the
+# per-id update transiently duplicates a MAC still present at the next id and
+# FortiOS aborts mid-apply — the wrong reservations vanish and the API errors.
+# The driver must pin surviving entries to the ids they already hold on the
+# device and delete removed entries via the child endpoint.
+
+
+def _existing_srv_obj() -> dict[str, Any]:
+    return {
+        "id": 7,
+        "interface": "port2",
+        "reserved-address": [
+            {"id": 1, "type": "mac", "ip": "192.168.20.50", "mac": "00:11:22:33:44:55"},
+            {"id": 2, "type": "mac", "ip": "192.168.20.51", "mac": "aa:aa:aa:aa:aa:02"},
+            {"id": 3, "type": "mac", "ip": "192.168.20.52", "mac": "aa:aa:aa:aa:aa:03"},
+        ],
+        "ip-range": [{"id": 1, "start-ip": "192.168.20.100", "end-ip": "192.168.20.200"}],
+        "exclude-range": [{"id": 1, "start-ip": "192.168.20.150", "end-ip": "192.168.20.160"}],
+        "options": [],
+    }
+
+
+def _scope_with_statics(*statics: StaticAssignmentDef) -> ScopeDef:
+    return ScopeDef(
+        subnet_cidr="192.168.20.0/24",
+        lease_time=3600,
+        is_active=True,
+        pools=(
+            PoolDef("192.168.20.100", "192.168.20.200", "dynamic"),
+            PoolDef("192.168.20.150", "192.168.20.160", "excluded"),
+        ),
+        statics=statics,
+    )
+
+
+async def test_update_deletes_stale_reservation_and_keeps_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Deleting the MIDDLE reservation must not renumber the survivors: the
+    device entry is removed via the child endpoint and the kept entries ride
+    the PUT under the exact ids they already hold on the FortiGate."""
+    fake = _FakeClient(
+        {
+            "get": [
+                _ok([_iface("port2", "192.168.20.1", "255.255.255.0")]),
+                _ok([_existing_srv_obj()]),
+            ],
+            "delete": [_write_ok(7)],
+            "put": [_write_ok(7)],
+        }
+    )
+    driver = _patch(monkeypatch, fake)
+    scope = _scope_with_statics(
+        StaticAssignmentDef("192.168.20.50", "00:11:22:33:44:55", "printer"),
+        StaticAssignmentDef("192.168.20.52", "aa:aa:aa:aa:aa:03", "cam"),
+    )
+    await driver._apply_scope(
+        _server(), _CREDS, scope, provider_ref={"mkey": 7, "interface": "port2"}
+    )
+    deletes = [c["path"] for c in fake.calls if c["method"] == "delete"]
+    assert deletes == ["/cmdb/system.dhcp/server/7/reserved-address/2"]
+    put = next(c for c in fake.calls if c["method"] == "put")
+    by_mac = {e["mac"]: e["id"] for e in put["json"]["reserved-address"]}
+    assert by_mac == {"00:11:22:33:44:55": 1, "aa:aa:aa:aa:aa:03": 3}
+
+
+async def test_update_assigns_new_ids_above_device_max(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A genuinely new reservation gets an id above every id in play on the
+    device, so it can never collide with an entry pending deletion."""
+    fake = _FakeClient(
+        {
+            "get": [
+                _ok([_iface("port2", "192.168.20.1", "255.255.255.0")]),
+                _ok([_existing_srv_obj()]),
+            ],
+            "put": [_write_ok(7)],
+        }
+    )
+    driver = _patch(monkeypatch, fake)
+    scope = _scope_with_statics(
+        StaticAssignmentDef("192.168.20.50", "00:11:22:33:44:55", "printer"),
+        StaticAssignmentDef("192.168.20.51", "aa:aa:aa:aa:aa:02", "ap"),
+        StaticAssignmentDef("192.168.20.52", "aa:aa:aa:aa:aa:03", "cam"),
+        StaticAssignmentDef("192.168.20.53", "bb:bb:bb:bb:bb:04", "nas"),
+    )
+    await driver._apply_scope(
+        _server(), _CREDS, scope, provider_ref={"mkey": 7, "interface": "port2"}
+    )
+    assert not any(c["method"] == "delete" for c in fake.calls)
+    put = next(c for c in fake.calls if c["method"] == "put")
+    by_mac = {e["mac"]: e["id"] for e in put["json"]["reserved-address"]}
+    assert by_mac["00:11:22:33:44:55"] == 1
+    assert by_mac["aa:aa:aa:aa:aa:02"] == 2
+    assert by_mac["aa:aa:aa:aa:aa:03"] == 3
+    assert by_mac["bb:bb:bb:bb:bb:04"] == 4
+
+
+async def test_update_stale_delete_404_is_tolerated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale child entry already gone on the device (404) must not fail the
+    push — the desired end state holds either way."""
+    fake = _FakeClient(
+        {
+            "get": [
+                _ok([_iface("port2", "192.168.20.1", "255.255.255.0")]),
+                _ok([_existing_srv_obj()]),
+            ],
+            "delete": [_FakeResponse(404, {"status": "error", "error": -3})],
+            "put": [_write_ok(7)],
+        }
+    )
+    driver = _patch(monkeypatch, fake)
+    scope = _scope_with_statics(
+        StaticAssignmentDef("192.168.20.50", "00:11:22:33:44:55", "printer"),
+        StaticAssignmentDef("192.168.20.52", "aa:aa:aa:aa:aa:03", "cam"),
+    )
+    await driver._apply_scope(
+        _server(), _CREDS, scope, provider_ref={"mkey": 7, "interface": "port2"}
+    )
+    assert any(c["method"] == "put" for c in fake.calls)
+
+
+async def test_update_removed_pool_deletes_excludes_before_ranges(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Dropping a dynamic pool deletes its dependent exclude-range entry
+    before the ip-range entry (FortiOS requires excludes to lie inside a
+    range, so the reverse order can be rejected mid-flight)."""
+    fake = _FakeClient(
+        {
+            "get": [
+                _ok([_iface("port2", "192.168.20.1", "255.255.255.0")]),
+                _ok([_existing_srv_obj()]),
+            ],
+            "delete": [_write_ok(7), _write_ok(7)],
+            "put": [_write_ok(7)],
+        }
+    )
+    driver = _patch(monkeypatch, fake)
+    scope = ScopeDef(
+        subnet_cidr="192.168.20.0/24",
+        lease_time=3600,
+        is_active=True,
+        pools=(),
+        statics=(
+            StaticAssignmentDef("192.168.20.50", "00:11:22:33:44:55", "printer"),
+            StaticAssignmentDef("192.168.20.51", "aa:aa:aa:aa:aa:02", "ap"),
+            StaticAssignmentDef("192.168.20.52", "aa:aa:aa:aa:aa:03", "cam"),
+        ),
+    )
+    await driver._apply_scope(
+        _server(), _CREDS, scope, provider_ref={"mkey": 7, "interface": "port2"}
+    )
+    deletes = [c["path"] for c in fake.calls if c["method"] == "delete"]
+    assert deletes == [
+        "/cmdb/system.dhcp/server/7/exclude-range/1",
+        "/cmdb/system.dhcp/server/7/ip-range/1",
+    ]
+
+
+async def test_create_keeps_positional_ids(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A fresh POST (no object on the interface) has no device ids to pin to —
+    the positional ids from the body builder ship as-is and no child deletes
+    are issued."""
+    fake = _FakeClient(
+        {
+            "get": [
+                _ok([_iface("port2", "192.168.20.1", "255.255.255.0")]),
+                _ok([]),
+            ],
+            "post": [_write_ok(9)],
+        }
+    )
+    driver = _patch(monkeypatch, fake)
+    ref = await driver._apply_scope(_server(), _CREDS, _full_scope())
+    assert ref == {"mkey": 9, "interface": "port2"}
+    assert not any(c["method"] == "delete" for c in fake.calls)
+
+
 async def test_remove_scope_deletes_owned(monkeypatch: pytest.MonkeyPatch) -> None:
     """With a recorded mkey we delete that exact object (no interface lookup)."""
     fake = _FakeClient({"delete": [_write_ok(7)]})
