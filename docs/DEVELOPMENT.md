@@ -313,7 +313,10 @@ than it saves.
 ### Nightly builds
 
 [`.github/workflows/nightly.yml`](../.github/workflows/nightly.yml) builds
-and publishes every image from `main` at 02:23 UTC. It exists because
+and publishes every image from `main` at **02:23 America/New_York** (the
+team works Eastern evenings, so the nightly runs after the late pushes —
+two UTC crons plus a wall-clock gate keep that true across DST). It exists
+because
 nothing else builds the *release* image except a release — which is how
 [#732](https://github.com/spatiumddi/spatiumddi/issues/732) shipped an api
 image carrying pytest as root, undetected until the next release cut it.
@@ -338,11 +341,17 @@ pulling `:nightly` never sees the rest.
 
 A run is **skipped entirely when `main` has not moved** since the last
 nightly, so the seven tags cover seven *changed* days rather than seven
-calendar days. The last built commit is recorded as `built-from:` in the
-body of the reused `nightly` pre-release, which is also where the appliance
-ISO will be published once that lands (deferred — see the workflow header
-for why). A failing nightly opens or comments on a single reused tracking
-issue rather than one per night.
+calendar days.
+
+Each nightly also publishes a **pre-release tagged `nightly-YYYY.MM.DD`**
+(CalVer date, prefixed so it can never match `release.yml`'s bare-CalVer
+tag trigger), carrying that build's appliance ISO + slot-upgrade image and
+a `built-from:` line recording the exact commit. Pre-releases older than
+**7 days** are deleted automatically, git tag included, so the Releases
+page shows at most a week of dated nightlies alongside the real releases
+(`prune-release-assets.sh` skips `nightly-*` — the nightly owns its own
+retention). A failing nightly opens or comments on a single reused
+tracking issue rather than one per night.
 
 `workflow_dispatch` takes `force` (build anyway) and `dry_run` (build and
 scan, push and prune nothing).
