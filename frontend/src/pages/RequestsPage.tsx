@@ -21,13 +21,14 @@
  * That means the form fields ARE the server's contract: adding a field to an
  * operation surfaces it here with no frontend change, and the two can't drift.
  */
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   authApi,
   requestsApi,
   type ChangeRequestState,
   type ProvisioningRequest,
+  type ResourceOptionsResponse,
   type RequestKind,
   type RequestKindId,
 } from "@/lib/api";
@@ -139,6 +140,9 @@ type FieldSpec = {
   type: string;
   required: boolean;
   enum?: string[];
+  // #759 — RBAC resource_type of the resource this field references
+  // (server-annotated via x-resource); drives the searchable picker.
+  resource?: string;
 };
 
 /**
@@ -172,8 +176,126 @@ function fieldsFrom(kind: RequestKind): FieldSpec[] {
       type,
       required: required.has(name),
       enum: Array.isArray(spec.enum) ? (spec.enum as string[]) : undefined,
+      resource:
+        typeof spec["x-resource"] === "string"
+          ? (spec["x-resource"] as string)
+          : undefined,
     };
   });
+}
+
+/**
+ * Searchable, permission-filtered picker for an `x-resource` field (#759).
+ *
+ * Backed by `/requests/resource-options`, which returns only rows the caller
+ * holds a read grant for — the raw admin list endpoints would leak the whole
+ * estate to a Requester. Server-side search + capped results, so a mature
+ * install's hundreds of subnets/zones never render as one giant <select>.
+ * The submitted value is the UUID; the user only ever sees labels.
+ */
+function ResourcePicker({
+  resource,
+  value,
+  onChange,
+}: {
+  resource: string;
+  value: string;
+  onChange: (id: string) => void;
+}) {
+  const [search, setSearch] = useState("");
+  const [debounced, setDebounced] = useState("");
+  const [open, setOpen] = useState(false);
+  const [selectedLabel, setSelectedLabel] = useState<string | null>(null);
+
+  useEffect(() => {
+    const t = setTimeout(() => setDebounced(search), 250);
+    return () => clearTimeout(t);
+  }, [search]);
+
+  const { data, isFetching } = useQuery<ResourceOptionsResponse>({
+    queryKey: ["resource-options", resource, debounced],
+    queryFn: () => requestsApi.resourceOptions(resource, debounced),
+    enabled: open,
+    staleTime: 30_000,
+  });
+  const options = data?.options ?? [];
+
+  if (value && selectedLabel) {
+    return (
+      <div className="flex w-full min-w-0 items-center gap-1.5 rounded-md border border-border bg-background px-2 py-1.5 text-sm">
+        <span className="truncate">{selectedLabel}</span>
+        <button
+          type="button"
+          aria-label="Clear selection"
+          className="ml-auto shrink-0 text-muted-foreground hover:text-foreground"
+          onClick={() => {
+            onChange("");
+            setSelectedLabel(null);
+            setSearch("");
+          }}
+        >
+          ✕
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="relative">
+      <input
+        className="w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm"
+        placeholder="Type to search…"
+        value={search}
+        onChange={(e) => {
+          setSearch(e.target.value);
+          setOpen(true);
+        }}
+        onFocus={() => setOpen(true)}
+        onBlur={() => setTimeout(() => setOpen(false), 150)}
+      />
+      {open ? (
+        <div className="absolute z-50 mt-1 max-h-56 w-full overflow-y-auto rounded-md border border-border bg-background shadow-lg">
+          {options.length === 0 ? (
+            <div className="px-2 py-1.5 text-xs text-muted-foreground">
+              {isFetching
+                ? "Searching…"
+                : data?.truncated
+                  ? "Large list — keep typing to narrow the search"
+                  : "No matches you can read"}
+            </div>
+          ) : (
+            options.map((o) => (
+              <button
+                type="button"
+                key={o.id}
+                className="block w-full px-2 py-1.5 text-left text-sm hover:bg-muted"
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => {
+                  onChange(o.id);
+                  setSelectedLabel(
+                    o.sublabel ? `${o.label} — ${o.sublabel}` : o.label,
+                  );
+                  setOpen(false);
+                }}
+              >
+                <span>{o.label}</span>
+                {o.sublabel ? (
+                  <span className="ml-1.5 text-xs text-muted-foreground">
+                    {o.sublabel}
+                  </span>
+                ) : null}
+              </button>
+            ))
+          )}
+          {options.length > 0 && data?.truncated ? (
+            <div className="border-t border-border px-2 py-1 text-[11px] text-muted-foreground">
+              More may exist — keep typing to narrow
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  );
 }
 
 function NewRequestModal({
@@ -265,7 +387,15 @@ function NewRequestModal({
                     <span className="ml-0.5 text-rose-500">*</span>
                   ) : null}
                 </label>
-                {f.enum ? (
+                {f.resource ? (
+                  <ResourcePicker
+                    resource={f.resource}
+                    value={values[f.name] ?? ""}
+                    onChange={(id) =>
+                      setValues((v) => ({ ...v, [f.name]: id }))
+                    }
+                  />
+                ) : f.enum ? (
                   <select
                     className="w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm"
                     value={values[f.name] ?? ""}

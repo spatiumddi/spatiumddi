@@ -181,7 +181,14 @@ def expires_at_default() -> datetime:
 class CreateIPAddressArgs(BaseModel):
     """Args for the ``create_ip_address`` operation."""
 
-    subnet_id: str = Field(description="UUID of the subnet to create the address in")
+    subnet_id: str = Field(
+        description="UUID of the subnet to create the address in",
+        # #759 — marks this as a resource reference. The requests portal
+        # renders a permission-filtered picker off this annotation (the value
+        # is the RBAC resource_type), and MCP clients learn it's a reference,
+        # not an opaque string.
+        json_schema_extra={"x-resource": "subnet"},
+    )
     address: str = Field(description="The IP address as a string (e.g. 10.0.5.10)")
     status: str = Field(
         default="allocated",
@@ -1528,7 +1535,11 @@ register(
 class AllocateSubnetArgs(BaseModel):
     """Args for the ``allocate_subnet`` operation."""
 
-    block_id: str = Field(description="UUID of the parent IP block to carve the subnet from")
+    block_id: str = Field(
+        description="UUID of the parent IP block to carve the subnet from",
+        # #759 — resource reference; see CreateIPAddressArgs.subnet_id.
+        json_schema_extra={"x-resource": "ip_block"},
+    )
     prefix_len: int = Field(
         ge=1,
         le=128,
@@ -1904,7 +1915,11 @@ _DNS_RECORD_TYPES = {
 class CreateDNSRecordArgs(BaseModel):
     """Args for the ``create_dns_record`` operation."""
 
-    zone_id: str = Field(description="UUID of the parent DNS zone.")
+    zone_id: str = Field(
+        description="UUID of the parent DNS zone.",
+        # #759 — resource reference; see CreateIPAddressArgs.subnet_id.
+        json_schema_extra={"x-resource": "dns_zone"},
+    )
     name: str = Field(
         description=(
             "Relative record name. Use ``@`` for the zone apex. Do NOT "
@@ -2565,7 +2580,11 @@ register(
 class CreateDHCPStaticArgs(BaseModel):
     """Args for the ``create_dhcp_static`` operation."""
 
-    scope_id: str = Field(description="UUID of the parent DHCP scope.")
+    scope_id: str = Field(
+        description="UUID of the parent DHCP scope.",
+        # #759 — resource reference; see CreateIPAddressArgs.subnet_id.
+        json_schema_extra={"x-resource": "dhcp_scope"},
+    )
     ip_address: str = Field(description="IP to reserve (must fall inside the scope).")
     mac_address: str = Field(description="MAC address (any standard format).")
     hostname: str | None = Field(default=None, description="Optional hostname.")

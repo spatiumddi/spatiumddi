@@ -833,6 +833,7 @@ async def agent_lease_events(
     from app.models.ipam import IPAddress
     from app.services.dhcp.pull_leases import (
         _find_containing_subnet,
+        _load_scope_cache,
         _load_subnet_cache,
     )
     from app.services.feature_modules import is_module_enabled
@@ -854,6 +855,25 @@ async def agent_lease_events(
     # ingestion path, up to 100 events/POST). Three queries total instead
     # of ~3 per event. ──────────────────────────────────────────────────
     ips = list({ev.ip_address for ev in events})
+
+    # Resolve subnets once (Python longest-prefix match, no per-IP SQL),
+    # BEFORE the lease upsert so new rows get their scope FK stamped. #844:
+    # prefer subnets actually scoped to this server's group — IPAM allows the
+    # same CIDR in different IP spaces, and an unranked longest-prefix match
+    # would mirror every customer's leases into one arbitrary space's subnet
+    # (and fire DDNS into the wrong customer's zone). The IPAM mirror is
+    # keyed by (subnet_id, address) below, which only disambiguates once the
+    # subnet itself is resolved correctly.
+    subnets = await _load_subnet_cache(db)
+    scope_cache = await _load_scope_cache(db, server.server_group_id)
+    subnet_for_ip = {
+        ip: _find_containing_subnet(ip, subnets, preferred_subnet_ids=set(scope_cache))
+        for ip in ips
+    }
+
+    def _scope_for_ip(ip: str) -> Any:
+        subnet = subnet_for_ip.get(ip)
+        return scope_cache.get(subnet.id) if subnet is not None else None
 
     existing_leases = (
         (
@@ -895,6 +915,10 @@ async def agent_lease_events(
                 ends_at=ev.ends_at,
                 expires_at=expires_at,
                 last_seen_at=now,
+                # #844 — wire the scope FK at ingestion so downstream
+                # consumers (lease cleanup, mirror scoping) never have to
+                # fall back to the space-ambiguous CIDR match.
+                scope_id=_scope_for_ip(ev.ip_address),
             )
             db.add(lease)
             lease_by_key[key] = lease
@@ -907,14 +931,15 @@ async def agent_lease_events(
             lease.ends_at = ev.ends_at
             lease.expires_at = expires_at
             lease.last_seen_at = now
+            if lease.scope_id is None:
+                # Backfill legacy rows created before scope stamping (#844).
+                lease.scope_id = _scope_for_ip(ev.ip_address)
         upserted += 1
     await db.flush()
 
-    # Resolve subnets once (Python longest-prefix match, no per-IP SQL) and
-    # bulk-load the existing IPAM mirror rows. Keyed by (subnet_id, address)
-    # so overlapping ranges across spaces stay disambiguated.
-    subnets = await _load_subnet_cache(db)
-    subnet_for_ip = {ip: _find_containing_subnet(ip, subnets) for ip in ips}
+    # Bulk-load the existing IPAM mirror rows. Keyed by (subnet_id, address)
+    # so overlapping ranges across spaces stay disambiguated (subnets were
+    # resolved space-aware above).
     ipam_existing = (
         (await db.execute(select(IPAddress).where(IPAddress.address.in_(ips)))).scalars().all()
     )
@@ -1110,7 +1135,11 @@ async def agent_mac_sightings(
     server-side until the operator arms the feature.
     """
     from app.models.ipam import IPAddress
-    from app.services.dhcp.pull_leases import _find_containing_subnet, _load_subnet_cache
+    from app.services.dhcp.pull_leases import (
+        _find_containing_subnet,
+        _load_scope_cache,
+        _load_subnet_cache,
+    )
     from app.services.feature_modules import is_module_enabled
 
     server, _ = auth
@@ -1124,6 +1153,9 @@ async def agent_mac_sightings(
 
     now = datetime.now(UTC)
     subnets = await _load_subnet_cache(db)
+    # #844 — prefer this server's own scoped subnets over an equal prefix
+    # from an unrelated IP space (same ambiguity as the lease-event path).
+    sighting_preferred = set(await _load_scope_cache(db, server.server_group_id))
     ips = list({s.ip_address for s in body.sightings})
     existing = (
         (await db.execute(select(IPAddress).where(IPAddress.address.in_(ips)))).scalars().all()
@@ -1133,7 +1165,9 @@ async def agent_mac_sightings(
     # (ipam_row, mac) pairs to classify after the flush assigns new-row ids.
     to_observe: list[tuple[IPAddress, str]] = []
     for s in body.sightings:
-        subnet = _find_containing_subnet(s.ip_address, subnets)
+        subnet = _find_containing_subnet(
+            s.ip_address, subnets, preferred_subnet_ids=sighting_preferred
+        )
         if subnet is None:
             continue
         row = by_key.get((subnet.id, s.ip_address))

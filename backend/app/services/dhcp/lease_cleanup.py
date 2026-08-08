@@ -81,8 +81,11 @@ async def _resolve_lease_subnet_id(
     own subnet so expiring one subnet's lease can't drop another's
     mirror. Prefer the lease's scope FK (DHCPScope.subnet_id); fall back
     to longest-prefix match over ``subnet_cache`` when the lease has no
-    scope backlink. The sweep passes a cache loaded ONCE per run; the
-    single-lease delete path leaves it None and we load it on demand.
+    scope backlink. Both ingestion paths now stamp ``scope_id`` (Windows
+    pull always did; Kea lease-events since #844), so the space-ambiguous
+    CIDR fallback only covers legacy rows and shrinks as they refresh.
+    The sweep passes a cache loaded ONCE per run; the single-lease delete
+    path leaves it None and we load it on demand.
     """
     if lease.scope_id is not None:
         subnet_id = (

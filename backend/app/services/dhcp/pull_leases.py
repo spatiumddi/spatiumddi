@@ -215,6 +215,9 @@ async def pull_leases_from_server(
     # resolve a stale lease's owning subnet straight from its scope FK,
     # without an extra query per stale row.
     scope_subnet_ids = {scope_id: subnet_id for subnet_id, scope_id in scope_cache.items()}
+    # #844 — subnet ids this server's group actually serves; hoisted out of
+    # the per-lease loops (rebuilding the set per lease is O(scopes) each).
+    preferred_subnet_ids = set(scope_cache)
 
     now = datetime.now(UTC)
 
@@ -224,7 +227,7 @@ async def pull_leases_from_server(
         if not ip or not mac:
             continue
 
-        containing = _find_containing_subnet(ip, subnets)
+        containing = _find_containing_subnet(ip, subnets, preferred_subnet_ids=preferred_subnet_ids)
         scope_id = scope_cache.get(containing.id) if containing else None
 
         existing = (
@@ -458,7 +461,9 @@ async def pull_leases_from_server(
         # lease's scope FK when present, else longest-prefix match.
         stale_subnet_id = scope_subnet_ids.get(stale.scope_id) if stale.scope_id else None
         if stale_subnet_id is None:
-            stale_containing = _find_containing_subnet(stale.ip_address, subnets)
+            stale_containing = _find_containing_subnet(
+                stale.ip_address, subnets, preferred_subnet_ids=preferred_subnet_ids
+            )
             stale_subnet_id = stale_containing.id if stale_containing else None
         if apply:
             # Shared teardown: revoke DDNS (best-effort) → delete the
@@ -533,20 +538,34 @@ async def _load_scope_cache(db: AsyncSession, group_id: Any) -> dict[Any, Any]:
 
 
 def _find_containing_subnet(
-    ip: str, subnets: list[tuple[Subnet, ipaddress._BaseNetwork]]
+    ip: str,
+    subnets: list[tuple[Subnet, ipaddress._BaseNetwork]],
+    preferred_subnet_ids: set[Any] | None = None,
 ) -> Subnet | None:
+    """Longest-prefix match of ``ip`` over ``subnets``.
+
+    ``preferred_subnet_ids`` (#844) carries the subnet ids actually scoped to
+    the requesting server's group. IPAM allows the same CIDR in different IP
+    spaces (VRF semantics), so a bare longest-prefix over ALL subnets is
+    ambiguous on an MSP install — whichever space's row came back first would
+    swallow every customer's leases. A subnet the server actually serves
+    outranks any equal-or-longer prefix from an unrelated space; the global
+    match stays as the fallback for leases in ranges the group has no scope
+    for. Remaining ties break on subnet id so resolution is at least
+    deterministic across runs.
+    """
     try:
         addr = ipaddress.ip_address(ip)
     except (ValueError, TypeError):
         return None
-    # Longest-prefix wins if multiple subnets nest (shouldn't in IPAM,
-    # but defensively).
-    best: tuple[int, Subnet] | None = None
+    best: tuple[int, int, str, Subnet] | None = None
     for subnet, net in subnets:
         if addr in net:
-            if best is None or net.prefixlen > best[0]:
-                best = (net.prefixlen, subnet)
-    return best[1] if best else None
+            rank = 1 if preferred_subnet_ids and subnet.id in preferred_subnet_ids else 0
+            key = (rank, net.prefixlen, str(subnet.id))
+            if best is None or key > (best[0], best[1], best[2]):
+                best = (rank, net.prefixlen, str(subnet.id), subnet)
+    return best[3] if best else None
 
 
 async def _upsert_scope(

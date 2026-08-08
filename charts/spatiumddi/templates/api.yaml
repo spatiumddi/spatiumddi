@@ -55,6 +55,16 @@ spec:
               containerPort: 8000
           env:
             {{- include "spatiumddi.commonEnv" . | nindent 12 }}
+            # The node this replica runs on. The api Deployment scales to
+            # the control-plane node count under hard anti-affinity, so on a
+            # cluster there is one api pod per node — and several appliance
+            # endpoints read node-local hostPath mounts. Without this the
+            # pod cannot say which host its answer describes, and the caller
+            # cannot either. Same downward-API shape the supervisor uses.
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
             {{- if .Values.frontend.controlPlaneVIP }}
             # #272 Phase 6 — the self-signed cert bootstrap adds the
             # control-plane VIP to the cert SANs (and regenerates an
