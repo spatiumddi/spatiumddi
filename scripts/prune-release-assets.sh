@@ -112,6 +112,19 @@ for line in "${RELEASES[@]}"; do
     tag="${line%%$'\t'*}"
     is_latest="${line##*$'\t'}"
 
+    # Nightly pre-releases are NOT this sweep's problem: nightly.yml's own
+    # prune-releases job deletes the whole release (assets, tag and all)
+    # after 7 days. They must also not consume keep-window index slots —
+    # up to 7 of them sit newest-first at any time, and counting them
+    # would silently shrink the real releases' asset window from
+    # KEEP_VERSIONED to KEEP_VERSIONED-7.
+    case "$tag" in
+        nightly | nightly-*)
+            echo "  [--] ${tag} — nightly pre-release: skipped (nightly.yml owns its retention)"
+            continue
+            ;;
+    esac
+
     # release-time race guard: the freshly-published tag IS (about to be)
     # latest; treat it as latest regardless of isLatest propagation lag so
     # its generic /latest/-backing assets are never Tier-1 pruned.
