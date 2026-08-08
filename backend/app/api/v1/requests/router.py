@@ -6,6 +6,11 @@ they cannot do themselves, an approver reviews it with the operation's own
 preview in front of them, and approving **executes the provisioning**.
 
 * ``GET  /catalog`` — what may be asked for (the allow-list + arg schemas).
+* ``GET  /resource-options`` — permission-filtered typeahead options for the
+  ``x-resource`` reference fields in those schemas (#759). No matching MCP
+  tool on purpose: the Copilot already has the full ``find_*`` read tools for
+  these resources — this endpoint exists only to narrow them to the caller's
+  read grants for the portal form (explicit NN #13 decision).
 * ``POST /`` — submit a request. Needs ``create,provisioning_request``; does
   **not** need the underlying operation's permission, which is the entire
   point (see ``services/requests/service.py``).
@@ -33,8 +38,11 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request, status
+from fastapi import APIRouter, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
+from sqlalchemy import String, or_, select
+from sqlalchemy import cast as sa_cast
+from sqlalchemy.sql import Select
 
 from app.api.deps import DB, CurrentUser
 from app.core.permissions import (
@@ -45,6 +53,9 @@ from app.core.permissions import (
 )
 from app.models.auth import User
 from app.models.change_request import ChangeRequest
+from app.models.dhcp import DHCPScope
+from app.models.dns import DNSView, DNSZone
+from app.models.ipam import IPBlock, Subnet
 from app.services.approvals.service import (
     ChangeRequestStateError,
     DecisionError,
@@ -204,6 +215,193 @@ async def _load_visible(
     ):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
     return cr
+
+
+# ── Resource picker (issue #759) ───────────────────────────────────────────
+#
+# Typeahead options for the resource-reference fields (``x-resource`` in the
+# catalog arg schemas). The submit path deliberately does not require the
+# underlying operation's permission, so a picker naively backed by the admin
+# list endpoints would hand a Requester the complete estate inventory —
+# resources they hold no read grant for, from the one screen designed for
+# people without grants. Every candidate row is therefore individually
+# filtered through ``user_has_permission(read, <type>, <id>)``; the
+# ``x-resource`` value IS the RBAC resource_type, so there is one vocabulary
+# and no mapping table to drift. This is the issue's primary acceptance
+# criterion, not an optimization.
+
+_PICKER_PAGE = 200  # rows fetched per scan page
+_PICKER_SCAN_CAP = 2000  # bound the per-request work for narrow grants
+_PICKER_MAX = 50
+
+
+class ResourceOption(BaseModel):
+    id: str
+    label: str
+    sublabel: str | None = None
+
+
+class ResourceOptionsResponse(BaseModel):
+    options: list[ResourceOption]
+    # True when the permission scan hit its cap before filling ``limit`` —
+    # the caller's readable rows may exist beyond the scanned window, so the
+    # UI should say "keep typing to narrow" rather than "no matches".
+    truncated: bool
+
+
+def _like(q: str) -> str:
+    """``%<q>%`` with ILIKE metacharacters escaped so the user searches
+    literally — ``_``-led zone names are routine in AD estates."""
+    escaped = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
+def _subnet_query(q: str) -> Select:
+    # The id tiebreaker matters: none of these sort keys are unique (the same
+    # CIDR is legal in two IP spaces), and the scan re-executes the query per
+    # page — without a total order, a readable row straddling a page boundary
+    # can be skipped or duplicated between executions.
+    stmt = select(Subnet).order_by(Subnet.network, Subnet.id)
+    if q:
+        like = _like(q)
+        stmt = stmt.where(or_(Subnet.name.ilike(like), sa_cast(Subnet.network, String).ilike(like)))
+    return stmt
+
+
+def _subnet_option(row: object) -> ResourceOption:
+    sub = row[0]  # type: ignore[index]
+    return ResourceOption(id=str(sub.id), label=str(sub.network), sublabel=sub.name or None)
+
+
+def _block_query(q: str) -> Select:
+    stmt = select(IPBlock).order_by(IPBlock.network, IPBlock.id)
+    if q:
+        like = _like(q)
+        stmt = stmt.where(
+            or_(IPBlock.name.ilike(like), sa_cast(IPBlock.network, String).ilike(like))
+        )
+    return stmt
+
+
+def _block_option(row: object) -> ResourceOption:
+    blk = row[0]  # type: ignore[index]
+    return ResourceOption(id=str(blk.id), label=str(blk.network), sublabel=blk.name or None)
+
+
+def _zone_query(q: str) -> Select:
+    # Primary zones only — records can only be created in zones the control
+    # plane authors; offering a secondary/forward zone would produce a request
+    # whose approval can only fail.
+    # The same zone name legitimately exists per view (split-horizon), so
+    # join the view for a disambiguating sublabel and tiebreak on id.
+    stmt = (
+        select(DNSZone, DNSView.name)
+        .outerjoin(DNSView, DNSView.id == DNSZone.view_id)
+        .where(DNSZone.zone_type == "primary")
+        .order_by(DNSZone.name, DNSZone.id)
+    )
+    if q:
+        stmt = stmt.where(DNSZone.name.ilike(_like(q)))
+    return stmt
+
+
+def _zone_option(row: object) -> ResourceOption:
+    zone = row[0]  # type: ignore[index]
+    view_name = row[1]  # type: ignore[index]
+    parts = [p for p in (view_name, "reverse" if zone.kind == "reverse" else None) if p]
+    return ResourceOption(
+        id=str(zone.id),
+        label=zone.name,
+        sublabel=" · ".join(parts) or None,
+    )
+
+
+def _scope_query(q: str) -> Select:
+    # Active scopes only — a reservation in a deactivated scope would never
+    # serve. The subnet join supplies the range for the label.
+    stmt = (
+        select(DHCPScope, Subnet.network)
+        .join(Subnet, Subnet.id == DHCPScope.subnet_id)
+        .where(DHCPScope.is_active.is_(True))
+        .order_by(Subnet.network, DHCPScope.id)
+    )
+    if q:
+        like = _like(q)
+        stmt = stmt.where(
+            or_(DHCPScope.name.ilike(like), sa_cast(Subnet.network, String).ilike(like))
+        )
+    return stmt
+
+
+def _scope_option(row: Any) -> ResourceOption:
+    scope: DHCPScope = row[0]
+    network = row[1]
+    return ResourceOption(
+        id=str(scope.id),
+        label=scope.name or str(network),
+        sublabel=str(network) if scope.name else None,
+    )
+
+
+# resource → (query builder, RBAC resource_type, row → option). The key is the
+# exact ``x-resource`` value the arg schemas carry.
+_RESOURCE_PICKERS: dict[str, tuple] = {
+    "subnet": (_subnet_query, "subnet", _subnet_option),
+    "ip_block": (_block_query, "ip_block", _block_option),
+    "dns_zone": (_zone_query, "dns_zone", _zone_option),
+    "dhcp_scope": (_scope_query, "dhcp_scope", _scope_option),
+}
+
+
+@router.get("/resource-options", response_model=ResourceOptionsResponse)
+async def resource_options(
+    db: DB,
+    current_user: CurrentUser,
+    resource: str,
+    q: str = Query(default="", max_length=200),
+    limit: int = Query(default=20, ge=1, le=_PICKER_MAX),
+) -> ResourceOptionsResponse:
+    """Permission-filtered typeahead options for one ``x-resource`` field.
+
+    Requires submit permission (like ``/catalog`` — the picker exists to fill
+    the request form), and returns only rows the caller holds a ``read`` grant
+    for. Scans candidates in pages so a caller with narrow per-resource grants
+    still fills their ``limit`` when the first page happens to contain none of
+    their rows; the scan is capped so a huge estate can't turn one keystroke
+    into a full-table permission sweep.
+    """
+    _require_submit(current_user)
+    picker = _RESOURCE_PICKERS.get(resource)
+    if picker is None:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown resource {resource!r} — expected one of "
+            f"{sorted(_RESOURCE_PICKERS)}",
+        )
+    query_fn, rtype, to_option = picker
+    out: list[ResourceOption] = []
+    offset = 0
+    exhausted = False
+    while len(out) < limit and offset < _PICKER_SCAN_CAP:
+        rows = (await db.execute(query_fn(q).offset(offset).limit(_PICKER_PAGE))).all()
+        if not rows:
+            exhausted = True
+            break
+        offset += len(rows)
+        for row in rows:
+            rid = row[0].id
+            if not user_has_permission(current_user, "read", rtype, rid):
+                continue
+            out.append(to_option(row))
+            if len(out) >= limit:
+                break
+        if len(rows) < _PICKER_PAGE:
+            exhausted = True
+            break
+    # ``truncated`` = the caller's readable rows may exist beyond the scanned
+    # window (cap hit, or limit filled with candidates left) — the UI shows
+    # "keep typing to narrow" instead of a dead-end "no matches".
+    return ResourceOptionsResponse(options=out, truncated=not exhausted and len(out) < limit)
 
 
 # ── Catalog ────────────────────────────────────────────────────────────────
