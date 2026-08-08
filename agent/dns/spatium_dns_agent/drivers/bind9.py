@@ -1097,9 +1097,20 @@ class Bind9Driver(DriverBase):
             else:
                 self._reload_rendered_zones(base, self._changed_zones(backup))
         if not rndc_ok and self.daemon_pid:
+            # Degraded path: SIGHUP is a config + zone reload, and like a
+            # plain reload it does NOT re-read a dynamic zone's file — and
+            # without rndc there is no freeze/thaw to force it. So on this
+            # path the split-horizon record-propagation fix above does not
+            # apply and re-rendered record changes may not be served until
+            # named restarts. Log it as such rather than as a clean apply.
             try:
                 os.kill(self.daemon_pid, signal.SIGHUP)
-                log.info("named_sighup_sent", pid=self.daemon_pid)
+                log.warning(
+                    "named_sighup_sent_record_propagation_degraded",
+                    pid=self.daemon_pid,
+                    note="SIGHUP does not re-read dynamic zone files; "
+                    "rendered record changes may not be served",
+                )
             except OSError as e:
                 log.error("named_sighup_failed", error=str(e))
 
@@ -1157,7 +1168,8 @@ class Bind9Driver(DriverBase):
         return changed
 
     def _reload_rendered_zones(
-        self, base: list[str],
+        self,
+        base: list[str],
         only: set[tuple[str, str | None]] | None = None,
     ) -> None:
         """Make named re-read the zone files ``reconfig`` just ignored.
@@ -1175,6 +1187,26 @@ class Bind9Driver(DriverBase):
         Best-effort by design: a zone that will not reload must not stop the
         rest from reloading, and it is already reported through the daemon's
         own status channel.
+
+        Two known subtleties, recorded so nobody chases them as bugs:
+
+        * **Journal-dirty flat zones.** ``freeze`` syncs the journal into the
+          master file — i.e. it overwrites the fresh render with named's
+          in-memory zone before ``reload`` reads it back. Views groups (the
+          case this fix exists for) never journal, so it is moot there. For a
+          flat zone with RFC 2136 activity it means the render does not truly
+          land (no regression — ``reconfig`` never read it either, and DB and
+          journal converge through the record-op path), and the clobbered
+          on-disk file no longer byte-matches render output, so that zone
+          diffs as "changed" on every later structural render and reloads
+          each time. Harmless: flat structural renders are infrequent.
+        * **DNSSEC inline-signed zones.** ``freeze``/``thaw`` semantics for
+          inline-signed dynamic zones vary across BIND versions (older ones
+          refuse, or do not re-read the raw zone on thaw). A failure here
+          only logs ``bind9_zone_reload_failed`` — for a signed zone that is
+          the same "rendered but never served" symptom this fix removes for
+          unsigned ones. Untested interaction; if it bites, the fix likely
+          belongs next to the ``inline-signing`` rendering, not here.
         """
         all_zones = self.rendered_zone_views()
         targets = all_zones if only is None else [z for z in all_zones if z in only]
@@ -1194,9 +1226,12 @@ class Bind9Driver(DriverBase):
                         view=view,
                         stderr=res.stderr.strip()[:200],
                     )
-        log.info("bind9_rendered_zones_reloaded",
-                 zones=len(targets), of=len(all_zones),
-                 selective=only is not None)
+        log.info(
+            "bind9_rendered_zones_reloaded",
+            zones=len(targets),
+            of=len(all_zones),
+            selective=only is not None,
+        )
 
     # ── Record ops (RFC 2136 over loopback) ─────────────────────────────────
 
@@ -1478,7 +1513,9 @@ class Bind9Driver(DriverBase):
                     note="did not spawn a second daemon",
                 )
                 return
-            self.daemon_pid = subprocess.Popen(["named", "-f", "-c", str(conf_path)]).pid
+            self.daemon_pid = subprocess.Popen(
+                ["named", "-f", "-c", str(conf_path)]
+            ).pid
             wait_for_daemon("named", self.daemon_pid)
         log.info("named_started", pid=self.daemon_pid)
 

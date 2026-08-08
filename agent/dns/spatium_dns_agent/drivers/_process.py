@@ -5,16 +5,19 @@ call ``start_daemon()`` from two places — ``supervisor.py`` at boot and
 the config-apply path — with only ``daemon_running()`` between them and
 a duplicate spawn.
 
-**The exact trigger is not fully established.** An earlier version of
-this docstring blamed a second driver object; that is wrong —
-``supervisor.run()`` builds exactly one driver and hands that same
-object to the sync loop. What was observed on a real agent is two
-``named_started`` events 118 ms apart from one process, which most
-plausibly means the boot-path daemon had not yet been reflected in
-``daemon_pid`` (or had already exited) when the first config apply ran
-its check. Whatever the precise race, the fix is the same and does not
-depend on knowing it: consult the system rather than instance state
-before spawning.
+**The trigger is now established** (root-caused live on a QA appliance,
+2026-08-06; two ``named_started`` events 118 ms apart from one process):
+:func:`find_running_daemon` matches on ``/proc/<pid>/comm``, and between
+``Popen([...])`` returning and the child completing ``execve`` the new
+process still carries the *forking* program's name — so a concurrent
+caller looking for the daemon sees nothing and spawns a second one. An
+earlier version of this docstring blamed a second driver object; that
+is wrong — ``supervisor.run()`` builds exactly one driver and hands
+that same object to the sync loop. The system look-up is therefore
+necessary (instance state can be stale) but not sufficient:
+:func:`spawn_guard` serialises check-and-spawn under an exclusive
+flock, and :func:`wait_for_daemon` keeps that lock held until the child
+is visible under its own name, so the window has no interior.
 
 The two failure modes look nothing alike, which is why this went
 unnoticed for so long:
@@ -42,6 +45,10 @@ import fcntl
 import os
 import time
 from collections.abc import Iterator
+
+import structlog
+
+log = structlog.get_logger(__name__)
 
 
 def is_zombie(pid: str) -> bool:
@@ -103,8 +110,8 @@ def spawn_guard(state_dir, name: str) -> Iterator[None]:
     ``Popen(["named", ...])`` returning and the child completing ``execve``,
     the new process is still named after the FORKING program, so a concurrent
     caller looking for ``named`` sees nothing and spawns a second one. That is
-    precisely the 118 ms window this module's docstring describes as "not
-    fully established", and it still fires — observed live on a QA appliance
+    precisely the 118 ms window between the two ``named_started`` events in
+    the module docstring, and it still fires — observed live on a QA appliance
     2026-08-06 with two ``named`` processes (pids 14 and 24), same parent,
     same config, both holding :53 and :953 under SO_REUSEPORT, which made
     every subsequent ``rndc`` a coin flip between one daemon holding the
@@ -120,19 +127,27 @@ def spawn_guard(state_dir, name: str) -> Iterator[None]:
         fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
         fcntl.flock(fd, fcntl.LOCK_EX)
     except OSError as exc:
-        # No writable state dir / no flock (some sandboxes). Fall back to the
-        # unguarded path, which is the pre-existing behaviour.
-        if exc.errno not in (errno.EACCES, errno.EPERM, errno.EROFS, errno.ENOSYS):
-            raise
+        # No writable / missing state dir, or no flock (some sandboxes). Fall
+        # back to the unguarded path, which is the pre-existing behaviour.
         if fd is not None:
             os.close(fd)
         fd = None
+        if exc.errno not in (
+            errno.EACCES,
+            errno.EPERM,
+            errno.ENOENT,
+            errno.EROFS,
+            errno.ENOSYS,
+        ):
+            raise
     try:
         yield
     finally:
         if fd is not None:
+            # Closing the fd releases the flock; no explicit LOCK_UN needed
+            # (and pairing them under one suppress could leak the fd if the
+            # unlock ever raised first).
             with contextlib.suppress(OSError):
-                fcntl.flock(fd, fcntl.LOCK_UN)
                 os.close(fd)
 
 
@@ -152,3 +167,9 @@ def wait_for_daemon(comm: str, pid: int, timeout_s: float = 5.0) -> None:
         except OSError:
             return  # exited, or not Linux — nothing to wait for
         time.sleep(0.02)
+    # Returning here means the spawn lock is released while the child may
+    # still be pre-execve — the race window technically reopens. Should not
+    # happen in practice; make it diagnosable if it ever does.
+    log.warning(
+        "daemon_spawn_visibility_timeout", comm=comm, pid=pid, timeout_s=timeout_s
+    )
