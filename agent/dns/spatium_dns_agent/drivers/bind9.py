@@ -30,7 +30,12 @@ try:
 except ImportError:  # pragma: no cover - runtime-optional
     dns = None  # type: ignore[assignment]
 
-from ._process import find_running_daemon, is_zombie
+from ._process import (
+    find_running_daemon,
+    is_zombie,
+    spawn_guard,
+    wait_for_daemon,
+)
 from .base import RRSET_OP_KINDS, DriverBase
 
 log = structlog.get_logger(__name__)
@@ -1063,23 +1068,170 @@ class Bind9Driver(DriverBase):
         # fall back to SIGHUP which named handles as a config + zone reload.
         rndc_ok = False
         if shutil.which("rndc"):
-            cmd = ["rndc"]
-            agent_conf = self.state_dir / "rndc.conf"
-            if agent_conf.exists():
-                cmd += ["-c", str(agent_conf)]
-            cmd.append("reconfig")
-            res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            base = self._rndc_base()
+            # ``reconfig`` picks up config changes and zones that were ADDED or
+            # REMOVED — but by BIND's documented definition it "does not reload
+            # existing zone files even if they have changed". That was fine
+            # while a record edit rode the RFC 2136 path. Under split-horizon
+            # (issue #24) it is not: the control plane deliberately stops
+            # dispatching record ops for a group with views — an nsupdate to
+            # loopback cannot target a view — and propagates record changes by
+            # RE-RENDERING the zone file instead
+            # (backend/app/services/dns/agent_config.py, has_views branch).
+            # ``reconfig`` never reads that file back, so on any group with a
+            # view every record created after the zone's first load was written
+            # to disk and never served: the API returned 201 and the wire
+            # answered NXDOMAIN forever. Proven live on a 3-node QA rig
+            # 2026-08-06 — the record was present in
+            # rendered/zones/<view>/<zone>.db while dig returned NXDOMAIN, and
+            # the zone's own ``rndc zonestatus`` still showed the serial and
+            # node count from the previous load.
+            res = subprocess.run(
+                [*base, "reconfig"], capture_output=True, text=True, check=False
+            )
             rndc_ok = res.returncode == 0
             if not rndc_ok:
                 log.warning(
                     "rndc_failed_falling_back_to_sighup", stderr=res.stderr.strip()
                 )
+            else:
+                self._reload_rendered_zones(base, self._changed_zones(backup))
         if not rndc_ok and self.daemon_pid:
+            # Degraded path: SIGHUP is a config + zone reload, and like a
+            # plain reload it does NOT re-read a dynamic zone's file — and
+            # without rndc there is no freeze/thaw to force it. So on this
+            # path the split-horizon record-propagation fix above does not
+            # apply and re-rendered record changes may not be served until
+            # named restarts. Log it as such rather than as a clean apply.
             try:
                 os.kill(self.daemon_pid, signal.SIGHUP)
-                log.info("named_sighup_sent", pid=self.daemon_pid)
+                log.warning(
+                    "named_sighup_sent_record_propagation_degraded",
+                    pid=self.daemon_pid,
+                    note="SIGHUP does not re-read dynamic zone files; "
+                    "rendered record changes may not be served",
+                )
             except OSError as e:
                 log.error("named_sighup_failed", error=str(e))
+
+    def rendered_zone_views(self) -> list[tuple[str, str | None]]:
+        """``(zone_name, view_name)`` for every zone file we just rendered.
+
+        Read back off the rendered tree rather than threaded down from
+        ``render()`` so it cannot drift from what is actually on disk — the
+        layout is ``rendered/zones/<view>/<zone>.db`` under split-horizon and
+        ``rendered/zones/<zone>.db`` without views, which is exactly the
+        ``file_prefix`` contract ``_zone_stanza`` writes.
+        """
+        root = self.state_dir / self.rendered_dir_name / "zones"
+        out: list[tuple[str, str | None]] = []
+        try:
+            entries = sorted(root.iterdir())
+        except OSError:
+            return out
+        for entry in entries:
+            if entry.is_dir():
+                for zf in sorted(entry.glob("*.db")):
+                    out.append((zf.name[: -len(".db")], entry.name))
+            elif entry.name.endswith(".db"):
+                out.append((entry.name[: -len(".db")], None))
+        return out
+
+    def _changed_zones(self, prev_dir: Path) -> set[tuple[str, str | None]] | None:
+        """Which rendered zones differ from the previous render.
+
+        ``None`` means "cannot tell — reload everything": no previous tree (first
+        render after a cold start), or a read error. Returning the empty set is
+        therefore meaningfully different from ``None`` and must stay that way.
+
+        This is what keeps the reload proportional to the edit. A group with
+        views re-renders on EVERY record change (records are folded into the
+        structural etag there), so reloading the whole tree each time turns one
+        record edit into an rndc freeze/reload/thaw storm across every zone —
+        with the deep test tiers mutating records continuously, that is a real
+        load amplification on an 8-12 GiB appliance, not a theoretical one.
+        Comparing the rendered bytes costs one read per zone and collapses it to
+        the zones that actually moved.
+        """
+        if not prev_dir.exists():
+            return None
+        changed: set[tuple[str, str | None]] = set()
+        try:
+            for zname, view in self.rendered_zone_views():
+                rel = f"zones/{view}/{zname}.db" if view else f"zones/{zname}.db"
+                new_p = self.state_dir / self.rendered_dir_name / rel
+                old_p = prev_dir / rel
+                if not old_p.exists() or new_p.read_bytes() != old_p.read_bytes():
+                    changed.add((zname, view))
+        except OSError:
+            return None
+        return changed
+
+    def _reload_rendered_zones(
+        self,
+        base: list[str],
+        only: set[tuple[str, str | None]] | None = None,
+    ) -> None:
+        """Make named re-read the zone files ``reconfig`` just ignored.
+
+        Every primary zone we render carries an ``allow-update`` clause — the
+        group's loopback TSIG grant is ALWAYS included so control-plane record
+        ops can flow (see ``_render_allow_update``), which makes the zone
+        DYNAMIC as far as named is concerned. named will not re-read a dynamic
+        zone's file on a plain reload, because doing so would silently discard
+        journal contents; it has to be frozen first. So: freeze → reload →
+        thaw, per zone, per view. ``freeze``/``thaw`` fail harmlessly on a zone
+        that is not dynamic, and the plain ``reload`` covers that case, so one
+        sequence is correct for both.
+
+        Best-effort by design: a zone that will not reload must not stop the
+        rest from reloading, and it is already reported through the daemon's
+        own status channel.
+
+        Two known subtleties, recorded so nobody chases them as bugs:
+
+        * **Journal-dirty flat zones.** ``freeze`` syncs the journal into the
+          master file — i.e. it overwrites the fresh render with named's
+          in-memory zone before ``reload`` reads it back. Views groups (the
+          case this fix exists for) never journal, so it is moot there. For a
+          flat zone with RFC 2136 activity it means the render does not truly
+          land (no regression — ``reconfig`` never read it either, and DB and
+          journal converge through the record-op path), and the clobbered
+          on-disk file no longer byte-matches render output, so that zone
+          diffs as "changed" on every later structural render and reloads
+          each time. Harmless: flat structural renders are infrequent.
+        * **DNSSEC inline-signed zones.** ``freeze``/``thaw`` semantics for
+          inline-signed dynamic zones vary across BIND versions (older ones
+          refuse, or do not re-read the raw zone on thaw). A failure here
+          only logs ``bind9_zone_reload_failed`` — for a signed zone that is
+          the same "rendered but never served" symptom this fix removes for
+          unsigned ones. Untested interaction; if it bites, the fix likely
+          belongs next to the ``inline-signing`` rendering, not here.
+        """
+        all_zones = self.rendered_zone_views()
+        targets = all_zones if only is None else [z for z in all_zones if z in only]
+        for zname, view in targets:
+            scope = [zname] + (["in", view] if view else [])
+            for verb in ("freeze", "reload", "thaw"):
+                res = subprocess.run(
+                    [*base, verb, *scope],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if res.returncode != 0 and verb == "reload":
+                    log.warning(
+                        "bind9_zone_reload_failed",
+                        zone=zname,
+                        view=view,
+                        stderr=res.stderr.strip()[:200],
+                    )
+        log.info(
+            "bind9_rendered_zones_reloaded",
+            zones=len(targets),
+            of=len(all_zones),
+            selective=only is not None,
+        )
 
     # ── Record ops (RFC 2136 over loopback) ─────────────────────────────────
 
@@ -1343,16 +1495,28 @@ class Bind9Driver(DriverBase):
         # ``rndc status`` land on either. Enabling query logging then
         # appears to do nothing, which silently breaks the Logs → DNS
         # Queries surface and anything built on it.
-        existing = find_running_daemon("named")
-        if existing is not None:
-            self.daemon_pid = existing
-            log.info(
-                "named_already_running_adopted",
-                pid=existing,
-                note="did not spawn a second daemon",
-            )
-            return
-        self.daemon_pid = subprocess.Popen(["named", "-f", "-c", str(conf_path)]).pid
+        # The system look-up alone does NOT close the race: it matches on
+        # ``/proc/<pid>/comm``, and a child that has been forked but has not
+        # yet ``execve``'d still carries the PARENT's name, so a concurrent
+        # caller sees no daemon and spawns a second one. Hold an exclusive
+        # lock across the check, the spawn, and the wait for the new process
+        # to become visible under its own name — then the window has no
+        # interior. (Observed live 2026-08-06: pids 14 and 24, same parent,
+        # same config, both bound to :53 and :953.)
+        with spawn_guard(self.state_dir, "named"):
+            existing = find_running_daemon("named")
+            if existing is not None:
+                self.daemon_pid = existing
+                log.info(
+                    "named_already_running_adopted",
+                    pid=existing,
+                    note="did not spawn a second daemon",
+                )
+                return
+            self.daemon_pid = subprocess.Popen(
+                ["named", "-f", "-c", str(conf_path)]
+            ).pid
+            wait_for_daemon("named", self.daemon_pid)
         log.info("named_started", pid=self.daemon_pid)
 
     def daemon_running(self) -> bool:
