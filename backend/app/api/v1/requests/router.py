@@ -54,7 +54,7 @@ from app.core.permissions import (
 from app.models.auth import User
 from app.models.change_request import ChangeRequest
 from app.models.dhcp import DHCPScope
-from app.models.dns import DNSZone
+from app.models.dns import DNSView, DNSZone
 from app.models.ipam import IPBlock, Subnet
 from app.services.approvals.service import (
     ChangeRequestStateError,
@@ -241,10 +241,29 @@ class ResourceOption(BaseModel):
     sublabel: str | None = None
 
 
+class ResourceOptionsResponse(BaseModel):
+    options: list[ResourceOption]
+    # True when the permission scan hit its cap before filling ``limit`` —
+    # the caller's readable rows may exist beyond the scanned window, so the
+    # UI should say "keep typing to narrow" rather than "no matches".
+    truncated: bool
+
+
+def _like(q: str) -> str:
+    """``%<q>%`` with ILIKE metacharacters escaped so the user searches
+    literally — ``_``-led zone names are routine in AD estates."""
+    escaped = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
 def _subnet_query(q: str) -> Select:
-    stmt = select(Subnet).order_by(Subnet.network)
+    # The id tiebreaker matters: none of these sort keys are unique (the same
+    # CIDR is legal in two IP spaces), and the scan re-executes the query per
+    # page — without a total order, a readable row straddling a page boundary
+    # can be skipped or duplicated between executions.
+    stmt = select(Subnet).order_by(Subnet.network, Subnet.id)
     if q:
-        like = f"%{q}%"
+        like = _like(q)
         stmt = stmt.where(or_(Subnet.name.ilike(like), sa_cast(Subnet.network, String).ilike(like)))
     return stmt
 
@@ -255,9 +274,9 @@ def _subnet_option(row: object) -> ResourceOption:
 
 
 def _block_query(q: str) -> Select:
-    stmt = select(IPBlock).order_by(IPBlock.network)
+    stmt = select(IPBlock).order_by(IPBlock.network, IPBlock.id)
     if q:
-        like = f"%{q}%"
+        like = _like(q)
         stmt = stmt.where(
             or_(IPBlock.name.ilike(like), sa_cast(IPBlock.network, String).ilike(like))
         )
@@ -273,18 +292,27 @@ def _zone_query(q: str) -> Select:
     # Primary zones only — records can only be created in zones the control
     # plane authors; offering a secondary/forward zone would produce a request
     # whose approval can only fail.
-    stmt = select(DNSZone).where(DNSZone.zone_type == "primary").order_by(DNSZone.name)
+    # The same zone name legitimately exists per view (split-horizon), so
+    # join the view for a disambiguating sublabel and tiebreak on id.
+    stmt = (
+        select(DNSZone, DNSView.name)
+        .outerjoin(DNSView, DNSView.id == DNSZone.view_id)
+        .where(DNSZone.zone_type == "primary")
+        .order_by(DNSZone.name, DNSZone.id)
+    )
     if q:
-        stmt = stmt.where(DNSZone.name.ilike(f"%{q}%"))
+        stmt = stmt.where(DNSZone.name.ilike(_like(q)))
     return stmt
 
 
 def _zone_option(row: object) -> ResourceOption:
     zone = row[0]  # type: ignore[index]
+    view_name = row[1]  # type: ignore[index]
+    parts = [p for p in (view_name, "reverse" if zone.kind == "reverse" else None) if p]
     return ResourceOption(
         id=str(zone.id),
         label=zone.name,
-        sublabel="reverse" if zone.kind == "reverse" else None,
+        sublabel=" · ".join(parts) or None,
     )
 
 
@@ -295,10 +323,10 @@ def _scope_query(q: str) -> Select:
         select(DHCPScope, Subnet.network)
         .join(Subnet, Subnet.id == DHCPScope.subnet_id)
         .where(DHCPScope.is_active.is_(True))
-        .order_by(Subnet.network)
+        .order_by(Subnet.network, DHCPScope.id)
     )
     if q:
-        like = f"%{q}%"
+        like = _like(q)
         stmt = stmt.where(
             or_(DHCPScope.name.ilike(like), sa_cast(Subnet.network, String).ilike(like))
         )
@@ -325,14 +353,14 @@ _RESOURCE_PICKERS: dict[str, tuple] = {
 }
 
 
-@router.get("/resource-options", response_model=list[ResourceOption])
+@router.get("/resource-options", response_model=ResourceOptionsResponse)
 async def resource_options(
     db: DB,
     current_user: CurrentUser,
     resource: str,
-    q: str = "",
+    q: str = Query(default="", max_length=200),
     limit: int = Query(default=20, ge=1, le=_PICKER_MAX),
-) -> list[ResourceOption]:
+) -> ResourceOptionsResponse:
     """Permission-filtered typeahead options for one ``x-resource`` field.
 
     Requires submit permission (like ``/catalog`` — the picker exists to fill
@@ -353,9 +381,11 @@ async def resource_options(
     query_fn, rtype, to_option = picker
     out: list[ResourceOption] = []
     offset = 0
+    exhausted = False
     while len(out) < limit and offset < _PICKER_SCAN_CAP:
         rows = (await db.execute(query_fn(q).offset(offset).limit(_PICKER_PAGE))).all()
         if not rows:
+            exhausted = True
             break
         offset += len(rows)
         for row in rows:
@@ -365,7 +395,13 @@ async def resource_options(
             out.append(to_option(row))
             if len(out) >= limit:
                 break
-    return out
+        if len(rows) < _PICKER_PAGE:
+            exhausted = True
+            break
+    # ``truncated`` = the caller's readable rows may exist beyond the scanned
+    # window (cap hit, or limit filled with candidates left) — the UI shows
+    # "keep typing to narrow" instead of a dead-end "no matches".
+    return ResourceOptionsResponse(options=out, truncated=not exhausted and len(out) < limit)
 
 
 # ── Catalog ────────────────────────────────────────────────────────────────

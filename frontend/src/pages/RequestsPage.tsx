@@ -28,7 +28,7 @@ import {
   requestsApi,
   type ChangeRequestState,
   type ProvisioningRequest,
-  type ResourceOption,
+  type ResourceOptionsResponse,
   type RequestKind,
   type RequestKindId,
 } from "@/lib/api";
@@ -212,12 +212,13 @@ function ResourcePicker({
     return () => clearTimeout(t);
   }, [search]);
 
-  const { data: options = [], isFetching } = useQuery<ResourceOption[]>({
+  const { data, isFetching } = useQuery<ResourceOptionsResponse>({
     queryKey: ["resource-options", resource, debounced],
     queryFn: () => requestsApi.resourceOptions(resource, debounced),
     enabled: open,
     staleTime: 30_000,
   });
+  const options = data?.options ?? [];
 
   if (value && selectedLabel) {
     return (
@@ -256,7 +257,11 @@ function ResourcePicker({
         <div className="absolute z-50 mt-1 max-h-56 w-full overflow-y-auto rounded-md border border-border bg-background shadow-lg">
           {options.length === 0 ? (
             <div className="px-2 py-1.5 text-xs text-muted-foreground">
-              {isFetching ? "Searching…" : "No matches you can read"}
+              {isFetching
+                ? "Searching…"
+                : data?.truncated
+                  ? "Large list — keep typing to narrow the search"
+                  : "No matches you can read"}
             </div>
           ) : (
             options.map((o) => (
@@ -282,6 +287,11 @@ function ResourcePicker({
               </button>
             ))
           )}
+          {options.length > 0 && data?.truncated ? (
+            <div className="border-t border-border px-2 py-1 text-[11px] text-muted-foreground">
+              More may exist — keep typing to narrow
+            </div>
+          ) : null}
         </div>
       ) : null}
     </div>

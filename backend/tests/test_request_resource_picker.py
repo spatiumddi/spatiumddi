@@ -140,8 +140,10 @@ async def test_picker_returns_only_rows_the_caller_can_read(
         params={"resource": "subnet"},
     )
     assert resp.status_code == 200, resp.text
-    assert [o["id"] for o in resp.json()] == [str(visible.id)]
-    assert resp.json()[0]["label"] == "10.2.0.0/24"
+    body = resp.json()
+    assert [o["id"] for o in body["options"]] == [str(visible.id)]
+    assert body["options"][0]["label"] == "10.2.0.0/24"
+    assert body["truncated"] is False
 
 
 @pytest.mark.asyncio
@@ -162,7 +164,7 @@ async def test_picker_type_level_read_sees_all(
         params={"resource": "subnet"},
     )
     assert resp.status_code == 200
-    got = {o["id"] for o in resp.json()}
+    got = {o["id"] for o in resp.json()["options"]}
     assert {str(s.id) for s in subs} <= got
 
 
@@ -217,7 +219,7 @@ async def test_picker_search_narrows(client: AsyncClient, db_session: AsyncSessi
         params={"resource": "subnet", "q": "192.168.7"},
     )
     assert resp.status_code == 200
-    labels = [o["label"] for o in resp.json()]
+    labels = [o["label"] for o in resp.json()["options"]]
     assert labels == ["192.168.7.0/24"]
 
 
@@ -249,7 +251,7 @@ async def test_zone_picker_offers_primary_zones_only(
         params={"resource": "dns_zone", "q": "example.test"},
     )
     assert resp.status_code == 200
-    assert [o["id"] for o in resp.json()] == [str(primary.id)]
+    assert [o["id"] for o in resp.json()["options"]] == [str(primary.id)]
 
 
 @pytest.mark.asyncio
@@ -277,7 +279,69 @@ async def test_scope_picker_active_only_and_labeled_with_range(
         params={"resource": "dhcp_scope"},
     )
     assert resp.status_code == 200
-    opts = {o["id"]: o for o in resp.json()}
+    opts = {o["id"]: o for o in resp.json()["options"]}
     assert str(active.id) in opts and str(inactive.id) not in opts
     got = opts[str(active.id)]
     assert got["label"] == "office" and got["sublabel"] == "10.5.0.0/24"
+
+
+@pytest.mark.asyncio
+async def test_picker_grants_on_other_types_reveal_nothing(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The acceptance criterion's other face: read on dns_zone does not open
+    the subnet picker."""
+    await _enable_module(db_session)
+    await _subnets(db_session, ["10.1.0.0/24"])
+    _, token = await _user(
+        db_session,
+        permissions=REQUESTER_PERMS + [{"action": "read", "resource_type": "dns_zone"}],
+    )
+    await db_session.commit()
+
+    resp = await client.get(
+        "/api/v1/requests/resource-options",
+        headers=_auth(token),
+        params={"resource": "subnet"},
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"options": [], "truncated": False}
+
+
+@pytest.mark.asyncio
+async def test_picker_scan_reaches_past_the_first_page(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A scoped grant whose row sorts beyond page one (200 rows) must still be
+    found — this exercises the multi-page loop and the id tiebreaker."""
+    await _enable_module(db_session)
+    space = IPSpace(name=f"sp-{uuid.uuid4().hex[:6]}")
+    db_session.add(space)
+    await db_session.flush()
+    block = IPBlock(space_id=space.id, network="10.0.0.0/8", name="b")
+    db_session.add(block)
+    await db_session.flush()
+    subs = []
+    # 205 /24s — 10.0.0.0/24 … 10.0.204.0/24, sorted by network.
+    for i in range(205):
+        sub = Subnet(space_id=space.id, block_id=block.id, network=f"10.0.{i}.0/24", name=f"n{i}")
+        db_session.add(sub)
+        subs.append(sub)
+    await db_session.flush()
+    target = subs[204]  # sorts last → beyond the first 200-row page
+    _, token = await _user(
+        db_session,
+        permissions=REQUESTER_PERMS
+        + [{"action": "read", "resource_type": "subnet", "resource_id": str(target.id)}],
+    )
+    await db_session.commit()
+
+    resp = await client.get(
+        "/api/v1/requests/resource-options",
+        headers=_auth(token),
+        params={"resource": "subnet"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert [o["id"] for o in body["options"]] == [str(target.id)]
+    assert body["truncated"] is False

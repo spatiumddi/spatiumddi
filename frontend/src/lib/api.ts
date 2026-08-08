@@ -10024,13 +10024,21 @@ export interface ResourceOption {
   sublabel: string | null;
 }
 
+export interface ResourceOptionsResponse {
+  options: ResourceOption[];
+  // True when the permission scan stopped before covering every candidate —
+  // the caller's readable rows may exist beyond the window, so show "keep
+  // typing to narrow" rather than "no matches".
+  truncated: boolean;
+}
+
 export const requestsApi = {
   catalog: () =>
     api.get<RequestKind[]>("/requests/catalog").then((r) => r.data),
   // #759 — permission-filtered typeahead options for x-resource fields.
   resourceOptions: (resource: string, q: string) =>
     api
-      .get<ResourceOption[]>("/requests/resource-options", {
+      .get<ResourceOptionsResponse>("/requests/resource-options", {
         params: { resource, q },
       })
       .then((r) => r.data),
