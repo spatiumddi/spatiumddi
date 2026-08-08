@@ -454,6 +454,8 @@ Every subnet can be assigned:
 
 When a subnet is created or edited, the UI prompts: *"Auto-create reverse zone for 10.1.2.0/24?"* — which generates `2.1.10.in-addr.arpa.` on the designated server group.
 
+> **Overlapping IP spaces (#844).** The same CIDR in two IP spaces computes the same reverse zone name, and a DNS group can hold only one zone by that name — sharing it would merge two tenants' PTRs into one RRset (cross-tenant hostname disclosure). SpatiumDDI therefore refuses to attach a second space's subnet to a reverse zone another space's subnet created (the IPs get no PTR, logged as `reverse_zone_cross_space_conflict`), and PTR sync skips reverse zones linked to a different space's subnet. **Overlapping IP spaces need a separate DNS server group per space.** Operator-created reverse zones with no linked subnet stay shared — no space can be attributed to them.
+
 ---
 
 ## 5. DNS Records

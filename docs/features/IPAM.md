@@ -29,6 +29,7 @@ The IPAM module is the core of SpatiumDDI. It manages the hierarchy of IP space 
 - The primary unit of management — a routable network with a gateway
 - IPs are allocated, tracked, and assigned at the subnet level
 - Subnets cannot overlap within the same IP Space
+- Subnets in *different* IP Spaces **may** overlap (VRF semantics) — but overlapping spaces must use **disjoint DHCP and DNS server groups**: one Kea server cannot serve two same-prefix subnets, and one DNS group cannot hold two same-name reverse zones. Enforced per #844 (scope create/activate `409`; reverse-zone attach refused)
 
 ---
 

@@ -61,6 +61,7 @@ from app.services.approvals.gate import gate_or_execute
 from app.services.dhcp.windows_writethrough import (
     push_statics_bulk_delete,
 )
+from app.services.dns.reverse_zone import cidrs_overlap
 from app.services.ipam.address_set_gate import (
     WritableSetRanges,
     load_writable_set_ranges,
@@ -73,6 +74,11 @@ from app.services.oui import bulk_lookup_vendors, is_voip_phone_vendor, normaliz
 from app.services.tags import apply_tag_filter
 
 logger = structlog.get_logger(__name__)
+
+# #844 — log-dedupe for _resolve_reverse_zone's cross-space skip (it runs per
+# IP inside _sync_dns_record). Log suppression only — never consulted for
+# logic.
+_cross_space_skip_warned: set[tuple[str, str]] = set()
 
 
 def _validate_opt_ddns_domain(v: Any) -> Any:
@@ -470,8 +476,10 @@ async def _check_ip_collisions(
     mac_address: str | None,
     exclude_ip_id: uuid.UUID | None = None,
     role: str | None = None,
+    subnet: Subnet | None = None,
+    address: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Return FQDN + MAC collision warnings for a pending IP assignment.
+    """Return FQDN + MAC + PTR collision warnings for a pending IP assignment.
 
     - FQDN check runs only when both ``hostname`` and ``forward_zone_id``
       resolve — nothing to collide on otherwise.
@@ -487,6 +495,13 @@ async def _check_ip_collisions(
       common virtual MAC, so the MAC-collision warning is suppressed.
       The FQDN check still runs (a duplicate hostname on a VIP isn't a
       shared-by-design pattern, just an operator typo).
+    - PTR check (#844) runs when ``subnet`` + ``address`` are supplied AND
+      the pending row would actually publish DNS (hostname + forward zone —
+      ``_sync_dns_record`` only writes a PTR alongside a forward record): if
+      the reverse zone this IP would land in already holds a PTR at the same
+      name from a *different* IP row (a manual PTR, or pre-existing
+      cross-space data from before the #844 space guards), warn rather than
+      silently stacking a second value onto the RRset.
     """
     warnings: list[dict[str, Any]] = []
 
@@ -533,6 +548,43 @@ async def _check_ip_collisions(
                     "existing_ip_id": str(ip.id),
                 }
             )
+
+    if subnet is not None and address and hostname and forward_zone_id:
+        try:
+            ip_obj = ipaddress.ip_address(address)
+        except ValueError:
+            ip_obj = None
+        if ip_obj is not None:
+            rev_zone = await _resolve_reverse_zone(db, subnet, ip_obj)
+            if rev_zone is not None:
+                rev_pointer_full = ip_obj.reverse_pointer + "."
+                rev_zone_name = rev_zone.name.rstrip(".") + "."
+                if rev_pointer_full == rev_zone_name:
+                    ptr_name = "@"
+                else:
+                    ptr_name = rev_pointer_full[: -(len(rev_zone_name) + 1)]
+                q = select(DNSRecord).where(
+                    DNSRecord.zone_id == rev_zone.id,
+                    DNSRecord.record_type == "PTR",
+                    DNSRecord.name == ptr_name,
+                )
+                if exclude_ip_id is not None:
+                    q = q.where(
+                        or_(
+                            DNSRecord.ip_address_id.is_(None),
+                            DNSRecord.ip_address_id != exclude_ip_id,
+                        )
+                    )
+                for rec in (await db.execute(q)).scalars().all():
+                    warnings.append(
+                        {
+                            "kind": "ptr_collision",
+                            "zone": rev_zone.name,
+                            "ptr_name": ptr_name,
+                            "existing_value": rec.value,
+                            "existing_record_id": str(rec.id),
+                        }
+                    )
 
     return warnings
 
@@ -958,18 +1010,51 @@ async def _resolve_reverse_zone(
     effective_group_ids, _, _ = await _resolve_effective_dns(db, subnet)
     if not effective_group_ids:
         return None
+    # #844 — carry the linked subnet's space + network so a zone that an
+    # OVERLAPPING subnet in another IP space auto-created is never adopted
+    # here: both compute the identical reverse zone name, and a bare
+    # name-suffix match would fold two customers' PTRs onto the same names
+    # (cross-tenant hostname disclosure). The overlap test matters — IPv4
+    # reverse zones aggregate to /24, so two NON-overlapping subnets (in any
+    # spaces) legitimately share one zone with disjoint PTR names and must
+    # keep working. Zones with no linked subnet (operator-created shared
+    # reverse zones, or a link left dangling by a subnet delete) stay
+    # matchable — a space can't be attributed to them, and refusing would
+    # break legit single-tenant setups; ``ensure_reverse_zone_for_subnet``
+    # re-links dangling zones on the next allocation.
     res = await db.execute(
-        select(DNSZone).where(
+        select(DNSZone, Subnet.space_id, Subnet.network)
+        .outerjoin(Subnet, Subnet.id == DNSZone.linked_subnet_id)
+        .where(
             DNSZone.group_id.in_(effective_group_ids),
             DNSZone.kind == "reverse",
         )
     )
-    candidates = list(res.scalars().all())
     # Choose the longest matching suffix (most specific)
     best: DNSZone | None = None
-    for z in candidates:
+    for z, linked_space_id, linked_network in res.all():
         zname = z.name.rstrip(".") + "."
         if rev_pointer.endswith("." + zname) or rev_pointer == zname:
+            if (
+                linked_space_id is not None
+                and linked_space_id != subnet.space_id
+                and cidrs_overlap(linked_network, subnet.network)
+            ):
+                key = (str(subnet.id), str(z.id))
+                # Per-IP call site: warn once per (subnet, zone) pair per
+                # process, debug after — bulk syncs would otherwise emit one
+                # warning per IP per run, forever.
+                log_fn = logger.debug if key in _cross_space_skip_warned else logger.warning
+                _cross_space_skip_warned.add(key)
+                log_fn(
+                    "reverse_zone_cross_space_skipped",
+                    subnet_id=str(subnet.id),
+                    zone_id=str(z.id),
+                    zone=z.name,
+                    note="zone is linked to an overlapping subnet in another "
+                    "IP space; PTR would leak across tenants (#844)",
+                )
+                continue
             if best is None or len(z.name) > len(best.name):
                 best = z
     return best
@@ -6717,6 +6802,8 @@ async def create_address(
             forward_zone_id=effective_zone,
             mac_address=body.mac_address,
             role=body.role,
+            subnet=subnet,
+            address=body.address,
         )
         # Public-facing safety guard (issue #25). Append to the same
         # warnings list so the operator sees both surfaces in one
@@ -7071,6 +7158,8 @@ async def update_address(
             mac_address=body.mac_address if mac_touched else None,
             exclude_ip_id=ip.id,
             role=effective_role,
+            subnet=subnet_for_check if hostname_or_zone_touched else None,
+            address=str(ip.address),
         )
         # Public-facing safety guard (issue #25). Run on every update
         # that touches the zone bindings — adding an extra zone can
