@@ -10018,9 +10018,22 @@ export interface SubmitRequestBody {
   justification?: string | null;
 }
 
+export interface ResourceOption {
+  id: string;
+  label: string;
+  sublabel: string | null;
+}
+
 export const requestsApi = {
   catalog: () =>
     api.get<RequestKind[]>("/requests/catalog").then((r) => r.data),
+  // #759 — permission-filtered typeahead options for x-resource fields.
+  resourceOptions: (resource: string, q: string) =>
+    api
+      .get<ResourceOption[]>("/requests/resource-options", {
+        params: { resource, q },
+      })
+      .then((r) => r.data),
   list: (params: ProvisioningRequestListParams = {}) =>
     api.get<ProvisioningRequest[]>("/requests", { params }).then((r) => r.data),
   get: (id: string) =>
