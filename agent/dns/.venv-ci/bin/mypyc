@@ -1,6 +1,0 @@
-#!/private/tmp/claude-501/-Users-eroot-source-ddi-pg/108b9c7c-e24c-432b-8c7d-5c2cabcb0c16/scratchpad/wt-704/agent/dns/.venv-ci/bin/python3.12
-import sys
-from mypyc.__main__ import main
-if __name__ == '__main__':
-    sys.argv[0] = sys.argv[0].removesuffix('.exe')
-    sys.exit(main())
