@@ -187,6 +187,52 @@ def _make_device(
     return dev
 
 
+# ── Installed-pysnmp API contract ───────────────────────────────────
+#
+# Everything else in this file stubs the HLAPI module, which is exactly
+# how the pysnmp 6.x → 7.x rename (getCmd → get_cmd, bulkWalkCmd →
+# bulk_walk_cmd) sailed through a fully green CI while breaking every
+# real poll. These two tests import the *installed* pysnmp and assert
+# the symbols + keyword arguments the poller actually uses, so the next
+# incompatible bump fails here instead of in the field. If pysnmp is
+# missing entirely, ``_import_hlapi`` raises and the test fails — also
+# the right signal, since it is a hard dependency of the backend.
+
+
+def test_installed_pysnmp_has_every_symbol_the_poller_uses() -> None:
+    hlapi = poller._import_hlapi()
+    needed = [
+        "get_cmd",
+        "bulk_walk_cmd",
+        "walk_cmd",
+        "SnmpEngine",
+        "ContextData",
+        "ObjectType",
+        "ObjectIdentity",
+        "CommunityData",
+        "UsmUserData",
+        "UdpTransportTarget",
+        *poller._AUTH_PROTO_NAMES.values(),
+        *poller._PRIV_PROTO_NAMES.values(),
+    ]
+    missing = [name for name in needed if not hasattr(hlapi, name)]
+    assert not missing, f"installed pysnmp lacks symbols the poller calls: {missing}"
+
+
+def test_installed_pysnmp_accepts_the_kwargs_the_poller_passes() -> None:
+    import inspect
+
+    hlapi = poller._import_hlapi()
+    community_params = inspect.signature(hlapi.CommunityData.__init__).parameters
+    assert "mpModel" in community_params
+    usm_params = inspect.signature(hlapi.UsmUserData.__init__).parameters
+    for kw in ("authProtocol", "privProtocol", "authKey", "privKey"):
+        assert kw in usm_params
+    # _build_target probes for the async factory before falling back to
+    # the plain constructor — the installed version must have it.
+    assert hasattr(hlapi.UdpTransportTarget, "create")
+
+
 # ── Auth construction ──────────────────────────────────────────────
 
 
