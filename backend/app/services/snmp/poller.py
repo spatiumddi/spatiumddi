@@ -1,4 +1,4 @@
-"""Async SNMP wrappers built on top of pysnmp 6.x's HLAPI.
+"""Async SNMP wrappers built on top of pysnmp 7.x's HLAPI.
 
 Public surface:
 
@@ -259,8 +259,8 @@ def _guess_vendor(sys_descr: str | None, sys_object_id: str | None) -> str | Non
 
 # ── pysnmp engine resolution ────────────────────────────────────────
 #
-# pysnmp 6.x exposes the async HLAPI under
-# ``pysnmp.hlapi.v3arch.asyncio``. Older 4.x ships the same symbols in
+# pysnmp 7.x exposes the async HLAPI under
+# ``pysnmp.hlapi.v3arch.asyncio``. Older 6.x ships the same symbols in
 # ``pysnmp.hlapi.asyncio``. We resolve at call time so test stubs can
 # patch the resulting symbols cleanly without faking an entire module.
 
@@ -359,8 +359,9 @@ def _build_auth(device: NetworkDevice, hlapi: Any) -> Any:
 
 async def _build_target(device: NetworkDevice, hlapi: Any) -> Any:
     """``UdpTransportTarget.create`` builds an asyncio-capable target
-    in pysnmp 6.x. 4.x just uses the ``UdpTransportTarget(...)``
-    constructor synchronously. We probe for ``create`` first.
+    in pysnmp 6.x/7.x. Older versions just use the
+    ``UdpTransportTarget(...)`` constructor synchronously. We probe
+    for ``create`` first.
 
     Address selection: prefer ``ip_address`` (always present, always
     a parseable INET), fall back to ``hostname`` only when the IP
@@ -476,7 +477,7 @@ async def _walk_oids(
 ) -> AsyncIterator[tuple[str, Any]]:
     """Yield ``(oid_str, value)`` pairs from a bulk-walk over ``oids``.
 
-    Walks each OID column **independently** (one bulkWalkCmd per OID)
+    Walks each OID column **independently** (one bulk_walk_cmd per OID)
     rather than batching them into a single GETBULK PDU. Why: when
     pysnmp packs N column OIDs into a single GETBULK with
     ``max-repetitions=R``, the device must respond with ``N*R``
@@ -494,24 +495,34 @@ async def _walk_oids(
     UDP responses. Cost is ~2× more round-trips per column; on
     a 10ms-RTT LAN that's still sub-second per device.
 
-    Falls back to repeated GETNEXT internally for SNMPv1 (pysnmp
-    handles that automatically inside ``bulkWalkCmd``).
+    SNMPv1 has no GETBULK, and pysnmp does *not* downgrade for us —
+    v1 devices walk via ``walk_cmd`` (repeated GETNEXT) instead.
     """
     hlapi = hlapi or _import_hlapi()
     auth = _build_auth(device, hlapi)
     target = await _build_target(device, hlapi)
 
     for oid in oids:
-        walker = hlapi.bulkWalkCmd(
-            hlapi.SnmpEngine(),
-            auth,
-            target,
-            hlapi.ContextData(),
-            0,  # non-repeaters
-            10,  # max-repetitions per PDU (was 25 — see above)
-            hlapi.ObjectType(hlapi.ObjectIdentity(oid)),
-            lexicographicMode=False,
-        )
+        if device.snmp_version == "v1":
+            walker = hlapi.walk_cmd(
+                hlapi.SnmpEngine(),
+                auth,
+                target,
+                hlapi.ContextData(),
+                hlapi.ObjectType(hlapi.ObjectIdentity(oid)),
+                lexicographicMode=False,
+            )
+        else:
+            walker = hlapi.bulk_walk_cmd(
+                hlapi.SnmpEngine(),
+                auth,
+                target,
+                hlapi.ContextData(),
+                0,  # non-repeaters
+                10,  # max-repetitions per PDU (was 25 — see above)
+                hlapi.ObjectType(hlapi.ObjectIdentity(oid)),
+                lexicographicMode=False,
+            )
 
         async for ei, es, eidx, varbinds in walker:
             err = _classify_pysnmp_error(ei, es, eidx)
@@ -524,7 +535,7 @@ async def _walk_oids(
 async def test_connection(device: NetworkDevice) -> SysInfo:
     """One-shot scalar probe — returns the system group.
 
-    Uses a single ``getCmd`` over the four sys* scalars. Any error
+    Uses a single ``get_cmd`` over the four sys* scalars. Any error
     (transport / auth / timeout / protocol) is normalised; on success
     we attach a vendor heuristic so the caller can prefill the
     ``vendor`` column without a follow-up query.
@@ -540,7 +551,7 @@ async def test_connection(device: NetworkDevice) -> SysInfo:
         hlapi.ObjectType(hlapi.ObjectIdentity(OID_SYS_UP_TIME)),
     ]
 
-    ei, es, eidx, varbinds = await hlapi.getCmd(
+    ei, es, eidx, varbinds = await hlapi.get_cmd(
         hlapi.SnmpEngine(),
         auth,
         target,

@@ -136,8 +136,9 @@ def _hlapi_stub(*, walk_factory=None, get_result=None):
         CommunityData=_CommunityData,
         UsmUserData=_UsmUserData,
         UdpTransportTarget=_UdpTransportTarget,
-        bulkWalkCmd=_bulk_walk,
-        getCmd=_get_cmd,
+        bulk_walk_cmd=_bulk_walk,
+        walk_cmd=_bulk_walk,
+        get_cmd=_get_cmd,
         # Auth/priv protocol sentinels — the poller looks them up by
         # name on the hlapi module via ``getattr``.
         usmHMACMD5AuthProtocol="md5",
@@ -184,6 +185,52 @@ def _make_device(
     )
     dev.id = uuid.uuid4()
     return dev
+
+
+# ── Installed-pysnmp API contract ───────────────────────────────────
+#
+# Everything else in this file stubs the HLAPI module, which is exactly
+# how the pysnmp 6.x → 7.x rename (getCmd → get_cmd, bulkWalkCmd →
+# bulk_walk_cmd) sailed through a fully green CI while breaking every
+# real poll. These two tests import the *installed* pysnmp and assert
+# the symbols + keyword arguments the poller actually uses, so the next
+# incompatible bump fails here instead of in the field. If pysnmp is
+# missing entirely, ``_import_hlapi`` raises and the test fails — also
+# the right signal, since it is a hard dependency of the backend.
+
+
+def test_installed_pysnmp_has_every_symbol_the_poller_uses() -> None:
+    hlapi = poller._import_hlapi()
+    needed = [
+        "get_cmd",
+        "bulk_walk_cmd",
+        "walk_cmd",
+        "SnmpEngine",
+        "ContextData",
+        "ObjectType",
+        "ObjectIdentity",
+        "CommunityData",
+        "UsmUserData",
+        "UdpTransportTarget",
+        *poller._AUTH_PROTO_NAMES.values(),
+        *poller._PRIV_PROTO_NAMES.values(),
+    ]
+    missing = [name for name in needed if not hasattr(hlapi, name)]
+    assert not missing, f"installed pysnmp lacks symbols the poller calls: {missing}"
+
+
+def test_installed_pysnmp_accepts_the_kwargs_the_poller_passes() -> None:
+    import inspect
+
+    hlapi = poller._import_hlapi()
+    community_params = inspect.signature(hlapi.CommunityData.__init__).parameters
+    assert "mpModel" in community_params
+    usm_params = inspect.signature(hlapi.UsmUserData.__init__).parameters
+    for kw in ("authProtocol", "privProtocol", "authKey", "privKey"):
+        assert kw in usm_params
+    # _build_target probes for the async factory before falling back to
+    # the plain constructor — the installed version must have it.
+    assert hasattr(hlapi.UdpTransportTarget, "create")
 
 
 # ── Auth construction ──────────────────────────────────────────────
@@ -317,6 +364,38 @@ async def test_test_connection_propagates_timeout() -> None:
     hlapi = _hlapi_stub(get_result=get_result)
     with patch.object(poller, "_import_hlapi", return_value=hlapi), pytest.raises(SNMPTimeoutError):
         await poller.test_connection(dev)
+
+
+# ── _walk_oids version routing ──────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_walk_oids_routes_v1_to_getnext_walk() -> None:
+    """SNMPv1 has no GETBULK — v1 must walk via ``walk_cmd``
+    (repeated GETNEXT); v2c/v3 keep the faster ``bulk_walk_cmd``."""
+    calls: list[str] = []
+
+    def _track(name: str):
+        def _walker(*_args: Any, **_kwargs: Any):
+            calls.append(name)
+            return _make_walk({"1.3.6.1.2.1.2.2.1.2": {"1": "eth0"}})()
+
+        return _walker
+
+    hlapi = _hlapi_stub()
+    hlapi.walk_cmd = _track("walk_cmd")
+    hlapi.bulk_walk_cmd = _track("bulk_walk_cmd")
+
+    dev_v1 = _make_device(snmp_version="v1")
+    async for _ in poller._walk_oids(dev_v1, ["1.3.6.1.2.1.2.2.1.2"], hlapi=hlapi):
+        pass
+    assert calls == ["walk_cmd"]
+
+    calls.clear()
+    dev_v2c = _make_device(snmp_version="v2c")
+    async for _ in poller._walk_oids(dev_v2c, ["1.3.6.1.2.1.2.2.1.2"], hlapi=hlapi):
+        pass
+    assert calls == ["bulk_walk_cmd"]
 
 
 # ── walk_arp fallback ───────────────────────────────────────────────

@@ -193,8 +193,9 @@ Mirrors CLAUDE.md's three mixed sections:
     Juniper / Arista / Aruba / MikroTik / OPNsense / pfSense /
     FortiNet / Cumulus / SONiC / FS.com / Ubiquiti out of the
     box.
-  - **Polling pipeline** — `pysnmp` 6.x async (`bulkWalk` for
-    table OIDs, ~10–50× faster than `getNext`).
+  - **Polling pipeline** — `pysnmp` 7.x async (`bulk_walk_cmd` for
+    table OIDs, ~10–50× faster than GETNEXT; v1 devices walk via
+    `walk_cmd` since GETBULK doesn't exist in SNMPv1).
     `app.tasks.snmp_poll.poll_device` runs sysinfo → interfaces
     → ARP → FDB sequentially under a per-device
     `SELECT FOR UPDATE SKIP LOCKED` so concurrent dispatches
