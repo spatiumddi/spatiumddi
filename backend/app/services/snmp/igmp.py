@@ -140,7 +140,7 @@ async def walk_igmp_cache(device: NetworkDevice) -> list[IGMPCacheRow]:
 
     Returns one :class:`IGMPCacheRow` per (group, ifIndex) pair. The
     walker uses the same per-column bulk-walk pattern the rest of the
-    poller does (one ``bulkWalkCmd`` per column, max-rep=10) — see
+    poller does (one ``bulk_walk_cmd`` per column, max-rep=10) — see
     ``services/snmp/poller.py:_walk_oids`` for the rationale.
 
     Defensive: if the device doesn't implement IGMP-STD-MIB at all
