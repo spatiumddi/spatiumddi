@@ -20,6 +20,902 @@ the formatter handles the rest.
 
 ---
 
+## 2026.08.12-1 — 2026-08-12
+
+**The migration + field-hardening release.** Two additions change what
+the platform can take on. The **guided Windows → SpatiumDDI cutover**
+(#756) is the half the importers stop short of: they land a *copy* of a
+Windows estate and prove nothing about what happens next, because the
+Windows server is still running, still authoritative, and still the
+thing clients actually talk to. The cutover verifies the two sides
+agree, runs them in parallel against real traffic, performs the switch
+per zone and per scope with a rollback, and tracks the decommission —
+while creating no zones, scopes, pools or records of its own.
+Alongside it, an **agentless Technitium driver** (#810) closes the last
+one-shape-only backend: paste an API URL and a token, and the control
+plane drives an install the operator already runs with nothing
+deployed. Also landing: **searchable, permission-filtered resource
+pickers** on the self-service request portal (#759), which was asking
+low-privilege users to type raw UUIDs, and an appliance **Web UI
+firewall reachability self-check** (#779) that answers the one question
+a self-`curl` cannot.
+
+The bulk of the release, though, is field-found correctness, and one
+bug stands out. Under split-horizon views a DNS record created through
+the API was rendered correctly into its zone file and then **never
+served** — 201 from the API, NXDOMAIN on the wire, permanently, for
+every record created after the zone's first load (#704, #707).
+`rndc reconfig` is defined not to re-read existing zone files, which
+was the correct signal while record edits rode RFC 2136 and became the
+wrong one the moment views made re-rendering the only path. The same
+investigation found **two `named` daemons** sharing :53 under
+SO_REUSEPORT on a live appliance, which turned `rndc` into a coin flip
+and had one zone answering from two different serials depending on
+which process the kernel picked. Both fixes are in the DNS agent image,
+so **operators must pull new agent images to get them**.
+
+Three more arcs run through this one. The **backup and restore
+hardening** (#781) found that selective restore was truncating with
+`CASCADE` and silently emptying up to 130 tables it never refilled, and
+that the cross-install secret rewrap covered 21 of the schema's 47
+encrypted columns and none of the five JSONB-embedded ones — so the
+appliance CA key, TLS private keys, k3s join tokens, ACME account keys,
+SNMPv3 passphrases and every integration credential survived a restore
+still encrypted under a key the operator no longer has. The
+**appliance slot-upgrade** surface stopped lying about which machine it
+was acting on: on a multi-node control plane the status endpoint was
+answered by an arbitrary node and the write endpoints armed whichever
+one the load balancer picked, so a rolling upgrade could upgrade one
+node three times and never touch the other two. And **OPNsense** was
+mirroring nothing at all on 25.7+, reporting a clean sync with zero
+results forever, because it parsed an interface shape that has never
+existed and asked only an ISC dhcpd that moved out of core.
+
+One upgrade-path note, unchanged from where it was documented (#787):
+if you are coming from **2026.07.11-1 or 2026.07.21-1**, uploading an
+appliance slot image through the Web UI will 413 before FastAPI ever
+sees it — the nginx `client_max_body_size` fix first shipped *in*
+2026.07.30-1. Use the URL source or the host CLI instead; neither
+crosses that nginx location.
+
+### Added
+
+- **Guided Windows → SpatiumDDI cutover (#756).** The unit of work is
+  a **plan**: a source Windows DNS and/or DHCP server, a target server
+  group, and a list of **items**, where one item is one zone or one
+  scope. Items are independent — they can be cut over on different
+  days and each rolls back on its own. There is no big-bang step
+  anywhere. Behind the default-on `migration.cutover` feature module
+  (group **Tools**, because one plan covers both protocols and either
+  "DNS" or "DHCP" would be a lie about half the surface), **superadmin
+  on every endpoint** — a cutover is strictly more dangerous than an
+  import, so inventing a grantable permission for it would be a
+  *weaker* posture than the surface it extends.
+  - **Phase 1 — parity.** Diffs each object against the live Windows
+    server and classifies every difference by *why* the two sides
+    differ: `value_mismatch` / `drifted_since_import` /
+    `never_imported` / `intentionally_diverged`. A changed record
+    pairs into one decision rather than the missing+extra pair the
+    drift report produces. Two traps are handled explicitly: a Path-B
+    PowerShell pull cannot emit CAA / TLSA / SSHFP, so those report
+    `not_compared` instead of missing; and an unparseable PowerShell
+    response is indistinguishable from an empty zone, so that case
+    reports `unverified` rather than "everything diverged".
+  - **Phase 2 — parallel run.** Replays recently-observed queries from
+    the query log against both sides and compares answers, so parity
+    is *demonstrated against production traffic* rather than asserted
+    from config equality. Falls back to the zone's own records when
+    the query log is empty and says which via `sample_source`, because
+    the two are not equally strong evidence. Queries address an IP
+    literal, never a hostname — the exact `dns.query` failure that
+    made the drift report fail 100% against hostname-addressed servers
+    — and go out with RD=0, so a cached answer from somewhere else
+    cannot stand in for the server under test.
+  - **Phase 3 — the switch.** A TTL pre-flight that snapshots the
+    originals once and restores them exactly; a DHCP lease handover
+    that promotes live Windows leases to reservations, so a renewing
+    client keeps the address it already holds instead of meeting a Kea
+    with an empty lease database; then the switch itself, which
+    deactivates the Windows scope **before** activating the managed
+    one and puts the old one back if the new side fails to come up.
+  - **Phase 4 — a 15-item decommission checklist**, three of them
+    advisory-evaluated from SpatiumDDI's own data (DC SRV
+    registration, reverse-zone ownership, zone-transfer ACLs — the
+    three an operator is most likely to get wrong). None is ever
+    auto-ticked.
+  - **One refusal `force` cannot bypass.** An AD-integrated zone set
+    to "Secure only" dynamic updates is a hard block, because GSS-TSIG
+    is unimplemented (#444) and a domain controller that cannot
+    register its SRV records turns a DNS migration into a domain
+    outage. It fails closed: a dynamic-update mode we cannot interpret
+    on an AD-integrated zone is treated as Secure. 16 readiness
+    blocker codes in all, each `block` or `warn` with an
+    operator-facing fix string. Never having run parity and having run
+    one that proved nothing are treated identically.
+  - **A markdown runbook** (`GET …/runbook`) to paste into a change
+    ticket — deliberately not a summary of what SpatiumDDI already
+    did. It carries the Windows-side PowerShell SpatiumDDI
+    deliberately does not run for you (lowering the *authoritative*
+    TTLs resolvers actually cache — lowering only our side is worse
+    than lowering neither, because it promises a five-minute rollback
+    while the world holds hour-long answers), the exact order of
+    operations, and a rollback with a real number attached, derived
+    from that item's own pre-flight TTL or lease time.
+  - **Ordering is sealed inside a transaction where it has to be.**
+    Both DHCP paths paired an irreversible WinRM call with a database
+    write and let the router commit after both, leaving two windows: a
+    cutover where Windows is deactivated and then the commit fails
+    (the subnet has *no* DHCP server), and a rollback where both sides
+    end up active for one subnet — the exact overlap the
+    deactivate-before-activate order exists to prevent. The commit
+    point now lives with the ordering rules.
+  - Four MCP tools — `find_cutover_plans`, `find_cutover_plan_status`
+    and `count_cutover_blockers` default-on, `find_cutover_parity_check`
+    default-**off** because it runs a live WinRM pull. Registered in
+    both the backup catalog (its own `migration` section — the
+    pre-flight TTL snapshot is the only copy of the pre-migration
+    TTLs, so a restore without it loses the ability to roll a cutover
+    back) and factory reset.
+- **Agentless Technitium DNS driver — `technitium_api` (#810).**
+  Technitium was the only backend SpatiumDDI supported in exactly one
+  shape: BIND9 has the agent path and RFC 2136, Windows DNS has Path A
+  and Path B, the cloud providers are agentless-only. An operator with
+  an existing Technitium install had to migrate off it, stand up a
+  second one under our agent, or not use SpatiumDDI — for the backend
+  whose entire control surface is a plain HTTP API and is therefore
+  the *easiest* one to drive remotely. Zone and record CRUD plus
+  topology pull; DNSSEC, forwarders and blocklists stay agent-managed.
+  It coexists with the agent-managed `technitium` driver, and since a
+  group is single-driver, a mixed estate is one group each. **No
+  migration** — credentials ride the existing
+  `DNSServer.credentials_encrypted`.
+  - **Agentless, but explicitly not a cloud driver.** It subclasses
+    `CloudDNSDriverBase` — which despite the name is really "agentless
+    driver that keeps a credential dict" — while staying out of
+    `CLOUD_DNS_DRIVERS`, the set that gates the cloud-import flow and
+    the hosted-provider UI. This server is operator-hosted on an
+    operator-supplied URL, which is also why create and update run it
+    through the SSRF guard. The registry grows two sets so the
+    distinction is expressible, `CREDENTIALED_DNS_DRIVERS` and
+    `TOPOLOGY_PULL_DRIVERS`, the latter replacing two inline
+    `windows_dns or CLOUD_DNS_DRIVERS` comparisons that had to be kept
+    in step by hand.
+  - **Errors arrive as HTTP 200.** Technitium reports application
+    failures in the response *body*, so a driver trusting
+    `raise_for_status()` reads every auth failure as an empty success
+    — and an empty zone list handed to a sync diff is exactly the #430
+    shape that proposes deleting everything SpatiumDDI knows about.
+    One unwrap path reads every response, and an `invalid-token` names
+    the console page that fixes it rather than sending people to read
+    zone config.
+  - **Zone create is Primary-only and refuses anything else rather
+    than defaulting.** Silently creating a Primary for a secondary /
+    stub / forward zone would mint an empty authoritative zone on the
+    operator's *live* server, and the whole domain would start
+    answering NXDOMAIN. Zone reads preserve Technitium's real type and
+    mark non-Primary zones unmanageable; sync-from-server skips them
+    rather than adopting someone else's zone as authoritative.
+  - **Credential update merges over the stored blob.** The modal
+    renders every field blank on edit, because credentials are never
+    returned, and says blank means keep — under a full replace,
+    "fix the port in the URL" became "delete the token".
+  - New **Test Connection** button on a saved DNS server, covering all
+    nine credentialed agentless drivers. `CloudDNSDriverBase.probe`
+    had existed since #37 with no caller, so "did that token work?"
+    was previously answered by waiting for a sync to fail. A bad token
+    returns `ok=false` carrying the provider's own message rather than
+    raising, which is the useful thing to show.
+- **Searchable, permission-filtered resource pickers on the
+  self-service request portal (#759).** The New Request form asked for
+  raw UUIDs for block / subnet / zone / scope — unfillable by exactly
+  the low-privilege audience the portal exists for. The four reference
+  fields now carry an `x-resource` annotation whose value **is** the
+  RBAC `resource_type` (one vocabulary, no mapping table), and a new
+  `GET /requests/resource-options` typeahead filters every candidate
+  row individually through the caller's own read grants: a scoped
+  requester sees exactly their row and never an estate inventory. Only
+  primary zones and active scopes are offered, since anything else
+  produces a request whose approval can only fail. A future annotated
+  field gets a picker with zero frontend changes; unannotated fields
+  keep the text input and enum fields keep their select. Deliberately
+  **no MCP tool** — an explicit non-negotiable #13 decision recorded in
+  the module docstring, since the Copilot's `find_*` tools already
+  cover discovery and this endpoint exists only to narrow them to one
+  caller's grants.
+  - Hardening from review: a stable total order (none of the sort keys
+    are unique — the same CIDR in two spaces, the same zone name per
+    view — and the offset scan re-executes per page, so a readable row
+    straddling a page boundary could be intermittently skipped or
+    duplicated); a `truncated` flag so a caller whose one readable row
+    sorts past the scan cap is told to keep typing instead of hitting
+    a dead-end "no matches" they cannot submit past; ILIKE
+    metacharacters escaped so search is literal, since underscore-led
+    zone names are routine in AD estates; and the view name as a zone
+    sublabel, because the same primary zone name legitimately exists
+    per view under split-horizon and two identical options left the
+    requester picking blind.
+- **Appliance Web UI firewall reachability self-check (#779).** When a
+  fresh appliance's Web UI was unreachable, nothing on the box said so
+  — #776 took a full diagnostic session to arrive at "one nftables
+  accept rule is missing", with every intermediate step confirming
+  something healthy. A new host script reads the kernel-active ruleset
+  via `nft -j` and answers the question a self-`curl` **cannot**: would
+  a *new, off-box* TCP connection to 443 (and 80) be accepted? Curling
+  the appliance's own LAN IP rides `iif lo accept` and succeeds against
+  a firewalled port — the exact trap #776 walked into, now pinned by
+  test. It runs at first boot right after the Ready URL is printed, on
+  a 5-minute timer, and again after every firewall apply.
+  - **It cannot cry wolf, by construction.** An accept carrying a
+    `saddr` restriction (the #285 Phase 6 `web_ui_allowed_cidrs`)
+    reports `scoped`, never `blocked` — a hardened appliance must not
+    be reported as broken. Qualified drops are skipped rather than
+    counted as blocks, so a per-subnet drop or a `limit rate over`
+    flood protector produces no false CRITICAL. Constructs the model
+    does not cover — negated matches, named-set dport references,
+    dport vmaps, jumps in drop-policy chains — degrade to
+    `indeterminate` rather than a confident wrong verdict. Only a
+    fresh `blocked` renders anything, in bold red on the console next
+    to the Web UI URL it invalidates.
+  - **Per-chain evaluation with worst-wins combining.** Flattening
+    every input-hooked chain into one first-match walk let a stray
+    `iptables -A INPUT … -j ACCEPT` landing in kube-proxy's
+    accept-policy chain mask the drop-policy chain that had no accept
+    — a false *open* in exactly the scenario the tool exists for.
+  - The verdict lives in `/run`, because it must never outlive the
+    ruleset it describes, and carries its own freshness window so a
+    change to the timer cadence cannot silently outrun the reader.
+    Deliberately independent of the supervisor, whose drift check
+    cannot run before it registers and answers "did my drop-in apply",
+    not "can anyone reach the management surface".
+- **Nightly pre-releases (#805, #823, #849).** Nothing built the
+  *release* images except a release, which is how #732 shipped an api
+  image with pytest installed as root and how base-image CVEs stayed
+  invisible (the scheduled Trivy scan only reads *published* images).
+  Every night that `main` moves now cuts a pre-release tagged
+  `nightly-YYYY.MM.DD` — CalVer so nightlies sort and read like the
+  releases they sit beside, and prefixed so the tag can never match
+  the bare-CalVer trigger and fire a real release build. It carries
+  container images, the appliance ISO and the A/B slot image, and it
+  scans **before** it pushes, so the gate can actually prevent
+  publication. The ISO and slot image are assembled by a new reusable
+  workflow that `release.yml` also calls, so the nightly exercises the
+  exact assembly the next release will run and a regression surfaces
+  the next morning instead of at the cut. Kept 7 Eastern calendar
+  days, keyed on the tag's own date so a late re-run cannot rejuvenate
+  one.
+
+### Changed
+
+- **Backend test shards are skipped when a PR cannot affect them
+  (#813, #821).** The 8 shards are the longest thing in CI — each
+  spins up Postgres and Redis, installs dependencies and migrates —
+  and ran on every PR including docs-only, frontend-only and
+  chart-only ones. A `changes` job now gates them, while the workflow
+  still always runs and posts every check-run so `protect-main` never
+  blocks. The path list is a **deny-list** deliberately: an allow-list
+  fails silently toward a green PR that was never tested. The follow-up
+  added `agent/`, `appliance/` and `.github/` to that deny-list with
+  enforced carve-outs — a handful of backend tests genuinely read
+  files out of those subtrees, so the reads are declared in a manifest
+  the gate's own test file enforces in both directions, and a new
+  undeclared cross-boundary read fails loudly instead of the gate
+  silently skipping coverage.
+- **The four per-image build workflows are now PR-only (#807).** Each
+  carried a CalVer `tags:` trigger that resolved to exactly the
+  `:<VERSION>` tag `release.yml` pushes, so every release ran two
+  concurrent multi-arch builds of identical source pushing the same
+  tag, with the winner decided by whichever finished last. On `main`
+  they published `:main` and `:sha-<short>` tags that no chart,
+  compose file or manifest pins — and that path skipped Trivy
+  entirely, so it was publishing unscanned multi-arch images for no
+  consumer. Manual rebuilds stay available via `workflow_dispatch`.
+- **Every GitHub Action bumped to its Node 24 release** (#764, #770
+  and #833). All 39 first-party `actions/*` usages across 11 workflows,
+  then the remaining third-party majors — `azure/setup-helm`,
+  `docker/build-push-action` (which also collapses a v5/v6 drift),
+  `docker/login-action`, `docker/metadata-action`,
+  `docker/setup-buildx-action`, `docker/setup-qemu-action` and
+  `softprops/action-gh-release`. Every target was verified node24 by
+  reading `using:` out of the tag's own `action.yml`, which corrected
+  the issue's own table — `download-artifact` v5 and v6 are both still
+  node20. Nothing in the repo targets Node 20 after this.
+  `aquasecurity/trivy-action` also moves 0.33.1 → 0.36.0.
+- **pysnmp `~=6.2` → `~=7.1`, with the poller migrated (#854).**
+  pysnmp 7.x removed the camelCase HLAPI functions the SNMP poller
+  called, so `getCmd` and `bulkWalkCmd` raise `AttributeError` on 7.1
+  and every device poll and test-connection probe would have broken.
+  Dependabot's bare bump could not be merged as-is, because the poller
+  tests stub the whole HLAPI module and CI stayed green while the real
+  path was dead. Call sites renamed to `get_cmd` / `bulk_walk_cmd`,
+  and SNMPv1 walks routed through `walk_cmd` — SNMPv1 has no GETBULK
+  and pysnmp never downgraded automatically, so the old docstring's
+  claim that it did was wrong in 6.x too. Two new contract tests
+  import the *installed* pysnmp and assert every symbol and
+  constructor kwarg the poller uses, so the next incompatible bump
+  fails in CI instead of in the field. Validated live against a UniFi
+  UDM-SE on pysnmp 7.1.28.
+- **Documentation moved to `www.spatiumddi.com`, and publishes on
+  every `main` push (#754).** ~45 references still advertised
+  `spatiumddi.github.io` — an extra 301 on every link, the wrong brand
+  in the appliance login banner and Helm chart metadata, and a sitemap
+  naming a domain that only redirects. Publishing switched from
+  release-tags-only to every main push, so a docs fix no longer waits
+  for the release cadence; deliberately with **no** paths filter,
+  because a paths filter applies to tag pushes too and a tag push
+  carries no changed-file list, which would silently stop releases
+  publishing.
+- **21 ASCII diagrams converted to SVG, with a CI geometry gate
+  (#763).** Box-drawing diagrams in fenced code blocks wrapped badly
+  on narrow viewports and ignored the dark theme. A new verifier
+  renders every diagram in headless Chromium and reads real `getBBox()`
+  metrics — text overflowing its container, viewBox clipping,
+  colliding labels, sub-9.5px type, dropped text — wired into CI as
+  "Docs — Diagram Geometry", which immediately failed 3 of the 8
+  already-committed diagrams. New `make docs` / `docs-down` /
+  `docs-verify` targets and a local Jekyll preview come with it.
+- **Getting Started rewritten with progressive disclosure (#766)** for
+  three audiences (evaluator, expert, DDI newcomer) without slowing
+  the fast path: pick-your-path entry points, a collapsible concepts
+  primer, per-step success checks, two-question backend decision
+  helpers ahead of the unchanged matrices, a worked example threaded
+  through steps 3–10, and symptom/cause/fix troubleshooting. All
+  existing headings, anchors and tables preserved verbatim.
+- **New `docs/THIRD_PARTY.md` catalogue (#804),** grouped by artifact
+  with license, version pin and the file authoritative for that pin,
+  so it can be checked rather than trusted — including the things
+  easiest to get wrong (Traefik and metrics-server ship in the k3s
+  airgap bundle but are disabled by config; MetalLB is pinned to
+  0.15.3 because 0.16.0 regressed the speaker into an apiserver-
+  flooding loop; Alpine is held at 3.23 because 3.24's Python 3.13
+  crashloops the agents). Writing it turned up real NOTICE defects,
+  below.
+- **Technitium given first-class billing everywhere BIND9 and PowerDNS
+  appear (#800).** It shipped as the third agent-managed driver back
+  in #746, but the landing page, getting-started backend picker, Docker
+  and Kubernetes guides, migration reference, firewall role taxonomy
+  and architecture tables all still described a two-driver world, so
+  an operator had no way to discover a driver the product already
+  runs.
+- **The docs site nav collapses into a hamburger on small screens
+  (#780).** Below 820px it did not collapse — `hide-sm` set
+  `display: none` on Features, Install and Community, so three of the
+  five destinations were simply unreachable on a phone with nothing
+  indicating they existed. The replacement is an opaque full-width
+  panel (the bar itself is `backdrop-filter`-translucent, and a
+  see-through dropdown over content is unreadable) that closes on link
+  click, outside click and Escape, and is gated on
+  `data-nav-enhanced` so without JavaScript the links stay a plain
+  wrapping row rather than hiding behind a button that cannot open.
+- **The Operator Copilot system prompt was refreshed (#760).** It had
+  not been touched since #120 and had accumulated factual errors the
+  model acted on: it named `propose_create_subnet`, which does not
+  exist (the real tool is `propose_allocate_subnet`), and an example
+  filtered `get_audit_history` by a parameter that tool has never had.
+  Stale facts corrected and terse primers added for every post-May
+  surface the Copilot had no awareness of — integration mirrors, ops
+  and governance, appliance fleet, vertical registries, and
+  feature-module gating, which the disabled-tools block now also names
+  as a cause.
+- Dependency bumps: axios 1.18.1 → 1.19.0, vite 8.1.5 → 8.2.1,
+  `@vitejs/plugin-react` 6.0.4 → 6.0.5, postcss 8.5.23 → 8.5.26,
+  `react-router-dom` 7.18.1 → 7.18.2 (#771, #772, #852).
+
+### Fixed
+
+- **A DNS record created through the API never reached the wire under
+  split-horizon (#704, #707).** The record was rendered correctly into
+  `rendered/zones/<view>/<zone>.db` and then never served: the API
+  returned 201 and the wire answered NXDOMAIN, permanently, for every
+  record created after the zone's first load. `swap_and_reload`
+  signalled named with `rndc reconfig`, which BIND defines as "reload
+  the configuration file and load new zones, but do **not** reload
+  existing zone files even if they have changed". That was the right
+  primitive while a record edit reached the daemon over RFC 2136 — but
+  split-horizon changed the contract underneath it: for a group with
+  views the control plane deliberately stops dispatching record ops
+  (an nsupdate to loopback cannot target a view) and propagates by
+  re-rendering the zone file instead. The re-render became the only
+  path left, and it is exactly the path `reconfig` does not read.
+  Compounding it, every primary zone renders with the group's loopback
+  TSIG grant in `allow-update` unconditionally, so named treats the
+  zone as dynamic and will not re-read its file on a plain reload
+  either. Now `reconfig` still handles config and added or removed
+  zones, then each rendered zone is frozen, reloaded and thawed,
+  scoped `in <view>` under split-horizon — and only for zones whose
+  rendered bytes actually changed, since a views group re-renders on
+  every record change and reloading all of them per edit is a real
+  `rndc` storm.
+- **Two `named` daemons served the same zone from different serials
+  (#704).** `find_running_daemon` matched on `/proc/<pid>/comm`, but
+  between `Popen(["named", …])` returning and the child completing
+  `execve` the process still carries the *forking* program's name — an
+  ~118 ms window in which a concurrent caller sees nothing and spawns
+  a duplicate. Observed live: two `named` processes, same parent, same
+  config, both holding :53 and :953 under SO_REUSEPORT. The
+  consequence is worse than the known dead-query-log symptom —
+  **`rndc` becomes a coin flip**, so a zone reload reaches one daemon
+  while the other keeps serving its own copy; successive
+  `rndc zonestatus` calls for one zone alternated between two serials
+  loaded an hour apart, and clients got whichever the kernel picked.
+  Fixed with an exclusive flock held across the check, the spawn *and*
+  the wait for the new process to become visible under its own name,
+  degrading to the previous behaviour where flock is unavailable
+  rather than refusing to launch. PowerDNS never ran two servers (it
+  has no `reuseport`, so the duplicate fails to bind) but left a
+  zombie the driver reported as a healthy daemon — the same race with
+  a different tail.
+- **Selective restore deleted most of the database (#781).**
+  `TRUNCATE … CASCADE` empties every table holding a foreign key into
+  a truncated one, transitively — and selective restore truncated that
+  way, then restored only the *selected* sections' tables, so
+  everything else CASCADE reached was silently deleted. Measured
+  against the shipped catalog: restoring `auth` owns 11 tables and has
+  **130 collateral**; `dhcp` 16 and 85; `ownership` 5 and 78; `dns` 22
+  and 72. Ten of the twenty sections have collateral. That also
+  invalidated the fix originally sketched, because CASCADE reaches a
+  table whether or not a section claims it — classification only
+  decides what an operator can *tick*, while the real reach is the FK
+  graph. A new closure is computed from mapped metadata (a
+  hand-maintained copy is one migration away from being wrong) and the
+  restore now truncates **and restores** it. The result is
+  deliberately wider than what the operator ticked — the alternative
+  was never "narrower", it was "emptied" — so it is reported on the
+  response, in a warning naming the tables, in the log and on the
+  audit row.
+- **The cross-install secret rewrap missed more than half the
+  credentials it existed to migrate (#781).** `ENCRYPTED_COLUMNS`
+  drove it and had drifted to **21 of the schema's 47** Fernet
+  `LargeBinary` columns, while naming one table that has never
+  existed, whose lookup failure was swallowed as "absent on this
+  install". Everything it missed survived a restore still encrypted
+  under the *source* install's key: the appliance CA and Web-UI TLS
+  private keys, k3s join tokens, pairing-code reveals, ACME account
+  keys, and every integration credential added since the feature
+  shipped. On the appliance this is the default case, since firstboot
+  mints a fresh `SECRET_KEY`, so every restore onto reimaged hardware
+  is a cross-install restore. A second, structurally invisible class
+  followed: Fernet ciphertext stored as a JSON string inside a JSONB
+  column is neither `LargeBinary` nor `*_encrypted`-suffixed, so the
+  metadata diff could not see it — leaving SNMPv3 auth and priv
+  passphrases, syslog-forwarder TLS CA bundles, APT armoured GPG keys
+  and private-mirror passwords unrewrapped. Both halves now have drift
+  guards that fail the build: set-equality against mapped metadata for
+  the columns, and an AST walk asserting every `encrypt_str(...)` call
+  site is registered for the JSONB fields.
+- **A partial rewrap was reported as "nothing happened" (#781).** The
+  walk commits per column, so an abort partway leaves the credential
+  store genuinely half-migrated — and the old shape lost exactly that,
+  answering with a fresh result object so the audit row and API
+  response both said `rewrapped_rows=0`, from which an operator
+  concludes nothing happened, the one wrong conclusion. It now returns
+  accumulated counters with `aborted=True`, records how far it got,
+  and raises a warning. Relatedly, the newer-schema refusal is no
+  longer a one-way door: it protects a real failure, but absolute it
+  removed the A/B rollback path, telling an operator who rolled back
+  *because* the new build broke to upgrade into the build they had
+  just escaped. A superadmin-only `allow_newer_schema` override now
+  exists, recorded on the audit row.
+- **The slot-upgrade endpoints did not say which node they described,
+  and armed an arbitrary one (#839).** The api Deployment runs one
+  replica per control-plane node with hard anti-affinity behind a
+  Service with no session affinity, so an IP selects an ingress, not a
+  pod. Eight consecutive GETs against *one* member's own IP returned
+  `ready / done / ready / done / done / done / done / ready` — same
+  URL, same second, different machines. The write half was worse:
+  apply and rollback write trigger files to a hostPath on whichever
+  node answered, so a rolling cluster upgrade could upgrade one node
+  three times and never touch the other two, returning 202 every time.
+  Status now carries the responding `node`, and the write endpoints
+  refuse rather than guess — see Breaking.
+- **Slot state and rollback were broken on every appliance (#836).**
+  The API reported `current_slot` and `durable_default` as null,
+  `is_trial_boot` always false, and rollback 409'd with "active slot
+  couldn't be detected" even immediately after a successful, committed
+  A/B upgrade. The endpoint derives that state from host paths only
+  the supervisor pod mounted. The api pod now mirrors the same two
+  read-only mounts, gated on the existing `applianceHostMounts` flag
+  so non-appliance deploys are unaffected. The host-side CLI worked
+  throughout; only the API surface was broken.
+- **"Clear failed upgrade" could not clear a failed upgrade (#786).**
+  The button POSTed and the appliance stayed in the red card, across
+  reboots. The endpoint reset the `desired_slot_image_*` columns, but
+  the card renders from `last_upgrade_state` / `last_upgrade_progress`,
+  which the heartbeat re-publishes verbatim from host sidecar files
+  every ~30 s — the host owned the state, and it lives on the
+  persistent `/var` a slot write never touches. Worse, the existing
+  cleanup path returned early whenever a trigger file was present,
+  which is exactly what a stranded apply leaves behind, so the box
+  could neither clear nor re-apply. The clear is now a *command to the
+  host* that rides every heartbeat until the host acknowledges, rather
+  than expiring on a timer that could fire before delivery. Two
+  enabling fixes underneath it: the host runner publishes both
+  sidecars world-writable and firstboot backfills the mode, because
+  the unprivileged supervisor got EACCES against root-written files —
+  meaning the long-shipped fleet-marker clear had also been inert —
+  and a clear whose unlink fails now returns an error instead of
+  reporting success on a still-wedged box.
+- **Three more slot-upgrade defects (#787, #788, #789).**
+  `spatium-upgrade-slot status` always showed the *booted* slot as
+  "unreadable", because the active slot's device is already mounted rw
+  at `/` and the read-only probe is refused by the kernel — on every
+  appliance and every release, read by operators as a failed upgrade
+  immediately after a successful one. The rolling upgrade path set
+  only the version and URL and never the integrity hints, so the host
+  runner fetched the appliance's own self-signed HTTPS URL with
+  verification on and no hash to check, and any stale hash from an
+  earlier per-box schedule was checked against the *new* image and
+  failed the apply as corruption; resolution and stamping now live in
+  one place both callers use. And the air-gap download recipe in the
+  docs pinned a release tag while using the un-versioned "stable"
+  asset name, which retention prunes the moment a newer release is
+  cut, so that URL 404s forever after.
+- **Uploaded slot images went missing on multi-node control planes
+  (#787, #792).** An uploaded or imported image lands on a node-local
+  hostPath — whichever api replica served the upload — while the host
+  runner's download round-robins through the Service, so roughly half
+  of downloads 404'd with "bytes missing on disk — re-upload
+  required", and re-uploading could not fix it because the bytes exist
+  on a node the operator cannot see. The mirror that solves this
+  shipped in #296 but defaulted off and nothing ever enabled it; it is
+  now derived from control-plane size and **latches on**, because the
+  PVC and its Secret carry a keep policy and disabling the mirror
+  would strand every image living only on the PVC. Separately,
+  `apply_control_plane_overrides` assigned its values wholesale and
+  deleted every key it did not own — including the `image.tag` a
+  rolling upgrade had stamped on the same resource seconds earlier,
+  i.e. two writers PATCHing each other and silently rolling the
+  control-plane version back mid-upgrade. It now deep-merges onto the
+  parsed live document and **aborts the write entirely when current
+  values are unknown**.
+- **The founding node never appeared in the Fleet UI on some networks
+  (#777).** Narrower than "ndots:5 plus an inherited search domain":
+  kubelet appends the *node's* DHCP search domains to every pod's
+  `resolv.conf`; with `ndots:5` a four-dot Service name walks that list
+  first; and if an inherited domain answers **NOERROR/NODATA** rather
+  than NXDOMAIN for a non-existent name, musl stops the walk and gives
+  up without ever trying the bare name. A lab domain that NXDOMAINs
+  works fine, which is why this looked healthy in-house. Fixed with a
+  trailing dot on the two URLs that broke plus `ndots:1` on the pod
+  spec, and the DNS and DHCP agent charts carried the identical
+  unqualified name and are fixed the same way.
+- **A cold-booting appliance showed a wall of failing XHRs instead of
+  the initialising page (#767, #769).** `_starting.html` shipped and
+  both nginx configs declared the error page, but `location /` serves
+  `index.html` off local disk — no upstream, so the error page could
+  never fire, and the page appeared only if you hand-typed an `/api/`
+  URL. It now gates on a sub-request to the api Service. Underneath
+  that, :80 and :443 were firewall-filtered until the supervisor's
+  first heartbeat, which on a control-plane appliance goes to the
+  *local* api — measured on a clean install, the port opened 41 s
+  *after* the control plane came up, so operators saw a ~3-minute
+  connection timeout rather than the initialising page, making the fix
+  above inert on exactly the case it was written for. A baked sentinel
+  now opens the Web UI ports from first boot and **retires itself the
+  moment `web_ui_allowed_cidrs` is set**, since its un-scoped accept
+  sorts earlier in the include glob and leaving it would silently
+  defeat the operator's scope. Also fixed in the same pass: the api's
+  startup bootstrap minted a *rival* self-signed cert to the one
+  firstboot had already installed, so operators accepted two certs and
+  :443 dropped for ~5 s mid-boot; startup now adopts a deployed cert
+  when it parses, its key matches and its SANs cover the appliance.
+- **Overlapping IP spaces broke shared DHCP and DNS groups (#844).**
+  Two same-CIDR subnets in different IP spaces converging on shared
+  infrastructure failed four ways, and there are now four guards.
+  Scope create and activate 409 when another active scope in the group
+  covers an overlapping CIDR, because two identical `subnet4` prefixes
+  make Kea reject the **whole** config at load. The bundle build drops
+  raced-in duplicate and overlapping-but-unequal prefixes, oldest
+  scope winning, so a bad combination can never reach an agent — which
+  also covers subnet resize, which still lacks a scope-aware API
+  guard. Lease-to-subnet resolution prefers subnets actually scoped to
+  the requesting server's group over an equal prefix from an unrelated
+  space. And reverse zones are never shared across spaces. That last
+  guard originally keyed on a bare space-id mismatch, but IPv4 reverse
+  zones aggregate to /24, so two legitimately non-overlapping subnets
+  in different spaces share one zone with disjoint PTR names — it now
+  requires an actual CIDR overlap before refusing.
+- **`dnssec_enabled=true` at zone create set a flag and nothing else
+  (#811).** BIND9 converges from the flag alone via inline-signing,
+  but PowerDNS and Technitium sign only in response to the
+  `dnssec_sign` record op, which neither REST `create_zone` nor the
+  Copilot's `create_dns_zone` enqueued — so the zone read as
+  DNSSEC-enabled in the UI, in `GET /zones/{id}` and in the audit row,
+  and was **unsigned on the wire** until someone clicked Sign. Create
+  also never called the driver gate, so the flag was accepted on a
+  `windows_dns` group where nothing will ever sign it. One
+  `enqueue_dnssec_op()` chokepoint now serves the sign and unsign
+  endpoints, both create paths and the update flip, so they cannot
+  drift apart again. The flag-*off* direction is deliberately ungated
+  everywhere, because gating it trapped the pre-existing
+  flagged-but-unsignable zones with no API remediation.
+- **Agentless drivers had been doing whole-RRset writes all along
+  (#773, #783).** A record op carries one record, but no agent wire
+  protocol can express "change this RR and leave its siblings alone"
+  from a payload naming only the new value — so every agent driver did
+  a whole-RRset write and lost the siblings, and a name with several
+  values served whichever op landed last. The agentless drivers were
+  initially left out of that fix on the reasoning that they never read
+  the field; the reasoning was sound and the conclusion was the bug.
+  Windows rendered a remove that drops **every** RR at the (name,
+  type) and then added back only one value, so a name with two A
+  records, a backup MX, SPF beside a verification TXT, or several apex
+  NS served exactly one of them after any write. Route 53, Azure DNS
+  and Google Cloud DNS replaced the whole RRset with the op's single
+  value, each carrying a comment calling that an inherent limitation —
+  it was only inherent while the op carried a single value. The
+  database and the drift report showed every value throughout, which
+  is the kind of divergence nobody notices until a failover. The
+  control plane now ships the complete desired set on the op, which
+  makes every op idempotent as a side effect: replaying one converges
+  the server to the database instead of moving it to an earlier state.
+- **OPNsense mirrored nothing on 25.7+ (#797).** The integration
+  reported a successful sync with zero results on every pass against a
+  current firewall, forever, with nothing in the UI suggesting a
+  problem. Three independent causes. The interface parser was written
+  against a shape that does not exist — it expected flat address keys
+  on a logical-name-keyed dict, while the endpoint is a passthrough
+  keyed by OS device with addresses in arrays — so it matched nothing
+  on every real firewall, and because the response is a non-empty dict
+  the degraded-read guard never tripped. ISC dhcpd moved out of core
+  to a plugin in 25.7 with Dnsmasq the wizard default and Kea the
+  advanced option, so `/api/dhcpv4/*` simply 404s — and the client
+  treated 404 as "empty table", so leases and reservations could never
+  mirror; all three backends are now unioned every pass. And the
+  warnings were computed and dropped on the floor, read by nothing —
+  no column, no API field, no UI, absent from the audit row and the
+  log line. It survived a green test suite because the fixtures
+  encoded the same invented shape as the parser, so the tests agreed
+  with the code and both disagreed with reality; every fixture is now
+  a captured payload, and a non-empty payload that parses to zero rows
+  raises as a degraded read.
+- **A FortiGate reservation delete scrambled the reserved-address
+  table (#847).** FortiOS applies a parent PUT to child tables per
+  entry id, not as an atomic replace, and the driver renumbered
+  reserved addresses, ranges and options positionally on every push —
+  so deleting a non-last reservation shifted every later entry onto a
+  different id, the per-id update transiently duplicated a MAC still
+  present at the next id, FortiOS aborted mid-apply, the wrong entries
+  vanished from the device, and the error surfaced as a 502 that
+  failed the frontend delete outright. Deleting the highest-id entry
+  shifted nothing, which is why it only failed sometimes. Each desired
+  child entry is now pinned to the id its logical match already holds
+  on the device, with genuinely new entries assigned ids above every
+  id in play and stale entries removed via explicit child DELETEs
+  before the parent PUT.
+- **A typo'd reservation MAC returned 500 (#828).** The field was a
+  bare `str` with no validator while the column is `MACADDR`, so a
+  malformed value reached Postgres as a cast failure and surfaced in
+  the New Static Assignment form as "Internal Server Error". The
+  MAC-blocklist endpoint in the same package had always validated
+  correctly, so reservations also *rejected* input the blocklist
+  accepts; that canonicalizer now serves both. Strictly narrowing —
+  what used to 500 now 422s naming the field, and what used to succeed
+  still does.
+- **The OpenAPI document declared a 422 body the API has never
+  returned (#834).** ~270 hand-raised 422s across the router files
+  serialise as `{"detail": "<string>"}` while the schema declared
+  `detail` as an array, so every hand-raised 422 violated the API's own
+  published contract — 29 of the 39 red rows on one conformance run
+  were this single defect. Widening the *document* rather than
+  rewriting the bodies is deliberate: the string form is the
+  established contract and the frontend already normalises all three
+  shapes, so rewriting 270 bodies would break clients outside this
+  repo to fix a documentation defect. In the same pass, `page` was
+  bounded: `page_size` has been capped since #455 but `page` never
+  was, and the offset is `(page - 1) * page_size` against a bigint
+  `OFFSET`, so every list endpoint was one query parameter away from a
+  500 — measured live, the boundary is exactly 2^63-1.
+- **`PUT /dhcp/scopes/{id}` silently no-op'd a read-modify-write
+  (#774).** The response emits only `enabled` while the write model
+  also accepts `is_active`, so a GET, edit and PUT let stale GET
+  residue win: "deactivate this scope" returned 200 while the scope
+  kept handing out addresses. Both write models now 422 when the two
+  names are present with real, differing values. A precedence rule was
+  rejected deliberately — the entire cost of this bug was that it was
+  silent.
+- **The scope form had a DDNS field that went nowhere (#784).**
+  `ScopeResponse` declared `ddns_domain_override` and hardcoded it to
+  `None`; no column backed it, neither write model declared it, and
+  the create modal sent it on every save. An operator typed a domain,
+  got a 200, re-opened the scope and found the field empty, with no
+  error anywhere in between. Removed rather than implemented, because
+  the setting already exists one level up and works — the effective
+  DDNS resolver walks subnet, block and space, and a scope maps 1:1 to
+  a subnet, so a scope-level copy would be a second source of truth.
+- **The Copilot refused DNSSEC work the product supports (#798).**
+  `propose_create_dns_zone` declined `dnssec_enabled=true` on any group
+  without a PowerDNS member, but the REST gate it fronts has allowed
+  BIND9 since #49 and Technitium since #740 — the tool's own list was
+  never widened alongside it. It now reads the REST operation's gate at
+  preview time so the two cannot drift again. Four operator-visible
+  tool descriptions also stated the old rule as fact, and since those
+  ship to the model as schema text they steered it toward PowerDNS
+  even where the guard was correct.
+- **Technitium's encrypted-DNS ports were never declared in any
+  deployment artifact (#799).** #741 shipped the native DoT, DoH and
+  DoQ listeners and the supervisor already opens the host firewall
+  ports, but the compose file had no Technitium block at all, so on
+  the documented evaluation path the daemon listened inside the
+  container with nothing routed to it; and the appliance chart declared
+  only :53, which is cosmetic under hostNetwork but meant enabling the
+  MetalLB VIP silently took encrypted DNS away from a Technitium group
+  while leaving it working for BIND9. The umbrella chart also had no
+  `doqPort` key at all, so DoQ was not expressible — it needs its own
+  key because it shares DoT's port *number* and differs in protocol.
+- **coredns rollout deadlocked on a single-node appliance (#750).**
+  The HA shape was applied regardless of node count; on one node the
+  pod-template rewrite creates a ReplicaSet that can never schedule
+  while the old pod can never drain, and the converged check was a
+  ratchet so nothing could undo it. The target is now a function of
+  registered node count, so a fresh install is a total no-op and a
+  stuck appliance heals in one patch.
+- **Appliance console rendering (#803).** Nine items checked on a real
+  screen: a non-expanding grid left 10–15 columns dead while a hard cut
+  truncated pod names at exactly the hash, so two CloudNativePG
+  replicas rendered identically; the NODE column rendered on
+  single-node boxes, starving the only flexible column; two adjacent
+  panels disagreed about pod count because one counted Succeeded Jobs
+  the other hides; the live-log pane was drowned in Celery sweep churn
+  and now parses the *result* rather than matching literals; both log
+  sources strip ANSI and control bytes, since the console font has 256
+  glyphs; a reversed sort swapped equal-usage pods as readings
+  wobbled; and sub-centicore CPU rendered `0.00` for every idle pod
+  and now falls back to millicores.
+- **The frontend went blank when one component threw, and the dev loop
+  crashed on the platform health card (#817, #818).** Error boundaries
+  now apply at three layers — top-level, route-level around the outlet
+  so the sidebar and header stay usable, and per-widget on dashboard
+  cards so a bad panel is confined to its own error card. The
+  route-level boundary's error state initially survived navigation, so
+  after one page crashed every sidebar link kept rendering the
+  fallback; it is now keyed by pathname. Separately the Vite dev proxy
+  forwarded only `/api`, so `/health/platform` fell through to the SPA
+  fallback and returned `index.html`. Community contributions — thanks
+  to Tristan Rhodes and Devin.
+- **The forced first-login password change only checked the confirm
+  field after submit (#814).** A typo surfaced post-click via the error
+  banner; it now mirrors the live-mismatch pattern already shipped in
+  the admin users page — destructive border, inline hint, submit
+  disabled — with the submit-time guard kept as a backstop for the
+  empty-confirm case.
+- **A failing nightly could not open its own tracking issue (#820).**
+  The finalize job has no checkout, so every `gh` call died with "not a
+  git repository" — the one thing that makes a scheduled build worth
+  having.
+- **`docs/THIRD_PARTY.md` fixed real NOTICE defects (#804).**
+  Technitium — a GPL v3 server we ship — was missing entirely, as were
+  paramiko, the appliance OS userland beyond ten packages, CoreDNS,
+  runc, local-path-provisioner, Patroni, HAProxy, the API image's
+  operator tooling and ~20 backend and frontend libraries. Authlib was
+  listed but is not a dependency, Scapy was filed under Backend but
+  ships in the DHCP agent image, Redis was described as a version we
+  do not ship, and the closing line promised license texts in a
+  directory that has never existed.
+
+### Security
+
+- **SNMPv3 users were silently downgraded to unauthenticated (#781).**
+  The passphrase decrypt returned `None` for both "absent" and
+  "undecryptable", and the level ladder gated on the passphrase being
+  present — so a user configured for **authPriv** whose passphrase
+  would not decrypt fell all the way through to a `noauth` read-only
+  user reachable by anyone the firewall lets in. A silent downgrade
+  rather than an outage, so nothing failed and nobody looked. Both
+  rungs now omit the user and say why in the rendered config. The
+  trigger narrowed once the JSONB rewrap above landed, but a rotated
+  `SECRET_KEY` still reaches it.
+- **`snmpd.conf` directive injection via the SNMPv3 username (#781).**
+  The file is whitespace-delimited and does not quote the username
+  token, so a **newline** ends the directive and starts another: given
+  a username containing one, the renderer emitted four directives from
+  one configured user — including a **read-write** SNMP user. The only
+  validation was a strip and a non-empty check, so it passed the API
+  cleanly. Superadmin-only, so not remotely reachable, but it
+  escalates "can edit a settings form" into "can write the daemon's
+  config". Fixed in both places deliberately: the API rejects
+  whitespace and control characters so the operator's own request is
+  the error site, and the renderer re-checks, because rows written
+  before the validator exist in the database and the renderer is the
+  last thing between stored state and the file snmpd loads.
+- **"Exclude secrets" diagnostic archives shipped credentials anyway
+  (#781).** Two blind spots, both from the same hardcoding. The scrub
+  drove off the 21-of-47 column list, so a sanitized archive still
+  carried the appliance CA key, TLS private keys, k3s join tokens,
+  pairing-code reveals, ACME account keys and integration credentials;
+  and it shared the JSONB blind spot, so an archive built with secrets
+  excluded still shipped every SNMPv3 passphrase, syslog TLS CA
+  bundle, APT GPG key and private-mirror password. Both now drive off
+  the same registries the rewrap does, blanking keyed entries the way
+  the settings writers do when an operator clears one, so a scrubbed
+  archive restores to "not configured" rather than "configured as
+  empty".
+- **The restore's schema-direction gate failed open (#781).** The
+  newer-schema refusal ran *after* the restore replay, so it only
+  described damage already done; it used a hardcoded path that made it
+  return "proceed" everywhere outside the container image; and it
+  returned the same on any unreadable-head condition. It now runs
+  before replay, resolves through the shared locator, and **fails
+  closed** with a message naming the reason.
+- **Publishing workflows never run on forks (#830).** GitHub copies
+  workflows into every fork, and a fork owner who enables Actions got
+  working publishers: the image prefix derives from the repository
+  owner and the fork's token can push packages to its own namespace,
+  so the nightly would build and push images and a 1.5 GB appliance
+  ISO, create pre-releases and failure-tracking issues in the fork,
+  and a CalVer tag push there would cut a full look-alike release. The
+  entry job of each publishing and scheduled workflow is now guarded
+  on the repository owner, and since every downstream job needs the
+  entry job the whole graph skips. CI, the agent e2e suite and the
+  PR-triggered scan workflows are deliberately not gated — fork
+  contributors need them and they publish nothing on the PR path.
+- **Two HIGH findings cleared in the looking-glass image (#820).**
+  `golang.org/x/text` v0.38.0 (CVE-2026-56852, `norm.Iter` infinite
+  loop) and `google.golang.org/grpc` v1.79.3 (GHSA-hrxh-6v49-42gf, xDS
+  RBAC + HTTP/2), both pinned transitively by gobgp v4.7.0. Bumped to
+  x/text 0.40.0 and grpc 1.83.0 via the existing build-stage pin.
+- **Three high-severity transitive advisories patched in the frontend
+  lockfile (#850),** all within-major patch releases: js-yaml 4.3.0 →
+  4.3.1 (GHSA-5p4m-2wfm-xmqj, quadratic CPU in `!!omap` resolution),
+  nanoid 3.3.16 → 3.3.18 (CVE-2026-67213, custom generators loop
+  indefinitely on size 0) and brace-expansion 1.1.17 → 1.1.18 plus
+  5.0.8 → 5.0.9 (GHSA-mh99-v99m-4gvg and GHSA-rgw5-rvv9-x895, OOM
+  DoS). `npm audit` reports 0 vulnerabilities at any level.
+- **axios 1.19.0 raises the form-data floor past
+  GHSA-hmw2-7cc7-3qxx (#772).** Hardening only — form-data already
+  resolved to a fixed version, so this was not a live exposure.
+- The removed `main`-push image publishes (#807) had also **skipped
+  Trivy entirely**, since the scan is gated on pull requests, so
+  unscanned multi-arch images are no longer published.
+
+### Migrations
+
+- `a4f1c93d7e28` — `cutover_plan` / `cutover_item` /
+  `cutover_checklist_item` / `cutover_event` + seed the
+  `migration.cutover` feature module (#756).
+- `e3b7a1c25d94` — `appliance.clear_upgrade_requested` + `…_at`, the
+  host-side clear-upgrade command (#786).
+- `f4c81a37e0b2` — `opnsense_router.last_sync_warning` (#797).
+
+### Breaking
+
+- **`POST /api/v1/appliance/slot-upgrade/apply` and `/rollback` now
+  409 on any multi-node control plane (#839).** They wrote trigger
+  files to a hostPath on whichever node the load balancer picked,
+  which on a single-node appliance is right and on a cluster is not —
+  so an operator asked to upgrade an appliance and an arbitrary
+  machine armed its inactive slot, returning 202 either way. The 409
+  names the responding node, the node count, and the endpoint that
+  *does* target a node,
+  `POST /api/v1/appliance/appliances/{appliance_id}/upgrade`, which is
+  what the Fleet UI already drives. This breaks automation that drove
+  the singleton endpoint against a cluster, which is the intent: such
+  a caller was already upgrading whichever node it happened to reach.
+  Nothing in the frontend calls it.
+- **`HTTPValidationError.detail` now accepts a string as well as an
+  array (#834).** Regenerate any OpenAPI-derived clients. No wire
+  behaviour changed — the document now matches what the API has always
+  sent.
+- **Out-of-range `page` now returns 422 (#834),** bounded at
+  1,000,000 on 14 list endpoints. It previously returned 200 up to the
+  bigint boundary and then 500.
+- **`POST` and `PUT /dhcp/scopes` now 422 when `enabled` and
+  `is_active` are both supplied with differing real values (#774),**
+  and likewise for `hostname_sync_mode` and `hostname_to_ipam_sync`.
+  Either name alone still works untouched. Read-modify-write
+  automation that echoes a GET back with an edited alias now breaks
+  loudly instead of silently no-oping.
+- **`ddns_domain_override` is removed from `ScopeResponse` (#784).**
+  It was always `null`. Write bodies still sending it are unaffected,
+  since it was never accepted on write.
+- **The `:main` and `:sha-<short>` image tags are no longer
+  published (#807).** No chart, compose file or manifest ever pinned
+  them, and that publish path skipped Trivy. Use `:nightly` or the
+  dated `:nightly-YYYYMMDD` ring instead.
+- **`slotImageMirror.enabled` is now auto-derived on appliance control
+  planes (#787)** — multi-node or already-true, and it latches,
+  because disabling it would strand images that live only on the PVC.
+  BYO-Kubernetes deployments still set it manually.
+
 ## 2026.07.30-1 — 2026-07-30
 
 **The Technitium + DNS threat-analytics release.** Two headline

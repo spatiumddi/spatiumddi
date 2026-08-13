@@ -57,7 +57,7 @@
   <text x="195" y="191" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">DNSServer</text>
   <text x="290" y="182" font-size="12" font-weight="600" fill="#334155"
         font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">dns_server</text>
-  <text x="290" y="200" font-size="12" fill="#475569">an individual BIND9 / PowerDNS / Windows / agentless server</text>
+  <text x="290" y="200" font-size="12" fill="#475569">an individual BIND9 / PowerDNS / Technitium / Windows / agentless server</text>
 
   <!-- DNSView -->
   <rect x="100" y="224" width="756" height="52" rx="10"

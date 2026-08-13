@@ -83,7 +83,8 @@
         fill="url(#arch-surface)" stroke="#94a3b8" stroke-width="2"/>
   <rect x="738" y="140" width="140" height="68" rx="8" fill="url(#arch-agent)"/>
   <text x="808" y="166" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">DNS agent</text>
-  <text x="808" y="184" text-anchor="middle" font-size="11" fill="#fed7aa">BIND9 / PowerDNS</text>
+  <text x="808" y="181" text-anchor="middle" font-size="11" fill="#fed7aa">BIND9 / PowerDNS</text>
+  <text x="808" y="195" text-anchor="middle" font-size="11" fill="#fed7aa">Technitium</text>
   <rect x="738" y="224" width="140" height="68" rx="8" fill="url(#arch-agent)"/>
   <text x="808" y="250" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">DHCP agent</text>
   <text x="808" y="268" text-anchor="middle" font-size="11" fill="#fed7aa">Kea</text>
