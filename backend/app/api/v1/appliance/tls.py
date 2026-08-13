@@ -132,12 +132,16 @@ class CSRGenerate(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     # Subject fields — common_name is required, the rest are optional.
     # Country must be the 2-letter ISO code (CA, US, GB, …) per the
-    # x509 spec; we don't validate further because length=2 strings
-    # like "ZZ" are valid x509 even if politically meaningless.
+    # x509 spec; "ZZ" is fine even if politically meaningless, but the
+    # letters must be ASCII: pydantic's min/max_length counts CHARACTERS
+    # while cryptography's CountryName counts encoded BYTES, so a
+    # 2-character multibyte string passed validation and blew up the
+    # x509.Name build as a 500 ("length must be >= 2 and <= 2, but it
+    # was 6", live under fuzz).
     common_name: str = Field(min_length=1, max_length=255)
     organization: str | None = Field(default=None, max_length=120)
     organizational_unit: str | None = Field(default=None, max_length=120)
-    country: str | None = Field(default=None, min_length=2, max_length=2)
+    country: str | None = Field(default=None, pattern="^[A-Za-z]{2}$")
     state: str | None = Field(default=None, max_length=120)
     locality: str | None = Field(default=None, max_length=120)
     email: str | None = Field(default=None, max_length=255)

@@ -194,6 +194,15 @@ class CloudDNSServerOption(BaseModel):
     has_credentials: bool
 
 
+# A remote-source URL / API credential travels as a URL and an HTTP header,
+# which are ASCII on the wire — a non-ASCII value can never be a working
+# credential, only a crash in the outbound client (live under fuzz:
+# UnicodeEncodeError out of the URL build and "Invalid HTTP header value"
+# out of the header build, both surfacing as 500 before any pull started).
+# Rejecting it here makes it the 422 it is.
+_ASCII = Field(pattern=r"^[\x20-\x7e]*$")
+
+
 class PowerDNSPreviewIn(BaseModel):
     """Body shape for ``POST /dns/import/powerdns/preview``.
 
@@ -203,9 +212,9 @@ class PowerDNSPreviewIn(BaseModel):
     and are read-once (never persisted).
     """
 
-    api_url: str
-    api_key: str
-    server_name: str = "localhost"
+    api_url: str = _ASCII
+    api_key: str = _ASCII
+    server_name: str = Field(default="localhost", pattern=r"^[\x20-\x7e]*$")
     target_group_id: uuid.UUID
     target_view_id: uuid.UUID | None = None
 
@@ -215,16 +224,16 @@ class PowerDNSTestIn(BaseModel):
     same auth fields as the preview body but without a target
     group, since the test endpoint never touches the DB."""
 
-    api_url: str
-    api_key: str
-    server_name: str = "localhost"
+    api_url: str = _ASCII
+    api_key: str = _ASCII
+    server_name: str = Field(default="localhost", pattern=r"^[\x20-\x7e]*$")
 
 
 class TechnitiumPreviewIn(BaseModel):
     """Body shape for ``POST /dns/import/technitium/preview``."""
 
-    api_url: str
-    api_token: str
+    api_url: str = _ASCII
+    api_token: str = _ASCII
     target_group_id: uuid.UUID
     target_view_id: uuid.UUID | None = None
 
@@ -232,8 +241,8 @@ class TechnitiumPreviewIn(BaseModel):
 class TechnitiumTestIn(BaseModel):
     """Body shape for ``POST /dns/import/technitium/test-connection``."""
 
-    api_url: str
-    api_token: str
+    api_url: str = _ASCII
+    api_token: str = _ASCII
 
 
 class TechnitiumTestOut(BaseModel):
