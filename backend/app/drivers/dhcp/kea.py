@@ -57,6 +57,12 @@ _KEA_OPTION_NAMES: dict[str, str] = {
 # ``definition for the option 'dhcp4.tftp-server-address' does not exist``
 # (verified against Kea 3.0.3) — which takes DHCP down rather than dropping
 # one option, so the definition has to ship with it.
+#
+# KEYED BY THE RENDERED KEA NAME, not the canonical SpatiumDDI one, because
+# that is what ``_collect_option_defs`` sees in the assembled ``option-data``.
+# The two happen to be spelled identically for option 150; they are NOT for
+# e.g. ``bootfile-name`` → ``boot-file-name``, and keying this table the other
+# way would emit that option with no definition and fail the whole config.
 _KEA_OPTION_DEFS: dict[str, dict[str, Any]] = {
     "tftp-server-address": {
         "name": "tftp-server-address",
@@ -91,7 +97,9 @@ def _collect_option_defs(dhcp4: dict[str, Any]) -> list[dict[str, Any]]:
                 _walk(item)
 
     _walk(dhcp4)
-    return [_KEA_OPTION_DEFS[n] for n in _KEA_OPTION_NAMES if n in seen]
+    # Stable order, keyed off ``_KEA_OPTION_DEFS`` (Kea names, the same
+    # namespace as ``seen``) rather than set iteration.
+    return [d for n, d in _KEA_OPTION_DEFS.items() if n in seen]
 
 
 # Map of SpatiumDDI option-name → Kea Dhcp6 ``option-data`` name. DHCPv6

@@ -142,9 +142,52 @@ def test_emission_order_is_independent_of_input_order() -> None:
     assert a == b
 
 
+def test_two_aliases_of_one_option_resolve_deterministically() -> None:
+    """Alias-vs-alias must not resolve by input dict ordering either.
+
+    ``dns_servers`` and ``domain-name-servers`` both collapse onto
+    ``dns-servers``; whichever wins, it must be the SAME one whatever order
+    the bundle happens to serialise them in, or two agents in a group render
+    different configs from the same bundle.
+    """
+    both = {"dns_servers": ["9.9.9.9"], "domain-name-servers": ["1.1.1.1"]}
+    assert _options_from_mapping(both) == _options_from_mapping(
+        dict(reversed(list(both.items())))
+    )
+
+
 def test_unknown_option_is_ignored_not_emitted() -> None:
     """An unrecognised key must not reach Kea, which would reject the config."""
     assert _options_from_mapping({"totally-made-up": "x"}) == []
+
+
+def test_dropped_option_is_logged_not_silent(capsys: pytest.CaptureFixture[str]) -> None:
+    """#856 was invisible because a dropped key looks like an unset option.
+
+    Custom / vendor options (``code:NN`` from the Kea + ISC importers, and the
+    codes the UI's custom-options accordion offers beyond the canonical set)
+    are still dropped — emitting a name Kea has no definition for would fail
+    the WHOLE config — but the operator must at least get a log line.
+    """
+    assert _options_from_mapping({"code:43": "0102", "time-servers": ["1.2.3.4"]}) == []
+    out = capsys.readouterr().out
+    assert out.count("kea_option_dropped_unsupported") == 2
+
+
+def test_supported_and_structural_keys_do_not_warn(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``lease_time`` rides in ``global_options`` and ``option_data`` is the
+    raw pass-through list — neither is a dropped option."""
+    _options_from_mapping(
+        {
+            "lease_time": 3600,
+            "dns-servers": ["1.1.1.1"],
+            "dns_servers": ["9.9.9.9"],
+            "option_data": [{"name": "domain-name", "data": "ex.com"}],
+        }
+    )
+    assert "kea_option_dropped_unsupported" not in capsys.readouterr().out
 
 
 # ── option-def for non-standard options ─────────────────────────────────────
