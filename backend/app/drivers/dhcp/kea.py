@@ -49,6 +49,59 @@ _KEA_OPTION_NAMES: dict[str, str] = {
     "time-offset": "time-offset",
 }
 
+# Options Kea has no built-in definition for, mapped to the ``option-def``
+# that makes them loadable.
+#
+# #856: option 150 (Cisco TFTP server address) is not a standard Kea option.
+# Emitting it by name alone fails the WHOLE config —
+# ``definition for the option 'dhcp4.tftp-server-address' does not exist``
+# (verified against Kea 3.0.3) — which takes DHCP down rather than dropping
+# one option, so the definition has to ship with it.
+#
+# KEYED BY THE RENDERED KEA NAME, not the canonical SpatiumDDI one, because
+# that is what ``_collect_option_defs`` sees in the assembled ``option-data``.
+# The two happen to be spelled identically for option 150; they are NOT for
+# e.g. ``bootfile-name`` → ``boot-file-name``, and keying this table the other
+# way would emit that option with no definition and fail the whole config.
+_KEA_OPTION_DEFS: dict[str, dict[str, Any]] = {
+    "tftp-server-address": {
+        "name": "tftp-server-address",
+        "code": 150,
+        "space": "dhcp4",
+        "type": "ipv4-address",
+        "array": True,
+    },
+}
+
+
+def _collect_option_defs(dhcp4: dict[str, Any]) -> list[dict[str, Any]]:
+    """``option-def`` entries required by whatever this render emitted.
+
+    Walks the assembled ``Dhcp4`` block rather than each options mapping on
+    the way in, so subnet, pool, reservation, client-class and global
+    option-data are all covered — including any future producer.
+    """
+    seen: set[str] = set()
+
+    def _walk(node: Any) -> None:
+        if isinstance(node, dict):
+            for key, val in node.items():
+                if key == "option-data" and isinstance(val, list):
+                    for entry in val:
+                        if isinstance(entry, dict) and entry.get("name") in _KEA_OPTION_DEFS:
+                            seen.add(str(entry["name"]))
+                else:
+                    _walk(val)
+        elif isinstance(node, list):
+            for item in node:
+                _walk(item)
+
+    _walk(dhcp4)
+    # Stable order, keyed off ``_KEA_OPTION_DEFS`` (Kea names, the same
+    # namespace as ``seen``) rather than set iteration.
+    return [d for n, d in _KEA_OPTION_DEFS.items() if n in seen]
+
+
 # Map of SpatiumDDI option-name → Kea Dhcp6 ``option-data`` name. DHCPv6
 # uses a different option-code space + cmdlet names; only options that
 # have a true v6 equivalent are forwarded. Options with no v6 analogue
@@ -345,6 +398,10 @@ class KeaDriver(DHCPDriver):
                 + [_render_phone_class(p) for p in bundle.phone_classes],
                 "option-data": _render_option_data(bundle.options.options, address_family="ipv4"),
             }
+            # #856 — ship definitions for any non-standard option emitted above.
+            option_defs = _collect_option_defs(out["Dhcp4"])
+            if option_defs:
+                out["Dhcp4"]["option-def"] = option_defs
         if v6_scopes:
             # Kea names the subnet list "subnet6" in Dhcp6 mode. Options /
             # client-class options render through the Dhcp6 name map;

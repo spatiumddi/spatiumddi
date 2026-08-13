@@ -68,6 +68,87 @@ _OPTION_CODES: dict[str, int] = {
     "domain-search": 119,
 }
 
+# Map of canonical SpatiumDDI option-name → Kea Dhcp4 ``option-data`` name.
+# This MUST stay in step with ``_KEA_OPTION_NAMES`` in
+# ``backend/app/drivers/dhcp/kea.py`` and with ``STANDARD_OPTION_NAMES`` in
+# ``backend/app/drivers/dhcp/base.py``, which is the vocabulary the bundle
+# actually carries.
+#
+# #856: this table replaces a hand-written list of per-option ``_put(...)``
+# lookups that had drifted from that vocabulary. Option 6 is stored
+# canonically as ``dns-servers``, but the old code looked only for
+# ``dns_servers`` / ``domain-name-servers`` and so dropped it from every
+# rendered config — silently, because a missing key is indistinguishable
+# from an unset option. ``routers`` survived purely because it happens to
+# be spelled the same on both sides. Driving both directions off one table
+# is what stops that class of bug recurring: a new option is added in one
+# place or it is not supported at all.
+_KEA_OPTION_NAMES_V4: dict[str, str] = {
+    "routers": "routers",
+    "dns-servers": "domain-name-servers",
+    "domain-name": "domain-name",
+    "broadcast-address": "broadcast-address",
+    "ntp-servers": "ntp-servers",
+    "tftp-server-name": "tftp-server-name",
+    "bootfile-name": "boot-file-name",
+    "tftp-server-address": "tftp-server-address",
+    "domain-search": "domain-search",
+    "mtu": "interface-mtu",
+    "time-offset": "time-offset",
+}
+
+# Keys that legitimately appear alongside options in an options mapping but
+# are NOT options — excluded from the "unsupported option dropped" warning.
+# ``lease_time`` rides in ``global_options``; ``option_data`` is the raw
+# pass-through list handled separately in ``_options_from_mapping``.
+_NON_OPTION_KEYS: frozenset[str] = frozenset({"lease_time", "option_data"})
+
+# Legacy input spellings accepted for backward compatibility with bundles
+# from an older control plane (and with hand-written test fixtures). Values
+# are canonical names in ``_KEA_OPTION_NAMES_V4``. Kea's own IANA spellings
+# are accepted too, so a bundle that already speaks Kea passes through.
+# Declaration order is load-bearing: two aliases of the same canonical name
+# resolve in this order, so the result never depends on input dict ordering.
+_LEGACY_OPTION_ALIASES_V4: dict[str, str] = {
+    "dns_servers": "dns-servers",
+    "domain-name-servers": "dns-servers",
+    "ntp_servers": "ntp-servers",
+    "gateway": "routers",
+    "domain_name": "domain-name",
+    "domain_search": "domain-search",
+    "tftp_server": "tftp-server-name",
+    "boot_file": "bootfile-name",
+    "boot-file-name": "bootfile-name",
+    "broadcast_address": "broadcast-address",
+    "interface-mtu": "mtu",
+    "time_offset": "time-offset",
+    "tftp_server_address": "tftp-server-address",
+}
+
+# Options Kea has no built-in definition for, mapped to the ``option-def``
+# entry that makes them loadable.
+#
+# Option 150 (Cisco TFTP server address) is NOT a standard Kea option:
+# ``kea-dhcp4 -t`` fails the WHOLE config with "definition for the option
+# 'dhcp4.tftp-server-address' does not exist", which takes DHCP down rather
+# than dropping one option. Verified against Kea 3.0.3. So emitting it
+# requires shipping the definition alongside it.
+#
+# KEYED BY THE RENDERED KEA NAME, not the canonical SpatiumDDI one, because
+# that is what ``_collect_option_defs`` sees in the assembled ``option-data``.
+# The two happen to be spelled identically for option 150; they are NOT for
+# e.g. ``bootfile-name`` → ``boot-file-name``, and keying this table the other
+# way would emit that option with no definition and fail the whole config.
+_OPTION_DEFS_V4: dict[str, dict[str, Any]] = {
+    "tftp-server-address": {
+        "name": "tftp-server-address",
+        "code": 150,
+        "space": "dhcp4",
+        "type": "ipv4-address",
+        "array": True,
+    },
+}
+
 # Map of SpatiumDDI / bundle-neutral option-name → Kea Dhcp6 ``option-data``
 # name. DHCPv6 uses a different option-code space + names from v4; only
 # options with a true v6 equivalent are forwarded. Mirrors
@@ -112,46 +193,97 @@ def _opt(name: str, value: Any) -> dict[str, Any]:
     return entry
 
 
-def _options_from_mapping(options: dict[str, Any] | None) -> list[dict[str, Any]]:
-    """Translate bundle-neutral keys to Kea option names.
+def _canonicalize_v4(options: dict[str, Any]) -> dict[str, Any]:
+    """Resolve legacy / Kea-native input spellings onto canonical names.
 
-    Supported keys (both snake_case and hyphenated are accepted):
-        dns_servers / domain-name-servers
-        ntp_servers / ntp-servers       (DHCP option 42)
-        routers
-        domain_name / domain-name
-        domain_search / domain-search
-        tftp_server / tftp-server-name
-        boot_file / boot-file-name
+    A canonical key already present always wins over an alias resolving onto
+    it, and two aliases of the SAME canonical name (``dns_servers`` and
+    ``domain-name-servers``) resolve in ``_LEGACY_OPTION_ALIASES_V4``
+    declaration order — so the outcome never depends on the input dict's
+    ordering either way.
+    """
+    out: dict[str, Any] = {k: v for k, v in options.items() if k in _KEA_OPTION_NAMES_V4}
+    for alias, canon in _LEGACY_OPTION_ALIASES_V4.items():
+        if canon in out or alias not in options:
+            continue
+        out[canon] = options[alias]
+    return out
+
+
+def _options_from_mapping(options: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Translate bundle-neutral keys to Kea Dhcp4 ``option-data`` entries.
+
+    Keys are the canonical SpatiumDDI option names in
+    ``_KEA_OPTION_NAMES_V4``; the legacy snake_case and Kea-native spellings
+    in ``_LEGACY_OPTION_ALIASES_V4`` are accepted for older bundles (#856).
+
+    Emission order follows ``_KEA_OPTION_NAMES_V4`` rather than the caller's
+    dict order, so the rendered file is byte-stable across restarts and an
+    unchanged bundle never triggers a spurious config rewrite + Kea reload.
     """
     if not options:
         return []
+    canon = _canonicalize_v4(options)
     out: list[dict[str, Any]] = []
-
-    def _put(name: str, val: Any) -> None:
+    for name, kea_name in _KEA_OPTION_NAMES_V4.items():
+        val = canon.get(name)
         if val in (None, "", []):
-            return
-        out.append(_opt(name, val))
+            continue
+        out.append(_opt(kea_name, val))
 
-    _put(
-        "domain-name-servers",
-        options.get("dns_servers") or options.get("domain-name-servers"),
-    )
-    _put("ntp-servers", options.get("ntp_servers") or options.get("ntp-servers"))
-    _put("routers", options.get("routers") or options.get("gateway"))
-    _put("domain-name", options.get("domain_name") or options.get("domain-name"))
-    _put("domain-search", options.get("domain_search") or options.get("domain-search"))
-    _put(
-        "tftp-server-name",
-        options.get("tftp_server") or options.get("tftp-server-name"),
-    )
-    _put("boot-file-name", options.get("boot_file") or options.get("boot-file-name"))
+    # Anything outside the table is still dropped — emitting an option Kea
+    # has no definition for fails the WHOLE config, which is worse than not
+    # serving it. But drop it LOUDLY: #856 was invisible precisely because a
+    # dropped key looks identical to an unset option. Custom / vendor options
+    # (the ``code:NN`` keys the Kea + ISC importers produce, and the ~80 codes
+    # the UI's custom-options accordion offers beyond the canonical set) land
+    # here, so the operator gets a log line instead of silence.
+    for key in options:
+        if key in _NON_OPTION_KEYS or key in _KEA_OPTION_NAMES_V4:
+            continue
+        if key in _LEGACY_OPTION_ALIASES_V4:
+            continue
+        _log.warning("kea_option_dropped_unsupported", option=key)
 
     # Pass through any raw Kea-style list already shaped correctly.
     raw = options.get("option_data")
     if isinstance(raw, list):
         out.extend(raw)
     return out
+
+
+def _collect_option_defs(dhcp4: dict[str, Any]) -> list[dict[str, Any]]:
+    """``option-def`` entries required by whatever the render actually emitted.
+
+    Kea rejects the ENTIRE config for an option it has no definition for, so
+    a non-standard option must ship its definition or not be emitted at all.
+
+    This walks the assembled ``Dhcp4`` block rather than each options mapping
+    on the way in, so it cannot miss a source: subnet, pool, reservation,
+    client-class and global option-data are all covered by construction, as
+    is anything a future caller adds.
+    """
+    seen: set[str] = set()
+
+    def _walk(node: Any) -> None:
+        if isinstance(node, dict):
+            for key, val in node.items():
+                if key == "option-data" and isinstance(val, list):
+                    for entry in val:
+                        if isinstance(entry, dict):
+                            name = entry.get("name")
+                            if isinstance(name, str) and name in _OPTION_DEFS_V4:
+                                seen.add(name)
+                else:
+                    _walk(val)
+        elif isinstance(node, list):
+            for item in node:
+                _walk(item)
+
+    _walk(dhcp4)
+    # Stable order, keyed off ``_OPTION_DEFS_V4`` (Kea names, same namespace
+    # as ``seen``) rather than set iteration.
+    return [d for n, d in _OPTION_DEFS_V4.items() if n in seen]
 
 
 def _options_from_mapping_v6(options: dict[str, Any] | None) -> list[dict[str, Any]]:
@@ -792,6 +924,13 @@ def render(
 
     if rendered_classes:
         dhcp4["client-classes"] = rendered_classes
+
+    # #856 — ship definitions for any non-standard option we just emitted.
+    # Must run after every option-data producer above, and Kea requires
+    # ``option-def`` to precede nothing in particular, so placement is free.
+    option_defs = _collect_option_defs(dhcp4)
+    if option_defs:
+        dhcp4["option-def"] = option_defs
 
     out: dict[str, Any] = {"Dhcp4": dhcp4}
 
