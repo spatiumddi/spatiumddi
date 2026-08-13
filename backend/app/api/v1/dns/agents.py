@@ -61,12 +61,16 @@ LONGPOLL_POLL_INTERVAL = 2.0
 
 
 class AgentRegisterRequestV2(BaseModel):
-    hostname: str
-    driver: str = "bind9"
+    # Bounds mirror the columns these land in (DNSServer.name/host 255,
+    # .driver 50, .agent_fingerprint 128, DNSServerGroup.name 255) — an
+    # over-length value used to reach asyncpg and surface as 500 instead
+    # of the 422 it is.
+    hostname: str = Field(max_length=255)
+    driver: str = Field(default="bind9", max_length=50)
     roles: list[str] = ["authoritative"]
-    version: str | None = None
-    group_name: str | None = None
-    fingerprint: str
+    version: str | None = Field(default=None, max_length=100)
+    group_name: str | None = Field(default=None, max_length=255)
+    fingerprint: str = Field(max_length=128)
     agent_id: str | None = None  # persisted UUID from previous runs
 
 

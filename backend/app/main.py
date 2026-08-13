@@ -867,6 +867,48 @@ def create_app() -> FastAPI:
             headers={"Retry-After": "1"},
         )
 
+    from sqlalchemy.exc import DataError as SADataError  # noqa: PLC0415
+    from sqlalchemy.exc import IntegrityError as SAIntegrityError  # noqa: PLC0415
+
+    @app.exception_handler(SAIntegrityError)
+    async def _integrity_conflict(request: Request, exc: Exception) -> Response:
+        """A constraint violation is the DATA conflicting, never a server
+        fault. Handlers that pre-check (SELECT then INSERT — asns, agent
+        register's group auto-create) still race between the check and the
+        flush; the loser's unique-violation surfaced as 500 where the
+        pre-check's own answer would have been 409."""
+        from fastapi.responses import JSONResponse  # noqa: PLC0415
+
+        logger.info(
+            "integrity_conflict",
+            method=request.method,
+            path=request.url.path,
+            error=str(getattr(exc, "orig", exc))[:200],
+        )
+        return JSONResponse(
+            status_code=409,
+            content={"detail": "The request conflicts with existing data."},
+        )
+
+    @app.exception_handler(SADataError)
+    async def _unstorable_value(request: Request, exc: Exception) -> Response:
+        """A value Postgres refuses to store (over-length string, NUL byte in
+        text, out-of-range number) is the CLIENT's input, same class as a
+        pydantic 422 — it reached the driver only because the request model
+        didn't bound it."""
+        from fastapi.responses import JSONResponse  # noqa: PLC0415
+
+        logger.info(
+            "unstorable_value",
+            method=request.method,
+            path=request.url.path,
+            error=str(getattr(exc, "orig", exc))[:200],
+        )
+        return JSONResponse(
+            status_code=422,
+            content={"detail": "A supplied value cannot be stored as sent."},
+        )
+
     # Unhandled-exception capture (issue #123). Registered last so it
     # only catches what slipped past every other handler — auth /
     # permission / validation errors raise typed HTTPException

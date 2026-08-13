@@ -50,9 +50,12 @@ LONGPOLL_TIMEOUT_SECONDS = int(os.environ.get("LG_AGENT_LONGPOLL_TIMEOUT", "30")
 
 
 class AgentRegisterRequest(BaseModel):
-    hostname: str
-    version: str | None = None
-    fingerprint: str
+    # Bounds mirror the collector columns (name/host 255, fingerprint 128)
+    # — an over-length value used to reach asyncpg and surface as 500
+    # instead of the 422 it is.
+    hostname: str = Field(max_length=255)
+    version: str | None = Field(default=None, max_length=100)
+    fingerprint: str = Field(max_length=128)
     agent_id: str | None = None
 
 
