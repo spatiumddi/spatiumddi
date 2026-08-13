@@ -252,7 +252,13 @@ def _require_bootstrap_key(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="DHCP_AGENT_KEY is not configured on the control plane",
         )
-    if not x_dhcp_agent_key or not hmac.compare_digest(x_dhcp_agent_key, expected):
+    # Compare BYTES: hmac.compare_digest raises TypeError on a str with
+    # non-ASCII characters, so any client that sent one (fuzz: '\x80')
+    # got a 500 out of the auth gate instead of the 401 a wrong key is.
+    if not x_dhcp_agent_key or not hmac.compare_digest(
+        x_dhcp_agent_key.encode("utf-8", "surrogateescape"),
+        expected.encode("utf-8", "surrogateescape"),
+    ):
         raise HTTPException(status_code=401, detail="Invalid bootstrap key")
     return x_dhcp_agent_key
 
