@@ -22,7 +22,18 @@ def hash_password(password: str) -> str:
 
 
 def verify_password(plain: str, hashed: str) -> bool:
-    return bcrypt.checkpw(plain.encode(), hashed.encode())
+    # Total by contract: a candidate password can only ever be WRONG, never an
+    # exception. bcrypt.checkpw raises ValueError on >72-byte input and on NUL
+    # bytes (and on a malformed stored hash) — request schemas allow up to 256
+    # chars, so any caller that fed this a user-supplied string 500'd on those
+    # inputs instead of answering 401/403 (live: DELETE
+    # /appliance/appliances/{id} answered 500 on every conformance run).
+    # bcrypt itself only reads the first 72 bytes of a valid input, so the
+    # truncation cannot accept a password the untruncated compare would reject.
+    try:
+        return bcrypt.checkpw(plain.encode()[:72], hashed.encode())
+    except ValueError:
+        return False
 
 
 # ── JWT ────────────────────────────────────────────────────────────────────────
