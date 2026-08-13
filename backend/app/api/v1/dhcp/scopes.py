@@ -122,9 +122,17 @@ def _normalize_options(raw: Any) -> dict[str, Any]:
             if not isinstance(entry, dict):
                 continue
             code = entry.get("code")
-            name = entry.get("name") or _CODE_TO_NAME.get(int(code)) if code else None
-            if not name:
-                name = f"option-{code}" if code else None
+            # #856 — the conditional binds looser than ``or``, so the previous
+            # ``entry.get("name") or _CODE_TO_NAME.get(int(code)) if code else None``
+            # evaluated as ``(name or lookup) if code else None``: an entry
+            # identified by NAME with no ``code`` was silently discarded rather
+            # than used as-is. Resolve the two independently.
+            name = entry.get("name")
+            if not name and code:
+                try:
+                    name = _CODE_TO_NAME.get(int(code)) or f"option-{code}"
+                except (TypeError, ValueError):
+                    name = None
             if not name:
                 continue
             name = _OPTION_NAME_ALIASES.get(name, name)
