@@ -542,7 +542,11 @@ async def windows_dns_servers(
     ]
 
 
-@router.post("/windows-dns/preview", response_model=PreviewOut)
+@router.post(
+    "/windows-dns/preview",
+    response_model=PreviewOut,
+    responses={502: {"description": "The remote import source is unreachable or refused the pull"}},
+)
 async def windows_dns_preview(
     current_user: SuperAdmin,
     db: DB,
@@ -661,7 +665,11 @@ async def windows_dns_commit(
 # ── PowerDNS endpoints (Phase 3) ─────────────────────────────────────
 
 
-@router.post("/powerdns/test-connection", response_model=PowerDNSTestOut)
+@router.post(
+    "/powerdns/test-connection",
+    response_model=PowerDNSTestOut,
+    responses={502: {"description": "The remote import source is unreachable or refused the pull"}},
+)
 async def powerdns_test_connection(
     _: SuperAdmin,
     body: PowerDNSTestIn = Body(...),
@@ -687,7 +695,11 @@ async def powerdns_test_connection(
     return PowerDNSTestOut(**info)
 
 
-@router.post("/powerdns/preview", response_model=PreviewOut)
+@router.post(
+    "/powerdns/preview",
+    response_model=PreviewOut,
+    responses={502: {"description": "The remote import source is unreachable or refused the pull"}},
+)
 async def powerdns_preview(
     current_user: SuperAdmin,
     db: DB,
@@ -790,7 +802,11 @@ async def powerdns_commit(
 # ── Technitium endpoints (issue #744) ────────────────────────────────
 
 
-@router.post("/technitium/test-connection", response_model=TechnitiumTestOut)
+@router.post(
+    "/technitium/test-connection",
+    response_model=TechnitiumTestOut,
+    responses={502: {"description": "The remote import source is unreachable or refused the pull"}},
+)
 async def technitium_test_connection(
     _: SuperAdmin,
     body: TechnitiumTestIn = Body(...),
@@ -809,7 +825,11 @@ async def technitium_test_connection(
     return TechnitiumTestOut(**info)
 
 
-@router.post("/technitium/preview", response_model=PreviewOut)
+@router.post(
+    "/technitium/preview",
+    response_model=PreviewOut,
+    responses={502: {"description": "The remote import source is unreachable or refused the pull"}},
+)
 async def technitium_preview(
     current_user: SuperAdmin,
     db: DB,

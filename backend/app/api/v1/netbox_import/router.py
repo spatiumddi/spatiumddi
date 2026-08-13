@@ -367,7 +367,11 @@ def _commit_result_to_pydantic(r: CommitResult) -> CommitOut:
 # ── Endpoints ────────────────────────────────────────────────────────
 
 
-@router.post("/test-connection", response_model=NetboxTestOut)
+@router.post(
+    "/test-connection",
+    response_model=NetboxTestOut,
+    responses={502: {"description": "The remote import source is unreachable or refused the pull"}},
+)
 async def netbox_test_connection(
     _: SuperAdmin,
     body: NetboxConnIn = Body(...),
@@ -431,7 +435,11 @@ async def _status_counts(nb: NetBoxClient) -> dict[str, int] | None:
     return counts or None
 
 
-@router.post("/preview", response_model=PreviewOut)
+@router.post(
+    "/preview",
+    response_model=PreviewOut,
+    responses={502: {"description": "The remote import source is unreachable or refused the pull"}},
+)
 async def netbox_preview(
     current_user: SuperAdmin,
     db: DB,

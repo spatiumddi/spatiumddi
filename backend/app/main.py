@@ -867,7 +867,7 @@ def create_app() -> FastAPI:
             headers={"Retry-After": "1"},
         )
 
-    from sqlalchemy.exc import DataError as SADataError  # noqa: PLC0415
+    from sqlalchemy.exc import DBAPIError as SADBAPIError  # noqa: PLC0415
     from sqlalchemy.exc import IntegrityError as SAIntegrityError  # noqa: PLC0415
 
     @app.exception_handler(SAIntegrityError)
@@ -890,19 +890,36 @@ def create_app() -> FastAPI:
             content={"detail": "The request conflicts with existing data."},
         )
 
-    @app.exception_handler(SADataError)
+    @app.exception_handler(SADBAPIError)
     async def _unstorable_value(request: Request, exc: Exception) -> Response:
-        """A value Postgres refuses to store (over-length string, NUL byte in
-        text, out-of-range number) is the CLIENT's input, same class as a
-        pydantic 422 — it reached the driver only because the request model
-        didn't bound it."""
+        """A value Postgres refuses as DATA (over-length string, NUL byte,
+        malformed macaddr/uuid/inet literal, out-of-range number) is the
+        CLIENT's input, same class as a pydantic 422 — it reached the driver
+        only because a request model didn't bound it.
+
+        The asyncpg dialect wraps most driver errors as the GENERIC
+        DBAPIError, not sqlalchemy.exc.DataError (observed live:
+        InvalidTextRepresentationError and UntranslatableCharacterError both
+        arrive as bare DBAPIError), so the discriminator is the error itself:
+        SQLSTATE class 22 is "data exception" by definition, and asyncpg's
+        client-side bind failures subclass asyncpg.exceptions.DataError.
+        Anything else (ProgrammingError — OUR query is wrong; transient
+        connection errors — their own handler above, which wins by being the
+        more specific registered class) re-raises unchanged."""
         from fastapi.responses import JSONResponse  # noqa: PLC0415
 
+        orig = getattr(exc, "orig", None)
+        sqlstate = str(getattr(orig, "sqlstate", "") or "")
+        is_data = sqlstate.startswith("22") or any(
+            c.__name__ == "DataError" for c in type(orig).__mro__
+        )
+        if not is_data:
+            raise exc
         logger.info(
             "unstorable_value",
             method=request.method,
             path=request.url.path,
-            error=str(getattr(exc, "orig", exc))[:200],
+            error=str(orig or exc)[:200],
         )
         return JSONResponse(
             status_code=422,
