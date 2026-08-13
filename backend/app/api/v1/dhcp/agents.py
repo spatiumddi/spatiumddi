@@ -28,6 +28,7 @@ from app.core.agent_wake import (
     wake_subscription,
 )
 from app.core.dns_names import sanitize_hostname
+from app.drivers.dhcp.kea import option_defs_for_option_maps
 from app.models.dhcp import (
     DHCPConfigOp,
     DHCPLease,
@@ -592,6 +593,13 @@ async def agent_config_longpoll(
                                         "delegated_length": p.delegated_length,
                                         "excluded_prefix": p.excluded_prefix,
                                         "class_restriction": p.class_restriction,
+                                        # #858 — per-pool option overrides are
+                                        # settable and ETag-hashed, and the
+                                        # control-plane driver renders them, but
+                                        # were omitted here: the same silent drop
+                                        # #430 hit for statics' options_override
+                                        # (serialized on the very next block).
+                                        "options_override": p.options_override,
                                     }
                                     for p in s.pools
                                 ],
@@ -626,6 +634,51 @@ async def agent_config_longpoll(
                             }
                             for c in bundle.client_classes
                         ],
+                        # #858 — PXE + phone classes were folded into the bundle
+                        # ETag and rendered by the control-plane driver, but
+                        # never serialized here. The consequence was worse than a
+                        # plain omission: editing a PXE profile DID move the
+                        # ETag, so it broke every agent's /config long-poll and
+                        # they all re-fetched — a payload with no PXE classes in
+                        # it, which re-rendered byte-identical config. A
+                        # guaranteed no-op resync of the whole group, and a
+                        # feature (README-advertised PXE provisioning profiles)
+                        # that could never reach agent-managed Kea at all.
+                        "pxe_classes": [
+                            {
+                                "name": p.name,
+                                "match_expression": p.match_expression,
+                                "next_server": p.next_server,
+                                "boot_file_name": p.boot_file_name,
+                                "is_ipxe_chain": p.is_ipxe_chain,
+                            }
+                            for p in bundle.pxe_classes
+                        ],
+                        "phone_classes": [
+                            {
+                                "name": c.name,
+                                "match_expression": c.match_expression,
+                                "options": c.options,
+                            }
+                            for c in bundle.phone_classes
+                        ],
+                        # #858 — Kea types a raw ``code:NN`` option as BINARY,
+                        # so an operator's string value ("not a valid string of
+                        # hexadecimal digits") fails the WHOLE config. The real
+                        # type comes from the VoIP / option-code catalogues,
+                        # which live in this package and not the agent's, so the
+                        # control plane resolves the definitions once and the
+                        # agent emits them verbatim — rather than keeping a
+                        # second copy of the table, which is the drift that
+                        # caused #856.
+                        "option_defs": option_defs_for_option_maps(
+                            [bundle.options.options]
+                            + [s.options for s in bundle.scopes]
+                            + [p.options_override for s in bundle.scopes for p in s.pools]
+                            + [st.options_override for s in bundle.scopes for st in s.statics]
+                            + [c.options for c in bundle.client_classes]
+                            + [c.options for c in bundle.phone_classes]
+                        ),
                         "mac_blocks": [
                             {
                                 "mac_address": m.mac_address,

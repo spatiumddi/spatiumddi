@@ -231,17 +231,32 @@ def _options_from_mapping(options: dict[str, Any] | None) -> list[dict[str, Any]
             continue
         out.append(_opt(kea_name, val))
 
-    # Anything outside the table is still dropped — emitting an option Kea
-    # has no definition for fails the WHOLE config, which is worse than not
-    # serving it. But drop it LOUDLY: #856 was invisible precisely because a
-    # dropped key looks identical to an unset option. Custom / vendor options
-    # (the ``code:NN`` keys the Kea + ISC importers produce, and the ~80 codes
-    # the UI's custom-options accordion offers beyond the canonical set) land
-    # here, so the operator gets a log line instead of silence.
+    # #858 — options addressed by raw code (``code:NN``), which is how phone
+    # profiles and the importers carry a vendor option with no canonical name.
+    # Emitted in Kea's ``{"code": NN}`` form, mirroring ``_render_option_data``
+    # in the backend driver. Kea types an unknown code as BINARY, so a string
+    # value only loads when the bundle also ships an ``option-def`` for it —
+    # the control plane resolves those (it owns the option catalogues) and
+    # ``render()`` emits them; see ``_option_defs_from_bundle``.
+    for key, val in options.items():
+        if not key.startswith("code:"):
+            continue
+        try:
+            code_int = int(key[5:])
+        except ValueError:
+            _log.warning("kea_option_bad_code_key", option=key)
+            continue
+        data = ", ".join(str(x) for x in val) if isinstance(val, list) else str(val)
+        out.append({"code": code_int, "data": data})
+
+    # Anything else outside the table is still dropped — emitting an option
+    # name Kea has no definition for fails the WHOLE config, which is worse
+    # than not serving it. But drop it LOUDLY: #856 was invisible precisely
+    # because a dropped key looks identical to an unset option.
     for key in options:
         if key in _NON_OPTION_KEYS or key in _KEA_OPTION_NAMES_V4:
             continue
-        if key in _LEGACY_OPTION_ALIASES_V4:
+        if key in _LEGACY_OPTION_ALIASES_V4 or key.startswith("code:"):
             continue
         _log.warning("kea_option_dropped_unsupported", option=key)
 
@@ -250,6 +265,37 @@ def _options_from_mapping(options: dict[str, Any] | None) -> list[dict[str, Any]
     if isinstance(raw, list):
         out.extend(raw)
     return out
+
+
+def _strip_undefined_code_options(node: Any, defined_codes: set[int]) -> None:
+    """Remove ``{"code": NN}`` option-data entries with no matching definition.
+
+    Mutates in place, walking the same structures ``_collect_option_defs``
+    does so subnet / pool / reservation / client-class / global option-data are
+    all covered. Emitting an undefined code fails the entire config, so this is
+    the guard that keeps a stray vendor option from taking DHCP down.
+    """
+    if isinstance(node, dict):
+        for key, val in node.items():
+            if key == "option-data" and isinstance(val, list):
+                kept = []
+                for entry in val:
+                    code = entry.get("code") if isinstance(entry, dict) else None
+                    # Entries carrying a name are Kea built-ins, already safe.
+                    if (
+                        isinstance(code, int)
+                        and not (isinstance(entry, dict) and entry.get("name"))
+                        and code not in defined_codes
+                    ):
+                        _log.warning("kea_option_dropped_no_definition", code=code)
+                        continue
+                    kept.append(entry)
+                node[key] = kept
+            else:
+                _strip_undefined_code_options(val, defined_codes)
+    elif isinstance(node, list):
+        for item in node:
+            _strip_undefined_code_options(item, defined_codes)
 
 
 def _collect_option_defs(dhcp4: dict[str, Any]) -> list[dict[str, Any]]:
@@ -323,6 +369,13 @@ def _options_from_mapping_v6(options: dict[str, Any] | None) -> list[dict[str, A
         normalized = k.replace("_", "-")
         if normalized in _DHCP4_ONLY_OPTION_NAMES:
             _log.warning("kea_option_skipped_v6_no_equivalent", option=k)
+        elif k.startswith("code:"):
+            # #858 — raw-code options are v4-only here. The definitions the
+            # control plane ships declare ``space: dhcp4``, so emitting the
+            # code under Dhcp6 would reference a definition that does not
+            # exist in that space and fail the whole config. Dropped, but
+            # loudly: the silent version of this is the bug #858 exists to fix.
+            _log.warning("kea_option_skipped_v6_raw_code", option=k)
 
     # Pass through any raw Kea-style list already shaped correctly.
     raw = options.get("option_data")
@@ -360,6 +413,79 @@ def _reservation_v6(res: dict[str, Any]) -> dict[str, Any]:
     if res.get("hostname"):
         out["hostname"] = res["hostname"]
     opts = _options_from_mapping_v6(res.get("options"))
+    if opts:
+        out["option-data"] = opts
+    return out
+
+
+def _pxe_class(p: dict[str, Any]) -> dict[str, Any]:
+    """Render a PXE / iPXE client class (#51) — Dhcp4 only.
+
+    Mirrors ``_render_pxe_class`` in ``backend/app/drivers/dhcp/kea.py``.
+    ``next-server`` + ``boot-file-name`` on the class win over scope-level
+    defaults when Kea matches the packet, which is what lets one scope serve
+    a different boot binary per architecture. An empty ``match_expression``
+    means "always match" — a low-priority fallthrough — so the key is omitted
+    rather than emitted empty, which Kea would reject.
+    """
+    out: dict[str, Any] = {
+        "name": p["name"],
+        "boot-file-name": p.get("boot_file_name") or "",
+    }
+    # ``next-server`` must be an IPv4 literal — Kea rejects the WHOLE config on
+    # a hostname or a typo, and the control plane only checks the field is a
+    # non-empty string. Omitting it falls back to the scope / global value,
+    # which is a served lease with a wrong boot server rather than no DHCP.
+    next_server = (p.get("next_server") or "").strip()
+    if next_server:
+        try:
+            ipaddress.IPv4Address(next_server)
+        except ValueError:
+            _log.warning(
+                "kea_pxe_next_server_invalid", pxe_class=p.get("name"), value=next_server
+            )
+        else:
+            out["next-server"] = next_server
+    if p.get("match_expression"):
+        out["test"] = p["match_expression"]
+    return out
+
+
+def _phone_class(c: dict[str, Any]) -> dict[str, Any]:
+    """Render a VoIP phone-profile client class.
+
+    Mirrors ``_render_phone_class`` in the backend driver. Vendor options Kea
+    does not know by name ride as ``code:NN`` keys, which
+    ``_options_from_mapping`` emits in ``{"code": NN}`` form.
+    """
+    out: dict[str, Any] = {"name": c["name"]}
+    if c.get("match_expression"):
+        out["test"] = c["match_expression"]
+    opts = _options_from_mapping(c.get("options"))
+    if opts:
+        out["option-data"] = opts
+    return out
+
+
+def _dynamic_pool(p: dict[str, Any], *, address_family: str) -> dict[str, Any]:
+    """Render one dynamic address pool, with its per-pool option overrides.
+
+    #858 — ``options_override`` is settable, ETag-hashed and rendered by the
+    control-plane driver, but the wire bundle never carried it and this
+    renderer never read it, so a per-pool option could not reach Kea at all.
+    Mirrors ``_render_pool`` in ``backend/app/drivers/dhcp/kea.py``.
+
+    ``class_restriction`` rides along for the same reason: the backend driver
+    emits it as Kea's ``client-class``, scoping the pool to one class.
+    """
+    out: dict[str, Any] = {"pool": f"{p['start_ip']} - {p['end_ip']}"}
+    if p.get("class_restriction"):
+        out["client-class"] = p["class_restriction"]
+    opts = (
+        _options_from_mapping_v6(p.get("options_override"))
+        if address_family == "ipv6"
+        else _options_from_mapping(p.get("options_override"))
+    )
     if opts:
         out["option-data"] = opts
     return out
@@ -463,7 +589,7 @@ def _scope_to_subnet6(scope: dict[str, Any]) -> dict[str, Any]:
             if (p.get("pool_type") or "dynamic") == "dynamic"
         ]
         if dyn:
-            out["pools"] = [{"pool": f"{p['start_ip']} - {p['end_ip']}"} for p in dyn]
+            out["pools"] = [_dynamic_pool(p, address_family="ipv6") for p in dyn]
         # Prefix-delegation pools (issue #368) — drop malformed rows.
         pd = [
             p
@@ -652,7 +778,7 @@ def _scope_to_subnet(scope: dict[str, Any]) -> dict[str, Any]:
         if (p.get("pool_type") or "dynamic") == "dynamic"
     ]
     if dyn:
-        out["pools"] = [{"pool": f"{p['start_ip']} - {p['end_ip']}"} for p in dyn]
+        out["pools"] = [_dynamic_pool(p, address_family="ipv4") for p in dyn]
     opts = _options_from_mapping(scope.get("options"))
     if opts:
         out["option-data"] = opts
@@ -912,6 +1038,15 @@ def render(
         for c in classes
     ]
 
+    # #858 — PXE + phone classes. Both were folded into the bundle ETag and
+    # rendered by the control-plane driver, but never serialized onto the wire
+    # and never read here, so neither could reach agent-managed Kea — which is
+    # how both the appliance and the Compose stack run DHCP. Order matches the
+    # backend driver: operator classes, then PXE, then phone. Kea evaluates
+    # client-classes in declaration order, so this is behaviour, not style.
+    rendered_classes += [_pxe_class(p) for p in (bundle.get("pxe_classes") or [])]
+    rendered_classes += [_phone_class(c) for c in (bundle.get("phone_classes") or [])]
+
     # MAC blocklist — render as Kea's reserved ``DROP`` class. Any packet
     # whose hardware address matches the OR-ed expression is silently
     # dropped before allocation. ``DROP`` is a Kea built-in name, not
@@ -928,7 +1063,32 @@ def render(
     # #856 — ship definitions for any non-standard option we just emitted.
     # Must run after every option-data producer above, and Kea requires
     # ``option-def`` to precede nothing in particular, so placement is free.
+    #
+    # #858 — plus the definitions the control plane resolved for raw-code
+    # vendor options. Those cannot be derived here: the type comes from the
+    # option catalogues, which live in the backend package. Deduplicated by
+    # code so a definition supplied both ways is emitted once — Kea rejects a
+    # duplicate definition for the same code.
     option_defs = _collect_option_defs(dhcp4)
+    seen_def_codes = {d.get("code") for d in option_defs}
+    for d in bundle.get("option_defs") or []:
+        if isinstance(d, dict) and d.get("code") not in seen_def_codes:
+            option_defs.append(d)
+            seen_def_codes.add(d.get("code"))
+
+    # A raw-code option is only safe to emit once a definition for it exists:
+    # Kea types an undefined code as BINARY and REJECTS THE WHOLE CONFIG when
+    # the value isn't hex. Dropping one option is survivable; a rejected config
+    # is not, and `sync.py` writes the file before `config-test`, so a bad
+    # render outlives the process that made it.
+    #
+    # This also covers the two cases where no definitions arrive at all: the
+    # on-disk last-known-good cache written before #858, and an older control
+    # plane that doesn't send them. Both then behave exactly as they did before
+    # #858 — the option is dropped, loudly — rather than wedging the daemon at
+    # the moment the cache matters most (non-negotiable #5).
+    _strip_undefined_code_options(dhcp4, {c for c in seen_def_codes if isinstance(c, int)})
+
     if option_defs:
         dhcp4["option-def"] = option_defs
 
