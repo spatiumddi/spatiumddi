@@ -10,6 +10,7 @@ needed at our scale).
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
 from datetime import UTC, datetime
@@ -133,7 +134,10 @@ async def generate_change_report_pdf(
                 body,
             )
         )
-        doc.build(story)
+        # reportlab's render pass is synchronous CPU work; on the single-
+        # worker uvicorn loop it stalls every request AND the kubelet's
+        # 1s-budget probes, so it runs on a worker thread.
+        await asyncio.to_thread(doc.build, story)
         return buf.getvalue()
 
     def _section(heading: str, label: str, counts: list[tuple[str, int]]) -> None:
@@ -186,5 +190,8 @@ async def generate_change_report_pdf(
             small,
         )
     )
-    doc.build(story)
+    # reportlab's render pass is synchronous CPU work; on the single-
+    # worker uvicorn loop it stalls every request AND the kubelet's
+    # 1s-budget probes, so it runs on a worker thread.
+    await asyncio.to_thread(doc.build, story)
     return buf.getvalue()
