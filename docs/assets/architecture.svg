@@ -208,7 +208,7 @@
   <g>
     <rect x="506" y="536" width="380" height="126" rx="10" class="card" fill="url(#g-agented)" fill-opacity="0.88"/>
     <text x="696" y="562" text-anchor="middle" class="card-title">Role pods (DaemonSets)</text>
-    <text x="696" y="582" text-anchor="middle" class="card-sub">dns-bind9 / dns-powerdns / dhcp-kea</text>
+    <text x="696" y="582" text-anchor="middle" class="card-sub">dns-bind9 / dns-powerdns / dns-technitium / dhcp-kea</text>
     <text x="696" y="602" text-anchor="middle" class="card-sub-dim">role-picked at fleet promotion</text>
     <text x="696" y="622" text-anchor="middle" class="card-sub-dim">= the agented data plane (below)</text>
     <text x="696" y="642" text-anchor="middle" class="card-sub-dim">scheduled by spatium.io/role-* labels</text>
@@ -231,46 +231,57 @@
   <!-- Lane A: Agented on-prem -->
   <text x="52" y="740" class="lane-label">Agented (on-prem) — built-in containers, auto-register</text>
   <g>
-    <rect x="52" y="750" width="412" height="82" rx="9" class="card" fill="url(#g-agented)"/>
-    <text x="258" y="773" text-anchor="middle" class="card-title">dns-bind9</text>
-    <text x="258" y="791" text-anchor="middle" class="card-sub-dim">ghcr.io/spatiumddi/dns-bind9</text>
-    <text x="258" y="811" text-anchor="middle" class="card-sub">spatium-dns-agent · BIND9 9.18 · nsupdate+TSIG · 53/udp+tcp</text>
+    <rect x="52" y="750" width="412" height="62" rx="9" class="card" fill="url(#g-agented)"/>
+    <text x="258" y="768" text-anchor="middle" class="card-title">dns-bind9</text>
+    <text x="258" y="784" text-anchor="middle" class="card-sub-dim">ghcr.io/spatiumddi/dns-bind9</text>
+    <text x="258" y="802" text-anchor="middle" class="card-sub">spatium-dns-agent · BIND9 9.18 · nsupdate+TSIG · 53/udp+tcp</text>
   </g>
   <g>
-    <rect x="52" y="842" width="412" height="82" rx="9" class="card" fill="url(#g-agented)" fill-opacity="0.9"/>
-    <text x="258" y="865" text-anchor="middle" class="card-title">dns-powerdns</text>
-    <text x="258" y="883" text-anchor="middle" class="card-sub-dim">ghcr.io/spatiumddi/dns-powerdns</text>
-    <text x="258" y="903" text-anchor="middle" class="card-sub">spatium-dns-agent · PowerDNS · REST Control Agent · DNSSEC</text>
+    <rect x="52" y="818" width="412" height="62" rx="9" class="card" fill="url(#g-agented)" fill-opacity="0.95"/>
+    <text x="258" y="836" text-anchor="middle" class="card-title">dns-powerdns</text>
+    <text x="258" y="852" text-anchor="middle" class="card-sub-dim">ghcr.io/spatiumddi/dns-powerdns</text>
+    <text x="258" y="870" text-anchor="middle" class="card-sub">spatium-dns-agent · PowerDNS · REST Control Agent · DNSSEC</text>
   </g>
   <g>
-    <rect x="52" y="934" width="412" height="82" rx="9" class="card" fill="url(#g-agented)" fill-opacity="0.8"/>
-    <text x="258" y="957" text-anchor="middle" class="card-title">dhcp-kea</text>
-    <text x="258" y="975" text-anchor="middle" class="card-sub-dim">ghcr.io/spatiumddi/dhcp-kea</text>
-    <text x="258" y="995" text-anchor="middle" class="card-sub">spatium-dhcp-agent · kea-dhcp4/6 · 67/udp · HA hook</text>
+    <rect x="52" y="886" width="412" height="62" rx="9" class="card" fill="url(#g-agented)" fill-opacity="0.9"/>
+    <text x="258" y="904" text-anchor="middle" class="card-title">dns-technitium</text>
+    <text x="258" y="920" text-anchor="middle" class="card-sub-dim">ghcr.io/spatiumddi/dns-technitium</text>
+    <text x="258" y="938" text-anchor="middle" class="card-sub">spatium-dns-agent · REST API · DoT/DoH/DoQ · online DNSSEC</text>
+  </g>
+  <g>
+    <rect x="52" y="954" width="412" height="62" rx="9" class="card" fill="url(#g-agented)" fill-opacity="0.8"/>
+    <text x="258" y="972" text-anchor="middle" class="card-title">dhcp-kea</text>
+    <text x="258" y="988" text-anchor="middle" class="card-sub-dim">ghcr.io/spatiumddi/dhcp-kea</text>
+    <text x="258" y="1006" text-anchor="middle" class="card-sub">spatium-dhcp-agent · kea-dhcp4/6 · 67/udp · HA hook</text>
   </g>
   <text x="258" y="1024" text-anchor="middle" class="lane-label" font-size="10.5px" fill="#64748b">PSK/pairing→JWT · long-poll ETag</text>
   <text x="258" y="1040" text-anchor="middle" class="lane-label" font-size="10.5px" fill="#64748b">last-known-good cache · DNS engine mutually exclusive</text>
 
   <!-- Lane B: Agentless on-prem (Windows) -->
-  <text x="488" y="740" class="lane-label">Agentless (on-prem) — Windows Server, nothing installed</text>
+  <text x="488" y="740" class="lane-label">Agentless (on-prem) — nothing installed on the host</text>
   <g>
-    <rect x="488" y="750" width="420" height="128" rx="9" class="card" fill="url(#g-agentless)"/>
-    <text x="698" y="773" text-anchor="middle" class="card-title">Windows DNS</text>
-    <text x="698" y="790" text-anchor="middle" class="card-sub-dim">existing Active Directory DC</text>
-    <rect x="508" y="800" width="380" height="28" rx="6" class="pill"/>
-    <text x="698" y="818" text-anchor="middle" class="pill-text">Path A — RFC 2136 record CRUD</text>
-    <rect x="508" y="836" width="380" height="28" rx="6" class="pill"/>
-    <text x="698" y="854" text-anchor="middle" class="pill-text">Path B — WinRM zone CRUD (DnsServer PS)</text>
+    <rect x="488" y="750" width="420" height="112" rx="9" class="card" fill="url(#g-agentless)"/>
+    <text x="698" y="771" text-anchor="middle" class="card-title">Windows DNS</text>
+    <text x="698" y="788" text-anchor="middle" class="card-sub-dim">existing Active Directory DC</text>
+    <rect x="508" y="796" width="380" height="26" rx="6" class="pill"/>
+    <text x="698" y="813" text-anchor="middle" class="pill-text">Path A — RFC 2136 record CRUD</text>
+    <rect x="508" y="826" width="380" height="26" rx="6" class="pill"/>
+    <text x="698" y="843" text-anchor="middle" class="pill-text">Path B — WinRM zone CRUD (DnsServer PS)</text>
   </g>
   <g>
-    <rect x="488" y="888" width="420" height="128" rx="9" class="card" fill="url(#g-agentless)" fill-opacity="0.9"/>
-    <text x="698" y="911" text-anchor="middle" class="card-title">Windows DHCP</text>
-    <text x="698" y="928" text-anchor="middle" class="card-sub-dim">existing DHCP server</text>
-    <rect x="508" y="938" width="380" height="28" rx="6" class="pill"/>
-    <text x="698" y="956" text-anchor="middle" class="pill-text">read-only WinRM polling → IPAM mirror</text>
-    <text x="698" y="984" text-anchor="middle" class="card-sub-dim">5985/5986 · status=dhcp · Path B (CRUD) roadmap</text>
+    <rect x="488" y="870" width="420" height="88" rx="9" class="card" fill="url(#g-agentless)" fill-opacity="0.9"/>
+    <text x="698" y="891" text-anchor="middle" class="card-title">Windows DHCP</text>
+    <text x="698" y="908" text-anchor="middle" class="card-sub-dim">existing DHCP server</text>
+    <rect x="508" y="916" width="380" height="26" rx="6" class="pill"/>
+    <text x="698" y="933" text-anchor="middle" class="pill-text">read-only WinRM polling → IPAM mirror</text>
+    <text x="698" y="951" text-anchor="middle" class="card-sub-dim">5985/5986 · status=dhcp</text>
   </g>
-  <text x="698" y="1024" text-anchor="middle" class="lane-label" font-size="10.5px" fill="#64748b">no software on the DC</text>
+  <g>
+    <rect x="488" y="966" width="420" height="50" rx="9" class="card" fill="url(#g-agentless)" fill-opacity="0.8"/>
+    <text x="698" y="986" text-anchor="middle" class="card-title">Technitium (technitium_api)</text>
+    <text x="698" y="1003" text-anchor="middle" class="card-sub-dim">an install you already run · API URL + bearer token</text>
+  </g>
+  <text x="698" y="1024" text-anchor="middle" class="lane-label" font-size="10.5px" fill="#64748b">no software on the managed host</text>
   <text x="698" y="1040" text-anchor="middle" class="lane-label" font-size="10.5px" fill="#64748b">credentials Fernet-encrypted on the server row</text>
 
   <!-- Lane C: Agentless cloud DNS -->
