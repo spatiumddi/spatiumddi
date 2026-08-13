@@ -524,7 +524,14 @@ async def summary(db: DB, current_user: CurrentUser) -> SummaryResponse:
 # ── PDF export ──────────────────────────────────────────────────────
 
 
-@router.get("/export.pdf")
+@router.get(
+    "/export.pdf",
+    # Declared media type, not just the wire header: FastAPI documents a bare
+    # `-> Response` as application/json, so the (correctly sent)
+    # application/pdf was undocumented and schema-conformance clients flagged
+    # every response (schemathesis UndefinedContentType, 13/13 runs).
+    responses={200: {"content": {"application/pdf": {}}, "description": "PDF conformity report"}},
+)
 async def export_pdf(
     db: DB,
     current_user: CurrentUser,
@@ -539,11 +546,9 @@ async def export_pdf(
     when an auditor only needs PCI evidence.
     """
     _require_read(current_user)
-    # ``reportlab`` itself is sync; the heavy lifting in
-    # ``generate_conformity_pdf`` is the rendering pass after the
-    # async DB queries resolve. The PDF for 100 policies × 1000
-    # resources still renders in well under a second, so we don't
-    # need ``asyncio.to_thread``. Promote if benchmarks ever say so.
+    # ``reportlab`` itself is sync; the service runs its render pass in
+    # ``asyncio.to_thread`` — on the single-worker uvicorn loop an inline
+    # render stalled every concurrent request and the kubelet's probes.
     pdf_bytes = await generate_conformity_pdf(db, framework=framework)
     fname = "spatiumddi-conformity"
     if framework:
