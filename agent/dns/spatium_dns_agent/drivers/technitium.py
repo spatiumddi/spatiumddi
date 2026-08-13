@@ -115,7 +115,13 @@ _ZONE_TRANSFER_VALUES = frozenset(
         "Allow",
         "AllowOnlyZoneNameServers",
         "UseSpecifiedNetworkACL",
-        "AllowOnlyZoneNameServersAndUseSpecifiedNetworkACL",
+        # Upstream spells the combined variant WITHOUT "Only" (verified
+        # against DnsServer.cs's ``AuthZoneTransfer`` switch), unlike the
+        # name-servers-only variant above. The list is an allow-list of
+        # values we are willing to send, and Technitium silently ignores an
+        # unrecognised one, so a misspelling here would have been a value
+        # that could never be set and never report why.
+        "AllowZoneNameServersAndUseSpecifiedNetworkACL",
     }
 )
 
@@ -358,28 +364,49 @@ def _tsig_key_names(bundle: dict[str, Any]) -> list[str]:
     return sorted(set(out))
 
 
-def _zone_options_payload(ztype: str, bundle: dict[str, Any]) -> dict[str, Any]:
-    """Map the bundle's server-level transfer policy onto Technitium's
-    per-zone transfer options.
+def _zone_options_payload(
+    ztype: str, bundle: dict[str, Any], zone: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Map the bundle's transfer policy onto Technitium's per-zone options.
 
-    BIND expresses ``allow-transfer`` once for the whole server; Technitium
-    has no global equivalent, so the same policy is stamped onto each zone
-    we own. Only meaningful for zones this server is authoritative for —
-    a Secondary/Stub transfers *in*, and re-serving it is a separate
-    decision we do not make on the operator's behalf.
+    BIND expresses ``allow-transfer`` once for the whole server and lets a
+    zone override it; Technitium has no global equivalent, so the effective
+    policy is resolved here and stamped onto each zone we own. Only
+    meaningful for zones this server is authoritative for — a Secondary/Stub
+    transfers *in*, and re-serving it is a separate decision we do not make
+    on the operator's behalf.
+
+    ``zone["allow_transfer"]`` (#734) overrides the server-level list when
+    set; ``None`` means inherit, matching how the BIND9 agent treats the
+    same field. Without this the per-zone value would ship in the bundle and
+    be silently ignored here — which is the exact defect #734 is about, one
+    driver over.
 
     The list follows BIND's vocabulary: ``["none"]`` (or empty) denies,
     ``any`` allows, anything else is treated as a network ACL.
+
+    Issue #734: ``none`` is the default, so honouring it literally left the
+    control plane unable to read any zone — the drift report and
+    sync-with-servers both AXFR, and both got REFUSED on every install
+    nobody had hand-configured. When the group has TSIG keys we therefore
+    fall back to ``Allow`` + ``zoneTransferTsigKeyNames``, which Technitium
+    reads as "from any source, but the transfer must be signed by one of
+    these keys". That is the same posture the BIND9 agent renders as
+    ``allow-transfer { key "…"; };`` and is narrower than an address ACL,
+    not wider: it demands possession of a secret.
     """
     if ztype != "Primary":
         return {}
     opts = bundle.get("options") or {}
-    acl = [str(a) for a in (opts.get("allow_transfer") or []) if a]
+    zone_acl = (zone or {}).get("allow_transfer")
+    source = zone_acl if zone_acl is not None else opts.get("allow_transfer")
+    acl = [str(a) for a in (source or []) if a]
     lowered = {a.lower() for a in acl}
+    names = _tsig_key_names(bundle)
 
     payload: dict[str, Any] = {}
     if not acl or lowered == {"none"}:
-        payload["zoneTransfer"] = "Deny"
+        payload["zoneTransfer"] = "Allow" if names else "Deny"
     elif "any" in lowered:
         payload["zoneTransfer"] = "Allow"
     else:
@@ -387,13 +414,21 @@ def _zone_options_payload(ztype: str, bundle: dict[str, Any]) -> dict[str, Any]:
         payload["zoneTransferNetworkACL"] = [a for a in acl if a.lower() != "none"]
 
     # Naming keys here is what makes a transfer TSIG-*authenticated* rather
-    # than merely address-filtered. Only attach them where transfer is
-    # actually permitted — pinning key names onto a Deny zone reads as if
-    # signed transfer were enabled when nothing can transfer at all.
-    if payload["zoneTransfer"] != "Deny":
-        names = _tsig_key_names(bundle)
-        if names:
-            payload["zoneTransferTsigKeyNames"] = names
+    # than merely address-filtered.
+    #
+    # ALWAYS sent, including empty. Technitium treats an absent parameter as
+    # "leave unchanged" and an empty one as "clear" (verified in upstream
+    # ``WebServiceZonesApi.cs``: ``Length == 0`` sets the set to null). So
+    # omitting it when the group's last key is deleted would strand the old
+    # key names on every zone, and transfers from an otherwise-permitted
+    # network would then fail forever, demanding a signature by a key that
+    # no longer exists anywhere. The control plane is the source of truth for
+    # this list, the same stance ``_sync_tsig_keys`` takes for the keys.
+    #
+    # On a Deny zone the list is necessarily empty (the branch above only
+    # picks Deny when there are no keys), so this never reads as "signed
+    # transfer enabled" on a zone that cannot transfer at all.
+    payload["zoneTransferTsigKeyNames"] = names
     return payload
 
 
@@ -626,7 +661,7 @@ class TechnitiumDriver(DriverBase):
                 # Drives ``zones/options/set``. Absent/empty values are not
                 # sent at all, so the daemon default stands rather than us
                 # stamping an opinion onto every zone.
-                "options": _zone_options_payload(ztype, bundle),
+                "options": _zone_options_payload(ztype, bundle, zone),
             }
             if masters:
                 entry["masters"] = masters

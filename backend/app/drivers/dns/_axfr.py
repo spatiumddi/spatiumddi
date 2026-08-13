@@ -18,7 +18,7 @@ from typing import Any
 
 import structlog
 
-from app.drivers.dns.base import RecordData
+from app.drivers.dns.base import RecordData, TsigKey
 
 logger = structlog.get_logger(__name__)
 
@@ -92,6 +92,19 @@ def _hint(exc: BaseException, port: int) -> str:
             "allow-transfer permits the SpatiumDDI control plane, and that it is "
             "authoritative for this zone."
         )
+    # A signed transfer the server rejected on the signature itself. Sending
+    # the operator to allow-transfer here would be actively wrong — the ACL
+    # matched, the key didn't. dnspython signals these by exception TYPE and
+    # its messages carry none of the RCODE mnemonics, so match the class
+    # name: verified live, a wrong secret raises PeerBadSignature ("The peer
+    # didn't like the signature we sent") and a wrong algorithm raises
+    # PeerBadKey ("The peer didn't know the key we used").
+    if type(exc).__name__ in {"PeerBadSignature", "PeerBadKey", "PeerBadTime", "BadSignature"}:
+        return (
+            " The server rejected the TSIG signature — check that the group's key "
+            "name, secret and algorithm match the ones the agent was given, and "
+            "that the two clocks agree (TSIG allows a 5-minute skew)."
+        )
     return (
         f" Check that the server's allow-transfer permits the SpatiumDDI control "
         f"plane and that TCP/{port} is reachable."
@@ -111,6 +124,7 @@ async def axfr_zone_records(
     timeout: int = 20,
     log_driver: str = "dns",
     server_id: str | None = None,
+    tsig: TsigKey | None = None,
 ) -> list[RecordData]:
     """AXFR ``zone_name`` from ``host:port`` and return neutral record dicts.
 
@@ -119,15 +133,58 @@ async def axfr_zone_records(
     surfaces. Out-of-zone glue (an NS target living in a different zone) is
     also skipped, as are DNSSEC signing artefacts (RRSIG / NSEC* / DNSKEY /
     CDS / CDNSKEY), which the signing server owns and rotates itself.
+
+    ``tsig`` signs the transfer (#734). Agent-managed BIND9 and Technitium
+    grant ``allow-transfer`` to the group's TSIG key rather than to a source
+    address — the control plane's address is not knowable on the appliance —
+    so an unsigned transfer is REFUSED there 100% of the time. Callers that
+    have group context resolve the key and pass it; the parameter stays
+    optional because the Windows Path A and cloud callers have no key and
+    are authorised by address instead.
+
+    A key that cannot be turned into a keyring raises rather than falling
+    back to an unsigned transfer: silently degrading would turn a
+    configuration error into the same permanent REFUSED this exists to fix.
     """
     import dns.name  # noqa: PLC0415
     import dns.query  # noqa: PLC0415
     import dns.rdatatype  # noqa: PLC0415
+    import dns.tsig  # noqa: PLC0415
     import dns.zone  # noqa: PLC0415
 
     zone_origin = dns.name.from_text(zone_name)
 
     what = f"AXFR of {zone_name}"
+
+    sign_kwargs: dict[str, Any] = {}
+    if tsig is not None:
+        try:
+            keyname = dns.name.from_text(tsig.name)
+            keyalgorithm = dns.name.from_text(tsig.algorithm)
+            # Build the Key explicitly rather than via ``tsigkeyring.from_text``,
+            # which yields ``{name: bytes}`` and so carries no algorithm at all.
+            key = dns.tsig.Key(keyname, tsig.secret, algorithm=keyalgorithm)
+            # An unknown algorithm is caught by NOTHING above: ``from_text``
+            # and ``Key`` both accept "hmac-nonsense" happily, because it is a
+            # perfectly valid DNS *name*. It only fails much later, inside the
+            # signing call. ``get_context`` is the earliest hook that rejects
+            # it, so probe here to keep the failure attributable to the key
+            # rather than surfacing as an opaque mid-transfer error.
+            dns.tsig.get_context(key)
+            sign_kwargs = {
+                "keyring": {keyname: key},
+                "keyname": keyname,
+                "keyalgorithm": keyalgorithm,
+            }
+        except Exception as exc:
+            # Bad base64 secret, or an algorithm dnspython doesn't know.
+            # Both are operator-fixable configuration, and neither should
+            # be papered over by transferring unsigned.
+            raise RuntimeError(
+                f"{what} from {host}:{port} failed: TSIG key {tsig.name!r} is "
+                f"unusable ({type(exc).__name__}: {exc}). Check the key's secret "
+                f"is valid base64 and that {tsig.algorithm!r} is a supported algorithm."
+            ) from exc
 
     def _axfr() -> dns.zone.Zone:
         # A dual-stack host can resolve to an address that isn't the one
@@ -139,7 +196,7 @@ async def axfr_zone_records(
         for addr in addrs:
             try:
                 return dns.zone.from_xfr(
-                    dns.query.xfr(addr, zone_origin, port=port, timeout=timeout)
+                    dns.query.xfr(addr, zone_origin, port=port, timeout=timeout, **sign_kwargs)
                 )
             except Exception as exc:  # noqa: PERF203 — retry the next address
                 last = exc
@@ -239,6 +296,7 @@ async def axfr_zone_records(
         host=host,
         zone=zone_name,
         count=len(out),
+        signed=tsig is not None,
     )
     return out
 

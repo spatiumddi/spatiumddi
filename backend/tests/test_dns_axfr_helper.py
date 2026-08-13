@@ -20,6 +20,7 @@ from typing import Any
 import pytest
 
 from app.drivers.dns._axfr import axfr_zone_records
+from app.drivers.dns.base import TsigKey
 
 
 class _FakeZone:
@@ -40,6 +41,7 @@ def captured_xfr(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     def fake_xfr(where: str, origin: Any, **kwargs: Any) -> object:
         seen["where"] = where
         seen["port"] = kwargs.get("port")
+        seen["kwargs"] = kwargs
         return object()
 
     monkeypatch.setattr(dns.query, "xfr", fake_xfr)
@@ -207,3 +209,111 @@ async def test_hint_matches_the_failure_cause(
     msg = str(excinfo.value)
     assert expect_present in msg
     assert expect_absent not in msg
+
+
+# ── TSIG-signed transfers (#734) ────────────────────────────────────────────
+#
+# Agent-managed BIND9 / Technitium grant ``allow-transfer`` to a KEY, not to
+# a source address, so an unsigned transfer is REFUSED 100% of the time.
+# Verified live against the dev BIND9 on a stock ``allow_transfer: ["none"]``
+# group before these were written: unsigned → REFUSED, signed with the group
+# key → 7 nodes returned.
+
+
+def _key(name: str = "spatium-default", algorithm: str = "hmac-sha256") -> TsigKey:
+    # Any valid base64 works — dnspython only decodes it, the peer verifies it.
+    return TsigKey(name=name, algorithm=algorithm, secret="c2VjcmV0c2VjcmV0c2VjcmV0c2VjcmV0MDE=")
+
+
+async def test_no_tsig_means_no_keyring(captured_xfr: dict[str, Any]) -> None:
+    """The default stays an unsigned transfer — Windows Path A and the
+    operator-run BIND9 case authorise by address and must not regress."""
+    await axfr_zone_records(host="192.0.2.10", port=53, zone_name="example.com.")
+    assert "keyring" not in captured_xfr["kwargs"]
+
+
+async def test_tsig_is_passed_through_to_the_query(captured_xfr: dict[str, Any]) -> None:
+    """The whole point: a key must reach ``dns.query.xfr`` as a keyring."""
+    import dns.name
+
+    await axfr_zone_records(host="192.0.2.10", port=53, zone_name="example.com.", tsig=_key())
+    kwargs = captured_xfr["kwargs"]
+    assert kwargs["keyname"] == dns.name.from_text("spatium-default")
+    assert kwargs["keyalgorithm"] == dns.name.from_text("hmac-sha256")
+    assert dns.name.from_text("spatium-default") in kwargs["keyring"]
+
+
+async def test_algorithm_is_honoured_not_defaulted(captured_xfr: dict[str, Any]) -> None:
+    """A group on a non-default algorithm must sign with THAT algorithm.
+
+    Signing with the wrong one fails as PeerBadKey, which looks nothing like
+    a permissions problem — so silently defaulting would send the operator
+    hunting the wrong thing.
+    """
+    import dns.name
+
+    await axfr_zone_records(
+        host="192.0.2.10",
+        port=53,
+        zone_name="example.com.",
+        tsig=_key(algorithm="hmac-sha512"),
+    )
+    assert captured_xfr["kwargs"]["keyalgorithm"] == dns.name.from_text("hmac-sha512")
+
+
+@pytest.mark.parametrize(
+    ("bad_key", "reason"),
+    [
+        (TsigKey(name="k.", algorithm="hmac-sha256", secret="not!valid!base64"), "secret"),
+        (TsigKey(name="k.", algorithm="hmac-nonsense", secret="c2VjcmV0"), "algorithm"),
+    ],
+)
+async def test_unusable_key_raises_instead_of_degrading(
+    bad_key: TsigKey, reason: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unusable key must NOT fall back to an unsigned transfer.
+
+    Degrading would turn a fixable configuration error into the same
+    permanent REFUSED that #734 was about, with a hint pointing at
+    allow-transfer instead of at the key.
+    """
+    import dns.query
+
+    def _never_called(*_a: Any, **_kw: Any) -> Any:
+        raise AssertionError("must not attempt a transfer with an unusable key")
+
+    monkeypatch.setattr(dns.query, "xfr", _never_called)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        await axfr_zone_records(host="192.0.2.10", port=53, zone_name="example.com.", tsig=bad_key)
+    msg = str(excinfo.value)
+    assert "unusable" in msg
+    assert reason in msg
+
+
+@pytest.mark.parametrize("exc_name", ["PeerBadSignature", "PeerBadKey", "PeerBadTime"])
+async def test_signature_rejection_does_not_blame_allow_transfer(
+    exc_name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rejected signature must not be reported as an ACL problem.
+
+    dnspython signals these by exception TYPE, and its messages contain none
+    of the RCODE mnemonics — "The peer didn't like the signature we sent"
+    has no "BADSIG" in it — so the hint has to match on the class name.
+    Matching on the text instead is a silent no-op, which is why this is
+    parametrized over the real class names rather than a message.
+    """
+    import dns.query
+
+    exc = type(exc_name, (Exception,), {})("The peer didn't like the signature we sent")
+
+    def _raise(*_a: Any, **_kw: Any) -> Any:
+        raise exc
+
+    monkeypatch.setattr(dns.query, "xfr", _raise)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        await axfr_zone_records(host="192.0.2.10", port=53, zone_name="example.com.", tsig=_key())
+    msg = str(excinfo.value)
+    assert "TSIG signature" in msg
+    assert "allow-transfer" not in msg

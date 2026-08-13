@@ -443,8 +443,9 @@ Mechanics worth knowing:
 - Queries go to an **IP literal**; hostnames are resolved first. Every
   low-level dnspython entry point resolves the nameserver itself and
   raises a bare, message-less `ValueError` for anything that is not an
-  address — the exact reason #61's drift report failed 100% of the time
-  against hostname-addressed servers (#734).
+  address — one of the two reasons #61's drift report failed 100% of the
+  time against hostname-addressed servers (the other was the unsigned
+  transfer, #734).
 - Recursion is disabled (RD=0). Both sides are supposed to be
   authoritative, and letting either recurse would let a cached answer
   from somewhere else stand in for the server under test.

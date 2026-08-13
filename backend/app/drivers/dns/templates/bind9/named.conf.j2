@@ -50,7 +50,11 @@ options {
     allow-recursion { {% for a in options.allow_recursion %}{{ a }}; {% endfor %}};
     allow-query { {% for a in options.allow_query %}{{ a }}; {% endfor %}};
     allow-query-cache { {% for a in options.allow_query_cache %}{{ a }}; {% endfor %}};
-    allow-transfer { {% for a in options.allow_transfer %}{{ a }}; {% endfor %}};
+    {#- #734: computed in Python (``_allow_transfer_items``) rather than
+        inline, so it stays byte-identical to the agent's union of the group
+        TSIG key grants with the operator ACL. Rendering it here by hand is
+        how the two renderers drift. #}
+    allow-transfer { {% for a in allow_transfer_items %}{{ a }} {% endfor %}};
     {%- if options.blackhole %}
     blackhole { {% for a in options.blackhole %}{{ a }}; {% endfor %}};
     {%- endif %}
