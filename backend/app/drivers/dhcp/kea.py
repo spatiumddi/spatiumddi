@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+from collections.abc import Iterable
 from typing import Any
 
 import structlog
@@ -63,6 +64,39 @@ _KEA_OPTION_NAMES: dict[str, str] = {
 # The two happen to be spelled identically for option 150; they are NOT for
 # e.g. ``bootfile-name`` → ``boot-file-name``, and keying this table the other
 # way would emit that option with no definition and fail the whole config.
+# Vendor / phone-profile options addressed by RAW CODE (``code:NN`` keys,
+# which is how ``_assemble_phone_classes`` emits an option the operator picked
+# from the VoIP vendor catalogue rather than by name).
+#
+# #858: Kea does not reject these as undefined — it types them as BINARY, so
+# an operator's string value fails with "not a valid string of hexadecimal
+# digits" and takes the whole config down. Declaring the real type fixes it.
+#
+# The membership of this table is MEASURED against Kea 3.0.3, not assumed,
+# because the rule is not derivable: Kea REFUSES to redefine an option it
+# already types correctly ("unable to override definition of option '66' in
+# standard option space"), so a blanket definition for every code is just as
+# fatal as none. Every code below was confirmed to (a) fail bare with a
+# type-appropriate value and (b) accept the definition given here. Types come
+# from ``app/data/dhcp_voip_options.json``'s ``kind``.
+#
+# Re-measure with `kea-dhcp4 -t` before adding a code here.
+_KEA_VENDOR_OPTION_DEFS: dict[int, dict[str, Any]] = {
+    43: {"name": "spatium-opt-43", "code": 43, "space": "dhcp4", "type": "binary"},
+    132: {"name": "spatium-opt-132", "code": 132, "space": "dhcp4", "type": "string"},
+    150: {
+        "name": "spatium-opt-150",
+        "code": 150,
+        "space": "dhcp4",
+        "type": "ipv4-address",
+        "array": True,
+    },
+    160: {"name": "spatium-opt-160", "code": 160, "space": "dhcp4", "type": "string"},
+    161: {"name": "spatium-opt-161", "code": 161, "space": "dhcp4", "type": "string"},
+    176: {"name": "spatium-opt-176", "code": 176, "space": "dhcp4", "type": "string"},
+    242: {"name": "spatium-opt-242", "code": 242, "space": "dhcp4", "type": "string"},
+}
+
 _KEA_OPTION_DEFS: dict[str, dict[str, Any]] = {
     "tftp-server-address": {
         "name": "tftp-server-address",
@@ -74,6 +108,59 @@ _KEA_OPTION_DEFS: dict[str, dict[str, Any]] = {
 }
 
 
+def _dedupe_defs_by_code(
+    named: list[dict[str, Any]], vendor: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """One definition per code — Kea rejects a config that declares two.
+
+    #858: option 150 is reachable both ways, as the canonical
+    ``tftp-server-address`` name and as a raw ``code:150`` from a Cisco phone
+    profile. A scope using one and a profile using the other produced two
+    definitions for code 150 and a config Kea refuses. The NAMED definition
+    wins: it is the one the rendered ``option-data`` references by name, and a
+    name with no matching definition is itself fatal.
+    """
+    out = list(named)
+    seen = {d.get("code") for d in out}
+    for d in vendor:
+        if d.get("code") not in seen:
+            out.append(d)
+            seen.add(d.get("code"))
+    return out
+
+
+def option_defs_for_option_maps(maps: Iterable[dict[str, Any] | None]) -> list[dict[str, Any]]:
+    """``option-def`` entries needed by the given SpatiumDDI option mappings.
+
+    The agent renders its own Kea config but cannot compute these: the type
+    for a raw ``code:NN`` comes from the VoIP / option-code catalogues, which
+    live in the backend package. So the control plane resolves them once and
+    ships the result on the wire (#858) — the agent emits it verbatim rather
+    than keeping a second copy of a table that would drift, which is the
+    mistake #856 was.
+
+    Takes the neutral ``{name: value}`` mappings, not a rendered document, so
+    it can run at bundle-assembly time before any driver is involved.
+    """
+    codes: set[int] = set()
+    names: set[str] = set()
+    for m in maps:
+        for key in m or {}:
+            if key.startswith("code:"):
+                try:
+                    codes.add(int(key[5:]))
+                except ValueError:
+                    continue
+            else:
+                kea_name = _KEA_OPTION_NAMES.get(key)
+                if kea_name in _KEA_OPTION_DEFS:
+                    names.add(str(kea_name))
+    return _dedupe_defs_by_code(
+        [d for n, d in _KEA_OPTION_DEFS.items() if n in names],
+        [d for c, d in _KEA_VENDOR_OPTION_DEFS.items() if c in codes],
+    )
+
+
 def _collect_option_defs(dhcp4: dict[str, Any]) -> list[dict[str, Any]]:
     """``option-def`` entries required by whatever this render emitted.
 
@@ -81,15 +168,24 @@ def _collect_option_defs(dhcp4: dict[str, Any]) -> list[dict[str, Any]]:
     the way in, so subnet, pool, reservation, client-class and global
     option-data are all covered — including any future producer.
     """
-    seen: set[str] = set()
+    seen_names: set[str] = set()
+    seen_codes: set[int] = set()
 
     def _walk(node: Any) -> None:
         if isinstance(node, dict):
             for key, val in node.items():
                 if key == "option-data" and isinstance(val, list):
                     for entry in val:
-                        if isinstance(entry, dict) and entry.get("name") in _KEA_OPTION_DEFS:
-                            seen.add(str(entry["name"]))
+                        if not isinstance(entry, dict):
+                            continue
+                        if entry.get("name") in _KEA_OPTION_DEFS:
+                            seen_names.add(str(entry["name"]))
+                        # #858 — code-addressed vendor options need the same
+                        # treatment; they are emitted by ``code:NN`` keys and
+                        # carry no ``name`` to match on.
+                        code = entry.get("code")
+                        if isinstance(code, int) and code in _KEA_VENDOR_OPTION_DEFS:
+                            seen_codes.add(code)
                 else:
                     _walk(val)
         elif isinstance(node, list):
@@ -97,9 +193,12 @@ def _collect_option_defs(dhcp4: dict[str, Any]) -> list[dict[str, Any]]:
                 _walk(item)
 
     _walk(dhcp4)
-    # Stable order, keyed off ``_KEA_OPTION_DEFS`` (Kea names, the same
-    # namespace as ``seen``) rather than set iteration.
-    return [d for n, d in _KEA_OPTION_DEFS.items() if n in seen]
+    # Stable order, keyed off the definition tables (whose keys share a
+    # namespace with what was collected) rather than set iteration.
+    return _dedupe_defs_by_code(
+        [d for n, d in _KEA_OPTION_DEFS.items() if n in seen_names],
+        [d for c, d in _KEA_VENDOR_OPTION_DEFS.items() if c in seen_codes],
+    )
 
 
 # Map of SpatiumDDI option-name → Kea Dhcp6 ``option-data`` name. DHCPv6

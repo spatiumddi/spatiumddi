@@ -164,14 +164,17 @@ def test_unknown_option_is_ignored_not_emitted() -> None:
 def test_dropped_option_is_logged_not_silent(capsys: pytest.CaptureFixture[str]) -> None:
     """#856 was invisible because a dropped key looks like an unset option.
 
-    Custom / vendor options (``code:NN`` from the Kea + ISC importers, and the
-    codes the UI's custom-options accordion offers beyond the canonical set)
-    are still dropped — emitting a name Kea has no definition for would fail
-    the WHOLE config — but the operator must at least get a log line.
+    An unrecognised option NAME is still dropped — emitting a name Kea has no
+    definition for would fail the WHOLE config — but the operator gets a log
+    line rather than silence.
+
+    ``code:NN`` keys are no longer dropped: #858 renders them in Kea's
+    ``{"code": NN}`` form, with the control plane shipping the matching
+    ``option-def``.
     """
-    assert _options_from_mapping({"code:43": "0102", "time-servers": ["1.2.3.4"]}) == []
+    assert _options_from_mapping({"time-servers": ["1.2.3.4"]}) == []
     out = capsys.readouterr().out
-    assert out.count("kea_option_dropped_unsupported") == 2
+    assert out.count("kea_option_dropped_unsupported") == 1
 
 
 def test_supported_and_structural_keys_do_not_warn(
