@@ -26,6 +26,7 @@ from app.core.agent_wake import (
     dns_wake_channels,
     wake_subscription,
 )
+from app.core.http_etag import etag_matches, format_etag
 from app.drivers.dns import get_driver as get_dns_driver
 from app.models.audit import AuditLog
 from app.models.dns import (
@@ -360,16 +361,16 @@ async def agent_config_longpoll(
             etag = bundle["etag"]
             # Early return if there are pending ops (fast-path per §3)
             has_pending_ops = bool(bundle.get("pending_record_ops"))
-            if etag != if_none_match or has_pending_ops:
+            if not etag_matches(if_none_match, etag) or has_pending_ops:
                 server.last_config_etag = etag
                 await db.commit()
-                response.headers["ETag"] = etag
+                response.headers["ETag"] = format_etag(etag)
                 return bundle
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
                 response.status_code = 304
-                response.headers["ETag"] = etag
-                return Response(status_code=304, headers={"ETag": etag})
+                response.headers["ETag"] = format_etag(etag)
+                return Response(status_code=304, headers={"ETag": format_etag(etag)})
             await wake.wait(min(WAKE_TICK_SECONDS, remaining))
 
 

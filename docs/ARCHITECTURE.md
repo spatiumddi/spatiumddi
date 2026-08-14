@@ -224,6 +224,27 @@ See the loop in `backend/app/api/v1/dns/agents.py`
 (`agent_config_longpoll`). The ETag compare is the **sole source of
 truth** for whether the agent reloads.
 
+> **Wire form of the ETag (#862).** The internal value is a bare
+> `sha256:<hex>` — that is what the DB columns, the bundle body's own
+> `etag` field, `structural_etag` and the agents' on-disk cache all
+> hold. On the wire it is emitted as a **weak, quoted** entity-tag,
+> `W/"sha256:<hex>"`, via `format_etag` in
+> `backend/app/core/http_etag.py`. Two reasons, and both are load-bearing:
+> an unquoted tag is malformed per RFC 9110 §8.8.3, and a *strong* tag is
+> deleted outright by nginx's gzip filter — which cannot honestly assert
+> byte-identity for a body it just compressed. Both the appliance and
+> compose nginx gzip `application/json`, so before this the header simply
+> vanished for any client sending `Accept-Encoding: gzip`. A weak tag is
+> also the semantically correct one: gzipped and identity are different
+> representations of the same payload, which is exactly what `W/` means.
+>
+> Incoming `If-None-Match` is compared with `etag_matches`, which accepts
+> the weak, strong-quoted and legacy-bare spellings plus `*` and
+> comma-separated lists. That tolerance is what stops the whole fleet
+> re-downloading a bundle on the first poll after an upgrade. **Compare
+> with `etag_matches`, never with `==`** — a raw compare re-breaks the
+> conditional poll for every client that normalises the header.
+
 ### Redis wake (#358)
 
 The long-poll no longer blind-polls the DB on a fixed tick. It waits on
