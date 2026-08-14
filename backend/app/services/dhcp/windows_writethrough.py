@@ -121,17 +121,24 @@ async def _scope_range(
     return str(hosts[0]), str(hosts[-1])
 
 
-async def push_scope_upsert(db: AsyncSession, scope: DHCPScope) -> None:
+async def push_scope_upsert(
+    db: AsyncSession, scope: DHCPScope, *, adopt_existing: bool = False
+) -> None:
     """Push a scope create/update to every agentless member of the scope's group.
 
     Windows members take a per-object ``apply_scope``; agentless cloud/REST
     members (FortiGate) take the whole ``system.dhcp.server`` object rebuilt
     from DB (see ``cloud_writethrough``). Both run before commit so a push
     failure surfaces as a 502 and rolls back.
+
+    ``adopt_existing`` (cloud members only, #865) opts in to overwriting a
+    provider DHCP object SpatiumDDI never created; without it such a push
+    raises ``CloudAdoptionRequired`` (409) and the caller's transaction rolls
+    back. Windows members have no equivalent guard, so the flag stops here.
     """
     # Cloud/REST members first — independent of, and not gated by, the Windows
     # early-return below (a cloud-only group has no Windows members).
-    await push_cloud_scope_upsert(db, scope)
+    await push_cloud_scope_upsert(db, scope, adopt_existing=adopt_existing)
 
     win_servers = await _windows_servers_for_group(db, scope.group_id)
     if not win_servers:

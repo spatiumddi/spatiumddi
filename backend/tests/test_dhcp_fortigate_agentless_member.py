@@ -260,3 +260,105 @@ async def test_real_upsert_persists_provider_ref(
     assert post["json"]["reserved-address"][0]["ip"] == "10.88.0.10"
     # …and the FortiOS mkey is recorded as this scope+server's ownership marker.
     assert scope.provider_refs == {str(server.id): {"mkey": 9, "interface": "port2"}}
+
+
+async def test_scope_create_adoption_409_then_adopt_retry(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#865 — the scope-create dead end. A create whose pre-commit push hits
+    the adoption guard must 409 with the ``X-Adoption-Required`` marker (so the
+    modal can tell it apart from the duplicate-scope 409) and roll the scope
+    back; retrying with ``?adopt_existing=true`` threads the flag through
+    ``push_scope_upsert`` to the cloud push and persists the scope."""
+    from app.services.dhcp.cloud_writethrough import CloudAdoptionRequired
+
+    user, scope = await _setup(db_session)
+    subnet1 = await db_session.get(Subnet, scope.subnet_id)
+    assert subnet1 is not None
+    group_id = scope.group_id
+    # A second subnet with no scope yet — the create target.
+    subnet2 = Subnet(
+        space_id=subnet1.space_id,
+        block_id=subnet1.block_id,
+        name="s2",
+        network="10.89.0.0/24",
+    )
+    db_session.add(subnet2)
+    await db_session.flush()
+    subnet2_id = subnet2.id
+    await db_session.commit()
+
+    adopt_flags: list[bool] = []
+
+    async def _stub(db: AsyncSession, sc: DHCPScope, **kw: object) -> None:
+        adopt = bool(kw.get("adopt_existing"))
+        adopt_flags.append(adopt)
+        if not adopt:
+            raise CloudAdoptionRequired(
+                "A DHCP server already exists on FortiGate interface 'port2' "
+                "that SpatiumDDI did not create."
+            )
+
+    monkeypatch.setattr("app.services.dhcp.windows_writethrough.push_cloud_scope_upsert", _stub)
+
+    hdrs = {"Authorization": f"Bearer {create_access_token(str(user.id))}"}
+    body = {"group_id": str(group_id), "name": "vlan30"}
+
+    resp = await client.post(
+        f"/api/v1/dhcp/subnets/{subnet2_id}/dhcp-scopes", json=body, headers=hdrs
+    )
+    assert resp.status_code == 409, resp.text
+    assert resp.headers.get("x-adoption-required") == "true"
+    # The create rolled back — no half-persisted scope for Force Sync to find.
+    # (The test client shares this session and skips the per-request
+    # ``session.close()`` the real ``get_db`` does, so discard the pending
+    # flush the same way close would before checking what was persisted.)
+    await db_session.rollback()
+    orphan = (
+        (await db_session.execute(select(DHCPScope).where(DHCPScope.subnet_id == subnet2_id)))
+        .unique()
+        .scalar_one_or_none()
+    )
+    assert orphan is None
+
+    resp = await client.post(
+        f"/api/v1/dhcp/subnets/{subnet2_id}/dhcp-scopes?adopt_existing=true",
+        json=body,
+        headers=hdrs,
+    )
+    assert resp.status_code == 201, resp.text
+    assert adopt_flags == [False, True]
+
+    # The duplicate-scope 409 must NOT carry the adoption marker — an
+    # adopt-retry there would be wrong, and the modal keys on the header.
+    resp = await client.post(
+        f"/api/v1/dhcp/subnets/{subnet2_id}/dhcp-scopes", json=body, headers=hdrs
+    )
+    assert resp.status_code == 409
+    assert resp.headers.get("x-adoption-required") is None
+
+
+async def test_scope_update_threads_adopt_existing(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#865 — the edit/activation path hits the same guard, so update accepts
+    the same opt-in and forwards it to the cloud push."""
+    user, scope = await _setup(db_session)
+    scope_id = scope.id
+    await db_session.commit()
+
+    adopt_flags: list[bool] = []
+
+    async def _stub(db: AsyncSession, sc: DHCPScope, **kw: object) -> None:
+        adopt_flags.append(bool(kw.get("adopt_existing")))
+
+    monkeypatch.setattr("app.services.dhcp.windows_writethrough.push_cloud_scope_upsert", _stub)
+
+    hdrs = {"Authorization": f"Bearer {create_access_token(str(user.id))}"}
+    resp = await client.put(
+        f"/api/v1/dhcp/scopes/{scope_id}?adopt_existing=true",
+        json={"description": "adopted"},
+        headers=hdrs,
+    )
+    assert resp.status_code == 200, resp.text
+    assert adopt_flags == [True]

@@ -7897,12 +7897,28 @@ export const dhcpApi = {
       .then((r) => r.data),
   getScope: (id: string) =>
     api.get<DHCPScope>(`/dhcp/scopes/${id}`).then((r) => r.data),
-  createScope: (subnetId: string, data: Partial<DHCPScope>) =>
+  // `adoptExisting` (cloud/FortiGate groups only, #865) opts in to
+  // overwriting a provider DHCP object SpatiumDDI never created; without it
+  // such a save 409s with an X-Adoption-Required header (see
+  // isAdoptionRequired) so the modal can offer an adopt-and-retry.
+  createScope: (
+    subnetId: string,
+    data: Partial<DHCPScope>,
+    adoptExisting = false,
+  ) =>
     api
-      .post<DHCPScope>(`/dhcp/subnets/${subnetId}/dhcp-scopes`, data)
+      .post<DHCPScope>(
+        `/dhcp/subnets/${subnetId}/dhcp-scopes${adoptExisting ? "?adopt_existing=true" : ""}`,
+        data,
+      )
       .then((r) => r.data),
-  updateScope: (id: string, data: Partial<DHCPScope>) =>
-    api.put<DHCPScope>(`/dhcp/scopes/${id}`, data).then((r) => r.data),
+  updateScope: (id: string, data: Partial<DHCPScope>, adoptExisting = false) =>
+    api
+      .put<DHCPScope>(
+        `/dhcp/scopes/${id}${adoptExisting ? "?adopt_existing=true" : ""}`,
+        data,
+      )
+      .then((r) => r.data),
   // #62: returns the full axios response (may be 202 queued-for-approval —
   // see ipamApi.deleteSpace). Do NOT add ``.then((r) => r.data)``.
   deleteScope: (id: string) => api.delete(`/dhcp/scopes/${id}`),

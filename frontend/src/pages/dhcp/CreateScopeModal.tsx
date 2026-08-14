@@ -7,7 +7,14 @@ import {
   type DHCPScope,
   type DHCPOption,
 } from "@/lib/api";
-import { Modal, Field, Btns, inputCls, errMsg } from "./_shared";
+import {
+  Modal,
+  Field,
+  Btns,
+  inputCls,
+  errMsg,
+  isAdoptionRequired,
+} from "./_shared";
 import { DHCPOptionsEditor } from "./DHCPOptionsEditor";
 
 // Suggest a dynamic pool range for a v4 subnet: skip the first 10 hosts
@@ -135,6 +142,11 @@ export function CreateScopeModal({
   const [poolStart, setPoolStart] = useState("");
   const [poolEnd, setPoolEnd] = useState("");
   const [error, setError] = useState("");
+  // 409 + X-Adoption-Required from a cloud (FortiGate) group member: a DHCP
+  // server already exists on the interface that SpatiumDDI didn't create
+  // (#865). Holds the provider detail so we can offer an adopt-and-retry —
+  // the save is always attempted WITHOUT the flag first.
+  const [adoptConflict, setAdoptConflict] = useState<string | null>(null);
 
   const { data: subnets = [] } = useQuery({
     queryKey: ["subnets"],
@@ -242,7 +254,7 @@ export function CreateScopeModal({
   }, [editing, prefilled, settings, subnetDetail]);
 
   const mut = useMutation({
-    mutationFn: () => {
+    mutationFn: (adoptExisting: boolean) => {
       const parsedLeaseTime = parseInt(leaseTime, 10) || 86400;
       const parsedMinLease = minLease ? parseInt(minLease, 10) : null;
       const parsedMaxLease = maxLease ? parseInt(maxLease, 10) : null;
@@ -346,18 +358,20 @@ export function CreateScopeModal({
       } else if (editing && scope?.pxe_profile_id) {
         data.clear_pxe_profile = true;
       }
-      if (editing) return dhcpApi.updateScope(scope!.id, data);
-      return dhcpApi.createScope(subnetId, data).then(async (created) => {
-        if (poolStart && poolEnd) {
-          await dhcpApi.createPool(created.id, {
-            name: "default",
-            start_ip: poolStart,
-            end_ip: poolEnd,
-            pool_type: "dynamic",
-          });
-        }
-        return created;
-      });
+      if (editing) return dhcpApi.updateScope(scope!.id, data, adoptExisting);
+      return dhcpApi
+        .createScope(subnetId, data, adoptExisting)
+        .then(async (created) => {
+          if (poolStart && poolEnd) {
+            await dhcpApi.createPool(created.id, {
+              name: "default",
+              start_ip: poolStart,
+              end_ip: poolEnd,
+              pool_type: "dynamic",
+            });
+          }
+          return created;
+        });
     },
     onSuccess: () => {
       // Invalidate every shape of the scope query so the DHCP page
@@ -378,7 +392,19 @@ export function CreateScopeModal({
       }
       onClose();
     },
-    onError: (e) => setError(errMsg(e, "Failed to save scope")),
+    onError: (e) => {
+      if (isAdoptionRequired(e)) {
+        // Don't show the generic error too — the banner carries the detail
+        // plus the retry action.
+        setAdoptConflict(
+          errMsg(e, "A DHCP server already exists on the interface."),
+        );
+        setError("");
+      } else {
+        setAdoptConflict(null);
+        setError(errMsg(e, "Failed to save scope"));
+      }
+    },
   });
 
   return (
@@ -390,7 +416,9 @@ export function CreateScopeModal({
       <form
         onSubmit={(e) => {
           e.preventDefault();
-          mut.mutate();
+          // Always try without adopting first; the 409 banner below offers
+          // the explicit adopt-and-retry (#865).
+          mut.mutate(false);
         }}
         className="space-y-3"
       >
@@ -851,6 +879,28 @@ export function CreateScopeModal({
         />
 
         {error && <p className="text-xs text-destructive">{error}</p>}
+        {adoptConflict && (
+          <div className="flex items-center justify-between gap-2 rounded border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-800 dark:text-amber-300">
+            <span>{adoptConflict}</span>
+            <div className="flex flex-shrink-0 gap-1.5">
+              <button
+                type="button"
+                onClick={() => mut.mutate(true)}
+                disabled={mut.isPending}
+                className="rounded-md border border-amber-500/50 bg-amber-500/10 px-2.5 py-1 font-medium hover:bg-amber-500/20 disabled:opacity-50"
+              >
+                Adopt existing &amp; save
+              </button>
+              <button
+                type="button"
+                onClick={() => setAdoptConflict(null)}
+                className="rounded border px-1.5 py-0.5 text-[10px] hover:bg-accent"
+              >
+                dismiss
+              </button>
+            </div>
+          </div>
+        )}
         <Btns onClose={onClose} pending={mut.isPending} />
       </form>
     </Modal>

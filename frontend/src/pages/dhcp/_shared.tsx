@@ -79,6 +79,22 @@ export function errMsg(e: unknown, fallback = "Request failed"): string {
   return fallback;
 }
 
+// True when the error is the cloud-driver adoption conflict (#865): a push
+// would overwrite a provider DHCP object SpatiumDDI never created. The
+// backend marks these 409s with X-Adoption-Required so they're
+// distinguishable from other conflicts (e.g. duplicate group+subnet) where
+// an adopt-retry would be wrong. Axios lower-cases response header names.
+// eslint-disable-next-line react-refresh/only-export-components
+export function isAdoptionRequired(e: unknown): boolean {
+  const ae = e as {
+    response?: { status?: number; headers?: Record<string, unknown> };
+  };
+  return (
+    ae?.response?.status === 409 &&
+    String(ae.response.headers?.["x-adoption-required"] ?? "") === "true"
+  );
+}
+
 /** Shared destructive-confirm modal (single-step with optional references block). */
 export function DeleteConfirmModal({
   title,
