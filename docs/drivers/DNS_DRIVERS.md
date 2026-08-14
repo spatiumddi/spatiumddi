@@ -837,14 +837,13 @@ Only `Primary` zones are imported. Secondary / Stub / Forwarder / Catalog are re
 
 `pull_zone_records` AXFRs the zone off the Technitium host, the same path BIND9's drift uses. Technitium's own REST API would be the more natural source — it is exactly what the live-pull importer reads — but that API listens on loopback `:5380` inside the agent's container and only the co-located agent can reach it, so the control plane goes over DNS.
 
-**Two prerequisites, and the second is a real limitation:**
+**The transfer is TSIG-signed** ([#734](https://github.com/spatiumddi/spatiumddi/issues/734)). `allow transfer` defaults to `none` → `zoneTransfer: Deny`, which used to mean drift could never read anything on a stock install. So when the group has TSIG keys, `_zone_options_payload` renders `zoneTransfer: Allow` **plus** `zoneTransferTsigKeyNames`, and the control plane signs with the group key.
 
-1. The group's `allow transfer` must permit the control plane. It defaults to `none`, which renders as Technitium `zoneTransfer: Deny`.
-2. **The group must have no TSIG keys.** `_zone_options_payload` names every group TSIG key on the zone once transfer is permitted, and Technitium then requires a *signed* transfer — an unsigned AXFR is REFUSED. The control plane does not yet sign its AXFR, which is exactly the limitation [#734](https://github.com/spatiumddi/spatiumddi/issues/734) tracks for BIND9. Verified both ways on a live daemon: with key names attached the transfer is REFUSED, and clearing them makes the same AXFR return NOERROR.
+That is a *narrowing*, not an opening, and the reason is in Technitium's own source: `DnsServer.cs` runs two gates in sequence, `IsZoneTransferAllowed` (address/policy) and then `IsTsigAuthenticated`, and the second returns "no auth needed" **only** when the key-name set is empty. So `Allow` + non-empty key names means *any source, but the request must be signed by one of these keys* — the same posture BIND9 renders as `allow-transfer { key "…"; };`, and stricter than an address ACL, which admits anyone who can occupy the address.
 
-The refusal is surfaced as an error on the drift row rather than an empty diff — an empty diff from a refused transfer would read as "in sync", which is the worst possible answer.
+A group with **no** key stays at `Deny`: without a key there is nothing to authenticate with, so `Allow` would be a plain open-AXFR hole. That case surfaces on the drift row as `unsupported`, naming the missing key. An operator-set network ACL is never overridden — the keys are added as the second gate alongside it.
 
-Closing this properly means teaching the shared AXFR path to TSIG-sign, which fixes #734 for BIND9 at the same time. It is deliberately not done here: it touches shared infrastructure and secret decryption in the drift path, and deserves its own change.
+A refused transfer is surfaced as an error on the drift row rather than an empty diff — an empty diff from a refused transfer would read as "in sync", which is the worst possible answer.
 
 ### 4B.4 Record type mapping
 

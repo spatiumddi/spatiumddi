@@ -117,6 +117,21 @@ CREDENTIALED_DNS_DRIVERS: frozenset[str] = CLOUD_DNS_DRIVERS | {"technitium_api"
 # plane has no channel to their daemon.
 TOPOLOGY_PULL_DRIVERS: frozenset[str] = CREDENTIALED_DNS_DRIVERS | {"windows_dns"}
 
+# Drivers whose *agent* grants ``allow-transfer`` to the group's TSIG **key**
+# rather than to a source address (#734), so the control plane must sign to
+# read a live zone.
+#
+# NECESSARY BUT NOT SUFFICIENT — always test with
+# ``app.services.dns.tsig.transfer_needs_tsig``, never with this set alone.
+# A ``bind9`` row can equally be an operator's own BIND9 that SpatiumDDI
+# never deployed to, authorised the ordinary way by address; that server has
+# no group key, so signing it would turn a working unsigned pull into
+# NOTAUTH. ``agent_id`` is what separates the two.
+#
+# ``windows_dns`` also AXFRs on Path A but is deliberately absent: Windows
+# authorises by address and knows nothing of our group key.
+AXFR_TSIG_DRIVERS: frozenset[str] = frozenset({"bind9", "technitium"})
+
 
 def is_agentless(driver_name: str) -> bool:
     """True if the driver runs from the control plane without an agent."""
@@ -153,6 +168,7 @@ def register_driver(name: str, driver_cls: type[DNSDriver]) -> None:
 
 __all__ = [
     "AGENTLESS_DRIVERS",
+    "AXFR_TSIG_DRIVERS",
     "CLOUD_DNS_DRIVERS",
     "CREDENTIALED_DNS_DRIVERS",
     "TOPOLOGY_PULL_DRIVERS",

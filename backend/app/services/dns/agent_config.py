@@ -224,6 +224,13 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
             # wakes the long-poll → a full, allow-update-correct re-render.
             "dynamic_update_enabled": bool(getattr(z, "dynamic_update_enabled", False)),
             "update_acl": update_acls_by_zone.get(z.id, []),
+            # #734 — per-zone transfer override. Settable and persisted since
+            # the column landed, but never shipped, so the agent could not
+            # have rendered it even in principle. None (the common case)
+            # means "inherit the server-level allow_transfer"; the agent
+            # emits a zone-level clause only for a non-None value, because in
+            # BIND a zone-level allow-transfer shadows the options one.
+            "allow_transfer": getattr(z, "allow_transfer", None),
         }
         # Ship records to every server in the group. The is_primary flag
         # historically gated this, but agents need records to render zone
@@ -356,8 +363,20 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
     # external nsupdate clients / AXFR auth — distinct from the legacy
     # auto-generated single key on DNSServerGroup. Both kinds end up in
     # the same `key { … };` block via the named.conf template.
+    #
+    # Ordered by name (#734): the agent takes ``tsig_keys[0]`` as the
+    # loopback identity, and ``resolve_group_transfer_key`` reproduces this
+    # same ordering to decide what to sign a transfer with. Unordered, the
+    # head of the list was whatever the planner returned, so two agents in
+    # one group could render different configs from the same bundle.
     op_keys = (
-        (await db.execute(select(DNSTSIGKey).where(DNSTSIGKey.group_id == server.group_id)))
+        (
+            await db.execute(
+                select(DNSTSIGKey)
+                .where(DNSTSIGKey.group_id == server.group_id)
+                .order_by(DNSTSIGKey.name)
+            )
+        )
         .scalars()
         .all()
     )

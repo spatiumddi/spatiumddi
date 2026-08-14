@@ -15,9 +15,9 @@ driver). Destructive reconciliation (three-way diff + confirmation UI)
 is a later iteration.
 
 Driver-agnostic via ``DNSDriver.pull_zone_records`` + the existing
-``apply_record_change``. Only the Windows driver implements the pull
-side today; BIND9 can follow the same pattern using AXFR from the
-agent's loopback named.
+``apply_record_change``. BIND9, Technitium, Windows DNS and the cloud
+providers all implement the pull side; the agent-managed ones read over
+a TSIG-signed AXFR (#734), the rest over their own authenticated API.
 """
 
 from __future__ import annotations
@@ -30,10 +30,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.drivers.dns import get_driver
-from app.drivers.dns.base import RecordChange, RecordData
+from app.drivers.dns.base import RecordChange, RecordData, TsigKey
 from app.models.dns import DNSRecord, DNSZone
 from app.services.dns.record_ops import resolve_primary_server
 from app.services.dns.serial import bump_zone_serial
+from app.services.dns.tsig import resolve_group_transfer_key, transfer_needs_tsig
 
 logger = structlog.get_logger(__name__)
 
@@ -126,9 +127,19 @@ def _key(r: RecordData | DNSRecord, zone_name: str) -> tuple[str, str, str]:
     return (name, rtype, _normalize_value(rtype, r.value, zone_name))
 
 
-async def _resolve_primary_and_driver(db: AsyncSession, zone: DNSZone) -> tuple[Any, Any]:
+async def _resolve_primary_and_driver(
+    db: AsyncSession, zone: DNSZone
+) -> tuple[Any, Any, TsigKey | None]:
     """Shared preamble for both pull and sync: find the zone's primary,
-    sanity-check the driver supports pulling records."""
+    sanity-check the driver supports pulling records, and resolve the TSIG
+    key its transfers have to be signed with.
+
+    The third element is the key to pass to ``pull_zone_records``, and is
+    None unless :func:`transfer_needs_tsig` says this server's agent granted
+    one. Windows Path A, the cloud providers and an operator's own BIND9 all
+    authorise the read some other way, and signing for them would break a
+    working pull rather than fix a broken one (#734).
+    """
     primary = await resolve_primary_server(db, zone)
     if primary is None:
         raise ValueError(
@@ -138,11 +149,24 @@ async def _resolve_primary_and_driver(db: AsyncSession, zone: DNSZone) -> tuple[
     driver = get_driver(primary.driver)
     if not hasattr(driver, "pull_zone_records"):
         raise ValueError(
-            f"Driver {primary.driver!r} does not support syncing with the "
-            "authoritative server. Only Windows DNS (RFC 2136 via AXFR) is "
-            "implemented today."
+            f"Driver {primary.driver!r} does not support syncing with the authoritative server."
         )
-    return primary, driver
+    if not transfer_needs_tsig(primary):
+        return primary, driver, None
+
+    # #734 — the agent grants allow-transfer to the group key, so an
+    # unsigned read is REFUSED. No key means the sync cannot work at all;
+    # say so up front instead of surfacing a REFUSED that points the
+    # operator at a named.conf the agent owns and they cannot edit.
+    tsig = await resolve_group_transfer_key(db, primary.group_id)
+    if tsig is None:
+        raise ValueError(
+            f"This zone's group has no TSIG key, so the zone transfer that "
+            f"syncing reads from {primary.name!r} cannot be authenticated. "
+            "Create a TSIG key on the group and let the agent apply the new "
+            "config, then try again."
+        )
+    return primary, driver, tsig
 
 
 def _additive_import(
@@ -217,9 +241,9 @@ async def pull_zone_from_server(
     task when the admin wants read-only sync; for the UI "Sync with server"
     button see ``sync_zone_with_server``.
     """
-    primary, driver = await _resolve_primary_and_driver(db, zone)
+    primary, driver, tsig = await _resolve_primary_and_driver(db, zone)
 
-    on_wire: list[RecordData] = await driver.pull_zone_records(primary, zone.name)  # type: ignore[attr-defined]
+    on_wire: list[RecordData] = await driver.pull_zone_records(primary, zone.name, tsig=tsig)  # type: ignore[attr-defined]
 
     db_rows_res = await db.execute(select(DNSRecord).where(DNSRecord.zone_id == zone.id))
     db_rows = list(db_rows_res.scalars().all())
@@ -400,9 +424,9 @@ async def sync_zone_with_server(
     Never deletes. Returns counts for both phases so the UI can surface
     them in one pass.
     """
-    primary, driver = await _resolve_primary_and_driver(db, zone)
+    primary, driver, tsig = await _resolve_primary_and_driver(db, zone)
 
-    on_wire: list[RecordData] = await driver.pull_zone_records(primary, zone.name)  # type: ignore[attr-defined]
+    on_wire: list[RecordData] = await driver.pull_zone_records(primary, zone.name, tsig=tsig)  # type: ignore[attr-defined]
 
     # Snapshot DB state BEFORE the pull so we can compute the push set
     # against the "old" DB. We still import new rows from the pull into

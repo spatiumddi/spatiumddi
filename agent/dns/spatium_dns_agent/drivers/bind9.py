@@ -47,6 +47,7 @@ NAMED_CONF_SKELETON = """\
     listen-on-v6 {{ any; }};
 {encrypted_listeners}    recursion {recursion};
     allow-query {{ {allow_query}; }};
+    {allow_transfer}
     dnssec-validation {dnssec};
     key-directory "/var/cache/bind/keys";
     check-integrity no;
@@ -117,6 +118,62 @@ def _render_allow_update(zone: dict[str, Any], group_key_name: str | None) -> st
     if not items:
         return ""
     return f'allow-update {{ {" ".join(items)} }}; '
+
+
+def _transfer_key_grants(tsig_keys: list[dict[str, Any]]) -> list[str]:
+    """``key "name";`` items for every TSIG key in the bundle (issue #734).
+
+    These are what make a zone transfer possible at all on an appliance.
+    ``allow-transfer`` defaults to ``none``, and the control plane cannot be
+    granted by address — behind an HA VIP the request can arrive from any
+    control-plane node, and on the appliance the address isn't knowable at
+    render time. So the grant is by key, which is also strictly narrower:
+    an address ACL admits anyone who can spoof/occupy the address, a key
+    admits only a holder of the secret.
+
+    Every key is granted rather than just the first, so the control plane's
+    choice of which one to sign with (``resolve_group_transfer_key``) can
+    never disagree with what was granted.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for k in tsig_keys or []:
+        name = (k.get("name") or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        out.append(f'key "{name}";')
+    return out
+
+
+def _render_allow_transfer(
+    acl: list[Any] | None,
+    key_grants: list[str],
+) -> str:
+    """Build an ``allow-transfer { ... };`` clause (issue #734).
+
+    ``acl`` is the operator's own list in BIND's vocabulary (``["any"]``,
+    ``["10.0.0.0/8", "192.0.2.1"]``, ``["none"]``, …) from
+    ``DNSServerOptions.allow_transfer`` or a zone's override. Both were
+    settable in the UI and persisted, but nothing ever rendered them — the
+    operator got a 200 and silence.
+
+    The key grants are unioned in unconditionally, INCLUDING when the ACL
+    says ``none``. That is deliberate: ``none`` is the default, so honouring
+    it literally would lock the control plane out of every zone on a stock
+    install and re-break drift the moment this shipped. ``none`` is dropped
+    from the rendered list when anything else is present — as an address
+    match it never matches, so it is pure noise.
+    """
+    items = list(key_grants)
+    for entry in acl or []:
+        token = str(entry).strip()
+        if not token or token.lower() == "none":
+            continue
+        items.append(f"{token};")
+    if not items:
+        return "allow-transfer { none; }; "
+    return f'allow-transfer {{ {" ".join(items)} }}; '
 
 
 _UPDATE_POLICY_NAMED_SCOPES = frozenset({"subdomain", "name", "wildcard", "self"})
@@ -560,6 +617,13 @@ class Bind9Driver(DriverBase):
         tsig_include = (
             'include "/var/lib/spatium-dns-agent/tsig/ddns.key";\n' if tsig_keys else ""
         )
+        # Server-wide transfer policy (issue #734). Rendered once here so it
+        # covers every zone type — primary, secondary, stub, RPZ — and so the
+        # control plane can read any zone this server serves. A zone with its
+        # own ``allow_transfer`` override emits its own clause below, which
+        # BIND lets shadow this one entirely.
+        key_grants = _transfer_key_grants(tsig_keys)
+        allow_transfer_opt = _render_allow_transfer(opts.get("allow_transfer"), key_grants)
 
         # Split-horizon (issue #24): when the group defines views, every
         # zone — and every RPZ/response-policy — lives INSIDE a
@@ -590,6 +654,7 @@ class Bind9Driver(DriverBase):
         conf = NAMED_CONF_SKELETON.format(
             recursion=recursion,
             allow_query=allow_query,
+            allow_transfer=allow_transfer_opt.rstrip(),
             dnssec=dnssec,
             forwarders=fwd_block,
             response_policy=response_policy_block,
@@ -680,15 +745,23 @@ class Bind9Driver(DriverBase):
                 update_clause = _render_update_policy(zone, tsig_key_name)
             else:
                 update_clause = _render_allow_update(zone, tsig_key_name)
-            # Ingest-back (issue #641): a dynamic zone can accept externally-
-            # injected records that live only in the journal. The agent AXFRs
-            # the live zone from loopback to read them back — but the global
-            # ``allow-transfer`` defaults to ``none``, so grant transfer to the
-            # loopback TSIG key (only, and only on dynamic zones). The AXFR is
-            # signed with that key; nothing is opened to the network.
+            # Transfer policy (issues #641 + #734). The key grant that makes
+            # ingest-back and the drift report work now lives in the options
+            # block above, so it covers every zone rather than only dynamic
+            # ones — a static zone is still a zone the control plane has to be
+            # able to read, and static zones are most of them.
+            #
+            # A per-zone clause is emitted only when the operator set
+            # ``DNSZone.allow_transfer``, because BIND lets a zone-level
+            # ``allow-transfer`` shadow the options one completely. The key
+            # grants are re-added here so that override can widen or narrow
+            # who else may transfer without ever locking out the control
+            # plane — which would silently break drift, and look exactly like
+            # the bug this replaced.
+            zone_xfer_acl = zone.get("allow_transfer")
             allow_transfer = (
-                f'allow-transfer {{ key "{tsig_key_name}"; }}; '
-                if (zone.get("dynamic_update_enabled") and tsig_key_name)
+                _render_allow_transfer(zone_xfer_acl, key_grants)
+                if zone_xfer_acl is not None
                 else ""
             )
             # DNSSEC inline-signing (issue #49): primary zones with signing on

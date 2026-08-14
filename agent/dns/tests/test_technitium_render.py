@@ -673,18 +673,120 @@ def test_zone_options_only_for_primary() -> None:
         assert _zone_options_payload(ztype, _zone_bundle()) == {}
 
 
-def test_tsig_key_names_only_attached_when_transfer_permitted() -> None:
-    """Pinning key names onto a Deny zone reads as if signed transfer were
-    enabled when nothing can transfer at all."""
-    keys = [{"name": "k1.", "secret": "s", "algorithm": "hmac-sha256"}]
-    denied = _zone_options_payload("Primary", _zone_bundle(tsig_keys=keys))
+def test_tsig_key_names_track_the_bundle() -> None:
+    """A Deny zone has no keys to name, and a permitted one names them all."""
+    denied = _zone_options_payload("Primary", _zone_bundle())
     assert denied["zoneTransfer"] == "Deny"
-    assert "zoneTransferTsigKeyNames" not in denied
+    assert denied["zoneTransferTsigKeyNames"] == []
 
+    keys = [{"name": "k1.", "secret": "s", "algorithm": "hmac-sha256"}]
     allowed = _zone_options_payload(
         "Primary", _zone_bundle(tsig_keys=keys, options={"allow_transfer": ["any"]})
     )
     assert allowed["zoneTransferTsigKeyNames"] == ["k1"]
+
+
+# ── Signed-transfer fallback (issue #734) ───────────────────────────────
+#
+# ``allow_transfer`` defaults to ``["none"]``, so honouring it literally
+# left the control plane unable to AXFR any zone — which is what the drift
+# report and sync-with-servers both do. Both were broken on every install
+# nobody had hand-configured.
+#
+# Technitium ANDs two independent gates (verified against DnsServer.cs:
+# ``IsZoneTransferAllowed`` then ``IsTsigAuthenticated``), and the second
+# returns "no auth needed" ONLY when the key-name set is empty. So
+# ``Allow`` + non-empty ``zoneTransferTsigKeyNames`` means "any source, but
+# the request MUST be signed by one of these keys" — the same posture BIND9
+# renders as ``allow-transfer { key "…"; };``, and narrower than an address
+# ACL rather than wider.
+
+
+def test_deny_becomes_signed_allow_when_the_group_has_keys() -> None:
+    """The fix: a stock ["none"] group with a key permits a SIGNED transfer."""
+    keys = [{"name": "spatium-default", "secret": "s", "algorithm": "hmac-sha256"}]
+    out = _zone_options_payload("Primary", _zone_bundle(tsig_keys=keys))
+    assert out["zoneTransfer"] == "Allow"
+    assert out["zoneTransferTsigKeyNames"] == ["spatium-default"]
+
+
+def test_deny_stays_deny_without_keys() -> None:
+    """No key means nothing can authenticate, so ``Allow`` would be a plain
+    open-AXFR hole rather than a signed grant. Never widen without a key."""
+    out = _zone_options_payload("Primary", _zone_bundle(tsig_keys=[]))
+    assert out["zoneTransfer"] == "Deny"
+
+
+def test_operator_network_acl_is_not_overridden_by_the_fallback() -> None:
+    """An explicit ACL is a deliberate choice — keep it, and add the keys as
+    the second gate rather than replacing the address restriction."""
+    keys = [{"name": "k1.", "secret": "s", "algorithm": "hmac-sha256"}]
+    out = _zone_options_payload(
+        "Primary", _zone_bundle(tsig_keys=keys, options={"allow_transfer": ["10.0.0.0/8"]})
+    )
+    assert out["zoneTransfer"] == "UseSpecifiedNetworkACL"
+    assert out["zoneTransferNetworkACL"] == ["10.0.0.0/8"]
+    assert out["zoneTransferTsigKeyNames"] == ["k1"]
+
+
+def test_removing_the_last_key_clears_the_pinned_names() -> None:
+    """Technitium reads an ABSENT parameter as "leave unchanged" and an empty
+    one as "clear" (upstream ``WebServiceZonesApi.cs``: ``Length == 0`` sets
+    the set to null). Omitting it when the group's last key is deleted would
+    strand the old names on the zone, and transfers from the permitted range
+    would then fail forever, demanding a signature by a key that no longer
+    exists. Always send it so the control plane stays the source of truth.
+    """
+    out = _zone_options_payload(
+        "Primary", _zone_bundle(tsig_keys=[], options={"allow_transfer": ["10.0.0.0/8"]})
+    )
+    assert out["zoneTransfer"] == "UseSpecifiedNetworkACL"
+    assert out["zoneTransferTsigKeyNames"] == []
+
+
+def test_per_zone_allow_transfer_overrides_the_server_list() -> None:
+    """``DNSZone.allow_transfer`` ships in the bundle since #734. The BIND9
+    agent honours it; ignoring it here would leave it a silent no-op on
+    Technitium — the same defect #734 exists to fix, one driver over."""
+    out = _zone_options_payload(
+        "Primary",
+        _zone_bundle(options={"allow_transfer": ["any"]}),
+        {"allow_transfer": ["10.0.0.0/8"]},
+    )
+    assert out["zoneTransfer"] == "UseSpecifiedNetworkACL"
+    assert out["zoneTransferNetworkACL"] == ["10.0.0.0/8"]
+
+
+def test_per_zone_none_narrows_a_permissive_server_default() -> None:
+    """An override must be able to tighten, not just widen — otherwise
+    "deny transfers of this one zone" is unexpressible."""
+    out = _zone_options_payload(
+        "Primary",
+        _zone_bundle(options={"allow_transfer": ["any"]}),
+        {"allow_transfer": ["none"]},
+    )
+    assert out["zoneTransfer"] == "Deny"
+
+
+def test_null_per_zone_value_inherits_the_server_list() -> None:
+    """None means inherit, matching the BIND9 agent. Treating it as an empty
+    ACL would silently deny every zone that had no override."""
+    out = _zone_options_payload(
+        "Primary", _zone_bundle(options={"allow_transfer": ["any"]}), {"allow_transfer": None}
+    )
+    assert out["zoneTransfer"] == "Allow"
+
+
+def test_combined_transfer_enum_matches_upstream_spelling() -> None:
+    """Upstream spells the combined variant WITHOUT "Only" — unlike
+    ``AllowOnlyZoneNameServers``. The set is an allow-list of values we will
+    send, and Technitium silently ignores an unrecognised one, so a
+    misspelling here is a value that can never be set and never reports why.
+    """
+    from spatium_dns_agent.drivers.technitium import _ZONE_TRANSFER_VALUES
+
+    assert "AllowZoneNameServersAndUseSpecifiedNetworkACL" in _ZONE_TRANSFER_VALUES
+    assert "AllowOnlyZoneNameServersAndUseSpecifiedNetworkACL" not in _ZONE_TRANSFER_VALUES
 
 
 def test_tsig_key_names_strip_root_dot() -> None:

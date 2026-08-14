@@ -49,6 +49,7 @@ from app.drivers.dns.base import (
     RecordChange,
     RecordData,
     ServerOptions,
+    TsigKey,
     ZoneData,
 )
 
@@ -217,12 +218,25 @@ class CloudDNSDriverBase(DNSDriver):
             for z in zones
         ]
 
-    async def pull_zone_records(self, server: Any, zone_name: str) -> list[RecordData]:
+    async def pull_zone_records(
+        self,
+        server: Any,
+        zone_name: str,
+        *,
+        tsig: TsigKey | None = None,  # noqa: ARG002 — no AXFR here; see below
+    ) -> list[RecordData]:
         """Return the records for ``zone_name`` from the provider.
 
         Record names are returned **relative** to the zone apex (``"@"``
         for apex) to match BIND9 / Windows pulls, so the import + drift
         machinery keys records consistently across drivers.
+
+        ``tsig`` is accepted and ignored: cloud providers are read over
+        their own authenticated HTTP APIs, not AXFR, so there is nothing to
+        sign. Callers only pass a key for the drivers in
+        ``AXFR_TSIG_DRIVERS``, so in practice this always arrives as None
+        — the parameter exists to keep one call signature across drivers
+        rather than making every call site branch (#734).
         """
         creds = self._load_credentials(server)
         records = await self._list_zone_records(server, creds, normalize_fqdn(zone_name))

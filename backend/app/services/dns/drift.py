@@ -28,6 +28,7 @@ from app.drivers.dns import get_driver
 from app.drivers.dns.base import RecordData
 from app.models.dns import DNSRecord, DNSServer, DNSZone
 from app.services.dns.pull_from_server import _key
+from app.services.dns.tsig import resolve_group_transfer_key, transfer_needs_tsig
 
 logger = structlog.get_logger(__name__)
 
@@ -102,6 +103,19 @@ async def compute_zone_drift(
         zone_id=str(zone.id), zone_name=zone.name, db_record_count=len(db_rows)
     )
 
+    # #734 — an agent-managed BIND9 / Technitium grants transfer to the
+    # group's TSIG key, not to our address, so the read has to be signed.
+    # Resolve once for the whole group rather than per server: every server
+    # in a group renders from the same bundle and so grants the same keys.
+    # Must happen before the gather() below, which deliberately touches no
+    # DB. Skipped entirely when no server needs it, so a group of Windows or
+    # operator-run servers never decrypts a secret it has no use for.
+    transfer_key = (
+        await resolve_group_transfer_key(db, group_id)
+        if any(transfer_needs_tsig(s) for s in servers)
+        else None
+    )
+
     # Split-horizon caveat. Under views (#24) each view gets its own zone row
     # and its own rendered zone file, but an AXFR is addressed by zone *name*
     # — the server answers with whichever view matches the control plane's
@@ -134,8 +148,33 @@ async def compute_zone_drift(
             entry.status = "unsupported"
             entry.error = f"Driver {srv.driver!r} can't pull live records for drift."
             return entry
+        # Fail closed, and say which thing is missing (#734). Without a key
+        # the transfer is REFUSED, and the generic error sends the operator
+        # to allow-transfer / the firewall — neither of which is the problem,
+        # and neither of which they can reach anyway, because the agent owns
+        # named.conf. Naming the missing key is the difference between a
+        # fixable report and a dead end.
+        if transfer_needs_tsig(srv):
+            if transfer_key is None:
+                entry.status = "unsupported"
+                entry.error = (
+                    "This server's group has no TSIG key, so the zone transfer that "
+                    "drift reads cannot be authenticated. Create a TSIG key on the "
+                    "group (Servers → group → TSIG keys) and let the agent apply the "
+                    "new config, then re-run this report."
+                )
+                return entry
+            srv_tsig = transfer_key
+        else:
+            # Only sign where an agent actually granted the key. Windows Path
+            # A and an operator's own BIND9 both AXFR unsigned and are
+            # authorised by address; handing either a key it never granted
+            # turns a working pull into NOTAUTH.
+            srv_tsig = None
         try:
-            on_wire: list[RecordData] = await driver.pull_zone_records(srv, zone.name)
+            on_wire: list[RecordData] = await driver.pull_zone_records(
+                srv, zone.name, tsig=srv_tsig
+            )
         except Exception as exc:  # noqa: BLE001 — per-server, never fail the whole report
             entry.status = "error"
             entry.error = str(exc)

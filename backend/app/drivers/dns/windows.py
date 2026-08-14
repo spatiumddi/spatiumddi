@@ -56,6 +56,7 @@ from app.drivers.dns.base import (
     RecordChangeResult,
     RecordData,
     ServerOptions,
+    TsigKey,
     ZoneData,
 )
 
@@ -497,7 +498,9 @@ class WindowsDNSDriver(DNSDriver):
     async def reload_zone(self, server: Any, zone_name: str) -> None:
         return
 
-    async def pull_zone_records(self, server: Any, zone_name: str) -> list[RecordData]:
+    async def pull_zone_records(
+        self, server: Any, zone_name: str, *, tsig: TsigKey | None = None
+    ) -> list[RecordData]:
         """Return the records for ``zone_name`` from the Windows DC.
 
         Dispatches by credential state:
@@ -511,7 +514,10 @@ class WindowsDNSDriver(DNSDriver):
           read rights on the zone (DnsAdmins or a custom role).
         * **No credentials (Path A)** — falls back to standard RFC 2136
           AXFR. Requires the zone to allow transfers to the SpatiumDDI
-          host.
+          host. ``tsig`` signs the transfer when the group has a key
+          (#734); Windows DNS authorises transfers by address rather than
+          by key, so this normally arrives as ``None`` and the transfer
+          goes unsigned, exactly as before.
         """
         if getattr(server, "credentials_encrypted", None):
             return await self._pull_zone_records_winrm(server, zone_name)
@@ -528,6 +534,7 @@ class WindowsDNSDriver(DNSDriver):
             zone_name=zone_name,
             log_driver="windows_dns",
             server_id=str(getattr(server, "id", "")),
+            tsig=tsig,
         )
 
     async def _pull_zone_records_winrm(self, server: Any, zone_name: str) -> list[RecordData]:
