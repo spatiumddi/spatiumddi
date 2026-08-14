@@ -8681,6 +8681,27 @@ function EditAddressModal({
   const [pendingWarnings, setPendingWarnings] = useState<
     CollisionWarning[] | null
   >(null);
+  // #867 — parity with AddAddressModal: flipping an existing row to
+  // ``static_dhcp`` must be able to pin the reservation on a scope instead of
+  // silently saving a row the DHCP server keeps leasing. Only surfaced when no
+  // reservation is linked yet — a linked row is owned by the DHCP side
+  // (``upsert_ipam_for_static`` is the source of truth for hostname/MAC).
+  const [dhcpScopeId, setDhcpScopeId] = useState<string>("");
+  const [showCreateScope, setShowCreateScope] = useState(false);
+  const needsDhcpScope =
+    status === "static_dhcp" && !address.static_assignment_id;
+
+  const { data: dhcpScopes = [] } = useQuery({
+    queryKey: ["dhcp-scopes-subnet", address.subnet_id],
+    queryFn: () => dhcpApi.listScopesBySubnet(address.subnet_id),
+    enabled: needsDhcpScope,
+  });
+
+  useEffect(() => {
+    if (needsDhcpScope && !dhcpScopeId && dhcpScopes.length > 0) {
+      setDhcpScopeId(dhcpScopes[0].id);
+    }
+  }, [needsDhcpScope, dhcpScopes.length]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const { data: cfDefs = [] } = useQuery({
     queryKey: ["custom-fields", "ip_address"],
@@ -8779,7 +8800,7 @@ function EditAddressModal({
       : null;
 
   const mutation = useMutation({
-    mutationFn: (force: boolean) => {
+    mutationFn: async (force: boolean) => {
       // Empty string on role → null (clears the field).
       // Empty string on reservedUntil → null when status=reserved
       // (= no TTL); when status moved off reserved we still send
@@ -8788,7 +8809,7 @@ function EditAddressModal({
         status === "reserved" && reservedUntil
           ? new Date(reservedUntil).toISOString()
           : null;
-      return ipamApi.updateAddress(address.id, {
+      const updated = await ipamApi.updateAddress(address.id, {
         // Send explicit null/"" so an operator can *clear* a field — the old
         // ``value || undefined`` was dropped by axios and ignored by the
         // backend's exclude_unset, making a clear a silent no-op (#502).
@@ -8808,12 +8829,42 @@ function EditAddressModal({
         reserved_until: reservedIso,
         force,
       });
+      // #867 — mirror the row into the DHCP side, same chained pattern +
+      // partial-failure contract as AddAddressModal (#516). Unlike create,
+      // the row update is idempotent, so a failed reservation is retried by
+      // simply saving again.
+      let staticError: string | null = null;
+      if (needsDhcpScope && dhcpScopeId && macAddress) {
+        try {
+          await dhcpApi.createStatic(dhcpScopeId, {
+            ip_address: String(address.address),
+            mac_address: macAddress,
+            hostname: hostname || "",
+            description: description || "",
+          });
+        } catch (e) {
+          staticError = formatApiError(e, "DHCP reservation failed");
+        }
+      }
+      return { updated, staticError };
     },
-    onSuccess: () => {
+    onSuccess: ({ staticError }) => {
       qc.invalidateQueries({ queryKey: ["addresses", address.subnet_id] });
       qc.invalidateQueries({ queryKey: ["dns-records"] });
       qc.invalidateQueries({ queryKey: ["dns-group-records"] });
       qc.invalidateQueries({ queryKey: ["dns-zones"] });
+      if (dhcpScopeId) {
+        qc.invalidateQueries({ queryKey: ["dhcp-statics", dhcpScopeId] });
+      }
+      if (staticError) {
+        // Row saved, reservation failed — keep the modal open so the
+        // operator sees it; saving again retries just the reservation.
+        setError(
+          `Address saved, but the DHCP reservation failed: ${staticError}. ` +
+            "Fix the cause and press Save again to retry the reservation.",
+        );
+        return;
+      }
       onClose();
     },
     onError: (err: unknown) => {
@@ -8982,6 +9033,65 @@ function EditAddressModal({
             ))}
           </select>
         </Field>
+        {/* #867 — scope picker for pinning a reservation on a row edited
+            into ``static_dhcp``. Mirrors AddAddressModal, incl. the #472
+            inline create-scope escape hatch. */}
+        {needsDhcpScope && (
+          <Field label="DHCP Scope">
+            {dhcpScopes.length === 0 ? (
+              <div className="rounded-md border bg-amber-500/10 border-amber-500/40 px-3 py-2 text-xs">
+                No DHCP scope exists for this subnet — a reservation needs one.
+                <button
+                  type="button"
+                  onClick={() => setShowCreateScope(true)}
+                  className="ml-1 font-medium text-primary underline hover:no-underline"
+                >
+                  Create a scope
+                </button>{" "}
+                to continue.
+              </div>
+            ) : (
+              <select
+                className={inputCls}
+                value={dhcpScopeId}
+                onChange={(e) => setDhcpScopeId(e.target.value)}
+              >
+                {dhcpScopes.map((sc) => (
+                  <option key={sc.id} value={sc.id}>
+                    {sc.name || `Scope ${sc.id.slice(0, 8)}`}
+                    {" — group "}
+                    {sc.group_id.slice(0, 8)}
+                  </option>
+                ))}
+              </select>
+            )}
+            {!macAddress && (
+              <p className="mt-1 text-xs text-amber-600">
+                MAC address required to create a static DHCP reservation.
+              </p>
+            )}
+            {showCreateScope && (
+              <CreateScopeModal
+                subnetId={address.subnet_id}
+                onClose={() => setShowCreateScope(false)}
+              />
+            )}
+          </Field>
+        )}
+        {status === "static_dhcp" && address.static_assignment_id && (
+          <p className="text-[11px] text-muted-foreground">
+            A DHCP reservation is already linked to this address — the
+            reservation (DHCP side) is the source of truth for hostname and MAC.
+          </p>
+        )}
+        {address.status === "static_dhcp" &&
+          status !== "static_dhcp" &&
+          address.static_assignment_id && (
+            <p className="text-[11px] text-amber-700 dark:text-amber-400">
+              This edit does not remove the linked DHCP reservation — delete it
+              on the DHCP side to actually free the address.
+            </p>
+          )}
         <div className="grid grid-cols-2 gap-2">
           <Field label="Role">
             <select
