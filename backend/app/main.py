@@ -780,10 +780,14 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
         # Custom response headers the browser must be allowed to read via
         # fetch(). ``X-Total-Count`` backs server-side pagination on the IPAM
-        # address list + cross-subnet search (issues #517 / #520). Without
-        # this the header is present on the wire but the JS layer can't read
-        # it under CORS.
-        expose_headers=["X-Total-Count"],
+        # address list + cross-subnet search (issues #517 / #520);
+        # ``X-Adoption-Required`` marks the cloud-driver adoption 409 so the
+        # scope modal can offer an adopt-and-retry instead of the generic
+        # error (#865). Without this the header is present on the wire but
+        # the JS layer can't read it under CORS — for a cross-origin
+        # frontend the feature would silently degrade to the dead end it
+        # fixes.
+        expose_headers=["X-Total-Count", "X-Adoption-Required"],
     )
 
     # SECURITY (#400 / L3): Host-header allow-list. Added LAST so — given
