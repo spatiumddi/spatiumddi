@@ -313,4 +313,10 @@ server {
 
     gzip on;
     gzip_types text/plain text/css application/javascript application/json image/svg+xml;
+    # Issue #862 — without this a shared cache between the appliance and a
+    # client can serve a gzipped body to a client that never asked for one,
+    # because nothing in the response says the entity varies by encoding.
+    # It also matters for the agent /config long-poll, whose ETag is now a
+    # weak validator deliberately shared by both encodings.
+    gzip_vary on;
 }

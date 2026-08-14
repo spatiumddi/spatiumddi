@@ -30,6 +30,7 @@ from app.core.agent_wake import (
     looking_glass_wake_channels,
     wake_subscription,
 )
+from app.core.http_etag import etag_matches, format_etag
 from app.models.bgp_looking_glass import BGPLGPeer, LookingGlassCollector
 from app.services.looking_glass.agent_token import (
     hash_token,
@@ -285,14 +286,14 @@ async def agent_config_longpoll(
         while True:
             bundle = await build_lg_config_bundle(db, collector)
             etag = bundle.etag
-            if etag != if_none_match:
+            if not etag_matches(if_none_match, etag):
                 logger.info(
                     "lg_agent_config_200",
                     collector_id=str(collector.id),
                     etag=etag,
                     if_none_match=if_none_match,
                 )
-                response.headers["ETag"] = etag
+                response.headers["ETag"] = format_etag(etag)
                 return {
                     "collector_id": str(collector.id),
                     "etag": etag,
@@ -320,7 +321,7 @@ async def agent_config_longpoll(
                 }
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
-                return Response(status_code=304, headers={"ETag": etag})
+                return Response(status_code=304, headers={"ETag": format_etag(etag)})
             await wake.wait(min(WAKE_TICK_SECONDS, remaining))
 
 
