@@ -126,6 +126,17 @@ class AllowlistCreate(BaseModel):
     oui_prefix: str | None = None
     note: str = ""
 
+    # Same MACADDR column, same guard as BlockBody above. Without it a
+    # malformed value reaches the cast and produces a generic field-less
+    # 422 from the driver instead of the precise per-field one every
+    # sibling schema gives — inconsistent inside a single file. `None` is
+    # a legitimate value here (the model validator below accepts either
+    # key), so it passes through untouched.
+    @field_validator("mac_address")
+    @classmethod
+    def _norm_mac(cls, v: str | None) -> str | None:
+        return None if v is None else canonicalize_mac(v)
+
     @model_validator(mode="after")
     def _one_key(self) -> AllowlistCreate:
         if not self.mac_address and not self.oui_prefix:

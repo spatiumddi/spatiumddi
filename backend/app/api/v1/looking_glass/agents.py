@@ -54,7 +54,7 @@ class AgentRegisterRequest(BaseModel):
     # — an over-length value used to reach asyncpg and surface as 500
     # instead of the 422 it is.
     hostname: str = Field(max_length=255)
-    version: str | None = Field(default=None, max_length=100)
+    version: str | None = Field(default=None, max_length=64)
     fingerprint: str = Field(max_length=128)
     agent_id: str | None = None
 
@@ -93,7 +93,11 @@ class AgentHeartbeatRequest(BaseModel):
     # per-peer state reports (mirrors the DHCP #482 hardening).
     model_config = ConfigDict(extra="forbid")
 
-    agent_version: str | None = None
+    # Bounded to the column (String(64)); the heartbeat is the OTHER route
+    # the same value arrives by, and leaving it unbounded here would let
+    # an over-length version in through the side door that register now
+    # rejects at the field.
+    agent_version: str | None = Field(default=None, max_length=64)
     peers: list[PeerStateReport] = Field(default_factory=list, max_length=5000)
 
 

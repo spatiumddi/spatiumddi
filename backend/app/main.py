@@ -870,19 +870,39 @@ def create_app() -> FastAPI:
     from sqlalchemy.exc import DBAPIError as SADBAPIError  # noqa: PLC0415
     from sqlalchemy.exc import IntegrityError as SAIntegrityError  # noqa: PLC0415
 
+    # ONLY a unique violation (SQLSTATE 23505) is the data conflicting.
+    #
+    # NOT NULL (23502), foreign key (23503) and CHECK (23514) violations are
+    # OUR code being wrong, and answering 409 would blame the client for a
+    # server bug — worse, it would hide it: a 4xx is invisible to the
+    # conformance fuzz's no-5xx assertion. That is not hypothetical here.
+    # Item 3 of this same change was a NOT NULL violation (the delete
+    # denial path writing an AuditLog without resource_display); a blanket
+    # handler would answer 409 for it, and the suite that caught it would
+    # sail straight past the regression. A handler must not blind the test
+    # that guards the bug class it sits on.
+    unique_violation = "23505"
+
     @app.exception_handler(SAIntegrityError)
     async def _integrity_conflict(request: Request, exc: Exception) -> Response:
-        """A constraint violation is the DATA conflicting, never a server
-        fault. Handlers that pre-check (SELECT then INSERT — asns, agent
-        register's group auto-create) still race between the check and the
-        flush; the loser's unique-violation surfaced as 500 where the
-        pre-check's own answer would have been 409."""
+        """A UNIQUE violation is the DATA conflicting, and 409 is its answer.
+
+        Handlers that pre-check (SELECT then INSERT — asns, agent register's
+        group auto-create) race between the check and the flush; the loser's
+        unique violation surfaced as a 500 where the pre-check's own answer
+        would have been 409. Every other integrity error re-raises to the
+        500 path, because it means the server sent something it shouldn't.
+        """
         from fastapi.responses import JSONResponse  # noqa: PLC0415
 
+        sqlstate = str(getattr(getattr(exc, "orig", None), "sqlstate", "") or "")
+        if sqlstate != unique_violation:
+            raise exc
         logger.info(
             "integrity_conflict",
             method=request.method,
             path=request.url.path,
+            sqlstate=sqlstate,
             error=str(getattr(exc, "orig", exc))[:200],
         )
         return JSONResponse(

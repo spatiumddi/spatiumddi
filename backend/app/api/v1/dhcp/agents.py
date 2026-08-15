@@ -71,7 +71,7 @@ class AgentRegisterRequest(BaseModel):
     hostname: str = Field(max_length=255)
     driver: str = Field(default="kea", max_length=50)
     roles: list[str] = ["standalone"]
-    version: str | None = Field(default=None, max_length=100)
+    version: str | None = Field(default=None, max_length=64)
     group_name: str | None = Field(default=None, max_length=255)
     fingerprint: str = Field(max_length=128)
     agent_id: str | None = None
@@ -97,7 +97,11 @@ class AgentHeartbeatRequest(BaseModel):
     # pre-Wave-C1 agents valid too.
     model_config = ConfigDict(extra="forbid")
 
-    agent_version: str | None = None
+    # Bounded to the column (String(64)); the heartbeat is the OTHER route
+    # the same value arrives by, and leaving it unbounded here would let
+    # an over-length version in through the side door that register now
+    # rejects at the field.
+    agent_version: str | None = Field(default=None, max_length=64)
     # #637 — running Kea daemon version, e.g. "3.0.3". MUST be declared here:
     # this model is extra="forbid", so an undeclared field would 422 every
     # heartbeat from a current agent.

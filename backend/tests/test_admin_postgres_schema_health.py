@@ -70,3 +70,45 @@ def test_verify_password_is_total() -> None:
     assert verify_password("x" * 100, hashed) is False
     assert verify_password("nul\x00byte", hashed) is False
     assert verify_password("correct horse", "not-a-bcrypt-hash") is False
+
+
+def test_hash_password_is_total_too() -> None:
+    """Review catch: verify_password became total but its sibling did not.
+
+    bcrypt.hashpw raises above 72 bytes exactly as checkpw does, and nothing
+    bounded the input — so create-user / reset-password / change-password
+    still 500'd on the very input class the verify fix was meant to close.
+    Both halves must agree on the boundary or a long password would hash
+    fine and then never verify.
+    """
+    from app.core.security import hash_password, verify_password
+
+    long_pw = "x" * 200
+    hashed = hash_password(long_pw)  # must not raise
+    assert verify_password(long_pw, hashed) is True
+    # and the truncation is consistent: the first 72 bytes decide identity
+    assert verify_password("x" * 72, hashed) is True
+
+
+def test_password_policy_rejects_over_length_in_bytes() -> None:
+    """The API layer must answer before the hasher does — and in BYTES,
+    because that is what bcrypt measures. A 40-character password of 2-byte
+    characters is over the line while a 71-character ASCII one is not."""
+    from app.services.password_policy import PasswordPolicy, validate
+
+    policy = PasswordPolicy(
+        min_length=8,
+        require_uppercase=False,
+        require_lowercase=False,
+        require_digit=False,
+        require_symbol=False,
+        history_count=0,
+        max_age_days=0,
+    )
+    assert validate("x" * 71, policy).ok is True
+    over_ascii = validate("x" * 73, policy)
+    assert over_ascii.ok is False
+    assert any("72 bytes" in e for e in over_ascii.errors)
+    # 40 two-byte characters = 80 bytes: rejected despite being 40 chars
+    over_utf8 = validate("é" * 40, policy)
+    assert over_utf8.ok is False
