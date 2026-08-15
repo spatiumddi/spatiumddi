@@ -16,14 +16,26 @@ class _FakeDriver:
     def __init__(self, records: list[RecordData]) -> None:
         self._records = records
 
-    async def pull_zone_records(self, server: Any, zone_name: str) -> list[RecordData]:
+    async def pull_zone_records(
+        self, server: Any, zone_name: str, *, tsig: Any = None
+    ) -> list[RecordData]:
         return list(self._records)
 
 
 async def _group_server_zone(
     db: AsyncSession, *, server_name: str, zone_name: str
 ) -> tuple[DNSServerGroup, DNSServer, DNSZone]:
-    group = DNSServerGroup(name=f"g-{uuid.uuid4().hex[:6]}")
+    # Agent-managed and keyed — the flagship BIND9 shape. Since #734 a
+    # keyless agent-managed group is reported as ``unsupported`` before any
+    # pull is attempted, because the transfer could only be REFUSED. These
+    # tests are about categorising a diff, so give them a server that can
+    # actually be transferred from; the keyless and operator-run paths are
+    # covered by ``test_dns_transfer_tsig.py``.
+    group = DNSServerGroup(
+        name=f"g-{uuid.uuid4().hex[:6]}",
+        tsig_key_name="spatium-test",
+        tsig_key_secret="c2VjcmV0c2VjcmV0c2VjcmV0c2VjcmV0MDE=",
+    )
     db.add(group)
     await db.flush()
     server = DNSServer(
@@ -33,6 +45,7 @@ async def _group_server_zone(
         host="10.0.0.53",
         port=53,
         is_enabled=True,
+        agent_id=uuid.uuid4(),
     )
     db.add(server)
     zone = DNSZone(group_id=group.id, name=zone_name, zone_type="primary", kind="forward")
@@ -81,7 +94,9 @@ async def test_zone_drift_pull_failure_is_surfaced(
     await db_session.commit()
 
     class _BoomDriver:
-        async def pull_zone_records(self, server: Any, zone_name: str) -> list[RecordData]:
+        async def pull_zone_records(
+            self, server: Any, zone_name: str, *, tsig: Any = None
+        ) -> list[RecordData]:
             raise RuntimeError("AXFR refused")
 
     monkeypatch.setattr(drift_mod, "get_driver", lambda _d: _BoomDriver())

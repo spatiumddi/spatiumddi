@@ -28,6 +28,7 @@ from app.core.agent_wake import (
     wake_subscription,
 )
 from app.core.dns_names import sanitize_hostname
+from app.core.http_etag import etag_matches, format_etag
 from app.drivers.dhcp.kea import option_defs_for_option_maps
 from app.models.dhcp import (
     DHCPConfigOp,
@@ -530,18 +531,18 @@ async def agent_config_longpoll(
                     for o in ops_res.scalars().all()
                 ]
 
-            if etag != if_none_match or pending_ops:
+            if not etag_matches(if_none_match, etag) or pending_ops:
                 logger.info(
                     "dhcp_agent_config_200",
                     server_id=str(server.id),
                     etag=etag,
                     if_none_match=if_none_match,
-                    etag_match=(etag == if_none_match),
+                    etag_match=etag_matches(if_none_match, etag),
                     pending_ops=len(pending_ops),
                 )
                 server.config_etag = etag
                 await db.commit()
-                response.headers["ETag"] = etag
+                response.headers["ETag"] = format_etag(etag)
                 return {
                     "server_id": str(server.id),
                     "etag": etag,
@@ -777,7 +778,7 @@ async def agent_config_longpoll(
                 }
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
-                return Response(status_code=304, headers={"ETag": etag})
+                return Response(status_code=304, headers={"ETag": format_etag(etag)})
             await wake.wait(min(WAKE_TICK_SECONDS, remaining))
 
 

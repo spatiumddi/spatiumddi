@@ -63,6 +63,7 @@ from app.drivers.dns.base import (
     RecordChange,
     RecordData,
     ServerOptions,
+    TsigKey,
     ZoneData,
 )
 
@@ -265,7 +266,9 @@ class TechnitiumDriver(DNSDriver):
             zone=zone_name,
         )
 
-    async def pull_zone_records(self, server: Any, zone_name: str) -> list[RecordData]:
+    async def pull_zone_records(
+        self, server: Any, zone_name: str, *, tsig: TsigKey | None = None
+    ) -> list[RecordData]:
         """AXFR the zone off the Technitium host, for the #61 drift report.
 
         Technitium's own REST API would be the more natural source — it is
@@ -275,12 +278,17 @@ class TechnitiumDriver(DNSDriver):
         server over DNS, so drift goes over AXFR, the same path BIND9 uses.
 
         **This requires the zone to permit transfer to the control plane.**
-        Zone-transfer policy is derived from the group's ``allow_transfer``
-        (see ``_zone_options_payload`` in the agent driver), which defaults
-        to ``["none"]`` → ``Deny``. On a default install the AXFR is
-        REFUSED and the drift row surfaces that rather than silently
-        reporting "no drift" — an empty diff from a refused transfer would
-        be far worse than an error, because it reads as "in sync".
+        Since #734 the agent grants a signed transfer whenever the group has
+        a TSIG key — ``zoneTransfer="Allow"`` plus ``zoneTransferTsigKeyNames``,
+        which Technitium reads as "any source, but the transfer must be
+        signed by one of these keys". So ``tsig`` must carry that key. The
+        operator's own ``allow_transfer`` ACL still applies on top when they
+        set one.
+
+        Without a key the AXFR is REFUSED, and the drift row surfaces that
+        rather than silently reporting "no drift" — an empty diff from a
+        refused transfer would be far worse than an error, because it reads
+        as "in sync".
         """
         from app.drivers.dns._axfr import axfr_zone_records  # noqa: PLC0415
 
@@ -295,20 +303,28 @@ class TechnitiumDriver(DNSDriver):
                 zone_name=zone_name,
                 log_driver="technitium",
                 server_id=str(getattr(server, "id", "")),
+                tsig=tsig,
             )
         except Exception as exc:
             # A bare "REFUSED" tells the operator nothing about what to do.
-            # Name the setting that governs it.
+            # Name the setting that governs it, and distinguish the two very
+            # different reasons a Technitium transfer gets declined.
             if "REFUSED" in str(exc).upper():
+                if tsig is None:
+                    raise RuntimeError(
+                        f"{host} refused the zone transfer for {zone_name!r}. Drift "
+                        "reads the live zone over AXFR, which the agent permits only "
+                        "for a TSIG-signed transfer — and this server's group has no "
+                        "TSIG key, so the control plane had nothing to sign with. "
+                        "Create a TSIG key on the group, or set the group's 'allow "
+                        "transfer' to permit the control plane by address."
+                    ) from exc
                 raise RuntimeError(
-                    f"{host} refused the zone transfer for {zone_name!r}. Drift "
-                    "reads the live zone over AXFR, which needs two things on "
-                    "the group: 'allow transfer' must permit the control plane "
-                    "(it defaults to none), AND the group must have no TSIG "
-                    "keys — Technitium requires a SIGNED transfer once any key "
-                    "is named on the zone, and the control plane does not yet "
-                    "sign its AXFR (the same limitation as issue #734 for "
-                    "BIND9)."
+                    f"{host} refused the zone transfer for {zone_name!r} despite "
+                    f"signing it with the group key {tsig.name!r}. Check that the "
+                    "agent has applied the current config bundle — the key must "
+                    "exist on the Technitium server and be named in the zone's "
+                    "transfer settings."
                 ) from exc
             raise
 

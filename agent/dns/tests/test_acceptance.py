@@ -93,10 +93,23 @@ def test_trivy_clean() -> None:
 def test_helm_chart_primary_secondary_axfr() -> None:
     """#5: Helm chart deploys ns1+ns2 in kind; AXFR observed in logs.
 
-    CI coverage lives in ``.github/workflows/agent-e2e.yml`` which
-    installs the umbrella chart against a kind cluster, port-forwards
-    the API, and runs a ``dig`` smoke against the DNS agent pod.
-    The local pytest stub stays as a skip-by-default reminder — real
-    e2e needs ``kind`` + ``kubectl`` on the runner.
+    Still a skip: a two-server AXFR between chart-deployed pods needs
+    ``kind`` + ``kubectl``, which ``agent-e2e.yml`` provides but this
+    suite does not.
+
+    **Read the docstring this replaced before trusting any skip here.** It
+    claimed "CI coverage lives in .github/workflows/agent-e2e.yml" — and
+    that workflow never performed a transfer of any kind, only a
+    ``dig version.bind CH TXT`` liveness smoke. ``grep -rl axfr
+    .github/workflows`` matched nothing at all. So the stub asserted a
+    coverage that did not exist, and #61's drift report shipped broken
+    against every agent-managed BIND9 and stayed broken across two
+    releases (#734).
+
+    What genuinely covers the transfer path now is
+    ``agent/dns/tests/live_axfr_check.py``, run by the "TSIG zone-transfer
+    check" step in ``build-dns-images.yml`` against the freshly built
+    bind9 image: real renderer, real named, real socket, and it exits
+    non-zero rather than skipping if its prerequisites are missing.
     """
-    pytest.skip("e2e — covered by .github/workflows/agent-e2e.yml")
+    pytest.skip("e2e — needs kind + kubectl; see live_axfr_check.py for transfer coverage")

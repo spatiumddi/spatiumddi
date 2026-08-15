@@ -30,6 +30,7 @@ from app.drivers.dns.base import (
     RecordChange,
     RecordData,
     ServerOptions,
+    TsigKey,
     ZoneData,
 )
 
@@ -87,6 +88,39 @@ def _render_record(zone: ZoneData, r: RecordData) -> str:
         rdata = value
 
     return f"{name} {ttl}IN {rtype} {rdata}"
+
+
+def _allow_transfer_items(allow_transfer: Any, tsig_keys: Any) -> list[str]:
+    """Address-match-list items for ``allow-transfer`` (issue #734).
+
+    Every group TSIG key is granted, then the operator's own ACL entries.
+    A literal ``none`` is dropped when anything else is present (as an
+    address match it can never match, so it is noise), and an empty result
+    renders the explicit ``none;`` that is BIND's default anyway.
+
+    The key grants are unconditional, including when the ACL says ``none``:
+    ``none`` is the default value of the column, so honouring it literally
+    would lock the control plane out of every zone on a stock install and
+    leave the drift report exactly as broken as before.
+
+    Mirrors ``_render_allow_transfer`` in the agent's BIND9 renderer. The
+    two live in separate packages, so — like ``_render_update_clause``
+    above — the logic is duplicated on purpose; keep them in step.
+    """
+    items: list[str] = []
+    seen: set[str] = set()
+    for k in tsig_keys or ():
+        name = (getattr(k, "name", "") or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        items.append(f'key "{name}";')
+    for entry in allow_transfer or ():
+        token = str(entry).strip()
+        if not token or token.lower() == "none":
+            continue
+        items.append(f"{token};")
+    return items or ["none;"]
 
 
 _UPDATE_POLICY_NAMED_SCOPES = frozenset({"subdomain", "name", "wildcard", "self"})
@@ -184,6 +218,9 @@ class BIND9Driver(DNSDriver):
             views=views,
             zones=zones,
             tsig_keys=tsig_keys,
+            allow_transfer_items=_allow_transfer_items(
+                getattr(options, "allow_transfer", None), tsig_keys
+            ),
             blocklists=blocklists,
             dnssec_policies=dnssec_policies,
             zone_stanzas=zone_stanzas,
@@ -335,13 +372,22 @@ class BIND9Driver(DNSDriver):
     async def reload_zone(self, server: Any, zone_name: str) -> None:
         logger.info("bind9.reload_zone", server=str(getattr(server, "id", "")), zone=zone_name)
 
-    async def pull_zone_records(self, server: Any, zone_name: str) -> list[RecordData]:
+    async def pull_zone_records(
+        self, server: Any, zone_name: str, *, tsig: TsigKey | None = None
+    ) -> list[RecordData]:
         """AXFR the zone from the BIND9 host.
 
-        The server must have ``allow-transfer`` permitting the SpatiumDDI
-        control plane — configured via the zone's ACL or a global
-        ``allow-transfer`` in ``named.conf`` options. If transfers are
-        denied the AXFR raises and the caller surfaces the error.
+        On an **agent-managed** server the agent renders
+        ``allow-transfer { key "<group-key>"; };`` on every primary zone
+        (#734) — key-gated, not address-gated, because the control plane's
+        source address isn't knowable on the appliance. So ``tsig`` must
+        carry the group key or the transfer is REFUSED; the caller resolves
+        it with ``resolve_group_transfer_key``.
+
+        On an operator-run BIND9 that SpatiumDDI does not configure, the
+        server must instead have an ``allow-transfer`` permitting the
+        control plane by address. Either way, a denied transfer raises and
+        the caller surfaces the error.
         """
         from app.drivers.dns._axfr import axfr_zone_records  # noqa: PLC0415
 
@@ -355,6 +401,7 @@ class BIND9Driver(DNSDriver):
             zone_name=zone_name,
             log_driver="bind9",
             server_id=str(getattr(server, "id", "")),
+            tsig=tsig,
         )
 
     # ── Validation / capabilities ─────────────────────────────────────────

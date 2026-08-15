@@ -93,6 +93,31 @@ jobs:
           cache-from: type=gha,scope=dns-${{ matrix.flavor }}
           cache-to: type=gha,mode=max,scope=dns-${{ matrix.flavor }}
 
+      # Issue #734 — the only automated proof that a zone transfer is
+      # permitted for a TSIG-signed request and refused for everything
+      # else. It runs against the image just built, so it exercises the
+      # real agent renderer and the real pinned BIND together on a socket;
+      # a unit test can only show we emit the string we intended, not that
+      # named reads it the way we believe.
+      #
+      # It lives here rather than in agent-e2e.yml because this job already
+      # loads the image locally for Trivy, and because the kind workflow
+      # only ever ran a `dig version.bind CH TXT` liveness smoke. Before
+      # this step, `grep -rl axfr .github/workflows` matched NOTHING, while
+      # test_acceptance.py's AXFR test was a permanent skip whose docstring
+      # claimed coverage lived in agent-e2e.yml. That false claim is a large
+      # part of why #61's drift report shipped broken and stayed broken.
+      #
+      # The script never skips: a missing prerequisite exits non-zero,
+      # because "the check quietly didn't run" is the failure being fixed.
+      - name: TSIG zone-transfer check (bind9)
+        if: github.event_name == 'pull_request' && matrix.flavor == 'bind9'
+        run: |
+          docker run --rm \
+            -v "$PWD/agent/dns/tests:/checks:ro" \
+            --entrypoint python3 \
+            ghcr.io/spatiumddi/dns-bind9:pr-scan /checks/live_axfr_check.py
+
       - name: Trivy scan
         if: github.event_name == 'pull_request'
         uses: aquasecurity/trivy-action@master
