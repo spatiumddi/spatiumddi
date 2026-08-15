@@ -91,9 +91,7 @@ async def test_viewer_is_refused(client: AsyncClient, db_session: AsyncSession) 
     assert resp.status_code == 403, resp.text
 
 
-async def test_superadmin_is_allowed(
-    client: AsyncClient, db_session: AsyncSession
-) -> None:
+async def test_superadmin_is_allowed(client: AsyncClient, db_session: AsyncSession) -> None:
     """The gate must not have broken the endpoint for the role that needs it.
 
     No snapshot has been pushed, so this is the documented empty answer
