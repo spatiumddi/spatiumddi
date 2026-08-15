@@ -17,12 +17,33 @@ ALGORITHM = "HS256"
 # ── Passwords ──────────────────────────────────────────────────────────────────
 
 
+# bcrypt reads at most 72 bytes of input and RAISES on anything longer, so
+# both halves of the pair have to agree on the boundary or they disagree
+# about what a password even is. `verify_password` truncates below; hashing
+# must truncate identically, or a >72-byte password would hash fine and then
+# never verify. The API layer rejects over-length input before it reaches
+# here (password_policy.validate) — this is the defensive floor under it, so
+# no caller can 500 on a password that is merely too long.
+BCRYPT_MAX_BYTES = 72
+
+
 def hash_password(password: str) -> str:
-    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+    return bcrypt.hashpw(password.encode()[:BCRYPT_MAX_BYTES], bcrypt.gensalt()).decode()
 
 
 def verify_password(plain: str, hashed: str) -> bool:
-    return bcrypt.checkpw(plain.encode(), hashed.encode())
+    # Total by contract: a candidate password can only ever be WRONG, never an
+    # exception. bcrypt.checkpw raises ValueError on >72-byte input and on NUL
+    # bytes (and on a malformed stored hash) — request schemas allow up to 256
+    # chars, so any caller that fed this a user-supplied string 500'd on those
+    # inputs instead of answering 401/403 (live: DELETE
+    # /appliance/appliances/{id} answered 500 on every conformance run).
+    # bcrypt itself only reads the first 72 bytes of a valid input, so the
+    # truncation cannot accept a password the untruncated compare would reject.
+    try:
+        return bcrypt.checkpw(plain.encode()[:BCRYPT_MAX_BYTES], hashed.encode())
+    except ValueError:
+        return False
 
 
 # ── JWT ────────────────────────────────────────────────────────────────────────

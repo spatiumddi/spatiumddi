@@ -4,7 +4,6 @@ import re
 import uuid
 from datetime import UTC, datetime
 
-import bcrypt
 import structlog
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, field_validator, model_validator
@@ -12,6 +11,7 @@ from sqlalchemy import select, update
 
 from app.api.deps import DB, SuperAdmin
 from app.core.demo_mode import forbid_in_demo_mode
+from app.core.security import hash_password
 from app.models.audit import AuditLog
 from app.models.auth import User, UserSession
 from app.models.settings import PlatformSettings
@@ -183,7 +183,7 @@ async def _enforce_policy(db: DB, password: str) -> tuple[PasswordPolicy, str]:
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={"reason": "password_policy", "errors": result.errors},
         )
-    return policy, bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+    return policy, hash_password(password)
 
 
 @router.post("", response_model=UserResponse, status_code=status.HTTP_201_CREATED)

@@ -14,13 +14,14 @@ from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, field_validator, model_validator
 from sqlalchemy import String, and_, cast, func, or_, select
 from sqlalchemy.exc import IntegrityError
 
 from app.api.deps import DB
 from app.api.pagination import DEFAULT_PAGE_SIZE, MAX_PAGE, MAX_PAGE_SIZE, Page
 from app.api.v1.dhcp._audit import write_audit
+from app.api.v1.dhcp._mac import canonicalize_mac
 from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_permission
 from app.models.auth import User
@@ -80,6 +81,7 @@ class BlockBody(BaseModel):
     group_id: uuid.UUID | None = None  # None → block in every DHCP server group
     reason: str = "other"
     description: str = ""
+
     # #601 — also push an upstream MAC quarantine (UniFi block-sta) via the
     # active block-sync surface. Only takes effect when the
     # ``security.block_sync`` module is on, the caller holds
@@ -88,6 +90,16 @@ class BlockBody(BaseModel):
     # only starves the device of a lease; a self-assigned static IP walks
     # right past it, which is exactly the gap this closes.
     block_upstream: bool = False
+
+    # Same guard (and same shared helper) as the DHCP mac-block/static
+    # models: the value lands in a MACADDR column, and an unparseable MAC
+    # used to reach Postgres and come back as a bind-time 500 (live:
+    # mac_address="" → InvalidTextRepresentationError). Rejecting here
+    # makes it the 422 it is.
+    @field_validator("mac_address")
+    @classmethod
+    def _norm_mac(cls, v: str) -> str:
+        return canonicalize_mac(v)
 
 
 class BlockResult(BaseModel):
@@ -113,6 +125,17 @@ class AllowlistCreate(BaseModel):
     mac_address: str | None = None
     oui_prefix: str | None = None
     note: str = ""
+
+    # Same MACADDR column, same guard as BlockBody above. Without it a
+    # malformed value reaches the cast and produces a generic field-less
+    # 422 from the driver instead of the precise per-field one every
+    # sibling schema gives — inconsistent inside a single file. `None` is
+    # a legitimate value here (the model validator below accepts either
+    # key), so it passes through untouched.
+    @field_validator("mac_address")
+    @classmethod
+    def _norm_mac(cls, v: str | None) -> str | None:
+        return None if v is None else canonicalize_mac(v)
 
     @model_validator(mode="after")
     def _one_key(self) -> AllowlistCreate:

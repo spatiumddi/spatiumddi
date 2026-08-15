@@ -66,8 +66,17 @@ class NetboxConnIn(BaseModel):
     v2 ``Bearer nbt_…`` scheme (the client detects which by prefix).
     """
 
-    base_url: str = Field(description="NetBox base URL, e.g. https://netbox.example.com")
-    token: str = Field(description="NetBox API token (read-once; never persisted).")
+    # ASCII-only for the same reason as the DNS importers: the URL and the
+    # Authorization header are ASCII on the wire, and a non-ASCII value
+    # crashed the outbound client as a 500 before any pull started.
+    base_url: str = Field(
+        description="NetBox base URL, e.g. https://netbox.example.com",
+        pattern=r"^[\x20-\x7e]*$",
+    )
+    token: str = Field(
+        description="NetBox API token (read-once; never persisted).",
+        pattern=r"^[\x20-\x7e]*$",
+    )
     verify_tls: bool = True
 
 
@@ -367,7 +376,11 @@ def _commit_result_to_pydantic(r: CommitResult) -> CommitOut:
 # ── Endpoints ────────────────────────────────────────────────────────
 
 
-@router.post("/test-connection", response_model=NetboxTestOut)
+@router.post(
+    "/test-connection",
+    response_model=NetboxTestOut,
+    responses={502: {"description": "The remote import source is unreachable or refused the pull"}},
+)
 async def netbox_test_connection(
     _: SuperAdmin,
     body: NetboxConnIn = Body(...),
@@ -431,7 +444,11 @@ async def _status_counts(nb: NetBoxClient) -> dict[str, int] | None:
     return counts or None
 
 
-@router.post("/preview", response_model=PreviewOut)
+@router.post(
+    "/preview",
+    response_model=PreviewOut,
+    responses={502: {"description": "The remote import source is unreachable or refused the pull"}},
+)
 async def netbox_preview(
     current_user: SuperAdmin,
     db: DB,
