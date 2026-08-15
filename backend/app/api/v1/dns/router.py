@@ -3920,7 +3920,7 @@ class RenderedConfigResponse(BaseModel):
     response_model=RenderedConfigResponse,
 )
 async def get_server_rendered_config(
-    server_id: uuid.UUID, db: DB, _: CurrentUser
+    server_id: uuid.UUID, db: DB, _: SuperAdmin
 ) -> RenderedConfigResponse:
     """Latest agent-pushed snapshot of the on-disk rendered config.
 
@@ -3928,6 +3928,15 @@ async def get_server_rendered_config(
     an empty file list with ``rendered_at=None`` when the agent hasn't
     pushed yet (fresh server, never reloaded). The UI shows a "no
     snapshot yet" placeholder in that case.
+
+    **Superadmin, not CurrentUser (#869).** This returns a server's whole
+    rendered configuration. The agent redacts known credential values before
+    pushing, but a full config dump is a reconnaissance surface in its own
+    right (ACLs, view match rules, forwarders, every zone name), and the
+    redaction is a denylist — it protects the secrets we know how to spot.
+    The router-level gate is satisfied by read on any dns_* resource, so
+    without this a Viewer could read it. No UI consumes this endpoint today,
+    so tightening it breaks no shipped workflow.
     """
     server = await db.get(DNSServer, server_id)
     if server is None:
