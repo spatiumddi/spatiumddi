@@ -70,6 +70,7 @@ import structlog
 
 from ._process import find_running_daemon, is_zombie
 from .base import RRSET_OP_KINDS, DriverBase
+from ..secure_io import write_private
 
 log = structlog.get_logger(__name__)
 
@@ -1846,15 +1847,12 @@ class TechnitiumDriver(DriverBase):
 
     @staticmethod
     def _write_secret(path: Path, value: str) -> None:
-        tmp = path.with_suffix(path.suffix + ".new")
-        fd = os.open(
-            str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600
-        )
-        try:
-            os.write(fd, (value + "\n").encode())
-        finally:
-            os.close(fd)
-        tmp.replace(path)
+        """0600 + atomic, via the shared primitive (#869).
+
+        The trailing newline is part of this store's format —
+        ``_read_or_create_secret`` strips it on the way back out.
+        """
+        write_private(path, value + "\n")
 
     def _read_or_create_secret(self, path: Path) -> str:
         if path.exists():

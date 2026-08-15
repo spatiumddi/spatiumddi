@@ -22,6 +22,7 @@ them, and a transient 5xx just gets retried on the next tick.
 from __future__ import annotations
 
 import random
+import re
 import shutil
 import subprocess
 import threading
@@ -39,6 +40,48 @@ log = structlog.get_logger(__name__)
 # aren't meaningful for the operator (binary state, locks, etc).
 _SKIP_FILE_NAMES: frozenset[str] = frozenset()
 _RENDERED_DIR_NAME = "rendered"
+
+_REDACTED = "***REDACTED***"
+
+# Credentials that appear INSIDE rendered config, which this module uploads
+# to the control plane (#869). Making the files 0600 on disk protects them
+# from other uids on the appliance and does nothing about this path — the
+# snapshot is stored server-side and served back over the API, so an
+# unredacted push puts the pdns REST api-key and the TSIG secrets that
+# authorise dynamic updates into the database and onto any screen allowed to
+# read them. The PowerDNS driver's own comment asserts these "never leave the
+# appliance"; that is only true with this redaction in place.
+#
+# Regex rather than a JSON/config parse on purpose: this runs over whatever
+# a driver happens to have rendered, and a parse failure must not be the
+# thing standing between a secret and the wire. A pattern that over-matches
+# costs an operator some debugging context; one that under-matches leaks a
+# credential.
+_REDACTIONS: tuple[re.Pattern[str], ...] = (
+    # pdns.conf: ``api-key=<value>`` (also covers any ``*-key=`` setting).
+    re.compile(r"(?im)^([ \t]*[\w.-]*api-key[ \t]*=[ \t]*).+$"),
+    # zones.json: ``"secret": "<value>"`` anywhere in the tree.
+    re.compile(r'(?i)("secret"[ \t]*:[ \t]*")[^"]*(")'),
+    # BIND-style ``secret "<value>";`` — nothing renders this into the
+    # pushed tree today (named.conf includes the key file rather than
+    # inlining it), which is exactly why it is cheap to guard now.
+    re.compile(r'(?i)(\bsecret[ \t]+")[^"]*(")'),
+)
+
+
+def redact_secrets(content: str) -> str:
+    """Mask credential values in a rendered-config file before upload.
+
+    Values only — the surrounding key/setting name is preserved so the
+    operator can still see THAT an api-key or TSIG secret is configured,
+    which is usually the question they opened the snapshot to answer.
+    """
+    for pattern in _REDACTIONS:
+        if pattern.groups == 2:
+            content = pattern.sub(rf"\1{_REDACTED}\2", content)
+        else:
+            content = pattern.sub(rf"\1{_REDACTED}", content)
+    return content
 
 
 def _cp_client(cfg: AgentConfig) -> httpx.Client:
@@ -68,7 +111,10 @@ def _walk_rendered(rendered_dir: Path) -> Iterable[tuple[str, str]]:
         except UnicodeDecodeError:
             continue
         rel = path.relative_to(rendered_dir).as_posix()
-        yield rel, content
+        # Redact on the way OUT of the appliance, not at the call site — this
+        # generator is the single chokepoint every pushed file passes through,
+        # so a future caller can't accidentally bypass it (#869).
+        yield rel, redact_secrets(content)
 
 
 def push_rendered_config(cfg: AgentConfig, token: str) -> None:

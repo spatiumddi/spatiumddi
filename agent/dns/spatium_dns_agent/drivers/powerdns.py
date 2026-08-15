@@ -47,6 +47,7 @@ from ._process import (
     wait_for_daemon,
 )
 from .base import RRSET_OP_KINDS, DriverBase
+from ..secure_io import harden_mode, write_private
 
 log = structlog.get_logger(__name__)
 
@@ -195,6 +196,27 @@ def _dnsdist_cert_paths() -> tuple[str, str]:
     return f"{base}/{TLS_CERT_FILENAME}", f"{base}/{TLS_KEY_FILENAME}"
 
 
+# Files inside the rendered tree that embed a credential and therefore need
+# 0600 + redaction before the snapshot pusher ships them (#869). Keep this in
+# step with anything new that render() writes under ``rendered.new``.
+_SECRET_RENDERED_FILES: tuple[str, ...] = ("pdns.conf", "zones.json")
+
+
+def _harden_legacy_rendered_modes(state_dir: Path) -> None:
+    """Fix 0644 secret files left by a pre-#869 agent build.
+
+    Upgrading the agent does not re-mode what is already on disk: the live
+    ``rendered/`` tree survives until the next structural render replaces it,
+    and then lingers as ``rendered.prev/`` for one more cycle. Without this,
+    a still-valid API key and TSIG secrets stay world-readable for two
+    renders' worth of uptime after the fix ships — on a stable install, that
+    could be indefinitely.
+    """
+    for tree in ("rendered", "rendered.prev"):
+        for name in _SECRET_RENDERED_FILES:
+            harden_mode(state_dir / tree / name)
+
+
 def render_dnsdist_conf(opts: dict[str, Any], has_cert: bool = False) -> str:
     """Render the dnsdist RULES + encrypted listeners from bundle options.
 
@@ -279,6 +301,10 @@ class PowerDNSDriver(DriverBase):
         editing options through the UI (loglevel, listen address) see
         the change without restarting the container.
         """
+        # Re-mode anything a pre-#869 build left world-readable before we
+        # render over it — the old trees outlive the upgrade (see the helper).
+        _harden_legacy_rendered_modes(self.state_dir)
+
         new_dir = self.state_dir / "rendered.new"
         if new_dir.exists():
             shutil.rmtree(new_dir)
@@ -312,13 +338,25 @@ class PowerDNSDriver(DriverBase):
         if alias_resolver is None:
             alias_resolver = "1.1.1.1,8.8.8.8"
         conf_path = new_dir / "pdns.conf"
-        conf_path.write_text(
+        # 0600, not write_text: this file embeds ``api-key=`` in cleartext,
+        # and that key grants zone CRUD + DNSSEC over the pdns REST API
+        # (#869). ``pdns_server`` and the dnsdist front both run as uid 101,
+        # the same owner, so the owner bit is all either of them needs —
+        # what 0600 removes is group/other, i.e. any OTHER uid that can see
+        # this path (a differently-run sidecar, a host bind-mount, a future
+        # image that stops running everything as 101).
+        # ``atomic=False``: this lands in a freshly-created ``rendered.new``
+        # that no reader can see; the directory rename in swap_and_reload is
+        # the atomic step.
+        write_private(
+            conf_path,
             self._render_conf(
                 api_key=api_key,
                 log_level=log_level,
                 query_log_enabled=query_log_enabled,
                 alias_resolver=str(alias_resolver),
-            )
+            ),
+            atomic=False,
         )
 
         # dnsdist rate-limit RULES (issue #146 Phase 2). Written to a STABLE
@@ -470,7 +508,16 @@ class PowerDNSDriver(DriverBase):
                 ),
             )
 
-        (new_dir / "zones.json").write_text(json.dumps(zones_payload, indent=2))
+        # 0600 for the same reason as pdns.conf (#869), and this one is not
+        # obvious: ``update_tsig_keys`` carries whole key dicts including
+        # ``secret`` (see ``_ensure_tsigkey``), so zones.json holds the TSIG
+        # material that authorises dynamic updates. CodeQL flagged only
+        # pdns.conf; this file was the same defect one write call away.
+        write_private(
+            new_dir / "zones.json",
+            json.dumps(zones_payload, indent=2),
+            atomic=False,
+        )
 
     def _write_listener_cert(self, tls_cert: dict[str, Any] | None) -> None:
         """Write (or remove) the DoT/DoH listener cert for the dnsdist front.
@@ -501,16 +548,7 @@ class PowerDNSDriver(DriverBase):
             (TLS_CERT_FILENAME, str(tls_cert.get("cert_pem") or "")),
             (TLS_KEY_FILENAME, str(tls_cert.get("key_pem") or "")),
         ):
-            dest = tls_dir / filename
-            tmp = dest.with_suffix(dest.suffix + ".new")
-            fd = os.open(
-                str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600
-            )
-            try:
-                os.write(fd, material.encode())
-            finally:
-                os.close(fd)
-            tmp.replace(dest)
+            write_private(tls_dir / filename, material)
 
     def validate(self) -> None:
         """``pdns_server --config-check`` if the binary supports it.
@@ -1157,20 +1195,9 @@ class PowerDNSDriver(DriverBase):
                     "be running with the original value."
                 ) from exc
         key = secrets.token_urlsafe(32)
-        tmp = path.with_suffix(path.suffix + ".new")
-        # Open with O_NOFOLLOW + mode 0600 so the file lands with
-        # the right permissions on creation (no race window between
-        # write + chmod where the file is world-readable).
-        fd = os.open(
-            str(tmp),
-            os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
-            0o600,
-        )
-        try:
-            os.write(fd, (key + "\n").encode())
-        finally:
-            os.close(fd)
-        tmp.replace(path)
+        # Shared primitive (#869): 0600 at creation via O_NOFOLLOW, complete
+        # write, atomic replace. Was open-coded here; the copies had drifted.
+        write_private(path, key + "\n")
         return key
 
     def _render_conf(
