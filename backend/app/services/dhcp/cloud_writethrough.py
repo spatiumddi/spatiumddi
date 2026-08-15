@@ -44,10 +44,14 @@ class CloudAdoptionRequired(HTTPException):
     The operator must opt in (``adopt_existing``) to take it over. Distinct
     from :class:`CloudPushError` so the UI can offer an adopt-and-retry action
     instead of treating it as a transient provider failure.
+
+    Carries ``X-Adoption-Required: true`` so clients can tell this 409 apart
+    from other conflicts on the same endpoint (scope create also 409s on a
+    duplicate group+subnet, where an adopt-retry would be wrong) — #865.
     """
 
     def __init__(self, detail: str) -> None:
-        super().__init__(status_code=409, detail=detail)
+        super().__init__(status_code=409, detail=detail, headers={"X-Adoption-Required": "true"})
 
 
 async def cloud_servers_for_group(db: AsyncSession, group_id: Any) -> list[DHCPServer]:

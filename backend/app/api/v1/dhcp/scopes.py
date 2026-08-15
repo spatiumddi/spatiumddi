@@ -632,8 +632,19 @@ async def _assert_no_overlapping_group_cidr(
     status_code=status.HTTP_201_CREATED,
 )
 async def create_scope(
-    subnet_id: uuid.UUID, body: ScopeCreate, db: DB, user: SuperAdmin
+    subnet_id: uuid.UUID,
+    body: ScopeCreate,
+    db: DB,
+    user: SuperAdmin,
+    adopt_existing: bool = False,
 ) -> ScopeResponse:
+    """Create a scope.
+
+    ``adopt_existing`` (cloud/FortiGate members only, #865) opts in to
+    overwriting a pre-existing provider DHCP object SpatiumDDI never created;
+    without it the pre-commit push 409s (``X-Adoption-Required``) and the
+    create rolls back, so the UI can offer an adopt-and-retry.
+    """
     subnet = await db.get(Subnet, subnet_id)
     if subnet is None:
         raise HTTPException(status_code=404, detail="Subnet not found")
@@ -731,7 +742,7 @@ async def create_scope(
         ) from exc
     # Push to every Windows DHCP member of the group BEFORE commit so a
     # WinRM failure rolls the DB row back.
-    await push_scope_upsert(db, scope)
+    await push_scope_upsert(db, scope, adopt_existing=adopt_existing)
     collect_wake(dhcp_group_channel(group_id))
     write_audit(
         db,
@@ -757,8 +768,15 @@ async def get_scope(scope_id: uuid.UUID, db: DB, _: CurrentUser) -> ScopeRespons
 
 @router.put("/scopes/{scope_id}", response_model=ScopeResponse)
 async def update_scope(
-    scope_id: uuid.UUID, body: ScopeUpdate, db: DB, user: SuperAdmin
+    scope_id: uuid.UUID,
+    body: ScopeUpdate,
+    db: DB,
+    user: SuperAdmin,
+    adopt_existing: bool = False,
 ) -> ScopeResponse:
+    # ``adopt_existing``: same opt-in as create (#865) — an edit of a scope
+    # whose interface carries a foreign provider object hits the same
+    # adoption guard on the pre-commit push.
     scope = await db.get(DHCPScope, scope_id)
     if scope is None:
         raise HTTPException(status_code=404, detail="Scope not found")
@@ -827,7 +845,7 @@ async def update_scope(
     for k, v in changes.items():
         setattr(scope, k, v)
     await db.flush()
-    await push_scope_upsert(db, scope)
+    await push_scope_upsert(db, scope, adopt_existing=adopt_existing)
     collect_wake(dhcp_group_channel(scope.group_id))
     write_audit(
         db,
