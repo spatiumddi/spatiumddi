@@ -29,6 +29,10 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import structlog
+
+log = structlog.get_logger(__name__)
+
 __all__ = ["write_private", "harden_mode"]
 
 _SECRET_MODE = 0o600
@@ -87,9 +91,23 @@ def harden_mode(path: Path) -> None:
     0644 across two renders' worth of uptime unless something reaches back
     and fixes it.
 
-    Missing file is not an error (the common case on a clean install).
+    Best-effort by construction: this runs at the top of a render, and
+    failing to re-mode a file from a previous build must never be the thing
+    that stops the agent applying config. Both swallowed cases are logged
+    rather than silently dropped.
     """
     try:
         path.chmod(_SECRET_MODE)
     except FileNotFoundError:
-        pass
+        # Nothing to harden. The common case — a clean install has no
+        # previous render, and callers pass every candidate path
+        # unconditionally rather than pre-checking each one.
+        log.debug("harden_mode_absent", path=str(path))
+    except OSError as exc:
+        # Typically PermissionError: the file exists but belongs to another
+        # uid (the container entrypoint writes some state as root before
+        # chown'ing it). We cannot fix that from here, and raising would
+        # turn "couldn't tighten an old file" into "the agent stopped
+        # rendering config" — strictly worse than the exposure it guards.
+        # Surfaced at WARNING so the operator can fix ownership.
+        log.warning("harden_mode_failed", path=str(path), error=str(exc))

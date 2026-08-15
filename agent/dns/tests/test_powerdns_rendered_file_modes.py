@@ -229,3 +229,33 @@ def test_write_private_is_atomic_and_private(tmp_path: Path) -> None:
     assert _mode(dest) == "0o600"
     # The tmp sibling must not survive a successful write.
     assert not (tmp_path / "secret.new").exists()
+
+
+def test_harden_survives_an_unchmodable_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file we cannot re-mode must not stop the render.
+
+    ``harden_mode`` runs at the top of ``render()``. The entrypoint writes
+    some state as root before chown'ing it, so an existing file can belong
+    to another uid; raising there would turn "couldn't tighten an old file"
+    into "the agent stopped applying config" — strictly worse than the
+    exposure the hardening guards against.
+    """
+    stale = tmp_path / "rendered"
+    stale.mkdir(parents=True)
+    (stale / "pdns.conf").write_text("api-key=x\n")
+
+    real_chmod = Path.chmod
+
+    def _refuse(self: Path, mode: int) -> None:
+        if self.name == "pdns.conf":
+            raise PermissionError(1, "Operation not permitted", str(self))
+        real_chmod(self, mode)
+
+    monkeypatch.setattr(Path, "chmod", _refuse)
+    # Must not raise, and must still produce a complete render.
+    PowerDNSDriver(state_dir=tmp_path).render(_bundle())
+    monkeypatch.undo()
+
+    assert _mode(tmp_path / "rendered.new" / "pdns.conf") == "0o600"
