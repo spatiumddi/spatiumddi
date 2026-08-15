@@ -201,13 +201,14 @@ class SchemaHealthResponse(BaseModel):
 @router.get("/postgres/schema-health", response_model=SchemaHealthResponse)
 async def postgres_schema_health(db: DB, _: SuperAdmin) -> SchemaHealthResponse:
     """Compare the DB's ``alembic_version`` against the alembic head this
-    api image bundles. Reuses the readiness probe's cached head reader so
-    there's a single source of truth for "is the schema where this image
-    expects it?". Cheap — the head is read+cached once, then it's one
+    api image bundles. Reuses the shared cached head reader (moved from
+    ``app.api.health`` to ``app.core.schema_check`` in #565) so there's a
+    single source of truth for "is the schema where this image expects
+    it?". Cheap — the head is read+cached once, then it's one
     ``SELECT version_num``."""
-    from app.api.health import _expected_alembic_head  # noqa: PLC0415
+    from app.core.schema_check import expected_alembic_head  # noqa: PLC0415
 
-    expected, head_err = _expected_alembic_head()
+    expected, head_err = expected_alembic_head()
     if head_err is not None:
         return SchemaHealthResponse(
             status="error", expected_head=None, db_revision=None, detail=head_err

@@ -867,6 +867,85 @@ def create_app() -> FastAPI:
             headers={"Retry-After": "1"},
         )
 
+    from sqlalchemy.exc import DBAPIError as SADBAPIError  # noqa: PLC0415
+    from sqlalchemy.exc import IntegrityError as SAIntegrityError  # noqa: PLC0415
+
+    # ONLY a unique violation (SQLSTATE 23505) is the data conflicting.
+    #
+    # NOT NULL (23502), foreign key (23503) and CHECK (23514) violations are
+    # OUR code being wrong, and answering 409 would blame the client for a
+    # server bug — worse, it would hide it: a 4xx is invisible to the
+    # conformance fuzz's no-5xx assertion. That is not hypothetical here.
+    # Item 3 of this same change was a NOT NULL violation (the delete
+    # denial path writing an AuditLog without resource_display); a blanket
+    # handler would answer 409 for it, and the suite that caught it would
+    # sail straight past the regression. A handler must not blind the test
+    # that guards the bug class it sits on.
+    unique_violation = "23505"
+
+    @app.exception_handler(SAIntegrityError)
+    async def _integrity_conflict(request: Request, exc: Exception) -> Response:
+        """A UNIQUE violation is the DATA conflicting, and 409 is its answer.
+
+        Handlers that pre-check (SELECT then INSERT — asns, agent register's
+        group auto-create) race between the check and the flush; the loser's
+        unique violation surfaced as a 500 where the pre-check's own answer
+        would have been 409. Every other integrity error re-raises to the
+        500 path, because it means the server sent something it shouldn't.
+        """
+        from fastapi.responses import JSONResponse  # noqa: PLC0415
+
+        sqlstate = str(getattr(getattr(exc, "orig", None), "sqlstate", "") or "")
+        if sqlstate != unique_violation:
+            raise exc
+        logger.info(
+            "integrity_conflict",
+            method=request.method,
+            path=request.url.path,
+            sqlstate=sqlstate,
+            error=str(getattr(exc, "orig", exc))[:200],
+        )
+        return JSONResponse(
+            status_code=409,
+            content={"detail": "The request conflicts with existing data."},
+        )
+
+    @app.exception_handler(SADBAPIError)
+    async def _unstorable_value(request: Request, exc: Exception) -> Response:
+        """A value Postgres refuses as DATA (over-length string, NUL byte,
+        malformed macaddr/uuid/inet literal, out-of-range number) is the
+        CLIENT's input, same class as a pydantic 422 — it reached the driver
+        only because a request model didn't bound it.
+
+        The asyncpg dialect wraps most driver errors as the GENERIC
+        DBAPIError, not sqlalchemy.exc.DataError (observed live:
+        InvalidTextRepresentationError and UntranslatableCharacterError both
+        arrive as bare DBAPIError), so the discriminator is the error itself:
+        SQLSTATE class 22 is "data exception" by definition, and asyncpg's
+        client-side bind failures subclass asyncpg.exceptions.DataError.
+        Anything else (ProgrammingError — OUR query is wrong; transient
+        connection errors — their own handler above, which wins by being the
+        more specific registered class) re-raises unchanged."""
+        from fastapi.responses import JSONResponse  # noqa: PLC0415
+
+        orig = getattr(exc, "orig", None)
+        sqlstate = str(getattr(orig, "sqlstate", "") or "")
+        is_data = sqlstate.startswith("22") or any(
+            c.__name__ == "DataError" for c in type(orig).__mro__
+        )
+        if not is_data:
+            raise exc
+        logger.info(
+            "unstorable_value",
+            method=request.method,
+            path=request.url.path,
+            error=str(orig or exc)[:200],
+        )
+        return JSONResponse(
+            status_code=422,
+            content={"detail": "A supplied value cannot be stored as sent."},
+        )
+
     # Unhandled-exception capture (issue #123). Registered last so it
     # only catches what slipped past every other handler — auth /
     # permission / validation errors raise typed HTTPException

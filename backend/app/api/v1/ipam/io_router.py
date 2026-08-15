@@ -221,7 +221,14 @@ async def import_addresses_commit(
     return result.as_dict()
 
 
-@router.get("/export.pdf")
+@router.get(
+    "/export.pdf",
+    # Declared media type, not just the wire header: FastAPI documents a bare
+    # `-> Response` as application/json, so the (correctly sent)
+    # application/pdf was undocumented and schema-conformance clients flagged
+    # every response (schemathesis UndefinedContentType, 13/13 runs).
+    responses={200: {"content": {"application/pdf": {}}, "description": "PDF IPAM report"}},
+)
 async def export_pdf_endpoint(
     current_user: CurrentUser,
     db: DB,

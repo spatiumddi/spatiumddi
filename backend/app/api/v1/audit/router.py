@@ -86,7 +86,14 @@ async def list_audit_log(
 # ── Compliance / change report PDF (issue #48) ──────────────────────
 
 
-@router.get("/export.pdf")
+@router.get(
+    "/export.pdf",
+    # Declared media type, not just the wire header: FastAPI documents a bare
+    # `-> Response` as application/json, so the (correctly sent)
+    # application/pdf was undocumented and schema-conformance clients flagged
+    # every response (schemathesis UndefinedContentType, 13/13 runs).
+    responses={200: {"content": {"application/pdf": {}}, "description": "PDF change report"}},
+)
 async def export_change_report_pdf(
     db: DB,
     since: datetime | None = Query(default=None),

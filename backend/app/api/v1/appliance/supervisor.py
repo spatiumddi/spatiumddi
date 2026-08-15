@@ -3084,8 +3084,12 @@ async def delete_appliance(
                 action="appliance.delete_denied",
                 resource_type="appliance",
                 resource_id=str(appliance_id),
+                resource_display=str(appliance_id),
                 result="denied",
-                error_message="bad_password",
+                # `error_detail` is the column; `error_message=` raised
+                # TypeError at construction, so the DENIAL path itself
+                # answered 500 — every wrong-password delete attempt, ever.
+                error_detail="bad_password",
             )
         )
         await db.commit()
@@ -3282,8 +3286,10 @@ async def permanent_delete_appliance(
                 action="appliance.permanent_delete_denied",
                 resource_type="appliance",
                 resource_id=str(appliance_id),
+                resource_display=str(appliance_id),
                 result="denied",
-                error_message="bad_password",
+                # Same construction defect as delete_appliance above.
+                error_detail="bad_password",
             )
         )
         await db.commit()

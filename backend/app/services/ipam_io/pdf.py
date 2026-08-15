@@ -16,11 +16,11 @@ CSV / JSON / XLSX exporter already takes:
 
 Follows the reportlab pattern already shipped in
 ``services/conformity/pdf.py`` and ``services/audit_report.py`` — a
-synchronous render after the async DB work, small enough at our scale
-to build inline. The issue text proposed weasyprint; adding a second
-PDF engine (plus its Cairo / Pango system libraries) to render tables
-we already know how to render would be a large dependency for no
-capability we don't have.
+synchronous render after the async DB work, dispatched to a worker
+thread so it cannot stall the event loop. The issue text proposed
+weasyprint; adding a second PDF engine (plus its Cairo / Pango system
+libraries) to render tables we already know how to render would be a
+large dependency for no capability we don't have.
 
 Unlike those two, this one paginates properly: repeating table headers
 plus a numbered page footer, because a printed address plan is read as
@@ -29,6 +29,7 @@ paper and "page 3 of 11" is what makes it checkable.
 
 from __future__ import annotations
 
+import asyncio
 import io
 import ipaddress
 import uuid
@@ -526,6 +527,13 @@ async def generate_ipam_pdf(
     Exactly one of ``space_id`` / ``block_id`` / ``subnet_id`` selects the
     scope; ``_collect`` raises 404 / 422 for a bad one, matching the
     behaviour of the spreadsheet exporter.
+
+    The render pass is synchronous reportlab, and THIS FUNCTION already
+    runs it in ``asyncio.to_thread`` — a caller must simply await it.
+    Do not wrap the call in ``asyncio.to_thread`` as well: handing a
+    worker thread an async function returns an un-awaited coroutine
+    instead of PDF bytes, and fails silently apart from a
+    ``coroutine was never awaited`` warning.
     """
     # A subnet-detail report is worthless without its addresses, so the
     # flag is forced on for that scope; for a tree it stays opt-in because
@@ -594,7 +602,14 @@ async def generate_ipam_pdf(
     )
 
     footer = f"SpatiumDDI · {heading} · generated {generated}"
-    doc.build(
+    # reportlab's render pass is synchronous CPU work; on the single-worker
+    # uvicorn loop it stalls every request AND the kubelet's probes, so it
+    # runs on a worker thread. This is the largest of the three renderers —
+    # a whole-space tree with the address appendix is a two-pass build over
+    # every row in the subtree — so it is the one most able to blow the
+    # probe budget, explicit ``timeoutSeconds`` included.
+    await asyncio.to_thread(
+        doc.build,
         story,
         canvasmaker=lambda *a, **kw: _NumberedCanvas(*a, footer_left=footer, **kw),
     )
