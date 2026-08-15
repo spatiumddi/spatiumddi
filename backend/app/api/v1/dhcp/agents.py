@@ -65,12 +65,16 @@ LONGPOLL_POLL_INTERVAL = 2.0
 
 
 class AgentRegisterRequest(BaseModel):
-    hostname: str
-    driver: str = "kea"
+    # Bounds mirror the columns these land in (DHCPServer.name/host 255,
+    # .driver 50, .agent_fingerprint 128, DHCPServerGroup.name 255) — an
+    # over-length value used to reach asyncpg and surface as 500 instead
+    # of the 422 it is.
+    hostname: str = Field(max_length=255)
+    driver: str = Field(default="kea", max_length=50)
     roles: list[str] = ["standalone"]
-    version: str | None = None
-    group_name: str | None = None
-    fingerprint: str
+    version: str | None = Field(default=None, max_length=64)
+    group_name: str | None = Field(default=None, max_length=255)
+    fingerprint: str = Field(max_length=128)
     agent_id: str | None = None
 
 
@@ -94,7 +98,11 @@ class AgentHeartbeatRequest(BaseModel):
     # pre-Wave-C1 agents valid too.
     model_config = ConfigDict(extra="forbid")
 
-    agent_version: str | None = None
+    # Bounded to the column (String(64)); the heartbeat is the OTHER route
+    # the same value arrives by, and leaving it unbounded here would let
+    # an over-length version in through the side door that register now
+    # rejects at the field.
+    agent_version: str | None = Field(default=None, max_length=64)
     # #637 — running Kea daemon version, e.g. "3.0.3". MUST be declared here:
     # this model is extra="forbid", so an undeclared field would 422 every
     # heartbeat from a current agent.
@@ -249,7 +257,13 @@ def _require_bootstrap_key(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="DHCP_AGENT_KEY is not configured on the control plane",
         )
-    if not x_dhcp_agent_key or not hmac.compare_digest(x_dhcp_agent_key, expected):
+    # Compare BYTES: hmac.compare_digest raises TypeError on a str with
+    # non-ASCII characters, so any client that sent one (fuzz: '\x80')
+    # got a 500 out of the auth gate instead of the 401 a wrong key is.
+    if not x_dhcp_agent_key or not hmac.compare_digest(
+        x_dhcp_agent_key.encode("utf-8", "surrogateescape"),
+        expected.encode("utf-8", "surrogateescape"),
+    ):
         raise HTTPException(status_code=401, detail="Invalid bootstrap key")
     return x_dhcp_agent_key
 

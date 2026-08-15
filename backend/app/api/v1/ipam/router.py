@@ -3067,6 +3067,12 @@ def _block_to_response(block: IPBlock, vrf_warning: str | None) -> dict[str, Any
         # read, so enabling split-horizon on a block appeared to save then
         # showed off on re-open, and re-saving the form wrote False back.
         "dns_split_horizon": block.dns_split_horizon,
+        # Same defect, next field pair: the column persisted fine but the
+        # response fell back to the model defaults (False/""), so a block the
+        # operator excluded from probing read as probe-eligible everywhere —
+        # and a UI round-trip wrote the False back.
+        "do_not_probe": block.do_not_probe,
+        "do_not_probe_reason": block.do_not_probe_reason,
         "dhcp_server_group_id": block.dhcp_server_group_id,
         "dhcp_inherit_settings": block.dhcp_inherit_settings,
         "ddns_enabled": block.ddns_enabled,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import uuid
 from datetime import UTC, datetime
 from ipaddress import ip_network
 from typing import Any, Literal
@@ -2848,7 +2849,12 @@ async def create_audit_target(
 
 @router.put("/audit-forward-targets/{target_id}", response_model=AuditTargetResponse)
 async def update_audit_target(
-    target_id: str, body: AuditTargetBody, current_user: CurrentUser, db: DB
+    # uuid.UUID, not str: a non-UUID path value used to reach the driver and
+    # surface as a bind-time 500 (live: target_id='0'); typed, it is a 422.
+    target_id: uuid.UUID,
+    body: AuditTargetBody,
+    current_user: CurrentUser,
+    db: DB,
 ) -> AuditTargetResponse:
     forbid_in_demo_mode("Audit-forward target updates are disabled")
     if not is_effective_superadmin(current_user):
@@ -2867,7 +2873,7 @@ async def update_audit_target(
 
 
 @router.delete("/audit-forward-targets/{target_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_audit_target(target_id: str, current_user: CurrentUser, db: DB) -> None:
+async def delete_audit_target(target_id: uuid.UUID, current_user: CurrentUser, db: DB) -> None:
     if not is_effective_superadmin(current_user):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
     row = await db.get(AuditForwardTarget, target_id)
@@ -2878,7 +2884,9 @@ async def delete_audit_target(target_id: str, current_user: CurrentUser, db: DB)
 
 
 @router.post("/audit-forward-targets/{target_id}/test")
-async def test_audit_target(target_id: str, current_user: CurrentUser, db: DB) -> dict[str, Any]:
+async def test_audit_target(
+    target_id: uuid.UUID, current_user: CurrentUser, db: DB
+) -> dict[str, Any]:
     """Send a synthetic event to one target and report success / error.
 
     The event is flagged ``action="test_forward"`` so the operator can

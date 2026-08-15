@@ -46,18 +46,27 @@ spec:
           # out of the Service so the page can't be reached at all), then
           # CrashLoop it on liveness. ``/nginx-health`` is served by
           # nginx alone and touches no upstream.
+          # timeoutSeconds is EXPLICIT for the same reason as the api's:
+          # the k8s default is 1s, and a probe that is merely slow then
+          # reads as a dead container. nginx serving a static file is far
+          # less likely to blow that budget than a single-worker uvicorn,
+          # so this is prophylactic rather than a fix for an observed
+          # failure — but leaving the fleet's LAST 1s-default probe in
+          # place is how the api's own omission survived unnoticed.
           livenessProbe:
             httpGet:
               path: /nginx-health
               port: 80
             initialDelaySeconds: 5
             periodSeconds: 15
+            timeoutSeconds: 5
           readinessProbe:
             httpGet:
               path: /nginx-health
               port: 80
             initialDelaySeconds: 3
             periodSeconds: 10
+            timeoutSeconds: 5
           resources:
             requests:
               cpu: 50m

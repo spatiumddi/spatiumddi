@@ -79,6 +79,12 @@ class ValidationResult:
     errors: list[str]
 
 
+# The hasher's hard ceiling — see app.core.security.BCRYPT_MAX_BYTES. Stated
+# as a policy rule so the operator gets an actionable message instead of a
+# 500 from inside the hash.
+MAX_PASSWORD_BYTES = 72
+
+
 def validate(password: str, policy: PasswordPolicy) -> ValidationResult:
     """Run every enabled rule. Returns one error per failed rule so the
     UI can render all violations at once instead of the operator
@@ -86,6 +92,16 @@ def validate(password: str, policy: PasswordPolicy) -> ValidationResult:
     errors: list[str] = []
     if len(password) < policy.min_length:
         errors.append(f"Password must be at least {policy.min_length} characters")
+    # bcrypt hashes at most 72 BYTES and raises above it, so an unbounded
+    # password reaches the hasher and 500s on the set path. Bytes, not
+    # characters: a 40-character password of 2-byte characters is over the
+    # line while a 71-character ASCII one is not, and only the byte count
+    # matches what bcrypt actually measures.
+    if len(password.encode("utf-8")) > MAX_PASSWORD_BYTES:
+        errors.append(
+            f"Password must be at most {MAX_PASSWORD_BYTES} bytes "
+            "(non-ASCII characters count as more than one)"
+        )
     if policy.require_uppercase and not any(c.isupper() for c in password):
         errors.append("Password must contain at least one uppercase letter")
     if policy.require_lowercase and not any(c.islower() for c in password):

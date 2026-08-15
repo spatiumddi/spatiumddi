@@ -15,6 +15,7 @@ status flipping.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
 import json
@@ -106,10 +107,12 @@ async def generate_conformity_pdf(
     evidence. ``None`` includes every framework grouped in
     alphabetical order.
 
-    The PDF is fully synchronous + in-memory; for large estates the
-    callsite should run this in ``asyncio.to_thread`` since reportlab
-    itself isn't async-aware. The DB queries above ARE async — only
-    the rendering pass needs the worker thread.
+    The render pass is synchronous reportlab, and THIS FUNCTION already
+    runs it in ``asyncio.to_thread`` — a caller must simply await it.
+    Do not wrap the call in ``asyncio.to_thread`` as well: handing a
+    worker thread an async function returns an un-awaited coroutine
+    instead of PDF bytes, and fails silently apart from a
+    ``coroutine was never awaited`` warning.
     """
     pol_q = select(ConformityPolicy)
     if framework:
@@ -166,7 +169,10 @@ async def generate_conformity_pdf(
                 body,
             )
         )
-        doc.build(story)
+        # reportlab's render pass is synchronous CPU work; on the single-
+        # worker uvicorn loop it stalls every request AND the kubelet's
+        # 1s-budget probes, so it runs on a worker thread.
+        await asyncio.to_thread(doc.build, story)
         return buf.getvalue()
 
     # Per-framework summary table.
@@ -299,7 +305,10 @@ async def generate_conformity_pdf(
         )
     )
 
-    doc.build(story)
+    # reportlab's render pass is synchronous CPU work; on the single-
+    # worker uvicorn loop it stalls every request AND the kubelet's
+    # 1s-budget probes, so it runs on a worker thread.
+    await asyncio.to_thread(doc.build, story)
     return buf.getvalue()
 
 

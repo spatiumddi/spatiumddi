@@ -3,13 +3,16 @@
 An auditor-facing PDF rollup of every ``audit_log`` mutation in a date
 range, grouped by user / resource type / action, with a SHA-256
 tamper-evidence trailer over the included rows. Mirrors the
-``services/conformity/pdf.py`` reportlab pattern (synchronous render after
-async DB queries; small enough to render inline, no ``asyncio.to_thread``
-needed at our scale).
+``services/conformity/pdf.py`` reportlab pattern: async DB queries, then a
+synchronous render THIS MODULE already runs in ``asyncio.to_thread``. Await
+the function; do not wrap the call in ``to_thread`` as well, which would
+hand a worker thread an async function and yield an un-awaited coroutine
+instead of PDF bytes.
 """
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
 from datetime import UTC, datetime
@@ -133,7 +136,10 @@ async def generate_change_report_pdf(
                 body,
             )
         )
-        doc.build(story)
+        # reportlab's render pass is synchronous CPU work; on the single-
+        # worker uvicorn loop it stalls every request AND the kubelet's
+        # 1s-budget probes, so it runs on a worker thread.
+        await asyncio.to_thread(doc.build, story)
         return buf.getvalue()
 
     def _section(heading: str, label: str, counts: list[tuple[str, int]]) -> None:
@@ -186,5 +192,8 @@ async def generate_change_report_pdf(
             small,
         )
     )
-    doc.build(story)
+    # reportlab's render pass is synchronous CPU work; on the single-
+    # worker uvicorn loop it stalls every request AND the kubelet's
+    # 1s-budget probes, so it runs on a worker thread.
+    await asyncio.to_thread(doc.build, story)
     return buf.getvalue()
