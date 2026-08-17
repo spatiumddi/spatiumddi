@@ -43,7 +43,7 @@ RUN python3 -m pip install --prefix=/install --no-cache-dir --break-system-packa
 #
 # ``1.26.5`` clears CVE-2026-39822 (HIGH — ``os.Root`` symlink following allows
 # directory traversal), which 1.26.4 carries. Keep this at the latest 1.26.x.
-FROM --platform=$BUILDPLATFORM golang:1.26.5-alpine AS gobgp-build
+FROM --platform=$BUILDPLATFORM golang:1.26.6-alpine AS gobgp-build
 ARG GOBGP_VERSION
 ARG TARGETOS
 ARG TARGETARCH
