@@ -41,8 +41,12 @@ RUN python3 -m pip install --prefix=/install --no-cache-dir --break-system-packa
 # no separate package to patch and no ``apk upgrade`` that can fix it. The only
 # remedy is to rebuild with a fixed toolchain.
 #
-# ``1.26.5`` clears CVE-2026-39822 (HIGH — ``os.Root`` symlink following allows
-# directory traversal), which 1.26.4 carries. Keep this at the latest 1.26.x.
+# The 1.26.4 → 1.26.5 bump cleared CVE-2026-39822 (HIGH — ``os.Root`` symlink
+# following allows directory traversal). Keep this at the latest 1.26.x.
+#
+# Stated in the PAST tense on purpose: Dependabot bumps the ``FROM`` line but
+# cannot touch this comment, so any wording that names the CURRENT pin goes
+# stale on the very next bump — which is exactly what happened at 1.26.6.
 FROM --platform=$BUILDPLATFORM golang:1.26.6-alpine AS gobgp-build
 ARG GOBGP_VERSION
 ARG TARGETOS
