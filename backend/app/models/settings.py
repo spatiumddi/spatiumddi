@@ -11,6 +11,7 @@ from sqlalchemy import (
     Numeric,
     String,
     Text,
+    UniqueConstraint,
 )
 from sqlalchemy import text as sa_text
 from sqlalchemy.dialects.postgresql import JSONB
@@ -1075,7 +1076,19 @@ class BrandingAsset(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     __tablename__ = "branding_asset"
 
-    kind: Mapped[str] = mapped_column(String(32), nullable=False, unique=True, index=True)
+    # The uniqueness of ``kind`` is declared as a NAMED constraint rather
+    # than ``unique=True`` on the column: an inline unique= lets Postgres
+    # auto-name it (``branding_asset_kind_key``) under
+    # ``Base.metadata.create_all``, which would not match the name the
+    # migration creates. The upload path's ON CONFLICT then resolves
+    # differently depending on whether the schema came from migrations or
+    # create_all. Naming it here keeps both paths identical.
+    #
+    # No separate index= on the column either — a unique constraint is
+    # already backed by an index, so one would just be a duplicate.
+    __table_args__ = (UniqueConstraint("kind", name="uq_branding_asset_kind"),)
+
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
     content: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
     media_type: Mapped[str] = mapped_column(String(100), nullable=False)
     # Hex sha256 of ``content`` — doubles as the ETag and as the cache-buster

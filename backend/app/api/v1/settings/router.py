@@ -3244,7 +3244,11 @@ async def upload_branding_logo(
             byte_size=len(content),
         )
         .on_conflict_do_update(
-            constraint="uq_branding_asset_kind",
+            # Infer the target from the column rather than naming the
+            # constraint, so this cannot break if the constraint is ever
+            # renamed — and so it behaves identically on a schema built by
+            # create_all versus one built by migrations.
+            index_elements=["kind"],
             set_={
                 "content": content,
                 "media_type": BRANDING_ASSET_MEDIA_TYPE,

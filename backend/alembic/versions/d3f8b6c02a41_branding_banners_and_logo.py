@@ -140,13 +140,14 @@ def upgrade() -> None:
         sa.Column("sha256", sa.String(length=64), nullable=False),
         sa.Column("byte_size", sa.Integer(), nullable=False),
         sa.PrimaryKeyConstraint("id"),
+        # Named to match the model's __table_args__ exactly, so a schema
+        # built by create_all (tests) and one built by migrations agree.
+        # The constraint is itself index-backed — no separate index here.
         sa.UniqueConstraint("kind", name="uq_branding_asset_kind"),
     )
-    op.create_index("ix_branding_asset_kind", "branding_asset", ["kind"])
 
 
 def downgrade() -> None:
-    op.drop_index("ix_branding_asset_kind", table_name="branding_asset")
     op.drop_table("branding_asset")
     op.drop_column("platform_settings", "env_banner_position")
     op.drop_column("platform_settings", "env_banner_fg")
