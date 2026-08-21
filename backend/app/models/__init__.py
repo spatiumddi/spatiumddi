@@ -129,7 +129,7 @@ from app.models.panos import FirewallObject, PANOSFirewall
 from app.models.pcap import PacketCapture
 from app.models.proxmox import ProxmoxNode
 from app.models.saved_view import SavedView
-from app.models.settings import PlatformSettings
+from app.models.settings import BrandingAsset, PlatformSettings
 from app.models.system_upgrade import SystemUpgradeRun
 from app.models.tailscale import TailscaleTenant
 from app.models.time_bound_grant import TimeBoundGrant
@@ -206,6 +206,7 @@ __all__ = [
     "VLANMapping",
     "OUIVendor",
     "PlatformSettings",
+    "BrandingAsset",
     "DNSServerGroup",
     "DNSServer",
     "DNSServerZoneState",

@@ -101,13 +101,18 @@ SECTIONS: tuple[Section, ...] = (
         key="settings",
         label="Platform settings & RBAC scaffolding",
         description=(
-            "Platform-wide settings, custom field definitions, "
-            "IPAM templates, feature-module toggles, alert rules + "
-            "events, conformity policies + results, platform-wide "
+            "Platform-wide settings, branding assets, custom field "
+            "definitions, IPAM templates, feature-module toggles, alert "
+            "rules + events, conformity policies + results, platform-wide "
             "tags, event subscriptions + outbox."
         ),
         tables=(
             "platform_settings",
+            # The operator-uploaded logo (#886). Belongs with settings
+            # rather than in its own section: it is branding config that
+            # happens to be bytes, and restoring the banner text without
+            # the logo it sits beside would be a half-restore.
+            "branding_asset",
             "custom_field_definition",
             "feature_module",
             "ipam_template",

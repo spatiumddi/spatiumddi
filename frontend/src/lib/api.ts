@@ -3401,9 +3401,53 @@ export const searchApi = {
 
 // ── Settings ───────────────────────────────────────────────────────────────────
 
+export type EnvBannerPosition = "top" | "bottom" | "both";
+
+/** The deliberately-public slice of PlatformSettings, served unauthenticated
+ *  so the login page can render branding before anyone has a session
+ *  (issues #885 / #886 / #887 / #888). Never add a field here that an
+ *  anonymous visitor shouldn't see. */
+export interface PublicSettings {
+  app_title: string;
+  login_banner: {
+    enabled: boolean;
+    title: string;
+    text: string;
+    require_ack: boolean;
+  };
+  env_banner: {
+    enabled: boolean;
+    text: string;
+    bg: string;
+    fg: string;
+    position: EnvBannerPosition;
+  };
+  /** sha256 of the operator-uploaded logo, or null when none is set (the
+   *  frontend then falls back to the bundled asset). Doubles as the
+   *  cache-buster in the logo URL. */
+  logo_sha256: string | null;
+}
+
+export interface BrandingLogoInfo {
+  sha256: string;
+  byte_size: number;
+  media_type: string;
+}
+
 export interface PlatformSettings {
   app_title: string;
   app_base_url: string;
+  // Login-screen acceptable-use banner — issue #885.
+  login_banner_enabled: boolean;
+  login_banner_title: string;
+  login_banner_text: string;
+  login_banner_require_ack: boolean;
+  // Environment banner ("you are on the DEV box") — issue #887.
+  env_banner_enabled: boolean;
+  env_banner_text: string;
+  env_banner_bg: string;
+  env_banner_fg: string;
+  env_banner_position: EnvBannerPosition;
   dns_auto_sync_enabled: boolean;
   dns_auto_sync_interval_minutes: number;
   dns_auto_sync_delete_stale: boolean;
@@ -3853,10 +3897,39 @@ export interface AuditForwardTargetWrite {
   resource_types?: string[] | null;
 }
 
+/** Unauthenticated branding reads (issues #885–#888). Kept separate from
+ *  ``settingsApi`` because these are the only settings calls that work
+ *  without a session — the login page depends on that. */
+export const publicSettingsApi = {
+  get: () => api.get<PublicSettings>("/settings/public").then((r) => r.data),
+  /** Direct URL — the browser fetches the bytes itself, so no auth header
+   *  is available; the route is public for exactly that reason. Built from
+   *  ``API_BASE`` rather than a hardcoded ``/api/v1`` so a deployment that
+   *  overrides ``VITE_API_BASE_URL`` (split-origin / sub-path) still points
+   *  at the real API. The sha busts the cache on re-upload. */
+  logoUrl: (sha256: string) =>
+    `${API_BASE.replace(/\/$/, "")}/settings/public/logo?v=${sha256}`,
+};
+
 export const settingsApi = {
   get: () => api.get<PlatformSettings>("/settings").then((r) => r.data),
   update: (data: Partial<PlatformSettings>) =>
     api.put<PlatformSettings>("/settings", data).then((r) => r.data),
+  /** Issue #886 — upload the branding logo (PNG, ≤512 KB). Superadmin
+   *  only, audited server-side. */
+  uploadLogo: (file: File) => {
+    const fd = new FormData();
+    fd.append("file", file);
+    return api
+      .put<BrandingLogoInfo>("/settings/branding/logo", fd, {
+        // Axios picks the multipart boundary itself when the body is a
+        // FormData; an explicit Content-Type would strip it.
+        headers: { "Content-Type": undefined },
+      })
+      .then((r) => r.data);
+  },
+  /** Issue #886 — remove the custom logo and fall back to the bundled one. */
+  deleteLogo: () => api.delete("/settings/branding/logo"),
   getDefaults: () =>
     api
       .get<Partial<PlatformSettings>>("/settings/defaults")

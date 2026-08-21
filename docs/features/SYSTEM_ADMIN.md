@@ -540,9 +540,87 @@ Performance: the middleware reads the flag from a short-TTL process-local cache.
 **Branding**
 
 ```
-app_title: str (default "SpatiumDDI")
+app_title: str (default "SpatiumDDI")   -- browser tab, login heading, sidebar wordmark
 app_base_url: str (default "") -- used to build OIDC/SAML redirect URLs; empty = derive from request
+
+-- Login-screen acceptable-use banner (issue #885)
+login_banner_enabled: bool (default false)
+login_banner_title: str (default "")        -- short heading, e.g. "NOTICE"
+login_banner_text: str (default "")         -- plain text; newlines preserved
+login_banner_require_ack: bool (default false)
+
+-- Environment banner (issue #887)
+env_banner_enabled: bool (default false)
+env_banner_text: str (default "")
+env_banner_bg: str (default "#b91c1c")      -- 6-digit hex, validated
+env_banner_fg: str (default "#ffffff")      -- 6-digit hex, validated
+env_banner_position: str (default "top")    -- top | bottom | both
 ```
+
+Branding writes (`app_title`, either banner) are **superadmin-only**, a
+stronger gate than the `write:settings` the rest of the PUT takes: these
+fields render to anonymous visitors on the login page, so a delegated
+settings editor must not be able to put arbitrary text in front of
+everyone. Every branding change writes an audit row
+(`resource_type="platform_settings"`, `resource_id="branding"`).
+
+### 6.1 Public branding endpoint
+
+`GET /api/v1/settings/public` is **unauthenticated** — the login page has
+to render the title, banners and logo before a session exists, the same
+reason `/auth/password-policy` and `/auth/providers` are public. It
+returns an explicit whitelist (`app_title`, `login_banner`, `env_banner`,
+`logo_sha256`), never a filtered dump of the settings row, so a column
+added to `PlatformSettings` later cannot leak through by default. Anything
+placed in these fields is world-readable to anyone who can reach the login
+page; the Settings UI says so.
+
+The acknowledgement checkbox (`login_banner_require_ack`) gates the
+sign-in button and the SSO buttons client-side. It is a consent
+affordance, not an access control — the API never receives the
+acknowledgement, and nothing server-side depends on it.
+
+### 6.2 Branding logo (issue #886)
+
+| Route | Auth | Purpose |
+|---|---|---|
+| `PUT /api/v1/settings/branding/logo` | superadmin, audited | Upload (multipart, PNG, ≤512 KB) |
+| `DELETE /api/v1/settings/branding/logo` | superadmin, audited | Remove; UI falls back to the bundled asset |
+| `GET /api/v1/settings/public/logo` | **none** | Serve the bytes to the login page |
+
+The bytes live in Postgres, in a dedicated `branding_asset` table keyed by
+`kind` — not on a volume, and not as a column on `PlatformSettings`.
+
+*Why the database:* the control plane is multi-node. A file written to one
+API pod's filesystem is invisible to the others, which is the problem that
+forced the slot-image mirror sidecar (#296) into existence — a whole extra
+Deployment and PVC to fan one file out. A logo is tens of KB, Postgres is
+already the shared store, and DB storage means it propagates everywhere for
+free and rides along in backups.
+
+*Why its own table:* the `platform_settings` row is read on many request
+paths, and none of them should pay to load a blob.
+
+*Why PNG only:* the logo is served same-origin, and an SVG can carry
+script — accepting one would turn a branding upload into stored XSS
+against every visitor, including unauthenticated ones. The upload
+validates PNG magic bytes rather than trusting the client's declared
+content type.
+
+The response carries a weak `ETag` built from the content sha256, and the
+frontend requests the logo with that sha as a query parameter, so a
+re-upload busts the cache immediately while an unchanged logo answers 304.
+
+The upload is an `ON CONFLICT` upsert keyed on `uq_branding_asset_kind`, so
+two superadmins uploading at the same moment resolve as last-write-wins
+rather than one of them hitting a unique-constraint error.
+
+Operator Copilot coverage is one read tool, `find_branding_settings`
+(default enabled) — it returns the same payload `GET /settings/public`
+serves, so nothing it exposes is secret. There is deliberately **no**
+`propose_update_branding`: these fields render to anonymous visitors, which
+is why the write path is superadmin-only, and that is not a gate to hand to
+a chat tool.
 
 **IP allocation**
 

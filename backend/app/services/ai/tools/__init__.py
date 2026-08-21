@@ -20,6 +20,7 @@ from app.services.ai.tools import (  # noqa: F401, E402
     bgp_lg,
     bgp_monitor,
     block_sync,
+    branding,
     certificates,
     changes,
     conformity,

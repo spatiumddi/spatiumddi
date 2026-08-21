@@ -481,6 +481,16 @@ backend/alembic/versions/d3f1ab7c8e02_windows_dns_credentials.py:drop_column:36
 backend/alembic/versions/d3f2a51c8e76_bgp_peering.py:drop_column:98
 backend/alembic/versions/d3f2a51c8e76_bgp_peering.py:drop_constraint_fk:96
 backend/alembic/versions/d3f2a51c8e76_bgp_peering.py:drop_table:94
+backend/alembic/versions/d3f8b6c02a41_branding_banners_and_logo.py:drop_column:151
+backend/alembic/versions/d3f8b6c02a41_branding_banners_and_logo.py:drop_column:152
+backend/alembic/versions/d3f8b6c02a41_branding_banners_and_logo.py:drop_column:153
+backend/alembic/versions/d3f8b6c02a41_branding_banners_and_logo.py:drop_column:154
+backend/alembic/versions/d3f8b6c02a41_branding_banners_and_logo.py:drop_column:155
+backend/alembic/versions/d3f8b6c02a41_branding_banners_and_logo.py:drop_column:156
+backend/alembic/versions/d3f8b6c02a41_branding_banners_and_logo.py:drop_column:157
+backend/alembic/versions/d3f8b6c02a41_branding_banners_and_logo.py:drop_column:158
+backend/alembic/versions/d3f8b6c02a41_branding_banners_and_logo.py:drop_column:159
+backend/alembic/versions/d3f8b6c02a41_branding_banners_and_logo.py:drop_table:150
 backend/alembic/versions/d4a18b20e3c7_dhcp_mac_blocks.py:drop_table:83
 backend/alembic/versions/d4a8b2e6f193_dns_group_tsig_key.py:drop_column:40
 backend/alembic/versions/d4a8b2e6f193_dns_group_tsig_key.py:drop_column:41

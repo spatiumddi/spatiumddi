@@ -11,12 +11,13 @@ from sqlalchemy import (
     Numeric,
     String,
     Text,
+    UniqueConstraint,
 )
 from sqlalchemy import text as sa_text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.models.base import Base
+from app.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
 
 # Default managed APT repos (issue #155) — mirror the Debian 13 (trixie)
 # set baked into the appliance ISO so enabling APT management starts from
@@ -72,6 +73,45 @@ class PlatformSettings(Base):
     # External-facing URL (used for OIDC / SAML redirect + callback URLs). Empty
     # means "derive from the incoming request" at runtime.
     app_base_url: Mapped[str] = mapped_column(String(500), nullable=False, default="")
+
+    # Login-screen acceptable-use banner (issue #885). Rendered above the
+    # sign-in form, so every field here is served UNAUTHENTICATED via
+    # ``GET /api/v1/settings/public`` — never put anything secret in them.
+    # ``require_ack`` gates the submit button on an "I acknowledge"
+    # checkbox; that is a display-and-consent affordance, not an
+    # enforcement boundary (the API never sees the acknowledgement).
+    login_banner_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+    login_banner_title: Mapped[str] = mapped_column(
+        String(120), nullable=False, default="", server_default=sa_text("''")
+    )
+    login_banner_text: Mapped[str] = mapped_column(
+        Text, nullable=False, default="", server_default=sa_text("''")
+    )
+    login_banner_require_ack: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+
+    # Environment banner (issue #887) — the "you are on the DEV box" strip
+    # rendered on every screen including the login page. Colours are
+    # operator-picked hex, so they land in an inline style rather than a
+    # Tailwind class. ``position`` is one of top / bottom / both.
+    env_banner_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+    env_banner_text: Mapped[str] = mapped_column(
+        String(200), nullable=False, default="", server_default=sa_text("''")
+    )
+    env_banner_bg: Mapped[str] = mapped_column(
+        String(7), nullable=False, default="#b91c1c", server_default=sa_text("'#b91c1c'")
+    )
+    env_banner_fg: Mapped[str] = mapped_column(
+        String(7), nullable=False, default="#ffffff", server_default=sa_text("'#ffffff'")
+    )
+    env_banner_position: Mapped[str] = mapped_column(
+        String(10), nullable=False, default="top", server_default=sa_text("'top'")
+    )
 
     # IP allocation
     ip_allocation_strategy: Mapped[str] = mapped_column(
@@ -1008,3 +1048,51 @@ class PlatformSettings(Base):
     approvals_protect_controls: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=sa_text("false")
     )
+
+
+# Operator-uploaded branding assets (issue #886). One row per ``kind``.
+#
+# The bytes live in Postgres rather than on a volume because the control
+# plane is multi-node: a file written to one API pod's filesystem is
+# invisible to the others, which is exactly the problem that forced the
+# slot-image mirror sidecar (#296) into existence. The database is already
+# the shared store, so a DB blob propagates everywhere for free and rides
+# along in backups. A logo is tens of KB — this is not a place where blob
+# storage costs anything.
+#
+# Deliberately NOT columns on PlatformSettings: that row is read on many
+# request paths, and no one should pay for a blob on every settings load.
+BRANDING_ASSET_KIND_LOGO = "logo"
+
+# PNG only, and small. SVG is deliberately excluded: it is served
+# same-origin, and an SVG is a script-execution vector unless sanitised.
+BRANDING_ASSET_MAX_BYTES = 512 * 1024
+BRANDING_ASSET_MEDIA_TYPE = "image/png"
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+
+
+class BrandingAsset(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """A single operator-uploaded branding file, keyed by ``kind``."""
+
+    __tablename__ = "branding_asset"
+
+    # The uniqueness of ``kind`` is declared as a NAMED constraint rather
+    # than ``unique=True`` on the column: an inline unique= lets Postgres
+    # auto-name it (``branding_asset_kind_key``) under
+    # ``Base.metadata.create_all``, which would not match the name the
+    # migration creates. The upload path's ON CONFLICT then resolves
+    # differently depending on whether the schema came from migrations or
+    # create_all. Naming it here keeps both paths identical.
+    #
+    # No separate index= on the column either — a unique constraint is
+    # already backed by an index, so one would just be a duplicate.
+    __table_args__ = (UniqueConstraint("kind", name="uq_branding_asset_kind"),)
+
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    content: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    media_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    # Hex sha256 of ``content`` — doubles as the ETag and as the cache-buster
+    # in the URL the frontend builds, so a re-upload is picked up immediately
+    # instead of sitting behind a stale browser cache.
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    byte_size: Mapped[int] = mapped_column(Integer, nullable=False)
