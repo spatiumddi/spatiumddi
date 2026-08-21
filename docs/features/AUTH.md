@@ -191,6 +191,50 @@ Key config fields:
 
 Secrets: `sp_private_key` (PEM, optional — only needed for signed requests).
 
+**SAML needs HTTPS with any hosted IdP.** Step 2 above is a *cross-site
+POST*: the browser is on the IdP's origin and submits the assertion to
+SpatiumDDI. The short-lived `saml_flow` cookie set in step 1 — which
+binds the assertion to the browser that started the flow — only rides
+that POST when it is marked `SameSite=None`, and browsers honour
+`SameSite=None` only when the cookie is also `Secure`. A `Lax` cookie is
+withheld from every cross-site POST, which is what made all logins
+against a hosted IdP fail with `error=saml_state_missing`
+([#873](https://github.com/spatiumddi/spatiumddi/issues/873)). Note the
+contrast with OIDC, whose flow cookie is legitimately `SameSite=Lax`:
+the OIDC provider returns the browser with a cross-site **GET**
+redirect, which Lax permits.
+
+The cookie policy is therefore picked per deployment, from the external
+URL's scheme:
+
+| External URL | Flow cookie | Works with |
+|---|---|---|
+| `https://…` | `SameSite=None; Secure` | any IdP |
+| `http://…` | `SameSite=Lax` | only an IdP sharing SpatiumDDI's registrable domain (its POST is same-site) |
+
+`SameSite=None` cannot be used over plain HTTP at all — the browser
+drops such a cookie at *set* time — so HTTP keeps Lax rather than
+losing the same-site case too. When that Lax cookie does not come back,
+the ACS reports `/login?error=saml_requires_https` instead of
+`saml_state_missing`, because on an HTTP deployment a missing cookie is
+the signature of a cross-site IdP and the fix is TLS, not a retry.
+
+The URL whose scheme decides all this is the admin-set **External URL**
+(Settings → General, `platform_settings.app_base_url`) when configured,
+otherwise the incoming request URL — the same value the SP metadata
+advertises as the ACS, i.e. the origin the IdP actually posts to.
+**Behind a TLS-terminating proxy, set the External URL to the public
+`https://` address.** Relying on `X-Forwarded-Proto` alone is not enough
+with the shipped Docker Compose stack: the frontend container's nginx
+listens on `:80` and hard-sets `X-Forwarded-Proto $scheme`, so it
+overwrites the `https` an outer terminator sent (the TLS recipes in
+[DOCKER.md §5](../deployment/DOCKER.md) Options A and B both put the
+terminator *in front of* that container). The request then looks like
+plain HTTP to the API, and the SP metadata would advertise an `http://`
+ACS URL anyway. The forwarded header does carry the real scheme where
+nginx itself terminates TLS: DOCKER.md Option C, and the Helm chart's
+TLS-enabled frontend.
+
 ### RADIUS
 
 Driver: `backend/app/core/auth/radius.py` (`pyrad`).

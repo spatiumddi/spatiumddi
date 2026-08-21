@@ -1218,6 +1218,41 @@ _OIDC_FLOW_COOKIE = "oidc_flow"
 _OIDC_FLOW_TTL = 300  # 5 minutes
 _SAML_FLOW_COOKIE = "saml_flow"
 _SAML_FLOW_TTL = 300
+
+
+def _saml_flow_cookie_kwargs(base: str) -> dict:
+    """Attributes shared by the set + delete of the SAML flow cookie.
+
+    SECURITY / CORRECTNESS (#873). Unlike OIDC — whose IdP hands the browser
+    back with a cross-site *GET* redirect, which SameSite=Lax permits — SAML's
+    Web Browser SSO profile returns the assertion as a cross-site **POST** to
+    our ACS, and Lax cookies are never sent on a cross-site POST. So a Lax
+    flow cookie is simply absent at the ACS for every IdP that does not share
+    our registrable domain — i.e. every hosted IdP (Okta / Entra / Google) —
+    and the login dies with ``saml_state_missing``. Only ``SameSite=None``
+    survives that POST, and browsers honour None only alongside ``Secure``.
+
+    Hence the policy is chosen from the deployment's own scheme rather than
+    fixed: over HTTPS we can (and must) set None + Secure; over plain HTTP
+    None would be dropped by the browser at *set* time, so Lax is strictly
+    better there — it is what a same-site IdP needs, and that is the only
+    kind of IdP that can work over HTTP at all. ``saml_callback`` turns the
+    remaining cross-site-IdP-on-HTTP case into an actionable
+    ``saml_requires_https`` instead of a bare state error.
+
+    ``base`` is the deployment's external URL (see ``_app_base_url``) — the
+    origin the SP metadata advertises as the ACS, i.e. the one the browser
+    actually posts to — not necessarily the origin of this request.
+    """
+    https = base.lower().startswith("https://")
+    return {
+        "httponly": True,
+        "samesite": "none" if https else "lax",
+        "secure": https,
+        "path": "/api/v1/auth/",
+    }
+
+
 _LOGIN_CALLBACK_PATH = "/login/callback"
 _LOGIN_ERROR_PATH = "/login"
 
@@ -1267,6 +1302,7 @@ _LOGIN_ERROR_REASONS = frozenset(
         "oidc_rejected",
         # SAML
         "saml_misconfigured",
+        "saml_requires_https",
         "saml_build_failed",
         "saml_state_missing",
         "saml_state_invalid",
@@ -1352,6 +1388,16 @@ async def _oidc_start(provider: AuthProvider, request: Request, db: DB) -> Redir
 
 async def _saml_start(provider: AuthProvider, request: Request, db: DB) -> RedirectResponse:
     base = await _app_base_url(db, request)
+    if not base.lower().startswith("https://"):
+        # Not fatal on its own — a same-site IdP still round-trips the Lax
+        # cookie this yields — but it is the precondition for the failure
+        # ``saml_callback`` reports as ``saml_requires_https`` (#873), so
+        # leave the operator a breadcrumb here rather than only at the ACS.
+        logger.warning(
+            "saml_authorize_insecure_base_url",
+            provider=provider.name,
+            base_url=base,
+        )
     try:
         cfg = SAMLConfig.from_provider(provider, base)
     except SAMLServiceError as exc:
@@ -1377,10 +1423,7 @@ async def _saml_start(provider: AuthProvider, request: Request, db: DB) -> Redir
         _SAML_FLOW_COOKIE,
         flow_token,
         max_age=_SAML_FLOW_TTL,
-        httponly=True,
-        samesite="lax",
-        secure=request.url.scheme == "https",
-        path="/api/v1/auth/",
+        **_saml_flow_cookie_kwargs(base),
     )
     return response
 
@@ -1480,8 +1523,23 @@ async def saml_callback(
     if provider is None or provider.type != "saml":
         raise HTTPException(status_code=404, detail="Provider not found")
 
+    base = await _app_base_url(db, request)
+
     flow_cookie = request.cookies.get(_SAML_FLOW_COOKIE)
     if not flow_cookie:
+        # Classify the absence (#873). Over plain HTTP the flow cookie can
+        # only be Lax (see ``_saml_flow_cookie_kwargs``), which the browser
+        # withholds from a *cross-site* POST — so on an HTTP deployment a
+        # missing cookie here is the signature of a hosted IdP, and the fix
+        # is TLS, not "try again". Over HTTPS the cookie is SameSite=None and
+        # should have arrived, so absence means an expired or dropped flow.
+        if not base.lower().startswith("https://"):
+            logger.warning(
+                "saml_callback_requires_https",
+                provider=provider.name,
+                base_url=base,
+            )
+            return _login_error_redirect("saml_requires_https")
         return _login_error_redirect("saml_state_missing")
     try:
         flow = _verify_flow_token(flow_cookie)
@@ -1492,7 +1550,6 @@ async def saml_callback(
     if RelayState != flow.get("relay_state"):
         return _login_error_redirect("saml_state_mismatch")
 
-    base = await _app_base_url(db, request)
     try:
         cfg = SAMLConfig.from_provider(provider, base)
         consumed = saml_consume_assertion(
@@ -1540,7 +1597,11 @@ async def saml_callback(
     )
     response = RedirectResponse(f"{_LOGIN_CALLBACK_PATH}#{frag}", status_code=302)
     _set_refresh_cookie(response, request, tokens.refresh_token)
-    response.delete_cookie(_SAML_FLOW_COOKIE, path="/api/v1/auth/")
+    # Clear with the attributes it was set with. Not strictly required —
+    # a cookie is identified by (name, domain, path), so the attributes
+    # play no part in matching — but keeping set and clear in one helper
+    # stops the pair drifting apart (#873).
+    response.delete_cookie(_SAML_FLOW_COOKIE, **_saml_flow_cookie_kwargs(base))
     return response
 
 

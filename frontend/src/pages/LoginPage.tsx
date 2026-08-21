@@ -6,6 +6,11 @@ import { KeyRound, ShieldCheck } from "lucide-react";
 
 function humanizeError(code: string | null): string {
   if (!code) return "";
+  if (code === "oidc_rejected")
+    return "OIDC login rejected: your account could not be provisioned (group mapping, username collision, or auto-create disabled).";
+  // Defensive: the backend allowlist (`_LOGIN_ERROR_REASONS`) only emits the
+  // bare `oidc_rejected` above, but keep the per-reason rendering in case a
+  // suffixed code is ever added to that set.
   if (code.startsWith("oidc_rejected_")) {
     const reason = code.slice("oidc_rejected_".length);
     if (reason === "no_group_mapping_match") {
@@ -35,6 +40,22 @@ function humanizeError(code: string | null): string {
     return "OIDC provider is misconfigured. Contact an administrator.";
   if (code.startsWith("oidc_idp_"))
     return `Identity provider returned: ${code.slice(9)}`;
+  if (code === "saml_requires_https")
+    return "SAML login requires HTTPS. The identity provider posts the assertion back cross-site, and browsers only carry the flow cookie across that POST over a secure connection — serve SpatiumDDI over TLS and set the external URL in Settings to its https:// address.";
+  if (
+    code === "saml_state_missing" ||
+    code === "saml_state_invalid" ||
+    code === "saml_state_mismatch"
+  )
+    return "SAML flow state was invalid or expired. Please try again.";
+  if (code === "saml_assertion_rejected")
+    return "The SAML assertion was rejected. Check the SP/IdP certificate and entity ID configuration.";
+  if (code === "saml_rejected")
+    return "SAML login rejected: your account could not be provisioned (group mapping, username collision, or auto-create disabled).";
+  if (code === "saml_build_failed")
+    return "Could not build the SAML authentication request. Check provider configuration.";
+  if (code === "saml_misconfigured")
+    return "SAML provider is misconfigured. Contact an administrator.";
   return "Login failed.";
 }
 
