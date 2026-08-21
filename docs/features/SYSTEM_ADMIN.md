@@ -611,6 +611,17 @@ The response carries a weak `ETag` built from the content sha256, and the
 frontend requests the logo with that sha as a query parameter, so a
 re-upload busts the cache immediately while an unchanged logo answers 304.
 
+The upload is an `ON CONFLICT` upsert keyed on `uq_branding_asset_kind`, so
+two superadmins uploading at the same moment resolve as last-write-wins
+rather than one of them hitting a unique-constraint error.
+
+Operator Copilot coverage is one read tool, `find_branding_settings`
+(default enabled) — it returns the same payload `GET /settings/public`
+serves, so nothing it exposes is secret. There is deliberately **no**
+`propose_update_branding`: these fields render to anonymous visitors, which
+is why the write path is superadmin-only, and that is not a gate to hand to
+a chat tool.
+
 **IP allocation**
 
 ```

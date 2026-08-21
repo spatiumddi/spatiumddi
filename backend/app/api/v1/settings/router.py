@@ -13,6 +13,7 @@ import structlog
 from fastapi import APIRouter, File, Header, HTTPException, Response, UploadFile, status
 from pydantic import BaseModel, field_validator, model_validator
 from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.api.deps import DB, CurrentUser
 from app.core.agent_wake import HOSTCONFIG_ALL, publish_wake
@@ -3119,7 +3120,14 @@ async def get_public_settings(db: DB) -> PublicSettingsResponse:
     # settings row is only created by the first write, and the logo is
     # independent of it — a logo uploaded before anyone saves settings must
     # still be served, so these two are queried separately.
-    settings = await db.get(PlatformSettings, _SINGLETON_ID)
+    # A transient instance stands in for the missing row so the no-row case
+    # answers with the same shape as a configured one. Note its columns read
+    # as None, NOT the ORM ``default=`` values — SQLAlchemy applies those at
+    # flush, not at construction — so the ``or`` fallbacks below are
+    # load-bearing, not belt-and-braces. Real attribute access (rather than
+    # ``getattr`` by string) keeps mypy and rename refactors honest: a
+    # renamed column errors here instead of silently serving defaults.
+    settings = await db.get(PlatformSettings, _SINGLETON_ID) or PlatformSettings()
     logo_sha: str | None = (
         await db.execute(
             select(BrandingAsset.sha256).where(BrandingAsset.kind == BRANDING_ASSET_KIND_LOGO)
@@ -3127,19 +3135,19 @@ async def get_public_settings(db: DB) -> PublicSettingsResponse:
     ).scalar_one_or_none()
 
     return PublicSettingsResponse(
-        app_title=(getattr(settings, "app_title", "") or "SpatiumDDI"),
+        app_title=settings.app_title or "SpatiumDDI",
         login_banner=PublicLoginBanner(
-            enabled=bool(getattr(settings, "login_banner_enabled", False)),
-            title=str(getattr(settings, "login_banner_title", "") or ""),
-            text=str(getattr(settings, "login_banner_text", "") or ""),
-            require_ack=bool(getattr(settings, "login_banner_require_ack", False)),
+            enabled=bool(settings.login_banner_enabled),
+            title=settings.login_banner_title or "",
+            text=settings.login_banner_text or "",
+            require_ack=bool(settings.login_banner_require_ack),
         ),
         env_banner=PublicEnvBanner(
-            enabled=bool(getattr(settings, "env_banner_enabled", False)),
-            text=str(getattr(settings, "env_banner_text", "") or ""),
-            bg=str(getattr(settings, "env_banner_bg", "") or "#b91c1c"),
-            fg=str(getattr(settings, "env_banner_fg", "") or "#ffffff"),
-            position=str(getattr(settings, "env_banner_position", "") or "top"),
+            enabled=bool(settings.env_banner_enabled),
+            text=settings.env_banner_text or "",
+            bg=settings.env_banner_bg or "#b91c1c",
+            fg=settings.env_banner_fg or "#ffffff",
+            position=settings.env_banner_position or "top",
         ),
         logo_sha256=logo_sha,
     )
@@ -3221,18 +3229,31 @@ async def upload_branding_logo(
         )
 
     digest = hashlib.sha256(content).hexdigest()
-    row = (
-        await db.execute(
-            select(BrandingAsset).where(BrandingAsset.kind == BRANDING_ASSET_KIND_LOGO)
+    # Upsert rather than read-then-insert: ``kind`` is UNIQUE, so two
+    # concurrent uploads would both see no row, both INSERT, and the loser
+    # would 500 on uq_branding_asset_kind. ON CONFLICT makes last-write-wins
+    # explicit instead.
+    await db.execute(
+        pg_insert(BrandingAsset)
+        .values(
+            id=uuid.uuid4(),
+            kind=BRANDING_ASSET_KIND_LOGO,
+            content=content,
+            media_type=BRANDING_ASSET_MEDIA_TYPE,
+            sha256=digest,
+            byte_size=len(content),
         )
-    ).scalar_one_or_none()
-    if row is None:
-        row = BrandingAsset(kind=BRANDING_ASSET_KIND_LOGO)
-        db.add(row)
-    row.content = content
-    row.media_type = BRANDING_ASSET_MEDIA_TYPE
-    row.sha256 = digest
-    row.byte_size = len(content)
+        .on_conflict_do_update(
+            constraint="uq_branding_asset_kind",
+            set_={
+                "content": content,
+                "media_type": BRANDING_ASSET_MEDIA_TYPE,
+                "sha256": digest,
+                "byte_size": len(content),
+                "modified_at": func.now(),
+            },
+        )
+    )
 
     db.add(
         AuditLog(

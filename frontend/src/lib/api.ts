@@ -3903,9 +3903,12 @@ export interface AuditForwardTargetWrite {
 export const publicSettingsApi = {
   get: () => api.get<PublicSettings>("/settings/public").then((r) => r.data),
   /** Direct URL — the browser fetches the bytes itself, so no auth header
-   *  is available; the route is public for exactly that reason. The sha
-   *  busts the cache when the operator uploads a replacement. */
-  logoUrl: (sha256: string) => `/api/v1/settings/public/logo?v=${sha256}`,
+   *  is available; the route is public for exactly that reason. Built from
+   *  ``API_BASE`` rather than a hardcoded ``/api/v1`` so a deployment that
+   *  overrides ``VITE_API_BASE_URL`` (split-origin / sub-path) still points
+   *  at the real API. The sha busts the cache on re-upload. */
+  logoUrl: (sha256: string) =>
+    `${API_BASE.replace(/\/$/, "")}/settings/public/logo?v=${sha256}`,
 };
 
 export const settingsApi = {

@@ -1062,7 +1062,6 @@ class PlatformSettings(Base):
 # Deliberately NOT columns on PlatformSettings: that row is read on many
 # request paths, and no one should pay for a blob on every settings load.
 BRANDING_ASSET_KIND_LOGO = "logo"
-BRANDING_ASSET_KINDS = (BRANDING_ASSET_KIND_LOGO,)
 
 # PNG only, and small. SVG is deliberately excluded: it is served
 # same-origin, and an SVG is a script-execution vector unless sanitised.

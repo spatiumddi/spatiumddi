@@ -43,6 +43,10 @@ export function usePublicSettings() {
     queryFn: publicSettingsApi.get,
     staleTime: 5 * 60 * 1000,
     refetchOnWindowFocus: false,
+    // One retry, not the default three. ``settled`` below gates the
+    // sign-in button, so the exponential-backoff window is time a user
+    // spends unable to log in when this endpoint is unhealthy — cap it.
+    retry: 1,
   });
 
   return {
@@ -50,6 +54,12 @@ export function usePublicSettings() {
     /** True once real values have arrived. Gate anything that would look
      *  wrong flashing the default first (the login banner, notably). */
     ready: !!query.data,
+    /** True once the query has stopped being unknown — success OR final
+     *  error. Use this, not ``ready``, to gate an ACTION (the sign-in
+     *  button): ``ready`` never flips on a failing endpoint, so gating a
+     *  control on it would lock users out rather than merely showing the
+     *  defaults. */
+    settled: query.isSuccess || query.isError,
     isLoading: query.isLoading,
   };
 }

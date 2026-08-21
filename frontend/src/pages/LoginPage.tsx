@@ -95,7 +95,7 @@ export function LoginPage() {
 
   // Branding (#885 / #886 / #887 / #888) — served unauthenticated so it can
   // render here, before any session exists.
-  const { settings } = usePublicSettings();
+  const { settings, settled: brandingSettled } = usePublicSettings();
   const appTitle = settings.app_title.trim() || DEFAULT_APP_TITLE;
   const loginBanner = settings.login_banner;
   const bannerText = loginBanner.text.trim();
@@ -106,7 +106,12 @@ export function LoginPage() {
   // The API never sees it, and deliberately so — a client-side checkbox
   // would be security theatre if we pretended otherwise.
   const ackRequired = showBanner && loginBanner.require_ack;
-  const ackSatisfied = !ackRequired || acknowledged;
+  // Hold the sign-in affordances until the branding payload has settled.
+  // Until then the fallback says "no banner", so an autofilled form
+  // submitted on the first keypress would skip a notice the operator
+  // configured as mandatory. Gated on ``settled`` rather than ``ready``
+  // deliberately: a failing /settings/public must still let people log in.
+  const ackSatisfied = brandingSettled && (!ackRequired || acknowledged);
 
   useEffect(() => {
     authApi
