@@ -1,6 +1,7 @@
 import { Routes, Route, Navigate } from "react-router-dom";
 
 import { AppLayout } from "@/components/layout/AppLayout";
+import { useBrandDocumentTitle } from "@/hooks/usePublicSettings";
 import { LoginPage } from "@/pages/LoginPage";
 import { LoginCallbackPage } from "@/pages/LoginCallbackPage";
 import { ChangePasswordPage } from "@/pages/ChangePasswordPage";
@@ -107,6 +108,9 @@ function ProtectedRoute({ children }: { children: React.ReactNode }) {
 }
 
 export default function App() {
+  // Issue #888 — keep the browser tab on the operator's configured title.
+  useBrandDocumentTitle();
+
   return (
     <Routes>
       <Route path="/login" element={<LoginPage />} />

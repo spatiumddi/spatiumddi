@@ -22,8 +22,43 @@ import { Modal } from "@/components/ui/modal";
 import { Toggle } from "@/components/ui/toggle";
 import { AuditForwardTargets } from "@/components/AuditForwardTargets";
 import { AgentBootstrapKeysSection } from "@/components/AgentBootstrapKeysSection";
+import { BrandLogo } from "@/components/BrandLogo";
+import { usePublicSettings } from "@/hooks/usePublicSettings";
 
 const OUI_SOURCE_URL = "https://standards-oui.ieee.org/oui/oui.csv";
+
+/** One-click colour pairs for the environment banner (#887). These are the
+ *  four environments people actually label, in the colours they expect. */
+const ENV_BANNER_PRESETS: {
+  label: string;
+  bg: string;
+  fg: string;
+}[] = [
+  { label: "Dev", bg: "#b91c1c", fg: "#ffffff" },
+  { label: "Test", bg: "#b45309", fg: "#ffffff" },
+  { label: "Staging", bg: "#6d28d9", fg: "#ffffff" },
+  { label: "Prod", bg: "#15803d", fg: "#ffffff" },
+];
+
+/** WCAG 2.x relative luminance → contrast ratio, so the UI can warn before
+ *  an operator ships a banner nobody can read. Not a hard block: some
+ *  houses have brand colours that fail and still want them. */
+function contrastRatio(a: string, b: string): number {
+  const luminance = (hex: string): number => {
+    const m = /^#([0-9a-fA-F]{6})$/.exec(hex.trim());
+    if (!m) return 0;
+    const n = parseInt(m[1], 16);
+    const channels = [(n >> 16) & 255, (n >> 8) & 255, n & 255].map((v) => {
+      const c = v / 255;
+      return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+    });
+    return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2];
+  };
+  const la = luminance(a);
+  const lb = luminance(b);
+  const [hi, lo] = la > lb ? [la, lb] : [lb, la];
+  return (hi + 0.05) / (lo + 0.05);
+}
 
 function Field({
   label,
@@ -105,7 +140,19 @@ const GROUP_ORDER: SectionGroup[] = [
 // Which PlatformSettings keys each section owns — drives the per-section
 // "Reset to defaults" button so it only overwrites that section's fields.
 const SECTION_FIELDS: Record<SectionId, (keyof PlatformSettings)[]> = {
-  branding: ["app_title", "app_base_url"],
+  branding: [
+    "app_title",
+    "app_base_url",
+    "login_banner_enabled",
+    "login_banner_title",
+    "login_banner_text",
+    "login_banner_require_ack",
+    "env_banner_enabled",
+    "env_banner_text",
+    "env_banner_bg",
+    "env_banner_fg",
+    "env_banner_position",
+  ],
   dns: [
     "dns_default_ttl",
     "dns_default_zone_type",
@@ -1012,9 +1059,38 @@ export function SettingsPage() {
     mutationFn: (patch: Partial<PlatformSettings>) => settingsApi.update(patch),
     onSuccess: (updated) => {
       qc.setQueryData(["settings"], updated);
+      // Branding fields are also served from the unauthenticated
+      // /settings/public payload the app shell reads (#885–#888). Without
+      // this the operator would save a banner and not see it until that
+      // query's 5-minute TTL expired.
+      qc.invalidateQueries({ queryKey: ["public-settings"] });
       setForm({});
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
+    },
+  });
+
+  // Issue #886 — branding logo. Independent of the settings form: the
+  // bytes go to their own multipart endpoint, not into the PUT patch.
+  const { settings: publicSettings } = usePublicSettings();
+  const [logoError, setLogoError] = useState("");
+  const logoUpload = useMutation({
+    mutationFn: (file: File) => settingsApi.uploadLogo(file),
+    onSuccess: () => {
+      setLogoError("");
+      qc.invalidateQueries({ queryKey: ["public-settings"] });
+    },
+    onError: (err: unknown) => {
+      const detail = (err as { response?: { data?: { detail?: string } } })
+        ?.response?.data?.detail;
+      setLogoError(typeof detail === "string" ? detail : "Logo upload failed.");
+    },
+  });
+  const logoDelete = useMutation({
+    mutationFn: () => settingsApi.deleteLogo(),
+    onSuccess: () => {
+      setLogoError("");
+      qc.invalidateQueries({ queryKey: ["public-settings"] });
     },
   });
 
@@ -1248,6 +1324,198 @@ export function SettingsPage() {
                     disabled={!isSuperadmin}
                     className={cn(inputCls, "w-72")}
                   />
+                </Field>
+
+                {/* ── Logo (#886) ──────────────────────────────────── */}
+                <Field
+                  label="Logo"
+                  description="PNG, 512 KB maximum. Shown on the sign-in screen and in the sidebar. Stored in the database, so it reaches every node without a shared volume."
+                >
+                  <div className="flex items-center gap-3">
+                    <BrandLogo className="h-8 w-8" />
+                    <input
+                      type="file"
+                      accept="image/png"
+                      disabled={!isSuperadmin || logoUpload.isPending}
+                      onChange={(e) => {
+                        const file = e.target.files?.[0];
+                        // Reset the input so re-picking the same file
+                        // after a failed upload still fires onChange.
+                        e.target.value = "";
+                        if (file) logoUpload.mutate(file);
+                      }}
+                      className="max-w-[14rem] text-xs file:mr-2 file:rounded-md file:border file:bg-background file:px-2 file:py-1 file:text-xs"
+                    />
+                    {publicSettings.logo_sha256 && (
+                      <button
+                        type="button"
+                        onClick={() => logoDelete.mutate()}
+                        disabled={!isSuperadmin || logoDelete.isPending}
+                        className="rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:opacity-40"
+                      >
+                        Remove
+                      </button>
+                    )}
+                  </div>
+                </Field>
+                {logoError && (
+                  <div className="py-2 text-xs text-destructive">
+                    {logoError}
+                  </div>
+                )}
+
+                {/* ── Login banner (#885) ──────────────────────────── */}
+                <Field
+                  label="Login banner"
+                  description="Show an acceptable-use / consent notice above the sign-in form. This text is served unauthenticated — anyone who can reach the login page can read it."
+                >
+                  <Toggle
+                    checked={!!values.login_banner_enabled}
+                    onChange={(v) => set("login_banner_enabled", v)}
+                    disabled={!isSuperadmin}
+                  />
+                </Field>
+                <Field
+                  label="Banner heading"
+                  description="Optional short heading, e.g. NOTICE."
+                >
+                  <input
+                    value={values.login_banner_title ?? ""}
+                    onChange={(e) => set("login_banner_title", e.target.value)}
+                    placeholder="NOTICE"
+                    maxLength={120}
+                    disabled={!isSuperadmin || !values.login_banner_enabled}
+                    className={cn(inputCls, "w-48")}
+                  />
+                </Field>
+                <Field
+                  label="Banner text"
+                  description="Plain text; line breaks are preserved."
+                >
+                  <textarea
+                    value={values.login_banner_text ?? ""}
+                    onChange={(e) => set("login_banner_text", e.target.value)}
+                    rows={4}
+                    maxLength={8000}
+                    disabled={!isSuperadmin || !values.login_banner_enabled}
+                    className={cn(inputCls, "w-72 font-mono text-xs")}
+                  />
+                </Field>
+                <Field
+                  label="Require acknowledgement"
+                  description="Gate the sign-in button on an “I acknowledge” checkbox. A consent affordance, not an access control — the API never sees the acknowledgement."
+                >
+                  <Toggle
+                    checked={!!values.login_banner_require_ack}
+                    onChange={(v) => set("login_banner_require_ack", v)}
+                    disabled={!isSuperadmin || !values.login_banner_enabled}
+                  />
+                </Field>
+
+                {/* ── Environment banner (#887) ────────────────────── */}
+                <Field
+                  label="Environment banner"
+                  description="A coloured strip on every screen naming this environment — the cheap way to stop a change landing on the wrong box."
+                >
+                  <Toggle
+                    checked={!!values.env_banner_enabled}
+                    onChange={(v) => set("env_banner_enabled", v)}
+                    disabled={!isSuperadmin}
+                  />
+                </Field>
+                <Field label="Banner text">
+                  <input
+                    value={values.env_banner_text ?? ""}
+                    onChange={(e) => set("env_banner_text", e.target.value)}
+                    placeholder="DEVELOPMENT — not production"
+                    maxLength={200}
+                    disabled={!isSuperadmin || !values.env_banner_enabled}
+                    className={cn(inputCls, "w-72")}
+                  />
+                </Field>
+                <Field
+                  label="Position"
+                  description="“Both” frames the page top and bottom."
+                >
+                  <select
+                    value={values.env_banner_position ?? "top"}
+                    onChange={(e) =>
+                      set(
+                        "env_banner_position",
+                        e.target
+                          .value as PlatformSettings["env_banner_position"],
+                      )
+                    }
+                    disabled={!isSuperadmin || !values.env_banner_enabled}
+                    className={inputCls}
+                  >
+                    <option value="top">Top</option>
+                    <option value="bottom">Bottom</option>
+                    <option value="both">Both</option>
+                  </select>
+                </Field>
+                <Field
+                  label="Colours"
+                  description="Background and text colour for the strip."
+                >
+                  <div className="flex flex-col items-end gap-2">
+                    <div className="flex items-center gap-2">
+                      {ENV_BANNER_PRESETS.map((p) => (
+                        <button
+                          key={p.label}
+                          type="button"
+                          onClick={() => {
+                            set("env_banner_bg", p.bg);
+                            set("env_banner_fg", p.fg);
+                          }}
+                          disabled={!isSuperadmin || !values.env_banner_enabled}
+                          style={{ backgroundColor: p.bg, color: p.fg }}
+                          className="rounded-md px-2 py-1 text-xs font-semibold disabled:opacity-40"
+                        >
+                          {p.label}
+                        </button>
+                      ))}
+                    </div>
+                    <div className="flex items-center gap-2 text-xs">
+                      <label className="flex items-center gap-1">
+                        <span className="text-muted-foreground">Bg</span>
+                        <input
+                          type="color"
+                          value={values.env_banner_bg ?? "#b91c1c"}
+                          onChange={(e) => set("env_banner_bg", e.target.value)}
+                          disabled={!isSuperadmin || !values.env_banner_enabled}
+                          className="h-7 w-10 rounded border bg-background"
+                        />
+                      </label>
+                      <label className="flex items-center gap-1">
+                        <span className="text-muted-foreground">Text</span>
+                        <input
+                          type="color"
+                          value={values.env_banner_fg ?? "#ffffff"}
+                          onChange={(e) => set("env_banner_fg", e.target.value)}
+                          disabled={!isSuperadmin || !values.env_banner_enabled}
+                          className="h-7 w-10 rounded border bg-background"
+                        />
+                      </label>
+                    </div>
+                    <div
+                      className="w-72 rounded-md px-3 py-1 text-center text-xs font-semibold"
+                      style={{
+                        backgroundColor: values.env_banner_bg ?? "#b91c1c",
+                        color: values.env_banner_fg ?? "#ffffff",
+                      }}
+                    >
+                      {values.env_banner_text?.trim() || "Preview"}
+                    </div>
+                    {contrastRatio(
+                      values.env_banner_bg ?? "#b91c1c",
+                      values.env_banner_fg ?? "#ffffff",
+                    ) < 4.5 && (
+                      <div className="text-xs text-amber-600 dark:text-amber-400">
+                        Low contrast — this may be hard to read.
+                      </div>
+                    )}
+                  </div>
                 </Field>
               </>
             )}

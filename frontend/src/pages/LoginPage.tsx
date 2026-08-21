@@ -4,6 +4,13 @@ import { useAuth } from "@/hooks/useAuth";
 import { authApi, type PublicAuthProvider } from "@/lib/api";
 import { KeyRound, ShieldCheck } from "lucide-react";
 
+import { BrandLogo } from "@/components/BrandLogo";
+import { EnvironmentBanner } from "@/components/layout/EnvironmentBanner";
+import {
+  usePublicSettings,
+  DEFAULT_APP_TITLE,
+} from "@/hooks/usePublicSettings";
+
 function humanizeError(code: string | null): string {
   if (!code) return "";
   if (code === "oidc_rejected")
@@ -86,6 +93,21 @@ export function LoginPage() {
   const [mfaCode, setMfaCode] = useState("");
   const [recoveryCode, setRecoveryCode] = useState("");
 
+  // Branding (#885 / #886 / #887 / #888) — served unauthenticated so it can
+  // render here, before any session exists.
+  const { settings } = usePublicSettings();
+  const appTitle = settings.app_title.trim() || DEFAULT_APP_TITLE;
+  const loginBanner = settings.login_banner;
+  const bannerText = loginBanner.text.trim();
+  const showBanner = loginBanner.enabled && !!bannerText;
+  const [acknowledged, setAcknowledged] = useState(false);
+  // The acknowledgement gate is a consent affordance, not an auth control:
+  // it exists so the operator can say the notice was displayed and accepted.
+  // The API never sees it, and deliberately so — a client-side checkbox
+  // would be security theatre if we pretended otherwise.
+  const ackRequired = showBanner && loginBanner.require_ack;
+  const ackSatisfied = !ackRequired || acknowledged;
+
   useEffect(() => {
     authApi
       .publicProviders()
@@ -165,186 +187,235 @@ export function LoginPage() {
   }
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-background">
-      <div className="w-full max-w-sm space-y-6 rounded-lg border bg-card p-8 shadow-sm">
-        <div className="space-y-1 text-center">
-          <h1 className="text-2xl font-bold tracking-tight">SpatiumDDI</h1>
-          <p className="text-sm text-muted-foreground">
-            {step.kind === "mfa"
-              ? "Two-factor verification"
-              : "Sign in to your account"}
-          </p>
-        </div>
-
-        {error && (
-          <div className="flex items-start justify-between gap-2 rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
-            <span>{error}</span>
-            <button
-              onClick={dismissErrorBanner}
-              className="font-semibold hover:underline"
-              type="button"
-            >
-              ×
-            </button>
-          </div>
-        )}
-
-        {step.kind === "password" ? (
-          <form onSubmit={handlePasswordSubmit} className="space-y-4">
-            <div className="space-y-2">
-              <label htmlFor="username" className="text-sm font-medium">
-                Username
-              </label>
-              <input
-                id="username"
-                type="text"
-                autoComplete="username"
-                required
-                value={username}
-                onChange={(e) => setUsername(e.target.value)}
-                className="w-full rounded-md border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-              />
-            </div>
-            <div className="space-y-2">
-              <label htmlFor="password" className="text-sm font-medium">
-                Password
-              </label>
-              <input
-                id="password"
-                type="password"
-                autoComplete="current-password"
-                required
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                className="w-full rounded-md border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-              />
-            </div>
-            <button
-              type="submit"
-              disabled={loading}
-              className="w-full rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
-            >
-              {loading ? "Signing in…" : "Sign in"}
-            </button>
-          </form>
-        ) : (
-          <form onSubmit={handleMfaSubmit} className="space-y-4">
-            <p className="text-xs text-muted-foreground">
-              {mfaMode === "code"
-                ? "Enter the 6-digit code from your authenticator app."
-                : "Enter one of your recovery codes (e.g. ABCD-EF12). Each code works once."}
+    <div className="flex min-h-screen flex-col bg-background">
+      {/* Which environment this is matters most at the sign-in prompt —
+          it is the last point before someone starts making changes. */}
+      <EnvironmentBanner edge="top" />
+      <div className="flex flex-1 items-center justify-center p-4">
+        <div className="w-full max-w-sm space-y-6 rounded-lg border bg-card p-8 shadow-sm">
+          <div className="space-y-2 text-center">
+            <BrandLogo className="mx-auto h-10 w-10" />
+            <h1 className="text-2xl font-bold tracking-tight">{appTitle}</h1>
+            <p className="text-sm text-muted-foreground">
+              {step.kind === "mfa"
+                ? "Two-factor verification"
+                : "Sign in to your account"}
             </p>
-            {mfaMode === "code" ? (
-              <div className="space-y-2">
-                <label htmlFor="mfa-code" className="text-sm font-medium">
-                  Authenticator code
-                </label>
-                <input
-                  id="mfa-code"
-                  type="text"
-                  inputMode="numeric"
-                  pattern="[0-9]*"
-                  autoComplete="one-time-code"
-                  required
-                  autoFocus
-                  value={mfaCode}
-                  onChange={(e) =>
-                    setMfaCode(e.target.value.replace(/\D/g, "").slice(0, 6))
-                  }
-                  className="w-full rounded-md border bg-background px-3 py-2 text-center font-mono text-lg tracking-[0.3em] focus:outline-none focus:ring-2 focus:ring-ring"
-                  placeholder="000000"
-                  maxLength={6}
-                />
-              </div>
-            ) : (
-              <div className="space-y-2">
-                <label htmlFor="recovery-code" className="text-sm font-medium">
-                  Recovery code
-                </label>
-                <input
-                  id="recovery-code"
-                  type="text"
-                  autoComplete="off"
-                  required
-                  autoFocus
-                  value={recoveryCode}
-                  onChange={(e) =>
-                    setRecoveryCode(e.target.value.toUpperCase())
-                  }
-                  className="w-full rounded-md border bg-background px-3 py-2 text-center font-mono text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-                  placeholder="ABCD-EF12"
-                />
-              </div>
-            )}
-            <button
-              type="submit"
-              disabled={
-                loading ||
-                (mfaMode === "code"
-                  ? mfaCode.length !== 6
-                  : recoveryCode.trim().length === 0)
-              }
-              className="w-full rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
-            >
-              {loading ? "Verifying…" : "Verify"}
-            </button>
-            <div className="flex items-center justify-between text-xs">
-              <button
-                type="button"
-                onClick={() => {
-                  setMfaMode((m) => (m === "code" ? "recovery" : "code"));
-                  setError("");
-                }}
-                className="text-muted-foreground hover:text-foreground hover:underline"
-              >
-                {mfaMode === "code"
-                  ? "Use a recovery code instead"
-                  : "Use my authenticator code"}
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setStep({ kind: "password" });
-                  setError("");
-                  setPassword("");
-                }}
-                className="text-muted-foreground hover:text-foreground hover:underline"
-              >
-                Sign out
-              </button>
-            </div>
-          </form>
-        )}
+          </div>
 
-        {step.kind === "password" && providers.length > 0 && (
-          <>
-            <div className="relative">
-              <div className="absolute inset-0 flex items-center">
-                <div className="w-full border-t" />
-              </div>
-              <div className="relative flex justify-center text-xs uppercase">
-                <span className="bg-card px-2 text-muted-foreground">or</span>
-              </div>
+          {showBanner && (
+            <div className="max-h-64 overflow-y-auto rounded-md border bg-muted/40 px-3 py-2 text-xs">
+              {loginBanner.title.trim() && (
+                <div className="mb-1 font-semibold uppercase tracking-wide">
+                  {loginBanner.title.trim()}
+                </div>
+              )}
+              {/* Rendered as plain text with newlines preserved — the field
+                  is operator-authored but shown to anonymous visitors, so it
+                  never becomes markup. */}
+              <p className="whitespace-pre-wrap text-muted-foreground">
+                {bannerText}
+              </p>
+              {ackRequired && (
+                <label className="mt-2 flex items-start gap-2 font-medium text-foreground">
+                  <input
+                    type="checkbox"
+                    checked={acknowledged}
+                    onChange={(e) => setAcknowledged(e.target.checked)}
+                    className="mt-0.5"
+                  />
+                  <span>I acknowledge and accept these terms</span>
+                </label>
+              )}
             </div>
-            <div className="space-y-2">
-              {providers.map((p) => (
-                <a
-                  key={p.id}
-                  href={`/api/v1/auth/${p.id}/authorize`}
-                  className="flex w-full items-center justify-center gap-2 rounded-md border bg-background px-4 py-2 text-sm font-medium transition-colors hover:bg-accent"
+          )}
+
+          {error && (
+            <div className="flex items-start justify-between gap-2 rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+              <span>{error}</span>
+              <button
+                onClick={dismissErrorBanner}
+                className="font-semibold hover:underline"
+                type="button"
+              >
+                ×
+              </button>
+            </div>
+          )}
+
+          {step.kind === "password" ? (
+            <form onSubmit={handlePasswordSubmit} className="space-y-4">
+              <div className="space-y-2">
+                <label htmlFor="username" className="text-sm font-medium">
+                  Username
+                </label>
+                <input
+                  id="username"
+                  type="text"
+                  autoComplete="username"
+                  required
+                  value={username}
+                  onChange={(e) => setUsername(e.target.value)}
+                  className="w-full rounded-md border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+                />
+              </div>
+              <div className="space-y-2">
+                <label htmlFor="password" className="text-sm font-medium">
+                  Password
+                </label>
+                <input
+                  id="password"
+                  type="password"
+                  autoComplete="current-password"
+                  required
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  className="w-full rounded-md border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+                />
+              </div>
+              <button
+                type="submit"
+                disabled={loading || !ackSatisfied}
+                className="w-full rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+              >
+                {loading ? "Signing in…" : "Sign in"}
+              </button>
+            </form>
+          ) : (
+            <form onSubmit={handleMfaSubmit} className="space-y-4">
+              <p className="text-xs text-muted-foreground">
+                {mfaMode === "code"
+                  ? "Enter the 6-digit code from your authenticator app."
+                  : "Enter one of your recovery codes (e.g. ABCD-EF12). Each code works once."}
+              </p>
+              {mfaMode === "code" ? (
+                <div className="space-y-2">
+                  <label htmlFor="mfa-code" className="text-sm font-medium">
+                    Authenticator code
+                  </label>
+                  <input
+                    id="mfa-code"
+                    type="text"
+                    inputMode="numeric"
+                    pattern="[0-9]*"
+                    autoComplete="one-time-code"
+                    required
+                    autoFocus
+                    value={mfaCode}
+                    onChange={(e) =>
+                      setMfaCode(e.target.value.replace(/\D/g, "").slice(0, 6))
+                    }
+                    className="w-full rounded-md border bg-background px-3 py-2 text-center font-mono text-lg tracking-[0.3em] focus:outline-none focus:ring-2 focus:ring-ring"
+                    placeholder="000000"
+                    maxLength={6}
+                  />
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  <label
+                    htmlFor="recovery-code"
+                    className="text-sm font-medium"
+                  >
+                    Recovery code
+                  </label>
+                  <input
+                    id="recovery-code"
+                    type="text"
+                    autoComplete="off"
+                    required
+                    autoFocus
+                    value={recoveryCode}
+                    onChange={(e) =>
+                      setRecoveryCode(e.target.value.toUpperCase())
+                    }
+                    className="w-full rounded-md border bg-background px-3 py-2 text-center font-mono text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+                    placeholder="ABCD-EF12"
+                  />
+                </div>
+              )}
+              <button
+                type="submit"
+                disabled={
+                  loading ||
+                  (mfaMode === "code"
+                    ? mfaCode.length !== 6
+                    : recoveryCode.trim().length === 0)
+                }
+                className="w-full rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+              >
+                {loading ? "Verifying…" : "Verify"}
+              </button>
+              <div className="flex items-center justify-between text-xs">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setMfaMode((m) => (m === "code" ? "recovery" : "code"));
+                    setError("");
+                  }}
+                  className="text-muted-foreground hover:text-foreground hover:underline"
                 >
-                  {p.type === "oidc" ? (
-                    <KeyRound className="h-4 w-4" />
-                  ) : (
-                    <ShieldCheck className="h-4 w-4" />
-                  )}
-                  Sign in with {p.name}
-                </a>
-              ))}
-            </div>
-          </>
-        )}
+                  {mfaMode === "code"
+                    ? "Use a recovery code instead"
+                    : "Use my authenticator code"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setStep({ kind: "password" });
+                    setError("");
+                    setPassword("");
+                  }}
+                  className="text-muted-foreground hover:text-foreground hover:underline"
+                >
+                  Sign out
+                </button>
+              </div>
+            </form>
+          )}
+
+          {step.kind === "password" && providers.length > 0 && (
+            <>
+              <div className="relative">
+                <div className="absolute inset-0 flex items-center">
+                  <div className="w-full border-t" />
+                </div>
+                <div className="relative flex justify-center text-xs uppercase">
+                  <span className="bg-card px-2 text-muted-foreground">or</span>
+                </div>
+              </div>
+              <div className="space-y-2">
+                {providers.map((p) => (
+                  <a
+                    key={p.id}
+                    // The SSO buttons honour the acknowledgement gate too —
+                    // otherwise the notice is trivially skipped by signing in
+                    // through the identity provider instead.
+                    href={
+                      ackSatisfied
+                        ? `/api/v1/auth/${p.id}/authorize`
+                        : undefined
+                    }
+                    aria-disabled={!ackSatisfied}
+                    className={
+                      ackSatisfied
+                        ? "flex w-full items-center justify-center gap-2 rounded-md border bg-background px-4 py-2 text-sm font-medium transition-colors hover:bg-accent"
+                        : "pointer-events-none flex w-full items-center justify-center gap-2 rounded-md border bg-background px-4 py-2 text-sm font-medium opacity-50"
+                    }
+                  >
+                    {p.type === "oidc" ? (
+                      <KeyRound className="h-4 w-4" />
+                    ) : (
+                      <ShieldCheck className="h-4 w-4" />
+                    )}
+                    Sign in with {p.name}
+                  </a>
+                ))}
+              </div>
+            </>
+          )}
+        </div>
       </div>
+      <EnvironmentBanner edge="bottom" />
     </div>
   );
 }

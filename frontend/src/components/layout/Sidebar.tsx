@@ -77,7 +77,11 @@ import { cn } from "@/lib/utils";
 import { changeRequestsApi, versionApi } from "@/lib/api";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { useSessionState } from "@/lib/useSessionState";
-import logoIcon from "@/assets/logo-icon.svg";
+import { BrandLogo } from "@/components/BrandLogo";
+import {
+  usePublicSettings,
+  DEFAULT_APP_TITLE,
+} from "@/hooks/usePublicSettings";
 
 // Core section. The flat list had grown to 11 rows — the four canonical
 // anchors (Dashboard / IPAM / DHCP / DNS) plus seven grown-in sub-features
@@ -597,6 +601,11 @@ export function Sidebar({
   );
   const location = useLocation();
 
+  // Operator-configured product name (#888) — the wordmark used to be a
+  // hard-coded literal here, which is why setting a title changed nothing.
+  const { settings } = usePublicSettings();
+  const appTitle = settings.app_title.trim() || DEFAULT_APP_TITLE;
+
   // Close the mobile drawer whenever the user navigates.
   useEffect(() => {
     if (mobileOpen) onMobileClose?.();
@@ -739,13 +748,11 @@ export function Sidebar({
             effectiveCollapsed ? "justify-center px-0" : "gap-2 px-4",
           )}
         >
-          <img
-            src={logoIcon}
-            alt="SpatiumDDI"
-            className="h-7 w-7 flex-shrink-0"
-          />
+          <BrandLogo className="h-7 w-7 flex-shrink-0" />
           {!effectiveCollapsed && (
-            <span className="font-semibold tracking-tight">SpatiumDDI</span>
+            <span className="truncate font-semibold tracking-tight">
+              {appTitle}
+            </span>
           )}
           {mobileOpen && (
             <button

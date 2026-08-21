@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 import uuid
 from datetime import UTC, datetime
@@ -9,18 +10,26 @@ from ipaddress import ip_network
 from typing import Any, Literal
 
 import structlog
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, File, Header, HTTPException, Response, UploadFile, status
 from pydantic import BaseModel, field_validator, model_validator
 from sqlalchemy import func, select
 
 from app.api.deps import DB, CurrentUser
 from app.core.agent_wake import HOSTCONFIG_ALL, publish_wake
 from app.core.demo_mode import forbid_in_demo_mode
+from app.core.http_etag import etag_matches, format_etag
 from app.core.permissions import is_effective_superadmin, user_has_permission
 from app.models.audit import AuditLog
 from app.models.audit_forward import AuditForwardTarget
 from app.models.oui import OUIVendor
-from app.models.settings import PlatformSettings
+from app.models.settings import (
+    BRANDING_ASSET_KIND_LOGO,
+    BRANDING_ASSET_MAX_BYTES,
+    BRANDING_ASSET_MEDIA_TYPE,
+    PNG_MAGIC,
+    BrandingAsset,
+    PlatformSettings,
+)
 from app.services import audit_forward as audit_forward_svc
 from app.services.appliance.apt import render_sources_list
 from app.services.appliance.ssh import is_valid_public_key, validate_lockout_safe
@@ -72,6 +81,18 @@ _SINGLETON_ID = 1
 class SettingsResponse(BaseModel):
     app_title: str
     app_base_url: str
+    # ── Login banner (issue #885) / environment banner (issue #887) ──
+    # No secrets — every field here is also served unauthenticated from
+    # ``GET /settings/public`` so the login page can render it.
+    login_banner_enabled: bool = False
+    login_banner_title: str = ""
+    login_banner_text: str = ""
+    login_banner_require_ack: bool = False
+    env_banner_enabled: bool = False
+    env_banner_text: str = ""
+    env_banner_bg: str = "#b91c1c"
+    env_banner_fg: str = "#ffffff"
+    env_banner_position: str = "top"
     ip_allocation_strategy: str
     session_timeout_minutes: int
     auto_logout_minutes: int
@@ -785,6 +806,16 @@ def _merge_apt_auth(
 class SettingsUpdate(BaseModel):
     app_title: str | None = None
     app_base_url: str | None = None
+    # Login banner (#885) + environment banner (#887).
+    login_banner_enabled: bool | None = None
+    login_banner_title: str | None = None
+    login_banner_text: str | None = None
+    login_banner_require_ack: bool | None = None
+    env_banner_enabled: bool | None = None
+    env_banner_text: str | None = None
+    env_banner_bg: str | None = None
+    env_banner_fg: str | None = None
+    env_banner_position: Literal["top", "bottom", "both"] | None = None
     ip_allocation_strategy: str | None = None
     session_timeout_minutes: int | None = None
     auto_logout_minutes: int | None = None
@@ -1214,6 +1245,47 @@ class SettingsUpdate(BaseModel):
             ZoneInfo(v)
         except Exception as exc:  # noqa: BLE001 — surface the parse failure
             raise ValueError(f"timezone {v!r} is not a valid IANA tz name: {exc}") from exc
+        return v
+
+    @field_validator("env_banner_bg", "env_banner_fg")
+    @classmethod
+    def _valid_banner_colour(cls, v: str | None) -> str | None:
+        # The colour is written straight into an inline ``style`` on every
+        # page, so it has to be a literal we control the shape of — a
+        # 6-digit hex triple and nothing else. Anything looser (named
+        # colours, ``rgb()``, CSS functions) would be operator-supplied
+        # text landing in a style attribute.
+        if v is None:
+            return None
+        s = v.strip().lower()
+        if not re.fullmatch(r"#[0-9a-f]{6}", s):
+            raise ValueError("colour must be a 6-digit hex value such as #b91c1c")
+        return s
+
+    @field_validator("env_banner_text")
+    @classmethod
+    def _valid_env_banner_text(cls, v: str | None) -> str | None:
+        # Mirrors the column width (VARCHAR(200)).
+        if v is not None and len(v) > 200:
+            raise ValueError("env_banner_text must be 200 characters or fewer")
+        return v
+
+    @field_validator("login_banner_title")
+    @classmethod
+    def _valid_login_banner_title(cls, v: str | None) -> str | None:
+        # Mirrors the column width (VARCHAR(120)).
+        if v is not None and len(v) > 120:
+            raise ValueError("login_banner_title must be 120 characters or fewer")
+        return v
+
+    @field_validator("login_banner_text")
+    @classmethod
+    def _valid_login_banner_text(cls, v: str | None) -> str | None:
+        # The column is unbounded TEXT, but this renders in a fixed-width
+        # box above the sign-in form — cap it so a paste accident can't
+        # push the form off-screen for every user at once.
+        if v is not None and len(v) > 8000:
+            raise ValueError("login_banner_text must be 8000 characters or fewer")
         return v
 
     @field_validator("maintenance_message")
@@ -1681,6 +1753,21 @@ async def update_settings(
                 detail="resolver override mode requires at least one DNS server",
             )
 
+    # Branding is SUPERADMIN-ONLY (issues #885 / #887). These fields render
+    # on the unauthenticated login page, so a delegated ``write:settings``
+    # editor could otherwise put arbitrary text in front of every visitor —
+    # a phishing surface, not a preference. The Settings UI already gates
+    # the branding block on superadmin; this is the server-side half of
+    # that (non-negotiable #3).
+    _branding_fields = {
+        f for f in changes if f.startswith(("login_banner_", "env_banner_")) or f == "app_title"
+    }
+    if _branding_fields and not is_effective_superadmin(current_user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Branding can only be changed by a superadmin",
+        )
+
     # Maintenance mode is SUPERADMIN-ONLY (issue #57). Flipping it turns the
     # WHOLE platform read-only for everyone except superadmins — a delegated
     # ``write:settings`` editor must not be able to inflict a platform-wide
@@ -2132,6 +2219,34 @@ async def update_settings(
                 resource_display="Appliance registration",
                 result="success",
                 new_value={"enabled": _reg_now},
+            )
+        )
+
+    # Branding (#885 / #887 / #888) — what an anonymous visitor sees before
+    # they authenticate, so every change is on the record.
+    if _branding_fields:
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                action="update",
+                resource_type="platform_settings",
+                resource_id="branding",
+                resource_display="Branding",
+                result="success",
+                new_value={
+                    "app_title": str(settings.app_title or ""),
+                    "login_banner_enabled": bool(settings.login_banner_enabled),
+                    "login_banner_title": str(settings.login_banner_title or ""),
+                    "login_banner_text": str(settings.login_banner_text or ""),
+                    "login_banner_require_ack": bool(settings.login_banner_require_ack),
+                    "env_banner_enabled": bool(settings.env_banner_enabled),
+                    "env_banner_text": str(settings.env_banner_text or ""),
+                    "env_banner_bg": str(settings.env_banner_bg or ""),
+                    "env_banner_fg": str(settings.env_banner_fg or ""),
+                    "env_banner_position": str(settings.env_banner_position or "top"),
+                },
             )
         )
 
@@ -2956,3 +3071,222 @@ async def test_audit_target(
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"delivery failed: {exc}") from exc
     return {"status": "ok", "target": row.name}
+
+
+# ── Public branding surface (issues #885 / #886 / #887 / #888) ──────────────────
+#
+# These two routes are the only ones in this router with no ``CurrentUser``
+# dependency, and that is deliberate: the login page renders the banner,
+# the logo and the app title before anyone has a session. Nothing here may
+# ever carry a value an anonymous visitor shouldn't see, which is why the
+# response is an explicit whitelist rather than a filtered dump of the
+# settings row — a field added to PlatformSettings tomorrow cannot leak
+# through by default.
+
+
+class PublicLoginBanner(BaseModel):
+    enabled: bool
+    title: str
+    text: str
+    require_ack: bool
+
+
+class PublicEnvBanner(BaseModel):
+    enabled: bool
+    text: str
+    bg: str
+    fg: str
+    position: str
+
+
+class PublicSettingsResponse(BaseModel):
+    app_title: str
+    login_banner: PublicLoginBanner
+    env_banner: PublicEnvBanner
+    logo_sha256: str | None
+
+
+@router.get("/public", response_model=PublicSettingsResponse)
+async def get_public_settings(db: DB) -> PublicSettingsResponse:
+    """Branding for pre-authentication rendering.
+
+    Unauthenticated on purpose — the login screen needs the operator's
+    title, acceptable-use banner, environment strip and logo before a
+    session exists. Everything returned is operator-authored text intended
+    for exactly that audience.
+    """
+    # Both lookups tolerate absence: on a fresh install the singleton
+    # settings row is only created by the first write, and the logo is
+    # independent of it — a logo uploaded before anyone saves settings must
+    # still be served, so these two are queried separately.
+    settings = await db.get(PlatformSettings, _SINGLETON_ID)
+    logo_sha: str | None = (
+        await db.execute(
+            select(BrandingAsset.sha256).where(BrandingAsset.kind == BRANDING_ASSET_KIND_LOGO)
+        )
+    ).scalar_one_or_none()
+
+    return PublicSettingsResponse(
+        app_title=(getattr(settings, "app_title", "") or "SpatiumDDI"),
+        login_banner=PublicLoginBanner(
+            enabled=bool(getattr(settings, "login_banner_enabled", False)),
+            title=str(getattr(settings, "login_banner_title", "") or ""),
+            text=str(getattr(settings, "login_banner_text", "") or ""),
+            require_ack=bool(getattr(settings, "login_banner_require_ack", False)),
+        ),
+        env_banner=PublicEnvBanner(
+            enabled=bool(getattr(settings, "env_banner_enabled", False)),
+            text=str(getattr(settings, "env_banner_text", "") or ""),
+            bg=str(getattr(settings, "env_banner_bg", "") or "#b91c1c"),
+            fg=str(getattr(settings, "env_banner_fg", "") or "#ffffff"),
+            position=str(getattr(settings, "env_banner_position", "") or "top"),
+        ),
+        logo_sha256=logo_sha,
+    )
+
+
+@router.get("/public/logo", response_model=None)
+async def get_public_logo(db: DB, if_none_match: str | None = Header(default=None)) -> Response:
+    """Serve the operator-uploaded logo, or 404 so the frontend falls back
+    to the bundled asset.
+
+    Unauthenticated for the same reason as ``/public`` — the browser
+    fetches this straight from an ``img`` tag on the login page, where no
+    Authorization header is available.
+    """
+    row = (
+        await db.execute(
+            select(BrandingAsset).where(BrandingAsset.kind == BRANDING_ASSET_KIND_LOGO)
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No custom logo is configured")
+
+    if if_none_match and etag_matches(if_none_match, row.sha256):
+        return Response(status_code=304, headers={"ETag": format_etag(row.sha256)})
+
+    return Response(
+        content=row.content,
+        media_type=row.media_type,
+        headers={
+            "ETag": format_etag(row.sha256),
+            # The URL the frontend builds carries the sha as a query
+            # param, so a cached copy is only ever reused for identical
+            # bytes; a re-upload changes the URL and misses the cache.
+            "Cache-Control": "public, max-age=300",
+        },
+    )
+
+
+class BrandingLogoInfo(BaseModel):
+    sha256: str
+    byte_size: int
+    media_type: str
+
+
+@router.put("/branding/logo", response_model=BrandingLogoInfo)
+async def upload_branding_logo(
+    current_user: CurrentUser,
+    db: DB,
+    file: UploadFile = File(..., description="PNG image, 512 KB maximum."),
+) -> BrandingLogoInfo:
+    """Replace the branding logo (issue #886).
+
+    PNG only. SVG is deliberately refused: this is served same-origin, and
+    an SVG can carry script — accepting one would turn a branding upload
+    into stored XSS against every visitor, including unauthenticated ones.
+    """
+    forbid_in_demo_mode("Branding changes are disabled")
+    if not is_effective_superadmin(current_user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Branding can only be changed by a superadmin",
+        )
+
+    # Read with one byte of headroom so an oversized upload is detected
+    # rather than silently truncated to the limit.
+    content = await file.read(BRANDING_ASSET_MAX_BYTES + 1)
+    if len(content) > BRANDING_ASSET_MAX_BYTES:
+        raise HTTPException(
+            status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            f"Logo must be {BRANDING_ASSET_MAX_BYTES // 1024} KB or smaller",
+        )
+    if not content:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Uploaded file is empty")
+    # Trust the magic bytes, not the client-declared content type.
+    if not content.startswith(PNG_MAGIC):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Logo must be a PNG image (SVG and other formats are not accepted)",
+        )
+
+    digest = hashlib.sha256(content).hexdigest()
+    row = (
+        await db.execute(
+            select(BrandingAsset).where(BrandingAsset.kind == BRANDING_ASSET_KIND_LOGO)
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        row = BrandingAsset(kind=BRANDING_ASSET_KIND_LOGO)
+        db.add(row)
+    row.content = content
+    row.media_type = BRANDING_ASSET_MEDIA_TYPE
+    row.sha256 = digest
+    row.byte_size = len(content)
+
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="update",
+            resource_type="platform_settings",
+            resource_id="branding_logo",
+            resource_display="Branding logo",
+            result="success",
+            new_value={"sha256": digest, "byte_size": len(content)},
+        )
+    )
+    await db.commit()
+
+    logger.info("branding_logo_updated", user=current_user.username, sha256=digest)
+    return BrandingLogoInfo(
+        sha256=digest,
+        byte_size=len(content),
+        media_type=BRANDING_ASSET_MEDIA_TYPE,
+    )
+
+
+@router.delete("/branding/logo", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_branding_logo(current_user: CurrentUser, db: DB) -> Response:
+    """Drop the custom logo; the UI falls back to the bundled asset."""
+    forbid_in_demo_mode("Branding changes are disabled")
+    if not is_effective_superadmin(current_user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Branding can only be changed by a superadmin",
+        )
+
+    row = (
+        await db.execute(
+            select(BrandingAsset).where(BrandingAsset.kind == BRANDING_ASSET_KIND_LOGO)
+        )
+    ).scalar_one_or_none()
+    if row is not None:
+        await db.delete(row)
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                action="delete",
+                resource_type="platform_settings",
+                resource_id="branding_logo",
+                resource_display="Branding logo",
+                result="success",
+            )
+        )
+        await db.commit()
+        logger.info("branding_logo_deleted", user=current_user.username)
+
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

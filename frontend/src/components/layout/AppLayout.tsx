@@ -5,6 +5,7 @@ import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { Sidebar } from "./Sidebar";
 import { Header } from "./Header";
 import { DemoBanner } from "./DemoBanner";
+import { EnvironmentBanner } from "./EnvironmentBanner";
 import { MaintenanceBanner } from "./MaintenanceBanner";
 import { MaintenanceModeBanner } from "./MaintenanceModeBanner";
 import { SetupBanner } from "./SetupBanner";
@@ -36,6 +37,9 @@ export function AppLayout() {
         onMobileClose={() => setMobileOpen(false)}
       />
       <div className="flex flex-1 flex-col overflow-hidden">
+        {/* Which box am I on (#887) comes before what state it's in — the
+            other banners describe the platform, this one identifies it. */}
+        <EnvironmentBanner edge="top" />
         <DemoBanner />
         <SetupBanner />
         <MaintenanceBanner />
@@ -65,6 +69,7 @@ export function AppLayout() {
             <Outlet />
           </ErrorBoundary>
         </main>
+        <EnvironmentBanner edge="bottom" />
       </div>
       {/* Issue #90 — Operator Copilot floating button. Hidden when no
           AI provider is enabled, opens the chat drawer otherwise. */}
