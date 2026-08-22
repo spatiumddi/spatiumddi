@@ -75,6 +75,15 @@ describe("buildQrMatrix round-trips through a real decoder", () => {
     expect(decode(uri)).toBe(uri);
   });
 
+  it("decodes a non-ASCII payload as UTF-8, not truncated to latin1", () => {
+    // qrcode-generator's DEFAULT byte encoder is ``charCodeAt(i) & 0xff``,
+    // which mangles anything outside latin1 and reports no error — the exact
+    // silent corruption this file exists to catch. `qr.ts` installs a
+    // TextEncoder-backed one; without it this decodes to mojibake.
+    const value = "münchen.example — ✓";
+    expect(decode(value)).toBe(value);
+  });
+
   it("decodes the longest payload this feature can produce", () => {
     // A worst case: long hostname, non-default port, explicit http, a token
     // and a fingerprint. If the version bump this forces were mishandled the

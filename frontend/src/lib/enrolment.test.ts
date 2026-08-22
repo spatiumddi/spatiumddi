@@ -13,6 +13,7 @@ import {
   displayFingerprint,
   formatHost,
   isDefaultPort,
+  isValidPort,
   normaliseFingerprint,
 } from "./enrolment";
 
@@ -115,6 +116,22 @@ describe("buildEnrolmentUri", () => {
     });
     expect(uri).not.toContain("#");
     expect(params(uri).get("token")).toBe(token);
+  });
+
+  it("refuses a port that is not a real port number", () => {
+    // The port arrives from a free-text field via `Number(...)`, which answers
+    // NaN for anything unparseable. Emitting it would put a literal
+    // ``port=NaN`` in the code, which fails on the phone — where the operator
+    // has no way to see what went wrong.
+    for (const port of [NaN, 0, -1, 70000, 8443.5]) {
+      expect(() =>
+        buildEnrolmentUri({ host: "h", port, scheme: "https" }),
+      ).toThrow();
+    }
+    expect(isValidPort(1)).toBe(true);
+    expect(isValidPort(65535)).toBe(true);
+    expect(isValidPort(65536)).toBe(false);
+    expect(isValidPort(NaN)).toBe(false);
   });
 
   it("refuses to build without a host", () => {

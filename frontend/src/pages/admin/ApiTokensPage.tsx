@@ -25,6 +25,7 @@ import {
   buildEnrolmentUri,
   connectionFromLocation,
   displayFingerprint,
+  normaliseFingerprint,
   type EnrolmentConnection,
 } from "@/lib/enrolment";
 import { QrCode } from "@/components/QrCode";
@@ -372,26 +373,43 @@ function EnrolmentQr({ token }: { token: ApiTokenCreated }) {
 
   // Only fetched once the operator opens the section — no reason to ask the
   // server about certificates for an operator who just wants to copy-paste.
-  const { data: ctx } = useQuery({
+  const {
+    data: ctx,
+    isLoading: ctxLoading,
+    isError: ctxError,
+  } = useQuery({
     queryKey: ["api-token-enrolment-context"],
     queryFn: apiTokensApi.enrolmentContext,
     enabled: shown,
     staleTime: 5 * 60 * 1000,
   });
 
-  const fingerprint = pinCert ? (ctx?.tls_fingerprint_sha256 ?? null) : null;
+  // ONE predicate for "there is a fingerprint we can pin", used by both the
+  // checkbox and the URI. Deriving them separately let the UI assert pinning
+  // was on — naming a fingerprint in the copy — while `buildEnrolmentUri`
+  // silently dropped a value `normaliseFingerprint` rejected.
+  const pinnable = normaliseFingerprint(ctx?.tls_fingerprint_sha256);
+  const fingerprint = pinCert ? pinnable : null;
 
   let payload: string | null = null;
   let buildError: string | null = null;
   if (mode === "token") {
     payload = token.token;
+  } else if (ctxLoading) {
+    // Hold the code back until we know whether it can carry a fingerprint.
+    // Rendering it first would paint a complete, scannable, silently UNPINNED
+    // enrolment code — and pinning is the whole point of this shape.
+    buildError = "Checking this server's certificate…";
   } else {
     try {
       payload = buildEnrolmentUri({ ...conn, token: token.token, fingerprint });
-    } catch {
-      // The only way this throws is an empty host, which the operator can
-      // see and fix in the field right below.
-      buildError = "Enter the address this server is reachable at.";
+    } catch (err) {
+      // An empty host or a port that isn't a number — both are visible in the
+      // fields right below, so surface what the builder actually objected to.
+      buildError =
+        err instanceof Error && err.message
+          ? err.message
+          : "Enter the address this server is reachable at.";
     }
   }
 
@@ -481,12 +499,12 @@ function EnrolmentQr({ token }: { token: ApiTokenCreated }) {
             <input
               className={inputCls}
               value={conn.port ?? ""}
-              onChange={(e) =>
-                setConn({
-                  ...conn,
-                  port: e.target.value ? Number(e.target.value) : null,
-                })
-              }
+              onChange={(e) => {
+                // Digits only. `Number("8443/")` is NaN, which would reach the
+                // URI as a literal ``port=NaN`` the client cannot parse.
+                const digits = e.target.value.replace(/\D/g, "").slice(0, 5);
+                setConn({ ...conn, port: digits ? Number(digits) : null });
+              }}
               placeholder="port"
               inputMode="numeric"
               aria-label="Port"
@@ -507,7 +525,7 @@ function EnrolmentQr({ token }: { token: ApiTokenCreated }) {
             </select>
           </div>
 
-          {ctx?.tls_fingerprint_sha256 ? (
+          {pinnable ? (
             <label className="flex items-start gap-2 text-[11px] text-muted-foreground">
               <input
                 type="checkbox"
@@ -519,16 +537,22 @@ function EnrolmentQr({ token }: { token: ApiTokenCreated }) {
                 Pin this server&apos;s certificate — the app verifies what it is
                 offered against{" "}
                 <code className="break-all font-mono text-[10px]">
-                  {displayFingerprint(ctx.tls_fingerprint_sha256)}
+                  {displayFingerprint(pinnable)}
                 </code>
                 . Untick if something in front of SpatiumDDI re-terminates TLS,
                 since the app would then report a mismatch on a correct setup.
               </span>
             </label>
           ) : (
+            // A failed lookup must not read as a still-loading one: both leave
+            // the code unpinned, and only one of them is going to change.
             <p className="text-[11px] text-muted-foreground">
-              {ctx?.fingerprint_unavailable_reason ??
-                "Checking whether this server can pin its certificate…"}
+              {ctxLoading
+                ? "Checking whether this server can pin its certificate…"
+                : ctxError
+                  ? "Couldn't check this server's certificate, so the code below carries no fingerprint — the app will ask you to confirm the certificate by hand."
+                  : (ctx?.fingerprint_unavailable_reason ??
+                    "This server cannot state the certificate it presents, so the code below carries no fingerprint.")}
             </p>
           )}
         </div>

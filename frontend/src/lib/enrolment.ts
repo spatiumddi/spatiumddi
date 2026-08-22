@@ -85,6 +85,19 @@ export function formatHost(host: string): string {
   return isIPv6Literal(bare) ? `[${bare}]` : bare;
 }
 
+/**
+ * Is this port a real TCP port number?
+ *
+ * `null` (meaning "the scheme default") is handled by `isDefaultPort`; this
+ * only judges a stated one. Worth checking rather than trusting: the value
+ * arrives from a free-text field via `Number(...)`, which answers `NaN` for
+ * anything unparseable and would otherwise reach the URI as a literal
+ * ``port=NaN`` that the client cannot parse.
+ */
+export function isValidPort(port: number): boolean {
+  return Number.isInteger(port) && port >= 1 && port <= 65535;
+}
+
 export function isDefaultPort(
   scheme: EnrolmentScheme,
   port: number | null,
@@ -104,7 +117,9 @@ export function isDefaultPort(
 export function connectionFromLocation(loc: Location): EnrolmentConnection {
   const scheme: EnrolmentScheme = loc.protocol === "http:" ? "http" : "https";
   // ``loc.port`` is "" when the URL used the scheme default. ``loc.hostname``
-  // already strips the brackets from an IPv6 literal.
+  // KEEPS the brackets on an IPv6 literal (the WHATWG host serialiser emits
+  // ``[::1]``), which is why `formatHost` strips before re-bracketing rather
+  // than bracketing blindly.
   const port = loc.port ? Number(loc.port) : null;
   return { host: loc.hostname, port, scheme };
 }
@@ -118,7 +133,12 @@ export function connectionFromLocation(loc: Location): EnrolmentConnection {
  */
 export function buildEnrolmentUri(payload: EnrolmentPayload): string {
   const host = formatHost(payload.host);
-  if (!host) throw new Error("host is required to build an enrolment URI");
+  if (!host) throw new Error("Enter the address this server is reachable at.");
+  if (payload.port !== null && !isValidPort(payload.port)) {
+    // Refusing beats emitting: an unparseable ``port=NaN`` in the code fails
+    // on the phone, where the operator has no way to see what went wrong.
+    throw new Error("Port must be a number between 1 and 65535.");
+  }
 
   const params = new URLSearchParams();
   params.set("host", host);

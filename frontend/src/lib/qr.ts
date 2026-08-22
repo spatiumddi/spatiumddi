@@ -12,6 +12,17 @@
 
 import qrcode from "qrcode-generator";
 
+// qrcode-generator's default byte encoder is ``charCodeAt(i) & 0xff`` — it
+// truncates anything outside latin1 instead of encoding it, so a non-ASCII
+// payload would produce a code that decodes to mojibake with no error at all.
+// The library ships a 'UTF-8' encoder, but ONLY in its CommonJS build; the
+// ESM build the bundler actually resolves does not register it, so supply one.
+// Every payload this repo builds today is ASCII (``URLSearchParams``
+// percent-encodes, and a token is base64url), for which UTF-8 is byte
+// identical — this is about the next caller, since silent corruption is
+// exactly what `qr.test.ts` exists to catch.
+qrcode.stringToBytes = (s: string) => Array.from(new TextEncoder().encode(s));
+
 export type QrLevel = "L" | "M" | "Q" | "H";
 
 /**

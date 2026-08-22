@@ -1,6 +1,7 @@
 import { useMemo } from "react";
 
 import { buildQrMatrix, type QrLevel } from "@/lib/qr";
+import { cn } from "@/lib/utils";
 
 /**
  * QR code rendered as inline SVG (issue #906).
@@ -35,7 +36,40 @@ export function QrCode({
   className,
   title = "QR code",
 }: QrCodeProps) {
-  const matrix = useMemo(() => buildQrMatrix(value, level), [value, level]);
+  // `buildQrMatrix` throws when the payload exceeds what a QR code can hold
+  // (qrcode-generator: "code length overflow"). Letting that escape a render
+  // unwinds to the app-level ErrorBoundary and takes the whole page with it —
+  // and this component's one caller is the reveal-once token modal, so a
+  // crash there loses a credential that can never be shown again.
+  const result = useMemo(() => {
+    try {
+      return { matrix: buildQrMatrix(value, level) };
+    } catch (err) {
+      return {
+        error:
+          err instanceof Error && err.message
+            ? err.message
+            : "This value is too long to encode as a QR code.",
+      };
+    }
+  }, [value, level]);
+
+  if (!result.matrix) {
+    return (
+      <div
+        role="img"
+        aria-label={title}
+        className={cn(
+          "flex items-center justify-center rounded-md border border-dashed p-3 text-center text-xs text-muted-foreground",
+          className,
+        )}
+        style={{ width: size, height: size }}
+      >
+        {result.error}
+      </div>
+    );
+  }
+  const matrix = result.matrix;
 
   return (
     <svg
