@@ -472,6 +472,40 @@ def test_render_rpz_zone_nxdomain_and_sinkhole_and_exception() -> None:
     assert "allowed.example.com" not in out  # exception excluded
 
 
+def test_render_rpz_redirect_to_hostname_is_a_cname() -> None:
+    """A redirect target is "the IP or hostname to return instead", and
+    the two need different record types. Emitting ``IN A
+    forcesafesearch.google.com`` is not merely wrong for that entry —
+    BIND rejects the malformed rdata and refuses to load the zone, which
+    takes the whole blocklist offline. Issue #878.
+    """
+    bl = EffectiveBlocklistData(
+        rpz_zone_name="spatium-blocklist.rpz.",
+        entries=(
+            BlocklistEntry(
+                domain="www.google.com",
+                action="redirect",
+                block_mode="nxdomain",
+                sinkhole_ip=None,
+                target="forcesafesearch.google.com",
+                is_wildcard=False,
+            ),
+            BlocklistEntry(
+                domain="v6.example.com",
+                action="redirect",
+                block_mode="nxdomain",
+                sinkhole_ip=None,
+                target="2001:db8::1",
+                is_wildcard=False,
+            ),
+        ),
+        exceptions=frozenset(),
+    )
+    out = BIND9Driver().render_rpz_zone(bl)
+    assert "www.google.com IN CNAME forcesafesearch.google.com." in out
+    assert "v6.example.com IN AAAA 2001:db8::1" in out
+
+
 # ── Serial bumping ────────────────────────────────────────────────────────
 
 

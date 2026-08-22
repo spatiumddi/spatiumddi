@@ -444,6 +444,13 @@ def _blocking_payload(bundle: dict[str, Any]) -> dict[str, Any]:
     * ``action="allow"`` / ``block_mode="passthru"`` entries, and each
       list's ``exceptions``, become allowed domains — Technitium's
       allowed set is exactly an RPZ passthru.
+    * ``action="redirect"`` entries are **dropped**, and logged. They
+      need a per-domain CNAME rewrite; Technitium's custom address is
+      server-wide, so there is nothing here to express them with.
+      Neither branch above is right for them — routing them to
+      ``allowed`` (which is what happened before #878) inverts a
+      SafeSearch rule into an exemption, and blocking them would take
+      the search engine off the air.
 
     Per-view blocklists collapse into the same flat set: Technitium's
     native blocking is server-wide with no view concept, and the driver
@@ -460,6 +467,7 @@ def _blocking_payload(bundle: dict[str, Any]) -> dict[str, Any]:
     allowed: set[str] = set()
     modes: set[str] = set()
     custom_addresses: set[str] = set()
+    skipped_redirects: set[str] = set()
 
     for bl in bundle.get("blocklists") or []:
         for exc in bl.get("exceptions") or []:
@@ -471,6 +479,17 @@ def _blocking_payload(bundle: dict[str, Any]) -> dict[str, Any]:
                 continue
             action = str(entry.get("action") or "block").lower()
             mode = str(entry.get("block_mode") or "nxdomain").lower()
+            if action == "redirect":
+                # Technitium's native blocking has no per-domain rewrite:
+                # it can answer a blocked name with a custom address, but
+                # that address is server-wide, so "send www.google.com to
+                # forcesafesearch.google.com" cannot be expressed. Skipping
+                # is the honest answer. Falling through to the allow branch
+                # below — which is what happened before #878 — inverted the
+                # entry into "never block this domain", quietly turning a
+                # SafeSearch rule into an exemption.
+                skipped_redirects.add(domain)
+                continue
             if action != "block" or mode == "passthru":
                 allowed.add(domain)
                 continue
@@ -480,6 +499,19 @@ def _blocking_payload(bundle: dict[str, Any]) -> dict[str, Any]:
                 modes.add(mapped)
             if mode in ("sinkhole", "redirect") and entry.get("target"):
                 custom_addresses.add(str(entry["target"]))
+
+    if skipped_redirects:
+        log.warning(
+            "technitium_redirect_entries_unsupported",
+            count=len(skipped_redirects),
+            sample=sorted(skipped_redirects)[:5],
+            detail=(
+                "Per-domain redirect entries (e.g. SafeSearch enforcement) "
+                "need RPZ CNAME rewrites, which Technitium's native blocking "
+                "cannot express. Those entries are not enforced on this "
+                "server; use a BIND9 group if they matter."
+            ),
+        )
 
     # One server-wide blocking type has to cover every entry. If the lists
     # disagree, prefer the address-answering mode: it is the more specific

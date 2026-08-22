@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import base64
 import dataclasses
+import ipaddress
 from pathlib import Path
 from typing import Any
 
@@ -124,6 +125,23 @@ def _allow_transfer_items(allow_transfer: Any, tsig_keys: Any) -> list[str]:
 
 
 _UPDATE_POLICY_NAMED_SCOPES = frozenset({"subdomain", "name", "wildcard", "self"})
+
+
+def _redirect_rdata(target: str) -> str:
+    """RPZ local-data for a ``redirect`` entry, chosen by target kind.
+
+    An IP target answers with a literal address; a hostname target
+    answers with a CNAME. Mirrors ``_redirect_rdata`` in the DNS agent's
+    BIND9 driver — the agent renders RPZ in production, this renderer
+    backs the driver ABC, and a disagreement between them means the two
+    would enforce different policy from the same rows.
+    """
+    text = str(target).strip()
+    try:
+        ip = ipaddress.ip_address(text)
+    except ValueError:
+        return f"CNAME {strip_control_chars(text.rstrip('.'))}."
+    return f"{'AAAA' if ip.version == 6 else 'A'} {ip}"
 
 
 def _render_update_clause(zone: ZoneData) -> str:
@@ -273,7 +291,14 @@ class BIND9Driver(DNSDriver):
                 continue
             rpz_name = f"*.{dom}" if e.is_wildcard else dom
             if e.action == "redirect" and e.target:
-                rendered.append(f"{rpz_name} IN A {e.target}")
+                # An IP target is an A/AAAA; a hostname target is a CNAME.
+                # Assuming A unconditionally emitted invalid rdata for the
+                # hostname case (SafeSearch rewrites, #878) — BIND rejects
+                # the zone, which takes the whole blocklist down with it,
+                # not just the one entry. Kept identical to the agent-side
+                # renderer in ``agent/dns/.../drivers/bind9.py``; the two
+                # implement the same contract and must not diverge.
+                rendered.append(f"{rpz_name} IN {_redirect_rdata(e.target)}")
             elif e.block_mode == "sinkhole" and e.sinkhole_ip:
                 rendered.append(f"{rpz_name} IN A {e.sinkhole_ip}")
             elif e.block_mode == "refused":

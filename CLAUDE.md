@@ -476,6 +476,37 @@ suggestion, free-space treemap.
   Not to be confused with `PlatformSettings.resolver_dns_over_tls`, which
   is the appliance host's own systemd-resolved stub resolver.
 
+- ✅ [**Family filter — adult-content blocking bundle + SafeSearch enforcement**](https://github.com/spatiumddi/spatiumddi/issues/878)
+  — the catalog gains **templates** (entry sets shipped inline, for rules
+  with no upstream feed) and **profiles** (compositions applied in one
+  action), alongside the existing feeds:
+  `backend/app/services/dns/blocklist_templates.py` +
+  `POST /dns/blocklists/{from-template,apply-profile}`. Ships a
+  **SafeSearch enforcement** template — RPZ *rewrites*, not blocks,
+  riding the `entry_type="redirect"` path that already existed — and a
+  **Family filter** profile pairing adult + gambling feeds with the
+  **DoH / VPN / proxy bypass** lists, because a filter one browser
+  setting routes around is not one. Five new sources; the two shipped
+  Hagezi entries were **dead** (`hosts/` retired upstream, and one was
+  `recommended: true`) and are repointed. Applying a profile assigns to
+  nothing — auto-scoping would filter the server VLAN too.
+  **Three latent bugs fixed on the way**, each of which made the feature
+  wrong rather than merely absent: (1) the two RPZ renderers disagreed
+  about `redirect` — the agent emitted `CNAME <target>`, the
+  control-plane driver `IN A <target>` — so a hostname target produced
+  rdata BIND rejects, taking the *whole* blocklist offline, not one
+  entry; both now branch on IP-vs-hostname; (2) Technitium routed
+  `action="redirect"` into its **allow** set, silently inverting a
+  SafeSearch rule into an exemption — now skipped with a warning, since
+  its native blocking has no per-domain rewrite; (3) feed-sourced
+  entries never set `is_wildcard`, so every subscribed list blocked
+  apexes only and `www.<blocked>` resolved fine — now on, matching the
+  manual add-entry default, with migration `b7e4a1c56d93` backfilling
+  existing rows. `parse_feed` also strips the `*.` prefix OISD and
+  Hagezi publish. 1 MCP tool (`list_blocklist_templates`). BIND9-only,
+  and [`docs/features/DNS.md` §8.1](docs/features/DNS.md) is explicit
+  that DNS filtering is bypassable at all.
+
 #### DHCP-specific
 
 - ✅ [**DHCPv6 stateful + SLAAC config UI**](https://github.com/spatiumddi/spatiumddi/issues/52) — shipped `2026.06.04-1`: `DHCPScope.v6_address_mode` + `ra_managed_flag` / `ra_other_flag`; the Kea driver renders `subnet6` by mode (stateful → pools + options; stateless / SLAAC → options only). Migration `e4c1a8f63b29`.

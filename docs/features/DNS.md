@@ -1,6 +1,6 @@
 # DNS Feature Specification
 
-> **Implementation status (snapshot):** Full CRUD for groups / servers / zones / records / views / ACLs / trust anchors; BIND9 driver with TSIG + RFC 2136 dynamic updates; agent auto-registration and long-poll config sync with ETag; RPZ blocklists actively rendered by the agent (nxdomain / sinkhole / redirect / passthru; wildcard + exceptions); **curated 14-source RPZ blocklist catalog** with one-click subscribe; per-entry `reason` and `is_wildcard` toggles; zone import/export (RFC 1035); **conditional forwarders as a first-class zone type**; **zone delegation wizard** (auto-stamps NS + glue records in the parent zone); **four starter zone-template wizards** (Email / Active Directory / Web / k8s external-dns target); **operator-managed TSIG keys** with Fernet-encrypted secrets and one-shot reveal modal; query logging + **clickable analytics strip** (top qnames + top clients + qtype distribution); **multi-resolver propagation check** (Cloudflare / Google / Quad9 / OpenDNS in parallel); **BIND9 catalog zones (RFC 9432)** with producer / consumer roles auto-derived from the group's primary; per-server zone serial reporting + drift pill; health checks; IPAM ↔ DNS drift detection & reconciliation (`Check DNS Sync` on subnet/block/space); reverse-zone auto-create + backfill; **Windows DNS driver shipped** — Path A (agentless, RFC 2136) and Path B (agentless, WinRM + PowerShell for zone CRUD and zone-record pull that sidesteps AXFR); group-level "Sync with Servers" button performs bi-directional zone reconciliation; **BIND9 Response Rate Limiting (RRL) + amplification toggles** (responses-per-second / window / slip / qps-scale / exempt-clients / log-only dry-run + minimal-responses / tcp-clients / clients-per-query; group-level, default-off — issue #146 Phase 1); **BIND9 + PowerDNS + Technitium DNSSEC** — inline-signing policies, DS export, manual rollover on BIND9 (issue #49 — see §3.3a); **Technitium driver shipped** — REST-API-driven authoritative agent with primary / secondary / stub / forward zones, catalog zones as producer *and* consumer, online DNSSEC, and native DoT / DoH / **DoQ** listeners plus encrypted upstream forwarding over all three, with no dnsdist-style sidecar (issues #746 / #740 / #741 / #743 / #744 — see §0 and [`DNS_DRIVERS.md` §4B](../drivers/DNS_DRIVERS.md)); **encrypted transports shipped** — DoT / DoH served and forwarded, per-group and default-off (issue #50 — see §20). **Deferred:** Technitium query-log shipping (issue #742), secondary-zone (AXFR/IXFR) full support, GSS-TSIG (Kerberos-signed RFC 2136), Windows DNS Path B record-level writes.
+> **Implementation status (snapshot):** Full CRUD for groups / servers / zones / records / views / ACLs / trust anchors; BIND9 driver with TSIG + RFC 2136 dynamic updates; agent auto-registration and long-poll config sync with ETag; RPZ blocklists actively rendered by the agent (nxdomain / sinkhole / redirect / passthru; wildcard + exceptions); **curated 19-source RPZ blocklist catalog** with one-click subscribe, plus built-in **templates** (SafeSearch enforcement) and one-click **profiles** (Family filter) — issue #878; per-entry `reason` and `is_wildcard` toggles; zone import/export (RFC 1035); **conditional forwarders as a first-class zone type**; **zone delegation wizard** (auto-stamps NS + glue records in the parent zone); **four starter zone-template wizards** (Email / Active Directory / Web / k8s external-dns target); **operator-managed TSIG keys** with Fernet-encrypted secrets and one-shot reveal modal; query logging + **clickable analytics strip** (top qnames + top clients + qtype distribution); **multi-resolver propagation check** (Cloudflare / Google / Quad9 / OpenDNS in parallel); **BIND9 catalog zones (RFC 9432)** with producer / consumer roles auto-derived from the group's primary; per-server zone serial reporting + drift pill; health checks; IPAM ↔ DNS drift detection & reconciliation (`Check DNS Sync` on subnet/block/space); reverse-zone auto-create + backfill; **Windows DNS driver shipped** — Path A (agentless, RFC 2136) and Path B (agentless, WinRM + PowerShell for zone CRUD and zone-record pull that sidesteps AXFR); group-level "Sync with Servers" button performs bi-directional zone reconciliation; **BIND9 Response Rate Limiting (RRL) + amplification toggles** (responses-per-second / window / slip / qps-scale / exempt-clients / log-only dry-run + minimal-responses / tcp-clients / clients-per-query; group-level, default-off — issue #146 Phase 1); **BIND9 + PowerDNS + Technitium DNSSEC** — inline-signing policies, DS export, manual rollover on BIND9 (issue #49 — see §3.3a); **Technitium driver shipped** — REST-API-driven authoritative agent with primary / secondary / stub / forward zones, catalog zones as producer *and* consumer, online DNSSEC, and native DoT / DoH / **DoQ** listeners plus encrypted upstream forwarding over all three, with no dnsdist-style sidecar (issues #746 / #740 / #741 / #743 / #744 — see §0 and [`DNS_DRIVERS.md` §4B](../drivers/DNS_DRIVERS.md)); **encrypted transports shipped** — DoT / DoH served and forwarded, per-group and default-off (issue #50 — see §20). **Deferred:** Technitium query-log shipping (issue #742), secondary-zone (AXFR/IXFR) full support, GSS-TSIG (Kerberos-signed RFC 2136), Windows DNS Path B record-level writes.
 
 ## Overview
 
@@ -642,6 +642,93 @@ DNSBlockListException
 - Allow-list exceptions (whitelist specific domains)
 - Manual domain addition to block list
 - "Test a domain" — check if a domain would be blocked
+
+### 8.1 Content filtering / family filter (issue #878)
+
+Two independent ways to filter adult content, and they compose:
+
+| | RPZ blocklists (this feature) | Filtered upstream resolver |
+|---|---|---|
+| Where the policy lives | Your server, per view / group | The upstream provider |
+| Maintenance | Feeds refresh on a cadence | None |
+| Per-network scoping | Yes — assign a list to one view | No — applies to everything the group forwards |
+| Works for authoritative zones | Yes | N/A |
+| Requires | A BIND9 group | Any group that forwards |
+
+Pick the resolver route when a whole site should be filtered identically
+and you would rather not maintain lists — Cloudflare `1.1.1.3` and
+OpenDNS FamilyShield are in the forwarder presets (§20.3.1). Pick RPZ
+when different networks need different policy, which is the usual case:
+the guest and kids' VLANs filtered, the server VLAN not.
+
+**Catalog → Profiles → Family filter** applies both halves of the RPZ
+route in one action:
+
+- **Adult + gambling feeds** — Hagezi NSFW and Gambling (`recommended:
+  false`, so they are opt-in rather than something a general install
+  picks up by accident).
+- **Bypass feeds** — public DoH endpoints, VPN and proxy services, and
+  search front-ends with no SafeSearch mode. Without these the filter
+  is one browser setting away from irrelevant: a client that speaks DoH
+  to `1.1.1.1` never asks your resolver anything.
+- **SafeSearch enforcement** — the template below.
+
+Applying a profile creates the lists and assigns them to **nothing**.
+That is deliberate: a profile that scoped itself would filter the server
+VLAN too. Assign them under the list's **Assignments** tab.
+
+#### SafeSearch enforcement
+
+Each major search engine publishes a filtered endpoint and documents a
+DNS rewrite that pins clients to it. These are RPZ **rewrites**, not
+blocks — the engine still answers, from its safe endpoint — so they ride
+`entry_type="redirect"` with the target as a CNAME.
+
+| Group | Rewrites | To |
+|---|---|---|
+| Google Search | 194 country domains | `forcesafesearch.google.com` |
+| YouTube — Strict | 5 hostnames | `restrict.youtube.com` |
+| YouTube — Moderate | the same 5 | `restrictmoderate.youtube.com` |
+| Bing | `www.` + `edgeservices.` | `strict.bing.com` |
+| DuckDuckGo | 3 hostnames | `safe.duckduckgo.com` |
+| Brave / Ecosia / Pixabay / Qwant | 1 each | provider's safe host |
+| Yandex (off by default) | 56 hostnames | `familysearch.yandex.ru` |
+
+Four things about this data are load-bearing:
+
+- **Every Google country domain is covered.** A rule on `www.google.com`
+  alone is bypassed by typing `google.de`.
+- **`edgeservices.bing.com` is included.** It is the Edge sidebar /
+  Copilot entry point; without it that surface answers unfiltered, which
+  looks like the filter is broken rather than incomplete.
+- **Exactly five YouTube hostnames, never more.** Google's own
+  documentation warns that rewriting `youtube.com`, `youtu.be`,
+  `s.ytimg.com` or `googleapis.com` breaks playback.
+- **The entries are never wildcards.** A wildcard would also match the
+  rewrite target's own subdomain — `*.youtube.com` catches
+  `restrict.youtube.com` — and BIND resolves the resulting CNAME loop
+  into SERVFAIL. The API emits `is_wildcard=false` with no knob to
+  change it.
+
+The Strict and Moderate YouTube groups cover the same five hostnames
+with different targets, so selecting both is refused (422) rather than
+letting one silently win.
+
+#### Honest limits
+
+- **BIND9 only.** RPZ rewrites need a response-policy zone. PowerDNS
+  logs that blocklists are unsupported; Technitium's native blocking has
+  no per-domain rewrite, so it skips redirect entries and logs them
+  (before #878 it silently converted them into *allow* rules, inverting
+  the intent); Windows and the cloud DNS drivers do not render RPZ.
+- **DNS filtering is bypassable** — a browser with DoH enabled, a
+  hard-coded resolver, or a VPN never consults your server. The bypass
+  feeds in the profile are the mitigation, not a fix. Blocking outbound
+  :53 and :853 to anything but your resolvers at the firewall is what
+  actually closes it.
+- **Blocklists disable DNSSEC validation** on a group that has any (RPZ
+  rewriting is by definition answer tampering). The agent handles this
+  automatically; it is why a filtered group cannot also validate.
 
 ---
 

@@ -9,6 +9,7 @@ TSIG key carried in the config bundle.
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import os
 import re
 import shutil
@@ -228,6 +229,27 @@ def _render_update_policy(zone: dict[str, Any], group_key_name: str | None) -> s
     if not lines:
         return ""
     return f'update-policy {{ {" ".join(lines)} }}; '
+
+
+def _redirect_rdata(target: str) -> str:
+    """RPZ local-data for a ``redirect`` entry, chosen by target kind.
+
+    A redirect target is "the IP or hostname to return instead", and the
+    two need different record types: an IP has to be an A/AAAA, a name
+    has to be a CNAME. Emitting ``CNAME 1.2.3.4.`` for an IP yields a
+    CNAME pointing at a name that does not exist, so the redirect
+    silently resolves to nothing — the failure mode is invisible until
+    someone queries the domain.
+
+    Used by SafeSearch enforcement (#878), whose targets are hostnames,
+    and by any operator redirect pointing at a sinkhole web server.
+    """
+    text = target.strip()
+    try:
+        ip = ipaddress.ip_address(text)
+    except ValueError:
+        return f"CNAME {text.rstrip('.')}."
+    return f"{'AAAA' if ip.version == 6 else 'A'} {ip}"
 
 
 def _render_rate_limit_block(opts: dict[str, Any]) -> str:
@@ -1075,8 +1097,11 @@ class Bind9Driver(DriverBase):
           - CNAME rpz-drop.    → drop the query (no response)
           - CNAME rpz-passthru → explicit bypass (used for exceptions)
           - CNAME <target>.    → rewrite response to CNAME target
+          - A / AAAA <ip>      → answer with a literal address
 
-        Wildcard entries are emitted as `*.<domain>` to catch subdomains.
+        Wildcard entries are emitted as `*.<domain>` *in addition to* the
+        bare name, because an RPZ wildcard matches subdomains only — a
+        `*.example.com`-only rule leaves the apex resolving normally.
         """
         path.parent.mkdir(parents=True, exist_ok=True)
         zname = bl["rpz_zone_name"]
@@ -1092,14 +1117,14 @@ class Bind9Driver(DriverBase):
             is_wildcard = bool(e.get("is_wildcard"))
             target = e.get("target")
             if action == "redirect" and target:
-                rhs = f"{target.rstrip('.')}."
+                rdata = _redirect_rdata(str(target))
             elif block_mode == "sinkhole":
-                rhs = "rpz-drop."
+                rdata = "CNAME rpz-drop."
             else:  # default: nxdomain
-                rhs = "."
-            lines.append(f"{domain} CNAME {rhs}")
+                rdata = "CNAME ."
+            lines.append(f"{domain} {rdata}")
             if is_wildcard:
-                lines.append(f"*.{domain} CNAME {rhs}")
+                lines.append(f"*.{domain} {rdata}")
         # Exceptions → passthrough (never blocked even if a broader rule matches).
         for exc in bl.get("exceptions") or []:
             d = exc.rstrip(".")

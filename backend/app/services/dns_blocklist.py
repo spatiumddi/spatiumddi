@@ -162,10 +162,11 @@ def parse_feed(content: str, feed_format: str) -> list[str]:
 
     Accepts:
       - `hosts`: `0.0.0.0 ads.example.com` (or `127.0.0.1`)
-      - `domains`: one domain per line
+      - `domains`: one domain per line, optionally `*.`-prefixed
       - `adblock`: `||ads.example.com^`
 
-    Ignores blank lines and comments (`#`, `!`).
+    Ignores blank lines and comments (`#`, `!`). A leading `*.` is
+    stripped rather than kept — see the comment at the strip site.
     """
     out: list[str] = []
     seen: set[str] = set()
@@ -203,6 +204,14 @@ def parse_feed(content: str, feed_format: str) -> list[str]:
         if not domain:
             continue
         domain = domain.lower().strip(".")
+        # Several feeds publish wildcard syntax (`*.example.com` — OISD's
+        # `domainswild`, Hagezi's `wildcard/`). The star is how the feed
+        # says "and every subdomain", which is what a blocklist entry
+        # means here anyway, so it is stripped rather than stored: kept
+        # literally it produces an RPZ rule matching subdomains ONLY,
+        # leaving the apex resolving normally.
+        if domain.startswith("*."):
+            domain = domain[2:]
         if not domain or "." not in domain:
             continue
         if domain in seen:

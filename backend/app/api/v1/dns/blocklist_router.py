@@ -40,6 +40,15 @@ from app.models.dns import (
     DNSServerGroup,
     DNSView,
 )
+from app.services.dns.blocklist_templates import (
+    BlocklistTemplate,
+    TemplateGroupConflict,
+    all_profiles,
+    all_templates,
+    profile_for,
+    template_entries,
+    template_for,
+)
 from app.services.dns_blocklist import (
     build_effective_for_group,
     build_effective_for_view,
@@ -389,10 +398,40 @@ class CatalogSource(BaseModel):
     recommended: bool = False
 
 
+class CatalogTemplateGroup(BaseModel):
+    id: str
+    name: str
+    target: str
+    domain_count: int
+    default: bool
+    note: str | None = None
+    conflicts_with: list[str] = []
+
+
+class CatalogTemplate(BaseModel):
+    id: str
+    name: str
+    description: str
+    category: str
+    block_mode: str
+    groups: list[CatalogTemplateGroup]
+
+
+class CatalogProfile(BaseModel):
+    id: str
+    name: str
+    description: str
+    source_ids: list[str]
+    template_ids: list[str]
+    note: str | None = None
+
+
 class CatalogResponse(BaseModel):
     version: str
     comment: str
     sources: list[CatalogSource]
+    templates: list[CatalogTemplate]
+    profiles: list[CatalogProfile]
 
 
 class SubscribeFromCatalogRequest(BaseModel):
@@ -407,16 +446,61 @@ class SubscribeFromCatalogRequest(BaseModel):
 
 @router.get("/blocklists/catalog", response_model=CatalogResponse)
 async def get_blocklist_catalog(_: CurrentUser) -> CatalogResponse:
-    """Return the curated catalog of public DNS blocklist sources.
+    """Return the curated catalog of blocklist sources, templates, profiles.
 
-    Snapshot of well-known feeds (StevenBlack, Hagezi, OISD, AdGuard,
-    Phishing Army, URLhaus, etc.) that ships with the app and updates
-    in lockstep with releases. Operators subscribe to a catalog entry
-    via ``POST /blocklists/from-catalog`` — that creates a normal
-    ``DNSBlockList`` row with ``source_type="url"`` prefilled from
-    the catalog entry.
+    Three kinds of thing, all applied the same way — pick one, click apply:
+
+    * **sources** — well-known remote feeds (StevenBlack, Hagezi, OISD,
+      AdGuard, Phishing Army, URLhaus, …). ``POST /blocklists/from-catalog``
+      creates a ``source_type="url"`` list the refresh task then populates.
+    * **templates** — entry sets shipped inline rather than fetched, for
+      rules that have no upstream feed. ``POST /blocklists/from-template``
+      creates a ``source_type="manual"`` list with the entries already in
+      it. Group ``domain_count`` is returned instead of the domains
+      themselves: the SafeSearch template alone carries 269 names, and no
+      caller needs them to render a picker.
+    * **profiles** — named compositions of the above, applied together by
+      ``POST /blocklists/apply-profile``.
     """
-    return CatalogResponse(**_load_catalog())
+    raw = _load_catalog()
+    return CatalogResponse(
+        version=raw["version"],
+        comment=raw["comment"],
+        sources=[CatalogSource(**s) for s in raw["sources"]],
+        templates=[
+            CatalogTemplate(
+                id=t.id,
+                name=t.name,
+                description=t.description,
+                category=t.category,
+                block_mode=t.block_mode,
+                groups=[
+                    CatalogTemplateGroup(
+                        id=g.id,
+                        name=g.name,
+                        target=g.target,
+                        domain_count=len(g.domains),
+                        default=g.default,
+                        note=g.note,
+                        conflicts_with=list(g.conflicts_with),
+                    )
+                    for g in t.groups
+                ],
+            )
+            for t in all_templates()
+        ],
+        profiles=[
+            CatalogProfile(
+                id=p.id,
+                name=p.name,
+                description=p.description,
+                source_ids=list(p.source_ids),
+                template_ids=list(p.template_ids),
+                note=p.note,
+            )
+            for p in all_profiles()
+        ],
+    )
 
 
 @router.post(
@@ -442,19 +526,10 @@ async def subscribe_from_catalog(
             detail=f"Catalog entry '{body.source_id}' not found",
         )
     name = body.name or src["name"]
-    existing = await db.execute(select(DNSBlockList).where(DNSBlockList.name == name))
-    if existing.scalar_one_or_none():
-        raise HTTPException(
-            status_code=409,
-            detail=f"A blocklist named '{name}' already exists",
-        )
-    bl = DNSBlockList(
-        name=name,
-        description=src["description"],
-        category=src["category"],
-        source_type="url",
-        feed_url=src["feed_url"],
-        feed_format=src["feed_format"],
+    await _assert_name_free(db, name)
+    bl = _build_from_source(
+        src,
+        name,
         update_interval_hours=body.update_interval_hours,
         block_mode=body.block_mode,
         enabled=body.enabled,
@@ -473,20 +548,7 @@ async def subscribe_from_catalog(
     await db.commit()
     reloaded = await _require_list(bl.id, db)
 
-    # Kick off the initial fetch immediately — operators expect a freshly-
-    # subscribed list to populate without a manual Refresh click. Same as
-    # the explicit /refresh endpoint, but enqueued automatically on subscribe.
-    if bl.enabled:
-        from app.tasks.dns import refresh_blocklist_feed
-
-        try:
-            refresh_blocklist_feed.delay(str(bl.id))
-        except Exception as e:  # noqa: BLE001
-            logger.warning(
-                "blocklist_initial_refresh_enqueue_failed",
-                list_id=str(bl.id),
-                error=str(e),
-            )
+    _enqueue_initial_refresh(bl)
     _wake_blocklist_groups(reloaded)
     logger.info(
         "dns_blocklist_subscribed_from_catalog",
@@ -494,6 +556,365 @@ async def subscribe_from_catalog(
         source_id=body.source_id,
     )
     return _to_response(reloaded)
+
+
+# ── Built-in templates + profiles (issue #878) ──────────────────────────────
+
+
+async def _assert_name_free(db: DB, name: str) -> None:
+    existing = await db.execute(select(DNSBlockList).where(DNSBlockList.name == name))
+    if existing.scalar_one_or_none():
+        raise HTTPException(
+            status_code=409,
+            detail=f"A blocklist named '{name}' already exists",
+        )
+
+
+def _build_from_source(
+    src: dict[str, Any],
+    name: str,
+    *,
+    update_interval_hours: int,
+    block_mode: str,
+    enabled: bool,
+) -> DNSBlockList:
+    return DNSBlockList(
+        name=name,
+        description=src["description"],
+        category=src["category"],
+        source_type="url",
+        feed_url=src["feed_url"],
+        feed_format=src["feed_format"],
+        update_interval_hours=update_interval_hours,
+        block_mode=block_mode,
+        enabled=enabled,
+    )
+
+
+def _enqueue_initial_refresh(bl: DNSBlockList) -> None:
+    """Populate a freshly-subscribed feed without a manual Refresh click.
+
+    Same work the explicit ``/refresh`` endpoint enqueues. Failure to
+    enqueue is logged, never raised: the list row is already committed
+    and the scheduled sweep will pick it up, so turning a broker hiccup
+    into a 500 would lose a valid subscription for nothing.
+    """
+    if not bl.enabled or bl.source_type != "url":
+        return
+    from app.tasks.dns import refresh_blocklist_feed
+
+    try:
+        refresh_blocklist_feed.delay(str(bl.id))
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "blocklist_initial_refresh_enqueue_failed",
+            list_id=str(bl.id),
+            error=str(e),
+        )
+
+
+class FromTemplateRequest(BaseModel):
+    template_id: str
+    name: str | None = None
+    # None ⇒ the template's default groups. An explicit [] means "none",
+    # which is refused below rather than quietly creating an empty list.
+    group_ids: list[str] | None = None
+    block_mode: str | None = None
+    enabled: bool = True
+
+    @field_validator("block_mode")
+    @classmethod
+    def _v_bm(cls, v: str | None) -> str | None:
+        if v is not None and v not in VALID_BLOCK_MODES:
+            raise ValueError(f"block_mode must be one of {sorted(VALID_BLOCK_MODES)}")
+        return v
+
+
+async def _materialise_template(
+    db: DB,
+    template: BlocklistTemplate,
+    *,
+    name: str,
+    group_ids: list[str] | None,
+    block_mode: str | None,
+    enabled: bool,
+) -> DNSBlockList:
+    """Create a manual list carrying the template's rendered entries.
+
+    Flushes but does not commit — the caller owns the transaction so a
+    profile can apply several of these atomically.
+    """
+    try:
+        entries = template_entries(template, group_ids)
+    except TemplateGroupConflict as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    if not entries:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"No groups selected for template '{template.id}', so the list "
+                f"would be empty. Available groups: "
+                f"{', '.join(g.id for g in template.groups)}"
+            ),
+        )
+
+    bl = DNSBlockList(
+        name=name,
+        description=template.description,
+        category=template.category,
+        source_type="manual",
+        feed_url=None,
+        # No feed to refresh — 0 keeps the scheduled sweep from picking it up.
+        update_interval_hours=0,
+        block_mode=block_mode or template.block_mode,
+        enabled=enabled,
+        entry_count=len(entries),
+    )
+    db.add(bl)
+    await db.flush()
+
+    db.add_all(
+        [
+            DNSBlockListEntry(
+                list_id=bl.id,
+                domain=e.domain,
+                entry_type=e.entry_type,
+                target=e.target,
+                is_wildcard=e.is_wildcard,
+                # "manual", not "feed": the refresh task diffs feed-sourced
+                # rows against the fetched set and deletes what is missing.
+                # These rows have no feed, so a stray refresh would wipe them.
+                source="manual",
+                reason=e.reason,
+            )
+            for e in entries
+        ]
+    )
+    return bl
+
+
+@router.post(
+    "/blocklists/from-template",
+    response_model=BlockListResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_from_template(
+    body: FromTemplateRequest, db: DB, current_user: SuperAdmin
+) -> BlockListResponse:
+    """Create a manual blocklist from a built-in template.
+
+    Unlike ``/from-catalog`` there is nothing to fetch: the entries ship
+    in the catalog file and are written straight into the new list, so it
+    is usable the moment this returns.
+    """
+    template = template_for(body.template_id)
+    if template is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Template '{body.template_id}' not found",
+        )
+    name = body.name or template.name
+    await _assert_name_free(db, name)
+
+    bl = await _materialise_template(
+        db,
+        template,
+        name=name,
+        group_ids=body.group_ids,
+        block_mode=body.block_mode,
+        enabled=body.enabled,
+    )
+    db.add(_audit(current_user, "create", "dns_blocklist", str(bl.id), bl.name))
+    await db.commit()
+
+    reloaded = await _require_list(bl.id, db)
+    _wake_blocklist_groups(reloaded)
+    logger.info(
+        "dns_blocklist_created_from_template",
+        list_id=str(bl.id),
+        template_id=template.id,
+        entries=reloaded.entry_count,
+    )
+    return _to_response(reloaded)
+
+
+class ApplyProfileRequest(BaseModel):
+    profile_id: str
+    enabled: bool = True
+
+
+class AppliedItem(BaseModel):
+    kind: str  # "source" | "template"
+    catalog_id: str
+    name: str
+    list_id: uuid.UUID | None = None
+    # "created" | "skipped_existing"
+    status: str
+
+
+class ApplyProfileResponse(BaseModel):
+    profile_id: str
+    created: int
+    skipped: int
+    items: list[AppliedItem]
+
+
+@router.post("/blocklists/apply-profile", response_model=ApplyProfileResponse)
+async def apply_profile(
+    body: ApplyProfileRequest, db: DB, current_user: SuperAdmin
+) -> ApplyProfileResponse:
+    """Apply a named profile — several feeds and templates in one action.
+
+    Nothing is scoped to a group or view here. A profile that auto-applied
+    itself everywhere would filter the server VLAN along with the kids'
+    one, so assignment stays a deliberate second step via
+    ``PUT /blocklists/{id}/assignments``.
+
+    Re-applying is safe: an entry whose list name is already taken is
+    reported as ``skipped_existing`` rather than failing the whole call,
+    so a profile that gained a source in a later release can be re-run to
+    pick up just the new one.
+    """
+    profile = profile_for(body.profile_id)
+    if profile is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Profile '{body.profile_id}' not found",
+        )
+
+    catalog = _load_catalog()
+    by_id = {s["id"]: s for s in catalog["sources"]}
+    items: list[AppliedItem] = []
+    fresh_feeds: list[DNSBlockList] = []
+    created_lists: list[DNSBlockList] = []
+
+    # Names claimed in one pass, so a profile naming the same list twice
+    # collides here rather than at flush.
+    existing_names = set((await db.execute(select(DNSBlockList.name))).scalars().all())
+
+    for source_id in profile.source_ids:
+        src = by_id.get(source_id)
+        if src is None:
+            # A profile referencing an unknown source is a packaging bug,
+            # not operator error. Report it and keep applying the rest.
+            logger.warning(
+                "blocklist_profile_unknown_source",
+                profile_id=profile.id,
+                source_id=source_id,
+            )
+            items.append(
+                AppliedItem(
+                    kind="source",
+                    catalog_id=source_id,
+                    name=source_id,
+                    status="skipped_missing",
+                )
+            )
+            continue
+        if src["name"] in existing_names:
+            items.append(
+                AppliedItem(
+                    kind="source",
+                    catalog_id=source_id,
+                    name=src["name"],
+                    status="skipped_existing",
+                )
+            )
+            continue
+        bl = _build_from_source(
+            src,
+            src["name"],
+            update_interval_hours=24,
+            block_mode="nxdomain",
+            enabled=body.enabled,
+        )
+        db.add(bl)
+        await db.flush()
+        existing_names.add(bl.name)
+        fresh_feeds.append(bl)
+        created_lists.append(bl)
+        items.append(
+            AppliedItem(
+                kind="source",
+                catalog_id=source_id,
+                name=bl.name,
+                list_id=bl.id,
+                status="created",
+            )
+        )
+
+    for template_id in profile.template_ids:
+        template = template_for(template_id)
+        if template is None:
+            logger.warning(
+                "blocklist_profile_unknown_template",
+                profile_id=profile.id,
+                template_id=template_id,
+            )
+            items.append(
+                AppliedItem(
+                    kind="template",
+                    catalog_id=template_id,
+                    name=template_id,
+                    status="skipped_missing",
+                )
+            )
+            continue
+        if template.name in existing_names:
+            items.append(
+                AppliedItem(
+                    kind="template",
+                    catalog_id=template_id,
+                    name=template.name,
+                    status="skipped_existing",
+                )
+            )
+            continue
+        bl = await _materialise_template(
+            db,
+            template,
+            name=template.name,
+            group_ids=None,
+            block_mode=None,
+            enabled=body.enabled,
+        )
+        existing_names.add(bl.name)
+        created_lists.append(bl)
+        items.append(
+            AppliedItem(
+                kind="template",
+                catalog_id=template_id,
+                name=bl.name,
+                list_id=bl.id,
+                status="created",
+            )
+        )
+
+    for bl in created_lists:
+        db.add(_audit(current_user, "create", "dns_blocklist", str(bl.id), bl.name))
+    await db.commit()
+
+    # Enqueued after commit — the rows must exist before a worker looks
+    # them up, and the worker runs in a different process.
+    for bl in fresh_feeds:
+        _enqueue_initial_refresh(bl)
+
+    created = sum(1 for i in items if i.status == "created")
+    logger.info(
+        "dns_blocklist_profile_applied",
+        profile_id=profile.id,
+        created=created,
+        total=len(items),
+    )
+    return ApplyProfileResponse(
+        profile_id=profile.id,
+        created=created,
+        skipped=len(items) - created,
+        items=items,
+    )
 
 
 # ── Blocklist CRUD ──────────────────────────────────────────────────────────
