@@ -60,6 +60,7 @@ from app.services.ai.tools import (  # noqa: F401, E402
     saved_views,
     snmp,
     ssh,
+    support_bundle,
     syslog,
     tls_certs,
     upgrades,
