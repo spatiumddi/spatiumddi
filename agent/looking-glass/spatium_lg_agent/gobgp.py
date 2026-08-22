@@ -338,24 +338,18 @@ def _assert_receive_only(rendered: dict[str, Any]) -> None:
             )
 
 
-def write_config(cfg: AgentConfig, bundle: dict[str, Any]) -> dict[str, Any]:
-    """Render + atomically write the gobgpd config file.
+def _write_rendered(cfg: AgentConfig, rendered: dict[str, Any]) -> None:
+    """Atomically swap the rendered document into gobgpd's config path.
 
     Also stashes a copy under the agent state dir's ``rendered/`` for
     audit/debug (mirrors the DHCP agent's ``rendered/kea-dhcp4.json``
     convention).
-    """
-    rendered = render_config(bundle)
-    _write_rendered(cfg, rendered)
-    return rendered
 
-
-def _write_rendered(cfg: AgentConfig, rendered: dict[str, Any]) -> None:
-    """Atomically swap the rendered document into gobgpd's config path.
-
-    Split out of :func:`write_config` so :func:`apply_config` can tell a
-    render failure (config file untouched) from a write failure (it may not
-    be) — see that function's docstring.
+    Kept separate from :func:`render_config` so :func:`apply_config` can tell
+    a render failure (config file untouched) from a write failure (it may not
+    be) — see that function's docstring. That split is why the old
+    ``write_config`` wrapper, which did both in one call, no longer exists:
+    it had no callers left and could only reintroduce the conflation.
     """
     target = cfg.gobgpd_config_path
     target.parent.mkdir(parents=True, exist_ok=True)

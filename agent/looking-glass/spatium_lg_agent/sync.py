@@ -132,9 +132,28 @@ class SyncLoop:
                 log.info("lg_agent_bootstrap_from_cache", etag=etag)
             except Exception as e:
                 log.exception("lg_bootstrap_cache_apply_failed")
-                if etag:
-                    self._quarantine.record(etag, truncate_error(str(e)))
-                self._bootstrap_fallback(etag, e)
+                if booting_from_previous:
+                    # It was the last-known-GOOD bundle that just failed, not
+                    # ``current`` — ``etag`` was rebound to ``prev_etag`` above.
+                    # Do NOT quarantine it: that would overwrite the record
+                    # naming the bundle which actually broke us, un-quarantining
+                    # the poison pill so the next poll applies it again.
+                    self._set_status(
+                        ApplyStatus(
+                            status=STATUS_REVERT_FAILED,
+                            failed_etag=self._quarantine.etag,
+                            error=truncate_error(str(e)),
+                        )
+                    )
+                    log.error(
+                        "lg_bootstrap_last_known_good_apply_failed",
+                        failed_etag=self._quarantine.etag,
+                        previous_etag=etag,
+                    )
+                else:
+                    if etag:
+                        self._quarantine.record(etag, truncate_error(str(e)))
+                    self._bootstrap_fallback(etag, e)
 
     def _set_status(self, status: ApplyStatus) -> None:
         self.apply_status = status

@@ -123,6 +123,13 @@ class SyncLoop:
         # Set by _reload_socket so the raised ConfigApplyError can carry
         # Kea's own words rather than a generic "rejected".
         self._last_reload_error: str | None = None
+        # #882 — did a Kea daemon actually ACCEPT the config we just wrote?
+        # An unreachable control socket is not a rejection (Kea may be
+        # restarting) so it must not revert — but it is not an acceptance
+        # either, and only an accepted bundle may be promoted to
+        # ``previous.json``. Without this the "last-known-GOOD" fallback can
+        # end up holding a document no daemon has ever loaded.
+        self._reload_confirmed = False
 
         # Preload cached bundle — offline-operation guarantee.
         #
@@ -166,11 +173,14 @@ class SyncLoop:
                     reload_kea=True,
                     reload_retry_timeout=_BOOTSTRAP_RELOAD_TIMEOUT,
                 )
-                if not booting_from_previous:
+                if not booting_from_previous and self._reload_confirmed:
                     # #882 — ``current`` demonstrably loads, so it becomes the
                     # bundle we fall back TO. Skipped when we booted from
                     # ``previous``: committing there would copy the still-bad
-                    # ``current.json`` over the only good config we have.
+                    # ``current.json`` over the only good config we have — and
+                    # skipped when no daemon confirmed the config (every
+                    # control socket unreachable), since an unverified bundle
+                    # is not a safe revert target.
                     commit_config(self.cfg.state_dir, etag or "")
                 # #296 A2 — warm-restart readiness. The hostPath cache carries
                 # the bundle we just successfully re-applied; the marker tells
@@ -191,9 +201,28 @@ class SyncLoop:
                 # #882 — the cached bundle no longer loads. Quarantine it and
                 # fall back rather than leave Kea on the baked image config.
                 log.exception("bootstrap_cache_apply_failed")
-                if etag:
-                    self._quarantine.record(etag, truncate_error(str(e)))
-                self._bootstrap_fallback(etag, e)
+                if booting_from_previous:
+                    # It was the last-known-GOOD bundle that just failed, not
+                    # ``current`` — ``etag`` was rebound to ``prev_etag`` above.
+                    # Do NOT quarantine it: that would overwrite the record
+                    # naming the bundle which actually broke us, un-quarantining
+                    # the poison pill so the next poll applies it again.
+                    self._set_status(
+                        ApplyStatus(
+                            status=STATUS_REVERT_FAILED,
+                            failed_etag=self._quarantine.etag,
+                            error=truncate_error(str(e)),
+                        )
+                    )
+                    log.error(
+                        "bootstrap_last_known_good_apply_failed",
+                        failed_etag=self._quarantine.etag,
+                        previous_etag=etag,
+                    )
+                else:
+                    if etag:
+                        self._quarantine.record(etag, truncate_error(str(e)))
+                    self._bootstrap_fallback(etag, e)
 
     def _set_status(self, status: ApplyStatus) -> None:
         self.apply_status = status
@@ -267,7 +296,14 @@ class SyncLoop:
             return False
 
         self._quarantine.clear()
-        commit_config(self.cfg.state_dir, etag)
+        if self._reload_confirmed:
+            commit_config(self.cfg.state_dir, etag)
+        else:
+            # Written, not confirmed — every control socket was unreachable,
+            # so nothing has validated this document. Keep the previous
+            # last-known-good rather than promoting a bundle Kea may refuse
+            # the moment it comes back.
+            log.info("config_not_committed_unconfirmed", etag=etag)
         self._set_status(ApplyStatus(status=STATUS_OK, etag=etag))
         return True
 
@@ -432,6 +468,8 @@ class SyncLoop:
         inner dict. Fall back to the envelope if ``bundle`` isn't
         there so cached v0 responses (pre-envelope) still render.
         """
+        # #882 — reset per apply; set below once a daemon accepts the doc.
+        self._reload_confirmed = False
         # Issue #258 — explicit narrowing. Pre-#258 the inline
         # ternary fell through to ``bundle`` for ANY non-dict value
         # of ``bundle["bundle"]`` (list, str, None, …) and the
@@ -509,6 +547,9 @@ class SyncLoop:
             r6 = self._reload_socket(
                 self.cfg.kea_control_socket_v6, dhcp6_doc, "dhcp6", reload_retry_timeout
             )
+            # At least one daemon ran config-test against this document and
+            # accepted it, which is what makes it a legitimate revert target.
+            self._reload_confirmed = RELOAD_OK in (r4, r6)
             if r4 == RELOAD_OK and r6 == RELOAD_OK:
                 self.heartbeat.daemon_status = {"status": "ok"}
             elif RELOAD_REJECTED in (r4, r6):

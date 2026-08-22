@@ -141,9 +141,28 @@ class SyncLoop:
                 # it and fall back, rather than leaving the daemon on whatever
                 # half-state the failed apply produced.
                 log.exception("bootstrap_cache_apply_failed")
-                if etag:
-                    self._quarantine.record(etag, truncate_error(str(e)))
-                self._bootstrap_fallback(etag, e)
+                if booting_from_previous:
+                    # It was the last-known-GOOD bundle that just failed, not
+                    # ``current`` — ``etag`` was rebound to ``prev_etag`` above.
+                    # Do NOT quarantine it: that would overwrite the record
+                    # naming the bundle which actually broke us, un-quarantining
+                    # the poison pill so the next poll applies it again.
+                    self.apply_status = ApplyStatus(
+                        status=STATUS_REVERT_FAILED,
+                        etag=None,
+                        failed_etag=self._quarantine.etag,
+                        error=truncate_error(str(e)),
+                    )
+                    self.heartbeat.config_apply = self.apply_status
+                    log.error(
+                        "bootstrap_last_known_good_apply_failed",
+                        failed_etag=self._quarantine.etag,
+                        previous_etag=etag,
+                    )
+                else:
+                    if etag:
+                        self._quarantine.record(etag, truncate_error(str(e)))
+                    self._bootstrap_fallback(etag, e)
 
     def _bootstrap_fallback(self, failed_etag: str | None, exc: BaseException) -> None:
         """Boot from the last-known-good bundle after ``current`` failed (#882).
@@ -406,12 +425,12 @@ class SyncLoop:
         try:
             self.driver.apply_config(bundle)
         except ConfigApplyError as e:
-            self._handle_apply_failure(bundle, etag, e.phase, e.cause, e.daemon_disturbed)
+            self._handle_apply_failure(etag, e.phase, e.cause, e.daemon_disturbed)
             return False
         except Exception as e:
             # A driver that raised outside the phased wrapper. Unknown phase,
             # so assume the worst and treat the daemon as disturbed.
-            self._handle_apply_failure(bundle, etag, None, e, True)
+            self._handle_apply_failure(etag, None, e, True)
             return False
 
         self._quarantine.clear()
@@ -426,7 +445,6 @@ class SyncLoop:
 
     def _handle_apply_failure(
         self,
-        bundle: dict[str, Any],
         etag: str,
         phase: str | None,
         cause: BaseException,
@@ -443,6 +461,15 @@ class SyncLoop:
 
         prev_bundle, prev_etag = load_previous_config(self.cfg.state_dir)
         if prev_bundle is None:
+            if daemon_disturbed:
+                # The live config directory was already replaced and we have
+                # nothing to put back, so we no longer know what ``named`` is
+                # running. Forget the structural fingerprint: leaving it would
+                # let a LATER bundle whose structural etag happens to match it
+                # (the operator undoing the change that broke this one) skip
+                # the apply entirely, and the agent would then report ``ok``
+                # for a daemon still sitting on the half-applied config.
+                self._current_structural_etag = None
             status = ApplyStatus(
                 status=STATUS_NO_PREVIOUS,
                 etag=None,
@@ -472,6 +499,11 @@ class SyncLoop:
             try:
                 self.driver.apply_config(prev_bundle)
             except Exception as revert_exc:
+                # Same reasoning as the no-previous branch above: the revert
+                # did not land either, so the running config is unknown and
+                # the structural fingerprint must not be trusted to skip the
+                # next apply.
+                self._current_structural_etag = None
                 status = ApplyStatus(
                     status=STATUS_REVERT_FAILED,
                     etag=None,
