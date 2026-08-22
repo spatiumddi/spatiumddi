@@ -482,7 +482,7 @@ jobs:
           print(f"ok: {len(doc['paths'])} paths, version {got}")
           EOF
 
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         with:
           name: openapi-contract
           path: openapi.json

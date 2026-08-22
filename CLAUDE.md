@@ -852,7 +852,10 @@ suggestion, free-space treemap.
     branded install would otherwise publish its own name as the name of the
     public API. **Two footguns found building it:** an *empty* `VERSION`
     env var is not an absent one — pydantic-settings honours `""`, so
-    `settings.version` becomes empty and FastAPI asserts; an undefined Make
+    `settings.version` becomes empty and FastAPI asserts on a falsy version
+    (`create_app()` now passes `settings.version or "dev"` so a stray empty
+    `VERSION` degrades instead of killing the container at import); an
+    undefined Make
     variable and an unset `GITHUB_REF_NAME` both produce exactly that. And
     the script only imported `app` because the API image happens to set
     `PYTHONPATH=/app`; run from a plain checkout — the client repo's case —

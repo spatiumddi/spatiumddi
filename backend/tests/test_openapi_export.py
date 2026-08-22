@@ -81,6 +81,30 @@ def _run(env_overrides: dict[str, str]) -> dict:
 # ── the served document ───────────────────────────────────────────────────
 
 
+def test_create_app_survives_an_empty_version_setting() -> None:
+    """An empty ``VERSION`` must degrade, not kill the container.
+
+    ``create_app()`` passed a literal until #903, which made a falsy
+    ``settings.version`` harmless. Reading the real value introduced a way to
+    crash at import instead: pydantic-settings honours an empty ``VERSION``
+    env var, and FastAPI asserts on a falsy version inside ``__init__`` —
+    before logging is configured, so the operator gets a bare AssertionError
+    and a crashlooping api container for what is a typo in ``.env``.
+
+    Called directly rather than through a subprocess because ``create_app()``
+    reads ``settings.version`` at call time; only the module-level ``app`` is
+    fixed at import.
+    """
+    from app.main import create_app  # noqa: PLC0415 — see docstring
+
+    original = settings.version
+    try:
+        settings.version = ""
+        assert create_app().openapi()["info"]["version"] == "dev"
+    finally:
+        settings.version = original
+
+
 def test_served_version_is_the_running_version_not_a_literal() -> None:
     """``create_app()`` passed ``version="0.1.0"`` literally while
     ``settings.version`` carried the real one, so every deployment
@@ -124,8 +148,10 @@ def test_empty_version_env_falls_back_instead_of_crashing() -> None:
     """An EMPTY ``VERSION`` is not an absent one.
 
     pydantic-settings honours the empty string, so ``settings.version``
-    becomes ``""`` rather than defaulting, and FastAPI then asserts
-    ("A version must be provided for OpenAPI"). Easy to hit for free: an
+    becomes ``""`` rather than defaulting, and FastAPI asserts on a falsy
+    version ("A version must be provided for OpenAPI") — which ``create_app()``
+    guards with ``settings.version or "dev"``, but the exporter must stamp the
+    right value itself rather than lean on that. Easy to hit for free: an
     undefined Make variable still expands to ``-e VERSION=``, and so does an
     unset ``GITHUB_REF_NAME``.
     """

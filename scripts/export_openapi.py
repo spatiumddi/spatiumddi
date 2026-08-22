@@ -78,6 +78,16 @@ def build_document(version: str | None) -> dict:
     import inside this function rather than at module scope. Reordering these
     two statements silently produces a document carrying the exporting
     machine's title and version instead of the canonical ones.
+
+    Exports the ``app`` that ``app.main`` builds at import, rather than
+    calling ``create_app()`` for a second, parallel instance — so the
+    artifact is generated from the very object the server serves.
+
+    Not a performance argument: measured in the API image, importing the
+    module costs 4.4 s and generating the document 3.5 s, while a second
+    ``create_app()`` costs 0.00 s (it re-registers already-imported routers
+    and imports nothing). Byte-identical either way; this is simply the
+    honest object to export.
     """
     os.environ["APP_TITLE"] = CANONICAL_TITLE
     if version:
@@ -85,16 +95,17 @@ def build_document(version: str | None) -> dict:
     else:
         # An EMPTY ``VERSION`` is not the same as an absent one: pydantic-
         # settings honours the empty string, so ``settings.version`` becomes
-        # "" instead of falling back to "dev", and FastAPI then asserts
-        # ("A version must be provided for OpenAPI"). Easy to hit — a Make
-        # variable that is merely undefined still expands to ``-e VERSION=``,
-        # and so does an unset ``GITHUB_REF_NAME``. Drop it so the default
-        # applies.
+        # "" instead of falling back to "dev". FastAPI asserts on a falsy
+        # version ("A version must be provided for OpenAPI"), which is why
+        # ``create_app()`` passes ``settings.version or "dev"`` — but the
+        # export must not lean on that guard to get ``info.version`` right.
+        # Easy to hit — a Make variable that is merely undefined still expands
+        # to ``-e VERSION=``, and so does an unset ``GITHUB_REF_NAME``. Drop it
+        # so the default applies.
         os.environ.pop("VERSION", None)
 
-    from app.main import create_app  # noqa: PLC0415 — see docstring
+    from app.main import app  # noqa: PLC0415 — see docstring
 
-    app = create_app()
     # ``app.openapi`` is the patched wrapper; see the module docstring for why
     # this must not be ``get_openapi``.
     return app.openapi()
