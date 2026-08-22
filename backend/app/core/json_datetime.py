@@ -78,9 +78,13 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-#: Guards ``_patch_pydantic`` against wrapping its own wrapper — ``install()``
-#: is safe to call from more than one entrypoint.
-_pydantic_patched = False
+#: Stamped on the wrapper so ``_patch_pydantic`` can recognise its own work.
+#: On the function rather than in a module-level flag because the question is
+#: "is ``core_schema`` already patched", not "has this module run" — the two
+#: differ if this module is ever imported twice under different names, and
+#: only the first one stops a wrapper wrapping a wrapper. Same shape as the
+#: encoder guard below, which asks its own target the same way.
+_PATCH_MARKER = "_spatium_rfc3339_ms"
 
 
 def to_rfc3339_ms(value: datetime) -> str:
@@ -130,13 +134,11 @@ def _patch_pydantic() -> None:
     more than it bought. Left absent, pydantic keeps the declared type's own
     schema and the serialiser still runs.
     """
-    global _pydantic_patched
-
     from pydantic_core import core_schema  # noqa: PLC0415 — patch target
 
-    if _pydantic_patched:
-        return
     build_datetime_schema = core_schema.datetime_schema
+    if getattr(build_datetime_schema, _PATCH_MARKER, False):
+        return
 
     def datetime_schema(*args: Any, **kwargs: Any) -> Any:
         schema = build_datetime_schema(*args, **kwargs)
@@ -149,8 +151,8 @@ def _patch_pydantic() -> None:
         )
         return schema
 
+    setattr(datetime_schema, _PATCH_MARKER, True)  # noqa: B010 — name is a constant
     core_schema.datetime_schema = datetime_schema  # type: ignore[assignment]
-    _pydantic_patched = True
 
 
 def _patch_fastapi_encoders() -> None:

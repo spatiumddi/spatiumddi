@@ -28,7 +28,7 @@ from httpx import AsyncClient
 from pydantic import BaseModel, TypeAdapter
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.json_datetime import to_rfc3339_ms
+from app.core.json_datetime import install, to_rfc3339_ms
 from app.core.security import create_access_token, hash_password
 from app.main import app
 from app.models.auth import User
@@ -133,6 +133,20 @@ def test_a_plain_date_is_left_alone() -> None:
     """Only ``datetime`` moves. A ``date`` has no time to be precise about,
     and rewriting its encoder would change ``format: date`` fields."""
     assert jsonable_encoder({"on": _MICROSECONDS.date()}) == {"on": "2026-05-14"}
+
+
+def test_installing_twice_does_not_wrap_the_wrapper() -> None:
+    """``install()`` runs from a package ``__init__``, so a second call is a
+    plausible accident — and a wrapper wrapping a wrapper would keep working
+    while doing the whole schema build twice per model. The guard asks the
+    patch target whether it is already ours rather than tracking a flag of its
+    own, so it holds even if this module is imported twice under two names."""
+    from pydantic_core import core_schema  # noqa: PLC0415 — the patch target
+
+    before = core_schema.datetime_schema
+    install()
+    assert core_schema.datetime_schema is before
+    assert to_rfc3339_ms(_MICROSECONDS) == "2026-05-14T21:59:10.586Z"
 
 
 def test_python_mode_dumps_keep_full_precision() -> None:
