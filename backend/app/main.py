@@ -744,7 +744,16 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title=settings.app_title,
         description="Open-source DDI — DNS, DHCP, and IP Address Management",
-        version="0.1.0",
+        # #903 — the RUNNING version, not a literal. This was hardcoded
+        # ``"0.1.0"`` while ``settings.version`` (from the ``VERSION`` env var
+        # the compose file and Helm chart both already set) carried the real
+        # one, so ``/api/docs`` and ``/api/openapi.json`` misreported every
+        # deployment since the first release. It matters more now that the
+        # document is published as a release asset and used to generate
+        # clients: a spec that always claims 0.1.0 cannot be pinned against.
+        # Falls back to ``"dev"`` for unversioned local builds, same as every
+        # other consumer of ``settings.version``.
+        version=settings.version,
         docs_url="/api/docs",
         redoc_url="/api/redoc",
         openapi_url="/api/openapi.json",

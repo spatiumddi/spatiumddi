@@ -22,6 +22,10 @@ appliance/mkosi.extra/usr/local/bin/
 # test_appliance_firewall_render.py imports the renderer by path.
 agent/supervisor/spatium_supervisor/
 
+# test_openapi_export.py runs the release-asset exporter (#903) and pins
+# that its output still goes through app.openapi()'s wrapper.
+scripts/export_openapi.py
+
 # The gate machinery itself: the script, this manifest, and the tests that
 # pin them. Any edit here must run the suite that contains those tests.
 .github/scripts/
