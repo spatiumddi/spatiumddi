@@ -456,6 +456,12 @@ upward instead of serving one thing while the database says another
   (`AuditLogResponse`, `SessionRow`, `UserResponse`) that carried their
   timestamps as pre-formatted strings are now declared `datetime` and
   serialised like everything else.
+- **Regenerate any OpenAPI-derived clients (#907)** after the two
+  changes above. Neither alters what the wire *means* — an absent key
+  and an explicit null both decode to nil, and the instant a timestamp
+  records is the same — so this is a regeneration rather than a
+  migration. What will notice: a validator asserting the old document,
+  and a client comparing timestamp strings byte-for-byte.
 - **Agent `/config` ETags are now weak and quoted — `W/"sha256:<hex>"`
   (#862).** The bare form was not a valid entity-tag at all, and a
   *strong* validator asserts byte-for-byte identity, so nginx's gzip
@@ -762,13 +768,6 @@ upward instead of serving one thing while the database says another
   including the builtin Viewer. No shipped UI consumes it; automation
   using a lower-privileged token will now get a 403, which is the
   intent.
-- **Regenerate any OpenAPI-derived clients (#907).** Nullable properties
-  are now published as the plain schema with the property absent from
-  `required` rather than as a `null` union, and timestamps carry three
-  fractional digits instead of six. The wire is unchanged in what it
-  *means* — an absent key and an explicit null both decode to nil — but
-  a validator asserting the old document, or a client comparing
-  timestamp strings byte-for-byte, will notice.
 - **Passwords are now bounded at 72 bytes with a policy message
   (#861),** which is what bcrypt reads and the point above which it
   raises. Nothing that previously succeeded now fails: a longer password
