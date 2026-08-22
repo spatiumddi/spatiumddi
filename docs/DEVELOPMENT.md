@@ -169,6 +169,19 @@ make test                                  # full suite — pytest -n auto insid
 make test-one T=tests/test_health.py::test_liveness   # a single test, run serially
 ```
 
+The **frontend** has a test suite too, added with the enrolment QR
+(#906) and run by the `frontend-lint` CI job:
+
+```bash
+cd frontend && npm test          # vitest, jsdom, run once
+cd frontend && npm test -- --watch
+```
+
+It exists for the class of bug review and `tsc` cannot catch — the QR
+tests decode the image the component actually renders, because a
+transposed row or an inverted polarity produces a code that looks
+entirely normal and scans as nothing.
+
 ### Parallelism + per-worker databases
 
 `make test` runs `python -m pytest -n auto` (pytest-xdist), one worker
@@ -211,7 +224,7 @@ It chains three targets:
 | `make` target | What it runs |
 |---|---|
 | `ci-backend-lint` | `ruff check app tests`, `black --check app tests`, `mypy app` (inside the api container; installs ruff/black/mypy on first run if missing) |
-| `ci-frontend-lint` | `npm run lint && npm run format:check && npm run typecheck` |
+| `ci-frontend-lint` | `npm run lint && npm run format:check && npm run typecheck` (CI's `frontend-lint` job also runs `npm test`) |
 | `ci-frontend-build` | `npm run build` |
 
 `make ci` requires the dev stack to be running (the backend checks
@@ -226,8 +239,8 @@ triggered on push to `main` and on every pull request:
 | Job | What it does |
 |---|---|
 | **Backend — Lint & Type Check** (`backend-lint`) | `pip install -e ".[dev]"` on Python 3.12, then `ruff check`, `black --check`, `mypy app`, **plus the migration-shape linter** (`python3 scripts/lint_migrations.py` — see §8). |
-| **Backend — Tests** (`backend-test`) | A required-check aggregator over four parallel `backend-test-shard` jobs. Each shard spins up `postgres:16-alpine` + `redis:8.8-alpine` services, runs `alembic upgrade head`, then `pytest -n auto --splits 4 --group N` (pytest-split selects the shard's slice; `-n auto` parallelizes it across the runner's vCPUs, each xdist worker on its own `spatiumddi_test_gw<N>` DB). The aggregator passes only if all four shards pass. |
-| **Frontend — Lint & Type Check** (`frontend-lint`) | Node 22, `npm install`, then `npm run lint`, `npm run format:check`, `npm run typecheck`. |
+| **Backend — Tests** (`backend-test`) | A required-check aggregator over **eight** parallel `backend-test-shard` jobs. Each shard spins up `postgres:16-alpine` + `redis:8.8-alpine` services, runs `alembic upgrade head`, then `pytest -n auto --splits 8 --group N` (pytest-split selects the shard's slice; `-n auto` parallelizes it across the runner's vCPUs, each xdist worker on its own `spatiumddi_test_gw<N>` DB). The aggregator passes only if all eight shards pass. |
+| **Frontend — Lint & Type Check** (`frontend-lint`) | Node 22, `npm install`, then `npm run lint`, `npm run format:check`, `npm run typecheck`, `npm test`. |
 | **Frontend — Build** (`frontend-build`) | Node 22, `npm install`, `npm run build`. |
 
 Branch protection on `main` gates on these checks. `make ci` reproduces

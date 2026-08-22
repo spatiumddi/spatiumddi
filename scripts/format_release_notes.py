@@ -14,6 +14,10 @@ release-body-friendly version on stdout that:
    real paragraph break.
 2. Leaves headings (``# / ## / ### / ####``), list items
    (``- ``, ``* ``, ``\\d+. ``), and fenced code blocks alone.
+   A blockquote is joined like prose but keeps ONE ``> `` marker —
+   joining it naively strips the callout and leaves the markers
+   stranded mid-sentence, which is what a release-note warning
+   ("you must pull new agent images") cannot afford.
 3. Renames the standard Keep-a-Changelog section headings with
    emoji prefixes for readability on GitHub.
 4. Wraps the top prose paragraph (the release summary) in a new
@@ -62,6 +66,17 @@ def _is_list_item(line: str) -> bool:
     if stripped.startswith(("- ", "* ")):
         return True
     return bool(re.match(r"\d+\.\s", stripped))
+
+
+def _is_blockquote(line: str) -> bool:
+    """``> foo``. A callout, not prose — see ``flush_para``."""
+    return line.lstrip().startswith(">")
+
+
+def _strip_quote_marker(line: str) -> str:
+    """``>  foo`` ↦ ``foo``. Tolerates ``>foo`` (no space), which GFM
+    accepts and hard-wrapping tools emit."""
+    return re.sub(r"^\s*>\s?", "", line)
 
 
 def _rewrite_heading(line: str) -> str:
@@ -113,6 +128,18 @@ def transform(text: str) -> str:
     def flush_para() -> None:
         nonlocal summary_emitted, saw_section_heading
         if not para:
+            return
+        # A paragraph whose every line is quoted is one blockquote: join
+        # the contents, then re-mark the result once. Without the strip
+        # the markers survive INSIDE the joined sentence ("the fixes >
+        # (#856) ... > all live in"), which is worse than losing the
+        # callout, because it reads as a typo in the warning.
+        quoted = all(_is_blockquote(line) for line in para)
+        if quoted:
+            joined = _join([_strip_quote_marker(line) for line in para])
+            if joined:
+                out.append(f"> {joined}")
+            para.clear()
             return
         joined = _join(para)
         if joined:
@@ -170,7 +197,11 @@ def transform(text: str) -> str:
         # Indented continuation of a bullet (the typical
         # "  continuation text" two-space indent or wrapped at any
         # leading whitespace).
-        if in_list_item and (line.startswith("  ") or line.startswith("\t")):
+        if (
+            in_list_item
+            and (line.startswith("  ") or line.startswith("\t"))
+            and not _is_blockquote(line)
+        ):
             current_list_buf.append(line)
             continue
 
