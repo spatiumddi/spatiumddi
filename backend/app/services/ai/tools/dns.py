@@ -1175,3 +1175,61 @@ async def find_dns_encrypted_transports(
             ),
         },
     }
+
+
+class ListResolverPresetsArgs(BaseModel):
+    """No arguments — the catalogue is small enough to return whole."""
+
+    pass
+
+
+@register_tool(
+    name="list_resolver_presets",
+    description=(
+        "List the curated public upstream DNS resolvers SpatiumDDI ships "
+        "presets for — Cloudflare, Google, Quad9 and friends — with each "
+        "one's IPv4/IPv6 addresses, the DoT/DoH hostname its certificate "
+        "presents, and what it filters by default. Use to answer 'what is "
+        "Quad9's DoT hostname?', 'which upstream blocks malware?' or "
+        "'what should I put in forward_tls_hostname for 1.1.1.1?'. The "
+        "hostname matters: with DoT verification on, a wrong one fails "
+        "closed and the group returns SERVFAIL for every query."
+    ),
+    args_model=ListResolverPresetsArgs,
+    category="dns",
+    # Read-only, and the contents are a static table of public addresses
+    # shipped with the release — nothing install-specific, nothing secret.
+    default_enabled=True,
+)
+async def list_resolver_presets(
+    db: AsyncSession, user: User, args: ListResolverPresetsArgs
+) -> dict[str, Any]:
+    from app.services.dns.resolver_presets import (  # noqa: PLC0415
+        all_presets,
+        catalog_version,
+    )
+
+    return {
+        "version": catalog_version(),
+        "presets": [
+            {
+                "id": p.id,
+                "name": p.name,
+                "provider": p.provider,
+                "description": p.description,
+                "ipv4": list(p.ipv4),
+                "ipv6": list(p.ipv6),
+                "tls_hostname": p.tls_hostname,
+                "filtering": p.filtering,
+                "homepage": p.homepage,
+            }
+            for p in all_presets()
+        ],
+        "note": (
+            "One TLS hostname applies to a whole server group, so every "
+            "forwarder in a group must present the same certificate name. "
+            "A brand's filtering variants do NOT share one (1.1.1.1 is "
+            "cloudflare-dns.com but 1.1.1.3 is family.cloudflare-dns.com), "
+            "so mixing them needs one group per variant."
+        ),
+    }

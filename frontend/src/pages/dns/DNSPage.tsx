@@ -83,6 +83,7 @@ import {
   type DNSTSIGKey,
   type WindowsDNSCredentials,
   type DNSGroupSyncResult,
+  type ResolverPreset,
 } from "@/lib/api";
 import { copyToClipboard } from "@/lib/clipboard";
 import { fqdnError, recordOwnerError } from "@/lib/dnsNames";
@@ -5474,6 +5475,109 @@ function OptionsTab({ groupId }: { groupId: string }) {
     return raw.trim() === "" || Number.isNaN(n) ? dflt : n;
   }
 
+  // ── Resolver presets (issue #877) ──────────────────────────────────
+  const { data: presetCatalog } = useQuery({
+    queryKey: ["dns", "forwarder-presets"],
+    queryFn: () => dnsApi.forwarderPresets(),
+    // Static catalogue shipped with the release — refetching it is pointless.
+    staleTime: Infinity,
+  });
+
+  const presetsByProvider = useMemo(() => {
+    const grouped = new Map<string, ResolverPreset[]>();
+    for (const p of presetCatalog?.presets ?? []) {
+      const bucket = grouped.get(p.provider);
+      if (bucket) bucket.push(p);
+      else grouped.set(p.provider, [p]);
+    }
+    return [...grouped.entries()];
+  }, [presetCatalog]);
+
+  /** Which catalogued upstream the current forwarder list resolves to, or
+   *  null when it is empty, custom, or mixed. Drives both the DoT nudge and
+   *  the hostname advisory below. */
+  const appliedPreset = useMemo(() => {
+    const presets = presetCatalog?.presets ?? [];
+    if (!presets.length) return null;
+    const addresses = list(forwarders).map((f) =>
+      f.split("@")[0].trim().toLowerCase(),
+    );
+    if (!addresses.length) return null;
+    const matched = new Set<string>();
+    for (const addr of addresses) {
+      const hit = presets.find((p) =>
+        [...p.ipv4, ...p.ipv6].some((a) => a.toLowerCase() === addr),
+      );
+      if (hit) matched.add(hit.id);
+    }
+    if (matched.size !== 1) return null;
+    return presets.find((p) => p.id === [...matched][0]) ?? null;
+  }, [presetCatalog, forwarders]);
+
+  /** Advisory, not a block: providers put several names in one certificate
+   *  (Cloudflare's covers one.one.one.one as well as cloudflare-dns.com) and
+   *  the catalogue records only the canonical one, so a mismatch is worth
+   *  flagging but not worth refusing. The API separately hard-refuses the
+   *  unambiguous case — forwarders spanning two certificate names. */
+  const forwarderHostnameHint = useMemo(() => {
+    // Applies to every encrypted transport, not just tls: https and quic
+    // address the upstream BY NAME and the API requires a hostname for
+    // them unconditionally, so a wrong one there is at least as
+    // fail-closed as it is on DoT. Only opportunistic DoT (verify off)
+    // and plaintext do53 authenticate nothing and need no opinion.
+    if (forwardTransport === "do53") return null;
+    if (forwardTransport === "tls" && !forwardTlsVerify) return null;
+    if (!appliedPreset) return null;
+    const typed = forwardTlsHostname.trim().toLowerCase();
+    if (!typed || typed === appliedPreset.tls_hostname.toLowerCase())
+      return null;
+    return `These forwarders are ${appliedPreset.name}, which documents its encrypted-DNS hostname as ${appliedPreset.tls_hostname} — not ${forwardTlsHostname.trim()}. If that name is not on the upstream's certificate, every query will fail closed with SERVFAIL.`;
+  }, [forwardTransport, forwardTlsVerify, forwardTlsHostname, appliedPreset]);
+
+  /** Caveats worth showing about the selected upstream — its own documented
+   *  quirks, plus the one interaction the operator cannot see coming. */
+  const presetAdvisories = useMemo(() => {
+    if (!appliedPreset) return [];
+    const out: string[] = [];
+    // An upstream that answers a forged address for a blocked name produces
+    // bogus data for a SIGNED name, so validating downstream turns the
+    // block into SERVFAIL. That is the same fail-closed symptom this
+    // feature exists to prevent, arriving from the opposite direction —
+    // and nothing in either setting hints at the interaction.
+    if (
+      appliedPreset.blocking_method === "forged_address" &&
+      dnssecValidation !== "no"
+    ) {
+      out.push(
+        `${appliedPreset.name} answers blocked names with a forged address rather than NXDOMAIN. With DNSSEC validation on, a blocked name that is signed validates as bogus and returns SERVFAIL instead of the block. Quad9 avoids this by answering NXDOMAIN.`,
+      );
+    }
+    if (appliedPreset.notes) out.push(appliedPreset.notes);
+    return out;
+  }, [appliedPreset, dnssecValidation]);
+
+  const [presetIncludeV6, setPresetIncludeV6] = useState(false);
+
+  function applyResolverPreset(id: string) {
+    const preset = (presetCatalog?.presets ?? []).find((p) => p.id === id);
+    if (!preset) return;
+    const addresses = presetIncludeV6
+      ? [...preset.ipv4, ...preset.ipv6]
+      : [...preset.ipv4];
+    setForwarders(addresses.join("\n"));
+    // Always fill the hostname, even on do53: it costs nothing, and it means
+    // switching to DoT later is one click rather than a lookup.
+    setForwardTlsHostname(preset.tls_hostname);
+    // Upstreams that refuse plaintext 53 get switched over rather than left
+    // in a state the API will reject on save — do53 here is not a weaker
+    // choice, it is a broken one.
+    if (preset.requires_encrypted && forwardTransport === "do53") {
+      setForwardTransport("tls");
+      setForwardTlsVerify(true);
+    }
+    setDirty(true);
+  }
+
   function save() {
     saveMut.mutate({
       forwarders: forwardersEnabled ? list(forwarders) : [],
@@ -5589,17 +5693,107 @@ function OptionsTab({ groupId }: { groupId: string }) {
         )}
         {forwardersEnabled && (
           <>
-            <Field label="Upstream resolvers (one per line)">
-              <textarea
-                value={forwarders}
-                onChange={(e) => {
-                  setForwarders(e.target.value);
-                  setDirty(true);
-                }}
-                className="w-full rounded border bg-background px-2 py-1 font-mono text-xs resize-none h-16 focus:outline-none focus:ring-1 focus:ring-ring"
-                placeholder={"1.1.1.1\n8.8.8.8"}
-              />
+            <Field label="Use a well-known resolver">
+              <div className="space-y-2">
+                <select
+                  className={selCls}
+                  value=""
+                  onChange={(e) => applyResolverPreset(e.target.value)}
+                >
+                  <option value="">Choose a preset…</option>
+                  {presetsByProvider.map(([provider, items]) => (
+                    <optgroup key={provider} label={provider}>
+                      {items.map((p) => (
+                        <option key={p.id} value={p.id}>
+                          {p.name} — {p.filtering}
+                        </option>
+                      ))}
+                    </optgroup>
+                  ))}
+                </select>
+                <label className="flex items-center gap-2 text-xs text-muted-foreground">
+                  <input
+                    type="checkbox"
+                    checked={presetIncludeV6}
+                    onChange={(e) => setPresetIncludeV6(e.target.checked)}
+                    className="h-3.5 w-3.5"
+                  />
+                  Include IPv6 addresses
+                </label>
+                <p className="text-xs text-muted-foreground">
+                  Fills the resolvers below and the matching DoT hostname
+                  together — with verification on they have to agree, and a
+                  mismatch fails closed rather than falling back to plaintext.
+                </p>
+              </div>
             </Field>
+            <Field label="Upstream resolvers (one per line)">
+              <div className="space-y-1">
+                <textarea
+                  value={forwarders}
+                  onChange={(e) => {
+                    setForwarders(e.target.value);
+                    setDirty(true);
+                  }}
+                  className="w-full rounded border bg-background px-2 py-1 font-mono text-xs resize-none h-16 focus:outline-none focus:ring-1 focus:ring-ring"
+                  placeholder={"1.1.1.1\n8.8.8.8"}
+                />
+                {/* The presets fill this box; they never police it. Say so,
+                    so nobody reads the picker above as a required choice. */}
+                <p className="text-xs text-muted-foreground">
+                  {appliedPreset
+                    ? `Recognised as ${appliedPreset.name}. Edit freely — any resolver address works, including your own.`
+                    : "Type any resolver address, or pick a preset above to fill this in. Addresses may pin a port as ip@port."}
+                </p>
+              </div>
+            </Field>
+            {presetAdvisories.map((advisory) => (
+              <p
+                key={advisory}
+                className="rounded-md border border-dashed px-3 py-2 text-xs text-muted-foreground"
+              >
+                {advisory}
+              </p>
+            ))}
+            {/* Only do53 is plaintext — https and quic are already encrypted,
+                so nudging there would claim a plaintext leak that isn't
+                happening AND downgrade a working DoH/DoQ config to DoT. The
+                requires_encrypted case gets the same button with a harder
+                message: on do53 that upstream does not merely leak, it
+                answers nothing, and the API refuses the save. */}
+            {appliedPreset && forwardTransport === "do53" && (
+              <p
+                className={cn(
+                  "flex flex-wrap items-center gap-2 rounded-md border border-dashed px-3 py-2 text-xs",
+                  appliedPreset.requires_encrypted
+                    ? "border-amber-500/40 bg-amber-500/5 text-amber-700 dark:text-amber-400"
+                    : "text-muted-foreground",
+                )}
+              >
+                <span>
+                  {appliedPreset.requires_encrypted
+                    ? `${appliedPreset.name} answers only over an encrypted transport and returns REFUSED on plaintext port 53, so forwarding to it over do53 fails every query. Saving this combination is rejected.`
+                    : `${appliedPreset.name} supports DNS-over-TLS. Queries currently leave in plaintext on port 53.`}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setForwardTransport("tls");
+                    setForwardTlsVerify(true);
+                    setForwardTlsHostname(appliedPreset.tls_hostname);
+                    setDirty(true);
+                  }}
+                  className="rounded-md border px-2 py-1 font-medium hover:bg-accent"
+                >
+                  Switch to DoT
+                </button>
+              </p>
+            )}
+            {forwarderHostnameHint && (
+              <p className="rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
+                {forwarderHostnameHint}
+              </p>
+            )}
             <Field label="Forward policy">
               <select
                 className={selCls}

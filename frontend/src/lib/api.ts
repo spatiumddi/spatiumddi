@@ -5034,6 +5034,36 @@ export interface DNSServerOptions {
   modified_at: string;
 }
 
+/** A curated public upstream resolver (issue #877). ``tls_hostname`` is the
+ *  name the provider's certificate presents — with DoT verification on, a
+ *  mismatch fails closed, so the address set and the hostname travel
+ *  together rather than being typed independently. */
+export interface ResolverPreset {
+  id: string;
+  name: string;
+  provider: string;
+  description: string;
+  ipv4: string[];
+  ipv6: string[];
+  tls_hostname: string;
+  /** What the upstream filters by default, for an honest picker label. */
+  filtering: string;
+  /** How a blocked name is answered: none | nxdomain | refused |
+   *  forged_address. A forged address for a signed name is bogus data, so
+   *  a DNSSEC-validating resolver downstream turns the block into
+   *  SERVFAIL — worth warning about. */
+  blocking_method: string;
+  /** True for upstreams that refuse plaintext 53 (Mullvad). */
+  requires_encrypted: boolean;
+  homepage: string;
+  notes: string | null;
+}
+
+export interface ResolverPresetCatalog {
+  version: string;
+  presets: ResolverPreset[];
+}
+
 export interface DNSTrustAnchor {
   id: string;
   zone_name: string;
@@ -5650,6 +5680,13 @@ export const dnsApi = {
   updateOptions: (groupId: string, data: Partial<DNSServerOptions>) =>
     api
       .put<DNSServerOptions>(`/dns/groups/${groupId}/options`, data)
+      .then((r) => r.data),
+  /** Issue #877 — curated public upstream resolvers, each carrying the DoT
+   *  hostname its certificate presents. Served from the backend so the
+   *  picker and the server-side conflict check read one table. */
+  forwarderPresets: () =>
+    api
+      .get<ResolverPresetCatalog>("/dns/forwarder-presets")
       .then((r) => r.data),
   addTrustAnchor: (
     groupId: string,
