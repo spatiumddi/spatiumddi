@@ -70,7 +70,7 @@ Always read the relevant spec doc(s) before writing code for a feature area.
 |---|---|
 | Backend API | Python 3.12+, FastAPI, SQLAlchemy 2.x (async), Alembic |
 | Task Queue | Celery + Redis |
-| Frontend | React 18 + TypeScript, Vite, shadcn/ui, Tailwind, React Query |
+| Frontend | React 18 + TypeScript, Vite, shadcn/ui, Tailwind, React Query, vitest (`npm test`, run by CI's Frontend Lint job) |
 | Database | PostgreSQL 16 (HA via Patroni or CloudNativePG) |
 | Cache / Sessions | Redis 7 |
 | Auth | python-jose + bcrypt (local), ldap3 (LDAP), joserfc (OIDC ID-token / JWKS), python3-saml (SAML), pyrad (RADIUS), tacacs_plus (TACACS+); Fernet for secrets at rest |
@@ -1010,6 +1010,9 @@ make migrate                           # apply
 make lint                              # ruff + black + mypy, eslint + prettier
 make ci                                # same three lint jobs CI runs (backend-lint + frontend-lint + frontend-build). Run before pushing.
 make trivy                             # container-image CVE scan — run before pushing ANY agent Dockerfile change.
+make openapi VERSION=2026.08.22-1      # export the OpenAPI contract the release attaches (#903). Byte-identical
+                                       #   to the release asset at the same tag; runs --network none, so it also proves
+                                       #   the export needs no database, Redis or outbound access.
 make docs                              # local Jekyll preview of docs/ on :4000 (DOCS_PORT to override); docs-down stops it.
 make docs-verify                       # diagram-geometry gate — same check CI's "Docs — Diagram Geometry" job runs.
                                        #   Run before pushing ANY docs/assets/**.svg change. Needs chromium on PATH.
@@ -1028,6 +1031,8 @@ make trivy IMAGE=kea                   #   ...one image only. Same gate CI uses 
 #     mapped table between tests, so two runs deadlock on the same locks.
 #     Reach for `-n auto` only in CI or on a bigger machine.
 make test                              # backend pytest, -n auto — CI / big-machine only; see warning above
+cd frontend && npm test                # vitest (#906) — the QR tests DECODE what the component renders, since a
+                                       #   transposed row scans as nothing and neither review nor tsc can see it.
 make test-one T=tests/test_health.py::test_liveness   # ← PREFER THIS LOCALLY. Serial, ~5 min per ~110 tests.
                                        #   Or several files at once, still serial:
                                        #   docker compose -f docker-compose.dev.yml exec -T api \

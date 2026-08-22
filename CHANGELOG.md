@@ -20,6 +20,760 @@ the formatter handles the rest.
 
 ---
 
+## 2026.08.22-1 — 2026-08-22
+
+**The "stored, shipped, never rendered" release.** One bug class runs
+through most of this one, and it is the worst kind a control plane can
+have: a setting the operator sets, the API returns, the UI displays and
+the ETag hashes — that never reaches the file the daemon actually reads.
+Every symptom is silence. A scope's **DNS Servers option never reached
+Kea** (#856), so clients took a lease with no resolver while option 3
+worked, which is what made it look arbitrary. **Pool options, PXE
+profiles and phone classes** never reached agent-managed Kea either
+(#858) — and because the ETag *did* move when they changed, agents
+dutifully resynced and re-rendered byte-identical config. **`acl {}`
+definitions were never rendered at all** (#899): the ACLs tab stored,
+listed and edited rows that applied to nothing, and citing one took the
+group's whole config down rather than losing one statement.
+`DNSServerOptions.forward_policy` was settable, persisted and shipped,
+and no `forward` statement was ever written — so `only`, which is how an
+operator forces every query through a filtering upstream, silently
+behaved as BIND's default `first` and let queries leak straight past it.
+`allow_transfer` was the same on both the server and the zone (#734).
+And the DNS + DHCP heartbeats declared `daemon` and `config` fields that
+neither handler read, so the degraded verdict the agents already
+computed was discarded at the door (#882).
+
+The lesson is recorded in `DNS.md` §8.2 in one line — **assert on the
+rendered config, not the stored row** — and the DHCP wire-coverage test
+now enforces it mechanically: every ConfigBundle field must be
+consciously classified as shipped-to-agents or withheld-with-a-reason,
+so adding a field fails the suite until someone makes that call.
+
+The second thread is **documents that lie about the server**. The
+published OpenAPI document expressed nullability the one way strict code
+generators cannot model, so a generated client silently lost 3,291
+schema properties and 297 query parameters — `limit` among them, so it
+could not paginate at all — while compiling cleanly and passing review
+(#907). Timestamps went out with six fractional digits, which most
+generated decoders reject, making 6 of 7 endpoints undecodable, every
+one of them a 200 OK. The agent `/config` long-poll's ETag was not a
+valid entity-tag at all, and being *strong* meant nginx's gzip filter
+deleted it outright (#862). And conformance fuzzing against a live
+appliance turned up **thirteen 5xx-class defects** (#861), including a
+password over 72 bytes 500-ing every password-gated endpoint and a
+kubelet restarting a perfectly healthy api pod every few minutes because
+it was the only workload in the chart with no probe `timeoutSeconds`.
+
+Alongside those: **global search rebuilt** (#879) — which had been
+applying no permission filtering at all, the widest read surface in the
+product and the only one that checked nothing; a **platform-wide
+scrubbed support bundle** (#875) that works on all three deployment
+shapes; a **family filter** with real SafeSearch enforcement (#878); and
+agents that now **revert to their last known-good config** and say so
+upward instead of serving one thing while the database says another
+(#882).
+
+> **Operators must pull new agent images.** The DHCP option fixes
+> (#856, #858), the TSIG `allow-transfer` grant (#734), the ACL and
+> `forward` rendering (#899), the RPZ exception + dedup fixes (#878) and
+> the last-known-good revert (#882) all live in the `dns-bind9`,
+> `dns-powerdns` and `dhcp-kea` images. A control-plane upgrade alone
+> changes none of the rendered files.
+
+### Added
+
+- **Global search v2 — ranking, RBAC, 20 types, command palette
+  (#879).** Matching, ranking and gating move out of the router into
+  `backend/app/services/search/`, and the `global_search` Copilot tool
+  now calls that engine instead of carrying its own copy of the fan-out
+  over the router's private helpers. Coverage goes 7 types → 20 through
+  a `SearchProvider` registry that the engine, the scope chips, the MCP
+  tool and `GET /search/types` all read from, so there is no second list
+  to keep in step.
+  - **Ranking is computed in SQL, before each type's `LIMIT`.** The
+    ordering complaint in the issue was the visible half of a worse
+    bug: with no `ORDER BY` the database returned any N matching rows,
+    and the exact hit was routinely not among them — which sorting in
+    Python afterwards cannot recover.
+  - Trigram GIN indexes back the leading-wildcard `ILIKE` on the tables
+    that actually grow; small tables are left unindexed on purpose.
+    Extension creation runs in a SAVEPOINT and degrades to sequential
+    scans rather than failing the upgrade.
+  - Frontend: scope chips, `sessionStorage` recents, and go-to-page
+    commands sourced from the sidebar's own nav tree (extracted to
+    `lib/navigation.ts`, so the palette cannot drift from the sidebar —
+    the same argument that shaped the #737 shortcut map).
+  - Deferred and stated: an expression index for custom-field values
+    (the field name is chosen at runtime, so no trigram index can serve
+    it), and action commands that *do* something rather than navigate.
+- **Platform-wide scrubbed support bundle (#875).** One-click
+  diagnostics archive at `POST /system/support-bundle` with `/preview`
+  and `/decode-map` beside it — superadmin, audited, and working on
+  Compose, Kubernetes and the appliance alike, unlike the appliance-only
+  diagnostics bundle it supersedes (whose pod-log and self-test halves
+  go through kubeapi and 503 everywhere else).
+  - **The premise is that attachments are public.** GitHub has no
+    private channel for this: attachment URLs on a public repo follow
+    *repository* visibility, and deleting the comment does not reliably
+    purge the file. There are no confidential issues, secret gists are
+    unlisted rather than private, and private vulnerability reporting is
+    for advisories. So the design is scrubbing, not secrecy.
+  - **Two tiers.** Secrets — Fernet blobs, bcrypt / argon2 hashes, PEM
+    private keys, JWTs, PSKs, credentials in URL userinfo — are matched
+    by field name *and* value shape and hard-excluded in **every** mode,
+    including the unscrubbed one: there is no version of "let me read my
+    own logs" improved by shipping the key that decrypts the database.
+    Identifiers are pseudonymised HMAC-deterministically off
+    `SECRET_KEY`, so mappings are stable per install (support can
+    correlate two bundles) and unguessable outside it.
+  - **Topology survives**, which is what keeps the archive worth reading
+    for a DDI product: one real /24 lands in one synthetic /24 with the
+    host octet intact, zone and subdomain grouping are preserved, and
+    loopback / link-local / multicast / `in-addr.arpa` pass through
+    untouched because they identify nobody and are load-bearing in a
+    log.
+  - Two choices are product-specific rather than copied from sos:
+    synthetic IPv4 goes to **240.0.0.0/6, not sos's CGNAT range**,
+    because #42 makes CGNAT a real modelled concept here and obfuscating
+    into it would make a bundle read as documenting genuine CGNAT
+    deployments; and the **IPv6 interface ID is discarded rather than
+    mapped**, because a SLAAC address embeds the MAC (RFC 4291 modified
+    EUI-64) and preserving it would route hardware identity straight
+    past the MAC scrubber.
+  - Preview → review → download, because the review step is the point:
+    the operator sees the file list, what was replaced and a sample
+    before deciding to share. **The decode map is a separate endpoint
+    and never in the archive** — a bundle carrying its own decoder is
+    not scrubbed, merely inconvenient to read. Unscrubbed needs a
+    verbatim confirmation string and is named `-UNSCRUBBED-` so it is
+    recognisable in a downloads folder a week later.
+  - A last-chance **safety net** sweeps the assembled text and *reports*
+    what it caught, in the manifest and in red in the UI: a net firing
+    means a collector has a bug, and hiding that would let the bug live
+    behind a net that may not catch the next variant.
+  - 1 MCP tool (`get_support_bundle_preview`, default **off** — a broad
+    read). No feature-module gate: an ops primitive like backup. The
+    bug-report template now says plainly that attachments are public.
+- **Family filter — adult blocklists + SafeSearch enforcement (#878).**
+  The blocklist catalog gains two kinds of thing beside the feeds it
+  already had: **templates**, entry sets shipped inline for rules with
+  no upstream feed to subscribe to, and **profiles**, named compositions
+  applied in one action.
+  - **SafeSearch ships as a template because it is not a blocklist at
+    all** — it is a set of RPZ *rewrites* pointing each engine at the
+    provider's own filtered endpoint, riding the `entry_type="redirect"`
+    path that already existed. The **Family filter** profile pairs the
+    adult and gambling feeds with the DoH / VPN / proxy bypass lists,
+    because a filter one browser setting routes around is not one.
+  - Data taken from each provider's own documentation: all **194 Google
+    country domains**, not just `www.google.com`, which is bypassed by
+    typing `google.de`; exactly the **five YouTube hostnames** Google
+    documents, since they warn that rewriting `youtube.com` / `youtu.be`
+    / `s.ytimg.com` breaks playback; `edgeservices.bing.com` alongside
+    `www.bing.com`, because it is the Edge sidebar / Copilot entry
+    point. Never wildcards — `*.youtube.com` would also match the
+    rewrite target `restrict.youtube.com`, and BIND turns that CNAME
+    loop into SERVFAIL.
+  - **Applying a profile assigns the lists to nothing.** Auto-scoping
+    would filter the server VLAN along with the kids' one, so assignment
+    stays a deliberate second step (see #876, which is what makes that
+    step reachable from the UI at all).
+  - `DNS.md` gains a sizing section: two RPZ records per feed entry, so
+    the Family filter's ~596k entries render ~1.2M records, measured at
+    1,192,147. BIND9 only — PowerDNS, Windows and the cloud drivers
+    render no RPZ, and §8.1 is explicit that DNS filtering is bypassable
+    at all.
+  - 1 MCP tool (`list_blocklist_templates`).
+- **Per-view blocklist scoping + full view CRUD (#876).** The backend
+  has been able to scope a blocking list to a view *or* a server group
+  since #24, but the UI only ever wrote the group half — so the family
+  filter's whole point, filtering one network and not another, was
+  unreachable from the product despite being fully implemented
+  underneath.
+  - **The Views tab is now full CRUD.** It was read-only, which meant
+    split-horizon DNS was API-only to configure at all. The editor has
+    an *Add subnets…* picker that turns IPAM prefixes into
+    `match_clients`, because "scope this to the guest VLAN" means that
+    VLAN's CIDR and retyping a prefix already modelled in IPAM is how
+    typos get in.
+  - A **scope modal** on each blocking list writes group and view
+    assignment in one PUT, preserving assignments belonging to other
+    groups; per-view chips on both tabs.
+  - **The load-bearing addition is server-side validation.**
+    `match_clients`, `match_destinations` and the view name are
+    interpolated verbatim into `named.conf`, and the name additionally
+    becomes a directory on the agent — so a malformed prefix, an
+    undefined TSIG key, a `;`-injection or a `../` traversal are now
+    422s naming the offending element. That gate matters because the
+    agent runs `named-checkconf` before swapping config in: an
+    accepted-but-invalid value does not break one view, it stops the
+    whole group's config converging, silently.
+- **Named ACLs are rendered into `named.conf` (#899).** An
+  `acl "<name>" { … };` block is now emitted **above `options`** — the
+  correctness property, since BIND resolves an `acl` where it is written
+  and a definition below its first use is an error, not a forward
+  declaration. Nested references work, because the list is emitted
+  dependency-ordered by a DFS topological sort, and **cycles are refused
+  at the commit** with a graph check: `a → b → a` is two individually
+  legal edges that per-field validation cannot see. The #876 rejection
+  of ACL names in a view's match-list is lifted.
+  - Everything that can leave a dangling reference is guarded, not just
+    creation: deleting or renaming a cited ACL is a 409 naming the
+    citers; an entry-less ACL renders `{ none; }` rather than being
+    skipped, because omitting the definition of a name that may already
+    be cited re-creates the exact outage this removes; the bundle
+    builder drops what it cannot render, loudly, since rows predating
+    this change were stored with no validation at all; and a legacy
+    cycle falls back to alphabetical order instead of raising —
+    `build_config_bundle` runs inside the agent `/config` long-poll, so
+    an exception there is not a failed edit, it is every agent in the
+    group getting a 500 on every poll, forever, with no way to fix it
+    from the UI.
+- **Upstream resolver presets carrying each provider's DoT hostname
+  (#877).** Forwarders were a free-text box, and since DoT upstream
+  forwarding (#50) that box has had a trap in it: with verification on,
+  BIND validates the upstream certificate against **one** group-level
+  `remote-hostname`, and a mismatch fails closed. An operator who knows
+  "Quad9 is 9.9.9.9" but not "…and its DoT name is `dns.quad9.net`" gets
+  a group that resolves nothing. 16 presets across 7 providers
+  (Cloudflare, Google, Quad9, Cisco OpenDNS, AdGuard, Mullvad, DNS4EU)
+  carry the addresses and the hostname together, so the two cannot be
+  filled in inconsistently.
+  - **The unit is the preset, not the provider brand.** The brands
+    publish filtering variants on adjacent addresses with *different*
+    certificate names — `1.1.1.1` is `cloudflare-dns.com` but `1.1.1.3`
+    is `family.cloudflare-dns.com` — so 1.1.1.1 beside 1.1.1.3 breaks
+    exactly like Cloudflare beside Google while looking entirely
+    deliberate.
+  - **Two levels of strictness, deliberately different.** A hard 422 for
+    what cannot work: a forwarder set spanning two certificate names
+    under verification, and an encrypted-only upstream (Mullvad answers
+    REFUSED on port 53) selected with Do53. A UI advisory only for a
+    hostname that is merely not the documented one, since providers list
+    several names per certificate and a hard error there would reject
+    working configurations.
+  - **Presets are a convenience, never a whitelist.** Unrecognised
+    addresses carry no opinion at any level — we cannot know a private
+    resolver's certificate, so silence is the only correct answer — with
+    tests pinning that private upstreams still save exactly as before.
+    Addresses are matched by value rather than spelling, so
+    `2606:4700:4700::1111` and its expanded form are one host.
+  - Every pair was verified against the provider's own documentation and
+    probed with `openssl s_client -verify_hostname`, which is what
+    `remote-hostname` does. Three values differ from what the obvious
+    sources still say: dns0.eu has shut down (not shipped), Quad9's
+    `9.9.9.10` is no longer non-validating (DNSSEC on all endpoints
+    since 2026-06-15, so it is labelled "no blocklist" only), and
+    OpenDNS FamilyShield ships IPv4-only because its IPv6 addresses are
+    not documented as family resolvers and reportedly do not filter.
+  - 1 MCP tool (`list_resolver_presets`).
+- **Operator branding — login banner, custom logo, environment strip,
+  real app title (#885, #886, #887, #888).** Four issues that all needed
+  the same missing piece: a way for the login page to know anything
+  about the operator's branding *before* a session exists. That endpoint
+  is built once here rather than three times.
+  - `GET /api/v1/settings/public` is unauthenticated, following the
+    `/auth/password-policy` precedent, and returns an explicit
+    whitelist rather than a filtered settings row, so a column added to
+    `PlatformSettings` later cannot leak through by default. Writes are
+    **superadmin-only** — a stronger gate than the `write:settings` the
+    rest of the PUT takes, because these fields render to anonymous
+    visitors and a delegated editor should not be able to put arbitrary
+    text in front of everyone.
+  - **The logo lives in Postgres**, in its own `branding_asset` table.
+    Not on a volume: the control plane is multi-node, and a file on one
+    API pod is invisible to the others — the problem that forced the
+    slot-image mirror sidecar (#296) into existence. Not a column on
+    `platform_settings` either, since that row is read on many request
+    paths and none of them should pay for a blob. **PNG only, validated
+    by magic bytes** rather than the client's declared type: the logo is
+    served same-origin, so accepting an SVG would turn a branding upload
+    into stored XSS against unauthenticated visitors.
+  - The acknowledgement checkbox gates the sign-in *and* SSO buttons,
+    since otherwise the notice is skipped by signing in through the IdP.
+    It stays a consent affordance, not an access control — the API never
+    sees it.
+  - `app_title` was already stored, already editable and already
+    documented as driving the tab and header; it reached nothing but the
+    OpenAPI page. It now drives `document.title`, the login heading and
+    the sidebar wordmark.
+  - 1 MCP tool (`find_branding_settings`, read-only by design — there is
+    no `propose_update_branding`, because the write path is
+    superadmin-only precisely because these fields render to anonymous
+    visitors, and that is not a gate to hand to a chat tool).
+- **Agents revert to their last known-good config and report it upward
+  (#882).** Non-negotiable #5's on-disk cache protects against a *dead*
+  control plane. This closes the other half — a *wrong* one: a bundle
+  that parses fine and renders config the daemon rejects.
+  - All three agents (DNS / DHCP / looking-glass) gain
+    `config_apply.py`: an `ApplyStatus` reported on the heartbeat and a
+    persisted `Quarantine`, so a failed etag is not re-applied on every
+    poll. The long-poll's 12 s wake tick plus 2 s fallback made a bad
+    bundle a re-render **loop** rather than one failure; the agent now
+    parks on the failing etag (the long-poll then blocks on a 304,
+    costing nothing) and retries on a 60 s → 5 min → 15 min ladder so a
+    transient failure still self-heals.
+  - **The rotation was the actual bug.** `previous.json` was written on
+    every *fetch*, so it meant "the bundle before this one" rather than
+    "the last one that worked" — identical only while every apply
+    succeeds, which is the case it does not exist for. It also destroyed
+    the fallback in two poll cycles: a failing bundle leaves the etag
+    unadvanced, so the next poll re-fetches the same bundle and rotates
+    it, now known-bad, over the only good config on disk. `previous` is
+    now written by an explicit `commit_config` that refuses to run if
+    `current` is not the bundle that applied.
+  - **Apply is phased — render, validate, swap-and-reload — and the
+    phase picks the recovery.** BIND validates into `rendered.new`, so a
+    `named-checkconf` failure never reached `named` and re-rendering
+    would bounce a healthy daemon to reach a state it is already in. Kea
+    is the mirror image: `config-test` rejects without touching the
+    running server, but the refused document is already at
+    `kea_config_path`, which is what Kea reads on its next start, so
+    that path always rewrites the files. Only Kea's *rejected* is a
+    verdict about the config; *socket-unreachable* is not, and reverting
+    there would discard a good bundle because Kea happened to be
+    restarting.
+  - **Reporting matters more than it sounds:** a reverted agent keeps
+    serving and keeps heartbeating, so `status`, the health check and
+    `last_seen_at` all read normal while the saved zone or scope is live
+    nowhere. The verdict lands on `config_apply_*` columns, a server-row
+    chip, a detail banner, the default-**on** `agent_config_rejected`
+    alert rule (severity from the agent's own verdict — `reverted` is a
+    warning, `revert_failed` / `no_previous` critical) and the
+    `find_agents_with_config_failures` Copilot tool. **NULL means
+    UNKNOWN, never `ok`** — an agent too old to report is exactly where
+    a silent revert would hide.
+- **Enrolment QR code when minting an API token (#906).** Getting a
+  token onto a phone meant typing or pasting it across devices — the
+  worst step in mobile sign-in, and worse than annoying: an operator who
+  cannot paste cleanly emails the credential to themselves. The
+  reveal-token modal now offers a QR in two shapes, the bare token or
+  `spatiumddi://enrol?host=…&token=…&fingerprint=…`, both already parsed
+  by the client in `spatiumddi/spatiumddi-mobile` — so the URI is a
+  **contract with another repo**, not a local convention.
+  - **The fingerprint is the interesting half.** A self-hosted control
+    plane presents a private-CA or self-signed certificate, so the
+    client has to ask the operator to confirm it — and comparing 64 hex
+    characters by eye on a phone is exactly the check people skim.
+    Scanned from inside an authenticated session, that comparison
+    becomes machine-checked.
+  - `GET /api/v1/api-tokens/enrolment-context` answers **only** when
+    SpatiumDDI owns TLS termination. On Compose or plain Kubernetes an
+    external proxy terminates TLS with a certificate this process has
+    never seen, and the honest answer is `null` with a reason: a
+    fingerprint that disagrees with the wire would make the client
+    report a mismatch on a *correct* setup, training operators to click
+    through the one warning this exists to make meaningful.
+  - The connection details come from `window.location`, not the server,
+    which behind a proxy or split DNS does not know its own externally
+    reachable address; the operator can correct them, since a laptop on
+    a VPN and a handset on wifi routinely disagree.
+  - The QR sits behind an explicit reveal and is not mounted until then
+    — it makes the credential *camera-readable*, which the masked string
+    beside it is not.
+  - **This is also where the frontend got its first test runner.**
+    vitest was added because the QR is verified by *decoding what it
+    renders*: a transposed row or an inverted polarity produces a code
+    that looks entirely normal and scans as nothing, which neither
+    review nor `tsc` can catch. `npm test` runs in the existing Frontend
+    Lint job.
+- **`openapi.json` is published as a versioned release asset (#903).**
+  With the native app in its own repo the document stopped being a file
+  a client reads off the working tree and became the contract *between
+  two repos* — which has to be versioned and fetchable, or someone
+  hand-transcribes response models and they drift within one release. A
+  new `export-openapi` job attaches it to every CalVer tag, and
+  `make openapi VERSION=…` reproduces the identical bytes locally and in
+  the client repo's CI.
+  - `info.version` was hardcoded `0.1.0` in `create_app()` while
+    `settings.version` already carried the real one, so every release
+    would have published a spec claiming to be 0.1.0 — a generated
+    client stamped with a version that never changes, defeating the
+    entire point of pinning. Fixed at the source, so a *running* server
+    also stops misreporting itself at `/api/docs`.
+  - The export goes through `app.openapi()` and never
+    `fastapi.openapi.utils.get_openapi`, which would silently drop the
+    `HTTPValidationError.detail` widening ~270 handlers depend on;
+    `info.title` is pinned to the product name, so exporting from a
+    branded install (#886/#888) cannot publish that install's name as
+    the name of the public API. Output is `sort_keys`-canonical, so two
+    runs at one tag are byte-identical and the release-to-release diff
+    stays readable.
+  - Retained on **every** release via the pruner's "unknown / future
+    asset — leave untouched" branch, because it is the contract for
+    pinning an *old* server: **do not add a pattern for it to
+    `scripts/prune-release-assets.sh`**.
+- **Per-list control over whether feed entries block subdomains
+  (#894).** #878 set every feed-sourced entry to wildcard, which is
+  right for all 19 catalog sources but was a global constant — and wrong
+  for a threat-intel feed listing individual C2 FQDNs, where blocking
+  the parent domain is over-blocking.
+  `DNSBlockList.feed_entries_are_wildcard` makes it a per-list choice,
+  defaulting true so nothing changes for existing lists.
+  - **Flipping it restamps the rows already imported.** The refresh task
+    diffs by domain and never revisits an unchanged one, so without that
+    the toggle would appear to do nothing until the feed's contents
+    happened to churn — the operator's stated intent silently deferred
+    for days. Measured rather than assumed: 464k rows, ~7 s, on a
+    2-core dev box. Kept synchronous deliberately, because a background
+    job would set the flag while the rows lagged, reintroducing the
+    exact state the restamp exists to prevent.
+  - `parse_feed_detailed` reports how many lines arrived `*.`-prefixed
+    — that prefix is the feed *declaring* it means "and every
+    subdomain" — so an apex-only list fed such a source logs that it is
+    overriding a stated intent rather than doing it silently.
+
+### Changed
+
+- **The OpenAPI document now states nullability the way code generators
+  read it (#907).** FastAPI emits OpenAPI 3.1's `anyOf` union with the
+  JSON Schema `null` type; a generator that cannot model the null arm
+  skips the member, and skipping a member drops **the whole property**
+  from the generated type, with a warning rather than an error. The
+  document now publishes the plain schema with the property out of
+  `required` — the load-bearing half, since 971 of them were nullable
+  *and* required.
+  - **Request bodies keep their `required` list.** On the way out it
+    describes what the server sends; on the way in it is what the server
+    *enforces*, so publishing a no-default `X | None` field as optional
+    would have a client omit a key and take a 422 back.
+  - The trade is written down in `API.md`: the server still *sends*
+    `null` rather than omitting the key, so a strict response validator
+    now sees an explicit null the schema no longer admits. Taken
+    deliberately — `exclude_none` on responses would change the wire for
+    every existing client to fix what is a documentation defect, and a
+    validator complaint is loud where the generated-code failure is
+    silent.
+- **Timestamps are RFC 3339 with exactly three fractional digits
+  (#907).** `datetime.isoformat()` emitted six, and none at all on a
+  whole second — both legal, neither what most generated decoders
+  accept, and the second is the nastier: a decoder configured *for*
+  fractional seconds fails on the values that have none, so it breaks
+  depending on when a row happened to be written. `format: date-time` is
+  unchanged, so a generator still emits a date decoder rather than a
+  string; only the precision is pinned. Three response models
+  (`AuditLogResponse`, `SessionRow`, `UserResponse`) that carried their
+  timestamps as pre-formatted strings are now declared `datetime` and
+  serialised like everything else.
+- **Agent `/config` ETags are now weak and quoted — `W/"sha256:<hex>"`
+  (#862).** The bare form was not a valid entity-tag at all, and a
+  *strong* validator asserts byte-for-byte identity, so nginx's gzip
+  filter deleted it rather than lie about a body it had just
+  transformed. The comparison accepts the weak, strong-quoted and legacy
+  bare spellings, which is load-bearing: without that tolerance every
+  agent in the fleet re-downloads a full bundle on its first poll after
+  upgrading.
+- **`gzip_vary on` in both nginx configs (#862)** — a separate
+  cache-correctness bug affecting every JSON response, not just agent
+  config: without it a shared cache can serve a gzipped body to a client
+  that never asked for one.
+- **The api workload declares probe `timeoutSeconds` (#861).** It was
+  the only workload in the chart without one, inheriting the Kubernetes
+  1 s default on a single-worker uvicorn whose probe p95 runs 1.2–2.3 s
+  under load — so three straight tail probes had the kubelet restarting
+  a **healthy** pod every few minutes, observed live as recurring
+  ~1-minute windows of 502s across every route. `timeoutSeconds: 5` on
+  both probes (liveness `failureThreshold` 3 → 4), and the frontend
+  workload gained the same in both manifests rather than assuming nginx
+  is too simple to blow a 1 s budget.
+- **PDF renders leave the event loop (#861).** The conformity, audit and
+  IPAM tree exports called `doc.build()` inline on that same
+  single-worker loop; all three now run in `asyncio.to_thread`, so a
+  whole-space export cannot stall the probe path.
+- **The password policy has a real maximum (#861).** bcrypt reads only
+  the first 72 bytes and raises above it, so every hashing path now
+  truncates identically to the verify path — they must agree on the
+  boundary or a long password would hash fine and never verify — and the
+  operator gets an actionable message instead of a 500 from inside the
+  hash. The limit is stated in **bytes**, which is what bcrypt measures:
+  40 two-byte characters are over the line while 71 ASCII ones are not.
+- `view_validation.py` becomes `named_conf_validation.py` (#899), since
+  it now gates two kinds of operator text that reach the same file.
+- The bug-report template states that GitHub attachments are public
+  (#875), and the Makefile gains an `openapi` target (#903).
+
+### Fixed
+
+- **A scope's DNS Servers option never reached the generated Kea config
+  (#856).** Option 6 was stored correctly, returned correctly by the API
+  and shown correctly in the UI, then silently omitted from
+  `kea-dhcp4.conf` — so clients got a lease with no resolver. Option 3
+  worked, which is what made it look arbitrary. Root cause was a
+  vocabulary mismatch: the control plane ships the canonical name
+  `dns-servers`, and the agent's v4 renderer looked it up with a
+  hand-written list checking only `dns_servers` and
+  `domain-name-servers`. A missing key is indistinguishable from an
+  unset option, so nothing complained.
+  - The agent's v4 path is now driven by one canonical-name → Kea-name
+    table mirroring the backend's, which also fixed three further
+    defects the hand-written list had accumulated: **option 67
+    (`bootfile-name`) was dropped the same way**, so PXE boot files set
+    at scope level never reached clients; options 2, 26, 28 and 150 were
+    not handled at all; and emission order followed the caller's dict,
+    so an unchanged bundle could rewrite the file and bounce Kea.
+  - **Option 150 needed more than a name.** Kea has no built-in
+    definition for it and fails the *whole* config, so passing it
+    through naively would have converted a silently dropped option into
+    a DHCP outage. Both renderers now emit the matching `option-def`
+    alongside it, collected by walking the assembled `Dhcp4` block so
+    subnet, pool, reservation, client-class and global option data are
+    covered by construction.
+  - Also fixed an operator-precedence bug found while confirming the
+    workaround: the name lookup was written as a bare `or` beside a
+    conditional, which parses as `(name or lookup) if code else None`,
+    so an option supplied by *name* with no `code` was discarded rather
+    than used as-is.
+- **Pool options, PXE classes and phone classes never reached
+  agent-managed Kea (#858)** — which is how both the OS appliance and
+  the Compose stack run DHCP. Each failed silently, and because the ETag
+  moved when they changed, agents even re-synced and re-rendered
+  byte-identical config: editing a PXE profile bumped the hash, broke
+  every agent's long-poll and delivered a payload with no PXE classes in
+  it. Pool `class_restriction` was honoured only for v6
+  prefix-delegation pools, so a class-restricted **address** pool served
+  every client instead of the class it named.
+  - **Raw-code options needed measurement, not reasoning.** Kea does not
+    reject an unknown `code:NN` as undefined — it types it BINARY, so a
+    string value fails and takes the whole config down. But defining
+    every code is equally fatal, because Kea refuses to redefine one it
+    already types correctly. So the definition table is **measured
+    against Kea 3.0.3**: each of 43 / 132 / 150 / 160 / 161 / 176 / 242
+    confirmed to fail bare and accept the definition given. A raw code
+    is emitted only when a matching definition is present and dropped
+    with a warning otherwise, which bounds the blast radius and makes
+    both no-definition cases — a last-known-good cache written before
+    this change, and an older control plane — degrade to pre-#858
+    behaviour rather than wedging the daemon at the moment the cache
+    matters most.
+  - The DHCP wire-coverage test is the part meant to stop the
+    next one: every ConfigBundle field must be consciously classified as
+    shipped or withheld-with-a-reason, so adding a field fails the suite
+    until someone makes that call. That is the step #430, #856 and both
+    halves of #858 all skipped.
+- **DNS drift and sync-with-servers were REFUSED on every zone against
+  agent-managed BIND9 — the flagship deployment — 100% of the time, for
+  two releases (#734).** Two independent defects that had to meet in the
+  middle: the control plane transferred **unsigned**, while the agent
+  grants `allow-transfer` to the group's TSIG *key* rather than to a
+  source address (behind an HA VIP the request can arrive from any node,
+  and on the appliance the address is not knowable at render time); and
+  the agent granted transfer on *dynamic* zones only, leaving every
+  static zone — most of them — at BIND's `none` default.
+  - The shared AXFR helper now takes an optional key and builds the
+    `dns.tsig.Key` explicitly, probing the algorithm: an unknown one is
+    a valid DNS *name*, so nothing else rejects it until mid-transfer.
+    An unusable key **raises rather than degrading to an unsigned
+    transfer**, which would turn a fixable config error into the same
+    permanent REFUSED this fixes.
+  - Signing is gated on the driver **and** on the server being
+    agent-managed: a `bind9` row can be an operator's own server,
+    authorised by address, whose `named.conf` never defined our key —
+    signing that yields `PeerBadKey`. Windows Path A is excluded for the
+    same reason. A keyless agent-managed group reports `unsupported`
+    naming the missing key, instead of a refusal pointing at a
+    `named.conf` the agent owns.
+  - On the agent, the grant moves to the **options** block so it covers
+    every zone type, with a zone-level override re-including the keys
+    (in BIND a zone clause shadows options completely). Technitium falls
+    back to `Allow` + `zoneTransferTsigKeyNames`, verified against
+    upstream `DnsServer.cs` before shipping: the two gates are ANDed, so
+    naming keys makes a signature *required* rather than merely
+    permitted — narrower than an address ACL, not wider.
+  - **The repo had zero automated zone-transfer coverage of any kind.**
+    The one check aimed at it was a permanent `pytest.skip` whose
+    docstring claimed CI covered it; that workflow only ever ran
+    `dig version.bind CH TXT`. A new live check renders config with the
+    real driver, starts the real pinned `named` and asserts six outcomes
+    over a real socket (signed with either granted key → zone returned;
+    unsigned, wrong secret, wrong algorithm, ungranted key → rejected),
+    against a deliberately **non-dynamic** zone, because the pre-fix
+    grant existed only on dynamic ones. It never skips: a missing
+    `named` exits non-zero, because "the check quietly didn't run" is
+    the failure mode being replaced.
+- **Thirteen 5xx-class defects found by conformance fuzzing a live
+  appliance (#861).** Highlights: a password over 72 bytes or containing
+  a NUL byte **500'd every password-gated endpoint**, because
+  `bcrypt.checkpw` raises on inputs it cannot digest while the schemas
+  allowed 256 characters; the admin schema-health panel had answered 500
+  on every call since #565 moved its head reader, on a perfectly healthy
+  appliance; the delete-appliance **denial** path passed a non-existent
+  column to `AuditLog`, so auditing the denial raised and the endpoint
+  500'd on every wrong password — 16 of 77 tracebacks, sitting *in
+  front* of the bcrypt fix on the same path; the agent PSK gates called
+  `hmac.compare_digest` on a `str`, which raises on non-ASCII, so a
+  wrong key answered 500 instead of 401; `CSRGenerate.country` was
+  bounded to 2 *characters* while `cryptography` counts encoded *bytes*;
+  and the import connection fields accepted any unicode into what is an
+  ASCII-only URL and HTTP header on the wire.
+  - A database constraint answer is now 409 or 422, never 500 — but
+    **only** for unique violations (23505). A blanket handler would
+    answer for NOT NULL, FK and CHECK violations, which are *our* bugs
+    and not the client's, and would have blinded the conformance suite's
+    own no-5xx assertion to exactly the bug class item 3 above belongs
+    to.
+  - `application/pdf` and the documented 502 on import
+    test-connection / preview are now declared, so a schema-aware client
+    can tell the designed gateway answer from an infrastructure one.
+  - `_block_to_response` omitted `do_not_probe` / `do_not_probe_reason`,
+    so a block the operator excluded from probing read as probe-eligible
+    everywhere and a UI round-trip persisted that back.
+- **Every SAML login against a hosted IdP failed with
+  `saml_state_missing` (#873).** The `saml_flow` cookie was set
+  `SameSite=Lax`, and SAML's Web Browser SSO profile returns the
+  assertion as a **cross-site POST** — which browsers never send a Lax
+  cookie on. (Contrast OIDC, whose flow cookie is legitimately Lax: its
+  provider returns the browser with a cross-site GET redirect, which Lax
+  does permit.) The policy is now picked per deployment from the
+  external URL's scheme: `https` gets `SameSite=None; Secure`, `http`
+  stays Lax, since browsers honour `None` only alongside `Secure`.
+  - An earlier cut refused SAML outright over HTTP; that would have
+    broken installs working today, because an IdP on the same
+    registrable domain POSTs same-site. Instead a *missing* cookie over
+    HTTP — the signature of a cross-site IdP — returns a new
+    `saml_requires_https` rather than the misleading
+    `saml_state_missing`.
+  - The login page had no SAML branch at all, so every SAML failure
+    rendered a bare "Login failed." Six messages added, plus the
+    `oidc_rejected` twin that was equally unhandled.
+- **The scope-create dead end with a FortiGate group member (#865).** A
+  create in a group with a FortiGate member 409s when the matching
+  interface already carries a DHCP-server object SpatiumDDI did not
+  create — and rolls back, so the only adopt affordance (Force Sync on
+  the server page) never had a scope to push. The modal now tries
+  without the flag first and, on an adoption 409, offers *Adopt existing
+  & save*; `CloudAdoptionRequired` carries `X-Adoption-Required: true`
+  so clients can tell it from the duplicate group+subnet 409, where an
+  adopt-retry would be wrong. That header is also now in the CORS
+  `expose_headers` list — without it a cross-origin frontend reads
+  `undefined` and the whole feature degrades to the generic 409 it set
+  out to fix.
+- **Editing an IP to `static_dhcp` was a silent no-op on the DHCP side
+  (#867).** The edit modal had no scope picker and never created the
+  reservation, leaving a row that looks reserved while the DHCP server
+  keeps leasing the address — and the create modal's partial-failure
+  message even instructed the operator to "edit the row to retry the
+  reservation", a path that did not exist. The edit modal now mirrors
+  the create pattern, including the inline create-scope escape hatch and
+  the idempotent retry-by-saving-again contract.
+- **RPZ zones stopped being killed whole by exceptions and overlapping
+  lists (#878).** BIND rejects a malformed zone *whole*, so any one of
+  these silently stopped every other entry being enforced — and nothing
+  caught it, because `validate()` runs `named-checkconf`, which never
+  reads zone files. The agent renderer never filtered entries against
+  `exceptions` (the control-plane one did), so excepting a domain a feed
+  lists put a block CNAME and a passthru CNAME on one owner name.
+  Nothing deduped owner names, so one domain in two lists with different
+  block modes did the same — not hypothetical: applying the Family
+  filter with one feed set to sinkhole renders 596,322 entries into
+  596,176 owners with 3 genuine rdata collisions, and pre-fix those
+  three would have taken all 596k entries offline. The two renderers
+  also disagreed about `redirect` (CNAME versus `IN A`), so a hostname
+  target produced rdata BIND rejects; Technitium routed `redirect` into
+  its **allow** set, silently inverting a SafeSearch rule into an
+  exemption; feed entries never set `is_wildcard`, so every subscribed
+  list blocked apexes only; and `entry_count` double-counted on a first
+  sync, reporting 33k for a 16k-domain feed.
+- **Global search applied no permission filtering at all (#879)** — the
+  widest read surface in the product and the only one that checked
+  nothing, so an IPAM-only operator could read DNS zones and records out
+  of a palette whose `GET /dns/zones` would have 403'd them. The Copilot
+  tool had the same hole. Two more found alongside: the query was
+  interpolated raw into `%…%`, so searching `50%` matched every row in
+  every table; and `_statement_references` resolved the FROM graph once
+  per soft-delete model, ~1.9 ms × 8 — **~16 ms of Python on every ORM
+  SELECT in the application**, invisible because it was uniform.
+  Resolving it once cut a 20-provider fan-out over 500k addresses from
+  734 ms to 93 ms.
+- The Blocklists tab classified a view-scoped list as "Available (not
+  applied)" — reporting a list actively filtering a VLAN as doing
+  nothing — and its Apply/Detach toggle keyed off that section rather
+  than the actual group relationship, so *Detach* on a view-scoped list
+  was a no-op that looked broken (#876).
+- The looking-glass agent's `daemon_status` was computed by its sync
+  loop and never put on the wire; a config **Kea refused** was reported
+  as a success, advancing the etag, logging `dhcp_config_applied` and
+  stamping the Kubernetes readiness marker; and `named-checkconf` writes
+  its diagnostics — with the line number — to **stdout**, which
+  `validate()` never read, so the error was always the empty string
+  (#882).
+- The supervisor's console-mode plane bypassed `_fire_host_config` and
+  therefore had none of #387's protections: a failing reload left the
+  applied sidecar unchanged, the next heartbeat rewrote the trigger, its
+  rename re-fired the `.path` unit, and it repeated every ~30 s forever
+  with nothing reported upward (#882).
+
+### Security
+
+- **The rendered PowerDNS config stopped leaking its credentials
+  (#869).** CodeQL flagged `pdns.conf` being written in cleartext with
+  the REST api-key inlined; the file mode was the visible half, and
+  chasing it turned up the same secrets going somewhere worse.
+  - **On disk:** `pdns.conf` and `zones.json` were written at the umask
+    default, typically 0644. `zones.json` was not in the alert and is
+    the less obvious of the two — `update_tsig_keys` carries whole key
+    dicts including `secret`, the material authorising dynamic updates.
+    Both now use the shared 0600 writer.
+  - **Off the appliance:** the admin pusher uploads every text file
+    under `rendered/` to the control plane, where
+    `GET /servers/{id}/rendered-config` served it to **any authenticated
+    user** — the DNS router gate is satisfied by read on any `dns_*`
+    resource, so the builtin Viewer could read a live api-key and every
+    TSIG secret. File modes do nothing about that path. The agent now
+    redacts credential values at the single chokepoint every pushed file
+    passes through, and **the endpoint is superadmin-only**. Redaction
+    is a denylist over arbitrary rendered output; the gate is the part
+    that does not depend on anticipating the format.
+  - **Upgrade remediation:** shipping the fix does not re-mode what is
+    already there — the old render survives as `rendered/` until the
+    next structural change, then as `rendered.prev/` for one more cycle,
+    so a still-live credential could sit at 0644 indefinitely on a
+    stable install. `render()` now hardens both trees first.
+  - Four copies of `os.open(O_NOFOLLOW, 0o600)` had drifted apart: only
+    three did tmp-and-replace, and none checked how many bytes
+    `os.write` returned. A short write silently truncated, and a
+    truncated `zones.json` raises nowhere — the structural etag advances
+    while the zone state is never applied and never retried. All four
+    now route through one writer that loops the write and raises if it
+    stalls.
+- `golang` 1.26.5 → 1.26.6-alpine in the GoBGP builder (#871), and the
+  pin's comment was rewritten in the past tense so it stops naming a
+  version the Dockerfile no longer uses — Dependabot updates the `FROM`
+  line and cannot touch the comment above it, so any wording anchored to
+  the current pin is guaranteed to go stale at the next bump (#872).
+
+### Migrations
+
+- `f4b91d38a70c` — trigram GIN indexes for global search (#879).
+- `e9c2d47b1a63` — `config_apply_*` columns on `dns_server`,
+  `dhcp_server` and `looking_glass_collector`, with a partial index over
+  the failing states only (#882).
+- `d3f8b6c02a41` — branding banners, logo and title columns plus the
+  `branding_asset` table (#885–#888).
+- `b7e4a1c56d93` — backfill `is_wildcard` on feed-sourced blocklist
+  entries (#878).
+- `c8a3f207e51b` — `dns_blocklist.feed_entries_are_wildcard` (#894).
+
+### Breaking
+
+- **`GET /api/v1/dns/servers/{id}/rendered-config` is now
+  superadmin-only (#869).** It served a live PowerDNS api-key and every
+  TSIG secret to any user holding read on any `dns_*` resource,
+  including the builtin Viewer. No shipped UI consumes it; automation
+  using a lower-privileged token will now get a 403, which is the
+  intent.
+- **Regenerate any OpenAPI-derived clients (#907).** Nullable properties
+  are now published as the plain schema with the property absent from
+  `required` rather than as a `null` union, and timestamps carry three
+  fractional digits instead of six. The wire is unchanged in what it
+  *means* — an absent key and an explicit null both decode to nil — but
+  a validator asserting the old document, or a client comparing
+  timestamp strings byte-for-byte, will notice.
+- **Passwords are now bounded at 72 bytes with a policy message
+  (#861),** which is what bcrypt reads and the point above which it
+  raises. Nothing that previously succeeded now fails: a longer password
+  could never have been set, because hashing it 500'd.
+
 ## 2026.08.12-1 — 2026-08-12
 
 **The migration + field-hardening release.** Two additions change what
