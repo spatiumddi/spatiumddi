@@ -19,6 +19,7 @@ import {
   formatApiError,
 } from "@/lib/api";
 import { copyToClipboard } from "@/lib/clipboard";
+import { SupportBundleSection } from "./SupportBundleSection";
 
 /**
  * Diagnostics → Errors (issue #123).
@@ -46,8 +47,15 @@ const GITHUB_BODY_URL_CAP = 6800;
 type AckedFilter = "all" | "yes" | "no";
 type ServiceFilter = "all" | "api" | "worker" | "beat";
 
+type DiagTab = "errors" | "support-bundle";
+
 export function DiagnosticsErrorsPage() {
   const qc = useQueryClient();
+  // The support bundle lives here rather than on its own page: this is
+  // where an operator already is when something has gone wrong, and the
+  // "Submit bug" button below opens the GitHub issue the bundle is meant
+  // to be attached to.
+  const [tab, setTab] = useState<DiagTab>("errors");
   const [serviceFilter, setServiceFilter] = useState<ServiceFilter>("all");
   const [ackedFilter, setAckedFilter] = useState<AckedFilter>("all");
   const [sinceHours, setSinceHours] = useState<number | null>(null);
@@ -100,7 +108,7 @@ export function DiagnosticsErrorsPage() {
         <div className="flex flex-wrap items-center gap-3">
           <div className="flex items-center gap-2">
             <AlertTriangle className="h-5 w-5 text-muted-foreground" />
-            <h1 className="text-lg font-semibold">Diagnostics — Errors</h1>
+            <h1 className="text-lg font-semibold">Diagnostics</h1>
           </div>
           {statsQ.data && (
             <div className="flex items-center gap-3 text-xs text-muted-foreground">
@@ -186,64 +194,96 @@ export function DiagnosticsErrorsPage() {
         </div>
       </div>
 
-      <div className="flex-1 overflow-auto">
-        {listQ.isLoading ? (
-          <div className="p-6 text-sm text-muted-foreground">
-            <Loader2 className="mr-2 inline h-3.5 w-3.5 animate-spin" />
-            Loading…
-          </div>
-        ) : listQ.isError ? (
-          <div className="p-6 text-sm text-destructive">
-            Failed to load errors.
-            {(listQ.error as Error)?.message
-              ? ` ${formatApiError(listQ.error)}`
-              : ""}
-          </div>
-        ) : errors.length === 0 ? (
-          <div className="p-6 text-sm text-muted-foreground">
-            No errors recorded. The capture handler is wired and will land
-            uncaught exceptions here as they happen.
-          </div>
-        ) : (
-          <table className="w-full text-sm">
-            <thead className="sticky top-0 z-10 bg-card text-left text-xs text-muted-foreground">
-              <tr className="border-b">
-                <th className="w-8 px-2 py-2"></th>
-                <th className="px-3 py-2">When</th>
-                <th className="px-3 py-2">Service</th>
-                <th className="px-3 py-2">Class</th>
-                <th className="px-3 py-2">Message</th>
-                <th className="px-3 py-2">Route / Task</th>
-                <th className="px-3 py-2 text-right">Count</th>
-                <th className="px-3 py-2">State</th>
-                <th className="px-3 py-2 text-right">Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              {errors.map((row) => (
-                <ErrorRow
-                  key={row.id}
-                  row={row}
-                  expanded={expandedId === row.id}
-                  onToggleExpand={() =>
-                    setExpandedId(expandedId === row.id ? null : row.id)
-                  }
-                  onAck={() => ackMut.mutate(row.id)}
-                  onSuppress={() => suppressMut.mutate(row.id)}
-                  onDelete={() => deleteMut.mutate(row.id)}
-                  pendingAck={ackMut.isPending && ackMut.variables === row.id}
-                  pendingSuppress={
-                    suppressMut.isPending && suppressMut.variables === row.id
-                  }
-                  pendingDelete={
-                    deleteMut.isPending && deleteMut.variables === row.id
-                  }
-                />
-              ))}
-            </tbody>
-          </table>
-        )}
+      <div className="border-b bg-card px-6">
+        <div className="-mb-px flex gap-1">
+          {(
+            [
+              ["errors", "Errors"],
+              ["support-bundle", "Support bundle"],
+            ] as const
+          ).map(([key, label]) => (
+            <button
+              key={key}
+              type="button"
+              onClick={() => setTab(key)}
+              className={`-mb-px border-b-2 px-3 py-1.5 text-sm ${
+                tab === key
+                  ? "border-primary text-foreground"
+                  : "border-transparent text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
       </div>
+
+      {tab === "support-bundle" ? (
+        <div className="flex-1 overflow-auto p-6">
+          <div className="mx-auto max-w-4xl">
+            <SupportBundleSection />
+          </div>
+        </div>
+      ) : (
+        <div className="flex-1 overflow-auto">
+          {listQ.isLoading ? (
+            <div className="p-6 text-sm text-muted-foreground">
+              <Loader2 className="mr-2 inline h-3.5 w-3.5 animate-spin" />
+              Loading…
+            </div>
+          ) : listQ.isError ? (
+            <div className="p-6 text-sm text-destructive">
+              Failed to load errors.
+              {(listQ.error as Error)?.message
+                ? ` ${formatApiError(listQ.error)}`
+                : ""}
+            </div>
+          ) : errors.length === 0 ? (
+            <div className="p-6 text-sm text-muted-foreground">
+              No errors recorded. The capture handler is wired and will land
+              uncaught exceptions here as they happen.
+            </div>
+          ) : (
+            <table className="w-full text-sm">
+              <thead className="sticky top-0 z-10 bg-card text-left text-xs text-muted-foreground">
+                <tr className="border-b">
+                  <th className="w-8 px-2 py-2"></th>
+                  <th className="px-3 py-2">When</th>
+                  <th className="px-3 py-2">Service</th>
+                  <th className="px-3 py-2">Class</th>
+                  <th className="px-3 py-2">Message</th>
+                  <th className="px-3 py-2">Route / Task</th>
+                  <th className="px-3 py-2 text-right">Count</th>
+                  <th className="px-3 py-2">State</th>
+                  <th className="px-3 py-2 text-right">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {errors.map((row) => (
+                  <ErrorRow
+                    key={row.id}
+                    row={row}
+                    expanded={expandedId === row.id}
+                    onToggleExpand={() =>
+                      setExpandedId(expandedId === row.id ? null : row.id)
+                    }
+                    onAck={() => ackMut.mutate(row.id)}
+                    onSuppress={() => suppressMut.mutate(row.id)}
+                    onDelete={() => deleteMut.mutate(row.id)}
+                    pendingAck={ackMut.isPending && ackMut.variables === row.id}
+                    pendingSuppress={
+                      suppressMut.isPending && suppressMut.variables === row.id
+                    }
+                    pendingDelete={
+                      deleteMut.isPending && deleteMut.variables === row.id
+                    }
+                  />
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      )}
     </div>
   );
 }

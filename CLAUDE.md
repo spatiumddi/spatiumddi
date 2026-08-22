@@ -583,11 +583,41 @@ suggestion, free-space treemap.
 - ✅ [**PCAP capture trigger**](https://github.com/spatiumddi/spatiumddi/issues/59) — shipped `2026.06.15-1`: on-demand tcpdump as an RBAC-gated/audited Tools page, both server-container and appliance-host (real-NIC) vantages, keep-partial-on-Stop, `.pcap` download, 4 Operator Copilot tools.
 - ❌ [**ACL / prefix-list generator**](https://github.com/spatiumddi/spatiumddi/issues/60) — **closed as not planned** 2026-06-17, in the same triage pass that closed #40. No rationale was recorded on the issue; re-open it rather than re-filing if the need comes back.
 - ✅ [**Config-drift report (full record diff)**](https://github.com/spatiumddi/spatiumddi/issues/61) — **backend shipped `2026.06.11-1`**: `GET …/zones/{id}/drift` AXFRs the live zone from every server in the group and diffs it against the DB — extra-on-server (manual host change) / missing-on-server / in-sync, per server, read-only — plus a `find_dns_zone_drift` MCP tool. **UI shipped `2026.07.30-1` (#735)** — a Drift tab on the zone detail, fetched on demand because one call fans out an AXFR to every server in the group. That PR also fixed the reason nothing had ever consumed the endpoint: `dns.query.xfr` takes an IP *literal* and raises a bare, message-less `ValueError` for a hostname before sending a packet, so every hostname-addressed server failed 100% of the time reporting `""` as the error. **[#734](https://github.com/spatiumddi/spatiumddi/issues/734) closed the last gap** — agent-managed BIND9 / Technitium reached the server but got `REFUSED`, because the control plane transferred unsigned while the agent granted `allow-transfer` only to the group key and only on *dynamic* zones; separately, `DNSServerOptions.allow_transfer` and `DNSZone.allow_transfer` were both settable, persisted and **never rendered at all** (a silent no-op). Now: the shared AXFR helper takes an optional `TsigKey`, `resolve_group_transfer_key` picks the same key the agent granted (legacy group key first, then operator `DNSTSIGKey` rows by name — matching the bundle's ordering, which is why `op_keys` is now `order_by(name)`), the BIND9 agent renders the grant in the **options** block so it covers every zone type, Technitium falls back to `Allow` + `zoneTransferTsigKeyNames` (verified against upstream `DnsServer.cs`: the two gates AND, so naming keys makes a signature *required*), and a keyless group reports `unsupported` naming the missing key instead of a misleading ACL error. Windows Path A is deliberately excluded from `AXFR_TSIG_DRIVERS` — it authorises by address, so signing would break a working pull. **Drift now works on every driver except PowerDNS**, which implements no record pull.
-- ⬜ [**Support bundle**](https://github.com/spatiumddi/spatiumddi/issues/875) — one-click scrubbed diagnostics
-  export for bug reports: versions, health, config with secrets
-  redacted, recent logs and audit rows. Includes deciding the private
-  submission channel, since a GitHub issue is public and a bundle is
-  not.
+- ✅ [**Support bundle**](https://github.com/spatiumddi/spatiumddi/issues/875)
+  — platform-wide scrubbed diagnostics export at
+  `POST /system/support-bundle{,/preview,/decode-map}`
+  (`backend/app/services/support_bundle/`), superadmin + audited, and
+  working on **all three deployment shapes** — the appliance-only
+  `/appliance/diagnostics/bundle` it supersedes 503s on compose and
+  plain k8s because its pod-log and self-test halves go through kubeapi.
+  **Research finding that shaped the design:** GitHub has no private
+  channel for this. Attachment URLs on a public repo follow *repository*
+  visibility, and deleting the comment does not purge the file — so the
+  answer is scrubbing, not secrecy. **Two tiers:** secrets (Fernet,
+  bcrypt/argon2, PEM, JWT, PSK, TSIG) are **hard-excluded in every
+  mode** including the unscrubbed one, matched by field name *and* value
+  shape; identifiers (IPs / hostnames / MACs / usernames) are
+  pseudonymised HMAC-deterministically off `SECRET_KEY` so mappings are
+  stable per install and unguessable outside it. Topology survives —
+  same /24 → same synthetic /24 with the host octet kept; zone and
+  subdomain grouping preserved. Synthetic v4 lands in **240.0.0.0/6,
+  not sos's CGNAT range**, because #42 makes CGNAT a real modelled thing
+  here and obfuscating into it would read as genuine. The IPv6 interface
+  ID is **discarded rather than mapped** — SLAAC embeds the MAC (RFC
+  4291), so preserving it would route hardware identity past the MAC
+  scrubber. Decode map is a separate endpoint, **never in the archive**.
+  A last-chance `safety_net` sweeps the assembled text and *reports*
+  what it caught, because a net firing means a collector has a bug.
+  **Two bugs found building it, both about failure isolation:** a
+  collector that swallows its own DB error leaves PostgreSQL in
+  "transaction is aborted" so every *later* section fails and the bundle
+  blames the wrong ones — every guarded query now runs in its own
+  SAVEPOINT, as does every section. 1 MCP tool
+  (`get_support_bundle_preview`, default **off**). No feature-module
+  gate: an ops primitive like backup. **Deferred:** true streaming (a
+  zip's central directory is written last, so it needs a third-party
+  writer — bounded by per-section + 48 MB caps instead) and a CLI
+  fallback for a host that cannot serve HTTP.
 - ⬜ [**Agents never read the `previous.json` they write**](https://github.com/spatiumddi/spatiumddi/issues/882) —
   both agents persist a last-known-good bundle and neither ever loads
   it, so a bad config that passes validation but breaks the daemon has

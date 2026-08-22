@@ -782,3 +782,126 @@ InfluxDBTarget
 - System health status per component
 
 Multiple InfluxDB targets can be configured simultaneously (e.g., local InfluxDB + remote InfluxCloud).
+
+---
+
+## 9. Support bundle (issue #875)
+
+**Diagnostics → Support bundle**, or `POST /api/v1/system/support-bundle`.
+Superadmin-only and audited. Works on every deployment shape — appliance,
+docker-compose and plain Kubernetes.
+
+A one-click archive to attach to a bug report. The appliance-only
+`GET /api/v1/appliance/diagnostics/bundle` that predates it still exists;
+this is the platform-wide successor and degrades gracefully where that
+one returns 503.
+
+### The premise: attachments are public
+
+There is no private channel for this on GitHub, and that shapes the whole
+design:
+
+- Attachment URLs on a **public** repository's issues are effectively
+  world-readable. Uploads go to `private-user-images.githubusercontent.com`
+  behind short-lived JWTs, but visibility follows *repository* visibility —
+  anyone who can read the issue gets a working link. Deleting the comment
+  does not reliably purge the file.
+- GitHub has no confidential issues (GitLab does). Secret gists are
+  unlisted, not private.
+- Private vulnerability reporting exists, but it is for security advisories
+  — the wrong tool for a routine support bundle.
+
+So the bundle is **scrubbed**, not secret.
+
+### Two tiers
+
+**Hard-exclude — secrets.** Fernet blobs, bcrypt/argon2 password hashes,
+PEM private keys, JWTs, PSKs, API tokens, TSIG keys. Matched both by field
+name and by value shape, and removed in **every** mode including the
+unscrubbed one. There is no version of "let me read my own logs" that is
+improved by including the key that decrypts the database.
+
+**Pseudonymise — identifiers.** IPs, hostnames, domains, MACs, usernames
+become stable synthetic values, so the archive stays *readable*:
+
+| Real | Becomes | What survives |
+|---|---|---|
+| `10.1.2.5`, `10.1.2.9` | `240.x.y.5`, `240.x.y.9` | Same subnet, same host octet |
+| `10.1.3.5` | a different `240.x.z.5` | A different subnet reads as one |
+| `2001:db8:1::5` | `2001:db8:…` | The /64 grouping — but **not** the interface ID |
+| `aa:bb:cc:dd:ee:ff` | `02:00:00:…` | Nothing; the OUI names your hardware vendor |
+| `a.corp.example.net` | `nA.nB.dK.invalid` | Zone and subdomain grouping, subdomain depth |
+| `127.0.0.1`, `fe80::1`, `5.2.1.10.in-addr.arpa` | unchanged | These identify nobody and are load-bearing in a log |
+
+Synthetic IPv4 lands in **240.0.0.0/6**, not the CGNAT range `sos report`
+uses: SpatiumDDI models CGNAT as a real thing (#42 badges it), so
+obfuscating into it would make a bundle look like it documents genuine
+CGNAT deployments. IPv6 uses the RFC 3849 documentation prefix and names
+use the RFC 2606 `.invalid` TLD, both unmistakably synthetic. The IPv6
+interface ID is discarded rather than mapped because a SLAAC address
+embeds the MAC (RFC 4291 modified EUI-64) — preserving it would route
+hardware identity straight past the MAC scrubber.
+
+Mappings are HMAC-derived from the install's `SECRET_KEY`, so they are
+stable across bundles from one install (support can correlate two
+reports) and unguessable from outside it.
+
+### Review before you share
+
+The **preview** step is not decoration. It lists every file with its size,
+counts what the scrubber replaced, shows a sample of the output, and names
+any section that failed to collect. Read it, then download.
+
+Scrubbing is **best-effort** — the same caveat `sos report --clean` and
+GitLab's sanitizer carry. Freeform text can hold an identifier in a shape
+no pattern anticipates. Review the archive before attaching it.
+
+### The decode map
+
+Support answers in synthetic terms: "`n5.d12.invalid` is failing its health
+check." `POST /system/support-bundle/decode-map` returns synthetic → real
+so you can act on that.
+
+It is **never inside the archive**. A bundle carrying its own decoder is
+not scrubbed, it is merely inconvenient to read. The endpoint regenerates
+the mapping rather than storing it, which works because the mapping is
+deterministic per install.
+
+### The unscrubbed variant
+
+`scrubbed: false` keeps real hostnames and addresses, for debugging your
+own systems. It requires the confirmation string
+`I understand this bundle is not anonymised` sent verbatim, and the file is
+named `…-UNSCRUBBED-….zip` so it is recognisable in a downloads folder a
+week later. Credentials are still excluded.
+
+### Contents
+
+`manifest.json` plus: `versions.json` (product, appliance, Alembic head vs
+database head, image tags), `health/` (self-test, connection counts, table
+sizes), `errors/internal-errors.json` (#123), `alerts/events.json`,
+`audit/recent.json`, `activity/recent.log` (merged, time-ordered),
+`config/` (feature modules, sanitised platform settings, integration
+flags), `agents/servers.json`, `system/` (environment, `/proc`), plus
+`containers/` and `logs/` where the deployment exposes them.
+
+A section that cannot be collected becomes a note explaining **why**, not
+an absence — an empty section and an inapplicable one are otherwise
+indistinguishable. Each runs inside its own savepoint, so one failure
+cannot abort the transaction and take every later section with it.
+
+### Limits
+
+- **Assembled in memory**, not streamed: a zip's central directory is
+  written last, so real streaming needs a third-party writer. Bounded
+  instead by per-section caps (1 MB, 2 MB for logs) and a 48 MB total, with
+  truncation marked in-file and in the preview.
+- **No CLI fallback** for a host that cannot serve HTTP. The appliance
+  console remains the path there.
+- `safety_net_hits` in the manifest names any file where the last-chance
+  redaction sweep fired. That is a **bug report in itself** — it means a
+  collector shipped something it should have redacted. The UI surfaces it
+  in red for the same reason.
+
+**MCP:** `get_support_bundle_preview` (default **off** — a broad read of
+logs and configuration). It returns the preview, never the archive.

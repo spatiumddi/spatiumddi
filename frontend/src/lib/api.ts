@@ -17274,6 +17274,68 @@ export const factoryResetApi = {
       .then((r) => r.data),
 };
 
+// ── Support bundle (#875) ────────────────────────────────────────────
+
+export interface SupportBundleFile {
+  path: string;
+  bytes: number;
+  truncated: boolean;
+}
+
+export interface SupportBundlePreview {
+  scrubbed: boolean;
+  filename: string;
+  total_bytes: number;
+  files: SupportBundleFile[];
+  manifest: Record<string, unknown>;
+  section_errors: string[];
+  sample: string;
+  warning: string;
+}
+
+export interface SupportBundleDecodeMap {
+  warning: string;
+  mappings: Record<string, Record<string, string>>;
+  counts: Record<string, number>;
+}
+
+/**
+ * Typed verbatim when generating an unscrubbed bundle. Kept in sync with
+ * UNSCRUBBED_CONFIRM in backend/app/api/v1/system/support_bundle.py — the
+ * backend compares it exactly, so a drift here surfaces as a 400.
+ */
+export const SUPPORT_BUNDLE_UNSCRUBBED_CONFIRM =
+  "I understand this bundle is not anonymised";
+
+export const supportBundleApi = {
+  preview: (scrubbed: boolean) =>
+    api
+      .post<SupportBundlePreview>("/system/support-bundle/preview", {
+        scrubbed,
+        confirm_unscrubbed: scrubbed
+          ? undefined
+          : SUPPORT_BUNDLE_UNSCRUBBED_CONFIRM,
+      })
+      .then((r) => r.data),
+  download: (scrubbed: boolean) =>
+    api
+      .post(
+        "/system/support-bundle",
+        {
+          scrubbed,
+          confirm_unscrubbed: scrubbed
+            ? undefined
+            : SUPPORT_BUNDLE_UNSCRUBBED_CONFIRM,
+        },
+        { responseType: "blob" },
+      )
+      .then((r) => r.data as Blob),
+  decodeMap: () =>
+    api
+      .post<SupportBundleDecodeMap>("/system/support-bundle/decode-map")
+      .then((r) => r.data),
+};
+
 // ── Scheduled Wake-on-LAN (#586 Phase 1) ─────────────────────────────
 // Mirrors backend/app/api/v1/wol_schedules/schemas.py. The Python package
 // is ``wol_schedules`` but the wire prefix is ``/wake-scheduler`` — that

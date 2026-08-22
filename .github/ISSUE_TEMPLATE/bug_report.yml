@@ -83,6 +83,33 @@ body:
       description: API, worker, or browser console logs. Please redact secrets.
       render: shell
 
+  - type: markdown
+    attributes:
+      value: |
+        ### Support bundle (optional, but it saves a round trip)
+
+        **Diagnostics → Support bundle** generates a scrubbed archive with
+        versions, schema head, recent errors, alert history, configuration
+        shape and an audit tail. IP addresses, hostnames, MAC addresses and
+        usernames are replaced with stable synthetic values; credentials are
+        excluded outright.
+
+        ⚠️ **Attachments on this repository are public.** Anyone who can read
+        this issue can download what you attach, and deleting the comment does
+        not reliably remove the file. Scrubbing is best-effort — please use the
+        preview screen to review the bundle before attaching it, and never
+        attach the `-UNSCRUBBED-` variant or the decode map.
+
+  - type: checkboxes
+    id: bundle_ack
+    attributes:
+      label: If you are attaching a support bundle
+      options:
+        - label: I generated it with scrubbing on (the filename does NOT contain UNSCRUBBED)
+          required: false
+        - label: I reviewed the preview before attaching it
+          required: false
+
   - type: textarea
     id: env
     attributes:
