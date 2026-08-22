@@ -730,12 +730,49 @@ letting one silently win.
   rewriting is by definition answer tampering). The agent handles this
   automatically; it is why a filtered group cannot also validate.
 
+#### Do feed entries block subdomains?
+
+Yes by default, and it is a **per-list** setting — *Block subdomains of
+feed entries* on the list's edit form (`feed_entries_are_wildcard`,
+issue #894).
+
+Leave it on for anything in the curated catalog. Every one of those 19
+sources is a "block this domain and everything under it" list, and off
+would mean a feed naming `tracker.example` leaves
+`cdn.tracker.example` resolving — which is what these lists exist to
+stop.
+
+Turn it off only for a feed that lists **specific hosts** rather than
+domains: a threat-intel drop of individual C2 FQDNs, say, where
+blocking the parent domain would take out everything else hosted under
+it. Toggling it restamps the entries already imported, so the change
+takes effect immediately rather than waiting for the feed's contents to
+churn — the save takes a few seconds on a large list (measured ~7 s on
+a 464k-entry feed) because it rewrites every row in one transaction.
+
+Two related behaviours worth knowing:
+
+- Feeds published in wildcard syntax (`*.example.com` — OISD's
+  `domainswild`, Hagezi's `wildcard/`) have the prefix **stripped on
+  import**. Stored literally it produces an RPZ rule matching
+  subdomains *only*, leaving the apex resolving — the opposite of what
+  the feed means. The prefix is instead read as the feed declaring
+  "and every subdomain", which is exactly what this setting expresses.
+- If such a feed is imported into an apex-only list, the refresh logs
+  `blocklist_feed_wildcard_intent_overridden` naming the count. That is
+  a legitimate configuration, not an error — but it overrides something
+  the feed stated, so it says so.
+
+A **manual** entry's own *Include subdomains* checkbox is independent
+and is never rewritten by this list-level switch.
+
 #### Sizing
 
 Feed-sourced entries block the named domain *and* its subdomains, which
 takes two RPZ records each (`example.com` and `*.example.com`) — an RPZ
 wildcard matches subdomains only, so the bare name is not redundant.
-Budget roughly **two records per feed entry**:
+Budget roughly **two records per feed entry** (halve it for a list with
+*Block subdomains* off):
 
 | Profile feed | Entries | RPZ records |
 |---|---|---|

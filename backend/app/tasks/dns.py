@@ -17,7 +17,7 @@ from app.celery_app import celery_app
 from app.config import settings
 from app.core.agent_wake import dns_group_channel, publish_wake
 from app.models.dns import DNSBlockList, DNSBlockListEntry, DNSServer
-from app.services.dns_blocklist import parse_feed
+from app.services.dns_blocklist import parse_feed_detailed
 
 # If an agent hasn't heartbeat'd in this long, we fall back to an active probe.
 AGENT_STALE_AFTER = timedelta(seconds=120)
@@ -85,7 +85,27 @@ async def _refresh_blocklist_feed_async(list_id: str) -> dict[str, int | str]:
                 logger.exception("blocklist_feed_fetch_failed", list_id=list_id, error=str(e))
                 return {"status": "error", "added": 0, "removed": 0}
 
-            domains = set(parse_feed(text, bl.feed_format))
+            parsed = parse_feed_detailed(text, bl.feed_format)
+            domains = set(parsed.domains)
+            wildcard = bool(bl.feed_entries_are_wildcard)
+
+            # A `*.`-prefixed feed is DECLARING it means "and every
+            # subdomain". Honouring an apex-only list setting against such
+            # a feed is the operator's call, but doing it silently would
+            # leave them wondering why subdomains still resolve.
+            if not wildcard and parsed.wildcard_count:
+                logger.warning(
+                    "blocklist_feed_wildcard_intent_overridden",
+                    list_id=list_id,
+                    list_name=bl.name,
+                    wildcard_lines=parsed.wildcard_count,
+                    detail=(
+                        "This feed publishes wildcard syntax, but the list is "
+                        "set to apex-only, so subdomains of its entries are "
+                        "NOT blocked. Enable 'Block subdomains' on the list if "
+                        "that is not intended."
+                    ),
+                )
 
             # Load current feed-sourced entries
             existing_result = await db.execute(
@@ -107,13 +127,13 @@ async def _refresh_blocklist_feed_async(list_id: str) -> dict[str, int | str]:
                         domain=d,
                         entry_type="block",
                         source="feed",
-                        # Subdomains too — the same default the manual
-                        # add-entry form uses, and what every consumer of
-                        # these feeds (Pi-hole, AdGuard, uBlock) does.
-                        # Feed rows used to take the column default of
-                        # False, so a list naming `tracker.example` left
-                        # `cdn.tracker.example` resolving (#878).
-                        is_wildcard=True,
+                        # Per-list, defaulting on (#878 made it universal,
+                        # #894 made it a choice): a list naming
+                        # `tracker.example` normally means
+                        # `cdn.tracker.example` too, which is what every
+                        # consumer of these feeds does — but a
+                        # host-specific feed wants apex-only.
+                        is_wildcard=wildcard,
                     )
                 )
 

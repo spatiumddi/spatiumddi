@@ -27,6 +27,7 @@ import structlog
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, field_validator
 from sqlalchemy import select
+from sqlalchemy import update as sa_update
 from sqlalchemy.orm import selectinload
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
@@ -78,6 +79,8 @@ class BlockListCreate(BaseModel):
     update_interval_hours: int = 24
     block_mode: str = "nxdomain"
     sinkhole_ip: str | None = None
+    # Feed rows block subdomains too. Default on — see the model.
+    feed_entries_are_wildcard: bool = True
     enabled: bool = True
 
     @field_validator("source_type")
@@ -112,6 +115,7 @@ class BlockListUpdate(BaseModel):
     update_interval_hours: int | None = None
     block_mode: str | None = None
     sinkhole_ip: str | None = None
+    feed_entries_are_wildcard: bool | None = None
     enabled: bool | None = None
 
     @field_validator("source_type")
@@ -147,6 +151,7 @@ class BlockListResponse(BaseModel):
     update_interval_hours: int
     block_mode: str
     sinkhole_ip: str | None
+    feed_entries_are_wildcard: bool
     enabled: bool
     last_synced_at: datetime | None
     last_sync_status: str | None
@@ -312,6 +317,7 @@ def _to_response(bl: DNSBlockList) -> BlockListResponse:
         update_interval_hours=bl.update_interval_hours,
         block_mode=bl.block_mode,
         sinkhole_ip=bl.sinkhole_ip,
+        feed_entries_are_wildcard=bl.feed_entries_are_wildcard,
         enabled=bl.enabled,
         last_synced_at=bl.last_synced_at,
         last_sync_status=bl.last_sync_status,
@@ -396,6 +402,8 @@ class CatalogSource(BaseModel):
     license: str
     homepage: str | None = None
     recommended: bool = False
+    # Absent on every current entry, meaning True — see _build_from_source.
+    entries_are_wildcard: bool = True
 
 
 class CatalogTemplateGroup(BaseModel):
@@ -587,6 +595,13 @@ def _build_from_source(
         feed_format=src["feed_format"],
         update_interval_hours=update_interval_hours,
         block_mode=block_mode,
+        # Per-source, defaulting on (#894). Every catalog entry today is a
+        # "block this domain and everything under it" list, so none set it
+        # — the key exists for a host-specific feed (a threat-intel drop of
+        # individual C2 FQDNs), where blocking the parent domain would be
+        # over-blocking. Left absent rather than stamped `true` on all 19
+        # entries, which would be noise carrying no information.
+        feed_entries_are_wildcard=bool(src.get("entries_are_wildcard", True)),
         enabled=enabled,
     )
 
@@ -981,8 +996,42 @@ async def update_blocklist(
 ) -> BlockListResponse:
     bl = await _require_list(list_id, db)
     changes = body.model_dump(exclude_none=True)
+    wildcard_flipped = (
+        "feed_entries_are_wildcard" in changes
+        and changes["feed_entries_are_wildcard"] != bl.feed_entries_are_wildcard
+    )
     for k, v in changes.items():
         setattr(bl, k, v)
+
+    if wildcard_flipped:
+        # Restamp the rows already stored (#894). The refresh task diffs by
+        # domain and never revisits an unchanged one, so without this the
+        # toggle would appear to do nothing until a feed's contents
+        # happened to churn — the operator's stated intent silently
+        # deferred for days.
+        #
+        # Feed rows only. A manual entry's ``is_wildcard`` is that row's own
+        # setting, and someone who unchecked "include subdomains" on one
+        # domain did not ask for a list-wide switch to overwrite it.
+        #
+        # One statement, in the same transaction as the flag write, and
+        # deliberately so: the flag and the rows it describes must not be
+        # able to disagree, and a background job would set the flag while
+        # the rows lagged — reintroducing the exact "silently deferred"
+        # state this restamp exists to prevent. Measured at **~7 s** on
+        # the largest catalog feed (Hagezi Gambling, 464k rows) on a
+        # 2-core dev box, which is slow for a click but nowhere near an
+        # HTTP timeout. Revisit if a list an order of magnitude larger
+        # ever becomes normal.
+        await db.execute(
+            sa_update(DNSBlockListEntry)
+            .where(
+                DNSBlockListEntry.list_id == bl.id,
+                DNSBlockListEntry.source == "feed",
+            )
+            .values(is_wildcard=bl.feed_entries_are_wildcard)
+        )
+
     db.add(
         _audit(
             current_user,

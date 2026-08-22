@@ -405,6 +405,7 @@ backend/alembic/versions/c87a3f29d108_appliance_ntp_settings.py:drop_column:85
 backend/alembic/versions/c8a3f1e94d27_user_mfa.py:drop_column:39
 backend/alembic/versions/c8a3f1e94d27_user_mfa.py:drop_column:51
 backend/alembic/versions/c8a3f1e94d27_user_mfa.py:drop_column:52
+backend/alembic/versions/c8a3f207e51b_per_list_feed_wildcard_flag.py:drop_column:47
 backend/alembic/versions/c8d2f47a90b3_multicast_domain.py:drop_constraint_fk:115
 backend/alembic/versions/c8d2f47a90b3_multicast_domain.py:drop_table:123
 backend/alembic/versions/c8d5e2a9f736_audit_forward_settings.py:drop_column:102
@@ -481,7 +482,6 @@ backend/alembic/versions/d3f1ab7c8e02_windows_dns_credentials.py:drop_column:36
 backend/alembic/versions/d3f2a51c8e76_bgp_peering.py:drop_column:98
 backend/alembic/versions/d3f2a51c8e76_bgp_peering.py:drop_constraint_fk:96
 backend/alembic/versions/d3f2a51c8e76_bgp_peering.py:drop_table:94
-backend/alembic/versions/d3f8b6c02a41_branding_banners_and_logo.py:drop_column:151
 backend/alembic/versions/d3f8b6c02a41_branding_banners_and_logo.py:drop_column:152
 backend/alembic/versions/d3f8b6c02a41_branding_banners_and_logo.py:drop_column:153
 backend/alembic/versions/d3f8b6c02a41_branding_banners_and_logo.py:drop_column:154
@@ -490,7 +490,8 @@ backend/alembic/versions/d3f8b6c02a41_branding_banners_and_logo.py:drop_column:1
 backend/alembic/versions/d3f8b6c02a41_branding_banners_and_logo.py:drop_column:157
 backend/alembic/versions/d3f8b6c02a41_branding_banners_and_logo.py:drop_column:158
 backend/alembic/versions/d3f8b6c02a41_branding_banners_and_logo.py:drop_column:159
-backend/alembic/versions/d3f8b6c02a41_branding_banners_and_logo.py:drop_table:150
+backend/alembic/versions/d3f8b6c02a41_branding_banners_and_logo.py:drop_column:160
+backend/alembic/versions/d3f8b6c02a41_branding_banners_and_logo.py:drop_table:151
 backend/alembic/versions/d4a18b20e3c7_dhcp_mac_blocks.py:drop_table:83
 backend/alembic/versions/d4a8b2e6f193_dns_group_tsig_key.py:drop_column:40
 backend/alembic/versions/d4a8b2e6f193_dns_group_tsig_key.py:drop_column:41

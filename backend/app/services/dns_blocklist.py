@@ -157,8 +157,33 @@ async def build_effective_for_group(db: AsyncSession, group_id: uuid.UUID) -> Ef
 # ── Feed parsing (manual / hosts / domains / adblock) ────────────────────────
 
 
+@dataclass(frozen=True)
+class ParsedFeed:
+    """A parsed feed plus what its syntax said about subdomains.
+
+    ``wildcard_count`` is how many lines arrived `*.`-prefixed. The
+    caller needs it because that prefix is the feed *declaring* it means
+    "and every subdomain" — so a list configured apex-only
+    (``feed_entries_are_wildcard=False``, #894) against such a feed is
+    overriding a stated intent, which is worth saying out loud rather
+    than doing silently.
+    """
+
+    domains: list[str]
+    wildcard_count: int
+
+
 def parse_feed(content: str, feed_format: str) -> list[str]:
     """Parse raw feed text into a deduped list of domains.
+
+    Thin wrapper over :func:`parse_feed_detailed` for the many callers
+    (and tests) that only want the names.
+    """
+    return parse_feed_detailed(content, feed_format).domains
+
+
+def parse_feed_detailed(content: str, feed_format: str) -> ParsedFeed:
+    """Parse raw feed text into deduped domains + wildcard-syntax count.
 
     Accepts:
       - `hosts`: `0.0.0.0 ads.example.com` (or `127.0.0.1`)
@@ -170,6 +195,7 @@ def parse_feed(content: str, feed_format: str) -> list[str]:
     """
     out: list[str] = []
     seen: set[str] = set()
+    wildcard_count = 0
 
     for raw in content.splitlines():
         line = raw.strip()
@@ -212,6 +238,7 @@ def parse_feed(content: str, feed_format: str) -> list[str]:
         # leaving the apex resolving normally.
         if domain.startswith("*."):
             domain = domain[2:]
+            wildcard_count += 1
         if not domain or "." not in domain:
             continue
         if domain in seen:
@@ -219,7 +246,7 @@ def parse_feed(content: str, feed_format: str) -> list[str]:
         seen.add(domain)
         out.append(domain)
 
-    return out
+    return ParsedFeed(domains=out, wildcard_count=wildcard_count)
 
 
 def dedupe_domains(domains: list[str]) -> list[str]:

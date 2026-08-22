@@ -75,7 +75,7 @@ Always read the relevant spec doc(s) before writing code for a feature area.
 | Cache / Sessions | Redis 7 |
 | Auth | python-jose + bcrypt (local), ldap3 (LDAP), joserfc (OIDC ID-token / JWKS), python3-saml (SAML), pyrad (RADIUS), tacacs_plus (TACACS+); Fernet for secrets at rest |
 | Logging | structlog → JSON → centralized log store (Loki / Elasticsearch) |
-| Metrics | Prometheus + Grafana; InfluxDB v1/v2 push export |
+| Metrics | Prometheus + Grafana (InfluxDB push export is **planned, not built** — [#889](https://github.com/spatiumddi/spatiumddi/issues/889)) |
 | Containerization | Docker (multi-stage, amd64+arm64), Docker Compose, Kubernetes + Helm |
 | Appliance OS | Alpine Linux (containers/appliance), Debian Stable (bare-metal ISO) |
 | Logo / Assets | `docs/assets/logo.svg`, `docs/assets/logo-icon.svg` — also copied to `frontend/src/assets/` |
@@ -443,6 +443,10 @@ probe-safety fix (#722) is not a vertical at all.
 - ✅ [**Decom-date awareness**](https://github.com/spatiumddi/spatiumddi/issues/46) — shipped `2026.06.11-1`: first-class `decom_date` on subnet + IP, a `decom_expiring` alert rule (severity escalation reused from the other `*_expiring` rules), a dashboard widget, and a `find_subnets_decommissioning` MCP tool. Migration `a3f7c1e92b48`.
 - ✅ [**Top-N reports**](https://github.com/spatiumddi/spatiumddi/issues/47) — shipped `2026.06.11-1`: a `/reports` surface (top subnets by utilization, owners by IP count, most-modified resources via `audit_log`, noisiest DNS clients), feature-module-gated with 4 MCP read tools.
 - ✅ [**Compliance / change report PDF**](https://github.com/spatiumddi/spatiumddi/issues/48) — shipped `2026.06.11-1`: `GET /api/v1/audit/export.pdf` renders an auditor-facing PDF of every `audit_log` mutation in a date range, grouped by user / resource / action, with a per-row SHA-256 tamper-evidence trailer.
+- ⬜ [**InfluxDB push export**](https://github.com/spatiumddi/spatiumddi/issues/889) — build the writer the tech-stack
+  table claimed for months but nothing implemented: periodic push of the
+  existing `metric_sample` rows to InfluxDB v1 / v2 / v3. Spec shape is
+  already written up in `docs/SHIPPED.md`; the code is greenfield.
 
 #### Subnet planning & calculation tools
 
@@ -476,6 +480,24 @@ suggestion, free-space treemap.
   Not to be confused with `PlatformSettings.resolver_dns_over_tls`, which
   is the appliance host's own systemd-resolved stub resolver.
 
+- ✅ [**Upstream resolver presets**](https://github.com/spatiumddi/spatiumddi/issues/877) — shipped in PR
+  [#893](https://github.com/spatiumddi/spatiumddi/pull/893): 16 verified
+  presets across 7 providers in `backend/app/data/dns_resolver_presets.json`,
+  served by `GET /dns/forwarder-presets` and picked from the Forwarders
+  card. Each carries the **certificate name its addresses actually
+  present**, which is the point: since DoT upstream forwarding (#50),
+  BIND validates against ONE group-level `remote-hostname` and a
+  mismatch fails closed (SERVFAIL), so "Quad9 is 9.9.9.9" without
+  "…and its DoT name is dns.quad9.net" yields a group that resolves
+  nothing. Two hard 422s for configurations that cannot work (a
+  forwarder set spanning two certificate names under verification;
+  Mullvad on plaintext 53) and a UI advisory — deliberately not a
+  refusal — for a non-canonical hostname, because providers list
+  several names per certificate. Addresses are matched by **value, not
+  spelling**: `2606:4700:4700::1111` and its expanded form are one
+  host, and a string compare would fail OPEN. Manual entry is
+  unconstrained — the catalogue is a convenience, never a whitelist,
+  with a test pinning that. 1 MCP tool (`list_resolver_presets`).
 - ✅ [**Family filter — adult-content blocking bundle + SafeSearch enforcement**](https://github.com/spatiumddi/spatiumddi/issues/878)
   — the catalog gains **templates** (entry sets shipped inline, for rules
   with no upstream feed) and **profiles** (compositions applied in one
@@ -524,6 +546,27 @@ suggestion, free-space treemap.
   1 MCP tool (`list_blocklist_templates`). BIND9-only,
   and [`docs/features/DNS.md` §8.1](docs/features/DNS.md) is explicit
   that DNS filtering is bypassable at all.
+- ⬜ [**Per-subnet DNS blocklist scoping — surface it in the UI**](https://github.com/spatiumddi/spatiumddi/issues/876)
+  — the backend already scopes a blocklist to a view *or* a server
+  group (`dns_blocklist_view_assoc`, honoured by the agent renderer
+  since #24); the UI exposes only the group half. Pairs with the #878
+  family filter, whose whole point is filtering one network and not
+  another.
+- ✅ [**Blocklist feed wildcard semantics are per-list**](https://github.com/spatiumddi/spatiumddi/issues/894)
+  — #878 made every feed row `is_wildcard=True`, right for all 19
+  catalog sources but a global constant, and wrong for a host-specific
+  threat-intel feed. Now `DNSBlockList.feed_entries_are_wildcard`
+  (migration `c8a3f207e51b`, defaults true so nothing changes for
+  existing lists), a checkbox on the list form, and an optional
+  `entries_are_wildcard` key on a catalog source. **Flipping it
+  restamps the rows already imported** — the refresh task diffs by
+  domain and never revisits an unchanged one, so without that the
+  toggle would appear to do nothing until the feed's contents happened
+  to churn. Feed rows only: a manual entry's `is_wildcard` is that
+  row's own choice. `parse_feed_detailed` also reports how many lines
+  arrived `*.`-prefixed, so an apex-only list fed a wildcard-syntax
+  feed logs that it is overriding the feed's stated intent instead of
+  doing it silently.
 
 #### DHCP-specific
 
@@ -540,6 +583,21 @@ suggestion, free-space treemap.
 - ✅ [**PCAP capture trigger**](https://github.com/spatiumddi/spatiumddi/issues/59) — shipped `2026.06.15-1`: on-demand tcpdump as an RBAC-gated/audited Tools page, both server-container and appliance-host (real-NIC) vantages, keep-partial-on-Stop, `.pcap` download, 4 Operator Copilot tools.
 - ❌ [**ACL / prefix-list generator**](https://github.com/spatiumddi/spatiumddi/issues/60) — **closed as not planned** 2026-06-17, in the same triage pass that closed #40. No rationale was recorded on the issue; re-open it rather than re-filing if the need comes back.
 - ✅ [**Config-drift report (full record diff)**](https://github.com/spatiumddi/spatiumddi/issues/61) — **backend shipped `2026.06.11-1`**: `GET …/zones/{id}/drift` AXFRs the live zone from every server in the group and diffs it against the DB — extra-on-server (manual host change) / missing-on-server / in-sync, per server, read-only — plus a `find_dns_zone_drift` MCP tool. **UI shipped `2026.07.30-1` (#735)** — a Drift tab on the zone detail, fetched on demand because one call fans out an AXFR to every server in the group. That PR also fixed the reason nothing had ever consumed the endpoint: `dns.query.xfr` takes an IP *literal* and raises a bare, message-less `ValueError` for a hostname before sending a packet, so every hostname-addressed server failed 100% of the time reporting `""` as the error. **[#734](https://github.com/spatiumddi/spatiumddi/issues/734) closed the last gap** — agent-managed BIND9 / Technitium reached the server but got `REFUSED`, because the control plane transferred unsigned while the agent granted `allow-transfer` only to the group key and only on *dynamic* zones; separately, `DNSServerOptions.allow_transfer` and `DNSZone.allow_transfer` were both settable, persisted and **never rendered at all** (a silent no-op). Now: the shared AXFR helper takes an optional `TsigKey`, `resolve_group_transfer_key` picks the same key the agent granted (legacy group key first, then operator `DNSTSIGKey` rows by name — matching the bundle's ordering, which is why `op_keys` is now `order_by(name)`), the BIND9 agent renders the grant in the **options** block so it covers every zone type, Technitium falls back to `Allow` + `zoneTransferTsigKeyNames` (verified against upstream `DnsServer.cs`: the two gates AND, so naming keys makes a signature *required*), and a keyless group reports `unsupported` naming the missing key instead of a misleading ACL error. Windows Path A is deliberately excluded from `AXFR_TSIG_DRIVERS` — it authorises by address, so signing would break a working pull. **Drift now works on every driver except PowerDNS**, which implements no record pull.
+- ⬜ [**Support bundle**](https://github.com/spatiumddi/spatiumddi/issues/875) — one-click scrubbed diagnostics
+  export for bug reports: versions, health, config with secrets
+  redacted, recent logs and audit rows. Includes deciding the private
+  submission channel, since a GitHub issue is public and a bundle is
+  not.
+- ⬜ [**Agents never read the `previous.json` they write**](https://github.com/spatiumddi/spatiumddi/issues/882) —
+  both agents persist a last-known-good bundle and neither ever loads
+  it, so a bad config that passes validation but breaks the daemon has
+  no auto-revert. The file exists; the restore path does not.
+- ⬜ [**Config snapshots + rollback**](https://github.com/spatiumddi/spatiumddi/issues/883) — audit-log-driven revert
+  of a single change plus scoped named snapshots. Distinct from #882,
+  which is an agent-side safety net rather than an operator action.
+- ⬜ [**Service restart from the GUI**](https://github.com/spatiumddi/spatiumddi/issues/890) — closes the #111 gap on
+  docker-compose and Helm deployments, where the appliance's supervisor
+  path has no equivalent.
 
 #### Workflow & RBAC
 
@@ -562,6 +620,13 @@ suggestion, free-space treemap.
 - ✅ [**Account lockout after N failed logins**](https://github.com/spatiumddi/spatiumddi/issues/71) — shipped `2026.05.07-1`: windowed-counter lockout for local-auth users over `user.failed_login_count` / `failed_login_locked_until` / `last_failed_login_at`, reset on any success. Defaults to disabled (`threshold=0`). Migration `a7b3c8d92e14`.
 - ✅ [**Active session viewer + force-logout**](https://github.com/spatiumddi/spatiumddi/issues/72) — shipped `2026.05.07-1`: live JWT registry the operator can browse and revoke from — access tokens carry a `jti`, and `user_session` gains `auth_source` / `last_seen_at` / `revoked` + a `(revoked, expires_at)` index. Migration `c8e4f7a91d36`.
 - ✅ [**Internal cert + secret expiry monitoring**](https://github.com/spatiumddi/spatiumddi/issues/76) — shipped `2026.06.11-1`: one `secret_expiring` alert rule that fires per internal credential expiring within `threshold_days` — supervisor mTLS certs (`appliance.cert_expires_at`) + API tokens (`api_token.expires_at`). Extended in `2026.06.19-1` to cover the Let's Encrypt Web-UI cert (#438).
+- ⬜ [**FIPS 140-3 posture**](https://github.com/spatiumddi/spatiumddi/issues/880) — crypto audit plus a tiered
+  roadmap for a FIPS-capable build (containers / Kubernetes /
+  appliance). Gate for government deployments; the audit comes first
+  because the answer may be "these three libraries block it".
+- ⬜ [**Appliance full-disk encryption**](https://github.com/spatiumddi/spatiumddi/issues/881) — LUKS2 at install for
+  STATE + `/var`, TPM2 auto-unlock, and a recovery key the installer
+  has to present exactly once without writing it anywhere it protects.
 
 #### UX polish
 
@@ -582,6 +647,27 @@ suggestion, free-space treemap.
   Note for anyone adding a binding: declare it here and match via
   `matchesShortcut` rather than adding another described-only row.
 - ✅ [**Print / PDF export for IPAM tree + subnet detail**](https://github.com/spatiumddi/spatiumddi/issues/82) — shipped `2026.07.30-1` (#739): `GET /ipam/export.pdf` takes the same scope selector as the CSV/JSON/XLSX exporter (and reuses its `_collect`, so the two can't disagree about the subtree) and renders one of two shapes — a **tree** report for a space / block, or a **detail** report for a subnet. Surfaced as *Print / PDF* in both Export dropdowns. **reportlab, not the weasyprint the issue text proposed** — two reportlab PDFs already ship and a second engine would add Cairo / Pango to every image for no new capability. Unlike #48 and the conformity report, this one paginates: `repeatRows=1` plus a two-pass `_NumberedCanvas` for "Page N of M". Two things worth knowing if you touch it: reportlab's `Paragraph` parses mini-XML, so **all** DB-sourced text must go through `_para()` (an unescaped `a<b>c` space name 500s the export, and `<legacy> net` silently renders as "net"); and the tree indent must stay inside WinAnsiEncoding, or reportlab swaps in ZapfDingbats and nested blocks render as `■■`. Both have regression tests. *(GitHub auto-closed this issue on 2026-06-18 in error — PR [#446](https://github.com/spatiumddi/spatiumddi/pull/446) said `CodeQL #82`, meaning alert 82. Reopened 2026-07-28, genuinely shipped now.)*
+- ⬜ [**Global search v2**](https://github.com/spatiumddi/spatiumddi/issues/879) — relevance ranking, trigram
+  indexes, wider resource coverage, and command actions. The existing
+  typeahead works; this is about it being useful past ~3 resource
+  types.
+- ⬜ [**Native mobile app**](https://github.com/spatiumddi/spatiumddi/issues/884) — PWA groundwork first, then iOS
+  (SwiftUI) against the REST API. Non-negotiable #1 means the API is
+  already complete enough to build against.
+- ✅ [**Login banner**](https://github.com/spatiumddi/spatiumddi/issues/885) · [**custom logo**](https://github.com/spatiumddi/spatiumddi/issues/886) ·
+  [**environment banner**](https://github.com/spatiumddi/spatiumddi/issues/887) · [**`app_title` wired up**](https://github.com/spatiumddi/spatiumddi/issues/888)
+  — shipped together in PR
+  [#892](https://github.com/spatiumddi/spatiumddi/pull/892): an
+  acceptable-use banner on the login screen, an operator-uploaded logo,
+  a coloured DEV/TEST/PROD strip, and a real browser/product title
+  (`app_title` was previously settable and read by nothing). All four
+  ride nine `platform_settings` columns plus a `branding_asset` table;
+  migration `d3f8b6c02a41`. The **logo lives in Postgres, not on
+  disk** — a node-local file does not propagate across a multi-node
+  control plane, the same reasoning as the #296 slot-image mirror.
+  New unauthenticated `GET /settings/public` + `/settings/public/logo`
+  (ETag + 304), because the login page needs all of this *before* a
+  token exists. 1 MCP tool (`find_branding_settings`).
 
 #### CLI tool
 

@@ -411,3 +411,181 @@ class _NullEngine:
 
 async def _noop_publish(_channel: str) -> None:
     return None
+
+
+# ── Per-list feed wildcard control (issue #894) ────────────────────────────
+
+
+def test_parse_feed_reports_wildcard_syntax() -> None:
+    """The `*.` prefix is the feed DECLARING it means "and subdomains".
+
+    Stripping it is right — kept literally it produces an RPZ rule
+    matching subdomains only — but the caller needs to know the feed
+    said it, so an apex-only list can flag that it is overriding the
+    feed's stated intent rather than doing so silently.
+    """
+    from app.services.dns_blocklist import parse_feed_detailed
+
+    out = parse_feed_detailed("*.a.example\n*.b.example\nc.example\n", "domains")
+    assert out.domains == ["a.example", "b.example", "c.example"]
+    assert out.wildcard_count == 2
+
+    plain = parse_feed_detailed("a.example\nb.example\n", "domains")
+    assert plain.wildcard_count == 0
+
+
+@pytest.mark.asyncio
+async def test_feed_wildcard_flag_defaults_on_and_drives_new_rows(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Default on preserves #878; off is what a host-specific feed needs."""
+    import contextlib
+
+    from app.tasks import dns as dns_tasks
+
+    async def _run(bl_id: str, body: str) -> None:
+        class _Resp:
+            text = body
+
+            def raise_for_status(self) -> None:
+                return None
+
+        class _Client:
+            def __init__(self, *a: object, **kw: object) -> None:
+                pass
+
+            async def __aenter__(self) -> _Client:
+                return self
+
+            async def __aexit__(self, *a: object) -> None:
+                return None
+
+            async def get(self, _url: str) -> _Resp:
+                return _Resp()
+
+        monkeypatch.setattr(dns_tasks.httpx, "AsyncClient", _Client)
+        monkeypatch.setattr(dns_tasks, "create_async_engine", lambda *a, **kw: _NullEngine())
+
+        @contextlib.asynccontextmanager
+        async def _factory_cm():  # type: ignore[no-untyped-def]
+            yield db_session
+
+        monkeypatch.setattr(dns_tasks, "async_sessionmaker", lambda *a, **kw: _factory_cm)
+        monkeypatch.setattr(dns_tasks, "publish_wake", _noop_publish)
+        await dns_tasks._refresh_blocklist_feed_async(bl_id)
+
+    wide = DNSBlockList(
+        name="wide", source_type="url", feed_url="http://x/1", feed_format="domains"
+    )
+    narrow = DNSBlockList(
+        name="narrow",
+        source_type="url",
+        feed_url="http://x/2",
+        feed_format="domains",
+        feed_entries_are_wildcard=False,
+    )
+    db_session.add_all([wide, narrow])
+    await db_session.commit()
+    # The column default applies without the caller passing anything.
+    assert wide.feed_entries_are_wildcard is True
+
+    await _run(str(wide.id), "a.example.com\n")
+    await _run(str(narrow.id), "b.example.com\n")
+
+    rows = (await db_session.execute(select(DNSBlockListEntry))).scalars().all()
+    by_domain = {r.domain: r for r in rows}
+    assert by_domain["a.example.com"].is_wildcard is True
+    assert by_domain["b.example.com"].is_wildcard is False
+
+
+@pytest.mark.asyncio
+async def test_toggling_the_flag_restamps_existing_feed_rows(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    """Without this the toggle silently does nothing until the feed churns.
+
+    The refresh task diffs by domain and never revisits an unchanged
+    one, so a flag flip would only reach rows added afterwards — the
+    operator's stated intent deferred for days with no sign of it.
+
+    Manual rows are deliberately untouched: ``is_wildcard`` there is that
+    row's own setting, and someone who unchecked "include subdomains" on
+    one domain did not ask for a list-wide switch to overwrite it.
+    """
+    from app.core.security import create_access_token, hash_password
+    from app.models.auth import User
+
+    user = User(
+        username="wcadmin",
+        email="wcadmin@example.com",
+        display_name="wcadmin",
+        hashed_password=hash_password("password123"),
+        auth_source="local",
+        is_superadmin=True,
+    )
+    user.groups = []
+    db_session.add(user)
+    await db_session.flush()
+    headers = {"Authorization": f"Bearer {create_access_token(str(user.id))}"}
+
+    bl = DNSBlockList(name="flip", source_type="url", feed_url="http://x/f")
+    db_session.add(bl)
+    await db_session.flush()
+    db_session.add_all(
+        [
+            DNSBlockListEntry(
+                list_id=bl.id, domain="feed-a.example", source="feed", is_wildcard=True
+            ),
+            DNSBlockListEntry(
+                list_id=bl.id, domain="feed-b.example", source="feed", is_wildcard=True
+            ),
+            DNSBlockListEntry(
+                list_id=bl.id, domain="manual.example", source="manual", is_wildcard=False
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    resp = await client.put(
+        f"/api/v1/dns/blocklists/{bl.id}",
+        headers=headers,
+        json={"feed_entries_are_wildcard": False},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["feed_entries_are_wildcard"] is False
+
+    rows = (
+        (
+            await db_session.execute(
+                select(DNSBlockListEntry).where(DNSBlockListEntry.list_id == bl.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    by_domain = {r.domain: r for r in rows}
+    assert by_domain["feed-a.example"].is_wildcard is False
+    assert by_domain["feed-b.example"].is_wildcard is False
+    # Untouched — the operator's per-row choice survives.
+    assert by_domain["manual.example"].is_wildcard is False
+
+    # …and flipping back restamps the feed rows again.
+    back = await client.put(
+        f"/api/v1/dns/blocklists/{bl.id}",
+        headers=headers,
+        json={"feed_entries_are_wildcard": True},
+    )
+    assert back.status_code == 200
+    rows2 = (
+        (
+            await db_session.execute(
+                select(DNSBlockListEntry).where(
+                    DNSBlockListEntry.list_id == bl.id,
+                    DNSBlockListEntry.source == "feed",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert all(r.is_wildcard for r in rows2)

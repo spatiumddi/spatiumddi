@@ -8005,6 +8005,9 @@ function BlocklistModal({
   const [updateHours, setUpdateHours] = useState(
     list?.update_interval_hours ?? 24,
   );
+  const [feedWildcard, setFeedWildcard] = useState(
+    list?.feed_entries_are_wildcard ?? true,
+  );
   const [enabled, setEnabled] = useState(list?.enabled ?? true);
   const [error, setError] = useState("");
 
@@ -8038,6 +8041,7 @@ function BlocklistModal({
             block_mode: blockMode,
             sinkhole_ip: blockMode === "sinkhole" ? sinkholeIp || null : null,
             update_interval_hours: updateHours,
+            feed_entries_are_wildcard: feedWildcard,
             enabled,
           });
         }}
@@ -8131,6 +8135,27 @@ function BlocklistModal({
                 onChange={(e) => setUpdateHours(Number(e.target.value))}
               />
             </Field>
+            <label className="flex items-start gap-2 text-sm">
+              <input
+                type="checkbox"
+                className="mt-0.5"
+                checked={feedWildcard}
+                onChange={(e) => setFeedWildcard(e.target.checked)}
+              />
+              <span>
+                Block subdomains of feed entries
+                <span className="block text-xs text-muted-foreground">
+                  On (recommended): a feed naming <code>tracker.example</code>{" "}
+                  also blocks <code>cdn.tracker.example</code> — what these
+                  lists mean. Turn off only for a feed listing specific hosts,
+                  where blocking the parent domain would be too broad.
+                  {list &&
+                    list.feed_entries_are_wildcard !== feedWildcard &&
+                    " Saving restamps the entries already imported, which" +
+                      " takes a few seconds on a large list."}
+                </span>
+              </span>
+            </label>
           </>
         )}
         <label className="flex items-center gap-2 text-sm">
