@@ -13,6 +13,7 @@ import structlog
 from . import __version__, kea_ctrl
 from .cache import save_token
 from .config import AgentConfig
+from .config_apply import ApplyStatus
 
 log = structlog.get_logger(__name__)
 
@@ -23,6 +24,12 @@ class HeartbeatClient:
         self.token_ref = token_ref
         self._stop = threading.Event()
         self.daemon_status: dict[str, Any] = {}
+        # #882 — set by SyncLoop (constructed after this object, assigns itself
+        # in). Rides the heartbeat's ``config`` field so the control plane can
+        # tell a Kea that is up but running a REVERTED config apart from one
+        # that converged. Defaults to a healthy ApplyStatus so a heartbeat sent
+        # before the first sync doesn't report a failure that hasn't happened.
+        self.config_apply: ApplyStatus = ApplyStatus()
         self.lease_count_since_start = 0
         self.pending_acks: list[dict] = []
         # #637 — cached Kea daemon version. See _kea_version(); immutable for the
@@ -66,6 +73,10 @@ class HeartbeatClient:
             "pid": os.getpid(),
             "status": self.daemon_status.get("status", "ok"),
             "daemon": self.daemon_status,
+            # #882 — last config-apply verdict. The server's request model has
+            # declared a ``config`` field since the beginning; until now the
+            # DHCP agent never sent one and the handler never read one.
+            "config": self.config_apply.as_dict(),
             "lease_count_since_start": self.lease_count_since_start,
             "ops_ack": ops_ack,
             # #637 — the running Kea daemon's version (e.g. "3.0.3"), read live

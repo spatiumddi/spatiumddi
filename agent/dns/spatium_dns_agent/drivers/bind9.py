@@ -1310,10 +1310,25 @@ class Bind9Driver(DriverBase):
             log.warning("named_checkconf_missing_skipping")
             return
         res = subprocess.run(
-            ["named-checkconf", str(conf)], capture_output=True, text=True, check=False
+            ["named-checkconf", str(conf)],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
         )
         if res.returncode != 0:
-            raise RuntimeError(f"named-checkconf failed: {res.stderr.strip()}")
+            # #882 — read stdout FIRST. ``named-checkconf`` writes its
+            # diagnostics ("named.conf:20: undefined ACL 'trusted'", with the
+            # line number) to stdout and leaves stderr empty, so reading only
+            # stderr produced the message "named-checkconf failed: " with
+            # nothing after the colon. That was survivable while the text went
+            # nowhere; now it is the operator-facing explanation of why their
+            # config did not go live, and an empty one makes the whole revert
+            # report useless. Mirrors the PowerDNS driver's
+            # ``res.stderr or res.stdout``, inverted because these two tools
+            # disagree about which stream diagnostics belong on.
+            detail = (res.stdout or "").strip() or (res.stderr or "").strip()
+            raise RuntimeError(f"named-checkconf failed: {detail or 'no output'}")
 
     def swap_and_reload(self) -> None:
         new_dir = self.state_dir / "rendered.new"

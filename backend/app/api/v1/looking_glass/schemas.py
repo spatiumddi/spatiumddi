@@ -106,6 +106,13 @@ class CollectorRead(BaseModel):
     last_seen_ip: str | None
     last_seen_at: datetime | None
     last_health_check_at: datetime | None
+    # #882 — last config-apply verdict reported by the collector agent.
+    # ``ok`` / ``reverted`` / ``revert_failed`` / ``no_previous``; NULL when
+    # the agent has never reported. NULL means UNKNOWN, never "fine".
+    config_apply_status: str | None = None
+    config_apply_error: str | None = None
+    config_failed_etag: str | None = None
+    config_apply_at: datetime | None = None
     appliance_id: uuid.UUID | None
     created_at: datetime
     modified_at: datetime

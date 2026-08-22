@@ -16,8 +16,18 @@ import httpx
 import structlog
 
 from .admin_pusher import push_rendered_config
-from .cache import load_config, save_config
+from .cache import commit_config, load_config, load_previous_config, save_config
 from .config import AgentConfig
+from .config_apply import (
+    STATUS_NO_PREVIOUS,
+    STATUS_OK,
+    STATUS_REVERT_FAILED,
+    STATUS_REVERTED,
+    ApplyStatus,
+    ConfigApplyError,
+    Quarantine,
+    truncate_error,
+)
 from .drivers.base import DriverBase
 
 log = structlog.get_logger(__name__)
@@ -59,14 +69,49 @@ class SyncLoop:
         # but leave structural_etag alone — the agent then drains record ops
         # via RFC 2136 over loopback without bouncing the daemon.
         self._current_structural_etag: str | None = None
+        # #882 — last-known-good revert. ``quarantine`` remembers an etag
+        # whose apply failed so we stop re-applying it every poll;
+        # ``apply_status`` is what the heartbeat reports upward.
+        self._quarantine = Quarantine(self.cfg.state_dir)
+        self.apply_status = ApplyStatus()
+        self.heartbeat.config_apply = self.apply_status
 
         # Preload cached bundle (offline-operation guarantee)
         bundle, etag = load_config(self.cfg.state_dir)
+        # #882 — a restart must not re-break the daemon with the same bundle
+        # that failed before it. ``current.json`` is what the control plane
+        # last SENT, which is not necessarily what worked; if that bundle is
+        # quarantined, boot from the last-known-good instead.
+        booting_from_previous = False
+        if bundle is not None and self._quarantine.blocks(etag):
+            prev_bundle, prev_etag = load_previous_config(self.cfg.state_dir)
+            if prev_bundle is not None:
+                log.warning(
+                    "bootstrap_skipping_quarantined_bundle",
+                    failed_etag=etag,
+                    booting_etag=prev_etag,
+                    reason=self._quarantine.reason,
+                )
+                self.apply_status = ApplyStatus(
+                    status=STATUS_REVERTED,
+                    etag=prev_etag,
+                    failed_etag=etag,
+                    error=self._quarantine.reason,
+                )
+                self.heartbeat.config_apply = self.apply_status
+                bundle, etag = prev_bundle, prev_etag
+                booting_from_previous = True
         if bundle is not None:
             self._current_etag = etag
             try:
                 self.driver.apply_config(bundle)
                 self._current_structural_etag = bundle.get("structural_etag")
+                if not booting_from_previous:
+                    # #882 — ``current`` demonstrably works, so it becomes the
+                    # bundle we fall back TO. Skipped when we booted from
+                    # ``previous``: committing there would copy the still-bad
+                    # ``current.json`` over the only good config we have.
+                    commit_config(self.cfg.state_dir, etag or "")
                 # #296 A2 — warm-restart readiness. The hostPath cache carries
                 # the bundle we just successfully re-applied; the marker tells
                 # the K8s readinessProbe this pod is ready to serve without
@@ -91,8 +136,79 @@ class SyncLoop:
                     push_rendered_config(self.cfg, self.token_ref[0])
                 except Exception:
                     log.exception("rendered_config_bootstrap_push_failed")
-            except Exception:
+            except Exception as e:
+                # #882 — the cached bundle itself no longer applies. Quarantine
+                # it and fall back, rather than leaving the daemon on whatever
+                # half-state the failed apply produced.
                 log.exception("bootstrap_cache_apply_failed")
+                if booting_from_previous:
+                    # It was the last-known-GOOD bundle that just failed, not
+                    # ``current`` — ``etag`` was rebound to ``prev_etag`` above.
+                    # Do NOT quarantine it: that would overwrite the record
+                    # naming the bundle which actually broke us, un-quarantining
+                    # the poison pill so the next poll applies it again.
+                    self.apply_status = ApplyStatus(
+                        status=STATUS_REVERT_FAILED,
+                        etag=None,
+                        failed_etag=self._quarantine.etag,
+                        error=truncate_error(str(e)),
+                    )
+                    self.heartbeat.config_apply = self.apply_status
+                    log.error(
+                        "bootstrap_last_known_good_apply_failed",
+                        failed_etag=self._quarantine.etag,
+                        previous_etag=etag,
+                    )
+                else:
+                    if etag:
+                        self._quarantine.record(etag, truncate_error(str(e)))
+                    self._bootstrap_fallback(etag, e)
+
+    def _bootstrap_fallback(self, failed_etag: str | None, exc: BaseException) -> None:
+        """Boot from the last-known-good bundle after ``current`` failed (#882).
+
+        Only reached at startup, where there is no running daemon to protect
+        — so unlike the steady-state revert this is about getting the server
+        answering at all, on the newest config that is known to work.
+        """
+        prev_bundle, prev_etag = load_previous_config(self.cfg.state_dir)
+        if prev_bundle is None or prev_etag == failed_etag:
+            self.apply_status = ApplyStatus(
+                status=STATUS_NO_PREVIOUS,
+                etag=None,
+                failed_etag=failed_etag,
+                error=truncate_error(str(exc)),
+            )
+            self.heartbeat.config_apply = self.apply_status
+            log.error("bootstrap_no_last_known_good", failed_etag=failed_etag)
+            return
+        try:
+            self.driver.apply_config(prev_bundle)
+        except Exception as revert_exc:
+            self.apply_status = ApplyStatus(
+                status=STATUS_REVERT_FAILED,
+                etag=None,
+                failed_etag=failed_etag,
+                error=truncate_error(f"{exc} (revert also failed: {revert_exc})"),
+            )
+            self.heartbeat.config_apply = self.apply_status
+            log.exception("bootstrap_last_known_good_apply_failed")
+            return
+        self._current_etag = prev_etag
+        self._current_structural_etag = prev_bundle.get("structural_etag")
+        self.apply_status = ApplyStatus(
+            status=STATUS_REVERTED,
+            etag=prev_etag,
+            failed_etag=failed_etag,
+            error=truncate_error(str(exc)),
+        )
+        self.heartbeat.config_apply = self.apply_status
+        _touch_ready_marker(self.cfg.state_dir)
+        log.warning(
+            "bootstrap_from_last_known_good",
+            failed_etag=failed_etag,
+            booted_etag=prev_etag,
+        )
 
     def stop(self) -> None:
         self._stop.set()
@@ -110,6 +226,18 @@ class SyncLoop:
 
     def _poll_once(self) -> None:
         headers = {"Authorization": f"Bearer {self.token_ref[0]}"}
+        # #882 — a quarantined bundle is parked on a 304 by the etag we sent
+        # last time, so the only way to give it another attempt is to stop
+        # sending that etag. Dropping If-None-Match makes the server answer
+        # 200 with whatever it holds now: the corrected bundle if the operator
+        # has saved one, otherwise the same bundle for one more try.
+        if self._quarantine.retry_due():
+            log.info(
+                "sync_quarantine_retry_due",
+                etag=self._quarantine.etag,
+                failures=self._quarantine.failures,
+            )
+            self._current_etag = None
         if self._current_etag:
             headers["If-None-Match"] = self._current_etag
         try:
@@ -153,6 +281,14 @@ class SyncLoop:
             log.warning("sync_bundle_missing_etag")
             return
 
+        # #882 — the quarantine names ONE bundle. If the control plane is no
+        # longer serving it, the operator has saved something else and the
+        # record is moot: drop it now rather than let ``retry_due`` keep
+        # forcing If-None-Match off on every poll for a bundle that no
+        # longer exists.
+        if self._quarantine.etag is not None and etag != self._quarantine.etag:
+            self._quarantine.clear()
+
         # Atomic-swap cache always (cache is the source of truth for restarts)
         save_config(self.cfg.state_dir, bundle, etag)
 
@@ -170,15 +306,17 @@ class SyncLoop:
         # daemon stays running and ops are applied incrementally below.
         new_structural = bundle.get("structural_etag")
         if new_structural != self._current_structural_etag:
-            try:
-                self.driver.apply_config(bundle)
-            except Exception as e:
-                log.exception("sync_apply_failed")
-                self.heartbeat.daemon_status = {
-                    **self.heartbeat.daemon_status,
-                    "status": "degraded",
-                    "reason": f"config_validation_failed: {e}",
-                }
+            # #882 — a bundle that already failed is not retried on every
+            # poll. Advancing ``_current_etag`` parks the long-poll on a 304
+            # until either the operator saves something different or the
+            # quarantine backoff expires, instead of re-rendering the same
+            # broken config as fast as the wake tick fires.
+            if self._quarantine.blocks(etag):
+                log.info("sync_skipping_quarantined_bundle", etag=etag)
+                self._current_etag = etag
+                return
+            if not self._apply_with_revert(bundle, etag):
+                self._current_etag = etag
                 return
             self._current_structural_etag = new_structural
             log.info("structural_reload_applied", structural_etag=new_structural)
@@ -238,6 +376,29 @@ class SyncLoop:
         if dnssec_states:
             self._report_dnssec_state(dnssec_states)
 
+        # #882 — we got here with nothing quarantined and nothing to
+        # re-render, so whatever the control plane is serving is what we are
+        # running. Clear a stale ``reverted`` verdict: the operator's fix has
+        # landed and leaving the chip up would report a divergence that no
+        # longer exists.
+        if self._quarantine.etag is None and not self.apply_status.healthy:
+            self.apply_status = ApplyStatus(status=STATUS_OK, etag=etag)
+            self.heartbeat.config_apply = self.apply_status
+            log.info("config_apply_recovered", etag=etag)
+
+        # #882 — a poll that got all the way here had no apply failure, so
+        # whatever is cached as ``current`` is known to work and becomes the
+        # bundle we fall back TO.
+        #
+        # This is NOT redundant with the commit inside ``_apply_with_revert``.
+        # A structural etag that is unchanged skips the apply entirely — which
+        # is exactly what happens when an operator UNDOES the change that
+        # broke the config: the rendered result is byte-identical to what is
+        # already running, so nothing re-renders and the commit inside the
+        # apply path never fires. Without this, ``previous`` would keep
+        # pointing at an older etag indefinitely.
+        commit_config(self.cfg.state_dir, etag)
+
         # #296 A2 — stamp readiness marker AFTER the bundle was fetched,
         # persisted to the hostPath cache, and the driver-apply path
         # completed (either structural reload, record-op dispatch, or
@@ -245,6 +406,134 @@ class SyncLoop:
         # confirmed-in-sync state). A failed apply returns early above
         # so we never reach this point on error.
         _touch_ready_marker(self.cfg.state_dir)
+
+    def _apply_with_revert(self, bundle: dict[str, Any], etag: str) -> bool:
+        """Apply ``bundle``; on failure fall back to the last-known-good (#882).
+
+        Returns True when ``bundle`` is live, False when it was rejected —
+        in which case the daemon is either untouched (the failure happened
+        while rendering or validating into the staging tree) or has been
+        put back onto the previous bundle.
+
+        The phase distinction is what keeps the revert honest. BIND renders
+        and validates into ``rendered.new``, so a ``named-checkconf`` failure
+        never reached ``named``: re-rendering the previous bundle there would
+        bounce a healthy daemon to reach a state it is already in. Only a
+        failure at swap/reload — where the live directory has been replaced —
+        needs the previous config put back on disk.
+        """
+        try:
+            self.driver.apply_config(bundle)
+        except ConfigApplyError as e:
+            self._handle_apply_failure(etag, e.phase, e.cause, e.daemon_disturbed)
+            return False
+        except Exception as e:
+            # A driver that raised outside the phased wrapper. Unknown phase,
+            # so assume the worst and treat the daemon as disturbed.
+            self._handle_apply_failure(etag, None, e, True)
+            return False
+
+        self._quarantine.clear()
+        commit_config(self.cfg.state_dir, etag)
+        self.apply_status = ApplyStatus(status=STATUS_OK, etag=etag)
+        self.heartbeat.config_apply = self.apply_status
+        if self.heartbeat.daemon_status.get("status") == "degraded":
+            # Clear a degraded verdict this loop set on a previous cycle;
+            # leaving it would make a recovered server look broken forever.
+            self.heartbeat.daemon_status = {"status": "ok"}
+        return True
+
+    def _handle_apply_failure(
+        self,
+        etag: str,
+        phase: str | None,
+        cause: BaseException,
+        daemon_disturbed: bool,
+    ) -> None:
+        log.error(
+            "sync_apply_failed",
+            etag=etag,
+            phase=phase,
+            error=str(cause),
+            daemon_disturbed=daemon_disturbed,
+        )
+        self._quarantine.record(etag, truncate_error(f"{phase or 'apply'}: {cause}"))
+
+        prev_bundle, prev_etag = load_previous_config(self.cfg.state_dir)
+        if prev_bundle is None:
+            if daemon_disturbed:
+                # The live config directory was already replaced and we have
+                # nothing to put back, so we no longer know what ``named`` is
+                # running. Forget the structural fingerprint: leaving it would
+                # let a LATER bundle whose structural etag happens to match it
+                # (the operator undoing the change that broke this one) skip
+                # the apply entirely, and the agent would then report ``ok``
+                # for a daemon still sitting on the half-applied config.
+                self._current_structural_etag = None
+            status = ApplyStatus(
+                status=STATUS_NO_PREVIOUS,
+                etag=None,
+                failed_etag=etag,
+                phase=phase,
+                error=truncate_error(str(cause)),
+            )
+            log.error("sync_no_last_known_good", failed_etag=etag)
+        elif not daemon_disturbed:
+            # The staging tree failed; the daemon is still serving the config
+            # it was already serving, which IS the previous bundle. Nothing to
+            # re-render — record what is live and leave the daemon alone.
+            status = ApplyStatus(
+                status=STATUS_REVERTED,
+                etag=prev_etag,
+                failed_etag=etag,
+                phase=phase,
+                error=truncate_error(str(cause)),
+            )
+            log.warning(
+                "sync_reverted_without_reload",
+                failed_etag=etag,
+                live_etag=prev_etag,
+                phase=phase,
+            )
+        else:
+            try:
+                self.driver.apply_config(prev_bundle)
+            except Exception as revert_exc:
+                # Same reasoning as the no-previous branch above: the revert
+                # did not land either, so the running config is unknown and
+                # the structural fingerprint must not be trusted to skip the
+                # next apply.
+                self._current_structural_etag = None
+                status = ApplyStatus(
+                    status=STATUS_REVERT_FAILED,
+                    etag=None,
+                    failed_etag=etag,
+                    phase=phase,
+                    error=truncate_error(f"{cause} (revert also failed: {revert_exc})"),
+                )
+                log.exception("sync_revert_failed", failed_etag=etag)
+            else:
+                self._current_structural_etag = prev_bundle.get("structural_etag")
+                status = ApplyStatus(
+                    status=STATUS_REVERTED,
+                    etag=prev_etag,
+                    failed_etag=etag,
+                    phase=phase,
+                    error=truncate_error(str(cause)),
+                )
+                log.warning(
+                    "sync_reverted_to_last_known_good",
+                    failed_etag=etag,
+                    live_etag=prev_etag,
+                )
+
+        self.apply_status = status
+        self.heartbeat.config_apply = status
+        self.heartbeat.daemon_status = {
+            **self.heartbeat.daemon_status,
+            "status": "degraded",
+            "reason": f"config_apply_{status.status}: {status.error}",
+        }
 
     def _report_zone_state(self, bundle: dict[str, Any]) -> None:
         """POST ``{zones: [{zone_name, serial}, ...]}`` after a successful apply.

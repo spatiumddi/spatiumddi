@@ -183,6 +183,23 @@ RULE_TYPE_FIREWALL_APPLY_STALLED = "firewall.apply_stalled"
 # critical). Catches the "we forgot to rotate" 3am-page failure mode.
 RULE_TYPE_SECRET_EXPIRING = "secret_expiring"
 
+# Issue #882 — an agent reported that it could NOT apply the config we sent
+# and has reverted to its last-known-good (or has nothing to revert to).
+# Subject = the dns_server / dhcp_server / looking_glass_collector row.
+#
+# Deliberately NOT folded into ``server_unreachable``: that rule is about
+# an agent we cannot hear from, and this one fires on an agent that is
+# heartbeating perfectly, whose daemon is healthy, and whose answers are
+# simply not the ones the operator configured. Reachability alerting is
+# what makes such a divergence invisible — the server looks fine on every
+# other signal, which is exactly why a revert needs its own alarm rather
+# than a health check.
+#
+# Severity comes from the reported status, not from the rule: ``reverted``
+# is a warning (serving, wrong config), ``revert_failed`` / ``no_previous``
+# are critical (may not be serving at all).
+RULE_TYPE_AGENT_CONFIG_REJECTED = "agent_config_rejected"
+
 # Issue #46 — planned-decommission awareness. Subject = subnet. Fires
 # when a subnet's ``decom_date`` falls within ``threshold_days`` (default
 # 30). Same threshold-escalation shape as the other ``*_expiring`` rules
@@ -384,6 +401,7 @@ RULE_TYPES = frozenset(
         RULE_TYPE_DHCP_POOL_EXHAUSTION,
         RULE_TYPE_FIREWALL_APPLY_STALLED,
         RULE_TYPE_SECRET_EXPIRING,
+        RULE_TYPE_AGENT_CONFIG_REJECTED,
         RULE_TYPE_DECOM_EXPIRING,
         RULE_TYPE_DNS_NXDOMAIN_SPIKE,
         RULE_TYPE_DNS_QUERY_RATE_SPIKE,
@@ -2802,6 +2820,75 @@ async def _matching_secret_expiring_subjects(
     return matches
 
 
+async def _matching_agent_config_rejected_subjects(
+    db: AsyncSession,
+    rule: AlertRule,  # noqa: ARG001
+) -> list[tuple[str, str, str, str | None]]:
+    """``agent_config_rejected`` — every agent-managed server that reported a
+    failed config apply on its last heartbeat (#882).
+
+    Reads the ``config_apply_*`` columns the three heartbeat handlers write;
+    no probing, no extra round-trip. Auto-resolves through ``evaluate_all``'s
+    standard "subject no longer matches" diff the moment an agent reports
+    ``ok`` again.
+
+    NULL is deliberately not a match. It means the agent has never reported —
+    a pre-#882 agent, or one of the agentless drivers (Windows DNS, the cloud
+    DNS providers, ``technitium_api``) that has no apply loop at all. Firing
+    on those would alarm every install on upgrade day and say nothing true.
+    """
+    from app.models.bgp_looking_glass import LookingGlassCollector  # noqa: PLC0415
+    from app.models.dhcp import DHCPServer  # noqa: PLC0415
+    from app.models.dns import DNSServer  # noqa: PLC0415
+    from app.services.agents.config_apply import (  # noqa: PLC0415
+        FAILED_STATUSES,
+        SEVERITY_BY_STATUS,
+        STATUS_NO_PREVIOUS,
+        STATUS_REVERT_FAILED,
+    )
+
+    matches: list[tuple[str, str, str, str | None]] = []
+    failed = sorted(FAILED_STATUSES)
+    for model, kind in (
+        (DNSServer, "DNS"),
+        (DHCPServer, "DHCP"),
+        (LookingGlassCollector, "Looking Glass collector"),
+    ):
+        rows = (
+            (await db.execute(select(model).where(model.config_apply_status.in_(failed))))
+            .scalars()
+            .all()
+        )
+        for row in rows:
+            status = row.config_apply_status or ""
+            if status == STATUS_NO_PREVIOUS:
+                what = (
+                    "could not apply the configuration and had no previously-working "
+                    "configuration to fall back to, so it may not be serving at all"
+                )
+            elif status == STATUS_REVERT_FAILED:
+                what = (
+                    "could not apply the configuration AND failed to roll back to the "
+                    "previous one — its running state is unknown"
+                )
+            else:
+                what = (
+                    "rejected the configuration and rolled back to the last one that "
+                    "worked, so it is healthy but NOT serving what is saved here"
+                )
+            detail = (row.config_apply_error or "").strip()
+            message = (
+                f"{kind} server '{row.name}' {what}. "
+                f"Rejected config etag: {row.config_failed_etag or 'unknown'}."
+                + (f" Daemon reported: {detail}" if detail else "")
+            )
+            subject_id = f"{model.__tablename__}:{row.id}"
+            matches.append(
+                (subject_id, f"{row.name} ({kind})", message, SEVERITY_BY_STATUS.get(status))
+            )
+    return matches
+
+
 async def _matching_firewall_apply_stalled_subjects(
     db: AsyncSession,
     rule: AlertRule,
@@ -3557,6 +3644,58 @@ async def seed_firewall_apply_stalled_alert_rule() -> None:
                 rule_type=RULE_TYPE_FIREWALL_APPLY_STALLED,
                 severity="warning",
                 enabled=False,
+                notify_syslog=True,
+                notify_webhook=True,
+                notify_smtp=False,
+            )
+        )
+        await session.commit()
+
+
+_AGENT_CONFIG_REJECTED_RULE_NAME = "Agent config apply rejected"
+
+
+async def seed_agent_config_rejected_alert_rule() -> None:
+    """Seed the #882 rule, ENABLED by default.
+
+    Unlike the firewall-stalled and DNS-anomaly rules — which are seeded off
+    because they only make sense once an optional subsystem is switched on —
+    this one applies to every install that runs an agent, needs no
+    configuration, and cannot false-fire: it reads a verdict the agent itself
+    reported about its own apply. The failure it catches (a saved config that
+    silently never went live) is invisible on every other signal, so leaving
+    the alarm off by default would mean the operator has to already suspect
+    the problem in order to find out about it.
+
+    Keyed on ``name``; an operator who disables or renames it is never
+    overridden.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    async with AsyncSessionLocal() as session:
+        existing = await session.scalar(
+            select(AlertRule).where(AlertRule.name == _AGENT_CONFIG_REJECTED_RULE_NAME)
+        )
+        if existing is not None:
+            return
+        session.add(
+            AlertRule(
+                name=_AGENT_CONFIG_REJECTED_RULE_NAME,
+                description=(
+                    "Fires when a DNS, DHCP or Looking Glass agent reports that it "
+                    "could not apply the configuration the control plane sent it. "
+                    "The agent reverts to its last-known-good config and keeps "
+                    "serving, so the server stays reachable and healthy while NOT "
+                    "running what is saved here — a divergence no reachability or "
+                    "health check can see. Severity follows the agent's verdict: a "
+                    "rollback is a warning; a failed rollback, or a failure with no "
+                    "previous config to fall back to, is critical. Auto-resolves "
+                    "when the agent reports a successful apply."
+                ),
+                rule_type=RULE_TYPE_AGENT_CONFIG_REJECTED,
+                severity="warning",
+                enabled=True,
                 notify_syslog=True,
                 notify_webhook=True,
                 notify_smtp=False,
@@ -4699,6 +4838,15 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 expiring = await _matching_secret_expiring_subjects(db, rule, now)
                 matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in expiring]
                 subject_type = "secret"
+            elif rule.rule_type == RULE_TYPE_AGENT_CONFIG_REJECTED:
+                rejected = await _matching_agent_config_rejected_subjects(db, rule)
+                matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in rejected]
+                # One rule spans three tables, so the subject_type is the
+                # generic "agent" and the subject_id carries the source —
+                # same shape ``secret_expiring`` uses for its two credential
+                # tables. Without the prefix a dns_server and a dhcp_server
+                # sharing a UUID would collide into one event.
+                subject_type = "agent"
             elif rule.rule_type == RULE_TYPE_FIREWALL_APPLY_STALLED:
                 stalled = await _matching_firewall_apply_stalled_subjects(db, rule, now)
                 matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in stalled]

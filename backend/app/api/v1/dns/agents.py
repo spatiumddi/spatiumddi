@@ -41,6 +41,7 @@ from app.models.dns import (
 from app.models.dns_rpz_hit import DNSRPZHit
 from app.models.logs import DNSQueryLogEntry
 from app.models.metrics import DNSMetricSample
+from app.services.agents.config_apply import apply_reported_status
 from app.services.dns.agent_config import build_config_bundle
 from app.services.dns.agent_token import (
     hash_token,
@@ -102,6 +103,11 @@ class AgentHeartbeatRequest(BaseModel):
     # 422 every heartbeat from a current agent.
     daemon_version: str | None = None
     daemon: dict[str, Any] = {}
+    # #882 — the agent's last config-apply verdict:
+    # ``{status, etag, failed_etag, phase, error}``. Kept as a loose dict
+    # rather than a strict model because a pre-#882 agent sends ``{}`` and
+    # a NEWER agent may send fields this control plane predates — both must
+    # keep heartbeating. ``apply_reported_status`` validates what it reads.
     config: dict[str, Any] = {}
     # Bound the ACK list so a malformed/hostile heartbeat can't pin memory.
     ops_ack: list[dict[str, Any]] = Field(default_factory=list, max_length=5000)
@@ -464,6 +470,11 @@ async def agent_heartbeat(
         if elapsed > 15:
             server.reboot_requested = False
             server.reboot_requested_at = None
+
+    # #882 — the config-apply verdict. ``body.config`` has been declared on
+    # this model since it was written and read by nothing; a server could be
+    # reachable, healthy and serving a config the operator never approved.
+    apply_reported_status(server, body.config, agent_kind="dns", server_id=str(server.id))
 
     # Process op ACKs
     for ack in body.ops_ack:

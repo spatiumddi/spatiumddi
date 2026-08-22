@@ -489,6 +489,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_firewall_apply_stalled_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("firewall_apply_stalled_alert_rule_seed_skipped", reason=str(exc))
+    # Agent config-apply-rejected alert rule — singleton, ENABLED by default
+    # (issue #882). Fires when an agent reverts to its last-known-good config
+    # because the one we sent would not apply. Idempotent.
+    try:
+        from app.services.alerts import (  # noqa: PLC0415
+            seed_agent_config_rejected_alert_rule,
+        )
+
+        await seed_agent_config_rejected_alert_rule()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("agent_config_rejected_alert_rule_seed_skipped", reason=str(exc))
     # DNS query-anomaly alert rules — NXDOMAIN-spike + query-rate-spike,
     # singletons, DISABLED by default (issue #371). Discoverable in the
     # Alerts UI; fire only on agent-based BIND9 installs with metric data.

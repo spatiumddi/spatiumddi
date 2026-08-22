@@ -236,6 +236,33 @@ class DNSServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # report one) and must be treated as UNKNOWN, never as "old".
     daemon_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
+    # ── #882 last config-apply verdict ────────────────────────────────────
+    #
+    # Reported by the agent on every heartbeat. Distinct from ``status`` /
+    # ``last_seen_at``, which only say whether the agent is TALKING to us:
+    # a server can be reachable, healthy and answering queries while running
+    # a config the operator never approved, because the one they saved was
+    # rejected and the agent reverted to its last-known-good.
+    #
+    # ``config_apply_status`` values, mirroring the agent's
+    # ``config_apply.py``:
+    #   ok            — converged; the live config is the saved one
+    #   reverted      — the saved bundle failed; running the previous one
+    #   revert_failed — the saved bundle failed AND the revert failed
+    #   no_previous   — failed with nothing to fall back to (first bundle)
+    #
+    # NULL means the agent has never reported (a pre-#882 agent, or an
+    # agentless driver that has no apply loop at all). Treat NULL as
+    # UNKNOWN, never as ``ok``.
+    config_apply_status: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    # The daemon's own words about why it refused — ``named-checkconf``
+    # output, Kea's config-test text. Truncated agent-side to 2000 chars.
+    config_apply_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # etag of the bundle that was rejected, so the operator can tell whether
+    # the failure is still current or predates the config now saved.
+    config_failed_etag: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    config_apply_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
     # Issue #197 — link back to the parent Application appliance
     # (when the row was registered through the supervisor's role-
     # assignment flow). ``ON DELETE CASCADE`` does the orphan-row

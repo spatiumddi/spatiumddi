@@ -442,3 +442,80 @@ async def global_search(
 # Silence the false-positive "imported but unused" — ``or_`` is part
 # of the standard import block we share with sibling tool modules.
 _ = or_
+
+
+# ── find_agents_with_config_failures ──────────────────────────────────
+
+
+class FindAgentConfigFailuresArgs(BaseModel):
+    include_unreported: bool = Field(
+        default=False,
+        description=(
+            "Also list agent-managed servers that have never reported a "
+            "config-apply verdict (a pre-#882 agent, or an agentless driver "
+            "with no apply loop). These are UNKNOWN, not healthy."
+        ),
+    )
+    limit: int = Field(default=200, ge=1, le=1000)
+
+
+@register_tool(
+    name="find_agents_with_config_failures",
+    description=(
+        "List DNS servers, DHCP servers and Looking Glass collectors whose "
+        "agent could NOT apply the configuration the control plane sent, and "
+        "has reverted to its last-known-good config (issue #882). Use this to "
+        "answer 'why isn't my zone/scope change live?' when the server looks "
+        "healthy: a reverted agent keeps serving and keeps heartbeating, so "
+        "status, health checks and last-seen all read normal while the saved "
+        "configuration is not running anywhere. Returns the rejected config's "
+        "etag and the daemon's own error text (named-checkconf output, Kea's "
+        "config-test message) — that text usually names the exact problem. A "
+        "status of 'reverted' means healthy-but-stale; 'revert_failed' and "
+        "'no_previous' mean the service may not be running at all."
+    ),
+    args_model=FindAgentConfigFailuresArgs,
+    category="ops",
+)
+async def find_agents_with_config_failures(
+    db: AsyncSession,
+    user: User,  # noqa: ARG001 — read-only fleet health, same gate as the other ops tools
+    args: FindAgentConfigFailuresArgs,
+) -> list[dict[str, Any]]:
+    from app.models.bgp_looking_glass import LookingGlassCollector  # noqa: PLC0415
+    from app.models.dhcp import DHCPServer  # noqa: PLC0415
+    from app.models.dns import DNSServer  # noqa: PLC0415
+    from app.services.agents.config_apply import FAILED_STATUSES  # noqa: PLC0415
+
+    out: list[dict[str, Any]] = []
+    for model, kind in (
+        (DNSServer, "dns_server"),
+        (DHCPServer, "dhcp_server"),
+        (LookingGlassCollector, "looking_glass_collector"),
+    ):
+        stmt = select(model)
+        if args.include_unreported:
+            stmt = stmt.where(
+                or_(
+                    model.config_apply_status.in_(sorted(FAILED_STATUSES)),
+                    model.config_apply_status.is_(None),
+                )
+            )
+        else:
+            stmt = stmt.where(model.config_apply_status.in_(sorted(FAILED_STATUSES)))
+        rows = (await db.execute(stmt.limit(args.limit))).scalars().all()
+        for r in rows:
+            out.append(
+                {
+                    "kind": kind,
+                    "id": str(r.id),
+                    "name": r.name,
+                    "config_apply_status": r.config_apply_status or "never_reported",
+                    "config_failed_etag": r.config_failed_etag,
+                    "config_apply_error": r.config_apply_error,
+                    "config_apply_at": (
+                        r.config_apply_at.isoformat() if r.config_apply_at else None
+                    ),
+                }
+            )
+    return out[: args.limit]

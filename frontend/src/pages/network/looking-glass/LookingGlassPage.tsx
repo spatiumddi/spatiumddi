@@ -7,6 +7,7 @@ import { lookingGlassApi, type BGPLGPeer } from "@/lib/api";
 import { HeaderButton } from "@/components/ui/header-button";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { cn } from "@/lib/utils";
+import { ConfigApplyBanner } from "@/components/ConfigApplyChip";
 
 import { PeerFormModal, SessionsTab } from "./SessionsTab";
 import { RoutesTab } from "./RoutesTab";
@@ -183,6 +184,22 @@ export function LookingGlassPage() {
       </div>
 
       <div className="flex-1 overflow-auto p-6">
+        {/* #882 — a collector whose peer set failed to render keeps running on
+            the previous one, so its sessions look healthy while the peers the
+            operator added are simply absent. There is no collector list to
+            hang a per-row chip on, so surface it above the tab content. */}
+        {collectors
+          .filter(
+            (c) => c.config_apply_status && c.config_apply_status !== "ok",
+          )
+          .map((c) => (
+            <div key={c.id} className="mb-4">
+              <div className="mb-1 text-xs font-medium text-muted-foreground">
+                Collector “{c.name}”
+              </div>
+              <ConfigApplyBanner server={c} />
+            </div>
+          ))}
         {tab === "sessions" ? (
           <SessionsTab
             collectors={collectors}

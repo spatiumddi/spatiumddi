@@ -27,7 +27,6 @@ docstring.
 
 from __future__ import annotations
 
-import random
 import subprocess
 import threading
 import time
@@ -37,17 +36,34 @@ import httpx
 import structlog
 
 from . import gobgp
-from .cache import load_config, save_config, save_token
+from .cache import (
+    commit_config,
+    load_config,
+    load_previous_config,
+    save_config,
+    save_token,
+)
 from .config import AgentConfig
+from .config_apply import (
+    STATUS_NO_PREVIOUS,
+    STATUS_OK,
+    STATUS_REVERT_FAILED,
+    STATUS_REVERTED,
+    ApplyStatus,
+    ConfigApplyError,
+    Quarantine,
+    truncate_error,
+)
 
 log = structlog.get_logger(__name__)
 
-# Jittered exponential backoff for a persistently-failing bundle apply
-# (mirrors bootstrap.py's register loop). Bounded so a bad bundle can't
-# hammer the /config long-poll or peg the CPU, but small enough that a
-# transient failure recovers within a poll or two.
-_APPLY_BACKOFF_BASE = 2.0
-_APPLY_BACKOFF_CAP = 45.0
+# NOTE: the jittered ``_APPLY_BACKOFF_BASE`` / ``_APPLY_BACKOFF_CAP`` sleep
+# that used to live here is gone (#882). It kept a persistently-bad bundle
+# from pegging the CPU, but it also kept RETRYING that bundle forever at a
+# 45 s cap, with the collector stuck on a peer set that does not render and
+# nothing said upward. ``Quarantine`` replaces it: park on the etag so the
+# long-poll blocks properly, retry on a longer ladder, and report the
+# failure on the heartbeat.
 
 
 class SyncLoop:
@@ -66,14 +82,39 @@ class SyncLoop:
         self.gobgpd_proc = gobgpd_proc
         self._stop = threading.Event()
         self._current_etag: str | None = None
-        # Grows on consecutive apply failures, resets to base on success.
-        self._apply_backoff = _APPLY_BACKOFF_BASE
+        # #882 — last-known-good revert. ``quarantine`` remembers an etag
+        # whose apply failed so we stop re-rendering it; ``apply_status`` is
+        # what the heartbeat reports upward.
+        self._quarantine = Quarantine(self.cfg.state_dir)
+        self.apply_status = ApplyStatus()
+        self.heartbeat.config_apply = self.apply_status
 
         # Preload cached bundle (non-negotiable #5 — offline-operation
         # guarantee). Applying it BEFORE the first network poll is what
         # keeps already-configured BGP sessions up if the control plane
         # is unreachable at container start.
         bundle, etag = load_config(self.cfg.state_dir)
+        # #882 — a restart must not re-apply the bundle that already failed.
+        booting_from_previous = False
+        if bundle is not None and self._quarantine.blocks(etag):
+            prev_bundle, prev_etag = load_previous_config(self.cfg.state_dir)
+            if prev_bundle is not None:
+                log.warning(
+                    "lg_bootstrap_skipping_quarantined_bundle",
+                    failed_etag=etag,
+                    booting_etag=prev_etag,
+                    reason=self._quarantine.reason,
+                )
+                self._set_status(
+                    ApplyStatus(
+                        status=STATUS_REVERTED,
+                        etag=prev_etag,
+                        failed_etag=etag,
+                        error=self._quarantine.reason,
+                    )
+                )
+                bundle, etag = prev_bundle, prev_etag
+                booting_from_previous = True
         if bundle is not None:
             self._current_etag = etag
             try:
@@ -82,9 +123,85 @@ class SyncLoop:
                     gobgp.peer_address_map(bundle),
                     gobgp.peer_import_scopes(bundle),
                 )
+                if not booting_from_previous:
+                    # #882 — ``current`` demonstrably renders, so it becomes
+                    # the bundle we fall back TO. Skipped when we booted from
+                    # ``previous``: committing there would copy the still-bad
+                    # ``current.json`` over the only good config we have.
+                    commit_config(self.cfg.state_dir, etag or "")
                 log.info("lg_agent_bootstrap_from_cache", etag=etag)
-            except Exception:
+            except Exception as e:
                 log.exception("lg_bootstrap_cache_apply_failed")
+                if booting_from_previous:
+                    # It was the last-known-GOOD bundle that just failed, not
+                    # ``current`` — ``etag`` was rebound to ``prev_etag`` above.
+                    # Do NOT quarantine it: that would overwrite the record
+                    # naming the bundle which actually broke us, un-quarantining
+                    # the poison pill so the next poll applies it again.
+                    self._set_status(
+                        ApplyStatus(
+                            status=STATUS_REVERT_FAILED,
+                            failed_etag=self._quarantine.etag,
+                            error=truncate_error(str(e)),
+                        )
+                    )
+                    log.error(
+                        "lg_bootstrap_last_known_good_apply_failed",
+                        failed_etag=self._quarantine.etag,
+                        previous_etag=etag,
+                    )
+                else:
+                    if etag:
+                        self._quarantine.record(etag, truncate_error(str(e)))
+                    self._bootstrap_fallback(etag, e)
+
+    def _set_status(self, status: ApplyStatus) -> None:
+        self.apply_status = status
+        self.heartbeat.config_apply = status
+
+    def _bootstrap_fallback(self, failed_etag: str | None, exc: BaseException) -> None:
+        """Boot from the last-known-good bundle after ``current`` failed (#882)."""
+        prev_bundle, prev_etag = load_previous_config(self.cfg.state_dir)
+        if prev_bundle is None or prev_etag == failed_etag:
+            self._set_status(
+                ApplyStatus(
+                    status=STATUS_NO_PREVIOUS,
+                    failed_etag=failed_etag,
+                    error=truncate_error(str(exc)),
+                )
+            )
+            log.error("lg_bootstrap_no_last_known_good", failed_etag=failed_etag)
+            return
+        try:
+            gobgp.apply_config(self.cfg, prev_bundle, self.gobgpd_proc)
+            self.rib.set_peers(
+                gobgp.peer_address_map(prev_bundle),
+                gobgp.peer_import_scopes(prev_bundle),
+            )
+        except Exception as revert_exc:
+            self._set_status(
+                ApplyStatus(
+                    status=STATUS_REVERT_FAILED,
+                    failed_etag=failed_etag,
+                    error=truncate_error(f"{exc} (revert also failed: {revert_exc})"),
+                )
+            )
+            log.exception("lg_bootstrap_last_known_good_apply_failed")
+            return
+        self._current_etag = prev_etag
+        self._set_status(
+            ApplyStatus(
+                status=STATUS_REVERTED,
+                etag=prev_etag,
+                failed_etag=failed_etag,
+                error=truncate_error(str(exc)),
+            )
+        )
+        log.warning(
+            "lg_bootstrap_from_last_known_good",
+            failed_etag=failed_etag,
+            booted_etag=prev_etag,
+        )
 
     def stop(self) -> None:
         self._stop.set()
@@ -101,6 +218,16 @@ class SyncLoop:
 
     def _poll_once(self) -> None:
         headers = {"Authorization": f"Bearer {self.token_ref[0]}"}
+        # #882 — a quarantined bundle is parked on a 304 by the etag we sent
+        # last time, so the only way to give it another attempt is to stop
+        # sending that etag.
+        if self._quarantine.retry_due():
+            log.info(
+                "lg_sync_quarantine_retry_due",
+                etag=self._quarantine.etag,
+                failures=self._quarantine.failures,
+            )
+            self._current_etag = None
         if self._current_etag:
             headers["If-None-Match"] = self._current_etag
         try:
@@ -146,36 +273,28 @@ class SyncLoop:
         # restarts, even before we know the apply below succeeds. We cache
         # the unwrapped inner bundle (matches what the constructor's
         # ``load_config`` preload path expects to hand to ``gobgp.py``).
+        # #882 — the quarantine names ONE bundle. If the control plane is no
+        # longer serving it, the operator has saved something else and the
+        # record is moot.
+        if self._quarantine.etag is not None and etag != self._quarantine.etag:
+            self._quarantine.clear()
+
         save_config(self.cfg.state_dir, inner_bundle, etag)
 
-        try:
-            gobgp.apply_config(self.cfg, inner_bundle, self.gobgpd_proc)
-        except Exception as e:
-            log.exception("lg_sync_apply_failed")
-            self.heartbeat.daemon_status = {
-                **self.heartbeat.daemon_status,
-                "status": "degraded",
-                "reason": f"config_render_failed: {e}",
-            }
-            # Bounded backoff so a persistently-bad bundle (e.g. a
-            # ReceiveOnlyViolation, a malformed peer set) can't spin the
-            # bare ``run()`` loop: we deliberately DON'T advance
-            # ``_current_etag``, so the next poll re-fetches the SAME
-            # bundle to retry the apply — but only after sleeping, instead
-            # of immediately re-hitting /config with the stale
-            # If-None-Match and pegging the CPU. ``_stop.wait`` so a
-            # shutdown signal interrupts the sleep promptly.
-            sleep_for = min(
-                self._apply_backoff + random.uniform(0, 2), _APPLY_BACKOFF_CAP
-            )
-            log.warning("lg_sync_apply_backoff", seconds=round(sleep_for, 1))
-            self._stop.wait(sleep_for)
-            self._apply_backoff = min(self._apply_backoff * 2, _APPLY_BACKOFF_CAP)
+        if self._quarantine.blocks(etag):
+            # #882 — already known-bad. Park on this etag so the long-poll
+            # blocks on a 304 instead of re-rendering the same broken peer
+            # set; the quarantine backoff decides when to try again. This
+            # replaces the pre-#882 sleep-and-retry, which held the bundle
+            # forever at a 45 s cap with no upward signal.
+            log.info("lg_sync_skipping_quarantined_bundle", etag=etag)
+            self._current_etag = etag
             return
 
-        # Apply succeeded — reset the backoff so the next failure (if any)
-        # starts from the base again.
-        self._apply_backoff = _APPLY_BACKOFF_BASE
+        if not self._apply_with_revert(inner_bundle, etag):
+            self._current_etag = etag
+            return
+
         self.rib.set_peers(
             gobgp.peer_address_map(inner_bundle),
             gobgp.peer_import_scopes(inner_bundle),
@@ -186,6 +305,111 @@ class SyncLoop:
             etag=etag,
             peer_count=len(inner_bundle.get("peers") or []),
         )
+
+    def _apply_with_revert(self, bundle: dict[str, Any], etag: str) -> bool:
+        """Apply ``bundle``; on failure fall back to the last-known-good (#882).
+
+        Returns True when ``bundle`` is live, False when it was rejected.
+
+        gobgpd has no dry-run and :func:`gobgp.reload` is a best-effort
+        SIGHUP that never raises, so the only failures observable here are
+        render and file-write. That is still worth reverting for: the
+        rendered document is what gobgpd reads on its next start, so a
+        half-written or stale-but-wrong file turns one bad bundle into a
+        collector that comes back up with the wrong peer set.
+        """
+        try:
+            gobgp.apply_config(self.cfg, bundle, self.gobgpd_proc)
+        except ConfigApplyError as e:
+            self._handle_apply_failure(etag, e.phase, e.cause, e.daemon_disturbed)
+            return False
+        except Exception as e:
+            self._handle_apply_failure(etag, None, e, True)
+            return False
+
+        self._quarantine.clear()
+        commit_config(self.cfg.state_dir, etag)
+        self._set_status(ApplyStatus(status=STATUS_OK, etag=etag))
+        if self.heartbeat.daemon_status.get("status") == "degraded":
+            self.heartbeat.daemon_status = {"status": "ok"}
+        return True
+
+    def _handle_apply_failure(
+        self,
+        etag: str,
+        phase: str | None,
+        cause: BaseException,
+        daemon_disturbed: bool,
+    ) -> None:
+        log.error(
+            "lg_sync_apply_failed",
+            etag=etag,
+            phase=phase,
+            error=str(cause),
+            daemon_disturbed=daemon_disturbed,
+        )
+        self._quarantine.record(etag, truncate_error(f"{phase or 'apply'}: {cause}"))
+
+        prev_bundle, prev_etag = load_previous_config(self.cfg.state_dir)
+        if prev_bundle is None:
+            status = ApplyStatus(
+                status=STATUS_NO_PREVIOUS,
+                failed_etag=etag,
+                phase=phase,
+                error=truncate_error(str(cause)),
+            )
+            log.error("lg_sync_no_last_known_good", failed_etag=etag)
+        elif not daemon_disturbed:
+            # Rendering failed, so gobgpd's config file was never replaced —
+            # it still holds the previous bundle, which is the state a revert
+            # would produce. Rewriting it would be busywork.
+            status = ApplyStatus(
+                status=STATUS_REVERTED,
+                etag=prev_etag,
+                failed_etag=etag,
+                phase=phase,
+                error=truncate_error(str(cause)),
+            )
+            log.warning(
+                "lg_sync_reverted_without_rewrite",
+                failed_etag=etag,
+                live_etag=prev_etag,
+            )
+        else:
+            try:
+                gobgp.apply_config(self.cfg, prev_bundle, self.gobgpd_proc)
+                self.rib.set_peers(
+                    gobgp.peer_address_map(prev_bundle),
+                    gobgp.peer_import_scopes(prev_bundle),
+                )
+            except Exception as revert_exc:
+                status = ApplyStatus(
+                    status=STATUS_REVERT_FAILED,
+                    failed_etag=etag,
+                    phase=phase,
+                    error=truncate_error(f"{cause} (revert also failed: {revert_exc})"),
+                )
+                log.exception("lg_sync_revert_failed", failed_etag=etag)
+            else:
+                status = ApplyStatus(
+                    status=STATUS_REVERTED,
+                    etag=prev_etag,
+                    failed_etag=etag,
+                    phase=phase,
+                    error=truncate_error(str(cause)),
+                )
+                log.warning(
+                    "lg_sync_reverted_to_last_known_good",
+                    failed_etag=etag,
+                    live_etag=prev_etag,
+                )
+
+        self._set_status(status)
+        self.heartbeat.daemon_status = {
+            **self.heartbeat.daemon_status,
+            "status": "degraded",
+            "reason": f"config_apply_{status.status}: {status.error}",
+        }
 
     def run(self) -> None:
         while not self._stop.is_set():

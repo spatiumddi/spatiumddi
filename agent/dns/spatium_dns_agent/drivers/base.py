@@ -11,6 +11,13 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
 
+from ..config_apply import (
+    PHASE_RELOAD,
+    PHASE_RENDER,
+    PHASE_VALIDATE,
+    ConfigApplyError,
+)
+
 # Record-op kinds that describe an RRset, and so can carry the complete
 # desired ``record["rrset"]`` the control plane stamps on them (#773).
 # Everything else on the queue is zone-level (the ``dnssec_*`` ops) and
@@ -72,7 +79,22 @@ class DriverBase(ABC):
         return None
 
     def apply_config(self, bundle: dict[str, Any]) -> None:
-        """Default orchestration: render → validate → swap+reload."""
-        self.render(bundle)
-        self.validate()
-        self.swap_and_reload()
+        """Default orchestration: render → validate → swap+reload.
+
+        Every failure is re-raised as :class:`ConfigApplyError` carrying the
+        phase it happened in. The caller needs that to choose a recovery: a
+        render or validate failure never reached the daemon, so nothing has
+        to be undone beyond the staging tree, whereas a swap/reload failure
+        means the live config directory has already been replaced and the
+        previous bundle has to be re-rendered to get back to a known state
+        (#882).
+        """
+        for phase, step in (
+            (PHASE_RENDER, lambda: self.render(bundle)),
+            (PHASE_VALIDATE, self.validate),
+            (PHASE_RELOAD, self.swap_and_reload),
+        ):
+            try:
+                step()
+            except Exception as e:
+                raise ConfigApplyError(phase, e) from e

@@ -73,6 +73,7 @@ import structlog
 
 from .cache import save_rendered_gobgpd
 from .config import AgentConfig
+from .config_apply import PHASE_RELOAD, PHASE_RENDER, ConfigApplyError
 
 log = structlog.get_logger(__name__)
 
@@ -337,21 +338,25 @@ def _assert_receive_only(rendered: dict[str, Any]) -> None:
             )
 
 
-def write_config(cfg: AgentConfig, bundle: dict[str, Any]) -> dict[str, Any]:
-    """Render + atomically write the gobgpd config file.
+def _write_rendered(cfg: AgentConfig, rendered: dict[str, Any]) -> None:
+    """Atomically swap the rendered document into gobgpd's config path.
 
     Also stashes a copy under the agent state dir's ``rendered/`` for
     audit/debug (mirrors the DHCP agent's ``rendered/kea-dhcp4.json``
     convention).
+
+    Kept separate from :func:`render_config` so :func:`apply_config` can tell
+    a render failure (config file untouched) from a write failure (it may not
+    be) — see that function's docstring. That split is why the old
+    ``write_config`` wrapper, which did both in one call, no longer exists:
+    it had no callers left and could only reintroduce the conflation.
     """
-    rendered = render_config(bundle)
     target = cfg.gobgpd_config_path
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp = target.with_suffix(target.suffix + ".tmp")
     tmp.write_text(json.dumps(rendered, indent=2, sort_keys=True))
     tmp.replace(target)
     save_rendered_gobgpd(cfg.state_dir, rendered)
-    return rendered
 
 
 def start_daemon(cfg: AgentConfig) -> subprocess.Popen[bytes]:
@@ -457,10 +462,25 @@ def apply_config(
     ``proc`` may be ``None`` when applying the cache before gobgpd has
     even been started yet (the config file write still happens — the
     daemon picks it up on its own first read).
+
+    Failures are re-raised as :class:`ConfigApplyError` tagged with the
+    phase (#882). The split is at the file swap, not at the reload: gobgpd
+    has no dry-run mode and :func:`reload` is a best-effort SIGHUP that
+    never raises, so "did the daemon accept it" is not knowable here. What
+    IS knowable is whether the config file on disk still holds the previous
+    bundle — and that file is what gobgpd reads on its next start. A render
+    failure leaves it untouched; anything after does not.
     """
-    rendered = write_config(cfg, bundle)
-    if proc is not None:
-        reload(proc)
+    try:
+        rendered = render_config(bundle)
+    except Exception as e:
+        raise ConfigApplyError(PHASE_RENDER, e) from e
+    try:
+        _write_rendered(cfg, rendered)
+        if proc is not None:
+            reload(proc)
+    except Exception as e:
+        raise ConfigApplyError(PHASE_RELOAD, e) from e
     return rendered
 
 

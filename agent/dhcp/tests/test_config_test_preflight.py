@@ -89,8 +89,10 @@ def test_reload_socket_rejection_surfaces_reason_and_skips_reload(
     monkeypatch.setattr(sync_mod, "config_test", bad_test)
     monkeypatch.setattr(sync_mod, "config_reload", lambda s: reloaded.append(s))
 
-    ok = loop._reload_socket(agent_cfg.kea_control_socket, {"Dhcp4": {}}, "dhcp4", 0.0)
-    assert ok is False
+    result = loop._reload_socket(agent_cfg.kea_control_socket, {"Dhcp4": {}}, "dhcp4", 0.0)
+    # #882 — the exact value matters now: REJECTED is a verdict on the
+    # config and triggers a revert; UNREACHABLE is not.
+    assert result == sync_mod.RELOAD_REJECTED
     assert reloaded == []  # never reload a config Kea rejects
     assert loop.heartbeat.daemon_status["status"] == "degraded"
     assert "pool not in subnet" in loop.heartbeat.daemon_status["reason"]
@@ -104,8 +106,8 @@ def test_reload_socket_happy_path_tests_then_reloads(
     monkeypatch.setattr(sync_mod, "config_test", lambda s, d: calls.append("test"))
     monkeypatch.setattr(sync_mod, "config_reload", lambda s: calls.append("reload"))
 
-    ok = loop._reload_socket(agent_cfg.kea_control_socket, {"Dhcp4": {}}, "dhcp4", 0.0)
-    assert ok is True
+    result = loop._reload_socket(agent_cfg.kea_control_socket, {"Dhcp4": {}}, "dhcp4", 0.0)
+    assert result == sync_mod.RELOAD_OK
     assert calls == ["test", "reload"]  # preflight BEFORE reload
 
 
@@ -121,8 +123,8 @@ def test_reload_socket_socket_not_ready_retries_then_reports(
     monkeypatch.setattr(sync_mod, "config_reload", lambda s: None)
 
     # timeout 0 → the OSError branch breaks immediately (no real wait).
-    ok = loop._reload_socket(agent_cfg.kea_control_socket, {"Dhcp4": {}}, "dhcp4", 0.0)
-    assert ok is False
+    result = loop._reload_socket(agent_cfg.kea_control_socket, {"Dhcp4": {}}, "dhcp4", 0.0)
+    assert result == sync_mod.RELOAD_UNREACHABLE
     assert "socket_unreachable" in loop.heartbeat.daemon_status["reason"]
 
 
@@ -146,7 +148,7 @@ def test_reload_socket_transient_kea_error_retries_then_succeeds(
     monkeypatch.setattr(sync_mod, "config_test", flaky_test)
     monkeypatch.setattr(sync_mod, "config_reload", lambda s: reloaded.append(s))
 
-    ok = loop._reload_socket(agent_cfg.kea_control_socket, {"Dhcp4": {}}, "dhcp4", 5.0)
-    assert ok is True
+    result = loop._reload_socket(agent_cfg.kea_control_socket, {"Dhcp4": {}}, "dhcp4", 5.0)
+    assert result == sync_mod.RELOAD_OK
     assert calls["test"] == 2  # retried past the transient KeaCtrlError
     assert reloaded  # reloaded once config-test passed

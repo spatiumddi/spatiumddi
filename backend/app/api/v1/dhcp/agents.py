@@ -39,6 +39,7 @@ from app.models.dhcp import (
 from app.models.logs import DHCPLogEntry
 from app.models.metrics import DHCPMetricSample
 from app.models.settings import PlatformSettings
+from app.services.agents.config_apply import apply_reported_status
 from app.services.appliance.lldp import lldp_bundle
 from app.services.appliance.ntp import ntp_bundle
 from app.services.appliance.resolver import resolver_bundle
@@ -108,6 +109,9 @@ class AgentHeartbeatRequest(BaseModel):
     # heartbeat from a current agent.
     kea_version: str | None = None
     daemon: dict[str, Any] = {}
+    # #882 — the agent's last config-apply verdict:
+    # ``{status, etag, failed_etag, phase, error}``. See the DNS agent's
+    # AgentHeartbeatRequest for why this stays a loose dict.
     config: dict[str, Any] = {}
     # Bound the ACK list so a malformed / hostile heartbeat can't pin memory.
     ops_ack: list[dict[str, Any]] = Field(default_factory=list, max_length=5000)
@@ -845,6 +849,12 @@ async def agent_heartbeat(
         if elapsed > 15:
             server.reboot_requested = False
             server.reboot_requested_at = None
+
+    # #882 — the config-apply verdict. Pre-#882 a config Kea REFUSED still
+    # reached here as a healthy heartbeat: the agent advanced its etag,
+    # recorded success and stamped its readiness marker, so nothing on this
+    # side ever learned the scope changes were not live.
+    apply_reported_status(server, body.config, agent_kind="dhcp", server_id=str(server.id))
 
     for ack in body.ops_ack:
         op_id = ack.get("op_id")

@@ -48,6 +48,20 @@ mkdir -p "$LOG_DIR" "$(dirname "$APPLIED_SIDECAR")"
 
 log() { printf '%s spatiumddi-verbose-boot-reload: %s\n' "$(date -u +%FT%TZ)" "$*" | tee -a "$LOG"; }
 
+# #882 audit — on any failure path, move the trigger aside before exiting.
+# Every sibling runner does this (#550) and this one did not: the supervisor's
+# _fire_host_config bails while the trigger exists, so an exit 1 that leaves it
+# in place wedges the plane until someone SSHes in and deletes the file by
+# hand. Renaming it lets the next corrected heartbeat re-fire; the copy stays
+# for forensics.
+fail_release() {
+    printf 'state=failed\nreason=%s\nrequested=%s\napplied_at=%s\n' \
+        "$1" "${2:-}" "$(date -u +%FT%TZ)" > "$STATUS_SIDECAR"
+    [ -f "$TRIGGER" ] \
+        && mv -f "$TRIGGER" "${TRIGGER}.failed.$(date +%s)" 2>/dev/null
+    exit 1
+}
+
 exec 9>"$LOCK"
 if ! flock -n 9; then
     log "another instance is running — exiting"
@@ -67,9 +81,7 @@ case "$val" in
     0 | 1 | 2) ;;
     *)
         log "REJECT: trigger value '$val' is not 0, 1 or 2"
-        printf 'state=failed\nreason=invalid_value\nrequested=%s\napplied_at=%s\n' \
-            "$val" "$(date -u +%FT%TZ)" > "$STATUS_SIDECAR"
-        exit 1
+        fail_release invalid_value "$val"
         ;;
 esac
 
@@ -82,17 +94,13 @@ for cand in /boot/efi/grub/grubenv /boot/grub/grubenv /boot/grub2/grubenv; do
 done
 if [ -z "$GRUBENV" ]; then
     log "ERROR: no grubenv found (looked in /boot/efi/grub, /boot/grub, /boot/grub2)"
-    printf 'state=failed\nreason=grubenv_not_found\nrequested=%s\napplied_at=%s\n' \
-        "$val" "$(date -u +%FT%TZ)" > "$STATUS_SIDECAR"
-    exit 1
+    fail_release grubenv_not_found "$val"
 fi
 
 log "apply: spatium_verbose=$val into $GRUBENV"
 if ! grub-editenv "$GRUBENV" set spatium_verbose="$val" 2>&1 | tee -a "$LOG"; then
     log "ERROR: grub-editenv failed"
-    printf 'state=failed\nreason=grub_editenv_failed\nrequested=%s\napplied_at=%s\n' \
-        "$val" "$(date -u +%FT%TZ)" > "$STATUS_SIDECAR"
-    exit 1
+    fail_release grub_editenv_failed "$val"
 fi
 
 # Apply landed. Record it so the supervisor short-circuits the next heartbeat's

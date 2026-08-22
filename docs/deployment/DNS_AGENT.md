@@ -201,9 +201,11 @@ agent-id                         # UUID, 0600
 agent_token.jwt                  # current JWT, 0600
 bootstrap.last                   # last-used PSK hash (for rotation detect)
 config/
-  current.json                   # last-applied AgentConfigBundle (ETag in header field)
+  current.json                   # last AgentConfigBundle FETCHED from the control plane
   current.etag
-  previous.json                  # rollback copy
+  previous.json                  # last bundle that APPLIED cleanly — the revert target
+  previous.etag
+  quarantine.json                # etag of a bundle that failed to apply, + its backoff
 rendered/
   zones/
     example.com.db
@@ -218,6 +220,54 @@ ops/
 ```
 
 **Offline operation**: if the control plane is unreachable on boot, the agent loads `config/current.json`, renders configs if not already rendered, starts the daemon, and continues serving DNS. It enters a retry loop and resumes sync when the control plane returns. No query path ever depends on control-plane reachability.
+
+### Last-known-good revert (issue #882)
+
+Offline operation covers a *missing* control plane. It does not cover a
+*wrong* one: a bundle that parses fine but renders config `named` rejects.
+Both agents wrote `previous.json` from the first release and **neither ever
+read it**, so a bad-but-parseable bundle overwrote the cache and left the
+agent with nothing to fall back to.
+
+Two properties make the fallback real:
+
+* **`previous` is the last bundle that APPLIED, not the last one fetched.**
+  It used to be rotated on every fetch, which destroyed the fallback in two
+  poll cycles: a failing bundle leaves the etag unadvanced, so the next poll
+  re-fetches the *same* bundle and rotates it — now known-bad — into
+  `previous`. It is now written by an explicit commit after the driver
+  accepts the bundle, and that commit refuses to run if `current` is not the
+  bundle that was applied.
+* **A failed etag is quarantined.** The long-poll wakes on a 12 s tick with a
+  2 s poll fallback, so without this a bad bundle is not one failure but a
+  re-render loop. The agent parks on the failing etag (the long-poll then
+  blocks on a 304, costing nothing) and retries on a 60 s → 5 min → 15 min
+  ladder, so a *transient* failure — a full disk mid-render, a daemon still
+  starting — still recovers on its own. Any bundle that applies clears the
+  record, as does the control plane simply serving a different etag.
+
+The apply is phased — render → validate → swap/reload — and the phase decides
+the recovery. BIND renders and validates into `rendered.new`, so a
+`named-checkconf` failure never reached `named`: the daemon is already in the
+state a revert would produce, and re-rendering the previous bundle there would
+bounce a healthy server for nothing. Only a swap/reload failure, where the
+live config directory has already been replaced, re-renders the previous
+bundle. Kea is the mirror image — `config-test` rejects without disturbing the
+running server, but the refused document has already been written to
+`kea_config_path`, and that file is what Kea reads on its next start, so a
+rejection there always rewrites the files even though the daemon is fine.
+
+On restart the agent checks the quarantine before re-applying `current.json`:
+a container that crash-loops must not re-break itself with the bundle that
+broke it.
+
+**A revert is reported, never silent.** That matters more than it sounds: a
+reverted agent keeps serving and keeps heartbeating, so `status`, the health
+check and `last_seen_at` all read normal while the zone the operator saved is
+live nowhere. The verdict rides the heartbeat's `config` field, lands on
+`dns_server.config_apply_*`, and drives a chip on the server row, a banner on
+the server detail, the `agent_config_rejected` alert rule and the
+`find_agents_with_config_failures` Copilot tool.
 
 
 ---
@@ -238,7 +288,13 @@ ops/
     "queries_per_sec_1m": 42.1,
     "cache_hit_ratio_5m": 0.87
   },
-  "config": { "etag": "sha256:...", "applied_at": "..." },
+  "config": {
+    "status": "ok",
+    "etag": "sha256:...",
+    "failed_etag": null,
+    "phase": null,
+    "error": null
+  },
   "ops_ack": [
     {"op_id": "...", "result": "ok"},
     {"op_id": "...", "result": "error", "message": "NXRRSET"}
