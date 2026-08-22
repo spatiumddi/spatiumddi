@@ -19,7 +19,13 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import selectinload
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
-from app.api.pagination import DEFAULT_PAGE_SIZE, MAX_PAGE, MAX_PAGE_SIZE, Page, paginate
+from app.api.pagination import (
+    DEFAULT_PAGE_SIZE,
+    MAX_PAGE,
+    MAX_PAGE_SIZE,
+    Page,
+    paginate,
+)
 from app.config import settings
 from app.core.agent_wake import (
     appliance_channel,
@@ -76,6 +82,16 @@ from app.services.dns.delegation import (
     find_parent_zone,
     preview_to_dict,
 )
+from app.services.dns.named_conf_validation import (
+    AclCycleError,
+    ViewValidationError,
+    is_name_reference,
+    order_acls_for_render,
+    validate_acl_entries,
+    validate_acl_name,
+    validate_address_match_list,
+    validate_view_name,
+)
 from app.services.dns.record_ops import (
     clear_dnssec_key_state,
     enqueue_dnssec_op,
@@ -91,11 +107,6 @@ from app.services.dns.resolver_presets import (
     find_forwarder_conflict,
 )
 from app.services.dns.serial import bump_zone_serial
-from app.services.dns.view_validation import (
-    ViewValidationError,
-    validate_address_match_list,
-    validate_view_name,
-)
 from app.services.dns.zone_templates import (
     get_template,
     list_templates,
@@ -2930,6 +2941,146 @@ async def _load_acl(group_id: uuid.UUID, acl_id: uuid.UUID, db: DB) -> DNSAcl | 
     return result.scalar_one_or_none()
 
 
+async def _group_symbol_names(
+    group_id: uuid.UUID, db: DB, *, exclude_acl_id: uuid.UUID | None = None
+) -> tuple[frozenset[str], frozenset[str]]:
+    """(ACL names, TSIG key names) an address-match-list in this group may cite.
+
+    Both are symbols in the rendered ``named.conf``; citing one that isn't
+    defined makes BIND refuse the file, which fails the entire bundle rather
+    than the one statement. ``exclude_acl_id`` drops the ACL currently being
+    edited, so a self-reference is reported as an undefined name at the field
+    the operator is looking at rather than surfacing later as a cycle.
+    """
+    acl_stmt = select(DNSAcl.name).where(DNSAcl.group_id == group_id)
+    if exclude_acl_id is not None:
+        acl_stmt = acl_stmt.where(DNSAcl.id != exclude_acl_id)
+    acl_names = frozenset((await db.execute(acl_stmt)).scalars().all())
+
+    key_names = set(
+        (await db.execute(select(DNSTSIGKey.name).where(DNSTSIGKey.group_id == group_id)))
+        .scalars()
+        .all()
+    )
+    # The group's legacy auto-generated loopback key is a real ``key {}`` in
+    # the rendered config too, so it is citable like any other.
+    group = await db.get(DNSServerGroup, group_id)
+    if group is not None and group.tsig_key_name:
+        key_names.add(group.tsig_key_name)
+    return acl_names, frozenset(key_names)
+
+
+async def _assert_acl_graph_is_acyclic(group_id: uuid.UUID, db: DB) -> None:
+    """Refuse a commit that would leave the group's ACLs circular.
+
+    Per-field validation catches a *self*-reference, but not A→B→A: each
+    edge is individually legal and only the pair is not. The bundle builder
+    orders ACLs by dependency and raises on a cycle, so without this check
+    an operator could save a config that makes every later bundle build
+    fail — breaking the group long after the edit that caused it.
+    """
+    # ``populate_existing`` is load-bearing, not defensive. The ACL being
+    # edited is already in the identity map with the entry collection it had
+    # on load, and a plain SELECT hands that cached object back — so the
+    # graph check would run against the PRE-edit entries and wave through
+    # the very cycle the edit just created. Caught by
+    # ``test_a_two_acl_cycle_is_refused_at_the_commit``.
+    rows = (
+        (
+            await db.execute(
+                select(DNSAcl)
+                .where(DNSAcl.group_id == group_id)
+                .options(selectinload(DNSAcl.entries))
+                .execution_options(populate_existing=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    try:
+        order_acls_for_render(
+            [
+                {
+                    "name": a.name,
+                    "entries": [{"value": e.value, "negate": e.negate} for e in a.entries],
+                }
+                for a in rows
+            ]
+        )
+    except AclCycleError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"field": exc.field, "value": exc.value, "message": str(exc)},
+        ) from exc
+
+
+async def _assert_acl_is_unreferenced(
+    group_id: uuid.UUID, acl: DNSAcl, db: DB, *, action: str
+) -> None:
+    """Refuse to delete or rename an ACL that something still cites.
+
+    Write-time validation stops an operator *creating* a dangling
+    reference. It does nothing about removing the target of one that
+    already resolves — and the consequence is identical: ``named.conf``
+    carries an undefined symbol, ``named-checkconf`` fails, and the agent
+    declines the whole bundle, so the group stops converging rather than
+    losing one statement.
+
+    Checks both directions a name can be cited: another ACL's entries, and
+    any view's ``match_clients`` / ``match_destinations`` /
+    ``allow_query`` / ``allow_query_cache``.
+    """
+    citing_acls = [
+        a.name
+        for a in (
+            await db.execute(
+                select(DNSAcl)
+                .where(DNSAcl.group_id == group_id, DNSAcl.id != acl.id)
+                .options(selectinload(DNSAcl.entries))
+                .execution_options(populate_existing=True)
+            )
+        )
+        .scalars()
+        .all()
+        if any(is_name_reference(e.value) == acl.name for e in a.entries)
+    ]
+    citing_views = [
+        v.name
+        for v in (await db.execute(select(DNSView).where(DNSView.group_id == group_id)))
+        .scalars()
+        .all()
+        if any(
+            is_name_reference(el) == acl.name
+            for el in (
+                (v.match_clients or [])
+                + (v.match_destinations or [])
+                + (v.allow_query or [])
+                + (v.allow_query_cache or [])
+            )
+        )
+    ]
+    if not citing_acls and not citing_views:
+        return
+    cited_by = ", ".join(
+        [
+            *(f"ACL '{n}'" for n in sorted(citing_acls)),
+            *(f"view '{n}'" for n in sorted(citing_views)),
+        ]
+    )
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "field": "name",
+            "value": acl.name,
+            "message": (
+                f"Cannot {action} ACL '{acl.name}' — it is still referenced by "
+                f"{cited_by}. BIND would refuse the whole server group's config "
+                f"with that name undefined. Remove the references first."
+            ),
+        },
+    )
+
+
 @router.get("/groups/{group_id}/acls", response_model=list[AclResponse])
 async def list_acls(group_id: uuid.UUID, db: DB, _: CurrentUser) -> list[DNSAcl]:
     await _require_group(group_id, db)
@@ -2942,20 +3093,37 @@ async def create_acl(
     group_id: uuid.UUID, body: AclCreate, db: DB, current_user: SuperAdmin
 ) -> DNSAcl:
     await _require_group(group_id, db)
+
+    acl_names, key_names = await _group_symbol_names(group_id, db)
+    try:
+        name = validate_acl_name(body.name)
+        values = validate_acl_entries(
+            [e.value for e in body.entries], known_acls=acl_names, known_keys=key_names
+        )
+    except ViewValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"field": exc.field, "value": exc.value, "message": str(exc)},
+        ) from exc
+
     existing = await db.execute(
-        select(DNSAcl).where(DNSAcl.group_id == group_id, DNSAcl.name == body.name)
+        select(DNSAcl).where(DNSAcl.group_id == group_id, DNSAcl.name == name)
     )
     if existing.scalar_one_or_none():
         raise HTTPException(
             status_code=409, detail="An ACL with that name already exists in this group"
         )
 
-    acl = DNSAcl(group_id=group_id, name=body.name, description=body.description)
+    acl = DNSAcl(group_id=group_id, name=name, description=body.description)
     db.add(acl)
     await db.flush()
 
-    for e in body.entries:
-        db.add(DNSAclEntry(acl_id=acl.id, **e.model_dump()))
+    for e, value in zip(body.entries, values, strict=True):
+        payload = e.model_dump()
+        payload["value"] = value
+        db.add(DNSAclEntry(acl_id=acl.id, **payload))
+    await db.flush()
+    await _assert_acl_graph_is_acyclic(group_id, db)
 
     db.add(
         AuditLog(
@@ -2983,7 +3151,32 @@ async def update_acl(
     current_user: SuperAdmin,
 ) -> DNSAcl:
     acl = await _require_acl(group_id, acl_id, db)
+    # Exclude this ACL from the citable set: an entry naming its own ACL is
+    # a self-reference, and reporting it as an undefined name points at the
+    # field the operator is editing.
+    acl_names, key_names = await _group_symbol_names(group_id, db, exclude_acl_id=acl_id)
     changes = body.model_dump(exclude_none=True, exclude={"entries"})
+    try:
+        if body.name is not None:
+            changes["name"] = validate_acl_name(body.name)
+        values = (
+            validate_acl_entries(
+                [e.value for e in body.entries],
+                known_acls=acl_names,
+                known_keys=key_names,
+            )
+            if body.entries is not None
+            else []
+        )
+    except ViewValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"field": exc.field, "value": exc.value, "message": str(exc)},
+        ) from exc
+    if "name" in changes and changes["name"] != acl.name:
+        # A rename orphans every reference to the OLD name, exactly as a
+        # delete would.
+        await _assert_acl_is_unreferenced(group_id, acl, db, action="rename")
     for k, v in changes.items():
         setattr(acl, k, v)
 
@@ -2992,8 +3185,12 @@ async def update_acl(
         for entry in result.scalars().all():
             await db.delete(entry)
         await db.flush()
-        for e in body.entries:
-            db.add(DNSAclEntry(acl_id=acl.id, **e.model_dump()))
+        for e, value in zip(body.entries, values, strict=True):
+            payload = e.model_dump()
+            payload["value"] = value
+            db.add(DNSAclEntry(acl_id=acl.id, **payload))
+        await db.flush()
+        await _assert_acl_graph_is_acyclic(group_id, db)
 
     db.add(
         AuditLog(
@@ -3017,6 +3214,7 @@ async def delete_acl(
     group_id: uuid.UUID, acl_id: uuid.UUID, db: DB, current_user: SuperAdmin
 ) -> None:
     acl = await _require_acl(group_id, acl_id, db)
+    await _assert_acl_is_unreferenced(group_id, acl, db, action="delete")
     db.add(
         AuditLog(
             user_id=current_user.id,
@@ -3364,28 +3562,21 @@ async def _validated_view_fields(
     # ``group_id == server.group_id``, so a global (NULL-group) row is never
     # rendered — accepting its name here would pass validation and then
     # produce a named.conf referencing an ACL that isn't defined.
-    acl_names = frozenset(
-        (await db.execute(select(DNSAcl.name).where(DNSAcl.group_id == group_id))).scalars().all()
-    )
-    # TSIG key names the group ships to its agents: the operator-managed
-    # ``DNSTSIGKey`` rows plus the legacy auto-generated group key. Mirrors
-    # what ``agent_config`` puts in the bundle's ``tsig_keys`` block.
-    key_names = set(
-        (await db.execute(select(DNSTSIGKey.name).where(DNSTSIGKey.group_id == group_id)))
-        .scalars()
-        .all()
-    )
-    group = await db.get(DNSServerGroup, group_id)
-    if group is not None and group.tsig_key_name:
-        key_names.add(group.tsig_key_name)
-    known_keys = frozenset(key_names)
+    # Shared with the ACL endpoints — one definition of "what symbols exist
+    # in this group's rendered config", so the two cannot drift.
+    acl_names, known_keys = await _group_symbol_names(group_id, db)
     try:
         name = getattr(body, "name", None)
         if name is not None:
             changes["name"] = validate_view_name(name)
         # ``allow_query`` / ``allow_query_cache`` (#430) land in the same
         # kind of address-match-list statement, so they get the same gate.
-        for attr in ("match_clients", "match_destinations", "allow_query", "allow_query_cache"):
+        for attr in (
+            "match_clients",
+            "match_destinations",
+            "allow_query",
+            "allow_query_cache",
+        ):
             value = getattr(body, attr, None)
             if value is not None:
                 changes[attr] = validate_address_match_list(

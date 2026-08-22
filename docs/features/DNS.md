@@ -660,9 +660,9 @@ everywhere" means in practice. It shipped with the split-horizon work in
 unreachable from the product despite being fully implemented underneath.
 
 A **view** is a set of clients, identified by source address. `match_clients`
-is a BIND address-match-list: addresses, CIDR prefixes, or one of `any` /
-`none` / `localhost` / `localnets`, each optionally negated with a leading
-`!`. Views are evaluated in `order`
+is a BIND address-match-list: addresses, CIDR prefixes, a named ACL from
+the ACLs tab, or one of `any` / `none` / `localhost` / `localnets`, each
+optionally negated with a leading `!`. Views are evaluated in `order`
 (low first) and a client is served by the **first** view it matches, so
 the catch-all belongs last.
 
@@ -701,18 +701,14 @@ view "guest" {
   `zone {}` alongside views, so once one view exists every zone is served
   from inside a view. Zones with no view of their own render into all of
   them.
-- **Named ACLs are not accepted in `match_clients` yet.** A `DNSAcl` row is
-  stored, listed and editable on the ACLs tab, and the config bundle even
-  carries an `acls` block — but only as `{id, name}`, and the DNS agent's
-  BIND9 renderer never reads it or emits an `acl {};` stanza. (The
-  control-plane template that does render one has no production caller.) A
-  view referencing an ACL by name would therefore reach a server with that
-  symbol undefined, `named-checkconf` would fail, and the agent would
-  decline the whole bundle — so the group stops converging entirely, not
-  just that view. The API rejects it with a 422 saying so. Use the
-  prefixes directly until the agent renders ACL definitions ([#899](https://github.com/spatiumddi/spatiumddi/issues/899)).
+- **Named ACLs work in `match_clients`** as of
+  [#899](https://github.com/spatiumddi/spatiumddi/issues/899). Before that
+  a `DNSAcl` row was stored, listed and editable and applied to nothing —
+  the bundle carried `{id, name}` with no entries and the agent emitted no
+  `acl {}` stanza — so a view citing one left an undefined symbol and the
+  group stopped converging. See §8.2.
 - **`match_clients` and the view name are validated server-side**
-  (`app/services/dns/view_validation.py`). Both are interpolated verbatim
+  (`app/services/dns/named_conf_validation.py`). Both are interpolated verbatim
   into `named.conf`, and the name additionally becomes a directory on the
   agent, so a malformed prefix, an undefined ACL or TSIG key name, or a
   name containing a path separator is rejected with a 422 naming the
@@ -878,6 +874,50 @@ entire zone — so the renderer picks one rather than enforcing nothing.
 Reconcile the lists if you see that warning.
 
 ---
+
+### 8.2 Named ACLs (issue #899)
+
+An ACL is a reusable address-match-list: define `office` once on the group's
+**ACLs tab**, then cite it by name from a view's `match_clients`, from
+`allow-query`, or from another ACL.
+
+They render as `acl "<name>" { … };` at the **top** of `named.conf`, above
+`options`. Placement is the correctness property, not tidiness: BIND
+resolves an `acl` statement where it is written, so a definition below its
+first use is an error rather than a forward declaration. The control plane
+emits the list dependency-ordered for the same reason — an ACL may
+reference another, so `inner` has to precede `outer`.
+
+Constraints, all enforced server-side with a 422 naming the offending
+element:
+
+- **Entry values get the same gate as a view's `match_clients`** — they end
+  up in the same kind of statement. Addresses, CIDR prefixes, `key <name>`
+  for a TSIG key the group ships, another ACL's name, or one of the
+  built-ins, each optionally negated with `!`.
+- **Cycles are refused.** `a → b → a` is rejected at the commit, not
+  discovered when the next bundle build fails. Each edge is individually
+  legal, so this needs a graph check rather than per-field validation.
+- **Built-in names cannot be redefined** — `acl "any" { … };` is an error.
+- **An ACL with no entries renders as `{ none; }`**, not skipped. BIND
+  rejects `acl "x" { };`, but omitting the definition would be worse — the
+  name may already be cited by a view, and dropping it re-creates the
+  undefined-symbol outage. `none` is also the honest meaning of an empty
+  address-match list.
+- **Deleting or renaming an ACL something still cites is refused** (409).
+  Write-time validation stops you *creating* a dangling reference; removing
+  the target of one that already resolves breaks the group identically.
+- **ACL names are per-group.** `DNSAcl.group_id` is nullable, but nothing
+  creates a global ACL and the bundle is built per group, so a NULL-group
+  row would be invisible to every agent. Treat global ACLs as unsupported.
+
+> **History worth knowing.** ACLs were the third field found stored,
+> persisted, editable and never rendered — after `allow_transfer` (#734)
+> and alongside `forward_policy`, which #899's audit also caught: `forward
+> only` was silently behaving as `forward first`, so an operator forcing
+> every query through a filtering upstream was getting fall-through
+> recursion instead. If you add a field an agent is supposed to act on,
+> assert on the rendered config, not just on the stored row.
 
 ## 9. DNS UI Features
 
