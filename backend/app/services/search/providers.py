@@ -726,12 +726,15 @@ async def search_vlans(db: AsyncSession, s: QueryShape, limit: int) -> list[Sear
         VLAN.description.ilike(like_pattern(s.raw), escape="\\"),
     ]
     # A bare number is almost always a VLAN id, not a name fragment.
-    # ``str.isdigit`` is true for digits int() rejects (superscripts,
-    # other scripts' numerals), so the conversion is still guarded.
     if s.raw.isdigit():
         try:
             clauses.append(VLAN.vlan_id == int(s.raw))
         except ValueError:
+            # ``str.isdigit`` is True for characters ``int()`` rejects —
+            # superscripts like "²", and other scripts' numerals. The query
+            # simply isn't a VLAN id, so fall through to the name and
+            # description clauses already in the list rather than failing
+            # the whole search on an unusual keystroke.
             pass
 
     stmt = select(VLAN).where(or_(*clauses))
