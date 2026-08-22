@@ -181,7 +181,17 @@ class TemplateGroupConflict(ValueError):
     ``(list_id, domain)`` unique constraint would reject the second
     insert anyway — so this is caught up front with an explanation
     instead of surfacing as an integrity error.
+
+    Carries the collision as fields, not only as prose: the message is
+    for the operator, and anything that needs to *act* on the conflict
+    should read ``domain`` / ``targets`` rather than re-parse the
+    sentence.
     """
+
+    def __init__(self, message: str, domain: str, targets: tuple[str, str]) -> None:
+        super().__init__(message)
+        self.domain = domain
+        self.targets = targets
 
 
 def template_entries(
@@ -213,7 +223,9 @@ def template_entries(
                 raise TemplateGroupConflict(
                     f"Groups selected for '{template.name}' disagree about "
                     f"{key}: one rewrites it to {prior.target}, another to "
-                    f"{group.target}. Pick one of them."
+                    f"{group.target}. Pick one of them.",
+                    domain=key,
+                    targets=(prior.target, group.target),
                 )
             by_domain[key] = TemplateEntry(
                 domain=key,

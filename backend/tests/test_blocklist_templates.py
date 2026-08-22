@@ -199,7 +199,21 @@ def test_selecting_both_youtube_modes_is_refused() -> None:
     assert t is not None
     with pytest.raises(TemplateGroupConflict) as e:
         template_entries(t, ["youtube-strict", "youtube-moderate"])
-    assert "youtube.com" in str(e.value)
+    # Asserted on the exception's fields, not by searching its prose: an
+    # operator needs to know WHICH domain collided and between which two
+    # targets, and equality on those pins it exactly where a substring
+    # check would pass on a half-written message.
+    assert e.value.domain in {
+        "www.youtube.com",
+        "m.youtube.com",
+        "youtubei.googleapis.com",
+        "youtube.googleapis.com",
+        "www.youtube-nocookie.com",
+    }
+    assert set(e.value.targets) == {
+        "restrict.youtube.com",
+        "restrictmoderate.youtube.com",
+    }
 
 
 def test_unknown_group_is_reported_by_name() -> None:
@@ -309,7 +323,18 @@ async def test_from_template_rejects_conflicting_groups(
         },
     )
     assert resp.status_code == 422, resp.text
-    assert "youtube" in resp.text.lower()
+    # The 422 must explain the collision rather than say "invalid": the
+    # operator picked two groups that look independent in the picker, and
+    # the detail is the only place the mutual exclusion is stated.
+    detail = resp.json()["detail"]
+    assert detail.startswith("Groups selected for 'SafeSearch enforcement' disagree about ")
+    assert detail.endswith("Pick one of them.")
+    # …and nothing was created by the rejected call.
+    listed = await client.get(
+        "/api/v1/dns/blocklists",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert listed.json() == []
 
 
 @pytest.mark.asyncio

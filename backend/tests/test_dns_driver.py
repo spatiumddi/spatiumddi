@@ -568,13 +568,18 @@ def test_render_rpz_emits_each_owner_name_once() -> None:
         exceptions=frozenset(),
     )
     out = BIND9Driver().render_rpz_zone(bl)
-    owners = [line.split(" ", 1)[0].lower() for line in out.splitlines() if " IN " in line]
-    blocklist_owners = [o for o in owners if o.endswith("example.com")]
-    assert len(blocklist_owners) == len(set(blocklist_owners)), blocklist_owners
-    # First writer wins, so the sinkhole/refused repeats are dropped.
-    assert "both.example.com IN CNAME ." in out
-    assert "A 10.0.0.250" not in out
-    assert "rpz-drop" not in out
+    # Exact list, not a uniqueness check over a filtered slice: this also
+    # pins that BOTH forms of each surviving wildcard entry are emitted,
+    # and that the later sinkhole/refused duplicates contributed nothing.
+    # The apex SOA/NS records are the zone's own, not blocklist entries.
+    apex = "spatium-blocklist.rpz."
+    rendered = [ln.strip() for ln in out.splitlines() if " IN " in ln and not ln.startswith(apex)]
+    assert rendered == [
+        "both.example.com IN CNAME .",
+        "*.both.example.com IN CNAME .",
+        "only.example.com IN CNAME .",
+        "*.only.example.com IN CNAME .",
+    ]
 
 
 # ── Serial bumping ────────────────────────────────────────────────────────
