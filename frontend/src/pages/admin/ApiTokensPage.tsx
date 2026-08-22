@@ -1,6 +1,15 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Copy, Eye, EyeOff, Plus, Power, PowerOff, Trash2 } from "lucide-react";
+import {
+  Copy,
+  Eye,
+  EyeOff,
+  Plus,
+  Power,
+  PowerOff,
+  QrCode as QrCodeIcon,
+  Trash2,
+} from "lucide-react";
 import {
   apiTokensApi,
   API_TOKEN_SCOPES,
@@ -12,6 +21,13 @@ import {
   type ApiTokenScope,
 } from "@/lib/api";
 import { copyToClipboard } from "@/lib/clipboard";
+import {
+  buildEnrolmentUri,
+  connectionFromLocation,
+  displayFingerprint,
+  type EnrolmentConnection,
+} from "@/lib/enrolment";
+import { QrCode } from "@/components/QrCode";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
 
@@ -322,6 +338,212 @@ function CreateTokenModal({
 }
 
 // ── Reveal-once Modal ──────────────────────────────────────────────────────
+// ── Device enrolment QR (issue #906) ───────────────────────────────────────
+//
+// Typing or pasting a token across devices is the worst step in the mobile
+// sign-in flow, and it is worse than annoying: an operator who cannot paste
+// cleanly emails the token to themselves or reads it aloud, and the
+// credential ends up somewhere it should never have been.
+//
+// Two payload shapes, per #906:
+//
+//   Token only    the bare token string — needs no format, works today
+//   Server+token  spatiumddi://enrol?host=…&token=…&fingerprint=…
+//
+// The enrolment form is the interesting one because of the fingerprint. A
+// self-hosted control plane usually presents a private-CA or self-signed
+// certificate, so the client must ask the operator to confirm it — and
+// comparing 64 hex characters by eye on a phone is exactly the check people
+// skim. Carrying the fingerprint in a code scanned from inside an
+// authenticated session turns that into a machine-checked comparison.
+//
+// The whole block is hidden behind an explicit reveal, matching the token
+// text above it. That is not decoration: a QR makes the credential
+// CAMERA-readable, so it is strictly easier to capture over a shoulder — or
+// from a screen-share — than the masked string beside it.
+
+function EnrolmentQr({ token }: { token: ApiTokenCreated }) {
+  const [shown, setShown] = useState(false);
+  const [mode, setMode] = useState<"enrol" | "token">("enrol");
+  const [conn, setConn] = useState<EnrolmentConnection>(() =>
+    connectionFromLocation(window.location),
+  );
+  const [pinCert, setPinCert] = useState(true);
+
+  // Only fetched once the operator opens the section — no reason to ask the
+  // server about certificates for an operator who just wants to copy-paste.
+  const { data: ctx } = useQuery({
+    queryKey: ["api-token-enrolment-context"],
+    queryFn: apiTokensApi.enrolmentContext,
+    enabled: shown,
+    staleTime: 5 * 60 * 1000,
+  });
+
+  const fingerprint = pinCert ? (ctx?.tls_fingerprint_sha256 ?? null) : null;
+
+  let payload: string | null = null;
+  let buildError: string | null = null;
+  if (mode === "token") {
+    payload = token.token;
+  } else {
+    try {
+      payload = buildEnrolmentUri({ ...conn, token: token.token, fingerprint });
+    } catch {
+      // The only way this throws is an empty host, which the operator can
+      // see and fix in the field right below.
+      buildError = "Enter the address this server is reachable at.";
+    }
+  }
+
+  if (!shown) {
+    return (
+      <button
+        type="button"
+        onClick={() => setShown(true)}
+        className="flex w-full items-center justify-center gap-2 rounded-md border border-dashed px-3 py-2 text-xs text-muted-foreground hover:bg-muted/40 hover:text-foreground"
+      >
+        <QrCodeIcon className="h-3.5 w-3.5" />
+        Show enrolment QR code for the mobile app
+      </button>
+    );
+  }
+
+  return (
+    <div className="space-y-3 rounded-md border p-3">
+      <div className="flex items-center justify-between gap-2">
+        <div className="inline-flex rounded-md border p-0.5 text-xs">
+          <button
+            type="button"
+            onClick={() => setMode("enrol")}
+            className={cn(
+              "rounded px-2 py-1",
+              mode === "enrol"
+                ? "bg-primary text-primary-foreground"
+                : "text-muted-foreground hover:text-foreground",
+            )}
+          >
+            Server + token
+          </button>
+          <button
+            type="button"
+            onClick={() => setMode("token")}
+            className={cn(
+              "rounded px-2 py-1",
+              mode === "token"
+                ? "bg-primary text-primary-foreground"
+                : "text-muted-foreground hover:text-foreground",
+            )}
+          >
+            Token only
+          </button>
+        </div>
+        <button
+          type="button"
+          onClick={() => setShown(false)}
+          className="inline-flex items-center gap-1 rounded p-1 text-xs text-muted-foreground hover:bg-background hover:text-foreground"
+          title="Hide the QR code"
+        >
+          <EyeOff className="h-3.5 w-3.5" />
+          Hide
+        </button>
+      </div>
+
+      <div className="rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-[11px] text-amber-700 dark:text-amber-300">
+        This code contains the token. Anything with a camera pointed at this
+        screen can read it — don&apos;t show it on a shared screen or a call.
+      </div>
+
+      <div className="flex justify-center">
+        {payload ? (
+          <QrCode value={payload} size={216} title="Device enrolment QR code" />
+        ) : (
+          <div className="flex h-[216px] w-[216px] items-center justify-center rounded-md border border-dashed text-center text-xs text-muted-foreground">
+            {buildError}
+          </div>
+        )}
+      </div>
+
+      {mode === "enrol" && (
+        <div className="space-y-2">
+          <p className="text-[11px] text-muted-foreground">
+            Pre-filled from the address <em>this browser</em> used. Correct it
+            if the phone reaches the server differently — a laptop on a VPN and
+            a handset on wifi often disagree.
+          </p>
+          <div className="grid grid-cols-[1fr_5rem_5.5rem] gap-2">
+            <input
+              className={inputCls}
+              value={conn.host}
+              onChange={(e) => setConn({ ...conn, host: e.target.value })}
+              placeholder="ddi.internal.example"
+              aria-label="Host"
+            />
+            <input
+              className={inputCls}
+              value={conn.port ?? ""}
+              onChange={(e) =>
+                setConn({
+                  ...conn,
+                  port: e.target.value ? Number(e.target.value) : null,
+                })
+              }
+              placeholder="port"
+              inputMode="numeric"
+              aria-label="Port"
+            />
+            <select
+              className={inputCls}
+              value={conn.scheme}
+              onChange={(e) =>
+                setConn({
+                  ...conn,
+                  scheme: e.target.value === "http" ? "http" : "https",
+                })
+              }
+              aria-label="Scheme"
+            >
+              <option value="https">https</option>
+              <option value="http">http</option>
+            </select>
+          </div>
+
+          {ctx?.tls_fingerprint_sha256 ? (
+            <label className="flex items-start gap-2 text-[11px] text-muted-foreground">
+              <input
+                type="checkbox"
+                checked={pinCert}
+                onChange={(e) => setPinCert(e.target.checked)}
+                className="mt-0.5"
+              />
+              <span>
+                Pin this server&apos;s certificate — the app verifies what it is
+                offered against{" "}
+                <code className="break-all font-mono text-[10px]">
+                  {displayFingerprint(ctx.tls_fingerprint_sha256)}
+                </code>
+                . Untick if something in front of SpatiumDDI re-terminates TLS,
+                since the app would then report a mismatch on a correct setup.
+              </span>
+            </label>
+          ) : (
+            <p className="text-[11px] text-muted-foreground">
+              {ctx?.fingerprint_unavailable_reason ??
+                "Checking whether this server can pin its certificate…"}
+            </p>
+          )}
+        </div>
+      )}
+
+      {mode === "token" && (
+        <p className="text-center text-[11px] text-muted-foreground">
+          The token on its own. Use this if the app is already pointed at this
+          server.
+        </p>
+      )}
+    </div>
+  );
+}
+
 // Shown after a successful create. The raw token is NEVER retrievable
 // again so we force the operator to copy it, and close the modal only
 // after explicit confirmation.
@@ -398,6 +620,7 @@ function RevealTokenModal({
             Authorization: Bearer {token.prefix}…
           </code>
         </p>
+        <EnrolmentQr token={token} />
         <div className="flex justify-end gap-2 pt-1">
           <button
             onClick={onClose}

@@ -316,6 +316,15 @@ jobs:
       - name: TypeScript check
         run: npm run typecheck
 
+      # #906 — the frontend had no test runner at all. Added with the
+      # enrolment QR because that code is verified by DECODING what it
+      # renders: a transposed row/column or an inverted polarity produces a
+      # QR that looks perfectly normal and scans as nothing, which no amount
+      # of review or type-checking catches. Lives in this job rather than a
+      # new one so it reuses the install above — the suite is <1 s.
+      - name: Vitest
+        run: npm test
+
   frontend-build:
     name: Frontend — Build
     runs-on: ubuntu-latest

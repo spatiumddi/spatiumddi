@@ -9361,8 +9361,26 @@ export interface ApiTokenUpdate {
   scopes?: ApiTokenScope[];
 }
 
+/**
+ * What the enrolment QR code needs that only the server can answer (#906).
+ *
+ * Just the certificate fingerprint — the connection itself comes from
+ * `window.location`, because behind a proxy or split DNS the server does not
+ * know its own externally-reachable address.
+ */
+export interface EnrolmentContext {
+  /** Bare lower-case hex, or null when the server does not manage its TLS. */
+  tls_fingerprint_sha256: string | null;
+  fingerprint_source: string | null;
+  fingerprint_unavailable_reason: string | null;
+}
+
 export const apiTokensApi = {
   list: () => api.get<ApiToken[]>("/api-tokens").then((r) => r.data),
+  enrolmentContext: () =>
+    api
+      .get<EnrolmentContext>("/api-tokens/enrolment-context")
+      .then((r) => r.data),
   create: (body: ApiTokenCreate) =>
     api.post<ApiTokenCreated>("/api-tokens", body).then((r) => r.data),
   update: (id: string, body: ApiTokenUpdate) =>

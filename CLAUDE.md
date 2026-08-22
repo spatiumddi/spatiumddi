@@ -830,6 +830,42 @@ suggestion, free-space treemap.
   already complete enough to build against. The app itself now lives in its
   own repo, **[spatiumddi/spatiumddi-mobile](https://github.com/spatiumddi/spatiumddi-mobile)**;
   what remains here is the server side of that split. **Still open:** the app.
+  - ✅ [**Enrolment QR code when minting an API token**](https://github.com/spatiumddi/spatiumddi/issues/906)
+    — the reveal-token modal renders a QR in two shapes: the bare token, or
+    `spatiumddi://enrol?host=…&port=…&scheme=…&token=…&fingerprint=…`, both
+    of which the mobile client already parses (so the URI is a **contract
+    with another repo**, not a local convention). Typing a token across
+    devices was the worst step in mobile sign-in, and worse than annoying:
+    an operator who cannot paste cleanly emails it to themselves.
+    **The fingerprint is the point.** A self-hosted control plane presents a
+    private-CA or self-signed cert, so the client must ask the operator to
+    confirm it — and comparing 64 hex characters by eye on a phone is
+    exactly the check people skim. Scanned from inside an authenticated
+    session, the comparison becomes machine-checked.
+    `GET /api/v1/api-tokens/enrolment-context` answers **only** when
+    SpatiumDDI owns TLS termination (an active `ApplianceCertificate`);
+    on Compose / plain-k8s an external proxy holds a cert this process has
+    never seen, so it returns `null` with a reason rather than guessing — a
+    fingerprint disagreeing with the wire would make the client report a
+    mismatch on a *correct* setup, training operators to click through the
+    one warning the feature exists to make meaningful. **The connection
+    comes from `window.location`, not the server**, which behind a proxy or
+    split DNS does not know its own external address; the operator can
+    correct it, since a laptop on a VPN and a handset on wifi disagree
+    routinely. QR hidden behind an explicit reveal and not mounted until
+    then — it makes the credential *camera-readable*, which the masked
+    string is not. **No new MCP tool**: `find_certificates` already returns
+    `fingerprint_sha256`, so a second surface would be redundant (explicit
+    decision per non-negotiable #13); no feature module, since this extends
+    an existing resource rather than adding a top-level family.
+    **This is also where the frontend got its first test runner.** vitest
+    was added because the QR is verified by *decoding what it renders* (via
+    `jsqr`, dev-only): a transposed row/column or inverted polarity yields a
+    code that looks perfectly normal and scans as nothing, which neither
+    review nor `tsc` can catch. Cross-checked once against ZXing and segno
+    during development. 25 frontend + 7 backend tests; `npm test` runs in
+    the existing Frontend Lint CI job. Ships `qrcode-generator` (MIT, zero
+    deps, +10 kB gzip).
   - ✅ [**Publish `openapi.json` as a release asset**](https://github.com/spatiumddi/spatiumddi/issues/903)
     — with the app out of this repo the schema stops being a file a client
     reads off the working tree and becomes the contract *between two repos*,

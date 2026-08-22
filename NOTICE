@@ -154,6 +154,7 @@ Where the two disagree about a license, THIS file is authoritative.
 - react-markdown / remark-gfm — MIT — https://github.com/remarkjs/react-markdown
 - dnd-kit — MIT — https://dndkit.com
 - clsx / tailwind-merge — MIT — https://github.com/lukeed/clsx
+- qrcode-generator (device-enrolment QR codes) — MIT — https://github.com/kazuhikoarase/qrcode-generator
 - nginx (frontend static serving + agent landing) — BSD 2-Clause — https://nginx.org
 
 This list covers the major bundled / shipped components; it is not an

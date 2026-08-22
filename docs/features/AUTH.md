@@ -411,6 +411,73 @@ list without leaking entropy to an observer.
 The raw value is returned exactly once from `POST /api/v1/api-tokens`
 and never again — losing it means creating a new token.
 
+### Device enrolment QR code (issue #906)
+
+The only way to get a token onto a phone used to be typing or pasting
+it between devices. That is the worst step in the mobile sign-in flow,
+and worse than merely annoying: an operator who cannot paste cleanly
+emails the token to themselves or reads it aloud, and the credential
+ends up somewhere it should never have been.
+
+The reveal-token modal therefore offers a QR code in two shapes:
+
+| Shape | Payload |
+|---|---|
+| **Token only** | the bare token string — no format needed |
+| **Server + token** | `spatiumddi://enrol?host=…&port=…&scheme=…&token=…&fingerprint=…` |
+
+The enrolment URI is a **contract with the mobile client**
+([spatiumddi-mobile](https://github.com/spatiumddi/spatiumddi-mobile)),
+which already parses both shapes. `port` is omitted when it is the
+scheme default, and `scheme` only appears when it is `http` — being
+explicit about the insecure case is the right way round, since a code
+that silently downgrades is the failure worth preventing. IPv6 hosts
+are bracketed so the client cannot reparse them as `host:port`. The
+builder lives in `frontend/src/lib/enrolment.ts`.
+
+**The connection comes from the browser, not the server.** Behind a
+reverse proxy, split DNS or NAT the control plane does not know its own
+externally-reachable address, and would guess wrong on exactly the
+deployments this is most useful for. The UI starts from
+`window.location` and lets the operator correct it — a laptop on a VPN
+and a handset on wifi routinely disagree about how to reach one server.
+
+**Why the fingerprint is the interesting part.** A self-hosted control
+plane usually presents a certificate from a private CA or the
+appliance's own root, so the client has to ask the operator to confirm
+it rather than blanket-trusting an unknown certificate. Comparing 64
+hex characters by eye on a phone is precisely the check people skim.
+Putting the fingerprint in a code the operator scans from inside an
+authenticated session makes that comparison machine-checked — the
+weakest step in the trust flow becomes the strongest, for one query
+parameter.
+
+`GET /api/v1/api-tokens/enrolment-context` supplies it, gated on
+authentication only (matching token creation — a TLS fingerprint is not
+a secret; it is what the server hands every client that connects).
+It answers **only** when SpatiumDDI actually owns the TLS termination,
+i.e. there is an active `ApplianceCertificate` — the row deployed to
+the TLS secret the frontend serves. On a Compose or plain-Kubernetes
+install an external proxy terminates TLS with a certificate this
+process has never seen, and the honest answer is `null` with a reason,
+not a guess: a fingerprint that disagrees with the wire would make the
+client report a mismatch on a *correct* setup, training operators to
+click through the one warning this exists to make meaningful. The UI
+also lets the operator untick certificate pinning for the case where
+something in front of SpatiumDDI re-terminates TLS.
+
+**Exposure.** The QR is hidden behind an explicit reveal, like the
+token text beside it, and is not rendered into the DOM until then. That
+is not decoration: a QR makes the credential *camera-readable*, so it
+is strictly easier to capture over a shoulder — or from a screen-share
+— than the masked string. The code carries no exposure the displayed
+token does not, but it is easier to capture at a distance.
+
+Short-lived enrolment codes would be better still: if minting ever
+moves to a device-token grant, the QR could carry a single-use code and
+the token would never leave the server. The URI format above does not
+preclude that.
+
 **Validation path.** `app/api/deps.py:get_current_user` checks for the
 `sddi_` prefix first; if present it hashes the bearer, looks the row
 up by hash, enforces `is_active` and `expires_at`, then loads the

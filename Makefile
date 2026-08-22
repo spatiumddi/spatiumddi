@@ -313,7 +313,7 @@ ci-backend-lint:
 
 ci-frontend-lint:
 	@echo "→ Frontend — Lint & Type Check"
-	cd $(FRONTEND_DIR) && npm run lint && npm run format:check && npm run typecheck
+	cd $(FRONTEND_DIR) && npm run lint && npm run format:check && npm run typecheck && npm test
 
 ci-frontend-build:
 	@echo "→ Frontend — Build"
