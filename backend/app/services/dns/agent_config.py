@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, TypedDict
 
+import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -37,6 +39,14 @@ from app.models.dns import (
 from app.models.settings import PlatformSettings
 from app.services.appliance.ntp import ntp_bundle
 from app.services.appliance.snmp import snmp_bundle
+from app.services.dns.named_conf_validation import (
+    AclCycleError,
+    ViewValidationError,
+    is_name_reference,
+    order_acls_for_render,
+    validate_acl_name,
+    validate_address_match_list,
+)
 from app.services.dns.pool_geo import (
     build_geo_steering,
     build_view_descriptors,
@@ -83,10 +93,88 @@ if TYPE_CHECKING:
     pass
 
 
+logger = structlog.get_logger(__name__)
+
+
 def _compute_etag(payload: dict[str, Any]) -> str:
     """SHA-256 of the canonicalized payload (sorted keys)."""
     blob = json.dumps(payload, sort_keys=True, default=str).encode()
     return "sha256:" + hashlib.sha256(blob).hexdigest()
+
+
+def _safe_acls_block(acls: Sequence[Any]) -> list[dict[str, Any]]:
+    """Assemble the bundle's ``acls`` block so that it always renders.
+
+    Validation on the ACL endpoints (#899) guards what an operator types
+    *from now on*. It cannot guard what is already in the table: ACL names
+    and entry values were completely unvalidated before this change, and
+    the moment the agent started rendering them a legacy row holding a bad
+    CIDR — or a quote, or the name ``any`` — would break ``named.conf`` on
+    upgrade with nobody having touched anything.
+
+    So the bundle drops what it cannot render, loudly, rather than shipping
+    a config the agent will refuse:
+
+    * an ACL whose name is not a legal identifier is skipped entirely;
+    * an individual entry that is not a legal address-match element is
+      dropped, leaving the rest of the ACL intact;
+    * an ACL left with no entries still renders (as ``{ none; }`` on the
+      agent) because its name may already be cited;
+    * a cyclic reference falls back to alphabetical order with the cycle
+      broken, instead of raising.
+
+    That last point matters most: this runs inside the agent's ``/config``
+    long-poll. An exception here is not a failed edit, it is every agent in
+    the group getting a 500 on every poll, forever, with no way to fix it
+    from the UI — strictly worse than the inert-config bug being fixed.
+    """
+    prepared: list[dict[str, Any]] = []
+    for acl in acls:
+        try:
+            name = validate_acl_name(acl.name)
+        except ViewValidationError as exc:
+            logger.warning("dns_acl_skipped_unrenderable_name", acl=str(acl.name), error=str(exc))
+            continue
+        entries: list[dict[str, Any]] = []
+        for e in sorted(acl.entries, key=lambda e: (e.order, e.value)):
+            try:
+                # Syntax only — whether a bare name actually resolves is
+                # decided by the known-set sweep below.
+                validate_address_match_list([e.value], field="entries", allow_unknown_names=True)
+            except ViewValidationError as exc:
+                logger.warning(
+                    "dns_acl_entry_dropped_unrenderable",
+                    acl=name,
+                    value=e.value,
+                    error=str(exc),
+                )
+                continue
+            entries.append({"value": e.value, "negate": e.negate})
+        prepared.append({"id": str(acl.id), "name": name, "entries": entries})
+
+    # A reference to an ACL that was just skipped would be an undefined
+    # symbol, so drop those entries too.
+    known = {a["name"] for a in prepared}
+    for a in prepared:
+        kept = []
+        for e in a["entries"]:
+            target = is_name_reference(str(e["value"]))
+            if target is not None and target not in known:
+                logger.warning(
+                    "dns_acl_entry_dropped_dangling_reference", acl=a["name"], value=target
+                )
+                continue
+            kept.append(e)
+        a["entries"] = kept
+
+    try:
+        # Dependency-ordered because BIND resolves ``acl`` statements
+        # top-down — a reference to one declared later in the file is an
+        # error, not a forward declaration.
+        return order_acls_for_render(prepared)
+    except AclCycleError as exc:
+        logger.error("dns_acl_cycle_in_bundle", error=str(exc))
+        return sorted(prepared, key=lambda a: a["name"])
 
 
 async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBundle:
@@ -474,7 +562,11 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
         }
         for vd in view_descs
     ]
-    acls_block = [{"id": str(a.id), "name": a.name} for a in acls]
+    # #899 — ship the entries, not just the name. The agent renders these
+    # into ``acl "<name>" { … };`` stanzas; before this the block carried
+    # ``{id, name}`` only, so an ACL was inert config and any reference to
+    # one was an undefined symbol that failed the entire bundle.
+    acls_block = _safe_acls_block(acls)
 
     # Blocklists: one RPZ zone per view (if any) + one group-level zone.
     # Each assembled list has its entries resolved against view/group scope

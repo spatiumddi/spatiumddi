@@ -4933,7 +4933,7 @@ function ViewsTab({ group }: { group: DNSServerGroup }) {
  * "scope this to the guest VLAN" is the guest VLAN's CIDR, and retyping a
  * prefix they already modelled in IPAM is how typos get in.
  *
- * Validation is server-side (`app/services/dns/view_validation.py`): these
+ * Validation is server-side (`app/services/dns/named_conf_validation.py`): these
  * strings are interpolated verbatim into named.conf, so the client checks
  * nothing it could be wrong about and simply renders the 422.
  */
@@ -5073,15 +5073,11 @@ function ViewModal({
             placeholder={"10.20.0.0/16\n192.168.50.0/24\nany"}
           />
           <p className="mt-1 text-[11px] text-muted-foreground">
-            An address, a CIDR prefix, or one of{" "}
+            An address, a CIDR prefix, a named ACL from the ACLs tab, or one of{" "}
             <span className="font-mono">any</span> /{" "}
             <span className="font-mono">none</span> /{" "}
             <span className="font-mono">localhost</span> /{" "}
-            <span className="font-mono">localnets</span>. Named ACLs from the
-            ACLs tab are not accepted here — the DNS agent doesn't render ACL
-            definitions into <span className="font-mono">named.conf</span> yet,
-            so a view referencing one would stop the whole group's config from
-            applying. Paste the prefixes instead.
+            <span className="font-mono">localnets</span>.
           </p>
         </div>
 

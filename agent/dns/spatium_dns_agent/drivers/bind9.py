@@ -42,7 +42,7 @@ from .base import RRSET_OP_KINDS, DriverBase
 log = structlog.get_logger(__name__)
 
 NAMED_CONF_SKELETON = """\
-{tls_statements}options {{
+{acl_statements}{tls_statements}options {{
     directory "/var/cache/bind";
     listen-on {{ any; }};
     listen-on-v6 {{ any; }};
@@ -344,7 +344,50 @@ def _forward_over_tls(opts: dict[str, Any]) -> bool:
     return (opts.get("forward_transport") or "do53") == "tls"
 
 
-def _render_tls_statements(opts: dict[str, Any], state_dir: Path, has_cert: bool) -> str:
+def _render_acl_statements(acls: list[dict[str, Any]] | None) -> str:
+    """``acl "name" { … };`` blocks for the group's named ACLs (issue #899).
+
+    These come FIRST in named.conf, ahead of ``options``, because BIND
+    resolves an ``acl`` statement where it is written: a reference to one
+    declared later in the file is an error, not a forward declaration. The
+    control plane already emits the list dependency-ordered (an ACL may
+    reference another), so this renders it as given.
+
+    Until #899 the bundle carried ``{id, name}`` with no entries and this
+    function did not exist — an ACL an operator created on the ACLs tab was
+    stored, listed, editable, and applied to nothing. Worse, naming one
+    anywhere that reached named.conf left an undefined symbol, so
+    ``named-checkconf`` failed and the whole bundle was declined.
+
+    An ACL with no usable entries renders as ``{ none; }`` rather than
+    being skipped. Skipping looks tidier and is wrong: the name may already
+    be cited by a view or another ACL, and dropping the definition
+    re-creates the undefined-symbol outage this whole change exists to
+    remove. ``none`` is also the honest meaning of an empty address-match
+    list — it matches nothing.
+    """
+    out = []
+    for acl in acls or []:
+        name = str(acl.get("name") or "").strip()
+        if not name:
+            continue
+        items = ""
+        for e in acl.get("entries") or []:
+            value = str(e.get("value", "")).strip()
+            if not value:
+                continue
+            # The control plane stores negation as a flag, but an operator
+            # pasting "!10.0.0.0/8" into the entry value is equally valid.
+            # Rendering both would emit "!!10.0.0.0/8", which BIND rejects.
+            negated = bool(e.get("negate")) or value.startswith("!")
+            items += f"{'!' if negated else ''}{value.lstrip('!').strip()}; "
+        out.append(f'acl "{name}" {{ {items or "none; "}}};\n')
+    return "".join(out)
+
+
+def _render_tls_statements(
+    opts: dict[str, Any], state_dir: Path, has_cert: bool
+) -> str:
     """Top-level ``tls`` / ``http`` statements for the encrypted transports.
 
     Returns "" when nothing is enabled so an install that never opted in
@@ -371,7 +414,9 @@ def _render_tls_statements(opts: dict[str, Any], state_dir: Path, has_cert: bool
 
     if _doh_listener_active(opts, has_cert):
         path = (opts.get("doh_path") or "/dns-query").strip()
-        blocks.append(f"http {_LOCAL_HTTP_ID} {{\n    endpoints {{ \"{path}\"; }};\n}};\n")
+        blocks.append(
+            f'http {_LOCAL_HTTP_ID} {{\n    endpoints {{ "{path}"; }};\n}};\n'
+        )
 
     if _forward_over_tls(opts):
         lines = [f"tls {_UPSTREAM_TLS_ID} {{"]
@@ -497,7 +542,12 @@ def _wire_value(rtype: str, value: str, fields: dict[str, Any]) -> str:
         pri = fields.get("priority")
         wt = fields.get("weight")
         prt = fields.get("port")
-        if pri is not None and wt is not None and prt is not None and len(value.split()) < 4:
+        if (
+            pri is not None
+            and wt is not None
+            and prt is not None
+            and len(value.split()) < 4
+        ):
             return f"{pri} {wt} {prt} {value}"
     return value
 
@@ -602,7 +652,6 @@ def _render_dnssec_policies(policies: list[dict[str, Any]]) -> str:
     return out
 
 
-
 class Bind9Driver(DriverBase):
     rendered_dir_name = "rendered"
     daemon_pid: int | None = None
@@ -632,7 +681,9 @@ class Bind9Driver(DriverBase):
         # the operator's intent flag — see _render_tls_statements.
         tls_cert = bundle.get("tls_cert") or None
         has_cert = bool(
-            isinstance(tls_cert, dict) and tls_cert.get("cert_pem") and tls_cert.get("key_pem")
+            isinstance(tls_cert, dict)
+            and tls_cert.get("cert_pem")
+            and tls_cert.get("key_pem")
         )
         if (opts.get("dot_enabled") or opts.get("doh_enabled")) and not has_cert:
             log.warning(
@@ -646,6 +697,22 @@ class Bind9Driver(DriverBase):
             fwd_block = "    forwarders {{ {fs}; }};\n".format(
                 fs="; ".join(_format_forwarder(str(f), opts) for f in forwarders)
             )
+            # ``forward only`` means "never fall back to recursing yourself".
+            # It was settable, persisted and shipped in the bundle, but no
+            # ``forward`` statement was ever rendered — so BIND used its own
+            # default (``first``) and an operator who chose ``only`` silently
+            # got the opposite. That matters beyond tidiness: ``only`` is how
+            # you force every query through a filtering upstream, and
+            # ``first`` lets queries leak straight past it on any upstream
+            # hiccup.
+            #
+            # Emitted only for ``only``, because ``first`` IS BIND's default
+            # — rendering it explicitly would change named.conf on every
+            # install that has forwarders and reload BIND for no behaviour
+            # change. Found by the #899 audit for stored-but-never-rendered
+            # fields, same class as allow-transfer (#734) and named ACLs.
+            if str(opts.get("forward_policy", "first")).lower() == "only":
+                fwd_block += "    forward only;\n"
 
         tsig_keys = bundle.get("tsig_keys") or []
         tsig_key_name = tsig_keys[0]["name"] if tsig_keys else None
@@ -658,7 +725,9 @@ class Bind9Driver(DriverBase):
         # own ``allow_transfer`` override emits its own clause below, which
         # BIND lets shadow this one entirely.
         key_grants = _transfer_key_grants(tsig_keys)
-        allow_transfer_opt = _render_allow_transfer(opts.get("allow_transfer"), key_grants)
+        allow_transfer_opt = _render_allow_transfer(
+            opts.get("allow_transfer"), key_grants
+        )
 
         # Split-horizon (issue #24): when the group defines views, every
         # zone — and every RPZ/response-policy — lives INSIDE a
@@ -696,6 +765,7 @@ class Bind9Driver(DriverBase):
             rate_limit=_render_rate_limit_block(opts),
             logging_block=logging_block,
             tsig_include=tsig_include,
+            acl_statements=_render_acl_statements(bundle.get("acls")),
             tls_statements=_render_tls_statements(opts, self.state_dir, has_cert),
             encrypted_listeners=_render_encrypted_listeners(opts, has_cert),
         )
@@ -741,7 +811,9 @@ class Bind9Driver(DriverBase):
             # fall back to plaintext for its zone-scoped upstreams.
             if zone_type == "forward":
                 fwds = [
-                    _format_forwarder(str(f), opts) for f in (zone.get("forwarders") or []) if f
+                    _format_forwarder(str(f), opts)
+                    for f in (zone.get("forwarders") or [])
+                    if f
                 ]
                 if not fwds:
                     return ""
@@ -1141,7 +1213,9 @@ class Bind9Driver(DriverBase):
         # Exceptions are emitted as passthru below, so an entry for the
         # same name must not also be emitted. Matches the control-plane
         # renderer, which already skips excluded domains.
-        excluded = {str(x).rstrip(".").lower() for x in (bl.get("exceptions") or []) if x}
+        excluded = {
+            str(x).rstrip(".").lower() for x in (bl.get("exceptions") or []) if x
+        }
         # First writer of an owner name wins. The choice between two
         # disagreeing lists is arbitrary — what is NOT arbitrary is that
         # the zone must load, since the alternative is enforcing nothing

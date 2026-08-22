@@ -1,4 +1,4 @@
-"""DNS view name + address-match-list validation (issue #876).
+"""Validation for the free-text that reaches ``named.conf`` (#876, #899).
 
 View scoping shipped with #24 but was API-only, so these fields were
 effectively unvalidated. #876 puts a form in front of them, and both are
@@ -22,7 +22,7 @@ from app.core.security import create_access_token, hash_password
 from app.models.auth import User
 from app.models.dns import DNSAcl, DNSServerGroup
 from app.services import feature_modules
-from app.services.dns.view_validation import (
+from app.services.dns.named_conf_validation import (
     MAX_VIEW_NAME_LEN,
     RESERVED_VIEW_NAMES,
     ViewValidationError,
@@ -173,28 +173,29 @@ def test_bare_negation_is_rejected():
 def test_an_undefined_name_is_rejected():
     with pytest.raises(ViewValidationError) as exc:
         validate_address_match_list(["office-clients"], field="match_clients")
-    assert "not an IP address" in str(exc.value)
+    assert "not an ACL defined" in str(exc.value)
 
 
-def test_a_real_acl_name_is_rejected_because_the_agent_cannot_render_it():
-    """The agent emits no ``acl {}`` definitions.
+def test_a_defined_acl_name_is_accepted():
+    """#899 — the agent now renders ``acl {}``, so a reference resolves.
 
-    ``DNSAcl`` rows are stored and editable, and the bundle carries an
-    ``acls`` block — but only ``{id, name}``, and the agent's BIND9
-    renderer never reads it. So ``match-clients { office; };`` reaches a
-    server with ``office`` undefined, ``named-checkconf`` fails, and the
-    agent declines the entire bundle: the whole group stops converging,
-    not just this view.
-
-    Accepting the name would therefore be the bug. The message has to name
-    the real reason, because from the operator's side the ACL plainly
-    exists — they just created it on the tab next door.
+    #876 rejected every ACL name because none of them could ever resolve;
+    that was the accurate answer then and the wrong one now.
     """
+    assert validate_address_match_list(
+        ["office", "10.0.0.0/8"],
+        field="match_clients",
+        known_acls=frozenset({"office"}),
+    ) == ["office", "10.0.0.0/8"]
+
+
+def test_an_undefined_acl_name_is_still_rejected():
+    """An undefined symbol fails the whole bundle, not just this view."""
     with pytest.raises(ViewValidationError) as exc:
         validate_address_match_list(
-            ["office"], field="match_clients", known_acls=frozenset({"office"})
+            ["marketing"], field="match_clients", known_acls=frozenset({"office"})
         )
-    assert "does not yet render ACL definitions" in str(exc.value)
+    assert "not an ACL defined in this server group" in str(exc.value)
 
 
 def test_unknown_tsig_key_is_rejected():
@@ -253,10 +254,8 @@ async def test_create_view_rejects_a_traversing_name(client: AsyncClient, db_ses
     assert r.json()["detail"]["field"] == "name"
 
 
-async def test_create_view_rejects_an_acl_name_with_the_reason(client: AsyncClient, db_session):
-    """End-to-end: a view naming an ACL the operator really created is
-    still refused, and the 422 explains why rather than claiming it does
-    not exist."""
+async def test_create_view_accepts_a_defined_acl_by_name(client: AsyncClient, db_session):
+    """#899 — the whole point. A view may cite an ACL the group defines."""
     token = await _admin(db_session)
     group = await _group(db_session)
     db_session.add(DNSAcl(group_id=group.id, name="office", description=""))
@@ -267,27 +266,26 @@ async def test_create_view_rejects_an_acl_name_with_the_reason(client: AsyncClie
         headers=_hdr(token),
         json={"name": "internal", "match_clients": ["office", "10.0.0.0/8"]},
     )
-    assert r.status_code == 422, r.text
-    detail = r.json()["detail"]
-    assert detail["field"] == "match_clients"
-    assert "does not yet render ACL definitions" in detail["message"]
+    assert r.status_code == 201, r.text
+    assert r.json()["match_clients"] == ["office", "10.0.0.0/8"]
 
 
-async def test_create_view_accepts_the_prefixes_the_acl_would_have_held(
-    client: AsyncClient, db_session
-):
-    """The documented workaround has to actually work."""
+async def test_create_view_rejects_an_acl_from_another_group(client: AsyncClient, db_session):
+    """ACL names are per-group, so one group's ACL is undefined in another —
+    and the bundle is built per group, so it would never be rendered."""
     token = await _admin(db_session)
-    group = await _group(db_session)
+    owner = await _group(db_session)
+    other = await _group(db_session)
+    db_session.add(DNSAcl(group_id=owner.id, name="office", description=""))
     await db_session.flush()
 
     r = await client.post(
-        f"/api/v1/dns/groups/{group.id}/views",
+        f"/api/v1/dns/groups/{other.id}/views",
         headers=_hdr(token),
-        json={"name": "internal", "match_clients": ["10.0.0.0/8", "192.168.0.0/16"]},
+        json={"name": "internal", "match_clients": ["office"]},
     )
-    assert r.status_code == 201, r.text
-    assert r.json()["match_clients"] == ["10.0.0.0/8", "192.168.0.0/16"]
+    assert r.status_code == 422
+    assert r.json()["detail"]["field"] == "match_clients"
 
 
 async def test_duplicate_name_is_caught_after_stripping(client: AsyncClient, db_session):

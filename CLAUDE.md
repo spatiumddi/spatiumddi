@@ -556,7 +556,7 @@ suggestion, free-space treemap.
   picker that turns IPAM prefixes into `match_clients`; a **scope modal**
   on each blocking list writing group and view assignment in one PUT; and
   per-view chips on both tabs. **The load-bearing addition is server-side
-  validation** (`app/services/dns/view_validation.py`): `match_clients`,
+  validation** (`app/services/dns/named_conf_validation.py`): `match_clients`,
   `match_destinations` and the view name are interpolated *verbatim* into
   `named.conf`, and the name additionally becomes a directory on the
   agent — so a malformed prefix, an undefined ACL name, a `;`-injection or
@@ -573,9 +573,9 @@ suggestion, free-space treemap.
   definitions at all — `DNSAcl` rows are stored and editable but the bundle
   ships only `{id, name}` and the agent renderer ignores it, so naming an
   ACL in a view would leave an undefined symbol and stop the group
-  converging. Named ACLs are therefore rejected in a view's match-list with
-  a 422 saying why; [#899](https://github.com/spatiumddi/spatiumddi/issues/899)
-  tracks making them real.
+  converging. Named ACLs were therefore rejected in a view's match-list
+  with a 422 saying why, until
+  [#899](https://github.com/spatiumddi/spatiumddi/issues/899) made them real.
 - ✅ [**Blocklist feed wildcard semantics are per-list**](https://github.com/spatiumddi/spatiumddi/issues/894)
   — #878 made every feed row `is_wildcard=True`, right for all 19
   catalog sources but a global constant, and wrong for a host-specific
@@ -591,6 +591,35 @@ suggestion, free-space treemap.
   arrived `*.`-prefixed, so an apex-only list fed a wildcard-syntax
   feed logs that it is overriding the feed's stated intent instead of
   doing it silently.
+
+- ✅ [**DNS agent never renders `acl {}` definitions**](https://github.com/spatiumddi/spatiumddi/issues/899)
+  — `DNSAcl` rows were stored, listed and editable on the ACLs tab and
+  applied to **nothing**: the bundle carried `{id, name}` with no entries
+  and the agent's BIND9 renderer emitted no `acl {}` stanza at all (the
+  control-plane template that does render one has no production caller).
+  Citing an ACL anywhere that reached `named.conf` therefore left an
+  undefined symbol — `named-checkconf` fails, the agent declines the
+  *whole* bundle, and the group stops converging rather than just that
+  statement, which is why #876 had to reject ACL names outright. Now the
+  bundle ships entries and the agent renders `acl "<name>" { … };` **above
+  `options`** — placement is the correctness property, since BIND resolves
+  an `acl` where it is written and a definition below its first use is an
+  error, not a forward declaration. The list is emitted
+  dependency-ordered (`order_acls_for_render`, a DFS topological sort) so
+  a nested reference resolves, and **cycles are refused at the commit**
+  with a graph check: `a → b → a` has two individually-legal edges, so
+  per-field validation cannot see it. Entry values now go through the same
+  gate as a view's `match_clients`, and an entry-less ACL is skipped at
+  render because BIND rejects `acl "x" { };`. Global ACLs (`group_id IS
+  NULL`) are documented unsupported — nothing creates one and the bundle
+  is per-group. **The audit the issue asked for found a second instance of
+  the same bug class:** `DNSServerOptions.forward_policy` was settable,
+  persisted and shipped, and no `forward` statement was ever rendered — so
+  `only` silently behaved as BIND's default `first`, letting queries leak
+  past a filtering upstream that an operator had deliberately forced
+  everything through. Third field in this class after `allow_transfer`
+  (#734); the lesson recorded in `DNS.md` §8.2 is to assert on the
+  *rendered config*, not the stored row.
 
 #### DHCP-specific
 
