@@ -903,6 +903,61 @@ suggestion, free-space treemap.
     to `scripts/prune-release-assets.sh`**. The version handshake the issue
     wanted is `GET /api/v1/version` (unauthenticated), **not**
     `/health/platform`, which reports no version at all.
+  - ✅ [**The published document is consumable by a code generator**](https://github.com/spatiumddi/spatiumddi/issues/907)
+    — two defects found generating the Swift client against a running control
+    plane, both of which break a generated client *silently*: it compiles,
+    passes review, and is wrong. (1) FastAPI emits OpenAPI 3.1's nullable
+    idiom, `anyOf: [X, {"type": "null"}]`; a generator that cannot model the
+    `null` arm **skips the member — which drops the whole property from the
+    generated type**, with a warning rather than an error. Measured on this
+    document: 3,291 schema properties and 297 query parameters gone, including
+    `limit` on list endpoints, so the client could not paginate at all.
+    `app.openapi()` now states nullability the other way round
+    (`app/core/openapi_compat.py`): the plain schema, with the property out of
+    `required` — which is the half that carries it, since 971 of them were
+    nullable *and* required. **Request bodies keep their `required`**, though:
+    there it is not a description but what the server enforces, so publishing
+    a no-default `X | None` field as optional would have a generated client
+    omit a key and take a 422 (`ImportedZoneOut.soa`, the one schema in the
+    document used in both directions, got the default it should always have
+    had, and a test now fails loudly on the next one). **Deliberate trade, written down in `API.md`:**
+    the server still *sends* `null` rather than omitting the key, so a strict
+    response validator now sees an explicit null the schema no longer admits.
+    The alternative (`exclude_none` on responses) changes the wire for every
+    existing client to fix a documentation defect, and the validator complaint
+    is loud where the generated-code failure is silent. (2) Timestamps went
+    out as `datetime.isoformat()` — six fractional digits, or **none at all**
+    on a whole second, which is the nastier half: a decoder configured *for*
+    fractional seconds fails intermittently, depending on when a row happened
+    to be written. 6 of 7 endpoints a client called were undecodable, every
+    one of them a 200 OK. Now pinned to RFC 3339 with exactly three digits
+    (`app/core/json_datetime.py`), truncated not rounded. **The mechanism is
+    the interesting part**: the framework-blessed `Annotated[datetime,
+    PlainSerializer(...)]` means editing 714 annotations across 166 files and
+    trusting every future model to remember, `json_encoders` is deprecated and
+    gone in pydantic v3, and rewriting the rendered body means sniffing every
+    string in every response for something date-shaped — mutating opaque
+    operator data (a raw BIND query-log line carries a timestamp) and paying a
+    second traversal per request. So it wraps
+    `pydantic_core.core_schema.datetime_schema`, the one point every
+    `datetime` core schema is built through, from `app/__init__.py` — the only
+    import site that reliably beats the first model class, since isort would
+    reorder the equivalent line in `main.py` below the routers. `install()`
+    also patches FastAPI's own encoder table — ordered ahead of the stock
+    entry, because `datetime` subclasses a `date` whose encoder is registered
+    first — or the wire format would depend on whether a route declared a
+    `response_model`. Three response models (`AuditLogResponse`, `SessionRow`,
+    `UserResponse`) additionally carried their timestamps as **`str`** filled
+    by `isoformat()`, so they published with no `format: date-time` at all;
+    now declared `datetime` and serialised like everything else. **One trap found on the
+    way, worth more than the rest:** declaring the serialiser's obvious
+    `return_schema=str_schema()` rewrites the *serialisation* JSON schema —
+    which is the mode FastAPI publishes response models in — so every
+    `created_at` in the document silently lost `format: date-time`, trading a
+    decode failure for a client that never parses a date at all. Omitted, and
+    asserted in both schema modes. Tests assert on the **wire format**, never
+    on the patch: the regression worth catching is a future pydantic that
+    stops routing through that function.
 - ✅ [**Login banner**](https://github.com/spatiumddi/spatiumddi/issues/885) · [**custom logo**](https://github.com/spatiumddi/spatiumddi/issues/886) ·
   [**environment banner**](https://github.com/spatiumddi/spatiumddi/issues/887) · [**`app_title` wired up**](https://github.com/spatiumddi/spatiumddi/issues/888)
   — shipped together in PR

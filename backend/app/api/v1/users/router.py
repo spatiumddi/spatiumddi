@@ -45,13 +45,14 @@ class UserResponse(BaseModel):
     is_superadmin: bool
     force_password_change: bool
     auth_source: str
-    last_login_at: str | None = None
+    # Real ``datetime``s (#907); see the audit router for why.
+    last_login_at: datetime | None = None
     # Lockout state (issue #71). ``locked`` mirrors the live time
     # check so the UI doesn't have to compare timestamps in JS;
     # ``failed_login_count`` + ``failed_login_locked_until`` are
     # surfaced for triage / admin display.
     failed_login_count: int = 0
-    failed_login_locked_until: str | None = None
+    failed_login_locked_until: datetime | None = None
     locked: bool = False
 
     model_config = {"from_attributes": True}
@@ -60,11 +61,6 @@ class UserResponse(BaseModel):
     @classmethod
     def coerce_id(cls, v: object) -> str:
         return str(v)
-
-    @field_validator("last_login_at", "failed_login_locked_until", mode="before")
-    @classmethod
-    def coerce_dt(cls, v: object) -> str | None:
-        return v.isoformat() if v is not None else None
 
     @model_validator(mode="before")
     @classmethod

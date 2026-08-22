@@ -48,9 +48,12 @@ class SessionRow(BaseModel):
     auth_source: str
     source_ip: str | None
     user_agent: str | None
-    created_at: str
-    last_seen_at: str | None
-    expires_at: str
+    # Real ``datetime``s (#907) — typed as strings these published without
+    # ``format: date-time`` and went out in a shape no other timestamp in the
+    # API uses.
+    created_at: datetime
+    last_seen_at: datetime | None
+    expires_at: datetime
     revoked: bool
     is_current: bool
 
@@ -71,9 +74,9 @@ def _row(
         auth_source=s.auth_source or "local",
         source_ip=s.source_ip,
         user_agent=s.user_agent,
-        created_at=s.created_at.isoformat(),
-        last_seen_at=s.last_seen_at.isoformat() if s.last_seen_at else None,
-        expires_at=s.expires_at.isoformat(),
+        created_at=s.created_at,
+        last_seen_at=s.last_seen_at,
+        expires_at=s.expires_at,
         revoked=bool(s.revoked),
         is_current=current_jti is not None and str(s.id) == current_jti,
     )
