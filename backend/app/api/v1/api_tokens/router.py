@@ -34,6 +34,7 @@ from sqlalchemy import delete, select
 from app.api.deps import DB, CurrentUser
 from app.core.permissions import is_effective_superadmin, user_has_permission
 from app.core.security import generate_api_token
+from app.models.appliance import ApplianceCertificate
 from app.models.audit import AuditLog
 from app.models.auth import APIToken
 from app.models.dns import DNSZone
@@ -186,6 +187,30 @@ def _resolve_expiry(body: ApiTokenCreate) -> datetime | None:
     return None
 
 
+class EnrolmentContext(BaseModel):
+    """What the web UI needs to build a device-enrolment QR code (#906).
+
+    Only the certificate fingerprint. The connection itself (host / port /
+    scheme) deliberately does NOT come from here: behind a reverse proxy,
+    split DNS or NAT the server does not know its own externally-reachable
+    address, and it would guess wrong on exactly the deployments this feature
+    is most useful for. The browser knows the address the operator actually
+    reached it on, so the UI starts from ``window.location`` and lets the
+    operator correct it — a laptop on a VPN and a handset on wifi routinely
+    disagree about how to reach the same server.
+    """
+
+    #: SHA-256 of the leaf certificate SpatiumDDI serves, bare lower-case hex,
+    #: or ``None`` when the server does not know what it presents.
+    tls_fingerprint_sha256: str | None
+    #: Where the fingerprint came from, so the UI can say so rather than
+    #: asserting a provenance it cannot support. ``None`` when there is none.
+    fingerprint_source: str | None
+    #: Why there is no fingerprint, for the UI to explain the absence instead
+    #: of silently dropping the strongest half of the enrolment code.
+    fingerprint_unavailable_reason: str | None
+
+
 # ── Endpoints ──────────────────────────────────────────────────────────────
 
 
@@ -263,6 +288,72 @@ async def create_token(
         "created_at": token.created_at,
         "token": raw,
     }
+
+
+@router.get("/enrolment-context", response_model=EnrolmentContext)
+async def enrolment_context(db: DB, current_user: CurrentUser) -> EnrolmentContext:
+    """Certificate fingerprint for the enrolment QR code (#906).
+
+    Gated on ``CurrentUser`` only, matching ``create_token`` — anyone who can
+    mint a token for themselves can build a code for it. That is not a
+    weakening: a TLS fingerprint is not a secret, it is what the server hands
+    to every client that connects, and anyone able to reach the port can
+    compute it without asking.
+
+    **Why the fingerprint is worth carrying.** A self-hosted control plane
+    generally presents a certificate from a private CA or the appliance's own
+    root, so the client has to ask the operator to confirm it. Comparing 64
+    hex characters by eye on a phone is precisely the check people skim. Put
+    the fingerprint in the code the operator scans from inside an
+    authenticated session and the comparison becomes machine-checked.
+
+    Reported ONLY when SpatiumDDI actually owns the TLS termination — i.e.
+    there is an active ``ApplianceCertificate``, which is the row deployed to
+    the TLS secret the frontend serves. On a Compose or plain-Kubernetes
+    install an external proxy or ingress terminates TLS with a certificate
+    this process has never seen, and there is no row: the honest answer is
+    ``None``, not a guess. A fingerprint that does not match the wire would
+    make the client report a mismatch on a correct setup, which trains
+    operators to click through the one warning this exists to make meaningful.
+    """
+    # Route ordering: this is declared BEFORE ``GET /{token_id}`` on purpose.
+    # FastAPI matches in registration order, so a later declaration would be
+    # shadowed by the UUID path param and 422 on the literal segment.
+    del current_user  # auth-only dependency; the answer is not per-user
+
+    row = (
+        (
+            await db.execute(
+                select(ApplianceCertificate)
+                .where(ApplianceCertificate.is_active.is_(True))
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+
+    if row is None or not row.fingerprint_sha256:
+        return EnrolmentContext(
+            tls_fingerprint_sha256=None,
+            fingerprint_source=None,
+            fingerprint_unavailable_reason=(
+                "SpatiumDDI does not manage the TLS certificate for this "
+                "deployment, so it cannot state what clients are served. "
+                "Verify the fingerprint out of band."
+            ),
+        )
+
+    # Normalise to bare lower-case hex. The stored value has carried colons
+    # historically depending on which path wrote it, and the enrolment format
+    # specifies hex with colons optional — emitting one canonical form keeps
+    # the client's comparison a string equality.
+    fingerprint = row.fingerprint_sha256.replace(":", "").strip().lower()
+    return EnrolmentContext(
+        tls_fingerprint_sha256=fingerprint,
+        fingerprint_source=row.source,
+        fingerprint_unavailable_reason=None,
+    )
 
 
 @router.get("/{token_id}", response_model=ApiTokenResponse)
