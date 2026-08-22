@@ -6,9 +6,11 @@ import os
 
 from spatium_dhcp_agent.cache import (
     CACHE_SCHEMA_VERSION,
+    commit_config,
     ensure_layout,
     load_config,
     load_or_create_agent_id,
+    load_previous_config,
     load_token,
     save_config,
     save_rendered_kea,
@@ -31,12 +33,30 @@ def test_cache_roundtrip(tmp_state) -> None:
     assert loaded["subnets"] == bundle["subnets"]
 
 
-def test_cache_previous_on_second_write(tmp_state) -> None:
+def test_fetching_does_not_rotate_previous(tmp_state) -> None:
+    """``previous`` tracks the last bundle that APPLIED, not the last fetched.
+
+    This test asserted the opposite until #882. The old rotate-on-fetch made
+    ``previous`` useless as a fallback: a bundle Kea refuses leaves the etag
+    unadvanced, so the next poll re-fetches the same bundle and rotates the
+    bad config into ``previous``, destroying the only copy that worked.
+    """
     ensure_layout(tmp_state)
     save_config(tmp_state, {"v": 1}, "etag1")
     save_config(tmp_state, {"v": 2}, "etag2")
-    assert (tmp_state / "config" / "previous.json").exists()
+    assert not (tmp_state / "config" / "previous.json").exists()
     assert (tmp_state / "config" / "current.json").exists()
+
+
+def test_commit_config_promotes_current(tmp_state) -> None:
+    ensure_layout(tmp_state)
+    save_config(tmp_state, {"v": 1}, "etag1")
+    commit_config(tmp_state, "etag1")
+    save_config(tmp_state, {"v": 2}, "etag2")
+
+    bundle, etag = load_previous_config(tmp_state)
+    assert etag == "etag1"
+    assert bundle["v"] == 1
 
 
 def test_agent_id_stable(tmp_state) -> None:

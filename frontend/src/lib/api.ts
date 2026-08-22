@@ -4970,6 +4970,30 @@ export interface DNSPoolWrite {
   members?: DNSPoolMemberWrite[];
 }
 
+/**
+ * Last config-apply verdict an agent reported (#882).
+ *
+ * `null` means the agent has never reported one — a pre-#882 agent, or an
+ * agentless driver (Windows DNS, the cloud DNS providers, `technitium_api`)
+ * that has no apply loop at all. Render that as unknown, never as healthy.
+ */
+export type ConfigApplyStatus =
+  | "ok"
+  /** The saved config failed; the agent rolled back and is serving the previous one. */
+  | "reverted"
+  /** The saved config failed AND the rollback failed. Running state unknown. */
+  | "revert_failed"
+  /** Failed with no previously-working config to fall back to. */
+  | "no_previous";
+
+/** Config-apply fields shared by DNS servers, DHCP servers and LG collectors. */
+export interface ConfigApplyFields {
+  config_apply_status: ConfigApplyStatus | null;
+  config_apply_error: string | null;
+  config_failed_etag: string | null;
+  config_apply_at: string | null;
+}
+
 export interface DNSServer {
   id: string;
   group_id: string;
@@ -5001,6 +5025,10 @@ export interface DNSServer {
    *  to identify which host an agent is on (the operator-set ``host``
    *  is just a label; doesn't reflect NAT / distributed deployments). */
   last_seen_ip: string | null;
+  config_apply_status: ConfigApplyStatus | null;
+  config_apply_error: string | null;
+  config_failed_etag: string | null;
+  config_apply_at: string | null;
   last_config_etag: string | null;
   pending_approval: boolean;
   is_primary: boolean;
@@ -7606,6 +7634,10 @@ export interface DHCPServer {
    *  to identify which host an agent runs on (the operator-set ``host``
    *  is just a label; doesn't reflect NAT / distributed deployments). */
   last_seen_ip: string | null;
+  config_apply_status: ConfigApplyStatus | null;
+  config_apply_error: string | null;
+  config_failed_etag: string | null;
+  config_apply_at: string | null;
   agent_version: string | null;
   config_etag: string | null;
   config_pushed_at: string | null;
@@ -15306,6 +15338,10 @@ export interface BGPLGCollector {
   agent_registered: boolean;
   agent_version: string | null;
   last_seen_ip: string | null;
+  config_apply_status: ConfigApplyStatus | null;
+  config_apply_error: string | null;
+  config_failed_etag: string | null;
+  config_apply_at: string | null;
   last_seen_at: string | null;
   last_health_check_at: string | null;
   appliance_id: string | null;

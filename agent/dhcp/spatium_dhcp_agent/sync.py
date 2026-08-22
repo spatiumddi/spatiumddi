@@ -30,8 +30,27 @@ from typing import Any
 import httpx
 import structlog
 
-from .cache import load_config, save_config, save_rendered_kea, save_token
+from .cache import (
+    commit_config,
+    load_config,
+    load_previous_config,
+    save_config,
+    save_rendered_kea,
+    save_token,
+)
 from .config import AgentConfig
+from .config_apply import (
+    PHASE_RELOAD,
+    PHASE_RENDER,
+    STATUS_NO_PREVIOUS,
+    STATUS_OK,
+    STATUS_REVERT_FAILED,
+    STATUS_REVERTED,
+    ApplyStatus,
+    ConfigApplyError,
+    Quarantine,
+    truncate_error,
+)
 from .kea_ctrl import KeaCtrlError, config_reload, config_test
 from .radvd_apply import apply_radvd
 from .render_kea import render as render_kea
@@ -70,6 +89,12 @@ _OFFLINE_RETRY_SECONDS = 60.0
 _BOOTSTRAP_RELOAD_TIMEOUT = 15.0
 _BOOTSTRAP_RELOAD_INTERVAL = 1.0
 
+# Outcomes of one daemon's reload attempt. Only REJECTED is a verdict about
+# the config itself; UNREACHABLE means we never got to ask (#882).
+RELOAD_OK = "ok"
+RELOAD_REJECTED = "rejected"
+RELOAD_UNREACHABLE = "unreachable"
+
 
 class SyncLoop:
     def __init__(
@@ -89,6 +114,15 @@ class SyncLoop:
         self._current_etag: str | None = None
         self._consecutive_failures = 0
         self._offline = False
+        # #882 — last-known-good revert. ``quarantine`` remembers an etag
+        # whose apply Kea refused so we stop re-applying it every poll;
+        # ``apply_status`` is what the heartbeat reports upward.
+        self._quarantine = Quarantine(self.cfg.state_dir)
+        self.apply_status = ApplyStatus()
+        self.heartbeat.config_apply = self.apply_status
+        # Set by _reload_socket so the raised ConfigApplyError can carry
+        # Kea's own words rather than a generic "rejected".
+        self._last_reload_error: str | None = None
 
         # Preload cached bundle — offline-operation guarantee.
         #
@@ -100,6 +134,30 @@ class SyncLoop:
         # on its baked config forever — in particular losing HA state on
         # any agent restart.
         bundle, etag = load_config(self.cfg.state_dir)
+        # #882 — a restart must not re-break Kea with the bundle that broke
+        # it. ``current.json`` is what the control plane last SENT, which is
+        # not necessarily what loaded; if that bundle is quarantined, boot
+        # from the last-known-good instead.
+        booting_from_previous = False
+        if bundle is not None and self._quarantine.blocks(etag):
+            prev_bundle, prev_etag = load_previous_config(self.cfg.state_dir)
+            if prev_bundle is not None:
+                log.warning(
+                    "bootstrap_skipping_quarantined_bundle",
+                    failed_etag=etag,
+                    booting_etag=prev_etag,
+                    reason=self._quarantine.reason,
+                )
+                self._set_status(
+                    ApplyStatus(
+                        status=STATUS_REVERTED,
+                        etag=prev_etag,
+                        failed_etag=etag,
+                        error=self._quarantine.reason,
+                    )
+                )
+                bundle, etag = prev_bundle, prev_etag
+                booting_from_previous = True
         if bundle is not None:
             self._current_etag = etag
             try:
@@ -108,6 +166,12 @@ class SyncLoop:
                     reload_kea=True,
                     reload_retry_timeout=_BOOTSTRAP_RELOAD_TIMEOUT,
                 )
+                if not booting_from_previous:
+                    # #882 — ``current`` demonstrably loads, so it becomes the
+                    # bundle we fall back TO. Skipped when we booted from
+                    # ``previous``: committing there would copy the still-bad
+                    # ``current.json`` over the only good config we have.
+                    commit_config(self.cfg.state_dir, etag or "")
                 # #296 A2 — warm-restart readiness. The hostPath cache carries
                 # the bundle we just successfully re-applied; the marker tells
                 # the K8s readinessProbe this pod is ready to serve without
@@ -123,8 +187,139 @@ class SyncLoop:
                 # longer write the trigger surface anyway; the
                 # supervisor's appliance-state module is the single
                 # producer of appliance-host trigger files now.
-            except Exception:
+            except Exception as e:
+                # #882 — the cached bundle no longer loads. Quarantine it and
+                # fall back rather than leave Kea on the baked image config.
                 log.exception("bootstrap_cache_apply_failed")
+                if etag:
+                    self._quarantine.record(etag, truncate_error(str(e)))
+                self._bootstrap_fallback(etag, e)
+
+    def _set_status(self, status: ApplyStatus) -> None:
+        self.apply_status = status
+        self.heartbeat.config_apply = status
+
+    def _bootstrap_fallback(self, failed_etag: str | None, exc: BaseException) -> None:
+        """Boot from the last-known-good bundle after ``current`` failed (#882)."""
+        prev_bundle, prev_etag = load_previous_config(self.cfg.state_dir)
+        if prev_bundle is None or prev_etag == failed_etag:
+            self._set_status(
+                ApplyStatus(
+                    status=STATUS_NO_PREVIOUS,
+                    failed_etag=failed_etag,
+                    error=truncate_error(str(exc)),
+                )
+            )
+            log.error("bootstrap_no_last_known_good", failed_etag=failed_etag)
+            return
+        try:
+            self._apply_bundle(
+                prev_bundle,
+                reload_kea=True,
+                reload_retry_timeout=_BOOTSTRAP_RELOAD_TIMEOUT,
+            )
+        except Exception as revert_exc:
+            self._set_status(
+                ApplyStatus(
+                    status=STATUS_REVERT_FAILED,
+                    failed_etag=failed_etag,
+                    error=truncate_error(f"{exc} (revert also failed: {revert_exc})"),
+                )
+            )
+            log.exception("bootstrap_last_known_good_apply_failed")
+            return
+        self._current_etag = prev_etag
+        self._set_status(
+            ApplyStatus(
+                status=STATUS_REVERTED,
+                etag=prev_etag,
+                failed_etag=failed_etag,
+                error=truncate_error(str(exc)),
+            )
+        )
+        _touch_ready_marker(self.cfg.state_dir)
+        log.warning(
+            "bootstrap_from_last_known_good",
+            failed_etag=failed_etag,
+            booted_etag=prev_etag,
+        )
+
+    def _apply_with_revert(self, bundle: dict[str, Any], etag: str) -> bool:
+        """Apply ``bundle``; on failure fall back to the last-known-good (#882).
+
+        Returns True when ``bundle`` is live, False when it was rejected.
+
+        Unlike the DNS agent, a revert here always rewrites the on-disk Kea
+        documents even when the running daemon was never disturbed. Kea's
+        ``config-test`` rejects without touching the running server, so the
+        daemon is fine — but ``_apply_bundle`` has already written the
+        refused document to ``kea_config_path``, and that file is what Kea
+        reads on its next start. Leaving it would turn a rejected apply into
+        a crash loop the next time the container restarts.
+        """
+        try:
+            self._apply_bundle(bundle, reload_kea=True)
+        except ConfigApplyError as e:
+            self._handle_apply_failure(etag, e.phase, e.cause)
+            return False
+        except Exception as e:
+            self._handle_apply_failure(etag, None, e)
+            return False
+
+        self._quarantine.clear()
+        commit_config(self.cfg.state_dir, etag)
+        self._set_status(ApplyStatus(status=STATUS_OK, etag=etag))
+        return True
+
+    def _handle_apply_failure(
+        self, etag: str, phase: str | None, cause: BaseException
+    ) -> None:
+        log.error("sync_apply_failed", etag=etag, phase=phase, error=str(cause))
+        self._quarantine.record(etag, truncate_error(f"{phase or 'apply'}: {cause}"))
+
+        prev_bundle, prev_etag = load_previous_config(self.cfg.state_dir)
+        if prev_bundle is None:
+            self._set_status(
+                ApplyStatus(
+                    status=STATUS_NO_PREVIOUS,
+                    failed_etag=etag,
+                    phase=phase,
+                    error=truncate_error(str(cause)),
+                )
+            )
+            log.error("sync_no_last_known_good", failed_etag=etag)
+            return
+
+        try:
+            self._apply_bundle(prev_bundle, reload_kea=True)
+        except Exception as revert_exc:
+            self._set_status(
+                ApplyStatus(
+                    status=STATUS_REVERT_FAILED,
+                    failed_etag=etag,
+                    phase=phase,
+                    error=truncate_error(f"{cause} (revert also failed: {revert_exc})"),
+                )
+            )
+            log.exception("sync_revert_failed", failed_etag=etag)
+            return
+
+        self._set_status(
+            ApplyStatus(
+                status=STATUS_REVERTED,
+                etag=prev_etag,
+                failed_etag=etag,
+                phase=phase,
+                error=truncate_error(str(cause)),
+            )
+        )
+        self.heartbeat.daemon_status = {
+            "status": "degraded",
+            "reason": f"config_apply_reverted: {truncate_error(str(cause))}",
+        }
+        log.warning(
+            "sync_reverted_to_last_known_good", failed_etag=etag, live_etag=prev_etag
+        )
 
     def stop(self) -> None:
         self._stop.set()
@@ -155,12 +350,17 @@ class SyncLoop:
         config_doc: dict[str, Any],
         daemon: str,
         reload_retry_timeout: float,
-    ) -> bool:
+    ) -> str:
         """Preflight (config-test) then reload one Kea daemon.
 
-        Returns ``True`` on a successful reload, ``False`` otherwise. Never
-        raises, so a v6 failure can't abort the v4 apply (and vice-versa). Two
-        failure modes are now distinguished (#477):
+        Returns ``RELOAD_OK`` / ``RELOAD_REJECTED`` / ``RELOAD_UNREACHABLE``.
+        Never raises, so a v6 failure can't abort the v4 apply (and
+        vice-versa). Two failure modes are distinguished (#477), and #882
+        makes that distinction load-bearing rather than only cosmetic: a
+        REJECTED config is known-bad and triggers a revert to the last
+        config Kea accepted, while an UNREACHABLE socket says nothing about
+        the config — reverting there would discard a perfectly good bundle
+        because Kea happened to be restarting.
 
         * **Config rejected** — config-test / reload answers with a non-zero
           result. Terminal (retrying won't fix a bad render), so surface Kea's
@@ -179,7 +379,7 @@ class SyncLoop:
                 # reason on rejection; only reload once it passes.
                 config_test(socket_path, config_doc)
                 config_reload(socket_path)
-                return True
+                return RELOAD_OK
             except (KeaCtrlError, OSError) as e:
                 # Retry BOTH classes through the deadline. An OSError is the
                 # control socket not being up yet; and during Kea's startup
@@ -208,13 +408,15 @@ class SyncLoop:
                 "status": "degraded",
                 "reason": f"{daemon}_config_rejected: {last_err}",
             }
-        else:
-            log.warning("kea_config_reload_failed", daemon=daemon, error=str(last_err))
-            self.heartbeat.daemon_status = {
-                "status": "degraded",
-                "reason": f"{daemon}_socket_unreachable: {last_err}",
-            }
-        return False
+            self._last_reload_error = f"{daemon}: {last_err}"
+            return RELOAD_REJECTED
+        log.warning("kea_config_reload_failed", daemon=daemon, error=str(last_err))
+        self.heartbeat.daemon_status = {
+            "status": "degraded",
+            "reason": f"{daemon}_socket_unreachable: {last_err}",
+        }
+        self._last_reload_error = f"{daemon}: {last_err}"
+        return RELOAD_UNREACHABLE
 
     def _apply_bundle(
         self,
@@ -255,13 +457,18 @@ class SyncLoop:
         # swapped (``kea-leases4.csv`` → ``kea-leases6.csv``) so the v6
         # daemon never writes the v4 lease store.
         lease_file_v6 = str(self.cfg.kea_lease_file).replace("leases4", "leases6")
-        rendered = render_kea(
-            inner,
-            control_socket=str(self.cfg.kea_control_socket),
-            lease_file=str(self.cfg.kea_lease_file),
-            control_socket_v6=str(self.cfg.kea_control_socket_v6),
-            lease_file_v6=lease_file_v6,
-        )
+        try:
+            rendered = render_kea(
+                inner,
+                control_socket=str(self.cfg.kea_control_socket),
+                lease_file=str(self.cfg.kea_lease_file),
+                control_socket_v6=str(self.cfg.kea_control_socket_v6),
+                lease_file_v6=lease_file_v6,
+            )
+        except Exception as e:
+            # #882 — tag the phase. A render failure never reached Kea, so
+            # the caller knows the running config is untouched.
+            raise ConfigApplyError(PHASE_RENDER, e) from e
         # Keep the HA poller aligned with whether Kea is about to load
         # the HA hook — when the bundle has no failover block the hook
         # won't be loaded, so we don't want the poller spamming
@@ -295,14 +502,31 @@ class SyncLoop:
             # not abort the v4 apply (and vice-versa) — each is wrapped in
             # the same retry / tolerate-missing-socket logic, and the
             # heartbeat daemon_status reflects the worst of the two.
-            ok4 = self._reload_socket(
+            self._last_reload_error = None
+            r4 = self._reload_socket(
                 self.cfg.kea_control_socket, dhcp4_doc, "dhcp4", reload_retry_timeout
             )
-            ok6 = self._reload_socket(
+            r6 = self._reload_socket(
                 self.cfg.kea_control_socket_v6, dhcp6_doc, "dhcp6", reload_retry_timeout
             )
-            if ok4 and ok6:
+            if r4 == RELOAD_OK and r6 == RELOAD_OK:
                 self.heartbeat.daemon_status = {"status": "ok"}
+            elif RELOAD_REJECTED in (r4, r6):
+                # #882 — Kea told us the config is wrong. Pre-#882 this fell
+                # through: the caller advanced ``_current_etag``, called
+                # ``_record_success()``, logged ``dhcp_config_applied`` and
+                # stamped the readiness marker, all for a config that had
+                # been refused. Worse, the refused document was left at
+                # ``kea_config_path``, so the next container restart booted
+                # Kea straight into it. Raise so the caller reverts the
+                # files as well as the verdict.
+                raise ConfigApplyError(
+                    PHASE_RELOAD,
+                    RuntimeError(self._last_reload_error or "Kea rejected the config"),
+                )
+            # An UNREACHABLE socket is NOT a verdict on the config — Kea may
+            # simply be starting. daemon_status already says degraded; leave
+            # the rendered files in place so the next reload picks them up.
         # IPv6 Router Advertisements (issue #524) — write + reload the
         # managed radvd.conf the control plane rendered. No-op unless
         # RADVD_MANAGED=1; best-effort so a radvd failure never disturbs
@@ -339,6 +563,18 @@ class SyncLoop:
 
     def _poll_once(self) -> None:
         headers = {"Authorization": f"Bearer {self.token_ref[0]}"}
+        # #882 — a quarantined bundle is parked on a 304 by the etag we sent
+        # last time, so the only way to give it another attempt is to stop
+        # sending that etag. Dropping If-None-Match makes the server answer
+        # 200 with whatever it holds now: the corrected bundle if the operator
+        # has saved one, otherwise the same bundle for one more try.
+        if self._quarantine.retry_due():
+            log.info(
+                "sync_quarantine_retry_due",
+                etag=self._quarantine.etag,
+                failures=self._quarantine.failures,
+            )
+            self._current_etag = None
         if self._current_etag:
             headers["If-None-Match"] = self._current_etag
         try:
@@ -391,6 +627,14 @@ class SyncLoop:
             self._record_success()
             return
 
+        # #882 — the quarantine names ONE bundle. If the control plane is no
+        # longer serving it, the operator has saved something else and the
+        # record is moot: drop it now rather than let ``retry_due`` keep
+        # forcing If-None-Match off on every poll for a bundle that no
+        # longer exists.
+        if self._quarantine.etag is not None and etag != self._quarantine.etag:
+            self._quarantine.clear()
+
         save_config(self.cfg.state_dir, bundle, etag)
 
         # #170 Wave C1 — fleet-upgrade / reboot / SNMP / NTP trigger
@@ -402,14 +646,21 @@ class SyncLoop:
         # appliance_state module is the only producer of appliance-
         # host trigger files now.
 
-        try:
-            self._apply_bundle(bundle, reload_kea=True)
-        except Exception as e:
-            log.exception("sync_apply_failed")
-            self.heartbeat.daemon_status = {
-                "status": "degraded",
-                "reason": f"config_apply_failed: {e}",
-            }
+        if self._quarantine.blocks(etag):
+            # Already known-bad. Park on this etag so the long-poll blocks
+            # instead of re-rendering the same refused config every second.
+            log.info("sync_skipping_quarantined_bundle", etag=etag)
+            self._current_etag = etag
+            self._record_success()
+            return
+
+        if not self._apply_with_revert(bundle, etag):
+            # The bundle was refused. ``_current_etag`` still advances so the
+            # loop parks on a 304 rather than spinning; the quarantine
+            # decides when to try again. Deliberately no ``_record_success``
+            # / readiness marker: the control plane is reachable, but this
+            # server has NOT converged and must not look like it has.
+            self._current_etag = etag
             return
 
         self._current_etag = etag

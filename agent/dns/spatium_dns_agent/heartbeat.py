@@ -12,6 +12,7 @@ import structlog
 from . import __version__
 from .cache import save_token
 from .config import AgentConfig
+from .config_apply import ApplyStatus
 from .drivers.base import DriverBase
 
 log = structlog.get_logger(__name__)
@@ -30,6 +31,13 @@ class HeartbeatClient:
         self._stop = threading.Event()
         self.pending_acks: list[dict[str, Any]] = []
         self.daemon_status: dict[str, Any] = {}
+        # #882 — set by SyncLoop (which is constructed after this object and
+        # assigns itself in). Its ``as_dict()`` rides the heartbeat's
+        # ``config`` field so the control plane can tell a server that is up
+        # but running a REVERTED config apart from one that converged.
+        # Defaults to a healthy ApplyStatus so a heartbeat sent before the
+        # first sync doesn't report a failure that hasn't happened.
+        self.config_apply: ApplyStatus = ApplyStatus()
         self.failed_ops_count = 0
         # #638 — the driver is only used to probe the DNS daemon's version.
         # Optional so tests (and any caller that just wants liveness) can build
@@ -96,7 +104,10 @@ class HeartbeatClient:
             # plane must treat that as "unknown", never as a specific version.
             "daemon_version": self._daemon_version(),
             "daemon": self.daemon_status,
-            "config": {},
+            # #882 — last config-apply verdict. Before #882 this field was
+            # sent as a literal ``{}``: declared on the server's request
+            # model, accepted, and read by nothing.
+            "config": self.config_apply.as_dict(),
             "ops_ack": self.pending_acks,
             "failed_ops_count": self.failed_ops_count,
         }

@@ -426,6 +426,14 @@ class ServerResponse(BaseModel):
     # Per-server maintenance mode (issue #182).
     maintenance_mode: bool = False
     maintenance_started_at: datetime | None = None
+    # #882 — last config-apply verdict reported by the agent.
+    # ``ok`` / ``reverted`` / ``revert_failed`` / ``no_previous``; NULL when
+    # the agent has never reported (a pre-#882 agent, or an agentless driver
+    # with no apply loop). NULL means UNKNOWN, never "fine".
+    config_apply_status: str | None = None
+    config_apply_error: str | None = None
+    config_failed_etag: str | None = None
+    config_apply_at: datetime | None = None
     maintenance_reason: str | None = None
     created_at: datetime
     modified_at: datetime
@@ -458,6 +466,10 @@ class ServerResponse(BaseModel):
             is_primary=s.is_primary,
             maintenance_mode=s.maintenance_mode,
             maintenance_started_at=s.maintenance_started_at,
+            config_apply_status=s.config_apply_status,
+            config_apply_error=s.config_apply_error,
+            config_failed_etag=s.config_failed_etag,
+            config_apply_at=s.config_apply_at,
             maintenance_reason=s.maintenance_reason,
             created_at=s.created_at,
             modified_at=s.modified_at,

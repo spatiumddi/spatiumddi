@@ -671,10 +671,69 @@ suggestion, free-space treemap.
   zip's central directory is written last, so it needs a third-party
   writer — bounded by per-section + 48 MB caps instead) and a CLI
   fallback for a host that cannot serve HTTP.
-- ⬜ [**Agents never read the `previous.json` they write**](https://github.com/spatiumddi/spatiumddi/issues/882) —
-  both agents persist a last-known-good bundle and neither ever loads
-  it, so a bad config that passes validation but breaks the daemon has
-  no auto-revert. The file exists; the restore path does not.
+- ✅ [**Agents never read the `previous.json` they write**](https://github.com/spatiumddi/spatiumddi/issues/882)
+  — non-negotiable #5's cached config protects against a *dead* control
+  plane; this closes the other half, a *wrong* one. All three agents
+  (DNS / DHCP / looking-glass) gain `config_apply.py`: an `ApplyStatus`
+  reported on the heartbeat and a persisted `Quarantine` so a failed etag
+  is not re-applied every poll (the long-poll's 12 s wake tick + 2 s
+  fallback made a bad bundle a re-render *loop*, not one failure). The
+  agent parks on the failing etag — the long-poll then blocks on a 304,
+  costing nothing — and retries on a 60 s → 5 min → 15 min ladder so a
+  *transient* failure still self-heals.
+  **The rotation was the actual bug.** `previous.json` was written on
+  every *fetch*, so it meant "the bundle before this one", not "the last
+  one that worked" — identical only while every apply succeeds, which is
+  the case it does not exist for. Worse, it destroyed the fallback in two
+  poll cycles: a failing bundle leaves the etag unadvanced, so the next
+  poll re-fetches the *same* bundle and rotates it, now known-bad, over
+  the only good config on disk. `previous` is now written by an explicit
+  `commit_config` that **refuses to run if `current` is not the bundle
+  that applied**.
+  Apply is phased (render → validate → swap/reload) and the phase picks
+  the recovery: BIND validates into `rendered.new`, so a
+  `named-checkconf` failure never reached `named` and re-rendering would
+  bounce a healthy daemon to reach the state it is already in. Kea is the
+  mirror image — `config-test` rejects without touching the running
+  server, but the refused document is already at `kea_config_path`, which
+  is what Kea reads on its next start, so that one always rewrites the
+  files. Only Kea's *rejected* is a verdict about the config;
+  *socket-unreachable* is not, and reverting there would discard a good
+  bundle because Kea happened to be restarting.
+  **Four latent bugs found on the way, all of the "written, never read"
+  class the #899 audit named.** (1) `daemon` and `config` were declared
+  on the DNS + DHCP heartbeat request models and read by **neither
+  handler** — the degraded verdict agents already computed was discarded
+  at the door; the LG agent's `daemon_status` was set by its sync loop and
+  never even put on the wire. (2) A config **Kea refused** was reported as
+  a success: the loop advanced its etag, called `_record_success()`,
+  logged `dhcp_config_applied` and stamped the K8s readiness marker.
+  (3) `named-checkconf` writes its diagnostics — with the line number —
+  to **stdout**, and `validate()` read only stderr, so the error was
+  always the empty string `"named-checkconf failed: "`. Harmless while it
+  went nowhere; now it is the operator's only explanation. (4) The
+  supervisor audit the issue asked for: `maybe_fire_console_mode`
+  bypassed `_fire_host_config`, so the console-mode plane had none of
+  #387's protections — a failing `spatiumddi-verbose-boot-reload` left
+  the applied sidecar unchanged, the next heartbeat rewrote the trigger,
+  its rename re-fired the `.path` unit, and it repeated every ~30 s
+  forever with nothing said upward; that runner's three failure paths
+  also left the trigger in place (the #550 pattern, unfixed there).
+  Reporting matters more than it sounds: a reverted agent keeps serving
+  and keeps heartbeating, so `status`, the health check and `last_seen_at`
+  all read normal while the saved zone or scope is live nowhere. Verdict
+  → `{dns_server,dhcp_server,looking_glass_collector}.config_apply_*`
+  (migration `e9c2d47b1a63`, partial index on the failing states only),
+  a chip + detail banner, the default-**on** `agent_config_rejected` alert
+  rule (severity from the agent's own verdict — `reverted` is a warning,
+  `revert_failed` / `no_previous` critical), and 1 MCP tool
+  (`find_agents_with_config_failures`). NULL means UNKNOWN, never `ok` —
+  an agent too old to report is exactly where a silent revert would hide.
+  **Deferred:** the `tz-status` / `verbose-boot-status` sidecars carry a
+  failure *reason* nothing reads (`host_config_health` reports only that a
+  plane is unapplied); and `DNSServerOptions.allow_query` is interpolated
+  into `named.conf` unvalidated — a third instance of the #876/#899
+  class, used deliberately here as the E2E fault-injection lever.
 - ⬜ [**Config snapshots + rollback**](https://github.com/spatiumddi/spatiumddi/issues/883) — audit-log-driven revert
   of a single change plus scoped named snapshots. Distinct from #882,
   which is an agent-side safety net rather than an operator action.

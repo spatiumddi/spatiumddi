@@ -465,7 +465,9 @@ _TZ_TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/tz-pending")
 _TZ_APPLIED_HASH_FILE = Path("/var/lib/spatiumddi-host/release-state/tz-hash")
 # Verbose-boot console toggle. The runner flips a grubenv variable
 # (spatium_verbose) the grub.cfg menuentries read; trigger body is a single
-# "1" (standard Linux console) or "0" (quiet boot + dashboard).
+# "0" (quiet boot + dashboard), "1" (verbose boot + plain getty, no dashboard)
+# or "2" (verbose boot output, then the dashboard) — see
+# ``_CONSOLE_MODE_TO_GRUBENV``. It was binary until #393 added mode 2.
 _VERBOSE_TRIGGER_FILE = Path(
     "/var/lib/spatiumddi-host/release-state/verbose-boot-pending"
 )
@@ -960,6 +962,9 @@ _HOST_CONFIG_PLANES: list[tuple[str, Path, Path]] = [
     ("resolver", _RESOLVER_TRIGGER_FILE, _RESOLVER_HASH_SIDECAR),
     ("firewall", _FIREWALL_TRIGGER_FILE, _FIREWALL_APPLIED_HASH_SIDECAR),
     ("timezone", _TZ_TRIGGER_FILE, _TZ_APPLIED_HASH_FILE),
+    # #882 audit — was absent, so a console-mode apply that kept failing
+    # was invisible on the heartbeat while re-firing every tick.
+    ("console_mode", _VERBOSE_TRIGGER_FILE, _VERBOSE_APPLIED_FILE),
 ]
 
 
@@ -1353,20 +1358,36 @@ def maybe_fire_console_mode(desired_console_mode: str | None) -> bool:
     if detect_deployment_kind() != "appliance":
         return False
     desired = _CONSOLE_MODE_TO_GRUBENV.get(desired_console_mode or "dashboard", "0")
+    # #882 audit — fire through the shared bounded-retry guard, like every
+    # other host-config plane. This used to write the trigger directly, which
+    # meant it had none of the #387 protections: no trigger-presence check, no
+    # backoff, and no entry in ``_HOST_CONFIG_PLANES``. A runner that could not
+    # apply (no grubenv found, ``grub-editenv`` failing) left ``applied``
+    # unchanged, so the very next heartbeat rewrote the trigger, the .path unit
+    # fired on the rename, and the failure repeated every ~30 s indefinitely
+    # with nothing said upward — the silent re-fire flood the guard exists to
+    # prevent, on the one plane that never got it.
+    #
+    # The applied grubenv numeric plays the role of the applied-hash, exactly
+    # as ``maybe_fire_timezone`` uses the applied IANA name.
+    #
+    # The "already applied" test stays HERE rather than being left to
+    # ``_fire_host_config``: a missing sidecar means a fresh box, and a fresh
+    # box IS on mode 0 because the installer seeds
+    # ``grub-editenv … spatium_verbose=0``. ``_fire_host_config`` reads a
+    # missing sidecar as the empty string, which would never equal "0" — so
+    # delegating this check would make every fresh appliance fire a
+    # console-mode trigger on its first heartbeat to set the value it already
+    # has.
     try:
         applied = _VERBOSE_APPLIED_FILE.read_text(encoding="utf-8").strip()
     except OSError:
-        applied = "0"  # install seeds grubenv spatium_verbose=0 — default is live
+        applied = "0"
     if applied == desired:
         return False
-    try:
-        _VERBOSE_TRIGGER_FILE.parent.mkdir(parents=True, exist_ok=True)
-        tmp = _VERBOSE_TRIGGER_FILE.with_suffix(".new")
-        tmp.write_text(desired + "\n", encoding="utf-8")
-        tmp.replace(_VERBOSE_TRIGGER_FILE)
-        return True
-    except OSError:
-        return False
+    return _fire_host_config(
+        _VERBOSE_TRIGGER_FILE, _VERBOSE_APPLIED_FILE, desired, desired + "\n"
+    )
 
 
 def read_slot_versions() -> tuple[str | None, str | None]:

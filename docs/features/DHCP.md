@@ -619,6 +619,38 @@ The Kea daemon config file (JSON) is generated from this cache. On startup, the 
 - A manual "force resync" is available from the admin UI (`POST /api/v1/dhcp/servers/{id}/sync`)
 - Cache version is tracked; SpatiumDDI will reject applying a cache version older than the current DB version
 
+### Last-known-good revert (issue #882)
+
+The section above covers a control plane that is *unreachable*. It does not
+cover one that is *wrong* — a bundle that renders to a Kea config the daemon
+refuses.
+
+Two files back the fallback, under `config/` in the agent state dir:
+`previous.json` is the last bundle Kea **accepted** (not, as it used to be,
+whichever bundle came before this one — that rotation destroyed the fallback
+after two poll cycles), and `quarantine.json` records an etag whose apply
+failed so it is not re-rendered on every poll.
+
+Kea's `config-test` is what makes the distinction usable: a rejection is a
+verdict about the config, whereas an unreachable control socket says nothing
+about it — Kea may simply be restarting. Only a rejection reverts; reverting
+on an unreachable socket would discard a good bundle because of a timing
+accident.
+
+The revert rewrites the on-disk `kea-dhcp4.conf` / `kea-dhcp6.conf`, not just
+the agent's bookkeeping. `config-test` rejects *without* disturbing the
+running daemon, so Kea itself is fine either way — but the refused document
+has already been written to those paths, and that file is what Kea reads on
+its next start. Leaving it turns a rejected apply into a crash loop the next
+time the container restarts.
+
+Before #882 a refused config was reported as a **success**: the loop advanced
+its etag, called `_record_success()`, logged `dhcp_config_applied` and stamped
+the Kubernetes readiness marker. The agent now reports the verdict on its
+heartbeat (`config` field → `dhcp_server.config_apply_*`), which drives the
+server-row chip, the `agent_config_rejected` alert rule and the
+`find_agents_with_config_failures` Copilot tool.
+
 ---
 
 ## 7. DHCP ↔ IPAM Synchronization

@@ -11,9 +11,11 @@ Body shape matches
 ``AgentHeartbeatRequest``/``PeerStateReport`` EXACTLY — both carry
 ``model_config = ConfigDict(extra="forbid")``, so anything not in the
 allowed field set (a stray top-level ``pid``/``status``, say) 422s the
-*entire* heartbeat, not just the extra field. Only ``agent_version`` +
-``peers[]`` travel at the top level; each peer entry is restricted to
-``_PEER_STATE_FIELDS`` before being sent.
+*entire* heartbeat, not just the extra field. ``agent_version``, ``peers[]``
+and ``config`` (the #882 config-apply verdict) travel at the top level; each
+peer entry is restricted to ``_PEER_STATE_FIELDS`` before being sent. A new
+top-level field therefore has to be added to ``AgentHeartbeatRequest`` in
+the SAME change, or every heartbeat 422s.
 
 Note: ``rpki_invalid_count`` is never populated here even though
 ``PeerStateReport`` accepts it — RPKI validation is computed server-side
@@ -35,6 +37,7 @@ import structlog
 from . import __version__
 from .cache import save_token
 from .config import AgentConfig
+from .config_apply import ApplyStatus
 
 log = structlog.get_logger(__name__)
 
@@ -58,10 +61,15 @@ class HeartbeatClient:
         self.cfg = cfg
         self.token_ref = token_ref
         self._stop = threading.Event()
-        # Internal-only degraded-state note (e.g. set by SyncLoop on a
-        # render failure) — logged locally, NOT sent upstream (the real
-        # heartbeat schema has no room for it; see module docstring).
+        # Free-form degraded-state note (set by SyncLoop) — logged locally
+        # and not sent upstream; the structured half of the same signal now
+        # IS sent, as ``config_apply`` below (#882).
         self.daemon_status: dict[str, Any] = {}
+        # #882 — last config-apply verdict, assigned by SyncLoop (constructed
+        # after this object). Defaults to a healthy ApplyStatus so a
+        # heartbeat sent before the first sync doesn't report a failure that
+        # hasn't happened.
+        self.config_apply: ApplyStatus = ApplyStatus()
         # peer_id -> {session_state, uptime_started_at, prefixes_received,
         #             prefixes_accepted, last_state_change, last_flap_at}.
         # Written by RibPoller.
@@ -89,6 +97,11 @@ class HeartbeatClient:
         body: dict[str, Any] = {
             "agent_version": __version__,
             "peers": peers,
+            # #882 — whether the collector is running the peer set the
+            # operator saved, or a reverted one. Without this a revert is
+            # silent: the collector looks healthy while quietly peering on
+            # a config the control plane no longer believes is live.
+            "config": self.config_apply.as_dict(),
         }
         try:
             with self._client() as c:

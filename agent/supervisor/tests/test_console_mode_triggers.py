@@ -72,3 +72,65 @@ def test_non_appliance_no_op(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) ->
     )
     assert appliance_state.maybe_fire_console_mode("text_console") is False
     assert not (tmp_path / "verbose-boot-pending").exists()
+
+
+# ── #882 audit: the plane now rides the shared bounded-retry guard ────────
+#
+# Pre-#882 this writer bypassed ``_fire_host_config`` entirely, so it had
+# none of the #387 protections. A runner that could not apply left the
+# applied sidecar unchanged, and the next heartbeat rewrote the trigger —
+# whose rename re-fires the .path unit — so a failing console-mode apply
+# repeated every ~30 s forever, with nothing reported upward.
+
+
+@pytest.fixture
+def guarded(cm_paths: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """``cm_paths`` plus the plane registered for health reporting."""
+    monkeypatch.setattr(
+        appliance_state,
+        "_HOST_CONFIG_PLANES",
+        [
+            (
+                "console_mode",
+                cm_paths / "verbose-boot-pending",
+                cm_paths / "verbose-boot-applied",
+            )
+        ],
+    )
+    return cm_paths
+
+
+def test_does_not_stack_a_second_trigger(guarded: Path) -> None:
+    """An unconsumed trigger means the runner has not run yet."""
+    assert appliance_state.maybe_fire_console_mode("text_console") is True
+    # The trigger is still sitting there — do not rewrite it. The rewrite is
+    # what re-fired the .path unit on every heartbeat.
+    assert appliance_state.maybe_fire_console_mode("text_console") is False
+
+
+def test_failing_apply_backs_off_instead_of_flooding(guarded: Path) -> None:
+    """Simulate the runner failing: it consumes the trigger but never
+    updates the applied sidecar."""
+    fires = 0
+    for _ in range(10):
+        if appliance_state.maybe_fire_console_mode("text_console"):
+            fires += 1
+            (guarded / "verbose-boot-pending").unlink()  # runner consumed it
+    # Without the guard this fired 10/10. With it, the backoff window means
+    # only the first attempt goes out within the same instant.
+    assert fires == 1
+
+
+def test_failing_apply_is_reported_on_the_heartbeat(guarded: Path) -> None:
+    assert appliance_state.maybe_fire_console_mode("text_console") is True
+    (guarded / "verbose-boot-pending").unlink()  # runner ran and failed
+    health = appliance_state.read_host_config_health()
+    assert "console_mode" in health
+    assert health["console_mode"]["state"] in ("retrying", "failing")
+
+
+def test_successful_apply_clears_the_health_entry(guarded: Path) -> None:
+    assert appliance_state.maybe_fire_console_mode("text_console") is True
+    (guarded / "verbose-boot-pending").unlink()
+    (guarded / "verbose-boot-applied").write_text("1\n")  # runner succeeded
+    assert appliance_state.read_host_config_health() == {}

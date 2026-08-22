@@ -32,6 +32,7 @@ from app.core.agent_wake import (
 )
 from app.core.http_etag import etag_matches, format_etag
 from app.models.bgp_looking_glass import BGPLGPeer, LookingGlassCollector
+from app.services.agents.config_apply import apply_reported_status
 from app.services.looking_glass.agent_token import (
     hash_token,
     mint_agent_token,
@@ -100,6 +101,12 @@ class AgentHeartbeatRequest(BaseModel):
     # rejects at the field.
     agent_version: str | None = Field(default=None, max_length=64)
     peers: list[PeerStateReport] = Field(default_factory=list, max_length=5000)
+    # #882 — the agent's last config-apply verdict:
+    # ``{status, etag, failed_etag, phase, error}``. MUST be declared here:
+    # this model is extra="forbid", so an undeclared field would 422 every
+    # heartbeat from a current collector. Kept a loose dict for the same
+    # reason as the DNS/DHCP agents — see their AgentHeartbeatRequest.
+    config: dict[str, Any] = Field(default_factory=dict)
 
 
 class AgentHeartbeatResponse(BaseModel):
@@ -354,6 +361,13 @@ async def agent_heartbeat(
         collector.last_seen_ip = request.client.host
     if body.agent_version:
         collector.agent_version = body.agent_version
+
+    # #882 — the config-apply verdict. The collector's own SyncLoop has set a
+    # ``daemon_status`` since it was written and the heartbeat never carried
+    # it, so a peer set that failed to render was invisible from here.
+    apply_reported_status(
+        collector, body.config, agent_kind="looking_glass", server_id=str(collector.id)
+    )
 
     # Per-peer runtime state — only overwrite the columns the agent sent.
     for rep in body.peers:
