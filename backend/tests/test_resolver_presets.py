@@ -98,8 +98,12 @@ def test_a_presets_own_addresses_never_conflict() -> None:
 def test_mixing_two_upstreams_conflicts() -> None:
     conflict = find_forwarder_conflict(["1.1.1.1", "8.8.8.8"])
     assert conflict is not None
-    assert "cloudflare-dns.com" in conflict.hostnames
-    assert "dns.google" in conflict.hostnames
+    # Exact tuple, not membership: this also pins that the conflict reports
+    # exactly two names and that they come back sorted, which membership
+    # checks would let drift. (It also keeps CodeQL from reading
+    # ``"host.example" in x`` as URL-substring sanitisation — here ``x`` is
+    # a tuple, so ``in`` is element equality, but the shapes look alike.)
+    assert conflict.hostnames == ("cloudflare-dns.com", "dns.google")
 
 
 def test_mixing_variants_of_one_brand_conflicts() -> None:
