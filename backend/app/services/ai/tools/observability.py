@@ -18,9 +18,11 @@ open the UI":
   roll-ups from the ``dns_metric_sample`` / ``dhcp_metric_sample``
   tables (caps default to 24 buckets so payload stays compact).
 * ``global_search`` — cross-resource lookup matching the UI's
-  Cmd-K palette. Calls the same internal helpers
-  ``app.api.v1.search.router`` exposes; output is the same hit
-  shape (type / id / display / breadcrumb).
+  Cmd-K palette. Calls ``app.services.search.execute``, the same
+  entry point ``GET /api/v1/search`` uses, so it sees the same
+  twenty resource types and the same per-type permission filtering
+  (#879); output is the same hit shape (type / id / display /
+  breadcrumb).
 
 All read-only. No tool here is gated by a feature_module — log /
 metric / search surfaces are always-on platform infrastructure.
@@ -376,10 +378,12 @@ async def get_dhcp_lease_rate(
 
 # ── global_search ─────────────────────────────────────────────────────
 #
-# Reuses the helpers behind ``GET /api/v1/search`` so the tool's
-# response shape matches what the UI's Cmd-K palette returns. We
-# import lazily inside the tool body to avoid pulling the search
-# router's full FastAPI namespace on backend boot.
+# Delegates to ``app.services.search.execute`` — the same call
+# ``GET /api/v1/search`` makes. This tool previously re-implemented the
+# fan-out by reaching into the router's private ``_search_*`` helpers,
+# which meant it silently missed every resource type added to the HTTP
+# endpoint and, more seriously, none of the permission filtering: the
+# Copilot would happily read out DNS rows to an IPAM-only operator.
 
 
 class GlobalSearchArgs(BaseModel):
@@ -394,9 +398,11 @@ class GlobalSearchArgs(BaseModel):
     types: list[str] | None = Field(
         default=None,
         description=(
-            "Restrict to specific resource types. Allowed values: "
-            "ip_address, subnet, block, space, dns_group, dns_zone, "
-            "dns_record. Default returns matches across all types."
+            "Restrict to specific resource types, e.g. ip_address, subnet, "
+            "block, space, dns_zone, dns_record, dhcp_scope, "
+            "dhcp_reservation, vlan, device, site, circuit. Types the "
+            "caller may not read are ignored. Default searches every type "
+            "they are permitted to see."
         ),
     )
     limit: int = Field(default=25, ge=1, le=100)
@@ -419,43 +425,18 @@ class GlobalSearchArgs(BaseModel):
 async def global_search(
     db: AsyncSession, user: User, args: GlobalSearchArgs
 ) -> list[dict[str, Any]]:
-    # Lazy import — the router module pulls in FastAPI router glue on
-    # import; we only need the helpers.
-    from app.api.v1.search import router as search_router  # noqa: PLC0415
+    # Lazy import to keep the search service (and the twenty models it
+    # touches) off the tool-registry import path.
+    from app.services.search import execute as run_search  # noqa: PLC0415
 
-    requested = set(args.types) if args.types else None
-    per_type = max(args.limit, 10)
-    results: list[Any] = []
-
-    if not requested or "ip_address" in requested:
-        results.extend(await search_router._search_addresses(db, args.query, per_type))
-    if not requested or "subnet" in requested:
-        results.extend(await search_router._search_subnets(db, args.query, per_type))
-    if not requested or "block" in requested:
-        results.extend(await search_router._search_blocks(db, args.query, per_type))
-    if not requested or "space" in requested:
-        results.extend(await search_router._search_spaces(db, args.query, per_type))
-    if not requested or "dns_group" in requested:
-        results.extend(await search_router._search_dns_groups(db, args.query, per_type))
-    if not requested or "dns_zone" in requested:
-        results.extend(await search_router._search_dns_zones(db, args.query, per_type))
-    if not requested or "dns_record" in requested:
-        results.extend(await search_router._search_dns_records(db, args.query, per_type))
-    if not requested or requested & {"ip_address", "subnet", "block"}:
-        results.extend(await search_router._search_custom_fields(db, args.query, per_type))
-
-    # Dedup by (type, id) — the same row can hit multiple passes.
-    seen: set[tuple[str, str]] = set()
-    out: list[dict[str, Any]] = []
-    for r in results:
-        key = (r.type, r.id)
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(r.model_dump())
-        if len(out) >= args.limit:
-            break
-    return out
+    response = await run_search(
+        db,
+        user,
+        args.query,
+        types=set(args.types) if args.types else None,
+        limit=args.limit,
+    )
+    return [r.model_dump() for r in response.results]
 
 
 # Silence the false-positive "imported but unused" — ``or_`` is part
