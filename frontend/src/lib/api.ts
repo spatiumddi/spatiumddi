@@ -6060,6 +6060,8 @@ export interface DNSBlockList {
   update_interval_hours: number;
   block_mode: string;
   sinkhole_ip: string | null;
+  /** Whether feed-sourced entries block subdomains too (#894). */
+  feed_entries_are_wildcard: boolean;
   enabled: boolean;
   last_synced_at: string | null;
   last_sync_status: string | null;
@@ -6106,6 +6108,8 @@ export interface BlocklistCatalogSource {
   license: string;
   homepage: string | null;
   recommended: boolean;
+  /** Whether this feed's entries should block subdomains (#894). */
+  entries_are_wildcard: boolean;
 }
 
 /** One provider's rewrite set inside a template (issue #878). */

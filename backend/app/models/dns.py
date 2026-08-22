@@ -1216,6 +1216,19 @@ class DNSBlockList(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # block_mode: nxdomain | sinkhole | refused
     block_mode: Mapped[str] = mapped_column(String(20), nullable=False, default="nxdomain")
     sinkhole_ip: Mapped[str | None] = mapped_column(String(45), nullable=True)
+    # Whether a feed-sourced entry blocks the named domain's SUBDOMAINS too
+    # (#894). Default on, because that is what every one of these feeds
+    # means — a list naming ``tracker.example`` intends
+    # ``cdn.tracker.example`` as well, and the manual add-entry form has
+    # always defaulted the same way. Off suits a host-specific feed (a
+    # threat-intel drop of individual C2 FQDNs), where blocking the parent
+    # domain would be over-blocking.
+    #
+    # Only feed entries consult it; a manual entry's ``is_wildcard`` is the
+    # operator's own per-row choice and is never rewritten by this flag.
+    feed_entries_are_wildcard: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=sa_text("true")
+    )
 
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
