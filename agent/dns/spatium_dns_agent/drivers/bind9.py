@@ -231,7 +231,7 @@ def _render_update_policy(zone: dict[str, Any], group_key_name: str | None) -> s
     return f'update-policy {{ {" ".join(lines)} }}; '
 
 
-def _redirect_rdata(target: str) -> str:
+def _redirect_rdata(target: str) -> str | None:
     """RPZ local-data for a ``redirect`` entry, chosen by target kind.
 
     A redirect target is "the IP or hostname to return instead", and the
@@ -241,6 +241,16 @@ def _redirect_rdata(target: str) -> str:
     silently resolves to nothing — the failure mode is invisible until
     someone queries the domain.
 
+    Returns None for a target that cannot be a domain name, so the
+    caller can drop the entry. ``target`` is free-form on the API and
+    reaches here unvalidated; whitespace would split the rdata into
+    extra fields and an empty label is malformed, and either makes BIND
+    refuse the whole zone rather than just that record. Same
+    defend-at-the-render-boundary reasoning as ``strip_control_chars``
+    on the domain side (#597). Note that odd-but-parseable targets — a
+    pasted URL, ``host:8080`` — do load, so they are left alone here
+    rather than second-guessed.
+
     Used by SafeSearch enforcement (#878), whose targets are hostnames,
     and by any operator redirect pointing at a sinkhole web server.
     """
@@ -248,7 +258,10 @@ def _redirect_rdata(target: str) -> str:
     try:
         ip = ipaddress.ip_address(text)
     except ValueError:
-        return f"CNAME {text.rstrip('.')}."
+        name = text.rstrip(".")
+        if not name or any(c.isspace() for c in name) or ".." in name:
+            return None
+        return f"CNAME {name}."
     return f"{'AAAA' if ip.version == 6 else 'A'} {ip}"
 
 
@@ -1102,6 +1115,21 @@ class Bind9Driver(DriverBase):
         Wildcard entries are emitted as `*.<domain>` *in addition to* the
         bare name, because an RPZ wildcard matches subdomains only — a
         `*.example.com`-only rule leaves the apex resolving normally.
+
+        Every owner name is emitted at most once. Two CNAMEs at one owner
+        is a "multiple RRs of singleton type" error, and BIND then refuses
+        the ENTIRE zone — so one bad pair silently disables every other
+        entry. Two ways that happens, both ordinary rather than exotic:
+
+          - a domain that is both an entry and an exception (which is
+            what an exception is *for*);
+          - the same domain in two assigned lists whose ``block_mode``
+            differs, e.g. overlapping NSFW feeds where one is set to
+            sinkhole. The effective blocklist concatenates lists without
+            deduping, so this reaches the renderer intact.
+
+        Nothing upstream catches it: ``validate()`` runs named-checkconf,
+        which does not read zone files.
         """
         path.parent.mkdir(parents=True, exist_ok=True)
         zname = bl["rpz_zone_name"]
@@ -1110,28 +1138,96 @@ class Bind9Driver(DriverBase):
             "@ IN SOA localhost. root.localhost. ( 1 3600 600 86400 60 )",
             "@ IN NS localhost.",
         ]
+        # Exceptions are emitted as passthru below, so an entry for the
+        # same name must not also be emitted. Matches the control-plane
+        # renderer, which already skips excluded domains.
+        excluded = {str(x).rstrip(".").lower() for x in (bl.get("exceptions") or []) if x}
+        # First writer of an owner name wins. The choice between two
+        # disagreeing lists is arbitrary — what is NOT arbitrary is that
+        # the zone must load, since the alternative is enforcing nothing
+        # at all. Collisions are logged so the operator can reconcile the
+        # lists rather than wonder which one is in effect.
+        seen: dict[str, str] = {}
+        collisions: list[str] = []
+        bad_targets: list[str] = []
         for e in bl.get("entries") or []:
             domain = e["domain"].rstrip(".")
+            key = domain.lower()
+            if key in excluded:
+                continue
             action = e.get("action") or "block"
             block_mode = e.get("block_mode") or "nxdomain"
             is_wildcard = bool(e.get("is_wildcard"))
             target = e.get("target")
             if action == "redirect" and target:
-                rdata = _redirect_rdata(str(target))
+                # An unusable target means the rewrite cannot be expressed.
+                # Dropping the entry is the honest outcome — a redirect is
+                # a rewrite, so not rewriting is the same as no rule, while
+                # substituting a block would invent policy the operator
+                # never asked for.
+                rewrite = _redirect_rdata(str(target))
+                if rewrite is None:
+                    bad_targets.append(domain)
+                    continue
+                rdata = rewrite
             elif block_mode == "sinkhole":
                 rdata = "CNAME rpz-drop."
             else:  # default: nxdomain
                 rdata = "CNAME ."
+            if key in seen:
+                # An identical repeat is harmless duplication (BIND loads
+                # it); only a differing one would have killed the zone.
+                if seen[key] != rdata:
+                    collisions.append(domain)
+                continue
+            seen[key] = rdata
             lines.append(f"{domain} {rdata}")
             if is_wildcard:
                 lines.append(f"*.{domain} {rdata}")
-        # Exceptions → passthrough (never blocked even if a broader rule matches).
+        # Exceptions → passthrough (never blocked even if a broader rule
+        # matches). Deduped on the same lowercased key so two spellings of
+        # one name cannot land twice either.
+        emitted_exceptions: set[str] = set()
         for exc in bl.get("exceptions") or []:
-            d = exc.rstrip(".")
+            d = str(exc).rstrip(".")
+            if not d or d.lower() in emitted_exceptions:
+                continue
+            emitted_exceptions.add(d.lower())
             lines.append(f"{d} CNAME rpz-passthru.")
             lines.append(f"*.{d} CNAME rpz-passthru.")
         path.write_text("\n".join(lines) + "\n")
-        log.info("bind9_rpz_written", zone=zname, entries=len(bl.get("entries") or []))
+        if bad_targets:
+            log.warning(
+                "bind9_rpz_redirect_target_unusable",
+                zone=zname,
+                count=len(bad_targets),
+                sample=sorted(set(bad_targets))[:5],
+                detail=(
+                    "A redirect entry's target cannot be a domain name "
+                    "(whitespace or an empty label). Those entries were "
+                    "dropped; rendering them would make BIND reject the "
+                    "whole zone."
+                ),
+            )
+        if collisions:
+            log.warning(
+                "bind9_rpz_entry_collision",
+                zone=zname,
+                count=len(collisions),
+                sample=sorted(set(collisions))[:5],
+                detail=(
+                    "The same domain appears in two assigned blocklists with "
+                    "different block modes. The first was rendered and the "
+                    "rest ignored — emitting both would put two CNAMEs on one "
+                    "owner name, which makes BIND reject the whole zone."
+                ),
+            )
+        log.info(
+            "bind9_rpz_written",
+            zone=zname,
+            entries=len(bl.get("entries") or []),
+            owners=len(seen),
+        )
 
     def validate(self) -> None:
         new_dir = self.state_dir / "rendered.new"

@@ -730,6 +730,33 @@ letting one silently win.
   rewriting is by definition answer tampering). The agent handles this
   automatically; it is why a filtered group cannot also validate.
 
+#### Sizing
+
+Feed-sourced entries block the named domain *and* its subdomains, which
+takes two RPZ records each (`example.com` and `*.example.com`) — an RPZ
+wildcard matches subdomains only, so the bare name is not redundant.
+Budget roughly **two records per feed entry**:
+
+| Profile feed | Entries | RPZ records |
+|---|---|---|
+| Hagezi Gambling | ~464 k | ~928 k |
+| Hagezi NSFW | ~115 k | ~230 k |
+| Hagezi DoH / VPN / Proxy Bypass | ~17 k | ~33 k |
+| Hagezi No-SafeSearch | ~205 | ~410 |
+| **Family filter total** | **~596 k** | **~1.2 M** |
+
+BIND holds the whole zone in memory. Gambling is by far the largest —
+drop it, or swap it for the `gambling.medium` / `gambling.mini` variants
+Hagezi publishes, if the appliance is memory-constrained. The
+utilization is visible per list as **Entries** on the Blocklists tab.
+
+One caveat on overlapping lists: if the same domain appears in two
+assigned lists with **different block modes**, only the first is
+rendered and the agent logs `bind9_rpz_entry_collision`. Emitting both
+would put two CNAMEs on one owner name, which makes BIND refuse the
+entire zone — so the renderer picks one rather than enforcing nothing.
+Reconcile the lists if you see that warning.
+
 ---
 
 ## 9. DNS UI Features

@@ -667,7 +667,10 @@ async def _materialise_template(
         category=template.category,
         source_type="manual",
         feed_url=None,
-        # No feed to refresh — 0 keeps the scheduled sweep from picking it up.
+        # There is no feed to refresh, so the cadence is meaningless here;
+        # 0 says so rather than advertising a 24 h refresh that can never
+        # happen. (Feed refresh is enqueue-driven today — subscribe and the
+        # explicit /refresh button — so nothing polls this field yet.)
         update_interval_hours=0,
         block_mode=block_mode or template.block_mode,
         enabled=enabled,
@@ -751,7 +754,9 @@ class AppliedItem(BaseModel):
     catalog_id: str
     name: str
     list_id: uuid.UUID | None = None
-    # "created" | "skipped_existing"
+    # "created" | "skipped_existing" | "skipped_missing"
+    # (``skipped_missing`` = the profile names a catalog id this release
+    # does not ship — a packaging bug, reported rather than raised.)
     status: str
 
 

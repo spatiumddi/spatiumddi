@@ -490,20 +490,38 @@ suggestion, free-space treemap.
   Hagezi entries were **dead** (`hosts/` retired upstream, and one was
   `recommended: true`) and are repointed. Applying a profile assigns to
   nothing — auto-scoping would filter the server VLAN too.
-  **Three latent bugs fixed on the way**, each of which made the feature
-  wrong rather than merely absent: (1) the two RPZ renderers disagreed
-  about `redirect` — the agent emitted `CNAME <target>`, the
+  **Six latent bugs fixed on the way**, each of which made the feature
+  wrong rather than merely absent. Three about **RPZ zone validity** —
+  and note the shared blast radius: BIND rejects a malformed zone
+  *whole*, so any one of these silently stopped every other entry being
+  enforced, and nothing caught it because `validate()` runs
+  `named-checkconf`, which never reads zone files. (1) the two renderers
+  disagreed about `redirect` — the agent emitted `CNAME <target>`, the
   control-plane driver `IN A <target>` — so a hostname target produced
-  rdata BIND rejects, taking the *whole* blocklist offline, not one
-  entry; both now branch on IP-vs-hostname; (2) Technitium routed
+  rdata BIND rejects; both now branch on IP-vs-hostname. (2) the agent
+  renderer never filtered entries against `exceptions` (the
+  control-plane one did), so excepting a domain a feed lists — *the
+  entire point of an exception* — put a block CNAME and a passthru CNAME
+  on one owner name. (3) nothing deduped owner names, so one domain in
+  two assigned lists with different `block_mode`s did the same; the
+  Family filter ships four overlapping Hagezi feeds (146 shared domains
+  measured) so this went from hand-assembled to one setting away. Both
+  renderers now emit each owner once, first writer wins, and log the
+  collision. Verified against `named-checkzone`: identical duplicates
+  load, differing ones do not. Plus (4) Technitium routed
   `action="redirect"` into its **allow** set, silently inverting a
   SafeSearch rule into an exemption — now skipped with a warning, since
-  its native blocking has no per-domain rewrite; (3) feed-sourced
+  its native blocking has no per-domain rewrite; (5) feed-sourced
   entries never set `is_wildcard`, so every subscribed list blocked
   apexes only and `www.<blocked>` resolved fine — now on, matching the
   manual add-entry default, with migration `b7e4a1c56d93` backfilling
-  existing rows. `parse_feed` also strips the `*.` prefix OISD and
-  Hagezi publish. 1 MCP tool (`list_blocklist_templates`). BIND9-only,
+  existing rows (`parse_feed` also strips the `*.` prefix OISD and
+  Hagezi publish); (6) `entry_count` double-counted on a first sync,
+  because the recount query autoflushes the pending inserts and the old
+  code added `len(to_add)` on top — a 16k-domain feed reported 33k.
+  Sizing consequence of (5), documented in DNS.md: two RPZ records per
+  feed entry, so the Family filter's ~596k entries render ~1.2M records.
+  1 MCP tool (`list_blocklist_templates`). BIND9-only,
   and [`docs/features/DNS.md` §8.1](docs/features/DNS.md) is explicit
   that DNS filtering is bypassable at all.
 

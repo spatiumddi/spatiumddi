@@ -127,20 +127,28 @@ def _allow_transfer_items(allow_transfer: Any, tsig_keys: Any) -> list[str]:
 _UPDATE_POLICY_NAMED_SCOPES = frozenset({"subdomain", "name", "wildcard", "self"})
 
 
-def _redirect_rdata(target: str) -> str:
+def _redirect_rdata(target: str) -> str | None:
     """RPZ local-data for a ``redirect`` entry, chosen by target kind.
 
     An IP target answers with a literal address; a hostname target
-    answers with a CNAME. Mirrors ``_redirect_rdata`` in the DNS agent's
-    BIND9 driver — the agent renders RPZ in production, this renderer
-    backs the driver ABC, and a disagreement between them means the two
-    would enforce different policy from the same rows.
+    answers with a CNAME. None means the target cannot be a domain name
+    at all — whitespace splits the rdata into extra fields, an empty
+    label is malformed — and either makes BIND refuse the whole zone, so
+    the caller drops the entry.
+
+    Mirrors ``_redirect_rdata`` in the DNS agent's BIND9 driver — the
+    agent renders RPZ in production, this renderer backs the driver ABC,
+    and a disagreement between them means the two would enforce
+    different policy from the same rows.
     """
     text = str(target).strip()
     try:
         ip = ipaddress.ip_address(text)
     except ValueError:
-        return f"CNAME {strip_control_chars(text.rstrip('.'))}."
+        name = strip_control_chars(text.rstrip("."))
+        if not name or any(c.isspace() for c in name) or ".." in name:
+            return None
+        return f"CNAME {name}."
     return f"{'AAAA' if ip.version == 6 else 'A'} {ip}"
 
 
@@ -283,13 +291,19 @@ class BIND9Driver(DNSDriver):
 
         rendered: list[str] = []
         excluded = {d.lower() for d in blocklist.exceptions}
+        # One record per owner name, first writer wins. Two CNAMEs at one
+        # owner is "multiple RRs of singleton type" and BIND then refuses
+        # the ENTIRE zone, so a single collision disables every other
+        # entry. The effective blocklist concatenates assigned lists
+        # without deduping, so overlapping feeds with different block
+        # modes reach here intact. Mirrors the agent renderer.
+        seen: set[str] = set()
         for e in blocklist.entries:
             # Feed-sourced domains are untrusted; neutralize control chars
             # so a malformed feed entry can't inject a zone-file line (#597).
             dom = strip_control_chars(e.domain.lower().rstrip("."))
-            if dom in excluded:
+            if dom in excluded or dom in seen:
                 continue
-            rpz_name = f"*.{dom}" if e.is_wildcard else dom
             if e.action == "redirect" and e.target:
                 # An IP target is an A/AAAA; a hostname target is a CNAME.
                 # Assuming A unconditionally emitted invalid rdata for the
@@ -298,13 +312,34 @@ class BIND9Driver(DNSDriver):
                 # not just the one entry. Kept identical to the agent-side
                 # renderer in ``agent/dns/.../drivers/bind9.py``; the two
                 # implement the same contract and must not diverge.
-                rendered.append(f"{rpz_name} IN {_redirect_rdata(e.target)}")
+                #
+                # A target that cannot be a name at all means the rewrite
+                # is not expressible; drop the entry rather than render
+                # rdata BIND rejects. A redirect IS a rewrite, so not
+                # rewriting is the same as no rule — substituting a block
+                # would invent policy the operator never asked for. The
+                # owner name is left unclaimed so a later entry for the
+                # same domain can still render.
+                rewrite = _redirect_rdata(e.target)
+                if rewrite is None:
+                    continue
+                rdata = rewrite
             elif e.block_mode == "sinkhole" and e.sinkhole_ip:
-                rendered.append(f"{rpz_name} IN A {e.sinkhole_ip}")
+                rdata = f"A {e.sinkhole_ip}"
             elif e.block_mode == "refused":
-                rendered.append(f"{rpz_name} IN CNAME rpz-drop.")
+                rdata = "CNAME rpz-drop."
             else:  # nxdomain (default)
-                rendered.append(f"{rpz_name} IN CNAME .")
+                rdata = "CNAME ."
+            # A wildcard entry emits `*.<domain>` *in addition to* the bare
+            # name: an RPZ wildcard matches subdomains ONLY, so a
+            # `*.example.com`-only rule leaves the apex resolving. Same two
+            # lines the agent renderer emits — since #878 every feed-sourced
+            # row is wildcard, so emitting only the star would stop blocking
+            # the very domain the feed names.
+            seen.add(dom)
+            rendered.append(f"{dom} IN {rdata}")
+            if e.is_wildcard:
+                rendered.append(f"*.{dom} IN {rdata}")
 
         # Fixed SOA serial derived from blocklist size keeps this deterministic.
         serial = max(1, len(blocklist.entries))

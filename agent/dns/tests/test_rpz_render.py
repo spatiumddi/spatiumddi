@@ -123,6 +123,37 @@ def test_exceptions_render_as_passthru(tmp_path: Path) -> None:
     ]
 
 
+def test_an_excepted_entry_is_not_also_emitted_as_a_block(tmp_path: Path) -> None:
+    """Un-blocking a domain a feed lists is what exceptions are FOR.
+
+    Emitting the block line and the passthru line puts two CNAMEs on one
+    owner name; BIND rejects the zone outright ("multiple RRs of
+    singleton type") and every other entry stops being enforced with it.
+    ``validate()`` runs named-checkconf, which does not read zone files,
+    so nothing catches it before the reload.
+    """
+    lines = _render(
+        tmp_path,
+        [
+            {"domain": "ads.example.test", "action": "block",
+             "block_mode": "nxdomain", "is_wildcard": True},
+            {"domain": "keep.example.test", "action": "block",
+             "block_mode": "nxdomain"},
+        ],
+        ["ADS.example.test"],
+    )
+    # Matched case-insensitively — DNS names are, so `ADS` and `ads` are
+    # the same owner and would collide just the same.
+    assert lines == [
+        "keep.example.test CNAME .",
+        "ADS.example.test CNAME rpz-passthru.",
+        "*.ADS.example.test CNAME rpz-passthru.",
+    ]
+    # No owner name carries two different rdata.
+    owners = [line.split(" ", 1)[0].lower() for line in lines]
+    assert len(owners) == len(set(owners))
+
+
 def test_redirect_target_trailing_dot_is_not_doubled(tmp_path: Path) -> None:
     lines = _render(
         tmp_path,
@@ -130,3 +161,114 @@ def test_redirect_target_trailing_dot_is_not_doubled(tmp_path: Path) -> None:
           "block_mode": "nxdomain", "target": "safe.example.test."}],
     )
     assert lines == ["a.example.test CNAME safe.example.test."]
+
+
+def test_one_domain_in_two_lists_emits_one_owner(tmp_path: Path) -> None:
+    """Overlapping feeds with different block modes must not kill the zone.
+
+    The effective blocklist concatenates every assigned list without
+    deduping, so a domain in two of them arrives twice. If their block
+    modes differ the two lines carry different rdata, and BIND answers
+    "multiple RRs of singleton type" by refusing the WHOLE zone — every
+    other entry stops being enforced with it. Verified against
+    named-checkzone: identical duplicates load fine, differing ones do
+    not.
+
+    The Family filter (#878) subscribes to four overlapping Hagezi feeds
+    in one click, so this went from something you had to assemble by
+    hand to one `block_mode` change away.
+    """
+    lines = _render(
+        tmp_path,
+        [
+            {"domain": "both.example.test", "action": "block",
+             "block_mode": "nxdomain"},
+            {"domain": "both.example.test", "action": "block",
+             "block_mode": "sinkhole"},
+            {"domain": "only.example.test", "action": "block",
+             "block_mode": "nxdomain"},
+        ],
+    )
+    # First writer wins; the later, differing one is dropped.
+    assert lines == [
+        "both.example.test CNAME .",
+        "only.example.test CNAME .",
+    ]
+
+
+def test_duplicate_owner_check_is_case_insensitive(tmp_path: Path) -> None:
+    """DNS names are case-insensitive, so `ADS.x` and `ads.x` are one
+    owner and would collide exactly as a same-case pair would."""
+    lines = _render(
+        tmp_path,
+        [
+            {"domain": "Dup.example.test", "action": "block",
+             "block_mode": "nxdomain"},
+            {"domain": "dup.EXAMPLE.test", "action": "block",
+             "block_mode": "sinkhole"},
+        ],
+    )
+    assert lines == ["Dup.example.test CNAME ."]
+
+
+def test_no_owner_name_is_ever_emitted_twice(tmp_path: Path) -> None:
+    """The invariant the two tests above are instances of."""
+    lines = _render(
+        tmp_path,
+        [
+            {"domain": "a.example.test", "action": "block",
+             "block_mode": "nxdomain", "is_wildcard": True},
+            {"domain": "A.example.test", "action": "block",
+             "block_mode": "sinkhole"},
+            {"domain": "b.example.test", "action": "block",
+             "block_mode": "nxdomain"},
+            {"domain": "exc.example.test", "action": "block",
+             "block_mode": "nxdomain"},
+        ],
+        ["exc.example.test", "EXC.example.test"],
+    )
+    owners = [line.split(" ", 1)[0].lower() for line in lines]
+    assert len(owners) == len(set(owners)), owners
+
+
+def test_a_redirect_target_that_cannot_be_a_name_is_dropped(tmp_path: Path) -> None:
+    """``target`` is free-form on the API and reaches the renderer raw.
+
+    Whitespace splits the rdata into extra fields and an empty label is
+    malformed; either makes BIND reject the whole zone, so the entry is
+    dropped instead. Confirmed against named-checkzone — note that
+    odd-but-parseable targets (a pasted URL, ``host:8080``) DO load, so
+    they are deliberately left alone rather than second-guessed.
+    """
+    lines = _render(
+        tmp_path,
+        [
+            {"domain": "space.example.test", "action": "redirect",
+             "block_mode": "nxdomain", "target": "a b.example.test"},
+            {"domain": "empty.example.test", "action": "redirect",
+             "block_mode": "nxdomain", "target": "..."},
+            {"domain": "url.example.test", "action": "redirect",
+             "block_mode": "nxdomain", "target": "http://sink.example.test/"},
+            {"domain": "ok.example.test", "action": "redirect",
+             "block_mode": "nxdomain", "target": "safe.example.test"},
+        ],
+    )
+    assert lines == [
+        "url.example.test CNAME http://sink.example.test/.",
+        "ok.example.test CNAME safe.example.test.",
+    ]
+
+
+def test_a_dropped_redirect_leaves_the_owner_free(tmp_path: Path) -> None:
+    """Dropping the unusable entry must not also suppress a later, valid
+    entry for the same domain — the owner name was never emitted."""
+    lines = _render(
+        tmp_path,
+        [
+            {"domain": "dup.example.test", "action": "redirect",
+             "block_mode": "nxdomain", "target": "a b.example.test"},
+            {"domain": "dup.example.test", "action": "block",
+             "block_mode": "nxdomain"},
+        ],
+    )
+    assert lines == ["dup.example.test CNAME ."]

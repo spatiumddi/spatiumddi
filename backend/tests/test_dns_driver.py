@@ -506,6 +506,77 @@ def test_render_rpz_redirect_to_hostname_is_a_cname() -> None:
     assert "v6.example.com IN AAAA 2001:db8::1" in out
 
 
+def test_render_rpz_wildcard_covers_the_apex_too() -> None:
+    """An RPZ wildcard matches subdomains ONLY.
+
+    Since #878 every feed-sourced row carries ``is_wildcard=True``, so
+    emitting just ``*.ads.example.com`` would stop blocking the very
+    domain the feed names. Both lines are required, and the agent-side
+    renderer emits exactly the same pair — the two must not diverge.
+    """
+    bl = EffectiveBlocklistData(
+        rpz_zone_name="spatium-blocklist.rpz.",
+        entries=(
+            BlocklistEntry(
+                domain="ads.example.com",
+                action="block",
+                block_mode="nxdomain",
+                sinkhole_ip=None,
+                target=None,
+                is_wildcard=True,
+            ),
+        ),
+        exceptions=frozenset(),
+    )
+    out = BIND9Driver().render_rpz_zone(bl)
+    assert "ads.example.com IN CNAME ." in out
+    assert "*.ads.example.com IN CNAME ." in out
+
+
+def test_render_rpz_emits_each_owner_name_once() -> None:
+    """Overlapping lists must not produce two CNAMEs at one owner.
+
+    BIND answers that with "multiple RRs of singleton type" and refuses
+    the ENTIRE zone, so one collision stops every other entry being
+    enforced. The effective blocklist concatenates assigned lists
+    without deduping, so a domain in two of them — with different block
+    modes, e.g. one list switched to sinkhole — arrives here as two
+    entries carrying different rdata. Verified against named-checkzone:
+    identical duplicates load, differing ones do not.
+    """
+
+    def _entry(domain: str, mode: str) -> BlocklistEntry:
+        return BlocklistEntry(
+            domain=domain,
+            action="block",
+            block_mode=mode,
+            sinkhole_ip="10.0.0.250" if mode == "sinkhole" else None,
+            target=None,
+            is_wildcard=True,
+        )
+
+    bl = EffectiveBlocklistData(
+        rpz_zone_name="spatium-blocklist.rpz.",
+        entries=(
+            _entry("both.example.com", "nxdomain"),
+            _entry("both.example.com", "sinkhole"),
+            # Case difference is not a different owner — DNS names are
+            # case-insensitive, so this would collide just the same.
+            _entry("BOTH.example.com", "refused"),
+            _entry("only.example.com", "nxdomain"),
+        ),
+        exceptions=frozenset(),
+    )
+    out = BIND9Driver().render_rpz_zone(bl)
+    owners = [line.split(" ", 1)[0].lower() for line in out.splitlines() if " IN " in line]
+    blocklist_owners = [o for o in owners if o.endswith("example.com")]
+    assert len(blocklist_owners) == len(set(blocklist_owners)), blocklist_owners
+    # First writer wins, so the sinkhole/refused repeats are dropped.
+    assert "both.example.com IN CNAME ." in out
+    assert "A 10.0.0.250" not in out
+    assert "rpz-drop" not in out
+
+
 # ── Serial bumping ────────────────────────────────────────────────────────
 
 
