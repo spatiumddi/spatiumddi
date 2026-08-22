@@ -87,7 +87,13 @@ class ImportedZoneOut(BaseModel):
     name: str
     zone_type: str
     kind: str
-    soa: ImportedSOAOut | None
+    # Defaulted, unlike its annotation alone would suggest, because this model
+    # is BOTH the preview response and the commit request payload (see
+    # ``PreviewOut``). Without a default pydantic makes the key mandatory on
+    # the way in, so the published contract had to say "required" — and a
+    # generated client then cannot express the null a zone with no SOA
+    # legitimately carries. Handled as None everywhere it is read (#907).
+    soa: ImportedSOAOut | None = None
     records: list[ImportedRecordOut]
     view_name: str | None = None
     forwarders: list[str] = Field(default_factory=list)

@@ -25,6 +25,13 @@ stamped with a version that never changes, which defeats pinning entirely.
 compose file and the release workflow both already set), and ``--version``
 here sets it explicitly.
 
+**It carries the generator normalisations.** That same wrapper also rewrites
+OpenAPI 3.1's ``anyOf: [X, {"type": "null"}]`` nullable idiom, which strict
+generators answer by dropping the whole property from the generated type —
+3,291 schema properties and 297 query parameters, silently, on this document
+(#907). A dump that bypasses ``app.openapi()`` publishes a contract whose
+clients are missing a third of every model.
+
 **It does not inherit operator branding.** ``info.title`` comes from
 ``settings.app_title``, which is operator-settable (#886/#888) — exporting on
 a branded install would otherwise publish "Acme DDI" as the name of the

@@ -17,7 +17,12 @@ router = APIRouter(dependencies=[Depends(require_permission("read", "audit_log")
 
 class AuditLogResponse(BaseModel):
     id: str
-    timestamp: str
+    # A real ``datetime``, not a pre-formatted string (#907). Typed as ``str``
+    # it published as a bare ``type: string`` with no ``format: date-time`` —
+    # so a generated client read the API's most audit-relevant timestamp as
+    # text — and it went out in ``isoformat()``'s six-digit ``+00:00`` shape
+    # while every other timestamp in the API is millisecond ``Z``.
+    timestamp: datetime
     user_display_name: str
     auth_source: str
     action: str
@@ -32,13 +37,6 @@ class AuditLogResponse(BaseModel):
     @field_validator("id", mode="before")
     @classmethod
     def coerce_id(cls, v: object) -> str:
-        return str(v)
-
-    @field_validator("timestamp", mode="before")
-    @classmethod
-    def coerce_ts(cls, v: object) -> str:
-        if isinstance(v, datetime):
-            return v.isoformat()
         return str(v)
 
 

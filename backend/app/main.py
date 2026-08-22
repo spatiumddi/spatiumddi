@@ -15,6 +15,7 @@ from app.api.health import router as health_router
 from app.api.v1.router import api_v1_router
 from app.config import settings
 from app.core.maintenance_mode import MaintenanceModeMiddleware
+from app.core.openapi_compat import collapse_nullable_unions
 from app.log import configure_logging
 from app.metrics import PrometheusMiddleware, metrics_endpoint
 
@@ -1060,15 +1061,31 @@ def create_app() -> FastAPI:
     # schema would break clients outside this repo in order to fix what is a
     # documentation defect.
     #
+    # The wrapper below carries a second rewrite too (#907, nullable unions);
+    # both exist for the same reason — the document is generated FOR consumers
+    # we do not control, so a defect in it breaks a client somewhere else with
+    # no local symptom.
+    #
     # Wraps FastAPI's own ``openapi()`` rather than re-deriving the document
     # with ``get_openapi``, so every generation setting the app carries
     # (webhooks, separate input/output schemas, servers) keeps applying. That
     # call caches into ``app.openapi_schema`` and returns the cached object, so
-    # this patches in place — the ``anyOf`` guard keeps it idempotent.
+    # this patches it in place, once.
     _generate_openapi = app.openapi
+    _normalised: dict | None = None
 
-    def _openapi_with_string_validation_detail() -> dict:
+    def _openapi_for_generators() -> dict:
+        nonlocal _normalised
+
         schema = _generate_openapi()
+        # ``_generate_openapi`` caches into ``app.openapi_schema`` and hands
+        # back the same object every time, so the rewrites below have already
+        # been applied to it — re-walking a 1.8 MB document on every
+        # ``/api/docs`` load would be pure waste. Identity, not a marker key:
+        # the published document must carry nothing that is not OpenAPI.
+        if _normalised is not None and schema is _normalised:
+            return schema
+
         props = (
             schema.get("components", {})
             .get("schemas", {})
@@ -1082,9 +1099,18 @@ def create_app() -> FastAPI:
                 "anyOf": [detail, {"type": "string"}],
                 "title": detail.get("title", "Detail"),
             }
+
+        # #907 — FastAPI's 3.1 ``anyOf: [X, {"type": "null"}]`` nullable idiom
+        # makes strict generators DROP the property (a warning, not an error),
+        # so a generated client is silently missing thousands of fields. Runs
+        # after the widening above so the union it just added — which has no
+        # null arm — is left alone.
+        collapse_nullable_unions(schema)
+
+        _normalised = schema
         return schema
 
-    app.openapi = _openapi_with_string_validation_detail  # type: ignore[method-assign]
+    app.openapi = _openapi_for_generators  # type: ignore[method-assign]
 
     return app
 

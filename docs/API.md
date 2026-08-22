@@ -129,6 +129,83 @@ is for. `scripts/prune-release-assets.sh` achieves that through its
 "unknown / future asset — leave untouched" default branch, so **do not add
 a pattern for `openapi.json` to the pruner**.
 
+### 2.2 Two shapes the document commits to for code generators
+
+A generated client fails *quietly*: it compiles, passes review, and is
+missing whatever the generator could not model. Both rules below exist
+because a client generated from this document was silently wrong (#907),
+and both apply to the served document and the release asset alike — a
+client built against a running server and one built against a pinned tag
+must not disagree.
+
+**Nullable is expressed by absence from `required`, not by a `null`
+union.** OpenAPI 3.1 spells an optional value as a union with the JSON
+Schema `null` type, and FastAPI emits exactly that. Strict generators
+that cannot model the `null` arm skip the member — and skipping a member
+drops **the whole property** from the generated type, with a warning
+rather than an error. So `app.openapi()` rewrites every such union to the
+plain schema and takes the property out of `required`:
+
+What FastAPI emits:
+
+```json
+{ "anyOf": [ { "type": "string" }, { "type": "null" } ], "title": "Feed Url" }
+```
+
+What the document publishes — and `feed_url` is no longer listed in the
+schema's `required`:
+
+```json
+{ "type": "string", "title": "Feed Url" }
+```
+
+A union with more than one non-`null` arm stays a union, minus the
+`null`; a nullable `$ref` collapses to a bare `$ref` (keeping any
+`description`, dropping the generated title).
+
+**Request bodies keep their `required` list.** On the way out `required`
+describes what the server sends; on the way in it is what the server
+*enforces*, and a field the model declares `X | None` with no default is
+a key pydantic demands. So a schema reachable from a `requestBody` is
+collapsed but never has a property taken out of `required` — a client
+that believed otherwise and omitted the key would get a 422 back. A
+schema used in both directions (the preview → commit payloads) is
+resolved the same way, so a model in that position should carry a
+default rather than rely on the document to paper over it.
+
+Note what this trades: the server still **sends** `"feed_url": null`
+rather than omitting the key, so a strict response validator sees an
+explicit null against a schema that no longer admits one. That is
+deliberate — the alternative (dropping nulls from responses) changes the
+wire for every existing client, and a validator complaint is loud where
+the generated-code failure is silent. Decoding loses nothing: an absent
+key and an explicit null both land as `nil` / `undefined`.
+
+**Timestamps are RFC 3339 with exactly three fractional digits.**
+
+```
+2026-05-14T21:59:10.586Z
+2026-05-14T21:59:10.000Z     ← a whole second still carries .000
+```
+
+Python's `isoformat()` emits six fractional digits, and none at all when
+the value lands on a whole second. Both are legal RFC 3339 and neither is
+what most generated decoders accept — Foundation's
+`ISO8601DateFormatter` rejects fractional seconds unless configured for
+them, and then rejects the values that have none. A fixed shape removes a
+hand-written workaround from every client. `format: date-time` on the
+property is unchanged, so a generator still emits a date decoder rather
+than a string; only the precision is pinned. See
+[`backend/app/core/json_datetime.py`](../backend/app/core/json_datetime.py).
+
+The rule covers every `datetime`-typed field the API returns. It does
+**not** reach a timestamp parked inside an untyped payload — an `Any` /
+`dict[str, Any]` field such as an evidence trail or an agent telemetry
+blob, or one a handler formatted into a string itself. Those publish as
+untyped JSON or bare strings, so no generated decoder points at them and
+nothing fails to decode; the fix for one of them is to declare the field
+as a `datetime` and let it serialise normally.
+
 ---
 
 ## 3. Authentication
@@ -389,8 +466,8 @@ Response — `201 Created`, `IPSpaceResponse`:
   "dns_additional_zone_ids": [],
   "ddns_enabled": false,
   "ddns_hostname_policy": "client_or_generated",
-  "created_at": "2026-06-27T12:00:00Z",
-  "modified_at": "2026-06-27T12:00:00Z"
+  "created_at": "2026-06-27T12:00:00.000Z",
+  "modified_at": "2026-06-27T12:00:00.000Z"
 }
 ```
 

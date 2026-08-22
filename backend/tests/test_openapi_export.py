@@ -160,6 +160,21 @@ def test_empty_version_env_falls_back_instead_of_crashing() -> None:
 
 
 @_needs_exporter
+def test_export_carries_the_generator_normalisations() -> None:
+    """#907 — the artifact clients pin against must be the normalised document.
+
+    ``app.openapi()`` collapses OpenAPI 3.1's ``anyOf: [X, {"type": "null"}]``
+    nullable idiom, which strict generators answer by dropping the whole
+    property. A null arm surviving here means the exporter bypassed the
+    wrapper, and every client generated from the release asset would be
+    missing thousands of fields that the client generated from a running
+    server has.
+    """
+    raw = _run_raw({"VERSION": "2026.01.02-3"})
+    assert '"type": "null"' not in raw, "nullable unions survived into the exported artifact"
+
+
+@_needs_exporter
 def test_export_is_byte_reproducible() -> None:
     """The release attaches this artifact and the acceptance criterion is
     that it matches a local run at the same tag. Insertion-order-dependent
