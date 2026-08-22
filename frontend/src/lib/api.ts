@@ -6108,10 +6108,67 @@ export interface BlocklistCatalogSource {
   recommended: boolean;
 }
 
+/** One provider's rewrite set inside a template (issue #878). */
+export interface BlocklistTemplateGroup {
+  id: string;
+  name: string;
+  /** Where this group's domains are rewritten to. */
+  target: string;
+  domain_count: number;
+  default: boolean;
+  note: string | null;
+  /** Sibling group ids this one cannot be combined with. */
+  conflicts_with: string[];
+}
+
+export interface BlocklistTemplate {
+  id: string;
+  name: string;
+  description: string;
+  category: string;
+  block_mode: string;
+  groups: BlocklistTemplateGroup[];
+}
+
+export interface BlocklistProfile {
+  id: string;
+  name: string;
+  description: string;
+  source_ids: string[];
+  template_ids: string[];
+  note: string | null;
+}
+
 export interface BlocklistCatalogResponse {
   version: string;
   comment: string;
   sources: BlocklistCatalogSource[];
+  templates: BlocklistTemplate[];
+  profiles: BlocklistProfile[];
+}
+
+export interface BlocklistFromTemplateRequest {
+  template_id: string;
+  name?: string;
+  /** Omit for the template's default groups. */
+  group_ids?: string[];
+  block_mode?: string;
+  enabled?: boolean;
+}
+
+export interface BlocklistProfileAppliedItem {
+  kind: "source" | "template";
+  catalog_id: string;
+  name: string;
+  list_id: string | null;
+  status: "created" | "skipped_existing" | "skipped_missing";
+}
+
+export interface BlocklistApplyProfileResponse {
+  profile_id: string;
+  created: number;
+  skipped: number;
+  items: BlocklistProfileAppliedItem[];
 }
 
 // ── DNS configuration importer (issue #128) ─────────────────────────
@@ -7210,6 +7267,17 @@ export const dnsBlocklistApi = {
   }) =>
     api
       .post<DNSBlockList>("/dns/blocklists/from-catalog", body)
+      .then((r) => r.data),
+  createFromTemplate: (body: BlocklistFromTemplateRequest) =>
+    api
+      .post<DNSBlockList>("/dns/blocklists/from-template", body)
+      .then((r) => r.data),
+  applyProfile: (body: { profile_id: string; enabled?: boolean }) =>
+    api
+      .post<BlocklistApplyProfileResponse>(
+        "/dns/blocklists/apply-profile",
+        body,
+      )
       .then((r) => r.data),
   get: (id: string) =>
     api.get<DNSBlockList>(`/dns/blocklists/${id}`).then((r) => r.data),

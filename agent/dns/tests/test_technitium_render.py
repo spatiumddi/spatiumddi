@@ -1479,3 +1479,32 @@ def test_doh_path_override_warns_because_it_is_unsupported(tmp_path: Path) -> No
     # The path is not sent — there is no parameter for it.
     assert not any("Path" in k and k != "dnsTlsCertificatePath"
                    for c in calls for k in c[3])
+
+
+def test_blocking_payload_drops_redirects_instead_of_allowing_them() -> None:
+    """Redirect entries used to fall through into the ALLOW set.
+
+    ``action != "block"`` sent them to the allowed branch, so a
+    SafeSearch rewrite for ``www.google.com`` became "never block
+    www.google.com" — a silent inversion of the operator's intent.
+    Technitium's native blocking has no per-domain rewrite (its custom
+    address is server-wide), so the honest answer is to enforce nothing
+    and say so. Issue #878.
+    """
+    out = _blocking_payload(
+        _bl(
+            [
+                {"domain": "ads.example.test", "action": "block",
+                 "block_mode": "nxdomain"},
+                {"domain": "www.google.com", "action": "redirect",
+                 "block_mode": "nxdomain",
+                 "target": "forcesafesearch.google.com"},
+            ]
+        )
+    )
+    assert out["blocked"] == ["ads.example.test"]
+    assert "www.google.com" not in out["allowed"]
+    assert out["allowed"] == []
+    # …and the rewrite target must not leak into the server-wide
+    # custom-address setting, where it would apply to every blocked name.
+    assert out["custom_addresses"] == []

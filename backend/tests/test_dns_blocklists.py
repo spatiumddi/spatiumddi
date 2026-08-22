@@ -303,3 +303,111 @@ async def test_effective_blocklist_for_group(db_session: AsyncSession) -> None:
     assert any(e.domain == "bad.example.com" for e in eff.entries)
     assert "good.example.com" in eff.exceptions
     assert bl.id in eff.lists
+
+
+# ── Feed sync against the real task (issue #878) ───────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_feed_sync_counts_and_wildcards(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Drive the actual refresh coroutine, not a reimplementation of it.
+
+    ``test_feed_sync_adds_and_prunes`` above inlines a simplified copy of
+    the logic, which is why neither of the two bugs this pins was ever
+    caught: the copy did not run the code that had them.
+
+      * ``entry_count`` double-counted on a first sync, because the
+        recount query autoflushes the pending inserts and the old code
+        then added ``len(to_add)`` on top again. A 16k-domain feed
+        reported 33k.
+      * feed rows never set ``is_wildcard``, so a list naming
+        ``tracker.example`` left ``cdn.tracker.example`` resolving.
+    """
+    import contextlib
+
+    from app.tasks import dns as dns_tasks
+
+    bl = DNSBlockList(
+        name="countcheck",
+        source_type="url",
+        feed_url="http://example.com/list.txt",
+        feed_format="domains",
+        # Deliberately wrong to start with, so a task that never writes
+        # the field would fail rather than coincidentally match.
+        entry_count=999,
+    )
+    db_session.add(bl)
+    await db_session.flush()
+    db_session.add(DNSBlockListEntry(list_id=bl.id, domain="stale.example.com", source="feed"))
+    await db_session.commit()
+
+    body = "a.example.com\nb.example.com\n*.wild.example.com\n"
+
+    class _Resp:
+        text = body
+
+        def raise_for_status(self) -> None:
+            return None
+
+    class _Client:
+        def __init__(self, *a: object, **kw: object) -> None:
+            pass
+
+        async def __aenter__(self) -> _Client:
+            return self
+
+        async def __aexit__(self, *a: object) -> None:
+            return None
+
+        async def get(self, _url: str) -> _Resp:
+            return _Resp()
+
+    monkeypatch.setattr(dns_tasks.httpx, "AsyncClient", _Client)
+    # The task builds its own engine + session factory; hand it the test
+    # session so it writes where the assertions can see it.
+    monkeypatch.setattr(dns_tasks, "create_async_engine", lambda *a, **kw: _NullEngine())
+
+    @contextlib.asynccontextmanager
+    async def _factory_cm():  # type: ignore[no-untyped-def]
+        yield db_session
+
+    monkeypatch.setattr(dns_tasks, "async_sessionmaker", lambda *a, **kw: _factory_cm)
+    monkeypatch.setattr(dns_tasks, "publish_wake", _noop_publish)
+
+    out = await dns_tasks._refresh_blocklist_feed_async(str(bl.id))
+    assert out["status"] == "success"
+    assert out["added"] == 3
+    assert out["removed"] == 1
+
+    rows = (
+        (
+            await db_session.execute(
+                select(DNSBlockListEntry).where(DNSBlockListEntry.list_id == bl.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert {r.domain for r in rows} == {
+        "a.example.com",
+        "b.example.com",
+        # `*.` is feed syntax for "and subdomains", not part of the name.
+        "wild.example.com",
+    }
+    assert all(r.is_wildcard for r in rows), "feed rows must block subdomains"
+
+    await db_session.refresh(bl)
+    assert bl.entry_count == len(rows) == 3
+
+
+class _NullEngine:
+    """Stand-in for the engine the task disposes in its ``finally``."""
+
+    async def dispose(self) -> None:
+        return None
+
+
+async def _noop_publish(_channel: str) -> None:
+    return None

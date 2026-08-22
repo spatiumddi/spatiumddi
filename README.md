@@ -332,8 +332,10 @@ The tables above are the elevator pitch. The bullets here are the same surface w
   - **TSIG keys** — full CRUD with Fernet-encrypted secrets
     - One-shot "copy this secret now" reveal modal
     - Rows distribute through the existing `tsig_keys` ConfigBundle block
-  - **RPZ blocklists** — 14-source curated catalog with one-click subscribe + immediate refresh
+  - **RPZ blocklists** — 19-source curated catalog with one-click subscribe + immediate refresh
     - Sources: AdGuard, StevenBlack, OISD, Hagezi, 1Hosts, Phishing Army, URLhaus, EasyPrivacy, …
+    - **Content filtering / family filter** — a one-click **Family filter** profile pairs the adult + gambling feeds with the DoH / VPN / proxy bypass lists, because a filter a browser can route around is not one
+    - **SafeSearch enforcement** — a built-in template that rewrites each engine to its own filtered endpoint (all 194 Google country domains, the five YouTube hostnames Google documents and no others, Bing including the Edge sidebar entry point, DuckDuckGo / Brave / Ecosia / Pixabay / Qwant, Yandex opt-in)
   - **Rate limiting (RRL) + amplification defenses** — BIND9 Response Rate Limiting (responses-per-second / window / slip / qps-scale / exempt-clients) with a `log-only` dry-run, plus `minimal-responses` / `tcp-clients` / `clients-per-query` toggles; group-level, default-off (no-op until opted in)
     - **RRL drop observability** — `RateDropped` / `RateSlipped` charted as an "RRL drops/s" line on the server Stats tab + a default-off `dns_rate_limit_dropping` alert (fires when the server is actively shedding a flood)
     - **dnsdist front for PowerDNS** — opt-in front container (PowerDNS auth has no RRL of its own) forwarding to pdns: per-source-IP QPS cap (truncate / drop) + sustained-rate dynamic blocking, on a `dns-powerdns-with-dnsdist` compose profile (docker-compose for now)

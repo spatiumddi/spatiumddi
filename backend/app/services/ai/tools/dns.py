@@ -1233,3 +1233,82 @@ async def list_resolver_presets(
             "so mixing them needs one group per variant."
         ),
     }
+
+
+# ── list_blocklist_templates ──────────────────────────────────────────
+
+
+class ListBlocklistTemplatesArgs(BaseModel):
+    """No arguments — the built-in set is small enough to return whole."""
+
+
+@register_tool(
+    name="list_blocklist_templates",
+    description=(
+        "List the built-in DNS blocklist templates and one-click "
+        "profiles that ship with this release — the content-filtering "
+        "presets (SafeSearch enforcement, Family filter). Templates "
+        "carry per-provider groups showing which search engine each "
+        "rewrites and to what; profiles name the feeds and templates "
+        "they apply together. Use for 'how do I force SafeSearch?', "
+        "'what does the family filter turn on?' or 'which engines "
+        "does SafeSearch cover?'. Applying one is a separate action "
+        "in the DNS > Blocklists screen."
+    ),
+    args_model=ListBlocklistTemplatesArgs,
+    category="dns",
+    # Read-only, and the payload is a static table shipped with the
+    # release: rewrite targets published by each search provider, plus
+    # the ids of catalog feeds. Nothing install-specific, nothing secret.
+    default_enabled=True,
+)
+async def list_blocklist_templates(
+    db: AsyncSession, user: User, args: ListBlocklistTemplatesArgs
+) -> dict[str, Any]:
+    from app.services.dns.blocklist_templates import (  # noqa: PLC0415
+        all_profiles,
+        all_templates,
+    )
+
+    return {
+        "templates": [
+            {
+                "id": t.id,
+                "name": t.name,
+                "description": t.description,
+                "category": t.category,
+                "groups": [
+                    {
+                        "id": g.id,
+                        "name": g.name,
+                        "target": g.target,
+                        "domain_count": len(g.domains),
+                        "enabled_by_default": g.default,
+                        "note": g.note,
+                    }
+                    for g in t.groups
+                ],
+            }
+            for t in all_templates()
+        ],
+        "profiles": [
+            {
+                "id": p.id,
+                "name": p.name,
+                "description": p.description,
+                "source_ids": list(p.source_ids),
+                "template_ids": list(p.template_ids),
+                "note": p.note,
+            }
+            for p in all_profiles()
+        ],
+        "note": (
+            "Applying a profile creates the blocklists but assigns them "
+            "to nothing. Scope them to the views or server groups that "
+            "serve the networks you want filtered — a list left "
+            "unassigned filters nobody, and one assigned everywhere "
+            "filters your servers too. RPZ rewrites are a BIND9 "
+            "capability: Windows, PowerDNS and the cloud DNS drivers do "
+            "not enforce them."
+        ),
+    }

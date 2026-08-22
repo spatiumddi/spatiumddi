@@ -9,7 +9,7 @@ from datetime import UTC, datetime, timedelta
 
 import httpx
 import structlog
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.orm import selectinload
 
@@ -107,17 +107,33 @@ async def _refresh_blocklist_feed_async(list_id: str) -> dict[str, int | str]:
                         domain=d,
                         entry_type="block",
                         source="feed",
+                        # Subdomains too — the same default the manual
+                        # add-entry form uses, and what every consumer of
+                        # these feeds (Pi-hole, AdGuard, uBlock) does.
+                        # Feed rows used to take the column default of
+                        # False, so a list naming `tracker.example` left
+                        # `cdn.tracker.example` resolving (#878).
+                        is_wildcard=True,
                     )
                 )
 
             for d in to_remove:
                 await db.delete(existing[d])
 
-            # Recompute count
-            count_result = await db.execute(
-                select(DNSBlockListEntry).where(DNSBlockListEntry.list_id == bl.id)
+            # Recompute count — plain COUNT, no arithmetic on top: a query autoflushes
+            # the pending adds and deletes, so the result ALREADY reflects
+            # them. Adding ``len(to_add)`` on top double-counted every row on
+            # a first sync — a 16k-domain feed reported 33k (#878). It also
+            # loads ids instead of dragging every ORM row into memory, which
+            # matters on the 460k-entry feeds.
+            bl.entry_count = int(
+                await db.scalar(
+                    select(func.count())
+                    .select_from(DNSBlockListEntry)
+                    .where(DNSBlockListEntry.list_id == bl.id)
+                )
+                or 0
             )
-            bl.entry_count = len(count_result.scalars().all()) + len(to_add) - len(to_remove)
             bl.last_synced_at = datetime.now(UTC)
             bl.last_sync_status = "success"
             bl.last_sync_error = None
