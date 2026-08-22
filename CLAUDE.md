@@ -482,7 +482,7 @@ suggestion, free-space treemap.
 
 - ✅ [**Upstream resolver presets**](https://github.com/spatiumddi/spatiumddi/issues/877) — shipped in PR
   [#893](https://github.com/spatiumddi/spatiumddi/pull/893): 16 verified
-  presets across 6 providers in `backend/app/data/dns_resolver_presets.json`,
+  presets across 7 providers in `backend/app/data/dns_resolver_presets.json`,
   served by `GET /dns/forwarder-presets` and picked from the Forwarders
   card. Each carries the **certificate name its addresses actually
   present**, which is the point: since DoT upstream forwarding (#50),

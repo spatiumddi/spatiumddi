@@ -1013,6 +1013,16 @@ async def update_blocklist(
         # Feed rows only. A manual entry's ``is_wildcard`` is that row's own
         # setting, and someone who unchecked "include subdomains" on one
         # domain did not ask for a list-wide switch to overwrite it.
+        #
+        # One statement, in the same transaction as the flag write, and
+        # deliberately so: the flag and the rows it describes must not be
+        # able to disagree, and a background job would set the flag while
+        # the rows lagged — reintroducing the exact "silently deferred"
+        # state this restamp exists to prevent. Measured at **~7 s** on
+        # the largest catalog feed (Hagezi Gambling, 464k rows) on a
+        # 2-core dev box, which is slow for a click but nowhere near an
+        # HTTP timeout. Revisit if a list an order of magnitude larger
+        # ever becomes normal.
         await db.execute(
             sa_update(DNSBlockListEntry)
             .where(

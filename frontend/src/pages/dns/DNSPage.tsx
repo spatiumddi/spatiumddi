@@ -8151,7 +8151,8 @@ function BlocklistModal({
                   where blocking the parent domain would be too broad.
                   {list &&
                     list.feed_entries_are_wildcard !== feedWildcard &&
-                    " Changing this restamps the entries already imported."}
+                    " Saving restamps the entries already imported, which" +
+                      " takes a few seconds on a large list."}
                 </span>
               </span>
             </label>

@@ -747,7 +747,8 @@ domains: a threat-intel drop of individual C2 FQDNs, say, where
 blocking the parent domain would take out everything else hosted under
 it. Toggling it restamps the entries already imported, so the change
 takes effect immediately rather than waiting for the feed's contents to
-churn.
+churn — the save takes a few seconds on a large list (measured ~7 s on
+a 464k-entry feed) because it rewrites every row in one transaction.
 
 Two related behaviours worth knowing:
 
