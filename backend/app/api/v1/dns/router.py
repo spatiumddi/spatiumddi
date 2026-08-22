@@ -84,6 +84,12 @@ from app.services.dns.record_ops import (
     enqueue_record_ops_bulk,
     record_op_payload,
 )
+from app.services.dns.resolver_presets import (
+    all_presets,
+    catalog_version,
+    encrypted_only_presets,
+    find_forwarder_conflict,
+)
 from app.services.dns.serial import bump_zone_serial
 from app.services.dns.zone_templates import (
     get_template,
@@ -2667,6 +2673,92 @@ async def _assert_encrypted_transport_sane(opts: DNSServerOptions, db: DB) -> No
             "certificate against. Set the provider's DoT hostname (e.g. "
             "cloudflare-dns.com) or turn verification off for opportunistic DoT.",
         )
+
+    # Forwarders drawn from upstreams that present DIFFERENT certificate
+    # names cannot all validate against the group's single hostname, so at
+    # least one would SERVFAIL every query (issue #877). The trap is not
+    # only "Cloudflare plus Google" — a brand's filtering variants sit on
+    # adjacent addresses with different names, so 1.1.1.1 alongside 1.1.1.3
+    # breaks the same way while looking deliberate.
+    #
+    # Only checked when verification is actually on: opportunistic DoT
+    # authenticates nothing, so a mixed set is odd but functional, and
+    # do53 does not care at all. Unrecognised addresses are never a
+    # conflict — see find_forwarder_conflict.
+    if (
+        opts.forward_transport in ("tls", "https", "quic")
+        and opts.forward_tls_verify
+        and (conflict := find_forwarder_conflict(list(opts.forwarders or [])))
+    ):
+        raise HTTPException(422, conflict.message)
+
+    # Some upstreams are published for encrypted transport only and answer
+    # REFUSED on plaintext 53 (Mullvad). Pointing a do53 group at one does
+    # not degrade — it fails every query — so refuse the combination here
+    # rather than let it look configured and resolve nothing.
+    if opts.forward_transport == "do53" and (
+        encrypted_only := encrypted_only_presets(list(opts.forwarders or []))
+    ):
+        names = ", ".join(sorted(p.name for p in encrypted_only))
+        raise HTTPException(
+            422,
+            f"{names} only answers over an encrypted transport and returns "
+            "REFUSED on plaintext port 53, so forwarding to it over do53 would "
+            "fail every query. Set forward_transport to tls (with the "
+            "provider's hostname), or choose an upstream that serves do53.",
+        )
+
+
+class ResolverPresetResponse(BaseModel):
+    id: str
+    name: str
+    provider: str
+    description: str
+    ipv4: list[str]
+    ipv6: list[str]
+    tls_hostname: str
+    filtering: str
+    blocking_method: str
+    requires_encrypted: bool
+    homepage: str
+    notes: str | None
+
+
+class ResolverPresetCatalogResponse(BaseModel):
+    version: str
+    presets: list[ResolverPresetResponse]
+
+
+@router.get("/forwarder-presets", response_model=ResolverPresetCatalogResponse)
+async def get_forwarder_presets(_: CurrentUser) -> ResolverPresetCatalogResponse:
+    """Curated public upstream resolvers, with the DoT hostname each one
+    presents (issue #877).
+
+    Served from the backend rather than hardcoded in the frontend so the
+    API, the Copilot and any future CLI all read the same table — and so
+    the same data backs the server-side conflict check that refuses a
+    forwarder set spanning two certificate names.
+    """
+    return ResolverPresetCatalogResponse(
+        version=catalog_version(),
+        presets=[
+            ResolverPresetResponse(
+                id=p.id,
+                name=p.name,
+                provider=p.provider,
+                description=p.description,
+                ipv4=list(p.ipv4),
+                ipv6=list(p.ipv6),
+                tls_hostname=p.tls_hostname,
+                filtering=p.filtering,
+                blocking_method=p.blocking_method,
+                requires_encrypted=p.requires_encrypted,
+                homepage=p.homepage,
+                notes=p.notes,
+            )
+            for p in all_presets()
+        ],
+    )
 
 
 async def _load_options(group_id: uuid.UUID, db: DB) -> DNSServerOptions | None:

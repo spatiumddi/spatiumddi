@@ -1392,9 +1392,11 @@ defaults above collide on purpose.
 
 ### 20.3 Upstream forwarding
 
-`forward_transport` is `do53` (default) or `tls`. There is deliberately no
-`https` value: **BIND has no client-side HTTP transport**, so DoH-upstream
-is not expressible on the BIND9 driver.
+`forward_transport` is `do53` (default), `tls`, `https` or `quic`. The last
+two are Technitium-only and the API refuses them for a group containing a
+BIND9 server: **BIND has no client-side HTTP or QUIC transport**, so
+DoH-upstream and DoQ-upstream are not expressible on that driver (#741).
+See the driver table in §20.4.
 
 With `tls`, forwarders default to port 853 unless an entry pins its own
 (`ip@port`), and each renders with the generated `tls spatium-upstream-tls`
@@ -1411,8 +1413,49 @@ against a passive observer, but not against an active on-path attacker.
 
 One hostname applies to every forwarder in the group, because the common
 case is a single provider's anycast pair (1.1.1.1 + 1.0.0.1 both present
-`cloudflare-dns.com`). Mixing providers means one of them fails
-validation — use one group per provider.
+`cloudflare-dns.com`). Mixing upstreams that present different certificate
+names means one of them fails validation — use one group per upstream.
+
+Note the trap this creates: a brand's filtering variants sit on adjacent
+addresses but do **not** share a certificate name. `1.1.1.1` presents
+`cloudflare-dns.com`, `1.1.1.2` presents `security.cloudflare-dns.com` and
+`1.1.1.3` presents `family.cloudflare-dns.com`; Quad9 splits the same way
+across `dns.quad9.net` / `dns10.quad9.net` / `dns11.quad9.net`. So
+`1.1.1.1` alongside `1.1.1.3` breaks exactly like Cloudflare alongside
+Google, while looking deliberate. Since #877 the API refuses that
+combination outright when verification is on, rather than letting it
+SERVFAIL in production.
+
+### 20.3.1 Resolver presets (#877)
+
+Rather than expecting operators to remember both halves, `GET
+/api/v1/dns/forwarder-presets` serves a curated catalogue of well-known
+public upstreams — addresses, the DoT hostname each presents, and what it
+filters by default. The Forwarders card offers them as a picker that fills
+the address list and `forward_tls_hostname` in one action, with a one-click
+"Switch to DoT" nudge when the group is still on plaintext 53.
+
+The catalogue lives at `backend/app/data/dns_resolver_presets.json` behind
+`app/services/dns/resolver_presets.py`, and is served from the backend
+rather than hardcoded in the frontend so the picker, the API's conflict
+check and the `list_resolver_presets` Copilot tool all read one table.
+Entries are verified against each provider's own documentation; a preset
+carrying a stale hostname is worse than no preset, because it fails closed
+on every query.
+
+Two levels of checking sit on top of it:
+
+* **Hard refusal (422)** when the forwarder list spans two catalogued
+  upstreams with different certificate names and verification is on. This
+  case cannot work, so it is refused rather than warned about.
+* **Advisory (UI only)** when the typed hostname is not the documented one
+  for a recognised address set. Deliberately not a refusal: providers list
+  several names in one certificate — Cloudflare's covers `one.one.one.one`
+  as well as `cloudflare-dns.com` — and the catalogue records only the
+  canonical one, so a hard error would reject working configurations.
+
+Unrecognised addresses carry no opinion at either level. An internal
+resolver or an uncatalogued provider must stay configurable.
 
 ### 20.4 Driver support
 
