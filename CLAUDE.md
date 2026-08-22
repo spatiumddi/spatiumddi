@@ -677,10 +677,42 @@ suggestion, free-space treemap.
   Note for anyone adding a binding: declare it here and match via
   `matchesShortcut` rather than adding another described-only row.
 - ✅ [**Print / PDF export for IPAM tree + subnet detail**](https://github.com/spatiumddi/spatiumddi/issues/82) — shipped `2026.07.30-1` (#739): `GET /ipam/export.pdf` takes the same scope selector as the CSV/JSON/XLSX exporter (and reuses its `_collect`, so the two can't disagree about the subtree) and renders one of two shapes — a **tree** report for a space / block, or a **detail** report for a subnet. Surfaced as *Print / PDF* in both Export dropdowns. **reportlab, not the weasyprint the issue text proposed** — two reportlab PDFs already ship and a second engine would add Cairo / Pango to every image for no new capability. Unlike #48 and the conformity report, this one paginates: `repeatRows=1` plus a two-pass `_NumberedCanvas` for "Page N of M". Two things worth knowing if you touch it: reportlab's `Paragraph` parses mini-XML, so **all** DB-sourced text must go through `_para()` (an unescaped `a<b>c` space name 500s the export, and `<legacy> net` silently renders as "net"); and the tree indent must stay inside WinAnsiEncoding, or reportlab swaps in ZapfDingbats and nested blocks render as `■■`. Both have regression tests. *(GitHub auto-closed this issue on 2026-06-18 in error — PR [#446](https://github.com/spatiumddi/spatiumddi/pull/446) said `CodeQL #82`, meaning alert 82. Reopened 2026-07-28, genuinely shipped now.)*
-- ⬜ [**Global search v2**](https://github.com/spatiumddi/spatiumddi/issues/879) — relevance ranking, trigram
-  indexes, wider resource coverage, and command actions. The existing
-  typeahead works; this is about it being useful past ~3 resource
-  types.
+- ✅ [**Global search v2**](https://github.com/spatiumddi/spatiumddi/issues/879) — all six gaps closed.
+  Matching, ranking and gating moved out of the router into
+  `backend/app/services/search/` (`ranking` / `providers` / `engine`),
+  which the `global_search` MCP tool now calls instead of carrying its
+  own copy of the fan-out. Coverage went 7 types → 20 via a
+  `SearchProvider` registry that the engine, the scope chips, the MCP
+  tool and `GET /search/types` all read from. **Ranking is computed in
+  SQL, before each type's `LIMIT`** — the ordering bug was not really
+  about order: with no `ORDER BY`, the database returned any N matching
+  rows and the exact hit was routinely not among them, which sorting in
+  Python afterwards cannot fix. Trigram GIN indexes (migration
+  `f4b91d38a70c`) back the leading-wildcard `ILIKE` on the tables that
+  actually grow; small tables are left unindexed on purpose. Frontend:
+  scope chips, sessionStorage recents, and go-to-page commands sourced
+  from the sidebar's own nav tree, extracted to `lib/navigation.ts` so
+  the palette can't drift from the sidebar (the `lib/shortcuts.ts`
+  argument from #737).
+  **Four bugs found on the way, three of them pre-existing.** (1) Search
+  applied **no permission filtering at all** — it was the widest read
+  surface in the product and the only one that checked nothing, so an
+  IPAM-only operator could read DNS zones and records straight out of a
+  palette whose `GET /dns/zones` would have 403'd them; the Copilot tool
+  had the same hole. (2) The query was interpolated raw into `%…%`, so
+  searching `50%` matched every row in every table. (3) The MAC branch
+  in the address query was unindexable and sat in an `OR` beside two
+  indexed predicates, forcing the whole query to a sequential scan —
+  the two working indexes bought nothing until it was normalised.
+  (4) `_statement_references` in `app/db.py` called
+  `statement.get_final_froms()` once per soft-delete model, ~1.9 ms
+  each × 8, i.e. **~16 ms of Python on every ORM SELECT in the
+  application** — invisible because it was uniform. Resolving the FROM
+  graph once cut a 20-provider fan-out over 500k addresses from 734 ms
+  to 93 ms. **Deferred:** an expression index for custom-field values
+  (the field name is runtime-chosen, so no trigram index can serve
+  `custom_fields ->> 'x' ILIKE …`), and action commands that *do*
+  something rather than navigate.
 - ⬜ [**Native mobile app**](https://github.com/spatiumddi/spatiumddi/issues/884) — PWA groundwork first, then iOS
   (SwiftUI) against the REST API. Non-negotiable #1 means the API is
   already complete enough to build against.

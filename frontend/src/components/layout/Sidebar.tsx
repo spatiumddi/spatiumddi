@@ -2,74 +2,14 @@ import { useEffect, useState } from "react";
 import { NavLink, useLocation } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import {
-  Activity,
-  AudioLines,
-  Building2,
-  Scan,
-  Factory,
-  Power,
-  Network,
-  Globe,
-  Inbox,
-  LayoutDashboard,
-  Server,
-  Router as RouterIcon,
-  Route as RouteIcon,
-  Briefcase,
-  Cable,
-  Code2,
   Github,
-  Hash,
-  MapPin,
-  Package,
-  Spline,
-  Truck,
-  Users,
-  UsersRound,
-  KeyRound,
-  KeySquare,
-  ClipboardList,
   ChevronsLeft,
   ChevronsRight,
   ChevronDown,
   ChevronRight,
   Settings,
-  Tags,
-  ShieldCheck,
-  ShieldAlert,
-  ShieldBan,
-  ShieldQuestion,
-  ScrollText,
-  BellRing,
-  Bird,
   Sparkles,
-  Boxes,
-  Cloud,
-  Container as ContainerIcon,
-  Cpu,
-  Earth,
-  Flame,
-  Rss,
-  HardDrive,
-  LayoutTemplate,
-  Wifi,
-  Waypoints,
-  Radio,
-  Binoculars,
-  Shuffle,
-  Trash2,
-  History,
-  Search,
-  Calculator,
-  BarChart3,
-  Webhook,
-  Workflow,
-  GitPullRequest,
-  Monitor,
   ToggleLeft,
-  Upload,
-  AlertTriangle,
-  Database,
   Wrench,
   X,
 } from "lucide-react";
@@ -82,356 +22,28 @@ import {
   usePublicSettings,
   DEFAULT_APP_TITLE,
 } from "@/hooks/usePublicSettings";
+import {
+  adminConfigurationNav,
+  adminIdentityNav,
+  adminInsightsNav,
+  adminNotificationsNav,
+  adminReferenceNav,
+  baseMainNav,
+  coreDnsNav,
+  coreIpamNav,
+  filterNav,
+  integrationsNav,
+  networkInfrastructureNav,
+  networkLogicalNav,
+  operationsNav,
+  reportsNav,
+  toolsNav,
+} from "@/lib/navigation";
 
-// Core section. The flat list had grown to 11 rows — the four canonical
-// anchors (Dashboard / IPAM / DHCP / DNS) plus seven grown-in sub-features
-// that mixed daily-driver surfaces with mis-filed child resources (e.g.
-// "Domains" routing under /admin). Reorganised (sidebar IA pass): the four
-// anchors stay first + prominent, then the grown-in items group under
-// lightweight ``SubNavLabel`` sub-headings by family — IPAM-family under
-// "IPAM", DNS-family under "DNS" — reusing the same primitive Network +
-// Administration already use. Routes + module-gating are unchanged; only
-// sidebar adjacency moves. (Logs left Core entirely → its own "Operations"
-// section below, since it's cross-cutting telemetry, not an IPAM/DNS child.)
-const baseMainNav = [
-  { label: "Dashboard", icon: LayoutDashboard, to: "/dashboard" },
-  { label: "IPAM", icon: Network, to: "/ipam", end: true },
-  { label: "DHCP", icon: Server, to: "/dhcp" },
-  { label: "DNS", icon: Globe, to: "/dns", end: true },
-  // #696 — top-level rather than under Administration on purpose: the
-  // audience is ordinary users asking for a resource, and most of them will
-  // never see the admin section at all.
-  {
-    label: "Requests",
-    icon: Inbox,
-    to: "/requests",
-    module: "governance.requests",
-  },
-];
-// IPAM-family children (all route under /ipam/*). Alphabetised, matching the
-// Network/Administration sub-group convention.
-const coreIpamNav = [
-  { label: "NAT Mappings", icon: Shuffle, to: "/ipam/nat" },
-  { label: "Stale IPs", icon: History, to: "/ipam/stale" },
-  { label: "Subnet Planner", icon: Workflow, to: "/ipam/plans" },
-];
-// DNS-family children. "Domains" keeps its /admin/domains route — it's the
-// registrar/expiry/RDAP registry side of a name (linked to dns_zone.domain_id),
-// so it belongs beside DNS in the sidebar even though the route lives under
-// /admin.
-const coreDnsNav = [
-  { label: "DNS Pools", icon: Workflow, to: "/dns/pools" },
-  { label: "DNSSEC Policies", icon: KeyRound, to: "/dns/dnssec-policies" },
-  { label: "Domains", icon: Earth, to: "/admin/domains" },
-];
-// Operations — cross-cutting live telemetry. Logs aggregates DNS query logs,
-// DHCP activity, Windows event log + DHCP audit, so it's not an IPAM/DNS child;
-// it gets its own small top-level section (future home for the pending
-// operational-triage surfaces: PCAP trigger #59, config-drift #61, time-travel
-// #56).
-const operationsNav = [{ label: "Logs", icon: ScrollText, to: "/logs" }];
-
-// Network section — grouped under a collapsible header. As the
-// section grew (4 → 8 items, with #94/#95 still to come), a flat
-// list got hard to scan, so we sub-group it the same way
-// Administration does — ``SubNavLabel`` rows split the contents
-// into two themed bunches:
-//
-// * **Logical** — operator-facing ownership / deliverable rows
-//   (Customers / Providers / Services / Sites from #91 + #94).
-//   These cross-cut every other resource type; not network entities
-//   themselves.
-// * **Infrastructure** — the actual network entities (ASNs,
-//   Circuits, Devices, VLANs, VRFs).
-//
-// Each list is alphabetised so new entries slot in without
-// reshuffling.
-// Each network nav item carries the feature-module id that gates it
-// (see ``app.services.feature_modules.MODULES`` on the backend). The
-// renderer below filters by ``useFeatureModules.enabled(id)`` so a
-// disabled module disappears from the sidebar entirely.
-const networkLogicalNav = [
-  {
-    label: "Customers",
-    icon: Briefcase,
-    to: "/network/customers",
-    module: "network.customer",
-  },
-  {
-    label: "Providers",
-    icon: Truck,
-    to: "/network/providers",
-    module: "network.provider",
-  },
-  {
-    label: "Services",
-    icon: Package,
-    to: "/network/services",
-    module: "network.service",
-  },
-  {
-    label: "Sites",
-    icon: MapPin,
-    to: "/network/sites",
-    module: "network.site",
-  },
-];
-const networkInfrastructureNav = [
-  {
-    label: "ASNs",
-    icon: Hash,
-    to: "/network/asns",
-    module: "network.asn",
-  },
-  {
-    label: "AV over IP",
-    icon: AudioLines,
-    to: "/network/av",
-    module: "network.av",
-  },
-  {
-    label: "BACnet Devices",
-    icon: Building2,
-    to: "/network/bacnet",
-    module: "network.bacnet",
-  },
-  {
-    label: "Certificates",
-    icon: ShieldCheck,
-    to: "/network/certificates",
-    module: "security.tls_certs",
-  },
-  {
-    label: "Circuits",
-    icon: Waypoints,
-    to: "/network/circuits",
-    module: "network.circuit",
-  },
-  {
-    label: "DICOM AEs",
-    icon: Scan,
-    to: "/network/dicom",
-    module: "network.dicom",
-  },
-  {
-    label: "Devices",
-    icon: Cable,
-    to: "/network/devices",
-    module: "network.device",
-  },
-  {
-    label: "Looking Glass",
-    icon: Binoculars,
-    to: "/network/looking-glass",
-    module: "network.looking_glass",
-  },
-  {
-    label: "Multicast",
-    icon: Radio,
-    to: "/network/multicast",
-    module: "network.multicast",
-  },
-  {
-    label: "OT Devices",
-    icon: Factory,
-    to: "/network/ot",
-    module: "network.ot",
-  },
-  {
-    label: "Overlays",
-    icon: Spline,
-    to: "/network/overlays",
-    module: "network.overlay",
-  },
-  {
-    label: "VLANs",
-    icon: RouterIcon,
-    to: "/network/vlans",
-    module: "network.vlan",
-  },
-  {
-    label: "VRFs",
-    icon: RouteIcon,
-    to: "/network/vrfs",
-    module: "network.vrf",
-  },
-];
-
-// Keep this list alphabetised by label.
-const toolsNav = [
-  {
-    label: "Block Sync",
-    icon: ShieldBan,
-    to: "/security/block-sync",
-    module: "security.block_sync",
-  },
-  { label: "CIDR Calculator", icon: Calculator, to: "/tools/cidr" },
-  {
-    label: "Firewall Feeds",
-    icon: Rss,
-    to: "/security/firewall-feeds",
-    module: "security.firewall_feeds",
-  },
-  {
-    label: "Network Tools",
-    icon: Wrench,
-    to: "/tools/network",
-    module: "tools.network",
-  },
-  {
-    label: "New Devices",
-    icon: ShieldQuestion,
-    to: "/security/new-devices",
-    module: "security.new_device_watch",
-  },
-  { label: "Nmap", icon: Search, to: "/tools/nmap", module: "tools.nmap" },
-  {
-    label: "Packet Capture",
-    icon: Activity,
-    to: "/tools/pcap",
-    module: "tools.pcap",
-  },
-  {
-    label: "Wake Schedules",
-    icon: Power,
-    to: "/tools/wake-schedules",
-    module: "tools.wake_scheduler",
-  },
-];
-
-// Reports section (issue #47) — fixed Top-N rollups derived from
-// existing tables. Module-gated so operators who don't want the surface
-// can hide it via Settings → Features.
-const reportsNav = [
-  {
-    label: "Top-N Reports",
-    icon: BarChart3,
-    to: "/reports",
-    module: "reports.top_n",
-  },
-];
-
-const adminIdentityNav = [
-  { label: "API Tokens", icon: KeySquare, to: "/admin/api-tokens" },
-  { label: "Auth Providers", icon: ShieldCheck, to: "/admin/auth-providers" },
-  { label: "Groups", icon: UsersRound, to: "/admin/groups" },
-  { label: "Roles", icon: KeyRound, to: "/admin/roles" },
-  { label: "Sessions", icon: Monitor, to: "/admin/sessions" },
-  { label: "Users", icon: Users, to: "/admin/users" },
-];
-
-// Administration → Platform was getting unwieldy at 9-10 items; split it
-// into three sub-groups rendered with small non-collapsible labels.
-// "Settings" deliberately lives in the sidebar footer (above the
-// GitHub link), not in this list — it was getting buried in
-// Administration → Configuration as the platform grew, and it's
-// the one entry every operator hits often enough that it earns
-// dedicated chrome.
-const adminConfigurationNav = [
-  {
-    label: "AI Providers",
-    icon: Sparkles,
-    to: "/admin/ai/providers",
-    module: "ai.copilot",
-  },
-  {
-    label: "AI Prompts",
-    icon: Sparkles,
-    to: "/admin/ai/prompts",
-    module: "ai.copilot",
-  },
-  {
-    label: "AI Tool Catalog",
-    icon: Sparkles,
-    to: "/admin/ai/tools",
-    module: "ai.copilot",
-  },
-  { label: "Custom Fields", icon: Tags, to: "/admin/custom-fields" },
-  // Import hub (#36) — the one-shot DHCP (#129) / DNS (#128) / NetBox (#36)
-  // importers plus the guided Windows cutover (#756) share a single
-  // Configuration entry with a left sub-nav (see ImportPage), mirroring
-  // Appliance → Fleet. ``anyModule`` hides the entry only when ALL of those
-  // modules are off; the sub-nav inside gates each family individually.
-  {
-    label: "Import",
-    icon: Upload,
-    to: "/admin/import",
-    anyModule: [
-      "dhcp.import",
-      "dns.import",
-      "ipam.import.netbox",
-      "migration.cutover",
-    ],
-  },
-  // ``Features`` lives in the footer next to Settings — it's a
-  // platform-wide control, not a per-area config, and ops teams expect
-  // to find it next to "Settings" rather than buried in the sidebar.
-  {
-    label: "IPAM Templates",
-    icon: LayoutTemplate,
-    to: "/admin/ipam/templates",
-  },
-];
-
-const adminNotificationsNav = [
-  { label: "Alerts", icon: BellRing, to: "/admin/alerts" },
-  {
-    label: "DNS Blocklists",
-    icon: ShieldAlert,
-    to: "/admin/dns-blocklists",
-    module: "security.dnsbl",
-  },
-  {
-    label: "Change Requests",
-    icon: GitPullRequest,
-    to: "/admin/change-requests",
-    module: "governance.approvals",
-  },
-  { label: "Webhooks", icon: Webhook, to: "/admin/webhooks" },
-];
-
-const adminInsightsNav = [
-  { label: "Audit Log", icon: ClipboardList, to: "/admin/audit" },
-  // Backup + restore (issue #117 Phase 1a). Sits in the Insights
-  // group alongside Trash + Diagnostics — all "platform-state
-  // lifecycle" surfaces.
-  // Backup admin (issue #117) — also hosts the Factory Reset tab
-  // (issue #116). Factory reset doesn't get its own sidebar entry;
-  // it lives as a third tab alongside Manual + Destinations.
-  { label: "Backup", icon: Database, to: "/admin/backup" },
-  { label: "Compliance", icon: ShieldCheck, to: "/admin/compliance" },
-  {
-    label: "Conformity",
-    icon: ShieldCheck,
-    to: "/admin/conformity",
-    module: "compliance.conformity",
-  },
-  // Diagnostics → Errors (issue #123). Visible to all admins; the
-  // backend enforces superadmin on read, so non-superadmins land on
-  // a 403 page. We don't gate the nav entry itself so superadmins
-  // discover it.
-  {
-    label: "Diagnostics",
-    icon: AlertTriangle,
-    to: "/admin/diagnostics/errors",
-  },
-  { label: "Platform Insights", icon: Cpu, to: "/admin/platform-insights" },
-  { label: "Trash", icon: Trash2, to: "/admin/trash" },
-];
-
-// External documentation links — opened in a new tab via
-// ``NavExternalItem``. Kept in their own group so the visual
-// separator below the in-app entries reads as "you're leaving the
-// app". Matches the pattern from issue #96 (preferred ReDoc for
-// browsing; Swagger UI for interactive try-it-out).
-const adminReferenceNav: {
-  label: string;
-  icon: React.ElementType;
-  href: string;
-}[] = [
-  { label: "API Docs", icon: Code2, href: "/api/redoc" },
-  { label: "API Docs (interactive)", icon: Code2, href: "/api/docs" },
-];
+// The nav tree itself lives in ``lib/navigation.ts`` so the Cmd/Ctrl+K
+// command palette can render the same destinations without a second,
+// drifting copy of the list (issue #879). Adding a page means adding it
+// there; both surfaces pick it up.
 
 function NavSection({
   label,
@@ -646,16 +258,11 @@ export function Sidebar({
   // Loading / error state defaults to "everything visible" so the
   // sidebar never blinks empty on a slow network.
   const { enabled: moduleEnabled } = useFeatureModules();
+  // Shared with the command palette (``lib/navigation.ts``) so a
+  // module-gated page is hidden identically in both places.
   const filterByModule = <T extends { module?: string; anyModule?: string[] }>(
     items: T[],
-  ): T[] =>
-    items.filter(
-      (it) =>
-        (!it.module || moduleEnabled(it.module)) &&
-        // ``anyModule`` keeps a consolidated entry (e.g. Import) visible as
-        // long as at least one of its underlying modules is enabled.
-        (!it.anyModule || it.anyModule.some((m) => moduleEnabled(m))),
-    );
+  ): T[] => filterNav(items, moduleEnabled);
 
   // Pending approval-queue count → the Change Requests nav badge. Only
   // polls when the (default-off) governance.approvals module is on, so a
@@ -678,41 +285,7 @@ export function Sidebar({
   // Sorted alphabetically by label so the order is stable regardless
   // of the order we added integrations here — adding a new one later
   // shouldn't re-shuffle the sidebar for operators already using it.
-  const integrationsNav = [
-    ...(moduleEnabled("integrations.cloud")
-      ? [{ label: "Cloud", icon: Cloud, to: "/cloud" }]
-      : []),
-    ...(moduleEnabled("integrations.kubernetes")
-      ? [{ label: "Kubernetes", icon: Boxes, to: "/kubernetes" }]
-      : []),
-    ...(moduleEnabled("integrations.docker")
-      ? [{ label: "Docker", icon: ContainerIcon, to: "/docker" }]
-      : []),
-    ...(moduleEnabled("integrations.opnsense")
-      ? [{ label: "OPNsense", icon: ShieldCheck, to: "/opnsense" }]
-      : []),
-    ...(moduleEnabled("integrations.paloalto")
-      ? [{ label: "Palo Alto", icon: ShieldAlert, to: "/paloalto" }]
-      : []),
-    ...(moduleEnabled("integrations.fortinet")
-      ? [{ label: "Fortinet", icon: Flame, to: "/fortinet" }]
-      : []),
-    ...(moduleEnabled("integrations.meraki")
-      ? [{ label: "Meraki", icon: Network, to: "/meraki" }]
-      : []),
-    ...(moduleEnabled("integrations.netbird")
-      ? [{ label: "NetBird", icon: Bird, to: "/netbird" }]
-      : []),
-    ...(moduleEnabled("integrations.proxmox")
-      ? [{ label: "Proxmox", icon: HardDrive, to: "/proxmox" }]
-      : []),
-    ...(moduleEnabled("integrations.tailscale")
-      ? [{ label: "Tailscale", icon: Waypoints, to: "/tailscale" }]
-      : []),
-    ...(moduleEnabled("integrations.unifi")
-      ? [{ label: "UniFi", icon: Wifi, to: "/unifi" }]
-      : []),
-  ].sort((a, b) => a.label.localeCompare(b.label));
+  const visibleIntegrations = filterByModule(integrationsNav);
   // #696 — baseMainNav now carries a module-gated entry (Requests), so it
   // has to go through the same filter every other nav group uses. Without
   // this the item renders on every install even though governance.requests
@@ -910,14 +483,14 @@ export function Sidebar({
             );
           })()}
 
-          {integrationsNav.length > 0 && (
+          {visibleIntegrations.length > 0 && (
             <NavSection
               label="Integrations"
               storageKey="sidebar-section-integrations-open"
               collapsed={effectiveCollapsed}
               showDivider
             >
-              {integrationsNav.map((item) => (
+              {visibleIntegrations.map((item) => (
                 <NavItem
                   key={item.to}
                   {...item}

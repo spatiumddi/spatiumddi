@@ -1,6 +1,6 @@
 # IPAM Feature Specification
 
-> **Implementation status (post-`2026.04.28-2`):** Full hierarchical CRUD (spaces, blocks with nesting, subnets, addresses); next-available allocation that skips dynamic DHCP pool ranges; orphan soft-delete + bulk orphan purge modal; block utilization rollup via recursive CTE; block/subnet overlap validation via PostgreSQL `cidr &&` operator; **grow-only subnet + block resize** with blast-radius preview, cross-subtree overlap scan, typed-CIDR confirmation gate, and pg advisory lock during commit; **subnet planner** at `/ipam/plans` (draggable multi-level CIDR design saved as `SubnetPlan` rows, validated live, applied transactionally); **planning tools** — CIDR calculator at `/tools/cidr`, address planner that packs `{count, prefix_len}` requests into block free space, aggregation suggestion banner for clean-merge opportunities, free-space treemap toggleable from the Allocation map header; block-detail bulk-select reaches parity with the space view (child blocks selectable + bulk-deletable alongside subnets); DNS assignment inheritance (space → block → subnet) with dual-listbox picker for additional zones and shared `ZoneOptions` primary/additional separator across Create / Edit / Bulk-edit flows; DNS sync check (subnet / block / space scope) reconciling missing, mismatched, and stale records, with a `[Sync ▾]` dropdown (DNS / DHCP / All) on the subnet header plus result modals for each; **scheduled IPAM ↔ DNS auto-sync** (opt-in Celery beat task gated on `PlatformSettings.dns_auto_sync_enabled`); reverse-zone auto-create + backfill; IP aliases (CNAME/A tied to the IP, auto-cleaned on purge) with single-step delete confirmation + query-invalidation fix for the subnet Aliases tab; VLAN association (router + VLAN columns); DHCP scope/pool/static linkage with per-IP pool-membership badge, **pool boundary rows in the IP listing**, and **dynamic-pool allocation gates** (422 on manual allocation, skipped by `/next-ip`); static DHCP creation flow integrated into Allocate IP; drag-drop reparenting; **bulk-edit IPs with per-field opt-in toggles** (status, description, tags-merge-or-replace, custom-fields merge, DNS zone); **IP assignment collision warnings** (FQDN + MAC collisions across any subnet; 409 with `force`-flag reconfirm); import/export (CSV/JSON/XLSX) with UTC-timestamped filenames + **subnet-scoped IP address importer**; custom fields per resource type with inherited-value placeholders on Edit Subnet / Edit Block modals; global search (Cmd+K); **mobile-responsive layout** (sidebar drawer, horizontally scrollable tables, modals cap at `95vw`); every modal is draggable (`bg-black/20` backdrop, Esc close). **IPv6:** storage, UI, subnet create, AAAA/PTR sync, `/blocks/{id}/available-subnets` up to `/128`, per-block "Find by size" with family-aware prefix options, next-available allocation (`sequential` / `random` / `eui64` strategies, defaulting to `Subnet.ipv6_allocation_policy`), and Kea Dhcp6 scope rendering with v6 option-name translation all land.
+> **Implementation status (post-`2026.04.28-2`):** Full hierarchical CRUD (spaces, blocks with nesting, subnets, addresses); next-available allocation that skips dynamic DHCP pool ranges; orphan soft-delete + bulk orphan purge modal; block utilization rollup via recursive CTE; block/subnet overlap validation via PostgreSQL `cidr &&` operator; **grow-only subnet + block resize** with blast-radius preview, cross-subtree overlap scan, typed-CIDR confirmation gate, and pg advisory lock during commit; **subnet planner** at `/ipam/plans` (draggable multi-level CIDR design saved as `SubnetPlan` rows, validated live, applied transactionally); **planning tools** — CIDR calculator at `/tools/cidr`, address planner that packs `{count, prefix_len}` requests into block free space, aggregation suggestion banner for clean-merge opportunities, free-space treemap toggleable from the Allocation map header; block-detail bulk-select reaches parity with the space view (child blocks selectable + bulk-deletable alongside subnets); DNS assignment inheritance (space → block → subnet) with dual-listbox picker for additional zones and shared `ZoneOptions` primary/additional separator across Create / Edit / Bulk-edit flows; DNS sync check (subnet / block / space scope) reconciling missing, mismatched, and stale records, with a `[Sync ▾]` dropdown (DNS / DHCP / All) on the subnet header plus result modals for each; **scheduled IPAM ↔ DNS auto-sync** (opt-in Celery beat task gated on `PlatformSettings.dns_auto_sync_enabled`); reverse-zone auto-create + backfill; IP aliases (CNAME/A tied to the IP, auto-cleaned on purge) with single-step delete confirmation + query-invalidation fix for the subnet Aliases tab; VLAN association (router + VLAN columns); DHCP scope/pool/static linkage with per-IP pool-membership badge, **pool boundary rows in the IP listing**, and **dynamic-pool allocation gates** (422 on manual allocation, skipped by `/next-ip`); static DHCP creation flow integrated into Allocate IP; drag-drop reparenting; **bulk-edit IPs with per-field opt-in toggles** (status, description, tags-merge-or-replace, custom-fields merge, DNS zone); **IP assignment collision warnings** (FQDN + MAC collisions across any subnet; 409 with `force`-flag reconfirm); import/export (CSV/JSON/XLSX) with UTC-timestamped filenames + **subnet-scoped IP address importer**; custom fields per resource type with inherited-value placeholders on Edit Subnet / Edit Block modals; **global search v2** (Cmd/Ctrl+K palette over twenty permission-filtered resource types, relevance-ranked in SQL, trigram-indexed, with scope chips, recent searches and go-to-page commands — see §10); **mobile-responsive layout** (sidebar drawer, horizontally scrollable tables, modals cap at `95vw`); every modal is draggable (`bg-black/20` backdrop, Esc close). **IPv6:** storage, UI, subnet create, AAAA/PTR sync, `/blocks/{id}/available-subnets` up to `/128`, per-block "Find by size" with family-aware prefix options, next-available allocation (`sequential` / `random` / `eui64` strategies, defaulting to `Subnet.ipv6_allocation_policy`), and Kea Dhcp6 scope rendering with v6 option-name translation all land.
 
 ## Overview
 
@@ -1049,18 +1049,60 @@ enabled-gate + interval. Each sweep writes one summary audit row.
 
 ---
 
-## 10. IP Search
+## 10. Global search
 
-Global search across all IP resources:
+`GET /api/v1/search`, and the Cmd/Ctrl+K palette over it, reach well past
+IPAM — twenty resource types across IPAM, DNS, DHCP, Network and
+Administration. `GET /api/v1/search/types` returns the subset the calling
+user may search, which is what the palette's scope chips are built from.
 
-- Search by IP address (exact or CIDR contains)
-- Search by hostname (prefix, suffix, regex)
-- Search by MAC address
-- Search by custom field value (for indexed fields)
-- Search by tag key/value
-- Filters: status, subnet, space, block, assigned user/group
+**Query shapes.** The query string is classified once, and only the
+providers that could match that shape run:
 
-Search is implemented via PostgreSQL full-text search + `inet` operators, not a separate search engine.
+| Shape | Example | Reaches |
+|---|---|---|
+| IP | `10.0.0.42` | exact address, containing subnet/block, DNS records whose *value* is that address, reservations, devices, server hosts |
+| CIDR | `10.0.0.0/24` | subnets and blocks within the range |
+| MAC | `aa:bb:cc:dd:ee:ff` | addresses and DHCP reservations |
+| Text | `web-01` | names, hostnames, FQDNs, record values, descriptions, searchable custom fields |
+
+MAC matching is separator-insensitive in both directions: the stored value
+and the query are both reduced to bare hex, so a dashed query finds a
+colon-form row, and a partial MAC (an OUI prefix) works too.
+
+**Ranking.** Hits are scored exact (100) > prefix (60) > substring (25),
+plus a small per-type weight used only to break ties within a bucket. The
+score is computed **in SQL, before each type's `LIMIT`** — otherwise the
+database is free to return any N matching rows and the exact hit is
+routinely not among them, which no amount of re-sorting afterwards can
+fix. The returned `score` and `matched_field` make the ordering
+inspectable rather than something to infer.
+
+**Permissions.** Every type is filtered against the caller's own `read`
+permission and the install's enabled feature modules, server-side
+(non-negotiable #3). A type the caller cannot read is dropped from the
+request rather than rejected, so a stale scope chip returns nothing for
+that scope instead of failing the whole search. `user` is superadmin-only,
+matching `/api/v1/users`.
+
+**Indexing.** `pg_trgm` GIN indexes back the leading-wildcard `ILIKE`
+matches on the tables that grow large — `ip_address`, `dns_record`,
+`dns_zone`, `subnet`, `dhcp_static_assignment` (migration
+`f4b91d38a70c`). Small tables are deliberately left unindexed: a
+sequential scan of a few hundred rows is already the fastest plan and a
+GIN index there is pure write amplification. Queries shorter than three
+characters produce no full trigram and still scan; the palette is
+debounced and those match nearly everything anyway. If `CREATE EXTENSION
+pg_trgm` is refused on a locked-down managed instance, the migration logs
+and skips the indexes — search degrades to sequential scans rather than
+failing the upgrade.
+
+One known cost remains: matching *custom-field* values uses
+`custom_fields ->> 'name' ILIKE …`, which no trigram index can serve
+because the field name is chosen at runtime. On a table with hundreds of
+thousands of addresses that is a sequential scan of a few tens of
+milliseconds. Indexing it would mean creating an expression index when an
+operator flags a field searchable — worth doing, not yet done.
 
 ---
 

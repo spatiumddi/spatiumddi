@@ -3354,15 +3354,33 @@ export const diagnosticsApi = {
 
 // ── Search ─────────────────────────────────────────────────────────────────────
 
+/** Every type `app/services/search/providers.py` can emit. Keep in step
+ *  with the `PROVIDERS` registry there — a type missing here still returns
+ *  from the API, it just renders with the fallback icon and label. */
+export type SearchResultType =
+  | "ip_address"
+  | "subnet"
+  | "block"
+  | "space"
+  | "dns_group"
+  | "dns_zone"
+  | "dns_record"
+  | "dns_server"
+  | "dns_view"
+  | "dns_blocklist"
+  | "dhcp_scope"
+  | "dhcp_reservation"
+  | "dhcp_server"
+  | "vlan"
+  | "device"
+  | "site"
+  | "circuit"
+  | "user"
+  | "group"
+  | "appliance";
+
 export interface SearchResult {
-  type:
-    | "ip_address"
-    | "subnet"
-    | "block"
-    | "space"
-    | "dns_group"
-    | "dns_zone"
-    | "dns_record";
+  type: SearchResultType;
   id: string;
   display: string;
   name: string | null;
@@ -3383,13 +3401,30 @@ export interface SearchResult {
   dns_zone_name: string | null;
   dns_record_type: string | null;
   dns_record_value: string | null;
+  /** Free-form breadcrumb for types with no shared parent shape. */
+  context?: string | null;
+  /** Path to navigate to. Present for every type added in #879; the
+   *  original seven are dispatched client-side because they pass
+   *  react-router state rather than a path. */
+  route?: string | null;
   matched_field?: string | null;
+  /** Relevance: match quality plus type weight. Higher is better. */
+  score?: number;
+}
+
+/** A type the calling user is permitted to search, used for scope chips. */
+export interface SearchTypeInfo {
+  type: SearchResultType;
+  label: string;
+  /** Scope chip this type belongs to: ipam | dns | dhcp | network | admin. */
+  group: string;
 }
 
 export interface SearchResponse {
   query: string;
   total: number;
   results: SearchResult[];
+  searched_types: SearchTypeInfo[];
 }
 
 export const searchApi = {
@@ -3397,6 +3432,8 @@ export const searchApi = {
     api
       .get<SearchResponse>("/search", { params: { q, types, limit } })
       .then((r) => r.data),
+  /** Types this caller may search — permission- and module-filtered. */
+  types: () => api.get<SearchTypeInfo[]>("/search/types").then((r) => r.data),
 };
 
 // ── Settings ───────────────────────────────────────────────────────────────────

@@ -185,31 +185,44 @@ def _get_soft_delete_models() -> tuple[type, ...]:
     return _CACHED_SOFT_DELETE_MODELS
 
 
-def _statement_references(statement: Any, model: type) -> bool:
-    """Cheap check — is ``model`` mentioned in the FROM-clause graph?
+def _referenced_soft_delete_models(statement: Any, models: tuple[type, ...]) -> set[type]:
+    """Which of ``models`` the statement mentions — resolved in ONE pass.
 
-    Walks the statement's ``column_descriptions`` (top-level entities)
-    plus any explicit FROMs reachable via ``get_final_froms``. Avoids the
-    cost of injecting loader criteria for models that aren't in the
-    query at all (e.g. an audit-log SELECT shouldn't carry six dangling
-    loader options for IPSpace / IPBlock / Subnet / DNSZone / DNSRecord
-    / DHCPScope just because they exist).
+    This used to be called once per model, and each call did its own
+    ``statement.get_final_froms()``. That method is not a cheap accessor: it
+    resolves and compiles the FROM graph, ~1.9 ms on a modest ORM select. At
+    eight in-scope models that is ~15 ms of pure Python **on every ORM
+    SELECT in the application** — measured at 16.7 ms for a query against
+    ``vlan``, a table with no soft-delete column, versus 0.35 ms for the
+    same query with the filter skipped. It went unnoticed because it is
+    uniform: nothing looks slow relative to anything else.
+
+    Resolving the FROM graph once and testing all eight models against it
+    is behaviour-identical and roughly eight times cheaper. Surfaced while
+    profiling global search (#879), which issues up to twenty of these per
+    keystroke and so paid the cost twenty times over.
     """
-
     try:
-        for desc in getattr(statement, "column_descriptions", None) or []:
-            if desc.get("entity") is model:
-                return True
+        entities = {
+            desc.get("entity") for desc in getattr(statement, "column_descriptions", None) or []
+        }
+        classes: set[Any] = set()
+        table_names: set[Any] = set()
         froms = statement.get_final_froms() if hasattr(statement, "get_final_froms") else []
         for fr in froms or []:
             mapper = getattr(fr, "_annotations", {}).get("parententity")
-            if mapper is not None and getattr(mapper, "class_", None) is model:
-                return True
-            if getattr(fr, "name", None) == getattr(model, "__tablename__", None):
-                return True
+            if mapper is not None:
+                classes.add(getattr(mapper, "class_", None))
+            table_names.add(getattr(fr, "name", None))
     except Exception:  # pragma: no cover — defensive, never block a query
-        return True
-    return False
+        # Same conservative answer the per-model version gave: assume every
+        # model is present rather than risk leaking soft-deleted rows.
+        return set(models)
+    return {
+        m
+        for m in models
+        if m in entities or m in classes or getattr(m, "__tablename__", None) in table_names
+    }
 
 
 @event.listens_for(Session, "before_flush")
@@ -252,8 +265,15 @@ def _filter_soft_deleted(execute_state: Any) -> None:
         return
 
     statement = execute_state.statement
-    for model in _get_soft_delete_models():
-        if not _statement_references(statement, model):
+    all_models = _get_soft_delete_models()
+    referenced = _referenced_soft_delete_models(statement, all_models)
+    if not referenced:
+        return
+    # Iterate the canonical tuple, not the set, so the options are applied
+    # in a deterministic order — a set's iteration order would vary the
+    # statement's cache key between processes for no reason.
+    for model in all_models:
+        if model not in referenced:
             continue
         # NOTE: no late-binding-closure bug here. ``model`` (the outer
         # loop var) is NOT captured by the lambda — it's passed to
