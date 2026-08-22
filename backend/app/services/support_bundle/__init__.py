@@ -106,6 +106,22 @@ async def _safe(
         return f"[section failed: {type(exc).__name__}: {exc}]"
 
 
+def _merge(sections: dict[str, str], prefix: str, produced: Any) -> None:
+    """Fold a multi-file collector's output into ``sections``.
+
+    ``_safe`` reports a failure by RETURNING a note string, not by
+    raising — so a caller that assumed a dict and went straight for
+    ``.items()`` got an ``AttributeError`` out of the one code path whose
+    entire purpose is that a broken collector cannot 500 the bundle.
+    A non-dict result is filed as the section's own note instead.
+    """
+    if isinstance(produced, dict):
+        for name, body in produced.items():
+            sections[f"{prefix}/{name}"] = body
+        return
+    sections[f"{prefix}/_error.txt"] = str(produced or "")
+
+
 async def generate(db: AsyncSession, *, scrubbed: bool = True) -> BundleResult:
     """Assemble the bundle.
 
@@ -123,7 +139,9 @@ async def generate(db: AsyncSession, *, scrubbed: bool = True) -> BundleResult:
     sections["versions.json"] = await _safe(
         "versions", lambda: collect.collect_versions(db), errors, db
     )
-    sections["health/self-test.txt"] = await _safe("self_test", collect.collect_self_test, errors)
+    sections["health/self-test.txt"] = await _safe(
+        "self_test", lambda: collect.collect_self_test(scrub), errors
+    )
     sections["health/db-connections.json"] = await _safe(
         "db_pool", lambda: collect.collect_db_pool(db), errors, db
     )
@@ -159,16 +177,15 @@ async def generate(db: AsyncSession, *, scrubbed: bool = True) -> BundleResult:
     sections["system/env.txt"] = await _safe(
         "environment", lambda: collect.collect_environment(scrub), errors
     )
-    for name, body in (await _safe("proc", collect.collect_proc, errors) or {}).items():
-        sections[f"system/{name}"] = body
-    for name, body in (
-        await _safe("pods", lambda: collect.collect_container_logs(scrub), errors) or {}
-    ).items():
-        sections[f"containers/{name}"] = body
-    for name, body in (
-        await _safe("host_logs", lambda: collect.collect_host_logs(scrub), errors) or {}
-    ).items():
-        sections[f"logs/{name}"] = body
+    _merge(sections, "system", await _safe("proc", lambda: collect.collect_proc(scrub), errors))
+    _merge(
+        sections,
+        "containers",
+        await _safe("pods", lambda: collect.collect_container_logs(scrub), errors),
+    )
+    _merge(
+        sections, "logs", await _safe("host_logs", lambda: collect.collect_host_logs(scrub), errors)
+    )
 
     # ── Safety net ──────────────────────────────────────────────────
     #

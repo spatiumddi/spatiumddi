@@ -269,6 +269,47 @@ def test_hostname_mapping_preserves_zone_grouping() -> None:
 
 
 @pytest.mark.parametrize(
+    "token",
+    [
+        "sqlalchemy.exc.ProgrammingError",
+        "pathlib.PosixPath",
+        "versions.json",
+        "internal-errors.json",
+        "named.conf",
+        "app.yml",
+    ],
+)
+def test_code_tokens_are_not_mistaken_for_hostnames(token: str) -> None:
+    """A traceback is among the most useful things in a bundle, and the
+    hostname pattern happily eats it — `sqlalchemy.exc.ProgrammingError`
+    is "labels separated by dots ending in letters" too.
+
+    Every rule that spares these is strictly safe: a camel-case final
+    label and a non-TLD extension both describe tokens that could not
+    resolve anyway, so nothing real stays exposed to buy the
+    readability.
+    """
+    assert Scrubber(seed="s").text(token) == token
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        # These ARE real TLDs (Paraguay, .sh, .zone), so sparing them to
+        # tidy up a traceback would leak a genuine hostname.
+        "collect.py",
+        "deploy.sh",
+        "corp.example.zone",
+        # An all-caps final label is a shouted hostname, not camel-case
+        # code — it must still be pseudonymised.
+        "HOST.EXAMPLE.COM",
+    ],
+)
+def test_tokens_that_could_be_real_hostnames_are_still_scrubbed(name: str) -> None:
+    assert Scrubber(seed="s").text(name) != name
+
+
+@pytest.mark.parametrize(
     "name", ["localhost", "5.2.1.10.in-addr.arpa", "1.0.0.0.ip6.arpa", "example.com"]
 )
 def test_structural_names_are_left_alone(name: str) -> None:

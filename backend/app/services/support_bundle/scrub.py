@@ -123,8 +123,15 @@ _SECRET_VALUE_PATTERNS: tuple[tuple[str, re.Pattern[str], str], ...] = (
 # broad: a false positive costs one redacted diagnostic field, a false
 # negative ships a credential to a public issue.
 SECRET_KEY_NAME_RE = re.compile(
-    r"(password|passwd|secret|token|apikey|credential|"
+    r"(password|passwd|passphrase|secret|token|apikey|credential|"
     r"_encrypted$|psk|tsig|hmac|salt|gpg|bearer|cookie|session[_-]?id"
+    # ``audit_forward_webhook_auth_header`` holds a literal
+    # "Bearer …" / "Basic …" in PLAINTEXT (see its column comment) and
+    # matched none of the terms above, so the settings collector shipped
+    # it verbatim into an archive destined for a public issue. An
+    # incoming-webhook URL is a bearer credential in its own right — the
+    # path segment IS the authentication — so both are matched by name.
+    r"|auth[_-]?header|authorization|webhook[_-]?url"
     # Any name ENDING in "key" or "keys". Broad on purpose: the agent
     # PSKs ship as DNS_AGENT_KEY / DHCP_AGENT_KEY / LG_AGENT_KEY, whose
     # values are raw hex with no shape a value-matcher could recognise —
@@ -200,6 +207,82 @@ _HOSTNAME_ALLOWLIST = frozenset(
         "frontend",
     }
 )
+
+# Final labels that CANNOT be a TLD, so a dotted token ending in one
+# cannot be a resolvable hostname and skipping it costs nothing in
+# privacy. This is the whole test applied below: every entry here was
+# checked against the IANA root zone, and deliberately absent are the
+# extensions that ARE real TLDs — `.zone`, `.py`, `.sh`, `.md`, `.rs`,
+# `.go`, `.dev` — because denying those would leak a genuine hostname to
+# save a line of traceback.
+_NON_TLD_SUFFIXES = frozenset(
+    {
+        "json",
+        "jsonl",
+        "txt",
+        "log",
+        "yml",
+        "yaml",
+        "conf",
+        "ini",
+        "toml",
+        "cfg",
+        "sql",
+        "lock",
+        "pyc",
+        "pyo",
+        "env",
+        "pem",
+        "crt",
+        "csr",
+        "bak",
+        "tmp",
+        "out",
+        "err",
+        "db",
+        "sqlite",
+        "whl",
+        "tar",
+        "gz",
+    }
+)
+
+
+def _is_probably_code_not_a_hostname(name: str) -> bool:
+    """Whether a dotted token is source code rather than a name.
+
+    Tracebacks are among the most useful things in a bundle, and the
+    hostname pattern happily eats them: ``sqlalchemy.exc.ProgrammingError``
+    and ``versions.json`` are both "labels separated by dots ending in
+    letters". Rewriting them to ``nA.nB.dC.invalid`` costs the reader the
+    stack trace they opened the file for.
+
+    Only STRICTLY SAFE rules are applied — each one identifies a token
+    that could not be a resolvable hostname anyway, so nothing real is
+    left exposed to buy the readability:
+
+    * a final label with BOTH cases (``ProgrammingError``, ``PosixPath``)
+      — no TLD is camel-case, while an all-caps ``EXAMPLE.COM`` is still
+      pseudonymised because a shouted hostname is a real one;
+    * a final label in :data:`_NON_TLD_SUFFIXES`.
+
+    Not covered, and accepted: ``collect.py`` and ``app.services.scrub``
+    are still pseudonymised — ``py`` is Paraguay's ccTLD and ``scrub``
+    could be a gTLD for all this function knows. Sparing them would need
+    a "preceded by a slash, so it is a path" heuristic, and that leaks
+    the domain straight out of a DNS product's own
+    ``/var/named/corp.example.com.zone`` log lines. What a reader keeps
+    in a mangled traceback line is the directory, the line number, the
+    function name and — the part that matters most — the exception's own
+    dotted module path, since ``ProgrammingError`` is camel-case.
+    Over-scrubbing is the correct direction to err in a file destined for
+    a public issue.
+    """
+    last = name.rsplit(".", 1)[-1]
+    if last.lower() in _NON_TLD_SUFFIXES:
+        return True
+    return any(c.isupper() for c in last) and any(c.islower() for c in last)
+
 
 # Public suffixes we keep intact so `foo.co.uk` does not read as a
 # two-label domain. Not the full PSL — that would be a dependency for a
@@ -356,6 +439,8 @@ class Scrubber:
         # them would destroy the one thing that makes a PTR log readable.
         if name.endswith(".in-addr.arpa") or name.endswith(".ip6.arpa"):
             return raw
+        if _is_probably_code_not_a_hostname(raw):
+            return raw
         if name in self._hosts:
             return self._hosts[name]
 
@@ -375,7 +460,17 @@ class Scrubber:
         return synth
 
     def username(self, raw: str) -> str:
-        if not raw:
+        """Map an operator/account name.
+
+        Unlike :meth:`mac` / :meth:`ipv4` / :meth:`hostname`, collectors
+        call this DIRECTLY rather than through :meth:`text`, so it has to
+        honour ``enabled`` itself. Without that check an unscrubbed
+        bundle still came back with ``user41234`` in the audit tail —
+        contradicting its own manifest ("contains real … usernames") and
+        leaving no way to read it, since the UI only offers the decode
+        map for a scrubbed bundle.
+        """
+        if not raw or not self.enabled:
             return raw
         key = raw.lower()
         if key not in self._users:

@@ -126,6 +126,11 @@ async def preview_support_bundle(
 ) -> BundlePreviewOut:
     """Dry run — what a bundle generated right now would contain."""
     _require_superadmin(current_user)
+    # Gated like the download it precedes. The preview is not a summary:
+    # it returns an excerpt of the real activity log plus the whole file
+    # inventory, so leaving it open on a shared demo instance would read
+    # out most of what blocking the download is meant to prevent.
+    forbid_in_demo_mode()
     _check_unscrubbed(body)
 
     result = await generate(db, scrubbed=body.scrubbed)

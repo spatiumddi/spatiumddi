@@ -362,7 +362,7 @@ def collect_environment(scrub: Scrubber) -> str:
     return "\n".join(lines)
 
 
-def collect_proc() -> dict[str, str]:
+def collect_proc(scrub: Scrubber) -> dict[str, str]:
     """Kernel / memory / CPU basics.
 
     Read from the api container's ``/proc``, which shares the host
@@ -455,7 +455,7 @@ def collect_host_logs(scrub: Scrubber) -> dict[str, str]:
     return out
 
 
-def collect_self_test() -> str:
+def collect_self_test(scrub: Scrubber) -> str:
     """Appliance self-test, when applicable.
 
     Reports inapplicability instead of failing: on a compose install the
@@ -472,7 +472,9 @@ def collect_self_test() -> str:
     from app.services.appliance.diagnostics import _format_self_test_report, run_self_test
 
     try:
-        return _format_self_test_report(run_self_test())
+        # Scrubbed: the report names pods and prints the cluster
+        # addresses each check probed.
+        return scrub.text(_format_self_test_report(run_self_test()))
     except Exception as exc:  # noqa: BLE001
         return f"self-test failed to run: {type(exc).__name__}: {exc}"
 
@@ -590,8 +592,13 @@ async def collect_table_sizes(db: AsyncSession) -> str:
     which is the only question this section exists for. Estimates are
     labelled as such so nobody quotes them as row counts.
     """
-    try:
-        rows = (await db.execute(text("""
+    # Through ``_guarded``, not a bare try/except: a swallowed statement
+    # error leaves PostgreSQL in "current transaction is aborted", which
+    # takes out every LATER section and the caller's own commit. The
+    # savepoint is what confines the damage to this one section.
+    result = await _guarded(
+        db,
+        lambda: db.execute(text("""
                     SELECT c.relname,
                            GREATEST(c.reltuples, 0)::bigint AS approx_rows,
                            pg_total_relation_size(c.oid)     AS total_bytes
@@ -599,9 +606,11 @@ async def collect_table_sizes(db: AsyncSession) -> str:
                       JOIN pg_namespace n ON n.oid = c.relnamespace
                      WHERE c.relkind = 'r' AND n.nspname = 'public'
                      ORDER BY pg_total_relation_size(c.oid) DESC
-                    """))).all()
-    except Exception as exc:  # noqa: BLE001
-        return _json({"error": f"{type(exc).__name__}: {exc}"})
+                    """)),
+    )
+    if isinstance(result, str):
+        return _json({"error": result})
+    rows = result.all()
 
     payload: dict[str, Any] = {
         "_note": (
