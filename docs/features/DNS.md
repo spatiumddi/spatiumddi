@@ -643,6 +643,89 @@ DNSBlockListException
 - Manual domain addition to block list
 - "Test a domain" — check if a domain would be blocked
 
+### Scoping — where a list applies (issue #876)
+
+A blocking list is applied through one of **two** independent
+relationships, and the difference is the whole point of the feature:
+
+| Scope | Relationship | Who it filters |
+|---|---|---|
+| Server group | `applied_group_ids` | every client the group answers |
+| View | `applied_view_ids` | only clients matching that view's `match-clients` |
+
+View scoping is what "the adult lists on the guest VLAN, threat lists
+everywhere" means in practice. It shipped with the split-horizon work in
+#24 and has been rendered end-to-end by the BIND9 agent since — but until
+#876 the UI wrote only the group half, so per-subnet filtering was
+unreachable from the product despite being fully implemented underneath.
+
+A **view** is a set of clients, identified by source address. `match_clients`
+is a BIND address-match-list: addresses, CIDR prefixes, or one of `any` /
+`none` / `localhost` / `localnets`, each optionally negated with a leading
+`!`. Views are evaluated in `order`
+(low first) and a client is served by the **first** view it matches, so
+the catch-all belongs last.
+
+#### Worked example — filter one VLAN
+
+The guest VLAN is `10.20.0.0/16`; everyone else should be unfiltered.
+
+1. **DNS → group → Views → New View.** Name `guest`, order `0`,
+   match clients `10.20.0.0/16`. *Add subnets…* fills that in from IPAM
+   rather than retyping the prefix.
+2. **New View** again: name `default`, order `10`, match clients `any`.
+   This is load-bearing — once any view exists BIND serves every client
+   from a view, so without a catch-all everyone outside the guest VLAN
+   matches nothing and gets no answer.
+3. **Blocklists tab** → the funnel icon on the adult/gambling list →
+   tick `guest`, leave *Whole group* unticked → **Save scope**.
+4. Threat lists stay on *Whole group*: they apply inside every view.
+
+The rendered config puts the RPZ inside the matching view only:
+
+```
+view "guest" {
+    match-clients { 10.20.0.0/16; };
+    response-policy { zone "spatium-blocklist-guest.rpz"; } break-dnssec yes;
+    ...
+};
+```
+
+#### Constraints worth knowing
+
+- **BIND9 only.** `render_rpz_zone` is a no-op on the Windows, PowerDNS
+  and cloud drivers, and Technitium blocks natively with no per-view
+  concept. The Views tab and the scope modal both say so when the group
+  runs a non-BIND9 server; scoping is stored but never applied there.
+- **Views are all-or-nothing for a group.** BIND forbids a top-level
+  `zone {}` alongside views, so once one view exists every zone is served
+  from inside a view. Zones with no view of their own render into all of
+  them.
+- **Named ACLs are not accepted in `match_clients` yet.** A `DNSAcl` row is
+  stored, listed and editable on the ACLs tab, and the config bundle even
+  carries an `acls` block — but only as `{id, name}`, and the DNS agent's
+  BIND9 renderer never reads it or emits an `acl {};` stanza. (The
+  control-plane template that does render one has no production caller.) A
+  view referencing an ACL by name would therefore reach a server with that
+  symbol undefined, `named-checkconf` would fail, and the agent would
+  decline the whole bundle — so the group stops converging entirely, not
+  just that view. The API rejects it with a 422 saying so. Use the
+  prefixes directly until the agent renders ACL definitions ([#899](https://github.com/spatiumddi/spatiumddi/issues/899)).
+- **`match_clients` and the view name are validated server-side**
+  (`app/services/dns/view_validation.py`). Both are interpolated verbatim
+  into `named.conf`, and the name additionally becomes a directory on the
+  agent, so a malformed prefix, an undefined ACL or TSIG key name, or a
+  name containing a path separator is rejected with a 422 naming the
+  offending element. It has to be: the agent runs `named-checkconf` before
+  swapping config in, so an accepted-but-invalid value would not corrupt
+  one view — it would stop the whole group's config converging, silently.
+  A view name is capped at **45 characters**, not 63: the per-view RPZ zone
+  is named `spatium-blocklist-<view>.rpz.`, and that 18-character prefix
+  has to fit inside the 63-octet DNS label limit with it.
+- **Deleting a view** leaves its zones in place (they fall back to being
+  served from the remaining views) but any list scoped *only* to it stops
+  applying anywhere.
+
 ### 8.1 Content filtering / family filter (issue #878)
 
 Two independent ways to filter adult content, and they compose:

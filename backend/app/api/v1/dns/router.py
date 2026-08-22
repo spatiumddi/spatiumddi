@@ -91,6 +91,11 @@ from app.services.dns.resolver_presets import (
     find_forwarder_conflict,
 )
 from app.services.dns.serial import bump_zone_serial
+from app.services.dns.view_validation import (
+    ViewValidationError,
+    validate_address_match_list,
+    validate_view_name,
+)
 from app.services.dns.zone_templates import (
     get_template,
     list_templates,
@@ -3337,20 +3342,83 @@ async def list_views(group_id: uuid.UUID, db: DB, _: CurrentUser) -> list[DNSVie
     return list(result.scalars().all())
 
 
+async def _validated_view_fields(
+    group_id: uuid.UUID, body: ViewCreate | ViewUpdate, db: DB
+) -> dict[str, Any]:
+    """Validate the free-text halves of a view before they reach named.conf.
+
+    ``name``, ``match_clients`` and ``match_destinations`` are interpolated
+    verbatim into the rendered config (and the name additionally becomes a
+    directory on the agent), so they are checked here rather than trusted.
+    Until #876 these fields were API-only and effectively unvalidated; now
+    that a form writes them, one typo would otherwise stop the whole
+    group's config converging when the agent's ``named-checkconf`` refuses
+    the bundle.
+
+    Returns only the fields present on ``body`` — an update leaves the rest
+    alone. Raises 422 naming the exact offending element.
+    """
+    changes: dict[str, Any] = {}
+    # Group-scoped ACLs only. Both bundle builders
+    # (``services/dns/{agent_config,config_bundle}.py``) select ACLs with
+    # ``group_id == server.group_id``, so a global (NULL-group) row is never
+    # rendered — accepting its name here would pass validation and then
+    # produce a named.conf referencing an ACL that isn't defined.
+    acl_names = frozenset(
+        (await db.execute(select(DNSAcl.name).where(DNSAcl.group_id == group_id))).scalars().all()
+    )
+    # TSIG key names the group ships to its agents: the operator-managed
+    # ``DNSTSIGKey`` rows plus the legacy auto-generated group key. Mirrors
+    # what ``agent_config`` puts in the bundle's ``tsig_keys`` block.
+    key_names = set(
+        (await db.execute(select(DNSTSIGKey.name).where(DNSTSIGKey.group_id == group_id)))
+        .scalars()
+        .all()
+    )
+    group = await db.get(DNSServerGroup, group_id)
+    if group is not None and group.tsig_key_name:
+        key_names.add(group.tsig_key_name)
+    known_keys = frozenset(key_names)
+    try:
+        name = getattr(body, "name", None)
+        if name is not None:
+            changes["name"] = validate_view_name(name)
+        # ``allow_query`` / ``allow_query_cache`` (#430) land in the same
+        # kind of address-match-list statement, so they get the same gate.
+        for attr in ("match_clients", "match_destinations", "allow_query", "allow_query_cache"):
+            value = getattr(body, attr, None)
+            if value is not None:
+                changes[attr] = validate_address_match_list(
+                    value, field=attr, known_acls=acl_names, known_keys=known_keys
+                )
+    except ViewValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"field": exc.field, "value": exc.value, "message": str(exc)},
+        ) from exc
+    return changes
+
+
 @router.post("/groups/{group_id}/views", response_model=ViewResponse, status_code=201)
 async def create_view(
     group_id: uuid.UUID, body: ViewCreate, db: DB, current_user: SuperAdmin
 ) -> DNSView:
     await _require_group(group_id, db)
+    payload = body.model_dump()
+    # Validate BEFORE the duplicate check: the validator strips the name, so
+    # checking ``body.name`` would let " guest" past a pre-check that "guest"
+    # would have caught, and the answer would come from the DB's unique
+    # violation as a generic 409 instead of the message naming the field.
+    payload.update(await _validated_view_fields(group_id, body, db))
     existing = await db.execute(
-        select(DNSView).where(DNSView.group_id == group_id, DNSView.name == body.name)
+        select(DNSView).where(DNSView.group_id == group_id, DNSView.name == payload["name"])
     )
     if existing.scalar_one_or_none():
         raise HTTPException(
             status_code=409, detail="A view with that name already exists in this group"
         )
 
-    view = DNSView(group_id=group_id, **body.model_dump())
+    view = DNSView(group_id=group_id, **payload)
     db.add(view)
     db.add(
         AuditLog(
@@ -3380,6 +3448,7 @@ async def update_view(
 ) -> DNSView:
     view = await _require_view(group_id, view_id, db)
     changes = body.model_dump(exclude_none=True)
+    changes.update(await _validated_view_fields(group_id, body, db))
     for k, v in changes.items():
         setattr(view, k, v)
     db.add(
