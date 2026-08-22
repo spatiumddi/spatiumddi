@@ -825,9 +825,48 @@ suggestion, free-space treemap.
   (the field name is runtime-chosen, so no trigram index can serve
   `custom_fields ->> 'x' ILIKE …`), and action commands that *do*
   something rather than navigate.
-- ⬜ [**Native mobile app**](https://github.com/spatiumddi/spatiumddi/issues/884) — PWA groundwork first, then iOS
+- 🟡 [**Native mobile app**](https://github.com/spatiumddi/spatiumddi/issues/884) — PWA groundwork first, then iOS
   (SwiftUI) against the REST API. Non-negotiable #1 means the API is
-  already complete enough to build against.
+  already complete enough to build against. The app itself now lives in its
+  own repo, **[spatiumddi/spatiumddi-mobile](https://github.com/spatiumddi/spatiumddi-mobile)**;
+  what remains here is the server side of that split. **Still open:** the app.
+  - ✅ [**Publish `openapi.json` as a release asset**](https://github.com/spatiumddi/spatiumddi/issues/903)
+    — with the app out of this repo the schema stops being a file a client
+    reads off the working tree and becomes the contract *between two repos*,
+    so it has to be versioned and fetchable. New `export-openapi` job in
+    `release.yml` attaches it to every CalVer tag;
+    `scripts/export_openapi.py` + `make openapi VERSION=…` reproduce the
+    identical bytes locally and in the client repo's CI.
+    **`info.version` was hardcoded `"0.1.0"`** in `create_app()` while
+    `settings.version` carried the real one — so every release would have
+    published a spec claiming to be 0.1.0, and a generated client would be
+    stamped with a version that never changes, defeating the entire point
+    of pinning. Fixed at the source, which also means a *running* server
+    stops misreporting itself at `/api/docs`. The export must go through
+    `app.openapi()` and never `get_openapi`: `create_app()` wraps it to
+    widen `HTTPValidationError.detail` to the string form ~270 handlers
+    actually return, and re-deriving the document drops that without
+    touching a call site — verified present in generated TypeScript as
+    `ValidationError[] | string`. `info.title` is pinned to the default
+    because it follows the operator-settable `app_title` (#886/#888), so a
+    branded install would otherwise publish its own name as the name of the
+    public API. **Two footguns found building it:** an *empty* `VERSION`
+    env var is not an absent one — pydantic-settings honours `""`, so
+    `settings.version` becomes empty and FastAPI asserts on a falsy version
+    (`create_app()` now passes `settings.version or "dev"` so a stray empty
+    `VERSION` degrades instead of killing the container at import); an
+    undefined Make
+    variable and an unset `GITHUB_REF_NAME` both produce exactly that. And
+    the script only imported `app` because the API image happens to set
+    `PYTHONPATH=/app`; run from a plain checkout — the client repo's case —
+    Python puts `scripts/` on `sys.path` rather than the cwd, so it now
+    self-locates `backend/`. Output is `sort_keys`-canonical so the
+    release-to-release diff stays readable; ~3.6 MB (not the "few hundred
+    KB" the issue estimated). Retained on every release via the pruner's
+    "unknown / future asset" default branch — **do not add a pattern for it
+    to `scripts/prune-release-assets.sh`**. The version handshake the issue
+    wanted is `GET /api/v1/version` (unauthenticated), **not**
+    `/health/platform`, which reports no version at all.
 - ✅ [**Login banner**](https://github.com/spatiumddi/spatiumddi/issues/885) · [**custom logo**](https://github.com/spatiumddi/spatiumddi/issues/886) ·
   [**environment banner**](https://github.com/spatiumddi/spatiumddi/issues/887) · [**`app_title` wired up**](https://github.com/spatiumddi/spatiumddi/issues/888)
   — shipped together in PR

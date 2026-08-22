@@ -75,6 +75,60 @@ build. Each router carries a `tags=[...]` label (alphabetised in
 `router.py`) so the Swagger / ReDoc sidebar groups endpoints by
 feature area.
 
+### 2.1 The versioned contract (`openapi.json` release asset)
+
+`/api/openapi.json` always describes the **running** build, which is the
+right answer for a browser and the wrong one for a client generated ahead
+of time. Since #903 the same document is attached to every CalVer release
+as `openapi.json`, so an out-of-repo client — the native app in
+[`spatiumddi/spatiumddi-mobile`](https://github.com/spatiumddi/spatiumddi-mobile)
+— can codegen against an exact server version rather than against whatever
+`main` happens to be:
+
+```
+https://github.com/spatiumddi/spatiumddi/releases/download/<tag>/openapi.json
+```
+
+Reproduce the identical file locally at any tag:
+
+```bash
+make openapi VERSION=2026.08.22-1     # writes ./openapi.json
+```
+
+Both go through [`scripts/export_openapi.py`](../scripts/export_openapi.py),
+which is the only supported way to generate it. Three things that script
+guarantees and a hand-rolled dump would not:
+
+- **It calls `app.openapi()`, never `fastapi.openapi.utils.get_openapi`.**
+  `create_app()` replaces `app.openapi` with a wrapper that widens
+  `HTTPValidationError.detail` to admit the string form ~270 handlers
+  actually return (see §8). Re-deriving the document loses that silently,
+  and a generated client then rejects a large share of this server's real
+  4xx bodies as schema violations.
+- **`info.version` is the release tag.** It was hardcoded `0.1.0` until
+  #903 — every release would have shipped a spec claiming to be 0.1.0,
+  which defeats pinning entirely. A running server now reports the same
+  value in its own `/api/openapi.json`.
+- **`info.title` is pinned to `SpatiumDDI`.** The served title follows
+  `app_title`, which operators can rebrand, so exporting from a branded
+  install would otherwise publish that install's name as the name of the
+  public API.
+
+**Version handshake.** A client knows which spec it was built against, and
+`GET /api/v1/version` (unauthenticated — see §7.2) reports what the server
+is running. Gating a feature is then a version comparison rather than
+probing for an endpoint and interpreting the 404.
+
+The document declares no `servers` block. That is deliberate: there is no
+canonical host, so per OpenAPI 3.1 it means "relative to wherever this is
+served" and the client supplies the operator's base URL.
+
+The asset is retained on **every** release, including ones past the
+heavy-asset keep window — pinning to an *older* server is exactly what it
+is for. `scripts/prune-release-assets.sh` achieves that through its
+"unknown / future asset — leave untouched" default branch, so **do not add
+a pattern for `openapi.json` to the pruner**.
+
 ---
 
 ## 3. Authentication

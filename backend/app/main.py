@@ -400,7 +400,7 @@ def _log_backup_section_catalog_gap() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     configure_logging()
-    logger.info("startup", service="api", version="0.1.0", debug=settings.debug)
+    logger.info("startup", service="api", version=settings.version, debug=settings.debug)
     await _seed_default_admin()
     await _seed_builtin_roles()
     _log_backup_section_catalog_gap()
@@ -744,7 +744,21 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title=settings.app_title,
         description="Open-source DDI — DNS, DHCP, and IP Address Management",
-        version="0.1.0",
+        # #903 — the RUNNING version, not a literal. This was hardcoded
+        # ``"0.1.0"`` while ``settings.version`` (from the ``VERSION`` env var
+        # the compose file and Helm chart both already set) carried the real
+        # one, so ``/api/docs`` and ``/api/openapi.json`` misreported every
+        # deployment since the first release. It matters more now that the
+        # document is published as a release asset and used to generate
+        # clients: a spec that always claims 0.1.0 cannot be pinned against.
+        # Falls back to ``"dev"`` for unversioned local builds, same as every
+        # other consumer of ``settings.version``. The ``or`` is load-bearing:
+        # pydantic-settings honours an EMPTY ``VERSION`` (so ``settings.version``
+        # becomes ``""`` rather than defaulting), and FastAPI asserts on a falsy
+        # version in ``__init__`` — which would turn a harmless misconfiguration
+        # into an api container that dies at import with a bare AssertionError,
+        # before logging is even configured.
+        version=settings.version or "dev",
         docs_url="/api/docs",
         redoc_url="/api/redoc",
         openapi_url="/api/openapi.json",

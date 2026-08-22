@@ -44,6 +44,7 @@ _KNOWN_REPO_ROOT_READS: dict[str, str] = {
         "agent/supervisor/spatium_supervisor/firewall_renderer.py"
     ),
     "test_ci_backend_relevant.py": ".github/scripts/ci-backend-relevant.sh",
+    "test_openapi_export.py": "scripts/export_openapi.py",
 }
 
 # ``parents[2]`` from backend/tests/x.py is the repo root; anything at that
