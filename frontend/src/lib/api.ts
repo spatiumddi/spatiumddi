@@ -193,6 +193,17 @@ export function formatApiError(err: unknown, fallback = "Error"): string {
     if (parts.length) return parts.join("; ");
   }
   if (detail && typeof detail === "object") {
+    // A structured 422 that names the offending field, e.g. the DNS view
+    // address-match-list validator (#876):
+    //   {"field": "match_clients", "value": "10.0.0.300", "message": "…"}
+    // Without this the operator was shown the raw JSON, which buries the
+    // one sentence that tells them what to fix.
+    const rec = detail as { message?: unknown; field?: unknown };
+    if (typeof rec.message === "string" && rec.message.trim()) {
+      return typeof rec.field === "string" && rec.field
+        ? `${rec.field}: ${rec.message}`
+        : rec.message;
+    }
     // Unexpected shape — stringify defensively so we never render an object.
     try {
       return JSON.stringify(detail);

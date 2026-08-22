@@ -546,12 +546,36 @@ suggestion, free-space treemap.
   1 MCP tool (`list_blocklist_templates`). BIND9-only,
   and [`docs/features/DNS.md` §8.1](docs/features/DNS.md) is explicit
   that DNS filtering is bypassable at all.
-- ⬜ [**Per-subnet DNS blocklist scoping — surface it in the UI**](https://github.com/spatiumddi/spatiumddi/issues/876)
-  — the backend already scopes a blocklist to a view *or* a server
-  group (`dns_blocklist_view_assoc`, honoured by the agent renderer
-  since #24); the UI exposes only the group half. Pairs with the #878
-  family filter, whose whole point is filtering one network and not
-  another.
+- ✅ [**Per-subnet DNS blocklist scoping — surface it in the UI**](https://github.com/spatiumddi/spatiumddi/issues/876)
+  — the backend has scoped a blocklist to a view *or* a server group
+  since #24 (`dns_blocklist_view_assoc`, rendered per-view by the agent);
+  the UI wrote only the group half, so the #878 family filter's whole
+  point — filtering one network and not another — was unreachable from
+  the product. Now: the **Views tab is full CRUD** (it was read-only, so
+  split-horizon was API-only to configure at all), with an *Add subnets…*
+  picker that turns IPAM prefixes into `match_clients`; a **scope modal**
+  on each blocking list writing group and view assignment in one PUT; and
+  per-view chips on both tabs. **The load-bearing addition is server-side
+  validation** (`app/services/dns/view_validation.py`): `match_clients`,
+  `match_destinations` and the view name are interpolated *verbatim* into
+  `named.conf`, and the name additionally becomes a directory on the
+  agent — so a malformed prefix, an undefined ACL name, a `;`-injection or
+  a `../` traversal are now 422s naming the offending element. That gate
+  matters because the agent runs `named-checkconf` before swapping config
+  in: an accepted-but-invalid value doesn't break one view, it stops the
+  whole group's config converging, silently. Also fixed: the Blocklists
+  tab classified a view-scoped list as "Available (not applied)" — i.e.
+  reported a list actively filtering a VLAN as doing nothing — and its
+  Apply/Detach toggle keyed off that section rather than the actual group
+  relationship, so "Detach" on a view-scoped list was a no-op that looked
+  broken. BIND9-only, and both surfaces say so when the group runs another
+  driver. **Found on the way:** the agent never renders `acl {}`
+  definitions at all — `DNSAcl` rows are stored and editable but the bundle
+  ships only `{id, name}` and the agent renderer ignores it, so naming an
+  ACL in a view would leave an undefined symbol and stop the group
+  converging. Named ACLs are therefore rejected in a view's match-list with
+  a 422 saying why; [#899](https://github.com/spatiumddi/spatiumddi/issues/899)
+  tracks making them real.
 - ✅ [**Blocklist feed wildcard semantics are per-list**](https://github.com/spatiumddi/spatiumddi/issues/894)
   — #878 made every feed row `is_wildcard=True`, right for all 19
   catalog sources but a global constant, and wrong for a host-specific
