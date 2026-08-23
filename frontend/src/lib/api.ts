@@ -3873,6 +3873,70 @@ export interface OUITaskStatus {
   error: string | null;
 }
 
+// ── InfluxDB push export (issue #889) ─────────────────────────────────────────
+
+/** Three declared versions, two wire dialects: ``v3`` reuses the v2
+ *  write endpoint with bearer auth and bucket=database naming. */
+export type InfluxDBVersion = "v1" | "v2" | "v3";
+
+export interface InfluxDBTarget {
+  id: string;
+  name: string;
+  enabled: boolean;
+  version: InfluxDBVersion;
+  url: string;
+  verify_tls: boolean;
+  timeout_seconds: number;
+  database: string;
+  username: string;
+  /** Secrets are write-only — the server reports presence, never value. */
+  password_set: boolean;
+  org: string;
+  bucket: string;
+  token_set: boolean;
+  measurement_prefix: string;
+  push_interval_seconds: number;
+  push_dns_metrics: boolean;
+  push_dhcp_metrics: boolean;
+  push_subnet_utilization: boolean;
+  push_dhcp_scope_leases: boolean;
+  last_push_at: string | null;
+  last_push_points: number;
+  last_push_error: string | null;
+  last_dns_bucket_at: string | null;
+  last_dhcp_bucket_at: string | null;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface InfluxDBTargetWrite {
+  name: string;
+  enabled: boolean;
+  version: InfluxDBVersion;
+  url: string;
+  verify_tls: boolean;
+  timeout_seconds: number;
+  database: string;
+  username: string;
+  /** ``null`` = keep what is stored, ``""`` = clear, else replace. */
+  password?: string | null;
+  org: string;
+  bucket: string;
+  token?: string | null;
+  measurement_prefix: string;
+  push_interval_seconds: number;
+  push_dns_metrics: boolean;
+  push_dhcp_metrics: boolean;
+  push_subnet_utilization: boolean;
+  push_dhcp_scope_leases: boolean;
+}
+
+export interface InfluxDBTestResult {
+  ok: boolean;
+  message: string;
+  points: number;
+}
+
 export type AuditForwardKind = "syslog" | "webhook" | "smtp";
 export type AuditForwardWebhookFlavor =
   | "generic"
@@ -4046,6 +4110,26 @@ export const settingsApi = {
         status: string;
         target: string;
       }>(`/settings/audit-forward-targets/${id}/test`)
+      .then((r) => r.data),
+  /** Issue #889 — InfluxDB push-export targets. Superadmin-only server
+   *  side; secrets are write-only (the row carries `*_set` booleans). */
+  listInfluxTargets: () =>
+    api.get<InfluxDBTarget[]>("/settings/influxdb-targets").then((r) => r.data),
+  createInfluxTarget: (body: InfluxDBTargetWrite) =>
+    api
+      .post<InfluxDBTarget>("/settings/influxdb-targets", body)
+      .then((r) => r.data),
+  updateInfluxTarget: (id: string, body: InfluxDBTargetWrite) =>
+    api
+      .put<InfluxDBTarget>(`/settings/influxdb-targets/${id}`, body)
+      .then((r) => r.data),
+  deleteInfluxTarget: (id: string) =>
+    api.delete(`/settings/influxdb-targets/${id}`),
+  /** Writes one synthetic point — a real write, because a reachable URL
+   *  with the wrong bucket / org / token still answers a plain GET. */
+  testInfluxTarget: (id: string) =>
+    api
+      .post<InfluxDBTestResult>(`/settings/influxdb-targets/${id}/test`)
       .then((r) => r.data),
 };
 

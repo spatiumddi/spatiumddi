@@ -75,7 +75,7 @@ Always read the relevant spec doc(s) before writing code for a feature area.
 | Cache / Sessions | Redis 7 |
 | Auth | python-jose + bcrypt (local), ldap3 (LDAP), joserfc (OIDC ID-token / JWKS), python3-saml (SAML), pyrad (RADIUS), tacacs_plus (TACACS+); Fernet for secrets at rest |
 | Logging | structlog → JSON → centralized log store (Loki / Elasticsearch) |
-| Metrics | Prometheus + Grafana (InfluxDB push export is **planned, not built** — [#889](https://github.com/spatiumddi/spatiumddi/issues/889)) |
+| Metrics | Prometheus + Grafana; InfluxDB v1 / v2 / v3 push export ([#889](https://github.com/spatiumddi/spatiumddi/issues/889)) |
 | Containerization | Docker (multi-stage, amd64+arm64), Docker Compose, Kubernetes + Helm |
 | Appliance OS | Alpine Linux (containers/appliance), Debian Stable (bare-metal ISO) |
 | Logo / Assets | `docs/assets/logo.svg`, `docs/assets/logo-icon.svg` — also copied to `frontend/src/assets/` |
@@ -443,10 +443,63 @@ probe-safety fix (#722) is not a vertical at all.
 - ✅ [**Decom-date awareness**](https://github.com/spatiumddi/spatiumddi/issues/46) — shipped `2026.06.11-1`: first-class `decom_date` on subnet + IP, a `decom_expiring` alert rule (severity escalation reused from the other `*_expiring` rules), a dashboard widget, and a `find_subnets_decommissioning` MCP tool. Migration `a3f7c1e92b48`.
 - ✅ [**Top-N reports**](https://github.com/spatiumddi/spatiumddi/issues/47) — shipped `2026.06.11-1`: a `/reports` surface (top subnets by utilization, owners by IP count, most-modified resources via `audit_log`, noisiest DNS clients), feature-module-gated with 4 MCP read tools.
 - ✅ [**Compliance / change report PDF**](https://github.com/spatiumddi/spatiumddi/issues/48) — shipped `2026.06.11-1`: `GET /api/v1/audit/export.pdf` renders an auditor-facing PDF of every `audit_log` mutation in a date range, grouped by user / resource / action, with a per-row SHA-256 tamper-evidence trailer.
-- ⬜ [**InfluxDB push export**](https://github.com/spatiumddi/spatiumddi/issues/889) — build the writer the tech-stack
-  table claimed for months but nothing implemented: periodic push of the
-  existing `metric_sample` rows to InfluxDB v1 / v2 / v3. Spec shape is
-  already written up in `docs/SHIPPED.md`; the code is greenfield.
+- ✅ [**InfluxDB push export**](https://github.com/spatiumddi/spatiumddi/issues/889) — the writer the tech-stack
+  table claimed for months while `grep -ri influx` over `backend/` returned
+  nothing. Now `InfluxDBTarget` + `backend/app/services/influxdb/`
+  (`line_protocol` / `client` / `collect` / `push`) + a 30 s beat task with
+  per-target interval gating, CRUD at `/settings/influxdb-targets` with a
+  **test-write**, and 1 MCP tool (`find_influxdb_targets`, default on,
+  superadmin-only). Migration `a2e7f31c9b48`.
+  **"All versions" is three declared versions over two wire dialects:**
+  `v3` is not a third client — every InfluxDB 3 product (Core, Enterprise,
+  Cloud Dedicated, Cloud Serverless) accepts the **v2** write endpoint, so
+  v3 reuses that path with `Authorization: Bearer` instead of `Token` and a
+  *database* named in the `bucket` parameter. All three verified against a
+  live server during development, `v1` via InfluxDB 2.7's DBRP
+  compatibility mapping.
+  **The idempotency (non-negotiable #9) is the server's, not ours:** line
+  protocol overwrites a point with an identical measurement + tag set +
+  timestamp, so a retry is free. That is what lets each push run **two
+  queries per source on separate row budgets** — a forward drain
+  (strictly `> watermark`, capped) and a replay of the closed
+  `(watermark − 5 min, watermark]` window, so a bucket an agent reported
+  late is still exported rather than skipped permanently and silently.
+  The separation is load-bearing, not tidiness: fold the replay into the
+  drain's lower bound and a fleet dense enough to fill the row cap inside
+  that window returns a truncated batch whose maximum is *below* the
+  watermark — pulling the cursor backwards every tick until it pins on
+  the oldest retained sample, with every push still reporting success and
+  the UI still green. Replayed rows never set the cursor.
+  Watermarks advance only on a successful write, so a dead collector
+  delays the export rather than punching a hole in it (the samples sit in
+  Postgres until `prune_metrics` retires them, so a target that recovers
+  inside `metric_retention_days` backfills itself). `last_push_at` moves
+  on failure too, or a fast-failing target would retry on every 30 s tick
+  instead of on its own interval — and the push is wrapped in a broad
+  per-target boundary, because the sweep pushes every due target in one
+  transaction and an escaping exception would discard the state updates
+  of the ones that succeeded. `httpx.InvalidURL` is named explicitly
+  alongside `HTTPError` for that reason: it derives from `Exception`, not
+  from the httpx error base.
+  **Two shapes of metric, and the difference matters on a dashboard:**
+  the DNS/DHCP counter deltas carry the **agent's own 60 s bucket
+  timestamp**, so a backfill lands on the hour the traffic happened — and
+  60 s, not the push interval, is the resolution floor (`push_interval`
+  below that just re-sends the same bucket). The IPAM utilization and
+  per-scope lease gauges the spec asked for are sampled *at push time*
+  from counters the app already maintains — no new table, but also no
+  backfill: the first point is when the target was enabled. Documented
+  as such rather than labelled "realtime". The lease gauge counts
+  **distinct addresses**: `dhcp_lease` is per-server and a Kea HA pair
+  mirrors each lease twice, so `COUNT(*)` would report 2× on exactly the
+  deployments that matter, and disagree with `pool_occupancy.py`.
+  **Test is a real single-point write**, not a reachability ping: a
+  correct URL with the wrong bucket, org or token answers a GET perfectly
+  well and then rejects every point. Explicitly **not** a feature module
+  (non-negotiable #14) — no sidebar section, no router prefix, and "off"
+  is already `enabled=false` on the row. **Deferred:** API request
+  rate/latency and per-component health, which the old spec listed but
+  nothing samples at push cadence.
 
 #### Subnet planning & calculation tools
 

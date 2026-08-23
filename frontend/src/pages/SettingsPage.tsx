@@ -21,6 +21,7 @@ import { cn } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
 import { Toggle } from "@/components/ui/toggle";
 import { AuditForwardTargets } from "@/components/AuditForwardTargets";
+import { InfluxDBTargets } from "@/components/InfluxDBTargets";
 import { AgentBootstrapKeysSection } from "@/components/AgentBootstrapKeysSection";
 import { BrandLogo } from "@/components/BrandLogo";
 import { usePublicSettings } from "@/hooks/usePublicSettings";
@@ -98,6 +99,7 @@ type SectionId =
   | "network-domains"
   | "network-vrf"
   | "ai-digest"
+  | "influxdb-export"
   | "password-policy"
   | "account-lockout"
   | "agent-bootstrap-keys"
@@ -114,6 +116,7 @@ type SectionGroup =
   | "DNS"
   | "DHCP"
   | "Network"
+  | "Metrics"
   | "AI";
 
 interface SectionDef {
@@ -135,6 +138,10 @@ const GROUP_ORDER: SectionGroup[] = [
   "DNS",
   "DHCP",
   "Network",
+  "Metrics",
+  // "AI" was missing here while an "ai-digest" section declared it, so
+  // that section rendered only when the sidebar filter was non-empty.
+  "AI",
 ];
 
 // Which PlatformSettings keys each section owns — drives the per-section
@@ -190,6 +197,10 @@ const SECTION_FIELDS: Record<SectionId, (keyof PlatformSettings)[]> = {
   // service); they're intentionally not listed here so the singleton
   // Save button doesn't hit them.
   "audit-forward": [],
+  // Managed through the dedicated InfluxDBTargets component — the
+  // targets are their own rows, not PlatformSettings columns, so the
+  // singleton Save button owns nothing here.
+  "influxdb-export": [],
   "ip-allocation": ["ip_allocation_strategy"],
   "oui-lookup": ["oui_lookup_enabled", "oui_update_interval_hours"],
   "device-profiling": ["fingerbank_api_key"],
@@ -996,6 +1007,29 @@ const SECTIONS: SectionDef[] = [
       "rt",
       "validation",
       "strict",
+    ],
+  },
+
+  // ── Metrics ───────────────────────────────────────────────────────────
+  {
+    id: "influxdb-export",
+    title: "InfluxDB Export",
+    group: "Metrics",
+    description:
+      "Push DNS + DHCP counter deltas and IPAM / lease gauges to InfluxDB v1, v2 or v3 as line protocol, for Grafana dashboards. Multiple destinations can run at once (a local InfluxDB alongside a hosted one); each has its own interval, measurement prefix and metric selection. Prometheus scraping at /metrics is unaffected — the two exports are independent.",
+    keywords: [
+      "influx",
+      "influxdb",
+      "metrics",
+      "export",
+      "push",
+      "grafana",
+      "timeseries",
+      "time-series",
+      "telegraf",
+      "line protocol",
+      "bucket",
+      "observability",
     ],
   },
 
@@ -1845,6 +1879,10 @@ export function SettingsPage() {
 
             {activeId === "audit-forward" && (
               <AuditForwardTargets isSuperadmin={!!isSuperadmin} />
+            )}
+
+            {activeId === "influxdb-export" && (
+              <InfluxDBTargets isSuperadmin={!!isSuperadmin} />
             )}
 
             {activeId === "dhcp" && (

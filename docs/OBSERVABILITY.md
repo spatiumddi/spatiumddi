@@ -632,6 +632,73 @@ need `Get-DnsServerStatistics` / `Get-DhcpServerv4Statistics` calls
 over WinRM). The dashboard card shows "no data yet" rather than an
 error in that case.
 
+### InfluxDB Push Export (issue #889) — shipped
+
+The same two tables feed an outbound push. `InfluxDBTarget` rows are
+configured under **Settings → Metrics → InfluxDB Export**; a Celery
+beat task (`app.tasks.influxdb_push.push_influxdb_metrics`, 30 s tick,
+per-target interval gating) renders line protocol and POSTs it.
+
+This is a *push*, so it works where the Prometheus scrape does not —
+a control plane behind NAT, or an operator who already runs InfluxDB
+and does not want a second TSDB. The two are independent; running both
+is fine.
+
+Measurements, versions (v1 / v2 / v3), idempotency and the high-water
+marks (a strictly-forward drain plus a separately-budgeted replay
+window) are documented in
+[`features/SYSTEM_ADMIN.md` § 8](features/SYSTEM_ADMIN.md#influxdb-export-issue-889).
+The short version:
+
+* Counter deltas (`<prefix>dns_queries`, `<prefix>dhcp_messages`) carry
+  the **agent bucket's own timestamp** — 60 s is the resolution floor
+  no matter what push interval you pick.
+* Gauges (`<prefix>subnet_utilization`, `<prefix>dhcp_scope_leases`)
+  are sampled at push time and have no backfill.
+* v3 reuses the v2 write endpoint with bearer auth and
+  bucket=database naming, so InfluxDB 3 Core / Enterprise / Cloud all
+  work through the same path.
+
+#### Grafana with an InfluxDB datasource
+
+Add the datasource (**Connections → Add new connection → InfluxDB**),
+pick **Flux** as the query language, and point it at the same URL,
+org, bucket and token you gave the target. Then, for the two panels
+operators want first:
+
+DNS query rate per server, as queries/second:
+
+```flux
+from(bucket: "ddi")
+  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)
+  |> filter(fn: (r) => r._measurement == "spatiumddi_dns_queries")
+  |> filter(fn: (r) => r._field == "queries_total")
+  |> map(fn: (r) => ({r with _value: float(v: r._value) / 60.0}))
+  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)
+  |> group(columns: ["server"])
+```
+
+The `/ 60.0` is the load-bearing part: the stored value is a *delta
+per 60 s bucket*, not a rate and not a running counter, so neither
+`derivative()` nor a bare plot gives you queries/second.
+
+Subnet utilization, latest sample per subnet, for a table or gauge:
+
+```flux
+from(bucket: "ddi")
+  |> range(start: -1h)
+  |> filter(fn: (r) => r._measurement == "spatiumddi_subnet_utilization")
+  |> filter(fn: (r) => r._field == "percent")
+  |> last()
+  |> group()
+  |> keep(columns: ["subnet", "space", "_value"])
+```
+
+On a **v1** datasource the same series are reachable through InfluxQL,
+where the deltas are plain values (`SELECT sum("queries_total") FROM
+"spatiumddi_dns_queries" WHERE $timeFilter GROUP BY time($__interval),
+"server"`) — again a per-bucket sum, not `derivative()`.
+
 ### Celery / Worker Metrics (planned — not emitted)
 
 ```

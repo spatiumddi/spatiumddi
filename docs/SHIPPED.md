@@ -571,9 +571,10 @@ Mirrors CLAUDE.md's three mixed sections:
     column with `server_id` label would make the existing
     `/metrics` endpoint a full-featured scrape target for
     operators who prefer Grafana.
-  - **InfluxDB push export** (`InfluxDBTarget` spec in
-    `docs/features/SYSTEM_ADMIN.md §8.2`) — shape exists, writer
-    still pending.
+  - **InfluxDB push export** (`InfluxDBTarget`) — **shipped**
+    (#889). See `docs/features/SYSTEM_ADMIN.md §8` for the built
+    shape; the v1 / v2 / v3 writer, the beat task and the
+    high-water-mark semantics all live there.
   - **Per-qtype** (BIND) / **per-subnet** (Kea) breakdowns —
     `statistic-get-all` already carries per-subnet counters; the
     agent strips them for MVP. Adding them is column-only, no

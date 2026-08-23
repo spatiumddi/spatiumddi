@@ -83,6 +83,7 @@ from app.models.firewall import (
 )
 from app.models.firewall_feed import FirewallFeed
 from app.models.fortinet import FortinetFirewall
+from app.models.influxdb import InfluxDBTarget
 from app.models.ipam import (
     CustomFieldDefinition,
     IPAddress,
@@ -293,6 +294,7 @@ __all__ = [
     "FirewallApplyState",
     "FirewallPolicy",
     "FirewallRule",
+    "InfluxDBTarget",
     "InternalError",
     "BackupTarget",
     "RestoreDrill",
