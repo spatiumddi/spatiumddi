@@ -21,9 +21,21 @@ on none, and an unbounded heartbeat is worse than no heartbeat:
   so a tick that blocks forever wedges one slot per interval and takes
   the whole worker pool inside a few minutes — while ``inspect ping``,
   answered by the MainProcess, keeps reporting the worker healthy;
-* ``expires`` discards a tick that has been queued too long instead of
-  running a backlog of them after an outage, which would write the same
-  key N times for no benefit.
+* the Redis connect timeout is deliberately tighter than the platform
+  default. This is a 30 s-cadence liveness ping, not a data path: failing
+  fast and retrying on the next tick beats waiting.
+
+**``expires`` is deliberately NOT set.** It looks like the right way to
+stop an outage backlog replaying, and it introduces a worse failure than
+the one it prevents: Celery stamps ``expires`` as an *absolute* timestamp
+from the **publisher's** clock (beat) and ``Request.maybe_expire``
+compares it against the **worker's** clock. A worker node whose clock runs
+ahead of beat's by more than the window revokes every tick, the key is
+never written, and ``/health/platform`` sits red permanently — the exact
+symptom this file exists to prevent, in exactly the post-reboot window
+where NTP has not converged. The backlog it would have prevented is
+harmless anyway: every tick writes the same key, and with the time limits
+above the pool cannot wedge, so a backlog drains in seconds.
 
 A Redis failure is logged and swallowed rather than raised. The health
 endpoint already reports the outage from the key's absence, and letting
@@ -50,16 +62,26 @@ BEAT_HEARTBEAT_TTL_SECONDS = 300
 # ``celery_app.beat_schedule["platform-beat-heartbeat"]``.
 BEAT_HEARTBEAT_INTERVAL_SECONDS = 30
 
-# Long enough for a sentinel round trip that has to walk past one dead
-# sentinel (measured ~28 s against an unreachable one, so a tick during a
-# node reboot is *expected* to hit this), short enough that a wedged tick
-# frees its slot well inside the next few intervals.
-_SOFT_TIME_LIMIT_SECONDS = 20
-_HARD_TIME_LIMIT_SECONDS = 30
+# Sized from measurement, not intuition. Walking past a sentinel that
+# resolves but does not answer costs far more than its connect timeout,
+# because redis-py retries internally: measured 17.5 s per dead sentinel at
+# a 2 s connect timeout, 12.8 s at 1 s. A rolling node reboot leaves one
+# sentinel in that state, so the limit has to clear ~13 s comfortably or it
+# soft-kills the tick just before it would have succeeded — degrading
+# celery-beat for the length of every upgrade, which is the #925 symptom
+# rather than its fix.
+#
+# Both limits stay UNDER the 30 s schedule interval. That is the property
+# that matters: a tick which can outlive its own interval still accumulates
+# one occupied slot per interval, just more slowly.
+_SOFT_TIME_LIMIT_SECONDS = 25
+_HARD_TIME_LIMIT_SECONDS = 28
 
-# Four intervals. Normal worker backlog never trips it; an outage backlog
-# is discarded rather than replayed.
-_EXPIRES_SECONDS = BEAT_HEARTBEAT_INTERVAL_SECONDS * 4
+# Tighter than the platform default (2 s) on purpose — see the module
+# docstring. At 1 s a dead sentinel costs ~12.8 s instead of ~17.5 s, which
+# is what makes two of them fit inside the limits above.
+_CONNECT_TIMEOUT_SECONDS = 1
+_SOCKET_TIMEOUT_SECONDS = 2
 
 
 @celery_app.task(
@@ -68,7 +90,6 @@ _EXPIRES_SECONDS = BEAT_HEARTBEAT_INTERVAL_SECONDS * 4
     ignore_result=True,
     soft_time_limit=_SOFT_TIME_LIMIT_SECONDS,
     time_limit=_HARD_TIME_LIMIT_SECONDS,
-    expires=_EXPIRES_SECONDS,
 )
 def beat_tick(self) -> str:  # noqa: ARG001 — bind=True boilerplate
     r = None
@@ -78,8 +99,8 @@ def beat_tick(self) -> str:  # noqa: ARG001 — bind=True boilerplate
             # Explicit rather than relying on the helper's default: this is
             # the caller whose missing timeout caused #925, and a reader
             # checking "is this one bounded?" should not have to go look.
-            socket_connect_timeout=2,
-            socket_timeout=2,
+            socket_connect_timeout=_CONNECT_TIMEOUT_SECONDS,
+            socket_timeout=_SOCKET_TIMEOUT_SECONDS,
         )
         r.set(
             BEAT_HEARTBEAT_KEY,

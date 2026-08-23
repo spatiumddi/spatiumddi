@@ -235,9 +235,9 @@ async def platform_health() -> JSONResponse:
     #
     # Deliberately NOT fixed by adding an ``inspect.active()`` round trip:
     # this endpoint is unauthenticated, so every extra broadcast RPC here
-    # is amplification an anonymous caller controls. The beat component
-    # above is the signal that does surface a wedged pool — which is why
-    # its detail must not blame beat for it.
+    # is amplification an anonymous caller controls. The celery-beat
+    # component BELOW is the signal that does surface a wedged pool —
+    # which is why its detail must not blame beat for it.
     def _inspect_ping() -> dict[str, Any] | None:
         from app.celery_app import celery_app  # noqa: PLC0415
 
@@ -333,6 +333,12 @@ async def platform_health() -> JSONResponse:
                 # so a skewed clock could hide a genuinely dead beat.
                 status_str = "warn"
                 detail = f"last tick {-age_s:.0f}s in the future (clock skew)"
+            elif age_s < 0:
+                # Skew too small to be worth warning about, but "last tick
+                # -12s ago" is nonsense on a dashboard. Clamp the wording;
+                # sub-threshold skew between two nodes is normal.
+                status_str = "ok"
+                detail = "last tick just now"
             else:
                 status_str = "ok"
                 detail = f"last tick {age_s:.0f}s ago"

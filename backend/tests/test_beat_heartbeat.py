@@ -53,13 +53,34 @@ def test_tick_cannot_outlive_its_own_interval_by_much() -> None:
     )
 
 
-def test_stale_queued_ticks_expire_rather_than_replaying() -> None:
-    """After an outage the queue holds a backlog of ticks that all write the
-    same key. Running them is pure waste; the expiry is generous enough that
-    ordinary worker backlog never trips it."""
-    assert beat_tick.expires is not None
-    assert beat_tick.expires > BEAT_HEARTBEAT_INTERVAL_SECONDS
-    assert beat_tick.expires < BEAT_HEARTBEAT_TTL_SECONDS
+def test_expires_is_not_set() -> None:
+    """``expires`` would trade this bug for a worse one.
+
+    Celery stamps it as an *absolute* timestamp from the **publisher's**
+    clock (beat) and ``Request.maybe_expire`` compares it against the
+    **worker's** clock — verified against the installed celery. A worker
+    node running ahead of beat by more than the window revokes every tick,
+    so the key is never written and ``/health/platform`` sits red
+    permanently: the reported symptom, made unconditional, in exactly the
+    post-reboot window where NTP has not converged.
+
+    The backlog it would prevent is harmless — every tick writes the same
+    key, and the time limits above stop the pool wedging, so a backlog
+    drains in seconds.
+    """
+    assert beat_tick.expires is None
+
+
+def test_limits_clear_a_realistic_sentinel_outage() -> None:
+    """A rolling node reboot leaves one sentinel resolving-but-dead.
+
+    Measured cost of walking past one: ~12.8 s at the 1 s connect timeout
+    this task uses (~17.5 s at 2 s) — far more than the connect timeout,
+    because redis-py retries internally. A soft limit that does not clear
+    that comfortably kills the tick just before it would have succeeded,
+    degrading celery-beat for the length of every upgrade.
+    """
+    assert beat_tick.soft_time_limit >= 20
 
 
 def test_redis_failure_is_swallowed_and_logged(monkeypatch: pytest.MonkeyPatch) -> None:

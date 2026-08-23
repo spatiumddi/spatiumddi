@@ -1350,10 +1350,19 @@ suggestion, free-space treemap.
   failed; `socket_timeout` is deliberately *not* defaulted, since
   `core/agent_wake` parks a pub/sub read that is supposed to be slow and a
   read timeout would turn the wake bus into a reconnect loop. `beat_tick`
-  gains `soft_time_limit` / `time_limit` (a tick cannot outlive its own
-  interval and hold a slot) and `expires` (an outage backlog is discarded,
-  not replayed into the same key), and swallows+logs Redis errors rather
-  than filing a diagnostics row every 30 s for the length of an outage.
+  gains `soft_time_limit` / `time_limit`, both **under** its own 30 s
+  interval — a tick allowed to outlive the interval still accumulates one
+  occupied slot per interval, just more slowly — sized from measurement
+  (walking past one resolving-but-dead sentinel costs ~12.8 s at a 1 s
+  connect timeout, far more than the timeout itself because redis-py
+  retries internally, so a limit that does not clear it kills the tick just
+  before it succeeds). `expires` was tried and **removed in review**: Celery
+  stamps it as an absolute time from the *publisher's* clock and the
+  *worker* compares it, so a worker running ahead of beat would revoke every
+  tick and make the reported symptom permanent — trading the bug for a
+  strictly worse one, in exactly the post-reboot window where NTP has not
+  converged. Redis errors are swallowed and logged rather than filing a
+  diagnostics row every 30 s for the length of an outage.
   The health detail now names both suspects, and a stamp more than 90 s in
   the **future** reads as clock skew instead of as perfectly fresh — the
   plain `age_s > 90` test would have masked a genuinely dead beat behind a

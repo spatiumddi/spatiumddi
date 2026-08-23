@@ -331,8 +331,11 @@ no timeout blocks indefinitely — measured still blocked at 60 s — and a
 tick is enqueued every 30 s regardless, so a 4-slot pool is gone in about
 two minutes and never comes back. Every Redis client now gets a default
 connect timeout (`app/core/redis_client.py`) and the heartbeat task carries
-`soft_time_limit` / `time_limit` / `expires`, so a tick fails and frees its
-slot instead of holding it.
+`soft_time_limit` / `time_limit`, both under its own 30 s interval, so a
+tick fails and frees its slot instead of holding it. (`expires` is
+deliberately absent — Celery stamps it from the *publisher's* clock and the
+*worker* compares it, so on a skewed pair it would revoke every tick and
+make this symptom permanent.)
 
 A `warn` reading `last tick Ns in the future (clock skew)` means the node
 that ran the tick and the node serving this endpoint disagree about the

@@ -74,6 +74,20 @@ async def test_stale_tick_warns(client: AsyncClient, monkeypatch: pytest.MonkeyP
 
 
 @pytest.mark.asyncio
+async def test_small_forward_skew_renders_sensibly(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Sub-threshold skew between two nodes is normal and stays ``ok`` — but
+    it must not render as ``last tick -45s ago``, which is nonsense on a
+    dashboard and was what the bare subtraction produced."""
+    stamp = (datetime.now(UTC) + timedelta(seconds=45)).isoformat()
+    monkeypatch.setattr("app.core.redis_client.make_async_redis", lambda *a, **k: _FakeRedis(stamp))
+    beat = _beat((await client.get("/health/platform")).json())
+    assert beat["status"] == "ok"
+    assert "-" not in beat["detail"], beat["detail"]
+
+
+@pytest.mark.asyncio
 async def test_tick_stamped_in_the_future_is_not_reported_healthy(
     client: AsyncClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
