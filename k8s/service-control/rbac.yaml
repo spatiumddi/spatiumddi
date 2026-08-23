@@ -1,0 +1,43 @@
+# Service control RBAC (issue #890) — opt-in.
+#
+# Grants the api ServiceAccount enough to list SpatiumDDI's own workloads
+# and bump the pod-template annotation that triggers a rollout restart.
+# Namespace-scoped; no cluster-scoped grants and no ability to create or
+# delete anything.
+#
+# The base manifests in k8s/base/ run the api under the namespace's
+# ``default`` ServiceAccount, so that is what this binds. If you have
+# switched the api to a dedicated SA, change the ``subjects`` name to
+# match and set ``serviceAccountName`` on the Deployment accordingly.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: spatiumddi-service-control
+  namespace: spatiumddi
+  labels:
+    app.kubernetes.io/name: spatiumddi
+    app.kubernetes.io/component: api
+rules:
+  # ``list`` powers the Services inventory; ``patch`` performs the
+  # rollout restart. No ``create`` / ``delete`` — the only mutation this
+  # feature makes is an annotation on an existing pod template.
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets", "daemonsets"]
+    verbs: ["get", "list", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: spatiumddi-service-control
+  namespace: spatiumddi
+  labels:
+    app.kubernetes.io/name: spatiumddi
+    app.kubernetes.io/component: api
+subjects:
+  - kind: ServiceAccount
+    name: default
+    namespace: spatiumddi
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: spatiumddi-service-control

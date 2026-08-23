@@ -12,6 +12,7 @@ import {
   RefreshCw,
   Server,
   Sparkles,
+  Wrench,
   Zap,
 } from "lucide-react";
 import {
@@ -28,11 +29,18 @@ import {
   type ContainerStat,
   type RedisOverview,
 } from "@/lib/api";
+import { ServicesPanel } from "@/components/ServicesPanel";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Link } from "react-router-dom";
 import { ShieldCheck } from "lucide-react";
 
-type TabKey = "postgres" | "redis" | "containers" | "conformity" | "copilot";
+type TabKey =
+  | "postgres"
+  | "redis"
+  | "containers"
+  | "services"
+  | "conformity"
+  | "copilot";
 
 function formatBytes(n: number | null | undefined): string {
   if (n == null) return "—";
@@ -675,6 +683,18 @@ export function PlatformInsightsPage() {
               Containers
             </button>
             <button
+              onClick={() => setTab("services")}
+              className={cn(
+                "border-b-2 px-3 py-2 text-sm font-medium -mb-px transition-colors",
+                tab === "services"
+                  ? "border-primary text-foreground"
+                  : "border-transparent text-muted-foreground hover:text-foreground",
+              )}
+            >
+              <Wrench className="mr-1 inline h-3.5 w-3.5" />
+              Services
+            </button>
+            <button
               onClick={() => setTab("conformity")}
               className={cn(
                 "border-b-2 px-3 py-2 text-sm font-medium -mb-px transition-colors",
@@ -703,6 +723,7 @@ export function PlatformInsightsPage() {
 
         {tab === "postgres" && <PostgresPanel />}
         {tab === "redis" && <RedisPanel />}
+        {tab === "services" && <ServicesPanel />}
         {tab === "containers" && <ContainersPanel />}
         {tab === "conformity" && <ConformityPanel />}
         {tab === "copilot" && <AIUsagePanel />}

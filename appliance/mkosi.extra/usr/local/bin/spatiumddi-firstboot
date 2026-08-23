@@ -803,6 +803,19 @@ spec:
       # upgrade path; docker/k8s installs leave this off by default.
       upgradeOrchestratorRBAC:
         enabled: true
+      # #890 — the Services screen lists and rollout-restarts the chart's
+      # own workloads. ``serviceControl`` (the SERVICE_CONTROL_ENABLED env)
+      # is deliberately NOT set here: ``appliance_mode`` already implies
+      # the gate in app/config.py, because the appliance has shipped the
+      # same control at POST /appliance/containers/{name}/{action} since
+      # #134 and an opt-in would take away a capability rather than add
+      # one. The RBAC half has no such history, so it is granted here —
+      # without it the api can patch a Deployment (the base Role allows
+      # that for the TLS-Secret rollover) but cannot list any workload,
+      # and the Services screen would report an empty inventory on the one
+      # deployment where control is on by default.
+      serviceControlRBAC:
+        enabled: true
       # Appliance bind mounts. /var/lib/spatiumddi-host/release-state
       # backs the setup-complete flag, slot-upgrade triggers, and the
       # maintenance flag; without this the wizard's "Finish setup"

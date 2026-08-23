@@ -1,0 +1,11 @@
+# Strategic-merge patch enabling the API half of service control (#890).
+# Pair with rbac.yaml — the env var alone reports the capability as on
+# and then takes a 403 from kubeapi on the first list.
+spec:
+  template:
+    spec:
+      containers:
+        - name: api
+          env:
+            - name: SERVICE_CONTROL_ENABLED
+              value: "true"

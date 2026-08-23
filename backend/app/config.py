@@ -171,6 +171,20 @@ class Settings(BaseSettings):
     # it as a scanner / SSRF / relay. See app.core.demo_mode.
     demo_mode: bool = False
 
+    # Service control (#890) — lets a superadmin start / stop / restart
+    # the stack's own services from the web UI. Default OFF, and
+    # deliberately so on both backends it can use: on docker-compose the
+    # action goes through a restart-capable ``docker.sock``, which is
+    # equivalent to root on the host; on Kubernetes it needs RBAC the
+    # chart only grants when ``api.serviceControlRBAC.enabled`` is set,
+    # so turning this on without that produces an honest 403 rather than
+    # a silent no-op. Appliance installs are exempt — ``appliance_mode``
+    # implies the gate, because ``POST /appliance/containers/{name}/
+    # {action}`` already ships the same control there and requiring a new
+    # opt-in would remove a capability rather than add one.
+    # See app/services/service_control/.
+    service_control_enabled: bool = False
+
     # Appliance mode — set true by the appliance ISO compose env so
     # the API knows it's running on an appliance image (vs. plain
     # docker-compose / k8s). Gates the "Appliance" sidebar section

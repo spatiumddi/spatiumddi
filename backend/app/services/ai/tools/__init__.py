@@ -58,6 +58,7 @@ from app.services.ai.tools import (  # noqa: F401, E402
     reports,
     resolver,
     saved_views,
+    services,
     snmp,
     ssh,
     support_bundle,

@@ -30,6 +30,7 @@ import {
   dhcpApi,
   dnsApi,
   type ApplianceRow,
+  type ApplianceWorkload,
   type ApplianceState,
   type ApplianceUpgradeStep,
   type ControlPlaneReplaceResult,
@@ -3051,28 +3052,19 @@ function ApplianceHostMigrationSection({ row }: { row: ApplianceRow }) {
 // state (legacy compose appliances ship an empty cluster_health
 // dict, so this section quietly hides).
 function ApplianceClusterHealthSection({ row }: { row: ApplianceRow }) {
-  const qc = useQueryClient();
-  // Hooks must run unconditionally — declare the mutation up front,
-  // then bail later if cluster_health is empty.
-  const restartBind9 = useMutation({
-    mutationFn: () =>
-      applianceApprovalApi.k8sRolloutRestart(row.id, {
-        kind: "Deployment",
-        namespace: "spatium",
-        name: "dns-bind9",
-      }),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["appliance", "fleet"] }),
-  });
+  // Hooks must run unconditionally — declare state up front, then bail
+  // later if cluster_health is empty.
+  // #890 — the restart was a single button hardcoded to
+  // ``deploy/dns-bind9``, so a node running PowerDNS, Technitium or Kea
+  // had no restart at all. The picker lists what the appliance runs.
+  const [restartOpen, setRestartOpen] = useState(false);
+  const [restartResult, setRestartResult] = useState<string | null>(null);
   const [revealOpen, setRevealOpen] = useState(false);
   const [cidrEditorOpen, setCidrEditorOpen] = useState(false);
   const [logsOpen, setLogsOpen] = useState(false);
 
   const ch = row.cluster_health ?? {};
   const ready = ch.kubeapi_ready === true;
-  // "Restart bind9" only makes sense on a node actually running the
-  // dns-bind9 role — on a control-plane seed (DNS off) the Deployment
-  // doesn't exist, so the button would just error. Gate it on the role.
-  const hasBind9 = (row.assigned_roles ?? []).includes("dns-bind9");
   const nodesTotal = ch.nodes_total;
   const nodesReady = ch.nodes_ready;
   const podsTotal = ch.pods_total;
@@ -3164,22 +3156,19 @@ function ApplianceClusterHealthSection({ row }: { row: ApplianceRow }) {
         sub-second on a healthy appliance.
       </p>
       <div className="mt-2 flex flex-wrap items-center gap-2">
-        {hasBind9 && (
-          <button
-            type="button"
-            onClick={() => restartBind9.mutate()}
-            disabled={!ready || restartBind9.isPending}
-            title="kubectl rollout restart deploy/dns-bind9 -n spatium"
-            className="inline-flex items-center gap-1 rounded-md border bg-background px-2 py-1 text-[11px] hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            {restartBind9.isPending ? (
-              <Loader2 className="h-3 w-3 animate-spin" />
-            ) : (
-              <RefreshCw className="h-3 w-3" />
-            )}
-            Restart bind9
-          </button>
-        )}
+        <button
+          type="button"
+          onClick={() => {
+            setRestartResult(null);
+            setRestartOpen(true);
+          }}
+          disabled={!ready}
+          title="Rollout-restart a workload on this appliance's k3s"
+          className="inline-flex items-center gap-1 rounded-md border bg-background px-2 py-1 text-[11px] hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          <RefreshCw className="h-3 w-3" />
+          Restart workload…
+        </button>
         <button
           type="button"
           onClick={() => setRevealOpen(true)}
@@ -3204,17 +3193,22 @@ function ApplianceClusterHealthSection({ row }: { row: ApplianceRow }) {
           <FileText className="h-3 w-3" />
           Pod logs
         </button>
-        {restartBind9.error && (
-          <span className="text-[11px] text-rose-700 dark:text-rose-300">
-            {formatApiError(restartBind9.error)}
-          </span>
-        )}
-        {restartBind9.isSuccess && (
+        {restartResult && (
           <span className="text-[11px] text-emerald-700 dark:text-emerald-300">
-            rollout-restart issued
+            {restartResult}
           </span>
         )}
       </div>
+      {restartOpen && (
+        <RestartWorkloadModal
+          appliance={row}
+          onClose={() => setRestartOpen(false)}
+          onRestarted={(label) => {
+            setRestartResult(`rollout-restart issued for ${label}`);
+            setRestartOpen(false);
+          }}
+        />
+      )}
       {revealOpen && (
         <RevealKubeconfigModal
           appliance={row}
@@ -3495,6 +3489,144 @@ function KubeapiCidrEditorModal({
               <CheckCircle2 className="h-3.5 w-3.5" />
             )}
             Save
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+// #890 — pick a workload to rollout-restart on this appliance's k3s.
+// Replaces the single hardcoded "Restart bind9" button, which meant a
+// node running PowerDNS, Technitium or Kea had no restart at all and a
+// control-plane seed with DNS off had a button that would have errored.
+// The list comes from the appliance itself through the supervisor's
+// kubeapi proxy, so it can't drift from what is actually deployed.
+function RestartWorkloadModal({
+  appliance,
+  onClose,
+  onRestarted,
+}: {
+  appliance: ApplianceRow;
+  onClose: () => void;
+  onRestarted: (label: string) => void;
+}) {
+  const [selected, setSelected] = useState<string | null>(null);
+  const workloads = useQuery({
+    queryKey: ["appliance", "k8s-workloads", appliance.id],
+    queryFn: () => applianceApprovalApi.k8sWorkloads(appliance.id),
+  });
+  const restart = useMutation({
+    mutationFn: (w: ApplianceWorkload) =>
+      applianceApprovalApi.k8sRolloutRestart(appliance.id, {
+        kind: w.kind,
+        namespace: w.namespace,
+        name: w.name,
+      }),
+    onSuccess: (_res, w) => onRestarted(`${w.kind.toLowerCase()}/${w.name}`),
+  });
+
+  const rows = workloads.data?.workloads ?? [];
+  const chosen = rows.find((w) => `${w.kind}/${w.name}` === selected) ?? null;
+
+  return (
+    <Modal
+      title={`Restart a workload on ${appliance.hostname}`}
+      onClose={onClose}
+      wide
+    >
+      <div className="space-y-3">
+        {workloads.isLoading && (
+          <p className="text-xs text-muted-foreground">
+            Asking the appliance what it runs…
+          </p>
+        )}
+        {workloads.error && (
+          <p className="text-xs text-rose-700 dark:text-rose-300">
+            {formatApiError(workloads.error)}
+          </p>
+        )}
+        {/* Per-kind failures, not a whole-call failure: a cluster with an
+            RBAC gap on StatefulSets should still let you restart the
+            Deployments you came here for. */}
+        {(workloads.data?.errors ?? []).map((e) => (
+          <p key={e} className="text-[11px] text-amber-700 dark:text-amber-300">
+            {e}
+          </p>
+        ))}
+        {!workloads.isLoading && rows.length === 0 && !workloads.error && (
+          <p className="text-xs text-muted-foreground">
+            No SpatiumDDI workloads found in the spatium namespace.
+          </p>
+        )}
+        {rows.length > 0 && (
+          <div className="max-h-72 overflow-y-auto rounded-md border">
+            <table className="w-full text-xs">
+              <thead className="bg-muted/40 text-[11px] uppercase tracking-wider text-muted-foreground">
+                <tr>
+                  <th className="px-2 py-1.5 text-left font-medium">
+                    Workload
+                  </th>
+                  <th className="px-2 py-1.5 text-left font-medium">Kind</th>
+                  <th className="px-2 py-1.5 text-left font-medium">Ready</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y">
+                {rows.map((w) => {
+                  const id = `${w.kind}/${w.name}`;
+                  return (
+                    <tr
+                      key={id}
+                      onClick={() => setSelected(id)}
+                      className={cn(
+                        "cursor-pointer",
+                        selected === id ? "bg-primary/10" : "hover:bg-muted/50",
+                      )}
+                    >
+                      <td className="px-2 py-1.5">
+                        <div className="font-medium">{w.name}</div>
+                        <div className="text-[10px] text-muted-foreground">
+                          {w.image}
+                        </div>
+                      </td>
+                      <td className="px-2 py-1.5 text-muted-foreground">
+                        {w.kind}
+                      </td>
+                      <td className="px-2 py-1.5 font-mono">
+                        {w.ready}/{w.desired}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+        {restart.error && (
+          <p className="text-xs text-rose-700 dark:text-rose-300">
+            {formatApiError(restart.error)}
+          </p>
+        )}
+        <p className="text-[11px] text-muted-foreground">
+          Rollout restart replaces pods one at a time, so a workload with more
+          than one replica keeps serving through it.
+        </p>
+        <div className="flex justify-end gap-2 border-t pt-3">
+          <button
+            onClick={onClose}
+            className="rounded-md border px-3 py-1.5 text-sm hover:bg-accent"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={() => chosen && restart.mutate(chosen)}
+            disabled={!chosen || restart.isPending}
+            className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:opacity-90 disabled:opacity-50"
+          >
+            {restart.isPending && (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            )}
+            Restart
           </button>
         </div>
       </div>

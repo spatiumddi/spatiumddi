@@ -7,7 +7,8 @@ k8s/
 ├── base/              # Core application manifests (namespace, API, worker, frontend, migrations)
 ├── dns/               # Managed DNS server StatefulSets (bind9)
 ├── dhcp/              # Managed DHCP server StatefulSets (kea)
-└── ha/                # High-availability add-ons (PostgreSQL Patroni/CloudNativePG, Redis Sentinel)
+├── ha/                # High-availability add-ons (PostgreSQL Patroni/CloudNativePG, Redis Sentinel)
+└── service-control/   # Opt-in RBAC + api patch for GUI service restart (#890)
 ```
 
 ## Managed DHCP servers (Kea)
@@ -292,6 +293,31 @@ On first boot each agent:
 
 If `dns_require_agent_approval=true` the server appears in the DNS Server
 Group UI with `pending_approval=true` until an admin approves it.
+
+## Service control from the GUI (opt-in, issue #890)
+
+**Settings → Services** lets a superadmin rollout-restart SpatiumDDI's
+own workloads. It is off by default and needs two things, which fail
+differently — the UI names whichever one you skipped rather than
+rendering a button that 403s:
+
+```bash
+kubectl apply -f k8s/service-control/rbac.yaml
+kubectl -n spatiumddi patch deployment api \
+  --type=strategic --patch-file k8s/service-control/api-patch.yaml
+kubectl -n spatiumddi rollout status deployment/api
+```
+
+Helm equivalents: `api.serviceControl.enabled` (the env gate) and
+`api.serviceControlRBAC.enabled` (the Role), both `false` by default and
+both requiring `api.serviceAccount.enabled`. Appliance installs get the
+RBAC from `spatiumddi-firstboot` and the gate from `appliance_mode`.
+
+`restart` is the only verb on Kubernetes. `start` / `stop` would mean
+scaling to zero and back, and restoring the previous replica count needs
+somewhere durable to remember it. See
+[`k8s/service-control/README.md`](service-control/README.md) for the
+scoping rationale.
 
 ## Image Tags
 

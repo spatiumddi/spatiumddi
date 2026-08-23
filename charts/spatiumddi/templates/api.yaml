@@ -91,6 +91,13 @@ spec:
                   name: {{ include "spatiumddi.fullname" . }}-slot-image-mirror-auth
                   key: secret
             {{- end }}
+            {{- if .Values.api.serviceControl.enabled }}
+            # #890 — opt-in lifecycle control (Settings → Services). Pair
+            # with ``api.serviceControlRBAC.enabled`` or the api can see
+            # the capability but kubeapi refuses every list and patch.
+            - name: SERVICE_CONTROL_ENABLED
+              value: "true"
+            {{- end }}
             {{- with .Values.api.env }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
