@@ -225,6 +225,19 @@ async def platform_health() -> JSONResponse:
     # that can hang, so run it in a threadpool with a short overall
     # timeout. Returns a mapping like ``{"celery@worker-1": {"ok": "pong"}}``
     # or ``None`` when no worker responds in time.
+    #
+    # KNOWN LIMIT (#925), stated because it misleads exactly when it
+    # matters: ping is answered by the worker's MainProcess pidbox
+    # consumer, which is independent of the prefork pool. A worker whose
+    # every pool slot is blocked still answers "pong" and reports here as
+    # ok, while nothing it is given can actually run. Verified directly
+    # against a 2-slot worker with both slots occupied.
+    #
+    # Deliberately NOT fixed by adding an ``inspect.active()`` round trip:
+    # this endpoint is unauthenticated, so every extra broadcast RPC here
+    # is amplification an anonymous caller controls. The beat component
+    # above is the signal that does surface a wedged pool — which is why
+    # its detail must not blame beat for it.
     def _inspect_ping() -> dict[str, Any] | None:
         from app.celery_app import celery_app  # noqa: PLC0415
 
@@ -265,9 +278,19 @@ async def platform_health() -> JSONResponse:
         )
 
     # Celery beat — written by ``app.tasks.heartbeat.beat_tick`` every 30 s
-    # to ``spatium:beat:heartbeat`` with a 5-minute TTL. Missing key →
-    # beat is stopped or has been stopped for >5 min. Present but older
-    # than 90 s → degraded (two beat intervals missed).
+    # to ``spatium:beat:heartbeat`` with a 5-minute TTL. Missing key → no
+    # tick has landed for >5 min. Present but older than 90 s → degraded
+    # (two beat intervals missed).
+    #
+    # #925 — the detail below says "no tick" and NOT "beat is stopped",
+    # which is what it used to say and could not know. beat *schedules*
+    # this task; a **worker** executes it, so the key is a round trip and
+    # its absence indicts either end. The wording mattered: an operator
+    # (and a QA gate) reading "beat is stopped" went and looked at a beat
+    # pod that was running perfectly, while the actual fault was every
+    # worker pool slot wedged on an unbounded Redis connect — a state
+    # ``inspect ping`` reports as healthy, because the MainProcess answers
+    # it without involving the pool at all.
     try:
         from app.config import settings
         from app.core.redis_client import make_async_redis
@@ -290,7 +313,10 @@ async def platform_health() -> JSONResponse:
                 {
                     "name": "celery-beat",
                     "status": "error",
-                    "detail": "no heartbeat — beat is stopped",
+                    "detail": (
+                        "no beat tick in the last 5 min — beat is not "
+                        "scheduling, or no worker is executing its tick"
+                    ),
                 }
             )
         else:
@@ -300,6 +326,13 @@ async def platform_health() -> JSONResponse:
             if age_s > 90:
                 status_str = "warn"
                 detail = f"last tick {age_s:.0f}s ago (stalled)"
+            elif age_s < -90:
+                # A tick stamped in the future is clock skew between the
+                # node that ran it and this one, not a healthy beat — and
+                # the plain ``age_s > 90`` test read it as perfectly fresh,
+                # so a skewed clock could hide a genuinely dead beat.
+                status_str = "warn"
+                detail = f"last tick {-age_s:.0f}s in the future (clock skew)"
             else:
                 status_str = "ok"
                 detail = f"last tick {age_s:.0f}s ago"

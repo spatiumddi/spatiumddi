@@ -19,6 +19,20 @@ The master name comes from ``settings.redis_sentinel_master``
 (default ``mymaster``). The Sentinel auth password comes from
 ``settings.redis_sentinel_password`` when set, else the password
 embedded in the URL.
+
+**Connect timeouts default to bounded, here** (#925). ``REDIS_URL`` on a
+multi-node control plane lists the sentinels by their *per-pod headless*
+DNS names, deliberately, so a client can reach every sentinel mid-failover.
+The cost is that those names keep resolving for the 20-40 s a node takes to
+be marked NotReady, so a connect to a rebooting node's sentinel SYNs into a
+black hole. With no ``socket_connect_timeout`` that connect is unbounded:
+measured still blocked at 60 s (and past 5 min) against an unreachable
+sentinel, versus ~28 s to a clean ``MasterNotFoundError`` once bounded.
+
+#590 fixed that per call site, and #925 is the call site it missed — the
+beat heartbeat, the one Redis caller in the codebase passing no timeout at
+all. A default that call sites may override is the shape that cannot be
+missed again; the alternative is a 15th caller getting it wrong.
 """
 
 from __future__ import annotations
@@ -34,6 +48,26 @@ from redis.sentinel import Sentinel as SentinelSync
 from app.config import settings
 
 _SENTINEL_SCHEMES = ("sentinel://", "redis+sentinel://")
+
+# Applied when a caller passes no ``socket_connect_timeout`` (#925). Matches
+# what the health checks already choose, so the codebase has one number.
+DEFAULT_CONNECT_TIMEOUT_SECONDS = 2.0
+
+
+def _with_default_timeouts(kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Bound the CONNECT, and only the connect.
+
+    ``socket_timeout`` is deliberately NOT defaulted. It bounds every socket
+    *read*, and ``core.agent_wake`` parks a pub/sub connection on
+    ``get_message(timeout=…)`` for up to a full wake tick waiting for a
+    message that is supposed to be slow in arriving — a default read timeout
+    would tear that down mid-wait and turn the wake bus into a reconnect
+    loop. Callers that only ever issue request/response commands can and do
+    pass ``socket_timeout`` themselves.
+    """
+    if "socket_connect_timeout" not in kwargs:
+        kwargs = {**kwargs, "socket_connect_timeout": DEFAULT_CONNECT_TIMEOUT_SECONDS}
+    return kwargs
 
 
 def is_sentinel_url(url: str) -> bool:
@@ -73,7 +107,11 @@ def make_async_redis(url: str, **kwargs: Any) -> aioredis.Redis:
     ``from_url``. ``sentinel://`` URLs resolve the current master via
     Sentinel and return a master-bound client that re-resolves on
     reconnect (so it follows failover).
+
+    A caller that passes no ``socket_connect_timeout`` gets
+    ``DEFAULT_CONNECT_TIMEOUT_SECONDS`` (#925); passing one overrides it.
     """
+    kwargs = _with_default_timeouts(kwargs)
     if not is_sentinel_url(url):
         return aioredis.from_url(url, **kwargs)
 
@@ -122,7 +160,11 @@ def _sentinel_kwargs(password: str | None, kwargs: dict[str, Any]) -> dict[str, 
 def make_sync_redis(url: str, **kwargs: Any) -> redis_sync.Redis:
     """Synchronous counterpart of ``make_async_redis`` — for the Celery
     tasks (e.g. the beat heartbeat) that run outside the asyncio loop.
+
+    Same default connect timeout, and this is the path that needed it: the
+    beat heartbeat called it with no kwargs at all (#925).
     """
+    kwargs = _with_default_timeouts(kwargs)
     if not is_sentinel_url(url):
         return redis_sync.from_url(url, **kwargs)
 
