@@ -215,7 +215,9 @@ def main() -> int:
         print("FAIL: `named` not on PATH — this must run inside the bind9 agent image")
         return 1
     try:
-        import spatium_dns_agent.drivers.bind9  # noqa: F401,PLC0415
+        # Same ``from`` form ``_render`` uses — importing one module both
+        # ways trips a code-quality check and reads as two dependencies.
+        from spatium_dns_agent.drivers.bind9 import Bind9Driver  # noqa: F401,PLC0415
     except ImportError as exc:
         print(f"FAIL: agent package not importable ({exc})")
         return 1
