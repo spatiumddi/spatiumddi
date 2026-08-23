@@ -645,7 +645,8 @@ and does not want a second TSDB. The two are independent; running both
 is fine.
 
 Measurements, versions (v1 / v2 / v3), idempotency and the high-water
-marks are documented in
+marks (a strictly-forward drain plus a separately-budgeted replay
+window) are documented in
 [`features/SYSTEM_ADMIN.md` § 8](features/SYSTEM_ADMIN.md#influxdb-export-issue-889).
 The short version:
 

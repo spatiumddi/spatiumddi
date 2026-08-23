@@ -139,7 +139,13 @@ async def write_lines(cfg: InfluxTargetConfig, body: str) -> None:
                 content=body.encode("utf-8"),
                 **auth_kwargs,
             )
-    except httpx.HTTPError as exc:
+    # ``InvalidURL`` is deliberately named alongside ``HTTPError``: it
+    # derives straight from ``Exception``, not from the httpx error base,
+    # so catching ``HTTPError`` alone lets a malformed URL that passed the
+    # save-time scheme check (``http://influx:80o86``) escape this
+    # function entirely — aborting the whole beat sweep and rolling back
+    # every *other* target's state instead of recording one failure here.
+    except (httpx.HTTPError, httpx.InvalidURL) as exc:
         raise InfluxDBWriteError(f"{type(exc).__name__}: {exc}") from exc
     # 204 is the documented success for both endpoints; 200 shows up on
     # some proxies. Anything else carries a body worth surfacing.

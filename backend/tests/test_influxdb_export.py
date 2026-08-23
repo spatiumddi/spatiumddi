@@ -28,15 +28,26 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.crypto import encrypt_str
 from app.core.security import create_access_token, hash_password
 from app.models.auth import User
+from app.models.dhcp import (
+    DHCPLease,
+    DHCPScope,
+    DHCPServer,
+    DHCPServerGroup,
+)
 from app.models.dns import DNSServer, DNSServerGroup
 from app.models.influxdb import InfluxDBTarget
+from app.models.ipam import IPBlock, IPSpace, Subnet
 from app.models.metrics import DNSMetricSample
 from app.services.influxdb.client import (
     InfluxDBWriteError,
     InfluxTargetConfig,
     build_write_request,
 )
-from app.services.influxdb.collect import REPUSH_OVERLAP_SECONDS, collect_dns_points
+from app.services.influxdb.collect import (
+    REPUSH_OVERLAP_SECONDS,
+    collect_dhcp_scope_lease_points,
+    collect_dns_points,
+)
 from app.services.influxdb.line_protocol import Point, render_batch, render_point
 from app.services.influxdb.push import is_due, push_target
 
@@ -366,25 +377,58 @@ async def test_collect_dns_points_reports_the_newest_bucket(db_session: AsyncSes
 
 
 @pytest.mark.asyncio
-async def test_collect_dns_points_resends_an_overlap_window(db_session: AsyncSession) -> None:
+async def test_collect_dns_points_replays_a_window_behind_the_mark(
+    db_session: AsyncSession,
+) -> None:
     """A late-arriving sample must not be skipped forever.
 
-    The cursor is deliberately not a strict ``>`` on the watermark: an
-    agent that reports a bucket after the watermark passed it would
-    otherwise never be exported. Re-sending is free — line protocol
-    overwrites a point with the same measurement, tags and timestamp.
+    The forward drain alone is a strict ``>`` on the watermark, so an
+    agent that reports a bucket after the cursor passed it would never be
+    exported. The replay window covers that. Re-sending is free — line
+    protocol overwrites a point with the same measurement, tags and
+    timestamp.
     """
     base = datetime.now(UTC).replace(microsecond=0) - timedelta(minutes=10)
     await _dns_sample(db_session, base, 10)
 
-    inside_overlap = base + timedelta(seconds=REPUSH_OVERLAP_SECONDS - 60)
-    points, _ = await collect_dns_points(db_session, inside_overlap)
+    inside_replay = base + timedelta(seconds=REPUSH_OVERLAP_SECONDS - 60)
+    points, newest = await collect_dns_points(db_session, inside_replay)
     assert len(points) == 1
+    # A replayed row is already behind the cursor, so it must not become
+    # the new one — that is what would drag the watermark backwards.
+    assert newest is None
 
-    beyond_overlap = base + timedelta(seconds=REPUSH_OVERLAP_SECONDS + 60)
-    points, newest = await collect_dns_points(db_session, beyond_overlap)
+    beyond_replay = base + timedelta(seconds=REPUSH_OVERLAP_SECONDS + 60)
+    points, newest = await collect_dns_points(db_session, beyond_replay)
     assert points == []
     assert newest is None
+
+
+@pytest.mark.asyncio
+async def test_truncated_batch_never_drags_the_watermark_backwards(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The row cap must not be able to move the cursor the wrong way.
+
+    Folding the replay window into the drain's lower bound would, on a
+    fleet dense enough to fill the cap inside that window, return a
+    truncated batch whose maximum is *below* the watermark — pulling the
+    cursor back a little further every tick until it pinned on the oldest
+    retained sample. The export would stop advancing while every push
+    still reported success. Separate budgets make it unrepresentable.
+    """
+    monkeypatch.setattr("app.services.influxdb.collect.MAX_ROWS_PER_PUSH", 2)
+    base = datetime.now(UTC).replace(microsecond=0) - timedelta(minutes=10)
+    for i in range(6):
+        await _dns_sample(db_session, base + timedelta(seconds=i), 1)
+
+    # Watermark sits above four of the six samples, all of them inside the
+    # replay window — exactly the shape that used to regress.
+    watermark = base + timedelta(seconds=3)
+    points, newest = await collect_dns_points(db_session, watermark)
+    assert points  # the replay still ships
+    assert newest is not None
+    assert newest > watermark
 
 
 @pytest.mark.asyncio
@@ -462,3 +506,107 @@ async def test_failed_push_leaves_the_watermark_alone(db_session: AsyncSession) 
     # ``last_push_at`` still moves, or a fast-failing target would be
     # retried on every 30 s beat tick instead of on its own interval.
     assert row.last_push_at == now
+
+
+@pytest.mark.asyncio
+async def test_malformed_url_is_recorded_not_raised(db_session: AsyncSession) -> None:
+    """A bad URL must fail *this* target, not abort the whole sweep.
+
+    ``httpx.InvalidURL`` derives from ``Exception``, not from
+    ``httpx.HTTPError`` — so catching only the latter let a URL that
+    passed the save-time scheme check escape ``push_target`` entirely,
+    rolling back every other target's state update in the same
+    transaction and leaving nothing to explain why.
+    """
+    # A body is required for the request to be built at all — an empty
+    # batch short-circuits before httpx is reached.
+    await _dns_sample(db_session, datetime.now(UTC).replace(microsecond=0), 1)
+    row = InfluxDBTarget(
+        name=f"t-{uuid.uuid4().hex[:6]}",
+        version="v2",
+        # Scheme is valid, so this passes the save-time check; the port
+        # is not a number, which httpx only discovers at request time.
+        url="http://influx:80o86",
+        org="acme",
+        bucket="ddi",
+        token_encrypted=encrypt_str("tok"),
+        push_dhcp_metrics=False,
+        push_subnet_utilization=False,
+        push_dhcp_scope_leases=False,
+    )
+    db_session.add(row)
+    await db_session.flush()
+
+    result = await push_target(db_session, row, now=datetime.now(UTC))
+    assert not result.ok
+    assert "InvalidURL" in (row.last_push_error or "")
+    # The cursor must not have moved — nothing was delivered.
+    assert row.last_dns_bucket_at is None
+
+
+@pytest.mark.asyncio
+async def test_scope_lease_gauge_counts_addresses_not_rows(
+    db_session: AsyncSession,
+) -> None:
+    """Under Kea HA both partners mirror the same lease.
+
+    ``dhcp_lease`` is per-server — "one lease event arrives here twice",
+    per the model's own docstring — so a bare row count reports 2x the
+    addresses actually in use on exactly the deployments redundancy is
+    for, and disagrees with ``pool_occupancy.py``, which dedupes.
+    """
+    space = IPSpace(name=f"s-{uuid.uuid4().hex[:6]}", description="")
+    db_session.add(space)
+    await db_session.flush()
+    block = IPBlock(space_id=space.id, network="10.62.0.0/16", name="b")
+    db_session.add(block)
+    await db_session.flush()
+    subnet = Subnet(space_id=space.id, block_id=block.id, network="10.62.0.0/24", name="s")
+    db_session.add(subnet)
+    await db_session.flush()
+
+    group = DHCPServerGroup(name=f"g-{uuid.uuid4().hex[:6]}")
+    db_session.add(group)
+    await db_session.flush()
+    scope = DHCPScope(group_id=group.id, subnet_id=subnet.id, name="ha-scope")
+    primary = DHCPServer(
+        name=f"kea-a-{uuid.uuid4().hex[:4]}",
+        host="10.0.0.1",
+        driver="kea",
+        server_group_id=group.id,
+    )
+    secondary = DHCPServer(
+        name=f"kea-b-{uuid.uuid4().hex[:4]}",
+        host="10.0.0.2",
+        driver="kea",
+        server_group_id=group.id,
+    )
+    db_session.add_all([scope, primary, secondary])
+    await db_session.flush()
+
+    # One address, mirrored by both HA partners; plus a second address on
+    # one partner only.
+    for server in (primary, secondary):
+        db_session.add(
+            DHCPLease(
+                server_id=server.id,
+                scope_id=scope.id,
+                ip_address="10.62.0.10",
+                mac_address="aa:bb:cc:00:00:01",
+                state="active",
+            )
+        )
+    db_session.add(
+        DHCPLease(
+            server_id=primary.id,
+            scope_id=scope.id,
+            ip_address="10.62.0.11",
+            mac_address="aa:bb:cc:00:00:02",
+            state="active",
+        )
+    )
+    await db_session.flush()
+
+    points = await collect_dhcp_scope_lease_points(db_session, datetime.now(UTC))
+    gauge = next(p for p in points if p.tags["scope_id"] == str(scope.id))
+    assert gauge.fields["active_leases"] == 2  # not 3

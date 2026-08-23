@@ -6,7 +6,10 @@ apart when reading a dashboard built on this data:
 **Counter deltas** (``dns_metric_sample`` / ``dhcp_metric_sample``) —
 agent-reported, already bucketed at 60 s, timestamped at the bucket. The
 pusher walks these forward from a high-water mark, so a point's
-timestamp is when the traffic happened, not when it was exported.
+timestamp is when the traffic happened, not when it was exported. Each
+push also replays a short window *behind* the mark to catch a bucket an
+agent reported late; the two are separate queries with separate row
+budgets — see ``_fetch_samples`` for why that matters.
 
 **Point-in-time gauges** (subnet utilization, per-scope active leases) —
 sampled here, at push time, from counters the application already
@@ -24,8 +27,9 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import distinct, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.dhcp import DHCPLease, DHCPScope, DHCPServer, DHCPServerGroup
@@ -40,9 +44,9 @@ from app.services.influxdb.line_protocol import Point
 MAX_ROWS_PER_PUSH = 5000
 
 # How far back before the high-water mark to re-send. Agents can report a
-# bucket late (a restart, a blocked heartbeat), and a strict ``>`` cursor
-# would skip it permanently. Re-sending is free: line protocol overwrites
-# a point with the same measurement + tags + timestamp.
+# bucket late (a restart, a blocked heartbeat), and the forward drain
+# alone would skip it permanently. Re-sending is free: line protocol
+# overwrites a point with the same measurement + tags + timestamp.
 REPUSH_OVERLAP_SECONDS = 300
 
 MEASUREMENT_DNS = "dns_queries"
@@ -55,92 +59,124 @@ def _epoch(dt: datetime) -> int:
     return int((dt if dt.tzinfo else dt.replace(tzinfo=UTC)).timestamp())
 
 
-def _lower_bound(watermark: datetime | None) -> datetime | None:
+def _aware(dt: datetime) -> datetime:
+    return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
+
+
+async def _fetch_samples(
+    db: AsyncSession,
+    sample_model: Any,
+    server_model: Any,
+    watermark: datetime | None,
+) -> tuple[list[Any], list[Any]]:
+    """Return ``(forward_rows, replay_rows)`` for one metric table.
+
+    Two queries with **separate row budgets**, and that separation is the
+    point rather than an optimisation:
+
+    * *forward* is strictly ``bucket_at > watermark``, so the cursor the
+      caller derives from it can only move forwards. A single query with
+      the overlap folded into its lower bound would, on a fleet dense
+      enough to fill ``MAX_ROWS_PER_PUSH`` inside the overlap window,
+      return a truncated batch whose maximum is *below* the watermark —
+      dragging the cursor backwards a little further every tick until it
+      pinned on the oldest retained sample. The export would stop
+      advancing while every push still reported success and the UI still
+      showed the target green.
+    * *replay* is the closed window ``(watermark - overlap, watermark]``,
+      re-sent so a bucket an agent reported late is still exported. It
+      never contributes to the cursor — these rows are, by definition,
+      already behind it.
+
+    ``replay`` is empty on the first push (no watermark yet), when every
+    row is ahead of the cursor anyway.
+    """
+    join_on = server_model.id == sample_model.server_id
+
+    forward_stmt = (
+        select(sample_model, server_model.name)
+        .join(server_model, join_on)
+        .order_by(sample_model.bucket_at.asc())
+        .limit(MAX_ROWS_PER_PUSH)
+    )
+    if watermark is not None:
+        forward_stmt = forward_stmt.where(sample_model.bucket_at > _aware(watermark))
+    forward = list((await db.execute(forward_stmt)).all())
+
     if watermark is None:
-        return None
-    tz_aware = watermark if watermark.tzinfo else watermark.replace(tzinfo=UTC)
-    return tz_aware - timedelta(seconds=REPUSH_OVERLAP_SECONDS)
+        return forward, []
+
+    mark = _aware(watermark)
+    replay_stmt = (
+        select(sample_model, server_model.name)
+        .join(server_model, join_on)
+        .where(sample_model.bucket_at > mark - timedelta(seconds=REPUSH_OVERLAP_SECONDS))
+        .where(sample_model.bucket_at <= mark)
+        .order_by(sample_model.bucket_at.asc())
+        .limit(MAX_ROWS_PER_PUSH)
+    )
+    return forward, list((await db.execute(replay_stmt)).all())
 
 
 async def collect_dns_points(
     db: AsyncSession, watermark: datetime | None
 ) -> tuple[list[Point], datetime | None]:
-    """DNS counter deltas newer than ``watermark`` (minus the overlap).
+    """DNS counter deltas: the forward drain plus the late-arrival replay.
 
-    Returns the points plus the newest ``bucket_at`` seen, which becomes
-    the target's next watermark — ``None`` when nothing was found, so the
-    caller leaves the stored value alone.
+    Returns the points plus the newest ``bucket_at`` **from the forward
+    drain only**, which becomes the target's next watermark. ``None``
+    when the drain was empty, so the caller leaves the stored cursor
+    alone rather than moving it to a replayed row.
     """
-    stmt = (
-        select(DNSMetricSample, DNSServer.name)
-        .join(DNSServer, DNSServer.id == DNSMetricSample.server_id)
-        .order_by(DNSMetricSample.bucket_at.asc())
-        .limit(MAX_ROWS_PER_PUSH)
-    )
-    lower = _lower_bound(watermark)
-    if lower is not None:
-        stmt = stmt.where(DNSMetricSample.bucket_at > lower)
 
-    points: list[Point] = []
-    newest: datetime | None = None
-    for sample, server_name in (await db.execute(stmt)).all():
-        points.append(
-            Point(
-                measurement=MEASUREMENT_DNS,
-                tags={"server": server_name or "", "server_id": str(sample.server_id)},
-                fields={
-                    "queries_total": int(sample.queries_total),
-                    "noerror": int(sample.noerror),
-                    "nxdomain": int(sample.nxdomain),
-                    "servfail": int(sample.servfail),
-                    "recursion": int(sample.recursion),
-                    "rate_dropped": int(sample.rate_dropped),
-                    "rate_slipped": int(sample.rate_slipped),
-                },
-                timestamp=_epoch(sample.bucket_at),
-            )
+    def _point(sample: Any, server_name: str | None) -> Point:
+        return Point(
+            measurement=MEASUREMENT_DNS,
+            tags={"server": server_name or "", "server_id": str(sample.server_id)},
+            fields={
+                "queries_total": int(sample.queries_total),
+                "noerror": int(sample.noerror),
+                "nxdomain": int(sample.nxdomain),
+                "servfail": int(sample.servfail),
+                "recursion": int(sample.recursion),
+                "rate_dropped": int(sample.rate_dropped),
+                "rate_slipped": int(sample.rate_slipped),
+            },
+            timestamp=_epoch(sample.bucket_at),
         )
-        if newest is None or sample.bucket_at > newest:
-            newest = sample.bucket_at
+
+    forward, replay = await _fetch_samples(db, DNSMetricSample, DNSServer, watermark)
+    points = [_point(s, n) for s, n in replay] + [_point(s, n) for s, n in forward]
+    # Rows come back ascending, so the drain's last row is its maximum.
+    newest = _aware(forward[-1][0].bucket_at) if forward else None
     return points, newest
 
 
 async def collect_dhcp_points(
     db: AsyncSession, watermark: datetime | None
 ) -> tuple[list[Point], datetime | None]:
-    """DHCP message-count deltas newer than ``watermark`` (minus overlap)."""
-    stmt = (
-        select(DHCPMetricSample, DHCPServer.name)
-        .join(DHCPServer, DHCPServer.id == DHCPMetricSample.server_id)
-        .order_by(DHCPMetricSample.bucket_at.asc())
-        .limit(MAX_ROWS_PER_PUSH)
-    )
-    lower = _lower_bound(watermark)
-    if lower is not None:
-        stmt = stmt.where(DHCPMetricSample.bucket_at > lower)
+    """DHCP message-count deltas — same two-query shape as the DNS side."""
 
-    points: list[Point] = []
-    newest: datetime | None = None
-    for sample, server_name in (await db.execute(stmt)).all():
-        points.append(
-            Point(
-                measurement=MEASUREMENT_DHCP,
-                tags={"server": server_name or "", "server_id": str(sample.server_id)},
-                fields={
-                    "discover": int(sample.discover),
-                    "offer": int(sample.offer),
-                    "request": int(sample.request),
-                    "ack": int(sample.ack),
-                    "nak": int(sample.nak),
-                    "decline": int(sample.decline),
-                    "release": int(sample.release),
-                    "inform": int(sample.inform),
-                },
-                timestamp=_epoch(sample.bucket_at),
-            )
+    def _point(sample: Any, server_name: str | None) -> Point:
+        return Point(
+            measurement=MEASUREMENT_DHCP,
+            tags={"server": server_name or "", "server_id": str(sample.server_id)},
+            fields={
+                "discover": int(sample.discover),
+                "offer": int(sample.offer),
+                "request": int(sample.request),
+                "ack": int(sample.ack),
+                "nak": int(sample.nak),
+                "decline": int(sample.decline),
+                "release": int(sample.release),
+                "inform": int(sample.inform),
+            },
+            timestamp=_epoch(sample.bucket_at),
         )
-        if newest is None or sample.bucket_at > newest:
-            newest = sample.bucket_at
+
+    forward, replay = await _fetch_samples(db, DHCPMetricSample, DHCPServer, watermark)
+    points = [_point(s, n) for s, n in replay] + [_point(s, n) for s, n in forward]
+    newest = _aware(forward[-1][0].bucket_at) if forward else None
     return points, newest
 
 
@@ -191,8 +227,13 @@ async def collect_dhcp_scope_lease_points(db: AsyncSession, now: datetime) -> li
     graph, and "the scope went quiet" is exactly what an operator wants
     to see.
     """
+    # DISTINCT on the address, not COUNT(*): ``dhcp_lease`` is per-server,
+    # and under Kea HA the partners both mirror the same lease — so a bare
+    # row count reports 2x the addresses actually in use on a redundant
+    # pair, and disagrees with ``services/dhcp/pool_occupancy.py``, which
+    # dedupes for exactly this reason.
     counts_stmt = (
-        select(DHCPLease.scope_id, func.count())
+        select(DHCPLease.scope_id, func.count(distinct(DHCPLease.ip_address)))
         .where(DHCPLease.scope_id.is_not(None), DHCPLease.state == "active")
         .group_by(DHCPLease.scope_id)
     )

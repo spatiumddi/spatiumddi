@@ -459,16 +459,28 @@ probe-safety fix (#722) is not a vertical at all.
   compatibility mapping.
   **The idempotency (non-negotiable #9) is the server's, not ours:** line
   protocol overwrites a point with an identical measurement + tag set +
-  timestamp. That is what makes a retry free — and it is *why* the cursor
-  is deliberately not a strict `>` on the high-water mark. It re-sends a
-  5-minute overlap so a bucket an agent reported late is still exported;
-  a strict cursor would skip it permanently and silently. Watermarks
-  advance only on a successful write, so a dead collector delays the
-  export rather than punching a hole in it (the samples sit in Postgres
-  until `prune_metrics` retires them, so a target that recovers inside
-  `metric_retention_days` backfills itself). `last_push_at` moves on
-  failure too, or a fast-failing target would retry on every 30 s tick
-  instead of on its own interval.
+  timestamp, so a retry is free. That is what lets each push run **two
+  queries per source on separate row budgets** — a forward drain
+  (strictly `> watermark`, capped) and a replay of the closed
+  `(watermark − 5 min, watermark]` window, so a bucket an agent reported
+  late is still exported rather than skipped permanently and silently.
+  The separation is load-bearing, not tidiness: fold the replay into the
+  drain's lower bound and a fleet dense enough to fill the row cap inside
+  that window returns a truncated batch whose maximum is *below* the
+  watermark — pulling the cursor backwards every tick until it pins on
+  the oldest retained sample, with every push still reporting success and
+  the UI still green. Replayed rows never set the cursor.
+  Watermarks advance only on a successful write, so a dead collector
+  delays the export rather than punching a hole in it (the samples sit in
+  Postgres until `prune_metrics` retires them, so a target that recovers
+  inside `metric_retention_days` backfills itself). `last_push_at` moves
+  on failure too, or a fast-failing target would retry on every 30 s tick
+  instead of on its own interval — and the push is wrapped in a broad
+  per-target boundary, because the sweep pushes every due target in one
+  transaction and an escaping exception would discard the state updates
+  of the ones that succeeded. `httpx.InvalidURL` is named explicitly
+  alongside `HTTPError` for that reason: it derives from `Exception`, not
+  from the httpx error base.
   **Two shapes of metric, and the difference matters on a dashboard:**
   the DNS/DHCP counter deltas carry the **agent's own 60 s bucket
   timestamp**, so a backfill lands on the hour the traffic happened — and
@@ -477,7 +489,10 @@ probe-safety fix (#722) is not a vertical at all.
   per-scope lease gauges the spec asked for are sampled *at push time*
   from counters the app already maintains — no new table, but also no
   backfill: the first point is when the target was enabled. Documented
-  as such rather than labelled "realtime".
+  as such rather than labelled "realtime". The lease gauge counts
+  **distinct addresses**: `dhcp_lease` is per-server and a Kea HA pair
+  mirrors each lease twice, so `COUNT(*)` would report 2× on exactly the
+  deployments that matter, and disagree with `pool_occupancy.py`.
   **Test is a real single-point write**, not a reachability ping: a
   correct URL with the wrong bucket, org or token answers a GET perfectly
   well and then rejects every point. Explicitly **not** a feature module

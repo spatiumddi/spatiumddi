@@ -837,6 +837,12 @@ first point is the moment the target was enabled.
 | `<prefix>subnet_utilization` | `subnet`, `subnet_id`, `space` | `allocated`, `total`, `percent` |
 | `<prefix>dhcp_scope_leases` | `scope`, `scope_id`, `group`, `subnet` | `active_leases`, `is_active` |
 
+`active_leases` counts **distinct addresses**, not `dhcp_lease` rows.
+That table is per-server, and under Kea HA both partners mirror the same
+lease, so a bare row count would report 2× the addresses actually in use
+on a redundant pair — and disagree with the pool-occupancy figures,
+which dedupe for the same reason.
+
 A scope with no active leases is exported as `0` rather than omitted —
 an absent series and an empty scope look identical on a graph, and "the
 scope went quiet" is what an operator wants to see.
@@ -857,21 +863,37 @@ per-subnet (Kea) breakdowns.
 
 Line protocol overwrites a point with an identical measurement, tag set
 and timestamp, so re-sending a batch is a no-op at the server. That is
-what makes the task safe to retry (non-negotiable #9), and it is why the
-cursor is *not* a strict `>` on the watermark: the pusher deliberately
-re-sends a 5-minute overlap window so a sample an agent reported late
-still gets exported rather than being skipped forever.
+what makes the task safe to retry (non-negotiable #9), and it is what
+lets each push do two queries per source instead of one:
+
+* a **forward drain**, strictly `bucket_at > watermark`, capped at
+  5 000 rows — so a newly-added target converges over several ticks
+  rather than in one oversized POST;
+* a **replay** of the closed window `(watermark - 5 min, watermark]`,
+  on its own row budget, so a bucket an agent reported *late* is still
+  exported instead of being skipped forever.
+
+The two budgets are separate deliberately. Folding the replay into the
+drain's lower bound would, on a fleet dense enough to fill the row cap
+inside that 5-minute window, return a truncated batch whose maximum sits
+*below* the watermark — dragging the cursor backwards a little further
+every tick until it pinned on the oldest retained sample. The export
+would stop advancing while every push still reported success and the UI
+still showed the target green. Replayed rows never contribute to the
+cursor, so it can only move forwards.
 
 The watermarks advance **only** on a successful write. A dead collector
 means a delayed export, never a hole — the samples stay in Postgres until
 `prune_metrics` retires them, so a target that recovers inside
-`metric_retention_days` backfills on its own. A newly-added target
-drains the whole retention window at 5 000 rows per source per push,
-so it converges over several ticks rather than in one oversized POST.
+`metric_retention_days` backfills on its own.
 
 `last_push_at` moves on failure as well as success — otherwise a
 fast-failing target would be retried on every 30 s beat tick instead of
-on its own interval.
+on its own interval. A failure is always recorded against the target
+that caused it: the push is wrapped in a broad per-target boundary,
+because the beat task pushes every due target in one transaction and an
+escaping exception would discard the state updates of the ones that
+succeeded.
 
 #### Test write
 

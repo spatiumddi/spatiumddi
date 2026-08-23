@@ -22,11 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.influxdb import InfluxDBTarget
 from app.services.influxdb import collect
-from app.services.influxdb.client import (
-    InfluxDBWriteError,
-    config_from_row,
-    write_lines,
-)
+from app.services.influxdb.client import config_from_row, write_lines
 from app.services.influxdb.line_protocol import Point, render_batch
 
 logger = structlog.get_logger(__name__)
@@ -94,13 +90,25 @@ async def push_target(db: AsyncSession, row: InfluxDBTarget, *, now: datetime) -
 
         body = render_batch(_prefixed(points, row.measurement_prefix or ""))
         await write_lines(config_from_row(row), body)
-    except (InfluxDBWriteError, ValueError) as exc:
-        row.last_push_error = str(exc)[:1000]
+    # Broad on purpose: this is the per-target failure-isolation boundary.
+    # The caller pushes every due target inside one transaction, so an
+    # exception escaping here would abandon the sweep before its commit —
+    # discarding the state updates of the targets that *did* succeed, and
+    # leaving this one with no ``last_push_error`` to explain itself, so
+    # nothing anywhere would say what went wrong.
+    except Exception as exc:  # noqa: BLE001
+        row.last_push_error = str(exc)[:1000] or type(exc).__name__
         # ``last_push_at`` still advances on failure — otherwise a target
         # that errors fast would be retried on every 30 s beat tick
         # instead of on its own interval.
         row.last_push_at = now
-        logger.warning("influxdb_push_failed", target=row.name, points=len(points), error=str(exc))
+        logger.warning(
+            "influxdb_push_failed",
+            target=row.name,
+            points=len(points),
+            error=str(exc),
+            error_type=type(exc).__name__,
+        )
         return PushResult(str(row.id), row.name, 0, ok=False, error=str(exc))
 
     if dns_watermark is not None:
