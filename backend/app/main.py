@@ -900,17 +900,32 @@ def create_app() -> FastAPI:
     from sqlalchemy.exc import DBAPIError as SADBAPIError  # noqa: PLC0415
     from sqlalchemy.exc import IntegrityError as SAIntegrityError  # noqa: PLC0415
 
-    # ONLY a unique violation (SQLSTATE 23505) is the data conflicting.
+    from app.core.integrity_errors import (  # noqa: PLC0415
+        FOREIGN_KEY_VIOLATION,
+        classify_foreign_key_violation,
+        extract_detail,
+    )
+
+    # A unique violation (SQLSTATE 23505) is the data conflicting.
     #
-    # NOT NULL (23502), foreign key (23503) and CHECK (23514) violations are
-    # OUR code being wrong, and answering 409 would blame the client for a
-    # server bug — worse, it would hide it: a 4xx is invisible to the
-    # conformance fuzz's no-5xx assertion. That is not hypothetical here.
-    # Item 3 of this same change was a NOT NULL violation (the delete
-    # denial path writing an AuditLog without resource_display); a blanket
-    # handler would answer 409 for it, and the suite that caught it would
-    # sail straight past the regression. A handler must not blind the test
-    # that guards the bug class it sits on.
+    # NOT NULL (23502) and CHECK (23514) violations are OUR code being wrong,
+    # and answering 409 would blame the client for a server bug — worse, it
+    # would hide it: a 4xx is invisible to the conformance fuzz's no-5xx
+    # assertion. That is not hypothetical here. Item 3 of the change that
+    # added this handler was a NOT NULL violation (the delete denial path
+    # writing an AuditLog without resource_display); a blanket handler would
+    # answer 409 for it, and the suite that caught it would sail straight
+    # past the regression. A handler must not blind the test that guards the
+    # bug class it sits on.
+    #
+    # Foreign key (23503) is the one arm that splits (#922). A dangling
+    # reference the CLIENT sent — a stale group id in a request body — is an
+    # ordinary client error; the same violation on a value the SERVER
+    # computed is exactly the bug the paragraph above protects. Postgres
+    # names the offending column and value in DETAIL, so
+    # ``classify_foreign_key_violation`` answers 4xx only when that value is
+    # one the request actually carried, and returns None — re-raise, 500 —
+    # otherwise.
     unique_violation = "23505"
 
     @app.exception_handler(SAIntegrityError)
@@ -920,12 +935,45 @@ def create_app() -> FastAPI:
         Handlers that pre-check (SELECT then INSERT — asns, agent register's
         group auto-create) race between the check and the flush; the loser's
         unique violation surfaced as a 500 where the pre-check's own answer
-        would have been 409. Every other integrity error re-raises to the
-        500 path, because it means the server sent something it shouldn't.
+        would have been 409.
+
+        A foreign-key violation carrying a value THIS REQUEST supplied is a
+        client error too (#922): 422 for a reference to a row that does not
+        exist, 409 for a delete of a row still referenced. Every other
+        integrity error re-raises to the 500 path, because it means the
+        server sent something it shouldn't.
         """
         from fastapi.responses import JSONResponse  # noqa: PLC0415
 
-        sqlstate = str(getattr(getattr(exc, "orig", None), "sqlstate", "") or "")
+        orig = getattr(exc, "orig", None)
+        sqlstate = str(getattr(orig, "sqlstate", "") or "")
+
+        if sqlstate == FOREIGN_KEY_VIOLATION:
+            # ``request._body`` rather than ``await request.body()``: the
+            # receive channel is already consumed by the time a handler has
+            # flushed, and re-reading it would block. FastAPI caches the
+            # bytes there when it parsed the JSON body, which is every route
+            # that can carry a client-supplied reference; a route with no
+            # body simply has nothing to match and re-raises.
+            classified = classify_foreign_key_violation(
+                extract_detail(exc),
+                getattr(request, "_body", None),
+                dict(request.path_params or {}),
+                request.url.query,
+            )
+            if classified is None:
+                raise exc
+            status_code, message = classified
+            logger.info(
+                "integrity_foreign_key",
+                method=request.method,
+                path=request.url.path,
+                sqlstate=sqlstate,
+                status=status_code,
+                error=str(orig or exc)[:200],
+            )
+            return JSONResponse(status_code=status_code, content={"detail": message})
+
         if sqlstate != unique_violation:
             raise exc
         logger.info(
@@ -933,7 +981,7 @@ def create_app() -> FastAPI:
             method=request.method,
             path=request.url.path,
             sqlstate=sqlstate,
-            error=str(getattr(exc, "orig", exc))[:200],
+            error=str(orig or exc)[:200],
         )
         return JSONResponse(
             status_code=409,

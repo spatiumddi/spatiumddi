@@ -430,6 +430,15 @@ async def bulk_delete_captures(
 
 @router.get(
     "/captures/{capture_id}/download",
+    # Declared media type, not just the wire header (#921): FastAPI
+    # documents a bare ``-> Response`` as application/json, so a generated
+    # client and any strict response validator reject the success path.
+    responses={
+        200: {
+            "content": {"application/vnd.tcpdump.pcap": {}, "application/octet-stream": {}},
+            "description": "The capture file",
+        }
+    },
     dependencies=[Depends(require_permission("read", PERMISSION))],
 )
 async def download_capture(

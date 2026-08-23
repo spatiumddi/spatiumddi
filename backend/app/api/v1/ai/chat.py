@@ -251,7 +251,18 @@ def _sse_frame(event_kind: str, data: dict[str, Any]) -> bytes:
     return f"event: {event_kind}\ndata: {payload}\n\n".encode()
 
 
-@router.post("/chat")
+@router.post(
+    "/chat",
+    # Declared media type, not just the wire header (#921): FastAPI
+    # documents a bare ``-> Response`` as application/json, so a generated
+    # client and any strict response validator reject the success path.
+    responses={
+        200: {
+            "content": {"text/event-stream": {}},
+            "description": "Server-sent event stream of the assistant's reply",
+        }
+    },
+)
 async def chat(body: ChatTurnRequest, current_user: CurrentUser, db: DB) -> StreamingResponse:
     """Stream one turn of the chat conversation back as SSE events.
 

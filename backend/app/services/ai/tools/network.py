@@ -64,7 +64,10 @@ async def list_network_devices(
     if args.device_type:
         stmt = stmt.where(NetworkDevice.device_type == args.device_type)
     if args.space_id:
-        stmt = stmt.where(NetworkDevice.space_id == args.space_id)
+        # ``ip_space_id`` — NetworkDevice has no ``space_id`` column, so the
+        # old spelling raised AttributeError and this tool 500'd whenever the
+        # documented space filter was supplied (#923).
+        stmt = stmt.where(NetworkDevice.ip_space_id == args.space_id)
     if args.search:
         like = f"%{args.search.lower()}%"
         stmt = stmt.where(
@@ -86,7 +89,12 @@ async def list_network_devices(
             "vendor": d.vendor,
             "sys_descr": d.sys_descr,
             "sys_uptime_seconds": d.sys_uptime_seconds,
-            "last_polled_at": d.last_polled_at.isoformat() if d.last_polled_at else None,
+            # ``last_poll_at`` — the column is not ``last_polled_at``, so
+            # building this row raised AttributeError and the tool answered
+            # nothing for any input (#923). The response key keeps its
+            # published name so a copilot prompt written against it still
+            # reads the same field.
+            "last_polled_at": d.last_poll_at.isoformat() if d.last_poll_at else None,
             "last_poll_status": d.last_poll_status,
         }
         for d in rows

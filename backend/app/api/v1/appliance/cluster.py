@@ -175,6 +175,15 @@ async def cluster_health(db: DB) -> ClusterHealth:
 
 @router.get(
     "/health/stream",
+    # Declared media type, not just the wire header (#921): FastAPI
+    # documents a bare ``-> Response`` as application/json, so a generated
+    # client and any strict response validator reject the success path.
+    responses={
+        200: {
+            "content": {"text/event-stream": {}},
+            "description": "Server-sent event stream of cluster health",
+        }
+    },
     dependencies=[Depends(require_permission("read", "appliance"))],
     summary="Stream cluster health snapshots as SSE (~2s cadence)",
 )

@@ -510,7 +510,13 @@ async def list_target_archives(
     ]
 
 
-@router.get("/{target_id}/archives/latest/download")
+@router.get(
+    "/{target_id}/archives/latest/download",
+    # Declared media type, not just the wire header (#921): FastAPI
+    # documents a bare ``-> Response`` as application/json, so a generated
+    # client and any strict response validator reject the success path.
+    responses={200: {"content": {"application/zip": {}}, "description": "Backup archive"}},
+)
 async def download_latest_target_archive(
     target_id: uuid.UUID,
     db: DB,
@@ -558,7 +564,13 @@ async def download_latest_target_archive(
     )
 
 
-@router.get("/{target_id}/archives/{filename}/download")
+@router.get(
+    "/{target_id}/archives/{filename}/download",
+    # Declared media type, not just the wire header (#921): FastAPI
+    # documents a bare ``-> Response`` as application/json, so a generated
+    # client and any strict response validator reject the success path.
+    responses={200: {"content": {"application/zip": {}}, "description": "Backup archive"}},
+)
 async def download_target_archive(
     target_id: uuid.UUID,
     filename: str,

@@ -13,6 +13,7 @@ fire these — they're query-only).
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import time
 
 import dns.asyncresolver
@@ -61,9 +62,34 @@ class PropagationCheckRequest(BaseModel):
     def _validate_name(cls, v: str) -> str:
         try:
             dns.name.from_text(v)
-        except dns.exception.DNSException:
-            raise ValueError("Not a valid DNS name")
+        except (dns.exception.DNSException, UnicodeError):
+            # UnicodeError too: IDNA encoding raises it (not a DNSException)
+            # for an over-long label, which would escape to a 500 (#923).
+            raise ValueError("Not a valid DNS name") from None
         return v.rstrip(".")
+
+    @field_validator("resolvers")
+    @classmethod
+    def _validate_resolvers(cls, v: list[str] | None) -> list[str] | None:
+        """Each override must be an IP literal (#923).
+
+        ``Resolver.nameservers`` accepts an address or an https URL and raises
+        a bare ``ValueError`` for anything else — reached from inside the
+        gather, that is an unhandled 500 rather than the per-resolver ``error``
+        status every other failure mode returns. The curated default list is
+        all IP literals, so requiring the same of an override keeps one shape.
+        """
+        if v is None:
+            return v
+        for entry in v:
+            try:
+                ipaddress.ip_address(entry.strip())
+            except ValueError:
+                raise ValueError(
+                    f"resolver {entry!r} is not an IP address — "
+                    "propagation checks query resolvers by address"
+                ) from None
+        return [entry.strip() for entry in v]
 
     @field_validator("record_type")
     @classmethod

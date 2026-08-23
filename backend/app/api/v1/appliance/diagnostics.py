@@ -76,6 +76,10 @@ async def post_self_test() -> dict:
 
 @router.get(
     "/bundle",
+    # Declared media type, not just the wire header (#921): FastAPI
+    # documents a bare ``-> Response`` as application/json, so a generated
+    # client and any strict response validator reject the success path.
+    responses={200: {"content": {"application/zip": {}}, "description": "Diagnostics archive"}},
     dependencies=[Depends(require_permission("admin", "appliance"))],
     summary="Download a diagnostic bundle (zip)",
 )

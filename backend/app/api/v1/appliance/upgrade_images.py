@@ -950,6 +950,15 @@ def _verify_slot_image_download_token(image_id: uuid.UUID, token: str) -> bool:
 
 @router.get(
     "/upgrade-images/{image_id}/raw.xz",
+    # Declared media type, not just the wire header (#921): FastAPI
+    # documents a bare ``-> Response`` as application/json, so a generated
+    # client and any strict response validator reject the success path.
+    responses={
+        200: {
+            "content": {"application/octet-stream": {}},
+            "description": "The .raw.xz upgrade image",
+        }
+    },
     summary="Download an upgrade image",
     # Return type is FileResponse on the local path, StreamingResponse
     # on the mirror-proxy path. FastAPI can't derive a pydantic model
@@ -1179,6 +1188,12 @@ async def _shim_slot_images_item(request: Request) -> RedirectResponse:
 
 @router.api_route(
     "/slot-images/{image_id}/raw.xz",
+    # Declared media type, not just the wire header (#921): FastAPI
+    # documents a bare ``-> Response`` as application/json, so a generated
+    # client and any strict response validator reject the success path.
+    responses={
+        200: {"content": {"application/octet-stream": {}}, "description": "The .raw.xz slot image"}
+    },
     methods=["GET"],
     include_in_schema=False,
     deprecated=True,

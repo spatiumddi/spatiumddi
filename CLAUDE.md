@@ -1209,6 +1209,101 @@ suggestion, free-space treemap.
   New unauthenticated `GET /settings/public` + `/settings/public/logo`
   (ETag + 304), because the login page needs all of this *before* a
   token exists. 1 MCP tool (`find_branding_settings`).
+- ✅ [**Conformance-fuzz sweep — undeclared media types, FK 500s, and tools that
+  never ran**](https://github.com/spatiumddi/spatiumddi/issues/921)
+  ([#922](https://github.com/spatiumddi/spatiumddi/issues/922),
+  [#923](https://github.com/spatiumddi/spatiumddi/issues/923)) — three QA
+  reports that turned out to be three *classes*, each fixed at class scope
+  with a guard so the set cannot regrow.
+  **(#921) `POST /system/support-bundle` served `application/zip` and declared
+  only `application/json`.** FastAPI documents a bare `-> Response` as JSON, so
+  a generated client and any strict validator reject the *success* path.
+  #861 had fixed the three `export.pdf` routes one at a time; sweeping the
+  whole surface found **eleven more** — SSE streams (`/ai/chat`,
+  `/nmap/scans/{id}/stream`, `/appliance/cluster/health/stream`), backup and
+  DNS zone archives, the SAML metadata document, pod logs, upgrade images and
+  the pcap download. `tests/test_response_media_types.py` compares each
+  handler's own `media_type=` against the **generated OpenAPI document** —
+  not `route.response_model`, which reports clean while the route stays
+  undecodable, the same trap #917's first cut of its guard fell into.
+  **(#922) A dangling foreign key answered an unhandled 500.** #861's global
+  handler maps unique violations (23505) and deliberately re-raises everything
+  else, on the reasoning that NOT NULL / FK / CHECK means *our* bug and a 4xx
+  would both misattribute it and **hide it** from the fuzz's no-5xx assertion.
+  That is right about NOT NULL and CHECK and only half right about FK: a
+  reference the CLIENT sent is an ordinary client error; the same violation on
+  a server-computed value is exactly the bug being protected. The
+  discriminator is the value itself — Postgres names it in `DETAIL`, so
+  `app/core/integrity_errors.py` answers 422 (missing referent) or 409 (still
+  referenced) **only when every offending value appears in what the request
+  carried**, and returns None — re-raise, 500 — otherwise, including for the
+  half of a composite key the server filled in. Reading the DETAIL is the part
+  that is easy to get silently wrong: `IntegrityError.orig` is SQLAlchemy's
+  `AsyncAdapt_asyncpg_dbapi` wrapper, which re-exports `sqlstate` but **not**
+  `detail` — the asyncpg error carrying it hangs off `__cause__`, and reading
+  `orig.detail` alone returns `""` for every error, so the handler looks wired
+  up and changes nothing.
+  **(#923) Rows the API accepts that break later reads — the read half did not
+  reproduce, and running the same program found a different real class.** A
+  two-pass whole-API fuzz over ~1,150 routes produced **zero** newly-broken
+  reads; every write-side 500 it did find reduced to #922. What it found
+  instead was **eight references to columns no model has** — valid Python,
+  clean under ruff, and clean under mypy for a specific reason worth knowing:
+  `attr-defined` is in `disable_error_code` repo-wide (`backend/pyproject.toml`),
+  because roughly thirty of its findings are false positives from
+  dynamic-model patterns. So the one check that would name these exactly
+  (`"DHCPScope" has no attribute "subnet"; maybe "subnet_id"?`) is off. Each is an
+  `AttributeError` the first time its line runs, so the surface answers
+  *nothing, for every input*: `DHCPScope.server_group_id` meant a phone
+  profile could never be assigned to a scope, so the validation that function
+  exists to perform had never once run; `list_dhcp_scopes` /
+  `list_dhcp_servers` / `list_dhcp_server_groups` / `list_network_devices`
+  had never returned a row since they shipped; and the copilot's
+  `create_dhcp_static` operation raised in **both** its preview and its apply,
+  so proposing a reservation from chat had never worked either. Two guards,
+  because neither can see the other's half:
+  `tests/test_model_attribute_references.py` walks the AST for the
+  `Model.attr` spelling in a query, and `tests/test_ai_tool_execution_smoke.py`
+  **executes** every read-only copilot tool, which is the only way to catch
+  `row.attr` while building a response dict — half the findings were that
+  kind. Each tool runs in its own SAVEPOINT: a failed statement leaves
+  Postgres refusing everything until rollback, and rolling the session back
+  instead expires the shared objects, so every later tool reports
+  `MissingGreenlet` and buries the real finding. It is one test rather than
+  300 parametrised ones because the `db_session` fixture truncates every
+  mapped table between tests and 300 of those exhausted memory before
+  finishing. Stated limit: an empty database exercises each tool's query, not
+  every response-row branch — `Subnet.cidr` in `list_platform_health` only
+  runs once a subnet passes 80% utilisation, and was found by the manual
+  `attr-defined` sweep instead.
+  No migration, no new endpoint, no MCP change.
+- 🟡 [**Agent-managed BIND9 AXFR fails PeerBadKey on operator-key-only groups**](https://github.com/spatiumddi/spatiumddi/issues/920)
+  — **not reproduced; one real latent defect in that path fixed, and the
+  regression case the issue asks for added.** The reported shape — a group
+  whose only TSIG material is an operator `DNSTSIGKey`, on a registered
+  agent — was built live and verified end to end: the bundle carries operator
+  keys, `tsig_keys` is inside the *structural* fingerprint so adding one
+  shifts the ETag and converges, the agent renders every bundle key into
+  `tsig/ddns.key`, BIND loads keys whether the include sits above or below
+  `options` (both tested against a running `named`), `rndc reconfig` **does**
+  pick up a key added to an include file — unlike `responselog` in #914 — and
+  a signed AXFR returns the zone while a wrong secret answers **BADSIG**, not
+  the reported BADKEY. That last distinction is the whole diagnosis: BADKEY
+  means named has no definition for the *name*, so a passing "wrong secret is
+  rejected" is what proves the key was rendered.
+  The real defect found on the way: the `include` for the key file was the one
+  path in the BIND9 agent renderer **hardcoded to `/var/lib/spatium-dns-agent`**
+  instead of derived from `state_dir`, while zone files, `rndc.key` and the
+  DoT/DoH cert all derive from it and `AGENT_STATE_DIR` is an honoured
+  override. Under a non-default state dir the key file is written to one place
+  and named told to read another — and if anything happens to exist at the
+  default path, `named-checkconf` passes, the apply reports **ok**, and named
+  holds a stale key set, which is precisely the "apply ok + BADKEY"
+  contradiction the issue reports. `live_axfr_check.py` had been working
+  around it by rewriting the path; it now asserts on it, and gains the
+  operator-key-only case #920 asks for. **Still open:** the reported failure
+  itself, which needs `rndc tsig-list` (or the effective `named.conf` plus
+  includes) from an affected node to say what named actually loaded.
 
 #### CLI tool
 

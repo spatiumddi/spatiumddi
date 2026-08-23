@@ -1605,7 +1605,15 @@ async def saml_callback(
     return response
 
 
-@router.get("/{provider_id}/metadata")
+@router.get(
+    "/{provider_id}/metadata",
+    # Declared media type, not just the wire header (#921): FastAPI
+    # documents a bare ``-> Response`` as application/json, so a generated
+    # client and any strict response validator reject the success path.
+    responses={
+        200: {"content": {"application/xml": {}}, "description": "SAML SP metadata document"}
+    },
+)
 async def saml_metadata(provider_id: uuid.UUID, request: Request, db: DB) -> Response:
     """Expose the SP metadata XML so admins can register SpatiumDDI with
     their IdP. Superadmin gate is not required: metadata is not sensitive and

@@ -155,10 +155,14 @@ async def _to_response(db: DB, p: DHCPPhoneProfile) -> PhoneProfileResponse:
 async def _validate_scope_ids(db: DB, group_id: uuid.UUID, scope_ids: list[uuid.UUID]) -> None:
     if not scope_ids:
         return
+    # ``group_id``, not ``server_group_id`` — the latter is not a column on
+    # DHCPScope, so every call with a non-empty ``scope_ids`` raised
+    # AttributeError and answered 500 (#923). The validation this function
+    # exists to perform therefore never ran: assigning a phone profile to any
+    # scope at all was unreachable. mypy does not catch an unknown attribute
+    # on a declarative model, which is why this survived review.
     res = await db.execute(
-        select(DHCPScope.id).where(
-            DHCPScope.id.in_(scope_ids), DHCPScope.server_group_id == group_id
-        )
+        select(DHCPScope.id).where(DHCPScope.id.in_(scope_ids), DHCPScope.group_id == group_id)
     )
     found = {row[0] for row in res.all()}
     missing = [str(s) for s in scope_ids if s not in found]

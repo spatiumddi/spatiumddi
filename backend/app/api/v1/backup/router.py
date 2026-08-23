@@ -109,7 +109,13 @@ async def list_backup_sections(current_user: CurrentUser) -> BackupSectionCatalo
     )
 
 
-@router.post("/create-and-download")
+@router.post(
+    "/create-and-download",
+    # Declared media type, not just the wire header (#921): FastAPI
+    # documents a bare ``-> Response`` as application/json, so a generated
+    # client and any strict response validator reject the success path.
+    responses={200: {"content": {"application/zip": {}}, "description": "Backup archive"}},
+)
 async def create_and_download_backup(
     db: DB,
     current_user: CurrentUser,

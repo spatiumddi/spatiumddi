@@ -235,7 +235,33 @@ never grow**. A new entry means a route shipped without a schema — declare a
 Detection runs against the generated OpenAPI document rather than the route
 attributes, because that is what a client actually consumes. Routes whose
 handler returns a `Response` subclass (file downloads, SSE streams) are
-excluded: they have no JSON body to describe.
+excluded from *that* check: they have no JSON body to describe. They have
+their own obligation instead — see §2.3.1.
+
+#### 2.3.1 A non-JSON response must declare its media type
+
+FastAPI documents a bare `-> Response` as `application/json`. A route that
+then streams a zip, a PDF, a pcap or an SSE stream is publishing a success
+response it does not produce, so a generated client cannot decode the 200 and
+a strict validator rejects it — schemathesis reports *"Undocumented
+Content-Type — Received: application/zip, Documented: application/json"*.
+
+Declare it on the decorator:
+
+```python
+@router.post(
+    "",
+    responses={200: {"content": {"application/zip": {}}, "description": "The archive"}},
+)
+async def download_support_bundle(...) -> Response:
+    return Response(content=blob, media_type="application/zip")
+```
+
+`backend/tests/test_response_media_types.py` compares each handler's own
+`media_type=` against the generated document and fails on any route that
+serves something it did not declare. Fourteen routes were in that state when
+#921 was filed — three `export.pdf` routes had been fixed one at a time in
+#861, and the sweep found eleven more.
 
 ### 2.4 Copilot tools and REST routes are two views of one capability
 
@@ -568,8 +594,8 @@ Common status codes across the surface:
 | `401 Unauthorized` | Missing / invalid / expired credential, or insufficient token scope |
 | `403 Forbidden` | Authenticated but not permitted (RBAC denial, superadmin-only, disabled account, forced password change) |
 | `404 Not Found` | Resource doesn't exist **or** its feature module is disabled |
-| `409 Conflict` | Uniqueness / overlap / collision conflict |
-| `422 Unprocessable Entity` | Pydantic request-body / query-param validation failure |
+| `409 Conflict` | Uniqueness / overlap / collision conflict, or a delete refused because rows still reference the target |
+| `422 Unprocessable Entity` | Pydantic request-body / query-param validation failure, or a request-supplied reference to a row that does not exist |
 | `429 Too Many Requests` | Per-IP login rate limit tripped |
 | `503 Service Unavailable` | Maintenance mode, transient DB-connection-closed (carries `Retry-After`), or a failing readiness check |
 
@@ -596,6 +622,38 @@ the diagnostics surface and returns a generic
 exception text). Transient DB-connection-closed errors (e.g. during a
 backup restore) are converted to a `503` with `Retry-After: 1` so agent
 long-polls back off rather than cascading.
+
+#### Database integrity errors
+
+Three SQLSTATEs are mapped to client errors before that last-resort handler
+sees them (`app/core/integrity_errors.py`, wired in `main.py`):
+
+| SQLSTATE | Condition | Answer |
+|---|---|---|
+| `23505` | Unique violation | `409` — the data conflicts |
+| `23503` | Foreign key, referent missing, **value came from this request** | `422` — `"<column> references a <table> row that does not exist."` |
+| `23503` | Foreign key, row still referenced, **value came from this request** | `409` |
+| class `22` | Value Postgres refuses as data (over-length, NUL byte, malformed literal) | `422` |
+
+**Everything else re-raises to the 500 path deliberately.** NOT NULL (23502)
+and CHECK (23514) violations mean the *server* built a bad row, and answering
+4xx would both misattribute the fault and hide it — a 4xx is invisible to the
+conformance fuzz's no-5xx assertion, which is the only thing watching for that
+class.
+
+The "value came from this request" qualifier is what splits the foreign-key
+arm (#922). Postgres names the offending column and value in the error's
+`DETAIL`; the value is compared against every scalar in the request body, path
+params and query string, and the request is only blamed when **every**
+offending value is one it actually carried. A dangling reference the server
+computed — including one half of a composite key — still answers 500, on
+purpose.
+
+If you are adding a similar mapping, note that `IntegrityError.orig` is
+SQLAlchemy's `AsyncAdapt_asyncpg_dbapi` wrapper: it re-exports `sqlstate` but
+**not** `detail`. The asyncpg error carrying the DETAIL line hangs off its
+`__cause__`, so reading `orig.detail` returns `""` for every error and the
+handler silently does nothing.
 
 ### Request correlation
 

@@ -561,7 +561,18 @@ async def _resolve_user_from_query_token(db: AsyncSession, token: str, request: 
     return user
 
 
-@router.get("/scans/{scan_id}/stream")
+@router.get(
+    "/scans/{scan_id}/stream",
+    # Declared media type, not just the wire header (#921): FastAPI
+    # documents a bare ``-> Response`` as application/json, so a generated
+    # client and any strict response validator reject the success path.
+    responses={
+        200: {
+            "content": {"text/event-stream": {}},
+            "description": "Server-sent event stream of scan progress",
+        }
+    },
+)
 async def stream_scan(
     scan_id: uuid.UUID,
     request: Request,

@@ -3844,7 +3844,15 @@ async def create_zone(
     return zone
 
 
-@router.get("/groups/{group_id}/zones/export")
+@router.get(
+    "/groups/{group_id}/zones/export",
+    # Declared media type, not just the wire header (#921): FastAPI
+    # documents a bare ``-> Response`` as application/json, so a generated
+    # client and any strict response validator reject the success path.
+    responses={
+        200: {"content": {"application/zip": {}}, "description": "Zone files as a zip archive"}
+    },
+)
 async def export_all_zones(
     group_id: uuid.UUID,
     db: DB,
@@ -6797,7 +6805,15 @@ async def sync_zone_with_server_endpoint(
     )
 
 
-@router.get("/groups/{group_id}/zones/{zone_id}/export")
+@router.get(
+    "/groups/{group_id}/zones/{zone_id}/export",
+    # Declared media type, not just the wire header (#921): FastAPI
+    # documents a bare ``-> Response`` as application/json, so a generated
+    # client and any strict response validator reject the success path.
+    responses={
+        200: {"content": {"text/dns": {}}, "description": "Zone file in master-file format"}
+    },
+)
 async def export_zone(
     group_id: uuid.UUID,
     zone_id: uuid.UUID,

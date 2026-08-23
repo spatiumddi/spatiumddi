@@ -140,7 +140,12 @@ async def current_state(
         "high_utilisation_subnets": [
             {
                 "id": str(s.id),
-                "cidr": str(s.cidr),
+                # #923: the column is ``network``; ``Subnet.cidr`` does not
+                # exist, so this raised AttributeError as soon as any subnet
+                # crossed 80% utilisation — i.e. the tool worked until the
+                # exact moment it had something to report. The response key
+                # keeps its published name.
+                "cidr": str(s.network),
                 "name": s.name,
                 "utilization_percent": float(s.utilization_percent or 0),
             }

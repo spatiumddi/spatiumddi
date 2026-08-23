@@ -6307,6 +6307,10 @@ async def k8s_list_pods(
 
 @router.get(
     "/appliances/{appliance_id}/k8s/logs",
+    # Declared media type, not just the wire header (#921): FastAPI
+    # documents a bare ``-> Response`` as application/json, so a generated
+    # client and any strict response validator reject the success path.
+    responses={200: {"content": {"text/plain": {}}, "description": "Pod logs as plain text"}},
     dependencies=[Depends(require_permission("admin", "appliance"))],
     summary="Fetch recent pod logs from the appliance's local k3s",
 )

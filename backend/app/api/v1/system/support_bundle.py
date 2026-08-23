@@ -152,7 +152,15 @@ async def preview_support_bundle(
     )
 
 
-@router.post("")
+@router.post(
+    "",
+    # Declared media type, not just the wire header (#921): FastAPI
+    # documents a bare ``-> Response`` as application/json, so a generated
+    # client and any strict response validator reject the success path.
+    responses={
+        200: {"content": {"application/zip": {}}, "description": "The support-bundle archive"}
+    },
+)
 async def download_support_bundle(
     body: BundleRequest, db: DB, current_user: CurrentUser
 ) -> Response:
