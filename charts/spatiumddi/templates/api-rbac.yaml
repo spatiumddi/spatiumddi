@@ -54,6 +54,26 @@ rules:
   - apiGroups: ["apps"]
     resources: ["deployments"]
     verbs: ["get", "patch"]
+  {{- if .Values.api.serviceControlRBAC.enabled }}
+  # #890 — service lifecycle control. ``list`` so the Services screen can
+  # enumerate the chart's own workloads, ``patch`` so a rollout restart can
+  # bump ``kubectl.kubernetes.io/restartedAt`` on the pod template.
+  # Deployments already carry get+patch above; the list verb and the other
+  # two kinds are what this block adds.
+  #
+  # No ``resourceNames`` restriction, deliberately: workload names carry
+  # the release name as a prefix and a resourceNames list cannot express
+  # a prefix — it would have to be regenerated per release and would
+  # silently omit any workload added later. The narrowing that matters
+  # happens in the API instead:
+  # ``app/services/service_control/kube.py`` lists only objects labelled
+  # ``app.kubernetes.io/name=spatiumddi`` (or ``part-of``), and an action
+  # resolves its target against that listing, so an operator's own
+  # Deployment in this namespace is neither listed nor restartable.
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets", "daemonsets"]
+    verbs: ["get", "list", "patch"]
+  {{- end }}
   {{- if .Values.api.upgradeOrchestratorRBAC.enabled }}
   # #296 Phase C/D/E — the rolling-upgrade orchestrator reads
   # Deployments + Jobs in the release namespace during the chart-bump

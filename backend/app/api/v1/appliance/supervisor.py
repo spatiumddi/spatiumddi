@@ -5760,6 +5760,101 @@ async def pcap_upload(capture_id: uuid.UUID, request: Request, db: DB) -> dict[s
     return {"status": final_status}
 
 
+class ApplianceWorkloadRow(BaseModel):
+    """One restartable workload on an appliance's k3s."""
+
+    kind: str
+    name: str
+    namespace: str
+    component: str
+    image: str
+    desired: int
+    ready: int
+    state: str
+    last_restarted_at: str | None = None
+
+
+class ApplianceWorkloadsResponse(BaseModel):
+    workloads: list[ApplianceWorkloadRow]
+    #: Per-kind failures. Reported rather than raised so a cluster with an
+    #: RBAC gap on one kind still lists the others.
+    errors: list[str]
+
+
+@router.get(
+    "/appliances/{appliance_id}/k8s/workloads",
+    response_model=ApplianceWorkloadsResponse,
+    dependencies=[Depends(require_permission("admin", "appliance"))],
+    summary="List restartable Deployments / DaemonSets / StatefulSets on an appliance",
+)
+async def k8s_list_workloads(
+    appliance_id: uuid.UUID,
+    current_user: CurrentUser,
+    db: DB,
+    namespace: str = "spatium",
+) -> ApplianceWorkloadsResponse:
+    """Inventory for the Fleet restart picker (#890).
+
+    Before this the Fleet UI had exactly one restart button and it was
+    hardcoded to ``deploy/dns-bind9``, so a node running PowerDNS,
+    Technitium or Kea had no restart at all. Listing the workloads the
+    appliance actually runs replaces the guess.
+
+    Read-only, and filtered to workloads labelled as ours — an operator's
+    own Deployment in the same namespace is neither listed here nor
+    restartable through the sibling endpoint, which resolves its target
+    against this same label set.
+    """
+    import json as _json  # noqa: PLC0415 — lazy; only on this path.
+
+    from app.services.appliance import k8s_proxy as _proxy  # noqa: PLC0415
+    from app.services.service_control import kube as _kube  # noqa: PLC0415
+
+    _require_superadmin(current_user)
+    row = await db.get(Appliance, appliance_id)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
+    if row.state != APPLIANCE_STATE_APPROVED:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"Appliance in state {row.state!r}; kubeapi proxy unavailable.",
+        )
+
+    workloads: list[dict[str, object]] = []
+    errors: list[str] = []
+    for kind, plural in _kube.WORKLOAD_KINDS:
+        api_path = f"/apis/apps/v1/namespaces/{namespace}/{plural}"
+        try:
+            status_code, body = await _proxy.k8s_call(row.id, "GET", api_path, timeout=20.0)
+        except TimeoutError:
+            raise HTTPException(
+                status.HTTP_504_GATEWAY_TIMEOUT,
+                "Supervisor didn't reply in 20s. Is the appliance heartbeating?",
+            ) from None
+        if not 200 <= status_code < 300:
+            # Report per-kind rather than failing the whole call: a
+            # cluster with no StatefulSets and an RBAC gap on them should
+            # still list the Deployments the operator came here to restart.
+            errors.append(f"{plural}: kubeapi {status_code}")
+            continue
+        try:
+            items = (_json.loads(body.decode("utf-8")) or {}).get("items") or []
+        except (ValueError, UnicodeDecodeError) as exc:
+            errors.append(f"{plural}: unparseable response ({exc})")
+            continue
+        workloads.extend(
+            {**_kube.summarise_workload(kind, obj), "namespace": namespace}
+            for obj in items
+            if _kube.is_spatium_workload(obj)
+        )
+
+    workloads.sort(key=lambda w: (str(w["kind"]), str(w["name"])))
+    return ApplianceWorkloadsResponse(
+        workloads=[ApplianceWorkloadRow(**w) for w in workloads],  # type: ignore[arg-type]
+        errors=errors,
+    )
+
+
 class ApplianceRestartDeploymentRequest(BaseModel):
     """Operator-driven Deployment / DaemonSet rollout-restart.
 
@@ -5769,7 +5864,10 @@ class ApplianceRestartDeploymentRequest(BaseModel):
     controller spin up new pods and reap the old ones one at a time.
     """
 
-    kind: Literal["Deployment", "DaemonSet"]
+    # StatefulSet joined the union in #890: the Fleet picker lists every
+    # workload kind the appliance runs, so restricting the restart to two
+    # of the three would leave rows in the picker that error on click.
+    kind: Literal["Deployment", "DaemonSet", "StatefulSet"]
     namespace: str = Field(default="spatium", min_length=1, max_length=64)
     name: str = Field(min_length=1, max_length=253)
 

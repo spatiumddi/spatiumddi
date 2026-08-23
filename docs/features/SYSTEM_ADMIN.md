@@ -99,19 +99,112 @@ Clicking any component opens a detail panel:
 - Memory usage
 - Hit/miss ratio
 
-### Service Start / Stop / Restart
+### Service Start / Stop / Restart (issue #890)
 
-From the Health Dashboard, superadmins can:
-- **Start / Stop / Restart** any managed service (DHCP daemon, DNS daemon, Celery workers, API)
-- **Force sync** any DHCP or DNS server (push current config immediately)
-- **Test connectivity** to any backend server
+**Admin → Platform Insights → Services.** Superadmin-only, audited, and
+**off by default** on everything except the appliance.
 
-Service control operations are executed via:
-- **Docker/Compose**: Docker API calls to the container daemon
-- **Kubernetes**: Rollout restart via Kubernetes API
-- **Bare metal**: SSH to host, `systemctl start/stop/restart <service>`
+> This section previously described a Start/Stop/Restart surface spanning
+> Docker, Kubernetes and bare-metal SSH `systemctl`, none of which had
+> been written — the appliance's pod restart was the only thing that
+> existed. What follows is what ships.
 
-All service control actions are **audit logged**.
+#### Capability first, not a 503
+
+`GET /api/v1/system/services` answers *which lifecycle backend this
+deployment has* before anything is attempted, so the UI renders the
+actions that exist. That matters because the same 503 previously meant
+both "this deployment cannot do that" and "the daemon is down", and
+those need opposite responses from the operator.
+
+| Backend | Detected when | Actions | Mechanism |
+|---|---|---|---|
+| `kubernetes` (flavor `k3s-appliance` or `kubernetes`) | a Kubernetes ServiceAccount is projected into the api pod | `restart` | rollout restart — bump `kubectl.kubernetes.io/restartedAt` on the pod template |
+| `compose` | `/var/run/docker.sock` is mounted **and** the api can read its own `com.docker.compose.project` label | `start`, `stop`, `restart` | Docker API `POST /containers/{id}/{action}` |
+| `none` | neither | — | the response names the missing mount |
+
+**`start` / `stop` are deliberately absent on Kubernetes.** They would
+mean scaling a workload to zero and back, and restoring the previous
+replica count needs somewhere durable to remember it — a control plane
+that forgets how many replicas a workload had is worse than one that
+never offered to stop it.
+
+#### Scope: the inventory is the allowlist
+
+An action names a service from the inventory and is resolved against a
+fresh listing server-side. There is no second allowlist to keep in sync,
+and a caller-supplied id that is not currently one of ours is a 404
+rather than a string handed to a daemon.
+
+* **compose** — only containers whose `com.docker.compose.project` label
+  matches the api container's *own*. This needs no configuration and
+  cannot be widened by a request. It also fails closed: if the api
+  cannot identify its own project (it is not running under compose, or
+  the socket does not expose it), the backend reports unavailable rather
+  than falling back to a name prefix, which a co-tenant container could
+  match on purpose.
+* **kubernetes** — only workloads in the api pod's own namespace
+  labelled `app.kubernetes.io/name=spatiumddi` or
+  `app.kubernetes.io/part-of=spatiumddi`. An operator's own Deployment
+  in the same namespace is neither listed nor restartable.
+
+#### Enabling it
+
+| Deployment | Gate | RBAC / mount |
+|---|---|---|
+| Appliance | on — implied by `appliance_mode` | granted by `spatiumddi-firstboot` (`api.serviceControlRBAC`) |
+| Helm | `api.serviceControl.enabled=true` | `api.serviceControlRBAC.enabled=true` (needs `api.serviceAccount.enabled`) |
+| Raw manifests | `SERVICE_CONTROL_ENABLED=true` on the api | `kubectl apply -f k8s/service-control/rbac.yaml` |
+| docker-compose | `SERVICE_CONTROL_ENABLED=true` on the api | mount `/var/run/docker.sock` + `group_add: ["${DOCKER_GID}"]` |
+
+The two halves are independent and fail differently, which is why they
+are separate switches: without the gate the screen renders read-only and
+says so; without the RBAC, kubeapi answers 403 and the API reports
+"enable the service-control RBAC" instead of an empty inventory that
+would read as "nothing to restart".
+
+The appliance is exempt from the gate because
+`POST /api/v1/appliance/containers/{name}/{action}` has shipped the same
+control since #134 — requiring a new opt-in there would take a capability
+away rather than add one. Everywhere else it is off because a
+restart-capable `docker.sock` is equivalent to root on the host, and a
+restart interrupts live DNS / DHCP / API traffic.
+
+#### Restarting the API that serves the page
+
+Allowed, and flagged in the response as `self_targeted`. The audit row is
+committed and the `202` returned **before** the daemon is signalled — on
+compose the container stops the moment the request is accepted, so
+signalling inline would abort the response and the operator would see a
+connection reset instead of confirmation. For the same reason the row
+records `result="accepted"`, not `"success"`: nothing here survives to
+observe the outcome. On Kubernetes a rollout keeps the current pod
+serving until the replacement is ready, so this only bites on compose.
+
+#### Fleet: remote appliances
+
+The Fleet drilldown's restart is a **workload picker**, fed by
+`GET /api/v1/appliance/appliances/{id}/k8s/workloads` through the
+supervisor's kubeapi proxy, so it lists what that appliance actually
+runs. It was previously a single button hardcoded to
+`deploy/dns-bind9` — a node running PowerDNS, Technitium or Kea had no
+restart at all. Remote *compose*-based agents (legacy pre-#170 installs)
+stay out of scope.
+
+#### Not covered
+
+**Force sync** and **test connectivity** are per-server DNS / DHCP
+actions and live on those servers' own pages, not here. Bare-metal
+`systemctl` over SSH is **not** implemented and is not planned — the
+supported non-container path is the appliance, which runs k3s.
+
+#### MCP
+
+`find_services` (read, default on, superadmin-only) reports the
+capability and the inventory. `propose_restart_service` (default
+**off** — non-negotiable #13) prepares a proposal the operator must
+Apply; a restart is the widest non-destructive blast radius in the
+product, so the copilot cannot offer it until an operator opts in.
 
 ---
 

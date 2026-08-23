@@ -790,9 +790,65 @@ suggestion, free-space treemap.
 - ⬜ [**Config snapshots + rollback**](https://github.com/spatiumddi/spatiumddi/issues/883) — audit-log-driven revert
   of a single change plus scoped named snapshots. Distinct from #882,
   which is an agent-side safety net rather than an operator action.
-- ⬜ [**Service restart from the GUI**](https://github.com/spatiumddi/spatiumddi/issues/890) — closes the #111 gap on
-  docker-compose and Helm deployments, where the appliance's supervisor
-  path has no equivalent.
+- ✅ [**Service restart from the GUI**](https://github.com/spatiumddi/spatiumddi/issues/890) — closes the #111 gap on
+  docker-compose and Helm, where the appliance's pod restart had no
+  equivalent. One surface at **Admin → Platform Insights → Services**
+  over `app/services/service_control/` (`backends` / `compose` / `kube`),
+  `GET|POST /system/services*`, opt-in RBAC in
+  `charts/spatiumddi` + `k8s/service-control/`, and 2 MCP tools
+  (`find_services` default on, `propose_restart_service` default **off**
+  per non-negotiable #13). No migration — nothing here is persisted
+  beyond the audit row.
+  **The capability is answered before anything is attempted**, which is
+  the design point rather than a nicety: the same 503 used to mean both
+  "this deployment cannot do that" and "the daemon is down", and those
+  need opposite responses from the operator. `GET /system/services`
+  reports the live backend (`kubernetes` / `compose` / `none`), whether
+  the gate is open, and the exact toggle to flip — so the UI renders the
+  buttons that exist instead of drawing one and learning from its error.
+  **The inventory is the allowlist.** An action names a service from the
+  listing and is resolved against a *fresh* one server-side, so there is
+  no second list to keep in sync and an id that is not currently ours is
+  a 404 rather than a string handed to a daemon. On compose the scope is
+  the api container's own `com.docker.compose.project` label — needs no
+  configuration, cannot be widened by a request, and **fails closed**: a
+  container that cannot identify its own project reports the backend
+  unavailable rather than falling back to a `spatiumddi-` name prefix,
+  which a co-tenant container could match on purpose. On Kubernetes it is
+  the api pod's own namespace filtered to `app.kubernetes.io/name` /
+  `part-of=spatiumddi`, which is also why the Role carries no
+  `resourceNames` (a release-name prefix isn't expressible there, and the
+  list would silently omit any workload added later).
+  **`start` / `stop` are deliberately absent on Kubernetes.** They would
+  mean scaling to zero and back, and restoring the previous replica count
+  needs somewhere durable to remember it — a control plane that forgets
+  is worse than one that never offered.
+  **Restarting the api that serves the page is allowed and flagged.** The
+  audit row commits and the 202 returns *before* the daemon is signalled,
+  because on compose the container stops the moment the request is
+  accepted and signalling inline would abort the response into a
+  connection reset; the row records `accepted`, not `success`, since
+  nothing survives to observe the outcome. Kubernetes doesn't have the
+  problem — a rollout keeps the current pod serving.
+  Gate defaults **off** everywhere except the appliance, where
+  `appliance_mode` implies it: `POST /appliance/containers/{name}/{action}`
+  has shipped the same control since #134, so an opt-in there would take
+  a capability away rather than add one. The env gate and the RBAC are
+  separate switches on purpose — each failure is reported as itself
+  ("enable SERVICE_CONTROL_ENABLED" vs "enable api.serviceControlRBAC")
+  rather than as an empty inventory that reads as "nothing to restart".
+  **Also fixed on the way:** the Fleet restart was one button hardcoded to
+  `deploy/dns-bind9`, so a node running PowerDNS, Technitium or Kea had no
+  restart at all — now a picker fed by
+  `GET /appliance/appliances/{id}/k8s/workloads` through the supervisor
+  proxy (and `StatefulSet` joined the restart endpoint's `kind` union, or
+  the picker could list a row that errors on click). And
+  `SYSTEM_ADMIN.md` described Start/Stop/Restart across Docker,
+  Kubernetes and bare-metal SSH `systemctl`, none of which had been
+  written; that section now documents what ships and says plainly that
+  the `systemctl` path is not planned.
+  **Deferred:** remote *compose*-based agents (legacy pre-#170 installs),
+  which have no supervisor to proxy through.
 
 #### Workflow & RBAC
 

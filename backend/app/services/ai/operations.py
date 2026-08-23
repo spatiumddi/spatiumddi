@@ -4717,3 +4717,149 @@ register(
         required_permission=("write", "bgp_lg_peer"),
     )
 )
+
+
+# ── restart_service operation (issue #890) ─────────────────────────────
+#
+# Restarting a control-plane service is the broadest-blast-radius write
+# in the product that isn't destructive: get the target wrong and DNS or
+# DHCP goes away for the length of a rollout. So it is superadmin-gated
+# at both preview and apply, and — like the REST route — the target is
+# resolved against the *live* inventory rather than trusted from the
+# caller, which means a hallucinated service name is a clean rejection at
+# preview time instead of a string handed to a daemon.
+
+
+class RestartServiceArgs(BaseModel):
+    """Args for ``restart_service`` — restart one SpatiumDDI service."""
+
+    service_id: str = Field(
+        description=(
+            "Service id exactly as returned by the service inventory: the "
+            "compose service name (e.g. 'api', 'dns-bind9') on docker-compose, "
+            "or 'Kind/name' (e.g. 'Deployment/spatiumddi-api') on Kubernetes."
+        )
+    )
+
+
+async def _resolve_restart_target(user: User, args: RestartServiceArgs) -> tuple[Any, str | None]:
+    """Shared superadmin + capability + inventory resolution.
+
+    Returns ``(plan, None)`` on success or ``(None, reason)`` — used by
+    preview and apply so the two cannot disagree about whether a restart
+    is legal.
+    """
+    from app.core.permissions import is_effective_superadmin  # noqa: PLC0415
+    from app.services import service_control  # noqa: PLC0415
+    from app.services.service_control.backends import plan_action  # noqa: PLC0415
+
+    if not is_effective_superadmin(user):
+        return None, (
+            "Restarting a service interrupts DNS / DHCP / API traffic, so it's "
+            "restricted to superadmin users."
+        )
+    try:
+        plan = await plan_action(args.service_id, "restart")
+    except LookupError:
+        return None, (
+            f"No controllable service {args.service_id!r} in this deployment. "
+            "List the inventory first — ids differ between docker-compose and "
+            "Kubernetes."
+        )
+    except service_control.ServiceControlError as exc:
+        return None, str(exc)
+    return plan, None
+
+
+async def _preview_restart_service(
+    db: AsyncSession, user: User, args: RestartServiceArgs
+) -> PreviewResult:
+    plan, reason = await _resolve_restart_target(user, args)
+    if plan is None:
+        return PreviewResult(ok=False, detail=reason or "restart unavailable")
+    svc = plan.service
+    lines = [
+        f"Restart **{svc.name}** (`{svc.id}`, {svc.kind}) — currently {svc.state}.",
+    ]
+    if plan.is_self:
+        lines.append(
+            "⚠️ This is the API container serving this session. It will drop "
+            "the connection; the UI reconnects once it is back."
+        )
+    if svc.kind != "container":
+        lines.append(
+            "Kubernetes rollout restart: pods are replaced one at a time, so "
+            "service continues if the workload has more than one replica."
+        )
+    else:
+        lines.append("The container stops and starts; anything it serves is down meanwhile.")
+    return PreviewResult(ok=True, detail="ready", preview_text="\n".join(lines))
+
+
+async def _apply_restart_service(
+    db: AsyncSession, user: User, args: RestartServiceArgs
+) -> dict[str, Any]:
+    from app.models.audit import AuditLog  # noqa: PLC0415
+    from app.services.service_control.backends import (  # noqa: PLC0415
+        apply_action,
+        apply_action_detached,
+    )
+
+    plan, reason = await _resolve_restart_target(user, args)
+    if plan is None:
+        raise ValueError(reason or "restart unavailable")
+
+    # Audit BEFORE signalling, and record ``accepted`` rather than
+    # ``success``: a self-targeted compose restart kills this process the
+    # moment the daemon accepts it, so nothing here survives to observe
+    # the outcome. Same ordering and same wording as the REST route.
+    db.add(
+        AuditLog(
+            user_id=user.id,
+            user_display_name=user.display_name,
+            auth_source=getattr(user, "auth_source", "local") or "local",
+            action="service_restart",
+            resource_type="service",
+            resource_id=plan.service.id,
+            resource_display=plan.service.name,
+            result="accepted",
+            new_value={
+                "kind": plan.service.kind,
+                "self_targeted": plan.is_self,
+                "via": "ai_proposal",
+            },
+        )
+    )
+    await db.commit()
+
+    if plan.is_self:
+        # No response to protect here the way the REST route has, but the
+        # commit above must still land before the daemon stops us.
+        await apply_action_detached(plan)
+    else:
+        await apply_action(plan)
+    return {
+        "id": plan.service.id,
+        "name": plan.service.name,
+        "kind": plan.service.kind,
+        "action": "restart",
+        "status": "accepted",
+        "self_targeted": plan.is_self,
+    }
+
+
+register(
+    Operation(
+        name="restart_service",
+        description=(
+            "Restart one SpatiumDDI service — a compose container or a "
+            "Kubernetes workload rollout (issue #890). Superadmin only. "
+            "Always route via propose_restart_service; the operator clicks "
+            "Apply, because this interrupts live DNS / DHCP / API traffic."
+        ),
+        args_model=RestartServiceArgs,
+        preview=_preview_restart_service,
+        apply=_apply_restart_service,
+        category="admin",
+    )
+)

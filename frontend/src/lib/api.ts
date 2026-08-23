@@ -12008,7 +12008,7 @@ export const applianceApprovalApi = {
   k8sRolloutRestart: (
     id: string,
     body: {
-      kind: "Deployment" | "DaemonSet";
+      kind: ApplianceWorkloadKind;
       namespace?: string;
       name: string;
     },
@@ -12020,6 +12020,16 @@ export const applianceApprovalApi = {
         kind: string;
         name: string;
       }>(`/appliance/appliances/${id}/k8s/restart`, body)
+      .then((r) => r.data),
+  /** #890 — what this appliance actually runs, so the Fleet restart
+   *  picker isn't hardcoded to one workload. Filtered server-side to
+   *  spatiumddi-labelled objects. */
+  k8sWorkloads: (id: string, namespace?: string) =>
+    api
+      .get<ApplianceWorkloadsResponse>(
+        `/appliance/appliances/${id}/k8s/workloads`,
+        { params: namespace ? { namespace } : undefined },
+      )
       .then((r) => r.data),
   // Issue #183 Phase 5 — reveal the stored kubeconfig after a
   // password re-confirmation. Same shape as the SNMP-community and
@@ -14254,6 +14264,89 @@ export const containersApi = {
   stats: (params: { prefix?: string; include_stopped?: boolean } = {}) =>
     api
       .get<ContainerStatsResponse>("/admin/containers/stats", { params })
+      .then((r) => r.data),
+};
+
+// ── Service lifecycle control (issue #890) ────────────────────────────────────
+
+/** Which lifecycle backend the deployment actually has. Reported before
+ *  anything is attempted, so the UI never infers "unsupported" from a 503. */
+/** #890 — the workload kinds the Fleet restart picker can act on.
+ *  StatefulSet joined the union so the picker can't list a row that
+ *  errors on click. */
+export type ApplianceWorkloadKind = "Deployment" | "DaemonSet" | "StatefulSet";
+
+export interface ApplianceWorkload {
+  kind: ApplianceWorkloadKind;
+  name: string;
+  namespace: string;
+  component: string;
+  image: string;
+  desired: number;
+  ready: number;
+  state: string;
+  last_restarted_at: string | null;
+}
+
+export interface ApplianceWorkloadsResponse {
+  workloads: ApplianceWorkload[];
+  /** Per-kind failures. Reported rather than swallowed so a cluster with
+   *  an RBAC gap on one kind still lists the others. */
+  errors: string[];
+}
+
+export type ServiceControlBackend = "kubernetes" | "compose" | "none";
+export type ServiceAction = "start" | "stop" | "restart";
+
+export interface ServiceControlCapability {
+  backend: ServiceControlBackend;
+  /** "k3s-appliance" | "kubernetes" | "compose" | "none" */
+  flavor: string;
+  enabled: boolean;
+  supported_actions: ServiceAction[];
+  /** Populated whenever control is unavailable — always actionable prose. */
+  reason: string | null;
+}
+
+export interface ServiceRow {
+  id: string;
+  name: string;
+  kind: string;
+  state: string;
+  image: string;
+  detail: string;
+  actions: ServiceAction[];
+  component: string | null;
+  desired: number | null;
+  ready: number | null;
+  last_restarted_at: string | null;
+}
+
+export interface ServiceListResponse {
+  capability: ServiceControlCapability;
+  services: ServiceRow[];
+  /** Backend is live but could not be queried — distinct from an empty
+   *  inventory, which would read as "nothing to restart". */
+  error: string | null;
+}
+
+export interface ServiceActionResult {
+  id: string;
+  action: ServiceAction;
+  status: string;
+  /** The target is the API serving this request; expect the session to
+   *  blink rather than treating a dropped poll as a failure. */
+  self_targeted: boolean;
+}
+
+export const serviceControlApi = {
+  list: () =>
+    api.get<ServiceListResponse>("/system/services").then((r) => r.data),
+  act: (id: string, action: ServiceAction) =>
+    api
+      .post<ServiceActionResult>(
+        `/system/services/${encodeURIComponent(id)}/${action}`,
+      )
       .then((r) => r.data),
 };
 

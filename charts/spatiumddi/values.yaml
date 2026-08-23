@@ -111,6 +111,27 @@ api:
   # resources at all.
   upgradeOrchestratorRBAC:
     enabled: false
+  # #890 — service lifecycle control (Settings → Services). Two
+  # independent switches, because they fail differently:
+  #
+  #   * ``serviceControl.enabled`` sets SERVICE_CONTROL_ENABLED on the api
+  #     and is what the capability probe reports to the UI. Without it the
+  #     Services screen renders read-only and says why.
+  #   * ``serviceControlRBAC.enabled`` grants the api SA ``list`` on
+  #     Deployments / StatefulSets / DaemonSets and ``patch`` on all three
+  #     (a rollout restart is a pod-template annotation bump). Without it
+  #     the api can list nothing and kubeapi answers 403 — which the code
+  #     surfaces as "enable api.serviceControlRBAC" rather than as an
+  #     empty inventory.
+  #
+  # Turn on both to get a working Services screen; either alone is a
+  # deliberate half-state that reports itself. Both default off: a
+  # restart interrupts live DNS / DHCP / API traffic, so it is opt-in.
+  # Requires ``serviceAccount.enabled`` for the SA to exist at all.
+  serviceControl:
+    enabled: false
+  serviceControlRBAC:
+    enabled: false
   # Appliance host bind mounts. The api writes the setup-complete
   # flag, slot-upgrade trigger files, rollback triggers, and the
   # maintenance flag into ``/var/lib/spatiumddi-host/release-state/``

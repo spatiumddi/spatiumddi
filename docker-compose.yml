@@ -50,11 +50,20 @@ services:
       CELERY_BROKER_URL: redis://redis:6379/1
       CELERY_RESULT_BACKEND: redis://redis:6379/2
       VERSION: ${SPATIUMDDI_VERSION:-dev}
+      # Service control (#890) — Admin → Platform Insights → Services
+      # gets Start / Stop / Restart buttons for THIS compose project's
+      # containers. Off by default: it needs the docker.sock mount below,
+      # and a restart-capable socket is equivalent to root on the host.
+      # Scope is the api container's own ``com.docker.compose.project``
+      # label, so it can never reach a container outside this stack.
+      SERVICE_CONTROL_ENABLED: ${SERVICE_CONTROL_ENABLED:-false}
     # Docker integration — uncomment both entries below to poll the
     # host's Docker daemon over its local Unix socket. Required when
-    # adding a Docker host with connection_type=unix. Read-only
-    # mount; SpatiumDDI only reads. Unnecessary for TCP+TLS remote
-    # daemons.
+    # adding a Docker host with connection_type=unix, and by service
+    # control (#890) — see SERVICE_CONTROL_ENABLED below. The ``:ro``
+    # mount is fine for both: it makes the socket *file* read-only, not
+    # the protocol, so lifecycle POSTs still work.
+    # Unnecessary for TCP+TLS remote daemons.
     #
     # ``DOCKER_GID`` must match the gid of ``/var/run/docker.sock``
     # on the host — find it with:
