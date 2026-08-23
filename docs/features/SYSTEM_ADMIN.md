@@ -753,35 +753,141 @@ GET /api/v1/version
 
 Available at `/metrics` when `prometheus_metrics_enabled=true`. Scraped by any Prometheus-compatible tool including Grafana Cloud.
 
-### InfluxDB Export
+### InfluxDB Export (issue #889)
 
-SpatiumDDI can push metrics to InfluxDB (v1.x and v2.x) for Grafana dashboards:
+**Settings → Metrics → InfluxDB Export.** SpatiumDDI is the *writer*: a
+Celery beat task formats [line protocol](https://docs.influxdata.com/influxdb/v2/reference/syntax/line-protocol/)
+from the metric tables the agents already fill and POSTs it. Nothing is
+read back, so a target's health is whatever its last push reported.
+Superadmin-only, audited, and independent of the Prometheus `/metrics`
+endpoint — running both is fine.
+
+Multiple targets run at once (a local InfluxDB alongside a hosted one),
+each with its own interval, prefix and metric selection.
+
+**Not a feature module** (non-negotiable #14, stated explicitly): this
+adds no sidebar section and no top-level router prefix. It is a
+Settings-level integration under the existing `/settings` surface, same
+as audit forwarding, and "off" is already modelled by disabling or
+deleting a target.
 
 ```
-InfluxDBTarget
-  id, name
-  version: enum(v1, v2)
-  url: str                   -- e.g., http://influxdb:8086
+InfluxDBTarget                    -- backend/app/models/influxdb.py
+  id, name (unique), enabled
+  version: enum(v1, v2, v3)
+  url: str                        -- base URL only, e.g. http://influxdb:8086
+  verify_tls: bool (default true)
+  timeout_seconds: int (default 10)
   -- v1 fields:
   database: str
-  username, password_ref
-  -- v2 fields:
-  org: str
-  bucket: str
-  token_ref: str             -- reference to encrypted secret
+  username: str
+  password_encrypted: bytes       -- Fernet at rest; API returns password_set only
+  -- v2 / v3 fields:
+  org: str                        -- required on v2; optional on v3
+  bucket: str                     -- on v3 this is the database name
+  token_encrypted: bytes          -- Fernet at rest; API returns token_set only
   measurement_prefix: str (default "spatiumddi_")
-  push_interval_seconds: int (default 60)
-  is_enabled: bool
+  push_interval_seconds: int (default 60, min 30)
+  push_dns_metrics / push_dhcp_metrics /
+  push_subnet_utilization / push_dhcp_scope_leases: bool (all default true)
+  -- push state (written by the task, read-only to the operator):
+  last_dns_bucket_at, last_dhcp_bucket_at    -- per-source high-water marks
+  last_push_at, last_push_points, last_push_error
 ```
 
-**Metrics pushed to InfluxDB:**
-- IP space/subnet utilization (current allocation %)
-- DHCP lease counts per scope
-- DNS query rates per server
-- API request rates and latencies
-- System health status per component
+#### "All versions" — v1, v2 and v3
 
-Multiple InfluxDB targets can be configured simultaneously (e.g., local InfluxDB + remote InfluxCloud).
+Three declared versions, **two** wire dialects. v3 is not a third
+client; it is the v2 write endpoint with different auth and naming, so
+InfluxDB 3 Core / Enterprise / Cloud Dedicated / Cloud Serverless are
+all covered by the same code path.
+
+| version | endpoint | auth | destination field |
+|---|---|---|---|
+| `v1` | `POST /write?db=…` | HTTP basic, omitted when username *and* password are blank | `database` |
+| `v2` | `POST /api/v2/write?org=…&bucket=…` | `Authorization: Token …` | `bucket` (`org` required) |
+| `v3` | `POST /api/v2/write?bucket=…` | `Authorization: Bearer …` | `bucket`, labelled **Database** in the UI (`org` optional — Core/Enterprise accept-and-ignore it, Cloud Serverless honours it) |
+
+Pointing a **v1** target at an InfluxDB 3 server also works: the API
+token goes in the *password* field and the username is ignored. That is
+InfluxDB's documented compatibility shim, and it needs nothing special
+here beyond basic auth already sending it.
+
+All three write with `precision=s`.
+
+#### What gets pushed
+
+Two shapes, which behave differently on a dashboard:
+
+**Counter deltas** — agent-reported, already bucketed at 60 s, carrying
+*the bucket's own timestamp*. A backfill therefore lands on the hour the
+traffic happened, not the hour it was exported.
+
+| measurement | tags | fields |
+|---|---|---|
+| `<prefix>dns_queries` | `server`, `server_id` | `queries_total`, `noerror`, `nxdomain`, `servfail`, `recursion`, `rate_dropped`, `rate_slipped` |
+| `<prefix>dhcp_messages` | `server`, `server_id` | `discover`, `offer`, `request`, `ack`, `nak`, `decline`, `release`, `inform` |
+
+**Point-in-time gauges** — sampled at push time from counters the
+application already maintains, so there is no historical backfill: the
+first point is the moment the target was enabled.
+
+| measurement | tags | fields |
+|---|---|---|
+| `<prefix>subnet_utilization` | `subnet`, `subnet_id`, `space` | `allocated`, `total`, `percent` |
+| `<prefix>dhcp_scope_leases` | `scope`, `scope_id`, `group`, `subnet` | `active_leases`, `is_active` |
+
+A scope with no active leases is exported as `0` rather than omitted —
+an absent series and an empty scope look identical on a graph, and "the
+scope went quiet" is what an operator wants to see.
+
+> **"Realtime" caveat.** The floor for the counter deltas is the **60 s
+> agent bucket**, not the push interval; setting a 30 s interval just
+> re-sends the same bucket. Sub-minute resolution would need agent-side
+> cadence changes and is out of scope. For the gauges, the floor *is*
+> the push interval.
+
+Not yet carried, because nothing samples them: API request rates and
+latencies, and per-component health status. The tracked deferrals in
+[`SHIPPED.md`](../SHIPPED.md) each widen what this export carries when
+they land — Windows DNS/DHCP stats over WinRM, and per-qtype (BIND) /
+per-subnet (Kea) breakdowns.
+
+#### Idempotency and the high-water marks
+
+Line protocol overwrites a point with an identical measurement, tag set
+and timestamp, so re-sending a batch is a no-op at the server. That is
+what makes the task safe to retry (non-negotiable #9), and it is why the
+cursor is *not* a strict `>` on the watermark: the pusher deliberately
+re-sends a 5-minute overlap window so a sample an agent reported late
+still gets exported rather than being skipped forever.
+
+The watermarks advance **only** on a successful write. A dead collector
+means a delayed export, never a hole — the samples stay in Postgres until
+`prune_metrics` retires them, so a target that recovers inside
+`metric_retention_days` backfills on its own. A newly-added target
+drains the whole retention window at 5 000 rows per source per push,
+so it converges over several ticks rather than in one oversized POST.
+
+`last_push_at` moves on failure as well as success — otherwise a
+fast-failing target would be retried on every 30 s beat tick instead of
+on its own interval.
+
+#### Test write
+
+The **Test** button performs a real single-point write to the target's
+own `<prefix>export_test` measurement, not a reachability check: a
+correct URL with the wrong bucket, org or token answers a plain GET
+perfectly well and then rejects every point. It leaves the watermarks
+alone — it is a probe, not
+a push.
+
+#### MCP
+
+`find_influxdb_targets` (default on, superadmin-only) reports each
+target's version, destination, what it carries, and its last push's
+timestamp, point count and error. Never returns a token or password —
+only whether one is on file.
 
 ---
 

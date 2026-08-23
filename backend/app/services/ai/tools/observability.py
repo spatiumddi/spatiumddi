@@ -23,9 +23,14 @@ open the UI":
   twenty resource types and the same per-type permission filtering
   (#879); output is the same hit shape (type / id / display /
   breadcrumb).
+* ``find_influxdb_targets`` — the #889 push-export destinations and
+  their delivery health. Superadmin-only (it describes the operator's
+  monitoring topology) and never returns a token or password.
 
 All read-only. No tool here is gated by a feature_module — log /
-metric / search surfaces are always-on platform infrastructure.
+metric / search surfaces are always-on platform infrastructure, and
+the InfluxDB export is a Settings-level integration with no sidebar
+surface of its own (non-negotiable #14).
 """
 
 from __future__ import annotations
@@ -37,7 +42,9 @@ from pydantic import BaseModel, Field
 from sqlalchemy import desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.permissions import is_effective_superadmin
 from app.models.auth import User
+from app.models.influxdb import InfluxDBTarget
 from app.models.logs import DHCPLogEntry, DNSQueryLogEntry
 from app.models.metrics import DHCPMetricSample, DNSMetricSample
 from app.services.ai.tools.base import register_tool
@@ -519,3 +526,92 @@ async def find_agents_with_config_failures(
                 }
             )
     return out[: args.limit]
+
+
+# ── find_influxdb_targets (issue #889) ─────────────────────────────
+
+
+class FindInfluxDBTargetsArgs(BaseModel):
+    name: str | None = Field(default=None, description="Substring match on target name.")
+    enabled_only: bool = Field(default=False, description="Only return targets with enabled=true.")
+    failing_only: bool = Field(
+        default=False,
+        description="Only return targets whose most recent push recorded an error.",
+    )
+    limit: int = Field(default=50, ge=1, le=200)
+
+
+@register_tool(
+    name="find_influxdb_targets",
+    description=(
+        "List configured InfluxDB push-export targets and their delivery "
+        "health. Each row carries name, version (v1 / v2 / v3), URL, the "
+        "database or bucket written to, measurement prefix, push interval, "
+        "which metric families it carries, and the last push's timestamp, "
+        "point count and error. Use to answer 'is the Grafana export "
+        "working?' or 'why did metrics stop arriving in InfluxDB?'. "
+        "Read-only, superadmin-only, and never returns tokens or passwords "
+        "— only whether one is on file."
+    ),
+    args_model=FindInfluxDBTargetsArgs,
+    category="ops",
+    default_enabled=True,
+)
+async def find_influxdb_targets(
+    db: AsyncSession, user: User, args: FindInfluxDBTargetsArgs
+) -> dict[str, Any]:
+    # Superadmin-gated to match ``GET /settings/influxdb-targets`` — the
+    # rows carry an operator's monitoring topology (hostnames, bucket
+    # names) even with the secrets stripped.
+    if not is_effective_superadmin(user):
+        return {
+            "error": (
+                "InfluxDB export targets are platform configuration and are "
+                "restricted to superadmin users. Ask your platform admin."
+            )
+        }
+
+    stmt = select(InfluxDBTarget)
+    if args.name:
+        stmt = stmt.where(InfluxDBTarget.name.ilike(f"%{args.name.strip()}%"))
+    if args.enabled_only:
+        stmt = stmt.where(InfluxDBTarget.enabled.is_(True))
+    if args.failing_only:
+        stmt = stmt.where(InfluxDBTarget.last_push_error.is_not(None))
+    stmt = stmt.order_by(InfluxDBTarget.name.asc()).limit(args.limit)
+
+    rows = list((await db.execute(stmt)).scalars().all())
+    return {
+        "targets": [
+            {
+                "id": str(t.id),
+                "name": t.name,
+                "enabled": t.enabled,
+                "version": t.version,
+                "url": t.url,
+                # v1 writes to a database, v2/v3 to a bucket. Reported
+                # under one key so the answer doesn't depend on which
+                # dialect the operator picked.
+                "destination": t.database if t.version == "v1" else t.bucket,
+                "org": t.org or None,
+                "measurement_prefix": t.measurement_prefix,
+                "push_interval_seconds": t.push_interval_seconds,
+                "carries": [
+                    label
+                    for label, on in (
+                        ("dns_queries", t.push_dns_metrics),
+                        ("dhcp_messages", t.push_dhcp_metrics),
+                        ("subnet_utilization", t.push_subnet_utilization),
+                        ("dhcp_scope_leases", t.push_dhcp_scope_leases),
+                    )
+                    if on
+                ],
+                "credential_on_file": bool(t.password_encrypted or t.token_encrypted),
+                "last_push_at": t.last_push_at.isoformat() if t.last_push_at else None,
+                "last_push_points": t.last_push_points,
+                "last_push_error": t.last_push_error,
+            }
+            for t in rows
+        ],
+        "count": len(rows),
+    }

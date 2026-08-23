@@ -30,6 +30,7 @@ celery_app = Celery(
         "app.tasks.prune_internal_errors",
         "app.tasks.prune_logs",
         "app.tasks.prune_metrics",
+        "app.tasks.influxdb_push",
         "app.tasks.prune_multicast_memberships",
         "app.tasks.prune_pairing_codes",
         "app.tasks.firewall_lint_scan",
@@ -105,6 +106,7 @@ celery_app.conf.update(
         "app.tasks.prune_internal_errors.*": {"queue": "default"},
         "app.tasks.prune_logs.*": {"queue": "default"},
         "app.tasks.prune_metrics.*": {"queue": "default"},
+        "app.tasks.influxdb_push.*": {"queue": "default"},
         "app.tasks.subnet_utilization_snapshot.*": {"queue": "default"},
         "app.tasks.prune_multicast_memberships.*": {"queue": "default"},
         "app.tasks.prune_pairing_codes.*": {"queue": "default"},
@@ -307,6 +309,14 @@ celery_app.conf.update(
         "metric-samples-prune": {
             "task": "app.tasks.prune_metrics.prune_metric_samples",
             "schedule": schedule(run_every=24 * 3600.0),
+        },
+        # #889 — InfluxDB push export. Coarse 30 s tick; each target is
+        # gated on its own ``push_interval_seconds`` inside the task, so
+        # cadence edits in the UI apply without restarting beat. A tick
+        # with no enabled targets is one indexed SELECT and returns.
+        "influxdb-push": {
+            "task": "app.tasks.influxdb_push.push_influxdb_metrics",
+            "schedule": schedule(run_every=30.0),
         },
         # #44 — daily per-subnet utilization snapshot + 90-day prune,
         # powering the "% used over time" chart on the subnet detail.

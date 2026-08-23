@@ -11,7 +11,7 @@ from typing import Any, Literal
 
 import structlog
 from fastapi import APIRouter, File, Header, HTTPException, Response, UploadFile, status
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
@@ -22,6 +22,13 @@ from app.core.http_etag import etag_matches, format_etag
 from app.core.permissions import is_effective_superadmin, user_has_permission
 from app.models.audit import AuditLog
 from app.models.audit_forward import AuditForwardTarget
+from app.models.influxdb import (
+    DEFAULT_MEASUREMENT_PREFIX,
+    DEFAULT_PUSH_INTERVAL_SECONDS,
+    INFLUXDB_VERSIONS,
+    MIN_PUSH_INTERVAL_SECONDS,
+    InfluxDBTarget,
+)
 from app.models.oui import OUIVendor
 from app.models.settings import (
     BRANDING_ASSET_KIND_LOGO,
@@ -3072,6 +3079,347 @@ async def test_audit_target(
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"delivery failed: {exc}") from exc
     return {"status": "ok", "target": row.name}
+
+
+# ── InfluxDB push export (issue #889) ──────────────────────────────────────────
+#
+# CRUD + test-write for ``InfluxDBTarget``. Superadmin-gated and audited
+# like the audit-forward targets above, and secrets follow the same
+# shape: write-only in, boolean-only out.
+#
+# Deliberately NOT a feature module (non-negotiable #14 asks for the
+# decision to be explicit): this adds no sidebar section and no top-level
+# router prefix — it is a Settings-level integration that lives under the
+# existing ``/settings`` surface, same as audit forwarding. There is
+# nothing for an operator to "turn off" beyond deleting or disabling a
+# target, which the resource already models.
+
+
+class InfluxDBTargetBody(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    enabled: bool = True
+    version: str = "v2"
+    url: str = ""
+    verify_tls: bool = True
+    timeout_seconds: int = Field(default=10, ge=1, le=120)
+    # v1
+    database: str = ""
+    username: str = ""
+    # ``None`` = leave the stored value alone (the operator is editing
+    # another field), ``""`` = clear, anything else = encrypt + replace.
+    # Same three-way contract as ``AuditTargetBody.smtp_password``.
+    password: str | None = None
+    # v2 / v3
+    org: str = ""
+    bucket: str = ""
+    token: str | None = None
+    measurement_prefix: str = Field(default=DEFAULT_MEASUREMENT_PREFIX, max_length=64)
+    push_interval_seconds: int = Field(
+        default=DEFAULT_PUSH_INTERVAL_SECONDS, ge=MIN_PUSH_INTERVAL_SECONDS, le=86400
+    )
+    push_dns_metrics: bool = True
+    push_dhcp_metrics: bool = True
+    push_subnet_utilization: bool = True
+    push_dhcp_scope_leases: bool = True
+
+    @field_validator("version")
+    @classmethod
+    def _valid_version(cls, v: str) -> str:
+        if v not in INFLUXDB_VERSIONS:
+            raise ValueError(f"version must be one of {list(INFLUXDB_VERSIONS)}")
+        return v
+
+    @field_validator("url")
+    @classmethod
+    def _valid_url(cls, v: str) -> str:
+        cleaned = v.strip()
+        if cleaned and not cleaned.startswith(("http://", "https://")):
+            raise ValueError("url must start with http:// or https://")
+        return cleaned
+
+    @field_validator("measurement_prefix")
+    @classmethod
+    def _valid_prefix(cls, v: str) -> str:
+        # The prefix is concatenated onto a measurement name and then
+        # line-protocol-escaped, so a stray comma or space would not
+        # corrupt the wire format — but it would produce a measurement
+        # name nobody can type into a Flux query. Reject early.
+        if v and not re.fullmatch(r"[A-Za-z0-9_.:-]*", v):
+            raise ValueError("measurement_prefix may only contain letters, digits, and _ . : -")
+        return v
+
+
+class InfluxDBTargetResponse(BaseModel):
+    id: str
+    name: str
+    enabled: bool
+    version: str
+    url: str
+    verify_tls: bool
+    timeout_seconds: int
+    database: str
+    username: str
+    # Secrets are never returned — only whether one is on file.
+    password_set: bool
+    org: str
+    bucket: str
+    token_set: bool
+    measurement_prefix: str
+    push_interval_seconds: int
+    push_dns_metrics: bool
+    push_dhcp_metrics: bool
+    push_subnet_utilization: bool
+    push_dhcp_scope_leases: bool
+    last_push_at: datetime | None
+    last_push_points: int
+    last_push_error: str | None
+    last_dns_bucket_at: datetime | None
+    last_dhcp_bucket_at: datetime | None
+    created_at: datetime
+    modified_at: datetime
+
+
+def _influx_to_response(t: InfluxDBTarget) -> InfluxDBTargetResponse:
+    return InfluxDBTargetResponse(
+        id=str(t.id),
+        name=t.name,
+        enabled=t.enabled,
+        version=t.version,
+        url=t.url or "",
+        verify_tls=bool(t.verify_tls),
+        timeout_seconds=int(t.timeout_seconds or 10),
+        database=t.database or "",
+        username=t.username or "",
+        password_set=bool(t.password_encrypted),
+        org=t.org or "",
+        bucket=t.bucket or "",
+        token_set=bool(t.token_encrypted),
+        measurement_prefix=t.measurement_prefix or "",
+        push_interval_seconds=int(t.push_interval_seconds or DEFAULT_PUSH_INTERVAL_SECONDS),
+        push_dns_metrics=bool(t.push_dns_metrics),
+        push_dhcp_metrics=bool(t.push_dhcp_metrics),
+        push_subnet_utilization=bool(t.push_subnet_utilization),
+        push_dhcp_scope_leases=bool(t.push_dhcp_scope_leases),
+        last_push_at=t.last_push_at,
+        last_push_points=int(t.last_push_points or 0),
+        last_push_error=t.last_push_error,
+        last_dns_bucket_at=t.last_dns_bucket_at,
+        last_dhcp_bucket_at=t.last_dhcp_bucket_at,
+        created_at=t.created_at,
+        modified_at=t.modified_at,
+    )
+
+
+def _apply_influx_body(t: InfluxDBTarget, body: InfluxDBTargetBody) -> None:
+    from app.core.crypto import encrypt_str
+
+    t.name = body.name
+    t.enabled = body.enabled
+    t.version = body.version
+    t.url = body.url
+    t.verify_tls = body.verify_tls
+    t.timeout_seconds = body.timeout_seconds
+    t.database = body.database
+    t.username = body.username
+    t.org = body.org
+    t.bucket = body.bucket
+    t.measurement_prefix = body.measurement_prefix
+    t.push_interval_seconds = body.push_interval_seconds
+    t.push_dns_metrics = body.push_dns_metrics
+    t.push_dhcp_metrics = body.push_dhcp_metrics
+    t.push_subnet_utilization = body.push_subnet_utilization
+    t.push_dhcp_scope_leases = body.push_dhcp_scope_leases
+    if body.password is not None:
+        t.password_encrypted = encrypt_str(body.password) if body.password else None
+    if body.token is not None:
+        t.token_encrypted = encrypt_str(body.token) if body.token else None
+
+
+def _assert_influx_writable(t: InfluxDBTarget) -> None:
+    """422 on a target the writer could not build a request for.
+
+    Runs at save time so the operator finds out in the form rather than
+    from a ``last_push_error`` string 60 s later. It is the *same*
+    function the pusher calls, so the two can't disagree about what a
+    valid target is.
+    """
+    from app.services.influxdb.client import InfluxTargetConfig, build_write_request
+
+    try:
+        build_write_request(
+            InfluxTargetConfig(
+                version=t.version,
+                url=t.url or "",
+                database=t.database or "",
+                username=t.username or "",
+                # Presence, not the value — the real secret is decrypted
+                # only on the push / test paths.
+                password="x" if t.password_encrypted else "",
+                org=t.org or "",
+                bucket=t.bucket or "",
+                token="x" if t.token_encrypted else "",
+            )
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+def _audit_influx(db: DB, current_user: CurrentUser, action: str, row: InfluxDBTarget) -> None:
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action=action,
+            resource_type="influxdb_target",
+            resource_id=str(row.id),
+            resource_display=row.name,
+            result="success",
+            # No credentials in the audit body — the encrypted columns are
+            # deliberately absent rather than redacted, so a future field
+            # can't leak in by being added to a dict comprehension.
+            new_value=(
+                None
+                if action == "delete"
+                else {
+                    "enabled": row.enabled,
+                    "version": row.version,
+                    "url": row.url,
+                    "database": row.database,
+                    "org": row.org,
+                    "bucket": row.bucket,
+                    "measurement_prefix": row.measurement_prefix,
+                    "push_interval_seconds": row.push_interval_seconds,
+                    "push_dns_metrics": row.push_dns_metrics,
+                    "push_dhcp_metrics": row.push_dhcp_metrics,
+                    "push_subnet_utilization": row.push_subnet_utilization,
+                    "push_dhcp_scope_leases": row.push_dhcp_scope_leases,
+                }
+            ),
+        )
+    )
+
+
+@router.get("/influxdb-targets", response_model=list[InfluxDBTargetResponse])
+async def list_influxdb_targets(current_user: CurrentUser, db: DB) -> list[InfluxDBTargetResponse]:
+    if not is_effective_superadmin(current_user):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+    res = await db.execute(select(InfluxDBTarget).order_by(InfluxDBTarget.name))
+    return [_influx_to_response(t) for t in res.scalars().all()]
+
+
+@router.post(
+    "/influxdb-targets",
+    response_model=InfluxDBTargetResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_influxdb_target(
+    body: InfluxDBTargetBody, current_user: CurrentUser, db: DB
+) -> InfluxDBTargetResponse:
+    forbid_in_demo_mode("InfluxDB target creation is disabled")
+    if not is_effective_superadmin(current_user):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+    row = InfluxDBTarget()
+    _apply_influx_body(row, body)
+    _assert_influx_writable(row)
+    db.add(row)
+    await db.flush()
+    _audit_influx(db, current_user, "create", row)
+    try:
+        await db.commit()
+    except Exception as exc:  # noqa: BLE001 — name collisions land here
+        await db.rollback()
+        raise HTTPException(status_code=400, detail=f"create failed: {exc}") from exc
+    await db.refresh(row)
+    return _influx_to_response(row)
+
+
+@router.put("/influxdb-targets/{target_id}", response_model=InfluxDBTargetResponse)
+async def update_influxdb_target(
+    target_id: uuid.UUID,
+    body: InfluxDBTargetBody,
+    current_user: CurrentUser,
+    db: DB,
+) -> InfluxDBTargetResponse:
+    forbid_in_demo_mode("InfluxDB target updates are disabled")
+    if not is_effective_superadmin(current_user):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+    row = await db.get(InfluxDBTarget, target_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Target not found")
+    _apply_influx_body(row, body)
+    _assert_influx_writable(row)
+    _audit_influx(db, current_user, "update", row)
+    try:
+        await db.commit()
+    except Exception as exc:  # noqa: BLE001
+        await db.rollback()
+        raise HTTPException(status_code=400, detail=f"update failed: {exc}") from exc
+    await db.refresh(row)
+    return _influx_to_response(row)
+
+
+@router.delete("/influxdb-targets/{target_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_influxdb_target(target_id: uuid.UUID, current_user: CurrentUser, db: DB) -> None:
+    if not is_effective_superadmin(current_user):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+    row = await db.get(InfluxDBTarget, target_id)
+    if row is None:
+        return
+    _audit_influx(db, current_user, "delete", row)
+    await db.delete(row)
+    await db.commit()
+
+
+class InfluxDBTestResponse(BaseModel):
+    ok: bool
+    message: str
+    points: int
+
+
+@router.post("/influxdb-targets/{target_id}/test", response_model=InfluxDBTestResponse)
+async def test_influxdb_target(
+    target_id: uuid.UUID, current_user: CurrentUser, db: DB
+) -> InfluxDBTestResponse:
+    """Write one synthetic point and report the server's verdict.
+
+    Deliberately a *real* write rather than a reachability ping: a
+    correct URL with the wrong bucket, org or token answers a GET
+    perfectly well and then rejects every point. The point lands in the
+    target's own ``<prefix>export_test`` measurement so it never
+    contaminates a real series, and the watermarks are untouched — this
+    is a probe, not a push.
+    """
+    if not is_effective_superadmin(current_user):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+    row = await db.get(InfluxDBTarget, target_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Target not found")
+
+    from app.core.ssrf import assert_safe_target
+    from app.services.influxdb.client import (
+        InfluxDBWriteError,
+        config_from_row,
+        write_lines,
+    )
+    from app.services.influxdb.line_protocol import Point, render_batch
+
+    # Advisory SSRF logging only (no block=True) — an InfluxDB on the
+    # same LAN, or on the appliance itself, is the common case. See
+    # app/core/ssrf.py.
+    assert_safe_target(row.url, label="influxdb")
+
+    point = Point(
+        measurement=f"{row.measurement_prefix or ''}export_test",
+        tags={"target": row.name},
+        fields={"ok": 1, "source": "spatiumddi"},
+        timestamp=int(datetime.now(UTC).timestamp()),
+    )
+    try:
+        await write_lines(config_from_row(row), render_batch([point]))
+    except (InfluxDBWriteError, ValueError) as exc:
+        return InfluxDBTestResponse(ok=False, message=str(exc), points=0)
+    return InfluxDBTestResponse(ok=True, message="1 point written", points=1)
 
 
 # ── Public branding surface (issues #885 / #886 / #887 / #888) ──────────────────
