@@ -473,6 +473,12 @@ class DNSQueryLogRow(BaseModel):
     qtype: str | None
     flags: str | None
     view: str | None
+    # What the client was actually told (issue #914). NULL means the
+    # outcome was never recorded — response logging is off, or the driver
+    # has no equivalent — and NOT that the query succeeded. The UI must
+    # render the two differently or an unrecorded query reads as healthy.
+    rcode: str | None = None
+    answer_count: int | None = None
     raw: str
 
 
@@ -486,6 +492,11 @@ class DNSQueryLogRequest(BaseModel):
     # Exact-match view filter (#371) — seeded by clicking a per-view
     # analytics card so split-horizon operators can drill into one view.
     view: str | None = None
+    # Exact-match RCODE (#914), case-insensitive: "NXDOMAIN", "REFUSED",
+    # "SERVFAIL". The literal ``UNKNOWN`` selects rows whose outcome was
+    # never recorded, which is a question an operator genuinely asks
+    # ("is response logging actually on?") and cannot express otherwise.
+    rcode: str | None = None
     max_events: int = Field(default=200, ge=1, le=1000)
 
 
@@ -527,6 +538,12 @@ async def query_dns_queries(body: DNSQueryLogRequest, db: DB) -> DNSQueryLogResp
         stmt = stmt.where(DNSQueryLogEntry.client_ip == body.client_ip)
     if body.view:
         stmt = stmt.where(DNSQueryLogEntry.view == body.view)
+    if body.rcode:
+        wanted = body.rcode.strip().upper()
+        if wanted == _RCODE_UNKNOWN:
+            stmt = stmt.where(DNSQueryLogEntry.rcode.is_(None))
+        else:
+            stmt = stmt.where(DNSQueryLogEntry.rcode == wanted)
     if body.q:
         like = f"%{body.q.lower()}%"
         # ILIKE on qname (most common search) and a fallback on raw —
@@ -549,6 +566,8 @@ async def query_dns_queries(body: DNSQueryLogRequest, db: DB) -> DNSQueryLogResp
             qtype=r.qtype,
             flags=r.flags,
             view=r.view,
+            rcode=r.rcode,
+            answer_count=r.answer_count,
             raw=r.raw,
         )
         for r in rows
@@ -558,6 +577,13 @@ async def query_dns_queries(body: DNSQueryLogRequest, db: DB) -> DNSQueryLogResp
         events=events,
         truncated=len(events) >= body.max_events,
     )
+
+
+#: Sentinel used on the wire for "the outcome was never recorded". Not a
+#: real DNS RCODE, and deliberately not spelled like one — an operator
+#: reading ``UNKNOWN`` in the filter or the distribution should not
+#: mistake it for something the resolver returned.
+_RCODE_UNKNOWN = "UNKNOWN"
 
 
 # ── DNS query analytics ─────────────────────────────────────────────────────
@@ -588,6 +614,11 @@ class DNSQueryAnalyticsResponse(BaseModel):
     # Per-view query split (issue #371) — empty for single-view servers; useful
     # for split-horizon operators to see "which view is taking the load".
     top_views: list[DNSQueryAnalyticsRow]
+    # Outcome split (issue #914). Rows with no recorded outcome are
+    # reported under the ``UNKNOWN`` key rather than omitted, so a server
+    # with response logging off shows one honest bar instead of an empty
+    # panel that reads as "no failures".
+    rcode_distribution: list[DNSQueryAnalyticsRow]
 
 
 @router.post("/dns-queries/analytics", response_model=DNSQueryAnalyticsResponse)
@@ -641,6 +672,23 @@ async def query_dns_analytics(body: DNSQueryAnalyticsRequest, db: DB) -> DNSQuer
     qtype_distribution = await _topn(DNSQueryLogEntry.qtype, 25)
     # Per-view split (issue #371) — every view seen (small cardinality).
     top_views = await _topn(DNSQueryLogEntry.view, 25)
+    # Outcome split (#914). ``_topn`` skips NULLs by design — that is
+    # right for a "top talkers" list and wrong here, where the NULLs are
+    # the answer to "is response logging on at all". Counted separately
+    # and prepended under an explicit key.
+    rcode_distribution = await _topn(DNSQueryLogEntry.rcode, 25)
+    unknown_rcodes = (
+        await db.execute(
+            select(func.count())
+            .select_from(DNSQueryLogEntry)
+            .where(*base_filter, DNSQueryLogEntry.rcode.is_(None))
+        )
+    ).scalar_one() or 0
+    if unknown_rcodes:
+        rcode_distribution.append(
+            DNSQueryAnalyticsRow(key=_RCODE_UNKNOWN, count=int(unknown_rcodes))
+        )
+        rcode_distribution.sort(key=lambda r: r.count, reverse=True)
 
     return DNSQueryAnalyticsResponse(
         server_id=server.id,
@@ -651,6 +699,7 @@ async def query_dns_analytics(body: DNSQueryAnalyticsRequest, db: DB) -> DNSQuer
         top_clients=top_clients,
         qtype_distribution=qtype_distribution,
         top_views=top_views,
+        rcode_distribution=rcode_distribution,
     )
 
 

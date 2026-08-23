@@ -499,6 +499,12 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
         # structural fingerprint so toggling it in the UI reliably
         # triggers a daemon reload.
         "query_log_enabled": (bool(getattr(opts, "query_log_enabled", False)) if opts else False),
+        # Response logging (#914) — same reasoning: it changes the rendered
+        # named.conf, so it belongs in the fingerprint or a UI toggle would
+        # not shift the etag and the agent would never re-render.
+        "response_log_enabled": (
+            bool(getattr(opts, "response_log_enabled", False)) if opts else False
+        ),
         # Response Rate Limiting + amplification defenses (issue #146). These
         # ride the same options dict → bundle etag, so a UI change wakes the
         # long-poll and reliably re-renders named.conf.

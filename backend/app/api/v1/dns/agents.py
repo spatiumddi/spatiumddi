@@ -10,7 +10,7 @@ import contextlib
 import hmac
 import os
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
@@ -19,6 +19,7 @@ from jose import JWTError
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import delete as sa_delete
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB
 from app.core.agent_wake import (
@@ -957,11 +958,31 @@ async def agent_query_log_entries(
         with contextlib.suppress(Exception):
             rpz_capable = bool(get_dns_driver(server.driver).capabilities().get("rpz"))
 
+    # Response logging (#914) is BIND9-only and opt-in, but the flag that
+    # decides it lives on the server group's options rather than here.
+    # Keying off the driver's own capability instead of a driver-name
+    # string keeps a future agent-based driver from being silently opted
+    # into BIND9 line matching (non-negotiable #10); the parser's own
+    # ``response:`` reject makes the probe cheap on every other line.
+    response_capable = False
+    with contextlib.suppress(Exception):
+        response_capable = bool(get_dns_driver(server.driver).capabilities().get("response_log"))
+
     capped = body.lines[:1000]
     dropped = max(0, len(body.lines) - len(capped))
     now = datetime.now(UTC)
     inserted = 0
     rpz_inserted = 0
+    responses_matched = 0
+    # Query rows added in THIS batch, keyed for the response line that
+    # follows them microseconds later. named writes the pair together, so
+    # the overwhelming majority of responses are matched here without
+    # touching the database at all.
+    pending: dict[tuple[str | None, int | None, str | None, str | None], DNSQueryLogEntry] = {}
+    # Responses whose question landed in an EARLIER batch — only possible
+    # when the 1000-line cap or the shipper's own batch boundary fell
+    # between the two lines. Resolved against the DB after the loop.
+    deferred: list[bind9_parser.ParsedResponseLine] = []
     for raw in capped:
         # RPZ policy hits (issue #699) ride the same channel as queries —
         # named logs them under its own ``rpz`` category, which the
@@ -992,31 +1013,132 @@ async def agent_query_log_entries(
                 )
                 rpz_inserted += 1
                 continue
+        # Response lines (issue #914) ride the same channel as queries when
+        # the operator enabled ``response_log_enabled``. They are tried
+        # before the query parser because a response line carries no
+        # ``: query: `` separator and would otherwise be dropped by the
+        # ``qname is None`` guard below — losing the only record of what
+        # the client was actually told. BIND9-only; the parser returns
+        # None for every other shape, which makes running it against
+        # pdns output harmless rather than conditional.
+        if response_capable:
+            resp = bind9_parser.parse_response_line(raw, fallback_ts=now)
+            if resp is not None:
+                row = pending.get(_correlation_key(resp))
+                if row is not None:
+                    row.rcode = resp.rcode
+                    row.answer_count = resp.answer_count
+                    responses_matched += 1
+                else:
+                    deferred.append(resp)
+                continue
         parsed = parse_fn(raw, fallback_ts=now)
         if parsed is None or parsed.qname is None:
             continue
-        db.add(
-            DNSQueryLogEntry(
-                server_id=server.id,
-                ts=parsed.ts,
-                client_ip=parsed.client_ip,
-                client_port=parsed.client_port,
-                qname=parsed.qname,
-                qclass=parsed.qclass,
-                qtype=parsed.qtype,
-                flags=parsed.flags,
-                view=parsed.view,
-                raw=parsed.raw,
-            )
+        entry = DNSQueryLogEntry(
+            server_id=server.id,
+            ts=parsed.ts,
+            client_ip=parsed.client_ip,
+            client_port=parsed.client_port,
+            qname=parsed.qname,
+            qclass=parsed.qclass,
+            qtype=parsed.qtype,
+            flags=parsed.flags,
+            view=parsed.view,
+            raw=parsed.raw,
         )
+        db.add(entry)
+        if response_capable:
+            # Last writer wins: an ephemeral source port is effectively
+            # unique per query, but a client that retries the identical
+            # question from the same port would otherwise have its second
+            # answer stamped onto its first row.
+            pending[_correlation_key(parsed)] = entry
         inserted += 1
+
+    deferred_matched = await _stamp_deferred_responses(db, server.id, deferred)
     await db.commit()
     return {
         "status": "ok",
         "inserted": inserted,
         "rpz_inserted": rpz_inserted,
+        "responses_matched": responses_matched + deferred_matched,
+        # Reported rather than swallowed: a persistently non-zero count
+        # means the correlation is failing, and the operator-visible
+        # symptom of that is an rcode column that is quietly blank.
+        "responses_unmatched": len(deferred) - deferred_matched,
         "dropped": dropped,
     }
+
+
+# ── Response-line correlation (issue #914) ───────────────────────────
+
+#: Response lines whose question was not in the same batch are resolved
+#: with one small query each. The split can only happen at a batch
+#: boundary, so the realistic count is 0 or 1; the cap is a backstop
+#: against a malformed or replayed batch turning one POST into a
+#: thousand round trips.
+_MAX_DEFERRED_RESPONSES = 50
+
+#: How far back to look for the question a late response answers. named
+#: writes the two lines microseconds apart, so this only has to cover the
+#: shipper's own batching interval; anything older is a different query
+#: that happens to share the ephemeral port.
+_RESPONSE_MATCH_WINDOW = timedelta(seconds=60)
+
+
+def _correlation_key(
+    parsed: Any,
+) -> tuple[str | None, int | None, str | None, str | None]:
+    """The tuple that ties a response line back to its question.
+
+    The ephemeral source port does nearly all the work — it is unique per
+    outstanding query from a given client — with qname and qtype as
+    corroboration so a port reused inside the batch cannot cross-stamp.
+    """
+    return (parsed.client_ip, parsed.client_port, parsed.qname, parsed.qtype)
+
+
+async def _stamp_deferred_responses(
+    db: AsyncSession,
+    server_id: uuid.UUID,
+    deferred: list[Any],
+) -> int:
+    """Stamp responses whose query row was committed by an earlier batch.
+
+    Returns how many were matched. An unmatched response is dropped
+    rather than stored on its own: a row with an outcome and no question
+    answers nothing, and inventing a query row for it would double-count
+    every query in the analytics rollups.
+    """
+    if not deferred:
+        return 0
+    matched = 0
+    for resp in deferred[:_MAX_DEFERRED_RESPONSES]:
+        stmt = (
+            select(DNSQueryLogEntry)
+            .where(DNSQueryLogEntry.server_id == server_id)
+            .where(DNSQueryLogEntry.rcode.is_(None))
+            .where(DNSQueryLogEntry.qname == resp.qname)
+            .where(DNSQueryLogEntry.qtype == resp.qtype)
+            .where(DNSQueryLogEntry.client_port == resp.client_port)
+            .where(DNSQueryLogEntry.ts >= resp.ts - _RESPONSE_MATCH_WINDOW)
+            # A response cannot precede its question, but the two lines
+            # carry independently-formatted timestamps, so allow a small
+            # amount of slack rather than losing a match to rounding.
+            .where(DNSQueryLogEntry.ts <= resp.ts + timedelta(seconds=1))
+            .order_by(DNSQueryLogEntry.ts.desc(), DNSQueryLogEntry.id.desc())
+            .limit(1)
+        )
+        if resp.client_ip is not None:
+            stmt = stmt.where(DNSQueryLogEntry.client_ip == resp.client_ip)
+        row = (await db.execute(stmt)).scalars().first()
+        if row is None:
+            continue
+        row.rcode = resp.rcode
+        row.answer_count = resp.answer_count
+        matched += 1
+    return matched
 
 
 # ── Admin runtime-state push (rendered config + rndc status) ─────────

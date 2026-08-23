@@ -675,10 +675,10 @@ backend/alembic/versions/e7f94b21c8d5_dns_zone_dnssec_ds_records.py:drop_column:
 backend/alembic/versions/e8c3f1b9a724_appliance_revoked_at.py:drop_column:65
 backend/alembic/versions/e8c3f1b9a724_appliance_revoked_at.py:drop_column:72
 backend/alembic/versions/e93b41ad7c5f_ai_daily_digest_setting.py:drop_column:39
-backend/alembic/versions/e9c2d47b1a63_agent_config_apply_status.py:drop_column:66
 backend/alembic/versions/e9c2d47b1a63_agent_config_apply_status.py:drop_column:67
 backend/alembic/versions/e9c2d47b1a63_agent_config_apply_status.py:drop_column:68
 backend/alembic/versions/e9c2d47b1a63_agent_config_apply_status.py:drop_column:69
+backend/alembic/versions/e9c2d47b1a63_agent_config_apply_status.py:drop_column:70
 backend/alembic/versions/e9c47a1f3b28_wake_scheduler.py:drop_table:235
 backend/alembic/versions/e9c47a1f3b28_wake_scheduler.py:drop_table:237
 backend/alembic/versions/e9c47a1f3b28_wake_scheduler.py:drop_table:239
@@ -702,6 +702,9 @@ backend/alembic/versions/f1a8d2c5e413_dns_pull_from_server_settings.py:drop_colu
 backend/alembic/versions/f1a8d2c5e413_dns_pull_from_server_settings.py:drop_column:58
 backend/alembic/versions/f1c4a90b27d6_appliance_ssh_settings.py:drop_column:97
 backend/alembic/versions/f1c4a90b27d6_appliance_ssh_settings.py:drop_column:99
+backend/alembic/versions/f1c7a92e4b06_dns_query_rcode.py:drop_column:45
+backend/alembic/versions/f1c7a92e4b06_dns_query_rcode.py:drop_column:46
+backend/alembic/versions/f1c7a92e4b06_dns_query_rcode.py:drop_column:47
 backend/alembic/versions/f1c8b2a945d3_subnet_ops_ipspace_vrf.py:drop_column:57
 backend/alembic/versions/f1c8b2a945d3_subnet_ops_ipspace_vrf.py:drop_column:58
 backend/alembic/versions/f1c8b2a945d3_subnet_ops_ipspace_vrf.py:drop_column:59

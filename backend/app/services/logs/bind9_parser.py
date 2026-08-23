@@ -44,6 +44,9 @@ _ISO_TS_RE: Final = re.compile(
 
 # Optional ``[severity]``-style category prefix BIND prepends when
 # ``print-severity`` / ``print-category`` are on. We tolerate both.
+# ``responses`` is listed because response logging (issue #914) rides
+# the same channel too, and an unstripped category prefix would push the
+# ``client`` head out of reach of the ``^``-anchored ``_HEAD_RE``.
 # ``rpz`` is listed alongside ``queries`` because RPZ policy hits ride
 # the same channel (issue #699) and carry their own category name — a
 # prefix left unstripped would push the client/qname head out of reach
@@ -52,7 +55,7 @@ _ISO_TS_RE: Final = re.compile(
 # and ``rpz`` would otherwise match the prefix of ``rpz-passthru:``
 # and leave ``-passthru: `` in front of the ``client`` head, which is
 # ``^``-anchored and would then fail to parse.
-_CAT_SEV_RE: Final = re.compile(r"^(?:(?:queries|rpz-passthru|rpz):\s+)?(?:info:\s+)?")
+_CAT_SEV_RE: Final = re.compile(r"^(?:(?:queries|responses|rpz-passthru|rpz):\s+)?(?:info:\s+)?")
 
 # BIND9 query lines are split on the hard ``: query: `` separator
 # rather than matched by one big regex. The combined pattern (client
@@ -297,7 +300,9 @@ def parse_query_line(line: str, *, fallback_ts: datetime | None = None) -> Parse
 __all__ = [
     "ParsedQueryLine",
     "ParsedRPZLine",
+    "ParsedResponseLine",
     "parse_query_line",
+    "parse_response_line",
     "parse_rpz_line",
 ]
 
@@ -530,3 +535,161 @@ def _bare_qname(operand: str | None) -> str | None:
     if not operand:
         return None
     return operand.split("/", 1)[0] or None
+
+
+# ── Response lines (issue #914) ───────────────────────────────────────
+#
+# BIND's ``queries`` category is request-side by design — it logs the
+# question as it arrives and never mentions the answer. BIND 9.20's
+# ``responselog yes;`` adds a second category, ``responses``, carrying
+# the RCODE and the section counts:
+#
+#   23-Aug-2026 13:20:09.490 responses: info: client @0x7f83 127.0.0.1#57018 \
+#       (www.example.com): view internal: response: www.example.com IN A \
+#       NOERROR 1 1 2 +E(0)K (127.0.0.1)
+#
+# Verified against BIND 9.20.26 across NOERROR / NXDOMAIN / REFUSED, a
+# NODATA (``NOERROR 0``), DNSSEC (``+E(0)DK``) and TCP (``+E(0)TK``) —
+# the three counts are always present and always in the order
+# answer / authority / additional.
+#
+# The line is routed to the same channel as ``queries`` (see the BIND9
+# renderer), so it arrives interleaved with query lines in the same
+# shipper batch and the ingest tells the shapes apart by separator:
+# ``: response: `` here, ``: query: `` there. Neither substring can
+# appear inside a DNS name, a view name or an address literal, so the
+# split is exact — the same argument :data:`_QUERY_SEP_RE` rests on.
+_RESPONSE_SEP_RE: Final = re.compile(r":\s+response:\s+", re.IGNORECASE)
+
+# ``<qname> <qclass> <qtype> <RCODE> <an> <au> <ad> [<flags>]``. Every
+# segment is a ``\S+`` run separated by a single ``\s+`` match and the
+# whole thing is anchored, so no two quantifiers compete for the same
+# whitespace — the property the rest of this module's regexes were
+# rewritten for (CodeQL py/polynomial-redos, alerts #16 / #18 / #40).
+_RESPONSE_BODY_RE: Final = re.compile(
+    r"^(?P<qname>\S+)\s+(?P<qclass>\S+)\s+(?P<qtype>\S+)\s+(?P<rcode>\S+)"
+    r"\s+(?P<answers>\d+)\s+(?P<authority>\d+)\s+(?P<additional>\d+)"
+    r"(?:\s+(?P<flags>\S+))?",
+)
+
+#: ``dns_query_log_entry.rcode`` is ``String(16)``. named prints an
+#: unassigned rcode numerically rather than symbolically, so the token is
+#: not drawn from a closed set; clamp here rather than at the call site,
+#: because one overlong value fails the single commit covering the whole
+#: ingest batch and would lose every other row in the same POST — the
+#: failure mode ``_RPZ_ZONE_MAX_LEN`` exists for.
+_RCODE_MAX_LEN: Final = 16
+
+
+@dataclass(frozen=True)
+class ParsedResponseLine:
+    """The answer half of one query, to be stamped onto its query row.
+
+    Carries the full correlation key rather than just the outcome: named
+    logs the response as an independent line, so matching it back to the
+    question is the caller's job and everything needed to do it has to
+    survive parsing.
+    """
+
+    ts: datetime
+    client_ip: str | None
+    client_port: int | None
+    qname: str | None
+    qclass: str | None
+    qtype: str | None
+    rcode: str
+    answer_count: int
+    authority_count: int
+    additional_count: int
+    flags: str | None
+    view: str | None
+    raw: str
+
+
+def parse_response_line(
+    line: str, *, fallback_ts: datetime | None = None
+) -> ParsedResponseLine | None:
+    """Parse one BIND9 ``responses`` category line, or ``None`` if it isn't one.
+
+    Returning ``None`` for non-response input is the contract the ingest
+    relies on to tell the three line shapes apart on a shared channel: it
+    tries RPZ, then this, then falls through to :func:`parse_query_line`.
+
+    Unlike the query parser, a line whose *head* fails to parse is
+    rejected outright rather than returned with ``None`` fields. A
+    response is only useful once it can be attributed to the question it
+    answers, and a response with no client address can be attributed to
+    nothing — keeping it would mean either dropping it later anyway or,
+    worse, stamping an outcome onto the wrong query.
+    """
+    line = line.rstrip("\r\n")
+    if not line.strip():
+        return None
+    if len(line) > _MAX_LINE_LEN:
+        line = line[:_MAX_LINE_LEN]
+
+    # Cheap reject before any regex work. Every ingested line pays this
+    # probe and almost all of them are query lines, which cannot contain
+    # the literal ``response:``.
+    if "response:" not in line:
+        return None
+
+    ts: datetime | None = None
+    rest = line
+    m = _BIND_TS_RE.match(rest)
+    if m:
+        ts = _parse_bind_ts(m.group("ts"))
+        rest = rest[m.end() :]
+    else:
+        m_iso = _ISO_TS_RE.match(rest)
+        if m_iso:
+            ts = _parse_iso_ts(m_iso.group("ts"))
+            rest = rest[m_iso.end() :]
+    if ts is None:
+        ts = fallback_ts or datetime.now(UTC)
+
+    rest = _CAT_SEV_RE.sub("", rest, count=1)
+
+    parts = _RESPONSE_SEP_RE.split(rest, maxsplit=1)
+    if len(parts) != 2:
+        return None
+    head, body = parts
+
+    head_m = _HEAD_RE.search(head)
+    body_m = _RESPONSE_BODY_RE.match(body)
+    if head_m is None or body_m is None:
+        return None
+
+    qname = body_m.group("qname") or None
+    # Same CHAOS-probe suppression the query side applies. Without it the
+    # query row is dropped at parse time and its response line survives,
+    # so the correlator would scan for a row that was never inserted on
+    # every monitoring poll.
+    if qname and qname.rstrip(".").lower() in _CHAOS_PROBE_QNAMES:
+        return None
+
+    view: str | None = None
+    vm = _VIEW_RE.search(head_m.group("rest") or "")
+    if vm:
+        view = (vm.group("view_paren") or vm.group("view_bare") or "").strip() or None
+
+    try:
+        client_port: int | None = int(head_m.group("client_port"))
+    except (TypeError, ValueError):
+        client_port = None
+
+    return ParsedResponseLine(
+        ts=ts,
+        client_ip=head_m.group("client_ip") or None,
+        client_port=client_port,
+        qname=qname,
+        qclass=body_m.group("qclass") or None,
+        qtype=body_m.group("qtype") or None,
+        rcode=body_m.group("rcode").upper()[:_RCODE_MAX_LEN],
+        answer_count=int(body_m.group("answers")),
+        authority_count=int(body_m.group("authority")),
+        additional_count=int(body_m.group("additional")),
+        flags=body_m.group("flags") or None,
+        view=view,
+        raw=line,
+    )

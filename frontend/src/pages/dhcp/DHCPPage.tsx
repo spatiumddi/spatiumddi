@@ -25,6 +25,7 @@ import {
   dhcpLeaseHistoryApi,
   ipamApi,
   type DHCPPool,
+  type DHCPPoolOccupancy,
   type DHCPScope,
   type DHCPServer,
   type DHCPServerGroup,
@@ -1423,6 +1424,61 @@ function ServerScopesTab({ groupId }: { groupId: string }) {
   );
 }
 
+/**
+ * Live pool occupancy (#913).
+ *
+ * `assigned` unions active leases with in-pool static reservations, so a
+ * reserved-but-offline address reads as taken — counting leases alone
+ * under-reports exhaustion, which is the failure that sends a technician
+ * looking in the wrong place.
+ *
+ * Answered for dynamic pools only, matching the alert evaluator and the
+ * copilot tool. Each other type would produce a misleading number: a pd
+ * pool's start/end are placeholders for a delegated prefix rather than a
+ * range, an excluded range is never offered to a client at all, and a
+ * reserved range is *supposed* to fill up — colouring that red would
+ * flag a correctly-configured pool as exhausted.
+ */
+function PoolOccupancyCell({
+  occ,
+  poolType,
+}: {
+  occ?: DHCPPoolOccupancy;
+  poolType: string;
+}) {
+  if (poolType !== "dynamic") {
+    return <span className="text-xs text-muted-foreground/60">n/a</span>;
+  }
+  if (!occ) {
+    return <span className="text-xs text-muted-foreground/40">—</span>;
+  }
+  const tone =
+    occ.percent >= 90
+      ? "bg-rose-500"
+      : occ.percent >= 75
+        ? "bg-amber-500"
+        : "bg-emerald-500";
+  return (
+    <div
+      className="flex min-w-[9rem] items-center gap-2"
+      title={`${occ.assigned} of ${occ.total} addresses in use, ${occ.free} free`}
+    >
+      <div className="h-1.5 w-16 overflow-hidden rounded-full bg-muted">
+        <div
+          className={`h-full ${tone}`}
+          style={{ width: `${Math.min(100, occ.percent)}%` }}
+        />
+      </div>
+      <span className="font-mono text-xs tabular-nums text-muted-foreground">
+        {occ.assigned}/{occ.total}
+      </span>
+      <span className="font-mono text-xs tabular-nums">
+        {occ.percent.toFixed(0)}%
+      </span>
+    </div>
+  );
+}
+
 function ServerPoolsOrStaticsTab({
   groupId,
   kind,
@@ -1449,6 +1505,22 @@ function ServerPoolsOrStaticsTab({
           : dhcpApi.listStatics(sc.id),
     })),
   });
+
+  // Live occupancy per pool (#913). One call per scope rather than one
+  // per pool — the scope endpoint batches the lease + reservation lookup,
+  // which is the reason it exists. Only fetched on the pools tab.
+  const occupancyQueries = useQueries({
+    queries: allScopes.map((sc) => ({
+      queryKey: ["dhcp-pool-occupancy", sc.id],
+      queryFn: () => dhcpApi.scopePoolOccupancy(sc.id),
+      enabled: kind === "pools",
+      staleTime: 15_000,
+    })),
+  });
+  const occupancyByPool = new Map<string, DHCPPoolOccupancy>();
+  for (const q of occupancyQueries) {
+    for (const row of q.data ?? []) occupancyByPool.set(row.pool_id, row);
+  }
 
   const rows: Array<{
     scope: DHCPScope;
@@ -1615,6 +1687,7 @@ function ServerPoolsOrStaticsTab({
                   >
                     Type
                   </SortableTh>
+                  <th className="px-3 py-2 text-left font-medium">Occupancy</th>
                 </tr>
               </thead>
               <tbody className={zebraBodyCls}>
@@ -1634,6 +1707,12 @@ function ServerPoolsOrStaticsTab({
                         <span className="rounded-full bg-muted px-2 py-0.5 text-xs">
                           {p.pool_type}
                         </span>
+                      </td>
+                      <td className="px-3 py-2">
+                        <PoolOccupancyCell
+                          occ={occupancyByPool.get(p.id)}
+                          poolType={p.pool_type}
+                        />
                       </td>
                     </tr>
                   );

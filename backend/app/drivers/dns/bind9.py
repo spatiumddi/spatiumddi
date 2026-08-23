@@ -490,6 +490,11 @@ class BIND9Driver(DNSDriver):
             "name": "bind9",
             "views": True,
             "rpz": True,
+            # Per-query RCODE via BIND 9.20's ``responselog`` (#914).
+            # Advertised as a capability rather than checked by driver
+            # name so the query-log ingest never has to know which
+            # daemon wrote a line (non-negotiable #10).
+            "response_log": True,
             "dnssec_inline_signing": True,
             "incremental_updates": "rfc2136",
             "zone_types": ["primary", "secondary", "stub", "forward"],

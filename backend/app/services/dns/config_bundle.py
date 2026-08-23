@@ -107,6 +107,7 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
             allow_transfer=tuple(opts_row.allow_transfer or ("none",)),
             blackhole=tuple(opts_row.blackhole or ()),
             query_log_enabled=opts_row.query_log_enabled,
+            response_log_enabled=opts_row.response_log_enabled,
             query_log_channel=opts_row.query_log_channel,
             query_log_file=opts_row.query_log_file,
             query_log_severity=opts_row.query_log_severity,

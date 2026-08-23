@@ -478,3 +478,66 @@ async def get_rpz_block_summary(
     out["since"] = out["since"].isoformat()
     out["feeds"] = await rpz_service.feed_effectiveness(db, hours=args.hours)
     return out
+
+
+# ── find_rpz_hits (issue #914) ────────────────────────────────────────
+
+
+class FindRPZHitsArgs(BaseModel):
+    hours: int = Field(default=24, ge=1, le=24 * 30, description="Trailing window in hours.")
+    limit: int = Field(default=50, ge=1, le=500)
+    client_ip: str | None = Field(
+        default=None, description="Only hits from this client IP address."
+    )
+    qname_contains: str | None = Field(
+        default=None, max_length=255, description="Substring match on the blocked domain."
+    )
+    include_passthru: bool = Field(
+        default=False,
+        description=(
+            "Include PASSTHRU rows — explicit ALLOWs where an exception let a "
+            "listed name through. Off by default: they are not blocks."
+        ),
+    )
+
+
+@register_tool(
+    name="find_rpz_hits",
+    description=(
+        "The INDIVIDUAL blocked lookups, newest first — not a rollup "
+        "(issue #914). find_rpz_offenders says a client has N blocked "
+        "lookups and its worst domain; this says exactly which names it "
+        "asked for, when, and which feed blocked each one. Use it to "
+        "close out 'the user says this site does not work': filter to "
+        "their IP and read the last few minutes. Set include_passthru to "
+        "answer the opposite question — why a listed name got through."
+    ),
+    args_model=FindRPZHitsArgs,
+    category="dns",
+    module="security.dns_threat",
+    default_enabled=True,
+)
+async def find_rpz_hits(
+    db: AsyncSession, user: User, args: FindRPZHitsArgs
+) -> list[dict[str, Any]]:
+    from app.services.dns_threat import rpz as rpz_service  # noqa: PLC0415
+
+    client_ip: str | None = None
+    if args.client_ip:
+        # An INET comparison raises on a malformed literal, so the model's
+        # own answer ("no such client") is returned instead of a 500 that
+        # reads to the copilot as a broken tool.
+        try:
+            client_ip = str(ipaddress.ip_address(args.client_ip.strip()))
+        except ValueError:
+            return [{"result": f"{args.client_ip!r} is not an IP address"}]
+
+    rows = await rpz_service.recent_hits(
+        db,
+        hours=args.hours,
+        limit=args.limit,
+        client_ip=client_ip,
+        qname_contains=args.qname_contains,
+        include_passthru=args.include_passthru,
+    )
+    return [{**r, "ts": r["ts"].isoformat() if r.get("ts") else None} for r in rows]

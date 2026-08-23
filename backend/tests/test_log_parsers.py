@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from app.services.logs.bind9_parser import parse_query_line
+from app.services.logs.bind9_parser import parse_query_line, parse_response_line
 from app.services.logs.kea_parser import parse_kea_line
 from app.services.logs.pdns_parser import parse_query_line as parse_pdns_query_line
 
@@ -285,3 +285,124 @@ def test_pdns_redos_regression_linear_time() -> None:
     # slow CI runners while still catching any future regression
     # that reintroduces the polynomial backtracking.
     assert elapsed < 2.0, f"adversarial parse took {elapsed:.2f}s — possible ReDoS regression"
+
+
+# ── BIND9 response log (issue #914) ───────────────────────────────────
+#
+# Every line below was captured from a real BIND 9.20.26 running with
+# ``responselog yes;`` — not hand-written from the documentation. The
+# format is the load-bearing assumption of the whole feature: get the
+# field order wrong and every rcode is silently the answer count.
+
+
+def test_bind9_response_noerror() -> None:
+    line = (
+        "23-Aug-2026 13:20:09.490 responses: info: client @0x7f83624012e0 "
+        "127.0.0.1#57018 (www.example.com): view internal: response: "
+        "www.example.com IN A NOERROR 1 1 2 +E(0)K (127.0.0.1)"
+    )
+    parsed = parse_response_line(line)
+    assert parsed is not None
+    assert parsed.client_ip == "127.0.0.1"
+    assert parsed.client_port == 57018
+    assert parsed.qname == "www.example.com"
+    assert parsed.qclass == "IN"
+    assert parsed.qtype == "A"
+    assert parsed.rcode == "NOERROR"
+    assert parsed.answer_count == 1
+    assert parsed.authority_count == 1
+    assert parsed.additional_count == 2
+    assert parsed.flags == "+E(0)K"
+    assert parsed.view == "internal"
+    assert parsed.raw == line
+
+
+def test_bind9_response_nxdomain() -> None:
+    parsed = parse_response_line(
+        "23-Aug-2026 13:20:09.494 client @0x7f83620ec4e0 127.0.0.1#58325 "
+        "(nosuch.example.com): view internal: response: nosuch.example.com "
+        "IN A NXDOMAIN 0 1 1 +E(0)K (127.0.0.1)"
+    )
+    assert parsed is not None
+    assert parsed.rcode == "NXDOMAIN"
+    assert parsed.answer_count == 0
+
+
+def test_bind9_response_refused() -> None:
+    parsed = parse_response_line(
+        "23-Aug-2026 13:20:09.506 client @0x7f836202c1e0 127.0.0.1#58506 "
+        "(outside.test): view internal: response: outside.test IN A "
+        "REFUSED 0 0 1 +E(0)K (127.0.0.1)"
+    )
+    assert parsed is not None
+    assert parsed.rcode == "REFUSED"
+
+
+def test_bind9_response_nodata_is_noerror_with_zero_answers() -> None:
+    """The case that reads as success and is not.
+
+    A name that exists with no record of the requested type answers
+    NOERROR with an empty answer section. Without the count, this is
+    indistinguishable from a working lookup — which is exactly the
+    outcome an operator is trying to tell apart from NXDOMAIN.
+    """
+    parsed = parse_response_line(
+        "23-Aug-2026 13:20:09.498 client @0x7f836202c1e0 127.0.0.1#48968 "
+        "(www.example.com): view internal: response: www.example.com IN MX "
+        "NOERROR 0 1 1 +E(0)K (127.0.0.1)"
+    )
+    assert parsed is not None
+    assert parsed.rcode == "NOERROR"
+    assert parsed.answer_count == 0
+
+
+def test_bind9_query_line_is_not_a_response() -> None:
+    """The discriminator the shared-channel ingest depends on."""
+    assert (
+        parse_response_line(
+            "25-Apr-2026 16:30:01.123 client @0x7f8b1c001234 192.0.2.5#54321 "
+            "(example.com): query: example.com IN A +E(0)K (10.0.0.1)"
+        )
+        is None
+    )
+
+
+def test_bind9_response_line_is_not_a_query() -> None:
+    """And the converse, so neither parser claims the other's lines.
+
+    The query parser splits on ``: query: ``; a response line has no such
+    separator, so it comes back with a null qname and the ingest drops
+    it — which is why response parsing has to run first, not instead.
+    """
+    parsed = parse_query_line(
+        "23-Aug-2026 13:20:09.490 client @0x7f83 127.0.0.1#57018 "
+        "(www.example.com): view internal: response: www.example.com IN A "
+        "NOERROR 1 1 2 +E(0)K (127.0.0.1)"
+    )
+    assert parsed is not None
+    assert parsed.qname is None
+
+
+def test_bind9_response_chaos_probe_dropped() -> None:
+    """Matches the query side, or the correlator hunts for a row that
+    was never inserted on every monitoring poll."""
+    assert (
+        parse_response_line(
+            "23-Aug-2026 13:20:09.490 client @0x7f83 127.0.0.1#57018 "
+            "(version.bind): view internal: response: version.bind CH TXT "
+            "NOERROR 1 0 1 +E(0)K (127.0.0.1)"
+        )
+        is None
+    )
+
+
+def test_bind9_response_unparseable_returns_none() -> None:
+    """Rejected outright rather than returned with null fields.
+
+    A response is only useful once it can be attributed to its question;
+    keeping an unattributable one risks stamping an outcome onto the
+    wrong row.
+    """
+    assert parse_response_line("23-Aug-2026 13:20:09.490 something: response: ") is None
+    assert parse_response_line("") is None
+    assert parse_response_line("plain text with no marker") is None

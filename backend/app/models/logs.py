@@ -43,6 +43,10 @@ class DNSQueryLogEntry(Base):
     We extract the client IP / port, qname, qclass, qtype, and the
     flags string into structured columns; the full original line is
     kept in ``raw`` for cases the parser doesn't fully understand.
+
+    ``rcode`` / ``answer_count`` come from a *second* line — BIND's
+    ``responses`` category — stamped onto this row at ingest when the
+    operator has opted into response logging (issue #914).
     """
 
     __tablename__ = "dns_query_log_entry"
@@ -66,6 +70,29 @@ class DNSQueryLogEntry(Base):
     flags: Mapped[str | None] = mapped_column(String(64), nullable=True)
     view: Mapped[str | None] = mapped_column(String(255), nullable=True)
     raw: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
+    # ── What the client actually got back (issue #914) ────────────────
+    #
+    # BIND's ``queries`` category is request-side by design: it logs the
+    # question on arrival and says nothing about the answer. So until
+    # #914 the log could prove a query reached the server and could not
+    # distinguish the five outcomes an operator is actually triaging —
+    # NOERROR, NOERROR-with-no-answers (NODATA), NXDOMAIN, REFUSED,
+    # SERVFAIL — which is the difference between "it is not DNS" and
+    # "an ACL is rejecting this client".
+    #
+    # These are filled from BIND's separate ``responses`` category
+    # (``responselog yes;``, BIND 9.20+), correlated back onto the query
+    # row at ingest. They are NULL whenever that is off or the driver
+    # has no equivalent, and **NULL means UNKNOWN, never NOERROR** —
+    # rendering an unrecorded outcome as "fine" is the one failure mode
+    # this column exists to prevent.
+    rcode: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    #: RRs in the answer section. NOERROR with ``answer_count == 0`` is a
+    #: NODATA response — the name exists but carries no record of that
+    #: type — which is a different fault from NXDOMAIN and reads
+    #: identically without this.
+    answer_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
 class DHCPLogEntry(Base):

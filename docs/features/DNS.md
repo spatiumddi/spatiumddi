@@ -1771,3 +1771,128 @@ curl -H 'accept: application/dns-message' \
 # confirm no plaintext :53 leaves the box
 tcpdump -ni any 'port 53'
 ```
+
+---
+
+## 21. Query outcomes — the answer half of the query log (issue #914)
+
+`dns_query_log_entry` recorded the *question* and nothing about the
+*response*. BIND's `queries` logging category is request-side by design:
+it logs a query as it arrives and never mentions what was sent back. So
+the Logs → DNS Queries surface could prove a query reached the server,
+and could not distinguish the five outcomes an operator is actually
+triaging:
+
+| What happened | What it means | Where to look next |
+|---|---|---|
+| No row at all | the query never reached this server | resolver config, DHCP option 6, firewall |
+| `NOERROR` with answers | DNS is fine | not DNS — routing, or the service itself |
+| `NOERROR` with **0** answers (NODATA) | the name exists, but has no record of that type | the record type, or an AAAA-only client |
+| `NXDOMAIN` | the record does not exist | the zone, or a typo |
+| `REFUSED` | an ACL or view is rejecting this client | `allow-query`, view `match-clients` |
+| `SERVFAIL` | DNSSEC validation or a broken forwarder | validation, the upstream |
+
+All of them collapsed into "there is a row" or "there is not", and the
+most common real outcome — a query that *was* answered, just not the way
+the user expected — was indistinguishable from one that was refused.
+
+### 21.1 Where the data comes from
+
+BIND 9.20 ships `responselog`, a second logging category (`responses`)
+carrying one line per response:
+
+```
+23-Aug-2026 13:20:09.490 responses: info: client @0x7f83 127.0.0.1#57018 \
+    (www.example.com): view internal: response: www.example.com IN A \
+    NOERROR 1 1 2 +E(0)K (127.0.0.1)
+```
+
+The trailing counts are answer / authority / additional. SpatiumDDI
+parses the RCODE and the **answer count** — the second is what makes
+NODATA visible, and NODATA is a genuinely different fault from NXDOMAIN
+that reads identically without it.
+
+The line is routed to the same `queries_channel` the query log already
+uses, so no second shipper thread, log file or bind mount is involved.
+The control plane tells the shapes apart at ingest by separator
+(`: response: ` vs `: query: `, neither of which can occur inside a DNS
+name or a view name) and stamps the outcome onto the query row it
+belongs to, matched on client address + ephemeral source port + qname +
+qtype. A response whose question cannot be found is **dropped, not
+stored**: a row with an outcome and no question answers nothing, and
+inventing a query row for it would double-count every query in the
+analytics rollups the same table feeds.
+
+### 21.2 Enabling it
+
+Per DNS server group, under **Query Logging** → *Record the outcome of
+each query*. Default **off**, and it requires query logging to be on,
+because the response lines are written to the channel the query-log
+block defines. A caller that explicitly asks for the impossible pair
+gets a 422 rather than a toggle that rewrites `named.conf` and produces
+nothing; a caller simply turning query logging *off* has asked for
+nothing impossible, so response logging is cleared alongside it — the
+only coherent resulting state, and the alternative would leave no single
+call that disables query logging at all.
+
+It roughly **doubles query-log volume**: named writes a second line per
+query. That volume is why the query log is capped at a 24 h window in
+the first place, so treat this as a troubleshooting switch rather than a
+permanent setting on a busy resolver.
+
+> **`rndc reconfig` does not apply `responselog`.** Verified against
+> BIND 9.20.26: with `responselog yes;` in a freshly-swapped config and
+> a clean reconfig, `rndc status` still reported
+> `response logging is OFF`. It is a live switch, like `querylog`, and
+> reconfig deliberately
+> preserves whatever the running server was last told. Query logging
+> escapes this only by accident of BIND's own defaulting — with no
+> `querylog` statement it follows the presence of the `queries`
+> category, which a reload does pick up. The agent therefore issues an
+> explicit `rndc responselog on|off` after each structural reload,
+> reading the desired state back off the config it just swapped in.
+> Without that the toggle would appear to work and produce not one line
+> until the daemon was next restarted.
+
+### 21.3 Which drivers fill it
+
+| Driver | `rcode` |
+|---|---|
+| BIND9 (agent-managed) | yes, when response logging is enabled |
+| PowerDNS (agent-managed) | no — its detail log carries no RCODE field |
+| Technitium | no — query-log polling is deferred (#742), and its API does expose the rcode when it lands |
+| Windows DNS, cloud drivers | no — they ship no query log at all |
+
+**`NULL` means UNRECORDED, never `NOERROR`.** Every surface keeps the
+two apart: the API returns `null`, the grid renders *not recorded* in
+italics rather than a dash beside a successful lookup, the analytics
+breakdown counts them under an explicit `UNKNOWN` key rather than
+omitting them, and the copilot tool spells the reason out in the field
+itself. A server with the toggle off shows one honest bar instead of an
+empty panel that reads as "no failures".
+
+### 21.4 Individual RPZ hits
+
+`GET /api/v1/dns-threat/rpz/hits` returns the per-hit rows behind the
+blocklist rollups — timestamp, client, name, trigger, policy and the
+feed that matched. Those rows have been stored since #699 and were
+reachable from no endpoint, so "show me the three lookups this PC made
+in the last ten minutes that were blocked" was unanswerable; only "this
+client has N hits and its top name is X" was. PASSTHRU rows are excluded
+by default, because a PASSTHRU is an explicit *allow* and listing it
+among blocks makes a working allowlist read as an infection —
+`include_passthru=true` answers the opposite question, why a listed name
+got through.
+
+> **The pipeline behind them was dead on the agent path.** named logs a
+> policy rewrite to its own `rpz` category, and the agent's BIND9
+> renderer — the one every agent-managed server actually runs — never
+> emitted `category rpz { queries_channel; };`. The control-plane Jinja
+> template has carried it since #699, which is why the gap survived
+> review: the code was right in the file nothing renders from. Fixed in
+> #914 along with `rpz-passthru`, whose absence left the entire
+> exception half of the attribution dark and the `policy != PASSTHRU`
+> filters in `services/dns_threat/rpz.py` unreachable. Same class as
+> `allow_transfer` (#734) and `forward_policy` (#899): a setting that is
+> stored, shipped, and rendered nowhere. The lesson from §8.2 applies
+> unchanged — **assert on the rendered config, not the stored row**.

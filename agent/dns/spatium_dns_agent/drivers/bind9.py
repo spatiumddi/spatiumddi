@@ -52,7 +52,7 @@ NAMED_CONF_SKELETON = """\
     dnssec-validation {dnssec};
     key-directory "/var/cache/bind/keys";
     check-integrity no;
-{forwarders}{response_policy}{rate_limit}
+{response_log}{forwarders}{response_policy}{rate_limit}
 }};
 statistics-channels {{
     inet 127.0.0.1 port 8053 allow {{ 127.0.0.1; }};
@@ -66,7 +66,7 @@ statistics-channels {{
 # print-* defaults match ``DNSServerOptions``' column defaults; we
 # don't plumb the per-field overrides through the agent yet because
 # the operator-facing UI surfaces the boolean toggle only.
-_QUERY_LOG_BLOCK = """\
+_QUERY_LOG_HEAD = """\
 logging {
     channel queries_channel {
         file "/var/log/named/queries.log" versions 5 size 50m;
@@ -77,8 +77,64 @@ logging {
     };
     category queries { queries_channel; };
     category query-errors { queries_channel; };
-};
 """
+
+# RPZ policy hits (issue #699). named logs a rewrite to its OWN ``rpz``
+# category, never to ``queries`` — so without these two lines a blocked
+# lookup is invisible to the control plane and every per-client
+# attribution the feature exists for reports nothing. The control-plane
+# Jinja template has carried them since #699; this renderer, which is
+# what every agent-managed BIND9 server actually runs, did not, so the
+# ingest's RPZ branch had nothing to parse (issue #914).
+#
+# PASSTHRU — an exception firing, i.e. an explicit ALLOW — goes to a
+# SEPARATE category, so it needs its own line or the passthru half of
+# the attribution stays dark and the ``policy != PASSTHRU`` filters in
+# services/dns_threat/rpz.py are dead code. Verified against BIND 9.20.
+_RPZ_LOG_CATEGORIES = """\
+    category rpz { queries_channel; };
+    category rpz-passthru { queries_channel; };
+"""
+
+# Response logging (issue #914) — the RCODE and section counts, on a
+# second line per query. Routed to the same channel for the same reason
+# RPZ is: the shipper already tails this file, so no second thread, file
+# or bind mount is needed, and the control plane tells the shapes apart
+# at ingest.
+_RESPONSE_LOG_CATEGORY = """\
+    category responses { queries_channel; };
+"""
+
+
+def _render_logging_block(opts: dict[str, Any]) -> str:
+    """The ``logging { ... }`` statement, or empty when logging is off.
+
+    Response logging is nested inside the query-log gate rather than
+    standing on its own: the responses ride the ``queries_channel`` this
+    block defines, and the shipper tails the file that channel writes —
+    so enabling responses without queries would define nothing to log to
+    and ship nothing. The control plane refuses that combination with a
+    422; this is the renderer-side half of the same rule.
+    """
+    if not bool(opts.get("query_log_enabled")):
+        return ""
+    block = _QUERY_LOG_HEAD + _RPZ_LOG_CATEGORIES
+    if bool(opts.get("response_log_enabled")):
+        block += _RESPONSE_LOG_CATEGORY
+    return block + "};\n"
+
+
+def _render_response_log_option(opts: dict[str, Any]) -> str:
+    """``responselog yes;`` inside ``options``, or nothing.
+
+    Two switches, not one: the ``responses`` category says WHERE the
+    lines go, ``responselog`` says whether named emits them at all.
+    Rendering only the category would leave the operator with a toggle
+    that changes named.conf and produces no data.
+    """
+    if bool(opts.get("query_log_enabled")) and bool(opts.get("response_log_enabled")):
+        return "    responselog yes;\n"
+    return ""
 
 
 def _render_allow_update(zone: dict[str, Any], group_key_name: str | None) -> str:
@@ -754,7 +810,7 @@ class Bind9Driver(DriverBase):
                 f"    response-policy {{ {zones_list}; }} break-dnssec yes;\n"
             )
 
-        logging_block = _QUERY_LOG_BLOCK if bool(opts.get("query_log_enabled")) else ""
+        logging_block = _render_logging_block(opts)
         conf = NAMED_CONF_SKELETON.format(
             recursion=recursion,
             allow_query=allow_query,
@@ -763,6 +819,7 @@ class Bind9Driver(DriverBase):
             forwarders=fwd_block,
             response_policy=response_policy_block,
             rate_limit=_render_rate_limit_block(opts),
+            response_log=_render_response_log_option(opts),
             logging_block=logging_block,
             tsig_include=tsig_include,
             acl_statements=_render_acl_statements(bundle.get("acls")),
@@ -1379,6 +1436,7 @@ class Bind9Driver(DriverBase):
                 )
             else:
                 self._reload_rendered_zones(base, self._changed_zones(backup))
+                self._sync_response_log_runtime(base)
         if not rndc_ok and self.daemon_pid:
             # Degraded path: SIGHUP is a config + zone reload, and like a
             # plain reload it does NOT re-read a dynamic zone's file — and
@@ -1396,6 +1454,56 @@ class Bind9Driver(DriverBase):
                 )
             except OSError as e:
                 log.error("named_sighup_failed", error=str(e))
+
+    def _sync_response_log_runtime(self, base: list[str]) -> None:
+        """Assert named's runtime response-logging state after a reconfig.
+
+        ``rndc reconfig`` does NOT apply ``responselog`` (issue #914,
+        verified against BIND 9.20.26): the freshly-swapped named.conf
+        said ``responselog yes;``, the reconfig succeeded, and
+        ``rndc status`` still reported ``response logging is OFF``. It is
+        a live switch, like ``querylog``, and reconfig deliberately
+        preserves whatever the running server was last told rather than
+        stamping the file's value over an operator's ``rndc`` override.
+
+        Query logging escapes this only by accident of BIND's own
+        defaulting — with no ``querylog`` statement, it follows the
+        presence of the ``queries`` logging category, which the reload
+        does pick up. Response logging does not follow its category the
+        same way, so without this the operator gets a toggle that
+        rewrites named.conf, passes ``named-checkconf``, reloads cleanly
+        and produces not one line until the daemon is next restarted.
+
+        The desired state is read back off the config we just swapped in
+        rather than threaded down from the bundle, so it cannot disagree
+        with what named is actually running — the same reason #899 and
+        #734 assert on the rendered config rather than the stored row.
+
+        Best effort: a failure leaves the config-file value to take
+        effect at the next restart, which is strictly better than the
+        pre-#914 behaviour, so it is logged rather than raised.
+        """
+        conf = self.state_dir / self.rendered_dir_name / "named.conf"
+        try:
+            desired = "responselog yes;" in conf.read_text()
+        except OSError as exc:
+            log.warning("rndc_responselog_conf_unreadable", error=str(exc))
+            return
+        res = subprocess.run(
+            [*base, "responselog", "on" if desired else "off"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if res.returncode != 0:
+            # An older named has no ``responselog`` command at all, which
+            # is a legitimate reason to land here — hence warning, not
+            # error, and no exception.
+            log.warning(
+                "rndc_responselog_failed",
+                desired=desired,
+                stderr=res.stderr.strip(),
+            )
 
     def rendered_zone_views(self) -> list[tuple[str, str | None]]:
         """``(zone_name, view_name)`` for every zone file we just rendered.

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import ipaddress
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -18,6 +18,10 @@ from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
 from app.models.dhcp import DHCPPool, DHCPScope
 from app.models.ipam import IPAddress
+from app.services.dhcp.pool_occupancy import (
+    PoolOccupancy,
+    compute_pool_occupancy_batch,
+)
 from app.services.dhcp.windows_writethrough import push_pool_change
 
 router = APIRouter(tags=["dhcp"], dependencies=[Depends(require_resource_permission("dhcp_pool"))])
@@ -333,3 +337,131 @@ async def delete_pool(pool_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
     )
     await db.delete(pool)
     await db.commit()
+
+
+# ── Occupancy (issue #913) ───────────────────────────────────────────
+#
+# ``services/dhcp/pool_occupancy.py`` has computed this since #339, but
+# nothing HTTP called it — it was reachable only from the
+# ``find_dhcp_pool_occupancy`` MCP tool and the ``dhcp_pool_exhaustion``
+# alert evaluator. So "is this pool full?", which is the first question
+# asked when a client cannot get an address, could only be answered by a
+# caller that fetched pools + leases + reservations and redid the range
+# arithmetic itself — three round trips and an easy thing to get subtly
+# wrong, and a wrong "the pool is fine" sends the technician to the
+# wrong place.
+
+
+class PoolOccupancyResponse(BaseModel):
+    """Live occupancy of one address-range pool.
+
+    ``assigned`` unions active leases with in-pool static reservations, so
+    a reserved-but-offline address counts as unavailable (#631) and a
+    reserved-and-currently-leased one is not double-counted.
+    """
+
+    pool_id: uuid.UUID
+    scope_id: uuid.UUID
+    pool_name: str
+    start_ip: str
+    end_ip: str
+    pool_type: str
+    total: int
+    assigned: int
+    free: int
+    percent: float
+    #: Occupancy is derived at request time from mirrored lease rows, whose
+    #: freshness depends on the last lease pull — so the caller is told
+    #: when the number was computed rather than being left to assume it is
+    #: instantaneous.
+    computed_at: datetime
+
+
+#: Occupancy is a *dynamic-allocation* question — "can a client still get
+#: an address from here" — so it is answered for dynamic pools only, which
+#: is also what the ``dhcp_pool_exhaustion`` alert evaluator and the
+#: ``find_dhcp_pool_occupancy`` MCP tool already filter to. Reporting it
+#: for the other types would disagree with both:
+#:
+#: * an ``excluded`` range is one DHCP will never offer, so a percentage
+#:   full is not a fact about it at all;
+#: * a ``reserved`` range is held for static assignments, so a correctly
+#:   configured one is *supposed* to approach 100% and would render as a
+#:   red exhaustion bar for doing its job;
+#: * a ``pd`` pool (#368) stores its prefix's network address in both
+#:   ``start_ip`` and ``end_ip`` as NOT NULL placeholders rather than a
+#:   range, so the arithmetic yields a one-address pool at 0% — a number
+#:   that looks like an answer and is not one.
+_OCCUPANCY_POOL_TYPE = "dynamic"
+
+
+def _not_applicable(pool_type: str) -> str:
+    if pool_type == "pd":
+        return (
+            "Prefix-delegation pools have no address-range occupancy — "
+            "start_ip/end_ip are placeholders for the delegated prefix, not a range."
+        )
+    return (
+        f"Occupancy is only meaningful for dynamic pools; this one is "
+        f"{pool_type!r}. An excluded range is never offered to a client, and a "
+        f"reserved range is supposed to fill up."
+    )
+
+
+def _occupancy_row(
+    pool: DHCPPool, occ: PoolOccupancy, computed_at: datetime
+) -> PoolOccupancyResponse:
+    return PoolOccupancyResponse(
+        pool_id=pool.id,
+        scope_id=pool.scope_id,
+        pool_name=pool.name or "",
+        start_ip=str(pool.start_ip),
+        end_ip=str(pool.end_ip),
+        pool_type=pool.pool_type,
+        total=occ.total,
+        assigned=occ.assigned,
+        free=occ.free,
+        percent=round(occ.percent, 2),
+        computed_at=computed_at,
+    )
+
+
+@router.get("/pools/{pool_id}/occupancy", response_model=PoolOccupancyResponse)
+async def pool_occupancy(pool_id: uuid.UUID, db: DB, _: CurrentUser) -> PoolOccupancyResponse:
+    """Live occupancy of one pool — assigned / total / free / percent."""
+    pool = await db.get(DHCPPool, pool_id)
+    if pool is None:
+        raise HTTPException(status_code=404, detail="Pool not found")
+    if pool.pool_type != _OCCUPANCY_POOL_TYPE:
+        raise HTTPException(status_code=422, detail=_not_applicable(pool.pool_type))
+    occ = (await compute_pool_occupancy_batch(db, [pool]))[pool.id]
+    return _occupancy_row(pool, occ, datetime.now(UTC))
+
+
+@router.get("/scopes/{scope_id}/pools/occupancy", response_model=list[PoolOccupancyResponse])
+async def scope_pool_occupancy(
+    scope_id: uuid.UUID, db: DB, _: CurrentUser
+) -> list[PoolOccupancyResponse]:
+    """Live occupancy of every dynamic pool in a scope, in one call.
+
+    The scope-level shape is the one that matters operationally: a scope
+    with several pools is exactly where a call-per-pool is wasteful, and
+    also where "the scope looks fine" hides one exhausted class-restricted
+    pool. Non-dynamic pools are omitted rather than reported at a number
+    that is not a fact about them — see :data:`_OCCUPANCY_POOL_TYPE`.
+    """
+    scope = await db.get(DHCPScope, scope_id)
+    if scope is None:
+        raise HTTPException(status_code=404, detail="Scope not found")
+    res = await db.execute(
+        select(DHCPPool)
+        .where(DHCPPool.scope_id == scope_id)
+        .where(DHCPPool.pool_type == _OCCUPANCY_POOL_TYPE)
+        .order_by(DHCPPool.start_ip)
+    )
+    pools = list(res.scalars().all())
+    # One batched lease + reservation query for every pool, not one per
+    # pool — the whole point of answering at the scope level.
+    occ_by_pool = await compute_pool_occupancy_batch(db, pools)
+    computed_at = datetime.now(UTC)
+    return [_occupancy_row(p, occ_by_pool[p.id], computed_at) for p in pools]

@@ -174,6 +174,67 @@ DHCPPool
   current_lease_count: int (computed, pulled from server)
 ```
 
+### Pool occupancy over REST (issue #913)
+
+```
+GET /api/v1/dhcp/pools/{pool_id}/occupancy
+GET /api/v1/dhcp/scopes/{scope_id}/pools/occupancy    # every pool, one call
+```
+
+```json
+{
+  "pool_id": "…", "scope_id": "…", "pool_name": "Workstations",
+  "start_ip": "10.1.2.101", "end_ip": "10.1.2.200",
+  "pool_type": "dynamic",
+  "total": 100, "assigned": 97, "free": 3, "percent": 97.0,
+  "computed_at": "2026-08-23T12:00:00.000Z"
+}
+```
+
+`assigned` is the count of distinct in-range addresses **unavailable to
+a dynamic client**: active leases *unioned* with in-pool static
+reservations. Both halves matter and neither is obvious from outside:
+
+* A reservation withholds its address whether or not the reserved device
+  is currently online, so counting leases alone under-reports exhaustion
+  (#631) — and a wrong "the pool is fine" sends the technician looking
+  in the wrong place.
+* A reserved-**and**-currently-leased address is one address, not two,
+  which is why this is a union rather than a sum.
+
+"Is this pool exhausted?" is one of the first questions asked when a
+client cannot get an address, and until #913 the API could not answer it:
+the computation had existed since #339 but was reachable only from the
+`find_dhcp_pool_occupancy` copilot tool and the `dhcp_pool_exhaustion`
+alert evaluator. Every consumer had to fetch pools, leases and
+reservations separately and redo the range arithmetic — three round
+trips and an easy thing to get subtly wrong.
+
+The **scope-level** shape is the one that matters operationally: a scope
+with several pools is exactly where a call-per-pool is wasteful, and also
+where "the scope looks fine" hides one exhausted class-restricted pool.
+It runs a single batched lease + reservation query for all of them.
+
+**Dynamic pools only.** The scope listing omits every other type and the
+per-pool route returns 422 for one, because each would produce a
+misleading number — and because the `dhcp_pool_exhaustion` alert
+evaluator and the `find_dhcp_pool_occupancy` copilot tool already filter
+the same way, so answering differently here is how a wrong "the pool is
+fine" gets produced:
+
+* `excluded` — a range DHCP will never offer, so "percentage full" is
+  not a fact about it.
+* `reserved` — held for static assignments, so a correctly configured
+  one is *supposed* to approach 100% and would render as a red
+  exhaustion bar for doing its job.
+* `pd` (#368) — `start_ip` / `end_ip` are NOT NULL placeholders holding
+  the delegated prefix's network address rather than a range, so the
+  arithmetic reports a one-address pool at 0%.
+
+`computed_at` is returned because occupancy is derived from the mirrored
+lease rows, so its freshness follows the last lease pull rather than
+being instantaneous.
+
 ### Example: Multiple Pools in One Subnet (10.1.2.0/24)
 
 | Pool Name | Range | Type | Notes |

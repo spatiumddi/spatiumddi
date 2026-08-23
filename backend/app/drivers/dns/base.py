@@ -181,6 +181,10 @@ class ServerOptions:
     blackhole: tuple[str, ...] = ()
     trust_anchors: tuple[TrustAnchorData, ...] = ()
     query_log_enabled: bool = False
+    # Per-query RCODE logging (#914). BIND9-only, and only meaningful
+    # alongside ``query_log_enabled`` — the responses ride the same
+    # channel the query-log shipper already tails.
+    response_log_enabled: bool = False
     query_log_channel: str = "file"
     query_log_file: str = "/var/log/named/queries.log"
     query_log_severity: str = "info"
