@@ -5062,6 +5062,8 @@ export interface DNSServerOptions {
   allow_transfer: string[];
   blackhole: string[];
   query_log_enabled: boolean;
+  /** Per-query RCODE logging (#914). BIND9 only; requires query_log_enabled. */
+  response_log_enabled: boolean;
   query_log_channel: string;
   query_log_file: string;
   query_log_severity: string;
@@ -8196,6 +8198,21 @@ export const dhcpApi = {
   deletePool: (_scopeId: string, poolId: string) =>
     api.delete(`/dhcp/pools/${poolId}`),
 
+  // Live pool occupancy (#913). Assigned unions active leases with in-pool
+  // static reservations, so a reserved-but-offline address counts as taken.
+  // Dynamic pools only: the scope call omits every other type and the
+  // per-pool one 422s, because a percentage full is not a fact about an
+  // excluded range, a reserved range is supposed to fill up, and a pd
+  // pool's start/end are placeholders rather than a range.
+  poolOccupancy: (poolId: string) =>
+    api
+      .get<DHCPPoolOccupancy>(`/dhcp/pools/${poolId}/occupancy`)
+      .then((r) => r.data),
+  scopePoolOccupancy: (scopeId: string) =>
+    api
+      .get<DHCPPoolOccupancy[]>(`/dhcp/scopes/${scopeId}/pools/occupancy`)
+      .then((r) => r.data),
+
   // Rogue-DHCP observed responders (#370).
   listResponders: (groupId: string, classification?: string) =>
     api
@@ -8522,6 +8539,22 @@ export const newDeviceApi = {
       .post<NewDeviceBlockResult>("/new-devices/block", data)
       .then((r) => r.data),
 };
+
+/** Live occupancy of one address-range DHCP pool (#913). */
+export interface DHCPPoolOccupancy {
+  pool_id: string;
+  scope_id: string;
+  pool_name: string;
+  start_ip: string;
+  end_ip: string;
+  pool_type: string;
+  total: number;
+  assigned: number;
+  free: number;
+  percent: number;
+  /** Derived from mirrored lease rows, so its freshness follows the last lease pull. */
+  computed_at: string;
+}
 
 export interface DHCPPool {
   id: string;
@@ -8969,6 +9002,14 @@ export interface DNSQueryLogRow {
   qtype: string | null;
   flags: string | null;
   view: string | null;
+  /**
+   * What the client was actually told (#914). `null` means the outcome
+   * was never recorded — response logging is off for the group — and NOT
+   * that the query succeeded. Render the two differently.
+   */
+  rcode?: string | null;
+  /** RRs in the answer section. NOERROR with 0 is a NODATA response. */
+  answer_count?: number | null;
   raw: string;
 }
 
@@ -8981,6 +9022,8 @@ export interface DNSQueryLogRequest {
   client_ip?: string | null;
   // Exact-match view filter (#371) — seeded by the per-view analytics card.
   view?: string | null;
+  /** Exact outcome (#914). `UNKNOWN` selects rows with no recorded rcode. */
+  rcode?: string | null;
   max_events?: number;
 }
 
@@ -9043,6 +9086,13 @@ export interface DNSQueryAnalyticsResponse {
   qtype_distribution: DNSQueryAnalyticsRow[];
   // Per-view query split (#371). Empty for single-view servers.
   top_views?: DNSQueryAnalyticsRow[];
+  /**
+   * Outcome split (#914). Queries with no recorded outcome appear under
+   * the `UNKNOWN` key rather than being dropped, so a group with response
+   * logging off shows one honest bar instead of an empty panel that reads
+   * as "no failures".
+   */
+  rcode_distribution?: DNSQueryAnalyticsRow[];
 }
 
 /** One scored per-client DNS behaviour window (issue #699). */
@@ -9148,6 +9198,19 @@ export interface RPZBlockedName {
   rpz_zone: string | null;
 }
 
+/** One individual RPZ policy hit (#914) — the raw event, not a rollup. */
+export interface RPZHitRow {
+  id: string;
+  ts: string;
+  server_id: string | null;
+  client_ip: string | null;
+  qname: string | null;
+  trigger: string;
+  policy: string;
+  rpz_zone: string | null;
+  raw: string;
+}
+
 export interface RPZFeedRow {
   rpz_zone: string | null;
   hits: number;
@@ -9247,6 +9310,20 @@ export const dnsThreatApi = {
   rpzFeeds: (params?: { hours?: number }) =>
     api
       .get<RPZFeedRow[]>("/dns-threat/rpz/feeds", { params })
+      .then((r) => r.data),
+  /**
+   * The individual hits (#914) — what the rollups above cannot answer:
+   * "which three lookups did this PC make that were blocked".
+   */
+  rpzHits: (params?: {
+    hours?: number;
+    limit?: number;
+    client_ip?: string;
+    qname_contains?: string;
+    include_passthru?: boolean;
+  }) =>
+    api
+      .get<RPZHitRow[]>("/dns-threat/rpz/hits", { params })
       .then((r) => r.data),
 };
 

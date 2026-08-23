@@ -958,6 +958,87 @@ suggestion, free-space treemap.
     asserted in both schema modes. Tests assert on the **wire format**, never
     on the patch: the regression worth catching is a future pydantic that
     stops routing through that function.
+  - ✅ [**Expose DHCP pool occupancy over REST**](https://github.com/spatiumddi/spatiumddi/issues/913)
+    — `services/dhcp/pool_occupancy.py` has computed `assigned` / `total` /
+    `free` / `percent` since #339 and **no HTTP route called it**: it was
+    reachable only from the `find_dhcp_pool_occupancy` MCP tool and the
+    `dhcp_pool_exhaustion` alert evaluator. So "is this pool full?" — the
+    first question asked when a client cannot get an address — could only be
+    answered by fetching pools, leases and reservations separately and redoing
+    the range arithmetic, three round trips and easy to get subtly wrong.
+    Now `GET /dhcp/pools/{id}/occupancy` and
+    `GET /dhcp/scopes/{id}/pools/occupancy`, the second batching one lease +
+    reservation query across every pool — the scope shape is the one that
+    matters, since a scope with several pools is where "the scope looks fine"
+    hides one exhausted class-restricted pool. **Dynamic pools only** — the
+    scope call omits every other type and the per-pool call 422s, because each
+    would report a number that is not a fact about it: an `excluded` range is
+    never offered to a client, a `reserved` one is *supposed* to approach
+    100 % and would render as a red exhaustion bar for doing its job, and a
+    `pd` pool (#368) stores its prefix's network address in both range ends as
+    NOT NULL placeholders, so the arithmetic yields a one-address pool at 0 %.
+    That also keeps this endpoint agreeing with the `dhcp_pool_exhaustion`
+    alert evaluator and the `find_dhcp_pool_occupancy` MCP tool, which filter
+    the same way — a disagreement between those is precisely how a wrong "the
+    pool is fine" is produced. No new MCP tool (explicit decision per
+    non-negotiable #13): `find_dhcp_pool_occupancy` answers exactly this, over
+    the same pool set.
+  - ✅ [**DNS query log has no rcode**](https://github.com/spatiumddi/spatiumddi/issues/914)
+    — the log recorded the *question* and nothing about the *answer*, so
+    "was it answered, refused or NXDOMAIN?" collapsed into "there is a row"
+    or "there is not" — and the most common real outcome, a query that *was*
+    answered just not as the user expected, was indistinguishable from one
+    that was refused. BIND's `queries` category is request-side by design;
+    BIND 9.20's **`responselog`** emits a second category (`responses`)
+    carrying the RCODE and the section counts. Routed to the same
+    `queries_channel` the shipper already tails, told apart at ingest by
+    separator (`: response: ` vs `: query: `, neither expressible in a DNS
+    name), and stamped onto the query row it belongs to — matched on client
+    address + ephemeral port + qname + qtype, in-batch first and against the
+    DB when a batch boundary splits the pair, because that split lands on the
+    *same* row every time under load and would be a bias rather than noise.
+    An orphan response is dropped, never stored: a row with an outcome and no
+    question answers nothing and would double-count every query in the
+    analytics the same table feeds. **`answer_count` is carried as well as
+    `rcode`** — NOERROR with zero answers is NODATA, a different fault from
+    NXDOMAIN that reads identically without it. Opt-in per group
+    (`response_log_enabled`, migration `f1c7a92e4b06`) because it roughly
+    doubles query-log volume, and **422 when a caller explicitly asks for
+    response logging without query logging** rather than accepting a toggle
+    whose lines have no channel to go to — while simply turning query logging
+    off clears response logging with it, since refusing there would name a
+    field the caller never sent and leave no single call that disables query
+    logging at all. **NULL means
+    UNRECORDED, never NOERROR**, in every surface: `not recorded` in italics
+    in the grid, an explicit `UNKNOWN` key in the analytics breakdown (so a
+    group with the toggle off shows one honest bar, not an empty panel reading
+    as "no failures"), a selectable filter value, and the reason spelled out
+    in the copilot tool's own field. Also closes the issue's related gap:
+    `GET /dns-threat/rpz/hits` returns the individual blocked lookups behind
+    the four rollups, PASSTHRU excluded by default because an explicit ALLOW
+    listed among blocks makes a working allowlist read as an infection.
+    2 MCP tools (`find_dns_queries`, `find_rpz_hits`).
+    **Two bugs found on the way, both of the "written, never read" class the
+    #899 audit named.** (1) The agent's BIND9 renderer — what every
+    agent-managed server actually runs — never emitted
+    `category rpz { queries_channel; };`, so named logged every policy rewrite
+    to a category with no channel and #699's whole per-client attribution
+    recorded *nothing* on the only path that ships it. The control-plane Jinja
+    template has carried the line since #699, which is why review never caught
+    it: the code was right in the file nothing renders from. `rpz-passthru`
+    was missing too, leaving the exception half dark and the
+    `policy != PASSTHRU` filters unreachable. Verified live: a blocked lookup
+    that produced no row before now produces one. (2) **`rndc reconfig` does
+    not apply `responselog`** — verified against BIND 9.20.26, config swapped
+    and reconfig clean, `rndc status` still `response logging is OFF`. It is a
+    live switch and reconfig preserves what the server was last told; query
+    logging escapes this only by accident of BIND's defaulting (no `querylog`
+    statement, so it follows the `queries` category, which a reload *does*
+    pick up). Without the explicit `rndc responselog on|off` the agent now
+    issues after each structural reload — reading the desired state back off
+    the config it just swapped in — the toggle would rewrite `named.conf`,
+    pass `named-checkconf`, reload cleanly and produce not one line until the
+    daemon was next restarted.
 - ✅ [**Login banner**](https://github.com/spatiumddi/spatiumddi/issues/885) · [**custom logo**](https://github.com/spatiumddi/spatiumddi/issues/886) ·
   [**environment banner**](https://github.com/spatiumddi/spatiumddi/issues/887) · [**`app_title` wired up**](https://github.com/spatiumddi/spatiumddi/issues/888)
   — shipped together in PR

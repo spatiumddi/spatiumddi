@@ -541,6 +541,9 @@ class ServerOptionsUpdate(BaseModel):
     allow_transfer: list[str] | None = None
     blackhole: list[str] | None = None
     query_log_enabled: bool | None = None
+    # Issue #914 — BIND9 only, and only alongside query logging (see the
+    # 422 in ``update_options``).
+    response_log_enabled: bool | None = None
     query_log_channel: str | None = None
     query_log_file: str | None = None
     query_log_severity: str | None = None
@@ -685,6 +688,7 @@ class ServerOptionsResponse(BaseModel):
     allow_transfer: list[str]
     blackhole: list[str]
     query_log_enabled: bool
+    response_log_enabled: bool
     query_log_channel: str
     query_log_file: str
     query_log_severity: str
@@ -2846,6 +2850,31 @@ async def update_options(
         setattr(opts, k, v)
 
     await _assert_encrypted_transport_sane(opts, db)
+    # Response logging (#914) has nowhere to go without the query-log
+    # channel: the ``responses`` category is routed to ``queries_channel``,
+    # which is only defined inside the query-log block, and the agent's
+    # shipper tails the file that channel writes.
+    #
+    # Which of the two things to do about that depends on what the caller
+    # ASKED for, not on the merged row. Someone explicitly requesting the
+    # impossible pair is refused, because a toggle that reports success
+    # and produces no rcodes is the "configured but does nothing" failure
+    # this codebase keeps finding. But someone simply turning query
+    # logging off has not asked for anything impossible, and 422ing them
+    # over a field they never sent would leave no single call that
+    # disables query logging at all — so response logging is cleared with
+    # it, which is the only coherent resulting state.
+    if opts.response_log_enabled and not opts.query_log_enabled:
+        if body.response_log_enabled:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "response_log_enabled requires query_log_enabled — response "
+                    "lines are written to the query-log channel."
+                ),
+            )
+        opts.response_log_enabled = False
+        changes["response_log_enabled"] = False
 
     db.add(
         AuditLog(

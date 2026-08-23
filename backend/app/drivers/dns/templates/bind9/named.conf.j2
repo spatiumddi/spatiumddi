@@ -59,6 +59,14 @@ options {
     blackhole { {% for a in options.blackhole %}{{ a }}; {% endfor %}};
     {%- endif %}
     dnssec-validation {{ options.dnssec_validation }};
+    {#- Per-query RCODE logging (issue #914). Gated on query logging too:
+        the response lines are routed to ``queries_channel``, which only
+        exists inside the query-log block below, and the agent shipper
+        tails the file that channel writes. Enabling responses alone
+        would define nothing to log to. #}
+    {%- if options.query_log_enabled and options.response_log_enabled %}
+    responselog yes;
+    {%- endif %}
     notify {{ options.notify_enabled }};
     {%- if options.also_notify %}
     also-notify { {% for a in options.also_notify %}{{ a }}; {% endfor %}};
@@ -157,6 +165,13 @@ logging {
         `policy != PASSTHRU` filters in services/dns_threat/rpz.py are
         dead code. Verified against BIND 9.20. #}
     category rpz-passthru { queries_channel; };
+    {#- The answer half of each query (issue #914) — RCODE plus the
+        answer/authority/additional counts, which is what separates
+        NXDOMAIN from REFUSED from a NODATA NOERROR. Same channel again:
+        the agent already tails it. #}
+    {%- if options.response_log_enabled %}
+    category responses { queries_channel; };
+    {%- endif %}
 };
 {%- endif %}
 

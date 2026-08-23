@@ -5881,6 +5881,7 @@ function OptionsTab({ groupId }: { groupId: string }) {
   const [allowQuery, setAllowQuery] = useState("any");
   const [allowTransfer, setAllowTransfer] = useState("none");
   const [queryLogEnabled, setQueryLogEnabled] = useState(false);
+  const [responseLogEnabled, setResponseLogEnabled] = useState(false);
   const [queryLogChannel, setQueryLogChannel] = useState("file");
   const [queryLogFile, setQueryLogFile] = useState(
     "/var/log/named/queries.log",
@@ -5933,6 +5934,7 @@ function OptionsTab({ groupId }: { groupId: string }) {
     setAllowQuery(opts.allow_query.join(", "));
     setAllowTransfer(opts.allow_transfer.join(", "));
     setQueryLogEnabled(opts.query_log_enabled);
+    setResponseLogEnabled(opts.response_log_enabled);
     setQueryLogChannel(opts.query_log_channel);
     setQueryLogFile(opts.query_log_file);
     setQueryLogSeverity(opts.query_log_severity);
@@ -6114,6 +6116,9 @@ function OptionsTab({ groupId }: { groupId: string }) {
       allow_query: list(allowQuery),
       allow_transfer: list(allowTransfer),
       query_log_enabled: queryLogEnabled,
+      // Only meaningful with query logging on; the API 422s the other
+      // combination, so never send it (#914).
+      response_log_enabled: queryLogEnabled && responseLogEnabled,
       query_log_channel: queryLogChannel,
       query_log_file: queryLogFile,
       query_log_severity: queryLogSeverity,
@@ -6971,6 +6976,32 @@ function OptionsTab({ groupId }: { groupId: string }) {
         )}
         {queryLogEnabled && (
           <>
+            {/* Response logging (#914). Nested inside the query-log gate
+                because the response lines are written to the same
+                channel — the API refuses the other combination rather
+                than accepting a toggle that produces nothing. */}
+            <label className="flex cursor-pointer items-start gap-2 rounded border bg-muted/20 p-2 text-sm">
+              <input
+                type="checkbox"
+                checked={responseLogEnabled}
+                onChange={(e) => {
+                  setResponseLogEnabled(e.target.checked);
+                  setDirty(true);
+                }}
+                className="mt-0.5 h-4 w-4"
+              />
+              <span>
+                Record the outcome of each query
+                <span className="mt-0.5 block text-xs text-muted-foreground">
+                  Adds the RCODE (NOERROR / NXDOMAIN / REFUSED / SERVFAIL) and
+                  answer count to every row in the Logs page, which is what
+                  separates &ldquo;it is not DNS&rdquo; from &ldquo;an ACL is
+                  rejecting this client&rdquo;. BIND9 only, and it roughly
+                  doubles query-log volume — named writes a second line per
+                  query.
+                </span>
+              </span>
+            </label>
             <Field label="Log channel">
               <select
                 className={selCls}

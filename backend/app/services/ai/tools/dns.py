@@ -987,6 +987,107 @@ async def find_dns_query_stats(
     return out
 
 
+# ── find_dns_queries (issue #914) ─────────────────────────────────────
+
+
+class FindDNSQueriesArgs(BaseModel):
+    client_ip: str | None = Field(
+        default=None, description="Only queries from this client IP address."
+    )
+    qname_contains: str | None = Field(
+        default=None, max_length=255, description="Substring match on the queried name."
+    )
+    qtype: str | None = Field(default=None, max_length=16, description="e.g. A, AAAA, MX, PTR.")
+    rcode: str | None = Field(
+        default=None,
+        max_length=16,
+        description=(
+            "Exact outcome: NOERROR, NXDOMAIN, REFUSED, SERVFAIL. Pass "
+            "UNKNOWN for queries whose outcome was never recorded."
+        ),
+    )
+    server_id: str | None = Field(default=None, description="Filter to one DNS server UUID.")
+    minutes: int = Field(
+        default=60, ge=1, le=1440, description="Trailing window (the log is pruned at 24 h)."
+    )
+    limit: int = Field(default=50, ge=1, le=500)
+
+
+@register_tool(
+    name="find_dns_queries",
+    description=(
+        "Individual DNS queries a client made, newest first, WITH what it "
+        "was told back (issue #914): rcode plus the answer count, so "
+        "NXDOMAIN, REFUSED, SERVFAIL and an empty NOERROR (NODATA) are "
+        "distinguishable. Use for 'this machine cannot reach X' — no row "
+        "at all means the query never arrived (look at the resolver "
+        "config, DHCP option 6 or a firewall), NOERROR means it is not "
+        "DNS. rcode is null when the server group has response logging "
+        "off; null means UNRECORDED, never success. Requires query "
+        "logging on an agent-managed BIND9 / PowerDNS group; the log "
+        "holds 24 h."
+    ),
+    args_model=FindDNSQueriesArgs,
+    category="dns",
+)
+async def find_dns_queries(
+    db: AsyncSession, user: User, args: FindDNSQueriesArgs
+) -> list[dict[str, Any]]:
+    from datetime import UTC, datetime, timedelta  # noqa: PLC0415
+
+    from app.models.logs import DNSQueryLogEntry  # noqa: PLC0415
+    from app.services.search.ranking import like_pattern  # noqa: PLC0415
+
+    since = datetime.now(UTC) - timedelta(minutes=args.minutes)
+    stmt = select(DNSQueryLogEntry).where(DNSQueryLogEntry.ts >= since)
+    if args.client_ip:
+        try:
+            client_ip = str(ipaddress.ip_address(args.client_ip.strip()))
+        except ValueError:
+            return [{"result": f"{args.client_ip!r} is not an IP address"}]
+        stmt = stmt.where(DNSQueryLogEntry.client_ip == client_ip)
+    if args.server_id:
+        # A UUID column comparison raises a DBAPIError on anything that is
+        # not one, and the likeliest wrong value here is a server NAME the
+        # model read off another tool's output — so answer the question
+        # instead of 500ing, exactly as the client_ip guard above does.
+        try:
+            server_id = str(uuid.UUID(args.server_id.strip()))
+        except ValueError:
+            return [{"result": f"{args.server_id!r} is not a server UUID"}]
+        stmt = stmt.where(DNSQueryLogEntry.server_id == server_id)
+    if args.qtype:
+        stmt = stmt.where(DNSQueryLogEntry.qtype == args.qtype.strip().upper())
+    if args.rcode:
+        wanted = args.rcode.strip().upper()
+        if wanted == "UNKNOWN":
+            stmt = stmt.where(DNSQueryLogEntry.rcode.is_(None))
+        else:
+            stmt = stmt.where(DNSQueryLogEntry.rcode == wanted)
+    if args.qname_contains:
+        stmt = stmt.where(
+            DNSQueryLogEntry.qname.ilike(like_pattern(args.qname_contains.strip()), escape="\\")
+        )
+    stmt = stmt.order_by(DNSQueryLogEntry.ts.desc(), DNSQueryLogEntry.id.desc()).limit(args.limit)
+    rows = (await db.execute(stmt)).scalars().all()
+    return [
+        {
+            "ts": r.ts.isoformat(),
+            "server_id": str(r.server_id),
+            "client_ip": str(r.client_ip) if r.client_ip is not None else None,
+            "qname": r.qname,
+            "qtype": r.qtype,
+            "view": r.view,
+            # Spelled out rather than left null so a consumer cannot read
+            # "no key" as "fine" — the one mistake this field exists to
+            # stop (issue #914).
+            "rcode": r.rcode or "UNKNOWN (response logging off for this group)",
+            "answer_count": r.answer_count,
+        }
+        for r in rows
+    ]
+
+
 # Silence false-positive on lifted imports — Python pulls them in at
 # module load, but the linters want at-least-one referent in module
 # scope.

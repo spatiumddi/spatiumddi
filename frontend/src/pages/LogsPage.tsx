@@ -1075,6 +1075,7 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
   const [qtype, setQtype] = useState<string>("");
   const [clientIp, setClientIp] = useState<string>("");
   const [view, setView] = useState<string>("");
+  const [rcode, setRcode] = useState<string>("");
 
   useEffect(() => {
     if (sources.length === 0) {
@@ -1099,6 +1100,7 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
       qtype,
       clientIp,
       view,
+      rcode,
     ],
     queryFn: () =>
       logsApi.dnsQueries({
@@ -1109,6 +1111,7 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
         qtype: qtype.trim() || null,
         client_ip: clientIp.trim() || null,
         view: view.trim() || null,
+        rcode: rcode.trim() || null,
       }),
     enabled,
     staleTime: 5_000,
@@ -1169,6 +1172,25 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
             className="w-32 rounded-md border bg-background px-2 py-1 text-sm font-mono text-[11px]"
           />
         </label>
+        {/* Outcome filter (#914). "Unrecorded" is a real question an
+            operator asks — it is how you find out whether response
+            logging is actually on — so it is a selectable value rather
+            than an absence. */}
+        <label className="flex items-center gap-1.5 text-xs">
+          <span className="text-muted-foreground">Result</span>
+          <select
+            value={rcode}
+            onChange={(e) => setRcode(e.target.value)}
+            className="rounded-md border bg-background px-2 py-1 text-sm"
+          >
+            <option value="">Any</option>
+            <option value="NOERROR">NOERROR</option>
+            <option value="NXDOMAIN">NXDOMAIN</option>
+            <option value="REFUSED">REFUSED</option>
+            <option value="SERVFAIL">SERVFAIL</option>
+            <option value="UNKNOWN">Unrecorded</option>
+          </select>
+        </label>
         <label className="flex items-center gap-1.5 text-xs">
           <span className="inline-flex items-center gap-1 text-muted-foreground">
             <Calendar className="h-3 w-3" />
@@ -1194,7 +1216,7 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
         <MaxEventsPicker value={maxEvents} onChange={setMaxEvents} />
         <FilterSearch value={q} onChange={setQ} />
         <div className="ml-auto flex items-center gap-2">
-          {(q || qtype || clientIp || view || since) && (
+          {(q || qtype || clientIp || view || rcode || since) && (
             <button
               type="button"
               onClick={() => {
@@ -1202,6 +1224,7 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
                 setQtype("");
                 setClientIp("");
                 setView("");
+                setRcode("");
                 setSince("");
               }}
               title="Clear all filters"
@@ -1225,6 +1248,7 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
         onPickClient={(ip) => setClientIp(ip)}
         onPickQtype={(t) => setQtype(t)}
         onPickView={(v) => setView(v)}
+        onPickRcode={(r) => setRcode(r)}
       />
 
       {dnsQueriesQuery.isError && <QueryErrorBanner query={dnsQueriesQuery} />}
@@ -1237,12 +1261,13 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
 
       {events.length > 0 && (
         <div className="flex-1 overflow-auto">
-          <div className="grid grid-cols-[160px_140px_60px_70px_120px_80px_1fr] gap-x-3 border-b bg-muted/30 px-6 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+          <div className="grid grid-cols-[160px_140px_60px_70px_120px_95px_80px_1fr] gap-x-3 border-b bg-muted/30 px-6 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
             <span>Time</span>
             <span>Client</span>
             <span>QType</span>
             <span>QClass</span>
             <span>QName</span>
+            <span>Result</span>
             <span>Flags</span>
             <span>Raw</span>
           </div>
@@ -1270,6 +1295,7 @@ function DNSQueryAnalyticsStrip({
   onPickClient,
   onPickQtype,
   onPickView,
+  onPickRcode,
 }: {
   analytics: import("@/lib/api").DNSQueryAnalyticsResponse | null;
   loading: boolean;
@@ -1277,14 +1303,26 @@ function DNSQueryAnalyticsStrip({
   onPickClient: (ip: string) => void;
   onPickQtype: (t: string) => void;
   onPickView: (v: string) => void;
+  onPickRcode: (r: string) => void;
 }) {
   if (!analytics && !loading) return null;
   const total = analytics?.total_queries ?? 0;
   // Per-view card only renders for split-horizon servers (≥1 view seen) so
   // single-view setups keep the tidy 3-card strip (#371).
   const views = analytics?.top_views ?? [];
+  // Outcome breakdown (#914). Present on every server once the backend
+  // ships it — a group with response logging off still gets one bar
+  // ("UNKNOWN"), which is the honest rendering and also the fastest way
+  // to notice the toggle is off.
+  const rcodes = analytics?.rcode_distribution ?? [];
+  const cardCount =
+    3 + (views.length > 0 ? 1 : 0) + (rcodes.length > 0 ? 1 : 0);
   const cols =
-    views.length > 0 ? "md:grid-cols-2 lg:grid-cols-4" : "md:grid-cols-3";
+    cardCount >= 5
+      ? "md:grid-cols-3 lg:grid-cols-5"
+      : cardCount === 4
+        ? "md:grid-cols-2 lg:grid-cols-4"
+        : "md:grid-cols-3";
 
   return (
     <div className="border-b bg-muted/10 px-6 py-2">
@@ -1325,6 +1363,15 @@ function DNSQueryAnalyticsStrip({
             total={total}
             onPick={onPickView}
             emptyHint="No view data."
+          />
+        )}
+        {rcodes.length > 0 && (
+          <AnalyticsCard
+            title="Outcome"
+            rows={rcodes}
+            total={total}
+            onPick={onPickRcode}
+            emptyHint="No outcome data."
           />
         )}
       </div>
@@ -1383,9 +1430,61 @@ function AnalyticsCard({
   );
 }
 
+/**
+ * The answer half of a query (#914).
+ *
+ * A missing rcode is rendered as an explicit "not recorded", never as a
+ * dash that sits in the same column as a successful NOERROR — reading an
+ * unrecorded outcome as "fine" is the one mistake the field exists to
+ * prevent, and a blank cell invites exactly that. A NOERROR carrying no
+ * answer records is labelled NODATA, because "the name exists but has no
+ * record of that type" is a different fault from NXDOMAIN and looks
+ * identical without it.
+ */
+function RcodeCell({
+  rcode,
+  answers,
+}: {
+  rcode: string | null;
+  answers: number | null;
+}) {
+  if (!rcode) {
+    return (
+      <span
+        className="truncate text-[10px] italic text-muted-foreground/50"
+        title="Response logging is off for this server group, so the outcome was never recorded. This does NOT mean the query succeeded."
+      >
+        not recorded
+      </span>
+    );
+  }
+  const nodata = rcode === "NOERROR" && answers === 0;
+  const label = nodata ? "NODATA" : rcode;
+  const tone =
+    rcode === "NOERROR"
+      ? nodata
+        ? "text-amber-600"
+        : "text-emerald-600"
+      : rcode === "NXDOMAIN"
+        ? "text-amber-600"
+        : "text-rose-600";
+  return (
+    <span
+      className={cn("truncate font-mono text-[11px] font-medium", tone)}
+      title={
+        nodata
+          ? "NOERROR with no answer records — the name exists but has no record of this type"
+          : `${rcode}${answers !== null ? ` — ${answers} answer record(s)` : ""}`
+      }
+    >
+      {label}
+    </span>
+  );
+}
+
 function DNSQueryRow({ row }: { row: DNSQueryLogRow }) {
   return (
-    <div className="grid grid-cols-[160px_140px_60px_70px_120px_80px_1fr] items-baseline gap-x-3 px-6 py-1 hover:bg-muted/40">
+    <div className="grid grid-cols-[160px_140px_60px_70px_120px_95px_80px_1fr] items-baseline gap-x-3 px-6 py-1 hover:bg-muted/40">
       <span
         className="font-mono tabular-nums text-muted-foreground"
         title={row.ts}
@@ -1411,6 +1510,7 @@ function DNSQueryRow({ row }: { row: DNSQueryLogRow }) {
       <span className="truncate" title={row.qname ?? ""}>
         {row.qname ?? <span className="text-muted-foreground/40">—</span>}
       </span>
+      <RcodeCell rcode={row.rcode ?? null} answers={row.answer_count ?? null} />
       <span className="font-mono text-muted-foreground">
         {row.flags ?? <span className="text-muted-foreground/40">—</span>}
       </span>

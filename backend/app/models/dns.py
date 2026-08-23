@@ -433,6 +433,14 @@ class DNSServerOptions(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     query_log_print_severity: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     query_log_print_time: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
+    # Response logging (issue #914). BIND 9.20's ``responselog`` adds a
+    # second line per query carrying the RCODE and the section counts —
+    # the only way, short of dnstap, to know what a client was actually
+    # told. Opt-in and default-off because it doubles query-log volume,
+    # and volume is the reason the query log is capped at a 24 h window
+    # in the first place.
+    response_log_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
     # ── Response Rate Limiting (RRL) + amplification defenses (issue #146) ──
     # All default to a no-op so an existing install renders byte-identical
     # named.conf until an operator opts in. The rate-limit{} block is emitted

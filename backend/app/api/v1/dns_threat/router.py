@@ -450,6 +450,55 @@ async def rpz_names(
     ]
 
 
+class RPZHitRow(BaseModel):
+    """One individual policy hit — the raw event, not a rollup."""
+
+    id: str
+    ts: datetime
+    server_id: str | None
+    client_ip: str | None
+    qname: str | None
+    trigger: str
+    policy: str
+    rpz_zone: str | None
+    raw: str
+
+
+@router.get("/rpz/hits", response_model=list[RPZHitRow])
+async def rpz_hits(
+    db: DB,
+    current_user: CurrentUser,
+    hours: int = Query(default=24, ge=1, le=24 * 30),
+    limit: int = Query(default=100, ge=1, le=500),
+    client_ip: str | None = Query(default=None),
+    qname_contains: str | None = Query(default=None, max_length=255),
+    include_passthru: bool = Query(default=False),
+) -> list[RPZHitRow]:
+    """The individual blocked lookups, newest first (issue #914).
+
+    The four rollups above answer "how much"; this answers "what". The
+    rows have been stored since #699 and were reachable from no endpoint,
+    so "show me the three lookups this PC made in the last ten minutes
+    that were blocked" — the question that actually closes out a user
+    report — could not be asked.
+
+    ``include_passthru`` is off by default: a PASSTHRU is an explicit
+    ALLOW, and listing it among blocks makes a working allowlist look
+    like an infection.
+    """
+    return [
+        RPZHitRow(**r)
+        for r in await rpz_service.recent_hits(
+            db,
+            hours=hours,
+            limit=limit,
+            client_ip=_validated_ip(client_ip) if client_ip else None,
+            qname_contains=qname_contains,
+            include_passthru=include_passthru,
+        )
+    ]
+
+
 @router.get("/rpz/feeds", response_model=list[RPZFeedRow])
 async def rpz_feeds(
     db: DB,

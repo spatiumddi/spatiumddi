@@ -14,6 +14,7 @@ import {
 } from "lucide-react";
 
 import { Modal } from "@/components/ui/modal";
+import { cn } from "@/lib/utils";
 import {
   dnsThreatApi,
   type DNSClientWindow,
@@ -1007,6 +1008,19 @@ function RPZPanel({ hours }: { hours: number }) {
     queryKey: ["dns-threat-rpz-clients", hours],
     queryFn: () => dnsThreatApi.rpzClients({ hours, limit: 20 }),
   });
+  // Clicking a client narrows the per-hit list below (#914). The rollup
+  // says a host has 412 blocked lookups; closing out "the user says this
+  // site does not work" needs the names themselves.
+  const [focusClient, setFocusClient] = useState<string | null>(null);
+  const hits = useQuery({
+    queryKey: ["dns-threat-rpz-hits", hours, focusClient],
+    queryFn: () =>
+      dnsThreatApi.rpzHits({
+        hours,
+        limit: 100,
+        ...(focusClient ? { client_ip: focusClient } : {}),
+      }),
+  });
 
   if (summary.isLoading) {
     return (
@@ -1077,7 +1091,19 @@ function RPZPanel({ hours }: { hours: number }) {
               </thead>
               <tbody>
                 {rows.map((r) => (
-                  <tr key={r.client_ip} className="border-b last:border-0">
+                  <tr
+                    key={r.client_ip}
+                    onClick={() =>
+                      setFocusClient(
+                        focusClient === r.client_ip ? null : r.client_ip,
+                      )
+                    }
+                    className={cn(
+                      "cursor-pointer border-b last:border-0 hover:bg-muted/40",
+                      focusClient === r.client_ip && "bg-muted/60",
+                    )}
+                    title="Show this client's individual blocked lookups"
+                  >
                     <td className="py-1.5 pr-3 font-mono text-xs">
                       <span className="inline-flex items-center gap-1.5">
                         {r.noisy && (
@@ -1101,6 +1127,71 @@ function RPZPanel({ hours }: { hours: number }) {
                     </td>
                     <td className="py-1.5 text-xs text-muted-foreground">
                       {new Date(r.last_seen).toLocaleString()}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      <div>
+        <div className="mb-1 flex flex-wrap items-center gap-2">
+          <h4 className="text-xs font-semibold">Recent blocked lookups</h4>
+          {focusClient && (
+            <button
+              type="button"
+              onClick={() => setFocusClient(null)}
+              className="rounded-md border px-2 py-0.5 text-[11px] hover:bg-accent"
+            >
+              {focusClient} &times;
+            </button>
+          )}
+        </div>
+        <p className="mb-2 text-xs text-muted-foreground">
+          The individual hits, newest first — what the counts above cannot tell
+          you. Click a client to narrow. PASSTHRU rows are excluded: an
+          exception firing is an explicit allow, not a block.
+        </p>
+        {hits.isLoading ? (
+          <div className="flex items-center gap-2 py-3 text-sm text-muted-foreground">
+            <Loader2 className="h-4 w-4 animate-spin" />
+            Loading&hellip;
+          </div>
+        ) : (hits.data ?? []).length === 0 ? (
+          <p className="py-3 text-sm text-muted-foreground">
+            No blocked lookups in this window.
+          </p>
+        ) : (
+          <div className="max-h-96 overflow-auto">
+            <table className="w-full min-w-[40rem] text-sm">
+              <thead className="sticky top-0 border-b bg-card text-left text-xs text-muted-foreground">
+                <tr>
+                  <th className="py-1.5 pr-3 font-medium">Time</th>
+                  <th className="py-1.5 pr-3 font-medium">Client</th>
+                  <th className="py-1.5 pr-3 font-medium">Name</th>
+                  <th className="py-1.5 pr-3 font-medium">Policy</th>
+                  <th className="py-1.5 font-medium">Feed</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(hits.data ?? []).map((h) => (
+                  <tr key={h.id} className="border-b last:border-0">
+                    <td className="py-1.5 pr-3 text-xs text-muted-foreground whitespace-nowrap">
+                      {new Date(h.ts).toLocaleString()}
+                    </td>
+                    <td className="py-1.5 pr-3 font-mono text-xs">
+                      {h.client_ip ?? "—"}
+                    </td>
+                    <td className="py-1.5 pr-3 font-mono text-xs break-all">
+                      {h.qname ?? "—"}
+                    </td>
+                    <td className="py-1.5 pr-3 font-mono text-xs">
+                      {h.trigger} {h.policy}
+                    </td>
+                    <td className="py-1.5 font-mono text-xs break-all text-muted-foreground">
+                      {h.rpz_zone ?? "—"}
                     </td>
                   </tr>
                 ))}

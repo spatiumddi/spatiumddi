@@ -27,6 +27,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.dns_rpz_hit import DNSRPZHit
+from app.services.search.ranking import like_pattern
 
 # An explicit allow, not a block. See the module docstring.
 PASSTHRU = "PASSTHRU"
@@ -261,3 +262,60 @@ async def summary(db: AsyncSession, *, hours: int = 24) -> dict[str, Any]:
         "since": since,
         "has_data": (any_row or 0) > 0,
     }
+
+
+async def recent_hits(
+    db: AsyncSession,
+    *,
+    hours: int = 24,
+    limit: int = 100,
+    client_ip: str | None = None,
+    qname_contains: str | None = None,
+    include_passthru: bool = False,
+) -> list[dict[str, Any]]:
+    """The individual hits, newest first — not a rollup.
+
+    Every other function here answers "how much"; this one answers "what,
+    exactly". The rollups can say a client has 412 blocked lookups and a
+    top name, which is enough to spot an infected host and not enough to
+    close the other case out: a user reports a site is broken, and the
+    operator needs the three lookups that machine made in the last ten
+    minutes and what blocked them. That was unanswerable from the API
+    even though the rows have been stored since #699 (issue #914).
+
+    ``include_passthru`` is off by default for the reason the module
+    docstring gives — a PASSTHRU is an explicit allow, and mixing it into
+    a list captioned "blocked" misreads a working allowlist as an
+    infection. It is available because "why did this name get through
+    when the feed lists it?" is answered by exactly those rows.
+    """
+    since = datetime.now(UTC) - timedelta(hours=hours)
+    stmt = select(DNSRPZHit).where(DNSRPZHit.ts >= since)
+    if not include_passthru:
+        stmt = stmt.where(DNSRPZHit.policy != PASSTHRU)
+    if client_ip:
+        stmt = stmt.where(DNSRPZHit.client_ip == client_ip)
+    if qname_contains:
+        # Names are stored lower-cased and dot-stripped by the parser, so
+        # the needle is normalised the same way rather than relying on
+        # ILIKE to paper over a mismatch that would also defeat any index.
+        needle = qname_contains.strip().rstrip(".").lower()
+        # ``like_pattern`` neutralises LIKE metacharacters — searching for
+        # ``50%`` must not match every row (the #879 finding).
+        stmt = stmt.where(DNSRPZHit.qname.like(like_pattern(needle), escape="\\"))
+    stmt = stmt.order_by(DNSRPZHit.ts.desc(), DNSRPZHit.id.desc()).limit(limit)
+    rows = (await db.execute(stmt)).scalars().all()
+    return [
+        {
+            "id": str(h.id),
+            "ts": h.ts,
+            "server_id": str(h.server_id) if h.server_id else None,
+            "client_ip": str(h.client_ip) if h.client_ip is not None else None,
+            "qname": h.qname,
+            "trigger": h.trigger,
+            "policy": h.policy,
+            "rpz_zone": h.rpz_zone,
+            "raw": h.raw,
+        }
+        for h in rows
+    ]
