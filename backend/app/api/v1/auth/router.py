@@ -44,6 +44,7 @@ from app.core.auth_throttle import login_rate_limited, mfa_challenge_consume
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.permissions import effective_grants, is_effective_superadmin
 from app.core.request_meta import clean_user_agent, get_trusted_client_ip
+from app.core.responses import XmlResponse
 from app.core.security import (
     create_access_token,
     create_mfa_challenge_token,
@@ -1607,12 +1608,11 @@ async def saml_callback(
 
 @router.get(
     "/{provider_id}/metadata",
-    # Declared media type, not just the wire header (#921): FastAPI
-    # documents a bare ``-> Response`` as application/json, so a generated
-    # client and any strict response validator reject the success path.
-    responses={
-        200: {"content": {"application/xml": {}}, "description": "SAML SP metadata document"}
-    },
+    # ``response_class`` REPLACES the documented application/json (#921);
+    # a ``responses={200: {"content": ...}}`` entry merges with it instead,
+    # leaving the route declaring a JSON body it never produces.
+    response_class=XmlResponse,
+    responses={200: {"description": "SAML SP metadata document"}},
 )
 async def saml_metadata(provider_id: uuid.UUID, request: Request, db: DB) -> Response:
     """Expose the SP metadata XML so admins can register SpatiumDDI with

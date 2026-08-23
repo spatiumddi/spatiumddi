@@ -44,6 +44,7 @@ from app.api.deps import DB, CurrentUser
 from app.api.pagination import MAX_PAGE
 from app.api.v1.probe_guard import enforce_probe_target
 from app.core.permissions import require_permission, user_has_permission
+from app.core.responses import EventStreamResponse
 from app.core.security import decode_access_token
 from app.db import get_db
 from app.models.audit import AuditLog
@@ -563,15 +564,11 @@ async def _resolve_user_from_query_token(db: AsyncSession, token: str, request: 
 
 @router.get(
     "/scans/{scan_id}/stream",
-    # Declared media type, not just the wire header (#921): FastAPI
-    # documents a bare ``-> Response`` as application/json, so a generated
-    # client and any strict response validator reject the success path.
-    responses={
-        200: {
-            "content": {"text/event-stream": {}},
-            "description": "Server-sent event stream of scan progress",
-        }
-    },
+    # ``response_class`` REPLACES the documented application/json (#921);
+    # a ``responses={200: {"content": ...}}`` entry merges with it instead,
+    # leaving the route declaring a JSON body it never produces.
+    response_class=EventStreamResponse,
+    responses={200: {"description": "Server-sent event stream of scan progress"}},
 )
 async def stream_scan(
     scan_id: uuid.UUID,

@@ -110,6 +110,18 @@ def test_value_the_request_never_carried_still_reaches_the_500_path() -> None:
     assert classify_foreign_key_violation(_MISSING, None, {}, "") is None
 
 
+def test_uppercase_guid_from_the_client_still_matches() -> None:
+    """Postgres renders a ``uuid`` in canonical lowercase whatever arrived.
+
+    .NET and PowerShell emit uppercase GUIDs routinely, so a case-sensitive
+    compare answered 422 for one client and 500 for another sending the very
+    same id.
+    """
+    body = b'{"server_group_id": "ABF64806-1111-2222-3333-444455556666"}'
+    result = classify_foreign_key_violation(_MISSING, body, {}, "")
+    assert result is not None and result[0] == 422
+
+
 def test_partially_client_supplied_composite_key_is_not_downgraded() -> None:
     """Half a composite key from the server is still the server's bug."""
     detail = 'Key (a, b)=(from-client, from-server) is not present in table "t".'

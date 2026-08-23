@@ -17,6 +17,15 @@ Detection reads the **handler's source** for the media type it passes and
 compares against the **generated OpenAPI document**, not against
 ``route.response_model``: the document is what a client generator consumes,
 and it is the only place the mismatch is visible.
+
+Two assertions, because the obvious fix only half works. Adding
+``responses={200: {"content": {"application/zip": {}}}}`` **merges** with the
+inferred ``application/json`` rather than replacing it, so the route ends up
+declaring both — the conformance failure goes quiet while a generator is
+still told the endpoint might return JSON, which it never does. Replacing it
+takes ``response_class`` set to a subclass that declares ``media_type``
+(``app/core/responses.py``). So this checks that every served type is
+declared *and* that a non-JSON route does not also declare JSON.
 """
 
 from __future__ import annotations
@@ -79,6 +88,7 @@ def test_non_json_responses_are_declared() -> None:
     document = app.openapi()
 
     undeclared: list[str] = []
+    spurious_json: list[str] = []
     for path, route in _walk(app.routes):
         served = _served_media_types(route)
         if not served:
@@ -93,7 +103,33 @@ def test_non_json_responses_are_declared() -> None:
                 undeclared.append(
                     f"{method} {path} serves {missing} but declares {sorted(declared)}"
                 )
+            if "application/json" in declared:
+                spurious_json.append(
+                    f"{method} {path} serves {sorted(served)} and also declares "
+                    "application/json — set response_class= instead of responses="
+                )
 
     assert not undeclared, "routes serving an undeclared media type:\n  " + "\n  ".join(
         sorted(set(undeclared))
     )
+    assert (
+        not spurious_json
+    ), "routes declaring a JSON success body they never produce:\n  " + "\n  ".join(
+        sorted(set(spurious_json))
+    )
+
+
+def test_typed_response_classes_match_their_names() -> None:
+    """Each helper in ``app.core.responses`` declares a real media type.
+
+    A subclass that forgets ``media_type`` inherits ``None`` from
+    ``Response``, and FastAPI then documents *no* content for the route —
+    which the check above cannot see, because "serves X, declares nothing"
+    and "serves X, declares X" both have X missing from a JSON set that is
+    empty either way.
+    """
+    from app.core import responses as typed
+
+    for name in typed.__all__:
+        media_type = getattr(typed, name).media_type
+        assert media_type and "/" in media_type, f"{name} declares no media type"

@@ -1222,10 +1222,20 @@ suggestion, free-space treemap.
   whole surface found **eleven more** — SSE streams (`/ai/chat`,
   `/nmap/scans/{id}/stream`, `/appliance/cluster/health/stream`), backup and
   DNS zone archives, the SAML metadata document, pod logs, upgrade images and
-  the pcap download. `tests/test_response_media_types.py` compares each
-  handler's own `media_type=` against the **generated OpenAPI document** —
-  not `route.response_model`, which reports clean while the route stays
-  undecodable, the same trap #917's first cut of its guard fell into.
+  the pcap download. **The obvious fix only half works**, which is the part
+  worth remembering: `responses={200: {"content": {…}}}` *merges* with the
+  inferred `application/json` instead of replacing it, so the route quietly
+  declares both — the conformance failure goes away while a generator is
+  still told the endpoint might return JSON. Replacing it takes
+  `response_class` set to a subclass that declares `media_type`
+  (`app/core/responses.py`; a bare `Response` or `StreamingResponse` leaves
+  it `None` and documents *no* content, which is worse). All seventeen routes
+  including #861's three now use it.
+  `tests/test_response_media_types.py` compares each handler's own
+  `media_type=` against the **generated OpenAPI document** — not
+  `route.response_model`, which reports clean while the route stays
+  undecodable, the same trap #917's first cut of its guard fell into — and
+  fails the spurious-JSON case too.
   **(#922) A dangling foreign key answered an unhandled 500.** #861's global
   handler maps unique violations (23505) and deliberately re-raises everything
   else, on the reasoning that NOT NULL / FK / CHECK means *our* bug and a 4xx
@@ -1247,7 +1257,7 @@ suggestion, free-space treemap.
   reproduce, and running the same program found a different real class.** A
   two-pass whole-API fuzz over ~1,150 routes produced **zero** newly-broken
   reads; every write-side 500 it did find reduced to #922. What it found
-  instead was **eight references to columns no model has** — valid Python,
+  instead was **ten references to columns no model has** — valid Python,
   clean under ruff, and clean under mypy for a specific reason worth knowing:
   `attr-defined` is in `disable_error_code` repo-wide (`backend/pyproject.toml`),
   because roughly thirty of its findings are false positives from
@@ -1259,8 +1269,11 @@ suggestion, free-space treemap.
   exists to perform had never once run; `list_dhcp_scopes` /
   `list_dhcp_servers` / `list_dhcp_server_groups` / `list_network_devices`
   had never returned a row since they shipped; and the copilot's
-  `create_dhcp_static` operation raised in **both** its preview and its apply,
-  so proposing a reservation from chat had never worked either. Two guards,
+  `create_dhcp_static` operation raised in **both** its preview and its
+  apply, so proposing a reservation from chat had never worked either. Two
+  more sit in `GET /services/{id}/summary` (`Subnet.ip_block_id` and
+  `Subnet.cidr`, really `block_id` / `network`), which 500'd the L3VPN
+  summary for any service with a linked subnet. Two guards,
   because neither can see the other's half:
   `tests/test_model_attribute_references.py` walks the AST for the
   `Model.attr` spelling in a query, and `tests/test_ai_tool_execution_smoke.py`

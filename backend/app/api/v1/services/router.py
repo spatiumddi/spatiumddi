@@ -760,16 +760,24 @@ async def _l3vpn_summary(db: Any, resources: list[NetworkServiceResource]) -> L3
         # — keep it lightweight and let the IPAM page show the full
         # picture when the operator clicks through.
         block_vrf_id: uuid.UUID | None = None
-        if sn.ip_block_id is not None:
-            blk = await db.get(IPBlock, sn.ip_block_id)
+        # ``block_id`` — Subnet has no ``ip_block_id``, so this raised
+        # AttributeError one line before the ``sn.cidr`` below and the L3VPN
+        # summary 500'd for every service with a linked subnet (#923).
+        if sn.block_id is not None:
+            blk = await db.get(IPBlock, sn.block_id)
             if blk is not None:
                 block_vrf_id = getattr(blk, "vrf_id", None)
         if vrf_obj is not None and block_vrf_id is not None and block_vrf_id != vrf_obj.id:
-            warnings.append(f"subnet {sn.cidr} sits in a different VRF than the service VRF")
+            # ``network``, not ``cidr`` — Subnet has no ``cidr`` column, so
+            # this raised AttributeError and the L3VPN summary 500'd for any
+            # service with a linked subnet whose block sits in another VRF.
+            # Same #923 class as the copilot tools; a router building a
+            # response row is a place neither new guard can see.
+            warnings.append(f"subnet {sn.network} sits in a different VRF than the service VRF")
         edge_subnets.append(
             L3VPNSubnetSummary(
                 id=sn.id,
-                cidr=str(sn.cidr),
+                cidr=str(sn.network),
                 vrf_id=block_vrf_id,
                 role=link.role,
             )

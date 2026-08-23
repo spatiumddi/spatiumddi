@@ -37,6 +37,7 @@ from pydantic import BaseModel, Field
 from app.api.deps import DB, CurrentUser
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.permissions import is_effective_superadmin
+from app.core.responses import ZipResponse
 from app.models.audit import AuditLog
 from app.services.support_bundle import generate
 
@@ -154,12 +155,11 @@ async def preview_support_bundle(
 
 @router.post(
     "",
-    # Declared media type, not just the wire header (#921): FastAPI
-    # documents a bare ``-> Response`` as application/json, so a generated
-    # client and any strict response validator reject the success path.
-    responses={
-        200: {"content": {"application/zip": {}}, "description": "The support-bundle archive"}
-    },
+    # ``response_class`` REPLACES the documented application/json (#921);
+    # a ``responses={200: {"content": ...}}`` entry merges with it instead,
+    # leaving the route declaring a JSON body it never produces.
+    response_class=ZipResponse,
+    responses={200: {"description": "The support-bundle archive"}},
 )
 async def download_support_bundle(
     body: BundleRequest, db: DB, current_user: CurrentUser

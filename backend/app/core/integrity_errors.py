@@ -108,24 +108,31 @@ def _walk_scalars(node: Any, out: set[str]) -> None:
         # and ``str(True)`` == "True" could collide with a real string value.
         return
     else:
-        out.add(str(node))
+        out.add(str(node).casefold())
 
 
 def client_supplied_values(body: bytes | None, path_params: dict[str, Any], query: str) -> set[str]:
-    """Every scalar the request carried, as text, for comparison with DETAIL.
+    """Every scalar the request carried, **casefolded**, for comparison with
+    DETAIL.
 
     Compared as whole tokens rather than by substring: a foreign key whose
     value is ``1`` would otherwise match any body containing the digit, which
     would hand a 4xx to precisely the server-side bug this is careful not to
     mask.
+
+    Casefolded because Postgres renders a ``uuid`` in its own canonical
+    lowercase regardless of how it arrived, while .NET and PowerShell clients
+    emit uppercase GUIDs as a matter of course. A case-sensitive compare
+    therefore answered 422 for one client and 500 for another sending the
+    same id.
     """
-    supplied: set[str] = {str(v) for v in path_params.values()}
+    supplied: set[str] = {str(v).casefold() for v in path_params.values()}
     for pair in (query or "").split("&"):
         if not pair:
             continue
         _, _, raw = pair.partition("=")
         if raw:
-            supplied.add(unquote_plus(raw))
+            supplied.add(unquote_plus(raw).casefold())
     if body:
         try:
             _walk_scalars(json.loads(body), supplied)
@@ -156,7 +163,7 @@ def classify_foreign_key_violation(
     # EVERY offending value must be one the request carried. On a composite
     # key where the server filled half of it, the half we got wrong is still
     # our bug, and answering 4xx would bury it.
-    if not all(value in supplied for value in violation.values):
+    if not all(value.casefold() in supplied for value in violation.values):
         return None
 
     columns = ", ".join(violation.columns)

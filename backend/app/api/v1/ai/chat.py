@@ -25,6 +25,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import desc, select
 
 from app.api.deps import DB, CurrentUser
+from app.core.responses import EventStreamResponse
 from app.models.ai import (
     AIChatMessage,
     AIChatSession,
@@ -253,15 +254,11 @@ def _sse_frame(event_kind: str, data: dict[str, Any]) -> bytes:
 
 @router.post(
     "/chat",
-    # Declared media type, not just the wire header (#921): FastAPI
-    # documents a bare ``-> Response`` as application/json, so a generated
-    # client and any strict response validator reject the success path.
-    responses={
-        200: {
-            "content": {"text/event-stream": {}},
-            "description": "Server-sent event stream of the assistant's reply",
-        }
-    },
+    # ``response_class`` REPLACES the documented application/json (#921);
+    # a ``responses={200: {"content": ...}}`` entry merges with it instead,
+    # leaving the route declaring a JSON body it never produces.
+    response_class=EventStreamResponse,
+    responses={200: {"description": "Server-sent event stream of the assistant's reply"}},
 )
 async def chat(body: ChatTurnRequest, current_user: CurrentUser, db: DB) -> StreamingResponse:
     """Stream one turn of the chat conversation back as SSE events.

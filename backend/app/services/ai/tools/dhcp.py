@@ -42,7 +42,7 @@ class ListDHCPServersArgs(BaseModel):
     name="list_dhcp_servers",
     description=(
         "List DHCP servers (Kea / Windows DHCP). Each summary "
-        "includes name, group, server type, and HA state."
+        "includes name, group, driver, operational status, and HA state."
     ),
     args_model=ListDHCPServersArgs,
     category="dhcp",
@@ -257,7 +257,7 @@ class ListServerGroupsArgs(BaseModel):
     description=(
         "List DHCP server groups (logical bundles of Kea servers, "
         "with HA implicit when the group has ≥ 2 members). Each "
-        "summary includes name, member count, DDNS toggle, "
+        "summary includes name, member count, HA mode, "
         "dhcp_socket_mode ('direct' = raw sockets that hear broadcast "
         "DISCOVERs from on-LAN clients; 'relay' = udp, relay-only), and the "
         "group-wide Kea lease cache (lease_cache_threshold 0.0 = disabled / "

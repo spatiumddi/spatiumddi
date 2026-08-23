@@ -246,22 +246,30 @@ response it does not produce, so a generated client cannot decode the 200 and
 a strict validator rejects it — schemathesis reports *"Undocumented
 Content-Type — Received: application/zip, Documented: application/json"*.
 
-Declare it on the decorator:
+Set `response_class` to one of the typed helpers in `app/core/responses.py`:
 
 ```python
-@router.post(
-    "",
-    responses={200: {"content": {"application/zip": {}}, "description": "The archive"}},
-)
+from app.core.responses import ZipResponse
+
+@router.post("", response_class=ZipResponse, responses={200: {"description": "The archive"}})
 async def download_support_bundle(...) -> Response:
     return Response(content=blob, media_type="application/zip")
 ```
 
+**`response_class`, not `responses={200: {"content": ...}}`.** The latter —
+the shape #861 first used — *merges* with the inferred `application/json`
+rather than replacing it, so the route ends up declaring both. That silences
+the conformance failure while still telling a generator the endpoint might
+return JSON, which it never does. It also has to be a subclass that declares
+`media_type`: a bare `Response` or `StreamingResponse` leaves it `None` and
+FastAPI then documents *no* content at all.
+
 `backend/tests/test_response_media_types.py` compares each handler's own
-`media_type=` against the generated document and fails on any route that
-serves something it did not declare. Fourteen routes were in that state when
-#921 was filed — three `export.pdf` routes had been fixed one at a time in
-#861, and the sweep found eleven more.
+`media_type=` against the generated document and fails a route that serves
+something it did not declare **or** that declares `application/json`
+alongside a non-JSON body. Fourteen routes were in the first state when #921
+was filed — three `export.pdf` routes had been fixed one at a time in #861,
+and the sweep found eleven more; all seventeen now use `response_class`.
 
 ### 2.4 Copilot tools and REST routes are two views of one capability
 

@@ -26,6 +26,7 @@ from app.api.deps import DB, CurrentUser
 from app.core.crypto import encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.permissions import is_effective_superadmin
+from app.core.responses import ZipResponse
 from app.models.audit import AuditLog
 from app.models.backup import BackupTarget
 from app.services.backup.runner import run_backup_for_target
@@ -512,10 +513,11 @@ async def list_target_archives(
 
 @router.get(
     "/{target_id}/archives/latest/download",
-    # Declared media type, not just the wire header (#921): FastAPI
-    # documents a bare ``-> Response`` as application/json, so a generated
-    # client and any strict response validator reject the success path.
-    responses={200: {"content": {"application/zip": {}}, "description": "Backup archive"}},
+    # ``response_class`` REPLACES the documented application/json (#921);
+    # a ``responses={200: {"content": ...}}`` entry merges with it instead,
+    # leaving the route declaring a JSON body it never produces.
+    response_class=ZipResponse,
+    responses={200: {"description": "Backup archive"}},
 )
 async def download_latest_target_archive(
     target_id: uuid.UUID,
@@ -566,10 +568,11 @@ async def download_latest_target_archive(
 
 @router.get(
     "/{target_id}/archives/{filename}/download",
-    # Declared media type, not just the wire header (#921): FastAPI
-    # documents a bare ``-> Response`` as application/json, so a generated
-    # client and any strict response validator reject the success path.
-    responses={200: {"content": {"application/zip": {}}, "description": "Backup archive"}},
+    # ``response_class`` REPLACES the documented application/json (#921);
+    # a ``responses={200: {"content": ...}}`` entry merges with it instead,
+    # leaving the route declaring a JSON body it never produces.
+    response_class=ZipResponse,
+    responses={200: {"description": "Backup archive"}},
 )
 async def download_target_archive(
     target_id: uuid.UUID,

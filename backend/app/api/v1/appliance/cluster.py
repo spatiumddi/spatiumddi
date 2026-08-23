@@ -28,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB
 from app.core.permissions import require_permission
+from app.core.responses import EventStreamResponse
 from app.db import AsyncSessionLocal
 from app.models.appliance import APPLIANCE_STATE_APPROVED, Appliance
 from app.services.appliance import k8s
@@ -175,15 +176,11 @@ async def cluster_health(db: DB) -> ClusterHealth:
 
 @router.get(
     "/health/stream",
-    # Declared media type, not just the wire header (#921): FastAPI
-    # documents a bare ``-> Response`` as application/json, so a generated
-    # client and any strict response validator reject the success path.
-    responses={
-        200: {
-            "content": {"text/event-stream": {}},
-            "description": "Server-sent event stream of cluster health",
-        }
-    },
+    # ``response_class`` REPLACES the documented application/json (#921);
+    # a ``responses={200: {"content": ...}}`` entry merges with it instead,
+    # leaving the route declaring a JSON body it never produces.
+    response_class=EventStreamResponse,
+    responses={200: {"description": "Server-sent event stream of cluster health"}},
     dependencies=[Depends(require_permission("read", "appliance"))],
     summary="Stream cluster health snapshots as SSE (~2s cadence)",
 )

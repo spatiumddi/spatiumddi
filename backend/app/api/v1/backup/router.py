@@ -34,6 +34,7 @@ from pydantic import BaseModel
 from app.api.deps import DB, CurrentUser
 from app.config import settings
 from app.core.permissions import is_effective_superadmin
+from app.core.responses import ZipResponse
 from app.models.audit import AuditLog
 from app.services.backup import (
     BackupArchiveError,
@@ -111,10 +112,11 @@ async def list_backup_sections(current_user: CurrentUser) -> BackupSectionCatalo
 
 @router.post(
     "/create-and-download",
-    # Declared media type, not just the wire header (#921): FastAPI
-    # documents a bare ``-> Response`` as application/json, so a generated
-    # client and any strict response validator reject the success path.
-    responses={200: {"content": {"application/zip": {}}, "description": "Backup archive"}},
+    # ``response_class`` REPLACES the documented application/json (#921);
+    # a ``responses={200: {"content": ...}}`` entry merges with it instead,
+    # leaving the route declaring a JSON body it never produces.
+    response_class=ZipResponse,
+    responses={200: {"description": "Backup archive"}},
 )
 async def create_and_download_backup(
     db: DB,

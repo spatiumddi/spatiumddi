@@ -31,6 +31,7 @@ from sqlalchemy import delete, desc, func, select
 
 from app.api.deps import DB, CurrentUser
 from app.core.permissions import user_has_permission
+from app.core.responses import PdfResponse
 from app.models.audit import AuditLog
 from app.models.conformity import ConformityPolicy, ConformityResult
 from app.services.conformity import evaluate_policy
@@ -530,7 +531,11 @@ async def summary(db: DB, current_user: CurrentUser) -> SummaryResponse:
     # `-> Response` as application/json, so the (correctly sent)
     # application/pdf was undocumented and schema-conformance clients flagged
     # every response (schemathesis UndefinedContentType, 13/13 runs).
-    responses={200: {"content": {"application/pdf": {}}, "description": "PDF conformity report"}},
+    # ``response_class`` rather than a ``responses={200: {"content": ...}}``
+    # entry (#921): that entry MERGES with the inferred application/json, so
+    # the route still declared a JSON body it never produces.
+    response_class=PdfResponse,
+    responses={200: {"description": "PDF conformity report"}},
 )
 async def export_pdf(
     db: DB,

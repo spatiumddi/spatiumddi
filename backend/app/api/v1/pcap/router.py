@@ -39,6 +39,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import DB, CurrentUser
 from app.api.pagination import MAX_PAGE
 from app.core.permissions import require_permission
+from app.core.responses import PcapResponse
 from app.models.appliance import APPLIANCE_STATE_APPROVED, Appliance
 from app.models.audit import AuditLog
 from app.models.pcap import PacketCapture
@@ -430,15 +431,11 @@ async def bulk_delete_captures(
 
 @router.get(
     "/captures/{capture_id}/download",
-    # Declared media type, not just the wire header (#921): FastAPI
-    # documents a bare ``-> Response`` as application/json, so a generated
-    # client and any strict response validator reject the success path.
-    responses={
-        200: {
-            "content": {"application/vnd.tcpdump.pcap": {}, "application/octet-stream": {}},
-            "description": "The capture file",
-        }
-    },
+    # ``response_class`` REPLACES the documented application/json (#921);
+    # a ``responses={200: {"content": ...}}`` entry merges with it instead,
+    # leaving the route declaring a JSON body it never produces.
+    response_class=PcapResponse,
+    responses={200: {"description": "The capture file"}},
     dependencies=[Depends(require_permission("read", PERMISSION))],
 )
 async def download_capture(

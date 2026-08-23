@@ -12,6 +12,7 @@ from fastapi.responses import Response
 
 from app.api.deps import DB, CurrentUser
 from app.core.permissions import user_has_permission
+from app.core.responses import PdfResponse
 from app.services.ipam.address_set_gate import (
     load_writable_set_ranges,
     user_can_write_ip,
@@ -227,7 +228,11 @@ async def import_addresses_commit(
     # `-> Response` as application/json, so the (correctly sent)
     # application/pdf was undocumented and schema-conformance clients flagged
     # every response (schemathesis UndefinedContentType, 13/13 runs).
-    responses={200: {"content": {"application/pdf": {}}, "description": "PDF IPAM report"}},
+    # ``response_class`` rather than a ``responses={200: {"content": ...}}``
+    # entry (#921): that entry MERGES with the inferred application/json, so
+    # the route still declared a JSON body it never produces.
+    response_class=PdfResponse,
+    responses={200: {"description": "PDF IPAM report"}},
 )
 async def export_pdf_endpoint(
     current_user: CurrentUser,
