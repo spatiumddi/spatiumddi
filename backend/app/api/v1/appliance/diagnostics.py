@@ -18,6 +18,7 @@ from fastapi.responses import StreamingResponse
 
 from app.api.deps import DB, CurrentUser
 from app.core.permissions import require_permission
+from app.core.responses import ZipResponse
 from app.models.audit import AuditLog
 from app.services.appliance.diagnostics import (
     generate_diagnostic_bundle,
@@ -76,6 +77,11 @@ async def post_self_test() -> dict:
 
 @router.get(
     "/bundle",
+    # ``response_class`` REPLACES the documented application/json (#921);
+    # a ``responses={200: {"content": ...}}`` entry merges with it instead,
+    # leaving the route declaring a JSON body it never produces.
+    response_class=ZipResponse,
+    responses={200: {"description": "Diagnostics archive"}},
     dependencies=[Depends(require_permission("admin", "appliance"))],
     summary="Download a diagnostic bundle (zip)",
 )

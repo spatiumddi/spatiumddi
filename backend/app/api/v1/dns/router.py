@@ -45,6 +45,7 @@ from app.core.permissions import (
     require_any_resource_permission,
     token_scope_allows,
 )
+from app.core.responses import DnsZoneResponse, ZipResponse
 from app.drivers.dns import _DRIVERS as _DNS_DRIVERS
 from app.drivers.dns import (
     CREDENTIALED_DNS_DRIVERS,
@@ -3844,7 +3845,14 @@ async def create_zone(
     return zone
 
 
-@router.get("/groups/{group_id}/zones/export")
+@router.get(
+    "/groups/{group_id}/zones/export",
+    # ``response_class`` REPLACES the documented application/json (#921);
+    # a ``responses={200: {"content": ...}}`` entry merges with it instead,
+    # leaving the route declaring a JSON body it never produces.
+    response_class=ZipResponse,
+    responses={200: {"description": "Zone files as a zip archive"}},
+)
 async def export_all_zones(
     group_id: uuid.UUID,
     db: DB,
@@ -6797,7 +6805,14 @@ async def sync_zone_with_server_endpoint(
     )
 
 
-@router.get("/groups/{group_id}/zones/{zone_id}/export")
+@router.get(
+    "/groups/{group_id}/zones/{zone_id}/export",
+    # ``response_class`` REPLACES the documented application/json (#921);
+    # a ``responses={200: {"content": ...}}`` entry merges with it instead,
+    # leaving the route declaring a JSON body it never produces.
+    response_class=DnsZoneResponse,
+    responses={200: {"description": "Zone file in master-file format"}},
+)
 async def export_zone(
     group_id: uuid.UUID,
     zone_id: uuid.UUID,

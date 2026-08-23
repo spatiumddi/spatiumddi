@@ -214,10 +214,28 @@ rendered/
     spatium-blocklist.rpz
 tsig/
   ddns.key                       # 0600, owned by agent user; read by named via include
+                                 #   ALL bundle keys, not just the group key: an
+                                 #   operator DNSTSIGKey can be named in a zone's
+                                 #   update ACL and in the allow-transfer grant,
+                                 #   and BIND rejects a config naming a key it has
+                                 #   no definition for
 ops/
   inflight/                      # one file per unacked RecordOp
   failed/                        # ops that exhausted retries (surfaced in heartbeat)
 ```
+
+> **Every path in the rendered `named.conf` is derived from the state dir**
+> (`AGENT_STATE_DIR`, default `/var/lib/spatium-dns-agent`) — zone files,
+> `rndc.key`, the DoT/DoH cert and the `include` for `tsig/ddns.key`. The key
+> include was the one exception until #920: hardcoded to the default path, so
+> under a non-default state dir the agent wrote the key file to one place and
+> told `named` to read another. If nothing exists at the default path that is
+> a loud `named-checkconf` failure; if something *does* — a leftover from an
+> earlier layout — it is silent, because the config validates, the apply
+> reports `ok`, and `named` simply holds a stale key set. Every TSIG-signed
+> transfer then fails `BADKEY` with nothing anywhere reporting a problem.
+> `agent/dns/tests/live_axfr_check.py` now asserts the include resolves to the
+> render's own state dir, and covers the operator-key-only group shape.
 
 **Offline operation**: if the control plane is unreachable on boot, the agent loads `config/current.json`, renders configs if not already rendered, starts the daemon, and continues serving DNS. It enters a retry loop and resumes sync when the control plane returns. No query path ever depends on control-plane reachability.
 

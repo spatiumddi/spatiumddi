@@ -139,9 +139,16 @@ def assert_safe_target(
             # sockaddr[0] is the address string (AF_INET: (host, port);
             # AF_INET6: (host, port, flow, scope)) — str() pins the type.
             resolved = sorted({str(info[4][0]) for info in infos})
-        except OSError as exc:
+        except (OSError, UnicodeError) as exc:
             # Resolution failed — let the downstream connect surface the
             # real error; we just record that we tried.
+            #
+            # UnicodeError as well as OSError (#923): a hostname with a label
+            # over 63 characters fails IDNA encoding with
+            # ``UnicodeError: label too long``, which subclasses ValueError
+            # and NOT OSError — so it escaped this handler and 500'd. This
+            # guard is on the operator-supplied-host path of every outbound
+            # integration, so that was one unhandled 500 per caller, not one.
             logger.debug("ssrf_guard_resolve_failed", label=label, host=host, error=str(exc))
             return []
 

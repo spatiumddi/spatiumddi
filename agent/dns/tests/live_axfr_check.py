@@ -43,6 +43,9 @@ from pathlib import Path
 _SECRET = "c2VjcmV0c2VjcmV0c2VjcmV0c2VjcmV0MDE="
 _KEY = "spatium-live-check"
 _OTHER_KEY = "operator-second-key"
+# Deliberately a dotted, FQDN-shaped name — the form operators actually use
+# for a DNSTSIGKey, and the one #920 was reported against.
+_OPERATOR_KEY = "tsig-update.operator.example"
 _ZONE = "live.example."
 _PORT = 15353
 
@@ -55,7 +58,7 @@ def check(label: str, ok: bool, detail: str = "") -> None:
         _FAILURES.append(label)
 
 
-def _bundle() -> dict:
+def _bundle(tsig_keys: list[dict] | None = None) -> dict:
     return {
         "options": {
             "forwarders": [],
@@ -67,7 +70,9 @@ def _bundle() -> dict:
             # unreadable by anyone — which is the bug.
             "allow_transfer": ["none"],
         },
-        "tsig_keys": [
+        "tsig_keys": tsig_keys
+        if tsig_keys is not None
+        else [
             {"name": _KEY, "secret": _SECRET, "algorithm": "hmac-sha256"},
             {"name": _OTHER_KEY, "secret": _SECRET, "algorithm": "hmac-sha256"},
         ],
@@ -102,6 +107,16 @@ def _wait_for_port(port: int, timeout: float = 20.0) -> bool:
     return False
 
 
+def _wait_for_port_free(port: int, timeout: float = 10.0) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1):
+                time.sleep(0.2)
+        except OSError:
+            return
+
+
 def _xfr(keyname: str | None, secret: str = _SECRET, algorithm: str = "hmac-sha256"):
     """Attempt an AXFR. Returns (ok, detail)."""
     import dns.name
@@ -129,19 +144,12 @@ def _xfr(keyname: str | None, secret: str = _SECRET, algorithm: str = "hmac-sha2
         return False, type(exc).__name__
 
 
-def main() -> int:
-    named = shutil.which("named")
-    if not named:
-        print("FAIL: `named` not on PATH — this must run inside the bind9 agent image")
-        return 1
-    try:
-        from spatium_dns_agent.drivers.bind9 import Bind9Driver
-    except ImportError as exc:
-        print(f"FAIL: agent package not importable ({exc})")
-        return 1
+def _render(bundle: dict) -> tuple[Path, Path]:
+    """Render ``bundle`` into a fresh state dir. Returns (state, named.conf)."""
+    from spatium_dns_agent.drivers.bind9 import Bind9Driver  # noqa: PLC0415
 
     state = Path(tempfile.mkdtemp(prefix="axfr-check-"))
-    Bind9Driver(state_dir=state).render(_bundle())
+    Bind9Driver(state_dir=state).render(bundle)
     # ``render`` stages into ``rendered.new`` while the zone-file paths it
     # writes into named.conf point at the promoted ``rendered`` directory —
     # the agent renames one to the other before starting the daemon. Do the
@@ -153,23 +161,33 @@ def main() -> int:
     conf = rendered / "named.conf"
     text = conf.read_text()
 
-    # The rendered config includes the key file by its production absolute
-    # path. Point it at the one render() just wrote instead of copying into
-    # /var, so the check never depends on the container's state volume.
-    text = text.replace(
-        '"/var/lib/spatium-dns-agent/tsig/ddns.key"', f'"{state / "tsig" / "ddns.key"}"'
+    # #920: the key include is derived from state_dir, so it already points at
+    # the file render() just wrote. Assert that rather than rewriting it — a
+    # hardcoded path here would send named to a DIFFERENT install's key file,
+    # which passes named-checkconf and then fails every transfer BADKEY.
+    expected_include = f'include "{state / "tsig" / "ddns.key"}";'
+    check(
+        "key include points at this render's own state dir",
+        expected_include in text,
+        expected_include,
     )
-    # named needs a writable working directory it owns.
-    text = text.replace('directory "/var/cache/bind";', f'directory "{state}";')
-    conf.write_text(text)
 
-    print("Rendered named.conf transfer policy:")
+    # named needs a writable working directory it owns.
+    conf.write_text(text.replace('directory "/var/cache/bind";', f'directory "{state}";'))
+    return state, conf
+
+
+def _run_case(label: str, bundle: dict, expectations) -> None:
+    """Start named on ``bundle`` and run ``expectations`` against it."""
+    print(f"\n=== {label} ===")
+    state, conf = _render(bundle)
+    text = conf.read_text()
     for line in text.splitlines():
         if "allow-transfer" in line:
             print(f"    {line.strip()[:120]}")
 
     proc = subprocess.Popen(  # noqa: S603 — fixed argv, no shell
-        [named, "-c", str(conf), "-f", "-g", "-p", str(_PORT)],
+        [shutil.which("named") or "named", "-c", str(conf), "-f", "-g", "-p", str(_PORT)],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -178,11 +196,33 @@ def main() -> int:
         if not _wait_for_port(_PORT):
             proc.terminate()
             out = proc.communicate(timeout=10)[0]
-            print(f"FAIL: named never listened on {_PORT}\n{out[-3000:]}")
-            return 1
+            check(f"{label}: named listened on {_PORT}", False, out[-2000:])
+            return
+        expectations()
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        # named holds the port briefly after exit; the next case rebinds it.
+        _wait_for_port_free(_PORT)
+        shutil.rmtree(state, ignore_errors=True)
 
-        print(f"\nnamed {('up on port ' + str(_PORT))}; transfer matrix:")
 
+def main() -> int:
+    if not shutil.which("named"):
+        print("FAIL: `named` not on PATH — this must run inside the bind9 agent image")
+        return 1
+    try:
+        # Same ``from`` form ``_render`` uses — importing one module both
+        # ways trips a code-quality check and reads as two dependencies.
+        from spatium_dns_agent.drivers.bind9 import Bind9Driver  # noqa: F401,PLC0415
+    except ImportError as exc:
+        print(f"FAIL: agent package not importable ({exc})")
+        return 1
+
+    def group_key_expectations() -> None:
         ok, detail = _xfr(_KEY)
         check("signed with the group key returns the zone", ok, detail)
 
@@ -202,13 +242,34 @@ def main() -> int:
 
         ok, detail = _xfr("never-granted-key")
         check("a key the server never granted is rejected", not ok, detail)
-    finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-        shutil.rmtree(state, ignore_errors=True)
+
+    def operator_only_expectations() -> None:
+        ok, detail = _xfr(_OPERATOR_KEY)
+        check("operator-only: signed with the operator key returns the zone", ok, detail)
+
+        ok, detail = _xfr(None)
+        check("operator-only: unsigned is REFUSED", not ok, detail)
+
+        # The distinction #920 turns on. A key named in named.conf answers
+        # BADSIG for a wrong secret; a key named NOWHERE answers BADKEY. So
+        # "wrong secret is rejected" passing here is what proves the operator
+        # key was actually rendered, rather than the transfer failing for the
+        # unrelated reason that named has never heard of it.
+        ok, detail = _xfr(_OPERATOR_KEY, secret="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+        check("operator-only: wrong secret is rejected", not ok, detail)
+
+    _run_case("group legacy key + operator key", _bundle(), group_key_expectations)
+
+    # #920 — a group whose ONLY TSIG material is an operator DNSTSIGKey row.
+    # This shape arises when a server is adopted into an existing group rather
+    # than direct-registered, since only registration auto-mints the legacy
+    # group key. ``tsig_keys[0]`` is then an operator key, which is the head
+    # the control plane's ``resolve_group_transfer_key`` also picks.
+    _run_case(
+        "operator key only (no legacy group key)",
+        _bundle([{"name": _OPERATOR_KEY, "secret": _SECRET, "algorithm": "hmac-sha256"}]),
+        operator_only_expectations,
+    )
 
     if _FAILURES:
         print(f"\n{len(_FAILURES)} expectation(s) failed: {', '.join(_FAILURES)}")

@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from app.api.deps import CurrentUser
 from app.core.permissions import require_any_resource_permission
+from app.services.nettools.schemas import assert_target_allowed
 
 router = APIRouter(
     prefix="/tools",
@@ -62,8 +63,32 @@ class PropagationCheckRequest(BaseModel):
         try:
             dns.name.from_text(v)
         except dns.exception.DNSException:
-            raise ValueError("Not a valid DNS name")
+            raise ValueError("Not a valid DNS name") from None
         return v.rstrip(".")
+
+    @field_validator("resolvers")
+    @classmethod
+    def _validate_resolvers(cls, v: list[str] | None) -> list[str] | None:
+        """Each override must be an IP literal, and one we are allowed to
+        query (#923).
+
+        Two separate reasons, and both are needed. ``Resolver.nameservers``
+        accepts an address or an https URL and raises a bare ``ValueError``
+        for anything else — reached from inside the ``gather``, that is an
+        unhandled 500 rather than the per-resolver ``error`` status every
+        other failure mode returns.
+
+        And a resolver is a host **this server sends traffic to**, so it goes
+        through the same SSRF denylist ``/tools/dns-propagation`` applies to
+        its own resolver list (``nettools/schemas.py::_v_resolvers``). Without
+        it, an authenticated caller could aim the control plane at loopback or
+        at 169.254.169.254 and read the timing and answers back out of the
+        per-resolver result — a probe of the internal network wearing the
+        shape of a propagation check.
+        """
+        if v is None:
+            return v
+        return [assert_target_allowed(entry.strip()) for entry in v]
 
     @field_validator("record_type")
     @classmethod

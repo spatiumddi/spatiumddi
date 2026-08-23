@@ -8,6 +8,7 @@ from sqlalchemy import func, select
 
 from app.api.deps import DB
 from app.core.permissions import require_permission
+from app.core.responses import PdfResponse
 from app.models.audit import AuditLog
 from app.services.audit_chain import verify_chain
 from app.services.audit_report import generate_change_report_pdf
@@ -90,7 +91,11 @@ async def list_audit_log(
     # `-> Response` as application/json, so the (correctly sent)
     # application/pdf was undocumented and schema-conformance clients flagged
     # every response (schemathesis UndefinedContentType, 13/13 runs).
-    responses={200: {"content": {"application/pdf": {}}, "description": "PDF change report"}},
+    # ``response_class`` rather than a ``responses={200: {"content": ...}}``
+    # entry (#921): that entry MERGES with the inferred application/json, so
+    # the route still declared a JSON body it never produces.
+    response_class=PdfResponse,
+    responses={200: {"description": "PDF change report"}},
 )
 async def export_change_report_pdf(
     db: DB,

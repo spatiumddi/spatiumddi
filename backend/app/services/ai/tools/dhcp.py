@@ -27,6 +27,7 @@ from app.models.dhcp import (
     DHCPStaticAssignment,
 )
 from app.models.dhcp_fingerprint import DHCPFingerprint
+from app.models.ipam import Subnet
 from app.models.metrics import DHCPMetricSample
 from app.services.ai.tools.base import register_tool
 from app.services.dhcp.stats import STATS_WINDOW_SECONDS, active_lease_count
@@ -41,7 +42,7 @@ class ListDHCPServersArgs(BaseModel):
     name="list_dhcp_servers",
     description=(
         "List DHCP servers (Kea / Windows DHCP). Each summary "
-        "includes name, group, server type, and HA state."
+        "includes name, group, driver, operational status, and HA state."
     ),
     args_model=ListDHCPServersArgs,
     category="dhcp",
@@ -51,16 +52,25 @@ async def list_dhcp_servers(
 ) -> list[dict[str, Any]]:
     stmt = select(DHCPServer)
     if args.group_id:
-        stmt = stmt.where(DHCPServer.group_id == args.group_id)
+        # ``server_group_id`` — DHCPServer has no ``group_id`` column, so the
+        # old spelling raised AttributeError and this tool 500'd whenever a
+        # group filter was supplied (#923).
+        stmt = stmt.where(DHCPServer.server_group_id == args.group_id)
     stmt = stmt.order_by(DHCPServer.name.asc())
     rows = (await db.execute(stmt)).scalars().all()
     return [
         {
             "id": str(s.id),
             "name": s.name,
-            "group_id": str(s.group_id) if s.group_id else None,
-            "server_type": s.server_type,
-            "is_enabled": s.is_enabled,
+            # #923: ``group_id`` / ``server_type`` / ``is_enabled`` are not
+            # columns on DHCPServer, so building this row raised
+            # AttributeError and the tool answered nothing for any input —
+            # not just for the group filter. ``driver`` is what the old
+            # "server_type" meant, and there is no enable flag; ``status`` is
+            # the operational state a caller actually wants.
+            "group_id": str(s.server_group_id) if s.server_group_id else None,
+            "driver": s.driver,
+            "status": s.status,
             "ha_state": s.ha_state,
         }
         for s in rows
@@ -88,7 +98,16 @@ class ListDHCPScopesArgs(BaseModel):
 async def list_dhcp_scopes(
     db: AsyncSession, user: User, args: ListDHCPScopesArgs
 ) -> list[dict[str, Any]]:
-    stmt = select(DHCPScope).where(DHCPScope.deleted_at.is_(None))
+    # The CIDR is NOT on DHCPScope — it has ``subnet_id`` and the prefix lives
+    # on the related Subnet. The old code read ``DHCPScope.subnet`` for the
+    # search, the sort AND the response, so this tool raised AttributeError on
+    # the ``order_by`` alone and had never returned a scope (#923). Joining
+    # Subnet makes all three work and keeps the CIDR filter in SQL.
+    stmt = (
+        select(DHCPScope, Subnet.network)
+        .join(Subnet, Subnet.id == DHCPScope.subnet_id)
+        .where(DHCPScope.deleted_at.is_(None))
+    )
     if args.group_id:
         stmt = stmt.where(DHCPScope.group_id == args.group_id)
     if args.search:
@@ -96,16 +115,17 @@ async def list_dhcp_scopes(
         stmt = stmt.where(
             or_(
                 func.lower(DHCPScope.name).like(like),
-                func.text(DHCPScope.subnet).like(like),
+                # ``network`` is a CIDR column; cast to text so LIKE applies.
+                func.text(Subnet.network).like(like),
             )
         )
-    stmt = stmt.order_by(DHCPScope.subnet.asc()).limit(args.limit)
-    rows = (await db.execute(stmt)).scalars().all()
+    stmt = stmt.order_by(Subnet.network.asc()).limit(args.limit)
+    rows = (await db.execute(stmt)).all()
     return [
         {
             "id": str(s.id),
             "group_id": str(s.group_id) if s.group_id else None,
-            "subnet": str(s.subnet),
+            "subnet": str(network),
             "name": s.name,
             "address_family": s.address_family,
             "v6_address_mode": getattr(s, "v6_address_mode", "stateful"),
@@ -117,7 +137,7 @@ async def list_dhcp_scopes(
             "lease_cache_threshold": s.lease_cache_threshold,
             "lease_cache_max_age": s.lease_cache_max_age,
         }
-        for s in rows
+        for s, network in rows
     ]
 
 
@@ -237,7 +257,7 @@ class ListServerGroupsArgs(BaseModel):
     description=(
         "List DHCP server groups (logical bundles of Kea servers, "
         "with HA implicit when the group has ≥ 2 members). Each "
-        "summary includes name, member count, DDNS toggle, "
+        "summary includes name, member count, HA mode, "
         "dhcp_socket_mode ('direct' = raw sockets that hear broadcast "
         "DISCOVERs from on-LAN clients; 'relay' = udp, relay-only), and the "
         "group-wide Kea lease cache (lease_cache_threshold 0.0 = disabled / "
@@ -259,13 +279,19 @@ async def list_dhcp_server_groups(
     out: list[dict[str, Any]] = []
     for g in rows:
         member_count = await db.scalar(
-            select(func.count(DHCPServer.id)).where(DHCPServer.group_id == g.id)
+            select(func.count(DHCPServer.id)).where(DHCPServer.server_group_id == g.id)
         )
         out.append(
             {
                 "id": str(g.id),
                 "name": g.name,
-                "ddns_enabled": g.ddns_enabled,
+                # #923: DHCPServerGroup carries no ``ddns_enabled`` column —
+                # DDNS is configured per scope and inherited down the IPAM
+                # chain, not on the server group — so reading it raised
+                # AttributeError and this tool answered nothing at all.
+                # ``mode`` (the HA mode) is the group-level fact a caller
+                # asking about a server group actually needs.
+                "mode": g.mode,
                 # #365 — "direct" (raw sockets, hears broadcast DISCOVERs) or
                 # "relay" (udp sockets, relay-only). Helps the copilot answer
                 # "why isn't this DHCP server replying to direct clients?".

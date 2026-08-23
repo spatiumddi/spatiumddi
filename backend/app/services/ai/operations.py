@@ -2595,10 +2595,21 @@ async def _preview_create_dhcp_static(
     db: AsyncSession, user: User, args: CreateDHCPStaticArgs
 ) -> PreviewResult:
     from app.models.dhcp import DHCPScope, DHCPStaticAssignment
+    from app.models.ipam import Subnet
 
     scope = await db.get(DHCPScope, args.scope_id)
     if scope is None:
         return PreviewResult(ok=False, detail=f"DHCP scope {args.scope_id} not found.")
+
+    # #923: the CIDR is on the related Subnet, not on DHCPScope — the scope
+    # carries only ``subnet_id``. Reading ``scope.subnet`` raised
+    # AttributeError, so this operation's preview AND apply both 500'd on
+    # every call and creating a reservation from the copilot never worked.
+    subnet = await db.get(Subnet, scope.subnet_id)
+    if subnet is None:
+        return PreviewResult(
+            ok=False, detail=f"DHCP scope {args.scope_id} has no subnet to validate against."
+        )
 
     try:
         addr_obj = ipaddress.ip_address(args.ip_address)
@@ -2606,13 +2617,13 @@ async def _preview_create_dhcp_static(
         return PreviewResult(ok=False, detail=f"Invalid IP {args.ip_address!r}.")
 
     try:
-        net = ipaddress.ip_network(str(scope.subnet), strict=False)
+        net = ipaddress.ip_network(str(subnet.network), strict=False)
     except ValueError:
-        return PreviewResult(ok=False, detail=f"Scope subnet {scope.subnet!r} is unparseable.")
+        return PreviewResult(ok=False, detail=f"Scope subnet {subnet.network!r} is unparseable.")
     if addr_obj not in net:
         return PreviewResult(
             ok=False,
-            detail=(f"IP {args.ip_address} is outside scope subnet {scope.subnet}."),
+            detail=(f"IP {args.ip_address} is outside scope subnet {subnet.network}."),
         )
 
     # Conflict probe — do NOT reject in preview; surface as a hint so
@@ -2633,7 +2644,7 @@ async def _preview_create_dhcp_static(
         suffix = " — note: a static for this IP or MAC already exists; apply will fail"
 
     parts = [
-        f"Create DHCP static reservation in scope `{scope.name or scope.subnet}`",
+        f"Create DHCP static reservation in scope `{scope.name or subnet.network}`",
         f"ip={args.ip_address}",
         f"mac={args.mac_address}",
     ]
@@ -2650,6 +2661,7 @@ async def _apply_create_dhcp_static(
 ) -> dict[str, Any]:
     from app.api.v1.dhcp._audit import write_audit
     from app.models.dhcp import DHCPScope, DHCPStaticAssignment
+    from app.models.ipam import Subnet
 
     # SECURITY (#400, C2): RBAC backstop — matches the DHCP statics
     # router's require_resource_permission("dhcp_static") write gate.
@@ -2659,10 +2671,15 @@ async def _apply_create_dhcp_static(
     if scope is None:
         raise ValueError(f"DHCP scope {args.scope_id} not found.")
 
+    # #923 — see the preview above: the prefix lives on the related Subnet.
+    subnet = await db.get(Subnet, scope.subnet_id)
+    if subnet is None:
+        raise ValueError(f"DHCP scope {args.scope_id} has no subnet to validate against.")
+
     addr_obj = ipaddress.ip_address(args.ip_address)
-    net = ipaddress.ip_network(str(scope.subnet), strict=False)
+    net = ipaddress.ip_network(str(subnet.network), strict=False)
     if addr_obj not in net:
-        raise ValueError(f"IP {args.ip_address} is outside scope subnet {scope.subnet}.")
+        raise ValueError(f"IP {args.ip_address} is outside scope subnet {subnet.network}.")
 
     row = DHCPStaticAssignment(
         scope_id=scope.id,

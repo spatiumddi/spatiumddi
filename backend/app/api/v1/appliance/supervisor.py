@@ -71,6 +71,7 @@ from app.core.agent_wake import (
     wake_subscription,
 )
 from app.core.permissions import is_effective_superadmin, require_permission
+from app.core.responses import PlainTextStreamResponse
 from app.models.appliance import (
     APPLIANCE_STATE_APPROVED,
     APPLIANCE_STATE_PENDING_APPROVAL,
@@ -6307,6 +6308,11 @@ async def k8s_list_pods(
 
 @router.get(
     "/appliances/{appliance_id}/k8s/logs",
+    # ``response_class`` REPLACES the documented application/json (#921);
+    # a ``responses={200: {"content": ...}}`` entry merges with it instead,
+    # leaving the route declaring a JSON body it never produces.
+    response_class=PlainTextStreamResponse,
+    responses={200: {"description": "Pod logs as plain text"}},
     dependencies=[Depends(require_permission("admin", "appliance"))],
     summary="Fetch recent pod logs from the appliance's local k3s",
 )

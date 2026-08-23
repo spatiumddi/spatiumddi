@@ -772,8 +772,16 @@ class Bind9Driver(DriverBase):
 
         tsig_keys = bundle.get("tsig_keys") or []
         tsig_key_name = tsig_keys[0]["name"] if tsig_keys else None
+        # Derived from ``state_dir``, not hardcoded (#920). AGENT_STATE_DIR is
+        # an honoured override and every other path the config points at —
+        # zone files, rndc.key, the DoT/DoH cert — is already built from it.
+        # This one was the exception, so a non-default state dir wrote the key
+        # file to one place and told named to read another. If some file
+        # happened to exist at the default path, ``named-checkconf`` passed
+        # and the apply reported ok while named held a stale key set — a TSIG
+        # transfer then fails BADKEY with nothing anywhere reporting a problem.
         tsig_include = (
-            'include "/var/lib/spatium-dns-agent/tsig/ddns.key";\n' if tsig_keys else ""
+            f'include "{self.state_dir / "tsig" / "ddns.key"}";\n' if tsig_keys else ""
         )
         # Server-wide transfer policy (issue #734). Rendered once here so it
         # covers every zone type — primary, secondary, stub, RPZ — and so the

@@ -80,6 +80,7 @@ from app.api.deps import DB, CurrentUser
 from app.api.v1.appliance.slot_image_mirror import mirror_auth_token
 from app.config import settings
 from app.core.permissions import is_effective_superadmin, require_permission
+from app.core.responses import OctetStreamResponse
 from app.models.appliance import ApplianceUpgradeImage
 from app.models.audit import AuditLog
 from app.services.appliance import releases as releases_service
@@ -950,6 +951,11 @@ def _verify_slot_image_download_token(image_id: uuid.UUID, token: str) -> bool:
 
 @router.get(
     "/upgrade-images/{image_id}/raw.xz",
+    # ``response_class`` REPLACES the documented application/json (#921);
+    # a ``responses={200: {"content": ...}}`` entry merges with it instead,
+    # leaving the route declaring a JSON body it never produces.
+    response_class=OctetStreamResponse,
+    responses={200: {"description": "The .raw.xz upgrade image"}},
     summary="Download an upgrade image",
     # Return type is FileResponse on the local path, StreamingResponse
     # on the mirror-proxy path. FastAPI can't derive a pydantic model
@@ -1179,6 +1185,11 @@ async def _shim_slot_images_item(request: Request) -> RedirectResponse:
 
 @router.api_route(
     "/slot-images/{image_id}/raw.xz",
+    # ``response_class`` REPLACES the documented application/json (#921);
+    # a ``responses={200: {"content": ...}}`` entry merges with it instead,
+    # leaving the route declaring a JSON body it never produces.
+    response_class=OctetStreamResponse,
+    responses={200: {"description": "The .raw.xz slot image"}},
     methods=["GET"],
     include_in_schema=False,
     deprecated=True,
