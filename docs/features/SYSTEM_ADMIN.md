@@ -136,6 +136,14 @@ fresh listing server-side. There is no second allowlist to keep in sync,
 and a caller-supplied id that is not currently one of ours is a 404
 rather than a string handed to a daemon.
 
+The id is the compose *service* name (`api`, `worker`) or `Kind:name`
+for a Kubernetes workload (`Deployment:spatiumddi-api`) — never a
+container id or pod name, which churn on exactly the restart the
+operator just asked for. The separator is a **colon, not a slash**,
+because the action route matches its path parameter as `[^/]+` against
+the *unquoted* path: a `%2F` in the id is unescaped before routing and
+the request would 404 before reaching any handler.
+
 * **compose** — only containers whose `com.docker.compose.project` label
   matches the api container's *own*. This needs no configuration and
   cannot be widened by a request. It also fails closed: if the api

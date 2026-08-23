@@ -4737,7 +4737,7 @@ class RestartServiceArgs(BaseModel):
         description=(
             "Service id exactly as returned by the service inventory: the "
             "compose service name (e.g. 'api', 'dns-bind9') on docker-compose, "
-            "or 'Kind/name' (e.g. 'Deployment/spatiumddi-api') on Kubernetes."
+            "or 'Kind:name' (e.g. 'Deployment:spatiumddi-api') on Kubernetes."
         )
     )
 

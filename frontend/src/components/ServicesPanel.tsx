@@ -126,6 +126,28 @@ export function ServicesPanel() {
     );
   }
 
+  // A failed request is NOT "this deployment has no backend" — that is
+  // exactly the "cannot" vs "down" confusion the capability probe exists
+  // to remove, and rendering the no-backend panel here would reintroduce
+  // it one layer up. A 403 (this page is reachable without superadmin)
+  // and a network failure both land here.
+  if (query.isError) {
+    return (
+      <div className="rounded border border-rose-500/40 bg-rose-500/5 p-4">
+        <div className="flex items-center gap-2 text-sm font-medium text-rose-800 dark:text-rose-300">
+          <AlertTriangle className="h-4 w-4" />
+          Could not read the service inventory
+        </div>
+        <p className="mt-2 text-xs text-muted-foreground">
+          {errorDetail(
+            query.error,
+            "The request failed. Service control is superadmin-only — if you are not a superadmin this is expected.",
+          )}
+        </p>
+      </div>
+    );
+  }
+
   if (!cap || cap.backend === "none") {
     return (
       <div className="rounded border border-amber-500/40 bg-amber-500/5 p-4">

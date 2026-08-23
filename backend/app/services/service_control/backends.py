@@ -33,6 +33,11 @@ Action = Literal["start", "stop", "restart"]
 
 ACTIONS: tuple[str, ...] = ("start", "stop", "restart")
 
+# Separator between a Kubernetes workload's kind and name in a service
+# id. A colon, not a slash — see ``ServiceSummary.id`` for why a slash
+# makes the action route unreachable.
+WORKLOAD_ID_SEP = ":"
+
 # Kubernetes offers restart only — see ``kube.py`` for why start/stop are
 # deliberately absent rather than merely unimplemented.
 _KUBE_ACTIONS: tuple[str, ...] = ("restart",)
@@ -48,9 +53,17 @@ class ServiceSummary:
     """One controllable unit, in whichever vocabulary its backend uses.
 
     ``id`` is stable across polls and is what an action names: the
-    compose *service* name (``api``, ``worker``) or ``Kind/name`` for a
+    compose *service* name (``api``, ``worker``) or ``Kind:name`` for a
     workload. Not a container id or pod name — those churn on every
     restart, which is precisely what the operator just asked for.
+
+    **The separator is a colon, not a slash, and that is load-bearing.**
+    The action route is ``POST /system/services/{service_id}/{action}``,
+    where a path parameter matches ``[^/]+`` against the *unquoted*
+    path — so a ``%2F`` in the id is unescaped before routing and the
+    request misses the route entirely, 404ing before it reaches any
+    handler. Neither compose service names nor Kubernetes object names
+    may contain a colon, so ``Kind:name`` stays unambiguous.
     """
 
     id: str
@@ -165,7 +178,7 @@ async def list_services(cap: ServiceControlCapability | None = None) -> list[Ser
             raise ServiceControlError(str(exc)) from exc
         return [
             ServiceSummary(
-                id=f"{r['kind']}/{r['name']}",
+                id=f"{r['kind']}{WORKLOAD_ID_SEP}{r['name']}",
                 name=r["name"],
                 kind=r["kind"],
                 state=r["state"],
@@ -313,20 +326,24 @@ async def apply_action_detached(plan: ActionPlan) -> None:
     """
     try:
         await apply_action(plan)
-    except ServiceControlError as exc:
-        # Nothing left to return it to — the response is already sent —
-        # so the log is the only record, and the audit row written before
-        # the response deliberately says "accepted", not "succeeded".
+    # Broad on purpose: this runs after the response, so anything that
+    # escapes surfaces as an unhandled background-task error with no
+    # connection to return it on. The log is the only record — and the
+    # audit row written before the response deliberately says
+    # "accepted", not "succeeded", for exactly this reason.
+    except Exception as exc:  # noqa: BLE001
         logger.warning(
             "service_control_detached_action_failed",
             service=plan.service.id,
             action=plan.action,
             error=str(exc),
+            error_type=type(exc).__name__,
         )
 
 
 __all__ = [
     "ACTIONS",
+    "WORKLOAD_ID_SEP",
     "Action",
     "ActionPlan",
     "Backend",

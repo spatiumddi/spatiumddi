@@ -558,3 +558,153 @@ def test_self_detection_prefers_the_daemons_container_id(monkeypatch) -> None:
         ),
     ]
     assert backends._self_service_id(services) == "api"
+
+
+# ── review regressions (#890) ──────────────────────────────────────
+
+
+def test_workload_ids_never_contain_a_slash() -> None:
+    """A slash in the id makes the action route unreachable.
+
+    ``POST /system/services/{service_id}/{action}`` matches a path
+    parameter as ``[^/]+`` against the *unquoted* path, so a ``%2F`` in
+    the id is unescaped before routing and the request 404s before any
+    handler sees it. Verified live before this was caught: the encoded
+    form missed the route entirely while a slash-free id reached auth.
+    """
+    assert "/" not in backends.WORKLOAD_ID_SEP
+
+
+@pytest.mark.asyncio
+async def test_kubernetes_service_id_survives_the_action_route(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """End-to-end proof for the finding above, over real routing."""
+    h = {"Authorization": f"Bearer {await _superadmin(db_session)}"}
+    workload_id = f"Deployment{backends.WORKLOAD_ID_SEP}spatiumddi-api"
+    listed = [
+        ServiceSummary(
+            id=workload_id,
+            name="spatiumddi-api",
+            kind="Deployment",
+            state="running",
+            actions=("restart",),
+        )
+    ]
+    kube_cap = ServiceControlCapability(
+        backend="kubernetes",
+        flavor="kubernetes",
+        enabled=True,
+        supported_actions=("restart",),
+    )
+    applied: list[str] = []
+
+    async def _fake_apply(plan: backends.ActionPlan) -> None:
+        applied.append(plan.service.id)
+
+    with (
+        patch.object(backends, "capability", AsyncMock(return_value=kube_cap)),
+        patch.object(backends, "list_services", AsyncMock(return_value=listed)),
+        patch("app.api.v1.system.services.apply_action", _fake_apply),
+    ):
+        r = await client.post(f"/api/v1/system/services/{workload_id}/restart", headers=h)
+    assert r.status_code == 202, r.text
+    assert applied == [workload_id]
+
+
+@pytest.mark.asyncio
+async def test_kubernetes_inventory_ids_are_route_safe() -> None:
+    """The id the listing produces is the id the route has to accept."""
+    with patch.object(
+        kube,
+        "list_workloads",
+        return_value=[
+            {
+                "kind": "Deployment",
+                "name": "spatiumddi-api",
+                "component": "api",
+                "image": "img",
+                "desired": 1,
+                "ready": 1,
+                "state": "running",
+                "last_restarted_at": None,
+            }
+        ],
+    ):
+        cap = ServiceControlCapability(
+            backend="kubernetes",
+            flavor="kubernetes",
+            enabled=True,
+            supported_actions=("restart",),
+        )
+        services = await backends.list_services(cap)
+    assert services[0].id == "Deployment:spatiumddi-api"
+    assert "/" not in services[0].id
+
+
+def test_self_identification_does_not_rely_on_hostname_alone(tmp_path, monkeypatch) -> None:
+    """``$HOSTNAME`` is not an id when a compose service sets ``hostname:``.
+
+    Docker resolves that path segment as an id or a *name*; a custom
+    hostname is neither, so inspect 404s, the capability collapses to
+    ``none``, and the whole compose backend silently disappears. The
+    mount table carries the real id regardless.
+    """
+    from app.services.service_control import compose as compose_mod
+
+    cid = "a" * 64
+    mountinfo = tmp_path / "mountinfo"
+    mountinfo.write_text(
+        f"1234 25 0:57 / /etc/hosts rw - ext4 /dev/sda1 rw,/var/lib/docker/containers/{cid}/hosts\n"
+    )
+    monkeypatch.setattr(compose_mod, "_MOUNTINFO", mountinfo)
+    monkeypatch.setenv("HOSTNAME", "a-friendly-name")
+    candidates = compose_mod._self_candidates()
+    # The real id first, the hostname only as a fallback.
+    assert candidates[0] == cid
+    assert "a-friendly-name" in candidates
+
+
+@pytest.mark.asyncio
+async def test_transport_failures_surface_as_backend_errors_not_500s() -> None:
+    """A raw httpx error escaping becomes an opaque 500 — or, on the
+    self-targeted path, an unhandled background-task exception."""
+    import httpx
+
+    from app.services.service_control import compose as compose_mod
+
+    class _Boom:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, *a, **kw):
+            raise httpx.ConnectTimeout("docker.sock timed out")
+
+        async def post(self, *a, **kw):
+            raise httpx.ConnectTimeout("docker.sock timed out")
+
+    with patch.object(compose_mod, "_client", lambda: _Boom()):
+        with pytest.raises(compose_mod.ComposeUnavailableError, match="ConnectTimeout"):
+            await compose_mod.list_project_containers("proj")
+        with pytest.raises(compose_mod.ComposeUnavailableError, match="ConnectTimeout"):
+            await compose_mod.act("abc123", "restart")
+
+
+@pytest.mark.asyncio
+async def test_detached_action_never_raises_past_the_response() -> None:
+    """It runs after the response, so there is nothing to return an error
+    to — an escape would be an unhandled background-task exception."""
+    plan = backends.ActionPlan(
+        service=ServiceSummary(id="api", name="proj-api-1", kind="container", state="running"),
+        action="restart",
+        is_self=True,
+    )
+
+    async def _explode(_plan: backends.ActionPlan) -> None:
+        raise RuntimeError("daemon vanished")
+
+    with patch.object(backends, "apply_action", _explode):
+        await backends.apply_action_detached(plan)  # must not raise

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -53,14 +54,38 @@ def _client() -> httpx.AsyncClient:
     )
 
 
-def _self_id() -> str:
-    """Our own container id.
+# Docker bind-mounts /etc/hosts, /etc/hostname and /etc/resolv.conf from
+# /var/lib/docker/containers/<full-id>/ into every container, so the id
+# is readable out of our own mount table.
+_MOUNTINFO = Path("/proc/self/mountinfo")
+_CONTAINER_ID_RE = re.compile(r"/containers/([0-9a-f]{64})")
 
-    Docker sets the container hostname to the short container id unless
-    the operator overrode it, and the Docker API accepts a short id or a
-    name wherever it accepts an id — so this resolves either way.
+
+def _self_candidates() -> list[str]:
+    """Identifiers to try against ``/containers/{id}/json``, best first.
+
+    ``$HOSTNAME`` is NOT a reliable answer here. The Docker API resolves
+    that path segment as an id or a *name*, and while Docker defaults a
+    container's hostname to its own short id, compose lets a service set
+    ``hostname:`` — and there the value is neither. Inspect then 404s,
+    the capability collapses to ``none``, and the whole compose backend
+    disappears with no explanation.
+
+    So the mount table is tried first (it carries the real id regardless
+    of hostname) and ``$HOSTNAME`` is the fallback for the environments
+    where it isn't readable.
     """
-    return os.environ.get("HOSTNAME", "").strip()
+    out: list[str] = []
+    try:
+        match = _CONTAINER_ID_RE.search(_MOUNTINFO.read_text(encoding="utf-8"))
+        if match:
+            out.append(match.group(1))
+    except OSError as exc:
+        logger.debug("compose_self_mountinfo_failed", error=str(exc))
+    host = os.environ.get("HOSTNAME", "").strip()
+    if host and host not in out:
+        out.append(host)
+    return out
 
 
 @dataclass(frozen=True)
@@ -85,20 +110,21 @@ async def own_identity() -> SelfIdentity | None:
     ``None`` means "cannot establish scope", and every caller treats that
     as unavailable rather than widening to all containers.
     """
-    ident = _self_id()
-    if not ident:
-        return None
+    payload: dict[str, Any] | None = None
     try:
         async with _client() as client:
-            resp = await client.get(f"/containers/{ident}/json")
-            if resp.status_code != 200:
-                logger.debug("compose_self_inspect_status", status=resp.status_code)
-                return None
-            payload = resp.json() or {}
-            labels = (payload.get("Config") or {}).get("Labels") or {}
+            for ident in _self_candidates():
+                resp = await client.get(f"/containers/{ident}/json")
+                if resp.status_code == 200:
+                    payload = resp.json() or {}
+                    break
+                logger.debug("compose_self_inspect_status", ident=ident, status=resp.status_code)
     except (httpx.HTTPError, ValueError) as exc:
         logger.debug("compose_self_inspect_failed", error=str(exc))
         return None
+    if payload is None:
+        return None
+    labels = (payload.get("Config") or {}).get("Labels") or {}
     project = labels.get(_PROJECT_LABEL)
     if not project:
         return None
@@ -122,11 +148,23 @@ async def list_project_containers(project: str) -> list[dict[str, Any]]:
     # operator-chosen and can contain characters that would otherwise
     # break out of the filter document.
     filters = json.dumps({"label": [f"{_PROJECT_LABEL}={project}"]})
-    async with _client() as client:
-        resp = await client.get("/containers/json", params={"all": "true", "filters": filters})
-        if resp.status_code != 200:
-            raise ComposeUnavailableError(f"docker returned {resp.status_code} listing containers")
-        rows: list[dict[str, Any]] = resp.json()
+    # Transport failures are translated here rather than allowed to
+    # escape: an httpx timeout reaching the caller as a raw exception
+    # becomes an opaque 500 (and, on the self-targeted path, an
+    # unhandled background-task error) instead of the 502 / reported
+    # ``error`` the caller is written to surface.
+    try:
+        async with _client() as client:
+            resp = await client.get("/containers/json", params={"all": "true", "filters": filters})
+            if resp.status_code != 200:
+                raise ComposeUnavailableError(
+                    f"docker returned {resp.status_code} listing containers"
+                )
+            rows: list[dict[str, Any]] = resp.json()
+    except httpx.HTTPError as exc:
+        raise ComposeUnavailableError(f"{type(exc).__name__}: {exc}") from exc
+    except ValueError as exc:
+        raise ComposeUnavailableError(f"unparseable docker response: {exc}") from exc
     return rows
 
 
@@ -148,8 +186,11 @@ async def act(container_id: str, action: str) -> None:
     ``container_id`` is always a full id taken from a fresh inventory
     listing, never a caller-supplied string.
     """
-    async with _client() as client:
-        resp = await client.post(f"/containers/{container_id}/{action}")
+    try:
+        async with _client() as client:
+            resp = await client.post(f"/containers/{container_id}/{action}")
+    except httpx.HTTPError as exc:
+        raise ComposeUnavailableError(f"{type(exc).__name__}: {exc}") from exc
     # 204 = done, 304 = already in the requested state (start on a running
     # container). Both are the outcome the operator asked for.
     if resp.status_code in (204, 304):
