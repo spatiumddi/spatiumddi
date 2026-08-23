@@ -89,6 +89,8 @@ ENCRYPTED_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("event_subscription", "id", "secret_encrypted"),
     ("firewall_feed", "id", "token_encrypted"),
     ("fortinet_firewall", "id", "api_token_encrypted"),
+    ("influxdb_target", "id", "password_encrypted"),
+    ("influxdb_target", "id", "token_encrypted"),
     ("kubernetes_cluster", "id", "token_encrypted"),
     ("meraki_org", "id", "api_key_encrypted"),
     ("meraki_org", "id", "block_sync_api_key_encrypted"),

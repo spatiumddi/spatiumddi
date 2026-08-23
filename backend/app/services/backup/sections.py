@@ -104,7 +104,7 @@ SECTIONS: tuple[Section, ...] = (
             "Platform-wide settings, branding assets, custom field "
             "definitions, IPAM templates, feature-module toggles, alert "
             "rules + events, conformity policies + results, platform-wide "
-            "tags, event subscriptions + outbox."
+            "tags, event subscriptions + outbox, InfluxDB export targets."
         ),
         tables=(
             "platform_settings",
@@ -122,6 +122,12 @@ SECTIONS: tuple[Section, ...] = (
             "conformity_result",
             "event_subscription",
             "event_outbox",
+            # #889. Configuration, not sample data — so it belongs here
+            # and NOT in the volatile ``metrics`` section, which is
+            # excluded from the default backup. A target whose Fernet
+            # columns survive a cross-install restore but whose row does
+            # not is the same silent failure from the other direction.
+            "influxdb_target",
         ),
     ),
     Section(
