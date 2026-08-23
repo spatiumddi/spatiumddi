@@ -184,14 +184,20 @@ def _to_response(t: BackupTarget) -> BackupTargetResponse:
 # ── Endpoints ──────────────────────────────────────────────────────────
 
 
-@router.get("/kinds")
-async def list_kinds(current_user: CurrentUser) -> dict[str, Any]:
+class BackupTargetKinds(BaseModel):
+    """The destination kinds this build supports (s3 / sftp / …)."""
+
+    kinds: list[dict[str, Any]]
+
+
+@router.get("/kinds", response_model=BackupTargetKinds)
+async def list_kinds(current_user: CurrentUser) -> BackupTargetKinds:
     """Catalog of available destination kinds + their config-field
     descriptors. The frontend reflects on these to render the
     per-kind config form.
     """
     _require_superadmin(current_user)
-    return {"kinds": list_destination_kinds()}
+    return BackupTargetKinds(kinds=list_destination_kinds())
 
 
 @router.get("", response_model=list[BackupTargetResponse])

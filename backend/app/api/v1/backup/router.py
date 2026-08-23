@@ -64,8 +64,27 @@ def _require_superadmin(current_user: CurrentUser) -> None:
 # ── /backup/create-and-download ──────────────────────────────────────
 
 
-@router.get("/sections")
-async def list_backup_sections(current_user: CurrentUser) -> dict[str, Any]:
+class BackupSection(BaseModel):
+    """One selectable slice of the backup, as offered to the operator."""
+
+    key: str
+    label: str
+    description: str
+    table_count: int
+    #: Volatile sections (caches, transient metrics) restore cleanly but are
+    #: rarely worth including — flagged so the UI can default them off.
+    volatile: bool
+    #: False for sections that must always be included; the UI renders those
+    #: as fixed rather than as an unticked checkbox.
+    selectable: bool
+
+
+class BackupSectionCatalog(BaseModel):
+    sections: list[BackupSection]
+
+
+@router.get("/sections", response_model=BackupSectionCatalog)
+async def list_backup_sections(current_user: CurrentUser) -> BackupSectionCatalog:
     """Catalog of backup sections (issue #117 Phase 2a). Drives
     the upcoming selective-backup + selective-restore checkboxes —
     operators tick which sections to include / apply.
@@ -75,19 +94,19 @@ async def list_backup_sections(current_user: CurrentUser) -> dict[str, Any]:
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Backup is restricted to superadmin",
         )
-    return {
-        "sections": [
-            {
-                "key": s.key,
-                "label": s.label,
-                "description": s.description,
-                "table_count": len(s.tables),
-                "volatile": s.volatile,
-                "selectable": s.selectable,
-            }
+    return BackupSectionCatalog(
+        sections=[
+            BackupSection(
+                key=s.key,
+                label=s.label,
+                description=s.description,
+                table_count=len(s.tables),
+                volatile=s.volatile,
+                selectable=s.selectable,
+            )
             for s in SECTIONS
         ]
-    }
+    )
 
 
 @router.post("/create-and-download")

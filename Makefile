@@ -1,5 +1,7 @@
 .PHONY: help up down dev build build-supervisor migrate lint test lint-backend lint-frontend test-backend \
         openapi \
+        lint-untyped-routes \
+        lint-untyped-routes-baseline \
         ci ci-backend-lint ci-frontend-lint ci-frontend-build screenshots \
         docs docs-down docs-verify \
         trivy \
@@ -295,6 +297,32 @@ openapi:
 	  spatiumddi-api:dev \
 	  python3 /scripts/export_openapi.py > openapi.json
 	@echo "✓ Wrote openapi.json ($$(wc -c < openapi.json) bytes, version=$$(python3 -c 'import json;print(json.load(open("openapi.json"))["info"]["version"])'))"
+
+# ── Untyped-route guard (issue #917) ─────────────────────────────────────────
+# A route with no response_model publishes an unconstrained object as its
+# response schema, so a generated client gets an untyped container. 91 routes
+# were in that state when the guard landed; the baseline stops the set from
+# growing, exactly like scripts/lint_migrations.py does for destructive
+# migrations. Extraction runs inside the API image (it imports the app); the
+# comparison is pure stdlib and runs on the host.
+UNTYPED_LIST := /tmp/spatiumddi-untyped-routes.txt
+
+.PHONY: lint-untyped-routes lint-untyped-routes-baseline
+
+$(UNTYPED_LIST): FORCE
+	@$(COMPOSE_DEV) build api >/dev/null
+	@docker run --rm --network none \
+	  -v "$(PWD)/scripts:/scripts:ro" \
+	  spatiumddi-api:dev \
+	  python3 /scripts/lint_untyped_routes.py --list 2>/dev/null > $@
+
+lint-untyped-routes: $(UNTYPED_LIST)
+	@python3 scripts/lint_untyped_routes.py --check $(UNTYPED_LIST)
+
+lint-untyped-routes-baseline: $(UNTYPED_LIST)
+	@python3 scripts/lint_untyped_routes.py --baseline $(UNTYPED_LIST)
+
+FORCE:
 
 ci: ci-backend-lint ci-frontend-lint ci-frontend-build
 	@echo ""

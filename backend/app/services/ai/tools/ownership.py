@@ -24,14 +24,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.asn import ASN
 from app.models.auth import User
-from app.models.circuit import Circuit
-from app.models.dns import DNSZone
-from app.models.domain import Domain
-from app.models.ipam import IPBlock, IPSpace, Subnet
-from app.models.network_service import NetworkService
-from app.models.overlay import OverlayNetwork
 from app.models.ownership import (
     CUSTOMER_STATUSES,
     PROVIDER_KINDS,
@@ -158,41 +151,15 @@ class GetCustomerSummaryArgs(BaseModel):
 async def get_customer_summary(
     db: AsyncSession, user: User, args: GetCustomerSummaryArgs
 ) -> dict[str, Any]:
+    # Shared with ``GET /customers/{id}/summary`` (#917) so a decommission
+    # decision made from a phone and one made from a chat window are looking
+    # at the same numbers.
+    from app.services.ownership.customer_summary import build_customer_summary  # noqa: PLC0415
+
     cust = await _resolve_customer(db, args.customer_ref)
     if cust is None:
         return {"error": f"No active customer matched {args.customer_ref!r}."}
-
-    async def _count(model: Any, *, soft_delete: bool = False) -> int:
-        stmt = select(func.count()).select_from(model).where(model.customer_id == cust.id)
-        if soft_delete:
-            stmt = stmt.where(model.deleted_at.is_(None))
-        return int((await db.execute(stmt)).scalar_one())
-
-    counts = {
-        "ip_spaces": await _count(IPSpace, soft_delete=True),
-        "ip_blocks": await _count(IPBlock, soft_delete=True),
-        "subnets": await _count(Subnet, soft_delete=True),
-        "circuits": await _count(Circuit, soft_delete=True),
-        "services": await _count(NetworkService, soft_delete=True),
-        "asns": await _count(ASN),
-        "dns_zones": await _count(DNSZone),
-        "domains": await _count(Domain),
-        "overlays": await _count(OverlayNetwork, soft_delete=True),
-    }
-    return {
-        "id": str(cust.id),
-        "name": cust.name,
-        "account_number": cust.account_number,
-        "status": cust.status,
-        "contact_email": cust.contact_email,
-        "contact_phone": cust.contact_phone,
-        "contact_address": cust.contact_address,
-        "notes": cust.notes,
-        "owned_resources": counts,
-        "owned_resource_total": sum(counts.values()),
-        "tags": cust.tags or {},
-        "created_at": cust.created_at.isoformat() if cust.created_at else None,
-    }
+    return await build_customer_summary(db, cust)
 
 
 # ── list_sites ────────────────────────────────────────────────────────

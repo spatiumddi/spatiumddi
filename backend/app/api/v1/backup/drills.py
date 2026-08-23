@@ -102,8 +102,22 @@ async def list_drills(
     return [_to_response(row, target_name=name) for row, name in rows]
 
 
-@router.get("/readiness")
-async def get_readiness(db: DB, current_user: CurrentUser) -> dict[str, Any]:
+class DrillReadinessSummary(BaseModel):
+    """Per-target recovery readiness — "can I restore this, and how do I know?".
+
+    ``verified_targets`` counts targets with a *proven* restore, not targets
+    with a backup: an unverified archive is a hypothesis, and reporting the
+    two as one number is how a restore fails on the day it matters.
+    """
+
+    targets: list[dict[str, Any]]
+    total_targets: int
+    verified_targets: int
+    unverified_targets: int
+
+
+@router.get("/readiness", response_model=DrillReadinessSummary)
+async def get_readiness(db: DB, current_user: CurrentUser) -> DrillReadinessSummary:
     """Per-target recovery readiness — "can I restore this, and how do
     I know?".
 
@@ -116,12 +130,12 @@ async def get_readiness(db: DB, current_user: CurrentUser) -> dict[str, Any]:
     _require_superadmin(current_user)
     rows = await compute_drill_readiness(db)
     verified = sum(1 for r in rows if r["verified"])
-    return {
-        "targets": rows,
-        "total_targets": len(rows),
-        "verified_targets": verified,
-        "unverified_targets": len(rows) - verified,
-    }
+    return DrillReadinessSummary(
+        targets=rows,
+        total_targets=len(rows),
+        verified_targets=verified,
+        unverified_targets=len(rows) - verified,
+    )
 
 
 @router.get("/{drill_id}", response_model=RestoreDrillResponse)

@@ -386,6 +386,21 @@ async def list_events(
     current_user: CurrentUser,
     open_only: bool = Query(False, description="Only return events with resolved_at IS NULL"),
     rule_id: uuid.UUID | None = Query(None),
+    # Per-resource filters (#917). Events have always carried the subject they
+    # fired about; without these a "alerts for this subnet" panel had to pull
+    # up to 1000 events and filter client-side, which silently truncates on a
+    # noisy install — the one where the panel matters most.
+    subject_type: str | None = Query(
+        None,
+        max_length=64,
+        description="Exact subject type, e.g. 'subnet', 'dns_server', 'dhcp_pool'.",
+    ),
+    subject_id: str | None = Query(
+        None,
+        max_length=255,
+        description="Exact subject id. Usually paired with subject_type.",
+    ),
+    severity: str | None = Query(None, max_length=32, description="Exact severity match."),
     limit: int = Query(200, ge=1, le=1000),
 ) -> list[AlertEvent]:
     q = select(AlertEvent).order_by(AlertEvent.fired_at.desc()).limit(limit)
@@ -393,6 +408,12 @@ async def list_events(
         q = q.where(AlertEvent.resolved_at.is_(None))
     if rule_id:
         q = q.where(AlertEvent.rule_id == rule_id)
+    if subject_type:
+        q = q.where(AlertEvent.subject_type == subject_type)
+    if subject_id:
+        q = q.where(AlertEvent.subject_id == subject_id)
+    if severity:
+        q = q.where(AlertEvent.severity == severity)
     res = await db.execute(q)
     return list(res.scalars().all())
 

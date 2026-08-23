@@ -17,8 +17,6 @@ in the execute body — the issue asks for "warn-only with override".
 
 from __future__ import annotations
 
-from typing import Any
-
 import structlog
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field
@@ -106,12 +104,18 @@ class ExecuteResponse(BaseModel):
 # ── Endpoints ────────────────────────────────────────────────────────
 
 
-@router.get("/sections")
-async def list_sections(current_user: CurrentUser) -> dict[str, Any]:
+class FactorySectionCatalog(BaseModel):
+    """Catalog the factory-reset page reflects on to render itself."""
+
+    sections: list[SectionCatalogEntry]
+
+
+@router.get("/sections", response_model=FactorySectionCatalog)
+async def list_sections(current_user: CurrentUser) -> FactorySectionCatalog:
     """Section catalog the UI reflects on to render the page."""
     _require_superadmin(current_user)
-    return {
-        "sections": [
+    return FactorySectionCatalog(
+        sections=[
             SectionCatalogEntry(
                 key=s.key,
                 label=s.label,
@@ -119,10 +123,10 @@ async def list_sections(current_user: CurrentUser) -> dict[str, Any]:
                 phrase=s.phrase,
                 kind=s.kind,
                 table_count=len(s.tables),
-            ).model_dump()
+            )
             for s in FACTORY_SECTIONS
         ],
-    }
+    )
 
 
 @router.post("/preview", response_model=PreviewResponse)

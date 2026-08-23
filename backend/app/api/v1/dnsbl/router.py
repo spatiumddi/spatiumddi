@@ -378,8 +378,44 @@ async def list_listings(
     )
 
 
-@router.get("/listings/by-ip/{ip}")
-async def listings_by_ip(ip: str, db: DB, _: CurrentUser) -> dict[str, Any]:
+class DNSBLListingEntry(BaseModel):
+    """One list's verdict on an IP."""
+
+    list_id: uuid.UUID | None = None
+    list_name: str | None = None
+    zone_suffix: str | None = None
+    listed: bool
+    #: False when this list has never been queried for the IP — which is a
+    #: different statement from "queried and not listed".
+    checked: bool
+    return_codes: list[str] = []
+    txt_reason: str | None = None
+    check_error: str | None = None
+    first_listed_at: datetime | None = None
+    last_checked_at: datetime | None = None
+    resolved_at: datetime | None = None
+
+
+class DNSBLListingsByIP(BaseModel):
+    ip: str
+    listed_count: int
+    entries: list[DNSBLListingEntry]
+
+
+class DNSBLCheckResult(BaseModel):
+    """Result of an on-demand check across every enabled list."""
+
+    ip: str
+    #: How many lists were actually queried. Zero with an ``error`` set means
+    #: nothing ran — not that the IP came back clean.
+    checked: int = 0
+    listed: int = 0
+    source: str | None = None
+    error: str | None = None
+
+
+@router.get("/listings/by-ip/{ip}", response_model=DNSBLListingsByIP)
+async def listings_by_ip(ip: str, db: DB, _: CurrentUser) -> DNSBLListingsByIP:
     """Per-IP reputation across every enabled list (the Reputation panel).
 
     Returns one entry per enabled list — merging any existing listing row
@@ -410,14 +446,21 @@ async def listings_by_ip(ip: str, db: DB, _: CurrentUser) -> dict[str, Any]:
                 "last_checked_at": (
                     row.last_checked_at.isoformat() if row and row.last_checked_at else None
                 ),
+                # Populated here too, not just on the per-listing route: a
+                # delisting date is the single most useful field on a
+                # reputation panel, and declaring it on the schema while
+                # never filling it in is worse than omitting it.
+                "resolved_at": (row.resolved_at.isoformat() if row and row.resolved_at else None),
             }
         )
     listed_count = sum(1 for e in entries if e["listed"])
-    return {"ip": ip, "listed_count": listed_count, "entries": entries}
+    return DNSBLListingsByIP.model_validate(
+        {"ip": ip, "listed_count": listed_count, "entries": entries}
+    )
 
 
-@router.post("/check")
-async def check_now(body: DNSBLCheckRequest, db: DB, user: CurrentUser) -> dict[str, Any]:
+@router.post("/check", response_model=DNSBLCheckResult)
+async def check_now(body: DNSBLCheckRequest, db: DB, user: CurrentUser) -> DNSBLCheckResult:
     """On-demand reputation check of one IP across every enabled list."""
     from app.services.dnsbl.sweep import check_ip_now  # noqa: PLC0415
 
@@ -435,7 +478,7 @@ async def check_now(body: DNSBLCheckRequest, db: DB, user: CurrentUser) -> dict[
         new_value={"checked": result.get("checked"), "listed": result.get("listed")},
     )
     await db.commit()
-    return result
+    return DNSBLCheckResult.model_validate(result)
 
 
 # ── Settings ────────────────────────────────────────────────────────

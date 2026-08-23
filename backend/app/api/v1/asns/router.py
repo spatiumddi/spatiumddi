@@ -26,6 +26,7 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import String, func, or_, select
 
 from app.api.deps import DB, CurrentUser
+from app.api.v1._common import BulkDeleteResponse
 from app.api.v1.asns._audit import write_audit
 from app.core.permissions import require_resource_permission
 from app.models.asn import ASN, ASNRpkiRoa, BGPCommunity, BGPPeering
@@ -513,8 +514,8 @@ async def refresh_asn_rpki(asn_id: uuid.UUID, db: DB, user: CurrentUser) -> Refr
     )
 
 
-@router.post("/bulk-delete")
-async def bulk_delete_asns(body: ASNBulkDelete, db: DB, user: CurrentUser) -> dict[str, Any]:
+@router.post("/bulk-delete", response_model=BulkDeleteResponse)
+async def bulk_delete_asns(body: ASNBulkDelete, db: DB, user: CurrentUser) -> BulkDeleteResponse:
     """Delete up to 500 ASNs in a single round-trip.
 
     Returns a small summary so the UI can render a bulk-results
@@ -524,7 +525,7 @@ async def bulk_delete_asns(body: ASNBulkDelete, db: DB, user: CurrentUser) -> di
     isn't punished for a partial selection.
     """
     if not body.ids:
-        return {"deleted": 0, "not_found": []}
+        return BulkDeleteResponse(deleted=0, not_found=[])
 
     rows = (await db.execute(select(ASN).where(ASN.id.in_(body.ids)))).scalars().all()
     found_ids = {r.id for r in rows}
@@ -542,7 +543,7 @@ async def bulk_delete_asns(body: ASNBulkDelete, db: DB, user: CurrentUser) -> di
         await db.delete(r)
 
     await db.commit()
-    return {"deleted": len(rows), "not_found": not_found}
+    return BulkDeleteResponse(deleted=len(rows), not_found=not_found)
 
 
 # ── BGP peering ─────────────────────────────────────────────────────

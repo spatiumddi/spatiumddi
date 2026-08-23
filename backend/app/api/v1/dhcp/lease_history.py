@@ -21,6 +21,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, field_validator
 from sqlalchemy import String, cast, func, select
+from sqlalchemy.sql import Select
 
 from app.api.deps import DB, CurrentUser
 from app.api.pagination import MAX_PAGE
@@ -34,7 +35,10 @@ router = APIRouter(
 )
 
 
-_VALID_STATES = frozenset({"expired", "released", "removed", "superseded"})
+#: Terminal lease states a history row can carry. Exported because the
+#: fleet-wide route in ``leases.py`` validates against the same set — two
+#: copies would let one route accept a state the other rejects (#917).
+VALID_LEASE_HISTORY_STATES = frozenset({"expired", "released", "removed", "superseded"})
 
 
 class LeaseHistoryRow(BaseModel):
@@ -65,6 +69,37 @@ class LeaseHistoryPage(BaseModel):
     items: list[LeaseHistoryRow]
 
 
+def apply_lease_history_filters(
+    base: Select[Any],
+    *,
+    mac: str | None,
+    ip: str | None,
+    hostname: str | None,
+    lease_state: str | None,
+) -> Select[Any]:
+    """The mac / ip / hostname / state filters, shared with the fleet-wide
+    route in ``leases.py`` (#917) so the two cannot diverge on what a filter
+    means."""
+    if mac:
+        # MACADDR → text for substring match. Postgres canonicalises to
+        # ``aa:bb:cc:dd:ee:ff`` so we lowercase the input first.
+        base = base.where(cast(DHCPLeaseHistory.mac_address, String).ilike(f"%{mac.lower()}%"))
+    if ip:
+        # Try CIDR-containment first; if the operator typed a bare host,
+        # fall back to exact match. The INET column supports the
+        # ``<<=`` (subnet-or-equal) operator natively in postgres.
+        try:
+            net = ipaddress.ip_network(ip, strict=False)
+            base = base.where(DHCPLeaseHistory.ip_address.op("<<=")(str(net)))
+        except (ValueError, TypeError):
+            base = base.where(DHCPLeaseHistory.ip_address == ip)
+    if hostname:
+        base = base.where(DHCPLeaseHistory.hostname.ilike(f"%{hostname}%"))
+    if lease_state:
+        base = base.where(DHCPLeaseHistory.lease_state == lease_state)
+    return base
+
+
 @router.get("/{server_id}/lease-history", response_model=LeaseHistoryPage)
 async def list_lease_history(
     server_id: uuid.UUID,
@@ -87,33 +122,19 @@ async def list_lease_history(
         since = datetime.now(UTC) - timedelta(days=90)
     if until is None:
         until = datetime.now(UTC)
-    if lease_state is not None and lease_state not in _VALID_STATES:
+    if lease_state is not None and lease_state not in VALID_LEASE_HISTORY_STATES:
         raise HTTPException(
             status_code=422,
-            detail=f"lease_state must be one of {sorted(_VALID_STATES)}",
+            detail=f"lease_state must be one of {sorted(VALID_LEASE_HISTORY_STATES)}",
         )
 
     base = select(DHCPLeaseHistory).where(DHCPLeaseHistory.server_id == server_id)
     base = base.where(DHCPLeaseHistory.expired_at >= since)
     base = base.where(DHCPLeaseHistory.expired_at <= until)
 
-    if mac:
-        # MACADDR → text for substring match. Postgres canonicalises to
-        # ``aa:bb:cc:dd:ee:ff`` so we lowercase the input first.
-        base = base.where(cast(DHCPLeaseHistory.mac_address, String).ilike(f"%{mac.lower()}%"))
-    if ip:
-        # Try CIDR-containment first; if the operator typed a bare host,
-        # fall back to exact match. The INET column supports the
-        # ``<<=`` (subnet-or-equal) operator natively in postgres.
-        try:
-            net = ipaddress.ip_network(ip, strict=False)
-            base = base.where(DHCPLeaseHistory.ip_address.op("<<=")(str(net)))
-        except (ValueError, TypeError):
-            base = base.where(DHCPLeaseHistory.ip_address == ip)
-    if hostname:
-        base = base.where(DHCPLeaseHistory.hostname.ilike(f"%{hostname}%"))
-    if lease_state:
-        base = base.where(DHCPLeaseHistory.lease_state == lease_state)
+    base = apply_lease_history_filters(
+        base, mac=mac, ip=ip, hostname=hostname, lease_state=lease_state
+    )
 
     total = (await db.execute(select(func.count()).select_from(base.subquery()))).scalar_one()
     rows = (
