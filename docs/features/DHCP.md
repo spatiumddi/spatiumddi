@@ -170,9 +170,13 @@ DHCPPool
   class_restriction: str (nullable)   -- Kea client class
   lease_time_override: int (nullable) -- overrides scope lease_time for this pool
   options_override: JSONB (nullable)  -- additional options for this pool only
-  utilization_percent: float (computed)
-  current_lease_count: int (computed, pulled from server)
 ```
+
+> Earlier revisions of this document listed `utilization_percent` and
+> `current_lease_count` as computed model fields. Neither ever existed on the
+> row — occupancy is derived at request time from mirrored lease and
+> reservation state, and is served by the endpoints below (#913, corrected
+> in #917).
 
 ### Pool occupancy over REST (issue #913)
 
@@ -234,6 +238,33 @@ fine" gets produced:
 `computed_at` is returned because occupancy is derived from the mirrored
 lease rows, so its freshness follows the last lease pull rather than
 being instantaneous.
+
+### Fleet-wide lease lookup (issue #917)
+
+```
+GET /api/v1/dhcp/leases          # active leases across every server
+GET /api/v1/dhcp/lease-history   # expired / released, across every server
+```
+
+The per-server routes (`/dhcp/servers/{id}/leases` and
+`/dhcp/servers/{id}/lease-history`) answer "what is this server handing out",
+which is the server-detail question. They cannot answer the one a technician
+*starts* from — **"does this MAC have a lease anywhere?"** — without a call per
+server plus a client-side merge, and that merge is order-sensitive: page 1 of
+server A and page 1 of server B are not the newest rows overall.
+
+Both fleet routes take the same filters as their per-server counterparts, with
+the server restriction moved to optional `server_id` / `group_id` query
+parameters, and return the same row shapes (including the OUI vendor and
+Fingerbank device fields). `/leases` additionally accepts **exact** `mac` and
+`ip` filters alongside the substring `search`, because a substring match on a
+MAC also returns unrelated devices whose address happens to contain the same
+bytes.
+
+`mac` is normalised before matching, so `AA-BB-CC-DD-EE-FF`, `aabb.ccdd.eeff`
+and `aa:bb:cc:dd:ee:ff` are the same query — a lookup that answers "no lease"
+because the operator pasted a different separator is worse than one that
+errors.
 
 ### Example: Multiple Pools in One Subnet (10.1.2.0/24)
 

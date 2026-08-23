@@ -28,6 +28,7 @@ from pydantic import BaseModel, field_validator
 from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
+from app.api.v1._common import StatusResponse
 from app.core.crypto import decrypt_str, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.permissions import require_resource_permission
@@ -612,7 +613,7 @@ async def delete_cluster(cluster_id: uuid.UUID, db: DB, user: SuperAdmin) -> Non
     "/clusters/{cluster_id}/sync",
     status_code=status.HTTP_202_ACCEPTED,
 )
-async def sync_cluster(cluster_id: uuid.UUID, db: DB, _: SuperAdmin) -> dict[str, str]:
+async def sync_cluster(cluster_id: uuid.UUID, db: DB, _: SuperAdmin) -> StatusResponse:
     """Queue an on-demand reconcile for this cluster.
 
     Fire-and-forget — the reconciler runs on the worker and updates
@@ -628,10 +629,10 @@ async def sync_cluster(cluster_id: uuid.UUID, db: DB, _: SuperAdmin) -> dict[str
 
     try:
         result = sync_cluster_now.delay(str(c.id))
-        return {"status": "queued", "task_id": result.id}
+        return StatusResponse(status="queued", task_id=result.id)
     except Exception:  # noqa: BLE001
         # Broker down — the periodic sweep will catch up.
-        return {"status": "broker_unavailable", "task_id": ""}
+        return StatusResponse(status="broker_unavailable", task_id="")
 
 
 @router.post(

@@ -5073,13 +5073,99 @@ async def delete_dnssec_policy(policy_id: uuid.UUID, db: DB, current_user: Super
     await db.commit()
 
 
-@router.get("/groups/{group_id}/zones/{zone_id}/dnssec/info")
+# ── Typed report envelopes (issue #917) ──────────────────────────────
+
+
+class DNSSECKeyState(BaseModel):
+    """One key's state as last reported by the agent.
+
+    BIND owns the private keys under inline-signing; this is a read-only
+    mirror, so ``reported_at`` being stale is the signal that the agent has
+    stopped reporting rather than that the key stopped rotating.
+    """
+
+    key_tag: int | None = None
+    key_type: str | None = None
+    algorithm: str | None = None
+    state: str | None = None
+    ds_records: list[str] = []
+    timing: dict[str, Any] = {}
+    reported_at: datetime | None = None
+
+
+class ZoneDNSSECInfo(BaseModel):
+    zone_id: uuid.UUID
+    zone_name: str
+    dnssec_enabled: bool
+    dnssec_policy_id: uuid.UUID | None = None
+    dnssec_ds_records: list[str] = []
+    dnssec_synced_at: datetime | None = None
+    keys: list[DNSSECKeyState] = []
+
+
+class ZoneTemplateParameter(BaseModel):
+    key: str
+    label: str
+    type: str
+    required: bool
+    default: Any = None
+    placeholder: str | None = None
+    hint: str | None = None
+
+
+class ZoneTemplate(BaseModel):
+    model_config = {"extra": "allow"}
+
+    id: str
+    name: str
+    category: str
+    description: str
+    parameters: list[ZoneTemplateParameter] = []
+    #: How many records the template stamps — rendered by the wizard, so it
+    #: has to be on the schema and not left to ``extra``.
+    record_count: int | None = None
+
+
+class ZoneTemplateCatalog(BaseModel):
+    templates: list[ZoneTemplate]
+
+
+class DelegationRecordPreview(BaseModel):
+    name: str
+    record_type: str
+    value: str
+    ttl: int | None = None
+
+
+class DelegationPreviewResponse(BaseModel):
+    """What stamping a delegation into the parent zone would change.
+
+    ``has_parent`` false means no managed parent zone exists, so there is
+    nothing to delegate *from* — every other field is absent, and a client
+    must not read that as "nothing to do".
+    """
+
+    has_parent: bool
+    parent_zone_id: uuid.UUID | None = None
+    parent_zone_name: str | None = None
+    child_zone_id: uuid.UUID | None = None
+    child_zone_name: str | None = None
+    child_label: str | None = None
+    ns_records_to_create: list[DelegationRecordPreview] = []
+    glue_records_to_create: list[DelegationRecordPreview] = []
+    existing_ns_records: list[DelegationRecordPreview] = []
+    existing_glue_records: list[DelegationRecordPreview] = []
+    warnings: list[str] = []
+    child_apex_ns_count: int | None = None
+
+
+@router.get("/groups/{group_id}/zones/{zone_id}/dnssec/info", response_model=ZoneDNSSECInfo)
 async def get_zone_dnssec_info(
     group_id: uuid.UUID,
     zone_id: uuid.UUID,
     db: DB,
     current_user: CurrentUser,
-) -> dict[str, Any]:
+) -> ZoneDNSSECInfo:
     """DNSSEC state + DS records for the zone-edit DNSSEC card.
 
     Reads the cached ``dnssec_ds_records`` + ``dnssec_synced_at`` the
@@ -5100,26 +5186,30 @@ async def get_zone_dnssec_info(
         .scalars()
         .all()
     )
-    return {
-        "zone_id": str(zone.id),
-        "zone_name": zone.name,
-        "dnssec_enabled": zone.dnssec_enabled,
-        "dnssec_policy_id": (str(zone.dnssec_policy_id) if zone.dnssec_policy_id else None),
-        "dnssec_ds_records": zone.dnssec_ds_records or [],
-        "dnssec_synced_at": (zone.dnssec_synced_at.isoformat() if zone.dnssec_synced_at else None),
-        "keys": [
-            {
-                "key_tag": k.key_tag,
-                "key_type": k.key_type,
-                "algorithm": k.algorithm,
-                "state": k.state,
-                "ds_records": k.ds_records or [],
-                "timing": k.timing or {},
-                "reported_at": k.reported_at.isoformat() if k.reported_at else None,
-            }
-            for k in keys
-        ],
-    }
+    return ZoneDNSSECInfo.model_validate(
+        {
+            "zone_id": str(zone.id),
+            "zone_name": zone.name,
+            "dnssec_enabled": zone.dnssec_enabled,
+            "dnssec_policy_id": (str(zone.dnssec_policy_id) if zone.dnssec_policy_id else None),
+            "dnssec_ds_records": zone.dnssec_ds_records or [],
+            "dnssec_synced_at": (
+                zone.dnssec_synced_at.isoformat() if zone.dnssec_synced_at else None
+            ),
+            "keys": [
+                {
+                    "key_tag": k.key_tag,
+                    "key_type": k.key_type,
+                    "algorithm": k.algorithm,
+                    "state": k.state,
+                    "ds_records": k.ds_records or [],
+                    "timing": k.timing or {},
+                    "reported_at": k.reported_at.isoformat() if k.reported_at else None,
+                }
+                for k in keys
+            ],
+        }
+    )
 
 
 class DNSSECSignRequest(BaseModel):
@@ -5348,34 +5438,36 @@ class FromTemplateRequest(BaseModel):
         return v if v.endswith(".") else v + "."
 
 
-@router.get("/zone-templates")
-async def list_zone_templates(_: CurrentUser) -> dict[str, Any]:
+@router.get("/zone-templates", response_model=ZoneTemplateCatalog)
+async def list_zone_templates(_: CurrentUser) -> ZoneTemplateCatalog:
     """Return the static catalog of zone templates."""
     templates = list_templates()
-    return {
-        "templates": [
-            {
-                "id": t.id,
-                "name": t.name,
-                "category": t.category,
-                "description": t.description,
-                "parameters": [
-                    {
-                        "key": p.key,
-                        "label": p.label,
-                        "type": p.type,
-                        "required": p.required,
-                        "default": p.default,
-                        "placeholder": p.placeholder,
-                        "hint": p.hint,
-                    }
-                    for p in t.parameters
-                ],
-                "record_count": len(t.records),
-            }
-            for t in templates
-        ]
-    }
+    return ZoneTemplateCatalog.model_validate(
+        {
+            "templates": [
+                {
+                    "id": t.id,
+                    "name": t.name,
+                    "category": t.category,
+                    "description": t.description,
+                    "parameters": [
+                        {
+                            "key": p.key,
+                            "label": p.label,
+                            "type": p.type,
+                            "required": p.required,
+                            "default": p.default,
+                            "placeholder": p.placeholder,
+                            "hint": p.hint,
+                        }
+                        for p in t.parameters
+                    ],
+                    "record_count": len(t.records),
+                }
+                for t in templates
+            ]
+        }
+    )
 
 
 @router.post(
@@ -5489,10 +5581,13 @@ async def create_zone_from_template(
 # ── Zone delegation wizard ──────────────────────────────────────────────────
 
 
-@router.get("/groups/{group_id}/zones/{zone_id}/delegation-preview")
+@router.get(
+    "/groups/{group_id}/zones/{zone_id}/delegation-preview",
+    response_model=DelegationPreviewResponse,
+)
 async def get_delegation_preview(
     group_id: uuid.UUID, zone_id: uuid.UUID, db: DB, current_user: CurrentUser
-) -> dict[str, Any]:
+) -> DelegationPreviewResponse:
     """Compute the NS + glue records needed to delegate this zone from its parent.
 
     Returns ``{has_parent: false}`` when no eligible parent zone exists in
@@ -5502,9 +5597,11 @@ async def get_delegation_preview(
     child = await _require_zone(group_id, zone_id, db, current_user)
     parent = await find_parent_zone(db, group_id, child.name)
     if parent is None:
-        return {"has_parent": False}
+        return DelegationPreviewResponse(has_parent=False)
     preview = await compute_delegation(db, parent, child)
-    return {"has_parent": True, **preview_to_dict(preview)}
+    return DelegationPreviewResponse.model_validate(
+        {"has_parent": True, **preview_to_dict(preview)}
+    )
 
 
 @router.post(

@@ -1191,44 +1191,15 @@ class FindIPHygieneFindingsArgs(BaseModel):
 async def find_ip_hygiene_findings(
     db: AsyncSession, user: User, args: FindIPHygieneFindingsArgs
 ) -> dict[str, Any]:
-    # Reuse the alert matchers so the on-demand view and the alert rules can't
-    # drift. Pass transient (unsaved) AlertRule objects purely as a threshold
-    # carrier — the matchers only read ``threshold_days``.
-    from app.models.alerts import AlertRule  # noqa: PLC0415
-    from app.services.alerts import (  # noqa: PLC0415
-        RULE_TYPE_IP_FREE_BUT_RESPONDING,
-        RULE_TYPE_STALE_RESERVATION,
-        RULE_TYPE_UNKNOWN_MAC_IN_STATIC_RANGE,
-        _matching_ip_free_but_responding_subjects,
-        _matching_stale_reservation_subjects,
-        _matching_unknown_mac_in_static_range_subjects,
-    )
+    # Shared with ``GET /ipam/reports/hygiene`` (#917) so the copilot answer
+    # and the REST answer cannot disagree; that helper in turn calls the alert
+    # matchers, so a tuning change to a detection reaches all three surfaces.
+    from app.services.ipam.hygiene import build_hygiene_report  # noqa: PLC0415
 
-    def _rule(rule_type: str, days: int) -> AlertRule:
-        return AlertRule(name="adhoc", rule_type=rule_type, severity="info", threshold_days=days)
-
-    free = await _matching_ip_free_but_responding_subjects(
-        db, _rule(RULE_TYPE_IP_FREE_BUT_RESPONDING, args.free_responding_days)
+    return await build_hygiene_report(
+        db,
+        free_responding_days=args.free_responding_days,
+        stale_reservation_days=args.stale_reservation_days,
+        squat_days=args.squat_days,
+        limit=args.limit,
     )
-    stale = await _matching_stale_reservation_subjects(
-        db, _rule(RULE_TYPE_STALE_RESERVATION, args.stale_reservation_days)
-    )
-    squat = await _matching_unknown_mac_in_static_range_subjects(
-        db, _rule(RULE_TYPE_UNKNOWN_MAC_IN_STATIC_RANGE, args.squat_days)
-    )
-
-    def _fmt(rows: list[tuple[str, str, str]]) -> list[dict[str, str]]:
-        return [
-            {"ip_id": sid, "address": disp, "detail": msg} for sid, disp, msg in rows[: args.limit]
-        ]
-
-    return {
-        "free_but_responding": _fmt(free),
-        "stale_reservations": _fmt(stale),
-        "unknown_mac_in_static_range": _fmt(squat),
-        "counts": {
-            "free_but_responding": len(free),
-            "stale_reservations": len(stale),
-            "unknown_mac_in_static_range": len(squat),
-        },
-    }

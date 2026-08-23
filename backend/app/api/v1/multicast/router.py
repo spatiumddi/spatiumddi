@@ -46,6 +46,7 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, or_, select
 
 from app.api.deps import DB, CurrentUser
+from app.api.v1._common import BulkDeleteResponse
 from app.api.v1.ownership._audit import write_audit
 from app.core.permissions import require_resource_permission
 from app.models.ipam import IPAddress, IPSpace
@@ -734,10 +735,10 @@ async def update_group(
     return MulticastGroupRead.model_validate(row)
 
 
-@router.post("/groups/bulk-delete")
+@router.post("/groups/bulk-delete", response_model=BulkDeleteResponse)
 async def bulk_delete_groups(
     body: MulticastGroupBulkDelete, db: DB, user: CurrentUser
-) -> dict[str, Any]:
+) -> BulkDeleteResponse:
     """Hard-delete the named multicast groups in one transaction.
 
     Cascades to ports + memberships per the FK declarations on
@@ -747,7 +748,7 @@ async def bulk_delete_groups(
     in practice but we mirror the same shape so the operator UI
     can lean on the standard pattern."""
     if not body.ids:
-        return {"deleted": 0, "not_found": []}
+        return BulkDeleteResponse(deleted=0, not_found=[])
 
     rows = (
         (await db.execute(select(MulticastGroup).where(MulticastGroup.id.in_(body.ids))))
@@ -768,7 +769,7 @@ async def bulk_delete_groups(
         )
         await db.delete(r)
     await db.commit()
-    return {"deleted": len(rows), "not_found": not_found}
+    return BulkDeleteResponse(deleted=len(rows), not_found=not_found)
 
 
 @router.delete("/groups/{group_id:uuid}", status_code=status.HTTP_204_NO_CONTENT)

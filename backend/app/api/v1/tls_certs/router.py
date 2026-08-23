@@ -386,8 +386,64 @@ async def list_probes(
     )
 
 
-@router.get("/{target_id}/chain")
-async def get_chain(target_id: uuid.UUID, db: DB, _: CurrentUser) -> dict[str, Any]:
+class CertChainEntry(BaseModel):
+    """One parsed certificate from the captured bundle.
+
+    Every field ``parse_chain_pem`` emits is declared, not just the obvious
+    ones: leaving the rest to ``extra`` would keep them off the published
+    schema, so a generated client would be missing exactly the fields the
+    existing chain view already renders (``TLSChainCert`` in the frontend).
+    Typing half a model is the failure this whole change is about.
+    """
+
+    model_config = {"extra": "allow"}
+
+    #: 0-based depth in the presented bundle: leaf first, root last.
+    position: int | None = None
+    role: str | None = None
+    subject_cn: str | None = None
+    issuer_cn: str | None = None
+    serial: str | None = None
+    not_before: datetime | None = None
+    not_after: datetime | None = None
+    key_algo: str | None = None
+    key_size: int | None = None
+    sig_algo: str | None = None
+    is_ca: bool | None = None
+    self_signed: bool | None = None
+    fingerprint_sha256: str | None = None
+
+
+class CertChainResponse(BaseModel):
+    """The latest successful probe's captured chain. Public material only —
+    no private key is ever stored or returned."""
+
+    target_id: uuid.UUID
+    probed_at: datetime
+    subject_cn: str | None = None
+    issuer_cn: str | None = None
+    serial: str | None = None
+    not_before: datetime | None = None
+    not_after: datetime | None = None
+    sans: list[str] = []
+    key_algo: str | None = None
+    key_size: int | None = None
+    sig_algo: str | None = None
+    chain_depth: int | None = None
+    #: ``None`` when validation was never attempted, which is not the same as
+    #: a chain that failed to validate.
+    chain_valid: bool | None = None
+    chain_error: str | None = None
+    self_signed: bool | None = None
+    fingerprint_sha256: str | None = None
+    leaf_pem: str | None = None
+    chain_pem: str | None = None
+    #: leaf → intermediate(s) → root, parsed from the captured bundle.
+    chain: list[CertChainEntry] = []
+
+
+@router.get("/{target_id}/chain", response_model=CertChainResponse)
+async def get_chain(target_id: uuid.UUID, db: DB, _: CurrentUser) -> CertChainResponse:
     """Latest probe's captured PEM + parsed identity (powers the UI chain
     view + the get_cert_chain MCP tool). Public material only."""
     if (await db.get(TLSCertTarget, target_id)) is None:
@@ -400,29 +456,31 @@ async def get_chain(target_id: uuid.UUID, db: DB, _: CurrentUser) -> dict[str, A
     )
     if probe is None:
         raise HTTPException(status_code=404, detail="no successful probe yet")
-    return {
-        "target_id": str(target_id),
-        "probed_at": probe.probed_at.isoformat(),
-        "subject_cn": probe.subject_cn,
-        "issuer_cn": probe.issuer_cn,
-        "serial": probe.serial,
-        "not_before": probe.not_before.isoformat() if probe.not_before else None,
-        "not_after": probe.not_after.isoformat() if probe.not_after else None,
-        "sans": probe.sans_json or [],
-        "key_algo": probe.key_algo,
-        "key_size": probe.key_size,
-        "sig_algo": probe.sig_algo,
-        "chain_depth": probe.chain_depth,
-        "chain_valid": probe.chain_valid,
-        "chain_error": probe.chain_error,
-        "self_signed": probe.self_signed,
-        "fingerprint_sha256": probe.fingerprint_sha256,
-        "leaf_pem": probe.leaf_pem,
-        "chain_pem": probe.chain_pem,
-        # Per-cert breakdown (leaf → intermediate(s) → root) parsed from the
-        # captured bundle, for the cert detail view.
-        "chain": parse_chain_pem(probe.chain_pem or probe.leaf_pem),
-    }
+    return CertChainResponse.model_validate(
+        {
+            "target_id": str(target_id),
+            "probed_at": probe.probed_at.isoformat(),
+            "subject_cn": probe.subject_cn,
+            "issuer_cn": probe.issuer_cn,
+            "serial": probe.serial,
+            "not_before": probe.not_before.isoformat() if probe.not_before else None,
+            "not_after": probe.not_after.isoformat() if probe.not_after else None,
+            "sans": probe.sans_json or [],
+            "key_algo": probe.key_algo,
+            "key_size": probe.key_size,
+            "sig_algo": probe.sig_algo,
+            "chain_depth": probe.chain_depth,
+            "chain_valid": probe.chain_valid,
+            "chain_error": probe.chain_error,
+            "self_signed": probe.self_signed,
+            "fingerprint_sha256": probe.fingerprint_sha256,
+            "leaf_pem": probe.leaf_pem,
+            "chain_pem": probe.chain_pem,
+            # Per-cert breakdown (leaf → intermediate(s) → root) parsed from the
+            # captured bundle, for the cert detail view.
+            "chain": parse_chain_pem(probe.chain_pem or probe.leaf_pem),
+        }
+    )
 
 
 @router.get("/{target_id}/ct-log")

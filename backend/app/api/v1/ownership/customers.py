@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, or_, select
 
 from app.api.deps import DB, CurrentUser
+from app.api.v1._common import BulkDeleteResponse
 from app.api.v1.ownership._audit import write_audit
 from app.core.permissions import require_resource_permission
 from app.models.ownership import CUSTOMER_STATUSES, Customer
@@ -178,6 +179,64 @@ async def get_customer(customer_id: uuid.UUID, db: DB, _: CurrentUser) -> Custom
     return CustomerRead.model_validate(row)
 
 
+class CustomerOwnedResources(BaseModel):
+    """Counts of what a customer owns, per resource type.
+
+    Soft-deleted rows are excluded where the model supports it — a
+    decommission check must not be blocked by resources already in the trash.
+    """
+
+    ip_spaces: int
+    ip_blocks: int
+    subnets: int
+    circuits: int
+    services: int
+    asns: int
+    dns_zones: int
+    domains: int
+    overlays: int
+
+
+class CustomerSummary(BaseModel):
+    """One customer plus everything it owns (issue #917).
+
+    ``GET /customers/{id}`` returns the row; answering "is this customer safe
+    to decommission?" from it meant nine list calls against nine routers. The
+    copilot could already do this in one turn, which is exactly the asymmetry
+    #917 catalogued.
+    """
+
+    id: uuid.UUID
+    name: str
+    account_number: str | None = None
+    status: str
+    contact_email: str | None = None
+    contact_phone: str | None = None
+    contact_address: str | None = None
+    notes: str | None = None
+    owned_resources: CustomerOwnedResources
+    #: Sum across every bucket — the single number that answers "is anything
+    #: still attached to this customer".
+    owned_resource_total: int
+    tags: dict[str, Any] = {}
+    created_at: datetime | None = None
+
+
+@router.get("/{customer_id:uuid}/summary", response_model=CustomerSummary)
+async def get_customer_summary_route(
+    customer_id: uuid.UUID, db: DB, current_user: CurrentUser
+) -> CustomerSummary:
+    """A customer plus a count of every resource type it owns (#917)."""
+    from app.services.ownership.customer_summary import (  # noqa: PLC0415
+        build_customer_summary,
+    )
+
+    row = await db.get(Customer, customer_id)
+    if row is None or row.deleted_at is not None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Customer not found")
+    return CustomerSummary.model_validate(await build_customer_summary(db, row))
+
+
 @router.put("/{customer_id:uuid}", response_model=CustomerRead)
 async def update_customer(
     customer_id: uuid.UUID, body: CustomerUpdate, db: DB, user: CurrentUser
@@ -247,12 +306,12 @@ async def delete_customer(customer_id: uuid.UUID, db: DB, user: CurrentUser) -> 
     await db.commit()
 
 
-@router.post("/bulk-delete")
+@router.post("/bulk-delete", response_model=BulkDeleteResponse)
 async def bulk_delete_customers(
     body: CustomerBulkDelete, db: DB, user: CurrentUser
-) -> dict[str, Any]:
+) -> BulkDeleteResponse:
     if not body.ids:
-        return {"deleted": 0, "not_found": []}
+        return BulkDeleteResponse(deleted=0, not_found=[])
 
     from datetime import UTC  # noqa: PLC0415
     from datetime import datetime as _dt  # noqa: PLC0415
@@ -283,7 +342,7 @@ async def bulk_delete_customers(
             resource_display=r.name,
         )
     await db.commit()
-    return {"deleted": len(rows), "not_found": not_found}
+    return BulkDeleteResponse(deleted=len(rows), not_found=not_found)
 
 
 __all__ = ["router"]

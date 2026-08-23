@@ -122,6 +122,19 @@ jobs:
       - name: mypy
         run: python -m mypy app
 
+      # Stops the untyped-response-schema class from growing (issue #917).
+      # A route with no response_model publishes an unconstrained object, so a
+      # generated client gets a dictionary instead of a model — the same
+      # silent drift #907 fixed for nullable properties. 91 routes were in
+      # that state when the guard landed; the checked-in baseline may shrink,
+      # never grow. Extraction imports the app, which this job already has
+      # installed, so no container is needed here.
+      - name: Untyped-route guard
+        working-directory: ${{ github.workspace }}
+        run: |
+          python3 scripts/lint_untyped_routes.py --list > /tmp/untyped-routes.txt
+          python3 scripts/lint_untyped_routes.py --check /tmp/untyped-routes.txt
+
       # Enforces the expand/contract migration contract (issue #296).
       # Every Alembic migration must be safe against BOTH N-1 and N
       # application code during the rolling-upgrade mixed-version

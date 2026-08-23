@@ -5,6 +5,7 @@ from fastapi import APIRouter
 from app.api.v1.dhcp.agents import router as agents_router
 from app.api.v1.dhcp.client_classes import router as client_classes_router
 from app.api.v1.dhcp.lease_history import router as lease_history_router
+from app.api.v1.dhcp.leases import router as leases_router
 from app.api.v1.dhcp.mac_blocks import router as mac_blocks_router
 from app.api.v1.dhcp.option_codes import router as option_codes_router
 from app.api.v1.dhcp.option_templates import router as option_templates_router
@@ -22,6 +23,7 @@ router = APIRouter()
 router.include_router(server_groups_router)
 router.include_router(servers_router)
 router.include_router(lease_history_router)
+router.include_router(leases_router)
 router.include_router(scopes_router)
 router.include_router(pools_router)
 router.include_router(pxe_profiles_router)

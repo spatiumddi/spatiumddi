@@ -18,6 +18,7 @@ from pydantic import BaseModel, field_validator
 from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
+from app.api.v1._common import StatusResponse
 from app.core.crypto import decrypt_str, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.permissions import require_resource_permission
@@ -363,7 +364,7 @@ async def delete_instance(instance_id: uuid.UUID, db: DB, user: SuperAdmin) -> N
     "/instances/{instance_id}/sync",
     status_code=status.HTTP_202_ACCEPTED,
 )
-async def sync_instance(instance_id: uuid.UUID, db: DB, _: SuperAdmin) -> dict[str, str]:
+async def sync_instance(instance_id: uuid.UUID, db: DB, _: SuperAdmin) -> StatusResponse:
     t = await db.get(NetbirdInstance, instance_id)
     if t is None:
         raise HTTPException(status_code=404, detail="NetBird instance not found")
@@ -372,9 +373,9 @@ async def sync_instance(instance_id: uuid.UUID, db: DB, _: SuperAdmin) -> dict[s
 
     try:
         result = sync_instance_now.delay(str(t.id))
-        return {"status": "queued", "task_id": result.id}
+        return StatusResponse(status="queued", task_id=result.id)
     except Exception:  # noqa: BLE001
-        return {"status": "broker_unavailable", "task_id": ""}
+        return StatusResponse(status="broker_unavailable", task_id="")
 
 
 @router.post("/instances/test", response_model=TestConnectionResponse)

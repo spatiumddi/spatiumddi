@@ -903,6 +903,53 @@ suggestion, free-space treemap.
     to `scripts/prune-release-assets.sh`**. The version handshake the issue
     wanted is `GET /api/v1/version` (unauthenticated), **not**
     `/health/platform`, which reports no version at all.
+  - ✅ [**API-surface sweep — MCP-only capabilities and untyped responses**](https://github.com/spatiumddi/spatiumddi/issues/917)
+    — the five issues the mobile client filed were all one finding: **data the
+    server already has that a REST client cannot get, or cannot get typed**.
+    Non-negotiable #13 guarantees every REST surface gets MCP tools, and
+    nothing guaranteed the converse — the copilot tools are written against
+    the *service layer*, so a capability could exist, be reachable from a chat
+    window, and be invisible to the only API an external client has. A sweep of
+    every registered tool against the route table, all 181 models against
+    `backend/app/api/`, and all ~1,058 handlers for response typing found four
+    more instances and one systemic gap.
+    **Four capabilities given routes**, each sharing one service function with
+    its tool so the two cannot answer differently: fleet-wide **lease search +
+    lease history** (`GET /dhcp/leases`, `/dhcp/lease-history` — the mobile
+    client-lookup screen's own question, "does this MAC have a lease
+    *anywhere*", previously one call per server plus a client-side merge that
+    is order-sensitive); **IPAM hygiene** (`GET /ipam/reports/hygiene` — the
+    three #369 detections on demand, at a threshold the caller picks, rather
+    than only as fired alert events at whatever a rule was configured with);
+    the **vendor rollup** (`/ipam/reports/vendors{,/devices}`); and the
+    **customer decommission summary** (`/customers/{id}/summary` — nine list
+    calls collapsed to one). The `mac` filter on `/dhcp/leases` normalises
+    separators (`AA-BB-…` / `aabb.ccdd.…` / bare hex all match) and compares
+    as `MACADDR` rather than casting to text, which would have been
+    non-sargable and defeated `ix_dhcp_lease_server_mac` on the endpoint's
+    flagship query. Also `GET /alerts/events` gained
+    `subject_type` / `subject_id` / `severity`, so a per-resource alert panel
+    no longer pulls 1,000 events and filters client-side.
+    **The systemic gap was response typing.** ~113 handlers returned a bare
+    `dict`, publishing an unconstrained object — and annotating `-> dict[str,
+    Any]` does *not* help, because FastAPI infers a response model from the
+    return annotation and the inferred one is still `{"type": "object"}` with
+    no properties. That detail matters: the first cut of the guard checked
+    `route.response_model is not None` and reported **zero** findings while
+    every one of those routes stayed unusable to a generator, so detection runs
+    against the generated document instead. ~22 routes were typed (the reports
+    #917 named, plus shared `StatusResponse` / `BulkDeleteResponse` for the
+    sync-trigger and bulk-delete shapes that were identical in six places), and
+    `scripts/lint_untyped_routes.py` + a checked-in baseline of the remaining
+    91 stops the set growing — the `lint_migrations.py` pattern.
+    **Two bugs found on the way.** `enrich_leases` extraction surfaced that the
+    per-server lease route's INET/MACADDR `field_validator` would have been
+    lost by a naive copy (it exists because the first `windows_dhcp` lease
+    500'd the list); and the MCP vendor-device lookup ran a `db.get(Subnet, …)`
+    **per matching row** — an N+1 that was invisible on a lab estate and is now
+    reachable over HTTP, so it became one batched query. 1 MCP tool
+    (`find_dhcp_lease_history`) — the only place the sweep found the gap
+    pointing the *other* way.
   - ✅ [**The published document is consumable by a code generator**](https://github.com/spatiumddi/spatiumddi/issues/907)
     — two defects found generating the Swift client against a running control
     plane, both of which break a generated client *silently*: it compiles,

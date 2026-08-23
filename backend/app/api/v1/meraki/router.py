@@ -18,6 +18,7 @@ from pydantic import BaseModel, field_validator
 from sqlalchemy import func, select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
+from app.api.v1._common import StatusResponse
 from app.core.crypto import decrypt_str, encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.permissions import require_resource_permission
@@ -350,8 +351,10 @@ async def delete_org(org_pk: uuid.UUID, db: DB, user: SuperAdmin) -> None:
     await db.commit()
 
 
-@router.post("/orgs/{org_pk}/sync", status_code=status.HTTP_202_ACCEPTED)
-async def sync_org(org_pk: uuid.UUID, db: DB, _: SuperAdmin) -> dict[str, str]:
+@router.post(
+    "/orgs/{org_pk}/sync", status_code=status.HTTP_202_ACCEPTED, response_model=StatusResponse
+)
+async def sync_org(org_pk: uuid.UUID, db: DB, _: SuperAdmin) -> StatusResponse:
     o = await db.get(MerakiOrg, org_pk)
     if o is None:
         raise HTTPException(status_code=404, detail="Meraki org not found")
@@ -360,9 +363,9 @@ async def sync_org(org_pk: uuid.UUID, db: DB, _: SuperAdmin) -> dict[str, str]:
 
     try:
         result = sync_org_now.delay(str(o.id))
-        return {"status": "queued", "task_id": result.id}
+        return StatusResponse(status="queued", task_id=result.id)
     except Exception:  # noqa: BLE001
-        return {"status": "broker_unavailable", "task_id": ""}
+        return StatusResponse(status="broker_unavailable", task_id="")
 
 
 @router.get("/orgs/{org_pk}/objects", response_model=list[FirewallObjectResponse])

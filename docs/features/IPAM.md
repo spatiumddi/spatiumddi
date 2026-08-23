@@ -1182,6 +1182,73 @@ Implementation: `SubnetDomain` junction table; `IPAddress.domain_id` (FK → DNS
 
 ---
 
+## 12a. Address-space reports (issue #917)
+
+Three read-only reports that answer "what is wrong with my address space
+right now", each at a threshold the caller picks rather than one an alert rule
+was configured with.
+
+| Route | Answers |
+|---|---|
+| `GET /api/v1/ipam/reports/stale-ips` | allocated IPs nothing has seen in N days (#45) |
+| `GET /api/v1/ipam/reports/hygiene` | the three #369 hygiene detections, live |
+| `GET /api/v1/ipam/reports/vendors` | device counts by hardware vendor |
+| `GET /api/v1/ipam/reports/vendors/devices` | the devices behind one vendor bucket |
+| `GET /api/v1/ipam/subnets/{id}/reconciliation` | per-subnet discovery reconciliation (#23) |
+
+### Hygiene
+
+Three buckets, all derived from the discovery `last_seen_at` / `ip_mac_history`
+signals:
+
+* **`free_but_responding`** — rows marked `available` that answered on the
+  wire inside `free_responding_days`. Either the row is wrong or something is
+  squatting; both matter before the address is handed out again.
+* **`stale_reservations`** — `reserved` / `static_dhcp` rows nothing has seen
+  in `stale_reservation_days`. Requires at least one prior sighting, so a
+  subnet where discovery was never enabled does not read as dead.
+* **`unknown_mac_in_static_range`** — a reservation whose recently observed
+  MAC differs from the recorded one. Operator-set `mac_address` is never
+  overwritten by discovery, so a differing recent observation is a genuine
+  "someone else is answering on this IP".
+
+These have existed as **alert rules** since #369, which answers "tell me when
+this becomes true". The report answers "is it true right now", without
+requiring a rule to have been configured — and it calls the same matchers the
+evaluator does, so the two cannot disagree about what a detection means.
+
+`counts` are the full match counts while the row lists are capped at `limit`;
+`truncated` says whether any bucket was cut, so a client that received exactly
+`limit` rows does not have to compare against `counts` to find out.
+
+### Vendor rollup
+
+Requires OUI lookup to be enabled (Settings → IPAM). When it is off the rollup
+returns zero matches with an unchanged shape — `total_macs_seen` is what tells
+an empty network apart from a disabled feature or a stale OUI table.
+
+`source` selects `ipam` (managed rows), `dhcp_active` (live leases), or `all`
+(the union, deduplicated by MAC — a device with both is one device).
+
+## 12b. "Where has this MAC been?"
+
+Per-IP MAC history is stored in `ip_mac_history` and surfaced through the
+**new-device** endpoints rather than an IPAM-named one, which is not
+guessable:
+
+```
+GET /api/v1/new-devices/sightings?classification=known&search=<mac>
+```
+
+Each row carries the MAC, the IP it was seen on, that IP's subnet, the OUI
+vendor, and `first_seen` / `last_seen`. `classification=new` is the
+unacknowledged review queue; `known` is the history. The surface is gated on
+the `security.new_devices` feature module.
+
+Pair it with `GET /api/v1/dhcp/lease-history?mac=<mac>` (see
+[`DHCP.md`](DHCP.md)) for the DHCP side of the same question — that one is
+fleet-wide and needs no module.
+
 ## 13. Network Device Management (SNMP Polling)
 
 SpatiumDDI can manage a registry of **network devices** (routers, switches, access points) that are polled via SNMP to gather:

@@ -9,7 +9,7 @@ import re
 import string
 import uuid
 from datetime import UTC, date, datetime, timedelta
-from typing import Annotated, Any, cast
+from typing import Annotated, Any, Literal, cast
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
@@ -69,7 +69,14 @@ from app.services.ipam.address_set_gate import (
 from app.services.ipam.address_set_gate import (
     user_can_write_ip as _user_can_write_ip,
 )
+from app.services.ipam.hygiene import (
+    DEFAULT_FREE_RESPONDING_DAYS,
+    DEFAULT_SQUAT_DAYS,
+    DEFAULT_STALE_RESERVATION_DAYS,
+    build_hygiene_report,
+)
 from app.services.ipam.probe_policy import resolve_probe_policy
+from app.services.ipam.vendor_rollup import count_by_vendor, find_devices
 from app.services.oui import bulk_lookup_vendors, is_voip_phone_vendor, normalize_mac_key
 from app.services.tags import apply_tag_filter
 
@@ -4469,13 +4476,124 @@ async def get_subnet_utilization_history(
     ]
 
 
-@router.get("/subnets/{subnet_id}/reconciliation")
+# ── Typed report envelopes (issue #917) ──────────────────────────────
+#
+# These three reports were the largest untyped surfaces in the API: each
+# returned a bare ``dict``, so the published OpenAPI schema was ``{}`` and a
+# generated client got an untyped container. #907 fixed that class for
+# nullable *properties*; a route with no ``response_model`` at all is the same
+# silent drift arriving through a different door.
+#
+# Timestamps here are declared ``datetime`` even though the service layer
+# hands back ``isoformat()`` strings — pydantic parses them on the way in and
+# the #907 serializer re-emits them as RFC 3339 with milliseconds, so typing
+# these also fixes their wire format.
+
+
+class StaleIPEntry(BaseModel):
+    id: uuid.UUID
+    address: str
+    status: str
+    hostname: str | None = None
+    mac_address: str | None = None
+    last_seen_at: datetime | None = None
+    last_seen_method: str | None = None
+    #: ``None`` when the row was never seen at all, which is a different
+    #: statement from "stale for 0 days".
+    days_stale: int | None = None
+    subnet_id: uuid.UUID
+    subnet_network: str | None = None
+    subnet_name: str | None = None
+
+
+class StaleIPReport(BaseModel):
+    generated_at: datetime
+    stale_days: int
+    include_never_seen: bool
+    #: Full match count, not ``len(entries)`` — the page is capped and an
+    #: estate with thousands of stale rows is exactly the one that needs the
+    #: real number.
+    total: int
+    limit: int
+    offset: int
+    entries: list[StaleIPEntry]
+
+
+class ReconciliationEntry(BaseModel):
+    id: uuid.UUID
+    address: str
+    status: str
+    hostname: str | None = None
+    mac_address: str | None = None
+    last_seen_at: datetime | None = None
+    last_seen_method: str | None = None
+
+
+class ReconciliationCounts(BaseModel):
+    in_ipam_not_seen: int
+    discovered_not_allocated: int
+    status_mismatch: int
+
+
+class ReconciliationReport(BaseModel):
+    subnet_id: uuid.UUID
+    network: str
+    generated_at: datetime
+    stale_minutes: int
+    #: ``None`` when discovery has never run for this subnet — which is why
+    #: an empty report must not read as "everything is reconciled".
+    last_discovery_at: datetime | None = None
+    counts: ReconciliationCounts
+    in_ipam_not_seen: list[ReconciliationEntry]
+    discovered_not_allocated: list[ReconciliationEntry]
+    status_mismatch: list[ReconciliationEntry]
+
+
+class HygieneFinding(BaseModel):
+    ip_id: uuid.UUID
+    address: str
+    detail: str
+
+
+class HygieneCounts(BaseModel):
+    free_but_responding: int
+    stale_reservations: int
+    unknown_mac_in_static_range: int
+
+
+class HygieneThresholds(BaseModel):
+    free_responding_days: int
+    stale_reservation_days: int
+    squat_days: int
+
+
+class HygieneReport(BaseModel):
+    """Live answers to the three #369 hygiene detections.
+
+    The detections have existed as alert *rules* since #369; this reports them
+    on demand at a threshold the caller chooses, without requiring a rule to
+    have been configured first (issue #917).
+    """
+
+    free_but_responding: list[HygieneFinding]
+    stale_reservations: list[HygieneFinding]
+    unknown_mac_in_static_range: list[HygieneFinding]
+    counts: HygieneCounts
+    thresholds: HygieneThresholds
+    limit: int
+    #: True when any bucket held more rows than ``limit`` — otherwise a client
+    #: that received exactly ``limit`` rows has to compare against ``counts``
+    #: itself to find out.
+    truncated: bool
+
+
+@router.get("/subnets/{subnet_id}/reconciliation", response_model=ReconciliationReport)
 async def get_subnet_reconciliation(
     subnet_id: uuid.UUID,
     current_user: CurrentUser,
     db: DB,
     stale_minutes: int = 1440,
-) -> dict:
+) -> ReconciliationReport:
     """IP-discovery reconciliation report for a subnet (issue #23).
 
     Three buckets — allocated-but-not-seen, discovered-but-not-allocated,
@@ -4489,7 +4607,13 @@ async def get_subnet_reconciliation(
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
     stale_minutes = max(1, min(stale_minutes, 525600))  # clamp 1 min … 1 year
-    return await build_reconciliation_report(db, subnet, stale_minutes=stale_minutes)
+    # ``model_validate`` rather than a bare return: the service hands back a
+    # plain dict (it predates the typed envelope and is also called by the
+    # copilot tool), and validating here is what makes the declared schema a
+    # guarantee rather than a claim.
+    return ReconciliationReport.model_validate(
+        await build_reconciliation_report(db, subnet, stale_minutes=stale_minutes)
+    )
 
 
 @router.post("/subnets/{subnet_id}/discover", status_code=status.HTTP_202_ACCEPTED)
@@ -4539,7 +4663,7 @@ async def trigger_subnet_discovery(subnet_id: uuid.UUID, current_user: CurrentUs
 # any row back), stamping ``user_modified_at`` so a later sweep won't undo it.
 
 
-@router.get("/reports/stale-ips")
+@router.get("/reports/stale-ips", response_model=StaleIPReport)
 async def get_stale_ip_report(
     current_user: CurrentUser,
     db: DB,
@@ -4550,7 +4674,7 @@ async def get_stale_ip_report(
     subnet_id: uuid.UUID | None = Query(None),
     limit: int = Query(200, ge=1, le=1000),
     offset: int = Query(0, ge=0),
-) -> dict:
+) -> StaleIPReport:
     """Allocated IPs nothing has seen in ``stale_days`` days (issue #45).
 
     Optional ``space_id`` / ``block_id`` / ``subnet_id`` scope the report.
@@ -4560,15 +4684,158 @@ async def get_stale_ip_report(
     """
     from app.services.ipam.stale_ips import build_stale_ip_report
 
-    return await build_stale_ip_report(
-        db,
-        stale_days=stale_days,
-        include_never_seen=include_never_seen,
-        space_id=space_id,
-        block_id=block_id,
-        subnet_id=subnet_id,
-        limit=limit,
-        offset=offset,
+    return StaleIPReport.model_validate(
+        await build_stale_ip_report(
+            db,
+            stale_days=stale_days,
+            include_never_seen=include_never_seen,
+            space_id=space_id,
+            block_id=block_id,
+            subnet_id=subnet_id,
+            limit=limit,
+            offset=offset,
+        )
+    )
+
+
+@router.get("/reports/hygiene", response_model=HygieneReport)
+async def get_ip_hygiene_report(
+    current_user: CurrentUser,
+    db: DB,
+    free_responding_days: int = Query(
+        DEFAULT_FREE_RESPONDING_DAYS,
+        ge=1,
+        le=365,
+        description="An 'available' row counts as responding if seen within N days.",
+    ),
+    stale_reservation_days: int = Query(
+        DEFAULT_STALE_RESERVATION_DAYS,
+        ge=1,
+        le=3650,
+        description="A reservation counts as stale if nothing has seen it in N days.",
+    ),
+    squat_days: int = Query(
+        DEFAULT_SQUAT_DAYS,
+        ge=1,
+        le=365,
+        description="An observed MAC differing from the recorded one counts if seen within N days.",
+    ),
+    limit: int = Query(100, ge=1, le=500, description="Max rows per bucket."),
+) -> HygieneReport:
+    """Address-space hygiene, computed live (issue #917 over the #369 detections).
+
+    Three buckets: IPs marked ``available`` that are answering, reservations
+    nothing has seen in ``stale_reservation_days``, and static-range IPs
+    answered by a **different MAC** than the one recorded — a squat.
+
+    These have existed as alert *rules* since #369, which answers "tell me
+    when this becomes true". This answers "is it true right now, at the
+    threshold I care about", without requiring a rule to have been configured
+    first — and it is the same code path the rules use, so the two cannot
+    disagree about what a detection means.
+    """
+    return HygieneReport.model_validate(
+        await build_hygiene_report(
+            db,
+            free_responding_days=free_responding_days,
+            stale_reservation_days=stale_reservation_days,
+            squat_days=squat_days,
+            limit=limit,
+        )
+    )
+
+
+# ── Vendor rollup (issue #917) ───────────────────────────────────────
+
+
+class VendorCount(BaseModel):
+    vendor: str
+    count: int
+
+
+class VendorRollup(BaseModel):
+    """MAC → vendor counts across the estate.
+
+    ``total_macs_seen`` counts every MAC in scope and ``total_with_vendor``
+    only those whose OUI resolved. The gap between the two is how complete the
+    OUI table is — collapsing them would make a stale table look like an empty
+    network, and OUI lookup is off by default.
+    """
+
+    source: str
+    total_macs_seen: int
+    #: MACs whose OUI resolved, across the whole estate — NOT narrowed by
+    #: ``vendor_search``, so it stays a statement about the OUI table.
+    total_with_vendor: int
+    #: MACs in the buckets actually returned, i.e. after ``vendor_search``.
+    matching_macs: int
+    distinct_vendors: int
+    vendors: list[VendorCount]
+
+
+class VendorDevice(BaseModel):
+    #: ``ipam`` for a managed row, ``dhcp_lease`` for a currently-active lease.
+    source: str
+    ip_address: str
+    mac_address: str
+    vendor: str
+    hostname: str | None = None
+    fqdn: str | None = None
+    subnet_id: uuid.UUID | None = None
+    subnet_network: str | None = None
+    subnet_name: str | None = None
+    status: str | None = None
+    last_seen_at: datetime | None = None
+
+
+class VendorDeviceList(BaseModel):
+    vendor_search: str
+    matches: list[VendorDevice]
+    error: str | None = None
+
+
+@router.get("/reports/vendors", response_model=VendorRollup)
+async def get_vendor_rollup(
+    current_user: CurrentUser,
+    db: DB,
+    source: Literal["ipam", "dhcp_active", "all"] = Query(
+        "ipam",
+        description="'ipam' = managed rows, 'dhcp_active' = live leases, 'all' = union by MAC.",
+    ),
+    vendor_search: str | None = Query(
+        None, max_length=255, description="Case-insensitive substring on the OUI vendor name."
+    ),
+    limit: int = Query(100, ge=1, le=500),
+) -> VendorRollup:
+    """Device counts by hardware vendor — "how many Apple devices?" (#917).
+
+    Requires OUI lookup to be enabled in Settings → IPAM. When it is off the
+    rollup reports zero matches with an unchanged shape rather than erroring,
+    which ``total_macs_seen`` makes distinguishable from an empty network.
+    """
+    return VendorRollup.model_validate(
+        await count_by_vendor(db, source=source, vendor_search=vendor_search, limit=limit)
+    )
+
+
+@router.get("/reports/vendors/devices", response_model=VendorDeviceList)
+async def get_vendor_devices(
+    current_user: CurrentUser,
+    db: DB,
+    vendor_search: str = Query(
+        ..., min_length=1, max_length=255, description="e.g. 'apple', 'raspberry', 'cisco'."
+    ),
+    source: Literal["ipam", "dhcp_active", "all"] = Query("ipam"),
+    limit: int = Query(100, ge=1, le=500),
+) -> VendorDeviceList:
+    """The devices behind a vendor bucket, IPAM rows first.
+
+    Deduplicated by normalized MAC, so a device with both a managed row and a
+    live lease is listed once — as the managed row, which carries the hostname
+    and subnet context the lease does not.
+    """
+    return VendorDeviceList.model_validate(
+        await find_devices(db, vendor_search=vendor_search, source=source, limit=limit)
     )
 
 

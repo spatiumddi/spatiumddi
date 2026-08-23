@@ -30,6 +30,7 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, select
 
 from app.api.deps import DB, CurrentUser
+from app.api.v1._common import BulkDeleteResponse
 from app.api.v1.ownership._audit import write_audit
 from app.core.permissions import require_resource_permission
 from app.models.circuit import Circuit
@@ -529,12 +530,12 @@ async def delete_overlay(overlay_id: uuid.UUID, db: DB, user: CurrentUser) -> No
     await db.commit()
 
 
-@router.post("/bulk-delete")
+@router.post("/bulk-delete", response_model=BulkDeleteResponse)
 async def bulk_delete_overlays(
     body: OverlayBulkDelete, db: DB, user: CurrentUser
-) -> dict[str, Any]:
+) -> BulkDeleteResponse:
     if not body.ids:
-        return {"deleted": 0, "not_found": []}
+        return BulkDeleteResponse(deleted=0, not_found=[])
     rows = (
         (
             await db.execute(
@@ -563,7 +564,7 @@ async def bulk_delete_overlays(
             resource_display=r.name,
         )
     await db.commit()
-    return {"deleted": len(rows), "not_found": not_found}
+    return BulkDeleteResponse(deleted=len(rows), not_found=not_found)
 
 
 # ── Site membership CRUD ────────────────────────────────────────────

@@ -237,11 +237,37 @@ async def delete_error(
     await db.commit()
 
 
-@router.get("/name-conformance")
+class NameConformanceExample(BaseModel):
+    """One offending value. ``context`` is present for categories where the
+    value alone is ambiguous (a record owner needs its zone)."""
+
+    id: str
+    value: str
+    reason: str
+    context: str | None = None
+
+
+class NameConformanceCategory(BaseModel):
+    category: str
+    #: Exact count — only ``examples`` is truncated.
+    total: int
+    #: True when the scan hit its own row cap, so ``total`` is a floor rather
+    #: than the whole picture.
+    scanned_capped: bool
+    examples: list[NameConformanceExample]
+
+
+class NameConformanceReport(BaseModel):
+    total_nonconforming: int
+    examples_per_category: int
+    categories: list[NameConformanceCategory]
+
+
+@router.get("/name-conformance", response_model=NameConformanceReport)
 async def name_conformance(
     db: DB,
     current_user: CurrentUser,
-) -> dict[str, Any]:
+) -> NameConformanceReport:
     """Report existing names that the #597 DNS-name validators would reject.
 
     Read-only. The validators reject non-conforming names on write, but
@@ -250,4 +276,4 @@ async def name_conformance(
     so an operator can fix them deliberately. Nothing is mutated.
     """
     _require_superadmin(current_user)
-    return await scan_name_conformance(db)
+    return NameConformanceReport.model_validate(await scan_name_conformance(db))

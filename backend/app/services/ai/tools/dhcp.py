@@ -887,3 +887,88 @@ async def find_dhcp_server_stats(
             "release": int(totals_row.release or 0),
         },
     }
+
+
+# ── find_dhcp_lease_history (issue #917) ─────────────────────────────
+
+
+class FindDHCPLeaseHistoryArgs(BaseModel):
+    mac_address: str | None = Field(
+        default=None, description="Substring match on MAC (any separator form)."
+    )
+    ip_address: str | None = Field(default=None, description="IP or CIDR.")
+    hostname_search: str | None = Field(default=None, description="Hostname substring.")
+    lease_state: str | None = Field(
+        default=None, description="expired | released | removed | superseded."
+    )
+    server_id: str | None = Field(default=None, description="Filter to one DHCP server UUID.")
+    days: int = Field(default=90, ge=1, le=3650, description="Trailing window in days.")
+    limit: int = Field(default=50, ge=1, le=500)
+
+
+@register_tool(
+    name="find_dhcp_lease_history",
+    description=(
+        "Expired / released DHCP leases across every server — 'has this MAC "
+        "EVER had a lease here?', which find_dhcp_leases cannot answer "
+        "because it only sees leases that are still active. Use it to place "
+        "a device that is now offline, or to find which address a machine "
+        "used to hold. Retention follows "
+        "dhcp_lease_history_retention_days (default 90)."
+    ),
+    args_model=FindDHCPLeaseHistoryArgs,
+    category="dhcp",
+)
+async def find_dhcp_lease_history(
+    db: AsyncSession, user: User, args: FindDHCPLeaseHistoryArgs
+) -> list[dict[str, Any]]:
+    from app.api.v1.dhcp.lease_history import (  # noqa: PLC0415
+        VALID_LEASE_HISTORY_STATES,
+        apply_lease_history_filters,
+    )
+    from app.models.dhcp import DHCPLeaseHistory  # noqa: PLC0415
+
+    if args.lease_state and args.lease_state not in VALID_LEASE_HISTORY_STATES:
+        return [
+            {
+                "result": (
+                    f"{args.lease_state!r} is not a lease state; "
+                    f"expected one of {sorted(VALID_LEASE_HISTORY_STATES)}"
+                )
+            }
+        ]
+    since = datetime.now(UTC) - timedelta(days=args.days)
+    stmt = select(DHCPLeaseHistory).where(DHCPLeaseHistory.expired_at >= since)
+    if args.server_id:
+        try:
+            stmt = stmt.where(DHCPLeaseHistory.server_id == str(uuid.UUID(args.server_id.strip())))
+        except (ValueError, AttributeError):
+            return [{"result": f"{args.server_id!r} is not a server UUID"}]
+    # Shared with the REST route so the two cannot disagree about what a
+    # filter means (#917).
+    stmt = apply_lease_history_filters(
+        stmt,
+        mac=args.mac_address,
+        ip=args.ip_address,
+        hostname=args.hostname_search,
+        lease_state=args.lease_state,
+    )
+    rows = (
+        (await db.execute(stmt.order_by(DHCPLeaseHistory.expired_at.desc()).limit(args.limit)))
+        .scalars()
+        .all()
+    )
+    return [
+        {
+            "id": str(r.id),
+            "server_id": str(r.server_id),
+            "scope_id": str(r.scope_id) if r.scope_id else None,
+            "ip_address": str(r.ip_address),
+            "mac_address": str(r.mac_address),
+            "hostname": r.hostname,
+            "lease_state": r.lease_state,
+            "started_at": r.started_at.isoformat() if r.started_at else None,
+            "expired_at": r.expired_at.isoformat() if r.expired_at else None,
+        }
+        for r in rows
+    ]

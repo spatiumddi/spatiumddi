@@ -208,6 +208,53 @@ as a `datetime` and let it serialise normally.
 
 ---
 
+### 2.3 Every route declares a response schema
+
+A route with no `response_model` publishes an unconstrained object, so a
+generated client gets a dictionary where it should get a model: every field
+access is stringly-typed and every rename is a silent break. That is the same
+failure §2.2 describes for nullable properties, arriving through a different
+door — and it is not fixed by annotating the handler `-> dict[str, Any]`,
+because FastAPI infers a response model from the return annotation and the
+inferred one is still `{"type": "object"}` with no properties.
+
+**91 routes were in that state when issue #917 catalogued it.** Retyping all of
+them at once was not the point; stopping the set from growing was, so
+`scripts/lint_untyped_routes.py` guards it the way `scripts/lint_migrations.py`
+guards destructive migrations:
+
+```bash
+make lint-untyped-routes            # the check CI runs
+make lint-untyped-routes-baseline   # re-record after typing some
+```
+
+The baseline lives at `backend/untyped_routes_baseline.txt` and **may shrink,
+never grow**. A new entry means a route shipped without a schema — declare a
+`response_model` instead of baselining it.
+
+Detection runs against the generated OpenAPI document rather than the route
+attributes, because that is what a client actually consumes. Routes whose
+handler returns a `Response` subclass (file downloads, SSE streams) are
+excluded: they have no JSON body to describe.
+
+### 2.4 Copilot tools and REST routes are two views of one capability
+
+Non-negotiable #13 requires every new REST surface to get matching MCP tools.
+**The converse is equally required**, and was not enforced until #917: a
+capability reachable only from the Operator Copilot is invisible to every
+external client, because the copilot tools are written against the service
+layer rather than against HTTP.
+
+Five issues from the mobile client turned out to be instances of this
+(#903, #906, #907, #913, #914), and a sweep of every registered tool against
+the route table found four more: **fleet-wide lease search**, **IPAM hygiene
+findings**, the **vendor rollup**, and the **customer decommission summary**.
+(Pool occupancy was the same shape and shipped earlier as #913.)
+
+When adding a tool that computes something, add the route too, and have both
+call one shared service function so they cannot answer the same question
+differently.
+
 ## 3. Authentication
 
 The API authenticates via the HTTP **`Authorization: Bearer <token>`**

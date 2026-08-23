@@ -21,6 +21,7 @@ from pydantic import BaseModel, field_validator
 from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
+from app.api.v1._common import StatusResponse
 from app.core.crypto import decrypt_dict, encrypt_dict
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.permissions import require_resource_permission
@@ -370,8 +371,12 @@ async def delete_endpoint(endpoint_id: uuid.UUID, db: DB, user: SuperAdmin) -> N
     await db.commit()
 
 
-@router.post("/endpoints/{endpoint_id}/sync", status_code=status.HTTP_202_ACCEPTED)
-async def sync_endpoint(endpoint_id: uuid.UUID, db: DB, _: SuperAdmin) -> dict[str, str]:
+@router.post(
+    "/endpoints/{endpoint_id}/sync",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=StatusResponse,
+)
+async def sync_endpoint(endpoint_id: uuid.UUID, db: DB, _: SuperAdmin) -> StatusResponse:
     forbid_in_demo_mode("Cloud sync is disabled")
     e = await db.get(CloudEndpoint, endpoint_id)
     if e is None:
@@ -381,9 +386,9 @@ async def sync_endpoint(endpoint_id: uuid.UUID, db: DB, _: SuperAdmin) -> dict[s
 
     try:
         result = sync_endpoint_now.delay(str(e.id))
-        return {"status": "queued", "task_id": result.id}
+        return StatusResponse(status="queued", task_id=result.id)
     except Exception:  # noqa: BLE001 — broker may be down; surface gracefully
-        return {"status": "broker_unavailable", "task_id": ""}
+        return StatusResponse(status="broker_unavailable", task_id="")
 
 
 @router.post("/endpoints/test", response_model=TestConnectionResponse)

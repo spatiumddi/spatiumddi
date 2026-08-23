@@ -9,11 +9,12 @@ from typing import Any
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, field_validator
-from sqlalchemy import String, cast, func, or_, select
+from sqlalchemy import func, or_, select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.pagination import DEFAULT_PAGE_SIZE, MAX_PAGE, MAX_PAGE_SIZE, Page, paginate
 from app.api.v1.dhcp._audit import write_audit
+from app.api.v1.dhcp._leases import LeaseResponse, apply_lease_filters, enrich_leases
 from app.core.agent_wake import (
     collect_wake,
     dhcp_group_channel,
@@ -32,7 +33,6 @@ from app.drivers.dhcp.registry import CLOUD_DHCP_DRIVERS, get_driver
 from app.drivers.dhcp.windows import test_winrm_credentials
 from app.models.audit import AuditLog
 from app.models.dhcp import DHCPConfigOp, DHCPLease, DHCPMACBlock, DHCPScope, DHCPServer
-from app.models.dhcp_fingerprint import DHCPFingerprint
 from app.models.ipam import Subnet
 from app.models.metrics import DHCPMetricSample
 from app.services.dhcp.cloud_writethrough import push_cloud_scope_upsert
@@ -42,11 +42,6 @@ from app.services.dhcp.stats import (
     STATS_BUCKET_SECONDS,
     STATS_WINDOW_SECONDS,
     active_lease_count,
-)
-from app.services.oui import (
-    bulk_lookup_vendors,
-    is_voip_phone_vendor,
-    normalize_mac_key,
 )
 
 router = APIRouter(
@@ -292,40 +287,29 @@ class ServerResponse(BaseModel):
         )
 
 
-class LeaseResponse(BaseModel):
-    id: uuid.UUID
-    server_id: uuid.UUID
-    scope_id: uuid.UUID | None
-    ip_address: str
-    mac_address: str
-    hostname: str | None
-    state: str
-    starts_at: datetime | None
-    ends_at: datetime | None
-    expires_at: datetime | None
-    last_seen_at: datetime
-    # IEEE OUI vendor for this MAC, when the feature is enabled.
-    vendor: str | None = None
-    # ``True`` when the vendor matches the curated VoIP-phone list
-    # (issue #112 phase 3). Drives a Phone icon in the lease table.
-    is_voip_phone: bool = False
-    # Fingerbank passive-fingerprinting device classification for this MAC
-    # (issue #373), joined from ``dhcp_fingerprint`` when a fingerprint exists.
-    # All ``None`` when fingerprinting is off / unconfigured / not-yet-looked-up.
-    device_class: str | None = None
-    device_name: str | None = None
-    device_manufacturer: str | None = None
-    fingerbank_score: int | None = None
+class ServerSyncResponse(BaseModel):
+    """Result of ``POST /servers/{id}/sync``.
 
-    model_config = {"from_attributes": True}
+    Two shapes behind one route, which is why it needs its own model rather
+    than the shared ``StatusResponse``: an agentless cloud driver reconciles
+    scopes inline and reports how many; an agent-based one queues a config op
+    and reports the op id + the bundle etag the agent will converge on.
+    Whichever branch ran, the fields belonging to the other are ``null``.
+    """
 
-    # asyncpg decodes INET / MACADDR columns into ipaddress.IPv4Address and
-    # netaddr.EUI-like objects. Coerce to str for the wire — this hit our
-    # lease list 500 when the first windows_dhcp lease landed.
-    @field_validator("ip_address", "mac_address", mode="before")
-    @classmethod
-    def _to_str(cls, v: Any) -> Any:
-        return str(v) if v is not None else v
+    status: str
+    #: Cloud/agentless branch — scopes pushed in this reconcile.
+    #:
+    #: **Wire change (#917):** this was previously emitted as a JSON *string*
+    #: (``"3"``) because the untyped handler returned ``dict[str, str]``.
+    #: Typing the route corrected it to a number. Called out rather than
+    #: slipped in: a change in a PR about client contracts is exactly the
+    #: kind that should not be silent. No shipped caller reads it — the UI
+    #: shows the audit row, not this field.
+    scopes: int | None = None
+    #: Agent branch — the queued ``dhcp_config_op`` and the bundle etag.
+    op_id: uuid.UUID | None = None
+    etag: str | None = None
 
 
 class TestWindowsCredentialsRequest(BaseModel):
@@ -646,13 +630,17 @@ async def delete_server(server_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
     await db.commit()
 
 
-@router.post("/{server_id}/sync", status_code=status.HTTP_202_ACCEPTED)
+@router.post(
+    "/{server_id}/sync",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=ServerSyncResponse,
+)
 async def sync_server(
     server_id: uuid.UUID,
     db: DB,
     user: SuperAdmin,
     adopt_existing: bool = False,
-) -> dict[str, str]:
+) -> ServerSyncResponse:
     """Force a config push: rebuild the bundle, enqueue an apply_config op.
 
     Coalesces consecutive clicks: if an ``apply_config`` op is already
@@ -704,7 +692,7 @@ async def sync_server(
             new_value={"reconciled_scopes": len(scopes)},
         )
         await db.commit()
-        return {"status": "reconciled", "scopes": str(len(scopes))}
+        return ServerSyncResponse(status="reconciled", scopes=len(scopes))
     if is_read_only(s.driver):
         raise HTTPException(
             status_code=400,
@@ -743,7 +731,7 @@ async def sync_server(
         new_value={"etag": bundle.etag, "op_id": str(op.id)},
     )
     await db.commit()
-    return {"status": "queued", "op_id": str(op.id), "etag": bundle.etag}
+    return ServerSyncResponse(status="queued", op_id=op.id, etag=bundle.etag)
 
 
 @router.post("/test-windows-credentials", response_model=TestResult)
@@ -1434,53 +1422,14 @@ async def list_leases(
     s = await db.get(DHCPServer, server_id)
     if s is None:
         raise HTTPException(status_code=404, detail="Server not found")
-    q = select(DHCPLease).where(DHCPLease.server_id == server_id)
-    if device_class:
-        # Inner-join the fingerprint table so the page lands on matching rows.
-        q = q.join(DHCPFingerprint, DHCPFingerprint.mac_address == DHCPLease.mac_address).where(
-            DHCPFingerprint.fingerbank_device_class == device_class
-        )
-    if state:
-        q = q.where(DHCPLease.state == state)
-    if search and search.strip():
-        like = f"%{search.strip()}%"
-        # ip_address / mac_address are INET / MACADDR — cast to text for ilike.
-        q = q.where(
-            or_(
-                cast(DHCPLease.ip_address, String).ilike(like),
-                cast(DHCPLease.mac_address, String).ilike(like),
-                DHCPLease.hostname.ilike(like),
-            )
-        )
-    q = q.order_by(DHCPLease.last_seen_at.desc())
+    q = apply_lease_filters(
+        select(DHCPLease).where(DHCPLease.server_id == server_id),
+        search=search,
+        state=state,
+        device_class=device_class,
+    ).order_by(DHCPLease.last_seen_at.desc())
     rows, total = await paginate(db, q, page=page, page_size=page_size)
-
-    vendors = await bulk_lookup_vendors(
-        db, [str(lease.mac_address) if lease.mac_address else None for lease in rows]
-    )
-    # Batch-fetch fingerprints for the result MACs (one query, mirroring the
-    # OUI bulk-lookup pattern) and key by normalized MAC so the device class /
-    # name / manufacturer / score join into each lease without a per-row query.
-    macs = [str(lease.mac_address) for lease in rows if lease.mac_address]
-    fps: dict[str, DHCPFingerprint] = {}
-    if macs:
-        fp_rows = (
-            await db.execute(select(DHCPFingerprint).where(DHCPFingerprint.mac_address.in_(macs)))
-        ).scalars()
-        for fp in fp_rows:
-            fps[normalize_mac_key(str(fp.mac_address))] = fp
-    for lease in rows:
-        key = normalize_mac_key(str(lease.mac_address)) if lease.mac_address else None
-        vendor = vendors.get(key) if key else None
-        lease.vendor = vendor  # type: ignore[attr-defined]
-        lease.is_voip_phone = is_voip_phone_vendor(vendor)  # type: ignore[attr-defined]
-        fp = fps.get(key) if key else None
-        lease.device_class = fp.fingerbank_device_class if fp else None  # type: ignore[attr-defined]
-        lease.device_name = fp.fingerbank_device_name if fp else None  # type: ignore[attr-defined]
-        lease.device_manufacturer = (  # type: ignore[attr-defined]
-            fp.fingerbank_manufacturer if fp else None
-        )
-        lease.fingerbank_score = fp.fingerbank_score if fp else None  # type: ignore[attr-defined]
+    await enrich_leases(db, rows)
     return Page[LeaseResponse](
         items=[LeaseResponse.model_validate(lease) for lease in rows],
         total=total,
