@@ -14,6 +14,7 @@ Mirrors ``app.services.dns.config_bundle``.
 from __future__ import annotations
 
 import ipaddress
+import uuid
 from datetime import UTC, datetime
 
 import structlog
@@ -24,6 +25,7 @@ from sqlalchemy.orm import selectinload
 from app.drivers.dhcp.base import (
     ClientClassDef,
     ConfigBundle,
+    DevicePolicyClassDef,
     FailoverConfig,
     MACBlockDef,
     PhoneClassDef,
@@ -44,7 +46,9 @@ from app.models.dhcp import (
     DHCPServer,
     DHCPServerGroup,
 )
+from app.models.dhcp_device_policy import DHCPDevicePolicy
 from app.models.ipam import Subnet
+from app.services.dhcp.device_policy import compile_device_policy
 from app.services.dhcp.radvd import build_ra_config, render_radvd_conf
 from app.services.feature_modules import is_module_enabled
 
@@ -335,6 +339,7 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
 
     pxe_classes = await _assemble_pxe_classes(db, scope_rows)
     phone_classes = await _assemble_phone_classes(db, scope_rows)
+    device_policy_classes = await _assemble_device_policy_classes(db, group.id if group else None)
 
     # IPv6 Router Advertisements (issue #524) — one radvd stanza per
     # RA-enabled IPv6 subnet in the group. The rendered radvd.conf ships in
@@ -387,6 +392,7 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
         mac_blocks=mac_blocks,
         pxe_classes=pxe_classes,
         phone_classes=phone_classes,
+        device_policy_classes=device_policy_classes,
         generated_at=datetime.now(UTC),
         failover=failover,
         dhcp_socket_type=dhcp_socket_type,
@@ -551,6 +557,65 @@ async def _assemble_phone_classes(
                 name=f"voip-{str(prof.id)[:8]}",
                 match_expression=match_expr,
                 options=options,
+            )
+        )
+    return tuple(out)
+
+
+async def _assemble_device_policy_classes(
+    db: AsyncSession, group_id: uuid.UUID | None
+) -> tuple[DevicePolicyClassDef, ...]:
+    """Compile each enabled device policy into a Kea client-class (#700).
+
+    Two properties worth stating because both are load-bearing:
+
+    **A policy that compiles to nothing is dropped, not emitted empty.**
+    A Kea client-class with no ``test`` matches every packet, so shipping
+    an empty expression would apply a quarantine option-set and lease time
+    to the entire network. "Compiles to nothing" is the normal state for a
+    freshly-created policy whose device classes have not been observed
+    yet, so this is a routine path rather than an error one.
+
+    **The expression depends on observed fingerprints, so the bundle
+    changes without an operator edit.** That is the feature — a newly
+    classified device joins the policy on its next renewal — but it means
+    the ETag legitimately shifts when the fingerprint store grows. It is
+    bounded by *distinct signatures*, not device count, so it settles once
+    the estate has been seen; a fleet of 500 identical handsets adds one
+    term, not 500.
+    """
+    if group_id is None:
+        return ()
+    rows = list(
+        (
+            await db.execute(
+                select(DHCPDevicePolicy)
+                .where(DHCPDevicePolicy.group_id == group_id)
+                .order_by(DHCPDevicePolicy.priority, DHCPDevicePolicy.name)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    out: list[DevicePolicyClassDef] = []
+    for policy in rows:
+        if not policy.enabled:
+            continue
+        compiled = await compile_device_policy(db, policy)
+        if not compiled.expression:
+            log.info(
+                "dhcp_device_policy_no_match",
+                policy_id=str(policy.id),
+                policy=policy.name,
+                reason=compiled.source,
+            )
+            continue
+        out.append(
+            DevicePolicyClassDef(
+                name=policy.class_name,
+                match_expression=compiled.expression,
+                options=dict(policy.options or {}),
+                lease_time=policy.lease_time,
             )
         )
     return tuple(out)

@@ -537,6 +537,11 @@ DHCPClientClass
 
 Classes are referenced by pool `class_restriction` field. The DHCP driver translates these to server-native syntax.
 
+Hand-authoring a match expression is not the only way to get a class:
+[§17a](#17a-fingerprint-driven-device-policies-issue-700) compiles one
+from fingerbank device classes, so "printers get a short lease and a
+restricted resolver" does not have to start from Kea syntax.
+
 ---
 
 ## 4a. DHCP MAC Blocklist
@@ -1290,6 +1295,148 @@ a "Raw signature" disclosure) the option-55 / option-60 strings.
 The same surface lets operators force a re-lookup if they think the
 fingerbank result is wrong (the dispatched task ignores the cache
 window for that one MAC).
+
+## 17a. Fingerprint-driven device policies (issue #700)
+
+Section 17 tells you what a device *is*. Section 4 lets you treat
+classes of device differently. This joins them: the operator picks
+fingerbank device classes and an outcome — an option set, a lease
+time, and optionally a pool — and SpatiumDDI compiles it into a real
+Kea client-class `test` expression.
+
+That produces NAC-lite outcomes with no 802.1X and no switch
+configuration: unknown and IoT devices get a short lease, a restricted
+resolver and a quarantine pool; corporate laptops get the normal
+treatment.
+
+### What the expression actually matches
+
+Fingerbank classifies by querying their corpus with the signature a
+device emitted. Kea cannot do that mid-packet, and there is no
+`device-class == IoT` predicate to render. So the compiler matches
+**the signatures we have observed and had classified into the
+selected classes** — not the abstract category.
+
+Two consequences, repeated in the UI rather than hidden:
+
+1. A device whose signature we have never seen matches nothing,
+   however obviously it belongs to the category. It is classified on
+   its first lease and the policy applies from the **next renewal**.
+   Nothing here is instant enforcement.
+2. The policy tracks observation. As new signatures land in a selected
+   class the expression grows on its own — which is the feature, but
+   it also means the rendered config changes with no operator edit,
+   and the bundle ETag legitimately shifts. It is bounded by *distinct
+   signatures*, not device count, so it settles once the estate has
+   been seen: a fleet of 500 identical handsets adds one term, not 500.
+
+### Ambiguous signatures are excluded by default
+
+DHCP signatures are not unique to a device class. A minimal parameter
+request list like `1,3,6,15` is emitted by embedded Linux in a
+doorbell and by a rack server alike. If a signature appears on devices
+both inside **and** outside the selected classes, matching it applies
+the policy to devices the operator did not choose — which for a
+feature whose headline use is "put unknown devices in a quarantine
+pool" is how the CEO's laptop ends up quarantined.
+
+Such signatures are excluded, counted, and listed in the preview.
+`include_ambiguous` is the explicit, audited opt-in.
+
+Devices fingerbank has **not** classified are treated differently:
+they are not evidence of a different class (excluding an otherwise
+clean signature because of one would make the feature unusable before
+an API key is set), so they do not trigger ambiguity. They *will*
+receive the policy, so the count is reported instead — and only for
+signatures that survived filtering and the term cap, so the number
+reflects devices the rendered expression actually reaches.
+
+### Nothing device-controlled becomes syntax
+
+Option 60 is a value the *device* chooses, and it lands inside a
+config file with quoting. Both halves of every term are emitted as hex
+literals:
+
+```
+(option[55].hex == 0x0103060F and option[60].hex == 0x4D53465420352E30)
+```
+
+so a vendor class of `' or 1--` becomes inert bytes rather than
+expression syntax. Verified against kea-dhcp4 3.0.3.
+
+A device that sent no option 60 compiles to `not option[60].exists`
+rather than omitting the test — ignoring the absence would widen the
+match to every device sharing the request list, including ones that
+*do* send a vendor class.
+
+### The compiled expression is visible and overridable
+
+`GET /dhcp/device-policies/{id}/preview` returns the expression, the
+signatures behind it, the excluded ones, and the MACs currently
+matched. `match_override` replaces the generated expression entirely,
+and the preview still shows what the compiler produced so the two can
+be compared. Nobody should end up debugging a black box against
+`kea-dhcp4.log`.
+
+An override is structurally checked at the API (balanced parentheses
+and quotes, length). This is deliberately not a Kea expression parser
+— operators need the real language for the escape hatch to be usable —
+but Kea rejects a malformed config **whole**, so an unbalanced paren
+would stop every other class, scope and reservation in the group
+converging, not just this policy. Same blast radius `named.conf`
+validation exists for in #876 / #899. The agent still runs Kea's own
+`config-test` before applying, and #882's quarantine means a rejected
+bundle is reverted rather than re-applied in a loop.
+
+### Rendering
+
+| Property | Value |
+|---|---|
+| Table | `dhcp_device_policy` (migration `f3b8d21c74ae`) |
+| Kea class name | `spatium-device-<slug>`, stored not derived |
+| Per-class lease | Kea `valid-lifetime` on the class |
+| Address family | **DHCPv4 only** — options 55/60 are v4 option codes |
+| Order | After operator, PXE and phone classes |
+
+`class_name` is a stored column rather than derived from `name` at
+render time. Pools bind to a class **by name** via
+`DHCPPool.class_restriction`, so regenerating it on rename would leave
+every pool restricted to a class that no longer exists — which Kea
+accepts, and which silently stops the pool serving anyone.
+
+A policy that compiles to nothing is **dropped**, never rendered with
+an empty `test`: a Kea client class with no test matches every packet,
+which would hand a quarantine's option set and lease time to the whole
+network. The agent renderer fails closed the same way.
+
+The maximum number of signature terms in one expression is 128. Kea's
+parser is not the constraint (a 1024-term / 32 KB expression loads
+fine); per-packet evaluation cost and operator legibility are. Hitting
+the cap is **reported**, never silent.
+
+### Endpoints
+
+| Method | Path |
+|---|---|
+| GET/POST | `/dhcp/server-groups/{gid}/device-policies` |
+| GET/PUT/DELETE | `/dhcp/device-policies/{id}` |
+| GET | `/dhcp/device-policies/{id}/preview` |
+| GET | `/dhcp/server-groups/{gid}/device-observations` |
+
+Permissions ride on `dhcp_client_class` — a device policy *is* a
+client class, generated rather than hand-written — so the builtin DHCP
+Editor role picks it up with no role migration.
+
+MCP: `find_dhcp_device_policies` and `preview_dhcp_device_policy`,
+both read-only and default-enabled.
+
+**Deferred:** auto-creating the quarantine pool alongside the policy
+(today the operator points a pool's class restriction at the generated
+class name); DHCPv6, which needs the option 16 / ORO equivalents and a
+different fingerbank input; and rules that key on fingerbank
+*device name* rather than class.
+
+---
 
 ## 18. PXE / iPXE provisioning profiles (issue #51)
 

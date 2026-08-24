@@ -467,6 +467,40 @@ def _phone_class(c: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _device_policy_class(c: dict[str, Any]) -> dict[str, Any] | None:
+    """Render a fingerprint-driven device-policy class (#700).
+
+    Mirrors ``_render_device_policy_class`` in ``backend/app/drivers/dhcp/kea.py``.
+
+    **Dhcp4 only, by construction.** The compiled expressions test options
+    55 and 60, which are DHCPv4 option codes; under Dhcp6 those numbers
+    address entirely different options (and the v6 equivalents are the ORO
+    and vendor-class, options 6 and 16). The v6 branch below builds its
+    class list from the generic ``client_classes`` alone, so nothing here
+    reaches it — same as the v4-only DROP class, and same as the backend
+    driver.
+
+    Returns ``None`` — rather than a class with no ``test`` — when the
+    expression is missing. The control plane already drops these, so
+    reaching here means a hand-crafted or truncated bundle; a testless Kea
+    class matches every packet, which would hand this policy's option set
+    and lease time to the whole network. Failing closed is the only safe
+    reading of a malformed device policy.
+    """
+    expr = c.get("match_expression") or c.get("test")
+    if not expr:
+        _log.warning("kea_device_policy_class_no_test", policy_class=c.get("name"))
+        return None
+    out: dict[str, Any] = {"name": c["name"], "test": expr}
+    lease_time = c.get("lease_time")
+    if lease_time is not None:
+        out["valid-lifetime"] = lease_time
+    opts = _options_from_mapping(c.get("options"))
+    if opts:
+        out["option-data"] = opts
+    return out
+
+
 def _dynamic_pool(p: dict[str, Any], *, address_family: str) -> dict[str, Any]:
     """Render one dynamic address pool, with its per-pool option overrides.
 
@@ -1046,6 +1080,17 @@ def render(
     # client-classes in declaration order, so this is behaviour, not style.
     rendered_classes += [_pxe_class(p) for p in (bundle.get("pxe_classes") or [])]
     rendered_classes += [_phone_class(c) for c in (bundle.get("phone_classes") or [])]
+    # #700 — device policies last, matching the backend driver's order, so an
+    # operator's own class of the same shape is evaluated first. Kea stops at
+    # the first match, so this is precedence rather than presentation.
+    rendered_classes += [
+        rc
+        for rc in (
+            _device_policy_class(c)
+            for c in (bundle.get("device_policy_classes") or [])
+        )
+        if rc is not None
+    ]
 
     # MAC blocklist — render as Kea's reserved ``DROP`` class. Any packet
     # whose hardware address matches the OR-ed expression is silently

@@ -299,3 +299,79 @@ def test_pxe_next_server_ip_is_kept() -> None:
         {"name": "pxe", "match_expression": "", "next_server": "10.0.0.5", "boot_file_name": "b"}
     )
     assert c["next-server"] == "10.0.0.5"
+
+
+# ── #700 device-policy classes ────────────────────────────────────
+
+
+def test_device_policy_class_renders_with_lease_time() -> None:
+    """The per-class ``valid-lifetime`` is the "short leases for unknown
+    devices" half of #700's NAC-lite outcome. Kea honours it per class —
+    checked against kea-dhcp4 3.0.3, because a silently-ignored lease time
+    is the difference between a quarantine that expires and one that does
+    not."""
+    out = render(
+        _bundle(
+            device_policy_classes=[
+                {
+                    "name": "spatium-device-IoT",
+                    "match_expression": "option[55].hex == 0x010306",
+                    "options": {"dns-servers": "10.0.0.53"},
+                    "lease_time": 600,
+                }
+            ]
+        )
+    )
+    classes = out["Dhcp4"]["client-classes"]
+    cls = next(c for c in classes if c["name"] == "spatium-device-IoT")
+    assert cls["test"] == "option[55].hex == 0x010306"
+    assert cls["valid-lifetime"] == 600
+    assert cls["option-data"]
+
+
+def test_device_policy_class_without_test_is_dropped_not_rendered() -> None:
+    """A Kea client-class with no ``test`` matches EVERY packet.
+
+    The control plane already drops these, so arriving here means a
+    hand-crafted or truncated bundle. Rendering it would hand a quarantine
+    option set and lease time to the whole network, so the only safe
+    reading is to fail closed."""
+    out = render(
+        _bundle(
+            device_policy_classes=[
+                {"name": "no-test", "match_expression": "", "lease_time": 300}
+            ]
+        )
+    )
+    names = [c["name"] for c in out["Dhcp4"].get("client-classes", [])]
+    assert "no-test" not in names
+
+
+def test_device_policy_classes_do_not_leak_into_dhcp6() -> None:
+    """Options 55 and 60 are DHCPv4 option codes; under Dhcp6 those numbers
+    address entirely different options. The v6 branch builds its class list
+    from the generic ``client_classes`` alone — same as the v4-only DROP
+    class."""
+    bundle = _bundle(
+        device_policy_classes=[
+            {
+                "name": "spatium-device-IoT",
+                "match_expression": "option[55].hex == 0x010306",
+                "lease_time": 600,
+            }
+        ]
+    )
+    bundle["scopes"] = list(bundle["scopes"]) + [
+        {
+            "subnet_cidr": "2001:db8::/64",
+            "address_family": "ipv6",
+            "is_active": True,
+            "lease_time": 3600,
+            "options": {},
+            "pools": [],
+            "statics": [],
+        }
+    ]
+    out = render(bundle)
+    v6_classes = out.get("Dhcp6", {}).get("client-classes", [])
+    assert "spatium-device-IoT" not in [c["name"] for c in v6_classes]

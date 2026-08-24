@@ -4,6 +4,7 @@ from fastapi import APIRouter
 
 from app.api.v1.dhcp.agents import router as agents_router
 from app.api.v1.dhcp.client_classes import router as client_classes_router
+from app.api.v1.dhcp.device_policies import router as device_policies_router
 from app.api.v1.dhcp.lease_history import router as lease_history_router
 from app.api.v1.dhcp.leases import router as leases_router
 from app.api.v1.dhcp.mac_blocks import router as mac_blocks_router
@@ -30,6 +31,9 @@ router.include_router(pxe_profiles_router)
 router.include_router(phone_profiles_router)
 router.include_router(statics_router)
 router.include_router(client_classes_router)
+# #700 — fingerprint-driven device policies, which compile into the same
+# Kea client-class list the router above manages by hand.
+router.include_router(device_policies_router)
 router.include_router(mac_blocks_router)
 router.include_router(option_codes_router)
 router.include_router(option_templates_router)

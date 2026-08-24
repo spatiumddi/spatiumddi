@@ -132,6 +132,27 @@ class PhoneClassDef:
 
 
 @dataclass(frozen=True)
+class DevicePolicyClassDef:
+    """A rendered fingerprint-driven device-policy class (issue #700).
+
+    Kept distinct from :class:`ClientClassDef` because it carries a
+    ``lease_time`` that becomes Kea's per-class ``valid-lifetime`` — the
+    "short leases for unknown devices" half of the issue's NAC-lite
+    outcome, which a plain client class has no field for.
+
+    ``match_expression`` is already compiled (see
+    ``services.dhcp.device_policy``) and is never empty here: the
+    assembler drops a policy that compiles to nothing rather than
+    emitting a testless class, which Kea treats as *match everything*.
+    """
+
+    name: str
+    match_expression: str
+    options: dict[str, Any] = field(default_factory=dict)
+    lease_time: int | None = None
+
+
+@dataclass(frozen=True)
 class MACBlockDef:
     """A blocked MAC address — group-global deny entry.
 
@@ -261,6 +282,11 @@ class ConfigBundle:
     mac_blocks: tuple[MACBlockDef, ...] = ()
     pxe_classes: tuple[PXEClassDef, ...] = ()
     phone_classes: tuple[PhoneClassDef, ...] = ()
+    # #700 — fingerprint-driven device policies, already compiled to Kea
+    # match expressions. Ordered by (priority, name) at assembly time;
+    # Kea evaluates client-classes in declaration order, so the ordering
+    # is behaviour rather than presentation.
+    device_policy_classes: tuple[DevicePolicyClassDef, ...] = ()
     etag: str = ""
     # Populated when the server's group has ≥ 2 Kea members. The
     # agent's Kea renderer injects ``libdhcp_ha.so`` + the ``high-
@@ -299,6 +325,7 @@ class ConfigBundle:
             "mac_blocks": [asdict(m) for m in self.mac_blocks],
             "pxe_classes": [asdict(p) for p in self.pxe_classes],
             "phone_classes": [asdict(c) for c in self.phone_classes],
+            "device_policy_classes": [asdict(c) for c in self.device_policy_classes],
             "failover": asdict(self.failover) if self.failover else None,
             "dhcp_socket_type": self.dhcp_socket_type,
             "lease_cache_threshold": self.lease_cache_threshold,

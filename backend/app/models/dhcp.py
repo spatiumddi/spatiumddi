@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 from sqlalchemy import (
     Boolean,
@@ -36,6 +37,9 @@ from sqlalchemy.dialects.postgresql import INET, JSONB, MACADDR, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, SoftDeleteMixin, TimestampMixin, UUIDPrimaryKeyMixin
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from app.models.dhcp_device_policy import DHCPDevicePolicy
 
 # ── Server Group / Server ────────────────────────────────────────────────────
 
@@ -144,6 +148,13 @@ class DHCPServerGroup(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     option_templates: Mapped[list[DHCPOptionTemplate]] = relationship(
         "DHCPOptionTemplate", back_populates="group", cascade="all, delete-orphan"
+    )
+    # #700 — fingerprint-driven device policies. Defined in its own module
+    # (``models.dhcp_device_policy``) because it depends on the fingerprint
+    # store rather than on anything in this file; the string target defers
+    # resolution until both are imported.
+    device_policies: Mapped[list[DHCPDevicePolicy]] = relationship(
+        "DHCPDevicePolicy", back_populates="group", cascade="all, delete-orphan"
     )
 
 

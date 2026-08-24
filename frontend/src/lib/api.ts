@@ -8387,6 +8387,37 @@ export const dhcpApi = {
   deleteClientClass: (_groupId: string, classId: string) =>
     api.delete(`/dhcp/client-classes/${classId}`),
 
+  // #700 — fingerprint-driven device policies. These COMPILE INTO client
+  // classes; they are not a parallel mechanism. The preview call is what
+  // keeps the generated match expression from being a black box.
+  listDevicePolicies: (groupId: string) =>
+    api
+      .get<DHCPDevicePolicy[]>(`/dhcp/server-groups/${groupId}/device-policies`)
+      .then((r) => r.data),
+  createDevicePolicy: (groupId: string, data: Partial<DHCPDevicePolicy>) =>
+    api
+      .post<DHCPDevicePolicy>(
+        `/dhcp/server-groups/${groupId}/device-policies`,
+        data,
+      )
+      .then((r) => r.data),
+  updateDevicePolicy: (policyId: string, data: Partial<DHCPDevicePolicy>) =>
+    api
+      .put<DHCPDevicePolicy>(`/dhcp/device-policies/${policyId}`, data)
+      .then((r) => r.data),
+  deleteDevicePolicy: (policyId: string) =>
+    api.delete(`/dhcp/device-policies/${policyId}`),
+  previewDevicePolicy: (policyId: string) =>
+    api
+      .get<DHCPDevicePolicyPreview>(`/dhcp/device-policies/${policyId}/preview`)
+      .then((r) => r.data),
+  listDeviceObservations: (groupId: string) =>
+    api
+      .get<DHCPDeviceObservations>(
+        `/dhcp/server-groups/${groupId}/device-observations`,
+      )
+      .then((r) => r.data),
+
   listOptionCodes: (q?: string) =>
     api
       .get<DHCPOptionCodeDef[]>("/dhcp/option-codes", {
@@ -8780,6 +8811,64 @@ export interface DHCPClientClass {
   options: Record<string, unknown>;
   created_at: string;
   modified_at: string;
+}
+
+// #700 — fingerprint-driven device policy. ``class_name`` is the Kea client
+// class this compiles to; a pool's ``class_restriction`` binds to that string,
+// which is why it is stable across renames rather than derived from ``name``.
+export interface DHCPDevicePolicy {
+  id: string;
+  group_id: string;
+  name: string;
+  description: string;
+  enabled: boolean;
+  class_name: string;
+  device_classes: string[];
+  options: Record<string, unknown>;
+  lease_time: number | null;
+  match_override: string | null;
+  include_ambiguous: boolean;
+  priority: number;
+  last_compiled_at: string | null;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface DHCPDeviceSignature {
+  option_55: string | null;
+  option_60: string | null;
+}
+
+export interface DHCPDevicePolicyPreview {
+  policy_id: string;
+  class_name: string;
+  expression: string;
+  source: string;
+  compiled_expression: string;
+  signature_count: number;
+  signatures: DHCPDeviceSignature[];
+  ambiguous_signatures: DHCPDeviceSignature[];
+  ambiguous_excluded: boolean;
+  truncated: number;
+  max_signature_terms: number;
+  matched_macs: string[];
+  matched_device_count: number;
+  unclassified_matches: number;
+  warnings: string[];
+  renders: boolean;
+}
+
+export interface DHCPDeviceObservation {
+  device_class: string;
+  device_count: number;
+  signature_count: number;
+}
+
+export interface DHCPDeviceObservations {
+  classes: DHCPDeviceObservation[];
+  unclassified_devices: number;
+  total_devices: number;
+  note: string;
 }
 
 export interface DHCPOptionCodeDef {

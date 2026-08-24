@@ -680,6 +680,54 @@ suggestion, free-space treemap.
 - ⬜ [**Lease histogram by hour**](https://github.com/spatiumddi/spatiumddi/issues/53)
 - ⬜ [**Option 82 (relay agent info) class matching**](https://github.com/spatiumddi/spatiumddi/issues/54)
 - ⬜ [**DHCP test client**](https://github.com/spatiumddi/spatiumddi/issues/55)
+- ✅ [**Fingerprint-driven DHCP policy — compile device profiles into Kea client-classes**](https://github.com/spatiumddi/spatiumddi/issues/700)
+  — device profiling told us what a device *is*; client classes let us treat
+  kinds of device differently; nothing joined them. Now `dhcp_device_policy`
+  (migration `f3b8d21c74ae`) + `services/dhcp/device_policy.py` compile an
+  operator's choice of fingerbank device classes into a real Kea client-class
+  `test`, carrying an option set, a per-class `valid-lifetime`, and a stable
+  generated class name a pool's `class_restriction` can bind to. NAC-lite with
+  no 802.1X and no switch config. 4 REST routes, 2 MCP tools
+  (`find_dhcp_device_policies`, `preview_dhcp_device_policy`, both read-only,
+  default on), a Device Policies tab. Permissions ride on `dhcp_client_class`
+  — a device policy *is* a client class, generated rather than typed — so the
+  builtin DHCP Editor role gains it with no role migration. Explicitly **not**
+  a feature module (non-negotiable #14): it adds no top-level family, and
+  "off" is already `enabled=false` on the row.
+  **The compiler cannot match the category, and says so.** Fingerbank
+  classifies by querying its corpus; Kea has no `device-class == IoT`
+  predicate. So it matches *the signatures observed and classified into the
+  selected classes* — which makes v1 honestly "classify on first lease, apply
+  on renewal", stated in the UI rather than implied away.
+  **The load-bearing safety property is ambiguity exclusion.** A parameter
+  request list like `1,3,6,15` comes from a doorbell and a rack server alike,
+  so a signature seen both inside and outside the selected classes is excluded
+  by default, counted and listed — otherwise the headline use ("quarantine
+  unknown devices") is also how the CEO's laptop gets quarantined.
+  `include_ambiguous` is the audited opt-in. Unclassified devices are
+  deliberately *not* treated as ambiguity evidence (that would make the
+  feature unusable before a fingerbank key is set) but are reported — and
+  only for signatures that survive filtering and the 128-term cap, so the
+  count reflects devices the rendered expression actually reaches.
+  **Nothing device-controlled reaches the config as a string:** option 60 is
+  chosen by the *device*, so both halves of every term are emitted as hex
+  (`option[60].hex == 0x4D5346…`), making a vendor class of `' or 1--` inert
+  bytes rather than syntax. An absent option 60 compiles to `not
+  option[60].exists` rather than being ignored, which would silently widen the
+  match to every device sharing the request list.
+  **Two fail-closed rules, both about the same Kea behaviour:** a class with
+  no `test` matches *every* packet, so a policy compiling to nothing is
+  dropped rather than rendered testless (in both renderers), and `text_to_hex`
+  returns None for empty rather than emitting `0x`, which is a parse error
+  that fails the WHOLE config. Kea's parser is *not* the term-cap constraint
+  (1024 terms / 32 KB loads fine) — per-packet cost and legibility are, and
+  hitting the cap is reported, never silent. Every expression form was
+  validated against a live kea-dhcp4 3.0.3, and the end-to-end path
+  (REST → bundle → wire → agent → on-disk `kea-dhcp4.conf`) was walked on the
+  dev stack rather than reasoned about. **v4-only by construction** — options
+  55/60 are DHCPv4 codes, and the v6 branch of both renderers builds its class
+  list from generic client classes alone. **Deferred:** auto-creating the
+  quarantine pool, DHCPv6, and rules keyed on fingerbank device *name*.
 
 #### Operational tooling
 
