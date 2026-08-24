@@ -8829,7 +8829,6 @@ export interface DHCPDevicePolicy {
   match_override: string | null;
   include_ambiguous: boolean;
   priority: number;
-  last_compiled_at: string | null;
   created_at: string;
   modified_at: string;
 }
@@ -8852,6 +8851,7 @@ export interface DHCPDevicePolicyPreview {
   truncated: number;
   max_signature_terms: number;
   matched_macs: string[];
+  matched_macs_truncated: boolean;
   matched_device_count: number;
   unclassified_matches: number;
   warnings: string[];

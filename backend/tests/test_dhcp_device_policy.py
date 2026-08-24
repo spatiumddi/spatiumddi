@@ -21,6 +21,7 @@ from __future__ import annotations
 import uuid
 
 import pytest
+from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import create_access_token, hash_password
@@ -35,6 +36,7 @@ from app.services.dhcp.device_policy import (
     _term,
     build_expression,
     compile_device_policy,
+    load_fingerprint_snapshot,
     option55_to_hex,
     slugify_class_name,
     text_to_hex,
@@ -137,12 +139,44 @@ def test_absent_vendor_class_is_asserted_not_ignored() -> None:
     assert "not option[60].exists" in term
 
 
+def test_signatures_sort_when_one_lacks_an_option() -> None:
+    """Regression: ``Signature`` used ``order=True``, whose generated
+    ``__lt__`` compares ``None`` against ``str`` as soon as two in-class
+    signatures agree on option 55 and differ on whether option 60 is
+    present. That raised TypeError inside ``build_config_bundle`` — a 500
+    on the agent long-poll that stops the entire group converging. Every
+    earlier fixture happened to differ on option 55, which is why nothing
+    caught it."""
+    rows = [
+        Signature("1,3,6", "HP"),
+        Signature("1,3,6", None),
+        Signature(None, "X"),
+        Signature(None, None),
+    ]
+    rows.sort(key=lambda s: s.sort_key)  # must not raise
+    assert len(rows) == 4
+
+
+def test_lossy_decoded_vendor_class_is_refused_not_mismatched() -> None:
+    """A non-UTF-8 option 60 is stored already destroyed (the fingerprint
+    row decodes with errors="replace"), so re-encoding yields EF BF BD —
+    bytes the device never sent. Emitting it would list the device as
+    matched in the preview while the rendered class silently skipped it."""
+    assert text_to_hex("Acme\ufffdPrinter") is None
+    assert build_expression([Signature("1,3,6", "Acme\ufffdPrinter")]) == (
+        "(option[55].hex == 0x010306 and not option[60].exists)"
+    )
+
+
 def test_expression_is_deterministic_regardless_of_input_order() -> None:
     """The expression rides the config-bundle ETag. An unstable ordering
     would shift the ETag on every rebuild and make every agent in the group
     re-fetch and re-render byte-identical config."""
     a = [Signature("1,3,6", "A"), Signature("1,3", "B"), Signature("9", None)]
-    assert build_expression(sorted(a)) == build_expression(sorted(list(reversed(a))))
+    key = lambda s: s.sort_key  # noqa: E731
+    assert build_expression(sorted(a, key=key)) == build_expression(
+        sorted(list(reversed(a)), key=key)
+    )
 
 
 def test_device_controlled_vendor_class_never_becomes_syntax() -> None:
@@ -388,3 +422,117 @@ async def test_unclassified_behind_an_excluded_signature_is_not_counted(
     assert out.signatures == [Signature("1,3,6,15", None)]
     # One, not two: the device behind the excluded signature does not count.
     assert out.unclassified_matches == 1
+
+
+@pytest.mark.asyncio
+async def test_bundle_survives_signatures_differing_only_on_absent_option(
+    db_session: AsyncSession,
+) -> None:
+    """End-to-end guard for the sort crash: this is the shape that reached
+    ``build_config_bundle`` and 500'd the agent config long-poll."""
+    grp, srv = await _make_group_with_server(db_session)
+    db_session.add_all(
+        [
+            _fp("aa:bb:cc:00:08:01", "1,3,6", "HP-Printer", "Printer"),
+            _fp("aa:bb:cc:00:08:02", "1,3,6", None, "Printer"),
+        ]
+    )
+    db_session.add(_policy(grp.id, device_classes=["Printer"]))
+    await db_session.flush()
+
+    bundle = await build_config_bundle(db_session, srv)  # must not raise
+    assert len(bundle.device_policy_classes) == 1
+
+
+@pytest.mark.asyncio
+async def test_override_reports_the_compiled_expression_separately(
+    db_session: AsyncSession,
+) -> None:
+    """``compiled_expression`` previously echoed the override, making the
+    documented comparison impossible."""
+    grp, _ = await _make_group_with_server(db_session)
+    db_session.add(_fp("aa:bb:cc:00:09:01", "1,3,6", None, "Printer"))
+    policy = _policy(grp.id, device_classes=["Printer"], match_override="option[55].hex == 0xDEAD")
+    db_session.add(policy)
+    await db_session.flush()
+
+    out = await compile_device_policy(db_session, policy)
+    assert out.expression == "option[55].hex == 0xDEAD"
+    assert out.compiled_expression != out.expression
+    assert "option[55].hex == 0x010306" in out.compiled_expression
+
+
+@pytest.mark.asyncio
+async def test_shared_snapshot_matches_a_per_policy_compile(
+    db_session: AsyncSession,
+) -> None:
+    """The bundle passes one fingerprint snapshot to every policy so the
+    store is read once per tick rather than once per policy. The hoisted
+    read must not change the answer."""
+    grp, _ = await _make_group_with_server(db_session)
+    db_session.add_all(
+        [
+            _fp("aa:bb:cc:00:0a:01", "1,3,6,15", None, "Printer"),
+            _fp("aa:bb:cc:00:0a:02", "1,3,6", None, "Windows"),
+        ]
+    )
+    policy = _policy(grp.id, device_classes=["Printer"])
+    db_session.add(policy)
+    await db_session.flush()
+
+    snap = await load_fingerprint_snapshot(db_session)
+    assert (await compile_device_policy(db_session, policy, snapshot=snap)).expression == (
+        await compile_device_policy(db_session, policy)
+    ).expression
+
+
+@pytest.mark.asyncio
+async def test_explicit_null_on_a_not_null_field_is_422_not_500(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    """``exclude_unset`` is kept so a null can CLEAR a nullable field, but
+    it also let a null reach NOT NULL columns, where the blanket setattr
+    turned it into an unhandled 500 on commit."""
+    _, token = await _make_user(db_session)
+    grp, _ = await _make_group_with_server(db_session)
+    policy = _policy(grp.id, device_classes=["Printer"])
+    db_session.add(policy)
+    await db_session.commit()
+
+    headers = {"Authorization": f"Bearer {token}"}
+    for field_name in ("options", "enabled", "priority", "device_classes"):
+        r = await client.put(
+            f"/api/v1/dhcp/device-policies/{policy.id}",
+            json={field_name: None},
+            headers=headers,
+        )
+        assert r.status_code == 422, f"{field_name} -> {r.status_code}"
+
+    # A null on a NULLABLE field still means "clear it".
+    r = await client.put(
+        f"/api/v1/dhcp/device-policies/{policy.id}",
+        json={"lease_time": None},
+        headers=headers,
+    )
+    assert r.status_code == 200
+    assert r.json()["lease_time"] is None
+
+
+@pytest.mark.asyncio
+async def test_preview_does_not_write(db_session: AsyncSession, client: AsyncClient) -> None:
+    """A GET authorised by ``read`` must not commit — it would be an
+    unaudited write that maintenance mode does not gate."""
+    _, token = await _make_user(db_session)
+    grp, _ = await _make_group_with_server(db_session)
+    policy = _policy(grp.id, device_classes=["Printer"])
+    db_session.add(policy)
+    await db_session.commit()
+    before = policy.modified_at
+
+    r = await client.get(
+        f"/api/v1/dhcp/device-policies/{policy.id}/preview",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert r.status_code == 200
+    await db_session.refresh(policy)
+    assert policy.modified_at == before

@@ -281,6 +281,10 @@ SECTIONS: tuple[Section, ...] = (
             "dhcp_pxe_arch_match",
             "dhcp_phone_profile",
             "dhcp_phone_profile_scope",
+            # #700 — FKs into dhcp_server_group, so a selective restore of
+            # this section TRUNCATE-CASCADEs it. Absent from the list, it
+            # would be emptied and never repopulated.
+            "dhcp_device_policy",
             "dhcp_fingerprint",
             "dhcp_config_op",
         ),

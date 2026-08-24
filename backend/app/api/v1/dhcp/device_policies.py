@@ -18,15 +18,20 @@ asks for explicitly:
   silently matches nothing.
 
 Permissions ride on ``dhcp_client_class``: a device policy *is* a client
-class, generated rather than hand-written, so anyone trusted to author
-one by hand is trusted to author one this way. It also means the builtin
-DHCP Editor role picks this up with no role migration.
+class, generated rather than hand-written. Reads follow that resource
+permission, so the builtin DHCP Editor role gains them with no role
+migration.
+
+**Writes are superadmin**, matching the hand-authored client-class
+surface next door rather than quietly widening it — the two produce the
+same Kea object, and a policy that can move devices into a quarantine
+pool is not a smaller privilege than typing that class by hand.
 """
 
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Any
 
 import structlog
@@ -59,6 +64,10 @@ router = APIRouter(
 # unbounded string is both a config-size problem and an easy way to make
 # the whole group's config unparseable. See ``_validate_override``.
 MAX_OVERRIDE_LENGTH = 8192
+
+# Matched MACs returned by the preview. The full count is always reported
+# separately, so this bounds the response without hiding the scale.
+PREVIEW_MAC_LIMIT = 500
 
 
 def _validate_override(expr: str | None) -> str | None:
@@ -185,7 +194,6 @@ class DevicePolicyResponse(BaseModel):
     match_override: str | None
     include_ambiguous: bool
     priority: int
-    last_compiled_at: datetime | None
     created_at: datetime
     modified_at: datetime
 
@@ -214,6 +222,7 @@ class DevicePolicyPreviewOut(BaseModel):
     truncated: int
     max_signature_terms: int
     matched_macs: list[str]
+    matched_macs_truncated: bool
     matched_device_count: int
     unclassified_matches: int
     warnings: list[str]
@@ -285,7 +294,7 @@ def _to_preview(policy: DHCPDevicePolicy, compiled: Any) -> DevicePolicyPreviewO
         class_name=policy.class_name,
         expression=compiled.expression,
         source=compiled.source,
-        compiled_expression=compiled.expression,
+        compiled_expression=compiled.compiled_expression,
         signature_count=len(compiled.signatures),
         signatures=[
             SignatureOut(option_55=s.option_55, option_60=s.option_60) for s in compiled.signatures
@@ -296,7 +305,11 @@ def _to_preview(policy: DHCPDevicePolicy, compiled: Any) -> DevicePolicyPreviewO
         ambiguous_excluded=bool(compiled.ambiguous) and not policy.include_ambiguous,
         truncated=compiled.truncated,
         max_signature_terms=MAX_SIGNATURE_TERMS,
-        matched_macs=compiled.matched_macs,
+        # Capped for transport; the count is the whole population, so a
+        # large estate reports honestly instead of returning a 50k-element
+        # array to a modal that renders chips.
+        matched_macs=compiled.matched_macs[:PREVIEW_MAC_LIMIT],
+        matched_macs_truncated=len(compiled.matched_macs) > PREVIEW_MAC_LIMIT,
         matched_device_count=len(compiled.matched_macs),
         unclassified_matches=compiled.unclassified_matches,
         warnings=compiled.warnings,
@@ -379,6 +392,31 @@ async def update_device_policy(
     row = await _get_policy(db, policy_id)
     changes = body.model_dump(exclude_unset=True)
 
+    # ``exclude_unset`` is deliberate — it is what lets an explicit null
+    # CLEAR a nullable field (``lease_time``, ``match_override``), which
+    # ``exclude_none`` would make impossible. But it also lets a null
+    # through to columns that are NOT NULL, where the blanket setattr below
+    # turns it into an unhandled 500 on commit. So nulls are rejected for
+    # exactly the non-nullable set, by name, rather than for everything.
+    non_nullable = {
+        "name",
+        "description",
+        "enabled",
+        "device_classes",
+        "options",
+        "include_ambiguous",
+        "priority",
+    }
+    nulled = sorted(k for k in changes if k in non_nullable and changes[k] is None)
+    if nulled:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"{', '.join(nulled)} cannot be null. Omit the field to leave it "
+                "unchanged, or send a value."
+            ),
+        )
+
     if "options" in changes:
         validate_domain_options(changes["options"] or {}, previous=row.options or {})
     if "match_override" in changes:
@@ -447,14 +485,16 @@ async def preview_device_policy(
 ) -> DevicePolicyPreviewOut:
     """Show exactly what this policy compiles to, and who it catches.
 
-    Read-only and side-effect free apart from stamping
-    ``last_compiled_at`` — the operator needs to know how fresh the answer
-    is, because the underlying fingerprint set moves on its own.
+    Genuinely read-only. An earlier cut stamped ``last_compiled_at`` here,
+    which made a GET authorised by ``read`` perform an unaudited write that
+    maintenance mode does not gate (it only holds POST/PUT/PATCH/DELETE).
+    The column was dropped rather than moved: the only other place a
+    compile happens is the config-bundle build, and stamping there would
+    add a write to every agent long-poll tick. Compilation is stateless and
+    always current, so there was nothing worth recording.
     """
     row = await _get_policy(db, policy_id)
     compiled = await compile_device_policy(db, row)
-    row.last_compiled_at = datetime.now(UTC)
-    await db.commit()
     return _to_preview(row, compiled)
 
 

@@ -74,7 +74,7 @@ logger = structlog.get_logger(__name__)
 MAX_SIGNATURE_TERMS = 128
 
 
-@dataclass(frozen=True, order=True)
+@dataclass(frozen=True)
 class Signature:
     """One observed DHCP signature.
 
@@ -83,7 +83,30 @@ class Signature:
     vendor-class string. ``None`` means the device did not send that
     option, which is itself matchable and is *not* the same as an empty
     one — see ``_term``.
+
+    Deliberately **not** ``order=True``. A generated ``__lt__`` compares
+    the fields pairwise, and two signatures that agree on option 55 but
+    differ on whether option 60 is present then compare ``None`` against
+    ``str`` — a ``TypeError`` raised inside ``build_config_bundle``, which
+    would 500 the agent long-poll and stop the whole group converging.
+    Sorting goes through ``sort_key`` instead, which gives absence a
+    defined position rather than an accidental one.
     """
+
+    @property
+    def sort_key(self) -> tuple[bool, str, bool, str]:
+        """Total order that tolerates absent options.
+
+        Absent sorts after present for the same value, so ``(1,3,6, no
+        vendor class)`` and ``(1,3,6, "HP")`` have a stable relative
+        position instead of raising.
+        """
+        return (
+            self.option_55 is None,
+            self.option_55 or "",
+            self.option_60 is None,
+            self.option_60 or "",
+        )
 
     option_55: str | None
     option_60: str | None
@@ -96,6 +119,11 @@ class CompiledPolicy:
     class_name: str
     expression: str
     source: str  # "compiled" | "override" | "empty"
+    # What the compiler produced, ALWAYS — even when an override replaces
+    # it on the wire. Storing the override in both fields would make the
+    # documented "compare your override against the generated expression"
+    # impossible, which is the whole reason the override is visible.
+    compiled_expression: str = ""
     signatures: list[Signature] = field(default_factory=list)
     ambiguous: list[Signature] = field(default_factory=list)
     # Signatures dropped by MAX_SIGNATURE_TERMS. Never silent.
@@ -110,17 +138,6 @@ class CompiledPolicy:
     # them by name, so the count is surfaced rather than buried.
     unclassified_matches: int = 0
     warnings: list[str] = field(default_factory=list)
-
-    @property
-    def compiled_expression(self) -> str:
-        """The expression the compiler produced, override or not.
-
-        When an override is set the rendered ``expression`` is the
-        operator's, but the UI still shows what we would have generated so
-        the two can be compared — that comparison is the whole point of
-        making the override visible.
-        """
-        return self.expression
 
 
 def option55_to_hex(csv: str | None) -> str | None:
@@ -149,13 +166,24 @@ def option55_to_hex(csv: str | None) -> str | None:
 
 
 def text_to_hex(text: str | None) -> str | None:
-    """Encode a vendor-class string as hex bytes. ``None`` when empty.
+    """Encode a vendor-class string as hex bytes. ``None`` when unusable.
 
     Empty must return ``None``, not ``""``: ``option[60].hex == 0x`` is a
     parse error that fails the *entire* Kea config, taking every unrelated
     class down with it (verified against kea-dhcp4 3.0.3).
+
+    A value containing U+FFFD is also refused. ``DHCPFingerprint`` decodes
+    option 60 with ``errors="replace"``, so a device that sent non-UTF-8
+    bytes — plenty of IoT vendors do — is stored with the original bytes
+    already destroyed. Re-encoding that yields ``EF BF BD``, which is not
+    what the device puts on the wire, so the term could never match. Worse
+    than useless: the preview would list the device as matched while the
+    rendered class silently skipped it. Refusing is the honest answer
+    until the fingerprint store keeps the raw bytes.
     """
     if not text:
+        return None
+    if "\ufffd" in text:
         return None
     raw = text.encode("utf-8", errors="replace")
     return raw.hex().upper() or None
@@ -219,8 +247,37 @@ def slugify_class_name(name: str) -> str:
     return f"spatium-device-{slug}"
 
 
-async def _load_signatures(
-    db: AsyncSession, selected: set[str]
+@dataclass(frozen=True)
+class FingerprintSnapshot:
+    """Every observed fingerprint, read once.
+
+    ``compile_device_policy`` runs per policy, and a config bundle is
+    rebuilt on every agent long-poll tick — so scanning ``dhcp_fingerprint``
+    inside the compiler meant one full scan per policy per tick, on the
+    hottest read path in the DHCP subsystem. The scan is hoisted here and
+    the assembler passes one snapshot to every policy in the group.
+    """
+
+    rows: tuple[tuple[str, str | None, str | None, str | None], ...]
+
+
+async def load_fingerprint_snapshot(db: AsyncSession) -> FingerprintSnapshot:
+    """Read the fingerprint store once for a whole compilation pass."""
+    res = await db.execute(
+        select(
+            DHCPFingerprint.mac_address,
+            DHCPFingerprint.option_55,
+            DHCPFingerprint.option_60,
+            DHCPFingerprint.fingerbank_device_class,
+        )
+    )
+    return FingerprintSnapshot(
+        rows=tuple((str(m), o55, o60, cls) for m, o55, o60, cls in res.all())
+    )
+
+
+def _partition(
+    snapshot: FingerprintSnapshot, selected: set[str]
 ) -> tuple[dict[Signature, list[str]], set[Signature], dict[Signature, int]]:
     """Partition observed fingerprints by whether their class was selected.
 
@@ -243,18 +300,10 @@ async def _load_signatures(
     one would make the feature unusable before the fingerbank key is set.
     They are counted instead, and reported: they will receive the policy.
     """
-    res = await db.execute(
-        select(
-            DHCPFingerprint.mac_address,
-            DHCPFingerprint.option_55,
-            DHCPFingerprint.option_60,
-            DHCPFingerprint.fingerbank_device_class,
-        )
-    )
     inside: dict[Signature, list[str]] = {}
     outside: set[Signature] = set()
     unclassified: dict[Signature, int] = {}
-    for mac, opt55, opt60, device_class in res.all():
+    for mac, opt55, opt60, device_class in snapshot.rows:
         sig = Signature(option_55=opt55, option_60=opt60)
         if device_class is None or device_class == "":
             unclassified[sig] = unclassified.get(sig, 0) + 1
@@ -265,13 +314,22 @@ async def _load_signatures(
     return inside, outside, unclassified
 
 
-async def compile_device_policy(db: AsyncSession, policy: DHCPDevicePolicy) -> CompiledPolicy:
+async def compile_device_policy(
+    db: AsyncSession,
+    policy: DHCPDevicePolicy,
+    *,
+    snapshot: FingerprintSnapshot | None = None,
+) -> CompiledPolicy:
     """Compile one policy into its Kea client-class expression.
 
     Always returns a result — a policy that currently matches nothing is a
     normal state (no devices seen yet in the selected classes), not an
     error. The caller decides whether to render it; ``source == "empty"``
     means there is nothing to render.
+
+    Pass ``snapshot`` when compiling several policies together (the config
+    bundle does) so the fingerprint store is read once rather than once per
+    policy — see :class:`FingerprintSnapshot`.
     """
     selected = {c for c in (policy.device_classes or []) if isinstance(c, str) and c}
     result = CompiledPolicy(class_name=policy.class_name, expression="", source="empty")
@@ -280,9 +338,12 @@ async def compile_device_policy(db: AsyncSession, policy: DHCPDevicePolicy) -> C
         result.warnings.append(
             "No device classes selected — this policy matches nothing and is not rendered."
         )
-    inside, outside, unclassified = (
-        await _load_signatures(db, selected) if selected else ({}, set(), {})
-    )
+    if selected:
+        if snapshot is None:
+            snapshot = await load_fingerprint_snapshot(db)
+        inside, outside, unclassified = _partition(snapshot, selected)
+    else:
+        inside, outside, unclassified = {}, set(), {}
 
     usable: list[Signature] = []
     ambiguous: list[Signature] = []
@@ -298,8 +359,8 @@ async def compile_device_policy(db: AsyncSession, policy: DHCPDevicePolicy) -> C
         usable.append(sig)
 
     # Deterministic ordering — the expression rides the bundle ETag.
-    usable.sort()
-    ambiguous.sort()
+    usable.sort(key=lambda s: s.sort_key)
+    ambiguous.sort(key=lambda s: s.sort_key)
 
     if len(usable) > MAX_SIGNATURE_TERMS:
         result.truncated = len(usable) - MAX_SIGNATURE_TERMS
@@ -333,6 +394,7 @@ async def compile_device_policy(db: AsyncSession, policy: DHCPDevicePolicy) -> C
         )
 
     compiled = build_expression(usable)
+    result.compiled_expression = compiled
     override = (policy.match_override or "").strip()
     if override:
         result.expression = override
@@ -354,9 +416,11 @@ async def compile_device_policy(db: AsyncSession, policy: DHCPDevicePolicy) -> C
 __all__ = [
     "MAX_SIGNATURE_TERMS",
     "CompiledPolicy",
+    "FingerprintSnapshot",
     "Signature",
     "build_expression",
     "compile_device_policy",
+    "load_fingerprint_snapshot",
     "option55_to_hex",
     "slugify_class_name",
     "text_to_hex",

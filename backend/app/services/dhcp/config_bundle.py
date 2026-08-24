@@ -48,7 +48,10 @@ from app.models.dhcp import (
 )
 from app.models.dhcp_device_policy import DHCPDevicePolicy
 from app.models.ipam import Subnet
-from app.services.dhcp.device_policy import compile_device_policy
+from app.services.dhcp.device_policy import (
+    compile_device_policy,
+    load_fingerprint_snapshot,
+)
 from app.services.dhcp.radvd import build_ra_config, render_radvd_conf
 from app.services.feature_modules import is_module_enabled
 
@@ -597,11 +600,16 @@ async def _assemble_device_policy_classes(
         .scalars()
         .all()
     )
+    enabled = [p for p in rows if p.enabled]
+    if not enabled:
+        return ()
+    # One read of the fingerprint store for the whole group. This runs on
+    # every agent long-poll tick, so a per-policy scan would multiply the
+    # hottest read path in the subsystem by the policy count.
+    snapshot = await load_fingerprint_snapshot(db)
     out: list[DevicePolicyClassDef] = []
-    for policy in rows:
-        if not policy.enabled:
-            continue
-        compiled = await compile_device_policy(db, policy)
+    for policy in enabled:
+        compiled = await compile_device_policy(db, policy, snapshot=snapshot)
         if not compiled.expression:
             log.info(
                 "dhcp_device_policy_no_match",

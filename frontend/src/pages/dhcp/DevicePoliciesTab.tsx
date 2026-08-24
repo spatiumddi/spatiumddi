@@ -514,10 +514,26 @@ function PreviewBody({ data }: { data: DHCPDevicePolicyPreview }) {
         <div className="mb-1 text-xs font-semibold uppercase text-muted-foreground">
           Kea match expression ({data.source})
         </div>
-        <pre className="max-h-40 overflow-auto rounded-md border bg-muted/40 p-2 font-mono text-xs whitespace-pre-wrap break-all">
+        <pre className="max-h-40 overflow-auto whitespace-pre-wrap break-all rounded-md border bg-muted/40 p-2 font-mono text-xs">
           {data.expression || "(matches nothing — no observed signatures yet)"}
         </pre>
       </div>
+
+      {/* The comparison is the whole reason the override is visible: without
+          it, a manual expression is exactly the black box the feature exists
+          to avoid. Only shown when the two actually differ. */}
+      {data.source === "override" &&
+        data.compiled_expression !== data.expression && (
+          <div>
+            <div className="mb-1 text-xs font-semibold uppercase text-muted-foreground">
+              What the compiler would have generated
+            </div>
+            <pre className="max-h-40 overflow-auto whitespace-pre-wrap break-all rounded-md border border-dashed bg-muted/20 p-2 font-mono text-xs text-muted-foreground">
+              {data.compiled_expression ||
+                "(nothing — no observed signatures in the selected classes)"}
+            </pre>
+          </div>
+        )}
 
       {data.signatures.length > 0 && (
         <SignatureList title="Signatures matched" rows={data.signatures} />
@@ -545,6 +561,11 @@ function PreviewBody({ data }: { data: DHCPDevicePolicyPreview }) {
               </code>
             ))}
           </div>
+          {data.matched_macs_truncated && (
+            <div className="mt-1 text-xs text-muted-foreground">
+              Showing {data.matched_macs.length} of {data.matched_device_count}.
+            </div>
+          )}
         </div>
       )}
 

@@ -69,7 +69,6 @@ def upgrade() -> None:
             sa.ForeignKey("user.id", ondelete="SET NULL"),
             nullable=True,
         ),
-        sa.Column("last_compiled_at", sa.DateTime(timezone=True), nullable=True),
         # TimestampMixin columns need an explicit server_default here: a
         # fresh install runs the migration, not create_all, and would
         # otherwise NULL-violate on the first insert.

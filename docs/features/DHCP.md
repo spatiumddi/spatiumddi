@@ -1425,7 +1425,21 @@ the cap is **reported**, never silent.
 
 Permissions ride on `dhcp_client_class` — a device policy *is* a
 client class, generated rather than hand-written — so the builtin DHCP
-Editor role picks it up with no role migration.
+Editor role gains **read** with no role migration. **Writes are
+superadmin**, matching the hand-authored client-class surface rather
+than quietly widening it: the two produce the same Kea object, and a
+policy that can move devices into a quarantine pool is not a smaller
+privilege than typing that class by hand.
+
+The preview is genuinely read-only — it commits nothing, so it cannot
+become an unaudited write on a path authorised by `read` and not gated
+by maintenance mode.
+
+A vendor class that was stored after a lossy decode (option 60 arrived
+as non-UTF-8 and `DHCPFingerprint` decodes with `errors="replace"`) is
+**refused**, not re-encoded: `EF BF BD` is not what the device puts on
+the wire, so the term could never match while the preview claimed the
+device was caught. It falls back to matching option 55 alone.
 
 MCP: `find_dhcp_device_policies` and `preview_dhcp_device_policy`,
 both read-only and default-enabled.

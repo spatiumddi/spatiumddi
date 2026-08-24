@@ -39,12 +39,10 @@ accepts and which quietly stops the pool serving anyone.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
 from typing import TYPE_CHECKING
 
 from sqlalchemy import (
     Boolean,
-    DateTime,
     ForeignKey,
     Index,
     Integer,
@@ -123,9 +121,6 @@ class DHCPDevicePolicy(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         UUID(as_uuid=True),
         ForeignKey("user.id", ondelete="SET NULL"),
         nullable=True,
-    )
-    last_compiled_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
     )
 
     group: Mapped[DHCPServerGroup] = relationship(

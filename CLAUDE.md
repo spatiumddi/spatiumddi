@@ -691,7 +691,9 @@ suggestion, free-space treemap.
   (`find_dhcp_device_policies`, `preview_dhcp_device_policy`, both read-only,
   default on), a Device Policies tab. Permissions ride on `dhcp_client_class`
   — a device policy *is* a client class, generated rather than typed — so the
-  builtin DHCP Editor role gains it with no role migration. Explicitly **not**
+  builtin DHCP Editor role gains **read** with no role migration (writes stay
+  superadmin, matching the hand-authored client-class surface rather than
+  quietly widening it). Explicitly **not**
   a feature module (non-negotiable #14): it adds no top-level family, and
   "off" is already `enabled=false` on the row.
   **The compiler cannot match the category, and says so.** Fingerbank
@@ -715,6 +717,25 @@ suggestion, free-space treemap.
   bytes rather than syntax. An absent option 60 compiles to `not
   option[60].exists` rather than being ignored, which would silently widen the
   match to every device sharing the request list.
+  **Nine findings from /code-review, all confirmed and fixed**, two of which
+  were live 500s. The worst: `Signature` carried `order=True`, whose generated
+  `__lt__` compares `None` against `str` the moment two in-class signatures
+  agree on option 55 and differ on whether option 60 is present — a
+  `TypeError` raised *inside* `build_config_bundle`, i.e. a 500 on the agent
+  long-poll that stops the whole group converging. Every fixture happened to
+  differ on option 55, which is why the suite was green. Sorting now goes
+  through an explicit key that gives absence a defined position. Also: an
+  explicit `null` reached NOT NULL columns through `exclude_unset` (500 → now
+  422, while a null on a *nullable* field still clears it, which
+  `exclude_none` would have broken); the new table was absent from the backup
+  catalogue, so a selective `dhcp` restore would TRUNCATE-CASCADE it and never
+  repopulate it — a failing test caught that one; `compiled_expression` echoed
+  the override, making the documented comparison impossible; the preview GET
+  committed `last_compiled_at`, an unaudited write on a `read`-authorised path
+  that maintenance mode does not gate (the column was dropped — the only other
+  compile site is the bundle build, and stamping there would write on every
+  long-poll tick); and the fingerprint scan ran once per policy per tick
+  instead of once per bundle.
   **Two fail-closed rules, both about the same Kea behaviour:** a class with
   no `test` matches *every* packet, so a policy compiling to nothing is
   dropped rather than rendered testless (in both renderers), and `text_to_hex`
