@@ -736,6 +736,18 @@ suggestion, free-space treemap.
   compile site is the bundle build, and stamping there would write on every
   long-poll tick); and the fingerprint scan ran once per policy per tick
   instead of once per bundle.
+  **Validated against a live fingerbank key**, which corrected a wrong
+  assumption carried by the issue text and the first draft of the docs: there
+  is no plain `Printer` or `IoT` class. Fingerbank's `device_class` is its own
+  taxonomy at mixed granularity — real observed values are `HP Print Server`
+  (score 89), `Operating System` (78), `Generic Android` (60),
+  `Hardware Manufacturer` (29), `Generic IoT` (15). The last of those is the
+  interesting one: a low score means fingerbank *failed* to identify the
+  device and fell back to the MAC vendor, so that class groups unrelated
+  hardware and is a poor policy target however plausible the name reads in a
+  list. `fingerbank_score` was already stored and surfaced nowhere, so the
+  class picker now shows it per class and flags anything under 30, and the
+  compiler warns when the best score among matched devices is below that.
   **Two fail-closed rules, both about the same Kea behaviour:** a class with
   no `test` matches *every* packet, so a policy compiling to nothing is
   dropped rather than rendered testless (in both renderers), and `text_to_hex`

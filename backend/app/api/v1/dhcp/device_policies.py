@@ -131,10 +131,13 @@ class DevicePolicyCreate(BaseModel):
     device_classes: list[str] = Field(
         default_factory=list,
         description=(
-            "Fingerbank device classes to match, e.g. "
-            '["Printer", "Internet of Things (IoT)"]. Use '
-            "GET /dhcp/server-groups/{id}/device-observations for the classes "
-            "actually seen on this install."
+            "Fingerbank device classes to match. These are fingerbank's own "
+            "taxonomy strings, which sit at mixed granularity and are rarely "
+            "the tidy category you would guess — real values include "
+            '"HP Print Server", "Generic IoT", "Generic Android" and '
+            '"Operating System". Always pick from GET '
+            "/dhcp/server-groups/{id}/device-observations rather than typing "
+            "one: a class string that does not appear there matches nothing."
         ),
     )
     options: dict[str, Any] = Field(default_factory=dict)
@@ -213,6 +216,7 @@ class DevicePolicyPreviewOut(BaseModel):
     # against it. Equal to ``expression`` when no override is set.
     compiled_expression: str
     signature_count: int
+    confidence: int | None
     signatures: list[SignatureOut]
     ambiguous_signatures: list[SignatureOut]
     ambiguous_excluded: bool
@@ -235,6 +239,13 @@ class DeviceObservationOut(BaseModel):
     device_class: str
     device_count: int
     signature_count: int
+    # Fingerbank's own 0-100 confidence, surfaced because the class name
+    # alone hides the difference between an identified device and a
+    # vendor-only fallback. "Hardware Manufacturer" at 29 is fingerbank
+    # saying it could not identify the device, which makes it a poor
+    # policy target however plausible the name looks in a list.
+    best_score: int | None
+    avg_score: int | None
 
 
 class DeviceObservationsOut(BaseModel):
@@ -293,6 +304,7 @@ def _to_preview(policy: DHCPDevicePolicy, compiled: Any) -> DevicePolicyPreviewO
         source=compiled.source,
         compiled_expression=compiled.compiled_expression,
         signature_count=len(compiled.signatures),
+        confidence=compiled.confidence,
         signatures=[
             SignatureOut(option_55=s.option_55, option_60=s.option_60) for s in compiled.signatures
         ],
@@ -529,6 +541,8 @@ async def list_device_observations(
                     )
                 )
             ).label("signature_count"),
+            func.max(DHCPFingerprint.fingerbank_score).label("best_score"),
+            func.avg(DHCPFingerprint.fingerbank_score).label("avg_score"),
         )
         .where(DHCPFingerprint.fingerbank_device_class.isnot(None))
         .where(DHCPFingerprint.fingerbank_device_class != "")
@@ -536,7 +550,13 @@ async def list_device_observations(
         .order_by(func.count().desc())
     )
     classes = [
-        DeviceObservationOut(device_class=row[0], device_count=row[1], signature_count=row[2])
+        DeviceObservationOut(
+            device_class=row[0],
+            device_count=row[1],
+            signature_count=row[2],
+            best_score=int(row[3]) if row[3] is not None else None,
+            avg_score=int(row[4]) if row[4] is not None else None,
+        )
         for row in res.all()
     ]
 
@@ -551,6 +571,9 @@ async def list_device_observations(
         note=(
             "Classes come from fingerprints already observed and enriched. A "
             "device class absent here has not been seen on this network yet, so "
-            "a policy naming it will match nothing until one appears."
+            "a policy naming it will match nothing until one appears. Scores are "
+            "fingerbank's own 0-100 confidence: a low one usually means it fell "
+            "back to the MAC vendor instead of identifying the device, so that "
+            "class groups unrelated hardware and makes a poor policy target."
         ),
     )

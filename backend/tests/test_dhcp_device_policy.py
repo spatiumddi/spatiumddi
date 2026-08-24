@@ -31,6 +31,7 @@ from app.models.dhcp_device_policy import DHCPDevicePolicy
 from app.models.dhcp_fingerprint import DHCPFingerprint
 from app.services.dhcp.config_bundle import build_config_bundle
 from app.services.dhcp.device_policy import (
+    LOW_CONFIDENCE_SCORE,
     MAX_SIGNATURE_TERMS,
     Signature,
     _term,
@@ -74,12 +75,19 @@ async def _make_group_with_server(
     return grp, srv
 
 
-def _fp(mac: str, opt55: str | None, opt60: str | None, klass: str | None) -> DHCPFingerprint:
+def _fp(
+    mac: str,
+    opt55: str | None,
+    opt60: str | None,
+    klass: str | None,
+    score: int | None = 90,
+) -> DHCPFingerprint:
     return DHCPFingerprint(
         mac_address=mac,
         option_55=opt55,
         option_60=opt60,
         fingerbank_device_class=klass,
+        fingerbank_score=score,
     )
 
 
@@ -163,7 +171,22 @@ def test_lossy_decoded_vendor_class_is_refused_not_mismatched() -> None:
     bytes the device never sent. Emitting it would list the device as
     matched in the preview while the rendered class silently skipped it."""
     assert text_to_hex("Acme\ufffdPrinter") is None
-    assert build_expression([Signature("1,3,6", "Acme\ufffdPrinter")]) == (
+
+
+def test_present_but_unencodable_option_drops_the_whole_signature() -> None:
+    """ "Absent" and "present but unencodable" must not be conflated.
+
+    The device DID send a vendor class, so falling back to
+    ``not option[60].exists`` would assert the opposite of the truth and
+    match a different population — devices that send this request list and
+    no vendor class at all. Matching confidently and wrongly is worse than
+    not matching, so the signature is dropped whole."""
+    assert _term(Signature("1,3,6", "Acme\ufffdPrinter")) is None
+    assert _term(Signature("1,3,junk", "HP")) is None
+    assert build_expression([Signature("1,3,6", "Acme\ufffdPrinter")]) == ""
+
+    # A genuinely absent option still compiles, asserting the absence.
+    assert _term(Signature("1,3,6", None)) == (
         "(option[55].hex == 0x010306 and not option[60].exists)"
     )
 
@@ -536,3 +559,41 @@ async def test_preview_does_not_write(db_session: AsyncSession, client: AsyncCli
     assert r.status_code == 200
     await db_session.refresh(policy)
     assert policy.modified_at == before
+
+
+@pytest.mark.asyncio
+async def test_low_fingerbank_confidence_is_warned(db_session: AsyncSession) -> None:
+    """A low score means fingerbank fell back to the MAC vendor instead of
+    identifying the device — verified against a live key, where an
+    unidentified Apple device came back as device_class "Hardware
+    Manufacturer" at 29 while an exactly-identified print server scored 89.
+    A class built from vendor fallbacks groups unrelated hardware, which is
+    the wrong thing to hang a quarantine on."""
+    grp, _ = await _make_group_with_server(db_session)
+    db_session.add(_fp("aa:bb:cc:00:0b:01", "1,3,6", None, "Hardware Manufacturer", score=29))
+    policy = _policy(grp.id, device_classes=["Hardware Manufacturer"])
+    db_session.add(policy)
+    await db_session.flush()
+
+    out = await compile_device_policy(db_session, policy)
+    assert out.confidence == 29
+    assert any("confidence" in w for w in out.warnings)
+    # Still compiles — this is advice, not a refusal. The operator may know
+    # their estate better than fingerbank does.
+    assert out.expression
+
+
+@pytest.mark.asyncio
+async def test_confident_classification_is_not_warned(
+    db_session: AsyncSession,
+) -> None:
+    grp, _ = await _make_group_with_server(db_session)
+    db_session.add(_fp("aa:bb:cc:00:0c:01", "1,3,6", None, "HP Print Server", score=89))
+    policy = _policy(grp.id, device_classes=["HP Print Server"])
+    db_session.add(policy)
+    await db_session.flush()
+
+    out = await compile_device_policy(db_session, policy)
+    assert out.confidence == 89
+    assert not any("confidence" in w for w in out.warnings)
+    assert out.confidence >= LOW_CONFIDENCE_SCORE

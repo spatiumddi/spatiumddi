@@ -8845,6 +8845,7 @@ export interface DHCPDevicePolicyPreview {
   source: string;
   compiled_expression: string;
   signature_count: number;
+  confidence: number | null;
   signatures: DHCPDeviceSignature[];
   ambiguous_signatures: DHCPDeviceSignature[];
   ambiguous_excluded: boolean;
@@ -8862,6 +8863,11 @@ export interface DHCPDeviceObservation {
   device_class: string;
   device_count: number;
   signature_count: number;
+  // Fingerbank's own 0-100 confidence. A low score usually means it fell
+  // back to the MAC vendor rather than identifying the device, so the
+  // class groups unrelated hardware — worth showing next to the name.
+  best_score: number | null;
+  avg_score: number | null;
 }
 
 export interface DHCPDeviceObservations {

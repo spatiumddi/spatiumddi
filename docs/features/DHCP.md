@@ -1304,6 +1304,35 @@ fingerbank device classes and an outcome — an option set, a lease
 time, and optionally a pool — and SpatiumDDI compiles it into a real
 Kea client-class `test` expression.
 
+### Device classes are fingerbank's strings, not tidy categories
+
+Worth setting expectations before the first policy: `device_class` is
+fingerbank's own taxonomy (the first parent of the matched device), and
+it sits at mixed granularity. Verified against a live key, real values
+look like:
+
+| `device_class` | `device_name` | score |
+|---|---|---|
+| `HP Print Server` | HP JetDirect Print Server | 89 |
+| `Operating System` | Windows OS | 78 |
+| `Generic Android` | Samsung Android | 60 |
+| `Hardware Manufacturer` | Apple, Inc. | 29 |
+| `Generic IoT` | Raspberry Pi | 15 |
+
+There is no plain `Printer` or `IoT` class to select. Always pick from
+`GET …/device-observations` rather than typing a string — one that does
+not appear there compiles to an empty expression and renders nothing,
+which looks configured and does nothing.
+
+**The score is part of the safety story, not decoration.** A low
+fingerbank score means it could not identify the device and fell back to
+the MAC vendor — which is exactly what `Hardware Manufacturer` at 29
+above is. A class like that groups unrelated hardware, so building a
+quarantine on it targets an arbitrary set of unidentified devices. The
+class picker shows the score per class and flags anything under 30, and
+the compiler adds a warning when the best score among matched devices is
+below that.
+
 That produces NAC-lite outcomes with no 802.1X and no switch
 configuration: unknown and IoT devices get a short lease, a restricted
 resolver and a quarantine pool; corporate laptops get the normal

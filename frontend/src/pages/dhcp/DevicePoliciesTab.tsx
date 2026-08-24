@@ -267,12 +267,13 @@ function DevicePolicyModal({
   // visible and selected, or editing an existing policy would silently drop
   // it just because the last device of that kind left the network.
   const options = useMemo(() => {
-    const seen = new Map<string, number>();
+    const seen = new Map<string, { count: number; score: number | null }>();
     for (const c of obs?.classes ?? [])
-      seen.set(c.device_class, c.device_count);
-    for (const c of selected) if (!seen.has(c)) seen.set(c, 0);
+      seen.set(c.device_class, { count: c.device_count, score: c.best_score });
+    for (const c of selected)
+      if (!seen.has(c)) seen.set(c, { count: 0, score: null });
     return [...seen.entries()].sort(
-      (a, b) => b[1] - a[1] || a[0].localeCompare(b[0]),
+      (a, b) => b[1].count - a[1].count || a[0].localeCompare(b[0]),
     );
   }, [obs, selected]);
 
@@ -354,7 +355,7 @@ function DevicePolicyModal({
                 Nothing observed yet.
               </div>
             ) : (
-              options.map(([cls, count]) => (
+              options.map(([cls, meta]) => (
                 <label key={cls} className="flex items-center gap-2 text-sm">
                   <input
                     type="checkbox"
@@ -368,8 +369,27 @@ function DevicePolicyModal({
                     }
                   />
                   <span className="min-w-0 flex-1 truncate">{cls}</span>
+                  {/* A class name alone hides the difference between an
+                      identified device and a vendor-only fallback, which is
+                      what a low fingerbank score means. */}
+                  {meta.score != null && (
+                    <span
+                      className={`shrink-0 rounded px-1.5 py-0.5 text-xs ${
+                        meta.score < 30
+                          ? "bg-amber-500/15 text-amber-600 dark:text-amber-400"
+                          : "bg-muted text-muted-foreground"
+                      }`}
+                      title={
+                        meta.score < 30
+                          ? "Low confidence — fingerbank likely fell back to the MAC vendor rather than identifying the device, so this class may group unrelated hardware."
+                          : "Fingerbank confidence for this class"
+                      }
+                    >
+                      {meta.score}/100
+                    </span>
+                  )}
                   <span className="shrink-0 text-xs text-muted-foreground">
-                    {count} device{count === 1 ? "" : "s"}
+                    {meta.count} device{meta.count === 1 ? "" : "s"}
                   </span>
                 </label>
               ))

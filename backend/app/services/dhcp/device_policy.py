@@ -70,6 +70,15 @@ from app.models.dhcp_fingerprint import DHCPFingerprint
 # surfaces it as a warning.
 MAX_SIGNATURE_TERMS = 128
 
+# Below this fingerbank score, a classification is usually the OUI vendor
+# rather than an identified device — its ``device_class`` comes back as a
+# taxonomy node like "Hardware Manufacturer" that groups unrelated
+# hardware. Observed rather than documented upstream: on a live key, an
+# exactly-identified print server scored 89 and an unidentified Apple
+# device fell back to the vendor at 29. Policies built on those are the
+# ones most likely to catch devices the operator did not mean.
+LOW_CONFIDENCE_SCORE = 30
+
 
 @dataclass(frozen=True)
 class Signature:
@@ -134,6 +143,9 @@ class CompiledPolicy:
     # certainly the same kind of device — but the operator did not pick
     # them by name, so the count is surfaced rather than buried.
     unclassified_matches: int = 0
+    # Best fingerbank score among the devices this policy matches, 0-100.
+    # None when nothing matched or no score was recorded.
+    confidence: int | None = None
     warnings: list[str] = field(default_factory=list)
 
 
@@ -193,14 +205,28 @@ def _term(sig: Signature) -> str | None:
     rendered: an empty term would collapse into an always-true expression
     and apply the policy to every device on the network.
 
-    When the device sent no option 60 the term asserts that absence
+    When the device sent no option 60 the term asserts that **absence**
     (``not option[60].exists``) rather than ignoring it. Ignoring it would
     silently widen the match to every device sharing the
     parameter-request-list *including* ones that do send a vendor class —
     the exact over-matching the ambiguity check exists to prevent.
+
+    Which is why "absent" and "present but unencodable" must not be
+    conflated. A vendor class destroyed by a lossy decode, or a malformed
+    parameter-request-list, cannot be encoded — but the device *did* send
+    one, so asserting its absence would state the opposite of the truth
+    and match a different population of devices entirely. Such a signature
+    is dropped whole. Degrading it to the other option alone would be
+    worse than not matching: it would match confidently, and wrongly.
     """
+    has55, has60 = bool(sig.option_55), bool(sig.option_60)
     hex55 = option55_to_hex(sig.option_55)
     hex60 = text_to_hex(sig.option_60)
+
+    # Present but unencodable → the signature cannot be expressed at all.
+    if (has55 and not hex55) or (has60 and not hex60):
+        return None
+
     if hex55 and hex60:
         return f"(option[55].hex == 0x{hex55} and option[60].hex == 0x{hex60})"
     if hex55:
@@ -255,7 +281,7 @@ class FingerprintSnapshot:
     the assembler passes one snapshot to every policy in the group.
     """
 
-    rows: tuple[tuple[str, str | None, str | None, str | None], ...]
+    rows: tuple[tuple[str, str | None, str | None, str | None, int | None], ...]
 
 
 async def load_fingerprint_snapshot(db: AsyncSession) -> FingerprintSnapshot:
@@ -266,16 +292,17 @@ async def load_fingerprint_snapshot(db: AsyncSession) -> FingerprintSnapshot:
             DHCPFingerprint.option_55,
             DHCPFingerprint.option_60,
             DHCPFingerprint.fingerbank_device_class,
+            DHCPFingerprint.fingerbank_score,
         )
     )
     return FingerprintSnapshot(
-        rows=tuple((str(m), o55, o60, cls) for m, o55, o60, cls in res.all())
+        rows=tuple((str(m), o55, o60, cls, score) for m, o55, o60, cls, score in res.all())
     )
 
 
 def _partition(
     snapshot: FingerprintSnapshot, selected: set[str]
-) -> tuple[dict[Signature, list[str]], set[Signature], dict[Signature, int]]:
+) -> tuple[dict[Signature, list[str]], set[Signature], dict[Signature, int], list[int]]:
     """Partition observed fingerprints by whether their class was selected.
 
     Returns ``(inside, outside, unclassified)`` where ``inside`` maps each
@@ -300,15 +327,18 @@ def _partition(
     inside: dict[Signature, list[str]] = {}
     outside: set[Signature] = set()
     unclassified: dict[Signature, int] = {}
-    for mac, opt55, opt60, device_class in snapshot.rows:
+    scores: list[int] = []
+    for mac, opt55, opt60, device_class, score in snapshot.rows:
         sig = Signature(option_55=opt55, option_60=opt60)
         if device_class is None or device_class == "":
             unclassified[sig] = unclassified.get(sig, 0) + 1
         elif device_class in selected:
             inside.setdefault(sig, []).append(str(mac))
+            if score is not None:
+                scores.append(int(score))
         else:
             outside.add(sig)
-    return inside, outside, unclassified
+    return inside, outside, unclassified, scores
 
 
 async def compile_device_policy(
@@ -338,9 +368,9 @@ async def compile_device_policy(
     if selected:
         if snapshot is None:
             snapshot = await load_fingerprint_snapshot(db)
-        inside, outside, unclassified = _partition(snapshot, selected)
+        inside, outside, unclassified, scores = _partition(snapshot, selected)
     else:
-        inside, outside, unclassified = {}, set(), {}
+        inside, outside, unclassified, scores = {}, set(), {}, []
 
     usable: list[Signature] = []
     ambiguous: list[Signature] = []
@@ -389,6 +419,17 @@ async def compile_device_policy(
             f"{unclassified_hits} device(s) fingerbank has not classified share a "
             "matched signature and will also receive this policy."
         )
+    if usable and scores:
+        best = max(scores)
+        result.confidence = best
+        if best < LOW_CONFIDENCE_SCORE:
+            result.warnings.append(
+                f"Fingerbank's confidence in these classifications is low "
+                f"(best score {best}/100). Below about {LOW_CONFIDENCE_SCORE} it "
+                "is usually falling back to the MAC vendor rather than "
+                "identifying the device, so the class may group unrelated "
+                "hardware. Check the matched devices before relying on this."
+            )
 
     compiled = build_expression(usable)
     result.compiled_expression = compiled
