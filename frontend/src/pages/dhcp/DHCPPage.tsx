@@ -64,6 +64,7 @@ import { CreateStaticAssignmentModal } from "./CreateStaticAssignmentModal";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { usePermissions } from "@/hooks/usePermissions";
 import { MacBlocksTab } from "./MacBlocksTab";
+import { DevicePoliciesTab } from "./DevicePoliciesTab";
 import { PhoneProfilesTab } from "./PhoneProfilesTab";
 import { DeleteConfirmModal, StatusDot } from "./_shared";
 import {
@@ -346,6 +347,7 @@ type GroupTab =
   | "option-templates"
   | "mac-blocks"
   | "phone-profiles"
+  | "device-policies"
   | "responders"
   | "router-advertisements";
 
@@ -506,6 +508,12 @@ function GroupDetailView({
               Phone Profiles
             </TabButton>
             <TabButton
+              active={tab === "device-policies"}
+              onClick={() => setTab("device-policies")}
+            >
+              Device Policies
+            </TabButton>
+            <TabButton
               active={tab === "responders"}
               onClick={() => setTab("responders")}
             >
@@ -547,6 +555,9 @@ function GroupDetailView({
         {isKea && tab === "mac-blocks" && <MacBlocksTab groupId={group.id} />}
         {isKea && tab === "phone-profiles" && (
           <PhoneProfilesTab groupId={group.id} />
+        )}
+        {isKea && tab === "device-policies" && (
+          <DevicePoliciesTab groupId={group.id} />
         )}
         {isKea && tab === "responders" && <RespondersTab groupId={group.id} />}
         {isKea && raEnabled && tab === "router-advertisements" && (

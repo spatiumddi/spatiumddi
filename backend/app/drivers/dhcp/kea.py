@@ -22,6 +22,7 @@ import structlog
 from app.drivers.dhcp.base import (
     ClientClassDef,
     ConfigBundle,
+    DevicePolicyClassDef,
     DHCPDriver,
     PhoneClassDef,
     PoolDef,
@@ -433,6 +434,27 @@ def _render_phone_class(p: PhoneClassDef) -> dict[str, Any]:
     return d
 
 
+def _render_device_policy_class(p: DevicePolicyClassDef) -> dict[str, Any]:
+    """Render a fingerprint-driven device-policy class (issue #700).
+
+    ``valid-lifetime`` on a client class is honoured by Kea per-class —
+    verified against kea-dhcp4 3.0.3 rather than assumed, because a
+    silently-ignored lease time is the difference between a quarantine
+    that expires and one that never does.
+
+    The ``test`` key is emitted unconditionally: the assembler never
+    produces a device-policy class with an empty expression, since a Kea
+    class with no ``test`` matches every packet — which for this feature
+    would apply a quarantine policy to the whole network.
+    """
+    d: dict[str, Any] = {"name": p.name, "test": p.match_expression}
+    if p.lease_time is not None:
+        d["valid-lifetime"] = p.lease_time
+    if p.options:
+        d["option-data"] = _render_option_data(p.options, address_family="ipv4")
+    return d
+
+
 def _render_pxe_class(p: PXEClassDef) -> dict[str, Any]:
     """Render a PXE / iPXE class for Dhcp4 ``client-classes`` (issue #51).
 
@@ -494,7 +516,11 @@ class KeaDriver(DHCPDriver):
                     _render_client_class(c, address_family="ipv4") for c in bundle.client_classes
                 ]
                 + [_render_pxe_class(p) for p in bundle.pxe_classes]
-                + [_render_phone_class(p) for p in bundle.phone_classes],
+                + [_render_phone_class(p) for p in bundle.phone_classes]
+                # #700 — last, so an operator's hand-written class of the
+                # same shape is evaluated first. Kea stops at the first
+                # match, so declaration order is precedence.
+                + [_render_device_policy_class(p) for p in bundle.device_policy_classes],
                 "option-data": _render_option_data(bundle.options.options, address_family="ipv4"),
             }
             # #856 — ship definitions for any non-standard option emitted above.

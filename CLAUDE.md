@@ -680,6 +680,87 @@ suggestion, free-space treemap.
 - ⬜ [**Lease histogram by hour**](https://github.com/spatiumddi/spatiumddi/issues/53)
 - ⬜ [**Option 82 (relay agent info) class matching**](https://github.com/spatiumddi/spatiumddi/issues/54)
 - ⬜ [**DHCP test client**](https://github.com/spatiumddi/spatiumddi/issues/55)
+- ✅ [**Fingerprint-driven DHCP policy — compile device profiles into Kea client-classes**](https://github.com/spatiumddi/spatiumddi/issues/700)
+  — device profiling told us what a device *is*; client classes let us treat
+  kinds of device differently; nothing joined them. Now `dhcp_device_policy`
+  (migration `f3b8d21c74ae`) + `services/dhcp/device_policy.py` compile an
+  operator's choice of fingerbank device classes into a real Kea client-class
+  `test`, carrying an option set, a per-class `valid-lifetime`, and a stable
+  generated class name a pool's `class_restriction` can bind to. NAC-lite with
+  no 802.1X and no switch config. 4 REST routes, 2 MCP tools
+  (`find_dhcp_device_policies`, `preview_dhcp_device_policy`, both read-only,
+  default on), a Device Policies tab. Permissions ride on `dhcp_client_class`
+  — a device policy *is* a client class, generated rather than typed — so the
+  builtin DHCP Editor role gains **read** with no role migration (writes stay
+  superadmin, matching the hand-authored client-class surface rather than
+  quietly widening it). Explicitly **not**
+  a feature module (non-negotiable #14): it adds no top-level family, and
+  "off" is already `enabled=false` on the row.
+  **The compiler cannot match the category, and says so.** Fingerbank
+  classifies by querying its corpus; Kea has no `device-class == IoT`
+  predicate. So it matches *the signatures observed and classified into the
+  selected classes* — which makes v1 honestly "classify on first lease, apply
+  on renewal", stated in the UI rather than implied away.
+  **The load-bearing safety property is ambiguity exclusion.** A parameter
+  request list like `1,3,6,15` comes from a doorbell and a rack server alike,
+  so a signature seen both inside and outside the selected classes is excluded
+  by default, counted and listed — otherwise the headline use ("quarantine
+  unknown devices") is also how the CEO's laptop gets quarantined.
+  `include_ambiguous` is the audited opt-in. Unclassified devices are
+  deliberately *not* treated as ambiguity evidence (that would make the
+  feature unusable before a fingerbank key is set) but are reported — and
+  only for signatures that survive filtering and the 128-term cap, so the
+  count reflects devices the rendered expression actually reaches.
+  **Nothing device-controlled reaches the config as a string:** option 60 is
+  chosen by the *device*, so both halves of every term are emitted as hex
+  (`option[60].hex == 0x4D5346…`), making a vendor class of `' or 1--` inert
+  bytes rather than syntax. An absent option 60 compiles to `not
+  option[60].exists` rather than being ignored, which would silently widen the
+  match to every device sharing the request list.
+  **Nine findings from /code-review, all confirmed and fixed**, two of which
+  were live 500s. The worst: `Signature` carried `order=True`, whose generated
+  `__lt__` compares `None` against `str` the moment two in-class signatures
+  agree on option 55 and differ on whether option 60 is present — a
+  `TypeError` raised *inside* `build_config_bundle`, i.e. a 500 on the agent
+  long-poll that stops the whole group converging. Every fixture happened to
+  differ on option 55, which is why the suite was green. Sorting now goes
+  through an explicit key that gives absence a defined position. Also: an
+  explicit `null` reached NOT NULL columns through `exclude_unset` (500 → now
+  422, while a null on a *nullable* field still clears it, which
+  `exclude_none` would have broken); the new table was absent from the backup
+  catalogue, so a selective `dhcp` restore would TRUNCATE-CASCADE it and never
+  repopulate it — a failing test caught that one; `compiled_expression` echoed
+  the override, making the documented comparison impossible; the preview GET
+  committed `last_compiled_at`, an unaudited write on a `read`-authorised path
+  that maintenance mode does not gate (the column was dropped — the only other
+  compile site is the bundle build, and stamping there would write on every
+  long-poll tick); and the fingerprint scan ran once per policy per tick
+  instead of once per bundle.
+  **Validated against a live fingerbank key**, which corrected a wrong
+  assumption carried by the issue text and the first draft of the docs: there
+  is no plain `Printer` or `IoT` class. Fingerbank's `device_class` is its own
+  taxonomy at mixed granularity — real observed values are `HP Print Server`
+  (score 89), `Operating System` (78), `Generic Android` (60),
+  `Hardware Manufacturer` (29), `Generic IoT` (15). The last of those is the
+  interesting one: a low score means fingerbank *failed* to identify the
+  device and fell back to the MAC vendor, so that class groups unrelated
+  hardware and is a poor policy target however plausible the name reads in a
+  list. `fingerbank_score` was already stored and surfaced nowhere, so the
+  class picker now shows it per class and flags anything under 30, and the
+  compiler warns when the best score among matched devices is below that.
+  **Two fail-closed rules, both about the same Kea behaviour:** a class with
+  no `test` matches *every* packet, so a policy compiling to nothing is
+  dropped rather than rendered testless (in both renderers), and `text_to_hex`
+  returns None for empty rather than emitting `0x`, which is a parse error
+  that fails the WHOLE config. Kea's parser is *not* the term-cap constraint
+  (1024 terms / 32 KB loads fine) — per-packet cost and legibility are, and
+  hitting the cap is reported, never silent. Every expression form was
+  validated against a live kea-dhcp4 3.0.3, and the end-to-end path
+  (REST → bundle → wire → agent → on-disk `kea-dhcp4.conf`) was walked on the
+  dev stack rather than reasoned about. **v4-only by construction** — options
+  55/60 are DHCPv4 codes, and the v6 branch of both renderers builds its class
+  list from generic client classes alone. **Deferred:** auto-creating the
+  quarantine pool, DHCPv6, and rules keyed on fingerbank device *name*.
 
 #### Operational tooling
 

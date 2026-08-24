@@ -26,10 +26,12 @@ from app.models.dhcp import (
     DHCPServerGroup,
     DHCPStaticAssignment,
 )
+from app.models.dhcp_device_policy import DHCPDevicePolicy
 from app.models.dhcp_fingerprint import DHCPFingerprint
 from app.models.ipam import Subnet
 from app.models.metrics import DHCPMetricSample
 from app.services.ai.tools.base import register_tool
+from app.services.dhcp.device_policy import compile_device_policy
 from app.services.dhcp.stats import STATS_WINDOW_SECONDS, active_lease_count
 from app.services.oui import bulk_lookup_vendors, is_voip_phone_vendor, normalize_mac_key
 
@@ -998,3 +1000,100 @@ async def find_dhcp_lease_history(
         }
         for r in rows
     ]
+
+
+# ── Fingerprint-driven device policies (#700) ──────────────────────────────
+
+
+class ListDevicePoliciesArgs(BaseModel):
+    group_id: uuid.UUID | None = Field(default=None, description="Filter to one DHCP server group.")
+    enabled_only: bool = Field(default=False, description="Only policies that are switched on.")
+
+
+@register_tool(
+    name="find_dhcp_device_policies",
+    description=(
+        "List fingerprint-driven DHCP device policies (issue #700) — the rules "
+        "that give devices of a given fingerbank class (Printer, IoT, game "
+        "console, …) a specific option set, lease time and optionally a "
+        "restricted pool. Each row reports the Kea client-class it compiles to "
+        "and whether it currently matches anything."
+    ),
+    args_model=ListDevicePoliciesArgs,
+    category="dhcp",
+    default_enabled=True,
+)
+async def find_dhcp_device_policies(
+    db: AsyncSession, user: User, args: ListDevicePoliciesArgs
+) -> list[dict[str, Any]]:
+    stmt = select(DHCPDevicePolicy)
+    if args.group_id:
+        stmt = stmt.where(DHCPDevicePolicy.group_id == args.group_id)
+    if args.enabled_only:
+        stmt = stmt.where(DHCPDevicePolicy.enabled.is_(True))
+    stmt = stmt.order_by(DHCPDevicePolicy.priority, DHCPDevicePolicy.name)
+    rows = list((await db.execute(stmt)).scalars().all())
+    return [
+        {
+            "id": str(r.id),
+            "name": r.name,
+            "group_id": str(r.group_id),
+            "enabled": r.enabled,
+            "kea_client_class": r.class_name,
+            "device_classes": list(r.device_classes or []),
+            "lease_time": r.lease_time,
+            "options": dict(r.options or {}),
+            "has_manual_override": bool(r.match_override),
+            "include_ambiguous": r.include_ambiguous,
+            "priority": r.priority,
+        }
+        for r in rows
+    ]
+
+
+class PreviewDevicePolicyArgs(BaseModel):
+    policy_id: uuid.UUID = Field(description="The device policy to compile.")
+
+
+@register_tool(
+    name="preview_dhcp_device_policy",
+    description=(
+        "Compile one fingerprint-driven DHCP device policy and report exactly "
+        "what it matches: the Kea expression, how many observed signatures went "
+        "into it, which devices it currently catches, and any signatures "
+        "excluded because devices outside the selected classes emit them too. "
+        "Read-only — it changes no configuration."
+    ),
+    args_model=PreviewDevicePolicyArgs,
+    category="dhcp",
+    default_enabled=True,
+)
+async def preview_dhcp_device_policy(
+    db: AsyncSession, user: User, args: PreviewDevicePolicyArgs
+) -> dict[str, Any]:
+    row = await db.get(DHCPDevicePolicy, args.policy_id)
+    if row is None:
+        return {"error": "Device policy not found", "policy_id": str(args.policy_id)}
+    compiled = await compile_device_policy(db, row)
+    return {
+        "id": str(row.id),
+        "name": row.name,
+        "kea_client_class": row.class_name,
+        "expression": compiled.expression,
+        "source": compiled.source,
+        "renders": bool(row.enabled and compiled.expression),
+        "signature_count": len(compiled.signatures),
+        "matched_device_count": len(compiled.matched_macs),
+        "matched_macs": compiled.matched_macs[:50],
+        "ambiguous_signature_count": len(compiled.ambiguous),
+        "ambiguous_excluded": bool(compiled.ambiguous) and not row.include_ambiguous,
+        "truncated_signatures": compiled.truncated,
+        "unclassified_matches": compiled.unclassified_matches,
+        "warnings": compiled.warnings,
+        "note": (
+            "Matching is over DHCP signatures already observed and classified. "
+            "A device whose signature has never been seen does not match until "
+            "it has leased once and been classified — policies apply from the "
+            "next renewal, not instantly."
+        ),
+    }

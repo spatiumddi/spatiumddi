@@ -49,6 +49,7 @@ from app.models.dhcp import (
     DHCPServerGroup,
     DHCPStaticAssignment,
 )
+from app.models.dhcp_device_policy import DHCPDevicePolicy
 from app.models.dhcp_fingerprint import DHCPFingerprint
 from app.models.diagnostics import InternalError
 from app.models.dicom import DICOMApplicationEntity, DICOMPeer
@@ -234,6 +235,7 @@ __all__ = [
     "DHCPStaticAssignment",
     "DHCPClientClass",
     "DHCPMACBlock",
+    "DHCPDevicePolicy",
     "DHCPFingerprint",
     "DHCPLease",
     "DHCPLeaseHistory",

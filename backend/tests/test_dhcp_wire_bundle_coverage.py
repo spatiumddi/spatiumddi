@@ -9,6 +9,10 @@ This boundary has now produced the same bug four times:
 * #858 — pool ``options_override``, ``pxe_classes`` and ``phone_classes``.
 * #858 — pool ``class_restriction``, shipped but never read by the agent.
 
+This test is why #700 wired ``device_policy_classes`` through the payload
+and the agent renderer in the same change: adding the dataclass field alone
+fails here.
+
 Every occurrence is silent: the UI shows the value, the API returns it, the
 ETag moves when it changes so the agent even re-syncs — and the rendered
 config is identical, because the payload never carried it.
@@ -40,6 +44,7 @@ SHIPPED: frozenset[str] = frozenset(
         "client_classes",
         "pxe_classes",
         "phone_classes",
+        "device_policy_classes",  # #700
         "mac_blocks",
         "failover",
         "dhcp_socket_type",  # → inside the synthesized "server" block

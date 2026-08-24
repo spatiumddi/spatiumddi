@@ -681,6 +681,22 @@ async def agent_config_longpoll(
                             }
                             for c in bundle.phone_classes
                         ],
+                        # #700 — fingerprint-driven device policies. Serialized
+                        # here for the reason #858 documents one block up: a
+                        # class that is ETag-hashed and rendered by the
+                        # control-plane driver but absent from the wire cannot
+                        # reach agent-managed Kea, which is how both the
+                        # appliance and the Compose stack run DHCP — i.e. the
+                        # feature would work nowhere it actually runs.
+                        "device_policy_classes": [
+                            {
+                                "name": c.name,
+                                "match_expression": c.match_expression,
+                                "options": c.options,
+                                "lease_time": c.lease_time,
+                            }
+                            for c in bundle.device_policy_classes
+                        ],
                         # #858 — Kea types a raw ``code:NN`` option as BINARY,
                         # so an operator's string value ("not a valid string of
                         # hexadecimal digits") fails the WHOLE config. The real
@@ -697,6 +713,11 @@ async def agent_config_longpoll(
                             + [st.options_override for s in bundle.scopes for st in s.statics]
                             + [c.options for c in bundle.client_classes]
                             + [c.options for c in bundle.phone_classes]
+                            # #700 — a device policy can deliver a raw
+                            # ``code:NN`` vendor option just as a phone profile
+                            # can; without its definition Kea types the value
+                            # BINARY and rejects the WHOLE config.
+                            + [c.options for c in bundle.device_policy_classes]
                         ),
                         "mac_blocks": [
                             {
