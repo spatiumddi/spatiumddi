@@ -760,11 +760,32 @@ All services expose:
     run in a threadpool with a 3 s overall timeout (so a dead broker
     can't hang the endpoint). Detail carries the worker count; full
     list surfaces on UI hover.
+
+    > **Known limit (#925).** Ping is answered by the worker's
+    > MainProcess pidbox consumer, which is independent of the prefork
+    > pool. A worker whose every pool slot is blocked still answers
+    > `pong` and reports `ok` here, while nothing it is handed can run.
+    > Verified directly against a 2-slot worker holding two
+    > forever-tasks. Detecting pool saturation would need an
+    > `inspect.active()` round trip, and this endpoint is
+    > unauthenticated — every extra broadcast RPC is amplification an
+    > anonymous caller controls — so the `celery-beat` component below
+    > is the signal that surfaces a wedged pool instead.
+
   - `celery-beat` — reads the `spatium:beat:heartbeat` key from
     Redis (written by `app.tasks.heartbeat.beat_tick` every 30 s with
     a 5-min TTL). Age folded into `ok` (≤ 90 s), `warn` (> 90 s — two
-    beat intervals missed), or `error` (missing — beat stopped or
-    down > 5 min).
+    beat intervals missed, or a stamp more than 90 s in the *future*,
+    which is clock skew between the node that ran the tick and this
+    one), or `error` (missing — no tick has landed for > 5 min).
+
+    **`error` here does not mean beat is broken.** Beat *schedules*
+    this task; a **worker** executes it, so the key is a round trip and
+    its absence indicts either end. The detail says so. It used to read
+    "beat is stopped", and that cost real investigation time on #925 —
+    the appliance's beat was running perfectly and the fault was every
+    worker pool slot wedged on an unbounded Redis connect, which per the
+    note above is a state `celery-workers` reports as healthy.
 - Consumed by the Dashboard → Platform Health card. Authenticated
   dashboard users only — the endpoint itself is unauthenticated for
   parity with the other `/health/*` probes, and exposes nothing a

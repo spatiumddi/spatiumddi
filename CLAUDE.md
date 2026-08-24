@@ -1318,6 +1318,56 @@ suggestion, free-space treemap.
   itself, which needs `rndc tsig-list` (or the effective `named.conf` plus
   includes) from an affected node to say what named actually loaded.
 
+- ✅ [**celery-beat reported unhealthy forever after a slot upgrade**](https://github.com/spatiumddi/spatiumddi/issues/925)
+  — the rollup was right that something was broken and wrong about what.
+  **Beat only *schedules* `beat_tick`; a worker executes it**, so the
+  `spatium:beat:heartbeat` key is a round trip and its absence indicts
+  either end — while the old detail asserted "beat is stopped", which sent
+  the investigation to a pod that was running perfectly.
+  **Root cause, reproduced in isolation:** `make_sync_redis` in
+  `tasks/heartbeat.py` was **the one Redis caller of fourteen passing no
+  timeout at all**. #590 had bounded the sentinel hops but did it *per call
+  site*, and this was the site it missed. `REDIS_URL` on a multi-node
+  control plane lists sentinels by **per-pod headless DNS** (deliberately —
+  a client must reach every sentinel mid-failover), and those names keep
+  resolving through the 20–40 s a rebooting node takes to be marked
+  NotReady. Measured against an unreachable sentinel: unbounded is **still
+  blocked at 60 s** (and past 5 min); bounded returns `MasterNotFoundError`
+  in ~28 s. A tick is enqueued every 30 s regardless, so one wedged slot
+  per interval takes the default 4-slot pool in **~2 minutes** — which is
+  exactly the "still unhealthy after 120 s" the report measured, and why
+  *every* periodic job stops, not just the heartbeat.
+  **The second half is why it looked like beat's fault:** `inspect ping` is
+  answered by the worker's MainProcess pidbox consumer, independent of the
+  prefork pool, so a worker with **every** slot blocked still reports
+  `celery-workers: ok`. Verified directly against a 2-slot worker holding
+  two forever-tasks. Documented as a known limit rather than fixed with an
+  `inspect.active()` round trip — `/health/platform` is unauthenticated, so
+  every extra broadcast RPC there is amplification an anonymous caller
+  controls.
+  Fix: the connect timeout is now a **default inside
+  `core/redis_client.py`**, because a per-call-site convention is what
+  failed; `socket_timeout` is deliberately *not* defaulted, since
+  `core/agent_wake` parks a pub/sub read that is supposed to be slow and a
+  read timeout would turn the wake bus into a reconnect loop. `beat_tick`
+  gains `soft_time_limit` / `time_limit`, both **under** its own 30 s
+  interval — a tick allowed to outlive the interval still accumulates one
+  occupied slot per interval, just more slowly — sized from measurement
+  (walking past one resolving-but-dead sentinel costs ~12.8 s at a 1 s
+  connect timeout, far more than the timeout itself because redis-py
+  retries internally, so a limit that does not clear it kills the tick just
+  before it succeeds). `expires` was tried and **removed in review**: Celery
+  stamps it as an absolute time from the *publisher's* clock and the
+  *worker* compares it, so a worker running ahead of beat would revoke every
+  tick and make the reported symptom permanent — trading the bug for a
+  strictly worse one, in exactly the post-reboot window where NTP has not
+  converged. Redis errors are swallowed and logged rather than filing a
+  diagnostics row every 30 s for the length of an outage.
+  The health detail now names both suspects, and a stamp more than 90 s in
+  the **future** reads as clock skew instead of as perfectly fresh — the
+  plain `age_s > 90` test would have masked a genuinely dead beat behind a
+  skewed worker clock. No migration, no new endpoint, no MCP change.
+
 #### CLI tool
 
 - ⬜ [**`spddi` CLI**](https://github.com/spatiumddi/spatiumddi/issues/83)

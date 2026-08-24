@@ -287,3 +287,56 @@ permanent (hard) delete path, which refuses unless you either:
 System placeholder rows (the `.0` network and `.255` broadcast) and
 DHCP-lease mirrored rows (`auto_from_lease=True`) do **not** count as
 blockers — they're cleaned up automatically on delete.
+
+---
+
+## `/health/platform` says `celery-beat` is unhealthy
+
+**Read the component name as a symptom, not a diagnosis.** Beat only
+*schedules* `app.tasks.heartbeat.beat_tick`; a **worker** executes it and
+writes the `spatium:beat:heartbeat` key the check reads. So a red
+`celery-beat` means *no tick landed*, which has two very different causes —
+and `celery-workers` cannot be used to rule the second one out, because
+`inspect ping` is answered by the worker's MainProcess and stays green
+while every prefork slot is blocked (see `docs/OBSERVABILITY.md` § Platform
+health).
+
+Split them in about a minute:
+
+```bash
+# 1. Is beat scheduling? Look for the send line, once per 30 s.
+kubectl -n spatiumddi logs deploy/spatiumddi-beat --tail=20 | grep 'Sending due task'
+docker compose logs --tail=20 beat | grep 'Sending due task'      # compose
+
+# 2. Is a worker executing it? Look for the matching succeeded line.
+kubectl -n spatiumddi logs deploy/spatiumddi-worker --tail=50 | grep beat_tick
+
+# 3. Can the pool run anything at all? active == concurrency means it can't.
+kubectl -n spatiumddi exec deploy/spatiumddi-worker -- \
+  celery -A app.celery_app inspect active --timeout 5
+```
+
+| What you see | Where the fault is |
+|---|---|
+| No "Sending due task" | Beat really is stopped — check the pod / its `wait-for-migrate` init container |
+| Sending, but no `beat_tick` succeeded | The worker is not consuming — check the pool (step 3) and the broker |
+| `active` count equals `--concurrency` | The pool is wedged; every scheduled job across the platform has stopped, not just the heartbeat |
+
+**The case #925 was filed for** is the third row, after a slot upgrade on a
+multi-node control plane. `REDIS_URL` lists sentinels by their per-pod
+headless DNS names (deliberately — a client must reach every sentinel
+mid-failover), and those names keep resolving through the 20-40 s a
+rebooting node takes to be marked NotReady. A connect to one of them with
+no timeout blocks indefinitely — measured still blocked at 60 s — and a
+tick is enqueued every 30 s regardless, so a 4-slot pool is gone in about
+two minutes and never comes back. Every Redis client now gets a default
+connect timeout (`app/core/redis_client.py`) and the heartbeat task carries
+`soft_time_limit` / `time_limit`, both under its own 30 s interval, so a
+tick fails and frees its slot instead of holding it. (`expires` is
+deliberately absent — Celery stamps it from the *publisher's* clock and the
+*worker* compares it, so on a skewed pair it would revoke every tick and
+make this symptom permanent.)
+
+A `warn` reading `last tick Ns in the future (clock skew)` means the node
+that ran the tick and the node serving this endpoint disagree about the
+time — check NTP on both rather than looking at Celery.
