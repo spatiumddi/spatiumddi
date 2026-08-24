@@ -34,7 +34,6 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-import structlog
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, select
@@ -52,8 +51,6 @@ from app.services.dhcp.device_policy import (
     compile_device_policy,
     slugify_class_name,
 )
-
-logger = structlog.get_logger(__name__)
 
 router = APIRouter(
     tags=["dhcp"],

@@ -52,14 +52,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.dhcp_device_policy import DHCPDevicePolicy
 from app.models.dhcp_fingerprint import DHCPFingerprint
-
-logger = structlog.get_logger(__name__)
 
 # Cap on signature terms in one compiled expression.
 #
