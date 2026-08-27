@@ -301,7 +301,12 @@ async def test_effective_blocklist_for_group(db_session: AsyncSession) -> None:
     eff = await build_effective_for_group(db_session, group.id)
     assert eff.scope == "group"
     assert any(e.domain == "bad.example.com" for e in eff.entries)
-    assert "good.example.com" in eff.exceptions
+    # Equality, not membership: the group has one list carrying one exception,
+    # so pinning the whole set also catches an exception leaking in from a list
+    # that is not in scope. (It additionally keeps CodeQL's
+    # py/incomplete-url-substring-sanitization off a `"host" in <set[str]>`
+    # test it mistakes for a substring check on an unparsed URL.)
+    assert eff.exceptions == {"good.example.com"}
     assert bl.id in eff.lists
 
 
