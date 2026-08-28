@@ -181,6 +181,70 @@ simply unreachable. The pointer is only moved when it currently names the
 group being left; an appliance deliberately assigned elsewhere is not
 redirected on the strength of one server row moving.
 
+### Moving a zone between groups (#935)
+
+Zones are group-bound too, but a zone is a much sharper thing to move than a
+server: it holds references **into** its group, and the sharpest of those is
+the view. Preview → commit rather than a single call, at
+`POST /api/v1/dns/groups/{gid}/zones/{zid}/move/{preview,commit}` or the
+**Move** button on the zone detail. The preview writes nothing and is safe to
+re-run; the commit re-derives the same plan inside an advisory lock, so a view
+or key created in between changes the answer rather than being applied against
+a stale reading.
+
+**Clearing a view widens exposure — this is the property to understand.**
+Under split-horizon a record with a view set renders in exactly that view; one
+with no view is *shared* and renders in **every** view. So when the target
+group has no view of the same name, dropping the reference does not remove the
+zone from a view, it adds it to all of them. A zone that answered only on
+`internal` starts answering on `external`, with no operator-visible symptom.
+Views are therefore remapped **by name** wherever the target has a match
+(a view called `internal` in each group is the operator's own statement that
+the two mean the same thing), and where it does not, the move refuses until
+the operator acknowledges the widening explicitly.
+
+Three acknowledgements exist, each its own checkbox rather than one blanket
+"I understand", so the DNSSEC warning cannot be accepted by someone who only
+read the view one:
+
+| Key | When | Why it is not just a warning |
+|---|---|---|
+| `view_widening` | a view reference cannot be resolved in the target, which renders views | the zone or record goes from answering in one view to answering in all of them |
+| `dnssec_rollover` | the zone is signed | the private keys live on the **current** group's servers and do not move; the target signs from scratch, so the DS at the registrar is wrong until republished and validation fails in the interval |
+| `lost_update_grants` | a dynamic-update grant names a TSIG key absent from the target | the row cannot be kept (`num_nonnulls(tsig_key_id, ip_cidr) = 1` forbids clearing the key) so it is deleted, and the clients using it lose the ability to update the zone |
+
+The commit also requires the zone name typed back, the way the IPAM block move
+requires a typed CIDR.
+
+What the move does besides reassigning the row:
+
+* **Views and TSIG keys remap by name**, per the above. Dynamic-update grants
+  matched to a same-named key in the target keep working with no operator
+  action.
+* **Pools follow the zone.** They are attached by `zone_id` and their health
+  checks run from the control plane rather than the group's agents, so nothing
+  about them is bound to the old group.
+* **Per-server zone state and queued record updates are purged** — both
+  describe the old group's servers.
+* **DNSSEC key state is deleted.** It is a read-only mirror of what the old
+  group's agents reported; leaving it would show the operator keys that no
+  server holds.
+* **Both group channels are woken** so each side converges immediately.
+
+Two refusals: a **name collision** in the target (409) and a move to the group
+the zone is already in (422). The collision check runs against the *resolved*
+view, not the original one — the constraint is `(group_id, view_id, name)`, so
+a zone whose view is cleared lands at `(target, NULL, name)` and can collide
+with an unviewed zone that a `(group, name)` check would have missed.
+
+A **driver change warns rather than refuses**, unlike the server move: a zone
+is data, not a driver-bound thing, so moving one from a BIND9 group to a
+PowerDNS group is a legitimate migration — but driver-specific features
+(ALIAS, DNSSEC signing, per-driver record types) may not survive, so it says
+so. An **ACME DNS-01 delegation** on the zone is also flagged: its TXT records
+will be written by the target's servers while the NS delegation at the
+registrar still points at the old group's, so issuance fails until repointed.
+
 ### Designating the group primary (#934)
 
 `is_primary` marks the one server per group that DDNS and record writes are

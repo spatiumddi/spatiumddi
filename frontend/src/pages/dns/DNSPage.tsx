@@ -39,6 +39,7 @@ import {
   Clipboard,
   Cloud,
   ExternalLink,
+  ArrowRightLeft,
 } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import { ConfigApplyChip } from "@/components/ConfigApplyChip";
@@ -3061,6 +3062,221 @@ function ZoneSyncPill({ state }: { state: ZoneServerState }) {
   );
 }
 
+// ── Move a zone to another server group (#935) ─────────────────────────────
+//
+// Preview → commit rather than a one-click action, because none of the
+// consequences are visible from the zone page: which view scoping survives,
+// which dynamic-update grants do, and that a signed zone changes groups by
+// rolling its keys. Each consequence is its own checkbox — a single "I
+// understand" would let the DNSSEC warning be accepted by someone who only
+// read the view one.
+
+const ACK_LABELS: Record<string, string> = {
+  view_widening:
+    "I understand these records will answer in EVERY view in the target group, not just the one they are scoped to today.",
+  dnssec_rollover:
+    "I understand this zone will be re-signed with new keys, and DNSSEC validation fails until I publish the new DS record at the registrar.",
+  lost_update_grants:
+    "I understand the listed dynamic-update grants will be deleted, and the clients using them can no longer update this zone.",
+};
+
+function MoveZoneModal({
+  zone,
+  onClose,
+  onMoved,
+}: {
+  zone: DNSZone;
+  onClose: () => void;
+  onMoved: (targetGroupId: string) => void;
+}) {
+  const [targetGroupId, setTargetGroupId] = useState("");
+  const [acks, setAcks] = useState<Record<string, boolean>>({});
+  const [confirmName, setConfirmName] = useState("");
+  const [error, setError] = useState("");
+
+  const { data: groups = [] } = useQuery({
+    queryKey: ["dns-groups"],
+    queryFn: () => dnsApi.listGroups(),
+  });
+
+  // Preview is a pure read, so it re-runs freely as the target changes.
+  const { data: preview, isFetching: previewing } = useQuery({
+    queryKey: ["zone-move-preview", zone.id, targetGroupId],
+    queryFn: () =>
+      dnsApi.previewZoneMove(zone.group_id, zone.id, targetGroupId),
+    enabled: !!targetGroupId,
+  });
+
+  // Clear stale acknowledgements when the target changes — a box ticked
+  // for one group's consequences must not carry over to another's.
+  useEffect(() => {
+    setAcks({});
+  }, [targetGroupId]);
+
+  const mut = useMutation({
+    mutationFn: () =>
+      dnsApi.commitZoneMove(zone.group_id, zone.id, {
+        target_group_id: targetGroupId,
+        confirmation_zone_name: confirmName,
+        acknowledgements: Object.keys(acks).filter((k) => acks[k]),
+      }),
+    onSuccess: () => onMoved(targetGroupId),
+    onError: (e: ApiError) => setError(formatApiError(e)),
+  });
+
+  const required = preview?.required_acknowledgements ?? [];
+  const allAcked = required.every((k) => acks[k]);
+  const nameOk =
+    confirmName.trim().replace(/\.$/, "") === zone.name.replace(/\.$/, "");
+  const canSubmit =
+    !!targetGroupId &&
+    !!preview &&
+    !preview.name_collision &&
+    allAcked &&
+    nameOk &&
+    !mut.isPending;
+
+  return (
+    <Modal title={`Move ${zone.name}`} onClose={onClose} wide>
+      <div className="space-y-4">
+        <Field label="Destination server group">
+          <select
+            className={inputCls}
+            value={targetGroupId}
+            onChange={(e) => setTargetGroupId(e.target.value)}
+          >
+            <option value="">Select a group…</option>
+            {groups
+              .filter((g) => g.id !== zone.group_id)
+              .map((g) => (
+                <option key={g.id} value={g.id}>
+                  {g.name}
+                </option>
+              ))}
+          </select>
+        </Field>
+
+        {previewing && (
+          <p className="text-sm text-muted-foreground">
+            Checking what this move would do…
+          </p>
+        )}
+
+        {preview && (
+          <>
+            {preview.name_collision && (
+              <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
+                <strong>{preview.target_group_name}</strong> already has a zone
+                named <code>{preview.zone_name}</code> in the view this one
+                would land in. Rename or delete it first.
+              </div>
+            )}
+
+            <div className="rounded-md border bg-muted/30 px-3 py-2 text-xs">
+              <div className="grid grid-cols-2 gap-x-4 gap-y-1">
+                <span className="text-muted-foreground">Records moving</span>
+                <span>{preview.records_total}</span>
+                {preview.records_remapped > 0 && (
+                  <>
+                    <span className="text-muted-foreground">
+                      View scoping preserved
+                    </span>
+                    <span>
+                      {preview.records_remapped} record(s) remapped by view name
+                    </span>
+                  </>
+                )}
+                {preview.acl_rows_remapped > 0 && (
+                  <>
+                    <span className="text-muted-foreground">
+                      Update grants preserved
+                    </span>
+                    <span>
+                      {preview.acl_rows_remapped} remapped by key name
+                    </span>
+                  </>
+                )}
+                {preview.pools_repointed > 0 && (
+                  <>
+                    <span className="text-muted-foreground">
+                      Pools following
+                    </span>
+                    <span>{preview.pools_repointed}</span>
+                  </>
+                )}
+                {preview.pending_ops > 0 && (
+                  <>
+                    <span className="text-muted-foreground">
+                      Queued updates discarded
+                    </span>
+                    <span>{preview.pending_ops}</span>
+                  </>
+                )}
+              </div>
+            </div>
+
+            {preview.warnings.length > 0 && (
+              <ul className="space-y-1.5 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-800 dark:text-amber-300">
+                {preview.warnings.map((w, i) => (
+                  <li key={i}>• {w}</li>
+                ))}
+              </ul>
+            )}
+
+            {required.length > 0 && (
+              <div className="space-y-2">
+                {required.map((key) => (
+                  <label key={key} className="flex items-start gap-2 text-xs">
+                    <input
+                      type="checkbox"
+                      className="mt-0.5"
+                      checked={!!acks[key]}
+                      onChange={(e) =>
+                        setAcks((prev) => ({
+                          ...prev,
+                          [key]: e.target.checked,
+                        }))
+                      }
+                    />
+                    <span>{ACK_LABELS[key] ?? key}</span>
+                  </label>
+                ))}
+              </div>
+            )}
+
+            <Field label={`Type the zone name to confirm (${zone.name})`}>
+              <input
+                className={inputCls}
+                value={confirmName}
+                onChange={(e) => setConfirmName(e.target.value)}
+                placeholder={zone.name}
+              />
+            </Field>
+          </>
+        )}
+
+        {error && (
+          <p className="text-sm text-rose-600 dark:text-rose-400">{error}</p>
+        )}
+
+        <div className="flex justify-end gap-2 pt-1">
+          <HeaderButton onClick={onClose}>Cancel</HeaderButton>
+          <HeaderButton
+            variant="destructive"
+            disabled={!canSubmit}
+            onClick={() => {
+              setError("");
+              mut.mutate();
+            }}
+          >
+            {mut.isPending ? "Moving…" : "Move zone"}
+          </HeaderButton>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
 // Sub-tabs on the zone detail surface. Mirrored in the ``subtab`` URL param
 // (``records`` is the default and is left out of the URL entirely).
 type ZoneSubtab = "records" | "pools" | "certs" | "drift";
@@ -3077,6 +3293,7 @@ function ZoneDetailView({
   onDeleted: () => void;
 }) {
   const qc = useQueryClient();
+  const navigate = useNavigate();
   const [showAddRecord, setShowAddRecord] = useState(false);
   const [editRecord, setEditRecord] = useState<DNSRecord | null>(null);
   const [propagationRecord, setPropagationRecord] = useState<DNSRecord | null>(
@@ -3087,6 +3304,7 @@ function ZoneDetailView({
   const [showDelegate, setShowDelegate] = useState(false);
   const [showUpdateAcl, setShowUpdateAcl] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [showMoveZone, setShowMoveZone] = useState(false);
   const [deleteNotice, setDeleteNotice] = useState<string | null>(null);
   const [showImport, setShowImport] = useState(false);
   const [showRecFilters, setShowRecFilters] = useState(false);
@@ -3454,6 +3672,18 @@ function ZoneDetailView({
             }
           >
             Edit Zone
+          </HeaderButton>
+          <HeaderButton
+            icon={ArrowRightLeft}
+            onClick={() => setShowMoveZone(true)}
+            disabled={!!zone.tailscale_tenant_id}
+            title={
+              zone.tailscale_tenant_id
+                ? "This zone is synthesised by the Tailscale integration; it is bound to that tenant's group."
+                : "Move this zone to another server group"
+            }
+          >
+            Move
           </HeaderButton>
           <HeaderButton
             variant="destructive"
@@ -4132,6 +4362,23 @@ function ZoneDetailView({
             bulkDeleteRecords.mutate(Array.from(selectedRecords))
           }
           onClose={() => setConfirmBulkDelete(false)}
+        />
+      )}
+      {showMoveZone && (
+        <MoveZoneModal
+          zone={zone}
+          onClose={() => setShowMoveZone(false)}
+          onMoved={(targetGroupId) => {
+            setShowMoveZone(false);
+            // Both groups' zone lists changed, and the zone's own URL is
+            // keyed on the group it is in — so navigate to it under the new
+            // group rather than leaving the page on a 404.
+            qc.invalidateQueries({ queryKey: ["dns-zones"] });
+            qc.invalidateQueries({ queryKey: ["dns-groups"] });
+            navigate(`/dns?group=${targetGroupId}&zone=${zone.id}`, {
+              replace: true,
+            });
+          }}
         />
       )}
       {showEditZone && (

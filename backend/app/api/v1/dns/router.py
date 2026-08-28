@@ -8,7 +8,7 @@ import re
 import uuid
 import zipfile
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Self
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -110,6 +110,12 @@ from app.services.dns.resolver_presets import (
 )
 from app.services.dns.serial import bump_zone_serial
 from app.services.dns.server_move import ServerMoveError, move_server_to_group
+from app.services.dns.zone_move import (
+    ZoneMoveError,
+    ZoneMovePlan,
+)
+from app.services.dns.zone_move import commit_move as commit_zone_move
+from app.services.dns.zone_move import preview_move as preview_zone_move
 from app.services.dns.zone_templates import (
     get_template,
     list_templates,
@@ -5529,6 +5535,178 @@ async def rollover_zone_dnssec_key(
     )
     await db.commit()
     return {"status": "queued", "zone_id": str(zone.id), "key_tag": body.key_tag}
+
+
+# ── Zone move between server groups (issue #935) ────────────────────────────
+#
+# Preview → commit, like the IPAM block move, because none of the
+# consequences are guessable from the request. The heavy lifting lives in
+# ``app.services.dns.zone_move``; the handlers parse, call, audit, commit.
+
+
+class ZoneMovePreviewRequest(BaseModel):
+    target_group_id: uuid.UUID
+
+
+class ZoneMovePreviewResponse(BaseModel):
+    zone_id: uuid.UUID
+    zone_name: str
+    source_group_id: uuid.UUID
+    source_group_name: str
+    target_group_id: uuid.UUID
+    target_group_name: str
+    source_has_views: bool
+    target_has_views: bool
+    zone_view_action: str
+    zone_view_from: str | None
+    records_total: int
+    records_remapped: int
+    records_widened: int
+    records_cleared_inert: int
+    records_widened_by_view: dict[str, int]
+    acl_rows_remapped: int
+    acl_keys_lost: list[str]
+    pools_repointed: int
+    zone_state_rows: int
+    pending_ops: int
+    dnssec_signed: bool
+    dnssec_key_count: int
+    acme_accounts: int
+    source_drivers: list[str]
+    target_drivers: list[str]
+    name_collision: bool
+    warnings: list[str]
+    required_acknowledgements: list[str]
+
+    @classmethod
+    def from_plan(cls, plan: ZoneMovePlan) -> Self:
+        return cls(
+            zone_id=plan.zone_id,
+            zone_name=plan.zone_name,
+            source_group_id=plan.source_group_id,
+            source_group_name=plan.source_group_name,
+            target_group_id=plan.target_group_id,
+            target_group_name=plan.target_group_name,
+            source_has_views=plan.source_has_views,
+            target_has_views=plan.target_has_views,
+            zone_view_action=plan.zone_view_action,
+            zone_view_from=plan.zone_view_from,
+            records_total=plan.records_total,
+            records_remapped=plan.records_remapped,
+            records_widened=plan.records_widened,
+            records_cleared_inert=plan.records_cleared_inert,
+            records_widened_by_view=plan.records_widened_by_view,
+            acl_rows_remapped=plan.acl_rows_remapped,
+            acl_keys_lost=plan.acl_keys_lost,
+            pools_repointed=plan.pools_repointed,
+            zone_state_rows=plan.zone_state_rows,
+            pending_ops=plan.pending_ops,
+            dnssec_signed=plan.dnssec_signed,
+            dnssec_key_count=plan.dnssec_key_count,
+            acme_accounts=plan.acme_accounts,
+            source_drivers=plan.source_drivers,
+            target_drivers=plan.target_drivers,
+            name_collision=plan.name_collision,
+            warnings=plan.warnings,
+            required_acknowledgements=plan.required_acknowledgements,
+        )
+
+
+class ZoneMoveCommitRequest(ZoneMovePreviewRequest):
+    #: Must equal the zone name. Guards against a mis-clicked row, the
+    #: same way the IPAM block move takes a typed CIDR.
+    confirmation_zone_name: str
+    #: Consequences the operator has accepted — the keys the preview
+    #: returned in ``required_acknowledgements``. Anything the plan
+    #: demands and this omits is a 422 rather than a silent apply.
+    acknowledgements: list[str] = []
+
+
+class ZoneMoveCommitResponse(ZoneMovePreviewResponse):
+    moved: bool = True
+    target_tsig_key_generated: bool = False
+
+
+@router.post(
+    "/groups/{group_id}/zones/{zone_id}/move/preview",
+    response_model=ZoneMovePreviewResponse,
+)
+async def move_zone_preview(
+    group_id: uuid.UUID,
+    zone_id: uuid.UUID,
+    body: ZoneMovePreviewRequest,
+    db: DB,
+    current_user: SuperAdmin,
+) -> ZoneMovePreviewResponse:
+    """Report exactly what moving this zone to another group would do.
+
+    Pure read — nothing is written, so it is safe to call repeatedly while
+    the operator decides. The commit re-derives the same plan inside its
+    lock rather than trusting this one.
+    """
+    zone = await _require_zone(group_id, zone_id, db, current_user)
+    target_group = await _require_group(body.target_group_id, db)
+    try:
+        plan = await preview_zone_move(db, zone, target_group)
+    except ZoneMoveError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    return ZoneMovePreviewResponse.from_plan(plan)
+
+
+@router.post(
+    "/groups/{group_id}/zones/{zone_id}/move/commit",
+    response_model=ZoneMoveCommitResponse,
+)
+async def move_zone_commit(
+    group_id: uuid.UUID,
+    zone_id: uuid.UUID,
+    body: ZoneMoveCommitRequest,
+    db: DB,
+    current_user: SuperAdmin,
+) -> ZoneMoveCommitResponse:
+    zone = await _require_zone(group_id, zone_id, db, current_user)
+    target_group = await _require_group(body.target_group_id, db)
+    try:
+        plan = await commit_zone_move(
+            db,
+            zone,
+            target_group,
+            confirmation_zone_name=body.confirmation_zone_name,
+            acknowledgements=set(body.acknowledgements),
+        )
+    except ZoneMoveError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="move",
+            resource_type="dns_zone",
+            resource_id=str(zone.id),
+            resource_display=zone.name,
+            old_value={"group_id": str(plan.source_group_id)},
+            new_value={
+                "group_id": str(plan.target_group_id),
+                "zone_view_action": plan.zone_view_action,
+                "records_remapped": plan.records_remapped,
+                "records_widened": plan.records_widened,
+                "records_cleared_inert": plan.records_cleared_inert,
+                "acl_rows_remapped": plan.acl_rows_remapped,
+                "acl_keys_lost": plan.acl_keys_lost,
+                "pools_repointed": plan.pools_repointed,
+                "dnssec_signed": plan.dnssec_signed,
+                "acknowledgements": sorted(body.acknowledgements),
+            },
+            result="success",
+        )
+    )
+    await db.commit()
+    await db.refresh(zone)
+    resp = ZoneMoveCommitResponse.from_plan(plan)
+    resp.target_tsig_key_generated = plan.target_tsig_key_generated
+    return resp
 
 
 @router.delete("/groups/{group_id}/zones/{zone_id}", status_code=204, response_model=None)

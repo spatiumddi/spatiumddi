@@ -259,6 +259,77 @@ async def find_dns_servers(
     ]
 
 
+class PreviewZoneMoveArgs(BaseModel):
+    zone_id: str = Field(..., description="UUID of the zone to move.")
+    target_group_id: str = Field(..., description="UUID of the destination server group.")
+
+
+@register_tool(
+    name="preview_dns_zone_move",
+    description=(
+        "Report what moving a DNS zone to another server group would do, "
+        "WITHOUT doing it. Answers 'can this zone move to that group, and "
+        "what breaks?' — view scoping that would be lost or widened, "
+        "dynamic-update grants whose TSIG keys don't exist in the target, "
+        "whether the zone is DNSSEC-signed (a move re-signs it with new "
+        "keys, so the DS at the registrar goes stale), name collisions, "
+        "and ACME delegations whose NS records would still point at the "
+        "old group. Read-only. The move itself is deliberately not "
+        "available here — run it from the DNS UI or the REST API, where "
+        "the operator confirms the zone name and acknowledges each "
+        "consequence."
+    ),
+    args_model=PreviewZoneMoveArgs,
+    category="dns",
+)
+async def preview_dns_zone_move(
+    db: AsyncSession, user: User, args: PreviewZoneMoveArgs
+) -> dict[str, Any]:
+    from app.services.dns.zone_move import ZoneMoveError, preview_move
+
+    try:
+        zone_uuid = uuid.UUID(args.zone_id)
+        group_uuid = uuid.UUID(args.target_group_id)
+    except ValueError as exc:
+        return {"error": f"Invalid UUID: {exc}"}
+
+    zone = await db.get(DNSZone, zone_uuid)
+    if zone is None:
+        return {"error": "Zone not found"}
+    target = await db.get(DNSServerGroup, group_uuid)
+    if target is None:
+        return {"error": "Target server group not found"}
+
+    try:
+        plan = await preview_move(db, zone, target)
+    except ZoneMoveError as exc:
+        return {"error": exc.detail, "status": exc.status_code}
+
+    return {
+        "zone_name": plan.zone_name,
+        "source_group": plan.source_group_name,
+        "target_group": plan.target_group_name,
+        "zone_view_action": plan.zone_view_action,
+        "zone_view_from": plan.zone_view_from,
+        "records_total": plan.records_total,
+        "records_remapped": plan.records_remapped,
+        # The dangerous one: an unscoped record answers in EVERY view, so
+        # dropping a view reference widens exposure rather than removing it.
+        "records_widened": plan.records_widened,
+        "records_widened_by_view": plan.records_widened_by_view,
+        "acl_rows_remapped": plan.acl_rows_remapped,
+        "acl_keys_lost": plan.acl_keys_lost,
+        "pools_repointed": plan.pools_repointed,
+        "dnssec_signed": plan.dnssec_signed,
+        "acme_accounts": plan.acme_accounts,
+        "source_drivers": plan.source_drivers,
+        "target_drivers": plan.target_drivers,
+        "name_collision": plan.name_collision,
+        "warnings": plan.warnings,
+        "required_acknowledgements": plan.required_acknowledgements,
+    }
+
+
 # ── Live DNS lookup tools ───────────────────────────────────────────
 #
 # ``forward_dns`` and ``reverse_dns`` wrap dnspython so the operator
