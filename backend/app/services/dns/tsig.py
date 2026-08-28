@@ -19,6 +19,7 @@ rather than only after someone creates a key.
 from __future__ import annotations
 
 import base64
+import re
 import secrets
 import uuid
 
@@ -102,6 +103,34 @@ async def resolve_group_transfer_key(db: AsyncSession, group_id: uuid.UUID) -> T
 __all__ = ["resolve_group_transfer_key", "transfer_needs_tsig"]
 
 
+#: Characters legal in a derived TSIG key name. Everything else is folded to
+#: a hyphen — see ``_safe_key_label``.
+_UNSAFE_KEY_CHARS_RE = re.compile(r"[^a-z0-9_-]+")
+
+
+def _safe_key_label(group: DNSServerGroup) -> str:
+    """Fold a group name into a key name that is safe in ``named.conf``.
+
+    The result is interpolated VERBATIM into ``key "<name>" { … };`` by both
+    agent renderers, so a group named ``edge"; };`` would close the statement
+    early and inject the rest. That is not a cosmetic break: BIND rejects the
+    file whole, ``named-checkconf`` fails, and the agent declines the entire
+    bundle — so one badly-named group stops its whole group converging, with
+    the same blast radius as the #876 / #899 findings.
+
+    Sanitising rather than rejecting is deliberate. The key name is DERIVED,
+    not typed: an operator naming a group ``Edge (DMZ)`` has done nothing
+    wrong and should not be refused because of how we build an identifier
+    from it. Group names are not unique per rendered config either — a
+    bundle carries one legacy key, its own group's — so folding two names
+    together cannot collide in practice.
+    """
+    label = _UNSAFE_KEY_CHARS_RE.sub("-", (group.name or "").strip().lower()).strip("-")
+    # Nothing survived (a name that is entirely punctuation or non-ASCII).
+    # Fall back to the id, which is always a safe identifier and unique.
+    return f"spatium-{label}" if label else f"spatium-{group.id}"
+
+
 def ensure_group_tsig_key(group: DNSServerGroup) -> bool:
     """Give ``group`` a legacy group TSIG key if it has none yet.
 
@@ -118,7 +147,7 @@ def ensure_group_tsig_key(group: DNSServerGroup) -> bool:
     """
     if group.tsig_key_secret:
         return False
-    group.tsig_key_name = f"spatium-{group.name}".replace(" ", "-").lower()
+    group.tsig_key_name = _safe_key_label(group)
     group.tsig_key_secret = base64.b64encode(secrets.token_bytes(32)).decode()
     group.tsig_key_algorithm = "hmac-sha256"
     return True

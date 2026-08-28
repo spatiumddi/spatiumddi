@@ -160,10 +160,26 @@ operations only notice at DNSSEC-sign / ALIAS time, long after the mistake.
 Moving into an *empty* group is always allowed, whatever its driver — that is
 the common case.
 
-The move survives agent re-registration. `/register` resolves an existing row
-by `agent_id` first, with no group filter, and never writes `group_id` on an
-existing row — so a stale `AGENT_GROUP` on the container does not drag the
-server back. There is no need to edit the agent's environment after moving it.
+The move survives agent re-registration, on both deployment shapes — but for
+two different reasons, and the difference matters if you are debugging one.
+
+On a **standalone agent** (Docker / Kubernetes), the group comes from the
+container's own `AGENT_GROUP`. `/register` resolves an existing row by
+`agent_id` first, with no group filter, and never writes `group_id` on a row
+it finds — so a stale `AGENT_GROUP` neither drags the server back nor forks a
+second row in the old group. There is no need to edit the agent's environment
+after moving it, though leaving it accurate is tidier.
+
+On an **appliance** (#170), the agent is not configured from its own
+environment at all: the supervisor derives both `AGENT_GROUP` and the per-role
+nftables ports from `Appliance.assigned_dns_group_id`. The move therefore
+**repoints that field too**, and wakes the supervisor's heartbeat so it
+re-applies rather than waiting out its interval. Without that the firewall
+would keep the *old* group's DoT/DoH/DoQ ports open while the agent listens on
+the new group's — a failure that leaves every config valid and the listener
+simply unreachable. The pointer is only moved when it currently names the
+group being left; an appliance deliberately assigned elsewhere is not
+redirected on the strength of one server row moving.
 
 ### Designating the group primary (#934)
 

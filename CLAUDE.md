@@ -727,7 +727,28 @@ suggestion, free-space treemap.
   `/register` resolves the row by `agent_id` first, globally, and its
   update branch never writes `group_id`, so a stale `AGENT_GROUP` neither
   drags the server back nor forks a second row. Pinned by a test, and
-  `DNS_AGENT.md` now says so where that variable is documented.
+  `DNS_AGENT.md` now says so where that variable is documented. **The
+  appliance path needed the opposite treatment**, found in review: there
+  the agent is not configured from its own environment at all — the
+  supervisor derives `AGENT_GROUP` *and* the per-role nftables ports from
+  `Appliance.assigned_dns_group_id`, so that pointer is repointed by the
+  move (only when it names the group being left) and the supervisor
+  heartbeat woken. Otherwise the firewall keeps the OLD group's #50
+  DoT/DoH/DoQ ports open while the agent listens on the new group's —
+  every config file valid, the listener simply unreachable.
+  **Three more from review.** The op purge covers `in_flight` as well as
+  `pending`: an op already shipped is not finished with, because `ack_op`
+  returns a NACKed one to `pending` and that ack can land *after* the move,
+  re-queueing an old-group zone's update against the new group's daemon.
+  The derived TSIG key name is now folded to a safe identifier — it is
+  interpolated verbatim into `key "<name>" { … };`, so a group named
+  `edge"; };` made `named-checkconf` reject the file whole and the agent
+  decline the entire bundle, the #876 / #899 class again, newly reachable
+  because the move generates keys for operator-typed group names
+  (sanitised, not refused: the name is derived, and `Edge (DMZ)` is not a
+  mistake). And the frontend invalidated only the *source* group's server
+  list, so with a 30 s `staleTime` a moved server was invisible in both
+  groups if the operator navigated straight to the target.
   **Also fixed, found on the way:** `is_primary` was settable by **no API
   at all**, while three separate comments told operators to flip it "later
   via the API" — including the hint `record_ops` logs when it drops a write

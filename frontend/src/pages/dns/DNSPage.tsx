@@ -1259,7 +1259,15 @@ function ServerModal({
         ? dnsApi.updateServer(groupId, server.id, d)
         : dnsApi.createServer(groupId, d),
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["dns-servers", groupId] });
+      // Prefix-invalidate EVERY group's server list, not just this one.
+      // A #934 move writes rows in two groups (the server leaves one and
+      // joins the other) and primary re-election touches a sibling in each,
+      // so scoping this to `groupId` left the target group's cached list
+      // wrong for the full 30 s `staleTime` — the moved server invisible in
+      // both places if the operator navigated straight there.
+      qc.invalidateQueries({ queryKey: ["dns-servers"] });
+      // Group rows carry `server_count`, which a move changes on both sides.
+      qc.invalidateQueries({ queryKey: ["dns-groups"] });
       onClose();
     },
     onError: (e: ApiError) => setError(formatApiError(e)),

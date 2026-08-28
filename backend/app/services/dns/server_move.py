@@ -39,7 +39,13 @@ from sqlalchemy import delete as sa_delete
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.agent_wake import collect_wake, dns_group_channel, dns_server_channel
+from app.core.agent_wake import (
+    appliance_channel,
+    collect_wake,
+    dns_group_channel,
+    dns_server_channel,
+)
+from app.models.appliance import Appliance
 from app.models.dns import (
     DNSRecordOp,
     DNSServer,
@@ -78,6 +84,7 @@ class ServerMoveResult:
     old_group_new_primary_id: uuid.UUID | None
     elected_primary: bool
     target_tsig_key_generated: bool
+    appliance_repointed_id: uuid.UUID | None
 
     def as_audit_value(self) -> dict[str, object]:
         return {
@@ -91,6 +98,9 @@ class ServerMoveResult:
             ),
             "elected_primary_in_target": self.elected_primary,
             "target_tsig_key_generated": self.target_tsig_key_generated,
+            "appliance_repointed_id": (
+                str(self.appliance_repointed_id) if self.appliance_repointed_id else None
+            ),
         }
 
 
@@ -201,11 +211,18 @@ async def move_server_to_group(
             sa_delete(DNSServerZoneState).where(DNSServerZoneState.server_id == server.id)
         )
     ).rowcount or 0
+    # ``in_flight`` as well as ``pending``: an op already shipped in a bundle
+    # is not finished with. ``ack_op`` resets a NACKed one back to ``pending``
+    # (fewer than 5 attempts), and that ack can arrive AFTER the move — which
+    # would put an RFC 2136 update for an old-group zone back in the queue and
+    # ship it to the new group's daemon, exactly what this purge exists to
+    # prevent. ``build_config_bundle`` already treats the two states as one
+    # live set when it retires ops for an agentless server.
     pending_ops_dropped = (
         await db.execute(
             sa_delete(DNSRecordOp).where(
                 DNSRecordOp.server_id == server.id,
-                DNSRecordOp.state == "pending",
+                DNSRecordOp.state.in_(("pending", "in_flight")),
             )
         )
     ).rowcount or 0
@@ -250,6 +267,33 @@ async def move_server_to_group(
     # dynamic-update path cannot authenticate.
     target_tsig_key_generated = ensure_group_tsig_key(target_group)
 
+    # ── Appliance-registered servers: repoint the parent appliance ─────
+    #
+    # On the #170 appliance path the DNS agent is not configured from its own
+    # environment — the supervisor derives it from ``Appliance.
+    # assigned_dns_group_id``. That pointer feeds ``_build_role_assignment``,
+    # which hands the supervisor both the ``AGENT_GROUP`` written into
+    # ``role-compose.env`` AND the #50 DoT/DoH/DoQ ports opened in the
+    # per-role nftables drop-in. Leaving it on the old group means the
+    # firewall keeps the OLD group's encrypted-transport ports: move into a
+    # group serving DoT on 8853 and the agent listens on a port nftables
+    # never opens — a silent, config-clean failure. And because the same
+    # pointer supplies AGENT_GROUP, an agent whose volume is later wiped
+    # would re-register into the old group as a duplicate row.
+    #
+    # Only repointed when it currently names the group being left: an
+    # appliance deliberately assigned elsewhere is not ours to redirect.
+    appliance_repointed_id: uuid.UUID | None = None
+    if server.appliance_id is not None:
+        appliance = await db.get(Appliance, server.appliance_id)
+        if appliance is not None and appliance.assigned_dns_group_id == old_group_id:
+            appliance.assigned_dns_group_id = target_group.id
+            appliance_repointed_id = appliance.id
+            # Per-appliance desired state changed, so wake the supervisor's
+            # heartbeat long-poll rather than making it wait out its interval
+            # for a firewall rule its agent already needs.
+            collect_wake(appliance_channel(appliance.id))
+
     # Both groups' bundles change shape (a member left one and joined the
     # other), and the server's own channel is what reaches an agent already
     # parked in a long-poll — its subscription was built from the OLD group,
@@ -279,4 +323,5 @@ async def move_server_to_group(
         old_group_new_primary_id=old_group_new_primary_id,
         elected_primary=elected_primary,
         target_tsig_key_generated=target_tsig_key_generated,
+        appliance_repointed_id=appliance_repointed_id,
     )

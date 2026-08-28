@@ -211,6 +211,19 @@ async def test_move_purges_zone_state_and_pending_ops(
             state="pending",
         )
     )
+    # Already shipped in a bundle but not yet acked. NOT finished with:
+    # ``ack_op`` puts a NACKed op back to ``pending``, and that ack can
+    # arrive after the move — re-queueing an old-group zone's update against
+    # the new group's daemon.
+    db_session.add(
+        DNSRecordOp(
+            server_id=srv.id,
+            zone_name="example.com.",
+            op="create",
+            record={"name": "inflight", "type": "A", "value": "10.0.0.3"},
+            state="in_flight",
+        )
+    )
     # An already-applied op is history, not queued work — it stays.
     db_session.add(
         DNSRecordOp(
@@ -721,3 +734,156 @@ async def test_move_survives_agent_re_registration_with_a_stale_group_name(
 
     await db_session.refresh(srv)
     assert srv.group_id == target.id, "re-registration must not undo the operator's move"
+
+
+# ── Code-review follow-ups ──────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_move_repoints_the_parent_appliance_dns_group(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """On the #170 appliance path the agent is not configured from its own
+    environment — the supervisor derives ``AGENT_GROUP`` *and* the #50
+    DoT/DoH/DoQ firewall ports from ``Appliance.assigned_dns_group_id``.
+    Left on the old group, nftables keeps the old group's encrypted-transport
+    ports open while the agent listens on the new group's: config-clean, and
+    silently unreachable."""
+    from app.models.appliance import Appliance
+
+    token = await _superadmin(db_session)
+    default = await _group(db_session, "default")
+    target = await _group(db_session, "internal")
+    appliance = Appliance(
+        hostname="ddi1",
+        public_key_der=b"\x00" * 32,
+        public_key_fingerprint="fp-ddi1",
+        state="approved",
+        assigned_roles=["dns_bind9"],
+        assigned_dns_group_id=default.id,
+    )
+    db_session.add(appliance)
+    await db_session.flush()
+    srv = await _server(db_session, default, "ns1", appliance_id=appliance.id)
+
+    resp = await client.put(
+        _url(default.id, srv.id),
+        json={"group_id": str(target.id)},
+        headers=_auth(token),
+    )
+    assert resp.status_code == 200, resp.text
+
+    await db_session.refresh(appliance)
+    assert appliance.assigned_dns_group_id == target.id
+
+
+@pytest.mark.asyncio
+async def test_move_leaves_an_appliance_assigned_elsewhere_alone(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Only repoint when the appliance currently names the group being
+    left. One deliberately assigned somewhere else is not ours to redirect
+    on the strength of one server row moving."""
+    from app.models.appliance import Appliance
+
+    token = await _superadmin(db_session)
+    default = await _group(db_session, "default")
+    target = await _group(db_session, "internal")
+    elsewhere = await _group(db_session, "elsewhere")
+    appliance = Appliance(
+        hostname="ddi1",
+        public_key_der=b"\x00" * 32,
+        public_key_fingerprint="fp-ddi1",
+        state="approved",
+        assigned_roles=["dns_bind9"],
+        assigned_dns_group_id=elsewhere.id,
+    )
+    db_session.add(appliance)
+    await db_session.flush()
+    srv = await _server(db_session, default, "ns1", appliance_id=appliance.id)
+
+    resp = await client.put(
+        _url(default.id, srv.id),
+        json={"group_id": str(target.id)},
+        headers=_auth(token),
+    )
+    assert resp.status_code == 200, resp.text
+
+    await db_session.refresh(appliance)
+    assert appliance.assigned_dns_group_id == elsewhere.id
+
+
+@pytest.mark.asyncio
+async def test_derived_tsig_key_name_is_safe_in_named_conf(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The key name is interpolated VERBATIM into ``key "<name>" { … };`` by
+    both agent renderers. A group name that closes the statement early makes
+    ``named-checkconf`` reject the file WHOLE, so the agent declines the
+    entire bundle — one badly-named group stops its group converging.
+
+    Sanitised rather than refused: the name is derived, not typed, and an
+    operator naming a group ``Edge (DMZ)`` has done nothing wrong."""
+    token = await _superadmin(db_session)
+    default = await _group(db_session, "default")
+    hostile = await _group(db_session, 'edge"; }; key "evil')
+    srv = await _server(db_session, default, "ns1")
+
+    resp = await client.put(
+        _url(default.id, srv.id),
+        json={"group_id": str(hostile.id)},
+        headers=_auth(token),
+    )
+    assert resp.status_code == 200, resp.text
+
+    await db_session.refresh(hostile)
+    name = hostile.tsig_key_name
+    assert name
+    assert set(name) <= set("abcdefghijklmnopqrstuvwxyz0123456789_-"), name
+    # Specifically: nothing that could terminate or open a BIND statement.
+    for ch in '";{}\n\\':
+        assert ch not in name
+
+
+@pytest.mark.asyncio
+async def test_derived_tsig_key_name_falls_back_to_the_group_id(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A name that is entirely punctuation leaves no label to fold, and an
+    empty ``key "" { … }`` is not valid BIND either."""
+    token = await _superadmin(db_session)
+    default = await _group(db_session, "default")
+    punct = await _group(db_session, "!!! ***")
+    srv = await _server(db_session, default, "ns1")
+
+    resp = await client.put(
+        _url(default.id, srv.id),
+        json={"group_id": str(punct.id)},
+        headers=_auth(token),
+    )
+    assert resp.status_code == 200, resp.text
+
+    await db_session.refresh(punct)
+    assert punct.tsig_key_name == f"spatium-{punct.id}"
+
+
+@pytest.mark.asyncio
+async def test_derived_tsig_key_name_keeps_the_readable_form(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Sanitising must not make ordinary names unrecognisable — spaces and
+    parentheses fold to single hyphens, not to the id fallback."""
+    token = await _superadmin(db_session)
+    default = await _group(db_session, "default")
+    normal = await _group(db_session, "Edge (DMZ)")
+    srv = await _server(db_session, default, "ns1")
+
+    resp = await client.put(
+        _url(default.id, srv.id),
+        json={"group_id": str(normal.id)},
+        headers=_auth(token),
+    )
+    assert resp.status_code == 200, resp.text
+
+    await db_session.refresh(normal)
+    assert normal.tsig_key_name == "spatium-edge-dmz"
