@@ -115,6 +115,67 @@ Groups:
 
 A server may belong to only one group but may have **multiple roles** (e.g., both authoritative and recursive).
 
+### Moving a server between groups (#934)
+
+An auto-registered agent lands in the group its `AGENT_GROUP` names, or in
+`default` when it names none — which is rarely the group the operator wants
+it in permanently. Send `group_id` on
+`PUT /api/v1/dns/groups/{current_group_id}/servers/{server_id}`, or use the
+**Server group** picker in the server's edit modal. Note the URL names the
+group the server is *leaving* and the body the one it is joining; addressing
+it under the target group is a 404.
+
+Re-sending the server's current `group_id` is a no-op, so an idempotent PUT
+that echoes the whole row back is safe.
+
+The move is not just a column write. It also:
+
+* **Purges the server's `DNSServerZoneState` rows and its pending
+  `DNSRecordOp`s.** Both reference the *old* group's zones — left behind, the
+  Zone Sync pill reports convergence for zones this server no longer serves,
+  and the queued RFC 2136 updates would be shipped to a daemon that has never
+  heard of those zones. Already-applied ops are history and stay.
+* **Clears the `config_apply_*` verdict (#882).** `ok` means "the live config
+  is the saved one"; a move changes the saved one, so carrying it across is
+  false at the instant of commit. NULL is UNKNOWN, never ok.
+* **Re-elects primaries on both sides.** Moving a group's primary out elects
+  the oldest enabled, unpaused survivor — a group with none silently drops
+  every record write to its zones. In the target the server is elected only
+  if there is no primary already; an existing one is never demoted, because
+  two primaries in one group is not a tie-break, it raises inside the agent
+  long-poll and stops the whole group converging.
+* **Generates the target group's TSIG key if it has none.** A group created
+  in the UI has never been through agent registration, where that key was
+  historically generated.
+* **Wakes both groups and the server's own channel.** The server channel is
+  what reaches an agent already parked in a long-poll — its subscription was
+  built from the old group, so a group wake alone would not reach it.
+
+Two refusals: a **name collision** in the target group (409 — server names are
+unique per group), and a move that would leave the target **mixed-driver**
+(422). The second fails closed here even though a mixed group is still
+reachable by other paths: a group is single-driver (see
+[`DNS_DRIVERS.md` §5.1](../drivers/DNS_DRIVERS.md)) and the driver-gated
+operations only notice at DNSSEC-sign / ALIAS time, long after the mistake.
+Moving into an *empty* group is always allowed, whatever its driver — that is
+the common case.
+
+The move survives agent re-registration. `/register` resolves an existing row
+by `agent_id` first, with no group filter, and never writes `group_id` on an
+existing row — so a stale `AGENT_GROUP` on the container does not drag the
+server back. There is no need to edit the agent's environment after moving it.
+
+### Designating the group primary (#934)
+
+`is_primary` marks the one server per group that DDNS and record writes are
+applied at. It is auto-elected on create and on first agent registration when
+the group has none; send `is_primary: true` on the same PUT to move it, which
+demotes whichever server currently holds it. **Clearing the last primary is
+refused (422)** — it re-creates the footgun the auto-election exists to
+prevent, and the resulting dropped writes are silent (a log line; no error
+reaches whoever made the change). Promote a replacement instead; that demotes
+the incumbent as a side effect.
+
 ---
 
 ## 2. DNS Views (Split-Horizon)

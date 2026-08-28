@@ -18,6 +18,8 @@ rather than only after someone creates a key.
 
 from __future__ import annotations
 
+import base64
+import secrets
 import uuid
 
 import structlog
@@ -98,3 +100,25 @@ async def resolve_group_transfer_key(db: AsyncSession, group_id: uuid.UUID) -> T
 
 
 __all__ = ["resolve_group_transfer_key", "transfer_needs_tsig"]
+
+
+def ensure_group_tsig_key(group: DNSServerGroup) -> bool:
+    """Give ``group`` a legacy group TSIG key if it has none yet.
+
+    The agent renders this key into ``tsig/ddns.key`` and signs its
+    loopback RFC 2136 updates with it; ``resolve_group_transfer_key``
+    above prefers it for AXFR because it exists on every agent-managed
+    group without operator action. Historically it was generated inline
+    on first agent registration, which meant a group created through the
+    UI — or one a server is MOVED into (#934) — could reach an agent with
+    no key at all.
+
+    Returns True when a key was generated, False when one already existed.
+    Mutates the row; the caller commits.
+    """
+    if group.tsig_key_secret:
+        return False
+    group.tsig_key_name = f"spatium-{group.name}".replace(" ", "-").lower()
+    group.tsig_key_secret = base64.b64encode(secrets.token_bytes(32)).decode()
+    group.tsig_key_algorithm = "hmac-sha256"
+    return True

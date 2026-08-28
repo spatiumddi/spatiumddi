@@ -1166,7 +1166,21 @@ function ServerModal({
   const [notes, setNotes] = useState(server?.notes ?? "");
   const [apiKey, setApiKey] = useState("");
   const [isEnabled, setIsEnabled] = useState(server?.is_enabled ?? true);
+  // #934 — move this server to another group, and designate the group's
+  // primary. Edit-only: on create the group is the one you are creating it
+  // in, and the primary flag is auto-elected when the group has none.
+  const [targetGroupId, setTargetGroupId] = useState(
+    server?.group_id ?? groupId,
+  );
+  const [isPrimary, setIsPrimary] = useState(server?.is_primary ?? false);
   const [error, setError] = useState("");
+
+  // Only needed for the move picker, so don't fetch it on the create path.
+  const { data: allGroups = [] } = useQuery({
+    queryKey: ["dns-groups"],
+    queryFn: () => dnsApi.listGroups(),
+    enabled: editing,
+  });
 
   // Windows credential state — same contract as the DHCP modal:
   //   * On edit with creds: leave blank to keep, type to replace.
@@ -1274,6 +1288,15 @@ function ServerModal({
       notes,
       is_enabled: isEnabled,
       ...(apiKey && !cloud ? { api_key: apiKey } : {}),
+      // #934 — only on edit, and only when actually changed. Sending an
+      // unchanged group_id is a server-side no-op, but sending is_primary
+      // unchanged would still take the demotion path on every save.
+      ...(editing && targetGroupId !== server!.group_id
+        ? { group_id: targetGroupId }
+        : {}),
+      ...(editing && isPrimary !== server!.is_primary
+        ? { is_primary: isPrimary }
+        : {}),
     };
 
     if (credFields) {
@@ -1561,6 +1584,50 @@ function ServerModal({
             placeholder="Optional notes"
           />
         </Field>
+        {editing && (
+          <>
+            <Field label="Server group">
+              <select
+                className={inputCls}
+                value={targetGroupId}
+                onChange={(e) => setTargetGroupId(e.target.value)}
+              >
+                {allGroups.map((g) => (
+                  <option key={g.id} value={g.id}>
+                    {g.name}
+                  </option>
+                ))}
+              </select>
+              {targetGroupId !== server!.group_id && (
+                <p className="mt-1 text-xs text-amber-600 dark:text-amber-400">
+                  Moving this server re-renders both groups&rsquo; config. Its
+                  per-zone sync state and any queued record updates for the old
+                  group&rsquo;s zones are discarded, and the agent picks up the
+                  new group&rsquo;s config on its next poll. A group is
+                  single-driver, so the target must be empty or already running{" "}
+                  <code>{driver}</code>.
+                </p>
+              )}
+            </Field>
+            <label className="flex items-start gap-2 text-sm">
+              <input
+                type="checkbox"
+                className="mt-0.5"
+                checked={isPrimary}
+                onChange={(e) => setIsPrimary(e.target.checked)}
+              />
+              <span>
+                <span className="font-medium">Primary for this group</span>
+                <span className="block text-xs text-muted-foreground">
+                  The server DDNS and record writes are applied at. Exactly one
+                  per group &mdash; ticking this demotes whichever server holds
+                  it now. A group with no primary silently drops every record
+                  write to its zones, so it can only be moved, not cleared.
+                </span>
+              </span>
+            </label>
+          </>
+        )}
         <label className="flex items-start gap-2 text-sm">
           <input
             type="checkbox"

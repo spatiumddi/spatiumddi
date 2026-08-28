@@ -20,6 +20,7 @@ from app.models.dns import (
     DNSPool,
     DNSPoolMember,
     DNSRecord,
+    DNSServer,
     DNSServerGroup,
     DNSServerOptions,
     DNSTSIGKey,
@@ -175,6 +176,86 @@ async def list_dns_server_groups(
             "is_recursive": g.is_recursive,
         }
         for g in rows
+    ]
+
+
+class FindDnsServersArgs(BaseModel):
+    group_id: str | None = Field(
+        default=None,
+        description="Restrict to one server group (UUID). Omit for the whole fleet.",
+    )
+    search: str | None = Field(
+        default=None,
+        description="Case-insensitive substring match on server name or host.",
+    )
+    primary_only: bool = Field(
+        default=False,
+        description=(
+            "Only the server each group applies DDNS / record writes at. "
+            "Use when asked which server is primary, or to find a group "
+            "that has none."
+        ),
+    )
+    limit: int = Field(default=200, ge=1, le=1000)
+
+
+@register_tool(
+    name="find_dns_servers",
+    description=(
+        "List individual DNS servers with the group each belongs to, its "
+        "driver, whether it is the group's primary, and its enabled / "
+        "maintenance / config-apply state. Answers 'which group is this "
+        "server in?', 'which server is primary for that group?' and "
+        "'which groups have no primary?' — the last of which silently "
+        "drops every record write to that group's zones. Read-only: "
+        "moving a server between groups is done over the REST API or the "
+        "DNS → Server Groups UI, not from here."
+    ),
+    args_model=FindDnsServersArgs,
+    category="dns",
+)
+async def find_dns_servers(
+    db: AsyncSession, user: User, args: FindDnsServersArgs
+) -> list[dict[str, Any]]:
+    stmt = (
+        select(DNSServer, DNSServerGroup.name)
+        .join(DNSServerGroup, DNSServer.group_id == DNSServerGroup.id)
+        .order_by(DNSServerGroup.name.asc(), DNSServer.name.asc())
+        .limit(args.limit)
+    )
+    if args.group_id:
+        try:
+            stmt = stmt.where(DNSServer.group_id == uuid.UUID(args.group_id))
+        except ValueError:
+            return []
+    if args.search:
+        term = f"%{args.search.strip()}%"
+        stmt = stmt.where(or_(DNSServer.name.ilike(term), DNSServer.host.ilike(term)))
+    if args.primary_only:
+        stmt = stmt.where(DNSServer.is_primary.is_(True))
+
+    rows = (await db.execute(stmt)).all()
+    return [
+        {
+            "id": str(s.id),
+            "name": s.name,
+            "group_id": str(s.group_id),
+            "group_name": group_name,
+            "driver": s.driver,
+            "host": s.host,
+            "port": s.port,
+            "is_primary": s.is_primary,
+            "is_enabled": s.is_enabled,
+            "maintenance_mode": s.maintenance_mode,
+            "status": s.status,
+            # NULL means the agent has never reported a verdict (a pre-#882
+            # agent, or an agentless driver with no apply loop). UNKNOWN,
+            # never "ok" — a silently reverted config is exactly what would
+            # hide behind that assumption.
+            "config_apply_status": s.config_apply_status,
+            "last_seen_at": s.last_seen_at.isoformat() if s.last_seen_at else None,
+        }
+        for s, group_name in rows
     ]
 
 

@@ -608,11 +608,21 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
     ):
         producer = (
             await db.execute(
-                select(DNSServer).where(
+                select(DNSServer)
+                .where(
                     DNSServer.group_id == server.group_id,
                     DNSServer.driver == server.driver,
                     DNSServer.is_primary.is_(True),
                 )
+                # ``.limit(1)`` is load-bearing, not tidiness: without it a
+                # group that somehow holds two primaries raises
+                # MultipleResultsFound from ``scalar_one_or_none`` — INSIDE
+                # the agent long-poll, so the failure is a 500 that stops the
+                # whole group converging rather than a mis-picked producer.
+                # Ordered so the pick is at least deterministic if it happens.
+                # Every other primary lookup in the codebase already caps at 1.
+                .order_by(DNSServer.created_at, DNSServer.id)
+                .limit(1)
             )
         ).scalar_one_or_none()
 

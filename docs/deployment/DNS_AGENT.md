@@ -574,6 +574,17 @@ dns-bind9-ns1:
 > the control plane fans record ops out to every enabled agent-based
 > server in the group regardless of role.
 
+> **`AGENT_GROUP` only decides where a BRAND-NEW agent lands.** On
+> re-registration the control plane resolves the existing row by `agent_id`
+> and never rewrites its `group_id`, so editing this variable does not move
+> a server that has already registered — and leaving it stale does not drag
+> a moved one back. To change a registered server's group, move it in the
+> control plane (`group_id` on the server PUT, or the **Server group**
+> picker in its edit modal — see
+> [`DNS.md` §1](../features/DNS.md)). Naming a group that does not exist
+> still auto-creates an empty one, so a stale value here is untidy rather
+> than harmful.
+
 ---
 
 ## 9. Deliverables for Wave 2 Implementation
