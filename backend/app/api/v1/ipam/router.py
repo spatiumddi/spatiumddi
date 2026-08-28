@@ -2492,6 +2492,13 @@ def _validate_role(v: str | None) -> str | None:
     """
     if v is None or v == "":
         return None
+    # A non-string (a JSON list/object/number) reaches this ``mode="before"``
+    # validator raw. ``v not in IP_ROLES`` then hashes ``v`` against the role
+    # set and an unhashable list raised TypeError — a 500, not the 422 the
+    # contract declares. Hand any non-string to core validation, which rejects
+    # it against the ``str | None`` field as a normal 422.
+    if not isinstance(v, str):
+        return v
     if v not in IP_ROLES:
         raise ValueError(f"role must be one of: {', '.join(sorted(IP_ROLES))}")
     return v
