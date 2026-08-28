@@ -674,6 +674,97 @@ suggestion, free-space treemap.
   (#734); the lesson recorded in `DNS.md` §8.2 is to assert on the
   *rendered config*, not the stored row.
 
+- ✅ [**A DNS server cannot be moved between server groups**](https://github.com/spatiumddi/spatiumddi/issues/934)
+  — reported in discussion #933 the obvious way: an auto-registered BIND9
+  agent lands in `default`, the operator creates the group they actually
+  wanted, and the server is stuck there. `ServerUpdate` carried no
+  `group_id` and no move endpoint existed, while the DHCP side has had
+  `server_group_id` on its update payload since #430 — an asymmetry, not
+  a design decision. Now `group_id` on the server PUT, routed through
+  `services/dns/server_move.py` rather than the generic setattr loop, and
+  a **Server group** picker in the edit modal. No migration, no new table.
+  **The move is not a column write**, because a DNS server accumulates
+  group-scoped state that becomes false the instant its group changes.
+  `DNSServerZoneState` rows and pending `DNSRecordOp`s reference the OLD
+  group's zones — left behind, the Zone Sync pill reports convergence for
+  zones the server no longer serves, and queued RFC 2136 updates ship to a
+  daemon that has never heard of those zones. `config_apply_status` (#882)
+  means "the live config is the saved one", so carrying `ok` across a move
+  is false at commit; it resets to NULL, which is UNKNOWN and never `ok`.
+  The target group's TSIG key is generated if absent, since a group created
+  in the UI has never been through agent registration, where that
+  generation used to be inlined (now `ensure_group_tsig_key`, shared by
+  both paths). Both group channels **and the server's own** are woken — the
+  server channel is the load-bearing one, because an agent already parked
+  in a long-poll subscribed using its OLD group and a group wake alone
+  would never reach it.
+  **`is_primary` is the sharp edge, in both directions.** A group with none
+  drops every record write to its zones *silently* — a log line, no error
+  to the caller — so moving a primary out elects the oldest enabled,
+  unpaused survivor. A group with **two** is worse than a wrong pick: the
+  catalog-zone producer lookup in `build_config_bundle` used
+  `scalar_one_or_none` with no `LIMIT`, so a second primary raises
+  `MultipleResultsFound` *inside the agent long-poll* — a 500 that stops
+  the whole group converging. So the incoming server is elected in the
+  target only when it has none, an existing primary is never demoted, and
+  that query was capped defensively. **The election bug this class predicts
+  was in the first draft and caught by tests**: the departing server is
+  still `group_id == old_group` in-session when the election runs, so
+  without an explicit `exclude_id` the query re-elects the very server
+  being demoted — the flag stays on a member that has left AND the target
+  ends up with two.
+  Two refusals. A **name collision** in the target (409 — names are unique
+  per group; the constraint would fire anyway, but not say which name).
+  And a move that would leave the target **mixed-driver** (422): a group is
+  single-driver, which `DNS_DRIVERS.md` §5.1 has always asserted the
+  control plane enforces — it does not, it only 422s *later*, at DNSSEC-sign
+  or ALIAS time. A move is a new operation with no installs to break, so it
+  fails closed rather than manufacturing a state that breaks something
+  else afterwards; moving into an *empty* group is always allowed, whatever
+  its driver, which is the reported case.
+  **The move survives agent re-registration**, which is what makes it an
+  operator action rather than a setting the next restart undoes:
+  `/register` resolves the row by `agent_id` first, globally, and its
+  update branch never writes `group_id`, so a stale `AGENT_GROUP` neither
+  drags the server back nor forks a second row. Pinned by a test, and
+  `DNS_AGENT.md` now says so where that variable is documented. **The
+  appliance path needed the opposite treatment**, found in review: there
+  the agent is not configured from its own environment at all — the
+  supervisor derives `AGENT_GROUP` *and* the per-role nftables ports from
+  `Appliance.assigned_dns_group_id`, so that pointer is repointed by the
+  move (only when it names the group being left) and the supervisor
+  heartbeat woken. Otherwise the firewall keeps the OLD group's #50
+  DoT/DoH/DoQ ports open while the agent listens on the new group's —
+  every config file valid, the listener simply unreachable.
+  **Three more from review.** The op purge covers `in_flight` as well as
+  `pending`: an op already shipped is not finished with, because `ack_op`
+  returns a NACKed one to `pending` and that ack can land *after* the move,
+  re-queueing an old-group zone's update against the new group's daemon.
+  The derived TSIG key name is now folded to a safe identifier — it is
+  interpolated verbatim into `key "<name>" { … };`, so a group named
+  `edge"; };` made `named-checkconf` reject the file whole and the agent
+  decline the entire bundle, the #876 / #899 class again, newly reachable
+  because the move generates keys for operator-typed group names
+  (sanitised, not refused: the name is derived, and `Edge (DMZ)` is not a
+  mistake). And the frontend invalidated only the *source* group's server
+  list, so with a 30 s `staleTime` a moved server was invisible in both
+  groups if the operator navigated straight to the target.
+  **Also fixed, found on the way:** `is_primary` was settable by **no API
+  at all**, while three separate comments told operators to flip it "later
+  via the API" — including the hint `record_ops` logs when it drops a write
+  for want of a primary, i.e. the message shown at the exact moment the
+  advice was needed. It is now on `ServerUpdate`, demoting the incumbent
+  atomically; clearing the *last* primary is refused (422) rather than
+  silently re-creating the footgun create-time auto-election exists to
+  prevent. 1 MCP tool (`find_dns_servers`, read-only, default on) — the
+  copilot could list server *groups* and had no way to see the servers in
+  them, so "which group is ns1 in?" and "which group has no primary?" were
+  both unanswerable. Deliberately **no** `propose_move_*` write tool
+  (explicit decision per non-negotiable #13): the move re-renders two
+  groups' configs, which is the broad-blast-radius shape that guidance says
+  to keep off the copilot. Not a feature module (#14) — it extends an
+  existing resource rather than adding a top-level family.
+
 #### DHCP-specific
 
 - ✅ [**DHCPv6 stateful + SLAAC config UI**](https://github.com/spatiumddi/spatiumddi/issues/52) — shipped `2026.06.04-1`: `DHCPScope.v6_address_mode` + `ra_managed_flag` / `ra_other_flag`; the Kea driver renders `subnet6` by mode (stateful → pools + options; stateless / SLAAC → options only). Migration `e4c1a8f63b29`.

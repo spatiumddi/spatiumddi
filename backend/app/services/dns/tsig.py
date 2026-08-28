@@ -18,6 +18,9 @@ rather than only after someone creates a key.
 
 from __future__ import annotations
 
+import base64
+import re
+import secrets
 import uuid
 
 import structlog
@@ -98,3 +101,53 @@ async def resolve_group_transfer_key(db: AsyncSession, group_id: uuid.UUID) -> T
 
 
 __all__ = ["resolve_group_transfer_key", "transfer_needs_tsig"]
+
+
+#: Characters legal in a derived TSIG key name. Everything else is folded to
+#: a hyphen — see ``_safe_key_label``.
+_UNSAFE_KEY_CHARS_RE = re.compile(r"[^a-z0-9_-]+")
+
+
+def _safe_key_label(group: DNSServerGroup) -> str:
+    """Fold a group name into a key name that is safe in ``named.conf``.
+
+    The result is interpolated VERBATIM into ``key "<name>" { … };`` by both
+    agent renderers, so a group named ``edge"; };`` would close the statement
+    early and inject the rest. That is not a cosmetic break: BIND rejects the
+    file whole, ``named-checkconf`` fails, and the agent declines the entire
+    bundle — so one badly-named group stops its whole group converging, with
+    the same blast radius as the #876 / #899 findings.
+
+    Sanitising rather than rejecting is deliberate. The key name is DERIVED,
+    not typed: an operator naming a group ``Edge (DMZ)`` has done nothing
+    wrong and should not be refused because of how we build an identifier
+    from it. Group names are not unique per rendered config either — a
+    bundle carries one legacy key, its own group's — so folding two names
+    together cannot collide in practice.
+    """
+    label = _UNSAFE_KEY_CHARS_RE.sub("-", (group.name or "").strip().lower()).strip("-")
+    # Nothing survived (a name that is entirely punctuation or non-ASCII).
+    # Fall back to the id, which is always a safe identifier and unique.
+    return f"spatium-{label}" if label else f"spatium-{group.id}"
+
+
+def ensure_group_tsig_key(group: DNSServerGroup) -> bool:
+    """Give ``group`` a legacy group TSIG key if it has none yet.
+
+    The agent renders this key into ``tsig/ddns.key`` and signs its
+    loopback RFC 2136 updates with it; ``resolve_group_transfer_key``
+    above prefers it for AXFR because it exists on every agent-managed
+    group without operator action. Historically it was generated inline
+    on first agent registration, which meant a group created through the
+    UI — or one a server is MOVED into (#934) — could reach an agent with
+    no key at all.
+
+    Returns True when a key was generated, False when one already existed.
+    Mutates the row; the caller commits.
+    """
+    if group.tsig_key_secret:
+        return False
+    group.tsig_key_name = _safe_key_label(group)
+    group.tsig_key_secret = base64.b64encode(secrets.token_bytes(32)).decode()
+    group.tsig_key_algorithm = "hmac-sha256"
+    return True

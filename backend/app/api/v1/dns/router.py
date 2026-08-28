@@ -16,6 +16,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import delete as sa_delete
 from sqlalchemy import func, or_, select
+from sqlalchemy import update as sa_update
 from sqlalchemy.orm import selectinload
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
@@ -108,6 +109,7 @@ from app.services.dns.resolver_presets import (
     find_forwarder_conflict,
 )
 from app.services.dns.serial import bump_zone_serial
+from app.services.dns.server_move import ServerMoveError, move_server_to_group
 from app.services.dns.zone_templates import (
     get_template,
     list_templates,
@@ -377,6 +379,21 @@ class ServerUpdate(BaseModel):
     status: str | None = None
     notes: str | None = None
     is_enabled: bool | None = None
+    # #934 — move this server to another server group. Same contract as the
+    # DHCP side's ``server_group_id``: omitted / null leaves it alone,
+    # re-sending the current group is a no-op. The handler routes it through
+    # ``move_server_to_group`` rather than the generic setattr loop, because
+    # the move has to purge old-group state and re-elect primaries.
+    group_id: uuid.UUID | None = None
+    # #934 — designate this server as the group's primary (the row DDNS /
+    # RFC 2136 writes are queued against). Setting it demotes whatever other
+    # member currently holds the flag: two primaries in one group is not a
+    # tie-break, it is a ``MultipleResultsFound`` inside the agent long-poll.
+    # Until now the flag was only ever set implicitly, on create and on first
+    # agent registration, while three separate comments — including the hint
+    # an operator sees when a record write is dropped for want of a primary —
+    # told them to flip it "later via the API".
+    is_primary: bool | None = None
     # Same contract as the DHCP side:
     #   * None → leave stored creds alone
     #   * {}   → clear stored creds (revert to Path A only)
@@ -1606,7 +1623,15 @@ async def update_server(
     server = await _require_server(group_id, server_id, db)
     changes = body.model_dump(
         exclude_none=True,
-        exclude={"api_key", "windows_credentials", "cloud_credentials"},
+        # ``group_id`` / ``is_primary`` (#934) are NOT plain column writes —
+        # each has cross-row consequences the generic loop below can't have.
+        exclude={
+            "api_key",
+            "windows_credentials",
+            "cloud_credentials",
+            "group_id",
+            "is_primary",
+        },
     )
     if body.api_key is not None:
         # Issue #210 — Fernet-encrypted at rest; matches the create
@@ -1699,6 +1724,64 @@ async def update_server(
             server.credentials_encrypted = encrypt_dict(merged)
             changes["cloud_credentials_set"] = True
 
+    # ── #934 group move ───────────────────────────────────────────────
+    # Deliberately AFTER the setattr loop: a payload that renames and moves
+    # in one request must have its name collision checked against the NEW
+    # name, and its driver homogeneity against the NEW driver.
+    move_result = None
+    if body.group_id is not None and body.group_id != server.group_id:
+        target_group = await _require_group(body.group_id, db)
+        try:
+            move_result = await move_server_to_group(db, server, target_group)
+        except ServerMoveError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+        if move_result is not None:
+            changes["group_id"] = str(move_result.new_group_id)
+
+    # ── #934 explicit primary designation ─────────────────────────────
+    # Runs after the move so "put it in that group and make it primary" is
+    # one request, and so the demotion sweep targets the group the server
+    # ends up in rather than the one it left.
+    if body.is_primary is not None and body.is_primary != server.is_primary:
+        if body.is_primary:
+            await db.execute(
+                sa_update(DNSServer)
+                .where(
+                    DNSServer.group_id == server.group_id,
+                    DNSServer.id != server.id,
+                    DNSServer.is_primary.is_(True),
+                )
+                .values(is_primary=False)
+            )
+            server.is_primary = True
+        else:
+            # Clearing the LAST primary re-creates the footgun create-time
+            # auto-election exists to prevent: ``enqueue_record_op`` drops
+            # every write to the group's zones with only a log line — no
+            # error reaches whoever made the change. Promote a replacement
+            # instead; that demotes this one as a side effect.
+            others = await db.execute(
+                select(DNSServer.id)
+                .where(
+                    DNSServer.group_id == server.group_id,
+                    DNSServer.id != server.id,
+                    DNSServer.is_primary.is_(True),
+                )
+                .limit(1)
+            )
+            if others.first() is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "This is the only primary in its group; clearing it would "
+                        "silently drop every DNS record write to the group's zones. "
+                        "Mark another server in the group as primary instead — that "
+                        "demotes this one."
+                    ),
+                )
+            server.is_primary = False
+        changes["is_primary"] = server.is_primary
+
     db.add(
         AuditLog(
             user_id=current_user.id,
@@ -1709,6 +1792,7 @@ async def update_server(
             resource_id=str(server.id),
             resource_display=server.name,
             changed_fields=list(changes.keys()),
+            new_value=move_result.as_audit_value() if move_result else None,
             result="success",
         )
     )

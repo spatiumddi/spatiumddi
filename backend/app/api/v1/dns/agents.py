@@ -51,6 +51,7 @@ from app.services.dns.agent_token import (
     verify_agent_token,
 )
 from app.services.dns.record_ops import ack_op
+from app.services.dns.tsig import ensure_group_tsig_key
 from app.services.feature_modules import is_module_enabled
 
 logger = structlog.get_logger(__name__)
@@ -233,13 +234,9 @@ async def agent_register(
 
     # Auto-generate group TSIG key on first registration if not set.
     # Used by the agent's RFC 2136 dynamic update path over loopback.
-    if not group.tsig_key_secret:
-        import base64
-        import secrets
-
-        group.tsig_key_name = f"spatium-{group.name}".replace(" ", "-").lower()
-        group.tsig_key_secret = base64.b64encode(secrets.token_bytes(32)).decode()
-        group.tsig_key_algorithm = "hmac-sha256"
+    # Shared with the #934 group-move path, which has the same need for a
+    # group the operator created in the UI and no agent has registered into.
+    ensure_group_tsig_key(group)
 
     # First server in the group is auto-elected primary so DDNS ops have
     # somewhere to land. Operator can flip later via API.
