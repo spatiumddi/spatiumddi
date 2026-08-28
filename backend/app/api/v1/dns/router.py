@@ -292,10 +292,58 @@ class ServerGroupResponse(BaseModel):
     catalog_zones_enabled: bool
     catalog_zone_name: str
     is_public_facing: bool = False
+    # #934 follow-up — the distinct drivers of the servers currently in this
+    # group. Empty means an empty group, which is compatible with anything.
+    # A group is single-driver, so one entry is the normal case; two or more
+    # is a group that got mixed through the create path, which does not
+    # enforce homogeneity (only the move and the driver-gated operations do).
+    # Exposed so a client can tell which groups a given server may move into
+    # without fetching every group's server list to find out.
+    server_drivers: list[str] = []
     created_at: datetime
     modified_at: datetime
 
     model_config = {"from_attributes": True}
+
+    @classmethod
+    def from_model(cls, g: DNSServerGroup, drivers: list[str] | None = None) -> ServerGroupResponse:
+        return cls(
+            id=g.id,
+            name=g.name,
+            description=g.description,
+            group_type=g.group_type,
+            default_view=g.default_view,
+            is_recursive=g.is_recursive,
+            catalog_zones_enabled=g.catalog_zones_enabled,
+            catalog_zone_name=g.catalog_zone_name,
+            is_public_facing=g.is_public_facing,
+            server_drivers=sorted(drivers or []),
+            created_at=g.created_at,
+            modified_at=g.modified_at,
+        )
+
+
+async def _drivers_by_group(db: DB, group_ids: list[uuid.UUID]) -> dict[uuid.UUID, list[str]]:
+    """Distinct server drivers per group, in ONE query.
+
+    Aggregated rather than fetched per group: the group list is rendered on
+    every visit to the DNS page, and a per-group lookup would be an N+1 that
+    grows with the estate.
+    """
+    if not group_ids:
+        return {}
+    rows = (
+        await db.execute(
+            select(DNSServer.group_id, DNSServer.driver)
+            .where(DNSServer.group_id.in_(group_ids))
+            .distinct()
+        )
+    ).all()
+    out: dict[uuid.UUID, list[str]] = {}
+    for gid, driver in rows:
+        if driver:
+            out.setdefault(gid, []).append(driver)
+    return out
 
 
 # ── Server schemas ──────────────────────────────────────────────────────────
@@ -1340,13 +1388,17 @@ def _validate_address_record_value(record_type: str, value: str) -> None:
 
 
 @router.get("/groups", response_model=list[ServerGroupResponse])
-async def list_groups(db: DB, _: CurrentUser) -> list[DNSServerGroup]:
+async def list_groups(db: DB, _: CurrentUser) -> list[ServerGroupResponse]:
     result = await db.execute(select(DNSServerGroup).order_by(DNSServerGroup.name))
-    return list(result.scalars().all())
+    groups = list(result.scalars().all())
+    drivers = await _drivers_by_group(db, [g.id for g in groups])
+    return [ServerGroupResponse.from_model(g, drivers.get(g.id)) for g in groups]
 
 
 @router.post("/groups", response_model=ServerGroupResponse, status_code=status.HTTP_201_CREATED)
-async def create_group(body: ServerGroupCreate, db: DB, current_user: SuperAdmin) -> DNSServerGroup:
+async def create_group(
+    body: ServerGroupCreate, db: DB, current_user: SuperAdmin
+) -> ServerGroupResponse:
     existing = await db.execute(select(DNSServerGroup).where(DNSServerGroup.name == body.name))
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=409, detail="A server group with that name already exists")
@@ -1373,21 +1425,23 @@ async def create_group(body: ServerGroupCreate, db: DB, current_user: SuperAdmin
     await db.commit()
     await db.refresh(group)
     logger.info("dns_group_created", group_id=str(group.id), name=group.name)
-    return group
+    # A group is empty at creation, so no aggregate query is needed here.
+    return ServerGroupResponse.from_model(group, [])
 
 
 @router.get("/groups/{group_id}", response_model=ServerGroupResponse)
-async def get_group(group_id: uuid.UUID, db: DB, _: CurrentUser) -> DNSServerGroup:
+async def get_group(group_id: uuid.UUID, db: DB, _: CurrentUser) -> ServerGroupResponse:
     group = await db.get(DNSServerGroup, group_id)
     if not group:
         raise HTTPException(status_code=404, detail="Server group not found")
-    return group
+    drivers = await _drivers_by_group(db, [group.id])
+    return ServerGroupResponse.from_model(group, drivers.get(group.id))
 
 
 @router.put("/groups/{group_id}", response_model=ServerGroupResponse)
 async def update_group(
     group_id: uuid.UUID, body: ServerGroupUpdate, db: DB, current_user: SuperAdmin
-) -> DNSServerGroup:
+) -> ServerGroupResponse:
     group = await db.get(DNSServerGroup, group_id)
     if not group:
         raise HTTPException(status_code=404, detail="Server group not found")
@@ -1412,7 +1466,8 @@ async def update_group(
     collect_wake(dns_group_channel(group.id))
     await db.commit()
     await db.refresh(group)
-    return group
+    drivers = await _drivers_by_group(db, [group.id])
+    return ServerGroupResponse.from_model(group, drivers.get(group.id))
 
 
 @router.delete("/groups/{group_id}", status_code=status.HTTP_204_NO_CONTENT)

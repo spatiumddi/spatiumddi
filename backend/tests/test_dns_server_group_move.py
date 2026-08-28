@@ -887,3 +887,87 @@ async def test_derived_tsig_key_name_keeps_the_readable_form(
 
     await db_session.refresh(normal)
     assert normal.tsig_key_name == "spatium-edge-dmz"
+
+
+# ── `server_drivers` on the group response (#934 follow-up) ─────────────────
+
+
+@pytest.mark.asyncio
+async def test_group_response_reports_its_server_drivers(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The move picker needs to know which groups a server may go to. Without
+    this it would have to fetch every group's server list to find out, so it
+    offered groups the move then refused with a 422 on save."""
+    token = await _superadmin(db_session)
+    await _group(db_session, "empty")
+    bind = await _group(db_session, "bind-only")
+    pdns = await _group(db_session, "pdns-only")
+    await _server(db_session, bind, "ns1", driver="bind9")
+    await _server(db_session, bind, "ns2", driver="bind9")
+    await _server(db_session, pdns, "pdns1", driver="powerdns")
+
+    resp = await client.get("/api/v1/dns/groups", headers=_auth(token))
+    assert resp.status_code == 200, resp.text
+    by_name = {g["name"]: g["server_drivers"] for g in resp.json()}
+
+    # Empty group: compatible with anything, so no drivers to report.
+    assert by_name["empty"] == []
+    # Distinct, not one entry per server.
+    assert by_name["bind-only"] == ["bind9"]
+    assert by_name["pdns-only"] == ["powerdns"]
+
+
+@pytest.mark.asyncio
+async def test_group_response_reports_a_mixed_group_honestly(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A group is single-driver, but only the MOVE and the driver-gated
+    operations enforce it — the create path does not, so mixed groups are
+    reachable. Reporting one driver would let the picker offer it as
+    compatible when the move will refuse."""
+    token = await _superadmin(db_session)
+    mixed = await _group(db_session, "mixed")
+    await _server(db_session, mixed, "a", driver="bind9")
+    await _server(db_session, mixed, "b", driver="powerdns")
+
+    resp = await client.get(f"/api/v1/dns/groups/{mixed.id}", headers=_auth(token))
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["server_drivers"] == ["bind9", "powerdns"]
+
+
+@pytest.mark.asyncio
+async def test_newly_created_group_reports_no_drivers(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The create response is the one the UI puts straight into its cache."""
+    token = await _superadmin(db_session)
+    resp = await client.post(
+        "/api/v1/dns/groups",
+        json={"name": "fresh", "description": "", "group_type": "custom"},
+        headers=_auth(token),
+    )
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["server_drivers"] == []
+
+
+@pytest.mark.asyncio
+async def test_group_drivers_track_a_move(client: AsyncClient, db_session: AsyncSession) -> None:
+    """The field has to move with the server, or the picker keeps offering
+    (or blocking) groups on the strength of where servers used to be."""
+    token = await _superadmin(db_session)
+    src = await _group(db_session, "src")
+    dst = await _group(db_session, "dst")
+    srv = await _server(db_session, src, "ns1", driver="bind9")
+
+    resp = await client.put(
+        _url(src.id, srv.id),
+        json={"group_id": str(dst.id)},
+        headers=_auth(token),
+    )
+    assert resp.status_code == 200, resp.text
+
+    listing = await client.get("/api/v1/dns/groups", headers=_auth(token))
+    by_name = {g["name"]: g["server_drivers"] for g in listing.json()}
+    assert by_name["src"] == []
+    assert by_name["dst"] == ["bind9"]
