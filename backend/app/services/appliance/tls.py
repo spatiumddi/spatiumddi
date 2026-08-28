@@ -262,27 +262,39 @@ def generate_csr_and_key(
 
     private_key = _generate_private_key(key_type)
 
-    name_attrs: list[x509.NameAttribute] = [x509.NameAttribute(NameOID.COMMON_NAME, cn)]
-    if subject.country:
-        name_attrs.append(x509.NameAttribute(NameOID.COUNTRY_NAME, subject.country))
-    if subject.state:
-        name_attrs.append(x509.NameAttribute(NameOID.STATE_OR_PROVINCE_NAME, subject.state))
-    if subject.locality:
-        name_attrs.append(x509.NameAttribute(NameOID.LOCALITY_NAME, subject.locality))
-    if subject.organization:
-        name_attrs.append(x509.NameAttribute(NameOID.ORGANIZATION_NAME, subject.organization))
-    if subject.organizational_unit:
-        name_attrs.append(
-            x509.NameAttribute(NameOID.ORGANIZATIONAL_UNIT_NAME, subject.organizational_unit)
-        )
-    if subject.email:
-        name_attrs.append(x509.NameAttribute(NameOID.EMAIL_ADDRESS, subject.email))
+    # ``x509.NameAttribute``/``x509.DNSName`` enforce X.509's own limits that
+    # the request schema cannot fully express — a CommonName is capped at 64
+    # BYTES (the schema bounds characters, so a 65-255-char or multibyte CN
+    # passes validation then raises here), and a SAN must be an IDNA A-label
+    # (a non-ASCII hostname like "你好.test" raises). Both surfaced as
+    # a 500; the endpoint declares 422 for bad subject input, so translate any
+    # cryptography ValueError into the validation error the contract promises.
+    try:
+        name_attrs: list[x509.NameAttribute] = [x509.NameAttribute(NameOID.COMMON_NAME, cn)]
+        if subject.country:
+            name_attrs.append(x509.NameAttribute(NameOID.COUNTRY_NAME, subject.country))
+        if subject.state:
+            name_attrs.append(x509.NameAttribute(NameOID.STATE_OR_PROVINCE_NAME, subject.state))
+        if subject.locality:
+            name_attrs.append(x509.NameAttribute(NameOID.LOCALITY_NAME, subject.locality))
+        if subject.organization:
+            name_attrs.append(x509.NameAttribute(NameOID.ORGANIZATION_NAME, subject.organization))
+        if subject.organizational_unit:
+            name_attrs.append(
+                x509.NameAttribute(NameOID.ORGANIZATIONAL_UNIT_NAME, subject.organizational_unit)
+            )
+        if subject.email:
+            name_attrs.append(x509.NameAttribute(NameOID.EMAIL_ADDRESS, subject.email))
 
-    builder = x509.CertificateSigningRequestBuilder().subject_name(x509.Name(name_attrs))
+        builder = x509.CertificateSigningRequestBuilder().subject_name(x509.Name(name_attrs))
 
-    san_entries = _build_san_entries(sans)
-    if san_entries:
-        builder = builder.add_extension(x509.SubjectAlternativeName(san_entries), critical=False)
+        san_entries = _build_san_entries(sans)
+        if san_entries:
+            builder = builder.add_extension(
+                x509.SubjectAlternativeName(san_entries), critical=False
+            )
+    except ValueError as exc:
+        raise TLSValidationError(f"invalid subject or SAN: {exc}") from exc
 
     # RSA + ECDSA use SHA-256; Ed25519/Ed448 don't take a hash arg, but
     # we don't generate those here (no public CA supports them yet so
