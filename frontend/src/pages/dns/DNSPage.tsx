@@ -1266,7 +1266,10 @@ function ServerModal({
       // wrong for the full 30 s `staleTime` — the moved server invisible in
       // both places if the operator navigated straight there.
       qc.invalidateQueries({ queryKey: ["dns-servers"] });
-      // Group rows carry `server_count`, which a move changes on both sides.
+      // Also the group list: since #934 a group row carries `server_drivers`,
+      // which a move changes on BOTH sides — and that field is what decides
+      // which groups this picker offers, so a stale one would keep offering
+      // a group the move now refuses (or hide one it would now accept).
       qc.invalidateQueries({ queryKey: ["dns-groups"] });
       onClose();
     },
@@ -1600,20 +1603,33 @@ function ServerModal({
                 value={targetGroupId}
                 onChange={(e) => setTargetGroupId(e.target.value)}
               >
-                {allGroups.map((g) => (
-                  <option key={g.id} value={g.id}>
-                    {g.name}
-                  </option>
-                ))}
+                {allGroups.map((g) => {
+                  // A group is single-driver, so the server can only move to
+                  // one that is empty or already runs its driver. Incompatible
+                  // groups are shown DISABLED with the reason rather than
+                  // hidden: an operator looking for a group they can see in
+                  // the sidebar should find out why it isn't available here,
+                  // not conclude it has vanished. The server's current group
+                  // always stays selectable, whatever it contains — otherwise
+                  // an already-mixed group could not render its own value.
+                  const drivers = g.server_drivers ?? [];
+                  const foreign = drivers.filter((d) => d !== driver);
+                  const isCurrent = g.id === server!.group_id;
+                  const blocked = !isCurrent && foreign.length > 0;
+                  return (
+                    <option key={g.id} value={g.id} disabled={blocked}>
+                      {g.name}
+                      {blocked ? ` — runs ${foreign.join(", ")}` : ""}
+                    </option>
+                  );
+                })}
               </select>
               {targetGroupId !== server!.group_id && (
                 <p className="mt-1 text-xs text-amber-600 dark:text-amber-400">
                   Moving this server re-renders both groups&rsquo; config. Its
                   per-zone sync state and any queued record updates for the old
                   group&rsquo;s zones are discarded, and the agent picks up the
-                  new group&rsquo;s config on its next poll. A group is
-                  single-driver, so the target must be empty or already running{" "}
-                  <code>{driver}</code>.
+                  new group&rsquo;s config on its next poll.
                 </p>
               )}
             </Field>

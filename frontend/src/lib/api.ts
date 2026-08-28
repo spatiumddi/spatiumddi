@@ -4810,6 +4810,12 @@ export interface DNSServerGroup {
   // operator binds a private IP into a zone in this group, forcing a
   // typed-CIDR confirm.
   is_public_facing?: boolean;
+  /** Distinct drivers of the servers currently in this group (#934
+   *  follow-up). Empty = an empty group, compatible with anything. A group
+   *  is single-driver, so one entry is normal; two or more means the group
+   *  was mixed through the create path, which doesn't enforce homogeneity.
+   *  Lets the move picker tell which groups a server can actually go to. */
+  server_drivers?: string[];
   created_at: string;
   modified_at: string;
 }
