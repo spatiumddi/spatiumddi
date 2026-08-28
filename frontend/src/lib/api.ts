@@ -4793,6 +4793,54 @@ export const customFieldsApi = {
 
 // ── DNS ────────────────────────────────────────────────────────────────────
 
+/** #935 — what moving a zone to another group would do. Returned by both
+ *  the preview and the commit, so the UI can show the same figures after
+ *  the fact. */
+export interface ZoneMovePreview {
+  zone_id: string;
+  zone_name: string;
+  source_group_id: string;
+  source_group_name: string;
+  target_group_id: string;
+  target_group_name: string;
+  source_has_views: boolean;
+  target_has_views: boolean;
+  /** kept_none | remapped | cleared_widening | cleared_inert */
+  zone_view_action: string;
+  zone_view_from: string | null;
+  records_total: number;
+  records_remapped: number;
+  /** Records whose view scoping is lost while the TARGET renders views —
+   *  they go from answering in one view to answering in every one. */
+  records_widened: number;
+  records_cleared_inert: number;
+  records_widened_by_view: Record<string, number>;
+  acl_rows_remapped: number;
+  acl_keys_lost: string[];
+  pools_repointed: number;
+  zone_state_rows: number;
+  pending_ops: number;
+  dnssec_signed: boolean;
+  dnssec_key_count: number;
+  acme_accounts: number;
+  source_drivers: string[];
+  target_drivers: string[];
+  name_collision: boolean;
+  /** Target drivers that cannot sign, when the zone is signed. Non-empty
+   *  means the commit refuses — not waivable by acknowledgement. */
+  dnssec_unsupported_drivers: string[];
+  acl_names_remapped: string[];
+  /** Named ACLs the zone cites that the target group doesn't define.
+   *  Non-empty means the commit refuses: an undefined symbol makes BIND
+   *  reject the whole file, stopping the entire target group. */
+  acl_names_lost: string[];
+  warnings: string[];
+  /** Keys the commit will demand: view_widening | dnssec_rollover |
+   *  lost_update_grants. */
+  required_acknowledgements: string[];
+  target_tsig_key_generated?: boolean;
+}
+
 export interface DNSServerGroup {
   id: string;
   name: string;
@@ -5712,6 +5760,32 @@ export const dnsApi = {
     api
       .put<DNSServer>(`/dns/groups/${groupId}/servers/${serverId}`, data)
       .then((r) => r.data),
+  // #935 — move a zone to another server group. Preview is a pure read
+  // and safe to call repeatedly; commit demands the typed zone name plus
+  // an acknowledgement for each consequence the preview flagged.
+  previewZoneMove: (groupId: string, zoneId: string, targetGroupId: string) =>
+    api
+      .post<ZoneMovePreview>(
+        `/dns/groups/${groupId}/zones/${zoneId}/move/preview`,
+        { target_group_id: targetGroupId },
+      )
+      .then((r) => r.data),
+  commitZoneMove: (
+    groupId: string,
+    zoneId: string,
+    body: {
+      target_group_id: string;
+      confirmation_zone_name: string;
+      acknowledgements: string[];
+    },
+  ) =>
+    api
+      .post<ZoneMovePreview>(
+        `/dns/groups/${groupId}/zones/${zoneId}/move/commit`,
+        body,
+      )
+      .then((r) => r.data),
+
   deleteServer: (groupId: string, serverId: string) =>
     api.delete(`/dns/groups/${groupId}/servers/${serverId}`),
   // Issue #182: per-server maintenance mode.
