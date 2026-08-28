@@ -24,6 +24,7 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import quote
 
 from fastapi import APIRouter, HTTPException, Query, Response, status
 from pydantic import BaseModel, Field, field_validator
@@ -560,8 +561,16 @@ async def export_pdf(
         slug = framework.lower().replace(" ", "-").replace("/", "-")
         fname += f"-{slug}"
     fname += f"-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}.pdf"
+    # Content-Disposition is a latin-1 header (Starlette encodes it as such),
+    # so a non-latin-1 ``framework`` name in the filename raised
+    # UnicodeEncodeError — a 500 on an already-rendered PDF. Emit an
+    # ASCII-only ``filename`` plus the RFC 6266 ``filename*`` UTF-8 form, which
+    # keeps the unicode name for clients that read it and never leaves a
+    # non-latin-1 byte in the header.
+    ascii_fname = fname.encode("ascii", "ignore").decode("ascii") or "spatiumddi-conformity.pdf"
+    disposition = f"attachment; filename=\"{ascii_fname}\"; filename*=UTF-8''{quote(fname)}"
     return Response(
         content=pdf_bytes,
         media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+        headers={"Content-Disposition": disposition},
     )
