@@ -231,11 +231,39 @@ What the move does besides reassigning the row:
   server holds.
 * **Both group channels are woken** so each side converges immediately.
 
-Two refusals: a **name collision** in the target (409) and a move to the group
-the zone is already in (422). The collision check runs against the *resolved*
-view, not the original one — the constraint is `(group_id, view_id, name)`, so
-a zone whose view is cleared lands at `(target, NULL, name)` and can collide
-with an unviewed zone that a `(group, name)` check would have missed.
+Refusals, none of them waivable by acknowledgement — each would leave a state
+the operator could not inspect and fix afterwards:
+
+* a **name collision** in the target (409), checked against the *resolved*
+  view rather than the original: the constraint is `(group_id, view_id, name)`,
+  so a zone whose view is cleared lands at `(target, NULL, name)` and can
+  collide with an unviewed zone a `(group, name)` check would have missed —
+  while the same name in two different views is not a collision at all;
+* a move to the group the zone is already in (422);
+* a **signed zone onto a group that cannot sign** (422). The row would keep
+  reporting `dnssec_enabled` while the zone is served unsigned, indefinitely,
+  with nothing to notice — the same driver gate every other path into a signed
+  zone goes through;
+* a **named ACL** cited in the zone's `allow_query` / `allow_transfer` /
+  `also_notify` that the target group does not define (422). `DNSAcl` is
+  per-group, so the name becomes an undefined symbol — and BIND rejects the
+  file *whole*, which stops the entire target group converging rather than
+  just this zone;
+* a **forwarders-less forward zone onto a Technitium group** (422), the same
+  #743 guard every create and update runs.
+
+A zone owned by an integration reconciler (Tailscale, NetBird) cannot be moved
+at all — the next sync would recreate it in the group the integration is bound
+to. That one is refused on the *preview* as well, so it is learned before the
+modal is filled in.
+
+**Agentless groups are driven at both ends.** When either side runs
+`windows_dns`, a cloud driver or `technitium_api`, the zone lives in a system
+the ConfigBundle never reaches, so the move creates it on the target's servers
+and deletes it from the source's. Create runs first: if either call fails the
+whole move rolls back, and a failed create leaves nothing changed where a
+failed delete would have removed the zone from the old server while the
+database still said it lived there.
 
 A **driver change warns rather than refuses**, unlike the server move: a zone
 is data, not a driver-bound thing, so moving one from a BIND9 group to a

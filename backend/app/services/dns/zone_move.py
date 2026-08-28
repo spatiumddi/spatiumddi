@@ -30,16 +30,18 @@ from __future__ import annotations
 import uuid
 import zlib
 from dataclasses import dataclass, field
+from typing import Any
 
 import structlog
 from sqlalchemy import delete as sa_delete
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy import update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.agent_wake import collect_wake, dns_group_channel
 from app.models.acme import ACMEAccount
 from app.models.dns import (
+    DNSAcl,
     DNSKey,
     DNSPool,
     DNSRecord,
@@ -52,7 +54,9 @@ from app.models.dns import (
     DNSZone,
     DNSZoneUpdateAcl,
 )
+from app.services.dns.named_conf_validation import is_name_reference
 from app.services.dns.pool_geo import build_geo_steering
+from app.services.dns.record_ops import clear_dnssec_key_state
 from app.services.dns.tsig import ensure_group_tsig_key
 
 logger = structlog.get_logger(__name__)
@@ -67,6 +71,13 @@ _LOCK_NS_ZONE_MOVE = 0x5A4D  # "ZM"
 ACK_VIEW_WIDENING = "view_widening"
 ACK_DNSSEC_ROLLOVER = "dnssec_rollover"
 ACK_LOST_UPDATE_GRANTS = "lost_update_grants"
+
+#: Drivers whose agents can actually sign a zone. Mirrors the router's
+#: ``_DRIVER_GATED_OPERATIONS["dnssec_sign"]`` gate, which every other
+#: path into a signed zone goes through — a move that skipped it would
+#: leave the row saying ``dnssec_enabled`` while the zone is served
+#: unsigned, indefinitely and with nothing to notice it.
+DNSSEC_SIGN_DRIVERS = frozenset({"bind9", "powerdns"})
 
 
 class ZoneMoveError(Exception):
@@ -153,6 +164,18 @@ class ZoneMovePlan:
 
     name_collision: bool = False
     target_tsig_key_generated: bool = False
+    #: Target drivers that cannot sign, when the zone is signed. A move
+    #: onto one is refused rather than warned: the row keeps saying
+    #: ``dnssec_enabled`` while the zone is served unsigned forever.
+    dnssec_unsupported_drivers: list[str] = field(default_factory=list)
+    #: Named ACLs cited in the zone's own address-match lists
+    #: (``allow_query`` / ``allow_transfer`` / ``also_notify``). ``DNSAcl``
+    #: is group-scoped, so a name that exists in the source and not the
+    #: target becomes an undefined symbol in the target's named.conf —
+    #: which BIND rejects WHOLE, so the agent declines the entire bundle
+    #: and the group stops converging (the #882 / #899 failure).
+    acl_names_remapped: list[str] = field(default_factory=list)
+    acl_names_lost: list[str] = field(default_factory=list)
 
     warnings: list[str] = field(default_factory=list)
     #: Acknowledgement keys the commit will demand.
@@ -260,14 +283,32 @@ async def assemble_move_plan(
 
     plan.zone_view_action, plan.zone_view_to_id, plan.zone_view_from = _resolve(zone.view_id)
 
-    records = (
-        (await db.execute(select(DNSRecord).where(DNSRecord.zone_id == zone.id))).scalars().all()
-    )
-    plan.records_total = len(records)
-    for r in records:
-        if r.view_id is None:
-            continue
-        action, _new_id, old_name = _resolve(r.view_id)
+    # ``records_total`` is what the operator is moving, so it counts LIVE
+    # rows only. The view scan below deliberately does not — see there.
+    plan.records_total = (
+        await db.execute(
+            select(func.count()).select_from(DNSRecord).where(DNSRecord.zone_id == zone.id)
+        )
+    ).scalar_one()
+
+    # Only view-scoped rows need looking at, and only their ``view_id`` —
+    # so this selects two columns rather than hydrating every DNSRecord in
+    # the zone, which the modal would otherwise do on every dropdown change.
+    #
+    # ``include_deleted=True`` is load-bearing: DNSRecord is soft-deleted,
+    # so the default filter would leave a deleted row pointing at a
+    # SOURCE-group view. Restoring it later resurrects a dangling reference
+    # into a group the zone has left — and under split-horizon that row
+    # then renders into no operator view at all rather than into one.
+    scoped = (
+        await db.execute(
+            select(DNSRecord.id, DNSRecord.view_id)
+            .where(DNSRecord.zone_id == zone.id, DNSRecord.view_id.isnot(None))
+            .execution_options(include_deleted=True)
+        )
+    ).all()
+    for _rid, view_id in scoped:
+        action, _new_id, old_name = _resolve(view_id)
         if action == "remapped":
             plan.records_remapped += 1
         elif action == "cleared_widening":
@@ -336,27 +377,86 @@ async def assemble_move_plan(
                 plan.acl_keys_lost.append(name or "(unknown key)")
 
     # ── Everything else ───────────────────────────────────────────────
-    plan.pools_repointed = len(
-        (await db.execute(select(DNSPool.id).where(DNSPool.zone_id == zone.id))).all()
-    )
-    plan.zone_state_rows = len(
-        (
-            await db.execute(
-                select(DNSServerZoneState.id).where(DNSServerZoneState.zone_id == zone.id)
-            )
-        ).all()
+    source_acls = {
+        a.name
+        for a in (await db.execute(select(DNSAcl).where(DNSAcl.group_id == zone.group_id)))
+        .scalars()
+        .all()
+    }
+    target_acls = {
+        a.name
+        for a in (await db.execute(select(DNSAcl).where(DNSAcl.group_id == target_group.id)))
+        .scalars()
+        .all()
+    }
+
+    plan.pools_repointed = await _count(db, DNSPool, DNSPool.zone_id == zone.id)
+    plan.zone_state_rows = await _count(
+        db, DNSServerZoneState, DNSServerZoneState.zone_id == zone.id
     )
     plan.pending_ops = await _count_pending_ops(db, zone)
-    plan.dnssec_key_count = len(
-        (await db.execute(select(DNSKey.id).where(DNSKey.zone_id == zone.id))).all()
-    )
+    plan.dnssec_key_count = await _count(db, DNSKey, DNSKey.zone_id == zone.id)
     plan.dnssec_signed = bool(zone.dnssec_enabled) or plan.dnssec_key_count > 0
-    plan.acme_accounts = len(
-        (await db.execute(select(ACMEAccount.id).where(ACMEAccount.zone_id == zone.id))).all()
-    )
+    plan.acme_accounts = await _count(db, ACMEAccount, ACMEAccount.zone_id == zone.id)
+
+    # ── DNSSEC support in the target (a refusal, not a warning) ───────
+    if plan.dnssec_signed:
+        allowed = DNSSEC_SIGN_DRIVERS
+        plan.dnssec_unsupported_drivers = sorted(set(plan.target_drivers) - allowed)
+
+    # ── Named ACLs cited by the zone's own address-match lists ────────
+    _scan_acl_references(plan, zone, source_acls, target_acls)
 
     _fill_warnings(plan)
     return plan
+
+
+async def _count(db: AsyncSession, model: type, *criteria: Any) -> int:
+    """``SELECT count(*)`` rather than hydrating rows to call ``len()`` on.
+
+    The preview runs on every change of the destination dropdown, so the
+    difference between counting in Postgres and materialising every record,
+    pool and key in the zone is the difference between a snappy modal and
+    one that stalls on a large zone.
+    """
+    return int(
+        (await db.execute(select(func.count()).select_from(model).where(*criteria))).scalar_one()
+    )
+
+
+def _acl_references(zone: DNSZone) -> set[str]:
+    """Named ACLs the zone's own address-match lists refer to.
+
+    ``allow_query`` / ``allow_transfer`` / ``also_notify`` are interpolated
+    into the rendered zone statement, and a bare identifier in one of them
+    is a reference to an ``acl "<name>" { … };`` block — which is defined
+    PER GROUP (#899). ``is_name_reference`` is the same helper the bundle
+    builder and the ACL ordering pass use, so the three cannot disagree
+    about what counts as a reference.
+    """
+    names: set[str] = set()
+    for values in (zone.allow_query, zone.allow_transfer, zone.also_notify):
+        for element in values or []:
+            name = is_name_reference(str(element))
+            if name:
+                names.add(name)
+    return names
+
+
+def _scan_acl_references(
+    plan: ZoneMovePlan, zone: DNSZone, source_acls: set[str], target_acls: set[str]
+) -> None:
+    for name in sorted(_acl_references(zone)):
+        # Only a name the SOURCE group actually defines is something the
+        # move can break. An unknown name is already broken (or is a
+        # built-in this helper does not classify) and is not ours to
+        # report as a consequence of moving.
+        if name not in source_acls:
+            continue
+        if name in target_acls:
+            plan.acl_names_remapped.append(name)
+        else:
+            plan.acl_names_lost.append(name)
 
 
 async def _count_pending_ops(db: AsyncSession, zone: DNSZone) -> int:
@@ -433,6 +533,15 @@ def _fill_warnings(plan: ZoneMovePlan) -> None:
         )
         plan.required_acknowledgements.append(ACK_LOST_UPDATE_GRANTS)
 
+    if plan.acl_names_lost:
+        plan.warnings.append(
+            f"The zone's address-match lists name ACL(s) that do not exist in the target group "
+            f"({', '.join(plan.acl_names_lost)}). A named ACL is defined per group, so the "
+            f"target's named.conf would carry an undefined symbol — BIND rejects the file "
+            f"whole, which stops the WHOLE target group converging, not just this zone. "
+            f"Create ACLs with the same names in the target first."
+        )
+
     if plan.acme_accounts:
         plan.warnings.append(
             f"{plan.acme_accounts} ACME DNS-01 delegation account(s) use this zone. Their TXT "
@@ -505,6 +614,25 @@ async def commit_move(
 
     plan = await assemble_move_plan(db, zone, target_group)
 
+    # Two hard refusals that no acknowledgement can waive, because neither
+    # produces a state the operator could inspect and fix afterwards.
+    if plan.dnssec_unsupported_drivers:
+        raise ZoneMoveError(
+            f"This zone is DNSSEC-signed and '{target_group.name}' runs "
+            f"{plan.dnssec_unsupported_drivers}, which cannot sign. The zone would keep "
+            f"reporting as signed while being served unsigned. Unsign it first, or pick a "
+            f"group running one of {sorted(DNSSEC_SIGN_DRIVERS)}.",
+            status_code=422,
+        )
+    if plan.acl_names_lost:
+        raise ZoneMoveError(
+            f"The zone names ACL(s) the target group does not define "
+            f"({', '.join(plan.acl_names_lost)}). Moving it would leave an undefined symbol in "
+            f"the target's named.conf, which BIND rejects whole — the entire target group "
+            f"would stop converging, not just this zone. Create ACLs with those names in "
+            f"'{target_group.name}' first.",
+            status_code=422,
+        )
     if plan.name_collision:
         where = f"view '{plan.zone_view_from}'" if plan.zone_view_to_id is not None else "no view"
         raise ZoneMoveError(
@@ -544,10 +672,17 @@ async def commit_move(
 
     # ── Views ─────────────────────────────────────────────────────────
     zone.view_id = _new_view_id(zone.view_id)
+    # ``include_deleted=True`` for the same reason the plan scan uses it:
+    # DNSRecord is soft-deleted, and a deleted row left pointing at a
+    # SOURCE-group view is a dangling reference the moment someone restores
+    # it. The plan counts those rows, so the commit has to actually rewrite
+    # them or the preview and the outcome disagree.
     records = (
         (
             await db.execute(
-                select(DNSRecord).where(DNSRecord.zone_id == zone.id, DNSRecord.view_id.isnot(None))
+                select(DNSRecord)
+                .where(DNSRecord.zone_id == zone.id, DNSRecord.view_id.isnot(None))
+                .execution_options(include_deleted=True)
             )
         )
         .scalars()
@@ -619,10 +754,14 @@ async def commit_move(
                 DNSRecordOp.state.in_(("pending", "in_flight")),
             )
         )
-    # DNSSEC key state is a read-only mirror of what the OLD group's
-    # agents reported. The target signs from scratch, so leaving these
-    # would show the operator keys that no server holds.
-    await db.execute(sa_delete(DNSKey).where(DNSKey.zone_id == zone.id))
+    # DNSSEC key state is a read-only mirror of what the OLD group's agents
+    # reported. The target signs from scratch, so leaving it would show the
+    # operator keys that no server holds — and, worse, a cached
+    # ``dnssec_ds_records`` telling them to publish the OLD group's DS.
+    # ``clear_dnssec_key_state`` is the one helper every other flag-off path
+    # uses, and it clears both halves; deleting the DNSKey rows alone left
+    # the stale DS behind.
+    await clear_dnssec_key_state(db, zone)
 
     zone.group_id = target_group.id
 

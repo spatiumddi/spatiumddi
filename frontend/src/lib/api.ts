@@ -4826,6 +4826,14 @@ export interface ZoneMovePreview {
   source_drivers: string[];
   target_drivers: string[];
   name_collision: boolean;
+  /** Target drivers that cannot sign, when the zone is signed. Non-empty
+   *  means the commit refuses — not waivable by acknowledgement. */
+  dnssec_unsupported_drivers: string[];
+  acl_names_remapped: string[];
+  /** Named ACLs the zone cites that the target group doesn't define.
+   *  Non-empty means the commit refuses: an undefined symbol makes BIND
+   *  reject the whole file, stopping the entire target group. */
+  acl_names_lost: string[];
   warnings: string[];
   /** Keys the commit will demand: view_widening | dnssec_rollover |
    *  lost_update_grants. */

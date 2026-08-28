@@ -3128,10 +3128,15 @@ function MoveZoneModal({
   const allAcked = required.every((k) => acks[k]);
   const nameOk =
     confirmName.trim().replace(/\.$/, "") === zone.name.replace(/\.$/, "");
+  const blocked =
+    !!preview &&
+    (preview.name_collision ||
+      preview.dnssec_unsupported_drivers.length > 0 ||
+      preview.acl_names_lost.length > 0);
   const canSubmit =
     !!targetGroupId &&
     !!preview &&
-    !preview.name_collision &&
+    !blocked &&
     allAcked &&
     nameOk &&
     !mut.isPending;
@@ -3169,6 +3174,29 @@ function MoveZoneModal({
                 <strong>{preview.target_group_name}</strong> already has a zone
                 named <code>{preview.zone_name}</code> in the view this one
                 would land in. Rename or delete it first.
+              </div>
+            )}
+            {/* Two blockers no acknowledgement can waive — neither leaves a
+                state the operator could inspect and fix afterwards. */}
+            {preview.dnssec_unsupported_drivers.length > 0 && (
+              <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
+                This zone is DNSSEC-signed and{" "}
+                <strong>{preview.target_group_name}</strong> runs{" "}
+                <code>{preview.dnssec_unsupported_drivers.join(", ")}</code>,
+                which cannot sign. It would keep reporting as signed while being
+                served unsigned. Unsign it first, or pick a BIND9 / PowerDNS
+                group.
+              </div>
+            )}
+            {preview.acl_names_lost.length > 0 && (
+              <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
+                This zone names ACL(s){" "}
+                <code>{preview.acl_names_lost.join(", ")}</code> that{" "}
+                <strong>{preview.target_group_name}</strong> does not define.
+                Moving it would leave an undefined symbol in that group&rsquo;s{" "}
+                <code>named.conf</code>, which BIND rejects whole &mdash; the
+                entire target group would stop converging, not just this zone.
+                Create ACLs with those names there first.
               </div>
             )}
 

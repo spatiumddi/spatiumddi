@@ -15,6 +15,7 @@ pin that it cannot happen without the operator saying so.
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, datetime
 
 import pytest
 from httpx import AsyncClient
@@ -74,12 +75,13 @@ async def _zone(
     name: str = "example.com.",
     *,
     view: DNSView | None = None,
+    zone_type: str = "primary",
     **kw: object,
 ) -> DNSZone:
     z = DNSZone(
         group_id=group.id,
         name=name,
-        zone_type="primary",
+        zone_type=zone_type,
         view_id=view.id if view else None,
         **kw,
     )
@@ -779,3 +781,254 @@ async def test_zone_addressed_under_the_wrong_group_404s(
         headers=_auth(token),
     )
     assert resp.status_code == 404
+
+
+# ── Code-review follow-ups ──────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_integration_owned_zone_cannot_be_moved(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A reconciler-owned zone is not the operator's to re-home — the next
+    sync recreates it in the group the integration is bound to. Refused on
+    the PREVIEW too, so it is learned before the modal is filled in."""
+    from app.models.ipam import IPSpace
+    from app.models.tailscale import TailscaleTenant
+
+    token = await _superadmin(db_session)
+    src = await _group(db_session, "src")
+    dst = await _group(db_session, "dst")
+    space = IPSpace(name="ts-space")
+    db_session.add(space)
+    await db_session.flush()
+    tenant = TailscaleTenant(name="tailnet", ipam_space_id=space.id)
+    db_session.add(tenant)
+    await db_session.flush()
+    zone = await _zone(db_session, src, "ts.net.", tailscale_tenant_id=tenant.id)
+
+    prev = await _preview(client, token, zone, dst)
+    assert prev.status_code == 422
+    assert "Tailscale" in prev.json()["detail"]
+
+    resp = await _commit(client, token, zone, dst, name="ts.net.")
+    assert resp.status_code == 422
+    await db_session.refresh(zone)
+    assert zone.group_id == src.id
+
+
+@pytest.mark.asyncio
+async def test_signed_zone_refused_on_a_group_that_cannot_sign(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Not waivable by acknowledgement: the row would keep saying
+    ``dnssec_enabled`` while the zone is served unsigned, indefinitely,
+    with nothing to notice it. Every other path into a signed zone goes
+    through the same driver gate."""
+    token = await _superadmin(db_session)
+    src = await _group(db_session, "src")
+    dst = await _group(db_session, "dst")
+    await _server(db_session, src, "ns1")
+    win = DNSServer(
+        group_id=dst.id,
+        name="win1",
+        driver="windows_dns",
+        host="win1",
+        port=53,
+        roles=["authoritative"],
+        status="active",
+    )
+    db_session.add(win)
+    await db_session.flush()
+    zone = await _zone(db_session, src, dnssec_enabled=True)
+
+    body = (await _preview(client, token, zone, dst)).json()
+    assert body["dnssec_unsupported_drivers"] == ["windows_dns"]
+
+    # Even WITH the rollover acknowledgement — this one is a hard refusal.
+    resp = await _commit(client, token, zone, dst, acks=["dnssec_rollover"])
+    assert resp.status_code == 422
+    assert "cannot sign" in resp.json()["detail"]
+    await db_session.refresh(zone)
+    assert zone.group_id == src.id
+
+
+@pytest.mark.asyncio
+async def test_signed_zone_moves_to_a_signing_capable_group(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The gate must not block the legitimate case."""
+    token = await _superadmin(db_session)
+    src = await _group(db_session, "src")
+    dst = await _group(db_session, "dst")
+    await _server(db_session, src, "ns1")
+    await _server(db_session, dst, "ns2")
+    zone = await _zone(db_session, src, dnssec_enabled=True)
+
+    body = (await _preview(client, token, zone, dst)).json()
+    assert body["dnssec_unsupported_drivers"] == []
+    assert (await _commit(client, token, zone, dst, acks=["dnssec_rollover"])).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_move_clears_the_cached_ds_records(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Deleting the DNSKey rows alone left ``dnssec_ds_records`` at the old
+    group's values — so the UI would tell the operator to publish a DS for
+    keys that no server in the new group holds."""
+    token = await _superadmin(db_session)
+    src = await _group(db_session, "src")
+    dst = await _group(db_session, "dst")
+    zone = await _zone(
+        db_session,
+        src,
+        dnssec_enabled=True,
+        dnssec_ds_records=[{"key_tag": 12345, "digest": "abc"}],
+    )
+
+    assert (await _commit(client, token, zone, dst, acks=["dnssec_rollover"])).status_code == 200
+    await db_session.refresh(zone)
+    assert zone.dnssec_ds_records is None
+
+
+@pytest.mark.asyncio
+async def test_forward_zone_without_forwarders_refused_on_technitium(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The #743 guard every create/update runs, applied to the group the
+    zone lands in. Technitium has no global-forwarder fallback, so the zone
+    would be accepted and then silently never created on the daemon."""
+    token = await _superadmin(db_session)
+    src = await _group(db_session, "src")
+    dst = await _group(db_session, "dst")
+    tech = DNSServer(
+        group_id=dst.id,
+        name="tech1",
+        driver="technitium",
+        host="tech1",
+        port=53,
+        roles=["authoritative"],
+        status="active",
+    )
+    db_session.add(tech)
+    await db_session.flush()
+    zone = await _zone(db_session, src, "fwd.example.", zone_type="forward", forwarders=[])
+
+    resp = await _commit(client, token, zone, dst, name="fwd.example.")
+    assert resp.status_code == 422
+    assert "forwarder" in resp.json()["detail"]
+    await db_session.refresh(zone)
+    assert zone.group_id == src.id
+
+
+@pytest.mark.asyncio
+async def test_named_acl_reference_the_target_lacks_is_refused(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """``DNSAcl`` is per-group (#899). A name the target does not define is
+    an undefined symbol in its named.conf — and BIND rejects the file
+    WHOLE, so the entire target group stops converging, not just this
+    zone. Refused rather than warned for that reason."""
+    from app.models.dns import DNSAcl
+
+    token = await _superadmin(db_session)
+    src = await _group(db_session, "src")
+    dst = await _group(db_session, "dst")
+    db_session.add(DNSAcl(group_id=src.id, name="trusted"))
+    await db_session.flush()
+    zone = await _zone(db_session, src, allow_transfer=["trusted"])
+
+    body = (await _preview(client, token, zone, dst)).json()
+    assert body["acl_names_lost"] == ["trusted"]
+
+    resp = await _commit(client, token, zone, dst)
+    assert resp.status_code == 422
+    assert "trusted" in resp.json()["detail"]
+    await db_session.refresh(zone)
+    assert zone.group_id == src.id
+
+
+@pytest.mark.asyncio
+async def test_named_acl_present_in_the_target_is_fine(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Same name in both groups is the operator saying they mean the same
+    thing — the view / TSIG rule applied to ACLs."""
+    from app.models.dns import DNSAcl
+
+    token = await _superadmin(db_session)
+    src = await _group(db_session, "src")
+    dst = await _group(db_session, "dst")
+    db_session.add(DNSAcl(group_id=src.id, name="trusted"))
+    db_session.add(DNSAcl(group_id=dst.id, name="trusted"))
+    await db_session.flush()
+    zone = await _zone(db_session, src, allow_transfer=["trusted"])
+
+    body = (await _preview(client, token, zone, dst)).json()
+    assert body["acl_names_remapped"] == ["trusted"]
+    assert body["acl_names_lost"] == []
+    assert (await _commit(client, token, zone, dst)).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_builtin_match_list_values_are_not_acl_references(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """``any`` / ``none`` / a CIDR / an address are not names, so they must
+    not be reported as ACLs the target is missing — that would refuse
+    almost every zone."""
+    token = await _superadmin(db_session)
+    src = await _group(db_session, "src")
+    dst = await _group(db_session, "dst")
+    zone = await _zone(
+        db_session,
+        src,
+        allow_query=["any"],
+        allow_transfer=["none", "10.0.0.0/8", "192.168.1.1"],
+    )
+
+    body = (await _preview(client, token, zone, dst)).json()
+    assert body["acl_names_lost"] == []
+    assert body["acl_names_remapped"] == []
+    assert (await _commit(client, token, zone, dst)).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_soft_deleted_records_have_their_view_remapped_too(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """DNSRecord is soft-deleted, so the default query filter hides deleted
+    rows. Left behind, a restored record points at a view in a group the
+    zone has left — and under split-horizon that renders it into no
+    operator view at all."""
+    from sqlalchemy import update as sa_update
+
+    token = await _superadmin(db_session)
+    src = await _group(db_session, "src")
+    dst = await _group(db_session, "dst")
+    src_internal = await _view(db_session, src, "internal")
+    dst_internal = await _view(db_session, dst, "internal")
+    zone = await _zone(db_session, src)
+    gone = await _record(db_session, zone, "old", view=src_internal)
+    await db_session.execute(
+        sa_update(DNSRecord)
+        .where(DNSRecord.id == gone.id)
+        .values(deleted_at=datetime.now(UTC))
+        .execution_options(include_deleted=True)
+    )
+    await db_session.flush()
+
+    # It is not part of "records moving" — that count is live rows.
+    body = (await _preview(client, token, zone, dst)).json()
+    assert body["records_total"] == 0
+    assert body["records_remapped"] == 1
+
+    assert (await _commit(client, token, zone, dst)).status_code == 200
+
+    row = (
+        await db_session.execute(
+            select(DNSRecord).where(DNSRecord.id == gone.id).execution_options(include_deleted=True)
+        )
+    ).scalar_one()
+    assert row.view_id == dst_internal.id, "a soft-deleted row must not keep a stale view"
