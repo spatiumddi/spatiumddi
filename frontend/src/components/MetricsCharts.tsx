@@ -61,9 +61,16 @@ function formatT(iso: string, win: MetricsWindow): string {
   return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
-function perSecond(value: number, bucketSeconds: number): number {
-  if (bucketSeconds <= 0) return 0;
-  return +(value / bucketSeconds).toFixed(2);
+// Rates divide by the seconds a point ACTUALLY covers, not by the nominal
+// bucket width (#942). The newest 5-minute bucket has only had one or two
+// 60 s samples reported into it, so dividing its partial sum by a full 300
+// drew a 70%+ phantom dip at the right-hand edge of every chart — the
+// leading bucket is partial for the same reason, and so is any bucket an
+// agent was down for. Falls back to the nominal width for a server too old
+// to report the field.
+function perSecond(value: number, coveredSeconds: number): number {
+  if (coveredSeconds <= 0) return 0;
+  return +(value / coveredSeconds).toFixed(2);
 }
 
 function WindowPicker({
@@ -136,10 +143,22 @@ export function DNSQueryRateCard({
 
   const points = (data?.points ?? []).map((p) => ({
     t: formatT(p.t, win),
-    queries: perSecond(p.queries_total, data?.bucket_seconds ?? 60),
-    noerror: perSecond(p.noerror, data?.bucket_seconds ?? 60),
-    nxdomain: perSecond(p.nxdomain, data?.bucket_seconds ?? 60),
-    servfail: perSecond(p.servfail, data?.bucket_seconds ?? 60),
+    queries: perSecond(
+      p.queries_total,
+      p.covered_seconds || (data?.bucket_seconds ?? 60),
+    ),
+    noerror: perSecond(
+      p.noerror,
+      p.covered_seconds || (data?.bucket_seconds ?? 60),
+    ),
+    nxdomain: perSecond(
+      p.nxdomain,
+      p.covered_seconds || (data?.bucket_seconds ?? 60),
+    ),
+    servfail: perSecond(
+      p.servfail,
+      p.covered_seconds || (data?.bucket_seconds ?? 60),
+    ),
   }));
 
   // The API returns one zero-filled sample per bucket even when no
@@ -276,10 +295,16 @@ export function DHCPTrafficCard({
 
   const points = (data?.points ?? []).map((p) => ({
     t: formatT(p.t, win),
-    discover: perSecond(p.discover, data?.bucket_seconds ?? 60),
-    request: perSecond(p.request, data?.bucket_seconds ?? 60),
-    ack: perSecond(p.ack, data?.bucket_seconds ?? 60),
-    nak: perSecond(p.nak, data?.bucket_seconds ?? 60),
+    discover: perSecond(
+      p.discover,
+      p.covered_seconds || (data?.bucket_seconds ?? 60),
+    ),
+    request: perSecond(
+      p.request,
+      p.covered_seconds || (data?.bucket_seconds ?? 60),
+    ),
+    ack: perSecond(p.ack, p.covered_seconds || (data?.bucket_seconds ?? 60)),
+    nak: perSecond(p.nak, p.covered_seconds || (data?.bucket_seconds ?? 60)),
   }));
 
   // The API returns one zero-filled sample per bucket even when no

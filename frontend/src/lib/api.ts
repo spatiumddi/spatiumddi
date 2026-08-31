@@ -10745,6 +10745,11 @@ export type MetricsWindow = "1h" | "6h" | "24h" | "7d";
 
 export interface DNSMetricsPoint {
   t: string;
+  /** Seconds this point actually covers (60 x distinct agent buckets), NOT
+   *  `bucket_seconds`. Derive rates from this: the newest bucket is always
+   *  partial, and dividing it by the nominal width draws a phantom dip at
+   *  the right edge of the chart (#942). */
+  covered_seconds: number;
   queries_total: number;
   noerror: number;
   nxdomain: number;
@@ -10762,6 +10767,11 @@ export interface DNSMetricsSeries {
 
 export interface DHCPMetricsPoint {
   t: string;
+  /** Seconds this point actually covers (60 x distinct agent buckets), NOT
+   *  `bucket_seconds`. Derive rates from this: the newest bucket is always
+   *  partial, and dividing it by the nominal width draws a phantom dip at
+   *  the right edge of the chart (#942). */
+  covered_seconds: number;
   discover: number;
   offer: number;
   request: number;

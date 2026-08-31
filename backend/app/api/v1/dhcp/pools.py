@@ -499,9 +499,20 @@ async def fleet_pool_occupancy(
     """Dynamic pools across every scope, fullest first.
 
     Answers the DHCP dashboard's headline question — "can clients still
-    get an address anywhere" — in one round trip whose cost does not grow
-    with the number of scopes: the pool fetch, one batched lease +
-    reservation pass, and name resolution for the returned slice only.
+    get an address anywhere" — in one round trip and a fixed number of
+    queries: the pool fetch, one batched lease + reservation pass, the
+    lease count, and name resolution for the returned slice only.
+
+    Fixed query *count*, not fixed *work*: the batched pass reads every
+    active lease and reservation in the scopes that own a dynamic pool,
+    so it scales with the lease table rather than with ``limit``, which
+    bounds only the rendered slice. That is deliberate — it is the same
+    scan ``compute_pool_occupancy_batch`` already performs for the
+    per-scope endpoint and for the ``dhcp_pool_exhaustion`` evaluator on
+    its own tick, and re-deriving occupancy in SQL here would be a
+    fourth implementation of the range arithmetic that could disagree
+    with the other three. If this becomes hot, push the range containment
+    into the shared helper so every caller benefits.
     """
     pools = list(
         (await db.execute(select(DHCPPool).where(DHCPPool.pool_type == _OCCUPANCY_POOL_TYPE)))

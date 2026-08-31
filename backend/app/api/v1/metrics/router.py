@@ -30,6 +30,11 @@ from app.models.metrics import DHCPMetricSample, DNSMetricSample
 router = APIRouter()
 
 
+#: The cadence agents report counters at. One ``metric_sample`` row per
+#: server per minute, so a point's covered time span is this times the
+#: number of distinct buckets folded into it.
+_AGENT_BUCKET_SECONDS = 60
+
 WINDOW_SECONDS = {
     "1h": 3600,
     "6h": 6 * 3600,
@@ -56,6 +61,17 @@ def _window_start(window: str) -> datetime:
 
 class DNSTimePoint(BaseModel):
     t: datetime
+    #: Seconds of sampling this point actually covers — ``60 x`` the number
+    #: of distinct agent buckets folded into it, NOT ``bucket_seconds``.
+    #: Rates must be derived from this or the newest point is systematically
+    #: wrong: the current 5-minute bucket has only had one or two 60 s
+    #: samples reported into it, and dividing that partial sum by a full 300
+    #: renders a 70%+ phantom dip at the right-hand edge of every chart, on
+    #: every refresh. The leading bucket is partial for the same reason (the
+    #: window start does not align to a bucket boundary), and a bucket
+    #: missing a sample because an agent was briefly down is the same
+    #: problem in the middle of the series.
+    covered_seconds: int
     queries_total: int
     noerror: int
     nxdomain: int
@@ -73,6 +89,17 @@ class DNSTimeseries(BaseModel):
 
 class DHCPTimePoint(BaseModel):
     t: datetime
+    #: Seconds of sampling this point actually covers — ``60 x`` the number
+    #: of distinct agent buckets folded into it, NOT ``bucket_seconds``.
+    #: Rates must be derived from this or the newest point is systematically
+    #: wrong: the current 5-minute bucket has only had one or two 60 s
+    #: samples reported into it, and dividing that partial sum by a full 300
+    #: renders a 70%+ phantom dip at the right-hand edge of every chart, on
+    #: every refresh. The leading bucket is partial for the same reason (the
+    #: window start does not align to a bucket boundary), and a bucket
+    #: missing a sample because an agent was briefly down is the same
+    #: problem in the middle of the series.
+    covered_seconds: int
     discover: int
     offer: int
     request: int
@@ -120,6 +147,12 @@ async def dns_timeseries(
 
     stmt = select(
         bucket_col,
+        # Distinct agent buckets folded into this point. Counting DISTINCT
+        # bucket_at (not rows) is what makes this the covered TIME SPAN
+        # rather than a sample count: with several servers reporting, N
+        # rows share one minute, and the aggregate rate for that minute is
+        # still measured over 60 seconds.
+        func.count(func.distinct(DNSMetricSample.bucket_at)).label("sample_buckets"),
         func.sum(DNSMetricSample.queries_total).label("queries_total"),
         func.sum(DNSMetricSample.noerror).label("noerror"),
         func.sum(DNSMetricSample.nxdomain).label("nxdomain"),
@@ -136,6 +169,7 @@ async def dns_timeseries(
     points = [
         DNSTimePoint(
             t=row._mapping["t"],
+            covered_seconds=int(row.sample_buckets or 0) * _AGENT_BUCKET_SECONDS,
             queries_total=int(row.queries_total or 0),
             noerror=int(row.noerror or 0),
             nxdomain=int(row.nxdomain or 0),
@@ -168,6 +202,7 @@ async def dhcp_timeseries(
 
     stmt = select(
         bucket_col,
+        func.count(func.distinct(DHCPMetricSample.bucket_at)).label("sample_buckets"),
         func.sum(DHCPMetricSample.discover).label("discover"),
         func.sum(DHCPMetricSample.offer).label("offer"),
         func.sum(DHCPMetricSample.request).label("request"),
@@ -185,6 +220,7 @@ async def dhcp_timeseries(
     points = [
         DHCPTimePoint(
             t=row._mapping["t"],
+            covered_seconds=int(row.sample_buckets or 0) * _AGENT_BUCKET_SECONDS,
             discover=int(row.discover or 0),
             offer=int(row.offer or 0),
             request=int(row.request or 0),

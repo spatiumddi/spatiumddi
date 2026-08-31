@@ -529,12 +529,43 @@ function StatusChip({
  * Shares its query with the header pill (one key, one fetch); the events
  * arrive newest-first from the API.
  */
-function OpenAlertsPanel({ events }: { events: AlertEvent[] }) {
+function OpenAlertsPanel({
+  events,
+  failed = false,
+  truncated = false,
+}: {
+  events: AlertEvent[];
+  /** The fetch failed. Distinct from "no open alerts" — see below. */
+  failed?: boolean;
+  /** The response came back at the fetch cap, so the count is a floor. */
+  truncated?: boolean;
+}) {
   const bySeverity = {
     critical: events.filter((e) => e.severity === "critical").length,
     warning: events.filter((e) => e.severity === "warning").length,
     info: events.filter((e) => e.severity === "info").length,
   };
+
+  // A failed fetch renders as unknown, never as an all-clear. React Query
+  // hands back the `[]` default on error, which would otherwise paint the
+  // exact green "No open alerts" this panel exists to disprove.
+  if (failed) {
+    return (
+      <div className="flex items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-4 py-2.5 text-xs text-amber-700 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-400">
+        <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+        <span className="font-medium">Could not load alerts</span>
+        <span className="text-[11px]">
+          This is not an all-clear — the alert state is unknown.
+        </span>
+        <Link
+          to="/admin/alerts"
+          className="ml-auto text-[11px] underline hover:no-underline"
+        >
+          Alerts page →
+        </Link>
+      </div>
+    );
+  }
 
   if (events.length === 0) {
     return (
@@ -557,7 +588,8 @@ function OpenAlertsPanel({ events }: { events: AlertEvent[] }) {
         <div className="flex items-center gap-2">
           <AlertTriangle className="h-3.5 w-3.5 text-amber-500" />
           <h3 className="text-xs font-semibold uppercase tracking-wider">
-            Open alerts ({events.length})
+            Open alerts ({events.length}
+            {truncated ? "+" : ""})
           </h3>
           <span className="flex items-center gap-1.5 text-[11px]">
             {bySeverity.critical > 0 && (
@@ -1455,11 +1487,22 @@ export function DashboardPage() {
   // corroborate, pointing at a page unrelated to most of what it
   // counted. Capacity + server health still drive the health LABEL
   // next to the title, which is what they actually describe.
-  const { data: openAlerts = [] } = useQuery({
+  // ``limit`` is the API's own maximum. It is still a cap, and the count
+  // this drives is presented as authoritative — the RPKI misfire this same
+  // issue fixed had 928 events open at once, so the ceiling is reachable in
+  // practice. When the response comes back exactly full the total is
+  // rendered as "N+" rather than as a number we know is wrong.
+  const OPEN_ALERT_FETCH_LIMIT = 1000;
+  const { data: openAlerts = [], isError: openAlertsFailed } = useQuery({
     queryKey: ["alert-events", { open: true }],
-    queryFn: () => alertsApi.listEvents({ open_only: true, limit: 200 }),
+    queryFn: () =>
+      alertsApi.listEvents({
+        open_only: true,
+        limit: OPEN_ALERT_FETCH_LIMIT,
+      }),
     refetchInterval: 60_000,
   });
+  const openAlertsTruncated = openAlerts.length >= OPEN_ALERT_FETCH_LIMIT;
 
   // IPAM-tab IP-space filter (issue #115). Multi-select dropdown above
   // the IPAM-tab cards scopes every subnet-derived stat to the chosen
@@ -1614,9 +1657,13 @@ export function DashboardPage() {
             {openAlerts.length > 0 && (
               <Link
                 to="/admin/alerts"
-                title={`${openAlerts.length} unresolved alert event${
-                  openAlerts.length === 1 ? "" : "s"
-                } — open the Alerts page to triage`}
+                title={
+                  openAlertsTruncated
+                    ? `At least ${openAlerts.length} unresolved alert events — more than this page fetches. Open the Alerts page to triage.`
+                    : `${openAlerts.length} unresolved alert event${
+                        openAlerts.length === 1 ? "" : "s"
+                      } — open the Alerts page to triage`
+                }
                 className={cn(
                   "inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs font-medium",
                   openAlerts.some((e) => e.severity === "critical")
@@ -1625,8 +1672,9 @@ export function DashboardPage() {
                 )}
               >
                 <AlertTriangle className="h-3.5 w-3.5" />
-                {openAlerts.length} alert{openAlerts.length === 1 ? "" : "s"}{" "}
-                open
+                {openAlerts.length}
+                {openAlertsTruncated ? "+" : ""} alert
+                {openAlerts.length === 1 ? "" : "s"} open
               </Link>
             )}
             {/* Blanket invalidate, deliberately (#942). This used to
@@ -1841,7 +1889,11 @@ export function DashboardPage() {
 
         {tab === "overview" && (
           <WidgetErrorBoundary title="Open alerts">
-            <OpenAlertsPanel events={openAlerts} />
+            <OpenAlertsPanel
+              events={openAlerts}
+              failed={openAlertsFailed}
+              truncated={openAlertsTruncated}
+            />
           </WidgetErrorBoundary>
         )}
 
@@ -2693,12 +2745,23 @@ function ServerRow({
  * either would render as a red exhaustion bar for behaving correctly.
  */
 function DhcpPoolPressure() {
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, isError } = useQuery({
     queryKey: ["dhcp-pool-occupancy", "fleet"],
     queryFn: () => dhcpApi.fleetPoolOccupancy(8),
     refetchInterval: 60_000,
   });
 
+  // A failed fetch must not render as "no pools configured" — that is the
+  // same false-calm this panel exists to prevent, and an error boundary
+  // does not catch a rejected query.
+  if (isError) {
+    return (
+      <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-xs text-red-700 dark:border-red-900/50 dark:bg-red-950/30 dark:text-red-400">
+        Could not load pool occupancy — allocation pressure is unknown, not
+        clear.
+      </div>
+    );
+  }
   if (isLoading) {
     return (
       <div className="rounded-lg border bg-card px-4 py-3 text-xs text-muted-foreground">
@@ -2773,7 +2836,11 @@ function DhcpPoolPressure() {
             {data.pools.map((p) => (
               <Link
                 key={p.pool_id}
-                to={`/dhcp?scope=${p.scope_id}`}
+                // DHCPPage restores from ``group`` / ``server`` only —
+                // a ``scope`` param is silently dropped and the click
+                // lands on whatever was last selected. Deep-link to the
+                // owning group, whose panel lists this scope.
+                to={`/dhcp?group=${p.group_id}`}
                 className="flex items-center gap-4 px-4 py-2.5 transition-colors hover:bg-accent/40"
               >
                 <span
