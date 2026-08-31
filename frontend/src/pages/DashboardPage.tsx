@@ -191,6 +191,44 @@ function UtilColor(percent: number): string {
   return "bg-muted/60 dark:bg-muted/40";
 }
 
+/** One entry in the Overview inventory strip (#942) — a value, its unit,
+ *  and the same click-through the KPI card it replaced had. */
+function InventoryStat({
+  value,
+  label,
+  to,
+  title,
+  tone,
+}: {
+  value: string | number;
+  label: string;
+  to: string;
+  title?: string;
+  tone?: "warn" | "bad";
+}) {
+  return (
+    <Link
+      to={to}
+      title={title}
+      className="inline-flex items-baseline gap-1.5 rounded px-2 py-0.5 transition-colors hover:bg-accent/60"
+    >
+      <span
+        className={cn(
+          "font-semibold tabular-nums",
+          tone === "bad"
+            ? "text-red-600 dark:text-red-400"
+            : tone === "warn"
+              ? "text-amber-600 dark:text-amber-400"
+              : "text-foreground",
+        )}
+      >
+        {value}
+      </span>
+      <span className="text-muted-foreground">{label}</span>
+    </Link>
+  );
+}
+
 /** True for an IPv6 prefix, whose capacity numbers are not comparable
  *  to a v4 subnet's and must not be rendered as if they were. */
 function isV6(network: string): boolean {
@@ -1658,115 +1696,222 @@ export function DashboardPage() {
           </div>
         </div>
 
-        {/* ── KPI grid (Overview / IPAM / DNS / DHCP — same data, different
-              lens. The focused tabs (Compliance / Conformity / Network /
-              Integrations / Security) own their own headline KPIs and
-              skip this grid). ──────────────────────────────────────── */}
-        {tab !== "compliance" &&
-          tab !== "conformity" &&
-          tab !== "network" &&
-          tab !== "integrations" &&
-          tab !== "security" && (
-            <div className="grid gap-3 grid-cols-2 md:grid-cols-3 lg:grid-cols-6">
-              <KpiCard
-                label="IP Spaces"
-                value={spaces?.length ?? "—"}
-                sub={spaces?.[0]?.name?.toUpperCase()}
-                icon={Layers}
-                to="/ipam"
-              />
-              <KpiCard
-                label="Subnets"
-                value={subnetsScoped.length}
-                sub={
-                  <>
-                    <span className="text-emerald-600 dark:text-emerald-400">
-                      {subnetsScoped.length - critical - warning} healthy
-                    </span>
-                    {(critical > 0 || warning > 0) && (
-                      <>
-                        {" · "}
-                        <span className="text-red-600 dark:text-red-400">
-                          {critical + warning} alert
-                          {critical + warning === 1 ? "" : "s"}
-                        </span>
-                      </>
-                    )}
-                  </>
-                }
-                icon={Network}
-                tone={critical > 0 ? "bad" : warning > 0 ? "warn" : "good"}
-                to="/ipam"
-              />
-              <KpiCard
-                label="Allocated IPs (IPv4)"
-                value={allocatedIPs.toLocaleString()}
-                sub={`${freeIPs.toLocaleString()} free`}
-                icon={Activity}
-                to="/ipam"
-              />
-              <KpiCard
-                label="Utilization (IPv4)"
-                value={`${overallUtil.toFixed(1)}%`}
-                sub={`${allocatedIPs.toLocaleString()} / ${totalIPs.toLocaleString()}`}
-                icon={Server}
-                tone={
-                  overallUtil >= 95
-                    ? "bad"
-                    : overallUtil >= 80
-                      ? "warn"
-                      : "default"
-                }
-              />
-              <KpiCard
-                label="DNS Zones"
-                value={totalZones}
-                sub={
-                  dnsGroups.length > 0
-                    ? `${dnsGroups.length} group${dnsGroups.length === 1 ? "" : "s"}`
-                    : "no groups"
-                }
-                icon={Globe2}
-                to="/dns"
-              />
-              <KpiCard
-                label="Servers"
-                value={allServers.length}
-                sub={
-                  unhealthyServers > 0 ? (
-                    <span className="text-red-600 dark:text-red-400">
-                      {activeServers} active · {unhealthyServers} unhealthy
-                    </span>
-                  ) : allServers.length > 0 ? (
-                    `${activeServers} active`
-                  ) : (
-                    "none registered"
-                  )
-                }
-                icon={Cpu}
-                tone={unhealthyServers > 0 ? "bad" : "default"}
-              />
-            </div>
-          )}
+        {/* ── Overview: what needs attention (#942) ──────────────────────
+              Overview used to open with the same six inventory counters
+              the IPAM / DNS / DHCP tabs repeat verbatim. Space and zone
+              counts do not change between visits, so the home page led
+              with the least informative thing on it while unhealthy
+              agents, capacity pressure and expiring certificates were
+              scattered across other tabs or absent. The counters are
+              still here — demoted to one line below — and the top of the
+              page now answers "what should I look at today". */}
+        {tab === "overview" && (
+          <div className="grid gap-3 grid-cols-1 sm:grid-cols-2 lg:grid-cols-3">
+            <KpiCard
+              label="Agents needing attention"
+              value={unhealthyServers + configFailedServers}
+              sub={
+                unhealthyServers + configFailedServers > 0 ? (
+                  <span className="text-red-600 dark:text-red-400">
+                    {unhealthyServers} unreachable
+                    {configFailedServers > 0 &&
+                      ` · ${configFailedServers} config failed`}
+                  </span>
+                ) : (
+                  `${activeServers} healthy · paused and maintenance excluded`
+                )
+              }
+              icon={Cpu}
+              tone={unhealthyServers + configFailedServers > 0 ? "bad" : "good"}
+              to="/dns"
+            />
+            <KpiCard
+              label="Capacity pressure"
+              value={critical + warning}
+              sub={
+                critical + warning > 0 ? (
+                  <span
+                    className={
+                      critical > 0
+                        ? "text-red-600 dark:text-red-400"
+                        : "text-amber-600 dark:text-amber-400"
+                    }
+                  >
+                    {critical} at ≥95% · {warning} at ≥80%
+                  </span>
+                ) : (
+                  "no subnet above 80%"
+                )
+              }
+              icon={Network}
+              tone={critical > 0 ? "bad" : warning > 0 ? "warn" : "good"}
+              to="/ipam"
+            />
+            <WidgetErrorBoundary title="Certificates expiring">
+              <CertsExpiringKpi />
+            </WidgetErrorBoundary>
+          </div>
+        )}
 
-        {/* ── Platform health (Overview only — sits directly below the
-              KPI row so the colour-coded health ribbon is the next
-              thing the eye lands on after the headline counters). ──── */}
+        {/* ── KPI grid (IPAM / DNS / DHCP — same data, different lens.
+              Overview gets the compact inventory strip instead, and the
+              focused tabs own their own headline KPIs). ─────────────── */}
+        {(tab === "ipam" || tab === "dns" || tab === "dhcp") && (
+          <div className="grid gap-3 grid-cols-2 md:grid-cols-3 lg:grid-cols-6">
+            <KpiCard
+              label="IP Spaces"
+              value={spaces?.length ?? "—"}
+              sub={spaces?.[0]?.name?.toUpperCase()}
+              icon={Layers}
+              to="/ipam"
+            />
+            <KpiCard
+              label="Subnets"
+              value={subnetsScoped.length}
+              sub={
+                <>
+                  <span className="text-emerald-600 dark:text-emerald-400">
+                    {subnetsScoped.length - critical - warning} healthy
+                  </span>
+                  {(critical > 0 || warning > 0) && (
+                    <>
+                      {" · "}
+                      <span className="text-red-600 dark:text-red-400">
+                        {critical + warning} alert
+                        {critical + warning === 1 ? "" : "s"}
+                      </span>
+                    </>
+                  )}
+                </>
+              }
+              icon={Network}
+              tone={critical > 0 ? "bad" : warning > 0 ? "warn" : "good"}
+              to="/ipam"
+            />
+            <KpiCard
+              label="Allocated IPs (IPv4)"
+              value={allocatedIPs.toLocaleString()}
+              sub={`${freeIPs.toLocaleString()} free`}
+              icon={Activity}
+              to="/ipam"
+            />
+            <KpiCard
+              label="Utilization (IPv4)"
+              value={`${overallUtil.toFixed(1)}%`}
+              sub={`${allocatedIPs.toLocaleString()} / ${totalIPs.toLocaleString()}`}
+              icon={Server}
+              tone={
+                overallUtil >= 95
+                  ? "bad"
+                  : overallUtil >= 80
+                    ? "warn"
+                    : "default"
+              }
+            />
+            <KpiCard
+              label="DNS Zones"
+              value={totalZones}
+              sub={
+                dnsGroups.length > 0
+                  ? `${dnsGroups.length} group${dnsGroups.length === 1 ? "" : "s"}`
+                  : "no groups"
+              }
+              icon={Globe2}
+              to="/dns"
+            />
+            <KpiCard
+              label="Servers"
+              value={allServers.length}
+              sub={
+                unhealthyServers > 0 ? (
+                  <span className="text-red-600 dark:text-red-400">
+                    {activeServers} active · {unhealthyServers} unhealthy
+                  </span>
+                ) : allServers.length > 0 ? (
+                  `${activeServers} active`
+                ) : (
+                  "none registered"
+                )
+              }
+              icon={Cpu}
+              tone={unhealthyServers > 0 ? "bad" : "default"}
+            />
+          </div>
+        )}
+
         {tab === "overview" && (
           <WidgetErrorBoundary title="Open alerts">
             <OpenAlertsPanel events={openAlerts} />
           </WidgetErrorBoundary>
         )}
 
+        {/* ── Platform health (Overview only) ───────────────────────── */}
         {tab === "overview" && platformHealth && (
           <WidgetErrorBoundary title="Platform health">
             <PlatformHealthCard health={platformHealth} />
           </WidgetErrorBoundary>
         )}
 
-        {/* ── Network overview cards (Overview tab) ─────────────────── */}
+        {/* ── Inventory strip (#942) — the demoted six KPI cards. Still
+              one click from everything they linked to, in a twelfth of
+              the vertical space, because "how many zones do we have" is
+              a reference lookup rather than a thing to monitor. ─────── */}
         {tab === "overview" && (
-          <div className="grid gap-3 grid-cols-1 sm:grid-cols-2 lg:grid-cols-4">
+          <div className="flex flex-wrap items-center gap-x-1 gap-y-2 rounded-lg border bg-card px-4 py-2.5 text-xs">
+            <InventoryStat
+              value={spaces?.length ?? 0}
+              label="spaces"
+              to="/ipam"
+            />
+            <InventoryStat
+              value={subnetsScoped.length}
+              label="subnets"
+              to="/ipam"
+            />
+            <InventoryStat
+              value={allocatedIPs.toLocaleString()}
+              label="allocated IPv4"
+              title={`${freeIPs.toLocaleString()} free of ${totalIPs.toLocaleString()}`}
+              to="/ipam"
+            />
+            <InventoryStat
+              value={`${overallUtil.toFixed(1)}%`}
+              label="utilization"
+              tone={
+                overallUtil >= 95
+                  ? "bad"
+                  : overallUtil >= 80
+                    ? "warn"
+                    : undefined
+              }
+              title={`${allocatedIPs.toLocaleString()} / ${totalIPs.toLocaleString()} IPv4 addresses`}
+              to="/ipam"
+            />
+            <InventoryStat
+              value={totalZones}
+              label="DNS zones"
+              title={`across ${dnsGroups.length} group${dnsGroups.length === 1 ? "" : "s"}`}
+              to="/dns"
+            />
+            <InventoryStat
+              value={allServers.length}
+              label="servers"
+              title={`${activeServers} active`}
+              to="/dns"
+            />
+          </div>
+        )}
+
+        {/* ── Network overview cards (Overview tab) ───────────────────
+              ``items-start`` is the fix for the whitespace, not styling
+              (#942): the grid's default stretch made every card as tall
+              as the tallest in its row, so a card whose whole content is
+              "No subnets scheduled for decommission" rendered as a
+              full-height panel of nothing. Each card is now its natural
+              height, which self-compacts the empty ones without five
+              components needing an empty-state variant. */}
+        {tab === "overview" && (
+          <div className="grid items-start gap-3 grid-cols-1 sm:grid-cols-2 lg:grid-cols-4">
             <WidgetErrorBoundary title="ASN summary">
               <AsnSummaryCard />
             </WidgetErrorBoundary>
@@ -1981,24 +2126,37 @@ export function DashboardPage() {
                     recent.items.slice(0, 12).map((entry) => (
                       <div
                         key={entry.id}
-                        className="flex items-center gap-3 px-4 py-2 text-[11px]"
+                        className="flex items-center gap-2.5 px-4 py-2 text-[11px]"
                       >
                         <span className="w-14 flex-shrink-0 tabular-nums text-muted-foreground">
                           {humanTime(entry.timestamp)}
                         </span>
-                        <span className="w-36 flex-shrink-0 min-w-0">
+                        {/* The badge used to reserve 144 px for names that
+                            are usually six characters, so the two columns
+                            that identify WHAT changed and WHO changed it
+                            were squeezed into what was left and truncated
+                            to "Administr…". It now takes what it needs and
+                            truncates itself, with the full text on hover
+                            everywhere (#942). */}
+                        <span
+                          className="min-w-0 max-w-[9rem] flex-shrink-0 truncate"
+                          title={`${entry.action}${entry.resource_type ? ` · ${entry.resource_type.replace(/_/g, " ")}` : ""}`}
+                        >
                           <ActionBadge
                             action={entry.action}
                             result={entry.result}
                           />
                         </span>
-                        <span className="w-20 flex-shrink-0 truncate text-muted-foreground">
-                          {entry.resource_type.replace(/_/g, " ")}
-                        </span>
-                        <span className="flex-1 truncate font-mono">
+                        <span
+                          className="flex-1 truncate font-mono"
+                          title={entry.resource_display}
+                        >
                           {entry.resource_display}
                         </span>
-                        <span className="w-20 flex-shrink-0 truncate text-right text-muted-foreground">
+                        <span
+                          className="w-24 flex-shrink-0 truncate text-right text-muted-foreground"
+                          title={entry.user_display_name}
+                        >
                           {entry.user_display_name}
                         </span>
                       </div>
