@@ -52,6 +52,8 @@ from reportlab.platypus import (
 )
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.content_disposition import slugify_filename_part
+
 # Same scope resolution + payload shaping the CSV/JSON/XLSX exporter uses,
 # so a PDF and a spreadsheet of the same scope can't disagree about what
 # the subtree contains. Intra-package use of the private helper is
@@ -242,19 +244,12 @@ def _sort_subnets(subnets: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def _slugify(value: str) -> str:
     """Reduce an operator-supplied name to a safe filename fragment.
 
-    This lands in a ``Content-Disposition`` header, so it is an
-    allowlist, not a blocklist: a space named ``x"; filename="evil.pdf``
-    would otherwise break out of the quoted filename, and even benign
-    names full of spaces and parentheses ("AV multicast (demo)") produce
-    a header that browsers handle inconsistently.
+    Thin alias for the shared implementation — this lands in a
+    ``Content-Disposition`` header, and that rule now has one home
+    (``app.core.content_disposition``) so the export routes, the PDF
+    filenames and any future download agree about it.
     """
-    cleaned = [c if (c.isascii() and (c.isalnum() or c in "-_.")) else "-" for c in value]
-    slug = "".join(cleaned).strip("-.")
-    # Collapse runs so "AV multicast (demo)" is `AV-multicast-demo`, not
-    # `AV-multicast--demo-`.
-    while "--" in slug:
-        slug = slug.replace("--", "-")
-    return slug[:60] or "export"
+    return slugify_filename_part(value)
 
 
 def _sort_addresses(addresses: list[dict[str, Any]]) -> list[dict[str, Any]]:

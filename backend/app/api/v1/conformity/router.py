@@ -30,6 +30,7 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import delete, desc, func, select
 
 from app.api.deps import DB, CurrentUser
+from app.core.content_disposition import content_disposition
 from app.core.permissions import user_has_permission
 from app.core.responses import PdfResponse
 from app.models.audit import AuditLog
@@ -557,11 +558,18 @@ async def export_pdf(
     pdf_bytes = await generate_conformity_pdf(db, framework=framework)
     fname = "spatiumddi-conformity"
     if framework:
-        slug = framework.lower().replace(" ", "-").replace("/", "-")
-        fname += f"-{slug}"
+        # Bounded so an arbitrarily long ``framework`` can't grow the
+        # response header without limit; the header builder below is what
+        # makes the *content* safe.
+        fname += f"-{framework.lower().replace(' ', '-').replace('/', '-')[:60]}"
     fname += f"-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}.pdf"
+    # Content-Disposition is a latin-1 header carrying an operator-supplied
+    # value, which is three separate bugs an f-string does not survive — see
+    # ``app.core.content_disposition``. Notably an ASCII-strip is NOT enough:
+    # CR/LF are ASCII, and reach uvicorn's writer as an invalid header value
+    # (connection dropped, no response at all).
     return Response(
         content=pdf_bytes,
         media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+        headers={"Content-Disposition": content_disposition(fname)},
     )

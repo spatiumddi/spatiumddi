@@ -244,7 +244,7 @@ class VRFCreate(BaseModel):
 
     @field_validator("import_targets", "export_targets", mode="before")
     @classmethod
-    def _coerce_list(cls, v: Any) -> list[str]:
+    def _coerce_list(cls, v: Any) -> Any:
         if v is None:
             return []
         if isinstance(v, str):
@@ -253,7 +253,13 @@ class VRFCreate(BaseModel):
             # in the form. Normalise to a list before per-item RT
             # validation runs in ``_after_validate``.
             return [s.strip() for s in v.split(",") if s.strip()]
-        return list(v)
+        if isinstance(v, (list, tuple)):
+            return list(v)
+        # Anything else is not a target list. ``list(v)`` raised TypeError on
+        # a non-iterable (a bare int/bool = a 500, not the declared 422) and
+        # silently turned an object into its KEY list. Hand it to core
+        # validation, which rejects it against ``list[str]``.
+        return v
 
     @field_validator("import_targets", "export_targets")
     @classmethod
@@ -289,12 +295,15 @@ class VRFUpdate(BaseModel):
 
     @field_validator("import_targets", "export_targets", mode="before")
     @classmethod
-    def _coerce_list(cls, v: Any) -> list[str] | None:
+    def _coerce_list(cls, v: Any) -> Any:
         if v is None:
             return None
         if isinstance(v, str):
             return [s.strip() for s in v.split(",") if s.strip()]
-        return list(v)
+        if isinstance(v, (list, tuple)):
+            return list(v)
+        # See VRFCreate._coerce_list — a non-iterable 500'd here.
+        return v
 
     @field_validator("import_targets", "export_targets")
     @classmethod

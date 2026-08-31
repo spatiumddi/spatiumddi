@@ -2483,7 +2483,7 @@ class AliasInput(BaseModel):
         return v
 
 
-def _validate_role(v: str | None) -> str | None:
+def _validate_role(v: Any) -> Any:
     """Reject role values outside the curated ``IP_ROLES`` set.
 
     Empty string is normalised to None so the modal can submit a
@@ -2492,6 +2492,13 @@ def _validate_role(v: str | None) -> str | None:
     """
     if v is None or v == "":
         return None
+    # A non-string (a JSON list/object/number) reaches this ``mode="before"``
+    # validator raw. ``v not in IP_ROLES`` then hashes ``v`` against the role
+    # set and an unhashable list raised TypeError — a 500, not the 422 the
+    # contract declares. Hand any non-string to core validation, which rejects
+    # it against the ``str | None`` field as a normal 422.
+    if not isinstance(v, str):
+        return v
     if v not in IP_ROLES:
         raise ValueError(f"role must be one of: {', '.join(sorted(IP_ROLES))}")
     return v
@@ -2557,7 +2564,7 @@ class IPAddressCreate(BaseModel):
 
     @field_validator("role", mode="before")
     @classmethod
-    def validate_role(cls, v: str | None) -> str | None:
+    def validate_role(cls, v: Any) -> Any:
         return _validate_role(v)
 
 
@@ -2612,7 +2619,7 @@ class IPAddressUpdate(BaseModel):
 
     @field_validator("role", mode="before")
     @classmethod
-    def validate_role(cls, v: str | None) -> str | None:
+    def validate_role(cls, v: Any) -> Any:
         return _validate_role(v)
 
 
@@ -2778,7 +2785,7 @@ class NextIPRequest(BaseModel):
 
     @field_validator("role", mode="before")
     @classmethod
-    def validate_role(cls, v: str | None) -> str | None:
+    def validate_role(cls, v: Any) -> Any:
         return _validate_role(v)
 
 
@@ -9371,7 +9378,7 @@ class IPAddressBulkChanges(BaseModel):
 
     @field_validator("role", mode="before")
     @classmethod
-    def _validate_role(cls, v: str | None) -> str | None:
+    def _validate_role(cls, v: Any) -> Any:
         return _validate_role(v)
 
 
