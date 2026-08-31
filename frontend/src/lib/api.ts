@@ -8376,6 +8376,14 @@ export const dhcpApi = {
     api
       .get<DHCPPoolOccupancy[]>(`/dhcp/scopes/${scopeId}/pools/occupancy`)
       .then((r) => r.data),
+  // Fleet-wide, fullest first (#942) — one round trip whose cost does not
+  // grow with the number of scopes. Same dynamic-only filter as above.
+  fleetPoolOccupancy: (limit = 10) =>
+    api
+      .get<DHCPFleetPoolOccupancy>("/dhcp/pools/occupancy", {
+        params: { limit },
+      })
+      .then((r) => r.data),
 
   // Rogue-DHCP observed responders (#370).
   listResponders: (groupId: string, classification?: string) =>
@@ -8749,6 +8757,27 @@ export interface DHCPPoolOccupancy {
   percent: number;
   /** Derived from mirrored lease rows, so its freshness follows the last lease pull. */
   computed_at: string;
+}
+
+/** One row of the fleet-wide occupancy rollup (#942) — a pool plus the
+ *  context needed to identify it without a follow-up call. */
+export interface DHCPFleetPoolOccupancyRow extends DHCPPoolOccupancy {
+  scope_name: string;
+  scope_is_active: boolean;
+  subnet_network: string | null;
+  group_id: string;
+  group_name: string;
+}
+
+export interface DHCPFleetPoolOccupancy {
+  computed_at: string;
+  /** Every dynamic pool considered, not just the returned slice. */
+  pool_count: number;
+  pools_warning: number;
+  pools_critical: number;
+  /** Distinct (scope, address) pairs on an active lease, fleet-wide. */
+  active_lease_count: number;
+  pools: DHCPFleetPoolOccupancyRow[];
 }
 
 export interface DHCPPool {

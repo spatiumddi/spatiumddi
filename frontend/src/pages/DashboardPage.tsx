@@ -89,6 +89,7 @@ import {
   type VRF,
   type Domain,
   type AlertEvent,
+  type ConfigApplyStatus,
   type AlertRule,
   type ConformityResult,
   type ConformitySummary,
@@ -451,9 +452,11 @@ function futureTime(ts: string): string {
 function StatusChip({
   tone,
   label,
+  title,
 }: {
   tone: "green" | "amber" | "red" | "gray";
   label: string;
+  title?: string;
 }) {
   const cls =
     tone === "green"
@@ -465,13 +468,126 @@ function StatusChip({
           : "bg-muted text-muted-foreground";
   return (
     <span
+      title={title}
       className={cn(
         "inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-semibold",
         cls,
+        title && "cursor-help",
       )}
     >
       {label}
     </span>
+  );
+}
+
+/**
+ * Open alerts rollup (#942).
+ *
+ * The alerts framework fires into `alert_event`, and until now the
+ * dashboard surfaced none of it — the header pill did arithmetic of its
+ * own and the Compliance tab showed a compliance-filtered slice. So the
+ * home page could look calm while the alerting was lit up.
+ *
+ * Shares its query with the header pill (one key, one fetch); the events
+ * arrive newest-first from the API.
+ */
+function OpenAlertsPanel({ events }: { events: AlertEvent[] }) {
+  const bySeverity = {
+    critical: events.filter((e) => e.severity === "critical").length,
+    warning: events.filter((e) => e.severity === "warning").length,
+    info: events.filter((e) => e.severity === "info").length,
+  };
+
+  if (events.length === 0) {
+    return (
+      <div className="flex items-center gap-2 rounded-lg border bg-card px-4 py-2.5 text-xs">
+        <span className="inline-block h-1.5 w-1.5 rounded-full bg-emerald-500" />
+        <span className="font-medium">No open alerts</span>
+        <Link
+          to="/admin/alerts"
+          className="ml-auto text-[11px] text-primary hover:underline"
+        >
+          Alert rules →
+        </Link>
+      </div>
+    );
+  }
+
+  return (
+    <div className="rounded-lg border bg-card">
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b px-4 py-2.5">
+        <div className="flex items-center gap-2">
+          <AlertTriangle className="h-3.5 w-3.5 text-amber-500" />
+          <h3 className="text-xs font-semibold uppercase tracking-wider">
+            Open alerts ({events.length})
+          </h3>
+          <span className="flex items-center gap-1.5 text-[11px]">
+            {bySeverity.critical > 0 && (
+              <StatusChip
+                tone="red"
+                label={`${bySeverity.critical} critical`}
+              />
+            )}
+            {bySeverity.warning > 0 && (
+              <StatusChip
+                tone="amber"
+                label={`${bySeverity.warning} warning`}
+              />
+            )}
+            {bySeverity.info > 0 && (
+              <StatusChip tone="gray" label={`${bySeverity.info} info`} />
+            )}
+          </span>
+        </div>
+        <Link
+          to="/admin/alerts"
+          className="text-[11px] text-primary hover:underline"
+        >
+          view all →
+        </Link>
+      </div>
+      <div className="divide-y">
+        {events.slice(0, 5).map((e) => (
+          <Link
+            key={e.id}
+            to="/admin/alerts"
+            className="flex items-center gap-3 px-4 py-2 text-[11px] transition-colors hover:bg-accent/40"
+          >
+            <span
+              className={cn(
+                "inline-block h-1.5 w-1.5 flex-shrink-0 rounded-full",
+                e.severity === "critical"
+                  ? "bg-red-500"
+                  : e.severity === "warning"
+                    ? "bg-amber-500"
+                    : "bg-muted-foreground/40",
+              )}
+              title={e.severity}
+            />
+            <span
+              className="w-40 flex-shrink-0 truncate font-semibold"
+              title={e.subject_display}
+            >
+              {e.subject_display || e.subject_type}
+            </span>
+            <span
+              className="flex-1 truncate text-muted-foreground"
+              title={e.message}
+            >
+              {e.message}
+            </span>
+            <span className="w-20 flex-shrink-0 text-right text-muted-foreground">
+              {humanTime(e.fired_at)}
+            </span>
+          </Link>
+        ))}
+      </div>
+      {events.length > 5 && (
+        <div className="border-t px-4 py-1.5 text-[11px] text-muted-foreground">
+          + {events.length - 5} more
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -1388,7 +1504,8 @@ export function DashboardPage() {
     (s) => s.config_apply_status != null && s.config_apply_status !== "ok",
   ).length;
 
-  const degraded = unhealthyServers > 0 || configFailedServers > 0 || critical > 0;
+  const degraded =
+    unhealthyServers > 0 || configFailedServers > 0 || critical > 0;
   const healthTone: Tone = degraded ? "bad" : warning > 0 ? "warn" : "good";
   const healthLabel = degraded
     ? "degraded"
@@ -1399,9 +1516,15 @@ export function DashboardPage() {
   // operator sees "degraded" and has no idea which one to chase.
   const healthDetail =
     [
-      critical > 0 ? `${critical} subnet${critical === 1 ? "" : "s"} ≥95% full` : null,
-      warning > 0 ? `${warning} subnet${warning === 1 ? "" : "s"} ≥80% full` : null,
-      unhealthyServers > 0 ? `${unhealthyServers} server${unhealthyServers === 1 ? "" : "s"} unreachable` : null,
+      critical > 0
+        ? `${critical} subnet${critical === 1 ? "" : "s"} ≥95% full`
+        : null,
+      warning > 0
+        ? `${warning} subnet${warning === 1 ? "" : "s"} ≥80% full`
+        : null,
+      unhealthyServers > 0
+        ? `${unhealthyServers} server${unhealthyServers === 1 ? "" : "s"} unreachable`
+        : null,
       configFailedServers > 0
         ? `${configFailedServers} agent${configFailedServers === 1 ? "" : "s"} failed to apply config`
         : null,
@@ -1629,6 +1752,12 @@ export function DashboardPage() {
         {/* ── Platform health (Overview only — sits directly below the
               KPI row so the colour-coded health ribbon is the next
               thing the eye lands on after the headline counters). ──── */}
+        {tab === "overview" && (
+          <WidgetErrorBoundary title="Open alerts">
+            <OpenAlertsPanel events={openAlerts} />
+          </WidgetErrorBoundary>
+        )}
+
         {tab === "overview" && platformHealth && (
           <WidgetErrorBoundary title="Platform health">
             <PlatformHealthCard health={platformHealth} />
@@ -1663,7 +1792,12 @@ export function DashboardPage() {
           </WidgetErrorBoundary>
         )}
 
-        {/* ── DHCP traffic (DHCP tab only) ───────────────────────────── */}
+        {/* ── DHCP pools + traffic (DHCP tab only) ───────────────────── */}
+        {tab === "dhcp" && (
+          <WidgetErrorBoundary title="DHCP pools">
+            <DhcpPoolPressure />
+          </WidgetErrorBoundary>
+        )}
         {tab === "dhcp" && (
           <WidgetErrorBoundary title="DHCP traffic">
             <DHCPTrafficCard dhcpServers={dhcpServers} />
@@ -1955,6 +2089,9 @@ export function DashboardPage() {
                       groupName={group?.name ?? "—"}
                       lastSeen={s.last_health_check_at}
                       isEnabled={s.is_enabled !== false}
+                      maintenance={s.maintenance_mode}
+                      configApplyStatus={s.config_apply_status}
+                      configApplyError={s.config_apply_error}
                     />
                   );
                 })}
@@ -2006,6 +2143,9 @@ export function DashboardPage() {
                       }
                       groupName={group?.name ?? "ungrouped"}
                       lastSeen={s.last_health_check_at}
+                      maintenance={s.maintenance_mode}
+                      configApplyStatus={s.config_apply_status}
+                      configApplyError={s.config_apply_error}
                     />
                   );
                 })}
@@ -2256,6 +2396,45 @@ function IpamSpaceFilter({
   );
 }
 
+/**
+ * Config-apply verdict chip (#882, surfaced here by #942).
+ *
+ * The failure this makes visible is silent by construction: an agent
+ * that could not apply its config keeps serving the PREVIOUS one and
+ * keeps heartbeating, so `status`, the health probe and `last_seen_at`
+ * all read normal while the zone or scope the operator saved is live
+ * nowhere.
+ *
+ * NULL renders nothing rather than "ok" — an agent too old to report a
+ * verdict is exactly where a silent revert would hide, and painting
+ * that green would be the same lie in a different colour.
+ */
+function ConfigApplyChip({
+  status,
+  error,
+}: {
+  status: ConfigApplyStatus | null;
+  error?: string | null;
+}) {
+  if (status == null || status === "ok") return null;
+  // `reverted` means a known-good config is still serving; the other two
+  // mean the running state is wrong or unknown.
+  const tone = status === "reverted" ? "amber" : "red";
+  const label = status === "reverted" ? "config reverted" : `config ${status}`;
+  return (
+    <StatusChip
+      tone={tone}
+      label={label.replace(/_/g, " ")}
+      title={
+        error ||
+        (status === "reverted"
+          ? "The saved config failed to apply; the agent rolled back and is serving the previous one."
+          : "The saved config failed to apply and the rollback did not succeed. Running state is unknown.")
+      }
+    />
+  );
+}
+
 function ServerRow({
   name,
   host,
@@ -2264,6 +2443,9 @@ function ServerRow({
   groupName,
   lastSeen,
   isEnabled = true,
+  maintenance = false,
+  configApplyStatus = null,
+  configApplyError = null,
 }: {
   name: string;
   host: string;
@@ -2272,6 +2454,9 @@ function ServerRow({
   groupName: string;
   lastSeen?: string | null;
   isEnabled?: boolean;
+  maintenance?: boolean;
+  configApplyStatus?: ConfigApplyStatus | null;
+  configApplyError?: string | null;
 }) {
   const dotCls =
     status === "active"
@@ -2318,10 +2503,158 @@ function ServerRow({
       <span className="w-24 truncate text-muted-foreground" title={groupName}>
         {groupName}
       </span>
-      <StatusIcon className="ml-auto h-3 w-3 flex-shrink-0 text-muted-foreground/50" />
+      <div className="ml-auto flex flex-shrink-0 items-center gap-1.5">
+        {maintenance && (
+          <StatusChip
+            tone="amber"
+            label="maintenance"
+            title="Operator-set maintenance mode — health alerts are suppressed for this server."
+          />
+        )}
+        <ConfigApplyChip status={configApplyStatus} error={configApplyError} />
+        <StatusIcon className="h-3 w-3 text-muted-foreground/50" />
+      </div>
       <span className="w-20 flex-shrink-0 text-right text-muted-foreground">
         {!isEnabled ? "disabled" : lastSeen ? humanTime(lastSeen) : "never"}
       </span>
+    </div>
+  );
+}
+
+/**
+ * DHCP pool pressure (#942, over the #913 occupancy computation).
+ *
+ * The DHCP tab used to show an empty traffic chart and a server list —
+ * nothing about leases or pools, despite "can a client still get an
+ * address" being the flagship DHCP question and the arithmetic having
+ * existed since #339. This answers it fleet-wide in one call.
+ *
+ * Dynamic pools only, matching the endpoint, the per-scope endpoint and
+ * the `dhcp_pool_exhaustion` alert evaluator: an excluded range is never
+ * offered to a client and a reserved one is *supposed* to fill up, so
+ * either would render as a red exhaustion bar for behaving correctly.
+ */
+function DhcpPoolPressure() {
+  const { data, isLoading } = useQuery({
+    queryKey: ["dhcp-pool-occupancy", "fleet"],
+    queryFn: () => dhcpApi.fleetPoolOccupancy(8),
+    refetchInterval: 60_000,
+  });
+
+  if (isLoading) {
+    return (
+      <div className="rounded-lg border bg-card px-4 py-3 text-xs text-muted-foreground">
+        Loading pool occupancy…
+      </div>
+    );
+  }
+  if (!data || data.pool_count === 0) {
+    return (
+      <div className="rounded-lg border bg-card px-4 py-3 text-xs text-muted-foreground">
+        No dynamic DHCP pools configured. Add a pool to a scope to see
+        allocation pressure here.
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-3">
+      <div className="grid gap-3 grid-cols-2 lg:grid-cols-4">
+        <KpiCard
+          label="Active leases"
+          value={data.active_lease_count.toLocaleString()}
+          sub="distinct addresses"
+          icon={Activity}
+          to="/dhcp"
+        />
+        <KpiCard
+          label="Dynamic pools"
+          value={data.pool_count}
+          sub="fleet-wide"
+          icon={Layers}
+          to="/dhcp"
+        />
+        <KpiCard
+          label="Pools ≥ 80%"
+          value={data.pools_warning}
+          tone={data.pools_warning > 0 ? "warn" : "good"}
+          sub="nearing exhaustion"
+          icon={AlertTriangle}
+          to="/dhcp"
+        />
+        <KpiCard
+          label="Pools ≥ 95%"
+          value={data.pools_critical}
+          tone={data.pools_critical > 0 ? "bad" : "good"}
+          sub="effectively full"
+          icon={AlertTriangle}
+          to="/dhcp"
+        />
+      </div>
+
+      <div className="rounded-lg border bg-card">
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b px-4 py-2.5">
+          <div className="flex items-center gap-2">
+            <Server className="h-3.5 w-3.5 text-muted-foreground" />
+            <h3 className="text-xs font-semibold uppercase tracking-wider">
+              Pools nearest exhaustion
+            </h3>
+            <span className="text-[11px] text-muted-foreground">
+              showing {data.pools.length} of {data.pool_count}
+            </span>
+          </div>
+          <span
+            className="text-[11px] text-muted-foreground"
+            title="Occupancy is derived from mirrored lease rows, so its freshness follows the last lease pull — not the moment this page rendered."
+          >
+            as of {humanTime(data.computed_at)}
+          </span>
+        </div>
+        <div className="overflow-x-auto">
+          <div className="min-w-[620px] divide-y">
+            {data.pools.map((p) => (
+              <Link
+                key={p.pool_id}
+                to={`/dhcp?scope=${p.scope_id}`}
+                className="flex items-center gap-4 px-4 py-2.5 transition-colors hover:bg-accent/40"
+              >
+                <span
+                  className="w-52 shrink-0 truncate font-mono text-xs"
+                  title={`${p.start_ip} – ${p.end_ip}`}
+                >
+                  {p.start_ip}–{p.end_ip}
+                </span>
+                <span className="w-36 truncate text-xs text-muted-foreground">
+                  {p.scope_name || p.subnet_network || (
+                    <span className="text-muted-foreground/40">—</span>
+                  )}
+                </span>
+                <span className="w-24 truncate text-[11px] text-muted-foreground">
+                  {p.group_name}
+                </span>
+                {/* A scope the operator deactivated is not handing out
+                    addresses, so its number is real but not urgent. Flagged
+                    rather than hidden — the exhaustion alert still fires on
+                    these, and a panel that silently disagreed with the
+                    alerting is how a wrong all-clear gets reported. */}
+                {!p.scope_is_active && (
+                  <StatusChip
+                    tone="gray"
+                    label="inactive"
+                    title="The parent scope is deactivated — it is not currently serving addresses."
+                  />
+                )}
+                <div className="flex-1">
+                  <UtilizationBar percent={p.percent} />
+                </div>
+                <span className="w-28 shrink-0 whitespace-nowrap text-right text-[11px] tabular-nums text-muted-foreground">
+                  {p.assigned.toLocaleString()} / {p.total.toLocaleString()}
+                </span>
+              </Link>
+            ))}
+          </div>
+        </div>
+      </div>
     </div>
   );
 }

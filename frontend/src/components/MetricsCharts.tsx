@@ -174,13 +174,18 @@ export function DNSQueryRateCard({
           <WindowPicker value={win} onChange={setWin} />
         </div>
       </div>
-      <div className="h-64 p-3">
+      {/* Collapse to a slim strip when there is nothing to plot (#942).
+          A full 256 px of empty state pushed the panels that DO have
+          something to say below the fold — and on a fresh install, or any
+          deployment with no agent reporting counters, that is the normal
+          case rather than the exception. */}
+      <div className={hasData || isLoading ? "h-64 p-3" : "px-4 py-3"}>
         {isLoading ? (
           <div className="flex h-full items-center justify-center text-xs text-muted-foreground">
             Loading…
           </div>
         ) : !hasData ? (
-          <div className="flex h-full flex-col items-center justify-center gap-1 text-center text-xs text-muted-foreground">
+          <div className="flex flex-wrap items-center gap-x-2 text-xs text-muted-foreground">
             <span>No query data yet.</span>
             <span className="text-[11px]">
               BIND9 agents report counters every 60&nbsp;s.
@@ -307,13 +312,18 @@ export function DHCPTrafficCard({
           <WindowPicker value={win} onChange={setWin} />
         </div>
       </div>
-      <div className="h-64 p-3">
+      {/* Collapse to a slim strip when there is nothing to plot (#942).
+          A full 256 px of empty state pushed the panels that DO have
+          something to say below the fold — and on a fresh install, or any
+          deployment with no agent reporting counters, that is the normal
+          case rather than the exception. */}
+      <div className={hasData || isLoading ? "h-64 p-3" : "px-4 py-3"}>
         {isLoading ? (
           <div className="flex h-full items-center justify-center text-xs text-muted-foreground">
             Loading…
           </div>
         ) : !hasData ? (
-          <div className="flex h-full flex-col items-center justify-center gap-1 text-center text-xs text-muted-foreground">
+          <div className="flex flex-wrap items-center gap-x-2 text-xs text-muted-foreground">
             <span>No DHCP traffic yet.</span>
             <span className="text-[11px]">
               Kea agents report packet counters every 60&nbsp;s.
