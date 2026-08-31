@@ -10074,6 +10074,10 @@ export interface NetworkDashboardSummary {
   asn_drift_count: number;
   rpki_expiring_count: number;
   rpki_expired_count: number;
+  /** Total ROAs tracked, and when the pull last touched one. Lets the
+   *  panel tell a real all-clear from stale or absent data (#942). */
+  rpki_total_count: number;
+  rpki_last_checked_at: string | null;
   circuit_term_expiring_count: number;
   circuit_status_changed_count: number;
   service_orphan_count: number;

@@ -22,9 +22,12 @@ evaluator + the manual "Refresh now" path use the same logic:
 * ``valid_to is None`` (the public mirrors don't expose validity
   windows) → ``valid``. We don't fire spurious "expired" events on
   unknown windows.
-* ``valid_to <= now`` → ``expired``.
-* ``valid_to <= now + 30d`` → ``expiring_soon``.
-* otherwise → ``valid``.
+* a source whose validity field is a short-cycle cache expiry rather
+  than a per-ROA lifetime → always ``valid``, for the same reason. This
+  is the Cloudflare case and it is the common one; see
+  ``_LIFETIME_VALIDITY_SOURCES``.
+* otherwise: ``valid_to <= now`` → ``expired``; ``valid_to <= now + 30d``
+  → ``expiring_soon``; else ``valid``.
 
 Every additive / removed / state-transitioned row gets an audit-log
 entry. We deliberately don't audit "still valid, ticked" — that's
@@ -54,12 +57,38 @@ _SINGLETON_ID = 1
 _VALID_SOURCES = frozenset({"cloudflare", "ripe"})
 
 
-def _derive_roa_state(valid_to: datetime | None, now: datetime) -> str:
-    """Map ``valid_to`` → ROA state. ``None`` (unknown window) maps
-    to ``valid`` so we don't fire spurious alerts on mirrors that
-    don't expose the X.509 notAfter field.
+# Sources whose validity field is a per-ROA LIFETIME, and can therefore
+# carry an "expiring soon" signal.
+#
+# Cloudflare's ``rpki.json`` is deliberately absent (#942). Its
+# ``expires`` is the validity of the VRP cache entry — derived from the
+# shortest-lived object in the validation chain (EE cert / manifest /
+# CRL), all of which RPKI CAs re-sign on a rolling cycle of hours. It is
+# not a statement about the ROA's lifetime and does not decay towards a
+# renewal deadline. Measured against the live global dump on 2026-08-31:
+# of 997,298 ROAs, 100% expired within 7 days and 79% within 2 — so a
+# 30-day threshold flags literally every ROA that will ever exist,
+# permanently. That is not a noisy signal, it is a constant, and it fed
+# the ``rpki_roa_expiring`` alert rule one event PER ROA.
+#
+# For this source, presence in the dump is the signal: a ROA the AS
+# holder actually pulled disappears, and the reconcile below DELETEs it.
+# RIPE's ``notAfter`` is a genuine EE-certificate notAfter and keeps the
+# ladder. If you add a source, measure its distribution before listing
+# it here — the failure mode is silent and total.
+_LIFETIME_VALIDITY_SOURCES = frozenset({"ripe"})
+
+
+def _derive_roa_state(valid_to: datetime | None, now: datetime, source: str) -> str:
+    """Map ``valid_to`` → ROA state.
+
+    ``None`` (unknown window) maps to ``valid`` so we don't fire
+    spurious alerts on mirrors that don't expose the X.509 notAfter
+    field. A source whose validity field is a short-cycle cache expiry
+    rather than a lifetime is treated the same way, and for the same
+    reason — see :data:`_LIFETIME_VALIDITY_SOURCES`.
     """
-    if valid_to is None:
+    if valid_to is None or source not in _LIFETIME_VALIDITY_SOURCES:
         return "valid"
     if valid_to <= now:
         return "expired"
@@ -111,7 +140,7 @@ async def _refresh_one_asn(
 
         key = (str(prefix), int(max_length), trust_anchor or None)
         seen_keys.add(key)
-        new_state = _derive_roa_state(valid_to, now)
+        new_state = _derive_roa_state(valid_to, now, source)
 
         existing = existing_index.get(key)
         if existing is None:

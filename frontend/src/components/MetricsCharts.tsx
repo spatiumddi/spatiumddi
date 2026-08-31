@@ -44,9 +44,13 @@ const WINDOWS: { key: MetricsWindow; label: string }[] = [
 
 const ALL_SERVERS = "__all__";
 
-function formatT(iso: string, bucketSeconds: number): string {
+// Tick labels key off the WINDOW, not the bucket size: a 24 h window
+// aggregated into 5 min buckets is still one day of data, and stamping
+// the date on every tick there is noise. Only the multi-day window
+// needs it to disambiguate.
+function formatT(iso: string, win: MetricsWindow): string {
   const d = new Date(iso);
-  if (bucketSeconds >= 300) {
+  if (win === "7d") {
     return d.toLocaleString([], {
       month: "short",
       day: "numeric",
@@ -131,7 +135,7 @@ export function DNSQueryRateCard({
   });
 
   const points = (data?.points ?? []).map((p) => ({
-    t: formatT(p.t, data?.bucket_seconds ?? 60),
+    t: formatT(p.t, win),
     queries: perSecond(p.queries_total, data?.bucket_seconds ?? 60),
     noerror: perSecond(p.noerror, data?.bucket_seconds ?? 60),
     nxdomain: perSecond(p.nxdomain, data?.bucket_seconds ?? 60),
@@ -266,7 +270,7 @@ export function DHCPTrafficCard({
   });
 
   const points = (data?.points ?? []).map((p) => ({
-    t: formatT(p.t, data?.bucket_seconds ?? 60),
+    t: formatT(p.t, win),
     discover: perSecond(p.discover, data?.bucket_seconds ?? 60),
     request: perSecond(p.request, data?.bucket_seconds ?? 60),
     ack: perSecond(p.ack, data?.bucket_seconds ?? 60),

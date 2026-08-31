@@ -7,9 +7,12 @@ the agents (see `app.api.v1.{dns,dhcp}.agents.agent_metrics`); this
 module is read-only.
 
 Window → bucket selection is auto-scaled so charts stay readable:
-short windows (≤ 24 h) return raw 60 s rows, longer windows aggregate
-server-side into 5 min buckets. That keeps 7-day charts under 2k
-points without losing shape.
+short windows (< 24 h) return raw 60 s rows, 24 h and longer aggregate
+server-side into 5 min buckets. The ceiling is the chart's pixel width,
+not a row budget — 24 h of raw 60 s rows is 1,440 points into a
+~1,300 px plot, i.e. more points than pixels, which paints a jittery
+low-rate series as a solid filled band rather than a line. At 300 s
+that window is 288 points and legible; 7 d is 2,016.
 """
 
 from __future__ import annotations
@@ -36,8 +39,13 @@ WINDOW_SECONDS = {
 
 
 def _bucket_seconds_for(window: str) -> int:
-    """Pick an aggregation bucket that keeps charts under ~2k points."""
-    if WINDOW_SECONDS[window] > 24 * 3600:
+    """Pick an aggregation bucket that keeps a window under ~300 plotted points.
+
+    The bound that matters is the chart's pixel width, not a row budget:
+    more points than pixels renders a line as a solid band. 24 h is the
+    crossover — at raw 60 s it is 1,440 points, at 300 s it is 288.
+    """
+    if WINDOW_SECONDS[window] >= 24 * 3600:
         return 300  # 5 min
     return 60
 

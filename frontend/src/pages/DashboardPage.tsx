@@ -190,7 +190,56 @@ function UtilColor(percent: number): string {
   return "bg-muted/60 dark:bg-muted/40";
 }
 
-function UtilizationBar({ percent }: { percent: number }) {
+/** True for an IPv6 prefix, whose capacity numbers are not comparable
+ *  to a v4 subnet's and must not be rendered as if they were. */
+function isV6(network: string): boolean {
+  return network.includes(":");
+}
+
+/**
+ * Capacity label for one subnet row (#942).
+ *
+ * A v6 prefix's ``total_ips`` is astronomical: a /64 is 2^64, which
+ * crosses `Number.MAX_SAFE_INTEGER` on the way through JSON and renders
+ * as "9223372036854776000" — a number that is both wrong and wide
+ * enough to wrap the row. The page already refuses to fold v6 into the
+ * aggregate totals for exactly this reason (see the reportingV4 /
+ * reportingV6 split); rows follow the same rule and show the allocation
+ * count alone, which is the only half that means anything.
+ */
+function capacityLabel(subnet: {
+  network: string;
+  allocated_ips: number;
+  total_ips: number;
+}): string {
+  if (isV6(subnet.network)) {
+    return `${subnet.allocated_ips.toLocaleString()} alloc`;
+  }
+  return `${subnet.allocated_ips.toLocaleString()} / ${subnet.total_ips.toLocaleString()}`;
+}
+
+function UtilizationBar({
+  percent,
+  network,
+}: {
+  percent: number;
+  /** When this is a v6 prefix the bar renders n/a: "0%" of a /64 is
+   *  true, useless, and indistinguishable from an empty v4 subnet. */
+  network?: string;
+}) {
+  if (network && isV6(network)) {
+    return (
+      <div className="flex items-center gap-2">
+        <div className="h-1.5 flex-1 rounded-full bg-muted/40" />
+        <span
+          className="w-10 text-right text-xs text-muted-foreground/50"
+          title="Utilization is not meaningful for an IPv6 prefix"
+        >
+          n/a
+        </span>
+      </div>
+    );
+  }
   return (
     <div className="flex items-center gap-2">
       <div className="h-1.5 flex-1 rounded-full bg-muted overflow-hidden">
@@ -290,7 +339,11 @@ function SubnetHeatmap({ subnets }: { subnets: Subnet[] }) {
             <Link
               key={s.id}
               to={`/ipam?subnet=${s.id}`}
-              title={`${s.network}${s.name ? ` — ${s.name}` : ""}\n${s.utilization_percent.toFixed(1)}% · ${s.allocated_ips} / ${s.total_ips}`}
+              title={`${s.network}${s.name ? ` — ${s.name}` : ""}\n${
+                isV6(s.network)
+                  ? capacityLabel(s)
+                  : `${s.utilization_percent.toFixed(1)}% · ${capacityLabel(s)}`
+              }`}
               className={cn(
                 "aspect-square rounded transition-all hover:scale-110 hover:ring-2 hover:ring-primary/40",
                 UtilColor(s.utilization_percent),
@@ -1241,6 +1294,19 @@ export function DashboardPage() {
     refetchInterval: 30_000,
   });
 
+  // Open alert events (#942). Drives BOTH the header pill and the
+  // Overview "Open alerts" panel — one query key, one fetch. The pill
+  // used to render `critical + warning + unhealthyServers` computed on
+  // this page and link to /ipam: a count the alerts page could not
+  // corroborate, pointing at a page unrelated to most of what it
+  // counted. Capacity + server health still drive the health LABEL
+  // next to the title, which is what they actually describe.
+  const { data: openAlerts = [] } = useQuery({
+    queryKey: ["alert-events", { open: true }],
+    queryFn: () => alertsApi.listEvents({ open_only: true, limit: 200 }),
+    refetchInterval: 60_000,
+  });
+
   // IPAM-tab IP-space filter (issue #115). Multi-select dropdown above
   // the IPAM-tab cards scopes every subnet-derived stat to the chosen
   // spaces. Empty list = "All spaces" (no filter). Persisted per-session
@@ -1293,25 +1359,55 @@ export function DashboardPage() {
     ...allDnsServers.map((s) => ({ ...s, kind: "dns" as const })),
     ...dhcpServers.map((s) => ({ ...s, kind: "dhcp" as const })),
   ];
-  const unhealthyServers = allServers.filter(
+  // A server the operator has deliberately paused or put into
+  // maintenance is not a fault, and counting one as unhealthy pins the
+  // whole dashboard to "degraded" for as long as it stays parked
+  // (#942). Maintenance mode is the load-bearing half: #182 already
+  // suppresses the heartbeat-stale ALERT server-side for those, so
+  // counting them here contradicted our own alerting. ``is_enabled``
+  // is DNS-only — DHCP servers have no pause switch — hence the kind
+  // narrowing rather than a bare property read.
+  const supervisedServers = allServers.filter(
+    (s) => !s.maintenance_mode && (s.kind !== "dns" || s.is_enabled !== false),
+  );
+  const unhealthyServers = supervisedServers.filter(
     (s) => s.status === "unreachable" || s.status === "error",
   ).length;
-  const activeServers = allServers.filter((s) => s.status === "active").length;
+  const activeServers = supervisedServers.filter(
+    (s) => s.status === "active",
+  ).length;
+  // #882 — an agent that failed to apply its config keeps serving and
+  // keeps heartbeating, so ``status``, the health check and
+  // ``last_seen_at`` all read normal while the saved zone or scope is
+  // live nowhere. That is exactly the silent failure the dashboard
+  // should catch, so a failing verdict degrades the header even when
+  // the server is otherwise healthy. NULL is UNKNOWN, never ok — an
+  // agent too old to report is where a silent revert would hide, so it
+  // is deliberately not counted as a failure either.
+  const configFailedServers = supervisedServers.filter(
+    (s) => s.config_apply_status != null && s.config_apply_status !== "ok",
+  ).length;
 
-  // Aggregate alerts — shown as a pill next to the title.
-  const alertCount = critical + warning + unhealthyServers;
-  const healthTone: Tone =
-    unhealthyServers > 0 || critical > 0
-      ? "bad"
-      : warning > 0
-        ? "warn"
-        : "good";
-  const healthLabel =
-    unhealthyServers > 0 || critical > 0
-      ? "degraded"
-      : warning > 0
-        ? "near capacity"
-        : "healthy";
+  const degraded = unhealthyServers > 0 || configFailedServers > 0 || critical > 0;
+  const healthTone: Tone = degraded ? "bad" : warning > 0 ? "warn" : "good";
+  const healthLabel = degraded
+    ? "degraded"
+    : warning > 0
+      ? "near capacity"
+      : "healthy";
+  // The label is a rollup of four unrelated things; without this the
+  // operator sees "degraded" and has no idea which one to chase.
+  const healthDetail =
+    [
+      critical > 0 ? `${critical} subnet${critical === 1 ? "" : "s"} ≥95% full` : null,
+      warning > 0 ? `${warning} subnet${warning === 1 ? "" : "s"} ≥80% full` : null,
+      unhealthyServers > 0 ? `${unhealthyServers} server${unhealthyServers === 1 ? "" : "s"} unreachable` : null,
+      configFailedServers > 0
+        ? `${configFailedServers} agent${configFailedServers === 1 ? "" : "s"} failed to apply config`
+        : null,
+    ]
+      .filter(Boolean)
+      .join(" · ") || "No capacity or server-health problems detected";
 
   return (
     <div className="h-full overflow-auto p-6">
@@ -1330,7 +1426,10 @@ export function DashboardPage() {
                 {subnets?.length ?? 0} subnet{subnets?.length === 1 ? "" : "s"}
               </span>
               <span>·</span>
-              <span className="inline-flex items-center gap-1.5">
+              <span
+                className="inline-flex cursor-help items-center gap-1.5"
+                title={healthDetail}
+              >
                 <span
                   className={cn(
                     "inline-block h-1.5 w-1.5 rounded-full",
@@ -1351,40 +1450,37 @@ export function DashboardPage() {
                 onChange={setIpamSpaceFilter}
               />
             )}
-            {alertCount > 0 && (
+            {openAlerts.length > 0 && (
               <Link
-                to="/ipam"
+                to="/admin/alerts"
+                title={`${openAlerts.length} unresolved alert event${
+                  openAlerts.length === 1 ? "" : "s"
+                } — open the Alerts page to triage`}
                 className={cn(
                   "inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs font-medium",
-                  "border-red-200 bg-red-50 text-red-700 dark:border-red-900/50 dark:bg-red-950/30 dark:text-red-400",
-                  "hover:bg-red-100 dark:hover:bg-red-950/50",
+                  openAlerts.some((e) => e.severity === "critical")
+                    ? "border-red-200 bg-red-50 text-red-700 dark:border-red-900/50 dark:bg-red-950/30 dark:text-red-400 hover:bg-red-100 dark:hover:bg-red-950/50"
+                    : "border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-950/50",
                 )}
               >
                 <AlertTriangle className="h-3.5 w-3.5" />
-                {alertCount} alert{alertCount === 1 ? "" : "s"} open
+                {openAlerts.length} alert{openAlerts.length === 1 ? "" : "s"}{" "}
+                open
               </Link>
             )}
+            {/* Blanket invalidate, deliberately (#942). This used to
+                enumerate twelve query keys, which covered the Overview and
+                missed every panel on the Network / Integrations /
+                Compliance / Conformity / Security tabs plus most of the
+                Overview summary cards — pressing Refresh on five of the
+                nine tabs did nothing at all. An allowlist on a button whose
+                whole contract is "reload everything on this page" can only
+                drift as panels are added; the correct scope is the page,
+                and React Query only refetches what is mounted. */}
             <button
               type="button"
-              onClick={() => {
-                for (const key of [
-                  ["spaces"],
-                  ["subnets"],
-                  ["settings"],
-                  ["dns-groups"],
-                  ["dns-zones"],
-                  ["dns-servers"],
-                  ["dhcp-servers"],
-                  ["dhcp-groups"],
-                  ["audit", "recent"],
-                  ["metrics"],
-                  ["nat-mappings", "count"],
-                  ["platform-health"],
-                ]) {
-                  qc.invalidateQueries({ queryKey: key });
-                }
-              }}
-              title="Reload every panel on the dashboard — IPAM, DNS, DHCP, activity feed, metrics charts."
+              onClick={() => void qc.invalidateQueries()}
+              title="Reload every panel on the dashboard."
               className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs font-medium hover:bg-accent"
             >
               <RefreshCw className="h-3.5 w-3.5" />
@@ -1709,10 +1805,11 @@ export function DashboardPage() {
                         <div className="flex-1">
                           <UtilizationBar
                             percent={subnet.utilization_percent}
+                            network={subnet.network}
                           />
                         </div>
-                        <span className="w-20 text-right text-[11px] tabular-nums text-muted-foreground">
-                          {subnet.allocated_ips} / {subnet.total_ips}
+                        <span className="w-24 shrink-0 whitespace-nowrap text-right text-[11px] tabular-nums text-muted-foreground">
+                          {capacityLabel(subnet)}
                         </span>
                       </Link>
                     ))
@@ -1814,10 +1911,13 @@ export function DashboardPage() {
                       )}
                     </span>
                     <div className="flex-1">
-                      <UtilizationBar percent={subnet.utilization_percent} />
+                      <UtilizationBar
+                        percent={subnet.utilization_percent}
+                        network={subnet.network}
+                      />
                     </div>
-                    <span className="w-24 text-right text-[11px] tabular-nums text-muted-foreground">
-                      {subnet.allocated_ips} / {subnet.total_ips}
+                    <span className="w-28 shrink-0 whitespace-nowrap text-right text-[11px] tabular-nums text-muted-foreground">
+                      {capacityLabel(subnet)}
                     </span>
                   </Link>
                 ))
@@ -3630,13 +3730,7 @@ function NetworkPanel() {
           tone={data.asn_drift_count > 0 ? "warn" : "good"}
           to="/network/asns"
         />
-        <NetworkKpi
-          label="RPKI expiring"
-          value={data.rpki_expiring_count}
-          tone={data.rpki_expiring_count > 0 ? "warn" : "good"}
-          to="/network/asns"
-          hint="< 30 d"
-        />
+        <RpkiExpiringKpi data={data} />
         <NetworkKpi
           label="RPKI expired"
           value={data.rpki_expired_count}
@@ -3803,23 +3897,82 @@ function NetworkPanel() {
   );
 }
 
+/**
+ * RPKI "expiring soon" KPI (#942).
+ *
+ * Three states, because a bare count answered the wrong question. An
+ * empty ROA table and a healthy one both rendered a green 0, and a pull
+ * that stopped days ago rendered whatever it last wrote as though it
+ * were current. The count is only meaningful if the data behind it is
+ * fresh, so freshness is checked first and reported instead of the
+ * count when it fails.
+ *
+ * The threshold is 24 h against a default refresh interval of 4 h (beat
+ * ticks hourly) — six missed cycles, generous enough not to flap on a
+ * slow sweep and short enough to notice a dead task the same day.
+ */
+function RpkiExpiringKpi({ data }: { data: NetworkDashboardSummary }) {
+  const STALE_AFTER_MS = 24 * 60 * 60 * 1000;
+  const checkedAt = data.rpki_last_checked_at;
+  const ageMs = checkedAt ? Date.now() - new Date(checkedAt).getTime() : null;
+  const stale = ageMs != null && ageMs > STALE_AFTER_MS;
+
+  if (data.rpki_total_count === 0) {
+    return (
+      <NetworkKpi
+        label="RPKI expiring"
+        value="—"
+        tone="default"
+        to="/network/asns"
+        hint="no ROAs tracked"
+        title="No RPKI ROAs have been pulled yet. Add a public ASN and the hourly refresh will populate them."
+      />
+    );
+  }
+  if (stale || checkedAt === null) {
+    return (
+      <NetworkKpi
+        label="RPKI expiring"
+        value="stale"
+        tone="warn"
+        to="/network/asns"
+        hint={checkedAt ? `checked ${humanTime(checkedAt)}` : "never checked"}
+        title={`The ROA refresh has not run recently, so any count here would be fiction. ${data.rpki_total_count} ROAs tracked.`}
+      />
+    );
+  }
+  return (
+    <NetworkKpi
+      label="RPKI expiring"
+      value={data.rpki_expiring_count}
+      tone={data.rpki_expiring_count > 0 ? "warn" : "good"}
+      to="/network/asns"
+      hint={`< 30 d · of ${data.rpki_total_count.toLocaleString()} · checked ${humanTime(checkedAt)}`}
+      title="ROAs inside 30 days of their certificate expiry. Only sources whose validity field is a per-ROA lifetime contribute — Cloudflare's rpki.json ships a short-cycle cache expiry that every ROA carries, so it is deliberately not counted here."
+    />
+  );
+}
+
 function NetworkKpi({
   label,
   value,
   tone,
   to,
   hint,
+  title,
 }: {
   label: string;
   value: number | string;
   tone: Tone;
   to: string;
   hint?: string;
+  title?: string;
 }) {
   const cls = TONE_CLASS[tone];
   return (
     <Link
       to={to}
+      title={title}
       className="rounded-lg border bg-card p-3 transition-colors hover:bg-accent/40"
     >
       <p className="text-[11px] uppercase tracking-wider text-muted-foreground">
@@ -3873,8 +4026,7 @@ function IntegrationsDashboardTabPanel() {
           >
             Features → Integrations
           </Link>{" "}
-          to wire up Kubernetes / Docker / Proxmox / OPNsense / Cloud /
-          Tailscale / UniFi mirrors.
+          to enable read-only infrastructure mirrors.
         </p>
       </div>
     );
@@ -4024,17 +4176,29 @@ function IntegrationCard({ panel }: { panel: IntegrationsDashboardPanel }) {
  * say which one you mean, and only one of them is reassuring.
  */
 function DNSThreatCard() {
+  // Gate the QUERY on the module, not just the render (#942). Hiding
+  // the card on a 404 still fired the request — and with a 60 s
+  // refetch, that is a console error every minute forever on every
+  // install with the module off. The 404 handling below stays as a
+  // backstop for the module being turned off while the page is open.
+  // ``ready &&`` is load-bearing, not belt-and-braces: ``enabled``
+  // optimistically returns true until the module set has loaded, so
+  // gating on it alone still fires one 404 per hard page load — see
+  // the hook's own docstring.
+  const { enabled, ready } = useFeatureModules();
+  const moduleEnabled = ready && enabled("security.dns_threat");
   const { data, isLoading, error } = useQuery({
     queryKey: ["dashboards", "dns-threat"],
     queryFn: () => dnsThreatApi.summary({ hours: 24 }),
     refetchInterval: 60_000,
     retry: false,
+    enabled: moduleEnabled,
   });
 
   const moduleOff =
     (error as { response?: { status?: number } } | null)?.response?.status ===
     404;
-  if (moduleOff || isLoading) return null;
+  if (!moduleEnabled || moduleOff || isLoading) return null;
   if (!data) return null;
 
   const tone: Tone = !data.has_data
