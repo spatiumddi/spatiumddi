@@ -249,8 +249,13 @@ def generate_csr_and_key(
     want IP SANs Just Work.
 
     Raises:
-        TLSValidationError: invalid key_type, no common_name, or
-            (theoretically unreachable) a cryptography library error.
+        TLSValidationError: invalid key_type, no common_name, or a
+            subject/SAN that X.509 itself refuses — a CommonName over
+            64 BYTES (the request schema bounds characters, so a long
+            or multibyte CN passes validation and fails here) or a SAN
+            that is not an IDNA A-label. Not theoretical: both are
+            reachable from the request body, and both were 500s until
+            they were translated into this error.
     """
     if key_type not in KEY_TYPES:
         raise TLSValidationError(
@@ -259,8 +264,6 @@ def generate_csr_and_key(
     cn = subject.common_name.strip()
     if not cn:
         raise TLSValidationError("common_name is required")
-
-    private_key = _generate_private_key(key_type)
 
     # ``x509.NameAttribute``/``x509.DNSName`` enforce X.509's own limits that
     # the request schema cannot fully express — a CommonName is capped at 64
@@ -295,6 +298,11 @@ def generate_csr_and_key(
             )
     except ValueError as exc:
         raise TLSValidationError(f"invalid subject or SAN: {exc}") from exc
+
+    # After the subject/SAN gate, not before: an RSA-4096 keygen is the most
+    # expensive thing this function does, and a request destined for a 422
+    # should not pay for one.
+    private_key = _generate_private_key(key_type)
 
     # RSA + ECDSA use SHA-256; Ed25519/Ed448 don't take a hash arg, but
     # we don't generate those here (no public CA supports them yet so

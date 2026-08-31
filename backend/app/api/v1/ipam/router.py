@@ -2483,7 +2483,7 @@ class AliasInput(BaseModel):
         return v
 
 
-def _validate_role(v: str | None) -> str | None:
+def _validate_role(v: Any) -> Any:
     """Reject role values outside the curated ``IP_ROLES`` set.
 
     Empty string is normalised to None so the modal can submit a
@@ -2564,7 +2564,7 @@ class IPAddressCreate(BaseModel):
 
     @field_validator("role", mode="before")
     @classmethod
-    def validate_role(cls, v: str | None) -> str | None:
+    def validate_role(cls, v: Any) -> Any:
         return _validate_role(v)
 
 
@@ -2619,7 +2619,7 @@ class IPAddressUpdate(BaseModel):
 
     @field_validator("role", mode="before")
     @classmethod
-    def validate_role(cls, v: str | None) -> str | None:
+    def validate_role(cls, v: Any) -> Any:
         return _validate_role(v)
 
 
@@ -2785,7 +2785,7 @@ class NextIPRequest(BaseModel):
 
     @field_validator("role", mode="before")
     @classmethod
-    def validate_role(cls, v: str | None) -> str | None:
+    def validate_role(cls, v: Any) -> Any:
         return _validate_role(v)
 
 
@@ -9378,7 +9378,7 @@ class IPAddressBulkChanges(BaseModel):
 
     @field_validator("role", mode="before")
     @classmethod
-    def _validate_role(cls, v: str | None) -> str | None:
+    def _validate_role(cls, v: Any) -> Any:
         return _validate_role(v)
 
 
