@@ -72,6 +72,7 @@ import {
   type DNSServer,
   type DHCPServer,
   type DHCPServerGroup,
+  type DNSServerGroup,
   type KubernetesCluster,
   type DockerHost,
   type ProxmoxNode,
@@ -515,6 +516,119 @@ function StatusChip({
     >
       {label}
     </span>
+  );
+}
+
+/**
+ * Agents needing attention (#942).
+ *
+ * The KPI card above counts these; this names them. A card reading "4
+ * agents needing attention" that navigates to a page which does not show
+ * those four is the same defect as the old alerts pill, and here no
+ * single link can be honest — the set spans DNS and DHCP servers across
+ * different groups, and both pages restore their last-visited selection,
+ * so a bare `/dns` lands on whatever zone the operator was reading last.
+ *
+ * Each row therefore deep-links to the group whose server list contains
+ * that server: DNSPage restores from ``group`` (defaulting to its servers
+ * tab) and DHCPPage from ``group``.
+ */
+function AttentionAgentsPanel({
+  servers,
+  dnsGroups,
+  dhcpGroups,
+}: {
+  servers: {
+    id: string;
+    name: string;
+    status: string;
+    kind: "dns" | "dhcp";
+    group_id?: string;
+    server_group_id?: string | null;
+    config_apply_status?: ConfigApplyStatus | null;
+    config_apply_error?: string | null;
+  }[];
+  dnsGroups: DNSServerGroup[];
+  dhcpGroups: DHCPServerGroup[];
+}) {
+  function groupFor(s: (typeof servers)[number]): {
+    id: string | null;
+    name: string;
+  } {
+    if (s.kind === "dns") {
+      const g = dnsGroups.find((x) => x.id === s.group_id);
+      return { id: g?.id ?? null, name: g?.name ?? "ungrouped" };
+    }
+    const g = dhcpGroups.find((x) => x.id === s.server_group_id);
+    return { id: g?.id ?? null, name: g?.name ?? "ungrouped" };
+  }
+
+  return (
+    <div className="rounded-lg border bg-card">
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b px-4 py-2.5">
+        <div className="flex items-center gap-2">
+          <Cpu className="h-3.5 w-3.5 text-red-500" />
+          <h3 className="text-xs font-semibold uppercase tracking-wider">
+            Agents needing attention ({servers.length})
+          </h3>
+          <span className="text-[11px] text-muted-foreground">
+            paused and maintenance-mode servers excluded
+          </span>
+        </div>
+      </div>
+      <div className="overflow-x-auto">
+        <div className="min-w-[520px] divide-y">
+          {servers.map((s) => {
+            const group = groupFor(s);
+            const to =
+              group.id === null
+                ? s.kind === "dns"
+                  ? "/dns"
+                  : "/dhcp"
+                : `/${s.kind}?group=${group.id}`;
+            const unreachable =
+              s.status === "unreachable" || s.status === "error";
+            return (
+              <Link
+                key={`${s.kind}-${s.id}`}
+                to={to}
+                className="flex items-center gap-3 px-4 py-2 text-[11px] transition-colors hover:bg-accent/40"
+              >
+                <span className="inline-block h-1.5 w-1.5 flex-shrink-0 rounded-full bg-red-500" />
+                <span
+                  className="w-40 flex-shrink-0 truncate font-semibold"
+                  title={s.name}
+                >
+                  {s.name}
+                </span>
+                <span className="w-12 flex-shrink-0 uppercase text-muted-foreground">
+                  {s.kind}
+                </span>
+                <span
+                  className="w-32 flex-shrink-0 truncate text-muted-foreground"
+                  title={group.name}
+                >
+                  {group.name}
+                </span>
+                <span className="flex flex-1 flex-wrap items-center gap-1.5">
+                  {unreachable && (
+                    <StatusChip
+                      tone="red"
+                      label={s.status}
+                      title="The health probe cannot reach this server."
+                    />
+                  )}
+                  <ConfigApplyChip
+                    status={s.config_apply_status ?? null}
+                    error={s.config_apply_error}
+                  />
+                </span>
+              </Link>
+            );
+          })}
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -1584,6 +1698,18 @@ export function DashboardPage() {
   const configFailedServers = supervisedServers.filter(
     (s) => s.config_apply_status != null && s.config_apply_status !== "ok",
   ).length;
+  // The actual offenders, not just how many. "4 agents needing attention"
+  // that navigates to a page which does not name those four is the same
+  // defect as the old alerts pill — and here no single link can be
+  // honest, because the set spans DNS and DHCP servers across different
+  // groups. So the Overview names them and each row deep-links to the
+  // group whose server list contains it.
+  const attentionServers = supervisedServers.filter(
+    (s) =>
+      s.status === "unreachable" ||
+      s.status === "error" ||
+      (s.config_apply_status != null && s.config_apply_status !== "ok"),
+  );
 
   const degraded =
     unhealthyServers > 0 || configFailedServers > 0 || critical > 0;
@@ -1771,7 +1897,6 @@ export function DashboardPage() {
               }
               icon={Cpu}
               tone={unhealthyServers + configFailedServers > 0 ? "bad" : "good"}
-              to="/dns"
             />
             <KpiCard
               label="Capacity pressure"
@@ -1885,6 +2010,16 @@ export function DashboardPage() {
               tone={unhealthyServers > 0 ? "bad" : "default"}
             />
           </div>
+        )}
+
+        {tab === "overview" && attentionServers.length > 0 && (
+          <WidgetErrorBoundary title="Agents needing attention">
+            <AttentionAgentsPanel
+              servers={attentionServers}
+              dnsGroups={dnsGroups}
+              dhcpGroups={dhcpGroups}
+            />
+          </WidgetErrorBoundary>
         )}
 
         {tab === "overview" && (
