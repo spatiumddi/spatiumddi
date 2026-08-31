@@ -8,7 +8,7 @@ import re
 import uuid
 import zipfile
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Self
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -110,6 +110,12 @@ from app.services.dns.resolver_presets import (
 )
 from app.services.dns.serial import bump_zone_serial
 from app.services.dns.server_move import ServerMoveError, move_server_to_group
+from app.services.dns.zone_move import (
+    ZoneMoveError,
+    ZoneMovePlan,
+)
+from app.services.dns.zone_move import commit_move as commit_zone_move
+from app.services.dns.zone_move import preview_move as preview_zone_move
 from app.services.dns.zone_templates import (
     get_template,
     list_templates,
@@ -5531,6 +5537,210 @@ async def rollover_zone_dnssec_key(
     return {"status": "queued", "zone_id": str(zone.id), "key_tag": body.key_tag}
 
 
+# ── Zone move between server groups (issue #935) ────────────────────────────
+#
+# Preview → commit, like the IPAM block move, because none of the
+# consequences are guessable from the request. The heavy lifting lives in
+# ``app.services.dns.zone_move``; the handlers parse, call, audit, commit.
+
+
+class ZoneMovePreviewRequest(BaseModel):
+    target_group_id: uuid.UUID
+
+
+class ZoneMovePreviewResponse(BaseModel):
+    zone_id: uuid.UUID
+    zone_name: str
+    source_group_id: uuid.UUID
+    source_group_name: str
+    target_group_id: uuid.UUID
+    target_group_name: str
+    source_has_views: bool
+    target_has_views: bool
+    zone_view_action: str
+    zone_view_from: str | None
+    records_total: int
+    records_remapped: int
+    records_widened: int
+    records_cleared_inert: int
+    records_widened_by_view: dict[str, int]
+    acl_rows_remapped: int
+    acl_keys_lost: list[str]
+    pools_repointed: int
+    zone_state_rows: int
+    pending_ops: int
+    dnssec_signed: bool
+    dnssec_key_count: int
+    acme_accounts: int
+    source_drivers: list[str]
+    target_drivers: list[str]
+    name_collision: bool
+    dnssec_unsupported_drivers: list[str]
+    acl_names_remapped: list[str]
+    acl_names_lost: list[str]
+    warnings: list[str]
+    required_acknowledgements: list[str]
+
+    @classmethod
+    def from_plan(cls, plan: ZoneMovePlan) -> Self:
+        return cls(
+            zone_id=plan.zone_id,
+            zone_name=plan.zone_name,
+            source_group_id=plan.source_group_id,
+            source_group_name=plan.source_group_name,
+            target_group_id=plan.target_group_id,
+            target_group_name=plan.target_group_name,
+            source_has_views=plan.source_has_views,
+            target_has_views=plan.target_has_views,
+            zone_view_action=plan.zone_view_action,
+            zone_view_from=plan.zone_view_from,
+            records_total=plan.records_total,
+            records_remapped=plan.records_remapped,
+            records_widened=plan.records_widened,
+            records_cleared_inert=plan.records_cleared_inert,
+            records_widened_by_view=plan.records_widened_by_view,
+            acl_rows_remapped=plan.acl_rows_remapped,
+            acl_keys_lost=plan.acl_keys_lost,
+            pools_repointed=plan.pools_repointed,
+            zone_state_rows=plan.zone_state_rows,
+            pending_ops=plan.pending_ops,
+            dnssec_signed=plan.dnssec_signed,
+            dnssec_key_count=plan.dnssec_key_count,
+            acme_accounts=plan.acme_accounts,
+            source_drivers=plan.source_drivers,
+            target_drivers=plan.target_drivers,
+            name_collision=plan.name_collision,
+            dnssec_unsupported_drivers=plan.dnssec_unsupported_drivers,
+            acl_names_remapped=plan.acl_names_remapped,
+            acl_names_lost=plan.acl_names_lost,
+            warnings=plan.warnings,
+            required_acknowledgements=plan.required_acknowledgements,
+        )
+
+
+class ZoneMoveCommitRequest(ZoneMovePreviewRequest):
+    #: Must equal the zone name. Guards against a mis-clicked row, the
+    #: same way the IPAM block move takes a typed CIDR.
+    confirmation_zone_name: str
+    #: Consequences the operator has accepted — the keys the preview
+    #: returned in ``required_acknowledgements``. Anything the plan
+    #: demands and this omits is a 422 rather than a silent apply.
+    acknowledgements: list[str] = []
+
+
+class ZoneMoveCommitResponse(ZoneMovePreviewResponse):
+    moved: bool = True
+    target_tsig_key_generated: bool = False
+
+
+@router.post(
+    "/groups/{group_id}/zones/{zone_id}/move/preview",
+    response_model=ZoneMovePreviewResponse,
+)
+async def move_zone_preview(
+    group_id: uuid.UUID,
+    zone_id: uuid.UUID,
+    body: ZoneMovePreviewRequest,
+    db: DB,
+    current_user: SuperAdmin,
+) -> ZoneMovePreviewResponse:
+    """Report exactly what moving this zone to another group would do.
+
+    Pure read — nothing is written, so it is safe to call repeatedly while
+    the operator decides. The commit re-derives the same plan inside its
+    lock rather than trusting this one.
+    """
+    zone = await _require_zone(group_id, zone_id, db, current_user)
+    # Refused here as well as on commit: an operator should learn that an
+    # integration owns this zone while reading the plan, not after filling
+    # the modal in.
+    _reject_if_synthesised_zone(zone, "move")
+    target_group = await _require_group(body.target_group_id, db)
+    try:
+        plan = await preview_zone_move(db, zone, target_group)
+    except ZoneMoveError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    return ZoneMovePreviewResponse.from_plan(plan)
+
+
+@router.post(
+    "/groups/{group_id}/zones/{zone_id}/move/commit",
+    response_model=ZoneMoveCommitResponse,
+)
+async def move_zone_commit(
+    group_id: uuid.UUID,
+    zone_id: uuid.UUID,
+    body: ZoneMoveCommitRequest,
+    db: DB,
+    current_user: SuperAdmin,
+) -> ZoneMoveCommitResponse:
+    zone = await _require_zone(group_id, zone_id, db, current_user)
+    # A reconciler-owned zone is not the operator's to re-home — the next
+    # sync would recreate it in the group the integration is bound to.
+    _reject_if_synthesised_zone(zone, "move")
+    target_group = await _require_group(body.target_group_id, db)
+    # The same serviceability guard every create / update runs, applied to
+    # the group the zone is landing in: a forwarders-less forward zone on a
+    # Technitium group is accepted and then silently never created on the
+    # daemon (#743). A move is just another way to arrive there.
+    await _assert_forward_zone_serviceable(target_group.id, zone.zone_type, zone.forwarders, db)
+    source_group_id = zone.group_id
+    try:
+        plan = await commit_zone_move(
+            db,
+            zone,
+            target_group,
+            confirmation_zone_name=body.confirmation_zone_name,
+            acknowledgements=set(body.acknowledgements),
+        )
+    except ZoneMoveError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+    # Agentless drivers (windows_dns / cloud / technitium_api) hold the zone
+    # in a system the ConfigBundle never reaches, so the move has to be
+    # driven at both ends or the zone is left live-and-unmanaged on the old
+    # server and absent from the new one.
+    #
+    # CREATE FIRST, then delete. Either call failing raises 502 before the
+    # commit below, so the DB rolls back — and on that path a create-then-
+    # fail leaves the zone existing in both places (visible, fixable) where
+    # delete-then-fail would have removed it from the old server with the
+    # database still saying it lives there.
+    await _push_zone_to_agentless_servers(db, zone, "create", group_id=target_group.id)
+    await _push_zone_to_agentless_servers(db, zone, "delete", group_id=source_group_id)
+
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="move",
+            resource_type="dns_zone",
+            resource_id=str(zone.id),
+            resource_display=zone.name,
+            old_value={"group_id": str(plan.source_group_id)},
+            new_value={
+                "group_id": str(plan.target_group_id),
+                "zone_view_action": plan.zone_view_action,
+                "records_remapped": plan.records_remapped,
+                "records_widened": plan.records_widened,
+                "records_cleared_inert": plan.records_cleared_inert,
+                "acl_rows_remapped": plan.acl_rows_remapped,
+                "acl_keys_lost": plan.acl_keys_lost,
+                "pools_repointed": plan.pools_repointed,
+                "dnssec_signed": plan.dnssec_signed,
+                "acknowledgements": sorted(body.acknowledgements),
+            },
+            result="success",
+        )
+    )
+    await db.commit()
+    await db.refresh(zone)
+    resp = ZoneMoveCommitResponse.from_plan(plan)
+    resp.target_tsig_key_generated = plan.target_tsig_key_generated
+    return resp
+
+
 @router.delete("/groups/{group_id}/zones/{zone_id}", status_code=204, response_model=None)
 async def delete_zone(
     group_id: uuid.UUID,
@@ -5843,7 +6053,9 @@ async def apply_delegation(
     return created
 
 
-async def _push_zone_to_agentless_servers(db: DB, zone: DNSZone, op: str) -> None:
+async def _push_zone_to_agentless_servers(
+    db: DB, zone: DNSZone, op: str, group_id: uuid.UUID | None = None
+) -> None:
     """Push ``create`` / ``delete`` to every agentless-with-creds server.
 
     "Agentless" means ``windows_dns`` (WinRM Path B), the cloud DNS drivers
@@ -5860,9 +6072,13 @@ async def _push_zone_to_agentless_servers(db: DB, zone: DNSZone, op: str) -> Non
     """
     from app.drivers.dns import get_driver, is_agentless  # noqa: PLC0415
 
+    # ``group_id`` overrides the zone's own when the caller needs to drive
+    # a group the zone is not (yet / no longer) in — the #935 move pushes a
+    # create into the TARGET and a delete into the SOURCE, and the row can
+    # only be in one of them at a time.
     servers_res = await db.execute(
         select(DNSServer).where(
-            DNSServer.group_id == zone.group_id,
+            DNSServer.group_id == (group_id if group_id is not None else zone.group_id),
             DNSServer.credentials_encrypted.isnot(None),
         )
     )

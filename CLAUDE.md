@@ -765,6 +765,74 @@ suggestion, free-space treemap.
   to keep off the copilot. Not a feature module (#14) — it extends an
   existing resource rather than adding a top-level family.
 
+- ✅ [**A DNS zone cannot be moved between server groups**](https://github.com/spatiumddi/spatiumddi/issues/935)
+  — the other half of discussion #933, and a much sharper tool than the
+  #934 server move. A server carries state *about* a group; a zone
+  carries references *into* one — `DNSView`, `DNSTSIGKey`, `DNSAcl`,
+  `DNSPool` are all group-scoped. Preview → commit at
+  `POST …/zones/{id}/move/{preview,commit}`, service in
+  `services/dns/zone_move.py`, Move button on the zone detail. No
+  migration.
+  **The design turns on one property: clearing a view WIDENS exposure.**
+  Under split-horizon a record with `view_id` set renders in exactly that
+  view; one with NULL is *shared* and renders in **every** view
+  (`pool_geo.records_for_view`). So dropping a reference the target cannot
+  resolve does not remove the zone from a view, it adds it to all of them —
+  a zone that answered only on `internal` starts answering on `external`,
+  with no operator-visible symptom. Views and TSIG keys therefore remap
+  **by name** (a view called `internal` in each group is the operator's own
+  statement that the two mean the same thing), and where they cannot, the
+  move refuses until the widening is acknowledged. The issue text as filed
+  had this wrong — it treated clearing as a neutral tidy-up.
+  **Three acknowledgements, each its own checkbox** rather than one blanket
+  "I understand", or the DNSSEC warning gets accepted by someone who only
+  read the view one: `view_widening`; `dnssec_rollover` (the private keys
+  live on the *current* group's servers and do not move, so the target
+  signs from scratch and the DS at the registrar is wrong until
+  republished); `lost_update_grants` (a grant naming a TSIG key absent from
+  the target cannot be kept — `num_nonnulls(tsig_key_id, ip_cidr) = 1`
+  forbids clearing the key — so the row is deleted, which fails *closed*,
+  the safe direction, but not silently). Plus the zone name typed back, as
+  the IPAM block move takes a typed CIDR.
+  **The collision check runs against the RESOLVED view.** The constraint is
+  `(group_id, view_id, name)`, so a zone whose view is cleared lands at
+  `(target, NULL, name)` and can collide with an unviewed zone a
+  `(group, name)` check would have missed — while the same name in two
+  different views is not a collision at all, which is the entire point of
+  split-horizon.
+  Pools follow the zone (attached by `zone_id`, health-checked from the
+  control plane rather than the group's agents); per-server zone state and
+  queued ops are purged; a driver change **warns rather than refuses**,
+  unlike the server move, because a zone is data and BIND9 → PowerDNS is a
+  legitimate migration.
+  **Eight findings from /code-review, all confirmed, and they clustered:**
+  the move reassigned `group_id` but skipped validations every *other* path
+  into a group performs. An integration-owned zone could be moved out from
+  under its reconciler; agentless groups (`windows_dns` / cloud /
+  `technitium_api`) were driven at neither end, leaving the zone live and
+  unmanaged on the old server and absent from the new (now create-first,
+  so a failure leaves it in both places rather than in neither); a signed
+  zone could land on a group that cannot sign and read as signed forever
+  while served unsigned; a named ACL the target does not define becomes an
+  undefined symbol that makes BIND reject the file *whole*, stopping the
+  entire target group — and the module docstring had claimed `DNSAcl` was
+  handled when it was never imported; a forwarders-less forward zone could
+  reach a Technitium group (the #743 failure). Plus: the DNSSEC purge left
+  `dnssec_ds_records` stale, so the UI would name a DS for keys no server
+  holds (now `clear_dnssec_key_state`, the helper every other flag-off path
+  uses); and the view-remap SELECT was soft-delete filtered, so a deleted
+  record kept a source-group `view_id` — whose test then caught the fix
+  going into the plan scan but not the commit loop, i.e. the preview
+  counting rows the commit did not rewrite. The two new refusals are
+  deliberately **not** acknowledgement-waivable: an acknowledgement is for
+  a consequence the operator can see and accept, and neither of those
+  leaves a state they could inspect afterwards.
+  1 MCP tool (`preview_dns_zone_move`, read-only, default on) —
+  deliberately **no** commit tool per non-negotiable #13, since the
+  operation's safety rests on a human reading three consequences and typing
+  the zone name back, none of which survives being driven from a chat
+  window.
+
 #### DHCP-specific
 
 - ✅ [**DHCPv6 stateful + SLAAC config UI**](https://github.com/spatiumddi/spatiumddi/issues/52) — shipped `2026.06.04-1`: `DHCPScope.v6_address_mode` + `ra_managed_flag` / `ra_other_flag`; the Kea driver renders `subnet6` by mode (stateful → pools + options; stateless / SLAAC → options only). Migration `e4c1a8f63b29`.
