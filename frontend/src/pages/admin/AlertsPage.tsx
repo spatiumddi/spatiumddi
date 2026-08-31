@@ -622,6 +622,121 @@ export function AlertsPage() {
           </div>
         </div>
 
+        {/* ── Events (first, deliberately) ──────────────────────────
+              Events are what an operator acts on; rules are the
+              configuration that produces them. With a populated rule
+              table this section used to sit well below the fold, so
+              arriving here from the dashboard's "N alerts open" pill
+              landed on a screen of rules with the alerts themselves
+              off-screen — the pill's whole job is to show them (#942).
+              ``openOnly`` already defaults on, so this opens on
+              exactly what the pill counted. ─────────────────────── */}
+        <div className="rounded-lg border bg-card">
+          <div className="flex items-center justify-between border-b px-4 py-2.5">
+            <div className="flex items-center gap-2">
+              <AlertTriangle className="h-4 w-4 text-amber-500" />
+              <h2 className="text-sm font-semibold">Events</h2>
+              <span className="text-xs text-muted-foreground">
+                {events.length} shown
+              </span>
+            </div>
+            <label className="flex items-center gap-2 text-xs text-muted-foreground">
+              <input
+                type="checkbox"
+                checked={openOnly}
+                onChange={(e) => setOpenOnly(e.target.checked)}
+              />
+              Open only
+            </label>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead className="text-xs uppercase tracking-wider text-muted-foreground">
+                <tr className="border-b">
+                  <th className="px-4 py-2 text-left">Fired</th>
+                  <th className="px-4 py-2 text-left">Severity</th>
+                  <th className="px-4 py-2 text-left">Subject</th>
+                  <th className="px-4 py-2 text-left">Message</th>
+                  <th className="px-4 py-2 text-left">State</th>
+                  <th className="px-4 py-2" />
+                </tr>
+              </thead>
+              <tbody className={zebraBodyCls}>
+                {events.length === 0 && (
+                  <tr>
+                    <td
+                      colSpan={6}
+                      className="px-4 py-8 text-center text-xs text-muted-foreground"
+                    >
+                      {openOnly
+                        ? "No open events — all clear."
+                        : "No events yet."}
+                    </td>
+                  </tr>
+                )}
+                {events.map((ev) => (
+                  <tr key={ev.id} className="border-b">
+                    <td className="px-4 py-2 text-xs text-muted-foreground tabular-nums whitespace-nowrap">
+                      {new Date(ev.fired_at).toLocaleString()}
+                    </td>
+                    <td className="px-4 py-2">
+                      <SeverityBadge severity={ev.severity} />
+                    </td>
+                    <td className="px-4 py-2 text-xs">
+                      <span className="text-muted-foreground">
+                        {ev.subject_type}:
+                      </span>{" "}
+                      <span className="font-medium">{ev.subject_display}</span>
+                    </td>
+                    <td className="px-4 py-2 text-xs text-muted-foreground">
+                      {ev.message}
+                    </td>
+                    <td className="px-4 py-2">
+                      {ev.resolved_at ? (
+                        <span className="text-xs text-emerald-600 dark:text-emerald-400">
+                          resolved {new Date(ev.resolved_at).toLocaleString()}
+                        </span>
+                      ) : (
+                        <span className="text-xs text-amber-600 dark:text-amber-400">
+                          open
+                        </span>
+                      )}
+                    </td>
+                    <td className="px-4 py-2">
+                      <div className="flex items-center justify-end gap-1">
+                        <AskAIButton
+                          context={[
+                            `Alert event on ${ev.subject_type} ${ev.subject_display}`,
+                            `severity: ${ev.severity}`,
+                            `message: ${ev.message}`,
+                            `fired_at: ${ev.fired_at}`,
+                            ev.resolved_at
+                              ? `resolved_at: ${ev.resolved_at}`
+                              : "state: open",
+                            `event_id: ${ev.id}`,
+                          ].join(", ")}
+                          tooltip="Ask AI about this alert"
+                          prompt="Explain this alert — what tripped it, what it means, and the most likely remediation."
+                          iconOnly
+                          className="px-1.5 py-1"
+                        />
+                        {!ev.resolved_at && (
+                          <button
+                            onClick={() => resolve.mutate(ev.id)}
+                            className="rounded border px-2 py-0.5 text-[11px] hover:bg-accent"
+                          >
+                            Resolve
+                          </button>
+                        )}
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
         {/* ── Rules ───────────────────────────────────────────────────── */}
         <div className="rounded-lg border bg-card">
           <div className="flex items-center justify-between border-b px-4 py-2.5">
@@ -763,113 +878,6 @@ export function AlertsPage() {
                         >
                           <Trash2 className="h-3.5 w-3.5" />
                         </button>
-                      </div>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </div>
-
-        {/* ── Events ─────────────────────────────────────────────────── */}
-        <div className="rounded-lg border bg-card">
-          <div className="flex items-center justify-between border-b px-4 py-2.5">
-            <div className="flex items-center gap-2">
-              <AlertTriangle className="h-4 w-4 text-amber-500" />
-              <h2 className="text-sm font-semibold">Events</h2>
-              <span className="text-xs text-muted-foreground">
-                {events.length} shown
-              </span>
-            </div>
-            <label className="flex items-center gap-2 text-xs text-muted-foreground">
-              <input
-                type="checkbox"
-                checked={openOnly}
-                onChange={(e) => setOpenOnly(e.target.checked)}
-              />
-              Open only
-            </label>
-          </div>
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead className="text-xs uppercase tracking-wider text-muted-foreground">
-                <tr className="border-b">
-                  <th className="px-4 py-2 text-left">Fired</th>
-                  <th className="px-4 py-2 text-left">Severity</th>
-                  <th className="px-4 py-2 text-left">Subject</th>
-                  <th className="px-4 py-2 text-left">Message</th>
-                  <th className="px-4 py-2 text-left">State</th>
-                  <th className="px-4 py-2" />
-                </tr>
-              </thead>
-              <tbody className={zebraBodyCls}>
-                {events.length === 0 && (
-                  <tr>
-                    <td
-                      colSpan={6}
-                      className="px-4 py-8 text-center text-xs text-muted-foreground"
-                    >
-                      {openOnly
-                        ? "No open events — all clear."
-                        : "No events yet."}
-                    </td>
-                  </tr>
-                )}
-                {events.map((ev) => (
-                  <tr key={ev.id} className="border-b">
-                    <td className="px-4 py-2 text-xs text-muted-foreground tabular-nums whitespace-nowrap">
-                      {new Date(ev.fired_at).toLocaleString()}
-                    </td>
-                    <td className="px-4 py-2">
-                      <SeverityBadge severity={ev.severity} />
-                    </td>
-                    <td className="px-4 py-2 text-xs">
-                      <span className="text-muted-foreground">
-                        {ev.subject_type}:
-                      </span>{" "}
-                      <span className="font-medium">{ev.subject_display}</span>
-                    </td>
-                    <td className="px-4 py-2 text-xs text-muted-foreground">
-                      {ev.message}
-                    </td>
-                    <td className="px-4 py-2">
-                      {ev.resolved_at ? (
-                        <span className="text-xs text-emerald-600 dark:text-emerald-400">
-                          resolved {new Date(ev.resolved_at).toLocaleString()}
-                        </span>
-                      ) : (
-                        <span className="text-xs text-amber-600 dark:text-amber-400">
-                          open
-                        </span>
-                      )}
-                    </td>
-                    <td className="px-4 py-2">
-                      <div className="flex items-center justify-end gap-1">
-                        <AskAIButton
-                          context={[
-                            `Alert event on ${ev.subject_type} ${ev.subject_display}`,
-                            `severity: ${ev.severity}`,
-                            `message: ${ev.message}`,
-                            `fired_at: ${ev.fired_at}`,
-                            ev.resolved_at
-                              ? `resolved_at: ${ev.resolved_at}`
-                              : "state: open",
-                            `event_id: ${ev.id}`,
-                          ].join(", ")}
-                          tooltip="Ask AI about this alert"
-                          prompt="Explain this alert — what tripped it, what it means, and the most likely remediation."
-                          iconOnly
-                          className="px-1.5 py-1"
-                        />
-                        {!ev.resolved_at && (
-                          <button
-                            onClick={() => resolve.mutate(ev.id)}
-                            className="rounded border px-2 py-0.5 text-[11px] hover:bg-accent"
-                          >
-                            Resolve
-                          </button>
-                        )}
                       </div>
                     </td>
                   </tr>

@@ -250,3 +250,172 @@ async def test_occupancy_404s_for_unknown_ids(
     assert (
         await client.get(f"/api/v1/dhcp/scopes/{missing}/pools/occupancy", headers=headers)
     ).status_code == 404
+
+
+# ── Fleet-wide rollup (issue #942) ──────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_fleet_occupancy_ranks_fullest_first_and_carries_context(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The dashboard's question is "which pools are fullest", across every
+    scope, in one call — and each row must identify itself without a
+    follow-up, since a pool name is frequently empty."""
+    scope, _ = await _scope(db_session)
+    roomy = DHCPPool(
+        scope_id=scope.id,
+        name="roomy",
+        start_ip="10.61.0.10",
+        end_ip="10.61.0.109",  # 100 addresses
+        pool_type="dynamic",
+    )
+    tight = DHCPPool(
+        scope_id=scope.id,
+        name="tight",
+        start_ip="10.61.0.200",
+        end_ip="10.61.0.209",  # 10 addresses
+        pool_type="dynamic",
+    )
+    db_session.add_all([roomy, tight])
+    await db_session.flush()
+    # 1/100 vs 8/10 — the smaller absolute count is the bigger problem,
+    # so ranking must be on percent, not on assigned.
+    db_session.add(
+        DHCPStaticAssignment(
+            scope_id=scope.id, ip_address="10.61.0.11", mac_address="aa:bb:cc:00:00:01"
+        )
+    )
+    for i in range(8):
+        db_session.add(
+            DHCPStaticAssignment(
+                scope_id=scope.id,
+                ip_address=f"10.61.0.{200 + i}",
+                mac_address=f"aa:bb:cc:00:01:{i:02x}",
+            )
+        )
+    await db_session.flush()
+
+    headers = {"Authorization": f"Bearer {await _token(db_session)}"}
+    res = await client.get("/api/v1/dhcp/pools/occupancy", headers=headers)
+    assert res.status_code == 200, res.text
+    body = res.json()
+
+    assert [p["pool_name"] for p in body["pools"]][:2] == ["tight", "roomy"]
+    assert body["pool_count"] == 2
+    assert body["pools_warning"] == 1  # tight at 80%
+    assert body["pools_critical"] == 0
+    top = body["pools"][0]
+    assert top["percent"] == 80.0
+    # Context that saves a follow-up call.
+    assert top["scope_name"] == "scope-a"
+    assert top["subnet_network"] == CIDR
+    assert top["group_name"]
+    assert top["scope_is_active"] is True
+
+
+@pytest.mark.asyncio
+async def test_fleet_occupancy_omits_non_dynamic_pools(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Same filter as the per-scope endpoint and the exhaustion alert
+    evaluator. An excluded range is never offered to a client and a
+    reserved one is supposed to fill up, so either would render as a red
+    exhaustion bar for behaving correctly."""
+    scope, _ = await _scope(db_session)
+    db_session.add_all(
+        [
+            DHCPPool(
+                scope_id=scope.id,
+                name="dyn",
+                start_ip="10.61.0.10",
+                end_ip="10.61.0.19",
+                pool_type="dynamic",
+            ),
+            DHCPPool(
+                scope_id=scope.id,
+                name="excl",
+                start_ip="10.61.0.20",
+                end_ip="10.61.0.29",
+                pool_type="excluded",
+            ),
+            DHCPPool(
+                scope_id=scope.id,
+                name="resv",
+                start_ip="10.61.0.30",
+                end_ip="10.61.0.39",
+                pool_type="reserved",
+            ),
+        ]
+    )
+    await db_session.flush()
+
+    headers = {"Authorization": f"Bearer {await _token(db_session)}"}
+    body = (await client.get("/api/v1/dhcp/pools/occupancy", headers=headers)).json()
+    assert [p["pool_name"] for p in body["pools"]] == ["dyn"]
+    assert body["pool_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_fleet_lease_count_dedupes_ha_mirrored_leases(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """``dhcp_lease`` is per-server and a Kea HA pair mirrors every lease,
+    so COUNT(*) reports 2x on exactly the deployments where the number
+    matters — and would disagree with pool_occupancy.py and the #889
+    InfluxDB exporter, both of which dedupe."""
+    scope, server_a = await _scope(db_session)
+    server_b = DHCPServer(name=f"kea-{uuid.uuid4().hex[:6]}", host="10.0.0.2", driver="kea")
+    db_session.add(server_b)
+    await db_session.flush()
+    # The SAME address, mirrored by both HA partners.
+    for srv in (server_a, server_b):
+        db_session.add(
+            DHCPLease(
+                server_id=srv.id,
+                scope_id=scope.id,
+                ip_address="10.61.0.50",
+                mac_address="aa:bb:cc:dd:ee:ff",
+                state="active",
+            )
+        )
+    # Plus one address only one partner has seen, and one expired row that
+    # must not count at all.
+    db_session.add(
+        DHCPLease(
+            server_id=server_a.id,
+            scope_id=scope.id,
+            ip_address="10.61.0.51",
+            mac_address="aa:bb:cc:dd:ee:01",
+            state="active",
+        )
+    )
+    db_session.add(
+        DHCPLease(
+            server_id=server_a.id,
+            scope_id=scope.id,
+            ip_address="10.61.0.52",
+            mac_address="aa:bb:cc:dd:ee:02",
+            state="expired",
+        )
+    )
+    await db_session.flush()
+
+    headers = {"Authorization": f"Bearer {await _token(db_session)}"}
+    body = (await client.get("/api/v1/dhcp/pools/occupancy", headers=headers)).json()
+    assert body["active_lease_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_fleet_occupancy_empty_estate_is_not_an_error(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A fresh install has no pools; the panel needs a shape to render,
+    not a 404."""
+    headers = {"Authorization": f"Bearer {await _token(db_session)}"}
+    res = await client.get("/api/v1/dhcp/pools/occupancy", headers=headers)
+    assert res.status_code == 200
+    body = res.json()
+    assert body["pool_count"] == 0
+    assert body["pools"] == []
+    assert body["active_lease_count"] == 0

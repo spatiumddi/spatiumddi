@@ -7,17 +7,17 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, field_validator
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.v1.dhcp._audit import write_audit
 from app.core.agent_wake import collect_wake, dhcp_group_channel
 from app.core.permissions import require_resource_permission
-from app.models.dhcp import DHCPPool, DHCPScope
-from app.models.ipam import IPAddress
+from app.models.dhcp import DHCPLease, DHCPPool, DHCPScope, DHCPServerGroup
+from app.models.ipam import IPAddress, Subnet
 from app.services.dhcp.pool_occupancy import (
     PoolOccupancy,
     compute_pool_occupancy_batch,
@@ -436,6 +436,174 @@ async def pool_occupancy(pool_id: uuid.UUID, db: DB, _: CurrentUser) -> PoolOccu
         raise HTTPException(status_code=422, detail=_not_applicable(pool.pool_type))
     occ = (await compute_pool_occupancy_batch(db, [pool]))[pool.id]
     return _occupancy_row(pool, occ, datetime.now(UTC))
+
+
+# ── Fleet-wide occupancy (issue #942) ────────────────────────────────
+#
+# The dashboard's DHCP tab needs "which pools are fullest, across every
+# scope" and must not answer it by fanning out one call per scope. The
+# filters here are deliberately IDENTICAL to the per-scope endpoint and
+# to the ``dhcp_pool_exhaustion`` alert evaluator: dynamic pools only,
+# and no ``is_active`` filter on the parent scope. That last one is a
+# choice, not an oversight — the evaluator does not filter on it either,
+# and a surface that quietly dropped rows the alerting still fires on is
+# precisely how an operator ends up reading "the pool is fine" about a
+# pool that is paging someone. Inactive scopes are flagged in the row
+# instead, so the UI can annotate without the API deciding for it.
+
+
+class FleetPoolOccupancyRow(PoolOccupancyResponse):
+    """One pool, plus the context needed to identify it without a
+    follow-up call — a pool name alone is frequently empty, and a
+    ``pool_id`` is not something an operator can act on."""
+
+    scope_name: str
+    scope_is_active: bool
+    subnet_network: str | None
+    group_id: uuid.UUID
+    group_name: str
+
+
+class FleetPoolOccupancyResponse(BaseModel):
+    computed_at: datetime
+    #: Every dynamic pool considered, not just the returned slice — so a
+    #: caller can say "3 of 47" rather than implying the top-N is all of
+    #: them.
+    pool_count: int
+    pools_warning: int
+    pools_critical: int
+    #: Distinct ``(scope, address)`` pairs in an active lease, fleet-wide.
+    #: DISTINCT, not COUNT(*): ``dhcp_lease`` is per-server and a Kea HA
+    #: pair mirrors every lease twice, so a row count reports 2x on
+    #: exactly the deployments where the number matters — and would
+    #: disagree with both ``pool_occupancy.py`` and the #889 InfluxDB
+    #: exporter, which dedupe for the same reason. Pairing with the scope
+    #: keeps this equal to the sum of that exporter's per-scope series.
+    active_lease_count: int
+    pools: list[FleetPoolOccupancyRow]
+
+
+#: Occupancy bands for the fleet rollup. Same numbers the subnet
+#: utilization heatmap uses, so "amber" means the same thing wherever an
+#: operator sees it on this dashboard.
+_POOL_WARNING_PERCENT = 80.0
+_POOL_CRITICAL_PERCENT = 95.0
+
+
+@router.get("/pools/occupancy", response_model=FleetPoolOccupancyResponse)
+async def fleet_pool_occupancy(
+    db: DB,
+    _: CurrentUser,
+    limit: int = Query(10, ge=1, le=200),
+) -> FleetPoolOccupancyResponse:
+    """Dynamic pools across every scope, fullest first.
+
+    Answers the DHCP dashboard's headline question — "can clients still
+    get an address anywhere" — in one round trip and a fixed number of
+    queries: the pool fetch, one batched lease + reservation pass, the
+    lease count, and name resolution for the returned slice only.
+
+    Fixed query *count*, not fixed *work*: the batched pass reads every
+    active lease and reservation in the scopes that own a dynamic pool,
+    so it scales with the lease table rather than with ``limit``, which
+    bounds only the rendered slice. That is deliberate — it is the same
+    scan ``compute_pool_occupancy_batch`` already performs for the
+    per-scope endpoint and for the ``dhcp_pool_exhaustion`` evaluator on
+    its own tick, and re-deriving occupancy in SQL here would be a
+    fourth implementation of the range arithmetic that could disagree
+    with the other three. If this becomes hot, push the range containment
+    into the shared helper so every caller benefits.
+    """
+    pools = list(
+        (await db.execute(select(DHCPPool).where(DHCPPool.pool_type == _OCCUPANCY_POOL_TYPE)))
+        .scalars()
+        .all()
+    )
+    computed_at = datetime.now(UTC)
+    occ_by_pool = await compute_pool_occupancy_batch(db, pools)
+
+    # A zero-size pool (malformed or inverted range) reports 0/0 at 0%.
+    # It is counted in ``pool_count`` — it exists and is misconfigured —
+    # but must never outrank a genuinely full pool in the ranking.
+    ranked = sorted(
+        pools,
+        key=lambda p: (occ_by_pool[p.id].percent, occ_by_pool[p.id].assigned),
+        reverse=True,
+    )
+    pools_warning = sum(1 for p in pools if occ_by_pool[p.id].percent >= _POOL_WARNING_PERCENT)
+    pools_critical = sum(1 for p in pools if occ_by_pool[p.id].percent >= _POOL_CRITICAL_PERCENT)
+
+    lease_pairs = (
+        select(DHCPLease.scope_id, DHCPLease.ip_address)
+        .where(DHCPLease.scope_id.is_not(None), DHCPLease.state == "active")
+        .distinct()
+        .subquery()
+    )
+    active_lease_count = (
+        await db.execute(select(func.count()).select_from(lease_pairs))
+    ).scalar_one()
+
+    top = ranked[:limit]
+    # Resolve display context for the returned slice only — three
+    # queries, independent of how many pools the fleet has.
+    scope_ids = {p.scope_id for p in top}
+    scopes: dict[uuid.UUID, DHCPScope] = {}
+    if scope_ids:
+        scopes = {
+            s.id: s
+            for s in (await db.execute(select(DHCPScope).where(DHCPScope.id.in_(scope_ids))))
+            .scalars()
+            .all()
+        }
+    subnet_ids = {s.subnet_id for s in scopes.values()}
+    networks: dict[uuid.UUID, str] = {}
+    if subnet_ids:
+        networks = {
+            row[0]: str(row[1])
+            for row in (
+                await db.execute(select(Subnet.id, Subnet.network).where(Subnet.id.in_(subnet_ids)))
+            ).all()
+        }
+    group_ids = {s.group_id for s in scopes.values()}
+    group_names: dict[uuid.UUID, str] = {}
+    if group_ids:
+        group_names = {
+            row[0]: row[1]
+            for row in (
+                await db.execute(
+                    select(DHCPServerGroup.id, DHCPServerGroup.name).where(
+                        DHCPServerGroup.id.in_(group_ids)
+                    )
+                )
+            ).all()
+        }
+
+    rows: list[FleetPoolOccupancyRow] = []
+    for pool in top:
+        scope = scopes.get(pool.scope_id)
+        base = _occupancy_row(pool, occ_by_pool[pool.id], computed_at)
+        rows.append(
+            FleetPoolOccupancyRow(
+                **base.model_dump(),
+                scope_name=(scope.name if scope else "") or "",
+                scope_is_active=scope.is_active if scope else False,
+                subnet_network=networks.get(scope.subnet_id) if scope else None,
+                # A pool always has a scope (FK, CASCADE) and a scope always
+                # has a group. The fallbacks exist only so a row mid-delete
+                # degrades instead of 500-ing the whole panel.
+                group_id=scope.group_id if scope else uuid.UUID(int=0),
+                group_name=(group_names.get(scope.group_id, "") if scope else "") or "",
+            )
+        )
+
+    return FleetPoolOccupancyResponse(
+        computed_at=computed_at,
+        pool_count=len(pools),
+        pools_warning=pools_warning,
+        pools_critical=pools_critical,
+        active_lease_count=int(active_lease_count),
+        pools=rows,
+    )
 
 
 @router.get("/scopes/{scope_id}/pools/occupancy", response_model=list[PoolOccupancyResponse])

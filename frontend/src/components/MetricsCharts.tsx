@@ -44,9 +44,13 @@ const WINDOWS: { key: MetricsWindow; label: string }[] = [
 
 const ALL_SERVERS = "__all__";
 
-function formatT(iso: string, bucketSeconds: number): string {
+// Tick labels key off the WINDOW, not the bucket size: a 24 h window
+// aggregated into 5 min buckets is still one day of data, and stamping
+// the date on every tick there is noise. Only the multi-day window
+// needs it to disambiguate.
+function formatT(iso: string, win: MetricsWindow): string {
   const d = new Date(iso);
-  if (bucketSeconds >= 300) {
+  if (win === "7d") {
     return d.toLocaleString([], {
       month: "short",
       day: "numeric",
@@ -57,9 +61,16 @@ function formatT(iso: string, bucketSeconds: number): string {
   return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
-function perSecond(value: number, bucketSeconds: number): number {
-  if (bucketSeconds <= 0) return 0;
-  return +(value / bucketSeconds).toFixed(2);
+// Rates divide by the seconds a point ACTUALLY covers, not by the nominal
+// bucket width (#942). The newest 5-minute bucket has only had one or two
+// 60 s samples reported into it, so dividing its partial sum by a full 300
+// drew a 70%+ phantom dip at the right-hand edge of every chart — the
+// leading bucket is partial for the same reason, and so is any bucket an
+// agent was down for. Falls back to the nominal width for a server too old
+// to report the field.
+function perSecond(value: number, coveredSeconds: number): number {
+  if (coveredSeconds <= 0) return 0;
+  return +(value / coveredSeconds).toFixed(2);
 }
 
 function WindowPicker({
@@ -131,11 +142,23 @@ export function DNSQueryRateCard({
   });
 
   const points = (data?.points ?? []).map((p) => ({
-    t: formatT(p.t, data?.bucket_seconds ?? 60),
-    queries: perSecond(p.queries_total, data?.bucket_seconds ?? 60),
-    noerror: perSecond(p.noerror, data?.bucket_seconds ?? 60),
-    nxdomain: perSecond(p.nxdomain, data?.bucket_seconds ?? 60),
-    servfail: perSecond(p.servfail, data?.bucket_seconds ?? 60),
+    t: formatT(p.t, win),
+    queries: perSecond(
+      p.queries_total,
+      p.covered_seconds || (data?.bucket_seconds ?? 60),
+    ),
+    noerror: perSecond(
+      p.noerror,
+      p.covered_seconds || (data?.bucket_seconds ?? 60),
+    ),
+    nxdomain: perSecond(
+      p.nxdomain,
+      p.covered_seconds || (data?.bucket_seconds ?? 60),
+    ),
+    servfail: perSecond(
+      p.servfail,
+      p.covered_seconds || (data?.bucket_seconds ?? 60),
+    ),
   }));
 
   // The API returns one zero-filled sample per bucket even when no
@@ -170,13 +193,18 @@ export function DNSQueryRateCard({
           <WindowPicker value={win} onChange={setWin} />
         </div>
       </div>
-      <div className="h-64 p-3">
+      {/* Collapse to a slim strip when there is nothing to plot (#942).
+          A full 256 px of empty state pushed the panels that DO have
+          something to say below the fold — and on a fresh install, or any
+          deployment with no agent reporting counters, that is the normal
+          case rather than the exception. */}
+      <div className={hasData || isLoading ? "h-64 p-3" : "px-4 py-3"}>
         {isLoading ? (
           <div className="flex h-full items-center justify-center text-xs text-muted-foreground">
             Loading…
           </div>
         ) : !hasData ? (
-          <div className="flex h-full flex-col items-center justify-center gap-1 text-center text-xs text-muted-foreground">
+          <div className="flex flex-wrap items-center gap-x-2 text-xs text-muted-foreground">
             <span>No query data yet.</span>
             <span className="text-[11px]">
               BIND9 agents report counters every 60&nbsp;s.
@@ -266,11 +294,17 @@ export function DHCPTrafficCard({
   });
 
   const points = (data?.points ?? []).map((p) => ({
-    t: formatT(p.t, data?.bucket_seconds ?? 60),
-    discover: perSecond(p.discover, data?.bucket_seconds ?? 60),
-    request: perSecond(p.request, data?.bucket_seconds ?? 60),
-    ack: perSecond(p.ack, data?.bucket_seconds ?? 60),
-    nak: perSecond(p.nak, data?.bucket_seconds ?? 60),
+    t: formatT(p.t, win),
+    discover: perSecond(
+      p.discover,
+      p.covered_seconds || (data?.bucket_seconds ?? 60),
+    ),
+    request: perSecond(
+      p.request,
+      p.covered_seconds || (data?.bucket_seconds ?? 60),
+    ),
+    ack: perSecond(p.ack, p.covered_seconds || (data?.bucket_seconds ?? 60)),
+    nak: perSecond(p.nak, p.covered_seconds || (data?.bucket_seconds ?? 60)),
   }));
 
   // The API returns one zero-filled sample per bucket even when no
@@ -303,13 +337,18 @@ export function DHCPTrafficCard({
           <WindowPicker value={win} onChange={setWin} />
         </div>
       </div>
-      <div className="h-64 p-3">
+      {/* Collapse to a slim strip when there is nothing to plot (#942).
+          A full 256 px of empty state pushed the panels that DO have
+          something to say below the fold — and on a fresh install, or any
+          deployment with no agent reporting counters, that is the normal
+          case rather than the exception. */}
+      <div className={hasData || isLoading ? "h-64 p-3" : "px-4 py-3"}>
         {isLoading ? (
           <div className="flex h-full items-center justify-center text-xs text-muted-foreground">
             Loading…
           </div>
         ) : !hasData ? (
-          <div className="flex h-full flex-col items-center justify-center gap-1 text-center text-xs text-muted-foreground">
+          <div className="flex flex-wrap items-center gap-x-2 text-xs text-muted-foreground">
             <span>No DHCP traffic yet.</span>
             <span className="text-[11px]">
               Kea agents report packet counters every 60&nbsp;s.

@@ -193,12 +193,16 @@ class ASNRpkiRoa(UUIDPrimaryKeyMixin, Base):
     )
     prefix: Mapped[str] = mapped_column(CIDR, nullable=False)
     max_length: Mapped[int] = mapped_column(Integer, nullable=False)
-    # Some public ROA mirrors (Cloudflare's ``rpki.json`` in particular)
-    # don't surface per-ROA validity windows — the JSON only has
-    # ``(asn, prefix, maxLength, ta)`` quads. We relax these to nullable
-    # in Phase 2 so the pull job can land what it has; ``state`` falls
-    # back to ``valid`` when the window is unknown so the alert
+    # Nullable because not every mirror exposes a validity window, and
+    # ``state`` falls back to ``valid`` when it is unknown so the alert
     # evaluator doesn't fire spurious "expired" events.
+    #
+    # Cloudflare's ``rpki.json`` DOES ship a per-row ``expires`` (an
+    # earlier comment here said it did not) — but it is the validity of
+    # the VRP cache entry, not of the ROA, and every row in the global
+    # dump carries one under a week out. It is landed for the record and
+    # deliberately not read as a lifetime; see
+    # ``_LIFETIME_VALIDITY_SOURCES`` in ``tasks/rpki_roa_refresh.py``.
     valid_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     valid_to: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 

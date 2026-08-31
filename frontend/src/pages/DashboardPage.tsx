@@ -72,6 +72,7 @@ import {
   type DNSServer,
   type DHCPServer,
   type DHCPServerGroup,
+  type DNSServerGroup,
   type KubernetesCluster,
   type DockerHost,
   type ProxmoxNode,
@@ -89,6 +90,7 @@ import {
   type VRF,
   type Domain,
   type AlertEvent,
+  type ConfigApplyStatus,
   type AlertRule,
   type ConformityResult,
   type ConformitySummary,
@@ -190,7 +192,94 @@ function UtilColor(percent: number): string {
   return "bg-muted/60 dark:bg-muted/40";
 }
 
-function UtilizationBar({ percent }: { percent: number }) {
+/** One entry in the Overview inventory strip (#942) — a value, its unit,
+ *  and the same click-through the KPI card it replaced had. */
+function InventoryStat({
+  value,
+  label,
+  to,
+  title,
+  tone,
+}: {
+  value: string | number;
+  label: string;
+  to: string;
+  title?: string;
+  tone?: "warn" | "bad";
+}) {
+  return (
+    <Link
+      to={to}
+      title={title}
+      className="inline-flex items-baseline gap-1.5 rounded px-2 py-0.5 transition-colors hover:bg-accent/60"
+    >
+      <span
+        className={cn(
+          "font-semibold tabular-nums",
+          tone === "bad"
+            ? "text-red-600 dark:text-red-400"
+            : tone === "warn"
+              ? "text-amber-600 dark:text-amber-400"
+              : "text-foreground",
+        )}
+      >
+        {value}
+      </span>
+      <span className="text-muted-foreground">{label}</span>
+    </Link>
+  );
+}
+
+/** True for an IPv6 prefix, whose capacity numbers are not comparable
+ *  to a v4 subnet's and must not be rendered as if they were. */
+function isV6(network: string): boolean {
+  return network.includes(":");
+}
+
+/**
+ * Capacity label for one subnet row (#942).
+ *
+ * A v6 prefix's ``total_ips`` is astronomical: a /64 is 2^64, which
+ * crosses `Number.MAX_SAFE_INTEGER` on the way through JSON and renders
+ * as "9223372036854776000" — a number that is both wrong and wide
+ * enough to wrap the row. The page already refuses to fold v6 into the
+ * aggregate totals for exactly this reason (see the reportingV4 /
+ * reportingV6 split); rows follow the same rule and show the allocation
+ * count alone, which is the only half that means anything.
+ */
+function capacityLabel(subnet: {
+  network: string;
+  allocated_ips: number;
+  total_ips: number;
+}): string {
+  if (isV6(subnet.network)) {
+    return `${subnet.allocated_ips.toLocaleString()} alloc`;
+  }
+  return `${subnet.allocated_ips.toLocaleString()} / ${subnet.total_ips.toLocaleString()}`;
+}
+
+function UtilizationBar({
+  percent,
+  network,
+}: {
+  percent: number;
+  /** When this is a v6 prefix the bar renders n/a: "0%" of a /64 is
+   *  true, useless, and indistinguishable from an empty v4 subnet. */
+  network?: string;
+}) {
+  if (network && isV6(network)) {
+    return (
+      <div className="flex items-center gap-2">
+        <div className="h-1.5 flex-1 rounded-full bg-muted/40" />
+        <span
+          className="w-10 text-right text-xs text-muted-foreground/50"
+          title="Utilization is not meaningful for an IPv6 prefix"
+        >
+          n/a
+        </span>
+      </div>
+    );
+  }
   return (
     <div className="flex items-center gap-2">
       <div className="h-1.5 flex-1 rounded-full bg-muted overflow-hidden">
@@ -290,7 +379,11 @@ function SubnetHeatmap({ subnets }: { subnets: Subnet[] }) {
             <Link
               key={s.id}
               to={`/ipam?subnet=${s.id}`}
-              title={`${s.network}${s.name ? ` — ${s.name}` : ""}\n${s.utilization_percent.toFixed(1)}% · ${s.allocated_ips} / ${s.total_ips}`}
+              title={`${s.network}${s.name ? ` — ${s.name}` : ""}\n${
+                isV6(s.network)
+                  ? capacityLabel(s)
+                  : `${s.utilization_percent.toFixed(1)}% · ${capacityLabel(s)}`
+              }`}
               className={cn(
                 "aspect-square rounded transition-all hover:scale-110 hover:ring-2 hover:ring-primary/40",
                 UtilColor(s.utilization_percent),
@@ -398,9 +491,11 @@ function futureTime(ts: string): string {
 function StatusChip({
   tone,
   label,
+  title,
 }: {
   tone: "green" | "amber" | "red" | "gray";
   label: string;
+  title?: string;
 }) {
   const cls =
     tone === "green"
@@ -412,13 +507,271 @@ function StatusChip({
           : "bg-muted text-muted-foreground";
   return (
     <span
+      title={title}
       className={cn(
         "inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-semibold",
         cls,
+        title && "cursor-help",
       )}
     >
       {label}
     </span>
+  );
+}
+
+/**
+ * Agents needing attention (#942).
+ *
+ * The KPI card above counts these; this names them. A card reading "4
+ * agents needing attention" that navigates to a page which does not show
+ * those four is the same defect as the old alerts pill, and here no
+ * single link can be honest — the set spans DNS and DHCP servers across
+ * different groups, and both pages restore their last-visited selection,
+ * so a bare `/dns` lands on whatever zone the operator was reading last.
+ *
+ * Each row therefore deep-links to the group whose server list contains
+ * that server: DNSPage restores from ``group`` (defaulting to its servers
+ * tab) and DHCPPage from ``group``.
+ */
+function AttentionAgentsPanel({
+  servers,
+  dnsGroups,
+  dhcpGroups,
+}: {
+  servers: {
+    id: string;
+    name: string;
+    status: string;
+    kind: "dns" | "dhcp";
+    group_id?: string;
+    server_group_id?: string | null;
+    config_apply_status?: ConfigApplyStatus | null;
+    config_apply_error?: string | null;
+  }[];
+  dnsGroups: DNSServerGroup[];
+  dhcpGroups: DHCPServerGroup[];
+}) {
+  function groupFor(s: (typeof servers)[number]): {
+    id: string | null;
+    name: string;
+  } {
+    if (s.kind === "dns") {
+      const g = dnsGroups.find((x) => x.id === s.group_id);
+      return { id: g?.id ?? null, name: g?.name ?? "ungrouped" };
+    }
+    const g = dhcpGroups.find((x) => x.id === s.server_group_id);
+    return { id: g?.id ?? null, name: g?.name ?? "ungrouped" };
+  }
+
+  return (
+    <div className="rounded-lg border bg-card">
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b px-4 py-2.5">
+        <div className="flex items-center gap-2">
+          <Cpu className="h-3.5 w-3.5 text-red-500" />
+          <h3 className="text-xs font-semibold uppercase tracking-wider">
+            Agents needing attention ({servers.length})
+          </h3>
+          <span className="text-[11px] text-muted-foreground">
+            paused and maintenance-mode servers excluded
+          </span>
+        </div>
+      </div>
+      <div className="overflow-x-auto">
+        <div className="min-w-[520px] divide-y">
+          {servers.map((s) => {
+            const group = groupFor(s);
+            const to =
+              group.id === null
+                ? s.kind === "dns"
+                  ? "/dns"
+                  : "/dhcp"
+                : `/${s.kind}?group=${group.id}`;
+            const unreachable =
+              s.status === "unreachable" || s.status === "error";
+            return (
+              <Link
+                key={`${s.kind}-${s.id}`}
+                to={to}
+                className="flex items-center gap-3 px-4 py-2 text-[11px] transition-colors hover:bg-accent/40"
+              >
+                <span className="inline-block h-1.5 w-1.5 flex-shrink-0 rounded-full bg-red-500" />
+                <span
+                  className="w-40 flex-shrink-0 truncate font-semibold"
+                  title={s.name}
+                >
+                  {s.name}
+                </span>
+                <span className="w-12 flex-shrink-0 uppercase text-muted-foreground">
+                  {s.kind}
+                </span>
+                <span
+                  className="w-32 flex-shrink-0 truncate text-muted-foreground"
+                  title={group.name}
+                >
+                  {group.name}
+                </span>
+                <span className="flex flex-1 flex-wrap items-center gap-1.5">
+                  {unreachable && (
+                    <StatusChip
+                      tone="red"
+                      label={s.status}
+                      title="The health probe cannot reach this server."
+                    />
+                  )}
+                  <ConfigApplyChip
+                    status={s.config_apply_status ?? null}
+                    error={s.config_apply_error}
+                  />
+                </span>
+              </Link>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Open alerts rollup (#942).
+ *
+ * The alerts framework fires into `alert_event`, and until now the
+ * dashboard surfaced none of it — the header pill did arithmetic of its
+ * own and the Compliance tab showed a compliance-filtered slice. So the
+ * home page could look calm while the alerting was lit up.
+ *
+ * Shares its query with the header pill (one key, one fetch); the events
+ * arrive newest-first from the API.
+ */
+function OpenAlertsPanel({
+  events,
+  failed = false,
+  truncated = false,
+}: {
+  events: AlertEvent[];
+  /** The fetch failed. Distinct from "no open alerts" — see below. */
+  failed?: boolean;
+  /** The response came back at the fetch cap, so the count is a floor. */
+  truncated?: boolean;
+}) {
+  const bySeverity = {
+    critical: events.filter((e) => e.severity === "critical").length,
+    warning: events.filter((e) => e.severity === "warning").length,
+    info: events.filter((e) => e.severity === "info").length,
+  };
+
+  // A failed fetch renders as unknown, never as an all-clear. React Query
+  // hands back the `[]` default on error, which would otherwise paint the
+  // exact green "No open alerts" this panel exists to disprove.
+  if (failed) {
+    return (
+      <div className="flex items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-4 py-2.5 text-xs text-amber-700 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-400">
+        <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+        <span className="font-medium">Could not load alerts</span>
+        <span className="text-[11px]">
+          This is not an all-clear — the alert state is unknown.
+        </span>
+        <Link
+          to="/admin/alerts"
+          className="ml-auto text-[11px] underline hover:no-underline"
+        >
+          Alerts page →
+        </Link>
+      </div>
+    );
+  }
+
+  if (events.length === 0) {
+    return (
+      <div className="flex items-center gap-2 rounded-lg border bg-card px-4 py-2.5 text-xs">
+        <span className="inline-block h-1.5 w-1.5 rounded-full bg-emerald-500" />
+        <span className="font-medium">No open alerts</span>
+        <Link
+          to="/admin/alerts"
+          className="ml-auto text-[11px] text-primary hover:underline"
+        >
+          Alert rules →
+        </Link>
+      </div>
+    );
+  }
+
+  return (
+    <div className="rounded-lg border bg-card">
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b px-4 py-2.5">
+        <div className="flex items-center gap-2">
+          <AlertTriangle className="h-3.5 w-3.5 text-amber-500" />
+          <h3 className="text-xs font-semibold uppercase tracking-wider">
+            Open alerts ({events.length}
+            {truncated ? "+" : ""})
+          </h3>
+          <span className="flex items-center gap-1.5 text-[11px]">
+            {bySeverity.critical > 0 && (
+              <StatusChip
+                tone="red"
+                label={`${bySeverity.critical} critical`}
+              />
+            )}
+            {bySeverity.warning > 0 && (
+              <StatusChip
+                tone="amber"
+                label={`${bySeverity.warning} warning`}
+              />
+            )}
+            {bySeverity.info > 0 && (
+              <StatusChip tone="gray" label={`${bySeverity.info} info`} />
+            )}
+          </span>
+        </div>
+        <Link
+          to="/admin/alerts"
+          className="text-[11px] text-primary hover:underline"
+        >
+          view all →
+        </Link>
+      </div>
+      <div className="divide-y">
+        {events.slice(0, 5).map((e) => (
+          <Link
+            key={e.id}
+            to="/admin/alerts"
+            className="flex items-center gap-3 px-4 py-2 text-[11px] transition-colors hover:bg-accent/40"
+          >
+            <span
+              className={cn(
+                "inline-block h-1.5 w-1.5 flex-shrink-0 rounded-full",
+                e.severity === "critical"
+                  ? "bg-red-500"
+                  : e.severity === "warning"
+                    ? "bg-amber-500"
+                    : "bg-muted-foreground/40",
+              )}
+              title={e.severity}
+            />
+            <span
+              className="w-40 flex-shrink-0 truncate font-semibold"
+              title={e.subject_display}
+            >
+              {e.subject_display || e.subject_type}
+            </span>
+            <span
+              className="flex-1 truncate text-muted-foreground"
+              title={e.message}
+            >
+              {e.message}
+            </span>
+            <span className="w-20 flex-shrink-0 text-right text-muted-foreground">
+              {humanTime(e.fired_at)}
+            </span>
+          </Link>
+        ))}
+      </div>
+      {events.length > 5 && (
+        <div className="border-t px-4 py-1.5 text-[11px] text-muted-foreground">
+          + {events.length - 5} more
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -1241,6 +1594,30 @@ export function DashboardPage() {
     refetchInterval: 30_000,
   });
 
+  // Open alert events (#942). Drives BOTH the header pill and the
+  // Overview "Open alerts" panel — one query key, one fetch. The pill
+  // used to render `critical + warning + unhealthyServers` computed on
+  // this page and link to /ipam: a count the alerts page could not
+  // corroborate, pointing at a page unrelated to most of what it
+  // counted. Capacity + server health still drive the health LABEL
+  // next to the title, which is what they actually describe.
+  // ``limit`` is the API's own maximum. It is still a cap, and the count
+  // this drives is presented as authoritative — the RPKI misfire this same
+  // issue fixed had 928 events open at once, so the ceiling is reachable in
+  // practice. When the response comes back exactly full the total is
+  // rendered as "N+" rather than as a number we know is wrong.
+  const OPEN_ALERT_FETCH_LIMIT = 1000;
+  const { data: openAlerts = [], isError: openAlertsFailed } = useQuery({
+    queryKey: ["alert-events", { open: true }],
+    queryFn: () =>
+      alertsApi.listEvents({
+        open_only: true,
+        limit: OPEN_ALERT_FETCH_LIMIT,
+      }),
+    refetchInterval: 60_000,
+  });
+  const openAlertsTruncated = openAlerts.length >= OPEN_ALERT_FETCH_LIMIT;
+
   // IPAM-tab IP-space filter (issue #115). Multi-select dropdown above
   // the IPAM-tab cards scopes every subnet-derived stat to the chosen
   // spaces. Empty list = "All spaces" (no filter). Persisted per-session
@@ -1293,25 +1670,74 @@ export function DashboardPage() {
     ...allDnsServers.map((s) => ({ ...s, kind: "dns" as const })),
     ...dhcpServers.map((s) => ({ ...s, kind: "dhcp" as const })),
   ];
-  const unhealthyServers = allServers.filter(
+  // A server the operator has deliberately paused or put into
+  // maintenance is not a fault, and counting one as unhealthy pins the
+  // whole dashboard to "degraded" for as long as it stays parked
+  // (#942). Maintenance mode is the load-bearing half: #182 already
+  // suppresses the heartbeat-stale ALERT server-side for those, so
+  // counting them here contradicted our own alerting. ``is_enabled``
+  // is DNS-only — DHCP servers have no pause switch — hence the kind
+  // narrowing rather than a bare property read.
+  const supervisedServers = allServers.filter(
+    (s) => !s.maintenance_mode && (s.kind !== "dns" || s.is_enabled !== false),
+  );
+  const unhealthyServers = supervisedServers.filter(
     (s) => s.status === "unreachable" || s.status === "error",
   ).length;
-  const activeServers = allServers.filter((s) => s.status === "active").length;
+  const activeServers = supervisedServers.filter(
+    (s) => s.status === "active",
+  ).length;
+  // #882 — an agent that failed to apply its config keeps serving and
+  // keeps heartbeating, so ``status``, the health check and
+  // ``last_seen_at`` all read normal while the saved zone or scope is
+  // live nowhere. That is exactly the silent failure the dashboard
+  // should catch, so a failing verdict degrades the header even when
+  // the server is otherwise healthy. NULL is UNKNOWN, never ok — an
+  // agent too old to report is where a silent revert would hide, so it
+  // is deliberately not counted as a failure either.
+  const configFailedServers = supervisedServers.filter(
+    (s) => s.config_apply_status != null && s.config_apply_status !== "ok",
+  ).length;
+  // The actual offenders, not just how many. "4 agents needing attention"
+  // that navigates to a page which does not name those four is the same
+  // defect as the old alerts pill — and here no single link can be
+  // honest, because the set spans DNS and DHCP servers across different
+  // groups. So the Overview names them and each row deep-links to the
+  // group whose server list contains it.
+  const attentionServers = supervisedServers.filter(
+    (s) =>
+      s.status === "unreachable" ||
+      s.status === "error" ||
+      (s.config_apply_status != null && s.config_apply_status !== "ok"),
+  );
 
-  // Aggregate alerts — shown as a pill next to the title.
-  const alertCount = critical + warning + unhealthyServers;
-  const healthTone: Tone =
-    unhealthyServers > 0 || critical > 0
-      ? "bad"
-      : warning > 0
-        ? "warn"
-        : "good";
-  const healthLabel =
-    unhealthyServers > 0 || critical > 0
-      ? "degraded"
-      : warning > 0
-        ? "near capacity"
-        : "healthy";
+  const degraded =
+    unhealthyServers > 0 || configFailedServers > 0 || critical > 0;
+  const healthTone: Tone = degraded ? "bad" : warning > 0 ? "warn" : "good";
+  const healthLabel = degraded
+    ? "degraded"
+    : warning > 0
+      ? "near capacity"
+      : "healthy";
+  // The label is a rollup of four unrelated things; without this the
+  // operator sees "degraded" and has no idea which one to chase.
+  const healthDetail =
+    [
+      critical > 0
+        ? `${critical} subnet${critical === 1 ? "" : "s"} ≥95% full`
+        : null,
+      warning > 0
+        ? `${warning} subnet${warning === 1 ? "" : "s"} ≥80% full`
+        : null,
+      unhealthyServers > 0
+        ? `${unhealthyServers} server${unhealthyServers === 1 ? "" : "s"} unreachable`
+        : null,
+      configFailedServers > 0
+        ? `${configFailedServers} agent${configFailedServers === 1 ? "" : "s"} failed to apply config`
+        : null,
+    ]
+      .filter(Boolean)
+      .join(" · ") || "No capacity or server-health problems detected";
 
   return (
     <div className="h-full overflow-auto p-6">
@@ -1330,7 +1756,10 @@ export function DashboardPage() {
                 {subnets?.length ?? 0} subnet{subnets?.length === 1 ? "" : "s"}
               </span>
               <span>·</span>
-              <span className="inline-flex items-center gap-1.5">
+              <span
+                className="inline-flex cursor-help items-center gap-1.5"
+                title={healthDetail}
+              >
                 <span
                   className={cn(
                     "inline-block h-1.5 w-1.5 rounded-full",
@@ -1351,40 +1780,42 @@ export function DashboardPage() {
                 onChange={setIpamSpaceFilter}
               />
             )}
-            {alertCount > 0 && (
+            {openAlerts.length > 0 && (
               <Link
-                to="/ipam"
+                to="/admin/alerts"
+                title={
+                  openAlertsTruncated
+                    ? `At least ${openAlerts.length} unresolved alert events — more than this page fetches. Open the Alerts page to triage.`
+                    : `${openAlerts.length} unresolved alert event${
+                        openAlerts.length === 1 ? "" : "s"
+                      } — open the Alerts page to triage`
+                }
                 className={cn(
                   "inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs font-medium",
-                  "border-red-200 bg-red-50 text-red-700 dark:border-red-900/50 dark:bg-red-950/30 dark:text-red-400",
-                  "hover:bg-red-100 dark:hover:bg-red-950/50",
+                  openAlerts.some((e) => e.severity === "critical")
+                    ? "border-red-200 bg-red-50 text-red-700 dark:border-red-900/50 dark:bg-red-950/30 dark:text-red-400 hover:bg-red-100 dark:hover:bg-red-950/50"
+                    : "border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-950/50",
                 )}
               >
                 <AlertTriangle className="h-3.5 w-3.5" />
-                {alertCount} alert{alertCount === 1 ? "" : "s"} open
+                {openAlerts.length}
+                {openAlertsTruncated ? "+" : ""} alert
+                {openAlerts.length === 1 ? "" : "s"} open
               </Link>
             )}
+            {/* Blanket invalidate, deliberately (#942). This used to
+                enumerate twelve query keys, which covered the Overview and
+                missed every panel on the Network / Integrations /
+                Compliance / Conformity / Security tabs plus most of the
+                Overview summary cards — pressing Refresh on five of the
+                nine tabs did nothing at all. An allowlist on a button whose
+                whole contract is "reload everything on this page" can only
+                drift as panels are added; the correct scope is the page,
+                and React Query only refetches what is mounted. */}
             <button
               type="button"
-              onClick={() => {
-                for (const key of [
-                  ["spaces"],
-                  ["subnets"],
-                  ["settings"],
-                  ["dns-groups"],
-                  ["dns-zones"],
-                  ["dns-servers"],
-                  ["dhcp-servers"],
-                  ["dhcp-groups"],
-                  ["audit", "recent"],
-                  ["metrics"],
-                  ["nat-mappings", "count"],
-                  ["platform-health"],
-                ]) {
-                  qc.invalidateQueries({ queryKey: key });
-                }
-              }}
-              title="Reload every panel on the dashboard — IPAM, DNS, DHCP, activity feed, metrics charts."
+              onClick={() => void qc.invalidateQueries()}
+              title="Reload every panel on the dashboard."
               className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs font-medium hover:bg-accent"
             >
               <RefreshCw className="h-3.5 w-3.5" />
@@ -1439,109 +1870,235 @@ export function DashboardPage() {
           </div>
         </div>
 
-        {/* ── KPI grid (Overview / IPAM / DNS / DHCP — same data, different
-              lens. The focused tabs (Compliance / Conformity / Network /
-              Integrations / Security) own their own headline KPIs and
-              skip this grid). ──────────────────────────────────────── */}
-        {tab !== "compliance" &&
-          tab !== "conformity" &&
-          tab !== "network" &&
-          tab !== "integrations" &&
-          tab !== "security" && (
-            <div className="grid gap-3 grid-cols-2 md:grid-cols-3 lg:grid-cols-6">
-              <KpiCard
-                label="IP Spaces"
-                value={spaces?.length ?? "—"}
-                sub={spaces?.[0]?.name?.toUpperCase()}
-                icon={Layers}
-                to="/ipam"
-              />
-              <KpiCard
-                label="Subnets"
-                value={subnetsScoped.length}
-                sub={
-                  <>
-                    <span className="text-emerald-600 dark:text-emerald-400">
-                      {subnetsScoped.length - critical - warning} healthy
-                    </span>
-                    {(critical > 0 || warning > 0) && (
-                      <>
-                        {" · "}
-                        <span className="text-red-600 dark:text-red-400">
-                          {critical + warning} alert
-                          {critical + warning === 1 ? "" : "s"}
-                        </span>
-                      </>
-                    )}
-                  </>
-                }
-                icon={Network}
-                tone={critical > 0 ? "bad" : warning > 0 ? "warn" : "good"}
-                to="/ipam"
-              />
-              <KpiCard
-                label="Allocated IPs (IPv4)"
-                value={allocatedIPs.toLocaleString()}
-                sub={`${freeIPs.toLocaleString()} free`}
-                icon={Activity}
-                to="/ipam"
-              />
-              <KpiCard
-                label="Utilization (IPv4)"
-                value={`${overallUtil.toFixed(1)}%`}
-                sub={`${allocatedIPs.toLocaleString()} / ${totalIPs.toLocaleString()}`}
-                icon={Server}
-                tone={
-                  overallUtil >= 95
-                    ? "bad"
-                    : overallUtil >= 80
-                      ? "warn"
-                      : "default"
-                }
-              />
-              <KpiCard
-                label="DNS Zones"
-                value={totalZones}
-                sub={
-                  dnsGroups.length > 0
-                    ? `${dnsGroups.length} group${dnsGroups.length === 1 ? "" : "s"}`
-                    : "no groups"
-                }
-                icon={Globe2}
-                to="/dns"
-              />
-              <KpiCard
-                label="Servers"
-                value={allServers.length}
-                sub={
-                  unhealthyServers > 0 ? (
-                    <span className="text-red-600 dark:text-red-400">
-                      {activeServers} active · {unhealthyServers} unhealthy
-                    </span>
-                  ) : allServers.length > 0 ? (
-                    `${activeServers} active`
-                  ) : (
-                    "none registered"
-                  )
-                }
-                icon={Cpu}
-                tone={unhealthyServers > 0 ? "bad" : "default"}
-              />
-            </div>
-          )}
+        {/* ── Overview: what needs attention (#942) ──────────────────────
+              Overview used to open with the same six inventory counters
+              the IPAM / DNS / DHCP tabs repeat verbatim. Space and zone
+              counts do not change between visits, so the home page led
+              with the least informative thing on it while unhealthy
+              agents, capacity pressure and expiring certificates were
+              scattered across other tabs or absent. The counters are
+              still here — demoted to one line below — and the top of the
+              page now answers "what should I look at today". */}
+        {tab === "overview" && (
+          <div className="grid gap-3 grid-cols-1 sm:grid-cols-2 lg:grid-cols-3">
+            <KpiCard
+              label="Agents needing attention"
+              value={unhealthyServers + configFailedServers}
+              sub={
+                unhealthyServers + configFailedServers > 0 ? (
+                  <span className="text-red-600 dark:text-red-400">
+                    {unhealthyServers} unreachable
+                    {configFailedServers > 0 &&
+                      ` · ${configFailedServers} config failed`}
+                  </span>
+                ) : (
+                  `${activeServers} healthy · paused and maintenance excluded`
+                )
+              }
+              icon={Cpu}
+              tone={unhealthyServers + configFailedServers > 0 ? "bad" : "good"}
+            />
+            <KpiCard
+              label="Capacity pressure"
+              value={critical + warning}
+              sub={
+                critical + warning > 0 ? (
+                  <span
+                    className={
+                      critical > 0
+                        ? "text-red-600 dark:text-red-400"
+                        : "text-amber-600 dark:text-amber-400"
+                    }
+                  >
+                    {critical} at ≥95% · {warning} at ≥80%
+                  </span>
+                ) : (
+                  "no subnet above 80%"
+                )
+              }
+              icon={Network}
+              tone={critical > 0 ? "bad" : warning > 0 ? "warn" : "good"}
+              to="/ipam"
+            />
+            <WidgetErrorBoundary title="Certificates expiring">
+              <CertsExpiringKpi />
+            </WidgetErrorBoundary>
+          </div>
+        )}
 
-        {/* ── Platform health (Overview only — sits directly below the
-              KPI row so the colour-coded health ribbon is the next
-              thing the eye lands on after the headline counters). ──── */}
+        {/* ── KPI grid (IPAM / DNS / DHCP — same data, different lens.
+              Overview gets the compact inventory strip instead, and the
+              focused tabs own their own headline KPIs). ─────────────── */}
+        {(tab === "ipam" || tab === "dns" || tab === "dhcp") && (
+          <div className="grid gap-3 grid-cols-2 md:grid-cols-3 lg:grid-cols-6">
+            <KpiCard
+              label="IP Spaces"
+              value={spaces?.length ?? "—"}
+              sub={spaces?.[0]?.name?.toUpperCase()}
+              icon={Layers}
+              to="/ipam"
+            />
+            <KpiCard
+              label="Subnets"
+              value={subnetsScoped.length}
+              sub={
+                <>
+                  <span className="text-emerald-600 dark:text-emerald-400">
+                    {subnetsScoped.length - critical - warning} healthy
+                  </span>
+                  {(critical > 0 || warning > 0) && (
+                    <>
+                      {" · "}
+                      <span className="text-red-600 dark:text-red-400">
+                        {critical + warning} alert
+                        {critical + warning === 1 ? "" : "s"}
+                      </span>
+                    </>
+                  )}
+                </>
+              }
+              icon={Network}
+              tone={critical > 0 ? "bad" : warning > 0 ? "warn" : "good"}
+              to="/ipam"
+            />
+            <KpiCard
+              label="Allocated IPs (IPv4)"
+              value={allocatedIPs.toLocaleString()}
+              sub={`${freeIPs.toLocaleString()} free`}
+              icon={Activity}
+              to="/ipam"
+            />
+            <KpiCard
+              label="Utilization (IPv4)"
+              value={`${overallUtil.toFixed(1)}%`}
+              sub={`${allocatedIPs.toLocaleString()} / ${totalIPs.toLocaleString()}`}
+              icon={Server}
+              tone={
+                overallUtil >= 95
+                  ? "bad"
+                  : overallUtil >= 80
+                    ? "warn"
+                    : "default"
+              }
+            />
+            <KpiCard
+              label="DNS Zones"
+              value={totalZones}
+              sub={
+                dnsGroups.length > 0
+                  ? `${dnsGroups.length} group${dnsGroups.length === 1 ? "" : "s"}`
+                  : "no groups"
+              }
+              icon={Globe2}
+              to="/dns"
+            />
+            <KpiCard
+              label="Servers"
+              value={allServers.length}
+              sub={
+                unhealthyServers > 0 ? (
+                  <span className="text-red-600 dark:text-red-400">
+                    {activeServers} active · {unhealthyServers} unhealthy
+                  </span>
+                ) : allServers.length > 0 ? (
+                  `${activeServers} active`
+                ) : (
+                  "none registered"
+                )
+              }
+              icon={Cpu}
+              tone={unhealthyServers > 0 ? "bad" : "default"}
+            />
+          </div>
+        )}
+
+        {tab === "overview" && attentionServers.length > 0 && (
+          <WidgetErrorBoundary title="Agents needing attention">
+            <AttentionAgentsPanel
+              servers={attentionServers}
+              dnsGroups={dnsGroups}
+              dhcpGroups={dhcpGroups}
+            />
+          </WidgetErrorBoundary>
+        )}
+
+        {tab === "overview" && (
+          <WidgetErrorBoundary title="Open alerts">
+            <OpenAlertsPanel
+              events={openAlerts}
+              failed={openAlertsFailed}
+              truncated={openAlertsTruncated}
+            />
+          </WidgetErrorBoundary>
+        )}
+
+        {/* ── Platform health (Overview only) ───────────────────────── */}
         {tab === "overview" && platformHealth && (
           <WidgetErrorBoundary title="Platform health">
             <PlatformHealthCard health={platformHealth} />
           </WidgetErrorBoundary>
         )}
 
-        {/* ── Network overview cards (Overview tab) ─────────────────── */}
+        {/* ── Inventory strip (#942) — the demoted six KPI cards. Still
+              one click from everything they linked to, in a twelfth of
+              the vertical space, because "how many zones do we have" is
+              a reference lookup rather than a thing to monitor. ─────── */}
         {tab === "overview" && (
-          <div className="grid gap-3 grid-cols-1 sm:grid-cols-2 lg:grid-cols-4">
+          <div className="flex flex-wrap items-center gap-x-1 gap-y-2 rounded-lg border bg-card px-4 py-2.5 text-xs">
+            <InventoryStat
+              value={spaces?.length ?? 0}
+              label="spaces"
+              to="/ipam"
+            />
+            <InventoryStat
+              value={subnetsScoped.length}
+              label="subnets"
+              to="/ipam"
+            />
+            <InventoryStat
+              value={allocatedIPs.toLocaleString()}
+              label="allocated IPv4"
+              title={`${freeIPs.toLocaleString()} free of ${totalIPs.toLocaleString()}`}
+              to="/ipam"
+            />
+            <InventoryStat
+              value={`${overallUtil.toFixed(1)}%`}
+              label="utilization"
+              tone={
+                overallUtil >= 95
+                  ? "bad"
+                  : overallUtil >= 80
+                    ? "warn"
+                    : undefined
+              }
+              title={`${allocatedIPs.toLocaleString()} / ${totalIPs.toLocaleString()} IPv4 addresses`}
+              to="/ipam"
+            />
+            <InventoryStat
+              value={totalZones}
+              label="DNS zones"
+              title={`across ${dnsGroups.length} group${dnsGroups.length === 1 ? "" : "s"}`}
+              to="/dns"
+            />
+            <InventoryStat
+              value={allServers.length}
+              label="servers"
+              title={`${activeServers} active`}
+              to="/dns"
+            />
+          </div>
+        )}
+
+        {/* ── Network overview cards (Overview tab) ───────────────────
+              ``items-start`` is the fix for the whitespace, not styling
+              (#942): the grid's default stretch made every card as tall
+              as the tallest in its row, so a card whose whole content is
+              "No subnets scheduled for decommission" rendered as a
+              full-height panel of nothing. Each card is now its natural
+              height, which self-compacts the empty ones without five
+              components needing an empty-state variant. */}
+        {tab === "overview" && (
+          <div className="grid items-start gap-3 grid-cols-1 sm:grid-cols-2 lg:grid-cols-4">
             <WidgetErrorBoundary title="ASN summary">
               <AsnSummaryCard />
             </WidgetErrorBoundary>
@@ -1567,7 +2124,12 @@ export function DashboardPage() {
           </WidgetErrorBoundary>
         )}
 
-        {/* ── DHCP traffic (DHCP tab only) ───────────────────────────── */}
+        {/* ── DHCP pools + traffic (DHCP tab only) ───────────────────── */}
+        {tab === "dhcp" && (
+          <WidgetErrorBoundary title="DHCP pools">
+            <DhcpPoolPressure />
+          </WidgetErrorBoundary>
+        )}
         {tab === "dhcp" && (
           <WidgetErrorBoundary title="DHCP traffic">
             <DHCPTrafficCard dhcpServers={dhcpServers} />
@@ -1709,10 +2271,11 @@ export function DashboardPage() {
                         <div className="flex-1">
                           <UtilizationBar
                             percent={subnet.utilization_percent}
+                            network={subnet.network}
                           />
                         </div>
-                        <span className="w-20 text-right text-[11px] tabular-nums text-muted-foreground">
-                          {subnet.allocated_ips} / {subnet.total_ips}
+                        <span className="w-24 shrink-0 whitespace-nowrap text-right text-[11px] tabular-nums text-muted-foreground">
+                          {capacityLabel(subnet)}
                         </span>
                       </Link>
                     ))
@@ -1750,24 +2313,37 @@ export function DashboardPage() {
                     recent.items.slice(0, 12).map((entry) => (
                       <div
                         key={entry.id}
-                        className="flex items-center gap-3 px-4 py-2 text-[11px]"
+                        className="flex items-center gap-2.5 px-4 py-2 text-[11px]"
                       >
                         <span className="w-14 flex-shrink-0 tabular-nums text-muted-foreground">
                           {humanTime(entry.timestamp)}
                         </span>
-                        <span className="w-36 flex-shrink-0 min-w-0">
+                        {/* The badge used to reserve 144 px for names that
+                            are usually six characters, so the two columns
+                            that identify WHAT changed and WHO changed it
+                            were squeezed into what was left and truncated
+                            to "Administr…". It now takes what it needs and
+                            truncates itself, with the full text on hover
+                            everywhere (#942). */}
+                        <span
+                          className="min-w-0 max-w-[9rem] flex-shrink-0 truncate"
+                          title={`${entry.action}${entry.resource_type ? ` · ${entry.resource_type.replace(/_/g, " ")}` : ""}`}
+                        >
                           <ActionBadge
                             action={entry.action}
                             result={entry.result}
                           />
                         </span>
-                        <span className="w-20 flex-shrink-0 truncate text-muted-foreground">
-                          {entry.resource_type.replace(/_/g, " ")}
-                        </span>
-                        <span className="flex-1 truncate font-mono">
+                        <span
+                          className="flex-1 truncate font-mono"
+                          title={entry.resource_display}
+                        >
                           {entry.resource_display}
                         </span>
-                        <span className="w-20 flex-shrink-0 truncate text-right text-muted-foreground">
+                        <span
+                          className="w-24 flex-shrink-0 truncate text-right text-muted-foreground"
+                          title={entry.user_display_name}
+                        >
                           {entry.user_display_name}
                         </span>
                       </div>
@@ -1814,10 +2390,13 @@ export function DashboardPage() {
                       )}
                     </span>
                     <div className="flex-1">
-                      <UtilizationBar percent={subnet.utilization_percent} />
+                      <UtilizationBar
+                        percent={subnet.utilization_percent}
+                        network={subnet.network}
+                      />
                     </div>
-                    <span className="w-24 text-right text-[11px] tabular-nums text-muted-foreground">
-                      {subnet.allocated_ips} / {subnet.total_ips}
+                    <span className="w-28 shrink-0 whitespace-nowrap text-right text-[11px] tabular-nums text-muted-foreground">
+                      {capacityLabel(subnet)}
                     </span>
                   </Link>
                 ))
@@ -1855,6 +2434,9 @@ export function DashboardPage() {
                       groupName={group?.name ?? "—"}
                       lastSeen={s.last_health_check_at}
                       isEnabled={s.is_enabled !== false}
+                      maintenance={s.maintenance_mode}
+                      configApplyStatus={s.config_apply_status}
+                      configApplyError={s.config_apply_error}
                     />
                   );
                 })}
@@ -1906,6 +2488,9 @@ export function DashboardPage() {
                       }
                       groupName={group?.name ?? "ungrouped"}
                       lastSeen={s.last_health_check_at}
+                      maintenance={s.maintenance_mode}
+                      configApplyStatus={s.config_apply_status}
+                      configApplyError={s.config_apply_error}
                     />
                   );
                 })}
@@ -2156,6 +2741,45 @@ function IpamSpaceFilter({
   );
 }
 
+/**
+ * Config-apply verdict chip (#882, surfaced here by #942).
+ *
+ * The failure this makes visible is silent by construction: an agent
+ * that could not apply its config keeps serving the PREVIOUS one and
+ * keeps heartbeating, so `status`, the health probe and `last_seen_at`
+ * all read normal while the zone or scope the operator saved is live
+ * nowhere.
+ *
+ * NULL renders nothing rather than "ok" — an agent too old to report a
+ * verdict is exactly where a silent revert would hide, and painting
+ * that green would be the same lie in a different colour.
+ */
+function ConfigApplyChip({
+  status,
+  error,
+}: {
+  status: ConfigApplyStatus | null;
+  error?: string | null;
+}) {
+  if (status == null || status === "ok") return null;
+  // `reverted` means a known-good config is still serving; the other two
+  // mean the running state is wrong or unknown.
+  const tone = status === "reverted" ? "amber" : "red";
+  const label = status === "reverted" ? "config reverted" : `config ${status}`;
+  return (
+    <StatusChip
+      tone={tone}
+      label={label.replace(/_/g, " ")}
+      title={
+        error ||
+        (status === "reverted"
+          ? "The saved config failed to apply; the agent rolled back and is serving the previous one."
+          : "The saved config failed to apply and the rollback did not succeed. Running state is unknown.")
+      }
+    />
+  );
+}
+
 function ServerRow({
   name,
   host,
@@ -2164,6 +2788,9 @@ function ServerRow({
   groupName,
   lastSeen,
   isEnabled = true,
+  maintenance = false,
+  configApplyStatus = null,
+  configApplyError = null,
 }: {
   name: string;
   host: string;
@@ -2172,6 +2799,9 @@ function ServerRow({
   groupName: string;
   lastSeen?: string | null;
   isEnabled?: boolean;
+  maintenance?: boolean;
+  configApplyStatus?: ConfigApplyStatus | null;
+  configApplyError?: string | null;
 }) {
   const dotCls =
     status === "active"
@@ -2218,10 +2848,173 @@ function ServerRow({
       <span className="w-24 truncate text-muted-foreground" title={groupName}>
         {groupName}
       </span>
-      <StatusIcon className="ml-auto h-3 w-3 flex-shrink-0 text-muted-foreground/50" />
+      <div className="ml-auto flex flex-shrink-0 items-center gap-1.5">
+        {maintenance && (
+          <StatusChip
+            tone="amber"
+            label="maintenance"
+            title="Operator-set maintenance mode — health alerts are suppressed for this server."
+          />
+        )}
+        <ConfigApplyChip status={configApplyStatus} error={configApplyError} />
+        <StatusIcon className="h-3 w-3 text-muted-foreground/50" />
+      </div>
       <span className="w-20 flex-shrink-0 text-right text-muted-foreground">
         {!isEnabled ? "disabled" : lastSeen ? humanTime(lastSeen) : "never"}
       </span>
+    </div>
+  );
+}
+
+/**
+ * DHCP pool pressure (#942, over the #913 occupancy computation).
+ *
+ * The DHCP tab used to show an empty traffic chart and a server list —
+ * nothing about leases or pools, despite "can a client still get an
+ * address" being the flagship DHCP question and the arithmetic having
+ * existed since #339. This answers it fleet-wide in one call.
+ *
+ * Dynamic pools only, matching the endpoint, the per-scope endpoint and
+ * the `dhcp_pool_exhaustion` alert evaluator: an excluded range is never
+ * offered to a client and a reserved one is *supposed* to fill up, so
+ * either would render as a red exhaustion bar for behaving correctly.
+ */
+function DhcpPoolPressure() {
+  const { data, isLoading, isError } = useQuery({
+    queryKey: ["dhcp-pool-occupancy", "fleet"],
+    queryFn: () => dhcpApi.fleetPoolOccupancy(8),
+    refetchInterval: 60_000,
+  });
+
+  // A failed fetch must not render as "no pools configured" — that is the
+  // same false-calm this panel exists to prevent, and an error boundary
+  // does not catch a rejected query.
+  if (isError) {
+    return (
+      <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-xs text-red-700 dark:border-red-900/50 dark:bg-red-950/30 dark:text-red-400">
+        Could not load pool occupancy — allocation pressure is unknown, not
+        clear.
+      </div>
+    );
+  }
+  if (isLoading) {
+    return (
+      <div className="rounded-lg border bg-card px-4 py-3 text-xs text-muted-foreground">
+        Loading pool occupancy…
+      </div>
+    );
+  }
+  if (!data || data.pool_count === 0) {
+    return (
+      <div className="rounded-lg border bg-card px-4 py-3 text-xs text-muted-foreground">
+        No dynamic DHCP pools configured. Add a pool to a scope to see
+        allocation pressure here.
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-3">
+      <div className="grid gap-3 grid-cols-2 lg:grid-cols-4">
+        <KpiCard
+          label="Active leases"
+          value={data.active_lease_count.toLocaleString()}
+          sub="distinct addresses"
+          icon={Activity}
+          to="/dhcp"
+        />
+        <KpiCard
+          label="Dynamic pools"
+          value={data.pool_count}
+          sub="fleet-wide"
+          icon={Layers}
+          to="/dhcp"
+        />
+        <KpiCard
+          label="Pools ≥ 80%"
+          value={data.pools_warning}
+          tone={data.pools_warning > 0 ? "warn" : "good"}
+          sub="nearing exhaustion"
+          icon={AlertTriangle}
+          to="/dhcp"
+        />
+        <KpiCard
+          label="Pools ≥ 95%"
+          value={data.pools_critical}
+          tone={data.pools_critical > 0 ? "bad" : "good"}
+          sub="effectively full"
+          icon={AlertTriangle}
+          to="/dhcp"
+        />
+      </div>
+
+      <div className="rounded-lg border bg-card">
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b px-4 py-2.5">
+          <div className="flex items-center gap-2">
+            <Server className="h-3.5 w-3.5 text-muted-foreground" />
+            <h3 className="text-xs font-semibold uppercase tracking-wider">
+              Pools nearest exhaustion
+            </h3>
+            <span className="text-[11px] text-muted-foreground">
+              showing {data.pools.length} of {data.pool_count}
+            </span>
+          </div>
+          <span
+            className="text-[11px] text-muted-foreground"
+            title="Occupancy is derived from mirrored lease rows, so its freshness follows the last lease pull — not the moment this page rendered."
+          >
+            as of {humanTime(data.computed_at)}
+          </span>
+        </div>
+        <div className="overflow-x-auto">
+          <div className="min-w-[620px] divide-y">
+            {data.pools.map((p) => (
+              <Link
+                key={p.pool_id}
+                // DHCPPage restores from ``group`` / ``server`` only —
+                // a ``scope`` param is silently dropped and the click
+                // lands on whatever was last selected. Deep-link to the
+                // owning group, whose panel lists this scope.
+                to={`/dhcp?group=${p.group_id}`}
+                className="flex items-center gap-4 px-4 py-2.5 transition-colors hover:bg-accent/40"
+              >
+                <span
+                  className="w-52 shrink-0 truncate font-mono text-xs"
+                  title={`${p.start_ip} – ${p.end_ip}`}
+                >
+                  {p.start_ip}–{p.end_ip}
+                </span>
+                <span className="w-36 truncate text-xs text-muted-foreground">
+                  {p.scope_name || p.subnet_network || (
+                    <span className="text-muted-foreground/40">—</span>
+                  )}
+                </span>
+                <span className="w-24 truncate text-[11px] text-muted-foreground">
+                  {p.group_name}
+                </span>
+                {/* A scope the operator deactivated is not handing out
+                    addresses, so its number is real but not urgent. Flagged
+                    rather than hidden — the exhaustion alert still fires on
+                    these, and a panel that silently disagreed with the
+                    alerting is how a wrong all-clear gets reported. */}
+                {!p.scope_is_active && (
+                  <StatusChip
+                    tone="gray"
+                    label="inactive"
+                    title="The parent scope is deactivated — it is not currently serving addresses."
+                  />
+                )}
+                <div className="flex-1">
+                  <UtilizationBar percent={p.percent} />
+                </div>
+                <span className="w-28 shrink-0 whitespace-nowrap text-right text-[11px] tabular-nums text-muted-foreground">
+                  {p.assigned.toLocaleString()} / {p.total.toLocaleString()}
+                </span>
+              </Link>
+            ))}
+          </div>
+        </div>
+      </div>
     </div>
   );
 }
@@ -3630,13 +4423,7 @@ function NetworkPanel() {
           tone={data.asn_drift_count > 0 ? "warn" : "good"}
           to="/network/asns"
         />
-        <NetworkKpi
-          label="RPKI expiring"
-          value={data.rpki_expiring_count}
-          tone={data.rpki_expiring_count > 0 ? "warn" : "good"}
-          to="/network/asns"
-          hint="< 30 d"
-        />
+        <RpkiExpiringKpi data={data} />
         <NetworkKpi
           label="RPKI expired"
           value={data.rpki_expired_count}
@@ -3803,23 +4590,82 @@ function NetworkPanel() {
   );
 }
 
+/**
+ * RPKI "expiring soon" KPI (#942).
+ *
+ * Three states, because a bare count answered the wrong question. An
+ * empty ROA table and a healthy one both rendered a green 0, and a pull
+ * that stopped days ago rendered whatever it last wrote as though it
+ * were current. The count is only meaningful if the data behind it is
+ * fresh, so freshness is checked first and reported instead of the
+ * count when it fails.
+ *
+ * The threshold is 24 h against a default refresh interval of 4 h (beat
+ * ticks hourly) — six missed cycles, generous enough not to flap on a
+ * slow sweep and short enough to notice a dead task the same day.
+ */
+function RpkiExpiringKpi({ data }: { data: NetworkDashboardSummary }) {
+  const STALE_AFTER_MS = 24 * 60 * 60 * 1000;
+  const checkedAt = data.rpki_last_checked_at;
+  const ageMs = checkedAt ? Date.now() - new Date(checkedAt).getTime() : null;
+  const stale = ageMs != null && ageMs > STALE_AFTER_MS;
+
+  if (data.rpki_total_count === 0) {
+    return (
+      <NetworkKpi
+        label="RPKI expiring"
+        value="—"
+        tone="default"
+        to="/network/asns"
+        hint="no ROAs tracked"
+        title="No RPKI ROAs have been pulled yet. Add a public ASN and the hourly refresh will populate them."
+      />
+    );
+  }
+  if (stale || checkedAt === null) {
+    return (
+      <NetworkKpi
+        label="RPKI expiring"
+        value="stale"
+        tone="warn"
+        to="/network/asns"
+        hint={checkedAt ? `checked ${humanTime(checkedAt)}` : "never checked"}
+        title={`The ROA refresh has not run recently, so any count here would be fiction. ${data.rpki_total_count} ROAs tracked.`}
+      />
+    );
+  }
+  return (
+    <NetworkKpi
+      label="RPKI expiring"
+      value={data.rpki_expiring_count}
+      tone={data.rpki_expiring_count > 0 ? "warn" : "good"}
+      to="/network/asns"
+      hint={`< 30 d · of ${data.rpki_total_count.toLocaleString()} · checked ${humanTime(checkedAt)}`}
+      title="ROAs inside 30 days of their certificate expiry. Only sources whose validity field is a per-ROA lifetime contribute — Cloudflare's rpki.json ships a short-cycle cache expiry that every ROA carries, so it is deliberately not counted here."
+    />
+  );
+}
+
 function NetworkKpi({
   label,
   value,
   tone,
   to,
   hint,
+  title,
 }: {
   label: string;
   value: number | string;
   tone: Tone;
   to: string;
   hint?: string;
+  title?: string;
 }) {
   const cls = TONE_CLASS[tone];
   return (
     <Link
       to={to}
+      title={title}
       className="rounded-lg border bg-card p-3 transition-colors hover:bg-accent/40"
     >
       <p className="text-[11px] uppercase tracking-wider text-muted-foreground">
@@ -3873,8 +4719,7 @@ function IntegrationsDashboardTabPanel() {
           >
             Features → Integrations
           </Link>{" "}
-          to wire up Kubernetes / Docker / Proxmox / OPNsense / Cloud /
-          Tailscale / UniFi mirrors.
+          to enable read-only infrastructure mirrors.
         </p>
       </div>
     );
@@ -4024,17 +4869,29 @@ function IntegrationCard({ panel }: { panel: IntegrationsDashboardPanel }) {
  * say which one you mean, and only one of them is reassuring.
  */
 function DNSThreatCard() {
+  // Gate the QUERY on the module, not just the render (#942). Hiding
+  // the card on a 404 still fired the request — and with a 60 s
+  // refetch, that is a console error every minute forever on every
+  // install with the module off. The 404 handling below stays as a
+  // backstop for the module being turned off while the page is open.
+  // ``ready &&`` is load-bearing, not belt-and-braces: ``enabled``
+  // optimistically returns true until the module set has loaded, so
+  // gating on it alone still fires one 404 per hard page load — see
+  // the hook's own docstring.
+  const { enabled, ready } = useFeatureModules();
+  const moduleEnabled = ready && enabled("security.dns_threat");
   const { data, isLoading, error } = useQuery({
     queryKey: ["dashboards", "dns-threat"],
     queryFn: () => dnsThreatApi.summary({ hours: 24 }),
     refetchInterval: 60_000,
     retry: false,
+    enabled: moduleEnabled,
   });
 
   const moduleOff =
     (error as { response?: { status?: number } } | null)?.response?.status ===
     404;
-  if (moduleOff || isLoading) return null;
+  if (!moduleEnabled || moduleOff || isLoading) return null;
   if (!data) return null;
 
   const tone: Tone = !data.has_data

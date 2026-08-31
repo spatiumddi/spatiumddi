@@ -144,7 +144,7 @@ async def test_dhcp_timeseries_returns_empty_when_no_data(
     assert resp.status_code == 200
     body = resp.json()
     assert body["points"] == []
-    assert body["bucket_seconds"] == 60
+    assert body["bucket_seconds"] == 300
 
 
 @pytest.mark.asyncio
@@ -157,6 +157,42 @@ async def test_7d_window_uses_5min_buckets(client: AsyncClient, db_session: Asyn
     )
     assert resp.status_code == 200
     assert resp.json()["bucket_seconds"] == 300
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("window", "expected_bucket", "max_points"),
+    [
+        ("1h", 60, 60),
+        ("6h", 60, 360),
+        # 24 h is the crossover (#942). At raw 60 s it is 1,440 points
+        # into a ~1,300 px chart — more points than pixels, which paints
+        # a low-rate series as a solid band instead of a line.
+        ("24h", 300, 288),
+        ("7d", 300, 2016),
+    ],
+)
+async def test_window_bucketing_keeps_points_plottable(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    window: str,
+    expected_bucket: int,
+    max_points: int,
+) -> None:
+    """Every window must resolve to a bucket that keeps it under a
+    screen's worth of points. Guards both directions: shrinking a bucket
+    reintroduces the smear, growing one throws away shape."""
+    _, token = await _make_user(db_session)
+    resp = await client.get(
+        f"/api/v1/metrics/dns/timeseries?window={window}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["bucket_seconds"] == expected_bucket
+    from app.api.v1.metrics.router import WINDOW_SECONDS
+
+    assert WINDOW_SECONDS[window] // body["bucket_seconds"] == max_points
 
 
 @pytest.mark.asyncio
@@ -210,3 +246,87 @@ async def test_dhcp_agent_metrics_ingest_roundtrip(
     assert len(body["points"]) == 1
     assert body["points"][0]["discover"] == 7
     assert body["points"][0]["ack"] == 5
+
+
+@pytest.mark.asyncio
+async def test_partial_bucket_reports_the_seconds_it_actually_covers(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The newest 5-minute bucket has only had one or two 60 s samples
+    reported into it (#942).
+
+    Dividing that partial sum by a full 300 renders a 70%+ phantom dip at
+    the right-hand edge of every chart, on every refresh — measured on the
+    dev estate as 0.027 against a steady 0.093. ``covered_seconds`` is what
+    makes the rate honest, so it must reflect distinct agent buckets, not
+    the nominal bucket width.
+    """
+    _, token = await _make_user(db_session)
+    server = await _make_dns_server(db_session)
+
+    now = datetime.now(UTC).replace(second=0, microsecond=0)
+    # A complete 5-minute bucket, then a partial one holding a single
+    # sample. date_bin anchors on 2000-01-01, so :00 and :05 are boundaries.
+    base = now.replace(minute=(now.minute // 10) * 10) - timedelta(minutes=20)
+    for i in range(5):
+        db_session.add(
+            DNSMetricSample(
+                server_id=server.id,
+                bucket_at=base + timedelta(minutes=i),
+                queries_total=10,
+            )
+        )
+    db_session.add(
+        DNSMetricSample(
+            server_id=server.id,
+            bucket_at=base + timedelta(minutes=5),
+            queries_total=10,
+        )
+    )
+    await db_session.commit()
+
+    body = (
+        await client.get(
+            "/api/v1/metrics/dns/timeseries?window=24h",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    ).json()
+    assert body["bucket_seconds"] == 300
+    points = {p["t"]: p for p in body["points"]}
+    full, partial = sorted(points.values(), key=lambda p: p["t"])[:2]
+
+    assert full["covered_seconds"] == 300
+    assert partial["covered_seconds"] == 60
+    # The rate the chart draws. Same underlying qps; without the fix the
+    # partial point would render at a fifth of it.
+    assert full["queries_total"] / full["covered_seconds"] == pytest.approx(
+        partial["queries_total"] / partial["covered_seconds"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_covered_seconds_is_a_time_span_not_a_row_count(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Two servers reporting the same minute cover 60 seconds, not 120.
+
+    Counting rows would halve the aggregate rate on every multi-server
+    deployment — i.e. on exactly the ones with enough traffic to look at.
+    """
+    _, token = await _make_user(db_session)
+    s1 = await _make_dns_server(db_session)
+    s2 = await _make_dns_server(db_session)
+    now = datetime.now(UTC).replace(second=0, microsecond=0)
+    for srv in (s1, s2):
+        db_session.add(DNSMetricSample(server_id=srv.id, bucket_at=now, queries_total=30))
+    await db_session.commit()
+
+    body = (
+        await client.get(
+            "/api/v1/metrics/dns/timeseries?window=1h",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    ).json()
+    point = body["points"][0]
+    assert point["queries_total"] == 60
+    assert point["covered_seconds"] == 60

@@ -26,7 +26,7 @@ from typing import Any
 
 from fastapi import APIRouter
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.api.deps import DB, CurrentUser  # noqa: F401 — auth via dep
 from app.models.asn import ASN, ASNRpkiRoa
@@ -95,6 +95,10 @@ class NetworkDashboardSummary(BaseModel):
     asn_drift_count: int
     rpki_expiring_count: int
     rpki_expired_count: int
+    # Total ROAs tracked + when the pull last touched one. Lets the panel
+    # distinguish a real all-clear from stale or absent data (#942).
+    rpki_total_count: int
+    rpki_last_checked_at: datetime | None
     circuit_term_expiring_count: int
     circuit_status_changed_count: int
     service_orphan_count: int
@@ -178,6 +182,15 @@ async def network_summary(
     expired_rows = (
         (await db.execute(select(ASNRpkiRoa).where(ASNRpkiRoa.state == "expired"))).scalars().all()
     )
+    # Freshness of the underlying pull (#942). Without this the panel
+    # cannot tell "nothing is expiring" from "the refresh task died
+    # three weeks ago and these counts are fiction" — and those want
+    # opposite responses from the operator. Reported, never inferred:
+    # the frontend decides what counts as stale.
+    rpki_total_count = (await db.execute(select(func.count()).select_from(ASNRpkiRoa))).scalar_one()
+    rpki_last_checked_at = (
+        await db.execute(select(func.max(ASNRpkiRoa.last_checked_at)))
+    ).scalar_one()
     rpki_expiring: list[RpkiRoaRow] = []
     for r in expiring_rows[:_DETAIL_LIMIT]:
         asn_number = await _resolve_asn_number(db, r.asn_id)
@@ -344,6 +357,8 @@ async def network_summary(
         asn_drift_count=asn_drift_count,
         rpki_expiring_count=len(expiring_rows),
         rpki_expired_count=len(expired_rows),
+        rpki_total_count=rpki_total_count,
+        rpki_last_checked_at=rpki_last_checked_at,
         circuit_term_expiring_count=circuit_term_expiring_count,
         circuit_status_changed_count=circuit_status_changed_count,
         service_orphan_count=service_orphan_count,
