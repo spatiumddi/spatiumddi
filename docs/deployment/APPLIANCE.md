@@ -106,8 +106,18 @@ does not converge at all. Split large namespaces across groups.
 
 For a 3-node control plane, size every member like the standalone
 recommendation (4 vCPU / 8 GiB); the members carry the same api / worker /
-Postgres / Redis replicas, and the cluster's failure modes under load are
-tracked separately (see the HA notes below).
+Postgres / Redis replicas. Measured on `main` (2026-09-03): three 6.5 GiB /
+4 vCPU nodes formed cleanly and kept every api replica and every k3s
+server up through the same 250k-record / 20k-device load and a kill-leader
+drill (0 k3s restarts, at most one api restart).
+
+**Control-plane HA is not serving HA.** The DNS and DHCP roles are assigned
+per appliance, and only the nodes that carry a role run the `dns-bind9` /
+`dhcp-kea` pods. In that drill the roles sat on the seed alone, so for the
+~2 minutes between the seed going down and coming back the survivors
+answered ~5 % of the queries the load generator sent — the control plane
+had failed over, the data plane had nothing to serve with. Assign the DNS
+and DHCP roles on every node you expect to keep serving during a failover.
 
 The installer's **hard disk floor is 32 GiB** for every role (raised from 24 GiB — issue #312: a 24 GiB disk left `/var` only ~7 GiB, and the Control plane's first boot tipped the kubelet DiskPressure threshold into an eviction storm). 2 GiB RAM boots a single-node control plane but is tight once Postgres + Redis + the Python api/worker are all resident; 8 GiB is the comfortable recommendation. When the operator picks the **Control plane** role on a box below the recommended 40 GiB disk / 8 GiB RAM, `spatium-install` shows a soft sizing warning before proceeding (the lighter Appliance/agent role is fine at the 32 GiB floor and gets no warning). Each control-plane **HA member** sizes the same as a standalone control plane (4 vCPU / 8 GiB) — every member runs a full api / worker / Postgres replica / Redis. SSD is strongly preferred for the etcd + Postgres write path; the installer's disk floor assumes the baked image set lands on the slots, not RAM.
 
