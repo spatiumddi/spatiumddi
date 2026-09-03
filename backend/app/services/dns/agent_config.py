@@ -256,7 +256,37 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
                 }
             )
 
-    def _rec_dict(r: DNSRecord) -> dict[str, Any]:
+    # Every record of every zone in ONE query, as column rows rather than
+    # ORM instances. This was one ``select(DNSRecord)`` per zone inside the
+    # loop below (N+1), and each row came back as a tracked ORM object — on
+    # the sizing campaign's 250k A+PTR zone the build held ~500k instances
+    # in the identity map for the life of the request, most of the api's
+    # working set on every long-poll (2026-09-02/03). Only the eight fields
+    # the bundle and the view filter read are fetched, ordered by (zone,
+    # id) so the rendered payload — and therefore the ETag — is the same
+    # from one poll to the next.
+    records_by_zone: dict[Any, list[Any]] = {}
+    if zone_ids:
+        rec_res = await db.execute(
+            select(
+                DNSRecord.zone_id,
+                DNSRecord.name,
+                DNSRecord.record_type,
+                DNSRecord.ttl,
+                DNSRecord.value,
+                DNSRecord.priority,
+                DNSRecord.weight,
+                DNSRecord.port,
+                DNSRecord.view_id,
+                DNSRecord.pool_member_id,
+            )
+            .where(DNSRecord.zone_id.in_(zone_ids))
+            .order_by(DNSRecord.zone_id, DNSRecord.id)
+        )
+        for rec in rec_res:
+            records_by_zone.setdefault(rec.zone_id, []).append(rec)
+
+    def _rec_dict(r: Any) -> dict[str, Any]:
         return {
             "name": r.name,
             "type": r.record_type,
@@ -325,9 +355,7 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
         # historically gated this, but agents need records to render zone
         # files for serving — primary/secondary distinction matters for
         # accepting RFC 2136 updates, not for which server gets the data.
-        rec_rows = list(
-            (await db.execute(select(DNSRecord).where(DNSRecord.zone_id == z.id))).scalars().all()
-        )
+        rec_rows: list[Any] = records_by_zone.get(z.id, [])
 
         if not has_views:
             # Flat render — one zone copy, all records, no view (today's path).
