@@ -4070,11 +4070,26 @@ async def replace_control_plane_member(
             f"Appliance {row.hostname!r} is the etcd seed — replacing the seed is a "
             "separate migration flow, out of scope here.",
         )
-    if row.cluster_role != CLUSTER_ROLE_MEMBER:
+    # A joiner whose join FAILED is replaceable too. The failure that needs
+    # this flow is the one the classifier names "already an etcd member":
+    # the node's k3s got far enough to register its etcd member (or the
+    # seed kept a stale one under its hostname), then died — so the seed
+    # holds a member nobody serves, every re-promote is refused with
+    # "duplicate node name", and Replace was the one route that evicts the
+    # stale Node/member by name, yet it 409'd on the row not being settled
+    # (appliance sizing campaign, 2026-09-02: a 3-node formation stuck on
+    # one such joiner, cleared only by hand). In-flight joiners still 409.
+    failed_joiner = (
+        row.cluster_role is None
+        and row.cluster_join_state == CLUSTER_JOIN_STATE_FAILED
+        and row.desired_cluster_role is None
+    )
+    if row.cluster_role != CLUSTER_ROLE_MEMBER and not failed_joiner:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
-            f"Appliance {row.hostname!r} isn't a settled control-plane member — nothing "
-            "to evict. (Demote in-flight joiners; this is for replacing a dead member.)",
+            f"Appliance {row.hostname!r} isn't a settled control-plane member or a "
+            "failed joiner — nothing to evict. (Demote in-flight joiners; this is for "
+            "replacing a dead member or clearing a failed join's stale etcd member.)",
         )
 
     # Drop the dead member from the cluster accounting + flag it for the

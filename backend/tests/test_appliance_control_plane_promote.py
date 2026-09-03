@@ -813,3 +813,56 @@ async def test_restore_non_superadmin_refused(
         headers=_hdr(token),
     )
     assert resp.status_code == 403
+
+
+async def test_replace_accepts_a_failed_joiner(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    """A joiner whose join died "already an etcd member" holds a stale etcd
+    member under its hostname; Replace is the route that evicts it by name,
+    and it used to 409 on the row not being a settled member (sizing
+    campaign, 2026-09-02)."""
+    token = await _admin(db_session)
+    await _seed(db_session)
+    await _appliance(db_session, "m1", cluster_role=CLUSTER_ROLE_MEMBER, node_ip="10.0.0.2")
+    stuck = await _appliance(
+        db_session,
+        "m2",
+        appliance_variant="appliance",
+        cluster_role=None,
+        desired_cluster_role=None,
+        cluster_join_state="failed",
+        cluster_join_reason="this hostname is already an etcd member of the target cluster — evict it",
+        node_ip="10.0.0.3",
+    )
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/v1/appliance/fleet/control-plane/{stuck.id}/replace",
+        headers=_hdr(token),
+    )
+    assert resp.status_code == 200, resp.text
+    await db_session.refresh(stuck)
+    assert stuck.evict_requested is True
+    assert stuck.cluster_join_state == "evicting"
+
+
+async def test_replace_still_refuses_an_in_flight_joiner(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    token = await _admin(db_session)
+    await _seed(db_session)
+    joining = await _appliance(
+        db_session,
+        "m3",
+        appliance_variant="appliance",
+        desired_cluster_role="member",
+        cluster_join_state="joining",
+    )
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/v1/appliance/fleet/control-plane/{joining.id}/replace",
+        headers=_hdr(token),
+    )
+    assert resp.status_code == 409
