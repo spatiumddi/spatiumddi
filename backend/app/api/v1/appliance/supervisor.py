@@ -117,6 +117,39 @@ from app.services.appliance.syslog import syslog_bundle
 
 logger = structlog.get_logger(__name__)
 
+# A transient join failure keeps the promote desired-state (so the supervisor
+# re-fires the join, bounded by its own per-target attempt ceiling) for this
+# long after the latest reported failure; then the row is cleared exactly as
+# a permanent failure is, and the operator re-promotes.
+_JOIN_AUTO_RETRY_WINDOW = timedelta(minutes=15)
+# The runner's classifier (appliance/.../spatium-cluster-join
+# classify_join_failure) names the two failures no retry can fix.
+_PERMANENT_JOIN_FAILURE_MARKERS = (
+    "already an etcd member",
+    "different token",
+)
+
+
+def _join_failure_is_permanent(reason: str | None) -> bool:
+    """PURE: a join failure an automatic retry cannot fix (stale etcd member
+    under this hostname, bootstrap-token mismatch). Everything else — the
+    seed unreachable while it adds a learner, a readiness timeout, an
+    unclassified k3s exit — is treated as transient and retried."""
+    text = (reason or "").lower()
+    return any(marker in text for marker in _PERMANENT_JOIN_FAILURE_MARKERS)
+
+
+def _join_retry_window_elapsed(state_at: datetime | None, now: datetime | None = None) -> bool:
+    """PURE: whether the latest failure is older than the auto-retry window.
+    An unknown clock counts as elapsed — never retry blind."""
+    if state_at is None:
+        return True
+    now = now or datetime.now(UTC)
+    if state_at.tzinfo is None:
+        state_at = state_at.replace(tzinfo=UTC)
+    return now - state_at > _JOIN_AUTO_RETRY_WINDOW
+
+
 router = APIRouter()
 
 
@@ -1917,16 +1950,48 @@ async def supervisor_heartbeat(
         row.desired_cluster_role == DESIRED_CLUSTER_ROLE_MEMBER
         and row.cluster_join_state == CLUSTER_JOIN_STATE_FAILED
     ):
-        row.desired_cluster_role = None
-        row.desired_k3s_server_url = None
-        row.desired_k3s_join_token_encrypted = None
-        logger.warning(
-            "control_plane_join_failed",
-            appliance_id=str(row.id),
-            hostname=row.hostname,
-            reason=row.cluster_join_reason,
-            detail="cleared desired-state; re-promote to retry",
-        )
+        # …but not on the FIRST transient failure. Two members promoted
+        # together race each other into the seed's etcd (one of them is a
+        # learner while the other is being added), and the loser's join
+        # dies with "could not reach the seed" / a readiness timeout that a
+        # second attempt a minute later survives. Clearing the desired-state
+        # here turned that flake into an operator round-trip on every third
+        # formation (appliance sizing campaign, 2026-09-02/03: 3-node
+        # formations stuck at 2 until someone re-promoted by hand).
+        #
+        # So a transient failure keeps the desired-state and lets the
+        # supervisor re-fire the join — it does so on its own once the row
+        # still says "member" and its `.state` says failed, bounded by its
+        # per-target attempt ceiling (appliance_state._CLUSTER_JOIN_MAX_
+        # ATTEMPTS) — for up to _JOIN_AUTO_RETRY_WINDOW after the latest
+        # failure. A PERMANENT failure (the runner's classifier names the
+        # two: a stale etcd member under this hostname, a token mismatch)
+        # clears immediately as before: no retry can fix those, the
+        # operator has to evict or re-pair.
+        if _join_failure_is_permanent(row.cluster_join_reason) or _join_retry_window_elapsed(
+            row.cluster_join_state_at
+        ):
+            row.desired_cluster_role = None
+            row.desired_k3s_server_url = None
+            row.desired_k3s_join_token_encrypted = None
+            logger.warning(
+                "control_plane_join_failed",
+                appliance_id=str(row.id),
+                hostname=row.hostname,
+                reason=row.cluster_join_reason,
+                detail="cleared desired-state; re-promote to retry",
+            )
+        else:
+            logger.warning(
+                "control_plane_join_retrying",
+                appliance_id=str(row.id),
+                hostname=row.hostname,
+                reason=row.cluster_join_reason,
+                detail=(
+                    "transient join failure — desired-state kept so the supervisor "
+                    f"re-fires the join (window {_JOIN_AUTO_RETRY_WINDOW})"
+                ),
+            )
     # Auto-clear the demote desired-state once the leave landed: the
     # supervisor reports ``left`` → the node is back to a plain
     # application appliance.
