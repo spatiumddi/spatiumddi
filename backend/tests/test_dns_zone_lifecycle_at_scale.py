@@ -174,3 +174,54 @@ async def test_bulk_delete_keeps_the_row_only_when_the_wire_delete_failed(
     assert "primary refused" in body["skipped"][0]["reason"]
     # The failed one is still published, so it is still in the database.
     assert await _record_count(db_session, zone.id) == 1
+
+
+# ── 2. permanent zone delete at scale ────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_permanent_zone_delete_is_set_based_and_sweeps_its_queued_ops(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    headers = await _admin_headers(db_session)
+    _grp, server, zone = await _agent_group_and_zone(db_session)
+    rows = await _add_records(db_session, zone, 400)
+    # Queued ops the agent has not picked up yet — a zone that no longer
+    # exists must not leave them behind to fail on the agent later.
+    for rec in rows[:5]:
+        db_session.add(
+            DNSRecordOp(
+                server_id=server.id,
+                zone_name=zone.name,
+                op="create",
+                record={"name": rec.name, "type": "A", "value": rec.value},
+                state="pending",
+            )
+        )
+    await db_session.commit()
+    zone_id, zone_name = zone.id, zone.name
+    assert await _record_count(db_session, zone_id) == 400
+    assert len(await _ops(db_session, zone_name)) == 5
+
+    record_deletes: list[str] = []
+
+    def _count(conn, cursor, statement, parameters, context, executemany):  # noqa: ANN001
+        if statement.lstrip().upper().startswith("DELETE FROM DNS_RECORD "):
+            record_deletes.append(statement)
+
+    event.listen(Engine, "before_cursor_execute", _count)
+    try:
+        resp = await client.delete(f"{_zone_url(zone)}?permanent=true", headers=headers)
+    finally:
+        event.remove(Engine, "before_cursor_execute", _count)
+    assert resp.status_code == 204, resp.text
+
+    db_session.expire_all()
+    assert await _record_count(db_session, zone_id) == 0
+    assert await _ops(db_session, zone_name) == []
+    assert (
+        await db_session.execute(select(DNSZone).where(DNSZone.id == zone_id))
+    ).scalar_one_or_none() is None
+    # ONE statement for the records, never one per row: 400 rows here, 250k-1M
+    # on the appliance the campaign measured.
+    assert len(record_deletes) == 1, record_deletes
