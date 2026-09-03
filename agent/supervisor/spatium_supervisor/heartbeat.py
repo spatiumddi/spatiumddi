@@ -976,8 +976,15 @@ def heartbeat_once(
         ml_bgp_peers = body_out.get("desired_metallb_bgp_peers") or []
         ml_bgp_advertisements = body_out.get("desired_metallb_bgp_advertisements") or []
 
+        # The api / worker memory limits and worker concurrency ride along,
+        # sized from this node's RAM (k8s_api.control_plane_resources) — the
+        # chart's BYO-cluster defaults gave way before the VM did on the
+        # appliance, and a kubectl patch never survived a k3s restart.
         cp_changed, cp_err = k8s_api.apply_control_plane_overrides(
-            cp_size, str(ml_vip), web_ui_allowed_cidrs=list(web_ui_cidrs)
+            cp_size,
+            str(ml_vip),
+            web_ui_allowed_cidrs=list(web_ui_cidrs),
+            mem_total_mib=k8s_api.node_memory_mib(),
         )
         if cp_changed:
             log.info(
