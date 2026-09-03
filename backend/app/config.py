@@ -96,6 +96,12 @@ class Settings(BaseSettings):
     dns_agent_token_ttl_hours: int = 24
     dns_agent_longpoll_timeout: int = 30
     dns_require_agent_approval: bool = False
+    # Pending record ops shipped per config bundle. The queue is drained a
+    # page at a time (the agent acks a page, the next long-poll ships the
+    # next); unbounded, a bulk seed's backlog was materialised whole into
+    # one response — 500k ops took the api to 4.2 GB and a memcg kill on
+    # every poll (appliance sizing campaign, 2026-09-02/03).
+    dns_agent_ops_batch: int = 5000
 
     # DHCP agent
     dhcp_agent_key: str = ""

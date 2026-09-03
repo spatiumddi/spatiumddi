@@ -17,10 +17,11 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, TypedDict
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.config import settings
 from app.core.crypto import decrypt_str
 from app.models.appliance import ApplianceCertificate
 from app.models.dns import (
@@ -381,6 +382,7 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
     # it. Failure ack resets to pending (with attempt++); after 5
     # failures it becomes "failed" and stays out.
     pending_ops: list[dict[str, Any]] = []
+    pending_ops_remaining = 0
     # Issue #182: pause pending-op dispatch when the server is in
     # operator-set maintenance mode. Ops accumulate in ``state=pending``
     # and ship as soon as the operator resumes — no work is lost.
@@ -412,15 +414,39 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
         if stale_ops:
             await db.flush()
     else:
+        # One PAGE of the queue, oldest first, never the whole backlog. The
+        # agent applies a page and acks it on its next heartbeat; the page
+        # it was shipped is ``in_flight`` meanwhile, so the next long-poll
+        # (which returns immediately while ops are pending) ships the next
+        # page. Unbounded, a bulk seed's backlog — 500k ops for 250k A+PTR
+        # records on one agent server — was materialised whole into every
+        # response: the api reached 4.2 GB and was memcg-killed on each poll,
+        # the bundle never reached the data plane, and the queue could only
+        # be cleared by hand (appliance sizing campaign, 2026-09-02/03).
+        # ``pending_ops_remaining`` tells the agent (and an operator reading
+        # the bundle) how deep the backlog still is.
+        batch = max(1, int(settings.dns_agent_ops_batch))
         op_res = await db.execute(
             select(DNSRecordOp)
             .where(
                 DNSRecordOp.server_id == server.id,
                 DNSRecordOp.state == "pending",
             )
-            .order_by(DNSRecordOp.created_at)
+            .order_by(DNSRecordOp.created_at, DNSRecordOp.id)
+            .limit(batch)
         )
         ops_to_dispatch = list(op_res.scalars().all())
+        if len(ops_to_dispatch) == batch:
+            pending_ops_remaining = int(
+                (
+                    await db.execute(
+                        select(func.count()).where(
+                            DNSRecordOp.server_id == server.id,
+                            DNSRecordOp.state == "pending",
+                        )
+                    )
+                ).scalar_one()
+            ) - len(ops_to_dispatch)
     for op in ops_to_dispatch:
         pending_ops.append(
             {
@@ -802,6 +828,7 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
         "forwarders": options_block["forwarders"],
         "blocklists": blocklists_payload,
         "pending_record_ops": pending_ops,
+        "pending_ops_remaining": pending_ops_remaining,
         "catalog": catalog_block,
         "fleet_upgrade": fleet_upgrade_block,
         "snmp_settings": snmp_block,
