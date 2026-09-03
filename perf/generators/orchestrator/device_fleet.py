@@ -64,6 +64,7 @@ from spddi_perf.runpaths import RunPaths  # noqa: E402
 
 import dhcp_packet as dp  # noqa: E402
 from lifecycle_log import LatencyAccumulator, LifecycleLog  # noqa: E402
+from relay_sockets import open_relay_sockets  # noqa: E402
 
 # dnspython is an off-box runtime dep (perf/requirements.txt: dnspython>=2.6); resolve
 # it once at import so the per-query hot path doesn't re-run the import machinery. When
@@ -318,6 +319,10 @@ class Orchestrator:
 
         self._stop = asyncio.Event()
         self._sock: socket.socket | None = None
+        # Relay topology: giaddr -> the socket bound to that address (see
+        # open_relay_sockets); a giaddr without its own socket sends and receives
+        # on the wildcard ``_sock``.
+        self._socks: dict[str, socket.socket] = {}
         self._last_seen_tick = -1
         self._tick_seen_at = time.monotonic()
         self._arrival_accum = 0.0
@@ -344,33 +349,14 @@ class Orchestrator:
 
     # ---------------- socket ----------------
     def _open_socket(self) -> None:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        # Multi-homed egress (perf #454). In broadcast topology the DISCOVER goes
-        # to 255.255.255.255; on a box with several NICs (docker bridges, tailscale,
-        # …) the kernel won't necessarily send it out the one facing the appliance.
-        # Bind the socket to the configured device so it does. SO_BINDTODEVICE needs
-        # CAP_NET_RAW (the load-gen already runs as root for the :67/:68 bind).
         iface = getattr(self.m.target.dhcp, "iface", "") or ""
-        if iface:
-            try:
-                s.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, iface.encode())
-                self.log.info("dhcp socket bound to device", extra={"fields": {
-                    "event": "socket_bindtodevice", "iface": iface}})
-            except OSError as exc:
-                self.log.error("SO_BINDTODEVICE(%s) failed: %s — broadcast may not "
-                               "reach the appliance on a multi-homed box", iface, exc,
-                               extra={"fields": {"event": "bindtodevice_failed", "iface": iface}})
         # Relay topology: bind to the relay/server port (67) so Kea unicasts replies
         # to giaddr:67 back to us. Broadcast topology: bind to the client port (68).
         bind_port = 67 if self.relay else 68
-        # 0.0.0.0 is required, not a misconfiguration: a simulated client has no
-        # lease yet, so it must listen on the wildcard address to receive the
-        # broadcast OFFER/ACK. SO_BINDTODEVICE above already pins the socket to the
-        # appliance-facing NIC on multi-homed hosts, so this is not "all interfaces".
+        giaddrs = [s.giaddr for s in self.subnets if s.giaddr] if self.relay else []
         try:
-            s.bind(("0.0.0.0", bind_port))
+            self._sock, self._socks = open_relay_sockets(
+                iface, giaddrs, bind_port, self.log)
         except PermissionError:
             self.log.error(
                 "binding UDP/%d needs CAP_NET_BIND_SERVICE (run the load-gen "
@@ -378,10 +364,15 @@ class Orchestrator:
                 extra={"fields": {"event": "bind_denied", "port": bind_port}},
             )
             raise
-        s.setblocking(False)
-        self._sock = s
         self.log.info("dhcp socket bound", extra={"fields": {
-            "event": "socket_open", "bind_port": bind_port, "topology": self.m.target.dhcp.topology}})
+            "event": "socket_open", "bind_port": bind_port,
+            "topology": self.m.target.dhcp.topology,
+            "giaddr_sockets": len(self._socks), "giaddrs": len(set(giaddrs))}})
+
+    def _sock_for(self, dev: Device) -> socket.socket | None:
+        if self.relay and self._socks:
+            return self._socks.get(self.subnets[dev.subnet_idx].giaddr, self._sock)
+        return self._sock
 
     # ---------------- timer wheel ----------------
     def _schedule(self, delay: float, index: int, action: str) -> None:
@@ -407,16 +398,19 @@ class Orchestrator:
         return ((nonce & 0xFF) << 24) | (dev.index & 0xFFFFFF)
 
     def _send(self, pkt: bytes, dev: Device) -> None:
-        if self._sock is None:
+        sock = self._sock_for(dev)
+        if sock is None:
             return
         if self.relay:
-            # Unicast to Kea; subnet selection is by giaddr (kea.py:237-241).
+            # Unicast to Kea; subnet selection is by giaddr (kea.py:237-241). The
+            # socket bound to this device's giaddr sends it, so the datagram's
+            # source address is the relay address Kea answers to.
             dest = (self.node_ip, self.dhcp_port)
         else:
             # Broadcast on the local L2 segment (kea.py interfaces ["*"]).
             dest = ("255.255.255.255", self.dhcp_port)
         try:
-            self._sock.sendto(pkt, dest)
+            sock.sendto(pkt, dest)
         except OSError as exc:
             self.log.debug("send failed: %s", exc,
                            extra={"fields": {"event": "send_error", "index": dev.index}})
@@ -640,12 +634,13 @@ class Orchestrator:
             asyncio.ensure_future(self._run_propagation_probe(dev))
 
     # ---------------- receive loop ----------------
-    async def _recv_loop(self) -> None:
+    async def _recv_loop(self, sock: socket.socket | None = None) -> None:
         loop = asyncio.get_running_loop()
-        assert self._sock
+        sock = sock or self._sock
+        assert sock
         while not self._stop.is_set():
             try:
-                data = await loop.sock_recv(self._sock, 2048)
+                data = await loop.sock_recv(sock, 2048)
             except (BlockingIOError, InterruptedError):
                 await asyncio.sleep(0.001)
                 continue
@@ -971,8 +966,12 @@ class Orchestrator:
                 # add_signal_handler isn't available on every platform / loop;
                 # the _stop event still drives shutdown via other paths.
                 self.log.debug("signal handler unavailable for %s", sig)
+        # One reader per socket: the wildcard one plus every per-giaddr socket
+        # (relay topology). Kea answers to giaddr:67, and each of those replies
+        # lands on the socket bound to that address.
+        readers = [self._sock] + [s for s in self._socks.values() if s is not self._sock]
         tasks = [
-            asyncio.ensure_future(self._recv_loop()),
+            *(asyncio.ensure_future(self._recv_loop(s)) for s in readers),
             asyncio.ensure_future(self._scheduler_loop()),
             asyncio.ensure_future(self._control_loop()),
             asyncio.ensure_future(self._stats_loop()),
