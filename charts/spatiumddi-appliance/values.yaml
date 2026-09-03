@@ -36,6 +36,15 @@ dnsBind9:
   enabled: false
   image:
     repository: ghcr.io/spatiumddi/dns-bind9
+  # Scheduling weight for the serving pod. Requests only, no limits: a
+  # request lifts the pod out of BestEffort QoS (cgroup cpu.weight 1, the
+  # lowest on the node) so the control plane's bursts cannot starve the
+  # data plane; a CPU limit would throttle the bursts the data plane
+  # exists to serve. Sized as a floor, not a measurement of need.
+  resources:
+    requests:
+      cpu: 250m
+      memory: 64Mi
   # Pass-through to the agent via env. The supervisor fills these in
   # when assigning the DNS role.
   # controlPlaneUrl is the EXTERNAL operator-facing URL (self-signed
@@ -145,6 +154,15 @@ dhcpKea:
   enabled: false
   image:
     repository: ghcr.io/spatiumddi/dhcp-kea
+  # Scheduling weight for the DHCP server pod — see dnsBind9.resources.
+  # Measured 2026-09-03 on a 5632 MiB / 3 vCPU appliance under a 35k-device
+  # DORA ramp: as a BestEffort pod Kea was given 7.5 % of a CPU while the
+  # api ran at 110 %, its socket queue overflowed and only 37 % of the
+  # DISCOVERs on the wire were answered. Requests only, no limits.
+  resources:
+    requests:
+      cpu: 250m
+      memory: 64Mi
   controlPlaneUrl: ""
   inClusterApiUrl: ""  # #292 — see dnsBind9.inClusterApiUrl
   agentKey: ""
