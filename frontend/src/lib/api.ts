@@ -6156,14 +6156,25 @@ export const dnsApi = {
   deleteRecord: (groupId: string, zoneId: string, recordId: string) =>
     api.delete(`/dns/groups/${groupId}/zones/${zoneId}/records/${recordId}`),
 
-  bulkDeleteRecords: (groupId: string, zoneId: string, recordIds: string[]) =>
+  // Soft-deletes by default (#963) — the whole selection shares one
+  // deletion_batch_id, so it restores from Admin → Trash in one action.
+  // ``permanent`` is superadmin-only server-side, same as deleteRecord.
+  bulkDeleteRecords: (
+    groupId: string,
+    zoneId: string,
+    recordIds: string[],
+    opts?: { permanent?: boolean },
+  ) =>
     api
       .post<{
         deleted: number;
         skipped: { record_id: string; reason: string }[];
-      }>(`/dns/groups/${groupId}/zones/${zoneId}/records/bulk-delete`, {
-        record_ids: recordIds,
-      })
+        deletion_batch_id: string | null;
+      }>(
+        `/dns/groups/${groupId}/zones/${zoneId}/records/bulk-delete`,
+        { record_ids: recordIds },
+        { params: opts?.permanent ? { permanent: true } : undefined },
+      )
       .then((r) => r.data),
 
   // Bulk zone file import / export
@@ -14180,6 +14191,7 @@ export interface TrashListResponse {
 export interface TrashRestoreResponse {
   batch_id: string;
   restored: number;
+  skipped: { type: string; id: string; display: string; reason: string }[];
 }
 
 export const trashApi = {
@@ -14194,9 +14206,21 @@ export const trashApi = {
     } = {},
   ) =>
     api.get<TrashListResponse>("/admin/trash", { params }).then((r) => r.data),
-  restore: (type: TrashEntryType, id: string) =>
+  // ``skipConflicts`` restores every sibling that does not clash with a live
+  // row and reports the rest in ``skipped`` (#963 — one hand-recreated record
+  // must not pin a whole bulk-delete batch in the trash). Without it a
+  // conflict is a 409 for the whole batch, as for cascade batches.
+  restore: (
+    type: TrashEntryType,
+    id: string,
+    opts?: { skipConflicts?: boolean },
+  ) =>
     api
-      .post<TrashRestoreResponse>(`/admin/trash/${type}/${id}/restore`)
+      .post<TrashRestoreResponse>(
+        `/admin/trash/${type}/${id}/restore`,
+        undefined,
+        { params: opts?.skipConflicts ? { skip_conflicts: true } : undefined },
+      )
       .then((r) => r.data),
   permanentDelete: (type: TrashEntryType, id: string) =>
     api.delete(`/admin/trash/${type}/${id}`),

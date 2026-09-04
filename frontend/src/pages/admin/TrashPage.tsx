@@ -40,8 +40,19 @@ function ConfirmRestoreModal({
 }) {
   const qc = useQueryClient();
   const [error, setError] = useState<string | null>(null);
+  // Set after a 409: the batch holds rows that clash with live ones. The
+  // operator can then restore the others and leave the clashing rows behind.
+  //
+  // Only offered for a dns_record batch — a bulk record delete (#963) stamps
+  // N independent siblings under one id, so leaving one behind is sound. Every
+  // other batch is a cascade (a zone AND its records, a scope AND its pools)
+  // where a partial restore can bring a child back without its parent; the
+  // server refuses those with a 422, and this keeps the button off the screen
+  // rather than showing one that always errors.
+  const [canSkipConflicts, setCanSkipConflicts] = useState(false);
   const mut = useMutation({
-    mutationFn: () => trashApi.restore(entry.type, entry.id),
+    mutationFn: (skipConflicts: boolean) =>
+      trashApi.restore(entry.type, entry.id, { skipConflicts }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["trash"] });
       qc.invalidateQueries({ queryKey: ["ipam"] });
@@ -61,6 +72,9 @@ function ConfirmRestoreModal({
             .map((c) => `${c.display} — ${c.reason}`)
             .join("; ")}`,
         );
+        setCanSkipConflicts(
+          entry.type === "dns_record" && entry.batch_size > conflicts.length,
+        );
       } else if (typeof detail === "string") {
         setError(detail);
       } else {
@@ -77,7 +91,7 @@ function ConfirmRestoreModal({
           <span className="font-mono font-medium">{entry.name_or_cidr}</span> (
           {TYPE_LABELS[entry.type]})
           {entry.batch_size > 1
-            ? ` and ${entry.batch_size - 1} cascaded child row${entry.batch_size - 1 === 1 ? "" : "s"}`
+            ? ` and the ${entry.batch_size - 1} other row${entry.batch_size - 1 === 1 ? "" : "s"} deleted with it`
             : ""}
           ?
         </p>
@@ -93,10 +107,23 @@ function ConfirmRestoreModal({
           >
             Cancel
           </button>
+          {canSkipConflicts && (
+            <button
+              onClick={() => {
+                setError(null);
+                mut.mutate(true);
+              }}
+              disabled={mut.isPending}
+              className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted disabled:opacity-50"
+              title="Restore every row in the batch except the ones that clash with a live row"
+            >
+              Restore the others
+            </button>
+          )}
           <button
             onClick={() => {
               setError(null);
-              mut.mutate();
+              mut.mutate(false);
             }}
             disabled={mut.isPending}
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"

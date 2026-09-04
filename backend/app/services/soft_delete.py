@@ -220,16 +220,43 @@ def apply_soft_delete(batch: SoftDeleteBatch, user_id: uuid.UUID | None) -> date
     return now
 
 
+async def batch_resource_types(db: AsyncSession, batch_id: uuid.UUID) -> set[str]:
+    """Which resource types a deletion batch holds.
+
+    Lets a caller tell a FLAT batch of independent siblings (a #963 bulk
+    record delete — every row a ``dns_record``) from a CASCADE batch (a zone
+    and its records, a scope and its pools), which is the difference between
+    a partial restore being safe and it leaving a dangling child.
+    """
+    types: set[str] = set()
+    for resource_type, model in TYPE_TO_MODEL.items():
+        stmt: Any = (
+            select(model.id)
+            .where(model.deletion_batch_id == batch_id)
+            .limit(1)
+            .execution_options(include_deleted=True)
+        )
+        if (await db.execute(stmt)).first() is not None:
+            types.add(resource_type)
+    return types
+
+
 async def restore_batch(
     db: AsyncSession,
     batch_id: uuid.UUID,
     *,
     conflict_check: Callable[[Any], Awaitable[str | None]] | None = None,
+    skip_conflicts: bool = False,
 ) -> tuple[list[Any], list[dict[str, str]]]:
     """Restore every row sharing ``batch_id``.
 
-    Returns ``(restored_objs, conflicts)``. When ``conflicts`` is non-empty
-    the caller should roll back and 409 with the conflict list.
+    Returns ``(restored_objs, conflicts)``. By default a non-empty
+    ``conflicts`` means NOTHING was restored and the caller should 409 with
+    the list — right for a cascade batch (a zone with a hole is worse than a
+    refusal). With ``skip_conflicts`` the conflicting rows are left in the
+    trash and every other row is restored — the shape a bulk record delete
+    (#963) needs, where the rows are independent siblings and one hand-made
+    duplicate must not pin the other N in the trash forever.
     """
 
     restored: list[Any] = []
@@ -260,7 +287,7 @@ async def restore_batch(
                     continue
             restored.append(obj)
 
-    if conflicts:
+    if conflicts and not skip_conflicts:
         return [], conflicts
 
     for obj in restored:
@@ -268,7 +295,7 @@ async def restore_batch(
         obj.deleted_by_user_id = None
         obj.deletion_batch_id = None
 
-    return restored, []
+    return restored, conflicts
 
 
 async def default_conflict_check(db: AsyncSession, obj: Any) -> str | None:

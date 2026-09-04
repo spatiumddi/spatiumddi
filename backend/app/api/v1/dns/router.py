@@ -19,7 +19,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy import update as sa_update
 from sqlalchemy.orm import selectinload
 
-from app.api.deps import DB, CurrentUser, SuperAdmin
+from app.api.deps import DB, CurrentUser, SuperAdmin, require_superadmin
 from app.api.pagination import (
     DEFAULT_PAGE_SIZE,
     MAX_PAGE,
@@ -131,6 +131,7 @@ from app.services.dns_io import (
 )
 from app.services.feature_modules import require_module
 from app.services.soft_delete import (
+    SoftDeleteBatch,
     apply_soft_delete,
     collect_soft_delete_batch,
 )
@@ -6470,8 +6471,6 @@ async def delete_record(
         await db.commit()
         return
 
-    from app.api.deps import require_superadmin  # noqa: PLC0415
-
     require_superadmin(current_user)
 
     db.add(
@@ -6491,21 +6490,42 @@ async def delete_record(
     await db.commit()
 
 
+# Cap on ids per bulk-delete call — the bulk-create cap's twin. Each id costs
+# a wire op per agent-based server plus an audit row inside ONE transaction
+# that holds the zone's serial-bump row lock; callers with more loop in
+# chunks of this size (the UI does).
+BULK_DELETE_RECORDS_MAX = 2000
+
+
 class BulkDeleteRecordsRequest(BaseModel):
     """IDs of auto- or manually-created records to delete in one shot.
 
     All IDs must belong to the zone in the URL — cross-zone deletion
     isn't allowed here (the UI scopes bulk ops to a single zone). Any
     record ID that doesn't belong to the zone is skipped with a reason
-    so a partial payload doesn't fail the whole batch.
+    so a partial payload doesn't fail the whole batch. Duplicate ids count
+    once: ``[X, X]`` must not enqueue two ops, write two audit rows and
+    report ``deleted: 2`` for one row.
     """
 
     record_ids: list[uuid.UUID]
+
+    @field_validator("record_ids")
+    @classmethod
+    def _validate_record_ids(cls, v: list[uuid.UUID]) -> list[uuid.UUID]:
+        if len(v) > BULK_DELETE_RECORDS_MAX:
+            raise ValueError(f"at most {BULK_DELETE_RECORDS_MAX} record ids per bulk-delete call")
+        return list(dict.fromkeys(v))  # de-duplicate, order-preserving
 
 
 class BulkDeleteRecordsResponse(BaseModel):
     deleted: int
     skipped: list[dict[str, str]]  # each: {record_id, reason}
+    # Set on the default soft-delete path: every record in the batch shares
+    # it, so "undo that bulk delete" is ONE restore from /admin/trash (the
+    # per-record singular route cannot offer that). ``None`` when
+    # ``permanent=true`` — there is nothing to restore.
+    deletion_batch_id: uuid.UUID | None = None
 
 
 @router.post(
@@ -6518,6 +6538,7 @@ async def bulk_delete_records(
     body: BulkDeleteRecordsRequest,
     db: DB,
     current_user: CurrentUser,
+    permanent: bool = False,
 ) -> BulkDeleteRecordsResponse:
     """Delete many records from one zone in a single transaction.
 
@@ -6526,11 +6547,32 @@ async def bulk_delete_records(
     so agentless Windows DNS sees one WinRM round trip for the whole
     batch instead of one per record. BIND9 still writes N queued rows
     (the agent will batch-ship on its next poll).
+
+    Same contract as the singular ``DELETE .../records/{id}`` (#963): the
+    default is a **soft** delete — every record stamped with ONE shared
+    ``deletion_batch_id`` so the whole batch restores from /admin/trash in
+    one action — and ``?permanent=true`` is superadmin-only. Before #963
+    this route hard-deleted under a plain ``CurrentUser`` while the
+    singular route soft-deleted, so the same rows had two authorization
+    bars and two retention outcomes depending on which button was pressed.
+    Both paths push the wire retraction (#632). A row whose wire delete came
+    back ``failed`` stays live — which only an agentless driver can answer
+    inline; an agent-based server queues ``pending`` and a later NACK marks
+    the op ``failed`` after the row is already in the trash (restorable) or
+    gone (permanent). Same window the singular route accepts.
+
+    No ``propose_*`` copilot tool for this route (explicit decision per
+    non-negotiable #13): a bulk delete is the broad-blast-radius shape that
+    guidance keeps off the chat window.
     """
     if not body.record_ids:
         return BulkDeleteRecordsResponse(deleted=0, skipped=[])
 
     zone = await _require_zone(group_id, zone_id, db, current_user)
+    if permanent:
+        # Gate BEFORE any wire op is enqueued: a 403 must leave nothing queued
+        # for the agent.
+        require_superadmin(current_user)
 
     res = await db.execute(select(DNSRecord).where(DNSRecord.id.in_(body.record_ids)))
     records = list(res.scalars().all())
@@ -6545,6 +6587,16 @@ async def bulk_delete_records(
             continue
         if rec.zone_id != zone_id:
             skipped.append({"record_id": str(rid), "reason": "wrong zone"})
+            continue
+        # The singular route's gate, verbatim — Tailscale / NetBird synthesised
+        # records AND pool-managed ones. A pool member's record is re-created
+        # by the next health pass, which would then make the trashed copy
+        # unrestorable ("identical record already exists"). Skip with the
+        # gate's own reason instead of 422-ing the whole batch.
+        try:
+            _reject_if_synthesised_record(rec, "delete")
+        except HTTPException as exc:
+            skipped.append({"record_id": str(rid), "reason": str(exc.detail)})
             continue
         targets.append(rec)
 
@@ -6596,7 +6648,10 @@ async def bulk_delete_records(
     # zone skipped every record and returned ``deleted: 0`` while the
     # singular route deleted the same rows (appliance sizing campaign,
     # 2026-09-02).
-    deleted = 0
+    # Rows whose wire delete was DISPATCHED (queued or applied) — the ones
+    # about to leave the live table. Not "kept in the DB": that is the
+    # ``failed`` branch above.
+    dispatched: list[DNSRecord] = []
     for rec, op_row in zip(targets, op_rows, strict=True):
         if op_row is None:
             skipped.append(
@@ -6614,23 +6669,53 @@ async def bulk_delete_records(
                 }
             )
             continue
+        dispatched.append(rec)
+
+    if permanent:
+        for rec in dispatched:
+            db.add(
+                AuditLog(
+                    user_id=current_user.id,
+                    user_display_name=current_user.display_name,
+                    auth_source=current_user.auth_source,
+                    action="delete",
+                    resource_type="dns_record",
+                    resource_id=str(rec.id),
+                    resource_display=rec.fqdn,
+                    result="success",
+                )
+            )
+            await db.delete(rec)
+        await db.commit()
+        return BulkDeleteRecordsResponse(deleted=len(dispatched), skipped=skipped)
+
+    # One batch id across the whole selection. ``collect_soft_delete_batch``
+    # mints a fresh id per root, so collect each record's cascade set and
+    # re-home the rows under a single batch before stamping.
+    batch = SoftDeleteBatch(batch_id=uuid.uuid4())
+    for rec in dispatched:
+        batch.rows.extend((await collect_soft_delete_batch(db, rec)).rows)
+    apply_soft_delete(batch, current_user.id)
+    for row in batch.rows:
         db.add(
             AuditLog(
                 user_id=current_user.id,
                 user_display_name=current_user.display_name,
                 auth_source=current_user.auth_source,
-                action="delete",
-                resource_type="dns_record",
-                resource_id=str(rec.id),
-                resource_display=rec.fqdn,
+                action="soft_delete",
+                resource_type=row.resource_type,
+                resource_id=str(row.obj.id),
+                resource_display=row.display,
+                old_value={"deletion_batch_id": str(batch.batch_id)},
                 result="success",
             )
         )
-        await db.delete(rec)
-        deleted += 1
-
     await db.commit()
-    return BulkDeleteRecordsResponse(deleted=deleted, skipped=skipped)
+    return BulkDeleteRecordsResponse(
+        deleted=len(dispatched),
+        skipped=skipped,
+        deletion_batch_id=batch.batch_id if dispatched else None,
+    )
 
 
 # Cap on records per bulk-create call. Keeps the single transaction (and the

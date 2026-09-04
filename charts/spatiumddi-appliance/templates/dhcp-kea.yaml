@@ -27,7 +27,7 @@ spec:
   template:
     metadata:
       labels:
-        {{- include "spatiumddi-appliance.labels" . | nindent 8 }}
+        {{- include "spatiumddi-appliance.podLabels" . | nindent 8 }}
         app.kubernetes.io/name: dhcp-kea
         app.kubernetes.io/component: dhcp-kea
     spec:

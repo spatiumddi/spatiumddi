@@ -53,6 +53,18 @@ class _RecordingDriver:
     async def apply_record_change(self, _server: Any, change: Any) -> None:
         self.changes.append((change.op, change.record.name, change.record.record_type))
 
+    async def apply_record_changes(self, server: Any, changes: list[Any]) -> list[Any]:
+        # The batched entry point every real driver has (the ABC default loops
+        # the singular one); the trash restore re-pushes a zone's records
+        # through it in one call (#963 review).
+        from app.drivers.dns.base import RecordChangeResult
+
+        results = []
+        for change in changes:
+            await self.apply_record_change(server, change)
+            results.append(RecordChangeResult(ok=True))
+        return results
+
 
 def _patch_record_driver(monkeypatch: pytest.MonkeyPatch) -> _RecordingDriver:
     """Route every agentless record push through one recorder (the seam

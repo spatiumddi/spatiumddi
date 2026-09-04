@@ -205,6 +205,7 @@ async def _purge_dns_zones(db: Any, cutoff: datetime) -> tuple[int, int]:
     separately.
     """
     from app.api.v1.dns.router import _push_zone_to_agentless_servers  # noqa: PLC0415
+    from app.services.dns.record_ops import sweep_zone_ops  # noqa: PLC0415
 
     res = await db.execute(
         select(DNSZone)
@@ -229,6 +230,10 @@ async def _purge_dns_zones(db: Any, cutoff: datetime) -> tuple[int, int]:
                 hint="left soft-deleted; next daily sweep retries the provider push",
             )
             continue
+        # Ops queued before the soft-delete started sweeping them (#964 review)
+        # have no zone FK to cascade through; sweep defensively so a pre-fix
+        # trash row does not leave a failed queue behind.
+        await sweep_zone_ops(db, zone, zone.group_id)
         # Core DELETE (not ORM ``db.delete``) — leans on the DB-level FK ON
         # DELETE CASCADE to remove this zone's still-present soft-deleted records
         # (they were excluded from the record pass precisely so they'd ride this
