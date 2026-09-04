@@ -17,6 +17,7 @@ from datetime import UTC, datetime
 import pytest
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.responses import JSONResponse
 
 from app.api.v1.dns import agents as agents_api
 from app.models.dns import DNSRecord, DNSRecordOp, DNSServer, DNSServerGroup, DNSZone
@@ -127,3 +128,46 @@ async def test_pending_ops_take_the_fast_path_a_page_at_a_time(
     body2 = second.json()
     assert [op["record"]["name"] for op in body2["pending_record_ops"]] == ["n4", "n5"]
     assert body2["pending_ops_remaining"] == 0
+
+
+@pytest.mark.asyncio
+async def test_the_body_is_byte_identical_to_starlettes_json_encoding(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    r"""#958 — assert on the BYTES, not on ``resp.json()``.
+
+    The route hand-rolls the serialisation to skip ``jsonable_encoder``. That
+    is only safe while the call reproduces Starlette ``JSONResponse.render``'s
+    kwargs, and every way they can differ is invisible to a parsed
+    comparison: stock ``json.dumps`` spaces its separators (+13.5% on the
+    250k-record bundle this path exists to shrink) and escapes non-ASCII to
+    \uXXXX. Both decode to an equal object, so the sibling tests that go
+    through ``.json()`` cannot see either one — which is how it shipped.
+    """
+    monkeypatch.setattr(agents_api, "LONGPOLL_TIMEOUT_SECONDS", 1)
+    _server, zone, headers = await _agent(db_session, records=2)
+    # A non-ASCII value exercises ensure_ascii; on an all-ASCII payload the
+    # two encodings agree and this would pass on the stock defaults.
+    db_session.add(
+        DNSRecord(
+            zone_id=zone.id,
+            name="cafe-txt",
+            fqdn=f"cafe-txt.{zone.name}",
+            record_type="TXT",
+            value="v=sp\u00e9cial \u00fcnicode",
+        )
+    )
+    await db_session.commit()
+
+    resp = await client.get(CONFIG_URL, headers=headers)
+    assert resp.status_code == 200, resp.text
+
+    body = resp.content
+    # Byte-for-byte what FastAPI produced for this route before it started
+    # returning a prebuilt Response, or the switch was not transparent.
+    assert body == JSONResponse(resp.json()).body
+
+    # Name the two regressions directly so a failure explains itself rather
+    # than printing two multi-megabyte blobs.
+    assert b'"etag":"sha256:' in body, "separators are not compact"
+    assert "sp\u00e9cial".encode() in body, "non-ASCII escaped instead of sent as UTF-8"
