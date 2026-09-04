@@ -100,8 +100,7 @@ async def _report_failed(client: AsyncClient, row: Appliance, token: str, reason
 # reworded runner now fails this test instead of silently reclassifying a
 # permanent failure as retryable.
 _RUNNER = (
-    Path(__file__).resolve().parents[2]
-    / "appliance/mkosi.extra/usr/local/bin/spatium-cluster-join"
+    Path(__file__).resolve().parents[2] / "appliance/mkosi.extra/usr/local/bin/spatium-cluster-join"
 )
 # reason substring -> needs an operator (evict / re-pair / leave first)
 _NEEDS_OPERATOR = {
