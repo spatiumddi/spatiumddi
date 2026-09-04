@@ -242,10 +242,14 @@ triggered on push to `main` and on every pull request:
 | **Backend — Tests** (`backend-test`) | A required-check aggregator over **eight** parallel `backend-test-shard` jobs. Each shard spins up `postgres:16-alpine` + `redis:8.8-alpine` services, runs `alembic upgrade head`, then `pytest -n auto --splits 8 --group N` (pytest-split selects the shard's slice; `-n auto` parallelizes it across the runner's vCPUs, each xdist worker on its own `spatiumddi_test_gw<N>` DB). The aggregator passes only if all eight shards pass. |
 | **Frontend — Lint & Type Check** (`frontend-lint`) | Node 22, `npm install`, then `npm run lint`, `npm run format:check`, `npm run typecheck`, `npm test`. |
 | **Frontend — Build** (`frontend-build`) | Node 22, `npm install`, `npm run build`. |
+| **Charts — Lint & Template** (`charts-lint`) | Helm 3.20 + a checksum-pinned kubeconform. `helm lint --strict` both charts at defaults and with every role / feature toggle on, `helm template` five value sets (umbrella: defaults, all-on, external DB + Redis; appliance: defaults, all-on, the single-node full-stack shape), `kubeconform -strict` against the Kubernetes 1.31 + CRD-catalog schemas, and `.github/scripts/chart-no-besteffort.py` on the appliance renders (#965 — no container may lack CPU + memory requests). Rendered manifests are uploaded as the `rendered-charts` artifact. Until #966 nothing on a PR parsed the appliance chart at all; it was first read by helm during the release. `make charts-lint` runs the same script in a helm container. |
+| **Perf — Tests** (`perf-test`) | Python 3.12 + pytest, `python -m pytest perf`. Hermetic (fake sockets, no network, no appliance). Tests only — `perf/` is outside the Backend Lint scope and carries pre-existing ruff/black drift (#968). `make perf-test` reproduces it. |
 
 Branch protection on `main` gates on these checks. `make ci` reproduces
 the two lint jobs and the frontend build locally; `make test` reproduces
-the backend test job (single-runner rather than sharded).
+the backend test job (single-runner rather than sharded); `make charts-lint`
+and `make perf-test` reproduce the two jobs above (both via Docker, so
+neither helm nor kubeconform needs to be on the host).
 
 ### What runs when — the trigger policy
 

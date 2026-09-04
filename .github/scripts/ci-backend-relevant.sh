@@ -73,9 +73,15 @@ set -euo pipefail
 #   *.md        Root-level prose (README, CHANGELOG, CLAUDE.md, ...). Nested
 #               *.md are covered by their own directory's entry, or fall
 #               through and run the suite — which is the safe direction.
+#   perf/       Off-box load-generation + campaign tooling (#968). Nothing in
+#               backend/ imports it and no backend test reads it; it has its
+#               own Perf — Tests job. Before this entry a perf-only PR fell
+#               through to "unrecognised → run" and spent all 8 shards on
+#               tests that could not be affected, while running none that
+#               could — exactly inverted.
 #   NOTICE      Third-party attribution.
 #   LICENSE     Apache 2.0 text.
-IRRELEVANT='^(docs/|website/|frontend/|charts/|k8s/|agent/|appliance/|\.github/|[^/]+\.md$|NOTICE$|LICENSE$)'
+IRRELEVANT='^(docs/|website/|frontend/|charts/|k8s/|agent/|appliance/|perf/|\.github/|[^/]+\.md$|NOTICE$|LICENSE$)'
 
 # Load the must-run carve-outs. A missing or unreadable manifest fails toward
 # running the suite — same direction as every other failure here.

@@ -1,4 +1,4 @@
-.PHONY: help up down dev build build-supervisor migrate lint test lint-backend lint-frontend test-backend \
+.PHONY: charts-lint perf-test help up down dev build build-supervisor migrate lint test lint-backend lint-frontend test-backend \
         openapi \
         lint-untyped-routes \
         lint-untyped-routes-baseline \
@@ -346,6 +346,24 @@ ci-frontend-lint:
 ci-frontend-build:
 	@echo "→ Frontend — Build"
 	cd $(FRONTEND_DIR) && npm run build
+
+# Charts — Lint & Template (#966): the same script CI's job runs, inside a
+# helm container so a dev box with no helm / kubeconform can run it. Renders
+# land in ./.charts-render/ (gitignored) for inspection.
+HELM_IMAGE ?= alpine/helm:3.20.2
+charts-lint:
+	@echo "→ Charts — Lint & Template (matches .github/workflows/ci.yml)"
+	@mkdir -p .charts-render
+	docker run --rm --entrypoint sh -v "$(PWD):/repo" -w /repo -e HOME=/tmp -e OUT=/repo/.charts-render \
+	  $(HELM_IMAGE) -c 'apk add -q --no-cache bash curl python3 py3-yaml \
+	    && .github/scripts/install-kubeconform.sh \
+	    && .github/scripts/charts-render-check.sh'
+
+# Perf — Tests (#968): hermetic, stdlib-only tests under perf/.
+perf-test:
+	@echo "→ Perf — Tests (matches .github/workflows/ci.yml)"
+	docker run --rm -v "$(PWD):/repo" -w /repo python:3.12-slim sh -c \
+	  'pip -q install pytest >/dev/null && python -m pytest perf -q'
 
 # ── Screenshots ────────────────────────────────────────────────────────────────
 # Re-captures the README screenshots via headless chromium. The dev stack must

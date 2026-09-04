@@ -434,6 +434,85 @@ jobs:
       - name: Run tests
         run: python -m pytest appliance/tests -q
 
+  # ── Helm charts (#966) ──────────────────────────────────────────────────────
+  # Nothing on a PR used to parse either chart: the one PR-time helm job
+  # (agent-e2e) is path-filtered to ``charts/spatiumddi/**`` and installs only
+  # the umbrella chart, so ``charts/spatiumddi-appliance/`` was first read by
+  # helm during ``release.yml``'s ``helm package`` — a template that failed to
+  # render broke the RELEASE, not the PR that introduced it — and no job ran
+  # ``helm lint`` at all. #953 (three chart files) went green on 17 checks,
+  # none of which opened a file it changed.
+  #
+  # The gate lives in ``.github/scripts/charts-render-check.sh`` so ``make
+  # charts-lint`` runs the identical thing locally: helm lint, helm template
+  # with every role / feature toggle ON, kubeconform -strict against the K8s
+  # + CRD schemas, and a no-BestEffort check on the appliance renders (#965).
+  # Unconditional like every other job here — see the header on why ``paths``
+  # filters are absent — and ~1 min.
+  charts-lint:
+    name: Charts — Lint & Template
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Helm
+        uses: azure/setup-helm@v5
+        with:
+          version: v3.20.2
+
+      - name: Install kubeconform
+        run: .github/scripts/install-kubeconform.sh
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install pyyaml
+
+      - name: Lint, render and validate both charts
+        env:
+          OUT: ${{ runner.temp }}/charts
+        run: |
+          mkdir -p "$OUT"
+          .github/scripts/charts-render-check.sh
+
+      - name: Upload rendered manifests
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: rendered-charts
+          path: ${{ runner.temp }}/charts
+          retention-days: 7
+
+  # ── Perf tooling (#968) ─────────────────────────────────────────────────────
+  # ``perf/`` — the off-box load generators + campaign harness the appliance
+  # sizing work runs on — was referenced by no workflow, so its tests never
+  # ran (#955 merged on 25 green checks that opened none of its files) while
+  # the backend path filter, which did not know ``perf/`` either, spent all 8
+  # backend shards on it. Hermetic: the tests use a fake socket, no network,
+  # no appliance, ~0.01 s.
+  #
+  # Tests only, like the agent + appliance jobs: ``perf/`` is outside the
+  # Backend Lint scope and carries pre-existing ruff/black drift (25 findings,
+  # 39 of 42 files black would reformat, measured 2026-09-04) — bringing it
+  # under lint is a formatting-only change of its own.
+  perf-test:
+    name: Perf — Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install pytest
+
+      - name: Run tests
+        run: python -m pytest perf -q
+
   # Required-status-check aggregator: branch protection can gate on the stable
   # name "Agent — Tests"; this job passes only if all three agent suites did.
   # Keep this name (and the matrix above) in sync with the required check.

@@ -151,6 +151,12 @@ def test_must_run_carveouts_run_the_suite(path: str, why: str) -> None:
         "frontend/package.json",
         "charts/spatiumddi/values.yaml",
         "k8s/base/api.yaml",
+        # #968 — perf/ has its own Perf — Tests job; before it was denied a
+        # perf-only PR ran all 8 backend shards (PR #955, measured).
+        "perf/generators/orchestrator/relay_sockets.py",
+        "perf/generators/orchestrator/tests/test_relay_sockets.py",
+        "perf/requirements.txt",
+        "perf/README.md",
         "CHANGELOG.md",
         "README.md",
         "CLAUDE.md",
@@ -217,7 +223,9 @@ def test_an_empty_change_set_runs_the_suite() -> None:
     [
         "terraform/main.tf",
         "ansible/playbook.yml",
-        "perf/locustfile.py",
+        # (``perf/locustfile.py`` used to sit here as the example of an
+        # unrecognised subtree — #968 made perf/ a recognised, denied one.)
+        "loadtest/locustfile.py",
         "some-new-top-level-thing/x.py",
         "Makefile",
         "docker-compose.yml",
