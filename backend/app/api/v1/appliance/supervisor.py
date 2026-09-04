@@ -4144,11 +4144,16 @@ async def replace_control_plane_member(
     # stale Node/member by name, yet it 409'd on the row not being settled
     # (appliance sizing campaign, 2026-09-02: a 3-node formation stuck on
     # one such joiner, cleared only by hand). In-flight joiners still 409.
-    failed_joiner = (
-        row.cluster_role is None
-        and row.cluster_join_state == CLUSTER_JOIN_STATE_FAILED
-        and row.desired_cluster_role is None
-    )
+    #
+    # The failed joiner is accepted WHETHER OR NOT its desired-state is still
+    # set: a transient failure keeps `desired_cluster_role` for the
+    # supervisor's automatic retry window (the heartbeat path above), and an
+    # operator who reaches for Replace during that window is overriding the
+    # retry on purpose — refusing them because a retry is pending is exactly
+    # the contradiction this route exists to remove (live 2026-09-04
+    # 01:34Z: a blocked join, desired-state kept, Replace answered 409).
+    # The fields are cleared just below, which also ends the retry.
+    failed_joiner = row.cluster_role is None and row.cluster_join_state == CLUSTER_JOIN_STATE_FAILED
     if row.cluster_role != CLUSTER_ROLE_MEMBER and not failed_joiner:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
