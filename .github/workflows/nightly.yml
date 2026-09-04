@@ -143,9 +143,9 @@ jobs:
           # spring-forward night no Eastern 02:xx exists (01:59 → 03:00),
           # so neither twin builds; the next night covers it.
           if [ "$EVENT_NAME" = "schedule" ]; then
-            # "23 6 * * *" → "6:23", today's 06:23 UTC read on the Eastern
-            # clock. A missing or odd cron string is a hard failure, never
-            # a skip — a failed gate is what finalize turns into the
+            # "23 6 * * *" → "6:23", that cron's UTC instant read on the
+            # Eastern clock. A missing or odd cron string is a hard failure,
+            # never a skip — a failed gate is what finalize turns into the
             # tracking issue, whereas a quiet skip is exactly how the
             # previous gate went unnoticed for four weeks.
             CRON_UTC=$(printf '%s' "$SCHEDULE" | awk '{print $2 ":" $1}')
@@ -153,8 +153,23 @@ jobs:
               echo "::error::github.event.schedule is '${SCHEDULE}' — cannot tell which twin fired"
               exit 1
             fi
-            SLOT_ET=$(TZ=America/New_York \
-                      date -d "$(date -u +%F) ${CRON_UTC} UTC" '+%H:%M %Z')
+            # Which day's slot? The most recent occurrence at or before now,
+            # never today's unconditionally: GitHub starts a run late but
+            # never early, so a delay that crosses UTC midnight would read
+            # TOMORROW's slot. On a same-offset day both readings agree, so
+            # this is invisible 363 nights a year — but on a DST-change day
+            # they differ by an hour and that is the whole decision. Worked
+            # example: the 02:23 EDT twin of Sat 10-31, started 00:30 UTC on
+            # Sun 11-01, reads 11-01 06:23 UTC = 01:23 EST and skips, while
+            # the 03:23 EDT twin that must skip reads 02:23 EST and builds.
+            # With the on-time twin also skipping, that night builds nothing
+            # — the same silent miss this gate was rewritten to end, just
+            # twice a year instead of nightly.
+            SLOT_UTC=$(date -u -d "$(date -u +%F) ${CRON_UTC} UTC" +%s)
+            if [ "$SLOT_UTC" -gt "$(date -u +%s)" ]; then
+              SLOT_UTC=$((SLOT_UTC - 86400))
+            fi
+            SLOT_ET=$(TZ=America/New_York date -d "@$SLOT_UTC" '+%H:%M %Z')
             if [ "${SLOT_ET%%:*}" != "02" ]; then
               echo "should_build=false" >> "$GITHUB_OUTPUT"
               echo "→ cron '${SCHEDULE}' is the ${SLOT_ET} slot, not 02:xx Eastern; skipping (DST twin cron)"
