@@ -14191,6 +14191,7 @@ export interface TrashListResponse {
 export interface TrashRestoreResponse {
   batch_id: string;
   restored: number;
+  skipped: { type: string; id: string; display: string; reason: string }[];
 }
 
 export const trashApi = {
@@ -14205,9 +14206,21 @@ export const trashApi = {
     } = {},
   ) =>
     api.get<TrashListResponse>("/admin/trash", { params }).then((r) => r.data),
-  restore: (type: TrashEntryType, id: string) =>
+  // ``skipConflicts`` restores every sibling that does not clash with a live
+  // row and reports the rest in ``skipped`` (#963 — one hand-recreated record
+  // must not pin a whole bulk-delete batch in the trash). Without it a
+  // conflict is a 409 for the whole batch, as for cascade batches.
+  restore: (
+    type: TrashEntryType,
+    id: string,
+    opts?: { skipConflicts?: boolean },
+  ) =>
     api
-      .post<TrashRestoreResponse>(`/admin/trash/${type}/${id}/restore`)
+      .post<TrashRestoreResponse>(
+        `/admin/trash/${type}/${id}/restore`,
+        undefined,
+        { params: opts?.skipConflicts ? { skip_conflicts: true } : undefined },
+      )
       .then((r) => r.data),
   permanentDelete: (type: TrashEntryType, id: string) =>
     api.delete(`/admin/trash/${type}/${id}`),

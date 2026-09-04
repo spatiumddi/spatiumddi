@@ -12,7 +12,6 @@ plane applies the change directly at enqueue time and writes the row as
 from __future__ import annotations
 
 import uuid
-from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any
 
@@ -37,8 +36,12 @@ logger = structlog.get_logger(__name__)
 QUEUED_OP_STATES: tuple[str, ...] = ("pending", "in_flight")
 
 
-def queued_zone_ops_where(zone: DNSZone, server_ids: Sequence[uuid.UUID]) -> list[Any]:
-    """WHERE clauses selecting the live (queued) ops for ``zone`` on ``server_ids``.
+def queued_zone_ops_where(zone: DNSZone, group_id: uuid.UUID) -> list[Any]:
+    """WHERE clauses selecting the live (queued) ops for ``zone`` on the servers
+    of ``group_id`` — every server, as a correlated subquery, so no caller has
+    to prefetch an id list (and none can pass a partial one: a sweep that
+    reaches only the primary leaves secondaries' queues behind, the fan-out
+    bug #934 fixed).
 
     **This predicate is name-scoped, and that is a decision, not an accident
     of the schema (#964).** ``DNSRecordOp`` carries ``server_id`` +
@@ -48,58 +51,54 @@ def queued_zone_ops_where(zone: DNSZone, server_ids: Sequence[uuid.UUID]) -> lis
     ``example.com.`` also discards ``external``'s queued ops on the same
     servers.
 
-    Why that is accepted rather than fixed with a view column: the op
-    *payload* carries no view either. An RFC 2136 update for ``example.com.``
-    lands in whichever view the agent's update source matches, so under
-    split-horizon the queued ops for two same-named zones are already
-    indistinguishable at the agent — what converges both views is the
-    ConfigBundle re-render, which rebuilds full zone state from the database
-    on the next drop. A discarded incremental op therefore costs delayed
-    convergence, never permanent divergence, on every agent-based driver; on
-    agentless drivers ops are applied inline and never sit queued, so the
-    sweep never matches them. A ``zone_id`` column would need a migration plus
-    a name-scoped fallback for every pre-upgrade row, i.e. this predicate
-    again, to buy back a window the bundle already closes.
+    Why that is accepted rather than fixed with a view column: under
+    split-horizon the incremental op path does not run at all. When a group
+    has views (or geo steering) ``agent_config.build_config_bundle`` folds
+    records INTO the structural fingerprint, so every record change is a full
+    view-correct re-render from the database — and it ships no
+    ``pending_record_ops``, retiring every queued op for the server as
+    ``applied`` on each bundle build instead. A sibling view's op the sweep
+    discards was therefore never going to reach ``nsupdate``: the over-sweep
+    costs nothing. In a flat group the same name cannot exist twice (the
+    create route 409s it), so the predicate is exact there. A ``zone_id``
+    column would need a migration plus a name-scoped fallback for every
+    pre-upgrade row, i.e. this predicate again, to guard a path that is
+    already bypassed.
 
     Every zone-scoped sweep and count goes through here so the decision lives
     in one place; ``tests/test_dns_record_ops_sweep.py`` pins both the
-    behaviour and that the call sites do not carry their own copy.
+    behaviour and that no other module carries its own copy.
     """
     return [
-        DNSRecordOp.server_id.in_(list(server_ids)),
+        DNSRecordOp.server_id.in_(select(DNSServer.id).where(DNSServer.group_id == group_id)),
         DNSRecordOp.zone_name == zone.name,
         DNSRecordOp.state.in_(QUEUED_OP_STATES),
     ]
 
 
-async def count_queued_zone_ops(
-    db: AsyncSession, zone: DNSZone, server_ids: Sequence[uuid.UUID]
-) -> int:
+async def count_queued_zone_ops(db: AsyncSession, zone: DNSZone, group_id: uuid.UUID) -> int:
     """How many queued ops :func:`sweep_zone_ops` would discard. See its caveat."""
-    if not server_ids:
-        return 0
     return int(
         (
             await db.execute(
                 select(func.count())
                 .select_from(DNSRecordOp)
-                .where(*queued_zone_ops_where(zone, server_ids))
+                .where(*queued_zone_ops_where(zone, group_id))
             )
         ).scalar_one()
     )
 
 
-async def sweep_zone_ops(db: AsyncSession, zone: DNSZone, server_ids: Sequence[uuid.UUID]) -> int:
-    """Discard the queued ops for ``zone`` on ``server_ids``; returns the count.
+async def sweep_zone_ops(db: AsyncSession, zone: DNSZone, group_id: uuid.UUID) -> int:
+    """Discard the queued ops for ``zone`` on ``group_id``'s servers; returns the count.
 
     Used when the ops can no longer apply: the zone is being permanently
-    deleted, or moved out of the group whose servers they target. Applied /
-    failed rows are history, not queued work, and are kept. Name-scoped — see
-    :func:`queued_zone_ops_where` for the split-horizon caveat (#964).
+    deleted, or moved out of the group whose servers they target (pass the
+    OLD group). Applied / failed rows are history, not queued work, and are
+    kept. Name-scoped — see :func:`queued_zone_ops_where` for the
+    split-horizon caveat (#964).
     """
-    if not server_ids:
-        return 0
-    res = await db.execute(sa_delete(DNSRecordOp).where(*queued_zone_ops_where(zone, server_ids)))
+    res = await db.execute(sa_delete(DNSRecordOp).where(*queued_zone_ops_where(zone, group_id)))
     return int(res.rowcount or 0)
 
 
@@ -443,6 +442,101 @@ async def push_record_restore(db: AsyncSession, record: DNSRecord) -> DNSRecordO
     )
 
 
+async def push_records_restore(
+    db: AsyncSession, zone_id: uuid.UUID, records: list[DNSRecord]
+) -> list[DNSRecordOp | None]:
+    """Batch form of :func:`push_record_restore`: one serial bump and one
+    :func:`enqueue_record_ops_batch` call for every restored record of a zone.
+    Same ``[]`` outcome when the zone cannot be resolved."""
+    if not records:
+        return []
+    zone = await db.get(DNSZone, zone_id)
+    if zone is None:
+        return []
+    target_serial = bump_zone_serial(zone)
+    ops = [
+        {"op": "create", "record": record_op_payload(r), "target_serial": target_serial}
+        for r in records
+    ]
+    return await enqueue_record_ops_batch(db, zone, ops)
+
+
+async def _fanout_agent_ops(
+    db: AsyncSession,
+    zone: DNSZone,
+    primary: DNSServer,
+    ops: list[dict[str, Any]],
+) -> list[DNSRecordOp | None]:
+    """Queue ``ops`` for every ENABLED agent-based server in the zone's group.
+
+    The one fan-out both batch entry points share. Resolves the server set
+    ONCE, stamps the RRsets ONCE (#773), inserts every row in one ``add_all``
+    + one flush, wakes the group once. Returns, per input op, the row created
+    for ``primary`` when it is among the enabled servers, else the first
+    enabled agent's row — the same truthy-when-dispatched contract as
+    :func:`enqueue_record_op` (#481), which is what lets a caller gate a DB
+    delete on "was a wire op dispatched?". ``[None] * len(ops)`` when every
+    agent-based server is disabled.
+
+    Before this helper ``enqueue_record_ops_batch`` looped the singular path
+    per op: two identical server SELECTs and a flush for EVERY record, i.e.
+    ~4,000 round trips for a 2,000-record bulk delete on a two-agent group,
+    all inside one transaction holding the zone's serial-bump row lock.
+    """
+    if not ops:
+        return []
+    agent_rows = (
+        (
+            await db.execute(
+                select(DNSServer)
+                .where(
+                    DNSServer.group_id == zone.group_id,
+                    DNSServer.is_enabled.is_(True),
+                )
+                .order_by(DNSServer.is_primary.desc(), DNSServer.created_at)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    agent_servers = [s for s in agent_rows if not is_agentless(s.driver)]
+    if not agent_servers:
+        logger.warning(
+            "record_op_batch_dropped_no_enabled_agent",
+            zone=zone.name,
+            group_id=str(zone.group_id),
+            count=len(ops),
+        )
+        return [None] * len(ops)
+    ops = [{**o, "record": dict(o["record"])} for o in ops]
+    await stamp_rrsets_for_ops(db, zone, ops)
+    # The row we hand back per op: the primary's if enabled, else the first
+    # enabled agent's (``agent_servers`` is ordered is_primary DESC).
+    returned = next((s for s in agent_servers if s.id == primary.id), agent_servers[0])
+    result: list[DNSRecordOp | None] = []
+    rows: list[DNSRecordOp] = []
+    for srv in agent_servers:
+        for o in ops:
+            row = DNSRecordOp(
+                server_id=srv.id,
+                zone_name=zone.name,
+                op=o["op"],
+                record=o["record"],
+                target_serial=o.get("target_serial"),
+                state="pending",
+            )
+            rows.append(row)
+            if srv.id == returned.id:
+                result.append(row)
+    db.add_all(rows)
+    await db.flush()
+    # #358 — wake every agent in the group so they drain the queued ops on the
+    # next poll instead of the belt-and-braces tick. Flushed after the outer
+    # commit by the request's ``wake_publishing`` dependency.
+    collect_wake(dns_group_channel(zone.group_id))
+    return result
+
+
 async def enqueue_record_ops_batch(
     db: AsyncSession,
     zone: DNSZone,
@@ -452,8 +546,8 @@ async def enqueue_record_ops_batch(
 
     Groups all ops for a single zone into one driver call when the zone's
     primary is agentless — cuts an N-record sync from N WinRM round trips
-    to one. Agent-based primaries fall through to the per-op path since
-    they queue in the DB and the agent batches at poll time.
+    to one. Agent-based groups fan out in one ``add_all`` + flush via
+    :func:`_fanout_agent_ops`, and the agent batches at poll time.
 
     ``ops`` is a list of ``{op, record, target_serial?}`` dicts matching
     the singular ``enqueue_record_op`` arg shape.
@@ -487,18 +581,12 @@ async def enqueue_record_ops_batch(
             return [None] * len(ops)
         return await _apply_agentless_batch(db, primary, zone, ops)
 
-    # Agent-based: DB rows only; agent will batch at poll time. Delegates to
-    # enqueue_record_op per op, which fans out to every ENABLED agent-based
-    # server regardless of whether the designated primary is disabled (#481).
-    # The RRsets are resolved for the whole batch first (#773) — one query
-    # instead of one per op, and every op at a shared (name, type) then carries
-    # the same complete set, so none of them depends on the order the agent
-    # drains them in.
-    ops = [{**o, "record": dict(o["record"])} for o in ops]
-    await stamp_rrsets_for_ops(db, zone, ops)
-    return [
-        await enqueue_record_op(db, zone, o["op"], o["record"], o.get("target_serial")) for o in ops
-    ]
+    # Agent-based: DB rows only; the agent batches at poll time. One fan-out
+    # to every ENABLED agent-based server regardless of whether the designated
+    # primary is disabled (#481), with the RRsets resolved for the whole batch
+    # first (#773) so every op at a shared (name, type) carries the same
+    # complete set whatever order the agent drains them in.
+    return await _fanout_agent_ops(db, zone, primary, ops)
 
 
 async def enqueue_record_ops_bulk(
@@ -508,12 +596,9 @@ async def enqueue_record_ops_bulk(
 ) -> int:
     """Enqueue many ops for a SINGLE zone with one server-set resolution.
 
-    The seeding / bulk-import fast-path. :func:`enqueue_record_ops_batch`
-    re-resolves the agent server list once *per op* (it loops the singular
-    path), which is fine for a handful of records but quadratic-feeling at
-    seed scale. This resolves the enabled agent-based servers once and inserts
-    all ``DNSRecordOp`` rows in a single ``add_all`` + flush; agentless
-    primaries delegate to the existing batched driver call.
+    The seeding / bulk-import fast-path: the same fan-out as
+    :func:`enqueue_record_ops_batch` but returning a count rather than per-op
+    rows, for callers that own idempotency and write one summary audit row.
 
     Returns the number of ops dispatched (0 if no enabled primary).
     """
@@ -544,51 +629,10 @@ async def enqueue_record_ops_bulk(
             return 0
         rows = await _apply_agentless_batch(db, primary, zone, ops)
         return sum(1 for r in rows if r is not None)
-    # Agent-based falls through: the fan-out below queues to every ENABLED
-    # agent-based server regardless of whether the primary is disabled (#481).
-
-    # Agent-based: every enabled agent-based server in the group renders an
-    # independent authoritative copy, so each needs its own op rows. Resolve
-    # the set ONCE (mirrors enqueue_record_op's fan-out query).
-    agent_rows = (
-        (
-            await db.execute(
-                select(DNSServer).where(
-                    DNSServer.group_id == zone.group_id,
-                    DNSServer.is_enabled.is_(True),
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
-    agent_servers = [s for s in agent_rows if not is_agentless(s.driver)]
-    if not agent_servers:
-        return 0
-    # #773 — one query resolves every touched RRset for the whole batch, so the
-    # seed/import fast-path stays a fast path.
-    ops = [{**o, "record": dict(o["record"])} for o in ops]
-    await stamp_rrsets_for_ops(db, zone, ops)
-    for srv in agent_servers:
-        db.add_all(
-            [
-                DNSRecordOp(
-                    server_id=srv.id,
-                    zone_name=zone.name,
-                    op=o["op"],
-                    record=o["record"],
-                    target_serial=o.get("target_serial"),
-                    state="pending",
-                )
-                for o in ops
-            ]
-        )
-    await db.flush()
-    # #358 — wake every agent in the group so they drain the queued ops on the
-    # next poll instead of the belt-and-braces tick. Flushed after the outer
-    # commit by the request's ``wake_publishing`` dependency.
-    collect_wake(dns_group_channel(zone.group_id))
-    return len(ops)
+    # Agent-based: same fan-out as the batch path — every enabled agent-based
+    # server, resolved once, one add_all + flush (#481 semantics included).
+    rows = await _fanout_agent_ops(db, zone, primary, ops)
+    return sum(1 for r in rows if r is not None)
 
 
 async def _apply_agentless_batch(

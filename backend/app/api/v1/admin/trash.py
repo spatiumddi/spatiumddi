@@ -29,7 +29,7 @@ from app.services.dhcp.static_ipam import (
     remove_ipam_for_scope_statics,
 )
 from app.services.dhcp.windows_writethrough import push_scope_restore
-from app.services.dns.record_ops import push_record_restore
+from app.services.dns.record_ops import push_records_restore
 from app.services.soft_delete import (  # noqa: PLC2701 — canonical labels, keep in one place
     SOFT_DELETE_RESOURCE_TYPES,
     TYPE_TO_MODEL,
@@ -68,16 +68,19 @@ class TrashListResponse(BaseModel):
     total: int
 
 
-class RestoreResponse(BaseModel):
-    batch_id: uuid.UUID
-    restored: int
-
-
 class RestoreConflict(BaseModel):
     type: str
     id: str
     display: str
     reason: str
+
+
+class RestoreResponse(BaseModel):
+    batch_id: uuid.UUID
+    restored: int
+    # Rows left in the trash because a live duplicate exists — only ever
+    # non-empty with ``?skip_conflicts=true``; without it a conflict is a 409.
+    skipped: list[RestoreConflict] = []
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────
@@ -193,8 +196,15 @@ async def restore_row(
     row_id: uuid.UUID,
     db: DB,
     current_user: SuperAdmin,
+    skip_conflicts: bool = False,
 ) -> RestoreResponse:
-    """Restore a soft-deleted row and every sibling in its deletion batch."""
+    """Restore a soft-deleted row and every sibling in its deletion batch.
+
+    ``skip_conflicts`` restores every sibling that does NOT clash with a live
+    row and reports the ones left behind, instead of refusing the whole batch
+    — for a bulk record delete (#963), where one record re-created by hand
+    must not make the other N unrestorable.
+    """
 
     if type not in SOFT_DELETE_RESOURCE_TYPES:
         raise HTTPException(
@@ -221,8 +231,10 @@ async def restore_row(
     async def _check(obj: Any) -> str | None:
         return await default_conflict_check(db, obj)
 
-    restored, conflicts = await restore_batch(db, batch_id, conflict_check=_check)
-    if conflicts:
+    restored, conflicts = await restore_batch(
+        db, batch_id, conflict_check=_check, skip_conflicts=skip_conflicts
+    )
+    if conflicts and not skip_conflicts:
         raise HTTPException(
             status_code=409,
             detail={"message": "Restore would clash with active rows", "conflicts": conflicts},
@@ -240,6 +252,11 @@ async def restore_row(
     # teardown on soft-delete, to avoid cloud zone-ID / NS churn), so its
     # cascade-deleted records are still live there and need no re-push.
     restored_has_zone = any(isinstance(o, DNSZone) for o in restored)
+    # Records re-push per ZONE in one batch, not per record: a #963 bulk delete
+    # restores as one batch of N independent records, and N singular pushes
+    # would be N serial bumps and, on an agentless driver, N WinRM round trips
+    # inside one request — the cost the bulk-delete route exists to avoid.
+    records_by_zone: dict[uuid.UUID, list[DNSRecord]] = {}
     for obj in restored:
         if isinstance(obj, DHCPScope):
             await push_scope_restore(db, obj)
@@ -250,7 +267,7 @@ async def restore_row(
             # re-populates them.
             await remirror_scope_statics(db, obj)
         elif isinstance(obj, DNSRecord) and not restored_has_zone:
-            await push_record_restore(db, obj)
+            records_by_zone.setdefault(obj.zone_id, []).append(obj)
         db.add(
             AuditLog(
                 user_id=current_user.id,
@@ -265,14 +282,22 @@ async def restore_row(
             )
         )
 
+    for zone_id, recs in records_by_zone.items():
+        await push_records_restore(db, zone_id, recs)
+
     await db.commit()
     logger.info(
         "trash.restore",
         batch_id=str(batch_id),
         restored=len(restored),
+        skipped=len(conflicts),
         user_id=str(current_user.id),
     )
-    return RestoreResponse(batch_id=batch_id, restored=len(restored))
+    return RestoreResponse(
+        batch_id=batch_id,
+        restored=len(restored),
+        skipped=[RestoreConflict(**c) for c in conflicts],
+    )
 
 
 @router.delete("/trash/{type}/{row_id}", status_code=status.HTTP_204_NO_CONTENT)

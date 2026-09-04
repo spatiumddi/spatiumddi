@@ -254,3 +254,128 @@ async def test_failed_wire_delete_keeps_the_row_on_the_soft_path(
     rows = {r.id: r for r in await _rows_including_deleted(db_session, ids)}
     assert rows[ids[0]].deleted_at is None
     assert rows[ids[1]].deleted_at is not None
+
+
+# ── review findings on #963 ──────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_duplicate_ids_count_once_and_the_batch_is_capped(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    headers = await _user(db_session, superadmin=False)
+    server, zone = await _agent_zone(db_session)
+    server_id = server.id
+    ids = await _records(db_session, zone, 1)
+    await db_session.commit()
+
+    resp = await client.post(
+        _url(zone), headers=headers, json={"record_ids": [str(ids[0]), str(ids[0])]}
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["deleted"] == 1, resp.json()
+    # One op, one audit row — not two of each for one row.
+    assert len(await _ops(db_session, server_id)) == 1
+    audits = (
+        (
+            await db_session.execute(
+                select(AuditLog).where(
+                    AuditLog.action == "soft_delete", AuditLog.resource_id == str(ids[0])
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(audits) == 1
+
+    from app.api.v1.dns.router import BULK_DELETE_RECORDS_MAX
+
+    too_many = [str(uuid.uuid4()) for _ in range(BULK_DELETE_RECORDS_MAX + 1)]
+    resp = await client.post(_url(zone), headers=headers, json={"record_ids": too_many})
+    assert resp.status_code == 422, resp.text
+
+
+@pytest.mark.asyncio
+async def test_pool_managed_record_is_skipped_like_the_singular_route(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The singular route 422s a pool member's record; the bulk route skips it
+    with that reason. Trashing it would let the next health pass re-create the
+    record and make the trashed copy unrestorable."""
+    from app.models.dns import DNSPool, DNSPoolMember
+
+    headers = await _user(db_session, superadmin=False)
+    _server, zone = await _agent_zone(db_session)
+    ids = await _records(db_session, zone, 2)
+    pool = DNSPool(group_id=zone.group_id, zone_id=zone.id, name="p", record_name="svc")
+    db_session.add(pool)
+    await db_session.flush()
+    member = DNSPoolMember(pool_id=pool.id, address="10.9.9.9")
+    db_session.add(member)
+    await db_session.flush()
+    rec = await db_session.get(DNSRecord, ids[0])
+    assert rec is not None
+    rec.pool_member_id = member.id
+    await db_session.commit()
+
+    resp = await client.post(
+        _url(zone), headers=headers, json={"record_ids": [str(i) for i in ids]}
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["deleted"] == 1, body
+    assert [s["record_id"] for s in body["skipped"]] == [str(ids[0])]
+    assert "pool" in body["skipped"][0]["reason"].lower()
+    rows = {r.id: r for r in await _rows_including_deleted(db_session, ids)}
+    assert rows[ids[0]].deleted_at is None
+    assert rows[ids[1]].deleted_at is not None
+
+
+@pytest.mark.asyncio
+async def test_bulk_batch_restores_together_and_skip_conflicts_leaves_only_the_duplicate(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """One batch id makes the bulk delete one restore — and a record the
+    operator re-created by hand must not pin the other N in the trash."""
+    headers = await _user(db_session, superadmin=True)
+    server, zone = await _agent_zone(db_session)
+    server_id, zone_id = server.id, zone.id
+    ids = await _records(db_session, zone, 3)
+    await db_session.commit()
+
+    resp = await client.post(
+        _url(zone), headers=headers, json={"record_ids": [str(i) for i in ids]}
+    )
+    assert resp.status_code == 200, resp.text
+    # Hand-recreate the first record while the batch sits in the trash.
+    trashed = await _rows_including_deleted(db_session, ids)
+    first = next(r for r in trashed if r.id == ids[0])
+    db_session.add(
+        DNSRecord(
+            zone_id=zone_id,
+            name=first.name,
+            fqdn=first.fqdn,
+            record_type=first.record_type,
+            value=first.value,
+        )
+    )
+    await db_session.commit()
+
+    restore = f"/api/v1/admin/trash/dns_record/{ids[1]}/restore"
+    resp = await client.post(restore, headers=headers)
+    assert resp.status_code == 409, resp.text  # default: all-or-nothing, as before
+
+    resp = await client.post(f"{restore}?skip_conflicts=true", headers=headers)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["restored"] == 2, body
+    assert [s["id"] for s in body["skipped"]] == [str(ids[0])]
+    rows = {r.id: r for r in await _rows_including_deleted(db_session, ids)}
+    assert rows[ids[0]].deleted_at is not None
+    assert rows[ids[1]].deleted_at is None and rows[ids[2]].deleted_at is None
+    # The re-push went out as ONE batch: one create op per restored record,
+    # all carrying the same target serial (one bump, not one per record).
+    creates = [o for o in await _ops(db_session, server_id) if o.op == "create"]
+    assert len(creates) == 2
+    assert len({o.target_serial for o in creates}) == 1

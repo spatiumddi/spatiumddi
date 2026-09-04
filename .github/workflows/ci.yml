@@ -470,9 +470,19 @@ jobs:
       - name: Install dependencies
         run: pip install pyyaml
 
+      - name: Cache kubeconform schemas
+        # kubeconform caches fetched schemas only in memory, per invocation;
+        # persisting its disk cache means a steady-state PR fetches nothing
+        # from raw.githubusercontent.com — the job's only flake source.
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/kubeconform-schemas
+          key: kubeconform-schemas-v0.8.0-k8s-1.31.0-${{ hashFiles('.github/scripts/charts-render-check.sh') }}
+
       - name: Lint, render and validate both charts
         env:
           OUT: ${{ runner.temp }}/charts
+          KUBECONFORM_CACHE: ${{ runner.temp }}/kubeconform-schemas
         run: |
           mkdir -p "$OUT"
           .github/scripts/charts-render-check.sh

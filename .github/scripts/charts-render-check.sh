@@ -22,10 +22,13 @@
 #                      an error rather than something the apiserver would
 #                      silently drop. CRDs (the CNPG ``Cluster``) resolve
 #                      through the datreeio CRDs-catalog.
-#   no-besteffort    — appliance renders only: every container must carry
-#                      CPU + memory requests (#965). A ``with`` guard that
-#                      tests the wrong values path renders no ``resources:``
-#                      block and passes the three gates above.
+#   no-besteffort    — every render: each serving container must carry a
+#                      CPU + memory request or limit (#965). A ``with`` guard
+#                      that tests the wrong values path renders no
+#                      ``resources:`` block and passes the three gates above.
+#   toggle-coverage  — every ``.Values.x.enabled`` / ``.kind`` a template is
+#                      gated on must be flipped by at least one render, so a
+#                      new gate cannot silently fall out of the matrix.
 #
 # Runs anywhere helm + kubeconform + python3 (with PyYAML) are on PATH; the
 # CI job and ``make charts-lint`` both call it. Rendered manifests are left
@@ -55,8 +58,14 @@ lint() { # chart [helm --set args...]
     helm lint --strict "$chart" "$@" || failures=$((failures + 1))
 }
 
-render() { # name chart check_besteffort [helm --set args...]
-    local name="$1" chart="$2" besteffort="$3"; shift 3
+# kubeconform caches fetched schemas only in memory, per invocation; six
+# invocations would fetch every kind's schema six times from GitHub raw. A
+# disk cache makes renders 2-6 free, and CI persists it across runs.
+KUBECONFORM_CACHE="${KUBECONFORM_CACHE:-$OUT/.schema-cache}"
+mkdir -p "$KUBECONFORM_CACHE"
+
+render() { # name chart [helm --set args...]
+    local name="$1" chart="$2"; shift 2
     local file="$OUT/$name.yaml"
     echo "── helm template $name ($(basename "$chart")) $*"
     if ! helm template "$name" "$chart" --kube-version "$K8S_VERSION" "$@" > "$file"; then
@@ -72,10 +81,15 @@ render() { # name chart check_besteffort [helm --set args...]
         -schema-location default \
         -schema-location "$CRD_SCHEMAS" \
         -skip CustomResourceDefinition \
+        -cache "$KUBECONFORM_CACHE" \
         "$file" || failures=$((failures + 1))
-    if [ "$besteffort" = "yes" ]; then
-        python3 "$ROOT/.github/scripts/chart-no-besteffort.py" "$file" || failures=$((failures + 1))
-    fi
+    python3 "$ROOT/.github/scripts/chart-no-besteffort.py" "$file" || failures=$((failures + 1))
+}
+
+coverage() { # chart [every --set arg from every render of that chart...]
+    local chart="$1"; shift
+    echo "── toggle coverage $(basename "$chart")"
+    python3 "$ROOT/.github/scripts/chart-toggle-coverage.py" "$chart" "$@" || failures=$((failures + 1))
 }
 
 # Subcharts. The umbrella has none today; the appliance vendors CNPG (#272)
@@ -84,21 +98,46 @@ helm dependency update "$UMBRELLA"
 helm dependency update "$APPLIANCE"
 
 # ── Umbrella chart ──────────────────────────────────────────────────────────
+# Every template gate on: the agents, ingress, the slot-image mirror, HPA, the
+# three RBAC toggles + service control + appliance host mounts, frontend TLS,
+# Redis auth. ``chart-toggle-coverage.py`` fails this script if a template
+# grows a gate that no set below flips.
 UMBRELLA_ALL_ON=(
     --set dnsAgents.enabled=true
     --set dhcpAgents.enabled=true
     --set ingress.enabled=true
     --set slotImageMirror.enabled=true
     --set api.autoscaling.enabled=true
+    --set api.serviceAccount.enabled=true
+    --set api.serviceControl.enabled=true
+    --set api.serviceControlRBAC.enabled=true
+    --set api.upgradeOrchestratorRBAC.enabled=true
+    --set api.applianceHostMounts.enabled=true
+    --set frontend.tls.enabled=true
+    --set redis.auth.enabled=true
+)
+# The HA topology docs/deployment/KUBERNETES.md points operators at: a
+# CloudNativePG ``Cluster`` CR (the one CRD instance either chart renders —
+# the datreeio schema location exists for it) + Redis Sentinel, with CNPG
+# backups on.
+UMBRELLA_HA=(
+    --set postgresql.kind=cnpg
+    --set postgresql.cnpg.backup.enabled=true
+    --set redis.kind=sentinel
+)
+UMBRELLA_EXTERNAL=(
+    --set postgresql.enabled=false --set externalDatabase.host=pg.example
+    --set redis.enabled=false --set externalRedis.host=redis.example
 )
 lint "$UMBRELLA"
 lint "$UMBRELLA" "${UMBRELLA_ALL_ON[@]}"
-render umbrella-defaults "$UMBRELLA" no
-render umbrella-all-on "$UMBRELLA" no "${UMBRELLA_ALL_ON[@]}"
-# Bring-your-own database + Redis: the shape HA installs use (k8s/ha/).
-render umbrella-external-db "$UMBRELLA" no \
-    --set postgresql.enabled=false --set externalDatabase.host=pg.example \
-    --set redis.enabled=false --set externalRedis.host=redis.example
+lint "$UMBRELLA" "${UMBRELLA_HA[@]}"
+render umbrella-defaults "$UMBRELLA"
+render umbrella-all-on "$UMBRELLA" "${UMBRELLA_ALL_ON[@]}"
+render umbrella-ha "$UMBRELLA" "${UMBRELLA_HA[@]}"
+# Bring-your-own database + Redis: the shape k8s/ha/ installs use.
+render umbrella-external-db "$UMBRELLA" "${UMBRELLA_EXTERNAL[@]}"
+coverage "$UMBRELLA" "${UMBRELLA_ALL_ON[@]}" "${UMBRELLA_HA[@]}" "${UMBRELLA_EXTERNAL[@]}"
 
 # ── Appliance chart ─────────────────────────────────────────────────────────
 # Every role + every feature on at once. This is not a valid appliance (one
@@ -112,7 +151,6 @@ APPLIANCE_ALL_ON=(
     --set dhcpKea.relayVIP=10.0.0.5
     --set lookingGlass.enabled=true
     --set supervisor.enabled=true
-    --set observer.enabled=true
     --set observability.kubeStateMetrics.enabled=true
     --set observability.nodeExporter.enabled=true
     --set dns.useMetalLBVIP=true
@@ -120,11 +158,12 @@ APPLIANCE_ALL_ON=(
 )
 lint "$APPLIANCE"
 lint "$APPLIANCE" "${APPLIANCE_ALL_ON[@]}"
-render appliance-defaults "$APPLIANCE" yes
-render appliance-all-on "$APPLIANCE" yes "${APPLIANCE_ALL_ON[@]}"
+render appliance-defaults "$APPLIANCE"
+render appliance-all-on "$APPLIANCE" "${APPLIANCE_ALL_ON[@]}"
 # The single-node default install shape: one DNS driver + DHCP + supervisor.
-render appliance-full-stack "$APPLIANCE" yes \
+render appliance-full-stack "$APPLIANCE" \
     --set dnsBind9.enabled=true --set dhcpKea.enabled=true --set supervisor.enabled=true
+coverage "$APPLIANCE" "${APPLIANCE_ALL_ON[@]}"
 
 if [ "$failures" -ne 0 ]; then
     echo "charts: $failures gate(s) failed" >&2

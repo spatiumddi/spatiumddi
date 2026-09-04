@@ -324,7 +324,7 @@ lint-untyped-routes-baseline: $(UNTYPED_LIST)
 
 FORCE:
 
-ci: ci-backend-lint ci-frontend-lint ci-frontend-build
+ci: ci-backend-lint ci-frontend-lint ci-frontend-build charts-lint perf-test
 	@echo ""
 	@echo "✓ All CI checks passed — safe to push."
 

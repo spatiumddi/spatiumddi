@@ -471,15 +471,7 @@ async def _count_pending_ops(db: AsyncSession, zone: DNSZone) -> int:
     also counts a sibling view's same-named zone: see
     ``record_ops.queued_zone_ops_where`` for why that is accepted (#964).
     """
-    return await count_queued_zone_ops(db, zone, await _group_server_ids(db, zone.group_id))
-
-
-async def _group_server_ids(db: AsyncSession, group_id: uuid.UUID) -> list[uuid.UUID]:
-    return list(
-        (await db.execute(select(DNSServer.id).where(DNSServer.group_id == group_id)))
-        .scalars()
-        .all()
-    )
+    return await count_queued_zone_ops(db, zone, zone.group_id)
 
 
 def _fill_warnings(plan: ZoneMovePlan) -> None:
@@ -742,7 +734,7 @@ async def commit_move(
 
     # ── Purge state belonging to the old group ────────────────────────
     await db.execute(sa_delete(DNSServerZoneState).where(DNSServerZoneState.zone_id == zone.id))
-    await sweep_zone_ops(db, zone, await _group_server_ids(db, old_group_id))
+    await sweep_zone_ops(db, zone, old_group_id)
     # DNSSEC key state is a read-only mirror of what the OLD group's agents
     # reported. The target signs from scratch, so leaving it would show the
     # operator keys that no server holds — and, worse, a cached

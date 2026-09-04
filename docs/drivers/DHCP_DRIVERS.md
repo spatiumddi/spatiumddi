@@ -295,7 +295,7 @@ Default ABC impls call the singular method in a loop — Kea inherits the plural
 
 **Windows batch size — 30 ops per chunk.** `pywinrm.run_ps` ships the script as a single CMD.EXE command line (8191-char cap, see [DNS_DRIVERS.md §3.7](DNS_DRIVERS.md#37-batched-winrm-dispatch) for the full math). DHCP payloads are leaner than DNS — each reservation / exclusion op is ~60 raw chars of JSON vs. DNS's ~160 — so the cmdline limit is farther away, but capped at 30 to stay comfortably inside it. Documented in `_WINRM_BATCH_SIZE` in [`drivers/dhcp/windows.py`](../../backend/app/drivers/dhcp/windows.py).
 
-**Dispatcher.** `push_statics_bulk_delete` groups by `(server, scope)` so the IPAM purge-orphans path went from N×M WinRM calls to one per server. Same state-aware commit pattern as DNS — only state=`applied` ops delete the DB row.
+**Dispatcher.** `push_statics_bulk_delete` groups by `(server, scope)` so the IPAM purge-orphans path went from N×M WinRM calls to one per server. Unlike the DNS side there is no state-aware commit here: the dispatcher returns nothing and the caller deletes the `DHCPStaticAssignment` rows regardless — the push is best-effort, and the next lease poll / config bundle reconciles the server.
 
 ---
 

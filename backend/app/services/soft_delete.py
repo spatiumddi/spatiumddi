@@ -225,11 +225,17 @@ async def restore_batch(
     batch_id: uuid.UUID,
     *,
     conflict_check: Callable[[Any], Awaitable[str | None]] | None = None,
+    skip_conflicts: bool = False,
 ) -> tuple[list[Any], list[dict[str, str]]]:
     """Restore every row sharing ``batch_id``.
 
-    Returns ``(restored_objs, conflicts)``. When ``conflicts`` is non-empty
-    the caller should roll back and 409 with the conflict list.
+    Returns ``(restored_objs, conflicts)``. By default a non-empty
+    ``conflicts`` means NOTHING was restored and the caller should 409 with
+    the list — right for a cascade batch (a zone with a hole is worse than a
+    refusal). With ``skip_conflicts`` the conflicting rows are left in the
+    trash and every other row is restored — the shape a bulk record delete
+    (#963) needs, where the rows are independent siblings and one hand-made
+    duplicate must not pin the other N in the trash forever.
     """
 
     restored: list[Any] = []
@@ -260,7 +266,7 @@ async def restore_batch(
                     continue
             restored.append(obj)
 
-    if conflicts:
+    if conflicts and not skip_conflicts:
         return [], conflicts
 
     for obj in restored:
@@ -268,7 +274,7 @@ async def restore_batch(
         obj.deleted_by_user_id = None
         obj.deletion_batch_id = None
 
-    return restored, []
+    return restored, conflicts
 
 
 async def default_conflict_check(db: AsyncSession, obj: Any) -> str | None:

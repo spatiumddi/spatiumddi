@@ -818,6 +818,15 @@ async def _apply_delete_zone(db: AsyncSession, user: User, args: DeleteZoneArgs)
     _reject_if_synthesised_zone(zone, "delete")
 
     if not args.permanent:
+        # Soft-delete is the moment the zone leaves the bundle, so it is the
+        # moment its queued ops become unapplyable: left behind, each one is
+        # shipped up to five times against a zone the agent no longer serves,
+        # then parks as ``failed`` forever (review of #964). Sweep here — the
+        # trash purge and permanent-delete-from-trash only ever see rows that
+        # came through this path.
+        from app.services.dns.record_ops import sweep_zone_ops  # noqa: PLC0415
+
+        await sweep_zone_ops(db, zone, zone.group_id)
         batch = await collect_soft_delete_batch(db, zone)
         apply_soft_delete(batch, user.id)
         for row in batch.rows:
@@ -865,15 +874,10 @@ async def _apply_delete_zone(db: AsyncSession, user: User, args: DeleteZoneArgs)
     # surface as a zombie on the next resync.
     from sqlalchemy import delete as sa_delete
 
-    from app.models.dns import DNSRecord, DNSServer
+    from app.models.dns import DNSRecord
     from app.services.dns.record_ops import sweep_zone_ops
 
-    group_server_ids = (
-        (await db.execute(select(DNSServer.id).where(DNSServer.group_id == zone.group_id)))
-        .scalars()
-        .all()
-    )
-    await sweep_zone_ops(db, zone, group_server_ids)
+    await sweep_zone_ops(db, zone, zone.group_id)
     await db.execute(sa_delete(DNSRecord).where(DNSRecord.zone_id == zone.id))
     await db.delete(zone)
     await db.commit()
