@@ -6587,6 +6587,15 @@ async def bulk_delete_records(
     # failed must NOT remove the DB row — if we delete blindly the user
     # sees "deleted" in the UI but the record is still published, and
     # the next "Sync with server" pulls the zombie back.
+    #
+    # Only ``failed`` blocks, though. Agent-based servers never answer
+    # inline: ``enqueue_record_ops_batch`` queues their rows as ``pending``
+    # and the agent applies them on its next long-poll — exactly what the
+    # singular DELETE route relies on. Gating on ``!= "applied"`` treated
+    # every one of those as a failure, so bulk delete on an agent-based
+    # zone skipped every record and returned ``deleted: 0`` while the
+    # singular route deleted the same rows (appliance sizing campaign,
+    # 2026-09-02).
     deleted = 0
     for rec, op_row in zip(targets, op_rows, strict=True):
         if op_row is None:
@@ -6597,7 +6606,7 @@ async def bulk_delete_records(
                 }
             )
             continue
-        if op_row.state != "applied":
+        if op_row.state == "failed":
             skipped.append(
                 {
                     "record_id": str(rec.id),
