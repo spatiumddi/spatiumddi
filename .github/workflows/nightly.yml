@@ -55,8 +55,12 @@ on:
     # so the nightly must run AFTER their late pushes, DST included. Cron
     # is UTC-only, so schedule both candidate UTC hours (06:23 = 02:23
     # EDT, 07:23 = 02:23 EST) and let the gate job keep exactly the one
-    # where the Eastern wall clock actually reads 02 — the other fires
-    # and immediately skips. Off-the-hour minute for the same reason
+    # whose SCHEDULED slot reads 02 on the Eastern clock — the other fires
+    # and immediately skips. The gate decides from the cron string GitHub
+    # hands it (github.event.schedule), never from the clock at run time:
+    # GitHub starts these runs 40 min to 13 h late (measured, every
+    # night), so the run-time wall clock says nothing about which slot a
+    # run belongs to. Off-the-hour minute for the same reason
     # prune-release-assets.yml uses one: the top-of-hour cron stampede
     # delays runner scheduling on GitHub's shared infrastructure.
     - cron: "23 6 * * *"
@@ -114,18 +118,64 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           FORCE: ${{ github.event.inputs.force || 'false' }}
           EVENT_NAME: ${{ github.event_name }}
+          # The cron string that fired ("23 6 * * *"); empty on dispatch.
+          SCHEDULE: ${{ github.event.schedule }}
         run: |
           set -euo pipefail
 
-          # ── Eastern-wall-clock gate ──────────────────────────────────
+          # ── Which twin fired? ────────────────────────────────────────
           # Two UTC crons cover 02:23 America/New_York across DST (see the
-          # trigger comment). Keep the firing where Eastern actually reads
-          # 02; the other is a no-op. Manual dispatch always proceeds.
-          ET_HOUR=$(TZ=America/New_York date +%H)
-          if [ "$EVENT_NAME" = "schedule" ] && [ "$ET_HOUR" != "02" ]; then
-            echo "should_build=false" >> "$GITHUB_OUTPUT"
-            echo "→ $(TZ=America/New_York date '+%H:%M %Z') is not the 02:xx Eastern slot; skipping (DST twin cron)"
-            exit 0
+          # trigger comment). Keep the twin whose SCHEDULED slot reads 02
+          # on the Eastern clock; the other is a no-op. Manual dispatch
+          # always proceeds.
+          #
+          # The slot comes from the cron string that fired, NOT from the
+          # clock when this step runs. GitHub starts scheduled runs late —
+          # 40 min to 13 h on this repo, every night since the twin crons
+          # landed — and the previous form of this gate compared the
+          # run-time Eastern hour to 02, so both twins always woke outside
+          # 02:xx and both skipped: no scheduled nightly built between
+          # 2026-08-09 and this change (the only nightly in that window
+          # was a manual dispatch). The cron string is immune to the delay.
+          #
+          # DST nights: on the fall-back night the 06:23 twin reads 01:23
+          # EST and the 07:23 twin 02:23 EST — one build. On the
+          # spring-forward night no Eastern 02:xx exists (01:59 → 03:00),
+          # so neither twin builds; the next night covers it.
+          if [ "$EVENT_NAME" = "schedule" ]; then
+            # "23 6 * * *" → "6:23", that cron's UTC instant read on the
+            # Eastern clock. A missing or odd cron string is a hard failure,
+            # never a skip — a failed gate is what finalize turns into the
+            # tracking issue, whereas a quiet skip is exactly how the
+            # previous gate went unnoticed for four weeks.
+            CRON_UTC=$(printf '%s' "$SCHEDULE" | awk '{print $2 ":" $1}')
+            if [[ ! "$CRON_UTC" =~ ^[0-9]{1,2}:[0-9]{1,2}$ ]]; then
+              echo "::error::github.event.schedule is '${SCHEDULE}' — cannot tell which twin fired"
+              exit 1
+            fi
+            # Which day's slot? The most recent occurrence at or before now,
+            # never today's unconditionally: GitHub starts a run late but
+            # never early, so a delay that crosses UTC midnight would read
+            # TOMORROW's slot. On a same-offset day both readings agree, so
+            # this is invisible 363 nights a year — but on a DST-change day
+            # they differ by an hour and that is the whole decision. Worked
+            # example: the 02:23 EDT twin of Sat 10-31, started 00:30 UTC on
+            # Sun 11-01, reads 11-01 06:23 UTC = 01:23 EST and skips, while
+            # the 03:23 EDT twin that must skip reads 02:23 EST and builds.
+            # With the on-time twin also skipping, that night builds nothing
+            # — the same silent miss this gate was rewritten to end, just
+            # twice a year instead of nightly.
+            SLOT_UTC=$(date -u -d "$(date -u +%F) ${CRON_UTC} UTC" +%s)
+            if [ "$SLOT_UTC" -gt "$(date -u +%s)" ]; then
+              SLOT_UTC=$((SLOT_UTC - 86400))
+            fi
+            SLOT_ET=$(TZ=America/New_York date -d "@$SLOT_UTC" '+%H:%M %Z')
+            if [ "${SLOT_ET%%:*}" != "02" ]; then
+              echo "should_build=false" >> "$GITHUB_OUTPUT"
+              echo "→ cron '${SCHEDULE}' is the ${SLOT_ET} slot, not 02:xx Eastern; skipping (DST twin cron)"
+              exit 0
+            fi
+            echo "→ cron '${SCHEDULE}' is the ${SLOT_ET} slot; run started $(TZ=America/New_York date '+%H:%M %Z')"
           fi
 
           # ONE source of truth for which images exist. Both the build
