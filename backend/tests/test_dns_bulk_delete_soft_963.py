@@ -228,7 +228,7 @@ async def test_failed_wire_delete_keeps_the_row_on_the_soft_path(
 ) -> None:
     """A server that REJECTED the delete still serves the record; trashing the
     row would tell the operator it is gone. Same rule as #951's permanent path."""
-    import app.api.v1.dns.router as dns_router
+    from app.api.v1.dns import router as dns_router
 
     headers = await _user(db_session, superadmin=False)
     _server, zone = await _agent_zone(db_session)
@@ -289,9 +289,9 @@ async def test_duplicate_ids_count_once_and_the_batch_is_capped(
     )
     assert len(audits) == 1
 
-    from app.api.v1.dns.router import BULK_DELETE_RECORDS_MAX
+    from app.api.v1.dns import router as dns_router
 
-    too_many = [str(uuid.uuid4()) for _ in range(BULK_DELETE_RECORDS_MAX + 1)]
+    too_many = [str(uuid.uuid4()) for _ in range(dns_router.BULK_DELETE_RECORDS_MAX + 1)]
     resp = await client.post(_url(zone), headers=headers, json={"record_ids": too_many})
     assert resp.status_code == 422, resp.text
 
@@ -379,3 +379,39 @@ async def test_bulk_batch_restores_together_and_skip_conflicts_leaves_only_the_d
     creates = [o for o in await _ops(db_session, server_id) if o.op == "create"]
     assert len(creates) == 2
     assert len({o.target_serial for o in creates}) == 1
+
+
+@pytest.mark.asyncio
+async def test_skip_conflicts_is_refused_on_a_cascade_batch(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A zone's batch holds the zone AND its records. Skipping a row there can
+    restore a child whose parent stayed deleted — records pointing at a
+    soft-deleted zone, hidden by the zone's own filter and re-pushed to the
+    provider as if live. Only a flat batch of independent siblings (a bulk
+    record delete) may be partially restored."""
+    headers = await _user(db_session, superadmin=True)
+    _server, zone = await _agent_zone(db_session)
+    ids = await _records(db_session, zone, 2)
+    group_id, zone_id = zone.group_id, zone.id
+    await db_session.commit()
+
+    resp = await client.delete(f"/api/v1/dns/groups/{group_id}/zones/{zone_id}", headers=headers)
+    assert resp.status_code == 204, resp.text
+    rows = await _rows_including_deleted(db_session, ids)
+    batch_ids = {r.deletion_batch_id for r in rows}
+    assert len(batch_ids) == 1 and None not in batch_ids, "records ride the zone's batch"
+
+    restore = f"/api/v1/admin/trash/dns_record/{ids[0]}/restore"
+    resp = await client.post(f"{restore}?skip_conflicts=true", headers=headers)
+    assert resp.status_code == 422, resp.text
+    assert "dns_zone" in resp.json()["detail"], resp.text
+    # Nothing was restored on the way to the refusal.
+    rows = await _rows_including_deleted(db_session, ids)
+    assert all(r.deleted_at is not None for r in rows)
+
+    # The whole-batch restore still works — that is the supported path here.
+    resp = await client.post(restore, headers=headers)
+    assert resp.status_code == 200, resp.text
+    rows = await _rows_including_deleted(db_session, ids)
+    assert all(r.deleted_at is None for r in rows)

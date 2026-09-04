@@ -3310,6 +3310,10 @@ function MoveZoneModal({
 // (``records`` is the default and is left out of the URL entirely).
 type ZoneSubtab = "records" | "pools" | "certs" | "drift";
 
+// Matches BULK_DELETE_RECORDS_MAX server-side. A selection larger than this
+// is split, and each call is its own trash batch — the confirm copy says so.
+const BULK_DELETE_CHUNK = 2000;
+
 function ZoneDetailView({
   group,
   zone,
@@ -3489,32 +3493,43 @@ function ZoneDetailView({
   const bulkDeleteRecords = useMutation({
     // Server-side bulk endpoint: one WinRM round trip for agentless
     // drivers + a single zone-serial bump instead of N. Replaces the
-    // old Promise.allSettled fan-out. The server caps a call at 2000 ids
-    // and the selection can exceed that across pages, so chunk.
+    // old Promise.allSettled fan-out. The server caps a call at
+    // BULK_DELETE_CHUNK ids and the selection can exceed that across
+    // pages, so chunk — and each chunk is its own trash batch, which the
+    // confirm copy says rather than promising one restore.
     mutationFn: async (ids: string[]) => {
-      const CHUNK = 2000;
       let deleted = 0;
       const skipped: { record_id: string; reason: string }[] = [];
-      for (let i = 0; i < ids.length; i += CHUNK) {
+      const batches: string[] = [];
+      for (let i = 0; i < ids.length; i += BULK_DELETE_CHUNK) {
         const res = await dnsApi.bulkDeleteRecords(
           group.id,
           zone.id,
-          ids.slice(i, i + CHUNK),
+          ids.slice(i, i + BULK_DELETE_CHUNK),
           { permanent: bulkPermanent },
         );
         deleted += res.deleted;
         skipped.push(...res.skipped);
+        if (res.deletion_batch_id) batches.push(res.deletion_batch_id);
       }
-      return { deleted, skipped };
+      return { deleted, skipped, batches };
     },
-    onSuccess: ({ deleted, skipped }) => {
+    onSuccess: ({ deleted, skipped, batches }) => {
       qc.invalidateQueries({ queryKey: ["dns-records", zone.id] });
       setSelectedRecords(new Set());
       setConfirmBulkDelete(false);
+      const spread =
+        batches.length > 1
+          ? ` across ${batches.length} trash batches, each restored separately`
+          : "";
       if (skipped.length > 0) {
         const reasons = Array.from(new Set(skipped.map((s) => s.reason)));
         setBulkDeleteNotice(
-          `${deleted} record${deleted === 1 ? "" : "s"} ${bulkPermanent ? "deleted" : "moved to the trash"}; ${skipped.length} skipped — ${reasons.join("; ")}`,
+          `${deleted} record${deleted === 1 ? "" : "s"} ${bulkPermanent ? "deleted" : "moved to the trash"}${spread}; ${skipped.length} skipped — ${reasons.join("; ")}`,
+        );
+      } else if (spread) {
+        setBulkDeleteNotice(
+          `${deleted} record${deleted === 1 ? "" : "s"} ${bulkPermanent ? "deleted" : "moved to the trash"}${spread}.`,
         );
       } else {
         setBulkDeleteNotice(null);
@@ -4438,7 +4453,9 @@ function ZoneDetailView({
                 selected records
                 {bulkPermanent
                   ? "? This cannot be undone."
-                  : " to the trash? They can be restored together from Admin → Trash."}{" "}
+                  : selectedRecords.size > BULK_DELETE_CHUNK
+                    ? ` to the trash? They are split into ${Math.ceil(selectedRecords.size / BULK_DELETE_CHUNK)} batches in Admin → Trash, each restored separately.`
+                    : " to the trash? They can be restored together from Admin → Trash."}{" "}
                 IPAM-managed records are excluded automatically.
               </p>
               {isSuperadmin && (

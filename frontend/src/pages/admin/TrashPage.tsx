@@ -42,6 +42,13 @@ function ConfirmRestoreModal({
   const [error, setError] = useState<string | null>(null);
   // Set after a 409: the batch holds rows that clash with live ones. The
   // operator can then restore the others and leave the clashing rows behind.
+  //
+  // Only offered for a dns_record batch — a bulk record delete (#963) stamps
+  // N independent siblings under one id, so leaving one behind is sound. Every
+  // other batch is a cascade (a zone AND its records, a scope AND its pools)
+  // where a partial restore can bring a child back without its parent; the
+  // server refuses those with a 422, and this keeps the button off the screen
+  // rather than showing one that always errors.
   const [canSkipConflicts, setCanSkipConflicts] = useState(false);
   const mut = useMutation({
     mutationFn: (skipConflicts: boolean) =>
@@ -65,7 +72,9 @@ function ConfirmRestoreModal({
             .map((c) => `${c.display} — ${c.reason}`)
             .join("; ")}`,
         );
-        setCanSkipConflicts(entry.batch_size > conflicts.length);
+        setCanSkipConflicts(
+          entry.type === "dns_record" && entry.batch_size > conflicts.length,
+        );
       } else if (typeof detail === "string") {
         setError(detail);
       } else {

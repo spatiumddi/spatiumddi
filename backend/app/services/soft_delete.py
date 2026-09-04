@@ -220,6 +220,27 @@ def apply_soft_delete(batch: SoftDeleteBatch, user_id: uuid.UUID | None) -> date
     return now
 
 
+async def batch_resource_types(db: AsyncSession, batch_id: uuid.UUID) -> set[str]:
+    """Which resource types a deletion batch holds.
+
+    Lets a caller tell a FLAT batch of independent siblings (a #963 bulk
+    record delete — every row a ``dns_record``) from a CASCADE batch (a zone
+    and its records, a scope and its pools), which is the difference between
+    a partial restore being safe and it leaving a dangling child.
+    """
+    types: set[str] = set()
+    for resource_type, model in TYPE_TO_MODEL.items():
+        stmt: Any = (
+            select(model.id)
+            .where(model.deletion_batch_id == batch_id)
+            .limit(1)
+            .execution_options(include_deleted=True)
+        )
+        if (await db.execute(stmt)).first() is not None:
+            types.add(resource_type)
+    return types
+
+
 async def restore_batch(
     db: AsyncSession,
     batch_id: uuid.UUID,

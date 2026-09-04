@@ -33,6 +33,7 @@ from app.services.dns.record_ops import push_records_restore
 from app.services.soft_delete import (  # noqa: PLC2701 — canonical labels, keep in one place
     SOFT_DELETE_RESOURCE_TYPES,
     TYPE_TO_MODEL,
+    batch_resource_types,
     default_conflict_check,
     restore_batch,
 )
@@ -190,6 +191,20 @@ async def list_trash(
     return TrashListResponse(items=items[offset : offset + limit], total=total)
 
 
+# Types a partial restore is safe for (#963 review). ``skip_conflicts`` leaves
+# the clashing rows in the trash, which is only sound when the batch is a FLAT
+# set of independent siblings — every row a leaf, none the parent of another.
+#
+# ``dns_record`` is the only such batch anyone produces today: bulk record
+# delete stamps N records under one id, and ``_collect_descendants`` has no
+# DNSRecord branch, so a record never drags children along. Every other batch
+# is a cascade (a zone AND its records, a scope AND its pools), where skipping
+# a row can restore a child whose parent stayed deleted — records pointing at
+# a soft-deleted zone, hidden by the zone's own filter and re-pushed to the
+# provider as if live. Add a type here only with the same argument.
+_PARTIAL_RESTORE_TYPES = frozenset({"dns_record"})
+
+
 @router.post("/trash/{type}/{row_id}/restore", response_model=RestoreResponse)
 async def restore_row(
     type: str,
@@ -203,7 +218,8 @@ async def restore_row(
     ``skip_conflicts`` restores every sibling that does NOT clash with a live
     row and reports the ones left behind, instead of refusing the whole batch
     — for a bulk record delete (#963), where one record re-created by hand
-    must not make the other N unrestorable.
+    must not make the other N unrestorable. It is refused (422) on a cascade
+    batch; see ``_PARTIAL_RESTORE_TYPES``.
     """
 
     if type not in SOFT_DELETE_RESOURCE_TYPES:
@@ -227,6 +243,22 @@ async def restore_row(
         # Defensive: stamp a fresh batch and restore just this row.
         batch_id = uuid.uuid4()
         target.deletion_batch_id = batch_id
+
+    if skip_conflicts:
+        # Checked BEFORE the restore: a partial restore of a cascade batch is
+        # not something to undo afterwards. The UI hides the option for these
+        # types; this is what enforces it.
+        cascade = await batch_resource_types(db, batch_id) - _PARTIAL_RESTORE_TYPES
+        if cascade:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "skip_conflicts is only available for a flat batch of independent "
+                    f"rows; this batch also holds {', '.join(sorted(cascade))}, whose "
+                    "children would be restored without their parent. Resolve the "
+                    "clash and restore the batch whole."
+                ),
+            )
 
     async def _check(obj: Any) -> str | None:
         return await default_conflict_check(db, obj)
