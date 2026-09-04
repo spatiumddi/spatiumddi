@@ -56,6 +56,18 @@ spec:
         - name: dhcp-kea
           image: {{ include "spatiumddi-appliance.imageRef" (dict "global" .Values.global "repository" .Values.dhcpKea.image.repository) }}
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          # A CPU request is what keeps Kea serving when the control plane
+          # is busy: without one the pod is BestEffort, i.e. the LOWEST CFS
+          # weight on the node (cpu.weight 1 against the api's 4), and on a
+          # 3-vCPU appliance the api's lease-event work starves Kea's single
+          # thread until its socket queue overflows — the sizing campaign
+          # measured 37 % of DISCOVERs answered at 5632 MiB / 3 vCPU with the
+          # DHCP server at 7.5 % CPU. Requests only (a CPU limit would
+          # throttle the very burst we need served); see values.yaml.
+          {{- with .Values.dhcpKea.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           # NET_BIND_SERVICE — bind udp/67 (privileged port). NET_RAW
           # is needed by Kea's raw-socket DHCPDISCOVER read path when
           # not behind a relay agent.
