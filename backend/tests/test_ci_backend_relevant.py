@@ -39,6 +39,9 @@ _MANIFEST = _REPO_ROOT / ".github" / "scripts" / "ci-backend-must-run.txt"
 # changes that break the test doing the reading.
 _KNOWN_REPO_ROOT_READS: dict[str, str] = {
     "test_spatium_console.py": "appliance/mkosi.extra/usr/local/bin/spatium-console",
+    "test_appliance_join_auto_retry.py": (
+        "appliance/mkosi.extra/usr/local/bin/spatium-cluster-join"
+    ),
     "test_webui_selfcheck.py": ("appliance/mkosi.extra/usr/local/bin/spatiumddi-webui-selfcheck"),
     "test_appliance_firewall_render.py": (
         "agent/supervisor/spatium_supervisor/firewall_renderer.py"

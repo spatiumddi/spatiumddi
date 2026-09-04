@@ -17,6 +17,10 @@
 # Editing THIS file runs the suite too (it lives under .github/scripts/).
 
 # test_spatium_console.py loads the console script directly — 52 tests.
+# test_appliance_join_auto_retry.py parses spatium-cluster-join's
+# classify_join_failure and pins each message it can emit against the
+# backend's permanent-vs-transient markers, so rewording the runner has to
+# run the suite that would otherwise silently start misclassifying.
 appliance/mkosi.extra/usr/local/bin/
 
 # test_appliance_firewall_render.py imports the renderer by path.

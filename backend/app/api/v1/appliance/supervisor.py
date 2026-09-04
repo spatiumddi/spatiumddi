@@ -117,6 +117,61 @@ from app.services.appliance.syslog import syslog_bundle
 
 logger = structlog.get_logger(__name__)
 
+# A transient join failure keeps the promote desired-state (so the supervisor
+# re-fires the join, bounded by its own per-target attempt ceiling) for this
+# long after the latest reported failure; then the row is cleared exactly as
+# a permanent failure is, and the operator re-promotes.
+_JOIN_AUTO_RETRY_WINDOW = timedelta(minutes=15)
+# The three failures no retry can fix, matched against what the runner's
+# classifier (appliance/.../spatium-cluster-join ``classify_join_failure``)
+# EMITS — not against the k3s log lines it matches on. That distinction is
+# the whole content of this constant: ``cluster_join_reason`` is the
+# classifier's output message, so a marker lifted from its ``case`` patterns
+# ("different token", from "bootstrap data already found and encrypted with
+# different token") never matches anything that reaches this function, and
+# the failure it was meant to catch is retried for the full window instead
+# of clearing at once. ``tests/test_appliance_join_auto_retry.py`` pins each
+# marker against the runner's real output so the two cannot drift apart.
+_PERMANENT_JOIN_FAILURE_MARKERS = (
+    # "this hostname is already an etcd member of the target cluster — evict
+    # it (Fleet → Replace, or delete its k8s Node) before re-joining"
+    "already an etcd member",
+    # "stale k3s bootstrap data on disk — the join token does not match the
+    # cluster"
+    "the join token does not match",
+    # "this node's etcd member was removed from the cluster — it must re-join
+    # as a NEW member (leave first)"
+    "must re-join as a new member",
+)
+
+
+def _join_failure_is_permanent(reason: str | None) -> bool:
+    """PURE: a join failure an automatic retry cannot fix — a stale etcd
+    member under this hostname, a bootstrap-token mismatch on disk, or an
+    etcd member the cluster has permanently removed. All three need an
+    operator to evict, re-pair or leave first.
+
+    Everything else — the seed unreachable while it adds a learner, a
+    readiness timeout, an unclassified k3s exit — is treated as transient
+    and retried. "the seed rejected the join token" is deliberately in that
+    transient set despite naming the token: the campaign's own drill
+    produced it from a NETWORK block (2026-09-04 00:55Z), and the retry then
+    succeeded once the block lifted."""
+    text = (reason or "").lower()
+    return any(marker in text for marker in _PERMANENT_JOIN_FAILURE_MARKERS)
+
+
+def _join_retry_window_elapsed(state_at: datetime | None, now: datetime | None = None) -> bool:
+    """PURE: whether the latest failure is older than the auto-retry window.
+    An unknown clock counts as elapsed — never retry blind."""
+    if state_at is None:
+        return True
+    now = now or datetime.now(UTC)
+    if state_at.tzinfo is None:
+        state_at = state_at.replace(tzinfo=UTC)
+    return now - state_at > _JOIN_AUTO_RETRY_WINDOW
+
+
 router = APIRouter()
 
 
@@ -1917,16 +1972,49 @@ async def supervisor_heartbeat(
         row.desired_cluster_role == DESIRED_CLUSTER_ROLE_MEMBER
         and row.cluster_join_state == CLUSTER_JOIN_STATE_FAILED
     ):
-        row.desired_cluster_role = None
-        row.desired_k3s_server_url = None
-        row.desired_k3s_join_token_encrypted = None
-        logger.warning(
-            "control_plane_join_failed",
-            appliance_id=str(row.id),
-            hostname=row.hostname,
-            reason=row.cluster_join_reason,
-            detail="cleared desired-state; re-promote to retry",
-        )
+        # …but not on the FIRST transient failure. Two members promoted
+        # together race each other into the seed's etcd (one of them is a
+        # learner while the other is being added), and the loser's join
+        # dies with "could not reach the seed" / a readiness timeout that a
+        # second attempt a minute later survives. Clearing the desired-state
+        # here turned that flake into an operator round-trip on every third
+        # formation (appliance sizing campaign, 2026-09-02/03: 3-node
+        # formations stuck at 2 until someone re-promoted by hand).
+        #
+        # So a transient failure keeps the desired-state and lets the
+        # supervisor re-fire the join — it does so on its own once the row
+        # still says "member" and its `.state` says failed, bounded by its
+        # per-target attempt ceiling (appliance_state._CLUSTER_JOIN_MAX_
+        # ATTEMPTS) — for up to _JOIN_AUTO_RETRY_WINDOW after the latest
+        # failure. A PERMANENT failure (the runner's classifier names three:
+        # a stale etcd member under this hostname, a bootstrap-token mismatch
+        # on disk, an etcd member the cluster permanently removed) clears
+        # immediately as before: no retry can fix those, the operator has to
+        # evict, re-pair or leave first.
+        if _join_failure_is_permanent(row.cluster_join_reason) or _join_retry_window_elapsed(
+            row.cluster_join_state_at
+        ):
+            row.desired_cluster_role = None
+            row.desired_k3s_server_url = None
+            row.desired_k3s_join_token_encrypted = None
+            logger.warning(
+                "control_plane_join_failed",
+                appliance_id=str(row.id),
+                hostname=row.hostname,
+                reason=row.cluster_join_reason,
+                detail="cleared desired-state; re-promote to retry",
+            )
+        else:
+            logger.warning(
+                "control_plane_join_retrying",
+                appliance_id=str(row.id),
+                hostname=row.hostname,
+                reason=row.cluster_join_reason,
+                detail=(
+                    "transient join failure — desired-state kept so the supervisor "
+                    f"re-fires the join (window {_JOIN_AUTO_RETRY_WINDOW})"
+                ),
+            )
     # Auto-clear the demote desired-state once the leave landed: the
     # supervisor reports ``left`` → the node is back to a plain
     # application appliance.
@@ -4070,11 +4158,31 @@ async def replace_control_plane_member(
             f"Appliance {row.hostname!r} is the etcd seed — replacing the seed is a "
             "separate migration flow, out of scope here.",
         )
-    if row.cluster_role != CLUSTER_ROLE_MEMBER:
+    # A joiner whose join FAILED is replaceable too. The failure that needs
+    # this flow is the one the classifier names "already an etcd member":
+    # the node's k3s got far enough to register its etcd member (or the
+    # seed kept a stale one under its hostname), then died — so the seed
+    # holds a member nobody serves, every re-promote is refused with
+    # "duplicate node name", and Replace was the one route that evicts the
+    # stale Node/member by name, yet it 409'd on the row not being settled
+    # (appliance sizing campaign, 2026-09-02: a 3-node formation stuck on
+    # one such joiner, cleared only by hand). In-flight joiners still 409.
+    #
+    # The failed joiner is accepted WHETHER OR NOT its desired-state is still
+    # set: a transient failure keeps `desired_cluster_role` for the
+    # supervisor's automatic retry window (the heartbeat path above), and an
+    # operator who reaches for Replace during that window is overriding the
+    # retry on purpose — refusing them because a retry is pending is exactly
+    # the contradiction this route exists to remove (live 2026-09-04
+    # 01:34Z: a blocked join, desired-state kept, Replace answered 409).
+    # The fields are cleared just below, which also ends the retry.
+    failed_joiner = row.cluster_role is None and row.cluster_join_state == CLUSTER_JOIN_STATE_FAILED
+    if row.cluster_role != CLUSTER_ROLE_MEMBER and not failed_joiner:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
-            f"Appliance {row.hostname!r} isn't a settled control-plane member — nothing "
-            "to evict. (Demote in-flight joiners; this is for replacing a dead member.)",
+            f"Appliance {row.hostname!r} isn't a settled control-plane member or a "
+            "failed joiner — nothing to evict. (Demote in-flight joiners; this is for "
+            "replacing a dead member or clearing a failed join's stale etcd member.)",
         )
 
     # Drop the dead member from the cluster accounting + flag it for the
