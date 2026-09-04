@@ -41,7 +41,7 @@ spec:
   template:
     metadata:
       labels:
-        {{- include "spatiumddi-appliance.labels" . | nindent 8 }}
+        {{- include "spatiumddi-appliance.podLabels" . | nindent 8 }}
         app.kubernetes.io/name: looking-glass
         app.kubernetes.io/component: looking-glass
     spec:
@@ -66,6 +66,13 @@ spec:
         - name: looking-glass
           image: {{ include "spatiumddi-appliance.imageRef" (dict "global" .Values.global "repository" .Values.lookingGlass.image.repository) }}
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          # #965 — keep the collector out of BestEffort: a starved gobgpd
+          # misses keepalives and the operator's routers drop the session on
+          # hold-timer expiry. Requests only; see values.yaml.
+          {{- with .Values.lookingGlass.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           # gobgpd binds the privileged BGP port :179 as the non-root
           # ``spatium`` user via a file capability (``setcap
           # cap_net_bind_service`` on the binary). Under k8s that file cap is
