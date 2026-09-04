@@ -63,6 +63,78 @@ The trade-off: k3s adds ~70 MB to the slot rootfs and a steady ~150 MB RAM footp
 | **Control plane** (api + worker + frontend + Postgres + Redis + k3s etcd seed) | 4 | 8 GiB | 40 GiB SSD |
 | **Appliance** (DNS / DHCP agent) | 2 | 4 GiB | 32 GiB SSD |
 
+**Measured floors (single node, 2026-09).** The recommendation above was
+tested against a fixed load rather than guessed: a single-node control
+plane serving one agent-based DNS group of **250k A records (+250k PTR)**
+and a DHCP population of **35k devices with 20k active**, 75 minutes of
+lease / renew / DDNS churn per point, judged on api restarts, cgroup kills,
+memory thrash and kea/BIND's own served ratios rather than on the load
+generator's view alone.
+
+| RAM | vCPU | Outcome |
+|---|---|---|
+| 8 GiB | 4 | passes with headroom (the recommendation) |
+| 6 GiB | 3 | passes; the smallest point that passed on every attempt |
+| 5.5 GiB | 3 | the knee — see the third point below: it is a scheduling-weight limit, not a CPU-capacity one |
+| 5 GiB | 4 | marginal; memory thrash under the churn |
+| 4 GiB | any | the api cannot converge; the appliance wedges |
+| any | 2 | CPU-bound under 20k active devices; 3 vCPU is the CPU floor |
+
+Three things shape those numbers, and all three are the appliance's job,
+not the operator's:
+
+- The chart's default api limit (512Mi) cannot build the agent config
+  bundle for a group of this size, and the default worker limit (1Gi with
+  four prefork processes) is OOM-killed under lease/DDNS churn long before
+  the VM runs short. The supervisor therefore sizes both from the node's
+  RAM — api = ½ RAM (1–8 GiB), worker = ¼ RAM (1–4 GiB), two worker
+  processes on nodes of 12 GiB or less — and writes them into the
+  `spatium-control` HelmChartConfig, where they survive k3s restarts and
+  helm re-applies. (`kubectl set resources` on the Deployment does not:
+  k3s re-applies the on-disk HelmChart manifest on every restart.) If you
+  need different limits, put them in that HelmChartConfig, not on the
+  Deployment.
+- A bulk load creates one queued record op per record per agent server;
+  the api ships them to the agent a page at a time (5000 by default,
+  `dns_agent_ops_batch`). A group of 250k records drains in ~50 polls; the
+  zone itself renders once the agent has the bundle.
+- The DNS and DHCP pods must carry a CPU request. Without one Kubernetes
+  runs them as BestEffort — the lowest scheduler weight on the node — and on
+  a 3 vCPU appliance the api's lease-event work starves Kea's single thread
+  until its socket queue overflows: at 5.5 GiB / 3 vCPU, Kea was given 7.5 %
+  of a CPU and answered 37 % of the DISCOVERs on the wire (55 % handshake
+  success) while it answered 100 % of what reached it. The same cell with a
+  CPU request on `dhcp-kea` and `dns-bind9` reached 95.6 % with 0 restarts.
+  That measurement used a **500m** request (cgroup weight 20 against the
+  api's 4); the chart default since spatiumddi#953 is **250m** (weight 10),
+  which lifts the pods out of BestEffort — the defect — but has not itself
+  been run against this load. Sizing a node at the knee, prefer the measured
+  500m. See spatiumddi#967. That is why the 4 vCPU rows pass — a fourth CPU
+  happens to be free for Kea — and why 3 vCPU sits at the knee. A larger
+  socket receive buffer does not help: with 8 MiB of buffer the drops
+  vanish but a DORA takes 34 s instead of 1.5 s, because Kea then answers
+  stale requests whole retransmit rounds late.
+
+Beyond that: **500k records in one group** is not a supported single-node
+size at any RAM tested (up to 10 GiB) — the api's bundle build for the
+group outlives its own probes under churn — and **1M records in one group**
+does not converge at all. Split large namespaces across groups.
+
+For a 3-node control plane, size every member like the standalone
+recommendation (4 vCPU / 8 GiB); the members carry the same api / worker /
+Postgres / Redis replicas. Measured on `main` (2026-09-03): three 6.5 GiB /
+4 vCPU nodes formed cleanly and kept every api replica and every k3s
+server up through the same 250k-record / 20k-device load and a kill-leader
+drill (0 k3s restarts, at most one api restart).
+
+**Control-plane HA is not serving HA.** The DNS and DHCP roles are assigned
+per appliance, and only the nodes that carry a role run the `dns-bind9` /
+`dhcp-kea` pods. In that drill the roles sat on the seed alone, so for the
+~2 minutes between the seed going down and coming back the survivors
+answered ~5 % of the queries the load generator sent — the control plane
+had failed over, the data plane had nothing to serve with. Assign the DNS
+and DHCP roles on every node you expect to keep serving during a failover.
+
 The installer's **hard disk floor is 32 GiB** for every role (raised from 24 GiB — issue #312: a 24 GiB disk left `/var` only ~7 GiB, and the Control plane's first boot tipped the kubelet DiskPressure threshold into an eviction storm). 2 GiB RAM boots a single-node control plane but is tight once Postgres + Redis + the Python api/worker are all resident; 8 GiB is the comfortable recommendation. When the operator picks the **Control plane** role on a box below the recommended 40 GiB disk / 8 GiB RAM, `spatium-install` shows a soft sizing warning before proceeding (the lighter Appliance/agent role is fine at the 32 GiB floor and gets no warning). Each control-plane **HA member** sizes the same as a standalone control plane (4 vCPU / 8 GiB) — every member runs a full api / worker / Postgres replica / Redis. SSD is strongly preferred for the etcd + Postgres write path; the installer's disk floor assumes the baked image set lands on the slots, not RAM.
 
 ### Appliance management surfaces (k3s-aware)
