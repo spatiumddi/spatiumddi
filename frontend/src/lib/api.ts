@@ -6156,14 +6156,25 @@ export const dnsApi = {
   deleteRecord: (groupId: string, zoneId: string, recordId: string) =>
     api.delete(`/dns/groups/${groupId}/zones/${zoneId}/records/${recordId}`),
 
-  bulkDeleteRecords: (groupId: string, zoneId: string, recordIds: string[]) =>
+  // Soft-deletes by default (#963) — the whole selection shares one
+  // deletion_batch_id, so it restores from Admin → Trash in one action.
+  // ``permanent`` is superadmin-only server-side, same as deleteRecord.
+  bulkDeleteRecords: (
+    groupId: string,
+    zoneId: string,
+    recordIds: string[],
+    opts?: { permanent?: boolean },
+  ) =>
     api
       .post<{
         deleted: number;
         skipped: { record_id: string; reason: string }[];
-      }>(`/dns/groups/${groupId}/zones/${zoneId}/records/bulk-delete`, {
-        record_ids: recordIds,
-      })
+        deletion_batch_id: string | null;
+      }>(
+        `/dns/groups/${groupId}/zones/${zoneId}/records/bulk-delete`,
+        { record_ids: recordIds },
+        { params: opts?.permanent ? { permanent: true } : undefined },
+      )
       .then((r) => r.data),
 
   // Bulk zone file import / export

@@ -4380,9 +4380,10 @@ function ZoneDetailView({
           title={`Delete ${selectedRecords.size} records`}
           description={
             <>
-              Delete the{" "}
+              Move the{" "}
               <span className="font-medium">{selectedRecords.size}</span>{" "}
-              selected records? IPAM-managed records are excluded automatically.
+              selected records to the trash? They can be restored together from
+              Admin → Trash. IPAM-managed records are excluded automatically.
             </>
           }
           isPending={bulkDeleteRecords.isPending}

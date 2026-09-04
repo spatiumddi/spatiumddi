@@ -45,7 +45,6 @@ from app.models.dns import (
     DNSKey,
     DNSPool,
     DNSRecord,
-    DNSRecordOp,
     DNSServer,
     DNSServerGroup,
     DNSServerZoneState,
@@ -56,7 +55,11 @@ from app.models.dns import (
 )
 from app.services.dns.named_conf_validation import is_name_reference
 from app.services.dns.pool_geo import build_geo_steering
-from app.services.dns.record_ops import clear_dnssec_key_state
+from app.services.dns.record_ops import (
+    clear_dnssec_key_state,
+    count_queued_zone_ops,
+    sweep_zone_ops,
+)
 from app.services.dns.tsig import ensure_group_tsig_key
 
 logger = structlog.get_logger(__name__)
@@ -464,20 +467,18 @@ async def _count_pending_ops(db: AsyncSession, zone: DNSZone) -> int:
 
     Keyed by ``(server_id, zone_name)`` rather than by zone id — that is
     how ``DNSRecordOp`` is shaped — so it is scoped to the source group's
-    servers to avoid touching an identically-named zone's ops elsewhere.
+    servers. Within the group it is name-scoped, which under split-horizon
+    also counts a sibling view's same-named zone: see
+    ``record_ops.queued_zone_ops_where`` for why that is accepted (#964).
     """
-    return len(
-        (
-            await db.execute(
-                select(DNSRecordOp.id)
-                .join(DNSServer, DNSServer.id == DNSRecordOp.server_id)
-                .where(
-                    DNSServer.group_id == zone.group_id,
-                    DNSRecordOp.zone_name == zone.name,
-                    DNSRecordOp.state.in_(("pending", "in_flight")),
-                )
-            )
-        ).all()
+    return await count_queued_zone_ops(db, zone, await _group_server_ids(db, zone.group_id))
+
+
+async def _group_server_ids(db: AsyncSession, group_id: uuid.UUID) -> list[uuid.UUID]:
+    return list(
+        (await db.execute(select(DNSServer.id).where(DNSServer.group_id == group_id)))
+        .scalars()
+        .all()
     )
 
 
@@ -741,19 +742,7 @@ async def commit_move(
 
     # ── Purge state belonging to the old group ────────────────────────
     await db.execute(sa_delete(DNSServerZoneState).where(DNSServerZoneState.zone_id == zone.id))
-    old_server_ids = (
-        (await db.execute(select(DNSServer.id).where(DNSServer.group_id == old_group_id)))
-        .scalars()
-        .all()
-    )
-    if old_server_ids:
-        await db.execute(
-            sa_delete(DNSRecordOp).where(
-                DNSRecordOp.server_id.in_(old_server_ids),
-                DNSRecordOp.zone_name == zone.name,
-                DNSRecordOp.state.in_(("pending", "in_flight")),
-            )
-        )
+    await sweep_zone_ops(db, zone, await _group_server_ids(db, old_group_id))
     # DNSSEC key state is a read-only mirror of what the OLD group's agents
     # reported. The target signs from scratch, so leaving it would show the
     # operator keys that no server holds — and, worse, a cached

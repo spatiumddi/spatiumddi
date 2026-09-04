@@ -7,7 +7,9 @@
    servers never answer inline: the batch enqueue queues their ops as
    ``pending`` for the agent's next long-poll, and the route's gate treated
    anything but ``applied`` as a failure. Only a ``failed`` wire delete may
-   keep the DB row.
+   keep the DB row live. (Since #963 the route soft-deletes by default —
+   the rows go to the trash under one shared batch id rather than away —
+   so "deleted" below means trashed; ``?permanent=true`` is superadmin-only.)
 
 2. ``DELETE .../zones/{id}?permanent=true`` cascaded through the ORM — every
    record row loaded and deleted one by one in the request — so a large zone
@@ -113,14 +115,34 @@ async def _ops(db: AsyncSession, zone_name: str) -> list[DNSRecordOp]:
 # ── 1. bulk delete on an agent-based zone ────────────────────────────────────
 
 
+async def _live_and_trashed(db: AsyncSession, zone_id: uuid.UUID) -> tuple[int, int]:
+    """(rows not soft-deleted, rows soft-deleted) — ``_record_count`` is a
+    bare aggregate the soft-delete filter does not touch, so it cannot tell."""
+    db.expire_all()
+    rows = (
+        (
+            await db.execute(
+                select(DNSRecord)
+                .where(DNSRecord.zone_id == zone_id)
+                .execution_options(include_deleted=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    trashed = sum(1 for r in rows if r.deleted_at is not None)
+    return len(rows) - trashed, trashed
+
+
 @pytest.mark.asyncio
-async def test_bulk_delete_on_an_agent_zone_deletes_the_rows_and_queues_the_ops(
+async def test_bulk_delete_on_an_agent_zone_trashes_the_rows_and_queues_the_ops(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
     headers = await _admin_headers(db_session)
     _grp, _server, zone = await _agent_group_and_zone(db_session)
     rows = await _add_records(db_session, zone, 5)
     await db_session.commit()
+    zone_id, zone_name = zone.id, zone.name
 
     resp = await client.post(
         f"{_zone_url(zone)}/records/bulk-delete",
@@ -131,11 +153,13 @@ async def test_bulk_delete_on_an_agent_zone_deletes_the_rows_and_queues_the_ops(
     body = resp.json()
     # The wire ops are PENDING on an agent-based server (the agent applies
     # them on its next long-poll); that is a dispatched delete, not a failed
-    # one, and the DB rows must go.
+    # one, and the DB rows must go — to the trash, since #963 (one shared
+    # batch id, restorable together), not to /dev/null.
     assert body["deleted"] == 3, body
     assert body["skipped"] == [], body
-    assert await _record_count(db_session, zone.id) == 2
-    ops = [o for o in await _ops(db_session, zone.name) if o.op == "delete"]
+    assert body["deletion_batch_id"] is not None, body
+    assert await _live_and_trashed(db_session, zone_id) == (2, 3)
+    ops = [o for o in await _ops(db_session, zone_name) if o.op == "delete"]
     assert len(ops) == 3
     assert {o.state for o in ops} == {"pending"}
 
@@ -172,8 +196,9 @@ async def test_bulk_delete_keeps_the_row_only_when_the_wire_delete_failed(
     assert len(body["skipped"]) == 1
     assert body["skipped"][0]["record_id"] == str(rows[0].id)
     assert "primary refused" in body["skipped"][0]["reason"]
-    # The failed one is still published, so it is still in the database.
-    assert await _record_count(db_session, zone.id) == 1
+    # The failed one is still published, so it stays live; the other two are
+    # in the trash.
+    assert await _live_and_trashed(db_session, zone.id) == (1, 2)
 
 
 # ── 2. permanent zone delete at scale ────────────────────────────────────────

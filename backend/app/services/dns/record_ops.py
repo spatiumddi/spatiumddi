@@ -11,12 +11,14 @@ plane applies the change directly at enqueue time and writes the row as
 
 from __future__ import annotations
 
+import uuid
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any
 
 import structlog
 from sqlalchemy import delete as sa_delete
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.agent_wake import collect_wake, dns_group_channel
@@ -27,6 +29,78 @@ from app.services.dns.rrset import stamp_rrsets_for_ops
 from app.services.dns.serial import bump_zone_serial
 
 logger = structlog.get_logger(__name__)
+
+
+# Queued-op states. ``in_flight`` is queued work too: an op already shipped is
+# not finished with — ``ack_op`` returns a NACKed one to ``pending`` — so any
+# sweep of a zone's queue must cover both (the #934 review finding).
+QUEUED_OP_STATES: tuple[str, ...] = ("pending", "in_flight")
+
+
+def queued_zone_ops_where(zone: DNSZone, server_ids: Sequence[uuid.UUID]) -> list[Any]:
+    """WHERE clauses selecting the live (queued) ops for ``zone`` on ``server_ids``.
+
+    **This predicate is name-scoped, and that is a decision, not an accident
+    of the schema (#964).** ``DNSRecordOp`` carries ``server_id`` +
+    ``zone_name`` and no view discriminator, while ``DNSZone`` is unique on
+    ``(group_id, view_id, name)`` — so under split-horizon (#24) the same name
+    legitimately exists twice in one group, and a sweep for ``internal``'s
+    ``example.com.`` also discards ``external``'s queued ops on the same
+    servers.
+
+    Why that is accepted rather than fixed with a view column: the op
+    *payload* carries no view either. An RFC 2136 update for ``example.com.``
+    lands in whichever view the agent's update source matches, so under
+    split-horizon the queued ops for two same-named zones are already
+    indistinguishable at the agent — what converges both views is the
+    ConfigBundle re-render, which rebuilds full zone state from the database
+    on the next drop. A discarded incremental op therefore costs delayed
+    convergence, never permanent divergence, on every agent-based driver; on
+    agentless drivers ops are applied inline and never sit queued, so the
+    sweep never matches them. A ``zone_id`` column would need a migration plus
+    a name-scoped fallback for every pre-upgrade row, i.e. this predicate
+    again, to buy back a window the bundle already closes.
+
+    Every zone-scoped sweep and count goes through here so the decision lives
+    in one place; ``tests/test_dns_record_ops_sweep.py`` pins both the
+    behaviour and that the call sites do not carry their own copy.
+    """
+    return [
+        DNSRecordOp.server_id.in_(list(server_ids)),
+        DNSRecordOp.zone_name == zone.name,
+        DNSRecordOp.state.in_(QUEUED_OP_STATES),
+    ]
+
+
+async def count_queued_zone_ops(
+    db: AsyncSession, zone: DNSZone, server_ids: Sequence[uuid.UUID]
+) -> int:
+    """How many queued ops :func:`sweep_zone_ops` would discard. See its caveat."""
+    if not server_ids:
+        return 0
+    return int(
+        (
+            await db.execute(
+                select(func.count())
+                .select_from(DNSRecordOp)
+                .where(*queued_zone_ops_where(zone, server_ids))
+            )
+        ).scalar_one()
+    )
+
+
+async def sweep_zone_ops(db: AsyncSession, zone: DNSZone, server_ids: Sequence[uuid.UUID]) -> int:
+    """Discard the queued ops for ``zone`` on ``server_ids``; returns the count.
+
+    Used when the ops can no longer apply: the zone is being permanently
+    deleted, or moved out of the group whose servers they target. Applied /
+    failed rows are history, not queued work, and are kept. Name-scoped — see
+    :func:`queued_zone_ops_where` for the split-horizon caveat (#964).
+    """
+    if not server_ids:
+        return 0
+    res = await db.execute(sa_delete(DNSRecordOp).where(*queued_zone_ops_where(zone, server_ids)))
+    return int(res.rowcount or 0)
 
 
 async def resolve_primary_server(db: AsyncSession, zone: DNSZone) -> DNSServer | None:
