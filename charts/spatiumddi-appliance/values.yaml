@@ -95,6 +95,14 @@ dnsPowerdns:
   enabled: false
   image:
     repository: ghcr.io/spatiumddi/dns-powerdns
+  # Scheduling weight for the serving pod — see dnsBind9.resources. The
+  # three DNS drivers are interchangeable roles on the same node, so they
+  # carry the same floor: whichever one the operator assigns must not be
+  # the BestEffort pod the control plane starves.
+  resources:
+    requests:
+      cpu: 250m
+      memory: 64Mi
   controlPlaneUrl: ""
   inClusterApiUrl: ""  # #292 — see dnsBind9.inClusterApiUrl
   agentKey: ""
@@ -123,6 +131,14 @@ dnsTechnitium:
   enabled: false
   image:
     repository: ghcr.io/spatiumddi/dns-technitium
+  # Scheduling weight for the serving pod — see dnsBind9.resources. The
+  # memory request is the same 64Mi floor the other DNS roles carry; it is
+  # a scheduling and eviction-ranking floor, not a sizing estimate, and
+  # Technitium's .NET runtime idles well above it. Requests only.
+  resources:
+    requests:
+      cpu: 250m
+      memory: 64Mi
   controlPlaneUrl: ""
   inClusterApiUrl: ""  # #292 — see dnsBind9.inClusterApiUrl
   agentKey: ""
