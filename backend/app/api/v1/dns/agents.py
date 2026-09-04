@@ -392,10 +392,28 @@ async def agent_config_longpoll(
                 # (appliance sizing campaign, 2026-09-03: the api still hit
                 # 4.18 GB twice serving the first bundle after the paged-ops
                 # and one-query-records fixes). json.dumps of the same dict
-                # is what the ETag already hashes, so nothing changes on the
-                # wire.
+                # is what the ETag already hashes.
+                #
+                # #958 — the kwargs are Starlette ``JSONResponse.render``'s,
+                # not ``json.dumps``'s. They are not cosmetic: the stock
+                # defaults put a space after every ``,`` and ``:``, which on
+                # the 250k-record bundle this path exists to shrink is
+                # +3.5 MB (+13.5%) of string built in-process, and escape
+                # non-ASCII to ``\uXXXX`` (six bytes a character instead of
+                # two) so an IDN or a UTF-8 record value inflates further.
+                # ``allow_nan=False`` restores the guardrail: Python's own
+                # ``json.loads`` ACCEPTS bare ``NaN``, so a stray float would
+                # round-trip control plane → agent unnoticed and fail only on
+                # a strict parser. With these, the body is byte-identical to
+                # what FastAPI sent before the switch.
                 return Response(
-                    content=json.dumps(bundle, default=str),
+                    content=json.dumps(
+                        bundle,
+                        ensure_ascii=False,
+                        allow_nan=False,
+                        separators=(",", ":"),
+                        default=str,
+                    ),
                     media_type="application/json",
                     headers={"ETag": format_etag(etag)},
                 )
