@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hmac
+import json
 import os
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -382,8 +383,22 @@ async def agent_config_longpoll(
             if not etag_matches(if_none_match, etag) or has_pending_ops:
                 server.last_config_etag = etag
                 await db.commit()
-                response.headers["ETag"] = format_etag(etag)
-                return bundle
+                # Serialise ONCE and hand the bytes back. Returning the dict
+                # sends it through FastAPI's jsonable_encoder, which walks and
+                # copies the whole structure — for a 250k-record group that is
+                # 500k record dicts duplicated on the request loop before the
+                # JSON is even written, the difference between a bundle that
+                # fits the api's memory limit and one that is memcg-killed
+                # (appliance sizing campaign, 2026-09-03: the api still hit
+                # 4.18 GB twice serving the first bundle after the paged-ops
+                # and one-query-records fixes). json.dumps of the same dict
+                # is what the ETag already hashes, so nothing changes on the
+                # wire.
+                return Response(
+                    content=json.dumps(bundle, default=str),
+                    media_type="application/json",
+                    headers={"ETag": format_etag(etag)},
+                )
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
                 response.status_code = 304

@@ -545,7 +545,8 @@ def reclaim_stranded_redis_storage(
             continue
         try:
             status, resp = _request(
-                "DELETE", f"{base}/persistentvolumeclaims/{quote(name)}")
+                "DELETE", f"{base}/persistentvolumeclaims/{quote(name)}"
+            )
         except RuntimeError as exc:
             return reclaimed, str(exc)
         if status not in (200, 202, 404):
@@ -697,7 +698,9 @@ def _helmchartconfig_doc(name: str, *, namespace: str = "kube-system") -> dict |
     try:
         st, resp = _request("GET", path)
     except (RuntimeError, OSError) as exc:
-        log.warning("supervisor.helmchartconfig.read_failed", chart=name, error=str(exc))
+        log.warning(
+            "supervisor.helmchartconfig.read_failed", chart=name, error=str(exc)
+        )
         return None
     if st == 404:
         return {}
@@ -714,7 +717,9 @@ def _helmchartconfig_doc(name: str, *, namespace: str = "kube-system") -> dict |
     try:
         doc = yaml.safe_load(raw)
     except yaml.YAMLError as exc:
-        log.warning("supervisor.helmchartconfig.unparseable_values", chart=name, error=str(exc))
+        log.warning(
+            "supervisor.helmchartconfig.unparseable_values", chart=name, error=str(exc)
+        )
         return None
     if not isinstance(doc, dict):
         # A list or scalar at the top level is not something we can merge
@@ -793,14 +798,81 @@ def _slot_image_mirror_enabled(cp_size: int, current_doc: dict) -> bool:
     return bool(isinstance(block, dict) and block.get("enabled") is True)
 
 
+# Appliance sizing (2026-09 resource-floor campaign). The chart's defaults —
+# api 512Mi, worker 1Gi with four prefork processes — are BYO-cluster
+# defaults, and on the appliance they gave way long before the VM did: the
+# api could not build a 250k-record agent bundle under 512Mi (memcg-killed
+# on every long-poll, so the bundle never reached the data plane), the
+# worker's five ~220 MB processes were OOM-killed under 20k-device lease/DDNS
+# churn with gigabytes free on the node, and any ``kubectl set resources``
+# an operator applied was wiped by the next k3s restart (k3s re-applies the
+# on-disk HelmChart manifest). The supervisor knows the node's RAM, so it
+# sizes the two workloads from it and writes the result where it survives
+# (the same HelmChartConfig as the replica overrides, #272). Fractions and
+# clamps are deliberately simple; ``limits`` only — requests stay the
+# chart's, so scheduling on a small box is unchanged.
+_API_MEM_FRACTION = 0.5
+_API_MEM_MIN_MIB = 1024
+_API_MEM_MAX_MIB = 8192
+_WORKER_MEM_FRACTION = 0.25
+_WORKER_MEM_MIN_MIB = 1024
+_WORKER_MEM_MAX_MIB = 4096
+# Below this much RAM the worker runs two prefork processes instead of the
+# chart's four: the campaign's 8 GiB single node OOMed the 1Gi worker at
+# four, and the queues it serves (ipam/dns/dhcp/default) are latency-, not
+# throughput-bound on an appliance.
+_WORKER_SMALL_NODE_MIB = 12288
+
+
+def _clamp_mib(total_mib: int, fraction: float, lo: int, hi: int) -> int:
+    return int(min(max(total_mib * fraction, lo), hi))
+
+
+def control_plane_resources(mem_total_mib: int | None) -> dict[str, Any]:
+    """PURE: the ``api`` / ``worker`` resource overrides for a node with
+    ``mem_total_mib`` of RAM — ``{}`` when the size is unknown (the chart's
+    defaults then stand, exactly as before)."""
+    if not mem_total_mib or mem_total_mib <= 0:
+        return {}
+    api_mib = _clamp_mib(
+        mem_total_mib, _API_MEM_FRACTION, _API_MEM_MIN_MIB, _API_MEM_MAX_MIB
+    )
+    worker_mib = _clamp_mib(
+        mem_total_mib, _WORKER_MEM_FRACTION, _WORKER_MEM_MIN_MIB, _WORKER_MEM_MAX_MIB
+    )
+    return {
+        "api": {"resources": {"limits": {"memory": f"{api_mib}Mi"}}},
+        "worker": {
+            "concurrency": 2 if mem_total_mib <= _WORKER_SMALL_NODE_MIB else 4,
+            "resources": {"limits": {"memory": f"{worker_mib}Mi"}},
+        },
+    }
+
+
+def node_memory_mib() -> int | None:
+    """MemTotal from /proc/meminfo in MiB; ``None`` when unreadable."""
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) // 1024
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
 def apply_control_plane_overrides(
     cp_size: int,
     control_plane_vip: str,
     web_ui_allowed_cidrs: list[str] | None = None,
+    *,
+    mem_total_mib: int | None = None,
 ) -> tuple[bool, str | None]:
     """Durably set the spatium-control overrides: api / frontend / worker
     replicas + CNPG instances + redis sentinel replicas = ``cp_size``,
-    plus the frontend control-plane VIP. Written to the spatium-control
+    plus the frontend control-plane VIP, plus the api / worker memory
+    limits and worker concurrency sized from ``mem_total_mib`` (see
+    ``control_plane_resources``). Written to the spatium-control
     HelmChartConfig so it survives a k3s restart (#272).
 
     #285 Phase 6 — ``web_ui_allowed_cidrs`` (empty = open) also lands on the
@@ -848,17 +920,26 @@ def apply_control_plane_overrides(
         # Unknown current state — see _helmchartconfig_doc. Writing here
         # would merge onto {} and delete every key we do not own.
         return False, "could not read the current spatium-control values"
+    sized = control_plane_resources(mem_total_mib)
     owned: dict[str, Any] = {
-        "api": dict(scaled),
+        "api": dict(scaled) | sized.get("api", {}),
         "frontend": dict(scaled)
         | {
             "controlPlaneVIP": vip,
             "loadBalancerSourceRanges": cidrs,
         },
-        "worker": dict(scaled),
-        "slotImageMirror": {"enabled": _slot_image_mirror_enabled(cp_size, current_doc)},
+        "worker": dict(scaled) | sized.get("worker", {}),
+        "slotImageMirror": {
+            "enabled": _slot_image_mirror_enabled(cp_size, current_doc)
+        },
         "postgresql": {"cnpg": {"instances": cp_size}},
-        "redis": {"sentinel": {"replicas": cp_size}},
+        # ``kind`` is stated, not assumed: ``sentinel.replicas`` is only
+        # read by the chart under ``kind: sentinel``, and firstboot is the
+        # only place that ever set it. An appliance whose HelmChart values
+        # came from an older firstboot (or an operator's own override)
+        # would scale a key the chart ignores and keep a standalone redis
+        # on a three-node control plane.
+        "redis": {"kind": "sentinel", "sentinel": {"replicas": cp_size}},
     }
     # MERGE onto what is already there rather than replacing the document.
     #
@@ -1076,17 +1157,27 @@ def count_nodes(timeout: float = 5.0) -> tuple[int, int, str | None]:
 _COREDNS_PATH = "/apis/apps/v1/namespaces/kube-system/deployments/coredns"
 _FAST_EVICT_KEYS = ("node.kubernetes.io/unreachable", "node.kubernetes.io/not-ready")
 _FAST_EVICT_TOLERATIONS = [
-    {"key": "node.kubernetes.io/unreachable", "operator": "Exists",
-     "effect": "NoExecute", "tolerationSeconds": 20},
-    {"key": "node.kubernetes.io/not-ready", "operator": "Exists",
-     "effect": "NoExecute", "tolerationSeconds": 20},
+    {
+        "key": "node.kubernetes.io/unreachable",
+        "operator": "Exists",
+        "effect": "NoExecute",
+        "tolerationSeconds": 20,
+    },
+    {
+        "key": "node.kubernetes.io/not-ready",
+        "operator": "Exists",
+        "effect": "NoExecute",
+        "tolerationSeconds": 20,
+    },
 ]
 _COREDNS_SPREAD = {
     "podAntiAffinity": {
-        "requiredDuringSchedulingIgnoredDuringExecution": [{
-            "topologyKey": "kubernetes.io/hostname",
-            "labelSelector": {"matchLabels": {"k8s-app": "kube-dns"}},
-        }],
+        "requiredDuringSchedulingIgnoredDuringExecution": [
+            {
+                "topologyKey": "kubernetes.io/hostname",
+                "labelSelector": {"matchLabels": {"k8s-app": "kube-dns"}},
+            }
+        ],
     },
 }
 
@@ -1246,8 +1337,12 @@ def ensure_coredns_ha(max_replicas: int = 2) -> tuple[bool, str | None]:
     # still differing from the canonical body — and that difference is a new
     # pod-template hash, i.e. a rollout. Deciding the gate on the loose
     # predicate would let exactly that rollout skip the guard it exists to be.
-    want_affinity = None if affinity_patch is None else _merge_patch(affinity, affinity_patch)
-    rewrites_template = want_tolerations != tolerations or want_affinity != (affinity or None)
+    want_affinity = (
+        None if affinity_patch is None else _merge_patch(affinity, affinity_patch)
+    )
+    rewrites_template = want_tolerations != tolerations or want_affinity != (
+        affinity or None
+    )
 
     if current_replicas == desired and not rewrites_template:
         return False, None
@@ -1268,18 +1363,24 @@ def ensure_coredns_ha(max_replicas: int = 2) -> tuple[bool, str | None]:
         )
         return False, None
 
-    payload = json.dumps({
-        "spec": {
-            "replicas": desired,
-            "template": {"spec": {
-                "tolerations": want_tolerations,
-                "affinity": affinity_patch,
-            }},
-        },
-    }).encode("utf-8")
+    payload = json.dumps(
+        {
+            "spec": {
+                "replicas": desired,
+                "template": {
+                    "spec": {
+                        "tolerations": want_tolerations,
+                        "affinity": affinity_patch,
+                    }
+                },
+            },
+        }
+    ).encode("utf-8")
     try:
         status, resp = _request(
-            "PATCH", _COREDNS_PATH, body=payload,
+            "PATCH",
+            _COREDNS_PATH,
+            body=payload,
             content_type="application/merge-patch+json",
         )
     except (RuntimeError, OSError) as exc:
