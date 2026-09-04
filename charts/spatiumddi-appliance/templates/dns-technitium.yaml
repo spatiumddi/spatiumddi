@@ -53,6 +53,13 @@ spec:
         - name: dns-technitium
           image: {{ include "spatiumddi-appliance.imageRef" (dict "global" .Values.global "repository" .Values.dnsTechnitium.image.repository) }}
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          # A CPU request keeps the serving pod out of BestEffort QoS (the
+          # lowest CFS weight on the node) so a busy control plane cannot
+          # starve it — see dhcp-kea.yaml for the measurement. Requests only.
+          {{- with .Values.dnsTechnitium.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           env:
             # #292 / #409 — in-cluster API Service over HTTP by default;
             # prefer the supervisor-supplied external controlPlaneUrl when
