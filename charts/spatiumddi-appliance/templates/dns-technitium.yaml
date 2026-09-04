@@ -31,7 +31,7 @@ spec:
   template:
     metadata:
       labels:
-        {{- include "spatiumddi-appliance.labels" . | nindent 8 }}
+        {{- include "spatiumddi-appliance.podLabels" . | nindent 8 }}
         app.kubernetes.io/name: dns-technitium
         app.kubernetes.io/component: dns-technitium
     spec:

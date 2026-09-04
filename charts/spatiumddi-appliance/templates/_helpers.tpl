@@ -18,6 +18,17 @@
 
 {{- define "spatiumddi-appliance.labels" -}}
 app.kubernetes.io/name: {{ include "spatiumddi-appliance.name" . }}
+{{ include "spatiumddi-appliance.podLabels" . }}
+{{- end -}}
+
+{{/* Pod-template labels: everything in .labels EXCEPT app.kubernetes.io/name,
+     which every pod template sets to its own workload name (dns-bind9,
+     dhcp-kea, ...) so the selector matches. Including .labels there too
+     emitted the key twice in one map — YAML that yaml.v2 resolves last-wins
+     (which is why the live pods were always labelled correctly) but that a
+     strict decoder rejects outright: kubeconform, and kubectl's
+     --validate=strict. Found by the #966 render gate on the first run. */}}
+{{- define "spatiumddi-appliance.podLabels" -}}
 app.kubernetes.io/instance: {{ .Release.Name }}
 app.kubernetes.io/managed-by: {{ .Release.Service }}
 app.kubernetes.io/part-of: spatiumddi

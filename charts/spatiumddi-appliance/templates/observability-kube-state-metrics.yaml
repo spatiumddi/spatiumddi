@@ -96,7 +96,7 @@ spec:
   template:
     metadata:
       labels:
-        {{- include "spatiumddi-appliance.labels" . | nindent 8 }}
+        {{- include "spatiumddi-appliance.podLabels" . | nindent 8 }}
         app.kubernetes.io/name: kube-state-metrics
         app.kubernetes.io/component: kube-state-metrics
     spec:
