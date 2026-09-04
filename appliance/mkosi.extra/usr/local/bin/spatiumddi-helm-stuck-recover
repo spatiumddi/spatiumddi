@@ -72,10 +72,23 @@ charts_json=$($KUBECTL --request-timeout=10s get helmchart -A -o json 2>/dev/nul
 # is fragile besides (JSON containing ``'''`` would break the literal).
 # ``strict=False`` tolerates the control char (we only read the CRs to
 # find Failed conditions, so lossy value bytes don't matter).
-CHARTS_JSON="$charts_json" python3 - <<PY
+#
+# The JSON goes through a FILE, not the environment: a single environment
+# string is capped at MAX_ARG_STRLEN (128 KiB on Linux), and the
+# spatium-control HelmChart's ``valuesContent`` alone crosses that once a
+# cluster has been promoted (~250 KB of rendered values on the appliance
+# sizing campaign's 3-node clusters, 2026-09-02). ``CHARTS_JSON=... python3``
+# then failed with ``Argument list too long`` (E2BIG) on every tick, so the
+# recovery timer that exists to unwedge helm could never run on exactly the
+# clusters that wedge. Only the path rides in the environment.
+charts_file=$(mktemp /tmp/helm-stuck-recover.XXXXXX)
+trap 'rm -f "$charts_file"' EXIT
+printf '%s' "$charts_json" > "$charts_file"
+CHARTS_FILE="$charts_file" python3 - <<PY
 import json, os, subprocess, time
 
-data = json.loads(os.environ["CHARTS_JSON"], strict=False)
+with open(os.environ["CHARTS_FILE"], encoding="utf-8", errors="replace") as fh:
+    data = json.loads(fh.read(), strict=False)
 now = int(time.time())
 
 def kubectl(*args):
