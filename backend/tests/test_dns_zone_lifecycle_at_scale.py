@@ -203,11 +203,11 @@ async def test_permanent_zone_delete_is_set_based_and_sweeps_its_queued_ops(
     assert await _record_count(db_session, zone_id) == 400
     assert len(await _ops(db_session, zone_name)) == 5
 
-    record_deletes: list[str] = []
+    record_deletes: list[tuple[str, bool]] = []
 
     def _count(conn, cursor, statement, parameters, context, executemany):  # noqa: ANN001
         if statement.lstrip().upper().startswith("DELETE FROM DNS_RECORD "):
-            record_deletes.append(statement)
+            record_deletes.append((statement, bool(executemany)))
 
     event.listen(Engine, "before_cursor_execute", _count)
     try:
@@ -224,4 +224,15 @@ async def test_permanent_zone_delete_is_set_based_and_sweeps_its_queued_ops(
     ).scalar_one_or_none() is None
     # ONE statement for the records, never one per row: 400 rows here, 250k-1M
     # on the appliance the campaign measured.
+    #
+    # The statement COUNT alone does not discriminate, and asserting on it
+    # alone would leave this test green against the very regression it exists
+    # to catch: the ORM cascade emits a single ``DELETE FROM dns_record WHERE
+    # dns_record.id = $1`` and hands it one parameter set PER ROW, so
+    # ``before_cursor_execute`` fires exactly once there too. ``executemany``
+    # is what separates them — True is the per-row cascade, False the one
+    # set-based ``WHERE zone_id = $1``. Assert on both.
     assert len(record_deletes) == 1, record_deletes
+    statement, executemany = record_deletes[0]
+    assert not executemany, f"per-row ORM cascade, not a set-based delete: {statement}"
+    assert "ZONE_ID" in statement.upper(), statement
