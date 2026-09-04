@@ -10,14 +10,17 @@ nothing retried until somebody re-promoted by hand.
 Now a reported ``failed`` keeps the desired-state — so the supervisor
 re-fires the join on its next heartbeat, bounded by its own per-target
 attempt ceiling — unless the runner's classifier says no retry can fix it
-(a stale etcd member under this hostname, a bootstrap-token mismatch) or the
-latest failure is older than the auto-retry window.
+(a stale etcd member under this hostname, a bootstrap-token mismatch on disk,
+an etcd member the cluster permanently removed) or the latest failure is older
+than the auto-retry window.
 """
 
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 from httpx import AsyncClient
@@ -87,12 +90,67 @@ async def _report_failed(client: AsyncClient, row: Appliance, token: str, reason
 # ── the pure helpers ────────────────────────────────────────────────────────
 
 
-def test_the_classifier_names_the_two_permanent_failures() -> None:
+# Every message ``classify_join_failure`` can emit, read out of the runner
+# script itself, paired with whether an automatic retry could ever fix it.
+#
+# Parsed rather than pasted because the bug this replaces was a marker taken
+# from the classifier's ``case`` PATTERNS ("different token") instead of the
+# message it prints — which passes a hand-written test and matches nothing in
+# production, since ``cluster_join_reason`` carries the printed message. A
+# reworded runner now fails this test instead of silently reclassifying a
+# permanent failure as retryable.
+_RUNNER = (
+    Path(__file__).resolve().parents[2]
+    / "appliance/mkosi.extra/usr/local/bin/spatium-cluster-join"
+)
+# reason substring -> needs an operator (evict / re-pair / leave first)
+_NEEDS_OPERATOR = {
+    "already an etcd member": True,
+    "the join token does not match": True,
+    "must re-join as a NEW member": True,
+    "the seed rejected the join token": False,
+    "could not reach the seed": False,
+}
+
+
+def _runner_reasons() -> list[str] | None:
+    """Every ``printf`` payload inside ``classify_join_failure``, or None on a
+    backend-only checkout (the api image ships ``backend/`` alone) — same
+    graceful skip as ``test_appliance_firewall_render``."""
+    if not _RUNNER.exists():
+        return None
+    body = _RUNNER.read_text(encoding="utf-8").split("classify_join_failure() {", 1)[1]
+    body = body.split("\n}", 1)[0]
+    return [m for m in re.findall(r"printf '%s' \"([^\"]+)\"", body) if m]
+
+
+def test_the_classifier_markers_match_what_the_runner_actually_emits() -> None:
+    reasons = _runner_reasons()
+    if reasons is None:
+        pytest.skip("spatium-cluster-join not on disk (backend-only checkout)")
+    # Guard the parse itself: an empty list would make every assertion vacuous.
+    assert len(reasons) == len(_NEEDS_OPERATOR), reasons
+    for reason in reasons:
+        expected = next(
+            (v for k, v in _NEEDS_OPERATOR.items() if k.lower() in reason.lower()), None
+        )
+        assert expected is not None, f"unclassified runner reason: {reason}"
+        assert sup._join_failure_is_permanent(reason) is expected, reason
+
+
+def test_the_classifier_names_the_permanent_failures() -> None:
     assert sup._join_failure_is_permanent(_PERMANENT)
     assert sup._join_failure_is_permanent(
-        "bootstrap data already found and encrypted with a different token"
+        "stale k3s bootstrap data on disk — the join token does not match the cluster"
+    )
+    assert sup._join_failure_is_permanent(
+        "this node's etcd member was removed from the cluster — it must "
+        "re-join as a NEW member (leave first)"
     )
     assert not sup._join_failure_is_permanent(_TRANSIENT)
+    # Names the token, but the campaign drill produced it from a NETWORK block
+    # and the retry then succeeded — transient on purpose.
+    assert not sup._join_failure_is_permanent("the seed rejected the join token")
     assert not sup._join_failure_is_permanent("k3s did not come Ready within 180s")
     assert not sup._join_failure_is_permanent(None)
 

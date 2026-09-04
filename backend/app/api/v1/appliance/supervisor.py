@@ -122,19 +122,41 @@ logger = structlog.get_logger(__name__)
 # long after the latest reported failure; then the row is cleared exactly as
 # a permanent failure is, and the operator re-promotes.
 _JOIN_AUTO_RETRY_WINDOW = timedelta(minutes=15)
-# The runner's classifier (appliance/.../spatium-cluster-join
-# classify_join_failure) names the two failures no retry can fix.
+# The three failures no retry can fix, matched against what the runner's
+# classifier (appliance/.../spatium-cluster-join ``classify_join_failure``)
+# EMITS — not against the k3s log lines it matches on. That distinction is
+# the whole content of this constant: ``cluster_join_reason`` is the
+# classifier's output message, so a marker lifted from its ``case`` patterns
+# ("different token", from "bootstrap data already found and encrypted with
+# different token") never matches anything that reaches this function, and
+# the failure it was meant to catch is retried for the full window instead
+# of clearing at once. ``tests/test_appliance_join_auto_retry.py`` pins each
+# marker against the runner's real output so the two cannot drift apart.
 _PERMANENT_JOIN_FAILURE_MARKERS = (
+    # "this hostname is already an etcd member of the target cluster — evict
+    # it (Fleet → Replace, or delete its k8s Node) before re-joining"
     "already an etcd member",
-    "different token",
+    # "stale k3s bootstrap data on disk — the join token does not match the
+    # cluster"
+    "the join token does not match",
+    # "this node's etcd member was removed from the cluster — it must re-join
+    # as a NEW member (leave first)"
+    "must re-join as a new member",
 )
 
 
 def _join_failure_is_permanent(reason: str | None) -> bool:
-    """PURE: a join failure an automatic retry cannot fix (stale etcd member
-    under this hostname, bootstrap-token mismatch). Everything else — the
-    seed unreachable while it adds a learner, a readiness timeout, an
-    unclassified k3s exit — is treated as transient and retried."""
+    """PURE: a join failure an automatic retry cannot fix — a stale etcd
+    member under this hostname, a bootstrap-token mismatch on disk, or an
+    etcd member the cluster has permanently removed. All three need an
+    operator to evict, re-pair or leave first.
+
+    Everything else — the seed unreachable while it adds a learner, a
+    readiness timeout, an unclassified k3s exit — is treated as transient
+    and retried. "the seed rejected the join token" is deliberately in that
+    transient set despite naming the token: the campaign's own drill
+    produced it from a NETWORK block (2026-09-04 00:55Z), and the retry then
+    succeeded once the block lifted."""
     text = (reason or "").lower()
     return any(marker in text for marker in _PERMANENT_JOIN_FAILURE_MARKERS)
 
@@ -1964,10 +1986,11 @@ async def supervisor_heartbeat(
         # still says "member" and its `.state` says failed, bounded by its
         # per-target attempt ceiling (appliance_state._CLUSTER_JOIN_MAX_
         # ATTEMPTS) — for up to _JOIN_AUTO_RETRY_WINDOW after the latest
-        # failure. A PERMANENT failure (the runner's classifier names the
-        # two: a stale etcd member under this hostname, a token mismatch)
-        # clears immediately as before: no retry can fix those, the
-        # operator has to evict or re-pair.
+        # failure. A PERMANENT failure (the runner's classifier names three:
+        # a stale etcd member under this hostname, a bootstrap-token mismatch
+        # on disk, an etcd member the cluster permanently removed) clears
+        # immediately as before: no retry can fix those, the operator has to
+        # evict, re-pair or leave first.
         if _join_failure_is_permanent(row.cluster_join_reason) or _join_retry_window_elapsed(
             row.cluster_join_state_at
         ):
