@@ -75,13 +75,13 @@ generator's view alone.
 |---|---|---|
 | 8 GiB | 4 | passes with headroom (the recommendation) |
 | 6 GiB | 3 | passes; the smallest point that passed on every attempt |
-| 5.5 GiB | 3 | passes on some attempts only — the knee |
+| 5.5 GiB | 3 | the knee — see the third point below: it is a scheduling-weight limit, not a CPU-capacity one |
 | 5 GiB | 4 | marginal; memory thrash under the churn |
 | 4 GiB | any | the api cannot converge; the appliance wedges |
 | any | 2 | CPU-bound under 20k active devices; 3 vCPU is the CPU floor |
 
-Two things shape those numbers, and both are the supervisor's job on the
-appliance, not the operator's:
+Three things shape those numbers, and all three are the appliance's job,
+not the operator's:
 
 - The chart's default api limit (512Mi) cannot build the agent config
   bundle for a group of this size, and the default worker limit (1Gi with
@@ -98,6 +98,18 @@ appliance, not the operator's:
   the api ships them to the agent a page at a time (5000 by default,
   `dns_agent_ops_batch`). A group of 250k records drains in ~50 polls; the
   zone itself renders once the agent has the bundle.
+- The DNS and DHCP pods must carry a CPU request. Without one Kubernetes
+  runs them as BestEffort — the lowest scheduler weight on the node — and on
+  a 3 vCPU appliance the api's lease-event work starves Kea's single thread
+  until its socket queue overflows: at 5.5 GiB / 3 vCPU, Kea was given 7.5 %
+  of a CPU and answered 37 % of the DISCOVERs on the wire (55 % handshake
+  success) while it answered 100 % of what reached it. The same cell with a
+  250m request on `dhcp-kea` and `dns-bind9` (the chart default since
+  spatiumddi#953) reached 96 % with 0 restarts. That is why the 4 vCPU rows
+  pass — a fourth CPU happens to be free for Kea — and why 3 vCPU sits at
+  the knee. A larger socket receive buffer does not help: with 8 MiB of
+  buffer the drops vanish but a DORA takes 34 s instead of 1.5 s, because
+  Kea then answers stale requests whole retransmit rounds late.
 
 Beyond that: **500k records in one group** is not a supported single-node
 size at any RAM tested (up to 10 GiB) — the api's bundle build for the
