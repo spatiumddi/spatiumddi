@@ -28,6 +28,21 @@ RUN npm run build
 # ── Stage 2: serve via nginx ──────────────────────────────────────────────────
 FROM nginx:1.31.4-alpine AS runtime
 
+# Refresh the Alpine package set against the current index before copying
+# anything in. The nginx-alpine tag is rebuilt on nginx's cadence, not on
+# Alpine's, so between rebuilds its baked libssl / libcrypto / libexpat
+# drift behind the fixed versions — the same reason the gobgp image runs
+# this, and the same reason a stale GitHub Actions layer cache would
+# otherwise serve packages Trivy flags. This image has no per-PR Trivy
+# gate, and the weekly trivy-scheduled.yml superset that nominally covers
+# it has been dying at the backend image before reaching it — so in
+# practice it went unscanned, and the first scan in 2026.09.04-1 found
+# four HIGH CVEs (CVE-2026-14456 in libssl3 / libcrypto3, CVE-2026-66046
+# and CVE-2026-76641 in libexpat), all already fixed upstream. It is now
+# in the Makefile's TRIVY_IMAGES, so `make trivy IMAGE=frontend` catches
+# the next set.
+RUN apk upgrade --no-cache
+
 COPY --from=builder /app/dist /usr/share/nginx/html
 # Issue #176: the API upstream + DNS resolver are now templated so the
 # same image works on Docker Compose (defaults below) and Kubernetes

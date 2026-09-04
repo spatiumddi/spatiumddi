@@ -20,6 +20,579 @@ the formatter handles the rest.
 
 ---
 
+## 2026.09.04-1 — 2026-09-04
+
+**The appliance sizing release.** Two days of measured load against a
+real appliance — 250k A+PTR records, 35k devices, 75-minute cells
+judged on restarts, cgroup kills and the ratios Kea and BIND report
+themselves — turned up a family of defects that do not exist at lab
+scale and are invisible below it. A freshly bulk-loaded DNS group
+**could not converge at all**: the agent config bundle materialised all
+500,000 pending record ops plus every zone's records as tracked ORM
+instances, and `uvicorn` was memcg-killed at 4.18 GB anon-RSS eighteen
+times in eighty-nine minutes without the bundle ever reaching the data
+plane (#948 → #949). The Kea and BIND DaemonSets carried no `resources`
+block, so Kubernetes ran the **data plane as BestEffort** — the lowest
+CFS weight on the node — and under a device rush the api starved Kea
+down to 7.5 % of a CPU, its socket queue overflowed, and only 37 % of
+the DISCOVERs on the wire were answered while Kea answered 100 % of
+what reached it (#952 → #953). The chart's api and worker memory
+limits are BYO-cluster defaults that no appliance can build a 250k
+bundle under, and every `kubectl set resources` was wiped by the next
+k3s restart, so the supervisor now sizes them from the node's RAM
+durably (#946 → #947).
+
+The same campaign found two zone-lifecycle defects and a control-plane
+formation defect. `POST …/records/bulk-delete` on an **agent-based
+zone deleted nothing**: it gated the database delete on the wire op
+coming back `applied`, and agent-based servers never answer inline —
+they queue `pending` for the next long-poll — so every record came
+back `wire delete failed: unknown` and `deleted: 0` while the agent
+removed it from the daemon anyway (#950 → #951, and the identical gate
+in DNS sync as #962). A 3-node control plane always promotes two
+members in one call, and one of them regularly died reaching the seed;
+the backend cleared the promote desired-state on the first reported
+failure, so **one formation in three lost a member** until an operator
+re-promoted by hand (#960 → #961).
+
+The second thread is **contracts an external client can actually
+consume**, continuing #907's work now that the mobile app lives in its
+own repo. Five issues the mobile client filed reduced to one finding —
+data the server already has that a REST client cannot get, or cannot
+get typed — because non-negotiable #13 guarantees MCP tools for every
+REST surface and nothing guaranteed the converse (#917). Four
+capabilities got routes, ~113 handlers publishing an unconstrained
+object got a guard, and a whole-API conformance fuzz over ~1,150
+routes found **ten references to columns no model has** — each an
+`AttributeError` the first time its line runs, so `list_dhcp_scopes`,
+`list_dhcp_servers`, `list_dhcp_server_groups` and
+`list_network_devices` had never returned a row since they shipped,
+and proposing a DHCP reservation from the copilot had never once
+worked (#923).
+
+Alongside those: **InfluxDB v1/v2/v3 push export** (#889), the writer
+the tech-stack table had claimed for months while `grep -ri influx`
+over `backend/` returned nothing; **service control on Compose and
+Helm** (#890), which had worked on exactly one deployment shape;
+**fingerprint-driven DHCP device policies** (#700), joining device
+profiling to Kea client classes; and **moving a DNS server or zone
+between server groups** (#934, #935), which discussion #933 pointed
+out was possible on the DHCP side and nowhere on the DNS side.
+
+Two things had been quietly reporting success while doing nothing.
+The `rpki_roa_expiring` rule fired **one alert event per ROA** against
+Cloudflare's VRP cache entry rather than the ROA itself — measured
+against the live global dump, 100 % of 997,298 ROAs expire within
+seven days — so the 30-day threshold matched every ROA that will ever
+exist, permanently, and stormed the alerts framework with 928 open
+events on a small dev estate (#942). And **no scheduled nightly had
+built since 2026-08-09**: the DST twin-cron gate tested the Eastern
+wall clock when the job ran, GitHub starts those crons 1–13 hours
+late, so both twins skipped every night and 56 scheduled runs
+completed "success" in 10–18 seconds having done nothing (#970).
+
+> **Operators must pull new agent images.** The BIND9 renderer gained
+> the `rpz` and `rpz-passthru` log categories (#914 — without them
+> #699's per-client blocklist attribution recorded nothing on the only
+> path that ships it), the `responselog` statement and its `rndc`
+> follow-up, and a key-file `include` derived from `state_dir` rather
+> than hardcoded (#920). The Kea renderer gained device-policy client
+> classes (#700). A control-plane upgrade alone changes none of the
+> rendered files.
+
+### Added
+
+- **InfluxDB v1 / v2 / v3 push export (#889).** `InfluxDBTarget` plus
+  `backend/app/services/influxdb/`, a 30 s beat task with per-target
+  interval gating, CRUD at `/settings/influxdb-targets` with a real
+  **test-write**, and a Settings → Metrics → InfluxDB Export surface.
+  - **"All versions" is three declared versions over two wire
+    dialects.** `v3` is not a third client: every InfluxDB 3 product
+    accepts the v2 write endpoint, so it reuses that path with
+    `Authorization: Bearer` instead of `Token` and a *database* named
+    in the `bucket` parameter. All three were verified against a live
+    server, `v1` through InfluxDB 2.7's DBRP compatibility mapping.
+  - **The idempotency (non-negotiable #9) is the server's, not
+    ours.** Line protocol overwrites a point with an identical
+    measurement, tag set and timestamp, so a retry is free — which is
+    what lets each push run two queries per source on separate row
+    budgets: a forward drain and a replay of the closed
+    `(watermark − 5 min, watermark]` window, so a bucket an agent
+    reported late is exported rather than skipped permanently and
+    silently. The separation is load-bearing: fold the replay into
+    the drain's lower bound and a fleet dense enough to fill the row
+    cap inside that window returns a truncated batch whose maximum
+    sits *below* the watermark, pulling the cursor backwards every
+    tick with every push still reporting success.
+  - **Two shapes of metric, and the difference shows on a
+    dashboard.** DNS/DHCP counter deltas carry the agent's own 60 s
+    bucket timestamp, so a backfill lands on the hour the traffic
+    happened; the IPAM and lease gauges are sampled at push time and
+    have no backfill, documented as such rather than called
+    "realtime". `active_leases` counts **distinct addresses** — a Kea
+    HA pair mirrors every lease twice, so `COUNT(*)` would report 2×
+    on exactly the deployments redundancy is for.
+  - Explicitly **not** a feature module (non-negotiable #14): no
+    sidebar section, no router prefix, and "off" is already
+    `enabled=false` on the row.
+- **Capability-aware service control on Compose and Helm (#890).**
+  One surface at Admin → Platform Insights → Services over
+  `backend/app/services/service_control/`, with opt-in RBAC in
+  `charts/spatiumddi` and `k8s/service-control/`.
+  - **The capability is answered before anything is attempted.** The
+    same 503 used to mean both "this deployment cannot do that" and
+    "the daemon is down", and those need opposite responses from the
+    operator, so `GET /system/services` reports the live backend,
+    whether the gate is open, and the exact toggle to flip.
+  - **The inventory is the allowlist**, resolved server-side against a
+    fresh listing. On Compose the scope is the api container's own
+    `com.docker.compose.project` label and **fails closed**: a
+    container that cannot identify its own project reports the backend
+    unavailable rather than falling back to a name prefix a co-tenant
+    could match on purpose.
+  - `start` / `stop` are deliberately absent on Kubernetes — they
+    would mean scaling to zero and back, and restoring the previous
+    replica count needs somewhere durable to remember it.
+  - Restarting the api that serves the page is allowed and flagged;
+    the audit row commits and the `202` returns before the daemon is
+    signalled, and records `accepted`, not `success`.
+- **Fingerprint-driven DHCP device policies (#700).**
+  `DHCPDevicePolicy` compiles an operator's chosen fingerbank device
+  classes into a real Kea client-class `test`, carrying an option set,
+  a per-class `valid-lifetime` and a stable generated class name a
+  pool's `class_restriction` can bind to — NAC-lite with no 802.1X and
+  no switch configuration.
+  - **The compiler cannot match the category, and says so.** Kea has
+    no `device-class == IoT` predicate, so it matches the signatures
+    observed and classified into the selected classes — honestly
+    "classify on first lease, apply on renewal", stated in the UI.
+  - **Ambiguous signatures are excluded by default**, counted and
+    listed: a parameter request list like `1,3,6,15` comes from a
+    doorbell and a rack server alike, so without this the headline use
+    is also how the CEO's laptop gets quarantined.
+  - Nothing device-controlled becomes syntax — both halves of every
+    term are emitted as hex, so a vendor class of `' or 1--` is inert
+    bytes. A policy compiling to nothing is dropped rather than
+    rendered testless, because a Kea class with no `test` matches
+    every packet.
+  - Validated against a live fingerbank key, which corrected the
+    issue text: there is no plain `Printer` or `IoT` class. The
+    picker now shows `fingerbank_score` and flags anything under 30,
+    because a low score means fingerbank *failed* to identify the
+    device and fell back to the MAC vendor.
+- **Move a DNS server between server groups (#934, #937).**
+  `group_id` on the server PUT, routed through
+  `services/dns/server_move.py`, plus a Server group picker. The DHCP
+  side has carried this since #430 — an asymmetry, not a design
+  decision. The move purges the old group's zone state and queued
+  ops, clears `config_apply_status`, generates the target's TSIG key
+  if absent, wakes both group channels **and the server's own** (an
+  agent parked in a long-poll subscribed using its old group), and on
+  the appliance repoints `Appliance.assigned_dns_group_id` so the
+  per-role firewall does not keep the old group's DoT/DoH ports open
+  while the agent listens on the new group's. The picker disables
+  incompatible groups with the reason inline rather than hiding them.
+- **Move a DNS zone between server groups (#935).** Preview → commit,
+  a much sharper tool than the server move: a zone carries references
+  *into* a group, and **clearing a view widens exposure** rather than
+  narrowing it — a record with `view_id IS NULL` renders in *every*
+  view, so a zone that answered only on `internal` would start
+  answering on `external` with no visible symptom. Views and TSIG
+  keys remap by name; where they cannot, the move refuses until the
+  widening is acknowledged. Three separate acknowledgements
+  (`view_widening`, `dnssec_rollover`, `lost_update_grants`) plus the
+  zone name typed back, because one blanket "I understand" gets the
+  DNSSEC warning accepted by someone who only read the view one.
+- **REST parity for copilot-only capabilities (#917).** Fleet-wide
+  `GET /dhcp/leases` and `/dhcp/lease-history` (the "does this MAC
+  have a lease anywhere" question, previously one call per server plus
+  an order-sensitive client-side merge), `GET /ipam/reports/hygiene`,
+  `/ipam/reports/vendors{,/devices}` and `/customers/{id}/summary`.
+  The `mac` filter normalises separators and compares as `MACADDR`
+  rather than casting to text, which would be non-sargable and defeat
+  `ix_dhcp_lease_server_mac`. `GET /alerts/events` gained
+  `subject_type` / `subject_id` / `severity`.
+- **DHCP pool occupancy over REST (#913).**
+  `GET /dhcp/pools/{id}/occupancy` and
+  `GET /dhcp/scopes/{id}/pools/occupancy`, the second batching one
+  lease and reservation query across every pool. Dynamic pools only,
+  matching the alert evaluator and the copilot tool exactly —
+  disagreeing with them is precisely how a wrong "the pool is fine"
+  gets reported.
+- **DNS query-log rcode and RPZ hit detail (#914).** BIND 9.20's
+  `responselog` is routed to the channel the shipper already tails,
+  told apart at ingest by separator, and stamped onto the query row it
+  belongs to. `answer_count` rides along with `rcode` because NOERROR
+  with zero answers is NODATA, a different fault from NXDOMAIN that
+  reads identically without it. Opt-in per group, and **NULL means
+  UNRECORDED, never NOERROR** in every surface. Also
+  `GET /dns-threat/rpz/hits`, the individual blocked lookups behind
+  the four rollups.
+- **Dashboard: open alerts, pool pressure, config-apply verdicts
+  (#942).** An Open-alerts panel on Overview (which immediately
+  surfaced three criticals that had been invisible on the dev
+  estate), fleet-wide `GET /dhcp/pools/occupancy` with filters
+  deliberately identical to the per-scope endpoint and the alert
+  evaluator, and #882's config-apply verdicts on server rows — the
+  failure that is silent by construction, since a reverted agent
+  keeps serving and keeps heartbeating while the saved zone is live
+  nowhere. NULL renders nothing, never "ok".
+- **CI gates (#966, #968, #917).** `Charts — Lint & Template` runs
+  helm lint plus template over seven value sets including the
+  CloudNativePG and Sentinel HA shape, `kubeconform -strict`, a
+  no-BestEffort check on every render, and a toggle-coverage script
+  that fails when a template is gated on a values key no render flips
+  — it caught nine umbrella gates the first matrix missed, and on its
+  first run found every appliance pod template emitting
+  `app.kubernetes.io/name` twice in one map. `Perf — Tests` covers
+  `perf/`, which the backend path filter denies. `make charts-lint`,
+  `make perf-test` and `make lint-untyped-routes` run each locally;
+  `make ci` includes all three.
+
+### Changed
+
+- **Overview leads with what needs attention (#942).** Six inventory
+  counters repeated verbatim on three other tabs are demoted to one
+  line. Events now lead the Alerts page, on their own merits: events
+  are what an operator acts on, rules are the configuration that
+  produces them.
+- **The appliance supervisor sizes the api and worker memory limits
+  from the node's RAM (#946, #947),** clamped to 1–8 GiB and 1–4 GiB
+  and merged into the same `spatium-control` HelmChartConfig as the
+  #272 replica overrides, with `worker.concurrency` dropped to 2 on
+  nodes of 12 GiB or less. Limits only; requests stay the chart's, an
+  unknown node size leaves the document unchanged, and BYO-Kubernetes
+  installs are untouched. Durability is the point — k3s re-applies the
+  on-disk HelmChart manifest, so every `kubectl set resources` was
+  wiped by the next restart.
+- **The DNS agent config bundle is paged (#948, #949).** Pending ops
+  ship `settings.dns_agent_ops_batch` (default 5000) at a time, oldest
+  first, with `pending_ops_remaining` on the bundle; the shipped page
+  is `in_flight` while the agent acks it. Paging stays outside the
+  structural fingerprint, so a page is never a config change and no
+  daemon reloads per page. Every zone's records now come from **one**
+  column-row query ordered by `(zone, id)` instead of one ORM query
+  per zone, and the bundle is serialised once rather than being walked
+  and copied a second time by `jsonable_encoder`. The agent needs no
+  change.
+- **Data-plane and supervisor workloads carry resource requests
+  (#952, #953, #965, #967).** `dhcpKea` and `dnsBind9` render
+  `resources` from values, and the supervisor, looking-glass and
+  agent-landing workloads gained floors. `dhcpKea` ships the measured
+  **500m**. Requests only — a CPU limit would throttle the bursts the
+  data plane exists to serve.
+- **`POST …/records/bulk-delete` matches the singular route (#963).**
+  Soft-delete by default under one shared `deletion_batch_id` so the
+  whole selection restores together, `?permanent=true` superadmin-only
+  and checked **before** any wire op is enqueued, the synthesised and
+  pool-member gate reused, duplicate ids counted once, and a 2000-id
+  cap like bulk-create. Trash restore gained `?skip_conflicts=true`,
+  so one hand-recreated record no longer pins a whole batch.
+- **The nightly DST twin-cron gate decides from which cron fired
+  (#970),** reading that cron's scheduled UTC instant on the Eastern
+  clock instead of the wall clock when the job happens to run. A
+  missing or malformed cron string now fails the gate so `finalize`
+  opens the tracking issue — a quiet skip is exactly how this went
+  unnoticed for four weeks.
+- **Dependencies.** `@tanstack/react-query` 5.101.4 → 5.102.8,
+  `axios` 1.19.0 → 1.20.0, `vite` 8.2.1 → 8.2.2,
+  `@vitejs/plugin-react` 6.0.5 → 6.1.0, `browserslist` 4.28.6 →
+  4.28.8, `postcss-selector-parser` 6.1.2 → 6.1.4, `@humanfs/node`
+  0.16.7 → 0.16.8 (#929, #941, #944, #945, #957); `golang`
+  1.26.6-alpine → 1.27.0-alpine and `nginx` 1.31.3-alpine →
+  1.31.4-alpine (#931).
+
+### Fixed
+
+- **A freshly bulk-loaded DNS group could not converge (#948).**
+  Detail under Changed; the measured shape was a 250k A+PTR seed
+  queueing 500,000 pending ops, `uvicorn` memcg-killed at 4.18 GB
+  eighteen times in eighty-nine minutes, and the same rows rendering
+  in 2 s once the ops were deleted by hand.
+- **The agent config bundle's serialisation changed on the wire
+  (#958).** #949's prebuilt `Response` used `json.dumps`' stock
+  defaults while its comment said nothing changed: separators went
+  non-compact, `ensure_ascii` went on and `allow_nan` stopped raising.
+  The separators change worked directly against #949's own purpose —
+  measured on its own 250k benchmark shape, the body grew 13.5 % (26.0
+  MB → 29.5 MB) in the same process, on the same request, on the path
+  that had just been memcg-killed. Now byte-identical to what FastAPI
+  sent before. The regression test asserts on `resp.content` **bytes**
+  and carries a non-ASCII value deliberately: every difference decodes
+  to an equal object, which is how it shipped.
+- **The data plane ran as BestEffort (#952).** Under the campaign's
+  device rush the api ran at 72–110 % CPU on lease events, Kea was
+  given 7.5 % of a CPU and answered 37 % of the DISCOVERs on the wire.
+  Three consecutive cells measured 55.5 % and 51.1 % handshake success
+  with BestEffort pods against **95.6 %** with the requests in place;
+  receive-buffer drops in the node fell from 13,240 to 2,118. Noted in
+  `APPLIANCE.md`: a larger socket receive buffer is not the fix — a
+  cell with 8 MiB `rmem` had zero drops and DORA p50 of 34 s instead
+  of 1.5 s.
+- **`spatiumddi-helm-stuck-recover` failed on every tick on exactly
+  the clusters that wedge (#946).** It passed
+  `kubectl get helmchart -A -o json` in one environment string, and a
+  promoted control plane's `spatium-control.valuesContent` alone
+  exceeds the 128 KiB `MAX_ARG_STRLEN`, so the 5-minute timer died
+  with `Argument list too long`. Only the path rides in the
+  environment now, and the unit moved from `Requires=k3s.service` to
+  `Wants=` so a k3s restart no longer takes a running recovery tick
+  down with it.
+- **Bulk record delete removed nothing on agent-based zones (#950),**
+  and the identical gate in DNS sync reported every stale record as
+  failed and kept it while the agent removed it anyway (#962). A
+  permanent zone delete cascaded through the ORM one record at a time
+  inside the request, so the api pod's own liveness probe killed it
+  mid-delete on a 250k-record zone; the records now go in one
+  statement and the zone's queued ops are swept (#950, #964).
+- **A transient control-plane join failure was given up on (#960).**
+  A 3-node cluster always promotes two members in one call, joining
+  concurrently, and one regularly died reaching the seed; the backend
+  cleared the promote desired-state on the first reported `failed`, so
+  nothing retried. A reported failure now keeps the desired-state for
+  up to 15 minutes — the supervisor re-fires the join on its next
+  heartbeat — unless the runner's classifier names a failure no retry
+  can fix. Measured live: block lifted 90 s after the failure, member
+  rejoined 3 min 14 s later with no operator action.
+- **`Replace` refused to evict a joiner whose join had failed
+  (#960).** After a concurrent join died, a re-promote was refused
+  pointing at Replace, and Replace itself answered 409 saying the node
+  `isn't a settled control-plane member` — so neither route the
+  product offers could remove the stale etcd member. Replace now
+  accepts `cluster_role = null` with `cluster_join_state = failed`;
+  in-flight joiners still 409.
+- **The RPKI expiry signal fired on 100 % of rows, permanently
+  (#942).** Cloudflare's `expires` — on the default source — is the
+  validity of the VRP *cache entry*, not of the ROA, because RPKI CAs
+  re-sign the validation chain every few hours. Measured against the
+  live global dump on 2026-08-31: of 997,298 ROAs, **100 % expire
+  within 7 days and 79 % within 2**, so the 30-day threshold matched
+  every ROA that will ever exist. The dashboard number was the
+  cosmetic half — `rpki_roa_expiring` fires one alert event per ROA,
+  so it stormed the alerts framework with 928 open events on a small
+  dev estate. State derivation is now source-aware; RIPE's genuine
+  EE-cert `notAfter` keeps the ladder. No migration needed: the
+  reconcile restamps state and the framework auto-resolves the events.
+- **Seven more dashboard defects (#942).** The Alerts pill counted a
+  number computed on the page that the alerts page could not
+  corroborate and linked to `/ipam`; disabled servers were counted in
+  the health rollup, contradicting #182's own server-side suppression
+  and pinning the header to "degraded" for as long as a server stayed
+  parked; the default chart window returned 1,440 raw points into a
+  ~1,300 px plot; Refresh invalidated twelve hardcoded keys and missed
+  every panel on five of the nine tabs; the dns-threat query was
+  gated on the card's render rather than the module, so it was a
+  console error every 60 s forever with the module off; IPv6 rows
+  rendered `1 / 9223372036854776000`; and the Integrations empty state
+  enumerated mirrors it had gone stale on by four. A partial-bucket
+  artifact from the charting fix drew a phantom 71 % dip at the right
+  edge of both default charts — points now carry `covered_seconds`,
+  computed from **distinct** agent buckets so it is a time span rather
+  than a row count, which also fixes the same distortion for any
+  bucket an agent was down for.
+- **No scheduled nightly had built since 2026-08-09 (#970).**
+  Detail under Changed. 56 scheduled runs completed "success" in
+  10–18 s having done nothing, while `main` moved 30+ commits and the
+  downstream QA lane had nothing new to walk.
+- **The beat heartbeat's Redis connect was unbounded (#925).**
+  `app/tasks/heartbeat.py` was the one Redis caller of fourteen
+  passing no timeout — #590 bounded the sentinel hops but did it per
+  call site, and this was the site it missed. `REDIS_URL` lists
+  sentinels by per-pod headless DNS, which keeps resolving through the
+  20–40 s a rebooting node takes to be marked NotReady, so a slot
+  upgrade walks straight into it: measured, an unbounded client was
+  still blocked at 60 s and past 5 min where a bounded one raised
+  `MasterNotFoundError` in ~28 s. A tick is enqueued every 30 s
+  regardless, so the default 4-slot pool wedges in ~2 minutes and
+  *every* periodic job stops. The connect timeout is now a default
+  inside `core/redis_client.py`, because a per-call-site convention is
+  what failed; `socket_timeout` is deliberately not defaulted, since
+  `core/agent_wake` parks a pub/sub read that is supposed to be slow.
+  `beat_tick` gained soft and hard time limits under its own interval,
+  sized from measurement.
+  - **The health detail sent the investigation to the wrong pod.**
+    Beat only *schedules* `beat_tick`; a worker executes it, so the
+    key is a round trip and its absence indicts either end — but the
+    detail said "beat is stopped". Meanwhile `inspect ping` is
+    answered by the worker's MainProcess pidbox consumer independent
+    of the prefork pool, verified directly against a 2-slot worker
+    holding two forever-tasks, so a completely wedged worker still
+    reported `celery-workers: ok`. That limit is documented rather
+    than fixed: detecting pool saturation needs an `inspect.active()`
+    round trip, and `/health/platform` is unauthenticated.
+  - A future timestamp now reads as clock skew rather than as
+    perfectly fresh; the plain `age_s > 90` test would have masked a
+    genuinely dead beat behind a skewed worker clock.
+- **Ten references to columns no model has (#923).** Valid Python,
+  clean under ruff, and clean under mypy because `attr-defined` is
+  disabled repo-wide for ~30 false positives from dynamic-model
+  patterns — so the one check that would name these exactly is off.
+  Each is an `AttributeError` the first time its line runs, so the
+  surface answers nothing for every input: assigning a phone profile
+  to any scope 500'd, meaning the validation that function exists to
+  perform had never run; `list_dhcp_scopes`, `list_dhcp_servers`,
+  `list_dhcp_server_groups` and `list_network_devices` had never
+  returned a row since they shipped; `create_dhcp_static` raised in
+  both preview and apply, so proposing a reservation from chat had
+  never worked; and `GET /services/{id}/summary` 500'd for any service
+  with a linked subnet. Two guards, because neither sees the other's
+  half: an AST walk for the `Model.attr` spelling in a query, and a
+  smoke test that **executes** every read-only copilot tool, which is
+  the only way to catch `row.attr` while building a response dict.
+- **Seventeen routes declared `application/json` and served something
+  else (#921).** `POST /system/support-bundle` served
+  `application/zip`; the sweep found eleven more beyond #861's three —
+  SSE streams, backup and DNS-zone archives, SAML metadata, pod logs,
+  upgrade images and the pcap download. The obvious fix only half
+  works and that is the part worth knowing: `responses={200: …}`
+  *merges* with the inferred JSON rather than replacing it, so the
+  conformance failure goes quiet while a generator is still told the
+  endpoint might return JSON. Replacing it takes `response_class` set
+  to a subclass that declares `media_type`.
+- **A dangling foreign key answered an unhandled 500 (#922).** #861's
+  handler deliberately re-raised everything but unique violations, on
+  the reasoning that NOT NULL / FK / CHECK means our bug. That is
+  right about NOT NULL and CHECK and half right about foreign keys: a
+  reference the *client* sent is an ordinary client error. Postgres
+  names the offending value in `DETAIL`, so the handler answers 422 or
+  409 only when every offending value appears in what the request
+  carried, and re-raises otherwise. Reading that DETAIL is easy to get
+  silently wrong — `IntegrityError.orig` re-exports `sqlstate` but not
+  `detail`, so reading `orig.detail` returns `""` for every error and
+  the handler looks wired up while changing nothing.
+- **Three adversarial-input handlers returned 500 where the contract
+  declares 422 (#940).** `GET /conformity/export.pdf` built a
+  `Content-Disposition` filename from the `framework` query value,
+  which Starlette encodes as latin-1, so a non-latin-1 name raised
+  `UnicodeEncodeError` *after* the PDF was rendered (now an ASCII
+  filename plus the RFC 6266 `filename*` form);
+  `POST /ipam/addresses/bulk-edit` hashed a JSON list against a set in
+  a `mode="before"` validator; and `POST /appliance/tls/csr` accepted
+  a 255-character `common_name` the schema allows and X.509 caps at 64
+  bytes, plus non-IDNA SANs. All three reproduced and re-verified on a
+  live 3-node appliance.
+- **`assert_safe_target` let `UnicodeError` escape its `OSError`
+  handler (#923),** and `UnicodeError` subclasses `ValueError` — so an
+  over-long hostname label was one unhandled 500 per *every* outbound
+  integration that guard protects, not one endpoint.
+- **The BIND9 agent renderer never emitted `category rpz { … };`
+  (#914),** so #699's entire per-client blocklist attribution recorded
+  nothing on the only path that ships it. The control-plane Jinja
+  template has carried the line since #699 — which is why review never
+  caught it: the code was right in the file nothing renders from.
+  `rpz-passthru` was missing too, leaving the exception half dark and
+  the `policy != PASSTHRU` filters unreachable.
+- **`rndc reconfig` does not apply `responselog` (#914).** Verified
+  against BIND 9.20.26: config swapped in, reconfig clean,
+  `rndc status` still `response logging is OFF`. Query logging escapes
+  this only by accident of BIND's own defaulting. The agent now issues
+  an explicit `rndc responselog on|off` after each structural reload,
+  reading the desired state off the config it just swapped in.
+- **The BIND9 key-file `include` was hardcoded to
+  `/var/lib/spatium-dns-agent` (#920),** the one path in that renderer
+  not derived from `state_dir`, while `AGENT_STATE_DIR` is an honoured
+  override. Under a non-default state dir the agent writes the key
+  file to one place and tells `named` to read another — and if
+  anything stale is at the default path, the config validates, **the
+  apply reports `ok`**, and `named` holds a stale key set. #920 itself
+  did not reproduce and stays open: the reported operator-key-only
+  AXFR was built live and verified end to end, and a wrong secret
+  answers BADSIG rather than the reported BADKEY, which is what proves
+  the key was rendered.
+- **The relay perf harness shared Kea's OFFERs with other UDP/67
+  listeners (#954).** A single wildcard socket has the same lookup
+  score as libvirt's dnsmasq or any `dhcrelay` on the same device, and
+  the kernel hands each reply to one of them by its tie-break — the
+  fleet logs what lands elsewhere as a DORA timeout. One socket per
+  distinct giaddr makes delivery deterministic (98–99 % → 100 % on an
+  idle A/B), with a wildcard fallback for a giaddr the host cannot
+  bind so nothing that worked before stops working.
+- **`POST /dhcp/servers/{id}/sync` emitted `scopes` as a JSON string
+  (#917).** A wire change, called out rather than slipped in: the
+  untyped handler returned `dict[str, str]`, so typing the route
+  corrected `"3"` to `3`. No shipped caller reads it.
+- **The MCP vendor device lookup ran `db.get(Subnet, …)` per matching
+  row (#917)** — an N+1 invisible on a lab estate and now
+  HTTP-reachable. It became one batched query over a column select.
+- **The "AI" settings group declared a section but was missing from
+  `GROUP_ORDER` (#889),** so "Operator Daily Digest" rendered only
+  when the sidebar filter was non-empty.
+- **Every appliance pod template emitted `app.kubernetes.io/name`
+  twice in one map (#967)** — last-wins in helm, rejected by strict
+  decoders. Found by the new render gate on its first run.
+- **`DNS_DRIVERS.md` and `DHCP_DRIVERS.md` stated the inverse of the
+  #950 / #962 wire-delete gate (#969).**
+
+### Security
+
+- **`propagation-check` skipped the SSRF denylist its sibling
+  `/tools/dns-propagation` applies (#923),** so an authenticated
+  caller could aim the control plane at loopback or `169.254.169.254`
+  and read the timing and answers back out of the per-resolver result.
+  It also passed unvalidated resolver strings to dnspython, whose bare
+  `ValueError` escaped the `gather` as a 500. Both closed.
+- **Permanent bulk record delete ran under a plain `CurrentUser`
+  (#963)** while the singular route requires superadmin for the same
+  operation. `?permanent=true` is now superadmin-only and checked
+  before any wire op is enqueued.
+- **Four HIGH CVEs in the frontend image, which in practice nothing was
+  scanning.** It has no per-PR gate — the path-filtered
+  `build-*-images.yml` Trivy steps cover the agent images only — and it
+  was absent from `make trivy`, so the release-prep rule "scan every
+  image whose Dockerfile changed" had nothing to run against this
+  release's dependabot nginx bump. Its one nominal cover is the weekly
+  `trivy-scheduled.yml` superset, and **that job has exited 1 at the
+  `backend` image every week since 2026-08-17** without ever reaching
+  the two entries that follow it, with `has_findings` empty so its own
+  fail-safe leaves the tracking issue untouched. (Not fixed here — it
+  is a pre-existing CI defect, unrelated to this release, and is called
+  out so it gets its own issue rather than being buried in a release
+  commit.) `nginx:*-alpine` is rebuilt on nginx's cadence rather than
+  Alpine's, so its baked packages drift behind the fixed versions
+  between rebuilds: CVE-2026-14456 in `libssl3` / `libcrypto3`, and
+  CVE-2026-66046 + CVE-2026-76641 in `libexpat`, all already fixed
+  upstream. The runtime stage now runs `apk upgrade --no-cache` before
+  copying anything in — the same line the gobgp image carries for the
+  same reason — and the image joined `TRIVY_IMAGES`, so
+  `make trivy IMAGE=frontend` covers it from here. Specs there gained a
+  build-context field, because the frontend builds from `frontend/`
+  rather than the repo root, which is the mechanical reason it could
+  not simply have been added before.
+- The looking-glass image's pinned `google.golang.org/grpc` moved
+  1.83.0 → 1.83.1, clearing CVE-2026-84304 (HIGH). Dependabot does
+  not see these pins — they are `go get` arguments inside the
+  Dockerfile rather than a tracked manifest — so
+  `make trivy IMAGE=looking-glass` is what surfaces the next one, and
+  the Dockerfile now says so.
+- `idna` floor raised to `>=3.19` (#930).
+- CodeQL alert 93 (`py/incomplete-url-substring-sanitization`, high)
+  cleared (#932). It was a false positive: the blocklist's
+  `exceptions` field is a `set[str]`, so the flagged `in` is set
+  membership, not a substring check on an unparsed URL. The assertion
+  was also weaker than what the test means to assert, so it is pinned
+  by equality instead of dismissed — which additionally catches an
+  exception leaking in from a list that is not in scope.
+
+### Migrations
+
+- `a2e7f31c9b48` — `influxdb_target`: push-export targets with
+  Fernet-encrypted credentials, per-source watermarks and interval
+  gating (#889).
+- `f1c7a92e4b06` — `rcode` and `answer_count` on
+  `dns_query_log_entry`, plus the per-group `response_log_enabled`
+  toggle on `dns_server_options` (#914).
+- `f3b8d21c74ae` — `dhcp_device_policy`: fingerbank device classes
+  compiled into Kea client classes (#700).
+
+Ten MCP tools added this release: `find_dhcp_lease_history`,
+`find_dhcp_device_policies`, `preview_dhcp_device_policy`,
+`find_dns_servers`, `preview_dns_zone_move`, `find_dns_queries`,
+`find_rpz_hits`, `find_influxdb_targets`, `find_services` and
+`propose_restart_service` (the last default-off per non-negotiable
+#13).
+
+---
+
 ## 2026.08.22-1 — 2026-08-22
 
 **The "stored, shipped, never rendered" release.** One bug class runs
