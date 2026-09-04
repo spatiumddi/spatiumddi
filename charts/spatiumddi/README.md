@@ -208,6 +208,8 @@ dhcpAgents:
 | `api.service.port` | `8000` |  |
 | `api.autoscaling.enabled` | `true` | HPA on CPU + memory |
 | `api.autoscaling.minReplicas` / `maxReplicas` | `2` / `10` |  |
+| `api.serviceControl.enabled` | `false` | Sets `SERVICE_CONTROL_ENABLED` on the api — what the Services screen's capability probe reports |
+| `api.serviceControlRBAC.enabled` | `false` | Grants the api ServiceAccount `list` + `patch` on Deployments / StatefulSets / DaemonSets. Needs `serviceAccount.enabled` |
 | `frontend.replicas` | `2` |  |
 | `frontend.service.type` / `.port` | `ClusterIP` / `80` |  |
 | `frontend.apiUpstream.host` | `""` (→ `{{ fullname }}-api`) | nginx-proxy target Service name |

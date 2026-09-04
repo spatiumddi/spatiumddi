@@ -443,7 +443,7 @@ probe-safety fix (#722) is not a vertical at all.
 - ✅ [**Decom-date awareness**](https://github.com/spatiumddi/spatiumddi/issues/46) — shipped `2026.06.11-1`: first-class `decom_date` on subnet + IP, a `decom_expiring` alert rule (severity escalation reused from the other `*_expiring` rules), a dashboard widget, and a `find_subnets_decommissioning` MCP tool. Migration `a3f7c1e92b48`.
 - ✅ [**Top-N reports**](https://github.com/spatiumddi/spatiumddi/issues/47) — shipped `2026.06.11-1`: a `/reports` surface (top subnets by utilization, owners by IP count, most-modified resources via `audit_log`, noisiest DNS clients), feature-module-gated with 4 MCP read tools.
 - ✅ [**Compliance / change report PDF**](https://github.com/spatiumddi/spatiumddi/issues/48) — shipped `2026.06.11-1`: `GET /api/v1/audit/export.pdf` renders an auditor-facing PDF of every `audit_log` mutation in a date range, grouped by user / resource / action, with a per-row SHA-256 tamper-evidence trailer.
-- ✅ [**InfluxDB push export**](https://github.com/spatiumddi/spatiumddi/issues/889) — the writer the tech-stack
+- ✅ [**InfluxDB push export**](https://github.com/spatiumddi/spatiumddi/issues/889) — shipped `2026.09.04-1`. The writer the tech-stack
   table claimed for months while `grep -ri influx` over `backend/` returned
   nothing. Now `InfluxDBTarget` + `backend/app/services/influxdb/`
   (`line_protocol` / `client` / `collect` / `push`) + a 30 s beat task with
@@ -675,7 +675,7 @@ suggestion, free-space treemap.
   *rendered config*, not the stored row.
 
 - ✅ [**A DNS server cannot be moved between server groups**](https://github.com/spatiumddi/spatiumddi/issues/934)
-  — reported in discussion #933 the obvious way: an auto-registered BIND9
+  — shipped `2026.09.04-1`. Reported in discussion #933 the obvious way: an auto-registered BIND9
   agent lands in `default`, the operator creates the group they actually
   wanted, and the server is stuck there. `ServerUpdate` carried no
   `group_id` and no move endpoint existed, while the DHCP side has had
@@ -766,7 +766,7 @@ suggestion, free-space treemap.
   existing resource rather than adding a top-level family.
 
 - ✅ [**A DNS zone cannot be moved between server groups**](https://github.com/spatiumddi/spatiumddi/issues/935)
-  — the other half of discussion #933, and a much sharper tool than the
+  — shipped `2026.09.04-1`. The other half of discussion #933, and a much sharper tool than the
   #934 server move. A server carries state *about* a group; a zone
   carries references *into* one — `DNSView`, `DNSTSIGKey`, `DNSAcl`,
   `DNSPool` are all group-scoped. Preview → commit at
@@ -840,7 +840,7 @@ suggestion, free-space treemap.
 - ⬜ [**Option 82 (relay agent info) class matching**](https://github.com/spatiumddi/spatiumddi/issues/54)
 - ⬜ [**DHCP test client**](https://github.com/spatiumddi/spatiumddi/issues/55)
 - ✅ [**Fingerprint-driven DHCP policy — compile device profiles into Kea client-classes**](https://github.com/spatiumddi/spatiumddi/issues/700)
-  — device profiling told us what a device *is*; client classes let us treat
+  — shipped `2026.09.04-1`. Device profiling told us what a device *is*; client classes let us treat
   kinds of device differently; nothing joined them. Now `dhcp_device_policy`
   (migration `f3b8d21c74ae`) + `services/dhcp/device_policy.py` compile an
   operator's choice of fingerbank device classes into a real Kea client-class
@@ -1030,7 +1030,7 @@ suggestion, free-space treemap.
 - ⬜ [**Config snapshots + rollback**](https://github.com/spatiumddi/spatiumddi/issues/883) — audit-log-driven revert
   of a single change plus scoped named snapshots. Distinct from #882,
   which is an agent-side safety net rather than an operator action.
-- ✅ [**Service restart from the GUI**](https://github.com/spatiumddi/spatiumddi/issues/890) — closes the #111 gap on
+- ✅ [**Service restart from the GUI**](https://github.com/spatiumddi/spatiumddi/issues/890) — shipped `2026.09.04-1`, closing the #111 gap on
   docker-compose and Helm, where the appliance's pod restart had no
   equivalent. One surface at **Admin → Platform Insights → Services**
   over `app/services/service_control/` (`backends` / `compose` / `kube`),
@@ -1253,7 +1253,7 @@ suggestion, free-space treemap.
     wanted is `GET /api/v1/version` (unauthenticated), **not**
     `/health/platform`, which reports no version at all.
   - ✅ [**API-surface sweep — MCP-only capabilities and untyped responses**](https://github.com/spatiumddi/spatiumddi/issues/917)
-    — the five issues the mobile client filed were all one finding: **data the
+    — shipped `2026.09.04-1`. The five issues the mobile client filed were all one finding: **data the
     server already has that a REST client cannot get, or cannot get typed**.
     Non-negotiable #13 guarantees every REST surface gets MCP tools, and
     nothing guaranteed the converse — the copilot tools are written against
@@ -1355,7 +1355,7 @@ suggestion, free-space treemap.
     on the patch: the regression worth catching is a future pydantic that
     stops routing through that function.
   - ✅ [**Expose DHCP pool occupancy over REST**](https://github.com/spatiumddi/spatiumddi/issues/913)
-    — `services/dhcp/pool_occupancy.py` has computed `assigned` / `total` /
+    — shipped `2026.09.04-1`. `services/dhcp/pool_occupancy.py` has computed `assigned` / `total` /
     `free` / `percent` since #339 and **no HTTP route called it**: it was
     reachable only from the `find_dhcp_pool_occupancy` MCP tool and the
     `dhcp_pool_exhaustion` alert evaluator. So "is this pool full?" — the
@@ -1380,7 +1380,7 @@ suggestion, free-space treemap.
     non-negotiable #13): `find_dhcp_pool_occupancy` answers exactly this, over
     the same pool set.
   - ✅ [**DNS query log has no rcode**](https://github.com/spatiumddi/spatiumddi/issues/914)
-    — the log recorded the *question* and nothing about the *answer*, so
+    — shipped `2026.09.04-1`. The log recorded the *question* and nothing about the *answer*, so
     "was it answered, refused or NXDOMAIN?" collapsed into "there is a row"
     or "there is not" — and the most common real outcome, a query that *was*
     answered just not as the user expected, was indistinguishable from one
@@ -1452,7 +1452,7 @@ suggestion, free-space treemap.
 - ✅ [**Conformance-fuzz sweep — undeclared media types, FK 500s, and tools that
   never ran**](https://github.com/spatiumddi/spatiumddi/issues/921)
   ([#922](https://github.com/spatiumddi/spatiumddi/issues/922),
-  [#923](https://github.com/spatiumddi/spatiumddi/issues/923)) — three QA
+  [#923](https://github.com/spatiumddi/spatiumddi/issues/923)) — shipped `2026.09.04-1`. Three QA
   reports that turned out to be three *classes*, each fixed at class scope
   with a guard so the set cannot regrow.
   **(#921) `POST /system/support-bundle` served `application/zip` and declared
@@ -1559,7 +1559,7 @@ suggestion, free-space treemap.
   includes) from an affected node to say what named actually loaded.
 
 - ✅ [**celery-beat reported unhealthy forever after a slot upgrade**](https://github.com/spatiumddi/spatiumddi/issues/925)
-  — the rollup was right that something was broken and wrong about what.
+  — shipped `2026.09.04-1`. The rollup was right that something was broken and wrong about what.
   **Beat only *schedules* `beat_tick`; a worker executes it**, so the
   `spatium:beat:heartbeat` key is a round trip and its absence indicts
   either end — while the old detail asserted "beat is stopped", which sent

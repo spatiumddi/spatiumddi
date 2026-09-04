@@ -225,25 +225,35 @@ test-one:
 # gobgpd itself and Trivy flags it against the `gobinary` target. No package
 # patch or `apk upgrade` can fix it — only rebuilding on a newer golang base.
 #
-# IMAGE=<name> scans one image; omit to scan all seven.
+# The frontend image is here for the same reason, and it is the case that
+# proves the point. It has no per-PR Trivy gate, and the weekly
+# trivy-scheduled.yml superset that nominally covers it has been exiting
+# at the backend image before reaching it — so in practice nothing scanned
+# it, and the first scan in 2026.09.04-1 found four HIGH CVEs in the
+# nginx-alpine base. Its build context is ``frontend/`` rather than the
+# repo root, which is why each spec carries one —
+# ``dockerfile:context:name``.
+#
+# IMAGE=<name> scans one image; omit to scan all eight.
 TRIVY_CACHE ?= $(CURDIR)/.trivy-cache
 TRIVY_IMAGES ?= \
-	agent/dhcp/images/kea/Dockerfile:kea \
-	agent/dns/images/bind9/Dockerfile:bind9 \
-	agent/dns/images/powerdns/Dockerfile:powerdns \
-	agent/dns/images/technitium/Dockerfile:technitium \
-	agent/dns/images/dnsdist/Dockerfile:dnsdist \
-	agent/supervisor/images/supervisor/Dockerfile:supervisor \
-	agent/looking-glass/images/gobgp/Dockerfile:looking-glass
+	agent/dhcp/images/kea/Dockerfile:.:kea \
+	agent/dns/images/bind9/Dockerfile:.:bind9 \
+	agent/dns/images/powerdns/Dockerfile:.:powerdns \
+	agent/dns/images/technitium/Dockerfile:.:technitium \
+	agent/dns/images/dnsdist/Dockerfile:.:dnsdist \
+	agent/supervisor/images/supervisor/Dockerfile:.:supervisor \
+	agent/looking-glass/images/gobgp/Dockerfile:.:looking-glass \
+	frontend/Dockerfile:frontend:frontend
 
 trivy:
 	@mkdir -p $(TRIVY_CACHE)
 	@fail=0; \
 	for spec in $(TRIVY_IMAGES); do \
-	  df=$${spec%%:*}; name=$${spec##*:}; \
+	  df=$${spec%%:*}; name=$${spec##*:}; ctx=$${spec#*:}; ctx=$${ctx%:*}; \
 	  if [ -n "$(IMAGE)" ] && [ "$(IMAGE)" != "$$name" ]; then continue; fi; \
 	  printf "→ %-14s building… " "$$name"; \
-	  if ! docker build -q -f "$$df" -t "spatiumddi-trivy-$$name:scan" . >/dev/null 2>&1; then \
+	  if ! docker build -q -f "$$df" -t "spatiumddi-trivy-$$name:scan" "$$ctx" >/dev/null 2>&1; then \
 	    printf "BUILD FAILED\n"; fail=1; continue; \
 	  fi; \
 	  printf "scanning… "; \

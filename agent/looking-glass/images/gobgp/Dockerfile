@@ -60,12 +60,15 @@ RUN git clone --depth 1 --branch "v${GOBGP_VERSION}" https://github.com/osrg/gob
 # escalation, HTTP/2 DoS — fixed in 0.55); x/text v0.38 carries
 # CVE-2026-56852 (norm.Iter infinite loop, fixed in 0.39); grpc-go
 # v1.79.3 carries GHSA-hrxh-6v49-42gf (xDS RBAC + HTTP/2, fixed in
-# 1.82.1). Re-check + drop/bump these pins when GoBGP's own go.mod moves
-# past them.
+# 1.82.1) and, at v1.83.0, CVE-2026-84304 (HIGH, fixed in 1.83.1).
+# Re-check + drop/bump these pins when GoBGP's own go.mod moves past
+# them. Dependabot does not see these — they are `go get` arguments in a
+# Dockerfile, not a tracked manifest — so `make trivy IMAGE=looking-glass`
+# is what surfaces the next one.
 RUN go get \
       golang.org/x/net@v0.57.0 \
       golang.org/x/text@v0.40.0 \
-      google.golang.org/grpc@v1.83.0
+      google.golang.org/grpc@v1.83.1
 ENV CGO_ENABLED=0
 RUN GOOS="${TARGETOS:-linux}" GOARCH="${TARGETARCH}" \
       go build -trimpath -ldflags="-s -w" -o /out/gobgpd ./cmd/gobgpd \
