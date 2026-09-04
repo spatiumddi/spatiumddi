@@ -852,6 +852,35 @@ async def _apply_delete_zone(db: AsyncSession, user: User, args: DeleteZoneArgs)
         )
     )
     collect_wake(dns_group_channel(args.group_id))
+    # Set-based first, ORM second. ``db.delete(zone)`` alone cascades through
+    # the ORM: every record row is loaded, tracked and DELETEd one by one
+    # inside the request. On a 250k-1M record zone that is minutes of a
+    # single transaction on the request loop — the api's liveness probes
+    # timed out and the pod was killed mid-delete (appliance sizing
+    # campaign, 2026-09-02). ``dns_record.zone_id`` already cascades at the
+    # FK, so delete the records in one statement and let the ORM cascade
+    # find nothing left to load. The zone's queued record ops go with it
+    # (the sweep zone_move does): a ``pending``/``in_flight`` op for a zone
+    # that no longer exists would only fail on the agent and surface as a
+    # zombie on the next resync.
+    from sqlalchemy import delete as sa_delete
+
+    from app.models.dns import DNSRecord, DNSRecordOp, DNSServer
+
+    group_server_ids = (
+        (await db.execute(select(DNSServer.id).where(DNSServer.group_id == zone.group_id)))
+        .scalars()
+        .all()
+    )
+    if group_server_ids:
+        await db.execute(
+            sa_delete(DNSRecordOp).where(
+                DNSRecordOp.server_id.in_(group_server_ids),
+                DNSRecordOp.zone_name == zone.name,
+                DNSRecordOp.state.in_(("pending", "in_flight")),
+            )
+        )
+    await db.execute(sa_delete(DNSRecord).where(DNSRecord.zone_id == zone.id))
     await db.delete(zone)
     await db.commit()
     return {"zone_id": str(args.zone_id), "mode": "delete"}
