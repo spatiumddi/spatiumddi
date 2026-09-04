@@ -1643,7 +1643,8 @@ make migrate                           # apply
 
 # Lint, typecheck, test
 make lint                              # ruff + black + mypy, eslint + prettier
-make ci                                # same three lint jobs CI runs (backend-lint + frontend-lint + frontend-build). Run before pushing.
+make ci                                # the lint/build/chart/perf jobs CI runs (backend-lint + frontend-lint + frontend-build
+                                       #   + charts-lint + perf-test). Run before pushing.
 make trivy                             # container-image CVE scan — run before pushing ANY agent Dockerfile change.
 make openapi VERSION=2026.08.22-1      # export the OpenAPI contract the release attaches (#903). Byte-identical
                                        #   to the release asset at the same tag; runs --network none, so it also proves
@@ -1651,6 +1652,11 @@ make openapi VERSION=2026.08.22-1      # export the OpenAPI contract the release
 make docs                              # local Jekyll preview of docs/ on :4000 (DOCS_PORT to override); docs-down stops it.
 make docs-verify                       # diagram-geometry gate — same check CI's "Docs — Diagram Geometry" job runs.
                                        #   Run before pushing ANY docs/assets/**.svg change. Needs chromium on PATH.
+make charts-lint                       # Charts — Lint & Template gate (#966), via a helm container: helm lint + template
+                                       #   with every toggle on + kubeconform -strict + the no-BestEffort check (#965).
+                                       #   Run before pushing ANY charts/** change; renders land in .charts-render/.
+make perf-test                         # Perf — Tests (#968), via Docker. perf/ is denied by the backend path filter,
+                                       #   so a perf-only PR runs this and NOT the 8 backend shards.
 make trivy IMAGE=kea                   #   ...one image only. Same gate CI uses (HIGH/CRITICAL, ignore-unfixed).
                                        #   CI's Trivy is path-filtered + PR-only, so touching a Dockerfile can surface a
                                        #   PRE-EXISTING CVE. Note golang:X.Y.Z pins are SECURITY pins — Go static-links its

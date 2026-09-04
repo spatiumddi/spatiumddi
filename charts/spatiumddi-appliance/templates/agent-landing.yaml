@@ -33,7 +33,7 @@ spec:
   template:
     metadata:
       labels:
-        {{- include "spatiumddi-appliance.labels" . | nindent 8 }}
+        {{- include "spatiumddi-appliance.podLabels" . | nindent 8 }}
         app.kubernetes.io/name: agent-landing
         app.kubernetes.io/component: agent-landing
     spec:
@@ -45,6 +45,12 @@ spec:
         - name: nginx
           image: "{{ .Values.agentLanding.image.repository }}:{{ .Values.agentLanding.image.tag }}"
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          # #965 — token request so the audit of this chart has no BestEffort
+          # pod left; nginx serving a static page needs nothing more.
+          {{- with .Values.agentLanding.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           ports:
             - name: http
               containerPort: 80

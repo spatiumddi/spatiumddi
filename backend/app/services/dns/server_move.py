@@ -52,6 +52,7 @@ from app.models.dns import (
     DNSServerGroup,
     DNSServerZoneState,
 )
+from app.services.dns.record_ops import QUEUED_OP_STATES
 from app.services.dns.tsig import ensure_group_tsig_key
 
 logger = structlog.get_logger(__name__)
@@ -222,7 +223,7 @@ async def move_server_to_group(
         await db.execute(
             sa_delete(DNSRecordOp).where(
                 DNSRecordOp.server_id == server.id,
-                DNSRecordOp.state.in_(("pending", "in_flight")),
+                DNSRecordOp.state.in_(QUEUED_OP_STATES),
             )
         )
     ).rowcount or 0

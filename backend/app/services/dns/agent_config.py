@@ -53,6 +53,7 @@ from app.services.dns.pool_geo import (
     build_view_descriptors,
     records_for_view,
 )
+from app.services.dns.record_ops import QUEUED_OP_STATES
 from app.services.dns_blocklist import (
     build_effective_for_group,
     build_effective_for_view,
@@ -430,7 +431,7 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
                 await db.execute(
                     select(DNSRecordOp).where(
                         DNSRecordOp.server_id == server.id,
-                        DNSRecordOp.state.in_(("pending", "in_flight")),
+                        DNSRecordOp.state.in_(QUEUED_OP_STATES),
                     )
                 )
             )

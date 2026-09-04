@@ -58,6 +58,7 @@ import {
   TLSStatePill,
 } from "@/pages/network/CertificatesPage";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
+import { usePermissions } from "@/hooks/usePermissions";
 import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
@@ -3309,6 +3310,10 @@ function MoveZoneModal({
 // (``records`` is the default and is left out of the URL entirely).
 type ZoneSubtab = "records" | "pools" | "certs" | "drift";
 
+// Matches BULK_DELETE_RECORDS_MAX server-side. A selection larger than this
+// is split, and each call is its own trash batch — the confirm copy says so.
+const BULK_DELETE_CHUNK = 2000;
+
 function ZoneDetailView({
   group,
   zone,
@@ -3474,16 +3479,62 @@ function ZoneDetailView({
     new Set(),
   );
   const [confirmBulkDelete, setConfirmBulkDelete] = useState(false);
+  // Superadmin-only permanent bulk delete (#963): the default moves the
+  // selection to the trash under one batch id; before #963 the grid could
+  // only hard-delete, so the option stays reachable for the one role that
+  // may use it.
+  const { isSuperadmin } = usePermissions();
+  const [bulkPermanent, setBulkPermanent] = useState(false);
+  // Outcome of the last bulk delete when some rows were skipped — the
+  // selection persists across pages, so the count in the modal can differ
+  // from what the server did (pool-managed or synthesised rows, wire
+  // failures). Shown above the records table until dismissed.
+  const [bulkDeleteNotice, setBulkDeleteNotice] = useState<string | null>(null);
   const bulkDeleteRecords = useMutation({
     // Server-side bulk endpoint: one WinRM round trip for agentless
     // drivers + a single zone-serial bump instead of N. Replaces the
-    // old Promise.allSettled fan-out.
-    mutationFn: (ids: string[]) =>
-      dnsApi.bulkDeleteRecords(group.id, zone.id, ids),
-    onSuccess: () => {
+    // old Promise.allSettled fan-out. The server caps a call at
+    // BULK_DELETE_CHUNK ids and the selection can exceed that across
+    // pages, so chunk — and each chunk is its own trash batch, which the
+    // confirm copy says rather than promising one restore.
+    mutationFn: async (ids: string[]) => {
+      let deleted = 0;
+      const skipped: { record_id: string; reason: string }[] = [];
+      const batches: string[] = [];
+      for (let i = 0; i < ids.length; i += BULK_DELETE_CHUNK) {
+        const res = await dnsApi.bulkDeleteRecords(
+          group.id,
+          zone.id,
+          ids.slice(i, i + BULK_DELETE_CHUNK),
+          { permanent: bulkPermanent },
+        );
+        deleted += res.deleted;
+        skipped.push(...res.skipped);
+        if (res.deletion_batch_id) batches.push(res.deletion_batch_id);
+      }
+      return { deleted, skipped, batches };
+    },
+    onSuccess: ({ deleted, skipped, batches }) => {
       qc.invalidateQueries({ queryKey: ["dns-records", zone.id] });
       setSelectedRecords(new Set());
       setConfirmBulkDelete(false);
+      const spread =
+        batches.length > 1
+          ? ` across ${batches.length} trash batches, each restored separately`
+          : "";
+      if (skipped.length > 0) {
+        const reasons = Array.from(new Set(skipped.map((s) => s.reason)));
+        setBulkDeleteNotice(
+          `${deleted} record${deleted === 1 ? "" : "s"} ${bulkPermanent ? "deleted" : "moved to the trash"}${spread}; ${skipped.length} skipped — ${reasons.join("; ")}`,
+        );
+      } else if (spread) {
+        setBulkDeleteNotice(
+          `${deleted} record${deleted === 1 ? "" : "s"} ${bulkPermanent ? "deleted" : "moved to the trash"}${spread}.`,
+        );
+      } else {
+        setBulkDeleteNotice(null);
+      }
+      setBulkPermanent(false);
     },
   });
 
@@ -3914,6 +3965,18 @@ function ZoneDetailView({
               />
             </>
           )}
+        </div>
+      )}
+
+      {bulkDeleteNotice && (
+        <div className="flex items-center justify-between border-b bg-amber-50 px-5 py-1.5 text-xs dark:bg-amber-900/10">
+          <span>{bulkDeleteNotice}</span>
+          <button
+            onClick={() => setBulkDeleteNotice(null)}
+            className="rounded-md border px-2 py-1 hover:bg-muted"
+          >
+            Dismiss
+          </button>
         </div>
       )}
 
@@ -4377,19 +4440,45 @@ function ZoneDetailView({
       )}
       {confirmBulkDelete && (
         <ConfirmSingleModal
-          title={`Delete ${selectedRecords.size} records`}
-          description={
-            <>
-              Delete the{" "}
-              <span className="font-medium">{selectedRecords.size}</span>{" "}
-              selected records? IPAM-managed records are excluded automatically.
-            </>
+          title={
+            bulkPermanent
+              ? `Permanently delete ${selectedRecords.size} records`
+              : `Move ${selectedRecords.size} records to the trash`
           }
+          description={
+            <div className="space-y-2">
+              <p>
+                {bulkPermanent ? "Permanently delete the " : "Move the "}
+                <span className="font-medium">{selectedRecords.size}</span>{" "}
+                selected records
+                {bulkPermanent
+                  ? "? This cannot be undone."
+                  : selectedRecords.size > BULK_DELETE_CHUNK
+                    ? ` to the trash? They are split into ${Math.ceil(selectedRecords.size / BULK_DELETE_CHUNK)} batches in Admin → Trash, each restored separately.`
+                    : " to the trash? They can be restored together from Admin → Trash."}{" "}
+                IPAM-managed records are excluded automatically.
+              </p>
+              {isSuperadmin && (
+                <label className="flex items-center gap-2 text-xs">
+                  <input
+                    type="checkbox"
+                    checked={bulkPermanent}
+                    onChange={(e) => setBulkPermanent(e.target.checked)}
+                  />
+                  Delete permanently (skip the trash)
+                </label>
+              )}
+            </div>
+          }
+          confirmLabel={bulkPermanent ? "Delete permanently" : "Move to trash"}
           isPending={bulkDeleteRecords.isPending}
           onConfirm={() =>
             bulkDeleteRecords.mutate(Array.from(selectedRecords))
           }
-          onClose={() => setConfirmBulkDelete(false)}
+          onClose={() => {
+            setConfirmBulkDelete(false);
+            setBulkPermanent(false);
+          }}
         />
       )}
       {showMoveZone && (

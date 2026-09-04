@@ -20,7 +20,7 @@ spec:
   template:
     metadata:
       labels:
-        {{- include "spatiumddi-appliance.labels" . | nindent 8 }}
+        {{- include "spatiumddi-appliance.podLabels" . | nindent 8 }}
         app.kubernetes.io/name: spatium-supervisor
         app.kubernetes.io/component: supervisor
     spec:
@@ -57,6 +57,14 @@ spec:
         - name: spatium-supervisor
           image: {{ include "spatiumddi-appliance.imageRef" (dict "global" .Values.global "repository" .Values.supervisor.image.repository) }}
           imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          # #965 — a CPU request lifts the supervisor out of BestEffort QoS. It
+          # is the thing that REPAIRS the node (watchdog auto-heal, firewall
+          # drift re-apply), and BestEffort starves it in exactly the window
+          # those exist for. Requests only; see values.yaml.
+          {{- with .Values.supervisor.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           # Privileged because the supervisor writes host-side
           # trigger files + reads /run/udev. Phase 3 narrows this
           # down once the controller pattern lands.

@@ -75,3 +75,6 @@ docs/_site/
 docs/.jekyll-cache/
 docs/.jekyll-metadata
 /openapi.json
+
+# Local `make charts-lint` renders (#966)
+.charts-render/

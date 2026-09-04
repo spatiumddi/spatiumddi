@@ -6432,9 +6432,18 @@ async def _apply_dns_sync(
             # Honor per-op state. A failed wire op must NOT remove the
             # DB row — otherwise the UI tells the user "deleted" but the
             # record is still published on the DNS server, and a later
-            # "Sync with server" pulls the zombie back into IPAM. Only
-            # state=="applied" (or a zone-less orphan with no wire op to
-            # begin with) is safe to delete locally.
+            # "Sync with server" pulls the zombie back into IPAM.
+            #
+            # Only ``failed`` blocks, though (#962 — the same defect #950
+            # fixed in the DNS bulk-delete route). Agent-based servers
+            # never answer inline: ``enqueue_record_ops_batch`` queues
+            # their rows as ``pending`` and the agent applies them on its
+            # next long-poll. Gating on ``!= "applied"`` reported every one
+            # of those as "wire delete failed — unknown" and kept the row,
+            # while the op still queued and the agent still removed the
+            # record from the served zone — so the next drift report
+            # listed it as missing-on-server and invited the operator to
+            # re-create the record they had just asked to delete.
             for r, op_row in zip(recs, op_rows, strict=True):
                 if op_row is None:
                     # No server in the zone's group will apply the op (no
@@ -6457,7 +6466,7 @@ async def _apply_dns_sync(
                     except Exception as exc:  # noqa: BLE001
                         errors.append(f"record {r.id}: {exc}")
                     continue
-                if op_row.state != "applied":
+                if op_row.state == "failed":
                     errors.append(
                         f"{r.record_type} {r.name}.{zone.name}: "
                         f"wire delete failed — {op_row.last_error or 'unknown'}"

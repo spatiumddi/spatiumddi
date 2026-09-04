@@ -175,9 +175,17 @@ dhcpKea:
   # DORA ramp: as a BestEffort pod Kea was given 7.5 % of a CPU while the
   # api ran at 110 %, its socket queue overflowed and only 37 % of the
   # DISCOVERs on the wire were answered. Requests only, no limits.
+  #
+  # 500m is the value every measured cell used (#967): what does the work
+  # under contention is the cgroup weight the request derives to, and
+  # 500m (weight 20) holds ~48 % of the CPU against the api + worker where
+  # the 250m #953 first shipped (weight 10) holds ~31 %. Kea's own use was
+  # under 100m once scheduled, so this is headroom for the api's bursts,
+  # not Kea's need; the DNS roles held 99.5–100 % at 250m in every cell
+  # and keep that floor.
   resources:
     requests:
-      cpu: 250m
+      cpu: 500m
       memory: 64Mi
   controlPlaneUrl: ""
   inClusterApiUrl: ""  # #292 — see dnsBind9.inClusterApiUrl
@@ -212,6 +220,15 @@ lookingGlass:
   enabled: false
   image:
     repository: ghcr.io/spatiumddi/looking-glass
+  # #965 — a floor, not a measurement. gobgpd holds real BGP sessions with
+  # operator routers (#566); as a BestEffort pod it had the lowest CFS
+  # weight on the node, and a starved collector misses keepalives until
+  # the peer's hold timer expires and the session flaps — louder than a
+  # dropped query. Requests only, no limits, same shape as dnsBind9.
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
   # Same precedence + rationale as dnsBind9.controlPlaneUrl /
   # inClusterApiUrl above: external operator-facing URL (Application
   # appliance, self-signed) takes priority over the in-cluster Service
@@ -295,6 +312,17 @@ supervisor:
   enabled: false
   image:
     repository: ghcr.io/spatiumddi/spatium-supervisor
+  # #965 — a floor, not a measurement. The supervisor is not a data-plane
+  # server, it is what repairs the node: the Wave-E watchdog re-fires
+  # apply_role_assignment for a missing service and re-applies a drifted
+  # nftables ruleset, both from inside the heartbeat loop. As a BestEffort
+  # pod it was starved at exactly the moment the data plane degraded, and
+  # the external bash watchdog then restarted a supervisor that was merely
+  # slow — burning its 3-per-30-min budget for nothing. Requests only.
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
   # Host mounts the supervisor needs — same set as today's compose
   # entry (release-state writes the trigger files, etc).
   hostMounts:
@@ -337,6 +365,12 @@ agentLanding:
   image:
     repository: nginx
     tag: 1.30.3-alpine
+  # #965 — token request so no pod in this chart is BestEffort (the CI
+  # render check refuses one). A static nginx page needs nothing more.
+  resources:
+    requests:
+      cpu: 10m
+      memory: 16Mi
   hostMounts:
     htmlDir: /var/lib/spatiumddi/agent-landing
 

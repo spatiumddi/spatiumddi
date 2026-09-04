@@ -459,7 +459,7 @@ $r | ConvertTo-Json -Compress -Depth 3
 
 **RFC 2136 path — `asyncio.gather`.** The 2136 write path is cheap per-op but was still serial. Record ops now run in parallel via `asyncio.gather`; no batching needed because the dnspython update framing is already compact.
 
-**Dispatch.** `enqueue_record_ops_batch(db, zone, ops)` in [`services/dns/record_ops.py`](../../backend/app/services/dns/record_ops.py) groups pending ops by zone and calls `apply_record_changes` once per group. Zone serial bumps once per batch instead of N times. **State-aware commit**: the caller zips through the returned op rows and only deletes (or confirms success) when `state == "applied"`. A failed wire op never causes a DB delete — previous behaviour would report "deleted" to the UI while the record was still published on Windows.
+**Dispatch.** `enqueue_record_ops_batch(db, zone, ops)` in [`services/dns/record_ops.py`](../../backend/app/services/dns/record_ops.py) groups pending ops by zone and calls `apply_record_changes` once per group. Zone serial bumps once per batch instead of N times. **State-aware commit**: the caller zips through the returned op rows and keeps the DB row only when the op came back `state == "failed"` — a server rejected the delete, so the record is still published and reporting "deleted" would leave a zombie the next "Sync with server" pulls back. Every other outcome deletes locally: `applied` (agentless, inline), `pending` (agent-based — the agent applies it on its next long-poll; gating on `applied` here was the #950 / #962 defect, which reported every agent-side delete as failed) and `None` (no primary to push to — DB-only cruft, #623).
 
 **Results.**
 
