@@ -4,16 +4,31 @@ Why per-giaddr sockets: in relay topology Kea unicasts every OFFER/ACK to
 ``giaddr:67``. A load-gen host that owns those giaddrs is rarely the only
 process listening on UDP/67 — libvirt's dnsmasq (the appliance VM's own DHCP
 server), a leftover ``dhcrelay``, a lab DHCP server all bind the wildcard
-address on the same device. Two wildcard sockets with the same score share the
-unicast replies according to the kernel's UDP lookup tie-break (in practice a
-CPU-affinity split), so the fleet silently loses a large fraction of the OFFERs
-it was sent and logs them as timeouts (measured 2026-09-03: 58 % seen of 74.8k
-OFFERs on the wire, ~45 % handshake success on a healthy Kea).
+address on the same device, so which socket the kernel hands a given reply to
+stops being ours to decide and the fleet logs what lands elsewhere as a DORA
+timeout (measured 2026-09-03: 58 % seen of 74.8k OFFERs on the wire, ~45 %
+handshake success on a healthy Kea).
 
-A socket bound to the giaddr itself is looked up before any wildcard socket,
-so it receives every reply to that address, deterministically. The wildcard
-socket stays open as the fallback for a giaddr the host cannot bind (the address
-is not local, or the platform refuses), and for the broadcast topology.
+What the kernel does with two equally-scored wildcard sockets depends on how
+the OTHER listener opened its own, and neither outcome is one to depend on
+(verified on Linux 6.x, 200 datagrams per case):
+
+  * ``SO_REUSEADDR`` only — the LAST socket bound takes every datagram and the
+    other receives nothing, so whether the fleet sees its replies at all is
+    decided by process start order.
+  * ``SO_REUSEPORT`` — the group splits by a hash of the 4-tuple
+    (``reuseport_select_sock`` → ``udp_ehashfn``): replies to different
+    giaddrs land on different sockets, and a constant 4-tuple always lands on
+    the same one. Not a per-packet or CPU-affinity split.
+
+A socket bound to the giaddr itself moots both. ``compute_score`` ranks a
+matching ``inet_rcv_saddr`` above a wildcard, so it is chosen ahead of any
+wildcard socket — including one in a ``SO_REUSEPORT`` group, and regardless of
+bind order — and receives every reply to that address, deterministically.
+
+The wildcard socket stays open as the fallback for a giaddr the host cannot
+bind (the address is not local, or the platform refuses), and for the
+broadcast topology.
 """
 
 from __future__ import annotations

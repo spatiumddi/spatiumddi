@@ -1001,9 +1001,17 @@ class Orchestrator:
                 if d.state is not DState.OFFLINE),
         }
         append_ndjson(self.rp.generator(f"orchestrator.shard{self.shard}.summary.ndjson"), summary)
-        if self._sock:
+        # Every socket, not just the wildcard one: relay topology opens one per
+        # giaddr (open_relay_sockets). A giaddr that could not be bound maps to
+        # the wildcard socket, so the values can repeat it — dedupe by identity
+        # rather than closing the same fd twice.
+        seen: set[int] = set()
+        for sock in [self._sock, *self._socks.values()]:
+            if sock is None or id(sock) in seen:
+                continue
+            seen.add(id(sock))
             try:
-                self._sock.close()
+                sock.close()
             except OSError as exc:
                 # Best-effort close during teardown; a socket error here is non-fatal.
                 self.log.debug("socket close failed during finalize: %s", exc)
