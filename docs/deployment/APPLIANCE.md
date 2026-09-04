@@ -104,12 +104,16 @@ not the operator's:
   until its socket queue overflows: at 5.5 GiB / 3 vCPU, Kea was given 7.5 %
   of a CPU and answered 37 % of the DISCOVERs on the wire (55 % handshake
   success) while it answered 100 % of what reached it. The same cell with a
-  250m request on `dhcp-kea` and `dns-bind9` (the chart default since
-  spatiumddi#953) reached 96 % with 0 restarts. That is why the 4 vCPU rows
-  pass — a fourth CPU happens to be free for Kea — and why 3 vCPU sits at
-  the knee. A larger socket receive buffer does not help: with 8 MiB of
-  buffer the drops vanish but a DORA takes 34 s instead of 1.5 s, because
-  Kea then answers stale requests whole retransmit rounds late.
+  CPU request on `dhcp-kea` and `dns-bind9` reached 95.6 % with 0 restarts.
+  That measurement used a **500m** request (cgroup weight 20 against the
+  api's 4); the chart default since spatiumddi#953 is **250m** (weight 10),
+  which lifts the pods out of BestEffort — the defect — but has not itself
+  been run against this load. Sizing a node at the knee, prefer the measured
+  500m. See spatiumddi#967. That is why the 4 vCPU rows pass — a fourth CPU
+  happens to be free for Kea — and why 3 vCPU sits at the knee. A larger
+  socket receive buffer does not help: with 8 MiB of buffer the drops
+  vanish but a DORA takes 34 s instead of 1.5 s, because Kea then answers
+  stale requests whole retransmit rounds late.
 
 Beyond that: **500k records in one group** is not a supported single-node
 size at any RAM tested (up to 10 GiB) — the api's bundle build for the
