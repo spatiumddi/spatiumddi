@@ -49,6 +49,7 @@
 
 - [Why I built this](#why-i-built-this) — the story
 - [Why SpatiumDDI](#why-spatiumddi) — the elevator pitch
+- [Privacy: your data stays yours](#privacy-your-data-stays-yours) — no telemetry, no analytics, no phone-home
 - [Support the project](#support-the-project) — sponsors, tip jar, getting involved
 - [What's in the box](#whats-in-the-box) — quick capability tour
 - [Full feature detail](#full-feature-detail) — deep dive on every subsystem
@@ -98,6 +99,12 @@ SpatiumDDI is built on nights and weekends with no commercial backing — every 
 **Built for delegation.** Group-based RBAC with LDAP, OIDC, SAML, RADIUS, and TACACS+ (with backup-server failover). Hand a subnet or a zone to a department without handing over root.
 
 **API-first.** Every UI action is a REST call. Terraform, Ansible, and ad-hoc scripts all speak the same surface. If you can click it, you can automate it.
+
+## Privacy: your data stays yours
+
+SpatiumDDI collects **no telemetry, no usage analytics, no crash reports, and no account or registration data**. There is no phone-home, no license server, no sign-up, and no project-controlled endpoint the software talks to. Everything you put in it — zones, records, leases, subnets, credentials, query logs, audit history — lives in *your* PostgreSQL on *your* infrastructure, and the maintainers have no way to see it and do not want it. This README, the documentation site and the web UI use no analytics or tracking scripts.
+
+The software makes no outbound connection you did not configure, with one exception: a **daily anonymous check of GitHub for a newer release** (an unauthenticated GET; GitHub sees your IP address and nothing about your install — no version, no counts, no identifiers). Turn it off under **Settings → Application → Updates → Check for GitHub Releases**, or run fully air-gapped — every feature works with no internet access at all. Optional features that do reach third parties (Fingerbank device profiling, the Operator Copilot's LLM provider, Let's Encrypt, blocklist feeds, cloud DNS / integration mirrors, the whois and RBL tools) are off until you configure them, and [docs/PRIVACY.md](docs/PRIVACY.md) lists exactly what each one sends, to whom, and how to stop it.
 
 ## What's in the box
 

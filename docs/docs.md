@@ -51,4 +51,5 @@ Every specification, deployment guide and driver internal, grouped by what you'r
 
 ## Project
 
+- [Privacy](PRIVACY.md) — no telemetry, no analytics, no phone-home; every outbound connection the software can make, what it sends, and how to turn it off
 - [Third-Party Components](THIRD_PARTY.md) — every bundled engine, library and OS package, with licenses and which artifact each ships in
