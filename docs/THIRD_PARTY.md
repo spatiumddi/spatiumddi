@@ -82,7 +82,7 @@ Notes worth carrying:
 
 | Component | Version | License | Where | Pinned in |
 |---|---|---|---|---|
-| [k3s](https://k3s.io/) | v1.35.6+k3s1 | Apache 2.0 | Appliance OS | `appliance/scripts/fetch-k3s.sh` |
+| [k3s](https://k3s.io/) | v1.36.4+k3s1 | Apache 2.0 | Appliance OS | `appliance/scripts/fetch-k3s.sh` |
 | [containerd](https://containerd.io/) + [runc](https://github.com/opencontainers/runc) | embedded in k3s | Apache 2.0 | Appliance OS | (k3s bundle) |
 | [CoreDNS](https://coredns.io/) | k3s airgap bundle | Apache 2.0 | Appliance OS | (k3s bundle) |
 | [Flannel](https://github.com/flannel-io/flannel) | embedded in k3s, `host-gw` backend | Apache 2.0 | Appliance OS | `appliance/mkosi.extra/etc/rancher/k3s/config.yaml` |
@@ -93,7 +93,7 @@ Notes worth carrying:
 | [metrics-server](https://github.com/kubernetes-sigs/metrics-server) | in k3s bundle, **disabled** | Apache 2.0 | Appliance OS | `config.yaml` `disable:` list |
 | [MetalLB](https://metallb.io/) | chart + images 0.15.3 | Apache 2.0 | Helm chart (opt-in) | `charts/spatiumddi-metallb/Chart.yaml` |
 | [FRRouting](https://frrouting.org/) | via MetalLB frr-k8s | GPL v2 | Helm chart (opt-in) | `charts/spatiumddi-metallb` values |
-| [CloudNativePG](https://cloudnative-pg.io/) | chart 0.28.2 | Apache 2.0 | Helm chart (opt-in) | `charts/spatiumddi-appliance/Chart.yaml` |
+| [CloudNativePG](https://cloudnative-pg.io/) | chart 0.29.0 (operator 1.30.0) | Apache 2.0 | Helm chart (opt-in) | `charts/spatiumddi-appliance/Chart.yaml` |
 | [Patroni](https://github.com/patroni/patroni) | `k8s/ha/` overlay | MIT | Bare-metal HA overlay | `k8s/ha/` |
 | [HAProxy](https://www.haproxy.org/) | 2.9-alpine | GPL v2 (+ LGPL libs) | Patroni HA overlay | `k8s/ha/` |
 

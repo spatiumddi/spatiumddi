@@ -44,6 +44,6 @@ maintainers:
 dependencies:
   - name: cloudnative-pg
     alias: cnpg
-    version: 0.28.2
+    version: 0.29.0
     repository: https://cloudnative-pg.github.io/charts
     condition: cnpg.enabled

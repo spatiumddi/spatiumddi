@@ -408,8 +408,13 @@ ingress:
 #   ``charts/spatiumddi-appliance/`` for appliance installs; for
 #   plain k8s installs apply the operator separately via:
 #   ``kubectl apply --server-side -f
-#    https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/release-1.29/releases/cnpg-1.29.1.yaml``
+#    https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/release-1.30/releases/cnpg-1.30.0.yaml``
 #   ).
+#   Pick the operator line your cluster is in CNPG's support matrix
+#   for, not simply the newest: 1.30.x covers Kubernetes 1.34-1.36
+#   (what the appliance ships), while an older cluster wants the
+#   matching older line. The appliance pin lives in
+#   ``charts/spatiumddi-appliance/Chart.yaml``.
 #
 # For an externally-managed database, set ``postgresql.enabled=false``
 # and fill in the ``externalDatabase`` block below.

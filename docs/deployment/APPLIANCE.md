@@ -1411,6 +1411,47 @@ so a first-time operator never gets stuck looking for the upload.
    `aborted`). Lease is released. The OS Versions tab shows the new
    default slot on every node.
 
+**Rolling back, and why a Kubernetes minor is different (#974).**
+
+For a same-minor release an **A/B slot revert is a rollback**: boot the
+previous slot and the node is as it was. Across a Kubernetes *minor* it
+is not, and the difference is easy to miss because the slot machinery
+behaves identically.
+
+The k3s datastore (`/var/lib/rancher/k3s`) lives on the persistent
+`/var`, **outside the A/B slot**. Booting a slot that carries the older
+k3s therefore starts an older apiserver against a datastore the newer
+one has already written to — which Kubernetes does not support and does
+not detect for you. The slot revert succeeds and the cluster is the
+thing that is broken.
+
+So for a minor bump the rollback is **slot revert *plus* an etcd restore
+from a snapshot taken before the upgrade**:
+
+1. Revert the slot (OS Versions → set the previous slot as default,
+   reboot) on the node you are recovering.
+2. Restore etcd from a pre-upgrade snapshot via **Fleet → Control plane
+   → etcd snapshots**. The seed reports `k3s etcd-snapshot list` on
+   every heartbeat, so the inventory is already in the UI.
+
+> ⚠️ **The restore is a single-node cluster reset.** k3s collapses to a
+> 1-member etcd from the snapshot and every *other* control-plane node
+> is orphaned and has to be re-paired through the Replace flow. Plan a
+> multi-node rollback as a rebuild of the other members, not as a
+> per-node undo.
+
+**Take a manual snapshot before starting a minor upgrade.** Automatic
+snapshots run on `etcd-snapshot-schedule-cron: "0 */6 * * *"` with
+`etcd-snapshot-retention: 8`, so the newest one can be almost six hours
+old — six hours of DNS, DHCP and IPAM changes that a restore would
+discard. The pre-upgrade snapshot step in the rolling-upgrade primitive
+(step 2) is still a documented no-op: creating one needs a host-side
+runner the supervisor does not expose yet (tracked in #296). Until it
+lands, that step is the operator's, and on an appliance it is
+`k3s etcd-snapshot save` on the seed.
+
+Same-minor bumps are unaffected — revert the slot and you are done.
+
 **Air-gap operator workflow (TL;DR):**
 
 ```
