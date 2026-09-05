@@ -44,22 +44,49 @@ from typing import Any
 
 
 def normalize_zone_name(name: str) -> str:
-    """Return the comparison key for a zone name.
+    """Return the canonical key for a zone name: lower-cased, no root dot.
 
-    Lower-cased and stripped of the root dot, so a manifest's
-    ``Burst.DDIPG.test`` and the API's ``burst.ddipg.test.`` compare
-    equal. This is a comparison key, NOT the wire format: the seeder
-    still POSTs the manifest's spelling and lets the API canonicalise.
+    So a manifest's ``Burst.DDIPG.test`` and the API's
+    ``burst.ddipg.test.`` compare equal.
+
+    Used for two things, and the second is why the first is safe:
+
+    * comparing an API-reported name with one from a manifest
+      (``find_existing_zone``, ``is_reverse_zone``);
+    * as the spelling the seeder itself carries. ``seed_scaffold``
+      canonicalises ``forward_zones`` and explicit ``reverse_zones``
+      where it assembles them, so one spelling keys
+      ``zone_id_by_name``, feeds the record generator's suffix
+      arithmetic, reaches the seed manifest — and is what gets POSTed.
+
+    POSTing this form changes nothing on the server: it is a strict
+    prefix of what ``ZoneCreate.validate_zone_name`` would produce from
+    the manifest's spelling anyway (that validator appends the root dot,
+    which this omits). What it does change is that everything downstream
+    of the POST agrees with everything the API reports back.
+
+    The one thing it is NOT is a wire *format*: the root dot belongs on
+    a canonical FQDN and is deliberately absent here, so do not use the
+    result where an FQDN is required.
     """
     return name.strip().rstrip(".").lower()
 
 
 def is_reverse_zone(name: str) -> bool:
-    """True for a reverse-lookup zone (``in-addr.arpa`` / ``ip6.arpa``).
+    """True for any zone under ``.arpa`` — in practice a reverse zone.
 
-    Suffix-matched on the canonical name, so the API's
-    ``0.10.in-addr.arpa.`` is recognised. A raw ``endswith(".arpa")``
-    against the stored name is always false — the root dot is last.
+    Deliberately the whole ``.arpa`` tree (``in-addr.arpa``,
+    ``ip6.arpa``, the bare ``arpa`` apex, and the infrastructure
+    sub-trees this harness never creates) rather than the two reverse
+    suffixes alone. Callers use it to pick a zone to write ordinary A
+    records into, and none of ``.arpa`` is a place for those — so the
+    superset is the safe direction, and matching two suffixes would let
+    a future zone through on a technicality.
+
+    Matched on the label boundary, so ``arpanet.example.com`` is not a
+    hit, and on the canonical name, so the API's stored
+    ``0.10.in-addr.arpa.`` is one. A raw ``endswith(".arpa")`` against
+    the stored name is always false — the root dot is last.
     """
     canonical = normalize_zone_name(name)
     return canonical == "arpa" or canonical.endswith(".arpa")
