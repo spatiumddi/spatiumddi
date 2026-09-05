@@ -1,4 +1,4 @@
-"""Zone-name canonicalisation for the seeder's get-or-create paths (#981).
+"""Zone-name canonicalisation, shared by every component that reads zone names (#981).
 
 The API canonicalises a zone name on the way IN and reports the canonical
 form on the way OUT, so a seeder that compares an API-returned name with
@@ -23,10 +23,18 @@ dot; the lower-casing is the same bug for any manifest that spells a
 zone with a capital, and ``rstrip('.')`` alone would leave that one
 live.
 
-Kept in its own module, dependency-free, so the comparison can be tested
-without importing the seeder (which pulls in ``httpx`` and the
-``spddi_perf`` package — neither is available to the hermetic
-``make perf-test`` runner).
+It lives in the shared spine rather than next to the seeder because the
+seeder was not the only component reading zone names off the API and
+comparing them to an undotted string. ``api_mutation_stream`` picked its
+target zone with ``not name.endswith(".arpa")``, which is false for
+``0.10.in-addr.arpa.`` — and since ``list_zones`` orders by name, that
+reverse zone sorts first, so the mutation stream spent whole runs POSTing
+``perf-op-*`` A records into a reverse zone. ``synthetic_ui_probe``
+carried the same expression. Both now go through ``is_reverse_zone``.
+
+Dependency-free on purpose: the comparison is testable without importing
+any component that needs ``httpx``, so it runs under the hermetic
+``make perf-test`` runner.
 """
 
 from __future__ import annotations
@@ -44,6 +52,17 @@ def normalize_zone_name(name: str) -> str:
     still POSTs the manifest's spelling and lets the API canonicalise.
     """
     return name.strip().rstrip(".").lower()
+
+
+def is_reverse_zone(name: str) -> bool:
+    """True for a reverse-lookup zone (``in-addr.arpa`` / ``ip6.arpa``).
+
+    Suffix-matched on the canonical name, so the API's
+    ``0.10.in-addr.arpa.`` is recognised. A raw ``endswith(".arpa")``
+    against the stored name is always false — the root dot is last.
+    """
+    canonical = normalize_zone_name(name)
+    return canonical == "arpa" or canonical.endswith(".arpa")
 
 
 def find_existing_zone(zones: Iterable[Mapping[str, Any]], zname: str) -> Mapping[str, Any] | None:

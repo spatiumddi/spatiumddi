@@ -79,6 +79,10 @@ export SPDDI_PERF_NODE_IP=192.168.0.x  # → api_base derived as https://<node_i
 # Required when using a pre-prepared appliance (PERF_APPLIANCE_SETUP.md §2):
 export SPDDI_PERF_DNS_GROUP_ID=<uuid>  # existing DNS group bind9 is already bound to
 export SPDDI_PERF_DHCP_GROUP_ID=<uuid> # existing DHCP group kea is already bound to
+
+# Only if a partial dataset in a reused zone is deliberate — the seeder otherwise
+# refuses to skip its record load onto a dataset smaller than the manifest plans.
+export SPDDI_PERF_ALLOW_SHORT_REUSED_ZONE=1
 ```
 
 See `docs/PERF_APPLIANCE_SETUP.md` for how to retrieve these IDs after manual setup.

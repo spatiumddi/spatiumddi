@@ -8,13 +8,18 @@ The comparison was therefore false for every zone that existed, so the
 fixed zone died in the seeder before a single DORA.
 
 ``find_existing_zone`` is tested rather than ``_get_or_create_zone``
-itself because the latter imports ``httpx`` and the ``spddi_perf``
-package, neither of which the hermetic ``make perf-test`` runner has.
-What that leaves untested here is the HTTP plumbing around the helper;
-what it does cover is the comparison, which is where the defect was, and
+itself because the latter imports ``httpx``, which the hermetic
+``make perf-test`` runner does not have. What that leaves untested here
+is the HTTP plumbing around the helper; what it does cover is the
+comparison, which is where the defect was, and
 ``test_second_post_resolves_to_the_first_zones_id`` walks the whole
 POST → 409 → list → match round trip against a fake API that
 canonicalises the way the real one does.
+
+``is_reverse_zone`` is here for the same reason and the same bug one
+layer over: ``api_mutation_stream`` and ``synthetic_ui_probe`` selected a
+target zone with ``not name.endswith(".arpa")``, false for every stored
+reverse zone.
 """
 
 from __future__ import annotations
@@ -26,7 +31,11 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from _zone_names import find_existing_zone, normalize_zone_name  # noqa: E402
+from spddi_perf.zone_names import (  # noqa: E402
+    find_existing_zone,
+    is_reverse_zone,
+    normalize_zone_name,
+)
 
 
 def zone(name: str, zid: str = "z1", view_id: str | None = None) -> dict:
@@ -183,3 +192,45 @@ def test_the_old_comparison_is_what_broke() -> None:
     api.post("burst.ddipg.test")
     assert not any(z["name"] == "burst.ddipg.test" for z in api.list())
     assert find_existing_zone(api.list(), "burst.ddipg.test") is not None
+
+
+# ── is_reverse_zone ─────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "0.10.in-addr.arpa.",
+        "0.10.in-addr.arpa",
+        "107.10.IN-ADDR.ARPA.",
+        "8.b.d.0.1.0.0.2.ip6.arpa.",
+        "arpa.",
+    ],
+)
+def test_reverse_zones_are_recognised(name: str) -> None:
+    assert is_reverse_zone(name)
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["campus.example.edu.", "burst.ddipg.test", "arpanet.example.com.", ""],
+)
+def test_forward_zones_are_not_reverse(name: str) -> None:
+    """``arpanet.example.com`` is the reason this is a LABEL suffix test."""
+    assert not is_reverse_zone(name)
+
+
+def test_the_mutation_stream_picks_a_forward_zone() -> None:
+    """The selection api_mutation_stream / synthetic_ui_probe make.
+
+    ``list_zones`` orders by name, so the reverse zone sorts first — with
+    the old ``endswith(".arpa")`` (false for a stored, dotted name) the
+    filter kept it and ``fwd[0]`` was the reverse zone, sending every
+    ``perf-op-*`` A record into it for the length of the run.
+    """
+    listed = [zone("0.10.in-addr.arpa.", "rev"), zone("campus.example.edu.", "fwd")]
+    picked = [z for z in listed if not is_reverse_zone(str(z.get("name", "")))]
+    assert [z["id"] for z in picked] == ["fwd"]
+    # And the expression it replaced would have picked the reverse zone.
+    old = [z for z in listed if not str(z.get("name", "")).endswith(".arpa")]
+    assert old[0]["id"] == "rev"

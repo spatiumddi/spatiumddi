@@ -152,6 +152,18 @@ export SPDDI_PERF_DHCP_GROUP_ID="$DHCP_GID"       # from the §2 group-create ou
 > Zones are get-or-created (idempotent); the bulk record load is skipped on re-runs
 > where the forward zone already exists.
 
+> **One group, one manifest.** The skip above is what makes a re-run cheap, and it
+> is only correct when the records already in the zone are *this* manifest's
+> dataset. Every shipped manifest names the same forward zone, so running
+> `smoke.yaml` and then `300k-ceiling.yaml` against one reused group would skip the
+> 300k load and measure the ceiling against smoke's 10k. The seeder now counts what
+> the reused zone holds and refuses to skip when it is short of the plan, or when a
+> reverse zone was created empty this run ([#981](https://github.com/spatiumddi/spatiumddi/issues/981)).
+> Use a fresh group per manifest, delete the zones between manifests, or — if the
+> partial dataset is deliberate — set `SPDDI_PERF_ALLOW_SHORT_REUSED_ZONE=1`. A zone
+> holding *more* than the manifest plans is allowed and logged, since every planned
+> name still resolves.
+
 If you lost the group IDs, retrieve them:
 ```bash
 TOK=$(tok)

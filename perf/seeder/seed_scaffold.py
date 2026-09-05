@@ -59,12 +59,13 @@ import spddi_perf.manifest as manifest_mod
 from spddi_perf import canonical
 from spddi_perf.logging_util import atomic_write_json, get_logger, log_event, utc_now_iso
 from spddi_perf.runpaths import RunPaths
+from spddi_perf.seed_reuse import LARGER, OK, SHORT, reused_dataset_verdict
+from spddi_perf.zone_names import find_existing_zone, normalize_zone_name
 
 # _api lives beside this script (perf/seeder/) — add to path defensively so it
 # imports whether launched as a module or a file.
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
 from _api import ApiClient, ApiError  # noqa: E402
-from _zone_names import find_existing_zone  # noqa: E402
 
 # Env vars for group reuse (pre-prepared appliances — see PERF_APPLIANCE_SETUP.md §2).
 # When set, skip group creation and seed zones/scopes into the existing groups so the
@@ -124,7 +125,15 @@ def _reverse_zone_names(subnet_cidrs: list[str], shape: str, explicit: list[str]
     block's leading octets. ``explicit`` (manifest ``seed.dns.reverse_zones``) wins.
     """
     if explicit:
-        return list(dict.fromkeys(explicit))
+        # Canonicalised here so every consumer downstream sees one spelling.
+        # ``_reverse_zone_for_ip`` matches against ``ip.reverse_pointer``,
+        # which is always lower-case and undotted, and the PTR relative-name
+        # arithmetic strips the zone suffix off that same string — so an
+        # explicit ``107.10.IN-ADDR.ARPA`` would resolve its zone id and then
+        # send every PTR to ``skipped_no_zone``, which no exit code notices
+        # (#981). Also makes the dedupe honest: ``x.test`` and ``X.test.``
+        # are one zone.
+        return list(dict.fromkeys(normalize_zone_name(z) for z in explicit))
     names: list[str] = []
     seen: set[str] = set()
     for cidr in subnet_cidrs:
@@ -215,7 +224,7 @@ def _get_or_create_zone(
     string: the API canonicalises a zone name (lower-case + root dot) and
     reports the canonical form, so ``z["name"] == zname`` compares
     ``"burst.ddipg.test."`` with ``"burst.ddipg.test"`` and is false for
-    every zone that exists. See ``_zone_names`` for the full story (#981).
+    every zone that exists. See ``spddi_perf.zone_names`` for the full story (#981).
     """
     try:
         z = api.json("POST", f"/v1/dns/groups/{group_id}/zones", json={
@@ -242,6 +251,70 @@ def _get_or_create_zone(
             f"{listed[:20]}{' …' if len(listed) > 20 else ''} "
             f"({len(listed)} zone(s))"
         ) from exc
+
+
+ENV_ALLOW_SHORT_REUSE = "SPDDI_PERF_ALLOW_SHORT_REUSED_ZONE"
+
+
+def _count_zone_records(api: "ApiClient", group_id: str, zone_id: str) -> int:
+    """How many records the zone holds, per the API's own paging total."""
+    body = api.json(
+        "GET", f"/v1/dns/groups/{group_id}/zones/{zone_id}/records",
+        params={"page": 1, "page_size": 1},
+    )
+    return int(body.get("total", 0))
+
+
+def _assert_reused_dataset_matches(
+    api: "ApiClient",
+    group_id: str,
+    forward_zone: str,
+    fwd_zone_id: str | None,
+    *,
+    planned_forward: int,
+    fresh_reverse_zones: list[str],
+    log: logging.Logger,
+) -> None:
+    """Refuse to skip the bulk load when the reused zone is not this dataset.
+
+    Counting is here; the verdict is ``spddi_perf.seed_reuse``, which
+    carries the reasoning and is unit-tested. ``SPDDI_PERF_ALLOW_SHORT_REUSED_ZONE=1``
+    overrides a SHORT zone for an operator who knows the dataset is
+    partial and wants the run anyway — it does NOT override an empty
+    reverse zone, which is a structural mismatch rather than a judgement
+    about how much data is enough.
+    """
+    present = _count_zone_records(api, group_id, fwd_zone_id) if fwd_zone_id else 0
+    verdict, detail = reused_dataset_verdict(
+        present=present, planned=planned_forward, fresh_reverse_zones=fresh_reverse_zones,
+    )
+    if verdict == OK:
+        return
+    if verdict == LARGER:
+        log_event(log, logging.WARNING, "reused_zone_larger_than_manifest",
+                  forward_zone=forward_zone, records_present=present,
+                  records_planned=planned_forward, detail=detail,
+                  note="run is valid but measured against a larger set than the manifest declares")
+        return
+    allow_short = (os.environ.get(ENV_ALLOW_SHORT_REUSE) or "").strip().lower() in (
+        "1", "true", "yes",
+    )
+    if verdict == SHORT and allow_short:
+        log_event(log, logging.WARNING, "reused_zone_short_allowed",
+                  forward_zone=forward_zone, records_present=present,
+                  records_planned=planned_forward, env=ENV_ALLOW_SHORT_REUSE)
+        return
+    log_event(log, logging.ERROR, "reused_zone_mismatch", verdict=verdict,
+              forward_zone=forward_zone, records_present=present,
+              records_planned=planned_forward,
+              fresh_reverse_zones=sorted(fresh_reverse_zones))
+    raise RuntimeError(
+        f"re-using DNS group {group_id}: forward zone {forward_zone!r} {detail}. "
+        "Skipping the bulk load here would report this manifest's dataset size for a "
+        f"measurement taken on a different one. Seed into a fresh group (unset "
+        f"{ENV_DNS_GROUP_ID}), delete the zone(s), or set {ENV_ALLOW_SHORT_REUSE}=1 if a "
+        "partial dataset is deliberate."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -400,7 +473,12 @@ def run(rp: RunPaths, m: manifest_mod.Manifest, log: logging.Logger) -> int:
         return 2
 
     subnet_cidrs = _plan_subnets(m.seed.ip_block, count, prefix)
-    forward_zones = list(m.seed.dns.forward_zones) or ["campus.example.edu"]
+    # Canonical spelling throughout: these names key ``zone_id_by_name``,
+    # feed the record generator, and are written to the seed manifest the
+    # query generator reads. See spddi_perf.zone_names (#981).
+    forward_zones = [normalize_zone_name(z) for z in m.seed.dns.forward_zones] or [
+        "campus.example.edu"
+    ]
     forward_zone = forward_zones[0]
     reverse_zones = _reverse_zone_names(
         subnet_cidrs, m.seed.dns.reverse_zone_shape, m.seed.dns.reverse_zones
@@ -522,9 +600,12 @@ def run(rp: RunPaths, m: manifest_mod.Manifest, log: logging.Logger) -> int:
                 forward_zone_was_created = False
             zone_id_by_name[zname] = zid
             created["forward_zones"].append({"id": zid, "name": zname, "created": was_created})
+        fresh_reverse_zones: list[str] = []
         for rzname in reverse_zones:
             zid, was_created = _get_or_create_zone(api, dns_group_id, rzname, "reverse", log)
             zone_id_by_name[rzname] = zid
+            if was_created:
+                fresh_reverse_zones.append(rzname)
             created["reverse_zones"].append({"id": zid, "name": rzname, "created": was_created})
         log_event(log, logging.INFO, "zones_ready",
                   forward=len(forward_zones), reverse=len(reverse_zones),
@@ -575,42 +656,57 @@ def run(rp: RunPaths, m: manifest_mod.Manifest, log: logging.Logger) -> int:
             _flush()
 
         # ---- 7) Bulk-load the authoritative dataset (§4.9 Layer 1) -----
-        # Skip when the forward zone already existed (i.e. we're re-using a pre-seeded
-        # group from a prior run via SPDDI_PERF_DNS_GROUP_ID). Re-loading would cause
-        # duplicate-record 409s that exceed the 1% failure cap and abort the seeder.
+        # Planned first, unconditionally: the reuse decision below needs to
+        # know how much data this manifest expects, and the plan is local +
+        # deterministic (no API calls).
+        total_records = int(m.seed.dns.authoritative_records)
+        plan = _gen_records(total_records, forward_zone, subnet_cidrs)
+        # Map each record to its target zone id (forward zone or reverse zone).
+        items: list[tuple[str, dict[str, Any]]] = []
+        skipped_no_zone = 0
+        fwd_zone_id = zone_id_by_name.get(forward_zone)
+        for rec in plan:
+            if rec["kind"] == "forward":
+                if fwd_zone_id is None:
+                    skipped_no_zone += 1
+                    continue
+                # name relative to zone: strip the trailing ".<zone>" suffix.
+                items.append((fwd_zone_id, {**rec, "name": rec["name"]}))
+            else:  # reverse PTR
+                rz = _reverse_zone_for_ip(rec["ip"], reverse_zones)
+                rz_id = zone_id_by_name.get(rz) if rz else None
+                if rz_id is None:
+                    skipped_no_zone += 1
+                    continue
+                # PTR name relative to the reverse zone (strip the zone suffix).
+                rel = rec["name"][: -(len(rz) + 1)] if rec["name"].endswith("." + rz) else rec["name"]
+                items.append((rz_id, {**rec, "name": rel}))
+
+        # Re-using a pre-seeded group (SPDDI_PERF_DNS_GROUP_ID): the prior
+        # run's records are still in the zone and re-POSTing them would be
+        # duplicate 409s past the loader's 1% failure cap. Skipping is only
+        # correct when what is already there IS this manifest's dataset —
+        # and the zone NAME cannot tell us that, because every shipped
+        # manifest names the same forward zone. smoke.yaml then
+        # 300k-ceiling.yaml against one group would skip the 300k load,
+        # leave the fresh reverse zones empty, NXDOMAIN every PTR, and exit
+        # 0 reporting a 300k-ceiling result measured on smoke's 10k. So
+        # count what the zone actually holds.
         if not forward_zone_was_created:
+            _assert_reused_dataset_matches(
+                api, dns_group_id, forward_zone, fwd_zone_id,
+                planned_forward=sum(1 for zid, _ in items if zid == fwd_zone_id),
+                fresh_reverse_zones=fresh_reverse_zones, log=log,
+            )
             log_event(log, logging.INFO, "bulk_load_skipped",
                       reason="forward zone already exists in reused group — records from prior seed run",
                       forward_zone=forward_zone)
             created["authoritative_records"].update({
-                "planned": 0, "created": 0, "failed": 0, "skipped_no_zone": 0,
+                "planned": len(items), "created": 0, "failed": 0, "skipped_no_zone": 0,
                 "skipped_reason": "zone_reused",
             })
             loader = None
         else:
-            total_records = int(m.seed.dns.authoritative_records)
-            plan = _gen_records(total_records, forward_zone, subnet_cidrs)
-            # Map each record to its target zone id (forward zone or reverse zone).
-            items: list[tuple[str, dict[str, Any]]] = []
-            skipped_no_zone = 0
-            fwd_zone_id = zone_id_by_name.get(forward_zone)
-            for rec in plan:
-                if rec["kind"] == "forward":
-                    if fwd_zone_id is None:
-                        skipped_no_zone += 1
-                        continue
-                    # name relative to zone: strip the trailing ".<zone>" suffix.
-                    items.append((fwd_zone_id, {**rec, "name": rec["name"]}))
-                else:  # reverse PTR
-                    rz = _reverse_zone_for_ip(rec["ip"], reverse_zones)
-                    rz_id = zone_id_by_name.get(rz) if rz else None
-                    if rz_id is None:
-                        skipped_no_zone += 1
-                        continue
-                    # PTR name relative to the reverse zone (strip the zone suffix).
-                    rel = rec["name"][: -(len(rz) + 1)] if rec["name"].endswith("." + rz) else rec["name"]
-                    items.append((rz_id, {**rec, "name": rel}))
-
             log_event(log, logging.INFO, "bulk_load_start",
                       records_planned=len(items), skipped_no_zone=skipped_no_zone,
                       workers=RECORD_WORKERS,

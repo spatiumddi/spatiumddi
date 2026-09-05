@@ -44,6 +44,7 @@ import spddi_perf.manifest as manifest_mod  # noqa: E402
 import spddi_perf.setpoints as setpoints_mod  # noqa: E402
 from spddi_perf.logging_util import append_ndjson, get_logger, utc_now_iso  # noqa: E402
 from spddi_perf.runpaths import RunPaths  # noqa: E402
+from spddi_perf.zone_names import is_reverse_zone  # noqa: E402
 
 from lifecycle_log import LatencyAccumulator  # noqa: E402
 
@@ -90,7 +91,7 @@ class SyntheticUiProbe:
                 rz = await client.get(
                     f"{self.api}/dns/groups/{self._dns_group_id}/zones")
                 zones = rz.json() if rz.status_code == 200 else []
-                fwd = [z for z in zones if not str(z.get("name", "")).endswith(".arpa")]
+                fwd = [z for z in zones if not is_reverse_zone(str(z.get("name", "")))]
                 pick = fwd or zones
                 if pick:
                     self._dns_zone_id = pick[0]["id"]
