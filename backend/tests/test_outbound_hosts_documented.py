@@ -120,6 +120,17 @@ def test_exactly_one_connection_is_enabled_by_default() -> None:
     assert len(rows) == 2, (
         f"§3.1 has {len(rows) - 1} default-on connection(s), expected 1. Adding one "
         "is a product decision (CLAUDE.md non-negotiable #17), and the README, the "
-        "docs hero and Settings → Platform all state there is exactly one."
+        "docs hero and Settings → Application → Updates all state there is exactly one."
     )
-    assert "api.github.com" in rows[1], "the one default-on row should be the release check"
+    # Read the first cell's code span and compare it whole. A substring test
+    # would also pass on a row that merely mentions the host in prose — and
+    # CodeQL flags ``"api.github.com" in row`` as incomplete URL sanitization,
+    # correctly in general even though nothing is being sanitized here.
+    first_cell = re.match(r"\|\s*`([^`]+)`", rows[1])
+    assert (
+        first_cell is not None
+    ), f"§3.1's data row should name its host in a code span, got: {rows[1]!r}"
+    assert first_cell.group(1) == "api.github.com", (
+        f"the one default-on connection should be the release check, "
+        f"not {first_cell.group(1)!r}"
+    )
