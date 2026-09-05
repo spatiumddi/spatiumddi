@@ -314,8 +314,15 @@ separately first:
 
 ```bash
 kubectl apply --server-side -f \
-  https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/release-1.29/releases/cnpg-1.29.1.yaml
+  https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/release-1.30/releases/cnpg-1.30.0.yaml
 ```
+
+> **Match the operator line to your cluster, not to this page.** CNPG
+> publishes a support matrix per minor: 1.30.x covers Kubernetes
+> 1.34-1.36, which is what the appliance ships (k3s v1.36.4+k3s1). On an
+> older cluster, apply the CNPG line whose matrix includes your version
+> instead — a newer operator against an untested Kubernetes is the one
+> combination CNPG will not support.
 
 CNPG creates `<cluster>-rw` (read/write, always the current primary),
 `<cluster>-r` (read, primary + sync replicas), and `<cluster>-ro`

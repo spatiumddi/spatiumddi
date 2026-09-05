@@ -11,7 +11,10 @@ Step shape (one row per step in the issue body):
     1. preflight gate                — reuse Phase A's run_all
     2. etcd snapshot                  — TODO follow-up; relies on k3s
                                         auto-snapshots (every 6 h) until
-                                        the supervisor exposes a hook
+                                        the supervisor exposes a hook.
+                                        Across a Kubernetes MINOR that
+                                        window is the rollback exposure
+                                        — see the step's docstring (#974)
     3. CNPG nodeMaintenanceWindow     — patch_cnpg_maintenance_window
     4. cordon                         — cordon_node (triggers auto-
                                         switchover if primary's here)
@@ -162,13 +165,32 @@ async def _step_etcd_snapshot() -> StepResult:
     """No-op in Phase C v0.
 
     k3s auto-snapshots run every 6 h via ``--etcd-snapshot-schedule-cron``
-    — there's always a recent snapshot on disk we can fall back to in
-    a recovery scenario. A *fresh* snapshot before each node upgrade is
-    cheap insurance per the issue body but requires shell access to a
-    k3s control-plane host, which the api pod doesn't have today.
-    Follow-up: add ``POST /v1/snapshot`` to the supervisor + call it
-    from here. Skipping with a structured comment in the step log
-    rather than silently dropping the contract.
+    (``appliance/mkosi.extra/etc/rancher/k3s/config.yaml``, retention 8),
+    so there is always a recent snapshot on disk to fall back to. A
+    *fresh* snapshot before each node upgrade needs shell access to a
+    k3s control-plane host, which the api pod does not have: the
+    supervisor has no inbound HTTP, so it would take the trigger-file →
+    systemd ``.path`` → host-runner shape the pcap and firewall planes
+    use. Skipping with a structured comment in the step log rather than
+    silently dropping the contract.
+
+    **This mattered more from the k3s v1.36 bump on (#974).** Every
+    earlier bump was same-minor, where an A/B slot revert is a real
+    rollback. Across a Kubernetes MINOR it is not: the k3s datastore
+    lives on persistent ``/var``, outside the slot, and an older
+    apiserver is not supported against a store a newer one has written.
+    So the rollback for a minor is slot revert **plus** an etcd restore
+    from before the upgrade, which makes the age of the newest snapshot
+    part of the upgrade's safety rather than a nicety. Until this step
+    creates one, the exposure is up to the 6 h cron interval, and
+    ``docs/deployment/APPLIANCE.md`` §5d tells the operator to take a
+    manual snapshot before a minor.
+
+    Follow-up (#296), cheaper than it looks: the seed already reports
+    ``k3s etcd-snapshot list`` on every heartbeat into
+    ``Appliance.etcd_snapshots`` (name / location / size /
+    ``created_at``), so *verifying* a recent snapshot needs no new
+    mechanism at all — only *creating* one does.
     """
     step = StepResult(name="etcd_snapshot", started_at=_now_iso())
     return step.finish(
@@ -176,7 +198,9 @@ async def _step_etcd_snapshot() -> StepResult:
         skipped=True,
         reason=(
             "supervisor-driven snapshot not yet exposed; relying on "
-            "k3s auto-snapshots (every 6 h). Follow-up tracked in #296."
+            "k3s auto-snapshots (every 6 h). Follow-up tracked in #296. "
+            "Across a Kubernetes minor, rollback is slot revert + etcd "
+            "restore — take a manual snapshot first (#974)."
         ),
     )
 

@@ -1411,6 +1411,93 @@ so a first-time operator never gets stuck looking for the upload.
    `aborted`). Lease is released. The OS Versions tab shows the new
    default slot on every node.
 
+**Rolling back, and why a Kubernetes minor is different (#974).**
+
+For a same-minor release an **A/B slot revert is a rollback**: boot the
+previous slot and the node is as it was. Across a Kubernetes *minor* it
+is not, and the difference is easy to miss because the slot machinery
+behaves identically.
+
+The k3s datastore (`/var/lib/rancher/k3s`) lives on the persistent
+`/var`, **outside the A/B slot**. Booting a slot that carries the older
+k3s therefore starts an older apiserver against a datastore the newer
+one has already written to — which Kubernetes does not support and does
+not detect for you. The slot revert succeeds and the cluster is the
+thing that is broken.
+
+So for a minor bump the rollback is **slot revert *plus* an etcd restore
+from a snapshot taken before the upgrade** — and the order and the
+vantage both matter.
+
+**The Fleet UI path only works while the control plane still serves.**
+Fleet → Control plane → etcd snapshots drives the restore through the
+api pod → the seed's heartbeat → a host trigger file, so every hop
+needs the very cluster you are recovering to be up. Use it while things
+still work: on a partial rollout, or when you have decided to abandon
+the upgrade before the cluster is unhealthy. Once the apiserver is down,
+it is not available and the console is the only vantage.
+
+**From the console, the order is revert first, restore second** — the
+restore has to be performed by the k3s binary you intend to keep
+running, and the pre-upgrade snapshot was written by the older one:
+
+1. Revert the slot: **OS Versions → set the previous slot as default**,
+   or from the console `spatiumddi-slot-rollback`, then reboot.
+2. The node comes up on the older k3s against a datastore the newer one
+   wrote. Expect k3s to be unhealthy here — that is the state you are
+   fixing, not a new fault. Stop it: `systemctl stop k3s`.
+3. Restore a **pre-upgrade** snapshot. `ls
+   /var/lib/rancher/k3s/server/db/snapshots` lists what is on the node;
+   pick one from before the upgrade window. Then either drive the
+   shipped runner:
+
+   ```bash
+   # 2 lines: the confirm marker, then the snapshot name.
+   printf 'SPATIUMDDI-CLUSTER-RESTORE-CONFIRM-V1\n%s\n' "<snapshot-name>" \
+     > /var/lib/spatiumddi/release-state/cluster-restore-pending
+   # the spatiumddi-cluster-restore.path unit fires the runner
+   journalctl -fu spatiumddi-cluster-restore   # or: tail -f /var/log/spatiumddi/cluster-restore.log
+   ```
+
+   …or run the underlying k3s command yourself, which is what the runner
+   wraps:
+
+   ```bash
+   k3s server --cluster-reset \
+     --cluster-reset-restore-path=/var/lib/rancher/k3s/server/db/snapshots/<snapshot-name>
+   systemctl start k3s
+   ```
+
+   The runner is the better default — it reaps orphaned containerd
+   shims, resets the systemd start counter, waits for Ready, and writes
+   the state sidecar the supervisor reports back. The raw command is the
+   fallback if the `.path` unit is not running.
+
+> ⚠️ **The restore is a single-node cluster reset.** k3s collapses to a
+> 1-member etcd from the snapshot and every *other* control-plane node
+> is orphaned and has to be re-paired through the Replace flow. Plan a
+> multi-node rollback as a rebuild of the other members, not as a
+> per-node undo — and do the revert + restore on **one** node, then
+> re-pair the rest.
+
+**Take a manual snapshot before starting a minor upgrade.** Automatic
+snapshots run on `etcd-snapshot-schedule-cron: "0 */6 * * *"` with
+`etcd-snapshot-retention: 8`, so the newest one can be almost six hours
+old — six hours of DNS, DHCP and IPAM changes that a restore would
+discard. The pre-upgrade snapshot step in the rolling-upgrade primitive
+(step 2) is still a documented no-op: creating one needs a host-side
+runner the supervisor does not expose yet (tracked in #296). Until it
+lands, that step is the operator's, and on an appliance it is
+`k3s etcd-snapshot save` on the seed. Preflight does check the age for
+you — the `etcd_snapshot_freshness` row warns when the newest snapshot
+the seed has reported is older than the cron interval, or when there is
+none — but it can only report; taking one is still a manual step, and
+nothing can tell preflight whether a given target crosses a Kubernetes
+minor (the target is a CalVer tag; the k3s it bakes is not known until
+the image boots). Read the release notes.
+
+Same-minor bumps are unaffected — revert the slot and you are done.
+
 **Air-gap operator workflow (TL;DR):**
 
 ```

@@ -154,12 +154,20 @@ METALLB_IMAGES=(
 # The operator runs from the spatiumddi-appliance chart's cnpg subchart;
 # the runtime image is what each Cluster instance pod runs. Both MUST be
 # baked or a fresh airgap install can't bring postgres up.
-#   * operator tag = cloudnative-pg chart 0.28.2 appVersion (1.29.1).
+#   * operator tag = cloudnative-pg chart 0.29.0 appVersion (1.30.0).
 #   * runtime tag  = charts/spatiumddi values.yaml postgresql.cnpg.imageName.
-# KEEP in lock-step with charts/spatiumddi-appliance/charts/cloudnative-pg-*.tgz
-# (appVersion) and charts/spatiumddi/values.yaml (cnpg.imageName).
+# KEEP in lock-step with the subchart pin in
+# charts/spatiumddi-appliance/Chart.yaml (dependencies[].version) and
+# charts/spatiumddi/values.yaml (cnpg.imageName). The chart VERSION is
+# what that file pins; the operator tag here is its appVersion, which is
+# a different number and is not written down anywhere tracked — the
+# vendored tarball and Chart.lock that carry it are both gitignored
+# (see .gitignore: charts/**/charts/, charts/**/Chart.lock). Read it back
+# after a bump with:
+#   helm dependency update charts/spatiumddi-appliance
+#   helm show chart charts/spatiumddi-appliance/charts/cloudnative-pg-*.tgz | grep appVersion
 CNPG_IMAGES=(
-    "ghcr.io/cloudnative-pg/cloudnative-pg:1.29.1"
+    "ghcr.io/cloudnative-pg/cloudnative-pg:1.30.0"
     "ghcr.io/cloudnative-pg/postgresql:16"
 )
 

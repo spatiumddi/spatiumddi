@@ -863,6 +863,8 @@ ask_k3s_cidrs() {
     log "Step: ask_k3s_cidrs"
     if [ -n "${PRESEED_HAS_K3S:-}" ]; then
         if [ -n "${PRESEED_HAS_NETWORK:-}" ]; then
+            K3S_POD_CIDR=$(_k3s_cidr_canonical "$K3S_POD_CIDR")
+            K3S_SERVICE_CIDR=$(_k3s_cidr_canonical "$K3S_SERVICE_CIDR")
             log "Preseed: k3s pod=$K3S_POD_CIDR svc=$K3S_SERVICE_CIDR (skipping prompt)"
             return 0
         fi
@@ -874,6 +876,8 @@ ask_k3s_cidrs() {
         # fix it (this only happens on a partial, already-interactive
         # run — never a fully-unattended one).
         if _validate_k3s_cidrs "$K3S_POD_CIDR" "$K3S_SERVICE_CIDR"; then
+            K3S_POD_CIDR=$(_k3s_cidr_canonical "$K3S_POD_CIDR")
+            K3S_SERVICE_CIDR=$(_k3s_cidr_canonical "$K3S_SERVICE_CIDR")
             log "Preseed: k3s CIDRs validated against interactive network (skipping prompt)"
             return 0
         fi
@@ -893,8 +897,10 @@ ask_k3s_cidrs() {
             14 70 "$K3S_SERVICE_CIDR" 3>&1 1>&2 2>&3) \
             || return 1
         if _validate_k3s_cidrs "$pod" "$svc"; then
-            K3S_POD_CIDR="$pod"
-            K3S_SERVICE_CIDR="$svc"
+            # Store the masked form, not the typed one — see
+            # _k3s_cidr_canonical (#974).
+            K3S_POD_CIDR=$(_k3s_cidr_canonical "$pod")
+            K3S_SERVICE_CIDR=$(_k3s_cidr_canonical "$svc")
             return 0
         fi
         # _validate_k3s_cidrs already showed the operator a msgbox
@@ -902,8 +908,14 @@ ask_k3s_cidrs() {
         # operator's just-typed values pre-filled so they don't lose
         # them. Set the running defaults to what they typed so the
         # next prompt-iteration's inputbox shows those values.
-        K3S_POD_CIDR="$pod"
-        K3S_SERVICE_CIDR="$svc"
+        # Canonicalised like every other commit point: the value that
+        # failed is not necessarily the one that was wrong (a pod/svc
+        # overlap fails both), and pre-filling the masked form shows the
+        # operator what their host-bits-set entry actually meant.
+        # _k3s_cidr_canonical passes an unparseable string through, so a
+        # typo is still shown back verbatim to be corrected.
+        K3S_POD_CIDR=$(_k3s_cidr_canonical "$pod")
+        K3S_SERVICE_CIDR=$(_k3s_cidr_canonical "$svc")
     done
 }
 
@@ -991,6 +1003,29 @@ _validate_k3s_cidrs() {
     whiptail --backtitle "$BACKTITLE" --title "k3s networking — invalid" \
         --msgbox "$err\n\nPress OK to fix." 14 72 || true
     return 1
+}
+
+# Helper: canonicalise a CIDR — mask off any host bits the operator
+# typed (``10.42.0.5/16`` → ``10.42.0.0/16``) and normalise the spelling.
+# Prints the input unchanged if it does not parse; the validator above is
+# what refuses those, and a canonicaliser is not the place to fail.
+#
+# Why (#974): the validator parses with ``strict=False``, which masks for
+# the purposes of the overlap checks and then throws the masked value
+# away — the operator's literal string is what reached ``config.yaml``.
+# The effective network was always the masked one, so the file recorded
+# something that was never what the cluster ran. Kubernetes 1.36 turns
+# that from untidy into risky: ``StrictIPCIDRValidation`` is on by
+# default and rejects host-bits-set CIDRs in core API objects, and the
+# apiserver derives a ``ServiceCIDR`` object from
+# ``--service-cluster-ip-range``. Writing the canonical form removes the
+# question.
+_k3s_cidr_canonical() {
+    python3 - "$1" <<'PY' 2>/dev/null || printf '%s' "$1"
+import ipaddress
+import sys
+print(str(ipaddress.ip_network(sys.argv[1], strict=False)), end="")
+PY
 }
 
 # Helper: compute the cluster-dns IP from the chosen service CIDR.

@@ -38,7 +38,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 OUT="${OUT:-$(mktemp -d)}"
-K8S_VERSION="${K8S_VERSION:-1.31.0}"
+K8S_VERSION="${K8S_VERSION:-1.36.0}"
 # Group/kind/version-templated so any CRD in the catalog resolves; the one
 # we render today is postgresql.cnpg.io/Cluster.
 CRD_SCHEMAS='https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'

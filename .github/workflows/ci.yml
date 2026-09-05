@@ -477,7 +477,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ${{ runner.temp }}/kubeconform-schemas
-          key: kubeconform-schemas-v0.8.0-k8s-1.31.0-${{ hashFiles('.github/scripts/charts-render-check.sh') }}
+          key: kubeconform-schemas-v0.8.0-k8s-1.36.0-${{ hashFiles('.github/scripts/charts-render-check.sh') }}
 
       - name: Lint, render and validate both charts
         env:
