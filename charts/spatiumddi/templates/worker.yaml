@@ -1,3 +1,4 @@
+{{- $kubeletCA := .Values.api.kubeletCA -}}
 {{- $cmp := "worker" -}}
 apiVersion: apps/v1
 kind: Deployment
@@ -21,6 +22,7 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
     spec:
+      {{- include "spatiumddi.hostUsers" (dict "value" .Values.worker.hostUsers "conflict" (.Values.api.applianceHostMounts.enabled) "workload" "worker" "why" "the appliance host mounts are on, and the worker WRITES packet captures into the shared pcap hostPath") | nindent 6 }}
       {{- with (include "spatiumddi.priorityClassName" (dict "component" .Values.worker.priorityClassName "fallback" (.Values.global).priorityClassName)) }}
       priorityClassName: {{ . | quote }}
       {{- end }}
@@ -30,6 +32,12 @@ spec:
           type: {{ . }}
       {{- end }}
       terminationGracePeriodSeconds: 60
+      {{- if .Values.worker.serviceAccount.enabled }}
+      # #983 Phase 2 — alert evaluation runs HERE, not in the api, so the
+      # node_pressure rule needs the worker to be able to read the kubelet
+      # Summary API. Narrow grant; see worker-rbac.yaml.
+      serviceAccountName: {{ include "spatiumddi.fullname" . }}-worker
+      {{- end }}
       {{- with .Values.image.pullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -61,6 +69,13 @@ spec:
             - {{ .Values.worker.queues | quote }}
           env:
             {{- include "spatiumddi.commonEnv" . | nindent 12 }}
+            {{- if $kubeletCA.enabled }}
+            # #983 Phase 2 — the worker runs alert evaluation, so it makes the
+            # same direct kubelet call the api does and needs the same CA.
+            # One values key for both; two would drift.
+            - name: SPATIUM_KUBELET_CA_PATH
+              value: {{ $kubeletCA.mountPath | quote }}
+            {{- end }}
           # Worker has no HTTP listener — Celery-native ping over the
           # broker confirms this specific worker is alive. Using
           # ``$HOSTNAME`` scopes the ping to this pod, not any random
@@ -77,20 +92,36 @@ spec:
             failureThreshold: 3
           resources:
             {{- toYaml .Values.worker.resources | nindent 12 }}
-          {{- if .Values.api.applianceHostMounts.enabled }}
+          {{- if or .Values.api.applianceHostMounts.enabled $kubeletCA.enabled }}
           volumeMounts:
+            {{- if $kubeletCA.enabled }}
+            - name: kubelet-ca
+              mountPath: {{ $kubeletCA.mountPath }}
+              subPath: {{ base $kubeletCA.mountPath }}
+              readOnly: true
+            {{- end }}
+            {{- if .Values.api.applianceHostMounts.enabled }}
             # #59 — packet-capture .pcap store. The worker WRITES captures
             # here; the api reads them back on download. Same single-node
             # shared hostPath (firstboot chowns it 1000:1000).
             - name: pcaps
               mountPath: /var/lib/spatiumddi/pcaps
+            {{- end }}
           {{- end }}
-      {{- if .Values.api.applianceHostMounts.enabled }}
+      {{- if or .Values.api.applianceHostMounts.enabled $kubeletCA.enabled }}
       volumes:
+        {{- if $kubeletCA.enabled }}
+        - name: kubelet-ca
+          hostPath:
+            path: {{ $kubeletCA.hostPath }}
+            type: File
+        {{- end }}
+        {{- if .Values.api.applianceHostMounts.enabled }}
         - name: pcaps
           hostPath:
             path: {{ .Values.api.applianceHostMounts.pcapsDir }}
             type: DirectoryOrCreate
+        {{- end }}
       {{- end }}
       {{- include "spatiumddi.controlPlaneNodeSelector" (merge (dict "componentNodeSelector" .Values.worker.nodeSelector) .) | nindent 6 }}
       {{- with .Values.worker.tolerations }}
@@ -98,3 +129,4 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       {{- include "spatiumddi.podAntiAffinity" (merge (dict "component" $cmp "mode" .Values.worker.podAntiAffinity "replicas" .Values.worker.replicas "override" .Values.worker.affinity) .) | nindent 6 }}
+      {{- include "spatiumddi.topologySpreadConstraints" (merge (dict "component" $cmp "mode" .Values.worker.podAntiAffinity "replicas" .Values.worker.replicas "override" .Values.worker.topologySpreadConstraints) .) | nindent 6 }}

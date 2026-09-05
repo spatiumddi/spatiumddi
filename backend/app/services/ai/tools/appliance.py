@@ -437,10 +437,15 @@ class FindClusterMetricsArgs(BaseModel):
         "membership from heartbeats), this reads the cluster *now* via the "
         "api pod's ServiceAccount: per-node CPU / memory / disk from the "
         "kubelet Summary API, pod counts by phase, a per-component workload "
-        "health rollup, and the top pods by CPU + memory. Use to answer "
-        "'how loaded is the appliance?', 'what's eating memory?', or 'are "
-        "all workloads healthy?'. Appliance control plane only; read-only — "
-        "the same data the Cluster → Overview dashboard renders."
+        "health rollup, the top pods by CPU + memory, and per-node PSI "
+        "stall percentages (#983). Use to answer 'how loaded is the "
+        "appliance?', 'what's eating memory?', 'are all workloads healthy?' "
+        "or 'is anything actually WAITING on CPU?' — the last one is what "
+        "utilisation cannot answer, since a node at 70% CPU with a run queue "
+        "and one without look identical by usage alone. A null PSI figure "
+        "means the kubelet did not report it (below Kubernetes 1.36), which "
+        "is NOT the same as no pressure. Appliance control plane only; "
+        "read-only — the same data the Cluster → Overview dashboard renders."
     ),
     args_model=FindClusterMetricsArgs,
     category="admin",
@@ -473,6 +478,12 @@ async def find_cluster_metrics(
     def _pct(used: float | None, cap: float | None) -> float | None:
         return round(100.0 * used / cap, 1) if used is not None and cap else None
 
+    def _psi(block: Any, kind: str) -> float | None:
+        """``avg300`` out of one PSI series, or None when unreported."""
+        series = (block or {}).get(kind) if isinstance(block, dict) else None
+        val = series.get("avg300") if isinstance(series, dict) else None
+        return round(float(val), 1) if isinstance(val, (int, float)) else None
+
     nodes = [
         {
             "name": n["name"],
@@ -481,6 +492,13 @@ async def find_cluster_metrics(
             "cpu_pct": _pct(n.get("cpu_usage_cores"), n.get("cpu_capacity_cores")),
             "mem_pct": _pct(n.get("memory_working_set_bytes"), n.get("memory_capacity_bytes")),
             "pods_running": n.get("pods_running"),
+            # #983 Phase 2 — the share of the last 5 minutes something spent
+            # stalled. ``some`` = at least one task blocked; memory ``full``
+            # = every runnable task blocked. null = not reported, never zero.
+            "cpu_stall_pct_5m": _psi(n.get("psi_cpu"), "some"),
+            "mem_stall_pct_5m": _psi(n.get("psi_memory"), "some"),
+            "mem_full_stall_pct_5m": _psi(n.get("psi_memory"), "full"),
+            "io_stall_pct_5m": _psi(n.get("psi_io"), "some"),
         }
         for n in snap.get("nodes", [])
     ]
@@ -494,6 +512,9 @@ async def find_cluster_metrics(
         "kubelet_version": snap["kubelet_version"],
         "is_ha": snap["is_ha"],
         "metrics_available": snap["metrics_available"],
+        # Which transport served the kubelet Summary API, and why the direct
+        # one is off if it is (#983 Phase 2 item 6).
+        "kubelet_transport": snap.get("kubelet_transport"),
         "cluster_cpu_pct": _pct(snap.get("cpu_usage_cores"), snap.get("cpu_capacity_cores")),
         "cluster_mem_pct": _pct(
             snap.get("memory_working_set_bytes"), snap.get("memory_capacity_bytes")

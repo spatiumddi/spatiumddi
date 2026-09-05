@@ -119,7 +119,7 @@ def _summary(node: str = "ddi1") -> dict:
     }
 
 
-def _patch_kube(monkeypatch, *, node_status=200, summary_status=200) -> None:
+def _patch_kube(monkeypatch, *, node_status=200, summary_status=200, nodes=1) -> None:
     pods = [
         _pod("spatium-control-spatiumddi-api-x", comp="api"),
         _pod("spatium-control-spatiumddi-worker-y", comp="worker"),
@@ -136,7 +136,7 @@ def _patch_kube(monkeypatch, *, node_status=200, summary_status=200) -> None:
         "app.services.appliance.k8s.list_nodes",
         lambda label_selector=None: (
             node_status,
-            [_node()] if node_status == 200 else [],
+            [_node(f"ddi{i + 1}") for i in range(nodes)] if node_status == 200 else [],
         ),
     )
     monkeypatch.setattr(
@@ -145,9 +145,12 @@ def _patch_kube(monkeypatch, *, node_status=200, summary_status=200) -> None:
     )
     monkeypatch.setattr(
         "app.services.appliance.k8s.get_node_stats_summary",
-        lambda name: (
+        # #983 Phase 2 item 6 — the caller now hands over the node IP so the
+        # direct kubelet transport can be tried before the apiserver proxy.
+        lambda name, node_ip=None: (
             summary_status,
             _summary(name) if summary_status == 200 else None,
+            "direct",
         ),
     )
 
@@ -344,3 +347,151 @@ async def test_health_endpoint_merges_host_partitions(
     root = next(p for p in node["host_disk_partitions"] if p["mount"] == "/")
     assert root["label"] == "OS (root slot)"
     assert root["total_bytes"] == 8_000_000_000
+
+
+# ── PSI (#983 Phase 2 item 7) ───────────────────────────────────────────────
+#
+# The whole point of these is the null/zero distinction. A kubelet below 1.36
+# reports no PSI at all; a 1.36 kubelet on an idle node reports 0.0. Those are
+# opposite facts — "we don't know" versus "nothing is stalling" — and every
+# surface downstream (the node card, the alert matcher, the copilot tool)
+# branches on it, so flattening one into the other here would be invisible and
+# wrong everywhere at once.
+
+
+def _psi(some: float, full: float = 0.0) -> dict:
+    return {
+        "some": {"total": 1, "avg10": some, "avg60": some, "avg300": some},
+        "full": {"total": 1, "avg10": full, "avg60": full, "avg300": full},
+    }
+
+
+def test_psi_absent_parses_to_none_not_zero() -> None:
+    """The pre-1.36 shape — no ``psi`` key anywhere."""
+    stats = cluster_health._parse_node_stats(_summary())
+    assert stats["psi_cpu"] is None
+    assert stats["psi_memory"] is None
+    assert stats["psi_io"] is None
+
+
+def test_psi_zero_is_reported_as_zero() -> None:
+    """A 1.36 kubelet on an idle node. Must NOT come back as None."""
+    summary = _summary()
+    summary["node"]["cpu"]["psi"] = _psi(0.0)
+    stats = cluster_health._parse_node_stats(summary)
+    assert stats["psi_cpu"] is not None
+    assert stats["psi_cpu"]["some"]["avg300"] == 0.0
+
+
+def test_psi_parsed_for_cpu_memory_and_io() -> None:
+    summary = _summary()
+    summary["node"]["cpu"]["psi"] = _psi(12.5)
+    summary["node"]["memory"]["psi"] = _psi(3.25, full=1.5)
+    summary["node"]["io"] = {"psi": _psi(0.75)}
+    stats = cluster_health._parse_node_stats(summary)
+    assert stats["psi_cpu"]["some"]["avg10"] == 12.5
+    assert stats["psi_memory"]["full"]["avg300"] == 1.5
+    assert stats["psi_io"]["some"]["avg60"] == 0.75
+
+
+def test_psi_partial_window_set_keeps_what_it_has() -> None:
+    """Tolerate a kubelet that reports fewer windows than we expect rather
+    than discarding the reading — this is an unversioned wire shape."""
+    summary = _summary()
+    summary["node"]["cpu"]["psi"] = {"some": {"avg10": 4.0}}
+    stats = cluster_health._parse_node_stats(summary)
+    assert stats["psi_cpu"]["some"] == {"avg10": 4.0}
+    assert stats["psi_cpu"].get("full") is None
+
+
+@pytest.mark.parametrize("junk", [None, [], "psi", {}, {"some": "nope"}, {"some": {}}])
+def test_psi_junk_is_none(junk) -> None:
+    """An unusable block must not become a half-populated reading."""
+    assert cluster_health._parse_psi(junk) is None
+
+
+def test_psi_reaches_the_node_row(monkeypatch) -> None:
+    def _with_psi(node: str = "ddi1") -> dict:
+        s = _summary(node)
+        s["node"]["cpu"]["psi"] = _psi(41.0)
+        return s
+
+    _patch_kube(monkeypatch)
+    monkeypatch.setattr(
+        "app.services.appliance.k8s.get_node_stats_summary",
+        lambda name, node_ip=None: (200, _with_psi(name), "direct"),
+    )
+    snap = cluster_health.get_cluster_health()
+    assert snap["nodes"][0]["psi_cpu"]["some"]["avg300"] == 41.0
+    assert snap["nodes"][0]["psi_memory"] is None
+
+
+def test_node_ip_is_handed_to_the_summary_fetch(monkeypatch) -> None:
+    """Item 6's plumbing: without the IP the direct kubelet transport can
+    never be tried and the broad ``nodes/proxy`` grant can never be retired."""
+    seen: list[tuple[str, str | None]] = []
+
+    def _capture(name, node_ip=None):
+        seen.append((name, node_ip))
+        return 200, _summary(name), "direct"
+
+    _patch_kube(monkeypatch)
+    monkeypatch.setattr("app.services.appliance.k8s.get_node_stats_summary", _capture)
+    cluster_health.get_cluster_health()
+    assert seen and seen[0][1] == "192.168.0.199"
+
+
+# ── kubelet transport report (#983 Phase 2 item 6) ──────────────────────────
+
+
+def _patch_transport(monkeypatch, per_node: dict[str, str], reasons=None) -> None:
+    _patch_kube(monkeypatch)
+    monkeypatch.setattr(
+        "app.services.appliance.k8s.get_node_stats_summary",
+        lambda name, node_ip=None: (200, _summary(name), per_node.get(name, "direct")),
+    )
+    monkeypatch.setattr("app.services.appliance.k8s.kubelet_block_reasons", lambda: reasons or {})
+
+
+def test_transport_all_direct_is_the_go_ahead(monkeypatch) -> None:
+    _patch_transport(monkeypatch, {"ddi1": "direct"})
+    t = cluster_health.get_cluster_health()["kubelet_transport"]
+    assert t["all_direct"] is True
+    assert (t["direct_nodes"], t["proxy_nodes"]) == (1, 0)
+    assert t["by_node"] == {"ddi1": "direct"}
+
+
+def test_transport_reports_per_node_not_last_wins(monkeypatch) -> None:
+    """One value would report whichever node was processed last — reading
+    'direct' while another node was quietly served by the proxy, which is the
+    exact wrong answer to 'can I drop the broad grant?'."""
+    _patch_kube(monkeypatch, nodes=2)
+    per = {"ddi1": "direct", "ddi2": "proxy"}
+    monkeypatch.setattr(
+        "app.services.appliance.k8s.get_node_stats_summary",
+        lambda name, node_ip=None: (200, _summary(name), per[name]),
+    )
+    monkeypatch.setattr(
+        "app.services.appliance.k8s.kubelet_block_reasons",
+        lambda: {"192.168.0.199": "kubelet returned HTTP 403 (nodes/stats grant?)"},
+    )
+    t = cluster_health.get_cluster_health()["kubelet_transport"]
+    assert t["all_direct"] is False
+    assert (t["direct_nodes"], t["proxy_nodes"]) == (1, 1)
+    assert t["by_node"] == per
+
+
+def test_transport_reasons_are_keyed_by_node_name(monkeypatch) -> None:
+    """k8s.py tracks blocks by IP because that is what it connects to; the
+    report has to name nodes or an operator cannot act on it."""
+    _patch_transport(monkeypatch, {"ddi1": "proxy"}, reasons={"192.168.0.199": "bad CA"})
+    t = cluster_health.get_cluster_health()["kubelet_transport"]
+    assert t["blocked_reasons"] == {"ddi1": "bad CA"}
+
+
+def test_transport_all_direct_is_false_when_nothing_was_probed(monkeypatch) -> None:
+    """Measuring nothing must never read as 'safe to drop the grant'."""
+    assert (
+        cluster_health.cluster_unavailable("kubeapi down")["kubelet_transport"]["all_direct"]
+        is False
+    )

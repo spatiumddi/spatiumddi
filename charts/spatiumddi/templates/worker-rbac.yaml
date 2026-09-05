@@ -1,0 +1,74 @@
+{{/*
+#983 Phase 2 item 7 — a ServiceAccount for the Celery worker.
+
+WHY THE WORKER NEEDS ONE AT ALL. Alert evaluation runs in the worker
+(``app.tasks.alerts`` → ``services.alerts.evaluate_all``), not in the api.
+The ``node_pressure`` rule reads PSI out of the kubelet Summary API, so
+without a mounted ServiceAccount the worker's ``get_config()`` returns None,
+every fetch reports the cluster unavailable, and the rule can never fire —
+it would have shipped as dead code that looked enabled in the Alerts UI.
+
+The grant is deliberately MUCH narrower than the api's. The worker gets:
+
+  * ``nodes [get, list]``  — enumerate the cluster's nodes.
+  * ``nodes/stats [get]``  — the Summary API on each kubelet, and nothing
+                             else on the kubelet (#983 item 6).
+  * optionally ``nodes/proxy [get]`` while the fallback transport is on.
+
+It does NOT get pods/eviction, HelmChartConfig patch, Secret write, or
+node patch — everything the api's upgrade-orchestrator role carries. Sharing
+the api's ServiceAccount would have been one line and would have handed the
+widest task surface in the product the ability to cordon nodes and evict
+pods.
+
+``get_cluster_health`` also lists pods cluster-wide, which is NOT granted
+here: that call already degrades to an empty pod list on a non-200, and the
+node PSI the rule reads does not depend on it. So the worker sees nodes
+without pod detail, which is exactly what it needs and no more.
+*/}}
+{{- if .Values.worker.serviceAccount.enabled }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "spatiumddi.fullname" . }}-worker
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" "worker") .) | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "spatiumddi.fullname" . }}-worker-node-metrics
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" "worker") .) | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["nodes/stats"]
+    verbs: ["get"]
+  {{- if .Values.api.upgradeOrchestratorRBAC.kubeletProxyFallback }}
+  # Same fallback the api carries, and the same reason it is still here —
+  # see api-rbac.yaml. Drops out with the api's when the direct transport is
+  # confirmed on a cluster.
+  - apiGroups: [""]
+    resources: ["nodes/proxy"]
+    verbs: ["get"]
+  {{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "spatiumddi.fullname" . }}-worker-node-metrics
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" "worker") .) | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "spatiumddi.fullname" . }}-worker
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "spatiumddi.fullname" . }}-worker-node-metrics
+{{- end }}

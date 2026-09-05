@@ -872,6 +872,18 @@ spec:
       applianceHostMounts:
         enabled: true
     worker:
+      # #983 Phase 2 — alert evaluation runs in the WORKER, not the api, so
+      # the node_pressure PSI rule needs a ServiceAccount here or it
+      # evaluates to nothing forever while sitting enabled in the Alerts UI.
+      # The appliance is the ONLY place that rule can fire (it gates on
+      # appliance_mode), so leaving this off would make the rule dead
+      # everywhere it matters.
+      #
+      # Much narrower than the api's: nodes read + nodes/stats, and none of
+      # the eviction / node-patch / Secret-write the orchestrator role
+      # carries. See charts/spatiumddi/templates/worker-rbac.yaml.
+      serviceAccount:
+        enabled: true
       replicas: 1  # spatium:cp-size
       # #590 — one worker per control-plane node; see api.podAntiAffinity.
       podAntiAffinity: hard

@@ -242,3 +242,29 @@ def test_the_gate_negative_control() -> None:
         "the one legitimate release moved or was renamed — the scan in the "
         "test above keys off exactly this shape and would now pass vacuously"
     )
+
+
+# ── the worker ServiceAccount (#983 Phase 2 item 7) ─────────────────────────
+
+
+def test_worker_gets_a_service_account(tmp_path: Path) -> None:
+    """Alert evaluation runs in the WORKER. Without a ServiceAccount mounted
+    there the node_pressure PSI rule evaluates to nothing forever while
+    sitting enabled in the Alerts UI — and the appliance is the only place
+    that rule can fire at all, so this overlay is what makes it real rather
+    than merely possible."""
+    values = _control_values(_written(tmp_path))
+    assert values["worker"]["serviceAccount"]["enabled"] is True
+
+
+def test_the_api_service_account_is_untouched(tmp_path: Path) -> None:
+    """The worker's SA is a separate, narrower grant — adding it must not
+    have disturbed the api's, which the Fleet UI and cert flows depend on."""
+    values = _control_values(_written(tmp_path))
+    assert values["api"]["serviceAccount"]["enabled"] is True
+
+
+def _written(tmp_path: Path) -> Path:
+    tgz = tmp_path / "spatiumddi-appliance.tgz"
+    tgz.write_bytes(b"x")
+    return tgz

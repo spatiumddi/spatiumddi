@@ -487,6 +487,89 @@ For the raw manifests under `k8s/`, the `spatiumddi` namespace carries
 report-only — neither can reject a pod — and `enforce` is not usable because
 the DHCP agent needs `hostNetwork` and the DNS agents bind `:53` on the host.
 
+### User namespaces (#983 Phase 2)
+
+`hostUsers: false` (GA in Kubernetes 1.36) maps container root to an
+unprivileged host uid, so a container escape is not root on the node. Exposed
+per workload — `api`, `worker`, `beat`, `redis` — and **unset by default**,
+because a runtime without idmapped-mount support refuses the pod outright:
+
+```yaml
+api:
+  hostUsers: false     # worth most here — this pod runs tcpdump + nmap
+beat:
+  hostUsers: false
+```
+
+Two cautions the chart encodes rather than leaves to discovery:
+
+* `api.hostUsers: false` and `worker.hostUsers: false` are **refused at
+  render time** while `api.applianceHostMounts.enabled` is on. Those host
+  directories are chowned to the image's uid and the pods *write* to them; a
+  user namespace remaps exactly that, which corrupts state rather than
+  failing to start.
+* `redis` owns a PVC. If your StorageClass is backed by a host directory and
+  the runtime does not idmap the mount, the remapped uid cannot read what it
+  wrote before the change. Not refused — a runtime that idmaps correctly makes
+  it safe — but verify on one replica first. Postgres and CNPG are not offered
+  the knob at all for the same reason, only sharper.
+
+### Topology spread (#983 Phase 2)
+
+`api` and `worker` render a `maxSkew: 1` / `kubernetes.io/hostname` /
+`whenUnsatisfiable: ScheduleAnyway` constraint when `podAntiAffinity` is
+`soft` (the default) and `replicas > 1`. `soft` anti-affinity is only a
+*preference*, so without this the scheduler can still stack every replica on
+one node.
+
+`ScheduleAnyway`, not `DoNotSchedule`: the strict form leaves surplus replicas
+permanently Pending on a cluster with fewer ready nodes than replicas, which
+turns a placement preference into an outage. Set `podAntiAffinity: hard` if
+you want the strict behaviour — that path uses required anti-affinity and
+renders no spread constraint.
+
+Supply `<component>.topologySpreadConstraints` to replace the default
+outright; nothing is rendered in `hard`/`none` mode or at `replicas: 1`.
+
+### Kubelet Summary API grants (#983 Phase 2)
+
+The api reads per-node CPU / memory / disk — and, on Kubernetes 1.36+, PSI
+stall percentages — straight from the kubelet Summary API, because the
+appliance ships no metrics-server. Two transports, two very different grants:
+
+| Transport | Grant | Scope of the grant |
+|---|---|---|
+| direct, `:10250` | `nodes/stats [get]` | that one page |
+| apiserver proxy | `nodes/proxy [get]` | read GETs to **every** kubelet endpoint |
+
+Both are granted by default (`api.upgradeOrchestratorRBAC.enabled`). Direct is
+tried first, **per node**, and Cluster → Overview shows a `kubelet:` chip —
+green only when every node went direct, which is the condition for dropping the
+broad grant. Then set
+`api.upgradeOrchestratorRBAC.kubeletProxyFallback: false`.
+
+If a node fell back, `blocked_reasons` names it and why. The common cause is
+the kubelet's serving cert not chaining to the ServiceAccount's CA; set
+`api.kubeletCA.enabled: true` to mount the right bundle and point
+`SPATIUM_KUBELET_CA_PATH` at it:
+
+```yaml
+api:
+  kubeletCA:
+    enabled: true
+    hostPath: /var/lib/rancher/k3s/server/tls/server-ca.crt   # k3s default
+```
+
+The same mount and env reach the worker, which makes the same call.
+
+### The worker needs a ServiceAccount for PSI alerting
+
+Alert evaluation runs in the **Celery worker**, so the `node_pressure` rule
+needs `worker.serviceAccount.enabled: true` — without it the rule sits enabled
+and evaluates to nothing. The grant is narrow (`nodes` read + `nodes/stats`,
+plus `nodes/proxy` while the fallback is on) and shares none of the api's
+eviction / node-patch / Secret-write permissions.
+
 ---
 
 ## 8. Upgrading

@@ -145,17 +145,41 @@ rules:
   - apiGroups: [""]
     resources: ["pods/eviction"]
     verbs: ["create"]
-  # #402 — read-only kubelet Summary API proxy for the Cluster health
-  # screen (per-node + per-pod CPU / memory / fs via
-  # GET /api/v1/nodes/<n>/proxy/stats/summary — the same source the TTY
-  # console uses; the appliance ships no metrics-server / Prometheus).
-  # ``get`` ONLY: this authorizes read GETs to kubelet endpoints, not
-  # exec / attach / run (those need ``create`` on nodes/proxy). Folded
-  # into the orchestrator block because the health screen already needs
-  # the cluster-scoped ``nodes`` read above.
+  # #402 / #983 Phase 2 item 6 — read-only kubelet Summary API for the
+  # Cluster health screen (per-node + per-pod CPU / memory / fs, and since
+  # Kubernetes 1.36 the PSI stall percentages). The appliance ships no
+  # metrics-server / Prometheus, so this response is the only source.
+  #
+  # ``nodes/stats`` is the grant that should survive. Kubernetes 1.36 GA'd
+  # fine-grained kubelet API authorization, so a caller talking to the
+  # kubelet DIRECTLY on :10250 is authorized per-endpoint — this one names
+  # exactly the Summary API and nothing else.
+  - apiGroups: [""]
+    resources: ["nodes/stats"]
+    verbs: ["get"]
+  {{- if .Values.api.upgradeOrchestratorRBAC.kubeletProxyFallback }}
+  # ``nodes/proxy`` is the OLD transport, via the apiserver, and it is much
+  # broader than it looks: ``get`` on it authorizes read GETs to EVERY
+  # kubelet endpoint — /pods, /logs/…, /configz, /debug/… — not just the one
+  # page the health screen wants. (It stops short of exec / attach / run,
+  # which need ``create``.) Retiring it is the entire point of the item.
+  #
+  # It is still granted by default, for one honest reason: whether the
+  # ServiceAccount's CA validates this cluster's kubelet serving cert is a
+  # property of the deployment, and k3s signs kubelet serving certs with its
+  # own ``server-ca``. Nothing in this repo has ever spoken to a kubelet
+  # directly (#983 named the TTY console as a reference; it is not one — it
+  # goes through this same proxy), so the answer was not available at
+  # authoring time. The api tries the direct transport first, falls back
+  # here, and REPORTS which one served: Cluster → Overview, the
+  # ``kubelet_transport`` field, and the ``find_cluster_metrics`` tool.
+  #
+  # Once a cluster shows ``direct``, set this to false. The fallback then
+  # disappears along with the broad grant.
   - apiGroups: [""]
     resources: ["nodes/proxy"]
     verbs: ["get"]
+  {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

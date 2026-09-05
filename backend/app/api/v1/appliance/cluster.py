@@ -51,6 +51,63 @@ class HostPartition(BaseModel):
     used_bytes: int
 
 
+class PSIWindow(BaseModel):
+    """One /proc/pressure line's rolling averages, as percentages of wall time.
+
+    ``avg10`` is the number to look at during an incident; ``avg300`` is the
+    one that separates a burst from a condition.
+    """
+
+    avg10: float | None = None
+    avg60: float | None = None
+    avg300: float | None = None
+
+
+class PSIStats(BaseModel):
+    """``some`` / ``full`` stall shares for one resource (#983 Phase 2).
+
+    ``some`` — at least one task was stalled waiting for the resource.
+    ``full`` — every runnable task was. At node level the kernel reports CPU
+    ``full`` as 0, so a CPU verdict has to read ``some``.
+
+    The whole object is null when the kubelet did not report PSI (pre-1.36,
+    or the feature off). Null is UNRECORDED, never "no pressure" — the two
+    are opposite facts and a panel that conflates them is worse than one that
+    shows nothing.
+    """
+
+    some: PSIWindow | None = None
+    full: PSIWindow | None = None
+
+
+class KubeletTransport(BaseModel):
+    """Which transport served the kubelet Summary API, per node (#983 Phase 2).
+
+    ``direct`` = straight to the kubelet on :10250, authorized by
+    ``nodes/stats``. ``proxy`` = through the apiserver, authorized by
+    ``nodes/proxy``, which grants read access to EVERY kubelet endpoint and is
+    the grant this exists to retire.
+
+    Per node rather than a single value, because a mixed cluster is the
+    dangerous case: one value would report whichever node was processed last,
+    and "direct" while another node fell back is precisely the wrong answer to
+    "can I drop the broad grant?".
+
+    ``all_direct`` is that decision, and it is False when nothing was probed —
+    measuring nothing must never read as safe.
+
+    Reported by whichever api replica served the request. Each replica probes
+    every node within that request, so the map is complete; only the
+    retry-backoff cache is per-replica.
+    """
+
+    by_node: dict[str, str] = {}
+    direct_nodes: int = 0
+    proxy_nodes: int = 0
+    all_direct: bool = False
+    blocked_reasons: dict[str, str] = {}
+
+
 class NodeVitals(BaseModel):
     name: str
     ready: bool
@@ -75,6 +132,10 @@ class NodeVitals(BaseModel):
     memory_available_bytes: int | None = None
     fs_used_bytes: int | None = None
     fs_capacity_bytes: int | None = None
+    # #983 Phase 2 — PSI. null means the kubelet did not report it.
+    psi_cpu: PSIStats | None = None
+    psi_memory: PSIStats | None = None
+    psi_io: PSIStats | None = None
     # #402 — host partitions (root slot / var / ESP) from the supervisor.
     host_disk_partitions: list[HostPartition] = []
 
@@ -114,6 +175,7 @@ class ClusterHealth(BaseModel):
     is_ha: bool
     control_plane_nodes: int
     metrics_available: bool
+    kubelet_transport: KubeletTransport | None = None
     cpu_usage_cores: float | None = None
     cpu_capacity_cores: float | None = None
     memory_working_set_bytes: int | None = None

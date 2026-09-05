@@ -585,3 +585,87 @@ to leave a single workload unranked on a cluster that has a global policy.
 {{- .component -}}
 {{- end -}}
 {{- end -}}
+
+{{/*
+#983 Phase 2 item 8 — topology spread for a replicated control-plane
+workload, umbrella chart only.
+
+Only meaningful in ``soft`` anti-affinity mode. ``preferred`` anti-affinity
+is a *preference*: the scheduler weighs it against everything else and can
+still land three api replicas on one node, which is the whole failure the
+replica count exists to avoid. ``maxSkew: 1`` with
+``whenUnsatisfiable: ScheduleAnyway`` is a second, differently-shaped push
+toward one-per-node that still degrades to "schedule it somewhere" rather
+than leaving a replica Pending.
+
+Emitted for NEITHER of the other two modes, on purpose:
+
+  * ``hard`` already pins one replica per node with required anti-affinity —
+    the appliance's shape (#590), where replicas track the control-plane node
+    count exactly. A spread constraint there is inert at best.
+  * ``none`` means the operator has taken placement into their own hands.
+
+Also skipped at ``replicas: 1``, where there is nothing to spread, and
+whenever the operator supplied their own ``topologySpreadConstraints`` —
+this augments a default, it never overrides an explicit choice.
+
+``ScheduleAnyway`` rather than ``DoNotSchedule`` is the load-bearing part:
+DoNotSchedule on a cluster with fewer ready nodes than replicas leaves the
+surplus permanently Pending, which converts a placement preference into an
+outage. Operators who want the strict form set ``hard``.
+*/}}
+{{- define "spatiumddi.topologySpreadConstraints" -}}
+{{- $mode := default "soft" .mode -}}
+{{- if .override -}}
+topologySpreadConstraints:
+  {{- toYaml .override | nindent 2 }}
+{{- else if and (gt (int .replicas) 1) (eq $mode "soft") -}}
+{{- $selector := dict "matchLabels" (include "spatiumddi.componentSelectorLabels" . | fromYaml) -}}
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector:
+      {{- toYaml $selector | nindent 6 }}
+{{- end -}}
+{{- end -}}
+
+{{/*
+#983 Phase 2 item 5 — user namespaces (``hostUsers: false``, GA in
+Kubernetes 1.36). Container root maps to an unprivileged host uid, so an
+escape from the pod is not root on the node.
+
+Default UNSET everywhere and it must stay that way in this chart: a
+bring-your-own cluster may run a runtime without idmapped-mount support, and
+there the pod does not start. Failing to start with a clear event is the
+right failure — but it is still a failure, so it has to be the operator's
+choice, not a chart default.
+
+THE ELIGIBILITY LIST IN #983 IS WRONG ABOUT THE APPLIANCE, and this helper
+is where that gets enforced rather than commented. The issue reasoned that
+``api`` and ``worker`` neither hostNetwork nor hostPath-mount, which is true
+of a plain Kubernetes install and false of an appliance: with
+``api.applianceHostMounts.enabled`` the api bind-mounts five host
+directories (and WRITES the slot-upgrade triggers and the maintenance flag),
+and the worker bind-mounts the shared pcap store. spatiumddi-firstboot
+chowns those 1000:1000 to match the image's uid — a mapping that a user
+namespace changes by definition. That is the same "a wrong uid map corrupts
+data rather than failing to start" hazard the issue reserved for Postgres,
+so the combination is refused outright instead of being left to discover.
+
+A PVC carries a quieter version of the same hazard on the appliance, where
+the StorageClass is local-path and a PVC is a host directory underneath.
+That one is documented at each knob rather than refused: the runtime may
+idmap it correctly, and refusing would leave redis with no way to opt in on
+a cluster where it works.
+
+Args: ``value`` (bool or nil), ``conflict`` (bool), ``workload``, ``why``.
+*/}}
+{{- define "spatiumddi.hostUsers" -}}
+{{- if not (kindIs "invalid" .value) -}}
+{{- if and (not .value) .conflict -}}
+{{- fail (printf "%s.hostUsers=false is refused: %s. A user namespace remaps every uid in the pod, so host files chowned to the image's uid stop being readable — and for a directory the pod WRITES that corrupts state rather than failing to start. Either leave hostUsers unset here, or turn off the host mounts." .workload .why) -}}
+{{- end -}}
+hostUsers: {{ .value }}
+{{- end -}}
+{{- end -}}

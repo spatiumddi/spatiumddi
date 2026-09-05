@@ -50,6 +50,7 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
     spec:
+      {{- include "spatiumddi.hostUsers" (dict "value" .Values.beat.hostUsers "conflict" (false) "workload" "beat" "why" "") | nindent 6 }}
       {{- with (include "spatiumddi.priorityClassName" (dict "component" .Values.beat.priorityClassName "fallback" (.Values.global).priorityClassName)) }}
       priorityClassName: {{ . | quote }}
       {{- end }}
