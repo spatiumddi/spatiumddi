@@ -69,8 +69,20 @@ disable:
 # provider integrations to reconcile.
 disable-cloud-controller: true
 
-# Don't render NetworkPolicy in kube-proxy — single node, no need
-# for inter-pod policies that the CNI plugin would have to enforce.
+# Don't run k3s's NetworkPolicy controller.
+#
+# The rationale used to read "single node, no need" — that stopped being
+# true when #272 made the appliance multi-node. The setting still holds,
+# for different reasons: nothing in either chart renders a NetworkPolicy,
+# so the controller would reconcile an empty set; and it is another
+# always-resident daemon on a node whose floor is 4 GiB.
+#
+# Revisit when we actually ship policies (Kubernetes 1.36 started a
+# NetworkPolicy conformance effort, still alpha). Turning it on later is a
+# config change plus a k3s restart, not a migration — and turning it on
+# BEFORE there are policies to enforce is strictly worse than leaving it
+# off, because an empty policy set changes nothing while the daemon costs
+# memory on every node.
 disable-network-policy: true
 
 # Flannel backend ``host-gw`` writes Linux routes directly instead

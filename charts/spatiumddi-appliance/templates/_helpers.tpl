@@ -43,3 +43,26 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | quote }}
 {{- $tag := default $.global.imageTag .tag -}}
 {{- printf "%s:%s" $repo $tag -}}
 {{- end -}}
+
+{{/*
+#983 — pod-level seccomp profile, shared by every workload this chart
+renders. Mirrors ``spatiumddi.seccompProfileType`` in the umbrella chart;
+duplicated rather than shared because Helm named templates are per-chart
+and the appliance chart is not a subchart of the umbrella.
+
+Kubernetes runs a container ``Unconfined`` unless a profile is asked for,
+while docker-compose applies the runtime's default profile to every
+service — so without this the appliance runs the SAME images with fewer
+syscall restrictions than a Compose install. ``RuntimeDefault`` under
+containerd is the same profile family Compose gets from Docker.
+
+Returns the bare type string, or nothing when disabled.
+*/}}
+{{- define "spatiumddi-appliance.seccompProfileType" -}}
+{{- $t := default "" (.Values.global).seccompProfile -}}
+{{- if and $t (not (has $t (list "RuntimeDefault" "Unconfined"))) -}}
+{{- fail (printf "global.seccompProfile must be \"RuntimeDefault\", \"Unconfined\" or \"\" — got %q. Localhost profiles need a localhostProfile path this chart cannot place on the node." $t) -}}
+{{- end -}}
+{{- $t -}}
+{{- end -}}
+

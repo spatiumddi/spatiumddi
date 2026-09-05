@@ -21,6 +21,14 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
     spec:
+      {{- with (include "spatiumddi.priorityClassName" (dict "component" .Values.api.priorityClassName "fallback" (.Values.global).priorityClassName)) }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
+      {{- with (include "spatiumddi.seccompProfileType" $) }}
+      securityContext:
+        seccompProfile:
+          type: {{ . }}
+      {{- end }}
       terminationGracePeriodSeconds: 30
       {{- if .Values.api.serviceAccount.enabled }}
       # Phase 11 wave 4 (#183) — the api uses kubeapi for two things

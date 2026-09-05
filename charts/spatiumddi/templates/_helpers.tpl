@@ -510,3 +510,65 @@ URL comes from commonEnv.
   env:
     {{- include "spatiumddi.commonEnv" . | nindent 4 }}
 {{- end -}}
+
+{{/*
+#983 — the pod-level seccomp profile applied to every workload this chart
+renders.
+
+Kubernetes runs a container ``Unconfined`` unless a profile is asked for,
+while docker-compose applies the runtime's default profile to every
+service. So without this the SAME container images run with FEWER syscall
+restrictions under Kubernetes than under Compose — a regression, not a
+gap. ``RuntimeDefault`` under containerd is the same profile family
+Compose gets from Docker, which is also why it is low-risk: the raw
+sockets Kea needs, the api's pcap capture (#59) and nmap (#58) all
+already run under it on a Compose install.
+
+Returns the bare type string (or nothing when disabled) so a caller can
+place it inside an existing ``securityContext:`` block or open its own:
+
+    {{- with (include "spatiumddi.seccompProfileType" .) }}
+    securityContext:
+      seccompProfile:
+        type: {{ . }}
+    {{- end }}
+
+``Localhost`` is rejected rather than passed through: it needs a
+``localhostProfile`` path relative to the kubelet's seccomp root, which
+this chart has no way to place on the node. Set the value to ``""`` to
+omit the block entirely (an exotic runtime whose default profile breaks a
+workload) — that restores the pre-#983 behaviour, it does not harden
+anything.
+*/}}
+{{- define "spatiumddi.seccompProfileType" -}}
+{{- $t := default "" (.Values.global).seccompProfile -}}
+{{- if and $t (not (has $t (list "RuntimeDefault" "Unconfined"))) -}}
+{{- fail (printf "global.seccompProfile must be \"RuntimeDefault\", \"Unconfined\" or \"\" — got %q. Localhost profiles need a localhostProfile path this chart cannot place on the node." $t) -}}
+{{- end -}}
+{{- $t -}}
+{{- end -}}
+
+{{/*
+#983 — resolve a workload's PriorityClass name.
+
+Every pod this chart renders is Burstable at priority 0 by default, which
+makes them indistinguishable to two schedulers' worth of ranking:
+kubelet eviction under memory / ephemeral-storage pressure orders victims
+by priority THEN usage-over-request, and scheduler preemption gives a
+pending pod no claim on a full node. With every priority equal, the
+likeliest eviction victim is whichever pod grew the most — on an
+appliance, BIND with a warm cache.
+
+Defaults to empty: a bring-your-own cluster has its own priority policy,
+and naming a PriorityClass that does not exist makes the apiserver
+REJECT the pod outright, so this must never be set speculatively. The
+appliance overlay (spatiumddi-firstboot's spatium-control valuesContent)
+sets ``global.priorityClassName`` to the class the appliance chart
+renders.
+
+Args: ``component`` (the per-workload override) and ``fallback`` (the
+chart-wide default). Returns the resolved name, or nothing.
+*/}}
+{{- define "spatiumddi.priorityClassName" -}}
+{{- default (default "" .fallback) .component -}}
+{{- end -}}

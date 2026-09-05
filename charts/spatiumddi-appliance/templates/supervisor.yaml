@@ -24,6 +24,14 @@ spec:
         app.kubernetes.io/name: spatium-supervisor
         app.kubernetes.io/component: supervisor
     spec:
+      {{- with .Values.supervisor.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
+      {{- with (include "spatiumddi-appliance.seccompProfileType" $) }}
+      securityContext:
+        seccompProfile:
+          type: {{ . }}
+      {{- end }}
       nodeSelector:
         {{- toYaml .Values.global.nodeSelector | nindent 8 }}
       # Pin the resolver so the supervisor's own bootstrap can't be broken by

@@ -31,6 +31,14 @@ spec:
         app.kubernetes.io/name: dhcp-kea
         app.kubernetes.io/component: dhcp-kea
     spec:
+      {{- with .Values.dhcpKea.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
+      {{- with (include "spatiumddi-appliance.seccompProfileType" $) }}
+      securityContext:
+        seccompProfile:
+          type: {{ . }}
+      {{- end }}
       nodeSelector:
         {{- toYaml .Values.global.nodeSelector | nindent 8 }}
         # Phase 10 (#183) — per-role scheduling label. The supervisor

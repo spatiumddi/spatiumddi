@@ -30,8 +30,15 @@ spec:
       labels:
         {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" $cmp) .) | nindent 8 }}
     spec:
+      {{- with (include "spatiumddi.priorityClassName" (dict "component" .Values.redis.priorityClassName "fallback" (.Values.global).priorityClassName)) }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
       terminationGracePeriodSeconds: 30
       securityContext:
+        {{- with (include "spatiumddi.seccompProfileType" $) }}
+        seccompProfile:
+          type: {{ . }}
+        {{- end }}
         # Redis Alpine image runs as 999:999 by default.
         fsGroup: 999
       containers:

@@ -362,6 +362,131 @@ and runtime/airgap pulls need a persistent home.
 
 ---
 
+## Kubernetes posture (#983)
+
+What the appliance's k3s asks for beyond the defaults, and why. Each of
+these is a chart or config setting, not a runtime feature — an operator can
+read the whole posture out of `charts/spatiumddi-appliance/values.yaml` and
+`/etc/rancher/k3s/config.yaml`.
+
+### PriorityClasses
+
+Three cluster-scoped classes, rendered by
+`charts/spatiumddi-appliance/templates/priorityclasses.yaml`:
+
+| Class | Value | Applied to |
+|---|---|---|
+| `spatium-service` | 100000 | `dns-bind9`, `dns-powerdns`, `dns-technitium`, `dhcp-kea`, `looking-glass` |
+| `spatium-control-plane` | 90000 | `api`, `worker`, `beat`, `frontend`, Postgres / CNPG (operator + instances), `redis`, `redis-sentinel`, `supervisor` |
+| `spatium-observability` | 10000 | `kube-state-metrics`, `node-exporter` — plus `preemptionPolicy: Never` |
+
+Before this every pod ran at priority 0, which is not a neutral state: it
+is a *tie*, and the two rankings that break it both do the wrong thing with
+a tie. Kubelet eviction under memory or ephemeral-storage pressure orders
+victims by priority first and usage-over-request second, so with every
+priority equal the pod evicted is whichever grew the most — on this box,
+BIND with a warm cache. Scheduler preemption has the mirror-image gap: a
+role DaemonSet landing on a freshly joined node has no claim over
+kube-state-metrics if the node is already full.
+
+`preemptionPolicy: Never` on the observability class is the one piece that
+is not just ordering: a pending exporter can never evict a running pod to
+schedule itself. Monitoring must not cause the outage it would then report.
+
+All three sit far below Kubernetes' own `system-cluster-critical`
+(2000000000) and `system-node-critical` (2000001000), so k3s's components
+still outrank everything here, and none of them is `globalDefault` — a
+global default would silently re-rank every pod in the cluster, including
+anything an operator joined to it themselves.
+
+`agent-landing` is deliberately left at priority 0: it is a courtesy
+redirect page on an Application appliance, it must not outrank anything,
+and at 0 it is also the natural first eviction candidate. That decision is
+recorded in the CI gate (`--allow-no-priority agent-landing`) rather than
+left implicit.
+
+**Failure mode worth knowing.** A pod naming a PriorityClass that does not
+exist is refused by the apiserver: the Deployment is *accepted* and the
+ReplicaSet controller then cannot create pods, reporting it as an event.
+Running pods are untouched, and the whole thing self-heals the moment the
+class appears. That is why `spatiumddi-firstboot` emits
+`global.priorityClassName` into the `spatium-control` values only when the
+appliance chart — which renders the classes — is also going into the
+auto-deploy dir, and why the bootstrap manifest is written before the
+control manifest is released from `.deferred`.
+
+### seccomp
+
+Every pod in both charts carries `securityContext.seccompProfile.type:
+RuntimeDefault` (`global.seccompProfile`, settable to `Unconfined` or `""`
+for an exotic runtime).
+
+This closes a regression rather than adding hardening: docker-compose
+applies the runtime's default seccomp profile to every service, while
+Kubernetes runs a container `Unconfined` unless a profile is asked for. So
+until #983 the appliance ran the *same container images* with fewer syscall
+restrictions than a Compose install. `RuntimeDefault` under containerd is
+the same profile family Docker applies, which is also why the risk is low —
+Kea's raw sockets, the api's pcap capture (#59) and nmap (#58) all already
+run under it on Compose.
+
+Kubernetes 1.36 adds an alpha `SeccompDefault` kubelet gate that would do
+this cluster-wide; it is alpha, so the charts do it instead.
+
+One exception is worth knowing rather than discovering: the **supervisor**
+runs `privileged: true`, and containerd skips seccomp entirely for a
+privileged container. The field is set on that pod like every other, and the
+runtime ignores it. That is not a gap this change could close — a privileged
+container is unconfined by definition — it just means the supervisor's
+posture rests on the pod being privileged for a reason (host mounts,
+`hostPID`, driving the node's own lifecycle), not on the profile.
+
+### Pod Security Admission
+
+The `spatium` namespace carries `pod-security.kubernetes.io/warn: baseline`
+and `.../audit: baseline`, written by `spatiumddi-firstboot`'s namespace
+render (the chart deliberately does not own the namespace — see
+`spatiumddi-helm-stuck-recover`).
+
+`enforce` is absent and cannot be added. The role DaemonSets bind :53 / :67
+on the host, the supervisor runs `hostPID` with host mounts, and the
+frontend takes :80 / :443 on the node — every one of those violates
+`baseline` by design, so enforcing would reject the appliance's reason for
+existing. Expect standing warnings from `dns-*`, `dhcp-kea`,
+`looking-glass`, `node-exporter`, `supervisor` and `frontend`; a warning
+from **anything else** is the signal. Audit annotations land in
+`/var/log/spatiumddi/k3s-audit.log`, the apiserver audit log the appliance
+already writes.
+
+Neither label can reject a pod, so both are safe to carry on a running
+cluster. The namespace manifest is re-rendered on every boot, so this
+reaches appliances installed before #983 as soon as they boot the slot
+carrying it — no host patch needed.
+
+### Version floors
+
+`charts/spatiumddi` declares `kubeVersion: ">=1.31.0-0"`; the appliance and
+MetalLB charts declare `">=1.35.0-0"`. The appliance floor is deliberately
+one minor *below* the k3s the ISO bakes: during a rolling OS upgrade the
+cluster transiently serves a mix of 1.35 and 1.36 apiservers, helm
+validates `kubeVersion` against whichever it reaches, and a floor at 1.36
+would turn an ordinary mid-upgrade role toggle into a failed release.
+
+### What is deliberately not set
+
+`disable-network-policy: true` stays on. The old rationale ("single node,
+no need") stopped being true with #272; the setting holds for different
+reasons — nothing in either chart renders a NetworkPolicy, so the
+controller would reconcile an empty set, and it is another always-resident
+daemon on a node whose floor is 4 GiB.
+
+User namespaces (`hostUsers: false`), fine-grained kubelet API
+authorization (`nodes/stats` in place of `nodes/proxy`), PSI metrics and
+`topologySpreadConstraints` are all Phase 2 of #983 — after the 1.36 ISO
+has soaked on a real 3-node cluster.
+
+---
+
 ## Fleet firewall — declarative per-role policy (#285)
 
 The per-role `spatium-role.nft` renderer (above) grew into a first-class

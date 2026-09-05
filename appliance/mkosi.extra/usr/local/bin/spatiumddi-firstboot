@@ -494,11 +494,34 @@ fi
 APPLIANCE_API_URL="http://spatium-control-spatiumddi-api.spatium.svc.cluster.local:8000"
 
 _render_namespace_yaml() {
+    # #983 — Pod Security Admission at ``baseline``, report-only.
+    #
+    # ``enforce`` is impossible here and always will be: the role
+    # DaemonSets bind :53 / :67 on the host (hostNetwork), the supervisor
+    # mounts host paths and runs with hostPID, and the frontend takes :80 /
+    # :443 on the node. Every one of those violates ``baseline`` on purpose,
+    # so enforcing would reject the appliance's entire reason for existing.
+    #
+    # ``warn`` + ``audit`` are still worth carrying: neither can reject a
+    # pod, and they turn "a workload quietly started wanting hostPath" from
+    # invisible into a line in the helm-controller job log and an annotation
+    # in /var/log/spatiumddi/k3s-audit.log (the apiserver audit log this
+    # appliance already writes — see config.yaml's kube-apiserver-arg).
+    # Expect standing warnings from dns-*, dhcp-kea, looking-glass,
+    # node-exporter, the supervisor and the frontend; a warning from
+    # anything ELSE is the signal.
+    #
+    # Re-rendered on every boot (firstboot rewrites this manifest each
+    # time), so this reaches appliances installed before #983 as soon as
+    # they boot the slot carrying it — no host patch needed.
     cat <<EOF
 apiVersion: v1
 kind: Namespace
 metadata:
   name: spatium
+  labels:
+    pod-security.kubernetes.io/warn: baseline
+    pod-security.kubernetes.io/audit: baseline
 EOF
 }
 
@@ -646,6 +669,18 @@ place_metallb_frrk8s_crds() {
 #        full-stack=false because the appliance chart owns them)
 _render_control_helmchart() {
     local chart_b64="$1"
+    # #983 — only rank the control-plane workloads if the chart that RENDERS
+    # ``spatium-control-plane`` is also going into the auto-deploy dir. A pod
+    # naming a PriorityClass that does not exist is refused by the apiserver
+    # (the Deployment is accepted; the ReplicaSet controller then cannot
+    # create pods, and says so in an event). Running pods are untouched and
+    # the whole thing self-heals the moment the class appears — but there is
+    # no reason to enter that state on a box whose appliance chart is
+    # missing, which already means no supervisor and no role pods.
+    local cp_priority_class=""
+    if [ -f "$CHART_TGZ" ]; then
+        cp_priority_class="spatium-control-plane"
+    fi
     cat <<EOF
 apiVersion: helm.cattle.io/v1
 kind: HelmChart
@@ -670,6 +705,15 @@ spec:
     global:
       controlPlaneNodeSelector:
         spatium.io/role-control-plane: "true"
+      # #983 — rank the control-plane workloads. ``spatium-control-plane``
+      # is rendered by the spatiumddi-appliance chart (spatium-bootstrap),
+      # which firstboot writes into the auto-deploy dir BEFORE this one
+      # (the control chart is held back as ``.deferred`` until the CNPG
+      # webhook is up), so the class exists by the time any pod here names
+      # it. That ordering is load-bearing: the apiserver REFUSES a pod
+      # naming a PriorityClass that does not exist. Empty when the
+      # appliance chart is absent — see the guard above.
+      priorityClassName: "${cp_priority_class}"
     # Appliance overrides — collapse the frontend to a single
     # replica with hostNetwork on the node IP so http://<ip>/
     # serves the SpatiumDDI UI. klipper-lb is disabled in our

@@ -123,6 +123,14 @@ spec:
       labels:
         {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" $cmp) .) | nindent 8 }}
     spec:
+      {{- with (include "spatiumddi.priorityClassName" (dict "component" .Values.slotImageMirror.priorityClassName "fallback" (.Values.global).priorityClassName)) }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
+      {{- with (include "spatiumddi.seccompProfileType" $) }}
+      securityContext:
+        seccompProfile:
+          type: {{ . }}
+      {{- end }}
       terminationGracePeriodSeconds: 30
       {{- with .Values.image.pullSecrets }}
       imagePullSecrets:

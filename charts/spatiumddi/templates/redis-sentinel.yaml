@@ -122,8 +122,15 @@ spec:
       labels:
         {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" $cmp) .) | nindent 8 }}
     spec:
+      {{- with (include "spatiumddi.priorityClassName" (dict "component" .Values.redis.priorityClassName "fallback" (.Values.global).priorityClassName)) }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
       terminationGracePeriodSeconds: 30
       securityContext:
+        {{- with (include "spatiumddi.seccompProfileType" $) }}
+        seccompProfile:
+          type: {{ . }}
+        {{- end }}
         fsGroup: 999
       initContainers:
         # Render redis.conf + sentinel.conf from the ConfigMap

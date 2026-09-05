@@ -45,6 +45,14 @@ spec:
         app.kubernetes.io/name: looking-glass
         app.kubernetes.io/component: looking-glass
     spec:
+      {{- with .Values.lookingGlass.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
+      {{- with (include "spatiumddi-appliance.seccompProfileType" $) }}
+      securityContext:
+        seccompProfile:
+          type: {{ . }}
+      {{- end }}
       nodeSelector:
         {{- toYaml .Values.global.nodeSelector | nindent 8 }}
         # Phase 10 (#183) per-role scheduling label pattern, extended

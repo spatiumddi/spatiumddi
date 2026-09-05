@@ -4,3 +4,19 @@ metadata:
   name: spatiumddi
   labels:
     app.kubernetes.io/name: spatiumddi
+    # #983 — Pod Security Admission at the ``baseline`` level, in
+    # report-only mode.
+    #
+    # ``enforce`` is deliberately absent and cannot be added: several
+    # SpatiumDDI workloads violate ``baseline`` by design — the DHCP agent
+    # needs hostNetwork to see DHCPDISCOVER broadcasts, the DNS agents bind
+    # :53 on the host, and the appliance supervisor mounts host paths.
+    # Enforcing would reject exactly the pods that have to exist.
+    #
+    # ``warn`` + ``audit`` still earn their place: a workload added later
+    # that quietly starts wanting hostPath or privileged shows up in
+    # ``kubectl apply`` output and in the apiserver audit log, instead of
+    # nowhere. Neither label can reject a pod, so this is safe to carry on
+    # a running cluster.
+    pod-security.kubernetes.io/warn: baseline
+    pod-security.kubernetes.io/audit: baseline

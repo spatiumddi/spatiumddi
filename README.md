@@ -1353,7 +1353,7 @@ EOF
 ### Requirements
 
 - Docker 24+ and Docker Compose v2, **or**
-- Kubernetes 1.27+ with Helm 3, **or**
+- Kubernetes 1.31+ with Helm 3, **or**
 - Ubuntu 22.04 / Debian 12 / Alpine 3.20+ for bare metal
 
 ---

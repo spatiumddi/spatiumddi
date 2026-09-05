@@ -166,6 +166,14 @@ have served straight through starts evicting them instead.
 
 The worker pod ships with `securityContext.capabilities.add: ["NET_RAW"]` so `nmap` can run SYN scans + `-O` OS detection from the device-profiling auto-nmap path. The image already grants the cap to the `nmap` binary via `setcap` — this line keeps it in the pod's bounding set so restricted Pod Security Admission (`restricted` profile), OpenShift SCC, and GKE Autopilot don't drop it. The cap is in containerd's default cap set on permissive clusters, so it's a no-op there. If you've turned device profiling off cluster-wide and want a tighter security posture, drop the `securityContext` block from `k8s/base/worker.yaml` (or set `worker.netRawCapability: false` in the Helm chart).
 
+### Pod posture — seccomp + Pod Security Admission (issue #983)
+
+Every pod template in these manifests carries `securityContext.seccompProfile.type: RuntimeDefault`, and the CloudNativePG `Cluster` in `k8s/ha/postgres-cluster.yaml` sets the equivalent CR field. This is parity work, not extra hardening: Kubernetes runs a container `Unconfined` unless a profile is asked for, while Docker Compose applies the runtime's default profile to every service — so without it the *same images* run with fewer syscall restrictions here than on a Compose install. `RuntimeDefault` under containerd is the same profile family Docker applies, which is why the capabilities above (`NET_RAW` for nmap, raw sockets for Kea) still work under it.
+
+The `spatiumddi` namespace carries `pod-security.kubernetes.io/warn: baseline` and `.../audit: baseline`. Both are report-only and neither can reject a pod. `enforce` is deliberately absent and is not usable here — the Kea StatefulSet needs `hostNetwork` to see DHCPDISCOVER broadcasts and the BIND9 StatefulSet binds `:53` on the host, both of which violate `baseline` by design. What warn/audit buy you is that a workload added *later* which quietly starts wanting `hostPath` or `privileged` shows up in `kubectl apply` output and the apiserver audit log rather than nowhere.
+
+These manifests set no `priorityClassName`. That is the correct default for a bring-your-own cluster: a pod naming a PriorityClass the cluster does not define is refused by the apiserver. If you have a priority policy, the Helm chart exposes `global.priorityClassName` / `global.servicePriorityClassName` — see [`docs/deployment/KUBERNETES.md`](../docs/deployment/KUBERNETES.md).
+
 ## TLS / Ingress
 
 The Ingress in `k8s/base/frontend.yaml` uses `ingressClassName: nginx`. For TLS:
