@@ -75,9 +75,21 @@ jobs:
           version: v3.20.2
 
       - name: Create kind cluster
+        # #983 — kind and the node image are BOTH pinned, and the node image
+        # is what matters: without it the Kubernetes version this job tests
+        # against is whatever kind's default happened to be on the day the
+        # action version was written (v0.22.0, Feb 2024, defaulted to 1.29),
+        # so the number was real but written down nowhere.
+        #
+        # v1.36.4 matches the k3s the appliance ISO bakes (Makefile
+        # K3S_VERSION, #974), so a chart change that only breaks on the
+        # appliance's Kubernetes minor fails here first. The digest pins the
+        # exact image kind v0.33.0 publishes for that tag — a floating tag
+        # would silently drift the thing being pinned.
         uses: helm/kind-action@v1
         with:
-          version: v0.22.0
+          version: v0.33.0
+          node_image: kindest/node:v1.36.4@sha256:099e049362a1526b2db71494e1947aae99bd16290d7c895f2b7ea312e3cbfaed
           cluster_name: spatium-e2e
           wait: 120s
 

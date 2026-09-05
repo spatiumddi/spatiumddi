@@ -24,6 +24,13 @@ spec:
         app.kubernetes.io/instance: dhcp1
         spatiumddi.org/dhcp-flavor: kea
     spec:
+      # #983 — Kubernetes runs a container ``Unconfined`` unless a profile is
+      # asked for, while docker-compose applies the runtime's default profile
+      # to every service. Without this the same image runs with FEWER syscall
+      # restrictions here than under Compose.
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:

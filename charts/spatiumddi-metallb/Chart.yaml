@@ -12,7 +12,15 @@ description: |
 type: application
 version: 0.1.0
 appVersion: "0.0.0-dev"
-kubeVersion: ">=1.27.0-0"
+# #983 — these charts only ever run on the k3s the appliance ISO bakes, which
+# is Kubernetes 1.36 as of #974. The floor is deliberately ONE MINOR BELOW
+# that rather than at it: during a rolling OS upgrade the cluster transiently
+# serves a mix of 1.35 and 1.36 apiservers, and helm validates kubeVersion
+# against whichever apiserver it reaches. A floor of 1.36 would turn an
+# ordinary role toggle made mid-upgrade — the supervisor patches this chart's
+# values on every role change — into a failed release, for no gain: nothing
+# in either chart uses API surface newer than 1.35.
+kubeVersion: ">=1.35.0-0"
 home: https://www.spatiumddi.com/
 sources:
   - https://github.com/spatiumddi/spatiumddi

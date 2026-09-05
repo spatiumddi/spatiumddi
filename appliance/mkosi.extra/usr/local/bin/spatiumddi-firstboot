@@ -494,11 +494,34 @@ fi
 APPLIANCE_API_URL="http://spatium-control-spatiumddi-api.spatium.svc.cluster.local:8000"
 
 _render_namespace_yaml() {
+    # #983 — Pod Security Admission at ``baseline``, report-only.
+    #
+    # ``enforce`` is impossible here and always will be: the role
+    # DaemonSets bind :53 / :67 on the host (hostNetwork), the supervisor
+    # mounts host paths and runs with hostPID, and the frontend takes :80 /
+    # :443 on the node. Every one of those violates ``baseline`` on purpose,
+    # so enforcing would reject the appliance's entire reason for existing.
+    #
+    # ``warn`` + ``audit`` are still worth carrying: neither can reject a
+    # pod, and they turn "a workload quietly started wanting hostPath" from
+    # invisible into a line in the helm-controller job log and an annotation
+    # in /var/log/spatiumddi/k3s-audit.log (the apiserver audit log this
+    # appliance already writes — see config.yaml's kube-apiserver-arg).
+    # Expect standing warnings from dns-*, dhcp-kea, looking-glass,
+    # node-exporter, the supervisor and the frontend; a warning from
+    # anything ELSE is the signal.
+    #
+    # Re-rendered on every boot (firstboot rewrites this manifest each
+    # time), so this reaches appliances installed before #983 as soon as
+    # they boot the slot carrying it — no host patch needed.
     cat <<EOF
 apiVersion: v1
 kind: Namespace
 metadata:
   name: spatium
+  labels:
+    pod-security.kubernetes.io/warn: baseline
+    pod-security.kubernetes.io/audit: baseline
 EOF
 }
 
@@ -646,6 +669,19 @@ place_metallb_frrk8s_crds() {
 #        full-stack=false because the appliance chart owns them)
 _render_control_helmchart() {
     local chart_b64="$1"
+    # #983 — first of two gates on naming ``spatium-control-plane`` here.
+    # This one is cheap and early: no appliance chart tarball means the chart
+    # that RENDERS the class is not going into the auto-deploy dir at all.
+    #
+    # It is not sufficient on its own — a tarball that exists proves nothing
+    # about whether its release SUCCEEDED — so ``release_control_manifest``
+    # re-checks against the live cluster before the manifest is applied. Both
+    # matter: this one keeps a known-hopeless value out of the file, that one
+    # catches the failure this one cannot see.
+    local cp_priority_class=""
+    if [ -f "$CHART_TGZ" ]; then
+        cp_priority_class="spatium-control-plane"
+    fi
     cat <<EOF
 apiVersion: helm.cattle.io/v1
 kind: HelmChart
@@ -670,6 +706,15 @@ spec:
     global:
       controlPlaneNodeSelector:
         spatium.io/role-control-plane: "true"
+      # #983 — rank the control-plane workloads. ``spatium-control-plane``
+      # is rendered by the spatiumddi-appliance chart (spatium-bootstrap),
+      # which firstboot writes into the auto-deploy dir BEFORE this one
+      # (the control chart is held back as ``.deferred`` until the CNPG
+      # webhook is up), so the class exists by the time any pod here names
+      # it. That ordering is load-bearing: the apiserver REFUSES a pod
+      # naming a PriorityClass that does not exist. Empty when the
+      # appliance chart is absent — see the guard above.
+      priorityClassName: "${cp_priority_class}"
     # Appliance overrides — collapse the frontend to a single
     # replica with hostNetwork on the node IP so http://<ip>/
     # serves the SpatiumDDI UI. klipper-lb is disabled in our
@@ -1050,6 +1095,49 @@ if [ -x /usr/local/bin/spatium-upgrade-slot ] && [ -e /etc/spatiumddi/role-confi
         echo "WARN: sync-versions failed — OS Image card will show 'unknown' for slot versions"
 fi
 
+# #983 — release the deferred control manifest, dropping the PriorityClass
+# reference if the class is not actually there.
+#
+# The control chart names ``spatium-control-plane``, which is rendered by a
+# DIFFERENT release: spatium-bootstrap, from the spatiumddi-appliance chart.
+# Render time can only check that that chart's tarball exists. If its release
+# then fails — a bad values patch, a helm-controller wedge, a broken bake —
+# every control-plane Deployment is still ACCEPTED by the apiserver and the
+# ReplicaSet controller cannot create a single pod for it. Pre-#983 that
+# failure left the operator a working UI to diagnose the supervisor with; it
+# must not now take the UI down as well, and because the manifest would
+# already be applied it could not self-heal on its own.
+#
+# So: ask the cluster. A missing class — or an apiserver we cannot reach to
+# ask, which is the "k3s never came ready" release path below — falls back to
+# no class at all. Unranked is exactly the pre-#983 behaviour and is always
+# schedulable, and nothing is lost permanently: firstboot re-renders this
+# manifest from scratch on every boot, so the ranking comes back on the first
+# boot where bootstrap is healthy.
+_strip_control_priority_class() {
+    # Tolerant of indentation on purpose — the pattern has to keep matching
+    # what _render_control_helmchart emits, and that pairing is asserted by
+    # appliance/tests/test_firstboot_pod_posture.py.
+    sed -i -E 's/^([[:space:]]*)priorityClassName: "spatium-control-plane"$/\1priorityClassName: ""/' "$1"
+}
+
+release_control_manifest() {
+    local deferred="${CONTROL_MANIFEST}.deferred"
+    [ -f "$deferred" ] || return 0
+    if ! /usr/local/bin/k3s kubectl get priorityclass spatium-control-plane \
+            >/dev/null 2>&1; then
+        echo "WARN: PriorityClass spatium-control-plane is absent, or the apiserver could not be reached." >&2
+        echo "      Releasing the control chart WITHOUT it — a pod naming a PriorityClass that does" >&2
+        echo "      not exist cannot be created at all, which would take the Web UI down alongside" >&2
+        echo "      the spatium-bootstrap release instead of leaving it up to diagnose with." >&2
+        echo "      Check: k3s kubectl -n kube-system get helmchart spatium-bootstrap" >&2
+        echo "      The ranking returns on the first boot where that release is healthy." >&2
+        _strip_control_priority_class "$deferred"
+    fi
+    mv -f "$deferred" "$CONTROL_MANIFEST"
+    chmod 0600 "$CONTROL_MANIFEST"
+}
+
 # #554 — is this a TRIAL boot (running slot != durable default)? Blocking
 # the slot commit on a host-migrate failure only matters during a trial
 # boot; on a steady-state boot there's nothing to commit, so a persistent
@@ -1078,7 +1166,7 @@ if [ -x /usr/local/bin/spatium-host-migrate ]; then
         echo "ERROR: host-migration reconcile failed." >&2
         # Still release any deferred control manifest so the control plane
         # comes up regardless.
-        mv -f "${CONTROL_MANIFEST}.deferred" "$CONTROL_MANIFEST" 2>/dev/null || true
+        release_control_manifest || true
         if is_trial_boot; then
             # Trial boot: a bad grub render risks the next reboot, so do NOT
             # commit — exit non-zero so commit_slot_if_healthy never runs and
@@ -1168,8 +1256,7 @@ place_deferred_control_manifest() {
     else
         echo "WARN: CNPG webhook not ready after 4 min — applying control chart anyway (helm-controller retries)." >&2
     fi
-    mv -f "$deferred" "$CONTROL_MANIFEST"
-    chmod 0600 "$CONTROL_MANIFEST"
+    release_control_manifest
 }
 
 # Wait for k3s to come up + helm-controller to apply the bootstrap
@@ -1209,6 +1296,8 @@ echo "WARN: k3s /readyz did not respond within 5 minutes." >&2
 echo "      Check 'systemctl status k3s' + 'journalctl -u k3s'." >&2
 # k3s never became ready, but don't strand the deferred control chart —
 # place it so a later k3s recovery (or manual restart) still deploys the
-# control plane. helm-controller will retry the webhook on its own.
-mv -f "${CONTROL_MANIFEST}.deferred" "$CONTROL_MANIFEST" 2>/dev/null || true
+# control plane. helm-controller will retry the webhook on its own. #983 —
+# the class lookup necessarily fails here (no apiserver), so this path always
+# releases unranked; the next boot restores it.
+release_control_manifest || true
 exit 1

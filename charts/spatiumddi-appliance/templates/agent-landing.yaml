@@ -37,6 +37,14 @@ spec:
         app.kubernetes.io/name: agent-landing
         app.kubernetes.io/component: agent-landing
     spec:
+      {{- with .Values.agentLanding.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
+      {{- with (include "spatiumddi-appliance.seccompProfileType" $) }}
+      securityContext:
+        seccompProfile:
+          type: {{ . }}
+      {{- end }}
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
       nodeSelector:

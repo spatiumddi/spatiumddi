@@ -22,6 +22,14 @@
 # once #3063 is fixed upstream. KEEP the image tags below in lock-step
 # with the chart version + appliance/scripts/bake-images.sh
 # ``METALLB_IMAGES``.
+# POD POSTURE (#983) — the ``priorityClassName`` values below name classes
+# rendered by a DIFFERENT release (spatium-bootstrap, the spatiumddi-appliance
+# chart), which normally needs care: the apiserver REFUSES a pod naming a
+# PriorityClass that does not exist. It is safe here specifically because
+# MetalLB ships disabled and is only ever enabled by the supervisor when an
+# operator sets a VIP — and the supervisor itself comes from that same
+# bootstrap release. If bootstrap never succeeded there is nothing to turn
+# MetalLB on, so there are no speaker/controller pods to refuse.
 metallb:
   enabled: false
 
@@ -51,12 +59,56 @@ metallb:
     # control-plane nodes via the per-role label (CLAUDE.md non-neg #16).
     nodeSelector:
       spatium.io/role-control-plane: "true"
+    # #983 — the speaker is ON THE DATA PATH. It answers ARP/NDP for the
+    # control-plane VIP and, with ``dns.useMetalLBVIP=true``, for the DNS
+    # VIP too — so evicting it takes out the address that dns-bind9's
+    # ``spatium-service`` ranking exists to protect. Leaving it at priority
+    # 0 while everything around it moved to 90000/100000 would have made
+    # the ARP responder the FIRST thing the kubelet reclaims under memory
+    # pressure. Same class as the DNS/DHCP pods, for the same reason.
+    priorityClassName: spatium-service
+    # #965 — requests only, a floor rather than a measurement. Upstream
+    # ships ``resources: {}``, which is BestEffort: cgroup cpu.weight 1 and
+    # first in the OOM queue, on the pod that owns the VIP.
+    resources:
+      requests:
+        cpu: 10m
+        memory: 64Mi
+    # #983 — upstream leaves the speaker's pod securityContext empty (it
+    # needs to run as root for raw ARP/NDP), so nothing asked for a seccomp
+    # profile and the container ran ``Unconfined``. ``RuntimeDefault`` under
+    # containerd permits ``socket(AF_PACKET, …)`` for a container holding
+    # CAP_NET_RAW, which the speaker does — the capability, not the profile,
+    # is what gates the raw socket.
+    securityContext:
+      seccompProfile:
+        type: RuntimeDefault
   controller:
     image:
       repository: quay.io/metallb/controller
       tag: v0.15.3  # lock-step with the 0.15.3 chart — metallb#3063 (header note)
     nodeSelector:
       spatium.io/role-control-plane: "true"
+    # #983 — the controller allocates IPs from the pool; it is not on the
+    # packet path, so it ranks with the rest of the control plane rather
+    # than with the speaker.
+    priorityClassName: spatium-control-plane
+    # #965 — see the speaker's note.
+    resources:
+      requests:
+        cpu: 10m
+        memory: 64Mi
+    # #983 — MUST repeat upstream's three keys: the chart renders this map
+    # wholesale (``toYaml .Values.controller.securityContext``), so a
+    # values override REPLACES it rather than merging, and dropping
+    # runAsNonRoot / runAsUser / fsGroup here would silently put the
+    # controller back to running as root.
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 65534    # nobody
+      fsGroup: 65534
+      seccompProfile:
+        type: RuntimeDefault
 
   # ── L2 IP pool ────────────────────────────────────────────────────
   # ``ipPool.addresses`` is the L2 range MetalLB hands out. The operator
@@ -153,6 +205,43 @@ metallb:
       # above (non-negotiable #16) — BGP is a control-plane concern.
       nodeSelector:
         spatium.io/role-control-plane: "true"
+      # #983 — in BGP mode frr-k8s IS the data path: the speaker delegates
+      # advertisement to it, so an evicted frr-k8s withdraws the VIP's route
+      # exactly as an evicted speaker stops answering ARP in L2 mode. Same
+      # class as the speaker for the same reason. One key covers both the
+      # DaemonSet and the status-cleaner Deployment (the chart reads
+      # ``.Values.frrk8s.priorityClassName`` in both templates).
+      priorityClassName: spatium-service
+      # #965 — floors, not measurements. Upstream ships ``resources: {}`` for
+      # all five containers, i.e. a five-container BestEffort pod holding the
+      # BGP session. ``frrk8s.resources`` covers the controller container AND
+      # the status-cleaner Deployment; the other four are per-container keys.
+      resources:
+        requests:
+          cpu: 10m
+          memory: 64Mi
+      reloader:
+        resources:
+          requests:
+            cpu: 5m
+            memory: 32Mi
+      frrMetrics:
+        resources:
+          requests:
+            cpu: 5m
+            memory: 32Mi
+      frrStatus:
+        resources:
+          requests:
+            cpu: 5m
+            memory: 32Mi
+      # #983 — NO seccomp profile here, and it is not an oversight: the
+      # frr-k8s 0.0.21 chart exposes no pod-securityContext knob at all
+      # (grep its templates — ``.Values.frrk8s.*`` covers image, nodeSelector,
+      # resources and priorityClassName, nothing else), so no values override
+      # can supply one. The render check therefore exempts these two
+      # workloads by name rather than skipping the chart, which is how they
+      # went unnoticed until #983. Revisit on a chart bump.
       # Explicit image tags, locked to what the vendored 0.15.3 metallb
       # package's frr-k8s@0.0.21 subchart defaults to (verified by
       # inspecting charts/frr-k8s/values.yaml + Chart.yaml inside the
@@ -167,6 +256,11 @@ metallb:
         image:
           repository: quay.io/frrouting/frr
           tag: 10.4.1
+        # #965 — the FRR daemon itself; see the resources note above.
+        resources:
+          requests:
+            cpu: 10m
+            memory: 64Mi
 
 # Cross-namespace pod-read for the control-plane api SA so the
 # Network & Host MetalLB status card works now that MetalLB is in

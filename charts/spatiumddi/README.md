@@ -24,7 +24,7 @@ Default login: **`admin` / `admin`** (forced password change on first login).
 
 ## Prerequisites
 
-- Kubernetes 1.26+
+- Kubernetes 1.31+
 - Helm 3.8+ (needed for OCI)
 - A StorageClass supporting `ReadWriteOnce` (Postgres, Redis, and
   agent state all use PVCs)
@@ -198,6 +198,11 @@ dhcpAgents:
 | `auth.existingSecret` | `""` | BYO secret with key `secret-key` |
 | `fullnameOverride` | `""` |  |
 | `nameOverride` | `""` |  |
+| `global.controlPlaneNodeSelector` | `{}` | Merged into every control-plane workload's `nodeSelector` |
+| `global.seccompProfile` | `RuntimeDefault` | Pod-level seccomp for every workload. `Unconfined` or `""` (omit) also accepted; `Localhost` is rejected |
+| `global.priorityClassName` | `""` | PriorityClass for the control-plane workloads. **Leave empty unless the class exists** — the apiserver refuses a pod naming one that does not |
+| `global.servicePriorityClassName` | `""` | Same, for the DNS / DHCP agent StatefulSets |
+| `<component>.priorityClassName` | unset | Per-workload override. Unset inherits the chart-wide key above; `""` means *no class for this workload*, even when the chart-wide key is set |
 
 ### Control plane
 

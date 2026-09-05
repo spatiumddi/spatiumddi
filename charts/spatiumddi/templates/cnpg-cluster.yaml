@@ -68,6 +68,26 @@ spec:
   instances: {{ .Values.postgresql.cnpg.instances }}
   imageName: {{ .Values.postgresql.cnpg.imageName | quote }}
 
+  {{- with (include "spatiumddi.priorityClassName" (dict "component" .Values.postgresql.priorityClassName "fallback" (.Values.global).priorityClassName)) }}
+  # #983 — CNPG passes this straight through to the instance pods.
+  priorityClassName: {{ . | quote }}
+  {{- end }}
+  {{- with (include "spatiumddi.seccompProfileType" $) }}
+  # #983 — CNPG owns the instance pods' securityContext, so the chart-wide
+  # knob has to be handed to the operator rather than set on a pod template.
+  # The CRD already defaults this field to ``RuntimeDefault``; setting it
+  # explicitly is what makes ``global.seccompProfile: Unconfined`` mean the
+  # same thing here as everywhere else.
+  seccompProfile:
+    type: {{ . }}
+  {{- end }}
+  # NOTE both fields above only reach a cluster on FIRST CREATE. The
+  # ``helm.sh/resource-policy: keep`` annotation stops Helm patching this CR
+  # on upgrade, so an appliance installed before #983 keeps whatever the
+  # operator defaulted to until the Cluster is recreated. That is the
+  # accepted trade — the annotation exists because a Helm-driven delete of
+  # this CR destroys the database, which is far worse than an unranked pod.
+
   # #296 Phase A — PDB on by default (set in values.yaml). Suspended
   # during a rolling-upgrade node's maintenance window — the api-side
   # orchestrator stamps + clears

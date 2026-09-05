@@ -17,6 +17,13 @@ spec:
   instances: 3
   imageName: ghcr.io/cloudnative-pg/postgresql:16
 
+  # #983 — CNPG owns the instance pods, so the seccomp profile is a field on
+  # the Cluster rather than a pod-template securityContext. The CRD already
+  # defaults it to RuntimeDefault; stating it makes the posture readable
+  # here instead of only in the operator's source.
+  seccompProfile:
+    type: RuntimeDefault
+
   # #590 — spread the instances one per node. CNPG enables anti-affinity by
   # default but only as `preferred` (best effort), which lets two of three
   # instances land on the same node — one node loss then takes the primary

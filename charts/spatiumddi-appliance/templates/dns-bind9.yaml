@@ -47,6 +47,14 @@ spec:
         app.kubernetes.io/name: dns-bind9
         app.kubernetes.io/component: dns-bind9
     spec:
+      {{- with .Values.dnsBind9.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
+      {{- with (include "spatiumddi-appliance.seccompProfileType" $) }}
+      securityContext:
+        seccompProfile:
+          type: {{ . }}
+      {{- end }}
       {{- if not .Values.dns.useMetalLBVIP }}
       # #272 Phase 5 — default path: bind on the node IP so non-cluster
       # clients resolve against the appliance directly. When a DNS VIP

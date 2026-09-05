@@ -65,6 +65,14 @@ spec:
         app.kubernetes.io/instance-name: {{ $server.name | quote }}
         spatiumddi.org/dns-flavor: {{ $flavor }}
     spec:
+      {{- with (include "spatiumddi.priorityClassName" (dict "component" $root.Values.dnsAgents.priorityClassName "fallback" ($root.Values.global).servicePriorityClassName)) }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
+      {{- with (include "spatiumddi.seccompProfileType" $) }}
+      securityContext:
+        seccompProfile:
+          type: {{ . }}
+      {{- end }}
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:

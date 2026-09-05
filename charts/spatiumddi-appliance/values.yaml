@@ -28,12 +28,64 @@ global:
   # operator override).
   extraEnv: []
 
+  # #983 — pod-level seccomp profile for every workload this chart renders.
+  # Kubernetes leaves a container ``Unconfined`` unless asked; docker-compose
+  # applies the runtime's default profile to every service, so the appliance
+  # was running the same images with FEWER syscall restrictions than a
+  # Compose install. ``RuntimeDefault`` under containerd is the same profile
+  # family Docker applies.
+  # ``RuntimeDefault`` | ``Unconfined`` | ``""`` (omit the block entirely).
+  seccompProfile: RuntimeDefault
+
+# #983 — PriorityClasses. Unlike the umbrella chart these default to ON and
+# the per-workload names below default to NON-empty, because this chart
+# renders the classes it names. Turning ``create`` off without also clearing
+# every ``priorityClassName`` below leaves pods naming a class that does not
+# exist — which the apiserver REJECTS, so those pods never schedule at all.
+#
+# Values sit far below Kubernetes' own ``system-cluster-critical``
+# (2000000000) / ``system-node-critical`` (2000001000) so k3s components
+# still outrank everything here.
+priorityClasses:
+  create: true
+  classes:
+    # Serving pods — BIND / PowerDNS / Technitium / Kea / the BGP collector.
+    # The LAN stops working without these, so they are the last thing the
+    # kubelet should evict and the first thing the scheduler should place.
+    service:
+      name: spatium-service
+      value: 100000
+      description: >-
+        SpatiumDDI serving workloads (DNS / DHCP / BGP collector). Evicted
+        last under node pressure; the LAN depends on them.
+    # Control plane — the API, workers, database, cache, supervisor. Losing
+    # these costs the operator the UI and the config path, which is bad but
+    # recoverable; losing DNS costs everyone on the network.
+    controlPlane:
+      name: spatium-control-plane
+      value: 90000
+      description: >-
+        SpatiumDDI control plane (api / worker / beat / frontend / postgres /
+        redis / supervisor). Ranked below the serving pods on purpose.
+    # Observability — metrics exporters. First to be evicted, and
+    # ``preemptionPolicy: Never`` so a pending exporter can never displace a
+    # running pod to get itself scheduled: monitoring must not cause the
+    # outage it would then report.
+    observability:
+      name: spatium-observability
+      value: 10000
+      preemptionPolicy: Never
+      description: >-
+        SpatiumDDI observability exporters (kube-state-metrics /
+        node-exporter). Evicted first; never preempts anything.
+
 # DNS — bind9 backend. Exactly one of dnsBind9 / dnsPowerdns /
 # dnsTechnitium runs per appliance; the supervisor enforces mutual-
 # exclusion at the CRD reconciler level so flipping more than one
 # ``enabled: true`` is a server-side validation error.
 dnsBind9:
   enabled: false
+  priorityClassName: spatium-service  # #983 — see ``priorityClasses`` above
   image:
     repository: ghcr.io/spatiumddi/dns-bind9
   # Scheduling weight for the serving pod. Requests only, no limits: a
@@ -93,6 +145,7 @@ dnsBind9:
 # DNS — PowerDNS backend. Same shape as dnsBind9.
 dnsPowerdns:
   enabled: false
+  priorityClassName: spatium-service  # #983 — see ``priorityClasses`` above
   image:
     repository: ghcr.io/spatiumddi/dns-powerdns
   # Scheduling weight for the serving pod — see dnsBind9.resources. The
@@ -129,6 +182,7 @@ dnsPowerdns:
 # Technitium needs no dnsdist-style sidecar the way PowerDNS does.
 dnsTechnitium:
   enabled: false
+  priorityClassName: spatium-service  # #983 — see ``priorityClasses`` above
   image:
     repository: ghcr.io/spatiumddi/dns-technitium
   # Scheduling weight for the serving pod — see dnsBind9.resources. The
@@ -168,6 +222,7 @@ dnsTechnitium:
 # ``network_mode: host`` docker-compose entry.
 dhcpKea:
   enabled: false
+  priorityClassName: spatium-service  # #983 — see ``priorityClasses`` above
   image:
     repository: ghcr.io/spatiumddi/dhcp-kea
   # Scheduling weight for the DHCP server pod — see dnsBind9.resources.
@@ -218,6 +273,7 @@ dhcpKea:
 # the collector daemon + the hard receive-only invariant.
 lookingGlass:
   enabled: false
+  priorityClassName: spatium-service  # #983 — see ``priorityClasses`` above
   image:
     repository: ghcr.io/spatiumddi/looking-glass
   # #965 — a floor, not a measurement. gobgpd holds real BGP sessions with
@@ -268,6 +324,10 @@ observer:
 # metrics at the standard endpoints; future Phase 8 work adds a
 # control-plane Prometheus scraper that federates across appliances.
 observability:
+  # #983 — PriorityClass for both exporters. ``spatium-observability``
+  # carries ``preemptionPolicy: Never``, so a pending exporter can never
+  # evict a running service pod to schedule itself.
+  priorityClassName: spatium-observability
   # kube-state-metrics exposes cluster-state metrics (pod count,
   # deployment status, restart counts, …) at /metrics. ~30 MB RSS.
   # Standard k8s observability primitive.
@@ -310,6 +370,7 @@ observability:
 # stable from the start.
 supervisor:
   enabled: false
+  priorityClassName: spatium-control-plane  # #983 — see ``priorityClasses`` above
   image:
     repository: ghcr.io/spatiumddi/spatium-supervisor
   # #965 — a floor, not a measurement. The supervisor is not a data-plane
@@ -362,6 +423,10 @@ supervisor:
 # mounts that dir read-only.
 agentLanding:
   enabled: true
+  # #983 — deliberately UNSET. The landing page is a courtesy redirect on
+  # an Application appliance; it must not outrank anything, and at priority
+  # 0 it is also the natural first eviction candidate.
+  priorityClassName: ""
   image:
     repository: nginx
     tag: 1.30.3-alpine
@@ -400,6 +465,17 @@ cnpg:
   # rendered consistently) back to ``cloudnative-pg`` so self-discovery
   # works. Do NOT remove without also de-aliasing the dependency.
   nameOverride: cloudnative-pg
+  # #983 — the operator is control-plane machinery: while it is gone,
+  # nothing reconciles Postgres failover, switchover or a replica rejoin.
+  # Ranking it alongside the rest of the control plane is the same argument
+  # #315 made for giving it resource requests — the upstream chart's
+  # defaults leave it the first casualty of node pressure, and the failure
+  # is silent until the next time Postgres needs it.
+  #
+  # Passed straight through to the vendored subchart's own
+  # ``priorityClassName`` value; the class itself is rendered by
+  # templates/priorityclasses.yaml in this chart.
+  priorityClassName: spatium-control-plane
   # #315 — pin the operator pod's resources + loosen its startup probe.
   #
   # The upstream chart ships ``resources: {}``, which makes the operator

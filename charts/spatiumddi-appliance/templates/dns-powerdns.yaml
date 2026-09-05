@@ -34,6 +34,14 @@ spec:
         app.kubernetes.io/name: dns-powerdns
         app.kubernetes.io/component: dns-powerdns
     spec:
+      {{- with .Values.dnsPowerdns.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
+      {{- with (include "spatiumddi-appliance.seccompProfileType" $) }}
+      securityContext:
+        seccompProfile:
+          type: {{ . }}
+      {{- end }}
       {{- if not .Values.dns.useMetalLBVIP }}
       # #272 Phase 5 — default path: bind :53 on the node IP. A DNS VIP
       # drops hostNetwork in favour of the LoadBalancer Service below.

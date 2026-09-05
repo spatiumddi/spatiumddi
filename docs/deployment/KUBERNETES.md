@@ -47,7 +47,7 @@ SemVer 2 identifier (tag `2026.04.20-1` → chart version `2026.4.20-1`).
 
 ### Prerequisites
 
-- Kubernetes 1.26+
+- Kubernetes 1.31+
 - Helm 3.8+ (required for OCI registry support)
 - A `StorageClass` supporting `ReadWriteOnce` (Postgres, Redis, and agent
   state all use PVCs)
@@ -445,6 +445,47 @@ non-negotiable #16 — its `dns-bind9.yaml` / `dns-technitium.yaml` /
 `dhcp-kea.yaml` templates are the reference pattern. On the
 umbrella chart, DNS/DHCP agent placement is controlled per-server through the
 `storage` / `service` / `resources` fields and standard scheduling primitives.
+
+### Pod posture — seccomp and PriorityClasses (#983)
+
+Every pod the chart renders carries
+`securityContext.seccompProfile.type: RuntimeDefault`. This is on by
+default because Kubernetes runs a container `Unconfined` unless a profile is
+asked for, while docker-compose applies the runtime's default profile to
+every service — so without it the same images run *less* restricted under
+Kubernetes than under Compose. Set `global.seccompProfile` to `Unconfined`,
+or to `""` to omit the block, if your runtime's default profile breaks a
+workload; `Localhost` is rejected, because it needs a profile file the chart
+cannot place on your nodes.
+
+PriorityClasses are **off by default and you should keep them off unless you
+create the classes yourself**: a pod naming a PriorityClass that does not
+exist is refused by the apiserver, so setting a name the cluster has never
+heard of stops new pods being created (running ones are untouched, and it
+self-heals once the class exists). When you do have a priority policy:
+
+```yaml
+global:
+  priorityClassName: my-control-plane   # api, worker, beat, frontend,
+                                        # migrate, postgres/CNPG, redis,
+                                        # sentinel, slot-image mirror
+  servicePriorityClassName: my-serving  # the DNS / DHCP agent StatefulSets
+```
+
+Any single workload can override with `<component>.priorityClassName`, where
+*unset* (the shipped default) inherits the chart-wide key and `""` means no
+class for that workload even when the chart-wide key is set. The
+split exists because a DNS agent answering the LAN should outrank the API
+that configures it when a node runs out of memory. The appliance sets
+`global.priorityClassName: spatium-control-plane` against classes its own
+chart renders — see
+[APPLIANCE.md § Kubernetes posture](APPLIANCE.md#kubernetes-posture-983) for
+the three classes and their values.
+
+For the raw manifests under `k8s/`, the `spatiumddi` namespace carries
+`pod-security.kubernetes.io/warn` + `audit` at `baseline`. Both are
+report-only — neither can reject a pod — and `enforce` is not usable because
+the DHCP agent needs `hostNetwork` and the DNS agents bind `:53` on the host.
 
 ---
 

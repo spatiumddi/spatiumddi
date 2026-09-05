@@ -7,7 +7,14 @@ type: application
 # --app-version` using the CalVer release tag.
 version: 0.1.0
 appVersion: "0.0.0-dev"
-kubeVersion: ">=1.26.0-0"
+# #983 — 1.26 was a claim, not a tested floor: nobody has run this chart on
+# it. The oldest behaviour the charts actually depend on is the >= 1.31
+# EndpointSlice loopback validation the appliance's k3s config comments
+# describe, so that is the floor. Raise it when a template starts using an
+# API only a later version serves — not speculatively, because the check is
+# enforced by the apiserver's reported version and a floor above what an
+# operator runs refuses the install outright.
+kubeVersion: ">=1.31.0-0"
 home: https://www.spatiumddi.com/
 sources:
   - https://github.com/spatiumddi

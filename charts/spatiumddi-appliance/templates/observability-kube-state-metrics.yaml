@@ -100,6 +100,14 @@ spec:
         app.kubernetes.io/name: kube-state-metrics
         app.kubernetes.io/component: kube-state-metrics
     spec:
+      {{- with .Values.observability.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
+      {{- with (include "spatiumddi-appliance.seccompProfileType" $) }}
+      securityContext:
+        seccompProfile:
+          type: {{ . }}
+      {{- end }}
       serviceAccountName: kube-state-metrics
       nodeSelector:
         {{- toYaml .Values.global.nodeSelector | nindent 8 }}

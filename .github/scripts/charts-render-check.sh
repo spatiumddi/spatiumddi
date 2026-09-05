@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Lint, render and schema-check both Helm charts (#966).
+# Lint, render and schema-check the Helm charts (#966, #983).
 #
 # Until this existed nothing on a PR parsed the charts at all: the one
 # PR-time helm job (agent-e2e) is path-filtered to charts/spatiumddi/** and
@@ -26,6 +26,11 @@
 #                      CPU + memory request or limit (#965). A ``with`` guard
 #                      that tests the wrong values path renders no
 #                      ``resources:`` block and passes the three gates above.
+#   pod-posture      — every render: each pod template carries a seccomp
+#                      profile, and (where the render opts in) a
+#                      PriorityClass (#983). Same failure mode as the line
+#                      above — a workload added without either one runs
+#                      perfectly well, just unprotected and unranked.
 #   toggle-coverage  — every ``.Values.x.enabled`` / ``.kind`` a template is
 #                      gated on must be flipped by at least one render, so a
 #                      new gate cannot silently fall out of the matrix.
@@ -45,6 +50,7 @@ CRD_SCHEMAS='https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Gro
 
 UMBRELLA="$ROOT/charts/spatiumddi"
 APPLIANCE="$ROOT/charts/spatiumddi-appliance"
+METALLB="$ROOT/charts/spatiumddi-metallb"
 
 for tool in helm kubeconform python3; do
     command -v "$tool" >/dev/null || { echo "missing: $tool" >&2; exit 1; }
@@ -63,6 +69,10 @@ lint() { # chart [helm --set args...]
 # disk cache makes renders 2-6 free, and CI persists it across runs.
 KUBECONFORM_CACHE="${KUBECONFORM_CACHE:-$OUT/.schema-cache}"
 mkdir -p "$KUBECONFORM_CACHE"
+
+# Extra flags handed to chart-pod-posture.py, set per render group below.
+# Word-split on purpose (simple flags only).
+POSTURE_ARGS=""
 
 render() { # name chart [helm --set args...]
     local name="$1" chart="$2"; shift 2
@@ -84,6 +94,9 @@ render() { # name chart [helm --set args...]
         -cache "$KUBECONFORM_CACHE" \
         "$file" || failures=$((failures + 1))
     python3 "$ROOT/.github/scripts/chart-no-besteffort.py" "$file" || failures=$((failures + 1))
+    # shellcheck disable=SC2086  # POSTURE_ARGS is a deliberate flag list
+    python3 "$ROOT/.github/scripts/chart-pod-posture.py" $POSTURE_ARGS "$file" \
+        || failures=$((failures + 1))
 }
 
 coverage() { # chart [every --set arg from every render of that chart...]
@@ -96,6 +109,7 @@ coverage() { # chart [every --set arg from every render of that chart...]
 # and this is the first time the dependency resolves before release.
 helm dependency update "$UMBRELLA"
 helm dependency update "$APPLIANCE"
+helm dependency update "$METALLB"
 
 # ── Umbrella chart ──────────────────────────────────────────────────────────
 # Every template gate on: the agents, ingress, the slot-image mirror, HPA, the
@@ -129,6 +143,18 @@ UMBRELLA_EXTERNAL=(
     --set postgresql.enabled=false --set externalDatabase.host=pg.example
     --set redis.enabled=false --set externalRedis.host=redis.example
 )
+# #983 — the appliance overlay's shape: both PriorityClass knobs set, and
+# every optional workload on, so the posture gate sees each one wired. Agent
+# StatefulSets only render when ``servers`` is non-empty, so the ``enabled``
+# toggle alone leaves those two templates unrendered — name a server.
+UMBRELLA_POSTURE=(
+    "${UMBRELLA_ALL_ON[@]}"
+    --set global.priorityClassName=spatium-control-plane
+    --set global.servicePriorityClassName=spatium-service
+    --set dnsAgents.servers[0].name=ns1
+    --set dhcpAgents.servers[0].name=dhcp1
+)
+
 lint "$UMBRELLA"
 lint "$UMBRELLA" "${UMBRELLA_ALL_ON[@]}"
 lint "$UMBRELLA" "${UMBRELLA_HA[@]}"
@@ -137,6 +163,15 @@ render umbrella-all-on "$UMBRELLA" "${UMBRELLA_ALL_ON[@]}"
 render umbrella-ha "$UMBRELLA" "${UMBRELLA_HA[@]}"
 # Bring-your-own database + Redis: the shape k8s/ha/ installs use.
 render umbrella-external-db "$UMBRELLA" "${UMBRELLA_EXTERNAL[@]}"
+POSTURE_ARGS="--require-priority"
+render umbrella-posture "$UMBRELLA" "${UMBRELLA_POSTURE[@]}"
+# ...and again on the HA topology. The CNPG ``Cluster`` and the Sentinel
+# StatefulSet only exist in this shape, and the Cluster carries the posture on
+# its OWN fields rather than on a pod template — so without this render a
+# wrong values path in cnpg-cluster.yaml ships green with Postgres at
+# priority 0, which is precisely what the gate exists to prevent.
+render umbrella-posture-ha "$UMBRELLA" "${UMBRELLA_POSTURE[@]}" "${UMBRELLA_HA[@]}"
+POSTURE_ARGS=""
 coverage "$UMBRELLA" "${UMBRELLA_ALL_ON[@]}" "${UMBRELLA_HA[@]}" "${UMBRELLA_EXTERNAL[@]}"
 
 # ── Appliance chart ─────────────────────────────────────────────────────────
@@ -158,12 +193,47 @@ APPLIANCE_ALL_ON=(
 )
 lint "$APPLIANCE"
 lint "$APPLIANCE" "${APPLIANCE_ALL_ON[@]}"
+# #983 — this chart renders the PriorityClasses it names, so every appliance
+# pod must carry one. ``agent-landing`` is the recorded exception: a courtesy
+# redirect page that must not outrank anything, and at priority 0 it is also
+# the natural first eviction candidate.
+POSTURE_ARGS="--require-priority --allow-no-priority agent-landing"
 render appliance-defaults "$APPLIANCE"
 render appliance-all-on "$APPLIANCE" "${APPLIANCE_ALL_ON[@]}"
 # The single-node default install shape: one DNS driver + DHCP + supervisor.
 render appliance-full-stack "$APPLIANCE" \
     --set dnsBind9.enabled=true --set dhcpKea.enabled=true --set supervisor.enabled=true
+POSTURE_ARGS=""
 coverage "$APPLIANCE" "${APPLIANCE_ALL_ON[@]}"
+
+# ── MetalLB wrapper chart ───────────────────────────────────────────────────
+# #983 — this chart was rendered by NOTHING on a PR (the two blocks above name
+# the other two charts explicitly), which is how its speaker and controller
+# stayed BestEffort at priority 0 while every workload around them was ranked:
+# no gate could see them. It ships ``metallb.enabled: false``, so the
+# render that matters is the one with it on — the shape the supervisor
+# applies the moment an operator sets a control-plane VIP.
+METALLB_ALL_ON=(
+    --set metallb.enabled=true
+    --set metallb.ipPool.addresses[0]=10.0.0.20-10.0.0.30
+    --set metallb.bgp.enabled=true
+)
+lint "$METALLB"
+lint "$METALLB" "${METALLB_ALL_ON[@]}"
+render metallb-defaults "$METALLB"
+POSTURE_ARGS="--require-priority"
+render metallb-all-on "$METALLB" "${METALLB_ALL_ON[@]}"
+# BGP mode (#566 D1) — the supervisor flips ``frrk8s.enabled`` on together
+# with ``bgp.enabled`` the moment a peer is configured, so this shape reaches
+# real appliances and has to be rendered. The two frr-k8s workloads are
+# exempted from the seccomp check ONLY: the frr-k8s 0.0.21 subchart exposes no
+# pod-securityContext knob, so no values override can supply a profile.
+# Exempting them by name is strictly better than not rendering the chart,
+# which is how their missing priority class and BestEffort QoS survived #965.
+POSTURE_ARGS="--require-priority --allow-no-seccomp frr-k8s,frr-k8s-statuscleaner"
+render metallb-bgp "$METALLB" "${METALLB_ALL_ON[@]}" --set metallb.frrk8s.enabled=true
+POSTURE_ARGS=""
+coverage "$METALLB" "${METALLB_ALL_ON[@]}" --set metallb.frrk8s.enabled=true
 
 if [ "$failures" -ne 0 ]; then
     echo "charts: $failures gate(s) failed" >&2

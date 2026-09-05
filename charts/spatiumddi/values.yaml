@@ -38,6 +38,31 @@ global:
   # phases) configures the gate from the umbrella valuesContent.
   controlPlaneNodeSelector: {}
 
+  # #983 — pod-level seccomp profile for every workload this chart renders.
+  # Kubernetes leaves a container ``Unconfined`` unless asked; docker-compose
+  # applies the runtime's default profile to every service. So the default
+  # here restores parity — without it the same images run with FEWER syscall
+  # restrictions under Kubernetes than under Compose.
+  # ``RuntimeDefault`` | ``Unconfined`` | ``""`` (omit the block entirely).
+  seccompProfile: RuntimeDefault
+
+  # #983 — PriorityClass applied to every CONTROL-PLANE workload (api,
+  # worker, beat, frontend, migrate, postgres, redis, sentinel, the slot-image
+  # mirror). Per-workload ``<component>.priorityClassName`` overrides it.
+  #
+  # Empty by default and it must stay that way for a bring-your-own cluster:
+  # the apiserver REJECTS a pod naming a PriorityClass that does not exist, so
+  # setting this without creating the class first takes the whole release
+  # down. The appliance overlay sets it to ``spatium-control-plane``, which
+  # the spatiumddi-appliance chart renders.
+  priorityClassName: ""
+
+  # #983 — same, for the SERVICE workloads (the optional DNS / DHCP agent
+  # StatefulSets). Split from the control-plane knob because a DNS agent
+  # answering the LAN should outrank the API that configures it when a node
+  # runs out of memory.
+  servicePriorityClassName: ""
+
 # Cluster-wide app name override. Leave empty to use `.Release.Name`.
 fullnameOverride: ""
 nameOverride: ""
@@ -53,6 +78,7 @@ auth:
 # ── API ──────────────────────────────────────────────────────────────────────
 api:
   replicas: 2
+  priorityClassName:  # #983 — unset inherits ``global.priorityClassName``; "" means no class
   service:
     type: ClusterIP
     port: 8000
@@ -209,6 +235,7 @@ api:
 # BYO-Kubernetes installs, where nothing tracks the replica count for you.
 slotImageMirror:
   enabled: false
+  priorityClassName:  # #983 — unset inherits ``global.priorityClassName``; "" means no class
   storage:
     # 32 GiB default — fits ~7-8 typical slot images (4 GiB cap each,
     # but real images today are ~800 MiB-1.2 GiB compressed). Bump
@@ -241,6 +268,7 @@ slotImageMirror:
 # ── Frontend (nginx + Vite build) ────────────────────────────────────────────
 frontend:
   replicas: 2
+  priorityClassName:  # #983 — unset inherits ``global.priorityClassName``; "" means no class
   service:
     type: ClusterIP
     port: 80
@@ -326,6 +354,7 @@ frontend:
 # ── Worker (Celery queues: ipam, dns, dhcp, default) ─────────────────────────
 worker:
   replicas: 2
+  priorityClassName:  # #983 — unset inherits ``global.priorityClassName``; "" means no class
   concurrency: 4
   queues: "ipam,dns,dhcp,default"
   resources:
@@ -348,6 +377,7 @@ worker:
 
 # ── Beat (singleton scheduler — always 1 replica) ────────────────────────────
 beat:
+  priorityClassName:  # #983 — unset inherits ``global.priorityClassName``; "" means no class
   resources:
     requests: { cpu: 50m, memory: 128Mi }
     limits:   { cpu: 200m, memory: 256Mi }
@@ -369,6 +399,7 @@ beat:
 # migrations from CI/CD instead of Helm.
 migrate:
   enabled: true
+  priorityClassName:  # #983 — unset inherits ``global.priorityClassName``; "" means no class
   backoffLimit: 3
   # Garbage-collect each migrate Job this many seconds after completion.
   # Without a TTL the cluster would slowly accumulate one completed Job
@@ -420,6 +451,7 @@ ingress:
 # and fill in the ``externalDatabase`` block below.
 postgresql:
   enabled: true
+  priorityClassName:  # #983 — unset inherits ``global.priorityClassName``; "" means no class
   kind: standalone
   image:
     repository: postgres
@@ -556,6 +588,7 @@ externalDatabase:
 # fill in ``externalRedis``.
 redis:
   enabled: true
+  priorityClassName:  # #983 — unset inherits ``global.priorityClassName``; "" means no class
   kind: standalone
   image:
     repository: redis
@@ -648,6 +681,7 @@ externalRedis:
 # closer to the network edge.
 dnsAgents:
   enabled: false
+  priorityClassName:  # #983 — unset inherits ``global.servicePriorityClassName``; "" means no class
   # Default image — used when a server entry doesn't override.
   # Configures the BIND9 driver (the historical default flavor).
   image:
@@ -704,6 +738,7 @@ dnsAgents:
 # ── DHCP agents (optional — managed Kea StatefulSets) ────────────────────────
 dhcpAgents:
   enabled: false
+  priorityClassName:  # #983 — unset inherits ``global.servicePriorityClassName``; "" means no class
   image:
     repository: ghcr.io/spatiumddi/dhcp-kea
     tag: ""

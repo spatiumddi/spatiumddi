@@ -44,6 +44,14 @@ spec:
         prometheus.io/scrape: "true"
         prometheus.io/port: "9100"
     spec:
+      {{- with .Values.observability.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
+      {{- with (include "spatiumddi-appliance.seccompProfileType" $) }}
+      securityContext:
+        seccompProfile:
+          type: {{ . }}
+      {{- end }}
       serviceAccountName: node-exporter
       nodeSelector:
         {{- toYaml .Values.global.nodeSelector | nindent 8 }}

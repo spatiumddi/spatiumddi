@@ -33,8 +33,15 @@ spec:
       labels:
         {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" $cmp) .) | nindent 8 }}
     spec:
+      {{- with (include "spatiumddi.priorityClassName" (dict "component" .Values.postgresql.priorityClassName "fallback" (.Values.global).priorityClassName)) }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
       terminationGracePeriodSeconds: 30
       securityContext:
+        {{- with (include "spatiumddi.seccompProfileType" $) }}
+        seccompProfile:
+          type: {{ . }}
+        {{- end }}
         # Match the postgres image's UID — the Alpine ``postgres`` user
         # runs as 70:70. fsGroup makes the mounted PVC writable.
         fsGroup: 70

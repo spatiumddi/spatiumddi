@@ -17,6 +17,13 @@ spec:
         app: spatiumddi-worker
         app.kubernetes.io/component: worker
     spec:
+      # #983 — Kubernetes runs a container ``Unconfined`` unless a profile is
+      # asked for, while docker-compose applies the runtime's default profile
+      # to every service. Without this the same image runs with FEWER syscall
+      # restrictions here than under Compose.
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
       # #590 — spread replicas across nodes so a single node loss can't
       # take every replica of this workload with it. Soft (preferred): a
       # single-node or replicas>nodes cluster must still schedule. The
@@ -130,6 +137,13 @@ spec:
         app: spatiumddi-beat
         app.kubernetes.io/component: beat
     spec:
+      # #983 — Kubernetes runs a container ``Unconfined`` unless a profile is
+      # asked for, while docker-compose applies the runtime's default profile
+      # to every service. Without this the same image runs with FEWER syscall
+      # restrictions here than under Compose.
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: beat
           image: ghcr.io/spatiumddi/spatiumddi-api:latest

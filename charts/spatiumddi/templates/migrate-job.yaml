@@ -32,6 +32,14 @@ spec:
       labels:
         {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" "migrate") .) | nindent 8 }}
     spec:
+      {{- with (include "spatiumddi.priorityClassName" (dict "component" .Values.migrate.priorityClassName "fallback" (.Values.global).priorityClassName)) }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
+      {{- with (include "spatiumddi.seccompProfileType" $) }}
+      securityContext:
+        seccompProfile:
+          type: {{ . }}
+      {{- end }}
       restartPolicy: OnFailure
       {{- with .Values.image.pullSecrets }}
       imagePullSecrets:
