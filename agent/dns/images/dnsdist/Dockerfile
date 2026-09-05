@@ -11,7 +11,15 @@ FROM alpine:3.23 AS runtime
 
 # apk upgrade before add so the layer cache can't serve a stale index that
 # Trivy would then flag (mirrors the powerdns image rationale).
-RUN apk upgrade --no-cache \
+# ``APK_SNAPSHOT`` is what makes that upgrade actually run in CI. BuildKit
+# keys a layer on its RUN text, so a ``type=gha`` cache serves this whole
+# layer — package set included — from whenever it was first built, until
+# the text changes. The nightly passes its date tag so the layer is
+# rebuilt once a night against the current index; local builds default
+# to ``dev``. Full story: agent/supervisor/images/supervisor/Dockerfile.
+ARG APK_SNAPSHOT=dev
+RUN echo "apk snapshot ${APK_SNAPSHOT}" >/dev/null \
+    && apk upgrade --no-cache \
     && apk add --no-cache dnsdist libcap bash tini \
     # uid/gid PINNED (#50) — must match the powerdns image, whose agent
     # writes the DoT/DoH listener key at mode 0600 into the volume this

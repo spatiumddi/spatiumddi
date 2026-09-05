@@ -339,8 +339,18 @@ because
 nothing else builds the *release* image except a release — which is how
 [#732](https://github.com/spatiumddi/spatiumddi/issues/732) shipped an api
 image carrying pytest as root, undetected until the next release cut it.
-The nightly also runs the same Trivy gate CI uses on PRs, so a base-image
-CVE surfaces the night the Dockerfile changes rather than at the next tag.
+The nightly also runs the same Trivy scan CI uses on PRs (HIGH/CRITICAL,
+fix available), *before* anything is pushed, so a base-image CVE surfaces
+the night it lands rather than at the next tag. The verdict comes from
+[`.github/scripts/trivy-gate.sh`](../.github/scripts/trivy-gate.sh),
+which asks the image's own package index whether each flagged fix is
+installable today: if it is, the image fails (a rebuild would cure it);
+if Alpine has committed the fix but the package has not reached the
+mirrors yet, the finding is **deferred** — a warning, not a failure — and
+the next night picks it up. That works because every Alpine image
+declares `ARG APK_SNAPSHOT` right before its `apk upgrade`, and the
+nightly passes the date tag, so the package layer is rebuilt against the
+current index each night instead of being served from the layer cache.
 
 To run current `main` without cutting a release:
 

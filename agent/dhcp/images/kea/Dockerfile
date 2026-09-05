@@ -85,7 +85,15 @@ FROM alpine:3.23 AS runtime
 # The old explicit ``libcrypto3>=3.5.7-r0`` / ``libssl3>=3.5.7-r0`` bounds
 # (CVE-2026-45447) are gone: the alpine 3.23 base already ships openssl
 # 3.5.7-r0, so they were redundant. ``apk upgrade`` above keeps them current.
-RUN apk upgrade --no-cache \
+# ``APK_SNAPSHOT`` is what makes that upgrade actually run in CI. BuildKit
+# keys a layer on its RUN text, so a ``type=gha`` cache serves this whole
+# layer — package set included — from whenever it was first built, until
+# the text changes. The nightly passes its date tag so the layer is
+# rebuilt once a night against the current index; local builds default
+# to ``dev``. Full story: agent/supervisor/images/supervisor/Dockerfile.
+ARG APK_SNAPSHOT=dev
+RUN echo "apk snapshot ${APK_SNAPSHOT}" >/dev/null \
+ && apk upgrade --no-cache \
  && apk add --no-cache \
       'kea>=3.0.3-r0' kea-dhcp4 kea-dhcp6 kea-admin \
       kea-hook-lease-cmds kea-hook-ha \
