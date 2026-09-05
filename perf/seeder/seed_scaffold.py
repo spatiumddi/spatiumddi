@@ -64,6 +64,7 @@ from spddi_perf.runpaths import RunPaths
 # imports whether launched as a module or a file.
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
 from _api import ApiClient, ApiError  # noqa: E402
+from _zone_names import find_existing_zone  # noqa: E402
 
 # Env vars for group reuse (pre-prepared appliances — see PERF_APPLIANCE_SETUP.md §2).
 # When set, skip group creation and seed zones/scopes into the existing groups so the
@@ -209,6 +210,12 @@ def _get_or_create_zone(
     Tries POST first. On 409 (zone already exists in the group) fetches the zone
     list and returns the existing id with ``was_created=False``. Used when reusing
     a pre-existing DNS group so the seeder is idempotent across smoke-run retries.
+
+    The list is matched through ``find_existing_zone``, never on the raw
+    string: the API canonicalises a zone name (lower-case + root dot) and
+    reports the canonical form, so ``z["name"] == zname`` compares
+    ``"burst.ddipg.test."`` with ``"burst.ddipg.test"`` and is false for
+    every zone that exists. See ``_zone_names`` for the full story (#981).
     """
     try:
         z = api.json("POST", f"/v1/dns/groups/{group_id}/zones", json={
@@ -218,14 +225,22 @@ def _get_or_create_zone(
     except ApiError as exc:
         if exc.status_code != 409:
             raise
-        # Zone already exists — find it in the group's zone list
+        # Zone already exists — find it in the group's zone list.
         zones = api.json("GET", f"/v1/dns/groups/{group_id}/zones")
-        for z in zones:
-            if z.get("name") == zname:
-                log_event(log, logging.INFO, "zone_reused", zone=zname, zone_id=z["id"])
-                return z["id"], False
+        found = find_existing_zone(zones, zname)
+        if found is not None:
+            log_event(log, logging.INFO, "zone_reused",
+                      zone=zname, api_name=found.get("name"), zone_id=found["id"])
+            return found["id"], False
+        # Should be unreachable: the 409 says an unviewed zone by this name
+        # exists in this group. Name what the group actually holds — the
+        # bare "not found" this replaced took a QA rig to diagnose.
+        listed = sorted(str(z.get("name") or "") for z in zones)
         raise RuntimeError(
-            f"zone {zname!r} reported conflict (409) but was not found in group {group_id}"
+            f"zone {zname!r} reported conflict (409) but no unviewed zone in group "
+            f"{group_id} matches it; the group lists "
+            f"{listed[:20]}{' …' if len(listed) > 20 else ''} "
+            f"({len(listed)} zone(s))"
         ) from exc
 
 
