@@ -46,6 +46,7 @@ import spddi_perf.manifest as manifest_mod  # noqa: E402
 import spddi_perf.setpoints as setpoints_mod  # noqa: E402
 from spddi_perf.logging_util import append_ndjson, get_logger, read_json, utc_now_iso  # noqa: E402
 from spddi_perf.runpaths import RunPaths  # noqa: E402
+from spddi_perf.zone_names import is_reverse_zone  # noqa: E402
 
 from lifecycle_log import LatencyAccumulator  # noqa: E402
 
@@ -122,8 +123,13 @@ class ApiMutationStream:
                 rz = await client.get(
                     f"{self.api}/dns/groups/{self._dns_group_id}/zones")
                 zones = rz.json() if rz.status_code == 200 else []
-                # pick a forward zone (skip in-addr.arpa to keep record names simple)
-                fwd = [z for z in zones if not str(z.get("name", "")).endswith(".arpa")]
+                # Pick a FORWARD zone — record names stay simple, and an A
+                # record in a reverse zone is nonsense. Matched on the
+                # canonical name: the API stores ``0.10.in-addr.arpa.`` and a
+                # raw ``endswith('.arpa')`` is false for it, so this used to
+                # select the reverse zone that ``list_zones`` sorts first
+                # and POST every mutation into it (#981).
+                fwd = [z for z in zones if not is_reverse_zone(str(z.get("name", "")))]
                 if fwd:
                     self._dns_zone_id = fwd[0]["id"]
         except Exception as exc:
