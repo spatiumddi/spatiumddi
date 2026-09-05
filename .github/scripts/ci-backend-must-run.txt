@@ -30,6 +30,12 @@ agent/supervisor/spatium_supervisor/
 # that its output still goes through app.openapi()'s wrapper.
 scripts/export_openapi.py
 
+# test_outbound_hosts_documented.py (#976) asserts every hostname literal in
+# backend/app is documented in the privacy statement. docs/ is denied
+# wholesale, so without this carve-out a PR that quietly deletes a row from
+# PRIVACY.md would go green — the one edit that must run the guard.
+docs/PRIVACY.md
+
 # The gate machinery itself: the script, this manifest, and the tests that
 # pin them. Any edit here must run the suite that contains those tests.
 .github/scripts/

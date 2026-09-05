@@ -38,6 +38,7 @@ Always read the relevant spec doc(s) before writing code for a feature area.
 | `docs/OBSERVABILITY.md` | Logging (centralized + UI viewer), metrics, health dashboard, alerting |
 | `docs/TROUBLESHOOTING.md` | Recovery recipes: accidentally deleted agent rows, password reset, subnet delete refused |
 | `docs/THIRD_PARTY.md` | Catalogue of every bundled/shipped third-party component — engine, library, OS package — with license, the artifact it ships in, and the rationale. Operator-facing companion to the root `NOTICE` (which stays authoritative for license text). **When you add a shipped component, update BOTH** |
+| `docs/PRIVACY.md` | The privacy statement — no telemetry, no analytics, no phone-home — plus the **normative table of every outbound connection** the backend can make, its default, and what it sends. `backend/tests/test_outbound_hosts_documented.py` fails CI when a hostname literal in `backend/app` is absent from it. **When you add an outbound call, update this page in the same PR** (see non-negotiable #17) |
 | `docs/features/IPAM.md` | IP Space/Block/Subnet/Address management, VLAN/VXLAN, custom fields, import/export, tree UI |
 | `docs/features/DHCP.md` | DHCP servers, scopes, pools, static assignments, DDNS, caching, Windows DHCP (Path A) |
 | `docs/features/DNS.md` | DNS servers, zones, records, views, server groups, blocking lists, DDNS, zone tree, Windows DNS (Path A + B), Technitium, encrypted transports (DoT / DoH / DoQ), DNS threat analytics, sync-with-servers reconciliation |
@@ -146,6 +147,8 @@ These rules apply to every file Claude Code generates. No exceptions.
 14. **Feature-module gating for new top-level surfaces**: When adding a new top-level resource family (sidebar section, REST router prefix, MCP tool cluster), evaluate whether it should be a togglable feature module. If yes: (a) add a `ModuleSpec` to `app.services.feature_modules.MODULES`, (b) seed a row in a migration alongside the model migration, (c) apply `dependencies=[Depends(require_module("…"))]` to the router include in `app/api/v1/router.py`, (d) tag MCP tools with `module="…"` in their `register_tool(...)` call, (e) carry `module: "…"` on the matching sidebar `NavItem` definition. Default-enabled, per #13's discovery argument — operators turn off what they don't use
 15. **New integrations show up on the Dashboard — both surfaces**: When adding an integration mirror (Kubernetes / Docker / Proxmox / Tailscale / UniFi shape — read-only pull reconciler with per-target rows), wire it into BOTH dashboard surfaces: (1) the `IntegrationsPanel` inside the IPAM tab on `frontend/src/pages/DashboardPage.tsx` — add the `useQuery` gated on the `integration_*_enabled` flag, thread `enabled` + row list through props, extend column-count + grid cn() case, add a panel block following the existing icon + name + count + view-all + per-row `IntegrationRow` pattern; (2) the dedicated **Integrations dashboard tab** at `backend/app/api/v1/dashboards/integrations.py` — append a target query, add a `_build_panel(...)` entry to the `panels` list, register the new resource_type string in `_INTEGRATION_RESOURCE_TYPES` so reconciler error-audit rows surface in the recent-errors list, and extend the frontend `IntegrationDashboardKind` union in `lib/api.ts`. Both surfaces are operator-facing health rollups; missing either one means a new integration is invisible somewhere it should be obvious
 16. **Per-role node-label gating for every new workload**: Every new top-level workload (Deployment / StatefulSet / DaemonSet) added to `charts/spatiumddi/` or `charts/spatiumddi-appliance/` gates scheduling on a per-role node label (`spatium.io/role-<service>=true`), not on chart-render `values.<svc>.enabled` toggles. The `nodeSelector` block merges `global.nodeSelector` (the umbrella `spatium.io/role=appliance` gate) AND a per-role label. Labels are stamped by two paths that already exist: install-time bake in `appliance/mkosi.extra/usr/local/bin/spatium-install`'s `config.yaml.d/spatium-roles.yaml` drop-in for `full-stack` / `control-only` variants; dynamic apply via the supervisor's `kubectl label` (`agent/supervisor/spatium_supervisor/k8s_api.py`) for `application` variants on role-assignment changes. `enabled: false` values stay as a global suppression knob; the per-role label is the source of truth for *which* node a workload lands on. Reference pattern: `charts/spatiumddi-appliance/templates/{dns-bind9,dhcp-kea}.yaml`. Without this, multi-node HA (#272) silently schedules control-plane workloads on DNS-only nodes — invisible misplacement that won't surface until the first node loss.
+
+17. **No telemetry.** SpatiumDDI has no phone-home, no usage analytics, no crash reporting, and no project-controlled endpoint — and there is never to be one. Never add an outbound connection that is not operator-configured and documented in [`docs/PRIVACY.md`](docs/PRIVACY.md) with its default and its payload; a hostname literal in `backend/app` that is absent from that page fails CI (`backend/tests/test_outbound_hosts_documented.py`). Anything **default-on** needs an issue and a decision, not a PR: today exactly one connection is enabled out of the box (the daily anonymous GitHub release check), the README / docs hero / Settings copy all say so in those words, and a second one makes all three false at once
 
 ---
 
@@ -1111,6 +1114,34 @@ suggestion, free-space treemap.
 - ✅ [**Account lockout after N failed logins**](https://github.com/spatiumddi/spatiumddi/issues/71) — shipped `2026.05.07-1`: windowed-counter lockout for local-auth users over `user.failed_login_count` / `failed_login_locked_until` / `last_failed_login_at`, reset on any success. Defaults to disabled (`threshold=0`). Migration `a7b3c8d92e14`.
 - ✅ [**Active session viewer + force-logout**](https://github.com/spatiumddi/spatiumddi/issues/72) — shipped `2026.05.07-1`: live JWT registry the operator can browse and revoke from — access tokens carry a `jti`, and `user_session` gains `auth_source` / `last_seen_at` / `revoked` + a `(revoked, expires_at)` index. Migration `c8e4f7a91d36`.
 - ✅ [**Internal cert + secret expiry monitoring**](https://github.com/spatiumddi/spatiumddi/issues/76) — shipped `2026.06.11-1`: one `secret_expiring` alert rule that fires per internal credential expiring within `threshold_days` — supervisor mTLS certs (`appliance.cert_expires_at`) + API tokens (`api_token.expires_at`). Extended in `2026.06.19-1` to cover the Let's Encrypt Web-UI cert (#438).
+- ✅ [**Privacy statement — no telemetry, no analytics, your data stays in your install**](https://github.com/spatiumddi/spatiumddi/issues/976)
+  — SpatiumDDI has been privacy-first by construction since the first commit
+  and said so **nowhere**, so an operator evaluating a platform that will hold
+  every hostname, lease and subnet they own had to infer it from the absence of
+  a settings page. Now [`docs/PRIVACY.md`](docs/PRIVACY.md) (short form in the
+  README, linked from the docs nav, footer and hero), written from a sweep of
+  every outbound connection in the tree rather than from a slogan.
+  **The release check stays default-on and is disclosed in the first
+  paragraph**, not a footnote — the issue's other option was flipping it to
+  opt-in so the headline sentence needed no exception. It is an unauthenticated
+  GET that carries *nothing* about the install, GitHub is the only party that
+  sees it, and an operator who misses a security fix is worse off than one
+  whose firewall logged a daily GET; the Settings → Application → Updates toggle that
+  closes it now says exactly that instead of being an unlabelled switch.
+  **The guard is the deliverable, not the prose.** A statement like this rots
+  the first time somebody adds a convenience fetch — it does not go vague, it
+  goes *false*. `backend/tests/test_outbound_hosts_documented.py` scans
+  `backend/app` for hostname literals and fails until each appears on the page,
+  and a second test pins §3.1 to **one** row, because the README, the docs hero
+  and the Settings copy all state there is exactly one default-on connection
+  and a second would falsify three surfaces at once. Both lists — connections
+  *and* non-connections — live in PRIVACY.md rather than in a test allowlist,
+  so filing a real endpoint under "not a connection" is a lie a human has to
+  type into the document readers actually read. `docs/PRIVACY.md` is a declared
+  carve-out in `.github/scripts/ci-backend-must-run.txt`, or deleting a row
+  from it would go green (docs/ is denied wholesale). The sweep found six
+  hostnames the hand-written issue table missed, which is the argument for the
+  guard in one line. See non-negotiable #17.
 - ⬜ [**FIPS 140-3 posture**](https://github.com/spatiumddi/spatiumddi/issues/880) — crypto audit plus a tiered
   roadmap for a FIPS-capable build (containers / Kubernetes /
   appliance). Gate for government deployments; the audit comes first

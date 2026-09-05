@@ -687,8 +687,18 @@ const SECTIONS: SectionDef[] = [
     id: "updates",
     title: "Updates",
     group: "Application",
-    description: "Release-check behavior.",
-    keywords: ["github", "release", "version", "check"],
+    description:
+      "Release-check behavior — the only outbound connection SpatiumDDI makes on its own.",
+    keywords: [
+      "github",
+      "release",
+      "version",
+      "check",
+      "privacy",
+      "telemetry",
+      "phone home",
+      "air-gap",
+    ],
   },
 
   // ── Security ─────────────────────────────────────────────────────────
@@ -2416,16 +2426,42 @@ export function SettingsPage() {
             )}
 
             {activeId === "updates" && (
-              <Field
-                label="Check for GitHub Releases"
-                description="Periodically check GitHub for new SpatiumDDI releases."
-              >
-                <Toggle
-                  checked={!!values.github_release_check_enabled}
-                  onChange={(v) => set("github_release_check_enabled", v)}
-                  disabled={!isSuperadmin}
-                />
-              </Field>
+              <>
+                <Field
+                  label="Check for GitHub Releases"
+                  description="Once a day, ask GitHub whether a newer SpatiumDDI release exists, so the UI can show an update pill."
+                >
+                  <Toggle
+                    checked={!!values.github_release_check_enabled}
+                    onChange={(v) => set("github_release_check_enabled", v)}
+                    disabled={!isSuperadmin}
+                  />
+                </Field>
+                {/* The privacy statement (docs/PRIVACY.md) names this as the
+                    one connection that is on by default, so the screen that
+                    turns it off has to say exactly what it sends — an
+                    unlabelled switch is what makes a reader assume the worst. */}
+                <p className="pb-2 text-xs leading-relaxed text-muted-foreground">
+                  Unauthenticated <code>GET</code> to{" "}
+                  <code>api.github.com</code> — no token, and nothing about this
+                  install is sent: no version, no counts, no identifiers. GitHub
+                  sees this server&rsquo;s IP address and an HTTP User-Agent,
+                  and the SpatiumDDI project receives nothing (there is no
+                  project-controlled endpoint). This is the only outbound
+                  connection SpatiumDDI makes that you did not configure;
+                  turning it off closes it entirely and nothing else changes.
+                  See the{" "}
+                  <a
+                    className="underline hover:text-foreground"
+                    href="https://www.spatiumddi.com/PRIVACY.html"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    privacy statement
+                  </a>{" "}
+                  for every other connection the product can make.
+                </p>
+              </>
             )}
 
             {activeId === "utilization" && (
