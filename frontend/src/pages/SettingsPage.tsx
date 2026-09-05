@@ -2455,7 +2455,7 @@ export function SettingsPage() {
                     className="underline hover:text-foreground"
                     href="https://www.spatiumddi.com/PRIVACY.html"
                     target="_blank"
-                    rel="noreferrer"
+                    rel="noopener noreferrer"
                   >
                     privacy statement
                   </a>{" "}
