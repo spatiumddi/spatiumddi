@@ -3,7 +3,7 @@
 The gather reads nodes + pods cluster-wide and the kubelet Summary API via
 the api pod's ServiceAccount. Here we monkeypatch the three ``k8s`` helpers
 with realistic kubeapi-shaped fixtures and assert the rollup (KPIs, per-node
-live usage, workload health, top pods) + the degraded paths (no nodes/proxy
+live usage, workload health, top pods) + the degraded paths (no Summary-API
 grant → no live usage; nodes 403 → available=false; SA missing → 503).
 """
 
@@ -195,7 +195,7 @@ def test_get_cluster_health_rollup(monkeypatch) -> None:
 
 
 def test_cluster_health_degrades_without_kubelet_proxy(monkeypatch) -> None:
-    # nodes/proxy not granted → 403 on the Summary API → no live usage, but
+    # Neither Summary-API grant → 403 → no live usage, but
     # the node inventory + workload rollup still render.
     _patch_kube(monkeypatch, summary_status=403)
     snap = cluster_health.get_cluster_health()

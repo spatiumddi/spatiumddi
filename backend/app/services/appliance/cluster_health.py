@@ -2,10 +2,15 @@
 
 Aggregates a live picture of the k3s cluster *underneath* the appliance from
 data the api pod's ServiceAccount can already read (nodes + pods cluster-wide)
-plus the kubelet Summary API via the apiserver proxy (``nodes/proxy [get]``,
-added in the same PR). This is the same data source the TTY console uses — the
-appliance ships **no** metrics-server / Prometheus, so live CPU / memory comes
-from the kubelet Summary API, not ``metrics.k8s.io``.
+plus the kubelet Summary API. This is the same data source the TTY console
+uses — the appliance ships **no** metrics-server / Prometheus, so live CPU /
+memory comes from the kubelet Summary API, not ``metrics.k8s.io``. Since
+Kubernetes 1.36 that response also carries PSI stall percentages (#983).
+
+Two transports reach it, per node: direct to the kubelet on :10250 under
+``nodes/stats``, falling back to the apiserver proxy under ``nodes/proxy``.
+See ``k8s.get_node_stats_summary``; which one served is reported back on the
+snapshot so the broad proxy grant can eventually be dropped.
 
 ``get_cluster_health()`` is a synchronous gather (a handful of stdlib kubeapi
 calls); the router runs it in a worker thread so the event loop never blocks,
@@ -347,9 +352,9 @@ def get_cluster_health() -> dict[str, Any]:
     except k8s.KubeapiUnavailableError:
         pods_raw = []
 
-    # Per-node kubelet Summary API (CPU / mem / fs + per-pod usage). Degrades
-    # cleanly to "no live usage" when nodes/proxy isn't granted (403) or a
-    # kubelet is briefly unreachable.
+    # Per-node kubelet Summary API (CPU / mem / fs + per-pod usage, and PSI
+    # since 1.36). Degrades cleanly to "no live usage" when NEITHER transport
+    # is granted (403 on both) or a kubelet is briefly unreachable.
     node_stats: dict[str, dict[str, Any]] = {}
     pod_usage: dict[tuple[str, str], tuple[float, int]] = {}
     metrics_available = False

@@ -6,10 +6,13 @@ Mounted at ``/api/v1/appliance/cluster``:
     GET  /health/stream   SSE — a fresh snapshot every ~2 s (live dashboard)
 
 Both read the k3s cluster *underneath* the appliance via the api pod's
-ServiceAccount (nodes + pods + kubelet Summary API). Live CPU / memory come
-from the kubelet Summary API (``nodes/proxy``) because the appliance ships no
-metrics-server / Prometheus — same source the TTY console uses. See
-``services/appliance/cluster_health.py`` for the gather.
+ServiceAccount (nodes + pods + kubelet Summary API). Live CPU / memory — and,
+since Kubernetes 1.36, PSI stall percentages (#983) — come from the kubelet
+Summary API because the appliance ships no metrics-server / Prometheus, the
+same source the TTY console uses. That API is reached per node either
+directly (``nodes/stats``) or through the apiserver proxy (``nodes/proxy``);
+the snapshot reports which. See ``services/appliance/cluster_health.py`` for
+the gather.
 """
 
 from __future__ import annotations
