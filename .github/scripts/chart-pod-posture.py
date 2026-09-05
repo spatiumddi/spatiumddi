@@ -119,6 +119,7 @@ def main(argv: list[str]) -> int:
         return 2
 
     problems: list[str] = []
+    exempted: list[str] = []
     checked = 0
 
     for path in files:
@@ -135,14 +136,15 @@ def main(argv: list[str]) -> int:
             if cr_key in MANAGED_POD_CRS:
                 checked += 1
                 fields = MANAGED_POD_CRS[cr_key]
-                if not _exempt(name, exempt_seccomp) and not dig(doc, fields["seccomp"]):
+                if _exempt(name, exempt_seccomp):
+                    exempted.append(f"{name} (seccomp)")
+                elif not dig(doc, fields["seccomp"]):
                     problems.append(f"{where}: no {'.'.join(fields['seccomp'])}")
-                if (
-                    require_priority
-                    and not _exempt(name, exempt_priority)
-                    and not dig(doc, fields["priority"])
-                ):
-                    problems.append(f"{where}: no {'.'.join(fields['priority'])}")
+                if require_priority:
+                    if _exempt(name, exempt_priority):
+                        exempted.append(f"{name} (priority)")
+                    elif not dig(doc, fields["priority"]):
+                        problems.append(f"{where}: no {'.'.join(fields['priority'])}")
                 continue
 
             if kind not in POD_TEMPLATE_PATHS:
@@ -153,19 +155,19 @@ def main(argv: list[str]) -> int:
                 continue
             checked += 1
 
-            profile = dig(pod, ("securityContext", "seccompProfile", "type"))
-            if not profile and not _exempt(name, exempt_seccomp):
+            if _exempt(name, exempt_seccomp):
+                exempted.append(f"{name} (seccomp)")
+            elif not dig(pod, ("securityContext", "seccompProfile", "type")):
                 problems.append(f"{where}: pod securityContext has no seccompProfile.type")
 
-            if (
-                require_priority
-                and not _exempt(name, exempt_priority)
-                and not pod.get("priorityClassName")
-            ):
-                problems.append(
-                    f"{where}: no priorityClassName "
-                    "(add one, or name it in --allow-no-priority to record the decision)"
-                )
+            if require_priority:
+                if _exempt(name, exempt_priority):
+                    exempted.append(f"{name} (priority)")
+                elif not pod.get("priorityClassName"):
+                    problems.append(
+                        f"{where}: no priorityClassName "
+                        "(add one, or name it in --allow-no-priority to record the decision)"
+                    )
 
     if problems:
         print(f"pod-posture: {len(problems)} problem(s) across {checked} workload(s)", file=sys.stderr)
@@ -173,9 +175,12 @@ def main(argv: list[str]) -> int:
             print(f"  {p}", file=sys.stderr)
         return 1
 
+    # Name what was skipped rather than counting the flags: a count of names
+    # GIVEN reads as "1 exempted" on a render where that workload is not even
+    # present, which quietly overstates how much the gate let through.
     note = " (priority required)" if require_priority else ""
-    if exempt_priority or exempt_seccomp:
-        note += f", {len(exempt_priority | exempt_seccomp)} exempted"
+    if exempted:
+        note += f" — exempted: {', '.join(sorted(exempted))}"
     print(f"pod-posture: {checked} workload(s) OK{note}")
     return 0
 
