@@ -48,13 +48,19 @@ import re
 import shutil
 import uuid
 from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 import structlog
-from sqlalchemy import text
+from sqlalchemy import select, text
 
 from app.config import settings
 from app.db import AsyncSessionLocal
+from app.models.appliance import (
+    APPLIANCE_STATE_APPROVED,
+    CLUSTER_ROLE_PRIMARY,
+    Appliance,
+)
 from app.services.upgrades import mutex
 
 logger = structlog.get_logger(__name__)
@@ -587,6 +593,7 @@ async def run_all(
         check_quorum(),
         await check_kea_ha_version_skew(),
         await check_powerdns_lmdb_migration(),
+        await check_etcd_snapshot_freshness(),
     ]
     levels = {r.level for r in results}
     if "fail" in levels:
@@ -939,6 +946,173 @@ async def check_powerdns_lmdb_migration() -> PreflightResult:
         message=(
             f"All {len(servers)} PowerDNS node(s) already on pdns ≥ 5.0 — "
             "the LMDB schema migration has already happened."
+        ),
+        detail=detail,
+    )
+
+
+# The appliance's k3s runs ``etcd-snapshot-schedule-cron: "0 */6 * * *"``
+# (appliance/mkosi.extra/etc/rancher/k3s/config.yaml). Plus an hour of
+# grace so a snapshot that has just missed its slot — or a heartbeat that
+# has not landed yet — does not read as a fault.
+_ETCD_SNAPSHOT_MAX_AGE_S = 7 * 3600
+
+
+def _newest_snapshot(snapshots: list[dict[str, Any]]) -> tuple[dict[str, Any] | None, float | None]:
+    """Newest entry by ``created_at`` and its age in seconds.
+
+    Entries come from the seed's ``k3s etcd-snapshot list``, relayed on
+    the heartbeat, so the shape is the seed's and unparseable timestamps
+    are possible. Those are skipped rather than raising — an inventory
+    we cannot read is reported as "no usable snapshot", which is the
+    conservative reading.
+    """
+    now = datetime.now(UTC)
+    newest: dict[str, Any] | None = None
+    newest_at: datetime | None = None
+    for snap in snapshots or []:
+        raw = (snap or {}).get("created_at")
+        if not raw:
+            continue
+        try:
+            when = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=UTC)
+        if newest_at is None or when > newest_at:
+            newest, newest_at = snap, when
+    if newest is None or newest_at is None:
+        return None, None
+    return newest, (now - newest_at).total_seconds()
+
+
+async def check_etcd_snapshot_freshness() -> PreflightResult:
+    """How old is the newest etcd snapshot? (#974)
+
+    Every k3s bump before v1.36 was same-minor, where an A/B slot revert
+    IS the rollback: boot the previous slot and the node is as it was.
+    Across a Kubernetes **minor** it is not. The k3s datastore lives on
+    the persistent ``/var``, outside the slot, and an older apiserver is
+    not supported against a store a newer one has written — so the
+    rollback is slot revert **plus** an etcd restore from before the
+    upgrade. That makes the age of the newest snapshot part of the
+    upgrade's safety rather than a nicety, and it is the one input the
+    operator can still act on while the Start button is unpressed.
+
+    Nothing here can tell whether *this* upgrade crosses a minor: the
+    target is a CalVer appliance tag and the k3s version it bakes is not
+    known to the control plane until the image boots. So the check
+    reports what it can measure — how much history a restore would
+    discard — and leaves the minor-or-not judgement to the operator, who
+    has the release notes. The current k3s versions across the cluster
+    ride along in ``detail`` for exactly that comparison.
+
+    **Never ``fail``.** ``fail`` sets ``can_start=False``, and refusing
+    to upgrade because a snapshot is stale would be the wrong lever: the
+    fix is one ``k3s etcd-snapshot save`` on the seed, not abandoning
+    the run. A ``warn`` that names the age and the command is the honest
+    shape, matching ``check_kea_ha_version_skew``.
+
+    Cheap by construction: the seed already reports ``k3s etcd-snapshot
+    list`` into ``Appliance.etcd_snapshots`` on every heartbeat, so this
+    is a single indexed read, not a new mechanism. Creating a fresh
+    pre-upgrade snapshot still needs the host-side runner tracked in
+    #296 — see ``per_node._step_etcd_snapshot``.
+    """
+    name = "etcd_snapshot_freshness"
+    try:
+        async with AsyncSessionLocal() as db:
+            rows = (
+                (
+                    await db.execute(
+                        select(Appliance).where(
+                            Appliance.state == APPLIANCE_STATE_APPROVED,
+                            Appliance.deployment_kind == "appliance",
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+    except Exception as e:  # pragma: no cover - DB unavailable is its own signal
+        logger.warning("preflight_etcd_snapshot_query_failed", error=str(e))
+        return PreflightResult(
+            name=name,
+            level="warn",
+            message="Could not read the etcd snapshot inventory — check it manually.",
+            detail={"error": str(e)},
+        )
+
+    if not rows:
+        # Docker / plain-k8s control plane: no appliance rows, no k3s,
+        # no A/B slots. Nothing this check is about applies.
+        return PreflightResult(
+            name=name,
+            level="ok",
+            message="No appliance nodes — etcd snapshot freshness does not apply.",
+            detail={"appliances": 0},
+        )
+
+    k3s_versions = sorted({r.k3s_version for r in rows if r.k3s_version})
+    seed = next((r for r in rows if r.cluster_role == CLUSTER_ROLE_PRIMARY), None)
+    if seed is None and len(rows) == 1:
+        # Single-node, pre-promote: cluster_role is still NULL but the
+        # lone control-plane appliance IS the etcd seed.
+        seed = rows[0]
+    detail: dict[str, Any] = {
+        "appliances": len(rows),
+        "k3s_versions": k3s_versions,
+        "max_age_hours": _ETCD_SNAPSHOT_MAX_AGE_S / 3600,
+    }
+
+    if seed is None:
+        return PreflightResult(
+            name=name,
+            level="warn",
+            message=(
+                "Could not identify the etcd seed, so snapshot freshness is unknown. "
+                "Confirm a recent snapshot exists before starting."
+            ),
+            detail=detail,
+        )
+
+    snapshots = list(seed.etcd_snapshots or [])
+    newest, age_s = _newest_snapshot(snapshots)
+    detail["seed"] = seed.hostname
+    detail["snapshots"] = len(snapshots)
+    if newest is not None and age_s is not None:
+        detail["newest"] = newest.get("name")
+        detail["age_hours"] = round(age_s / 3600, 1)
+
+    advice = (
+        "Take one with `k3s etcd-snapshot save` on the seed before starting — across a "
+        "Kubernetes minor, rollback is a slot revert PLUS an etcd restore, so anything "
+        "written since the newest snapshot is what a rollback would discard."
+    )
+    if newest is None:
+        return PreflightResult(
+            name=name,
+            level="warn",
+            message=f"The seed reports no usable etcd snapshot. {advice}",
+            detail=detail,
+        )
+    if age_s is not None and age_s > _ETCD_SNAPSHOT_MAX_AGE_S:
+        return PreflightResult(
+            name=name,
+            level="warn",
+            message=(
+                f"The newest etcd snapshot is {age_s / 3600:.1f} h old "
+                f"({newest.get('name')}). {advice}"
+            ),
+            detail=detail,
+        )
+    return PreflightResult(
+        name=name,
+        level="ok",
+        message=(
+            f"Newest etcd snapshot is {age_s / 3600:.1f} h old ({newest.get('name')}). "
+            "A rollback across a Kubernetes minor restores to that point."
         ),
         detail=detail,
     )
