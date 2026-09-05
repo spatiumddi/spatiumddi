@@ -1686,8 +1686,9 @@ make docs-verify                       # diagram-geometry gate — same check CI
 make charts-lint                       # Charts — Lint & Template gate (#966), via a helm container: helm lint + template
                                        #   with every toggle on + kubeconform -strict + the no-BestEffort check (#965)
                                        #   + the pod-posture check (#983 — seccomp everywhere, a PriorityClass on every
-                                       #   appliance pod). Run before pushing ANY charts/** change; renders land in
-                                       #   .charts-render/.
+                                       #   appliance pod). Covers ALL THREE charts: #983 added spatiumddi-metallb, which
+                                       #   nothing had ever rendered on a PR. Run before pushing ANY charts/** change;
+                                       #   renders land in .charts-render/.
 make perf-test                         # Perf — Tests (#968), via Docker. perf/ is denied by the backend path filter,
                                        #   so a perf-only PR runs this and NOT the 8 backend shards.
 make trivy IMAGE=kea                   #   ...one image only. Same gate CI uses (HIGH/CRITICAL, ignore-unfixed).

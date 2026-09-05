@@ -15,7 +15,7 @@ helm or a cluster.
 | `test_cluster_join_identity.py` | `spatium-cluster-join`'s cluster-identity wipe (#590) |
 | `test_firewall_webui_sentinel.py` | Web UI reachability before the supervisor exists (#769) |
 | `test_firstboot_member_guard.py` | `spatiumddi-firstboot` not re-seeding manifests on a joined member (#590) |
-| `test_firstboot_pod_posture.py` | `spatiumddi-firstboot`'s PSA namespace labels + control-plane PriorityClass overlay (#983) |
+| `test_firstboot_pod_posture.py` | `spatiumddi-firstboot`'s PSA namespace labels, the control-plane PriorityClass overlay, and the release-time gate that strips it when the class is absent (#983) |
 | `test_frontend_boot_gate.py` | SPA fallback landing on the initialising page (#767) |
 | `test_grub_render.py` | `spatium-grub-render` renderer via `--print` (DRY-RUN) |
 | `test_host_migrate.py` | `spatium-host-migrate` orchestrator via a patched subprocess |

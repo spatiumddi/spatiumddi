@@ -380,6 +380,19 @@ Three cluster-scoped classes, rendered by
 | `spatium-control-plane` | 90000 | `api`, `worker`, `beat`, `frontend`, Postgres / CNPG (operator + instances), `redis`, `redis-sentinel`, `supervisor` |
 | `spatium-observability` | 10000 | `kube-state-metrics`, `node-exporter` — plus `preemptionPolicy: Never` |
 
+MetalLB rides the same classes from `charts/spatiumddi-metallb`: the
+**speaker** takes `spatium-service` because it is on the data path — it
+answers ARP/NDP for the control-plane VIP and, with
+`dns.useMetalLBVIP=true`, for the DNS VIP, so evicting it takes out the
+address `dns-bind9`'s own ranking exists to protect. The **controller**
+allocates from the pool and is not on the packet path, so it ranks with the
+control plane. In BGP mode (#566 D1) **frr-k8s** takes `spatium-service` for
+the same reason the speaker does. Naming classes from another release is
+safe here for a specific reason: MetalLB ships disabled and is only ever
+enabled by the supervisor when an operator sets a VIP — and the supervisor
+comes from the same `spatium-bootstrap` release that renders the classes, so
+if that release never succeeded there is nothing to turn MetalLB on.
+
 Before this every pod ran at priority 0, which is not a neutral state: it
 is a *tie*, and the two rankings that break it both do the wrong thing with
 a tie. Kubelet eviction under memory or ephemeral-storage pressure orders
@@ -408,12 +421,26 @@ left implicit.
 **Failure mode worth knowing.** A pod naming a PriorityClass that does not
 exist is refused by the apiserver: the Deployment is *accepted* and the
 ReplicaSet controller then cannot create pods, reporting it as an event.
-Running pods are untouched, and the whole thing self-heals the moment the
-class appears. That is why `spatiumddi-firstboot` emits
-`global.priorityClassName` into the `spatium-control` values only when the
-appliance chart — which renders the classes — is also going into the
-auto-deploy dir, and why the bootstrap manifest is written before the
-control manifest is released from `.deferred`.
+Running pods are untouched, and it self-heals the moment the class appears.
+
+The control-plane workloads are the exposed case, because their class comes
+from a *different* release (`spatium-bootstrap`) than the one that names it
+(`spatium-control`). `spatiumddi-firstboot` therefore gates it twice:
+
+1. **At render**, on the appliance chart's tarball being present at all — if
+   it is not, nothing will ever render the class.
+2. **At release**, in `release_control_manifest`, by asking the live cluster
+   whether `spatium-control-plane` exists. A missing class — or an apiserver
+   it cannot reach to ask — strips the reference and logs why.
+
+The second gate is the one that matters. The first can only see that a file
+exists, which says nothing about whether its release *succeeded*; without the
+second, a broken `spatium-bootstrap` would take the Web UI down alongside the
+supervisor, removing the surface an operator would use to diagnose it, and it
+could not recover because the manifest would already be applied. Falling back
+to no class is exactly the pre-#983 behaviour and is always schedulable, and
+nothing is lost: firstboot re-renders this manifest on every boot, so the
+ranking returns on the first boot where bootstrap is healthy.
 
 ### seccomp
 
@@ -433,7 +460,14 @@ run under it on Compose.
 Kubernetes 1.36 adds an alpha `SeccompDefault` kubelet gate that would do
 this cluster-wide; it is alpha, so the charts do it instead.
 
-One exception is worth knowing rather than discovering: the **supervisor**
+One workload cannot have it at all: **frr-k8s**, the BGP-mode routing
+daemon, comes from a vendored subchart (`frr-k8s` 0.0.21) that exposes no
+pod-`securityContext` knob, so no values override can supply a profile. It is
+exempted by name in the render check rather than the chart being skipped —
+which is how its missing PriorityClass and BestEffort QoS survived #965
+unnoticed. Revisit on a chart bump.
+
+One further exception is worth knowing rather than discovering: the **supervisor**
 runs `privileged: true`, and containerd skips seccomp entirely for a
 privileged container. The field is set on that pod like every other, and the
 runtime ignores it. That is not a gap this change could close — a privileged

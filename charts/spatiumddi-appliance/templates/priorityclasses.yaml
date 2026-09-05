@@ -42,6 +42,29 @@ it also stops Helm patching a kept resource on UPGRADE, so retuning a
 class's value would silently do nothing. A few seconds of "cannot create
 pods" beats a value that reads as changed and is not.
 */}}
+{{/*
+Refuse the render outright when ``create`` is off while workloads still name
+a class. The apiserver REFUSES a pod naming a PriorityClass that does not
+exist, so that combination does not degrade the appliance — it stops every
+role pod and the supervisor being created at all, with the reason buried in
+a ReplicaSet event. The chart already fails for a less severe seccomp
+misconfiguration; this one earns it more.
+
+Named rather than counted, so the message says what to clear.
+*/}}
+{{- if not .Values.priorityClasses.create }}
+{{- $named := list -}}
+{{- range $key, $wl := .Values -}}
+{{- if kindIs "map" $wl -}}
+{{- if get $wl "priorityClassName" -}}
+{{- $named = append $named (printf "%s.priorityClassName=%s" $key (get $wl "priorityClassName")) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if $named -}}
+{{- fail (printf "priorityClasses.create is false, but these still name a class this chart would no longer render: %s. A pod naming a PriorityClass that does not exist is REFUSED by the apiserver — set each of them to \"\" as well, or leave create: true." (join ", " $named)) -}}
+{{- end -}}
+{{- end }}
 {{- if .Values.priorityClasses.create }}
 {{- range $key, $class := .Values.priorityClasses.classes }}
 ---

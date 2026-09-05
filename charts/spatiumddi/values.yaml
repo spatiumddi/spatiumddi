@@ -78,7 +78,7 @@ auth:
 # ── API ──────────────────────────────────────────────────────────────────────
 api:
   replicas: 2
-  priorityClassName: ""  # #983 — overrides ``global.priorityClassName``
+  priorityClassName:  # #983 — unset inherits ``global.priorityClassName``; "" means no class
   service:
     type: ClusterIP
     port: 8000
@@ -235,7 +235,7 @@ api:
 # BYO-Kubernetes installs, where nothing tracks the replica count for you.
 slotImageMirror:
   enabled: false
-  priorityClassName: ""  # #983 — overrides ``global.priorityClassName``
+  priorityClassName:  # #983 — unset inherits ``global.priorityClassName``; "" means no class
   storage:
     # 32 GiB default — fits ~7-8 typical slot images (4 GiB cap each,
     # but real images today are ~800 MiB-1.2 GiB compressed). Bump
@@ -268,7 +268,7 @@ slotImageMirror:
 # ── Frontend (nginx + Vite build) ────────────────────────────────────────────
 frontend:
   replicas: 2
-  priorityClassName: ""  # #983 — overrides ``global.priorityClassName``
+  priorityClassName:  # #983 — unset inherits ``global.priorityClassName``; "" means no class
   service:
     type: ClusterIP
     port: 80
@@ -354,7 +354,7 @@ frontend:
 # ── Worker (Celery queues: ipam, dns, dhcp, default) ─────────────────────────
 worker:
   replicas: 2
-  priorityClassName: ""  # #983 — overrides ``global.priorityClassName``
+  priorityClassName:  # #983 — unset inherits ``global.priorityClassName``; "" means no class
   concurrency: 4
   queues: "ipam,dns,dhcp,default"
   resources:
@@ -377,7 +377,7 @@ worker:
 
 # ── Beat (singleton scheduler — always 1 replica) ────────────────────────────
 beat:
-  priorityClassName: ""  # #983 — overrides ``global.priorityClassName``
+  priorityClassName:  # #983 — unset inherits ``global.priorityClassName``; "" means no class
   resources:
     requests: { cpu: 50m, memory: 128Mi }
     limits:   { cpu: 200m, memory: 256Mi }
@@ -399,7 +399,7 @@ beat:
 # migrations from CI/CD instead of Helm.
 migrate:
   enabled: true
-  priorityClassName: ""  # #983 — overrides ``global.priorityClassName``
+  priorityClassName:  # #983 — unset inherits ``global.priorityClassName``; "" means no class
   backoffLimit: 3
   # Garbage-collect each migrate Job this many seconds after completion.
   # Without a TTL the cluster would slowly accumulate one completed Job
@@ -451,7 +451,7 @@ ingress:
 # and fill in the ``externalDatabase`` block below.
 postgresql:
   enabled: true
-  priorityClassName: ""  # #983 — overrides ``global.priorityClassName``
+  priorityClassName:  # #983 — unset inherits ``global.priorityClassName``; "" means no class
   kind: standalone
   image:
     repository: postgres
@@ -588,7 +588,7 @@ externalDatabase:
 # fill in ``externalRedis``.
 redis:
   enabled: true
-  priorityClassName: ""  # #983 — overrides ``global.priorityClassName``
+  priorityClassName:  # #983 — unset inherits ``global.priorityClassName``; "" means no class
   kind: standalone
   image:
     repository: redis
@@ -681,7 +681,7 @@ externalRedis:
 # closer to the network edge.
 dnsAgents:
   enabled: false
-  priorityClassName: ""  # #983 — overrides ``global.servicePriorityClassName``
+  priorityClassName:  # #983 — unset inherits ``global.servicePriorityClassName``; "" means no class
   # Default image — used when a server entry doesn't override.
   # Configures the BIND9 driver (the historical default flavor).
   image:
@@ -738,7 +738,7 @@ dnsAgents:
 # ── DHCP agents (optional — managed Kea StatefulSets) ────────────────────────
 dhcpAgents:
   enabled: false
-  priorityClassName: ""  # #983 — overrides ``global.servicePriorityClassName``
+  priorityClassName:  # #983 — unset inherits ``global.servicePriorityClassName``; "" means no class
   image:
     repository: ghcr.io/spatiumddi/dhcp-kea
     tag: ""

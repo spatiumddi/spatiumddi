@@ -472,7 +472,9 @@ global:
   servicePriorityClassName: my-serving  # the DNS / DHCP agent StatefulSets
 ```
 
-Any single workload can override with `<component>.priorityClassName`. The
+Any single workload can override with `<component>.priorityClassName`, where
+*unset* (the shipped default) inherits the chart-wide key and `""` means no
+class for that workload even when the chart-wide key is set. The
 split exists because a DNS agent answering the LAN should outrank the API
 that configures it when a node runs out of memory. The appliance sets
 `global.priorityClassName: spatium-control-plane` against classes its own

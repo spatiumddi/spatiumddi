@@ -202,7 +202,7 @@ dhcpAgents:
 | `global.seccompProfile` | `RuntimeDefault` | Pod-level seccomp for every workload. `Unconfined` or `""` (omit) also accepted; `Localhost` is rejected |
 | `global.priorityClassName` | `""` | PriorityClass for the control-plane workloads. **Leave empty unless the class exists** — the apiserver refuses a pod naming one that does not |
 | `global.servicePriorityClassName` | `""` | Same, for the DNS / DHCP agent StatefulSets |
-| `<component>.priorityClassName` | `""` | Per-workload override of the two keys above |
+| `<component>.priorityClassName` | unset | Per-workload override. Unset inherits the chart-wide key above; `""` means *no class for this workload*, even when the chart-wide key is set |
 
 ### Control plane
 

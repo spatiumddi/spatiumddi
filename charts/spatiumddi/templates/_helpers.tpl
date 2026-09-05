@@ -568,7 +568,20 @@ renders.
 
 Args: ``component`` (the per-workload override) and ``fallback`` (the
 chart-wide default). Returns the resolved name, or nothing.
+
+UNSET and EMPTY are different, deliberately: a per-workload key left unset
+(the shipped default, YAML null) INHERITS the chart-wide value, while
+setting it to ``""`` means "no class for this one" and overrides a
+non-empty chart-wide value. Sprig's ``default`` cannot express that — it
+treats null and "" alike — so the nil test is explicit. Without it
+``priorityClassName: ""`` would silently inherit, which is the opposite of
+what a key documented as an override should do, and there would be no way
+to leave a single workload unranked on a cluster that has a global policy.
 */}}
 {{- define "spatiumddi.priorityClassName" -}}
-{{- default (default "" .fallback) .component -}}
+{{- if kindIs "invalid" .component -}}
+{{- default "" .fallback -}}
+{{- else -}}
+{{- .component -}}
+{{- end -}}
 {{- end -}}

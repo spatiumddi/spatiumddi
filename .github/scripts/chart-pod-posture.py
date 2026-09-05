@@ -23,13 +23,25 @@ without the protection:
                  ``--allow-no-priority``, so the decision is visible at the
                  call site and a NEW workload still fails the gate.
 
+``--allow-no-seccomp`` exists for the same reason and is used for exactly one
+thing: a vendored subchart whose templates expose no pod-securityContext knob,
+so no values override can supply a profile. Exempting it is strictly better
+than the alternative, which is not rendering that chart at all — which is how
+its pods got missed in the first place.
+
+Exemption names match either exactly or on a ``-<name>`` suffix, because helm
+prefixes a subchart's workload names with the release name. The suffix is not
+segment-aware — ``k8s`` would also match ``frr-k8s`` — so write exemptions as
+the full workload name, never an abbreviation.
+
 Both are checked against the RENDERED manifests rather than the templates: a
 ``with`` guard on the wrong values path renders nothing and reads fine in the
 template. Reference: the #917 lesson that a guard which inspects intent instead
 of output reports clean while the defect ships.
 
 Usage:
-    chart-pod-posture.py [--require-priority] [--allow-no-priority a,b] file...
+    chart-pod-posture.py [--require-priority] [--allow-no-priority a,b]
+                         [--allow-no-seccomp a,b] file...
 """
 
 from __future__ import annotations
@@ -59,6 +71,22 @@ MANAGED_POD_CRS: dict[str, dict[str, tuple[str, ...]]] = {
 }
 
 
+def _exempt(name: str, names: set[str]) -> bool:
+    """Match an exemption exactly, or on a ``-<name>`` suffix.
+
+    Helm prefixes a subchart's workload names with the release name, so the
+    same object is ``frr-k8s`` in the chart and ``metallb-bgp-frr-k8s`` in a
+    render — an exact-match-only exemption would silently stop applying the
+    moment the render name changed.
+
+    The suffix test is not segment-aware, so a short exemption over-matches
+    (``k8s`` catches ``frr-k8s``). That is a reason to write full workload
+    names, not a reason to hand-roll boundary parsing: an over-broad
+    exemption still has to be typed by someone, in a file under review.
+    """
+    return any(name == n or name.endswith(f"-{n}") for n in names)
+
+
 def dig(obj, path):
     for key in path:
         if not isinstance(obj, dict):
@@ -69,18 +97,20 @@ def dig(obj, path):
 
 def main(argv: list[str]) -> int:
     require_priority = "--require-priority" in argv
-    exempt: set[str] = set()
+    exempt_priority: set[str] = set()
+    exempt_seccomp: set[str] = set()
     args = argv[1:]
     files: list[str] = []
     i = 0
     while i < len(args):
         a = args[i]
-        if a == "--allow-no-priority":
+        if a in ("--allow-no-priority", "--allow-no-seccomp"):
+            target = exempt_priority if a == "--allow-no-priority" else exempt_seccomp
             i += 1
             if i >= len(args):
-                print("--allow-no-priority needs a comma-separated list", file=sys.stderr)
+                print(f"{a} needs a comma-separated list", file=sys.stderr)
                 return 2
-            exempt.update(x for x in args[i].split(",") if x)
+            target.update(x for x in args[i].split(",") if x)
         elif not a.startswith("--"):
             files.append(a)
         i += 1
@@ -105,9 +135,13 @@ def main(argv: list[str]) -> int:
             if cr_key in MANAGED_POD_CRS:
                 checked += 1
                 fields = MANAGED_POD_CRS[cr_key]
-                if not dig(doc, fields["seccomp"]):
+                if not _exempt(name, exempt_seccomp) and not dig(doc, fields["seccomp"]):
                     problems.append(f"{where}: no {'.'.join(fields['seccomp'])}")
-                if require_priority and name not in exempt and not dig(doc, fields["priority"]):
+                if (
+                    require_priority
+                    and not _exempt(name, exempt_priority)
+                    and not dig(doc, fields["priority"])
+                ):
                     problems.append(f"{where}: no {'.'.join(fields['priority'])}")
                 continue
 
@@ -120,10 +154,14 @@ def main(argv: list[str]) -> int:
             checked += 1
 
             profile = dig(pod, ("securityContext", "seccompProfile", "type"))
-            if not profile:
+            if not profile and not _exempt(name, exempt_seccomp):
                 problems.append(f"{where}: pod securityContext has no seccompProfile.type")
 
-            if require_priority and name not in exempt and not pod.get("priorityClassName"):
+            if (
+                require_priority
+                and not _exempt(name, exempt_priority)
+                and not pod.get("priorityClassName")
+            ):
                 problems.append(
                     f"{where}: no priorityClassName "
                     "(add one, or name it in --allow-no-priority to record the decision)"
@@ -135,7 +173,10 @@ def main(argv: list[str]) -> int:
             print(f"  {p}", file=sys.stderr)
         return 1
 
-    print(f"pod-posture: {checked} workload(s) OK" + (" (priority required)" if require_priority else ""))
+    note = " (priority required)" if require_priority else ""
+    if exempt_priority or exempt_seccomp:
+        note += f", {len(exempt_priority | exempt_seccomp)} exempted"
+    print(f"pod-posture: {checked} workload(s) OK{note}")
     return 0
 
 

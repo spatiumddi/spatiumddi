@@ -165,3 +165,59 @@ def test_non_workload_documents_are_ignored(tmp_path: Path) -> None:
     )
     assert r.returncode == 0, r.stderr
     assert "0 workload(s) OK" in r.stdout
+
+
+def test_seccomp_exemption(tmp_path: Path) -> None:
+    """Used for exactly one thing: a vendored subchart (frr-k8s) whose
+    templates expose no pod-securityContext knob, so no values override can
+    supply a profile. Exempting it beats not rendering the chart at all."""
+    bad = GOOD_DEPLOYMENT.replace(
+        "      securityContext:\n        seccompProfile:\n          type: RuntimeDefault\n",
+        "",
+    )
+    assert _run(bad, tmp_path).returncode == 1
+    r = _run(bad, tmp_path, "--allow-no-seccomp", "api")
+    assert r.returncode == 0, r.stderr
+    # ...by name, not a blanket switch.
+    assert _run(bad, tmp_path, "--allow-no-seccomp", "other").returncode == 1
+
+
+def test_exemptions_are_independent(tmp_path: Path) -> None:
+    """Exempting seccomp must not quietly exempt the priority check too."""
+    bad = GOOD_DEPLOYMENT.replace(
+        "      securityContext:\n        seccompProfile:\n          type: RuntimeDefault\n",
+        "",
+    ).replace("      priorityClassName: spatium-control-plane\n", "")
+    r = _run(bad, tmp_path, "--require-priority", "--allow-no-seccomp", "api")
+    assert r.returncode == 1
+    assert "no priorityClassName" in r.stderr
+    assert "seccompProfile" not in r.stderr
+
+
+def test_exemptions_match_the_release_prefixed_name(tmp_path: Path) -> None:
+    """Helm prefixes a subchart's workloads with the release name, so the
+    same object is ``frr-k8s`` in the chart and ``metallb-bgp-frr-k8s`` in a
+    render. An exact-match-only exemption would stop applying the moment a
+    render was renamed — silently, since the gate would then just fail."""
+    bad = GOOD_DEPLOYMENT.replace("name: api", "name: metallb-bgp-frr-k8s").replace(
+        "      securityContext:\n        seccompProfile:\n          type: RuntimeDefault\n",
+        "",
+    )
+    assert _run(bad, tmp_path, "--allow-no-seccomp", "frr-k8s").returncode == 0
+    # An unrelated name must not match — the property that actually matters.
+    assert _run(bad, tmp_path, "--allow-no-seccomp", "api").returncode == 1
+    # The suffix test is NOT segment-aware, so a short exemption over-matches.
+    # Pinned rather than fixed: the docstring tells callers to write full
+    # workload names, and an over-broad exemption is still typed by a human
+    # into a reviewed file.
+    assert _run(bad, tmp_path, "--allow-no-seccomp", "k8s").returncode == 0
+
+
+def test_exemption_flag_without_a_value_is_a_usage_error(tmp_path: Path) -> None:
+    f = tmp_path / "render.yaml"
+    f.write_text(GOOD_DEPLOYMENT)
+    r = subprocess.run(
+        [sys.executable, str(SCRIPT), str(f), "--allow-no-seccomp"],
+        capture_output=True, text=True, check=False,
+    )
+    assert r.returncode == 2, r.stdout
