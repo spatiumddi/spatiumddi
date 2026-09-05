@@ -957,6 +957,15 @@ async def check_powerdns_lmdb_migration() -> PreflightResult:
 # has not landed yet — does not read as a fault.
 _ETCD_SNAPSHOT_MAX_AGE_S = 7 * 3600
 
+# How far into the future a snapshot timestamp may sit before it is read
+# as clock skew rather than as a very fresh snapshot. The timestamp comes
+# off the seed's own clock and is relayed on a heartbeat, so a few
+# seconds of disagreement is normal; five minutes is not, and a
+# materially-future stamp is the one case where "age" silently passes the
+# staleness test while meaning nothing. Same lesson as #925's beat
+# heartbeat, where a future stamp read as perfectly fresh.
+_ETCD_SNAPSHOT_FUTURE_GRACE_S = 300
+
 
 def _newest_snapshot(snapshots: list[dict[str, Any]]) -> tuple[dict[str, Any] | None, float | None]:
     """Newest entry by ``created_at`` and its age in seconds.
@@ -984,6 +993,10 @@ def _newest_snapshot(snapshots: list[dict[str, Any]]) -> tuple[dict[str, Any] | 
             newest, newest_at = snap, when
     if newest is None or newest_at is None:
         return None, None
+    # Negative = the seed's clock is ahead of ours. Returned as-is; the
+    # caller decides whether that is jitter to clamp or skew to report,
+    # because silently taking max(0, age) would let a wildly-future stamp
+    # pass the staleness test as "0 h old".
     return newest, (now - newest_at).total_seconds()
 
 
@@ -1055,7 +1068,27 @@ async def check_etcd_snapshot_freshness() -> PreflightResult:
         )
 
     k3s_versions = sorted({r.k3s_version for r in rows if r.k3s_version})
-    seed = next((r for r in rows if r.cluster_role == CLUSTER_ROLE_PRIMARY), None)
+    primaries = [r for r in rows if r.cluster_role == CLUSTER_ROLE_PRIMARY]
+    if len(primaries) > 1:
+        # Two rows claiming to be the etcd seed is a fault in itself, and
+        # picking whichever the database returned first would report one
+        # node's inventory as if it were the cluster's. Say so instead.
+        return PreflightResult(
+            name=name,
+            level="warn",
+            message=(
+                f"{len(primaries)} appliances claim cluster_role=primary "
+                f"({', '.join(sorted(p.hostname for p in primaries))}), so the etcd seed is "
+                "ambiguous and snapshot freshness cannot be established. Resolve the "
+                "duplicate before starting."
+            ),
+            detail={
+                "appliances": len(rows),
+                "k3s_versions": k3s_versions,
+                "primaries": sorted(p.hostname for p in primaries),
+            },
+        )
+    seed = primaries[0] if primaries else None
     if seed is None and len(rows) == 1:
         # Single-node, pre-promote: cluster_role is still NULL but the
         # lone control-plane appliance IS the etcd seed.
@@ -1083,7 +1116,9 @@ async def check_etcd_snapshot_freshness() -> PreflightResult:
     detail["snapshots"] = len(snapshots)
     if newest is not None and age_s is not None:
         detail["newest"] = newest.get("name")
-        detail["age_hours"] = round(age_s / 3600, 1)
+        # Inside the grace window a small negative is clock jitter, not a
+        # snapshot from the future. Report it as 0 rather than "-0.1 h".
+        detail["age_hours"] = round(max(age_s, 0.0) / 3600, 1)
 
     advice = (
         "Take one with `k3s etcd-snapshot save` on the seed before starting — across a "
@@ -1095,6 +1130,18 @@ async def check_etcd_snapshot_freshness() -> PreflightResult:
             name=name,
             level="warn",
             message=f"The seed reports no usable etcd snapshot. {advice}",
+            detail=detail,
+        )
+    if age_s is not None and age_s < -_ETCD_SNAPSHOT_FUTURE_GRACE_S:
+        return PreflightResult(
+            name=name,
+            level="warn",
+            message=(
+                f"The newest etcd snapshot ({newest.get('name')}) is dated "
+                f"{abs(age_s) / 3600:.1f} h in the FUTURE — the seed's clock disagrees with "
+                "the control plane's, so its age cannot be trusted. Check NTP on the seed, "
+                "then confirm a recent snapshot exists before starting."
+            ),
             detail=detail,
         )
     if age_s is not None and age_s > _ETCD_SNAPSHOT_MAX_AGE_S:
@@ -1111,8 +1158,9 @@ async def check_etcd_snapshot_freshness() -> PreflightResult:
         name=name,
         level="ok",
         message=(
-            f"Newest etcd snapshot is {age_s / 3600:.1f} h old ({newest.get('name')}). "
-            "A rollback across a Kubernetes minor restores to that point."
+            f"Newest etcd snapshot is {max(age_s or 0.0, 0.0) / 3600:.1f} h old "
+            f"({newest.get('name')}). A rollback across a Kubernetes minor restores "
+            "to that point."
         ),
         detail=detail,
     )

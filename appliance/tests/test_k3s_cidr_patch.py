@@ -150,6 +150,15 @@ def test_dual_stack_lists_are_left_alone(tmp_path: Path) -> None:
 
 
 def test_patch_is_executable() -> None:
-    """spatium-host-migrate runs the patch by path; the +x bit must be
-    committed (and mirrored in mkosi.postinst's chmod block)."""
+    """Consistency, not correctness — and worth being honest about which.
+
+    spatium-host-migrate invokes each patch as ``sh "$patch"``, so a
+    patch without the +x bit still runs. The bit is required because
+    every other patch has it, because mkosi.postinst chmods it (a chmod
+    on a file that never had the bit committed is a silent no-op waiting
+    to matter), and because it makes the patch runnable by hand from a
+    rescue shell — which, for a repair that edits the file deciding
+    whether k3s starts, is the situation it is most likely to be needed
+    in.
+    """
     assert PATCH.stat().st_mode & 0o111, f"{PATCH} is not executable"

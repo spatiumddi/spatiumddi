@@ -181,6 +181,26 @@ async def test_the_primary_is_read_not_a_member(db_session: AsyncSession) -> Non
     assert r.detail["appliances"] == 2
 
 
+async def test_two_primaries_warn_instead_of_picking_one(db_session: AsyncSession) -> None:
+    """Two rows claiming the seed is a fault in itself.
+
+    Taking whichever the database returned first would report one node's
+    inventory as if it were the cluster's — and the wrong one may be the
+    one with no snapshots, or with stale ones.
+    """
+    await _appliance(
+        db_session,
+        hostname="cp-1",
+        cluster_role=CLUSTER_ROLE_PRIMARY,
+        snapshots=[_snap("fresh", 1)],
+    )
+    await _appliance(db_session, hostname="cp-2", cluster_role=CLUSTER_ROLE_PRIMARY)
+    r = await check_etcd_snapshot_freshness()
+    assert r.level == "warn"
+    assert "ambiguous" in r.message
+    assert r.detail["primaries"] == ["cp-1", "cp-2"]
+
+
 async def test_multi_node_without_a_primary_warns(db_session: AsyncSession) -> None:
     """Two members and no primary: the seed cannot be identified, and
     guessing one would report someone else's (empty) inventory as fact."""
@@ -189,6 +209,45 @@ async def test_multi_node_without_a_primary_warns(db_session: AsyncSession) -> N
     r = await check_etcd_snapshot_freshness()
     assert r.level == "warn"
     assert "identify the etcd seed" in r.message
+
+
+# ── Clock skew ──────────────────────────────────────────────────────────
+
+
+async def test_a_future_dated_snapshot_is_reported_as_clock_skew(
+    db_session: AsyncSession,
+) -> None:
+    """A future stamp is the one case where age silently passes.
+
+    ``now - created_at`` goes negative, which is < the staleness bound,
+    so an unguarded check calls a meaningless timestamp fresh — the same
+    trap #925 hit with the beat heartbeat.
+    """
+    await _appliance(
+        db_session,
+        hostname="cp-1",
+        cluster_role=CLUSTER_ROLE_PRIMARY,
+        snapshots=[_snap("etcd-snapshot-cp-1-future", -3)],
+    )
+    r = await check_etcd_snapshot_freshness()
+    assert r.level == "warn"
+    assert "FUTURE" in r.message
+    assert "NTP" in r.message
+
+
+async def test_small_clock_jitter_is_clamped_not_reported(db_session: AsyncSession) -> None:
+    """A few seconds of disagreement between two clocks is normal. It
+    must not print "-0.0 h old" or trip the skew warning."""
+    await _appliance(
+        db_session,
+        hostname="cp-1",
+        cluster_role=CLUSTER_ROLE_PRIMARY,
+        snapshots=[_snap("etcd-snapshot-cp-1-just-now", -1 / 60)],  # 1 min ahead
+    )
+    r = await check_etcd_snapshot_freshness()
+    assert r.level == "ok"
+    assert r.detail["age_hours"] == 0.0
+    assert "-" not in r.message.split("(")[0]
 
 
 # ── Scoping ─────────────────────────────────────────────────────────────
