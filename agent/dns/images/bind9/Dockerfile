@@ -40,7 +40,15 @@ FROM alpine:3.23 AS runtime
 # * ``libcrypto3`` / ``libssl3`` ``>=3.5.7-r0`` — CVE-2026-45447 (HIGH,
 #   OpenSSL). The 3.23 base already satisfies this one; the bound is
 #   kept because it still busts a pre-3.23 cache layer.
-RUN apk upgrade --no-cache \
+# ``APK_SNAPSHOT`` is what makes that upgrade actually run in CI. BuildKit
+# keys a layer on its RUN text, so a ``type=gha`` cache serves this whole
+# layer — package set included — from whenever it was first built, until
+# the text changes. The nightly passes its date tag so the layer is
+# rebuilt once a night against the current index; local builds default
+# to ``dev``. Full story: agent/supervisor/images/supervisor/Dockerfile.
+ARG APK_SNAPSHOT=dev
+RUN echo "apk snapshot ${APK_SNAPSHOT}" >/dev/null \
+ && apk upgrade --no-cache \
  && apk add --no-cache \
       'bind>=9.20.26-r0' 'bind-tools>=9.20.26-r0' \
       tini su-exec \

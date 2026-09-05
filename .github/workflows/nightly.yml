@@ -285,6 +285,17 @@ jobs:
       # `fail-fast: false` the registry is left holding a mixed set of
       # some-new / some-old images. Cost is one extra amd64 build, which
       # the shared buildx cache makes near-free.
+      #
+      # APK_SNAPSHOT keeps that cache from defeating the scan. BuildKit
+      # keys a layer on its command text, so `RUN apk upgrade` is a cache
+      # hit from whenever this scope was last written — the package set
+      # of that first build, frozen. A fix Alpine publishes afterwards is
+      # then never installed but IS flagged by Trivy, and every later
+      # night fails on it. The Alpine Dockerfiles declare
+      # `ARG APK_SNAPSHOT` immediately before that RUN; passing the date
+      # tag rebuilds the package layer once a night (everything above it
+      # still caches), and passing the SAME value to both builds below
+      # makes the push's amd64 half the exact layers the scan saw.
       - name: Build amd64 for scanning
         uses: docker/build-push-action@v7
         with:
@@ -297,17 +308,41 @@ jobs:
           tags: scan-target:${{ matrix.image }}
           build-args: |
             VITE_APP_VERSION=${{ needs.gate.outputs.version }}
+            APK_SNAPSHOT=${{ needs.gate.outputs.date_tag }}
           cache-from: type=gha,scope=nightly-${{ matrix.image }}
           cache-to: type=gha,mode=max,scope=nightly-${{ matrix.image }}
 
+      # Trivy reports; trivy-gate.sh decides. Trivy's "fixed" means the
+      # distro's security database names a fixed version — not that the
+      # package is on the mirrors yet, and for Alpine the two diverge by
+      # hours after every security commit (secdb updates when the fix is
+      # committed to aports; the .apk reaches dl-cdn once the builders and
+      # the CDN sync are done). nightly-20260905 died in that window: the
+      # frontend's fresh `apk upgrade` at 10:45Z installed every other fix
+      # on the mirror, libuuid's arrived there at 13:53Z, and Trivy failed
+      # the image on 7 HIGH that nothing could have installed. The gate
+      # asks the image's own package index whether each fix is installable
+      # today: yes → fail (a rebuild would cure it); not yet → defer,
+      # reported as a warning and treated like the unfixed findings
+      # `ignore-unfixed` already skips, picked up by the next night's
+      # rebuilt package layer. Anything it cannot verify fails, as before.
       - name: Trivy
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: scan-target:${{ matrix.image }}
           severity: HIGH,CRITICAL
           ignore-unfixed: true
-          exit-code: "1"
-          format: table
+          # The verdict belongs to the gate step; a non-zero exit here
+          # would stop the job before it runs.
+          exit-code: "0"
+          format: json
+          output: trivy-${{ matrix.image }}.json
+
+      - name: Gate on the scan
+        run: >-
+          .github/scripts/trivy-gate.sh
+          "trivy-${{ matrix.image }}.json"
+          "scan-target:${{ matrix.image }}"
 
       # Only now, with the scan green, does anything reach the registry.
       # The multi-arch build reuses the cache the scan build just warmed,
@@ -327,6 +362,7 @@ jobs:
             ${{ env.IMAGE_PREFIX }}/${{ matrix.image }}:${{ needs.gate.outputs.date_tag }}
           build-args: |
             VITE_APP_VERSION=${{ needs.gate.outputs.version }}
+            APK_SNAPSHOT=${{ needs.gate.outputs.date_tag }}
           cache-from: type=gha,scope=nightly-${{ matrix.image }}
           cache-to: type=gha,mode=max,scope=nightly-${{ matrix.image }}
 

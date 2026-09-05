@@ -41,7 +41,15 @@ FROM nginx:1.31.4-alpine AS runtime
 # and CVE-2026-76641 in libexpat), all already fixed upstream. It is now
 # in the Makefile's TRIVY_IMAGES, so `make trivy IMAGE=frontend` catches
 # the next set.
-RUN apk upgrade --no-cache
+# ``APK_SNAPSHOT`` is what makes that upgrade actually run in CI. BuildKit
+# keys a layer on its RUN text, so a ``type=gha`` cache serves this whole
+# layer — package set included — from whenever it was first built, until
+# the text changes. The nightly passes its date tag so the layer is
+# rebuilt once a night against the current index; local builds default
+# to ``dev``. Full story: agent/supervisor/images/supervisor/Dockerfile.
+ARG APK_SNAPSHOT=dev
+RUN echo "apk snapshot ${APK_SNAPSHOT}" >/dev/null \
+ && apk upgrade --no-cache
 
 COPY --from=builder /app/dist /usr/share/nginx/html
 # Issue #176: the API upstream + DNS resolver are now templated so the

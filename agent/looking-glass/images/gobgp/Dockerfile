@@ -89,7 +89,15 @@ FROM alpine:3.23 AS runtime
 # libssl/libcrypto (or other base) version gets re-resolved against the
 # current alpine 3.22 index rather than serving a stale GitHub Actions
 # layer cache that Trivy would then flag.
-RUN apk upgrade --no-cache \
+# ``APK_SNAPSHOT`` is what makes that upgrade actually run in CI. BuildKit
+# keys a layer on its RUN text, so a ``type=gha`` cache serves this whole
+# layer — package set included — from whenever it was first built, until
+# the text changes. The nightly passes its date tag so the layer is
+# rebuilt once a night against the current index; local builds default
+# to ``dev``. Full story: agent/supervisor/images/supervisor/Dockerfile.
+ARG APK_SNAPSHOT=dev
+RUN echo "apk snapshot ${APK_SNAPSHOT}" >/dev/null \
+ && apk upgrade --no-cache \
  && apk add --no-cache \
       tini su-exec \
       python3 py3-pip \
