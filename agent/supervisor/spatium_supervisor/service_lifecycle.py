@@ -310,6 +310,57 @@ def _read_chart_tarball() -> bytes:
     return _BAKED_CHART_TARBALL.read_bytes()
 
 
+def _resolve_node_name() -> str:
+    """This node's k8s name, or "" when it cannot be determined."""
+    node_name = os.environ.get("NODE_NAME") or os.environ.get("APPLIANCE_HOSTNAME") or ""
+    if node_name:
+        return node_name
+    try:
+        import socket as _socket
+
+        return _socket.gethostname()
+    except OSError:
+        return ""
+
+
+def desired_role_set(profiles: list[str]) -> set[str]:
+    """Roles this node must be labelled for — the ONE definition (#1003 item 3).
+
+    The union of:
+
+      * operator-assigned ``profiles`` from the heartbeat role-assignment;
+      * the fixed per-variant set (#272 Phase 7b) — full-stack and
+        frontend-core always assert ``control-plane``;
+      * ``control-plane`` for an ``appliance``-variant node promoted into the
+        control-plane cluster (#277), keyed off the join-state sidecar.
+
+    This used to exist twice, and only one copy had the last two terms.
+    ``reconcile_node_labels`` unioned all three; ``apply_role_assignment``
+    took ``profiles`` alone and then cleared every label not in it — so on any
+    tick where the env hash changed (the first heartbeat, and every role
+    toggle) it removed the ``control-plane`` label that the install baked and
+    that the reconcile had asserted moments earlier on the same tick.
+
+    Observed on a fresh single-node install: the same heartbeat's memory-limit
+    re-render rolled api and worker, and the new pods hit "0/1 nodes are
+    available: 1 node(s) didn't match Pod's node affinity/selector" until the
+    next tick put the label back. Self-healing there, but on a #272 multi-node
+    control plane, toggling DNS on a member makes that member briefly
+    ineligible for every control-plane workload.
+
+    Non-negotiable #16 makes the label the source of truth for placement, so a
+    writer that clears labels has to know the whole desired set.
+    """
+    roles = {p for p in profiles if p in _ROLE_LABEL_KEYS}
+    variant = appliance_state.detect_appliance_variant()
+    if variant is not None:
+        roles |= set(_VARIANT_FIXED_ROLES.get(variant, frozenset()))
+    join_state, _ = appliance_state.read_cluster_join_state()
+    if join_state == "ready":
+        roles.add("control-plane")
+    return roles
+
+
 def apply_role_assignment(
     profiles: list[str],
     env_file: Path,
@@ -365,18 +416,15 @@ def apply_role_assignment(
     # doesn't block the apply (the values PATCH already landed and
     # the helm-install will sit Pending until the next reconcile
     # writes the labels).
-    desired_role_set = {p for p in profiles if p in _ROLE_LABEL_KEYS}
+    # #1003 item 3 — the desired set is shared with reconcile_node_labels.
+    # This used to be `{p for p in profiles ...}`, which omitted the
+    # variant-fixed roles and the promoted-member case, so this call CLEARED
+    # the control-plane label that the reconcile had just asserted.
+    roles = desired_role_set(profiles)
     label_diff: dict[str, str | None] = {}
     for role, label in _ROLE_LABEL_KEYS.items():
-        label_diff[label] = "true" if role in desired_role_set else None
-    node_name = os.environ.get("NODE_NAME") or os.environ.get("APPLIANCE_HOSTNAME") or ""
-    if not node_name:
-        try:
-            import socket as _socket
-
-            node_name = _socket.gethostname()
-        except OSError:
-            node_name = ""
+        label_diff[label] = "true" if role in roles else None
+    node_name = _resolve_node_name()
     if node_name:
         label_ok, label_err = k8s_api.patch_node_labels(node_name, label_diff)
         if not label_ok:
@@ -421,48 +469,21 @@ def reconcile_node_labels(profiles: list[str]) -> tuple[bool, str | None]:
     or a manual unlabeling without waiting for the values-hash to
     change.
 
-    The desired role set is the union of:
-
-      * Operator-assigned ``profiles`` from the heartbeat-response's
-        role-assignment block (passed through here every tick).
-      * The fixed per-variant set from ``_VARIANT_FIXED_ROLES``
-        (#272 Phase 7b) — full-stack + frontend-core always assert
-        ``control-plane``; DNS/DHCP are operator-toggleable on every
-        variant (full-stack just defaults them on at register time).
-        application contributes nothing fixed (operator chooses).
+    The desired set comes from :func:`desired_role_set`, which
+    ``apply_role_assignment`` also uses — see #1003 item 3 for why having
+    two copies of it, only one complete, made this function's work get
+    undone on the same tick.
 
     Returns ``(ok, error_or_None)`` — caller logs but doesn't act
     on failure (next heartbeat re-attempts).
     """
-    desired_role_set = {p for p in profiles if p in _ROLE_LABEL_KEYS}
-    # #272 Phase 1 — union with the variant's fixed roles. Variant
-    # detection reads /etc/spatiumddi-host/role-config:ROLE; falls
-    # back to no-op (empty set) on docker / k8s / unknown variants.
-    variant = appliance_state.detect_appliance_variant()
-    if variant is not None:
-        desired_role_set |= set(_VARIANT_FIXED_ROLES.get(variant, frozenset()))
-    # #277 — a promoted `appliance`-variant node (one that JOINED the
-    # control-plane cluster as a k3s server) must also carry the
-    # control-plane label so the control-plane workloads (api / frontend
-    # / worker + the CNPG postgres primary & replicas) can schedule onto
-    # it. The seed (control-plane variant) already gets this via
-    # _VARIANT_FIXED_ROLES; this covers members promoted from an
-    # `appliance` install. Key off the host runner's join-state sidecar:
-    # "ready" == joined and Ready as a cluster member.
-    join_state, _ = appliance_state.read_cluster_join_state()
-    if join_state == "ready":
-        desired_role_set.add("control-plane")
+    roles = desired_role_set(profiles)
     label_diff: dict[str, str | None] = {}
     for role, label in _ROLE_LABEL_KEYS.items():
-        label_diff[label] = "true" if role in desired_role_set else None
-    node_name = os.environ.get("NODE_NAME") or os.environ.get("APPLIANCE_HOSTNAME") or ""
+        label_diff[label] = "true" if role in roles else None
+    node_name = _resolve_node_name()
     if not node_name:
-        try:
-            import socket as _socket
-
-            node_name = _socket.gethostname()
-        except OSError:
-            return False, "node_name unknown"
+        return False, "node_name unknown"
     return k8s_api.patch_node_labels(node_name, label_diff)
 
 

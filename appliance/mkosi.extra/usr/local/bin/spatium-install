@@ -395,7 +395,13 @@ preflight() {
     fi
     [ -n "$cpus" ] && [ "$cpus" != "0" ] || cpus="?"
     ram_kb=$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null || echo 0)
-    ram_gb=$(( ram_kb / 1024 / 1024 ))
+    # #1003 item 6 — round to NEAREST, matching pick_disk's sizing gate.
+    # This floored while that one rounded, so on a 4 GiB VM pre-flight said
+    # "Memory: 3 GiB" and the gate thirty seconds later said "ram=4G" — the
+    # installer disagreeing with itself about the machine it is standing on,
+    # which is exactly the kind of thing that makes an operator distrust the
+    # rest of the screen.
+    ram_gb=$(( (ram_kb + 524288) / 1024 / 1024 ))
     body+="CPU:       $cpus core(s)\n"
     # -1 for the same reason pick_disk's sizing gate does it: MemTotal
     # excludes what the kernel reserves, so an 8 GiB box reports 7 and a
@@ -2914,6 +2920,32 @@ _dm_maps_on_target() {
 #
 # So the release has to be verified here, while nothing has been written.
 # Runs after the teardown loop and before `wipefs`.
+# Run a release command whose failure is expected and uninteresting.
+#
+# #1003 item 7. "not mounted" and swapoff's "Invalid argument" mean the
+# partition was simply not in use — the normal case, and not something the
+# operator or a support bundle reader needs to see eighteen times. Those go
+# to the trace log; anything else is a real surprise and goes to the install
+# log where it will be read. Never fails: the caller's next step is the
+# _assert_target_released gate, which is what actually decides whether the
+# disk is safe to write.
+_release_quietly() {
+    local out rc
+    out=$("$@" 2>&1)
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+        printf '%s: released %s\n' "$1" "${*: -1}" >> "$TRACE_LOG"
+        return 0
+    fi
+    case "$out" in
+        *"not mounted"*|*"Invalid argument"*|*"not found"*|*"no mount point"*)
+            printf '%s\n' "$out" >> "$TRACE_LOG" ;;
+        *)
+            printf '%s\n' "$out" >> "$INSTALL_LOG" ;;
+    esac
+    return 0
+}
+
 _assert_target_released() {
     local remaining
     remaining=$(_dm_maps_on_target "$TARGET_DISK" | tr '\n' ' ')
@@ -3206,10 +3238,26 @@ do_install() {
         # swap entries. sgdisk -Z, mkfs.fat, and the subsequent
         # mount all fail on a busy device, so unconditionally
         # release everything before partitioning.
+        #
+        # #1003 item 7 — the expected-failure noise goes to the TRACE log,
+        # not the install log. Every one of these fails on a partition that
+        # is not mounted and not swap, which is the normal case, so a
+        # six-partition disk produced eighteen lines of
+        #
+        #     swapoff: /dev/sda1: swapoff failed: Invalid argument
+        #     umount: /dev/sda1: not mounted.
+        #
+        # That was tolerable while the log died with the live medium. Since
+        # #995 item 1 it is copied onto the installed system and #875 ships
+        # it in support bundles, so it is now the first thing somebody
+        # debugging a failed install reads — and it reads as six failed
+        # unmounts. A genuine failure still lands in the install log: only
+        # "not mounted" / "Invalid argument" are filtered, and anything else
+        # is reported as itself.
         for part in $(lsblk -nr -o NAME "$TARGET_DISK" 2>/dev/null | tail -n +2); do
-            swapoff "/dev/$part" >> "$INSTALL_LOG" 2>&1 || true
-            umount "/dev/$part"  >> "$INSTALL_LOG" 2>&1 || true
-            umount -l "/dev/$part" >> "$INSTALL_LOG" 2>&1 || true
+            _release_quietly swapoff "/dev/$part"
+            _release_quietly umount "/dev/$part"
+            _release_quietly umount -l "/dev/$part"
         done
         # device-mapper entries (LVM / dm-crypt) backed by this disk —
         # and, since #995 item 10, ONLY this disk. Retry until the target
@@ -4168,7 +4216,13 @@ GRUB_SAVEDEFAULT=true
 # matters when something is wrong (a panic, a missed module, plymouth
 # eating keystrokes — all silently undebuggable otherwise).
 GRUB_CMDLINE_LINUX_DEFAULT="loglevel=3 audit=0"
-GRUB_CMDLINE_LINUX="console=tty0 console=ttyS0,115200n8"
+# systemd.ssh_auto=no — #1003 item 9. systemd-ssh-generator probes for an
+# AF_VSOCK CID and exits 1 on a VM that has a vsock device but no CID
+# (Proxmox), which is the ONLY non-kernel journalctl -p err entry on an
+# otherwise healthy boot. The appliance has no use for the vsock SSH
+# endpoint, and per #994 a healthy node whose logs say otherwise trains
+# operators to skim past the one that matters.
+GRUB_CMDLINE_LINUX="console=tty0 console=ttyS0,115200n8 systemd.ssh_auto=no"
 GRUB_TERMINAL_INPUT="console serial"
 GRUB_TERMINAL_OUTPUT="console serial"
 GRUB_SERIAL_COMMAND="serial --unit=0 --speed=115200"

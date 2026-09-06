@@ -723,6 +723,56 @@ place_metallb_frrk8s_crds() {
 #        full-stack=false because the appliance chart owns them)
 _render_control_helmchart() {
     local chart_b64="$1"
+    # #1003 item 4 — size api + worker HERE, so the first render is the final one.
+    #
+    # firstboot rendered the chart with the values-file defaults (api 512Mi) and
+    # the supervisor's first heartbeat then re-rendered it sized to the node
+    # (1960Mi on a 4 GiB VM). Every install therefore paid for a second
+    # helm-install Job, a second migrate Job, and an api + worker rollout with a
+    # transient readiness Unhealthy — three minutes into a box that was already
+    # up. The supervisor still owns the value afterwards; this just stops the
+    # first render being knowingly wrong.
+    #
+    # MIRRORS k8s_api.control_plane_resources(). Two implementations of one
+    # formula is a drift risk, so agent/supervisor/tests/test_control_plane_sizing.py
+    # computes both and requires them to agree — the same way #992 pins this
+    # script's role-chart values to the Python.
+    _mem_total_mib() {
+        awk '/^MemTotal:/ {print int($2/1024); exit}' /proc/meminfo 2>/dev/null || true
+    }
+    _clamp_mib() {  # total, numerator, denominator, lo, hi
+        local v=$(( $1 * $2 / $3 ))
+        [ "$v" -lt "$4" ] && v="$4"
+        [ "$v" -gt "$5" ] && v="$5"
+        printf '%s' "$v"
+    }
+    local MEM_TOTAL_MIB API_MEM_MIB WORKER_MEM_MIB WORKER_CONCURRENCY
+    local API_SIZING_YAML WORKER_SIZING_YAML
+    MEM_TOTAL_MIB=$(_mem_total_mib)
+    API_MEM_MIB=""
+    WORKER_MEM_MIB=""
+    WORKER_CONCURRENCY=""
+    if [ -n "$MEM_TOTAL_MIB" ] && [ "$MEM_TOTAL_MIB" -gt 0 ] 2>/dev/null; then
+        # 0.5 / 0.25 as integer ratios; clamps 1024..8192 and 1024..4096.
+        API_MEM_MIB=$(_clamp_mib "$MEM_TOTAL_MIB" 1 2 1024 8192)
+        WORKER_MEM_MIB=$(_clamp_mib "$MEM_TOTAL_MIB" 1 4 1024 4096)
+        # _WORKER_SMALL_NODE_MIB = 12288.
+        if [ "$MEM_TOTAL_MIB" -le 12288 ]; then WORKER_CONCURRENCY=2; else WORKER_CONCURRENCY=4; fi
+        echo "Sizing control plane for ${MEM_TOTAL_MIB} MiB: api=${API_MEM_MIB}Mi worker=${WORKER_MEM_MIB}Mi concurrency=${WORKER_CONCURRENCY}"
+    else
+        echo "MemTotal unreadable — leaving the chart's default control-plane sizing in place"
+    fi
+    # Rendered into the values block below. Empty string = emit nothing, so an
+    # unreadable MemTotal leaves the chart's defaults untouched rather than
+    # emitting a malformed `memory: Mi`.
+    API_SIZING_YAML=""
+    WORKER_SIZING_YAML=""
+    if [ -n "$API_MEM_MIB" ]; then
+        API_SIZING_YAML=$(printf '      resources:\n        limits:\n          memory: "%sMi"' \
+            "$API_MEM_MIB")
+        WORKER_SIZING_YAML=$(printf '      concurrency: %s\n      resources:\n        limits:\n          memory: "%sMi"' \
+            "$WORKER_CONCURRENCY" "$WORKER_MEM_MIB")
+    fi
     # #983 — first of two gates on naming ``spatium-control-plane`` here.
     # This one is cheap and early: no appliance chart tarball means the chart
     # that RENDERS the class is not going into the auto-deploy dir at all.
@@ -825,6 +875,9 @@ spec:
     # Appliance is single-node — collapse api/worker to 1 replica
     # each + disable HPA (no horizontal scaling on a single host).
     api:
+      # #1003 item 4 — sized from this node's RAM, matching what the
+      # supervisor would otherwise re-render on its first heartbeat.
+${API_SIZING_YAML}
       replicas: 1  # spatium:cp-size
       # #590 — one api per control-plane node. Without this a promote
       # could land every api pod on the seed, so losing the seed left no
@@ -933,6 +986,8 @@ spec:
       applianceHostMounts:
         enabled: true
     worker:
+      # #1003 item 4 — see the api block above.
+${WORKER_SIZING_YAML}
       # #983 Phase 2 — alert evaluation runs in the WORKER, not the api, so
       # the node_pressure PSI rule needs a ServiceAccount here or it
       # evaluates to nothing forever while sitting enabled in the Alerts UI.

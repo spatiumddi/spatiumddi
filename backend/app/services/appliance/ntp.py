@@ -106,8 +106,15 @@ def render_chrony_conf(settings: PlatformSettings) -> str:
             "# RTC has drifted while powered off.",
             "rtcsync",
             "",
-            "# Set the system clock based on observed time using the leapseconds list.",
-            "leapsectz right/UTC",
+            # #1003 item 5 — no `leapsectz right/UTC`. Debian's stock
+            # chrony.conf carries it, but on trixie the `right/` zone tree
+            # moved to `tzdata-legacy`, which the appliance image does not
+            # install: /usr/share/zoneinfo/right is absent, and chrony logs
+            # "Timezone right/UTC failed leap second check, ignoring" at
+            # WARNING on every start. Dropping the directive costs nothing —
+            # chrony then takes leap seconds from the NTP sources themselves,
+            # which is what happens today anyway since the directive is
+            # already being ignored.
             "",
         ]
     )

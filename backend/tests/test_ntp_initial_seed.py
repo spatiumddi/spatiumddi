@@ -62,8 +62,15 @@ def test_the_column_uses_the_callable(monkeypatch):
 
 
 def test_server_default_stays_the_plain_pool():
-    """A row created outside the ORM cannot know an installer answer."""
+    """A row created outside the ORM cannot know an installer answer.
+
+    Compared exactly rather than with ``"pool.ntp.org" in ...``: a substring
+    test would also pass for ``evil-pool.ntp.org.attacker.test``, which is
+    why CodeQL flags that shape (py/incomplete-url-substring-sanitization)
+    — and here the exact form is simply the better assertion, since a
+    changed DDL default is precisely what this guards.
+    """
     from app.models.settings import PlatformSettings
 
     col = PlatformSettings.__table__.c.ntp_pool_servers
-    assert "pool.ntp.org" in str(col.server_default.arg)
+    assert str(col.server_default.arg) == "'[\"pool.ntp.org\"]'::jsonb"
