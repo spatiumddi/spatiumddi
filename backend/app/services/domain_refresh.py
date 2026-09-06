@@ -146,10 +146,34 @@ async def refresh_one_domain(
         domain.whois_last_checked_at = when
         domain.next_check_at = when + timedelta(hours=max(1, interval_hours))
         domain.whois_state = "n/a"
-        reason = (
-            f"{domain.name} is not under a delegated top-level domain "
-            f"({skip_scope}) — there is no registry to query."
-        )
+        # One reason per scope. "not under a delegated top-level domain" is
+        # true of `.lan` and FALSE of the other two: `example.com` is under
+        # `.com` and `10.in-addr.arpa` under `.arpa`, both delegated. They
+        # are skipped because nothing *registers* them, which is a different
+        # statement, and telling an operator their example.com is on an
+        # undelegated TLD would be simply wrong.
+        if skip_scope == "reserved":
+            where = (
+                f"the reserved special-use namespace .{scope.matched_suffix}"
+                if scope.matched_suffix
+                else "a reserved special-use namespace"
+            )
+            rfc = f" ({scope.rfc})" if scope.rfc else ""
+            reason = (
+                f"{domain.name} is in {where}{rfc} — those names are not "
+                "registered with anyone, so there is no registry to query."
+            )
+        elif skip_scope == "reverse":
+            reason = (
+                f"{domain.name} is a reverse-lookup zone — it is delegated "
+                "with an address block, not registered as a domain, so there "
+                "is no registration to look up."
+            )
+        else:
+            reason = (
+                f"{domain.name} is not under a delegated top-level domain — "
+                "there is no registry to query."
+            )
         logger.info("domain_rdap_skipped", domain=domain.name, name_scope=skip_scope)
         return DomainRefreshResult(
             rdap_reachable=False,

@@ -202,14 +202,22 @@ def resolve_effective(bundled: TldRegistry, snapshot: TldRegistry | None) -> Tld
 # immediate, and any other api / worker process converges within the TTL.
 
 _CACHE_TTL_SECONDS = 60.0
-_effective_cache: tuple[float, TldRegistry] | None = None
+# Two globals rather than one tuple, matching ``core.maintenance_mode`` and
+# ``services.feature_modules`` — the codebase's other two TTL caches.
+_cache_loaded_at: float = 0.0
+_cached_registry: TldRegistry | None = None
 
 
 def invalidate_effective_cache() -> None:
     """Drop the cached effective registry (called after a refresh, and by
-    the test suite's global-cache reset)."""
-    global _effective_cache  # noqa: PLW0603
-    _effective_cache = None
+    the test suite's global-cache reset).
+
+    Clears the value rather than zeroing the timestamp: ``time.monotonic()``
+    has an arbitrary epoch, so a "stale" sentinel of ``0.0`` would still
+    look fresh for the first 60 s of whatever that epoch counts from.
+    """
+    global _cached_registry  # noqa: PLW0603
+    _cached_registry = None
 
 
 async def load_snapshot(db: AsyncSession) -> TldRegistry | None:
@@ -237,17 +245,15 @@ async def effective_registry(db: AsyncSession) -> TldRegistry:
     card, which reports both candidates — reads ``load_bundled()`` and
     ``load_snapshot()`` directly instead.
     """
-    global _effective_cache  # noqa: PLW0603
+    global _cache_loaded_at, _cached_registry  # noqa: PLW0603
 
     now = time.monotonic()
-    if _effective_cache is not None:
-        stamped, cached = _effective_cache
-        if now - stamped < _CACHE_TTL_SECONDS:
-            return cached
+    if _cached_registry is not None and now - _cache_loaded_at < _CACHE_TTL_SECONDS:
+        return _cached_registry
 
-    resolved = resolve_effective(load_bundled(), await load_snapshot(db))
-    _effective_cache = (now, resolved)
-    return resolved
+    _cached_registry = resolve_effective(load_bundled(), await load_snapshot(db))
+    _cache_loaded_at = now
+    return _cached_registry
 
 
 # ── Operator-triggered refresh ───────────────────────────────────────

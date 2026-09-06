@@ -63,6 +63,11 @@ export function TldRegistrySection({
       // potentially wrong until it is refetched.
       qc.invalidateQueries({ queryKey: ["dns-zones"] });
       qc.invalidateQueries({ queryKey: ["domains"] });
+      // …and so is the create-zone modal's live hint, which caches per
+      // typed name for 5 minutes. Without this, an operator who refreshes
+      // and then opens the modal is told a freshly-delegated TLD is still
+      // undelegated — the one moment the answer is most likely to matter.
+      qc.invalidateQueries({ queryKey: ["dns-name-scope"] });
     },
     onError: (e: unknown) => setError(formatApiError(e)),
   });

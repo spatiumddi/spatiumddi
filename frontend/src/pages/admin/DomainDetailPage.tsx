@@ -602,11 +602,19 @@ export function DomainDetailPage() {
                   <WhoisStateBadge state={domain.whois_state} />
                   {/* #986 — "n/a" is not a failed lookup, it is a name with
                       no registry to look up. Say so, or it reads as an
-                      error the operator is expected to fix. */}
+                      error the operator is expected to fix — and say WHICH
+                      reason: "not under a delegated TLD" is true of .lan and
+                      flatly false of example.com (under .com) and of a
+                      reverse zone (under .arpa). Both of those are skipped
+                      because nothing registers them, not because their TLD
+                      is undelegated. */}
                   {domain.whois_state === "n/a" && (
                     <span className="text-[11px] text-muted-foreground">
-                      Not under a delegated top-level domain — there is no
-                      registry to query, so RDAP is skipped.
+                      {domain.name_scope === "reserved"
+                        ? "Reserved special-use name — those are not registered with anyone, so RDAP is skipped."
+                        : domain.name_scope === "reverse"
+                          ? "Reverse-lookup name — delegated with an address block rather than registered as a domain, so RDAP is skipped."
+                          : "Not under a delegated top-level domain — there is no registry to query, so RDAP is skipped."}
                     </span>
                   )}
                 </span>

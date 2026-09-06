@@ -728,6 +728,48 @@ async def test_rdap_service_state_distinguishes_absent_from_unknown(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("name", "must_contain", "must_not_contain"),
+    [
+        # example.com IS under .com, a delegated TLD. Saying otherwise is
+        # simply false, and it is the message the operator reads.
+        ("example.com", "reserved special-use", "not under a delegated"),
+        ("10.in-addr.arpa", "reverse-lookup", "not under a delegated"),
+        # Only the genuinely-undelegated case gets that sentence.
+        ("corp.lan", "not under a delegated", "reserved special-use"),
+    ],
+)
+async def test_the_skip_reason_names_the_right_cause(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    must_contain: str,
+    must_not_contain: str,
+) -> None:
+    from app.models.domain import Domain
+    from app.services.domain_refresh import refresh_one_domain
+
+    async def _must_not_run(n: str) -> object:  # pragma: no cover - guard
+        raise AssertionError(f"an outbound lookup was made for {n}")
+
+    async def _absent(n: str) -> str:
+        return "absent"
+
+    monkeypatch.setattr("app.services.domain_refresh.lookup_domain", _must_not_run)
+    monkeypatch.setattr("app.services.domain_refresh.rdap_service_state", _absent)
+
+    d = Domain(name=name)
+    db_session.add(d)
+    await db_session.flush()
+
+    result = await refresh_one_domain(d, interval_hours=24)
+    assert d.whois_state == "n/a"
+    assert result.skipped_reason is not None
+    assert must_contain in result.skipped_reason
+    assert must_not_contain not in result.skipped_reason
+
+
+@pytest.mark.asyncio
 async def test_rdap_still_runs_for_a_public_name(
     db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
