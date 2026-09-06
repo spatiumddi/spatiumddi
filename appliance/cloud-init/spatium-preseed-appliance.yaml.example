@@ -19,14 +19,57 @@ spatium_preseed:
   hostname: dns-east-1
   admin_user: admin
   admin_password: "change-me-please"
+  # admin_password_hash: "$6$rounds=4096$abcd...$..."
+  # root is locked by default since #995; true restores the old
+  # same-password-as-admin behaviour.
+  set_root_password: false
   timezone: UTC
+
+  # Console keyboard layout (#995 item 17) — an XKB layout code, applied
+  # before the password prompt and persisted. Default us.
+  keymap: us
+
+  # Time source (#995 item 16). String or list. Also seeds the node's
+  # initial NTP config (#1003 item 2). Note that leaving it empty does
+  # NOT disable NTP — Debian's own pool directive stays (#1002).
+  ntp_servers: pool.ntp.org
+
+  # SSH bootstrap keys for the admin account (#995 item 18). Replaced by
+  # the control plane's list once it manages SSH (#157).
+  # ssh_authorized_keys:
+  #   - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... ops@corp"
+  # Refused unless ssh_authorized_keys is also set.
+  # ssh_disable_password: false
 
   network:
     mode: dhcp
+    # Optional in dhcp mode: PIN the lease to one port (#995 item 19).
+    # Without it NetworkManager DHCPs every NIC and the node answers on
+    # whichever replied first — which on a DNS/DHCP appliance decides
+    # which network it serves.
+    # interface: enp1s0
+    #
+    # Static instead — all four required (see the control-plane example
+    # for the full notes), plus optional IPv6 (#995 item 21):
+    # mode: static
+    # interface: enp1s0
+    # ip: 192.168.1.20
+    # prefix: 24
+    # gateway: 192.168.1.1
+    # dns: "1.1.1.1 1.0.0.1"
+    # ip6: 2001:db8:1::20
+    # prefix6: 64
+    # gateway6: fe80::1
 
-  k3s:
-    pod_cidr: 10.42.0.0/16
-    service_cidr: 10.43.0.0/16
+  # NOTE (#995 item 14): an Additional node writes NO k3s CIDR drop-in.
+  # A k3s server refuses to join a cluster whose cluster-cidr /
+  # service-cidr differ from the datastore's, so pinning them here would
+  # make this node impossible to PROMOTE into the control plane later.
+  # The join inherits the seed's values. Left here, commented, because
+  # the parser still accepts the block for a standalone appliance.
+  # k3s:
+  #   pod_cidr: 10.42.0.0/16
+  #   service_cidr: 10.43.0.0/16
 
   # ── Control-plane join (REQUIRED for role: appliance) ───────────────
   # Where this appliance registers. Point at the control plane's URL —
