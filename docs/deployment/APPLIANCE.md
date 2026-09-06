@@ -1348,6 +1348,11 @@ trigger: tag push (CalVer)
 >   be destroyed, the kernel would keep the stale partition table, and
 >   `mkfs` would write at the old offsets. The release is verified
 >   explicitly, before anything is written.
+>   Note that this whole path is **dormant on a stock ISO**: `mkosi.conf`
+>   names neither `lvm2` nor `dmsetup` nor `cryptsetup` and nothing it
+>   does name depends on them, so the teardown returns immediately — as
+>   the loop it replaced also did. Adding the storage tooling belongs with
+>   Phase 4 (RAID + multipath), which owns that part of `mkosi.conf`.
 > - **The admin account is checked before the wipe as well.** `useradd` is
 >   fatal now, at ~63% — after the disk is gone. The preseed parser's
 >   reserved-account list is a hand-written approximation of what the

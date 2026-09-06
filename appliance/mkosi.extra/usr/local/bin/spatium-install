@@ -1372,6 +1372,19 @@ partition_node() {
 # an unreleased map does not abort the install, it lets the GPT be
 # destroyed while the kernel keeps the stale partition table, and mkfs
 # then writes at the OLD offsets, over whatever the map was serving.
+#
+# DORMANT ON A STOCK ISO TODAY, and that is worth knowing before reading
+# the rest as a description of live behaviour: `mkosi.conf` names neither
+# `lvm2` nor `dmsetup` nor `cryptsetup`, no `Depends:` chain from the
+# packages it does name reaches them, and mkosi installs with
+# --no-install-recommends. So `command -v dmsetup` fails and this returns
+# immediately — as did the loop it replaced. Nothing activates a volume
+# group on an attached disk either, so a reinstall over an existing LVM
+# box works because there are no maps, not because they were released.
+# Adding the storage tooling belongs with #995 Phase 4 (RAID + multipath),
+# which owns that part of mkosi.conf; the point of getting this right now
+# is that the code is correct on the day it arrives, and correct today for
+# anyone running `spatium-install` from a live shell that has dmsetup.
 _dm_maps_on_target() {
     local disk="$1"
     command -v dmsetup >/dev/null 2>&1 || return 0
