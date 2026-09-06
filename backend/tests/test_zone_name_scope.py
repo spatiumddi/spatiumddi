@@ -856,6 +856,43 @@ async def test_store_snapshot_does_not_invalidate_the_cache_before_the_commit(
 
 
 @pytest.mark.asyncio
+async def test_the_cache_is_actually_used_within_the_ttl(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Repeated reads inside the TTL must hit the cache, not the database.
+
+    This is the test that makes ``_cache_loaded_at`` demonstrably
+    load-bearing rather than merely asserted to be. Delete the
+    ``_cache_loaded_at = now`` line and the timestamp stays at its initial
+    ``0.0``, so ``now - 0.0`` exceeds any TTL, every call re-queries, and
+    this fails — which is the answer to a static analyser that reports the
+    write as an unused global because it cannot see the read happening on
+    the *next* invocation.
+    """
+    from app.services.dns import tld_registry as tr
+
+    calls: list[int] = []
+    real_load = tr.load_snapshot
+
+    async def _counting(db: AsyncSession) -> object:
+        calls.append(1)
+        return await real_load(db)
+
+    monkeypatch.setattr(tr, "load_snapshot", _counting)
+    tr.invalidate_effective_cache()
+
+    first = await tr.effective_registry(db_session)
+    for _ in range(3):
+        assert (await tr.effective_registry(db_session)).version == first.version
+    assert calls == [1], f"expected one DB read inside the TTL, got {len(calls)}"
+
+    # …and an explicit invalidation really does force the next read.
+    tr.invalidate_effective_cache()
+    await tr.effective_registry(db_session)
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
 async def test_the_refresh_endpoint_invalidates_after_committing(
     client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
