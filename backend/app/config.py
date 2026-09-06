@@ -204,6 +204,19 @@ class Settings(BaseSettings):
     # render "SpatiumDDI Appliance v0.1.0 @ host-name" without an
     # extra round-trip into the OS.
     appliance_mode: bool = False
+
+    # #1003 item 2 — the OS installer's "Time source" answer, stamped into
+    # the api's environment by spatiumddi-firstboot from the STATE config.
+    #
+    # Seeds the INITIAL value of ``platform_settings.ntp_pool_servers``
+    # only. Once that row exists the control plane is authoritative, or an
+    # operator's later change in the UI would be undone on every boot.
+    # Empty (the default, and every non-appliance deployment) leaves the
+    # model's own ``pool.ntp.org`` in place.
+    #
+    # Space-separated, because that is the shape the installer prompt
+    # collects and writes to STATE.
+    initial_ntp_servers: str = ""
     appliance_version: str = ""
     appliance_hostname: str = ""
     # The k8s node this api pod runs on, from the downward API

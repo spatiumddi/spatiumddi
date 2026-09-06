@@ -542,7 +542,7 @@ ask_keyboard() {
     if [ -n "${PRESEED_HAS_KEYMAP:-}" ]; then
         log "Preseed: keymap=$KEYMAP (skipping prompt)"
         _apply_keymap "$KEYMAP" || \
-            log "WARN: loadkeys $KEYMAP failed on the live system"
+            log "WARN: could not apply keymap $KEYMAP on the live system"
         return 2
     fi
     # Ordered by how likely they are rather than alphabetically — a menu
@@ -578,21 +578,23 @@ ask_keyboard() {
         while true; do
             pick=$(whiptail --backtitle "$BACKTITLE" --title "Keyboard layout" \
                 --cancel-button "Back" \
-                --inputbox "Console keymap name, as 'loadkeys' takes it (e.g. 'be2', 'hu', 'tr').\n\nFrom a shell: localectl list-keymaps" \
-                13 70 -- "$KEYMAP" 3>&1 1>&2 2>&3) \
+                --inputbox "Keyboard layout code (e.g. 'be', 'hu', 'tr', 'gr').\n\nThese are XKB layout names - the two-letter code for the country in most cases. From a shell: localectl list-x11-keymap-layouts" \
+                14 70 -- "$KEYMAP" 3>&1 1>&2 2>&3) \
                 || return 1
-            # Refuse a name loadkeys cannot load, rather than silently
-            # leaving the operator on US — which is the same bug one
-            # screen later in a different disguise.
+            # Refuse a layout that cannot be applied, rather than
+            # silently leaving the operator on US — the same bug one
+            # screen later in a different disguise. #1003 item 1a: this
+            # loop used to be unescapable, because the mechanism it
+            # validated against could not load ANY name.
             if [ -n "$pick" ] && _apply_keymap "$pick"; then
                 break
             fi
             whiptail --backtitle "$BACKTITLE" --title "Unknown keymap" \
-                --msgbox "'$pick' is not a keymap this system can load.\n\nRun 'localectl list-keymaps' from a shell to see the names." 11 68 || true
+                --msgbox "'$pick' is not a layout this system can compile.\n\nRun 'localectl list-x11-keymap-layouts' from a shell to see the names." 11 68 || true
         done
     else
         _apply_keymap "$pick" || \
-            log "WARN: loadkeys $pick failed; the console stays on the previous layout"
+            log "WARN: could not apply keymap $pick; the console stays on the previous layout"
     fi
     KEYMAP="$pick"
     log "Keymap: $KEYMAP"
@@ -605,10 +607,38 @@ ask_keyboard() {
 # layout to get wrong, and refusing every name would make the prompt
 # impossible to satisfy.
 _apply_keymap() {
+    # #1003 item 1a — this used to be `loadkeys -- "$1"`, and it could
+    # NEVER succeed. The image has no keymaps at all: Debian ships them in
+    # `console-data`, which mkosi.conf does not install, so
+    # /usr/share/keymaps and /usr/lib/kbd/keymaps are both absent and
+    # loadkeys fails for every name including the `us` default. Verified
+    # against a trixie image with exactly our package set.
+    #
+    # Worse than a no-op, because the "Something else" loop refuses any
+    # name _apply_keymap cannot load: every name failed, so an operator
+    # with a non-listed layout was stuck at that prompt with no way
+    # forward and a hint (`localectl list-keymaps`) that would also have
+    # come back empty.
+    #
+    # ckbcomp compiles an XKB layout into a console keymap on stdout, and
+    # it IS present — console-setup ships it and pulls in xkb-data. That
+    # is also the mechanism console-setup itself uses on the installed
+    # system, so the live console and the installed console now agree
+    # rather than being configured two different ways.
+    command -v ckbcomp >/dev/null 2>&1 || return 0
     command -v loadkeys >/dev/null 2>&1 || return 0
-    # `--` or an "other" entry of `-h` makes loadkeys print help and exit
-    # 0, which the re-prompt loop would accept as a valid keymap.
-    loadkeys -- "$1" >>"$INSTALL_LOG" 2>&1
+    local xkb_layout xkb_variant xkb_model
+    _keymap_to_xkb "$1"
+    # Array, not `${v:+-variant $v}`: an empty variant must contribute NO
+    # argument, and unquoted expansion to build one would word-split a
+    # value like "Canadian Multilingual".
+    local -a args=(-model "$xkb_model" -layout "$xkb_layout")
+    [ -n "$xkb_variant" ] && args+=(-variant "$xkb_variant")
+    # ckbcomp exits non-zero on an unknown layout, which is what makes the
+    # retry loop a real validator instead of a formality. `loadkeys -`
+    # reads the compiled map from stdin. pipefail is on, so either half
+    # failing fails the function.
+    ckbcomp "${args[@]}" 2>>"$INSTALL_LOG" | loadkeys - >>"$INSTALL_LOG" 2>&1
 }
 
 # Console keymap -> XKB layout/variant/model, into the caller's
@@ -619,8 +649,10 @@ _apply_keymap() {
 # knows `gb` and not `uk`, `br`+variant `abnt2` and not `br-abnt2`, `jp`
 # and not `jp106` — so on exactly the layouts item 17 was filed for,
 # ckbcomp fails, console-setup falls back to US, and the operator meets
-# the mangled password at the login prompt one boot later. /etc/vconsole.conf
-# still gets the console name, which is what systemd-vconsole-setup wants.
+# the mangled password at the login prompt one boot later. Since #1003
+# item 1a this map is on the LIVE path too — _apply_keymap compiles
+# through ckbcomp rather than calling loadkeys with a console name that
+# the image has no file for.
 #
 # Only the names that actually differ are listed; anything else passes
 # through, which is right for the great majority (de, fr, es, it, …) and
@@ -3851,26 +3883,56 @@ EOF
             log "Root account password set from the admin password (operator opted in)"
         fi
 
-        # #995 item 17 — persist the console keymap. Two files because
-        # two things read it: /etc/default/keyboard is what console-setup
-        # applies at boot on Debian, and /etc/vconsole.conf is what
-        # systemd-vconsole-setup reads. Writing only one leaves the
-        # operator on US at exactly the login prompt where a mangled
-        # password is least explicable.
+        # #995 item 17 — persist the console keymap, for the two readers:
+        # /etc/default/keyboard is what console-setup applies at boot on
+        # Debian, and /etc/vconsole.conf is systemd-vconsole-setup's.
+        #
+        # #1003 item 1b — but on this image /etc/vconsole.conf is a SYMLINK
+        # to default/keyboard, so writing them in sequence made the second
+        # write clobber the first: the XKB block went in, `KEYMAP=` replaced
+        # the entire file, and console-setup was left with no XKBMODEL —
+        # four "keyboard model is unknown, assuming pc105" warnings on every
+        # boot and the layout never applied. Masked on a `us` install, and
+        # exactly the mangled-password-at-login failure item 17 exists to
+        # prevent on any other.
+        #
+        # So: resolve both paths and write the second only when it is a
+        # genuinely different file. Resolving beats special-casing the
+        # symlink because what matters is whether they are the same inode,
+        # not how they came to be that way — nothing in mkosi.extra creates
+        # it, so it arrives from a package postinst that can change.
+        #
+        # Both files get the XKB block rather than a `KEYMAP=` line.
+        # vconsole.conf(5) documents XKBLAYOUT / XKBMODEL / XKBVARIANT, and
+        # `KEYMAP=` would name a console keymap that does not exist on this
+        # image at all (#1003 item 1a) — so it is inert at best and, since
+        # systemd would try to load it, a boot-time failure at worst.
         local xkb_layout xkb_variant xkb_model
         _keymap_to_xkb "$KEYMAP"
-        cat > "$MOUNT/etc/default/keyboard" <<EOF
-# Written by spatium-install (issue #995 item 17).
+        local _kb_block
+        _kb_block=$(cat <<EOF
+# Written by spatium-install (issue #995 item 17, #1003 item 1b).
+# Read by console-setup (Debian) and systemd-vconsole-setup, which is why
+# this is the XKB block and not a KEYMAP= line: the image ships no console
+# keymaps, so console-setup compiles this with ckbcomp instead.
 XKBMODEL="$xkb_model"
 XKBLAYOUT="$xkb_layout"
 XKBVARIANT="$xkb_variant"
 XKBOPTIONS=""
 BACKSPACE="guess"
 EOF
+)
+        printf '%s\n' "$_kb_block" > "$MOUNT/etc/default/keyboard"
         chmod 0644 "$MOUNT/etc/default/keyboard"
-        printf 'KEYMAP=%s\n' "$KEYMAP" > "$MOUNT/etc/vconsole.conf"
-        chmod 0644 "$MOUNT/etc/vconsole.conf"
-        log "Keymap persisted: $KEYMAP"
+        local _vc="$MOUNT/etc/vconsole.conf" _kbf="$MOUNT/etc/default/keyboard"
+        if [ "$(readlink -f "$_vc" 2>/dev/null || printf '%s' "$_vc")" \
+             != "$(readlink -f "$_kbf" 2>/dev/null || printf '%s' "$_kbf")" ]; then
+            printf '%s\n' "$_kb_block" > "$_vc"
+            chmod 0644 "$_vc"
+            log "Keymap persisted: $KEYMAP (keyboard + vconsole)"
+        else
+            log "Keymap persisted: $KEYMAP (vconsole.conf is the same file - written once)"
+        fi
 
         # #995 item 16 — the operator's time source, as a chrony
         # sourcedir file rather than an edit to chrony.conf.
