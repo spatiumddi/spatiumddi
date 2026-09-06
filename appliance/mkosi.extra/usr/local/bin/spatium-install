@@ -365,17 +365,28 @@ _iso_build_date() {
 preflight() {
     log "Step: preflight"
     if [ "$FULLY_UNATTENDED" = "1" ]; then
-        return 0
+        return 2
     fi
     local body="" warn_count=0
 
     # ── CPU + RAM ────────────────────────────────────────────────────
     local cpus ram_kb ram_gb
-    cpus=$(nproc 2>/dev/null || grep -c '^processor' /proc/cpuinfo 2>/dev/null || echo "?")
+    # NOT `grep -c … || echo "?"`: grep -c prints 0 AND exits 1 when it
+    # matches nothing, so both branches run and the value becomes "0\n?".
+    cpus=$(nproc 2>/dev/null || true)
+    if [ -z "$cpus" ]; then
+        cpus=$(grep -c '^processor' /proc/cpuinfo 2>/dev/null || true)
+    fi
+    [ -n "$cpus" ] && [ "$cpus" != "0" ] || cpus="?"
     ram_kb=$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null || echo 0)
     ram_gb=$(( ram_kb / 1024 / 1024 ))
     body+="CPU:       $cpus core(s)\n"
-    if [ "$ram_gb" -gt 0 ] && [ "$ram_gb" -lt "$REC_CP_RAM_GIB" ]; then
+    # -1 for the same reason pick_disk's sizing gate does it: MemTotal
+    # excludes what the kernel reserves, so an 8 GiB box reports 7 and a
+    # bare `< REC_CP_RAM_GIB` warns on hardware that meets the published
+    # recommendation exactly. A screen that cries wolf is one operators
+    # learn to skim.
+    if [ "$ram_gb" -gt 0 ] && [ "$ram_gb" -lt "$((REC_CP_RAM_GIB - 1))" ]; then
         body+="Memory:    ${ram_gb} GiB  (control plane wants ${REC_CP_RAM_GIB} GiB)\n"
         warn_count=$((warn_count + 1))
     else
@@ -504,11 +515,19 @@ preflight() {
 # Distinct from #168 (UI language). This is the physical keyboard.
 ask_keyboard() {
     log "Step: ask_keyboard"
+    # An unattended run has nobody to answer this. The default is
+    # safe, and adding PRESEED_HAS_KEYMAP to compute_unattended would
+    # instead make every answer file that predates #995 stop being
+    # unattended — breaking the same installs a second way.
+    if [ "$FULLY_UNATTENDED" = "1" ] && [ -z "${PRESEED_HAS_KEYMAP:-}" ]; then
+        log "Unattended: no keymap preseeded, keeping the default"
+        return 2
+    fi
     if [ -n "${PRESEED_HAS_KEYMAP:-}" ]; then
         log "Preseed: keymap=$KEYMAP (skipping prompt)"
         _apply_keymap "$KEYMAP" || \
             log "WARN: loadkeys $KEYMAP failed on the live system"
-        return 0
+        return 2
     fi
     # Ordered by how likely they are rather than alphabetically — a menu
     # is scanned, not searched — plus an escape hatch for the rest.
@@ -571,7 +590,36 @@ ask_keyboard() {
 # impossible to satisfy.
 _apply_keymap() {
     command -v loadkeys >/dev/null 2>&1 || return 0
-    loadkeys "$1" >>"$INSTALL_LOG" 2>&1
+    # `--` or an "other" entry of `-h` makes loadkeys print help and exit
+    # 0, which the re-prompt loop would accept as a valid keymap.
+    loadkeys -- "$1" >>"$INSTALL_LOG" 2>&1
+}
+
+# Console keymap -> XKB layout/variant/model, into the caller's
+# xkb_layout / xkb_variant / xkb_model.
+#
+# These are two different namespaces and the first cut wrote the console
+# name into both files. console-setup feeds XKBLAYOUT to ckbcomp, which
+# knows `gb` and not `uk`, `br`+variant `abnt2` and not `br-abnt2`, `jp`
+# and not `jp106` — so on exactly the layouts item 17 was filed for,
+# ckbcomp fails, console-setup falls back to US, and the operator meets
+# the mangled password at the login prompt one boot later. /etc/vconsole.conf
+# still gets the console name, which is what systemd-vconsole-setup wants.
+#
+# Only the names that actually differ are listed; anything else passes
+# through, which is right for the great majority (de, fr, es, it, …) and
+# is the safe answer for an operator-typed "other" value.
+_keymap_to_xkb() {
+    xkb_model="pc105"
+    xkb_variant=""
+    case "$1" in
+        uk)         xkb_layout="gb" ;;
+        br-abnt2)   xkb_layout="br"; xkb_variant="abnt2" ;;
+        jp106)      xkb_layout="jp"; xkb_model="jp106" ;;
+        dvorak)     xkb_layout="us"; xkb_variant="dvorak" ;;
+        us-acentos) xkb_layout="us"; xkb_variant="intl" ;;
+        *)          xkb_layout="$1" ;;
+    esac
 }
 
 # ── NTP (issue #995 item 16) ──────────────────────────────────────────
@@ -583,9 +631,18 @@ _apply_keymap() {
 # pairing is rejected, both of which read as a networking fault.
 ask_ntp() {
     log "Step: ask_ntp"
+    local _ntp_loop=0
+    # An unattended run has nobody to answer this. The default is
+    # safe, and adding PRESEED_HAS_NTP to compute_unattended would
+    # instead make every answer file that predates #995 stop being
+    # unattended — breaking the same installs a second way.
+    if [ "$FULLY_UNATTENDED" = "1" ] && [ -z "${PRESEED_HAS_NTP:-}" ]; then
+        log "Unattended: no NTP preseeded, keeping the default"
+        return 2
+    fi
     if [ -n "${PRESEED_HAS_NTP:-}" ]; then
         log "Preseed: ntp_servers=$NTP_SERVERS (skipping prompt)"
-        return 0
+        return 2
     fi
     # Pre-fill from DHCP option 42 when the lease carried one: a site with
     # its own time servers usually hands them out, and typing them again
@@ -598,14 +655,40 @@ ask_ntp() {
     fi
     local hint=""
     [ -n "$dhcp_ntp" ] && hint="\n\nDHCP offered: $dhcp_ntp"
-    NTP_SERVERS=$(whiptail --backtitle "$BACKTITLE" --title "Time source" \
+    while : ; do
+    _ntp_loop=$((_ntp_loop + 1))
+    # Assign to a temp and commit after the cancel check. `VAR=$(whiptail
+    # …) || return 1` lands the empty string FIRST, and because empty is a
+    # legitimate answer here ("air-gapped, trusted RTC") a pure Back press
+    # silently turned a configured time source into none at all.
+    local ntp_pick
+    ntp_pick=$(whiptail --backtitle "$BACKTITLE" --title "Time source" \
         --cancel-button "Back" \
         --inputbox "NTP servers, space-separated. Names or addresses.\n\nThis clock is now: $(date -u '+%Y-%m-%d %H:%M UTC')\n\nOn a network with no route to the public pool, put your own server here — a clock nothing corrects breaks TLS and pairing on first boot.$hint" \
         17 74 -- "$NTP_SERVERS" 3>&1 1>&2 2>&3) \
         || return 1
+    # Validate the same way the preseed door does. Without this the two
+    # doors disagreed: an operator typing the very natural comma-separated
+    # "ntp1.corp,ntp2.corp" produced `server ntp1.corp,ntp2.corp iburst`,
+    # which chronyd refuses — the "clock nothing corrects" outcome this
+    # screen exists to prevent, arrived at by a different route.
+    local bad_ntp="" _tok
+    for _tok in $ntp_pick; do
+        case "$_tok" in
+            *[!A-Za-z0-9._:-]*|"") bad_ntp="$bad_ntp $_tok" ;;
+        esac
+    done
+    if [ -n "$bad_ntp" ]; then
+        whiptail --backtitle "$BACKTITLE" --title "Not a server name" \
+            --msgbox "These are not hostnames or IP addresses:$bad_ntp"$'\n\n'"Separate several servers with SPACES, not commas." 12 70 || true
+        continue
+    fi
+    NTP_SERVERS="$ntp_pick"
     # Empty is a legitimate answer: an air-gapped site with a hardware
     # clock it trusts, or one that will push NTP from the control plane
     # later. Recorded as "none" rather than silently reinstated.
+    break
+    done
     if [ -z "$NTP_SERVERS" ]; then
         log "NTP: no servers configured (operator left it blank)"
     else
@@ -650,9 +733,17 @@ _dhcp_ntp_servers() {
 # A key added here is a bootstrap, not a permanent grant.
 ask_ssh_keys() {
     log "Step: ask_ssh_keys"
+    # An unattended run has nobody to answer this. The default is
+    # safe, and adding PRESEED_HAS_SSH_KEYS to compute_unattended would
+    # instead make every answer file that predates #995 stop being
+    # unattended — breaking the same installs a second way.
+    if [ "$FULLY_UNATTENDED" = "1" ] && [ -z "${PRESEED_HAS_SSH_KEYS:-}" ]; then
+        log "Unattended: no SSH keys preseeded, keeping the default"
+        return 2
+    fi
     if [ -n "${PRESEED_HAS_SSH_KEYS:-}" ]; then
-        log "Preseed: $(printf '%s' "$SSH_AUTHORIZED_KEYS" | grep -c . || echo 0) SSH key(s) supplied (skipping prompt)"
-        return 0
+        log "Preseed: $(_ssh_key_count) SSH key(s) supplied (skipping prompt)"
+        return 2
     fi
     local choice
     while true; do
@@ -702,9 +793,15 @@ ask_ssh_keys() {
                         --msgbox "$src"$'\n\n'"$fetched" 12 72 || true
                     continue
                 fi
+                # _add_ssh_key's own modal is for the single-line PASTE
+                # path. Here the loop reports a total afterwards, and a
+                # server that answers 200 with an HTML page would
+                # otherwise draw one blocking dialog per line — hundreds,
+                # over IPMI, with no way to abort. SPATIUM_QUIET_KEY_ADD
+                # suppresses it; the count below is the report.
                 local added=0 line
                 while IFS= read -r line; do
-                    _add_ssh_key "$line" 2>/dev/null && added=$((added + 1))
+                    SPATIUM_QUIET_KEY_ADD=1 _add_ssh_key "$line" && added=$((added + 1))
                 done <<EOF
 $fetched
 EOF
@@ -757,8 +854,10 @@ _add_ssh_key() {
         printf '%s\n' "$key" > "$tmp"
         if ! ssh-keygen -l -f "$tmp" >/dev/null 2>&1; then
             rm -f "$tmp"
-            whiptail --backtitle "$BACKTITLE" --title "Not a public key" \
-                --msgbox "That line is not a public key ssh could load.\n\nA truncated paste is the usual cause — the line must be complete, on ONE line." 12 70 || true
+            if [ -z "${SPATIUM_QUIET_KEY_ADD:-}" ]; then
+                whiptail --backtitle "$BACKTITLE" --title "Not a public key" \
+                    --msgbox "That line is not a public key ssh could load.\n\nA truncated paste is the usual cause — the line must be complete, on ONE line." 12 70 || true
+            fi
             return 1
         fi
         rm -f "$tmp"
@@ -776,7 +875,7 @@ ask_role() {
     log "Step: ask_role"
     if [ -n "${PRESEED_HAS_ROLE:-}" ]; then
         log "Preseed: role=$ROLE (skipping prompt)"
-        return 0
+        return 2
     fi
     # #272 UX — reframe the install role around the decision operators
     # actually make ("is this my FIRST SpatiumDDI node, or am I adding
@@ -855,13 +954,33 @@ ask_role() {
 #
 # Echoes a one-line verdict; returns 0 reachable, 1 not.
 _probe_control_plane() {
-    local url="$1" body rc
+    local url="$1" body rc insecure=""
     # Tolerate a trailing slash either way.
     url="${url%/}"
-    body=$(curl -fsS --max-time 5 \
+    # -L because the appliance frontend 301s http -> https, and the
+    # supervisor this probe predicts sets follow_redirects=True for
+    # exactly that reason. Without it a lab operator's http:// URL comes
+    # back rc 0 with an EMPTY body and is reported as the wrong host.
+    #
+    # --connect-timeout so an unroutable host fails in 3 s rather than
+    # freezing the TUI for the full budget.
+    body=$(curl -fsSL --max-time 8 --connect-timeout 3 \
         -H 'Accept: application/json' \
         "$url/api/v1/version" 2>&1)
     rc=$?
+    # A SpatiumDDI control plane serves a self-signed cert until an ACME
+    # or operator cert is installed (firstboot generates one), and the
+    # supervisor skips verification for that reason. Refusing here would
+    # red-screen the DEFAULT topology and train operators to click
+    # through the one dialog that catches a real typo. So retry
+    # unverified and say so, rather than either failing or hiding it.
+    if [ "$rc" -eq 60 ]; then
+        body=$(curl -fsSLk --max-time 8 --connect-timeout 3 \
+            -H 'Accept: application/json' \
+            "$url/api/v1/version" 2>&1)
+        rc=$?
+        [ "$rc" -eq 0 ] && insecure=" (self-signed cert, not verified)"
+    fi
     if [ "$rc" -ne 0 ]; then
         # curl's own message is more useful than any paraphrase: it
         # distinguishes DNS failure from refused from TLS from timeout,
@@ -869,18 +988,15 @@ _probe_control_plane() {
         printf '%s' "${body:-curl exited $rc}"
         return 1
     fi
-    case "$body" in
-        *'"version"'*) : ;;
-        *)
-            printf '%s' "Reachable, but the reply is not a SpatiumDDI version document. Is this the right host?"
-            return 1
-            ;;
-    esac
-    # Pull the value out without a JSON parser — python3 is available but
-    # this runs on every keystroke-completed prompt and the shape is ours.
+    # One pass: an empty result IS the "not a version document" verdict,
+    # so the two matchers cannot disagree about what one is.
     local ver
     ver=$(printf '%s' "$body" | sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
-    printf 'SpatiumDDI %s' "${ver:-(version not reported)}"
+    if [ -z "$ver" ]; then
+        printf '%s' "Reachable, but the reply carries no version string. Is this the right host?"
+        return 1
+    fi
+    printf 'SpatiumDDI %s%s' "$ver" "$insecure"
     return 0
 }
 
@@ -890,7 +1006,7 @@ ask_application_config() {
     # (Function/step name kept historical to avoid churning the wizard
     # state machine; it gates on the appliance role now.)
     if [ "$ROLE" != "appliance" ]; then
-        return 0
+        return 2
     fi
     log "Step: ask_application_config"
 
@@ -957,7 +1073,7 @@ ask_application_config() {
     # console.
     if [ -n "${PRESEED_HAS_PAIRING_CODE:-}" ]; then
         log "Preseed: pairing code supplied (skipping prompt)"
-        return 0
+        return 2
     fi
     # #995 item 1 (prerequisite) — tracing OFF for the whole loop, exactly
     # as ask_user_password does for the password. Without it `set -x`
@@ -1220,7 +1336,7 @@ ask_hostname() {
     log "Step: ask_hostname"
     if [ -n "${PRESEED_HAS_HOSTNAME:-}" ]; then
         log "Preseed: hostname=$HOSTNAME (skipping prompt)"
-        return 0
+        return 2
     fi
     # No pre-filled default — multiple appliances on the same network
     # all named "spatiumddi" caused real-world server-name collisions
@@ -1297,7 +1413,11 @@ _check_field() {
         log "WARN: spatium-preseed-parse not found — accepting $kind unvalidated"
         return 0
     fi
-    out=$(python3 "$parser" --check-field "$kind" "$value" "$@" 2>&1)
+    # stderr goes to the LOG, not into $out: under the "exit 0 with
+    # stdout means advisory" contract, any Python chatter (a
+    # DeprecationWarning, a locale note) would otherwise become a spurious
+    # "weak password" modal for a perfectly strong one.
+    out=$(python3 "$parser" --check-field "$kind" "$value" "$@" 2>>"$INSTALL_LOG")
     rc=$?
     case "$rc" in
         0) printf '%s' "$out"; return 0 ;;
@@ -1320,14 +1440,20 @@ _check_field_stdin() {
         log "WARN: spatium-preseed-parse not found — accepting $kind unvalidated"
         return 0
     fi
-    out=$(printf '%s' "$value" | python3 "$parser" --check-field "$kind" - "$@" 2>&1)
+    out=$(printf '%s' "$value" | python3 "$parser" --check-field "$kind" - "$@" 2>>"$INSTALL_LOG")
     rc=$?
     case "$rc" in
         0) printf '%s' "$out"; return 0 ;;
         2) printf '%s' "$out"; return 1 ;;
         *)
-            log "WARN: --check-field $kind failed to run (rc=$rc) — accepting unvalidated"
-            return 0
+            # Fails CLOSED, unlike _check_field. This wrapper carries only
+            # the password, and "the validator did not run" must not
+            # silently disable the one security control #995 item 11 adds.
+            # There is an operator at this prompt who can pick another
+            # password; there is nobody to notice a log line.
+            log "ERROR: --check-field $kind could not run (rc=$rc) — refusing rather than accepting unvalidated"
+            printf '%s' "The password validator could not run (rc=$rc). This is a problem with the installer image, not with your password. Check /var/log/spatium-install.log."
+            return 1
             ;;
     esac
 }
@@ -1374,7 +1500,7 @@ ask_user_password() {
 
     if [ -n "${PRESEED_HAS_PASSWORD:-}" ]; then
         log "Preseed: admin password supplied (skipping prompt)"
-        return 0
+        return 2
     fi
 
     # Tracing OFF for the whole prompt loop (issue #581). The preseed
@@ -1694,7 +1820,7 @@ ask_network() {
                 on_cancel
             fi
         fi
-        return 0
+        return 2
     fi
     NET_MODE=$(whiptail --backtitle "$BACKTITLE" --title "Network" \
         --cancel-button "Back" \
@@ -1703,6 +1829,15 @@ ask_network() {
         "static" "Static IP" \
         3>&1 1>&2 2>&3) \
         || return 1
+
+    # A re-answer must not carry the previous one's IPv6 forward. These
+    # were only ever reset inside the static branch, so static -> Back ->
+    # dhcp left NET6_MODE=static with a stale address that confirm()
+    # advertised and the renderer then either applied to the DHCP keyfile
+    # or silently dropped — the confirm/apply divergence #554 was about.
+    NET6_MODE="auto"
+    NET6_IP=""
+    NET6_GATEWAY=""
 
     # #995 item 19 — the interface picker is offered in BOTH modes now.
     #
@@ -1823,7 +1958,7 @@ ask_timezone() {
     log "Step: ask_timezone"
     if [ -n "${PRESEED_HAS_TIMEZONE:-}" ]; then
         log "Preseed: timezone=$TIMEZONE (skipping prompt)"
-        return 0
+        return 2
     fi
     # #995 item 3 — this was a free-text box with no validation at all,
     # and do_install's only response to a name it could not resolve was
@@ -1885,7 +2020,7 @@ ask_k3s_cidrs() {
     # it inherits the seed's values. So the values are not merely unasked,
     # they are not written: see the drop-in block in do_install.
     if [ "$ROLE" = "appliance" ]; then
-        return 0
+        return 2
     fi
     log "Step: ask_k3s_cidrs"
     if [ -n "${PRESEED_HAS_K3S:-}" ]; then
@@ -1893,7 +2028,7 @@ ask_k3s_cidrs() {
             K3S_POD_CIDR=$(_k3s_cidr_canonical "$K3S_POD_CIDR")
             K3S_SERVICE_CIDR=$(_k3s_cidr_canonical "$K3S_SERVICE_CIDR")
             log "Preseed: k3s pod=$K3S_POD_CIDR svc=$K3S_SERVICE_CIDR (skipping prompt)"
-            return 0
+            return 2
         fi
         # k3s was preseeded but the network was chosen interactively, so
         # the parser could not check the pod/service CIDRs against the
@@ -1906,7 +2041,7 @@ ask_k3s_cidrs() {
             K3S_POD_CIDR=$(_k3s_cidr_canonical "$K3S_POD_CIDR")
             K3S_SERVICE_CIDR=$(_k3s_cidr_canonical "$K3S_SERVICE_CIDR")
             log "Preseed: k3s CIDRs validated against interactive network (skipping prompt)"
-            return 0
+            return 2
         fi
         log "Preseed: k3s CIDRs conflict with the interactively-chosen network — prompting"
     fi
@@ -2191,6 +2326,27 @@ confirm() {
         s+="Booted:      UEFI (BIOS boot also installed, untested here)\n"
     else
         s+="Booted:      BIOS/CSM (UEFI boot also installed, untested here)\n"
+    fi
+    # #995 Phase 3 — the new answers belong on the last review screen
+    # before an irreversible wipe. Key-only SSH especially: it is the most
+    # consequential thing the wizard can now do, and it was invisible here.
+    if [ "$KEYMAP" != "us" ]; then
+        s+="Keyboard:    $KEYMAP\n"
+    fi
+    if [ -z "$NTP_SERVERS" ]; then
+        s+="Time source: none (the clock is never corrected)\n"
+    elif [ "$NTP_SERVERS" != "pool.ntp.org" ]; then
+        s+="Time source: $NTP_SERVERS\n"
+    fi
+    if [ "$(_ssh_key_count)" -gt 0 ]; then
+        s+="SSH keys:    $(_ssh_key_count) authorised for $ADMIN_USER"
+        if [ "$SSH_DISABLE_PASSWORD" = "yes" ]; then
+            s+=" (password SSH OFF)"
+        fi
+        s+="\n"
+    fi
+    if [ "$SET_ROOT_PASSWORD" != "yes" ]; then
+        s+="Root:        locked (use sudo)\n"
     fi
     # Only show the k3s CIDR row when the operator overrode either
     # default — keeps the confirm screen short for the common case.
@@ -2879,6 +3035,11 @@ EOF
 # rendered into /etc by spatium-etc-render on every boot. Survives
 # OS slot swaps + a /var factory reset.
 hostname: "$HOSTNAME"
+# #995 item 18 — the operator-chosen admin account. spatiumddi-ssh-reload
+# reads this to find whose authorized_keys to manage; without it the #157
+# plane hardcodes "admin" and errors out on every appliance installed
+# with a different name.
+admin_user: "$ADMIN_USER"
 role: "$ROLE"
 control_plane_url: "$CONTROL_PLANE_URL"
 bootstrap_pairing_code: "$BOOTSTRAP_PAIRING_CODE"
@@ -3144,7 +3305,29 @@ EOF
         if [ "$SET_ROOT_PASSWORD" != "yes" ]; then
             chroot "$MOUNT" passwd -l root >> "$INSTALL_LOG" 2>&1 || \
                 log "WARN: could not lock the root account"
+            # ...and make the rescue path this would otherwise remove work
+            # again. rescue.target / emergency.target run sulogin, which
+            # loops "Login incorrect" forever on a locked account — and
+            # spatium-grub-render ships a "(rescue / single-user)"
+            # menuentry, so without this the documented recovery route is a
+            # dead end on every appliance installed with the new default.
+            # SYSTEMD_SULOGIN_FORCE is a PHYSICAL-console escalation only,
+            # which is the same threat model as "sshd refuses root either
+            # way": someone at the console can already boot from anything.
+            mkdir -p "$MOUNT/etc/systemd/system/rescue.service.d" \
+                     "$MOUNT/etc/systemd/system/emergency.service.d"
+            for _u in rescue emergency; do
+                cat > "$MOUNT/etc/systemd/system/$_u.service.d/10-spatium-sulogin.conf" <<EOF
+# Written by spatium-install (issue #995 item 12).
+# Root has no password (passwd -l), and sulogin cannot authenticate a
+# locked account — so without this the shipped rescue menuentry drops to
+# a prompt that can never be satisfied. Physical-console only.
+[Service]
+Environment=SYSTEMD_SULOGIN_FORCE=1
+EOF
+            done
             log "Root account locked (no console password); use sudo from $ADMIN_USER"
+            log "  rescue/emergency targets set SYSTEMD_SULOGIN_FORCE=1 so the console recovery path still works"
         else
             log "Root account password set from the admin password (operator opted in)"
         fi
@@ -3155,11 +3338,13 @@ EOF
         # systemd-vconsole-setup reads. Writing only one leaves the
         # operator on US at exactly the login prompt where a mangled
         # password is least explicable.
+        local xkb_layout xkb_variant xkb_model
+        _keymap_to_xkb "$KEYMAP"
         cat > "$MOUNT/etc/default/keyboard" <<EOF
 # Written by spatium-install (issue #995 item 17).
-XKBMODEL="pc105"
-XKBLAYOUT="$KEYMAP"
-XKBVARIANT=""
+XKBMODEL="$xkb_model"
+XKBLAYOUT="$xkb_layout"
+XKBVARIANT="$xkb_variant"
 XKBOPTIONS=""
 BACKSPACE="guess"
 EOF
@@ -3182,7 +3367,12 @@ EOF
             {
                 echo "# Written by spatium-install (issue #995 item 16)."
                 echo "# Replaced by the control plane if NTP is managed centrally."
-                for _srv in $NTP_SERVERS; do
+                # read -a, not `for x in $VAR`: the latter also GLOBS, so a
+                # value containing * would emit one server line per file in
+                # the current directory.
+                local -a _srvs=()
+                read -r -a _srvs <<< "$NTP_SERVERS"
+                for _srv in "${_srvs[@]}"; do
                     echo "server $_srv iburst"
                 done
             } > "$MOUNT/etc/chrony/sources.d/spatium-install.sources"
@@ -3217,10 +3407,19 @@ EOF
         if [ "$SSH_DISABLE_PASSWORD" = "yes" ]; then
             # The same drop-in path the #157 control-plane plane manages,
             # so central config later REPLACES this rather than fighting
-            # it. sshd reads the last matching directive across
-            # sshd_config.d in lexical order, so a single file is the
-            # whole story here.
+            # it.
+            #
+            # The 10- file has to GO, not be layered over. mkosi.postinst
+            # ships /etc/ssh/sshd_config.d/10-spatiumddi-password-auth.conf
+            # carrying `PasswordAuthentication yes` (it exists to undo
+            # Debian 13's default), sshd takes the FIRST value it obtains
+            # for a keyword, and Include expands the glob in lexical order
+            # — so `10-…` beats anything named `spatiumddi.conf` and the
+            # setting would report success while doing nothing. Removing
+            # it makes precedence irrelevant instead of making this file's
+            # name load-bearing.
             mkdir -p "$MOUNT/etc/ssh/sshd_config.d"
+            rm -f "$MOUNT/etc/ssh/sshd_config.d/10-spatiumddi-password-auth.conf"
             cat > "$MOUNT/etc/ssh/sshd_config.d/spatiumddi.conf" <<EOF
 # Written by spatium-install (issue #995 item 18).
 # Superseded wholesale if the control plane manages SSH (#157).
@@ -4276,121 +4475,75 @@ main() {
     # ROLE=appliance — it returns 0 immediately for the control-plane
     # role so Back from confirm walks through it transparently to
     # ask_timezone.
-    local step="welcome"
-    while [ -n "$step" ]; do
-        log "Wizard state: $step"
+    # Linear step table + a three-way return, replacing the hand-written
+    # per-step case that routed Back by name.
+    #
+    #   0  the screen drew and the operator went forward
+    #   1  Back
+    #   2  the screen drew NOTHING (preseeded, or inert for this role)
+    #
+    # The third code is the fix. Every ask_* short-circuits when its field
+    # is preseeded, so with a partial answer file — everything but the
+    # password, which operators keep out of files — Back from `confirm`
+    # landed on a step that returned 0 without drawing and was immediately
+    # routed forward again. The confirm screen redrew on every Back press
+    # and the operator could not reach the disk picker to correct the very
+    # thing they had just spotted, one keystroke from an irreversible
+    # wipe. Item 14 added a second inert screen and made it worse.
+    #
+    # With the direction tracked, "I drew nothing" means "keep going the
+    # way you were going", which is right in both directions and needs no
+    # screen to know anything about its neighbours.
+    local -a STEPS=(
+        welcome preflight ask_keyboard ask_role pick_disk
+        confirm_partition_layout ask_hostname ask_user_password
+        ask_ssh_keys ask_network ask_timezone ask_ntp ask_k3s_cidrs
+        ask_application_config confirm do_install
+    )
+    local i=0 dir="fwd" rc step
+    while [ "$i" -lt "${#STEPS[@]}" ]; do
+        step="${STEPS[$i]}"
+        log "Wizard state: $step (dir=$dir)"
         case "$step" in
             welcome)
-                # welcome only returns 0 — Cancel here calls on_cancel
-                # which exec's a shell (never returns). That's the
-                # explicit "I changed my mind, don't install" path.
-                # Skipped entirely on a fully-unattended preseed run.
+                # Cancel here calls on_cancel, which exec's a shell and
+                # never returns — the one "I changed my mind" exit.
                 if [ "$FULLY_UNATTENDED" != "1" ]; then
                     welcome
-                fi
-                step="preflight"
-                ;;
-            preflight)
-                # #995 item 15 — everything the installer can learn about
-                # this machine, before it asks anything. Skipped on a
-                # fully-unattended run (returns 0 immediately), so Back
-                # from ask_keyboard has to land on welcome, which only
-                # ever returns 0 and is itself skipped there.
-                if preflight; then step="ask_keyboard"; else step="welcome"; fi
-                ;;
-            ask_keyboard)
-                # #995 item 17 — before every screen that takes typed
-                # input, because the layout is applied immediately and the
-                # password screen is the one that matters.
-                if ask_keyboard; then step="ask_role"; else step="preflight"; fi
-                ;;
-            ask_role)
-                if ask_role; then step="pick_disk"; else step="ask_keyboard"; fi
-                ;;
-            pick_disk)
-                if pick_disk; then step="confirm_partition_layout"; else step="ask_role"; fi
-                ;;
-            confirm_partition_layout)
-                if confirm_partition_layout; then step="ask_hostname"; else step="pick_disk"; fi
-                ;;
-            ask_hostname)
-                if ask_hostname; then step="ask_user_password"; else step="confirm_partition_layout"; fi
-                ;;
-            ask_user_password)
-                if ask_user_password; then step="ask_ssh_keys"; else step="ask_hostname"; fi
-                ;;
-            ask_ssh_keys)
-                # #995 item 18 — beside the password, because the two
-                # together are "how do I get into this box".
-                if ask_ssh_keys; then step="ask_network"; else step="ask_user_password"; fi
-                ;;
-            ask_network)
-                if ask_network; then step="ask_timezone"; else step="ask_ssh_keys"; fi
-                ;;
-            ask_timezone)
-                if ask_timezone; then step="ask_ntp"; else step="ask_network"; fi
-                ;;
-            ask_ntp)
-                # #995 item 16 — next to the timezone, which is the other
-                # half of "what time does this box think it is".
-                if ask_ntp; then step="ask_k3s_cidrs"; else step="ask_timezone"; fi
-                ;;
-            ask_k3s_cidrs)
-                # Issue #302 — operator picks (or accepts the defaults
-                # for) the k3s pod + service CIDRs. Forward → the
-                # Additional-node config; back → timezone.
-                if ask_k3s_cidrs; then step="ask_application_config"; else step="ask_ntp"; fi
-                ;;
-            ask_application_config)
-                # Returns 0 immediately when ROLE != appliance — so
-                # forward navigation moves straight to confirm and
-                # backward navigation from confirm walks through here
-                # without showing any whiptail screen.
-                #
-                # #995 item 14 made ask_k3s_cidrs the mirror image: a
-                # no-op for the appliance role. Routing Back through a
-                # screen that returns 0 without drawing anything bounces
-                # forward again immediately — the #554 infinite loop — so
-                # Back has to skip whichever of the two is inert for this
-                # role. For an Additional node that is the CIDR screen.
-                if ask_application_config; then
-                    step="confirm"
-                elif [ "$ROLE" = "appliance" ]; then
-                    step="ask_ntp"
+                    rc=0
                 else
-                    step="ask_k3s_cidrs"
+                    rc=2
                 fi
                 ;;
             confirm)
-                # Fully-unattended preseed skips the final confirm —
                 # confirm_wipe:true in the answer file already authorised
-                # the destructive install. A partial preseed still shows
-                # it (the operator was prompted for something, so give
-                # them the review screen).
+                # the destructive install.
                 if [ "$FULLY_UNATTENDED" = "1" ]; then
-                    step="do_install"
-                elif confirm; then
-                    step="do_install"
+                    rc=2
                 else
-                    # #554 — Back. ask_application_config returns 0 without
-                    # showing a screen for every role EXCEPT appliance, so
-                    # routing Back through it for a control-plane install
-                    # bounced confirm→ask_application_config→confirm forever
-                    # (the operator could never get back to hostname / tz /
-                    # disk / CIDRs). Skip straight to ask_k3s_cidrs unless the
-                    # appliance role, which has a real screen there.
-                    if [ "$ROLE" = "appliance" ]; then
-                        step="ask_application_config"
-                    else
-                        step="ask_k3s_cidrs"
-                    fi
+                    confirm
+                    rc=$?
                 fi
                 ;;
             do_install)
                 do_install
-                step=""
+                return 0
+                ;;
+            *)
+                "$step"
+                rc=$?
                 ;;
         esac
+        case "$rc" in
+            0) dir="fwd"; i=$((i + 1)) ;;
+            2) if [ "$dir" = "back" ]; then i=$((i - 1)); else i=$((i + 1)); fi ;;
+            *) dir="back"; i=$((i - 1)) ;;
+        esac
+        # Backing past the first screen is not an exit — welcome owns that.
+        if [ "$i" -lt 0 ]; then
+            i=0
+            dir="fwd"
+        fi
     done
 }
 

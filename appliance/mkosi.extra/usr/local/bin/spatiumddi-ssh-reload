@@ -63,7 +63,14 @@ HASH_SIDECAR=/var/lib/spatiumddi/release-state/ssh-config-hash
 COUNT_SIDECAR=/var/lib/spatiumddi/release-state/ssh-key-count
 LOG_DIR=/var/log/spatiumddi
 LOG="$LOG_DIR/ssh-reload.log"
-ADMIN_USER=admin
+# #995 item 18 — the admin account is operator-chosen at install, not
+# always literally "admin". spatium-config.yaml records the real name;
+# without this the whole plane errors out with "invalid user" on any
+# appliance installed with a different one, so the control plane's key
+# list is never applied and the UI shows managed keys that exist nowhere.
+ADMIN_USER="$(sed -n 's/^admin_user:[[:space:]]*"\{0,1\}\([^"]*\)"\{0,1\}[[:space:]]*$/\1/p' \
+    /var/lib/spatium-state/spatium-config.yaml 2>/dev/null | head -1)"
+[ -n "$ADMIN_USER" ] || ADMIN_USER="admin"
 ADMIN_HOME=$(getent passwd "$ADMIN_USER" | cut -d: -f6)
 ADMIN_HOME=${ADMIN_HOME:-/var/home/admin}
 AK_FILE="$ADMIN_HOME/.ssh/authorized_keys"
@@ -237,6 +244,13 @@ PYEOF
         echo "  ✓ authorized_keys installed ($KEY_COUNT key(s))"
 
         # Atomic install of the sshd drop-in (root, 0644 — no secrets).
+        # The 10- file has to go, not be layered over: mkosi.postinst
+        # ships /etc/ssh/sshd_config.d/10-spatiumddi-password-auth.conf
+        # with `PasswordAuthentication yes`, sshd takes the FIRST value
+        # per keyword, and Include expands lexically — so `10-` beat this
+        # file and central SSH management could never turn password auth
+        # off at all (#995 item 18 found the same shadowing).
+        rm -f /etc/ssh/sshd_config.d/10-spatiumddi-password-auth.conf
         install -o root -g root -m 0644 "$SSHD_TMP" "$SSHD_DROPIN"
         echo "  ✓ sshd drop-in installed"
 

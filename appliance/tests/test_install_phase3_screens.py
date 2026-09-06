@@ -268,9 +268,9 @@ def test_the_keymap_is_applied_before_anything_is_typed():
     """The password is the field that matters: on AZERTY or QWERTZ its
     symbols land elsewhere, the installer stores what US produced, and
     the login later fails with no explanation."""
-    kb = CODE.index('            ask_keyboard)')
-    pw = CODE.index('            ask_user_password)')
-    assert kb < pw
+    steps = CODE[CODE.index("local -a STEPS=("):]
+    steps = steps[:steps.index(")")]
+    assert steps.index("ask_keyboard") < steps.index("ask_user_password")
     assert "_apply_keymap" in extract_fn("ask_keyboard")
 
 
@@ -384,3 +384,104 @@ def test_disabling_password_ssh_headlessly_requires_a_key():
     # The first mention is the `known` key set at the top of the file.
     i = body.index('ssh_nopw = ps.get("ssh_disable_password")')
     assert "requires at least one" in body[i:i + 1400]
+
+
+
+# ── The wizard loop itself (executable) ───────────────────────────────
+#
+# The old per-step `case` was pinned by substring assertions that passed
+# on inverted routing. The replacement is a linear table plus a three-way
+# return, which can be driven directly with stub screens — so these
+# assert on where the wizard GOES, not on what the source says.
+
+
+def _drive(script_steps: str, screens: dict[str, str]) -> list[str]:
+    """Run main()'s loop with every screen stubbed. Returns the visit order."""
+    body = extract_fn("main")
+    loop = body[body.index("    local -a STEPS=("):body.rindex("}")]
+    stubs = "\n".join(
+        f'{name}() {{ echo "{name}" >&2; return {rc}; }}' for name, rc in screens.items()
+    )
+    script = f"""
+set -uo pipefail
+log() {{ :; }}
+FULLY_UNATTENDED=0
+{stubs}
+{script_steps}
+_loop() {{
+{loop}
+}}
+_loop
+"""
+    r = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+    return [ln for ln in r.stderr.splitlines() if ln and not ln.startswith("+")]
+
+
+_ALL = [
+    "welcome", "preflight", "ask_keyboard", "ask_role", "pick_disk",
+    "confirm_partition_layout", "ask_hostname", "ask_user_password",
+    "ask_ssh_keys", "ask_network", "ask_timezone", "ask_ntp",
+    "ask_k3s_cidrs", "ask_application_config", "confirm", "do_install",
+]
+
+
+def test_the_wizard_loop_walks_every_screen_forward():
+    visited = _drive("", {n: 0 for n in _ALL})
+    assert visited == _ALL, visited
+
+
+def test_back_from_confirm_reaches_a_screen_that_actually_draws():
+    """The bug: with a partial preseed the three screens before `confirm`
+    are inert, so Back landed on one that returned 0 without drawing and
+    was routed straight forward again — the confirm screen redrew on
+    every press and the disk picker was unreachable, one keystroke from
+    an irreversible wipe."""
+    screens = {n: 0 for n in _ALL}
+    # Inert: preseeded or inert-for-this-role.
+    for n in ("ask_ntp", "ask_k3s_cidrs", "ask_application_config"):
+        screens[n] = 2
+    # confirm says Back once, then OK.
+    screens["confirm"] = 1
+    visited = _drive('_c=0\nconfirm() { echo confirm >&2; _c=$((_c+1)); [ "$_c" -ge 2 ] && return 0; return 1; }',
+                     {k: v for k, v in screens.items() if k != "confirm"})
+    # An inert screen is still CALLED — it just returns 2. What matters
+    # is that the walk keeps going back through them and reaches
+    # ask_timezone, the nearest screen that draws, before confirm redraws.
+    after = visited[visited.index("confirm") + 1:]
+    assert "ask_timezone" in after, visited
+    assert after.index("ask_timezone") < after.index("confirm"), visited
+
+
+def test_back_walks_through_a_run_of_inert_screens():
+    screens = {n: 0 for n in _ALL}
+    for n in ("ask_keyboard", "ask_role", "pick_disk", "confirm_partition_layout"):
+        screens[n] = 2
+    visited = _drive(
+        '_h=0\nask_hostname() { echo ask_hostname >&2; _h=$((_h+1)); [ "$_h" -ge 2 ] && return 0; return 1; }',
+        {k: v for k, v in screens.items() if k != "ask_hostname"},
+    )
+    after = visited[visited.index("ask_hostname") + 1:]
+    assert "preflight" in after, visited
+    # Back walks THROUGH the inert run rather than stopping in it...
+    assert after.index("preflight") < after.index("ask_hostname"), visited
+    # ...and every one of them is passed over on the way.
+    for inert in ("confirm_partition_layout", "pick_disk", "ask_role", "ask_keyboard"):
+        assert after.index(inert) < after.index("preflight"), (inert, visited)
+
+
+def test_backing_past_the_first_screen_does_not_exit_or_loop():
+    screens = {n: 0 for n in _ALL}
+    for n in ("welcome", "preflight", "ask_keyboard"):
+        screens[n] = 2
+    visited = _drive(
+        '_r=0\nask_role() { echo ask_role >&2; _r=$((_r+1)); [ "$_r" -ge 2 ] && return 0; return 1; }',
+        {k: v for k, v in screens.items() if k != "ask_role"},
+    )
+    assert visited[-1] == "do_install", visited
+    assert visited.count("ask_role") == 2, visited
+
+
+def test_an_inert_screen_does_not_stop_forward_progress():
+    screens = {n: 2 for n in _ALL if n != "do_install"}
+    screens["do_install"] = 0
+    assert _drive("", screens) == _ALL

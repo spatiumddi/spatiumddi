@@ -160,8 +160,14 @@ def test_the_probe_asks_for_the_version_document():
     ping perfectly well."""
     fn = extract_fn("_probe_control_plane")
     assert "/api/v1/version" in fn
+    # ONE matcher: the extraction's empty result IS the "not a version
+    # document" verdict, so there is no second test to disagree with it.
     assert '"version"' in fn, "a 200 from anything else must not pass"
-    assert "--max-time 5" in fn
+    assert "no version string" in fn
+    assert "--max-time" in fn and "--connect-timeout" in fn
+    # -L because the appliance frontend 301s http -> https and the
+    # supervisor this predicts follows redirects for that reason.
+    assert "-fsSL" in fn
 
 
 def test_the_probe_reports_curls_own_error():
@@ -199,7 +205,9 @@ def test_the_cidr_screen_is_skipped_for_an_additional_node():
     fn = extract_fn("ask_k3s_cidrs")
     head = fn.split('log "Step: ask_k3s_cidrs"', 1)[0]
     assert '[ "$ROLE" = "appliance" ]' in head
-    assert "return 0" in head
+    # 2, not 0 — "I drew nothing", so Back walks past instead of being
+    # bounced forward. See the state-machine test in phase3.
+    assert "return 2" in head
 
 
 def test_no_cidr_dropin_is_written_for_an_additional_node():
@@ -218,18 +226,19 @@ def test_confirm_does_not_advertise_cidrs_that_will_not_be_applied():
     assert '"$ROLE" != "appliance"' in fn[i - 300:i]
 
 
-def test_back_navigation_skips_whichever_screen_is_inert():
-    """ask_k3s_cidrs and ask_application_config are now mirror images —
-    each a no-op for one role. Routing Back through a screen that returns
-    0 without drawing anything bounces forward again immediately, which
-    is the #554 infinite loop."""
-    i = CODE.index("            ask_application_config)")
-    window = CODE[i:i + 900]
-    assert 'elif [ "$ROLE" = "appliance" ]; then' in window
-    # Whatever precedes ask_k3s_cidrs in the chain — Phase 3 inserted
-    # ask_ntp between it and ask_timezone.
-    assert 'step="ask_ntp"' in window or 'step="ask_timezone"' in window
+def test_back_navigation_is_not_a_per_step_case_any_more():
+    """The routing that produced the bounce is gone.
 
+    The old machine named each step's Back target by hand, so it had to
+    know which neighbours were inert — and got it wrong the moment a
+    partial preseed made a screen inert at runtime rather than by role.
+    The executable test of the replacement lives in
+    test_install_phase3_screens.py::test_the_wizard_loop_*.
+    """
+    assert 'local -a STEPS=(' in CODE
+    assert 'dir="back"' in CODE
+    # Three-way: 0 forward, 1 Back, 2 drew nothing.
+    assert '2) if [ "$dir" = "back" ]; then' in CODE
 
 # ── A class, not an item ──────────────────────────────────────────────
 

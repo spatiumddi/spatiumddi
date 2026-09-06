@@ -127,7 +127,10 @@ network the way Debian hosts do:
 
 | Connection | Default | Change it under |
 |---|---|---|
-| `pool.ntp.org` — time sync | on (cloud-init's default pool) | Appliance → Fleet → Services → NTP; point it at an internal server or a unicast peer |
+| `pool.ntp.org` — time sync | on | The disk installer's **Time source** screen (or the `ntp_servers` preseed key) sets it at install; Appliance → Fleet → Services → NTP changes it afterwards. Point it at an internal server, a unicast peer, or leave it blank for no time source at all |
+| `github.com` — SSH public keys, **only if you ask** | off | The disk installer's **SSH public key** screen: typing a bare username there fetches `https://github.com/<user>.keys`. Typing a URL fetches that URL instead, and picking "Paste" or "No key" fetches nothing. One `GET`, no request body, nothing about the install is sent |
+| The control-plane URL you type — an `/api/v1/version` probe | off (Additional-node installs only) | The disk installer probes the URL you entered before it wipes the disk, so a typo is caught while it is still correctable. One `GET` to **your own** control plane |
+| Your default gateway — one ICMP echo | on (pre-flight screen) | The installer's pre-flight check pings the LAN gateway to show whether it answers. LAN-local; there is deliberately no internet-reachability probe |
 | Debian APT mirrors (`deb.debian.org`, `security.debian.org`) | host default | Appliance → Fleet → Services → APT sources — managed repositories, an internal mirror, or a proxy |
 | `ghcr.io` — container image pulls at slot upgrade | only during an upgrade | Not needed at all if you upgrade from an uploaded slot image; the ISO already carries every image it runs |
 
@@ -238,7 +241,7 @@ The guard in §8 matches text, so these appear in `backend/app` and are
 listed here to keep the check honest. **None of them is contacted.**
 
 **Documentation and homepage links** (shown in the UI or written in a
-comment, never fetched): `github.com`, `www.spatiumddi.com` (the ACME
+comment, never fetched): `www.spatiumddi.com` (the ACME
 client's User-Agent string, as RFC 8555 asks for), `fingerbank.org`,
 `aistudio.google.com` (the "get an API key" link in an error message),
 `bacnet.org`, `kea.readthedocs.io`, `schema.org` (a JSON-LD `@context`

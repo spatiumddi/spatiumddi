@@ -282,7 +282,11 @@ if len(sys.argv) >= 2 and sys.argv[1] == "--check-field":
     # here without passing through argv. One trailing newline is stripped
     # (a here-string adds one); nothing else is touched, because a leading
     # or trailing space is legitimate content in a password.
-    if _value == "-":
+    # Gated on _STDIN_FIELDS: honoured for every kind, a literal `-` typed
+    # at the username or timezone prompt made python block reading the
+    # installer's console to EOF — a frozen wizard with no dialog and no
+    # way forward, the same dead end the `--` fix removed in Phase 1.
+    if _value == "-" and _kind in _STDIN_FIELDS:
         _value = sys.stdin.read()
         if _value.endswith("\n"):
             _value = _value[:-1]
@@ -292,7 +296,18 @@ if len(sys.argv) >= 2 and sys.argv[1] == "--check-field":
         # would be accepted headlessly and rejected interactively. NOT
         # applied to a password, where whitespace is content.
         _value = _value.strip()
-    _reason = _validator(_value, *sys.argv[4:])
+    # A TypeError here is a CALLER bug (wrong number of context args), and
+    # the wizard's degrade path treats an unexpected exit code as "accept
+    # unvalidated" — so an uncaught one would silently turn the password
+    # policy into a no-op. Exit 3 says "this is about the call, not the
+    # value", which the caller refuses for security-relevant fields.
+    try:
+        _reason = _validator(_value, *sys.argv[4:])
+    except TypeError as exc:
+        sys.stderr.write(
+            f"spatium-preseed-parse: --check-field {_kind} called wrongly: {exc}\n"
+        )
+        sys.exit(3)
     if _reason:
         sys.stdout.write(_reason + "\n")
         sys.exit(2)
@@ -738,6 +753,20 @@ if net is not None:
         elif mode not in {"dhcp", "static"}:
             fail(f"network.mode {mode!r} must be 'dhcp' or 'static'")
         elif mode == "dhcp":
+            # Refused, not ignored. The static branch already fails a
+            # half-configured v6 for saying that silently dropping keys is
+            # the "written, never read" shape; dropping the whole v6 block
+            # here would be the same shape, and an operator writing a
+            # dual-stack answer file (DHCPv4 + a pinned v6) would get an
+            # install that reports success with no IPv6 address.
+            if any(as_str(net.get(k)) for k in ("ip6", "prefix6", "gateway6")):
+                fail(
+                    "network.ip6 / prefix6 / gateway6 require network.mode: "
+                    "static — a static IPv6 address cannot be pinned on a "
+                    "DHCP install (the renderer writes one keyfile, and its "
+                    "v4 half would be method=auto while the v6 half is "
+                    "manual)"
+                )
             env["NET_MODE"] = "dhcp"
             # #995 item 19 — a DHCP install can pin ONE port. Absent keeps
             # the old behaviour (NetworkManager DHCPs every ethernet
@@ -828,12 +857,21 @@ if net is not None:
                     elif ip6_obj.is_loopback or ip6_obj.is_multicast:
                         fail(f"network.ip6 {ip6!r} is not a host address")
                         v6_ok = False
-                try:
-                    if not (0 < int(prefix6) <= 128):
-                        raise ValueError
-                except ValueError:
+                # int() tolerates a leading '+' and PEP-515 underscores;
+                # ipaddress and NetworkManager do not. Parse ONCE and use
+                # the parsed value everywhere, or "+64" passes this guard,
+                # makes the ip_network() call below raise UNCAUGHT, and —
+                # with gateway6 absent, where that call never runs — is
+                # stored verbatim and reaches the keyfile as
+                # `address1=…/+64`, which NM refuses outright.
+                prefix6_n = None
+                if prefix6.isdigit():
+                    prefix6_n = int(prefix6)
+                if prefix6_n is None or not (0 < prefix6_n <= 128):
                     fail(f"network.prefix6 {prefix6!r} must be an integer 1-128")
                     v6_ok = False
+                else:
+                    prefix6 = str(prefix6_n)
                 if gateway6:
                     try:
                         gw6_obj = ipaddress.IPv6Address(gateway6)
@@ -844,7 +882,8 @@ if net is not None:
                         if (
                             v6_ok
                             and not gw6_obj.is_link_local
-                            and int(prefix6) < 128
+                            and prefix6_n is not None
+                            and prefix6_n < 128
                             and gw6_obj
                             not in ipaddress.ip_network(f"{ip6}/{prefix6}", strict=False)
                         ):
@@ -898,6 +937,13 @@ if k3s is not None and role == "appliance":
         "and pinning different ones here would make that promotion fail"
     )
     k3s = None
+    # ...but the marker still has to be set, or FULLY_UNATTENDED becomes
+    # structurally unreachable for this role: compute_unattended requires
+    # PRESEED_HAS_K3S for every role, and with k3s dropped there is no key
+    # left that can produce it. Every headless Additional-node install
+    # would fall back to interactive at the very first screen. The node
+    # genuinely has no CIDRs to answer for, so "answered" is the truth.
+    env["PRESEED_HAS_K3S"] = "1"
 if k3s is not None:
     if not isinstance(k3s, dict):
         fail("k3s must be a mapping (pod_cidr / service_cidr)")

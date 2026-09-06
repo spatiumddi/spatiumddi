@@ -172,6 +172,10 @@ uuid=$net_uuid
 type=ethernet
 interface-name=$NET_IFACE_VAL
 autoconnect=true
+# Same reason the pinned-DHCP twin sets one: NetworkManager's own
+# auto-generated "Wired connection N" profiles default to 0, and a static
+# profile that merely ties them is not guaranteed to win.
+autoconnect-priority=100
 
 [ethernet]
 
@@ -185,6 +189,16 @@ $(_render_ipv6_block)
 EOF
         # NM refuses keyfiles that aren't mode 600.
         chmod 0600 "$NM_KEYFILE"
+        # Drop the pinned-DHCP twin. The dhcp branch is symmetric about
+        # this and the static one was not — and the dhcp keyfile carries
+        # autoconnect-priority=100 while the static one is at NM's default
+        # 0, so a leftover would OUTRANK the profile just written: the box
+        # would come up on a lease while every config file and every log
+        # line said static.
+        if [ -f "$NM_DHCP_KEYFILE" ]; then
+            rm -f "$NM_DHCP_KEYFILE"
+            echo "  removed the stale pinned-DHCP keyfile"
+        fi
         echo "network → static $NET_IP_VAL/$NET_PREFIX_VAL on $NET_IFACE_VAL"
     else
         echo "WARN: network_mode=static but ip/interface missing — skipping keyfile"
