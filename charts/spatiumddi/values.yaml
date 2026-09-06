@@ -79,6 +79,18 @@ auth:
 api:
   replicas: 2
   priorityClassName:  # #983 — unset inherits ``global.priorityClassName``; "" means no class
+  # #983 Phase 2 — user namespaces (Kubernetes 1.36 GA). UNSET by default.
+  # REFUSED at render time while ``api.applianceHostMounts.enabled`` is on:
+  # the host directories this pod writes are chowned to the image's uid, and
+  # a user namespace remaps exactly that. Usable on a plain Kubernetes
+  # install, which is also where it is worth most — this pod runs tcpdump,
+  # nmap and operator-typed argv.
+  hostUsers:
+  # #983 — extra placement push in ``soft`` anti-affinity mode, where
+  # preferred anti-affinity can still stack every replica on one node.
+  # Rendered only at replicas > 1 in ``soft`` mode; supply your own list
+  # here to replace the default entirely.
+  topologySpreadConstraints: []
   service:
     type: ClusterIP
     port: 8000
@@ -137,6 +149,20 @@ api:
   # resources at all.
   upgradeOrchestratorRBAC:
     enabled: false
+    # #983 Phase 2 item 6 — keep granting the broad ``nodes/proxy`` read as
+    # a fallback transport for the kubelet Summary API.
+    #
+    # ``get`` on nodes/proxy authorizes read GETs to EVERY kubelet endpoint
+    # (/pods, /logs/…, /configz, /debug/…), where ``nodes/stats`` — granted
+    # unconditionally alongside it — authorizes only the one page the Cluster
+    # screen reads. Set this to false to drop the broad grant.
+    #
+    # Default true because the direct transport depends on the ServiceAccount
+    # CA validating the kubelet's serving cert, which is a fact about the
+    # cluster (k3s signs kubelet serving certs with its own server-ca) that
+    # the chart cannot assert. Check Cluster → Overview: once it reports the
+    # transport as ``direct``, this can go false.
+    kubeletProxyFallback: true
   # #890 — service lifecycle control (Settings → Services). Two
   # independent switches, because they fail differently:
   #
@@ -168,6 +194,28 @@ api:
   # ``/appliance`` UI surfaces. Leave off for non-appliance K8s
   # installs; the host paths don't exist there and the ``/appliance``
   # endpoints already 404 via the ``settings.appliance_mode`` gate.
+  # #983 Phase 2 item 6 — mount the CA that signs kubelet SERVING certs, so
+  # the direct kubelet transport can verify the connection.
+  #
+  # Needed because k3s signs kubelet serving certs with its own ``server-ca``,
+  # which is NOT the CA in the ServiceAccount token mount. Without this the
+  # direct path fails verification on every node and silently falls back to
+  # the broad ``nodes/proxy`` grant — and the fix the logs name would be
+  # unreachable, since nothing would mount the file.
+  #
+  # Turn it on only after Cluster → Overview reports a CA failure: if the
+  # ServiceAccount CA already validates the kubelet (it does on some
+  # distributions), this mount buys nothing and adds a hostPath.
+  kubeletCA:
+    enabled: false
+    # Host path to the CA bundle. The k3s default; ``type: File`` means the
+    # pod fails to start rather than silently mounting an empty directory if
+    # the path is wrong.
+    hostPath: /var/lib/rancher/k3s/server/tls/server-ca.crt
+    # Where it lands in the container. Also the value of the
+    # SPATIUM_KUBELET_CA_PATH env var the chart sets from it, so the two can
+    # never disagree.
+    mountPath: /etc/spatiumddi/kubelet-ca.crt
   applianceHostMounts:
     enabled: false
     # Host paths (created by spatiumddi-firstboot). The ``-host`` suffix
@@ -355,6 +403,29 @@ frontend:
 worker:
   replicas: 2
   priorityClassName:  # #983 — unset inherits ``global.priorityClassName``; "" means no class
+  # #983 Phase 2 — mount a ServiceAccount on the worker so it can read the
+  # kubelet Summary API. Alert evaluation runs in the WORKER, so without this
+  # the ``node_pressure`` PSI rule can never fire — it would sit enabled in
+  # the Alerts UI and evaluate to nothing forever.
+  #
+  # Narrow by design: nodes read + nodes/stats, and nothing the api's
+  # orchestrator role carries (no eviction, no node patch, no Secret write).
+  # Off by default like every other cluster-touching switch; the appliance
+  # overlay turns it on.
+  serviceAccount:
+    enabled: false
+  # #983 Phase 2 — user namespaces (Kubernetes 1.36 GA). UNSET by default.
+  # REFUSED at render time while ``api.applianceHostMounts.enabled`` is on:
+  # the host directories this pod writes are chowned to the image's uid, and
+  # a user namespace remaps exactly that. Usable on a plain Kubernetes
+  # install, which is also where it is worth most — this pod runs tcpdump,
+  # nmap and operator-typed argv.
+  hostUsers:
+  # #983 — extra placement push in ``soft`` anti-affinity mode, where
+  # preferred anti-affinity can still stack every replica on one node.
+  # Rendered only at replicas > 1 in ``soft`` mode; supply your own list
+  # here to replace the default entirely.
+  topologySpreadConstraints: []
   concurrency: 4
   queues: "ipam,dns,dhcp,default"
   resources:
@@ -378,6 +449,12 @@ worker:
 # ── Beat (singleton scheduler — always 1 replica) ────────────────────────────
 beat:
   priorityClassName:  # #983 — unset inherits ``global.priorityClassName``; "" means no class
+  # #983 Phase 2 — user namespaces (Kubernetes 1.36 GA). ``false`` maps
+  # container root to an unprivileged host uid, so a container escape is not
+  # root on the node. UNSET by default: a runtime without idmapped-mount
+  # support refuses the pod outright, which is the right failure but is
+  # still a failure, so it has to be opted into.
+  hostUsers:
   resources:
     requests: { cpu: 50m, memory: 128Mi }
     limits:   { cpu: 200m, memory: 256Mi }
@@ -589,6 +666,13 @@ externalDatabase:
 redis:
   enabled: true
   priorityClassName:  # #983 — unset inherits ``global.priorityClassName``; "" means no class
+  # #983 Phase 2 — user namespaces (Kubernetes 1.36 GA). UNSET by default,
+  # and think before setting it here: this workload owns a PVC, and on the
+  # appliance the StorageClass is local-path, i.e. a host directory. If the
+  # runtime does not idmap that mount, the remapped uid cannot read the data
+  # it wrote before the change. Not refused (a runtime that idmaps correctly
+  # makes it safe) — but verify on one node before the fleet.
+  hostUsers:
   kind: standalone
   image:
     repository: redis

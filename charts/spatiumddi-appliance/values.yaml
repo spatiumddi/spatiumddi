@@ -333,6 +333,13 @@ observability:
   # Standard k8s observability primitive.
   kubeStateMetrics:
     enabled: false
+    # #983 Phase 2 — user namespaces (Kubernetes 1.36 GA). ``false`` maps
+    # container root to an unprivileged host uid. This is the one appliance
+    # workload it is straightforwardly safe on: no volumes, no hostNetwork,
+    # it only reads the kubeapi. UNSET by default so it stays an explicit
+    # decision — the appliance's containerd 2.3 + kernel 6.12 meet the
+    # requirements, but that has not been exercised in the field yet.
+    hostUsers:
     image:
       repository: registry.k8s.io/kube-state-metrics/kube-state-metrics
       tag: v2.18.0

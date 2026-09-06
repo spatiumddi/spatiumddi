@@ -1,3 +1,4 @@
+{{- $kubeletCA := .Values.api.kubeletCA -}}
 {{- $cmp := "api" -}}
 apiVersion: apps/v1
 kind: Deployment
@@ -21,6 +22,7 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
     spec:
+      {{- include "spatiumddi.hostUsers" (dict "value" .Values.api.hostUsers "conflict" (.Values.api.applianceHostMounts.enabled) "workload" "api" "why" "the appliance host mounts are on, and the api WRITES the slot-upgrade triggers and maintenance flag into /var/lib/spatiumddi/release-state") | nindent 6 }}
       {{- with (include "spatiumddi.priorityClassName" (dict "component" .Values.api.priorityClassName "fallback" (.Values.global).priorityClassName)) }}
       priorityClassName: {{ . | quote }}
       {{- end }}
@@ -63,6 +65,10 @@ spec:
               containerPort: 8000
           env:
             {{- include "spatiumddi.commonEnv" . | nindent 12 }}
+            {{- if $kubeletCA.enabled }}
+            - name: SPATIUM_KUBELET_CA_PATH
+              value: {{ $kubeletCA.mountPath | quote }}
+            {{- end }}
             # The node this replica runs on. The api Deployment scales to
             # the control-plane node count under hard anti-affinity, so on a
             # cluster there is one api pod per node — and several appliance
@@ -142,8 +148,15 @@ spec:
             failureThreshold: 3
           resources:
             {{- toYaml .Values.api.resources | nindent 12 }}
-          {{- if .Values.api.applianceHostMounts.enabled }}
+          {{- if or .Values.api.applianceHostMounts.enabled $kubeletCA.enabled }}
           volumeMounts:
+            {{- if $kubeletCA.enabled }}
+            - name: kubelet-ca
+              mountPath: {{ $kubeletCA.mountPath }}
+              subPath: {{ base $kubeletCA.mountPath }}
+              readOnly: true
+            {{- end }}
+            {{- if .Values.api.applianceHostMounts.enabled }}
             # Setup-complete flag, slot-upgrade triggers,
             # maintenance flag — api WRITES here.
             - name: spatiumddi-host-release-state
@@ -196,9 +209,23 @@ spec:
             - name: boot-efi
               mountPath: /boot/efi-host
               readOnly: true
+            {{- end }}
           {{- end }}
-      {{- if .Values.api.applianceHostMounts.enabled }}
+      {{- if or .Values.api.applianceHostMounts.enabled $kubeletCA.enabled }}
       volumes:
+      {{- if $kubeletCA.enabled }}
+        # #983 Phase 2 item 6 — the CA that signs kubelet SERVING certs,
+        # which on k3s is its own ``server-ca`` and NOT the CA in the
+        # ServiceAccount token mount. Without this the direct kubelet
+        # transport cannot verify the connection, every node silently falls
+        # back to the broad ``nodes/proxy`` grant, and the remedy the logs
+        # name is unreachable because nothing mounts the file.
+        - name: kubelet-ca
+          hostPath:
+            path: {{ $kubeletCA.hostPath }}
+            type: File
+      {{- end }}
+      {{- if .Values.api.applianceHostMounts.enabled }}
         - name: spatiumddi-host-release-state
           hostPath:
             path: {{ .Values.api.applianceHostMounts.releaseStateDir }}
@@ -238,12 +265,14 @@ spec:
             path: {{ .Values.api.applianceHostMounts.bootEfiDir }}
             type: Directory
       {{- end }}
+      {{- end }}
       {{- include "spatiumddi.controlPlaneNodeSelector" (merge (dict "componentNodeSelector" .Values.api.nodeSelector) .) | nindent 6 }}
       {{- with .Values.api.tolerations }}
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       {{- include "spatiumddi.podAntiAffinity" (merge (dict "component" $cmp "mode" .Values.api.podAntiAffinity "replicas" .Values.api.replicas "override" .Values.api.affinity) .) | nindent 6 }}
+      {{- include "spatiumddi.topologySpreadConstraints" (merge (dict "component" $cmp "mode" .Values.api.podAntiAffinity "replicas" .Values.api.replicas "override" .Values.api.topologySpreadConstraints) .) | nindent 6 }}
 ---
 apiVersion: v1
 kind: Service

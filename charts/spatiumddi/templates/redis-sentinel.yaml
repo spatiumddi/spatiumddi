@@ -122,6 +122,7 @@ spec:
       labels:
         {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" $cmp) .) | nindent 8 }}
     spec:
+      {{- include "spatiumddi.hostUsers" (dict "value" .Values.redis.hostUsers "conflict" false "workload" "redis" "why" "") | nindent 6 }}
       {{- with (include "spatiumddi.priorityClassName" (dict "component" .Values.redis.priorityClassName "fallback" (.Values.global).priorityClassName)) }}
       priorityClassName: {{ . | quote }}
       {{- end }}

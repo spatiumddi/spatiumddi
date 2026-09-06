@@ -200,6 +200,55 @@ RULE_TYPE_SECRET_EXPIRING = "secret_expiring"
 # are critical (may not be serving at all).
 RULE_TYPE_AGENT_CONFIG_REJECTED = "agent_config_rejected"
 
+# Issue #983 Phase 2 item 7 — node resource pressure from PSI (Pressure Stall
+# Information), GA in Kubernetes 1.36. Subject = the node NAME (there is no DB
+# row for a cluster node).
+#
+# This is the alarm #980 needed and nothing could raise: the appliance dropped
+# relayed DHCP under CPU pressure with every dashboard green, because
+# utilisation cannot distinguish a node at 70% CPU with a run queue from a
+# node at 70% without one. PSI measures the thing that actually hurts — the
+# share of wall-clock time tasks spent STALLED waiting for a resource.
+#
+# "Sustained" needs no state here, which is the neat part: the kernel already
+# publishes 10 / 60 / 300-second rolling averages, so the 300 s window IS the
+# sustained reading. Evaluating avg300 makes a burst and a condition different
+# numbers rather than the same number seen twice.
+#
+# Two thresholds that deliberately do NOT share a knob:
+#   * ``some`` (at least one task stalled) is compared against the rule's
+#     ``threshold_percent``.
+#   * ``full`` on MEMORY (every runnable task stalled) has its own fixed
+#     floor. ``some`` at 20% is a busy node; ``full`` at 20% is a node that
+#     spent a fifth of five minutes doing no work at all. One operator knob
+#     cannot mean both, and reusing it would make whichever they tuned for
+#     wrong for the other.
+# CPU ``full`` is not evaluated at all: the kernel reports it as 0 at node
+# level by definition, so a threshold on it could only ever be dead code.
+RULE_TYPE_NODE_PRESSURE = "node_pressure"
+
+
+class AlertDataUnavailable(Exception):
+    """A rule could not be evaluated because its input is temporarily gone.
+
+    Distinct from "no subjects matched", and the distinction is load-bearing:
+    ``evaluate_all`` RESOLVES every open event whose subject is absent from
+    this pass's matches. So a matcher that returns ``[]`` when it simply could
+    not read anything closes the operator's open events, and re-opens them on
+    the next successful tick — a notification flap once a minute, under
+    exactly the load the rule exists to report.
+
+    Raising this instead skips the rule for one pass, leaving open events
+    open and opening nothing new. "We do not know" is not "it recovered".
+    """
+
+
+# Percent of wall time, averaged over 300 s, with EVERY runnable task stalled
+# on memory. Fixed rather than operator-tunable in v1, same as the other
+# rules' fixed windows.
+_NODE_PRESSURE_FULL_CRITICAL_PCT = 1.0
+_NODE_PRESSURE_RULE_NAME = "Node under sustained resource pressure"
+
 # Issue #46 — planned-decommission awareness. Subject = subnet. Fires
 # when a subnet's ``decom_date`` falls within ``threshold_days`` (default
 # 30). Same threshold-escalation shape as the other ``*_expiring`` rules
@@ -402,6 +451,7 @@ RULE_TYPES = frozenset(
         RULE_TYPE_FIREWALL_APPLY_STALLED,
         RULE_TYPE_SECRET_EXPIRING,
         RULE_TYPE_AGENT_CONFIG_REJECTED,
+        RULE_TYPE_NODE_PRESSURE,
         RULE_TYPE_DECOM_EXPIRING,
         RULE_TYPE_DNS_NXDOMAIN_SPIKE,
         RULE_TYPE_DNS_QUERY_RATE_SPIKE,
@@ -2820,6 +2870,107 @@ async def _matching_secret_expiring_subjects(
     return matches
 
 
+async def _matching_node_pressure_subjects(
+    db: AsyncSession,  # noqa: ARG001
+    rule: AlertRule,
+) -> list[tuple[str, str, str, str | None]]:
+    """``node_pressure`` — cluster nodes whose PSI shows sustained stalling.
+
+    Reads the kubelet Summary API through the same ``get_cluster_health()``
+    the Cluster screen uses, so there is no new collector and no new
+    permission: whatever transport already works for the health panel works
+    here (#983 Phase 2 item 6).
+
+    NULL PSI is never a match. A kubelet older than 1.36 — or one with the
+    feature off — reports nothing, and firing on that would alarm every node
+    in the fleet on upgrade day while saying something false. It is the same
+    rule the #882 matcher follows for an agent that has never reported.
+
+    Runs in a worker thread: ``get_cluster_health`` is synchronous and does
+    one HTTPS round trip per node, which would otherwise stall the event
+    loop for the whole 60 s tick.
+    """
+    import asyncio  # noqa: PLC0415
+
+    from app.config import settings  # noqa: PLC0415
+
+    # Cluster health only exists on the appliance; everywhere else the
+    # ServiceAccount is not mounted and every node would silently report no
+    # PSI, so skip the round trip entirely.
+    if not settings.appliance_mode:
+        return []
+
+    from app.services.appliance import cluster_health  # noqa: PLC0415
+
+    try:
+        snap = await asyncio.to_thread(cluster_health.get_cluster_health)
+    except Exception as exc:  # noqa: BLE001 - any read failure means "unknown"
+        raise AlertDataUnavailable(f"cluster health unreadable: {exc}") from exc
+    if not snap.get("available"):
+        # A kubeapi blip and a genuinely dead cluster look the same from here,
+        # and neither is evidence that the pressure cleared. Returning [] would
+        # resolve every open event and re-open it a minute later.
+        raise AlertDataUnavailable(f"cluster health unavailable: {snap.get('detail')}")
+
+    # ``is not None``, not ``or`` — the column is numeric and the form allows
+    # 0, which ``or`` would silently rewrite to 50. Every other rule in this
+    # file reads its threshold the same way. Note that 0 does mean what it
+    # says: ``some >= 0`` matches every node that reports PSI at all, which is
+    # a legitimate (if loud) way to ask "tell me about any stalling".
+    threshold = float(rule.threshold_percent if rule.threshold_percent is not None else 50)
+    matches: list[tuple[str, str, str, str | None]] = []
+    for node in snap.get("nodes") or []:
+        name = node.get("name")
+        if not name:
+            continue
+        reasons: list[str] = []
+        severity: str | None = None
+
+        mem_full = _psi_avg300(node.get("psi_memory"), "full")
+        if mem_full is not None and mem_full >= _NODE_PRESSURE_FULL_CRITICAL_PCT:
+            reasons.append(
+                f"memory full-stall {mem_full:.1f}% of the last 5 min "
+                "(every runnable task blocked)"
+            )
+            severity = "critical"
+
+        for label, key in (("CPU", "psi_cpu"), ("memory", "psi_memory")):
+            some = _psi_avg300(node.get(key), "some")
+            if some is not None and some >= threshold:
+                reasons.append(
+                    f"{label} stall {some:.1f}% of the last 5 min (threshold {threshold:.0f}%)"
+                )
+                severity = severity or "warning"
+
+        if reasons:
+            matches.append((str(name), str(name), "; ".join(reasons), severity))
+    return matches
+
+
+def _psi_avg300(psi: Any, kind: str) -> float | None:
+    """``avg300`` for one ``some`` / ``full`` series, or None if unreported.
+
+    None propagates all the way from the kubelet: it means the reading does
+    not exist, which is a different fact from 0.0 (no pressure) and must not
+    be compared against a threshold.
+    """
+    if not isinstance(psi, dict):
+        return None
+    series = psi.get(kind)
+    if not isinstance(series, dict):
+        return None
+    val = series.get("avg300")
+    # ``bool`` is an ``int`` subclass, so a JSON ``true`` would arrive as 1.0
+    # and read as a real one-percent stall. Unreachable through the live path
+    # today — ``cluster_health._parse_psi`` filters it first — but the two
+    # functions parsing the same wire shape must not disagree about what
+    # counts as a number, or a change to that filter turns into a phantom
+    # alert here with nothing to point at.
+    if isinstance(val, bool) or not isinstance(val, (int, float)):
+        return None
+    return float(val)
+
+
 async def _matching_agent_config_rejected_subjects(
     db: AsyncSession,
     rule: AlertRule,  # noqa: ARG001
@@ -3653,6 +3804,60 @@ async def seed_firewall_apply_stalled_alert_rule() -> None:
 
 
 _AGENT_CONFIG_REJECTED_RULE_NAME = "Agent config apply rejected"
+
+
+async def seed_node_pressure_alert_rule() -> None:
+    """Seed the #983 Phase 2 PSI rule, ENABLED by default.
+
+    Safe to enable everywhere despite being new and uncalibrated, because it
+    cannot fire where the reading does not exist: a kubelet below 1.36
+    reports no PSI at all, and the matcher treats that as "no match" rather
+    than as zero. So on upgrade day it is silent until the node is actually
+    running 1.36, and silent after that until something stalls.
+
+    The default threshold is deliberately conservative. #983 asked for
+    "warning at sustained cpu.some / memory.some" without a number, and the
+    honest position is that nobody has watched PSI on a loaded appliance yet
+    — so it is set where the reading is unambiguous rather than where it is
+    sensitive. 50% means half of every five-minute window had something
+    blocked; a node doing that is not merely busy. Tune it DOWN once there
+    are field numbers to tune against; starting low would page on day one
+    and teach operators to ignore it, which costs more than a late alarm.
+
+    Keyed on ``name``; an operator who disables or renames it is never
+    overridden.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    async with AsyncSessionLocal() as session:
+        existing = await session.scalar(
+            select(AlertRule).where(AlertRule.name == _NODE_PRESSURE_RULE_NAME)
+        )
+        if existing is not None:
+            return
+        session.add(
+            AlertRule(
+                name=_NODE_PRESSURE_RULE_NAME,
+                description=(
+                    "Fires when a cluster node reports sustained resource stalling "
+                    "through PSI (Pressure Stall Information, Kubernetes 1.36+). "
+                    "Utilisation cannot see this: a node at 70% CPU with a run "
+                    "queue behind one core and a node at 70% without one look "
+                    "identical, and only the first one drops traffic. Warning when "
+                    "CPU or memory 'some' stalling holds above the threshold across "
+                    "a 5-minute window; critical when memory 'full' stalling — every "
+                    "runnable task blocked — holds above 1% of that window. Silent "
+                    "on nodes whose kubelet does not report PSI. Auto-resolves when "
+                    "the pressure clears."
+                ),
+                rule_type=RULE_TYPE_NODE_PRESSURE,
+                severity="warning",
+                enabled=True,
+                threshold_percent=50,
+            )
+        )
+        await session.commit()
 
 
 async def seed_agent_config_rejected_alert_rule() -> None:
@@ -4838,6 +5043,14 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 expiring = await _matching_secret_expiring_subjects(db, rule, now)
                 matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in expiring]
                 subject_type = "secret"
+            elif rule.rule_type == RULE_TYPE_NODE_PRESSURE:
+                pressured = await _matching_node_pressure_subjects(db, rule)
+                matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in pressured]
+                # Subject is the Kubernetes node NAME — cluster nodes have no
+                # row in this database, and the name is what every other
+                # surface (Cluster screen, kubectl, the Fleet drilldown)
+                # identifies them by.
+                subject_type = "node"
             elif rule.rule_type == RULE_TYPE_AGENT_CONFIG_REJECTED:
                 rejected = await _matching_agent_config_rejected_subjects(db, rule)
                 matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in rejected]
@@ -5036,6 +5249,17 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                     continue
                 event.resolved_at = now
                 resolved += 1
+        except AlertDataUnavailable as exc:
+            # Not a failure worth a traceback, and deliberately not treated as
+            # "no matches": open events stay open, nothing new opens, and the
+            # next tick with real data decides. Logged at info because during
+            # a genuine outage this fires every 60 s.
+            logger.info(
+                "alert_rule_eval_skipped_no_data",
+                rule=str(rule.id),
+                rule_type=rule.rule_type,
+                reason=str(exc),
+            )
         except Exception as exc:  # noqa: BLE001
             logger.exception(
                 "alert_rule_eval_failed",

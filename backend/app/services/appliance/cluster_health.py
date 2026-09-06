@@ -2,10 +2,15 @@
 
 Aggregates a live picture of the k3s cluster *underneath* the appliance from
 data the api pod's ServiceAccount can already read (nodes + pods cluster-wide)
-plus the kubelet Summary API via the apiserver proxy (``nodes/proxy [get]``,
-added in the same PR). This is the same data source the TTY console uses — the
-appliance ships **no** metrics-server / Prometheus, so live CPU / memory comes
-from the kubelet Summary API, not ``metrics.k8s.io``.
+plus the kubelet Summary API. This is the same data source the TTY console
+uses — the appliance ships **no** metrics-server / Prometheus, so live CPU /
+memory comes from the kubelet Summary API, not ``metrics.k8s.io``. Since
+Kubernetes 1.36 that response also carries PSI stall percentages (#983).
+
+Two transports reach it, per node: direct to the kubelet on :10250 under
+``nodes/stats``, falling back to the apiserver proxy under ``nodes/proxy``.
+See ``k8s.get_node_stats_summary``; which one served is reported back on the
+snapshot so the broad proxy grant can eventually be dropped.
 
 ``get_cluster_health()`` is a synchronous gather (a handful of stdlib kubeapi
 calls); the router runs it in a worker thread so the event loop never blocks,
@@ -138,11 +143,85 @@ def _internal_ip(node: dict[str, Any]) -> str | None:
     return None
 
 
+# ── PSI (#983 Phase 2 item 7) ────────────────────────────────────────────────
+# Pressure Stall Information, GA in Kubernetes 1.36 (``KubeletPSI``). The
+# kubelet Summary API grows a ``psi`` block on the node's ``cpu`` and
+# ``memory`` sections and a new ``io`` section, each shaped like
+# /proc/pressure/<res>:
+#
+#   "psi": {"some": {"total": N, "avg10": x, "avg60": y, "avg300": z},
+#           "full": { ...same... }}
+#
+# ``some`` is the share of wall-clock time at least one task was stalled on
+# the resource; ``full`` is the share where EVERY runnable task was. For CPU,
+# ``full`` is meaningless at the node level and the kernel reports it as 0 —
+# so a CPU verdict has to read ``some``.
+#
+# Why this is worth parsing at all: #980 was the appliance dropping relayed
+# DHCP under CPU pressure with every dashboard green. Utilisation cannot see
+# that — a node at 70% CPU with a queue behind one core looks identical to a
+# node at 70% with none. Stall time is the signal that separates them, and it
+# arrives in a response this code already fetches.
+_PSI_WINDOWS = ("avg10", "avg60", "avg300")
+
+
+def _parse_psi(block: Any) -> dict[str, Any] | None:
+    """One ``psi`` object → ``{"some": {...}, "full": {...}}`` of floats.
+
+    Returns None when the block is absent or unusable, and the caller keeps
+    that None all the way to the API. NULL here means UNRECORDED — a kubelet
+    older than 1.36, or one with the feature off — and must never be
+    flattened to 0.0, which is a real reading meaning "no pressure at all".
+    Those are opposite facts about the node and the panel that shows them.
+    """
+    if not isinstance(block, dict):
+        return None
+    out: dict[str, Any] = {}
+    for kind in ("some", "full"):
+        raw = block.get(kind)
+        if not isinstance(raw, dict):
+            continue
+        vals: dict[str, float] = {}
+        for window in _PSI_WINDOWS:
+            val = raw.get(window)
+            # bool is an int subclass; a JSON ``true`` here would otherwise
+            # become 1.0 and read as a real one-percent stall.
+            if isinstance(val, (int, float)) and not isinstance(val, bool):
+                vals[window] = float(val)
+        if vals:
+            out[kind] = vals
+    return out or None
+
+
+def _kubelet_transport_report(
+    by_node: dict[str, str], ip_by_node: dict[str, str]
+) -> dict[str, Any]:
+    """Per-node transport + the one verdict an operator acts on (#983).
+
+    ``all_direct`` is the question the ``nodes/proxy`` grant hangs on, and it
+    is False when NO node was probed — "we measured nothing" must never read
+    as "safe to drop the broad grant". Reasons are keyed back to node names
+    (k8s.py tracks them by IP, which is what it connects to) so the report can
+    be read without cross-referencing addresses.
+    """
+    reasons_by_ip = k8s.kubelet_block_reasons()
+    blocked = {name: reasons_by_ip[ip] for name, ip in ip_by_node.items() if ip in reasons_by_ip}
+    direct = sum(1 for t in by_node.values() if t == k8s.TRANSPORT_DIRECT)
+    return {
+        "by_node": by_node,
+        "direct_nodes": direct,
+        "proxy_nodes": len(by_node) - direct,
+        "all_direct": bool(by_node) and direct == len(by_node),
+        "blocked_reasons": blocked,
+    }
+
+
 def _parse_node_stats(summary: dict[str, Any]) -> dict[str, Any]:
     node = summary.get("node") or {}
     cpu = node.get("cpu") or {}
     mem = node.get("memory") or {}
     fs = node.get("fs") or {}
+    io = node.get("io") or {}
     nano = cpu.get("usageNanoCores")
     return {
         "cpu_usage_cores": (nano / 1e9) if isinstance(nano, (int, float)) else None,
@@ -150,6 +229,10 @@ def _parse_node_stats(summary: dict[str, Any]) -> dict[str, Any]:
         "memory_available_bytes": mem.get("availableBytes"),
         "fs_used_bytes": fs.get("usedBytes"),
         "fs_capacity_bytes": fs.get("capacityBytes"),
+        # None (not {}) when the kubelet reports no PSI at all — see _parse_psi.
+        "psi_cpu": _parse_psi(cpu.get("psi")),
+        "psi_memory": _parse_psi(mem.get("psi")),
+        "psi_io": _parse_psi(io.get("psi") if isinstance(io, dict) else None),
     }
 
 
@@ -221,6 +304,15 @@ def _unavailable(detail: str) -> dict[str, Any]:
         "is_ha": False,
         "control_plane_nodes": 0,
         "metrics_available": False,
+        # #983 Phase 2 item 6 — which kubelet transport served, so the
+        # apiserver-proxy fallback is visible instead of silent.
+        "kubelet_transport": {
+            "by_node": {},
+            "direct_nodes": 0,
+            "proxy_nodes": 0,
+            "all_direct": False,
+            "blocked_reasons": {},
+        },
         "cpu_usage_cores": None,
         "cpu_capacity_cores": None,
         "memory_working_set_bytes": None,
@@ -260,20 +352,34 @@ def get_cluster_health() -> dict[str, Any]:
     except k8s.KubeapiUnavailableError:
         pods_raw = []
 
-    # Per-node kubelet Summary API (CPU / mem / fs + per-pod usage). Degrades
-    # cleanly to "no live usage" when nodes/proxy isn't granted (403) or a
-    # kubelet is briefly unreachable.
+    # Per-node kubelet Summary API (CPU / mem / fs + per-pod usage, and PSI
+    # since 1.36). Degrades cleanly to "no live usage" when NEITHER transport
+    # is granted (403 on both) or a kubelet is briefly unreachable.
     node_stats: dict[str, dict[str, Any]] = {}
     pod_usage: dict[tuple[str, str], tuple[float, int]] = {}
     metrics_available = False
+    # #983 Phase 2 item 6 — record the transport PER NODE. A single value
+    # would report whichever node was processed last, which can read "direct"
+    # while another node was quietly served by the proxy — the exact wrong
+    # answer to "is it safe to drop the nodes/proxy grant?".
+    transport_by_node: dict[str, str] = {}
+    transport_ip_by_node: dict[str, str] = {}
     for n in nodes_raw:
         nm = (n.get("metadata") or {}).get("name")
         if not nm:
             continue
+        node_ip = _internal_ip(n)
         try:
-            sstatus, summary = k8s.get_node_stats_summary(nm)
+            # Hand the node IP over so the direct kubelet transport
+            # (``nodes/stats``) can be tried before the apiserver proxy
+            # (``nodes/proxy``, which authorizes read GETs to every kubelet
+            # endpoint). Falls back per node on its own; see k8s.py.
+            sstatus, summary, transport = k8s.get_node_stats_summary(nm, node_ip)
         except k8s.KubeapiUnavailableError:
             continue
+        transport_by_node[nm] = transport
+        if node_ip:
+            transport_ip_by_node[nm] = node_ip
         if sstatus == 200 and summary:
             metrics_available = True
             node_stats[nm] = _parse_node_stats(summary)
@@ -342,6 +448,11 @@ def get_cluster_health() -> dict[str, Any]:
                 "memory_available_bytes": stats.get("memory_available_bytes"),
                 "fs_used_bytes": stats.get("fs_used_bytes"),
                 "fs_capacity_bytes": stats.get("fs_capacity_bytes"),
+                # #983 Phase 2 — PSI. null means the kubelet did not report it
+                # (pre-1.36, or the feature gate off), NOT "no pressure".
+                "psi_cpu": stats.get("psi_cpu"),
+                "psi_memory": stats.get("psi_memory"),
+                "psi_io": stats.get("psi_io"),
                 # #402 — host disk partitions are merged in by the router from
                 # the supervisor's cluster_health JSONB (the api pod can't see
                 # host partitions itself); empty here so the shape is stable.
@@ -440,6 +551,7 @@ def get_cluster_health() -> dict[str, Any]:
         "is_ha": control_plane_nodes > 1,
         "control_plane_nodes": control_plane_nodes,
         "metrics_available": metrics_available,
+        "kubelet_transport": _kubelet_transport_report(transport_by_node, transport_ip_by_node),
         "cpu_usage_cores": round(cluster_cpu_used, 4) if metrics_available else None,
         "cpu_capacity_cores": round(cluster_cpu_cap, 4) if cluster_cpu_cap else None,
         "memory_working_set_bytes": cluster_mem_used if metrics_available else None,

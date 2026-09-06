@@ -42,6 +42,11 @@ const RULE_TYPE_PARAM_DEFAULTS: Partial<
   service_term_expiring: { thresholdDays: 30 },
   secret_expiring: { thresholdDays: 30 },
   decom_expiring: { thresholdDays: 30 },
+  // #983 Phase 2 — PSI stall %. Conservative on purpose: nobody has watched
+  // PSI on a loaded appliance yet, so it starts where the reading is
+  // unambiguous rather than where it is sensitive. Tune DOWN with field
+  // numbers; starting low pages on day one and teaches people to ignore it.
+  node_pressure: { threshold: 50 },
 };
 
 function Field({
@@ -125,7 +130,8 @@ function RuleEditorModal({
           ruleType === "subnet_utilization" ||
           ruleType === "voice_lease_count_below" ||
           ruleType === "stale_ip_count" ||
-          ruleType === "dhcp_pool_exhaustion"
+          ruleType === "dhcp_pool_exhaustion" ||
+          ruleType === "node_pressure"
             ? threshold
             : null,
         min_free_addresses:
@@ -206,6 +212,9 @@ function RuleEditorModal({
                 <option value="stale_ip_count">
                   Stale IP count (address-space hygiene)
                 </option>
+                <option value="node_pressure">
+                  Node resource pressure (PSI stalling)
+                </option>
               </optgroup>
               <optgroup label="Subnet / IPAM">
                 <option value="decom_expiring">
@@ -284,6 +293,29 @@ function RuleEditorModal({
           <Field
             label="Threshold (%)"
             hint="Fires when subnet utilization ≥ this. PTP / loopback subnets (prefix > utilization_max_prefix_*) are excluded."
+          >
+            <input
+              type="number"
+              min={0}
+              max={100}
+              className={inputCls}
+              value={threshold}
+              onChange={(e) => setThreshold(Number(e.target.value))}
+            />
+          </Field>
+        )}
+        {ruleType === "node_pressure" && (
+          <Field
+            label="Stall threshold (%)"
+            hint={
+              "Warns when CPU or memory 'some' stalling holds at or above this " +
+              "across a 5-minute window — the share of wall time at least one " +
+              "task was blocked waiting for the resource. Separate from the " +
+              "fixed 1% memory 'full' floor, which is always critical: 'some' " +
+              "at 20% is a busy node, 'full' at 20% is a node doing no work. " +
+              "Silent on nodes whose kubelet does not report PSI (below " +
+              "Kubernetes 1.36)."
+            }
           >
             <input
               type="number"
@@ -792,17 +824,19 @@ export function AlertsPage() {
                           ? `< ${r.threshold_percent ?? 1} leases`
                           : r.rule_type === "stale_ip_count"
                             ? `≥ ${r.threshold_percent ?? 10} stale · ${r.threshold_days ?? 90}d`
-                            : r.rule_type === "server_unreachable"
-                              ? `type=${r.server_type ?? "any"}`
-                              : r.rule_type === "domain_expiring" ||
-                                  r.rule_type === "circuit_term_expiring" ||
-                                  r.rule_type === "service_term_expiring" ||
-                                  r.rule_type === "secret_expiring" ||
-                                  r.rule_type === "decom_expiring"
-                                ? `≤ ${r.threshold_days ?? 30} d`
-                                : r.rule_type === "compliance_change"
-                                  ? `${r.classification ?? "?"} · ${r.change_scope ?? "any_change"}`
-                                  : "—"}
+                            : r.rule_type === "node_pressure"
+                              ? `≥ ${r.threshold_percent ?? 50}% stalled · full ≥ 1%`
+                              : r.rule_type === "server_unreachable"
+                                ? `type=${r.server_type ?? "any"}`
+                                : r.rule_type === "domain_expiring" ||
+                                    r.rule_type === "circuit_term_expiring" ||
+                                    r.rule_type === "service_term_expiring" ||
+                                    r.rule_type === "secret_expiring" ||
+                                    r.rule_type === "decom_expiring"
+                                  ? `≤ ${r.threshold_days ?? 30} d`
+                                  : r.rule_type === "compliance_change"
+                                    ? `${r.classification ?? "?"} · ${r.change_scope ?? "any_change"}`
+                                    : "—"}
                     </td>
                     <td className="px-4 py-2">
                       <SeverityBadge severity={r.severity} />

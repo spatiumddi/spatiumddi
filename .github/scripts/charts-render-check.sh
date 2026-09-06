@@ -123,6 +123,7 @@ UMBRELLA_ALL_ON=(
     --set slotImageMirror.enabled=true
     --set api.autoscaling.enabled=true
     --set api.serviceAccount.enabled=true
+    --set worker.serviceAccount.enabled=true
     --set api.serviceControl.enabled=true
     --set api.serviceControlRBAC.enabled=true
     --set api.upgradeOrchestratorRBAC.enabled=true

@@ -237,31 +237,207 @@ def list_all_pods() -> tuple[int, list[dict[str, Any]]]:
     return status, data.get("items") or []
 
 
-def get_node_stats_summary(node_name: str) -> tuple[int, dict[str, Any] | None]:
-    """Fetch the kubelet Summary API for a node via the apiserver proxy.
+# ── Kubelet Summary API transports (#983 Phase 2 item 6) ─────────────────────
+# Two ways to reach the same document, needing different authorization:
+#
+#   proxy   GET {apiserver}/api/v1/nodes/<n>/proxy/stats/summary
+#           needs ``nodes/proxy [get]`` at the APISERVER — which authorizes
+#           read GETs to EVERY kubelet endpoint (/pods, /logs/…, /configz,
+#           /debug/…), not just this one. That is the grant #983 wants gone.
+#
+#   direct  GET https://<nodeIP>:10250/stats/summary
+#           the kubelet authorizes it itself via SubjectAccessReview, and
+#           Kubernetes 1.36 GA'd fine-grained kubelet subresources — so this
+#           needs only ``nodes/stats [get]``.
+#
+# Direct is tried first and the proxy is the fallback, rather than a flag
+# day, for one reason we could not settle without a cluster: k3s signs
+# kubelet serving certs with its own ``server-ca``, and whether that is the
+# same CA as the one in the ServiceAccount's ``ca.crt`` is a fact about the
+# deployment, not something the chart can assert. #983 suggested the TTY
+# console as a reference implementation — it is not one; ``spatium-console``
+# also goes through the apiserver proxy (``kubectl get --raw``), so nothing
+# in this repo has ever spoken to a kubelet directly.
+#
+# So the code finds out, once, and says which transport served. When the
+# direct path is confirmed in the field the ``nodes/proxy`` grant can be
+# switched off (``api.upgradeOrchestratorRBAC.kubeletProxyFallback``) and
+# this degrades to direct-only.
+_KUBELET_PORT = 10250
+# A failure that will not change on the next poll — a CA that cannot verify
+# the kubelet, or an RBAC answer — must not be retried every tick: the health
+# poll fans out over every node once a minute and a TLS handshake against a
+# wrong CA costs a round trip each time. Re-probe on this interval instead.
+_KUBELET_DIRECT_RETRY_S = 900.0
+# PER NODE, keyed by node IP: ``{ip: (blocked_until_monotonic, reason)}``.
+#
+# Deliberately not one global flag. A single kubelet restarting would
+# otherwise demote the WHOLE cluster to the apiserver proxy for 15 minutes —
+# and with ``kubeletProxyFallback: false`` that is not a demotion, it is total
+# loss of live metrics for every node because one of them blinked.
+_kubelet_direct_blocked: dict[str, tuple[float, str]] = {}
 
-    ``GET /api/v1/nodes/<n>/proxy/stats/summary`` — per-node + per-pod
-    CPU (``usageNanoCores``) + memory (``workingSetBytes``) + filesystem
-    usage. This is how the appliance surfaces live usage WITHOUT a
-    metrics-server / Prometheus (the TTY console uses the same source).
+TRANSPORT_DIRECT = "direct"
+TRANSPORT_PROXY = "proxy"
 
-    Needs the ``nodes/proxy [get]`` grant (#402). Returns
-    (status, parsed_or_None); a 403 (older chart without the grant)
-    comes back as the status so the caller degrades to "no live usage"
-    instead of erroring. A short timeout keeps a wedged kubelet from
-    stalling the health poll.
+
+def kubelet_block_reasons() -> dict[str, str]:
+    """``{node_ip: reason}`` for every node whose direct path is blocked NOW.
+
+    Expired entries are pruned as they are read. That pruning is also what
+    stops a recovered node reporting a stale reason: the reason lives inside
+    the block entry rather than in a separate variable nothing clears, so it
+    cannot outlive it.
+    """
+    now = time.monotonic()
+    for ip in [ip for ip, (until, _) in _kubelet_direct_blocked.items() if until <= now]:
+        _kubelet_direct_blocked.pop(ip, None)
+    return {ip: reason for ip, (_, reason) in _kubelet_direct_blocked.items()}
+
+
+def _direct_is_blocked(node_ip: str) -> bool:
+    entry = _kubelet_direct_blocked.get(node_ip)
+    if entry is None:
+        return False
+    if entry[0] <= time.monotonic():
+        # Expired — clear it here so the reason disappears WITH the block.
+        # Keeping a reason around after recovery is how a status line ends up
+        # reporting "direct" and a CA error at the same time.
+        _kubelet_direct_blocked.pop(node_ip, None)
+        return False
+    return True
+
+
+def _block_direct(node_ip: str, reason: str) -> None:
+    _kubelet_direct_blocked[node_ip] = (time.monotonic() + _KUBELET_DIRECT_RETRY_S, reason)
+    logger.info(
+        "kubelet_direct_unavailable",
+        node_ip=node_ip,
+        reason=reason,
+        retry_in_s=int(_KUBELET_DIRECT_RETRY_S),
+        note="this node falls back to the apiserver nodes/proxy transport",
+    )
+
+
+def _kubelet_ca_path(cfg: _Config) -> str:
+    """CA bundle used to verify the kubelet's serving cert.
+
+    Defaults to the ServiceAccount's ``ca.crt``. ``SPATIUM_KUBELET_CA_PATH``
+    overrides it for a cluster whose kubelet serving certs are signed by a
+    different CA than the apiserver's — k3s's ``server-ca`` is the case this
+    exists for, and until it is checked on real hardware the override is how
+    an operator fixes it without a release.
+    """
+    import os  # noqa: PLC0415
+
+    return os.environ.get("SPATIUM_KUBELET_CA_PATH") or cfg.ca_path
+
+
+def _get_stats_summary_direct(node_ip: str) -> tuple[int, dict[str, Any] | None]:
+    """``GET https://<nodeIP>:10250/stats/summary`` with the SA token.
+
+    Raises nothing: every failure mode is converted into a blocked-direct
+    verdict plus a (0, None) return, because the caller's job is to fall back
+    rather than to surface a transport problem as missing metrics.
+    """
+    cfg = get_config()
+    if cfg is None:
+        return 0, None
+    # Building the context is INSIDE the guard on purpose. ``SPATIUM_KUBELET_
+    # CA_PATH`` is operator-supplied, and ``create_default_context`` raises on
+    # a path that is missing or is not a PEM — outside the guard that
+    # exception escapes ``get_node_stats_summary``, past cluster_health's
+    # ``KubeapiUnavailableError``-only handler, and 500s the whole health
+    # poll. A misconfigured CA has to degrade to the proxy like every other
+    # direct-path failure, not take the Cluster screen down.
+    try:
+        ctx = _ssl_context(_kubelet_ca_path(cfg))
+    except (OSError, ssl.SSLError) as exc:
+        _block_direct(node_ip, f"cannot load kubelet CA bundle: {exc} (SPATIUM_KUBELET_CA_PATH?)")
+        return 0, None
+    conn = http.client.HTTPSConnection(node_ip, _KUBELET_PORT, timeout=6.0, context=ctx)
+    try:
+        conn.request(
+            "GET",
+            "/stats/summary",
+            headers={"Authorization": f"Bearer {cfg.token}", "Accept": "application/json"},
+        )
+        resp = conn.getresponse()
+        body = resp.read()
+        if resp.status == 200:
+            try:
+                return 200, json.loads(body.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                # A 200 we cannot parse is not a transport problem; do not
+                # block the direct path over it.
+                return 200, None
+        if resp.status in (401, 403):
+            # The kubelet authorized us and said no — almost certainly the
+            # ``nodes/stats`` grant is missing. Naming the status matters:
+            # this is the one failure an operator fixes in the chart.
+            _block_direct(node_ip, f"kubelet returned HTTP {resp.status} (nodes/stats grant?)")
+        else:
+            _block_direct(node_ip, f"kubelet returned HTTP {resp.status}")
+        return resp.status, None
+    except ssl.SSLCertVerificationError as exc:
+        # THE question this whole arrangement exists to answer. Logged with
+        # the remedy rather than just the error.
+        _block_direct(
+            node_ip,
+            f"kubelet serving cert not valid for the ServiceAccount CA: {exc}. "
+            "Set SPATIUM_KUBELET_CA_PATH to the CA that signs kubelet serving "
+            "certs (k3s: /var/lib/rancher/k3s/server/tls/server-ca.crt)",
+        )
+        return 0, None
+    except (OSError, http.client.HTTPException) as exc:
+        _block_direct(node_ip, f"{type(exc).__name__}: {exc}")
+        return 0, None
+    finally:
+        conn.close()
+
+
+def get_node_stats_summary(
+    node_name: str, node_ip: str | None = None
+) -> tuple[int, dict[str, Any] | None, str]:
+    """Fetch the kubelet Summary API for a node.
+
+    Per-node + per-pod CPU (``usageNanoCores``) + memory
+    (``workingSetBytes``) + filesystem usage, and since Kubernetes 1.36 the
+    PSI blocks (#983 Phase 2 item 7). This is how the appliance surfaces
+    live usage WITHOUT a metrics-server / Prometheus.
+
+    Tries the direct kubelet transport when ``node_ip`` is known and THAT
+    NODE's direct path is not currently blocked, then falls back to the
+    apiserver proxy.
+
+    Returns ``(status, parsed_or_None, transport)``. The transport is returned
+    rather than stashed in a module global because the caller is the only
+    thing that knows the node NAMES, and a global would report whichever node
+    happened to be processed last — reading "direct" while another node was
+    quietly served by the proxy, which is the opposite of the fact an operator
+    needs before dropping the ``nodes/proxy`` grant.
+
+    A 403 from the proxy (a chart without that grant) comes back as the status
+    so the caller degrades to "no live usage" instead of erroring. Short
+    timeouts keep a wedged kubelet from stalling the health poll.
     """
     cfg = get_config()
     if cfg is None:
         raise KubeapiUnavailableError("ServiceAccount not mounted; kubeapi unreachable")
+
+    if node_ip and not _direct_is_blocked(node_ip):
+        status, parsed = _get_stats_summary_direct(node_ip)
+        if status == 200:
+            return status, parsed, TRANSPORT_DIRECT
+
     path = f"/api/v1/nodes/{quote(node_name)}/proxy/stats/summary"
     status, body = _request("GET", path, timeout=6.0)
     if status == 200:
         try:
-            return status, json.loads(body.decode("utf-8"))
+            return status, json.loads(body.decode("utf-8")), TRANSPORT_PROXY
         except (ValueError, UnicodeDecodeError):
-            return status, None
-    return status, None
+            return status, None, TRANSPORT_PROXY
+    return status, None, TRANSPORT_PROXY
 
 
 def get_pod_logs(

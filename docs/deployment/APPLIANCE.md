@@ -506,6 +506,176 @@ cluster transiently serves a mix of 1.35 and 1.36 apiservers, helm
 validates `kubeVersion` against whichever it reaches, and a floor at 1.36
 would turn an ordinary mid-upgrade role toggle into a failed release.
 
+### Pressure Stall Information (PSI)
+
+Kubernetes 1.36 GA'd `KubeletPSI`, so the kubelet Summary API — a response
+the Cluster screen already fetches — now carries a `psi` block on the node's
+`cpu` and `memory` sections plus a new `io` section, each shaped like
+`/proc/pressure/<res>`:
+
+```
+"psi": {"some": {"total": N, "avg10": x, "avg60": y, "avg300": z},
+        "full": { ...same... }}
+```
+
+`some` is the share of wall-clock time at least one task was stalled waiting
+for the resource; `full` is the share where *every* runnable task was.
+
+**This is the reading [#980](https://github.com/spatiumddi/spatiumddi/issues/980) needed and nothing could give.** That was the
+appliance dropping relayed DHCP under CPU pressure with every dashboard
+green — and it stayed green because utilisation cannot distinguish a node at
+70% CPU with a run queue behind one core from a node at 70% without one.
+Only the first drops traffic. Stall time is what separates them.
+
+Surfaced in three places, all reading `avg300` (the kernel's own 5-minute
+rolling average, which is why "sustained" needs no state on our side — a
+burst and a condition are already different numbers):
+
+* **Cluster → Overview**, a `stalled 5m` row on each node card.
+* **`find_cluster_metrics`** (Operator Copilot), as `cpu_stall_pct_5m` /
+  `mem_stall_pct_5m` / `mem_full_stall_pct_5m` / `io_stall_pct_5m`.
+* **The `node_pressure` alert rule**, default ON.
+
+**The alert needs `worker.serviceAccount.enabled`.** Alert evaluation runs in
+the Celery worker, not the api, so without a ServiceAccount mounted there the
+rule evaluates to nothing forever while sitting enabled in the Alerts UI. The
+worker's grant is deliberately much narrower than the api's — `nodes` read +
+`nodes/stats`, and none of the eviction / node-patch / Secret-write the api's
+orchestrator role carries. The appliance overlay turns it on.
+
+**A cluster it cannot read is UNKNOWN, not "recovered".** The evaluator
+resolves any open event whose subject is absent from a pass, so a matcher
+returning "no matches" on a kubeapi blip would close the operator's open
+pressure events and re-open them a minute later — a notification flap once a
+minute, for the duration of exactly the incident the rule reports on. The
+matcher raises instead, which skips the rule for that pass and leaves open
+events open.
+
+**`null` means UNRECORDED and is never rendered as zero.** A kubelet below
+1.36 reports no PSI at all; a 1.36 kubelet on an idle node reports `0.0`.
+Those are opposite facts, and a panel that draws the first as a quiet green
+bar is worse than one that says "not reported". Same rule the #914 rcode
+work follows.
+
+The alert's two thresholds deliberately do **not** share a knob. `some` is
+compared against the rule's `threshold_percent` (default 50); memory `full`
+has its own fixed 1% floor. `some` at 20% is a busy node, `full` at 20% is a
+node that spent a fifth of five minutes doing no work at all — one operator
+knob cannot mean both. CPU `full` is not evaluated at all: the kernel
+reports it as 0 at node level by definition, so a threshold on it could only
+ever be dead code.
+
+The 50% default is conservative on purpose. #983 asked for "warning at
+sustained cpu.some / memory.some" without a number, and nobody has watched
+PSI on a loaded appliance yet — so it sits where the reading is unambiguous
+rather than where it is sensitive. **Tune it down once there are field
+numbers**; starting low would page on day one and teach operators to ignore
+it, which costs more than a late alarm.
+
+### Kubelet Summary API transport
+
+Two ways to reach that response, needing very different authorization:
+
+| Transport | Request | Grant |
+|---|---|---|
+| `direct` | `GET https://<nodeIP>:10250/stats/summary` | `nodes/stats [get]` — that page only |
+| `proxy` | `GET {apiserver}/api/v1/nodes/<n>/proxy/stats/summary` | `nodes/proxy [get]` — read GETs to **every** kubelet endpoint |
+
+`nodes/proxy` is much broader than it looks: it authorizes `/pods`,
+`/logs/…`, `/configz` and `/debug/…` as well, not just the one page the
+health screen wants. (It stops short of exec / attach / run, which need
+`create`.) Kubernetes 1.36 GA'd fine-grained kubelet API authorization, which
+is what makes the narrow grant possible.
+
+The api tries `direct` first and falls back to `proxy`, rather than a flag
+day, for one honest reason: **whether the ServiceAccount's CA validates a
+given cluster's kubelet serving cert is a property of the deployment**, and
+k3s signs kubelet serving certs with its own `server-ca`. #983 suggested the
+TTY console as a reference implementation — it is not one; `spatium-console`
+also goes through the apiserver proxy (`kubectl get --raw`), so nothing in
+this repo had ever spoken to a kubelet directly.
+
+So the code finds out and reports it, **per node**. Cluster → Overview
+carries a `kubelet:` chip (green only when every node went direct); the same
+data is on `find_cluster_metrics` as `kubelet_transport`:
+
+* `all_direct: true` — the narrow grant works here. Set
+  `api.upgradeOrchestratorRBAC.kubeletProxyFallback: false` and the broad
+  grant disappears from both the api and the worker.
+* otherwise, `blocked_reasons` names each node and why. An HTTP 401/403 means
+  the `nodes/stats` grant did not reach the ServiceAccount. A CA mismatch
+  means the kubelet's serving cert does not chain to the ServiceAccount's CA —
+  set `api.kubeletCA.enabled: true`, which mounts
+  `/var/lib/rancher/k3s/server/tls/server-ca.crt` into both pods and points
+  `SPATIUM_KUBELET_CA_PATH` at it.
+
+Per node, not per cluster, and both halves of that matter. The **verdict** is
+per node because one value would report whichever node was processed last —
+reading `direct` while another node was quietly served by the proxy, which is
+the wrong answer to the only question the report exists to answer. The
+**backoff** is per node because a settled failure is not retried for 15
+minutes, and a single global flag would push the whole cluster onto the proxy
+because one kubelet restarted — which with `kubeletProxyFallback: false` is
+not a demotion but total loss of live metrics. The backoff does expire, so a
+node that was merely restarting returns to `direct` on its own, and the reason
+disappears with the block rather than lingering next to a recovered node.
+
+`all_direct` is false when **no** node was probed. Measuring nothing must
+never read as "safe to drop the grant".
+
+### User namespaces (`hostUsers: false`)
+
+GA in Kubernetes 1.36. Container root maps to an unprivileged host uid, so
+an escape from the pod is not root on the node. Exposed as a per-workload
+`hostUsers` value, **unset everywhere by default** — a runtime without
+idmapped-mount support refuses the pod outright, which is the right failure
+but is still a failure, so it has to be opted into.
+
+**#983's eligibility list is wrong about the appliance, and the chart now
+refuses the combination rather than commenting on it.** The issue reasoned
+that `api` and `worker` neither hostNetwork nor hostPath-mount. True of a
+plain Kubernetes install; false here. With `api.applianceHostMounts.enabled`
+the api bind-mounts five host directories — and *writes* the slot-upgrade
+triggers and the maintenance flag — while the worker writes the shared pcap
+store. `spatiumddi-firstboot` chowns those `1000:1000` to match the image's
+uid, which is exactly the mapping a user namespace changes. That is the same
+"a wrong uid map corrupts data rather than failing to start" hazard the
+issue reserved for Postgres, so `hostUsers: false` on either of them while
+the host mounts are on is a render-time error naming the reason.
+
+A PVC carries a quieter version of the same hazard, because on the appliance
+the StorageClass is local-path and a PVC is a host directory underneath.
+That one is documented at each knob rather than refused — a runtime that
+idmaps correctly makes it safe, and refusing would leave redis with no way
+to opt in on a cluster where it works.
+
+Which leaves, on an appliance, `kube-state-metrics` as the one workload it
+is straightforwardly safe on: no volumes, no hostNetwork, reads only the
+kubeapi. On a plain Kubernetes install the api and worker are eligible too —
+and that is where it is worth most, since the api pod runs tcpdump, nmap and
+operator-typed argv.
+
+Not offered at all, per #983: the role DaemonSets and the frontend
+(hostNetwork), the supervisor (host mounts + hostPID), and Postgres / CNPG.
+
+### Topology spread
+
+Umbrella chart only, and only in `soft` anti-affinity mode. `preferred`
+anti-affinity is a *preference* the scheduler weighs against everything
+else, so it can still land three api replicas on one node — which is the
+failure the replica count exists to avoid. `maxSkew: 1` on
+`kubernetes.io/hostname` with `whenUnsatisfiable: ScheduleAnyway` is a
+second, differently-shaped push toward one-per-node.
+
+`ScheduleAnyway` rather than `DoNotSchedule` is load-bearing: DoNotSchedule
+on a cluster with fewer ready nodes than replicas leaves the surplus
+permanently Pending, converting a placement preference into an outage.
+Operators who want the strict form set `hard`.
+
+Nothing is emitted in `hard` mode (the appliance's shape — required
+anti-affinity already pins one replica per node, #590), in `none` mode, at
+`replicas: 1`, or when the operator supplied their own list.
+
 ### What is deliberately not set
 
 `disable-network-policy: true` stays on. The old rationale ("single node,
@@ -514,10 +684,12 @@ reasons — nothing in either chart renders a NetworkPolicy, so the
 controller would reconcile an empty set, and it is another always-resident
 daemon on a node whose floor is 4 GiB.
 
-User namespaces (`hostUsers: false`), fine-grained kubelet API
-authorization (`nodes/stats` in place of `nodes/proxy`), PSI metrics and
-`topologySpreadConstraints` are all Phase 2 of #983 — after the 1.36 ISO
-has soaked on a real 3-node cluster.
+`hostUsers: false` is **not** set by the appliance overlay on any workload,
+including `kube-state-metrics` where it is safe. The appliance's containerd
+2.3 + kernel 6.12 meet the requirements on paper; that has not been
+exercised in the field, and a pod that will not start is a worse first
+impression than a capability left switched off. Turn it on per workload once
+a node has been through it.
 
 ---
 

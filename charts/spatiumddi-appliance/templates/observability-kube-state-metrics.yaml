@@ -100,6 +100,12 @@ spec:
         app.kubernetes.io/name: kube-state-metrics
         app.kubernetes.io/component: kube-state-metrics
     spec:
+      {{- if not (kindIs "invalid" .Values.observability.kubeStateMetrics.hostUsers) }}
+      # #983 Phase 2 — user namespaces. Safe here where it is not on the
+      # api: kube-state-metrics mounts nothing, is not hostNetwork, and
+      # only reads the kubeapi. Default unset; see values.yaml.
+      hostUsers: {{ .Values.observability.kubeStateMetrics.hostUsers }}
+      {{- end }}
       {{- with .Values.observability.priorityClassName }}
       priorityClassName: {{ . | quote }}
       {{- end }}

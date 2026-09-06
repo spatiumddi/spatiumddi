@@ -9786,7 +9786,8 @@ export type AlertRuleType =
   | "stale_ip_count"
   | "dhcp_pool_exhaustion"
   | "secret_expiring"
-  | "decom_expiring";
+  | "decom_expiring"
+  | "node_pressure";
 export type AlertSeverity = "info" | "warning" | "critical";
 export type AlertServerType = "dns" | "dhcp" | "any";
 // ``compliance_change`` rule type — keep in lock-step with
@@ -12477,7 +12478,44 @@ export interface ClusterNodeVitals {
   memory_available_bytes: number | null;
   fs_used_bytes: number | null;
   fs_capacity_bytes: number | null;
+  // #983 Phase 2 — PSI stall shares. `null` means the kubelet did not report
+  // it (below Kubernetes 1.36), which is NOT "no pressure" — render the two
+  // differently or the panel lies about the quiet case.
+  psi_cpu: ClusterPSIStats | null;
+  psi_memory: ClusterPSIStats | null;
+  psi_io: ClusterPSIStats | null;
   host_disk_partitions: HostPartition[];
+}
+
+/** One /proc/pressure line's rolling averages, as % of wall time. */
+export interface ClusterPSIWindow {
+  avg10: number | null;
+  avg60: number | null;
+  avg300: number | null;
+}
+
+/**
+ * `some` — at least one task stalled waiting for the resource.
+ * `full` — every runnable task was. The kernel reports CPU `full` as 0 at
+ * node level, so a CPU verdict reads `some`.
+ */
+export interface ClusterPSIStats {
+  some: ClusterPSIWindow | null;
+  full: ClusterPSIWindow | null;
+}
+
+/**
+ * Which transport served the kubelet Summary API, per node (#983 Phase 2).
+ *
+ * `all_direct` is the decision the broad `nodes/proxy` grant hangs on, and it
+ * is false when nothing was probed — measuring nothing is not "safe".
+ */
+export interface ClusterKubeletTransport {
+  by_node: Record<string, string>;
+  direct_nodes: number;
+  proxy_nodes: number;
+  all_direct: boolean;
+  blocked_reasons: Record<string, string>;
 }
 
 export interface ClusterPodSummary {
@@ -12515,6 +12553,7 @@ export interface ClusterHealthSnapshot {
   is_ha: boolean;
   control_plane_nodes: number;
   metrics_available: boolean;
+  kubelet_transport: ClusterKubeletTransport | null;
   cpu_usage_cores: number | null;
   cpu_capacity_cores: number | null;
   memory_working_set_bytes: number | null;

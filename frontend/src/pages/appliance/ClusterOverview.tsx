@@ -36,6 +36,7 @@ import {
   applianceSystemApi,
   streamApplianceWorkloadLogs,
   versionApi,
+  type ClusterKubeletTransport,
   type ClusterNodeVitals,
   type ClusterPodSummary,
   type ClusterWorkloadHealth,
@@ -354,6 +355,114 @@ export function StatusChip({ status }: { status: string }) {
 
 // ── node card ────────────────────────────────────────────────────────────────
 
+/**
+ * #983 Phase 2 — the share of the last 5 minutes something spent STALLED on a
+ * resource, which is the reading utilisation cannot give you: a node at 70%
+ * CPU with a run queue and one without look identical by usage, and only the
+ * first drops traffic (#980).
+ *
+ * `null` is rendered as "not reported", never as 0%. A kubelet below 1.36
+ * reports no PSI at all, and a panel that draws that as a quiet green bar is
+ * worse than one that admits it does not know.
+ */
+function PressureRow({ node }: { node: ClusterNodeVitals }) {
+  const rows: { label: string; some: number | null; full: number | null }[] = [
+    {
+      label: "CPU",
+      some: node.psi_cpu?.some?.avg300 ?? null,
+      // Deliberately not shown: the kernel reports CPU `full` as 0 at node
+      // level by definition, so a column for it would always read 0.0%.
+      full: null,
+    },
+    {
+      label: "Mem",
+      some: node.psi_memory?.some?.avg300 ?? null,
+      full: node.psi_memory?.full?.avg300 ?? null,
+    },
+    {
+      label: "I/O",
+      some: node.psi_io?.some?.avg300 ?? null,
+      full: null,
+    },
+  ];
+  const reported = rows.some((r) => r.some !== null || r.full !== null);
+  if (!reported) {
+    return (
+      <div
+        className="mt-2 text-[10px] italic text-muted-foreground"
+        title="Pressure Stall Information is reported by kubelet 1.36 and later. This node reported none, which is not the same as no pressure."
+      >
+        pressure: not reported
+      </div>
+    );
+  }
+  const tone = (v: number | null) =>
+    v === null
+      ? "text-muted-foreground"
+      : v >= 50
+        ? "text-rose-600 dark:text-rose-400"
+        : v >= 20
+          ? "text-amber-600 dark:text-amber-400"
+          : "text-muted-foreground";
+  return (
+    <div
+      className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px]"
+      title="Share of the last 5 minutes spent stalled waiting on the resource (PSI avg300). 'some' = at least one task blocked; 'full' = every runnable task blocked."
+    >
+      <span className="text-muted-foreground">stalled 5m</span>
+      {rows.map((r) => (
+        <span key={r.label} className="font-mono">
+          <span className="text-muted-foreground">{r.label} </span>
+          <span className={tone(r.some)}>
+            {r.some === null ? "—" : `${r.some.toFixed(1)}%`}
+          </span>
+          {r.full !== null && (
+            <span className={tone(r.full)} title="every runnable task blocked">
+              {" "}
+              (full {r.full.toFixed(1)}%)
+            </span>
+          )}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+/**
+ * #983 Phase 2 item 6 — kubelet Summary API transport.
+ *
+ * `direct` reaches the kubelet on :10250 under `nodes/stats`, which
+ * authorizes that one page. `proxy` goes through the apiserver under
+ * `nodes/proxy`, which authorizes read GETs to EVERY kubelet endpoint. The
+ * chip is green only when EVERY node went direct, because that is the
+ * condition for dropping the broad grant — one node on the proxy means the
+ * grant is still load-bearing.
+ */
+function KubeletTransportChip({
+  transport,
+}: {
+  transport: ClusterKubeletTransport | null;
+}) {
+  if (!transport || transport.direct_nodes + transport.proxy_nodes === 0) {
+    return null;
+  }
+  const reasons = Object.entries(transport.blocked_reasons);
+  const title = transport.all_direct
+    ? "Every node served by the direct kubelet transport (nodes/stats). Safe to set api.upgradeOrchestratorRBAC.kubeletProxyFallback=false, which drops the broad nodes/proxy grant."
+    : [
+        `${transport.proxy_nodes} node(s) fell back to the apiserver proxy (nodes/proxy), which authorizes read GETs to every kubelet endpoint.`,
+        ...reasons.map(([node, why]) => `${node}: ${why}`),
+      ].join("\n\n");
+  return (
+    <Chip color={transport.all_direct ? EMERALD : AMBER} title={title}>
+      kubelet:{" "}
+      {transport.all_direct
+        ? "direct"
+        : `${transport.direct_nodes} direct / ${transport.proxy_nodes} proxy`}
+    </Chip>
+  );
+}
+
 function NodeCard({ node }: { node: ClusterNodeVitals }) {
   const cpuPct = pct(node.cpu_usage_cores, node.cpu_capacity_cores);
   const memPct = pct(node.memory_working_set_bytes, node.memory_capacity_bytes);
@@ -498,6 +607,13 @@ function NodeCard({ node }: { node: ClusterNodeVitals }) {
               pressure
             </div>
           )}
+          {/*
+            The badge above is the kubelet's node CONDITION — a binary that
+            flips only once eviction thresholds are already crossed. PSI below
+            is the continuous signal that gets there first, and is what #980
+            had no way to see.
+          */}
+          <PressureRow node={node} />
         </div>
       </div>
     </div>
@@ -1096,6 +1212,14 @@ export function ClusterOverview({
               live usage unavailable
             </Chip>
           )}
+          {/*
+            #983 Phase 2 item 6 — which transport served the kubelet Summary
+            API. This chip is the whole reason the fallback exists: without it
+            an operator has no way to know whether the narrow ``nodes/stats``
+            grant works on their cluster, and the broad ``nodes/proxy`` grant
+            stays forever because nothing ever said it could go.
+          */}
+          <KubeletTransportChip transport={s.kubelet_transport} />
           {self?.state && (
             <Chip
               color={self.state === "approved" ? EMERALD : AMBER}

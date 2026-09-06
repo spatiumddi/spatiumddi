@@ -501,6 +501,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_agent_config_rejected_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("agent_config_rejected_alert_rule_seed_skipped", reason=str(exc))
+    # Node resource-pressure (PSI) alert rule — singleton, ENABLED by default
+    # (issue #983 Phase 2). Cannot fire on a kubelet below 1.36, which reports
+    # no PSI at all, so enabling it everywhere is silent until it is real.
+    try:
+        from app.services.alerts import (  # noqa: PLC0415
+            seed_node_pressure_alert_rule,
+        )
+
+        await seed_node_pressure_alert_rule()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("node_pressure_alert_rule_seed_skipped", reason=str(exc))
     # DNS query-anomaly alert rules — NXDOMAIN-spike + query-rate-spike,
     # singletons, DISABLED by default (issue #371). Discoverable in the
     # Alerts UI; fire only on agent-based BIND9 installs with metric data.

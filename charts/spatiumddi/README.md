@@ -203,6 +203,11 @@ dhcpAgents:
 | `global.priorityClassName` | `""` | PriorityClass for the control-plane workloads. **Leave empty unless the class exists** — the apiserver refuses a pod naming one that does not |
 | `global.servicePriorityClassName` | `""` | Same, for the DNS / DHCP agent StatefulSets |
 | `<component>.priorityClassName` | unset | Per-workload override. Unset inherits the chart-wide key above; `""` means *no class for this workload*, even when the chart-wide key is set |
+| `<component>.hostUsers` | unset | #983 — `false` runs the pod in a user namespace (K8s 1.36+). Refused on `api`/`worker` while `api.applianceHostMounts.enabled` is on |
+| `api.topologySpreadConstraints` / `worker.…` | `[]` | #983 — replaces the default `maxSkew: 1` spread rendered in `soft` anti-affinity mode |
+| `api.upgradeOrchestratorRBAC.kubeletProxyFallback` | `true` | #983 — also grant the broad `nodes/proxy` read as a fallback transport, on both api and worker. Set false once Cluster → Overview's `kubelet:` chip is green (every node direct) |
+| `api.kubeletCA.enabled` / `.hostPath` / `.mountPath` | `false` | #983 — mount the CA that signs kubelet *serving* certs (k3s signs them with its own `server-ca`, not the ServiceAccount CA) and set `SPATIUM_KUBELET_CA_PATH` from it. Needed only if a node reports a CA failure |
+| `worker.serviceAccount.enabled` | `false` | #983 — mount a narrow ServiceAccount (`nodes` read + `nodes/stats`) on the worker. **Required for the `node_pressure` PSI alert**: alert evaluation runs in the worker, not the api |
 
 ### Control plane
 
