@@ -311,5 +311,19 @@ def test_the_version_is_parsed_in_exactly_one_place():
     """do_install reads the same value back out of the rsynced copy to
     label the grub menuentries; two awk blocks could disagree about which
     build this is."""
-    assert CODE.count("APPLIANCE_VERSION=/{") == 1
-    assert CODE.count("_appliance_version_from") == 3  # def + 2 call sites
+    assert CODE.count("APPLIANCE_VERSION=/{") == 1, "one awk parse, not several"
+    assert CODE.count("_appliance_version_from() {") == 1
+    # Nobody reads the release file except through the helper.
+    #
+    # Continuations are joined first: do_install passes the path on the
+    # line AFTER the call, and a per-line scan reports that argument as an
+    # unmediated read of the file.
+    joined = CODE.replace("\\\n", " ")
+    direct = [
+        ln.strip()
+        for ln in joined.splitlines()
+        if "spatiumddi/appliance-release" in ln
+        and "_appliance_version_from" not in ln
+        and "date -r" not in ln  # the mtime fallback, which wants the path itself
+    ]
+    assert not direct, direct

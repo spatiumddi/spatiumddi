@@ -1419,6 +1419,59 @@ trigger: tag push (CalVer)
 >   that sets `k3s` for `role: appliance` gets a `WARN` and the values are
 >   dropped.
 
+> **#995 Phase 3 update — the questions the wizard never asked.** Eight
+> additions, four of them fixes to the network screen:
+>
+> - **Pre-flight check**, before anything is asked: CPU, RAM, firmware
+>   mode, disks with sizes, every NIC with its link state / speed /
+>   current address, the gateway, the resolver, and the clock. The clock
+>   line is the one that earns its place — a date behind the ISO's own
+>   build date means a dead CMOS battery, which later breaks TLS to the
+>   control plane and the supervisor's pairing in ways that read as a
+>   networking fault. Informational, not a gate; the one hard refusal
+>   remains the disk-size floor. **It deliberately does not probe the
+>   internet** — non-negotiable #17 — so an air-gapped install is a
+>   normal case rather than a red line.
+> - **Keyboard layout**, applied immediately with `loadkeys` so the
+>   password screen already uses it, and persisted to both
+>   `/etc/default/keyboard` (console-setup) and `/etc/vconsole.conf`
+>   (systemd-vconsole-setup). On AZERTY or QWERTZ the symbols in a good
+>   password land elsewhere; the installer stored what US produced and
+>   the login later failed with no explanation, twice.
+> - **NTP**, pre-filled from the DHCP lease's option 42 when the site
+>   offered one (read back out of `/run/chrony-dhcp/`, which the live
+>   chrony is already using). Written as a `sources.d` file rather than
+>   an edit to `chrony.conf`, which makes it additive and gives the #154
+>   control-plane plane a clean seam — that runner now deletes it when
+>   central config takes over, so the two cannot silently stack.
+> - **SSH public key** for the admin account: paste, or fetch from a URL
+>   or a bare GitHub username. Validated with `ssh-keygen`, not a regex —
+>   a truncated paste is the common failure and a key sshd will not load
+>   is worse than no key. "Disable password SSH" is offered **only when a
+>   key is present**, and refused outright on the headless path without
+>   one.
+> - **The interface picker is offered in DHCP mode too**, and its rows
+>   say which cable is plugged in (link state, speed, the address the
+>   installer currently holds, the driver) rather than name + MAC.
+>   NetworkManager DHCPs every ethernet port by default, so on a
+>   multi-NIC server the appliance came up answering on whichever replied
+>   first. A pinned port is rendered as its own keyfile with
+>   `autoconnect-priority=100`, which is what beats NM's own
+>   auto-generated profiles.
+> - **Static mode offers the values the box already has** — address,
+>   gateway and resolvers from the live lease — as a starting point.
+> - **Static IPv6** alongside the v4 address, RA / SLAAC still the
+>   default. A link-local gateway is accepted, because a router
+>   advertising a /64 answers on `fe80::…` and an in-subnet check would
+>   refuse the commonest correct answer on every IPv6 network there is.
+> - **The k3s CIDR overlap check now knows the LAN in DHCP mode.** It
+>   only ever knew it for a static install, so the check was dead on the
+>   path most installs take — including for a site whose LAN is
+>   `10.42.0.0/16`, which is the k3s pod default and the exact range the
+>   check exists for. `--check-preseed` deliberately does **not** probe:
+>   the linting workstation's lease says nothing about the appliance's
+>   future LAN.
+
 ### Headless / unattended install — preseed the disk installer (#549)
 
 > **Supersedes the stale Phase-1 framing.** The *old* cloud-init

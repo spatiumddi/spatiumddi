@@ -155,6 +155,22 @@ echo "  ✓ chronyd -p passed"
 # visible anyway), so world-readable is fine.
 install -o root -g root -m 0644 "$TMP_BODY" "$ETC_CONF"
 
+# #995 item 16 — drop the install-time sources file once the control
+# plane is authoritative.
+#
+# spatium-install writes /etc/chrony/sources.d/spatium-install.sources
+# from the wizard's NTP answer, and Debian's chrony.conf carries
+# `sourcedir /etc/chrony/sources.d` — so unless the rendered conf above
+# happens to omit that directive, the install-time servers would keep
+# being polled ALONGSIDE the ones the control plane just set. Two sets of
+# time sources where the operator configured one, with the extra set
+# invisible in the UI that appears to own NTP.
+INSTALL_SOURCES=/etc/chrony/sources.d/spatium-install.sources
+if [ -f "$INSTALL_SOURCES" ]; then
+    rm -f "$INSTALL_SOURCES"
+    echo "  ✓ removed the install-time NTP sources (control plane is authoritative now)"
+fi
+
 # Reload chrony to pick up the new config. ``systemctl reload`` runs
 # chrony's reload handler which re-reads the conf + reconfigures
 # sources + ``allow`` lines without restarting the daemon (no clock

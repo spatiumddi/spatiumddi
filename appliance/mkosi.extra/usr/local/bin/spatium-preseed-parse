@@ -243,6 +243,18 @@ _FIELD_WARNERS = {
 #: pipes the value on stdin instead.
 _STDIN_FIELDS = {"admin_password"}
 
+# Shape rules for the #995 Phase 3 keys. All three values are
+# interpolated into files on the target (a chrony sources line, an
+# XKBLAYOUT= assignment, an authorized_keys line), so the point of these
+# is to keep a newline or a quote out of somewhere it would change the
+# meaning of the file — not to second-guess the real validator, which
+# runs on the live system where the answer is actually knowable.
+_NTP_HOST_RE = re.compile(r"^[A-Za-z0-9._:\[\]-]{1,253}$")
+_KEYMAP_RE = re.compile(r"^[A-Za-z0-9._-]{1,32}$")
+# "<type> <base64> [comment]" — the shape sshd parses. Deliberately not a
+# type allowlist: sshd gains key types faster than this file will.
+_SSH_KEY_RE = re.compile(r"^(sk-)?(ssh|ecdsa)-[A-Za-z0-9@.-]+\s+[A-Za-z0-9+/]{32,}={0,3}(\s|$)")
+
 # ``--check-field <kind> <value>`` — the interactive wizard's entry
 # point. Exit 0 (silent) = usable; exit 2 = rejected, reason on stdout
 # for the caller to put in a whiptail box; exit 3 = the caller asked for
@@ -391,6 +403,7 @@ if ps is None:
         "role", "target_disk", "confirm_wipe", "hostname", "admin_user",
         "admin_password", "admin_password_hash", "timezone", "network",
         "k3s", "control_plane_url", "pairing_code", "set_root_password",
+        "ntp_servers", "keymap", "ssh_authorized_keys", "ssh_disable_password",
     }
     if known & set(doc.keys()):
         ps = doc
@@ -633,6 +646,85 @@ if tz:
         env["TIMEZONE"] = tz
         env["PRESEED_HAS_TIMEZONE"] = "1"
 
+# ── NTP (issue #995 item 16) ──────────────────────────────────────────
+# A string or a list; empty is a legitimate answer (air-gapped site with
+# a trusted RTC) and is recorded as one rather than falling back to the
+# Debian pool the operator declined.
+ntp = ps.get("ntp_servers")
+if ntp is not None:
+    if isinstance(ntp, list):
+        ntp_list = [as_str(x) for x in ntp if as_str(x)]
+    else:
+        ntp_list = as_str(ntp).split()
+    bad_ntp = [x for x in ntp_list if not _NTP_HOST_RE.fullmatch(x)]
+    if bad_ntp:
+        fail(
+            "ntp_servers entries must be hostnames or IP addresses; "
+            f"rejected: {', '.join(repr(x) for x in bad_ntp)}"
+        )
+    else:
+        env["NTP_SERVERS"] = " ".join(ntp_list)
+        env["PRESEED_HAS_NTP"] = "1"
+
+# ── Console keymap (issue #995 item 17) ───────────────────────────────
+# Not validated against the system's keymap list: this parser is
+# host-portable and `--check-preseed` runs on a workstation whose
+# /usr/share/keymaps says nothing about the appliance's. The shape check
+# catches a typo'd path or an injected argument; a name loadkeys cannot
+# load is caught on the live system, where the answer is knowable.
+keymap = as_str(ps.get("keymap"))
+if keymap:
+    if not _KEYMAP_RE.fullmatch(keymap):
+        fail(
+            f"keymap {keymap!r} is not a plausible console keymap name "
+            "(letters, digits, hyphen, underscore, dot; e.g. 'de', 'br-abnt2')"
+        )
+    else:
+        env["KEYMAP"] = keymap
+        env["PRESEED_HAS_KEYMAP"] = "1"
+
+# ── SSH authorized keys (issue #995 item 18) ──────────────────────────
+# Public keys, so not secret — they go in the ordinary env file. A list
+# or a single newline-separated string.
+ssh_keys = ps.get("ssh_authorized_keys")
+if ssh_keys is not None:
+    if isinstance(ssh_keys, list):
+        key_lines = [as_str(x) for x in ssh_keys]
+    else:
+        key_lines = as_str(ssh_keys).splitlines()
+    key_lines = [k.strip() for k in key_lines if k.strip() and not k.strip().startswith("#")]
+    bad_keys = [k for k in key_lines if not _SSH_KEY_RE.match(k)]
+    if bad_keys:
+        # Shape only — the full check is ssh-keygen on the live system,
+        # which this parser cannot assume is installed. A truncated paste
+        # is what this catches, and it is the common failure.
+        fail(
+            "ssh_authorized_keys entries must look like an OpenSSH public "
+            f"key (type, base64 blob, optional comment); rejected: "
+            f"{', '.join(repr(k[:32]) for k in bad_keys)}"
+        )
+    elif key_lines:
+        env["SSH_AUTHORIZED_KEYS"] = "\n".join(key_lines)
+        env["PRESEED_HAS_SSH_KEYS"] = "1"
+
+ssh_nopw = ps.get("ssh_disable_password")
+if ssh_nopw is not None:
+    val = as_bool(ssh_nopw, "ssh_disable_password")
+    if val is None:
+        pass
+    elif val and not env.get("SSH_AUTHORIZED_KEYS"):
+        # Refused, not warned. An unattended install that turns off
+        # password SSH with no key authorised produces a headless box
+        # nobody can reach, and there is no operator at the console to
+        # notice.
+        fail(
+            "ssh_disable_password: true requires at least one "
+            "ssh_authorized_keys entry — otherwise the installed system "
+            "has no way in over SSH at all"
+        )
+    else:
+        env["SSH_DISABLE_PASSWORD"] = "yes" if val else "no"
+
 # ── Network ───────────────────────────────────────────────────────────
 static_subnet = ""  # feeds the k3s LAN-overlap check below
 net = ps.get("network")
@@ -647,6 +739,13 @@ if net is not None:
             fail(f"network.mode {mode!r} must be 'dhcp' or 'static'")
         elif mode == "dhcp":
             env["NET_MODE"] = "dhcp"
+            # #995 item 19 — a DHCP install can pin ONE port. Absent keeps
+            # the old behaviour (NetworkManager DHCPs every ethernet
+            # interface, and the appliance answers on whichever replied
+            # first, which on a multi-NIC server is a coin toss).
+            dhcp_iface = as_str(net.get("interface"))
+            if dhcp_iface:
+                env["NET_INTERFACE"] = dhcp_iface
             env["PRESEED_HAS_NETWORK"] = "1"
         else:  # static
             ip = as_str(net.get("ip"))
@@ -674,9 +773,10 @@ if net is not None:
                     "(the NIC name, e.g. eth0 / enp1s0)"
                 )
                 static_ok = False
-            # Only IPv4 is supported end-to-end — spatium-etc-render
-            # renders an [ipv4] method=manual keyfile, so reject IPv6
-            # rather than emit a config NetworkManager will refuse.
+            # network.ip is the IPv4 address specifically. A static v6
+            # address goes in network.ip6 (#995 item 21), which is
+            # optional and independent — putting a v6 address here would
+            # produce an [ipv4] section NetworkManager refuses.
             if static_ok:
                 try:
                     if ipaddress.ip_address(ip).version != 4:
@@ -698,6 +798,77 @@ if net is not None:
                 except ValueError:
                     fail(f"network.gateway {gateway!r} is not a valid address")
                     static_ok = False
+            # ── Optional static IPv6 (#995 item 21) ───────────────
+            # Same rules the wizard's _validate_static_net applies, with
+            # the two differences that matter for v6: any prefix 1..128 is
+            # legal (SLAAC needs /64, a manual address does not), and the
+            # gateway is very often LINK-LOCAL and outside the prefix,
+            # which is the normal case for a router advertising a /64 —
+            # so only a global gateway is range-checked.
+            ip6 = as_str(net.get("ip6"))
+            if ip6:
+                prefix6 = as_str(
+                    net.get("prefix6") if net.get("prefix6") is not None else ""
+                ) or "64"
+                gateway6 = as_str(net.get("gateway6"))
+                v6_ok = True
+                try:
+                    ip6_obj = ipaddress.IPv6Address(ip6)
+                except ValueError:
+                    fail(f"network.ip6 {ip6!r} is not a valid IPv6 address")
+                    v6_ok = False
+                else:
+                    if ip6_obj.is_link_local:
+                        fail(
+                            f"network.ip6 {ip6!r} is link-local (fe80::/10) — "
+                            "the kernel assigns those itself; give a routable "
+                            "address"
+                        )
+                        v6_ok = False
+                    elif ip6_obj.is_loopback or ip6_obj.is_multicast:
+                        fail(f"network.ip6 {ip6!r} is not a host address")
+                        v6_ok = False
+                try:
+                    if not (0 < int(prefix6) <= 128):
+                        raise ValueError
+                except ValueError:
+                    fail(f"network.prefix6 {prefix6!r} must be an integer 1-128")
+                    v6_ok = False
+                if gateway6:
+                    try:
+                        gw6_obj = ipaddress.IPv6Address(gateway6)
+                    except ValueError:
+                        fail(f"network.gateway6 {gateway6!r} is not a valid IPv6 address")
+                        v6_ok = False
+                    else:
+                        if (
+                            v6_ok
+                            and not gw6_obj.is_link_local
+                            and int(prefix6) < 128
+                            and gw6_obj
+                            not in ipaddress.ip_network(f"{ip6}/{prefix6}", strict=False)
+                        ):
+                            fail(
+                                f"network.gateway6 {gateway6} is not inside the "
+                                f"{ip6}/{prefix6} prefix and is not link-local"
+                            )
+                            v6_ok = False
+                if v6_ok:
+                    env["NET6_MODE"] = "static"
+                    env["NET6_IP"] = ip6
+                    env["NET6_PREFIX"] = prefix6
+                    env["NET6_GATEWAY"] = gateway6
+                else:
+                    static_ok = False
+            elif as_str(net.get("prefix6")) or as_str(net.get("gateway6")):
+                # Half a v6 config is a mistake, not a default: prefix6 /
+                # gateway6 do nothing without an address, and silently
+                # ignoring them is the "written, never read" shape.
+                fail(
+                    "network.prefix6 / network.gateway6 require network.ip6 "
+                    "— without an address they configure nothing"
+                )
+
             if static_ok:
                 env["NET_MODE"] = "static"
                 env["NET_INTERFACE"] = iface

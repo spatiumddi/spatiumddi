@@ -177,7 +177,31 @@ NET_IP=""
 NET_PREFIX="24"
 NET_GATEWAY=""
 NET_DNS="1.1.1.1 1.0.0.1"
+# #995 item 21 — optional static IPv6, alongside (not instead of) v4.
+# `auto` means RA / SLAAC, which is what every install has had until now
+# and stays the default; `static` adds an address the operator gives.
+# _validate_static_net checks these with the same ``ipaddress`` rules it
+# applies to v4, and spatium-etc-render writes them into the same
+# NetworkManager keyfile's [ipv6] section.
+NET6_MODE="auto"
+NET6_IP=""
+NET6_PREFIX="64"
+NET6_GATEWAY=""
 TIMEZONE="UTC"
+# #995 item 16 — a time source, which the wizard never asked for although
+# it asked for a timezone. A wrong clock breaks TLS to the control plane
+# and the supervisor's pairing on first boot, and both fail in ways that
+# read as a networking fault.
+NTP_SERVERS="pool.ntp.org"
+# #995 item 17 — console keymap. The live ISO assumes US, so a password
+# with symbols typed on any other layout is mangled at install and again
+# at the login prompt that then rejects it.
+KEYMAP="us"
+# #995 item 18 — SSH public keys for the admin account, newline-separated.
+SSH_AUTHORIZED_KEYS=""
+# Whether to turn off password SSH once a key is installed. Only offered
+# when at least one key is present, or it locks the operator out.
+SSH_DISABLE_PASSWORD="no"
 # Issue #302 — k3s pod + service CIDRs. Defaults match k3s upstream
 # defaults exactly so operators on a clean LAN don't have to touch
 # them. Customisable in ``ask_k3s_cidrs`` for installs where the LAN
@@ -304,6 +328,448 @@ You'll be asked for:\n\
   - Control-plane URL + 8-digit pairing code (Additional node only)\n\n\
 Press OK to begin, or Cancel to drop to a shell." 21 74 \
         || on_cancel "welcome"
+}
+
+# ── Pre-flight (issue #995 item 15) ───────────────────────────────────
+#
+# Everything the installer can learn about this machine, before it asks
+# the operator anything. Proxmox does this and it earns its place: the
+# facts that decide whether an install is going to work — is there enough
+# RAM, is a cable actually plugged in, did the machine boot the way you
+# think it did, is the clock sane — were previously discovered one at a
+# time, mid-wizard (the disk/RAM gate fires at the picker) or after the
+# reboot.
+#
+# Informational, not a gate. The one hard refusal in the wizard is the
+# disk size floor, which pick_disk owns and which stays there; a screen
+# that refuses on RAM would stop an operator who knows their VM is about
+# to be resized.
+
+# ISO build date as YYYY-MM-DD, or "" when it cannot be derived. Used
+# only for the clock check.
+_iso_build_date() {
+    local v
+    v="$(_appliance_version_from /etc/spatiumddi/appliance-release)"
+    # CalVer: YYYY.MM.DD-N. A dev build (dev-<sha>) carries no date, so
+    # fall back to the release file's own mtime — which mkosi stamps at
+    # build time and nothing on the live ISO rewrites.
+    case "$v" in
+        [0-9][0-9][0-9][0-9].[0-9][0-9].[0-9][0-9]-*)
+            printf '%s' "${v%%-*}" | tr '.' '-'
+            return 0
+            ;;
+    esac
+    date -r /etc/spatiumddi/appliance-release +%Y-%m-%d 2>/dev/null || true
+}
+
+preflight() {
+    log "Step: preflight"
+    if [ "$FULLY_UNATTENDED" = "1" ]; then
+        return 0
+    fi
+    local body="" warn_count=0
+
+    # ── CPU + RAM ────────────────────────────────────────────────────
+    local cpus ram_kb ram_gb
+    cpus=$(nproc 2>/dev/null || grep -c '^processor' /proc/cpuinfo 2>/dev/null || echo "?")
+    ram_kb=$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null || echo 0)
+    ram_gb=$(( ram_kb / 1024 / 1024 ))
+    body+="CPU:       $cpus core(s)\n"
+    if [ "$ram_gb" -gt 0 ] && [ "$ram_gb" -lt "$REC_CP_RAM_GIB" ]; then
+        body+="Memory:    ${ram_gb} GiB  (control plane wants ${REC_CP_RAM_GIB} GiB)\n"
+        warn_count=$((warn_count + 1))
+    else
+        body+="Memory:    ${ram_gb} GiB\n"
+    fi
+
+    # ── Firmware ─────────────────────────────────────────────────────
+    # Absorbed from item 2 — this is where an operator should learn it,
+    # not on the Confirm screen after they have answered everything.
+    if [ "$FIRMWARE_MODE" = "uefi" ]; then
+        body+="Firmware:  UEFI\n"
+    else
+        body+="Firmware:  BIOS / CSM\n"
+    fi
+
+    # ── Disks ────────────────────────────────────────────────────────
+    local disk_count disk_line big_enough=0
+    disk_count=0
+    disk_line=""
+    local d name sz szg
+    while read -r name sz; do
+        [ -n "$name" ] || continue
+        # Zero-size entries are unpopulated kernel placeholders — an
+        # unbound nbd, an empty card reader. Listing eighteen of them
+        # buries the one real disk.
+        [ "${sz:-0}" -gt 0 ] 2>/dev/null || continue
+        disk_count=$((disk_count + 1))
+        szg=$(( sz / 1024 / 1024 / 1024 ))
+        [ "$szg" -ge "$MIN_DISK_GIB" ] && big_enough=$((big_enough + 1))
+        [ -n "$disk_line" ] && disk_line+=", "
+        disk_line+="$name ${szg}G"
+    done < <(lsblk -dnbo NAME,SIZE 2>/dev/null | grep -vE '^(sr|loop|fd|ram|zram|nbd)' || true)
+    if [ "$disk_count" -eq 0 ]; then
+        body+="Disks:     NONE FOUND — the installer has nothing to install to\n"
+        warn_count=$((warn_count + 1))
+    else
+        body+="Disks:     $disk_line\n"
+        if [ "$big_enough" -eq 0 ]; then
+            body+="           none clears the ${MIN_DISK_GIB} GiB minimum\n"
+            warn_count=$((warn_count + 1))
+        fi
+    fi
+
+    # ── NICs ─────────────────────────────────────────────────────────
+    local nic_lines="" nic_up=0 iface
+    while read -r iface; do
+        [ -n "$iface" ] || continue
+        nic_lines+="           $iface  $(_iface_summary "$iface")\n"
+        [ "$(cat "/sys/class/net/$iface/operstate" 2>/dev/null)" = "up" ] && nic_up=$((nic_up + 1))
+    done < <(_net_interfaces)
+    if [ -z "$nic_lines" ]; then
+        body+="Network:   no ethernet interfaces found\n"
+        warn_count=$((warn_count + 1))
+    else
+        body+="Network:\n$nic_lines"
+        if [ "$nic_up" -eq 0 ]; then
+            body+="           no port has a live link — check the cable\n"
+            warn_count=$((warn_count + 1))
+        fi
+    fi
+
+    # ── Gateway + resolver ───────────────────────────────────────────
+    #
+    # Deliberately NOT an internet-reachability probe. SpatiumDDI makes no
+    # outbound connection the operator did not ask for (see the project's
+    # non-negotiable #17 and docs/PRIVACY.md), and an installer that
+    # pings a well-known host to draw a green tick would be exactly that.
+    # The LAN facts below are what actually decide whether the install
+    # works, and an air-gapped install is a supported, normal case rather
+    # than a red line on a screen.
+    local gw resolver
+    gw=$(ip -4 route show default 2>/dev/null | awk '{for (n=1;n<NF;n++) if ($n=="via") print $(n+1)}' | head -1)
+    if [ -n "$gw" ]; then
+        if ping -c1 -W1 "$gw" >/dev/null 2>&1; then
+            body+="Gateway:   $gw (responds)\n"
+        else
+            body+="Gateway:   $gw (no ping reply — may be filtered, not fatal)\n"
+        fi
+    else
+        body+="Gateway:   none configured\n"
+    fi
+    resolver=$(awk '/^nameserver/{print $2; exit}' /etc/resolv.conf 2>/dev/null)
+    body+="Resolver:  ${resolver:-none configured}\n"
+
+    # ── Clock ────────────────────────────────────────────────────────
+    #
+    # A clock behind the ISO's own build date means the RTC is wrong —
+    # usually a dead CMOS battery on reused hardware. It is worth a line
+    # because of what it breaks LATER and silently: TLS to the control
+    # plane fails "certificate not yet valid", and the supervisor's
+    # pairing is rejected, both of which read as a networking fault.
+    local now build
+    now=$(date -u +%Y-%m-%d)
+    build="$(_iso_build_date)"
+    if [ -n "$build" ] && [ "$now" \< "$build" ]; then
+        body+="Clock:     $(date -u '+%Y-%m-%d %H:%M UTC')  ← BEFORE this image was built ($build)\n"
+        body+="           Fix the RTC or TLS and pairing will fail after the reboot.\n"
+        warn_count=$((warn_count + 1))
+    else
+        body+="Clock:     $(date -u '+%Y-%m-%d %H:%M UTC')\n"
+    fi
+
+    local title="Pre-flight check"
+    [ "$warn_count" -gt 0 ] && title="Pre-flight check — $warn_count thing(s) to look at"
+    whiptail --backtitle "$BACKTITLE" --title "$title" \
+        --cancel-button "Back" \
+        --yesno "$body\nContinue?" \
+        "$(_whiptail_height "$body\nContinue?" 76)" 76 \
+        || return 1
+    log "Pre-flight: cpus=$cpus ram=${ram_gb}G disks=$disk_count nics_up=$nic_up warnings=$warn_count"
+}
+
+# ── Keyboard (issue #995 item 17) ─────────────────────────────────────
+#
+# Runs before every screen that takes typed input, and applies the layout
+# IMMEDIATELY with loadkeys, so the hostname and — the one that actually
+# hurts — the password are entered on the layout in front of the
+# operator.
+#
+# The failure it removes: on AZERTY or QWERTZ the symbols in a good
+# password land somewhere else entirely. The installer stores what the US
+# layout produced, the operator later types what they meant, and the
+# login fails with no explanation. Twice, because the installed system's
+# console defaulted the same way.
+#
+# Distinct from #168 (UI language). This is the physical keyboard.
+ask_keyboard() {
+    log "Step: ask_keyboard"
+    if [ -n "${PRESEED_HAS_KEYMAP:-}" ]; then
+        log "Preseed: keymap=$KEYMAP (skipping prompt)"
+        _apply_keymap "$KEYMAP" || \
+            log "WARN: loadkeys $KEYMAP failed on the live system"
+        return 0
+    fi
+    # Ordered by how likely they are rather than alphabetically — a menu
+    # is scanned, not searched — plus an escape hatch for the rest.
+    local pick
+    pick=$(whiptail --backtitle "$BACKTITLE" --title "Keyboard layout" \
+        --cancel-button "Back" \
+        --default-item "$KEYMAP" \
+        --menu "Applied straight away, so the password screen uses it.\n\nGet this wrong and a password with symbols is mangled now AND at every login afterwards." \
+        22 70 12 \
+        "us"       "English (US)" \
+        "uk"       "English (UK)" \
+        "de"       "German (QWERTZ)" \
+        "fr"       "French (AZERTY)" \
+        "es"       "Spanish" \
+        "it"       "Italian" \
+        "pt"       "Portuguese" \
+        "br-abnt2" "Portuguese (Brazil, ABNT2)" \
+        "ca"       "Canadian (multilingual)" \
+        "dk"       "Danish" \
+        "fi"       "Finnish" \
+        "no"       "Norwegian" \
+        "se"       "Swedish" \
+        "nl"       "Dutch" \
+        "pl"       "Polish" \
+        "cz"       "Czech" \
+        "ru"       "Russian" \
+        "jp106"    "Japanese (106)" \
+        "other"    "Something else - type the keymap name" \
+        3>&1 1>&2 2>&3) \
+        || return 1
+    if [ "$pick" = "other" ]; then
+        while true; do
+            pick=$(whiptail --backtitle "$BACKTITLE" --title "Keyboard layout" \
+                --cancel-button "Back" \
+                --inputbox "Console keymap name, as 'loadkeys' takes it (e.g. 'be2', 'hu', 'tr').\n\nFrom a shell: localectl list-keymaps" \
+                13 70 -- "$KEYMAP" 3>&1 1>&2 2>&3) \
+                || return 1
+            # Refuse a name loadkeys cannot load, rather than silently
+            # leaving the operator on US — which is the same bug one
+            # screen later in a different disguise.
+            if [ -n "$pick" ] && _apply_keymap "$pick"; then
+                break
+            fi
+            whiptail --backtitle "$BACKTITLE" --title "Unknown keymap" \
+                --msgbox "'$pick' is not a keymap this system can load.\n\nRun 'localectl list-keymaps' from a shell to see the names." 11 68 || true
+        done
+    else
+        _apply_keymap "$pick" || \
+            log "WARN: loadkeys $pick failed; the console stays on the previous layout"
+    fi
+    KEYMAP="$pick"
+    log "Keymap: $KEYMAP"
+}
+
+# loadkeys the given map. Non-zero when it does not exist, which is what
+# lets the "other" prompt above re-ask instead of accepting a typo.
+#
+# Returns 0 when loadkeys is absent: on a machine without it there is no
+# layout to get wrong, and refusing every name would make the prompt
+# impossible to satisfy.
+_apply_keymap() {
+    command -v loadkeys >/dev/null 2>&1 || return 0
+    loadkeys "$1" >>"$INSTALL_LOG" 2>&1
+}
+
+# ── NTP (issue #995 item 16) ──────────────────────────────────────────
+#
+# The wizard asked for a timezone and never for a time source, so a lab
+# with no route to the default pool came up with a clock nothing
+# corrects. That is not cosmetic: the supervisor's first TLS handshake
+# against the control plane fails "certificate not yet valid" and the
+# pairing is rejected, both of which read as a networking fault.
+ask_ntp() {
+    log "Step: ask_ntp"
+    if [ -n "${PRESEED_HAS_NTP:-}" ]; then
+        log "Preseed: ntp_servers=$NTP_SERVERS (skipping prompt)"
+        return 0
+    fi
+    # Pre-fill from DHCP option 42 when the lease carried one: a site with
+    # its own time servers usually hands them out, and typing them again
+    # is both work and a chance to get one wrong.
+    local dhcp_ntp
+    dhcp_ntp="$(_dhcp_ntp_servers)"
+    if [ -n "$dhcp_ntp" ] && [ "$NTP_SERVERS" = "pool.ntp.org" ]; then
+        NTP_SERVERS="$dhcp_ntp"
+        log "NTP servers pre-filled from the DHCP lease: $NTP_SERVERS"
+    fi
+    local hint=""
+    [ -n "$dhcp_ntp" ] && hint="\n\nDHCP offered: $dhcp_ntp"
+    NTP_SERVERS=$(whiptail --backtitle "$BACKTITLE" --title "Time source" \
+        --cancel-button "Back" \
+        --inputbox "NTP servers, space-separated. Names or addresses.\n\nThis clock is now: $(date -u '+%Y-%m-%d %H:%M UTC')\n\nOn a network with no route to the public pool, put your own server here — a clock nothing corrects breaks TLS and pairing on first boot.$hint" \
+        17 74 -- "$NTP_SERVERS" 3>&1 1>&2 2>&3) \
+        || return 1
+    # Empty is a legitimate answer: an air-gapped site with a hardware
+    # clock it trusts, or one that will push NTP from the control plane
+    # later. Recorded as "none" rather than silently reinstated.
+    if [ -z "$NTP_SERVERS" ]; then
+        log "NTP: no servers configured (operator left it blank)"
+    else
+        log "NTP servers: $NTP_SERVERS"
+    fi
+}
+
+# NTP servers from the live DHCP lease (option 42), space-separated.
+#
+# NetworkManager drops them into /run/chrony-dhcp/*.sources — which is a
+# chrony sourcedir, so the LIVE system is already using them; reading
+# that back is both the least code and the most faithful answer. The
+# lease files under /var/lib/NetworkManager are the fallback for a
+# systemd-networkd or dhclient live environment.
+_dhcp_ntp_servers() {
+    local out="" f srv
+    for f in /run/chrony-dhcp/*.sources; do
+        [ -f "$f" ] || continue
+        while read -r _kw srv _rest; do
+            case "$_kw" in server|pool) [ -n "$srv" ] && out+="$srv " ;; esac
+        done < "$f"
+    done
+    if [ -z "$out" ]; then
+        for f in /var/lib/NetworkManager/*.lease /var/lib/dhcp/*.leases; do
+            [ -f "$f" ] || continue
+            srv=$(sed -n 's/.*option ntp-servers \([^;]*\);.*/\1/p' "$f" | tail -1 | tr -d ',')
+            [ -n "$srv" ] && out+="$srv "
+        done
+    fi
+    # Deduplicate, preserve order.
+    printf '%s' "$out" | tr ' ' '\n' | awk 'NF && !seen[$0]++' | tr '\n' ' ' | sed 's/ $//'
+}
+
+# ── SSH authorized_keys (issue #995 item 18) ──────────────────────────
+#
+# Optional, and skipped by default. The value is that the very first SSH
+# into a fresh appliance can be key-based, on a box whose whole point is
+# that nobody sits at its console.
+#
+# Interaction worth knowing, and stated on the screen: once the control
+# plane manages SSH keys centrally (#157), its list REPLACES this file.
+# A key added here is a bootstrap, not a permanent grant.
+ask_ssh_keys() {
+    log "Step: ask_ssh_keys"
+    if [ -n "${PRESEED_HAS_SSH_KEYS:-}" ]; then
+        log "Preseed: $(printf '%s' "$SSH_AUTHORIZED_KEYS" | grep -c . || echo 0) SSH key(s) supplied (skipping prompt)"
+        return 0
+    fi
+    local choice
+    while true; do
+        choice=$(whiptail --backtitle "$BACKTITLE" --title "SSH public key" \
+            --cancel-button "Back" \
+            --menu "Authorise an SSH key for '$ADMIN_USER'?\n\nOptional — password SSH works either way. Currently held: $(_ssh_key_count) key(s)." \
+            17 74 4 \
+            "skip"   "No key — password SSH only" \
+            "paste"  "Paste a public key" \
+            "url"    "Fetch from a URL (or a GitHub username)" \
+            "done"   "Finished — continue with the keys above" \
+            3>&1 1>&2 2>&3) \
+            || return 1
+        case "$choice" in
+            skip)
+                SSH_AUTHORIZED_KEYS=""
+                SSH_DISABLE_PASSWORD="no"
+                log "SSH: no authorized key"
+                return 0
+                ;;
+            paste)
+                local key
+                key=$(whiptail --backtitle "$BACKTITLE" --title "Paste public key" \
+                    --inputbox "One public key, the whole line:\n\nssh-ed25519 AAAAC3Nza... you@host" \
+                    13 74 3>&1 1>&2 2>&3) || continue
+                _add_ssh_key "$key" || true
+                ;;
+            url)
+                local src fetched
+                src=$(whiptail --backtitle "$BACKTITLE" --title "Fetch public keys" \
+                    --inputbox "A URL serving public keys, or a bare GitHub username.\n\n  alice                  -> https://github.com/alice.keys\n  https://example/id.pub\n\nThis is the only outbound request the installer makes on your behalf, and only because you asked for it." \
+                    16 74 3>&1 1>&2 2>&3) || continue
+                [ -n "$src" ] || continue
+                case "$src" in
+                    http://*|https://*) : ;;
+                    # A bare word is a GitHub username. Anything with a
+                    # slash or a dot is not, and guessing would turn a
+                    # typo'd URL into a request to github.com.
+                    *[!A-Za-z0-9-]*)
+                        whiptail --msgbox "That is neither a URL nor a GitHub username." 8 60 || true
+                        continue
+                        ;;
+                    *) src="https://github.com/$src.keys" ;;
+                esac
+                if ! fetched=$(curl -fsS --max-time 10 "$src" 2>&1); then
+                    whiptail --backtitle "$BACKTITLE" --title "Fetch failed" \
+                        --msgbox "$src"$'\n\n'"$fetched" 12 72 || true
+                    continue
+                fi
+                local added=0 line
+                while IFS= read -r line; do
+                    _add_ssh_key "$line" 2>/dev/null && added=$((added + 1))
+                done <<EOF
+$fetched
+EOF
+                if [ "$added" -eq 0 ]; then
+                    whiptail --msgbox "Nothing at $src looked like a public key." 8 66 || true
+                else
+                    whiptail --msgbox "Added $added key(s) from $src." 8 66 || true
+                fi
+                ;;
+            done)
+                break
+                ;;
+        esac
+    done
+
+    if [ "$(_ssh_key_count)" -gt 0 ]; then
+        # Only ever offered WITH a key present. Offering it without one
+        # would let an operator lock themselves out of a headless box in
+        # two keystrokes.
+        if whiptail --backtitle "$BACKTITLE" --title "Disable password SSH?" \
+            --defaultno --yes-button "Key only" --no-button "Keep passwords" \
+            --yesno "$(_ssh_key_count) key(s) will be authorised for '$ADMIN_USER'.\n\nAlso refuse SSH password logins?\n\nThe console still takes a password, so this is recoverable — but test the key before you rely on it." \
+            15 72; then
+            SSH_DISABLE_PASSWORD="yes"
+        else
+            SSH_DISABLE_PASSWORD="no"
+        fi
+    fi
+    log "SSH: $(_ssh_key_count) authorized key(s), password auth $([ "$SSH_DISABLE_PASSWORD" = yes ] && echo disabled || echo enabled)"
+}
+
+_ssh_key_count() {
+    printf '%s' "$SSH_AUTHORIZED_KEYS" | grep -c '[^[:space:]]' || true
+}
+
+# Append one key after checking it IS one.
+#
+# ssh-keygen is the right validator rather than a regex: it is on the
+# appliance (a hard dependency of openssh-server), it is what sshd itself
+# parses with, and it rejects the truncated paste — the commonest failure
+# — that a regex on the leading "ssh-" would wave through. A key sshd
+# will not load is worse than no key: the operator believes they have
+# access and discovers otherwise after the reboot.
+_add_ssh_key() {
+    local key="$1" tmp
+    key="${key#"${key%%[![:space:]]*}"}"
+    case "$key" in ''|'#'*) return 1 ;; esac
+    if command -v ssh-keygen >/dev/null 2>&1; then
+        tmp=$(mktemp) || return 1
+        printf '%s\n' "$key" > "$tmp"
+        if ! ssh-keygen -l -f "$tmp" >/dev/null 2>&1; then
+            rm -f "$tmp"
+            whiptail --backtitle "$BACKTITLE" --title "Not a public key" \
+                --msgbox "That line is not a public key ssh could load.\n\nA truncated paste is the usual cause — the line must be complete, on ONE line." 12 70 || true
+            return 1
+        fi
+        rm -f "$tmp"
+    fi
+    if [ -n "$SSH_AUTHORIZED_KEYS" ]; then
+        SSH_AUTHORIZED_KEYS="$SSH_AUTHORIZED_KEYS
+$key"
+    else
+        SSH_AUTHORIZED_KEYS="$key"
+    fi
+    return 0
 }
 
 ask_role() {
@@ -978,6 +1444,116 @@ ask_user_password() {
     log "Root password will be $([ "$SET_ROOT_PASSWORD" = yes ] && echo set || echo locked)"
 }
 
+# ── Live network facts (issue #995 items 19, 20, 22) ──────────────────
+#
+# The installer's own host is already on the network the appliance will
+# live on. Three screens used to ignore that and make the operator retype
+# what the box in front of them already knows.
+
+# Ethernet-ish interfaces, one per line.
+#
+# Kept as a WIDENING of the rule this replaced (`ls /sys/class/net |
+# grep -E "^(en|eth)"`), not a narrowing: that rule is what has shipped,
+# and a NIC the picker does not list is a box the operator cannot
+# configure. So the predictable names still match by prefix, plus
+# anything carrying a `device` symlink — which catches a real NIC that
+# udev named something else — minus an explicit list of the virtual
+# devices a re-run from an installed system would otherwise offer.
+#
+# Filtering virtual devices by NAME rather than by the absence of a
+# `device` symlink is deliberate: a bridge or bond master has no such
+# symlink either, and on some virtio configurations neither does a real
+# NIC, so absence is not evidence.
+_net_interfaces() {
+    local i
+    for i in /sys/class/net/*; do
+        [ -e "$i" ] || continue
+        i=$(basename "$i")
+        case "$i" in
+            lo|bonding_masters) continue ;;
+            veth*|docker*|cni*|flannel*|br-*|virbr*|kube*|cali*|tunl*|nodelocaldns*) continue ;;
+        esac
+        case "$i" in
+            en*|eth*) echo "$i" ;;
+            *) [ -e "/sys/class/net/$i/device" ] && echo "$i" ;;
+        esac
+    done
+}
+
+# One human line per interface for the picker: link state, speed, the
+# address the live system currently holds, and the driver.
+#
+# #995 item 19 — the old picker showed name + MAC, which does not answer
+# the only question an operator has in front of a multi-port server:
+# which socket is the cable in. `operstate` answers it; `carrier` is not
+# usable here because reading it on a down interface returns EINVAL.
+_iface_summary() {
+    local i="$1" state speed addr drv out
+    state=$(cat "/sys/class/net/$i/operstate" 2>/dev/null || echo "unknown")
+    speed=$(cat "/sys/class/net/$i/speed" 2>/dev/null || true)
+    addr=$(ip -4 -br addr show dev "$i" 2>/dev/null | awk '{print $3}' | head -1)
+    drv=$(basename "$(readlink -f "/sys/class/net/$i/device/driver" 2>/dev/null || true)" 2>/dev/null || true)
+    case "$state" in
+        up)   out="UP" ;;
+        down) out="DOWN" ;;
+        *)    out="$state" ;;
+    esac
+    # A negative or absent speed means the driver cannot report one,
+    # which is normal for a down link and for some virtio NICs.
+    case "$speed" in
+        ''|-*) : ;;
+        *) out="$out ${speed}Mb" ;;
+    esac
+    [ -n "$addr" ] && out="$out $addr"
+    [ -n "$drv" ] && [ "$drv" != "." ] && out="$out ($drv)"
+    printf '%s' "$out"
+}
+
+# The address / gateway / resolvers the LIVE system is using on $1.
+# Prints three lines: "<ip> <prefix>", "<gateway>", "<dns...>". Empty
+# lines where the answer is unknown. Feeds item 20's "use what I already
+# have" button and item 22's overlap check.
+_iface_live_config() {
+    local i="$1" cidr gw dns
+    cidr=$(ip -4 -br addr show dev "$i" 2>/dev/null | awk '{print $3}' | head -1)
+    printf '%s %s\n' "${cidr%%/*}" "${cidr##*/}"
+    gw=$(ip -4 route show default dev "$i" 2>/dev/null | awk '{for (n=1;n<NF;n++) if ($n=="via") print $(n+1)}' | head -1)
+    printf '%s\n' "$gw"
+    # resolvectl knows per-link servers; /etc/resolv.conf is the fallback
+    # and on a systemd-resolved box points at the stub, which is useless
+    # as a value to install — so filter the stub out.
+    dns=$(resolvectl dns "$i" 2>/dev/null | sed -n 's/^.*: *//p' | head -1)
+    if [ -z "$dns" ]; then
+        dns=$(awk '/^nameserver/ && $2 !~ /^127\./ {printf "%s ", $2}' /etc/resolv.conf 2>/dev/null)
+    fi
+    printf '%s\n' "$dns"
+}
+
+# The LAN subnet to check the k3s CIDRs against when the operator chose
+# DHCP (#995 item 22).
+#
+# _k3s_cidr_error only ever knew the LAN in static mode, so a site whose
+# LAN is 10.42.0.0/16 — the k3s pod default, and the range this whole
+# check exists for — sailed through on the DHCP path, which is the one
+# most installs take. The live system is holding a lease on that LAN
+# right now.
+#
+# Deliberately NOT used by `--check-preseed`: that runs on somebody's
+# workstation, whose lease says nothing about the appliance's future LAN.
+_dhcp_lease_subnet() {
+    [ "$NET_MODE" = "static" ] && return 0
+    local i cidr
+    if [ -n "$NET_INTERFACE" ]; then
+        i="$NET_INTERFACE"
+    else
+        i=$(ip -4 -br addr show scope global 2>/dev/null \
+            | awk '$3!="" {sub(/@.*/, "", $1); print $1; exit}')
+    fi
+    [ -n "$i" ] || return 0
+    cidr=$(ip -4 -br addr show dev "$i" 2>/dev/null | awk '{print $3}' | head -1)
+    [ -n "$cidr" ] && printf '%s' "$cidr"
+}
+
 # #554 — validate the static-IP fields with Python's ``ipaddress`` (same
 # approach as the k3s CIDR step). Without this, a blank gateway wrote
 # ``address1=<ip>/<prefix>,`` (trailing comma) into the NetworkManager
@@ -986,11 +1562,13 @@ ask_user_password() {
 # prefix / IP / gateway failed the same silent way. Prints the problem(s)
 # on stdout + exits 1 on any error.
 _validate_static_net() {
-    python3 - "$NET_IP" "$NET_PREFIX" "$NET_GATEWAY" "$NET_DNS" <<'PY' 2>&1
+    python3 - "$NET_IP" "$NET_PREFIX" "$NET_GATEWAY" "$NET_DNS" \
+             "$NET6_MODE" "$NET6_IP" "$NET6_PREFIX" "$NET6_GATEWAY" <<'PY' 2>&1
 import ipaddress
 import sys
 
 ip_s, prefix_s, gw_s, dns_s = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+v6_mode, v6_ip_s, v6_prefix_s, v6_gw_s = sys.argv[5], sys.argv[6], sys.argv[7], sys.argv[8]
 errs = []
 
 prefix = None
@@ -1037,6 +1615,65 @@ for tok in dns_s.split():
     except ValueError:
         errs.append(f"DNS server {tok!r} is not a valid IP address.")
 
+# ── Static IPv6 (issue #995 item 21) ──────────────────────────────────
+# Optional and independent of v4: `auto` is RA/SLAAC, which is what the
+# appliance has always done and remains the default. Same rules as v4,
+# with the differences that actually matter for v6 rather than a
+# transliteration of the v4 checks:
+#   * /128 is a legitimate single-host assignment, and so is anything
+#     down to /1; SLAAC needs /64 but a manual address does not.
+#   * The gateway is very often a LINK-LOCAL address (fe80::/10) that is
+#     NOT inside the announced prefix — that is the normal case for a
+#     router advertising a /64, so an in-subnet check would refuse the
+#     commonest correct answer. Only a global gateway is range-checked.
+if v6_mode == "static":
+    v6_prefix = None
+    try:
+        v6_prefix = int(v6_prefix_s)
+        if not 0 < v6_prefix <= 128:
+            errs.append(f"IPv6 prefix must be between 1 and 128 (got {v6_prefix_s!r}).")
+            v6_prefix = None
+    except ValueError:
+        errs.append(f"IPv6 prefix must be a whole number (got {v6_prefix_s!r}).")
+
+    v6_ip = None
+    if not v6_ip_s.strip():
+        errs.append("IPv6 address is required when IPv6 is set to static.")
+    else:
+        try:
+            v6_ip = ipaddress.IPv6Address(v6_ip_s.strip())
+        except ValueError:
+            errs.append(f"IPv6 address {v6_ip_s!r} is not a valid IPv6 address.")
+        else:
+            if v6_ip.is_link_local:
+                errs.append(
+                    f"IPv6 address {v6_ip_s.strip()} is link-local (fe80::/10). "
+                    "The kernel assigns those itself; give a routable address."
+                )
+            elif v6_ip.is_loopback or v6_ip.is_multicast:
+                errs.append(f"IPv6 address {v6_ip_s.strip()} is not a host address.")
+
+    v6_gw = None
+    if v6_gw_s.strip():
+        try:
+            v6_gw = ipaddress.IPv6Address(v6_gw_s.strip())
+        except ValueError:
+            errs.append(f"IPv6 gateway {v6_gw_s!r} is not a valid IPv6 address.")
+
+    if (
+        v6_ip is not None
+        and v6_gw is not None
+        and v6_prefix is not None
+        and not v6_gw.is_link_local
+        and v6_prefix < 128
+    ):
+        v6_net = ipaddress.ip_network(f"{v6_ip_s.strip()}/{v6_prefix}", strict=False)
+        if v6_gw not in v6_net:
+            errs.append(
+                f"IPv6 gateway {v6_gw_s.strip()} is not inside {v6_net}, and is "
+                "not link-local — the appliance would not be able to reach it."
+            )
+
 if errs:
     print("\n".join(errs))
     sys.exit(1)
@@ -1067,24 +1704,69 @@ ask_network() {
         3>&1 1>&2 2>&3) \
         || return 1
 
+    # #995 item 19 — the interface picker is offered in BOTH modes now.
+    #
+    # It used to appear only for a static install, on the reasoning that
+    # DHCP needs no choice. That is wrong on a multi-NIC server:
+    # NetworkManager's default is to DHCP EVERY ethernet port, so the
+    # appliance comes up answering on whichever one replied first — a
+    # management LAN, a storage VLAN, an idle port on a different switch.
+    # The operator then finds the box at an address they did not choose,
+    # and the supervisor registers with it.
+    #
+    # And the rows say which socket the cable is in, which is the only
+    # question anyone actually has here. Name + MAC — what the old picker
+    # showed — answers a question nobody asks.
+    local ifs=() iface
+    while read -r iface; do
+        [ -n "$iface" ] || continue
+        ifs+=("$iface" "$(_iface_summary "$iface")")
+    done < <(_net_interfaces)
+    if [ ${#ifs[@]} -eq 0 ]; then
+        whiptail --msgbox "No ethernet interfaces found — falling back to DHCP on whatever appears at boot." 9 66 || true
+        NET_MODE="dhcp"
+        NET_INTERFACE=""
+        return 0
+    fi
+    local pick_hint="Pick the port this appliance should use."
+    if [ "$NET_MODE" = "dhcp" ]; then
+        pick_hint="$pick_hint\n\nUP means the link is live; the address shown is the lease this installer is holding right now.\n\nLeave it on \"any\" to let NetworkManager DHCP every port, which is the old behaviour."
+        ifs=("any" "Any / all ports (NetworkManager decides)" "${ifs[@]}")
+    else
+        pick_hint="$pick_hint\n\nUP means the link is live; the address shown is what this installer currently holds on that port."
+    fi
+    NET_INTERFACE=$(whiptail --backtitle "$BACKTITLE" --title "Network interface" \
+        --cancel-button "Back" \
+        --menu "$pick_hint" 20 74 8 "${ifs[@]}" 3>&1 1>&2 2>&3) \
+        || return 1
+    [ "$NET_INTERFACE" = "any" ] && NET_INTERFACE=""
+
     if [ "$NET_MODE" = "static" ]; then
-        local ifs=()
-        for iface in $(ls /sys/class/net 2>/dev/null | grep -E "^(en|eth)"); do
-            ifs+=("$iface" "$(cat /sys/class/net/$iface/address 2>/dev/null || echo "?")")
-        done
-        if [ ${#ifs[@]} -eq 0 ]; then
-            whiptail --msgbox "No ethernet interfaces found - falling back to DHCP." 8 60 || true
-            NET_MODE="dhcp"
-            return 0
+        # #995 item 20 — offer what the box already knows. The installer's
+        # own host is on the network the appliance will live on, holding
+        # an address, a gateway and resolvers that are almost always the
+        # right answer minus the last octet. Retyping them is where the
+        # #554 class of typo comes from.
+        local live_ip live_prefix live_gw live_dns live_line
+        { read -r live_ip live_prefix; read -r live_gw; read -r live_dns; } \
+            < <(_iface_live_config "$NET_INTERFACE")
+        if [ -n "$live_ip" ]; then
+            live_line="Address:  $live_ip/$live_prefix"$'\n'"Gateway:  ${live_gw:-<none seen>}"$'\n'"DNS:      ${live_dns:-<none seen>}"
+            if whiptail --backtitle "$BACKTITLE" --title "Use the current settings?" \
+                --yes-button "Use these" --no-button "Enter manually" \
+                --yesno "$NET_INTERFACE is currently configured as:"$'\n\n'"$live_line"$'\n\n'"Start from these values?"$'\n'"(You can still edit every field on the next screens.)" \
+                16 70; then
+                NET_IP="$live_ip"
+                NET_PREFIX="$live_prefix"
+                [ -n "$live_gw" ] && NET_GATEWAY="$live_gw"
+                [ -n "$live_dns" ] && NET_DNS="$live_dns"
+                log "Static network pre-filled from the live lease on $NET_INTERFACE"
+            fi
         fi
-        NET_INTERFACE=$(whiptail --backtitle "$BACKTITLE" --title "Static IP -interface" \
-            --cancel-button "Back" \
-            --menu "Pick an interface:" 12 60 5 "${ifs[@]}" 3>&1 1>&2 2>&3) \
-            || return 1
         # #554 — collect + validate in a loop: on a validation error re-show
-        # the four fields (pre-filled with what was entered) instead of
-        # writing an invalid keyfile. Back (Cancel) on any field still exits
-        # the step backward via ``return 1``.
+        # the fields (pre-filled with what was entered) instead of writing
+        # an invalid keyfile. Back (Cancel) on any field still exits the
+        # step backward via ``return 1``.
         while true; do
             NET_IP=$(whiptail --backtitle "$BACKTITLE" --title "Static IP -address" \
                 --cancel-button "Back" \
@@ -1102,6 +1784,31 @@ ask_network() {
                 --cancel-button "Back" \
                 --inputbox "DNS servers (space-separated):" 10 60 -- "$NET_DNS" 3>&1 1>&2 2>&3) \
                 || return 1
+            # #995 item 21 — optional static IPv6 alongside the v4
+            # address. Default stays RA / SLAAC, which is every install to
+            # date; this only adds the ability to pin one. Asked here
+            # rather than as its own wizard step so Back still walks the
+            # network screen as a single unit.
+            if whiptail --backtitle "$BACKTITLE" --title "IPv6" \
+                --defaultno --yes-button "Set a static v6" --no-button "Automatic (SLAAC)" \
+                --yesno "IPv6 is automatic (router advertisements / SLAAC) by default, which is what you want on almost every network.\n\nPin a static IPv6 address as well?" \
+                13 70; then
+                NET6_MODE="static"
+                NET6_IP=$(whiptail --backtitle "$BACKTITLE" --title "Static IPv6 -address" \
+                    --cancel-button "Back" \
+                    --inputbox "IPv6 address (e.g. 2001:db8:1::10):" 10 66 -- "$NET6_IP" 3>&1 1>&2 2>&3) \
+                    || return 1
+                NET6_PREFIX=$(whiptail --backtitle "$BACKTITLE" --title "Static IPv6 -prefix" \
+                    --cancel-button "Back" \
+                    --inputbox "Prefix length (usually 64):" 10 66 -- "$NET6_PREFIX" 3>&1 1>&2 2>&3) \
+                    || return 1
+                NET6_GATEWAY=$(whiptail --backtitle "$BACKTITLE" --title "Static IPv6 -gateway" \
+                    --cancel-button "Back" \
+                    --inputbox "Gateway — blank to keep using router advertisements for the default route.\n\nA link-local gateway (fe80::…) is normal and correct here." 13 66 -- "$NET6_GATEWAY" 3>&1 1>&2 2>&3) \
+                    || return 1
+            else
+                NET6_MODE="auto"
+            fi
             local nerr
             if nerr=$(_validate_static_net); then
                 break
@@ -1246,15 +1953,25 @@ ask_k3s_cidrs() {
 # linter can reuse the EXACT rule the interactive wizard enforces,
 # without the whiptail dialog.
 _k3s_cidr_error() {
-    local pod="$1" svc="$2"
+    local pod="$1" svc="$2" lan_override="${3:-}"
     # Hand off to Python — ``ipaddress`` does parsing, prefix-len
     # checking, and overlap detection in three idiomatic lines. The
     # bash regex alternative would be 30 lines + still wrong on edge
     # cases. We pass the operator's static-IP subnet (if static
     # mode) so we can refuse pod/svc CIDRs that would mask the LAN.
+    #
+    # #995 item 22 — in DHCP mode there was NO known LAN, so the whole
+    # overlap check was dead on the path most installs take. A site whose
+    # LAN is 10.42.0.0/16 — the k3s pod default, and the exact range this
+    # check exists for — sailed straight through. The caller passes the
+    # live lease's subnet as $3 for that case; `--check-preseed` passes
+    # nothing, because the linting workstation's own lease says nothing
+    # about the appliance's future LAN.
     local static_subnet=""
     if [ "$NET_MODE" = "static" ] && [ -n "$NET_IP" ] && [ -n "$NET_PREFIX" ]; then
         static_subnet="$NET_IP/$NET_PREFIX"
+    elif [ -n "$lan_override" ]; then
+        static_subnet="$lan_override"
     fi
     python3 - "$pod" "$svc" "$static_subnet" <<'PY' 2>&1
 import ipaddress
@@ -1316,7 +2033,9 @@ PY
 # it without popping a dialog.
 _validate_k3s_cidrs() {
     local err
-    err=$(_k3s_cidr_error "$1" "$2")
+    # The interactive path knows the live lease; the linter does not, and
+    # must not guess (see _dhcp_lease_subnet).
+    err=$(_k3s_cidr_error "$1" "$2" "$(_dhcp_lease_subnet)")
     if [ -z "$err" ]; then
         return 0
     fi
@@ -1451,6 +2170,16 @@ confirm() {
     s+="Network:     $NET_MODE"
     if [ "$NET_MODE" = "static" ]; then
         s+=" ($NET_INTERFACE: $NET_IP/$NET_PREFIX via $NET_GATEWAY)"
+    elif [ -n "$NET_INTERFACE" ]; then
+        # #995 item 19 — DHCP can be pinned to one port now, and a
+        # confirm screen that hides that is one an operator cannot use to
+        # catch the wrong pick.
+        s+=" (on $NET_INTERFACE)"
+    else
+        s+=" (any port)"
+    fi
+    if [ "$NET6_MODE" = "static" ]; then
+        s+="\nIPv6:        $NET6_IP/$NET6_PREFIX${NET6_GATEWAY:+ via $NET6_GATEWAY}"
     fi
     s+="\nTimezone:    $TIMEZONE\n"
     # #995 item 2 — say which firmware the LIVE ISO booted under, because
@@ -2163,6 +2892,17 @@ network_ip: "$NET_IP"
 network_prefix: "$NET_PREFIX"
 network_gateway: "$NET_GATEWAY"
 network_dns: "$NET_DNS"
+# #995 items 19 + 21 — the chosen port (empty means "any", the old
+# NetworkManager-decides behaviour) and the optional static IPv6.
+network6_mode: "$NET6_MODE"
+network6_ip: "$NET6_IP"
+network6_prefix: "$NET6_PREFIX"
+network6_gateway: "$NET6_GATEWAY"
+# #995 items 16 + 17 — recorded so spatium-state and a support bundle can
+# show what the install chose. Both are already applied on disk; the
+# render service does not act on them.
+ntp_servers: "$NTP_SERVERS"
+keymap: "$KEYMAP"
 # #995 item 12 — recorded, not acted on at boot: the account state is
 # already on disk. Here so spatium-state can show what was chosen, and so
 # a support bundle explains why root has no password.
@@ -2407,6 +3147,88 @@ EOF
             log "Root account locked (no console password); use sudo from $ADMIN_USER"
         else
             log "Root account password set from the admin password (operator opted in)"
+        fi
+
+        # #995 item 17 — persist the console keymap. Two files because
+        # two things read it: /etc/default/keyboard is what console-setup
+        # applies at boot on Debian, and /etc/vconsole.conf is what
+        # systemd-vconsole-setup reads. Writing only one leaves the
+        # operator on US at exactly the login prompt where a mangled
+        # password is least explicable.
+        cat > "$MOUNT/etc/default/keyboard" <<EOF
+# Written by spatium-install (issue #995 item 17).
+XKBMODEL="pc105"
+XKBLAYOUT="$KEYMAP"
+XKBVARIANT=""
+XKBOPTIONS=""
+BACKSPACE="guess"
+EOF
+        chmod 0644 "$MOUNT/etc/default/keyboard"
+        printf 'KEYMAP=%s\n' "$KEYMAP" > "$MOUNT/etc/vconsole.conf"
+        chmod 0644 "$MOUNT/etc/vconsole.conf"
+        log "Keymap persisted: $KEYMAP"
+
+        # #995 item 16 — the operator's time source, as a chrony
+        # sourcedir file rather than an edit to chrony.conf.
+        #
+        # Debian's chrony.conf carries `sourcedir /etc/chrony/sources.d`,
+        # so a file there is additive and survives a package upgrade
+        # rewriting the main config. It is also the seam the #154 control
+        # -plane plane can take over cleanly: that runner replaces
+        # chrony.conf wholesale and deletes this file, so central config
+        # wins without the two silently stacking.
+        mkdir -p "$MOUNT/etc/chrony/sources.d"
+        if [ -n "$NTP_SERVERS" ]; then
+            {
+                echo "# Written by spatium-install (issue #995 item 16)."
+                echo "# Replaced by the control plane if NTP is managed centrally."
+                for _srv in $NTP_SERVERS; do
+                    echo "server $_srv iburst"
+                done
+            } > "$MOUNT/etc/chrony/sources.d/spatium-install.sources"
+            chmod 0644 "$MOUNT/etc/chrony/sources.d/spatium-install.sources"
+            log "NTP sources written: $NTP_SERVERS"
+        else
+            # An empty answer is a real choice (air-gapped, trusted RTC),
+            # so record it as one rather than falling back to the Debian
+            # pool the operator just declined.
+            rm -f "$MOUNT/etc/chrony/sources.d/spatium-install.sources"
+            log "NTP: no operator sources (Debian's default pool still applies from chrony.conf)"
+        fi
+
+        # #995 item 18 — the admin's authorized_keys, written after
+        # useradd so the home directory exists.
+        #
+        # /home is bind-mounted onto /var/home for the rest of the
+        # install, so this lands on the persistent side and the boot-time
+        # .mount unit re-binds it. Ownership by NAME inside the chroot,
+        # not a numeric uid guessed out here.
+        if [ -n "$SSH_AUTHORIZED_KEYS" ]; then
+            mkdir -p "$MOUNT/home/$ADMIN_USER/.ssh"
+            printf '%s\n' "$SSH_AUTHORIZED_KEYS" \
+                > "$MOUNT/home/$ADMIN_USER/.ssh/authorized_keys"
+            chmod 0700 "$MOUNT/home/$ADMIN_USER/.ssh"
+            chmod 0600 "$MOUNT/home/$ADMIN_USER/.ssh/authorized_keys"
+            chroot "$MOUNT" chown -R "$ADMIN_USER:$ADMIN_USER" \
+                "/home/$ADMIN_USER/.ssh" >> "$INSTALL_LOG" 2>&1 || \
+                log "WARN: could not chown the admin .ssh directory"
+            log "SSH: authorized_keys written for $ADMIN_USER"
+        fi
+        if [ "$SSH_DISABLE_PASSWORD" = "yes" ]; then
+            # The same drop-in path the #157 control-plane plane manages,
+            # so central config later REPLACES this rather than fighting
+            # it. sshd reads the last matching directive across
+            # sshd_config.d in lexical order, so a single file is the
+            # whole story here.
+            mkdir -p "$MOUNT/etc/ssh/sshd_config.d"
+            cat > "$MOUNT/etc/ssh/sshd_config.d/spatiumddi.conf" <<EOF
+# Written by spatium-install (issue #995 item 18).
+# Superseded wholesale if the control plane manages SSH (#157).
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+EOF
+            chmod 0644 "$MOUNT/etc/ssh/sshd_config.d/spatiumddi.conf"
+            log "SSH: password authentication disabled (key-only)"
         fi
 
         # Disable cloud-init on the installed system (we configured
@@ -3466,10 +4288,24 @@ main() {
                 if [ "$FULLY_UNATTENDED" != "1" ]; then
                     welcome
                 fi
-                step="ask_role"
+                step="preflight"
+                ;;
+            preflight)
+                # #995 item 15 — everything the installer can learn about
+                # this machine, before it asks anything. Skipped on a
+                # fully-unattended run (returns 0 immediately), so Back
+                # from ask_keyboard has to land on welcome, which only
+                # ever returns 0 and is itself skipped there.
+                if preflight; then step="ask_keyboard"; else step="welcome"; fi
+                ;;
+            ask_keyboard)
+                # #995 item 17 — before every screen that takes typed
+                # input, because the layout is applied immediately and the
+                # password screen is the one that matters.
+                if ask_keyboard; then step="ask_role"; else step="preflight"; fi
                 ;;
             ask_role)
-                if ask_role; then step="pick_disk"; else step="welcome"; fi
+                if ask_role; then step="pick_disk"; else step="ask_keyboard"; fi
                 ;;
             pick_disk)
                 if pick_disk; then step="confirm_partition_layout"; else step="ask_role"; fi
@@ -3481,19 +4317,29 @@ main() {
                 if ask_hostname; then step="ask_user_password"; else step="confirm_partition_layout"; fi
                 ;;
             ask_user_password)
-                if ask_user_password; then step="ask_network"; else step="ask_hostname"; fi
+                if ask_user_password; then step="ask_ssh_keys"; else step="ask_hostname"; fi
+                ;;
+            ask_ssh_keys)
+                # #995 item 18 — beside the password, because the two
+                # together are "how do I get into this box".
+                if ask_ssh_keys; then step="ask_network"; else step="ask_user_password"; fi
                 ;;
             ask_network)
-                if ask_network; then step="ask_timezone"; else step="ask_user_password"; fi
+                if ask_network; then step="ask_timezone"; else step="ask_ssh_keys"; fi
                 ;;
             ask_timezone)
-                if ask_timezone; then step="ask_k3s_cidrs"; else step="ask_network"; fi
+                if ask_timezone; then step="ask_ntp"; else step="ask_network"; fi
+                ;;
+            ask_ntp)
+                # #995 item 16 — next to the timezone, which is the other
+                # half of "what time does this box think it is".
+                if ask_ntp; then step="ask_k3s_cidrs"; else step="ask_timezone"; fi
                 ;;
             ask_k3s_cidrs)
                 # Issue #302 — operator picks (or accepts the defaults
                 # for) the k3s pod + service CIDRs. Forward → the
                 # Additional-node config; back → timezone.
-                if ask_k3s_cidrs; then step="ask_application_config"; else step="ask_timezone"; fi
+                if ask_k3s_cidrs; then step="ask_application_config"; else step="ask_ntp"; fi
                 ;;
             ask_application_config)
                 # Returns 0 immediately when ROLE != appliance — so
@@ -3510,7 +4356,7 @@ main() {
                 if ask_application_config; then
                     step="confirm"
                 elif [ "$ROLE" = "appliance" ]; then
-                    step="ask_timezone"
+                    step="ask_ntp"
                 else
                     step="ask_k3s_cidrs"
                 fi

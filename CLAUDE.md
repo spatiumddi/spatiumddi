@@ -1803,9 +1803,9 @@ suggestion, free-space treemap.
 
 - 🟡 [**Installer wizard review — 30 fixes in five phases**](https://github.com/spatiumddi/spatiumddi/issues/995)
   — umbrella over `spatium-install` (2,723 lines, 19 screens), from a review
-  prompted by a fresh install of the #988 ISO. **Phase 1 (items 1–10, bugs and
-  stale text) shipped**; Phases 2–5 (safety gates, missing screens, RAID +
-  multipath, polish) are still open and the issue stays open with them.
+  prompted by a fresh install of the #988 ISO. **Phases 1–3 shipped**;
+  Phases 4–5 (RAID + multipath, polish) are still open and the issue stays
+  open with them.
   **Three of the ten were silent failures, which is the theme.**
   The **install logs did not survive the reboot** — `INSTALL_LOG`, the bash-xtrace
   `TRACE_LOG` and the launch log all lived on the live ISO's tmpfs and the
@@ -1895,7 +1895,60 @@ suggestion, free-space treemap.
   Welcome lists the two questions it omitted; and the backtitle reads
   `APPLIANCE_VERSION` instead of a hardcoded `0.1.0` — the first thing asked
   when an install misbehaves.
-  No migration, no new endpoint, no MCP change, no new screen.
+  No migration, no new endpoint, no MCP change, no new screen in Phase 1.
+  **Phase 2 (items 11–14) changes what the installer ACCEPTS**, so each
+  refusal boundary is pinned by a test. The OS account had *no* password
+  policy — any non-empty string passed, and it became root's password too.
+  Eight characters and not-the-username / not-the-hostname REFUSE;
+  everything past that advises, because a prompt that refuses a
+  merely-weak password is one an operator routes around with something
+  worse they can retype. Validated over **stdin**, never argv. **Root is
+  locked by default** now (`passwd -l`, opt-in `--defaultno` checkbox) — a
+  behaviour change, but sshd refused root either way and `sudo -i` / `su -`
+  / single-user mode all still work, so it removes a console login rather
+  than a recovery path. **The control-plane URL is probed before the disk
+  is wiped**: `GET /api/v1/version`, because the operator's question is not
+  "does something listen there" but "is that MY control plane", and a typo
+  landing on another host's web server answers a ping perfectly well;
+  Retry / Edit / Continue-anyway, the last one logged. The **pairing code
+  is deliberately not probed** — it can only be validated by claiming it,
+  and an unauthenticated "is this code valid" endpoint would be an oracle
+  for guessing eight digits. And **an Additional node no longer pins k3s
+  CIDRs**: k3s compares them against the datastore when a server joins, a
+  mismatch is fatal, and `spatium-cluster-join` never removes the drop-in
+  — so that screen offered a choice whose only possible effect was to make
+  the node's later *promotion* impossible.
+  **Phase 3 (items 15–22) adds the questions the wizard never asked.** A
+  **pre-flight screen** (CPU / RAM / firmware / disks / per-NIC link state
+  / gateway / resolver / clock) that deliberately does **not** probe the
+  internet — non-negotiable #17, and an air-gapped install is a normal
+  case, not a red line; its clock check catches the dead CMOS battery that
+  later breaks TLS and pairing in ways that read as a networking fault.
+  **Keyboard layout** applied with `loadkeys` before the password screen
+  and persisted to both readers, because on AZERTY the symbols in a good
+  password land elsewhere and the login fails later with no explanation.
+  **NTP**, pre-filled from the DHCP lease's option 42 and written as a
+  chrony `sources.d` file — with the #154 runner now deleting it when
+  central config takes over, or the two would silently stack. **SSH keys**
+  validated with `ssh-keygen` rather than a regex (a truncated paste is the
+  common failure, and a key sshd will not load is worse than no key), with
+  password-SSH-off offered only when a key is present and refused outright
+  headlessly without one.
+  **Four network fixes.** The **interface picker is offered in DHCP mode
+  too** and its rows say which cable is plugged in — NetworkManager DHCPs
+  every port by default, so a multi-NIC server came up answering on
+  whichever replied first; a pinned port needs `autoconnect-priority=100`
+  to beat NM's own auto profiles. **Static mode offers the live lease's
+  values** as a starting point. **Static IPv6**, where a **link-local
+  gateway is accepted** — a router advertising a /64 answers on `fe80::…`,
+  so transliterating the v4 in-subnet check would refuse the commonest
+  correct answer on every IPv6 network there is. And the **k3s overlap
+  check now knows the LAN in DHCP mode**: it only ever knew it for a static
+  install, so the check was dead on the path most installs take, including
+  for a site whose LAN is `10.42.0.0/16` — the k3s pod default, and the
+  exact range it exists for. `--check-preseed` still does not probe,
+  because the linting workstation's lease says nothing about the
+  appliance's future LAN.
   **78 new appliance tests**, and the ones that matter most execute rather than
   grep: the device-mapper closure runs against stubbed `lsblk`/`dmsetup` with a
   second disk present as the negative control, because the failure mode of

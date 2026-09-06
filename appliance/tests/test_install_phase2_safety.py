@@ -226,7 +226,9 @@ def test_back_navigation_skips_whichever_screen_is_inert():
     i = CODE.index("            ask_application_config)")
     window = CODE[i:i + 900]
     assert 'elif [ "$ROLE" = "appliance" ]; then' in window
-    assert 'step="ask_timezone"' in window
+    # Whatever precedes ask_k3s_cidrs in the chain — Phase 3 inserted
+    # ask_ntp between it and ask_timezone.
+    assert 'step="ask_ntp"' in window or 'step="ask_timezone"' in window
 
 
 # ── A class, not an item ──────────────────────────────────────────────
