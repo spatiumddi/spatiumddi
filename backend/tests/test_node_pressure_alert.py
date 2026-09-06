@@ -309,3 +309,15 @@ async def test_evaluate_all_still_resolves_when_the_pressure_really_clears(
     await alerts.evaluate_all(db_session)
     await db_session.refresh(event)
     assert event.resolved_at is not None
+
+
+@pytest.mark.asyncio
+async def test_a_zero_threshold_is_honoured_not_silently_defaulted(monkeypatch, _appliance) -> None:
+    """``or 50`` would rewrite an operator's 0 to 50 — the form allows it and
+    the column is numeric, so the UI would say 0 and the rule would use 50.
+    Every other rule in alerts.py reads its threshold with ``is not None``;
+    this one was the outlier."""
+    snap = _snap(psi_cpu=_psi(some=0.0))
+    assert len(await _match(monkeypatch, snap, _rule(threshold=0))) == 1
+    # ...and unset still falls back to the documented default.
+    assert await _match(monkeypatch, _snap(psi_cpu=_psi(some=30.0)), _rule(threshold=None)) == []

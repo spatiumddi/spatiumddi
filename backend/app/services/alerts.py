@@ -2912,7 +2912,12 @@ async def _matching_node_pressure_subjects(
         # resolve every open event and re-open it a minute later.
         raise AlertDataUnavailable(f"cluster health unavailable: {snap.get('detail')}")
 
-    threshold = float(rule.threshold_percent or 50)
+    # ``is not None``, not ``or`` — the column is numeric and the form allows
+    # 0, which ``or`` would silently rewrite to 50. Every other rule in this
+    # file reads its threshold the same way. Note that 0 does mean what it
+    # says: ``some >= 0`` matches every node that reports PSI at all, which is
+    # a legitimate (if loud) way to ask "tell me about any stalling".
+    threshold = float(rule.threshold_percent if rule.threshold_percent is not None else 50)
     matches: list[tuple[str, str, str, str | None]] = []
     for node in snap.get("nodes") or []:
         name = node.get("name")

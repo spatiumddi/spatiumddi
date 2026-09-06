@@ -827,16 +827,16 @@ export function AlertsPage() {
                             : r.rule_type === "node_pressure"
                               ? `≥ ${r.threshold_percent ?? 50}% stalled · full ≥ 1%`
                               : r.rule_type === "server_unreachable"
-                              ? `type=${r.server_type ?? "any"}`
-                              : r.rule_type === "domain_expiring" ||
-                                  r.rule_type === "circuit_term_expiring" ||
-                                  r.rule_type === "service_term_expiring" ||
-                                  r.rule_type === "secret_expiring" ||
-                                  r.rule_type === "decom_expiring"
-                                ? `≤ ${r.threshold_days ?? 30} d`
-                                : r.rule_type === "compliance_change"
-                                  ? `${r.classification ?? "?"} · ${r.change_scope ?? "any_change"}`
-                                  : "—"}
+                                ? `type=${r.server_type ?? "any"}`
+                                : r.rule_type === "domain_expiring" ||
+                                    r.rule_type === "circuit_term_expiring" ||
+                                    r.rule_type === "service_term_expiring" ||
+                                    r.rule_type === "secret_expiring" ||
+                                    r.rule_type === "decom_expiring"
+                                  ? `≤ ${r.threshold_days ?? 30} d`
+                                  : r.rule_type === "compliance_change"
+                                    ? `${r.classification ?? "?"} · ${r.change_scope ?? "any_change"}`
+                                    : "—"}
                     </td>
                     <td className="px-4 py-2">
                       <SeverityBadge severity={r.severity} />
