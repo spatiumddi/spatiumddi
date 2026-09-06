@@ -150,10 +150,98 @@ def validate_timezone(tz: str) -> str:
     return ""
 
 
+# #995 item 11 — the OS account had no password policy at all: any
+# non-empty string passed, and (before item 12) it became root's password
+# too. The web UI has had one since #70; the account that owns the
+# console and sudo had none.
+#
+# The floor is deliberately low and the judgement deliberately split.
+# Eight characters, and not the username or the hostname, are REFUSALS:
+# each is a password guessed without trying, and each is a mistake rather
+# than a choice. Everything past that is a WARNING the operator can
+# accept, because this is a console prompt on a box being installed by
+# the person who owns it, and an installer that refuses to proceed is one
+# an operator works around with a weaker password they can retype — or
+# abandons for the night with the disk half-wiped.
+_MIN_PASSWORD_LEN = 8
+
+# Not a dictionary — a dictionary belongs in the web UI's policy, which
+# has a database and a login rate limiter behind it. This is the handful
+# that appear in every breach corpus, spelled the way people type them at
+# a console.
+_COMMON_PASSWORDS = {
+    "password", "password1", "passw0rd", "p@ssw0rd", "12345678",
+    "123456789", "1234567890", "qwertyui", "qwerty123", "letmein1",
+    "iloveyou", "admin123", "root1234", "welcome1", "changeme",
+    "spatium1", "abcd1234", "1qaz2wsx", "zaq12wsx", "trustno1",
+}
+
+
+def validate_admin_password(pw: str, username: str = "", hostname: str = "") -> str:
+    """Return "" when the password is allowed, else why it is refused."""
+    if not pw:
+        return "admin_password is empty"
+    if len(pw) < _MIN_PASSWORD_LEN:
+        return (
+            f"admin_password is {len(pw)} characters — the minimum is "
+            f"{_MIN_PASSWORD_LEN}. This password owns sudo on the appliance "
+            "console."
+        )
+    low = pw.lower()
+    if username and low == username.lower():
+        return "admin_password is the same as the username."
+    if hostname and low == hostname.lower():
+        return "admin_password is the same as the hostname."
+    return ""
+
+
+def warn_admin_password(pw: str) -> str:
+    """Return "" when nothing is worth saying, else an advisory.
+
+    Never a refusal — see the note on _MIN_PASSWORD_LEN. The caller shows
+    this and lets the operator decide.
+    """
+    if not pw:
+        return ""
+    if pw.lower() in _COMMON_PASSWORDS:
+        return (
+            "That password appears in every published breach list. Anyone "
+            "who reaches the console will guess it."
+        )
+    if len(set(pw)) < 5:
+        return (
+            f"That password uses only {len(set(pw))} distinct characters. "
+            "Length does not help much when the alphabet is that small."
+        )
+    classes = sum(
+        1 for test in (str.islower, str.isupper, str.isdigit)
+        if any(test(c) for c in pw)
+    )
+    if not pw.isalnum():
+        classes += 1
+    if classes < 2 and len(pw) < 16:
+        return (
+            "That password is a single character class (all lowercase, all "
+            "digits, …). One more class, or more length, is worth more than "
+            "either alone."
+        )
+    return ""
+
+
 _FIELD_VALIDATORS = {
     "admin_user": validate_admin_user,
     "timezone": validate_timezone,
+    "admin_password": validate_admin_password,
 }
+#: Fields whose ACCEPT path can still carry advice, keyed the same way so
+#: a caller cannot ask for a warning on a field that has none.
+_FIELD_WARNERS = {
+    "admin_password": warn_admin_password,
+}
+#: Fields whose value must never travel in argv — argv is readable
+#: through /proc and lands in shell history. The caller passes ``-`` and
+#: pipes the value on stdin instead.
+_STDIN_FIELDS = {"admin_password"}
 
 # ``--check-field <kind> <value>`` — the interactive wizard's entry
 # point. Exit 0 (silent) = usable; exit 2 = rejected, reason on stdout
@@ -161,15 +249,16 @@ _FIELD_VALIDATORS = {
 # a field this script does not know how to check, which is a bug in the
 # caller rather than a verdict about the value.
 if len(sys.argv) >= 2 and sys.argv[1] == "--check-field":
-    if len(sys.argv) != 4:
+    # 4 args minimum; extras are context the validator takes (admin_password
+    # wants the username + hostname so it can refuse a password equal to
+    # either).
+    if len(sys.argv) < 4:
         sys.stderr.write(
-            "usage: spatium-preseed-parse --check-field <field> <value>\n"
+            "usage: spatium-preseed-parse --check-field <field> <value|-> "
+            "[context...]\n"
         )
         sys.exit(3)
-    # .strip() so the two doors agree: the preseed path normalises through
-    # as_str() before validating, and without this " netops " would be
-    # accepted headlessly and rejected interactively.
-    _kind, _value = sys.argv[2], sys.argv[3].strip()
+    _kind, _value = sys.argv[2], sys.argv[3]
     _validator = _FIELD_VALIDATORS.get(_kind)
     if _validator is None:
         sys.stderr.write(
@@ -177,10 +266,32 @@ if len(sys.argv) >= 2 and sys.argv[1] == "--check-field":
             f"(known: {', '.join(sorted(_FIELD_VALIDATORS))})\n"
         )
         sys.exit(3)
-    _reason = _validator(_value)
+    # ``-`` means "the value is on stdin", which is how a password reaches
+    # here without passing through argv. One trailing newline is stripped
+    # (a here-string adds one); nothing else is touched, because a leading
+    # or trailing space is legitimate content in a password.
+    if _value == "-":
+        _value = sys.stdin.read()
+        if _value.endswith("\n"):
+            _value = _value[:-1]
+    elif _kind not in _STDIN_FIELDS:
+        # .strip() so the two doors agree: the preseed path normalises
+        # through as_str() before validating, and without this " netops "
+        # would be accepted headlessly and rejected interactively. NOT
+        # applied to a password, where whitespace is content.
+        _value = _value.strip()
+    _reason = _validator(_value, *sys.argv[4:])
     if _reason:
         sys.stdout.write(_reason + "\n")
         sys.exit(2)
+    # Exit 0 with text on stdout means "allowed, but here is the caveat".
+    # The wizard shows it and lets the operator decide; the preseed path
+    # files it as a NOTE.
+    _warner = _FIELD_WARNERS.get(_kind)
+    if _warner is not None:
+        _advice = _warner(_value)
+        if _advice:
+            sys.stdout.write(_advice + "\n")
     sys.exit(0)
 
 
@@ -279,7 +390,7 @@ if ps is None:
     known = {
         "role", "target_disk", "confirm_wipe", "hostname", "admin_user",
         "admin_password", "admin_password_hash", "timezone", "network",
-        "k3s", "control_plane_url", "pairing_code",
+        "k3s", "control_plane_url", "pairing_code", "set_root_password",
     }
     if known & set(doc.keys()):
         ps = doc
@@ -477,8 +588,37 @@ elif pw_hash:
         secret["ADMIN_PASSWORD_HASH"] = pw_hash
         env["PRESEED_HAS_PASSWORD"] = "1"
 elif pw:
-    secret["ADMIN_PASSWORD"] = pw
-    env["PRESEED_HAS_PASSWORD"] = "1"
+    # #995 item 11 — the same floor the wizard applies. A hash cannot be
+    # checked (that is the point of a hash), so admin_password_hash above
+    # is exempt and the operator owns the strength of what they hashed.
+    pw_reason = validate_admin_password(
+        pw, admin_user or "admin", as_str(ps.get("hostname"))
+    )
+    if pw_reason:
+        fail(pw_reason)
+    else:
+        pw_advice = warn_admin_password(pw)
+        if pw_advice:
+            # A NOTE, not a failure: an unattended fleet install must not
+            # halt on a judgement call, but --check-preseed shows it and
+            # the install log records it.
+            note(f"admin_password: {pw_advice}")
+        secret["ADMIN_PASSWORD"] = pw
+        env["PRESEED_HAS_PASSWORD"] = "1"
+
+# ── Root account (issue #995 item 12) ─────────────────────────────────
+# Default FALSE, which changes the previous behaviour: root used to get
+# the admin password unconditionally. sshd refuses root either way
+# (mkosi.postinst), so this only ever affected the physical / IPMI
+# console, and a locked root with sudo in front of it is both safer and
+# Debian's own default. An answer file that wants the old behaviour says
+# so explicitly.
+set_root_pw = ps.get("set_root_password")
+if set_root_pw is not None:
+    val = as_bool(set_root_pw, "set_root_password")
+    if val is not None:
+        env["SET_ROOT_PASSWORD"] = "yes" if val else "no"
+        env["PRESEED_HAS_SET_ROOT_PASSWORD"] = "1"
 
 # ── Timezone ──────────────────────────────────────────────────────────
 # #995 item 3 — was a bare ``os.path.exists`` on the interpolated name,
@@ -570,6 +710,23 @@ if net is not None:
 
 # ── k3s pod + service CIDRs (mirrors _validate_k3s_cidrs) ─────────────
 k3s = ps.get("k3s")
+if k3s is not None and role == "appliance":
+    # #995 item 14 — an Additional node must not pin CIDRs: k3s compares
+    # cluster-cidr / service-cidr / cluster-dns against the datastore when
+    # it joins, a mismatch is fatal, and spatium-cluster-join does not
+    # remove the drop-in. Pinning them here would produce a node that
+    # pairs, is approved, serves DNS and DHCP — and can never be promoted.
+    #
+    # A NOTE rather than a hard error, so an answer file shared between
+    # both roles still installs; the values are dropped either way, and
+    # --check-preseed says so rather than letting the operator believe
+    # they took effect.
+    note(
+        "k3s pod_cidr / service_cidr are ignored for role=appliance — an "
+        "Additional node inherits the cluster's CIDRs when it is promoted, "
+        "and pinning different ones here would make that promotion fail"
+    )
+    k3s = None
 if k3s is not None:
     if not isinstance(k3s, dict):
         fail("k3s must be a mapping (pod_cidr / service_cidr)")

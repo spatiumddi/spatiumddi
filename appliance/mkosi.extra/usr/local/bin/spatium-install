@@ -167,6 +167,10 @@ ADMIN_PASSWORD=""
 # When set, do_install feeds it through `chpasswd -e` instead of the
 # plaintext ADMIN_PASSWORD. Mutually exclusive with ADMIN_PASSWORD.
 ADMIN_PASSWORD_HASH=""
+# #995 item 12 — whether root gets the admin password as well. Default no:
+# root is locked (`passwd -l`) and the operator uses sudo. This CHANGES
+# the previous behaviour, where root always got it.
+SET_ROOT_PASSWORD="no"
 NET_MODE="dhcp"
 NET_INTERFACE=""
 NET_IP=""
@@ -368,6 +372,52 @@ ask_role() {
     log "Selected role: $ROLE"
 }
 
+# #995 item 13 — is that URL a SpatiumDDI control plane, and can this box
+# reach it? Asked while the live system still has its network and the
+# target disk is still intact.
+#
+# ``GET <url>/api/v1/version`` is the right probe: unauthenticated (#903
+# made it the version handshake), cheap, and it answers the question the
+# operator actually has, which is not "does something listen there" but
+# "is that MY control plane". A typo landing on some other host's web
+# server fails the JSON check rather than passing a reachability ping.
+#
+# The pairing code deliberately is NOT probed. It can only be validated
+# by claiming it, and an unauthenticated "is this code valid" endpoint
+# would be an oracle for guessing eight digits. A reachable control plane
+# is the check worth having.
+#
+# Echoes a one-line verdict; returns 0 reachable, 1 not.
+_probe_control_plane() {
+    local url="$1" body rc
+    # Tolerate a trailing slash either way.
+    url="${url%/}"
+    body=$(curl -fsS --max-time 5 \
+        -H 'Accept: application/json' \
+        "$url/api/v1/version" 2>&1)
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        # curl's own message is more useful than any paraphrase: it
+        # distinguishes DNS failure from refused from TLS from timeout,
+        # which is exactly what the operator needs to fix it.
+        printf '%s' "${body:-curl exited $rc}"
+        return 1
+    fi
+    case "$body" in
+        *'"version"'*) : ;;
+        *)
+            printf '%s' "Reachable, but the reply is not a SpatiumDDI version document. Is this the right host?"
+            return 1
+            ;;
+    esac
+    # Pull the value out without a JSON parser — python3 is available but
+    # this runs on every keystroke-completed prompt and the shape is ours.
+    local ver
+    ver=$(printf '%s' "$body" | sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+    printf 'SpatiumDDI %s' "${ver:-(version not reported)}"
+    return 0
+}
+
 ask_application_config() {
     # Only fires for the Appliance role. The control-plane role IS a
     # control plane — it doesn't need to be told where one is.
@@ -383,6 +433,9 @@ ask_application_config() {
     else
         local default_url="${CONTROL_PLANE_URL:-https://}"
         while true; do
+            # Re-prefill whatever was last typed, so Retry / Edit do not
+            # make the operator start over.
+            [ -n "$CONTROL_PLANE_URL" ] && default_url="$CONTROL_PLANE_URL"
             CONTROL_PLANE_URL=$(whiptail --backtitle "$BACKTITLE" \
                 --title "Control plane URL" \
                 --cancel-button "Back" \
@@ -393,7 +446,40 @@ ask_application_config() {
                 whiptail --msgbox "Control-plane URL is required for an Additional node." 8 62 || true
                 continue
             fi
-            break
+            # #995 item 13 — probe before the disk is touched. A typo here
+            # is otherwise discovered on the first boot of the installed
+            # system, when the supervisor cannot register and the only
+            # symptom is an appliance that never appears in Fleet.
+            local probe
+            if probe=$(_probe_control_plane "$CONTROL_PLANE_URL"); then
+                whiptail --backtitle "$BACKTITLE" --title "Control plane reachable" \
+                    --msgbox "$CONTROL_PLANE_URL"$'\n\n'"Answered: $probe" 11 72 || true
+                break
+            fi
+            # Continue-anyway is a real option, not politeness: the
+            # control plane may legitimately not be up yet (staging both
+            # ends at once), and this box may be on an install VLAN that
+            # cannot see it. Refusing would make the installer unusable
+            # for those, so the choice is the operator's — but they make
+            # it having seen curl's actual error.
+            local choice
+            choice=$(whiptail --backtitle "$BACKTITLE" \
+                --title "Control plane NOT reachable" \
+                --cancel-button "Back" \
+                --menu "$CONTROL_PLANE_URL"$'\n\n'"$probe"$'\n\nNothing has been written to disk yet.' \
+                18 74 3 \
+                "retry"    "Try again (the control plane may still be starting)" \
+                "edit"     "Edit the URL" \
+                "continue" "Continue anyway — I know it is not up yet" \
+                3>&1 1>&2 2>&3) || return 1
+            case "$choice" in
+                retry)    continue ;;
+                edit)     default_url="$CONTROL_PLANE_URL"; continue ;;
+                continue)
+                    log "Operator continued past an unreachable control plane: $CONTROL_PLANE_URL ($probe)"
+                    break
+                    ;;
+            esac
         done
     fi
 
@@ -729,19 +815,52 @@ _preseed_parser_path() {
 # preserves onto the installed system — and do_install's useradd is
 # fatal, so a bad username still fails with a named reason rather than
 # leaving a box nobody can log into.
+#
+# Three outcomes, and the caller must be able to tell them apart:
+#   rc 0, no output — fine.
+#   rc 0, output    — allowed, but here is the caveat. Only
+#                     admin_password produces this today (#995 item 11):
+#                     a floor that REFUSES weak-ish passwords is one an
+#                     operator routes around with something worse they
+#                     can retype, so past the hard floor it advises.
+#   rc 1, output    — refused, and this is why.
 _check_field() {
     local kind="$1" value="$2" parser out rc
+    shift 2
     if ! parser=$(_preseed_parser_path); then
         log "WARN: spatium-preseed-parse not found — accepting $kind unvalidated"
         return 0
     fi
-    out=$(python3 "$parser" --check-field "$kind" "$value" 2>&1)
+    out=$(python3 "$parser" --check-field "$kind" "$value" "$@" 2>&1)
     rc=$?
     case "$rc" in
-        0) return 0 ;;
+        0) printf '%s' "$out"; return 0 ;;
         2) printf '%s' "$out"; return 1 ;;
         *)
             log "WARN: --check-field $kind failed to run (rc=$rc): $out — accepting unvalidated"
+            return 0
+            ;;
+    esac
+}
+
+# As above, but the value goes in on STDIN instead of argv (the parser
+# takes ``-`` for this). argv is readable through /proc and lands in
+# shell history, so a password must not travel that way — the same
+# reasoning as the `set +x` around the prompt itself.
+_check_field_stdin() {
+    local kind="$1" value="$2" parser out rc
+    shift 2
+    if ! parser=$(_preseed_parser_path); then
+        log "WARN: spatium-preseed-parse not found — accepting $kind unvalidated"
+        return 0
+    fi
+    out=$(printf '%s' "$value" | python3 "$parser" --check-field "$kind" - "$@" 2>&1)
+    rc=$?
+    case "$rc" in
+        0) printf '%s' "$out"; return 0 ;;
+        2) printf '%s' "$out"; return 1 ;;
+        *)
+            log "WARN: --check-field $kind failed to run (rc=$rc) — accepting unvalidated"
             return 0
             ;;
     esac
@@ -802,25 +921,61 @@ ask_user_password() {
     # 1`s restore it first).
     { set +x; } 2>/dev/null
     while true; do
-        local p1 p2
+        local p1 p2 pwerr
         p1=$(whiptail --backtitle "$BACKTITLE" --title "Admin password" \
             --cancel-button "Back" \
-            --passwordbox "Password for '$ADMIN_USER' (and root):" 10 60 \
+            --passwordbox "Password for '$ADMIN_USER'.\n\nAt least 8 characters. This is the console + sudo password." 12 64 \
             3>&1 1>&2 2>&3) \
             || { set -x; return 1; }
         p2=$(whiptail --backtitle "$BACKTITLE" --title "Confirm password" \
             --cancel-button "Back" \
             --passwordbox "Repeat:" 10 60 3>&1 1>&2 2>&3) \
             || { set -x; return 1; }
-        if [ "$p1" = "$p2" ] && [ -n "$p1" ]; then
-            ADMIN_PASSWORD="$p1"
-            break
+        if [ "$p1" != "$p2" ]; then
+            whiptail --backtitle "$BACKTITLE" \
+                --msgbox "Passwords don't match. Try again." 8 50 || true
+            continue
         fi
-        whiptail --backtitle "$BACKTITLE" \
-            --msgbox "Passwords don't match or are empty. Try again." 8 50 \
-            || true
+        # #995 item 11 — the same rules the preseed path applies, over
+        # stdin so the password never reaches argv. A refusal re-prompts;
+        # an advisory is shown once and the operator decides.
+        if ! pwerr=$(_check_field_stdin admin_password "$p1" "$ADMIN_USER" "$HOSTNAME"); then
+            whiptail --backtitle "$BACKTITLE" --title "Password not accepted" \
+                --msgbox "$pwerr" 12 66 || true
+            continue
+        fi
+        if [ -n "$pwerr" ]; then
+            if ! whiptail --backtitle "$BACKTITLE" --title "Weak password" \
+                --defaultno --yes-button "Use it anyway" --no-button "Change it" \
+                --yesno "$pwerr"$'\n\n'"Use this password anyway?" 13 66; then
+                continue
+            fi
+        fi
+        ADMIN_PASSWORD="$p1"
+        break
     done
     set -x
+
+    # #995 item 12 — root used to get the same password unconditionally.
+    # sshd already refuses root (mkosi.postinst sets PermitRootLogin no),
+    # so this only ever mattered on the console and over IPMI — but a
+    # locked root with sudo in front of it is the safer default, and it
+    # is the Debian default too. Opt-in, --defaultno, so a blind Enter
+    # leaves it locked.
+    #
+    # Skipped when the password came from a preseed: the answer file has
+    # its own ``set_root_password`` key and there is nobody to ask.
+    if [ -z "${PRESEED_HAS_SET_ROOT_PASSWORD:-}" ]; then
+        if whiptail --backtitle "$BACKTITLE" --title "Root account" \
+            --defaultno --yes-button "Set it too" --no-button "Leave locked" \
+            --yesno "Also set the SAME password on the root account?\n\nDefault is NO: root stays locked and you use 'sudo' from '$ADMIN_USER'. SSH already refuses root either way, so this only affects the physical / IPMI console.\n\nSay yes only if you specifically want a root console login." \
+            15 72; then
+            SET_ROOT_PASSWORD="yes"
+        else
+            SET_ROOT_PASSWORD="no"
+        fi
+    fi
+    log "Root password will be $([ "$SET_ROOT_PASSWORD" = yes ] && echo set || echo locked)"
 }
 
 # #554 — validate the static-IP fields with Python's ``ipaddress`` (same
@@ -1005,6 +1160,26 @@ ask_timezone() {
 # regex CIDR validation is awful and we want overlap detection
 # (between pod / service / operator's static-IP subnet) for free.
 ask_k3s_cidrs() {
+    # #995 item 14 — never asked for an Additional node, and no drop-in is
+    # written for one either.
+    #
+    # k3s refuses to join a cluster whose critical config differs:
+    # cluster-cidr, service-cidr and cluster-dns are compared against the
+    # datastore at join time and a mismatch is fatal. spatium-cluster-join
+    # does not touch /etc/rancher/k3s/config.yaml.d/spatium-cidrs.yaml, so
+    # an Additional node installed with non-default CIDRs could pair,
+    # could be approved, could run DNS and DHCP — and could never be
+    # PROMOTED into the control plane it was paired with. The screen
+    # offered a choice whose only possible effect was to break something
+    # later.
+    #
+    # A standalone appliance's own k3s runs fine on the upstream defaults
+    # (nothing on it is reachable from the LAN by pod IP), and on promotion
+    # it inherits the seed's values. So the values are not merely unasked,
+    # they are not written: see the drop-in block in do_install.
+    if [ "$ROLE" = "appliance" ]; then
+        return 0
+    fi
     log "Step: ask_k3s_cidrs"
     if [ -n "${PRESEED_HAS_K3S:-}" ]; then
         if [ -n "${PRESEED_HAS_NETWORK:-}" ]; then
@@ -1290,7 +1465,9 @@ confirm() {
     fi
     # Only show the k3s CIDR row when the operator overrode either
     # default — keeps the confirm screen short for the common case.
-    if [ "$K3S_POD_CIDR" != "10.42.0.0/16" ] || [ "$K3S_SERVICE_CIDR" != "10.43.0.0/16" ]; then
+    # ...and never for an Additional node, which pins none (#995 item 14).
+    if [ "$ROLE" != "appliance" ] && { [ "$K3S_POD_CIDR" != "10.42.0.0/16" ] || \
+         [ "$K3S_SERVICE_CIDR" != "10.43.0.0/16" ]; }; then
         s+="K3s pod CIDR: $K3S_POD_CIDR\n"
         s+="K3s svc CIDR: $K3S_SERVICE_CIDR\n"
     fi
@@ -1986,6 +2163,10 @@ network_ip: "$NET_IP"
 network_prefix: "$NET_PREFIX"
 network_gateway: "$NET_GATEWAY"
 network_dns: "$NET_DNS"
+# #995 item 12 — recorded, not acted on at boot: the account state is
+# already on disk. Here so spatium-state can show what was chosen, and so
+# a support bundle explains why root has no password.
+root_password_set: "$SET_ROOT_PASSWORD"
 EOF
         chmod 0644 "$STATE_MNT/spatium-config.yaml"
 
@@ -2110,7 +2291,18 @@ EOF
         # k3s + kube-dns convention. The coredns Deployment binds to
         # this IP at startup; changing it post-install requires a
         # coredns restart and is documented as "reinstall" today.
+        #
+        # #995 item 14 — EXCEPT for an Additional node, which must not
+        # pin CIDRs at all: a drop-in that disagrees with the cluster it
+        # later joins makes `k3s server --server` refuse to start, and
+        # nothing removes the file at join time. Its own single-node k3s
+        # runs on the upstream defaults until then.
         local cluster_dns_ip
+        if [ "$ROLE" = "appliance" ]; then
+            rm -f "$MOUNT/etc/rancher/k3s/config.yaml.d/spatium-cidrs.yaml" \
+                >> "$INSTALL_LOG" 2>&1 || true
+            log "k3s CIDRs: not pinned (Additional node inherits them on promotion)"
+        else
         cluster_dns_ip=$(_cluster_dns_ip_from_svc_cidr "$K3S_SERVICE_CIDR")
         cat > "$MOUNT/etc/rancher/k3s/config.yaml.d/spatium-cidrs.yaml" <<EOF
 # Auto-generated by spatium-install (issue #302) — operator-chosen
@@ -2128,6 +2320,7 @@ cluster-dns: $cluster_dns_ip
 EOF
         chmod 0644 "$MOUNT/etc/rancher/k3s/config.yaml.d/spatium-cidrs.yaml"
         log "k3s CIDRs: pod=$K3S_POD_CIDR svc=$K3S_SERVICE_CIDR dns=$cluster_dns_ip"
+        fi
 
         cat > "$MOUNT/etc/hosts" <<EOF
 127.0.0.1 localhost
@@ -2189,15 +2382,32 @@ EOF
         if [ -n "$ADMIN_PASSWORD_HASH" ]; then
             echo "$ADMIN_USER:$ADMIN_PASSWORD_HASH" | chroot "$MOUNT" chpasswd -e \
                 >> "$INSTALL_LOG" 2>&1
-            echo "root:$ADMIN_PASSWORD_HASH" | chroot "$MOUNT" chpasswd -e \
-                >> "$INSTALL_LOG" 2>&1
+            if [ "$SET_ROOT_PASSWORD" = "yes" ]; then
+                echo "root:$ADMIN_PASSWORD_HASH" | chroot "$MOUNT" chpasswd -e \
+                    >> "$INSTALL_LOG" 2>&1
+            fi
         else
             echo "$ADMIN_USER:$ADMIN_PASSWORD" | chroot "$MOUNT" chpasswd \
                 >> "$INSTALL_LOG" 2>&1
-            echo "root:$ADMIN_PASSWORD" | chroot "$MOUNT" chpasswd \
-                >> "$INSTALL_LOG" 2>&1
+            if [ "$SET_ROOT_PASSWORD" = "yes" ]; then
+                echo "root:$ADMIN_PASSWORD" | chroot "$MOUNT" chpasswd \
+                    >> "$INSTALL_LOG" 2>&1
+            fi
         fi
         set -x
+        # #995 item 12 — root is LOCKED unless the operator asked for it.
+        # `passwd -l` prefixes the hash with '!', which refuses password
+        # auth without disabling the account: `sudo -i`, `su -` from a
+        # sudoer, and single-user mode all still work, so this removes a
+        # console login rather than a recovery path. Debian's own default
+        # for a fresh install with a sudo user.
+        if [ "$SET_ROOT_PASSWORD" != "yes" ]; then
+            chroot "$MOUNT" passwd -l root >> "$INSTALL_LOG" 2>&1 || \
+                log "WARN: could not lock the root account"
+            log "Root account locked (no console password); use sudo from $ADMIN_USER"
+        else
+            log "Root account password set from the admin password (operator opted in)"
+        fi
 
         # Disable cloud-init on the installed system (we configured
         # everything ourselves; cloud-init would just sit waiting for a
@@ -3290,7 +3500,20 @@ main() {
                 # forward navigation moves straight to confirm and
                 # backward navigation from confirm walks through here
                 # without showing any whiptail screen.
-                if ask_application_config; then step="confirm"; else step="ask_k3s_cidrs"; fi
+                #
+                # #995 item 14 made ask_k3s_cidrs the mirror image: a
+                # no-op for the appliance role. Routing Back through a
+                # screen that returns 0 without drawing anything bounces
+                # forward again immediately — the #554 infinite loop — so
+                # Back has to skip whichever of the two is inert for this
+                # role. For an Additional node that is the CIDR screen.
+                if ask_application_config; then
+                    step="confirm"
+                elif [ "$ROLE" = "appliance" ]; then
+                    step="ask_timezone"
+                else
+                    step="ask_k3s_cidrs"
+                fi
                 ;;
             confirm)
                 # Fully-unattended preseed skips the final confirm —

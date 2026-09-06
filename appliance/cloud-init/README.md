@@ -56,10 +56,11 @@ Summary:
 | `target_disk` | Prefer `/dev/disk/by-id/…` or `by-path/…` (stable). Absent / unresolvable ⇒ interactive picker |
 | `hostname` | RFC 1123 (alnum + hyphen, ≤ 63) |
 | `admin_user` | default `admin`. Must match `[a-z_][a-z0-9_-]*$?`, ≤ 32 chars, and not be an existing system account (`root`, `www-data`, …) |
-| `admin_password` **or** `admin_password_hash` | plaintext, or a crypt(3) hash from `openssl passwd -6` |
-| `timezone` | IANA name, default `UTC` |
+| `admin_password` **or** `admin_password_hash` | plaintext, or a crypt(3) hash from `openssl passwd -6`. Plaintext is checked against the same floor the wizard applies (≥ 8 chars, not the username or hostname); a weak-but-allowed one becomes a `WARN` from `--check-preseed`. A hash cannot be checked — that is the point of a hash — so its strength is yours to own |
+| `set_root_password` | default **`false`** — root is locked (`passwd -l`) and you use `sudo`. Set `true` for the pre-#995 behaviour, where root got the same password. sshd refuses root either way, so this only affects the physical / IPMI console |
+| `timezone` | IANA name, default `UTC`. Must be a real compiled zone file — a traversal, a directory (`America`) and a non-zone file (`leapseconds`) are all refused |
 | `network.mode` | `dhcp`, or `static` with `interface` + `ip` + `prefix` + `gateway` all required (IPv4 only; optional `dns`) |
-| `k3s.pod_cidr` / `k3s.service_cidr` | default `10.42.0.0/16` / `10.43.0.0/16`; validated ≤ /22, disjoint, no LAN overlap |
+| `k3s.pod_cidr` / `k3s.service_cidr` | default `10.42.0.0/16` / `10.43.0.0/16`; validated ≤ /22, disjoint, no LAN overlap. **Ignored for `role: appliance`** (with a `WARN`): k3s compares these against the datastore when a node joins, a mismatch is fatal, and nothing removes the drop-in — so pinning them on an Additional node makes its later promotion impossible |
 | `control_plane_url` | **required for `role: appliance`** — the control plane URL (VIP for HA) |
 | `pairing_code` | **required for `role: appliance`** — 8-digit code from Appliance → Pairing |
 

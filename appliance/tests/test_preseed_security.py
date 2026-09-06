@@ -500,13 +500,46 @@ def test_pairing_code_prompt_restores_xtrace_on_every_exit():
     assert "\n    set -x\n" in tail, tail[-400:]
 
 
+def _xtrace_state_at_end(fn: str) -> bool:
+    """Is xtrace ON when this function returns normally?
+
+    Walks the same way _xtrace_is_off_at does, ignoring the `set -x` that
+    is part of an early `{ set -x; return 1; }` — those restore on the way
+    out and say nothing about the fall-through path.
+    """
+    off = False
+    for line in fn.splitlines():
+        code = line.split("#", 1)[0]
+        if "set +x" in code:
+            off = True
+        elif "set -x" in code:
+            after = code.split("set -x", 1)[1]
+            if "return" not in after and "exit" not in after:
+                off = False
+    return not off
+
+
 def test_password_prompt_restores_xtrace_on_every_exit():
     """A leaked `set +x` would silently blind the trace log for the rest
-    of the install, which is the diagnostic the whole file exists for."""
+    of the install, which is the diagnostic the whole file exists for.
+
+    Anchored on the STATE at the end rather than on the last line being
+    literally `set -x`: #995 item 12 appended a root-password prompt after
+    the password loop, and the line-anchored version reported that as a
+    failure while the property it cares about still held.
+    """
     fn = extract_fn("ask_user_password")
-    # Both early returns inside the loop, plus the fall-through at the end.
+    # Both early returns inside the loop restore before returning.
     assert fn.count("{ set -x; return 1; }") == 2, fn
-    assert fn.rstrip().endswith("set -x\n}"), fn[-120:]
+    assert _xtrace_state_at_end(fn), fn[-400:]
+
+
+def test_the_root_password_prompt_is_not_inside_the_blind_region():
+    """It carries no secret, and leaving it under `set +x` would mean the
+    trace log stops just before the most consequential branch in the
+    function."""
+    fn = extract_fn("ask_user_password")
+    assert not _xtrace_is_off_at(fn, "SET_ROOT_PASSWORD=\"yes\"")
 
 
 def test_chpasswd_still_runs_with_xtrace_off():

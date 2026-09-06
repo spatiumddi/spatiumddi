@@ -1375,6 +1375,50 @@ trigger: tag push (CalVer)
 >   questions it was omitting; and the backtitle shows the real
 >   `APPLIANCE_VERSION` instead of a hardcoded `0.1.0`.
 
+> **#995 Phase 2 update — safety.** Four changes to what the installer
+> *accepts*, each of which can refuse an install that used to succeed:
+>
+> - **The OS account has a password policy.** There was none: any
+>   non-empty string passed, and it became root's password too. The floor
+>   is 8 characters and not-the-username / not-the-hostname, and it
+>   **refuses**. Everything past that — a breach-list password, four
+>   distinct characters, a single character class — is an **advisory** the
+>   operator can accept, because a prompt that refuses a merely-weak
+>   password is one an operator routes around with something worse they
+>   can retype. Shared with the preseed path, where the advisory becomes a
+>   `--check-preseed` `WARN`. The password is validated over **stdin**,
+>   never argv.
+> - **Root is locked by default.** `passwd -l root`, with an opt-in
+>   checkbox (`--defaultno`) and a `set_root_password` preseed key. This
+>   **changes existing behaviour**: root used to get the admin password
+>   unconditionally. sshd refuses root either way (`mkosi.postinst`), so
+>   it only ever affected the physical / IPMI console — and `sudo -i`,
+>   `su -` from a sudoer and single-user mode all still work, so this
+>   removes a console login rather than a recovery path.
+> - **The control-plane URL is probed before the disk is wiped.**
+>   `GET <url>/api/v1/version` with a 5 s timeout, while the live system
+>   still has its network and the target is still intact. Success shows
+>   the reported version, so a typo pointing at the *wrong* control plane
+>   is visible; failure shows curl's own error (which distinguishes DNS
+>   from refused from TLS from timeout) and offers **Retry / Edit /
+>   Continue anyway**. Continue-anyway is a real option — the control
+>   plane may legitimately not be up yet — and taking it is logged. The
+>   pairing code is deliberately **not** probed: it can only be validated
+>   by claiming it, and an unauthenticated "is this code valid" endpoint
+>   would be an oracle for guessing eight digits.
+> - **An Additional node no longer pins k3s CIDRs.** The screen is skipped
+>   for that role and **no drop-in is written**. k3s compares
+>   `cluster-cidr` / `service-cidr` / `cluster-dns` against the datastore
+>   when a server joins and a mismatch is fatal, while
+>   `spatium-cluster-join` never removes
+>   `/etc/rancher/k3s/config.yaml.d/spatium-cidrs.yaml` — so an Additional
+>   node installed with non-default CIDRs could pair, be approved, serve
+>   DNS and DHCP, and **never be promoted** into the control plane it was
+>   paired with. Its own single-node k3s runs fine on the upstream
+>   defaults, and it inherits the seed's values on promotion. A preseed
+>   that sets `k3s` for `role: appliance` gets a `WARN` and the values are
+>   dropped.
+
 ### Headless / unattended install — preseed the disk installer (#549)
 
 > **Supersedes the stale Phase-1 framing.** The *old* cloud-init
