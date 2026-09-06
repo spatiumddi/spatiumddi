@@ -127,7 +127,10 @@ network the way Debian hosts do:
 
 | Connection | Default | Change it under |
 |---|---|---|
-| `pool.ntp.org` — time sync | on (cloud-init's default pool) | Appliance → Fleet → Services → NTP; point it at an internal server or a unicast peer |
+| `pool.ntp.org` — time sync | on | The disk installer's **Time source** screen (or the `ntp_servers` preseed key) sets it at install; Appliance → Fleet → Services → NTP changes it afterwards. Point it at an internal server or a unicast peer. Leaving it blank at install does **not** mean no time source: the platform default `pool.ntp.org` becomes the initial value, and the control plane renders it into a `chrony.conf` it owns (before that first push, Debian's own `pool` directive applies). What actually stops the host reaching a public pool is clearing the server list under Appliance → Fleet → Services → NTP, which renders a config with no sources ([#1002](https://github.com/spatiumddi/spatiumddi/issues/1002)) |
+| `github.com` — SSH public keys, **only if you ask** | off | The disk installer's **SSH public key** screen: typing a bare username there fetches `https://github.com/<user>.keys`. Typing a URL fetches that URL instead, and picking "Paste" or "No key" fetches nothing. One `GET`, no request body, nothing about the install is sent |
+| The control-plane URL you type — an `/api/v1/version` probe | off (Additional-node installs only) | The disk installer probes the URL you entered before it wipes the disk, so a typo is caught while it is still correctable. One `GET` to **your own** control plane |
+| Your default gateway — one ICMP echo | on (pre-flight screen) | The installer's pre-flight check pings the LAN gateway to show whether it answers. LAN-local; there is deliberately no internet-reachability probe |
 | Debian APT mirrors (`deb.debian.org`, `security.debian.org`) | host default | Appliance → Fleet → Services → APT sources — managed repositories, an internal mirror, or a proxy |
 | `ghcr.io` — container image pulls at slot upgrade | only during an upgrade | Not needed at all if you upgrade from an uploaded slot image; the ISO already carries every image it runs |
 
@@ -224,9 +227,13 @@ fetch. Two guards keep this one honest:
   here; anything default-on needs an issue and a decision, not a PR.
 
 The guard covers Python source under `backend/app`. Two things it
-cannot see, and which therefore need a human: hosts assembled at
+cannot see, and which therefore need a human: hostname literals in the
+appliance's **shell** scripts under
+`appliance/mkosi.extra/usr/local/bin/` — the guard reads Python only, so
+§3.4.1's rows were written by hand and the next `curl` added to the
+installer will pass CI with nothing to catch it; hosts assembled at
 runtime from operator input (which is the point — those are *your*
-endpoints), and the feed catalogues in `backend/app/data/`, whose
+endpoints); and the feed catalogues in `backend/app/data/`, whose
 entries are all opt-in downloads covered by the blocklist row above.
 
 If you find a connection this page does not describe, that is a bug —
@@ -238,7 +245,7 @@ The guard in §8 matches text, so these appear in `backend/app` and are
 listed here to keep the check honest. **None of them is contacted.**
 
 **Documentation and homepage links** (shown in the UI or written in a
-comment, never fetched): `github.com`, `www.spatiumddi.com` (the ACME
+comment, never fetched): `www.spatiumddi.com` (the ACME
 client's User-Agent string, as RFC 8555 asks for), `fingerbank.org`,
 `aistudio.google.com` (the "get an API key" link in an error message),
 `bacnet.org`, `kea.readthedocs.io`, `schema.org` (a JSON-LD `@context`

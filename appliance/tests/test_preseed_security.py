@@ -414,6 +414,45 @@ def test_absent_admin_user_is_not_an_error(tmp_path):
 
 # ── Secrets must not reach the trace log ──────────────────────────────
 
+def _xtrace_is_off_at(fn: str, needle: str) -> bool:
+    """Is xtrace off at every line of ``fn`` containing ``needle``?
+
+    Walks the function tracking the last `set +x` / `set -x` seen, rather
+    than slicing at the first loop keyword. The slice version anchored on
+    "everything before the first ``while true; do``", which silently
+    stopped testing anything the day #995 item 4 put a username-validation
+    loop ahead of the password loop: the property still held, the test no
+    longer looked at the right half of the function, and it reported that
+    as a failure. Track the state and the assertion survives the next
+    refactor too.
+
+    ``|| { set -x; return 1; }`` does NOT count as re-enabling for the
+    lines that follow it: it restores tracing on the way OUT of the
+    function, and the next statement is only reached when it did not run.
+    Counting it flags the second --passwordbox in a two-prompt loop, which
+    is a false positive — and was the first thing this helper got wrong.
+    """
+    off = False
+    seen = False
+    for line in fn.splitlines():
+        # Match the needle against CODE, not the raw line: the prose above
+        # ask_application_config's prompt says "Pairing code" too, and it
+        # sits before the `set +x` it is describing.
+        code = line.split("#", 1)[0]
+        if needle in code:
+            seen = True
+            if not off:
+                return False
+        if "set +x" in code:
+            off = True
+        elif "set -x" in code:
+            after = code.split("set -x", 1)[1]
+            if "return" not in after and "exit" not in after:
+                off = False
+    assert seen, f"{needle!r} not found — the anchor moved, fix the test"
+    return True
+
+
 def test_interactive_password_prompt_disables_xtrace():
     """`on_failure` tails 30 lines of the trace log to the console on any
     non-zero exit. The preseed path already suppressed xtrace around the
@@ -422,20 +461,85 @@ def test_interactive_password_prompt_disables_xtrace():
     operator's plaintext password into that log.
     """
     fn = extract_fn("ask_user_password")
-    body = fn.split("while true; do", 1)[0]
-    assert "set +x" in body, (
-        "ask_user_password must disable xtrace BEFORE the password prompt "
-        "loop, or the plaintext lands in the trace log on_failure prints"
+    assert _xtrace_is_off_at(fn, "--passwordbox"), (
+        "every --passwordbox in ask_user_password must run with xtrace "
+        "off, or the plaintext lands in the trace log on_failure prints"
     )
+
+
+def test_pairing_code_prompt_disables_xtrace():
+    """Same hole, same file, missed by #581 (issue #995 item 1).
+
+    The pairing code is typed into an inputbox and then assigned — both
+    argv — so `set -x` wrote it to the trace log that on_failure tails to
+    the console, and that #995 item 1 now copies onto the installed
+    system. A single-use code is spent on first boot; a PERSISTENT
+    multi-claim code is a standing fleet-join credential.
+    """
+    fn = extract_fn("ask_application_config")
+    assert _xtrace_is_off_at(fn, "BOOTSTRAP_PAIRING_CODE=\"$code_val\""), (
+        "the pairing-code assignment must run with xtrace off"
+    )
+    assert _xtrace_is_off_at(fn, "Pairing code"), (
+        "the pairing-code prompt must run with xtrace off"
+    )
+
+
+def test_pairing_code_prompt_restores_xtrace_on_every_exit():
+    """A leaked `set +x` blinds the trace log for the rest of the install,
+    which is the diagnostic the whole file exists for."""
+    fn = extract_fn("ask_application_config")
+    marker = "{ set +x; } 2>/dev/null"
+    # Named, not indexed: without this the pre-fix script raises
+    # IndexError instead of saying what is missing, and a harness whose
+    # failure mode is a stack trace is a harness nobody reads.
+    assert marker in fn, "ask_application_config never disables xtrace"
+    tail = fn.split(marker, 1)[1]
+    # One Back path out of the prompt, plus the fall-through at the end.
+    assert tail.count("{ set -x; return 1; }") == 1, tail
+    assert "\n    set -x\n" in tail, tail[-400:]
+
+
+def _xtrace_state_at_end(fn: str) -> bool:
+    """Is xtrace ON when this function returns normally?
+
+    Walks the same way _xtrace_is_off_at does, ignoring the `set -x` that
+    is part of an early `{ set -x; return 1; }` — those restore on the way
+    out and say nothing about the fall-through path.
+    """
+    off = False
+    for line in fn.splitlines():
+        code = line.split("#", 1)[0]
+        if "set +x" in code:
+            off = True
+        elif "set -x" in code:
+            after = code.split("set -x", 1)[1]
+            if "return" not in after and "exit" not in after:
+                off = False
+    return not off
 
 
 def test_password_prompt_restores_xtrace_on_every_exit():
     """A leaked `set +x` would silently blind the trace log for the rest
-    of the install, which is the diagnostic the whole file exists for."""
+    of the install, which is the diagnostic the whole file exists for.
+
+    Anchored on the STATE at the end rather than on the last line being
+    literally `set -x`: #995 item 12 appended a root-password prompt after
+    the password loop, and the line-anchored version reported that as a
+    failure while the property it cares about still held.
+    """
     fn = extract_fn("ask_user_password")
-    # Both early returns inside the loop, plus the fall-through at the end.
+    # Both early returns inside the loop restore before returning.
     assert fn.count("{ set -x; return 1; }") == 2, fn
-    assert fn.rstrip().endswith("set -x\n}"), fn[-120:]
+    assert _xtrace_state_at_end(fn), fn[-400:]
+
+
+def test_the_root_password_prompt_is_not_inside_the_blind_region():
+    """It carries no secret, and leaving it under `set +x` would mean the
+    trace log stops just before the most consequential branch in the
+    function."""
+    fn = extract_fn("ask_user_password")
+    assert not _xtrace_is_off_at(fn, "SET_ROOT_PASSWORD=\"yes\"")
 
 
 def test_chpasswd_still_runs_with_xtrace_off():

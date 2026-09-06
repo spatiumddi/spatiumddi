@@ -1801,6 +1801,208 @@ suggestion, free-space treemap.
   to review and to `tsc` alike. It earned its keep on the first run, catching
   that `focusItem(0, -1)` lands on the *last* item rather than the first.
 
+- ✅ [**Installer wizard review — 28 fixes in five phases**](https://github.com/spatiumddi/spatiumddi/issues/995)
+  — a review of `spatium-install` (2,723 lines, 19 screens) prompted by a
+  fresh install of the #988 ISO. **All five phases landed.** The two items
+  that cannot ship without image work — a RAID1 or multipath *install*,
+  needing `mdadm` / `multipath-tools` / initramfs changes `mkosi.conf` does
+  not carry — moved to
+  [#999](https://github.com/spatiumddi/spatiumddi/issues/999). What shipped
+  here is their **refusal**, which is the half that mattered: the picker used
+  to offer each PATH of a SAN LUN as a separate disk and let you install to
+  one of them. That is not "unsupported", it is an install that looks like it
+  worked and has no failover.
+  **Three of the ten were silent failures, which is the theme.**
+  The **install logs did not survive the reboot** — `INSTALL_LOG`, the bash-xtrace
+  `TRACE_LOG` and the launch log all lived on the live ISO's tmpfs and the
+  rootfs rsync excludes `/var/log/*`, so the one artefact explaining how a box
+  was built was the one artefact the build threw away. Now copied to
+  `/var/log/spatiumddi/install/` as the last write before the unmount **and
+  from the failure path**, and collected by the support bundle (#875).
+  0755/0644, matching every sibling: the api reads them through the
+  read-only host-log mount as uid 1000, so the root-only modes the first cut
+  used would have made the collector ship a PermissionError instead of the
+  logs, on every appliance. A **subdirectory**
+  deliberately, not a flat name: the host log dir is bind-mounted into the api
+  pod and its collector globs `*.log` non-recursively, so a subdir keeps three
+  static files out of the live Logs-tab dropdown *and* out of reach of
+  `logrotate`, which would otherwise age the install record out after twelve
+  weeks. The bundle reaches it explicitly rather than by widening
+  `list_log_sources`, which is the allowlist behind that tab's path-injection
+  sanitizer.
+  The **UEFI `grub-install` ended in `|| true`**, so on a UEFI-only guest the
+  Done screen appeared and the box did not boot. Now `/sys/firmware/efi` says
+  how the *live ISO* booted and the matching install is fatal — the other stays
+  best-effort, because `--removable` needs no efivars and the ef02 partition is
+  laid down regardless, so either can legitimately succeed on the other kind of
+  machine. Confirm names the detected mode.
+  The **`useradd` failure was swallowed** too, and `mkosi.postinst` sets
+  `PermitRootLogin no` — so a bad username produced a box with no way in at all,
+  discovered after the reboot with the installer gone. Fatal now, and the
+  username is validated at the prompt.
+  **The validators are shared, not copied.** `admin_user` (32 chars, Debian's
+  `NAME_REGEX`, a reserved-account list) and `timezone` were enforced for the
+  preseed path since #581 and by the interactive wizard **not at all**; rather
+  than transcribe them into bash, the wizard shells out to
+  `spatium-preseed-parse --check-field`, answered above that script's `import
+  yaml` so a username prompt cannot fail for want of python3-yaml. A validator
+  that cannot *run* is a third answer, distinct from a value that is invalid:
+  it accepts and logs loudly, because refusing would let an image defect block
+  every install, and the now-fatal `useradd` is the backstop.
+  **The timezone rule got stricter on the way**, closing two holes the preseed
+  path had: the old check was `os.path.exists` on the interpolated name, and
+  the value is interpolated into `ln -sf /usr/share/zoneinfo/$TIMEZONE
+  /etc/localtime` — so `../../../etc/passwd` (three levels; it resolves) and
+  `America` (a directory) both passed. Now a shape rule runs FIRST so a
+  traversal never reaches the filesystem, `isfile` rejects the directories, and
+  the `TZif` magic separates a zone from `leapseconds` / `posixrules`, which are
+  paths, are files, and are not zones.
+  **The device-mapper teardown removed every linear map on the machine**, not
+  just the target's — so installing alongside existing storage tore down a
+  volume group on another disk. Now a transitive closure from the target's own
+  partitions to a fixed point (LVM-on-LUKS gives the LV no direct dependency on
+  the disk at all), one dependency level per pass so the emitted order is
+  provably outermost-first — `dmsetup remove` refuses a device another map sits
+  on. **The seed must exclude `dm-*`**, which the first cut got wrong: `lsblk`
+  walks holders unless given `-d`, so seeding from its raw output puts the very
+  maps being searched for into the "already known" set, and the function returns
+  nothing on precisely the disks it exists for. Caught in review, reproduced
+  against a real kernel with real maps — the fixture had modelled
+  `lsblk --nodeps`, so eight passing tests were exercising an inert function.
+  **And failing to release is a refusal now, not a corruption.** The first cut
+  reasoned that unreleased maps would make `wipefs` fail and abort the install
+  harmlessly. `wipefs -af` *forces*: measured, it and `sgdisk -Z` both return 0
+  on a disk held open by a live map, and only `blockdev --rereadpt` fails, which
+  the installer tolerates as advisory. The GPT would be destroyed, the kernel
+  would keep the stale partition table, and `mkfs` would write at the old
+  offsets. The release is verified explicitly now, before anything is written.
+  **Found on the way, and a prerequisite for item 1:** #581 wrapped the password
+  prompt in `set +x` and **missed the 8-digit pairing code beside it** — so
+  `set -x` wrote it to the trace log that `on_failure` tails 30 lines of to the
+  console, and that item 1 would now copy onto disk. A single-use code is spent
+  on first boot; a persistent multi-claim code is a standing fleet-join
+  credential.
+  **`useradd` being fatal needed a pre-wipe gate to go with it**, or a
+  reserved-list miss turns a recoverable mistake into an unbootable disk: it
+  fires at ~63%, after the wipe and the rsync, on an unattended run with nobody
+  watching. The list is a hand-written approximation that misses `_apt` — which
+  matches the username regex and comes from a package `mkosi.conf` names
+  explicitly. The live ISO's rootfs *is* the target rootfs, so `getent passwd`
+  answers exactly and keeps answering as packages change.
+  Plus the stale text: the Done screen advertised `http://` (the frontend 301s
+  to https), said first boot "pulls the SpatiumDDI container images" (baked
+  since #170 Wave A4 — it *imports* them, nothing is downloaded), and showed a
+  web login to both roles when an Additional node has no web UI at all. It is
+  role-aware now, offers the live DHCP lease rather than `<appliance IP>`, and
+  is **sized to its own content and clamped to the terminal** — the old fixed
+  24 rows was already over newt's usable area, and an 80x24 serial console is a
+  first-class install path here. Confirm no longer promises "api + db + DNS +
+  DHCP" that #272 leaves off; the retired "Application install" naming is gone;
+  Welcome lists the two questions it omitted; and the backtitle reads
+  `APPLIANCE_VERSION` instead of a hardcoded `0.1.0` — the first thing asked
+  when an install misbehaves.
+  No migration, no new endpoint, no MCP change, no new screen in Phase 1.
+  **Phase 2 (items 11–14) changes what the installer ACCEPTS**, so each
+  refusal boundary is pinned by a test. The OS account had *no* password
+  policy — any non-empty string passed, and it became root's password too.
+  Eight characters and not-the-username / not-the-hostname REFUSE;
+  everything past that advises, because a prompt that refuses a
+  merely-weak password is one an operator routes around with something
+  worse they can retype. Validated over **stdin**, never argv. **Root is
+  locked by default** now (`passwd -l`, opt-in `--defaultno` checkbox) — a
+  behaviour change, but sshd refused root either way and `sudo -i` / `su -`
+  / single-user mode all still work, so it removes a console login rather
+  than a recovery path. **The control-plane URL is probed before the disk
+  is wiped**: `GET /api/v1/version`, because the operator's question is not
+  "does something listen there" but "is that MY control plane", and a typo
+  landing on another host's web server answers a ping perfectly well;
+  Retry / Edit / Continue-anyway, the last one logged. The **pairing code
+  is deliberately not probed** — it can only be validated by claiming it,
+  and an unauthenticated "is this code valid" endpoint would be an oracle
+  for guessing eight digits. And **an Additional node no longer pins k3s
+  CIDRs**: k3s compares them against the datastore when a server joins, a
+  mismatch is fatal, and `spatium-cluster-join` never removes the drop-in
+  — so that screen offered a choice whose only possible effect was to make
+  the node's later *promotion* impossible.
+  **Phase 3 (items 15–22) adds the questions the wizard never asked.** A
+  **pre-flight screen** (CPU / RAM / firmware / disks / per-NIC link state
+  / gateway / resolver / clock) that deliberately does **not** probe the
+  internet — non-negotiable #17, and an air-gapped install is a normal
+  case, not a red line; its clock check catches the dead CMOS battery that
+  later breaks TLS and pairing in ways that read as a networking fault.
+  **Keyboard layout** applied with `loadkeys` before the password screen
+  and persisted to both readers, because on AZERTY the symbols in a good
+  password land elsewhere and the login fails later with no explanation.
+  **NTP**, pre-filled from the DHCP lease's option 42 and written as a
+  chrony `sources.d` file — with the #154 runner now deleting it when
+  central config takes over, or the two would silently stack. **SSH keys**
+  validated with `ssh-keygen` rather than a regex (a truncated paste is the
+  common failure, and a key sshd will not load is worse than no key), with
+  password-SSH-off offered only when a key is present and refused outright
+  headlessly without one.
+  **Four network fixes.** The **interface picker is offered in DHCP mode
+  too** and its rows say which cable is plugged in — NetworkManager DHCPs
+  every port by default, so a multi-NIC server came up answering on
+  whichever replied first; a pinned port needs `autoconnect-priority=100`
+  to beat NM's own auto profiles. **Static mode offers the live lease's
+  values** as a starting point. **Static IPv6**, where a **link-local
+  gateway is accepted** — a router advertising a /64 answers on `fe80::…`,
+  so transliterating the v4 in-subnet check would refuse the commonest
+  correct answer on every IPv6 network there is. And the **k3s overlap
+  check now knows the LAN in DHCP mode**: it only ever knew it for a static
+  install, so the check was dead on the path most installs take, including
+  for a site whose LAN is `10.42.0.0/16` — the k3s pod default, and the
+  exact range it exists for. `--check-preseed` still does not probe,
+  because the linting workstation's lease says nothing about the
+  appliance's future LAN.
+  **Phases 4 + 5** add the reinstall the layout was designed for (`/var`
+  and STATE kept, both OS slots replaced — promised in a partition-table
+  comment since #276 and never implemented), the stable `by-id` disk name
+  in the picker / Confirm / log / STATE, a progress bar that moves during
+  the rsync, a Confirm screen that is a **menu of fields** so correcting
+  the hostname no longer means walking Back past four screens, an export
+  of the answers as a #549 preseed (secrets deliberately absent, and the
+  export is round-tripped through the real linter in all four
+  role × network shapes), and a **post-install verification** pass — ESP
+  bootloader, a `grub.cfg` that parses, grubenv on `slot_a`, a kernel in
+  the inactive slot — reported as a warning rather than an abort, because
+  the install is complete and the point is that the operator learns
+  before the reboot rather than after it.
+  **~180 new appliance tests** (the suite went 276 → 460), and the ones that
+  matter most execute rather than
+  grep: the device-mapper closure runs against stubbed `lsblk`/`dmsetup` with a
+  second disk present as the negative control, because the failure mode of
+  getting it wrong is destroying someone else's data and a structural
+  string-match would not catch an inverted comparison. Every guard was run
+  against the unpatched script — and the fixture itself was the thing that had
+  to be fixed first, since it modelled an `lsblk` that does not exist.
+
+- ⬜ [**Storage redundancy — RAID1 + multipath: fleet monitoring, management, and
+  install support**](https://github.com/spatiumddi/spatiumddi/issues/999) — split out
+  of #995 items 23 + 24, whose *refusal* half shipped there. Three parts, and the
+  **ordering is the design point**: monitoring first, install support last.
+  A mirrored root with no degraded-array alarm is a mirror that silently becomes a
+  single disk — the operator pays for two disks, the array loses a member at 03:00,
+  and the appliance keeps serving perfectly until the survivor dies. That is strictly
+  worse than never mirroring, because it displaced the backup discipline they would
+  otherwise have kept. So **Part A (monitoring) is a precondition for Part C
+  (install), not a follow-on** — and it is also far cheaper: `/proc/mdstat` is a
+  kernel interface rather than an mdadm feature, an mpath map is identifiable from
+  `/sys/block/dm-*/dm/uuid` exactly as `_disk_hazard()` already does it in the
+  installer, and the telemetry rides inside the `cluster_health` dict per the #402
+  pattern — no image change, no heartbeat field, no column, no migration.
+  Part A: a `read_storage_health()` collector, a chip on the Cluster → Overview node
+  cards + a Storage block in the Fleet drilldown + the console Disks row, a default-on
+  `appliance_storage_degraded` alert whose severity keys off *redundancy remaining*
+  rather than the state string (`2 of 3` is a warning, `1 of 2` is critical, both
+  report "degraded"), and 1 read MCP tool. Part B: fail / remove / add / scrub and
+  path reinstate over the existing trigger-file host-runner plane, with `mdadm --add`
+  carrying the installer's own wipe confirmation (it overwrites the disk it is given)
+  and removing the last good member **refused** rather than confirmed. Part C: the
+  `mkosi.conf` packages + initramfs, mirror-two-disks in the picker, and the part
+  easiest to skip and fatal to skip — **two ESPs kept in sync from the slot-upgrade
+  path**, or the mirror boots the old kernel off the surviving disk after an upgrade.
+
 #### CLI tool
 
 - ⬜ [**`spddi` CLI**](https://github.com/spatiumddi/spatiumddi/issues/83)

@@ -150,13 +150,30 @@ def test_bundle_has_stable_keys() -> None:
 
 
 def test_standard_hygiene_directives_always_present() -> None:
-    # ``driftfile``, ``makestep``, ``rtcsync`` and ``leapsectz`` are
-    # the standard chrony hygiene lines the renderer always emits so
-    # the config is self-contained — no stale Debian defaults left in
-    # place if the operator pushed a brand-new config.
+    # ``driftfile``, ``makestep`` and ``rtcsync`` are the standard chrony
+    # hygiene lines the renderer always emits so the config is
+    # self-contained — no stale Debian defaults left in place if the
+    # operator pushed a brand-new config.
     s = _bare_settings()
     text = render_chrony_conf(s)
     assert "driftfile /var/lib/chrony/chrony.drift" in text
     assert "makestep 1.0 3" in text
     assert "rtcsync" in text
-    assert "leapsectz right/UTC" in text
+
+
+def test_no_leapsectz_directive() -> None:
+    """#1003 item 5 — ``leapsectz right/UTC`` names a zone tree we do not ship.
+
+    Debian's stock chrony.conf carries it, and the renderer copied it. On
+    trixie the ``right/`` tree moved to ``tzdata-legacy``, which the appliance
+    image does not install — ``/usr/share/zoneinfo/right`` is absent — so
+    chrony logged "Timezone right/UTC failed leap second check, ignoring" at
+    WARNING on every start.
+
+    Removing it changes nothing operationally: chrony was already ignoring it,
+    and takes leap seconds from the NTP sources instead. It removes a warning
+    on an otherwise healthy boot, which per #994 is what teaches operators to
+    skim past the line that matters.
+    """
+    text = render_chrony_conf(_bare_settings())
+    assert "leapsectz" not in text

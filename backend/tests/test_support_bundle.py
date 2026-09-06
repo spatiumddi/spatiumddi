@@ -576,3 +576,111 @@ async def test_decode_map_is_stable_across_regenerations(db_session: AsyncSessio
     assert first.ipv4("10.4.5.6") == second.ipv4("10.4.5.6")
     assert first.hostname("a.b.example.net") == second.hostname("a.b.example.net")
     assert first.mac("aa:bb:cc:11:22:33") == second.mac("aa:bb:cc:11:22:33")
+
+
+# ── Installer logs (#995 item 1) ──────────────────────────────────────
+#
+# spatium-install copies its own logs to /var/log/spatiumddi/install/ as
+# the last write before it unmounts the target, because until then they
+# lived on the live ISO's tmpfs and the rsync excludes /var/log/* — so
+# the one artefact explaining how a box was built was the one artefact
+# the build threw away. The bundle has to reach into that subdirectory
+# explicitly: list_log_sources globs *.log NON-recursively, and it is the
+# allowlist behind the Logs tab's path-injection sanitizer.
+
+
+def _installer_log_dir(tmp_path, monkeypatch):
+    from app.services.appliance import diagnostics
+
+    base = tmp_path / "hostlogs"
+    (base / "install").mkdir(parents=True)
+    (base / "firstboot.log").write_text("host log\n")
+    monkeypatch.setattr(diagnostics, "_HOST_LOG_DIR", base)
+    return base
+
+
+def test_installer_logs_are_collected_from_the_subdirectory(tmp_path, monkeypatch):
+    from app.services.support_bundle.collect import collect_host_logs
+
+    base = _installer_log_dir(tmp_path, monkeypatch)
+    (base / "install" / "spatium-install.log").write_text("[ts] Step: welcome\n")
+    (base / "install" / "spatium-install-trace.log").write_text("+ main()\n")
+
+    out = collect_host_logs(Scrubber(enabled=False, seed="s"))
+    assert "install/spatium-install.log" in out
+    assert "install/spatium-install-trace.log" in out
+    assert "Step: welcome" in out["install/spatium-install.log"]
+    # The flat host logs still come through — the subdirectory is an
+    # addition, not a replacement.
+    assert "firstboot.log" in out
+
+
+def test_installer_logs_are_scrubbed_like_every_other_log(tmp_path, monkeypatch):
+    """They are the most identifier-dense text in the bundle: a full bash
+    xtrace naming every address, hostname and disk the wizard touched."""
+    from app.services.support_bundle.collect import collect_host_logs
+
+    base = _installer_log_dir(tmp_path, monkeypatch)
+    (base / "install" / "spatium-install.log").write_text(
+        "static ip 192.168.7.42 hostname ns1.corp.example\n"
+    )
+    out = collect_host_logs(Scrubber(enabled=True, seed="s"))
+    body = out["install/spatium-install.log"]
+    assert "192.168.7.42" not in body
+    assert "ns1.corp.example" not in body
+
+
+def test_no_installer_directory_is_silence_not_a_note(tmp_path, monkeypatch):
+    """Absent on every install that was not made from the ISO — compose,
+    plain Kubernetes, an appliance imaged some other way. A note there
+    would read as something being wrong."""
+    from app.services.support_bundle.collect import collect_host_logs
+
+    _installer_log_dir(tmp_path, monkeypatch)
+    (tmp_path / "hostlogs" / "install").rmdir()
+    out = collect_host_logs(Scrubber(enabled=False, seed="s"))
+    assert not [k for k in out if k.startswith("install/")]
+
+
+def test_a_subdirectory_under_install_is_skipped(tmp_path, monkeypatch):
+    """is_file(), so a stray directory does not raise IsADirectoryError
+    and take the whole logs section down with it."""
+    from app.services.support_bundle.collect import collect_host_logs
+
+    base = _installer_log_dir(tmp_path, monkeypatch)
+    (base / "install" / "nested").mkdir()
+    (base / "install" / "spatium-install.log").write_text("ok\n")
+    out = collect_host_logs(Scrubber(enabled=False, seed="s"))
+    assert "install/spatium-install.log" in out
+    assert "install/nested" not in out
+
+
+def test_installer_logs_survive_an_empty_top_level_log_dir(tmp_path, monkeypatch):
+    """The regression the early return caused.
+
+    A box whose host log dir holds only ``install/`` is an install that
+    died before firstboot opened its own log — exactly the case item 1
+    exists for. The old ordering returned "No host log directory is
+    mounted" and dropped the install logs, while the directory it called
+    absent was sitting right there.
+    """
+    from app.services.support_bundle.collect import collect_host_logs
+
+    base = _installer_log_dir(tmp_path, monkeypatch)
+    (base / "firstboot.log").unlink()
+    (base / "install" / "spatium-install.log").write_text("[ts] Step: welcome\n")
+
+    out = collect_host_logs(Scrubber(enabled=False, seed="s"))
+    assert "install/spatium-install.log" in out
+    assert "_note.txt" not in out
+
+
+def test_a_truly_absent_host_log_dir_still_reports_the_note(tmp_path, monkeypatch):
+    """Control for the test above — the note must not have been lost."""
+    from app.services.appliance import diagnostics
+    from app.services.support_bundle.collect import collect_host_logs
+
+    monkeypatch.setattr(diagnostics, "_HOST_LOG_DIR", tmp_path / "nope")
+    monkeypatch.setattr(diagnostics, "_FALLBACK_LOG_DIR", tmp_path / "nope")
+    out = collect_host_logs(Scrubber(enabled=False, seed="s"))
+    assert list(out) == ["_note.txt"]

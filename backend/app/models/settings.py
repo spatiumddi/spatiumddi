@@ -19,6 +19,41 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
 
+
+def _initial_ntp_servers() -> list[str]:
+    """Initial ``ntp_pool_servers`` — the OS installer's answer if there is one.
+
+    #1003 item 2. The appliance wizard asks for a time source, writes it to
+    ``/etc/chrony/sources.d/spatium-install.sources``, and the #154
+    control-plane chrony plane then deletes that file a few minutes into the
+    first boot and pushes the platform default instead — because nothing ever
+    told the platform what was typed. An air-gapped site that entered
+    ``ntp.corp.internal`` got a correct clock for three minutes and a chronyd
+    reaching for ``pool.ntp.org`` forever afterwards, with "unsynchronized"
+    as the only symptom.
+
+    Applies at ROW CREATION only, which is the point: after that the control
+    plane owns the value, and an operator's edit in the UI must not be
+    reverted on the next boot. No migration inserts ``platform_settings``
+    row 1 — it is created lazily by the ORM in about eight places — so a
+    Python-side default covers every one of them, where seeding at any single
+    call site would not.
+
+    ``server_default`` deliberately keeps the plain pool: that is what a row
+    created outside the ORM gets, and an installer answer is not available at
+    DDL time anyway.
+    """
+    # Deferred purely to keep this model module import-light; there is no
+    # cycle to avoid (app.config imports only sys + pydantic), so the
+    # justification this line used to carry was wrong. Either form works —
+    # `settings` attributes are read at call time regardless, which is what
+    # matters, since this must reflect the env at ROW CREATION.
+    from app.config import settings  # noqa: PLC0415
+
+    servers = (settings.initial_ntp_servers or "").split()
+    return servers or ["pool.ntp.org"]
+
+
 # Default managed APT repos (issue #155) — mirror the Debian 13 (trixie)
 # set baked into the appliance ISO so enabling APT management starts from
 # the working defaults rather than an empty sources.list. Used as both
@@ -563,7 +598,7 @@ class PlatformSettings(Base):
     ntp_pool_servers: Mapped[list[str]] = mapped_column(
         JSONB,
         nullable=False,
-        default=lambda: ["pool.ntp.org"],
+        default=_initial_ntp_servers,
         server_default=sa_text("'[\"pool.ntp.org\"]'::jsonb"),
     )
     ntp_custom_servers: Mapped[list[dict]] = mapped_column(

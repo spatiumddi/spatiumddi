@@ -1289,6 +1289,248 @@ trigger: tag push (CalVer)
 > reinstall to change `cluster-cidr` / `service-cidr`. The
 > partition layout permits keeping `/var` across reinstalls.
 
+> **#995 Phase 1 update — installer bugs and stale text.** Ten fixes
+> to `spatium-install`, no new screens:
+>
+> - **The install logs survive the reboot.** `spatium-install.log`,
+>   the bash-xtrace `spatium-install-trace.log` and the launch log all
+>   lived on the live ISO's tmpfs, and the rootfs rsync excludes
+>   `/var/log/*` — so after a bad first boot there was no record of what
+>   the installer had done. All three are now copied to
+>   **`/var/log/spatiumddi/install/`** (0755/0644, matching every sibling
+>   in that directory — the api reads them through the read-only host-log
+>   bind mount as uid 1000, so root-only modes would have made the
+>   collector half of this ship a PermissionError instead of the logs) as
+>   the last write before the target is unmounted, **and from the failure
+>   path too**, since the fatal aborts below all happen earlier. The
+>   support bundle (#875) collects them. A subdirectory rather than a flat
+>   name on purpose:
+>   the appliance Logs tab globs `*.log` in that directory
+>   non-recursively, so three static install-time files stay out of the
+>   live-log dropdown, and `logrotate` does not age the install record
+>   out after twelve weeks.
+> - **A failed bootloader install is no longer silent.** The UEFI
+>   `grub-install` ended in `|| true`, so on a UEFI-only guest the Done
+>   screen appeared and the box did not boot. The installer now reads
+>   `/sys/firmware/efi` to learn how the *live ISO* booted and makes the
+>   matching `grub-install` fatal; the other stays best-effort, because
+>   `--removable` and the ef02 BIOS Boot partition mean either can
+>   legitimately succeed on the other kind of machine. The Confirm
+>   screen names the detected mode.
+> - **The pairing code no longer reaches the trace log.** #581 wrapped
+>   the password prompt in `set +x` and missed the 8-digit code beside
+>   it — which `on_failure` tails to the console on any non-zero exit,
+>   and which the log copy above would now carry onto disk. A persistent
+>   multi-claim code is a standing fleet-join credential.
+> - **Timezone and username are validated at the prompt.** Both rules
+>   already existed for the preseed path; the interactive wizard had
+>   neither, so a typo'd zone silently became UTC and a username with a
+>   space reached `useradd` — whose failure was swallowed with
+>   `|| true`, leaving a box with no sudo account while
+>   `PermitRootLogin no` locked root out of SSH. The wizard now calls
+>   the same validator through `spatium-preseed-parse --check-field`
+>   (one definition, two callers) and the `useradd` failure is fatal.
+> - **The device-mapper teardown is scoped to the target disk.** The
+>   pre-partition cleanup removed *every* linear device-mapper map on
+>   the machine, including LVM on a second disk the operator intended to
+>   keep. It now walks the dependency graph from the target's own
+>   partitions to a fixed point — so a stacked LVM-on-LUKS target is fully
+>   released, one dependency level per pass so the removal order is
+>   provably outermost-first — and touches nothing else. The seed
+>   deliberately excludes `dm-*`: `lsblk` walks holders unless given
+>   `-d`, so seeding from its raw output puts the very maps being looked
+>   for into the "already known" set.
+>   **And a map that cannot be released is now a refusal, not a
+>   corruption.** `wipefs -af` *forces* — measured against a disk held
+>   open by a live map, both it and `sgdisk -Z` return 0 and erase the
+>   table, and only `blockdev --rereadpt` fails, which the installer
+>   tolerates. So nothing downstream would have caught it: the GPT would
+>   be destroyed, the kernel would keep the stale partition table, and
+>   `mkfs` would write at the old offsets. The release is verified
+>   explicitly, before anything is written.
+>   Note that this whole path is **dormant on a stock ISO**: `mkosi.conf`
+>   names neither `lvm2` nor `dmsetup` nor `cryptsetup` and nothing it
+>   does name depends on them, so the teardown returns immediately — as
+>   the loop it replaced also did. Adding the storage tooling belongs with
+>   Phase 4 (RAID + multipath), which owns that part of `mkosi.conf`.
+> - **The admin account is checked before the wipe as well.** `useradd` is
+>   fatal now, at ~63% — after the disk is gone. The preseed parser's
+>   reserved-account list is a hand-written approximation of what the
+>   image ships and misses `_apt`, which matches the username regex and
+>   is created by a package `mkosi.conf` names explicitly. The live ISO's
+>   rootfs *is* the rootfs about to be copied onto the target, so
+>   `getent passwd` answers exactly, and keeps answering as the package
+>   set changes. Both the interactive and the preseed path reach it.
+> - **The screens say what is true.** The Done screen advertised
+>   `http://` (the frontend 301s to https), claimed first boot "pulls
+>   the SpatiumDDI container images" (baked into the rootfs since #170
+>   Wave A4 — it *imports* them, nothing is downloaded), and showed a
+>   web login to both roles when an Additional node has no web UI at
+>   all. It is now role-aware, offers the live DHCP address rather than
+>   a placeholder, and is sized to its own content and clamped to the
+>   terminal so an 80x24 serial console does not clip it. The Confirm
+>   screen no longer promises "api + db + DNS + DHCP" when #272 leaves
+>   DNS and DHCP off at install; the retired "Application install"
+>   naming is gone; Welcome lists the k3s CIDR and pairing-code
+>   questions it was omitting; and the backtitle shows the real
+>   `APPLIANCE_VERSION` instead of a hardcoded `0.1.0`.
+
+> **#995 Phase 2 update — safety.** Four changes to what the installer
+> *accepts*, each of which can refuse an install that used to succeed:
+>
+> - **The OS account has a password policy.** There was none: any
+>   non-empty string passed, and it became root's password too. The floor
+>   is 8 characters and not-the-username / not-the-hostname, and it
+>   **refuses**. Everything past that — a breach-list password, four
+>   distinct characters, a single character class — is an **advisory** the
+>   operator can accept, because a prompt that refuses a merely-weak
+>   password is one an operator routes around with something worse they
+>   can retype. Shared with the preseed path, where the advisory becomes a
+>   `--check-preseed` `WARN`. The password is validated over **stdin**,
+>   never argv.
+> - **Root is locked by default.** `passwd -l root`, with an opt-in
+>   checkbox (`--defaultno`) and a `set_root_password` preseed key. This
+>   **changes existing behaviour**: root used to get the admin password
+>   unconditionally. sshd refuses root either way (`mkosi.postinst`), so
+>   it only ever affected the physical / IPMI console — and `sudo -i`,
+>   `su -` from a sudoer and single-user mode all still work, so this
+>   removes a console login rather than a recovery path.
+> - **The control-plane URL is probed before the disk is wiped.**
+>   `GET <url>/api/v1/version` with a 5 s timeout, while the live system
+>   still has its network and the target is still intact. Success shows
+>   the reported version, so a typo pointing at the *wrong* control plane
+>   is visible; failure shows curl's own error (which distinguishes DNS
+>   from refused from TLS from timeout) and offers **Retry / Edit /
+>   Continue anyway**. Continue-anyway is a real option — the control
+>   plane may legitimately not be up yet — and taking it is logged. The
+>   pairing code is deliberately **not** probed: it can only be validated
+>   by claiming it, and an unauthenticated "is this code valid" endpoint
+>   would be an oracle for guessing eight digits.
+> - **An Additional node no longer pins k3s CIDRs.** The screen is skipped
+>   for that role and **no drop-in is written**. k3s compares
+>   `cluster-cidr` / `service-cidr` / `cluster-dns` against the datastore
+>   when a server joins and a mismatch is fatal, while
+>   `spatium-cluster-join` never removes
+>   `/etc/rancher/k3s/config.yaml.d/spatium-cidrs.yaml` — so an Additional
+>   node installed with non-default CIDRs could pair, be approved, serve
+>   DNS and DHCP, and **never be promoted** into the control plane it was
+>   paired with. Its own single-node k3s runs fine on the upstream
+>   defaults, and it inherits the seed's values on promotion. A preseed
+>   that sets `k3s` for `role: appliance` gets a `WARN` and the values are
+>   dropped.
+
+> **#995 Phase 3 update — the questions the wizard never asked.** Eight
+> additions, four of them fixes to the network screen:
+>
+> - **Pre-flight check**, before anything is asked: CPU, RAM, firmware
+>   mode, disks with sizes, every NIC with its link state / speed /
+>   current address, the gateway, the resolver, and the clock. The clock
+>   line is the one that earns its place — a date behind the ISO's own
+>   build date means a dead CMOS battery, which later breaks TLS to the
+>   control plane and the supervisor's pairing in ways that read as a
+>   networking fault. Informational, not a gate; the one hard refusal
+>   remains the disk-size floor. **It deliberately does not probe the
+>   internet** — non-negotiable #17 — so an air-gapped install is a
+>   normal case rather than a red line.
+> - **Keyboard layout**, applied immediately with `loadkeys` so the
+>   password screen already uses it (compiled with `ckbcomp`, since the
+>   image ships no console keymaps at all), and persisted as an XKB block to
+>   `/etc/default/keyboard`. On AZERTY or QWERTZ the symbols in a good
+>   password land elsewhere; the installer stored what US produced and
+>   the login later failed with no explanation, twice.
+> - **NTP**, pre-filled from the DHCP lease's option 42 when the site
+>   offered one (read back out of `/run/chrony-dhcp/`, which the live
+>   chrony is already using). Written as a `sources.d` file rather than
+>   an edit to `chrony.conf`, which makes it additive and gives the #154
+>   control-plane plane a clean seam — that runner now deletes it when
+>   central config takes over, so the two cannot silently stack. On a
+>   First node the answer is ALSO seeded as the platform's initial
+>   `ntp_pool_servers` (#1003 item 2), so what the operator typed is what
+>   the central plane pushes back rather than the public pool. An
+>   Additional node has no api pod, so there the answer is superseded on
+>   the first push and the fleet value has to be set centrally.
+> - **SSH public key** for the admin account: paste, or fetch from a URL
+>   or a bare GitHub username. Validated with `ssh-keygen`, not a regex —
+>   a truncated paste is the common failure and a key sshd will not load
+>   is worse than no key. "Disable password SSH" is offered **only when a
+>   key is present**, and refused outright on the headless path without
+>   one.
+> - **The interface picker is offered in DHCP mode too**, and its rows
+>   say which cable is plugged in (link state, speed, the address the
+>   installer currently holds, the driver) rather than name + MAC.
+>   NetworkManager DHCPs every ethernet port by default, so on a
+>   multi-NIC server the appliance came up answering on whichever replied
+>   first. A pinned port is rendered as its own keyfile with
+>   `autoconnect-priority=100`, which is what beats NM's own
+>   auto-generated profiles.
+> - **Static mode offers the values the box already has** — address,
+>   gateway and resolvers from the live lease — as a starting point.
+> - **Static IPv6** alongside the v4 address, RA / SLAAC still the
+>   default. A link-local gateway is accepted, because a router
+>   advertising a /64 answers on `fe80::…` and an in-subnet check would
+>   refuse the commonest correct answer on every IPv6 network there is.
+> - **The k3s CIDR overlap check now knows the LAN in DHCP mode.** It
+>   only ever knew it for a static install, so the check was dead on the
+>   path most installs take — including for a site whose LAN is
+>   `10.42.0.0/16`, which is the k3s pod default and the exact range the
+>   check exists for. `--check-preseed` deliberately does **not** probe:
+>   the linting workstation's lease says nothing about the appliance's
+>   future LAN.
+
+> **#995 Phases 4 + 5 update — storage hazards, reinstall, polish.**
+>
+> - **A SAN LUN is no longer offered once per path.** The picker
+>   collapses paths by WWN, and installing to a single path of a
+>   multipath device — or to a member of an assembled md array — is
+>   **refused**, marked `[UNSUPPORTED]` in the list rather than hidden.
+>   This was not "unsupported", it was a trap: the install wrote through
+>   one path, the installed system had no failover, and nothing said so.
+>   **Installing *to* RAID1 or multipath is still not supported** —
+>   `mkosi.conf` ships no `mdadm`, `lvm2`, `multipath-tools` or `kpartx`,
+>   and the initramfs work that needs is not here. The refusal is the
+>   shippable half; the capability moved to
+>   [#999](https://github.com/spatiumddi/spatiumddi/issues/999), which
+>   carries it together with the fleet monitoring and management surface
+>   for both — a mirrored root with no degraded-array alarm is a mirror
+>   that silently becomes a single disk, so the monitoring half is a
+>   precondition for the install half rather than a follow-on.
+> - **Reinstall keeping `/var`.** The partition layout's own comment has
+>   promised this since #276 and nothing implemented it. When the target
+>   already carries the standard six-label layout the installer offers
+>   it: both OS slots are replaced, `/var` and STATE are kept — so the
+>   database, the logs, the imported container images and the machine
+>   identity (SSH host keys, supervisor keypair) survive. Offered only
+>   when every label is present, because a partial layout would mean
+>   guessing which partition is which.
+> - **The stable disk name is resolved, shown and recorded.** `sdX` is
+>   assigned in discovery order and #581 already noted it can move
+>   between the picker and the wipe. The picker resolves
+>   `/dev/disk/by-id/` (preferring `wwn-`), Confirm shows it, and it goes
+>   into the install log and `spatium-config.yaml`.
+> - **The progress bar moves during the rsync.** It sat at 20% for the
+>   longest step in the install, which is indistinguishable from a hang
+>   and is the point at which an operator power-cycles.
+> - **Confirm is a menu of fields.** Back used to walk one screen at a
+>   time, so correcting the hostname from the last screen before a wipe
+>   meant pressing Back past four screens and OK through them again.
+>   Picking a row jumps straight to it; `Install` is the last thing.
+> - **The answers are exported** to
+>   `/var/lib/spatium-state/spatium-preseed.yaml` in the #549 format, so
+>   an identical reinstall or a fleet clone is one file away. Secrets are
+>   deliberately absent — the file is world-readable and meant to be
+>   copied off the box — so a reader adds `admin_password` (and
+>   `pairing_code` for an Additional node) and lints it with
+>   `--check-preseed`.
+> - **The install is verified before it is called done**: the ESP carries
+>   `EFI/BOOT/BOOTX64.EFI` and a `grub.cfg` that parses, grubenv points
+>   at `slot_a`, the inactive slot has a kernel and an initrd, the
+>   machine config is on STATE, and the admin account exists. Failures
+>   are shown on the Done screen and written to
+>   `/var/log/spatiumddi/install/verify.failed` — a warning, not an
+>   abort, because the install *is* complete and an operator who sees
+>   "the ESP has no bootloader" before rebooting is far better off than
+>   one who reboots into a grub prompt.
+
 ### Headless / unattended install — preseed the disk installer (#549)
 
 > **Supersedes the stale Phase-1 framing.** The *old* cloud-init
@@ -1404,7 +1646,21 @@ must match `[a-z_][a-z0-9_-]*\$?` (Debian's `NAME_REGEX`), and must not
 be a reserved system account that already exists in the image (`root`,
 `www-data`, `nobody`, …). An unvalidated value would otherwise fail
 `useradd` *after* the disk was already wiped — or, with a colon in it,
-split the `user:password` line piped to `chpasswd`.
+split the `user:password` line piped to `chpasswd`. Since #995 item 4
+the interactive prompt calls the same rule, via
+`spatium-preseed-parse --check-field admin_user <name>`.
+
+**`timezone` shape (#995 item 3).** Three tests, in order: the name
+must look like an IANA zone (`[A-Za-z0-9+_-]` segments joined by `/`),
+the path under `/usr/share/zoneinfo` must be a **file**, and that file
+must start with the `TZif` magic. The old check was a bare
+`os.path.exists` on the interpolated name, which accepted a traversal
+(`../../../etc/passwd` resolves to `/etc/passwd`, and `do_install`
+symlinks `/etc/localtime` at whatever it is given), a directory
+(`America` exists; symlinking localtime at a directory breaks every
+timestamp on the box), and the non-zone regular files that live in the
+same tree (`leapseconds`, `posixrules`). Shared with the interactive
+prompt the same way `admin_user` is.
 
 Once the installed system reboots, `spatiumddi-firstboot.service`
 runs as normal (identical to the interactive path): generates

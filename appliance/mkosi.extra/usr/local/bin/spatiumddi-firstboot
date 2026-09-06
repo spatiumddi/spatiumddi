@@ -20,6 +20,31 @@ set -eu
 
 LOG=/var/log/spatiumddi/firstboot.log
 ENV_FILE=/etc/spatiumddi/.env
+
+# #1003 item 2 — the installer's Time source answer, read off STATE.
+#
+# The wizard asks for it, spatium-install writes
+# /etc/chrony/sources.d/spatium-install.sources, and roughly three
+# minutes into the first boot the #154 control-plane chrony plane
+# DELETES that file and installs the platform default — because nothing
+# ever told the platform what the operator typed. An air-gapped site
+# that entered ntp.corp.internal got a working clock for three minutes
+# and then a chronyd reaching for pool.ntp.org forever, with
+# "unsynchronized" as the only symptom.
+#
+# So the answer is seeded into the api's environment here and becomes the
+# INITIAL value of platform_settings.ntp_pool_servers. Only the initial
+# one: once the row exists, the control plane is authoritative and the
+# operator's later edits in the UI must not be undone on every boot.
+#
+# Same flat `key: value` reader spatium-etc-render uses — the config is
+# deliberately flat so this needs no yaml parser this early in boot.
+STATE_CONFIG=/var/lib/spatium-state/spatium-config.yaml
+_state_cfg() {
+    [ -f "$STATE_CONFIG" ] || return 0
+    sed -n "s/^$1:[[:space:]]*//p" "$STATE_CONFIG" | head -1 \
+        | sed 's/[[:space:]]*$//; s/^"//; s/"$//; s/^'"'"'//; s/'"'"'$//'
+}
 STAMP=/var/lib/spatiumddi/firstboot.done
 CHART_TGZ=/usr/lib/spatiumddi/charts/spatiumddi-appliance.tgz
 CONTROL_CHART_TGZ=/usr/lib/spatiumddi/charts/spatiumddi.tgz
@@ -495,6 +520,7 @@ APPLIANCE_ROLE_VAL="${APPLIANCE_ROLE_VAL:-control-plane}"
 # on the control plane"). All come from /etc/spatiumddi/.env which
 # firstboot writes (or carries over) on every boot.
 DNS_AGENT_KEY_VAL=$(_env_get DNS_AGENT_KEY)
+INITIAL_NTP_SERVERS_VAL=$(_env_get INITIAL_NTP_SERVERS)
 DHCP_AGENT_KEY_VAL=$(_env_get DHCP_AGENT_KEY)
 LG_AGENT_KEY_VAL=$(_env_get LG_AGENT_KEY)
 # Backfill for boxes provisioned before LG_AGENT_KEY existed (issue #576).
@@ -512,6 +538,27 @@ LG_AGENT_KEY_VAL=$(_env_get LG_AGENT_KEY)
 if [ -z "$LG_AGENT_KEY_VAL" ] && [ "$APPLIANCE_ROLE_VAL" = "control-plane" ]; then
     LG_AGENT_KEY_VAL=$(gen_hex 24)
     printf 'LG_AGENT_KEY=%s\n' "$LG_AGENT_KEY_VAL" >> "$ENV_FILE"
+fi
+# #1003 item 2 — the installer's Time source answer, seeded from STATE.
+#
+# Backfilled on ANY boot where the key is absent, not written once at .env
+# creation. STATE is mounted `nofail`, and systemd does not order a nofail
+# mount before local-fs.target — so if it is not up when firstboot runs,
+# _state_cfg returns empty. Writing an empty line then would record "the
+# operator declined" permanently and lose what they actually typed, with the
+# #154 plane pushing the public pool: exactly the bug item 2 exists to fix,
+# arrived at from the other side.
+#
+# So absence is the retry signal and an EMPTY answer writes nothing. The two
+# are indistinguishable downstream anyway — models.settings._initial_ntp_servers
+# falls back to the platform default for both — so nothing is lost by leaving
+# a declined answer unwritten, and a late STATE mount is recovered on the
+# next boot.
+if [ -z "$INITIAL_NTP_SERVERS_VAL" ]; then
+    INITIAL_NTP_SERVERS_VAL=$(_state_cfg ntp_servers)
+    if [ -n "$INITIAL_NTP_SERVERS_VAL" ]; then
+        printf 'INITIAL_NTP_SERVERS=%s\n' "$INITIAL_NTP_SERVERS_VAL" >> "$ENV_FILE"
+    fi
 fi
 # In-cluster service DNS for the api. Matches the umbrella chart's
 # release name (``spatium-control``) + the workload suffix the
@@ -696,6 +743,66 @@ place_metallb_frrk8s_crds() {
 #        full-stack=false because the appliance chart owns them)
 _render_control_helmchart() {
     local chart_b64="$1"
+    # #1003 item 4 — size api + worker HERE, so the first render is the final one.
+    #
+    # firstboot rendered the chart with the values-file defaults (api 512Mi) and
+    # the supervisor's first heartbeat then re-rendered it sized to the node
+    # (1960Mi on a 4 GiB VM). Every install therefore paid for a second
+    # helm-install Job, a second migrate Job, and an api + worker rollout with a
+    # transient readiness Unhealthy — three minutes into a box that was already
+    # up. The supervisor still owns the value afterwards; this just stops the
+    # first render being knowingly wrong.
+    #
+    # MIRRORS k8s_api.control_plane_resources(). Two implementations of one
+    # formula is a drift risk, so agent/supervisor/tests/test_control_plane_sizing.py
+    # computes both and requires them to agree — the same way #992 pins this
+    # script's role-chart values to the Python.
+    _mem_total_mib() {
+        awk '/^MemTotal:/ {print int($2/1024); exit}' /proc/meminfo 2>/dev/null || true
+    }
+    _clamp_mib() {  # total, numerator, denominator, lo, hi
+        local v=$(( $1 * $2 / $3 ))
+        [ "$v" -lt "$4" ] && v="$4"
+        [ "$v" -gt "$5" ] && v="$5"
+        printf '%s' "$v"
+    }
+    local MEM_TOTAL_MIB API_MEM_MIB WORKER_MEM_MIB WORKER_CONCURRENCY
+    local API_SIZING_YAML WORKER_SIZING_YAML
+    MEM_TOTAL_MIB=$(_mem_total_mib)
+    API_MEM_MIB=""
+    WORKER_MEM_MIB=""
+    WORKER_CONCURRENCY=""
+    if [ -n "$MEM_TOTAL_MIB" ] && [ "$MEM_TOTAL_MIB" -gt 0 ] 2>/dev/null; then
+        # 0.5 / 0.25 as integer ratios; clamps 1024..8192 and 1024..4096.
+        API_MEM_MIB=$(_clamp_mib "$MEM_TOTAL_MIB" 1 2 1024 8192)
+        WORKER_MEM_MIB=$(_clamp_mib "$MEM_TOTAL_MIB" 1 4 1024 4096)
+        # _WORKER_SMALL_NODE_MIB = 12288.
+        if [ "$MEM_TOTAL_MIB" -le 12288 ]; then WORKER_CONCURRENCY=2; else WORKER_CONCURRENCY=4; fi
+        # >&2, NOT bare echo. THIS FUNCTION'S STDOUT IS THE MANIFEST: the
+        # caller runs it inside `{ ... } > "$tmp"`, so anything printed here
+        # is captured into spatium-control.yaml. The first line happens to
+        # contain ": " and so parsed as a junk top-level key on the HelmChart
+        # CR — survivable, and why every test still passed. The second has no
+        # colon, which makes the document UNPARSEABLE: k3s cannot decode it,
+        # spatium-control never installs, and the control plane never comes
+        # up, with a parse error in the k3s log as the only symptom.
+        # firstboot does `exec >>"$LOG" 2>&1` and the caller redirects only
+        # stdout, so stderr is still the log.
+        echo "Sizing control plane for ${MEM_TOTAL_MIB} MiB: api=${API_MEM_MIB}Mi worker=${WORKER_MEM_MIB}Mi concurrency=${WORKER_CONCURRENCY}" >&2
+    else
+        echo "MemTotal unreadable — leaving the chart's default control-plane sizing in place" >&2
+    fi
+    # Rendered into the values block below. Empty string = emit nothing, so an
+    # unreadable MemTotal leaves the chart's defaults untouched rather than
+    # emitting a malformed `memory: Mi`.
+    API_SIZING_YAML=""
+    WORKER_SIZING_YAML=""
+    if [ -n "$API_MEM_MIB" ]; then
+        API_SIZING_YAML=$(printf '      resources:\n        limits:\n          memory: "%sMi"' \
+            "$API_MEM_MIB")
+        WORKER_SIZING_YAML=$(printf '      concurrency: %s\n      resources:\n        limits:\n          memory: "%sMi"' \
+            "$WORKER_CONCURRENCY" "$WORKER_MEM_MIB")
+    fi
     # #983 — first of two gates on naming ``spatium-control-plane`` here.
     # This one is cheap and early: no appliance chart tarball means the chart
     # that RENDERS the class is not going into the auto-deploy dir at all.
@@ -798,6 +905,9 @@ spec:
     # Appliance is single-node — collapse api/worker to 1 replica
     # each + disable HPA (no horizontal scaling on a single host).
     api:
+      # #1003 item 4 — sized from this node's RAM, matching what the
+      # supervisor would otherwise re-render on its first heartbeat.
+${API_SIZING_YAML}
       replicas: 1  # spatium:cp-size
       # #590 — one api per control-plane node. Without this a promote
       # could land every api pod on the seed, so losing the seed left no
@@ -838,6 +948,13 @@ spec:
           value: "${DHCP_AGENT_KEY_VAL}"
         - name: LG_AGENT_KEY
           value: "${LG_AGENT_KEY_VAL}"
+        # #1003 item 2 — the installer's Time source answer. Seeds the
+        # INITIAL platform_settings.ntp_pool_servers so the #154 chrony
+        # plane pushes what the operator typed instead of the platform
+        # default, which is what used to overwrite it three minutes into
+        # the first boot. Ignored once the settings row exists.
+        - name: INITIAL_NTP_SERVERS
+          value: "${INITIAL_NTP_SERVERS_VAL}"
         # #272 HA — stable identity for the self-signed Web UI cert.
         # The api Deployment runs N replicas (one per control-plane
         # node), all sharing one cluster TLS Secret. WITHOUT these the
@@ -899,6 +1016,8 @@ spec:
       applianceHostMounts:
         enabled: true
     worker:
+      # #1003 item 4 — see the api block above.
+${WORKER_SIZING_YAML}
       # #983 Phase 2 — alert evaluation runs in the WORKER, not the api, so
       # the node_pressure PSI rule needs a ServiceAccount here or it
       # evaluates to nothing forever while sitting enabled in the Alerts UI.

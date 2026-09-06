@@ -1114,6 +1114,12 @@ sizes), `errors/internal-errors.json` (#123), `alerts/events.json`,
 flags), `agents/servers.json`, `system/` (environment, `/proc`), plus
 `containers/` and `logs/` where the deployment exposes them.
 
+`logs/install/` carries the disk installer's own logs on a box built from
+the ISO (#995 item 1) — `spatium-install` copies them off the live
+medium's tmpfs before it unmounts the target, which is the only reason
+they exist after the first reboot at all. Absent, silently, on every
+other deployment shape.
+
 A section that cannot be collected becomes a note explaining **why**, not
 an absence — an empty section and an inapplicable one are otherwise
 indistinguishable. Each runs inside its own savepoint, so one failure

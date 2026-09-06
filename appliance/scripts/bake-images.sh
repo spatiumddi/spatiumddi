@@ -261,6 +261,18 @@ if [ "$BAKE_SOURCE" = "local" ] && [ "$ALLOW_STALE_IMAGES" != "1" ]; then
     fi
 fi
 
+# ``BAKE_SAVE_PLATFORM`` (optional, e.g. ``linux/amd64``): passed as
+# ``docker save --platform``. Required on a Docker host that uses the
+# containerd image store (Docker Desktop on Apple Silicon): a registry
+# image's index there lists platforms whose blobs were never pulled, and a
+# plain ``docker save`` fails with "content digest … not found". Also
+# guarantees the archive carries the appliance's architecture rather than
+# the build host's. Empty (the CI default) keeps the historical behaviour.
+SAVE_PLATFORM_FLAG=()
+if [ -n "${BAKE_SAVE_PLATFORM:-}" ]; then
+    SAVE_PLATFORM_FLAG=(--platform "$BAKE_SAVE_PLATFORM")
+fi
+
 for repo in "${IMAGES[@]}"; do
     short="$(basename "$repo")"
     source_tag="$(resolve_source_tag "$repo")"
@@ -292,7 +304,10 @@ for repo in "${IMAGES[@]}"; do
     # docker save | zstd → containerd-readable archive. Atomic via
     # .new sibling so a crash mid-bake doesn't ship a torn tarball.
     tmp="${out_tar}.new"
-    docker save "$target_tag" | zstd -T0 -19 -o "$tmp"
+    # A bake that died mid-save leaves ``.new`` behind, and zstd refuses to
+    # overwrite it — which made every later bake fail on the same file.
+    rm -f "$tmp"
+    docker save "${SAVE_PLATFORM_FLAG[@]}" "$target_tag" | zstd -T0 -19 -o "$tmp"
     mv "$tmp" "$out_tar"
 
     size="$(du -h "$out_tar" | awk '{print $1}')"
@@ -312,14 +327,23 @@ for image in "${OBSERVABILITY_IMAGES[@]}" "${METALLB_IMAGES[@]}" "${CNPG_IMAGES[
     short="$(basename "${image%%:*}")"
     out_tar="$IMAGES_DIR/${short}.tar.zst"
 
-    if ! docker image inspect "$image" >/dev/null 2>&1; then
+    # With a save platform pinned, always pull for that platform: a local
+    # copy pulled for the build host's own arch (a dev-compose ``redis``
+    # on an arm64 laptop) satisfies ``image inspect`` but cannot be saved
+    # as the appliance's arch.
+    if [ -n "${BAKE_SAVE_PLATFORM:-}" ]; then
+        docker pull --platform "$BAKE_SAVE_PLATFORM" "$image" >/dev/null
+    elif ! docker image inspect "$image" >/dev/null 2>&1; then
         echo "→ Pulling $image …"
         docker pull "$image" >/dev/null
     fi
 
     echo "→ Baking $image → $out_tar"
     tmp="${out_tar}.new"
-    docker save "$image" | zstd -T0 -19 -o "$tmp"
+    # A bake that died mid-save leaves ``.new`` behind, and zstd refuses to
+    # overwrite it — which made every later bake fail on the same file.
+    rm -f "$tmp"
+    docker save "${SAVE_PLATFORM_FLAG[@]}" "$image" | zstd -T0 -19 -o "$tmp"
     mv "$tmp" "$out_tar"
 
     size="$(du -h "$out_tar" | awk '{print $1}')"

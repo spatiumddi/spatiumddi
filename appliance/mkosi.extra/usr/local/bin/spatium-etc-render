@@ -101,13 +101,50 @@ else
     echo "no role in $CONFIG — leaving existing /etc/spatiumddi/role-config"
 fi
 
+# #995 item 21 — the [ipv6] section of the static keyfile.
+#
+# ``method=auto`` (RA / SLAAC) unless the operator pinned an address,
+# which is what every install before this did and stays the default. A
+# blank gateway is left OUT rather than written empty: NetworkManager
+# rejects a trailing comma in address1 the same way it does for v4 (the
+# #554 failure), and with no gateway line NM keeps taking the default
+# route from router advertisements, which is the sane behaviour when
+# someone pins an address on a network that still advertises a router.
+_render_ipv6_block() {
+    if [ "$NET6_MODE_VAL" != "static" ]; then
+        echo "method=auto"
+        return 0
+    fi
+    _v6_ip="$(get_cfg network6_ip)"
+    _v6_prefix="$(get_cfg network6_prefix)"
+    _v6_gw="$(get_cfg network6_gateway)"
+    if [ -z "$_v6_ip" ]; then
+        echo "method=auto"
+        return 0
+    fi
+    echo "method=manual"
+    if [ -n "$_v6_gw" ]; then
+        echo "address1=$_v6_ip/${_v6_prefix:-64},$_v6_gw"
+    else
+        echo "address1=$_v6_ip/${_v6_prefix:-64}"
+    fi
+}
+
 # ── Network (NetworkManager keyfile) ─────────────────────────────────
 # Runs Before=NetworkManager.service so the profile is in place before
 # NM reads its connections. dhcp mode = no keyfile (NM auto-DHCPs every
 # ethernet interface by default); static mode writes a keyfile-format
 # connection. Remove a stale keyfile when the mode flips back to dhcp.
 NET_MODE_VAL="$(get_cfg network_mode)"
+NET6_MODE_VAL="$(get_cfg network6_mode)"
 NM_KEYFILE=/etc/NetworkManager/system-connections/10-spatium-static.nmconnection
+# #995 item 19 — a DHCP install can now pin ONE port. NetworkManager's
+# default is to DHCP every ethernet interface, so on a multi-NIC server
+# the appliance came up on whichever replied first — a management LAN, a
+# storage VLAN, an idle port on another switch — and the supervisor
+# registered from there. A keyfile naming the interface makes the choice
+# stick; no interface still means the old any-port behaviour.
+NM_DHCP_KEYFILE=/etc/NetworkManager/system-connections/10-spatium-dhcp.nmconnection
 if [ "$NET_MODE_VAL" = "static" ]; then
     NET_IFACE_VAL="$(get_cfg network_interface)"
     NET_IP_VAL="$(get_cfg network_ip)"
@@ -135,6 +172,10 @@ uuid=$net_uuid
 type=ethernet
 interface-name=$NET_IFACE_VAL
 autoconnect=true
+# Same reason the pinned-DHCP twin sets one: NetworkManager's own
+# auto-generated "Wired connection N" profiles default to 0, and a static
+# profile that merely ties them is not guaranteed to win.
+autoconnect-priority=100
 
 [ethernet]
 
@@ -144,10 +185,21 @@ address1=$NET_IP_VAL/$NET_PREFIX_VAL,$NET_GATEWAY_VAL
 dns=$net_dns_csv;
 
 [ipv6]
-method=auto
+$(_render_ipv6_block)
 EOF
         # NM refuses keyfiles that aren't mode 600.
         chmod 0600 "$NM_KEYFILE"
+        # Drop the pinned-DHCP twin. The dhcp branch is symmetric about
+        # this and the static one was not. Both keyfiles now carry
+        # autoconnect-priority=100, so a leftover does not strictly
+        # outrank the profile just written — NetworkManager breaks the tie
+        # by connection timestamp, which is worse than losing: it is
+        # non-deterministic. Two autoconnect profiles on one interface is
+        # a race either way.
+        if [ -f "$NM_DHCP_KEYFILE" ]; then
+            rm -f "$NM_DHCP_KEYFILE"
+            echo "  removed the stale pinned-DHCP keyfile"
+        fi
         echo "network → static $NET_IP_VAL/$NET_PREFIX_VAL on $NET_IFACE_VAL"
     else
         echo "WARN: network_mode=static but ip/interface missing — skipping keyfile"
@@ -157,6 +209,40 @@ elif [ "$NET_MODE_VAL" = "dhcp" ]; then
     if [ -f "$NM_KEYFILE" ]; then
         rm -f "$NM_KEYFILE"
         echo "network → dhcp (removed stale static keyfile)"
+    fi
+    # #995 item 19 — pin DHCP to one port when the operator chose one.
+    NET_IFACE_VAL="$(get_cfg network_interface)"
+    if [ -n "$NET_IFACE_VAL" ]; then
+        dhcp_uuid="$(uuidgen 2>/dev/null || echo "5a71c0de-0001-4000-8000-$(printf '%012d' "$(echo "$NET_IFACE_VAL" | cksum | cut -d' ' -f1)")")"
+        if [ -f "$NM_DHCP_KEYFILE" ]; then
+            existing_uuid="$(sed -n 's/^uuid=//p' "$NM_DHCP_KEYFILE" | head -1)"
+            [ -n "$existing_uuid" ] && dhcp_uuid="$existing_uuid"
+        fi
+        install -d -m 0755 /etc/NetworkManager/system-connections
+        cat > "$NM_DHCP_KEYFILE" <<EOF
+[connection]
+id=spatium-dhcp
+uuid=$dhcp_uuid
+type=ethernet
+interface-name=$NET_IFACE_VAL
+autoconnect=true
+# Beat NetworkManager's own auto-generated "Wired connection N" profiles,
+# which default to 0 — otherwise whichever port comes up first still wins.
+autoconnect-priority=100
+
+[ethernet]
+
+[ipv4]
+method=auto
+
+[ipv6]
+$(_render_ipv6_block)
+EOF
+        chmod 0600 "$NM_DHCP_KEYFILE"
+        echo "network → dhcp pinned to $NET_IFACE_VAL"
+    elif [ -f "$NM_DHCP_KEYFILE" ]; then
+        rm -f "$NM_DHCP_KEYFILE"
+        echo "network → dhcp on any port (removed stale pinned keyfile)"
     fi
 fi
 

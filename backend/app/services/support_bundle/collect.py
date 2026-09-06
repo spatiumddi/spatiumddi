@@ -433,12 +433,25 @@ def collect_host_logs(scrub: Scrubber) -> dict[str, str]:
     """Host log files, when the appliance bind-mount is present."""
     from app.services.appliance.diagnostics import _log_dir, list_log_sources
 
-    out: dict[str, str] = {}
+    # Installer logs FIRST, and the emptiness verdict after both, because
+    # the two early returns below used to sit above the installer
+    # collector: a box whose host log dir holds only ``install/`` — an
+    # install that died before firstboot opened its own log, i.e. exactly
+    # the case #995 item 1 exists for — got the "not mounted" note and no
+    # install logs, while the directory it says is absent was right there.
+    out: dict[str, str] = _collect_installer_logs(scrub)
     try:
         names = list_log_sources()
     except OSError as exc:
-        return {"_error.txt": f"{type(exc).__name__}: {exc}"}
-    if not names:
+        out["_error.txt"] = f"{type(exc).__name__}: {exc}"
+        return out
+    for name in names:
+        try:
+            raw = (_log_dir() / name).read_text(encoding="utf-8", errors="replace")
+            out[name] = cap(scrub.text(raw), CAP_LOG_BYTES)
+        except OSError as exc:
+            out[f"{name}.error"] = f"{type(exc).__name__}: {exc}"
+    if not out:
         return {
             "_note.txt": (
                 "No host log directory is mounted. Expected on docker-compose "
@@ -446,12 +459,46 @@ def collect_host_logs(scrub: Scrubber) -> dict[str, str]:
                 "view of the host filesystem."
             )
         }
-    for name in names:
+    return out
+
+
+def _collect_installer_logs(scrub: Scrubber) -> dict[str, str]:
+    """The installer's own logs, if this box was built by spatium-install.
+
+    #995 item 1. spatium-install copies its install / trace / launch logs
+    to ``/var/log/spatiumddi/install/`` immediately before unmounting the
+    target, because until then they lived on the live ISO's tmpfs and the
+    rsync excludes ``/var/log/*`` — so the one artefact explaining how a
+    box was built was the one artefact the build threw away.
+
+    Read here rather than through ``list_log_sources`` because that
+    globs ``*.log`` non-recursively and is the allowlist behind the Logs
+    tab's ``read_log_tail``: widening it to walk subdirectories would put
+    three static install-time files in the live-log dropdown and would
+    mean touching the path-injection sanitizer that endpoint depends on.
+    Nothing reaches the filesystem here that a request supplied.
+
+    Absent on every install that was not made from the ISO (compose,
+    plain Kubernetes, an appliance imaged some other way), which is why a
+    missing directory is silence rather than a note.
+    """
+    from app.services.appliance.diagnostics import _log_dir
+
+    out: dict[str, str] = {}
+    base = _log_dir() / "install"
+    try:
+        if not base.is_dir():
+            return out
+        entries = sorted(p for p in base.iterdir() if p.is_file())
+    except OSError as exc:
+        return {"install/_error.txt": f"{type(exc).__name__}: {exc}"}
+    for path in entries:
         try:
-            raw = (_log_dir() / name).read_text(encoding="utf-8", errors="replace")
-            out[name] = cap(scrub.text(raw), CAP_LOG_BYTES)
+            raw = path.read_text(encoding="utf-8", errors="replace")
         except OSError as exc:
-            out[f"{name}.error"] = f"{type(exc).__name__}: {exc}"
+            out[f"install/{path.name}.error"] = f"{type(exc).__name__}: {exc}"
+            continue
+        out[f"install/{path.name}"] = cap(scrub.text(raw), CAP_LOG_BYTES)
     return out
 
 

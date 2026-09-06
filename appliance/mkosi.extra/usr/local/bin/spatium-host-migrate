@@ -36,6 +36,42 @@ STATE_DIR=${SPATIUM_HOST_STATE_DIR:-/var/lib/spatiumddi/release-state}
 APPLIED_VER_FILE="$STATE_DIR/host-template-version"
 LEDGER="$STATE_DIR/host-patches-applied.json"
 LOG=${SPATIUM_HOST_MIGRATE_LOG:-/var/log/spatiumddi/firstboot.log}
+
+# #1003 item 8 — say it once.
+#
+# Most lines in this script go to $LOG only. Three of them also wanted the
+# caller's terminal, and bought that by piping through `tee`. But firstboot
+# runs this with ITS OWN stdout already redirected into the very same file,
+# so each of those landed twice:
+#
+#     host-migrate: applying 001-grub-render
+#     host-migrate: applying 001-grub-render
+#     host-migrate: 001-grub-render OK
+#
+# Write to the stream always; append to $LOG only when the stream is not
+# already $LOG. If /proc is unavailable the comparison fails and both are
+# written — the pre-existing behaviour, so the failure direction is a
+# duplicated line rather than a lost one.
+_emit() {
+    local fd="$1"; shift
+    printf '%s\n' "$*" >&"$fd"
+    # Duplicate the stream onto fd 9 BEFORE resolving it. Reading
+    # /proc/self/fd/$fd directly inside $( ) inspects the command
+    # substitution's own stdout pipe, not the stream we were handed, so the
+    # comparison never matches and the line is written twice — which is the
+    # bug this function exists to fix, reintroduced one layer down. fd 9
+    # survives the substitution because only fd 1 is remapped.
+    local here there
+    exec 9>&"$fd" || return 0
+    here=$(readlink -f /proc/self/fd/9 2>/dev/null || true)
+    exec 9>&-
+    there=$(readlink -f "$LOG" 2>/dev/null || true)
+    if [ -z "$here" ] || [ "$here" != "$there" ]; then
+        printf '%s\n' "$*" >> "$LOG"
+    fi
+}
+_say()  { _emit 1 "$@"; }
+_warn() { _emit 2 "$@"; }
 ROLE_CONFIG=${SPATIUM_HOST_ROLE_CONFIG:-/etc/spatiumddi/role-config}
 
 # ── Appliance-only gate ───────────────────────────────────────────────────────
@@ -208,7 +244,7 @@ for patch in $(ls -1 "$PATCH_DIR"/[0-9]*.sh 2>/dev/null | sort); do
     fi
 
     # Patch needs to run.
-    echo "host-migrate: applying $id" | tee -a "$LOG"
+    _say "host-migrate: applying $id"
     ran_any=1
     patch_at=$(now_iso)
 
@@ -222,7 +258,7 @@ for patch in $(ls -1 "$PATCH_DIR"/[0-9]*.sh 2>/dev/null | sort); do
         echo "host-migrate: $id OK" >> "$LOG"
         ledger_patch_ok "$id" "$patch_at"
     else
-        echo "host-migrate: PATCH $id FAILED (rc=$patch_rc)" | tee -a "$LOG" >&2
+        _warn "host-migrate: PATCH $id FAILED (rc=$patch_rc)"
         ledger_patch_fail "$id" "$patch_at" "exit $patch_rc"
         all_ok=0
         break  # Stop at first failure — patches are ordered dependencies.
@@ -248,6 +284,6 @@ if [ "$all_ok" -eq 1 ]; then
 else
     # Leave APPLIED_VER_FILE unchanged so the next boot retries the failed patch.
     ledger_finalize "false" "$reconcile_at" ""
-    echo "host-migrate: reconcile FAILED — slot commit will be blocked" | tee -a "$LOG" >&2
+    _warn "host-migrate: reconcile FAILED — slot commit will be blocked"
     exit 1
 fi

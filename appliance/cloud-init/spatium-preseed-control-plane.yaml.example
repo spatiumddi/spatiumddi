@@ -42,8 +42,53 @@ spatium_preseed:
   admin_password: "change-me-please"
   # admin_password_hash: "$6$rounds=4096$abcd...$..."
 
+  # Since #995 root is LOCKED (`passwd -l`) and you use sudo. sshd
+  # refused root either way, so this removes a console login, not a
+  # recovery path — `sudo -i`, `su -` and single-user mode all still
+  # work. Set true for the pre-#995 behaviour, where root got the same
+  # password as the admin account.
+  set_root_password: false
+
   # ── Timezone (IANA name; default UTC) ───────────────────────────────
+  # Must be a real compiled zone file: a traversal, a directory
+  # ("America") and a non-zone file ("leapseconds") are all refused.
   timezone: UTC
+
+  # ── Console keyboard layout (#995 item 17; default us) ──────────────
+  # An XKB layout code — the two-letter country code in most cases.
+  # Applied on the live console before the password prompt (so a
+  # passphrase with symbols is typed on the layout you meant) and
+  # persisted to /etc/default/keyboard. `localectl list-x11-keymap-layouts`
+  # lists them. A few console-style aliases are mapped for you:
+  # uk -> gb, br-abnt2 -> br+abnt2, jp106 -> jp, dvorak, us-acentos.
+  keymap: us
+
+  # ── Time source (#995 item 16) ──────────────────────────────────────
+  # String or list. Written to /etc/chrony/sources.d/spatium-install.sources
+  # AND seeded as the control plane's initial ntp_pool_servers (#1003
+  # item 2), so an air-gapped site's own server survives the first
+  # heartbeat instead of being replaced by the public pool.
+  #
+  # Empty writes no installer sources file, which is NOT the same as no
+  # time source: Debian's chrony.conf keeps its own `pool` directive
+  # (see issue #1002).
+  ntp_servers: pool.ntp.org
+  # ntp_servers:
+  #   - ntp1.corp.internal
+  #   - ntp2.corp.internal
+
+  # ── SSH access for the admin account (#995 item 18) ─────────────────
+  # String or list of OpenSSH public keys. A BOOTSTRAP, not a permanent
+  # grant: once the control plane manages SSH keys (#157) its list
+  # replaces this file. Validated with ssh-keygen, so a truncated paste
+  # is refused rather than silently ignored.
+  # ssh_authorized_keys:
+  #   - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... ops@corp"
+  #
+  # Turn off password SSH. REFUSED (not warned) when no
+  # ssh_authorized_keys is set — an unattended install that disables
+  # password SSH with no key produces a box nobody can reach.
+  # ssh_disable_password: false
 
   # ── Network ─────────────────────────────────────────────────────────
   network:
@@ -57,6 +102,22 @@ spatium_preseed:
     # prefix: 24
     # gateway: 192.168.1.1
     # dns: "1.1.1.1 1.0.0.1"
+    #
+    # `interface` is OPTIONAL in dhcp mode too (#995 item 19), where it
+    # PINS the lease to one port. Omitting it keeps the old behaviour:
+    # NetworkManager DHCPs every ethernet interface and the appliance
+    # answers on whichever replied first — a coin toss on a multi-NIC
+    # server, and the wrong network is not obvious afterwards.
+    # interface: enp1s0
+    #
+    # Optional static IPv6 alongside the v4 address, `static` mode only
+    # (#995 item 21). Default is RA / SLAAC. prefix6 defaults to 64. A
+    # LINK-LOCAL gateway6 (fe80::…) is normal and accepted — that is what
+    # a router advertising a /64 answers on; a global one must be inside
+    # the prefix. prefix6 or gateway6 without ip6 is refused.
+    # ip6: 2001:db8:1::10
+    # prefix6: 64
+    # gateway6: fe80::1
 
   # ── k3s pod + service CIDRs (#302) ──────────────────────────────────
   # Defaults match k3s upstream. Override only if your LAN already uses
