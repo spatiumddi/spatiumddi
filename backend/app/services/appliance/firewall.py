@@ -88,6 +88,10 @@ _ROLE_PORTS_UDP: dict[str, list[int]] = {
 }
 _K3S_ETCD_KUBELET_TCP: tuple[int, ...] = (2379, 2380, 10250)
 _K3S_APISERVER_TCP = 6443
+# #993 — the kubelet, from inside the cluster as well as from peers. See the
+# long note on the same constant in the supervisor's ``firewall_renderer``;
+# this renderer must stay byte-identical to it.
+_K3S_KUBELET_TCP = 10250
 _METALLB_MEMBERLIST = 7946
 
 
@@ -229,6 +233,15 @@ def compile_firewall_body(
                 api_v6,
                 f"tcp dport {_K3S_APISERVER_TCP} accept",
                 "kubeapi",
+            )
+        kubelet_v4, kubelet_v6 = _split_families(list(pod_cidrs or []) + list(service_cidrs or []))
+        if kubelet_v4 or kubelet_v6:
+            _emit_family_rule(
+                lines,
+                kubelet_v4,
+                kubelet_v6,
+                f"tcp dport {_K3S_KUBELET_TCP} accept",
+                "kubelet",
             )
         if (peer_v4 or peer_v6) and cp_member_count >= 2 and vip_configured:
             _emit_family_rule(

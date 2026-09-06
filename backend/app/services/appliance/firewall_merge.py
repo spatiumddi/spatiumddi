@@ -139,6 +139,11 @@ _BUILTIN_SEED: list[tuple[str, str | None, bool, list[tuple]]] = [
         [
             (10, "accept", "tcp", (2379, 2380, 10250), "cluster_peers", "both", "k3s-peer", None),
             (20, "accept", "tcp", (6443,), "kubeapi", "both", "kubeapi", None),
+            # #993 — the kubelet from inside the cluster. seq 25 places it
+            # between kubeapi and memberlist, which is where both hardcoded
+            # renderers emit it; the byte-identity contract is on the ORDER,
+            # not just the set.
+            (25, "accept", "tcp", (10250,), "kubelet", "both", "kubelet", None),
             (
                 30,
                 "accept",
@@ -348,6 +353,12 @@ class MergeContext:
     svc_v6: tuple[str, ...]
     kubeapi_v4: tuple[str, ...]
     kubeapi_v6: tuple[str, ...]
+    # #993 — pod ∪ service, WITHOUT the operator's kubeapi_expose allowlist.
+    # That allowlist widens the apiserver, which is RBAC-guarded on every
+    # request; the kubelet API is not the same proposition and must not
+    # inherit it.
+    kubelet_v4: tuple[str, ...]
+    kubelet_v6: tuple[str, ...]
     mgmt_v4: tuple[str, ...]
     mgmt_v6: tuple[str, ...]
     vip_v4: tuple[str, ...]
@@ -386,6 +397,8 @@ class MergeContext:
             + list(service_cidrs or [])
             + list(kubeapi_cidrs)
         )
+        # #993 — pod ∪ svc only; see the note on MergeContext.kubelet_v4.
+        kubelet_v4, kubelet_v6 = _split_families(list(pod_cidrs or []) + list(service_cidrs or []))
         mgmt_v4, mgmt_v6 = _split_families(list(mgmt_cidrs or []))
         vv4, vv6 = _split_families(list(vip_cidrs or []))
         return cls(
@@ -402,6 +415,8 @@ class MergeContext:
             svc_v6=tuple(svc_v6),
             kubeapi_v4=tuple(api_v4),
             kubeapi_v6=tuple(api_v6),
+            kubelet_v4=tuple(kubelet_v4),
+            kubelet_v6=tuple(kubelet_v6),
             mgmt_v4=tuple(mgmt_v4),
             mgmt_v6=tuple(mgmt_v6),
             vip_v4=tuple(vv4),
@@ -419,6 +434,8 @@ class MergeContext:
             v4, v6 = list(self.peer_v4), list(self.peer_v6)
         elif sk == "kubeapi":
             v4, v6 = list(self.kubeapi_v4), list(self.kubeapi_v6)
+        elif sk == "kubelet":
+            v4, v6 = list(self.kubelet_v4), list(self.kubelet_v6)
         elif sk == "pod_cidr":
             v4, v6 = list(self.pod_v4), list(self.pod_v6)
         elif sk == "service_cidr":

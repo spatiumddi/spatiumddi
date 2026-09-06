@@ -269,6 +269,23 @@ _KUBELET_PORT = 10250
 # poll fans out over every node once a minute and a TLS handshake against a
 # wrong CA costs a round trip each time. Re-probe on this interval instead.
 _KUBELET_DIRECT_RETRY_S = 900.0
+# #993 — the direct probe's socket timeout, and it is on the REQUEST path:
+# the cluster-health snapshot probes each node before it can fall back, so
+# the first request after api start (and after every retry expiry above)
+# pays this once per node, serially.
+#
+# It was 6 s, which is a reasonable read timeout and a terrible connect
+# timeout for a LAN peer. On the appliance the port was firewalled shut
+# (the other half of this issue), so every probe hit the full 6 s: two nodes
+# is 12 s, three is 18 s, and the browser gave up first — the api logged the
+# dashboard request being cancelled mid-flight, with its DB connection torn
+# down under it.
+#
+# 1.5 s is the judgement that a kubelet on the same LAN which has not
+# completed a TCP handshake in that time is not going to. Getting it wrong is
+# cheap and self-correcting in the safe direction: a slow node is marked
+# blocked, served by the apiserver proxy, and re-probed 15 minutes later.
+_KUBELET_DIRECT_TIMEOUT_S = 1.5
 # PER NODE, keyed by node IP: ``{ip: (blocked_until_monotonic, reason)}``.
 #
 # Deliberately not one global flag. A single kubelet restarting would
@@ -355,7 +372,9 @@ def _get_stats_summary_direct(node_ip: str) -> tuple[int, dict[str, Any] | None]
     except (OSError, ssl.SSLError) as exc:
         _block_direct(node_ip, f"cannot load kubelet CA bundle: {exc} (SPATIUM_KUBELET_CA_PATH?)")
         return 0, None
-    conn = http.client.HTTPSConnection(node_ip, _KUBELET_PORT, timeout=6.0, context=ctx)
+    conn = http.client.HTTPSConnection(
+        node_ip, _KUBELET_PORT, timeout=_KUBELET_DIRECT_TIMEOUT_S, context=ctx
+    )
     try:
         conn.request(
             "GET",

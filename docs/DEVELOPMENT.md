@@ -111,6 +111,58 @@ make lint-backend  # backend only
 make lint-frontend   # eslint + prettier check
 ```
 
+Note `npm run typecheck` is `tsc --noEmit` and **`npm run build` is
+`tsc -b`**, which is stricter. Build mode catches errors `--noEmit`
+does not — a name colliding with a local declaration, an unused import,
+a config key the imported `defineConfig` overload does not accept. It is
+what CI's Frontend — Build job runs, so run it before pushing rather
+than trusting a green typecheck.
+
+#### Detail-page headers
+
+Action rows follow a fixed grammar, locked in by the `HeaderButton`
+primitive (`components/ui/header-button.tsx`):
+
+```
+[Refresh] [Sync …] [Import] [Export] [misc reads] [Edit] [Resize] [Delete] [+ Primary]
+```
+
+That ordering was written for five or six buttons and does not scale.
+Past roughly **seven** simultaneously-visible controls a header stops
+fitting: the DNS zone detail reached eleven and clipped `+ Add Record`,
+its own primary action, to a sliver at ~1,460 px with the sidebar open
+(#996). At that point fold the once-per-object actions into
+`HeaderMenu` (`components/ui/header-menu.tsx`) and keep the shape every
+detail page should read as:
+
+* `Refresh`
+* at most two menus (`Data ▾` / `Zone ▾`, `Sync ▾` / `Tools ▾`)
+* one primary action, always last
+
+Carry each item's `disabled` state **and its `title` reason** into the
+menu — a dead item with no explanation is worse than a dead button. A
+menu whose items all vanish (a forward DNS zone has nothing to import or
+export) renders nothing at all rather than a trigger onto an empty
+panel.
+
+Regardless of menus, every header gets `flex-wrap` on the row,
+`min-w-0 flex-1` on the title block and `shrink-0` on the actions, so a
+narrow window wraps the actions under the title instead of clipping
+them. This is the same rule the `/admin` pages adopted in Wave D.
+
+Reuse `HeaderMenu`; do not hand-roll the open-state and
+outside-mousedown dance. `IPAMPage.tsx` alone had accumulated **three**
+copies of it before #996, and the keyboard handling (arrow wrap, Home /
+End, Escape returning focus to the trigger, skipping disabled items) is
+exactly what every copy left out. It is covered by
+`components/ui/header-menu.test.tsx` — the first component test in the
+repo, and the reason `jsdom` is a dev dependency.
+
+New keybindings are declared in `lib/shortcuts.ts` and matched via
+`matchesShortcut`, never added straight to a component: that is what
+puts them in the `?` overlay and keeps the keycap, the handler and the
+help text in step (#81).
+
 ---
 
 ## 4. The Absolute Non-Negotiables

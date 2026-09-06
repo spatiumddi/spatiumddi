@@ -47,7 +47,21 @@ global:
 # (2000000000) / ``system-node-critical`` (2000001000) so k3s components
 # still outrank everything here.
 priorityClasses:
+  # Does THIS release render the PriorityClass objects?
+  #
+  # #992 — the chart is installed TWICE per appliance, under two release
+  # names, and these are cluster-scoped. Helm refuses an install whole when
+  # it meets an existing object owned by another release, so exactly one of
+  # the two may create them: ``spatium-bootstrap`` (firstboot, installs
+  # first) does, and the supervisor's ``spatiumddi-appliance`` release sets
+  # create: false + external: true. See templates/priorityclasses.yaml.
   create: true
+  # Assert that something ELSE creates them, so the guard in
+  # templates/priorityclasses.yaml stays satisfied while create is false.
+  # Required for any offline render (helm template / helm lint /
+  # charts-lint), where the guard's live ``lookup`` has no cluster to ask
+  # and would report every class missing.
+  external: false
   classes:
     # Serving pods — BIND / PowerDNS / Technitium / Kea / the BGP collector.
     # The LAN stops working without these, so they are the last thing the

@@ -249,8 +249,19 @@ def test_builtin_set_shape() -> None:
     }
     assert ps.roles["observer"].enabled is False
     cp = ps.roles["control-plane"]
-    assert [r.seq for r in cp.rules] == [10, 20, 30, 40]
-    assert cp.rules[2].render_guard == _BUILTIN_GUARD
+    assert [r.seq for r in cp.rules] == [10, 20, 25, 30, 40]
+    # The memberlist pair is the only guarded builtin (multi-node + VIP).
+    assert cp.rules[3].render_guard == _BUILTIN_GUARD
+    # #993 — the kubelet rule. Indexed by seq rather than position so a
+    # future insert renumbers the assertion instead of silently re-pointing
+    # it at a different rule.
+    kubelet = next(r for r in cp.rules if r.seq == 25)
+    assert (kubelet.protocol, kubelet.ports) == ("tcp", (10250,))
+    assert kubelet.render_guard is None, "must emit on a single node, where there are no peers"
+    # Not ``kubeapi``: that union carries the operator's kubeapi_expose
+    # allowlist, which widens the RBAC-guarded apiserver and must never be
+    # extended to the kubelet's /exec, /run and /attach.
+    assert kubelet.source_kind == "kubelet"
 
 
 def _load_migration_module(filename: str):
@@ -270,7 +281,36 @@ def _load_migration_module(filename: str):
 _SEED_MIGRATION_FILES = [
     "f5b8d2c91a06_firewall_builtin_seed.py",
     "6a668dd451d5_dns_technitium_firewall_seed.py",
+    "d4a9e37b2c15_kubelet_firewall_rule_seed.py",
 ]
+
+
+def _fold(entries):
+    """(scope_kind, scope_role) -> rules, in first-seen policy order.
+
+    A seed migration may add a whole POLICY (6a668dd451d5, Technitium) or
+    just a RULE to a policy an earlier migration created (d4a9e37b2c15, the
+    #993 kubelet rule on ``control-plane``). Comparing the flat concatenation
+    could only ever express the first shape. What actually has to match is
+    the state a fresh DB ends up in after every migration has applied, so
+    fold contributions onto the policy they belong to — and sort each
+    policy's rules by ``seq``, because that is what ``_policy_from_orm`` does
+    when reading them back, and the byte-identity contract is on the emitted
+    ORDER.
+    """
+    folded: dict[tuple[str, str | None], list] = {}
+    enabled_by: dict[tuple[str, str | None], bool] = {}
+    for scope_kind, scope_role, enabled, rules in entries:
+        key = (scope_kind, scope_role)
+        if key not in folded:
+            folded[key] = []
+            enabled_by[key] = enabled
+        else:
+            assert enabled_by[key] == enabled, f"{key} disagrees about ``enabled``"
+        folded[key].extend(
+            (seq, a, p, tuple(po), k, f, c, g) for (seq, a, p, po, k, f, c, g) in rules
+        )
+    return {k: (enabled_by[k], sorted(v, key=lambda r: r[0])) for k, v in folded.items()}
 
 
 def test_builtin_seed_matches_migration() -> None:
@@ -283,23 +323,22 @@ def test_builtin_seed_matches_migration() -> None:
         if guard is not None:
             assert guard == _BUILTIN_GUARD
 
-    def norm_merge(entry):
-        sk, sr, enabled, rules = entry
-        return (
-            sk,
-            sr,
-            enabled,
-            [(s, a, p, tuple(po), k, f, c, g) for (s, a, p, po, k, f, c, g) in rules],
-        )  # noqa: E501
+    mig_entries = [
+        (sk, sr, enabled, rules)
+        for mig in migs
+        for (sk, sr, _name, enabled, rules) in mig._POLICIES
+    ]
+    assert _fold(_BUILTIN_SEED) == _fold(mig_entries)
 
-    def norm_mig(entry):
-        sk, sr, _name, enabled, rules = entry
-        return (
-            sk,
-            sr,
-            enabled,
-            [(s, a, p, tuple(po), k, f, c, g) for (s, a, p, po, k, f, c, g) in rules],
-        )  # noqa: E501
 
-    mig_policies = [e for mig in migs for e in mig._POLICIES]
-    assert [norm_merge(e) for e in _BUILTIN_SEED] == [norm_mig(e) for e in mig_policies]
+def test_the_in_code_seed_lists_each_policy_rules_in_seq_order() -> None:
+    """``builtin_policy_set`` preserves list order verbatim while
+    ``_policy_from_orm`` sorts by ``seq``. So an out-of-order rule here makes
+    an unseeded DB render a DIFFERENT byte sequence from a seeded one — and
+    the triangle test only ever exercises one of those two paths at a time.
+
+    _fold() sorts, so it cannot see this; assert it separately.
+    """
+    for scope_kind, scope_role, _enabled, rules in _BUILTIN_SEED:
+        seqs = [r[0] for r in rules]
+        assert seqs == sorted(seqs), f"{scope_kind}/{scope_role} rules are not in seq order"

@@ -1688,6 +1688,119 @@ suggestion, free-space treemap.
   plain `age_s > 90` test would have masked a genuinely dead beat behind a
   skewed worker clock. No migration, no new endpoint, no MCP change.
 
+- ✅ [**Appliance role chart never installed since #988 — two Helm releases both claimed the PriorityClasses**](https://github.com/spatiumddi/spatiumddi/issues/992)
+  — the appliance chart is installed **twice per appliance**, under two
+  release names, and #988's cluster-scoped PriorityClasses were rendered by
+  both. Helm stamps `meta.helm.sh/release-name` on everything it creates and
+  refuses an install *whole* when it meets an object owned by another
+  release, so every fresh install after #988 had **no role DaemonSet on the
+  cluster at all** — assigning DNS or DHCP from Fleet could never produce a
+  running pod. Silently: the k3s helm-controller job carries
+  `backoffLimit: 1000`, so the release sat `FAILED` while a job retried
+  forever and nothing in Fleet reads that.
+  **One owner.** `spatium-bootstrap` renders them; it *must* install first,
+  since the supervisor that writes the other release does not exist until it
+  has. The supervisor's `_build_values` now sets
+  `priorityClasses.create: false` + `external: true`.
+  **The guard had to change with it**, because `create: false` alone no
+  longer means "nothing will create these". It now fails only when the
+  classes are also absent from the live cluster (`lookup`), with
+  `external: true` as the deterministic assertion for any offline render —
+  `lookup` returns empty under `helm template`, which is why the flag has to
+  exist rather than the live check being the only test.
+  **The template's own comment was the root cause**, asserting the chart was
+  "installed exactly once per appliance cluster". It never was.
+  **Verified, not assumed** — the issue flagged the upgrade path as unknown:
+  `spatiumddi-firstboot`'s `firstboot.done` stamp is *written and never
+  read*, so the bootstrap manifest is re-rendered from the running slot's
+  baked chart on **every** boot and a slot upgrade re-applies the classes.
+  Two CI gates, since neither sees the other's half: charts-lint renders
+  **both release shapes** and fails on any cluster-scoped object in both
+  (plus a negative control that the guard still fires), and
+  `agent/supervisor/tests/test_role_chart_values.py` pins the Python the
+  shell script mirrors. No migration.
+- ✅ [**Direct kubelet transport (#990) was firewalled shut on every appliance**](https://github.com/spatiumddi/spatiumddi/issues/993)
+  — the supervisor's `input` chain is `policy drop` and opened 10250 to
+  *cluster peers* only, an empty set on a single node, so the rule was not
+  emitted at all. A non-hostNetwork api pod reaching its own node's IP
+  enters via `cni0` with a pod-CIDR source and traverses INPUT like any LAN
+  packet — which is why 6443 (widened to peers ∪ pod ∪ svc) answered from
+  the same pod at the same moment. So #983 item 6's end state, dropping the
+  broad `nodes/proxy` grant, was unreachable: it would have blanked the
+  cluster-health screen on every appliance.
+  Now a second rule scopes 10250 to **pod ∪ service** — deliberately *not*
+  the operator's `kubeapi_expose_cidrs` allowlist, which exists so someone
+  can reach the RBAC-guarded apiserver from the LAN and has no business
+  widening an API that serves `/exec`, `/run` and `/attach`. New
+  `source_kind="kubelet"`; seeded at seq 25 by migration `d4a9e37b2c15`,
+  since the byte-identity contract across the **three** renderers
+  (supervisor in-pod, the frozen 2a port, the 3b merge) is on the emitted
+  *order*, not just the set.
+  The probe's socket timeout drops **6 s → 1.5 s**: the snapshot probes each
+  node before it can fall back, so on 3 nodes that first stall was ~18 s and
+  the browser gave up first — the api logged the request cancelled
+  mid-flight with its DB connection torn down under it.
+  **Found on the way:** `test_builtin_seed_matches_migration` compared the
+  flat concatenation of every seed migration's policies, which can only
+  express a migration adding a whole *policy*. It now folds contributions
+  onto the policy they belong to and sorts by `seq` — what has to match is
+  the state a fresh DB reaches, not the order the files happen to be listed
+  in. A second test covers what folding hides: the in-code list must itself
+  be in `seq` order, because `builtin_policy_set` preserves list order while
+  `_policy_from_orm` sorts, so an out-of-order entry makes an unseeded DB
+  render different bytes from a seeded one.
+- ✅ [**Boot cosmetics — a failed console unit and a Warning event on every healthy first boot**](https://github.com/spatiumddi/spatiumddi/issues/994)
+  — both make `systemctl --failed` and the events feed lie about a healthy
+  node, which is how operators learn to skim past the one that matters.
+  `spatium-console@ttyS0` exits 75 when there is no serial device (the
+  kernel cmdline carries `console=ttyS0` on every install; most VMs have no
+  serial port), and `RestartPreventExitStatus` stopped the loop but left the
+  unit `failed` — `SuccessExitStatus=75` records the probe's "nothing to
+  render here" verdict as the success it is. Applied to the tty1 twin too:
+  75 means the same thing on both and they should not disagree.
+  The TLS Secret manifest is now **staged** as `.deferred` and renamed in
+  once `kubectl get namespace spatium` succeeds, mirroring the control
+  chart's existing deferral, with placement forced on the k3s-never-ready
+  path so a slow boot can never strand the appliance's only Web UI cert.
+  **The fix the issue proposed was not taken, deliberately:** prepending a
+  `kind: Namespace` would put one object in two k3s Addon object sets, and
+  wrangler prunes what an addon used to own — so the two would fight over
+  the owner annotation on every resync and removing either manifest would
+  delete the namespace and everything in it. That is #992's failure shape
+  one layer down. Ordering by filename is no answer either: k3s reconciles
+  each Addon's contents asynchronously, so lexical order guarantees nothing.
+- ✅ [**DNS zone detail clipped its own primary action — eleven header buttons in one row**](https://github.com/spatiumddi/spatiumddi/issues/996)
+  — at ~1,460 px with the sidebar open, `+ Add Record` rendered as a `+`
+  sliver at the right edge. Folded into `Data ▾` / `Zone ▾` behind a new
+  shared `HeaderMenu` (`components/ui/header-menu.tsx`), leaving the shape
+  every detail page should read as: `Refresh`, at most two menus, one
+  primary action last. Each item keeps its `disabled` state **and its
+  `title` reason**; a menu whose items all vanish (a forward zone has
+  nothing to import or export) renders nothing rather than a trigger onto an
+  empty panel. `+ Add Record` gains a real binding declared in
+  `lib/shortcuts.ts`, so it appears in the `?` overlay instead of being
+  another `describedOnly` row.
+  **The extraction was the bigger half.** `IPAMPage.tsx` alone carried
+  **three** hand-rolled copies of the open-state + outside-mousedown dance
+  (`SyncMenu`, the subnet `ToolsMenu`, and a generic one confusingly already
+  named `HeaderMenu`), and the DNS header was about to be a fourth. All
+  three now adapt onto the shared primitive, which also gives them the
+  keyboard handling every copy left out.
+  Independent of the menus, the header gets `flex-wrap` + `min-w-0 flex-1` +
+  `shrink-0` so a narrow window wraps rather than clips — the Wave D
+  admin-page rule, applied to the IPAM subnet header too.
+  **The audit the issue asked for:** no other detail header is over the
+  line. IPAM subnet detail is already `Refresh` + three menus + a primary;
+  DHCP scope, DNS server-group and the Fleet drilldown are well under. The
+  two IPAM headers that *look* heavy are bulk-selection toolbars whose
+  branches are mutually exclusive.
+  **This is also the repo's first component test.** `jsdom` +
+  `@testing-library/react` are new dev dependencies (not shipped, so no
+  `NOTICE` entry) because a keyboard menu's failure modes — an arrow key
+  that does not wrap, a disabled item that still takes focus — are invisible
+  to review and to `tsc` alike. It earned its keep on the first run, catching
+  that `focusItem(0, -1)` lands on the *last* item rather than the first.
+
 #### CLI tool
 
 - ⬜ [**`spddi` CLI**](https://github.com/spatiumddi/spatiumddi/issues/83)

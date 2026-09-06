@@ -49,6 +49,20 @@ RestartSec=2
 # cluster_pods() call that gets terminated mid-flight and spams the
 # docker daemon journal with "broken pipe" entries.
 RestartPreventExitStatus=75
+# #994 — and record that verdict as a SUCCESS, not a failure.
+#
+# The kernel cmdline carries ``console=ttyS0,115200n8`` on every install and
+# mkosi.postinst enables this instance unconditionally, so on the common VM
+# with no serial device (Proxmox, VMware, Hyper-V) the probe above fires on
+# every boot. Without this line the unit is left ``failed``, which means
+# ``systemctl --failed`` is never empty on a perfectly healthy appliance —
+# and an operator who learns to ignore that list will ignore it on the boot
+# where it matters. "There is no serial port here, nothing to render" is the
+# probe working, so it exits clean and the unit reads ``inactive (dead)``.
+#
+# RestartPreventExitStatus stays: SuccessExitStatus alone would leave 75
+# subject to ``Restart=always``, which restarts on success too.
+SuccessExitStatus=75
 UtmpIdentifier=%I
 UtmpMode=user
 OOMScoreAdjust=-100

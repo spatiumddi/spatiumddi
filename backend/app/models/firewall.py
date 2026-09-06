@@ -195,8 +195,10 @@ class FirewallRule(UUIDPrimaryKeyMixin, Base):
     fine-grained scoping: literal ``cidr``/``alias``, ``any`` (no saddr
     clause), or a DERIVED scope the merge resolves per-node at render time
     (``cluster_peers`` / ``pod_cidr`` / ``service_cidr`` / ``kubeapi`` =
-    the 6443 union / ``mgmt`` / ``vip``). ``render_guard`` carries emission
-    conditions for builtins (e.g. memberlist only when multi-node + VIP).
+    the 6443 union / ``kubelet`` = pod ∪ service, WITHOUT the operator's
+    kubeapi_expose allowlist / ``mgmt`` / ``vip``). ``render_guard`` carries
+    emission conditions for builtins (e.g. memberlist only when
+    multi-node + VIP).
     """
 
     __tablename__ = "firewall_rule"
@@ -215,7 +217,7 @@ class FirewallRule(UUIDPrimaryKeyMixin, Base):
     ports: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)  # [53] / [67,68] / []
     source_kind: Mapped[str] = mapped_column(
         String(16), nullable=False, default="any", server_default=text("'any'")
-    )  # any|cidr|alias|cluster_peers|pod_cidr|service_cidr|kubeapi|mgmt|vip
+    )  # any|cidr|alias|cluster_peers|pod_cidr|service_cidr|kubeapi|kubelet|mgmt|vip
     source_cidrs: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
     source_alias: Mapped[str | None] = mapped_column(String(64), nullable=True)
     family: Mapped[str] = mapped_column(

@@ -40,6 +40,7 @@ import {
   Cloud,
   ExternalLink,
   ArrowRightLeft,
+  Database,
 } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import { ConfigApplyChip } from "@/components/ConfigApplyChip";
@@ -62,6 +63,13 @@ import { usePermissions } from "@/hooks/usePermissions";
 import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
+import { HeaderMenu } from "@/components/ui/header-menu";
+import {
+  ADD_DNS_RECORD,
+  formatCombo,
+  isTypingTarget,
+  matchesShortcut,
+} from "@/lib/shortcuts";
 import { Pager } from "@/components/ui/pager";
 import { AskAIButton } from "@/components/copilot/AskAIButton";
 import { ServicesUsingButton } from "@/components/ServicesUsingButton";
@@ -3571,6 +3579,39 @@ function ZoneDetailView({
   // for a forwarders/policy panel and hides the record-management buttons.
   const isForward = zone.zone_type === "forward";
 
+  // #996 — the Add Record keycap, rendered from lib/shortcuts.ts rather
+  // than typed here, so retuning the binding moves the handler below,
+  // this tooltip and the ``?`` overlay together.
+  const addRecordHint = formatCombo(ADD_DNS_RECORD.combos[0]);
+
+  // …and the handler it describes. Stands down inside form fields (the
+  // same ``isTypingTarget`` guard ``?`` uses — a bare letter would
+  // otherwise fire while the operator types a hostname), on a forward
+  // zone (no records to add), on a Tailscale-owned zone (the reconciler
+  // owns them), and while any modifier is held so browser bindings are
+  // untouched. Also stands down while a dialog is open, or ``n`` on a
+  // modal's own button would stack a second Add Record behind the first.
+  //
+  // ``[role="dialog"]`` is the signal because every modal in the app goes
+  // through the shared ``Modal`` primitive, which sets it (the standing
+  // rule is that pages never reintroduce a local one). A custom shape
+  // built on ``useDraggableModal`` + ``MODAL_BACKDROP_CLS`` directly
+  // would not be matched — hence the explicit ``showAddRecord`` check,
+  // which covers the case that actually matters whatever it is built on.
+  useEffect(() => {
+    if (isForward || zone.tailscale_tenant_id) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      if (isTypingTarget(e.target)) return;
+      if (!matchesShortcut(e, ADD_DNS_RECORD)) return;
+      if (showAddRecord || document.querySelector('[role="dialog"]')) return;
+      e.preventDefault();
+      setShowAddRecord(true);
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [isForward, zone.tailscale_tenant_id, showAddRecord]);
+
   // Records / Pools sub-tab toggle. Pools live under the same zone but
   // need their own management surface — health-check config, member
   // states, manual enable toggles. Forward zones don't host records,
@@ -3633,10 +3674,14 @@ function ZoneDetailView({
 
   return (
     <div className="flex flex-col h-full">
-      {/* Zone header */}
-      <div className="flex items-center justify-between border-b px-5 py-3">
-        <div>
-          <div className="flex items-center gap-2">
+      {/* Zone header — #996: wraps rather than clips. ``flex-wrap`` on the
+          row plus ``min-w-0 flex-1`` here and ``shrink-0`` on the action
+          block is the Wave D admin-page rule; without it a narrow window
+          squeezes the title line and pushes the primary action off the
+          right edge instead of moving the actions to a second line. */}
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b px-5 py-3">
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
             {swatchCls(zone.color) ? (
               <span
                 className={cn(
@@ -3687,7 +3732,14 @@ function ZoneDetailView({
             {serverState && <ZoneSyncPill state={serverState} />}
           </p>
         </div>
-        <div className="flex items-center gap-2">
+        {/* #996 — three visible actions, the rest folded into two menus.
+            This row had ELEVEN peer buttons and did not wrap, so at
+            ~1,460px with the sidebar open the primary action was clipped
+            to a sliver. ``shrink-0`` here plus ``min-w-0`` on the title
+            block above is the other half: with menus the row fits, but a
+            narrow window must wrap the actions under the title rather
+            than clip them again (the Wave D admin-page rule). */}
+        <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
           <AskAIButton
             context={[
               `DNS zone ${zone.name}`,
@@ -3729,95 +3781,128 @@ function ZoneDetailView({
               Refresh
             </HeaderButton>
           )}
-          {!isForward && (
-            <>
-              <HeaderButton
-                icon={RefreshCw}
-                iconClassName={syncMut.isPending ? "animate-spin" : ""}
-                onClick={() => syncMut.mutate()}
-                disabled={syncMut.isPending}
-                title="Two-way additive sync with the zone's authoritative server: AXFR missing records into SpatiumDDI, then push anything in our DB that isn't on the wire. Never deletes."
-              >
-                {syncMut.isPending ? "Syncing…" : "Sync with server"}
-              </HeaderButton>
-              <HeaderButton icon={Upload} onClick={() => setShowImport(true)}>
-                Import
-              </HeaderButton>
-              <HeaderButton icon={Download} onClick={handleExport}>
-                Export
-              </HeaderButton>
-            </>
-          )}
-          {showDelegateButton && (
-            <HeaderButton
-              icon={Workflow}
-              onClick={() => setShowDelegate(true)}
-              title="The parent zone is missing NS / glue records for this zone. Click to review and create them."
-            >
-              Delegate
-            </HeaderButton>
-          )}
           <ServicesUsingButton
             kind="dns_zone"
             resourceId={zone.id}
             label={zone.name}
           />
-          {(zone.zone_type === "primary" || zone.zone_type === "master") &&
-            moduleEnabled("dns.dynamic_update_acl") && (
-              <HeaderButton
-                icon={KeyRound}
-                onClick={() => setShowUpdateAcl(true)}
-                title="Manage which external clients (by TSIG key or source IP/CIDR) may send RFC 2136 dynamic updates to this zone."
-              >
-                Dynamic Updates
-              </HeaderButton>
-            )}
-          <HeaderButton
-            icon={Pencil}
-            onClick={() => setShowEditZone(true)}
-            disabled={!!zone.tailscale_tenant_id}
-            title={
-              zone.tailscale_tenant_id
-                ? "This zone is synthesised by the Tailscale integration; edits would be overwritten on the next sync."
-                : undefined
+          {/* Data ▾ — everything that moves records in or out. A forward
+              zone stores no records at all, so this collapses to nothing
+              and HeaderMenu declines to render a trigger. */}
+          <HeaderMenu
+            label="Data"
+            icon={Database}
+            title="Import, export, or reconcile this zone's records with its authoritative server"
+            items={
+              isForward
+                ? []
+                : [
+                    {
+                      key: "sync",
+                      label: syncMut.isPending
+                        ? "Syncing…"
+                        : "Sync with server",
+                      icon: RefreshCw,
+                      iconClassName: syncMut.isPending ? "animate-spin" : "",
+                      disabled: syncMut.isPending,
+                      onSelect: () => syncMut.mutate(),
+                      title:
+                        "Two-way additive sync with the zone's authoritative server: AXFR missing records into SpatiumDDI, then push anything in our DB that isn't on the wire. Never deletes.",
+                    },
+                    {
+                      key: "import",
+                      label: "Import",
+                      icon: Upload,
+                      onSelect: () => setShowImport(true),
+                    },
+                    {
+                      key: "export",
+                      label: "Export",
+                      icon: Download,
+                      onSelect: handleExport,
+                    },
+                  ]
             }
-          >
-            Edit Zone
-          </HeaderButton>
-          <HeaderButton
-            icon={ArrowRightLeft}
-            onClick={() => setShowMoveZone(true)}
-            disabled={!!zone.tailscale_tenant_id}
-            title={
-              zone.tailscale_tenant_id
-                ? "This zone is synthesised by the Tailscale integration; it is bound to that tenant's group."
-                : "Move this zone to another server group"
-            }
-          >
-            Move
-          </HeaderButton>
-          <HeaderButton
-            variant="destructive"
-            icon={Trash2}
-            onClick={() => setConfirmDelete(true)}
-            disabled={!!zone.tailscale_tenant_id}
-            title={
-              zone.tailscale_tenant_id
-                ? "Delete the Tailscale tenant or unbind its DNS group to release this zone."
-                : undefined
-            }
-          >
-            Delete Zone
-          </HeaderButton>
-          {!isForward && (
-            <HeaderButton
-              icon={Plus}
-              onClick={() => setShowAddSubzone(true)}
-              title={`Create a sub-zone under ${zone.name.replace(/\.$/, "")}`}
-            >
-              Sub-zone
-            </HeaderButton>
-          )}
+          />
+          {/* Zone ▾ — the once-per-zone lifecycle actions, Delete last. */}
+          <HeaderMenu
+            label="Zone"
+            icon={Settings2}
+            title="Edit, move, delegate or delete this zone"
+            badge={showDelegateButton}
+            badgeTitle="The parent zone is missing NS / glue records for this zone."
+            items={[
+              ...(showDelegateButton
+                ? [
+                    {
+                      key: "delegate",
+                      label: "Delegate",
+                      icon: Workflow,
+                      onSelect: () => setShowDelegate(true),
+                      title:
+                        "The parent zone is missing NS / glue records for this zone. Review and create them.",
+                    },
+                  ]
+                : []),
+              {
+                key: "edit",
+                label: "Edit Zone",
+                icon: Pencil,
+                onSelect: () => setShowEditZone(true),
+                disabled: !!zone.tailscale_tenant_id,
+                title: zone.tailscale_tenant_id
+                  ? "This zone is synthesised by the Tailscale integration; edits would be overwritten on the next sync."
+                  : undefined,
+              },
+              ...((zone.zone_type === "primary" ||
+                zone.zone_type === "master") &&
+              moduleEnabled("dns.dynamic_update_acl")
+                ? [
+                    {
+                      key: "dynamic-updates",
+                      label: "Dynamic Updates",
+                      icon: KeyRound,
+                      onSelect: () => setShowUpdateAcl(true),
+                      title:
+                        "Manage which external clients (by TSIG key or source IP/CIDR) may send RFC 2136 dynamic updates to this zone.",
+                    },
+                  ]
+                : []),
+              ...(!isForward
+                ? [
+                    {
+                      key: "subzone",
+                      label: "Sub-zone",
+                      icon: Plus,
+                      onSelect: () => setShowAddSubzone(true),
+                      title: `Create a sub-zone under ${zone.name.replace(/\.$/, "")}`,
+                    },
+                  ]
+                : []),
+              {
+                key: "move",
+                label: "Move",
+                icon: ArrowRightLeft,
+                onSelect: () => setShowMoveZone(true),
+                disabled: !!zone.tailscale_tenant_id,
+                title: zone.tailscale_tenant_id
+                  ? "This zone is synthesised by the Tailscale integration; it is bound to that tenant's group."
+                  : "Move this zone to another server group",
+              },
+              {
+                key: "delete",
+                label: "Delete Zone",
+                icon: Trash2,
+                destructive: true,
+                separatorBefore: true,
+                onSelect: () => setConfirmDelete(true),
+                disabled: !!zone.tailscale_tenant_id,
+                title: zone.tailscale_tenant_id
+                  ? "Delete the Tailscale tenant or unbind its DNS group to release this zone."
+                  : undefined,
+              },
+            ]}
+          />
           {!isForward && (
             <HeaderButton
               variant="primary"
@@ -3827,7 +3912,7 @@ function ZoneDetailView({
               title={
                 zone.tailscale_tenant_id
                   ? "Records are managed by the Tailscale reconciler."
-                  : undefined
+                  : `Add a record to ${zone.name.replace(/\.$/, "")} (${addRecordHint})`
               }
             >
               Add Record

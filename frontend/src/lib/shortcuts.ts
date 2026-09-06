@@ -193,6 +193,25 @@ export const SHOW_SHORTCUTS: Shortcut = {
   description: "Show keyboard shortcuts",
 };
 
+/**
+ * Add a record to the open DNS zone. Matched in `DNSPage.tsx` (#996).
+ *
+ * `+ Add Record` became the only always-visible primary on the zone
+ * detail when the eleven-button header folded into two menus, so it
+ * earns a binding — and a WIRED one rather than a `describedOnly` row,
+ * per the note at the top of this file.
+ *
+ * `mod` is deliberately absent: ⌘N / Ctrl+N is "new window" in every
+ * browser and cannot be intercepted reliably, and ⌘⇧N is "new private
+ * window". A bare letter is safe because `isTypingTarget` stands the
+ * handler down inside form fields — the same guard `?` relies on.
+ */
+export const ADD_DNS_RECORD: Shortcut = {
+  id: "dns-add-record",
+  combos: [{ key: "n" }],
+  description: "Add a record to the open zone",
+};
+
 export const SHORTCUT_GROUPS: ShortcutGroup[] = [
   {
     id: "global",
@@ -259,6 +278,12 @@ export const SHORTCUT_GROUPS: ShortcutGroup[] = [
         describedOnly: true,
       },
     ],
+  },
+  {
+    id: "dns-zone",
+    title: "DNS zone",
+    context: "while a zone's records are open",
+    shortcuts: [ADD_DNS_RECORD],
   },
   {
     id: "tables",

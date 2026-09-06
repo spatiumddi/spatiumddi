@@ -68,6 +68,11 @@ RestartSec=2
 # isn't usable (rare on tty1 itself, but mirrors the @.service
 # instance template for consistency).
 RestartPreventExitStatus=75
+# #994 — and, for the same reason as the @.service instance, record that
+# verdict as a SUCCESS rather than leaving the unit ``failed``. Rare here
+# (tty1 exists on essentially every boot), but 75 means the same thing on
+# both units and they should not disagree about whether it is an error.
+SuccessExitStatus=75
 UtmpIdentifier=spc1
 UtmpMode=user
 # Same nicety getty@.service applies — keep us out of the OOM killer

@@ -33,6 +33,9 @@ Per-role openings:
 
 Control-plane derived (#272 Phase 7b + #285 Phase 1 — CP nodes only):
 
+* kubelet ``10250`` additionally scoped to pod ∪ service CIDRs (#993) so
+  the api pod can read its OWN node's kubelet — the peer rule below never
+  covers that, and on a single node is not emitted at all
 * etcd ``2379`` / ``2380`` + kubelet ``10250`` scoped to the peer
   node IPs — NEVER LAN-wide (the #285 hardening).
 * kube-apiserver ``6443`` scoped to peers ∪ pod CIDR ∪ service CIDR ∪
@@ -178,6 +181,23 @@ _ROLE_PORTS_UDP: dict[str, list[int]] = {
 ETCD_PEER_PORT = 2380
 _K3S_ETCD_KUBELET_TCP: tuple[int, ...] = (2379, ETCD_PEER_PORT, 10250)
 _K3S_APISERVER_TCP = 6443
+# #993 — the kubelet, reachable from INSIDE the cluster as well as from
+# peers. The peer-scoped rule above covers a kubelet on another node; this
+# covers the api pod reading its OWN node's kubelet, which #990's direct
+# cluster-health transport needs and which no rule opened: a non-hostNetwork
+# pod talking to its node's IP enters via cni0 with a pod-CIDR source and
+# traverses INPUT like any LAN packet, and ``cluster_peer_cidrs`` is EMPTY on
+# a single node, so the peer rule was not even emitted. Every appliance
+# therefore fell back to the apiserver ``nodes/proxy`` transport after a full
+# connect timeout per node, on the request path.
+#
+# Scoped to pod ∪ service ONLY — deliberately NOT the operator's
+# ``kubeapi_expose_cidrs`` allowlist that widens 6443. That list exists so an
+# operator can reach the APISERVER from the LAN, which is guarded by RBAC on
+# every request; the kubelet API is a different proposition (``/exec``,
+# ``/run``, ``/attach``), and quietly extending a "let me run kubectl"
+# allowlist to it would be a privilege escalation nobody asked for.
+_K3S_KUBELET_TCP = 10250
 _METALLB_MEMBERLIST = 7946
 
 
@@ -379,6 +399,20 @@ def render_drop_in(
                 "kubeapi",
             )
             tcp_ports.add(_K3S_APISERVER_TCP)
+        # kubelet 10250 — pod ∪ svc (peers are covered by the k3s-peer rule
+        # above). Emitted whenever this is a CP node, single or HA.
+        kubelet_v4, kubelet_v6 = _split_families(
+            list(pod_cidrs or []) + list(service_cidrs or [])
+        )
+        if kubelet_v4 or kubelet_v6:
+            _emit_family_rule(
+                lines,
+                kubelet_v4,
+                kubelet_v6,
+                f"tcp dport {_K3S_KUBELET_TCP} accept",
+                "kubelet",
+            )
+            tcp_ports.add(_K3S_KUBELET_TCP)
         # MetalLB memberlist 7946 tcp+udp — peers only, gated on a
         # genuinely multi-node cluster + a configured VIP. Derived from
         # the membership model, NOT a metallb_enabled flag the

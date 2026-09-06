@@ -74,7 +74,21 @@ FIREWALL_RESOURCE = "appliance"
 _SCOPE_KINDS = frozenset({"fleet", "role", "appliance"})
 _ROLES = frozenset(_POLICY_ROLES)
 _SOURCE_KINDS = frozenset(
-    {"any", "cidr", "alias", "cluster_peers", "pod_cidr", "service_cidr", "kubeapi", "mgmt", "vip"}
+    {
+        "any",
+        "cidr",
+        "alias",
+        "cluster_peers",
+        "pod_cidr",
+        "service_cidr",
+        "kubeapi",
+        # #993 — pod ∪ service, deliberately WITHOUT the operator's
+        # kubeapi_expose allowlist: that widens the RBAC-guarded apiserver,
+        # and the kubelet API is not the same proposition.
+        "kubelet",
+        "mgmt",
+        "vip",
+    }
 )
 _PROTOCOLS = frozenset({"tcp", "udp", "icmp", "icmpv6"})
 _ACTIONS = frozenset({"accept", "drop"})
