@@ -20,11 +20,10 @@ from __future__ import annotations
 import re
 import shutil
 import subprocess
-import sys
 
 import pytest
 
-from _installer_source import CODE, PARSER, SRC, extract_fn
+from _installer_source import CODE, PARSER, extract_fn
 
 RENDERER = PARSER.parent / "spatium-etc-render"
 

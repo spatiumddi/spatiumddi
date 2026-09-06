@@ -34,7 +34,7 @@ from pathlib import Path
 
 import pytest
 
-from _installer_source import CODE, INSTALLER, extract_fn as _extract
+from _installer_source import CODE, extract_fn as _extract
 
 
 # A box with two disks and a stacked target:
