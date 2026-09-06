@@ -15,7 +15,7 @@ enforced neither:
     UTC. A typo produced a box silently hours out.
 
 The fix was to let the wizard CALL the parser's rules rather than
-transcribe a 26-entry reserved-account list and a zone check into bash —
+transcribe the reserved-account list and a zone check into bash —
 two copies that drift. This file tests that shared entry point, plus the
 two holes the pre-existing preseed-side timezone check had.
 
@@ -32,9 +32,8 @@ from pathlib import Path
 
 import pytest
 
-BIN = Path(__file__).parent.parent / "mkosi.extra" / "usr" / "local" / "bin"
-PARSER = BIN / "spatium-preseed-parse"
-INSTALLER = BIN / "spatium-install"
+from _installer_source import INSTALLER, PARSER
+
 ZONEINFO = Path("/usr/share/zoneinfo")
 
 

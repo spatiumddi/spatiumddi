@@ -17,24 +17,8 @@ HOW TO RUN (from the repo root):
 from __future__ import annotations
 
 import re
-from pathlib import Path
 
-INSTALLER = (
-    Path(__file__).parent.parent / "mkosi.extra" / "usr" / "local" / "bin" /
-    "spatium-install"
-)
-SRC = INSTALLER.read_text(encoding="utf-8")
-# Comment-stripped view. Every one of these guards asserts on the ABSENCE
-# of a token, and each item's comment explains the bug by quoting the code
-# it replaced — so matching raw text would report the explanation as the
-# regression.
-CODE = "\n".join(ln.split("#", 1)[0] for ln in SRC.splitlines())
-
-
-def _fn(name: str) -> str:
-    m = re.search(rf"^{re.escape(name)}\(\) \{{$.*?^\}}$", SRC, re.MULTILINE | re.DOTALL)
-    assert m, f"{name}() not found in {INSTALLER}"
-    return m.group(0)
+from _installer_source import CODE, SRC, extract_fn as _fn
 
 
 # ── Item 1 — the install logs survive the reboot ──────────────────────
@@ -50,13 +34,43 @@ def test_installer_logs_are_copied_to_the_target():
     assert "spatium-install-launch.log" in fn
 
 
-def test_installer_logs_are_root_only():
-    """The trace log is a full bash xtrace of the install: no secrets
-    after the pairing-code fix, but every hostname, address and disk name
-    the wizard touched."""
+def test_installer_logs_are_readable_by_the_api_uid():
+    """0755/0644, matching every sibling in that directory.
+
+    The first cut used 0700/0600, which is defensible in isolation and
+    silently breaks the collector half of the same change: the api reads
+    these through a read-only bind mount as uid 1000, with no fsGroup and
+    no userns remap, so root-only modes make iterdir() raise
+    PermissionError and the bundle ship an error note instead of the logs
+    — on every appliance, forever. firstboot chmods the parent 0755 and
+    logrotate creates the siblings 0644 for exactly this reason.
+    """
     fn = _fn("_save_install_logs")
-    assert "chmod 0700" in fn
-    assert "chmod 0600" in fn
+    assert "chmod 0755" in fn
+    assert "chmod 0644" in fn
+    assert "0700" not in fn and "0600" not in fn
+
+
+def test_saving_logs_reports_what_actually_happened():
+    """An unconditional success line is the last thing written to the log
+    that is then not copied — so on a read-only /var it ends with a claim
+    the WARNs above it disprove."""
+    fn = _fn("_save_install_logs")
+    assert "saved=$((saved + 1))" in fn
+    assert 'if [ "$saved" -gt 0 ]; then' in fn
+
+
+def test_logs_are_also_saved_on_the_failure_path():
+    """The three fatal aborts this change introduced all sit UPSTREAM of
+    the 94% success-path call, so without this the failures that most
+    need a durable record are the ones that leave none — and the
+    operator's natural next move re-runs the installer, whose startup
+    truncates both logs."""
+    fn = _fn("on_failure")
+    assert "_save_install_logs" in fn
+    # Guarded: the trap also fires from the wizard prompts, long before
+    # anything is mounted.
+    assert '[ -d "$MOUNT/var/log" ]' in fn
 
 
 def test_saving_logs_cannot_abort_a_successful_install():
@@ -91,11 +105,19 @@ def _grub_block() -> str:
 
 
 def test_neither_grub_install_is_unconditionally_ignored():
+    """Anchored on the grub-install invocations themselves.
+
+    A blanket "no `|| true` in this block" was the first shape of this
+    test and it is too broad: the boot-leg marker write is deliberately
+    best-effort, and a failure to record a warning must not abort an
+    install that otherwise succeeded.
+    """
     blk = _grub_block()
-    assert "|| true" not in blk, (
-        "a grub-install whose failure is swallowed shows the Done screen "
-        "on a box that will not boot"
-    )
+    for line in blk.splitlines():
+        if "grub-install" in line or "--bootloader-id" in line:
+            assert "|| true" not in line, line
+    # And the swallow the item was filed about is gone specifically.
+    assert ">> \"$INSTALL_LOG\" 2>&1 || true" not in blk
 
 
 def test_both_firmware_modes_have_a_fatal_branch():
@@ -162,15 +184,98 @@ def test_done_screen_offers_the_live_address_in_dhcp_mode():
     assert "ip -4 -br addr" in _done_block()
 
 
-def test_done_screen_height_is_computed_and_clamped_to_the_terminal():
+def test_both_operator_data_screens_are_sized_to_their_content():
     """An 80x24 serial console is a first-class install path here
-    (spatium-console@ttyS0), and newt does not draw a window taller than
-    the screen. The role block makes the body length vary, so a fixed
-    height cannot be right for both."""
-    blk = SRC[SRC.index("    local done_rows"):SRC.index('--msgbox "$done_body"') + 60]
-    assert "stty size" in blk
-    assert "term_rows - 1" in blk
-    assert '"$done_h" 76' in blk
+    (spatium-console@ttyS0), newt clips rather than scrolls, and the
+    longest line on each of these screens is operator-supplied — a
+    control-plane URL, a /dev/disk/by-id target path. A hardcoded height
+    is wrong exactly when the content is unusual."""
+    for screen in ('--msgbox "$done_body"', '--yesno "$s"'):
+        i = SRC.index(screen)
+        assert "_whiptail_height" in SRC[i:i + 120], screen
+
+
+def test_the_height_helper_counts_wrapped_rows_and_clamps():
+    fn = _fn("_whiptail_height")
+    # fold, not `wc -l` on the raw body: whiptail re-wraps at ~width-4.
+    assert "fold -s -w" in fn
+    assert "stty size" in fn
+    assert "term - 1" in fn
+
+
+def test_the_done_msgbox_cannot_abort_a_successful_install():
+    """whiptail returns 255 on ESC and `set -e` is still on, so without
+    `|| true` an operator who dismisses the final screen with ESC aborts
+    an install that already succeeded and never reaches the reboot."""
+    i = SRC.index('--msgbox "$done_body"')
+    assert "|| true" in SRC[i:i + 140]
+
+
+def test_the_other_boot_leg_failing_is_surfaced_not_just_logged():
+    """Confirm has by then already told the operator that leg was being
+    installed too. A log line nobody reads does not retract it."""
+    assert 'BOOT_LEG_WARNING=""' in SRC
+    blk = _grub_block()
+    # A FILE, because the whole install runs inside `{ … } | whiptail
+    # --gauge` and the left side of a pipeline is a subshell — a variable
+    # set there is discarded before the Done screen reads it. shellcheck
+    # reports that as SC2030/SC2031, and did, about the first version.
+    assert blk.count("$BOOT_LEG_MISSING_FILE") == 2
+    assert "BOOT_LEG_WARNING=" not in blk, (
+        "a variable assignment here is lost with the pipeline's subshell"
+    )
+    assert "BOOT_LEG_WARNING" in _done_block()
+    # Cleared before the pipeline, or a previous attempt's marker makes
+    # this run report a bootloader failure that did not happen.
+    assert 'rm -f "$BOOT_LEG_MISSING_FILE"' in CODE
+
+
+def test_an_unreleased_device_mapper_map_refuses_before_the_wipe():
+    """`wipefs -af` FORCES — measured, it returns 0 on a disk held open by
+    a live map, as does `sgdisk -Z`; only `blockdev --rereadpt` fails, and
+    that is `|| true`. So nothing downstream catches an unreleased map:
+    the GPT is destroyed, the kernel keeps the stale table, and mkfs
+    writes at the old offsets. The refusal has to be explicit."""
+    fn = _fn("_assert_target_released")
+    assert "_dm_maps_on_target" in fn
+    assert "exit 1" in fn
+    gate = CODE.index("_assert_target_released")
+    wipe = CODE.index('wipefs -af "$TARGET_DISK"')
+    assert gate < wipe, "the release gate must run before the wipe"
+
+
+def test_the_admin_account_is_checked_before_the_wipe_too():
+    """useradd is fatal now, at ~63% — after the disk is wiped. The
+    reserved-account list is a hand-written approximation that misses
+    `_apt`; the live rootfs IS the target rootfs, so its own passwd
+    database answers exactly, and keeps answering as packages change."""
+    fn = _fn("_assert_admin_user_available")
+    assert "getent passwd" in fn
+    assert "preseed_halt" in fn, "an unattended run must halt loudly"
+    call = CODE.index("    _assert_admin_user_available")
+    wipe = CODE.index('wipefs -af "$TARGET_DISK"')
+    assert call < wipe
+
+
+def test_every_prefilled_inputbox_guards_against_a_leading_dash():
+    """whiptail uses popt, so a default beginning with `-` is parsed as an
+    option: it exits 1 without drawing anything, and the state machine
+    reads that as Back. Since the value re-prefilled is the REJECTED one,
+    the validate-and-retry loops turn that into an inescapable bounce."""
+    bad = [
+        ln.strip() for ln in SRC.splitlines()
+        if "3>&1 1>&2 2>&3" in ln
+        and re.search(r'\d+ +"\$[A-Za-z_]', ln)  # ends `<width> "$VAR"`
+        and " -- " not in ln
+    ]
+    assert not bad, bad
+
+
+def test_one_resolver_for_the_preseed_parser():
+    """Three spellings would let the linter and the wizard find the repo's
+    parser while a real preseed load found the installed one."""
+    assert CODE.count('parser="$(dirname "$0")/spatium-preseed-parse"') == 1
+    assert "python3 /usr/local/bin/spatium-preseed-parse" not in CODE
 
 
 def test_confirm_no_longer_promises_dns_and_dhcp_at_install():

@@ -63,6 +63,10 @@ import sys
 # underscore, then lowercase / digits / underscore / hyphen, with an
 # optional trailing '$' for Samba machine accounts. 32-char limit is
 # useradd's own (utmp).
+# Matched with .fullmatch() below, not .match(): Python's ``$`` also
+# matches immediately BEFORE a trailing newline, so "netops\n" satisfied
+# this pattern — and a newline splits the ``user:password`` line piped to
+# chpasswd exactly the way the blocked ``:`` would.
 _ADMIN_USER_RE = re.compile(r"^[a-z_][a-z0-9_-]*\$?$")
 # Accounts the base image already ships. Handing one of these to
 # `useradd -m` fails ("user already exists") mid-install; `root` is
@@ -91,7 +95,7 @@ def validate_admin_user(name: str) -> str:
         return "admin_user is empty"
     if len(name) > 32:
         return f"admin_user {name!r} is longer than 32 characters (useradd's limit)"
-    if not _ADMIN_USER_RE.match(name):
+    if not _ADMIN_USER_RE.fullmatch(name):
         return (
             f"admin_user {name!r} is not a valid Linux username — must "
             "start with a lowercase letter or underscore and contain only "
@@ -115,13 +119,16 @@ def validate_timezone(tz: str) -> str:
     rejects the directory names that are also real paths under
     ``/usr/share/zoneinfo`` (``America`` exists; symlinking
     /etc/localtime at a directory breaks every timestamp on the box).
-    The TZif magic finally separates a zone from the other regular files
-    that live in the same tree — ``leapseconds``, ``posixrules``,
-    ``tzdata.zi`` — which are paths, are files, and are not zones.
+    The TZif magic finally rules out the non-zone regular files that live
+    in the same tree — ``leapseconds``, ``tzdata.zi`` — which are paths,
+    are files, and are not zones. It does NOT rule out ``posixrules``,
+    which on the distributions that still ship it is a byte copy of
+    America/New_York and therefore a perfectly valid TZif; naming it is a
+    strange way to ask for US Eastern, not a broken install.
     """
     if not tz:
         return "timezone is empty"
-    if not _TIMEZONE_RE.match(tz):
+    if not _TIMEZONE_RE.fullmatch(tz):
         return (
             f"timezone {tz!r} is not a valid IANA zone name — expected "
             "something like 'UTC', 'Europe/Berlin' or "
@@ -159,7 +166,10 @@ if len(sys.argv) >= 2 and sys.argv[1] == "--check-field":
             "usage: spatium-preseed-parse --check-field <field> <value>\n"
         )
         sys.exit(3)
-    _kind, _value = sys.argv[2], sys.argv[3]
+    # .strip() so the two doors agree: the preseed path normalises through
+    # as_str() before validating, and without this " netops " would be
+    # accepted headlessly and rejected interactively.
+    _kind, _value = sys.argv[2], sys.argv[3].strip()
     _validator = _FIELD_VALIDATORS.get(_kind)
     if _validator is None:
         sys.stderr.write(

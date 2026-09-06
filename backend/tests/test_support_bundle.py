@@ -653,3 +653,34 @@ def test_a_subdirectory_under_install_is_skipped(tmp_path, monkeypatch):
     out = collect_host_logs(Scrubber(enabled=False, seed="s"))
     assert "install/spatium-install.log" in out
     assert "install/nested" not in out
+
+
+def test_installer_logs_survive_an_empty_top_level_log_dir(tmp_path, monkeypatch):
+    """The regression the early return caused.
+
+    A box whose host log dir holds only ``install/`` is an install that
+    died before firstboot opened its own log — exactly the case item 1
+    exists for. The old ordering returned "No host log directory is
+    mounted" and dropped the install logs, while the directory it called
+    absent was sitting right there.
+    """
+    from app.services.support_bundle.collect import collect_host_logs
+
+    base = _installer_log_dir(tmp_path, monkeypatch)
+    (base / "firstboot.log").unlink()
+    (base / "install" / "spatium-install.log").write_text("[ts] Step: welcome\n")
+
+    out = collect_host_logs(Scrubber(enabled=False, seed="s"))
+    assert "install/spatium-install.log" in out
+    assert "_note.txt" not in out
+
+
+def test_a_truly_absent_host_log_dir_still_reports_the_note(tmp_path, monkeypatch):
+    """Control for the test above — the note must not have been lost."""
+    from app.services.appliance import diagnostics
+    from app.services.support_bundle.collect import collect_host_logs
+
+    monkeypatch.setattr(diagnostics, "_HOST_LOG_DIR", tmp_path / "nope")
+    monkeypatch.setattr(diagnostics, "_FALLBACK_LOG_DIR", tmp_path / "nope")
+    out = collect_host_logs(Scrubber(enabled=False, seed="s"))
+    assert list(out) == ["_note.txt"]

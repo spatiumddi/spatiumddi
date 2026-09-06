@@ -1811,8 +1811,12 @@ suggestion, free-space treemap.
   `TRACE_LOG` and the launch log all lived on the live ISO's tmpfs and the
   rootfs rsync excludes `/var/log/*`, so the one artefact explaining how a box
   was built was the one artefact the build threw away. Now copied to
-  `/var/log/spatiumddi/install/` (0700/0600) as the last write before the
-  unmount, and collected by the support bundle (#875). A **subdirectory**
+  `/var/log/spatiumddi/install/` as the last write before the unmount **and
+  from the failure path**, and collected by the support bundle (#875).
+  0755/0644, matching every sibling: the api reads them through the
+  read-only host-log mount as uid 1000, so the root-only modes the first cut
+  used would have made the collector ship a PermissionError instead of the
+  logs, on every appliance. A **subdirectory**
   deliberately, not a flat name: the host log dir is bind-mounted into the api
   pod and its collector globs `*.log` non-recursively, so a subdir keeps three
   static files out of the live Logs-tab dropdown *and* out of reach of
@@ -1831,7 +1835,7 @@ suggestion, free-space treemap.
   discovered after the reboot with the installer gone. Fatal now, and the
   username is validated at the prompt.
   **The validators are shared, not copied.** `admin_user` (32 chars, Debian's
-  `NAME_REGEX`, 26 reserved accounts) and `timezone` were enforced for the
+  `NAME_REGEX`, a reserved-account list) and `timezone` were enforced for the
   preseed path since #581 and by the interactive wizard **not at all**; rather
   than transcribe them into bash, the wizard shells out to
   `spatium-preseed-parse --check-field`, answered above that script's `import
@@ -1850,17 +1854,35 @@ suggestion, free-space treemap.
   **The device-mapper teardown removed every linear map on the machine**, not
   just the target's — so installing alongside existing storage tore down a
   volume group on another disk. Now a transitive closure from the target's own
-  partitions, to a fixed point (LVM-on-LUKS gives the LV no direct dependency on
-  the disk at all) and emitted outermost-first, since `dmsetup remove` refuses a
-  device another map sits on. A parse that yields nothing is the safe failure:
-  the maps stay, `wipefs` fails on the busy device, and the install aborts
-  before writing anything.
+  partitions to a fixed point (LVM-on-LUKS gives the LV no direct dependency on
+  the disk at all), one dependency level per pass so the emitted order is
+  provably outermost-first — `dmsetup remove` refuses a device another map sits
+  on. **The seed must exclude `dm-*`**, which the first cut got wrong: `lsblk`
+  walks holders unless given `-d`, so seeding from its raw output puts the very
+  maps being searched for into the "already known" set, and the function returns
+  nothing on precisely the disks it exists for. Caught in review, reproduced
+  against a real kernel with real maps — the fixture had modelled
+  `lsblk --nodeps`, so eight passing tests were exercising an inert function.
+  **And failing to release is a refusal now, not a corruption.** The first cut
+  reasoned that unreleased maps would make `wipefs` fail and abort the install
+  harmlessly. `wipefs -af` *forces*: measured, it and `sgdisk -Z` both return 0
+  on a disk held open by a live map, and only `blockdev --rereadpt` fails, which
+  the installer tolerates as advisory. The GPT would be destroyed, the kernel
+  would keep the stale partition table, and `mkfs` would write at the old
+  offsets. The release is verified explicitly now, before anything is written.
   **Found on the way, and a prerequisite for item 1:** #581 wrapped the password
   prompt in `set +x` and **missed the 8-digit pairing code beside it** — so
   `set -x` wrote it to the trace log that `on_failure` tails 30 lines of to the
   console, and that item 1 would now copy onto disk. A single-use code is spent
   on first boot; a persistent multi-claim code is a standing fleet-join
   credential.
+  **`useradd` being fatal needed a pre-wipe gate to go with it**, or a
+  reserved-list miss turns a recoverable mistake into an unbootable disk: it
+  fires at ~63%, after the wipe and the rsync, on an unattended run with nobody
+  watching. The list is a hand-written approximation that misses `_apt` — which
+  matches the username regex and comes from a package `mkosi.conf` names
+  explicitly. The live ISO's rootfs *is* the target rootfs, so `getent passwd`
+  answers exactly and keeps answering as packages change.
   Plus the stale text: the Done screen advertised `http://` (the frontend 301s
   to https), said first boot "pulls the SpatiumDDI container images" (baked
   since #170 Wave A4 — it *imports* them, nothing is downloaded), and showed a
@@ -1874,12 +1896,13 @@ suggestion, free-space treemap.
   `APPLIANCE_VERSION` instead of a hardcoded `0.1.0` — the first thing asked
   when an install misbehaves.
   No migration, no new endpoint, no MCP change, no new screen.
-  **69 new appliance tests**, and the two that matter most execute rather than
+  **78 new appliance tests**, and the ones that matter most execute rather than
   grep: the device-mapper closure runs against stubbed `lsblk`/`dmsetup` with a
   second disk present as the negative control, because the failure mode of
   getting it wrong is destroying someone else's data and a structural
   string-match would not catch an inverted comparison. Every guard was run
-  against the unpatched script.
+  against the unpatched script — and the fixture itself was the thing that had
+  to be fixed first, since it modelled an `lsblk` that does not exist.
 
 #### CLI tool
 

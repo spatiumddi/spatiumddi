@@ -1297,9 +1297,14 @@ trigger: tag push (CalVer)
 >   lived on the live ISO's tmpfs, and the rootfs rsync excludes
 >   `/var/log/*` — so after a bad first boot there was no record of what
 >   the installer had done. All three are now copied to
->   **`/var/log/spatiumddi/install/`** (0700/0600) as the last write
->   before the target is unmounted, and the support bundle (#875)
->   collects them. A subdirectory rather than a flat name on purpose:
+>   **`/var/log/spatiumddi/install/`** (0755/0644, matching every sibling
+>   in that directory — the api reads them through the read-only host-log
+>   bind mount as uid 1000, so root-only modes would have made the
+>   collector half of this ship a PermissionError instead of the logs) as
+>   the last write before the target is unmounted, **and from the failure
+>   path too**, since the fatal aborts below all happen earlier. The
+>   support bundle (#875) collects them. A subdirectory rather than a flat
+>   name on purpose:
 >   the appliance Logs tab globs `*.log` in that directory
 >   non-recursively, so three static install-time files stay out of the
 >   live-log dropdown, and `logrotate` does not age the install record
@@ -1328,9 +1333,29 @@ trigger: tag push (CalVer)
 > - **The device-mapper teardown is scoped to the target disk.** The
 >   pre-partition cleanup removed *every* linear device-mapper map on
 >   the machine, including LVM on a second disk the operator intended to
->   keep. It now walks the dependency graph to a fixed point from the
->   target's own partitions — so a stacked LVM-on-LUKS target is fully
->   released — and touches nothing else.
+>   keep. It now walks the dependency graph from the target's own
+>   partitions to a fixed point — so a stacked LVM-on-LUKS target is fully
+>   released, one dependency level per pass so the removal order is
+>   provably outermost-first — and touches nothing else. The seed
+>   deliberately excludes `dm-*`: `lsblk` walks holders unless given
+>   `-d`, so seeding from its raw output puts the very maps being looked
+>   for into the "already known" set.
+>   **And a map that cannot be released is now a refusal, not a
+>   corruption.** `wipefs -af` *forces* — measured against a disk held
+>   open by a live map, both it and `sgdisk -Z` return 0 and erase the
+>   table, and only `blockdev --rereadpt` fails, which the installer
+>   tolerates. So nothing downstream would have caught it: the GPT would
+>   be destroyed, the kernel would keep the stale partition table, and
+>   `mkfs` would write at the old offsets. The release is verified
+>   explicitly, before anything is written.
+> - **The admin account is checked before the wipe as well.** `useradd` is
+>   fatal now, at ~63% — after the disk is gone. The preseed parser's
+>   reserved-account list is a hand-written approximation of what the
+>   image ships and misses `_apt`, which matches the username regex and
+>   is created by a package `mkosi.conf` names explicitly. The live ISO's
+>   rootfs *is* the rootfs about to be copied onto the target, so
+>   `getent passwd` answers exactly, and keeps answering as the package
+>   set changes. Both the interactive and the preseed path reach it.
 > - **The screens say what is true.** The Done screen advertised
 >   `http://` (the frontend 301s to https), claimed first boot "pulls
 >   the SpatiumDDI container images" (baked into the rootfs since #170

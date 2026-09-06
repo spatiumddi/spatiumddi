@@ -433,12 +433,25 @@ def collect_host_logs(scrub: Scrubber) -> dict[str, str]:
     """Host log files, when the appliance bind-mount is present."""
     from app.services.appliance.diagnostics import _log_dir, list_log_sources
 
-    out: dict[str, str] = {}
+    # Installer logs FIRST, and the emptiness verdict after both, because
+    # the two early returns below used to sit above the installer
+    # collector: a box whose host log dir holds only ``install/`` — an
+    # install that died before firstboot opened its own log, i.e. exactly
+    # the case #995 item 1 exists for — got the "not mounted" note and no
+    # install logs, while the directory it says is absent was right there.
+    out: dict[str, str] = _collect_installer_logs(scrub)
     try:
         names = list_log_sources()
     except OSError as exc:
-        return {"_error.txt": f"{type(exc).__name__}: {exc}"}
-    if not names:
+        out["_error.txt"] = f"{type(exc).__name__}: {exc}"
+        return out
+    for name in names:
+        try:
+            raw = (_log_dir() / name).read_text(encoding="utf-8", errors="replace")
+            out[name] = cap(scrub.text(raw), CAP_LOG_BYTES)
+        except OSError as exc:
+            out[f"{name}.error"] = f"{type(exc).__name__}: {exc}"
+    if not out:
         return {
             "_note.txt": (
                 "No host log directory is mounted. Expected on docker-compose "
@@ -446,13 +459,6 @@ def collect_host_logs(scrub: Scrubber) -> dict[str, str]:
                 "view of the host filesystem."
             )
         }
-    for name in names:
-        try:
-            raw = (_log_dir() / name).read_text(encoding="utf-8", errors="replace")
-            out[name] = cap(scrub.text(raw), CAP_LOG_BYTES)
-        except OSError as exc:
-            out[f"{name}.error"] = f"{type(exc).__name__}: {exc}"
-    out.update(_collect_installer_logs(scrub))
     return out
 
 

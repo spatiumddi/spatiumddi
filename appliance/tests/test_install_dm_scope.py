@@ -27,7 +27,6 @@ HOW TO RUN (from the repo root):
 
 from __future__ import annotations
 
-import re
 import shutil
 import subprocess
 import textwrap
@@ -35,20 +34,7 @@ from pathlib import Path
 
 import pytest
 
-INSTALLER = (
-    Path(__file__).parent.parent / "mkosi.extra" / "usr" / "local" / "bin" /
-    "spatium-install"
-)
-
-
-def _extract(name: str) -> str:
-    m = re.search(
-        rf"^{re.escape(name)}\(\) \{{$.*?^\}}$",
-        INSTALLER.read_text(encoding="utf-8"),
-        re.MULTILINE | re.DOTALL,
-    )
-    assert m, f"{name}() not found in {INSTALLER}"
-    return m.group(0)
+from _installer_source import CODE, INSTALLER, extract_fn as _extract
 
 
 # A box with two disks and a stacked target:
@@ -62,9 +48,17 @@ def _extract(name: str) -> str:
 # The stack is the interesting part: vgt-lv's only dependency is dm-0, so
 # a one-level check would leave it in place, `dmsetup remove crypt_t`
 # would fail on the busy device, and the wipe would abort.
+#
+# lsblk WITHOUT -d walks holders, not just partitions ("-d, --nodeps —
+# don't print slaves or holders"), so the dm-N rows below are not
+# decoration: they are the input the first cut of this helper was not
+# written against, and their absence from this fixture is exactly why
+# eight passing tests were exercising a function that returned nothing on
+# real hardware. TYPE is carried because the seed has to tell a partition
+# from a holder.
 TOPOLOGY = {
-    "sda": ["sda", "sda1", "sda2", "sda3"],
-    "sdb": ["sdb", "sdb1"],
+    "sda": ["sda", "sda1", "sda2", "sda3", "dm-0", "dm-1"],
+    "sdb": ["sdb", "sdb1", "dm-2"],
 }
 MAPS = {
     "crypt_t": ("dm-0", "sda3"),
@@ -77,13 +71,16 @@ def _stub_dir(tmp_path: Path, maps: dict, topology: dict) -> Path:
     d = tmp_path / "stub"
     d.mkdir()
 
+    # `lsblk -nro KNAME <disk>` — one kernel name per row, holders included.
     lsblk = ["#!/bin/sh", 'disk=$(eval echo \\$$#)', "case \"$disk\" in"]
     for disk, knames in topology.items():
         lsblk.append(f"  /dev/{disk}) printf '%s\\n' " + " ".join(knames) + " ;;")
     lsblk += ["  *) exit 1 ;;", "esac"]
     (d / "lsblk").write_text("\n".join(lsblk) + "\n")
 
-    ls_out = "".join(f"{n}\\t({i})\\n" for i, n in enumerate(maps))
+    ls_out = "".join(
+        f"{n}\\t(253:{dm.split('-')[1]})\\n" for n, (dm, _d) in maps.items()
+    )
     deps = "\n".join(
         f"    {name}) echo '1 dependencies  : ({dep})' ;;"
         for name, (_dm, dep) in maps.items()
@@ -101,16 +98,6 @@ def _stub_dir(tmp_path: Path, maps: dict, topology: dict) -> Path:
         exit 0
         """))
 
-    links = "\n".join(
-        f"    /dev/mapper/{name}) echo /dev/{dm} ;;" for name, (dm, _d) in maps.items()
-    )
-    (d / "readlink").write_text(textwrap.dedent(f"""\
-        #!/bin/sh
-        case "$2" in
-        {links}
-          *) exit 1 ;;
-        esac
-        """))
     for f in d.iterdir():
         f.chmod(0o755)
     return d
@@ -120,7 +107,11 @@ def _run(tmp_path: Path, target: str, maps=None, topology=None) -> list[str]:
     stub = _stub_dir(tmp_path, maps or MAPS, topology or TOPOLOGY)
     script = tmp_path / "run.sh"
     script.write_text(
-        "set -uo pipefail\n" + _extract("_dm_maps_on_target")
+        "set -uo pipefail\n"
+        # log() writes to $INSTALL_LOG in the real script, never stdout —
+        # stub it so a depth-bound warning cannot land in the map list.
+        'log() { echo "LOG: $*" >&2; }\n'
+        + _extract("_dm_maps_on_target")
         + f'\n_dm_maps_on_target "{target}"\n'
     )
     r = subprocess.run(
@@ -203,12 +194,9 @@ def test_the_unscoped_loop_is_gone(tmp_path):
     The executable tests above prove the new helper is right; they cannot
     prove it is the thing do_install calls.
     """
-    # Comments stripped: the helper's own docstring quotes the old line
-    # to explain what it replaced, and matching that is a false positive.
-    code = "\n".join(
-        ln.split("#", 1)[0]
-        for ln in INSTALLER.read_text(encoding="utf-8").splitlines()
-    )
+    # Comment-stripped: the helper's own docstring quotes the old line to
+    # explain what it replaced, and matching that is a false positive.
+    code = CODE
     assert "dmsetup ls --target linear" not in code, (
         "the unscoped device-mapper teardown is back"
     )

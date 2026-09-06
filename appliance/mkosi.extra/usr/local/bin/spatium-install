@@ -236,6 +236,20 @@ CONTROL_PLANE_URL=""
 # digits — single-use ephemeral or persistent depending on what the
 # control-plane admin minted. Only meaningful when ROLE=appliance.
 BOOTSTRAP_PAIRING_CODE=""
+# #995 item 2 — records that the grub-install for the OTHER firmware mode
+# failed. Confirm has by then already told the operator that leg was being
+# installed too, so the Done screen has to retract it; without this the
+# only record is a log line, and a disk moved to the other kind of machine
+# later fails with no prior warning.
+#
+# A FILE, not a variable, and that is not a style choice: the whole
+# install runs inside `{ … } | whiptail --gauge`, and the left side of a
+# pipeline is a subshell — an assignment there is discarded when the
+# pipeline ends, so the Done screen (which runs after it) would never see
+# it. shellcheck says so as SC2030/SC2031, and said so about the first
+# version of this.
+BOOT_LEG_MISSING_FILE=/run/spatium-boot-leg-missing
+BOOT_LEG_WARNING=""
 
 # ── Headless preseed state (issue #549) ────────────────────────────────
 # When a preseed answer file is discovered + parsed, load_preseed sets
@@ -373,7 +387,7 @@ ask_application_config() {
                 --title "Control plane URL" \
                 --cancel-button "Back" \
                 --inputbox "Where does this Additional node register?\n\nFormat: https://<control-plane-host>/  — the URL of the SpatiumDDI control plane this supervisor pairs against. The supervisor submits its Ed25519 pubkey here, sits in pending until an admin clicks Approve, then receives a control-plane-CA-signed identity cert.\n\nHA TIP: if the control plane is a multi-node cluster, point this at the MetalLB virtual IP (VIP), NOT a single node's IP — otherwise this appliance loses its control plane whenever that one node is down. Configure the VIP under Appliance -> Network & Host on the control plane.\n\nUse https:// in production; http:// is acceptable for lab installs." \
-                21 78 "$default_url" 3>&1 1>&2 2>&3) \
+                21 78 -- "$default_url" 3>&1 1>&2 2>&3) \
                 || return 1
             if [ -z "$CONTROL_PLANE_URL" ] || [ "$CONTROL_PLANE_URL" = "https://" ]; then
                 whiptail --msgbox "Control-plane URL is required for an Additional node." 8 62 || true
@@ -407,7 +421,7 @@ ask_application_config() {
         code_val=$(whiptail --backtitle "$BACKTITLE" --title "Pairing code" \
             --cancel-button "Back" \
             --inputbox "Enter the 8-digit pairing code from the control plane.\n\nMint one at https://<control-plane>/appliance → Pairing → 'New pairing code'. Single-use ephemeral codes expire after 15 min by default; persistent codes (multi-claim) stay valid until disabled or revoked.\n\nAfter the supervisor claims the code, the appliance sits in pending — ask the control plane admin to click Approve in the fleet UI to issue the identity cert and assign a role." \
-            18 78 "$BOOTSTRAP_PAIRING_CODE" 3>&1 1>&2 2>&3) \
+            18 78 -- "$BOOTSTRAP_PAIRING_CODE" 3>&1 1>&2 2>&3) \
             || { set -x; return 1; }
         # The frontend displays codes as ``1234-5678`` for
         # readability; an operator typing in dashes or spaces from
@@ -664,7 +678,7 @@ ask_hostname() {
         HOSTNAME=$(whiptail --backtitle "$BACKTITLE" --title "Hostname" \
             --cancel-button "Back" \
             --inputbox "System hostname (also used as the SERVER_NAME this appliance registers under for DNS / DHCP agent roles, and shown in shell prompts + audit logs).\n\nGive each appliance a unique name (e.g. dns-east-1, dhcp-prod-a, ddi-control)." \
-            14 72 "$HOSTNAME" 3>&1 1>&2 2>&3) \
+            14 72 -- "$HOSTNAME" 3>&1 1>&2 2>&3) \
             || return 1
         HOSTNAME=$(echo "$HOSTNAME" | tr -d '[:space:]')
         if [ -z "$HOSTNAME" ]; then
@@ -694,7 +708,7 @@ ask_hostname() {
 # rules for the headless path; the interactive prompts had none, so a
 # username with a space or a mistyped zone sailed through the wizard and
 # was discovered (or silently swallowed) at install time. Rather than
-# transcribing a 26-entry reserved-account list and a TZif check into
+# transcribing the reserved-account list and a TZif check into
 # bash — two copies that drift — the wizard shells out to the parser's
 # ``--check-field`` mode, which is answered before it even imports YAML.
 _preseed_parser_path() {
@@ -743,12 +757,22 @@ ask_user_password() {
         # accept. Empty still means "admin"; anything else is checked
         # against the same rules the preseed path has enforced since
         # #581, so the interactive and headless doors agree.
+        #
+        # The `--` before the pre-filled default is load-bearing on every
+        # re-prompting box in this file, and newly so here: whiptail uses
+        # popt, so a default starting with `-` is parsed as an OPTION.
+        # `whiptail --inputbox … "-x"` exits 1 with `-x: unknown option`
+        # and draws nothing, which the state machine reads as Back — so an
+        # operator who typed `-x` gets bounced to the previous screen with
+        # no dialog and no explanation, forever, because the rejected
+        # value is what gets re-prefilled. Verified against Debian's
+        # whiptail: `--` restores the normal path.
         local uerr
         while true; do
             ADMIN_USER=$(whiptail --backtitle "$BACKTITLE" --title "Admin OS user" \
                 --cancel-button "Back" \
                 --inputbox "OS-level admin username (for SSH + sudo).\n\nThe SpatiumDDI web UI uses 'admin/admin' separately - change it on first login." \
-                12 70 "$ADMIN_USER" 3>&1 1>&2 2>&3) \
+                12 70 -- "$ADMIN_USER" 3>&1 1>&2 2>&3) \
                 || return 1
             if [ -z "$ADMIN_USER" ]; then
                 ADMIN_USER="admin"
@@ -909,19 +933,19 @@ ask_network() {
         while true; do
             NET_IP=$(whiptail --backtitle "$BACKTITLE" --title "Static IP -address" \
                 --cancel-button "Back" \
-                --inputbox "IPv4 address (e.g. 192.168.1.10):" 10 60 "$NET_IP" 3>&1 1>&2 2>&3) \
+                --inputbox "IPv4 address (e.g. 192.168.1.10):" 10 60 -- "$NET_IP" 3>&1 1>&2 2>&3) \
                 || return 1
             NET_PREFIX=$(whiptail --backtitle "$BACKTITLE" --title "Static IP -prefix" \
                 --cancel-button "Back" \
-                --inputbox "Prefix length:" 10 60 "$NET_PREFIX" 3>&1 1>&2 2>&3) \
+                --inputbox "Prefix length:" 10 60 -- "$NET_PREFIX" 3>&1 1>&2 2>&3) \
                 || return 1
             NET_GATEWAY=$(whiptail --backtitle "$BACKTITLE" --title "Static IP -gateway" \
                 --cancel-button "Back" \
-                --inputbox "Gateway:" 10 60 "$NET_GATEWAY" 3>&1 1>&2 2>&3) \
+                --inputbox "Gateway:" 10 60 -- "$NET_GATEWAY" 3>&1 1>&2 2>&3) \
                 || return 1
             NET_DNS=$(whiptail --backtitle "$BACKTITLE" --title "Static IP -DNS" \
                 --cancel-button "Back" \
-                --inputbox "DNS servers (space-separated):" 10 60 "$NET_DNS" 3>&1 1>&2 2>&3) \
+                --inputbox "DNS servers (space-separated):" 10 60 -- "$NET_DNS" 3>&1 1>&2 2>&3) \
                 || return 1
             local nerr
             if nerr=$(_validate_static_net); then
@@ -949,7 +973,7 @@ ask_timezone() {
         TIMEZONE=$(whiptail --backtitle "$BACKTITLE" --title "Timezone" \
             --cancel-button "Back" \
             --inputbox "Timezone (IANA name, e.g. America/Toronto, Europe/Berlin, UTC):" \
-            10 70 "$TIMEZONE" 3>&1 1>&2 2>&3) \
+            10 70 -- "$TIMEZONE" 3>&1 1>&2 2>&3) \
             || return 1
         # ``[ -z "$TIMEZONE" ] && TIMEZONE="UTC"`` as the last statement
         # here would return 1 when TIMEZONE is non-empty (the [ test
@@ -1009,13 +1033,13 @@ ask_k3s_cidrs() {
         pod=$(whiptail --backtitle "$BACKTITLE" --title "k3s pod network" \
             --cancel-button "Back" \
             --inputbox "Pod CIDR — internal range Flannel uses for per-pod IPs. Default works for most LANs; change only if your network already uses 10.42.x.x.\n\nIPv4 CIDR (e.g. 10.42.0.0/16):" \
-            14 70 "$K3S_POD_CIDR" 3>&1 1>&2 2>&3) \
+            14 70 -- "$K3S_POD_CIDR" 3>&1 1>&2 2>&3) \
             || return 1
         local svc
         svc=$(whiptail --backtitle "$BACKTITLE" --title "k3s service network" \
             --cancel-button "Back" \
             --inputbox "Service CIDR — internal range k8s uses for service ClusterIPs (incl. cluster DNS). Must not overlap with the pod CIDR or your LAN.\n\nIPv4 CIDR (e.g. 10.43.0.0/16):" \
-            14 70 "$K3S_SERVICE_CIDR" 3>&1 1>&2 2>&3) \
+            14 70 -- "$K3S_SERVICE_CIDR" 3>&1 1>&2 2>&3) \
             || return 1
         if _validate_k3s_cidrs "$pod" "$svc"; then
             # Store the masked form, not the typed one — see
@@ -1162,6 +1186,49 @@ print(str(net.network_address + 10))
 PY
 }
 
+# Height for a whiptail box whose body is $1, rendered at width $2.
+#
+# Counts WRAPPED rows, not logical lines. whiptail re-wraps at about
+# width-4, and the longest lines on both screens that use this are
+# operator-supplied — a control-plane URL, a /dev/disk/by-id target path —
+# so a logical-line count under-sizes exactly when the content is unusual,
+# and newt CLIPS rather than scrolls. The line that goes missing is the
+# last one, which on the Done screen is "Press OK to reboot." and on
+# Confirm is "Proceed with installation?" below the ERASE warning.
+#
+# Clamped to one below the terminal: an 80x24 serial console is a
+# first-class install path here (spatium-console@ttyS0), newt cannot draw
+# a window taller than the screen, and the backtitle owns row 0.
+#
+# `printf %b` because confirm() builds its body with literal ``\n``
+# escapes, which whiptail expands the same way — so the estimate is made
+# against what actually gets rendered.
+_whiptail_height() {
+    local body="$1" width="$2" rows term h
+    rows=$(printf '%b\n' "$body" | fold -s -w "$((width - 4))" | wc -l | tr -d ' ')
+    case "$rows" in ''|*[!0-9]*) rows=20 ;; esac
+    # stty is in coreutils (Essential); tput comes from ncurses-bin, which
+    # mkosi.conf never names and --no-install-recommends will not pull in.
+    term=$(stty size 2>/dev/null | awk '{print $1}' || true)
+    if [ -z "$term" ]; then
+        term=$(tput lines 2>/dev/null || true)
+    fi
+    # Non-numeric, absent, or implausible (stty reports 0 0 when stdin is
+    # not a tty) all mean "assume the smallest console we support".
+    case "$term" in ''|*[!0-9]*) term=24 ;; esac
+    if [ "$term" -lt 12 ]; then
+        term=24
+    fi
+    h=$((rows + 6))
+    if [ "$h" -ge "$term" ]; then
+        h=$((term - 1))
+    fi
+    if [ "$h" -lt 9 ]; then
+        h=9
+    fi
+    printf '%s' "$h"
+}
+
 confirm() {
     log "Step: confirm"
     # #995 item 6 — the old control-plane label read "api + db + DNS +
@@ -1229,13 +1296,16 @@ confirm() {
     fi
     s+="\nWARNING: $TARGET_DISK will be ERASED. There is no undo.\n\n"
     s+="Proceed with installation?"
-    # 23x76, not the old 20x72: items 2 + 6 added the firmware row and a
-    # role continuation row, which on an Additional node with overridden
-    # CIDRs takes the body to 16 lines — two more than 20 could show, and
-    # whiptail CLIPS rather than scrolls.
+    # Sized to the body, not hardcoded: items 2 + 6 added the firmware row
+    # and a role continuation row, taking an Additional node with
+    # overridden CIDRs to 16 logical lines — already past what the old
+    # ``20 72`` could show — and the Control URL row wraps for any
+    # control-plane URL over about 52 characters. This is the screen that
+    # must never be truncated, since the last two rows are the ERASE
+    # warning and the question itself.
     whiptail --backtitle "$BACKTITLE" --title "Confirm" \
         --no-button "Back" \
-        --yesno "$s" 23 76 \
+        --yesno "$s" "$(_whiptail_height "$s" 76)" 76 \
         || return 1
 }
 
@@ -1261,60 +1331,186 @@ partition_node() {
 # under anything using them, and there is no reason for an installer to
 # touch a disk it was not pointed at.
 #
-# Emits map names OUTERMOST-FIRST so the caller can remove them in
-# order: `dmsetup remove` refuses a device another map is stacked on.
+# THE SEED MUST EXCLUDE HOLDERS. `lsblk` walks the whole subtree unless
+# told otherwise — its own help says "-d, --nodeps  don't print slaves or
+# holders" — so `lsblk -nro KNAME /dev/sda` on a box with LVM prints
+# `sda sda1 sda2 sda3 dm-0 dm-1`. The first cut of this function seeded
+# from exactly that and used the same string as its dedup set, so every
+# map on the target matched "already known" and was skipped: the function
+# returned nothing, on precisely the disks it exists for. Hence the
+# `dm-*` filter here, and a separate `seen` list below. (The test fixture
+# had modelled lsblk WITH --nodeps, so eight passing tests were
+# exercising a function that was inert in the field.)
+#
+# Filtered by KNAME rather than by TYPE: `dm-<minor>` is what the kernel
+# calls a device-mapper block device, unconditionally, whereas the TYPE
+# vocabulary varies with what the thing is (`disk` for sda, `loop` for a
+# loop device, `mpath` for a SAN LUN) and an allowlist over it drops the
+# target itself in cases it did not anticipate. Everything else lsblk
+# reports for this disk — its partitions, and an md array stacked on them
+# — is legitimately part of the frontier, because a map depending on one
+# of those IS a map backed by the target.
+#
+# ONE DEPENDENCY LEVEL PER PASS. Hits are tested against `known`, which
+# only takes this pass's discoveries at the END of the pass. That is what
+# makes `found` strictly depth-ordered, so reversing it is genuinely
+# outermost-first — `dmsetup remove` refuses a device another map is
+# stacked on. Merging mid-pass would let a child be appended right after
+# its parent in the same sweep, and for an LVM-RAID or thin pool, whose
+# siblings sit at one depth under a map that spans them, the reversal
+# would then emit an inner leg before the map on top of it.
+#
 # The closure runs to a fixed point rather than one level deep because
 # LVM-on-LUKS-on-$TARGET_DISK gives the LV no direct dependency on the
 # disk at all — its only dependency is the crypt device.
 #
-# A parse that yields nothing is the SAFE failure: the maps stay, the
-# following `wipefs` fails on the busy device, and the install aborts
-# before writing anything. Silence here costs an aborted install; the
-# old behaviour cost someone else's volume group.
+# FAILING TO RELEASE A MAP IS NOT SELF-CORRECTING, which is why
+# _assert_target_released exists below rather than this leaving it to the
+# next command. `wipefs -af` FORCES — measured against a disk held open
+# by a live dm map, `wipefs -af` and `sgdisk -Z` both return 0 and erase
+# the table; only `blockdev --rereadpt` fails, and that is `|| true`. So
+# an unreleased map does not abort the install, it lets the GPT be
+# destroyed while the kernel keeps the stale partition table, and mkfs
+# then writes at the OLD offsets, over whatever the map was serving.
 _dm_maps_on_target() {
     local disk="$1"
     command -v dmsetup >/dev/null 2>&1 || return 0
     command -v lsblk   >/dev/null 2>&1 || return 0
 
-    # Seed: the target disk's own kernel name plus every partition on it.
-    local backing=" " kname
+    # Seed: the target disk and everything under it EXCEPT its
+    # device-mapper holders, which are what we are here to discover.
+    local known=" " kname
     while read -r kname; do
-        [ -n "$kname" ] && backing+="$kname "
+        [ -n "$kname" ] || continue
+        case "$kname" in dm-*) continue ;; esac
+        known+="$kname "
     done < <(lsblk -nro KNAME "$disk" 2>/dev/null || true)
-    [ "$backing" = " " ] && return 0
+    if [ "$known" = " " ]; then
+        return 0
+    fi
 
-    local found=() changed name dmk deps dep hit
-    # `_` because the counter is only a bound on the closure, never read.
-    for _ in 1 2 3 4 5 6 7 8; do
-        changed=0
-        while read -r name; do
+    local found=() seen=" " pending name rest minor dmk deps dep hit any
+    local depth=0 max_depth=16
+    while [ "$depth" -lt "$max_depth" ]; do
+        depth=$((depth + 1))
+        pending=""
+        any=0
+        # `dmsetup ls` prints "<name>\t(<major>:<minor>)". Split on the tab
+        # rather than taking the first whitespace field: a map name may
+        # contain a space (dmsetup rejects '/', not ' '), and awk '{print
+        # $1}' would silently truncate it to something that matches no map.
+        # A line with no tab is "No devices found", the empty-system case.
+        while IFS="$(printf '\t')" read -r name rest; do
             [ -n "$name" ] || continue
-            # /dev/mapper/<name> is a symlink to the /dev/dm-N node whose
-            # basename is what another map's deps list will name.
-            dmk=$(basename "$(readlink -f "/dev/mapper/$name" 2>/dev/null || true)" 2>/dev/null || true)
-            [ -n "$dmk" ] || continue
-            case "$backing" in *" $dmk "*) continue ;; esac
+            [ -n "$rest" ] || continue
+            case "$seen" in *" $name "*) continue ;; esac
+            # The kernel names a dm block device dm-<minor>, which is what
+            # another map's dependency list will report. Derived from the
+            # major:minor `ls` already printed — no readlink, no basename,
+            # and correct even where /dev/mapper carries no udev symlinks.
+            minor="${rest##*:}"
+            minor="${minor%%)*}"
+            case "$minor" in ''|*[!0-9]*) continue ;; esac
+            dmk="dm-$minor"
             deps=$(dmsetup deps -o blkdevname "$name" 2>/dev/null | \
                    sed -n 's/^.*: *//p' | tr -d '()' || true)
             hit=0
             for dep in $deps; do
-                case "$backing" in *" $dep "*) hit=1; break ;; esac
+                case "$known" in *" $dep "*) hit=1; break ;; esac
             done
             if [ "$hit" = 1 ]; then
-                backing+="$dmk "
+                seen+="$name "
+                pending+="$dmk "
                 found+=("$name")
-                changed=1
+                any=1
             fi
-        done < <(dmsetup ls 2>/dev/null | awk '{print $1}' || true)
-        [ "$changed" = 0 ] && break
+        done < <(dmsetup ls 2>/dev/null || true)
+        if [ "$any" = 0 ]; then
+            break
+        fi
+        known+="$pending"
     done
+    if [ "$any" = 1 ]; then
+        # Still finding maps at the bound. Emitting a truncated list is
+        # worse than saying so: the missing entries are the OUTERMOST ones,
+        # so every remove the caller attempts fails on a device something
+        # is still stacked on.
+        log "WARN: device-mapper stack on $disk deeper than $max_depth levels — the list below is incomplete"
+    fi
 
-    # Reverse: the closure discovers the innermost map first, and it has
-    # to be removed last.
+    # Reverse: the closure discovers depth 1 first, and it has to be
+    # removed last.
     local i
     for (( i=${#found[@]}-1; i>=0; i-- )); do
         echo "${found[$i]}"
     done
+}
+
+# The gate that makes an unreleased device-mapper map a refusal rather
+# than a corruption (#995 item 10).
+#
+# Measured, not assumed: with a live dm map holding the disk open,
+# `wipefs -af` returns 0 and erases the signatures, `sgdisk -Z` returns 0
+# and writes a new table, and only `blockdev --rereadpt` fails — which
+# do_install deliberately tolerates with `|| true` because it is
+# advisory. The kernel therefore keeps the STALE partition table, and the
+# very next step formats `$ESP` / `$ROOT_A` / `$VAR`, which still resolve
+# to the old extents. The disk ends up destroyed and the install reports
+# a different failure later, or none.
+#
+# So the release has to be verified here, while nothing has been written.
+# Runs after the teardown loop and before `wipefs`.
+_assert_target_released() {
+    local remaining
+    remaining=$(_dm_maps_on_target "$TARGET_DISK" | tr '\n' ' ')
+    remaining="${remaining%"${remaining##*[![:space:]]}"}"
+    if [ -z "$remaining" ]; then
+        return 0
+    fi
+    log "FATAL: device-mapper maps still hold $TARGET_DISK: $remaining"
+    log "  Refusing to partition a disk something is still using. Nothing"
+    log "  has been written. Deactivate them (vgchange -an / cryptsetup"
+    log "  close) from a shell and re-run the installer, or pick another"
+    log "  disk."
+    exit 1
+}
+
+# The other pre-wipe refusal (#995 item 4).
+#
+# `useradd` is now fatal, which is right — mkosi.postinst sets
+# PermitRootLogin no, so a swallowed failure yields a box with no way in
+# at all. But it fires at ~63%, after the disk is wiped and the rootfs
+# rsynced, so a name that useradd will reject turns a recoverable mistake
+# into an unbootable disk — and on a FULLY_UNATTENDED run there is nobody
+# at the console to see why.
+#
+# spatium-preseed-parse's reserved-account list is a hand-written
+# approximation of what the image ships and cannot help but drift: `_apt`
+# alone matches the username regex, is created by a package mkosi.conf
+# names explicitly, and is not on it. The live ISO's rootfs IS the rootfs
+# about to be rsynced onto the target, so its own passwd database answers
+# the question exactly, and keeps answering it as the package set
+# changes. Both paths reach here — the interactive one and the preseed
+# one — so this is also the only check the headless door cannot skip.
+_assert_admin_user_available() {
+    local why=""
+    if [ -z "$ADMIN_USER" ]; then
+        why="No admin username was chosen."
+    elif getent passwd "$ADMIN_USER" >/dev/null 2>&1; then
+        why="The account '$ADMIN_USER' already exists in the appliance image, so useradd would fail after the disk had been wiped. Pick a different name."
+    fi
+
+    [ -z "$why" ] && { log "Admin-user pre-flight OK: $ADMIN_USER"; return 0; }
+
+    log "Admin-user pre-flight REFUSED '$ADMIN_USER': $why"
+    if [ "$FULLY_UNATTENDED" = "1" ]; then
+        preseed_halt "Refusing to install with this admin_user:"$'\n\n'"$why"
+    fi
+    set +x
+    whiptail --backtitle "$BACKTITLE" --title "Unusable admin username" \
+        --msgbox "$why"$'\n\n'"Nothing has been written." 12 72 \
+        || true
+    on_cancel "admin-user pre-flight ($ADMIN_USER)"
 }
 
 # Last-line defence immediately before the irreversible wipe (issue
@@ -1401,21 +1597,34 @@ _assert_safe_wipe_target() {
 # stanza, which would otherwise age the install record out after twelve
 # weeks. The support bundle reaches it explicitly instead (#875).
 #
-# 0700/0600 because the trace log is a full bash xtrace: no password
-# (both prompt paths set +x around it, and item 1's sibling fix does the
-# same for the pairing code) but every hostname, address and disk name
-# the wizard touched.
+# 0755/0644, matching every sibling in that directory rather than the
+# 0700/0600 the first cut used. The api container reads these through the
+# read-only host-log bind mount and runs as uid 1000
+# (charts/spatiumddi/templates/api.yaml), with no fsGroup and no userns
+# remap — `hostUsers: false` is refused whenever the appliance host mounts
+# are on. Root-only modes therefore made `iterdir()` raise PermissionError
+# and the support bundle ship an error note instead of the logs, on every
+# appliance: the collector half of item 1 would never have fired. This is
+# why firstboot chmods /var/log/spatiumddi 0755 and logrotate creates the
+# logs beside it `0644 root root`.
 #
-# Never fatal. This runs under `set -e` after a successful install; a
-# failure to save a log must not be the thing that aborts it.
+# Safe to widen because the content is not secret: the trace is a bash
+# xtrace with `set +x` around the password (#581) and around the pairing
+# code (this change), and the sibling firstboot.log is already 0644. It
+# does name every hostname, address and disk the wizard touched — which
+# is what the support bundle's scrubber is for.
+#
+# Never fatal. It runs under `set -e` after a successful install, and
+# again from on_failure; a failure to save a log must not be the thing
+# that aborts, or reports, anything.
 _save_install_logs() {
     local dest="$MOUNT/var/log/spatiumddi/install"
     mkdir -p "$dest" 2>>"$INSTALL_LOG" || {
         log "WARN: could not create $dest — installer logs not preserved"
         return 0
     }
-    chmod 0700 "$dest" 2>/dev/null || true
-    local src base
+    chmod 0755 "$dest" 2>/dev/null || true
+    local src base saved=0 failed=0
     for src in "$INSTALL_LOG" "$TRACE_LOG" /var/log/spatium-install-launch.log; do
         # INSTALL_LOG / TRACE_LOG fall back to /dev/null when /var/log is
         # not writable (the #581 host-portable path); copying that would
@@ -1424,12 +1633,21 @@ _save_install_logs() {
         [ -f "$src" ] || continue
         base=$(basename "$src")
         if cp -f "$src" "$dest/$base" 2>>"$INSTALL_LOG"; then
-            chmod 0600 "$dest/$base" 2>/dev/null || true
+            chmod 0644 "$dest/$base" 2>/dev/null || true
+            saved=$((saved + 1))
         else
             log "WARN: could not copy $src to $dest"
+            failed=$((failed + 1))
         fi
     done
-    log "Installer logs preserved under /var/log/spatiumddi/install/"
+    # Say what happened. An unconditional success line is the last thing
+    # written to the log that is then (not) copied, so on a full or
+    # read-only /var it ends with a claim the three WARNs above disprove.
+    if [ "$saved" -gt 0 ]; then
+        log "Installer logs preserved under /var/log/spatiumddi/install/ ($saved file(s), $failed failed)"
+    else
+        log "WARN: no installer logs could be preserved ($failed failed)"
+    fi
     return 0
 }
 
@@ -1437,6 +1655,9 @@ do_install() {
     # Re-validate the wipe target before anything destructive (#581).
     # Runs BEFORE `set -e` so its own probes can fail harmlessly.
     _assert_safe_wipe_target
+    # ...and the account that will be the only way into the installed
+    # system, for the same reason and in the same place (#995 item 4).
+    _assert_admin_user_available
 
     # Now we're past all the prompts — enable -e so any failure
     # inside the partitioning / rsync / chroot block aborts cleanly
@@ -1486,6 +1707,9 @@ do_install() {
     # after they've typed hostname / admin / network / timezone).
 
     log "Install starting: target=$TARGET_DISK BBP=$BBP ESP=$ESP STATE=$STATE ROOT_A=$ROOT_A ROOT_B=$ROOT_B VAR=$VAR"
+    # A marker left by an earlier attempt would make this run report a
+    # bootloader failure that did not happen.
+    rm -f "$BOOT_LEG_MISSING_FILE" 2>/dev/null || true
 
     {
         echo "XXX"; echo "3"; echo "Releasing existing partitions on $TARGET_DISK..."; echo "XXX"
@@ -1502,17 +1726,25 @@ do_install() {
             umount -l "/dev/$part" >> "$INSTALL_LOG" 2>&1 || true
         done
         # device-mapper entries (LVM / dm-crypt) backed by this disk —
-        # and, since #995 item 10, ONLY this disk. Two passes because a
-        # stacked map can hold a reference the first pass has only just
-        # released.
-        local dm
-        for _ in 1 2; do
+        # and, since #995 item 10, ONLY this disk. Retry until the target
+        # is clear rather than a fixed number of sweeps: the helper emits
+        # outermost-first so one pass should do it, and a second is for a
+        # transient EBUSY (udev still holding a node open) rather than for
+        # ordering. Bounded, because a map that will never release must
+        # reach the gate below instead of spinning here.
+        local dm dm_maps
+        for _ in 1 2 3; do
+            dm_maps=$(_dm_maps_on_target "$TARGET_DISK")
+            [ -n "$dm_maps" ] || break
             while read -r dm; do
                 [ -n "$dm" ] || continue
                 log "Releasing device-mapper map '$dm' (backed by $TARGET_DISK)"
                 dmsetup remove "$dm" >> "$INSTALL_LOG" 2>&1 || true
-            done < <(_dm_maps_on_target "$TARGET_DISK")
+            done <<EOF
+$dm_maps
+EOF
         done
+        _assert_target_released
 
         echo "XXX"; echo "5"; echo "Partitioning $TARGET_DISK (A/B + var layout)..."; echo "XXX"
         wipefs -af "$TARGET_DISK"           >> "$INSTALL_LOG" 2>&1
@@ -2140,10 +2372,6 @@ EOF
         local APPLIANCE_VERSION_LABEL
         APPLIANCE_VERSION_LABEL=$(_appliance_version_from \
             "$MOUNT/etc/spatiumddi/appliance-release")
-        local SLOT_TITLE_PREFIX="SpatiumDDI Appliance"
-        if [ -n "$APPLIANCE_VERSION_LABEL" ]; then
-            SLOT_TITLE_PREFIX="SpatiumDDI Appliance $APPLIANCE_VERSION_LABEL"
-        fi
         mkdir -p "$MOUNT/boot/efi/grub"
         # #395 — grub.cfg is now rendered by spatium-grub-render (one source of
         # truth for the menu, shared with the firstboot reconcile and
@@ -2205,6 +2433,7 @@ EOF
             log "WARN: grub-install --target=i386-pc failed. This machine"
             log "  booted in UEFI mode so the install continues, but the disk"
             log "  will NOT boot in a BIOS/CSM machine."
+            echo "BIOS/CSM" > "$BOOT_LEG_MISSING_FILE" 2>/dev/null || true
         fi
         if ! chroot "$MOUNT" /usr/sbin/grub-install --target=x86_64-efi \
                 --efi-directory=/boot/efi \
@@ -2221,6 +2450,7 @@ EOF
             log "WARN: grub-install --target=x86_64-efi failed. This machine"
             log "  booted in BIOS/CSM mode so the install continues, but the"
             log "  disk will NOT boot in a UEFI machine."
+            echo "UEFI" > "$BOOT_LEG_MISSING_FILE" 2>/dev/null || true
         fi
 
         echo "XXX"; echo "93"; echo "Cloning root_A → root_B (slot redundancy)..."; echo "XXX"
@@ -2383,6 +2613,10 @@ EOF
             | awk '$1!="lo" && $3!="" {sub(/\/.*/, "", $3); print $3; exit}' || true)
     fi
 
+    if [ -f "$BOOT_LEG_MISSING_FILE" ]; then
+        BOOT_LEG_WARNING=$(cat "$BOOT_LEG_MISSING_FILE" 2>/dev/null || true)
+    fi
+
     local done_next
     if [ "$ROLE" = "appliance" ]; then
         # No web UI on this node; the next action is on the control plane.
@@ -2424,34 +2658,21 @@ First boot takes 2-5 min while k3s starts and imports the container
 images baked into this build. Nothing is downloaded.
 
 $done_next
-
+${BOOT_LEG_WARNING:+
+  NOTE: the $BOOT_LEG_WARNING bootloader did NOT install. This disk boots
+  only in $FIRMWARE_MODE mode — see /var/log/spatiumddi/install/.
+}
 Installer logs are kept at /var/log/spatiumddi/install/.
 Press OK to reboot."
 
-    local done_rows term_rows done_h
-    done_rows=$(printf '%s\n' "$done_body" | wc -l | tr -d ' ')
-    term_rows=$(stty size 2>/dev/null | awk '{print $1}' || true)
-    if [ -z "$term_rows" ]; then
-        term_rows=$(tput lines 2>/dev/null || true)
-    fi
-    # Non-numeric, absent, or an implausible answer (stty reports 0x0 when
-    # stdin is not a tty) all mean "assume the smallest console we
-    # support" rather than "assume it is big".
-    case "$term_rows" in ''|*[!0-9]*) term_rows=24 ;; esac
-    if [ "$term_rows" -lt 12 ]; then
-        term_rows=24
-    fi
-    done_h=$((done_rows + 6))
-    if [ "$done_h" -ge "$term_rows" ]; then
-        done_h=$((term_rows - 1))
-    fi
-    if [ "$done_h" -lt 12 ]; then
-        done_h=12
-    fi
-
     if [ "${FULLY_UNATTENDED:-0}" != "1" ]; then
+    # `|| true` because whiptail returns 255 on ESC and `set -e` is still
+    # on: without it, an operator who dismisses the final screen with ESC
+    # instead of Enter aborts a SUCCESSFUL install, and `systemctl reboot`
+    # below never runs. Same reasoning as the #554 comment on the unmount
+    # loop above.
     whiptail --backtitle "$BACKTITLE" --title "Done" \
-        --msgbox "$done_body" "$done_h" 76
+        --msgbox "$done_body" "$(_whiptail_height "$done_body" 76)" 76 || true
     else
         log "Fully unattended: install complete on $TARGET_DISK — skipping the interactive Done prompt and rebooting straight into the installed system."
     fi
@@ -2887,7 +3108,13 @@ load_preseed() {
         chmod 0600 "$f" 2>/dev/null || true
         log "Preseed: trying candidate ($kind) $src -> $f"
 
-        out=$(python3 /usr/local/bin/spatium-preseed-parse \
+        # Through the shared resolver, not a hardcoded absolute path: with
+        # three spellings in one file the linter and the wizard could find
+        # the repo's parser while a real preseed load found the installed
+        # one, which is the divergence _preseed_parser_path exists to
+        # remove. (The `|| true` keeps the pre-existing behaviour of
+        # falling through to the parser's own not-found error.)
+        out=$(python3 "$(_preseed_parser_path || echo /usr/local/bin/spatium-preseed-parse)" \
             "$f" "$PRESEED_ENV" "$PRESEED_SECRET_ENV" 2>&1)
         rc=$?
         printf '%s\n' "$out" >> "$INSTALL_LOG"
@@ -3089,6 +3316,16 @@ on_failure() {
     local exit_code=$?
     [ "$exit_code" -eq 0 ] && exit 0
     set +x
+    # #995 item 1 — save on the way out too. The success-path call sits at
+    # 94%, downstream of every fatal abort this change introduced (useradd
+    # at ~63%, the two grub-installs at ~90%, the device-mapper gate at
+    # ~4%) — so without this the failures that most need a durable record
+    # are exactly the ones that leave none, and the operator's natural
+    # next move re-runs the installer, whose startup TRUNCATES both logs.
+    # The target is still mounted here: the unmount block is at 95%.
+    if [ -d "$MOUNT/var/log" ]; then
+        _save_install_logs || true
+    fi
     clear
     echo
     echo "Installer exited with status $exit_code"
