@@ -211,3 +211,94 @@ def test_webui_directive_retire_when_scoped() -> None:
     # The scoped rule must be the only path to 80/443 in this body.
     assert 'tcp dport { 80, 443 } accept comment "web-ui"' not in p.body
     assert "192.168.0.0/24" in p.body
+
+
+# ── #993 — kubelet 10250 reachable from inside the cluster ──────────────
+
+
+def test_kubelet_open_to_pod_and_service_cidrs_on_a_single_node() -> None:
+    """#990's direct cluster-health transport could never connect.
+
+    10250 was opened to ``cluster_peer_cidrs`` only, which is EMPTY on a
+    single node — so the rule was not emitted at all and the chain's
+    ``policy drop`` took the packet. An api pod reading its own node's
+    kubelet enters via cni0 with a pod-CIDR source and traverses INPUT like
+    any LAN packet, which is why 6443 (widened to pod ∪ svc) worked from the
+    same pod at the same moment.
+    """
+    p = render_drop_in(
+        {"roles": ["dns-bind9"]},
+        pod_cidrs=["10.42.0.0/16"],
+        service_cidrs=["10.43.0.0/16"],
+    )
+    assert (
+        'ip saddr { 10.42.0.0/16, 10.43.0.0/16 } tcp dport 10250 accept comment "kubelet-v4"'
+    ) in p.body
+    # The peer rule really is absent on this shape — narrow scoping was not
+    # the problem, no rule at all was.
+    assert "k3s-peer" not in p.body
+
+
+def test_kubelet_port_is_expected_so_drift_re_applies() -> None:
+    """The supervisor re-applies the ruleset when an expected port is missing
+    from the live chain (an operator's ``nft flush``, a failed
+    ``nft -f``). A port absent from this set is one that never comes back.
+    """
+    p = render_drop_in(
+        {"roles": []},
+        pod_cidrs=["10.42.0.0/16"],
+        service_cidrs=["10.43.0.0/16"],
+    )
+    assert 10250 in p.expected_tcp_ports
+
+
+def test_kubelet_excludes_the_operator_kubeapi_allowlist() -> None:
+    """``kubeapi_expose_cidrs`` says "let me reach the apiserver from the
+    LAN", and the apiserver guards every request with RBAC. The kubelet API
+    serves /exec, /run and /attach. The two rules are one copy-paste apart,
+    so assert they resolve different sources."""
+    p = render_drop_in(
+        {"roles": [], "kubeapi_expose_cidrs": ["10.9.0.0/24"]},
+        pod_cidrs=["10.42.0.0/16"],
+        service_cidrs=["10.43.0.0/16"],
+    )
+    kubelet = next(ln for ln in p.body.splitlines() if "kubelet-v4" in ln)
+    kubeapi = next(ln for ln in p.body.splitlines() if "kubeapi-v4" in ln)
+    assert "10.9.0.0/24" not in kubelet
+    assert "10.9.0.0/24" in kubeapi
+
+
+def test_ha_reaches_both_peer_and_own_node_kubelets() -> None:
+    """On HA the peer rule covers OTHER nodes' kubelets and this one covers
+    the api pod's own node — the case that stays broken if you read the peer
+    rule as already handling 10250."""
+    p = render_drop_in(
+        {"roles": []},
+        cluster_peer_cidrs=_PEERS_V4,
+        pod_cidrs=["10.42.0.0/16"],
+        service_cidrs=["10.43.0.0/16"],
+        cp_member_count=3,
+    )
+    assert 'tcp dport { 2379, 2380, 10250 } accept comment "k3s-peer-v4"' in p.body
+    assert 'ip saddr { 10.42.0.0/16, 10.43.0.0/16 } tcp dport 10250 accept' in p.body
+
+
+def test_no_kubelet_rule_without_an_in_cluster_source() -> None:
+    """An empty nft set is a syntax error that fails the whole ruleset, not
+    a closed port — so a non-CP node must emit no rule at all."""
+    p = render_drop_in({"roles": ["dns-bind9"]})
+    assert "kubelet" not in p.body
+    assert 10250 not in p.expected_tcp_ports
+
+
+def test_kubelet_rule_is_family_split() -> None:
+    """A v6 CIDR inside an ``ip saddr`` set is rejected by nft, which fails
+    the drop-in whole — the v6-lockout shape _split_families exists for."""
+    p = render_drop_in(
+        {"roles": []},
+        pod_cidrs=["10.42.0.0/16", "2001:cafe:42::/56"],
+    )
+    v4 = next(ln for ln in p.body.splitlines() if "kubelet-v4" in ln)
+    v6 = next(ln for ln in p.body.splitlines() if "kubelet-v6" in ln)
+    assert "2001:cafe:42::/56" not in v4
+    assert "10.42.0.0/16" not in v6

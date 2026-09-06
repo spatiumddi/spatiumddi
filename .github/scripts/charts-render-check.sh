@@ -204,6 +204,69 @@ render appliance-all-on "$APPLIANCE" "${APPLIANCE_ALL_ON[@]}"
 # The single-node default install shape: one DNS driver + DHCP + supervisor.
 render appliance-full-stack "$APPLIANCE" \
     --set dnsBind9.enabled=true --set dhcpKea.enabled=true --set supervisor.enabled=true
+
+# #992 — the two release shapes this chart is ACTUALLY installed as, on every
+# appliance. Rendering the chart once (as everything above does) can never see
+# the bug that shipped in #988: a cluster-scoped object rendered by both
+# releases makes whichever install runs second fail whole with ``invalid
+# ownership metadata``, and under k3s's helm-controller that is a job retrying
+# forever rather than an error anyone sees.
+#
+#   bootstrap   firstboot writes it; supervisor + CNPG operator, roles off.
+#               Owns the PriorityClasses (it installs first, and firstboot
+#               re-renders it from the slot's baked chart on every boot).
+#   supervisor  the supervisor writes it; every role on, supervisor off.
+#
+# The supervisor's flags are mirrored from ``_build_values`` in
+# agent/supervisor/spatium_supervisor/service_lifecycle.py. That mirror is
+# pinned from the other side by
+# agent/supervisor/tests/test_role_chart_values.py, which asserts the Python
+# emits exactly the priorityClasses block set here — so the two cannot drift
+# without one of them failing.
+render appliance-release-bootstrap "$APPLIANCE" \
+    --set supervisor.enabled=true \
+    --set cnpg.enabled=true \
+    --set dnsBind9.enabled=false \
+    --set dhcpKea.enabled=false \
+    --set priorityClasses.create=true
+render appliance-release-supervisor "$APPLIANCE" \
+    --set supervisor.enabled=false \
+    --set dnsBind9.enabled=true \
+    --set dnsPowerdns.enabled=true \
+    --set dnsTechnitium.enabled=true \
+    --set dhcpKea.enabled=true \
+    --set lookingGlass.enabled=true \
+    --set agentLanding.enabled=false \
+    --set priorityClasses.create=false \
+    --set priorityClasses.external=true
+echo "── cluster-scoped collision (appliance, two release shapes)"
+python3 "$ROOT/.github/scripts/chart-cluster-scoped-collision.py" \
+    bootstrap="$OUT/appliance-release-bootstrap.yaml" \
+    supervisor="$OUT/appliance-release-supervisor.yaml" || failures=$((failures + 1))
+
+# The guard in templates/priorityclasses.yaml must still FIRE for the
+# combination it exists to catch: ``create: false`` with no ``external``
+# assertion and workloads still naming a class. Offline there is no cluster
+# to ask, so every named class reads as missing — which is exactly the
+# render a fresh appliance must never be given. A guard nothing tests is a
+# guard that stops working silently, and this one now has two ways to pass.
+echo "── negative control: priorityClasses.create=false without external must fail"
+neg_out="$(helm template neg "$APPLIANCE" --kube-version "$K8S_VERSION" \
+    --set dnsBind9.enabled=true \
+    --set priorityClasses.create=false 2>&1)" && neg_rc=0 || neg_rc=$?
+# Grep the message, not just the exit code. ``helm template`` exits non-zero
+# for a syntax error, a bad --set path or a missing dependency too, so an
+# exit-code-only check would keep passing after the guard was deleted — the
+# control would then be asserting that the chart is broken, which it would
+# be, for a different reason.
+if [ "$neg_rc" -ne 0 ] && printf '%s' "$neg_out" | grep -q "priorityClasses.create is false"; then
+    echo "   ok: render refused by the priorityClasses guard"
+else
+    echo "   FAIL: expected the priorityClasses guard to refuse this render (rc=$neg_rc)" >&2
+    printf '%s\n' "$neg_out" | tail -5 >&2
+    failures=$((failures + 1))
+fi
+
 POSTURE_ARGS=""
 coverage "$APPLIANCE" "${APPLIANCE_ALL_ON[@]}"
 

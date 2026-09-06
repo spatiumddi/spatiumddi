@@ -94,6 +94,21 @@ class _FakeResponse:
         return self._body
 
 
+class _FakeSocket:
+    """Only what the code under test touches: ``settimeout``.
+
+    Records every value, because #993's fix is precisely that the socket is
+    re-armed after connect — a fake that accepted the call and forgot it
+    would let the read budget regress to the connect budget silently.
+    """
+
+    def __init__(self):
+        self.timeouts: list[float] = []
+
+    def settimeout(self, value):
+        self.timeouts.append(value)
+
+
 class _FakeConn:
     """Stands in for HTTPSConnection; records what it was asked for."""
 
@@ -101,12 +116,30 @@ class _FakeConn:
 
     def __init__(self, host, port, timeout=None, context=None):
         self.host, self.port = host, port
+        # The timeout handed to the CONSTRUCTOR is the connect budget; the
+        # one handed to sock.settimeout() after connect is the read budget.
+        self.init_timeout = timeout
         self.requested: tuple[str, str] | None = None
         self.headers: dict[str, str] = {}
         self.closed = False
+        self.connected = False
+        self.sock: _FakeSocket | None = None
         self.raises: BaseException | None = None
+        self.connect_raises: BaseException | None = None
         self.response = _FakeResponse(200, b"{}")
         _FakeConn.last = self
+
+    def connect(self):
+        """Mirrors http.client: opens the socket, or raises trying.
+
+        ``sock`` stays None on failure, which is why the code under test
+        guards on it — a raising connect must not then be followed by an
+        attribute error on the way to the fallback.
+        """
+        if self.connect_raises is not None:
+            raise self.connect_raises
+        self.connected = True
+        self.sock = _FakeSocket()
 
     def request(self, method, path, headers=None):
         self.requested = (method, path)
@@ -121,11 +154,12 @@ class _FakeConn:
         self.closed = True
 
 
-def _install(monkeypatch, *, status=200, body=b"{}", raises=None):
+def _install(monkeypatch, *, status=200, body=b"{}", raises=None, connect_raises=None):
     def _factory(host, port, timeout=None, context=None):
         conn = _FakeConn(host, port, timeout, context)
         conn.response = _FakeResponse(status, body)
         conn.raises = raises
+        conn.connect_raises = connect_raises
         return conn
 
     monkeypatch.setattr(http.client, "HTTPSConnection", _factory)
@@ -336,3 +370,68 @@ def test_the_block_is_keyed_by_node_not_shared(monkeypatch, _cfg):
         k8s.get_node_stats_summary("ddi2", "192.168.0.200")
     assert attempts[bad_ip] == 1  # probed once, then backed off
     assert attempts["192.168.0.200"] == 3  # unaffected
+
+
+# ── #993 — the connect budget and the read budget are separate ──────────────
+
+
+def test_connect_is_short_and_the_read_budget_is_longer(monkeypatch, _cfg):
+    """One socket timeout would have to serve both, and cannot.
+
+    1.5 s is right for a LAN handshake and far too tight for the response:
+    a busy node marshalling /stats/summary for a few hundred pods can
+    legitimately take seconds, and under a single 1.5 s budget it would be
+    blocked-direct for 15 minutes with a reason indistinguishable from the
+    firewall failure #993 exists to fix. So connect gets the short budget
+    and the open socket is re-armed with the long one.
+    """
+    _install(monkeypatch)
+    k8s.get_node_stats_summary("ddi1", "192.168.0.199")
+    conn = _FakeConn.last
+    assert conn.init_timeout == k8s._KUBELET_CONNECT_TIMEOUT_S
+    assert conn.sock is not None
+    assert conn.sock.timeouts == [k8s._KUBELET_READ_TIMEOUT_S]
+    # The point of the split, stated as a relation rather than as two
+    # literals: a future retune that collapses them is the regression.
+    assert k8s._KUBELET_READ_TIMEOUT_S > k8s._KUBELET_CONNECT_TIMEOUT_S
+
+
+def test_the_socket_is_rearmed_before_the_request_is_sent(monkeypatch, _cfg):
+    """Re-arming after the response would be useless. Ordering is the whole
+    behaviour, and a fake that only counted calls could not see it."""
+    _install(monkeypatch)
+    order: list[str] = []
+
+    real_factory = http.client.HTTPSConnection
+
+    def _factory(host, port, timeout=None, context=None):
+        conn = real_factory(host, port, timeout=timeout, context=context)
+        orig_connect, orig_request = conn.connect, conn.request
+
+        def connect():
+            orig_connect()
+            conn.sock.settimeout = lambda v: order.append(f"settimeout({v})")
+
+        def request(*a, **kw):
+            order.append("request")
+            return orig_request(*a, **kw)
+
+        conn.connect, conn.request = connect, request
+        return conn
+
+    monkeypatch.setattr(http.client, "HTTPSConnection", _factory)
+    k8s.get_node_stats_summary("ddi1", "192.168.0.199")
+    assert order == [f"settimeout({k8s._KUBELET_READ_TIMEOUT_S})", "request"]
+
+
+def test_a_connect_failure_still_falls_back_to_the_proxy(monkeypatch, _cfg):
+    """``sock`` stays None when connect raises, and the code reads it. A
+    naive ``conn.sock.settimeout(...)`` would raise AttributeError there —
+    inside the direct path, on the way to a fallback that never happens.
+    """
+    _install(monkeypatch, connect_raises=TimeoutError("timed out"))
+    monkeypatch.setattr(k8s, "_request", lambda *a, **k: (200, b"{}"))
+    assert k8s.get_node_stats_summary("ddi1", "192.168.0.199")[2] == "proxy"
+    assert "TimeoutError" in k8s.kubelet_block_reasons()["192.168.0.199"]
+    # …and the connection is still closed on that path.
+    assert _FakeConn.last.closed is True

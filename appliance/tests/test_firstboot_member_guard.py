@@ -147,7 +147,9 @@ def test_tls_secret_writer_is_guarded() -> None:
     fresh self-signed cert every reboot and overwrites the cluster's shared
     ``spatium-appliance-tls`` Secret — silently replacing an operator-uploaded
     or ACME-issued cert with a throwaway one."""
-    assert _writer_guarded('elif [ ! -f "$TLS_CERT_MANIFEST" ]; then')
+    assert _writer_guarded(
+        'elif [ ! -f "$TLS_CERT_MANIFEST" ] && [ ! -f "$TLS_CERT_MANIFEST_DEFERRED" ]; then'
+    )
 
 
 def test_bootstrap_manifest_render_is_guarded() -> None:

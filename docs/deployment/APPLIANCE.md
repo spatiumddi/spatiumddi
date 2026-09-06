@@ -372,7 +372,9 @@ read the whole posture out of `charts/spatiumddi-appliance/values.yaml` and
 ### PriorityClasses
 
 Three cluster-scoped classes, rendered by
-`charts/spatiumddi-appliance/templates/priorityclasses.yaml`:
+`charts/spatiumddi-appliance/templates/priorityclasses.yaml` — from
+**exactly one** of the two releases that chart is installed as (see
+[Who renders them](#who-renders-them) below):
 
 | Class | Value | Applied to |
 |---|---|---|
@@ -441,6 +443,61 @@ could not recover because the manifest would already be applied. Falling back
 to no class is exactly the pre-#983 behaviour and is always schedulable, and
 nothing is lost: firstboot re-renders this manifest on every boot, so the
 ranking returns on the first boot where bootstrap is healthy.
+
+#### Who renders them
+
+The appliance chart is installed **twice on every appliance**, under two
+release names. That is easy to miss, and #988 did: the template's own
+comment asserted the chart was "installed exactly once per appliance
+cluster".
+
+| Release | Installed by | Contains | `priorityClasses` |
+|---|---|---|---|
+| `spatium-bootstrap` | `spatiumddi-firstboot` → `server/manifests/spatium-bootstrap.yaml` | supervisor DaemonSet + CNPG operator; every role off | `create: true` |
+| `spatiumddi-appliance` | the supervisor — `_build_values` in `agent/supervisor/spatium_supervisor/service_lifecycle.py` | the role DaemonSets; supervisor off | `create: false`, `external: true` |
+
+Namespaced objects never collide, because the two releases render disjoint
+workloads. Cluster-scoped objects have no namespace to keep them apart, and
+Helm stamps `meta.helm.sh/release-name` on everything it creates and
+**refuses an install whole** when it meets one owned by another release. So
+between #988 and #992 every fresh appliance failed like this:
+
+```
+Error: INSTALLATION FAILED: unable to continue with install: PriorityClass
+"spatium-control-plane" in namespace "" exists and cannot be imported into the
+current release: invalid ownership metadata; annotation validation error:
+key "meta.helm.sh/release-name" must equal "spatiumddi-appliance": current
+value is "spatium-bootstrap"
+```
+
+with **no** `dns-bind9` / `dns-powerdns` / `dns-technitium` / `dhcp-kea` /
+`looking-glass` DaemonSet on the cluster at all — so assigning a role from
+Fleet could never produce a running service pod. It was invisible because
+the k3s helm-controller job carries `backoffLimit: 1000`: the release sat
+`FAILED` while a job retried forever, and nothing in Fleet reads that.
+
+`spatium-bootstrap` is the owner because it *must* install first — the
+supervisor that writes the other release does not exist until it has. It
+also re-renders on every boot from the running slot's baked chart
+(`spatiumddi-firstboot` has no first-boot-only gate on that write; the
+`firstboot.done` stamp is written but never read), so a slot upgrade
+re-applies the classes rather than leaving an upgraded appliance with none.
+
+`priorityClasses.external: true` is what keeps the chart's own guard
+satisfied on the supervisor's side. The guard exists because a pod naming a
+class that does not exist is refused outright, and it now has two ways to
+pass: the explicit `external` assertion, or a live `lookup` against the
+apiserver for values an operator hand-rolled. `lookup` returns empty under
+`helm template`, which is why `external` has to exist at all — and why the
+supervisor sets it rather than relying on the lookup, whose answer of
+"absent" would only ever mean bootstrap has not finished yet.
+
+Two CI gates hold this in place, because neither can see the other's half:
+`.github/scripts/charts-render-check.sh` renders **both release shapes** and
+fails on any cluster-scoped object appearing in both (plus a negative
+control that the guard still fires), and
+`agent/supervisor/tests/test_role_chart_values.py` pins the Python side that
+the shell script mirrors.
 
 ### seccomp
 
@@ -594,6 +651,27 @@ k3s signs kubelet serving certs with its own `server-ca`. #983 suggested the
 TTY console as a reference implementation — it is not one; `spatium-console`
 also goes through the apiserver proxy (`kubectl get --raw`), so nothing in
 this repo had ever spoken to a kubelet directly.
+
+**The firewall has to allow it, and until #993 it did not.** The
+supervisor-rendered `input` chain is `policy drop`, and 10250 was opened to
+*cluster peers* only — an empty set on a single node, so the rule was not
+emitted at all. A non-hostNetwork api pod reaching its own node's IP enters
+via `cni0` with a pod-CIDR source and traverses INPUT like any LAN packet,
+which is why 6443 (widened to peers ∪ pod ∪ svc) answered from the same pod
+at the same moment while 10250 timed out. Every appliance therefore fell
+back to `proxy` — and paid a full connect timeout per node, on the request
+path, before it could. There is now a second rule scoping 10250 to pod ∪
+service, alongside the peer one; note it does **not** inherit
+`kubeapi_expose_cidrs`, which widens the RBAC-guarded apiserver and has no
+business widening the kubelet.
+
+The direct probe's socket timeout is **1.5 s**, not the 6 s it shipped with:
+the snapshot probes each node before it can fall back, so on a 3-node
+cluster that first stall was ~18 s — past the browser's patience, which the
+api logged as a request cancelled mid-flight with its DB connection torn
+down under it. A kubelet on the same LAN that has not completed a handshake
+in 1.5 s is not going to, and the 15-minute negative cache means getting it
+wrong costs one node fifteen minutes of proxy transport.
 
 So the code finds out and reports it, **per node**. Cluster → Overview
 carries a `kubelet:` chip (green only when every node went direct); the same

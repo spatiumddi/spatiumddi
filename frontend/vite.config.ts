@@ -1,5 +1,5 @@
 import path from "path";
-import { defineConfig } from "vite";
+import { defineConfig } from "vitest/config";
 import react from "@vitejs/plugin-react";
 import { readFileSync } from "fs";
 
@@ -18,6 +18,20 @@ export default defineConfig({
   plugins: [react()],
   define: {
     __APP_VERSION__: JSON.stringify(appVersion),
+  },
+  // #996 — component tests need a DOM. The pre-existing suites
+  // (``lib/enrolment``, ``lib/qr``) are pure logic and ran happily under
+  // vitest's default ``node`` environment; ``HeaderMenu`` is a keyboard-
+  // driven menu whose failure modes (an arrow key that does not wrap, a
+  // disabled item that still takes focus, a trigger that renders for an
+  // empty menu) are invisible to review and to ``tsc`` alike — the same
+  // argument #906 used for decoding the QR it renders.
+  //
+  // ``environment`` is per-file via a ``@vitest-environment`` docblock
+  // rather than global: jsdom costs ~1s of setup per file and the two
+  // existing pure-logic suites have no use for it.
+  test: {
+    globals: true,
   },
   resolve: {
     alias: {

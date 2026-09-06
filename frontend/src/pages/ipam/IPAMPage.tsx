@@ -9,7 +9,6 @@ import {
 } from "@tanstack/react-query";
 import { Link, useLocation, useSearchParams } from "react-router-dom";
 import {
-  ChevronDown,
   ChevronRight,
   Network,
   Layers,
@@ -121,6 +120,7 @@ import {
   useDraggableModal,
 } from "@/components/ui/use-draggable-modal";
 import { HeaderButton } from "@/components/ui/header-button";
+import { HeaderMenu } from "@/components/ui/header-menu";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { TagFilterChips } from "@/components/TagFilterChips";
 import { matchesAllTagChips } from "@/components/tag-filter-utils";
@@ -3959,6 +3959,12 @@ function BreadcrumbPills({ items }: { items: BreadcrumbItem[] }) {
 // more DHCP scopes attached. DHCP + "All" entries are gated on
 // ``hasDhcp`` — blocks/spaces don't carry scopes and keep the old single
 // button. Closes on outside click via a mousedown listener on the document.
+// #996 — was a local copy of the open-state + outside-mousedown +
+// keyboard dance. The DNS zone detail needed the same shape and a third
+// copy was about to be written, so the behaviour moved to the shared
+// ``HeaderMenu`` under components/ui/ and this became a description of
+// the items. Behaviourally identical, plus the keyboard handling the
+// local copy never had.
 function SyncMenu({
   onSyncDns,
   onSyncDhcp,
@@ -3970,74 +3976,32 @@ function SyncMenu({
   onSyncAll: () => void;
   hasDhcp: boolean;
 }) {
-  const [open, setOpen] = useState(false);
-  const ref = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    if (!open) return;
-    const onDocMouseDown = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) {
-        setOpen(false);
-      }
-    };
-    document.addEventListener("mousedown", onDocMouseDown);
-    return () => document.removeEventListener("mousedown", onDocMouseDown);
-  }, [open]);
-
-  const itemCls =
-    "flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-muted disabled:opacity-50";
-
   return (
-    <div ref={ref} className="relative">
-      <button
-        onClick={() => setOpen((v) => !v)}
-        title="Sync IPAM with DNS and/or DHCP servers"
-        className="flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm hover:bg-muted disabled:opacity-50"
-      >
-        <RefreshCw className="h-3.5 w-3.5" />
-        Sync
-        <ChevronDown className="h-3.5 w-3.5" />
-      </button>
-      {open && (
-        <div className="absolute right-0 z-20 mt-1 w-44 overflow-hidden rounded-md border bg-popover shadow-md">
-          <button
-            type="button"
-            onClick={() => {
-              setOpen(false);
-              onSyncDns();
-            }}
-            className={itemCls}
-          >
-            <Globe2 className="h-3.5 w-3.5" /> DNS
-          </button>
-          {hasDhcp && (
-            <>
-              <button
-                type="button"
-                onClick={() => {
-                  setOpen(false);
-                  onSyncDhcp();
-                }}
-                className={itemCls}
-              >
-                <Server className="h-3.5 w-3.5" /> DHCP
-              </button>
-              <div className="border-t" />
-              <button
-                type="button"
-                onClick={() => {
-                  setOpen(false);
-                  onSyncAll();
-                }}
-                className={itemCls}
-              >
-                <RefreshCw className="h-3.5 w-3.5" /> All
-              </button>
-            </>
-          )}
-        </div>
-      )}
-    </div>
+    <HeaderMenu
+      label="Sync"
+      icon={RefreshCw}
+      title="Sync IPAM with DNS and/or DHCP servers"
+      items={[
+        { key: "dns", label: "DNS", icon: Globe2, onSelect: onSyncDns },
+        ...(hasDhcp
+          ? [
+              {
+                key: "dhcp",
+                label: "DHCP",
+                icon: Server,
+                onSelect: onSyncDhcp,
+              },
+              {
+                key: "all",
+                label: "All",
+                icon: RefreshCw,
+                separatorBefore: true,
+                onSelect: onSyncAll,
+              },
+            ]
+          : []),
+      ]}
+    />
   );
 }
 
@@ -4208,8 +4172,12 @@ function ReconciliationModal({
 // Collapses Clean Orphans / Merge / Resize / Scan with nmap / Split into a
 // single dropdown so the subnet header doesn't accumulate a row of 9+ buttons
 // as we add features. Items are alphabetical to make discovery predictable —
-// operators don't have to scan a custom ordering. Closes on outside click via
-// a mousedown listener (same pattern as SyncMenu above).
+// operators don't have to scan a custom ordering.
+//
+// #996 — the open/close behaviour now comes from the shared ``HeaderMenu``
+// instead of a fourth hand-rolled copy of it, so this is just the item list
+// plus the AI gate. That also gives it the keyboard navigation the local
+// copy never had.
 function ToolsMenu({
   onBulkAllocate,
   onCleanOrphans,
@@ -4232,132 +4200,73 @@ function ToolsMenu({
   // rendered when an AI provider is configured.
   onAskAi?: () => void;
 }) {
-  const [open, setOpen] = useState(false);
-  const ref = useRef<HTMLDivElement>(null);
   const aiAvailable = useAiAvailable();
-
-  useEffect(() => {
-    if (!open) return;
-    const onDocMouseDown = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) {
-        setOpen(false);
-      }
-    };
-    document.addEventListener("mousedown", onDocMouseDown);
-    return () => document.removeEventListener("mousedown", onDocMouseDown);
-  }, [open]);
-
-  const itemCls =
-    "flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-muted disabled:opacity-50";
-
   return (
-    <div ref={ref} className="relative">
-      <button
-        type="button"
-        onClick={() => setOpen((v) => !v)}
-        title="Subnet tools — scan, clean, reshape"
-        className="flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
-      >
-        <Wrench className="h-3.5 w-3.5" />
-        Tools
-        <ChevronDown className="h-3.5 w-3.5" />
-      </button>
-      {open && (
-        <div className="absolute right-0 z-20 mt-1 w-52 overflow-hidden rounded-md border bg-popover shadow-md">
-          <button
-            type="button"
-            onClick={() => {
-              setOpen(false);
-              onBulkAllocate();
-            }}
-            className={itemCls}
-          >
-            <Layers className="h-3.5 w-3.5" /> Bulk allocate…
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              setOpen(false);
-              onCleanOrphans();
-            }}
-            className={itemCls}
-          >
-            <Trash2 className="h-3.5 w-3.5" /> Clean Orphans
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              setOpen(false);
-              onMerge();
-            }}
-            className={itemCls}
-          >
-            <GitMerge className="h-3.5 w-3.5" /> Merge…
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              setOpen(false);
-              onReconcile();
-            }}
-            className={itemCls}
-          >
-            <Radar className="h-3.5 w-3.5" /> Reconcile (IP discovery)
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              setOpen(false);
-              onResize();
-            }}
-            className={itemCls}
-          >
-            <Maximize2 className="h-3.5 w-3.5" /> Resize…
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              setOpen(false);
-              onScan();
-            }}
-            className={itemCls}
-          >
-            <Radar className="h-3.5 w-3.5" /> Scan with nmap
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              setOpen(false);
-              onSplit();
-            }}
-            className={itemCls}
-          >
-            <Scissors className="h-3.5 w-3.5" /> Split…
-          </button>
-          {onAskAi && aiAvailable && (
-            <button
-              type="button"
-              onClick={() => {
-                setOpen(false);
-                onAskAi();
-              }}
-              className={cn(itemCls, "border-t")}
-            >
-              <Sparkles className="h-3.5 w-3.5 text-primary" /> Ask AI about
-              this…
-            </button>
-          )}
-        </div>
-      )}
-    </div>
+    <HeaderMenu
+      label="Tools"
+      icon={Wrench}
+      title="Subnet tools — scan, clean, reshape"
+      items={[
+        {
+          key: "bulk-allocate",
+          label: "Bulk allocate…",
+          icon: Layers,
+          onSelect: onBulkAllocate,
+        },
+        {
+          key: "clean-orphans",
+          label: "Clean Orphans",
+          icon: Trash2,
+          onSelect: onCleanOrphans,
+        },
+        { key: "merge", label: "Merge…", icon: GitMerge, onSelect: onMerge },
+        {
+          key: "reconcile",
+          label: "Reconcile (IP discovery)",
+          icon: Radar,
+          onSelect: onReconcile,
+        },
+        {
+          key: "resize",
+          label: "Resize…",
+          icon: Maximize2,
+          onSelect: onResize,
+        },
+        { key: "scan", label: "Scan with nmap", icon: Radar, onSelect: onScan },
+        { key: "split", label: "Split…", icon: Scissors, onSelect: onSplit },
+        ...(onAskAi && aiAvailable
+          ? [
+              {
+                key: "ask-ai",
+                label: "Ask AI about this…",
+                icon: Sparkles,
+                iconClassName: "text-primary",
+                separatorBefore: true,
+                onSelect: onAskAi,
+              },
+            ]
+          : []),
+      ]}
+    />
   );
 }
 
 // Generic header overflow menu — gives the Block / Space headers the same
 // "secondary actions live behind a Tools ▾ dropdown" grammar the Subnet header
-// uses, instead of a flat row of buttons (#465 level-invariant toolbar). Items
-// with no handler are skipped so call sites can conditionally include entries.
-function HeaderMenu({
+// uses, instead of a flat row of buttons (#465 level-invariant toolbar).
+//
+// #996 — now a thin adapter over the shared ``HeaderMenu`` rather than a
+// local copy of the open-state + outside-mousedown dance. This file alone
+// carried THREE of those (this, ``SyncMenu``, and ``ToolsMenu`` above) and
+// the DNS zone detail was about to make a fourth, which is what turned
+// "extract SyncMenu" into "there is a primitive and everything uses it".
+// Renamed off ``HeaderMenu`` because the shared primitive owns that name.
+//
+// The ``| null`` item shape and ``onClick`` naming are kept so its call
+// site is untouched: it builds the list with an inline conditional that
+// reads better as ``cond ? {...} : null`` than as a spread. Entries with no
+// handler are dropped, and a menu left with nothing renders nothing.
+function ActionsMenu({
   label = "Tools",
   items,
 }: {
@@ -4369,59 +4278,24 @@ function HeaderMenu({
     title?: string;
   } | null>;
 }) {
-  const [open, setOpen] = useState(false);
-  const ref = useRef<HTMLDivElement>(null);
-  const real = items.filter(
-    (
-      i,
-    ): i is {
-      label: string;
-      icon?: LucideIcon;
-      onClick: () => void;
-      title?: string;
-    } => !!i && !!i.onClick,
-  );
-  useEffect(() => {
-    if (!open) return;
-    const onDocMouseDown = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node))
-        setOpen(false);
-    };
-    document.addEventListener("mousedown", onDocMouseDown);
-    return () => document.removeEventListener("mousedown", onDocMouseDown);
-  }, [open]);
-  if (real.length === 0) return null;
   return (
-    <div ref={ref} className="relative">
-      <button
-        type="button"
-        onClick={() => setOpen((v) => !v)}
-        className="flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
-      >
-        <Wrench className="h-3.5 w-3.5" />
-        {label}
-        <ChevronDown className="h-3.5 w-3.5" />
-      </button>
-      {open && (
-        <div className="absolute right-0 z-20 mt-1 w-52 overflow-hidden rounded-md border bg-popover shadow-md">
-          {real.map((it) => (
-            <button
-              key={it.label}
-              type="button"
-              title={it.title}
-              onClick={() => {
-                setOpen(false);
-                it.onClick();
-              }}
-              className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-muted"
-            >
-              {it.icon && <it.icon className="h-3.5 w-3.5" />}
-              {it.label}
-            </button>
-          ))}
-        </div>
+    <HeaderMenu
+      label={label}
+      icon={Wrench}
+      items={items.flatMap((it) =>
+        it && it.onClick
+          ? [
+              {
+                key: it.label,
+                label: it.label,
+                icon: it.icon,
+                title: it.title,
+                onSelect: it.onClick,
+              },
+            ]
+          : [],
       )}
-    </div>
+    />
   );
 }
 
@@ -5339,7 +5213,11 @@ function SubnetDetail({
                 return <BreadcrumbPills items={crumbs} />;
               })()}
           </div>
-          <div className="flex flex-shrink-0 items-center gap-2">
+          {/* #996 — already the target shape (Refresh + three menus + a
+              primary), so no regrouping needed here; ``flex-wrap`` is the
+              other half of that issue's fix, so a narrow window moves the
+              actions to a second line instead of clipping the last one. */}
+          <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
             <HeaderButton
               icon={RefreshCw}
               onClick={refreshSubnet}
@@ -12736,7 +12614,7 @@ function BlockDetailView({
                 {/* Structural / less-frequent actions grouped behind a Tools ▾
                     dropdown, mirroring the Subnet header's grammar instead of a
                     flat button row (#465). */}
-                <HeaderMenu
+                <ActionsMenu
                   items={[
                     space
                       ? {

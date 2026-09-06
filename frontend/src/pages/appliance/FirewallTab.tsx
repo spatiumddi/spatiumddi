@@ -70,6 +70,7 @@ const SOURCE_KINDS: FirewallSourceKind[] = [
   "pod_cidr",
   "service_cidr",
   "kubeapi",
+  "kubelet",
   "mgmt",
   "vip",
 ];

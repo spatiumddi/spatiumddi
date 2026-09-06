@@ -24,14 +24,33 @@ components still outrank everything here.
 re-rank every pod in every namespace on the cluster, including workloads an
 operator joined to it themselves.
 
-These are CLUSTER-SCOPED objects rendered by a namespaced release. That is
-deliberate: this chart is installed exactly once per appliance cluster (the
-seed renders it; joined members render nothing into the auto-deploy dir —
-see spatiumddi-firstboot's member guard), and the umbrella control-plane
-release references the names it defines. Ordering works out because
-firstboot writes spatium-bootstrap.yaml immediately and holds
-spatium-control.yaml back as ``.deferred`` until the CNPG webhook is ready,
-so the classes exist before any pod names one.
+#992 — THIS CHART IS INSTALLED TWICE PER APPLIANCE, under two release
+names, and these are CLUSTER-SCOPED objects. Helm stamps
+``meta.helm.sh/release-name`` on everything it creates and refuses an
+install whole when it meets an existing object owned by another release, so
+exactly one of the two releases may render them:
+
+  spatium-bootstrap     firstboot → server/manifests/spatium-bootstrap.yaml.
+                        supervisor DaemonSet + CNPG operator; every role off.
+                        ``priorityClasses.create: true`` — it installs first
+                        (the supervisor does not exist until it has run), and
+                        firstboot re-renders it from the running slot's baked
+                        chart on EVERY boot, so a slot upgrade re-applies it.
+
+  spatiumddi-appliance  the supervisor itself, via
+                        service_lifecycle._build_values. The role DaemonSets.
+                        ``priorityClasses.create: false`` + ``external: true``.
+
+The original comment here claimed the chart was "installed exactly once per
+appliance cluster". It never was, and every fresh install between #988 and
+#992 had its role chart refused with ``invalid ownership metadata`` — no
+role DaemonSet on the cluster at all, while the Fleet UI showed nothing
+wrong because the helm-install job has ``backoffLimit: 1000`` and simply
+retried forever.
+
+Ordering still works out because firstboot writes spatium-bootstrap.yaml
+immediately and holds spatium-control.yaml back as ``.deferred`` until the
+CNPG webhook is ready, so the classes exist before any pod names one.
 
 Deliberately NOT annotated ``helm.sh/resource-policy: keep``, unlike the
 CNPG ``Cluster``. ``keep`` would survive the k3s helm-controller's
@@ -43,26 +62,50 @@ class's value would silently do nothing. A few seconds of "cannot create
 pods" beats a value that reads as changed and is not.
 */}}
 {{/*
-Refuse the render outright when ``create`` is off while workloads still name
-a class. The apiserver REFUSES a pod naming a PriorityClass that does not
-exist, so that combination does not degrade the appliance — it stops every
-role pod and the supervisor being created at all, with the reason buried in
-a ReplicaSet event. The chart already fails for a less severe seccomp
-misconfiguration; this one earns it more.
+Guard the combination that stops the appliance dead: workloads naming a
+class that nothing will create. The apiserver REFUSES a pod naming a
+PriorityClass that does not exist, so it does not degrade the appliance —
+no role pod and no supervisor is created at all, with the reason buried in
+a DaemonSet event.
+
+``create: false`` alone is no longer enough to conclude that, since #992
+made a second release the legitimate owner. Two ways to satisfy the guard:
+
+  external: true   an explicit assertion that some other release or
+                   manifest creates them. Deterministic, and the only form
+                   that works under ``helm template`` / ``helm lint`` /
+                   charts-lint, where there is no cluster to ask. This is
+                   what the supervisor sets.
+
+  the class exists  ``lookup`` against the live apiserver, for values an
+                   operator hand-rolled without setting ``external``.
+                   ``lookup`` is live inside the k3s helm-controller job
+                   (it runs a real ``helm install``), and returns empty
+                   under ``helm template`` — which is why ``external`` has
+                   to exist at all rather than this being the only test.
 
 Named rather than counted, so the message says what to clear.
 */}}
 {{- if not .Values.priorityClasses.create }}
-{{- $named := list -}}
+{{- $named := dict -}}
 {{- range $key, $wl := .Values -}}
 {{- if kindIs "map" $wl -}}
-{{- if get $wl "priorityClassName" -}}
-{{- $named = append $named (printf "%s.priorityClassName=%s" $key (get $wl "priorityClassName")) -}}
+{{- $class := get $wl "priorityClassName" -}}
+{{- if $class -}}
+{{- $_ := set $named $class (printf "%s.priorityClassName" $key) -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}
-{{- if $named -}}
-{{- fail (printf "priorityClasses.create is false, but these still name a class this chart would no longer render: %s. A pod naming a PriorityClass that does not exist is REFUSED by the apiserver — set each of them to \"\" as well, or leave create: true." (join ", " $named)) -}}
+{{- if and $named (not .Values.priorityClasses.external) -}}
+{{- $missing := list -}}
+{{- range $class, $where := $named -}}
+{{- if not (lookup "scheduling.k8s.io/v1" "PriorityClass" "" $class) -}}
+{{- $missing = append $missing (printf "%s (named by %s)" $class $where) -}}
+{{- end -}}
+{{- end -}}
+{{- if $missing -}}
+{{- fail (printf "priorityClasses.create is false and these classes are not on the cluster: %s. A pod naming a PriorityClass that does not exist is REFUSED by the apiserver, so this render would produce workloads that can never be created. Fix one of three ways: leave create: true; set priorityClasses.external=true if another release (spatium-bootstrap) creates them and this render simply cannot see the cluster; or set each priorityClassName to \"\" as well." (join ", " $missing)) -}}
+{{- end -}}
 {{- end -}}
 {{- end }}
 {{- if .Values.priorityClasses.create }}

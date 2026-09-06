@@ -228,6 +228,28 @@ def _build_values(profiles: list[str], env_vars: dict[str, str]) -> dict[str, ob
             "imageTag": image_tag,
             "imagePullPolicy": "Never",
         },
+        # #992 — the PriorityClasses are CLUSTER-SCOPED and this chart is
+        # installed twice per appliance, under two release names. Helm
+        # stamps ``meta.helm.sh/release-name`` on everything it creates and
+        # refuses an install WHOLE when it meets an object owned by another
+        # release, so the second install fails with ``invalid ownership
+        # metadata`` and NO role DaemonSet is ever created — which is what
+        # every fresh install between #988 and #992 did, silently, because
+        # the helm-install job retries forever (backoffLimit: 1000) and
+        # nothing in Fleet reports a chart that never installed.
+        #
+        # ``spatium-bootstrap`` owns them: firstboot writes that manifest
+        # before the supervisor exists to write this one, and re-renders it
+        # from the running slot's baked chart on EVERY boot, so a slot
+        # upgrade re-applies it. ``external: true`` is what keeps the
+        # chart's own guard satisfied while ``create`` is false — the guard
+        # otherwise asks the apiserver, and an answer of "absent" here would
+        # only ever mean bootstrap has not finished, not that the values are
+        # wrong.
+        "priorityClasses": {
+            "create": False,
+            "external": True,
+        },
         "agentLanding": {
             "enabled": False,
         },

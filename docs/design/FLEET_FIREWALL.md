@@ -136,7 +136,7 @@ firewall_apply_lag_intervals:  Mapped[int]  = 5            # rendered≠applied 
 ### 2.5 Seeded builtins (migration — idempotent data seed, split from schema; see Phase 3)
 
 - One `fleet` policy (`is_builtin=True`, empty — operators add fleet-wide rules here).
-- Six `role` policies: `control-plane` (80/443+vip; 2379/2380/10250 cluster_peers; 6443 peers∪pod∪svc; memberlist 7946 **tcp+udp** cluster_peers), `dns-bind9`/`dns-powerdns`/`dns-technitium` (53 tcp+udp), `dhcp` (67 udp + 68 return), `observer` (9100→scraper-CIDR, default-disabled rule), `custom` (empty). The three DNS-engine policies are byte-identical; `dns-technitium` ships in its own seed migration (`6a668dd451d5`) rather than as an edit to the already-shipped `f5b8d2c91a06`, per the append-only migration rule.
+- Six `role` policies: `control-plane` (80/443+vip; 2379/2380/10250 cluster_peers; 6443 peers∪pod∪svc; **10250 also pod∪svc** — `source_kind=kubelet`, seeded by `d4a9e37b2c15` for #993, so the api pod can reach its OWN node's kubelet, which the peer-scoped rule never covers and on a single node is not emitted at all; deliberately NOT the `kubeapi` union, whose operator `kubeapi_expose_cidrs` allowlist must not be extended from the RBAC-guarded apiserver to the kubelet's `/exec` and `/run`; memberlist 7946 **tcp+udp** cluster_peers), `dns-bind9`/`dns-powerdns`/`dns-technitium` (53 tcp+udp), `dhcp` (67 udp + 68 return), `observer` (9100→scraper-CIDR, default-disabled rule), `custom` (empty). The three DNS-engine policies are byte-identical; `dns-technitium` ships in its own seed migration (`6a668dd451d5`) rather than as an edit to the already-shipped `f5b8d2c91a06`, per the append-only migration rule.
 - Builtin aliases: `@k3s_peer_ports`, `@dns_ports`, `@dhcp_ports`, `@web_ports`.
 
 ### 2.6 Two new derived inputs the supervisor must report (verified absent today)
@@ -207,6 +207,8 @@ tcp dport { 80, 443 } accept comment "role:control-plane web"
 # ── CLUSTER DERIVED (peer-scoped; etcd/kubelet NEVER LAN-wide) ──
 ip  saddr @k3s_peers_v4  tcp dport { 2379, 2380, 10250 } accept comment "k3s-peer-v4"
 ip6 saddr @k3s_peers_v6  tcp dport { 2379, 2380, 10250 } accept comment "k3s-peer-v6"
+ip  saddr @kubelet_v4    tcp dport 10250 accept comment "kubelet-v4"   # #993, pod ∪ svc
+ip6 saddr @kubelet_v6    tcp dport 10250 accept comment "kubelet-v6"   # #993, pod ∪ svc
 ip  saddr @kubeapi_v4    tcp dport 6443 accept comment "kubeapi"        # peers ∪ pod ∪ svc ∪ kubeapi_expose
 ip  saddr @k3s_peers_v4  tcp dport 7946 accept comment "metallb-memberlist-tcp"   # emitted iff cp_member_count>=2 && vip
 ip  saddr @k3s_peers_v4  udp dport 7946 accept comment "metallb-memberlist-udp"

@@ -290,3 +290,69 @@ def test_webui_sentinel_directive_all_renderers() -> None:
         for body in bodies:
             assert f"# spatium-webui: {expected}" in body
             assert f"# spatium-webui: {other}" not in body
+
+
+# ── #993 — kubelet 10250 reachable from inside the cluster ──────────────
+
+
+_SINGLE_NODE_CP = {
+    "role_assignment": {"roles": ["dns-bind9"]},
+    "pod_cidrs": ["10.42.0.0/16"],
+    "service_cidrs": ["10.43.0.0/16"],
+}
+
+
+def test_kubelet_is_open_to_the_pod_cidr_on_a_single_node() -> None:
+    """The bug #990 shipped into, and the reason it shipped unnoticed.
+
+    10250 was opened to ``cluster_peer_cidrs`` only — an EMPTY set on a
+    single node, so the rule was not emitted at all. An api pod reading its
+    own node's kubelet enters via cni0 with a pod-CIDR source and traverses
+    INPUT like any LAN packet, so the direct transport could never connect
+    on the deployment shape every appliance starts as.
+    """
+    body = compile_firewall_body(**_SINGLE_NODE_CP)
+    assert "ip saddr { 10.42.0.0/16, 10.43.0.0/16 } tcp dport 10250 accept" in body
+    assert 'comment "kubelet-v4"' in body
+    # …and the peer rule is genuinely absent here, which is what made the
+    # port unreachable rather than merely narrowly scoped.
+    assert "k3s-peer" not in body
+
+
+def test_kubelet_does_not_inherit_the_kubeapi_expose_allowlist() -> None:
+    """``kubeapi_expose_cidrs`` widens 6443 so an operator can run kubectl
+    from the LAN. The apiserver guards every request with RBAC; the kubelet
+    API serves /exec, /run and /attach. Extending one to the other would be
+    a privilege escalation nobody asked for, so the two rules resolve
+    different source sets — asserted, because they are one copy-paste apart.
+    """
+    body = compile_firewall_body(
+        role_assignment={"roles": [], "kubeapi_expose_cidrs": ["10.9.0.0/24"]},
+        pod_cidrs=["10.42.0.0/16"],
+        service_cidrs=["10.43.0.0/16"],
+    )
+    kubelet = next(ln for ln in body.splitlines() if "kubelet-v4" in ln)
+    kubeapi = next(ln for ln in body.splitlines() if "kubeapi-v4" in ln)
+    assert "10.9.0.0/24" not in kubelet
+    assert "10.9.0.0/24" in kubeapi
+
+
+def test_kubelet_rule_is_family_split() -> None:
+    """A v6 pod CIDR in a v4 nft set is the v6-lockout bug the whole
+    _split_families discipline exists for."""
+    body = compile_firewall_body(
+        role_assignment={"roles": []},
+        pod_cidrs=["10.42.0.0/16", "2001:cafe:42::/56"],
+    )
+    v4 = next(ln for ln in body.splitlines() if "kubelet-v4" in ln)
+    v6 = next(ln for ln in body.splitlines() if "kubelet-v6" in ln)
+    assert "2001:cafe:42::/56" not in v4
+    assert "10.42.0.0/16" not in v6
+
+
+def test_no_kubelet_rule_without_an_in_cluster_source() -> None:
+    """A node with neither pod nor service CIDR is not running a kubelet we
+    can reach in-cluster; emitting an empty nft set there is a syntax error,
+    not an open port."""
+    body = compile_firewall_body(role_assignment={"roles": ["dns-bind9"]})
+    assert "kubelet" not in body
