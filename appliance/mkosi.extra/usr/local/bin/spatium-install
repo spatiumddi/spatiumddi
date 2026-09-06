@@ -790,7 +790,7 @@ ask_ssh_keys() {
             url)
                 local src fetched
                 src=$(whiptail --backtitle "$BACKTITLE" --title "Fetch public keys" \
-                    --inputbox "A URL serving public keys, or a bare GitHub username.\n\n  alice                  -> https://github.com/alice.keys\n  https://example/id.pub\n\nThis is the only outbound request the installer makes on your behalf, and only because you asked for it." \
+                    --inputbox "A URL serving public keys, or a bare GitHub username.\n\n  alice                  -> https://github.com/alice.keys\n  https://example/id.pub\n\nThe installer fetches this only because you asked it to. See docs/PRIVACY.md for every outbound request it can make." \
                     16 74 3>&1 1>&2 2>&3) || continue
                 [ -n "$src" ] || continue
                 case "$src" in
@@ -1236,12 +1236,22 @@ _disk_hazard() {
 # Is there already a SpatiumDDI install on this disk? Prints its version
 # when there is (#995 item 25).
 _existing_install_version() {
-    local dev="$1" part label ver mnt
+    # ver="" because it is only assigned inside the `if mount` branch and
+    # read unconditionally after it — under `set -u` a failed mount killed
+    # the command-substitution subshell, so the caller silently got "" and
+    # the whole "Keep /var" offer disappeared. A dirty ext4 that will not
+    # mount read-only is exactly when someone reinstalls.
+    local dev="$1" part label ver="" mnt
     for part in $(lsblk -nro NAME "$dev" 2>/dev/null | tail -n +2); do
         label=$(lsblk -nro LABEL "/dev/$part" 2>/dev/null | head -1)
         [ "$label" = "root_a" ] || continue
         mnt=$(mktemp -d) || return 1
-        if mount -o ro "/dev/$part" "$mnt" 2>/dev/null; then
+        # noload: a plain `mount -o ro` on ext4 REPLAYS THE JOURNAL, so
+        # merely enumerating disks would write to one the operator has not
+        # chosen. Timeout because an unresponsive LUN or USB stick blocks
+        # in uninterruptible D state for the SCSI timeout with the console
+        # showing nothing.
+        if timeout 10 mount -o ro,noload -t ext4 "/dev/$part" "$mnt" 2>/dev/null; then
             ver=$(_appliance_version_from "$mnt/etc/spatiumddi/appliance-release")
             umount "$mnt" 2>/dev/null || true
         fi
@@ -1280,7 +1290,12 @@ pick_disk() {
         # size floor — _assert_safe_wipe_target re-applies both (plus the
         # whole-disk check) immediately before the wipe (#581).
         log "Preseed: target_disk=$TARGET_DISK (confirm_wipe authorised; skipping picker — pre-wipe guard still applies)"
-        return 0
+        # #995 item 26 — resolve the stable name here too. It was only set
+        # in the interactive branch below, so every headless install wrote
+        # target_disk_by_id: "" and exported the unstable /dev/sdX into the
+        # answer file whose whole purpose is fleet cloning.
+        TARGET_DISK_BY_ID=$(_disk_by_id "$TARGET_DISK")
+        return 2
     fi
     local options=()
     local -A live_disks=()
@@ -1366,15 +1381,30 @@ pick_disk() {
                 # partial or foreign layout must take the full wipe, not a
                 # guess about which partition is which.
                 KEEP_VAR="no"
-                if [ -n "$(_existing_install_version "$TARGET_DISK")" ] && \
-                   _layout_is_reusable "$TARGET_DISK"; then
-                    if whiptail --backtitle "$BACKTITLE" \
-                        --title "Existing SpatiumDDI install" \
-                        --defaultno --yes-button "Keep /var" --no-button "Erase everything" \
-                        --yesno "$TARGET_DISK already has a SpatiumDDI install with the standard layout.\n\nKeep /var and the STATE partition?\n\n  Keep    - the database, logs, container images and the machine identity (SSH host keys, supervisor keypair) survive. Both OS slots are replaced.\n  Erase   - everything goes, as a fresh install.\n\nKeeping /var reuses the existing partition table, so the sizes cannot change." \
-                        20 76; then
-                        KEEP_VAR="yes"
-                    fi
+                local existing
+                existing=$(_existing_install_version "$TARGET_DISK")
+                if [ -n "$existing" ] && _layout_is_reusable "$TARGET_DISK"; then
+                    # A --yesno here made ESC (whiptail exit 255) AND a
+                    # blind Enter both select the destructive branch. Every
+                    # other destructive gate in this wizard demands positive
+                    # consent; an ambiguous keypress must not authorise
+                    # wiping the database. A menu with no default has no
+                    # accidental answer, and Cancel re-asks.
+                    local keepvar_pick
+                    while true; do
+                        keepvar_pick=$(whiptail --backtitle "$BACKTITLE" \
+                            --title "Existing SpatiumDDI install" \
+                            --cancel-button "Back" \
+                            --menu "$TARGET_DISK already has a SpatiumDDI install ($existing) with the standard layout.\n\n  Keep  - the database, logs, container images and the machine identity (SSH host keys, supervisor keypair) survive. Both OS slots are replaced, and the existing partition table is reused so the sizes cannot change.\n  Erase - everything goes, as a fresh install." \
+                            20 76 2 \
+                            "keep"  "Keep /var and STATE" \
+                            "erase" "Erase everything on $TARGET_DISK" \
+                            3>&1 1>&2 2>&3) || continue
+                        case "$keepvar_pick" in
+                            keep)  KEEP_VAR="yes"; break ;;
+                            erase) KEEP_VAR="no";  break ;;
+                        esac
+                    done
                 fi
                 log "Picked target disk $TARGET_DISK (${TARGET_DISK_BY_ID:-no by-id name}) ($((DISK_BYTES / 1024 / 1024 / 1024)) GiB) keep_var=$KEEP_VAR"
                 break
@@ -1453,7 +1483,7 @@ confirm_partition_layout() {
         # confirm_wipe: true in the preseed IS the wipe authorisation —
         # don't re-prompt the layout checkbox on an unattended run.
         log "Preseed: partition-layout confirm skipped (confirm_wipe authorised $TARGET_DISK)"
-        return 0
+        return 2
     fi
     local DISK_BYTES disk_gib var_gib
     DISK_BYTES=$(blockdev --getsize64 "$TARGET_DISK" 2>/dev/null || echo 0)
@@ -2511,8 +2541,10 @@ confirm() {
     elif [ "$NTP_SERVERS" != "pool.ntp.org" ]; then
         s+="Time source: $NTP_SERVERS\n"
     fi
-    if [ "$(_ssh_key_count)" -gt 0 ]; then
-        s+="SSH keys:    $(_ssh_key_count) authorised for $ADMIN_USER"
+    local nkeys
+    nkeys=$(_ssh_key_count)
+    if [ "$nkeys" -gt 0 ]; then
+        s+="SSH keys:    $nkeys authorised for $ADMIN_USER"
         if [ "$SSH_DISABLE_PASSWORD" = "yes" ]; then
             s+=" (password SSH OFF)"
         fi
@@ -2543,35 +2575,49 @@ confirm() {
     # control-plane URL over about 52 characters. This is the screen that
     # must never be truncated, since the last two rows are the ERASE
     # warning and the question itself.
-    # #995 item 28 — a menu of fields, not a yes/no.
+    # #995 item 28 — the review, then a menu of fields.
+    #
+    # TWO screens, not one. The first cut put the whole summary in a
+    # --menu's message area and it did not fit: _whiptail_height clamps to
+    # term-1, whiptail then spends the list height plus chrome on the
+    # rows, and on the 80x24 serial console every appliance install
+    # actually uses, the bottom of the body was cut — which is where the
+    # ERASE / REINSTALL warning and the question live. Padding the height
+    # argument cannot beat a cap that is already binding. So the summary
+    # keeps its own full-height --msgbox, and the picker is a second,
+    # short screen that needs almost no message area.
     #
     # Back used to walk one screen at a time, so correcting the hostname
-    # from here meant pressing Back past the CIDRs, the pairing code, the
-    # timezone and the network — and then pressing OK through all of them
-    # again. On a serial console that is the slowest interaction in the
-    # wizard, and it is the one an operator reaches for precisely when
-    # they have spotted something wrong on the last screen before a wipe.
-    #
-    # The review text still renders above the menu, so nothing is lost:
-    # the rows are the same fields, and picking one jumps straight to its
-    # screen. "Install" is last so it is never the accidental default.
+    # from here meant pressing Back past four screens and OK through them
+    # again — on a serial console the slowest interaction in the wizard,
+    # reached precisely when the operator has spotted something wrong on
+    # the last screen before a wipe.
+    whiptail --backtitle "$BACKTITLE" --title "Review" \
+        --cancel-button "Back" \
+        --yes-button "Continue" --no-button "Back" \
+        --yesno "$s" "$(_whiptail_height "$s" 76)" 76 \
+        || return 1
+
     CONFIRM_JUMP=""
     local pick
+    # --default-item is a field row, never `install`: this is the last
+    # screen before an irreversible wipe and a reflexive Enter must not
+    # be the thing that starts it. `install` is also LAST in the list,
+    # so reaching it is a deliberate movement.
     pick=$(whiptail --backtitle "$BACKTITLE" --title "Confirm" \
         --cancel-button "Back" \
-        --default-item "install" \
-        --menu "$s"$'\n'"Pick a field to change it, or Install to begin." \
-        "$(_whiptail_height "$s"$'\n\n\n\n\n\n\n\n\n\n' 76)" 76 8 \
-        "install"  "*** INSTALL — erase $TARGET_DISK and begin ***" \
+        --default-item "pick_disk" \
+        --menu "Change a field, or choose Install to begin." 20 76 11 \
         "pick_disk"     "Target disk        $TARGET_DISK" \
+        "ask_role"      "Role               $ROLE" \
         "ask_hostname"  "Hostname           $HOSTNAME" \
         "ask_user_password" "Admin account  $ADMIN_USER" \
-        "ask_ssh_keys"  "SSH keys           $(_ssh_key_count) authorised" \
+        "ask_ssh_keys"  "SSH keys           $nkeys authorised" \
         "ask_network"   "Network            $NET_MODE" \
         "ask_timezone"  "Timezone           $TIMEZONE" \
         "ask_ntp"       "Time source        ${NTP_SERVERS:-none}" \
         "ask_keyboard"  "Keyboard           $KEYMAP" \
-        "ask_role"      "Role               $ROLE" \
+        "install"       "*** INSTALL - $([ "$KEEP_VAR" = yes ] && echo "reinstall" || echo "erase") $TARGET_DISK ***" \
         3>&1 1>&2 2>&3) \
         || return 1
     if [ "$pick" != "install" ]; then
@@ -2852,6 +2898,18 @@ _assert_safe_wipe_target() {
         fi
     fi
 
+    # #995 items 23 + 24 — the picker refuses a multipath path or an md
+    # member, and this function is the documented place where the picker's
+    # checks are re-applied for a preseeded disk. Without it an answer file
+    # naming one installs straight through the refusal, producing exactly
+    # the no-failover install the change calls a trap, with nobody at the
+    # console.
+    if [ -z "$why" ]; then
+        local hazard
+        hazard=$(_disk_hazard "$TARGET_DISK")
+        [ -n "$hazard" ] && why="Target disk $TARGET_DISK is $hazard. Installing to software RAID or to a multipath LUN is not supported yet (#995 Phase 4)."
+    fi
+
     [ -z "$why" ] && { log "Pre-wipe guard OK: $TARGET_DISK ($real)"; return 0; }
 
     log "Pre-wipe guard REFUSED $TARGET_DISK: $why"
@@ -2986,6 +3044,26 @@ do_install() {
     ROOT_A=$(partition_node 4)
     ROOT_B=$(partition_node 5)
     VAR=$(partition_node 6)
+    # #995 item 25 — on the KEEP_VAR path the table is NOT rewritten, so
+    # the positional names above are whatever the disk already has.
+    # _layout_is_reusable gates on the five LABELs and its comment even
+    # promises numbering-independence, so a disk carrying them at other
+    # indices would get `mkfs -L root_a` written over the var the operator
+    # asked to keep. Resolve by label, and refuse if any is missing rather
+    # than falling back to a position that could be anything.
+    if [ "$KEEP_VAR" = "yes" ]; then
+        local _l _dev
+        for _l in ESP:ESP state:STATE root_a:ROOT_A root_b:ROOT_B var:VAR; do
+            _dev=$(blkid -L "${_l%%:*}" 2>/dev/null || true)
+            if [ -z "$_dev" ] || [ ! -b "$_dev" ]; then
+                log "FATAL: reinstall keeping /var, but no partition is labelled '${_l%%:*}'."
+                log "  Refusing rather than guessing a partition number. Nothing has been written."
+                exit 1
+            fi
+            printf -v "${_l##*:}" '%s' "$_dev"
+            log "Reinstall: ${_l##*:} resolved by label to $_dev"
+        done
+    fi
 
     # Disk-size validation lives in ``pick_disk`` now (fires right
     # after the operator picks rather than at the end of the wizard
@@ -3128,12 +3206,21 @@ EOF
         # A five-minute pause with a static bar is indistinguishable from
         # a hang, and it is the point at which an operator power-cycles.
         #
-        # --info=progress2 gives a whole-transfer percentage, and writes
-        # it with \r rather than \n — hence RS. stdout here IS the gauge
-        # stream (the brace group is piped to whiptail --gauge), so the
-        # awk emits the XXX/percent/text/XXX blocks directly and rsync's
-        # own stderr goes to the log. Only emit on a CHANGE, or the gauge
-        # protocol is flooded with thousands of identical blocks.
+        # --info=progress2 gives a whole-transfer percentage, written with
+        # \r rather than \n. Parsed by a BASH read loop, not awk: the
+        # first attempt piped through awk and delivered nothing until
+        # rsync exited — Debian ships mawk, which buffers its input on a
+        # non-newline RS *and* block-buffers its output to a pipe, so all
+        # 41 gauge blocks arrived in one burst at EOF and the bar stayed
+        # frozen at 20% exactly as before. `read -d` has no buffer between
+        # it and the pipe, and printf from the shell is unbuffered.
+        # (`|| [ -n "$_line" ]` so a final record with no trailing \r is
+        # not dropped.)
+        #
+        # stdout here IS the gauge stream — the brace group is piped to
+        # whiptail --gauge — so the blocks go straight out and rsync's own
+        # stderr goes to the log. Only emit on a CHANGE, or the protocol
+        # is flooded with thousands of identical blocks.
         rsync -aAXH --info=progress2 \
             --exclude="/dev/*" \
             --exclude="/proc/*" \
@@ -3151,15 +3238,20 @@ EOF
             --exclude="/etc/ssh/sshd_config.d/00-spatium-live.conf" \
             --exclude="/etc/issue.d/zz-spatium-live.issue" \
             / "$MOUNT/" 2>> "$INSTALL_LOG" \
-            | awk -v RS='\r' -v lo=20 -v hi=60 '
-                match($0, /[0-9]+%/) {
-                    pct = substr($0, RSTART, RLENGTH - 1) + 0
-                    g = int(lo + (hi - lo) * pct / 100)
-                    if (g != last) {
-                        printf "XXX\n%d\nCopying root filesystem... %d%%\nXXX\n", g, pct
-                        last = g
-                    }
-                }'
+            | { _last=-1
+                while IFS= read -r -d $'\r' _line || [ -n "$_line" ]; do
+                    case "$_line" in
+                        *%*) : ;;
+                        *) continue ;;
+                    esac
+                    _pct=${_line#*(} ; _pct=${_line%%\%*} ; _pct=${_pct##* }
+                    case "$_pct" in ''|*[!0-9]*) continue ;; esac
+                    _g=$(( 20 + (60 - 20) * _pct / 100 ))
+                    [ "$_g" = "$_last" ] && continue
+                    _last=$_g
+                    printf 'XXX\n%d\nCopying root filesystem... %d%%\nXXX\n' "$_g" "$_pct"
+                done
+              }
 
         echo "XXX"; echo "60"; echo "Writing boot-critical config to root baseline..."; echo "XXX"
         # IMPORTANT: fstab + /etc/hostname need to land on the
@@ -3267,6 +3359,16 @@ EOF
         for k in "$MOUNT/usr/lib/etc.image/ssh/"ssh_host_*_key \
                  "$MOUNT/usr/lib/etc.image/ssh/"ssh_host_*_key.pub; do
             [ -f "$k" ] || continue
+            # #995 item 25 — never overwrite a key STATE already holds.
+            # STATE is not reformatted on a reinstall, so this loop would
+            # otherwise copy the NEW image's freshly-generated host keys
+            # over the preserved ones and every client that knew this
+            # appliance would get REMOTE HOST IDENTIFICATION HAS CHANGED —
+            # the one thing keeping STATE is for.
+            if [ -e "$STATE_MNT/ssh/$(basename "$k")" ]; then
+                rm -f "$k"
+                continue
+            fi
             cp -a "$k" "$STATE_MNT/ssh/" >> "$INSTALL_LOG" 2>&1
             rm -f "$k"
         done
@@ -3332,6 +3434,10 @@ EOF
 # Exported by spatium-install (issue #995 item 29) — the answers this
 # appliance was installed with, in the #549 answer-file format.
 #
+# Public keys ARE included — they are not secrets, and a clone built
+# without them comes up with password SSH back on and nothing authorised,
+# the inverse of the posture this node was installed with.
+#
 # NOT directly reusable: admin_password (or admin_password_hash) is
 # required, and role: appliance additionally needs pairing_code. Both are
 # omitted on purpose. Add them, then lint with:
@@ -3369,6 +3475,7 @@ $( [ "$ROLE" != "appliance" ] && cat <<K3SEOF
 K3SEOF
 )
 $( [ "$ROLE" = "appliance" ] && printf '  control_plane_url: "%s"\n' "$CONTROL_PLANE_URL" )
+$( [ -n "$SSH_AUTHORIZED_KEYS" ] && { printf '  ssh_authorized_keys:\n'; printf '%s\n' "$SSH_AUTHORIZED_KEYS" | while IFS= read -r _k; do [ -n "$_k" ] && printf '    - "%s"\n' "$_k"; done; printf '  ssh_disable_password: %s\n' "$([ "$SSH_DISABLE_PASSWORD" = yes ] && echo true || echo false)"; } )
 EOF
         chmod 0644 "$STATE_MNT/spatium-preseed.yaml"
         log "Answers exported to /var/lib/spatium-state/spatium-preseed.yaml (no secrets)"
@@ -3378,6 +3485,25 @@ EOF
         # would normally land in /etc instead lands in the upper layer
         # on /var/persist/etc — which persists across slot swaps. The
         # subsequent unmount step has to release this BEFORE /var.
+        # #995 item 25 — on a reinstall the upper layer is the PREVIOUS
+        # install's /etc: its passwd, shadow, group, sshd drop-ins and
+        # whiteouts, copied up when that install ran useradd. Left in
+        # place, `chroot useradd` finds the old account and — fatal since
+        # item 4 — aborts at ~63%, after both slots are already wiped;
+        # and a different username would silently leave the old account,
+        # its hash and its sudo grant live on the "reinstalled" system.
+        #
+        # The OS is being replaced, so its mutable /etc goes with it. What
+        # the operator asked to keep is /var's DATA and STATE's identity,
+        # neither of which lives here.
+        if [ "$KEEP_VAR" = "yes" ] && [ -d "$MOUNT/var/persist/etc" ]; then
+            rm -rf "$MOUNT/var/persist/etc.previous" 2>/dev/null || true
+            mv "$MOUNT/var/persist/etc" "$MOUNT/var/persist/etc.previous" \
+                >> "$INSTALL_LOG" 2>&1 || true
+            rm -rf "$MOUNT/var/persist/etc-work" 2>/dev/null || true
+            mkdir -p "$MOUNT/var/persist/etc" "$MOUNT/var/persist/etc-work"
+            log "Reinstall: previous /etc overlay moved aside to /var/persist/etc.previous"
+        fi
         mount -t overlay overlay \
             -o "lowerdir=$MOUNT/usr/lib/etc.image,upperdir=$MOUNT/var/persist/etc,workdir=$MOUNT/var/persist/etc-work" \
             "$MOUNT/etc" >> "$INSTALL_LOG" 2>&1
@@ -4062,10 +4188,12 @@ EOF
                 log "VERIFY FAILED: $desc"
             fi
         }
+        # shellcheck disable=SC2329  # invoked indirectly, via _verify "$@"
         _grubenv_points_at_slot_a() {
             chroot "$MOUNT" /usr/bin/grub-editenv /boot/efi/grub/grubenv list \
                 | grep -q "saved_entry=slot_a"
         }
+        # shellcheck disable=SC2329  # invoked indirectly, via _verify "$@"
         _slot_b_has() {
             # A glob, so it needs a shell rather than `test`.
             compgen -G "/mnt/spatium-verify-b/boot/$1*" >/dev/null
@@ -4842,16 +4970,6 @@ main() {
         fi
     fi
 
-    # State-machine wizard. Each step is one function that returns:
-    #   0 — operator pressed OK / Yes / made a valid selection
-    #   1 — operator pressed Back (or Cancel/Esc on Welcome, which
-    #       exits the wizard entirely via on_cancel).
-    # Cancel on Welcome is the only exit-installer path; every other
-    # screen's Cancel button is renamed "Back" and walks the wizard
-    # back one step. ask_application_config is conditional on
-    # ROLE=appliance — it returns 0 immediately for the control-plane
-    # role so Back from confirm walks through it transparently to
-    # ask_timezone.
     # Linear step table + a three-way return, replacing the hand-written
     # per-step case that routed Back by name.
     #
@@ -4877,7 +4995,13 @@ main() {
         ask_ssh_keys ask_network ask_timezone ask_ntp ask_k3s_cidrs
         ask_application_config confirm do_install
     )
-    local i=0 dir="fwd" rc step
+    # The index of `confirm`, so a field edit can come back to it.
+    local confirm_index=0 j2=0
+    while [ "$j2" -lt "${#STEPS[@]}" ]; do
+        [ "${STEPS[$j2]}" = "confirm" ] && confirm_index="$j2"
+        j2=$((j2 + 1))
+    done
+    local i=0 dir="fwd" rc step RETURN_TO_CONFIRM=""
     while [ "$i" -lt "${#STEPS[@]}" ]; do
         step="${STEPS[$i]}"
         log "Wizard state: $step (dir=$dir)"
@@ -4911,6 +5035,14 @@ main() {
                 rc=$?
                 ;;
         esac
+        # A field edited from the Confirm menu returns there rather than
+        # continuing the forward walk.
+        if [ -n "$RETURN_TO_CONFIRM" ] && [ "$rc" != "2" ] && [ "$step" != "confirm" ]; then
+            i="$RETURN_TO_CONFIRM"
+            RETURN_TO_CONFIRM=""
+            dir="fwd"
+            continue
+        fi
         case "$rc" in
             0) dir="fwd"; i=$((i + 1)) ;;
             2) if [ "$dir" = "back" ]; then i=$((i - 1)); else i=$((i + 1)); fi ;;
@@ -4921,16 +5053,35 @@ main() {
                 # preseeded one passing through toward confirm again is
                 # the right behaviour rather than reversing past it.
                 if [ -n "$CONFIRM_JUMP" ]; then
-                    local j=0
-                    while [ "$j" -lt "${#STEPS[@]}" ]; do
-                        if [ "${STEPS[$j]}" = "$CONFIRM_JUMP" ]; then
-                            i="$j"
+                    local jump_idx=0 jump_found=0
+                    while [ "$jump_idx" -lt "${#STEPS[@]}" ]; do
+                        if [ "${STEPS[$jump_idx]}" = "$CONFIRM_JUMP" ]; then
+                            i="$jump_idx"
+                            jump_found=1
                             break
                         fi
-                        j=$((j + 1))
+                        jump_idx=$((jump_idx + 1))
                     done
                     CONFIRM_JUMP=""
-                    dir="fwd"
+                    if [ "$jump_found" = 1 ]; then
+                        # Come straight back here once the field is
+                        # answered. Without this the walk continued
+                        # forward through every remaining screen — so
+                        # changing the hostname still meant OK-ing through
+                        # the password (typed twice, a passwordbox cannot
+                        # be pre-filled), the keys, the network and the
+                        # rest. That is the half of the cost item 28 said
+                        # it removed and did not.
+                        RETURN_TO_CONFIRM="$confirm_index"
+                        dir="fwd"
+                    else
+                        # A renamed step, or a typo in a menu tag. Falling
+                        # through with `i` unassigned redrew Confirm with
+                        # the selection silently discarded — nine rows
+                        # that quietly do nothing.
+                        log "BUG: confirm menu named an unknown step '$CONFIRM_JUMP'"
+                        dir="back"; i=$((i - 1))
+                    fi
                 else
                     dir="back"; i=$((i - 1))
                 fi

@@ -190,9 +190,12 @@ def test_both_operator_data_screens_are_sized_to_their_content():
     longest line on each of these screens is operator-supplied — a
     control-plane URL, a /dev/disk/by-id target path. A hardcoded height
     is wrong exactly when the content is unusual."""
-    for screen in ('--msgbox "$done_body"', '--menu "$s"'):
+    # Confirm's review is a --yesno again since the menu split (#995
+    # item 28's fix): the summary needs the full height, and the field
+    # picker is a separate short screen that needs almost none.
+    for screen in ('--msgbox "$done_body"', '--yesno "$s"'):
         i = SRC.index(screen)
-        assert "_whiptail_height" in SRC[i:i + 260], screen
+        assert "_whiptail_height" in SRC[i:i + 120], screen
 
 
 def test_the_height_helper_counts_wrapped_rows_and_clamps():

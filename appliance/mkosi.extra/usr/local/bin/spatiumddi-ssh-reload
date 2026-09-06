@@ -68,10 +68,12 @@ LOG="$LOG_DIR/ssh-reload.log"
 # without this the whole plane errors out with "invalid user" on any
 # appliance installed with a different one, so the control plane's key
 # list is never applied and the UI shows managed keys that exist nowhere.
-ADMIN_USER="$(sed -n 's/^admin_user:[[:space:]]*"\{0,1\}\([^"]*\)"\{0,1\}[[:space:]]*$/\1/p' \
-    /var/lib/spatium-state/spatium-config.yaml 2>/dev/null | head -1)"
+ADMIN_USER="$(sed -n "s/^admin_user:[[:space:]]*[\"']\{0,1\}\([^\"']*\)[\"']\{0,1\}[[:space:]]*\$/\\1/p" \
+    /var/lib/spatium-state/spatium-config.yaml 2>/dev/null | head -1 || true)"
 [ -n "$ADMIN_USER" ] || ADMIN_USER="admin"
-ADMIN_HOME=$(getent passwd "$ADMIN_USER" | cut -d: -f6)
+# getent exits 2 for an unknown user, which under `set -e` would kill the
+# runner here and make the ${...:-} default below unreachable too.
+ADMIN_HOME=$(getent passwd "$ADMIN_USER" 2>/dev/null | cut -d: -f6 || true)
 ADMIN_HOME=${ADMIN_HOME:-/var/home/admin}
 AK_FILE="$ADMIN_HOME/.ssh/authorized_keys"
 SSHD_DROPIN=/etc/ssh/sshd_config.d/spatiumddi.conf

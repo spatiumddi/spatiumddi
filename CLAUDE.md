@@ -1803,8 +1803,8 @@ suggestion, free-space treemap.
 
 - 🟡 [**Installer wizard review — 30 fixes in five phases**](https://github.com/spatiumddi/spatiumddi/issues/995)
   — umbrella over `spatium-install` (2,723 lines, 19 screens), from a review
-  prompted by a fresh install of the #988 ISO. **All five phases
-  landed**, except the one thing that cannot ship without image work: a
+  prompted by a fresh install of the #988 ISO. **Phases 1–5 landed.**
+  **Still open:** the one thing that cannot ship without image work — a
   RAID1 or multipath *install* (Phase 4's headline) needs `mdadm` /
   `multipath-tools` / initramfs changes `mkosi.conf` does not carry, so
   what shipped is the **refusal** — which is the half that mattered,
@@ -1967,7 +1967,8 @@ suggestion, free-space treemap.
   the inactive slot — reported as a warning rather than an abort, because
   the install is complete and the point is that the operator learns
   before the reboot rather than after it.
-  **78 new appliance tests**, and the ones that matter most execute rather than
+  **~180 new appliance tests** (the suite went 276 → 460), and the ones that
+  matter most execute rather than
   grep: the device-mapper closure runs against stubbed `lsblk`/`dmsetup` with a
   second disk present as the negative control, because the failure mode of
   getting it wrong is destroying someone else's data and a structural

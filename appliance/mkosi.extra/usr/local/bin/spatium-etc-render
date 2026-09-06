@@ -190,11 +190,12 @@ EOF
         # NM refuses keyfiles that aren't mode 600.
         chmod 0600 "$NM_KEYFILE"
         # Drop the pinned-DHCP twin. The dhcp branch is symmetric about
-        # this and the static one was not — and the dhcp keyfile carries
-        # autoconnect-priority=100 while the static one is at NM's default
-        # 0, so a leftover would OUTRANK the profile just written: the box
-        # would come up on a lease while every config file and every log
-        # line said static.
+        # this and the static one was not. Both keyfiles now carry
+        # autoconnect-priority=100, so a leftover does not strictly
+        # outrank the profile just written — NetworkManager breaks the tie
+        # by connection timestamp, which is worse than losing: it is
+        # non-deterministic. Two autoconnect profiles on one interface is
+        # a race either way.
         if [ -f "$NM_DHCP_KEYFILE" ]; then
             rm -f "$NM_DHCP_KEYFILE"
             echo "  removed the stale pinned-DHCP keyfile"

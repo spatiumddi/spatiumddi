@@ -920,6 +920,15 @@ if net is not None:
 
 # ── k3s pod + service CIDRs (mirrors _validate_k3s_cidrs) ─────────────
 k3s = ps.get("k3s")
+if role == "appliance":
+    # #995 item 14 — an Additional node pins no CIDRs, so there is nothing
+    # to answer and the marker is the truth. Set OUTSIDE the "a k3s block
+    # was supplied" branch: the first cut only set it when the operator
+    # wrote a block that then got discarded, so an appliance answer file
+    # that simply omits k3s — which is exactly what item 29's exporter
+    # writes for this role — could never be fully unattended, and the
+    # headless install it produced stopped at the welcome screen.
+    env["PRESEED_HAS_K3S"] = "1"
 if k3s is not None and role == "appliance":
     # #995 item 14 — an Additional node must not pin CIDRs: k3s compares
     # cluster-cidr / service-cidr / cluster-dns against the datastore when
@@ -937,13 +946,6 @@ if k3s is not None and role == "appliance":
         "and pinning different ones here would make that promotion fail"
     )
     k3s = None
-    # ...but the marker still has to be set, or FULLY_UNATTENDED becomes
-    # structurally unreachable for this role: compute_unattended requires
-    # PRESEED_HAS_K3S for every role, and with k3s dropped there is no key
-    # left that can produce it. Every headless Additional-node install
-    # would fall back to interactive at the very first screen. The node
-    # genuinely has no CIDRs to answer for, so "answered" is the truth.
-    env["PRESEED_HAS_K3S"] = "1"
 if k3s is not None:
     if not isinstance(k3s, dict):
         fail("k3s must be a mapping (pod_cidr / service_cidr)")

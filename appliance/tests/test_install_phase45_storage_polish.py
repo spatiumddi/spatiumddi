@@ -127,11 +127,18 @@ def test_confirm_says_reinstall_when_var_is_kept():
 def test_rsync_feeds_the_gauge():
     assert "--info=progress2" in CODE
     i = CODE.index("--info=progress2")
-    blk = CODE[i:i + 1200]
-    # \r, not \n: --info=progress2 rewrites one line.
-    assert "RS='\\r'" in blk
+    blk = CODE[i:i + 1400]
+    # A bash read loop, NOT awk. Debian ships mawk, which buffers its
+    # input on a non-newline RS and block-buffers its output to a pipe —
+    # measured, every gauge block arrived in one burst at rsync's EOF and
+    # the bar stayed frozen at 20%, which is the symptom item 27 exists
+    # to remove.
+    assert "awk" not in blk, "mawk buffers this into uselessness"
+    assert "read -r -d $'\\r'" in blk
+    # \r, not \n: --info=progress2 rewrites one line...
+    assert '|| [ -n "$_line" ]' in blk, "...so a final unterminated record is not dropped"
     # Only on a change, or the gauge protocol is flooded.
-    assert "if (g != last)" in blk
+    assert '[ "$_g" = "$_last" ] && continue' in blk
 
 
 # ── Item 28 — Confirm is a menu ───────────────────────────────────────
@@ -152,8 +159,12 @@ def test_a_jump_goes_forward_from_the_chosen_screen():
     """Executable coverage lives in test_install_phase3_screens.py; this
     pins that the loop honours the variable at all."""
     assert "CONFIRM_JUMP" in extract_fn("confirm")
-    assert 'if [ -n "$CONFIRM_JUMP" ]; then' in CODE
-    assert 'dir="fwd"' in CODE
+    blk = CODE[CODE.index('if [ -n "$CONFIRM_JUMP" ]; then'):]
+    blk = blk[:blk.index("esac")]
+    # An unknown step must fail visibly, not leave `i` unassigned and
+    # redraw confirm with the selection silently discarded.
+    assert 'log "BUG: confirm menu named an unknown step' in blk
+    assert "RETURN_TO_CONFIRM" in blk
 
 
 # ── Item 29 — export the answers ──────────────────────────────────────
@@ -189,12 +200,15 @@ def test_the_export_does_not_emit_v6_keys_the_parser_refuses():
 
 
 def test_the_install_is_verified_before_it_is_called_done():
-    i = CODE.index("        _verify() {")
-    fn = CODE[i:i + 700]
-    assert "verify_fail" in fn
+    # Scoped to the verify block. Against whole-file CODE four of these
+    # six tokens occur elsewhere, so deleting the checks they stand for
+    # left this test green — coverage that was fictional for two thirds
+    # of item 30.
+    blk = CODE[CODE.index("        _verify() {"):CODE.index("Saving installer logs to the target")]
+    assert "verify_fail" in blk
     for check in ("BOOTX64.EFI", "grub.cfg", "grub-script-check",
                   "saved_entry=slot_a", "spatium-config.yaml", "root_B"):
-        assert check in CODE, check
+        assert check in blk, check
 
 
 def test_verification_failures_survive_the_gauge_subshell():

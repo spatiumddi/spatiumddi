@@ -502,5 +502,54 @@ def test_the_confirm_menu_jumps_straight_to_the_field():
     )
     after = visited[visited.index("confirm") + 1:]
     assert after[0] == "ask_hostname", visited
-    # ...and then forward again from there, not backward.
-    assert after[1] == "ask_user_password", visited
+    # ...and straight BACK to confirm, not onward through the rest of the
+    # wizard. Continuing forward was half the cost item 28 said it
+    # removed: changing the hostname still meant OK-ing through the
+    # password (typed twice — a passwordbox cannot be pre-filled), the
+    # keys, the network and everything after.
+    assert after[1] == "confirm", visited
+
+
+def test_every_inert_path_in_the_real_screens_returns_2():
+    """The guard the stubbed loop tests could not be.
+
+    `_drive` stubs each screen with a return code the TEST chooses, so it
+    pins the dispatcher and says nothing about the 13 hand-written return
+    values it depends on. That is exactly how `pick_disk` and
+    `confirm_partition_layout` shipped still returning 0 from their
+    preseed short-circuit — reintroducing the #554 Back-bounce the whole
+    three-way contract exists to kill, for any answer file that pins
+    target_disk.
+
+    So: read the real functions, find every early return that fires
+    without drawing (a preseed short-circuit, an unattended skip, a
+    role-inert screen), and require it to be `return 2`.
+    """
+    offenders = []
+    for name in _ALL:
+        if name in ("welcome", "do_install", "confirm"):
+            continue  # driven by main() itself, not by a self-guard
+        fn = extract_fn(name)
+        lines = fn.splitlines()
+        for n, line in enumerate(lines):
+            code = line.split("#", 1)[0]
+            if not re.search(
+                r'\[ -n "\$\{PRESEED_HAS_\w+:-\}" \]|"\$FULLY_UNATTENDED" = "1"'
+                r'|\[ "\$ROLE" = "appliance" \]|\[ "\$ROLE" != "appliance" \]',
+                code,
+            ):
+                continue
+            # The return that belongs to this guard: the next bare return
+            # before the block closes.
+            for follow in lines[n + 1:n + 8]:
+                f = follow.strip().split("#", 1)[0].strip()
+                if f.startswith("return "):
+                    if f not in ("return 2",):
+                        offenders.append(f"{name}: {line.strip()} -> {f}")
+                    break
+                if f in ("fi", "}"):
+                    break
+    assert not offenders, (
+        "an inert screen returning 0 means 'the operator went forward', so "
+        "a Back walk is bounced straight back:\n  " + "\n  ".join(offenders)
+    )

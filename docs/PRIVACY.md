@@ -227,9 +227,13 @@ fetch. Two guards keep this one honest:
   here; anything default-on needs an issue and a decision, not a PR.
 
 The guard covers Python source under `backend/app`. Two things it
-cannot see, and which therefore need a human: hosts assembled at
+cannot see, and which therefore need a human: hostname literals in the
+appliance's **shell** scripts under
+`appliance/mkosi.extra/usr/local/bin/` — the guard reads Python only, so
+§3.4.1's rows were written by hand and the next `curl` added to the
+installer will pass CI with nothing to catch it; hosts assembled at
 runtime from operator input (which is the point — those are *your*
-endpoints), and the feed catalogues in `backend/app/data/`, whose
+endpoints); and the feed catalogues in `backend/app/data/`, whose
 entries are all opt-in downloads covered by the blocklist row above.
 
 If you find a connection this page does not describe, that is a bug —
