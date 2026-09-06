@@ -5322,6 +5322,40 @@ export interface DNSView {
   modified_at: string;
 }
 
+/**
+ * TLD scope of a zone name (#986). Derived server-side at serialisation
+ * from the IANA root-zone list — never stored, so it can change under a
+ * zone when the operator refreshes the TLD registry.
+ */
+export type ZoneNameScope = "public" | "reserved" | "undelegated" | "reverse";
+
+export interface ZoneNameScopeDetail {
+  scope: ZoneNameScope;
+  /** One line explaining the classification, shown as the pill tooltip. */
+  reason: string;
+  /** The special-use entry or TLD the decision rests on. */
+  matched_suffix: string | null;
+  /** RFC or ICANN action that reserved the suffix, when there is one. */
+  rfc: string | null;
+  /** `.local` only — an authoritative zone here collides with mDNS. */
+  mdns_conflict: boolean;
+}
+
+export interface TldRegistryInfo {
+  origin: "bundled" | "snapshot";
+  version: string;
+  fetched_at: string | null;
+  source: string;
+  count: number;
+  age_days: number | null;
+  stale: boolean;
+  bundled_version: string;
+  bundled_count: number;
+  snapshot_version: string | null;
+  snapshot_fetched_at: string | null;
+  snapshot_count: number | null;
+}
+
 export interface DNSZone {
   id: string;
   group_id: string;
@@ -5367,6 +5401,11 @@ export interface DNSZone {
   tailscale_tenant_id: string | null;
   // Logical ownership (issue #91). NULL = unassigned.
   customer_id: string | null;
+  // #986 — TLD scope of the zone name. Optional in the type because the
+  // importer preview and a few older cached payloads carry the bare zone
+  // shape; every live read from /dns/groups/{id}/zones sets both.
+  name_scope?: ZoneNameScope;
+  name_scope_detail?: ZoneNameScopeDetail | null;
   created_at: string;
   modified_at: string;
 }
@@ -5967,6 +6006,25 @@ export const dnsApi = {
   deleteView: (groupId: string, viewId: string) =>
     api.delete(`/dns/groups/${groupId}/views/${viewId}`),
 
+  // TLD registry (#986) — the IANA root-zone list behind zone name_scope.
+  // Read by anyone who can read DNS; refresh is superadmin-only and is the
+  // only outbound call in this router (see docs/PRIVACY.md §3.2).
+  getTldRegistry: () =>
+    api.get<TldRegistryInfo>("/dns/tld-registry").then((r) => r.data),
+  refreshTldRegistry: () =>
+    api.post<TldRegistryInfo>("/dns/tld-registry/refresh").then((r) => r.data),
+  /**
+   * Classify a candidate zone name (live hint in the create / edit modal).
+   * Server-side on purpose — a TypeScript copy of the rules would drift
+   * from the one that decides the pill in the table.
+   */
+  classifyZoneName: (name: string) =>
+    api
+      .get<ZoneNameScopeDetail>("/dns/tld-registry/classify", {
+        params: { name },
+      })
+      .then((r) => r.data),
+
   // Zones
   listZones: (groupId: string, params?: { tag?: string[] }) =>
     api
@@ -6468,6 +6526,11 @@ export interface DNSImportedZone {
   forwarders: string[];
   skipped_record_types: Record<string, number>;
   parse_warnings: string[];
+  /**
+   * #986 — TLD scope of the incoming name. Optional because this same
+   * shape is posted back on commit, where it is ignored server-side.
+   */
+  name_scope?: ZoneNameScope;
 }
 
 export interface DNSImportZoneConflict {
@@ -10315,12 +10378,10 @@ export const reportsApi = {
 // ── Domain registration (RDAP / WHOIS tracking) ─────────────────────────────
 
 export type DomainWhoisState =
-  | "ok"
-  | "drift"
-  | "expiring"
-  | "expired"
-  | "unreachable"
-  | "unknown";
+  // "n/a" (#986) — the name is not under a delegated TLD, so there is no
+  // registry to query and the refresh skips it rather than reporting the
+  // registry as unreachable.
+  "n/a" | "ok" | "drift" | "expiring" | "expired" | "unreachable" | "unknown";
 
 export interface Domain {
   id: string;
@@ -10342,6 +10403,8 @@ export interface Domain {
   custom_fields: Record<string, unknown>;
   customer_id: string | null;
   registrar_provider_id: string | null;
+  /** #986 — TLD scope of the name; non-public means RDAP is skipped. */
+  name_scope?: ZoneNameScope;
   created_at: string;
   modified_at: string;
 }

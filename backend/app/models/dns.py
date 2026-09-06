@@ -1490,3 +1490,43 @@ class DNSKey(UUIDPrimaryKeyMixin, Base):
     )
 
     zone: Mapped["DNSZone"] = relationship("DNSZone")
+
+
+class TLDRegistrySnapshot(TimestampMixin, Base):
+    """Operator-refreshed copy of IANA's root-zone TLD list (#986).
+
+    Singleton — always exactly one row with ``id=1``, the ``PlatformSettings``
+    shape. There is nothing to keep a history of: the list is a full
+    replacement each time, and the *bundled* copy in
+    ``app/data/iana_tlds.json`` is the fallback, so a bad refresh is
+    recovered by refreshing again rather than by rolling back.
+
+    In Postgres rather than on disk deliberately: a node-local file does not
+    propagate across a multi-node control plane, so one node would classify
+    ``.foo`` as public while its neighbour called it undelegated. Same
+    reasoning as the #886 branding logo.
+
+    Only ``tlds`` is overridable this way. The special-use table
+    (``.local``, ``example.com``, ``.internal``, …) stays bundled: it
+    changes by RFC and by ICANN action, and none of that appears in IANA's
+    root-zone download.
+    """
+
+    __tablename__ = "tld_registry_snapshot"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+
+    # Where it came from, and IANA's own "# Version YYYYMMDDNN" header. The
+    # version is what decides whether this row supersedes the bundled list.
+    source: Mapped[str] = mapped_column(String(500), nullable=False, default="")
+    version: Mapped[str] = mapped_column(String(32), nullable=False, default="")
+    # When the payload was downloaded (not when the row was written — a
+    # re-refresh that returns an identical payload still moves this).
+    fetched_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    # Lowercased TLD labels. Guarded on write: a payload with fewer than
+    # 1,000 entries or missing a sentinel TLD is rejected with a 502 and
+    # never lands here, because storing a truncated download would relabel
+    # every public zone in the estate as "undelegated" in one action.
+    tlds: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)

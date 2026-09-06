@@ -30,6 +30,12 @@ agent/supervisor/spatium_supervisor/
 # that its output still goes through app.openapi()'s wrapper.
 scripts/export_openapi.py
 
+# test_zone_name_scope.py (#986) loads the release-prep TLD regenerator and
+# pins that it uses the PRODUCT's payload guard rather than a second copy —
+# so a PR that gives the script its own parser has to run the test that says
+# it must not. The script is also the only writer of the bundled TLD list.
+scripts/refresh_iana_tlds.py
+
 # test_outbound_hosts_documented.py (#976) asserts every hostname literal in
 # backend/app is documented in the privacy statement. docs/ is denied
 # wholesale, so without this carve-out a PR that quietly deletes a row from

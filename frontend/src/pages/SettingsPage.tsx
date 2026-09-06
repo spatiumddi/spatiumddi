@@ -22,6 +22,7 @@ import { Modal } from "@/components/ui/modal";
 import { Toggle } from "@/components/ui/toggle";
 import { AuditForwardTargets } from "@/components/AuditForwardTargets";
 import { InfluxDBTargets } from "@/components/InfluxDBTargets";
+import { TldRegistrySection } from "@/components/TldRegistrySection";
 import { AgentBootstrapKeysSection } from "@/components/AgentBootstrapKeysSection";
 import { BrandLogo } from "@/components/BrandLogo";
 import { usePublicSettings } from "@/hooks/usePublicSettings";
@@ -89,6 +90,7 @@ type SectionId =
   | "dns-auto-sync"
   | "reverse-dns"
   | "dns-pull-from-server"
+  | "dns-tld-registry"
   | "dhcp"
   | "dhcp-lease-sync"
   | "audit-forward"
@@ -180,6 +182,10 @@ const SECTION_FIELDS: Record<SectionId, (keyof PlatformSettings)[]> = {
     "dns_pull_from_server_enabled",
     "dns_pull_from_server_interval_minutes",
   ],
+  // Managed through the dedicated TldRegistrySection component — the list
+  // is its own singleton row with its own refresh endpoint, not a
+  // PlatformSettings column, so the singleton Save button owns nothing here.
+  "dns-tld-registry": [],
   dhcp: [
     "dhcp_default_dns_servers",
     "dhcp_default_domain_name",
@@ -944,6 +950,30 @@ const SECTIONS: SectionDef[] = [
       "additive",
       "bidirectional",
       "auto",
+    ],
+  },
+
+  {
+    id: "dns-tld-registry",
+    title: "TLD Registry",
+    group: "DNS",
+    description:
+      "IANA's root-zone list, which decides whether a zone name reads as Public, Private, Undelegated or Reverse. A copy ships with every release; refresh on demand to pick up TLDs delegated since. No scheduled fetch.",
+    keywords: [
+      "tld",
+      "iana",
+      "root",
+      "zone",
+      "scope",
+      "public",
+      "reserved",
+      "undelegated",
+      "internal",
+      "local",
+      "lan",
+      "name",
+      "registry",
+      "refresh",
     ],
   },
 
@@ -1889,6 +1919,10 @@ export function SettingsPage() {
 
             {activeId === "audit-forward" && (
               <AuditForwardTargets isSuperadmin={!!isSuperadmin} />
+            )}
+
+            {activeId === "dns-tld-registry" && (
+              <TldRegistrySection isSuperadmin={!!isSuperadmin} />
             )}
 
             {activeId === "influxdb-export" && (

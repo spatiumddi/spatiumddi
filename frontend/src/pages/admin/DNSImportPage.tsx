@@ -33,6 +33,7 @@ import {
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { HeaderButton } from "@/components/ui/header-button";
+import { ZoneScopePill } from "@/components/ZoneScopePill";
 
 // Tab metadata. Every source is live; ``available: false`` remains the
 // hook for rendering a not-yet-shipped source (so the operator sees the
@@ -1852,6 +1853,7 @@ function PreviewPanel({
             <thead className="bg-muted/30 text-[11px] uppercase tracking-wider text-muted-foreground">
               <tr>
                 <th className="px-3 py-2 text-left">Zone</th>
+                <th className="px-3 py-2 text-left">Scope</th>
                 <th className="px-3 py-2 text-left">Type</th>
                 <th className="px-3 py-2 text-left">Kind</th>
                 <th className="px-3 py-2 text-right">Records</th>
@@ -1881,6 +1883,12 @@ function PreviewPanel({
                           view <span className="font-mono">{z.view_name}</span>
                         </div>
                       )}
+                    </td>
+                    <td className="px-3 py-2 align-top">
+                      {/* #986 — a bulk import is where an estate full of
+                          .lan zones first becomes visible, and it is the
+                          last point before they are committed. */}
+                      <ZoneScopePill scope={z.name_scope} />
                     </td>
                     <td className="px-3 py-2 align-top text-xs">
                       {z.zone_type}

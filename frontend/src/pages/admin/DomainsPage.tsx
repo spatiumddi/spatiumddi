@@ -13,6 +13,7 @@ import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
 import { TagFilterChips } from "@/components/TagFilterChips";
 import { CustomerPicker, ProviderPicker } from "@/components/ownership/pickers";
+import { ZoneScopePill } from "@/components/ZoneScopePill";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -95,6 +96,9 @@ function StateBadge({ state }: { state: DomainWhoisState }) {
     unreachable:
       "bg-zinc-200 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300",
     unknown: "bg-zinc-200 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300",
+    // #986 — the name is not under a delegated TLD, so RDAP is skipped
+    // rather than attempted and reported as an outage.
+    "n/a": "bg-zinc-200 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300",
   };
   return (
     <span
@@ -451,6 +455,7 @@ export function DomainsPage() {
             <option value="expiring">expiring</option>
             <option value="expired">expired</option>
             <option value="unreachable">unreachable</option>
+            <option value="n/a">n/a (no registry)</option>
             <option value="unknown">unknown</option>
           </select>
           <span className="ml-auto text-xs text-muted-foreground">
@@ -622,6 +627,9 @@ function DomainRow({
         >
           {domain.name}
         </Link>
+        {/* #986 — a domain under a non-public TLD can never have RDAP
+            data, which is why its state sits at "n/a". */}
+        <ZoneScopePill scope={domain.name_scope} className="ml-2" />
       </td>
       <td className="px-3 py-2 text-muted-foreground">
         {domain.registrar ?? "—"}

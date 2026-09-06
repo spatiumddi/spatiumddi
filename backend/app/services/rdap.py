@@ -119,6 +119,42 @@ async def _get_bootstrap() -> dict[str, str]:
         return new_map
 
 
+async def rdap_service_state(name: str) -> str:
+    """Is there an RDAP registry for this name's TLD? (#986)
+
+    Returns one of:
+
+    ``available``
+        IANA's bootstrap registry names an RDAP server for the TLD.
+    ``absent``
+        The bootstrap loaded and does **not** name one — a name under a
+        TLD nobody has delegated. There is nothing to query, ever.
+    ``unknown``
+        The bootstrap could not be loaded at all. Deliberately distinct
+        from ``absent``: an IANA outage must not be read as "no registry
+        exists", which would silently mark **every** domain in the estate
+        as having no registry in one tick.
+
+    This is the authoritative answer to "can this name have RDAP data",
+    and it is authoritative precisely because it comes from the **live**
+    bootstrap rather than from the release-bundled TLD list. Gating the
+    refresh on the bundled list would permanently freeze a domain on a
+    TLD delegated after that list was cut, and the operator's only
+    recovery would be a Settings → DNS → TLD Registry refresh that
+    nothing on the Domains page mentions.
+
+    Consulting the bootstrap sends nothing about the name: it is a cached
+    GET of one static public file that a real lookup fetches anyway.
+    """
+    tld = _domain_to_tld(name)
+    if tld is None:
+        return "absent"
+    bootstrap = await _get_bootstrap()
+    if not bootstrap:
+        return "unknown"
+    return "available" if tld in bootstrap else "absent"
+
+
 def _domain_to_tld(name: str) -> str | None:
     """Extract the public-facing TLD label from a domain. ``foo.bar.com``
     → ``com``. Multi-label TLDs like ``co.uk`` aren't matched directly —
@@ -498,6 +534,7 @@ def compute_nameserver_drift(
 __all__ = [
     "lookup_domain",
     "derive_whois_state",
+    "rdap_service_state",
     "normalise_nameservers",
     "compute_nameserver_drift",
     "_TOTAL_TIMEOUT_SECONDS",

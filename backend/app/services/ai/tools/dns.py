@@ -30,6 +30,10 @@ from app.models.dns import (
 )
 from app.services.ai.operations_writes import SetZoneUpdateAclArgs
 from app.services.ai.tools.base import register_tool
+from app.services.dns.name_scope import classify_zone_name
+from app.services.dns.tld_registry import effective_registry
+
+_ZONE_NAME_SCOPES = frozenset({"public", "reserved", "undelegated", "reverse"})
 
 
 class ListZonesArgs(BaseModel):
@@ -42,7 +46,44 @@ class ListZonesArgs(BaseModel):
         default=None,
         description="Substring match on the zone name (FQDN).",
     )
+    name_scope: str | None = Field(
+        default=None,
+        description=(
+            "Filter by TLD scope of the zone name: 'public' (a delegated "
+            "IANA TLD), 'reserved' (a special-use namespace such as .local "
+            "or .internal), 'undelegated' (a TLD nobody has delegated, e.g. "
+            ".lan), or 'reverse' (in-addr.arpa / ip6.arpa)."
+        ),
+    )
     limit: int = Field(default=100, ge=1, le=500)
+
+    @field_validator("name_scope")
+    @classmethod
+    def _v_name_scope(cls, v: str | None) -> str | None:
+        """Reject an unknown scope rather than quietly matching nothing.
+
+        A silent empty list here would read to the copilot — and to the
+        operator reading its answer — as "there are no such zones", which
+        is a confident wrong answer to a question that was never asked.
+        """
+        if v is None:
+            return None
+        norm = v.strip().lower()
+        if not norm:
+            return None
+        if norm not in _ZONE_NAME_SCOPES:
+            raise ValueError(f"name_scope must be one of {sorted(_ZONE_NAME_SCOPES)}")
+        return norm
+
+
+# Ceiling on the pre-filter scan when ``name_scope`` is set. The scope is
+# derived from the name at read time rather than stored, so it cannot be a
+# WHERE clause — the rows have to be classified in Python and the SQL LIMIT
+# applied afterwards, or a "show me the undelegated zones" question would
+# only ever search the alphabetically-first ``limit`` zones and confidently
+# answer "none". This caps the cost of that scan; the tool says so in its
+# reply when it bites, rather than silently under-reporting.
+_ZONE_SCOPE_SCAN_CAP = 20_000
 
 
 @register_tool(
@@ -50,7 +91,9 @@ class ListZonesArgs(BaseModel):
     description=(
         "List DNS zones (authoritative / secondary / stub / forward). "
         "Each summary includes name, type, kind (forward / reverse), "
-        "TTL, server group, and view binding."
+        "TTL, server group, view binding, and name_scope — whether the "
+        "zone name sits on a delegated public TLD, a reserved special-use "
+        "namespace, an undelegated TLD, or is a reverse zone."
     ),
     args_model=ListZonesArgs,
     category="dns",
@@ -64,20 +107,44 @@ async def list_dns_zones(db: AsyncSession, user: User, args: ListZonesArgs) -> l
     if args.search:
         like = f"%{args.search.lower()}%"
         stmt = stmt.where(func.lower(DNSZone.name).like(like))
-    stmt = stmt.order_by(DNSZone.name.asc()).limit(args.limit)
-    rows = (await db.execute(stmt)).scalars().all()
-    return [
-        {
-            "id": str(z.id),
-            "name": z.name,
-            "zone_type": z.zone_type,
-            "kind": z.kind,
-            "group_id": str(z.group_id),
-            "view_id": str(z.view_id) if z.view_id else None,
-            "ttl": z.ttl,
-        }
-        for z in rows
-    ]
+    stmt = stmt.order_by(DNSZone.name.asc())
+
+    wanted = args.name_scope  # already normalised + validated
+    stmt = stmt.limit(_ZONE_SCOPE_SCAN_CAP if wanted else args.limit)
+    rows = list((await db.execute(stmt)).scalars().all())
+
+    tlds = (await effective_registry(db)).tlds
+    out: list[dict[str, Any]] = []
+    for z in rows:
+        scope = classify_zone_name(z.name, tlds=tlds)
+        if wanted and scope.scope != wanted:
+            continue
+        out.append(
+            {
+                "id": str(z.id),
+                "name": z.name,
+                "zone_type": z.zone_type,
+                "kind": z.kind,
+                "group_id": str(z.group_id),
+                "view_id": str(z.view_id) if z.view_id else None,
+                "ttl": z.ttl,
+                "name_scope": scope.scope,
+                "name_scope_reason": scope.reason,
+            }
+        )
+        if len(out) >= args.limit:
+            break
+    if wanted and len(rows) >= _ZONE_SCOPE_SCAN_CAP and len(out) < args.limit:
+        out.append(
+            {
+                "note": (
+                    f"scanned the first {_ZONE_SCOPE_SCAN_CAP} zones by name; "
+                    "there may be further matches beyond that. Narrow with "
+                    "group_id or search."
+                )
+            }
+        )
+    return out
 
 
 class QueryRecordsArgs(BaseModel):

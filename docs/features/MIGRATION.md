@@ -62,6 +62,14 @@ a **"didn't import"** panel (`unsupported`) for whole subsystems we
 deliberately don't translate (DNSSEC keys, Kea hook libraries, ISC
 failover / TSIG keys, classifier DSL).
 
+The DNS preview also carries a **Scope** column per zone
+(`ImportedZoneOut.name_scope`, #986) — *Public* / *Private* /
+*Undelegated* / *Reverse*, classified against IANA's root-zone list. A
+bulk import is where an estate full of `.lan` zones first becomes
+visible, and the preview is the last point before they are committed.
+It is advisory: nothing about the scope blocks an import. See
+[`DNS.md` §22](DNS.md).
+
 ---
 
 ## DNS importer (#128)
