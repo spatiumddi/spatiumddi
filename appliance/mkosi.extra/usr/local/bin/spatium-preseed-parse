@@ -42,6 +42,138 @@ import shlex
 import stat
 import sys
 
+# ── Shared field validators (issue #995 items 3 + 4) ──────────────────
+#
+# Defined ABOVE the YAML import and the straight-line parse below,
+# because ``--check-field`` is answered before either runs. The
+# interactive wizard calls this script purely as a validator, and a
+# username or timezone prompt has no business failing because
+# python3-yaml is missing from the image.
+#
+# Both rules already existed here for the preseed path and the
+# INTERACTIVE path had neither: ``admin_user`` was defaulted-if-empty and
+# handed straight to ``useradd`` (a name with a space, or ``root``, left
+# the box with no sudo account while PermitRootLogin=no locked root out
+# of SSH), and ``timezone`` was a free-text box whose typos silently
+# became UTC at install time. So the fix is to let the wizard call these,
+# not to write a second copy in bash — the two-copies-that-drift shape.
+#
+# Rules are the POSIX-portable useradd shape Debian's adduser enforces
+# (NAME_REGEX in /etc/adduser.conf): start with a lowercase letter or
+# underscore, then lowercase / digits / underscore / hyphen, with an
+# optional trailing '$' for Samba machine accounts. 32-char limit is
+# useradd's own (utmp).
+_ADMIN_USER_RE = re.compile(r"^[a-z_][a-z0-9_-]*\$?$")
+# Accounts the base image already ships. Handing one of these to
+# `useradd -m` fails ("user already exists") mid-install; `root` is
+# doubly wrong because do_install sets the root password separately
+# from the same secret, so a root admin_user silently means "the
+# useradd step fails and the install aborts after the wipe".
+_RESERVED_USERS = {
+    "root", "daemon", "bin", "sys", "sync", "games", "man", "lp", "mail",
+    "news", "uucp", "proxy", "www-data", "backup", "list", "irc", "nobody",
+    "systemd-network", "systemd-resolve", "messagebus", "sshd",
+}
+
+ZONEINFO_DIR = "/usr/share/zoneinfo"
+# IANA zone names are ASCII letters / digits / '+' / '-' / '_' joined by
+# '/'  (``Etc/GMT+5``, ``America/Argentina/Buenos_Aires``). No dots — and
+# that exclusion is load-bearing rather than cosmetic: the value is
+# interpolated into ``ln -sf /usr/share/zoneinfo/$TIMEZONE
+# /etc/localtime``, so ``../../etc/passwd`` passes a bare existence check
+# and points the installed system's localtime at an arbitrary file.
+_TIMEZONE_RE = re.compile(r"^[A-Za-z0-9+_-]+(?:/[A-Za-z0-9+_-]+)*$")
+
+
+def validate_admin_user(name: str) -> str:
+    """Return "" when the username is usable, else the reason it is not."""
+    if not name:
+        return "admin_user is empty"
+    if len(name) > 32:
+        return f"admin_user {name!r} is longer than 32 characters (useradd's limit)"
+    if not _ADMIN_USER_RE.match(name):
+        return (
+            f"admin_user {name!r} is not a valid Linux username — must "
+            "start with a lowercase letter or underscore and contain only "
+            "lowercase letters, digits, underscore or hyphen (optionally "
+            "ending in '$')"
+        )
+    if name in _RESERVED_USERS:
+        return (
+            f"admin_user {name!r} is a reserved system account that "
+            "already exists in the image — pick a different name (the root "
+            "password is set from admin_password separately)"
+        )
+    return ""
+
+
+def validate_timezone(tz: str) -> str:
+    """Return "" when the IANA zone name is usable, else the reason.
+
+    Three tests, and the order matters. The shape rule runs FIRST so a
+    traversal never reaches the filesystem at all. ``isfile`` then
+    rejects the directory names that are also real paths under
+    ``/usr/share/zoneinfo`` (``America`` exists; symlinking
+    /etc/localtime at a directory breaks every timestamp on the box).
+    The TZif magic finally separates a zone from the other regular files
+    that live in the same tree — ``leapseconds``, ``posixrules``,
+    ``tzdata.zi`` — which are paths, are files, and are not zones.
+    """
+    if not tz:
+        return "timezone is empty"
+    if not _TIMEZONE_RE.match(tz):
+        return (
+            f"timezone {tz!r} is not a valid IANA zone name — expected "
+            "something like 'UTC', 'Europe/Berlin' or "
+            "'America/Argentina/Buenos_Aires'"
+        )
+    path = os.path.join(ZONEINFO_DIR, tz)
+    if not os.path.isfile(path):
+        return f"timezone {tz!r} is not a known IANA zone ({ZONEINFO_DIR})"
+    try:
+        with open(path, "rb") as fh:
+            magic = fh.read(4)
+    except OSError as exc:
+        return f"timezone {tz!r} could not be read from {ZONEINFO_DIR}: {exc}"
+    if magic != b"TZif":
+        return (
+            f"timezone {tz!r} exists under {ZONEINFO_DIR} but is not a "
+            "compiled zone file"
+        )
+    return ""
+
+
+_FIELD_VALIDATORS = {
+    "admin_user": validate_admin_user,
+    "timezone": validate_timezone,
+}
+
+# ``--check-field <kind> <value>`` — the interactive wizard's entry
+# point. Exit 0 (silent) = usable; exit 2 = rejected, reason on stdout
+# for the caller to put in a whiptail box; exit 3 = the caller asked for
+# a field this script does not know how to check, which is a bug in the
+# caller rather than a verdict about the value.
+if len(sys.argv) >= 2 and sys.argv[1] == "--check-field":
+    if len(sys.argv) != 4:
+        sys.stderr.write(
+            "usage: spatium-preseed-parse --check-field <field> <value>\n"
+        )
+        sys.exit(3)
+    _kind, _value = sys.argv[2], sys.argv[3]
+    _validator = _FIELD_VALIDATORS.get(_kind)
+    if _validator is None:
+        sys.stderr.write(
+            f"spatium-preseed-parse: no validator for field {_kind!r} "
+            f"(known: {', '.join(sorted(_FIELD_VALIDATORS))})\n"
+        )
+        sys.exit(3)
+    _reason = _validator(_value)
+    if _reason:
+        sys.stdout.write(_reason + "\n")
+        sys.exit(2)
+    sys.exit(0)
+
+
 try:
     import yaml
 except ImportError:  # pragma: no cover - image always ships python3-yaml
@@ -300,50 +432,20 @@ if hostname:
 # ── Admin OS user (issue #581) ────────────────────────────────────────
 # The value flows unquoted-in-spirit into `chroot useradd -m -G sudo -s
 # /bin/bash "$ADMIN_USER"` and into the `user:password` line piped to
-# `chpasswd`. The interactive path can only produce something sane (the
-# operator types into a whiptail box and useradd rejects the rest with a
-# visible error); a preseed is applied with no human watching, so an
+# `chpasswd`. A preseed is applied with no human watching, so an
 # unvalidated value either fails the install halfway through — after the
 # disk is already wiped — or, with a colon in it, splits the chpasswd
 # line and sets a password for the wrong account.
 #
-# Rules are the POSIX-portable useradd shape Debian's adduser enforces
-# (NAME_REGEX in /etc/adduser.conf): start with a lowercase letter or
-# underscore, then lowercase / digits / underscore / hyphen, with an
-# optional trailing '$' for Samba machine accounts. 32-char limit is
-# useradd's own (utmp).
-_ADMIN_USER_RE = re.compile(r"^[a-z_][a-z0-9_-]*\$?$")
-# Accounts the base image already ships. Handing one of these to
-# `useradd -m` fails ("user already exists") mid-install; `root` is
-# doubly wrong because do_install sets the root password separately
-# from the same secret, so a root admin_user silently means "the
-# useradd step fails and the install aborts after the wipe".
-_RESERVED_USERS = {
-    "root", "daemon", "bin", "sys", "sync", "games", "man", "lp", "mail",
-    "news", "uucp", "proxy", "www-data", "backup", "list", "irc", "nobody",
-    "systemd-network", "systemd-resolve", "messagebus", "sshd",
-}
-
+# #995 item 4 — the rules moved to ``validate_admin_user`` above so the
+# interactive wizard can call them too, via ``--check-field``. The
+# comment here used to say the interactive path "can only produce
+# something sane"; it could not, which is what item 4 was filed about.
 admin_user = as_str(ps.get("admin_user"))
 if admin_user:
-    if len(admin_user) > 32:
-        fail(
-            f"admin_user {admin_user!r} is longer than 32 characters "
-            "(useradd's limit)"
-        )
-    elif not _ADMIN_USER_RE.match(admin_user):
-        fail(
-            f"admin_user {admin_user!r} is not a valid Linux username — must "
-            "start with a lowercase letter or underscore and contain only "
-            "lowercase letters, digits, underscore or hyphen (optionally "
-            "ending in '$')"
-        )
-    elif admin_user in _RESERVED_USERS:
-        fail(
-            f"admin_user {admin_user!r} is a reserved system account that "
-            "already exists in the image — pick a different name (the root "
-            "password is set from admin_password separately)"
-        )
+    reason = validate_admin_user(admin_user)
+    if reason:
+        fail(reason)
     else:
         env["ADMIN_USER"] = admin_user
         env["PRESEED_HAS_ADMIN_USER"] = "1"
@@ -369,13 +471,17 @@ elif pw:
     env["PRESEED_HAS_PASSWORD"] = "1"
 
 # ── Timezone ──────────────────────────────────────────────────────────
+# #995 item 3 — was a bare ``os.path.exists`` on the interpolated name,
+# which accepts a traversal (``../../etc/passwd``) and a directory
+# (``America``). Shared with the wizard's prompt loop now.
 tz = as_str(ps.get("timezone"))
 if tz:
-    if os.path.exists(f"/usr/share/zoneinfo/{tz}"):
+    reason = validate_timezone(tz)
+    if reason:
+        fail(reason)
+    else:
         env["TIMEZONE"] = tz
         env["PRESEED_HAS_TIMEZONE"] = "1"
-    else:
-        fail(f"timezone {tz!r} is not a known IANA zone (/usr/share/zoneinfo)")
 
 # ── Network ───────────────────────────────────────────────────────────
 static_subnet = ""  # feeds the k3s LAN-overlap check below

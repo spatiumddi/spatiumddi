@@ -57,7 +57,35 @@ esac
 # to abort.
 set -uo pipefail
 
-BACKTITLE="SpatiumDDI Appliance Installer 0.1.0"
+# #995 item 8 — the ISO version is the first thing asked when an install
+# misbehaves, and this line said "0.1.0" on every ISO ever built. Read
+# APPLIANCE_VERSION off the release stamp instead.
+#
+# Takes the file as an argument because do_install reads the SAME value
+# back out of the freshly-rsynced $MOUNT copy to label the grub
+# menuentries; one parser so the backtitle and the boot menu can never
+# disagree about which build this is.
+_appliance_version_from() {
+    local f="$1" v=""
+    if [ -r "$f" ]; then
+        v=$(awk -F= '/^APPLIANCE_VERSION=/{
+            gsub(/^"|"$|^'"'"'|'"'"'$/, "", $2); print $2; exit
+        }' "$f" 2>/dev/null || true)
+    fi
+    printf '%s' "$v"
+}
+_INSTALLER_VERSION="$(_appliance_version_from /etc/spatiumddi/appliance-release)"
+BACKTITLE="SpatiumDDI Appliance Installer ${_INSTALLER_VERSION:-unknown}"
+
+# #995 item 2 — how the LIVE ISO booted, which decides which of the two
+# grub-install calls in do_install is allowed to fail. /sys/firmware/efi
+# exists if and only if the kernel was handed an EFI system table, so it
+# is the firmware mode, not a guess from the partition table.
+if [ -d /sys/firmware/efi ]; then
+    FIRMWARE_MODE="uefi"
+else
+    FIRMWARE_MODE="bios"
+fi
 # The SPATIUM_INSTALL_LOG override + the /dev/null fallback below exist
 # for the host-portable `--check-preseed` linter (issue #581) and its
 # pytest suite, which run this script unprivileged on machines where
@@ -236,17 +264,27 @@ PRESEED_CAND_KIND=()
 
 welcome() {
     log "Step: welcome"
+    # #995 item 9 — the list has to match the screens the wizard actually
+    # shows, or an operator sizes up the install from a list that is
+    # missing two of its questions. #995 item 7 — and it names the roles
+    # the way ask_role names them ("First node" / "Additional node"), not
+    # the internal control-plane / appliance pair.
+    #
+    # The role is not known yet (this screen runs before ask_role), so the
+    # two role-specific questions are listed with the role that asks them.
     whiptail --backtitle "$BACKTITLE" --title "Welcome" \
         --msgbox "Welcome to the SpatiumDDI Appliance Installer.\n\n\
 This installer will ERASE a target disk and install SpatiumDDI to it.\n\n\
 You'll be asked for:\n\
-  - Role (Control plane / Appliance)\n\
+  - Role (First node / Additional node)\n\
   - Target disk\n\
   - Hostname\n\
   - Admin OS user + password (for SSH access)\n\
   - Network (DHCP or static)\n\
-  - Timezone\n\n\
-Press OK to begin, or Cancel to drop to a shell." 18 70 \
+  - Timezone\n\
+  - k3s pod + service CIDRs (defaults are fine on most LANs)\n\
+  - Control-plane URL + 8-digit pairing code (Additional node only)\n\n\
+Press OK to begin, or Cancel to drop to a shell." 21 74 \
         || on_cancel "welcome"
 }
 
@@ -334,18 +372,18 @@ ask_application_config() {
             CONTROL_PLANE_URL=$(whiptail --backtitle "$BACKTITLE" \
                 --title "Control plane URL" \
                 --cancel-button "Back" \
-                --inputbox "Where does this Application appliance register?\n\nFormat: https://<control-plane-host>/  — the URL of the SpatiumDDI control plane this supervisor pairs against. The supervisor submits its Ed25519 pubkey here, sits in pending until an admin clicks Approve, then receives a control-plane-CA-signed identity cert.\n\nHA TIP: if the control plane is a multi-node cluster, point this at the MetalLB virtual IP (VIP), NOT a single node's IP — otherwise this appliance loses its control plane whenever that one node is down. Configure the VIP under Appliance -> Network & Host on the control plane.\n\nUse https:// in production; http:// is acceptable for lab installs." \
+                --inputbox "Where does this Additional node register?\n\nFormat: https://<control-plane-host>/  — the URL of the SpatiumDDI control plane this supervisor pairs against. The supervisor submits its Ed25519 pubkey here, sits in pending until an admin clicks Approve, then receives a control-plane-CA-signed identity cert.\n\nHA TIP: if the control plane is a multi-node cluster, point this at the MetalLB virtual IP (VIP), NOT a single node's IP — otherwise this appliance loses its control plane whenever that one node is down. Configure the VIP under Appliance -> Network & Host on the control plane.\n\nUse https:// in production; http:// is acceptable for lab installs." \
                 21 78 "$default_url" 3>&1 1>&2 2>&3) \
                 || return 1
             if [ -z "$CONTROL_PLANE_URL" ] || [ "$CONTROL_PLANE_URL" = "https://" ]; then
-                whiptail --msgbox "Control-plane URL is required for an Application install." 8 60 || true
+                whiptail --msgbox "Control-plane URL is required for an Additional node." 8 62 || true
                 continue
             fi
             break
         done
     fi
 
-    # Pairing code only — Application appliances never paste a long
+    # Pairing code only — an Additional node never pastes a long
     # bootstrap key. The supervisor generates its own Ed25519 keypair
     # on first boot and submits the pubkey against the code; the
     # control plane stores it and waits for admin approval. The 8-digit
@@ -355,20 +393,29 @@ ask_application_config() {
         log "Preseed: pairing code supplied (skipping prompt)"
         return 0
     fi
+    # #995 item 1 (prerequisite) — tracing OFF for the whole loop, exactly
+    # as ask_user_password does for the password. Without it `set -x`
+    # writes `code_val=12345678` and `BOOTSTRAP_PAIRING_CODE=12345678`
+    # into the trace log — which on_failure tails 30 lines of TO THE
+    # CONSOLE on any non-zero exit, and which item 1 now copies onto the
+    # installed system. #581 closed this hole for the admin password and
+    # missed the pairing code beside it; a persistent multi-claim code is
+    # a fleet-join credential, not a spent nonce.
     local code_val
+    { set +x; } 2>/dev/null
     while true; do
         code_val=$(whiptail --backtitle "$BACKTITLE" --title "Pairing code" \
             --cancel-button "Back" \
             --inputbox "Enter the 8-digit pairing code from the control plane.\n\nMint one at https://<control-plane>/appliance → Pairing → 'New pairing code'. Single-use ephemeral codes expire after 15 min by default; persistent codes (multi-claim) stay valid until disabled or revoked.\n\nAfter the supervisor claims the code, the appliance sits in pending — ask the control plane admin to click Approve in the fleet UI to issue the identity cert and assign a role." \
             18 78 "$BOOTSTRAP_PAIRING_CODE" 3>&1 1>&2 2>&3) \
-            || return 1
+            || { set -x; return 1; }
         # The frontend displays codes as ``1234-5678`` for
         # readability; an operator typing in dashes or spaces from
         # what they see on screen should validate cleanly. Strip
         # every non-digit before checking the length.
         code_val=$(echo "$code_val" | tr -cd '0-9')
         if [ -z "$code_val" ]; then
-            whiptail --msgbox "Pairing code is required for an Application install." 8 60 || true
+            whiptail --msgbox "Pairing code is required for an Additional node." 8 62 || true
             continue
         fi
         # Validate: exactly 8 decimal digits after stripping. Catch
@@ -381,7 +428,8 @@ ask_application_config() {
         break
     done
     BOOTSTRAP_PAIRING_CODE="$code_val"
-    log "Application paired against $CONTROL_PLANE_URL with an 8-digit pairing code"
+    set -x
+    log "Additional node paired against $CONTROL_PLANE_URL with an 8-digit pairing code"
 }
 
 # #554 — every disk backing the live boot medium, one /dev/<disk> per
@@ -640,18 +688,77 @@ ask_hostname() {
     done
 }
 
+# #995 items 3 + 4 — one validator, two callers.
+#
+# spatium-preseed-parse already carried the admin_user and timezone
+# rules for the headless path; the interactive prompts had none, so a
+# username with a space or a mistyped zone sailed through the wizard and
+# was discovered (or silently swallowed) at install time. Rather than
+# transcribing a 26-entry reserved-account list and a TZif check into
+# bash — two copies that drift — the wizard shells out to the parser's
+# ``--check-field`` mode, which is answered before it even imports YAML.
+_preseed_parser_path() {
+    local parser
+    parser="$(dirname "$0")/spatium-preseed-parse"
+    [ -f "$parser" ] || parser="/usr/local/bin/spatium-preseed-parse"
+    [ -f "$parser" ] || return 1
+    printf '%s' "$parser"
+}
+
+# Echoes the rejection reason and returns 1 when the value is unusable.
+#
+# A validator that cannot RUN is deliberately not the same answer as a
+# value that is invalid: returning 1 there would make a missing script
+# unrecoverably block the wizard, and returning 0 silently would restore
+# exactly the unvalidated behaviour these items exist to remove. So it
+# accepts and says so LOUDLY in the install log — which #995 item 1 now
+# preserves onto the installed system — and do_install's useradd is
+# fatal, so a bad username still fails with a named reason rather than
+# leaving a box nobody can log into.
+_check_field() {
+    local kind="$1" value="$2" parser out rc
+    if ! parser=$(_preseed_parser_path); then
+        log "WARN: spatium-preseed-parse not found — accepting $kind unvalidated"
+        return 0
+    fi
+    out=$(python3 "$parser" --check-field "$kind" "$value" 2>&1)
+    rc=$?
+    case "$rc" in
+        0) return 0 ;;
+        2) printf '%s' "$out"; return 1 ;;
+        *)
+            log "WARN: --check-field $kind failed to run (rc=$rc): $out — accepting unvalidated"
+            return 0
+            ;;
+    esac
+}
+
 ask_user_password() {
     log "Step: ask_user_password"
     # Username prompt is skipped when the admin user is preseeded, OR
     # when a preseeded password makes this a headless run (in which case
     # the ADMIN_USER default of "admin" — or a preseeded value — stands).
     if [ -z "${PRESEED_HAS_ADMIN_USER:-}" ] && [ -z "${PRESEED_HAS_PASSWORD:-}" ]; then
-        ADMIN_USER=$(whiptail --backtitle "$BACKTITLE" --title "Admin OS user" \
-            --cancel-button "Back" \
-            --inputbox "OS-level admin username (for SSH + sudo).\n\nThe SpatiumDDI web UI uses 'admin/admin' separately - change it on first login." \
-            12 70 "$ADMIN_USER" 3>&1 1>&2 2>&3) \
-            || return 1
-        [ -z "$ADMIN_USER" ] && ADMIN_USER="admin"
+        # #995 item 4 — loop until the name is one useradd will actually
+        # accept. Empty still means "admin"; anything else is checked
+        # against the same rules the preseed path has enforced since
+        # #581, so the interactive and headless doors agree.
+        local uerr
+        while true; do
+            ADMIN_USER=$(whiptail --backtitle "$BACKTITLE" --title "Admin OS user" \
+                --cancel-button "Back" \
+                --inputbox "OS-level admin username (for SSH + sudo).\n\nThe SpatiumDDI web UI uses 'admin/admin' separately - change it on first login." \
+                12 70 "$ADMIN_USER" 3>&1 1>&2 2>&3) \
+                || return 1
+            if [ -z "$ADMIN_USER" ]; then
+                ADMIN_USER="admin"
+            fi
+            if uerr=$(_check_field admin_user "$ADMIN_USER"); then
+                break
+            fi
+            whiptail --backtitle "$BACKTITLE" --title "Invalid username" \
+                --msgbox "$uerr" 13 72 || true
+        done
     else
         log "Preseed: admin user=$ADMIN_USER (skipping username prompt)"
     fi
@@ -832,20 +939,34 @@ ask_timezone() {
         log "Preseed: timezone=$TIMEZONE (skipping prompt)"
         return 0
     fi
-    TIMEZONE=$(whiptail --backtitle "$BACKTITLE" --title "Timezone" \
-        --cancel-button "Back" \
-        --inputbox "Timezone (IANA name, e.g. America/Toronto, Europe/Berlin, UTC):" \
-        10 70 "$TIMEZONE" 3>&1 1>&2 2>&3) \
-        || return 1
-    # ``[ -z "$TIMEZONE" ] && TIMEZONE="UTC"`` here would return 1 when
-    # TIMEZONE is non-empty (the [ test fails, && short-circuits, the
-    # function inherits the [ test's exit code), and the state machine
-    # would then treat OK as Back — infinite-looping the operator back
-    # into ask_network. Use an if/then so the function always exits 0
-    # on success.
-    if [ -z "$TIMEZONE" ]; then
-        TIMEZONE="UTC"
-    fi
+    # #995 item 3 — this was a free-text box with no validation at all,
+    # and do_install's only response to a name it could not resolve was
+    # to log a WARN and silently install UTC. An operator who typo'd
+    # "Amercia/Toronto" got a box four hours out and no indication why,
+    # which then shows up as clock skew in logs and TLS.
+    local tzerr
+    while true; do
+        TIMEZONE=$(whiptail --backtitle "$BACKTITLE" --title "Timezone" \
+            --cancel-button "Back" \
+            --inputbox "Timezone (IANA name, e.g. America/Toronto, Europe/Berlin, UTC):" \
+            10 70 "$TIMEZONE" 3>&1 1>&2 2>&3) \
+            || return 1
+        # ``[ -z "$TIMEZONE" ] && TIMEZONE="UTC"`` as the last statement
+        # here would return 1 when TIMEZONE is non-empty (the [ test
+        # fails, && short-circuits, the function inherits the [ test's
+        # exit code), and the state machine would then treat OK as Back —
+        # infinite-looping the operator back into ask_network. Use an
+        # if/then so the function always exits 0 on success.
+        if [ -z "$TIMEZONE" ]; then
+            TIMEZONE="UTC"
+        fi
+        if tzerr=$(_check_field timezone "$TIMEZONE"); then
+            break
+        fi
+        whiptail --backtitle "$BACKTITLE" --title "Unknown timezone" \
+            --msgbox "$tzerr"$'\n\n'"Tip: 'ls /usr/share/zoneinfo' from a shell lists the regions." \
+            13 72 || true
+    done
 }
 
 # Issue #302 — operator-customisable k3s pod + service CIDRs.
@@ -1043,14 +1164,37 @@ PY
 
 confirm() {
     log "Step: confirm"
-    local role_label
+    # #995 item 6 — the old control-plane label read "api + db + DNS +
+    # DHCP", which contradicts the role screen two steps back: since #272
+    # DNS and DHCP are OFF at install and are enabled per node from the
+    # Fleet UI. A confirm screen that promises services the install does
+    # not start is worse than a terse one. #995 item 7 — and both labels
+    # lead with the role-screen wording.
+    #
+    # Keep each rendered row under ~62 chars: the box is 76 wide, which
+    # leaves ~68 usable, and whiptail hard-wraps past that into a ragged
+    # second line rather than widening. The role detail therefore gets
+    # its own indented continuation row instead of a longer label.
+    local role_label role_detail
     case "$ROLE" in
-        control-plane) role_label="Control plane — api + db + DNS + DHCP (first node)" ;;
-        appliance)     role_label="Appliance — DNS / DHCP agent (pairs with a control plane)" ;;
-        *)             role_label="$ROLE" ;;
+        control-plane)
+            role_label="First node — control plane (api + db + web UI)"
+            role_detail="DNS + DHCP stay OFF; enable per node in the Fleet UI"
+            ;;
+        appliance)
+            role_label="Additional node — DNS / DHCP agent"
+            role_detail="Registers below, then waits for Approve in the Fleet UI"
+            ;;
+        *)
+            role_label="$ROLE"
+            role_detail=""
+            ;;
     esac
     local s
     s="Role:        $role_label\n"
+    if [ -n "$role_detail" ]; then
+        s+="             $role_detail\n"
+    fi
     if [ "$ROLE" = "appliance" ]; then
         s+="Control URL: $CONTROL_PLANE_URL\n"
         # Mask the code in the confirmation screen — the IPMI / serial
@@ -1067,6 +1211,16 @@ confirm() {
         s+=" ($NET_INTERFACE: $NET_IP/$NET_PREFIX via $NET_GATEWAY)"
     fi
     s+="\nTimezone:    $TIMEZONE\n"
+    # #995 item 2 — say which firmware the LIVE ISO booted under, because
+    # that is the mode whose bootloader install is about to be treated as
+    # fatal. The other one is installed too but cannot be verified from
+    # here, and an operator who plans to move the disk between a UEFI and
+    # a BIOS machine should know which half is untested.
+    if [ "$FIRMWARE_MODE" = "uefi" ]; then
+        s+="Booted:      UEFI (BIOS boot also installed, untested here)\n"
+    else
+        s+="Booted:      BIOS/CSM (UEFI boot also installed, untested here)\n"
+    fi
     # Only show the k3s CIDR row when the operator overrode either
     # default — keeps the confirm screen short for the common case.
     if [ "$K3S_POD_CIDR" != "10.42.0.0/16" ] || [ "$K3S_SERVICE_CIDR" != "10.43.0.0/16" ]; then
@@ -1075,9 +1229,13 @@ confirm() {
     fi
     s+="\nWARNING: $TARGET_DISK will be ERASED. There is no undo.\n\n"
     s+="Proceed with installation?"
+    # 23x76, not the old 20x72: items 2 + 6 added the firmware row and a
+    # role continuation row, which on an Additional node with overridden
+    # CIDRs takes the body to 16 lines — two more than 20 could show, and
+    # whiptail CLIPS rather than scrolls.
     whiptail --backtitle "$BACKTITLE" --title "Confirm" \
         --no-button "Back" \
-        --yesno "$s" 20 72 \
+        --yesno "$s" 23 76 \
         || return 1
 }
 
@@ -1090,6 +1248,73 @@ partition_node() {
         *nvme*|*mmcblk*) echo "${TARGET_DISK}p${idx}" ;;
         *)               echo "${TARGET_DISK}${idx}"  ;;
     esac
+}
+
+# #995 item 10 — device-mapper maps that must be released before
+# $TARGET_DISK can be repartitioned, and ONLY those.
+#
+# The old inline loop removed EVERY `dmsetup ls --target linear` device
+# on the machine. On a box with LVM on a second disk — the ordinary case
+# when someone installs the appliance alongside existing storage — that
+# tore down volume groups the operator intends to keep. It is not
+# destructive of data by itself, but it yanks live filesystems out from
+# under anything using them, and there is no reason for an installer to
+# touch a disk it was not pointed at.
+#
+# Emits map names OUTERMOST-FIRST so the caller can remove them in
+# order: `dmsetup remove` refuses a device another map is stacked on.
+# The closure runs to a fixed point rather than one level deep because
+# LVM-on-LUKS-on-$TARGET_DISK gives the LV no direct dependency on the
+# disk at all — its only dependency is the crypt device.
+#
+# A parse that yields nothing is the SAFE failure: the maps stay, the
+# following `wipefs` fails on the busy device, and the install aborts
+# before writing anything. Silence here costs an aborted install; the
+# old behaviour cost someone else's volume group.
+_dm_maps_on_target() {
+    local disk="$1"
+    command -v dmsetup >/dev/null 2>&1 || return 0
+    command -v lsblk   >/dev/null 2>&1 || return 0
+
+    # Seed: the target disk's own kernel name plus every partition on it.
+    local backing=" " kname
+    while read -r kname; do
+        [ -n "$kname" ] && backing+="$kname "
+    done < <(lsblk -nro KNAME "$disk" 2>/dev/null || true)
+    [ "$backing" = " " ] && return 0
+
+    local found=() changed name dmk deps dep hit
+    # `_` because the counter is only a bound on the closure, never read.
+    for _ in 1 2 3 4 5 6 7 8; do
+        changed=0
+        while read -r name; do
+            [ -n "$name" ] || continue
+            # /dev/mapper/<name> is a symlink to the /dev/dm-N node whose
+            # basename is what another map's deps list will name.
+            dmk=$(basename "$(readlink -f "/dev/mapper/$name" 2>/dev/null || true)" 2>/dev/null || true)
+            [ -n "$dmk" ] || continue
+            case "$backing" in *" $dmk "*) continue ;; esac
+            deps=$(dmsetup deps -o blkdevname "$name" 2>/dev/null | \
+                   sed -n 's/^.*: *//p' | tr -d '()' || true)
+            hit=0
+            for dep in $deps; do
+                case "$backing" in *" $dep "*) hit=1; break ;; esac
+            done
+            if [ "$hit" = 1 ]; then
+                backing+="$dmk "
+                found+=("$name")
+                changed=1
+            fi
+        done < <(dmsetup ls 2>/dev/null | awk '{print $1}' || true)
+        [ "$changed" = 0 ] && break
+    done
+
+    # Reverse: the closure discovers the innermost map first, and it has
+    # to be removed last.
+    local i
+    for (( i=${#found[@]}-1; i>=0; i-- )); do
+        echo "${found[$i]}"
+    done
 }
 
 # Last-line defence immediately before the irreversible wipe (issue
@@ -1157,6 +1382,55 @@ _assert_safe_wipe_target() {
         --msgbox "$why"$'\n\n'"Nothing has been written. Pick a different disk." 14 72 \
         || true
     on_cancel "pre-wipe safety check ($TARGET_DISK)"
+}
+
+# #995 item 1 — carry the installer's own logs onto the installed
+# system, immediately before the unmount block.
+#
+# INSTALL_LOG, TRACE_LOG and the launch log all live on the live ISO's
+# tmpfs, and the rsync above excludes /var/log/* — so every record of
+# what the installer actually did evaporated at the reboot. After a bad
+# first boot there was nothing to read: the one artefact that explains
+# the install was the one artefact the install threw away.
+#
+# Destination is a SUBDIRECTORY of the host log dir on purpose. That dir
+# is bind-mounted into the api pod as /var/log/spatiumddi-host and its
+# collector globs ``*.log`` non-recursively, so a subdir (a) keeps three
+# static install-time files out of the live Logs-tab dropdown, and
+# (b) sidesteps /etc/logrotate.d/spatiumddi's ``/var/log/spatiumddi/*.log``
+# stanza, which would otherwise age the install record out after twelve
+# weeks. The support bundle reaches it explicitly instead (#875).
+#
+# 0700/0600 because the trace log is a full bash xtrace: no password
+# (both prompt paths set +x around it, and item 1's sibling fix does the
+# same for the pairing code) but every hostname, address and disk name
+# the wizard touched.
+#
+# Never fatal. This runs under `set -e` after a successful install; a
+# failure to save a log must not be the thing that aborts it.
+_save_install_logs() {
+    local dest="$MOUNT/var/log/spatiumddi/install"
+    mkdir -p "$dest" 2>>"$INSTALL_LOG" || {
+        log "WARN: could not create $dest — installer logs not preserved"
+        return 0
+    }
+    chmod 0700 "$dest" 2>/dev/null || true
+    local src base
+    for src in "$INSTALL_LOG" "$TRACE_LOG" /var/log/spatium-install-launch.log; do
+        # INSTALL_LOG / TRACE_LOG fall back to /dev/null when /var/log is
+        # not writable (the #581 host-portable path); copying that would
+        # make an empty file that reads as "the installer logged nothing".
+        [ "$src" = "/dev/null" ] && continue
+        [ -f "$src" ] || continue
+        base=$(basename "$src")
+        if cp -f "$src" "$dest/$base" 2>>"$INSTALL_LOG"; then
+            chmod 0600 "$dest/$base" 2>/dev/null || true
+        else
+            log "WARN: could not copy $src to $dest"
+        fi
+    done
+    log "Installer logs preserved under /var/log/spatiumddi/install/"
+    return 0
 }
 
 do_install() {
@@ -1227,12 +1501,18 @@ do_install() {
             umount "/dev/$part"  >> "$INSTALL_LOG" 2>&1 || true
             umount -l "/dev/$part" >> "$INSTALL_LOG" 2>&1 || true
         done
-        # device-mapper entries (LVM / dm-crypt) backed by this disk
-        if command -v dmsetup >/dev/null 2>&1; then
-            for dm in $(dmsetup ls --target linear 2>/dev/null | awk '{print $1}'); do
+        # device-mapper entries (LVM / dm-crypt) backed by this disk —
+        # and, since #995 item 10, ONLY this disk. Two passes because a
+        # stacked map can hold a reference the first pass has only just
+        # released.
+        local dm
+        for _ in 1 2; do
+            while read -r dm; do
+                [ -n "$dm" ] || continue
+                log "Releasing device-mapper map '$dm' (backed by $TARGET_DISK)"
                 dmsetup remove "$dm" >> "$INSTALL_LOG" 2>&1 || true
-            done
-        fi
+            done < <(_dm_maps_on_target "$TARGET_DISK")
+        done
 
         echo "XXX"; echo "5"; echo "Partitioning $TARGET_DISK (A/B + var layout)..."; echo "XXX"
         wipefs -af "$TARGET_DISK"           >> "$INSTALL_LOG" 2>&1
@@ -1639,8 +1919,22 @@ EOF
 
         # User + password. -m creates home; -G adds to sudo only.
         # (Issue #183 Phase 7 — no docker group on the appliance.)
-        chroot "$MOUNT" useradd -m -G sudo -s /bin/bash "$ADMIN_USER" \
-            >> "$INSTALL_LOG" 2>&1 || true
+        #
+        # #995 item 4 — this used to end in `|| true`. It is the ONE
+        # account that can log into the installed system: mkosi.postinst
+        # sets PermitRootLogin no, so a swallowed useradd produces a box
+        # with no SSH access at all, discovered after the reboot with the
+        # installer gone. Fatal, with the reason named — the validator in
+        # ask_user_password should mean this never fires, which is
+        # exactly why it must be loud if it does.
+        if ! chroot "$MOUNT" useradd -m -G sudo -s /bin/bash "$ADMIN_USER" \
+                >> "$INSTALL_LOG" 2>&1; then
+            log "FATAL: useradd '$ADMIN_USER' failed inside the target rootfs."
+            log "  The installed system would have no sudo-capable account, and"
+            log "  root SSH login is disabled — it would be unreachable. Aborting"
+            log "  rather than finishing an install nobody can log into."
+            exit 1
+        fi
         # Set the admin + root passwords with tracing OFF so the
         # plaintext / hash never lands in the set -x trace log. A
         # preseed can supply a crypt(3) hash (ADMIN_PASSWORD_HASH) via
@@ -1843,12 +2137,9 @@ EOF
         # line 1060); spatium-upgrade-slot apply re-stamps the
         # inactive slot's title after each dd via _patch_grub_cfg_slot_
         # _label so the menu stays accurate across upgrades.
-        local APPLIANCE_VERSION_LABEL=""
-        if [ -f "$MOUNT/etc/spatiumddi/appliance-release" ]; then
-            APPLIANCE_VERSION_LABEL=$(awk -F= '/^APPLIANCE_VERSION=/{
-                gsub(/^"|"$|^'\''|'\''$/, "", $2); print $2; exit
-            }' "$MOUNT/etc/spatiumddi/appliance-release" || true)
-        fi
+        local APPLIANCE_VERSION_LABEL
+        APPLIANCE_VERSION_LABEL=$(_appliance_version_from \
+            "$MOUNT/etc/spatiumddi/appliance-release")
         local SLOT_TITLE_PREFIX="SpatiumDDI Appliance"
         if [ -n "$APPLIANCE_VERSION_LABEL" ]; then
             SLOT_TITLE_PREFIX="SpatiumDDI Appliance $APPLIANCE_VERSION_LABEL"
@@ -1885,15 +2176,52 @@ EOF
         # BIOS grub embeds slot_a's UUID + /boot/grub path into
         # core.img — meaning a damaged slot_a breaks the boot menu
         # even when slot_b is healthy.
-        chroot "$MOUNT" /usr/sbin/grub-install --target=i386-pc \
-            --boot-directory=/boot/efi \
-            "$TARGET_DISK" >> "$INSTALL_LOG" 2>&1
-        chroot "$MOUNT" /usr/sbin/grub-install --target=x86_64-efi \
-            --efi-directory=/boot/efi \
-            --boot-directory=/boot/efi \
-            --bootloader-id=SPATIUMDDI \
-            --removable \
-            >> "$INSTALL_LOG" 2>&1 || true
+        #
+        # #995 item 2 — the UEFI call used to end in `|| true`, so on a
+        # UEFI-only guest a failed EFI install still reached the Done
+        # screen and the box simply did not boot, with the reason sitting
+        # unread in a log that (until item 1) did not survive the reboot
+        # either. Both targets are still attempted — the disk should boot
+        # in either firmware mode — but the one matching how the LIVE ISO
+        # booted is the one we can actually hold to account here, so that
+        # one is fatal and the other stays best-effort.
+        #
+        # Neither ordering can be assumed away: `--removable` writes
+        # EFI/BOOT/BOOTX64.EFI and needs no efivars or efibootmgr, so the
+        # EFI install can legitimately succeed on a BIOS-booted machine,
+        # and the i386-pc install can legitimately succeed on a UEFI one
+        # because the BIOS Boot partition (p1, ef02) is laid down
+        # regardless. Which is why the failure of the *other* one is a
+        # log line rather than an abort.
+        if ! chroot "$MOUNT" /usr/sbin/grub-install --target=i386-pc \
+                --boot-directory=/boot/efi \
+                "$TARGET_DISK" >> "$INSTALL_LOG" 2>&1; then
+            if [ "$FIRMWARE_MODE" = "bios" ]; then
+                log "FATAL: grub-install --target=i386-pc failed and this"
+                log "  machine booted in BIOS/CSM mode, so that is the path it"
+                log "  will boot from. Refusing to report a successful install."
+                exit 1
+            fi
+            log "WARN: grub-install --target=i386-pc failed. This machine"
+            log "  booted in UEFI mode so the install continues, but the disk"
+            log "  will NOT boot in a BIOS/CSM machine."
+        fi
+        if ! chroot "$MOUNT" /usr/sbin/grub-install --target=x86_64-efi \
+                --efi-directory=/boot/efi \
+                --boot-directory=/boot/efi \
+                --bootloader-id=SPATIUMDDI \
+                --removable \
+                >> "$INSTALL_LOG" 2>&1; then
+            if [ "$FIRMWARE_MODE" = "uefi" ]; then
+                log "FATAL: grub-install --target=x86_64-efi failed and this"
+                log "  machine booted in UEFI mode, so that is the path it will"
+                log "  boot from. Refusing to report a successful install."
+                exit 1
+            fi
+            log "WARN: grub-install --target=x86_64-efi failed. This machine"
+            log "  booted in BIOS/CSM mode so the install continues, but the"
+            log "  disk will NOT boot in a UEFI machine."
+        fi
 
         echo "XXX"; echo "93"; echo "Cloning root_A → root_B (slot redundancy)..."; echo "XXX"
         # Phase 8c — install BOTH slots with the same content so an
@@ -1930,6 +2258,11 @@ EOF
                  /mnt/spatium-root-b/root /mnt/spatium-root-b/boot/efi
         umount /mnt/spatium-root-b 2>/dev/null || umount -l /mnt/spatium-root-b 2>/dev/null || true
         rmdir /mnt/spatium-root-b 2>/dev/null || true
+
+        echo "XXX"; echo "94"; echo "Saving installer logs to the target..."; echo "XXX"
+        # #995 item 1 — last write before the unmount block, so the copy
+        # captures everything except the unmounts themselves.
+        _save_install_logs
 
         echo "XXX"; echo "95"; echo "Unmounting..."; echo "XXX"
         for d in dev sys proc; do
@@ -1989,11 +2322,14 @@ EOF
         eject "$dev" >> "$INSTALL_LOG" 2>&1 || true
     done
 
-    # Title kept short (4 chars) so it doesn't collide with the 36-char
+    # Title kept short (4 chars) so it doesn't collide with the
     # BACKTITLE on the dialog top frame — whiptail renders backtitle on
     # row 0 + dialog title on the immediately-adjacent dialog top
     # border, and overlong combined widths cause the title to overflow
-    # into the backtitle (visible as e.g. "0.1.0ation complete").
+    # into the backtitle (visible as e.g. "0.1.0ation complete"). The
+    # backtitle is no longer a fixed 36 chars either: #995 item 8 made it
+    # carry the real APPLIANCE_VERSION, so a CalVer tag takes it to ~43.
+    # Which is a reason to keep the title short, not a reason to grow it.
     #
     # No inner box-drawing in the body: whiptail's own dialog frame
     # is the visual container, an inner ASCII box renders inconsistently
@@ -2020,32 +2356,102 @@ EOF
     # ATA EJECT) and there is no human to read it. Interactive + partial-
     # preseed installs still show it (an operator was prompted for
     # something, so give them the review + media reminder).
+    # #995 item 5 — the Done screen was wrong three ways, and each one
+    # sent the operator somewhere useless:
+    #
+    #   * it advertised http://, and the appliance frontend 301s to
+    #     https, so the very first thing they tried redirected;
+    #   * it said first boot "pulls the SpatiumDDI container images",
+    #     which has not been true since #170 Wave A4 baked them into the
+    #     rootfs — the wait is k3s starting and IMPORTING them, and an
+    #     operator told it is pulling goes hunting for a network problem
+    #     that does not exist;
+    #   * it showed a web login to BOTH roles, and an Additional node has
+    #     no web UI at all — it registers and waits in pending. The
+    #     screen has to be role-aware or half of all installs end at a
+    #     connection refused.
+    #
+    # And in DHCP mode the address is not "<appliance IP>": the live
+    # system is holding a lease right now, and barring a reservation
+    # change the installed system comes back on the same one. Show it,
+    # hedged, rather than a placeholder.
+    local done_addr=""
+    if [ "$NET_MODE" = "static" ] && [ -n "$NET_IP" ]; then
+        done_addr="$NET_IP"
+    else
+        done_addr=$(ip -4 -br addr 2>/dev/null \
+            | awk '$1!="lo" && $3!="" {sub(/\/.*/, "", $3); print $3; exit}' || true)
+    fi
+
+    local done_next
+    if [ "$ROLE" = "appliance" ]; then
+        # No web UI on this node; the next action is on the control plane.
+        done_next="\
+  This node has no web UI. It registers on first boot and waits in
+  \"pending\" until an admin approves it and assigns DNS / DHCP roles:
+    Control plane:  ${CONTROL_PLANE_URL:-<not set>}
+    Approve it at:  Appliance -> Fleet -> Approvals"
+    else
+        done_next="\
+  Web UI:  https://${done_addr:-<appliance IP>}/
+  Login:   admin / admin  (change forced on first login)"
+        if [ -z "$done_addr" ]; then
+            done_next+="
+  Address unreadable here; see the console banner after reboot."
+        elif [ "$NET_MODE" != "static" ]; then
+            done_next+="
+  DHCP: that is the installer's own lease; confirm it after reboot."
+        fi
+    fi
+
+    # Body assembled first so the box can be sized to it. The old screen
+    # was a fixed 24 rows around ~23 lines of text — over newt's usable
+    # area (height minus borders, spacer and button row) even before this
+    # change, and the role block now makes the length vary. So
+    # compute the height, and clamp it to the terminal: an 80x24 serial
+    # console is a first-class install path here (spatium-console@ttyS0),
+    # and asking newt for a window taller than the screen is not a
+    # cosmetic problem, it fails to draw.
+    local done_body
+    done_body="SpatiumDDI is installed on $TARGET_DISK.
+
+  *** REMOVE THE INSTALL MEDIA before the reboot ***
+  An ATA EJECT already fired, but detach the ISO in the VM config
+  (Proxmox: Hardware -> CD/DVD -> Do not use) or unplug the USB
+  stick, or the firmware boots straight back into this installer.
+
+First boot takes 2-5 min while k3s starts and imports the container
+images baked into this build. Nothing is downloaded.
+
+$done_next
+
+Installer logs are kept at /var/log/spatiumddi/install/.
+Press OK to reboot."
+
+    local done_rows term_rows done_h
+    done_rows=$(printf '%s\n' "$done_body" | wc -l | tr -d ' ')
+    term_rows=$(stty size 2>/dev/null | awk '{print $1}' || true)
+    if [ -z "$term_rows" ]; then
+        term_rows=$(tput lines 2>/dev/null || true)
+    fi
+    # Non-numeric, absent, or an implausible answer (stty reports 0x0 when
+    # stdin is not a tty) all mean "assume the smallest console we
+    # support" rather than "assume it is big".
+    case "$term_rows" in ''|*[!0-9]*) term_rows=24 ;; esac
+    if [ "$term_rows" -lt 12 ]; then
+        term_rows=24
+    fi
+    done_h=$((done_rows + 6))
+    if [ "$done_h" -ge "$term_rows" ]; then
+        done_h=$((term_rows - 1))
+    fi
+    if [ "$done_h" -lt 12 ]; then
+        done_h=12
+    fi
+
     if [ "${FULLY_UNATTENDED:-0}" != "1" ]; then
     whiptail --backtitle "$BACKTITLE" --title "Done" \
-        --msgbox "\
-SpatiumDDI is installed on $TARGET_DISK.
-
-
-   *** REMOVE THE INSTALL MEDIA before the reboot ***
-
-   Otherwise the BIOS will boot back into this installer.
-
-      Virtual:   detach the ISO from the VM's CD-ROM drive
-                 Proxmox: Hardware -> CD/DVD -> 'Do not use'
-      Physical:  unplug the USB stick
-
-   The installer already issued an ATA EJECT - most hypervisors
-   honor it and the ISO is already unmapped, but detach it from
-   the VM config too so it doesn't reattach on the next boot.
-
-
-First boot of the installed system takes 2-5 min while it pulls
-the SpatiumDDI container images.
-
-   Web UI:  http://<appliance IP>/
-   Login:   admin / admin   (change forced on first login)
-
-Press OK to reboot." 24 72
+        --msgbox "$done_body" "$done_h" 76
     else
         log "Fully unattended: install complete on $TARGET_DISK — skipping the interactive Done prompt and rebooting straight into the installed system."
     fi
@@ -2359,9 +2765,7 @@ check_preseed() {
     local line
 
     local parser
-    parser="$(dirname "$0")/spatium-preseed-parse"
-    [ -f "$parser" ] || parser="/usr/local/bin/spatium-preseed-parse"
-    if [ ! -f "$parser" ]; then
+    if ! parser=$(_preseed_parser_path); then
         echo "ERROR: spatium-preseed-parse not found next to $0 or in /usr/local/bin" >&2
         return 2
     fi
@@ -2637,12 +3041,12 @@ main() {
                 ;;
             ask_k3s_cidrs)
                 # Issue #302 — operator picks (or accepts the defaults
-                # for) the k3s pod + service CIDRs. Forward → application
-                # role config; back → timezone.
+                # for) the k3s pod + service CIDRs. Forward → the
+                # Additional-node config; back → timezone.
                 if ask_k3s_cidrs; then step="ask_application_config"; else step="ask_timezone"; fi
                 ;;
             ask_application_config)
-                # Returns 0 immediately when ROLE != application — so
+                # Returns 0 immediately when ROLE != appliance — so
                 # forward navigation moves straight to confirm and
                 # backward navigation from confirm walks through here
                 # without showing any whiptail screen.

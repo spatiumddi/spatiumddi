@@ -1801,6 +1801,86 @@ suggestion, free-space treemap.
   to review and to `tsc` alike. It earned its keep on the first run, catching
   that `focusItem(0, -1)` lands on the *last* item rather than the first.
 
+- 🟡 [**Installer wizard review — 30 fixes in five phases**](https://github.com/spatiumddi/spatiumddi/issues/995)
+  — umbrella over `spatium-install` (2,723 lines, 19 screens), from a review
+  prompted by a fresh install of the #988 ISO. **Phase 1 (items 1–10, bugs and
+  stale text) shipped**; Phases 2–5 (safety gates, missing screens, RAID +
+  multipath, polish) are still open and the issue stays open with them.
+  **Three of the ten were silent failures, which is the theme.**
+  The **install logs did not survive the reboot** — `INSTALL_LOG`, the bash-xtrace
+  `TRACE_LOG` and the launch log all lived on the live ISO's tmpfs and the
+  rootfs rsync excludes `/var/log/*`, so the one artefact explaining how a box
+  was built was the one artefact the build threw away. Now copied to
+  `/var/log/spatiumddi/install/` (0700/0600) as the last write before the
+  unmount, and collected by the support bundle (#875). A **subdirectory**
+  deliberately, not a flat name: the host log dir is bind-mounted into the api
+  pod and its collector globs `*.log` non-recursively, so a subdir keeps three
+  static files out of the live Logs-tab dropdown *and* out of reach of
+  `logrotate`, which would otherwise age the install record out after twelve
+  weeks. The bundle reaches it explicitly rather than by widening
+  `list_log_sources`, which is the allowlist behind that tab's path-injection
+  sanitizer.
+  The **UEFI `grub-install` ended in `|| true`**, so on a UEFI-only guest the
+  Done screen appeared and the box did not boot. Now `/sys/firmware/efi` says
+  how the *live ISO* booted and the matching install is fatal — the other stays
+  best-effort, because `--removable` needs no efivars and the ef02 partition is
+  laid down regardless, so either can legitimately succeed on the other kind of
+  machine. Confirm names the detected mode.
+  The **`useradd` failure was swallowed** too, and `mkosi.postinst` sets
+  `PermitRootLogin no` — so a bad username produced a box with no way in at all,
+  discovered after the reboot with the installer gone. Fatal now, and the
+  username is validated at the prompt.
+  **The validators are shared, not copied.** `admin_user` (32 chars, Debian's
+  `NAME_REGEX`, 26 reserved accounts) and `timezone` were enforced for the
+  preseed path since #581 and by the interactive wizard **not at all**; rather
+  than transcribe them into bash, the wizard shells out to
+  `spatium-preseed-parse --check-field`, answered above that script's `import
+  yaml` so a username prompt cannot fail for want of python3-yaml. A validator
+  that cannot *run* is a third answer, distinct from a value that is invalid:
+  it accepts and logs loudly, because refusing would let an image defect block
+  every install, and the now-fatal `useradd` is the backstop.
+  **The timezone rule got stricter on the way**, closing two holes the preseed
+  path had: the old check was `os.path.exists` on the interpolated name, and
+  the value is interpolated into `ln -sf /usr/share/zoneinfo/$TIMEZONE
+  /etc/localtime` — so `../../../etc/passwd` (three levels; it resolves) and
+  `America` (a directory) both passed. Now a shape rule runs FIRST so a
+  traversal never reaches the filesystem, `isfile` rejects the directories, and
+  the `TZif` magic separates a zone from `leapseconds` / `posixrules`, which are
+  paths, are files, and are not zones.
+  **The device-mapper teardown removed every linear map on the machine**, not
+  just the target's — so installing alongside existing storage tore down a
+  volume group on another disk. Now a transitive closure from the target's own
+  partitions, to a fixed point (LVM-on-LUKS gives the LV no direct dependency on
+  the disk at all) and emitted outermost-first, since `dmsetup remove` refuses a
+  device another map sits on. A parse that yields nothing is the safe failure:
+  the maps stay, `wipefs` fails on the busy device, and the install aborts
+  before writing anything.
+  **Found on the way, and a prerequisite for item 1:** #581 wrapped the password
+  prompt in `set +x` and **missed the 8-digit pairing code beside it** — so
+  `set -x` wrote it to the trace log that `on_failure` tails 30 lines of to the
+  console, and that item 1 would now copy onto disk. A single-use code is spent
+  on first boot; a persistent multi-claim code is a standing fleet-join
+  credential.
+  Plus the stale text: the Done screen advertised `http://` (the frontend 301s
+  to https), said first boot "pulls the SpatiumDDI container images" (baked
+  since #170 Wave A4 — it *imports* them, nothing is downloaded), and showed a
+  web login to both roles when an Additional node has no web UI at all. It is
+  role-aware now, offers the live DHCP lease rather than `<appliance IP>`, and
+  is **sized to its own content and clamped to the terminal** — the old fixed
+  24 rows was already over newt's usable area, and an 80x24 serial console is a
+  first-class install path here. Confirm no longer promises "api + db + DNS +
+  DHCP" that #272 leaves off; the retired "Application install" naming is gone;
+  Welcome lists the two questions it omitted; and the backtitle reads
+  `APPLIANCE_VERSION` instead of a hardcoded `0.1.0` — the first thing asked
+  when an install misbehaves.
+  No migration, no new endpoint, no MCP change, no new screen.
+  **69 new appliance tests**, and the two that matter most execute rather than
+  grep: the device-mapper closure runs against stubbed `lsblk`/`dmsetup` with a
+  second disk present as the negative control, because the failure mode of
+  getting it wrong is destroying someone else's data and a structural
+  string-match would not catch an inverted comparison. Every guard was run
+  against the unpatched script.
+
 #### CLI tool
 
 - ⬜ [**`spddi` CLI**](https://github.com/spatiumddi/spatiumddi/issues/83)

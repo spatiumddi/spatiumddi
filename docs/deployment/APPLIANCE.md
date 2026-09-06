@@ -1289,6 +1289,62 @@ trigger: tag push (CalVer)
 > reinstall to change `cluster-cidr` / `service-cidr`. The
 > partition layout permits keeping `/var` across reinstalls.
 
+> **#995 Phase 1 update — installer bugs and stale text.** Ten fixes
+> to `spatium-install`, no new screens:
+>
+> - **The install logs survive the reboot.** `spatium-install.log`,
+>   the bash-xtrace `spatium-install-trace.log` and the launch log all
+>   lived on the live ISO's tmpfs, and the rootfs rsync excludes
+>   `/var/log/*` — so after a bad first boot there was no record of what
+>   the installer had done. All three are now copied to
+>   **`/var/log/spatiumddi/install/`** (0700/0600) as the last write
+>   before the target is unmounted, and the support bundle (#875)
+>   collects them. A subdirectory rather than a flat name on purpose:
+>   the appliance Logs tab globs `*.log` in that directory
+>   non-recursively, so three static install-time files stay out of the
+>   live-log dropdown, and `logrotate` does not age the install record
+>   out after twelve weeks.
+> - **A failed bootloader install is no longer silent.** The UEFI
+>   `grub-install` ended in `|| true`, so on a UEFI-only guest the Done
+>   screen appeared and the box did not boot. The installer now reads
+>   `/sys/firmware/efi` to learn how the *live ISO* booted and makes the
+>   matching `grub-install` fatal; the other stays best-effort, because
+>   `--removable` and the ef02 BIOS Boot partition mean either can
+>   legitimately succeed on the other kind of machine. The Confirm
+>   screen names the detected mode.
+> - **The pairing code no longer reaches the trace log.** #581 wrapped
+>   the password prompt in `set +x` and missed the 8-digit code beside
+>   it — which `on_failure` tails to the console on any non-zero exit,
+>   and which the log copy above would now carry onto disk. A persistent
+>   multi-claim code is a standing fleet-join credential.
+> - **Timezone and username are validated at the prompt.** Both rules
+>   already existed for the preseed path; the interactive wizard had
+>   neither, so a typo'd zone silently became UTC and a username with a
+>   space reached `useradd` — whose failure was swallowed with
+>   `|| true`, leaving a box with no sudo account while
+>   `PermitRootLogin no` locked root out of SSH. The wizard now calls
+>   the same validator through `spatium-preseed-parse --check-field`
+>   (one definition, two callers) and the `useradd` failure is fatal.
+> - **The device-mapper teardown is scoped to the target disk.** The
+>   pre-partition cleanup removed *every* linear device-mapper map on
+>   the machine, including LVM on a second disk the operator intended to
+>   keep. It now walks the dependency graph to a fixed point from the
+>   target's own partitions — so a stacked LVM-on-LUKS target is fully
+>   released — and touches nothing else.
+> - **The screens say what is true.** The Done screen advertised
+>   `http://` (the frontend 301s to https), claimed first boot "pulls
+>   the SpatiumDDI container images" (baked into the rootfs since #170
+>   Wave A4 — it *imports* them, nothing is downloaded), and showed a
+>   web login to both roles when an Additional node has no web UI at
+>   all. It is now role-aware, offers the live DHCP address rather than
+>   a placeholder, and is sized to its own content and clamped to the
+>   terminal so an 80x24 serial console does not clip it. The Confirm
+>   screen no longer promises "api + db + DNS + DHCP" when #272 leaves
+>   DNS and DHCP off at install; the retired "Application install"
+>   naming is gone; Welcome lists the k3s CIDR and pairing-code
+>   questions it was omitting; and the backtitle shows the real
+>   `APPLIANCE_VERSION` instead of a hardcoded `0.1.0`.
+
 ### Headless / unattended install — preseed the disk installer (#549)
 
 > **Supersedes the stale Phase-1 framing.** The *old* cloud-init
@@ -1404,7 +1460,21 @@ must match `[a-z_][a-z0-9_-]*\$?` (Debian's `NAME_REGEX`), and must not
 be a reserved system account that already exists in the image (`root`,
 `www-data`, `nobody`, …). An unvalidated value would otherwise fail
 `useradd` *after* the disk was already wiped — or, with a colon in it,
-split the `user:password` line piped to `chpasswd`.
+split the `user:password` line piped to `chpasswd`. Since #995 item 4
+the interactive prompt calls the same rule, via
+`spatium-preseed-parse --check-field admin_user <name>`.
+
+**`timezone` shape (#995 item 3).** Three tests, in order: the name
+must look like an IANA zone (`[A-Za-z0-9+_-]` segments joined by `/`),
+the path under `/usr/share/zoneinfo` must be a **file**, and that file
+must start with the `TZif` magic. The old check was a bare
+`os.path.exists` on the interpolated name, which accepted a traversal
+(`../../../etc/passwd` resolves to `/etc/passwd`, and `do_install`
+symlinks `/etc/localtime` at whatever it is given), a directory
+(`America` exists; symlinking localtime at a directory breaks every
+timestamp on the box), and the non-zone regular files that live in the
+same tree (`leapseconds`, `posixrules`). Shared with the interactive
+prompt the same way `admin_user` is.
 
 Once the installed system reboots, `spatiumddi-firstboot.service`
 runs as normal (identical to the interactive path): generates
