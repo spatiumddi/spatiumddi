@@ -268,7 +268,12 @@ def test_every_prefilled_inputbox_guards_against_a_leading_dash():
     bad = [
         ln.strip() for ln in SRC.splitlines()
         if "3>&1 1>&2 2>&3" in ln
-        and re.search(r'\d+ +"\$[A-Za-z_]', ln)  # ends `<width> "$VAR"`
+        # The default is the LAST positional, immediately before the fd
+        # shuffle. Anchoring on that rather than on "a $VAR after a number"
+        # matters since the menus began computing their width: `20
+        # "$_DISK_MENU_W" 10 ...` matched the looser pattern and reported
+        # a pre-filled default on a dialog that has none.
+        and re.search(r'\d+ +"\$[A-Za-z_][A-Za-z0-9_]*" +3>&1', ln)
         and " -- " not in ln
     ]
     assert not bad, bad

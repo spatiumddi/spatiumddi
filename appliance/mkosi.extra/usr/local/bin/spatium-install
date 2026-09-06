@@ -1300,6 +1300,17 @@ pick_disk() {
         TARGET_DISK_BY_ID=$(_disk_by_id "$TARGET_DISK")
         return 2
     fi
+    # Box width first: every item is then budgeted to fit inside it.
+    # 70 was hardcoded and the items were not checked against it at all.
+    local _DISK_MENU_W _DISK_ITEM_COLS
+    _DISK_MENU_W=$(_whiptail_width 88)
+    # newt spends the rest of the row on the tag column and the frame:
+    # 2 border + 2 padding each side + the gap between tag and item. The
+    # longest tag we can emit is a device node ("/dev/nvme0n1" = 12; 16
+    # covers anything lsblk hands us), so reserve that plus 7 of chrome.
+    _DISK_ITEM_COLS=$((_DISK_MENU_W - 16 - 7))
+    [ "$_DISK_ITEM_COLS" -lt 24 ] && _DISK_ITEM_COLS=24
+
     local options=()
     local -A live_disks=()
     local _d
@@ -1309,10 +1320,13 @@ pick_disk() {
 
     local -A seen_wwn=()
     while IFS= read -r line; do
-        local name size model wwn hazard existing tag
+        local name size model wwn hazard existing
         name=$(echo "$line" | awk '{print $1}')
         size=$(echo "$line" | awk '{print $2}')
-        model=$(echo "$line" | cut -d' ' -f3- | sed 's/  */ /g')
+        # `lsblk -r` hex-escapes unsafe characters, so a model reads
+        # "Samsung\\x20SSD\\x20860" — ugly, and three columns per space
+        # wider than it needs to be in a box that has to fit.
+        model=$(echo "$line" | cut -d' ' -f3- | sed -e 's/\\x20/ /g' -e 's/  */ /g')
         [ -z "$model" ] && model="(no model)"
         # Skip any disk that backs the live boot medium.
         [ -n "${live_disks[/dev/$name]:-}" ] && continue
@@ -1327,16 +1341,27 @@ pick_disk() {
             fi
             seen_wwn["$wwn"]="/dev/$name"
         fi
-        tag="$size - $model"
         # #995 item 25 — say when a disk already carries an install, so
         # the operator can tell the target from the one they meant.
         existing=$(_existing_install_version "/dev/$name")
-        [ -n "$existing" ] && tag="$tag [SpatiumDDI $existing installed]"
         # #995 items 23 + 24 / #999 — mark, do not hide. A hidden disk reads as
         # a missing disk; a marked one explains itself.
         hazard=$(_disk_hazard "/dev/$name")
-        [ -n "$hazard" ] && tag="$tag [UNSUPPORTED]"
-        options+=("/dev/$name" "$tag")
+        local suffix=""
+        [ -n "$existing" ] && suffix=" [installed: $existing]"
+        [ -n "$hazard" ] && suffix="$suffix [UNSUPPORTED]"
+        # The SUFFIXES are budgeted first and the MODEL absorbs whatever is
+        # left, because newt does not truncate an over-wide --menu item — it
+        # writes past the frame and the box border is destroyed. Reported
+        # from a real reinstall: item 25's suffix pushed an ordinary
+        # "32G - QEMU HARDDISK" nine columns over, and only on a REINSTALL,
+        # since that is the one case where the suffix exists at all.
+        # `model` is the right thing to clip: it is the only unbounded part
+        # (vendor strings run to 40+ chars) and the least load-bearing, where
+        # the size and the two flags are what the operator is choosing on.
+        local budget=$((_DISK_ITEM_COLS - ${#size} - ${#suffix} - 3))
+        [ "$budget" -lt 8 ] && budget=8
+        options+=("/dev/$name" "$size - $(_ellipsis "$model" "$budget")$suffix")
     done < <(lsblk -dn -o NAME,SIZE,MODEL -r 2>/dev/null | grep -vE "^(sr|loop|fd|ram|zram)")
 
     if [ ${#options[@]} -eq 0 ]; then
@@ -1357,7 +1382,7 @@ pick_disk() {
         TARGET_DISK=$(whiptail --backtitle "$BACKTITLE" --title "Target Disk" \
             --cancel-button "Back" \
             --menu "Select the disk to install SpatiumDDI to.\nALL DATA on the chosen disk will be DESTROYED." \
-            20 70 10 "${options[@]}" 3>&1 1>&2 2>&3) \
+            20 "$_DISK_MENU_W" 10 "${options[@]}" 3>&1 1>&2 2>&3) \
             || return 1
         # #995 items 23 + 24 / #999 — refuse before the size check, because a
         # multipath path or an md member is not made acceptable by being
@@ -2055,10 +2080,17 @@ ask_network() {
     # And the rows say which socket the cable is in, which is the only
     # question anyone actually has here. Name + MAC — what the old picker
     # showed — answers a question nobody asks.
+    # Same width discipline as the disk picker: newt writes an over-wide
+    # --menu item straight through the frame instead of clipping it, and a
+    # v6 address plus a driver name comfortably clears the old fixed 74.
+    local _IF_MENU_W _IF_ITEM_COLS
+    _IF_MENU_W=$(_whiptail_width 88)
+    _IF_ITEM_COLS=$((_IF_MENU_W - 18 - 7))
+    [ "$_IF_ITEM_COLS" -lt 24 ] && _IF_ITEM_COLS=24
     local ifs=() iface
     while read -r iface; do
         [ -n "$iface" ] || continue
-        ifs+=("$iface" "$(_iface_summary "$iface")")
+        ifs+=("$iface" "$(_ellipsis "$(_iface_summary "$iface")" "$_IF_ITEM_COLS")")
     done < <(_net_interfaces)
     if [ ${#ifs[@]} -eq 0 ]; then
         whiptail --msgbox "No ethernet interfaces found — falling back to DHCP on whatever appears at boot." 9 66 || true
@@ -2075,7 +2107,7 @@ ask_network() {
     fi
     NET_INTERFACE=$(whiptail --backtitle "$BACKTITLE" --title "Network interface" \
         --cancel-button "Back" \
-        --menu "$pick_hint" 20 74 8 "${ifs[@]}" 3>&1 1>&2 2>&3) \
+        --menu "$pick_hint" 20 "$_IF_MENU_W" 8 "${ifs[@]}" 3>&1 1>&2 2>&3) \
         || return 1
     [ "$NET_INTERFACE" = "any" ] && NET_INTERFACE=""
 
@@ -2461,6 +2493,50 @@ _whiptail_height() {
     printf '%s' "$h"
 }
 
+# Usable columns for a dialog, clamped to the terminal.
+#
+# Companion to _whiptail_height. The appliance console is ~128 cols under
+# KMS, but a serial console is 80 and that is a first-class install path
+# here, so a hardcoded width is either cramped on one or wasteful on the
+# other. `want` is the preferred width; the result never exceeds the
+# terminal and never drops below 70 (the historical value every screen
+# was written against).
+_whiptail_width() {
+    local want="${1:-76}" term
+    term=$(stty size 2>/dev/null | awk '{print $2}' || true)
+    if [ -z "$term" ]; then
+        term=$(tput cols 2>/dev/null || true)
+    fi
+    case "$term" in ''|*[!0-9]*) term=80 ;; esac
+    if [ "$term" -lt 70 ]; then
+        term=80
+    fi
+    if [ "$want" -gt "$((term - 6))" ]; then
+        want=$((term - 6))
+    fi
+    if [ "$want" -lt 70 ]; then
+        want=70
+    fi
+    printf '%s' "$want"
+}
+
+# Truncate to $2 columns, marking the cut so a clipped name never reads as
+# a complete one. ASCII "..." deliberately, not "…": the appliance console
+# font is 256 glyphs and only a handful of box/blocks render (see the
+# console dashboard's fill-bar gauges).
+_ellipsis() {
+    local str="$1" max="$2"
+    if [ "${#str}" -le "$max" ]; then
+        printf '%s' "$str"
+        return
+    fi
+    if [ "$max" -le 3 ]; then
+        printf '%s' "${str:0:$max}"
+        return
+    fi
+    printf '%s...' "${str:0:$((max - 3))}"
+}
+
 confirm() {
     log "Step: confirm"
     # #995 item 6 — the old control-plane label read "api + db + DNS +
@@ -2544,6 +2620,18 @@ confirm() {
     elif [ "$NTP_SERVERS" != "pool.ntp.org" ]; then
         s+="Time source: $NTP_SERVERS\n"
     fi
+    # Field rows are label + operator-supplied value, and the values are
+    # NOT bounded by anything the labels know about: a hostname is legal to
+    # 63 chars (RFC 1123, and our own validator allows it), and Time source
+    # holds however many servers were typed. An over-wide --menu item is
+    # not clipped by newt, it is drawn through the frame.
+    local _CONF_MENU_W _CONF_VAL_COLS
+    _CONF_MENU_W=$(_whiptail_width 88)
+    # Longest tag is "ask_user_password" (17), plus frame chrome, minus the
+    # 19-column label field the rows are hand-aligned to.
+    _CONF_VAL_COLS=$((_CONF_MENU_W - 17 - 7 - 19))
+    [ "$_CONF_VAL_COLS" -lt 16 ] && _CONF_VAL_COLS=16
+
     local nkeys
     nkeys=$(_ssh_key_count)
     if [ "$nkeys" -gt 0 ]; then
@@ -2610,15 +2698,15 @@ confirm() {
     pick=$(whiptail --backtitle "$BACKTITLE" --title "Confirm" \
         --cancel-button "Back" \
         --default-item "pick_disk" \
-        --menu "Change a field, or choose Install to begin." 20 76 11 \
-        "pick_disk"     "Target disk        $TARGET_DISK" \
+        --menu "Change a field, or choose Install to begin." 20 "$_CONF_MENU_W" 11 \
+        "pick_disk"     "Target disk        $(_ellipsis "$TARGET_DISK" "$_CONF_VAL_COLS")" \
         "ask_role"      "Role               $ROLE" \
-        "ask_hostname"  "Hostname           $HOSTNAME" \
-        "ask_user_password" "Admin account  $ADMIN_USER" \
+        "ask_hostname"  "Hostname           $(_ellipsis "$HOSTNAME" "$_CONF_VAL_COLS")" \
+        "ask_user_password" "Admin account  $(_ellipsis "$ADMIN_USER" "$_CONF_VAL_COLS")" \
         "ask_ssh_keys"  "SSH keys           $nkeys authorised" \
         "ask_network"   "Network            $NET_MODE" \
-        "ask_timezone"  "Timezone           $TIMEZONE" \
-        "ask_ntp"       "Time source        ${NTP_SERVERS:-Debian default pool}" \
+        "ask_timezone"  "Timezone           $(_ellipsis "$TIMEZONE" "$_CONF_VAL_COLS")" \
+        "ask_ntp"       "Time source        $(_ellipsis "${NTP_SERVERS:-Debian default pool}" "$_CONF_VAL_COLS")" \
         "ask_keyboard"  "Keyboard           $KEYMAP" \
         "install"       "*** INSTALL - $([ "$KEEP_VAR" = yes ] && echo "reinstall" || echo "erase") $TARGET_DISK ***" \
         3>&1 1>&2 2>&3) \
