@@ -330,8 +330,17 @@ welcome() {
     #
     # The role is not known yet (this screen runs before ask_role), so the
     # two role-specific questions are listed with the role that asks them.
-    whiptail --backtitle "$BACKTITLE" --title "Welcome" \
-        --msgbox "Welcome to the SpatiumDDI Appliance Installer.\n\n\
+    #
+    # --yesno, NOT --msgbox. The text has always ended "or Cancel to drop
+    # to a shell" and --msgbox draws ONE button, so the only way to reach
+    # on_cancel was ESC — undocumented, undiscoverable, and awkward on a
+    # serial console. The screen promised an exit it did not offer.
+    #
+    # Sized from the body rather than the hardcoded 21 rows: #995 item 9
+    # added two bullets to this list, and 80x24 is a first-class install
+    # path here (_whiptail_height clamps to the terminal).
+    local body
+    body="Welcome to the SpatiumDDI Appliance Installer.\n\n\
 This installer will ERASE a target disk and install SpatiumDDI to it.\n\n\
 You'll be asked for:\n\
   - Role (First node / Additional node)\n\
@@ -342,7 +351,10 @@ You'll be asked for:\n\
   - Timezone\n\
   - k3s pod + service CIDRs (defaults are fine on most LANs)\n\
   - Control-plane URL + 8-digit pairing code (Additional node only)\n\n\
-Press OK to begin, or Cancel to drop to a shell." 21 74 \
+Press OK to begin, or Cancel to drop to a shell."
+    whiptail --backtitle "$BACKTITLE" --title "Welcome" \
+        --yes-button "OK" --no-button "Cancel" \
+        --yesno "$body" "$(_whiptail_height "$body" 74)" 74 \
         || on_cancel "welcome"
 }
 
@@ -2930,9 +2942,14 @@ _dm_maps_on_target() {
 # _assert_target_released gate, which is what actually decides whether the
 # disk is safe to write.
 _release_quietly() {
-    local out rc
-    out=$("$@" 2>&1)
-    rc=$?
+    local out rc=0
+    # `|| rc=$?`, NOT a bare assignment. do_install runs under `set -e`, and
+    # the exit status of `out=$(cmd)` IS cmd's — so the very first swapoff
+    # of a partition that is not swap (the NORMAL case, and the whole reason
+    # this function exists) aborted the install and dropped the operator to
+    # a shell. That is precisely what the `|| true` this replaced was buying,
+    # and removing it turned a cosmetic log fix into a total install failure.
+    out=$("$@" 2>&1) || rc=$?
     if [ "$rc" -eq 0 ]; then
         printf '%s: released %s\n' "$1" "${*: -1}" >> "$TRACE_LOG"
         return 0
