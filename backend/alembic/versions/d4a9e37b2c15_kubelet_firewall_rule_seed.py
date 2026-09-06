@@ -55,43 +55,67 @@ _RULES: list = [
 # test_builtin_seed_matches_migration folds every seed migration's policies
 # together by (scope_kind, scope_role) before comparing, so a rule-only
 # contribution lands on the policy it belongs to.
+#
+# ``upgrade`` / ``downgrade`` iterate THIS rather than ``_RULES`` directly,
+# so the structure the drift test asserts on is the same one the migration
+# actually executes. The alternative — a module-level list read only by a
+# test through ``importlib`` — reads as dead code to any static analyser
+# (github-code-quality flagged exactly that), and more to the point it lets
+# the two drift: a rule added to ``_RULES`` alone would be applied and never
+# compared.
 _POLICIES: list = [("role", _SCOPE_ROLE, None, True, _RULES)]
 
 
 def upgrade() -> None:
-    for seq, action, proto, ports, skind, fam, comment, guard in _RULES:
-        op.execute(
-            sa.text(
-                "INSERT INTO firewall_rule "
-                "(id, policy_id, seq, action, protocol, ports, source_kind, source_cidrs, "
-                " source_alias, family, comment, render_guard, enabled) "
-                "SELECT gen_random_uuid(), p.id, :seq, :action, :proto, CAST(:ports AS jsonb), "
-                " :skind, '[]'::jsonb, NULL, :fam, :comment, CAST(:guard AS jsonb), true "
-                "FROM firewall_policy p WHERE p.scope_kind = 'role' AND p.scope_role = :sr "
-                " AND p.is_builtin "
-                "ON CONFLICT (policy_id, seq) DO NOTHING"
-            ).bindparams(
-                sr=_SCOPE_ROLE,
-                seq=seq,
-                action=action,
-                proto=proto,
-                ports=json.dumps(ports),
-                skind=skind,
-                fam=fam,
-                comment=comment,
-                guard=json.dumps(guard) if guard is not None else None,
-            )
+    for _scope_kind, scope_role, _name, _enabled, rules in _POLICIES:
+        for seq, action, proto, ports, skind, fam, comment, guard in rules:
+            _insert_rule(scope_role, seq, action, proto, ports, skind, fam, comment, guard)
+
+
+def _insert_rule(  # noqa: PLR0913 — mirrors the seed tuple's shape
+    scope_role: str,
+    seq: int,
+    action: str,
+    proto: str,
+    ports: list,
+    skind: str,
+    fam: str,
+    comment: str | None,
+    guard: dict | None,
+) -> None:
+    op.execute(
+        sa.text(
+            "INSERT INTO firewall_rule "
+            "(id, policy_id, seq, action, protocol, ports, source_kind, source_cidrs, "
+            " source_alias, family, comment, render_guard, enabled) "
+            "SELECT gen_random_uuid(), p.id, :seq, :action, :proto, CAST(:ports AS jsonb), "
+            " :skind, '[]'::jsonb, NULL, :fam, :comment, CAST(:guard AS jsonb), true "
+            "FROM firewall_policy p WHERE p.scope_kind = 'role' AND p.scope_role = :sr "
+            " AND p.is_builtin "
+            "ON CONFLICT (policy_id, seq) DO NOTHING"
+        ).bindparams(
+            sr=scope_role,
+            seq=seq,
+            action=action,
+            proto=proto,
+            ports=json.dumps(ports),
+            skind=skind,
+            fam=fam,
+            comment=comment,
+            guard=json.dumps(guard) if guard is not None else None,
         )
+    )
 
 
 def downgrade() -> None:
-    # Only this rule — the control-plane policy and its other rules belong to
-    # f5b8d2c91a06 and must survive.
-    for seq, *_rest in _RULES:
-        op.execute(
-            sa.text(
-                "DELETE FROM firewall_rule WHERE seq = :seq AND policy_id IN "
-                "(SELECT id FROM firewall_policy WHERE scope_kind = 'role' "
-                " AND scope_role = :sr AND is_builtin)"
-            ).bindparams(sr=_SCOPE_ROLE, seq=seq)
-        )
+    # Only the rules THIS migration added — the control-plane policy and the
+    # rules f5b8d2c91a06 seeded into it must survive.
+    for _scope_kind, scope_role, _name, _enabled, rules in _POLICIES:
+        for seq, *_rest in rules:
+            op.execute(
+                sa.text(
+                    "DELETE FROM firewall_rule WHERE seq = :seq AND policy_id IN "
+                    "(SELECT id FROM firewall_policy WHERE scope_kind = 'role' "
+                    " AND scope_role = :sr AND is_builtin)"
+                ).bindparams(sr=scope_role, seq=seq)
+            )

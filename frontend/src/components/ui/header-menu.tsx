@@ -5,7 +5,6 @@ import {
   useLayoutEffect,
   useRef,
   useState,
-  type ReactNode,
 } from "react";
 import { ChevronDown } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
@@ -34,9 +33,20 @@ import { HeaderButton } from "@/components/ui/header-button";
 // than focused-and-inert.
 
 export type HeaderMenuItem = {
-  /** Stable key. Also the accessible label when `label` is a node. */
+  /** Stable identity for React's list key. Never rendered. */
   key: string;
-  label: ReactNode;
+  /**
+   * Deliberately `string`, not `ReactNode`.
+   *
+   * The item's text IS its accessible name — it is the button's only
+   * content besides a decorative icon. A node label could render as an
+   * icon or a badge with no text at all, leaving a menu item a screen
+   * reader announces as "button" and nothing else, and the type would
+   * not say so. Every call site passes a string today; if one ever
+   * genuinely needs markup, add an explicit `ariaLabel` alongside it
+   * rather than widening this and hoping.
+   */
+  label: string;
   icon?: LucideIcon;
   iconClassName?: string;
   onSelect: () => void;
