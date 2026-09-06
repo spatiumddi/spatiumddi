@@ -94,7 +94,7 @@ That is the whole list.
 | Connection | Feature | What is sent |
 |---|---|---|
 | `api.github.com` | The Releases view / Appliance → Fleet → Slot images (`services/appliance/releases.py`) | Anonymous GET for the release list and appliance-image asset names. |
-| `data.iana.org`, `rdap.arin.net`, `rdap.db.ripe.net`, `rdap.apnic.net`, `rdap.lacnic.net`, `rdap.afrinic.net` | Domain + ASN registration lookup (#85), and the *Refresh now* button | The domain name or ASN being looked up. RDAP is a public registry query — by nature the registry learns what you asked about. |
+| `data.iana.org`, `rdap.arin.net`, `rdap.db.ripe.net`, `rdap.apnic.net`, `rdap.lacnic.net`, `rdap.afrinic.net` | Domain + ASN registration lookup (#85) and its *Refresh now* button; Settings → DNS → TLD Registry → *Refresh now* (#986) | The domain name or ASN being looked up. RDAP is a public registry query — by nature the registry learns what you asked about. The TLD-registry refresh sends **nothing**: it is an unauthenticated GET of one public file, `data.iana.org/TLD/tlds-alpha-by-domain.txt`. |
 | `crt.sh` | TLS certificate → *Certificate Transparency* cross-reference | The hostname being checked. Explicitly on-demand, never run by the scheduled probe, and the matching copilot tool ships disabled. |
 | RBL / DNSBL zones (`zen.spamhaus.org`, `bl.spamcop.net`, …) | Tools → RBL check | A DNS query encoding the IP being checked, to the list operator's resolver. |
 | Public resolvers | Tools → DNS propagation check | The name being queried, to each resolver in the chosen set. |

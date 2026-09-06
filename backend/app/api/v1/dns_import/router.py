@@ -25,6 +25,8 @@ from app.api.deps import DB, SuperAdmin
 from app.core.agent_wake import collect_wake, dns_group_channel
 from app.core.ssrf import assert_safe_target
 from app.models.dns import DNSServer, DNSServerGroup
+from app.services.dns.name_scope import classify_zone_name
+from app.services.dns.tld_registry import effective_registry
 from app.services.dns_import import (
     CLOUD_DRIVERS,
     CloudDNSImportError,
@@ -99,6 +101,13 @@ class ImportedZoneOut(BaseModel):
     forwarders: list[str] = Field(default_factory=list)
     skipped_record_types: dict[str, int] = Field(default_factory=dict)
     parse_warnings: list[str] = Field(default_factory=list)
+    # #986 — TLD scope of the incoming zone name, so a bulk import is where
+    # an estate full of ``.lan`` zones is visible *before* it is committed.
+    # Derived, never round-tripped: ``_zone_from_pydantic`` ignores it, and
+    # it carries a default because this model is also the commit request
+    # payload (see the ``soa`` note above). None rather than "public" so an
+    # unclassified row shows no pill instead of a reassuring wrong one.
+    name_scope: str | None = None
 
 
 class ZoneConflictOut(BaseModel):
@@ -304,8 +313,9 @@ class CommitOut(BaseModel):
 # ── Conversion helpers (canonical IR ↔ Pydantic) ─────────────────────
 
 
-def _zone_to_pydantic(z: ImportedZone) -> ImportedZoneOut:
+def _zone_to_pydantic(z: ImportedZone, tlds: frozenset[str] | None = None) -> ImportedZoneOut:
     return ImportedZoneOut(
+        name_scope=classify_zone_name(z.name, tlds=tlds).scope,
         name=z.name,
         zone_type=z.zone_type,
         kind=z.kind,
@@ -318,10 +328,10 @@ def _zone_to_pydantic(z: ImportedZone) -> ImportedZoneOut:
     )
 
 
-def _preview_to_pydantic(p: ImportPreview) -> PreviewOut:
+def _preview_to_pydantic(p: ImportPreview, tlds: frozenset[str] | None = None) -> PreviewOut:
     return PreviewOut(
         source=p.source,
-        zones=[_zone_to_pydantic(z) for z in p.zones],
+        zones=[_zone_to_pydantic(z, tlds) for z in p.zones],
         conflicts=[
             ZoneConflictOut(
                 zone_name=c.zone_name,
@@ -460,7 +470,7 @@ async def bind9_preview(
         target_view_id=str(target_view_id) if target_view_id else None,
         user=current_user.display_name,
     )
-    return _preview_to_pydantic(preview)
+    return _preview_to_pydantic(preview, (await effective_registry(db)).tlds)
 
 
 @router.post("/bind9/commit", response_model=CommitOut)
@@ -619,7 +629,7 @@ async def windows_dns_preview(
         target_view_id=str(body.target_view_id) if body.target_view_id else None,
         user=current_user.display_name,
     )
-    return _preview_to_pydantic(preview)
+    return _preview_to_pydantic(preview, (await effective_registry(db)).tlds)
 
 
 @router.post("/windows-dns/commit", response_model=CommitOut)
@@ -757,7 +767,7 @@ async def powerdns_preview(
         target_view_id=str(body.target_view_id) if body.target_view_id else None,
         user=current_user.display_name,
     )
-    return _preview_to_pydantic(preview)
+    return _preview_to_pydantic(preview, (await effective_registry(db)).tlds)
 
 
 @router.post("/powerdns/commit", response_model=CommitOut)
@@ -883,7 +893,7 @@ async def technitium_preview(
         target_view_id=str(body.target_view_id) if body.target_view_id else None,
         user=current_user.display_name,
     )
-    return _preview_to_pydantic(preview)
+    return _preview_to_pydantic(preview, (await effective_registry(db)).tlds)
 
 
 @router.post("/technitium/commit", response_model=CommitOut)
@@ -1013,7 +1023,7 @@ async def cloud_dns_preview(
         target_group_id=str(body.target_group_id),
         user=current_user.display_name,
     )
-    return _preview_to_pydantic(preview)
+    return _preview_to_pydantic(preview, (await effective_registry(db)).tlds)
 
 
 @router.post("/cloud/commit", response_model=CommitOut)

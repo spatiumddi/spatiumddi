@@ -37,6 +37,7 @@ from app.db import task_session
 from app.models.audit import AuditLog
 from app.models.domain import Domain
 from app.models.settings import PlatformSettings
+from app.services.dns.tld_registry import effective_registry
 from app.services.domain_refresh import (
     build_refresh_audit_payload,
     refresh_one_domain,
@@ -90,9 +91,18 @@ async def _refresh_due_async() -> dict[str, Any]:
             .all()
         )
 
+        # #986 — resolved once for the whole sweep, not per row.
+        tlds = (await effective_registry(db)).tlds
+
         scanned = 0
         refreshed = 0
         unreachable = 0
+        # #986 — kept apart from ``unreachable`` on purpose. A name with no
+        # registry behind it is not a failed lookup, and folding the two
+        # together would report every .lan / .internal row as an
+        # unreachable registry on every tick — the exact mislabelling this
+        # change exists to remove.
+        skipped_no_registry = 0
         state_changes = 0
         registrar_changes = 0
         drift_changes = 0
@@ -102,7 +112,9 @@ async def _refresh_due_async() -> dict[str, Any]:
         for d in rows:
             scanned += 1
             try:
-                result = await refresh_one_domain(d, interval_hours=interval_hours, now=now)
+                result = await refresh_one_domain(
+                    d, interval_hours=interval_hours, tlds=tlds, now=now
+                )
             except Exception as exc:  # noqa: BLE001 — don't let one row poison the sweep
                 errors.append(f"{d.name}: {exc}")
                 logger.warning(
@@ -116,7 +128,9 @@ async def _refresh_due_async() -> dict[str, Any]:
                 continue
 
             refreshed += 1
-            if not result.rdap_reachable:
+            if result.skipped_reason is not None:
+                skipped_no_registry += 1
+            elif not result.rdap_reachable:
                 unreachable += 1
             if result.state_changed:
                 state_changes += 1
@@ -159,6 +173,7 @@ async def _refresh_due_async() -> dict[str, Any]:
                         "scanned": scanned,
                         "refreshed": refreshed,
                         "unreachable": unreachable,
+                        "skipped_no_registry": skipped_no_registry,
                         "state_changes": state_changes,
                         "registrar_changes": registrar_changes,
                         "drift_changes": drift_changes,
@@ -177,6 +192,7 @@ async def _refresh_due_async() -> dict[str, Any]:
                 scanned=scanned,
                 refreshed=refreshed,
                 unreachable=unreachable,
+                skipped_no_registry=skipped_no_registry,
                 state_changes=state_changes,
                 registrar_changes=registrar_changes,
                 drift_changes=drift_changes,
@@ -190,6 +206,7 @@ async def _refresh_due_async() -> dict[str, Any]:
             "scanned": scanned,
             "refreshed": refreshed,
             "unreachable": unreachable,
+            "skipped_no_registry": skipped_no_registry,
             "state_changes": state_changes,
             "registrar_changes": registrar_changes,
             "drift_changes": drift_changes,
@@ -233,9 +250,10 @@ async def _refresh_one_by_id_async(domain_id: str) -> dict[str, Any]:
         ps = await db.get(PlatformSettings, _SINGLETON_ID)
         interval_hours = _clamp_interval(ps.domain_whois_interval_hours if ps is not None else None)
         now = datetime.now(UTC)
+        tlds = (await effective_registry(db)).tlds
 
         try:
-            result = await refresh_one_domain(d, interval_hours=interval_hours, now=now)
+            result = await refresh_one_domain(d, interval_hours=interval_hours, tlds=tlds, now=now)
         except Exception as exc:  # noqa: BLE001 — one bad lookup shouldn't crash the worker
             logger.warning("domain_whois_refresh_one_failed", domain=d.name, error=str(exc))
             d.whois_last_checked_at = now  # record the attempt so the beat sweep paces itself
@@ -261,12 +279,16 @@ async def _refresh_one_by_id_async(domain_id: str) -> dict[str, Any]:
             "domain_whois_refresh_one_completed",
             domain=d.name,
             rdap_reachable=result.rdap_reachable,
+            skipped_reason=result.skipped_reason,
             state_changed=result.state_changed,
         )
         return {
-            "status": "ran",
+            # #986 — "skipped" is its own status, not a failed lookup: the
+            # name has no registry behind it and never will.
+            "status": "skipped" if result.skipped_reason else "ran",
             "domain": d.name,
             "rdap_reachable": result.rdap_reachable,
+            "skipped_reason": result.skipped_reason,
             "state_changed": result.state_changed,
         }
 

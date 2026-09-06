@@ -65,6 +65,7 @@ import { HeaderButton } from "@/components/ui/header-button";
 import { Pager } from "@/components/ui/pager";
 import { AskAIButton } from "@/components/copilot/AskAIButton";
 import { ServicesUsingButton } from "@/components/ServicesUsingButton";
+import { ZoneScopeHint, ZoneScopePill } from "@/components/ZoneScopePill";
 import {
   applianceTlsApi,
   dnsApi,
@@ -76,6 +77,7 @@ import {
   type DNSServerGroup,
   type DNSServer,
   type DNSZone,
+  type ZoneNameScope,
   type ZoneServerState,
   type DNSView,
   type DNSAcl,
@@ -2353,6 +2355,26 @@ function ZoneModal({
   const [color, setColor] = useState<string | null>(zone?.color ?? null);
   // Client-side FQDN check (create only — the name is locked on edit).
   const nameErr = !zone && name.trim() ? fqdnError(name) : null;
+  // #986 — TLD scope hint under the name field. Classified server-side so
+  // there is exactly one implementation of the rules (a TypeScript copy
+  // would drift from the one that decides the pill in the zone table); on
+  // edit the name is locked, so the zone's own stored detail is used and
+  // no request is made. 250 ms debounce, same as GlobalSearch.
+  const [debouncedName, setDebouncedName] = useState("");
+  useEffect(() => {
+    const timer = setTimeout(() => setDebouncedName(name.trim()), 250);
+    return () => clearTimeout(timer);
+  }, [name]);
+  const { data: liveScope } = useQuery({
+    queryKey: ["dns-name-scope", debouncedName],
+    queryFn: () => dnsApi.classifyZoneName(debouncedName),
+    // Only while creating, only once the name has a dot — a bare label is
+    // almost always mid-typing, and flashing "Undelegated" at someone who
+    // has typed "exa" is noise, not a warning.
+    enabled: !zone && debouncedName.includes(".") && !nameErr,
+    staleTime: 5 * 60_000,
+  });
+  const scopeDetail = zone ? zone.name_scope_detail : liveScope;
   // Forward-zone config — only shown / submitted when zoneType === "forward".
   const [forwardersText, setForwardersText] = useState(
     (zone?.forwarders ?? []).join(", "),
@@ -2454,6 +2476,12 @@ function ZoneModal({
                 Trailing dot added automatically.
               </p>
             )
+          )}
+          {!nameErr && (
+            <ZoneScopeHint
+              scope={scopeDetail?.scope}
+              detail={scopeDetail ?? null}
+            />
           )}
         </Field>
         <div className="grid grid-cols-2 gap-3">
@@ -3623,6 +3651,10 @@ function ZoneDetailView({
             <h2 className="font-semibold text-base font-mono">
               {zone.name.replace(/\.$/, "")}
             </h2>
+            <ZoneScopePill
+              scope={zone.name_scope}
+              detail={zone.name_scope_detail}
+            />
             <span className="inline-flex items-center rounded border px-1.5 py-0.5 text-xs">
               {zone.zone_type}
             </span>
@@ -8098,6 +8130,10 @@ function ZonesTab({
   const [showZoneFilters, setShowZoneFilters] = useState(false);
   const [zoneNameFilter, setZoneNameFilter] = useState("");
   const [zoneTypeFilter, setZoneTypeFilter] = useState("");
+  // #986 — "" is all scopes.
+  const [zoneScopeFilter, setZoneScopeFilter] = useState<"" | ZoneNameScope>(
+    "",
+  );
   const [tagFilters, setTagFilters] = useState<string[]>([]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [confirmBulkDelete, setConfirmBulkDelete] = useState(false);
@@ -8116,7 +8152,7 @@ function ZonesTab({
     queryFn: () => dnsApi.listViews(group.id),
   });
 
-  const hasZoneFilter = !!(zoneNameFilter || zoneTypeFilter);
+  const hasZoneFilter = !!(zoneNameFilter || zoneTypeFilter || zoneScopeFilter);
   const filteredZones = hasZoneFilter
     ? zones.filter((z) => {
         if (
@@ -8125,6 +8161,7 @@ function ZonesTab({
         )
           return false;
         if (zoneTypeFilter && z.zone_type !== zoneTypeFilter) return false;
+        if (zoneScopeFilter && z.name_scope !== zoneScopeFilter) return false;
         return true;
       })
     : zones;
@@ -8227,6 +8264,12 @@ function ZonesTab({
                   <CustomerChip customerId={z.customer_id} />
                 </span>
               </td>
+              <td className="py-1 pr-2">
+                <ZoneScopePill
+                  scope={z.name_scope}
+                  detail={z.name_scope_detail}
+                />
+              </td>
               <td className="py-1">
                 <span
                   className={`inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium ${typeBadge[z.zone_type] ?? "bg-muted text-muted-foreground"}`}
@@ -8300,7 +8343,7 @@ function ZonesTab({
           className="bg-muted/10 border-b last:border-0"
         >
           <td />
-          <td colSpan={6} className="py-0.5">
+          <td colSpan={7} className="py-0.5">
             <span
               className="inline-flex items-center gap-1.5 text-[11px] text-muted-foreground/70"
               style={{ paddingLeft: indent }}
@@ -8417,11 +8460,26 @@ function ZonesTab({
               </option>
             ))}
           </select>
+          <select
+            value={zoneScopeFilter}
+            onChange={(e) =>
+              setZoneScopeFilter(e.target.value as "" | ZoneNameScope)
+            }
+            title="Filter by the TLD scope of the zone name (#986)"
+            className="rounded border border-border bg-background px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+          >
+            <option value="">All scopes</option>
+            <option value="public">Public</option>
+            <option value="reserved">Private (reserved)</option>
+            <option value="undelegated">Undelegated</option>
+            <option value="reverse">Reverse</option>
+          </select>
           {hasZoneFilter && (
             <button
               onClick={() => {
                 setZoneNameFilter("");
                 setZoneTypeFilter("");
+                setZoneScopeFilter("");
               }}
               className="text-xs text-muted-foreground hover:text-foreground"
               title="Clear filters"
@@ -8463,6 +8521,7 @@ function ZonesTab({
                   />
                 </th>
                 <th className="py-1.5 font-medium">Name</th>
+                <th className="py-1.5 font-medium">Scope</th>
                 <th className="py-1.5 font-medium">Type</th>
                 <th className="py-1.5 font-medium">TTL</th>
                 <th className="py-1.5 font-medium">DNSSEC</th>

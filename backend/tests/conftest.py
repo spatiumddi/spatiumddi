@@ -167,12 +167,18 @@ async def _reset_global_caches() -> AsyncGenerator[None, None]:
     """
     from app.core import maintenance_mode
     from app.services import feature_modules
+    from app.services.dns import tld_registry
 
     maintenance_mode.invalidate_cache()
     feature_modules.invalidate_cache()
+    # #986 — the effective TLD registry is cached the same way, so a test
+    # that stores a snapshot would keep classifying later tests' zones
+    # against it after the per-test TRUNCATE removed the row.
+    tld_registry.invalidate_effective_cache()
     yield
     maintenance_mode.invalidate_cache()
     feature_modules.invalidate_cache()
+    tld_registry.invalidate_effective_cache()
 
 
 @pytest_asyncio.fixture(autouse=True)

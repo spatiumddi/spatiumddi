@@ -308,6 +308,31 @@ openapi:
 	  python3 /scripts/export_openapi.py > openapi.json
 	@echo "✓ Wrote openapi.json ($$(wc -c < openapi.json) bytes, version=$$(python3 -c 'import json;print(json.load(open("openapi.json"))["info"]["version"])'))"
 
+# ── IANA TLD registry (issue #986) ───────────────────────────────────────────
+# Regenerates backend/app/data/iana_tlds.json, the bundled root-zone list that
+# decides whether a zone name reads as Public or Undelegated. Run at
+# release-prep: an install that never clicks Settings → DNS → TLD Registry →
+# Refresh classifies against whatever the release shipped, so a stale bundled
+# list makes recently-delegated TLDs look unprotected.
+#
+# The hand-curated special-use table in the same file is preserved verbatim —
+# it changes by RFC and by ICANN action, not by download — and the script
+# refuses to run if it is missing rather than emitting a registry that would
+# reclassify every reserved zone as public.
+#
+# Runs in a bare python:3.12 with no backend dependencies, which is why the
+# parser it shares with the product is stdlib-only. `tld-registry-check`
+# reports whether the bundled copy is behind IANA without writing anything
+# (exit 1 when stale) — that is the release-prep question.
+.PHONY: tld-registry tld-registry-check
+tld-registry:
+	@docker run --rm -v "$(PWD)":/repo -w /repo python:3.12-slim \
+	  python3 scripts/refresh_iana_tlds.py
+
+tld-registry-check:
+	@docker run --rm -v "$(PWD)":/repo -w /repo python:3.12-slim \
+	  python3 scripts/refresh_iana_tlds.py --check
+
 # ── Untyped-route guard (issue #917) ─────────────────────────────────────────
 # A route with no response_model publishes an unconstrained object as its
 # response schema, so a generated client gets an untyped container. 91 routes

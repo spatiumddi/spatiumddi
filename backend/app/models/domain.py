@@ -89,6 +89,10 @@ class Domain(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     whois_data: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     # whois_state: ok | drift | expiring | expired | unreachable | unknown
+    # | n/a  — "n/a" (#986) is a name whose TLD is not delegated, so there
+    # is no registry to query; the refresh skips it rather than reporting
+    # the registry as unreachable. Mirrors ``asn.whois_state="n/a"`` for a
+    # private AS number.
     whois_state: Mapped[str] = mapped_column(
         String(16), nullable=False, default="unknown", server_default="unknown"
     )

@@ -2065,3 +2065,159 @@ got through.
 > `allow_transfer` (#734) and `forward_policy` (#899): a setting that is
 > stored, shipped, and rendered nowhere. The lesson from §8.2 applies
 > unchanged — **assert on the rendered config, not the stored row**.
+
+---
+
+## 22. Zone name scope — public, private, undelegated (issue #986)
+
+`validate_fqdn` only ever told you a zone name was *syntactically* a
+domain. So `corp.example.com`, `ad.contoso.local`, `lab` and `acme.lan`
+all rendered identically in the zone table — while the first is a name
+the public internet resolves, the second collides with mDNS, and the last
+two sit on top-level domains nobody has delegated.
+
+Every zone is now classified against IANA's root-zone list and shown as a
+pill in the zone table, an icon on the zone detail, a live hint under the
+name field as you type, and a column on every importer preview. It is
+derived at serialisation from the zone name — **no column, nothing
+stored**, so it changes on its own when IANA delegates a new TLD and you
+refresh the list.
+
+### 22.1 The four scopes
+
+| Scope | Rule | Examples | Pill |
+|---|---|---|---|
+| `reverse` | Under `in-addr.arpa` / `ip6.arpa` | `10.in-addr.arpa`, `8.b.d.0.1.0.0.2.ip6.arpa` | neutral **Reverse** |
+| `reserved` | Matches the special-use table | `.local`, `.localhost`, `.test`, `.example`, `.invalid`, `.onion`, `.alt`, `home.arpa`, `example.com/.net/.org`, `.internal`, `.corp`, `.home`, `.mail` | **Private** (amber for `.local`) |
+| `public` | Last label is a delegated IANA TLD | `.com`, `.io`, `.xn--p1ai`, `.arpa` | **Public** |
+| `undelegated` | None of the above | `.lab`, `.lan`, `.intranet`, `.private`, typos | **Undelegated** |
+
+**The order is load-bearing.** Reverse is tested first because `.arpa` is
+a real delegated TLD, so a reverse zone would otherwise read as *Public* —
+and they are always ours (#41 auto-creates them), so they must not read
+as *Private* either. Reserved comes before public because `example.com`
+sits under a delegated TLD and is still reserved, as does `home.arpa`.
+Within reserved, the longest suffix wins, so `home.arpa` is not shadowed
+by a one-label entry.
+
+Matching is **label-wise, never a string `endswith`**: `mylocal` is not
+under `.local`, and `notexample.com` is not `example.com`.
+
+### 22.2 What the pills mean, and what they deliberately do not
+
+Nothing here refuses anything. `.local` is a warning because Microsoft
+told a generation of admins to build Active Directory on it and plenty of
+real installs run it; an authoritative `.local` zone collides with
+mDNS / Bonjour on the same LAN, and clients may get either answer. That
+is worth saying once, in a tooltip — not worth a 422 that would lock an
+existing estate out of its own DNS.
+
+`undelegated` is the same shape. The name works today and is protected by
+nothing: ICANN could delegate the TLD, and any query that escapes your
+resolvers leaks to the root. The hint points at `.internal`, which ICANN
+reserved in 2024 for exactly this.
+
+> **`.lan`, `.intranet` and `.private` are deliberately *not* in the
+> reserved table.** They are the three names operators most often assume
+> are safe. SSAC's name-collision work considered them and did not
+> protect them, so listing them as reserved would tell you they are
+> blessed when they are exactly as unprotected as a typo.
+
+### 22.3 Where the list comes from
+
+Two sources, one effective answer:
+
+* **Bundled** — `backend/app/data/iana_tlds.json`, regenerated at
+  release-prep by `make tld-registry` (`scripts/refresh_iana_tlds.py`);
+  `make tld-registry-check` answers "is the bundled copy behind IANA?"
+  without writing anything. Always present, so classification works on an
+  air-gapped install that has never made an outbound call.
+* **Snapshot** — a one-row `tld_registry_snapshot` table filled by
+  **Settings → DNS → TLD Registry → Refresh now**
+  (`POST /api/v1/dns/tld-registry/refresh`, superadmin, audited).
+
+The snapshot wins **only when its version is newer** than the bundled
+one. That direction matters: a fresh release ships a newer bundled list
+than a year-old snapshot, and silently preferring the stored copy would
+make an upgrade lose TLDs. The Settings card says which one is in use and
+why, so a refresh that appears to change nothing is explained rather than
+mysterious.
+
+In Postgres rather than on disk, because a node-local file does not
+propagate across a multi-node control plane — one node would call `.foo`
+public while its neighbour called it undelegated. Same reasoning as the
+#886 branding logo.
+
+**There is no scheduled fetch.** TLD churn is a handful of entries a
+year, which does not justify a standing connection to a third party
+(non-negotiable #17). The refresh is listed in
+[`docs/PRIVACY.md`](../PRIVACY.md) §3.2 and sends nothing about the
+install — it is an unauthenticated GET of one public file.
+
+The **special-use table is never overridable by a refresh**. Those
+entries change by RFC and by ICANN action, and none of that appears in
+IANA's root-zone download; `scripts/refresh_iana_tlds.py` preserves the
+table verbatim and refuses to run if it is missing.
+
+> **The download guard is the load-bearing part.** A payload with fewer
+> than 1,000 entries, or missing `com` / `net` / `org` / `arpa`, is
+> rejected with a 502 and **nothing is written** — the previous snapshot,
+> or failing that the bundled list, stays in force. Storing a truncated
+> download would relabel every public zone in the estate as
+> *Undelegated* in one action, with no error anywhere. The script and the
+> product share one parser (`parse_tld_payload`) rather than keeping two
+> copies of that guard, and a test asserts they resolve to the same
+> source function — two validators meant to agree is the bug class §8.1
+> catalogues.
+
+### 22.4 Domains (#85) with no registry
+
+A Domain with no registry behind it can never have RDAP data. Rather than
+querying anyway and reporting "no RDAP server" as an outage, the refresh
+**skips** it: `whois_state` goes to `n/a`, `whois_last_checked_at` and
+`next_check_at` are still stamped so the beat sweep paces itself, and the
+result carries a `skipped_reason`. This mirrors the ASN side, where a
+private AS number sits at `n/a` and the RIR is never queried. The sweep
+counts these under `skipped_no_registry`, never under `unreachable` —
+folding them together would report every `.lan` row as a broken registry
+on every tick, which is the mislabelling this exists to remove.
+
+**The decision is made in two stages, and the split is load-bearing.**
+
+A `reserved` or `reverse` name is settled locally: those namespaces have
+never been served by a registry and never will be, so nothing outbound
+happens at all.
+
+`undelegated` is *not* settled locally, because the TLD list above is a
+snapshot — the one bundled with this release, plus whatever the operator
+last refreshed. A TLD delegated since that snapshot classifies
+`undelegated` while RDAP would answer perfectly well, and skipping it
+would freeze `expires_at` forever, leaving `domain_expiring` alerts
+sitting on data that never updates and no hint on the Domains page that a
+TLD-registry refresh is the cure. So the decision is handed to IANA's
+**live** RDAP bootstrap, which is authoritative and self-heals. An
+unreachable bootstrap is deliberately distinct from "no registry": it
+falls through to the lookup, because reading an IANA outage as "no
+registry exists" would mark every domain in the estate `n/a` in one tick.
+
+The privacy improvement survives that: an internal-only name like
+`corp.lan` still reaches no registry. The bootstrap is a cached GET of one
+static public file that any real lookup fetches anyway, and it carries no
+domain name.
+
+### 22.5 Surfaces
+
+| Where | What |
+|---|---|
+| `ZoneResponse.name_scope` + `name_scope_detail` | Every zone read, REST and MCP alike. Derived, never stored |
+| Zone table | Scope column + an *All scopes* filter |
+| Zone detail | Pill beside the name, reason in the tooltip |
+| Create / edit zone | Live hint under the name field, classified server-side (`GET /dns/tld-registry/classify`) so there is exactly one implementation of the rules |
+| Importer previews (#128 / #744) | Scope column per zone row — a bulk import is where an estate full of `.lan` zones first becomes visible, and the last point before it is committed |
+| Domains (#85) | Same pill; non-public rows sit at `whois_state = n/a` |
+| Copilot | `list_dns_zones` reports `name_scope` and accepts it as a filter |
+
+No new MCP tool (non-negotiable #13 — one field on an existing read), and
+none for the refresh, which is an off-prem call. Not a feature module
+(#14) — it extends the existing zone resource rather than adding a
+top-level family.

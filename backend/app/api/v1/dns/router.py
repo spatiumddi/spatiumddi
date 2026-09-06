@@ -7,6 +7,7 @@ import ipaddress
 import re
 import uuid
 import zipfile
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any, Self
 
@@ -84,6 +85,7 @@ from app.services.dns.delegation import (
     find_parent_zone,
     preview_to_dict,
 )
+from app.services.dns.name_scope import classify_zone_name
 from app.services.dns.named_conf_validation import (
     AclCycleError,
     ViewValidationError,
@@ -110,6 +112,19 @@ from app.services.dns.resolver_presets import (
 )
 from app.services.dns.serial import bump_zone_serial
 from app.services.dns.server_move import ServerMoveError, move_server_to_group
+from app.services.dns.tld_registry import (
+    SOURCE_URL,
+    TldFetchError,
+    TldPayloadError,
+    TldRegistry,
+    effective_registry,
+    fetch_remote_payload,
+    invalidate_effective_cache,
+    load_bundled,
+    load_snapshot,
+    resolve_effective,
+    store_snapshot,
+)
 from app.services.dns.zone_move import (
     ZoneMoveError,
     ZoneMovePlan,
@@ -1098,6 +1113,25 @@ class ZoneUpdate(BaseModel):
         return v
 
 
+class ZoneNameScopeDetail(BaseModel):
+    """Why a zone's name landed in the scope it did (#986).
+
+    ``matched_suffix`` is the special-use entry or TLD the decision rests
+    on, so the UI can explain itself rather than just asserting. ``rfc``
+    names the document that reserved the suffix — or the ICANN action,
+    for ``.internal`` / ``.corp`` / ``.home`` / ``.mail``, which are
+    withheld by policy rather than by RFC.
+    """
+
+    scope: str
+    reason: str
+    matched_suffix: str | None = None
+    rfc: str | None = None
+    # ``.local`` only — an authoritative zone by that name collides with
+    # mDNS / Bonjour on the same LAN. Drives the amber pill variant.
+    mdns_conflict: bool = False
+
+
 class ZoneResponse(BaseModel):
     id: uuid.UUID
     group_id: uuid.UUID
@@ -1138,8 +1172,53 @@ class ZoneResponse(BaseModel):
     tags: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
     modified_at: datetime
+    # #986 — derived at serialisation from the zone name, never stored.
+    # See ``_zone_out`` below; nothing writes these to the DB. Unrelated to
+    # ``UpdateAclEntryIn.name_scope`` further down this file, which is the
+    # RFC 2136 grant scope (self / subdomain / zonesub / …) — same word,
+    # different concept.
+    #
+    # A default is needed at all because ``model_validate`` runs against the
+    # ORM row, which has no such attribute. It is None and NOT "public": a
+    # path that ever bypassed ``_zone_out`` should render no pill, not a
+    # confident "this name is fine". Same rule as #882's config_apply_status,
+    # where NULL means UNKNOWN and never ``ok``.
+    name_scope: str | None = None
+    name_scope_detail: ZoneNameScopeDetail | None = None
 
     model_config = {"from_attributes": True}
+
+
+async def _zone_out(db: DB, zone: DNSZone) -> ZoneResponse:
+    """Serialise one zone, stamping its #986 name scope."""
+    return (await _zones_out(db, [zone]))[0]
+
+
+async def _zones_out(db: DB, zones: Sequence[DNSZone]) -> list[ZoneResponse]:
+    """Serialise zones, stamping each one's #986 name scope.
+
+    The effective TLD registry is resolved **once** per call rather than
+    per zone: it is a ~1,400-entry set behind a short TTL cache, and a
+    group with a few thousand zones would otherwise re-resolve it a few
+    thousand times for an identical answer.
+    """
+    if not zones:
+        return []
+    registry = await effective_registry(db)
+    out: list[ZoneResponse] = []
+    for z in zones:
+        scope = classify_zone_name(z.name, tlds=registry.tlds)
+        row = ZoneResponse.model_validate(z)
+        row.name_scope = scope.scope
+        row.name_scope_detail = ZoneNameScopeDetail(
+            scope=scope.scope,
+            reason=scope.reason,
+            matched_suffix=scope.matched_suffix,
+            rfc=scope.rfc,
+            mdns_conflict=scope.mdns_conflict,
+        )
+        out.append(row)
+    return out
 
 
 # ── Record schemas ──────────────────────────────────────────────────────────
@@ -3881,7 +3960,7 @@ async def list_zones(
     current_user: CurrentUser,
     customer_id: uuid.UUID | None = None,
     tag: list[str] = Query(default_factory=list),
-) -> list[DNSZone]:
+) -> list[ZoneResponse]:
     await _require_group(group_id, db)
     stmt = select(DNSZone).where(DNSZone.group_id == group_id).order_by(DNSZone.name)
     if customer_id is not None:
@@ -3894,7 +3973,7 @@ async def list_zones(
     if zone_ids is not None:
         stmt = stmt.where(DNSZone.id.in_(zone_ids))
     result = await db.execute(stmt)
-    return list(result.scalars().all())
+    return await _zones_out(db, list(result.scalars().all()))
 
 
 async def _assert_forward_zone_serviceable(
@@ -3929,7 +4008,7 @@ async def _assert_forward_zone_serviceable(
 @router.post("/groups/{group_id}/zones", response_model=ZoneResponse, status_code=201)
 async def create_zone(
     group_id: uuid.UUID, body: ZoneCreate, db: DB, current_user: SuperAdmin
-) -> DNSZone:
+) -> ZoneResponse:
     await _require_group(group_id, db)
     await _assert_forward_zone_serviceable(
         group_id, body.zone_type, list(body.forwarders or []), db
@@ -3988,7 +4067,7 @@ async def create_zone(
     collect_wake(dns_group_channel(group_id))
     await db.commit()
     await db.refresh(zone)
-    return zone
+    return await _zone_out(db, zone)
 
 
 @router.get(
@@ -4047,8 +4126,8 @@ async def export_all_zones(
 @router.get("/groups/{group_id}/zones/{zone_id}", response_model=ZoneResponse)
 async def get_zone(
     group_id: uuid.UUID, zone_id: uuid.UUID, db: DB, current_user: CurrentUser
-) -> DNSZone:
-    return await _require_zone(group_id, zone_id, db, current_user)
+) -> ZoneResponse:
+    return await _zone_out(db, await _require_zone(group_id, zone_id, db, current_user))
 
 
 class ServerZoneStateEntry(BaseModel):
@@ -4536,7 +4615,7 @@ async def update_zone(
     body: ZoneUpdate,
     db: DB,
     current_user: SuperAdmin,
-) -> DNSZone:
+) -> ZoneResponse:
     zone = await _require_zone(group_id, zone_id, db)
     _reject_if_synthesised_zone(zone, "edit")
     changes = body.model_dump(exclude_none=True)
@@ -4606,7 +4685,7 @@ async def update_zone(
     collect_wake(dns_group_channel(group_id))
     await db.commit()
     await db.refresh(zone)
-    return zone
+    return await _zone_out(db, zone)
 
 
 # ── Dynamic-update (RFC 2136) ACLs (issue #641) ─────────────────────────────
@@ -5406,7 +5485,7 @@ async def sign_zone_dnssec(
     db: DB,
     current_user: SuperAdmin,
     body: DNSSECSignRequest | None = None,
-) -> DNSZone:
+) -> ZoneResponse:
     """Enable DNSSEC signing for the zone (PowerDNS online signing #127 /
     BIND9 inline-signing #49).
 
@@ -5450,7 +5529,7 @@ async def sign_zone_dnssec(
     )
     await db.commit()
     await db.refresh(zone)
-    return zone
+    return await _zone_out(db, zone)
 
 
 @router.post("/groups/{group_id}/zones/{zone_id}/dnssec/unsign", response_model=ZoneResponse)
@@ -5459,7 +5538,7 @@ async def unsign_zone_dnssec(
     zone_id: uuid.UUID,
     db: DB,
     current_user: SuperAdmin,
-) -> DNSZone:
+) -> ZoneResponse:
     """Disable PowerDNS DNSSEC signing for the zone (issue #127, Phase 3c).
 
     Mirrors :func:`sign_zone_dnssec`, minus the driver gate: turning the
@@ -5488,7 +5567,7 @@ async def unsign_zone_dnssec(
     )
     await db.commit()
     await db.refresh(zone)
-    return zone
+    return await _zone_out(db, zone)
 
 
 class DNSSECRolloverRequest(BaseModel):
@@ -5835,7 +5914,7 @@ async def list_zone_templates(_: CurrentUser) -> ZoneTemplateCatalog:
 )
 async def create_zone_from_template(
     group_id: uuid.UUID, body: FromTemplateRequest, db: DB, current_user: SuperAdmin
-) -> DNSZone:
+) -> ZoneResponse:
     """Create a zone + materialise the template's records in one transaction."""
     await _require_group(group_id, db)
     template = get_template(body.template_id)
@@ -5933,7 +6012,7 @@ async def create_zone_from_template(
     )
     await db.commit()
     await db.refresh(zone)
-    return zone
+    return await _zone_out(db, zone)
 
 
 # ── Zone delegation wizard ──────────────────────────────────────────────────
@@ -7519,3 +7598,156 @@ def _reject_if_synthesised_record(record: DNSRecord, op: str) -> None:
                 f"health-check pass — manage the pool / member instead."
             ),
         )
+
+
+# ── TLD registry (#986) ─────────────────────────────────────────────────────
+# The list behind ``ZoneResponse.name_scope``. Read by anyone who can read
+# DNS (it is public reference data, not configuration); refreshed only by a
+# superadmin, because the refresh is the one outbound call this router can
+# make and a bad payload would reclassify the whole estate.
+
+# Past this, the card nudges the operator to refresh. TLD churn is a handful
+# of entries a year, so half a year is generous rather than tight.
+_TLD_SNAPSHOT_STALE_DAYS = 180
+
+
+class TLDRegistryResponse(BaseModel):
+    """State of the effective TLD list, plus both candidates.
+
+    Both are reported, not just the winner: an operator who has just
+    refreshed and sees no change needs to be told that the *bundled* list
+    is still newer, rather than left wondering whether the button worked.
+    """
+
+    origin: str  # "bundled" | "snapshot"
+    version: str
+    fetched_at: datetime | None
+    source: str
+    count: int
+    age_days: int | None
+    # ``age_days`` past the threshold. Advisory only — a stale list still
+    # classifies every TLD that existed when it was fetched.
+    stale: bool
+
+    bundled_version: str
+    bundled_count: int
+    snapshot_version: str | None
+    snapshot_fetched_at: datetime | None
+    snapshot_count: int | None
+
+
+def _tld_registry_response(
+    effective: TldRegistry, bundled: TldRegistry, snapshot: TldRegistry | None
+) -> TLDRegistryResponse:
+    age = effective.age_days
+    return TLDRegistryResponse(
+        origin=effective.origin,
+        version=effective.version,
+        fetched_at=effective.fetched_at,
+        source=effective.source,
+        count=effective.count,
+        age_days=age,
+        stale=age is not None and age > _TLD_SNAPSHOT_STALE_DAYS,
+        bundled_version=bundled.version,
+        bundled_count=bundled.count,
+        snapshot_version=snapshot.version if snapshot else None,
+        snapshot_fetched_at=snapshot.fetched_at if snapshot else None,
+        snapshot_count=snapshot.count if snapshot else None,
+    )
+
+
+@router.get("/tld-registry", response_model=TLDRegistryResponse)
+async def get_tld_registry(db: DB, current_user: CurrentUser) -> TLDRegistryResponse:
+    """Which TLD list zone classification is currently using."""
+    bundled = load_bundled()
+    snapshot = await load_snapshot(db)
+    return _tld_registry_response(resolve_effective(bundled, snapshot), bundled, snapshot)
+
+
+@router.get("/tld-registry/classify", response_model=ZoneNameScopeDetail)
+async def classify_name(
+    db: DB,
+    current_user: CurrentUser,
+    name: str = Query(..., min_length=1, max_length=255),
+) -> ZoneNameScopeDetail:
+    """Classify a candidate zone name without creating anything.
+
+    Backs the live hint under the name field in the create / edit zone
+    modal. It is a round trip per keystroke-burst rather than a copy of the
+    rules in TypeScript **on purpose**: a second implementation of the
+    ordering (reverse before reserved before public) and of the special-use
+    table would drift from this one, and the two disagreeing is worse than
+    either being wrong — the operator would be warned in the form and not in
+    the table, or the reverse.
+
+    Deliberately does **not** validate the name: it is called while the
+    operator is still typing, so a half-finished FQDN must classify, not
+    422.
+    """
+    scope = classify_zone_name(name, tlds=(await effective_registry(db)).tlds)
+    return ZoneNameScopeDetail(
+        scope=scope.scope,
+        reason=scope.reason,
+        matched_suffix=scope.matched_suffix,
+        rfc=scope.rfc,
+        mdns_conflict=scope.mdns_conflict,
+    )
+
+
+@router.post("/tld-registry/refresh", response_model=TLDRegistryResponse)
+async def refresh_tld_registry(db: DB, current_user: SuperAdmin) -> TLDRegistryResponse:
+    """Download IANA's root-zone list and store it as the snapshot.
+
+    The only outbound call in this router, and operator-triggered — there
+    is deliberately no scheduled fetch (non-negotiable #17; TLD churn is a
+    handful of entries a year, which does not justify a standing
+    connection to a third party).
+
+    A download that fails, or that fails the shape guard, answers 502 and
+    **writes nothing**: the previous snapshot stays in force, and failing
+    that the bundled list does. Storing a truncated payload would relabel
+    every public zone in the estate as "undelegated" in one action, which
+    is a far worse outcome than a refresh that did not happen.
+    """
+    try:
+        version, tlds = await fetch_remote_payload()
+    except TldPayloadError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=(
+                f"IANA returned an unusable TLD list ({exc}). Nothing was stored — "
+                "the previous list is still in effect."
+            ),
+        ) from exc
+    except TldFetchError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=(
+                f"Could not download the TLD list ({exc}). Nothing was stored — "
+                "the previous list is still in effect."
+            ),
+        ) from exc
+
+    bundled = load_bundled()
+    snapshot = await store_snapshot(db, version, tlds)
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="refresh",
+            resource_type="tld_registry",
+            resource_id="1",
+            resource_display=f"IANA TLD registry v{version}",
+            new_value={"version": version, "count": len(tlds), "source": SOURCE_URL},
+            result="success",
+        )
+    )
+    await db.commit()
+    # Only now — see the note in ``store_snapshot``. Invalidating before the
+    # commit lets a concurrent request re-cache the pre-refresh list for a
+    # further 60 s, so the card would report the new version while every
+    # pill still classified against the old one.
+    invalidate_effective_cache()
+    # The stored snapshot only wins if it is newer than what we ship.
+    return _tld_registry_response(resolve_effective(bundled, snapshot), bundled, snapshot)

@@ -87,6 +87,10 @@ function WhoisStateBadge({ state }: { state: DomainWhoisState }) {
     expired: "bg-red-100 text-red-700 dark:bg-red-950/30 dark:text-red-400",
     unreachable: "bg-red-100 text-red-700 dark:bg-red-950/30 dark:text-red-400",
     unknown: "bg-zinc-200 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300",
+    // #986 — the name is not under a delegated TLD, so there is no registry
+    // to query. Neutral, not red: nothing is wrong, the lookup is simply
+    // not applicable.
+    "n/a": "bg-zinc-200 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300",
   };
   return (
     <span
@@ -593,7 +597,20 @@ export function DomainDetailPage() {
             />
             <InfoRow
               label="WHOIS State"
-              value={<WhoisStateBadge state={domain.whois_state} />}
+              value={
+                <span className="inline-flex flex-wrap items-center gap-2">
+                  <WhoisStateBadge state={domain.whois_state} />
+                  {/* #986 — "n/a" is not a failed lookup, it is a name with
+                      no registry to look up. Say so, or it reads as an
+                      error the operator is expected to fix. */}
+                  {domain.whois_state === "n/a" && (
+                    <span className="text-[11px] text-muted-foreground">
+                      Not under a delegated top-level domain — there is no
+                      registry to query, so RDAP is skipped.
+                    </span>
+                  )}
+                </span>
+              }
             />
             <InfoRow
               label="Last Checked"

@@ -32,6 +32,8 @@ from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.domain import Domain
 from app.models.settings import PlatformSettings
+from app.services.dns.name_scope import classify_zone_name
+from app.services.dns.tld_registry import effective_registry
 from app.services.domain_refresh import build_refresh_audit_payload, refresh_one_domain
 from app.services.rdap import compute_nameserver_drift, derive_whois_state
 from app.services.tags import apply_tag_filter
@@ -52,7 +54,12 @@ router = APIRouter(
 # (nmap scans, etc).
 _BULK_DELETE_CAP = 500
 
-_VALID_WHOIS_STATES = frozenset({"ok", "drift", "expiring", "expired", "unreachable", "unknown"})
+# "n/a" (#986) — the name is not under a delegated TLD, so there is no
+# registry to query and refresh_one_domain skips it. Mirrors the ASN side,
+# where a private AS number sits at "n/a" and the RIR is never queried.
+_VALID_WHOIS_STATES = frozenset(
+    {"ok", "drift", "expiring", "expired", "unreachable", "unknown", "n/a"}
+)
 
 
 # ── Schemas ─────────────────────────────────────────────────────────
@@ -158,6 +165,11 @@ class DomainRead(BaseModel):
     custom_fields: dict[str, Any]
     customer_id: uuid.UUID | None = None
     registrar_provider_id: uuid.UUID | None = None
+    # #986 — TLD scope of the name. A domain that is not ``public`` can
+    # never have RDAP data, which is why its ``whois_state`` sits at
+    # "n/a" rather than cycling through "unreachable" forever. None rather
+    # than "public" for the same reason as ZoneResponse.name_scope.
+    name_scope: str | None = None
     created_at: datetime
     modified_at: datetime
 
@@ -207,8 +219,9 @@ def _audit(
     )
 
 
-def _to_read(d: Domain) -> DomainRead:
+def _to_read(d: Domain, tlds: frozenset[str] | None = None) -> DomainRead:
     return DomainRead(
+        name_scope=classify_zone_name(d.name, tlds=tlds).scope,
         id=d.id,
         name=d.name,
         registrar=d.registrar,
@@ -286,8 +299,9 @@ async def list_domains(
 
     stmt = base.order_by(Domain.name).limit(page_size).offset((page - 1) * page_size)
     rows = list((await db.execute(stmt)).scalars().all())
+    tlds = (await effective_registry(db)).tlds
     return DomainListResponse(
-        items=[_to_read(r) for r in rows],
+        items=[_to_read(r, tlds) for r in rows],
         total=total,
         page=page,
         page_size=page_size,
@@ -341,7 +355,7 @@ async def create_domain(body: DomainCreate, db: DB, current_user: CurrentUser) -
     except Exception as exc:  # noqa: BLE001
         logger.warning("domain_whois_refresh_dispatch_failed", domain=d.name, error=str(exc))
 
-    return _to_read(d)
+    return _to_read(d, (await effective_registry(db)).tlds)
 
 
 @router.get("/domains/{domain_id}", response_model=DomainRead)
@@ -351,7 +365,7 @@ async def get_domain(domain_id: uuid.UUID, db: DB, current_user: CurrentUser) ->
     d = await db.get(Domain, domain_id)
     if d is None:
         raise HTTPException(status_code=404, detail="Domain not found")
-    return _to_read(d)
+    return _to_read(d, (await effective_registry(db)).tlds)
 
 
 @router.put("/domains/{domain_id}", response_model=DomainRead)
@@ -370,7 +384,7 @@ async def update_domain(
 
     changes = body.model_dump(exclude_unset=True)
     if not changes:
-        return _to_read(d)
+        return _to_read(d, (await effective_registry(db)).tlds)
 
     # Name uniqueness — only check when it actually changed.
     if "name" in changes and changes["name"] != d.name:
@@ -409,7 +423,7 @@ async def update_domain(
     )
     await db.commit()
     await db.refresh(d)
-    return _to_read(d)
+    return _to_read(d, (await effective_registry(db)).tlds)
 
 
 @router.delete("/domains/{domain_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -462,7 +476,9 @@ async def refresh_whois(
         ps.domain_whois_interval_hours if ps is not None and ps.domain_whois_interval_hours else 24
     )
 
-    result = await refresh_one_domain(d, interval_hours=interval_hours)
+    result = await refresh_one_domain(
+        d, interval_hours=interval_hours, tlds=(await effective_registry(db)).tlds
+    )
 
     _audit(
         db,
@@ -474,7 +490,7 @@ async def refresh_whois(
     )
     await db.commit()
     await db.refresh(d)
-    return _to_read(d)
+    return _to_read(d, (await effective_registry(db)).tlds)
 
 
 @router.post("/domains/bulk-delete", response_model=BulkDeleteResponse)

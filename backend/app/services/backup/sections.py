@@ -33,8 +33,9 @@ Design notes:
   things like DHCP leases (re-syncs on next agent poll), the
   query/activity logs (short retention), nmap scan history
   (regenerable), and metric samples.
-* ``alembic_version`` and ``oui_vendor`` are platform-housekeeping
-  tables — they live in their own ``platform_internal`` section.
+* ``alembic_version``, ``oui_vendor`` and ``tld_registry_snapshot`` are
+  platform-housekeeping tables — they live in their own
+  ``platform_internal`` section.
   ``alembic_version`` is technically not user data; restoring
   from an older snapshot re-pins the schema head and the
   upgrade-on-restore path (Phase 2b) walks it forward.
@@ -436,13 +437,21 @@ SECTIONS: tuple[Section, ...] = (
     ),
     Section(
         key="platform_internal",
-        label="Platform internals (alembic head / OUI vendor cache)",
+        label="Platform internals (alembic head / reference caches)",
         description=(
-            "Schema-version pin (``alembic_version``) and the "
-            "IEEE OUI vendor cache. These ride along with every "
-            "restore — selective restore can't deselect them."
+            "Schema-version pin (``alembic_version``), the IEEE OUI "
+            "vendor cache, and the refreshed IANA TLD list. These ride "
+            "along with every restore — selective restore can't deselect "
+            "them."
         ),
-        tables=("alembic_version", "oui_vendor"),
+        # tld_registry_snapshot (#986) sits here for the same reason as
+        # oui_vendor: it is an operator-refreshed copy of public reference
+        # data, not their configuration. Losing it costs one click of
+        # Refresh, and the list bundled with the release keeps working in
+        # the meantime — but it is still restored rather than dropped, or
+        # a restore would silently roll an install back to the bundled
+        # list and relabel any zone on a recently-delegated TLD.
+        tables=("alembic_version", "oui_vendor", "tld_registry_snapshot"),
         selectable=False,
     ),
 )
