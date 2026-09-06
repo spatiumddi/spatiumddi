@@ -251,13 +251,20 @@ python3 "$ROOT/.github/scripts/chart-cluster-scoped-collision.py" \
 # render a fresh appliance must never be given. A guard nothing tests is a
 # guard that stops working silently, and this one now has two ways to pass.
 echo "── negative control: priorityClasses.create=false without external must fail"
-if helm template neg "$APPLIANCE" --kube-version "$K8S_VERSION" \
-        --set dnsBind9.enabled=true \
-        --set priorityClasses.create=false >/dev/null 2>&1; then
-    echo "   FAIL: the render succeeded; the priorityClasses guard is not firing" >&2
-    failures=$((failures + 1))
+neg_out="$(helm template neg "$APPLIANCE" --kube-version "$K8S_VERSION" \
+    --set dnsBind9.enabled=true \
+    --set priorityClasses.create=false 2>&1)" && neg_rc=0 || neg_rc=$?
+# Grep the message, not just the exit code. ``helm template`` exits non-zero
+# for a syntax error, a bad --set path or a missing dependency too, so an
+# exit-code-only check would keep passing after the guard was deleted — the
+# control would then be asserting that the chart is broken, which it would
+# be, for a different reason.
+if [ "$neg_rc" -ne 0 ] && printf '%s' "$neg_out" | grep -q "priorityClasses.create is false"; then
+    echo "   ok: render refused by the priorityClasses guard"
 else
-    echo "   ok: render refused"
+    echo "   FAIL: expected the priorityClasses guard to refuse this render (rc=$neg_rc)" >&2
+    printf '%s\n' "$neg_out" | tail -5 >&2
+    failures=$((failures + 1))
 fi
 
 POSTURE_ARGS=""

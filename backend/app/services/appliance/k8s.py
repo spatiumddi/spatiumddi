@@ -282,10 +282,19 @@ _KUBELET_DIRECT_RETRY_S = 900.0
 # down under it.
 #
 # 1.5 s is the judgement that a kubelet on the same LAN which has not
-# completed a TCP handshake in that time is not going to. Getting it wrong is
-# cheap and self-correcting in the safe direction: a slow node is marked
-# blocked, served by the apiserver proxy, and re-probed 15 minutes later.
-_KUBELET_DIRECT_TIMEOUT_S = 1.5
+# completed a TCP handshake in that time is not going to.
+#
+# CONNECT ONLY. ``HTTPSConnection(timeout=…)`` sets one socket timeout that
+# also caps the response read, and 1.5 s is far too tight for that: a busy
+# node marshalling /stats/summary for a few hundred pods can legitimately
+# take seconds, and it would be blocked-direct for 15 minutes with a reason
+# indistinguishable from the firewall failure #993 exists to fix. So the
+# socket is re-armed with the read budget below immediately after connect.
+_KUBELET_CONNECT_TIMEOUT_S = 1.5
+# Read budget once the handshake is through. Matches the apiserver-proxy
+# path's own 6 s, so choosing the direct transport never costs a node the
+# patience the fallback would have given it.
+_KUBELET_READ_TIMEOUT_S = 6.0
 # PER NODE, keyed by node IP: ``{ip: (blocked_until_monotonic, reason)}``.
 #
 # Deliberately not one global flag. A single kubelet restarting would
@@ -373,9 +382,16 @@ def _get_stats_summary_direct(node_ip: str) -> tuple[int, dict[str, Any] | None]
         _block_direct(node_ip, f"cannot load kubelet CA bundle: {exc} (SPATIUM_KUBELET_CA_PATH?)")
         return 0, None
     conn = http.client.HTTPSConnection(
-        node_ip, _KUBELET_PORT, timeout=_KUBELET_DIRECT_TIMEOUT_S, context=ctx
+        node_ip, _KUBELET_PORT, timeout=_KUBELET_CONNECT_TIMEOUT_S, context=ctx
     )
     try:
+        # Connect under the short budget, then hand the open socket the long
+        # one. ``connect()`` is explicit rather than left to ``request()`` so
+        # there is a point at which to swap them; it is idempotent, so the
+        # request below reuses this connection rather than making a second.
+        conn.connect()
+        if conn.sock is not None:
+            conn.sock.settimeout(_KUBELET_READ_TIMEOUT_S)
         conn.request(
             "GET",
             "/stats/summary",

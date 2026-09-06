@@ -1289,6 +1289,20 @@ commit_slot_if_healthy() {
 # where the ``[ ! -f ... ]`` guard sees it and does not mint a second cert.
 place_deferred_tls_manifest() {
     [ -f "$TLS_CERT_MANIFEST_DEFERRED" ] || return 0
+    # #590 — the seed owns spatium-appliance-tls. A member that placed it
+    # would overwrite the CLUSTER's shared cert (possibly operator-uploaded
+    # or ACME-issued) with this node's throwaway self-signed one. The writer
+    # above is already guarded, but staging opens a second door: a boot
+    # interrupted between staging and placement leaves the file behind, and
+    # if the node is joined before the next boot this function would place
+    # it. spatium-cluster-join's manifest-aside glob now sweeps ``.deferred``
+    # too; this is the belt to that braces, since the guard is one line and
+    # the failure is silent.
+    if node_is_cluster_member; then
+        echo "Joined cluster member — discarding the staged TLS Secret manifest (the seed owns spatium-appliance-tls)."
+        rm -f "$TLS_CERT_MANIFEST_DEFERRED"
+        return 0
+    fi
     local up=0
     for _ in $(seq 1 24); do   # up to 2 min
         if /usr/local/bin/k3s kubectl get namespace spatium >/dev/null 2>&1; then
@@ -1375,7 +1389,7 @@ echo "      Check 'systemctl status k3s' + 'journalctl -u k3s'." >&2
 # already know is not answering, so skip straight to the rename. k3s applies
 # it whenever it recovers, and the Warning this staging exists to avoid is
 # the least of the operator's problems on this path.
-if [ -f "$TLS_CERT_MANIFEST_DEFERRED" ]; then
+if [ -f "$TLS_CERT_MANIFEST_DEFERRED" ] && ! node_is_cluster_member; then
     mv -f "$TLS_CERT_MANIFEST_DEFERRED" "$TLS_CERT_MANIFEST"
     chmod 0600 "$TLS_CERT_MANIFEST"
     echo "      placed the staged TLS Secret manifest anyway ($TLS_CERT_MANIFEST)." >&2

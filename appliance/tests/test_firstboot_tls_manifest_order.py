@@ -113,3 +113,52 @@ def test_the_namespace_is_owned_by_exactly_one_manifest() -> None:
     # …and it IS rendered by the bootstrap manifest, which is the one owner.
     assert "_render_namespace_yaml" in BODY
     assert "kind: Namespace" in BODY
+
+
+def test_both_placement_sites_refuse_on_a_joined_member() -> None:
+    """#590, through the door staging opened.
+
+    The seed owns ``spatium-appliance-tls``. The GENERATOR was already
+    guarded, but staging adds a second way in: a boot interrupted between
+    staging and placement leaves the file on disk, and if the node is joined
+    before the next boot, placement would overwrite the cluster's shared
+    cert — possibly operator-uploaded or ACME-issued — with this node's
+    throwaway self-signed one.
+
+    Both sites are asserted because they are reached on opposite paths: the
+    happy one after k3s reports ready, and the ``exit 1`` fallback after it
+    never does.
+    """
+    fn = BODY[BODY.index("place_deferred_tls_manifest() {") :]
+    fn = fn[: fn.index("\nplace_deferred_control_manifest() {")]
+    guard = fn.index("node_is_cluster_member")
+    assert guard < fn.index('mv -f "$TLS_CERT_MANIFEST_DEFERRED"')
+    # It discards rather than leaving the file to be retried forever.
+    assert 'rm -f "$TLS_CERT_MANIFEST_DEFERRED"' in fn
+
+    tail = BODY[BODY.index("WARN: k3s /readyz did not respond") :]
+    placement = tail[: tail.index("exit 1")]
+    assert "! node_is_cluster_member" in placement
+
+
+def test_the_join_sweeps_staged_manifests_aside_too() -> None:
+    """The other half of the same hole, and one this issue did not open.
+
+    ``spatium-cluster-join`` moves this node's own manifests aside so a
+    joined member cannot re-apply its releases into the seed's cluster — but
+    its glob was ``spatium-*.yaml``, which matches neither the TLS Secret's
+    new ``.deferred`` staging nor ``spatium-control.yaml.deferred``, which
+    has been staged that way since #277.
+    """
+    join = (
+        Path(__file__).parent.parent
+        / "mkosi.extra"
+        / "usr"
+        / "local"
+        / "bin"
+        / "spatium-cluster-join"
+    ).read_text()
+    assert 'mv -f "$K3S_MANIFESTS"/spatium-*.yaml* "$MANIFESTS_ASIDE/"' in join
+    # …and the rollback path restores what it moved, or a failed join
+    # strands the staged manifest in the aside directory forever.
+    assert join.count('mv -f "$MANIFESTS_ASIDE"/*.yaml* "$K3S_MANIFESTS/"') == 2

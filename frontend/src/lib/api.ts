@@ -10956,6 +10956,10 @@ export type FirewallSourceKind =
   | "pod_cidr"
   | "service_cidr"
   | "kubeapi"
+  // #993 — pod ∪ service, WITHOUT the operator's kubeapi_expose allowlist.
+  // Kept out of that union on purpose: it widens the RBAC-guarded
+  // apiserver, and the kubelet API serves /exec, /run and /attach.
+  | "kubelet"
   | "mgmt"
   | "vip";
 

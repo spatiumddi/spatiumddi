@@ -4262,9 +4262,9 @@ function ToolsMenu({
 // "extract SyncMenu" into "there is a primitive and everything uses it".
 // Renamed off ``HeaderMenu`` because the shared primitive owns that name.
 //
-// The ``| null`` item shape and ``onClick`` naming are kept so both call
-// sites are untouched: they build lists with inline conditionals that read
-// better as ``cond ? {...} : null`` than as a spread. Entries with no
+// The ``| null`` item shape and ``onClick`` naming are kept so its call
+// site is untouched: it builds the list with an inline conditional that
+// reads better as ``cond ? {...} : null`` than as a spread. Entries with no
 // handler are dropped, and a menu left with nothing renders nothing.
 function ActionsMenu({
   label = "Tools",
