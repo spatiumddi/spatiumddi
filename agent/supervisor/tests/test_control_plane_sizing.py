@@ -66,21 +66,41 @@ _SIZES = [
 
 
 def _bash_sizing(mem_mib: int) -> dict[str, int]:
-    """Run firstboot's own arithmetic for a given MemTotal."""
+    """Run firstboot's own arithmetic — INCLUDING its call arguments.
+
+    The first version of this extracted the generic ``_clamp_mib`` helper and
+    then supplied ``1 2 1024 8192`` / ``1 4 1024 4096`` / ``12288`` from the
+    test. Those literals ARE the copy of the formula, so the guard covered
+    everything except the numbers that can drift: a review changed firstboot's
+    api fraction to 1/3 and all 13 sizing tests plus all 507 appliance tests
+    stayed green.
+
+    Now the invocation lines are extracted with anchored regexes and each
+    match is asserted, so a retuned constant either moves the test with it or
+    fails the extraction outright.
+    """
     src = FIRSTBOOT.read_text(encoding="utf-8")
-    # Indentation-tolerant: the helper lives inside
-    # _render_control_helmchart, so it is indented four spaces. A
-    # ``^_clamp_mib`` anchor silently matched nothing when it moved there,
-    # and every case failed at once rather than the formula being wrong.
-    clamp = re.search(r"^[ \t]*_clamp_mib\(\) \{.*?^[ \t]*\}", src, re.DOTALL | re.MULTILINE)
+    clamp = re.search(r"^[ \t]*_clamp_mib\(\) \{.*?^[ \t]*\}", src, re.S | re.MULTILINE)
     assert clamp, "firstboot no longer defines _clamp_mib"
+
+    api = re.search(
+        r'API_MEM_MIB=\$\(_clamp_mib "\$MEM_TOTAL_MIB" (\d+) (\d+) (\d+) (\d+)\)', src
+    )
+    assert api, "could not find firstboot's API_MEM_MIB invocation"
+    wrk = re.search(
+        r'WORKER_MEM_MIB=\$\(_clamp_mib "\$MEM_TOTAL_MIB" (\d+) (\d+) (\d+) (\d+)\)', src
+    )
+    assert wrk, "could not find firstboot's WORKER_MEM_MIB invocation"
+    thr = re.search(r'\[ "\$MEM_TOTAL_MIB" -le (\d+) \]; then WORKER_CONCURRENCY=(\d+); else WORKER_CONCURRENCY=(\d+)', src)
+    assert thr, "could not find firstboot's concurrency threshold"
+
     script = f"""
         set -euo pipefail
         {textwrap.dedent(clamp.group(0))}
         MEM_TOTAL_MIB={mem_mib}
-        API_MEM_MIB=$(_clamp_mib "$MEM_TOTAL_MIB" 1 2 1024 8192)
-        WORKER_MEM_MIB=$(_clamp_mib "$MEM_TOTAL_MIB" 1 4 1024 4096)
-        if [ "$MEM_TOTAL_MIB" -le 12288 ]; then C=2; else C=4; fi
+        API_MEM_MIB=$(_clamp_mib "$MEM_TOTAL_MIB" {api.group(1)} {api.group(2)} {api.group(3)} {api.group(4)})
+        WORKER_MEM_MIB=$(_clamp_mib "$MEM_TOTAL_MIB" {wrk.group(1)} {wrk.group(2)} {wrk.group(3)} {wrk.group(4)})
+        if [ "$MEM_TOTAL_MIB" -le {thr.group(1)} ]; then C={thr.group(2)}; else C={thr.group(3)}; fi
         echo "$API_MEM_MIB $WORKER_MEM_MIB $C"
     """
     out = subprocess.run(

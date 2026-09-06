@@ -144,17 +144,21 @@ esac
 log "===== spatium-install wizard started at $(date -Iseconds) ====="
 
 on_cancel() {
+    # ${1:-} — this runs on the way OUT, so it must not itself die. A bare
+    # `on_cancel` call read $1 under `set -u`, printed "$1: unbound variable"
+    # and exited 127 without the message OR the login shell.
+    local where="${1:-unknown step}"
     set +x
     clear
     cat <<EOF
 
-Installation cancelled at: $1
+Installation cancelled at: $where
 
 Run 'spatium-install' to start the wizard again,
 or 'reboot' to leave the live ISO and try a different boot path.
 
 EOF
-    log "Wizard cancelled at: $1"
+    log "Wizard cancelled at: $where"
     exec /bin/bash --login
 }
 
@@ -528,6 +532,7 @@ preflight() {
     whiptail --backtitle "$BACKTITLE" --title "$title" \
         --cancel-button "Back" \
         --yesno "$body\nContinue?" \
+        --scrolltext \
         "$(_whiptail_height "$body\nContinue?" 76)" 76 \
         || return 1
     log "Pre-flight: cpus=$cpus ram=${ram_gb}G disks=$disk_count nics_up=$nic_up warnings=$warn_count"
@@ -565,7 +570,15 @@ ask_keyboard() {
     fi
     # Ordered by how likely they are rather than alphabetically — a menu
     # is scanned, not searched — plus an escape hatch for the rest.
+    #
+    # Outer loop so Back out of "Something else" returns to THIS menu rather
+    # than leaving the screen: picking the escape hatch and changing your
+    # mind is not the same gesture as going back a wizard step. (`return 2`
+    # would be the wrong way to express that — the screen has drawn, and
+    # claiming otherwise is the inverted-#554 bug just fixed in
+    # ask_application_config.)
     local pick
+    while true; do
     pick=$(whiptail --backtitle "$BACKTITLE" --title "Keyboard layout" \
         --cancel-button "Back" \
         --default-item "$KEYMAP" \
@@ -598,7 +611,7 @@ ask_keyboard() {
                 --cancel-button "Back" \
                 --inputbox "Keyboard layout code (e.g. 'be', 'hu', 'tr', 'gr').\n\nThese are XKB layout names - the two-letter code for the country in most cases. From a shell: localectl list-x11-keymap-layouts" \
                 14 70 -- "$KEYMAP" 3>&1 1>&2 2>&3) \
-                || return 1
+                || continue 2
             # Refuse a layout that cannot be applied, rather than
             # silently leaving the operator on US — the same bug one
             # screen later in a different disguise. #1003 item 1a: this
@@ -614,6 +627,8 @@ ask_keyboard() {
         _apply_keymap "$pick" || \
             log "WARN: could not apply keymap $pick; the console stays on the previous layout"
     fi
+    break
+    done
     KEYMAP="$pick"
     log "Keymap: $KEYMAP"
 }
@@ -1070,6 +1085,7 @@ _probe_control_plane() {
 }
 
 ask_application_config() {
+    local _drew_something=0
     # Only fires for the Appliance role. The control-plane role IS a
     # control plane — it doesn't need to be told where one is.
     # (Function/step name kept historical to avoid churning the wizard
@@ -1082,6 +1098,7 @@ ask_application_config() {
     if [ -n "${PRESEED_HAS_CONTROL_URL:-}" ]; then
         log "Preseed: control_plane_url=$CONTROL_PLANE_URL (skipping prompt)"
     else
+        _drew_something=1
         local default_url="${CONTROL_PLANE_URL:-https://}"
         while true; do
             # Re-prefill whatever was last typed, so Retry / Edit do not
@@ -1142,6 +1159,16 @@ ask_application_config() {
     # console.
     if [ -n "${PRESEED_HAS_PAIRING_CODE:-}" ]; then
         log "Preseed: pairing code supplied (skipping prompt)"
+        # ...but only "drew nothing" if the URL half drew nothing either.
+        # The two preseed keys are INDEPENDENT — the parser accepts a
+        # pairing code with no control_plane_url and only note()s it — so
+        # this path could draw the URL inputbox plus the reachability
+        # msgbox and then return 2. The state machine reads 2 as "keep
+        # going the way you were going", so a Back press from `confirm`
+        # landed here, took an answer, and then continued BACKWARDS to
+        # ask_k3s_cidrs instead of forward to confirm. The #554 class,
+        # inverted.
+        [ "$_drew_something" = "1" ] && return 0
         return 2
     fi
     # #995 item 1 (prerequisite) — tracing OFF for the whole loop, exactly
@@ -1410,7 +1437,19 @@ pick_disk() {
         # (vendor strings run to 40+ chars) and the least load-bearing, where
         # the size and the two flags are what the operator is choosing on.
         local budget=$((_DISK_ITEM_COLS - ${#size} - ${#suffix} - 3))
-        [ "$budget" -lt 8 ] && budget=8
+        if [ "$budget" -lt 8 ]; then
+            # Clip the SUFFIX, do not floor-restore the budget. `budget=8`
+            # alone hands back up to 7 columns that were already spent, so
+            # the emitted item exceeds _DISK_ITEM_COLS — breaking the exact
+            # invariant this block exists to enforce. Reachable: a disk that
+            # is both a hazard AND carries an install whose version file is
+            # unreadable gives a 43-column suffix, and with a 17-column tag
+            # (/dev/mmcblk0boot0 — lsblk lists eMMC boot devices and the
+            # filter does not drop them) that destroys the frame, because
+            # newt sizes the tag column from the longest tag on the menu.
+            suffix=$(_ellipsis "$suffix" "$((_DISK_ITEM_COLS - ${#size} - 3 - 8))")
+            budget=8
+        fi
         options+=("/dev/$name" "$size - $(_ellipsis "$model" "$budget")$suffix")
     done < <(lsblk -dn -o NAME,SIZE,MODEL -r 2>/dev/null | grep -vE "^(sr|loop|fd|ram|zram)")
 
@@ -2095,7 +2134,7 @@ ask_network() {
             if ! perr=$(_validate_static_net); then
                 log "FATAL: preseed static network is invalid: $perr"
                 whiptail --msgbox "Preseed static network settings are invalid:\n\n$perr\n\nFix the answer file and reinstall." 16 72 || true
-                on_cancel
+                on_cancel "network (invalid preseeded static config)"
             fi
         fi
         return 2
@@ -2157,7 +2196,8 @@ ask_network() {
     fi
     NET_INTERFACE=$(whiptail --backtitle "$BACKTITLE" --title "Network interface" \
         --cancel-button "Back" \
-        --menu "$pick_hint" 20 "$_IF_MENU_W" 8 "${ifs[@]}" 3>&1 1>&2 2>&3) \
+        --menu "$pick_hint" "$(_whiptail_height "$pick_hint" "$_IF_MENU_W" 9)" \
+        "$_IF_MENU_W" 8 "${ifs[@]}" 3>&1 1>&2 2>&3) \
         || return 1
     [ "$NET_INTERFACE" = "any" ] && NET_INTERFACE=""
 
@@ -2363,7 +2403,7 @@ $note"
         choice=$(whiptail --backtitle "$BACKTITLE" --title "k3s networking" \
             --cancel-button "Back" \
             --default-item "$default_item" \
-            --menu "$body" "$(_whiptail_height "$body" "$w" 2)" "$w" 2 \
+            --menu "$body" "$(_whiptail_height "$body" "$w" 3)" "$w" 2 \
             "accept" "Use these ranges" \
             "change" "Change them..." \
             3>&1 1>&2 2>&3) \
@@ -2400,10 +2440,14 @@ $note"
         # both), and showing the masked form back tells the operator what
         # their host-bits-set entry actually meant. _k3s_cidr_canonical
         # passes an unparseable string through, so a typo is echoed verbatim
-        # to be corrected. Either way the loop redraws the summary with the
-        # new values, and _validate_k3s_cidrs has already explained any
-        # problem — so a bad entry lands back on a screen that SHOWS the
-        # state rather than on a bare re-prompt.
+        # to be corrected. A bad entry then lands back on a screen that
+        # SHOWS the state rather than on a bare re-prompt, with
+        # _validate_k3s_cidrs having already explained the problem.
+        #
+        # Back out of either inputbox is a different thing: it `continue`s
+        # without committing, so the edit is DISCARDED and the summary
+        # redraws with the values it had. Back means "cancel this edit",
+        # not "keep what I typed so far".
         if _validate_k3s_cidrs "$pod" "$svc"; then
             K3S_POD_CIDR=$(_k3s_cidr_canonical "$pod")
             K3S_SERVICE_CIDR=$(_k3s_cidr_canonical "$svc")
@@ -2570,8 +2614,15 @@ _whiptail_height() {
     # $3 (optional): extra rows the dialog needs beyond its body — a
     # --menu's list height, which whiptail reserves on top of the message
     # area rather than inside it. Without it a menu sized from its body
-    # alone silently clips the last lines of the message (#996 saw the
-    # same thing eat a Confirm screen's ERASE warning).
+    # alone silently clips the last lines of the message (#995 item 28 saw
+    # the same thing eat a Confirm screen's ERASE warning).
+    #
+    # A --menu wants LIST_HEIGHT + 1: measured against a real 80x24 pty, a
+    # menu is text_rows + list_rows + 7 of chrome while this function adds
+    # 6, so passing the bare list height is short by exactly one row and
+    # drops the LAST wrapped line. That is not a cosmetic loss — on the k3s
+    # screen the dropped line was the sentence naming the fix for the very
+    # PROBLEM the screen had just reported.
     local body="$1" width="$2" extra="${3:-0}" rows term h
     rows=$(printf '%b\n' "$body" | fold -s -w "$((width - 4))" | wc -l | tr -d ' ')
     case "$rows" in ''|*[!0-9]*) rows=20 ;; esac
@@ -2790,6 +2841,7 @@ confirm() {
     whiptail --backtitle "$BACKTITLE" --title "Review" \
         --cancel-button "Back" \
         --yes-button "Continue" --no-button "Back" \
+        --scrolltext \
         --yesno "$s" "$(_whiptail_height "$s" 76)" 76 \
         || return 1
 
@@ -2806,7 +2858,7 @@ confirm() {
         "pick_disk"     "Target disk        $(_ellipsis "$TARGET_DISK" "$_CONF_VAL_COLS")" \
         "ask_role"      "Role               $ROLE" \
         "ask_hostname"  "Hostname           $(_ellipsis "$HOSTNAME" "$_CONF_VAL_COLS")" \
-        "ask_user_password" "Admin account  $(_ellipsis "$ADMIN_USER" "$_CONF_VAL_COLS")" \
+        "ask_user_password" "Admin account      $(_ellipsis "$ADMIN_USER" "$_CONF_VAL_COLS")" \
         "ask_ssh_keys"  "SSH keys           $nkeys authorised" \
         "ask_network"   "Network            $NET_MODE" \
         "ask_timezone"  "Timezone           $(_ellipsis "$TIMEZONE" "$_CONF_VAL_COLS")" \
@@ -2972,20 +3024,6 @@ _dm_maps_on_target() {
     done
 }
 
-# The gate that makes an unreleased device-mapper map a refusal rather
-# than a corruption (#995 item 10).
-#
-# Measured, not assumed: with a live dm map holding the disk open,
-# `wipefs -af` returns 0 and erases the signatures, `sgdisk -Z` returns 0
-# and writes a new table, and only `blockdev --rereadpt` fails — which
-# do_install deliberately tolerates with `|| true` because it is
-# advisory. The kernel therefore keeps the STALE partition table, and the
-# very next step formats `$ESP` / `$ROOT_A` / `$VAR`, which still resolve
-# to the old extents. The disk ends up destroyed and the install reports
-# a different failure later, or none.
-#
-# So the release has to be verified here, while nothing has been written.
-# Runs after the teardown loop and before `wipefs`.
 # Run a release command whose failure is expected and uninteresting.
 #
 # #1003 item 7. "not mounted" and swapoff's "Invalid argument" mean the
@@ -3017,6 +3055,20 @@ _release_quietly() {
     return 0
 }
 
+# The gate that makes an unreleased device-mapper map a refusal rather
+# than a corruption (#995 item 10).
+#
+# Measured, not assumed: with a live dm map holding the disk open,
+# `wipefs -af` returns 0 and erases the signatures, `sgdisk -Z` returns 0
+# and writes a new table, and only `blockdev --rereadpt` fails — which
+# do_install deliberately tolerates with `|| true` because it is
+# advisory. The kernel therefore keeps the STALE partition table, and the
+# very next step formats `$ESP` / `$ROOT_A` / `$VAR`, which still resolve
+# to the old extents. The disk ends up destroyed and the install reports
+# a different failure later, or none.
+#
+# So the release has to be verified here, while nothing has been written.
+# Runs after the teardown loop and before `wipefs`.
 _assert_target_released() {
     local remaining
     remaining=$(_dm_maps_on_target "$TARGET_DISK" | tr '\n' ' ')
@@ -4704,7 +4756,14 @@ $done_body"
     # instead of Enter aborts a SUCCESSFUL install, and `systemctl reboot`
     # below never runs. Same reasoning as the #554 comment on the unmount
     # loop above.
+    # --scrolltext: _whiptail_height clamps to the terminal, and whiptail
+    # then TRUNCATES the tail rather than scrolling it. On an 80x24 console
+    # with BOOT_LEG_WARNING or a VERIFY_FAIL_FILE prepended, the lines lost
+    # are the last three — the install-log path (#995 item 1's entire
+    # deliverable), the answers-file path, and "Press OK to reboot" — and
+    # they vanish on exactly the failure path that needs them.
     whiptail --backtitle "$BACKTITLE" --title "Done" \
+        --scrolltext \
         --msgbox "$done_body" "$(_whiptail_height "$done_body" 76)" 76 || true
     else
         log "Fully unattended: install complete on $TARGET_DISK — skipping the interactive Done prompt and rebooting straight into the installed system."

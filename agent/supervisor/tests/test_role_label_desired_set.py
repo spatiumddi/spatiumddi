@@ -26,6 +26,8 @@ computation the patch used.
 
 from __future__ import annotations
 
+import inspect
+
 import pytest
 
 from spatium_supervisor import appliance_state, k8s_api, service_lifecycle
@@ -80,9 +82,12 @@ def test_reconcile_and_apply_agree_on_the_same_tick(
 ) -> None:
     """THE REGRESSION. Both writers run per tick; they must not disagree.
 
-    Driven through ``desired_role_set`` rather than through
-    ``apply_role_assignment`` end-to-end, which would need a compose env
-    file, a rendered chart and a live kubeapi — none of which is what broke.
+    Asserts on the SHARED writer, and separately that neither caller builds
+    its own diff — because the first version of this test re-implemented
+    ``apply_role_assignment``'s diff in the test body, and a review proved
+    that reverting the fix to the exact pre-#1003 expression left all 339
+    supervisor tests green. A test that reimplements the code it guards is
+    testing the reimplementation.
     """
     _as_control_plane(monkeypatch)
     profiles = ["dns-bind9"]
@@ -90,34 +95,34 @@ def test_reconcile_and_apply_agree_on_the_same_tick(
     service_lifecycle.reconcile_node_labels(profiles)
     reconcile_diff = captured[-1]
 
-    roles = service_lifecycle.desired_role_set(profiles)
-    apply_diff = {
-        label: ("true" if role in roles else None)
-        for role, label in service_lifecycle._ROLE_LABEL_KEYS.items()
-    }
-
-    assert apply_diff == reconcile_diff, (
-        "the two writers disagree — whichever runs second wins, and on the "
-        "reported box that was the one clearing role-control-plane"
-    )
-    assert apply_diff["spatium.io/role-control-plane"] == "true"
+    assert service_lifecycle.role_label_diff(profiles) == reconcile_diff
+    assert reconcile_diff["spatium.io/role-control-plane"] == "true"
 
 
-def test_the_old_profiles_only_computation_would_have_cleared_it(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Negative control, kept in the file.
+def test_neither_writer_builds_its_own_diff() -> None:
+    """The structural half, and the one that actually catches the revert.
 
-    Pins WHY the shared helper exists: the pre-fix expression is still
-    perfectly valid Python, so without this the fix could be reverted to it
-    and every other test here would still pass.
+    ``apply_role_assignment`` clearing a label it computed from ``profiles``
+    alone IS the bug. Both writers must go through ``role_label_diff``, and
+    neither may contain the profiles-only comprehension.
     """
-    _as_control_plane(monkeypatch)
-    profiles = ["dns-bind9"]
-
-    old = {p for p in profiles if p in service_lifecycle._ROLE_LABEL_KEYS}
-    assert "control-plane" not in old, "the pre-fix expression, reproduced"
-    assert "control-plane" in service_lifecycle.desired_role_set(profiles)
+    for fn in (
+        service_lifecycle.apply_role_assignment,
+        service_lifecycle.reconcile_node_labels,
+    ):
+        # Comments stripped: apply_role_assignment's own comment QUOTES the
+        # pre-#1003 expression to explain the bug, so a raw substring test
+        # matches the explanation and reports the defect as still present.
+        # Third time that trap has fired on this branch.
+        src = "\n".join(
+            ln
+            for ln in inspect.getsource(fn).splitlines()
+            if not ln.lstrip().startswith("#")
+        )
+        assert "role_label_diff(profiles)" in src, f"{fn.__name__} builds its own diff"
+        assert "{p for p in profiles" not in src, (
+            f"{fn.__name__} contains the pre-#1003 profiles-only set comprehension"
+        )
 
 
 def test_a_role_the_operator_removed_is_still_cleared(

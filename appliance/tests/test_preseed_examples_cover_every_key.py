@@ -34,7 +34,13 @@ _PARSER = (BIN / "spatium-preseed-parse").read_text(encoding="utf-8")
 _EXAMPLES = BIN.parents[3] / "cloud-init"  # appliance/cloud-init
 
 # Keys read from each mapping level, straight out of the parser.
-_TOP = sorted(set(re.findall(r'ps\.get\("([a-z_0-9]+)"', _PARSER)))
+# Both spellings: the parser reads `role` and `confirm_wipe` with a
+# SUBSCRIPT (`ps["role"]`), not `.get()`, so a `.get`-only sweep silently
+# omitted them and "every key the parser accepts" was overstated.
+_TOP = sorted(
+    set(re.findall(r'ps\.get\("([a-z_0-9]+)"', _PARSER))
+    | set(re.findall(r'ps\["([a-z_0-9]+)"\]', _PARSER))
+)
 _NET = sorted(set(re.findall(r'net\.get\("([a-z_0-9]+)"', _PARSER)))
 _K3S = sorted(set(re.findall(r'k3s\.get\("([a-z_0-9]+)"', _PARSER)))
 

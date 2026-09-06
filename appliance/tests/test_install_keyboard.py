@@ -79,10 +79,22 @@ def test_apply_keymap_builds_args_as_an_array() -> None:
 
 
 def test_vconsole_is_not_written_when_it_is_the_same_file() -> None:
-    """The clobber: vconsole.conf is a symlink to default/keyboard."""
-    assert "readlink -f" in CODE
-    # The bare KEYMAP= write that destroyed the XKB block must be gone.
-    assert "printf 'KEYMAP=%s\\n' \"$KEYMAP\" > \"$MOUNT/etc/vconsole.conf\"" not in CODE
+    """The clobber: vconsole.conf is a symlink to default/keyboard.
+
+    Anchored on the two SPECIFIC resolutions, not on ``"readlink -f" in
+    CODE`` — that string occurs eight times in this file (disk by-id, NIC
+    driver, disk resolution) and six of them are unrelated, so the loose
+    version passed with the whole guard deleted.
+    """
+    assert 'readlink -f "$_vc"' in CODE, "vconsole.conf path is not resolved"
+    assert 'readlink -f "$_kbf"' in CODE, "default/keyboard path is not resolved"
+    # Any unconditional write to vconsole.conf re-creates the clobber,
+    # whatever its spelling — the old test only caught the byte-identical
+    # historical one.
+    for spelling in ('> "$MOUNT/etc/vconsole.conf"', '> "$_vc"'):
+        for ln in CODE.splitlines():
+            if spelling in ln and "KEYMAP=" in ln:
+                raise AssertionError(f"unconditional KEYMAP write to vconsole: {ln.strip()}")
 
 
 def test_persisted_block_carries_xkbmodel() -> None:

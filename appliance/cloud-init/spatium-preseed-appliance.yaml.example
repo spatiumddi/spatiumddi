@@ -29,9 +29,13 @@ spatium_preseed:
   # before the password prompt and persisted. Default us.
   keymap: us
 
-  # Time source (#995 item 16). String or list. Also seeds the node's
-  # initial NTP config (#1003 item 2). Note that leaving it empty does
-  # NOT disable NTP — Debian's own pool directive stays (#1002).
+  # Time source (#995 item 16). String or list. Written to
+  # /etc/chrony/sources.d/spatium-install.sources.
+  #
+  # NOTE: the #1003 item 2 seeding of the platform's initial
+  # ntp_pool_servers happens on a FIRST NODE only — an Additional node runs
+  # no api pod, so this answer is superseded the moment the control plane
+  # pushes NTP (#154). Set the fleet-wide value there instead.
   ntp_servers: pool.ntp.org
 
   # SSH bootstrap keys for the admin account (#995 item 18). Replaced by
@@ -65,8 +69,10 @@ spatium_preseed:
   # A k3s server refuses to join a cluster whose cluster-cidr /
   # service-cidr differ from the datastore's, so pinning them here would
   # make this node impossible to PROMOTE into the control plane later.
-  # The join inherits the seed's values. Left here, commented, because
-  # the parser still accepts the block for a standalone appliance.
+  # The join inherits the seed's values. Left here, commented, because the
+  # parser TOLERATES the block rather than failing on it: for role=appliance
+  # it warns and DISCARDS the values, so one answer file can be shared
+  # between both roles. Uncommenting it has no effect beyond that warning.
   # k3s:
   #   pod_cidr: 10.42.0.0/16
   #   service_cidr: 10.43.0.0/16

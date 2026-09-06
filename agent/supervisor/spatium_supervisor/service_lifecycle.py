@@ -310,6 +310,20 @@ def _read_chart_tarball() -> bytes:
     return _BAKED_CHART_TARBALL.read_bytes()
 
 
+def role_label_diff(profiles: list[str]) -> dict[str, str | None]:
+    """The label patch this node needs — the ONE definition of the WRITE.
+
+    :func:`desired_role_set` unified what the desired set IS; this unifies
+    what gets PATCHed from it. Both matter, and only unifying the first left
+    the actual defect reachable: a writer could still build its own diff from
+    ``profiles`` alone, which is precisely the #1003 item 3 bug, and a review
+    of that fix showed the whole supervisor suite stayed green after
+    reverting to it.
+    """
+    roles = desired_role_set(profiles)
+    return {label: ("true" if role in roles else None) for role, label in _ROLE_LABEL_KEYS.items()}
+
+
 def _resolve_node_name() -> str:
     """This node's k8s name, or "" when it cannot be determined."""
     node_name = os.environ.get("NODE_NAME") or os.environ.get("APPLIANCE_HOSTNAME") or ""
@@ -420,10 +434,7 @@ def apply_role_assignment(
     # This used to be `{p for p in profiles ...}`, which omitted the
     # variant-fixed roles and the promoted-member case, so this call CLEARED
     # the control-plane label that the reconcile had just asserted.
-    roles = desired_role_set(profiles)
-    label_diff: dict[str, str | None] = {}
-    for role, label in _ROLE_LABEL_KEYS.items():
-        label_diff[label] = "true" if role in roles else None
+    label_diff = role_label_diff(profiles)
     node_name = _resolve_node_name()
     if node_name:
         label_ok, label_err = k8s_api.patch_node_labels(node_name, label_diff)
@@ -477,10 +488,7 @@ def reconcile_node_labels(profiles: list[str]) -> tuple[bool, str | None]:
     Returns ``(ok, error_or_None)`` — caller logs but doesn't act
     on failure (next heartbeat re-attempts).
     """
-    roles = desired_role_set(profiles)
-    label_diff: dict[str, str | None] = {}
-    for role, label in _ROLE_LABEL_KEYS.items():
-        label_diff[label] = "true" if role in roles else None
+    label_diff = role_label_diff(profiles)
     node_name = _resolve_node_name()
     if not node_name:
         return False, "node_name unknown"

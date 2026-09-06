@@ -43,7 +43,12 @@ def _initial_ntp_servers() -> list[str]:
     created outside the ORM gets, and an installer answer is not available at
     DDL time anyway.
     """
-    from app.config import settings  # noqa: PLC0415  — module-level would cycle
+    # Deferred purely to keep this model module import-light; there is no
+    # cycle to avoid (app.config imports only sys + pydantic), so the
+    # justification this line used to carry was wrong. Either form works —
+    # `settings` attributes are read at call time regardless, which is what
+    # matters, since this must reflect the env at ROW CREATION.
+    from app.config import settings  # noqa: PLC0415
 
     servers = (settings.initial_ntp_servers or "").split()
     return servers or ["pool.ntp.org"]

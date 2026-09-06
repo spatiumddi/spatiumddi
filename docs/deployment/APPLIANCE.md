@@ -1433,9 +1433,9 @@ trigger: tag push (CalVer)
 >   internet** — non-negotiable #17 — so an air-gapped install is a
 >   normal case rather than a red line.
 > - **Keyboard layout**, applied immediately with `loadkeys` so the
->   password screen already uses it, and persisted to both
->   `/etc/default/keyboard` (console-setup) and `/etc/vconsole.conf`
->   (systemd-vconsole-setup). On AZERTY or QWERTZ the symbols in a good
+>   password screen already uses it (compiled with `ckbcomp`, since the
+>   image ships no console keymaps at all), and persisted as an XKB block to
+>   `/etc/default/keyboard`. On AZERTY or QWERTZ the symbols in a good
 >   password land elsewhere; the installer stored what US produced and
 >   the login later failed with no explanation, twice.
 > - **NTP**, pre-filled from the DHCP lease's option 42 when the site
@@ -1443,7 +1443,12 @@ trigger: tag push (CalVer)
 >   chrony is already using). Written as a `sources.d` file rather than
 >   an edit to `chrony.conf`, which makes it additive and gives the #154
 >   control-plane plane a clean seam — that runner now deletes it when
->   central config takes over, so the two cannot silently stack.
+>   central config takes over, so the two cannot silently stack. On a
+>   First node the answer is ALSO seeded as the platform's initial
+>   `ntp_pool_servers` (#1003 item 2), so what the operator typed is what
+>   the central plane pushes back rather than the public pool. An
+>   Additional node has no api pod, so there the answer is superseded on
+>   the first push and the fleet value has to be set centrally.
 > - **SSH public key** for the admin account: paste, or fetch from a URL
 >   or a bare GitHub username. Validated with `ssh-keygen`, not a regex —
 >   a truncated paste is the common failure and a key sshd will not load
