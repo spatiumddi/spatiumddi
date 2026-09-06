@@ -2960,7 +2960,15 @@ def _psi_avg300(psi: Any, kind: str) -> float | None:
     if not isinstance(series, dict):
         return None
     val = series.get("avg300")
-    return float(val) if isinstance(val, (int, float)) else None
+    # ``bool`` is an ``int`` subclass, so a JSON ``true`` would arrive as 1.0
+    # and read as a real one-percent stall. Unreachable through the live path
+    # today — ``cluster_health._parse_psi`` filters it first — but the two
+    # functions parsing the same wire shape must not disagree about what
+    # counts as a number, or a change to that filter turns into a phantom
+    # alert here with nothing to point at.
+    if isinstance(val, bool) or not isinstance(val, (int, float)):
+        return None
+    return float(val)
 
 
 async def _matching_agent_config_rejected_subjects(

@@ -199,7 +199,21 @@ async def test_each_node_is_its_own_subject(monkeypatch, _appliance):
 
 
 @pytest.mark.parametrize(
-    "block", [None, {}, "psi", {"some": None}, {"some": {}}, {"some": {"avg300": "x"}}]
+    "block",
+    [
+        None,
+        {},
+        "psi",
+        {"some": None},
+        {"some": {}},
+        {"some": {"avg300": "x"}},
+        # bool is an int subclass — ``True`` would otherwise become 1.0 and
+        # read as a real one-percent stall. The sibling parser in
+        # cluster_health filters it; these two must agree about what counts
+        # as a number.
+        {"some": {"avg300": True}},
+        {"some": {"avg300": False}},
+    ],
 )
 def test_psi_avg300_returns_none_for_anything_unusable(block):
     assert alerts._psi_avg300(block, "some") is None
