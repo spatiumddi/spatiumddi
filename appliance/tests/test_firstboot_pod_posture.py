@@ -150,6 +150,65 @@ def test_the_node_selector_gate_still_renders(tmp_path: Path) -> None:
     }
 
 
+# ── The render functions must emit ONLY the manifest ────────────────────────
+#
+# `_render_control_helmchart`'s STDOUT IS THE MANIFEST — the caller runs it
+# inside `{ ... } > "$tmp"`. A stray `echo` is therefore captured into
+# spatium-control.yaml, and the damage depends on the text: one containing
+# ": " parses as a junk top-level key on the HelmChart CR (survivable, and
+# invisible to every test that asserts only on named keys), while one WITHOUT
+# a colon makes the whole document unparseable — k3s cannot decode it,
+# spatium-control never installs, and the control plane never comes up.
+#
+# That shipped: #1003 item 4 added two progress lines here, and the
+# MemTotal-unreadable branch was the fatal one. The tests that were supposed
+# to cover item 4 were structural string matches against the source, so they
+# saw nothing. These render and parse instead.
+
+
+def test_control_manifest_has_no_stray_top_level_keys() -> None:
+    doc = yaml.safe_load(_run("_render_control_helmchart"))
+    assert set(doc) == {"apiVersion", "kind", "metadata", "spec"}, (
+        f"stray top-level keys {sorted(set(doc) - {'apiVersion','kind','metadata','spec'})} "
+        f"— something echoed to stdout inside the render function, and stdout "
+        f"is the manifest"
+    )
+
+
+def test_control_manifest_parses_when_memtotal_is_unreadable(tmp_path: Path) -> None:
+    """The branch that made the document undecodable.
+
+    Driven by pointing the reader at a nonexistent file, which is what an
+    unreadable /proc/meminfo amounts to. Must still be valid YAML AND must
+    leave the chart's own sizing defaults in place.
+    """
+    body = _extract_function("_render_control_helmchart")
+    # Neutralise the MemTotal read the same way a missing /proc/meminfo would.
+    body = body.replace("/proc/meminfo", str(tmp_path / "no-such-meminfo"))
+    proc = subprocess.run(
+        ["bash", "-c", f"{body}\n_render_control_helmchart\n"],
+        env={**os.environ, "CHART_TGZ": "/nonexistent/appliance.tgz"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    doc = yaml.safe_load(proc.stdout)  # raises ScannerError on the bug
+    assert set(doc) == {"apiVersion", "kind", "metadata", "spec"}
+    values = yaml.safe_load(doc["spec"]["valuesContent"])
+    assert "resources" not in (values.get("api") or {}), (
+        "with MemTotal unreadable the chart's own defaults must stand"
+    )
+
+
+def test_control_manifest_carries_the_sizing_when_memtotal_is_readable() -> None:
+    """The other half: the fragment must actually land inside `api:`."""
+    doc = yaml.safe_load(_run("_render_control_helmchart"))
+    values = yaml.safe_load(doc["spec"]["valuesContent"])
+    assert values["api"]["resources"]["limits"]["memory"].endswith("Mi")
+    assert values["worker"]["concurrency"] in (2, 4)
+
+
 def test_extractor_reports_a_missing_function() -> None:
     """Negative control for the harness itself: if ``_extract_function``
     quietly returned an empty string for an unknown name, every test above

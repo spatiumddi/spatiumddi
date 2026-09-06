@@ -37,7 +37,33 @@ def test_installer_still_records_the_answer_on_state() -> None:
 
 def test_firstboot_reads_it_off_state() -> None:
     assert "_state_cfg()" in FIRSTBOOT
-    assert "INITIAL_NTP_SERVERS=$(_state_cfg ntp_servers)" in FIRSTBOOT
+    assert "INITIAL_NTP_SERVERS_VAL=$(_state_cfg ntp_servers)" in FIRSTBOOT
+
+
+def test_the_value_is_backfilled_not_captured_once() -> None:
+    """STATE is mounted ``nofail``, which systemd does NOT order before
+    local-fs.target — so it may not be up when firstboot runs.
+
+    Writing the key at ``.env`` creation only would then record an empty
+    value permanently and lose what the operator typed, with #154 pushing
+    the public pool: item 2's bug reached from the other side. Absence is
+    the retry signal, so the read must live outside the first-boot block.
+    """
+    # The generation heredoc must NOT carry the key.
+    gen = FIRSTBOOT[FIRSTBOOT.index("cat > \"$ENV_FILE\" <<EOF") :]
+    gen = gen[: gen.index("\nEOF\n")]
+    assert "INITIAL_NTP_SERVERS" not in gen, (
+        "captured at .env creation only — a late STATE mount is then permanent"
+    )
+    assert 'if [ -z "$INITIAL_NTP_SERVERS_VAL" ]; then' in FIRSTBOOT
+
+
+def test_an_empty_answer_writes_no_key() -> None:
+    """Empty and absent must stay distinguishable in the file, so a declined
+    answer does not look like a value that failed to read."""
+    i = FIRSTBOOT.index('if [ -z "$INITIAL_NTP_SERVERS_VAL" ]; then')
+    block = FIRSTBOOT[i : i + 400]
+    assert 'if [ -n "$INITIAL_NTP_SERVERS_VAL" ]; then' in block
 
 
 def test_firstboot_reads_it_back_on_later_boots() -> None:

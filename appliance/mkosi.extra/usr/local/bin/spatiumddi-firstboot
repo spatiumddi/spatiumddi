@@ -340,7 +340,6 @@ APPLIANCE_ROLE=${ROLE}
 APPLIANCE_VERSION=${APPLIANCE_VERSION_VAL}
 APPLIANCE_HOSTNAME=${APPLIANCE_HOSTNAME_VAL}
 APPLIANCE_HOST_IPS=${APPLIANCE_HOST_IPS_VAL}
-INITIAL_NTP_SERVERS=$(_state_cfg ntp_servers)
 EOF
     # Mode 644 so the supervisor pod's unprivileged user (uid varies
     # per image) can read the file through the hostPath bind mount
@@ -539,6 +538,27 @@ LG_AGENT_KEY_VAL=$(_env_get LG_AGENT_KEY)
 if [ -z "$LG_AGENT_KEY_VAL" ] && [ "$APPLIANCE_ROLE_VAL" = "control-plane" ]; then
     LG_AGENT_KEY_VAL=$(gen_hex 24)
     printf 'LG_AGENT_KEY=%s\n' "$LG_AGENT_KEY_VAL" >> "$ENV_FILE"
+fi
+# #1003 item 2 — the installer's Time source answer, seeded from STATE.
+#
+# Backfilled on ANY boot where the key is absent, not written once at .env
+# creation. STATE is mounted `nofail`, and systemd does not order a nofail
+# mount before local-fs.target — so if it is not up when firstboot runs,
+# _state_cfg returns empty. Writing an empty line then would record "the
+# operator declined" permanently and lose what they actually typed, with the
+# #154 plane pushing the public pool: exactly the bug item 2 exists to fix,
+# arrived at from the other side.
+#
+# So absence is the retry signal and an EMPTY answer writes nothing. The two
+# are indistinguishable downstream anyway — models.settings._initial_ntp_servers
+# falls back to the platform default for both — so nothing is lost by leaving
+# a declined answer unwritten, and a late STATE mount is recovered on the
+# next boot.
+if [ -z "$INITIAL_NTP_SERVERS_VAL" ]; then
+    INITIAL_NTP_SERVERS_VAL=$(_state_cfg ntp_servers)
+    if [ -n "$INITIAL_NTP_SERVERS_VAL" ]; then
+        printf 'INITIAL_NTP_SERVERS=%s\n' "$INITIAL_NTP_SERVERS_VAL" >> "$ENV_FILE"
+    fi
 fi
 # In-cluster service DNS for the api. Matches the umbrella chart's
 # release name (``spatium-control``) + the workload suffix the
@@ -758,9 +778,19 @@ _render_control_helmchart() {
         WORKER_MEM_MIB=$(_clamp_mib "$MEM_TOTAL_MIB" 1 4 1024 4096)
         # _WORKER_SMALL_NODE_MIB = 12288.
         if [ "$MEM_TOTAL_MIB" -le 12288 ]; then WORKER_CONCURRENCY=2; else WORKER_CONCURRENCY=4; fi
-        echo "Sizing control plane for ${MEM_TOTAL_MIB} MiB: api=${API_MEM_MIB}Mi worker=${WORKER_MEM_MIB}Mi concurrency=${WORKER_CONCURRENCY}"
+        # >&2, NOT bare echo. THIS FUNCTION'S STDOUT IS THE MANIFEST: the
+        # caller runs it inside `{ ... } > "$tmp"`, so anything printed here
+        # is captured into spatium-control.yaml. The first line happens to
+        # contain ": " and so parsed as a junk top-level key on the HelmChart
+        # CR — survivable, and why every test still passed. The second has no
+        # colon, which makes the document UNPARSEABLE: k3s cannot decode it,
+        # spatium-control never installs, and the control plane never comes
+        # up, with a parse error in the k3s log as the only symptom.
+        # firstboot does `exec >>"$LOG" 2>&1` and the caller redirects only
+        # stdout, so stderr is still the log.
+        echo "Sizing control plane for ${MEM_TOTAL_MIB} MiB: api=${API_MEM_MIB}Mi worker=${WORKER_MEM_MIB}Mi concurrency=${WORKER_CONCURRENCY}" >&2
     else
-        echo "MemTotal unreadable — leaving the chart's default control-plane sizing in place"
+        echo "MemTotal unreadable — leaving the chart's default control-plane sizing in place" >&2
     fi
     # Rendered into the values block below. Empty string = emit nothing, so an
     # unreadable MemTotal leaves the chart's defaults untouched rather than
