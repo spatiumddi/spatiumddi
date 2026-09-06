@@ -2330,37 +2330,86 @@ ask_k3s_cidrs() {
         fi
         log "Preseed: k3s CIDRs conflict with the interactively-chosen network — prompting"
     fi
+    # ONE screen, defaults pre-chosen. This used to be two free-text
+    # inputboxes an operator had to tab through on every single install,
+    # retyping nothing and risking a fat-finger in a value that is almost
+    # always correct — the common path cost two prompts and offered two
+    # chances to break k3s. Now it costs one Enter, and the ranges are
+    # VISIBLE without entering an edit mode.
+    #
+    # The pre-check is what keeps the fast path honest. #995 item 22 exists
+    # because a LAN on 10.42.0.0/16 — the k3s pod default — collides with
+    # the default answer, so "Use these" must not become a way to walk past
+    # the one check that matters. _k3s_cidr_error is the QUIET validator
+    # (_validate_k3s_cidrs is the same test plus a msgbox), so the state is
+    # known before the menu is drawn: a conflict makes "Change" the default
+    # item and says why, and choosing "Use these" anyway still refuses.
     while true; do
+        local err note default_item body choice
+        err=$(_k3s_cidr_error "$K3S_POD_CIDR" "$K3S_SERVICE_CIDR" "$(_dhcp_lease_subnet)")
+        if [ -n "$err" ]; then
+            note="PROBLEM: $err"
+            default_item="change"
+        else
+            note="These are the k3s defaults and are right for almost every LAN. Checked against this machine's network - no conflict found."
+            default_item="accept"
+        fi
+        body="Internal ranges k3s uses. They never appear on your LAN.\n\n\
+  Pod CIDR       $K3S_POD_CIDR   (per-pod IPs)\n\
+  Service CIDR   $K3S_SERVICE_CIDR   (service ClusterIPs + cluster DNS)\n\n\
+$note"
+        local w
+        w=$(_whiptail_width 76)
+        choice=$(whiptail --backtitle "$BACKTITLE" --title "k3s networking" \
+            --cancel-button "Back" \
+            --default-item "$default_item" \
+            --menu "$body" "$(_whiptail_height "$body" "$w" 2)" "$w" 2 \
+            "accept" "Use these ranges" \
+            "change" "Change them..." \
+            3>&1 1>&2 2>&3) \
+            || return 1
+
+        if [ "$choice" = "accept" ]; then
+            # Re-run through the loud validator rather than trusting the
+            # pre-check: same test, and it is the one that explains itself.
+            if _validate_k3s_cidrs "$K3S_POD_CIDR" "$K3S_SERVICE_CIDR"; then
+                # Store the masked form, not the typed one — see
+                # _k3s_cidr_canonical (#974).
+                K3S_POD_CIDR=$(_k3s_cidr_canonical "$K3S_POD_CIDR")
+                K3S_SERVICE_CIDR=$(_k3s_cidr_canonical "$K3S_SERVICE_CIDR")
+                log "k3s CIDRs: pod=$K3S_POD_CIDR svc=$K3S_SERVICE_CIDR (accepted)"
+                return 0
+            fi
+            continue
+        fi
+
         local pod
         pod=$(whiptail --backtitle "$BACKTITLE" --title "k3s pod network" \
             --cancel-button "Back" \
-            --inputbox "Pod CIDR — internal range Flannel uses for per-pod IPs. Default works for most LANs; change only if your network already uses 10.42.x.x.\n\nIPv4 CIDR (e.g. 10.42.0.0/16):" \
+            --inputbox "Pod CIDR — internal range Flannel uses for per-pod IPs. Change only if your network already uses 10.42.x.x.\n\nIPv4 CIDR (e.g. 10.42.0.0/16):" \
             14 70 -- "$K3S_POD_CIDR" 3>&1 1>&2 2>&3) \
-            || return 1
+            || continue
         local svc
         svc=$(whiptail --backtitle "$BACKTITLE" --title "k3s service network" \
             --cancel-button "Back" \
             --inputbox "Service CIDR — internal range k8s uses for service ClusterIPs (incl. cluster DNS). Must not overlap with the pod CIDR or your LAN.\n\nIPv4 CIDR (e.g. 10.43.0.0/16):" \
             14 70 -- "$K3S_SERVICE_CIDR" 3>&1 1>&2 2>&3) \
-            || return 1
+            || continue
+        # Canonicalised whether or not they validate: the value that failed
+        # is not necessarily the one that was wrong (a pod/svc overlap fails
+        # both), and showing the masked form back tells the operator what
+        # their host-bits-set entry actually meant. _k3s_cidr_canonical
+        # passes an unparseable string through, so a typo is echoed verbatim
+        # to be corrected. Either way the loop redraws the summary with the
+        # new values, and _validate_k3s_cidrs has already explained any
+        # problem — so a bad entry lands back on a screen that SHOWS the
+        # state rather than on a bare re-prompt.
         if _validate_k3s_cidrs "$pod" "$svc"; then
-            # Store the masked form, not the typed one — see
-            # _k3s_cidr_canonical (#974).
             K3S_POD_CIDR=$(_k3s_cidr_canonical "$pod")
             K3S_SERVICE_CIDR=$(_k3s_cidr_canonical "$svc")
+            log "k3s CIDRs: pod=$K3S_POD_CIDR svc=$K3S_SERVICE_CIDR (operator-set)"
             return 0
         fi
-        # _validate_k3s_cidrs already showed the operator a msgbox
-        # with the reason — loop back to the pod CIDR prompt with the
-        # operator's just-typed values pre-filled so they don't lose
-        # them. Set the running defaults to what they typed so the
-        # next prompt-iteration's inputbox shows those values.
-        # Canonicalised like every other commit point: the value that
-        # failed is not necessarily the one that was wrong (a pod/svc
-        # overlap fails both), and pre-filling the masked form shows the
-        # operator what their host-bits-set entry actually meant.
-        # _k3s_cidr_canonical passes an unparseable string through, so a
-        # typo is still shown back verbatim to be corrected.
         K3S_POD_CIDR=$(_k3s_cidr_canonical "$pod")
         K3S_SERVICE_CIDR=$(_k3s_cidr_canonical "$svc")
     done
@@ -2518,7 +2567,12 @@ PY
 # escapes, which whiptail expands the same way — so the estimate is made
 # against what actually gets rendered.
 _whiptail_height() {
-    local body="$1" width="$2" rows term h
+    # $3 (optional): extra rows the dialog needs beyond its body — a
+    # --menu's list height, which whiptail reserves on top of the message
+    # area rather than inside it. Without it a menu sized from its body
+    # alone silently clips the last lines of the message (#996 saw the
+    # same thing eat a Confirm screen's ERASE warning).
+    local body="$1" width="$2" extra="${3:-0}" rows term h
     rows=$(printf '%b\n' "$body" | fold -s -w "$((width - 4))" | wc -l | tr -d ' ')
     case "$rows" in ''|*[!0-9]*) rows=20 ;; esac
     # stty is in coreutils (Essential); tput comes from ncurses-bin, which
@@ -2533,7 +2587,7 @@ _whiptail_height() {
     if [ "$term" -lt 12 ]; then
         term=24
     fi
-    h=$((rows + 6))
+    h=$((rows + 6 + extra))
     if [ "$h" -ge "$term" ]; then
         h=$((term - 1))
     fi
