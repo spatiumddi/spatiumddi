@@ -702,7 +702,10 @@ ask_ntp() {
     NTP_SERVERS="$ntp_pick"
     # Empty is a legitimate answer: an air-gapped site with a hardware
     # clock it trusts, or one that will push NTP from the control plane
-    # later. Recorded as "none" rather than silently reinstated.
+    # later. It writes no sources file — which is NOT the same as no time
+    # source, because Debian's chrony.conf keeps its own `pool` directive
+    # and sources.d is additive. Every surface says so rather than
+    # claiming "none"; making blank actually mean none is #1002.
     break
     done
     if [ -z "$NTP_SERVERS" ]; then
@@ -2537,7 +2540,7 @@ confirm() {
         s+="Keyboard:    $KEYMAP\n"
     fi
     if [ -z "$NTP_SERVERS" ]; then
-        s+="Time source: none (the clock is never corrected)\n"
+        s+="Time source: none given - Debian's default pool still applies\n"
     elif [ "$NTP_SERVERS" != "pool.ntp.org" ]; then
         s+="Time source: $NTP_SERVERS\n"
     fi
@@ -2615,7 +2618,7 @@ confirm() {
         "ask_ssh_keys"  "SSH keys           $nkeys authorised" \
         "ask_network"   "Network            $NET_MODE" \
         "ask_timezone"  "Timezone           $TIMEZONE" \
-        "ask_ntp"       "Time source        ${NTP_SERVERS:-none}" \
+        "ask_ntp"       "Time source        ${NTP_SERVERS:-Debian default pool}" \
         "ask_keyboard"  "Keyboard           $KEYMAP" \
         "install"       "*** INSTALL - $([ "$KEEP_VAR" = yes ] && echo "reinstall" || echo "erase") $TARGET_DISK ***" \
         3>&1 1>&2 2>&3) \
@@ -3807,9 +3810,15 @@ EOF
             chmod 0644 "$MOUNT/etc/chrony/sources.d/spatium-install.sources"
             log "NTP sources written: $NTP_SERVERS"
         else
-            # An empty answer is a real choice (air-gapped, trusted RTC),
-            # so record it as one rather than falling back to the Debian
-            # pool the operator just declined.
+            # An empty answer is a real choice (air-gapped, trusted RTC)
+            # and we honour it by writing no sources file. It does NOT
+            # silence chrony: `pool` in Debian's own chrony.conf is still
+            # there, and sources.d is additive, so the host keeps reaching
+            # the public pool. Suppressing that needs an edit to a dpkg
+            # conffile and a decision about DHCP-supplied servers in
+            # /run/chrony-dhcp — #1002. Do not let this comment drift from
+            # the log line below it again: it once claimed the opposite of
+            # what the code does, three lines above the line saying so.
             rm -f "$MOUNT/etc/chrony/sources.d/spatium-install.sources"
             log "NTP: no operator sources (Debian's default pool still applies from chrony.conf)"
         fi

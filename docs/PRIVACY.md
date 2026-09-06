@@ -127,7 +127,7 @@ network the way Debian hosts do:
 
 | Connection | Default | Change it under |
 |---|---|---|
-| `pool.ntp.org` — time sync | on | The disk installer's **Time source** screen (or the `ntp_servers` preseed key) sets it at install; Appliance → Fleet → Services → NTP changes it afterwards. Point it at an internal server, a unicast peer, or leave it blank for no time source at all |
+| `pool.ntp.org` — time sync | on | The disk installer's **Time source** screen (or the `ntp_servers` preseed key) sets it at install; Appliance → Fleet → Services → NTP changes it afterwards. Point it at an internal server or a unicast peer. Leaving it blank writes no installer sources file but does **not** silence chrony — Debian's own `pool` directive in `chrony.conf` still applies, so the host keeps reaching the public pool ([#1002](https://github.com/spatiumddi/spatiumddi/issues/1002)) |
 | `github.com` — SSH public keys, **only if you ask** | off | The disk installer's **SSH public key** screen: typing a bare username there fetches `https://github.com/<user>.keys`. Typing a URL fetches that URL instead, and picking "Paste" or "No key" fetches nothing. One `GET`, no request body, nothing about the install is sent |
 | The control-plane URL you type — an `/api/v1/version` probe | off (Additional-node installs only) | The disk installer probes the URL you entered before it wipes the disk, so a typo is caught while it is still correctable. One `GET` to **your own** control plane |
 | Your default gateway — one ICMP echo | on (pre-flight screen) | The installer's pre-flight check pings the LAN gateway to show whether it answers. LAN-local; there is deliberately no internet-reachability probe |
