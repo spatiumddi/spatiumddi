@@ -1483,7 +1483,12 @@ trigger: tag push (CalVer)
 >   **Installing *to* RAID1 or multipath is still not supported** —
 >   `mkosi.conf` ships no `mdadm`, `lvm2`, `multipath-tools` or `kpartx`,
 >   and the initramfs work that needs is not here. The refusal is the
->   shippable half; the install support stays open on #995 Phase 4.
+>   shippable half; the capability moved to
+>   [#999](https://github.com/spatiumddi/spatiumddi/issues/999), which
+>   carries it together with the fleet monitoring and management surface
+>   for both — a mirrored root with no degraded-array alarm is a mirror
+>   that silently becomes a single disk, so the monitoring half is a
+>   precondition for the install half rather than a follow-on.
 > - **Reinstall keeping `/var`.** The partition layout's own comment has
 >   promised this since #276 and nothing implemented it. When the target
 >   already carries the standard six-label layout the installer offers

@@ -1167,7 +1167,7 @@ _live_boot_disks() {
     fi
 }
 
-# ── Disk identity + hazards (issue #995 Phase 4, items 24-26) ─────────
+# ── Disk identity + hazards (issue #995 items 24-26; #999) ───────────
 
 # The stable /dev/disk/by-id name for a disk, or "" when there is none.
 #
@@ -1194,7 +1194,7 @@ _disk_by_id() {
 }
 
 # The WWN a disk reports, or "". Two paths to the same SAN LUN report the
-# same WWN, which is how the picker collapses them (#995 item 24).
+# same WWN, which is how the picker collapses them (#995 item 24, now #999).
 _disk_wwn() {
     local dev="$1" w
     w=$(lsblk -dno WWN "$dev" 2>/dev/null | head -1 | tr -d ' ')
@@ -1203,15 +1203,15 @@ _disk_wwn() {
 
 # Why this disk must not be installed to, or "" when it is fine.
 #
-# #995 items 23 + 24 in their honest, shippable form. Full RAID1 and
-# multipath INSTALL support needs mdadm / multipath-tools in the image
-# and initramfs work that is not here yet (see APPLIANCE.md). What is
-# here is the refusal, because the pre-existing behaviour was not
-# "unsupported" but a trap: a SAN LUN appears once per path, the picker
-# offered each path as a separate disk, and installing to one of them
-# wrote through a single path with no failover — an install that looks
-# like it worked. Likewise wiping one member of a live md array degrades
-# it silently.
+# #995 items 23 + 24 in their honest, shippable form; the capability
+# they asked for moved to #999. RAID1 and multipath INSTALL support
+# needs mdadm / multipath-tools in the image and initramfs work that is
+# not here (see APPLIANCE.md). What IS here is the refusal, because the
+# pre-existing behaviour was not "unsupported" but a trap: a SAN LUN
+# appears once per path, the picker offered each path as a separate
+# disk, and installing to one of them wrote through a single path with
+# no failover — an install that looks like it worked. Likewise wiping
+# one member of a live md array degrades it silently.
 _disk_hazard() {
     local dev="$1" real base holder
     real=$(readlink -f "$dev" 2>/dev/null || echo "$dev")
@@ -1313,7 +1313,7 @@ pick_disk() {
         [ -z "$model" ] && model="(no model)"
         # Skip any disk that backs the live boot medium.
         [ -n "${live_disks[/dev/$name]:-}" ] && continue
-        # #995 item 24 — collapse the paths of one SAN LUN. Without this
+        # #995 item 24 / #999 — collapse the paths of one SAN LUN. Without this
         # the same LUN is offered three or four times and picking any of
         # them installs through a single path.
         wwn=$(_disk_wwn "/dev/$name")
@@ -1329,7 +1329,7 @@ pick_disk() {
         # the operator can tell the target from the one they meant.
         existing=$(_existing_install_version "/dev/$name")
         [ -n "$existing" ] && tag="$tag [SpatiumDDI $existing installed]"
-        # #995 items 23 + 24 — mark, do not hide. A hidden disk reads as
+        # #995 items 23 + 24 / #999 — mark, do not hide. A hidden disk reads as
         # a missing disk; a marked one explains itself.
         hazard=$(_disk_hazard "/dev/$name")
         [ -n "$hazard" ] && tag="$tag [UNSUPPORTED]"
@@ -1356,14 +1356,14 @@ pick_disk() {
             --menu "Select the disk to install SpatiumDDI to.\nALL DATA on the chosen disk will be DESTROYED." \
             20 70 10 "${options[@]}" 3>&1 1>&2 2>&3) \
             || return 1
-        # #995 items 23 + 24 — refuse before the size check, because a
+        # #995 items 23 + 24 / #999 — refuse before the size check, because a
         # multipath path or an md member is not made acceptable by being
         # big enough.
         local why_not
         why_not=$(_disk_hazard "$TARGET_DISK")
         if [ -n "$why_not" ]; then
             whiptail --backtitle "$BACKTITLE" --title "Unsupported target" \
-                --msgbox "$TARGET_DISK is $why_not."$'\n\n'"Installing to software RAID or to a multipath LUN is not supported yet (issue #995 Phase 4). Pick a plain disk, or break the array / disable multipathing first."$'\n\n'"Nothing has been written." 16 74 || true
+                --msgbox "$TARGET_DISK is $why_not."$'\n\n'"Installing to software RAID or to a multipath LUN is not supported yet (issue #999). Pick a plain disk, or break the array / disable multipathing first."$'\n\n'"Nothing has been written." 16 74 || true
             continue
         fi
         local DISK_BYTES
@@ -2699,7 +2699,7 @@ partition_node() {
 # immediately — as did the loop it replaced. Nothing activates a volume
 # group on an attached disk either, so a reinstall over an existing LVM
 # box works because there are no maps, not because they were released.
-# Adding the storage tooling belongs with #995 Phase 4 (RAID + multipath),
+# Adding the storage tooling belongs with #999 (RAID + multipath),
 # which owns that part of mkosi.conf; the point of getting this right now
 # is that the code is correct on the day it arrives, and correct today for
 # anyone running `spatium-install` from a live shell that has dmsetup.
@@ -2898,7 +2898,7 @@ _assert_safe_wipe_target() {
         fi
     fi
 
-    # #995 items 23 + 24 — the picker refuses a multipath path or an md
+    # #995 items 23 + 24 / #999 — the picker refuses a multipath path or an md
     # member, and this function is the documented place where the picker's
     # checks are re-applied for a preseeded disk. Without it an answer file
     # naming one installs straight through the refusal, producing exactly
@@ -2907,7 +2907,7 @@ _assert_safe_wipe_target() {
     if [ -z "$why" ]; then
         local hazard
         hazard=$(_disk_hazard "$TARGET_DISK")
-        [ -n "$hazard" ] && why="Target disk $TARGET_DISK is $hazard. Installing to software RAID or to a multipath LUN is not supported yet (#995 Phase 4)."
+        [ -n "$hazard" ] && why="Target disk $TARGET_DISK is $hazard. Installing to software RAID or to a multipath LUN is not supported yet (#999)."
     fi
 
     [ -z "$why" ] && { log "Pre-wipe guard OK: $TARGET_DISK ($real)"; return 0; }

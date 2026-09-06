@@ -1801,16 +1801,17 @@ suggestion, free-space treemap.
   to review and to `tsc` alike. It earned its keep on the first run, catching
   that `focusItem(0, -1)` lands on the *last* item rather than the first.
 
-- 🟡 [**Installer wizard review — 30 fixes in five phases**](https://github.com/spatiumddi/spatiumddi/issues/995)
-  — umbrella over `spatium-install` (2,723 lines, 19 screens), from a review
-  prompted by a fresh install of the #988 ISO. **Phases 1–5 landed.**
-  **Still open:** the one thing that cannot ship without image work — a
-  RAID1 or multipath *install* (Phase 4's headline) needs `mdadm` /
-  `multipath-tools` / initramfs changes `mkosi.conf` does not carry, so
-  what shipped is the **refusal** — which is the half that mattered,
-  because the picker used to offer each PATH of a SAN LUN as a separate
-  disk and let you install to one of them. That is not "unsupported", it
-  is an install that looks like it worked and has no failover.
+- ✅ [**Installer wizard review — 28 fixes in five phases**](https://github.com/spatiumddi/spatiumddi/issues/995)
+  — a review of `spatium-install` (2,723 lines, 19 screens) prompted by a
+  fresh install of the #988 ISO. **All five phases landed.** The two items
+  that cannot ship without image work — a RAID1 or multipath *install*,
+  needing `mdadm` / `multipath-tools` / initramfs changes `mkosi.conf` does
+  not carry — moved to
+  [#999](https://github.com/spatiumddi/spatiumddi/issues/999). What shipped
+  here is their **refusal**, which is the half that mattered: the picker used
+  to offer each PATH of a SAN LUN as a separate disk and let you install to
+  one of them. That is not "unsupported", it is an install that looks like it
+  worked and has no failover.
   **Three of the ten were silent failures, which is the theme.**
   The **install logs did not survive the reboot** — `INSTALL_LOG`, the bash-xtrace
   `TRACE_LOG` and the launch log all lived on the live ISO's tmpfs and the
@@ -1975,6 +1976,32 @@ suggestion, free-space treemap.
   string-match would not catch an inverted comparison. Every guard was run
   against the unpatched script — and the fixture itself was the thing that had
   to be fixed first, since it modelled an `lsblk` that does not exist.
+
+- ⬜ [**Storage redundancy — RAID1 + multipath: fleet monitoring, management, and
+  install support**](https://github.com/spatiumddi/spatiumddi/issues/999) — split out
+  of #995 items 23 + 24, whose *refusal* half shipped there. Three parts, and the
+  **ordering is the design point**: monitoring first, install support last.
+  A mirrored root with no degraded-array alarm is a mirror that silently becomes a
+  single disk — the operator pays for two disks, the array loses a member at 03:00,
+  and the appliance keeps serving perfectly until the survivor dies. That is strictly
+  worse than never mirroring, because it displaced the backup discipline they would
+  otherwise have kept. So **Part A (monitoring) is a precondition for Part C
+  (install), not a follow-on** — and it is also far cheaper: `/proc/mdstat` is a
+  kernel interface rather than an mdadm feature, an mpath map is identifiable from
+  `/sys/block/dm-*/dm/uuid` exactly as `_disk_hazard()` already does it in the
+  installer, and the telemetry rides inside the `cluster_health` dict per the #402
+  pattern — no image change, no heartbeat field, no column, no migration.
+  Part A: a `read_storage_health()` collector, a chip on the Cluster → Overview node
+  cards + a Storage block in the Fleet drilldown + the console Disks row, a default-on
+  `appliance_storage_degraded` alert whose severity keys off *redundancy remaining*
+  rather than the state string (`2 of 3` is a warning, `1 of 2` is critical, both
+  report "degraded"), and 1 read MCP tool. Part B: fail / remove / add / scrub and
+  path reinstate over the existing trigger-file host-runner plane, with `mdadm --add`
+  carrying the installer's own wipe confirmation (it overwrites the disk it is given)
+  and removing the last good member **refused** rather than confirmed. Part C: the
+  `mkosi.conf` packages + initramfs, mirror-two-disks in the picker, and the part
+  easiest to skip and fatal to skip — **two ESPs kept in sync from the slot-upgrade
+  path**, or the mirror boots the old kernel off the surviving disk after an upgrade.
 
 #### CLI tool
 
