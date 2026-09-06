@@ -406,6 +406,7 @@ def _drive(script_steps: str, screens: dict[str, str]) -> list[str]:
 set -uo pipefail
 log() {{ :; }}
 FULLY_UNATTENDED=0
+CONFIRM_JUMP=""
 {stubs}
 {script_steps}
 _loop() {{
@@ -485,3 +486,21 @@ def test_an_inert_screen_does_not_stop_forward_progress():
     screens = {n: 2 for n in _ALL if n != "do_install"}
     screens["do_install"] = 0
     assert _drive("", screens) == _ALL
+
+
+def test_the_confirm_menu_jumps_straight_to_the_field():
+    """#995 item 28. Back used to walk one screen at a time, so fixing the
+    hostname from the last screen before a wipe meant pressing Back past
+    four screens and OK through them again — on a serial console, at
+    exactly the moment the operator has spotted something wrong."""
+    screens = {n: 0 for n in _ALL}
+    visited = _drive(
+        '_c=0\n'
+        'confirm() { echo confirm >&2; _c=$((_c+1)); '
+        'if [ "$_c" = 1 ]; then CONFIRM_JUMP=ask_hostname; return 1; fi; return 0; }',
+        {k: v for k, v in screens.items() if k != "confirm"},
+    )
+    after = visited[visited.index("confirm") + 1:]
+    assert after[0] == "ask_hostname", visited
+    # ...and then forward again from there, not backward.
+    assert after[1] == "ask_user_password", visited

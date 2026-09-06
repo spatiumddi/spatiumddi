@@ -1803,9 +1803,14 @@ suggestion, free-space treemap.
 
 - 🟡 [**Installer wizard review — 30 fixes in five phases**](https://github.com/spatiumddi/spatiumddi/issues/995)
   — umbrella over `spatium-install` (2,723 lines, 19 screens), from a review
-  prompted by a fresh install of the #988 ISO. **Phases 1–3 shipped**;
-  Phases 4–5 (RAID + multipath, polish) are still open and the issue stays
-  open with them.
+  prompted by a fresh install of the #988 ISO. **All five phases
+  landed**, except the one thing that cannot ship without image work: a
+  RAID1 or multipath *install* (Phase 4's headline) needs `mdadm` /
+  `multipath-tools` / initramfs changes `mkosi.conf` does not carry, so
+  what shipped is the **refusal** — which is the half that mattered,
+  because the picker used to offer each PATH of a SAN LUN as a separate
+  disk and let you install to one of them. That is not "unsupported", it
+  is an install that looks like it worked and has no failover.
   **Three of the ten were silent failures, which is the theme.**
   The **install logs did not survive the reboot** — `INSTALL_LOG`, the bash-xtrace
   `TRACE_LOG` and the launch log all lived on the live ISO's tmpfs and the
@@ -1949,6 +1954,19 @@ suggestion, free-space treemap.
   exact range it exists for. `--check-preseed` still does not probe,
   because the linting workstation's lease says nothing about the
   appliance's future LAN.
+  **Phases 4 + 5** add the reinstall the layout was designed for (`/var`
+  and STATE kept, both OS slots replaced — promised in a partition-table
+  comment since #276 and never implemented), the stable `by-id` disk name
+  in the picker / Confirm / log / STATE, a progress bar that moves during
+  the rsync, a Confirm screen that is a **menu of fields** so correcting
+  the hostname no longer means walking Back past four screens, an export
+  of the answers as a #549 preseed (secrets deliberately absent, and the
+  export is round-tripped through the real linter in all four
+  role × network shapes), and a **post-install verification** pass — ESP
+  bootloader, a `grub.cfg` that parses, grubenv on `slot_a`, a kernel in
+  the inactive slot — reported as a warning rather than an abort, because
+  the install is complete and the point is that the operator learns
+  before the reboot rather than after it.
   **78 new appliance tests**, and the ones that matter most execute rather than
   grep: the device-mapper closure runs against stubbed `lsblk`/`dmsetup` with a
   second disk present as the negative control, because the failure mode of

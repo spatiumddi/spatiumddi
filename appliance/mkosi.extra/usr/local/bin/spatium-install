@@ -199,6 +199,15 @@ NTP_SERVERS="pool.ntp.org"
 KEYMAP="us"
 # #995 item 18 — SSH public keys for the admin account, newline-separated.
 SSH_AUTHORIZED_KEYS=""
+# #995 item 25 — reinstall onto an existing SpatiumDDI layout, keeping
+# /var and STATE. The partition table's own comment has promised this
+# since #276 ("the partition layout permits keeping /var across
+# reinstalls") and nothing implemented it.
+KEEP_VAR="no"
+# #995 item 26 — the stable name of the target, recorded so the log and
+# STATE say which physical disk was written to. sdX is assigned in
+# discovery order and #581 already notes it can move.
+TARGET_DISK_BY_ID=""
 # Whether to turn off password SSH once a key is installed. Only offered
 # when at least one key is present, or it locks the operator out.
 SSH_DISABLE_PASSWORD="no"
@@ -276,7 +285,14 @@ BOOTSTRAP_PAIRING_CODE=""
 # pipeline ends, so the Done screen (which runs after it) would never see
 # it. shellcheck says so as SC2030/SC2031, and said so about the first
 # version of this.
+# #995 item 28 — the step the operator picked on the Confirm menu, read
+# by the wizard loop. Set only by confirm(), which runs in main's own
+# shell rather than in the gauge subshell, so a variable is fine here.
+CONFIRM_JUMP=""
 BOOT_LEG_MISSING_FILE=/run/spatium-boot-leg-missing
+# #995 item 30 — post-install check failures, for the same subshell reason
+# as the line above.
+VERIFY_FAIL_FILE=/run/spatium-install-verify-failed
 BOOT_LEG_WARNING=""
 
 # ── Headless preseed state (issue #549) ────────────────────────────────
@@ -1151,6 +1167,112 @@ _live_boot_disks() {
     fi
 }
 
+# ── Disk identity + hazards (issue #995 Phase 4, items 24-26) ─────────
+
+# The stable /dev/disk/by-id name for a disk, or "" when there is none.
+#
+# #995 item 26 — `sdX` is assigned in discovery order and can land on a
+# different physical disk between the picker and the wipe, which #581's
+# own comments already note. The by-id name is what an operator can check
+# against a label on the drive, and it is what belongs in the log and in
+# STATE. `wwn-` is preferred where present because it survives a
+# controller change; usb- is skipped because it is the least stable of
+# the lot.
+_disk_by_id() {
+    local dev="$1" real link best=""
+    real=$(readlink -f "$dev" 2>/dev/null || echo "$dev")
+    for link in /dev/disk/by-id/*; do
+        [ -e "$link" ] || continue
+        case "${link##*/}" in *-part[0-9]*|usb-*) continue ;; esac
+        [ "$(readlink -f "$link" 2>/dev/null)" = "$real" ] || continue
+        case "${link##*/}" in
+            wwn-*) printf '%s' "${link##*/}"; return 0 ;;
+            *) [ -z "$best" ] && best="${link##*/}" ;;
+        esac
+    done
+    printf '%s' "$best"
+}
+
+# The WWN a disk reports, or "". Two paths to the same SAN LUN report the
+# same WWN, which is how the picker collapses them (#995 item 24).
+_disk_wwn() {
+    local dev="$1" w
+    w=$(lsblk -dno WWN "$dev" 2>/dev/null | head -1 | tr -d ' ')
+    printf '%s' "$w"
+}
+
+# Why this disk must not be installed to, or "" when it is fine.
+#
+# #995 items 23 + 24 in their honest, shippable form. Full RAID1 and
+# multipath INSTALL support needs mdadm / multipath-tools in the image
+# and initramfs work that is not here yet (see APPLIANCE.md). What is
+# here is the refusal, because the pre-existing behaviour was not
+# "unsupported" but a trap: a SAN LUN appears once per path, the picker
+# offered each path as a separate disk, and installing to one of them
+# wrote through a single path with no failover — an install that looks
+# like it worked. Likewise wiping one member of a live md array degrades
+# it silently.
+_disk_hazard() {
+    local dev="$1" real base holder
+    real=$(readlink -f "$dev" 2>/dev/null || echo "$dev")
+    base=$(basename "$real")
+    # A member of an assembled md array.
+    for holder in "/sys/block/$base"/holders/md* "/sys/block/$base"/*/holders/md*; do
+        [ -e "$holder" ] || continue
+        printf '%s' "part of the software RAID array ${holder##*/}, which installing here would degrade"
+        return 0
+    done
+    # One path of a multipath device: dm-multipath has claimed it.
+    for holder in "/sys/block/$base"/holders/dm-*; do
+        [ -e "$holder" ] || continue
+        if [ "$(cat "$holder/dm/uuid" 2>/dev/null | cut -d- -f1)" = "mpath" ]; then
+            printf '%s' "one path of a multipath device — installing to a single path gives the installed system no failover"
+            return 0
+        fi
+    done
+    printf ''
+}
+
+# Is there already a SpatiumDDI install on this disk? Prints its version
+# when there is (#995 item 25).
+_existing_install_version() {
+    local dev="$1" part label ver mnt
+    for part in $(lsblk -nro NAME "$dev" 2>/dev/null | tail -n +2); do
+        label=$(lsblk -nro LABEL "/dev/$part" 2>/dev/null | head -1)
+        [ "$label" = "root_a" ] || continue
+        mnt=$(mktemp -d) || return 1
+        if mount -o ro "/dev/$part" "$mnt" 2>/dev/null; then
+            ver=$(_appliance_version_from "$mnt/etc/spatiumddi/appliance-release")
+            umount "$mnt" 2>/dev/null || true
+        fi
+        rmdir "$mnt" 2>/dev/null || true
+        [ -n "$ver" ] && { printf '%s' "$ver"; return 0; }
+        printf '%s' "unknown version"
+        return 0
+    done
+    printf ''
+}
+
+# Does this disk already carry the six-partition layout do_install
+# creates, with a /var big enough to be worth keeping (#995 item 25)?
+#
+# Checked by LABEL rather than by partition number: the labels are what
+# fstab and spatium-upgrade-slot address, and a disk that has the right
+# labels in the right roles is one this installer can reuse whatever
+# numbering it happens to use.
+_layout_is_reusable() {
+    local dev="$1" want found part label
+    for want in ESP state root_a root_b var; do
+        found=0
+        for part in $(lsblk -nro NAME "$dev" 2>/dev/null | tail -n +2); do
+            label=$(lsblk -nro LABEL "/dev/$part" 2>/dev/null | head -1)
+            [ "$label" = "$want" ] && { found=1; break; }
+        done
+        [ "$found" = 1 ] || return 1
+    done
+    return 0
+}
+
 pick_disk() {
     log "Step: pick_disk"
     if [ -n "${PRESEED_HAS_DISK:-}" ]; then
@@ -1167,15 +1289,36 @@ pick_disk() {
         [ -n "$_d" ] && live_disks["$_d"]=1
     done < <(_live_boot_disks)
 
+    local -A seen_wwn=()
     while IFS= read -r line; do
-        local name size model
+        local name size model wwn hazard existing tag
         name=$(echo "$line" | awk '{print $1}')
         size=$(echo "$line" | awk '{print $2}')
         model=$(echo "$line" | cut -d' ' -f3- | sed 's/  */ /g')
         [ -z "$model" ] && model="(no model)"
         # Skip any disk that backs the live boot medium.
         [ -n "${live_disks[/dev/$name]:-}" ] && continue
-        options+=("/dev/$name" "$size - $model")
+        # #995 item 24 — collapse the paths of one SAN LUN. Without this
+        # the same LUN is offered three or four times and picking any of
+        # them installs through a single path.
+        wwn=$(_disk_wwn "/dev/$name")
+        if [ -n "$wwn" ]; then
+            if [ -n "${seen_wwn[$wwn]:-}" ]; then
+                log "Disk /dev/$name is another path to $wwn (already listed as ${seen_wwn[$wwn]}) — not offered twice"
+                continue
+            fi
+            seen_wwn["$wwn"]="/dev/$name"
+        fi
+        tag="$size - $model"
+        # #995 item 25 — say when a disk already carries an install, so
+        # the operator can tell the target from the one they meant.
+        existing=$(_existing_install_version "/dev/$name")
+        [ -n "$existing" ] && tag="$tag [SpatiumDDI $existing installed]"
+        # #995 items 23 + 24 — mark, do not hide. A hidden disk reads as
+        # a missing disk; a marked one explains itself.
+        hazard=$(_disk_hazard "/dev/$name")
+        [ -n "$hazard" ] && tag="$tag [UNSUPPORTED]"
+        options+=("/dev/$name" "$tag")
     done < <(lsblk -dn -o NAME,SIZE,MODEL -r 2>/dev/null | grep -vE "^(sr|loop|fd|ram|zram)")
 
     if [ ${#options[@]} -eq 0 ]; then
@@ -1198,6 +1341,16 @@ pick_disk() {
             --menu "Select the disk to install SpatiumDDI to.\nALL DATA on the chosen disk will be DESTROYED." \
             20 70 10 "${options[@]}" 3>&1 1>&2 2>&3) \
             || return 1
+        # #995 items 23 + 24 — refuse before the size check, because a
+        # multipath path or an md member is not made acceptable by being
+        # big enough.
+        local why_not
+        why_not=$(_disk_hazard "$TARGET_DISK")
+        if [ -n "$why_not" ]; then
+            whiptail --backtitle "$BACKTITLE" --title "Unsupported target" \
+                --msgbox "$TARGET_DISK is $why_not."$'\n\n'"Installing to software RAID or to a multipath LUN is not supported yet (issue #995 Phase 4). Pick a plain disk, or break the array / disable multipathing first."$'\n\n'"Nothing has been written." 16 74 || true
+            continue
+        fi
         local DISK_BYTES
         DISK_BYTES=$(blockdev --getsize64 "$TARGET_DISK" 2>/dev/null || echo 0)
         if [ "$DISK_BYTES" -ge "$MIN_BYTES" ]; then
@@ -1206,7 +1359,24 @@ pick_disk() {
             # proceed under-spec but is warned about first-boot
             # DiskPressure. A declined warning re-prompts the disk menu.
             if _control_plane_sizing_ok "$DISK_BYTES"; then
-                log "Picked target disk $TARGET_DISK ($((DISK_BYTES / 1024 / 1024 / 1024)) GiB)"
+                # #995 item 26 — resolve and record the stable name.
+                TARGET_DISK_BY_ID=$(_disk_by_id "$TARGET_DISK")
+                # #995 item 25 — offer the reinstall the layout was
+                # designed for. Only when the labels are all there: a
+                # partial or foreign layout must take the full wipe, not a
+                # guess about which partition is which.
+                KEEP_VAR="no"
+                if [ -n "$(_existing_install_version "$TARGET_DISK")" ] && \
+                   _layout_is_reusable "$TARGET_DISK"; then
+                    if whiptail --backtitle "$BACKTITLE" \
+                        --title "Existing SpatiumDDI install" \
+                        --defaultno --yes-button "Keep /var" --no-button "Erase everything" \
+                        --yesno "$TARGET_DISK already has a SpatiumDDI install with the standard layout.\n\nKeep /var and the STATE partition?\n\n  Keep    - the database, logs, container images and the machine identity (SSH host keys, supervisor keypair) survive. Both OS slots are replaced.\n  Erase   - everything goes, as a fresh install.\n\nKeeping /var reuses the existing partition table, so the sizes cannot change." \
+                        20 76; then
+                        KEEP_VAR="yes"
+                    fi
+                fi
+                log "Picked target disk $TARGET_DISK (${TARGET_DISK_BY_ID:-no by-id name}) ($((DISK_BYTES / 1024 / 1024 / 1024)) GiB) keep_var=$KEEP_VAR"
                 break
             fi
             continue
@@ -2300,6 +2470,9 @@ confirm() {
         s+="Pair code:   ●●●●●●●●\n"
     fi
     s+="Target disk: $TARGET_DISK\n"
+    if [ -n "$TARGET_DISK_BY_ID" ]; then
+        s+="             $TARGET_DISK_BY_ID\n"
+    fi
     s+="Hostname:    $HOSTNAME\n"
     s+="OS user:     $ADMIN_USER\n"
     s+="Network:     $NET_MODE"
@@ -2356,7 +2529,12 @@ confirm() {
         s+="K3s pod CIDR: $K3S_POD_CIDR\n"
         s+="K3s svc CIDR: $K3S_SERVICE_CIDR\n"
     fi
-    s+="\nWARNING: $TARGET_DISK will be ERASED. There is no undo.\n\n"
+    if [ "$KEEP_VAR" = "yes" ]; then
+        s+="\nREINSTALL: both OS slots on $TARGET_DISK are replaced.\n"
+        s+="/var and STATE are KEPT. There is no undo.\n\n"
+    else
+        s+="\nWARNING: $TARGET_DISK will be ERASED. There is no undo.\n\n"
+    fi
     s+="Proceed with installation?"
     # Sized to the body, not hardcoded: items 2 + 6 added the firmware row
     # and a role continuation row, taking an Additional node with
@@ -2365,10 +2543,42 @@ confirm() {
     # control-plane URL over about 52 characters. This is the screen that
     # must never be truncated, since the last two rows are the ERASE
     # warning and the question itself.
-    whiptail --backtitle "$BACKTITLE" --title "Confirm" \
-        --no-button "Back" \
-        --yesno "$s" "$(_whiptail_height "$s" 76)" 76 \
+    # #995 item 28 — a menu of fields, not a yes/no.
+    #
+    # Back used to walk one screen at a time, so correcting the hostname
+    # from here meant pressing Back past the CIDRs, the pairing code, the
+    # timezone and the network — and then pressing OK through all of them
+    # again. On a serial console that is the slowest interaction in the
+    # wizard, and it is the one an operator reaches for precisely when
+    # they have spotted something wrong on the last screen before a wipe.
+    #
+    # The review text still renders above the menu, so nothing is lost:
+    # the rows are the same fields, and picking one jumps straight to its
+    # screen. "Install" is last so it is never the accidental default.
+    CONFIRM_JUMP=""
+    local pick
+    pick=$(whiptail --backtitle "$BACKTITLE" --title "Confirm" \
+        --cancel-button "Back" \
+        --default-item "install" \
+        --menu "$s"$'\n'"Pick a field to change it, or Install to begin." \
+        "$(_whiptail_height "$s"$'\n\n\n\n\n\n\n\n\n\n' 76)" 76 8 \
+        "install"  "*** INSTALL — erase $TARGET_DISK and begin ***" \
+        "pick_disk"     "Target disk        $TARGET_DISK" \
+        "ask_hostname"  "Hostname           $HOSTNAME" \
+        "ask_user_password" "Admin account  $ADMIN_USER" \
+        "ask_ssh_keys"  "SSH keys           $(_ssh_key_count) authorised" \
+        "ask_network"   "Network            $NET_MODE" \
+        "ask_timezone"  "Timezone           $TIMEZONE" \
+        "ask_ntp"       "Time source        ${NTP_SERVERS:-none}" \
+        "ask_keyboard"  "Keyboard           $KEYMAP" \
+        "ask_role"      "Role               $ROLE" \
+        3>&1 1>&2 2>&3) \
         || return 1
+    if [ "$pick" != "install" ]; then
+        CONFIRM_JUMP="$pick"
+        log "Confirm: operator jumped to $pick"
+        return 1
+    fi
 }
 
 # ── Install ───────────────────────────────────────────────────────────────────
@@ -2821,6 +3031,14 @@ EOF
         done
         _assert_target_released
 
+        if [ "$KEEP_VAR" = "yes" ]; then
+            # #995 item 25 — reuse the table. Repartitioning would destroy
+            # the very thing the operator asked to keep, so the whole
+            # wipefs / sgdisk / partprobe sequence is skipped and only the
+            # two OS slots and the ESP are reformatted below.
+            echo "XXX"; echo "5"; echo "Reusing the existing partition table (keeping /var)..."; echo "XXX"
+            log "Reinstall keeping /var: partition table left intact on $TARGET_DISK"
+        else
         echo "XXX"; echo "5"; echo "Partitioning $TARGET_DISK (A/B + var layout)..."; echo "XXX"
         wipefs -af "$TARGET_DISK"           >> "$INSTALL_LOG" 2>&1
         sgdisk -Z "$TARGET_DISK"            >> "$INSTALL_LOG" 2>&1
@@ -2861,6 +3079,7 @@ EOF
         partprobe "$TARGET_DISK"            >> "$INSTALL_LOG" 2>&1 || true
         udevadm settle                      >> "$INSTALL_LOG" 2>&1 || true
         sleep 1
+        fi
 
         echo "XXX"; echo "10"; echo "Formatting partitions..."; echo "XXX"
         mkfs.fat -F32 -n ESP "$ESP"         >> "$INSTALL_LOG" 2>&1
@@ -2868,14 +3087,22 @@ EOF
         # config + SSH host keys + supervisor identity. Mounted at
         # /var/lib/spatium-state. Label ``state`` so fstab can
         # ``LABEL=state`` it without chasing UUIDs across re-installs.
+        # STATE and var are the two the reinstall keeps. STATE carries the
+        # machine identity (SSH host keys, supervisor keypair) and /var
+        # the database — losing either is what "keep /var" exists to
+        # avoid. The OS slots are replaced either way.
+        if [ "$KEEP_VAR" != "yes" ]; then
         mkfs.ext4 -F -L state "$STATE"      >> "$INSTALL_LOG" 2>&1
         # Label the slots distinctly so the boot loader / sysupdate
         # can pick them by label rather than position. root_a is the
         # active slot for this install; root_b is empty until 8b's
         # `spatium-update` writes the next image there.
+        fi
         mkfs.ext4 -F -L root_a "$ROOT_A"    >> "$INSTALL_LOG" 2>&1
         mkfs.ext4 -F -L root_b "$ROOT_B"    >> "$INSTALL_LOG" 2>&1
+        if [ "$KEEP_VAR" != "yes" ]; then
         mkfs.ext4 -F -L var    "$VAR"       >> "$INSTALL_LOG" 2>&1
+        fi
 
         echo "XXX"; echo "15"; echo "Mounting target..."; echo "XXX"
         # Mount layout for rsync: root_A as / and var as /var BEFORE
@@ -2896,7 +3123,18 @@ EOF
         mount "$STATE" "$MOUNT/var/lib/spatium-state"
 
         echo "XXX"; echo "20"; echo "Copying root filesystem (3-5 min)..."; echo "XXX"
-        rsync -aAXH \
+        # #995 item 27 — feed rsync's own progress into the gauge instead
+        # of leaving it frozen at 20% for the longest step in the install.
+        # A five-minute pause with a static bar is indistinguishable from
+        # a hang, and it is the point at which an operator power-cycles.
+        #
+        # --info=progress2 gives a whole-transfer percentage, and writes
+        # it with \r rather than \n — hence RS. stdout here IS the gauge
+        # stream (the brace group is piped to whiptail --gauge), so the
+        # awk emits the XXX/percent/text/XXX blocks directly and rsync's
+        # own stderr goes to the log. Only emit on a CHANGE, or the gauge
+        # protocol is flooded with thousands of identical blocks.
+        rsync -aAXH --info=progress2 \
             --exclude="/dev/*" \
             --exclude="/proc/*" \
             --exclude="/sys/*" \
@@ -2912,7 +3150,16 @@ EOF
             --exclude="/etc/spatiumddi/.env" \
             --exclude="/etc/ssh/sshd_config.d/00-spatium-live.conf" \
             --exclude="/etc/issue.d/zz-spatium-live.issue" \
-            / "$MOUNT/" >> "$INSTALL_LOG" 2>&1
+            / "$MOUNT/" 2>> "$INSTALL_LOG" \
+            | awk -v RS='\r' -v lo=20 -v hi=60 '
+                match($0, /[0-9]+%/) {
+                    pct = substr($0, RSTART, RLENGTH - 1) + 0
+                    g = int(lo + (hi - lo) * pct / 100)
+                    if (g != last) {
+                        printf "XXX\n%d\nCopying root filesystem... %d%%\nXXX\n", g, pct
+                        last = g
+                    }
+                }'
 
         echo "XXX"; echo "60"; echo "Writing boot-critical config to root baseline..."; echo "XXX"
         # IMPORTANT: fstab + /etc/hostname need to land on the
@@ -3040,6 +3287,9 @@ hostname: "$HOSTNAME"
 # plane hardcodes "admin" and errors out on every appliance installed
 # with a different name.
 admin_user: "$ADMIN_USER"
+# #995 item 26 — the stable name of the disk this was installed to. sdX
+# is assigned in discovery order and can move between boots.
+target_disk_by_id: "$TARGET_DISK_BY_ID"
 role: "$ROLE"
 control_plane_url: "$CONTROL_PLANE_URL"
 bootstrap_pairing_code: "$BOOTSTRAP_PAIRING_CODE"
@@ -3070,6 +3320,58 @@ keymap: "$KEYMAP"
 root_password_set: "$SET_ROOT_PASSWORD"
 EOF
         chmod 0644 "$STATE_MNT/spatium-config.yaml"
+
+        # #995 item 29 — the wizard's answers as a #549 answer file, so an
+        # identical reinstall or a fleet clone is one file away instead of
+        # nineteen screens. Secrets are deliberately absent: the password
+        # (and its hash) and the pairing code are the three things this
+        # must never carry, because the file is world-readable on STATE
+        # and is meant to be copied off the box. A reader adds them, and
+        # --check-preseed will tell them which are missing.
+        cat > "$STATE_MNT/spatium-preseed.yaml" <<EOF
+# Exported by spatium-install (issue #995 item 29) — the answers this
+# appliance was installed with, in the #549 answer-file format.
+#
+# NOT directly reusable: admin_password (or admin_password_hash) is
+# required, and role: appliance additionally needs pairing_code. Both are
+# omitted on purpose. Add them, then lint with:
+#     spatium-install --check-preseed spatium-preseed.yaml
+spatium_preseed:
+  role: "$ROLE"
+  confirm_wipe: true
+  target_disk: "${TARGET_DISK_BY_ID:+/dev/disk/by-id/}${TARGET_DISK_BY_ID:-$TARGET_DISK}"
+  hostname: "$HOSTNAME"
+  admin_user: "$ADMIN_USER"
+  set_root_password: $([ "$SET_ROOT_PASSWORD" = "yes" ] && echo true || echo false)
+  timezone: "$TIMEZONE"
+  keymap: "$KEYMAP"
+  ntp_servers: "$NTP_SERVERS"
+  network:
+    mode: "$NET_MODE"
+    interface: "$NET_INTERFACE"
+$( [ "$NET_MODE" = "static" ] && cat <<NETEOF
+    ip: "$NET_IP"
+    prefix: $NET_PREFIX
+    gateway: "$NET_GATEWAY"
+    dns: "$NET_DNS"
+NETEOF
+)
+$( [ "$NET6_MODE" = "static" ] && [ "$NET_MODE" = "static" ] && cat <<NET6EOF
+    ip6: "$NET6_IP"
+    prefix6: $NET6_PREFIX
+    gateway6: "$NET6_GATEWAY"
+NET6EOF
+)
+$( [ "$ROLE" != "appliance" ] && cat <<K3SEOF
+  k3s:
+    pod_cidr: "$K3S_POD_CIDR"
+    service_cidr: "$K3S_SERVICE_CIDR"
+K3SEOF
+)
+$( [ "$ROLE" = "appliance" ] && printf '  control_plane_url: "%s"\n' "$CONTROL_PLANE_URL" )
+EOF
+        chmod 0644 "$STATE_MNT/spatium-preseed.yaml"
+        log "Answers exported to /var/lib/spatium-state/spatium-preseed.yaml (no secrets)"
 
         # Mount overlay over /target/etc for the REMAINDER of the
         # install. Every chroot useradd / chpasswd / file write that
@@ -3733,6 +4035,75 @@ EOF
         umount /mnt/spatium-root-b 2>/dev/null || umount -l /mnt/spatium-root-b 2>/dev/null || true
         rmdir /mnt/spatium-root-b 2>/dev/null || true
 
+        mkdir -p "$MOUNT/var/log/spatiumddi/install" 2>/dev/null || true
+        echo "XXX"; echo "93"; echo "Verifying the installed system..."; echo "XXX"
+        # #995 item 30 — check the things whose absence is only
+        # discovered at the next boot, while the operator is still here
+        # and the disk is still mounted. Each failure is a WARN on the
+        # Done screen rather than an abort: the install is complete, and
+        # an operator who can see "the ESP has no bootloader" before
+        # rebooting is in a far better position than one who reboots into
+        # a grub prompt.
+        # A FILE on the live tmpfs, not a variable: the whole install runs
+        # inside `{ … } | whiptail --gauge` and the left side of a pipeline
+        # is a subshell, so an assignment here is discarded before the Done
+        # screen reads it. The same trap shellcheck caught on
+        # BOOT_LEG_MISSING_FILE. $MOUNT is unmounted by then, so /run it is.
+        rm -f "$VERIFY_FAIL_FILE" 2>/dev/null || true
+        local verify_fail=""
+        # Takes the check as ARGUMENTS, not as a string to eval: eval on a
+        # quoted expression is both a footgun and the reason shellcheck
+        # cannot see inside it.
+        _verify() {
+            local desc="$1"
+            shift
+            if ! "$@" >/dev/null 2>&1; then
+                verify_fail="${verify_fail}  - $desc"$'\n'
+                log "VERIFY FAILED: $desc"
+            fi
+        }
+        _grubenv_points_at_slot_a() {
+            chroot "$MOUNT" /usr/bin/grub-editenv /boot/efi/grub/grubenv list \
+                | grep -q "saved_entry=slot_a"
+        }
+        _slot_b_has() {
+            # A glob, so it needs a shell rather than `test`.
+            compgen -G "/mnt/spatium-verify-b/boot/$1*" >/dev/null
+        }
+        _verify "the ESP carries a UEFI bootloader (EFI/BOOT/BOOTX64.EFI)" \
+            test -f "$MOUNT/boot/efi/EFI/BOOT/BOOTX64.EFI"
+        _verify "the ESP carries grub.cfg" \
+            test -f "$MOUNT/boot/efi/grub/grub.cfg"
+        _verify "grub.cfg parses" \
+            chroot "$MOUNT" /usr/bin/grub-script-check /boot/efi/grub/grub.cfg
+        _verify "grubenv points at slot_a" _grubenv_points_at_slot_a
+        _verify "the machine config on STATE is present" \
+            test -s "$MOUNT/var/lib/spatium-state/spatium-config.yaml"
+        _verify "the admin account exists in the installed system" \
+            chroot "$MOUNT" getent passwd "$ADMIN_USER"
+        # root_B was unmounted after the clone; re-mount briefly to check
+        # that the slot an operator can switch to on day one is actually
+        # bootable, which is the whole point of cloning it.
+        mkdir -p /mnt/spatium-verify-b
+        if mount -o ro "$ROOT_B" /mnt/spatium-verify-b 2>/dev/null; then
+            _verify "the inactive slot (root_B) carries a kernel" _slot_b_has vmlinuz
+            _verify "the inactive slot (root_B) carries an initrd" _slot_b_has initrd.img
+            umount /mnt/spatium-verify-b 2>/dev/null || true
+        else
+            verify_fail="${verify_fail}  - the inactive slot (root_B) could not be mounted"$'\n'
+        fi
+        rmdir /mnt/spatium-verify-b 2>/dev/null || true
+        if [ -n "$verify_fail" ]; then
+            printf '%s' "$verify_fail" > "$VERIFY_FAIL_FILE" 2>/dev/null || true
+            # ...and a copy on the installed system, which outlives the
+            # reboot the operator is about to do.
+            printf '%s' "$verify_fail" \
+                > "$MOUNT/var/log/spatiumddi/install/verify.failed" 2>/dev/null || true
+            log "Post-install verification found problems (see the Done screen)"
+        else
+            log "Post-install verification: all checks passed"
+        fi
+
         echo "XXX"; echo "94"; echo "Saving installer logs to the target..."; echo "XXX"
         # #995 item 1 — last write before the unmount block, so the copy
         # captures everything except the unmounts themselves.
@@ -3907,7 +4278,13 @@ ${BOOT_LEG_WARNING:+
   only in $FIRMWARE_MODE mode — see /var/log/spatiumddi/install/.
 }
 Installer logs are kept at /var/log/spatiumddi/install/.
+Your answers are at /var/lib/spatium-state/spatium-preseed.yaml.
 Press OK to reboot."
+    if [ -s "$VERIFY_FAIL_FILE" ]; then
+        done_body="POST-INSTALL CHECKS FAILED:
+$(cat "$VERIFY_FAIL_FILE")
+$done_body"
+    fi
 
     if [ "${FULLY_UNATTENDED:-0}" != "1" ]; then
     # `|| true` because whiptail returns 255 on ESC and `set -e` is still
@@ -4537,7 +4914,27 @@ main() {
         case "$rc" in
             0) dir="fwd"; i=$((i + 1)) ;;
             2) if [ "$dir" = "back" ]; then i=$((i - 1)); else i=$((i + 1)); fi ;;
-            *) dir="back"; i=$((i - 1)) ;;
+            *)
+                # #995 item 28 — confirm's menu names a step to jump to
+                # rather than walking back one screen at a time. Forward,
+                # not back: the operator asked for that screen, and a
+                # preseeded one passing through toward confirm again is
+                # the right behaviour rather than reversing past it.
+                if [ -n "$CONFIRM_JUMP" ]; then
+                    local j=0
+                    while [ "$j" -lt "${#STEPS[@]}" ]; do
+                        if [ "${STEPS[$j]}" = "$CONFIRM_JUMP" ]; then
+                            i="$j"
+                            break
+                        fi
+                        j=$((j + 1))
+                    done
+                    CONFIRM_JUMP=""
+                    dir="fwd"
+                else
+                    dir="back"; i=$((i - 1))
+                fi
+                ;;
         esac
         # Backing past the first screen is not an exit — welcome owns that.
         if [ "$i" -lt 0 ]; then

@@ -1472,6 +1472,55 @@ trigger: tag push (CalVer)
 >   the linting workstation's lease says nothing about the appliance's
 >   future LAN.
 
+> **#995 Phases 4 + 5 update — storage hazards, reinstall, polish.**
+>
+> - **A SAN LUN is no longer offered once per path.** The picker
+>   collapses paths by WWN, and installing to a single path of a
+>   multipath device — or to a member of an assembled md array — is
+>   **refused**, marked `[UNSUPPORTED]` in the list rather than hidden.
+>   This was not "unsupported", it was a trap: the install wrote through
+>   one path, the installed system had no failover, and nothing said so.
+>   **Installing *to* RAID1 or multipath is still not supported** —
+>   `mkosi.conf` ships no `mdadm`, `lvm2`, `multipath-tools` or `kpartx`,
+>   and the initramfs work that needs is not here. The refusal is the
+>   shippable half; the install support stays open on #995 Phase 4.
+> - **Reinstall keeping `/var`.** The partition layout's own comment has
+>   promised this since #276 and nothing implemented it. When the target
+>   already carries the standard six-label layout the installer offers
+>   it: both OS slots are replaced, `/var` and STATE are kept — so the
+>   database, the logs, the imported container images and the machine
+>   identity (SSH host keys, supervisor keypair) survive. Offered only
+>   when every label is present, because a partial layout would mean
+>   guessing which partition is which.
+> - **The stable disk name is resolved, shown and recorded.** `sdX` is
+>   assigned in discovery order and #581 already noted it can move
+>   between the picker and the wipe. The picker resolves
+>   `/dev/disk/by-id/` (preferring `wwn-`), Confirm shows it, and it goes
+>   into the install log and `spatium-config.yaml`.
+> - **The progress bar moves during the rsync.** It sat at 20% for the
+>   longest step in the install, which is indistinguishable from a hang
+>   and is the point at which an operator power-cycles.
+> - **Confirm is a menu of fields.** Back used to walk one screen at a
+>   time, so correcting the hostname from the last screen before a wipe
+>   meant pressing Back past four screens and OK through them again.
+>   Picking a row jumps straight to it; `Install` is the last thing.
+> - **The answers are exported** to
+>   `/var/lib/spatium-state/spatium-preseed.yaml` in the #549 format, so
+>   an identical reinstall or a fleet clone is one file away. Secrets are
+>   deliberately absent — the file is world-readable and meant to be
+>   copied off the box — so a reader adds `admin_password` (and
+>   `pairing_code` for an Additional node) and lints it with
+>   `--check-preseed`.
+> - **The install is verified before it is called done**: the ESP carries
+>   `EFI/BOOT/BOOTX64.EFI` and a `grub.cfg` that parses, grubenv points
+>   at `slot_a`, the inactive slot has a kernel and an initrd, the
+>   machine config is on STATE, and the admin account exists. Failures
+>   are shown on the Done screen and written to
+>   `/var/log/spatiumddi/install/verify.failed` — a warning, not an
+>   abort, because the install *is* complete and an operator who sees
+>   "the ESP has no bootloader" before rebooting is far better off than
+>   one who reboots into a grub prompt.
+
 ### Headless / unattended install — preseed the disk installer (#549)
 
 > **Supersedes the stale Phase-1 framing.** The *old* cloud-init
