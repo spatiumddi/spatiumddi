@@ -142,11 +142,63 @@ def test_the_daemon_child_logger_is_never_silenced(daemon, root):
 @pytest.mark.parametrize(
     ("daemon", "root"), [("Dhcp4", "kea-dhcp4"), ("Dhcp6", "kea-dhcp6")]
 )
-def test_the_quiet_child_keeps_the_parents_appenders(daemon, root):
-    """log4cplus does not inherit appenders into a logger configured by
-    name, so a child with no ``output_options`` sends its WARNs and ERRORs
-    nowhere at all — which would be a silencing, not a level change."""
+def test_the_quiet_child_declares_no_appenders_of_its_own(daemon, root):
+    """The child must INHERIT the parent's appenders, not copy them.
+
+    Verified against kea-dhcp4 3.0.3: a child configured with only a
+    severity still reaches both stdout and the shipped file, so its WARNs
+    and ERRORs are not lost. Copying the parent's ``output_options`` also
+    works, but puts a second RollingFileAppender on the same path with its
+    own rotation state — at 50 MB one renames the file while the other holds
+    the old descriptor.
+    """
     out = render(_bundle(kea_packet_logging=False))[daemon]
     quiet = _loggers(out, f"{root}.packets")[0]
-    outputs = {o["output"] for o in quiet["output_options"]}
-    assert outputs == {"stdout", f"/var/log/kea/{root}.log"}
+    assert "output_options" not in quiet
+    # Exactly one appender set per file, on the parent.
+    parent = _loggers(out, root)[0]
+    assert {o["output"] for o in parent["output_options"]} == {
+        "stdout",
+        f"/var/log/kea/{root}.log",
+    }
+
+
+# ── the HA hook's own thread pools (#980 review finding) ────────────────────
+
+
+def _ha_bundle(**server_extra) -> dict:
+    b = _bundle(**server_extra)
+    b["failover"] = {
+        "this_server_name": "a",
+        "mode": "hot-standby",
+        "peers": [
+            {"name": "a", "url": "http://10.0.0.1:8000/", "role": "primary"},
+            {"name": "b", "url": "http://10.0.0.2:8000/", "role": "standby"},
+        ],
+    }
+    return b
+
+
+def _ha_relationship(out):
+    hook = [h for h in out["hooks-libraries"] if "ha.so" in h["library"]][0]
+    return hook["parameters"]["high-availability"][0]
+
+
+def test_ha_http_threads_do_not_follow_the_packet_pool():
+    """Kea reads ``http-listener-threads: 0`` as "same as thread-pool-size",
+    not as an independent auto-size — measured by counting OS threads: with
+    the HA hook loaded, pool=1 gave 8 threads and pool=8 gave 29, three pools
+    of N. Left alone, #980's pool of 1 would have serialised HA peer traffic
+    as a side effect. They are pinned instead."""
+    rel = _ha_relationship(render(_ha_bundle(kea_thread_pool_size=1))["Dhcp4"])
+    mt = rel["multi-threading"]
+    assert mt["http-listener-threads"] > 1
+    assert mt["http-client-threads"] > 1
+    assert mt["enable-multi-threading"] is True
+    assert mt["http-dedicated-listener"] is True
+
+
+def test_ha_http_threads_are_the_same_whatever_the_packet_pool():
+    one = _ha_relationship(render(_ha_bundle(kea_thread_pool_size=1))["Dhcp4"])
+    many = _ha_relationship(render(_ha_bundle(kea_thread_pool_size=16))["Dhcp4"])
+    assert one["multi-threading"] == many["multi-threading"]

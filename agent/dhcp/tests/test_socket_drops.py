@@ -137,57 +137,109 @@ def test_dhcp_ports_are_the_server_ports():
 
 
 # ── delta accumulation ──────────────────────────────────────────────────────
+#
+# These drive the REAL ``SocketDropCounter.sample()`` by pointing it at
+# fixture files on disk. An earlier version of this file subclassed it and
+# reimplemented ``sample()``, which meant the five tests below asserted on a
+# copy of the logic and would have passed with the production method
+# arbitrarily broken.
 
 
-class _Counter(SocketDropCounter):
-    """SocketDropCounter driven from a scripted list of snapshots."""
-
-    def __init__(self, snapshots):
-        super().__init__()
-        self._snapshots = list(snapshots)
-
-    def sample(self):
-        snap = self._snapshots.pop(0)
-        prev = self._prev
-        if snap is None:
-            self._prev = None
-            return None
-        self._prev = snap
-        if prev is None:
-            return None
-        return sum(max(0, v - prev.get(k, 0)) for k, v in snap.items())
+def _write_proc(tmp_path, name, rows):
+    """Write a /proc/net/udp-shaped file and return its path."""
+    path = tmp_path / name
+    path.write_text(_proc(*rows))
+    return str(path)
 
 
-def test_first_sample_has_no_baseline():
-    c = _Counter([{"1": 40}])
-    assert c.sample() is None
+def _counter_over(tmp_path, snapshots):
+    """A real SocketDropCounter reading a file this helper rewrites per tick.
+
+    ``read_socket_drops`` opens the path on every call, so rewriting the file
+    between ``sample()`` calls is exactly what a changing kernel table looks
+    like to it.
+    """
+    path = tmp_path / "udp"
+    counter = SocketDropCounter()
+
+    def tick(rows):
+        # rows=None models procfs becoming unreadable: point the counter at a
+        # path that does not exist.
+        if rows is None:
+            return counter.sample_from(("/nonexistent/net/udp",))
+        path.write_text(_proc(*rows))
+        return counter.sample_from((str(path),))
+
+    return [tick(r) for r in snapshots]
 
 
-def test_delta_is_per_socket():
-    c = _Counter([{"1": 40}, {"1": 47}])
-    c.sample()
-    assert c.sample() == 7
+def test_first_sample_has_no_baseline(tmp_path):
+    (out,) = _counter_over(tmp_path, [[_row("0043", "1", 40)]])
+    assert out is None
 
 
-def test_a_socket_disappearing_does_not_read_as_negative():
+def test_delta_is_per_socket(tmp_path):
+    out = _counter_over(
+        tmp_path, [[_row("0043", "1", 40)], [_row("0043", "1", 47)]]
+    )
+    assert out == [None, 7]
+
+
+def test_a_socket_disappearing_does_not_read_as_negative(tmp_path):
     """Kea closes and reopens its sockets on reconfiguration. Summing the
     totals would show the fleet-wide count falling, which looks exactly like
     a counter reset; summing per inode gives the right answer of 0."""
-    c = _Counter([{"1": 500, "2": 500}, {"2": 500}])
-    c.sample()
-    assert c.sample() == 0
+    out = _counter_over(
+        tmp_path,
+        [
+            [_row("0043", "1", 500), _row("0223", "2", 500)],
+            [_row("0223", "2", 500)],
+        ],
+    )
+    assert out == [None, 0]
 
 
-def test_a_new_socket_contributes_from_zero():
-    c = _Counter([{"1": 500}, {"1": 500, "2": 12}])
-    c.sample()
-    assert c.sample() == 12
+def test_a_new_socket_contributes_from_zero(tmp_path):
+    out = _counter_over(
+        tmp_path,
+        [
+            [_row("0043", "1", 500)],
+            [_row("0043", "1", 500), _row("0223", "2", 12)],
+        ],
+    )
+    assert out == [None, 12]
 
 
-def test_unreadable_procfs_clears_the_baseline():
+def test_unreadable_procfs_clears_the_baseline(tmp_path):
     """If a sample cannot be taken, the next one must not diff against a
     stale baseline and report a bucket's worth of drops as one spike."""
-    c = _Counter([{"1": 10}, None, {"1": 900}])
-    c.sample()
-    assert c.sample() is None
-    assert c.sample() is None
+    out = _counter_over(
+        tmp_path, [[_row("0043", "1", 10)], None, [_row("0043", "1", 900)]]
+    )
+    assert out == [None, None, None]
+
+
+def test_a_partial_read_is_not_a_sample(tmp_path):
+    """One of the two procfs files unreadable must fail the WHOLE sample.
+
+    Returning the half that read as a valid snapshot drops the missing
+    inodes out of the baseline; when the next read succeeds they come back
+    as brand-new sockets and their entire lifetime ``sk_drops`` is charged
+    to that one bucket — a fabricated spike, on a rule whose floor is one
+    packet.
+    """
+    v4 = _write_proc(tmp_path, "udp", [_row("0043", "1", 5)])
+    v6 = _write_proc(tmp_path, "udp6", [_row("0223", "2", 5000)])
+
+    both = read_socket_drops(paths=(v4, v6))
+    assert both == {"1": 5, "2": 5000}
+
+    # v6 present but unreadable (a directory stands in for EISDIR — any
+    # OSError that is not FileNotFoundError takes the same branch).
+    unreadable = tmp_path / "unreadable"
+    unreadable.mkdir()
+    assert read_socket_drops(paths=(v4, str(unreadable))) is None
+
+    # A genuinely absent file is different and stays a valid partial answer:
+    # no IPv6 stack means no v6 sockets to miss.
+    assert read_socket_drops(paths=(v4, str(tmp_path / "gone"))) == {"1": 5}

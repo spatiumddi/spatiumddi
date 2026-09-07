@@ -927,8 +927,13 @@ async def find_dhcp_server_stats(
             "release": int(totals_row.release or 0),
         },
         # #980. Kept out of ``totals`` deliberately: those are messages
-        # handled, these are messages lost, and folding them into one dict
-        # invites a model to add them up.
+        # handled, these are messages not handled, and folding them into one
+        # dict invites a model to add them up.
+        #
+        # ``measured`` keys on socket_drop ALONE. receive_drop always arrives
+        # from a #980 agent, so testing the pair would report a server whose
+        # kernel-side loss is unmeasurable as measured-and-clean — the exact
+        # false reassurance the counters exist to remove.
         "packet_loss": {
             "socket_drop": (
                 None if totals_row.socket_drop is None else int(totals_row.socket_drop)
@@ -936,7 +941,11 @@ async def find_dhcp_server_stats(
             "receive_drop": (
                 None if totals_row.receive_drop is None else int(totals_row.receive_drop)
             ),
-            "measured": totals_row.socket_drop is not None or totals_row.receive_drop is not None,
+            "measured": totals_row.socket_drop is not None,
+            "note": (
+                "socket_drop is lost traffic; receive_drop also counts deliberate "
+                "drops (blocklisted MAC, HA out-of-scope) and is not by itself a fault"
+            ),
         },
     }
 

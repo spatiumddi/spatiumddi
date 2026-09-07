@@ -84,10 +84,11 @@ def read_socket_drops(
 ) -> dict[str, int] | None:
     """Snapshot ``{inode: sk_drops}`` for every DHCP-port UDP socket.
 
-    Returns ``None`` — never ``{}`` — when the counter cannot be read at
-    all, so a caller can report UNKNOWN rather than a zero that reads as
-    "no loss". ``{}`` is a real answer: procfs was readable and no DHCP
-    socket is currently open (Kea starting, or bound raw-only).
+    Returns ``None`` — never ``{}`` — when the counter cannot be read, so a
+    caller can report UNKNOWN rather than a zero that reads as "no loss".
+    A *partial* read is also ``None``: see the OSError branch below.
+    ``{}`` is a real answer: procfs was readable and no DHCP socket is
+    currently open (Kea starting, or bound raw-only).
     """
     merged: dict[str, int] = {}
     readable = False
@@ -96,11 +97,21 @@ def read_socket_drops(
             with open(path, encoding="ascii", errors="replace") as fh:
                 text = fh.read()
         except FileNotFoundError:
-            # No IPv6 stack, or not Linux. Not an error on its own.
+            # No IPv6 stack, or not Linux. Not an error on its own: an
+            # absent file has no sockets to account for, so the remaining
+            # answer is still complete.
             continue
         except OSError as e:
+            # A file that EXISTS and could not be read is different. Its
+            # sockets are unaccounted for, and returning the rest as a valid
+            # snapshot is worse than returning nothing: the missing inodes
+            # drop out of the baseline, and when the next read succeeds they
+            # come back as new sockets whose whole-lifetime sk_drops is
+            # attributed to that one bucket. On a socket that has been up for
+            # days that is a fabricated spike large enough to trip the
+            # alert. Fail the whole sample instead.
             log.debug("socket_drops_unreadable", path=path, error=str(e))
-            continue
+            return None
         readable = True
         merged.update(_parse_proc_udp(text, ports))
     return merged if readable else None
@@ -120,13 +131,24 @@ class SocketDropCounter:
         self._prev: dict[str, int] | None = None
 
     def sample(self) -> int | None:
-        """Drops since the previous call, or ``None`` if not measurable.
+        """Drops since the previous call, or ``None`` if not measurable."""
+        return self.sample_from(_PROC_UDP)
+
+    def sample_from(
+        self, paths: tuple[str, ...], ports: frozenset[int] = DHCP_PORTS
+    ) -> int | None:
+        """Drops since the previous call, reading ``paths``.
 
         The first call after start returns ``None``: with no baseline, the
         counters standing on the sockets are however much was lost before
         the agent came up, which belongs to no bucket in particular.
+
+        ``paths`` is a parameter only so the tests can drive this exact
+        method over fixture files. Production calls :meth:`sample`, which
+        supplies the real procfs paths — the tests must not reimplement the
+        arithmetic below, or they assert on a copy of it.
         """
-        current = read_socket_drops()
+        current = read_socket_drops(paths, ports)
         if current is None:
             self._prev = None
             return None

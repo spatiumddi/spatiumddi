@@ -157,19 +157,33 @@ Kea reads them. The default is `1`; `0` restores Kea's auto-sizing. Note that
 `enable-multi-threading` stays **true** — this is a resize, not a mode change,
 because MT-off makes one thread both receive and process (measured 15,170
 socket drops where a pool of one had none) and also flips host-reservation
-lookup order. Kea's HA hook keeps its own `http-client-threads` /
-`http-listener-threads` (`http-dedicated-listener: true`), unaffected by this
-value, so HA peer traffic is not serialised behind the single worker.
+lookup order.
+
+Kea's HA hook does **not** keep independent HTTP pools by default:
+`http-listener-threads` / `http-client-threads` default to `0`, which Kea
+reads as *"same as `thread-pool-size`"*, not as an independent auto-size.
+Measured by counting OS threads with the hook loaded — pool=1 gave 8 threads
+and pool=8 gave 29, a delta of 21 for a pool delta of 7, i.e. three pools of
+N. Left alone, the packet-path fix would have taken HA's peer HTTP
+concurrency to 1 as a side effect, so `_ha_hook` now renders an explicit
+`multi-threading` block pinning both to 4 (a decoupling constant, not a
+tuned one — the HA threads do short LAN POSTs and never contend for the
+receive thread). With it, the same measurement gives 14 threads at pool=1 and
+21 at pool=8: a delta of exactly the core pool.
 
 `kea_packet_logging` → when false, appends a `kea-dhcpN.packets` logger at
 `WARN`, silencing `DHCP4_PACKET_RECEIVED` / `DHCP4_PACKET_SEND`. Default
 true (today's behaviour); off is worth ~1.30x more packets served. The child
-carries the parent's `output_options` explicitly — log4cplus does not inherit
-appenders into a logger configured by name, so omitting them would send its
-WARNs and ERRORs nowhere instead of raising the level. `kea-dhcpN.dhcpN` is
-deliberately never silenced: at INFO it carries `DHCP4_OPEN_SOCKETS_FAILED`,
-`DHCP4_CONFIG_COMPLETE`, `DHCP4_STARTED` and `DHCP4_MULTI_THREADING_INFO`,
-the last being the line that confirms the pool size took effect.
+declares **no `output_options`** and inherits the parent's — verified against
+kea-dhcp4 3.0.3: at DEBUG with no outputs of its own every packet line still
+reached both stdout and the shipped file, and at WARN none did while the
+parent's INFO lines kept flowing. Copying the parent's appenders also works
+but puts a second `RollingFileAppender` on one path with its own rotation
+state, so at 50 MB one renames the file while the other holds the old
+descriptor. `kea-dhcpN.dhcpN` is deliberately never silenced: at INFO it
+carries `DHCP4_OPEN_SOCKETS_FAILED`, `DHCP4_CONFIG_COMPLETE`,
+`DHCP4_STARTED` and `DHCP4_MULTI_THREADING_INFO`, the last being the line
+that confirms the pool size took effect.
 
 Both are also rendered by the control-plane-side `KeaDriver.render_config`
 for parity. Full measurements: [`DHCP.md` §4c](../features/DHCP.md).

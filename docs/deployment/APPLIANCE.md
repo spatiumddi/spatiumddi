@@ -129,8 +129,10 @@ not the operator's:
   `pkt4-receive-drop` stays at 0 through the whole thing — because the loss is
   the kernel discarding datagrams before Kea reads them. The per-bucket
   `socket_drop` metric and the default-on `dhcp_packets_dropped` alert are the
-  only signals that name it; see
-  [`DHCP.md` §4c](../features/DHCP.md).
+  only signals that name it — and note it is `socket_drop` specifically:
+  Kea's own `pkt4-receive-drop` also counts deliberate drops (a blocklisted
+  MAC, an HA standby declining an out-of-scope query) and is not a fault
+  signal. See [`DHCP.md` §4c](../features/DHCP.md).
 
 Beyond that: **500k records in one group** is not a supported single-node
 size at any RAM tested (up to 10 GiB) — the api's bundle build for the

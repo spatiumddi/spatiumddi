@@ -616,23 +616,31 @@ bucket_at, discover, offer, request, ack, nak, decline, release,
 inform, receive_drop, socket_drop)`. Retention is enforced by the
 `prune_metric_samples` Celery task (daily, default 7 days).
 
-Two of those DHCP columns are *loss* rather than traffic, and they do not
-come from the same place (issue #980). `receive_drop` is Kea's own
-`pkt4/6-receive-drop` — packets it read and then discarded. `socket_drop`
-is the kernel's per-socket `sk_drops` from `/proc/net/udp`, read by the
-agent directly: packets discarded because Kea's receive buffer was full,
-so Kea never saw them and no counter it keeps can report them. On a node
-short of CPU only the second one moves, which is why both are carried
-rather than just the one the issue originally asked for. See
-[`DHCP.md` §4c](features/DHCP.md).
+Two of those DHCP columns are about packets *not* handled, and they do not
+come from the same place or mean the same thing (issue #980).
+`socket_drop` is the kernel's per-socket `sk_drops` from `/proc/net/udp`,
+read by the agent directly: packets discarded because Kea's receive buffer
+was full, so Kea never saw them and no counter it keeps can report them.
+On a node short of CPU only this one moves, and it is the one the alert
+and the dashboard treat as loss.
+
+`receive_drop` is Kea's own `pkt4/6-receive-drop` — packets it read and then
+discarded — and is **context, not a fault**: it counts deliberate drops too.
+Verified against kea-dhcp4 3.0.3, a client matching a `DROP` client-class
+increments it once per packet, and a `DROP` class is exactly what the shipped
+DHCP MAC blocklist renders. See [`DHCP.md` §4c](features/DHCP.md).
 
 **Both are nullable, and NULL means UNMEASURED.** An agent older than #980,
-or one whose runtime cannot read `/proc/net/udp`, reports neither. Readers
-must render that as unknown — a 0 would say "this server has dropped
+or one whose runtime cannot read `/proc/net/udp`, reports no `socket_drop`.
+Readers must render that as unknown — a 0 would say "this server has dropped
 nothing", which is exactly the false reassurance #980 was filed about. The
 ingest endpoint therefore stores an omitted field as NULL rather than
-clamping it, and the `dhcp_packets_dropped` alert skips such a server
-rather than vouching for it.
+clamping it, the `dhcp_packets_dropped` alert skips such a server rather than
+vouching for it, and every "was this measured?" test keys on `socket_drop`
+alone (`receive_drop` always arrives from a #980 agent, so testing the pair
+would read an unmeasurable server as measured-and-clean). The InfluxDB
+exporter omits the field entirely rather than writing 0, since line protocol
+has no null.
 
 One more thing worth knowing about this endpoint: a second report for a
 bucket that already exists is **added** to it, not substituted. The agent

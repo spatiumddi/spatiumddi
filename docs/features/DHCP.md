@@ -652,19 +652,44 @@ Three counters, and only one of them moves:
 
 Verified against kea-dhcp4 3.0.3: a run that lost **9,700** datagrams to
 buffer overflow reported `pkt4-receive-drop = 0` for its entire duration.
-Both are now reported per 60 s bucket on `dhcp_metric_sample` as
-`socket_drop` and `receive_drop`; the server detail modal's **Stats** tab
-draws a dashed *DROPPED* line and a red `N dropped` chip, and the default-on
-**`dhcp_packets_dropped`** alert rule fires on any confirmed loss over a
-15-minute window (raise the rule's minimum-count threshold to alert only
-past a number of packets).
+Both are reported per 60 s bucket on `dhcp_metric_sample` as `socket_drop`
+and `receive_drop`, but only the first is treated as loss.
+
+> **`receive_drop` is context, not a fault.** Kea counts a packet there when
+> it reads one and throws it away — *including on purpose*. Verified against
+> kea-dhcp4 3.0.3: a client matching a `DROP` client-class increments it once
+> per packet, and a `DROP` class is exactly what the shipped
+> [DHCP MAC blocklist](#4a-dhcp-mac-blocklist) renders; Kea's HA hook drops
+> out-of-scope queries in `hot-standby` the same way. So the *DROPPED* line,
+> the `N dropped` chip and the alert rule all read `socket_drop` **alone** —
+> a rule that counted `receive_drop` would fire permanently, and never
+> auto-resolve, on any install with a blocklisted MAC or an HA pair.
+> `receive_drop` is still surfaced beside it, labelled as what it is.
+
+The server detail modal's **Stats** tab draws a dashed *DROPPED* line and a
+red `N dropped` chip from `socket_drop`, and the default-on
+**`dhcp_packets_dropped`** alert rule fires on any confirmed kernel-side loss
+over a 15-minute window (raise the rule's minimum-count threshold to alert
+only past a number of packets).
 
 > **`NULL` is not zero, anywhere in this chain.** An agent older than #980,
-> or one whose runtime cannot read `/proc/net/udp`, reports neither counter
+> or one whose runtime cannot read `/proc/net/udp`, reports no `socket_drop`
 > and the column stays NULL. That renders as *loss not measured*, the alert
 > skips the server rather than vouching for it, and nothing folds it to 0 —
 > a wall of green zeros from an un-upgraded fleet is precisely the false
-> reassurance this section exists to remove.
+> reassurance this section exists to remove. Every "was this measured?" test
+> keys on `socket_drop` **by itself**: `receive_drop` always arrives from a
+> #980 agent, so testing the pair would report a server whose kernel-side
+> loss is unmeasurable as measured-and-clean.
+>
+> A partial read counts as no read. If one of `/proc/net/udp` /
+> `/proc/net/udp6` exists but cannot be read, the whole sample is discarded
+> rather than returning the half that succeeded — otherwise the missing
+> inodes drop out of the baseline, and when the next read succeeds they
+> return as new sockets whose entire lifetime `sk_drops` is charged to that
+> one bucket. On a socket up for days that is a fabricated spike, on a rule
+> whose floor is one packet. (A file that is *absent* is different, and is
+> a valid partial answer: no IPv6 stack means no v6 sockets to miss.)
 >
 > One real blind spot: the AF_PACKET socket Kea opens for
 > `dhcp-socket-type: raw` is not covered. `/proc/net/packet` carries no drop
@@ -716,9 +741,15 @@ it up on upgrade (one Kea config-reload, no restart). Note this is a *resize*
 and not `enable-multi-threading: false` — with MT off one thread must both
 receive and process, which measured **15,170** socket drops in a run where a
 pool of one measured **none**, and it also changes host-reservation lookup
-order. Kea's HA hook keeps its own `http-client-threads` /
-`http-listener-threads`, unaffected by this value, so a failover pair's peer
-traffic is not serialised behind the single worker.
+order.
+
+Kea's HA hook does **not** keep independent HTTP pools by default —
+`http-listener-threads` / `http-client-threads` default to `0`, which Kea
+reads as *"same as `thread-pool-size`"*. Counting OS threads with the hook
+loaded: pool=1 gave 8, pool=8 gave 29, a delta of 21 for a pool delta of 7,
+i.e. three pools of N. Left alone, this change would have taken a failover
+pair's peer HTTP concurrency to 1 as an unmeasured side effect, so the agent
+pins both to 4 and the setting moves only the packet-worker pool.
 
 **`kea_packet_logging` defaults to on, which is exactly today's behaviour.**
 At INFO, Kea writes four lines per transaction to two appenders, one of them

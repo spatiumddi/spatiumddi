@@ -222,7 +222,7 @@ async def test_alert_fires_on_measured_socket_loss(db_session: AsyncSession) -> 
     srv = await _server_with_samples(db_session, [{"socket_drop": 12, "receive_drop": 0}])
     matches = await _matching_dhcp_packets_dropped_subjects(db_session, _rule())
     assert [m[0] for m in matches] == [str(srv.id)]
-    assert "12 dropped by the kernel" in matches[0][2]
+    assert "lost 12 packet(s)" in matches[0][2]
 
 
 async def test_alert_is_silent_when_loss_was_measured_as_zero(
@@ -242,14 +242,46 @@ async def test_alert_is_silent_when_loss_was_never_measured(
     assert await _matching_dhcp_packets_dropped_subjects(db_session, _rule()) == []
 
 
-async def test_alert_separates_the_two_kinds_of_loss(db_session: AsyncSession) -> None:
-    """They are fixed in different places — one is capacity, the other is
-    configuration — so the message must not merge them into one number."""
+async def test_alert_never_fires_on_receive_drop_alone(
+    db_session: AsyncSession,
+) -> None:
+    """THE REGRESSION THIS RULE MUST NOT HAVE.
+
+    ``pkt4-receive-drop`` counts packets Kea read and discarded ON PURPOSE as
+    well as by accident. Verified against kea-dhcp4 3.0.3: a client matching
+    a ``DROP`` client-class increments it once per blocked packet, and a
+    ``DROP`` class is exactly what the shipped DHCP MAC blocklist renders;
+    the HA hook drops out-of-scope queries in hot-standby the same way.
+
+    A default-on rule that counted it would therefore fire permanently, and
+    never auto-resolve, on two ordinary correctly-working configurations.
+    """
+    await _server_with_samples(db_session, [{"socket_drop": 0, "receive_drop": 5000}])
+    assert await _matching_dhcp_packets_dropped_subjects(db_session, _rule()) == []
+
+
+async def test_alert_is_silent_when_only_socket_drop_is_unmeasured(
+    db_session: AsyncSession,
+) -> None:
+    """The subtle half: ``receive_drop`` always arrives from a #980 agent, so
+    a server whose procfs is unreadable has receive_drop set and socket_drop
+    NULL. Testing the pair for "was this measured?" would call that
+    measured-and-clean; it must read as unmeasured."""
+    await _server_with_samples(db_session, [{"receive_drop": 3}])
+    assert await _matching_dhcp_packets_dropped_subjects(db_session, _rule()) == []
+
+
+async def test_alert_reports_receive_drop_as_context_when_it_fires(
+    db_session: AsyncSession,
+) -> None:
+    """It is not the trigger, but it is worth telling the operator about —
+    labelled as possibly-deliberate rather than as lost traffic."""
     await _server_with_samples(db_session, [{"socket_drop": 7, "receive_drop": 3}])
     matches = await _matching_dhcp_packets_dropped_subjects(db_session, _rule())
     msg = matches[0][2]
-    assert "7 dropped by the kernel" in msg
-    assert "3 read and then discarded" in msg
+    assert "lost 7 packet(s)" in msg
+    assert "3 packet(s) were read and then discarded" in msg
+    assert "deliberate drops" in msg
 
 
 async def test_alert_floor_is_honoured(db_session: AsyncSession) -> None:

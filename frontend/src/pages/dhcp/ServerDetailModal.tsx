@@ -803,19 +803,26 @@ function StatsTab({ serverId }: { serverId: string }) {
       nak: b.nak,
       decline: b.decline,
       release: b.release,
-      // #980 — null (not measured) must stay null. Recharts breaks the line
-      // at a null point, which is the honest rendering: a gap where nobody
-      // looked, rather than a zero that reads as "nothing was lost".
-      dropped:
-        b.socket_drop === null && b.receive_drop === null
-          ? null
-          : (b.socket_drop ?? 0) + (b.receive_drop ?? 0),
+      // #980 — DROPPED is socket_drop ALONE. receive_drop counts packets
+      // Kea read and threw away on purpose as well as by accident: a
+      // blocklisted MAC (the shipped DHCP MAC blocklist renders a Kea DROP
+      // class) and an HA standby declining an out-of-scope query both land
+      // there. Adding it in would draw a permanent "loss" line on a
+      // correctly-working server.
+      //
+      // Null (not measured) stays null, and is keyed on socket_drop by
+      // itself — receive_drop always arrives from a #980 agent, so testing
+      // the pair would render an unmeasurable server as measured-and-clean.
+      // Recharts breaks the line at a null point, which is the honest
+      // rendering: a gap where nobody looked, not a zero.
+      dropped: b.socket_drop,
     }));
   }, [data, withDate]);
 
   // #980 — three states, not two. Loss measured and non-zero; loss measured
   // and zero; loss never measured (an agent older than #980, or one that
   // cannot read /proc/net/udp). The third must not render as the second.
+  // Keyed on socket_drop only — see the `dropped` mapping above.
   const loss = useMemo(() => {
     const measured = points.filter((p) => p.dropped !== null);
     if (measured.length === 0) return { measured: false, total: 0 };
@@ -870,14 +877,14 @@ function StatsTab({ serverId }: { serverId: string }) {
               (!loss.measured ? (
                 <span
                   className="rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground"
-                  title="This server's agent does not report packet loss (it predates the counters, or cannot read /proc/net/udp). This is NOT the same as reporting no loss."
+                  title="This server's agent does not report kernel-side packet loss (it predates the counters, or cannot read /proc/net/udp). This is NOT the same as reporting no loss."
                 >
                   loss not measured
                 </span>
               ) : loss.total > 0 ? (
                 <span
                   className="rounded bg-rose-500/15 px-1.5 py-0.5 text-[10px] font-medium text-rose-600"
-                  title="Packets lost before or during receive. Most often the node is short of CPU: Kea answers 100% of what it reads, so no other signal shows this."
+                  title="Packets the kernel discarded before the server could read them — its receive buffer filled. Most often the node is short of CPU: Kea answers 100% of what it reads, so no other signal shows this. Does not count packets Kea read and dropped on purpose, such as a blocklisted MAC."
                 >
                   {loss.total} dropped
                 </span>

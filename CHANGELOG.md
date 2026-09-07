@@ -35,16 +35,30 @@ the formatter handles the rest.
   from the server looks like somebody else's problem. Two per-bucket
   counters now name it: `socket_drop`, the kernel's per-socket
   `sk_drops` read from `/proc/net/udp` by the agent, and
-  `receive_drop`, Kea's own. Both surface on the server's Stats tab
-  (a dashed *DROPPED* line and a red `N dropped` chip) and drive the
-  new default-on **`dhcp_packets_dropped`** alert rule.
+  `receive_drop`, Kea's own. Both are reported, but only
+  `socket_drop` is treated as loss: the *DROPPED* line, the red
+  `N dropped` chip on the server's Stats tab and the new default-on
+  **`dhcp_packets_dropped`** alert rule all read it alone.
+  `pkt4-receive-drop` counts packets Kea read and discarded **on
+  purpose** as well as by accident — verified, a client matching a
+  `DROP` client-class increments it once per packet, and a `DROP`
+  class is exactly what the shipped DHCP MAC blocklist renders (Kea's
+  HA hook drops out-of-scope queries in hot-standby the same way), so
+  a rule counting it would fire permanently and never auto-resolve on
+  two ordinary working configurations. It is surfaced beside the
+  other, labelled as context rather than fault.
 
   **NULL is not zero.** An agent older than this change, or one that
-  cannot read `/proc/net/udp`, reports neither counter; the columns
-  stay NULL, the UI says *loss not measured*, and the alert skips
+  cannot read `/proc/net/udp`, reports no `socket_drop`; the column
+  stays NULL, the UI says *loss not measured*, and the alert skips
   such a server rather than vouching for it. A wall of green zeros
   from an un-upgraded fleet is the exact false reassurance the issue
-  was about.
+  was about. Every "was this measured?" test keys on `socket_drop`
+  alone — `receive_drop` always arrives from an upgraded agent, so
+  testing the pair would read an unmeasurable server as
+  measured-and-clean — and a *partial* procfs read discards the whole
+  sample, because a missing inode returning later would charge its
+  entire lifetime of drops to one bucket.
 
   **The issue's two proposed mitigations do not work, and a third
   nobody proposed does.** A larger `packet-queue-size` is inert — 64
@@ -70,9 +84,12 @@ the formatter handles the rest.
   *resize*, deliberately not `enable-multi-threading: false` — with
   MT off one thread must both receive and process, measuring 15,170
   socket drops in a run where a pool of one measured none, and it
-  also flips host-reservation lookup order. Kea's HA hook keeps its
-  own `http-client-threads` / `http-listener-threads`, so a failover
-  pair's peer traffic is not serialised behind the single worker.
+  also flips host-reservation lookup order. Kea's HA hook does *not*
+  keep independent HTTP pools — `http-listener-threads` /
+  `http-client-threads` default to 0, which Kea reads as "same as
+  `thread-pool-size`" (counted: pool=1 gave 8 OS threads, pool=8 gave
+  29, three pools of N) — so the agent pins both to 4 and this
+  setting moves only the packet-worker pool.
 
   A second group setting, **`kea_packet_logging`**, defaults to
   **true** — exactly today's behaviour. Kea writes four INFO lines
@@ -86,6 +103,12 @@ the formatter handles the rest.
   carries `DHCP4_OPEN_SOCKETS_FAILED`, `DHCP4_CONFIG_COMPLETE`,
   `DHCP4_STARTED` and `DHCP4_MULTI_THREADING_INFO` — the line that
   confirms the pool size took effect.
+
+  Turning packet logging off appends a `kea-dhcpN.packets` child
+  logger at WARN with **no appenders of its own** — verified that a
+  child configured with only a severity inherits the parent's, so
+  giving it a copy would put a second `RollingFileAppender` on one
+  path with independent rotation state.
 
   **Found on the way:** the metrics ingest endpoint *substituted*
   rather than accumulated when a bucket already existed. The agent

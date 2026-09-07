@@ -1648,11 +1648,15 @@ suggestion, free-space treemap.
   it counts packets Kea *read* and discarded, and this loss is the kernel
   discarding them first. The number that moves is the per-socket `sk_drops`
   in `/proc/net/udp`, the same event as the `Udp RcvbufErrors` the reporter
-  saw. Both are now per-bucket columns on `dhcp_metric_sample`, a dashed
-  DROPPED line + chip on the Stats tab, and the default-on
-  `dhcp_packets_dropped` rule. **NULL means unmeasured** in every surface —
-  an agent too old to report is skipped by the alert, not vouched for, since
-  a wall of green zeros is the false reassurance being fixed.
+  saw. Both are per-bucket columns on `dhcp_metric_sample`, but only
+  `socket_drop` is treated as loss — the DROPPED line, the chip and the
+  default-on `dhcp_packets_dropped` rule all read it alone. **`pkt4-receive-drop`
+  counts deliberate drops too**: verified, a `DROP` client-class match
+  increments it, and a `DROP` class is exactly what the shipped MAC blocklist
+  renders, so a rule counting it would fire permanently on a working install.
+  **NULL means unmeasured** in every surface, keyed on `socket_drop` alone —
+  `receive_drop` always arrives from an upgraded agent, so testing the pair
+  would read an unmeasurable server as measured-and-clean.
   **Its two mitigations are dead ends.** `packet-queue-size` 64 → 2048 (32x)
   changed neither throughput nor drops: that queue sits *behind* the receive
   thread. A bigger receive buffer was already known to trade drops for a 34 s
@@ -1667,8 +1671,11 @@ suggestion, free-space treemap.
   and existing groups pick it up on upgrade. Deliberately a *resize*, not
   `enable-multi-threading: false`: MT-off makes one thread both receive and
   process (15,170 socket drops where pool 1 had none) and flips
-  host-reservation lookup order. Kea's HA hook keeps its own HTTP thread
-  pools, so a failover pair is unaffected.
+  host-reservation lookup order. **Kea's HA hook does NOT keep independent
+  HTTP pools** — `http-listener-threads` / `http-client-threads` default to 0,
+  which Kea reads as "same as `thread-pool-size`" (counted: pool=1 → 8 OS
+  threads, pool=8 → 29, three pools of N), so the agent pins both to 4 rather
+  than let a packet-path fix silently serialise HA peer traffic.
   Second knob `kea_packet_logging` (default **true** = today's behaviour) is
   worth 1.30x when turned off, and is opt-in because it removes two log codes
   an operator can see — the #637 lease-cache call. `kea-dhcpN.dhcpN` is never

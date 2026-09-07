@@ -885,6 +885,11 @@ def _resolve_peer_url(url: str) -> str:
         return url
 
 
+# #980 — see the ``multi-threading`` block in _ha_hook for why the HA hook's
+# HTTP pools are pinned rather than left to follow the packet-worker pool.
+_HA_HTTP_THREADS = 4
+
+
 def _ha_hook(failover: dict[str, Any]) -> dict[str, Any]:
     """Render the ``libdhcp_ha.so`` hook entry from a failover payload.
 
@@ -904,6 +909,31 @@ def _ha_hook(failover: dict[str, Any]) -> dict[str, Any]:
         for p in failover["peers"]
     ]
     relationship = {
+        # #980 — pin the HA hook's OWN thread pools.
+        #
+        # ``http-listener-threads`` / ``http-client-threads`` default to 0,
+        # which Kea reads as "same as the core ``thread-pool-size``" — NOT as
+        # an independent auto-size. Verified by counting OS threads on
+        # kea-dhcp4 3.0.3 with the HA hook loaded: pool=1 gave 8 threads and
+        # pool=8 gave 29, a delta of 21 for a pool delta of 7, i.e. three
+        # pools of N. So #980's drop of the packet-worker pool to 1 would
+        # also have taken HA's peer HTTP concurrency to 1, serialising lease
+        # updates to the partner — an unmeasured side effect on a code path
+        # #980 never tested, in exactly the device-rush conditions it is
+        # about.
+        #
+        # 4 is a decoupling constant, not a tuned one: the point is that the
+        # packet-path fix must not silently change HA's concurrency, and the
+        # HA threads do short LAN HTTP POSTs that never contend for the
+        # receive thread the pool size exists to protect. With this block the
+        # same measurement gives 14 threads at pool=1 and 21 at pool=8 — a
+        # delta of exactly the core pool.
+        "multi-threading": {
+            "enable-multi-threading": True,
+            "http-dedicated-listener": True,
+            "http-listener-threads": _HA_HTTP_THREADS,
+            "http-client-threads": _HA_HTTP_THREADS,
+        },
         "this-server-name": failover["this_server_name"],
         "mode": failover["mode"],
         "heartbeat-delay": int(failover.get("heartbeat_delay_ms", 10000)),
@@ -928,11 +958,9 @@ def _log_outputs(daemon: str) -> list[dict[str, Any]]:
         the Logs UI's "DHCP Activity" tab. Kea rotates the file in-process
         via ``maxsize`` / ``maxver`` so we don't need external logrotate.
 
-    Shared rather than repeated because the #980 ``.packets`` override has to
-    name the SAME appenders — log4cplus gives a logger configured by name no
-    inherited appenders, so a mismatch here would not raise that child's
-    level, it would send its WARNs and ERRORs to a different file or to
-    nowhere.
+    Shared by the Dhcp4 and Dhcp6 root loggers so the path is defined once.
+    The #980 ``.packets`` override deliberately does NOT use this — it
+    inherits instead, so there is only ever one appender per file.
     """
     return [
         {"output": "stdout"},
@@ -965,17 +993,22 @@ def _quiet_packet_logger(daemon: str, server: dict[str, Any]) -> list[dict[str, 
 
     Absent from the bundle means True — an older control plane's bundle must
     keep the logging its operator can see today.
+
+    **No ``output_options``, deliberately.** A child logger configured with
+    only a severity inherits the parent's appenders — verified against
+    kea-dhcp4 3.0.3: with the child at DEBUG and no outputs of its own, every
+    ``DHCP4_PACKET_RECEIVED`` still reached both stdout and the shipped file,
+    and at WARN none did while the parent's INFO lines kept flowing. Giving
+    it a copy of the parent's appenders also works, but puts a SECOND
+    RollingFileAppender on ``/var/log/kea/<daemon>.log`` with its own
+    independent rotation state: at the 50 MB threshold one appender renames
+    the file while the other still holds the old descriptor, so lines land in
+    the rotated copy and the next rotation clobbers it. Inheriting avoids
+    that for free.
     """
     if server.get("kea_packet_logging", True):
         return []
-    return [
-        {
-            "name": f"{daemon}.packets",
-            # Same appenders as the parent — see _log_outputs.
-            "output_options": _log_outputs(daemon),
-            "severity": "WARN",
-        }
-    ]
+    return [{"name": f"{daemon}.packets", "severity": "WARN"}]
 
 
 def _multi_threading(server: dict[str, Any]) -> dict[str, Any]:

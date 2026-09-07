@@ -149,10 +149,15 @@ class DHCPServerGroup(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # order, ``dhcp-queue-control`` staying disabled) is unchanged — which is
     # why this rather than ``enable-multi-threading: false``, whose single
     # thread must both receive and process and measured 15,170 socket drops
-    # in a run where pool=1 measured 0. Kea's HA hook keeps its own
-    # ``http-client-threads`` / ``http-listener-threads``, unaffected by this
-    # value, so a failover pair's peer traffic is not serialised behind the
-    # one worker.
+    # in a run where pool=1 measured 0.
+    #
+    # Kea's HA hook does NOT keep independent HTTP pools by default:
+    # ``http-listener-threads`` / ``http-client-threads`` default to 0, which
+    # Kea reads as "same as thread-pool-size". Verified by counting OS
+    # threads with the HA hook loaded — pool=1 gave 8 and pool=8 gave 29, a
+    # delta of 21 for a pool delta of 7, i.e. three pools of N. So the agent
+    # pins them (``_HA_HTTP_THREADS`` in ``render_kea.py``) and this setting
+    # moves only the packet-worker pool.
     #
     # ``0`` restores Kea's auto-sizing for an operator who measures otherwise.
     kea_thread_pool_size: Mapped[int] = mapped_column(
