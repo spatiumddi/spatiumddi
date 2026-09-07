@@ -48,6 +48,13 @@ jobs:
           load: ${{ github.event_name == 'pull_request' }}
           tags: |
             ghcr.io/spatiumddi/appliance-builder:latest
-          platforms: linux/amd64
+          # Both, since #991. The appliance ISO is x86-64 and mkosi
+          # cross-builds it happily, but the builder itself cannot be
+          # EMULATED: under qemu-user / Rosetta mkosi dies immediately on
+          # mount_setattr(2) ("Function not implemented"), which the
+          # syscall translation layers do not implement and --privileged
+          # does not fix. So an arm64 developer needs a NATIVE arm64
+          # builder, and this is where it comes from.
+          platforms: linux/amd64,linux/arm64
           cache-from: type=gha
           cache-to: type=gha,mode=max

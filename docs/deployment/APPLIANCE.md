@@ -1379,6 +1379,36 @@ The builder image's `Dockerfile` lives at `appliance/builder/Dockerfile`
 and republishes via `.github/workflows/build-appliance-builder.yml` on
 changes to `appliance/builder/**`.
 
+**The builder is multi-arch; the ISO is not.** Since #991 the image
+publishes for `linux/amd64` *and* `linux/arm64`, so a developer on an
+Apple Silicon Mac or an ARM server gets a native builder and mkosi
+cross-builds the x86-64 image inside it. One `Dockerfile` serves both:
+`grub-pc-bin` and `grub-efi-amd64-bin` are amd64-only packages carrying
+only the x86 GRUB modules grub-mkrescue embeds in the ISO, so on arm64
+they install via `dpkg --add-architecture amd64` alongside the native
+`grub-mkrescue`. On amd64 the `:amd64` qualifiers name the native
+architecture and nothing changes. Verified: both builds produce an ISO
+with the same El Torito catalogue — a BIOS record at
+`/boot/grub/i386-pc/eltorito.img` and a UEFI record at `/efi.img`.
+
+**Running the builder emulated is a dead end — do not spend an afternoon
+on it.** With `--platform linux/amd64` on an arm64 host, mkosi fails
+immediately:
+
+```
+mkosi was unable to invoke the mount_setattr() system call.
+OSError: [Errno 38] Function not implemented
+```
+
+`mount_setattr(2)` belongs to the new mount API, which neither qemu-user
+nor Rosetta implements. The kernel inside the Docker Desktop VM supports
+it; the syscall translation layer does not, and `--privileged` does not
+help. The supported path is a native builder plus mkosi's own
+cross-build, which is what `make appliance-baked-iso-cross` does. See
+`appliance/README.md` for the full recipe, including the two
+`DOCKER_DEFAULT_PLATFORM` halves and the `docker save --platform`
+requirement under Docker Desktop's containerd image store.
+
 ### Phase 1 (current — landed 2026-05)
 
 ```

@@ -126,6 +126,9 @@ of the migration, see the **"Why k3s"** section in
   chart` packages the Helm chart; `appliance/scripts/bake-images
   .sh` compresses image archives.
 - ~2 GiB free disk in the build directory.
+- On an **arm64 host** (Apple Silicon, an ARM server): nothing extra, but
+  use `make appliance-baked-iso-cross` rather than `make appliance-baked-iso`
+  — see *Building on Apple Silicon / any arm64 host* below.
 
 The build runs `docker run --privileged` because mkosi needs loop
 devices, kernel namespaces, and bind-mounts to bootstrap the rootfs.
@@ -147,6 +150,91 @@ inside it, and writes:
 
 ~5–10 min on a modern laptop with warm caches; first build is slower
 because mkosi populates its apt cache.
+
+### Building on Apple Silicon / any arm64 host
+
+The ISO is x86-64 (`Architecture=x86-64` in `mkosi.conf`) and cross-builds
+fine from arm64 — on an M4 the whole run is *faster* than the old amd64
+Linux box (~3 min for `make build` with warm buildkit layers, ~11 min for
+bake → mkosi → ISO → slot image). One command does it:
+
+```sh
+make appliance-baked-iso-cross
+```
+
+Three things that target handles, each of which is a real failure if you
+drive the steps by hand:
+
+**1. The builder must run NATIVE — the emulated path is a dead end.**
+`ghcr.io/spatiumddi/appliance-builder` is published for both
+architectures (since #991), so on arm64 you get an arm64 builder and
+mkosi cross-builds x86-64 inside it. Do *not* reach for
+`--platform linux/amd64` on the builder: under qemu-user or Rosetta,
+mkosi dies immediately with
+
+```
+mkosi was unable to invoke the mount_setattr() system call.
+OSError: [Errno 38] Function not implemented: '…/mkosi-workspace-…/root'
+```
+
+`mount_setattr(2)` is part of the new mount API, which neither
+translation layer implements. The kernel in the Docker Desktop VM is
+fine; the syscall translation is not, and **no amount of `--privileged`
+fixes it.** Cross-building works because the Docker Desktop VM registers
+`x86_64` binfmt handlers with the `F` flag, so the amd64 dpkg maintainer
+scripts mkosi chroots into run under emulation transparently. Loop mounts
+and `mount -o loop,offset=` on files under the bind-mounted macOS volume
+work too, which `wrap-iso.sh` and `build-slot-image.sh` both depend on.
+
+**2. The two halves of the build need opposite environments.** App-image
+builds and third-party pulls want `DOCKER_DEFAULT_PLATFORM=linux/amd64`;
+mkosi, the ISO wrap and the slot image need it *unset* so the builder runs
+native. A single `make appliance-baked-iso` runs both halves under one
+environment, which is why the cross target sets the variable per recipe
+line instead.
+
+**3. `docker save` needs a platform under the containerd image store.**
+Docker Desktop uses the containerd snapshotter, where `docker save` of a
+registry image fails when its index lists platforms whose blobs were never
+pulled:
+
+```
+Error response from daemon: unable to create manifests file:
+NotFound: content digest sha256:… : not found
+```
+
+`BAKE_SAVE_PLATFORM` (which the cross target sets) adds
+`docker save --platform` and an unconditional `docker pull --platform` for
+third-party images. That second half matters as much as the first: on a
+dev laptop `redis:8.8-alpine` and `nginx:…` are usually already present
+**as arm64** from the dev compose stack, they satisfy
+`docker image inspect`, and without the pin they would be baked silently —
+the appliance's Redis then crash-loops with `exec format error`.
+`make appliance-verify-arch` asserts this before the bake rather than
+leaving it to be discovered on the appliance; the cross target runs it for
+you.
+
+Empty `BAKE_SAVE_PLATFORM` is CI's default and is byte-for-byte the old
+behaviour.
+
+**Verifying the result.** Check freshness by epoch (`stat -f %m` on macOS,
+not `-c`), and check the contents by loop-mounting the raw — root is
+partition 3, at offset `2101248*512` — then:
+
+```sh
+chroot /mnt dpkg --print-architecture      # must print: amd64
+ls /mnt/var/lib/rancher/k3s/agent/images/  # the baked *.tar.zst archives
+```
+
+A byte-grep of the `.iso` proves nothing: the rootfs is compressed.
+
+**Side effect worth knowing.** `make build` retags the `spatiumddi-*:dev`
+images the dev compose stack uses, so after a cross-build the dev stack
+would start amd64 images under emulation. Restore them with:
+
+```sh
+docker compose -f docker-compose.dev.yml build
+```
 
 ### Iterating on the builder image
 

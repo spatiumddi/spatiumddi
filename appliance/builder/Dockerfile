@@ -20,7 +20,25 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 # Versions are pinned by the trixie release; bumping mkosi is a
 # debian-archive update inside this image.
-RUN apt-get update && apt-get install -y --no-install-recommends \
+#
+# ``dpkg --add-architecture amd64`` is what lets this one Dockerfile
+# build natively on BOTH architectures (#991). ``grub-pc-bin`` and
+# ``grub-efi-amd64-bin`` are amd64-only packages — they ship no code that
+# runs on the build host, only the x86 GRUB modules under
+# ``/usr/lib/grub/{i386-pc,x86_64-efi}`` that grub-mkrescue embeds in the
+# ISO — so on arm64 they install as a foreign architecture alongside the
+# native ``grub2-common`` / ``grub-mkrescue``. On amd64 the ``:amd64``
+# qualifiers name the native architecture and nothing changes.
+#
+# **Why an arm64 builder has to exist at all.** mkosi cross-builds x86-64
+# quite happily, but the builder itself cannot be *emulated*: under
+# qemu-user / Rosetta mkosi dies immediately on ``mount_setattr(2)``
+# ("Function not implemented"), part of the new mount API that the syscall
+# translation layers do not implement. The kernel in the Docker Desktop VM
+# is fine; the translation layer is not, and no amount of ``--privileged``
+# helps. So the builder runs NATIVE and mkosi cross-builds — which is also
+# why ``build-appliance-builder.yml`` publishes both platforms.
+RUN dpkg --add-architecture amd64 && apt-get update && apt-get install -y --no-install-recommends \
         mkosi \
         qemu-utils \
         debian-archive-keyring \
@@ -44,8 +62,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         systemd-repart \
         systemd-ukify \
         grub2-common \
-        grub-pc-bin \
-        grub-efi-amd64-bin \
+        grub-pc-bin:amd64 \
+        grub-efi-amd64-bin:amd64 \
         # Phase 2 — true hybrid live ISO. grub-mkrescue (in
         # grub-common) builds the ISO with BIOS El Torito + UEFI El
         # Torito + USB-dd-bootable hybrid MBR. grub-pc-bin supplies
