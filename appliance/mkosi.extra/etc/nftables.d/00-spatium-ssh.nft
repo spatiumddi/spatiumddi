@@ -1,10 +1,13 @@
 # SpatiumDDI SSH management floor (#1009).
 #
-# Opens port 22 unconditionally from the very first boot, before the
-# supervisor exists and before any drop-in has been rendered — the
-# management escape hatch `docs/design/FLEET_FIREWALL.md` §6.1 calls the
-# irreducible recovery channel, and the mitigation its risk register names
-# for every OTHER firewall risk (a bad Web-UI scope, a peer-CIDR typo).
+# Opens port 22 from the very first boot — before the supervisor exists and
+# before any drop-in has been rendered — unless the operator has turned on
+# `ssh_lockdown`, which retires this file (see Retirement below).
+#
+# By default, then, it is the management escape hatch
+# `docs/design/FLEET_FIREWALL.md` §6.1 calls the irreducible recovery
+# channel, and the mitigation its risk register names for every OTHER
+# firewall risk (a bad Web-UI scope, a peer-CIDR typo).
 #
 # Why it moved here from /etc/nftables.conf. It was a bare rule in the base
 # chain, ABOVE the `include "/etc/nftables.d/*.nft"` glob. nftables is

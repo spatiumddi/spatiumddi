@@ -153,6 +153,15 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: python3 scripts/lint_appliance_runners.py
 
+      # #1009 — no surface may promise SSH/22 as an unconditional recovery
+      # path, which ``ssh_lockdown`` made false. Lives here rather than in
+      # the backend suite because it reads ``frontend/src`` (where four of
+      # the seven stale claims were) and the backend shards are path-filtered
+      # off frontend changes. stdlib-only, no database; runs from repo root.
+      - name: SSH recovery-claim linter
+        working-directory: ${{ github.workspace }}
+        run: python3 scripts/lint_ssh_recovery_claims.py
+
   # The ~1900-test suite is DB-bound, so we fan it out across 8 parallel
   # jobs (free concurrent runners) via pytest-split; each job still runs
   # ``-n auto`` (4 xdist workers on a 4-vCPU runner) → ~32-way parallelism

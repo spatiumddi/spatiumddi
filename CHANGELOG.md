@@ -57,6 +57,17 @@ the formatter handles the rest.
   operators actually make, caught at the moment they make it
   rather than at their next SSH attempt.
 
+  **The two lockdowns compose, and nothing checks it.** Scope the
+  Web UI *and* enable this with a scope that excludes you, and the
+  console is what remains. Neither setting can see the other, so
+  neither warns; every surface that used to promise SSH as an
+  unconditional recovery path now names the console first and
+  treats SSH as conditional. `test_ssh_recovery_claims.py` asserts
+  on the *claim* rather than its wording — three earlier passes
+  each grepped for the previous phrasing and missed the next
+  paraphrase, and the guard caught two false UI strings that all
+  three had walked past.
+
 ### Security
 
 - **The SSH source-CIDR allowlist was discarded and the port

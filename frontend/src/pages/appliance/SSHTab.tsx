@@ -52,9 +52,10 @@ export function SSHTab() {
           centrally; the rendered <code>authorized_keys</code> +{" "}
           <code>/etc/ssh/sshd_config.d/spatiumddi.conf</code> ship through the
           ConfigBundle long-poll, validated host-side via <code>sshd -t</code>{" "}
-          before activation. The SSH port is firewall-scoped to the allowed
-          source networks; port 22 always stays open as an escape hatch so a bad
-          change can't lock you out.
+          before activation. Port 22 stays open in the host firewall as an
+          escape hatch, so a bad port change can&rsquo;t lock you out — until
+          the source restriction is enabled, which scopes the SSH port to the
+          allowed networks and retires that floor.
         </p>
       </div>
       <SSHSection
