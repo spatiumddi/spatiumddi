@@ -499,6 +499,14 @@ class KeaDriver(DHCPDriver):
                 # #637 — group-wide Kea lease cache, rendered explicitly because
                 # Kea 3.0 flipped the default from off to 0.25.
                 "cache-threshold": bundle.lease_cache_threshold,
+                # #980 — rendered explicitly because Kea's own default sizes
+                # the packet-worker pool from the machine's CPU count, not
+                # from the cgroup share the container holds. See
+                # ``DHCPServerGroup.kea_thread_pool_size`` for the numbers.
+                "multi-threading": {
+                    "enable-multi-threading": True,
+                    "thread-pool-size": bundle.kea_thread_pool_size,
+                },
                 # Issue #365 — ``raw`` (group socket_mode "direct") receives
                 # broadcast DISCOVERs from directly-attached clients; ``udp``
                 # is relay-only. v6 below has no socket-type concept.
@@ -541,6 +549,12 @@ class KeaDriver(DHCPDriver):
                 "host-reservation-identifiers": ["duid", "hw-address"],
                 # #637 — see the Dhcp4 block.
                 "cache-threshold": bundle.lease_cache_threshold,
+                # #980 — see the Dhcp4 block. Separate process, separate pool,
+                # same node's CPU.
+                "multi-threading": {
+                    "enable-multi-threading": True,
+                    "thread-pool-size": bundle.kea_thread_pool_size,
+                },
                 "lease-database": {
                     "type": "memfile",
                     "persist": True,

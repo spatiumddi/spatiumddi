@@ -384,6 +384,15 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
     lease_cache_threshold = 0.0 if _group_threshold is None else float(_group_threshold)
     lease_cache_max_age = getattr(group, "lease_cache_max_age", None) if group else None
 
+    # #980 — Kea packet-worker pool size. ``is None`` rather than ``or``: 0 is
+    # a real value here (it means "let Kea auto-size"), so a truthiness
+    # coalesce would silently rewrite the one setting an operator uses to opt
+    # back out of this change into the default they were opting out of.
+    _pool = getattr(group, "kea_thread_pool_size", None) if group else None
+    kea_thread_pool_size = 1 if _pool is None else int(_pool)
+    _pktlog = getattr(group, "kea_packet_logging", None) if group else None
+    kea_packet_logging = True if _pktlog is None else bool(_pktlog)
+
     bundle = ConfigBundle(
         server_id=str(server.id),
         server_name=server.name,
@@ -401,6 +410,8 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
         dhcp_socket_type=dhcp_socket_type,
         lease_cache_threshold=lease_cache_threshold,
         lease_cache_max_age=lease_cache_max_age,
+        kea_thread_pool_size=kea_thread_pool_size,
+        kea_packet_logging=kea_packet_logging,
         ra_configs=tuple(ra_configs),
         radvd_conf=radvd_conf,
     )

@@ -918,6 +918,104 @@ def _ha_hook(failover: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _log_outputs(daemon: str) -> list[dict[str, Any]]:
+    """The two appenders every Kea logger in this config writes to.
+
+    Two outputs by design:
+      * stdout — picked up by ``docker logs`` for the existing operator
+        workflow.
+      * file — tailed by ``LogShipper`` and shipped to the control plane for
+        the Logs UI's "DHCP Activity" tab. Kea rotates the file in-process
+        via ``maxsize`` / ``maxver`` so we don't need external logrotate.
+
+    Shared rather than repeated because the #980 ``.packets`` override has to
+    name the SAME appenders — log4cplus gives a logger configured by name no
+    inherited appenders, so a mismatch here would not raise that child's
+    level, it would send its WARNs and ERRORs to a different file or to
+    nowhere.
+    """
+    return [
+        {"output": "stdout"},
+        {
+            "output": f"/var/log/kea/{daemon}.log",
+            "maxsize": 50_000_000,
+            "maxver": 5,
+            "flush": True,
+        },
+    ]
+
+
+def _quiet_packet_logger(daemon: str, server: dict[str, Any]) -> list[dict[str, Any]]:
+    """The ``kea-dhcpN.packets`` override, or nothing (#980).
+
+    Kea writes four INFO lines per transaction. Two of them —
+    ``DHCP4_PACKET_RECEIVED`` and ``DHCP4_PACKET_SEND``, both from the
+    ``.packets`` child logger — restate a transaction the ``.dhcp4`` and
+    ``.leases`` lines already record, adding the source address and the
+    receiving interface. Raising just that child to WARN measured 1.30x more
+    packets served on a CPU-constrained node (24,997-26,077 against
+    19,026-20,403 at 0.25 CPU and 12,000 offered pkt/s).
+
+    Only that one child. ``kea-dhcpN.dhcpN`` is the obvious-looking second
+    candidate and it also carries ``DHCP4_OPEN_SOCKETS_FAILED`` — a genuine
+    failure Kea logs at INFO — plus ``DHCP4_CONFIG_COMPLETE``,
+    ``DHCP4_STARTED`` and ``DHCP4_MULTI_THREADING_INFO``, which is the line
+    that reports whether the #980 pool size took effect. Silencing it would
+    trade a diagnosis for a throughput number.
+
+    Absent from the bundle means True — an older control plane's bundle must
+    keep the logging its operator can see today.
+    """
+    if server.get("kea_packet_logging", True):
+        return []
+    return [
+        {
+            "name": f"{daemon}.packets",
+            # Same appenders as the parent — see _log_outputs.
+            "output_options": _log_outputs(daemon),
+            "severity": "WARN",
+        }
+    ]
+
+
+def _multi_threading(server: dict[str, Any]) -> dict[str, Any]:
+    """Render Kea's ``multi-threading`` block from the bundle (#980).
+
+    Kea leaves ``thread-pool-size`` at 0, meaning "one worker per CPU the
+    machine reports" — ``hardware_concurrency()``, which knows nothing about
+    the cgroup quota or weight the container is actually held to. Those
+    workers then compete, inside that one cgroup, with the single thread that
+    has to drain the receive socket, and when it is late the kernel drops
+    datagrams before Kea can see them. That loss is invisible to every
+    counter Kea keeps: measured on kea-dhcp4 3.0.3, a run that lost 9,700
+    datagrams that way reported ``pkt4-receive-drop`` 0 throughout.
+
+    Fewer workers measured strictly better at every CPU allocation tried
+    (12,000 relayed pkt/s, memfile, median of 4; packets served): at 0.25
+    CPU 19,381 for one worker against 11,119 for two and 6,723 for four; with
+    four CPUs and no quota, 93,717 / 73,089 / 55,957. Hence the control
+    plane's default of 1.
+
+    ``enable-multi-threading`` stays **true** even at a pool of one, so this
+    is a resize and not a mode change: the receive thread remains separate
+    from the worker (with MT off, one thread must do both, which measured
+    15,170 socket drops in a run where a pool of one measured none), and
+    host-reservation lookup order and the disabling of ``dhcp-queue-control``
+    are unchanged.
+
+    A bundle from a control plane older than #980 carries no value; 1 is
+    assumed rather than Kea's 0, because "the field is absent" and "the
+    operator asked for auto-sizing" must not render the same way — the whole
+    point is that auto is the wrong answer here. An explicit 0 IS honoured
+    and hands sizing back to Kea.
+    """
+    size = server.get("kea_thread_pool_size")
+    return {
+        "enable-multi-threading": True,
+        "thread-pool-size": 1 if size is None else int(size),
+    }
+
+
 def render(
     bundle: dict[str, Any],
     *,
@@ -988,6 +1086,9 @@ def render(
         # 0.25, which would silently suppress the memfile writes that drive
         # lease-events → DDNS + the IPAM lease mirror. See _apply_lease_cache.
         "cache-threshold": float(server.get("lease_cache_threshold") or 0.0),
+        # #980 — see _multi_threading. Rendered on every bundle, so the ETag
+        # already covers it via the "server" block it reads from.
+        "multi-threading": _multi_threading(server),
         "renew-timer": 900,
         "rebind-timer": 1800,
         "hooks-libraries": [
@@ -996,25 +1097,13 @@ def render(
         "loggers": [
             {
                 "name": "kea-dhcp4",
-                # Two outputs by design:
-                #   * stdout — picked up by `docker logs` for the
-                #     existing operator workflow.
-                #   * file — tailed by ``LogShipper`` and shipped to
-                #     the control plane for the Logs UI's "DHCP
-                #     Activity" tab. Kea rotates the file in-process
-                #     via ``maxsize`` / ``maxver`` so we don't need
-                #     external logrotate.
-                "output_options": [
-                    {"output": "stdout"},
-                    {
-                        "output": "/var/log/kea/kea-dhcp4.log",
-                        "maxsize": 50_000_000,
-                        "maxver": 5,
-                        "flush": True,
-                    },
-                ],
+                "output_options": _log_outputs("kea-dhcp4"),
                 "severity": "INFO",
-            }
+            },
+            # #980 — appended, not merged into the parent: log4cplus resolves
+            # the most specific logger name, so this raises ONLY the two
+            # per-packet codes and leaves everything else at INFO.
+            *_quiet_packet_logger("kea-dhcp4", server),
         ],
     }
 
@@ -1184,6 +1273,11 @@ def render(
         ),
         # #637 — see the Dhcp4 block. Same group-wide lease-cache default.
         "cache-threshold": float(server.get("lease_cache_threshold") or 0.0),
+        # #980 — same pool size as Dhcp4. kea-dhcp6 is a separate process with
+        # its own pool, and it shares the node's CPU with kea-dhcp4, so
+        # leaving it on auto would put back most of the threads Dhcp4 just
+        # dropped.
+        "multi-threading": _multi_threading(server),
         "renew-timer": 900,
         "rebind-timer": 1800,
         "hooks-libraries": [
@@ -1193,17 +1287,11 @@ def render(
         "loggers": [
             {
                 "name": "kea-dhcp6",
-                "output_options": [
-                    {"output": "stdout"},
-                    {
-                        "output": "/var/log/kea/kea-dhcp6.log",
-                        "maxsize": 50_000_000,
-                        "maxver": 5,
-                        "flush": True,
-                    },
-                ],
+                "output_options": _log_outputs("kea-dhcp6"),
                 "severity": "INFO",
-            }
+            },
+            # #980 — see the Dhcp4 block.
+            *_quiet_packet_logger("kea-dhcp6", server),
         ],
     }
     # #637 — see the Dhcp4 block. Optional, so set conditionally.

@@ -613,8 +613,34 @@ The control plane stores deltas in two small tables —
 `dns_metric_sample(server_id, bucket_at, queries_total, noerror,
 nxdomain, servfail, recursion)` and `dhcp_metric_sample(server_id,
 bucket_at, discover, offer, request, ack, nak, decline, release,
-inform)`. Retention is enforced by the `prune_metric_samples`
-Celery task (daily, default 7 days).
+inform, receive_drop, socket_drop)`. Retention is enforced by the
+`prune_metric_samples` Celery task (daily, default 7 days).
+
+Two of those DHCP columns are *loss* rather than traffic, and they do not
+come from the same place (issue #980). `receive_drop` is Kea's own
+`pkt4/6-receive-drop` — packets it read and then discarded. `socket_drop`
+is the kernel's per-socket `sk_drops` from `/proc/net/udp`, read by the
+agent directly: packets discarded because Kea's receive buffer was full,
+so Kea never saw them and no counter it keeps can report them. On a node
+short of CPU only the second one moves, which is why both are carried
+rather than just the one the issue originally asked for. See
+[`DHCP.md` §4c](features/DHCP.md).
+
+**Both are nullable, and NULL means UNMEASURED.** An agent older than #980,
+or one whose runtime cannot read `/proc/net/udp`, reports neither. Readers
+must render that as unknown — a 0 would say "this server has dropped
+nothing", which is exactly the false reassurance #980 was filed about. The
+ingest endpoint therefore stores an omitted field as NULL rather than
+clamping it, and the `dhcp_packets_dropped` alert skips such a server
+rather than vouching for it.
+
+One more thing worth knowing about this endpoint: a second report for a
+bucket that already exists is **added** to it, not substituted. The agent
+floors `bucket_at` to the minute while its own interval is 60 s ± 3 s of
+jitter, so a tick early in a minute followed by a 57-59 s gap puts two
+genuinely different deltas in the same bucket — about one bucket in forty.
+Substituting (the pre-#980 behaviour) silently discarded a poll, which for
+a loss counter discards the minute somebody is looking for.
 
 The dashboard queries two read endpoints:
 

@@ -1,15 +1,19 @@
 """Tests for the Kea metrics poller.
 
-Covers the three interesting behaviors:
+Covers the interesting behaviors:
   • first tick after startup establishes a baseline, doesn't report;
   • second tick with a positive delta gets reported upstream;
-  • counter-reset (Kea restart) is detected and the bucket is dropped.
+  • counter-reset (Kea restart) is detected and the bucket is dropped;
+  • the #980 loss counters ride the same delta, and ``socket_drop`` — which
+    comes from procfs rather than from Kea — stays in lockstep with them.
 
 We test ``_parse_snapshot`` + ``_compute_delta`` directly so the HTTP
 client stays out of the test path.
 """
 
 from __future__ import annotations
+
+from datetime import UTC, datetime
 
 from spatium_dhcp_agent.config import AgentConfig
 from spatium_dhcp_agent.metrics import MetricsPoller, _parse_snapshot
@@ -45,6 +49,9 @@ def test_parse_snapshot_picks_expected_columns():
         "decline": 0,
         "release": 2,
         "inform": 0,
+        # #980 — absent from this response, so 0. The column exists either
+        # way; a Kea too old to publish it is not a Kea that dropped nothing.
+        "receive_drop": 0,
     }
 
 
@@ -130,6 +137,7 @@ def test_second_tick_emits_delta(tmp_path):
         "decline": 0,
         "release": 1,
         "inform": 0,
+        "receive_drop": 0,
     }
 
 
@@ -183,4 +191,119 @@ def test_counter_reset_drops_bucket(tmp_path):
         "decline": 0,
         "release": 0,
         "inform": 0,
+        "receive_drop": 0,
     }
+
+
+# ── #980: the loss counters ─────────────────────────────────────────────────
+
+
+def test_receive_drop_folds_both_address_families():
+    """v4 and v6 are separate daemons sharing one row, like every other
+    column here — so their drop counters sum rather than one overwriting
+    the other."""
+    resp = _snapshot({"pkt4-receive-drop": 4, "pkt6-receive-drop": 3})
+    assert _parse_snapshot(resp)["receive_drop"] == 7
+
+
+class _FakeResponse:
+    status_code = 200
+
+
+class _FakeClient:
+    """Stands in for httpx.Client and records the JSON body actually posted."""
+
+    def __init__(self, sink: list):
+        self._sink = sink
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def post(self, url, json=None, headers=None):
+        self._sink.append(json)
+        return _FakeResponse()
+
+
+def _posted_body(tmp_path, monkeypatch, socket_drop):
+    """Run the REAL ``_report`` and return the body it put on the wire."""
+    p = _poller(tmp_path)
+    sink: list = []
+    monkeypatch.setattr(p, "_client", lambda: _FakeClient(sink))
+    p._report(datetime(2026, 9, 6, 12, 0, tzinfo=UTC), {"discover": 3}, socket_drop)
+    assert len(sink) == 1
+    return sink[0]
+
+
+def test_wire_body_carries_socket_drop_zero_as_a_value(tmp_path, monkeypatch):
+    """Zero is a measurement and has to appear in the payload as 0.
+
+    The server stores an omitted field as NULL, and NULL means "nobody
+    looked" — so a working agent that measured no loss must not be filed
+    under the same label as an agent that cannot measure at all. Asserts on
+    the posted body rather than on a stubbed ``_report``, or the test would
+    pass for a ``_report`` that silently dropped the field.
+    """
+    body = _posted_body(tmp_path, monkeypatch, 0)
+    assert "socket_drop" in body
+    assert body["socket_drop"] == 0
+    assert body["discover"] == 3
+
+
+def test_wire_body_carries_none_when_unmeasurable(tmp_path, monkeypatch):
+    """The other half: unknown travels as an explicit null, not as 0 and not
+    by omission (omission would be indistinguishable, but being explicit is
+    what makes an older control plane's 422 loud rather than silent)."""
+    body = _posted_body(tmp_path, monkeypatch, None)
+    assert "socket_drop" in body
+    assert body["socket_drop"] is None
+
+
+def test_one_run_iteration_samples_both_counters_together(tmp_path, monkeypatch):
+    """Drive the REAL ``run()`` loop for two ticks.
+
+    Both baselines must advance on the same ticks: a bucket that is thrown
+    away (agent start, Kea restart) throws away both deltas, and a bucket
+    that is reported carries two numbers covering the same interval. If only
+    one advanced, "drops against DISCOVERs" — the first comparison anyone
+    makes — would span different windows.
+    """
+    p = _poller(tmp_path)
+    sink: list = []
+    monkeypatch.setattr(p, "_client", lambda: _FakeClient(sink))
+
+    kea = iter([{"discover": 0}, {"discover": 7}])
+    monkeypatch.setattr(p, "_poll_kea", lambda: next(kea, None))
+
+    samples = iter([11, 22])
+    sock_calls: list = []
+
+    def _sample():
+        v = next(samples, None)
+        sock_calls.append(v)
+        return v
+
+    monkeypatch.setattr(p._socket, "sample", _sample)
+    # Stop after the second tick rather than sleeping 60 s.
+    real_wait = p._stop.wait
+    ticks = {"n": 0}
+
+    def _wait(timeout=None):
+        ticks["n"] += 1
+        if ticks["n"] >= 2:
+            p._stop.set()
+        return real_wait(0)
+
+    monkeypatch.setattr(p._stop, "wait", _wait)
+
+    p.run()
+
+    # Two ticks -> two socket samples; only the second tick had a Kea
+    # baseline, so exactly one bucket was posted, carrying that tick's
+    # socket sample and not the first one.
+    assert sock_calls == [11, 22]
+    assert len(sink) == 1
+    assert sink[0]["discover"] == 7
+    assert sink[0]["socket_drop"] == 22

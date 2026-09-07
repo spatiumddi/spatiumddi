@@ -126,6 +126,67 @@ class DHCPServerGroup(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     lease_cache_max_age: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
+    # #980 — Kea ``multi-threading.thread-pool-size``, rendered explicitly
+    # instead of left at Kea's own default of 0 ("auto").
+    #
+    # "Auto" means ``std::thread::hardware_concurrency()``: the number of CPUs
+    # on the MACHINE, with no regard for the cgroup share the container
+    # actually holds. On a 4 vCPU appliance Kea therefore starts four packet
+    # workers that compete, inside one cgroup, with the single thread whose
+    # only job is to drain the receive socket — and when that thread is late,
+    # the kernel drops datagrams Kea never learns about. Fewer workers get the
+    # receiver scheduled sooner; measured against kea-dhcp4 3.0.3 with the
+    # memfile backend at 12,000 relayed pkt/s (median of 4 runs, packets
+    # served):
+    #
+    #     cgroup CPU    pool=1     pool=2     pool=4 (what "auto" gives here)
+    #     0.25          19,381     11,119      6,723
+    #     4.0 (none)    93,717     73,089     55,957
+    #
+    # Monotonic in both shapes, so 1 is the default. It is a *pool* size, not
+    # a thread count: MT stays enabled, so the receive thread is still
+    # separate and every multi-threaded semantic (host-reservation lookup
+    # order, ``dhcp-queue-control`` staying disabled) is unchanged — which is
+    # why this rather than ``enable-multi-threading: false``, whose single
+    # thread must both receive and process and measured 15,170 socket drops
+    # in a run where pool=1 measured 0. Kea's HA hook keeps its own
+    # ``http-client-threads`` / ``http-listener-threads``, unaffected by this
+    # value, so a failover pair's peer traffic is not serialised behind the
+    # one worker.
+    #
+    # ``0`` restores Kea's auto-sizing for an operator who measures otherwise.
+    kea_thread_pool_size: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default=sa_text("1")
+    )
+
+    # #980 — per-packet logging, and whether it is worth its cost here.
+    #
+    # At severity INFO, Kea writes FOUR lines per transaction, to two
+    # appenders, one of them flushed: ``DHCP4_QUERY_LABEL`` and
+    # ``DHCP4_LEASE_ALLOC``/``_OFFER`` (from ``kea-dhcp4.dhcp4`` and
+    # ``kea-dhcp4.leases``), plus ``DHCP4_PACKET_RECEIVED`` and
+    # ``DHCP4_PACKET_SEND`` (from ``kea-dhcp4.packets``). Only the last two
+    # are switched off here, and only they: measured on the same rig as
+    # ``kea_thread_pool_size``, silencing that one child logger took packets
+    # served from 19,026-20,403 to 24,997-26,077 — 1.30x — for lines whose
+    # information is largely carried by the two that remain.
+    #
+    # ``kea-dhcp4.dhcp4`` is deliberately NOT part of this. It looks like the
+    # other noisy one, and silencing it also loses ``DHCP4_OPEN_SOCKETS_FAILED``
+    # (a real failure Kea logs at INFO), ``DHCP4_CONFIG_COMPLETE``,
+    # ``DHCP4_STARTED`` and ``DHCP4_MULTI_THREADING_INFO`` — the last of which
+    # is the line that reports the pool size above actually took effect.
+    #
+    # Defaults to True: OFF is a change an operator can SEE, since those two
+    # codes carry the source address and receiving interface and no other line
+    # does. Preserving observable behaviour and offering the throughput as an
+    # opt-in is the same call #637 made for the lease cache. The #980 loss
+    # counters are what tell an operator whether they are at the knee where
+    # this is worth reaching for.
+    kea_packet_logging: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=sa_text("true")
+    )
+
     # Eager-load `servers` by default. The API's group list endpoint
     # reads this relationship to compute `kea_member_count` + roll up
     # the members, and it runs in an async session where an accidental

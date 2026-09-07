@@ -568,6 +568,12 @@ async def agent_config_longpoll(
                             # falls back to these when the scope value is null.
                             "lease_cache_threshold": bundle.lease_cache_threshold,
                             "lease_cache_max_age": bundle.lease_cache_max_age,
+                            # #980 — Kea's packet-worker pool. Serialized here
+                            # as well as folded into the ETag; those are
+                            # separate steps and skipping this one is the #430
+                            # silent no-op the lease-cache keys above call out.
+                            "kea_thread_pool_size": bundle.kea_thread_pool_size,
+                            "kea_packet_logging": bundle.kea_packet_logging,
                         },
                         "scopes": [
                             {
@@ -1377,6 +1383,12 @@ class DHCPMetricReport(BaseModel):
     decline: int = 0
     release: int = 0
     inform: int = 0
+    # #980 — loss counters. ``None`` (the default, and what an agent older
+    # than #980 sends by omission) means NOT MEASURED and is stored as NULL;
+    # 0 means measured and no loss. They must not collapse together, or an
+    # un-upgraded fleet reads as a fleet that has never dropped a packet.
+    receive_drop: int | None = None
+    socket_drop: int | None = None
 
 
 @router.post("/metrics")
@@ -1385,7 +1397,25 @@ async def agent_metrics(
     db: DB,
     auth: tuple[DHCPServer, dict[str, Any]] = Depends(_auth_agent),
 ) -> dict[str, str]:
-    """Ingest one sample row. Idempotent on ``(server_id, bucket_at)``."""
+    """Ingest one sample row, accumulating into ``(server_id, bucket_at)``.
+
+    A second report for a bucket that already exists is ADDED to it rather
+    than replacing it, because these are counter *deltas* over disjoint
+    intervals and two of them landing in one bucket are two things that both
+    happened. Replacing was the original behaviour and it silently discarded
+    a poll: the agent floors ``bucket_at`` to the minute while its own
+    interval is 60 s ± 3 s of jitter, so a tick early in a minute followed by
+    a 57-59 s gap puts two genuinely different deltas in the same bucket —
+    roughly one bucket in forty. Harmless-looking on a traffic chart, and
+    exactly wrong for the #980 loss counters, where the discarded minute is
+    the one an operator is looking for.
+
+    The trade is that a client-side retry of an identical body would now
+    double-count. Nothing retries today (``MetricsPoller._report`` logs a
+    failed POST and moves on), and under-reporting loss is the worse of the
+    two failure modes; a retry added later needs an idempotency key rather
+    than a last-write-wins overwrite that loses a poll in normal operation.
+    """
     server, _ = auth
     values = {
         "discover": max(0, body.discover),
@@ -1397,12 +1427,30 @@ async def agent_metrics(
         "release": max(0, body.release),
         "inform": max(0, body.inform),
     }
+    # #980 — nullable, so kept out of ``values``: None must be stored as NULL
+    # (not measured) and must not be clamped to 0 by the max() above.
+    nullable_values = {
+        "receive_drop": None if body.receive_drop is None else max(0, body.receive_drop),
+        "socket_drop": None if body.socket_drop is None else max(0, body.socket_drop),
+    }
     existing = await db.get(DHCPMetricSample, (server.id, body.bucket_at))
     if existing is None:
-        db.add(DHCPMetricSample(server_id=server.id, bucket_at=body.bucket_at, **values))
+        db.add(
+            DHCPMetricSample(
+                server_id=server.id, bucket_at=body.bucket_at, **values, **nullable_values
+            )
+        )
     else:
         for k, v in values.items():
-            setattr(existing, k, v)
+            setattr(existing, k, getattr(existing, k, 0) + v)
+        for k, v in nullable_values.items():
+            prior = getattr(existing, k, None)
+            # UNKNOWN + n = n: one poll failing to measure does not erase
+            # what its neighbour in the same bucket did measure. Only two
+            # unmeasured polls leave the bucket unmeasured.
+            if v is None:
+                continue
+            setattr(existing, k, v if prior is None else prior + v)
     await db.commit()
     return {"status": "ok"}
 

@@ -20,6 +20,90 @@ the formatter handles the rest.
 
 ---
 
+## Unreleased
+
+### Fixed
+
+- **A DHCP server short of CPU loses packets silently, and nothing
+  in the product said so (#980).** Kea answers 100 % of what it
+  reads; when its receive thread is late the kernel discards the
+  datagram first, so every server-side signal stays green — health
+  check, heartbeat, free addresses, and Kea's own
+  `pkt4-receive-drop`, which measured **0** through a run that lost
+  9,700 datagrams to buffer overflow. The only symptom was clients
+  taking several 4-second retransmit rounds to get an address, which
+  from the server looks like somebody else's problem. Two per-bucket
+  counters now name it: `socket_drop`, the kernel's per-socket
+  `sk_drops` read from `/proc/net/udp` by the agent, and
+  `receive_drop`, Kea's own. Both surface on the server's Stats tab
+  (a dashed *DROPPED* line and a red `N dropped` chip) and drive the
+  new default-on **`dhcp_packets_dropped`** alert rule.
+
+  **NULL is not zero.** An agent older than this change, or one that
+  cannot read `/proc/net/udp`, reports neither counter; the columns
+  stay NULL, the UI says *loss not measured*, and the alert skips
+  such a server rather than vouching for it. A wall of green zeros
+  from an un-upgraded fleet is the exact false reassurance the issue
+  was about.
+
+  **The issue's two proposed mitigations do not work, and a third
+  nobody proposed does.** A larger `packet-queue-size` is inert — 64
+  → 2048 changed neither throughput nor drops, because that queue
+  sits behind the receive thread. A larger receive buffer trades the
+  drops for latency (#952 measured a 34 s DORA p50 against 1.5 s).
+  What works is **`multi-threading.thread-pool-size`**, which Kea
+  sizes from `hardware_concurrency()` — the *machine's* CPU count,
+  ignoring the container's cgroup share. Verified: a container
+  limited to 0.20 CPU starts ten workers, which then compete inside
+  that cgroup with the one thread draining the socket. Packets
+  served at 12,000 relayed pkt/s (kea-dhcp4 3.0.3, memfile, median
+  of 4 runs):
+
+  | cgroup CPU | pool = 1 | pool = 2 | pool = 4 (= "auto" on 4 vCPU) |
+  |---|---|---|---|
+  | 0.25 | 19,381 | 11,119 | 6,723 |
+  | 4.0 (no quota) | 93,717 | 73,089 | 55,957 |
+
+  Monotonic in both shapes, so `kea_thread_pool_size` now defaults to
+  **1** and every existing group picks it up on upgrade (one Kea
+  config-reload, no restart); `0` restores Kea's auto-sizing. It is a
+  *resize*, deliberately not `enable-multi-threading: false` — with
+  MT off one thread must both receive and process, measuring 15,170
+  socket drops in a run where a pool of one measured none, and it
+  also flips host-reservation lookup order. Kea's HA hook keeps its
+  own `http-client-threads` / `http-listener-threads`, so a failover
+  pair's peer traffic is not serialised behind the single worker.
+
+  A second group setting, **`kea_packet_logging`**, defaults to
+  **true** — exactly today's behaviour. Kea writes four INFO lines
+  per transaction to two appenders, one of them flushed; turning
+  this off raises only the `kea-dhcpN.packets` child to WARN for
+  1.30x more packets served, at the cost of the two codes carrying
+  the source address and receiving interface. Opt-in rather than
+  default because it removes something an operator can see, the same
+  call #637 made for the lease cache. `kea-dhcpN.dhcpN` is never
+  silenced despite looking like the same noise: at INFO it also
+  carries `DHCP4_OPEN_SOCKETS_FAILED`, `DHCP4_CONFIG_COMPLETE`,
+  `DHCP4_STARTED` and `DHCP4_MULTI_THREADING_INFO` — the line that
+  confirms the pool size took effect.
+
+  **Found on the way:** the metrics ingest endpoint *substituted*
+  rather than accumulated when a bucket already existed. The agent
+  floors `bucket_at` to the minute while its own interval is 60 s ±
+  3 s of jitter, so a tick early in a minute followed by a 57-59 s
+  gap put two genuinely different deltas in one bucket — about one
+  bucket in forty, silently discarding a poll since #195. It
+  accumulates now, which for a loss counter is the difference
+  between reporting the bad minute and losing it.
+
+### Migrations
+
+- `c93f1a72e408` — `dhcp_metric_sample.receive_drop` /
+  `.socket_drop` (both nullable: NULL means unmeasured) and
+  `dhcp_server_group.kea_thread_pool_size` / `.kea_packet_logging`.
+
+---
+
 ## 2026.09.04-1 — 2026-09-04
 
 **The appliance sizing release.** Two days of measured load against a

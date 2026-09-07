@@ -7832,6 +7832,17 @@ export interface DHCPServerGroup {
    * suppresses the lease-events that drive DDNS + the IPAM lease mirror. */
   lease_cache_threshold: number;
   lease_cache_max_age: number | null;
+  /** #980 — Kea `multi-threading.thread-pool-size`. 1 (the default) measured
+   *  1.7x-2.9x more packets served than Kea's own auto-sizing, which starts
+   *  one worker per HOST cpu regardless of the container's cgroup share and
+   *  leaves them competing with the thread that drains the receive socket.
+   *  0 hands sizing back to Kea. */
+  kea_thread_pool_size: number;
+  /** #980 — true (the default, and today's behaviour) logs every packet
+   *  received and sent. False raises only `kea-dhcpN.packets` to WARN, worth
+   *  ~1.3x more packets served on a constrained node, at the cost of the two
+   *  log codes that carry the source address and receiving interface. */
+  kea_packet_logging: boolean;
   // Number of Kea servers currently in the group. ≥ 2 means HA is
   // rendered into every peer's Kea config via libdhcp_ha.so.
   kea_member_count: number;
@@ -7853,6 +7864,8 @@ export interface DHCPServerGroupCreate {
   auto_failover?: boolean;
   lease_cache_threshold?: number;
   lease_cache_max_age?: number | null;
+  kea_thread_pool_size?: number;
+  kea_packet_logging?: boolean;
 }
 
 export interface DHCPServer {
@@ -8247,6 +8260,14 @@ export interface DHCPRateBucket {
   nak: number;
   decline: number;
   release: number;
+  /** #980 — packets lost, and where. `socket_drop` is the kernel dropping
+   *  datagrams before the server could read them (its receive buffer filled;
+   *  the node is short of CPU). `receive_drop` is the server reading a packet
+   *  and discarding it. `null` means the agent did not measure it — too old,
+   *  or unable to read /proc/net/udp — and must render as "not measured",
+   *  never as 0. Zero is a measurement; null is the absence of one. */
+  receive_drop: number | null;
+  socket_drop: number | null;
 }
 
 export interface DHCPServerStatsResponse {
@@ -10855,6 +10876,14 @@ export interface DHCPMetricsPoint {
   decline: number;
   release: number;
   inform: number;
+  /** #980 — packets lost, and where. `socket_drop` is the kernel dropping
+   *  datagrams before the server could read them (its receive buffer filled;
+   *  the node is short of CPU). `receive_drop` is the server reading a packet
+   *  and discarding it. `null` means the agent did not measure it — too old,
+   *  or unable to read /proc/net/udp — and must render as "not measured",
+   *  never as 0. Zero is a measurement; null is the absence of one. */
+  receive_drop: number | null;
+  socket_drop: number | null;
 }
 
 export interface DHCPMetricsSeries {

@@ -1485,10 +1485,14 @@ async def delete_lease(server_id: uuid.UUID, lease_id: uuid.UUID, db: DB, user: 
 
 
 class DHCPRateBucket(BaseModel):
-    """One time bucket of DHCP message-type counts (#195).
+    """One time bucket of DHCP message-type counts (#195) and loss (#980).
 
-    Exactly the 7 contract keys — ``inform`` is summed in the DB but
-    dropped here to match the pinned issue contract.
+    The 7 message-type keys are the pinned #195 contract — ``inform`` is
+    summed in the DB but dropped here to match it. The two loss counters
+    were added by #980 and are ``None``, never 0, when no sample in the
+    bucket reported them: an agent older than #980 measures neither, and a
+    bucket of zeroes from such an agent is the false "nothing was lost" this
+    endpoint exists to stop showing.
     """
 
     ts: datetime
@@ -1499,6 +1503,12 @@ class DHCPRateBucket(BaseModel):
     nak: int
     decline: int
     release: int
+    # Packets Kea read and discarded (unparseable, DROP class, no subnet).
+    receive_drop: int | None = None
+    # Packets the kernel dropped before Kea could read them, because its
+    # receive buffer was full. The one that moves when a node is short of
+    # CPU; ``receive_drop`` stays at 0 through exactly that failure.
+    socket_drop: int | None = None
 
 
 class DHCPServerStatsResponse(BaseModel):
@@ -1563,6 +1573,11 @@ async def get_server_stats(
             func.coalesce(func.sum(DHCPMetricSample.nak), 0).label("nak"),
             func.coalesce(func.sum(DHCPMetricSample.decline), 0).label("decline"),
             func.coalesce(func.sum(DHCPMetricSample.release), 0).label("release"),
+            # #980 — deliberately NOT coalesced. SUM over an all-NULL group
+            # is NULL, which is the answer: nothing in this bucket measured
+            # loss. A partially-measured bucket sums the samples that did.
+            func.sum(DHCPMetricSample.receive_drop).label("receive_drop"),
+            func.sum(DHCPMetricSample.socket_drop).label("socket_drop"),
         )
         .where(DHCPMetricSample.server_id == server_id)
         .where(DHCPMetricSample.bucket_at >= since)
@@ -1580,6 +1595,9 @@ async def get_server_stats(
             nak=int(r.nak or 0),
             decline=int(r.decline or 0),
             release=int(r.release or 0),
+            # ``is None`` rather than ``or``: 0 is a real, measured value.
+            receive_drop=None if r.receive_drop is None else int(r.receive_drop),
+            socket_drop=None if r.socket_drop is None else int(r.socket_drop),
         )
         for r in rows
     ]

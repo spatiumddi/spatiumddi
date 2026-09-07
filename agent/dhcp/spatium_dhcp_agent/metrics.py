@@ -28,6 +28,26 @@ without a schema migration.
     pkt4-decline-received                 pkt6-decline-received        → decline
     pkt4-release-received                 pkt6-release-received        → release
     pkt4-inform-received                  pkt6-information-request-received → inform
+    pkt4-receive-drop                     pkt6-receive-drop            → receive_drop
+
+Two *loss* signals ride alongside those, added for issue #980, and they
+name different failures:
+
+* ``receive_drop`` — packets Kea read off the socket and then discarded
+  (unparseable, matched the ``DROP`` class, no subnet selected).
+* ``socket_drop`` — packets the kernel dropped because Kea's receive
+  buffer was full, so Kea never saw them at all. Read from
+  ``/proc/net/udp`` by :mod:`.socket_drops`, not from Kea.
+
+The distinction is the point. Measured against kea-dhcp4 3.0.3 on
+2026-09-06, a run that lost 9,700 datagrams to buffer overflow reported
+``pkt4-receive-drop = 0`` throughout: a server starved of CPU answers
+100 % of what it reads, and every Kea-sourced counter agrees it is
+healthy. Only ``socket_drop`` moves.
+
+Both are ``None`` — not 0 — when they could not be measured, so an agent
+that cannot read them, or one older than this change, is reported as
+UNKNOWN rather than as a server with no loss.
 """
 
 from __future__ import annotations
@@ -42,6 +62,7 @@ import structlog
 
 from .config import AgentConfig
 from .kea_ctrl import KeaCtrlError, send_command
+from .socket_drops import SocketDropCounter
 
 log = structlog.get_logger(__name__)
 
@@ -67,6 +88,8 @@ _STAT_MAP = {
     "pkt6-decline-received": "decline",
     "pkt6-release-received": "release",
     "pkt6-information-request-received": "inform",
+    "pkt4-receive-drop": "receive_drop",
+    "pkt6-receive-drop": "receive_drop",
 }
 
 # Column names — the unique set of values from ``_STAT_MAP``, used by
@@ -121,6 +144,9 @@ class MetricsPoller:
         # Previous snapshot. None on first tick — the first post-boot
         # bucket is absorbed (no baseline to diff against).
         self._prev: dict[str, int] | None = None
+        # #980 — kernel-side loss, sampled in lockstep with the Kea
+        # counters so both deltas always cover the same interval.
+        self._socket = SocketDropCounter()
 
     def stop(self) -> None:
         self._stop.set()
@@ -163,12 +189,18 @@ class MetricsPoller:
             return None
         return delta
 
-    def _report(self, bucket_at: datetime, delta: dict[str, int]) -> None:
+    def _report(
+        self, bucket_at: datetime, delta: dict[str, int], socket_drop: int | None
+    ) -> None:
         try:
             with self._client() as c:
                 resp = c.post(
                     "/api/v1/dhcp/agents/metrics",
-                    json={"bucket_at": bucket_at.isoformat(), **delta},
+                    json={
+                        "bucket_at": bucket_at.isoformat(),
+                        "socket_drop": socket_drop,
+                        **delta,
+                    },
                     headers={"Authorization": f"Bearer {self.token_ref[0]}"},
                 )
             if resp.status_code not in (200, 204):
@@ -181,6 +213,14 @@ class MetricsPoller:
             current = self._poll_kea()
             if current is not None:
                 delta = self._compute_delta(current)
+                # Sampled unconditionally so its baseline advances in step
+                # with the Kea one: a bucket that is dropped (agent start,
+                # Kea restart) drops BOTH deltas, and the pair that is
+                # reported always covers the same interval. Advancing only
+                # one of the two would smear an interval's kernel drops
+                # into a bucket whose Kea counters exclude them, and the
+                # first comparison anyone makes is drops against DISCOVERs.
+                socket_drop = self._socket.sample()
                 if delta is not None:
                     # Bucket timestamp is "now, rounded to the poll
                     # interval" — the server path dedupes on
@@ -188,7 +228,7 @@ class MetricsPoller:
                     # the next interval won't double-count.
                     now = datetime.now(UTC).replace(microsecond=0)
                     bucket = now.replace(second=(now.second // 60) * 60)
-                    self._report(bucket, delta)
+                    self._report(bucket, delta, socket_drop)
             # 60s base + small jitter so paired peers don't hit the
             # control plane in lockstep.
             interval = 60.0 + random.uniform(-3, 3)

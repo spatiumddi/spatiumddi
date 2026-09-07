@@ -113,7 +113,24 @@ not the operator's:
   fourth CPU happens to be free for Kea — and why 3 vCPU sits at the knee.
   A larger socket receive buffer does not help: with 8 MiB of buffer the drops
   vanish but a DORA takes 34 s instead of 1.5 s, because Kea then answers
-  stale requests whole retransmit rounds late.
+  stale requests whole retransmit rounds late. Nor does a larger Kea
+  `packet-queue-size`: 64 → 2048 changed neither throughput nor drops, because
+  that queue sits behind the receive thread and the problem is the receive
+  thread not being scheduled.
+- Kea's own packet-worker pool is sized from the **machine's** CPU count, not
+  from the container's cgroup share, so on a 4 vCPU appliance it starts four
+  workers that compete with the one thread draining the receive socket
+  (spatiumddi#980). SpatiumDDI now renders `thread-pool-size: 1` explicitly:
+  measured at 12,000 relayed pkt/s, that served 19,381 packets against 6,723
+  for four workers at 0.25 CPU, and 93,717 against 55,957 with four CPUs and
+  no quota. It is a per-group setting; `0` restores Kea's auto-sizing.
+- **When a Kea server is short of CPU it loses packets silently.** Every
+  server-side counter stays green — it answers 100 % of what it reads, and
+  `pkt4-receive-drop` stays at 0 through the whole thing — because the loss is
+  the kernel discarding datagrams before Kea reads them. The per-bucket
+  `socket_drop` metric and the default-on `dhcp_packets_dropped` alert are the
+  only signals that name it; see
+  [`DHCP.md` §4c](../features/DHCP.md).
 
 Beyond that: **500k records in one group** is not a supported single-node
 size at any RAM tested (up to 10 GiB) — the api's bundle build for the
@@ -583,6 +600,12 @@ appliance dropping relayed DHCP under CPU pressure with every dashboard
 green — and it stayed green because utilisation cannot distinguish a node at
 70% CPU with a run queue behind one core from a node at 70% without one.
 Only the first drops traffic. Stall time is what separates them.
+
+PSI names the *cause*; the `socket_drop` metric added by #980 itself names
+the *effect*, per DHCP server rather than per node. They are worth reading
+together: PSI says the node is stalling, `socket_drop` says DHCP was what
+paid for it, and a node stalling with no DHCP loss is a node with headroom
+left. See [`DHCP.md` §4c](../features/DHCP.md).
 
 Surfaced in three places, all reading `avg300` (the kernel's own 5-minute
 rolling average, which is why "sustained" needs no state on our side — a

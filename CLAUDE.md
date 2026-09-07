@@ -1638,6 +1638,54 @@ suggestion, free-space treemap.
   itself, which needs `rndc tsig-list` (or the effective `named.conf` plus
   includes) from an affected node to say what named actually loaded.
 
+- ✅ [**Kea drops relayed DHCP requests before it reads them under CPU pressure**](https://github.com/spatiumddi/spatiumddi/issues/980)
+  — a QA report whose *observation* was exact and whose three proposed fixes
+  were all wrong, in ways only measurement could show. Reproduced against a
+  live kea-dhcp4 3.0.3 rather than reasoned about.
+  **The counter the issue asked us to report does not move.** It proposed
+  surfacing `pkt4-receive-drop`; measured, a run that lost **9,700** datagrams
+  to receive-buffer overflow reported it as **0** for the whole duration —
+  it counts packets Kea *read* and discarded, and this loss is the kernel
+  discarding them first. The number that moves is the per-socket `sk_drops`
+  in `/proc/net/udp`, the same event as the `Udp RcvbufErrors` the reporter
+  saw. Both are now per-bucket columns on `dhcp_metric_sample`, a dashed
+  DROPPED line + chip on the Stats tab, and the default-on
+  `dhcp_packets_dropped` rule. **NULL means unmeasured** in every surface —
+  an agent too old to report is skipped by the alert, not vouched for, since
+  a wall of green zeros is the false reassurance being fixed.
+  **Its two mitigations are dead ends.** `packet-queue-size` 64 → 2048 (32x)
+  changed neither throughput nor drops: that queue sits *behind* the receive
+  thread. A bigger receive buffer was already known to trade drops for a 34 s
+  DORA p50 (#952).
+  **What works is the knob nobody named.** Kea sizes its packet-worker pool
+  from `hardware_concurrency()` — the MACHINE's CPU count, ignoring the
+  cgroup share — so a container limited to 0.20 CPU starts **ten** workers
+  that compete, inside that cgroup, with the one thread draining the socket.
+  Packets served at 12,000 relayed pkt/s, median of 4: at 0.25 CPU 19,381
+  (pool 1) / 11,119 (2) / 6,723 (4); with 4 CPUs and no quota 93,717 /
+  73,089 / 55,957. Monotonic, so `kea_thread_pool_size` defaults to **1**
+  and existing groups pick it up on upgrade. Deliberately a *resize*, not
+  `enable-multi-threading: false`: MT-off makes one thread both receive and
+  process (15,170 socket drops where pool 1 had none) and flips
+  host-reservation lookup order. Kea's HA hook keeps its own HTTP thread
+  pools, so a failover pair is unaffected.
+  Second knob `kea_packet_logging` (default **true** = today's behaviour) is
+  worth 1.30x when turned off, and is opt-in because it removes two log codes
+  an operator can see — the #637 lease-cache call. `kea-dhcpN.dhcpN` is never
+  silenced despite looking like the same noise: it also carries
+  `DHCP4_OPEN_SOCKETS_FAILED` and the line reporting whether the pool size
+  took effect. Pairs with the #983 PSI alert, which names the cause where
+  this names the effect.
+  **Found on the way:** the metrics ingest *substituted* on a bucket
+  collision instead of accumulating, silently discarding roughly one poll in
+  forty since #195 — the agent floors `bucket_at` to the minute while its
+  interval is 60 s ± 3 s. Migration `c93f1a72e408`. No new MCP tool
+  (explicit decision per non-negotiable #13 — `find_dhcp_server_stats`
+  answers exactly this question and gained a `packet_loss` block; a
+  `propose_*` for the pool size is the broad-blast-radius shape that
+  guidance says to keep off the copilot) and not a feature module (#14 — it
+  extends an existing resource).
+
 - ✅ [**celery-beat reported unhealthy forever after a slot upgrade**](https://github.com/spatiumddi/spatiumddi/issues/925)
   — shipped `2026.09.04-1`. The rollup was right that something was broken and wrong about what.
   **Beat only *schedules* `beat_tick`; a worker executes it**, so the

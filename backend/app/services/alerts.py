@@ -54,7 +54,7 @@ from app.models.dhcp import (
 from app.models.dns import DNSServer, DNSZone
 from app.models.domain import Domain
 from app.models.ipam import IPAddress, IPBlock, IpMacHistory, Subnet
-from app.models.metrics import DNSMetricSample
+from app.models.metrics import DHCPMetricSample, DNSMetricSample
 from app.models.network_service import NetworkService, NetworkServiceResource
 from app.models.overlay import OverlayNetwork
 from app.models.ownership import Site
@@ -280,6 +280,19 @@ RULE_TYPE_DNS_QUERY_RATE_SPIKE = "dns_query_rate_spike"
 # clears the floor, auto-resolves when the flood subsides.
 RULE_TYPE_DNS_RATE_LIMIT_DROPPING = "dns_rate_limit_dropping"
 
+# A DHCP server losing packets it never got to read (#980). Subject =
+# dhcp_server. Open-while-true, same shape as the RRL rule above.
+#
+# This is deliberately NOT folded into ``dhcp_pool_exhaustion`` or any
+# reachability check, because it is invisible to both: the server is up,
+# heartbeating, has free addresses, and answers 100 % of the packets that
+# reach it. The loss is in the kernel's socket buffer, on a node whose CPU
+# the receive thread is not getting in time, and the only place it appears
+# is the counter this rule reads. Measured on kea-dhcp4 3.0.3: a run that
+# lost 9,700 datagrams that way left ``pkt4-receive-drop`` at 0 and every
+# other signal green.
+RULE_TYPE_DHCP_PACKETS_DROPPED = "dhcp_packets_dropped"
+
 # Active IP reconciliation hygiene alerts — issue #369. Subject = ip_address.
 # Reuse the on-the-wire liveness signal (IPAddress.last_seen_at) the discovery
 # sweep + SNMP poll already write + the ip_mac_history observation log; no new
@@ -498,6 +511,20 @@ _DNS_QUERY_RATE_MIN_DEFAULT = 1000  # absolute query floor over the window
 # is shedding a flood, i.e. likely under attack. Below it, a few drops from
 # an over-eager client are just noise.
 _DNS_RATE_LIMIT_DROP_MIN_DEFAULT = 100
+
+# DHCP packet-loss evaluation window + floor (#980). Same 15 min as the DNS
+# anomaly rules, for the same reason: long enough to smooth one noisy bucket,
+# short enough to page inside a quarter hour.
+#
+# The floor is 1 — ANY confirmed loss fires. That is deliberate and unlike
+# the RRL rule's 100: RRL dropping a few responses is the feature working as
+# designed, whereas a DHCP datagram dropped before the server read it is
+# never intended behaviour and always costs a client a full retransmit round
+# (4 s and up). The floor is still an operator knob (``min_free_addresses``,
+# reused as a raw count like the other DHCP rules) for a site that would
+# rather hear about it only past a threshold.
+_DHCP_PACKET_LOSS_WINDOW = timedelta(minutes=15)
+_DHCP_PACKET_LOSS_MIN_DEFAULT = 1
 
 # Issue #285 Phase 2d — how long a control-plane-rendered firewall hash may
 # go un-applied (ok-status) before it's "stalled". Comfortably larger than
@@ -1689,6 +1716,98 @@ async def _matching_dns_rate_limit_dropping_subjects(
             f"responses in the last {win_min} min ({slipped} slipped/truncated); "
             f"the server is shedding a query flood (floor {floor}). Investigate a "
             "possible amplification attempt or misbehaving client."
+        )
+        matches.append((str(sid), name, message))
+    return matches
+
+
+async def _matching_dhcp_packets_dropped_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+) -> list[tuple[str, str, str]]:
+    """DHCP servers that lost packets over the trailing window (issue #980).
+
+    Two independent losses, reported separately because they mean different
+    things and are fixed in different places:
+
+    * ``socket_drop`` — the kernel dropped the datagram because Kea's receive
+      buffer was full, so Kea never read it. The node is short of CPU, or
+      Kea's own worker threads are crowding out its receive thread. This is
+      the one that moves under load and the one nothing else can see.
+    * ``receive_drop`` — Kea read the packet and threw it away (unparseable,
+      matched a ``DROP`` class, no subnet selected). Usually a configuration
+      or client problem, not a capacity one.
+
+    NULL is not zero. A server whose agent predates #980, or cannot read
+    ``/proc/net/udp``, reports neither counter, and ``SUM`` over its rows is
+    NULL — such a server is skipped rather than treated as loss-free, which
+    is the whole point of keeping the columns nullable. It also cannot be
+    alerted on; the Stats tab renders it as "not measured" instead.
+
+    Open-while-true: auto-resolves once a window passes with no loss.
+    """
+    floor = (
+        rule.min_free_addresses
+        if rule.min_free_addresses is not None
+        else _DHCP_PACKET_LOSS_MIN_DEFAULT
+    )
+    since = datetime.now(UTC) - _DHCP_PACKET_LOSS_WINDOW
+    rows = (
+        await db.execute(
+            select(
+                DHCPMetricSample.server_id,
+                func.sum(DHCPMetricSample.socket_drop).label("sock"),
+                func.sum(DHCPMetricSample.receive_drop).label("recv"),
+                func.sum(DHCPMetricSample.discover).label("disc"),
+            )
+            .where(DHCPMetricSample.bucket_at >= since)
+            .group_by(DHCPMetricSample.server_id)
+        )
+    ).all()
+    if not rows:
+        return []
+
+    hits: dict[uuid.UUID, tuple[int | None, int | None, int]] = {}
+    for r in rows:
+        # ``is None`` throughout: an unmeasured counter must not clear the
+        # floor by being coalesced to 0, and must not be *reported* as 0
+        # either.
+        sock = None if r.sock is None else int(r.sock)
+        recv = None if r.recv is None else int(r.recv)
+        total = (sock or 0) + (recv or 0)
+        if total >= floor and total > 0:
+            hits[r.server_id] = (sock, recv, int(r.disc or 0))
+    if not hits:
+        return []
+
+    name_rows = (
+        await db.execute(
+            select(DHCPServer.id, DHCPServer.name).where(DHCPServer.id.in_(list(hits.keys())))
+        )
+    ).all()
+    names: dict[uuid.UUID, str] = {row[0]: row[1] for row in name_rows}
+
+    win_min = int(_DHCP_PACKET_LOSS_WINDOW.total_seconds() // 60)
+    matches: list[tuple[str, str, str]] = []
+    for sid, (sock, recv, disc) in hits.items():
+        name = names.get(sid) or str(sid)
+        parts: list[str] = []
+        if sock:
+            parts.append(
+                f"{sock} dropped by the kernel before the server could read them "
+                "(receive buffer full — the node is short of CPU, or Kea's worker "
+                "threads are crowding out its receive thread)"
+            )
+        if recv:
+            parts.append(
+                f"{recv} read and then discarded by Kea (unparseable, no subnet, or a DROP class)"
+            )
+        message = (
+            f"DHCP server {name} lost packets in the last {win_min} min: "
+            + "; ".join(parts)
+            + f". It answered {disc} DISCOVER(s) over the same window, so every "
+            "server-side counter reads healthy — the loss is upstream of them and "
+            "costs each affected client a full retransmit round."
         )
         matches.append((str(sid), name, message))
     return matches
@@ -3909,6 +4028,69 @@ async def seed_agent_config_rejected_alert_rule() -> None:
         await session.commit()
 
 
+_DHCP_PACKETS_DROPPED_RULE_NAME = "DHCP packets dropped"
+
+
+async def seed_dhcp_packets_dropped_alert_rule() -> None:
+    """Seed the #980 rule, ENABLED by default.
+
+    On by default for the same reason as ``agent_config_rejected``, and not
+    for the reason the DNS-anomaly rules are seeded off. Those are off
+    because they need an optional subsystem (agent-based BIND9) before they
+    can say anything; this one reads a counter every Kea agent reports
+    unconditionally, needs no configuration, and cannot false-fire — a
+    non-zero drop count is not an inference from a threshold, it is the
+    kernel saying it threw a packet away.
+
+    It also cannot be found by an operator who does not already suspect it.
+    A server dropping packets in its socket buffer is reachable, heartbeats
+    normally, passes its health check, has free addresses, and answers 100 %
+    of what it reads; the only symptom is clients taking multiple retransmit
+    rounds to get an address, which looks like a client-side or network
+    problem from here. Seeding this off would mean the alarm arrives only
+    after somebody has already diagnosed the thing it exists to diagnose.
+
+    Servers whose agent cannot report the counters are skipped by the
+    evaluator, not alarmed on — see
+    :func:`_matching_dhcp_packets_dropped_subjects`.
+
+    Keyed on ``name``; an operator who disables or renames it is never
+    overridden.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    async with AsyncSessionLocal() as session:
+        existing = await session.scalar(
+            select(AlertRule).where(AlertRule.name == _DHCP_PACKETS_DROPPED_RULE_NAME)
+        )
+        if existing is not None:
+            return
+        session.add(
+            AlertRule(
+                name=_DHCP_PACKETS_DROPPED_RULE_NAME,
+                description=(
+                    "Fires when a DHCP server lost packets over the last 15 minutes — "
+                    "either dropped by the kernel because the server's receive buffer "
+                    "filled before it could read them, or read and then discarded by "
+                    "Kea. The first kind is invisible to every other signal: the "
+                    "server stays reachable and healthy and answers 100% of what "
+                    "reaches it, while clients wait out retransmit rounds. Usually "
+                    "means the node is short of CPU. Auto-resolves once a window "
+                    "passes with no loss. Set the rule's minimum-count threshold to "
+                    "alert only past a number of packets."
+                ),
+                rule_type=RULE_TYPE_DHCP_PACKETS_DROPPED,
+                severity="warning",
+                enabled=True,
+                notify_syslog=True,
+                notify_webhook=True,
+                notify_smtp=False,
+            )
+        )
+        await session.commit()
+
+
 _DNS_NXDOMAIN_SPIKE_RULE_NAME = "DNS NXDOMAIN spike"
 _DNS_QUERY_RATE_SPIKE_RULE_NAME = "DNS query-rate spike"
 
@@ -4930,6 +5112,10 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 base = await _matching_dns_query_rate_spike_subjects(db, rule)
                 matches = [(sid, disp, msg, None) for sid, disp, msg in base]
                 subject_type = "dns_server"
+            elif rule.rule_type == RULE_TYPE_DHCP_PACKETS_DROPPED:
+                base = await _matching_dhcp_packets_dropped_subjects(db, rule)
+                matches = [(sid, disp, msg, None) for sid, disp, msg in base]
+                subject_type = "dhcp_server"
             elif rule.rule_type == RULE_TYPE_DNS_RATE_LIMIT_DROPPING:
                 base = await _matching_dns_rate_limit_dropping_subjects(db, rule)
                 matches = [(sid, disp, msg, None) for sid, disp, msg in base]

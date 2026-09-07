@@ -853,7 +853,14 @@ class FindDHCPServerStatsArgs(BaseModel):
     description=(
         "Summarize a DHCP server's recent traffic: active lease count and "
         "per-message-type totals (discover/offer/request/ack/nak/decline/"
-        "release) over a 1h/6h/24h/7d window. Use for 'how busy is server X?'."
+        "release) over a 1h/6h/24h/7d window, plus packets LOST over that "
+        "window. Use for 'how busy is server X?' and 'is server X dropping "
+        "packets?'. socket_drop counts packets the kernel dropped before the "
+        "server could read them (its receive buffer filled — the node is "
+        "short of CPU); receive_drop counts packets the server read and then "
+        "discarded. Either may be null, meaning the agent did not measure it "
+        "(too old, or cannot read /proc/net/udp) — null is NOT zero, and must "
+        "not be reported as 'no packets were dropped'."
     ),
     args_model=FindDHCPServerStatsArgs,
     category="dhcp",
@@ -894,6 +901,11 @@ async def find_dhcp_server_stats(
                 func.coalesce(func.sum(DHCPMetricSample.nak), 0).label("nak"),
                 func.coalesce(func.sum(DHCPMetricSample.decline), 0).label("decline"),
                 func.coalesce(func.sum(DHCPMetricSample.release), 0).label("release"),
+                # #980 — not coalesced: SUM over an all-NULL group is NULL,
+                # which means "not measured" and must reach the model as
+                # null rather than as a zero it would summarise as healthy.
+                func.sum(DHCPMetricSample.receive_drop).label("receive_drop"),
+                func.sum(DHCPMetricSample.socket_drop).label("socket_drop"),
             )
             .where(DHCPMetricSample.server_id == sid)
             .where(DHCPMetricSample.bucket_at >= since)
@@ -913,6 +925,18 @@ async def find_dhcp_server_stats(
             "nak": int(totals_row.nak or 0),
             "decline": int(totals_row.decline or 0),
             "release": int(totals_row.release or 0),
+        },
+        # #980. Kept out of ``totals`` deliberately: those are messages
+        # handled, these are messages lost, and folding them into one dict
+        # invites a model to add them up.
+        "packet_loss": {
+            "socket_drop": (
+                None if totals_row.socket_drop is None else int(totals_row.socket_drop)
+            ),
+            "receive_drop": (
+                None if totals_row.receive_drop is None else int(totals_row.receive_drop)
+            ),
+            "measured": totals_row.socket_drop is not None or totals_row.receive_drop is not None,
         },
     }
 

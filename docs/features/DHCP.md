@@ -626,6 +626,119 @@ override).
 
 ---
 
+## 4c. Packets lost before Kea reads them (#980)
+
+A Kea server that is short of CPU does not slow down — it loses packets, in
+the kernel, before the server ever sees them. Everything Kea can tell you
+about itself stays green: it answers **100 % of what it reads**, its own
+`pkt4-receive-drop` stays at zero, its health check passes, it heartbeats
+normally and its pools have free addresses. The only symptom is clients
+taking several retransmit rounds (4 s apart, and up) to get an address,
+which from the server looks like somebody else's problem.
+
+Measured on a 4 vCPU appliance serving a relayed burst: at 1,200 devices /
+20 DORA per second, 32-48 % of first DISCOVERs had to be resent, while Kea
+reported having answered every packet it received.
+
+### Where the loss actually is, and where it isn't
+
+Three counters, and only one of them moves:
+
+| Counter | What it means | Moves here? |
+|---|---|---|
+| per-socket `sk_drops` (`/proc/net/udp`) | the kernel found the receive buffer full and discarded the datagram | **yes** |
+| `pkt4-receive-drop` / `pkt6-receive-drop` | Kea read the packet and discarded it (unparseable, `DROP` class, no subnet) | no |
+| `pkt4-discover-received` vs `pkt4-offer-sent` | Kea answering what it read | always equal |
+
+Verified against kea-dhcp4 3.0.3: a run that lost **9,700** datagrams to
+buffer overflow reported `pkt4-receive-drop = 0` for its entire duration.
+Both are now reported per 60 s bucket on `dhcp_metric_sample` as
+`socket_drop` and `receive_drop`; the server detail modal's **Stats** tab
+draws a dashed *DROPPED* line and a red `N dropped` chip, and the default-on
+**`dhcp_packets_dropped`** alert rule fires on any confirmed loss over a
+15-minute window (raise the rule's minimum-count threshold to alert only
+past a number of packets).
+
+> **`NULL` is not zero, anywhere in this chain.** An agent older than #980,
+> or one whose runtime cannot read `/proc/net/udp`, reports neither counter
+> and the column stays NULL. That renders as *loss not measured*, the alert
+> skips the server rather than vouching for it, and nothing folds it to 0 —
+> a wall of green zeros from an un-upgraded fleet is precisely the false
+> reassurance this section exists to remove.
+>
+> One real blind spot: the AF_PACKET socket Kea opens for
+> `dhcp-socket-type: raw` is not covered. `/proc/net/packet` carries no drop
+> column and its statistics can only be read by the process that owns the
+> socket. Relayed traffic is unicast and therefore arrives on the UDP
+> fallback socket, which is fully covered; directly-attached broadcast
+> traffic is not.
+
+### What actually helps
+
+Two things do not, and it is worth knowing why before reaching for them:
+
+* **A bigger socket receive buffer** removes the drops and replaces them with
+  latency. Measured under #952: with 8 MiB of buffer the drops vanish and a
+  DORA takes **34 s instead of 1.5 s**, because Kea then works through a
+  backlog answering requests whole retransmit rounds late.
+* **A bigger `packet-queue-size`** does nothing at all. 64 → 2048 (32x)
+  changed neither throughput nor drops; that queue sits *behind* the receive
+  thread, and the bottleneck is the receive thread not being scheduled.
+
+What helps is giving the receive thread the CPU. The chart already ships a
+500m CPU request on the Kea pod (#953 / #967 — see
+[`APPLIANCE.md`](../deployment/APPLIANCE.md)), whose `node_pressure` alert
+reads the kernel's PSI stall time and names the *cause* where `socket_drop`
+names the *effect*; a node stalling with no DHCP loss still has headroom.
+Two group settings tune the packet path itself:
+
+| Setting | Where | Default | Meaning |
+|---|---|---|---|
+| `kea_thread_pool_size` | `DHCPServerGroup` | `1` | Kea's `multi-threading.thread-pool-size`. `0` = let Kea auto-size. |
+| `kea_packet_logging` | `DHCPServerGroup` | `true` | Log every packet received and sent. |
+
+**`kea_thread_pool_size` is the important one, and its default changed.**
+Left to Kea, `thread-pool-size` is `0` — one worker per CPU that
+`hardware_concurrency()` reports, which is the *machine's* CPU count and
+knows nothing about the cgroup share the container is held to. Verified: a
+container limited to 0.20 CPU starts **ten** workers, which then compete,
+inside that one cgroup, with the single thread that has to drain the receive
+socket. Packets served on kea-dhcp4 3.0.3 (memfile, relayed unicast, 12,000
+pkt/s offered, median of 4 runs):
+
+| cgroup CPU | pool = 1 | pool = 2 | pool = 4 (what "auto" gives on 4 vCPU) |
+|---|---|---|---|
+| 0.25 | **19,381** | 11,119 | 6,723 |
+| 4.0 (no quota) | **93,717** | 73,089 | 55,957 |
+
+Monotonic in both shapes, so the default is 1 and every existing group picks
+it up on upgrade (one Kea config-reload, no restart). Note this is a *resize*
+and not `enable-multi-threading: false` — with MT off one thread must both
+receive and process, which measured **15,170** socket drops in a run where a
+pool of one measured **none**, and it also changes host-reservation lookup
+order. Kea's HA hook keeps its own `http-client-threads` /
+`http-listener-threads`, unaffected by this value, so a failover pair's peer
+traffic is not serialised behind the single worker.
+
+**`kea_packet_logging` defaults to on, which is exactly today's behaviour.**
+At INFO, Kea writes four lines per transaction to two appenders, one of them
+flushed. Turning this off raises only the `kea-dhcpN.packets` child logger to
+WARN — silencing `DHCP4_PACKET_RECEIVED` and `DHCP4_PACKET_SEND`, which carry
+the source address and receiving interface — for 1.30x more packets served
+(24,997-26,077 against 19,026-20,403 on the same rig). The lines naming the
+client and the address handed out come from other loggers and stay, so the
+Logs tab keeps one entry per transaction. It is an opt-in because it removes
+something an operator can see; the `socket_drop` counter above is what tells
+you whether you are at the knee where it is worth it.
+
+> `kea-dhcpN.dhcpN` is *not* touched, though it looks like the same kind of
+> noise. At INFO it also carries `DHCP4_OPEN_SOCKETS_FAILED` — a real failure
+> Kea logs at INFO — plus `DHCP4_CONFIG_COMPLETE`, `DHCP4_STARTED` and
+> `DHCP4_MULTI_THREADING_INFO`, the last being the line that reports whether
+> the pool size above took effect.
+
+---
+
 ## 5. DHCP Lease Tracking
 
 Leases are **read-only** in SpatiumDDI — they are pulled from the DHCP server, not managed directly.
