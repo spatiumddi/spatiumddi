@@ -241,8 +241,9 @@ def test_the_scoped_rule_is_still_dead_code_on_port_22() -> None:
     once a scope is configured (``webui_action`` in the supervisor's firewall
     renderer). Doing that for SSH is a behaviour decision, not a bug fix: it
     would make a wrong CIDR a real SSH lockout, recoverable only at the
-    console. This test exists so whoever takes that decision finds this note
-    rather than rediscovering the ordering.
+    console. Tracked as #1009; this test exists so whoever takes that
+    decision finds this note rather than rediscovering the ordering — move
+    it to assert the new behaviour rather than deleting it.
     """
     base = (
         Path(__file__).parent.parent / "mkosi.extra" / "etc" / "nftables.conf"

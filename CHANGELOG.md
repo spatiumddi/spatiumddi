@@ -53,9 +53,10 @@ the formatter handles the rest.
   bad Web-UI source restriction from bricking the box, so it was
   left alone: retiring it when a scope is configured (what the
   Web UI does) would turn a wrong CIDR into a console-only
-  recovery, which is a decision rather than a bug fix. Said
-  plainly here because the allowlist previously did nothing for
-  two independent reasons and only one of them is now gone.
+  recovery, which is a decision rather than a bug fix — tracked
+  as #1009. Said plainly here because the allowlist previously
+  did nothing for two independent reasons and only one of them
+  is now gone.
 
   The apply order changed with it: the fragment is now staged
   and validated *before* the sshd drop-in is installed. Both

@@ -286,7 +286,7 @@ PYEOF
         # handles the same collision by retiring its unconditional accept
         # when a scope is set (`webui_action` in firewall_renderer.py); doing
         # that here would turn a wrong CIDR into a console-only recovery, so
-        # it is a decision rather than a fix. Pinned by
+        # it is a decision rather than a fix — tracked as #1009. Pinned by
         # appliance/tests/test_host_runner_stdin_programs.py.
         NFT_TMP=$(mktemp /tmp/spatium-ssh-nft.XXXXXX)
         trap 'rm -f "$BODY_TMP" "$AK_TMP" "$SSHD_TMP" "$TEST_CONF" "$NFT_TMP"; rm -rf "$STAGE_DIR"' EXIT

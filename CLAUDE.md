@@ -2090,8 +2090,10 @@ suggestion, free-space treemap.
   the Web UI resolves the same collision by *retiring* its unconditional
   accept when a scope is set (`webui_action`), and doing that for SSH would
   make a wrong CIDR a console-only recovery — a behaviour decision, not a bug
-  fix, and so out of scope here. Stated in the CHANGELOG and pinned by a test
-  that fails if the ordering ever changes without the note moving with it.
+  fix, and so out of scope here; filed as
+  [#1009](https://github.com/spatiumddi/spatiumddi/issues/1009). Stated in the
+  CHANGELOG and pinned by a test that fails if the ordering ever changes
+  without the note moving with it.
 
 - ✅ [**Blanking the installer's Time source did not disable NTP**](https://github.com/spatiumddi/spatiumddi/issues/1002)
   — Debian's `/etc/chrony/chrony.conf` carries its own `pool` directive and
