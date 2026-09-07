@@ -250,7 +250,10 @@ def _memtotal_mib() -> int | None:
             if line.startswith("MemTotal:"):
                 return int(int(line.split()[1]) / 1024)
     except OSError:
-        pass
+        # No /proc — a developer mac. Fall through to None, which is what
+        # firstboot's own `_mem_total_mib` yields there too, so both sides
+        # still see the same input and the comparison stays meaningful.
+        return None
     return None
 
 
