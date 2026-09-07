@@ -1327,8 +1327,10 @@ export function FleetTab({
                 every appliance host. The rendered <code>authorized_keys</code>{" "}
                 + <code>sshd_config.d/spatiumddi.conf</code> ship through the
                 ConfigBundle long-poll, validated host-side via{" "}
-                <code>sshd -t</code> before activation. Port 22 always stays
-                open in the host firewall as an escape hatch.
+                <code>sshd -t</code> before activation. Port 22 stays open in
+                the host firewall as an escape hatch, until the source
+                restriction below is enabled — that retires the floor and scopes
+                SSH to the allowed networks.
               </p>
               <SSHTab />
             </div>

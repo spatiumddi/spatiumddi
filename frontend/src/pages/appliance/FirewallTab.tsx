@@ -718,8 +718,8 @@ function WebUIAccessModal({
           HTTP/HTTPS door (nftables) and the control-plane VIP
           (loadBalancerSourceRanges). A mistake here is always recoverable from
           the console — and over SSH too, unless the SSH source restriction
-          (Settings → SSH) is also on with a scope that excludes you. The two
-          are independent and neither can see the other.
+          (Appliance → Fleet → SSH) is also on with a scope that excludes you.
+          The two are independent and neither can see the other.
         </p>
         <label className="block">
           <span className="text-xs text-muted-foreground">

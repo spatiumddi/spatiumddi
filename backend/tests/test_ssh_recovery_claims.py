@@ -19,9 +19,16 @@ paraphrase. This test asserts on the CLAIM instead: any sentence that puts an
 SSH/22-is-open assertion next to an unconditional word, without naming the
 exception, fails — however it is spelled.
 
-Deliberately narrow: it fires only where "always / never / regardless" sits in
-the same sentence as SSH and port 22. Saying SSH is open (it is, by default)
+Deliberately narrow: the CLAIM — port 22, stated with "always / never /
+regardless" — must sit in one sentence. Saying SSH is open (it is, by default)
 is fine; promising it *always* is what is no longer true.
+
+The SSH reference and the exception are both looked for in the SURROUNDING
+sentences, not the matched one. That is not laxity, it is what the misses
+looked like: FleetTab said "…validated host-side via sshd -t before
+activation. Port 22 always stays open in the host firewall as an escape
+hatch." — a false promise whose own sentence never says SSH, and which
+survived three human sweeps and the first cut of this guard.
 """
 
 from __future__ import annotations
@@ -47,8 +54,10 @@ _SEARCH: tuple[tuple[str, str], ...] = (
 
 #: A sentence asserting something unconditional…
 _ABSOLUTE = re.compile(r"\b(always|never|regardless|unconditional\w*)\b", re.I)
-#: …about SSH on 22.
-_SSH = re.compile(r"\bssh\b", re.I)
+#: …about SSH on 22. ``sshd`` counts too: prose about the daemon and prose
+#: about the protocol make the same promise, and much of the UI copy that
+#: carries these claims says ``sshd``.
+_SSH = re.compile(r"\bsshd?\b", re.I)
 _PORT22 = re.compile(r"(?<![\d.])22\b|port[- ]22|dport 22|:22\b", re.I)
 #: ...but "a NON-22 ssh port" asserts nothing about 22. Stripped before the
 #: port test rather than excluded by a lookbehind, because the hyphen in
@@ -98,13 +107,21 @@ def _offenders() -> list[str]:
                 continue
             sentences = _sentences(text)
             for i, sentence in enumerate(sentences):
-                if not _SSH.search(sentence):
-                    continue
+                # The CLAIM must be in one sentence: port 22, stated
+                # unconditionally.
                 if not _PORT22.search(_NOT_22.sub("", sentence)):
                     continue
                 if not _ABSOLUTE.search(sentence):
                     continue
                 window = " ".join(sentences[max(0, i - 1) : i + 1 + _CONTEXT_SENTENCES])
+                # ...but the SSH reference may sit in a neighbouring sentence,
+                # and routinely does. FleetTab said "…validated host-side via
+                # sshd -t before activation. Port 22 always stays open in the
+                # host firewall as an escape hatch." — a false promise whose
+                # own sentence never says SSH, which is how it survived three
+                # sweeps AND the first cut of this guard.
+                if not _SSH.search(window):
+                    continue
                 if _EXCEPTION.search(window):
                     continue
                 out.append(f"{path.relative_to(REPO)}: {sentence.strip()[:160]}")
@@ -144,6 +161,18 @@ def test_the_guard_can_actually_fire() -> None:
         assert _ABSOLUTE.search(sentence)
         assert not _EXCEPTION.search(sentence), sentence
 
+    # The claim split across sentences — the FleetTab shape, and the reason
+    # both the SSH test and the exception test run against the window.
+    split = (
+        "Rendered config is validated host-side via sshd -t before activation. "
+        "Port 22 always stays open in the host firewall as an escape hatch."
+    )
+    claim = _sentences(split)[1]
+    assert _PORT22.search(claim) and _ABSOLUTE.search(claim)
+    assert not _SSH.search(claim), "the claim's own sentence never says SSH"
+    assert _SSH.search(split), "...but the window does, which is what catches it"
+    assert not _EXCEPTION.search(split)
+
     # A sentence about a NON-22 port asserts nothing about the floor.
     non22 = (
         "The nft fragment is the only thing that opens a NON-22 ssh port, and "
@@ -153,10 +182,14 @@ def test_the_guard_can_actually_fire() -> None:
     assert not _PORT22.search(_NOT_22.sub("", non22))
 
     # ...and the corrected forms must pass, or the guard just bans the topic.
+    # Parenthesised: an implicitly-concatenated pair inside a list literal is
+    # indistinguishable from a missing comma, which is what the linter says.
     good = [
-        "The console always recovers it; SSH does too unless the SSH source "
-        "restriction is on and excludes you.",
-        "SSH on port 22 is open by default — the floor is retired only under " "lockdown.",
+        (
+            "The console always recovers it; SSH does too unless the SSH "
+            "source restriction is on and excludes you."
+        ),
+        ("SSH on port 22 is open by default — the floor is retired only " "under lockdown."),
     ]
     for sentence in good:
         assert _EXCEPTION.search(sentence), sentence

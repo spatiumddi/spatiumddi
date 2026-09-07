@@ -1370,7 +1370,8 @@ async def set_web_ui_access(
                 "session making the change. Add your IP / network to the list, or pass "
                 "override_lockout=true. The console always recovers the appliance; "
                 "SSH does too unless you have also turned on the SSH source "
-                "restriction (Settings \u2192 SSH) with a scope that excludes you."
+                "restriction (Appliance \u2192 Fleet \u2192 SSH) with a scope "
+                "that excludes you."
             ),
         )
     cfg = await db.get(PlatformSettings, 1)
