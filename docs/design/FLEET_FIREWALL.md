@@ -394,6 +394,25 @@ A new top-level **Firewall** surface under the Fleet sidebar **Services** group 
 
 ## 6. Safety rails + IPv6 + injection-safety + audit/compliance
 
+> **Shipped, partially, as [#1009](https://github.com/spatiumddi/spatiumddi/issues/1009) — and one sentence below is wrong.**
+> The SSH half of this section is now real, under the name `ssh_lockdown`
+> rather than `firewall_mgmt_lockdown`, reusing the existing
+> `ssh_allowed_source_networks` (#157) as its CIDR source rather than adding
+> `firewall_mgmt_cidrs`. The floor moved from `/etc/nftables.conf` to the
+> retireable sentinel `/etc/nftables.d/00-spatium-ssh.nft`, and all three
+> renderers stamp `# spatium-ssh: retire|keep`.
+>
+> **"The base-conf floor stays LAN-wide regardless" cannot be true at the
+> same time as line 192's `OR ip saddr {mgmt} when firewall_mgmt_lockdown`.**
+> nftables is first-match-wins and the base conf is read before the include
+> glob, so a floor that stays LAN-wide makes the scoped rule dead code — which
+> is exactly the bug #1009 was filed for, designed in. The floor is therefore
+> *retireable* rather than *un-removable*: present by default (so §6.1's
+> guarantee holds for every install that has not opted in), retired only when
+> the operator turns lockdown on. The belt-and-braces of line 266 survives in
+> the form that matters — a node whose drop-in never rendered still has the
+> baked sentinel.
+
 **6.1 Un-removable management floor.** SSH/22 + ICMP v4/v6 + loopback are emitted **first**, outside any operator-controllable block, AND baked in the base conf (`ssh-floor`). No policy, no `firewall_extra`, no `default_action=drop` can remove them. `compile_firewall` **asserts** the body contains an SSH accept and refuses to ship a body lacking it (returns last-good / floor-only + logs). The write-time lint additionally **rejects any rule whose resolved port atoms include 22 with `action=drop`** so an operator can't even author a self-lockout. `firewall_mgmt_lockdown` is honoured only when `firewall_mgmt_cidrs` is non-empty AND yields a non-empty `ip saddr {…} tcp dport 22 accept`; the backend 422s `lockdown=true` with empty `mgmt_cidrs`. The base-conf floor stays LAN-wide regardless — the irreducible recovery channel.
 
 **6.2 IPv6 (three confirmed bugs, fixed at the model layer).** (a) *Lockout-via-validation-gap*: aliases/rules family-split at rest (`v4_members`/`v6_members`, `family`); the renderer routes by family (`ip saddr` vs `ip6 saddr`) so a v6 entry can never leak into a v4 set and wipe the drop-in; the API 422s a v6 CIDR in a v4-only context. (b) *node_ip family*: `_cluster_peer_cidrs` is family-split so a v6 InternalIP yields `/128` (not a garbage `/32`); collection reports **all** InternalIPs as `node_ips: list` (k3s lists both families on dual-stack) so the v6 peer set is derived from a real v6 address. The compiler emits `ip6 saddr {…/128}` **only** when the v6 peer set is non-empty, and a **preflight check flags an asymmetric v6 peer set** (some CP nodes have a v6 InternalIP, the firewall set doesn't) before allowing the base-conf close — preventing a silent v6 etcd hole or v6 quorum outage on a dual-stack cluster. (c) *Silent bypass*: the base conf's family-agnostic k3s accept is gone (§3.2); the floor keeps `icmpv6` so v6 ND/ICMP is never stranded.

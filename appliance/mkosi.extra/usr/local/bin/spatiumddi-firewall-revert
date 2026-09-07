@@ -36,6 +36,12 @@ CONFIRM_FILE=$STATE/firewall-confirm
 LAST_GOOD=$STATE/firewall-role.nft.last-good
 LAST_GOOD_SENTINEL=$STATE/firewall-sentinel.last-good
 LAST_GOOD_WEBUI_SENTINEL=$STATE/firewall-webui-sentinel.last-good
+# #1009 — the SSH floor is a retireable sentinel too, so a reverted
+# test-apply has to restore whether it was present. Without this a
+# test-apply that retired it and then reverted would leave SSH scoped by a
+# ruleset nobody confirmed — the one posture this whole plane exists to
+# make impossible.
+LAST_GOOD_SSH_SENTINEL=$STATE/firewall-ssh-sentinel.last-good
 LOCK=$STATE/firewall.lock
 APPLIED_HASH=$STATE/firewall-applied-hash
 APPLIED_STATUS=$STATE/firewall-applied-status
@@ -45,6 +51,9 @@ SENTINEL_RETIRED="$SENTINEL.retired"
 # #769 — Web-UI bootstrap sentinel (80/443 open from first boot).
 WEBUI_SENTINEL=/etc/nftables.d/00-spatium-webui.nft
 WEBUI_SENTINEL_RETIRED="$WEBUI_SENTINEL.retired"
+# #1009 — SSH management floor sentinel.
+SSH_SENTINEL=/etc/nftables.d/00-spatium-ssh.nft
+SSH_SENTINEL_RETIRED="$SSH_SENTINEL.retired"
 NFT_MAIN=/etc/nftables.conf
 
 log() { printf '[spatiumddi-firewall-revert] %s\n' "$*"; }
@@ -116,6 +125,11 @@ restore_sentinel_state "$LAST_GOOD_SENTINEL" "$SENTINEL" "$SENTINEL_RETIRED"
 # retired it must not survive a revert whose whole purpose is undoing a
 # lockout: that would leave the Web UI narrower than before the test.
 restore_sentinel_state "$LAST_GOOD_WEBUI_SENTINEL" "$WEBUI_SENTINEL" "$WEBUI_SENTINEL_RETIRED"
+# #1009 — and the SSH floor. This is the sharpest case the revert covers:
+# retiring it is the only change in this plane that can close the operator's
+# own session, so a revert that left it retired would strand them on the
+# ruleset nobody confirmed.
+restore_sentinel_state "$LAST_GOOD_SSH_SENTINEL" "$SSH_SENTINEL" "$SSH_SENTINEL_RETIRED"
 
 if nft -c -f "$NFT_MAIN" 2>/tmp/nft-revert.err && nft -f "$NFT_MAIN" 2>>/tmp/nft-revert.err; then
     sha256sum "$DROP_IN" | cut -d' ' -f1 > "$APPLIED_HASH" 2>/dev/null || true
@@ -126,4 +140,4 @@ else
     log "REVERT FAILED on nft apply — manual intervention needed:"
     sed 's/^/[spatiumddi-firewall-revert]  /' /tmp/nft-revert.err 2>/dev/null || true
 fi
-rm -f "$LAST_GOOD_SENTINEL" "$LAST_GOOD_WEBUI_SENTINEL"
+rm -f "$LAST_GOOD_SENTINEL" "$LAST_GOOD_WEBUI_SENTINEL" "$LAST_GOOD_SSH_SENTINEL"

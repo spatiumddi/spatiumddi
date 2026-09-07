@@ -852,10 +852,26 @@ class PlatformSettings(Base):
     # ``PermitRootLogin yes|no``. ``ssh_port`` → sshd ``Port`` (server
     # rejects < 1024 except 22). ``ssh_allowed_source_networks`` is a
     # JSONB list of CIDRs the host nftables drop-in source-scopes the
-    # ssh port to (sshd has no native source filter); empty = open the
-    # port unconditionally, and the un-removable port-22 accept floor
-    # in the firewall renderer always stays so a bad port change can't
-    # brick the box.
+    # ssh port to (sshd has no native source filter).
+    #
+    # ``ssh_lockdown`` is what makes that list ENFORCEMENT rather than a
+    # note (#1009). Port 22 is opened unconditionally by a management
+    # floor — baked at ``/etc/nftables.d/00-spatium-ssh.nft`` and emitted
+    # again by the firewall renderers — and nftables is first-match-wins,
+    # so the scoped rule sat behind it as dead code. Retiring that floor
+    # removes what ``docs/design/FLEET_FIREWALL.md`` §6.1 calls the
+    # irreducible recovery channel, which is a decision an operator has
+    # to take rather than a side effect of typing a CIDR: hence a second,
+    # default-off switch, the same shape §6.1 specified as
+    # ``firewall_mgmt_lockdown`` and the same anti-lockout pattern
+    # pfSense / OPNsense ship.
+    #
+    # OFF (the default, including on upgrade): the port is opened
+    # unconditionally on every port, and the list is inert — so nothing
+    # tightens under an operator who never asked for it.
+    # ON: refused unless the list is non-empty (there would be nothing
+    # left to accept from), the floor is retired, and the scope applies
+    # on port 22 and on a moved port alike.
     ssh_authorized_keys: Mapped[list[dict]] = mapped_column(
         JSONB, nullable=False, default=list, server_default=sa_text("'[]'::jsonb")
     )
@@ -870,6 +886,9 @@ class PlatformSettings(Base):
     )
     ssh_allowed_source_networks: Mapped[list[str]] = mapped_column(
         JSONB, nullable=False, default=list, server_default=sa_text("'[]'::jsonb")
+    )
+    ssh_lockdown: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
     )
 
     # ── Appliance DNS resolver (issue #158) ─────────────────────────

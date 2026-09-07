@@ -7,6 +7,7 @@ import {
   type PlatformSettings,
   type SshAuthorizedKey,
 } from "@/lib/api";
+import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { Toggle } from "@/components/ui/toggle";
 import { cn } from "@/lib/utils";
 
@@ -89,6 +90,14 @@ export function SSHSection({
   const [sources, setSources] = useState<string[]>(
     values.ssh_allowed_source_networks || [],
   );
+  // #1009 — the allowlist above is a note until this is on. The host
+  // firewall opens port 22 unconditionally from a floor that sorts ahead of
+  // the scoped rule, so enforcing means retiring that floor — which is the
+  // appliance's recovery channel, hence an explicit switch rather than a
+  // consequence of typing a CIDR.
+  const [lockdown, setLockdown] = useState<boolean>(
+    values.ssh_lockdown ?? false,
+  );
 
   const dirty =
     passwordAuth !== values.ssh_password_auth_enabled ||
@@ -96,6 +105,7 @@ export function SSHSection({
     port !== (values.ssh_port || 22) ||
     JSON.stringify(sources) !==
       JSON.stringify(values.ssh_allowed_source_networks || []) ||
+    lockdown !== (values.ssh_lockdown ?? false) ||
     JSON.stringify(keys) !==
       JSON.stringify((values.ssh_authorized_keys || []).map((k) => ({ ...k })));
 
@@ -112,6 +122,10 @@ export function SSHSection({
 
   const [saveErr, setSaveErr] = useState<string | null>(null);
   const [savedAt, setSavedAt] = useState<number | null>(null);
+  // Set only after the operator confirms the server's self-lockout warning;
+  // cleared on every successful save so it can never be sticky.
+  const [lockdownForced, setLockdownForced] = useState(false);
+  const [confirmLockout, setConfirmLockout] = useState<string | null>(null);
 
   const mutation = useMutation({
     mutationFn: (patch: Partial<PlatformSettings>) => settingsApi.update(patch),
@@ -122,12 +136,23 @@ export function SSHSection({
       setAllowRoot(updated.ssh_allow_root_login);
       setPort(updated.ssh_port || 22);
       setSources(updated.ssh_allowed_source_networks || []);
+      setLockdown(updated.ssh_lockdown ?? false);
       setSaveErr(null);
       setSavedAt(Date.now());
+      setLockdownForced(false);
       setTimeout(() => setSavedAt(null), 2500);
     },
     onError: (err: unknown) => {
-      setSaveErr(err instanceof Error ? err.message : String(err));
+      const msg = err instanceof Error ? err.message : String(err);
+      // The self-lockout pre-flight is a question, not a failure — surface
+      // it as a confirmation the operator can accept, with the server's own
+      // wording rather than a paraphrase that could drift from it.
+      if (msg.includes("not inside the allowed networks")) {
+        setConfirmLockout(msg);
+        setSaveErr(null);
+        return;
+      }
+      setSaveErr(msg);
     },
   });
 
@@ -142,7 +167,13 @@ export function SSHSection({
       ssh_allow_root_login: allowRoot,
       ssh_port: port,
       ssh_allowed_source_networks: sources.map((s) => s.trim()).filter(Boolean),
+      ssh_lockdown: lockdown,
     };
+    // #1009 — the server refuses turning enforcement on from an address the
+    // allowlist does not cover, which is the mistake operators actually
+    // make. Confirming here re-sends with the acknowledgement rather than
+    // silently forcing: the operator has to read what they are accepting.
+    if (lockdownForced) patch.ssh_lockdown_force = true;
     mutation.mutate(patch);
   }
 
@@ -337,8 +368,9 @@ export function SSHSection({
             <div className="text-sm font-medium">Allowed source networks</div>
             <div className="text-xs text-muted-foreground">
               CIDRs the host firewall scopes the SSH port to (e.g.{" "}
-              <code>10.0.0.0/24</code>). Empty = reachable from anywhere. The
-              port-22 floor stays open regardless.
+              <code>10.0.0.0/24</code>). Applied only when{" "}
+              <span className="font-medium">Enforce source restriction</span> is
+              on.
             </div>
           </div>
           <button
@@ -382,6 +414,55 @@ export function SSHSection({
         )}
       </div>
 
+      {/* #1009 — the switch that turns the list above into enforcement.
+          Separate from the list on purpose: enforcing means retiring the
+          appliance's unconditional port-22 floor, which docs/design/
+          FLEET_FIREWALL.md §6.1 calls the irreducible recovery channel and
+          its risk register names as the mitigation for every OTHER firewall
+          mistake. Typing a CIDR should not remove it; deciding to should. */}
+      <div
+        className={cn(
+          "rounded-md border p-3",
+          lockdown ? "border-amber-500/50 bg-amber-500/5" : "bg-muted/30",
+        )}
+      >
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0">
+            <div className="text-sm font-medium">
+              Enforce source restriction
+            </div>
+            <div className="text-xs text-muted-foreground">
+              {lockdown ? (
+                <>
+                  SSH is reachable only from the networks above, on port 22 and
+                  on a moved port alike. The appliance&rsquo;s always-open
+                  port-22 floor is retired while this is on.
+                </>
+              ) : (
+                <>
+                  Off: SSH is reachable from anywhere and the list above is
+                  recorded but not applied. Turning this on retires the
+                  always-open port-22 floor &mdash; the recovery channel a wrong
+                  CIDR would otherwise leave you. Recover at the console, or by
+                  turning this back off here.
+                </>
+              )}
+            </div>
+          </div>
+          <Toggle
+            checked={lockdown}
+            onChange={setLockdown}
+            disabled={!isSuperadmin || sources.length === 0}
+          />
+        </div>
+        {sources.length === 0 && (
+          <div className="mt-2 text-xs text-muted-foreground">
+            Add at least one network above first &mdash; enforcing an empty list
+            would close SSH from everywhere.
+          </div>
+        )}
+      </div>
+
       <div className="mt-4 flex items-center gap-3 border-t pt-4">
         <button
           type="button"
@@ -407,6 +488,40 @@ export function SSHSection({
           </span>
         )}
       </div>
+
+      <ConfirmModal
+        open={confirmLockout !== null}
+        title="Enforce SSH restriction from outside it?"
+        tone="destructive"
+        message={confirmLockout ?? ""}
+        confirmLabel="Enforce anyway"
+        requireCheckboxLabel="I understand this may close my SSH access to every appliance"
+        loading={mutation.isPending}
+        onConfirm={() => {
+          setConfirmLockout(null);
+          setLockdownForced(true);
+          // The acknowledgement rides the NEXT save, so re-issue it here
+          // rather than asking the operator to press Save again — and read
+          // the flag from a local rather than from state, which has not
+          // committed yet.
+          mutation.mutate({
+            ssh_authorized_keys: keys.map((k) => ({
+              name: k.name.trim(),
+              public_key: k.public_key.trim(),
+              comment: k.comment.trim(),
+            })),
+            ssh_password_auth_enabled: passwordAuth,
+            ssh_allow_root_login: allowRoot,
+            ssh_port: port,
+            ssh_allowed_source_networks: sources
+              .map((x) => x.trim())
+              .filter(Boolean),
+            ssh_lockdown: lockdown,
+            ssh_lockdown_force: true,
+          });
+        }}
+        onClose={() => setConfirmLockout(null)}
+      />
     </div>
   );
 }

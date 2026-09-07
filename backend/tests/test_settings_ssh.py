@@ -222,3 +222,163 @@ async def test_denied_without_write_settings(db_session: AsyncSession, client: A
         json={"ssh_allow_root_login": True},
     )
     assert resp.status_code == 403, resp.text
+
+
+# ── #1009 — ssh_lockdown, the switch that makes the allowlist enforcement ──
+
+
+@pytest.mark.asyncio
+async def test_lockdown_defaults_off_and_leaves_the_scope_inert(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    """The reason nothing tightens on upgrade.
+
+    An operator who configured an allowlist while it was inert (which it was,
+    on the default port, from #157 until #1009) must not have their SSH
+    restricted by an upgrade they never asked for.
+    """
+    from app.services.appliance.ssh import effective_ssh_scope
+
+    _, token = await _make_user(db_session, username="sshlock1", superadmin=True)
+    await db_session.commit()
+    resp = await client.put(
+        "/api/v1/settings",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"ssh_allowed_source_networks": ["10.0.0.0/8"]},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["ssh_lockdown"] is False
+
+    row = await db_session.get(PlatformSettings, 1)
+    await db_session.refresh(row)
+    assert list(row.ssh_allowed_source_networks) == ["10.0.0.0/8"]
+    # ...and the resolved scope, which is what every renderer consumes, is
+    # empty — so the port-22 floor stays and the rule stays unscoped.
+    assert effective_ssh_scope(row) == []
+
+
+@pytest.mark.asyncio
+async def test_lockdown_with_an_empty_list_is_refused(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    """Not a restriction — a closed port, on every appliance at once.
+
+    ``docs/design/FLEET_FIREWALL.md`` §6.1 specified this same 422 for the
+    same combination under its ``firewall_mgmt_lockdown`` name.
+    """
+    _, token = await _make_user(db_session, username="sshlock2", superadmin=True)
+    await db_session.commit()
+    resp = await client.put(
+        "/api/v1/settings",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"ssh_lockdown": True},
+    )
+    assert resp.status_code == 422, resp.text
+    assert "empty allowed-networks list" in resp.text
+
+
+@pytest.mark.asyncio
+async def test_lockdown_from_outside_the_scope_needs_an_acknowledgement(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    """The mistake an operator actually makes.
+
+    Advisory rather than a refusal — browsing the UI from one network and
+    SSHing from another is legitimate — but it must be acknowledged, because
+    the alternative is finding out at the next SSH attempt.
+    """
+    _, token = await _make_user(db_session, username="sshlock3", superadmin=True)
+    await db_session.commit()
+    headers = {"Authorization": f"Bearer {token}", "X-Real-IP": "203.0.113.9"}
+
+    resp = await client.put(
+        "/api/v1/settings",
+        headers=headers,
+        json={"ssh_lockdown": True, "ssh_allowed_source_networks": ["10.0.0.0/8"]},
+    )
+    assert resp.status_code == 422, resp.text
+    assert "not inside the allowed networks" in resp.text
+
+    forced = await client.put(
+        "/api/v1/settings",
+        headers=headers,
+        json={
+            "ssh_lockdown": True,
+            "ssh_allowed_source_networks": ["10.0.0.0/8"],
+            "ssh_lockdown_force": True,
+        },
+    )
+    assert forced.status_code == 200, forced.text
+    assert forced.json()["ssh_lockdown"] is True
+
+
+@pytest.mark.asyncio
+async def test_lockdown_from_inside_the_scope_needs_no_acknowledgement(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    from app.services.appliance.ssh import effective_ssh_scope
+
+    _, token = await _make_user(db_session, username="sshlock4", superadmin=True)
+    await db_session.commit()
+    resp = await client.put(
+        "/api/v1/settings",
+        headers={"Authorization": f"Bearer {token}", "X-Real-IP": "10.1.2.3"},
+        json={"ssh_lockdown": True, "ssh_allowed_source_networks": ["10.0.0.0/8"]},
+    )
+    assert resp.status_code == 200, resp.text
+
+    row = await db_session.get(PlatformSettings, 1)
+    await db_session.refresh(row)
+    assert effective_ssh_scope(row) == ["10.0.0.0/8"]
+
+
+@pytest.mark.asyncio
+async def test_the_force_flag_is_never_written_as_a_column(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    """It is an acknowledgement, and ``changes`` is both the write set and
+    the audit payload — so leaving it in would 500 on setattr and, worse,
+    record a field that does not exist."""
+    _, token = await _make_user(db_session, username="sshlock5", superadmin=True)
+    await db_session.commit()
+    resp = await client.put(
+        "/api/v1/settings",
+        headers={"Authorization": f"Bearer {token}", "X-Real-IP": "10.1.2.3"},
+        json={
+            "ssh_lockdown": True,
+            "ssh_allowed_source_networks": ["10.0.0.0/8"],
+            "ssh_lockdown_force": True,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert "ssh_lockdown_force" not in resp.json()
+    row = await db_session.get(PlatformSettings, 1)
+    assert not hasattr(row, "ssh_lockdown_force")
+
+
+@pytest.mark.asyncio
+async def test_turning_lockdown_off_again_is_always_allowed(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    """The recovery path, and it must never need an acknowledgement.
+
+    An operator who has locked themselves out of SSH still has the Web UI
+    (scoped separately, by ``web_ui_allowed_cidrs``), and this is what they
+    reach for. Refusing it because their address is outside the scope they
+    are trying to REMOVE would be exactly backwards.
+    """
+    _, token = await _make_user(db_session, username="sshlock6", superadmin=True)
+    await db_session.commit()
+    headers = {"Authorization": f"Bearer {token}", "X-Real-IP": "203.0.113.9"}
+    await client.put(
+        "/api/v1/settings",
+        headers=headers,
+        json={
+            "ssh_lockdown": True,
+            "ssh_allowed_source_networks": ["10.0.0.0/8"],
+            "ssh_lockdown_force": True,
+        },
+    )
+    resp = await client.put("/api/v1/settings", headers=headers, json={"ssh_lockdown": False})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["ssh_lockdown"] is False

@@ -222,48 +222,39 @@ def test_everything_that_can_refuse_runs_before_the_sshd_drop_in() -> None:
     )
 
 
-def test_the_scoped_rule_is_still_dead_code_on_port_22() -> None:
-    """The allowlist now renders correctly and STILL does nothing on port 22.
+def test_the_scoped_rule_is_no_longer_dead_code_on_port_22() -> None:
+    """#1001 made the allowlist render correctly; #1009 made it reachable.
 
-    ``/etc/nftables.conf`` emits an unconditional ``tcp dport 22 accept`` in
-    its management floor, ABOVE the ``include "/etc/nftables.d/*.nft"`` that
-    pulls this drop-in in. nftables is first-match-wins, so on the default
-    port the scoped rule is never reached. Verified against a real nftables
-    kernel while #1001 was written: both rules load, and ``nft list chain``
-    shows the unconditional accept first.
+    Both were needed, and for a while only the first was done. The base
+    ``/etc/nftables.conf`` opened ``tcp dport 22`` unconditionally ABOVE the
+    ``include "/etc/nftables.d/*.nft"`` glob, and nftables is first-match-wins
+    — verified against a real kernel, both rules loaded, the unconditional one
+    listed first — so a perfectly-rendered scoped rule restricted nothing on
+    the default port.
 
-    That floor is deliberate — it is the un-removable recovery channel that
-    keeps a bad Web-UI source restriction from bricking the appliance — so
-    #1001 did not remove it. But it means the fix above only bites once SSH
-    has been moved off 22, and saying otherwise would overstate it.
+    That floor now lives in the retireable sentinel
+    ``/etc/nftables.d/00-spatium-ssh.nft`` (#1009), which the firewall
+    renderers retire under ``ssh_lockdown``. This test guards the half that
+    lives in this file's subject matter: the base config must not take the
+    accept back, because a rule there cannot be retired by anything.
 
-    The Web UI solves the same collision by RETIRING its unconditional accept
-    once a scope is configured (``webui_action`` in the supervisor's firewall
-    renderer). Doing that for SSH is a behaviour decision, not a bug fix: it
-    would make a wrong CIDR a real SSH lockout, recoverable only at the
-    console. Tracked as #1009; this test exists so whoever takes that
-    decision finds this note rather than rediscovering the ordering — move
-    it to assert the new behaviour rather than deleting it.
+    The rest of the mechanism — the sentinel, both host runners, and the
+    second unconditional accept the renderers emit AFTER the scoped rule —
+    is pinned by ``test_firewall_ssh_sentinel.py``.
     """
     base = (
         Path(__file__).parent.parent / "mkosi.extra" / "etc" / "nftables.conf"
     ).read_text(encoding="utf-8")
-    lines = [ln.strip() for ln in base.splitlines()]
-    accept = next(
-        (i for i, ln in enumerate(lines) if ln == "tcp dport 22 accept"), None
-    )
-    include = next(
-        (i for i, ln in enumerate(lines) if ln.startswith('include "/etc/nftables.d/')),
-        None,
-    )
-    assert accept is not None, "the base management floor no longer opens 22"
-    assert include is not None, "the drop-in include glob is gone"
-    assert accept < include, (
-        "the unconditional port-22 accept now sorts AFTER the drop-in include "
-        "— the ssh source-CIDR allowlist has become live on the default port. "
-        "That is a real behaviour change (a wrong CIDR is now an SSH lockout, "
-        "recoverable only at the console): update this test, the #1001 note in "
-        "spatiumddi-ssh-reload, and the CHANGELOG together."
+    for line in base.splitlines():
+        code = line.split("#", 1)[0].strip()
+        assert code != "tcp dport 22 accept", (
+            "the unconditional port-22 accept is back in the base config, "
+            "where nothing can retire it — the ssh source-CIDR allowlist is "
+            "dead code again on the default port (#1001 / #1009)"
+        )
+    assert 'include "/etc/nftables.d/*.nft"' in base, (
+        "the drop-in glob is gone, so neither the floor nor the scoped rule "
+        "reaches the chain at all"
     )
 
 

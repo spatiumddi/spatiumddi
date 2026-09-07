@@ -888,6 +888,7 @@ def _render_for(inputs: dict[str, Any], ps: PolicySet, ap: _Policy | None) -> st
         policy_set=ps,
         appliance_policy=ap,
         web_ui_allowed_cidrs=inputs.get("web_ui_allowed_cidrs") or [],
+        ssh_scope_cidrs=inputs.get("ssh_scope_cidrs") or [],
     )
 
 

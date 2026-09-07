@@ -70,6 +70,11 @@ SENTINEL_RETIRED="$SENTINEL.retired"
 # sorts earlier in the include glob and would defeat that scope.
 WEBUI_SENTINEL=/etc/nftables.d/00-spatium-webui.nft
 WEBUI_SENTINEL_RETIRED="$WEBUI_SENTINEL.retired"
+# #1009 — SSH management floor. Same machinery: retired only when the
+# operator turns on ssh_lockdown, which is the one thing that lets the
+# source-scoped rule in 50-spatium-ssh.nft be reached on port 22.
+SSH_SENTINEL=/etc/nftables.d/00-spatium-ssh.nft
+SSH_SENTINEL_RETIRED="$SSH_SENTINEL.retired"
 # #285 Phase 2c — test-apply + auto-revert. A test trigger (``__test__`` on
 # line 2) snapshots the current drop-in + sentinel state to .last-good and
 # arms a deadline; the always-running spatiumddi-firewall-revert.timer
@@ -82,6 +87,7 @@ CONFIRM_FILE=/var/lib/spatiumddi/release-state/firewall-confirm
 LAST_GOOD=/var/lib/spatiumddi/release-state/firewall-role.nft.last-good
 LAST_GOOD_SENTINEL=/var/lib/spatiumddi/release-state/firewall-sentinel.last-good
 LAST_GOOD_WEBUI_SENTINEL=/var/lib/spatiumddi/release-state/firewall-webui-sentinel.last-good
+LAST_GOOD_SSH_SENTINEL=/var/lib/spatiumddi/release-state/firewall-ssh-sentinel.last-good
 
 log() { printf '[spatium-firewall-reload] %s\n' "$*"; }
 
@@ -175,6 +181,17 @@ if [ "$TEST_MODE" = 1 ]; then
     else
         echo absent > "$LAST_GOOD_WEBUI_SENTINEL"
     fi
+    # #1009 — and the SSH floor, for the same reason and more sharply: a
+    # test-apply that retires it is the one change in this plane that can
+    # cost the operator their own session, so a revert that left it retired
+    # would strand them on exactly the ruleset nobody confirmed.
+    if [ -f "$SSH_SENTINEL" ]; then
+        echo present > "$LAST_GOOD_SSH_SENTINEL"
+    elif [ -f "$SSH_SENTINEL_RETIRED" ]; then
+        echo retired > "$LAST_GOOD_SSH_SENTINEL"
+    else
+        echo absent > "$LAST_GOOD_SSH_SENTINEL"
+    fi
 fi
 
 mv "$STAGING" "$DROP_IN"
@@ -241,6 +258,12 @@ apply_sentinel_directive bootstrap "spatium-bootstrap" "$SENTINEL" "$SENTINEL_RE
 # Web UI stays open — the safe direction: a stale unscoped accept is a
 # visible posture, a silently-closed Web UI is a support call.
 apply_sentinel_directive web-ui "spatium-webui" "$WEBUI_SENTINEL" "$WEBUI_SENTINEL_RETIRED"
+# #1009 — same machinery for the SSH floor. An absent directive (a pre-#1009
+# render reaching a post-#1009 host) leaves the file as-is, so SSH stays
+# open — the safe direction, and the same choice the web-ui line above makes:
+# a stale unscoped accept is a visible posture, a silently-closed SSH port is
+# a console trip.
+apply_sentinel_directive ssh "spatium-ssh" "$SSH_SENTINEL" "$SSH_SENTINEL_RETIRED"
 
 if ! nft -f "$NFT_MAIN" 2>/tmp/nft-apply.err; then
     log "nft -f $NFT_MAIN failed — runtime apply error:"
