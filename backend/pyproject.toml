@@ -139,6 +139,13 @@ ignore_missing_imports = true
 plugins = ["pydantic.mypy"]
 disable_error_code = ["assignment", "no-redef", "attr-defined", "index", "operator", "unused-ignore"]
 
+# #1020 — the push-to-main CI shards run with ``--cov-context=test`` and the
+# aggregator folds their .coverage files into the test-impact map. Relative
+# paths keep the map keyed ``app/x.py`` instead of the runner's absolute
+# workspace path, which is what the selector matches ``git diff`` output to.
+[tool.coverage.run]
+relative_files = true
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 # Force every async fixture and test onto a single session-scoped event loop.
@@ -150,4 +157,7 @@ asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "session"
 asyncio_default_test_loop_scope = "session"
 testpaths = ["tests"]
-addopts = "--cov=app --cov-report=term-missing"
+# Coverage is opt-in (``make test-cov``), not in addopts (#1019). #435 removed
+# ``--cov`` from the CI command line, but this line kept re-adding it on every
+# shard AND every local ``make test-one`` — 15-30 % tracing overhead for a
+# table nothing read. Do not put ``--cov`` back here.

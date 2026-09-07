@@ -70,6 +70,67 @@ the formatter handles the rest.
   past. The check that sees both settings at once landed in
   #1013, below.
 
+### Changed
+
+- **CI: a backend PR no longer waits 28 minutes on one test shard
+  (#1019).** The eight `Backend — Tests` shards were split by test
+  COUNT — no `.test_durations` file existed anywhere in the repo, so
+  pytest-split had nothing else to go on — and the alphabetical
+  slice holding the heavy DB-bound files ran 25–28 min while the
+  other seven took ~11 for the same 595 tests. The split is now
+  balanced by duration from a committed `backend/.test_durations`,
+  there are twelve shards, and every full run re-measures: each
+  shard uploads what it timed, the aggregator merges the pieces into
+  a `test-durations` artifact — normalizing each shard by its
+  runner's speed first, since hosted runners vary ~2× run to run
+  and a raw measurement bakes one slow runner into every test it
+  held — and warns when the file stops describing relative costs;
+  `make test-durations` pulls the newest artifact down for a human
+  to commit at release prep. A stale file only costs balance (an
+  unknown test is assumed average), never correctness. Measured on
+  the PR itself: 28 min → 15–16 min wall clock, the remainder being
+  one runner in twelve landing ~2× slower, which no split removes.
+  **Found on the way: coverage was still being traced on every
+  shard.** #435 removed `--cov` from the workflow command, but
+  `addopts` in `backend/pyproject.toml` re-added it silently, so
+  every shard log ended with the full coverage table and every
+  `make test-one` paid the same 15–30 % for output nothing read.
+  Coverage is now opt-in via `make test-cov`.
+- **CI: a PR runs only the backend tests its diff can affect
+  (#1020).** The push-to-main shards now record which test executed
+  each line (`--cov-context=test`); the aggregator folds that into a
+  `test-impact-map` artifact, and the next PR's change-detection job
+  narrows the shards to the test files the changed `app/` modules
+  were observed to reach. **Every rule fails open** — toward the
+  full suite: no map, a migration, `pyproject.toml`, a data file,
+  `conftest.py`, a module only ever executed at import (models,
+  registries), or a selection covering most of the suite all run
+  everything, and push to main always does, so a wrong selection is
+  caught after merge rather than lost. Why not a file-name mapping:
+  only 65 of 358 test files are named after an `app/` module, and
+  228 of them build the whole app through the `client` fixture, so
+  a static import graph reaches every test from any change.
+- **CI: `agent-e2e.yml` no longer runs on backend-only PRs
+  (#1021).** It installs the control plane from the `:latest`
+  release image and builds only the DNS agent images from PR
+  source, so on a backend change it spent 4–20 minutes probing a
+  cluster that did not contain the change — the workflow's own
+  header already made this argument for excluding `frontend/**`.
+  Its path filter now lists what it actually exercises.
+- **CI hygiene (#1022).** The `protect-main` ruleset now requires
+  every stable check name, not just Backend Lint and the two
+  Frontend jobs — `Backend — Tests` had been documented as "a
+  required-check aggregator" while not being one. The four
+  per-image build workflows lose a `docker/login-action` and a
+  "Build and push (main / tag)" step that their PR-only triggers
+  made reachable solely by hand (where it pushed `:<branch>` tags
+  nothing consumes), and drop `packages: write`. Both frontend
+  jobs cache npm. Stale ci.yml comments ("~1900 tests", "coverage
+  is no longer collected") corrected. The two GitHub-managed CodeQL
+  runs per PR (default setup + Code Quality) are documented in the
+  trigger table and kept — the Code Quality bot threads are acted
+  on.
+
 ### Security
 
 - **The two source restrictions composed into a console-only

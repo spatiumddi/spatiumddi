@@ -41,6 +41,11 @@ agent/dhcp/spatium_dhcp_agent/metrics.py
 # that its output still goes through app.openapi()'s wrapper.
 scripts/export_openapi.py
 
+# test_merge_test_durations.py (#1019) loads the shard-durations merge the
+# aggregator runs, and pins that a partial or malformed shard file is refused
+# rather than published as the file the next release balances the shards with.
+scripts/merge_test_durations.py
+
 # test_zone_name_scope.py (#986) loads the release-prep TLD regenerator and
 # pins that it uses the PRODUCT's payload guard rather than a second copy —
 # so a PR that gives the script its own parser has to run the test that says

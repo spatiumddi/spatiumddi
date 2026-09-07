@@ -139,7 +139,7 @@ CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--worker
 
 # ── Stage 3: dev (used by docker-compose.dev.yml) ─────────────────────────────
 # Adds the ``[dev]`` extras (pytest + pytest-asyncio + pytest-xdist +
-# pytest-cov) on top of the runtime stage so ``make test`` can run pytest
+# pytest-cov + pytest-split) on top of the runtime stage so ``make test`` can run pytest
 # inside the api container without bloating the production image. The dev
 # compose's ``build.target: dev`` selects this stage.
 #
@@ -160,5 +160,6 @@ RUN pip install --no-cache-dir --root-user-action=ignore \
         "pytest>=8.3.0" \
         "pytest-asyncio>=0.24.0" \
         "pytest-cov>=6.0.0" \
+        "pytest-split>=0.9.0" \
         "pytest-xdist>=3.6.0"
 USER app

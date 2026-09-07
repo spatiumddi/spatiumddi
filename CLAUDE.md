@@ -2363,6 +2363,11 @@ make trivy IMAGE=kea                   #   ...one image only. Same gate CI uses 
 #     mapped table between tests, so two runs deadlock on the same locks.
 #     Reach for `-n auto` only in CI or on a bigger machine.
 make test                              # backend pytest, -n auto — CI / big-machine only; see warning above
+make test-cov                          # the same, WITH coverage — the only place it runs since #1019 (addopts used
+                                       #   to force it onto every CI shard + every test-one: 15-30 % overhead nothing read)
+make test-durations                    # refresh backend/.test_durations from the latest main CI run's artifact (#1019).
+                                       #   pytest-split balances the 12 CI shards with it; commit at release-prep or when
+                                       #   the Backend — Tests aggregator warns. Stale = imbalanced shards, never wrong.
 cd frontend && npm test                # vitest (#906) — the QR tests DECODE what the component renders, since a
                                        #   transposed row scans as nothing and neither review nor tsc can see it.
 make test-one T=tests/test_health.py::test_liveness   # ← PREFER THIS LOCALLY. Serial, ~5 min per ~110 tests.

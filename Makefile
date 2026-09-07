@@ -1,4 +1,4 @@
-.PHONY: charts-lint perf-test help up down dev build build-supervisor migrate lint test lint-backend lint-frontend test-backend \
+.PHONY: charts-lint perf-test help up down dev build build-supervisor migrate lint test lint-backend lint-frontend test-backend test-cov test-durations \
         openapi \
         lint-untyped-routes \
         lint-untyped-routes-baseline \
@@ -200,6 +200,27 @@ test-backend:
 test-one:
 	@test -n "$(T)" || (echo "Usage: make test-one T=tests/test_health.py::test_liveness"; exit 1)
 	docker compose -f docker-compose.yml -f docker-compose.dev.yml exec -T api python -m pytest $(T) -v
+
+# Coverage is opt-in (#1019). It used to ride ``addopts`` in
+# backend/pyproject.toml, which made every CI shard — and every
+# ``make test-one`` — pay 15-30 % tracing overhead for a table nothing read.
+# This is the one place it runs.
+test-cov:
+	docker compose -f docker-compose.yml -f docker-compose.dev.yml exec -T api python -m pytest -n auto --cov=app --cov-report=term-missing
+
+# Refresh backend/.test_durations — the file pytest-split balances the CI
+# shards with (#1019) — from the ``test-durations`` artifact the most recent
+# successful CI run on main produced, then commit it. Run at release prep,
+# or when the ``Backend — Tests`` aggregator warns that the shards have
+# drifted. A stale file only costs balance (an unknown test is assumed
+# average), never correctness. Needs an authenticated GitHub CLI.
+test-durations:
+	@command -v gh >/dev/null || { echo "make test-durations needs the GitHub CLI (gh)"; exit 1; }
+	@run=$$(gh run list --workflow CI --branch main --event push --status success --limit 1 --json databaseId --jq '.[0].databaseId'); \
+	test -n "$$run" || { echo "no successful CI run on main found"; exit 1; }; \
+	echo "downloading test-durations from CI run $$run"; \
+	gh run download "$$run" -n test-durations -D backend/ && \
+	echo "wrote backend/.test_durations — review the diff and commit it"
 
 # ── CI parity ──────────────────────────────────────────────────────────────────
 # `make ci` runs the same lint + typecheck + build jobs GitHub Actions runs on

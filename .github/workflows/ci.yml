@@ -13,7 +13,7 @@ on:
   #
   # #813 gets the runtime back without that trade: the workflow still
   # ALWAYS runs and always posts every check, and the expensive part
-  # (8 backend test shards, each with its own Postgres + Redis) is
+  # (12 backend test shards, each with its own Postgres + Redis) is
   # gated per-JOB on change detection instead. A docs-only PR now
   # posts a green "Backend — Tests" in seconds rather than minutes,
   # and no ruleset knows the difference.
@@ -27,7 +27,7 @@ permissions:
 
 jobs:
   # ── Change detection (issue #813) ──────────────────────────────────────────
-  # Cheap (~15 s) job whose only output decides whether the 8 backend test
+  # Cheap (~15 s) job whose only output decides whether the 12 backend test
   # shards run. Everything else in this workflow is unconditional.
   #
   # Deliberately NOT ``dorny/paths-filter``: a plain git diff needs no
@@ -41,8 +41,14 @@ jobs:
   changes:
     name: Detect changed paths
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # #1020 — to download the test-impact map from the last main run.
+      actions: read
     outputs:
       backend: ${{ steps.detect.outputs.backend }}
+      # #1020 — "all", or the space-separated test files this PR can affect.
+      tests: ${{ steps.select.outputs.tests }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -92,6 +98,53 @@ jobs:
             echo "→ backend suite WILL run"
           else
             echo "→ nothing the backend suite covers changed; shards will be skipped"
+          fi
+
+      # #1020 — WHICH backend tests can this change set affect? Reads the
+      # test-impact map the most recent successful push-to-main run built from
+      # its shards' coverage contexts ({app file → test files that executed
+      # it}) and applies the fail-open rules in
+      # .github/scripts/select_impacted_tests.py. The answer is "all" whenever
+      # the map is missing or any changed path is outside what the map can
+      # speak for (migrations, config, data files, conftest, import-only
+      # modules such as models, anything in the must-run manifest). Push to
+      # main always runs everything — that is the safety net that makes a
+      # wrong selection recoverable rather than lost, the same contract #813
+      # relies on. Nothing in this step may fail the job: every error path
+      # lands on "all".
+      - id: select
+        name: Which backend tests can this change set affect?
+        if: steps.detect.outputs.backend == 'true'
+        env:
+          EVENT: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          tests=all
+          if [ "$EVENT" = "pull_request" ]; then
+            map_dir="$RUNNER_TEMP/impact-map"
+            mkdir -p "$map_dir"
+            # Newest successful main run that published a map. A green run can
+            # lack one (the aggregator builds it only when every shard ran), so
+            # look back a few. ``gh`` is preinstalled on ubuntu-latest.
+            for run_id in $(gh run list --workflow CI --branch main --event push \
+                              --status success --limit 5 --json databaseId \
+                              --jq '.[].databaseId' 2>/dev/null || true); do
+              if gh run download "$run_id" -n test-impact-map -D "$map_dir" 2>/dev/null; then
+                echo "test-impact map from main run $run_id"
+                break
+              fi
+            done
+            tests="$(python3 .github/scripts/select_impacted_tests.py \
+                       --changed "$RUNNER_TEMP/changed-files.txt" \
+                       --map "$map_dir/test-impact-map.json")" || tests=all
+            [ -n "$tests" ] || tests=all
+          fi
+          echo "tests=$tests" >> "$GITHUB_OUTPUT"
+          if [ "$tests" = all ]; then
+            echo "→ full backend suite"
+          else
+            echo "→ narrowed to: $tests"
           fi
 
   # ── Backend ────────────────────────────────────────────────────────────────
@@ -162,14 +215,32 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: python3 scripts/lint_ssh_recovery_claims.py
 
-  # The ~1900-test suite is DB-bound, so we fan it out across 8 parallel
-  # jobs (free concurrent runners) via pytest-split; each job still runs
-  # ``-n auto`` (4 xdist workers on a 4-vCPU runner) → ~32-way parallelism
-  # total, taking the wall-clock from ~18 min to ~3 min. Coverage is no
-  # longer collected on the PR gate (it was a non-gating ``continue-on-error``
-  # upload anyway and added ~15-30% tracing overhead on every run).
+  # The ~4,200-test suite is DB-bound (conftest TRUNCATEs every table per
+  # test), so we fan it out across 12 parallel jobs via pytest-split; each
+  # job still runs ``-n auto`` (4 xdist workers on a 4-vCPU runner).
+  #
+  # #1019 — the split is balanced by DURATION, from the committed
+  # ``backend/.test_durations``. Without that file pytest-split splits by
+  # test COUNT, and one shard of 8 took 25-28 min while the other seven took
+  # ~11 for the same 595 tests (PR #1018) — the whole PR waited on it. Each
+  # shard records what it measured (``--store-durations --clean-durations``
+  # → only the tests it ran) and uploads it; the aggregator merges the
+  # pieces into a ``test-durations`` artifact — normalizing each shard by
+  # its runner's speed first, because hosted runners vary ~2x run to run
+  # and a raw measurement would bake one slow runner into every test it
+  # held — and warns when the committed file has stopped describing the
+  # suite's relative costs; ``make test-durations`` downloads that artifact
+  # for a human to commit. A stale file degrades gracefully — an unknown
+  # test is assumed average — so the refresh is a release-prep chore,
+  # never a gate. Expect the slowest shard to be ~2x the median on a bad
+  # runner day; that bounds the wall clock and no balancing removes it.
+  #
+  # Coverage is NOT collected here. #435 dropped it from this command, but
+  # ``addopts`` in backend/pyproject.toml silently re-added it on every run
+  # (every shard log ended with the full coverage table, ~15-30 % overhead);
+  # it now lives only behind ``make test-cov``.
   backend-test-shard:
-    name: Backend — Tests (shard ${{ matrix.shard }}/8)
+    name: Backend — Tests (shard ${{ matrix.shard }}/12)
     runs-on: ubuntu-latest
     # #813 — skipped when the PR touches nothing the suite covers. The
     # aggregator below stays green in that case, so no required check
@@ -181,7 +252,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
     defaults:
       run:
         working-directory: backend
@@ -228,7 +299,7 @@ jobs:
           DATABASE_URL: postgresql+asyncpg://spatiumddi:test@localhost:5432/spatiumddi_test
         run: alembic upgrade head
 
-      - name: Run tests (shard ${{ matrix.shard }} of 8)
+      - name: Run tests (shard ${{ matrix.shard }} of 12)
         env:
           DATABASE_URL: postgresql+asyncpg://spatiumddi:test@localhost:5432/spatiumddi_test
           # conftest reads its own TEST_DATABASE_URL (defaults to "changeme")
@@ -237,17 +308,65 @@ jobs:
           CELERY_BROKER_URL: redis://localhost:6379/1
           CELERY_RESULT_BACKEND: redis://localhost:6379/2
           SECRET_KEY: ci-test-secret-key-not-for-production
-        # ``--splits 8 --group N`` (pytest-split) selects this shard's slice
-        # of the suite (even split by test count when no .test_durations file
-        # is present); ``-n auto`` then runs that slice across the runner's
-        # 4 vCPUs, each xdist worker on its own ``spatiumddi_test_gw<N>`` DB.
-        run: python -m pytest -n auto --splits 8 --group ${{ matrix.shard }}
+          TESTS: ${{ needs.changes.outputs.tests }}
+          EVENT: ${{ github.event_name }}
+        # ``--splits 12 --group N`` (pytest-split) selects this shard's slice
+        # of the suite, balanced by the committed ``.test_durations`` (an even
+        # split by count if that file were ever absent); ``-n auto`` then runs
+        # the slice across the runner's 4 vCPUs, each xdist worker on its own
+        # ``spatiumddi_test_gw<N>`` DB. ``--store-durations --clean-durations``
+        # rewrites .test_durations in the workspace with ONLY this shard's
+        # measured tests, which is what the upload below carries.
+        run: |
+          set -euo pipefail
+          # #1020 — on a PR the changes job may have narrowed the run to the
+          # test files the diff can affect; "all" (and every push to main)
+          # is the whole suite via pyproject's testpaths.
+          if [ "$TESTS" = all ] || [ -z "$TESTS" ]; then set --; else set -- $TESTS; fi
+          # #1020 — the push-to-main run also records WHICH test executed
+          # each line; the aggregator turns that into the test-impact map
+          # PRs select from. Coverage is otherwise off (#1019).
+          extra=()
+          if [ "$EVENT" = push ]; then extra=(--cov=app --cov-context=test --cov-report=); fi
+          rc=0
+          python -m pytest "$@" -n auto --splits 12 --group ${{ matrix.shard }} \
+            --store-durations --clean-durations "${extra[@]}" || rc=$?
+          # A narrowed run can leave this shard's slice empty; pytest reports
+          # that as exit 5, which is not a failure of anything.
+          if [ "$rc" -eq 5 ]; then echo "no tests in this shard's slice"; exit 0; fi
+          exit "$rc"
 
-  # Aggregator that collapses the 8 shards into one stable check name,
-  # "Backend — Tests". Not currently in ``protect-main``'s required set (only
-  # the two Frontend jobs and Backend Lint are) but it is the name to point at
-  # if it ever is — which is precisely why the skip logic lives HERE and never
-  # on the shards' own check names.
+      # #1019 — this shard's slice of the measurement. It is a dotfile, so
+      # ``include-hidden-files`` is load-bearing: upload-artifact v4+ skips
+      # hidden files silently otherwise and the aggregator would merge nothing.
+      # Full runs only: a narrowed PR run (#1020) measured a subset, and a
+      # subset must never become the file the shards are balanced with.
+      - name: Upload measured durations
+        if: needs.changes.outputs.tests == 'all'
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-durations-shard-${{ matrix.shard }}
+          path: backend/.test_durations
+          include-hidden-files: true
+          retention-days: 7
+
+      # #1020 — this shard's coverage contexts, for the test-impact map.
+      # pytest-cov has already combined the xdist workers' data into one file.
+      - name: Upload coverage contexts
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-shard-${{ matrix.shard }}
+          path: backend/.coverage
+          include-hidden-files: true
+          retention-days: 3
+
+  # Aggregator that collapses the 12 shards into one stable check name,
+  # "Backend — Tests" — the name ``protect-main`` requires (#1022; until then
+  # only the two Frontend jobs and Backend Lint were required, so the one
+  # check that took 28 minutes was the one nobody was forced to wait for).
+  # The skip logic lives HERE and never on the shards' own check names, which
+  # is what lets a required check stay green on a docs-only PR.
   #
   # #813: a skip is a pass, but only the skip detection asked for.
   backend-test:
@@ -260,6 +379,7 @@ jobs:
         env:
           SHARDS: ${{ needs.backend-test-shard.result }}
           BACKEND_RELEVANT: ${{ needs.changes.outputs.backend }}
+          TESTS: ${{ needs.changes.outputs.tests }}
         run: |
           set -euo pipefail
 
@@ -272,7 +392,7 @@ jobs:
               echo "::error::shards were skipped but change detection did not ask for it (backend='$BACKEND_RELEVANT')"
               exit 1
             fi
-            echo "no backend-relevant files changed — 8 shards skipped (#813)"
+            echo "no backend-relevant files changed — 12 shards skipped (#813)"
             exit 0
           fi
 
@@ -280,7 +400,80 @@ jobs:
             echo "::error::backend test shards did not all pass (result=$SHARDS)"
             exit 1
           fi
-          echo "all 8 backend test shards passed"
+          if [ "$TESTS" != all ]; then
+            echo "::notice title=Backend tests narrowed (#1020)::this PR ran only the test files its diff can affect: $TESTS — the full suite runs on merge to main"
+          fi
+          echo "all 12 backend test shards passed"
+
+      # #1019 — assemble the full durations picture from the shards' uploads.
+      # Only when EVERY shard succeeded AND the run was not narrowed (#1020):
+      # a partial union would drop the missing tests from the file and they
+      # would be split as "unknown → average" from then on. The job is
+      # ``if: always()``, hence the explicit gate on each step.
+      - uses: actions/checkout@v7
+        if: needs.backend-test-shard.result == 'success'
+
+      - uses: actions/download-artifact@v8
+        if: needs.backend-test-shard.result == 'success' && needs.changes.outputs.tests == 'all'
+        with:
+          pattern: test-durations-shard-*
+          path: ${{ runner.temp }}/durations
+
+      - name: Merge shard durations and report balance
+        if: needs.backend-test-shard.result == 'success' && needs.changes.outputs.tests == 'all'
+        env:
+          DURATIONS: ${{ runner.temp }}/durations
+          MERGED: ${{ runner.temp }}/merged/.test_durations
+        run: |
+          set -euo pipefail
+          python3 scripts/merge_test_durations.py \
+            --committed backend/.test_durations \
+            --out "$MERGED" \
+            "$DURATIONS"/test-durations-shard-*/.test_durations
+
+      # What ``make test-durations`` downloads. 30 days outlives a release
+      # cadence; the per-shard pieces above only need to outlive this job.
+      - name: Upload merged durations
+        if: needs.backend-test-shard.result == 'success' && needs.changes.outputs.tests == 'all'
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-durations
+          path: ${{ runner.temp }}/merged/.test_durations
+          include-hidden-files: true
+          retention-days: 30
+
+      # #1020 — fold the shards' coverage contexts into the test-impact map
+      # PRs select from. Push to main only: that run is always the whole
+      # suite, and a map built from a narrowed run would attribute too little
+      # and shrink the next selection further.
+      - uses: actions/download-artifact@v8
+        if: github.event_name == 'push' && needs.backend-test-shard.result == 'success'
+        with:
+          pattern: coverage-shard-*
+          path: ${{ runner.temp }}/coverage
+
+      - name: Build test-impact map
+        if: github.event_name == 'push' && needs.backend-test-shard.result == 'success'
+        env:
+          COVERAGE: ${{ runner.temp }}/coverage
+          MAP: ${{ runner.temp }}/impact/test-impact-map.json
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet "coverage>=7"
+          python3 .github/scripts/build_test_impact_map.py \
+            --sha "$GITHUB_SHA" --out "$MAP" \
+            "$COVERAGE"/coverage-shard-*/.coverage
+
+      # What the next PR's ``changes`` job downloads. 30 days: a map older
+      # than the last merge to main only exists if main has been idle that
+      # long, and the selector falls back to the full suite without one.
+      - name: Upload test-impact map
+        if: github.event_name == 'push' && needs.backend-test-shard.result == 'success'
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-impact-map
+          path: ${{ runner.temp }}/impact/test-impact-map.json
+          retention-days: 30
 
   # ── Frontend ───────────────────────────────────────────────────────────────
   # ── Docs ───────────────────────────────────────────────────────────────────
@@ -325,6 +518,10 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: "22"
+          # #1022 — both frontend jobs install from the same lockfile; without
+          # this each one fetched the whole tree from the registry every run.
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
 
       - name: Install dependencies
         run: npm install
@@ -359,6 +556,10 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: "22"
+          # #1022 — both frontend jobs install from the same lockfile; without
+          # this each one fetched the whole tree from the registry every run.
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
 
       - name: Install dependencies
         run: npm install
