@@ -942,8 +942,51 @@ Since [#1009](https://github.com/spatiumddi/spatiumddi/issues/1009) that SSH
 half is a default-on floor rather than a guarantee: **the two lockdowns
 compose.** An operator who scopes the Web UI *and* turns on `ssh_lockdown` with
 a scope that excludes them has closed both doors, and the console is what
-remains. Neither setting can see the other, so neither warns about the
-combination — each guards only its own.
+remains.
+
+### The cross-setting guard (#1013)
+
+Each guard used to see only its own door, so both could be passed one at a
+time and neither would mention the other. Both write paths now resolve the
+same question through `backend/app/services/appliance/access.py`: **after this
+change, does any remote door still admit the address I am talking to?**
+
+* When the answer is yes, nothing changes — each per-door guard behaves as it
+  did, and its 422 now *names* the surviving path instead of hedging about it
+  (reaching that refusal proves one door survives, so it can be stated).
+* When the answer is no, both paths raise the **same** 422 — one state of the
+  appliance, so one sentence about it — requiring
+  `acknowledge_console_only=true`. Deliberately **not** satisfied by
+  `override_lockout` / `ssh_lockdown_force`: those accept losing one door
+  while another remains, which is a materially smaller thing, and an operator
+  may have sent one for an unrelated reason. The implication runs the other
+  way only — accepting console-only already contains "this door closes on
+  me", so it is not asked for twice.
+
+Both screens also read `GET /appliance/remote-access` and show the *other*
+door's state at the point of decision. It sits on the always-mounted
+`/appliance` hub rather than under `/appliance/firewall`, because the SSH
+screen must be able to ask with the `appliance.firewall` module off.
+
+**An address we cannot read is not covered.** The two guards used to score
+that case in opposite directions — the Web UI one warned, the SSH one
+proceeded — which is not defensible as a pair. One rule now, and it is the
+conservative one: the costs are asymmetric (an unneeded warning costs a
+checkbox; a missing one costs a trip to the console), and #1009's argument for
+the other direction was about how often a gate that blocks on "I could not
+tell" gets forced past by reflex — a frequency claim, and the frequency is
+near zero, since the trusted client-IP helper falls back to the peer address
+that every real HTTP request has. The Web UI guard was additionally reading
+the **spoofable** helper, which behind a reverse proxy resolves the browser's
+own address out of `X-Forwarded-For` while nftables judges the packet source;
+it now reads the same trusted value the SSH guard does.
+
+**The console is the floor, and it is not universal.** `spatium-console` runs
+on `tty1` and `ttyS0`, and the installer's Done screen assumes one of them.
+A remote VM with no virtual serial port and no console access through its
+hypervisor has **no** floor: for that shape, an acknowledged console-only
+lockout is a rebuild, which is why the escalation says so in as many words
+rather than describing the console as a recovery path.
 
 ---
 

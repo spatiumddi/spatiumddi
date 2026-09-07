@@ -1,8 +1,9 @@
 import { useState } from "react";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertCircle, Plus, Trash2 } from "lucide-react";
 
 import {
+  applianceApi,
   formatApiError,
   settingsApi,
   type PlatformSettings,
@@ -124,11 +125,36 @@ export function SSHSection({
   const [saveErr, setSaveErr] = useState<string | null>(null);
   const [savedAt, setSavedAt] = useState<number | null>(null);
   const [confirmLockout, setConfirmLockout] = useState<string | null>(null);
+  const [confirmConsoleOnly, setConfirmConsoleOnly] = useState<string | null>(
+    null,
+  );
+
+  // #1013 — the OTHER door. Enforcing the SSH restriction is only a
+  // console-only lockout when the Web UI allow-list also excludes you, and
+  // this screen could not see that. ``retry: false`` because the answer is
+  // an advisory panel: a deploy where the caller lacks appliance-read (or
+  // has no appliance at all) should render the form, not retry a 403.
+  const { data: doors } = useQuery({
+    queryKey: ["appliance", "remote-access"],
+    queryFn: applianceApi.getRemoteAccess,
+    retry: false,
+    staleTime: 30_000,
+  });
+  const webUiExcludesMe = Boolean(
+    doors && doors.web_ui.restricted && !doors.web_ui.admits,
+  );
 
   const mutation = useMutation({
     mutationFn: (patch: Partial<PlatformSettings>) => settingsApi.update(patch),
     onSuccess: (updated) => {
       qc.setQueryData(["settings"], updated);
+      // #1013 — the door report is derived from BOTH settings, so an SSH
+      // save makes it stale. Without this the Firewall tab keeps rendering
+      // a cached "SSH still admits you" advisory after lockdown was just
+      // enabled against a scope that excludes the operator — the exact
+      // false assurance this guard exists to remove. The Web UI card
+      // invalidates the same key for the mirror-image reason.
+      qc.invalidateQueries({ queryKey: ["appliance", "remote-access"] });
       setKeys((updated.ssh_authorized_keys || []).map((k) => ({ ...k })));
       setPasswordAuth(updated.ssh_password_auth_enabled);
       setAllowRoot(updated.ssh_allow_root_login);
@@ -145,10 +171,21 @@ export function SSHSection({
       // detail, so matching on it below would never fire and the
       // acknowledgement would be unreachable from the UI entirely.
       const msg = formatApiError(err, "Failed to save");
-      // The self-lockout pre-flight is a question, not a failure — surface
-      // it as a confirmation the operator can accept, with the server's own
-      // wording rather than a paraphrase that could drift from it.
-      if (msg.includes("not inside the allowed networks")) {
+      // Both self-lockout pre-flights are questions, not failures — surface
+      // each as a confirmation the operator can accept, carrying the
+      // server's own wording rather than a paraphrase that could drift.
+      //
+      // Routed on the ACKNOWLEDGEMENT FIELD each 422 names, not on its
+      // prose: the field name is the API contract and the sentence around
+      // it is not. The console-only escalation (#1013) is checked first
+      // because it is the stricter of the two and its own tick is the one
+      // the server will accept.
+      if (msg.includes("acknowledge_console_only")) {
+        setConfirmConsoleOnly(msg);
+        setSaveErr(null);
+        return;
+      }
+      if (msg.includes("ssh_lockdown_force")) {
         setConfirmLockout(msg);
         setSaveErr(null);
         return;
@@ -157,8 +194,15 @@ export function SSHSection({
     },
   });
 
-  function handleSave() {
-    const patch: Partial<PlatformSettings> = {
+  // ONE builder for the save payload. It was written out twice — once here
+  // and once in the confirm modal's re-send — which is two chances for a
+  // field added to one to be missing from the other, on the path that only
+  // runs after a lockout warning. A third acknowledgement (#1013) made that
+  // three copies, so it became a function.
+  function buildPatch(
+    extra?: Partial<PlatformSettings>,
+  ): Partial<PlatformSettings> {
+    return {
       ssh_authorized_keys: keys.map((k) => ({
         name: k.name.trim(),
         public_key: k.public_key.trim(),
@@ -169,14 +213,18 @@ export function SSHSection({
       ssh_port: port,
       ssh_allowed_source_networks: sources.map((s) => s.trim()).filter(Boolean),
       ssh_lockdown: lockdown,
+      ...extra,
     };
+  }
+
+  function handleSave() {
     // No acknowledgement here, ever. The server refuses turning enforcement
-    // on from an address the allowlist does not cover; the ONLY path that
-    // sends ``ssh_lockdown_force`` is the confirm modal's own re-send, so
-    // each forced save is one the operator has just read and accepted. A
-    // remembered flag would latch on a save that failed for some other
-    // reason and silently force every later one.
-    mutation.mutate(patch);
+    // on from an address the allowlist does not cover; the ONLY paths that
+    // send ``ssh_lockdown_force`` / ``acknowledge_console_only`` are the
+    // confirm modals' own re-sends, so each forced save is one the operator
+    // has just read and accepted. A remembered flag would latch on a save
+    // that failed for some other reason and silently force every later one.
+    mutation.mutate(buildPatch());
   }
 
   function addKey() {
@@ -476,6 +524,26 @@ export function SSHSection({
               : "Add at least one network above first — enforcing an empty list would close SSH from everywhere."}
           </div>
         )}
+        {/* #1013 — the other door, shown at the point of decision. Both
+            restrictions are independent and each screen used to see only its
+            own, so an operator could close them one at a time and meet the
+            consequence at neither. */}
+        {doors && webUiExcludesMe && (
+          <div className="mt-2 flex items-start gap-2 rounded-md border border-rose-500/40 bg-rose-500/5 p-2 text-xs">
+            <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-rose-600 dark:text-rose-400" />
+            <span>
+              The Web UI is <span className="font-medium">also</span>{" "}
+              source-restricted &mdash; to{" "}
+              <code>{doors.web_ui.allowed_cidrs.join(", ")}</code>, which does
+              not cover the address you are connecting from (
+              <code>{doors.caller_ip ?? "unknown"}</code>). Enforcing an SSH
+              scope that excludes that address as well leaves the appliance
+              console as the only way in, unless you can reach one of those
+              networks another way. Change it under Fleet &rarr; Firewall &rarr;
+              Web UI access, or add your network to the list above.
+            </span>
+          </div>
+        )}
       </div>
 
       <div className="mt-4 flex items-center gap-3 border-t pt-4">
@@ -516,23 +584,28 @@ export function SSHSection({
           setConfirmLockout(null);
           // Re-issue the save with the acknowledgement attached, rather than
           // remembering it and asking the operator to press Save again.
-          mutation.mutate({
-            ssh_authorized_keys: keys.map((k) => ({
-              name: k.name.trim(),
-              public_key: k.public_key.trim(),
-              comment: k.comment.trim(),
-            })),
-            ssh_password_auth_enabled: passwordAuth,
-            ssh_allow_root_login: allowRoot,
-            ssh_port: port,
-            ssh_allowed_source_networks: sources
-              .map((x) => x.trim())
-              .filter(Boolean),
-            ssh_lockdown: lockdown,
-            ssh_lockdown_force: true,
-          });
+          mutation.mutate(buildPatch({ ssh_lockdown_force: true }));
         }}
         onClose={() => setConfirmLockout(null)}
+      />
+
+      {/* #1013 — the escalation. Deliberately its own modal with its own
+          tick rather than a stronger sentence in the one above: what is
+          being accepted is a different, larger thing, and the server will
+          not take the smaller acknowledgement for it either. */}
+      <ConfirmModal
+        open={confirmConsoleOnly !== null}
+        title="Leave the console as the only way in?"
+        tone="destructive"
+        message={confirmConsoleOnly ?? ""}
+        confirmLabel="Close the last remote door"
+        requireCheckboxLabel="I understand only the appliance console will reach this fleet"
+        loading={mutation.isPending}
+        onConfirm={() => {
+          setConfirmConsoleOnly(null);
+          mutation.mutate(buildPatch({ acknowledge_console_only: true }));
+        }}
+        onClose={() => setConfirmConsoleOnly(null)}
       />
     </div>
   );

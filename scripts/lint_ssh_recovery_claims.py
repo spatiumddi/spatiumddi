@@ -8,9 +8,11 @@ the moment they are deciding whether to restrict something.
 
 ``ssh_lockdown`` made that false in one specific case: it retires the port-22
 floor, so an operator who turns it on with a scope that excludes them, AND has
-also scoped the Web UI, is left with the console. The two settings are
-independent and neither can see the other (#1013), so neither warns — which
-makes this copy the only thing standing between the operator and a surprise.
+also scoped the Web UI, is left with the console. #1013 added a cross-setting
+guard that refuses that combination without an explicit acknowledgement, so the
+operator is no longer only warned by prose — but the prose still has to be
+true. A surface that promises SSH unconditionally contradicts the refusal they
+are about to meet, which is worse than saying nothing.
 
 Correcting those surfaces took four passes, and each one grepped for the
 PREVIOUS phrasing and so missed the next paraphrase:

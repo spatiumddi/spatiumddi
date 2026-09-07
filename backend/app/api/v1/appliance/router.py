@@ -22,7 +22,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel
 from sqlalchemy import select
 
@@ -41,7 +41,10 @@ from app.api.v1.appliance.tls import router as tls_router
 from app.api.v1.appliance.upgrade_images import router as upgrade_images_router
 from app.config import settings
 from app.core.permissions import require_permission
+from app.core.request_meta import get_trusted_client_ip
 from app.models.appliance import APPLIANCE_STATE_APPROVED, Appliance
+from app.models.settings import PlatformSettings
+from app.services.appliance.access import Door, effective_doors
 from app.services.feature_modules import require_module
 
 router = APIRouter()
@@ -91,6 +94,64 @@ router.include_router(pairing_router)
 # URL is ``/api/v1/appliance/supervisor/register`` rather than
 # ``/api/v1/appliance/supervisor/supervisor/register``.
 router.include_router(supervisor_router)
+
+
+class RemoteDoor(BaseModel):
+    """One source-restricted way in, and whether it admits this caller."""
+
+    name: str
+    restricted: bool
+    allowed_cidrs: list[str]
+    admits: bool
+
+
+class RemoteAccessResponse(BaseModel):
+    """Which remote doors currently admit the caller (#1013).
+
+    Read by BOTH lockout-sensitive screens — Fleet \u2192 Firewall (the Web UI
+    allow-list) and Fleet \u2192 SSH (the SSH allow-list) — so each can show
+    the state of the OTHER door at the moment the operator is deciding. Same
+    resolver the two write paths raise their 422s from, so the warning an
+    operator reads and the refusal they hit cannot disagree.
+
+    Lives on the always-mounted ``/appliance`` hub rather than under
+    ``/appliance/firewall``: that sub-router is behind the
+    ``appliance.firewall`` feature module, and the SSH screen must be able to
+    ask this question with the module off.
+    """
+
+    caller_ip: str | None
+    web_ui: RemoteDoor
+    ssh: RemoteDoor
+    #: True when neither door admits the caller — the console is all that is
+    #: left. Already the case, not a prediction about a pending change.
+    console_only: bool
+
+
+def _door_out(door: Door) -> RemoteDoor:
+    return RemoteDoor(
+        name=door.name,
+        restricted=door.restricted,
+        allowed_cidrs=list(door.allowed_cidrs),
+        admits=door.admits,
+    )
+
+
+@router.get(
+    "/remote-access",
+    response_model=RemoteAccessResponse,
+    dependencies=[Depends(require_permission("read", "appliance"))],
+    summary="Which remote doors admit this caller",
+)
+async def get_remote_access(request: Request, db: DB) -> RemoteAccessResponse:
+    cfg = await db.get(PlatformSettings, 1)
+    report = effective_doors(cfg, get_trusted_client_ip(request))
+    return RemoteAccessResponse(
+        caller_ip=report.caller_ip,
+        web_ui=_door_out(report.web_ui),
+        ssh=_door_out(report.ssh),
+        console_only=report.console_only,
+    )
 
 
 class SelfApplianceInfo(BaseModel):

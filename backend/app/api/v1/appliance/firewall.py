@@ -44,7 +44,7 @@ from sqlalchemy.orm import selectinload
 from app.api.deps import DB, CurrentUser
 from app.core.agent_wake import HOSTCONFIG_ALL, publish_wake
 from app.core.permissions import user_has_permission
-from app.core.request_meta import client_ip
+from app.core.request_meta import get_trusted_client_ip
 from app.models.appliance import APPLIANCE_STATE_APPROVED, Appliance
 from app.models.audit import AuditLog
 from app.models.firewall import (
@@ -55,6 +55,12 @@ from app.models.firewall import (
     FirewallRule,
 )
 from app.models.settings import PlatformSettings
+from app.services.appliance.access import (
+    SSH_REACHABILITY_CAVEAT,
+    console_only_detail,
+    covers,
+    effective_doors,
+)
 from app.services.appliance.firewall_lease import upgrade_in_flight
 from app.services.appliance.firewall_merge import (
     MergeContext,
@@ -1270,35 +1276,30 @@ async def apply_posture(
 # also drives ``loadBalancerSourceRanges`` on the MetalLB VIP Service so BOTH
 # the node-IP hostPort door and the VIP door are governed by one setting.
 #
-# ANTI-LOCKOUT: a non-empty set that doesn't cover the operator's CURRENT
-# source IP would brick the very session making the change (the request is
-# arriving through the frontend right now). We reject that 422 unless the
-# operator explicitly passes override_lockout=true.
+# ANTI-LOCKOUT, in two tiers (#285 Phase 6, then #1013).
 #
-# SSH/22 is the recovery path for an overridden lockout — but since #1009 it
-# is recoverable rather than guaranteed: the port-22 floor is a retireable
-# sentinel, and an operator who ALSO turned on ``ssh_lockdown`` with a scope
-# that excludes them has closed both doors and is left with the console. The
-# two are independent settings and each warns on its own; nothing here can
-# see the other, which is why this comment says "console" rather than
-# promising SSH.
-
-
-def _ip_in_cidrs(ip: str | None, cidrs: list[str]) -> bool:
-    if not ip:
-        return False
-    try:
-        addr = ipaddress.ip_address(ip)
-    except ValueError:
-        return False
-    for c in cidrs:
-        try:
-            net = ipaddress.ip_network(c, strict=False)
-        except ValueError:
-            continue
-        if addr.version == net.version and addr in net:
-            return True
-    return False
+# Tier 1 — this door. A non-empty set that doesn't cover the operator's
+# CURRENT source IP would brick the very session making the change (the
+# request is arriving through the frontend right now). Rejected 422 unless
+# the operator explicitly passes override_lockout=true. Losing this door is
+# survivable while another remains, which is what that override accepts.
+#
+# Tier 2 — every door. Since #1009 the port-22 floor is a retireable
+# sentinel, so SSH is a recoverable path rather than a guaranteed one: an
+# operator who has also turned on ``ssh_lockdown`` with a scope that excludes
+# them is left with the console. Both guards used to be blind to each other,
+# so both could be passed one at a time and neither would say so. They now
+# share ``services/appliance/access`` and this path escalates to a distinct
+# 422 with its own acknowledgement when the RESULTING state of both settings
+# admits the caller nowhere.
+#
+# The caller's address comes from ``get_trusted_client_ip``, not ``client_ip``
+# — see the two docstrings in ``core/request_meta``. This is a source-IP
+# allowlist gate, and the spoofable value is also simply the WRONG address on
+# a real topology: with a reverse proxy in front of the appliance, uvicorn's
+# ``--forwarded-allow-ips *`` resolves the browser's own IP out of
+# X-Forwarded-For while nftables will judge the packet source, which is the
+# proxy. The guard would clear an operator who is about to be locked out.
 
 
 class WebUIAccessResponse(BaseModel):
@@ -1310,7 +1311,14 @@ class WebUIAccessResponse(BaseModel):
 
 class SetWebUIAccessRequest(BaseModel):
     allowed_cidrs: list[str] = Field(default_factory=list)
+    #: Accept losing THIS door: the resulting list does not cover you, but
+    #: another remote path still does.
     override_lockout: bool = False
+    #: Accept losing EVERY remote door: after this change neither restriction
+    #: admits you and only the console does (#1013). Deliberately separate
+    #: from ``override_lockout`` — that one is a smaller statement, and may
+    #: have been ticked for an unrelated reason.
+    acknowledge_console_only: bool = False
 
     @field_validator("allowed_cidrs")
     @classmethod
@@ -1342,12 +1350,12 @@ async def get_web_ui_access(
     _require_read(current_user)
     cfg = await db.get(PlatformSettings, 1)
     cidrs = list(cfg.web_ui_allowed_cidrs or []) if cfg else []
-    ip = client_ip(request)
+    ip = get_trusted_client_ip(request)
     return WebUIAccessResponse(
         allowed_cidrs=cidrs,
         open=not cidrs,
         caller_ip=ip,
-        caller_covered=(not cidrs) or _ip_in_cidrs(ip, cidrs),
+        caller_covered=(not cidrs) or covers(ip, cidrs),
     )
 
 
@@ -1356,25 +1364,57 @@ async def set_web_ui_access(
     body: SetWebUIAccessRequest, request: Request, db: DB, current_user: CurrentUser
 ) -> WebUIAccessResponse:
     _require_admin(current_user)
-    ip = client_ip(request)
+    ip = get_trusted_client_ip(request)
+    cfg = await db.get(PlatformSettings, 1)
+    # Tier 2 first: it is the strictly more serious finding, and its message
+    # subsumes tier 1's. Checked against the state this request WOULD
+    # produce, with the SSH half read from storage — this endpoint cannot
+    # change it.
+    #
+    # Unlike the SSH side, this is NOT gated on a transition. There, the same
+    # PUT carries unrelated edits (a key, a port) and re-warning about a state
+    # the operator did not change is how a tick stops being read. Here the
+    # request's entire payload IS the door, so there is no unrelated edit to
+    # protect — and re-sending a list that already excludes you has always
+    # re-raised tier 1 for the same reason.
+    report = effective_doors(cfg, ip, web_ui_cidrs=body.allowed_cidrs)
+    if report.console_only and not body.acknowledge_console_only:
+        raise HTTPException(status_code=422, detail=console_only_detail(report))
     if (
         body.allowed_cidrs
-        and not body.override_lockout
-        and not _ip_in_cidrs(ip, body.allowed_cidrs)
+        # ``report.console_only`` here means the acknowledgement above was
+        # given: accepting "the console is my only way in" already contains
+        # "this door closes on me", so demanding a second tick for the
+        # smaller statement would be the reflex-training pattern. It cannot
+        # widen anything — when the escalation did NOT fire, this term is
+        # False and ``override_lockout`` stands on its own.
+        and not (body.override_lockout or report.console_only)
+        and not covers(ip, body.allowed_cidrs)
     ):
+        # Reaching here proves the SSH door did not exclude this address:
+        # the condition above IS "the Web UI door would not admit you", and
+        # had SSH excluded you too, the escalation would already have raised.
+        #
+        # That is a fact about an ADDRESS, not a promise about a session —
+        # see SSH_REACHABILITY_CAVEAT. State the list; do not assert that the
+        # operator will be able to SSH, which needs an assumption about where
+        # they SSH from that this request cannot support.
+        ssh_desc = (
+            f"SSH is allowed from {', '.join(report.ssh.allowed_cidrs)}, "
+            f"{SSH_REACHABILITY_CAVEAT}"
+            if report.ssh.restricted
+            else "SSH is not source-restricted"
+        )
         raise HTTPException(
             status_code=422,
             detail=(
                 f"Refusing to restrict the Web UI: your current source IP ({ip or 'unknown'}) "
                 "is not covered by the allow-list, so this would lock you out of the very "
                 "session making the change. Add your IP / network to the list, or pass "
-                "override_lockout=true. The console always recovers the appliance; "
-                "SSH does too unless you have also turned on the SSH source "
-                "restriction (Appliance \u2192 Fleet \u2192 SSH) with a scope "
-                "that excludes you."
+                f"override_lockout=true. {ssh_desc}, and the appliance console recovers "
+                "this either way."
             ),
         )
-    cfg = await db.get(PlatformSettings, 1)
     if cfg is None:
         cfg = PlatformSettings(id=1)
         db.add(cfg)
@@ -1396,6 +1436,8 @@ async def set_web_ui_access(
                 new_value={
                     "web_ui_allowed_cidrs": body.allowed_cidrs,
                     "override_lockout": body.override_lockout,
+                    "acknowledge_console_only": body.acknowledge_console_only,
+                    "console_only_result": report.console_only,
                     "caller_ip": ip,
                 },
             )
@@ -1409,5 +1451,5 @@ async def set_web_ui_access(
         allowed_cidrs=cidrs,
         open=not cidrs,
         caller_ip=ip,
-        caller_covered=(not cidrs) or _ip_in_cidrs(ip, cidrs),
+        caller_covered=(not cidrs) or covers(ip, cidrs),
     )
