@@ -45,6 +45,16 @@ _state_cfg() {
     sed -n "s/^$1:[[:space:]]*//p" "$STATE_CONFIG" | head -1 \
         | sed 's/[[:space:]]*$//; s/^"//; s/"$//; s/^'"'"'//; s/'"'"'$//'
 }
+# Is KEY present in the STATE config at all?
+#
+# #1002 — _state_cfg returns the empty string for three different facts: the
+# key is absent (a pre-#995 install), the file is absent (STATE mounted
+# `nofail` and not up yet), and the operator answered EMPTY on purpose. Only
+# the last of those is an answer, and acting on it is the whole of #1002.
+_state_cfg_has() {
+    [ -f "$STATE_CONFIG" ] || return 1
+    grep -qE "^$1:" "$STATE_CONFIG"
+}
 STAMP=/var/lib/spatiumddi/firstboot.done
 CHART_TGZ=/usr/lib/spatiumddi/charts/spatiumddi-appliance.tgz
 CONTROL_CHART_TGZ=/usr/lib/spatiumddi/charts/spatiumddi.tgz
@@ -549,14 +559,25 @@ fi
 # #154 plane pushing the public pool: exactly the bug item 2 exists to fix,
 # arrived at from the other side.
 #
-# So absence is the retry signal and an EMPTY answer writes nothing. The two
-# are indistinguishable downstream anyway — models.settings._initial_ntp_servers
-# falls back to the platform default for both — so nothing is lost by leaving
-# a declined answer unwritten, and a late STATE mount is recovered on the
-# next boot.
+# So a MISSING key (or a missing file) is the retry signal, and is left
+# unwritten so a late STATE mount is recovered on the next boot.
+#
+# #1002 — an empty answer is no longer indistinguishable from that. The
+# operator who cleared the Time source field declined a time source, and the
+# installer suppressed Debian's own pool on their behalf; seeding the
+# platform default here would have the #154 chrony plane push it straight
+# back a few minutes later, which is the bug from the other side. The key
+# being PRESENT and empty is what separates the two, so that is what is
+# tested — and it travels as an explicit sentinel rather than as "" so the
+# same ambiguity cannot re-form inside the api's own settings loader (see
+# models.settings.NTP_EXPLICITLY_NONE, which must stay in step with this).
+NTP_EXPLICITLY_NONE="!none"
 if [ -z "$INITIAL_NTP_SERVERS_VAL" ]; then
     INITIAL_NTP_SERVERS_VAL=$(_state_cfg ntp_servers)
     if [ -n "$INITIAL_NTP_SERVERS_VAL" ]; then
+        printf 'INITIAL_NTP_SERVERS=%s\n' "$INITIAL_NTP_SERVERS_VAL" >> "$ENV_FILE"
+    elif _state_cfg_has ntp_servers; then
+        INITIAL_NTP_SERVERS_VAL="$NTP_EXPLICITLY_NONE"
         printf 'INITIAL_NTP_SERVERS=%s\n' "$INITIAL_NTP_SERVERS_VAL" >> "$ENV_FILE"
     fi
 fi
@@ -892,6 +913,13 @@ spec:
       # APPLIANCE_EXTRA_CERT_SANS so the served cert validates on it.
       controlPlaneVIP: ""  # spatium:metallb-vip
       controlPlaneVIPPool: spatium-control-plane
+      # #1005 — stated, not left to the chart default, so the supervisor's
+      # first heartbeat has nothing to add. Same reasoning as the #1003
+      # item 4 sizing above: every key the supervisor owns must already be
+      # here, or its no-op guard cannot fire and the install still pays for
+      # a second helm revision. #285 Phase 6 fills this from
+      # platform_settings once an operator scopes the Web UI; empty = open.
+      loadBalancerSourceRanges: []
       tls:
         enabled: true
         secretName: spatium-appliance-tls
@@ -1078,6 +1106,13 @@ ${WORKER_SIZING_YAML}
       kind: sentinel
       sentinel:
         replicas: 1  # spatium:cp-size
+    # #1005 — likewise stated rather than defaulted. #787 turns this on from
+    # the control-plane node count (a download can only miss when more than
+    # one api replica serves them), and it LATCHES on, so the supervisor
+    # writes it explicitly in both states; a fresh single-node install is
+    # the ``false`` half of that and belongs here.
+    slotImageMirror:
+      enabled: false
     # DNS / DHCP agents from the umbrella chart are NOT used on the
     # appliance — the appliance chart (templates/dns-bind9.yaml etc.)
     # owns the role pods with hostNetwork + per-role node labels.

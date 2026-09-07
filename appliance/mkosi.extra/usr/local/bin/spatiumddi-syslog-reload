@@ -129,15 +129,22 @@ case "$MARKER" in
         # present on the appliance; this writes each {path: pem} entry to
         # its file with mode 0644 (public material — the CA cert, not a
         # private key). Clear stale files first.
+        #
+        # #1001 — the blob is passed as ARGV, never piped. ``python3 -``
+        # reads the PROGRAM from stdin, so a pipe and a heredoc both claim
+        # fd 0 and under bash the heredoc wins; the piped JSON was
+        # discarded and json.load() hit EOF on every run. Unguarded here,
+        # so it raised, the runner took its failure branch, and TLS syslog
+        # forwarding with an operator-supplied CA has never once worked.
         clear_ca_dir
         if [ -n "$CA_JSON" ] && [ "$CA_JSON" != "{}" ]; then
-            if ! printf '%s' "$CA_JSON" | python3 - "$CA_DIR" <<'PYEOF'
+            if ! python3 - "$CA_DIR" "$CA_JSON" <<'PYEOF'
 import json
 import os
 import sys
 
 ca_dir = sys.argv[1]
-data = json.load(sys.stdin)
+data = json.loads(sys.argv[2])
 for path, pem in data.items():
     # Only honour paths inside the managed CA dir — defence against a
     # malformed/hostile blob trying to write elsewhere.

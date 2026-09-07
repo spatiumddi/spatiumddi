@@ -19,6 +19,23 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
 
+#: ``INITIAL_NTP_SERVERS`` value meaning "the operator was asked for a time
+#: source and answered *none*" — as opposed to the empty string, which means
+#: nobody was asked (a pre-#995 installer, an unattended run, a STATE volume
+#: that was not mounted when firstboot read it).
+#:
+#: #1002 — those two were the same value, so declining a time source produced
+#: the platform default and the appliance synchronised against the public pool
+#: anyway, a few minutes into the first boot. They have to be distinguishable
+#: HERE, not just on the appliance, because the #154 chrony plane replaces
+#: /etc/chrony/chrony.conf wholesale from these settings: the installer's own
+#: suppression of Debian's ``pool`` line survives only until the first push.
+#:
+#: ``!`` is outside the character set the installer and the preseed linter
+#: accept for a server name (``[A-Za-z0-9._:-]``), so this can never collide
+#: with something an operator typed.
+NTP_EXPLICITLY_NONE = "!none"
+
 
 def _initial_ntp_servers() -> list[str]:
     """Initial ``ntp_pool_servers`` — the OS installer's answer if there is one.
@@ -50,7 +67,15 @@ def _initial_ntp_servers() -> list[str]:
     # matters, since this must reflect the env at ROW CREATION.
     from app.config import settings  # noqa: PLC0415
 
-    servers = (settings.initial_ntp_servers or "").split()
+    raw = (settings.initial_ntp_servers or "").strip()
+    # #1002 — "declined" and "not asked" are different answers and must not
+    # collapse. An empty list renders a chrony.conf with no sources at all
+    # (services.appliance.ntp.render_chrony_conf already handles it), which is
+    # what the operator asked for; falling back to the pool here would undo
+    # the installer's suppression on the first config push.
+    if raw == NTP_EXPLICITLY_NONE:
+        return []
+    servers = raw.split()
     return servers or ["pool.ntp.org"]
 
 

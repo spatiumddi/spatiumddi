@@ -3,12 +3,10 @@ import { useNavigate } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { isAxiosError } from "axios";
 import { authApi } from "@/lib/api";
+import { evaluatePolicy, parsePasswordError } from "@/lib/password-policy";
 import { cn } from "@/lib/utils";
 
-interface PolicyDetail {
-  reason?: string;
-  errors?: string[];
-}
+const GENERIC_FAILURE = "Failed to change password — try again.";
 
 export function ChangePasswordPage() {
   const navigate = useNavigate();
@@ -32,6 +30,14 @@ export function ChangePasswordPage() {
   const mismatch =
     confirmPassword.length > 0 && newPassword !== confirmPassword;
 
+  // #1004 — one evaluation drives BOTH the rule list and the submit gate.
+  // They used to be computed separately, so the page could show a rule
+  // failing and still let the operator submit it. Until the policy has
+  // loaded there is nothing to gate on, so submit stays enabled and the
+  // server remains the authority (which it is regardless).
+  const evaluation = policy ? evaluatePolicy(policy, newPassword) : null;
+  const unmetPolicy = evaluation ? !evaluation.satisfied : false;
+
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
     setError("");
@@ -41,35 +47,32 @@ export function ChangePasswordPage() {
       setError("New passwords do not match.");
       return;
     }
+    if (evaluation && !evaluation.satisfied) {
+      // Belt to the disabled button's braces: a form can still be submitted
+      // by pressing Enter in some browsers, and the rule list is right here.
+      setPolicyErrors(
+        evaluation.rules.filter((r) => !r.ok).map((r) => r.label),
+      );
+      return;
+    }
 
     setLoading(true);
     try {
       await authApi.changePassword(currentPassword, newPassword);
       navigate("/dashboard");
     } catch (err) {
-      // Server emits ``{detail: {reason: 'password_policy'|'password_history',
-      // errors: [...]}}`` for rule violations and a plain string detail for
-      // bad-current-password / generic failure. Surface each rule on its own
-      // line so the operator can fix everything in one pass.
+      // Three shapes reach here: the policy / history 400's
+      // ``{reason, errors: [...]}``, a plain string detail, and a pydantic
+      // 422's ARRAY of field errors. The third used to fall through to the
+      // generic message, which blamed the current password for a fault in
+      // the new one (#1004). parsePasswordError owns all three.
       if (isAxiosError(err)) {
-        const detail = err.response?.data?.detail as
-          | string
-          | PolicyDetail
-          | undefined;
-        if (
-          detail &&
-          typeof detail === "object" &&
-          Array.isArray(detail.errors)
-        ) {
-          setPolicyErrors(detail.errors);
-          setError("");
-        } else if (typeof detail === "string") {
-          setError(detail);
-        } else {
-          setError(
-            "Failed to change password. Check your current password and try again.",
-          );
-        }
+        const parsed = parsePasswordError(
+          err.response?.data?.detail,
+          GENERIC_FAILURE,
+        );
+        setPolicyErrors(parsed.fieldErrors);
+        setError(parsed.message);
       } else {
         setError("Unexpected error — try again.");
       }
@@ -115,9 +118,7 @@ export function ChangePasswordPage() {
               onChange={(e) => setNewPassword(e.target.value)}
               className="w-full rounded-md border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
             />
-            {policy && (
-              <PolicyHintList policy={policy} candidate={newPassword} />
-            )}
+            {evaluation && <PolicyHintList evaluation={evaluation} />}
           </div>
           <div className="space-y-2">
             <label htmlFor="confirm-password" className="text-sm font-medium">
@@ -149,7 +150,7 @@ export function ChangePasswordPage() {
           )}
           <button
             type="submit"
-            disabled={loading || mismatch}
+            disabled={loading || mismatch || unmetPolicy}
             className="w-full rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             {loading ? "Updating…" : "Set New Password"}
@@ -161,58 +162,30 @@ export function ChangePasswordPage() {
 }
 
 function PolicyHintList({
-  policy,
-  candidate,
+  evaluation,
 }: {
-  policy: import("@/lib/api").PasswordPolicy;
-  candidate: string;
+  evaluation: import("@/lib/password-policy").PolicyEvaluation;
 }) {
-  const rules: { ok: boolean; label: string }[] = [
-    {
-      ok: candidate.length >= policy.min_length,
-      label: `At least ${policy.min_length} characters`,
-    },
-  ];
-  if (policy.require_uppercase) {
-    rules.push({
-      ok: /[A-Z]/.test(candidate),
-      label: "Contains an uppercase letter",
-    });
-  }
-  if (policy.require_lowercase) {
-    rules.push({
-      ok: /[a-z]/.test(candidate),
-      label: "Contains a lowercase letter",
-    });
-  }
-  if (policy.require_digit) {
-    rules.push({
-      ok: /\d/.test(candidate),
-      label: "Contains a digit",
-    });
-  }
-  if (policy.require_symbol) {
-    rules.push({
-      ok: /[^A-Za-z0-9]/.test(candidate),
-      label: "Contains a symbol",
-    });
-  }
-  if (policy.history_count > 0) {
-    rules.push({
-      ok: candidate.length > 0,
-      label: `Cannot match the last ${policy.history_count} passwords (checked on submit)`,
-    });
-  }
   return (
-    <ul className="space-y-0.5 text-xs text-muted-foreground">
-      {rules.map((r) => (
-        <li
-          key={r.label}
-          className={r.ok ? "text-emerald-500" : "text-muted-foreground"}
-        >
-          {r.ok ? "✓" : "○"} {r.label}
-        </li>
+    <div className="space-y-0.5 text-xs">
+      <ul className="space-y-0.5">
+        {evaluation.rules.map((r) => (
+          <li
+            key={r.label}
+            className={r.ok ? "text-emerald-500" : "text-muted-foreground"}
+          >
+            {r.ok ? "✓" : "○"} {r.label}
+          </li>
+        ))}
+      </ul>
+      {/* Rendered as a note, not a rule: it has no ✓/○ because nothing here
+          evaluates it. Given the same green tick as the checkable rules, it
+          made a failing password read as nearly-complete (#1004). */}
+      {evaluation.notes.map((n) => (
+        <p key={n} className="text-muted-foreground/70 italic">
+          {n}
+        </p>
       ))}
-    </ul>
+    </div>
   );
 }

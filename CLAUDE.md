@@ -2032,6 +2032,141 @@ suggestion, free-space treemap.
   against the unpatched script — and the fixture itself was the thing that had
   to be fixed first, since it modelled an `lsblk` that does not exist.
 
+- ✅ [**Three host runners discard their piped input — `python3 -` reads the program from stdin**](https://github.com/spatiumddi/spatiumddi/issues/1001)
+  — one bug, three call sites, and the blast radius was decided entirely by
+  whichever `except` clause each site happened to have. `python3 -` means
+  *read the program from stdin*, so `printf … | python3 - … <<'PYEOF'` has the
+  pipe and the heredoc both claiming fd 0; under bash the heredoc, being the
+  later redirection, wins outright and the piped data is discarded.
+  **The one that matters failed OPEN.** `spatiumddi-ssh-reload` renders the
+  nftables drop-in that scopes the SSH port to the operator's networks — sshd
+  has no native source filter, so that fragment *is* the enforcement. Its
+  `except Exception: cidrs = []` turned the discarded JSON into the documented
+  empty-list branch, which opens the port unconditionally. Nothing anywhere
+  reported a problem: the rule is valid nftables so the #550 `nft -c` dry-run
+  passes, the reload succeeds, the applied sidecar reports success, and Fleet
+  shows the CIDR list exactly as typed. `spatiumddi-syslog-reload` failed
+  closed and loudly instead, so TLS syslog with an operator CA had never
+  worked; `spatiumddi-image-prune`'s documented fail-safe
+  `except: sys.exit(0)` made pruning silently inert, so the disk-reclaim
+  feature had never reclaimed anything and reported success doing it.
+  Fixed by passing data as **argv** — what the four correct sites in the same
+  tree already do — except in `image-prune`, where the crictl inventory is
+  unbounded and goes via a temp file rather than into `ARG_MAX`.
+  **The `except Exception` in ssh-reload is gone**, not preserved: a CIDR blob
+  that will not parse is not a condition to paper over with "open to
+  everyone". Unparseable JSON, a non-list, and a non-empty list yielding no
+  usable entry are now refusals; an *absent* list stays the legitimate "any
+  source" answer it has always been, and the port-22 accept floor in the
+  firewall renderer keeps a default install reachable while the operator
+  fixes it. Rendering goes to a temp file first, so a refusal cannot leave a
+  truncated fragment where the real rule used to be.
+  Two of the three swallowed the exception, so **the guard asserts on the
+  rendered artefact, not the exit code** (#899's lesson) — it extracts the
+  real command line plus heredoc out of each shipped script and runs it under
+  bash, so it tests the bytes that ship. Plus a structural sweep that fails
+  any `| python3 -` opening a heredoc, and any `python3 -` heredoc whose body
+  reads `sys.stdin`; both catch the shape rather than the symptom, since the
+  symptom is different at all three sites. All 18 were run against the
+  unpatched scripts and all 18 fail there. No migration, no API change.
+  **Found on the way, and left deliberately unfixed:** the allowlist has a
+  SECOND, independent reason for doing nothing, and it is the default case.
+  `/etc/nftables.conf` emits an unconditional `tcp dport 22 accept` in its
+  management floor *above* the include glob that pulls the drop-in in, and
+  nftables is first-match-wins — verified against a real kernel, both rules
+  loaded, the unconditional one listed first. So the scoped rule only bites
+  once SSH is moved off 22. That floor is the un-removable recovery channel
+  that keeps a bad Web-UI source restriction from bricking the appliance;
+  the Web UI resolves the same collision by *retiring* its unconditional
+  accept when a scope is set (`webui_action`), and doing that for SSH would
+  make a wrong CIDR a console-only recovery — a behaviour decision, not a bug
+  fix, and so out of scope here. Stated in the CHANGELOG and pinned by a test
+  that fails if the ordering ever changes without the note moving with it.
+
+- ✅ [**Blanking the installer's Time source did not disable NTP**](https://github.com/spatiumddi/spatiumddi/issues/1002)
+  — Debian's `/etc/chrony/chrony.conf` carries its own `pool` directive and
+  `sourcedir` is additive, so removing the installer's sources file left the
+  appliance synchronising against the public Debian pool. Four surfaces said
+  "none", including `docs/PRIVACY.md`, which is normative for
+  non-negotiable #17 — a false claim about an outbound connection, on the page
+  an operator reads to decide what the box talks to.
+  **Blank now means none**, in both windows, because they need different
+  mechanisms. The installer comments out the `pool` line *and* the
+  `/run/chrony-dhcp` sourcedir — marked, line-preserving and exactly
+  reversible by stripping the prefix. And the answer reaches
+  `platform_settings.ntp_pool_servers` as `[]`, because the #154 chrony plane
+  replaces `chrony.conf` wholesale a few minutes into the first boot and would
+  otherwise put the pool straight back. That half needed **"declined" and "not
+  asked" to stop being the same value** (`NTP_EXPLICITLY_NONE`, a sentinel
+  outside the character set a server name may use) — the #882 NULL-vs-zero
+  lesson, in a new place: firstboot reads the STATE config through a `nofail`
+  mount, so "the operator answered empty" and "the volume was not up yet" both
+  arrived as `""`, and recording the wrong one loses what they typed.
+  Suppressing the DHCP sourcedir is deliberate: the prompt PRE-FILLS the field
+  with the servers the lease offered, so clearing it rejects exactly those.
+  `sources.d` and `conf.d` are left in place as the way back.
+  **All four of the issue's open questions were settled by measurement**
+  against chrony 4.6.1, not reasoned about: `chronyd -p -f` still passes,
+  the daemon starts cleanly with zero sources, `chronyc tracking` reports
+  `Not synchronised` (honest, and no alert rule reads it), and the edit
+  round-trips. One premise in the issue was wrong — chrony *does* have a
+  `confdir` on Debian stable — but it is additive like `sourcedir`, so nothing
+  dropped into it can retract a `pool` line and the conclusion stands.
+  Tests assert on the **rendered on-target config** and on the rendered
+  `chrony.conf` body, which is what the issue asked for: every one of the four
+  wrong surfaces was prose, and prose is what nothing checks.
+
+- ✅ [**Change Password accepted a password the server then refused**](https://github.com/spatiumddi/spatiumddi/issues/1004)
+  — two minimums were in play on the forced first-login screen, a hardcoded 8
+  and the configured 12, and the page reported neither honestly.
+  The rule list and the submit gate were computed **separately**: the list
+  evaluated five rows, the button checked only the confirm-field mismatch. So
+  an 8-character password rendered four green ticks and an enabled button, and
+  the browser threw away an answer it had already computed. Both now come from
+  one `evaluatePolicy` — that sharing is the fix, not a tidy-up.
+  **The wrong answer was worse than the useless one.** Under 8 characters the
+  request never reached the handler: the pydantic `field_validator` fired a
+  422 whose `detail` is an error **array**, and an array *is* an object in JS,
+  so the page's `detail.errors` check read `undefined`, both branches missed,
+  and it fell through to "Check your current password and try again". The
+  current password was fine. That sent the operator to the wrong field on the
+  one screen they cannot navigate away from.
+  The hardcoded floor is now non-emptiness, at all three sites (change
+  password, admin create user, admin reset) — it exists so a legacy client
+  still 422s on empty input, and 1 cannot collide with a policy minimum the
+  settings validator clamps to 6..128. A relaxed 6-character policy was
+  previously unreachable through the API while the UI offered it.
+  Password history renders as a **note**, not a rule: its old test was
+  `candidate.length > 0`, so one character ticked it, which is most of why a
+  failing password read as four-of-five done.
+  **This is the repo's first page-level component test.**
+  `lib/password-policy.test.ts` pins the evaluation and
+  `pages/ChangePasswordPage.test.tsx` pins the wiring, because the evaluation was never wrong — the gate ignored
+  it, and neither review nor `tsc` can see that. It earned its keep
+  immediately: `setup(undefined)` silently received the default parameter, so
+  the "policy has not loaded" case was asserting nothing until the test failed.
+
+- ✅ [**Every control-plane first boot wrote a second helm revision**](https://github.com/spatiumddi/spatiumddi/issues/1005)
+  — helm-controller MERGES a `HelmChartConfig` on top of the same-named
+  `HelmChart`, and since #1003 item 4 firstboot renders the same sizing the
+  supervisor computes. So the first heartbeat created a CR carrying nothing
+  the Chart did not already say: no Deployment changed, but helm recorded
+  revision 2 and ran a second helm-install Job.
+  `_helmchartconfig_upsert` could not catch it — its idempotence is against
+  the CR's own previous body, and on a fresh boot there is none. The guard
+  therefore compares against the **HelmChart**, and only when no Config exists
+  yet: once one does, it holds keys the supervisor does not own (`image.tag`,
+  which a rolling upgrade is mid-flight on) and the upsert's compare is the
+  right test. An unreadable Chart falls through to the write, because
+  suppressing a needed override is worse than writing a redundant one.
+  **The guard alone would have been dead code**, which the issue's "two lines"
+  estimate did not account for: firstboot rendered every overridden key except
+  `frontend.loadBalancerSourceRanges` and `slotImageMirror.enabled`, so the
+  comparison never matched. Both now render, and a test executes firstboot's
+  actual `_render_control_helmchart` and asserts the merge is a no-op — so a
+  future override key that firstboot omits fails loudly instead of silently
+  restoring the second revision. Its failure message names the offending keys.
+
 - ⬜ [**Storage redundancy — RAID1 + multipath: fleet monitoring, management, and
   install support**](https://github.com/spatiumddi/spatiumddi/issues/999) — split out
   of #995 items 23 + 24, whose *refusal* half shipped there. Three parts, and the

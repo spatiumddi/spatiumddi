@@ -22,7 +22,96 @@ the formatter handles the rest.
 
 ## Unreleased
 
+### Security
+
+- **The SSH source-CIDR allowlist was discarded and the port
+  opened to the world (#1001).** `spatiumddi-ssh-reload` renders
+  the nftables drop-in that scopes the SSH port to the operator's
+  configured networks — sshd has no native source filter, so that
+  fragment *is* the enforcement. It piped the CIDR list into a
+  `python3 -` whose program came from a heredoc, and `python3 -`
+  means *read the program from stdin*: the heredoc, being the
+  later redirection, won and the JSON was discarded. The
+  `except Exception: cidrs = []` then took the documented
+  empty-list branch, which opens the port unconditionally.
+  Nothing reported a problem — the rendered rule is valid
+  nftables, so the pre-reload `nft -c` dry-run passes, the reload
+  succeeds, the applied sidecar reports success, and the Fleet UI
+  shows the CIDR list exactly as typed. The data is now passed as
+  argv, and an unparseable list is **refused** rather than treated
+  as "open to everyone"; an absent list stays the legitimate "any
+  source" answer, and the port-22 accept floor in the firewall
+  renderer keeps a default install reachable.
+
+  **The allowlist only takes effect once SSH is moved off port
+  22**, and that is not what this change fixed. The appliance's
+  base `/etc/nftables.conf` emits an unconditional
+  `tcp dport 22 accept` in its management floor, above the
+  include glob that pulls this drop-in in, and nftables is
+  first-match-wins — verified against a real kernel. That floor
+  is the deliberate un-removable recovery channel that keeps a
+  bad Web-UI source restriction from bricking the box, so it was
+  left alone: retiring it when a scope is configured (what the
+  Web UI does) would turn a wrong CIDR into a console-only
+  recovery, which is a decision rather than a bug fix. Said
+  plainly here because the allowlist previously did nothing for
+  two independent reasons and only one of them is now gone.
+
+- **Blanking the installer's Time source did not disable NTP
+  (#1002).** Debian's `/etc/chrony/chrony.conf` carries its own
+  `pool` directive and `sourcedir` is additive, so removing the
+  installer's sources file left the appliance synchronising
+  against the public Debian pool. Four surfaces said "none",
+  including `docs/PRIVACY.md`, which is normative for
+  non-negotiable #17 — a false claim about an outbound connection
+  on the page an operator reads to decide what the box talks to.
+  Blank now means none: the installer comments out the `pool`
+  line and the `/run/chrony-dhcp` sourcedir (marked and exactly
+  reversible), and the answer reaches
+  `platform_settings.ntp_pool_servers` as an empty list, so the
+  control plane's first config push does not put the pool back.
+  `sources.d` and `conf.d` are left in place as the way back.
+
 ### Fixed
+
+- **Two more host runners discarded their piped input (#1001).**
+  Same defect as the SSH one above, at two more call sites, with
+  the blast radius decided by whichever `except` clause each
+  happened to have. `spatiumddi-syslog-reload` failed closed and
+  loudly, so TLS syslog forwarding with an operator-supplied CA
+  had never worked; `spatiumddi-image-prune`'s documented
+  fail-safe made pruning silently inert, so the disk-reclaim
+  feature had never reclaimed anything and reported success doing
+  it. Both now receive their data as argv, except the crictl
+  image inventory, which is unbounded and goes via a temp file.
+
+- **Change Password accepted a password the server then refused
+  (#1004).** On the forced first-login screen the rule list and
+  the submit button were computed separately, so an 8-character
+  password under the default 12-character policy showed four
+  green ticks and an enabled button. Under 8 characters it was
+  worse: a hardcoded validator fired a 422 whose `detail` is an
+  error array, a shape the page did not parse, so it fell through
+  to "Check your current password and try again" — the wrong
+  field, on the one screen an operator cannot navigate away from.
+  Both now come from one evaluation; the 422 array is parsed; the
+  hardcoded 8-character floor is gone from all three password
+  endpoints, leaving every length verdict to the configured
+  policy (which also makes a relaxed 6-character policy reachable
+  through the API for the first time); and password history
+  renders as a note rather than as a rule that any single
+  character satisfied.
+
+- **Every control-plane first boot wrote a second helm revision
+  of `spatium-control` (#1005).** helm-controller merges a
+  `HelmChartConfig` on top of the same-named `HelmChart`, and
+  firstboot already renders the sizing the supervisor computes —
+  so the first heartbeat created a CR carrying nothing new. No
+  Deployment changed, but helm recorded a revision and ran a
+  second helm-install Job. The supervisor now skips the write
+  when the Chart already carries every value it would set, and
+  firstboot renders the two keys it was omitting so that
+  comparison can actually match.
 
 - **A DHCP server short of CPU loses packets silently, and nothing
   in the product said so (#980).** Kea answers 100 % of what it

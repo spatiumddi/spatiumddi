@@ -557,12 +557,37 @@ rather than swallowing the failure. Permission-related rejections
 
 ### Password management
 
-- **Password length floor.** New / changed passwords must be ≥ 8
-  characters at the Pydantic-validator baseline (`422`). The full
-  configurable policy (length / character classes / history / age,
-  issue #70) runs server-side against `PlatformSettings` and returns
-  `400` with a per-rule error list. `backend/app/api/v1/auth/router.py`,
+- **One length authority, and it is the configured policy.** The
+  Pydantic-validator baseline rejects only an *empty* password (`422`),
+  so a legacy client still fails before reaching the handler; every
+  length verdict comes from the configurable policy (length / character
+  classes / history / age, issue #70), which runs server-side against
+  `PlatformSettings` and returns `400` with a per-rule error list.
+  `backend/app/api/v1/auth/router.py`,
   `backend/app/services/password_policy.py`.
+
+  That baseline used to be **8 characters**
+  ([#1004](https://github.com/spatiumddi/spatiumddi/issues/1004)) — a
+  second minimum, unconfigurable, contradicting the default policy's 12
+  and making a relaxed 6-character policy unreachable through the API
+  while the UI offered it. It also fired as a Pydantic `422`, whose
+  `detail` is an error **array** rather than the `{reason, errors}`
+  object the policy path returns, and the change-password screen parsed
+  neither shape: a 7-character password was reported to the operator as
+  "check your current password". Any new `field_validator` on these
+  request models emits that same array shape, so the frontend parses it
+  (`frontend/src/lib/password-policy.ts`).
+
+- **The browser evaluates the policy too, and gates on what it
+  evaluated.** `GET /auth/password-policy` is unauthenticated so the
+  login and change-password forms can render the rule list before a
+  token exists; the Change Password screen disables submit while any
+  *evaluated* rule fails, sparing a round trip whose outcome it can
+  already predict. The server stays authoritative — this never permits
+  anything. Password history is excluded from the gate and rendered as
+  a note, because the browser cannot check it; giving it the same green
+  tick as the checkable rules made a failing password read as nearly
+  complete. `frontend/src/lib/password-policy.ts`.
 - **Current password required.** Change-password endpoints verify
   `current_password` before accepting the new value; a mismatch
   returns `400` rather than silently succeeding.

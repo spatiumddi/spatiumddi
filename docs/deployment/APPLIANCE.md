@@ -251,6 +251,24 @@ state on its heartbeat:
   earlier `# spatium:cp-size` marked-line regex rewriter, which lost its
   edits on every seed reboot — the systemic durability bug fixed in
   `083f8d2`.)
+
+  Since [#1005](https://github.com/spatiumddi/spatiumddi/issues/1005) the
+  supervisor does **not** create that CR when the HelmChart already carries
+  every value it would set. Merging a Config that changes nothing still
+  records a helm revision and runs a second helm-install Job, so every fresh
+  control-plane install used to end at `v2` for no reason. The skip is
+  create-only: once a Config exists it holds keys the supervisor does not own
+  (`image.tag`, which a rolling upgrade is mid-flight on), so the upsert's own
+  byte compare is the right test from then on. An unreadable HelmChart falls
+  through to the write — suppressing a needed override is worse than writing a
+  redundant one.
+
+  This only works while firstboot renders every key the supervisor overrides,
+  which is a coupling with nothing structural holding it together:
+  `agent/supervisor/tests/test_helmchartconfig_noop.py` executes firstboot's
+  real `_render_control_helmchart` and fails, naming the keys, if the merge
+  stops being a no-op. Add an override key without rendering it in firstboot
+  and every install silently goes back to two revisions.
 - **MetalLB / VIP (Phase 7c).** The operator's pool + VIP live on the
   `platform_settings` singleton (`metallb_enabled` /
   `metallb_pool_addresses` / `control_plane_vip`); the seed supervisor
