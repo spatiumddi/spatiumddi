@@ -345,6 +345,15 @@ def ssh_bundle(settings: PlatformSettings) -> dict[str, Any]:
     # sees one hash change on upgrade and re-fires the trigger once. The apply
     # is idempotent and the runner compares byte-for-byte, so the cost is one
     # no-op reload.
+    #
+    # CodeQL flags the sha256 below as ``py/weak-sensitive-data-hashing``, and
+    # it is a false positive every time (dismissed as alerts 60 and 97 — the
+    # rule re-raises whenever this line moves). Nothing hashed here is a
+    # secret: ``authorized_keys`` holds SSH PUBLIC keys, and the "password"
+    # the taint tracker matches is the literal ``PasswordAuthentication
+    # yes|no`` boolean ``render_sshd_config`` writes into the drop-in. This is
+    # a change-detection fingerprint, not password storage — a slow KDF here
+    # would make the heartbeat expensive and buy nothing.
     hash_input = "\n".join(
         [
             body,
