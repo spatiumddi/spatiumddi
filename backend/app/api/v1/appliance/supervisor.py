@@ -112,7 +112,7 @@ from app.services.appliance.slot_image_target import (
     stamp_desired_slot_image,
 )
 from app.services.appliance.snmp import snmp_bundle
-from app.services.appliance.ssh import ssh_bundle
+from app.services.appliance.ssh import effective_ssh_scope, ssh_bundle
 from app.services.appliance.syslog import syslog_bundle
 
 logger = structlog.get_logger(__name__)
@@ -1389,6 +1389,14 @@ class SupervisorHeartbeatResponse(BaseModel):
     # supervisor's in-pod render_drop_in scopes 80/443 to these CIDRs (the
     # base /etc/nftables.conf no longer opens 80/443 LAN-wide).
     web_ui_allowed_cidrs: list[str] = Field(default_factory=list)
+    # #1009 — the EFFECTIVE SSH source scope: the operator's allowlist when
+    # ``ssh_lockdown`` is on, and EMPTY otherwise. Non-empty is what makes
+    # the supervisor's in-pod render stamp ``# spatium-ssh: retire`` and
+    # scope the port-22 management line, so the baked floor is only removed
+    # when the operator asked for it. Empty is what every consumer already
+    # reads as "open unconditionally", which is why an older supervisor that
+    # ignores this field keeps the floor — the safe direction.
+    ssh_scope_cidrs: list[str] = Field(default_factory=list)
     # #277 — the committed control-plane size (count of settled
     # primary + member nodes, floored at 1). The seed's supervisor
     # patches the spatium-control HelmChart's ``# spatium:cp-size`` lines
@@ -2371,6 +2379,12 @@ async def supervisor_heartbeat(
         firewall_enabled=bool(cfg_row.firewall_enabled) if cfg_row else False,
         appliance_id=row.id,
         web_ui_allowed_cidrs=(list(cfg_row.web_ui_allowed_cidrs or []) if cfg_row else []),
+        # #1009 — the EFFECTIVE ssh scope, not the typed list: empty unless
+        # the operator turned lockdown on. Non-empty is what retires the
+        # baked port-22 floor, so it must be resolved in exactly one place
+        # (services.appliance.ssh.effective_ssh_scope) or the firewall and
+        # the ssh plane could disagree about whether SSH is restricted.
+        ssh_scope_cidrs=(effective_ssh_scope(cfg_row) if cfg_row else []),
         firewall_logging_enabled=(bool(cfg_row.firewall_logging_enabled) if cfg_row else False),
     )
     # Persist the rendered hash so 2d's apply-stalled alarm + the Fleet drift
@@ -2432,6 +2446,12 @@ async def supervisor_heartbeat(
         firewall_pod_cidrs=firewall_pod_cidrs,
         firewall_service_cidrs=firewall_service_cidrs,
         web_ui_allowed_cidrs=(list(cfg_row.web_ui_allowed_cidrs or []) if cfg_row else []),
+        # #1009 — the EFFECTIVE ssh scope, not the typed list: empty unless
+        # the operator turned lockdown on. Non-empty is what retires the
+        # baked port-22 floor, so it must be resolved in exactly one place
+        # (services.appliance.ssh.effective_ssh_scope) or the firewall and
+        # the ssh plane could disagree about whether SSH is restricted.
+        ssh_scope_cidrs=(effective_ssh_scope(cfg_row) if cfg_row else []),
         control_plane_size=control_plane_size,
         desired_metallb_enabled=metallb_enabled,
         desired_metallb_pool_addresses=metallb_pool,
@@ -2495,6 +2515,10 @@ async def firewall_render_inputs(db: DB, row: Appliance) -> dict[str, Any]:
         "vip_configured": bool((cfg_row.control_plane_vip or "") if cfg_row else ""),
         "firewall_enabled": bool(cfg_row.firewall_enabled) if cfg_row else False,
         "web_ui_allowed_cidrs": (list(cfg_row.web_ui_allowed_cidrs or []) if cfg_row else []),
+        # #1009 — mirrors web_ui_allowed_cidrs: the supervisor's in-pod
+        # fallback renderer needs the same input the server-authoritative
+        # render used, or the two would disagree about the floor.
+        "ssh_scope_cidrs": (effective_ssh_scope(cfg_row) if cfg_row else []),
     }
 
 

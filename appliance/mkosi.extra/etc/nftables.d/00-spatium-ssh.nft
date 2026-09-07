@@ -1,0 +1,40 @@
+# SpatiumDDI SSH management floor (#1009).
+#
+# Opens port 22 unconditionally from the very first boot, before the
+# supervisor exists and before any drop-in has been rendered — the
+# management escape hatch `docs/design/FLEET_FIREWALL.md` §6.1 calls the
+# irreducible recovery channel, and the mitigation its risk register names
+# for every OTHER firewall risk (a bad Web-UI scope, a peer-CIDR typo).
+#
+# Why it moved here from /etc/nftables.conf. It was a bare rule in the base
+# chain, ABOVE the `include "/etc/nftables.d/*.nft"` glob. nftables is
+# first-match-wins, so the source-scoped rule spatiumddi-ssh-reload renders
+# into 50-spatium-ssh.nft could never be reached on port 22: the operator's
+# allowlist rendered perfectly, passed the `nft -c` dry-run, showed in the
+# Fleet UI exactly as typed, and restricted nothing (#1009). A rule baked
+# into the base config cannot be retired; one in this directory can, by the
+# same `apply_sentinel_directive` machinery 00-spatium-webui.nft already
+# uses — which is the whole reason for the move.
+#
+# Retirement. The three firewall renderers stamp `# spatium-ssh: retire` in
+# the drop-in header when — and only when — the operator has turned on
+# `ssh_lockdown` AND configured a non-empty allowlist
+# (services.appliance.ssh.effective_ssh_scope resolves both into one
+# answer). spatium-firewall-reload then moves this file aside to
+# `.retired`; clearing lockdown stamps `keep` and restores it. Default is
+# `keep`, so an install that never opts in is unchanged.
+#
+# Retiring this file alone is NOT sufficient, and the pair must move
+# together: the renderers also emit an SSH accept in spatium-role.nft,
+# which sorts AFTER 50-spatium-ssh.nft in the glob — so a packet the scoped
+# rule declined would fall straight through to it. Under lockdown that line
+# is emitted source-scoped to the same CIDRs.
+#
+# Same lifecycle as 00-spatium-webui.nft and 00-spatium-k3s-bootstrap.nft:
+# lives in /etc so it rides the /etc overlay onto /var and survives A/B
+# slot swaps, and its `.retired` form persists the same way.
+#
+# This fragment is included INSIDE `chain input` by the
+# `include "/etc/nftables.d/*.nft"` glob in /etc/nftables.conf, so it is a
+# bare rule (no table/chain wrapper).
+tcp dport 22 accept comment "ssh-floor"

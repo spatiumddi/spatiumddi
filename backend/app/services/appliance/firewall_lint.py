@@ -8,7 +8,9 @@ findings two ways:
 
 * ``error`` — genuinely dangerous patterns that get a hard 422 in the write
   path: nft-injection / shell metacharacters (``; ` $ \\ | &``), unbalanced
-  braces, and any rule that DROPs port 22 (the un-removable mgmt floor).
+  braces, and any rule that DROPs port 22 (the mgmt floor, which a rule
+  may never remove — #1009's ``ssh_lockdown`` scopes it as a SETTING,
+  which is a different surface with its own guards).
 * ``warning`` — grammar the linter doesn't love but ``nft -c -f`` (the
   ultimate authority on the host) may still accept: an unscoped rule (no
   ``ip/ip6 saddr``), a missing action, ``dport`` on icmp, a family-mismatched
@@ -157,7 +159,9 @@ def _lint_line(i: int, line: str, findings: list[LintFinding]) -> None:
     if "drop" in toks and 22 in ports:
         findings.append(
             LintFinding(
-                i, "error", "must not drop port 22 (ssh) — the management floor is un-removable"
+                i,
+                "error",
+                "must not drop port 22 (ssh) — the management floor is not " "removable by a rule",
             )
         )
 

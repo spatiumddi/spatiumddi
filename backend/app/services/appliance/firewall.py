@@ -129,6 +129,7 @@ def compile_firewall_body(
     cp_member_count: int = 1,
     vip_configured: bool = False,
     web_ui_allowed_cidrs: list[Any] | None = None,
+    ssh_scope_cidrs: list[Any] | None = None,
 ) -> str:
     """Byte-identical port of ``firewall_renderer.render_drop_in`` — returns
     just the drop-in body string (the supervisor wraps it in a
@@ -162,16 +163,42 @@ def compile_firewall_body(
     # say the same thing); clearing a scope restores it.
     webui_action = "retire" if web_ui_allowed_cidrs else "keep"
     lines.append(f"# spatium-webui: {webui_action}")
+    # #1009 — host-runner directive for the baked SSH sentinel
+    # (00-spatium-ssh.nft), which opens port 22 unconditionally from first
+    # boot. Same shape as the Web-UI sentinel above and for the same
+    # reason: it sorts EARLIER in the include glob than the scoped rule
+    # spatiumddi-ssh-reload renders, and nftables accepts on first match,
+    # so the operator's allowlist was dead code behind it.
+    #
+    # Retired only under ``ssh_lockdown`` (services.appliance.ssh.
+    # effective_ssh_scope resolves the flag; an empty scope here means it
+    # is off). That floor is what docs/design/FLEET_FIREWALL.md §6.1 calls
+    # the irreducible recovery channel, so removing it is an explicit
+    # operator decision, never a side effect of typing a CIDR.
+    ssh_action = "retire" if ssh_scope_cidrs else "keep"
+    lines.append(f"# spatium-ssh: {ssh_action}")
     lines.append("")
     lines.append("# ── Management (always open) ────────────────────────────────")
-    lines.append('tcp dport 22 accept comment "ssh"')
+    # SSH — the management floor. Unconditional unless the operator has
+    # turned on lockdown, in which case it is source-scoped to the same
+    # CIDRs the sentinel directive above retires the baked floor for.
+    # BOTH have to move together: this line sits AFTER 50-spatium-ssh.nft
+    # in the include glob, so leaving it unconditional would let every
+    # packet the scoped rule declined fall straight through to it (#1009).
+    if ssh_scope_cidrs:
+        ssh_v4, ssh_v6 = _split_families(list(ssh_scope_cidrs))
+        _emit_family_rule(lines, ssh_v4, ssh_v6, "tcp dport 22 accept", "ssh")
+    else:
+        lines.append('tcp dport 22 accept comment "ssh"')
     lines.append('icmp type echo-request accept comment "icmpv4 ping"')
     lines.append('icmpv6 type echo-request accept comment "icmpv6 ping"')
     lines.append('iif lo accept comment "loopback"')
     # Web UI (HTTP + HTTPS) — #285 Phase 6. Open by default; source-scoped
     # when web_ui_allowed_cidrs is set (the base /etc/nftables.conf no longer
-    # opens 80/443, so this drop-in is authoritative). SSH/22 above stays the
-    # un-removable escape hatch, so a bad Web-UI scope is never a brick.
+    # opens 80/443, so this drop-in is authoritative). SSH/22 above is the
+    # escape hatch that keeps a bad Web-UI scope recoverable — open by
+    # default, and only scoped when the operator turns on ``ssh_lockdown``
+    # (#1009), which is a separate, deliberate act with its own guards.
     if web_ui_allowed_cidrs:
         web_v4, web_v6 = _split_families(list(web_ui_allowed_cidrs))
         _emit_family_rule(lines, web_v4, web_v6, "tcp dport { 80, 443 } accept", "web-ui")
@@ -279,6 +306,7 @@ async def firewall_bundle(
     firewall_enabled: bool,
     appliance_id: Any = None,
     web_ui_allowed_cidrs: list[Any] | None = None,
+    ssh_scope_cidrs: list[Any] | None = None,
     firewall_logging_enabled: bool = False,
 ) -> dict[str, Any]:
     """The ``firewall_settings`` block shipped on the supervisor heartbeat.
@@ -316,6 +344,7 @@ async def firewall_bundle(
         policy_set=policy_set,
         appliance_policy=appliance_policy,
         web_ui_allowed_cidrs=web_ui_allowed_cidrs,
+        ssh_scope_cidrs=ssh_scope_cidrs,
     )
     if firewall_logging_enabled:
         # #404 — a rate-limited catch-all log just before the chain's

@@ -22,6 +22,41 @@ the formatter handles the rest.
 
 ## Unreleased
 
+### Added
+
+- **The SSH source-CIDR allowlist can now actually be enforced
+  (#1009).** It has shipped since #157 and, on the default port,
+  restricted nothing: `/etc/nftables.conf` opened `tcp dport 22`
+  unconditionally *above* the drop-in include glob, and nftables
+  is first-match-wins, so the scoped rule was dead code. #1001
+  fixed the rendering; this makes it reachable. The floor moved
+  to the retireable sentinel
+  `/etc/nftables.d/00-spatium-ssh.nft`, the three firewall
+  renderers stamp `# spatium-ssh: retire|keep`, and the host
+  runner retires it through the same machinery the Web-UI
+  sentinel has used since #769.
+  A new **Enforce source restriction** switch
+  (`ssh_lockdown`) is what retires it, and it is deliberately a
+  second control rather than a consequence of typing a CIDR:
+  retiring the floor removes what
+  `docs/design/FLEET_FIREWALL.md` §6.1 calls the irreducible
+  recovery channel, and that document's risk register names the
+  same floor as the mitigation for every *other* firewall
+  mistake. It is the anti-lockout pattern pfSense and OPNsense
+  ship, and the shape §6.1 already specified (as
+  `firewall_mgmt_lockdown`).
+  **Default off, including on upgrade** — an operator who
+  configured an allowlist while it was inert does not get their
+  SSH tightened by an upgrade they never asked for. Enforcement
+  then applies on port 22 and on a moved port alike, so the
+  behaviour no longer depends on which port SSH is running on.
+  Two guards on the way in: enforcing with an empty list is
+  refused outright (that closes SSH from everywhere, not
+  restricts it), and enforcing from an address the list does not
+  cover asks for an explicit acknowledgement first — the mistake
+  operators actually make, caught at the moment they make it
+  rather than at their next SSH attempt.
+
 ### Security
 
 - **The SSH source-CIDR allowlist was discarded and the port

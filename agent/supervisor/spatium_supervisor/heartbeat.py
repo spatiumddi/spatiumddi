@@ -352,6 +352,7 @@ def _maybe_apply_firewall(
     cp_member_count: int = 1,
     vip_configured: bool = False,
     web_ui_allowed_cidrs: list[Any] | None = None,
+    ssh_scope_cidrs: list[Any] | None = None,
 ) -> None:
     """Render the firewall drop-in + write a trigger file the host
     runner picks up.
@@ -414,6 +415,7 @@ def _maybe_apply_firewall(
         cp_member_count=cp_member_count,
         vip_configured=vip_configured,
         web_ui_allowed_cidrs=web_ui_allowed_cidrs,
+        ssh_scope_cidrs=ssh_scope_cidrs,
     )
     body = profile.body
 
@@ -454,6 +456,7 @@ def _maybe_apply_firewall(
                 cp_member_count=cp_member_count,
                 vip_configured=vip_configured,
                 web_ui_allowed_cidrs=web_ui_allowed_cidrs,
+                ssh_scope_cidrs=ssh_scope_cidrs,
             )
             body = profile.body
 
@@ -1147,6 +1150,11 @@ def heartbeat_once(
     fw_vip_configured = bool(body_out.get("desired_control_plane_vip") or "")
     # #285 Phase 6 — operator Web-UI source restriction (empty = open).
     fw_web_ui_cidrs = body_out.get("web_ui_allowed_cidrs") or []
+    # #1009 — the EFFECTIVE ssh scope (empty unless the operator turned
+    # lockdown on). Non-empty retires the baked port-22 floor and scopes
+    # the management line; absent from an older control plane, which
+    # keeps the floor — the safe direction.
+    fw_ssh_scope_cidrs = body_out.get("ssh_scope_cidrs") or []
     # #285 Phase 2a — bundle-first / renderer-fallback dispatch. When the
     # control plane has firewall authority (firewall_enabled on → a non-empty
     # ``firewall_settings.config_hash``), pipe its server-rendered body to the
@@ -1175,8 +1183,10 @@ def heartbeat_once(
         # carry no roles, no peers and no pods. ``_maybe_apply_firewall`` already
         # self-gates on ``detect_deployment_kind() == "appliance"`` and the host
         # runner short-circuits on an unchanged body hash, so an unconditional
-        # call is cheap + idempotent. SSH/22 stays in the un-removable base floor,
-        # so even a total drop-in failure leaves the node SSH-recoverable.
+        # call is cheap + idempotent. SSH/22 is opened by the baked sentinel
+        # 00-spatium-ssh.nft (#1009 — it used to be in the base conf), which is
+        # a separate file the glob pulls in, so even a total drop-in failure
+        # still leaves the node SSH-recoverable.
         _maybe_apply_firewall(
             role_assignment,
             log,
@@ -1186,6 +1196,7 @@ def heartbeat_once(
             cp_member_count=fw_cp_member_count,
             vip_configured=fw_vip_configured,
             web_ui_allowed_cidrs=fw_web_ui_cidrs,
+            ssh_scope_cidrs=fw_ssh_scope_cidrs,
         )
 
     target = compute_target_env(role_assignment)

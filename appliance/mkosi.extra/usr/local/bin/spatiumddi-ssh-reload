@@ -276,18 +276,20 @@ PYEOF
         # reported success. Rendering goes to a temp file so a refusal below
         # cannot leave a truncated fragment where the real rule used to be.
         #
-        # KNOWN LIMIT, also #1001: on the DEFAULT port this rule is still
-        # dead code. /etc/nftables.conf emits an unconditional
-        # `tcp dport 22 accept` in its management floor, above the include
-        # glob that pulls this file in, and nftables is first-match-wins
-        # (verified against a real kernel). That floor is the deliberate
-        # un-removable recovery channel, so #1001 left it alone — the
-        # allowlist therefore only bites once SSH is moved off 22. The Web UI
-        # handles the same collision by retiring its unconditional accept
-        # when a scope is set (`webui_action` in firewall_renderer.py); doing
-        # that here would turn a wrong CIDR into a console-only recovery, so
-        # it is a decision rather than a fix — tracked as #1009. Pinned by
-        # appliance/tests/test_host_runner_stdin_programs.py.
+        # #1009 closed the other half. Until then this rule was dead code on
+        # port 22 whatever it contained: /etc/nftables.conf opened 22
+        # unconditionally ABOVE the include glob that pulls this file in, and
+        # nftables is first-match-wins. That floor now lives in the baked
+        # sentinel /etc/nftables.d/00-spatium-ssh.nft, which the firewall
+        # renderers retire when the operator turns on ``ssh_lockdown``.
+        #
+        # Which is also why CIDR_JSON is EMPTY unless lockdown is on: the
+        # control plane resolves the flag once (services.appliance.ssh.
+        # effective_ssh_scope) and ships the effective scope, so this runner
+        # renders an unconditional accept whenever the floor is staying — the
+        # two can never disagree about whether SSH is restricted, and an
+        # older control plane that predates the flag sends nothing, which
+        # lands on the same safe answer.
         NFT_TMP=$(mktemp /tmp/spatium-ssh-nft.XXXXXX)
         trap 'rm -f "$BODY_TMP" "$AK_TMP" "$SSHD_TMP" "$TEST_CONF" "$NFT_TMP"; rm -rf "$STAGE_DIR"' EXIT
         if ! python3 - "$PORT" "$CIDR_JSON" > "$NFT_TMP" <<'PYEOF'

@@ -94,13 +94,16 @@ def test_base_conf_still_does_not_open_web_ports() -> None:
 def test_reload_runner_manages_both_sentinels() -> None:
     body = _text(RELOAD)
     assert "00-spatium-webui.nft" in body
-    # Both sentinels go through the one directive helper — a second
-    # hand-rolled copy is how the two drift apart.
+    # EVERY sentinel goes through the one directive helper — a second
+    # hand-rolled copy is how they drift apart. Asserted as "one definition,
+    # every sentinel among the calls" rather than as an exact call count,
+    # which #1009 legitimately changed by adding a third (the SSH floor).
     assert body.count("apply_sentinel_directive()") == 1
     calls = re.findall(r"^apply_sentinel_directive .+$", body, re.M)
-    assert len(calls) == 2, calls
-    assert any("spatium-bootstrap" in c for c in calls)
-    assert any("spatium-webui" in c for c in calls)
+    assert any("spatium-bootstrap" in c for c in calls), calls
+    assert any("spatium-webui" in c for c in calls), calls
+    assert any("spatium-ssh" in c for c in calls), calls
+    assert len(calls) == 3, calls
 
 
 def test_reload_runner_snapshots_webui_state_for_revert() -> None:
@@ -116,8 +119,15 @@ def test_revert_runner_restores_webui_sentinel() -> None:
     body = _text(REVERT)
     assert "LAST_GOOD_WEBUI_SENTINEL" in body
     calls = re.findall(r"^restore_sentinel_state .+$", body, re.M)
-    assert len(calls) == 2, calls
-    assert any("WEBUI" in c for c in calls)
-    # The snapshot must be cleared alongside the k3s one, or a stale file
-    # would drive the next revert.
-    assert 'rm -f "$LAST_GOOD_SENTINEL" "$LAST_GOOD_WEBUI_SENTINEL"' in body
+    assert any("WEBUI" in c for c in calls), calls
+    # Three since #1009 added the SSH floor; the count is pinned so a
+    # sentinel that gains a retire directive without a matching restore —
+    # which would survive a revert, the one thing a revert must undo — fails
+    # here rather than in the field.
+    assert len(calls) == 3, calls
+    # Every snapshot must be cleared together, or a stale file would drive
+    # the next revert.
+    assert (
+        'rm -f "$LAST_GOOD_SENTINEL" "$LAST_GOOD_WEBUI_SENTINEL" '
+        '"$LAST_GOOD_SSH_SENTINEL"' in body
+    )

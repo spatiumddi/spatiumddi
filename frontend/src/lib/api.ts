@@ -3667,6 +3667,13 @@ export interface PlatformSettings {
   ssh_allow_root_login: boolean;
   ssh_port: number;
   ssh_allowed_source_networks: string[];
+  /** #1009 — whether the allowlist above is ENFORCED. Off, the host
+   *  firewall keeps its unconditional port-22 floor and the list is
+   *  inert; on, that floor is retired and the scope applies. */
+  ssh_lockdown: boolean;
+  /** Write-only acknowledgement for the self-lockout pre-flight —
+   *  never returned by the API. */
+  ssh_lockdown_force?: boolean;
   /** Appliance DNS resolver (issue #158). No secrets — resolver IPs /
    *  search domains are not sensitive, so read + write shapes match.
    *  ``automatic`` defers to per-link NetworkManager / DHCP DNS;

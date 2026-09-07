@@ -170,7 +170,9 @@ class RuleIn(BaseModel):
     def _v_shape(self) -> RuleIn:
         # Floor backstop (the DB CHECK is authoritative; this is the friendly 422).
         if self.action == "drop" and 22 in self.ports:
-            raise ValueError("a rule may not DROP port 22 (ssh) — the mgmt floor is un-removable")
+            raise ValueError(
+                "a rule may not DROP port 22 (ssh) — the mgmt floor is not " "removable by a rule"
+            )
         if self.source_kind == "cidr":
             if not self.source_cidrs:
                 raise ValueError("source_kind='cidr' requires source_cidrs")
@@ -888,6 +890,7 @@ def _render_for(inputs: dict[str, Any], ps: PolicySet, ap: _Policy | None) -> st
         policy_set=ps,
         appliance_policy=ap,
         web_ui_allowed_cidrs=inputs.get("web_ui_allowed_cidrs") or [],
+        ssh_scope_cidrs=inputs.get("ssh_scope_cidrs") or [],
     )
 
 
@@ -1270,9 +1273,15 @@ async def apply_posture(
 # ANTI-LOCKOUT: a non-empty set that doesn't cover the operator's CURRENT
 # source IP would brick the very session making the change (the request is
 # arriving through the frontend right now). We reject that 422 unless the
-# operator explicitly passes override_lockout=true. SSH/22 stays in the
-# un-removable base floor regardless, so even an overridden lockout is
-# always recoverable over SSH / the console.
+# operator explicitly passes override_lockout=true.
+#
+# SSH/22 is the recovery path for an overridden lockout — but since #1009 it
+# is recoverable rather than guaranteed: the port-22 floor is a retireable
+# sentinel, and an operator who ALSO turned on ``ssh_lockdown`` with a scope
+# that excludes them has closed both doors and is left with the console. The
+# two are independent settings and each warns on its own; nothing here can
+# see the other, which is why this comment says "console" rather than
+# promising SSH.
 
 
 def _ip_in_cidrs(ip: str | None, cidrs: list[str]) -> bool:

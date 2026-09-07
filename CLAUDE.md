@@ -2187,6 +2187,85 @@ suggestion, free-space treemap.
   future override key that firstboot omits fails loudly instead of silently
   restoring the second revision. Its failure message names the offending keys.
 
+- ✅ [**SSH source-CIDR allowlist was dead code on port 22**](https://github.com/spatiumddi/spatiumddi/issues/1009)
+  — the second of the two independent reasons the allowlist did nothing, and
+  the one #1001 deliberately left. `/etc/nftables.conf` opened
+  `tcp dport 22` unconditionally in its management floor, *above* the
+  `include "/etc/nftables.d/*.nft"` glob, and nftables is first-match-wins —
+  so a perfectly-rendered scoped rule restricted nothing, while Fleet showed
+  the CIDR list exactly as typed. Verified against a real kernel in both
+  directions: with the floor present every packet takes it; with it retired,
+  every port-22 accept that remains is source-scoped.
+  **The design doc had already decided this, differently from the issue.**
+  `docs/design/FLEET_FIREWALL.md` §6.1 specifies `firewall_mgmt_cidrs` +
+  `firewall_mgmt_lockdown` — the floor becomes scoped only behind an explicit
+  second opt-in — and calls the LAN-wide floor the *irreducible recovery
+  channel*, which its risk register then names as the mitigation for every
+  OTHER firewall risk. Neither field existed in code. So the shipped answer is
+  that design under the name `ssh_lockdown`, reusing #157's existing
+  `ssh_allowed_source_networks` rather than adding a second CIDR list. It is
+  also the pfSense / OPNsense anti-lockout pattern, which is what operators
+  already expect.
+  **Reading §6.1 closely turns up a contradiction worth knowing about**, now
+  annotated in the doc: "the base-conf floor stays LAN-wide regardless" cannot
+  hold at the same time as line 192's `OR ip saddr {mgmt} when
+  firewall_mgmt_lockdown` — first-match-wins makes the second dead. The floor
+  is therefore *retireable*, not un-removable: present by default so §6.1's
+  guarantee holds for every install that has not opted in.
+  **The mechanism already existed and is reused rather than reinvented.** The
+  Web UI's unconditional accept has lived in a retireable sentinel since #769,
+  and `spatium-firewall-reload` carries a generic `apply_sentinel_directive`.
+  The SSH accept was baked into the base config instead, which is the only
+  reason it could not be retired — so it moved to
+  `/etc/nftables.d/00-spatium-ssh.nft` and became the third caller.
+  **Retiring the sentinel alone is not enough, and the pair has to move
+  together**: all three renderers ALSO emit an SSH accept in
+  `spatium-role.nft`, which sorts *after* `50-spatium-ssh.nft` in the glob, so
+  a packet the scoped rule declined would fall straight through to it. Under
+  lockdown that line is emitted source-scoped too, and a test asserts both
+  halves so a future edit cannot do one without the other.
+  **Nothing tightens on upgrade**: `effective_ssh_scope` — the one place the
+  flag is resolved — returns `[]` while lockdown is off, which every consumer
+  already reads as "open unconditionally", so an operator who configured the
+  list while it was inert is unaffected, and an older host runner that has
+  never heard of the flag does the safe thing by construction. Behaviour also
+  stops depending on the port number, which was the real defect: post-#1001 it
+  enforced on a moved port and not on 22.
+  **/code-review found six, and the first re-created the bug one layer down.**
+  The ssh bundle's `config_hash` — the only thing that re-fires the host
+  runner — was sha256 over the authorized-keys and sshd-config bodies, and the
+  scope appears in neither (it is an nftables scope, not an sshd directive).
+  Harmless while the scoped rule was dead code; not harmless now: toggling
+  lockdown changed the effective scope and nothing else, so the hash was
+  unchanged, the trigger never fired, and `50-spatium-ssh.nft` kept its
+  UNCONDITIONAL accept — which sorts ahead of the scoped management line —
+  while the firewall plane had already retired the floor. SSH open from
+  anywhere, every surface reporting it restricted. The hash now covers the
+  scope and the port. Also: the UI matched on `err.message`, which on an
+  AxiosError is always `Request failed with status code 422` and never the
+  FastAPI detail — so the acknowledgement modal could never open and
+  `ssh_lockdown_force` was unreachable from the product; removing the last
+  CIDR under lockdown left the toggle checked AND disabled, with Save 422ing
+  and no way out; the self-lockout pre-flight gated on the resulting state
+  rather than the transition, demanding an acknowledgement on every later
+  `ssh_*` save; the force flag latched on a save that failed for any other
+  reason; and the ordering test sorted its own literals, so it exercised
+  `sorted()` and could never catch the rename that would silently un-enforce.
+  Two refusals on the way in — enforcing with an empty list (that closes SSH
+  from everywhere rather than restricting it, the 422 §6.1 already specified),
+  and enforcing from an address the list does not cover, which is advisory
+  rather than fatal because browsing the UI from one network and SSHing from
+  another is legitimate. That second one reads the same spoofing-resistant
+  client IP the login throttle uses, and fails OPEN when the address is
+  unknown: it exists to catch a typo, not to be a security control, and a
+  pre-flight that blocks on "I could not tell" is one operators learn to force
+  past by reflex. Turning lockdown back OFF never needs the acknowledgement —
+  that is the recovery path. Migration `e5b1d47a9c62`; 1 field on the existing
+  `find_ssh_settings` MCP tool (reported as a pair with the list, since
+  "restricted to 10/8" and "would be if enforced" are opposite answers to the
+  only question worth asking); no new feature module (#14 — it extends an
+  existing resource).
+
 - ⬜ [**Storage redundancy — RAID1 + multipath: fleet monitoring, management, and
   install support**](https://github.com/spatiumddi/spatiumddi/issues/999) — split out
   of #995 items 23 + 24, whose *refusal* half shipped there. Three parts, and the

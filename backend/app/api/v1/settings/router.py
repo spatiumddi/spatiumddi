@@ -10,7 +10,16 @@ from ipaddress import ip_network
 from typing import Any, Literal
 
 import structlog
-from fastapi import APIRouter, File, Header, HTTPException, Response, UploadFile, status
+from fastapi import (
+    APIRouter,
+    File,
+    Header,
+    HTTPException,
+    Request,
+    Response,
+    UploadFile,
+    status,
+)
 from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -20,6 +29,7 @@ from app.core.agent_wake import HOSTCONFIG_ALL, publish_wake
 from app.core.demo_mode import forbid_in_demo_mode
 from app.core.http_etag import etag_matches, format_etag
 from app.core.permissions import is_effective_superadmin, user_has_permission
+from app.core.request_meta import get_trusted_client_ip
 from app.models.audit import AuditLog
 from app.models.audit_forward import AuditForwardTarget
 from app.models.influxdb import (
@@ -254,6 +264,7 @@ class SettingsResponse(BaseModel):
     ssh_allow_root_login: bool = False
     ssh_port: int = 22
     ssh_allowed_source_networks: list[str] = []
+    ssh_lockdown: bool = False
     # ── Appliance DNS resolver (issue #158) ───────────────────────
     # No secrets — resolver IPs / search domains are not sensitive, so
     # the read shape mirrors the stored shape directly (like NTP / SSH
@@ -956,6 +967,10 @@ class SettingsUpdate(BaseModel):
     ssh_allow_root_login: bool | None = None
     ssh_port: int | None = None
     ssh_allowed_source_networks: list[str] | None = None
+    ssh_lockdown: bool | None = None
+    # Not a column — the acknowledgement for the self-lockout pre-flight
+    # below. Popped out of ``changes`` before anything is written.
+    ssh_lockdown_force: bool | None = None
     # ── Appliance DNS resolver (issue #158) ───────────────────────
     resolver_mode: str | None = None
     resolver_servers: list[str] | None = None
@@ -1133,8 +1148,9 @@ class SettingsUpdate(BaseModel):
             raise ValueError("ssh_port must be 1–65535")
         # Privileged-port floor — reject < 1024 except 22 so an operator
         # can't park sshd somewhere that needs root-only bind privileges
-        # the runner can't reliably reach. 22 stays the un-removable
-        # default; the host runner does the real bind / in-use check.
+        # the runner can't reliably reach. 22 is always an allowed value;
+        # the host runner does the real bind / in-use check. (Unrelated to
+        # the port-22 firewall floor, which #1009 made retireable.)
         if v < 1024 and v != 22:
             raise ValueError(
                 "ssh_port below 1024 is not allowed (except 22) — pick a "
@@ -1725,9 +1741,43 @@ async def get_settings_defaults(current_user: CurrentUser) -> dict[str, Any]:
     return _column_defaults()
 
 
+def _caller_within_scope(request: Request, cidrs: list[str]) -> bool:
+    """Is the address this request came from inside ``cidrs``? (#1009)
+
+    Uses the same spoofing-resistant value the login throttle and the audit
+    trail use, so a client cannot talk its way past the check with a header.
+
+    Returns True when the address is UNKNOWN. This gate exists to catch an
+    operator typo, not to be a security control — the restriction it guards
+    is enforced by nftables on the host regardless — and refusing every
+    request whose source we cannot read would make the setting unreachable
+    from a deployment shape that hides it. A pre-flight that fails closed on
+    "I could not tell" is one operators learn to force past by reflex, which
+    costs more than it buys.
+    """
+    from ipaddress import ip_address, ip_network  # noqa: PLC0415
+
+    raw = get_trusted_client_ip(request)
+    if not raw:
+        return True
+    try:
+        addr = ip_address(raw)
+    except ValueError:
+        return True
+    for cidr in cidrs:
+        try:
+            if addr in ip_network(str(cidr).strip(), strict=False):
+                return True
+        except ValueError:
+            # Already validated on the way in; a bad entry here cannot make
+            # the caller "covered", so skip it rather than fail the check.
+            continue
+    return False
+
+
 @router.put("", response_model=SettingsResponse)
 async def update_settings(
-    body: SettingsUpdate, current_user: CurrentUser, db: DB
+    body: SettingsUpdate, request: Request, current_user: CurrentUser, db: DB
 ) -> PlatformSettings:
     forbid_in_demo_mode("Platform settings updates are disabled")
     # Superadmin passes via user_has_permission shortcut; users with an
@@ -1740,6 +1790,9 @@ async def update_settings(
 
     settings = await _get_or_create(db)
     changes = body.model_dump(exclude_none=True)
+    # #1009 — an acknowledgement, not a column. Pop before anything reads
+    # ``changes`` as the set of fields to write or to audit.
+    changes.pop("ssh_lockdown_force", None)
 
     # CROSS-FIELD merged-state guard for the DNS resolver (#158). The
     # model_validator already rejects override + explicitly-empty servers in
@@ -1989,6 +2042,71 @@ async def update_settings(
     _ssh_field_in_request = any(f.startswith("ssh_") for f in changes) or (
         ssh_keys_normalised is not None
     )
+    # #1009 — ``ssh_lockdown`` with nothing to allow from.
+    #
+    # The flag retires the port-22 management floor so the allowlist can
+    # finally be reached. With an empty list the rendered scope accepts from
+    # nowhere, which is not a restriction but a closed port — and it would
+    # close it on every appliance at once, recoverable only at the console.
+    # docs/design/FLEET_FIREWALL.md §6.1 specified this 422 for the same
+    # combination under its ``firewall_mgmt_lockdown`` name.
+    _resulting_lockdown = bool(changes.get("ssh_lockdown", settings.ssh_lockdown))
+    _resulting_scope = (
+        changes["ssh_allowed_source_networks"]
+        if "ssh_allowed_source_networks" in changes
+        else list(settings.ssh_allowed_source_networks or [])
+    )
+    if _ssh_field_in_request and _resulting_lockdown and not _resulting_scope:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "Refusing to enforce the SSH source restriction with an empty "
+                "allowed-networks list — that closes SSH from everywhere, on "
+                "every appliance, leaving only the console. Add at least one "
+                "network first, or leave the restriction off."
+            ),
+        )
+    # ...and the mistake an operator actually makes: turning it on with a
+    # list that does not contain the address they are speaking to us from.
+    # Advisory rather than a refusal — browsing the UI from one network and
+    # SSHing from another is legitimate — but it must be acknowledged, since
+    # the alternative is discovering it at the next SSH attempt. Superadmin
+    # forces past it with ``ssh_lockdown_force``.
+    #
+    # Gated on the TRANSITION, not on the resulting state. Keyed on the
+    # latter it fires on every ``ssh_*`` save made while lockdown is already
+    # on — adding a key, changing the port — demanding an acknowledgement for
+    # a change that alters nothing about who can reach the box. An operator
+    # asked to accept a lockout warning for an unrelated edit learns to tick
+    # it without reading, which costs more than the warning buys.
+    #
+    # Two transitions introduce the risk: turning it on, and narrowing the
+    # scope while it is on. Both are re-checked against the caller's address
+    # even when the OLD scope already excluded them, since the fix for that
+    # is a save that includes them and it should stop warning the moment it
+    # does.
+    _lockdown_was_on = bool(settings.ssh_lockdown)
+    _scope_changing = "ssh_allowed_source_networks" in changes and list(_resulting_scope) != list(
+        settings.ssh_allowed_source_networks or []
+    )
+    _lockdown_newly_enforced = _resulting_lockdown and (not _lockdown_was_on or _scope_changing)
+    if (
+        _lockdown_newly_enforced
+        and _resulting_scope
+        and not body.ssh_lockdown_force
+        and not _caller_within_scope(request, _resulting_scope)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "Your own address is not inside the allowed networks, so "
+                "enforcing this restriction may close your SSH access to every "
+                "appliance. The console always recovers it; turning the "
+                "restriction back off here only works if you can still reach "
+                "this UI, which a Web UI source restriction may also be "
+                "limiting. Re-send with ssh_lockdown_force to proceed."
+            ),
+        )
     if _ssh_field_in_request and not validate_lockout_safe(
         _resulting_keys, _resulting_password_auth
     ):
@@ -2046,6 +2164,7 @@ async def update_settings(
                     "allow_root_login": bool(settings.ssh_allow_root_login),
                     "port": int(settings.ssh_port or 22),
                     "allowed_source_networks": list(settings.ssh_allowed_source_networks or []),
+                    "lockdown": bool(settings.ssh_lockdown),
                     "authorized_keys": [
                         {
                             "name": (k.get("name") or "") if isinstance(k, dict) else "",

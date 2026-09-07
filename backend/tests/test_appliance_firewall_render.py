@@ -95,6 +95,7 @@ def _call(fn, case: dict):
         cp_member_count=case.get("cp_member_count", 1),
         vip_configured=case.get("vip_configured", False),
         web_ui_allowed_cidrs=case.get("web_ui_allowed_cidrs"),
+        ssh_scope_cidrs=case.get("ssh_scope_cidrs"),
     )
 
 
@@ -108,6 +109,7 @@ def _call_merge(case: dict) -> str:
         vip_configured=case.get("vip_configured", False),
         policy_set=builtin_policy_set(),
         web_ui_allowed_cidrs=case.get("web_ui_allowed_cidrs"),
+        ssh_scope_cidrs=case.get("ssh_scope_cidrs"),
     )
 
 
@@ -290,6 +292,96 @@ def test_webui_sentinel_directive_all_renderers() -> None:
         for body in bodies:
             assert f"# spatium-webui: {expected}" in body
             assert f"# spatium-webui: {other}" not in body
+
+
+def test_ssh_sentinel_directive_all_renderers() -> None:
+    """The ``# spatium-ssh:`` host-runner directive, in every renderer (#1009).
+
+    The baked ``00-spatium-ssh.nft`` opens port 22 from first boot — the
+    management escape hatch ``docs/design/FLEET_FIREWALL.md`` §6.1 calls the
+    irreducible recovery channel. It sorts EARLIER in the include glob than
+    the scoped rule ``spatiumddi-ssh-reload`` renders, and nftables accepts on
+    first match, so the operator's allowlist was dead code behind it.
+
+    Retire it exactly when lockdown is on — which is what a non-empty
+    ``ssh_scope_cidrs`` means, since ``effective_ssh_scope`` resolves the flag
+    server-side. Keep is the default, so an install that never opts in renders
+    byte-for-byte as before.
+    """
+    sup = _load_supervisor_renderer()
+
+    off = {"role_assignment": {"roles": []}}
+    on = {"role_assignment": {"roles": []}, "ssh_scope_cidrs": ["192.168.0.0/24"]}
+
+    for case, expected in ((off, "keep"), (on, "retire")):
+        other = "retire" if expected == "keep" else "keep"
+        bodies = [_call(compile_firewall_body, case), _call_merge(case)]
+        if sup is not None:
+            bodies.append(_call(sup.render_drop_in, case).body)
+        for body in bodies:
+            assert f"# spatium-ssh: {expected}" in body
+            assert f"# spatium-ssh: {other}" not in body
+
+
+def test_ssh_management_line_is_scoped_under_lockdown_all_renderers() -> None:
+    """Retiring the sentinel alone would not be enough.
+
+    Every renderer also emits an SSH accept in ``spatium-role.nft``, which
+    sorts AFTER ``50-spatium-ssh.nft`` in the glob — so a packet the scoped
+    rule declined would fall straight through to it and the restriction would
+    still do nothing. The two have to move together.
+    """
+    sup = _load_supervisor_renderer()
+    case = {"role_assignment": {"roles": []}, "ssh_scope_cidrs": ["10.0.0.0/8"]}
+
+    bodies = [_call(compile_firewall_body, case), _call_merge(case)]
+    if sup is not None:
+        bodies.append(_call(sup.render_drop_in, case).body)
+    for body in bodies:
+        ssh_rules = [
+            ln for ln in body.splitlines() if "dport 22" in ln and not ln.strip().startswith("#")
+        ]
+        assert ssh_rules, "no SSH accept at all — the floor must not vanish"
+        assert all("saddr" in ln for ln in ssh_rules), ssh_rules
+        assert any("10.0.0.0/8" in ln for ln in ssh_rules), ssh_rules
+
+
+def test_the_ssh_floor_is_unconditional_when_lockdown_is_off() -> None:
+    """The default, and the reason nothing tightens on upgrade."""
+    sup = _load_supervisor_renderer()
+    case = {"role_assignment": {"roles": []}}
+
+    bodies = [_call(compile_firewall_body, case), _call_merge(case)]
+    if sup is not None:
+        bodies.append(_call(sup.render_drop_in, case).body)
+    for body in bodies:
+        assert 'tcp dport 22 accept comment "ssh"' in body
+
+
+def test_a_configured_allowlist_alone_does_not_retire_the_floor() -> None:
+    """``ssh_scope_cidrs`` IS the resolved answer, not the typed list.
+
+    ``effective_ssh_scope`` returns [] while lockdown is off, so an operator
+    who configured an allowlist back when it was inert does not have their
+    SSH tightened by an upgrade they never asked for. Asserted here at the
+    renderer boundary because that is where a future caller could pass the
+    raw column by mistake and change every appliance's posture silently.
+    """
+    from app.models.settings import PlatformSettings
+    from app.services.appliance.ssh import effective_ssh_scope
+
+    row = PlatformSettings(ssh_allowed_source_networks=["10.0.0.0/8"], ssh_lockdown=False)
+    assert effective_ssh_scope(row) == []
+
+    body = _call(
+        compile_firewall_body,
+        {
+            "role_assignment": {"roles": []},
+            "ssh_scope_cidrs": effective_ssh_scope(row),
+        },
+    )
+    assert "# spatium-ssh: keep" in body
+    assert 'tcp dport 22 accept comment "ssh"' in body
 
 
 # ── #993 — kubelet 10250 reachable from inside the cluster ──────────────

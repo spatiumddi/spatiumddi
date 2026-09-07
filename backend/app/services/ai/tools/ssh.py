@@ -65,6 +65,15 @@ async def find_ssh_settings(
         "allow_root_login": bool(settings.ssh_allow_root_login),
         "port": int(settings.ssh_port or 22),
         "allowed_source_networks": list(settings.ssh_allowed_source_networks or []),
+        # #1009 — the list above is what the operator typed; this is whether
+        # it is in force. Reported as a pair rather than collapsed, because
+        # "restricted to 10/8" and "would be restricted to 10/8 if enforced"
+        # are opposite answers to "can this host be reached over SSH?" and
+        # the copilot has no other way to tell them apart.
+        "lockdown": bool(settings.ssh_lockdown),
+        "source_restriction_enforced": bool(
+            settings.ssh_lockdown and list(settings.ssh_allowed_source_networks or [])
+        ),
         "authorized_keys": [
             {
                 "name": (k.get("name") or "") if isinstance(k, dict) else "",

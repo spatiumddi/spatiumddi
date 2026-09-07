@@ -288,6 +288,7 @@ async def find_firewall_effective(
         policy_set=ps,
         appliance_policy=ap,
         web_ui_allowed_cidrs=inputs.get("web_ui_allowed_cidrs") or [],
+        ssh_scope_cidrs=inputs.get("ssh_scope_cidrs") or [],
     )
     state = await db.get(FirewallApplyState, row.id)
     return {

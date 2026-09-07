@@ -23,13 +23,25 @@ Design notes:
   keys would lock the operator out, so :func:`validate_lockout_safe`
   refuses that combination — enforced both on the settings PUT and again
   defensively on the host runner.
-* ``Port`` may be changed, but the firewall renderer hardcodes an
-  un-removable ``tcp dport 22 accept`` floor (``firewall.py`` /
-  ``firewall_merge.py``) so even a bad port change leaves port 22 open as
-  the escape hatch. The host nft drop-in opens the configured port,
+* ``Port`` may be changed, but a management floor opens ``tcp dport 22``
+  regardless — baked at ``/etc/nftables.d/00-spatium-ssh.nft`` and emitted
+  again by the firewall renderers (``firewall.py`` / ``firewall_merge.py``
+  / the supervisor's) — so even a bad port change leaves 22 open as the
+  escape hatch. The host nft drop-in opens the configured port,
   SOURCE-SCOPED to ``ssh_allowed_source_networks`` (sshd has no native
   source-CIDR filter — this DIVERGES from the SNMP / NTP drop-ins which
-  open unscoped). Empty allowed-list = open the port unconditionally.
+  open unscoped).
+* ``ssh_lockdown`` (#1009) is what turns that scope into enforcement, and
+  :func:`effective_ssh_scope` is the ONE place that resolves it. nftables
+  is first-match-wins and the floor sorts first, so until the floor is
+  retired the scoped rule is dead code on port 22 — the allowlist rendered
+  perfectly and restricted nothing, while the UI, the applied sidecar and
+  the nft dry-run all reported success. Retiring the floor removes what
+  ``docs/design/FLEET_FIREWALL.md`` §6.1 calls the irreducible recovery
+  channel, so it is an explicit switch rather than a consequence of typing
+  a CIDR. With it off the effective scope is EMPTY, which every consumer
+  already reads as "open unconditionally" — so an older host runner that
+  has never heard of lockdown does the safe thing by construction.
 * ``ssh_bundle`` returns a STABLE dict shape even when "disabled"
   (here "disabled" = the default state: password auth on, no managed
   keys) so every hash-compare caller (DHCP-agent ETag mix, supervisor
@@ -239,6 +251,26 @@ def _valid_key_count(settings: PlatformSettings) -> int:
     )
 
 
+def effective_ssh_scope(settings: PlatformSettings) -> list[str]:
+    """The source CIDRs the host firewall should actually enforce.
+
+    ``ssh_allowed_source_networks`` is what the operator typed;
+    ``ssh_lockdown`` is whether it is in force. Everything downstream — the
+    ssh bundle the host runner renders ``50-spatium-ssh.nft`` from, and the
+    three firewall renderers that decide whether to retire the port-22
+    floor — reads THIS, so the two halves can never disagree about whether
+    SSH is restricted (#1009).
+
+    Empty means "open unconditionally", which is exactly what every existing
+    consumer already does with an empty list — so lockdown-off is
+    indistinguishable from never having configured a scope, including to an
+    older host runner that predates the flag.
+    """
+    if not settings.ssh_lockdown:
+        return []
+    return list(settings.ssh_allowed_source_networks or [])
+
+
 def ssh_bundle(settings: PlatformSettings) -> dict[str, Any]:
     """Build the ``ssh_settings`` block shipped to agents + supervisor.
 
@@ -249,15 +281,19 @@ def ssh_bundle(settings: PlatformSettings) -> dict[str, Any]:
       * ``enabled`` — True unless this is the pristine default state
         (password auth on + no managed keys). The host runner uses this
         to decide between applying the drop-in and tearing it back down.
-      * ``config_hash`` — sha256 over ``authorized_keys + sshd_conf`` so
+      * ``config_hash`` — sha256 over every input the host runner renders
+        from: the two file bodies PLUS the ssh port and the effective source
+        scope (see below — the scope reaches neither body, and omitting it
+        meant a lockdown toggle never re-fired the runner). Hashed so
         any change to either body shifts the agent/supervisor ETag.
       * ``authorized_keys`` — the rendered authorized_keys body (always
         rendered so a disable still ships an empty-keys body the runner
         can write).
       * ``sshd_conf`` — the rendered sshd drop-in body.
       * ``ssh_port`` — int, for the host nft drop-in.
-      * ``allowed_source_networks`` — list[str] CIDRs the host nft
-        drop-in source-scopes the port to (empty = open unconditionally).
+      * ``allowed_source_networks`` — the EFFECTIVE scope from
+        :func:`effective_ssh_scope`, i.e. empty unless ``ssh_lockdown``
+        is on (empty = open unconditionally).
       * ``password_auth`` — bool, surfaced so the runner can apply the
         lockout guard defensively.
       * ``key_count`` — count of well-formed keys the runner is expected
@@ -277,18 +313,62 @@ def ssh_bundle(settings: PlatformSettings) -> dict[str, Any]:
         and key_count == 0
         and int(settings.ssh_port or 22) == 22
         and not bool(settings.ssh_allow_root_login)
+        # The typed list, not the effective scope: a configured-but-not-
+        # enforced allowlist is still operator config, and collapsing it
+        # into "default" here would tear the drop-in down and lose the
+        # port/keys state the runner is managing.
         and not list(settings.ssh_allowed_source_networks or [])
     )
     enabled = not is_default
     body = authorized_keys + sshd_conf
-    config_hash = hashlib.sha256(body.encode("utf-8")).hexdigest() if enabled else ""
+    # The hash is the ONLY thing that re-fires the host runner
+    # (``_fire_host_config`` short-circuits on an unchanged one), so it has to
+    # cover every input the runner renders from — not just the two file bodies
+    # it happens to be built out of.
+    #
+    # ``allowed_source_networks`` appears in NEITHER body: it is an nftables
+    # scope, not an sshd directive. Before #1009 that was harmless, because
+    # the drop-in it feeds was dead code on port 22 anyway. It is not harmless
+    # now: toggling ``ssh_lockdown`` changes the effective scope and nothing
+    # else, so the hash would be unchanged, the trigger would not fire, and
+    # ``50-spatium-ssh.nft`` would keep its UNCONDITIONAL accept — which sorts
+    # ahead of the scoped management line — while the firewall plane had
+    # already retired the port-22 floor. SSH open from anywhere, every surface
+    # reporting it restricted: the exact #1009 bug, re-created one layer down.
+    #
+    # The port is folded in defensively. It does reach ``sshd_conf`` today, so
+    # this is belt-and-braces rather than a fix — but it is the other value
+    # the nft drop-in renders from, and the coupling that makes it safe to
+    # omit is not one this function states anywhere.
+    #
+    # Consequence, and it is intended: the formula changed, so every install
+    # sees one hash change on upgrade and re-fires the trigger once. The apply
+    # is idempotent and the runner compares byte-for-byte, so the cost is one
+    # no-op reload.
+    #
+    # CodeQL flags the sha256 below as ``py/weak-sensitive-data-hashing``, and
+    # it is a false positive every time (dismissed as alerts 60 and 97 — the
+    # rule re-raises whenever this line moves). Nothing hashed here is a
+    # secret: ``authorized_keys`` holds SSH PUBLIC keys, and the "password"
+    # the taint tracker matches is the literal ``PasswordAuthentication
+    # yes|no`` boolean ``render_sshd_config`` writes into the drop-in. This is
+    # a change-detection fingerprint, not password storage — a slow KDF here
+    # would make the heartbeat expensive and buy nothing.
+    hash_input = "\n".join(
+        [
+            body,
+            f"port={int(settings.ssh_port or 22)}",
+            "scope=" + ",".join(effective_ssh_scope(settings)),
+        ]
+    )
+    config_hash = hashlib.sha256(hash_input.encode("utf-8")).hexdigest() if enabled else ""
     return {
         "enabled": enabled,
         "config_hash": config_hash,
         "authorized_keys": authorized_keys,
         "sshd_conf": sshd_conf,
         "ssh_port": int(settings.ssh_port or 22),
-        "allowed_source_networks": list(settings.ssh_allowed_source_networks or []),
+        "allowed_source_networks": effective_ssh_scope(settings),
         "password_auth": password_auth,
         "key_count": key_count,
     }
