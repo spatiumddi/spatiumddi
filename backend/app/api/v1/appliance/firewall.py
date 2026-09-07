@@ -1368,8 +1368,9 @@ async def set_web_ui_access(
                 f"Refusing to restrict the Web UI: your current source IP ({ip or 'unknown'}) "
                 "is not covered by the allow-list, so this would lock you out of the very "
                 "session making the change. Add your IP / network to the list, or pass "
-                "override_lockout=true (SSH on port 22 stays open regardless, so the appliance "
-                "is always recoverable from the console)."
+                "override_lockout=true. The console always recovers the appliance; "
+                "SSH does too unless you have also turned on the SSH source "
+                "restriction (Settings \u2192 SSH) with a scope that excludes you."
             ),
         )
     cfg = await db.get(PlatformSettings, 1)

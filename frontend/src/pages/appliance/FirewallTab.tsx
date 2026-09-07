@@ -628,8 +628,9 @@ function WebUIAccessCard() {
               {excluded && (
                 <span className="font-medium text-rose-600 dark:text-rose-400">
                   {" "}
-                  — not in the allow-list (you reached this page another way;
-                  SSH on :22 stays open regardless).
+                  — not in the allow-list (you reached this page another way).
+                  The console always recovers this; SSH does too unless the SSH
+                  source restriction is also on and excludes you.
                 </span>
               )}
             </div>
@@ -715,8 +716,10 @@ function WebUIAccessModal({
           One CIDR (or bare IP) per line — IPv4 and IPv6 both accepted. Leave
           empty to open the Web UI to everyone. This governs both the per-node
           HTTP/HTTPS door (nftables) and the control-plane VIP
-          (loadBalancerSourceRanges). SSH on port 22 is never restricted, so a
-          mistake here is always recoverable from the console.
+          (loadBalancerSourceRanges). A mistake here is always recoverable from
+          the console — and over SSH too, unless the SSH source restriction
+          (Settings → SSH) is also on with a scope that excludes you. The two
+          are independent and neither can see the other.
         </p>
         <label className="block">
           <span className="text-xs text-muted-foreground">

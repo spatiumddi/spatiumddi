@@ -347,7 +347,7 @@ export function SSHSection({
 
       <Field
         label="SSH port"
-        description="The port sshd listens on. Ports below 1024 are not allowed (except 22). Port 22 always stays open in the host firewall as an escape hatch, so a bad port change can't lock you out."
+        description="The port sshd listens on. Ports below 1024 are not allowed (except 22). Port 22 stays open in the host firewall as an escape hatch, so a bad port change can't lock you out — unless you turn on the source restriction below, which retires that floor."
       >
         <input
           type="number"
