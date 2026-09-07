@@ -25,9 +25,10 @@ on:
       - "agent/dhcp/**"
   workflow_dispatch:
 
+# Read-only (#1022): this workflow builds and scans, it never publishes.
+# Publishing is release.yml (tags, multi-arch) and nightly.yml (main).
 permissions:
   contents: read
-  packages: write
 
 jobs:
   build:
@@ -39,28 +40,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: docker/setup-qemu-action@v4
       - uses: docker/setup-buildx-action@v4
 
-      - uses: docker/login-action@v4
-        if: github.event_name != 'pull_request'
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Image metadata
-        id: meta
-        uses: docker/metadata-action@v6
-        with:
-          images: ghcr.io/spatiumddi/dhcp-${{ matrix.flavor }}
-          tags: |
-            type=ref,event=branch
-            type=ref,event=tag
-            type=sha,format=short
-
-      - name: Build (PR — single-arch, load locally for Trivy)
-        if: github.event_name == 'pull_request'
+      # #1022 — this used to be one of two build steps, the other a multi-arch
+      # push gated on ``event_name != 'pull_request'``. The triggers are PR +
+      # workflow_dispatch only (see docs/DEVELOPMENT.md, trigger policy), so that
+      # step was reachable solely by hand and pushed ``:<branch>`` / ``:sha-*``
+      # tags nothing consumes. release.yml and nightly.yml own publishing.
+      - name: Build (single-arch, load locally for Trivy)
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -72,25 +59,10 @@ jobs:
           push: false
           load: true
           tags: ghcr.io/spatiumddi/dhcp-${{ matrix.flavor }}:pr-scan
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=dhcp-${{ matrix.flavor }}
-          cache-to: type=gha,mode=max,scope=dhcp-${{ matrix.flavor }}
-
-      - name: Build and push (main / tag — multi-arch, push to ghcr)
-        if: github.event_name != 'pull_request'
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          file: agent/dhcp/images/${{ matrix.flavor }}/Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=dhcp-${{ matrix.flavor }}
           cache-to: type=gha,mode=max,scope=dhcp-${{ matrix.flavor }}
 
       - name: Trivy scan
-        if: github.event_name == 'pull_request'
         uses: aquasecurity/trivy-action@master
         with:
           # Reference the locally-loaded image from the PR build

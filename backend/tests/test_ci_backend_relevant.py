@@ -1,6 +1,6 @@
 """The CI change-detection filter that decides whether THIS suite runs (#813, #821).
 
-``.github/scripts/ci-backend-relevant.sh`` gates the 8 backend test shards. A
+``.github/scripts/ci-backend-relevant.sh`` gates the 12 backend test shards. A
 bug in it is uniquely bad: it doesn't fail loudly, it makes a PR go green
 without having been tested. So the path list gets pinned here rather than
 being validated by pushing branches and squinting at Actions.
@@ -48,6 +48,8 @@ _KNOWN_REPO_ROOT_READS: dict[str, str] = {
     ),
     "test_ci_backend_relevant.py": ".github/scripts/ci-backend-relevant.sh",
     "test_openapi_export.py": "scripts/export_openapi.py",
+    "test_merge_test_durations.py": "scripts/merge_test_durations.py",
+    "test_test_impact_selection.py": ".github/scripts/select_impacted_tests.py",
     "test_outbound_hosts_documented.py": "docs/PRIVACY.md",
     "test_zone_name_scope.py": "scripts/refresh_iana_tlds.py",
     "test_dhcp_packet_loss.py": "agent/dhcp/spatium_dhcp_agent/metrics.py",

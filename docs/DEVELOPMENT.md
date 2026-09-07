@@ -219,6 +219,8 @@ mocks) so ORM and query issues surface early
 ```bash
 make test                                  # full suite — pytest -n auto inside the api container
 make test-one T=tests/test_health.py::test_liveness   # a single test, run serially
+make test-cov                              # the suite with coverage — the ONLY place coverage runs (#1019)
+make test-durations                        # refresh backend/.test_durations from the latest main CI run (#1019)
 ```
 
 The **frontend** has a test suite too, added with the enrolment QR
@@ -253,6 +255,73 @@ container, which has `pytest` baked into its `build.target: dev` image and
 
 Because a single test doesn't benefit from xdist overhead, `make test-one`
 runs serially (`-v`, no `-n`).
+
+### Coverage is opt-in
+
+`make test-cov` is the only place coverage runs (`--cov=app
+--cov-report=term-missing`). It used to ride `addopts` in
+`backend/pyproject.toml`, which meant every CI shard and every
+`make test-one` paid 15–30 % tracing overhead for a table nothing read —
+#435 had removed `--cov` from the CI command line and the `addopts` line
+quietly re-added it (#1019). Do not put it back in `addopts`.
+
+### Shard balancing (`backend/.test_durations`)
+
+pytest-split balances the twelve CI shards by **duration** only when a
+`.test_durations` file exists; without one it splits by test **count**, and
+the alphabetical slice holding the heavy DB-bound files becomes the straggler
+(one shard of eight took 25–28 min while the other seven took ~11, for the
+same 595 tests — PR #1018). The file is committed and kept honest by CI:
+
+1. Every shard runs with `--store-durations --clean-durations`, so its
+   `.test_durations` ends up holding ONLY the tests it ran, and uploads it.
+2. On a full run the aggregator merges the pieces
+   (`scripts/merge_test_durations.py`) into a `test-durations` artifact and
+   prints the measured per-shard totals — with a `::warning::` when the
+   slowest shard is more than 1.35× the mean.
+3. `make test-durations` downloads the newest `main` artifact into
+   `backend/.test_durations` for you to commit. Do it at release prep, or
+   when the warning fires.
+
+A stale file only costs balance — pytest-split assumes the average for a
+test it has never seen — never correctness, so this is a chore, not a gate.
+Narrowed PR runs (below) neither upload nor merge durations: a subset must
+never become the file the shards are balanced with.
+
+### Test-impact selection (#1020)
+
+A PR does not necessarily run all ~4,200 backend tests. The push-to-`main`
+shards run with `--cov-context=test`, and the aggregator folds their
+coverage data into a **test-impact map** — `{app file → test files that
+executed a line of it inside a test}` — published as the `test-impact-map`
+artifact (`.github/scripts/build_test_impact_map.py`). The next PR's
+`changes` job downloads the newest one and runs
+`.github/scripts/select_impacted_tests.py` over the diff. Its output is
+`all` or a list of test files, and the shards run exactly that.
+
+Every rule fails **open**, toward `all` — a wrong "run these" is caught by
+the push-to-`main` run, which always runs everything; a wrong "skip that"
+would not be:
+
+| Changed path | Selection |
+|---|---|
+| no map, unreadable map, other schema | `all` |
+| anything the deny-list does not call irrelevant that is not one of the two rows below — migrations, `pyproject.toml`, `Dockerfile`, `app/data/*`, templates, `conftest.py`, test helpers, the must-run carve-outs, this machinery | `all` |
+| `backend/tests/test_*.py` added or modified | that file |
+| `backend/app/**/*.py` in the map, tests attributed | those files |
+| `backend/app/**/*.py` in the map, **no** tests attributed (only ever executed at import — a model, a registry) | `all` |
+| `backend/app/**/*.py` absent from the map (new, or never imported by a test) | nothing — whatever exercises it is a changed test file or reached through a changed module, both already selected |
+| selection empty, or over 60 % of the suite's test files | `all` |
+
+Why not a name mapping or an import graph: only 65 of 358 test-file stems
+match an `app/` module name, and 228 of 358 test files use the `client`
+fixture, which imports the whole app through `app.main` — a static graph
+reaches every test from any change. Observed coverage is the only
+dependency data that is actually true.
+
+Pinned by `backend/tests/test_test_impact_selection.py` and
+`test_merge_test_durations.py`, both of which skip inside the dev api
+container (no repo root above `backend/` there) and run in CI.
 
 ### What a new endpoint needs
 
@@ -293,13 +362,18 @@ triggered on push to `main` and on every pull request:
 | Job | What it does |
 |---|---|
 | **Backend — Lint & Type Check** (`backend-lint`) | `pip install -e ".[dev]"` on Python 3.12, then `ruff check`, `black --check`, `mypy app`, **plus the migration-shape linter** (`python3 scripts/lint_migrations.py` — see §8). |
-| **Backend — Tests** (`backend-test`) | A required-check aggregator over **eight** parallel `backend-test-shard` jobs. Each shard spins up `postgres:16-alpine` + `redis:8.8-alpine` services, runs `alembic upgrade head`, then `pytest -n auto --splits 8 --group N` (pytest-split selects the shard's slice; `-n auto` parallelizes it across the runner's vCPUs, each xdist worker on its own `spatiumddi_test_gw<N>` DB). The aggregator passes only if all eight shards pass. |
+| **Backend — Tests** (`backend-test`) | A required-check aggregator over **twelve** parallel `backend-test-shard` jobs. Each shard spins up `postgres:16-alpine` + `redis:8.8-alpine` services, runs `alembic upgrade head`, then `pytest -n auto --splits 12 --group N --store-durations --clean-durations` (pytest-split selects the shard's slice, **balanced by duration** from the committed `backend/.test_durations` — see §Shard balancing; `-n auto` parallelizes it across the runner's vCPUs, each xdist worker on its own `spatiumddi_test_gw<N>` DB). On a PR the `changes` job may first narrow the run to the test files the diff can affect (#1020 — see §Test-impact selection). The aggregator passes only if all twelve shards pass; on a full run it also merges the shards' measured durations into a `test-durations` artifact, and on a push to `main` it builds the `test-impact-map` artifact from the shards' coverage contexts. Coverage is otherwise **not** collected here (#1019). |
 | **Frontend — Lint & Type Check** (`frontend-lint`) | Node 22, `npm install`, then `npm run lint`, `npm run format:check`, `npm run typecheck`, `npm test`. |
 | **Frontend — Build** (`frontend-build`) | Node 22, `npm install`, `npm run build`. |
 | **Charts — Lint & Template** (`charts-lint`) | Helm 3.20 + a checksum-pinned kubeconform. `helm lint --strict` both charts at defaults and with every role / feature toggle on, `helm template` six value sets (umbrella: defaults, all-on, external DB + Redis, the CNPG + Sentinel HA shape; appliance: defaults, all-on, the single-node full-stack shape), `kubeconform -strict` against the Kubernetes 1.36 + CRD-catalog schemas (kept at the version the appliance's k3s serves — it was five minors behind until #974), and `.github/scripts/chart-no-besteffort.py` on every render (#965 — no serving container may lack CPU + memory requests or limits; init containers are exempt, they finish before the pod serves) plus `chart-toggle-coverage.py`, which fails if a template is gated on a values key none of the value sets flips. Rendered manifests are uploaded as the `rendered-charts` artifact. Until #966 nothing on a PR parsed the appliance chart at all; it was first read by helm during the release. `make charts-lint` runs the same script in a helm container. |
 | **Perf — Tests** (`perf-test`) | Python 3.12 + pytest, `python -m pytest perf`. Hermetic (fake sockets, no network, no appliance). Tests only — `perf/` is outside the Backend Lint scope and carries pre-existing ruff/black drift (#968). `make perf-test` reproduces it. |
 
-Branch protection on `main` gates on these checks. `make ci` reproduces
+Branch protection on `main` (the `protect-main` ruleset) requires every
+stable check name above — the two aggregators (`Backend — Tests`,
+`Agent — Tests`) and the single-job checks — so a red job blocks the merge
+without anyone reading the run (#1022; before that only Backend Lint and the
+two Frontend jobs were required, and a 28-minute `Backend — Tests` that
+nobody was forced to wait for). `make ci` reproduces
 the two lint jobs, the frontend build, the chart gate and the perf tests
 locally (the last two via Docker, so neither helm nor kubeconform needs to
 be on the host); `make test` reproduces the backend test job
@@ -312,7 +386,7 @@ Three of the four events have distinct jobs:
 
 | Event | Runs | Why |
 |---|---|---|
-| **Pull request** | `ci.yml` (backend shards gated on change detection — see below), the per-image builds (single-arch + **Trivy**), `agent-e2e.yml` | Where correctness is gated. Nothing merges without it. |
+| **Pull request** | `ci.yml` (backend shards gated on change detection — see below), the per-image builds (single-arch + **Trivy**, path-filtered to their own `agent/<name>/**`), `agent-e2e.yml` (path-filtered to `agent/**` + `charts/spatiumddi/**` — it installs the control plane from the `:latest` release images, so a `backend/` or `frontend/` change cannot reach the cluster it tests; #1021), plus two GitHub-managed CodeQL runs that are not workflow files: **CodeQL** (default setup: actions, JS/TS, Python) and **CodeQL - Code Quality** (JS/TS, Python — the source of the bot review threads that must be resolved before merge). | Where correctness is gated. Nothing merges without it. |
 | **Push to `main`** | `ci.yml`, `docs-publish.yml`, `build-appliance-builder.yml` | Post-merge safety net + the two things that must be *published* from `main`. |
 | **Release tag** | `release.yml` only | Builds and publishes every image multi-arch, the chart, and the appliance ISO. |
 | **Schedule** | `nightly.yml`, `trivy-scheduled.yml`, `prune-release-assets.yml` | Work that is about *elapsed time*, not about a change. |
@@ -349,7 +423,7 @@ and every check name — unconditional:
 
 1. A `changes` job diffs the PR against its merge base and pipes the file
    list through [`.github/scripts/ci-backend-relevant.sh`](../.github/scripts/ci-backend-relevant.sh).
-2. The 8 `backend-test-shard` jobs are gated on its output.
+2. The 12 `backend-test-shard` jobs are gated on its output.
 3. The `Backend — Tests` aggregator treats a skip as a pass — but **only a
    skip that detection asked for**. An empty output (the `changes` job
    itself failed, taking the shards with it) fails the aggregator.
