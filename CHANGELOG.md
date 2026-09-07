@@ -81,11 +81,15 @@ the formatter handles the rest.
   balanced by duration from a committed `backend/.test_durations`,
   there are twelve shards, and every full run re-measures: each
   shard uploads what it timed, the aggregator merges the pieces into
-  a `test-durations` artifact and warns when the slowest shard
-  drifts past 1.35× the mean, and `make test-durations` pulls the
-  newest artifact down for a human to commit at release prep. A
-  stale file only costs balance (an unknown test is assumed
-  average), never correctness.
+  a `test-durations` artifact — normalizing each shard by its
+  runner's speed first, since hosted runners vary ~2× run to run
+  and a raw measurement bakes one slow runner into every test it
+  held — and warns when the file stops describing relative costs;
+  `make test-durations` pulls the newest artifact down for a human
+  to commit at release prep. A stale file only costs balance (an
+  unknown test is assumed average), never correctness. Measured on
+  the PR itself: 28 min → 15–16 min wall clock, the remainder being
+  one runner in twelve landing ~2× slower, which no split removes.
   **Found on the way: coverage was still being traced on every
   shard.** #435 removed `--cov` from the workflow command, but
   `addopts` in `backend/pyproject.toml` re-added it silently, so

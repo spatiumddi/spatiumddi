@@ -225,11 +225,15 @@ jobs:
   # ~11 for the same 595 tests (PR #1018) — the whole PR waited on it. Each
   # shard records what it measured (``--store-durations --clean-durations``
   # → only the tests it ran) and uploads it; the aggregator merges the
-  # pieces into a ``test-durations`` artifact and warns when the slowest
-  # shard drifts past 1.35x the mean; ``make test-durations`` downloads that
-  # artifact for a human to commit. A stale file degrades gracefully — an
-  # unknown test is assumed average — so the refresh is a release-prep
-  # chore, never a gate.
+  # pieces into a ``test-durations`` artifact — normalizing each shard by
+  # its runner's speed first, because hosted runners vary ~2x run to run
+  # and a raw measurement would bake one slow runner into every test it
+  # held — and warns when the committed file has stopped describing the
+  # suite's relative costs; ``make test-durations`` downloads that artifact
+  # for a human to commit. A stale file degrades gracefully — an unknown
+  # test is assumed average — so the refresh is a release-prep chore,
+  # never a gate. Expect the slowest shard to be ~2x the median on a bad
+  # runner day; that bounds the wall clock and no balancing removes it.
   #
   # Coverage is NOT collected here. #435 dropped it from this command, but
   # ``addopts`` in backend/pyproject.toml silently re-added it on every run

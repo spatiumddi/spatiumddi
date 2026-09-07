@@ -276,15 +276,33 @@ same 595 tests — PR #1018). The file is committed and kept honest by CI:
 1. Every shard runs with `--store-durations --clean-durations`, so its
    `.test_durations` ends up holding ONLY the tests it ran, and uploads it.
 2. On a full run the aggregator merges the pieces
-   (`scripts/merge_test_durations.py`) into a `test-durations` artifact and
-   prints the measured per-shard totals — with a `::warning::` when the
-   slowest shard is more than 1.35× the mean.
-3. `make test-durations` downloads the newest `main` artifact into
+   (`scripts/merge_test_durations.py`) into a `test-durations` artifact.
+   **Each shard is first normalized by its runner's speed** — the ratio of
+   what it measured to what the committed file predicted for its slice —
+   because hosted runners vary about 2× run to run (the same trivial tests
+   measured 1.5 s each on one run and 10 s on the next, on a different
+   shard each time). A raw measurement would bake one slow runner into the
+   weight of every test it happened to hold, which is exactly what the
+   first bootstrap of this file did. The normalized value is then blended
+   50/50 with the committed one, so a single noisy run cannot swing a
+   weight and a genuine change lands within a couple of refreshes.
+3. The report prints the raw per-shard wall time with each runner's speed
+   factor (that is where the clock went), and emits a `::warning::` only
+   when the committed file has stopped describing *relative* costs — more
+   than 15 % of the suite's normalized cost moved, or more than 10 % of it
+   belongs to tests the file has never seen. Runner variance never trips
+   it, because no refresh can fix runner variance.
+4. `make test-durations` downloads the newest `main` artifact into
    `backend/.test_durations` for you to commit. Do it at release prep, or
    when the warning fires.
 
 A stale file only costs balance — pytest-split assumes the average for a
 test it has never seen — never correctness, so this is a chore, not a gate.
+What balancing cannot do is remove the slow-runner tail: with twelve
+shards, expect one to land on a runner ~2× slower than the rest, so the
+wall clock is bounded by roughly twice the median shard (~7 min → ~14 min
+on a bad day, versus 28 min before, when the slowest shard was slow by
+construction on every run).
 Narrowed PR runs (below) neither upload nor merge durations: a subset must
 never become the file the shards are balanced with.
 
