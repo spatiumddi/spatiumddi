@@ -1363,11 +1363,17 @@ async def get_server_rendered_config(
 ) -> DHCPRenderedConfigResponse:
     """Render this server's current ConfigBundle through its driver.
 
-    For Kea this returns the ``Dhcp4`` / ``Dhcp6`` JSON the agent
-    would apply on its next reload — useful for operators to preview
-    what's in flight without SSHing into the agent. Read-only drivers
-    (``windows_dhcp``) return an empty ``config`` payload since there's
-    no rendered config to show; the UI tab handles that case.
+    A **preview** of what is in flight — the subnets, pools, classes,
+    options and group tunables the agent will apply — not a copy of the
+    file it writes. The driver-side render deliberately omits the daemon
+    plumbing the agent adds (control socket, hooks, timers, expired-lease
+    processing, the full logger block) and does not parse as a Kea config
+    on its own. Useful for checking a setting took without SSHing into the
+    agent; not for diffing against ``kea-dhcp4.conf``.
+
+    Read-only drivers (``windows_dhcp``) return an empty ``config``
+    payload since there's no rendered config to show; the UI tab handles
+    that case.
     """
     server = await db.get(DHCPServer, server_id)
     if server is None:

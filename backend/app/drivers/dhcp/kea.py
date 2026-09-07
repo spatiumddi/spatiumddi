@@ -479,6 +479,26 @@ def _render_pxe_class(p: PXEClassDef) -> dict[str, Any]:
     return d
 
 
+def _packet_logging_override(bundle: ConfigBundle, daemon: str) -> dict[str, Any]:
+    """The ``kea-dhcpN.packets`` severity override, for the preview (#980).
+
+    Returns ``{}`` when packet logging is on, so the rendered preview is
+    unchanged for the default.
+
+    Only the override, not a full ``loggers`` block: this render is a
+    *preview*, not the file the agent writes. It already omits the control
+    socket, hooks, timers and expired-lease processing — and does not parse
+    as a Kea config at all — so duplicating the agent's appender paths here
+    would add a third copy of them to drift, for no gain. What belongs in
+    the preview is the group tunables an operator just set, which is the
+    same rule ``dhcp_socket_type`` (#365) and ``cache-threshold`` (#637)
+    already follow.
+    """
+    if bundle.kea_packet_logging:
+        return {}
+    return {"loggers": [{"name": f"{daemon}.packets", "severity": "WARN"}]}
+
+
 class KeaDriver(DHCPDriver):
     """Kea DHCPv4 driver — emits a ``Dhcp4`` JSON config structure."""
 
@@ -530,6 +550,7 @@ class KeaDriver(DHCPDriver):
                 # match, so declaration order is precedence.
                 + [_render_device_policy_class(p) for p in bundle.device_policy_classes],
                 "option-data": _render_option_data(bundle.options.options, address_family="ipv4"),
+                **_packet_logging_override(bundle, "kea-dhcp4"),
             }
             # #856 — ship definitions for any non-standard option emitted above.
             option_defs = _collect_option_defs(out["Dhcp4"])
@@ -565,6 +586,7 @@ class KeaDriver(DHCPDriver):
                     _render_client_class(c, address_family="ipv6") for c in bundle.client_classes
                 ],
                 "option-data": _render_option_data(bundle.options.options, address_family="ipv6"),
+                **_packet_logging_override(bundle, "kea-dhcp6"),
             }
         # #637 — group-wide ``cache-max-age`` is optional (None = uncapped, Kea's
         # own default), so it is applied conditionally rather than in the literals.

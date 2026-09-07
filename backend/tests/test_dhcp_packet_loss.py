@@ -87,6 +87,22 @@ def test_thread_pool_size_shifts_the_etag() -> None:
     )
 
 
+def test_packet_logging_shows_in_the_rendered_preview() -> None:
+    """The preview is what an operator checks a setting against.
+
+    It already omits most daemon plumbing and does not parse as a Kea
+    config, but it does carry the group tunables — ``dhcp_socket_type``
+    (#365) and ``cache-threshold`` (#637) are both there — so a #980 knob
+    that was invisible would have the operator seeing one of the two
+    settings they just changed.
+    """
+    on = json.loads(KeaDriver().render_config(_bundle(kea_packet_logging=True)))
+    assert "loggers" not in on["Dhcp4"], "default must render exactly as before"
+
+    off = json.loads(KeaDriver().render_config(_bundle(kea_packet_logging=False)))
+    assert off["Dhcp4"]["loggers"] == [{"name": "kea-dhcp4.packets", "severity": "WARN"}]
+
+
 def test_packet_logging_shifts_the_etag() -> None:
     assert (
         _bundle(kea_packet_logging=True).compute_etag()

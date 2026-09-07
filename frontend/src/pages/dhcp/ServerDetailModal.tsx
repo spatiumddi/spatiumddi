@@ -14,6 +14,7 @@ import {
   ScrollText,
   Server,
 } from "lucide-react";
+import { bucketLoss, summariseLoss } from "@/lib/dhcp-loss";
 import {
   Area,
   CartesianGrid,
@@ -803,34 +804,17 @@ function StatsTab({ serverId }: { serverId: string }) {
       nak: b.nak,
       decline: b.decline,
       release: b.release,
-      // #980 — DROPPED is socket_drop ALONE. receive_drop counts packets
-      // Kea read and threw away on purpose as well as by accident: a
-      // blocklisted MAC (the shipped DHCP MAC blocklist renders a Kea DROP
-      // class) and an HA standby declining an out-of-scope query both land
-      // there. Adding it in would draw a permanent "loss" line on a
-      // correctly-working server.
-      //
-      // Null (not measured) stays null, and is keyed on socket_drop by
-      // itself — receive_drop always arrives from a #980 agent, so testing
-      // the pair would render an unmeasurable server as measured-and-clean.
-      // Recharts breaks the line at a null point, which is the honest
-      // rendering: a gap where nobody looked, not a zero.
-      dropped: b.socket_drop,
+      // #980 — DROPPED is socket_drop ALONE, and an unmeasured bucket stays
+      // null so Recharts breaks the line there: a gap where nobody looked,
+      // not a zero. See lib/dhcp-loss.ts for why receive_drop is excluded
+      // and why the coalesce matters.
+      dropped: bucketLoss(b),
     }));
   }, [data, withDate]);
 
-  // #980 — three states, not two. Loss measured and non-zero; loss measured
-  // and zero; loss never measured (an agent older than #980, or one that
-  // cannot read /proc/net/udp). The third must not render as the second.
-  // Keyed on socket_drop only — see the `dropped` mapping above.
-  const loss = useMemo(() => {
-    const measured = points.filter((p) => p.dropped !== null);
-    if (measured.length === 0) return { measured: false, total: 0 };
-    return {
-      measured: true,
-      total: measured.reduce((a, p) => a + (p.dropped ?? 0), 0),
-    };
-  }, [points]);
+  // #980 — three states, not two: measured and lossy, measured and clean,
+  // never measured. The third must not render as the second.
+  const loss = useMemo(() => summariseLoss(data?.rate_buckets ?? []), [data]);
 
   // date_bin emits only non-empty buckets, so an idle server usually yields
   // points.length === 0. But a window can also hold rows whose seven plotted

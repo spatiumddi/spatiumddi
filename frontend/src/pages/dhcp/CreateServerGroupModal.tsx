@@ -245,6 +245,7 @@ export function CreateServerGroupModal({
                 type="number"
                 min="0"
                 max="64"
+                step="1"
                 value={threadPoolSize}
                 onChange={(e) => setThreadPoolSize(e.target.value)}
               />

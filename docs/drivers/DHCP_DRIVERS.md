@@ -185,8 +185,16 @@ carries `DHCP4_OPEN_SOCKETS_FAILED`, `DHCP4_CONFIG_COMPLETE`,
 `DHCP4_STARTED` and `DHCP4_MULTI_THREADING_INFO`, the last being the line
 that confirms the pool size took effect.
 
-Both are also rendered by the control-plane-side `KeaDriver.render_config`
-for parity. Full measurements: [`DHCP.md` §4c](../features/DHCP.md).
+Both also appear in the control-plane-side `KeaDriver.render_config`, which
+backs the **Rendered config** tab. That render is a *preview*, not a copy of
+the file the agent writes — it omits the control socket, hooks, timers,
+expired-lease processing and the full logger block, and does not parse as a
+Kea config on its own. What it does carry is the group tunables an operator
+just set, which is the same rule `dhcp_socket_type` (#365) and
+`cache-threshold` (#637) already follow: `thread-pool-size` renders in full,
+and `kea_packet_logging` renders as the `kea-dhcpN.packets` severity
+override alone (nothing when it is on). Full measurements:
+[`DHCP.md` §4c](../features/DHCP.md).
 
 ### HA coordination
 
