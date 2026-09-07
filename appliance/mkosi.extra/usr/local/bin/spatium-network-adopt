@@ -1,0 +1,471 @@
+#!/usr/bin/env python3
+"""spatium-network-adopt — reconcile nmtui's edits with STATE (issue #1016).
+
+The console's F4 hands off to ``nmtui``, and ``appliance/mkosi.conf``
+advertises NetworkManager precisely because it gives operators
+"DHCP / static / VLAN / bonds / bridges, all editable via nmtui".  That
+was true for exactly one boot: ``spatium-etc-render`` regenerates both
+managed keyfiles from ``spatium-config.yaml`` on every boot, ordered
+``Before=NetworkManager.service``, so NM never sees the operator's
+version.
+
+The symptom is delayed and detached from its cause.  The change works,
+is verified working, and reverts on a reboot that may be weeks later —
+often a slot upgrade, which supplies a much more plausible suspect.  For
+an MTU or a route the presentation is worse still: pings and small
+requests keep working while large TCP hangs.
+
+This tool closes the gap in the two ways the issue settled on:
+
+``--check``   report how the live profile differs from what STATE would
+              render.  Exit 0 = converged, 10 = drift, 1 = error.
+``--adopt``   write the adoptable differences back into
+              ``spatium-config.yaml``, so the next boot renders what the
+              operator actually configured.
+``--json``    the same report, machine-readable, for the console and for
+              anything that later wants a drift chip.
+
+**Adoption is bounded to what STATE models, and says so.**  A keyfile
+setting with no field in ``spatium-config.yaml`` — an MTU, a static
+route, a bond or bridge — cannot be adopted, because etc-render would
+not render it back.  Those are reported as ``unadoptable`` rather than
+quietly dropped: an operator told "adopted 4 changes" while their MTU
+silently stayed revertible is worse off than one who was told nothing.
+That is why the console still warns *before* launching nmtui rather than
+relying on this tool afterwards.
+
+Deliberately NOT what this does: it does not stop etc-render owning the
+profile (that is option 3 in the issue, and it forfeits what #276 built
+the render path for — surviving a ``/var`` factory reset), and it never
+edits NetworkManager.  STATE stays the single source of truth; this only
+changes what STATE says.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from pathlib import Path
+
+STATE_CONFIG = Path("/var/lib/spatium-state/spatium-config.yaml")
+NM_DIR = Path("/etc/NetworkManager/system-connections")
+STATIC_KEYFILE = NM_DIR / "10-spatium-static.nmconnection"
+DHCP_KEYFILE = NM_DIR / "10-spatium-dhcp.nmconnection"
+
+#: Keyfile settings etc-render writes and therefore controls. Anything
+#: else an operator adds to a managed profile is reported unadoptable —
+#: including keys NM defaults, since a default we do not render is a
+#: default the next boot restores.
+_MANAGED_KEYS = {
+    ("connection", "interface-name"),
+    ("connection", "id"),
+    ("connection", "uuid"),
+    ("connection", "type"),
+    ("connection", "autoconnect"),
+    ("connection", "autoconnect-priority"),
+    ("ipv4", "method"),
+    ("ipv4", "address1"),
+    ("ipv4", "dns"),
+    ("ipv6", "method"),
+    ("ipv6", "address1"),
+}
+
+
+class AdoptError(Exception):
+    """Something the operator needs to fix before this can work."""
+
+
+# ── flat config I/O ───────────────────────────────────────────────────
+#
+# Same contract as spatium-etc-render's ``get_cfg``: a flat ``key: value``
+# document, no nested maps, so neither end needs PyYAML. Reading and
+# writing here go through one pair of functions so the two cannot drift
+# on quoting.
+
+
+def read_state(path: Path = STATE_CONFIG) -> dict[str, str]:
+    out: dict[str, str] = {}
+    if not path.exists():
+        return out
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line or line.lstrip().startswith("#") or ":" not in line:
+            continue
+        if line[:1].isspace():
+            continue  # a nested key; v1 config is flat, so not ours
+        key, _, value = line.partition(":")
+        out[key.strip()] = _unquote(value.strip())
+    return out
+
+
+def _unquote(value: str) -> str:
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        return value[1:-1]
+    return value
+
+
+def _quote(value: str) -> str:
+    """Quote only when the value would otherwise be ambiguous.
+
+    etc-render's reader strips one layer of quotes, so quoting is safe
+    either way — but leaving simple values bare keeps the file readable
+    and diffable, which is most of why it is a flat text document.
+    """
+    if value == "" or re.search(r'[:#\'"]|^\s|\s$', value):
+        return '"' + value.replace('"', '\\"') + '"'
+    return value
+
+
+def write_state(updates: dict[str, str], path: Path = STATE_CONFIG) -> list[str]:
+    """Apply ``updates`` in place, preserving every other line.
+
+    Rewrites an existing key where it sits rather than appending a second
+    copy — etc-render's reader takes the FIRST match, so an appended
+    duplicate would be read as a no-op and the adopt would appear to do
+    nothing. Keys not already present are appended.
+
+    Writes through a temp file in the same directory + rename, so an
+    interrupted write cannot leave STATE truncated. STATE is the file
+    that survives a factory reset; a torn one is not recoverable from
+    anywhere else on the box.
+    """
+    if not path.exists():
+        raise AdoptError(f"{path} does not exist — is the STATE partition mounted?")
+    lines = path.read_text(encoding="utf-8").splitlines()
+    remaining = dict(updates)
+    changed: list[str] = []
+    for i, line in enumerate(lines):
+        if not line or line.lstrip().startswith("#") or ":" not in line:
+            continue
+        if line[:1].isspace():
+            continue
+        key = line.partition(":")[0].strip()
+        if key in remaining:
+            new = f"{key}: {_quote(remaining.pop(key))}"
+            if lines[i] != new:
+                lines[i] = new
+                changed.append(key)
+    for key, value in remaining.items():
+        lines.append(f"{key}: {_quote(value)}")
+        changed.append(key)
+    tmp = path.with_suffix(path.suffix + ".new")
+    tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    tmp.replace(path)
+    return changed
+
+
+# ── keyfile parsing ───────────────────────────────────────────────────
+
+
+def parse_keyfile(path: Path) -> dict[str, dict[str, str]]:
+    """Parse an NM keyfile into ``{section: {key: value}}``.
+
+    Hand-rolled rather than ``configparser``: NM keyfiles routinely carry
+    values containing ``;`` and ``=`` (a DNS list, an address with a
+    gateway), duplicate-looking keys like ``address1`` / ``address2``,
+    and configparser's interpolation would choke on a ``%`` in an
+    interface name.
+    """
+    out: dict[str, dict[str, str]] = {}
+    section = ""
+    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].strip()
+            out.setdefault(section, {})
+            continue
+        if "=" not in line or not section:
+            continue
+        key, _, value = line.partition("=")
+        out[section][key.strip()] = value.strip()
+    return out
+
+
+def managed_keyfile(state: dict[str, str]) -> Path | None:
+    """Which keyfile etc-render owns, given what STATE currently says.
+
+    ``dhcp`` with no pinned interface owns nothing — NM's own auto
+    profile carries the interface, and an nmtui edit to *that* survives,
+    which is the one install shape #1016 does not bite.
+    """
+    mode = state.get("network_mode", "")
+    if mode == "static":
+        return STATIC_KEYFILE
+    if mode == "dhcp" and state.get("network_interface"):
+        return DHCP_KEYFILE
+    return None
+
+
+# ── comparison ────────────────────────────────────────────────────────
+
+
+def _split_address(value: str) -> tuple[str, str, str]:
+    """``IP/PREFIX,GATEWAY`` → (ip, prefix, gateway); gateway may be ''."""
+    addr, _, gateway = value.partition(",")
+    ip, _, prefix = addr.partition("/")
+    return ip.strip(), prefix.strip(), gateway.strip()
+
+
+def _state_from_keyfile(kf: dict[str, dict[str, str]]) -> dict[str, str]:
+    """Project a parsed keyfile onto the STATE keys it corresponds to."""
+    conn = kf.get("connection", {})
+    v4 = kf.get("ipv4", {})
+    v6 = kf.get("ipv6", {})
+    out: dict[str, str] = {}
+
+    if conn.get("interface-name"):
+        out["network_interface"] = conn["interface-name"]
+
+    v4_method = v4.get("method", "")
+    if v4_method == "manual":
+        out["network_mode"] = "static"
+        ip, prefix, gateway = _split_address(v4.get("address1", ""))
+        if ip:
+            out["network_ip"] = ip
+            out["network_prefix"] = prefix or "24"
+            out["network_gateway"] = gateway
+        # NM stores DNS semicolon-separated with a trailing ';'; STATE
+        # stores it space-separated, which is what etc-render translates
+        # back. Normalising here means a purely cosmetic difference in
+        # separators never shows up as drift.
+        dns = [d for d in v4.get("dns", "").split(";") if d.strip()]
+        out["network_dns"] = " ".join(d.strip() for d in dns)
+    elif v4_method == "auto":
+        out["network_mode"] = "dhcp"
+
+    v6_method = v6.get("method", "")
+    if v6_method == "manual":
+        out["network6_mode"] = "static"
+        ip, prefix, gateway = _split_address(v6.get("address1", ""))
+        if ip:
+            out["network6_ip"] = ip
+            out["network6_prefix"] = prefix or "64"
+            out["network6_gateway"] = gateway
+    elif v6_method == "auto":
+        out["network6_mode"] = "auto"
+    return out
+
+
+def _unadoptable(kf: dict[str, dict[str, str]]) -> list[str]:
+    """Settings present in the live keyfile that STATE cannot express.
+
+    These are the ones that WILL revert at the next boot however this
+    tool is used, so they are the ones the operator most needs named.
+    """
+    out: list[str] = []
+    for section, entries in kf.items():
+        for key in entries:
+            if (section, key) not in _MANAGED_KEYS:
+                out.append(f"{section}.{key}")
+    return sorted(out)
+
+
+#: What etc-render treats an ABSENT STATE key as meaning.
+#:
+#: ``_render_ipv6_block`` emits ``method=auto`` for anything that is not
+#: literally ``static``, so an unset ``network6_mode`` and a live
+#: ``method=auto`` are the same configuration. Without this the tool
+#: would report drift on every appliance that never set an IPv6 mode —
+#: which is most of them — and the console would offer to adopt a change
+#: nobody made. An alarm that always fires is one operators learn to
+#: dismiss, which would cost more than the feature is worth.
+_STATE_DEFAULTS = {
+    "network6_mode": "auto",
+    "network6_prefix": "64",
+}
+
+
+def _state_value(state: dict[str, str], key: str) -> str:
+    value = state.get(key, "")
+    if value:
+        return value
+    return _STATE_DEFAULTS.get(key, "")
+
+
+def drift_for(state: dict[str, str], live: dict[str, str]) -> dict[str, dict[str, str]]:
+    """The per-key differences between STATE and the live profile.
+
+    Its own function so the tests exercise the comparison the tool
+    actually performs — an inline re-derivation in a test passes while
+    the shipped path is wrong, which is how the ``network6_mode``
+    default was nearly missed.
+    """
+    return {
+        key: {"state": state.get(key, ""), "live": value}
+        for key, value in live.items()
+        if _state_value(state, key) != value
+    }
+
+
+def compare(state: dict[str, str] | None = None) -> dict[str, object]:
+    """Report how the live managed profile differs from STATE."""
+    state = read_state() if state is None else state
+    keyfile = managed_keyfile(state)
+    if keyfile is None:
+        return {
+            "managed": False,
+            "keyfile": None,
+            "reason": (
+                "this appliance has no etc-render-managed connection profile "
+                "(DHCP with no pinned interface), so nmtui edits to NetworkManager's "
+                "own profile are not regenerated at boot"
+            ),
+            "drift": {},
+            "unadoptable": [],
+            "extra_profiles": _extra_profiles(),
+        }
+    if not keyfile.exists():
+        return {
+            "managed": True,
+            "keyfile": str(keyfile),
+            "reason": f"{keyfile} does not exist yet — it is written on the next boot",
+            "drift": {},
+            "unadoptable": [],
+            "extra_profiles": _extra_profiles(),
+        }
+    kf = parse_keyfile(keyfile)
+    live = _state_from_keyfile(kf)
+    drift = drift_for(state, live)
+    return {
+        "managed": True,
+        "keyfile": str(keyfile),
+        "reason": None,
+        "drift": drift,
+        "unadoptable": _unadoptable(kf),
+        "extra_profiles": _extra_profiles(),
+    }
+
+
+def _extra_profiles() -> list[str]:
+    """Operator-added profiles that etc-render does not delete but that
+    still lose the interface.
+
+    Both managed keyfiles carry ``autoconnect-priority=100`` and a fresh
+    nmtui profile defaults to 0, so re-pointing the appliance's primary
+    address onto a bond — the exact case ``mkosi.conf`` advertises —
+    fails in a way that looks like nmtui did nothing at all. Naming the
+    profiles is the difference between that and a diagnosis.
+    """
+    if not NM_DIR.is_dir():
+        return []
+    managed = {STATIC_KEYFILE.name, DHCP_KEYFILE.name}
+    return sorted(
+        p.name for p in NM_DIR.glob("*.nmconnection") if p.name not in managed
+    )
+
+
+# ── CLI ───────────────────────────────────────────────────────────────
+
+
+def _render(report: dict[str, object]) -> str:
+    lines: list[str] = []
+    if not report["managed"]:
+        lines.append(f"No managed profile: {report['reason']}")
+    elif report["reason"]:
+        lines.append(str(report["reason"]))
+    else:
+        lines.append(f"Managed profile: {report['keyfile']}")
+    drift = report["drift"]
+    assert isinstance(drift, dict)
+    if drift:
+        lines.append("")
+        lines.append("Differs from STATE (will revert at the next boot):")
+        for key in sorted(drift):
+            entry = drift[key]
+            state_val = entry["state"] or "(unset)"
+            lines.append(f"  {key}: STATE={state_val}  live={entry['live']}")
+        lines.append("")
+        lines.append("Adopt these into STATE with: spatium-network-adopt --adopt")
+    elif report["managed"] and not report["reason"]:
+        lines.append("Live profile matches STATE — nothing would revert.")
+    unadoptable = report["unadoptable"]
+    assert isinstance(unadoptable, list)
+    if unadoptable:
+        lines.append("")
+        lines.append("Settings STATE cannot store — these revert at the next boot")
+        lines.append("whether or not you adopt:")
+        for key in unadoptable:
+            lines.append(f"  {key}")
+    extra = report["extra_profiles"]
+    assert isinstance(extra, list)
+    if extra:
+        lines.append("")
+        lines.append("Other NetworkManager profiles present (not deleted, but the")
+        lines.append("managed profile outranks them at autoconnect-priority=100):")
+        for name in extra:
+            lines.append(f"  {name}")
+    return "\n".join(lines)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="spatium-network-adopt",
+        description=(
+            "Compare the live NetworkManager profile with what STATE would "
+            "render at the next boot, and optionally adopt the difference."
+        ),
+    )
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--check",
+        action="store_true",
+        help="report drift; exit 10 when the live profile differs from STATE",
+    )
+    group.add_argument(
+        "--adopt",
+        action="store_true",
+        help="write the adoptable differences back into spatium-config.yaml",
+    )
+    parser.add_argument("--json", action="store_true", help="machine-readable output")
+    args = parser.parse_args(argv)
+
+    try:
+        report = compare()
+    except OSError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    if args.adopt:
+        drift = report["drift"]
+        assert isinstance(drift, dict)
+        if not drift:
+            if args.json:
+                print(json.dumps({"adopted": [], **report}, indent=2))
+            else:
+                print("Nothing to adopt — the live profile already matches STATE.")
+            return 0
+        updates = {key: str(entry["live"]) for key, entry in drift.items()}
+        try:
+            changed = write_state(updates)
+        except (AdoptError, OSError) as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        if args.json:
+            print(json.dumps({"adopted": changed, **report}, indent=2))
+        else:
+            print(f"Adopted {len(changed)} setting(s) into STATE:")
+            for key in changed:
+                print(f"  {key} = {updates[key]}")
+            unadoptable = report["unadoptable"]
+            assert isinstance(unadoptable, list)
+            if unadoptable:
+                print("")
+                print("NOTE: these are still not stored in STATE and WILL revert:")
+                for key in unadoptable:
+                    print(f"  {key}")
+        return 0
+
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        print(_render(report))
+    drift = report["drift"]
+    assert isinstance(drift, dict)
+    return 10 if drift else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

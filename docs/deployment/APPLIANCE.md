@@ -168,6 +168,67 @@ The `/appliance` section in the SpatiumDDI UI talks to k3s directly via the api 
 
 The api pod's ServiceAccount keeps minimal RBAC: namespace-scoped pods + pods/log read, the specific `spatium-appliance-tls` Secret patch, and the frontend Deployment annotation patch. The only cluster-scoped grant is **read-only** `nodes` + `nodes/proxy [get]` (added in #402) so the Cluster Overview dashboard can read per-node kubelet stats. Nothing destructive.
 
+### Reconfiguring the network after install
+
+The console's **F4** opens `nmtui`. What is not obvious, and used to be
+documented nowhere, is that SpatiumDDI **owns one connection profile** and
+regenerates it from the STATE partition on every boot (#276): the
+`spatium-etc-render` unit is ordered `Before=NetworkManager.service`, so NM
+never sees an edit made to that profile — it reads the regenerated file at
+startup.
+
+Which profile depends on how the box was installed:
+
+| Install shape | Managed keyfile | An nmtui edit to it |
+|---|---|---|
+| `network_mode=static` | `10-spatium-static.nmconnection` | regenerated at the next boot |
+| `network_mode=dhcp` **with** a pinned interface | `10-spatium-dhcp.nmconnection` | regenerated at the next boot |
+| `network_mode=dhcp`, no pinned interface | none | survives — it is NetworkManager's own auto profile |
+
+A *separate* profile you add — a VLAN, a bond, a bridge — is never deleted,
+since etc-render only rewrites its own two files. But it does not win
+either: both managed keyfiles carry `autoconnect-priority=100` and a fresh
+nmtui profile defaults to `0`, so re-pointing the appliance's primary
+address onto a bond fails in a way that looks like nmtui did nothing at all.
+
+**This used to be silent, and that was the real problem.** The change
+applies immediately, verifies as working, and reverts on a reboot that may
+be weeks later — often a slot upgrade, which supplies a much more plausible
+suspect. For an MTU or a route the presentation is worse still: pings and
+small requests keep working while large TCP hangs, so it does not even read
+as "my network configuration vanished".
+
+Since #1016 the console brackets nmtui with two things:
+
+1. **A screen before it launches**, naming the managed profile and saying
+   its edits are regenerated from STATE.
+2. **An offer when you leave it** to write what you changed back into
+   `spatium-config.yaml`, so the next boot renders it. This is bounded to
+   the fields STATE models — mode, interface, address, prefix, gateway,
+   DNS, and their IPv6 equivalents.
+
+Anything outside that set (an MTU, a static route, ethernet options, a bond
+or bridge) **cannot** be adopted, because etc-render would not render it
+back. Those are listed explicitly rather than quietly dropped: being told
+"adopted 4 changes" while your MTU stays revertible is worse than being told
+nothing. That is also why the warning in (1) exists rather than relying on
+the adopt-back alone.
+
+The same reconciliation is available directly:
+
+```sh
+spatium-network-adopt --check    # exit 0 converged, 10 drift
+spatium-network-adopt --adopt    # save the adoptable differences to STATE
+spatium-network-adopt --json     # machine-readable report
+```
+
+**What was deliberately not done:** etc-render was not changed to render
+only when the keyfile is absent. That is the simplest fix and it forfeits
+what #276 built the render path *for* — surviving a `/var` factory reset —
+and would strand an appliance whose STATE says one thing and whose `/etc`
+overlay says another. STATE stays the single source of truth; the adopt-back
+changes what STATE says rather than who owns the file.
+
 ### Cluster DNS (CoreDNS)
 
 k3s runs CoreDNS in `kube-system`, and every pod on the appliance resolves

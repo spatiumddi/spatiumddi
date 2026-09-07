@@ -236,6 +236,10 @@ chmod 0755 "$BUILDROOT/usr/local/bin/spatium-live-bootstrap"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-slot-upgrade"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-console"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-etc-reconcile"
+# #1016 — nmtui drift report + adopt-back. Invoked by the console
+# around F4; without the exec bit the console's --check silently
+# reports "no managed profile" and the warning never appears.
+chmod 0755 "$BUILDROOT/usr/local/bin/spatium-network-adopt"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-upgrade-slot"
 # #395 — host-migration framework: renderer + orchestrator + patch registry.
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-grub-render"
