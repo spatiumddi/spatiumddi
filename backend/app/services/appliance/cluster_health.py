@@ -22,6 +22,8 @@ Pydantic model in ``app.api.v1.appliance.cluster`` (so the SSE loop can
 
 from __future__ import annotations
 
+import os
+import time
 from datetime import UTC, datetime
 from typing import Any
 
@@ -291,6 +293,258 @@ def _ready_counts(pod: dict[str, Any]) -> tuple[int, int]:
 # ── assembly ───────────────────────────────────────────────────────────────
 
 
+# ── cluster DNS (CoreDNS) — issue #985 ────────────────────────────────
+#
+# The k3s cluster runs CoreDNS for every pod's ``*.svc.cluster.local``
+# lookup: the api pod finds Postgres and Redis through it, the frontend
+# nginx finds the api through it, and a cluster member's supervisor
+# heartbeats the in-cluster api Service name through it. We already ACT
+# on it in exactly one place — ``ensure_coredns_ha`` patches the bundled
+# Deployment to match replica count and spread to the node count,
+# because a single replica on a lost node took the whole cluster
+# NotReady for five minutes (#590, #750) — and showed nothing about it
+# anywhere. A CoreDNS that is down, single-replica, or co-located on one
+# node read as "everything healthy" until some unrelated pod restart
+# failed to resolve.
+#
+# Health visibility only. This is not a CoreDNS driver, not a zone
+# surface, and not a ``coredns-custom`` editor: CoreDNS is not a server
+# operators put zones on and no LAN client ever talks to it.
+
+#: The label upstream Kubernetes, k3s and GKE all put on their cluster
+#: DNS pods, and what the ``kube-dns`` Service selects. Deliberately NOT
+#: the Deployment name ``coredns`` — the umbrella chart's cluster health
+#: renders on BYO clusters too, and GKE calls its deployment ``kube-dns``.
+_CLUSTER_DNS_SELECTOR = ("k8s-app", "kube-dns")
+_CLUSTER_DNS_NAMESPACE = "kube-system"
+
+#: What ``ensure_coredns_ha`` itself targets: stock (1 replica) on a
+#: single node, two replicas on distinct nodes once a second node
+#: exists. Reused here so the card cannot disagree with the thing that
+#: does the patching.
+_CLUSTER_DNS_MAX_REPLICAS = 2
+
+#: The name every conformant cluster resolves, and the one thing we can
+#: query that proves the whole path works without depending on anything
+#: SpatiumDDI deployed.
+_CLUSTER_DNS_PROBE_NAME = "kubernetes.default.svc.cluster.local"
+
+#: Short on purpose. This runs inside the health snapshot, which the
+#: Cluster dashboard streams — a slow probe would stall the whole page,
+#: and "cluster DNS took longer than two seconds" is already the answer.
+_CLUSTER_DNS_PROBE_TIMEOUT_S = 2.0
+
+
+def _resolver_ip_from_resolv_conf(path: str = "/etc/resolv.conf") -> str | None:
+    """The nameserver this pod actually queries.
+
+    Read from our own ``resolv.conf`` rather than from the ``kube-dns``
+    Service object, for two reasons: it needs no ``services get`` grant
+    we do not already hold, and it is the more honest number — it is the
+    address pods really send to, which is what a resolution failure is
+    about.
+    """
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or line.startswith(";"):
+                    continue
+                parts = line.split()
+                if len(parts) >= 2 and parts[0] == "nameserver":
+                    return parts[1]
+    except OSError:
+        return None
+    return None
+
+
+def _cluster_dns_probe(resolver_ip: str | None) -> dict[str, Any]:
+    """Resolve a known cluster name against ``resolver_ip``.
+
+    **This is the load-bearing half.** Replica counts say the pods
+    exist; the probe says the path works. ``ready=2, spread_ok=true,
+    probe failed`` is a real and interesting state — a kube-proxy or
+    flannel problem rather than a CoreDNS one — so it is reported as
+    itself rather than collapsed into one boolean.
+    """
+    if not resolver_ip:
+        return {
+            "ok": False,
+            "latency_ms": None,
+            "error": "no nameserver found in /etc/resolv.conf",
+        }
+    try:
+        import dns.exception  # noqa: PLC0415
+        import dns.resolver  # noqa: PLC0415
+    except ImportError as exc:  # pragma: no cover - dnspython is a hard dep
+        return {"ok": False, "latency_ms": None, "error": f"dnspython unavailable: {exc}"}
+
+    resolver = dns.resolver.Resolver(configure=False)
+    resolver.nameservers = [resolver_ip]
+    resolver.timeout = _CLUSTER_DNS_PROBE_TIMEOUT_S
+    resolver.lifetime = _CLUSTER_DNS_PROBE_TIMEOUT_S
+    started = time.monotonic()
+    try:
+        resolver.resolve(_CLUSTER_DNS_PROBE_NAME, "A")
+    except dns.exception.DNSException as exc:
+        # ``str()`` on a dnspython exception is sometimes empty (the #735
+        # lesson), so fall back to the class name rather than reporting
+        # an error of "".
+        detail = str(exc) or exc.__class__.__name__
+        return {
+            "ok": False,
+            "latency_ms": round((time.monotonic() - started) * 1000, 1),
+            "error": f"{_CLUSTER_DNS_PROBE_NAME} did not resolve via {resolver_ip}: {detail}",
+        }
+    except OSError as exc:
+        return {
+            "ok": False,
+            "latency_ms": round((time.monotonic() - started) * 1000, 1),
+            "error": f"could not reach {resolver_ip}: {exc}",
+        }
+    return {
+        "ok": True,
+        "latency_ms": round((time.monotonic() - started) * 1000, 1),
+        "error": None,
+    }
+
+
+def _own_node_name(pods_raw: list[dict[str, Any]]) -> str | None:
+    """Which node this api replica is running on.
+
+    ``HOSTNAME`` inside a pod is the pod name, so the node is looked up
+    by finding our own pod in the list we already have. Falls back to the
+    ``SPATIUM_NODE_NAME`` downward-API env var if the chart sets one, and
+    to ``None`` rather than guessing.
+    """
+    explicit = os.environ.get("SPATIUM_NODE_NAME") or os.environ.get("NODE_NAME")
+    if explicit:
+        return explicit
+    me = os.environ.get("HOSTNAME")
+    if not me:
+        return None
+    for p in pods_raw:
+        if (p.get("metadata") or {}).get("name") == me:
+            return (p.get("spec") or {}).get("nodeName")
+    return None
+
+
+def _cluster_dns_unavailable(detail: str) -> dict[str, Any]:
+    """The shape callers get when cluster DNS could not be assessed.
+
+    Every count is ``None``, never ``0``: a zero would render as "no
+    replicas" — an alarming and wrong claim — where the truth is that we
+    could not look. The same NULL-is-UNKNOWN rule the agent config-apply
+    status follows (#882).
+    """
+    return {
+        "available": False,
+        "detail": detail,
+        "resolver_ip": None,
+        "replicas_ready": None,
+        "replicas_total": None,
+        "expected_replicas": None,
+        "nodes": [],
+        "spread_ok": None,
+        "resolve_probe": None,
+        "checked_at": datetime.now(UTC).isoformat(),
+    }
+
+
+def _cluster_dns_health(
+    pods_raw: list[dict[str, Any]],
+    *,
+    nodes_total: int,
+    pods_listable: bool,
+    from_node: str | None,
+) -> dict[str, Any]:
+    """Build the ``cluster_dns`` block from the pod list already fetched.
+
+    No new RBAC: replicas and placement come from the cluster-wide pod
+    list the snapshot fetches anyway, filtered on the cluster-DNS label.
+    On someone else's cluster, where the ServiceAccount may not be able
+    to list ``kube-system``, this degrades to ``available: false`` with a
+    reason rather than reporting an empty deployment.
+    """
+    if not pods_listable:
+        return _cluster_dns_unavailable(
+            "pods could not be listed, so cluster DNS replicas are unknown — grant the "
+            "api ServiceAccount cluster-wide pod read to populate this card."
+        )
+
+    key, value = _CLUSTER_DNS_SELECTOR
+    dns_pods = [
+        p
+        for p in pods_raw
+        if (p.get("metadata") or {}).get("namespace") == _CLUSTER_DNS_NAMESPACE
+        and ((p.get("metadata") or {}).get("labels") or {}).get(key) == value
+    ]
+
+    resolver_ip = _resolver_ip_from_resolv_conf()
+    probe = _cluster_dns_probe(resolver_ip)
+    probe["from_node"] = from_node
+
+    if not dns_pods:
+        # An empty *result* is different from an unreadable list. Both
+        # leave the counts unknown, but this one is worth its own
+        # sentence: on a BYO cluster it usually means the cluster labels
+        # its DNS differently, not that DNS is missing — and the probe
+        # right above will have said whether resolution works.
+        out = _cluster_dns_unavailable(
+            f"no pods matching {key}={value} in {_CLUSTER_DNS_NAMESPACE} — this cluster "
+            "may label its DNS differently. The resolve probe below still reports "
+            "whether cluster DNS actually answers."
+        )
+        out["resolver_ip"] = resolver_ip
+        out["resolve_probe"] = probe
+        return out
+
+    ready_nodes: list[str] = []
+    replicas_ready = 0
+    for p in dns_pods:
+        phase = (p.get("status") or {}).get("phase")
+        if phase in ("Succeeded", "Failed"):
+            continue
+        ready_n, total_n = _ready_counts(p)
+        if phase == "Running" and total_n > 0 and ready_n == total_n:
+            replicas_ready += 1
+            node = (p.get("spec") or {}).get("nodeName")
+            if node:
+                ready_nodes.append(node)
+
+    live_pods = [
+        p for p in dns_pods if (p.get("status") or {}).get("phase") not in ("Succeeded", "Failed")
+    ]
+    # ``ensure_coredns_ha``'s own target, not the Deployment's
+    # ``spec.replicas`` — reading that would need a ``deployments get``
+    # grant in kube-system that this snapshot does not hold, and on a BYO
+    # cluster it is not ours to have an opinion about anyway.
+    expected = min(nodes_total, _CLUSTER_DNS_MAX_REPLICAS) if nodes_total else None
+
+    spread_ok: bool | None
+    if expected is None:
+        spread_ok = None
+    else:
+        # Both halves matter, and the second is the one #633 was filed
+        # for: two replicas parked on the SAME node is not HA, and
+        # Kubernetes never rebalances running pods, so it stays that way
+        # until something forces a reschedule.
+        spread_ok = replicas_ready >= expected and len(set(ready_nodes)) == len(ready_nodes)
+
+    return {
+        "available": True,
+        "detail": None,
+        "resolver_ip": resolver_ip,
+        "replicas_ready": replicas_ready,
+        "replicas_total": len(live_pods),
+        "expected_replicas": expected,
+        "nodes": sorted(set(ready_nodes)),
+        "spread_ok": spread_ok,
+        "resolve_probe": probe,
+        "checked_at": datetime.now(UTC).isoformat(),
+    }
+
+
 def _unavailable(detail: str) -> dict[str, Any]:
     return {
         "available": False,
@@ -317,6 +571,8 @@ def _unavailable(detail: str) -> dict[str, Any]:
         "cpu_capacity_cores": None,
         "memory_working_set_bytes": None,
         "memory_capacity_bytes": None,
+        # #985 — present even here so the key never has to be probed for.
+        "cluster_dns": _cluster_dns_unavailable(detail),
         "nodes": [],
         "workloads": [],
         "top_pods_cpu": [],
@@ -347,10 +603,16 @@ def get_cluster_health() -> dict[str, Any]:
     if nstatus != 200:
         return _unavailable(f"kubeapi node list returned HTTP {nstatus}")
 
+    pods_listable = True
     try:
-        _pstatus, pods_raw = k8s.list_all_pods()
+        pstatus, pods_raw = k8s.list_all_pods()
+        # A 403 returns (status, []) rather than raising, so without this
+        # the cluster-DNS block would read an empty list as "no CoreDNS
+        # pods" — an alarming claim about a cluster we simply cannot see.
+        pods_listable = pstatus == 200
     except k8s.KubeapiUnavailableError:
         pods_raw = []
+        pods_listable = False
 
     # Per-node kubelet Summary API (CPU / mem / fs + per-pod usage, and PSI
     # since 1.36). Degrades cleanly to "no live usage" when NEITHER transport
@@ -552,6 +814,16 @@ def get_cluster_health() -> dict[str, Any]:
         "control_plane_nodes": control_plane_nodes,
         "metrics_available": metrics_available,
         "kubelet_transport": _kubelet_transport_report(transport_by_node, transport_ip_by_node),
+        # #985. The probe is labelled with the node this api replica runs
+        # on: on a multi-node control plane the request is served by
+        # whichever replica took it, and a probe that passes on node 1
+        # says nothing about node 3.
+        "cluster_dns": _cluster_dns_health(
+            pods_raw,
+            nodes_total=len(nodes_raw),
+            pods_listable=pods_listable,
+            from_node=_own_node_name(pods_raw),
+        ),
         "cpu_usage_cores": round(cluster_cpu_used, 4) if metrics_available else None,
         "cpu_capacity_cores": round(cluster_cpu_cap, 4) if cluster_cpu_cap else None,
         "memory_working_set_bytes": cluster_mem_used if metrics_available else None,

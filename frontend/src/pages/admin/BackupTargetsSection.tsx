@@ -919,9 +919,8 @@ function TargetFormModal({
                   SpatiumDDI writes archives here but never deletes them:
                   retention is skipped, the archive-delete action is refused,
                   and pull-mode download is unavailable. Use with an S3 bucket
-                  under Object Lock and a key without{" "}
-                  <code>DeleteObject</code>, so nothing this install holds can
-                  shorten retention.{" "}
+                  under Object Lock and a key without <code>DeleteObject</code>,
+                  so nothing this install holds can shorten retention.{" "}
                   <span className="text-amber-600 dark:text-amber-400">
                     Restore drills cannot run against a destination we cannot
                     read, so recovery readiness will report this target as

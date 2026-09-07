@@ -12696,6 +12696,37 @@ export interface ClusterWorkloadHealth {
   status: string;
 }
 
+/** The resolve probe's verdict (#985). */
+export interface ClusterDnsProbe {
+  ok: boolean;
+  latency_ms: number | null;
+  error: string | null;
+  /**
+   * Which node's api replica ran the probe. On a multi-node control plane
+   * the request is served by whichever replica took it, so a pass is a
+   * statement about one vantage, not the whole cluster.
+   */
+  from_node: string | null;
+}
+
+/**
+ * Cluster DNS (CoreDNS) health (#985). Every count is nullable and `null`
+ * means UNKNOWN — rendering it as 0 would claim "no replicas", which is a
+ * far more alarming statement than "we could not look".
+ */
+export interface ClusterDns {
+  available: boolean;
+  detail: string | null;
+  resolver_ip: string | null;
+  replicas_ready: number | null;
+  replicas_total: number | null;
+  expected_replicas: number | null;
+  nodes: string[];
+  spread_ok: boolean | null;
+  resolve_probe: ClusterDnsProbe | null;
+  checked_at: string | null;
+}
+
 export interface ClusterHealthSnapshot {
   available: boolean;
   detail: string | null;
@@ -12709,6 +12740,7 @@ export interface ClusterHealthSnapshot {
   control_plane_nodes: number;
   metrics_available: boolean;
   kubelet_transport: ClusterKubeletTransport | null;
+  cluster_dns: ClusterDns | null;
   cpu_usage_cores: number | null;
   cpu_capacity_cores: number | null;
   memory_working_set_bytes: number | null;

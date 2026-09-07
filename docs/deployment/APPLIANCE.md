@@ -168,6 +168,75 @@ The `/appliance` section in the SpatiumDDI UI talks to k3s directly via the api 
 
 The api pod's ServiceAccount keeps minimal RBAC: namespace-scoped pods + pods/log read, the specific `spatium-appliance-tls` Secret patch, and the frontend Deployment annotation patch. The only cluster-scoped grant is **read-only** `nodes` + `nodes/proxy [get]` (added in #402) so the Cluster Overview dashboard can read per-node kubelet stats. Nothing destructive.
 
+### Cluster DNS (CoreDNS)
+
+k3s runs CoreDNS in `kube-system`, and every pod on the appliance resolves
+`*.svc.cluster.local` through it: the api pod finds Postgres and Redis that
+way, the frontend nginx finds the api, and on a multi-node control plane a
+member's supervisor heartbeats the in-cluster api Service name. Nothing on
+the appliance talks to it from the LAN — it is not a DNS server operators put
+zones on, and it is unrelated to the BIND9 / Kea role containers.
+
+**What the appliance does to it.** k3s ships CoreDNS as a *single* replica
+with the default 300 s unreachable toleration, and on an appliance it
+deterministically lands on the seed node. Hard-kill that node and cluster DNS
+is gone for five minutes — and because the api readiness gate resolves the
+Postgres `-rw` Service and the Redis sentinel FQDNs through it, every api pod
+goes NotReady cluster-wide until CoreDNS finally reschedules (#590). So the
+supervisor's `ensure_coredns_ha` patches the bundled Deployment to a target
+that is a function of the **registered node count**:
+
+| Nodes | Target |
+|---|---|
+| 1 | Stock: 1 replica, no fast-evict toleration, no anti-affinity — both buy nothing with one node, and a 20 s toleration would evict the only DNS pod with nowhere to put it |
+| ≥2 | `min(nodes, 2)` replicas, fast-evict tolerations, and **required** (not preferred) pod anti-affinity |
+
+Required anti-affinity is deliberate and #633 has the evidence: *preferred*
+parked both replicas on the seed, and Kubernetes never rebalances running
+pods, so the "HA" DNS died with the seed anyway.
+
+**What the Cluster DNS card means** (Cluster → Overview, #985). Until now the
+appliance acted on cluster DNS and showed nothing about it, so a CoreDNS that
+was down, single-replica or co-located read as "everything healthy" until an
+unrelated pod restart failed to resolve. The card reports:
+
+- **Ready replicas** against `ensure_coredns_ha`'s own target — not the
+  Deployment's `spec.replicas`, which would need a `deployments get` grant in
+  `kube-system` that the api ServiceAccount does not hold.
+- **Spread** — amber when ready replicas share a node on a multi-node cluster,
+  which is not HA however healthy the count looks.
+- **Resolver** — the nameserver this api pod actually queries, read from its
+  own `/etc/resolv.conf` rather than from the `kube-dns` Service object. That
+  needs no extra grant and is the more honest number, since it is the address
+  pods really send to.
+- **Resolve probe** — a live lookup of `kubernetes.default.svc.cluster.local`
+  against that resolver, with the node the probing api replica runs on.
+
+The probe is the load-bearing part. Replica counts say the pods exist; the
+probe says the path works. **`ready 2 / spread ok / probe failed` is a real
+and distinct state** — it points at kube-proxy or the pod network rather than
+at CoreDNS, and the card says so rather than collapsing it into one verdict.
+A `null` count anywhere in this card means *unknown*, never zero: on a cluster
+whose `kube-system` pods the ServiceAccount cannot list, the card reports that
+it could not look instead of claiming there are no replicas.
+
+The default-on `Cluster DNS degraded` alert rule evaluates the same snapshot
+from the **worker** pod, which is a second probe vantage for free. Warning
+when replicas are missing or share a node; critical when none are ready or the
+probe fails.
+
+Pods match on the `k8s-app=kube-dns` label rather than on the deployment name
+`coredns` — the umbrella chart's cluster health renders on BYO clusters too,
+and GKE names its deployment `kube-dns`. On a cluster that labels DNS some
+third way, the replica view reports unknown and the probe still answers the
+question that matters.
+
+Editing CoreDNS configuration (stub domains or forwarders via a
+`coredns-custom` ConfigMap) is **not** in scope: appliance pods forward through
+the host resolver and that has not been a reported problem. There is no restart
+button either, for the same reason the Containers tab withholds one — on a
+single-node appliance restarting cluster DNS is a footgun.
+
 ### From-zero operator flow
 
 1. Boot the ISO → installer wizard asks for **role** + target disk + hostname + admin + network + timezone (+ pairing code / control-plane URL on Appliance).

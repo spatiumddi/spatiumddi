@@ -128,7 +128,7 @@ export const coreIpamNav: NavEntry[] = [
 // registrar/expiry/RDAP registry side of a name (linked to dns_zone.domain_id),
 // so it belongs beside DNS in the sidebar even though the route lives under
 // /admin.
-export const coreDnsNav: NavEntry[] = [
+export const dnsSectionNav: NavEntry[] = [
   { label: "DNS Pools", icon: Workflow, to: "/dns/pools" },
   { label: "DNSSEC Policies", icon: KeyRound, to: "/dns/dnssec-policies" },
   { label: "Domains", icon: Earth, to: "/admin/domains" },
@@ -480,7 +480,7 @@ export const footerNav: NavEntry[] = [
 export const NAV_SECTIONS: { section: string; items: NavEntry[] }[] = [
   { section: "Core", items: baseMainNav },
   { section: "IPAM", items: coreIpamNav },
-  { section: "DNS", items: coreDnsNav },
+  { section: "DNS", items: dnsSectionNav },
   { section: "Operations", items: operationsNav },
   { section: "Network", items: networkLogicalNav },
   { section: "Network", items: networkInfrastructureNav },

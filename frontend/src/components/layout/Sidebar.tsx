@@ -29,7 +29,7 @@ import {
   adminNotificationsNav,
   adminReferenceNav,
   baseMainNav,
-  coreDnsNav,
+  dnsSectionNav,
   coreIpamNav,
   filterNav,
   integrationsNav,
@@ -364,7 +364,7 @@ export function Sidebar({
               />
             ))}
             <SubNavLabel label="DNS" collapsed={effectiveCollapsed} />
-            {coreDnsNav.map((item) => (
+            {dnsSectionNav.map((item) => (
               <NavItem
                 key={item.to}
                 {...item}

@@ -440,11 +440,16 @@ class FindClusterMetricsArgs(BaseModel):
         "health rollup, the top pods by CPU + memory, and per-node PSI "
         "stall percentages (#983). Use to answer 'how loaded is the "
         "appliance?', 'what's eating memory?', 'are all workloads healthy?' "
-        "or 'is anything actually WAITING on CPU?' — the last one is what "
+        "'is cluster DNS healthy?', or 'is anything actually WAITING on CPU?' "
+        "— the last one is what "
         "utilisation cannot answer, since a node at 70% CPU with a run queue "
         "and one without look identical by usage alone. A null PSI figure "
         "means the kubelet did not report it (below Kubernetes 1.36), which "
-        "is NOT the same as no pressure. Appliance control plane only; "
+        "is NOT the same as no pressure. The ``cluster_dns`` block carries "
+        "CoreDNS replica count, node spread, and a live resolve probe — "
+        "replicas existing and DNS actually answering are different facts, "
+        "and a failed probe with healthy replicas points at kube-proxy or "
+        "the pod network rather than at CoreDNS. Appliance control plane only; "
         "read-only — the same data the Cluster → Overview dashboard renders."
     ),
     args_model=FindClusterMetricsArgs,
@@ -515,6 +520,10 @@ async def find_cluster_metrics(
         # Which transport served the kubelet Summary API, and why the direct
         # one is off if it is (#983 Phase 2 item 6).
         "kubelet_transport": snap.get("kubelet_transport"),
+        # Cluster DNS (#985). Nulls inside this block mean UNKNOWN, never
+        # zero — a cluster whose kube-system pods we cannot list reports
+        # ``available: false`` with a reason rather than "no replicas".
+        "cluster_dns": snap.get("cluster_dns"),
         "cluster_cpu_pct": _pct(snap.get("cpu_usage_cores"), snap.get("cpu_capacity_cores")),
         "cluster_mem_pct": _pct(
             snap.get("memory_working_set_bytes"), snap.get("memory_capacity_bytes")
