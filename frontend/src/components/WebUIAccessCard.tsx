@@ -81,8 +81,8 @@ export function WebUIAccessCard() {
                   — not in the allow-list (you reached this page another way).
                   {doors
                     ? sshExcludesMe
-                      ? " SSH is also restricted and excludes you, so only the appliance console reaches this fleet."
-                      : " SSH still admits you, and the appliance console recovers this either way."
+                      ? " SSH is also restricted and excludes this address, so unless you can reach one of those networks another way, only the appliance console reaches this fleet."
+                      : " The SSH allow-list does not exclude this address, and the appliance console recovers this either way."
                     : " The console always recovers this; SSH does too unless the SSH source restriction is also on and excludes you."}
                 </span>
               )}
@@ -170,11 +170,18 @@ function WebUIAccessModal({
   const lockoutError =
     !consoleOnlyError && errText.includes("override_lockout");
   const sshExcludesMe = Boolean(sshDoor?.restricted && !sshDoor.admits);
+  /** Both ticks, and the refusal that asked for them, belong to one list. */
+  const resetAcknowledgements = () => {
+    setOverride(false);
+    setAckConsoleOnly(false);
+    save.reset();
+  };
   const addMyIp = () => {
     if (!current.caller_ip) return;
     const entry =
       current.caller_ip + (current.caller_ip.includes(":") ? "/128" : "/32");
     setText((t) => (t.trim() ? `${t.trim()}\n${entry}` : entry));
+    resetAcknowledgements();
   };
   return (
     <Modal title="Web UI source restriction" onClose={onClose}>
@@ -193,8 +200,9 @@ function WebUIAccessModal({
             <span className="font-medium">SSH is also source-restricted</span> —
             to <code>{sshDoor?.allowed_cidrs.join(", ")}</code>, which does not
             cover <code>{current.caller_ip ?? "your address"}</code>. A list
-            here that excludes you as well would leave the appliance console as
-            the only way in.
+            here that excludes that address as well leaves the appliance console
+            as the only way in, unless you can reach one of those networks
+            another way.
           </p>
         )}
         <label className="block">
@@ -203,7 +211,16 @@ function WebUIAccessModal({
           </span>
           <textarea
             value={text}
-            onChange={(e) => setText(e.target.value)}
+            onChange={(e) => {
+              setText(e.target.value);
+              // #1013 — an acknowledgement belongs to the list that earned
+              // it. Left latched, an operator could accept the escalation
+              // for list A, retype list B, and save it past a guard the
+              // server never got to evaluate. Clearing the error with them
+              // returns the modal to a clean state so the next Save is
+              // judged on what is actually in the box.
+              resetAcknowledgements();
+            }}
             rows={5}
             placeholder={"192.168.0.0/24\n10.0.0.0/8\n2001:db8::/64"}
             className="mt-1 w-full rounded-md border bg-background px-2 py-1.5 font-mono text-xs"
@@ -220,7 +237,10 @@ function WebUIAccessModal({
           </button>
           <button
             type="button"
-            onClick={() => setText("")}
+            onClick={() => {
+              setText("");
+              resetAcknowledgements();
+            }}
             className="rounded-md border px-2.5 py-1 text-xs hover:bg-accent"
           >
             Open to all (clear)
@@ -243,8 +263,8 @@ function WebUIAccessModal({
             <span>
               Your current source IP isn&rsquo;t covered by this list &mdash;
               saving would cut off this session&rsquo;s path to the Web UI. Tick
-              to apply anyway; another remote door still admits you, and the
-              appliance console recovers this either way.
+              to apply anyway; the SSH allow-list does not exclude this address,
+              and the appliance console recovers it either way.
             </span>
           </label>
         )}

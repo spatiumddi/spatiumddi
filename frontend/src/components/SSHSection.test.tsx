@@ -38,8 +38,10 @@ vi.mock("@/lib/api", async () => {
  *  rendering rather than blanking it. */
 let doors: unknown;
 
+const invalidateQueries = vi.fn();
+
 vi.mock("@tanstack/react-query", () => ({
-  useQueryClient: () => ({ setQueryData: vi.fn() }),
+  useQueryClient: () => ({ setQueryData: vi.fn(), invalidateQueries }),
   useQuery: () => ({ data: doors }),
   useMutation: ({ mutationFn, onSuccess, onError }: never) => {
     const fn = mutationFn as (p: unknown) => Promise<unknown>;
@@ -67,8 +69,10 @@ function axios422(detail: string) {
 
 const LOCKOUT_DETAIL =
   "Your own address is not inside the allowed networks, so enforcing this " +
-  "restriction may close your SSH access to every appliance. Re-send with " +
-  "ssh_lockdown_force to proceed.";
+  "restriction may close your SSH access to every appliance. You would " +
+  "still reach this UI to turn it back off (the Web UI is not " +
+  "source-restricted), and the appliance console recovers it either way. " +
+  "Re-send with ssh_lockdown_force to proceed.";
 
 /** The #1013 escalation's detail, as ``console_only_detail`` renders it.
  *  Note it does NOT contain "not inside the allowed networks" — routing on
@@ -76,9 +80,10 @@ const LOCKOUT_DETAIL =
  *  wrong modal, whose tick the server then refuses. */
 const CONSOLE_ONLY_DETAIL =
   "Refusing to close the last remote way in. After this change neither the " +
-  "Web UI source restriction nor the SSH source restriction would admit your " +
-  "address (203.0.113.9), so the appliance console would be the only way to " +
-  "reach this fleet — and a VM with no console attached would need a " +
+  "Web UI source restriction nor the SSH source restriction would admit the " +
+  "address you are connecting from (203.0.113.9). Unless you can reach one " +
+  "of those networks another way, the appliance console becomes the only " +
+  "way into this fleet — and a VM with no console attached would need a " +
   "rebuild. Web UI allows 10.0.0.0/8; SSH allows 10.0.0.0/8. Add your " +
   "network to one of them, or re-send with acknowledge_console_only=true.";
 
@@ -358,5 +363,30 @@ describe("the other door (#1013)", () => {
     const first = update.mock.calls[0][0];
     const second = update.mock.calls[1][0];
     expect(second).toEqual({ ...first, acknowledge_console_only: true });
+  });
+});
+
+describe("keeping the other screen honest", () => {
+  it("invalidates the door report after a successful save", async () => {
+    // The report is derived from BOTH settings, so an SSH save makes it
+    // stale. Left cached, the Firewall tab keeps rendering "the SSH
+    // allow-list does not exclude this address" after lockdown was just
+    // enabled against a scope that excludes the operator — the exact false
+    // assurance this guard exists to remove.
+    update.mockResolvedValueOnce(
+      values({
+        ssh_allowed_source_networks: ["10.0.0.0/8"],
+        ssh_lockdown: true,
+      }),
+    );
+    const { enforce } = setup({ ssh_allowed_source_networks: ["10.0.0.0/8"] });
+    fireEvent.click(enforce);
+    fireEvent.click(screen.getByRole("button", { name: /save ssh settings/i }));
+
+    await waitFor(() =>
+      expect(invalidateQueries).toHaveBeenCalledWith({
+        queryKey: ["appliance", "remote-access"],
+      }),
+    );
   });
 });

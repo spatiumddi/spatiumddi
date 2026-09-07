@@ -55,7 +55,12 @@ from app.models.firewall import (
     FirewallRule,
 )
 from app.models.settings import PlatformSettings
-from app.services.appliance.access import console_only_detail, covers, effective_doors
+from app.services.appliance.access import (
+    SSH_REACHABILITY_CAVEAT,
+    console_only_detail,
+    covers,
+    effective_doors,
+)
 from app.services.appliance.firewall_lease import upgrade_in_flight
 from app.services.appliance.firewall_merge import (
     MergeContext,
@@ -1386,14 +1391,19 @@ async def set_web_ui_access(
         and not (body.override_lockout or report.console_only)
         and not covers(ip, body.allowed_cidrs)
     ):
-        # Reaching here proves a way in survives: the condition above IS
-        # "the Web UI door would not admit you", and had the SSH door not
-        # admitted you either, the escalation would already have raised. So
-        # this names the surviving path instead of hedging about it.
+        # Reaching here proves the SSH door did not exclude this address:
+        # the condition above IS "the Web UI door would not admit you", and
+        # had SSH excluded you too, the escalation would already have raised.
+        #
+        # That is a fact about an ADDRESS, not a promise about a session —
+        # see SSH_REACHABILITY_CAVEAT. State the list; do not assert that the
+        # operator will be able to SSH, which needs an assumption about where
+        # they SSH from that this request cannot support.
         ssh_desc = (
-            "allowed from " + ", ".join(report.ssh.allowed_cidrs)
+            f"SSH is allowed from {', '.join(report.ssh.allowed_cidrs)}, "
+            f"{SSH_REACHABILITY_CAVEAT}"
             if report.ssh.restricted
-            else "not source-restricted"
+            else "SSH is not source-restricted"
         )
         raise HTTPException(
             status_code=422,
@@ -1401,8 +1411,8 @@ async def set_web_ui_access(
                 f"Refusing to restrict the Web UI: your current source IP ({ip or 'unknown'}) "
                 "is not covered by the allow-list, so this would lock you out of the very "
                 "session making the change. Add your IP / network to the list, or pass "
-                "override_lockout=true — you would still reach this fleet over SSH "
-                f"({ssh_desc}) and at the appliance console."
+                f"override_lockout=true. {ssh_desc}, and the appliance console recovers "
+                "this either way."
             ),
         )
     if cfg is None:

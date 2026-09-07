@@ -27,6 +27,7 @@ from typing import Any
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.permissions import is_effective_superadmin
 from app.models.auth import User
 from app.models.settings import PlatformSettings
 from app.services.ai.tools.base import register_tool
@@ -109,6 +110,29 @@ async def find_ssh_settings(
     }
 
 
+def _superadmin_gate(user: User) -> dict[str, Any] | None:
+    """Gate for :func:`find_remote_access_doors` only.
+
+    It reports the Web UI allow-list, and ``find_web_ui_access`` — the only
+    other tool that returns that list — is superadmin-gated. A tool is gated
+    at the level of the most restricted datum it returns, so widening that
+    list to every copilot user as a side effect of joining it to the SSH one
+    would be a real (if quiet) change in who can read it.
+
+    Deliberately NOT applied to ``find_ssh_settings`` above: that shipped
+    ungated by decision (#157) and tightening it is a separate call, not
+    something to fold into a lockout fix.
+    """
+    if not is_effective_superadmin(user):
+        return {
+            "error": (
+                "Appliance source restrictions are restricted to superadmin "
+                "users. Ask your platform admin to run the query."
+            )
+        }
+    return None
+
+
 class FindRemoteAccessDoorsArgs(BaseModel):
     """No arguments — both restrictions are singleton settings."""
 
@@ -143,6 +167,8 @@ class FindRemoteAccessDoorsArgs(BaseModel):
 async def find_remote_access_doors(
     db: AsyncSession, user: User, args: FindRemoteAccessDoorsArgs
 ) -> dict[str, Any]:
+    if (err := _superadmin_gate(user)) is not None:
+        return err
     settings = await db.get(PlatformSettings, 1)
     # ``caller_ip=None`` is honest rather than a placeholder: there is no
     # request address here, so every ``admits`` below reflects only whether

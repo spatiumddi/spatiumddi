@@ -58,6 +58,14 @@ vi.mock("@tanstack/react-query", () => ({
       isPending: false,
       isError: state.isError,
       error: state.error,
+      // Modelled, not stubbed: the component calls reset() to clear a stale
+      // refusal when the list changes, and a no-op stub would let the
+      // latching test pass while the real thing still latched.
+      reset: () => {
+        state.isError = false;
+        state.error = null;
+        rerender?.();
+      },
       mutate: () =>
         fn().then(
           (r) => (onSuccess as ((r: unknown) => void) | undefined)?.(r),
@@ -92,16 +100,17 @@ const LOCKOUT_DETAIL =
   "Refusing to restrict the Web UI: your current source IP (203.0.113.9) is " +
   "not covered by the allow-list, so this would lock you out of the very " +
   "session making the change. Add your IP / network to the list, or pass " +
-  "override_lockout=true — you would still reach this fleet over SSH (not " +
-  "source-restricted) and at the appliance console.";
+  "override_lockout=true. SSH is not source-restricted, and the appliance " +
+  "console recovers this either way.";
 
 /** Note it contains NEITHER "lock you out" NOR "override_lockout" — routing
  *  on prose would send this to the wrong tick. */
 const CONSOLE_ONLY_DETAIL =
   "Refusing to close the last remote way in. After this change neither the " +
-  "Web UI source restriction nor the SSH source restriction would admit your " +
-  "address (203.0.113.9), so the appliance console would be the only way to " +
-  "reach this fleet — and a VM with no console attached would need a " +
+  "Web UI source restriction nor the SSH source restriction would admit the " +
+  "address you are connecting from (203.0.113.9). Unless you can reach one " +
+  "of those networks another way, the appliance console becomes the only " +
+  "way into this fleet — and a VM with no console attached would need a " +
   "rebuild. Web UI allows 10.0.0.0/8; SSH allows 10.0.0.0/8. Add your " +
   "network to one of them, or re-send with acknowledge_console_only=true.";
 
@@ -213,5 +222,77 @@ describe("the acknowledgement routing", () => {
       override_lockout: false,
       acknowledge_console_only: true,
     });
+  });
+});
+
+describe("an acknowledgement belongs to the list that earned it", () => {
+  async function acknowledgeThen(edit: () => void) {
+    setWebUIAccess.mockRejectedValueOnce(axios422(CONSOLE_ONLY_DETAIL));
+    openModal();
+    fireEvent.change(screen.getByRole("textbox"), {
+      target: { value: "10.0.0.0/8" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+    await screen.findByText(/closes the last remote way in/i);
+    fireEvent.click(screen.getByRole("checkbox"));
+    edit();
+  }
+
+  it("drops the escalation tick when the list is retyped", async () => {
+    // Acknowledge for list A, edit to list B, Save: the flag must not carry
+    // over, or list B is applied past a guard the server never evaluated.
+    await acknowledgeThen(() =>
+      fireEvent.change(screen.getByRole("textbox"), {
+        target: { value: "192.168.0.0/16" },
+      }),
+    );
+    setWebUIAccess.mockResolvedValueOnce(access);
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+
+    await waitFor(() => expect(setWebUIAccess).toHaveBeenCalledTimes(2));
+    expect(setWebUIAccess.mock.calls[1][0]).toEqual({
+      allowed_cidrs: ["192.168.0.0/16"],
+      override_lockout: false,
+      acknowledge_console_only: false,
+    });
+  });
+
+  it("clears the stale refusal with it", async () => {
+    // The warning described list A. Leaving it on screen next to list B
+    // would offer a tick for a state nothing has evaluated.
+    await acknowledgeThen(() =>
+      fireEvent.change(screen.getByRole("textbox"), {
+        target: { value: "192.168.0.0/16" },
+      }),
+    );
+    await waitFor(() =>
+      expect(screen.queryByText(/closes the last remote way in/i)).toBeNull(),
+    );
+  });
+
+  it("drops it when the list is cleared with the button", async () => {
+    await acknowledgeThen(() =>
+      fireEvent.click(screen.getByRole("button", { name: /open to all/i })),
+    );
+    setWebUIAccess.mockResolvedValueOnce(access);
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+
+    await waitFor(() => expect(setWebUIAccess).toHaveBeenCalledTimes(2));
+    expect(setWebUIAccess.mock.calls[1][0].acknowledge_console_only).toBe(
+      false,
+    );
+  });
+
+  it("drops it when Add my IP changes the list", async () => {
+    await acknowledgeThen(() =>
+      fireEvent.click(screen.getByRole("button", { name: /add my ip/i })),
+    );
+    setWebUIAccess.mockResolvedValueOnce(access);
+    fireEvent.click(screen.getByRole("button", { name: /^save$/i }));
+
+    await waitFor(() => expect(setWebUIAccess).toHaveBeenCalledTimes(2));
+    expect(setWebUIAccess.mock.calls[1][0].acknowledge_console_only).toBe(
+      false,
+    );
   });
 });

@@ -148,6 +148,13 @@ export function SSHSection({
     mutationFn: (patch: Partial<PlatformSettings>) => settingsApi.update(patch),
     onSuccess: (updated) => {
       qc.setQueryData(["settings"], updated);
+      // #1013 — the door report is derived from BOTH settings, so an SSH
+      // save makes it stale. Without this the Firewall tab keeps rendering
+      // a cached "SSH still admits you" advisory after lockdown was just
+      // enabled against a scope that excludes the operator — the exact
+      // false assurance this guard exists to remove. The Web UI card
+      // invalidates the same key for the mirror-image reason.
+      qc.invalidateQueries({ queryKey: ["appliance", "remote-access"] });
       setKeys((updated.ssh_authorized_keys || []).map((k) => ({ ...k })));
       setPasswordAuth(updated.ssh_password_auth_enabled);
       setAllowRoot(updated.ssh_allow_root_login);
@@ -528,10 +535,11 @@ export function SSHSection({
               The Web UI is <span className="font-medium">also</span>{" "}
               source-restricted &mdash; to{" "}
               <code>{doors.web_ui.allowed_cidrs.join(", ")}</code>, which does
-              not cover your address (
+              not cover the address you are connecting from (
               <code>{doors.caller_ip ?? "unknown"}</code>). Enforcing an SSH
-              scope that excludes you as well would leave the appliance console
-              as the only way in. Change it under Fleet &rarr; Firewall &rarr;
+              scope that excludes that address as well leaves the appliance
+              console as the only way in, unless you can reach one of those
+              networks another way. Change it under Fleet &rarr; Firewall &rarr;
               Web UI access, or add your network to the list above.
             </span>
           </div>

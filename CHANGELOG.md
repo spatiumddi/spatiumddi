@@ -110,11 +110,19 @@ the formatter handles the rest.
   `/appliance/firewall`, because the SSH screen must be able to
   ask with that module off.
 
-  **The per-door refusals got more useful on the way**, because
-  reaching one now *proves* a way in survives: had the other door
-  also excluded the caller, the escalation would have raised
-  first. So each names the surviving path and its scope instead of
-  hedging about it.
+  **The per-door refusals say more on the way**, because reaching
+  one now *proves* the other door did not exclude the caller's
+  address: had it, the escalation would have raised first. So each
+  names the other list and its scope instead of hedging about it.
+  Only as far as the fact goes, though — every verdict here is
+  about ONE address, the source of the HTTP request, and that is
+  the right address for the Web UI door (the operator is using it,
+  over that door, right now) but only a proxy for the SSH one,
+  since browsing from one network and SSHing from another is
+  legitimate. So the copy is asymmetric on purpose: "you can still
+  reach this UI" is asserted, "you can still SSH" is not — the SSH
+  list is reported as *including the address you are connecting
+  from*, which is what is actually known.
 
   **An address we cannot read is not covered — everywhere.** The
   two guards had been scoring that case in opposite directions:

@@ -192,11 +192,33 @@ def effective_doors(
 #: operator may have ticked one for an unrelated reason.
 CONSOLE_ONLY_DETAIL = (
     "Refusing to close the last remote way in. After this change neither the "
-    "Web UI source restriction nor the SSH source restriction would admit "
-    "your address ({caller}), so the appliance console would be the only way "
-    "to reach this fleet — and a VM with no console attached would need a "
+    "Web UI source restriction nor the SSH source restriction would admit the "
+    "address you are connecting from ({caller}). Unless you can reach one of "
+    "those networks another way, the appliance console becomes the only way "
+    "into this fleet — and a VM with no console attached would need a "
     "rebuild. Web UI allows {web}; SSH allows {ssh}. Add your network to one "
     "of them, or re-send with acknowledge_console_only=true."
+)
+
+#: What these guards can and cannot honestly assert.
+#:
+#: Every verdict here is about ONE address: the source of the HTTP request
+#: being made. That is exactly the right address for the Web UI door — the
+#: operator is using it, over that door, right now — and it is only a PROXY
+#: for the SSH door, because browsing from one network and SSHing from
+#: another is legitimate (#1009 says so where it justifies the per-door
+#: warning being advisory rather than a refusal).
+#:
+#: So the copy is asymmetric on purpose. A message may state that the SSH
+#: list *includes the address you are connecting from* — a fact — but not
+#: that you will therefore be able to SSH, which needs an assumption about
+#: where you SSH from. Going the other way, "you can still reach this UI" is
+#: sound and is stated plainly. The escalation names the address and the
+#: assumption rather than asserting the consequence outright, which keeps it
+#: honest without softening it: it fires on the cautious side either way,
+#: since it is an acknowledgeable warning and not a refusal.
+SSH_REACHABILITY_CAVEAT = (
+    "which includes the address you are connecting from now (you may SSH " "from elsewhere)"
 )
 
 

@@ -2114,6 +2114,15 @@ async def update_settings(
         # condition above IS "the SSH door would not admit you", and had the
         # Web UI door not admitted you either, the escalation would already
         # have raised. So this states the surviving path rather than hedging.
+        #
+        # This direction is sound in a way the mirror-image sentence on the
+        # firewall path is NOT, and the asymmetry is deliberate: the request
+        # arrived over the Web UI, from this address, just now — so "you can
+        # still reach this UI" is a statement about the very session making
+        # it. Asserting the reverse ("you can still SSH") would need an
+        # assumption about where the operator SSHes from, which #1009 says
+        # explicitly may differ. See SSH_REACHABILITY_CAVEAT in
+        # ``services/appliance/access``.
         _web = _doors_after.web_ui
         _web_desc = (
             "restricted to " + ", ".join(_web.allowed_cidrs)

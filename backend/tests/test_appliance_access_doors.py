@@ -41,16 +41,26 @@ def _reset_module_cache():
     invalidate_cache()
 
 
-async def _admin(db: AsyncSession, ip: str | None = None) -> dict:
+async def _user(db: AsyncSession, *, superadmin: bool = True) -> User:
     u = User(
         username=f"u-{uuid.uuid4().hex[:8]}",
         email=f"{uuid.uuid4().hex[:8]}@x.com",
         display_name="T",
         hashed_password=hash_password("x"),
-        is_superadmin=True,
+        is_superadmin=superadmin,
     )
     db.add(u)
     await db.flush()
+    # ``is_effective_superadmin`` falls through to the RBAC wildcard for a
+    # non-superadmin and touches ``user.groups``, which lazy-loads — and a
+    # lazy load inside an async call raises MissingGreenlet rather than
+    # returning False, so the gate would look broken instead of denying.
+    await db.refresh(u, ["groups"])
+    return u
+
+
+async def _admin(db: AsyncSession, ip: str | None = None) -> dict:
+    u = await _user(db)
     h = {"Authorization": f"Bearer {create_access_token(str(u.id))}"}
     if ip:
         h["X-Real-IP"] = ip
@@ -586,7 +596,8 @@ async def test_the_copilot_tool_reports_both_lists_together(
     )
     await db_session.flush()
 
-    out = await find_remote_access_doors(db_session, None, FindRemoteAccessDoorsArgs())
+    admin = await _user(db_session)
+    out = await find_remote_access_doors(db_session, admin, FindRemoteAccessDoorsArgs())
     assert out["both_restricted"] is True
     assert out["web_ui"]["allowed_cidrs"] == ["10.0.0.0/8"]
     assert out["ssh"]["allowed_cidrs"] == ["192.168.0.0/24"]
@@ -614,8 +625,86 @@ async def test_the_copilot_tool_reports_a_configured_but_unenforced_ssh_list(
     )
     await db_session.flush()
 
-    out = await find_remote_access_doors(db_session, None, FindRemoteAccessDoorsArgs())
+    admin = await _user(db_session)
+    out = await find_remote_access_doors(db_session, admin, FindRemoteAccessDoorsArgs())
     assert out["both_restricted"] is False
     assert out["ssh"]["restricted"] is False
     assert out["ssh"]["allowed_cidrs"] == []
     assert "recoverable" in out["summary"]
+
+
+@pytest.mark.asyncio
+async def test_the_copilot_tool_is_superadmin_gated(db_session: AsyncSession) -> None:
+    """It reports the Web UI allow-list, and ``find_web_ui_access`` — the only
+    other tool returning that list — is superadmin-gated. Joining it to the
+    SSH one must not widen who can read it."""
+    from app.services.ai.tools.ssh import (  # noqa: PLC0415
+        FindRemoteAccessDoorsArgs,
+        find_remote_access_doors,
+    )
+
+    db_session.add(PlatformSettings(id=1, web_ui_allowed_cidrs=["10.0.0.0/8"]))
+    plain = await _user(db_session, superadmin=False)
+    await db_session.flush()
+
+    out = await find_remote_access_doors(db_session, plain, FindRemoteAccessDoorsArgs())
+    assert "error" in out
+    assert "web_ui" not in out
+
+
+# ── what the refusals may honestly assert ───────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_the_per_door_refusal_states_the_ssh_list_not_ssh_reachability(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    """Every verdict here is about ONE address — the source of this HTTP
+    request. That is the right address for the Web UI door and only a PROXY
+    for the SSH door, since browsing from one network and SSHing from another
+    is legitimate (#1009 says so where it makes the per-door warning advisory
+    rather than a refusal). So the message may state that the SSH list
+    includes this address; it may not promise the operator can SSH.
+    """
+    from app.services.appliance.access import SSH_REACHABILITY_CAVEAT  # noqa: PLC0415
+
+    h = await _admin(db_session, ip="203.0.113.9")
+    db_session.add(
+        PlatformSettings(
+            id=1,
+            ssh_allowed_source_networks=["203.0.113.0/24"],
+            ssh_lockdown=True,
+        )
+    )
+    await db_session.commit()
+
+    r = await client.put(f"{FW}/web-ui-access", headers=h, json={"allowed_cidrs": ["10.0.0.0/8"]})
+    assert r.status_code == 422, r.text
+    detail = r.json()["detail"]
+    assert "203.0.113.0/24" in detail
+    assert SSH_REACHABILITY_CAVEAT in detail
+
+
+@pytest.mark.asyncio
+async def test_the_escalation_names_the_address_and_its_assumption(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    """Same discipline the other way: the escalation is a warning, not a
+    refusal, so it errs cautious — but it says which address it judged and
+    that reaching those networks another way would change the answer, rather
+    than asserting the consequence outright."""
+    h = await _admin(db_session, ip="203.0.113.9")
+    db_session.add(
+        PlatformSettings(
+            id=1,
+            ssh_allowed_source_networks=["10.0.0.0/8"],
+            ssh_lockdown=True,
+        )
+    )
+    await db_session.commit()
+
+    r = await client.put(f"{FW}/web-ui-access", headers=h, json={"allowed_cidrs": ["10.0.0.0/8"]})
+    assert r.status_code == 422, r.text
+    detail = r.json()["detail"]
+    assert "203.0.113.9" in detail
+    assert "another way" in detail
