@@ -237,9 +237,12 @@ class FirewallRule(UUIDPrimaryKeyMixin, Base):
         UniqueConstraint("policy_id", "seq", name="uq_fw_rule_policy_seq"),
         Index("ix_fw_rule_policy_seq", "policy_id", "seq"),
         # Floor protection: no rule may DROP ssh (port 22). The mgmt floor
-        # is also emitted in code, first + un-removable — this is the
-        # belt-and-braces DB guard so the policy surface can't author a
-        # self-lockout.
+        # is also emitted in code, first, and not removable BY A RULE — this
+        # is the belt-and-braces DB guard so the policy surface can't author
+        # a self-lockout. (#1009 lets an operator scope that floor
+        # deliberately via ``ssh_lockdown``, which is a separate setting with
+        # its own guards; this constraint is about what a firewall POLICY may
+        # express, and the answer there is still never.)
         CheckConstraint(
             "NOT (action = 'drop' AND ports @> '22'::jsonb)",
             name="ck_fw_rule_no_drop_ssh",

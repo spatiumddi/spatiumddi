@@ -1183,8 +1183,10 @@ def heartbeat_once(
         # carry no roles, no peers and no pods. ``_maybe_apply_firewall`` already
         # self-gates on ``detect_deployment_kind() == "appliance"`` and the host
         # runner short-circuits on an unchanged body hash, so an unconditional
-        # call is cheap + idempotent. SSH/22 stays in the un-removable base floor,
-        # so even a total drop-in failure leaves the node SSH-recoverable.
+        # call is cheap + idempotent. SSH/22 is opened by the baked sentinel
+        # 00-spatium-ssh.nft (#1009 — it used to be in the base conf), which is
+        # a separate file the glob pulls in, so even a total drop-in failure
+        # still leaves the node SSH-recoverable.
         _maybe_apply_firewall(
             role_assignment,
             log,

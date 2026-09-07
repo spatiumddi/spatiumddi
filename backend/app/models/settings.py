@@ -965,8 +965,12 @@ class PlatformSettings(Base):
     # MetalLB control-plane VIP). Empty = open (today's behaviour). When set,
     # both firewall renderers emit a peer-scoped 80/443 accept (requires the
     # base-conf strip of the LAN-wide 80/443) AND the frontend LoadBalancer
-    # Service gets loadBalancerSourceRanges. SSH/22 + console stay in the
-    # un-removable floor, so a bad scope is recoverable, never a brick.
+    # Service gets loadBalancerSourceRanges. A bad scope here is recoverable
+    # over SSH — the port-22 floor is open by default — or at the console.
+    # Since #1009 that SSH half is a default-on floor rather than a guarantee:
+    # an operator who also turned on ``ssh_lockdown`` with a scope excluding
+    # themselves has closed both doors and is left with the console. The two
+    # settings are independent and each warns on its own.
     web_ui_allowed_cidrs: Mapped[list[str]] = mapped_column(
         JSONB, nullable=False, default=list, server_default=sa_text("'[]'::jsonb")
     )

@@ -849,7 +849,10 @@ is `explode → deny-wins → source-union`; `source_kind` carries derived scope
 resolved per-node at render time, so promote/demote re-renders automatically.
 Seeded **builtin** role policies reproduce the Phase-2 hardcoded renderer
 byte-for-byte; operators tune their rules (the floor — ssh/22, ICMP, loopback —
-is un-removable, and no rule may `drop` 22).
+cannot be authored away by a rule, and no rule may `drop` 22). The ssh/22 half
+of that floor *can* be source-scoped, but only by the separate `ssh_lockdown`
+setting ([#1009](https://github.com/spatiumddi/spatiumddi/issues/1009)) — a
+deliberate act with its own guards, never a consequence of a firewall rule.
 
 **Fleet → Firewall tab.** A **left sub-nav** (#404 — was top sub-tabs) over
 five sections: **Policies** (fleet/role/appliance list + rule editor, with the
@@ -931,9 +934,16 @@ Unscoped, both rules say the same thing and the sentinel simply stays.
 `PUT /appliance/firewall/web-ui-access`
 carries an **anti-lockout guard**: a non-empty set that doesn't cover the
 operator's current source IP is rejected 422 unless `override_lockout=true`
-(the UI surfaces an "Add my IP" button + the override checkbox). SSH on :22
-stays in the un-removable base floor, so a bad scope is always recoverable from
-the console.
+(the UI surfaces an "Add my IP" button + the override checkbox). SSH on :22 is
+open by default — a baked sentinel, `/etc/nftables.d/00-spatium-ssh.nft` — so a
+bad Web-UI scope is recoverable over SSH, and from the console regardless.
+
+Since [#1009](https://github.com/spatiumddi/spatiumddi/issues/1009) that SSH
+half is a default-on floor rather than a guarantee: **the two lockdowns
+compose.** An operator who scopes the Web UI *and* turns on `ssh_lockdown` with
+a scope that excludes them has closed both doors, and the console is what
+remains. Neither setting can see the other, so neither warns about the
+combination — each guards only its own.
 
 ---
 

@@ -195,8 +195,10 @@ def compile_firewall_body(
     lines.append('iif lo accept comment "loopback"')
     # Web UI (HTTP + HTTPS) — #285 Phase 6. Open by default; source-scoped
     # when web_ui_allowed_cidrs is set (the base /etc/nftables.conf no longer
-    # opens 80/443, so this drop-in is authoritative). SSH/22 above stays the
-    # un-removable escape hatch, so a bad Web-UI scope is never a brick.
+    # opens 80/443, so this drop-in is authoritative). SSH/22 above is the
+    # escape hatch that keeps a bad Web-UI scope recoverable — open by
+    # default, and only scoped when the operator turns on ``ssh_lockdown``
+    # (#1009), which is a separate, deliberate act with its own guards.
     if web_ui_allowed_cidrs:
         web_v4, web_v6 = _split_families(list(web_ui_allowed_cidrs))
         _emit_family_rule(lines, web_v4, web_v6, "tcp dport { 80, 443 } accept", "web-ui")

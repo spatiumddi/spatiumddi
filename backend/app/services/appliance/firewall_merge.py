@@ -96,9 +96,12 @@ class PolicySet:
 
 
 # ── The mgmt floor — code, not data ──────────────────────────────────
-# Always-open management rules, emitted first + un-removable (the policy
-# surface cannot author these away; the no-drop-22 CHECK is the DB twin).
-# Byte-identical to firewall.compile_firewall_body lines 150-153.
+# Management rules, emitted first and not authorable away by the policy
+# surface (the no-drop-22 CHECK is the DB twin). Always OPEN, except that
+# #1009 lets an operator source-scope the SSH line via ``ssh_lockdown`` —
+# which is a setting, not a rule, and is why the first entry is emitted
+# separately by the caller rather than taken from this tuple wholesale.
+# Byte-identical to firewall.compile_firewall_body.
 _MGMT_FLOOR: tuple[str, ...] = (
     'tcp dport 22 accept comment "ssh"',
     'icmp type echo-request accept comment "icmpv4 ping"',

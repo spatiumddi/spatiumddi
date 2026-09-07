@@ -1148,8 +1148,9 @@ class SettingsUpdate(BaseModel):
             raise ValueError("ssh_port must be 1–65535")
         # Privileged-port floor — reject < 1024 except 22 so an operator
         # can't park sshd somewhere that needs root-only bind privileges
-        # the runner can't reliably reach. 22 stays the un-removable
-        # default; the host runner does the real bind / in-use check.
+        # the runner can't reliably reach. 22 is always an allowed value;
+        # the host runner does the real bind / in-use check. (Unrelated to
+        # the port-22 firewall floor, which #1009 made retireable.)
         if v < 1024 and v != 22:
             raise ValueError(
                 "ssh_port below 1024 is not allowed (except 22) — pick a "
