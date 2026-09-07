@@ -10,6 +10,14 @@ the SNMP community / syslog CA PEM.
 There is NO ``propose_*`` write tool — SSH config is changed through the
 Appliance → SSH form, same as SNMP / syslog (those writes carry a lockout-
 safety cross-check the form path enforces).
+
+Also home to ``find_remote_access_doors`` (#1013), which reports the SSH
+allow-list together with the Web UI one. Those are two independent settings
+that compose into a console-only lockout, and no tool could see both: the Web
+UI half sits on ``find_web_ui_access``, tagged ``module="appliance.firewall"``,
+so with that module off the copilot cannot see it at all — while the SSH half
+is plain host-config and always visible. It lives here rather than in
+``tools/firewall.py`` so it inherits that always-visible shape.
 """
 
 from __future__ import annotations
@@ -22,6 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.auth import User
 from app.models.settings import PlatformSettings
 from app.services.ai.tools.base import register_tool
+from app.services.appliance.access import effective_doors
 from app.services.appliance.ssh import is_valid_public_key, key_fingerprint
 
 
@@ -97,4 +106,78 @@ async def find_ssh_settings(
         or any(
             is_valid_public_key(str(k.get("public_key") or "")) for k in keys if isinstance(k, dict)
         ),
+    }
+
+
+class FindRemoteAccessDoorsArgs(BaseModel):
+    """No arguments — both restrictions are singleton settings."""
+
+    pass
+
+
+@register_tool(
+    name="find_remote_access_doors",
+    description=(
+        "Return BOTH appliance source restrictions together: the Web UI "
+        "allow-list (web_ui_allowed_cidrs) and the SSH allow-list, with "
+        "whether each is actually in force. Use to answer 'is this fleet at "
+        "risk of a console-only lockout?', 'which networks can reach the "
+        "appliance at all?', 'are both remote doors restricted?'. The two are "
+        "independent settings that compose: when BOTH are restricted, only an "
+        "address inside BOTH lists can reach the fleet remotely, and an "
+        "address in neither is left with the physical/serial console. Whether "
+        "a PARTICULAR address is admitted is not answered here — that depends "
+        "on the source address of the request, which a chat client does not "
+        "have; the Fleet screens compute it live."
+    ),
+    args_model=FindRemoteAccessDoorsArgs,
+    category="admin",
+    # Default enabled (NN #13) — read-only, no secrets, no off-prem calls,
+    # and the composition it reports is the one thing neither existing tool
+    # could show. module=None deliberately: find_web_ui_access is tagged
+    # ``appliance.firewall``, so gating this the same way would hide the SSH
+    # half too — exactly the blindness #1013 is about.
+    default_enabled=True,
+    module=None,
+)
+async def find_remote_access_doors(
+    db: AsyncSession, user: User, args: FindRemoteAccessDoorsArgs
+) -> dict[str, Any]:
+    settings = await db.get(PlatformSettings, 1)
+    # ``caller_ip=None`` is honest rather than a placeholder: there is no
+    # request address here, so every ``admits`` below reflects only whether
+    # the door is restricted at all.
+    report = effective_doors(settings, None)
+    web, ssh = report.web_ui, report.ssh
+    if web.restricted and ssh.restricted:
+        summary = (
+            "Both remote doors are source-restricted — the Web UI to "
+            f"{', '.join(web.allowed_cidrs)} and SSH to "
+            f"{', '.join(ssh.allowed_cidrs)}. Only an address inside both "
+            "lists can reach this fleet remotely; anything else is left with "
+            "the appliance console."
+        )
+    elif web.restricted:
+        summary = (
+            f"The Web UI is restricted to {', '.join(web.allowed_cidrs)}; SSH "
+            "is open from any source, so a wrong Web UI list stays recoverable."
+        )
+    elif ssh.restricted:
+        summary = (
+            f"SSH is restricted to {', '.join(ssh.allowed_cidrs)}; the Web UI "
+            "is open from any source, so a wrong SSH list stays recoverable."
+        )
+    else:
+        summary = "Neither remote door is source-restricted."
+    return {
+        "web_ui": {
+            "restricted": web.restricted,
+            "allowed_cidrs": list(web.allowed_cidrs),
+        },
+        "ssh": {
+            "restricted": ssh.restricted,
+            "allowed_cidrs": list(ssh.allowed_cidrs),
+        },
+        "both_restricted": web.restricted and ssh.restricted,
+        "summary": summary,
     }

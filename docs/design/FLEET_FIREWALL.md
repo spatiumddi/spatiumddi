@@ -412,6 +412,19 @@ A new top-level **Firewall** surface under the Fleet sidebar **Services** group 
 > the operator turns lockdown on. The belt-and-braces of line 266 survives in
 > the form that matters — a node whose drop-in never rendered still has the
 > baked sentinel.
+>
+> **What retiring the floor cost, and what paid for it —
+> [#1013](https://github.com/spatiumddi/spatiumddi/issues/1013).** §6.1's
+> LAN-wide floor is named in the risk register (R1, and by implication
+> everything below it) as the mitigation for *other* firewall mistakes,
+> including a bad Web-UI scope from #285 Phase 6. Making it retireable removed
+> that backstop for the one combination where both restrictions exclude the
+> operator, and the two settings' guards could not see each other. Both write
+> paths now resolve one shared question — after this change, does any remote
+> door still admit the caller? — and escalate to a distinct 422 with its own
+> acknowledgement when the answer is no. This section's guarantee therefore
+> holds in the form the register relied on for every install that has not
+> deliberately opted out of it *twice*, in writing.
 
 **6.1 Un-removable management floor.** SSH/22 + ICMP v4/v6 + loopback are emitted **first**, outside any operator-controllable block, AND baked in the base conf (`ssh-floor`). No policy, no `firewall_extra`, no `default_action=drop` can remove them. `compile_firewall` **asserts** the body contains an SSH accept and refuses to ship a body lacking it (returns last-good / floor-only + logs). The write-time lint additionally **rejects any rule whose resolved port atoms include 22 with `action=drop`** so an operator can't even author a self-lockout. `firewall_mgmt_lockdown` is honoured only when `firewall_mgmt_cidrs` is non-empty AND yields a non-empty `ip saddr {…} tcp dport 22 accept`; the backend 422s `lockdown=true` with empty `mgmt_cidrs`. The base-conf floor stays LAN-wide regardless — the irreducible recovery channel.
 

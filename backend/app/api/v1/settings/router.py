@@ -49,6 +49,7 @@ from app.models.settings import (
     PlatformSettings,
 )
 from app.services import audit_forward as audit_forward_svc
+from app.services.appliance.access import console_only_detail, covers, effective_doors
 from app.services.appliance.apt import render_sources_list
 from app.services.appliance.ssh import is_valid_public_key, validate_lockout_safe
 from app.services.appliance.syslog import validate_syslog_filter, validate_syslog_host
@@ -968,9 +969,16 @@ class SettingsUpdate(BaseModel):
     ssh_port: int | None = None
     ssh_allowed_source_networks: list[str] | None = None
     ssh_lockdown: bool | None = None
-    # Not a column — the acknowledgement for the self-lockout pre-flight
-    # below. Popped out of ``changes`` before anything is written.
+    # Neither of these is a column — both are acknowledgements for the
+    # self-lockout pre-flights below, popped out of ``changes`` before
+    # anything is written.
+    #
+    # ``ssh_lockdown_force`` accepts losing THIS door while another remains.
+    # ``acknowledge_console_only`` (#1013) accepts losing EVERY remote door,
+    # which is a materially larger thing and so cannot be satisfied by the
+    # smaller tick — an operator may have sent that one for another reason.
     ssh_lockdown_force: bool | None = None
+    acknowledge_console_only: bool | None = None
     # ── Appliance DNS resolver (issue #158) ───────────────────────
     resolver_mode: str | None = None
     resolver_servers: list[str] | None = None
@@ -1741,40 +1749,6 @@ async def get_settings_defaults(current_user: CurrentUser) -> dict[str, Any]:
     return _column_defaults()
 
 
-def _caller_within_scope(request: Request, cidrs: list[str]) -> bool:
-    """Is the address this request came from inside ``cidrs``? (#1009)
-
-    Uses the same spoofing-resistant value the login throttle and the audit
-    trail use, so a client cannot talk its way past the check with a header.
-
-    Returns True when the address is UNKNOWN. This gate exists to catch an
-    operator typo, not to be a security control — the restriction it guards
-    is enforced by nftables on the host regardless — and refusing every
-    request whose source we cannot read would make the setting unreachable
-    from a deployment shape that hides it. A pre-flight that fails closed on
-    "I could not tell" is one operators learn to force past by reflex, which
-    costs more than it buys.
-    """
-    from ipaddress import ip_address, ip_network  # noqa: PLC0415
-
-    raw = get_trusted_client_ip(request)
-    if not raw:
-        return True
-    try:
-        addr = ip_address(raw)
-    except ValueError:
-        return True
-    for cidr in cidrs:
-        try:
-            if addr in ip_network(str(cidr).strip(), strict=False):
-                return True
-        except ValueError:
-            # Already validated on the way in; a bad entry here cannot make
-            # the caller "covered", so skip it rather than fail the check.
-            continue
-    return False
-
-
 @router.put("", response_model=SettingsResponse)
 async def update_settings(
     body: SettingsUpdate, request: Request, current_user: CurrentUser, db: DB
@@ -1790,9 +1764,10 @@ async def update_settings(
 
     settings = await _get_or_create(db)
     changes = body.model_dump(exclude_none=True)
-    # #1009 — an acknowledgement, not a column. Pop before anything reads
-    # ``changes`` as the set of fields to write or to audit.
+    # #1009 / #1013 — acknowledgements, not columns. Pop before anything
+    # reads ``changes`` as the set of fields to write or to audit.
     changes.pop("ssh_lockdown_force", None)
+    changes.pop("acknowledge_console_only", None)
 
     # CROSS-FIELD merged-state guard for the DNS resolver (#158). The
     # model_validator already rejects override + explicitly-empty servers in
@@ -2090,21 +2065,70 @@ async def update_settings(
         settings.ssh_allowed_source_networks or []
     )
     _lockdown_newly_enforced = _resulting_lockdown and (not _lockdown_was_on or _scope_changing)
+    _caller_ip = get_trusted_client_ip(request)
+    # The membership test below is ``services.appliance.access.covers``. A
+    # ``_caller_within_scope`` helper used to live in this file and was one of
+    # TWO implementations of the same question (#1013), the other being the Web
+    # UI guard's. They agreed on families and disagreed on the case neither
+    # could read: this one counted an unknown address as COVERED and proceeded,
+    # that one counted it as excluded and warned. The shared one counts it as
+    # not covered, which flips this guard in that case — #1009's reason for the
+    # old direction (a gate blocking on "I could not tell" gets forced past by
+    # reflex) was an argument about frequency, and the frequency is near zero:
+    # ``get_trusted_client_ip`` falls back to the ASGI peer address, which
+    # every real HTTP request has.
+    #
+    # #1013 — the escalation, checked BEFORE the per-door guard because it is
+    # the more serious finding and its message subsumes the other's. The Web
+    # UI half is read from storage: this endpoint cannot change it, which is
+    # exactly why neither guard could see the whole picture before.
+    #
+    # Gated on the same transition as the guard below, and for the same
+    # reason: an operator already in this state who adds an authorized key has
+    # not made it worse, and warning them again teaches the tick.
+    _doors_after = effective_doors(
+        settings,
+        _caller_ip,
+        ssh_lockdown=_resulting_lockdown,
+        ssh_cidrs=list(_resulting_scope),
+    )
+    _console_only = _lockdown_newly_enforced and _doors_after.console_only
+    if _console_only and not body.acknowledge_console_only:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=console_only_detail(_doors_after),
+        )
     if (
         _lockdown_newly_enforced
         and _resulting_scope
-        and not body.ssh_lockdown_force
-        and not _caller_within_scope(request, _resulting_scope)
+        # ``_console_only`` here means the acknowledgement above was given.
+        # Accepting "only the console reaches this fleet" already contains
+        # "my SSH access may close", so a second tick for the smaller
+        # statement would be the reflex-training pattern this guard's own
+        # comment warns about. It cannot widen anything: when the escalation
+        # did not fire, this term is False.
+        and not (body.ssh_lockdown_force or _console_only)
+        and not covers(_caller_ip, _resulting_scope)
     ):
+        # Reaching here proves the Web UI still admits this caller: the
+        # condition above IS "the SSH door would not admit you", and had the
+        # Web UI door not admitted you either, the escalation would already
+        # have raised. So this states the surviving path rather than hedging.
+        _web = _doors_after.web_ui
+        _web_desc = (
+            "restricted to " + ", ".join(_web.allowed_cidrs)
+            if _web.restricted
+            else "not source-restricted"
+        )
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=(
                 "Your own address is not inside the allowed networks, so "
                 "enforcing this restriction may close your SSH access to every "
-                "appliance. The console always recovers it; turning the "
-                "restriction back off here only works if you can still reach "
-                "this UI, which a Web UI source restriction may also be "
-                "limiting. Re-send with ssh_lockdown_force to proceed."
+                "appliance. You would still reach this UI to turn it back off "
+                f"(the Web UI is {_web_desc}), and the appliance console "
+                "recovers it either way. Re-send with ssh_lockdown_force to "
+                "proceed."
             ),
         )
     if _ssh_field_in_request and not validate_lockout_safe(

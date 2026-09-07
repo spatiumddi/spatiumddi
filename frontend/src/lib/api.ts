@@ -3674,6 +3674,8 @@ export interface PlatformSettings {
   /** Write-only acknowledgement for the self-lockout pre-flight —
    *  never returned by the API. */
   ssh_lockdown_force?: boolean;
+  /** Accept losing EVERY remote door, leaving only the console (#1013). */
+  acknowledge_console_only?: boolean;
   /** Appliance DNS resolver (issue #158). No secrets — resolver IPs /
    *  search domains are not sensitive, so read + write shapes match.
    *  ``automatic`` defers to per-link NetworkManager / DHCP DNS;
@@ -10972,8 +10974,38 @@ export interface ApplianceInfo {
   self_appliance: SelfApplianceInfo | null;
 }
 
+/**
+ * One remote way in, and whether it admits the caller (#1013).
+ *
+ * The appliance has two source restrictions — the Web UI allow-list and the
+ * SSH allow-list — and each used to be editable from a screen that could not
+ * see the other, so both could be closed one at a time.
+ */
+export interface RemoteDoor {
+  name: "web_ui" | "ssh";
+  restricted: boolean;
+  allowed_cidrs: string[];
+  admits: boolean;
+}
+
+export interface RemoteAccess {
+  caller_ip: string | null;
+  web_ui: RemoteDoor;
+  ssh: RemoteDoor;
+  /** Neither door admits you — the console is all that is left. */
+  console_only: boolean;
+}
+
 export const applianceApi = {
   getInfo: () => api.get<ApplianceInfo>("/appliance/info").then((r) => r.data),
+  /**
+   * Read by BOTH lockout-sensitive screens (Firewall → Web UI access, and
+   * SSH → source restriction) so each can show the state of the OTHER door.
+   * Lives on the always-mounted hub, not under /appliance/firewall, because
+   * the SSH screen must be able to ask with that module off.
+   */
+  getRemoteAccess: () =>
+    api.get<RemoteAccess>("/appliance/remote-access").then((r) => r.data),
 };
 
 // ── Fleet firewall (issue #285 Phase 3) ──────────────────────────────
@@ -11173,7 +11205,10 @@ export const firewallApi = {
     api.get<FirewallWebUIAccess>(`${_FW}/web-ui-access`).then((r) => r.data),
   setWebUIAccess: (body: {
     allowed_cidrs: string[];
+    /** Accept losing THIS door while another remains open. */
     override_lockout?: boolean;
+    /** Accept losing EVERY remote door, leaving only the console (#1013). */
+    acknowledge_console_only?: boolean;
   }) =>
     api
       .put<FirewallWebUIAccess>(`${_FW}/web-ui-access`, body)

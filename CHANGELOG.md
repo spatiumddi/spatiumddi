@@ -57,18 +57,109 @@ the formatter handles the rest.
   operators actually make, caught at the moment they make it
   rather than at their next SSH attempt.
 
-  **The two lockdowns compose, and nothing checks it.** Scope the
-  Web UI *and* enable this with a scope that excludes you, and the
-  console is what remains. Neither setting can see the other, so
-  neither warns; every surface that used to promise SSH as an
-  unconditional recovery path now names the console first and
-  treats SSH as conditional. `test_ssh_recovery_claims.py` asserts
-  on the *claim* rather than its wording — three earlier passes
-  each grepped for the previous phrasing and missed the next
-  paraphrase, and the guard caught two false UI strings that all
-  three had walked past.
+  **The two lockdowns compose.** Scope the Web UI *and* enable
+  this with a scope that excludes you, and the console is what
+  remains. #1009 shipped with neither setting able to see the
+  other, so neither warned; every surface that used to promise SSH
+  as an unconditional recovery path now names the console first
+  and treats SSH as conditional.
+  `scripts/lint_ssh_recovery_claims.py` asserts on the *claim*
+  rather than its wording — three earlier passes each grepped for
+  the previous phrasing and missed the next paraphrase, and the
+  guard caught two false UI strings that all three had walked
+  past. The check that sees both settings at once landed in
+  #1013, below.
 
 ### Security
+
+- **The two source restrictions composed into a console-only
+  lockout, and neither guard could see the other (#1013).** The
+  appliance has two independent ways in and a source allowlist for
+  each — the Web UI (#285 Phase 6) and SSH (#1009). Each shipped
+  with an anti-lockout guard that checked only whether the
+  caller's address was inside *its own* list, so an operator could
+  pass both, one at a time, and end up reachable through neither.
+  That is not an exotic sequence: "lock this box down" means
+  scoping the Web UI to the management network and then scoping
+  SSH to the same one, and if that CIDR is stale both guards fire,
+  both offer an override, and each override is individually
+  reasonable. Nothing at any point said the other door was also
+  closing.
+  Before #1009 it could not happen — the port-22 floor was
+  un-removable, so SSH was the guaranteed recovery path the Web UI
+  guard leaned on. Making that floor retireable is what the SSH
+  allowlist needed in order to mean anything, and it removed the
+  guarantee.
+
+  Both write paths now resolve one shared question through
+  `backend/app/services/appliance/access.py`: **after this change,
+  does any remote door still admit the address I am talking to?**
+  When the answer is no they raise the *same* 422 — one state of
+  the appliance, so one sentence about it — requiring
+  `acknowledge_console_only=true`. Deliberately **not** satisfied
+  by the per-door `override_lockout` / `ssh_lockdown_force`: those
+  accept losing one door while another remains, which is a
+  materially smaller thing, and an operator may have ticked one
+  for an unrelated reason. The implication runs one way only —
+  accepting console-only already contains "this door closes on
+  me", so it is not asked for twice, which would be the
+  reflex-training pattern both guards' own comments warn about.
+  Both screens also read a new `GET /appliance/remote-access` and
+  show the *other* door's state at the point of decision; it sits
+  on the always-mounted `/appliance` hub rather than under
+  `/appliance/firewall`, because the SSH screen must be able to
+  ask with that module off.
+
+  **The per-door refusals got more useful on the way**, because
+  reaching one now *proves* a way in survives: had the other door
+  also excluded the caller, the escalation would have raised
+  first. So each names the surviving path and its scope instead of
+  hedging about it.
+
+  **An address we cannot read is not covered — everywhere.** The
+  two guards had been scoring that case in opposite directions:
+  the Web UI one counted it as excluded and warned, the SSH one as
+  covered and proceeded. Both had a written rationale and the pair
+  was not defensible. The conservative reading wins because the
+  costs are asymmetric — an unneeded warning costs a checkbox, a
+  missing one costs a trip to the console — and because #1009's
+  argument for the other direction ("a gate that blocks on *I
+  could not tell* gets forced past by reflex") was a claim about
+  frequency, and the frequency is near zero: the trusted
+  client-IP helper falls back to the ASGI peer address, which
+  every real HTTP request has.
+
+  **Found on the way:** the Web UI guard was reading `client_ip`,
+  which `core/request_meta` documents as spoofable and explicitly
+  unsuitable for a source-IP allowlist gate. It is also simply the
+  wrong address on a real topology — behind a reverse proxy,
+  uvicorn's `--forwarded-allow-ips *` resolves the browser's own
+  IP out of `X-Forwarded-For` while nftables judges the packet
+  source, which is the proxy — so the guard would clear an
+  operator who was about to be locked out, with no attacker
+  involved. It now reads the same trusted value the SSH guard
+  does.
+
+  **And the console is not universal.** `spatium-console` runs on
+  `tty1` and `ttyS0`; a remote VM with no virtual serial port and
+  no hypervisor console has no floor at all, so an acknowledged
+  console-only lockout there is a rebuild. The escalation says
+  that in as many words rather than describing the console as a
+  recovery path, and `docs/deployment/APPLIANCE.md` now states it.
+
+  Both 422s are routed in the UI by the **acknowledgement field**
+  each one names, not by its prose: a field name is the API
+  contract and the sentence around it is not, and a test pins that
+  the three markers stay mutually exclusive. `WebUIAccessCard` was
+  lifted out of `FirewallTab.tsx` into its own component so it can
+  be rendered in a test — the failure mode on both sides is a
+  modal or a checkbox that never appears, which neither review nor
+  `tsc` can see. 1 MCP tool (`find_remote_access_doors`,
+  read-only, default on): the composition was the one thing
+  neither existing tool could show, since `find_web_ui_access` is
+  tagged `module="appliance.firewall"` and `find_ssh_settings` is
+  not — so with that module off the copilot could see one door and
+  not the other. No migration, no new column.
 
 - **The SSH source-CIDR allowlist was discarded and the port
   opened to the world (#1001).** `spatiumddi-ssh-reload` renders
