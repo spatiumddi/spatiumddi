@@ -240,6 +240,134 @@ PYEOF
             fi
         fi
 
+        # ORDER MATTERS, and this block is deliberately first (#1001).
+        #
+        # The nft fragment is the only thing that opens a NON-22 ssh port, and
+        # both paths below can abort: the renderer now refuses an unparseable
+        # allowlist rather than opening the port to everyone, and `nft -c -f`
+        # has always refused a malformed CIDR. Run after the sshd drop-in was
+        # installed, either abort leaves sshd configured for a port with no
+        # firewall rule — the running daemon keeps the old one because `fail`
+        # exits before reload_sshd, so nothing looks wrong until the next
+        # sshd start or reboot silently locks the operator out.
+        #
+        # So everything that can refuse happens here, while the only artefact
+        # written is this fragment (removed again on the dry-run path). Opening
+        # a port before anything listens on it is harmless; the reverse is the
+        # lockout.
+
+        # SOURCE-SCOPED nft drop-in. sshd has no native source-CIDR filter,
+        # so we scope the configured port at the firewall. Empty CIDR list
+        # = open unconditionally. The port-22 accept floor lives in the
+        # firewall renderer (NOT here), so a bad port change is recoverable.
+        # python3 renders the rule fragment from the JSON CIDR list — same
+        # chain-rule-fragment form the SNMP drop-in uses (the include sits
+        # inside the input chain, so a top-level `add rule` would 422 the
+        # reload).
+        #
+        # #1001 — the CIDR list is passed as ARGV, never piped. ``python3 -``
+        # means "read the program from stdin", so `printf … | python3 - …`
+        # with a heredoc has the pipe and the heredoc both claiming fd 0;
+        # under bash the heredoc (the later redirection) wins outright and
+        # the piped JSON is discarded. That is how this ran until #1001:
+        # every allowlist parsed as EOF, fell into the empty-list branch,
+        # and rendered the UNSCOPED accept — the allowlist silently did
+        # nothing while the UI, the applied sidecar and the nft dry-run all
+        # reported success. Rendering goes to a temp file so a refusal below
+        # cannot leave a truncated fragment where the real rule used to be.
+        #
+        # KNOWN LIMIT, also #1001: on the DEFAULT port this rule is still
+        # dead code. /etc/nftables.conf emits an unconditional
+        # `tcp dport 22 accept` in its management floor, above the include
+        # glob that pulls this file in, and nftables is first-match-wins
+        # (verified against a real kernel). That floor is the deliberate
+        # un-removable recovery channel, so #1001 left it alone — the
+        # allowlist therefore only bites once SSH is moved off 22. The Web UI
+        # handles the same collision by retiring its unconditional accept
+        # when a scope is set (`webui_action` in firewall_renderer.py); doing
+        # that here would turn a wrong CIDR into a console-only recovery, so
+        # it is a decision rather than a fix — tracked as #1009. Pinned by
+        # appliance/tests/test_host_runner_stdin_programs.py.
+        NFT_TMP=$(mktemp /tmp/spatium-ssh-nft.XXXXXX)
+        trap 'rm -f "$BODY_TMP" "$AK_TMP" "$SSHD_TMP" "$TEST_CONF" "$NFT_TMP"; rm -rf "$STAGE_DIR"' EXIT
+        if ! python3 - "$PORT" "$CIDR_JSON" > "$NFT_TMP" <<'PYEOF'
+import json
+import sys
+
+port = int(sys.argv[1])
+raw = sys.argv[2]
+
+# An ABSENT allowlist is a legitimate operator answer meaning "any source" —
+# the control plane sends "[]" when no scoping is configured. An UNPARSEABLE
+# one is not, and must never collapse into it: this fragment IS the
+# enforcement, so treating a bad blob as "open" widens SSH to the whole
+# internet while every surface still reports the allowlist as configured.
+# Refuse instead. The caller turns a non-zero exit into a loud `fail`, and
+# the port-22 accept floor in the firewall renderer keeps a default install
+# reachable while the operator fixes it.
+if raw.strip() in ("", "null"):
+    cidrs = []
+else:
+    try:
+        cidrs = json.loads(raw)
+    except ValueError as exc:
+        print(f"ssh source-CIDR list is not valid JSON: {exc}", file=sys.stderr)
+        sys.exit(1)
+if not isinstance(cidrs, list):
+    print(
+        f"ssh source-CIDR list is a {type(cidrs).__name__}, expected a list",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+v4 = [c for c in cidrs if isinstance(c, str) and ":" not in c]
+v6 = [c for c in cidrs if isinstance(c, str) and ":" in c]
+# A non-empty list that yields no usable entry is the same fail-open shape
+# as unparseable JSON — the operator asked for scoping and would silently
+# get none.
+if cidrs and not v4 and not v6:
+    print(
+        f"ssh source-CIDR list has {len(cidrs)} entries but none are strings "
+        "— refusing to render an unscoped rule",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+print("# Managed by spatiumddi-ssh-reload — do not edit manually.")
+print("# SpatiumDDI manages SSH; this rule opens the configured ssh port,")
+print("# source-scoped to the allowed networks (empty = open). The port-22")
+print("# accept floor lives in the firewall renderer, so a bad port change")
+print("# is recoverable. Removed automatically when SSH management is off.")
+if not v4 and not v6:
+    print(f"tcp dport {port} accept comment \"spatium-ssh\"")
+else:
+    if v4:
+        print(f"tcp dport {port} ip saddr {{ {', '.join(v4)} }} accept comment \"spatium-ssh\"")
+    if v6:
+        print(f"tcp dport {port} ip6 saddr {{ {', '.join(v6)} }} accept comment \"spatium-ssh6\"")
+PYEOF
+        then
+            fail "failed to render ssh nft drop-in"
+        fi
+        install -o root -g root -m 0644 "$NFT_TMP" "$NFT_DROPIN"
+        # Dry-run the FULL ruleset with the new drop-in staged, before we
+        # reload (#550). sshd has no native source filter, so a malformed
+        # CIDR renders an invalid rule; without this check `systemctl
+        # reload nftables` fails atomically and the new port never opens,
+        # and on the next boot the bad fragment fails the whole
+        # transactional `nft -f` (fail-open, no input filtering). Mirror the
+        # firewall runner: validate, and on failure drop the fragment before
+        # erroring so the master config still loads clean. Since #1001 this
+        # runs before the sshd drop-in is installed, so an abort here leaves
+        # the ssh port unchanged rather than moved-but-unreachable.
+        if ! nft -c -f "$NFT_MAIN" 2>/tmp/spatium-ssh-nft-check.err; then
+            sed 's/^/      /' /tmp/spatium-ssh-nft-check.err
+            rm -f "$NFT_DROPIN"
+            systemctl reload nftables.service >/dev/null 2>&1 || true
+            fail "rendered ssh nft drop-in failed nft -c -f — fragment removed"
+        fi
+        nft_reload
+
         # Atomic install of authorized_keys (owned by admin, 0600, dir 0700).
         install -d -o "$ADMIN_USER" -g "$ADMIN_USER" -m 0700 "$(dirname "$AK_FILE")"
         install -o "$ADMIN_USER" -g "$ADMIN_USER" -m 0600 "$AK_TMP" "$AK_FILE"
@@ -255,62 +383,6 @@ PYEOF
         rm -f /etc/ssh/sshd_config.d/10-spatiumddi-password-auth.conf
         install -o root -g root -m 0644 "$SSHD_TMP" "$SSHD_DROPIN"
         echo "  ✓ sshd drop-in installed"
-
-        # SOURCE-SCOPED nft drop-in. sshd has no native source-CIDR filter,
-        # so we scope the configured port at the firewall. Empty CIDR list
-        # = open unconditionally. The port-22 accept floor lives in the
-        # firewall renderer (NOT here), so a bad port change is recoverable.
-        # python3 renders the rule fragment from the JSON CIDR list — same
-        # chain-rule-fragment form the SNMP drop-in uses (the include sits
-        # inside the input chain, so a top-level `add rule` would 422 the
-        # reload).
-        if ! printf '%s' "$CIDR_JSON" | python3 - "$PORT" > "$NFT_DROPIN" <<'PYEOF'
-import json
-import sys
-
-port = int(sys.argv[1])
-try:
-    cidrs = json.load(sys.stdin)
-except Exception:
-    cidrs = []
-if not isinstance(cidrs, list):
-    cidrs = []
-
-print("# Managed by spatiumddi-ssh-reload — do not edit manually.")
-print("# SpatiumDDI manages SSH; this rule opens the configured ssh port,")
-print("# source-scoped to the allowed networks (empty = open). The port-22")
-print("# accept floor lives in the firewall renderer, so a bad port change")
-print("# is recoverable. Removed automatically when SSH management is off.")
-v4 = [c for c in cidrs if isinstance(c, str) and ":" not in c]
-v6 = [c for c in cidrs if isinstance(c, str) and ":" in c]
-if not v4 and not v6:
-    print(f"tcp dport {port} accept comment \"spatium-ssh\"")
-else:
-    if v4:
-        print(f"tcp dport {port} ip saddr {{ {', '.join(v4)} }} accept comment \"spatium-ssh\"")
-    if v6:
-        print(f"tcp dport {port} ip6 saddr {{ {', '.join(v6)} }} accept comment \"spatium-ssh6\"")
-PYEOF
-        then
-            fail "failed to render ssh nft drop-in"
-        fi
-        chmod 0644 "$NFT_DROPIN"
-        # Dry-run the FULL ruleset with the new drop-in staged, before we
-        # reload (#550). sshd has no native source filter, so a malformed
-        # CIDR renders an invalid rule; without this check `systemctl
-        # reload nftables` fails atomically and — if the ssh PORT also
-        # changed — the new port never opens (lockout), and on the next
-        # boot the bad fragment fails the whole transactional `nft -f`
-        # (fail-open, no input filtering). Mirror the firewall runner:
-        # validate, and on failure drop the fragment before erroring so
-        # the master config still loads clean.
-        if ! nft -c -f "$NFT_MAIN" 2>/tmp/spatium-ssh-nft-check.err; then
-            sed 's/^/      /' /tmp/spatium-ssh-nft-check.err
-            rm -f "$NFT_DROPIN"
-            systemctl reload nftables.service >/dev/null 2>&1 || true
-            fail "rendered ssh nft drop-in failed nft -c -f — fragment removed"
-        fi
-        nft_reload
 
         reload_sshd || true
         echo "$HASH" > "$HASH_SIDECAR"

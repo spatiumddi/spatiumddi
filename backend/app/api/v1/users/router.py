@@ -105,8 +105,21 @@ class CreateUserRequest(BaseModel):
     @field_validator("password")
     @classmethod
     def password_length(cls, v: str) -> str:
-        if len(v) < 8:
-            raise ValueError("Password must be at least 8 characters")
+        # #1004 — NOT a length policy. This is the "obviously empty" floor
+        # that keeps a legacy client getting a 422 instead of reaching the
+        # handler; every length verdict belongs to the configured policy,
+        # which the handler enforces against PlatformSettings.
+        #
+        # It used to be 8, which was a SECOND minimum contradicting the
+        # operator's setting (12 by default) — and the only source of the
+        # number 8 anywhere in the flow. Worse, it fired as a pydantic 422
+        # whose detail is an error ARRAY, a shape the change-password screen
+        # did not parse, so a 7-character password was reported as "check
+        # your current password". A floor of 1 cannot collide with a policy
+        # minimum (settings clamp it to 6..128), so the two can never
+        # disagree again.
+        if not v:
+            raise ValueError("Password cannot be empty")
         return v
 
     @field_validator("username")
@@ -142,8 +155,21 @@ class ResetPasswordRequest(BaseModel):
     @field_validator("new_password")
     @classmethod
     def password_length(cls, v: str) -> str:
-        if len(v) < 8:
-            raise ValueError("Password must be at least 8 characters")
+        # #1004 — NOT a length policy. This is the "obviously empty" floor
+        # that keeps a legacy client getting a 422 instead of reaching the
+        # handler; every length verdict belongs to the configured policy,
+        # which the handler enforces against PlatformSettings.
+        #
+        # It used to be 8, which was a SECOND minimum contradicting the
+        # operator's setting (12 by default) — and the only source of the
+        # number 8 anywhere in the flow. Worse, it fired as a pydantic 422
+        # whose detail is an error ARRAY, a shape the change-password screen
+        # did not parse, so a 7-character password was reported as "check
+        # your current password". A floor of 1 cannot collide with a policy
+        # minimum (settings clamp it to 6..128), so the two can never
+        # disagree again.
+        if not v:
+            raise ValueError("Password cannot be empty")
         return v
 
 

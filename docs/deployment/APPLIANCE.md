@@ -251,6 +251,33 @@ state on its heartbeat:
   earlier `# spatium:cp-size` marked-line regex rewriter, which lost its
   edits on every seed reboot — the systemic durability bug fixed in
   `083f8d2`.)
+
+  Since [#1005](https://github.com/spatiumddi/spatiumddi/issues/1005) the
+  supervisor does **not** write that CR when the HelmChart already carries
+  every value it would set. Merging a Config that changes nothing still
+  records a helm revision and runs a second helm-install Job, so every fresh
+  control-plane install used to end at `v2` for no reason. The comparison is
+  on the **effective** values — `deep_merge(chart, config)` — so it skips
+  whenever merging the supervisor's keys in would leave them exactly as they
+  are, whether or not a Config already exists.
+
+  Deliberately **not** restricted to the create case. `chart_bump`'s
+  `_patch_image_tag` *creates* this CR carrying only `image.tag` to roll the
+  control plane to a new version, so from the next heartbeat — at most 30 s
+  later, i.e. mid-upgrade — a create-only guard would be bypassed and would
+  PATCH every owned key in while the tag-bump apply is still in flight. That
+  moves the redundant write to the worst possible moment instead of removing
+  it. Skipping stays safe with a Config present precisely because it is a
+  skip: nothing is replaced, so `image.tag` cannot be dropped. An unreadable
+  HelmChart falls through to the write — suppressing a needed override is
+  worse than writing a redundant one.
+
+  This only works while firstboot renders every key the supervisor overrides,
+  which is a coupling with nothing structural holding it together:
+  `agent/supervisor/tests/test_helmchartconfig_noop.py` executes firstboot's
+  real `_render_control_helmchart` and fails, naming the keys, if the merge
+  stops being a no-op. Add an override key without rendering it in firstboot
+  and every install silently goes back to two revisions.
 - **MetalLB / VIP (Phase 7c).** The operator's pool + VIP live on the
   `platform_settings` singleton (`metallb_enabled` /
   `metallb_pool_addresses` / `control_plane_vip`); the seed supervisor

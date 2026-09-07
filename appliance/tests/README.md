@@ -19,7 +19,9 @@ helm or a cluster.
 | `test_frontend_boot_gate.py` | SPA fallback landing on the initialising page (#767) |
 | `test_grub_render.py` | `spatium-grub-render` renderer via `--print` (DRY-RUN) |
 | `test_host_migrate.py` | `spatium-host-migrate` orchestrator via a patched subprocess |
+| `test_host_runner_stdin_programs.py` | The three runners that piped data into a `python3 -` whose program came from a heredoc — the SSH source-CIDR allowlist failing OPEN, TLS-syslog CAs, image pruning (#1001) |
 | `test_install_done_gate.py` | The headless-install Done-screen gate |
+| `test_install_ntp_decline.py` | Blanking the installer's **Time source** really disabling NTP — the rendered on-target `chrony.conf` plus firstboot's explicit-decline sentinel (#1002) |
 | `test_preseed_lint.py` | `spatium-install --check-preseed` linter |
 | `test_preseed_security.py` | The #549 preseed installer's security guards (#581) |
 | `test_slot_status_active_version.py` | `spatium-upgrade-slot status` reading the active slot's version without a mount (#788) |
@@ -38,6 +40,11 @@ pytest -v
 
 `grub-script-check` tests are automatically skipped when the binary is not
 on PATH (install `grub2-common` / `grub-common` to enable them).
+
+The `test_install_ntp_decline.py` cases that execute the installer's
+`sed -i -E` skip on macOS: BSD sed takes `-i`'s backup suffix as the next
+argument and swallows the `-E`, so it would measure a different program
+than the Debian appliance runs. CI is ubuntu-latest, where they always run.
 
 ## Notes
 

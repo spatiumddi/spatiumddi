@@ -767,16 +767,72 @@ ask_ntp() {
     NTP_SERVERS="$ntp_pick"
     # Empty is a legitimate answer: an air-gapped site with a hardware
     # clock it trusts, or one that will push NTP from the control plane
-    # later. It writes no sources file — which is NOT the same as no time
-    # source, because Debian's chrony.conf keeps its own `pool` directive
-    # and sources.d is additive. Every surface says so rather than
-    # claiming "none"; making blank actually mean none is #1002.
+    # later. Since #1002 it means exactly that — no sources file, Debian's
+    # own `pool` line and the DHCP sourcedir commented out, and
+    # platform_settings.ntp_pool_servers seeded EMPTY so the #154 plane does
+    # not push the public pool back a few minutes into the first boot.
     break
     done
     if [ -z "$NTP_SERVERS" ]; then
         log "NTP: no servers configured (operator left it blank)"
     else
         log "NTP servers: $NTP_SERVERS"
+    fi
+}
+
+# #1002 — make a blank Time source answer mean what it says.
+#
+# Removing our sources.d file does NOT stop chrony. Debian's own
+# /etc/chrony/chrony.conf carries `pool 2.debian.pool.ntp.org iburst`, and
+# `sourcedir` is additive — so an operator who cleared the field kept
+# synchronising against the public Debian pool while four surfaces told them
+# there was no time source. Non-negotiable #17: that is an outbound
+# connection they explicitly declined.
+#
+# The DHCP sourcedir goes too, and deliberately. The prompt PRE-FILLS the
+# field with the servers the lease offered and shows them as a hint, so
+# clearing it is an explicit rejection of exactly those. Leaving
+# /run/chrony-dhcp live would also make "none" false again the moment
+# NetworkManager renewed a lease carrying option 42.
+#
+# `sourcedir /etc/chrony/sources.d` and `confdir /etc/chrony/conf.d` are
+# left alone: both are empty here (our own file is removed just above) and
+# they are the way back for an operator who changes their mind without
+# hand-editing a conffile.
+#
+# chrony DOES have a confdir on Debian stable — contrary to the issue text —
+# but it is additive like sourcedir, so nothing dropped into it can retract
+# a `pool` line. Suppression has to happen in chrony.conf, which is a dpkg
+# conffile; the edit is therefore marked, line-preserving and reversible by
+# deleting the marker prefix, and dpkg's default (--force-confold) keeps it
+# across a chrony package upgrade.
+#
+# It composes with #154 because that runner REPLACES chrony.conf wholesale:
+# central config simply wins. The platform renderer emits no `sourcedir` at
+# all, which is why the same answer must ALSO reach
+# platform_settings.ntp_pool_servers as [] — see INITIAL_NTP_SERVERS below
+# and models.settings.NTP_EXPLICITLY_NONE. Verified against chrony 4.6.1:
+# `chronyd -p -f` still passes, the daemon starts with zero sources, and
+# `chronyc tracking` reports "Not synchronised", which is the truth.
+NTP_DECLINED_MARK="# spatium-install (#1002): time source declined by the operator — "
+_suppress_default_ntp_sources() {
+    local conf="$1" before after
+    if [ ! -f "$conf" ]; then
+        log "NTP: $conf absent, nothing to suppress"
+        return 0
+    fi
+    before=$(grep -cE '^[[:space:]]*(pool|server|peer)[[:space:]]+|^[[:space:]]*sourcedir[[:space:]]+/run/chrony-dhcp' "$conf" || true)
+    sed -i -E \
+        -e "s%^([[:space:]]*(pool|server|peer)[[:space:]]+.*)\$%${NTP_DECLINED_MARK}\1%" \
+        -e "s%^([[:space:]]*sourcedir[[:space:]]+/run/chrony-dhcp.*)\$%${NTP_DECLINED_MARK}\1%" \
+        "$conf"
+    after=$(grep -cE '^[[:space:]]*(pool|server|peer)[[:space:]]+|^[[:space:]]*sourcedir[[:space:]]+/run/chrony-dhcp' "$conf" || true)
+    if [ "$after" -ne 0 ]; then
+        # Not fatal — a clock that keeps syncing is not a broken install —
+        # but it must not be silent, because every surface now says "none".
+        log "WARN: NTP: $after source line(s) still active in $conf after suppression"
+    else
+        log "NTP: suppressed $before default source line(s) in chrony.conf (operator declined)"
     fi
 }
 
@@ -2771,7 +2827,7 @@ confirm() {
         s+="Keyboard:    $KEYMAP\n"
     fi
     if [ -z "$NTP_SERVERS" ]; then
-        s+="Time source: none given - Debian's default pool still applies\n"
+        s+="Time source: none - chrony left with no sources\n"
     elif [ "$NTP_SERVERS" != "pool.ntp.org" ]; then
         s+="Time source: $NTP_SERVERS\n"
     fi
@@ -2862,7 +2918,7 @@ confirm() {
         "ask_ssh_keys"  "SSH keys           $nkeys authorised" \
         "ask_network"   "Network            $NET_MODE" \
         "ask_timezone"  "Timezone           $(_ellipsis "$TIMEZONE" "$_CONF_VAL_COLS")" \
-        "ask_ntp"       "Time source        $(_ellipsis "${NTP_SERVERS:-Debian default pool}" "$_CONF_VAL_COLS")" \
+        "ask_ntp"       "Time source        $(_ellipsis "${NTP_SERVERS:-none}" "$_CONF_VAL_COLS")" \
         "ask_keyboard"  "Keyboard           $KEYMAP" \
         "install"       "*** INSTALL - $([ "$KEEP_VAR" = yes ] && echo "reinstall" || echo "erase") $TARGET_DISK ***" \
         3>&1 1>&2 2>&3) \
@@ -4131,17 +4187,13 @@ EOF
             chmod 0644 "$MOUNT/etc/chrony/sources.d/spatium-install.sources"
             log "NTP sources written: $NTP_SERVERS"
         else
-            # An empty answer is a real choice (air-gapped, trusted RTC)
-            # and we honour it by writing no sources file. It does NOT
-            # silence chrony: `pool` in Debian's own chrony.conf is still
-            # there, and sources.d is additive, so the host keeps reaching
-            # the public pool. Suppressing that needs an edit to a dpkg
-            # conffile and a decision about DHCP-supplied servers in
-            # /run/chrony-dhcp — #1002. Do not let this comment drift from
-            # the log line below it again: it once claimed the opposite of
-            # what the code does, three lines above the line saying so.
+            # An empty answer is a real choice (air-gapped, trusted RTC) and
+            # since #1002 it MEANS no time source: our sources file goes, and
+            # so do Debian's own `pool` line and the DHCP sourcedir. See
+            # _suppress_default_ntp_sources for why the conffile edit is the
+            # only place this can happen and how it composes with #154.
             rm -f "$MOUNT/etc/chrony/sources.d/spatium-install.sources"
-            log "NTP: no operator sources (Debian's default pool still applies from chrony.conf)"
+            _suppress_default_ntp_sources "$MOUNT/etc/chrony/chrony.conf"
         fi
 
         # #995 item 18 — the admin's authorized_keys, written after

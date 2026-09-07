@@ -670,6 +670,67 @@ def _deep_merge(base: dict, overlay: dict) -> dict:
     return out
 
 
+def _values_content_doc(path: str, *, kind: str, name: str) -> dict | None:
+    """Shared reader for a helm.cattle.io CR's ``spec.valuesContent``.
+
+    ``kind`` only names the log event (``helmchart`` / ``helmchartconfig``);
+    the semantics below are identical for both and must stay that way — the
+    HelmChart read added in #1005 decides whether to SKIP a write, so a
+    lenient reading of an unreadable document there suppresses an override
+    rather than merely writing a redundant one."""
+    try:
+        st, resp = _request("GET", path)
+    except (RuntimeError, OSError) as exc:
+        log.warning(f"supervisor.{kind}.read_failed", chart=name, error=str(exc))
+        return None
+    if st == 404:
+        return {}
+    if st != 200:
+        log.warning(f"supervisor.{kind}.read_failed", chart=name, status=st)
+        return None
+    try:
+        raw = (json.loads(resp).get("spec") or {}).get("valuesContent") or ""
+    except (json.JSONDecodeError, ValueError):
+        log.warning(f"supervisor.{kind}.unparseable_body", chart=name)
+        return None
+    if not str(raw).strip():
+        return {}
+    try:
+        doc = yaml.safe_load(raw)
+    except yaml.YAMLError as exc:
+        log.warning(f"supervisor.{kind}.unparseable_values", chart=name, error=str(exc))
+        return None
+    if not isinstance(doc, dict):
+        # A list or scalar at the top level is not something we can merge
+        # into. Refusing beats replacing it with our own keys and calling
+        # the operator's document a typo.
+        log.warning(f"supervisor.{kind}.values_not_a_mapping", chart=name)
+        return None
+    return doc
+
+
+def _helmchart_values(name: str, *, namespace: str = "kube-system") -> dict | None:
+    """Parsed ``spec.valuesContent`` of the **HelmChart** CR (the k3s
+    auto-deploy manifest firstboot writes), as opposed to the
+    HelmChartConfig the supervisor owns.
+
+    #1005 — helm-controller merges the Config on top of the Chart, so a
+    Config whose keys the Chart already satisfies changes nothing about the
+    rendered release and exists only to add a helm revision. Reading the
+    Chart is what lets the supervisor tell those two cases apart.
+
+    Same ``None`` = "unknown, do not act on this" contract as
+    ``_helmchartconfig_doc``: an unreadable Chart must not be mistaken for
+    an empty one, or the skip below would never fire — which is merely
+    today's behaviour — but, worse, a Chart we half-read could look like it
+    already agrees."""
+    path = (
+        f"/apis/helm.cattle.io/v1/namespaces/{quote(namespace)}"
+        f"/helmcharts/{quote(name)}"
+    )
+    return _values_content_doc(path, kind="helmchart", name=name)
+
+
 def _helmchartconfig_doc(name: str, *, namespace: str = "kube-system") -> dict | None:
     """Current ``spec.valuesContent`` of the HelmChartConfig, parsed.
 
@@ -695,39 +756,7 @@ def _helmchartconfig_doc(name: str, *, namespace: str = "kube-system") -> dict |
         f"/apis/helm.cattle.io/v1/namespaces/{quote(namespace)}"
         f"/helmchartconfigs/{quote(name)}"
     )
-    try:
-        st, resp = _request("GET", path)
-    except (RuntimeError, OSError) as exc:
-        log.warning(
-            "supervisor.helmchartconfig.read_failed", chart=name, error=str(exc)
-        )
-        return None
-    if st == 404:
-        return {}
-    if st != 200:
-        log.warning("supervisor.helmchartconfig.read_failed", chart=name, status=st)
-        return None
-    try:
-        raw = (json.loads(resp).get("spec") or {}).get("valuesContent") or ""
-    except (json.JSONDecodeError, ValueError):
-        log.warning("supervisor.helmchartconfig.unparseable_body", chart=name)
-        return None
-    if not str(raw).strip():
-        return {}
-    try:
-        doc = yaml.safe_load(raw)
-    except yaml.YAMLError as exc:
-        log.warning(
-            "supervisor.helmchartconfig.unparseable_values", chart=name, error=str(exc)
-        )
-        return None
-    if not isinstance(doc, dict):
-        # A list or scalar at the top level is not something we can merge
-        # into. Refusing beats replacing it with our own keys and calling
-        # the operator's document a typo.
-        log.warning("supervisor.helmchartconfig.values_not_a_mapping", chart=name)
-        return None
-    return doc
+    return _values_content_doc(path, kind="helmchartconfig", name=name)
 
 
 def _slot_image_mirror_enabled(cp_size: int, current_doc: dict) -> bool:
@@ -959,6 +988,51 @@ def apply_control_plane_overrides(
     # logical document now produce byte-identical strings and the upsert's
     # idempotent compare finally holds.
     merged = _deep_merge(current_doc, owned)
+
+    # #1005 — do not write a HelmChartConfig that changes nothing.
+    #
+    # helm-controller merges the Config on top of the HelmChart, and since
+    # #1003 item 4 firstboot renders the same sizing the supervisor would.
+    # So the first heartbeat of every control-plane install used to create a
+    # CR whose every key the Chart already carried — no Deployment changed,
+    # but helm still recorded revision 2 and ran a second helm-install Job.
+    # ``_helmchartconfig_upsert`` could not catch it: its idempotence is
+    # against the CR's own previous body, and on a fresh boot there is none.
+    #
+    # So the comparison is on the EFFECTIVE values — what helm actually
+    # renders — rather than on the CR alone: skip when merging ``owned`` in
+    # leaves ``deep_merge(chart, config)`` exactly as it already is.
+    #
+    # Deliberately not restricted to the create case. A create-only guard
+    # would hand the write to the worst possible moment instead of removing
+    # it: ``chart_bump._patch_image_tag`` creates this CR carrying only
+    # ``image.tag`` to roll the control plane to a new version, and from the
+    # next heartbeat — at most 30 s later, i.e. mid-upgrade — ``current_doc``
+    # is truthy, so a create-only guard is bypassed and every owned key is
+    # PATCHed in while the tag-bump apply is still in flight. Before #1005
+    # that write did not happen at all, because the CR already carried those
+    # keys and the rendered document was byte-identical.
+    #
+    # Skipping is safe with a Config present precisely because it is a skip:
+    # nothing is replaced, so the keys we do not own (``image.tag``) cannot
+    # be dropped. And it self-heals — a slot upgrade that ships a chart with
+    # different defaults makes the comparison differ, and the next heartbeat
+    # writes. In practice the skip only ever fires on a single-node control
+    # plane, since ``cp_size`` is the one value firstboot cannot know and any
+    # promote puts the Config ahead of the Chart for good.
+    #
+    # An unreadable Chart falls through to the write: writing a redundant CR
+    # is the status quo, suppressing a needed one is not.
+    chart_values = _helmchart_values("spatium-control")
+    if chart_values is not None and _deep_merge(chart_values, merged) == _deep_merge(
+        chart_values, current_doc
+    ):
+        log.info(
+            "supervisor.helmchartconfig.write_skipped",
+            chart="spatium-control",
+            reason="the HelmChart already carries every overridden value",
+        )
+        return False, None
     values = yaml.safe_dump(merged, sort_keys=True, default_flow_style=False)
     return _helmchartconfig_upsert("spatium-control", values)
 

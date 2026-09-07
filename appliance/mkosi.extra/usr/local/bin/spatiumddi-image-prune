@@ -60,13 +60,26 @@ echo "[$(date -Iseconds)] image-prune start — /var $(var_use)"
 # appliance (same as the snmp / apt runners). It reads crictl's JSON +
 # slot-versions.json and prints one image ID per line to remove; on any
 # uncertainty it prints nothing (fail-safe → no removals).
+#
+# #1001 — the image inventory reaches python via a temp FILE, not a pipe.
+# ``python3 -`` reads the PROGRAM from stdin, so `crictl … | python3 - …`
+# with a heredoc had the pipe and the heredoc both claiming fd 0; under
+# bash the heredoc won and the inventory was discarded, json.load() hit
+# EOF, and the documented fail-safe `except: sys.exit(0)` turned that into
+# "nothing to prune" — silently, on every run since this shipped. A file
+# rather than argv because the inventory is unbounded (ARG_MAX), unlike
+# the CIDR list and the CA blob.
+IMAGES_JSON=$(mktemp /tmp/spatium-image-prune.XXXXXX)
+trap 'rm -f "$IMAGES_JSON"' EXIT
+k3s crictl images -o json > "$IMAGES_JSON" 2>/dev/null || true
 mapfile -t TO_REMOVE < <(
-    k3s crictl images -o json 2>/dev/null | python3 - "$SLOT_VERSIONS" <<'PYEOF'
+    python3 - "$SLOT_VERSIONS" "$IMAGES_JSON" <<'PYEOF'
 import json, subprocess, sys
 
 slot_versions_path = sys.argv[1]
 try:
-    images = json.load(sys.stdin).get("images", [])
+    with open(sys.argv[2], encoding="utf-8") as fh:
+        images = json.load(fh).get("images", [])
 except Exception:
     sys.exit(0)  # crictl unavailable / bad JSON → keep everything
 
