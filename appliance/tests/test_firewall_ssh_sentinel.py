@@ -28,6 +28,7 @@ No appliance, no nftables, no root — this reads the shipped files.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
@@ -42,6 +43,18 @@ BASE_CONF = REPO / "appliance/mkosi.extra/etc/nftables.conf"
 
 def _text(p: Path) -> str:
     return p.read_text(encoding="utf-8")
+
+
+def _one(p: Path, pattern: str) -> str:
+    """The single regex capture in ``p``, or a loud failure.
+
+    Deliberately asserts on the match count: a renamed or reformatted
+    declaration must fail the extraction rather than quietly yield the first
+    of several, or none.
+    """
+    hits = re.findall(pattern, _text(p), re.MULTILINE)
+    assert len(hits) == 1, f"{p.name}: {pattern!r} matched {len(hits)}x"
+    return hits[0]
 
 
 def _rules(p: Path) -> list[str]:
@@ -81,11 +94,27 @@ def test_it_is_a_bare_rule_like_its_sibling() -> None:
 def test_it_sorts_before_the_scoped_rule_and_the_supervisor_drop_in() -> None:
     """Ordering IS the mechanism, in both directions.
 
-    While present it must win over ``50-spatium-ssh.nft`` (that is what makes
-    it a floor); once retired, the scoped rule is what remains.
+    While present the floor must win over ``50-spatium-ssh.nft`` (that is what
+    makes it a floor); once retired, the scoped rule is what remains, and it
+    must in turn win over the management line in ``spatium-role.nft``.
+
+    The three names are read from the places that actually produce them — the
+    shipped file on disk, and the two runners' own path constants — rather
+    than restated here. A test that sorts its own literals exercises
+    ``sorted()``: rename the sentinel to ``60-…`` and lockdown silently stops
+    enforcing, with the literal version still green.
     """
-    names = sorted(["00-spatium-ssh.nft", "50-spatium-ssh.nft", "spatium-role.nft"])
-    assert names == ["00-spatium-ssh.nft", "50-spatium-ssh.nft", "spatium-role.nft"]
+    floor = SENTINEL.name
+
+    scoped = _one(SSH_RELOAD, r"^NFT_DROPIN=/etc/nftables\.d/(\S+)$")
+    role = _one(RELOAD, r"^DROP_IN=/etc/nftables\.d/(\S+)$")
+
+    glob_order = sorted([floor, scoped, role])
+    assert glob_order == [floor, scoped, role], (
+        f"the include glob applies these in the order {glob_order}, but the "
+        f"mechanism needs floor({floor}) < scoped({scoped}) < role({role}) — "
+        "nftables accepts on first match"
+    )
 
 
 def test_the_base_conf_no_longer_opens_22_itself() -> None:

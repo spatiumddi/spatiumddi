@@ -2072,9 +2072,26 @@ async def update_settings(
     # SSHing from another is legitimate — but it must be acknowledged, since
     # the alternative is discovering it at the next SSH attempt. Superadmin
     # forces past it with ``ssh_lockdown_force``.
+    #
+    # Gated on the TRANSITION, not on the resulting state. Keyed on the
+    # latter it fires on every ``ssh_*`` save made while lockdown is already
+    # on — adding a key, changing the port — demanding an acknowledgement for
+    # a change that alters nothing about who can reach the box. An operator
+    # asked to accept a lockout warning for an unrelated edit learns to tick
+    # it without reading, which costs more than the warning buys.
+    #
+    # Two transitions introduce the risk: turning it on, and narrowing the
+    # scope while it is on. Both are re-checked against the caller's address
+    # even when the OLD scope already excluded them, since the fix for that
+    # is a save that includes them and it should stop warning the moment it
+    # does.
+    _lockdown_was_on = bool(settings.ssh_lockdown)
+    _scope_changing = "ssh_allowed_source_networks" in changes and list(_resulting_scope) != list(
+        settings.ssh_allowed_source_networks or []
+    )
+    _lockdown_newly_enforced = _resulting_lockdown and (not _lockdown_was_on or _scope_changing)
     if (
-        _ssh_field_in_request
-        and _resulting_lockdown
+        _lockdown_newly_enforced
         and _resulting_scope
         and not body.ssh_lockdown_force
         and not _caller_within_scope(request, _resulting_scope)

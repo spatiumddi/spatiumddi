@@ -2231,6 +2231,26 @@ suggestion, free-space treemap.
   never heard of the flag does the safe thing by construction. Behaviour also
   stops depending on the port number, which was the real defect: post-#1001 it
   enforced on a moved port and not on 22.
+  **/code-review found six, and the first re-created the bug one layer down.**
+  The ssh bundle's `config_hash` — the only thing that re-fires the host
+  runner — was sha256 over the authorized-keys and sshd-config bodies, and the
+  scope appears in neither (it is an nftables scope, not an sshd directive).
+  Harmless while the scoped rule was dead code; not harmless now: toggling
+  lockdown changed the effective scope and nothing else, so the hash was
+  unchanged, the trigger never fired, and `50-spatium-ssh.nft` kept its
+  UNCONDITIONAL accept — which sorts ahead of the scoped management line —
+  while the firewall plane had already retired the floor. SSH open from
+  anywhere, every surface reporting it restricted. The hash now covers the
+  scope and the port. Also: the UI matched on `err.message`, which on an
+  AxiosError is always `Request failed with status code 422` and never the
+  FastAPI detail — so the acknowledgement modal could never open and
+  `ssh_lockdown_force` was unreachable from the product; removing the last
+  CIDR under lockdown left the toggle checked AND disabled, with Save 422ing
+  and no way out; the self-lockout pre-flight gated on the resulting state
+  rather than the transition, demanding an acknowledgement on every later
+  `ssh_*` save; the force flag latched on a save that failed for any other
+  reason; and the ordering test sorted its own literals, so it exercised
+  `sorted()` and could never catch the rename that would silently un-enforce.
   Two refusals on the way in — enforcing with an empty list (that closes SSH
   from everywhere rather than restricting it, the 422 §6.1 already specified),
   and enforcing from an address the list does not cover, which is advisory

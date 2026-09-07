@@ -3,6 +3,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { AlertCircle, Plus, Trash2 } from "lucide-react";
 
 import {
+  formatApiError,
   settingsApi,
   type PlatformSettings,
   type SshAuthorizedKey,
@@ -122,9 +123,6 @@ export function SSHSection({
 
   const [saveErr, setSaveErr] = useState<string | null>(null);
   const [savedAt, setSavedAt] = useState<number | null>(null);
-  // Set only after the operator confirms the server's self-lockout warning;
-  // cleared on every successful save so it can never be sticky.
-  const [lockdownForced, setLockdownForced] = useState(false);
   const [confirmLockout, setConfirmLockout] = useState<string | null>(null);
 
   const mutation = useMutation({
@@ -139,11 +137,14 @@ export function SSHSection({
       setLockdown(updated.ssh_lockdown ?? false);
       setSaveErr(null);
       setSavedAt(Date.now());
-      setLockdownForced(false);
       setTimeout(() => setSavedAt(null), 2500);
     },
     onError: (err: unknown) => {
-      const msg = err instanceof Error ? err.message : String(err);
+      // formatApiError, NOT err.message: on an AxiosError the latter is
+      // always "Request failed with status code 422" and never the FastAPI
+      // detail, so matching on it below would never fire and the
+      // acknowledgement would be unreachable from the UI entirely.
+      const msg = formatApiError(err, "Failed to save");
       // The self-lockout pre-flight is a question, not a failure — surface
       // it as a confirmation the operator can accept, with the server's own
       // wording rather than a paraphrase that could drift from it.
@@ -169,11 +170,12 @@ export function SSHSection({
       ssh_allowed_source_networks: sources.map((s) => s.trim()).filter(Boolean),
       ssh_lockdown: lockdown,
     };
-    // #1009 — the server refuses turning enforcement on from an address the
-    // allowlist does not cover, which is the mistake operators actually
-    // make. Confirming here re-sends with the acknowledgement rather than
-    // silently forcing: the operator has to read what they are accepting.
-    if (lockdownForced) patch.ssh_lockdown_force = true;
+    // No acknowledgement here, ever. The server refuses turning enforcement
+    // on from an address the allowlist does not cover; the ONLY path that
+    // sends ``ssh_lockdown_force`` is the confirm modal's own re-send, so
+    // each forced save is one the operator has just read and accepted. A
+    // remembered flag would latch on a save that failed for some other
+    // reason and silently force every later one.
     mutation.mutate(patch);
   }
 
@@ -449,16 +451,27 @@ export function SSHSection({
               )}
             </div>
           </div>
+          {/* Only turning it ON needs a CIDR. Gating both directions on the
+              list left an operator who removed their last CIDR with the
+              toggle checked AND disabled: Save then 422s, and there is no
+              way out without re-adding a CIDR or reloading the page. */}
           <Toggle
+            label="Enforce source restriction"
             checked={lockdown}
             onChange={setLockdown}
-            disabled={!isSuperadmin || sources.length === 0}
+            disabled={!isSuperadmin || (!lockdown && sources.length === 0)}
           />
         </div>
         {sources.length === 0 && (
-          <div className="mt-2 text-xs text-muted-foreground">
-            Add at least one network above first &mdash; enforcing an empty list
-            would close SSH from everywhere.
+          <div
+            className={cn(
+              "mt-2 text-xs",
+              lockdown ? "text-destructive" : "text-muted-foreground",
+            )}
+          >
+            {lockdown
+              ? "Enforcement is on with no networks listed — add one, or turn enforcement off. Saving as-is is refused, because it would close SSH from everywhere."
+              : "Add at least one network above first — enforcing an empty list would close SSH from everywhere."}
           </div>
         )}
       </div>
@@ -499,11 +512,8 @@ export function SSHSection({
         loading={mutation.isPending}
         onConfirm={() => {
           setConfirmLockout(null);
-          setLockdownForced(true);
-          // The acknowledgement rides the NEXT save, so re-issue it here
-          // rather than asking the operator to press Save again — and read
-          // the flag from a local rather than from state, which has not
-          // committed yet.
+          // Re-issue the save with the acknowledgement attached, rather than
+          // remembering it and asking the operator to press Save again.
           mutation.mutate({
             ssh_authorized_keys: keys.map((k) => ({
               name: k.name.trim(),

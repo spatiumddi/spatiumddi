@@ -281,7 +281,10 @@ def ssh_bundle(settings: PlatformSettings) -> dict[str, Any]:
       * ``enabled`` — True unless this is the pristine default state
         (password auth on + no managed keys). The host runner uses this
         to decide between applying the drop-in and tearing it back down.
-      * ``config_hash`` — sha256 over ``authorized_keys + sshd_conf`` so
+      * ``config_hash`` — sha256 over every input the host runner renders
+        from: the two file bodies PLUS the ssh port and the effective source
+        scope (see below — the scope reaches neither body, and omitting it
+        meant a lockdown toggle never re-fired the runner). Hashed so
         any change to either body shifts the agent/supervisor ETag.
       * ``authorized_keys`` — the rendered authorized_keys body (always
         rendered so a disable still ships an empty-keys body the runner
@@ -318,7 +321,38 @@ def ssh_bundle(settings: PlatformSettings) -> dict[str, Any]:
     )
     enabled = not is_default
     body = authorized_keys + sshd_conf
-    config_hash = hashlib.sha256(body.encode("utf-8")).hexdigest() if enabled else ""
+    # The hash is the ONLY thing that re-fires the host runner
+    # (``_fire_host_config`` short-circuits on an unchanged one), so it has to
+    # cover every input the runner renders from — not just the two file bodies
+    # it happens to be built out of.
+    #
+    # ``allowed_source_networks`` appears in NEITHER body: it is an nftables
+    # scope, not an sshd directive. Before #1009 that was harmless, because
+    # the drop-in it feeds was dead code on port 22 anyway. It is not harmless
+    # now: toggling ``ssh_lockdown`` changes the effective scope and nothing
+    # else, so the hash would be unchanged, the trigger would not fire, and
+    # ``50-spatium-ssh.nft`` would keep its UNCONDITIONAL accept — which sorts
+    # ahead of the scoped management line — while the firewall plane had
+    # already retired the port-22 floor. SSH open from anywhere, every surface
+    # reporting it restricted: the exact #1009 bug, re-created one layer down.
+    #
+    # The port is folded in defensively. It does reach ``sshd_conf`` today, so
+    # this is belt-and-braces rather than a fix — but it is the other value
+    # the nft drop-in renders from, and the coupling that makes it safe to
+    # omit is not one this function states anywhere.
+    #
+    # Consequence, and it is intended: the formula changed, so every install
+    # sees one hash change on upgrade and re-fires the trigger once. The apply
+    # is idempotent and the runner compares byte-for-byte, so the cost is one
+    # no-op reload.
+    hash_input = "\n".join(
+        [
+            body,
+            f"port={int(settings.ssh_port or 22)}",
+            "scope=" + ",".join(effective_ssh_scope(settings)),
+        ]
+    )
+    config_hash = hashlib.sha256(hash_input.encode("utf-8")).hexdigest() if enabled else ""
     return {
         "enabled": enabled,
         "config_hash": config_hash,
