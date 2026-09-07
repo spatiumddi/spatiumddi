@@ -987,7 +987,9 @@ def apply_control_plane_overrides(
     # chart_bump uses fixes the churn, because two agents writing the same
     # logical document now produce byte-identical strings and the upsert's
     # idempotent compare finally holds.
-    # #1005 — do not CREATE a HelmChartConfig that changes nothing.
+    merged = _deep_merge(current_doc, owned)
+
+    # #1005 — do not write a HelmChartConfig that changes nothing.
     #
     # helm-controller merges the Config on top of the HelmChart, and since
     # #1003 item 4 firstboot renders the same sizing the supervisor would.
@@ -997,22 +999,40 @@ def apply_control_plane_overrides(
     # ``_helmchartconfig_upsert`` could not catch it: its idempotence is
     # against the CR's own previous body, and on a fresh boot there is none.
     #
-    # Only when there is no Config yet. Once one exists the upsert's compare
-    # is the right test, and skipping here would be wrong anyway — the Config
-    # holds keys we do not own (``image.tag``) that must not be dropped.
+    # So the comparison is on the EFFECTIVE values — what helm actually
+    # renders — rather than on the CR alone: skip when merging ``owned`` in
+    # leaves ``deep_merge(chart, config)`` exactly as it already is.
+    #
+    # Deliberately not restricted to the create case. A create-only guard
+    # would hand the write to the worst possible moment instead of removing
+    # it: ``chart_bump._patch_image_tag`` creates this CR carrying only
+    # ``image.tag`` to roll the control plane to a new version, and from the
+    # next heartbeat — at most 30 s later, i.e. mid-upgrade — ``current_doc``
+    # is truthy, so a create-only guard is bypassed and every owned key is
+    # PATCHed in while the tag-bump apply is still in flight. Before #1005
+    # that write did not happen at all, because the CR already carried those
+    # keys and the rendered document was byte-identical.
+    #
+    # Skipping is safe with a Config present precisely because it is a skip:
+    # nothing is replaced, so the keys we do not own (``image.tag``) cannot
+    # be dropped. And it self-heals — a slot upgrade that ships a chart with
+    # different defaults makes the comparison differ, and the next heartbeat
+    # writes. In practice the skip only ever fires on a single-node control
+    # plane, since ``cp_size`` is the one value firstboot cannot know and any
+    # promote puts the Config ahead of the Chart for good.
     #
     # An unreadable Chart falls through to the write: writing a redundant CR
     # is the status quo, suppressing a needed one is not.
-    if not current_doc:
-        chart_values = _helmchart_values("spatium-control")
-        if chart_values is not None and _deep_merge(chart_values, owned) == chart_values:
-            log.info(
-                "supervisor.helmchartconfig.write_skipped",
-                chart="spatium-control",
-                reason="the HelmChart already carries every overridden value",
-            )
-            return False, None
-    merged = _deep_merge(current_doc, owned)
+    chart_values = _helmchart_values("spatium-control")
+    if chart_values is not None and _deep_merge(chart_values, merged) == _deep_merge(
+        chart_values, current_doc
+    ):
+        log.info(
+            "supervisor.helmchartconfig.write_skipped",
+            chart="spatium-control",
+            reason="the HelmChart already carries every overridden value",
+        )
+        return False, None
     values = yaml.safe_dump(merged, sort_keys=True, default_flow_style=False)
     return _helmchartconfig_upsert("spatium-control", values)
 

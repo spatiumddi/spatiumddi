@@ -13,8 +13,9 @@ to compare against the **HelmChart**, which is what these tests pin.
 
 Two halves, and both are needed:
 
-* the guard itself — skip only when the Chart already carries every key the
-  supervisor owns, and never when the answer is unknown; and
+* the guard itself — skip only when merging the supervisor's keys in leaves
+  the EFFECTIVE values (``deep_merge(chart, config)``) exactly as they are,
+  and never when the answer is unknown; and
 * :func:`test_firstboot_values_already_satisfy_the_supervisor_overrides`,
   which renders firstboot's actual manifest and asserts the guard *fires* on
   a fresh install.  Without that second half the guard is dead code the first
@@ -176,12 +177,18 @@ def test_writes_when_the_chart_cannot_be_read(monkeypatch) -> None:
     assert (ok, err) == (True, None)
 
 
-def test_an_existing_config_still_takes_the_merge_path(monkeypatch) -> None:
-    """The guard is create-only.
+def test_a_chart_bump_config_does_not_pull_the_write_into_the_upgrade(
+    monkeypatch,
+) -> None:
+    """The guard must not be create-only.
 
-    Once a Config exists it holds keys we do not own — ``image.tag``, which a
-    rolling upgrade is mid-flight on — so skipping on the strength of the
-    Chart alone would be reading the wrong document.
+    ``chart_bump._patch_image_tag`` CREATES this CR carrying only
+    ``image.tag`` to roll the control plane to a new version. A create-only
+    guard is bypassed from the next heartbeat onward — at most 30 s later,
+    i.e. while the tag-bump apply is still in flight — and PATCHes every
+    owned key in. That would not merely fail to remove the redundant write,
+    it would move it to the worst possible moment: before #1005 it did not
+    happen at all, because the CR already carried those keys.
     """
     chart = _owned()
     kube = _Kube(chart=_yaml(chart), config=_yaml({"image": {"tag": "2026.09.09-1"}}))
@@ -189,8 +196,27 @@ def test_an_existing_config_still_takes_the_merge_path(monkeypatch) -> None:
 
     ok, err = k8s_api.apply_control_plane_overrides(1, "", web_ui_allowed_cidrs=[])
 
+    assert (ok, err) == (False, None)
+    assert not kube.wrote, "wrote the owned keys in mid-upgrade"
+
+
+def test_a_real_change_still_writes_through_an_existing_config(monkeypatch) -> None:
+    """...and the skip never suppresses an override that is actually needed.
+
+    A promote is the case that matters: the Chart cannot know ``cp_size``, so
+    from the first one the Config is permanently ahead of it.
+    """
+    chart = _owned()
+    kube = _Kube(chart=_yaml(chart), config=_yaml({"image": {"tag": "2026.09.09-1"}}))
+    monkeypatch.setattr(k8s_api, "_request", kube)
+
+    ok, err = k8s_api.apply_control_plane_overrides(3, "", web_ui_allowed_cidrs=[])
+
     assert (ok, err) == (True, None)
-    assert kube.wrote
+    written = kube.written_values
+    assert written["api"]["replicas"] == 3
+    # ...carrying the key we do not own through untouched.
+    assert written["image"] == {"tag": "2026.09.09-1"}
 
 
 # --------------------------------------------------------------------------

@@ -240,21 +240,21 @@ PYEOF
             fi
         fi
 
-        # Atomic install of authorized_keys (owned by admin, 0600, dir 0700).
-        install -d -o "$ADMIN_USER" -g "$ADMIN_USER" -m 0700 "$(dirname "$AK_FILE")"
-        install -o "$ADMIN_USER" -g "$ADMIN_USER" -m 0600 "$AK_TMP" "$AK_FILE"
-        echo "  ✓ authorized_keys installed ($KEY_COUNT key(s))"
-
-        # Atomic install of the sshd drop-in (root, 0644 — no secrets).
-        # The 10- file has to go, not be layered over: mkosi.postinst
-        # ships /etc/ssh/sshd_config.d/10-spatiumddi-password-auth.conf
-        # with `PasswordAuthentication yes`, sshd takes the FIRST value
-        # per keyword, and Include expands lexically — so `10-` beat this
-        # file and central SSH management could never turn password auth
-        # off at all (#995 item 18 found the same shadowing).
-        rm -f /etc/ssh/sshd_config.d/10-spatiumddi-password-auth.conf
-        install -o root -g root -m 0644 "$SSHD_TMP" "$SSHD_DROPIN"
-        echo "  ✓ sshd drop-in installed"
+        # ORDER MATTERS, and this block is deliberately first (#1001).
+        #
+        # The nft fragment is the only thing that opens a NON-22 ssh port, and
+        # both paths below can abort: the renderer now refuses an unparseable
+        # allowlist rather than opening the port to everyone, and `nft -c -f`
+        # has always refused a malformed CIDR. Run after the sshd drop-in was
+        # installed, either abort leaves sshd configured for a port with no
+        # firewall rule — the running daemon keeps the old one because `fail`
+        # exits before reload_sshd, so nothing looks wrong until the next
+        # sshd start or reboot silently locks the operator out.
+        #
+        # So everything that can refuse happens here, while the only artefact
+        # written is this fragment (removed again on the dry-run path). Opening
+        # a port before anything listens on it is harmless; the reverse is the
+        # lockout.
 
         # SOURCE-SCOPED nft drop-in. sshd has no native source-CIDR filter,
         # so we scope the configured port at the firewall. Empty CIDR list
@@ -353,12 +353,13 @@ PYEOF
         # Dry-run the FULL ruleset with the new drop-in staged, before we
         # reload (#550). sshd has no native source filter, so a malformed
         # CIDR renders an invalid rule; without this check `systemctl
-        # reload nftables` fails atomically and — if the ssh PORT also
-        # changed — the new port never opens (lockout), and on the next
-        # boot the bad fragment fails the whole transactional `nft -f`
-        # (fail-open, no input filtering). Mirror the firewall runner:
-        # validate, and on failure drop the fragment before erroring so
-        # the master config still loads clean.
+        # reload nftables` fails atomically and the new port never opens,
+        # and on the next boot the bad fragment fails the whole
+        # transactional `nft -f` (fail-open, no input filtering). Mirror the
+        # firewall runner: validate, and on failure drop the fragment before
+        # erroring so the master config still loads clean. Since #1001 this
+        # runs before the sshd drop-in is installed, so an abort here leaves
+        # the ssh port unchanged rather than moved-but-unreachable.
         if ! nft -c -f "$NFT_MAIN" 2>/tmp/spatium-ssh-nft-check.err; then
             sed 's/^/      /' /tmp/spatium-ssh-nft-check.err
             rm -f "$NFT_DROPIN"
@@ -366,6 +367,22 @@ PYEOF
             fail "rendered ssh nft drop-in failed nft -c -f — fragment removed"
         fi
         nft_reload
+
+        # Atomic install of authorized_keys (owned by admin, 0600, dir 0700).
+        install -d -o "$ADMIN_USER" -g "$ADMIN_USER" -m 0700 "$(dirname "$AK_FILE")"
+        install -o "$ADMIN_USER" -g "$ADMIN_USER" -m 0600 "$AK_TMP" "$AK_FILE"
+        echo "  ✓ authorized_keys installed ($KEY_COUNT key(s))"
+
+        # Atomic install of the sshd drop-in (root, 0644 — no secrets).
+        # The 10- file has to go, not be layered over: mkosi.postinst
+        # ships /etc/ssh/sshd_config.d/10-spatiumddi-password-auth.conf
+        # with `PasswordAuthentication yes`, sshd takes the FIRST value
+        # per keyword, and Include expands lexically — so `10-` beat this
+        # file and central SSH management could never turn password auth
+        # off at all (#995 item 18 found the same shadowing).
+        rm -f /etc/ssh/sshd_config.d/10-spatiumddi-password-auth.conf
+        install -o root -g root -m 0644 "$SSHD_TMP" "$SSHD_DROPIN"
+        echo "  ✓ sshd drop-in installed"
 
         reload_sshd || true
         echo "$HASH" > "$HASH_SIDECAR"

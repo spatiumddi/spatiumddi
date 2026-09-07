@@ -2067,8 +2067,18 @@ suggestion, free-space treemap.
   bash, so it tests the bytes that ship. Plus a structural sweep that fails
   any `| python3 -` opening a heredoc, and any `python3 -` heredoc whose body
   reads `sys.stdin`; both catch the shape rather than the symptom, since the
-  symptom is different at all three sites. All 18 were run against the
-  unpatched scripts and all 18 fail there. No migration, no API change.
+  symptom is different at all three sites. Every guard was run against the
+  unpatched scripts and fails there. No migration, no API change.
+  **The apply order changed with the refusal**, found by /code-review: both
+  paths that can now abort — the renderer's, and the `nft -c -f` dry-run that
+  could always refuse a malformed CIDR — ran *after* the sshd drop-in was
+  installed. `fail` exits before `reload_sshd`, so the running daemon keeps
+  the old port and nothing looks wrong, while the installed config has already
+  moved it: the next sshd start or reboot is the lockout, long after the log
+  line explaining it. The fragment is the only thing that opens a non-22 port,
+  so it is now staged, installed and validated *first*, and an abort leaves
+  the port untouched. Opening a port before anything listens on it is
+  harmless; the reverse is not.
   **Found on the way, and left deliberately unfixed:** the allowlist has a
   SECOND, independent reason for doing nothing, and it is the default case.
   `/etc/nftables.conf` emits an unconditional `tcp dport 22 accept` in its
@@ -2153,12 +2163,20 @@ suggestion, free-space treemap.
   the Chart did not already say: no Deployment changed, but helm recorded
   revision 2 and ran a second helm-install Job.
   `_helmchartconfig_upsert` could not catch it — its idempotence is against
-  the CR's own previous body, and on a fresh boot there is none. The guard
-  therefore compares against the **HelmChart**, and only when no Config exists
-  yet: once one does, it holds keys the supervisor does not own (`image.tag`,
-  which a rolling upgrade is mid-flight on) and the upsert's compare is the
-  right test. An unreadable Chart falls through to the write, because
-  suppressing a needed override is worse than writing a redundant one.
+  the CR's own previous body, and on a fresh boot there is none. So the guard
+  compares the **effective** values, `deep_merge(chart, config)`, and skips
+  when merging the supervisor's keys in leaves them exactly as they are. An
+  unreadable Chart falls through to the write, because suppressing a needed
+  override is worse than writing a redundant one.
+  **Deliberately not create-only**, which /code-review caught the first cut
+  being: `chart_bump._patch_image_tag` CREATES this CR carrying only
+  `image.tag` to roll the control plane to a new version, so from the next
+  heartbeat — at most 30 s later, i.e. mid-upgrade — a create-only guard is
+  bypassed and PATCHes every owned key in while the tag-bump apply is still in
+  flight. That does not merely fail to remove the redundant write, it moves it
+  to the worst possible moment; before #1005 it did not happen at all.
+  Skipping stays safe with a Config present precisely because it is a skip:
+  nothing is replaced, so `image.tag` cannot be dropped.
   **The guard alone would have been dead code**, which the issue's "two lines"
   estimate did not account for: firstboot rendered every overridden key except
   `frontend.loadBalancerSourceRanges` and `slotImageMirror.enabled`, so the

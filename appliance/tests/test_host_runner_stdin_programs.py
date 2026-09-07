@@ -179,6 +179,49 @@ def test_ssh_unparseable_allowlist_refuses_rather_than_opening(bad: str) -> None
     assert res.stderr.strip(), "refused silently — the operator gets no reason"
 
 
+def test_everything_that_can_refuse_runs_before_the_sshd_drop_in() -> None:
+    """A refusal must not leave sshd on a port with no firewall rule.
+
+    Two paths in the enabled branch abort: the renderer now refuses an
+    unparseable allowlist rather than opening the port to everyone, and
+    ``nft -c -f`` has always refused a malformed CIDR. Both call ``fail``,
+    which exits before ``reload_sshd`` — so the RUNNING daemon keeps the old
+    port and nothing looks wrong, while the installed drop-in has already
+    moved it. The next sshd start or reboot is the lockout, by which time the
+    log line that explains it is long gone.
+
+    The fragment is the only thing that opens a non-22 port, so staging and
+    validating it first is what makes an abort a no-op. Ordering is the whole
+    property, and it is invisible to `bash -n` and to review.
+    """
+    src = SSH_RELOAD.read_text(encoding="utf-8")
+    enabled = src[src.index("    enabled)") : src.index("    disabled)")]
+    lines = enabled.splitlines()
+
+    def at(needle: str) -> int:
+        hits = [i for i, ln in enumerate(lines) if needle in ln]
+        assert len(hits) == 1, f"{needle!r} appears {len(hits)}x in the enabled branch"
+        return hits[0]
+
+    render = at('python3 - "$PORT" "$CIDR_JSON"')
+    dry_run = at('nft -c -f "$NFT_MAIN"')
+    sshd_install = at('install -o root -g root -m 0644 "$SSHD_TMP" "$SSHD_DROPIN"')
+    ak_install = at('install -o "$ADMIN_USER" -g "$ADMIN_USER" -m 0600 "$AK_TMP"')
+
+    assert render < sshd_install, (
+        "the CIDR render can refuse, and now runs after the sshd drop-in is "
+        "installed — an abort leaves the configured port unreachable (#1001)"
+    )
+    assert dry_run < sshd_install, (
+        "the nft dry-run can refuse, and now runs after the sshd drop-in is "
+        "installed — same lockout shape (#1001)"
+    )
+    assert dry_run < ak_install, (
+        "a refusal now happens after authorized_keys was replaced, so the "
+        "runner aborts having half-applied the operator's key set (#1001)"
+    )
+
+
 def test_the_scoped_rule_is_still_dead_code_on_port_22() -> None:
     """The allowlist now renders correctly and STILL does nothing on port 22.
 

@@ -57,6 +57,14 @@ the formatter handles the rest.
   plainly here because the allowlist previously did nothing for
   two independent reasons and only one of them is now gone.
 
+  The apply order changed with it: the fragment is now staged
+  and validated *before* the sshd drop-in is installed. Both
+  paths that can refuse used to run after it, and `fail` exits
+  before the sshd reload — so the running daemon kept the old
+  port while the installed config had already moved it, and the
+  lockout arrived at the next sshd start rather than at the
+  failure.
+
 - **Blanking the installer's Time source did not disable NTP
   (#1002).** Debian's `/etc/chrony/chrony.conf` carries its own
   `pool` directive and `sourcedir` is additive, so removing the
@@ -109,9 +117,13 @@ the formatter handles the rest.
   so the first heartbeat created a CR carrying nothing new. No
   Deployment changed, but helm recorded a revision and ran a
   second helm-install Job. The supervisor now skips the write
-  when the Chart already carries every value it would set, and
-  firstboot renders the two keys it was omitting so that
-  comparison can actually match.
+  when merging its keys in would leave the effective values
+  unchanged, and firstboot renders the two keys it was omitting
+  so that comparison can actually match. The check is not
+  restricted to the create case on purpose: the rolling-upgrade
+  orchestrator creates this CR carrying only `image.tag`, so a
+  create-only guard would move the redundant write into the
+  middle of an upgrade rather than remove it.
 
 - **A DHCP server short of CPU loses packets silently, and nothing
   in the product said so (#980).** Kea answers 100 % of what it
