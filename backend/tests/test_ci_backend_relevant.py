@@ -50,6 +50,7 @@ _KNOWN_REPO_ROOT_READS: dict[str, str] = {
     "test_openapi_export.py": "scripts/export_openapi.py",
     "test_outbound_hosts_documented.py": "docs/PRIVACY.md",
     "test_zone_name_scope.py": "scripts/refresh_iana_tlds.py",
+    "test_dhcp_packet_loss.py": "agent/dhcp/spatium_dhcp_agent/metrics.py",
 }
 
 # ``parents[2]`` from backend/tests/x.py is the repo root; anything at that
