@@ -280,6 +280,16 @@ sandboxed argv builder, never a shell string.
 | BIND `dig` (dnsutils) | MPL 2.0 | DNS query + propagation check |
 | [PostgreSQL client 16](https://www.postgresql.org/) | PostgreSQL License | `pg_dump` / `pg_restore` for backup + restore |
 | [xmlsec1](https://www.aleksey.com/xmlsec/) (libxmlsec1-openssl) | MIT | SAML assertion signature verification |
+| [libnfs](https://github.com/sahlberg/libnfs) (libnfs14) | LGPL v2.1 | `nfs` backup destination ([#971](https://github.com/spatiumddi/spatiumddi/issues/971)) |
+
+**libnfs is LGPL and dynamically linked, deliberately.** The `nfs` backup
+destination binds `libnfs.so.14` through `ctypes` at runtime — no compilation, no
+static linking, and the Debian package is installed unmodified. That keeps the
+LGPL v2.1 obligation to its simple case (§6's dynamic-linking allowance): an
+operator can replace the shared library with their own build without touching
+SpatiumDDI. Only the runtime package (`libnfs14`) ships; `libnfs-dev` is not in
+either build stage. Note that this is the *only* entry in this table SpatiumDDI
+links against rather than executing as a subprocess.
 
 **nmap's license is not OSI-approved.** The NPSL is a GPL v2 derivative with
 added restrictions on redistribution inside commercial products. SpatiumDDI is

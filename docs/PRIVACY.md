@@ -118,7 +118,7 @@ nothing here runs on a schedule.
 | `stat.ripe.net`, `www.peeringdb.com`, `ris-live.ripe.net`, `rpki.cloudflare.com`, `rpki-validator.ripe.net` | BGP Looking Glass enrichment | off (`bgp.*` feature modules) | The ASN or prefix being enriched. |
 | Your alert / notification endpoints (Slack webhook, generic webhook, SMTP relay) | Alerting | off until a channel is configured | The alert payload, to the URL or relay you entered. |
 | Your audit-forward endpoint | Audit forwarding | off | Audit rows, to the URL you entered. |
-| Your backup destination (S3, Azure Blob, GCS, WebDAV, SMB, FTP, SCP) | Backup targets | off; local volume by default | The encrypted backup archive, to the destination you configured. |
+| Your backup destination (S3, Azure Blob, GCS, WebDAV, SMB, FTP, SCP, NFS, or any HTTPS receiver you name) | Backup targets | off; local volume by default | The encrypted backup archive, to the destination you configured. The `https_put` kind sends it to a URL you type — an Artifactory or Nexus repository, a presigned S3 URL, an internal receiver — so it goes exactly where you point it and nowhere else; the URL is checked against the SSRF guard and redirects are not followed, so the archive cannot be re-sent to a third address. The `nfs` kind connects to the server and export you name, over AUTH_SYS, which is unauthenticated (see SYSTEM_ADMIN.md). |
 
 ### 3.4 Appliance host (OS-level, not the application)
 

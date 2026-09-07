@@ -43,6 +43,7 @@ from app.services.backup.targets import (
     SecretFieldError,
     decrypt_config_secrets,
     get_destination,
+    is_retention_locked,
 )
 
 logger = structlog.get_logger(__name__)
@@ -76,38 +77,58 @@ async def _retention_sweep(
     "no automatic pruning". Returns the number of archives
     deleted.
     """
+    if target.write_only:
+        # Write-only destination (#989): retention belongs to the
+        # destination, not to us. Pruning here would need a delete
+        # credential — which is the exact thing this flag exists to make
+        # unnecessary — and on an Object-Lock bucket every attempt would
+        # be refused anyway, logging a warning per file per night about
+        # the feature working correctly.
+        return 0
     if target.retention_keep_last_n is None and target.retention_keep_days is None:
         return 0
     driver = get_destination(target.kind)
     archives = await driver.list_archives(config=config)
+
+    async def _prune(filename: str) -> bool:
+        """Delete one archive, distinguishing "refused because it is
+        under a retention lock" from a real failure.
+
+        A locked object is the feature working: an S3 bucket in
+        compliance mode refuses the delete until the retain-until date,
+        and logging that at WARNING once per file per night turns a
+        correctly-configured install into a nightly warning storm. So it
+        is skipped quietly at DEBUG, and only unexpected failures warn.
+        """
+        try:
+            await driver.delete(config=config, filename=filename)
+        except BackupDestinationError as exc:
+            if is_retention_locked(exc):
+                logger.debug(
+                    "backup_retention_object_locked",
+                    target_id=str(target.id),
+                    filename=filename,
+                )
+                return False
+            logger.warning(
+                "backup_retention_delete_failed",
+                target_id=str(target.id),
+                filename=filename,
+                error=str(exc),
+            )
+            return False
+        return True
+
     deleted = 0
     if target.retention_keep_last_n is not None:
         keep_n = max(target.retention_keep_last_n, 0)
         for stale in archives[keep_n:]:
-            try:
-                await driver.delete(config=config, filename=stale.filename)
-                deleted += 1
-            except BackupDestinationError as exc:
-                logger.warning(
-                    "backup_retention_delete_failed",
-                    target_id=str(target.id),
-                    filename=stale.filename,
-                    error=str(exc),
-                )
+            deleted += 1 if await _prune(stale.filename) else 0
     elif target.retention_keep_days is not None:
         cutoff = datetime.now(UTC).timestamp() - target.retention_keep_days * 86400
         for archive in archives:
             if archive.created_at.timestamp() < cutoff:
-                try:
-                    await driver.delete(config=config, filename=archive.filename)
-                    deleted += 1
-                except BackupDestinationError as exc:
-                    logger.warning(
-                        "backup_retention_delete_failed",
-                        target_id=str(target.id),
-                        filename=archive.filename,
-                        error=str(exc),
-                    )
+                deleted += 1 if await _prune(archive.filename) else 0
     return deleted
 
 

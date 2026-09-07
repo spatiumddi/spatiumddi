@@ -1,0 +1,298 @@
+"""NFS backup destination (issue #971).
+
+Nothing here reaches a real NFS server — CI has none. What it pins is
+the part that fails *silently* if it drifts, plus the refusals.
+
+**The struct constants are the point of this file.** The driver binds
+``libnfs`` through :mod:`ctypes`, so ``struct nfs_stat_64`` and ``struct
+nfsdirent`` are transcribed by hand from the C header. A wrong field
+offset does not raise — it reads an adjacent field, so an archive
+reports a plausible-but-wrong size, or a directory reads as a regular
+file, or ``created_at`` comes back as a date that quietly reorders the
+retention sweep. The expected values below were produced by compiling
+``offsetof()`` against Debian trixie's ``libnfs-dev`` (libnfs 5.0.2) on
+the same LP64 layout both shipped architectures use, so this asserts
+against the compiler rather than against a re-derivation of the same
+guess.
+
+The live half — mount, read/write round-trip on both protocol versions,
+atomic rename, squash and read-only error mapping — was validated
+against an ``nfs-ganesha`` export during development and is not
+reproducible in CI without a server.
+"""
+
+from __future__ import annotations
+
+import ctypes
+import errno
+
+import pytest
+
+from app.services.backup.targets import DESTINATIONS, get_destination
+from app.services.backup.targets.base import DestinationConfigError
+from app.services.backup.targets.libnfs_client import (
+    NfsError,
+    _NfsDirent,
+    _NfsStat64,
+    _NfsUrl,
+    build_url,
+)
+from app.services.backup.targets.nfs import (
+    _ARCHIVE_NAME_RE,
+    _PART_SUFFIX,
+    NfsDestination,
+    _remote_path,
+    _squash_hint,
+)
+
+# ── struct layout, against the C compiler ─────────────────────────────
+
+
+def test_nfs_stat64_layout_matches_the_c_header():
+    assert ctypes.sizeof(_NfsStat64) == 136
+    assert _NfsStat64.nfs_mode.offset == 16
+    assert _NfsStat64.nfs_size.offset == 56
+    assert _NfsStat64.nfs_mtime.offset == 88
+
+
+def test_nfsdirent_layout_matches_the_c_header():
+    assert ctypes.sizeof(_NfsDirent) == 160
+    expected = {
+        "next": 0,
+        "name": 8,
+        "inode": 16,
+        "type": 24,
+        "mode": 28,
+        "size": 32,
+        "atime": 40,
+        "mtime": 56,
+        "ctime": 72,
+        "uid": 88,
+        "gid": 92,
+        "nlink": 96,
+        "dev": 104,
+        "rdev": 112,
+        "blksize": 120,
+        "blocks": 128,
+        "used": 136,
+        "atime_nsec": 144,
+        "mtime_nsec": 148,
+        "ctime_nsec": 152,
+    }
+    for field, offset in expected.items():
+        assert getattr(_NfsDirent, field).offset == offset, field
+
+
+def test_nfs_url_layout_matches_the_c_header():
+    assert ctypes.sizeof(_NfsUrl) == 24
+
+
+# ── URL composition ───────────────────────────────────────────────────
+
+
+def test_build_url_defaults_to_v4_and_disables_autoreconnect():
+    url = build_url(server="nas.example", export="/volume1/backups")
+    assert url.startswith("nfs://nas.example/volume1/backups?")
+    assert "version=4" in url
+    # libnfs otherwise reconnects forever, like a kernel client. Right
+    # for a filesystem, wrong for a scheduled job: a dead NAS would hold
+    # the beat sweep's thread instead of failing the run.
+    assert "autoreconnect=0" in url
+
+
+def test_build_url_carries_port_uid_gid():
+    url = build_url(
+        server="10.0.0.5", export="/srv/backups", version=3, port=2050, uid=1000, gid=1000
+    )
+    assert "version=3" in url
+    assert "nfsport=2050" in url
+    # v3 additionally reaches mountd through the portmapper; an operator
+    # who pinned one port has almost always pinned both.
+    assert "mountport=2050" in url
+    assert "uid=1000" in url and "gid=1000" in url
+
+
+def test_build_url_normalises_a_missing_leading_slash():
+    assert build_url(server="h", export="vol1").startswith("nfs://h/vol1?")
+
+
+def test_build_url_omits_uid_when_unset():
+    # Blank must mean "the identity the process runs as", not uid 0 —
+    # presenting root to a root_squash export is the failure mode the
+    # field exists to avoid.
+    assert "uid=" not in build_url(server="h", export="/e")
+
+
+# ── path composition ──────────────────────────────────────────────────
+
+
+def test_remote_path_composes_the_subdirectory():
+    cfg = {"server": "h", "export": "/e", "path": "archives"}
+    assert _remote_path(cfg, "a.zip") == "/archives/a.zip"
+    assert _remote_path(cfg) == "/archives"
+
+
+def test_remote_path_without_a_subdirectory():
+    cfg = {"server": "h", "export": "/e"}
+    assert _remote_path(cfg, "a.zip") == "/a.zip"
+    assert _remote_path(cfg) == "/"
+
+
+def test_remote_path_strips_separators_from_the_filename():
+    # The same defence every other driver applies: an operator-supplied
+    # filename must not escape the configured directory.
+    cfg = {"server": "h", "export": "/e", "path": "archives"}
+    assert _remote_path(cfg, "../../etc/passwd") == "/archives/passwd"
+    assert _remote_path(cfg, "/abs/path/x.zip") == "/archives/x.zip"
+
+
+def test_part_suffix_is_invisible_to_the_archive_regex():
+    """The atomicity property, asserted directly.
+
+    ``write`` stages to ``<name>.part`` and renames. That is only safe
+    because the staged name cannot match the archive pattern — otherwise
+    a killed write would leave a half-written file that ``list_archives``
+    offers to the retention sweep and to ``latest/download``.
+    """
+    name = "spatiumddi-backup-20260907-120000.zip"
+    assert _ARCHIVE_NAME_RE.match(name)
+    assert not _ARCHIVE_NAME_RE.match(name + _PART_SUFFIX)
+
+
+# ── config validation ─────────────────────────────────────────────────
+
+
+@pytest.fixture
+def driver() -> NfsDestination:
+    return NfsDestination()
+
+
+def test_minimal_config_is_accepted(driver):
+    driver.validate_config({"server": "nas", "export": "/vol1/backups"})
+
+
+@pytest.mark.parametrize(
+    "config, because",
+    [
+        ({"export": "/e"}, "server missing"),
+        ({"server": "h"}, "export missing"),
+        ({"server": "", "export": "/e"}, "server empty"),
+        ({"server": "h", "export": "/e", "version": "2"}, "version 2 is not a thing"),
+        ({"server": "h", "export": "/e", "port": "0"}, "port below range"),
+        ({"server": "h", "export": "/e", "port": "70000"}, "port above range"),
+        ({"server": "h", "export": "/e", "uid": "root"}, "uid must be numeric"),
+        ({"server": "h", "export": "/e", "timeout_s": "0"}, "timeout below range"),
+        ({"server": "h", "export": "/e", "timeout_s": "99999"}, "timeout above range"),
+    ],
+)
+def test_invalid_configs_are_refused(driver, config, because):
+    with pytest.raises(DestinationConfigError):
+        driver.validate_config(config)
+
+
+@pytest.mark.parametrize("field", ["server", "export", "path"])
+@pytest.mark.parametrize("bad", ["a?b", "a&b", "a#b", "a b", "a\tb"])
+def test_url_hostile_characters_are_refused(driver, field, bad):
+    """libnfs has no ``nfs_set_nfsport``, so the port and version travel
+    as URL query arguments and the whole target is a URL. A ``?`` in an
+    export path would silently truncate it into a query string, mounting
+    something other than what the operator typed — so it is refused at
+    validate time rather than mis-parsed at mount time.
+    """
+    config = {"server": "h", "export": "/e", field: bad}
+    with pytest.raises(DestinationConfigError):
+        driver.validate_config(config)
+
+
+# ── errno → cause ─────────────────────────────────────────────────────
+
+
+def test_permission_errors_name_squash_as_the_likely_cause():
+    hint = _squash_hint(NfsError("write failed", errno=errno.EACCES), action="write")
+    assert "squash" in hint.lower()
+    assert "uid" in hint.lower()
+
+
+def test_eperm_is_treated_like_eacces():
+    assert "squash" in _squash_hint(NfsError("x", errno=errno.EPERM), action="write").lower()
+
+
+def test_read_only_export_says_so():
+    hint = _squash_hint(NfsError("write failed", errno=errno.EROFS), action="write")
+    assert "read-only" in hint.lower()
+    assert "squash" not in hint.lower()
+
+
+def test_out_of_space_and_quota_are_distinguished():
+    assert "space" in _squash_hint(NfsError("x", errno=errno.ENOSPC), action="write").lower()
+    assert "quota" in _squash_hint(NfsError("x", errno=errno.EDQUOT), action="write").lower()
+
+
+def test_an_unmapped_errno_passes_through_unembellished():
+    # Guessing at a cause we don't know would be worse than the raw
+    # message — the operator can search the latter.
+    exc = NfsError("mount failed: no route to host", errno=errno.EHOSTUNREACH)
+    assert _squash_hint(exc, action="mount") == str(exc)
+
+
+# ── registry ──────────────────────────────────────────────────────────
+
+
+def test_nfs_is_registered_and_reflected():
+    assert "nfs" in DESTINATIONS
+    driver = get_destination("nfs")
+    assert driver.kind == "nfs"
+    names = {f.name for f in driver.config_fields}
+    assert {"server", "export", "path", "version", "port", "uid", "gid"} <= names
+
+
+def test_nfs_declares_no_secret_fields():
+    """AUTH_SYS has no credential. A secret field here would imply the
+    connection is authenticated, which is the single most important
+    thing about this destination for an operator to understand.
+    """
+    assert not [f for f in get_destination("nfs").config_fields if f.secret]
+
+
+def test_the_authentication_caveat_is_carried_as_a_notice_field():
+    notices = [f for f in get_destination("nfs").config_fields if f.type == "notice"]
+    assert len(notices) == 1
+    body = (notices[0].description or "").lower()
+    assert "auth_sys" in body or "no credential" in body
+    # A notice is prose, never an input — the frontend renders it without
+    # one, and it must not be required or the form could not be saved.
+    assert notices[0].required is False
+
+
+def test_notice_fields_are_not_part_of_the_validated_config():
+    """The notice is decorative. If a client posts its name as a config
+    key anyway, validation must not care — and it must never be
+    *required*, which would make the kind unusable.
+    """
+    driver = get_destination("nfs")
+    driver.validate_config({"server": "h", "export": "/e", "_auth_notice": "whatever"})
+
+
+# ── copilot surface ───────────────────────────────────────────────────
+
+
+def test_the_copilot_kind_filter_enumerates_every_registered_kind():
+    """The ``kind`` filter's description is what the model reads to
+    decide which values are legal, so a hand-written list there does not
+    just go stale — it makes a registered destination unaskable-about.
+    It is now derived from the registry; this pins that it resolves to a
+    non-empty list containing the newest kind.
+
+    The empty case is the one worth guarding: the registry lives in
+    ``targets.base`` but is filled by ``targets.__init__``, so reading
+    the wrong module yields ``""`` silently.
+    """
+    from app.services.ai.tools.backup import ListBackupTargetsArgs, _known_kinds
+
+    kinds = _known_kinds()
+    assert "nfs" in kinds
+    assert len(kinds) >= 9
+    described = ListBackupTargetsArgs.model_fields["kind"].description or ""
+    assert "nfs" in described
+    for kind in kinds:
+        assert kind in described, f"{kind} missing from the tool description"

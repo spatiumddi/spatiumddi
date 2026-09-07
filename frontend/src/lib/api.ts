@@ -2921,6 +2921,14 @@ export interface BackupTargetKind {
   kind: string;
   label: string;
   config_fields: BackupTargetConfigField[];
+  /**
+   * True when the kind has no listing and no delete at all (`https_put`),
+   * as opposed to a kind whose credential merely lacks delete permission.
+   * The API forces `write_only` on for these, so the form renders the
+   * switch as checked and disabled rather than offering a choice the
+   * server will override.
+   */
+  inherently_write_only: boolean;
 }
 
 export interface BackupTarget {
@@ -2935,6 +2943,13 @@ export interface BackupTarget {
   schedule_cron: string | null;
   retention_keep_last_n: number | null;
   retention_keep_days: number | null;
+  /**
+   * Write-only destination (#989). Retention is skipped, archive delete
+   * is refused, pull-mode download answers 409, and the restore drill
+   * reports `cannot_drill` — recovery readiness is UNVERIFIED, never
+   * healthy.
+   */
+  write_only: boolean;
   last_run_status: string;
   last_run_at: string | null;
   last_run_filename: string | null;
@@ -2962,6 +2977,7 @@ export interface BackupTargetCreate {
   schedule_cron?: string | null;
   retention_keep_last_n?: number | null;
   retention_keep_days?: number | null;
+  write_only?: boolean;
 }
 
 export interface BackupTargetUpdate {
@@ -2974,6 +2990,7 @@ export interface BackupTargetUpdate {
   schedule_cron?: string | null;
   retention_keep_last_n?: number | null;
   retention_keep_days?: number | null;
+  write_only?: boolean;
   drill_enabled?: boolean;
   drill_cron?: string | null;
 }

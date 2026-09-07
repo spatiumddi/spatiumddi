@@ -21,6 +21,34 @@ Config shape:
 * ``addressing_style`` — optional (``"virtual"`` / ``"path"``).
   Defaults to virtual; some MinIO deploys + older bucket names
   with dots need ``"path"``.
+* ``object_lock_mode`` — optional ``none`` (default) /
+  ``governance`` / ``compliance`` (issue #989 item 1).
+* ``object_lock_days`` — retention period in days when a lock mode
+  is set.
+
+Object Lock (#989 item 1)
+-------------------------
+
+``compliance`` is the interesting one: not even the bucket owner can
+delete an object before its retain-until date, so retention holds
+regardless of what credential leaks. Paired with
+``backup_target.write_only`` and an IAM key carrying ``PutObject`` +
+``GetObject`` + ``ListBucket`` and **no** ``DeleteObject``, nothing
+SpatiumDDI holds can shorten retention — while restore-from-destination
+and restore drills keep working, because those only read.
+
+Two details that are easy to get wrong:
+
+* The **probe object is written without lock headers.** Writing a probe
+  under a 30-day compliance lock would leave undeletable litter in the
+  bucket every time an operator clicks Test. If the bucket carries a
+  *default* retention rule the probe is retained anyway — that is the
+  bucket's choice, not ours, and ``test_connection`` reports it as
+  ``probe_retained`` rather than failing.
+* The prune reads ``ObjectLockRetainUntilDate`` from ``head_object``
+  and skips a locked object **quietly**. A refused delete on a locked
+  bucket is the feature working; logging it per file per night would
+  make correct configuration indistinguishable from breakage.
 
 Implementation notes:
 
@@ -52,6 +80,7 @@ from app.services.backup.targets.base import (
     BackupDestinationError,
     ConfigFieldSpec,
     DestinationConfigError,
+    RetentionLockedError,
 )
 
 logger = structlog.get_logger(__name__)
@@ -103,6 +132,42 @@ def _key(config: dict[str, Any], filename: str) -> str:
     if prefix:
         return f"{prefix}/{safe}"
     return safe
+
+
+#: The two real Object Lock modes, plus the spellings that mean "off".
+_LOCK_MODES = {"governance": "GOVERNANCE", "compliance": "COMPLIANCE"}
+
+
+def _lock_mode(config: dict[str, Any]) -> str | None:
+    """Return the S3 API's spelling of the configured lock mode, or
+    ``None`` when locking is off. Raises for a value that is neither.
+    """
+    raw = (config.get("object_lock_mode") or "").strip().lower()
+    if raw in ("", "none", "off", "disabled"):
+        return None
+    if raw not in _LOCK_MODES:
+        raise DestinationConfigError(
+            f"'object_lock_mode' must be 'none', 'governance' or 'compliance' " f"(got {raw!r})"
+        )
+    return _LOCK_MODES[raw]
+
+
+def _lock_headers(config: dict[str, Any]) -> dict[str, Any]:
+    """``put_object`` kwargs that apply the configured retention.
+
+    Deliberately NOT applied to the connection probe — see the module
+    docstring.
+    """
+    mode = _lock_mode(config)
+    if mode is None:
+        return {}
+    from datetime import timedelta  # noqa: PLC0415
+
+    days = int(config["object_lock_days"])
+    return {
+        "ObjectLockMode": mode,
+        "ObjectLockRetainUntilDate": datetime.now(UTC) + timedelta(days=days),
+    }
 
 
 def _strip_prefix(config: dict[str, Any], key: str) -> str:
@@ -171,6 +236,31 @@ class S3Destination(BackupDestination):
             secret=True,
             description="Encrypted at rest. Leave the existing field unchanged on edit to keep the previous value.",
         ),
+        ConfigFieldSpec(
+            name="object_lock_mode",
+            label="Object Lock mode",
+            type="text",
+            required=False,
+            description=(
+                "'none' (default), 'governance', or 'compliance'. Requires a bucket "
+                "created with Object Lock enabled. Under 'compliance' not even the "
+                "bucket owner can delete an object before its retain-until date, so "
+                "retention survives a leaked credential; 'governance' can be "
+                "overridden by a principal holding "
+                "s3:BypassGovernanceRetention."
+            ),
+        ),
+        ConfigFieldSpec(
+            name="object_lock_days",
+            label="Object Lock retention (days)",
+            type="text",
+            required=False,
+            description=(
+                "How long each archive is locked. Required when a lock mode is set. "
+                "Pair this with the target's write-only setting and a lifecycle rule "
+                "for expiry."
+            ),
+        ),
     )
 
     def validate_config(self, config: dict[str, Any]) -> None:
@@ -188,6 +278,22 @@ class S3Destination(BackupDestination):
         prefix = config.get("prefix")
         if prefix and not isinstance(prefix, str):
             raise DestinationConfigError("'prefix' must be a string")
+        mode = _lock_mode(config)
+        if mode is not None:
+            days = config.get("object_lock_days")
+            if days in (None, ""):
+                raise DestinationConfigError(
+                    "'object_lock_days' is required when 'object_lock_mode' is set — "
+                    "a lock with no retention period would be a no-op"
+                )
+            try:
+                day_n = int(days)
+            except (TypeError, ValueError) as exc:
+                raise DestinationConfigError(
+                    f"'object_lock_days' must be a number ({exc})"
+                ) from exc
+            if day_n < 1:
+                raise DestinationConfigError("'object_lock_days' must be at least 1")
 
     async def write(
         self,
@@ -211,6 +317,7 @@ class S3Destination(BackupDestination):
                     Key=key,
                     Body=archive_bytes,
                     ContentType="application/zip",
+                    **_lock_headers(config),
                 )
             except (ClientError, BotoCoreError) as exc:
                 raise BackupDestinationError(f"S3 put_object failed: {exc}") from exc
@@ -284,6 +391,34 @@ class S3Destination(BackupDestination):
             )
 
             client = _client(config)
+            # Ask before pushing: an object under an unexpired retention
+            # lock cannot be deleted, and finding that out from a 403 is
+            # both slower and ambiguous (a missing DeleteObject grant
+            # answers the same way). ``head_object`` distinguishes them,
+            # which is what lets the retention sweep skip a locked object
+            # quietly instead of warning about it every night.
+            try:
+                head = client.head_object(Bucket=config["bucket"], Key=key)
+            except (ClientError, BotoCoreError):
+                # No head grant, or the object is already gone. Neither is
+                # a reason to refuse the delete — fall through and let the
+                # delete itself answer.
+                head = {}
+            retain_until = head.get("ObjectLockRetainUntilDate")
+            if retain_until is not None:
+                if retain_until.tzinfo is None:
+                    retain_until = retain_until.replace(tzinfo=UTC)
+                if retain_until > datetime.now(UTC):
+                    raise RetentionLockedError(
+                        f"{filename!r} is under an S3 Object Lock "
+                        f"({head.get('ObjectLockMode') or 'unknown'} mode) until "
+                        f"{retain_until.isoformat()} and cannot be deleted before then"
+                    )
+            if (head.get("ObjectLockLegalHoldStatus") or "").upper() == "ON":
+                raise RetentionLockedError(
+                    f"{filename!r} is under an S3 Object Lock legal hold and cannot "
+                    "be deleted until the hold is released"
+                )
             try:
                 client.delete_object(Bucket=config["bucket"], Key=key)
             except (ClientError, BotoCoreError) as exc:
@@ -306,7 +441,15 @@ class S3Destination(BackupDestination):
             )
 
             client = _client(config)
+            probe_retained = False
+            retained_reason = ""
             try:
+                # NOTE: no ``**_lock_headers(config)`` here, deliberately.
+                # A probe written under a 30-day compliance lock is
+                # undeletable litter, created every time somebody clicks
+                # Test. The bucket's own default retention rule may still
+                # retain it, which is reported rather than treated as a
+                # failure.
                 client.put_object(
                     Bucket=config["bucket"],
                     Key=probe_key,
@@ -315,7 +458,17 @@ class S3Destination(BackupDestination):
                 )
                 head = client.head_object(Bucket=config["bucket"], Key=probe_key)
                 ok = head.get("ContentLength", 0) == 16
-                client.delete_object(Bucket=config["bucket"], Key=probe_key)
+                try:
+                    client.delete_object(Bucket=config["bucket"], Key=probe_key)
+                except (ClientError, BotoCoreError) as del_exc:
+                    # A refused delete is expected — and correct — on the
+                    # recommended shape: a PutObject+GetObject+ListBucket
+                    # key with no DeleteObject, against an Object Lock
+                    # bucket. Failing the probe here is what trains
+                    # operators to widen the key, so instead the probe
+                    # passes and says the probe object was left behind.
+                    probe_retained = True
+                    retained_reason = str(del_exc)
             except (ClientError, BotoCoreError) as exc:
                 # Distinguish auth errors from missing-bucket so the
                 # operator gets a useful nudge.
@@ -332,6 +485,18 @@ class S3Destination(BackupDestination):
                 return {
                     "ok": False,
                     "error": "wrote probe but head_object disagreed on size",
+                }
+            if probe_retained:
+                return {
+                    "ok": True,
+                    "probe_retained": True,
+                    "detail": (
+                        f"wrote + verified probe at {config['bucket']}/{probe_key}, but "
+                        f"could not delete it ({retained_reason[:200]}). That is expected "
+                        "on a write-only key or an Object Lock bucket — the probe object "
+                        "stays until the bucket's own lifecycle rule removes it. Mark the "
+                        "target write-only so retention is not attempted from here."
+                    ),
                 }
             return {
                 "ok": True,

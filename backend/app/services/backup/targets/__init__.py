@@ -4,8 +4,9 @@ Each destination is a thin driver that knows how to ``write``,
 ``list``, ``delete``, and ``test_connection`` against its own
 storage backend. Phase 1b ships ``local_volume``; Phase 1c/1d
 add ``s3`` / ``scp`` / ``azure_blob``; Phase 2 Tier 2 adds
-``smb`` / ``ftp`` / ``gcs``. Every driver is mounted on the
-same :class:`BackupDestination` ABC + module-level registry.
+``smb`` / ``ftp`` / ``gcs``; Phase 3 adds ``webdav``; #971 adds
+``nfs``. Every driver is mounted on the same
+:class:`BackupDestination` ABC + module-level registry.
 """
 
 from app.services.backup.targets.azure_blob import AzureBlobDestination
@@ -15,12 +16,17 @@ from app.services.backup.targets.base import (
     BackupDestination,
     BackupDestinationError,
     DestinationConfigError,
+    RetentionLockedError,
+    UnsupportedOperationError,
     get_destination,
+    is_retention_locked,
     list_destination_kinds,
 )
 from app.services.backup.targets.ftp import FtpDestination
 from app.services.backup.targets.gcs import GcsDestination
+from app.services.backup.targets.https_put import HttpsPutDestination
 from app.services.backup.targets.local_volume import LocalVolumeDestination
+from app.services.backup.targets.nfs import NfsDestination
 from app.services.backup.targets.s3 import S3Destination
 from app.services.backup.targets.scp import ScpDestination
 from app.services.backup.targets.secrets_config import (
@@ -44,16 +50,22 @@ DESTINATIONS["smb"] = SmbDestination()
 DESTINATIONS["ftp"] = FtpDestination()
 DESTINATIONS["gcs"] = GcsDestination()
 DESTINATIONS["webdav"] = WebDAVDestination()
+DESTINATIONS["nfs"] = NfsDestination()
+DESTINATIONS["https_put"] = HttpsPutDestination()
 
 __all__ = [
     "ArchiveListing",
     "BackupDestination",
     "BackupDestinationError",
+    "UnsupportedOperationError",
     "DestinationConfigError",
+    "RetentionLockedError",
     "AzureBlobDestination",
     "FtpDestination",
     "GcsDestination",
+    "HttpsPutDestination",
     "LocalVolumeDestination",
+    "NfsDestination",
     "S3Destination",
     "ScpDestination",
     "SmbDestination",
@@ -64,6 +76,7 @@ __all__ = [
     "decrypt_config_secrets",
     "encrypt_config_secrets",
     "get_destination",
+    "is_retention_locked",
     "list_destination_kinds",
     "merge_config_for_update",
     "redact_config_secrets",
