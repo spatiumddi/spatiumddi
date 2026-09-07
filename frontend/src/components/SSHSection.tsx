@@ -445,8 +445,10 @@ export function SSHSection({
                   Off: SSH is reachable from anywhere and the list above is
                   recorded but not applied. Turning this on retires the
                   always-open port-22 floor &mdash; the recovery channel a wrong
-                  CIDR would otherwise leave you. Recover at the console, or by
-                  turning this back off here.
+                  CIDR would otherwise leave you. The console always recovers
+                  it. Turning this back off here works too, but only while you
+                  can still reach this UI &mdash; a Web UI source restriction
+                  can be limiting that separately.
                 </>
               )}
             </div>

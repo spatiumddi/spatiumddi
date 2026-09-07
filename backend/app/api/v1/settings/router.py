@@ -2101,9 +2101,10 @@ async def update_settings(
             detail=(
                 "Your own address is not inside the allowed networks, so "
                 "enforcing this restriction may close your SSH access to every "
-                "appliance (recoverable at the console, or by turning the "
-                "restriction back off here). Re-send with ssh_lockdown_force "
-                "to proceed."
+                "appliance. The console always recovers it; turning the "
+                "restriction back off here only works if you can still reach "
+                "this UI, which a Web UI source restriction may also be "
+                "limiting. Re-send with ssh_lockdown_force to proceed."
             ),
         )
     if _ssh_field_in_request and not validate_lockout_safe(
