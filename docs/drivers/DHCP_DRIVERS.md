@@ -121,7 +121,8 @@ The HTTP envelope returned by `GET /api/v1/dhcp/agents/config` is:
     "server_name": "…",
     "driver": "kea",
     "roles": [...],
-    "server": { "interfaces": ["*"], "dhcp_socket_type": "raw" },
+    "server": { "interfaces": ["*"], "dhcp_socket_type": "raw",
+                "kea_thread_pool_size": 1, "kea_packet_logging": true },
     "scopes": [
       {
         "subnet_cidr": "10.0.0.0/24",
@@ -142,6 +143,58 @@ The HTTP envelope returned by `GET /api/v1/dhcp/agents/config` is:
 Shipped 2026.04.21-2: `render_kea.py:_scope_to_subnet` maps each wire scope to a Kea `subnet4` entry — `subnet_cidr` → `subnet`, `pools[start_ip,end_ip,pool_type]` → `{"pool": "start - end"}` (only `dynamic` pools are emitted; `excluded` / `reserved` are IPAM bookkeeping and must **not** become Kea lease pools), `statics[ip_address,mac_address,hostname]` → `reservations[ip-address,hw-address,hostname]`. Client-class `match_expression` → Kea `test`. Subnet `id` is derived deterministically from the CIDR via truncated SHA-256, so a config reload never orphans active leases by renumbering subnets.
 
 **Socket type (issue #365).** The `server.dhcp_socket_type` field drives `Dhcp4.interfaces-config.dhcp-socket-type`. It is derived from the server group's `dhcp_socket_mode` in `services/dhcp/config_bundle.py` (`direct` → `raw`, `relay` → `udp`) and is part of `ConfigBundle.compute_etag()`, so flipping the mode shifts the ETag and the agent re-renders on its next long-poll. The default is `raw` (AF_PACKET) so Kea hears broadcast `DHCPDISCOVER`s from directly-attached clients; the agent's `render_kea.py` also falls back to `raw` when an older control plane omits the `server` block. `raw` needs `CAP_NET_RAW` (appliance DaemonSet + shipped compose Kea services grant it). DHCPv6 has no socket-type concept — the field applies to `Dhcp4` only.
+
+**Packet path (issue #980).** Two more `server` fields, both rendered
+explicitly rather than left to Kea's defaults, both folded into the ETag.
+
+`kea_thread_pool_size` → `Dhcp4`/`Dhcp6` `multi-threading.thread-pool-size`.
+Kea's own default is `0`, meaning one worker per CPU `hardware_concurrency()`
+reports — the *machine's* count, with no regard for the container's cgroup
+share. Verified against kea-dhcp4 3.0.3: a container limited to 0.20 CPU
+starts ten workers, which then compete inside that cgroup with the single
+thread draining the receive socket, and packets are lost in the kernel before
+Kea reads them. The default is `1`; `0` restores Kea's auto-sizing. Note that
+`enable-multi-threading` stays **true** — this is a resize, not a mode change,
+because MT-off makes one thread both receive and process (measured 15,170
+socket drops where a pool of one had none) and also flips host-reservation
+lookup order.
+
+Kea's HA hook does **not** keep independent HTTP pools by default:
+`http-listener-threads` / `http-client-threads` default to `0`, which Kea
+reads as *"same as `thread-pool-size`"*, not as an independent auto-size.
+Measured by counting OS threads with the hook loaded — pool=1 gave 8 threads
+and pool=8 gave 29, a delta of 21 for a pool delta of 7, i.e. three pools of
+N. Left alone, the packet-path fix would have taken HA's peer HTTP
+concurrency to 1 as a side effect, so `_ha_hook` now renders an explicit
+`multi-threading` block pinning both to 4 (a decoupling constant, not a
+tuned one — the HA threads do short LAN POSTs and never contend for the
+receive thread). With it, the same measurement gives 14 threads at pool=1 and
+21 at pool=8: a delta of exactly the core pool.
+
+`kea_packet_logging` → when false, appends a `kea-dhcpN.packets` logger at
+`WARN`, silencing `DHCP4_PACKET_RECEIVED` / `DHCP4_PACKET_SEND`. Default
+true (today's behaviour); off is worth ~1.30x more packets served. The child
+declares **no `output_options`** and inherits the parent's — verified against
+kea-dhcp4 3.0.3: at DEBUG with no outputs of its own every packet line still
+reached both stdout and the shipped file, and at WARN none did while the
+parent's INFO lines kept flowing. Copying the parent's appenders also works
+but puts a second `RollingFileAppender` on one path with its own rotation
+state, so at 50 MB one renames the file while the other holds the old
+descriptor. `kea-dhcpN.dhcpN` is deliberately never silenced: at INFO it
+carries `DHCP4_OPEN_SOCKETS_FAILED`, `DHCP4_CONFIG_COMPLETE`,
+`DHCP4_STARTED` and `DHCP4_MULTI_THREADING_INFO`, the last being the line
+that confirms the pool size took effect.
+
+Both also appear in the control-plane-side `KeaDriver.render_config`, which
+backs the **Rendered config** tab. That render is a *preview*, not a copy of
+the file the agent writes — it omits the control socket, hooks, timers,
+expired-lease processing and the full logger block, and does not parse as a
+Kea config on its own. What it does carry is the group tunables an operator
+just set, which is the same rule `dhcp_socket_type` (#365) and
+`cache-threshold` (#637) already follow: `thread-pool-size` renders in full,
+and `kea_packet_logging` renders as the `kea-dhcpN.packets` severity
+override alone (nothing when it is on). Full measurements:
+[`DHCP.md` §4c](../features/DHCP.md).
 
 ### HA coordination
 

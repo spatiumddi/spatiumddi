@@ -209,19 +209,24 @@ async def test_invalid_window_rejected(client: AsyncClient, db_session: AsyncSes
 async def test_dhcp_agent_metrics_ingest_roundtrip(
     client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    """POST → dedupe on (server_id, bucket_at) → read back via /timeseries.
+    """Direct insert → read back via /timeseries.
 
-    We skip the real agent auth path for brevity — the critical
-    invariant is that a repeat POST overwrites instead of duplicating.
+    This does NOT exercise the ingest handler — it writes rows straight to
+    the table — so it says nothing about what a repeat POST does. That
+    behaviour changed in #980 (a second report for an existing bucket is now
+    ADDED, not substituted, because the agent's minute-floored bucket and its
+    60 s +/- 3 s interval put two real deltas in one bucket about once in
+    forty) and is covered by the round-trip tests in
+    ``test_dhcp_packet_loss.py``. What this test pins is the read side:
+    one row per (server_id, bucket_at), surfaced by the timeseries endpoint.
     """
     _, token = await _make_user(db_session)
     server = await _make_dhcp_server(db_session)
     now = datetime.now(UTC).replace(second=0, microsecond=0)
 
-    # Insert directly (agent-auth happy-path is covered elsewhere):
-    # two writes to the same bucket with different values — the second
-    # must overwrite, not duplicate, so the read-back shows 7/5, not
-    # (3/2) + (7/5).
+    # Insert directly (the ingest handler is covered in
+    # test_dhcp_packet_loss.py): the primary key admits one row per
+    # (server_id, bucket_at), so the read-back shows that row's values.
     db_session.add(
         DHCPMetricSample(
             server_id=server.id,

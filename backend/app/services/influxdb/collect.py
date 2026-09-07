@@ -155,7 +155,11 @@ async def collect_dns_points(
 async def collect_dhcp_points(
     db: AsyncSession, watermark: datetime | None
 ) -> tuple[list[Point], datetime | None]:
-    """DHCP message-count deltas — same two-query shape as the DNS side."""
+    """DHCP message-count deltas — same two-query shape as the DNS side.
+
+    Carries the #980 loss counters too. They are the only reason a field can
+    be absent from a point here: everything else is NOT NULL.
+    """
 
     def _point(sample: Any, server_name: str | None) -> Point:
         return Point(
@@ -170,6 +174,21 @@ async def collect_dhcp_points(
                 "decline": int(sample.decline),
                 "release": int(sample.release),
                 "inform": int(sample.inform),
+                # #980 — loss, not traffic. Omitted (not zero-filled) when
+                # NULL: the agent did not measure it, and line protocol has
+                # no null, so writing 0 would assert "no packets were lost"
+                # on a server nobody looked at. An absent field leaves a gap
+                # in the series, which is the honest rendering.
+                **(
+                    {"socket_drop": int(sample.socket_drop)}
+                    if sample.socket_drop is not None
+                    else {}
+                ),
+                **(
+                    {"receive_drop": int(sample.receive_drop)}
+                    if sample.receive_drop is not None
+                    else {}
+                ),
             },
             timestamp=_epoch(sample.bucket_at),
         )

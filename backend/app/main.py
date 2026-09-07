@@ -512,6 +512,18 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_node_pressure_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("node_pressure_alert_rule_seed_skipped", reason=str(exc))
+    # DHCP packet-loss alert rule — singleton, ENABLED by default (issue
+    # #980). Reads counters every Kea agent reports unconditionally; a server
+    # whose agent is too old to report them is skipped, not alarmed on, so
+    # enabling it everywhere is silent until it is real. Idempotent.
+    try:
+        from app.services.alerts import (  # noqa: PLC0415
+            seed_dhcp_packets_dropped_alert_rule,
+        )
+
+        await seed_dhcp_packets_dropped_alert_rule()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("dhcp_packets_dropped_alert_rule_seed_skipped", reason=str(exc))
     # DNS query-anomaly alert rules — NXDOMAIN-spike + query-rate-spike,
     # singletons, DISABLED by default (issue #371). Discoverable in the
     # Alerts UI; fire only on agent-based BIND9 installs with metric data.

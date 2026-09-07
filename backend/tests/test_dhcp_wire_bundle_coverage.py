@@ -50,6 +50,8 @@ SHIPPED: frozenset[str] = frozenset(
         "dhcp_socket_type",  # → inside the synthesized "server" block
         "lease_cache_threshold",  # → "server" block (group-wide default)
         "lease_cache_max_age",  # → "server" block
+        "kea_thread_pool_size",  # #980 → "server" block
+        "kea_packet_logging",  # #980 → "server" block
         "radvd_conf",
         "ra_configs",
     }

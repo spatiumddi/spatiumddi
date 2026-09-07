@@ -60,6 +60,16 @@ class GroupCreate(BaseModel):
     # do not simply inherit it.
     lease_cache_threshold: float = Field(default=0.0, ge=0.0, le=1.0)
     lease_cache_max_age: int | None = Field(default=None, ge=1)
+    # #980 — Kea packet-worker pool size. 1 (the default) measured 1.7x-2.9x
+    # more packets served than Kea's own auto-sizing on every CPU allocation
+    # tested; ``0`` hands sizing back to Kea (one worker per HOST cpu,
+    # regardless of the container's cgroup share). Capped at 64 because this
+    # is a pool-size knob, not a free-form integer, and a four-digit value is
+    # a typo that renders a config Kea accepts and then thrashes on.
+    kea_thread_pool_size: int = Field(default=1, ge=0, le=64)
+    # #980 — True (default) keeps today's per-packet log detail. False
+    # silences DHCP4_PACKET_RECEIVED / _SEND for ~1.30x more packets served.
+    kea_packet_logging: bool = True
 
     @field_validator("mode")
     @classmethod
@@ -88,6 +98,8 @@ class GroupUpdate(BaseModel):
     auto_failover: bool | None = None
     lease_cache_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
     lease_cache_max_age: int | None = Field(default=None, ge=1)
+    kea_thread_pool_size: int | None = Field(default=None, ge=0, le=64)
+    kea_packet_logging: bool | None = None
 
     @field_validator("mode")
     @classmethod
@@ -128,6 +140,8 @@ class GroupResponse(BaseModel):
     auto_failover: bool
     lease_cache_threshold: float
     lease_cache_max_age: int | None
+    kea_thread_pool_size: int
+    kea_packet_logging: bool
     # Computed: count of Kea servers currently in the group. ≥ 2 means
     # the group renders the libdhcp_ha.so hook on every peer.
     kea_member_count: int = 0
@@ -155,6 +169,8 @@ def _group_to_response(g: DHCPServerGroup) -> GroupResponse:
         auto_failover=g.auto_failover,
         lease_cache_threshold=g.lease_cache_threshold,
         lease_cache_max_age=g.lease_cache_max_age,
+        kea_thread_pool_size=g.kea_thread_pool_size,
+        kea_packet_logging=g.kea_packet_logging,
         kea_member_count=len(kea),
         servers=[
             ServerSummary(
@@ -224,9 +240,10 @@ async def update_group(
     }
     for k, v in changes.items():
         setattr(g, k, v)
-    # HA tuning (mode / heartbeat / delays / auto-failover) and the Kea
-    # socket mode (#365) all render into every member's bundle, so wake the
-    # group channel — the bundle ETag shifts and agents re-render promptly.
+    # HA tuning (mode / heartbeat / delays / auto-failover), the Kea socket
+    # mode (#365) and the packet-worker pool size (#980) all render into
+    # every member's bundle, so wake the group channel — the bundle ETag
+    # shifts and agents re-render promptly.
     collect_wake(dhcp_group_channel(g.id))
     write_audit(
         db,

@@ -610,3 +610,78 @@ async def test_scope_lease_gauge_counts_addresses_not_rows(
     points = await collect_dhcp_scope_lease_points(db_session, datetime.now(UTC))
     gauge = next(p for p in points if p.tags["scope_id"] == str(scope.id))
     assert gauge.fields["active_leases"] == 2  # not 3
+
+
+# ── #980 loss counters in the DHCP export ──────────────────────────
+
+
+async def _dhcp_sample(db: AsyncSession, bucket_at: datetime, **loss: int | None) -> uuid.UUID:
+    from app.models.dhcp import DHCPServer, DHCPServerGroup
+    from app.models.metrics import DHCPMetricSample
+
+    group = DHCPServerGroup(name=f"g-{uuid.uuid4().hex[:6]}")
+    db.add(group)
+    await db.flush()
+    server = DHCPServer(
+        server_group_id=group.id,
+        name=f"kea {uuid.uuid4().hex[:4]}",
+        driver="kea",
+        host="10.0.0.67",
+        port=67,
+    )
+    db.add(server)
+    await db.flush()
+    db.add(
+        DHCPMetricSample(
+            server_id=server.id,
+            bucket_at=bucket_at,
+            discover=5,
+            offer=5,
+            request=5,
+            ack=5,
+            nak=0,
+            decline=0,
+            release=0,
+            inform=0,
+            **loss,
+        )
+    )
+    await db.flush()
+    return server.id
+
+
+@pytest.mark.asyncio
+async def test_dhcp_export_carries_the_loss_counters(db_session: AsyncSession) -> None:
+    """#980 — they were the only DHCPMetricSample columns the exporter missed."""
+    from app.services.influxdb.collect import collect_dhcp_points
+
+    base = datetime.now(UTC).replace(microsecond=0) - timedelta(minutes=10)
+    await _dhcp_sample(db_session, base, socket_drop=12, receive_drop=3)
+
+    points, _ = await collect_dhcp_points(db_session, None)
+    assert len(points) == 1
+    assert points[0].fields["socket_drop"] == 12
+    assert points[0].fields["receive_drop"] == 3
+
+
+@pytest.mark.asyncio
+async def test_dhcp_export_omits_an_unmeasured_counter(db_session: AsyncSession) -> None:
+    """Line protocol has no null, so an unmeasured counter must be OMITTED.
+
+    Writing 0 would assert "no packets were lost" on a server nobody looked
+    at — the same false reassurance #980 exists to remove, published into the
+    operator's long-term metrics store where it outlives the agent upgrade
+    that would have corrected it. An absent field leaves a gap in the series,
+    which is the honest rendering.
+    """
+    from app.services.influxdb.collect import collect_dhcp_points
+
+    base = datetime.now(UTC).replace(microsecond=0) - timedelta(minutes=10)
+    await _dhcp_sample(db_session, base, socket_drop=None, receive_drop=None)
+
+    points, _ = await collect_dhcp_points(db_session, None)
+    assert len(points) == 1
+    assert "socket_drop" not in points[0].fields
+    assert "receive_drop" not in points[0].fields
+    # The traffic counters are unaffected — the point is still emitted.
+    assert points[0].fields["discover"] == 5

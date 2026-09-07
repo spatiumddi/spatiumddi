@@ -14,11 +14,13 @@ import {
   ScrollText,
   Server,
 } from "lucide-react";
+import { bucketLoss, summariseLoss } from "@/lib/dhcp-loss";
 import {
   Area,
-  AreaChart,
   CartesianGrid,
+  ComposedChart,
   Legend,
+  Line,
   ResponsiveContainer,
   Tooltip,
   XAxis,
@@ -802,8 +804,17 @@ function StatsTab({ serverId }: { serverId: string }) {
       nak: b.nak,
       decline: b.decline,
       release: b.release,
+      // #980 — DROPPED is socket_drop ALONE, and an unmeasured bucket stays
+      // null so Recharts breaks the line there: a gap where nobody looked,
+      // not a zero. See lib/dhcp-loss.ts for why receive_drop is excluded
+      // and why the coalesce matters.
+      dropped: bucketLoss(b),
     }));
   }, [data, withDate]);
+
+  // #980 — three states, not two: measured and lossy, measured and clean,
+  // never measured. The third must not render as the second.
+  const loss = useMemo(() => summariseLoss(data?.rate_buckets ?? []), [data]);
 
   // date_bin emits only non-empty buckets, so an idle server usually yields
   // points.length === 0. But a window can also hold rows whose seven plotted
@@ -820,7 +831,12 @@ function StatsTab({ serverId }: { serverId: string }) {
             p.ack +
             p.nak +
             p.decline +
-            p.release >
+            p.release +
+            // #980 — loss counts as activity. A server starved badly enough
+            // that nothing completes has zeros in every message column and
+            // thousands of drops, and "No activity in the last 1h" is the
+            // worst possible thing to tell an operator at that moment.
+            (p.dropped ?? 0) >
           0,
       ),
     [points],
@@ -841,6 +857,22 @@ function StatsTab({ serverId }: { serverId: string }) {
                 {data.leases_active === 1 ? "lease" : "leases"}
               </span>
             )}
+            {data &&
+              (!loss.measured ? (
+                <span
+                  className="rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground"
+                  title="This server's agent does not report kernel-side packet loss (it predates the counters, or cannot read /proc/net/udp). This is NOT the same as reporting no loss."
+                >
+                  loss not measured
+                </span>
+              ) : loss.total > 0 ? (
+                <span
+                  className="rounded bg-rose-500/15 px-1.5 py-0.5 text-[10px] font-medium text-rose-600"
+                  title="Packets the kernel discarded before the server could read them — its receive buffer filled. Most often the node is short of CPU: Kea answers 100% of what it reads, so no other signal shows this. Does not count packets Kea read and dropped on purpose, such as a blocklisted MAC."
+                >
+                  {loss.total} dropped
+                </span>
+              ) : null)}
           </div>
           <select
             value={range}
@@ -867,7 +899,7 @@ function StatsTab({ serverId }: { serverId: string }) {
             </p>
           ) : (
             <ResponsiveContainer width="100%" height="100%">
-              <AreaChart
+              <ComposedChart
                 data={points}
                 margin={{ top: 5, right: 12, left: 0, bottom: 0 }}
               >
@@ -902,7 +934,24 @@ function StatsTab({ serverId }: { serverId: string }) {
                     strokeWidth={1.5}
                   />
                 ))}
-              </AreaChart>
+                {/* #980 — a LINE, not another stacked area: dropped packets
+                    are not a message type and adding them to the stack would
+                    inflate the traffic total by the traffic that never
+                    arrived. Rendered only once something has been measured,
+                    so an un-upgraded agent shows no misleading flat zero. */}
+                {loss.measured && (
+                  <Line
+                    type="monotone"
+                    dataKey="dropped"
+                    name="DROPPED"
+                    stroke="#e11d48"
+                    strokeWidth={2}
+                    strokeDasharray="4 2"
+                    dot={false}
+                    connectNulls={false}
+                  />
+                )}
+              </ComposedChart>
             </ResponsiveContainer>
           )}
         </div>

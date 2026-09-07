@@ -41,6 +41,16 @@ export function CreateServerGroupModal({
   const [leaseCacheMaxAge, setLeaseCacheMaxAge] = useState(
     group?.lease_cache_max_age != null ? String(group.lease_cache_max_age) : "",
   );
+  // #980 — Kea packet-path tuning. `?? 1` / `?? true` rather than a falsy
+  // fallback: 0 is a real pool size (Kea's auto) and false is a real logging
+  // choice, so `||` would silently rewrite either back to the default when
+  // editing a group that had opted out.
+  const [threadPoolSize, setThreadPoolSize] = useState(
+    String(group?.kea_thread_pool_size ?? 1),
+  );
+  const [packetLogging, setPacketLogging] = useState(
+    group?.kea_packet_logging ?? true,
+  );
   const [error, setError] = useState("");
 
   const isHA = mode === "hot-standby" || mode === "load-balancing";
@@ -70,6 +80,17 @@ export function CreateServerGroupModal({
         throw new Error("Lease cache max age must be at least 1 second.");
       }
 
+      // #980 — blank means the default (1), not 0: 0 is "let Kea auto-size",
+      // which is the behaviour this setting exists to replace, and clearing a
+      // box should not opt you into it.
+      const parsedPool =
+        threadPoolSize.trim() === "" ? 1 : parseInt(threadPoolSize, 10);
+      if (Number.isNaN(parsedPool) || parsedPool < 0 || parsedPool > 64) {
+        throw new Error(
+          "Packet worker threads must be between 0 and 64 (0 = let Kea decide).",
+        );
+      }
+
       const data = {
         name,
         description,
@@ -82,6 +103,8 @@ export function CreateServerGroupModal({
         auto_failover: autoFailover,
         lease_cache_threshold: parsedCacheThreshold,
         lease_cache_max_age: parsedCacheMaxAge,
+        kea_thread_pool_size: parsedPool,
+        kea_packet_logging: packetLogging,
       };
       return editing
         ? dhcpApi.updateGroup(group!.id, data)
@@ -195,6 +218,50 @@ export function CreateServerGroupModal({
                 value={leaseCacheMaxAge}
                 onChange={(e) => setLeaseCacheMaxAge(e.target.value)}
               />
+            </Field>
+          </div>
+        </div>
+
+        <div className="rounded-md border bg-muted/20 p-3 space-y-3">
+          <p className="text-xs font-semibold text-muted-foreground">
+            Packet path (#980)
+          </p>
+          <p className="text-xs text-muted-foreground">
+            When a Kea server is short of CPU it stops draining its receive
+            socket fast enough and the kernel discards DHCP packets before Kea
+            ever sees them. Kea reports itself perfectly healthy throughout — it
+            answers 100% of what it reads — so the only symptom is clients
+            taking several retransmit rounds to get an address. Watch{" "}
+            <strong>Dropped</strong> on a server&apos;s Stats tab to see whether
+            it is happening here.
+          </p>
+          <div className="grid grid-cols-2 gap-3">
+            <Field
+              label="Packet worker threads"
+              hint="Kea's multi-threading.thread-pool-size. Left to Kea, this is one worker per CPU on the MACHINE, ignoring the share this container actually gets — and those workers then compete with the single thread that has to drain the receive socket. 1 (the default) measured 1.7x–2.9x more packets served than Kea's auto-sizing at every CPU allocation tested. 0 hands sizing back to Kea."
+            >
+              <input
+                className={inputCls}
+                type="number"
+                min="0"
+                max="64"
+                step="1"
+                value={threadPoolSize}
+                onChange={(e) => setThreadPoolSize(e.target.value)}
+              />
+            </Field>
+            <Field
+              label="Per-packet logging"
+              hint="Kea logs four lines per transaction. Turning this off raises only the two that restate the transaction (DHCP4_PACKET_RECEIVED / _SEND, carrying the source address and receiving interface) to WARN, for roughly 1.3x more packets served on a constrained node. The lines naming the client and the address handed out stay, so the Logs tab keeps one entry per transaction."
+            >
+              <label className="flex items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  checked={packetLogging}
+                  onChange={(e) => setPacketLogging(e.target.checked)}
+                />
+                Log every packet received and sent
+              </label>
             </Field>
           </div>
         </div>

@@ -63,5 +63,24 @@ class DHCPMetricSample(Base):
     release: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     inform: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
 
+    # #980 — the two loss counters, and the reason they are NULLABLE where
+    # every column above is NOT NULL DEFAULT 0.
+    #
+    # ``receive_drop`` is Kea's own ``pkt4/6-receive-drop``: packets it read
+    # and then discarded. ``socket_drop`` is the kernel's per-socket
+    # ``sk_drops`` on UDP/67 + UDP/547 — packets Kea never saw because its
+    # receive buffer was full. They are not interchangeable, and the second
+    # is the one that moves when a node is short of CPU: measured against
+    # kea-dhcp4 3.0.3, a run that lost 9,700 datagrams to buffer overflow
+    # left ``pkt4-receive-drop`` at 0 for its whole duration.
+    #
+    # NULL means UNMEASURED, and only NULL can mean that. An agent older
+    # than #980 reports neither field, and 0 from such an agent would read
+    # as "this server has dropped nothing" — the precise false reassurance
+    # the issue was filed about. Every reader must render NULL as unknown
+    # rather than folding it to zero.
+    receive_drop: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    socket_drop: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
 
 __all__ = ["DNSMetricSample", "DHCPMetricSample"]

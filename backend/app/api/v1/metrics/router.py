@@ -108,6 +108,15 @@ class DHCPTimePoint(BaseModel):
     decline: int
     release: int
     inform: int
+    #: #980 — packets lost, and where. ``receive_drop`` is Kea's own
+    #: ``pkt4/6-receive-drop`` (read, then discarded); ``socket_drop`` is the
+    #: kernel dropping datagrams Kea never got to read, which is what a
+    #: CPU-starved node does while every Kea counter still reports health.
+    #: ``None`` means no sample in this point measured it — an agent older
+    #: than #980, or one that cannot read ``/proc/net/udp`` — and must be
+    #: rendered as unknown, not as zero.
+    receive_drop: int | None = None
+    socket_drop: int | None = None
 
 
 class DHCPTimeseries(BaseModel):
@@ -211,6 +220,11 @@ async def dhcp_timeseries(
         func.sum(DHCPMetricSample.decline).label("decline"),
         func.sum(DHCPMetricSample.release).label("release"),
         func.sum(DHCPMetricSample.inform).label("inform"),
+        # #980 — SUM over an all-NULL group is NULL, which is the correct
+        # answer here (nothing measured) and the reason these are not
+        # coalesced like the counters above.
+        func.sum(DHCPMetricSample.receive_drop).label("receive_drop"),
+        func.sum(DHCPMetricSample.socket_drop).label("socket_drop"),
     ).where(DHCPMetricSample.bucket_at >= since)
     if server_id is not None:
         stmt = stmt.where(DHCPMetricSample.server_id == server_id)
@@ -229,6 +243,10 @@ async def dhcp_timeseries(
             decline=int(row.decline or 0),
             release=int(row.release or 0),
             inform=int(row.inform or 0),
+            # ``is None`` rather than ``or``: 0 is measured, and means the
+            # opposite of unmeasured.
+            receive_drop=None if row.receive_drop is None else int(row.receive_drop),
+            socket_drop=None if row.socket_drop is None else int(row.socket_drop),
         )
         for row in rows
     ]
