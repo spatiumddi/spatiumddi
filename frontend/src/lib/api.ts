@@ -11024,6 +11024,20 @@ export interface RemoteAccess {
 export const applianceApi = {
   getInfo: () => api.get<ApplianceInfo>("/appliance/info").then((r) => r.data),
   /**
+   * #999 Part B — run an md / multipath management action on one
+   * appliance. Superadmin + audited; the control plane validates what
+   * may be ASKED for and the host runner re-checks what is safe to do at
+   * the moment of the action (its view of the array is current, ours is
+   * up to one heartbeat old).
+   */
+  storageAction: (applianceId: string, body: StorageActionRequest) =>
+    api
+      .post<StorageActionResult>(
+        `/appliance/appliances/${applianceId}/storage/action`,
+        body,
+      )
+      .then((r) => r.data),
+  /**
    * Read by BOTH lockout-sensitive screens (Firewall → Web UI access, and
    * SSH → source restriction) so each can show the state of the OTHER door.
    * Lives on the always-mounted hub, not under /appliance/firewall, because
@@ -12173,7 +12187,22 @@ export interface ApplianceRow {
     nodes_ready?: number;
     pods_total?: number;
     pods_by_phase?: Record<string, number>;
+    // #999 Part A — raw md / multipath reading, with NO verdict attached
+    // (the appliance row carries that in `storage_findings` below). Typed
+    // as the reading rather than as `NodeStorage` on purpose: `findings`
+    // is added by the cluster-health merge and is absent here, so the
+    // wider type would let a caller read `undefined` and type-check.
+    storage?: NodeStorageReading;
   };
+  // #999 Part A — storage redundancy, classified server-side by the same
+  // function that backs the `appliance_storage_degraded` alert and the
+  // `find_appliance_storage` copilot tool, so no two surfaces can
+  // disagree about whether an array is in trouble.
+  storage_findings: StorageFinding[];
+  storage_worst_severity: string | null;
+  // False = the supervisor never looked (too old to collect it), which is
+  // UNKNOWN — distinct from "looked and found no arrays".
+  storage_reported: boolean;
   // Issue #183 Phase 5 — installed k3s version (e.g. ``v1.36.4+k3s1``).
   // Null on legacy compose / pre-#183 supervisors.
   k3s_version: string | null;
@@ -12617,6 +12646,127 @@ export interface HostPartition {
   used_bytes: number;
 }
 
+/** One member of a software-RAID array (#999 Part A). */
+export interface MdMember {
+  device: string;
+  /** The kernel's own comma-joined member state, verbatim. */
+  state: string;
+  slot: number | null;
+}
+
+/** A rebuild / resync / scrub in progress. Absent when idle. */
+export interface MdSync {
+  action: string;
+  percent: number | null;
+  eta_seconds: number | null;
+}
+
+export interface MdArray {
+  name: string;
+  level: string;
+  /**
+   * DERIVED, not the kernel's `array_state`: a raid1 down to one member
+   * reports `clean` because the survivor is internally consistent.
+   * `unknown` when the member count could not be read — which is never
+   * to be rendered as healthy.
+   */
+  state: string;
+  array_state: string;
+  /** `null` when `raid_disks` was unreadable — never 0, which would make
+   * every degradation test false and read as clean. */
+  members_expected: number | null;
+  members_in_sync: number;
+  members_faulty: number;
+  spares: number;
+  /** How many more members can be lost before the array stops serving. */
+  redundancy_remaining: number | null;
+  min_working_members: number | null;
+  size_bytes: number | null;
+  members: MdMember[];
+  sync: MdSync | null;
+}
+
+export interface MultipathPath {
+  device: string;
+  /** dm's own path verdict — always `unknown` until #999 Part B. */
+  state: string;
+  /** SCSI device state (`running` / `offline` / `blocked`), or null. */
+  device_state: string | null;
+}
+
+export interface MultipathMap {
+  name: string;
+  dm_device: string;
+  uuid: string;
+  paths_total: number;
+  /** Paths whose SCSI device reports a DEFINITE fault. */
+  paths_faulted: number;
+  size_bytes: number | null;
+  paths: MultipathPath[];
+}
+
+/** One classified thing worth saying about a node's redundancy. */
+/** #999 Part B — an md / multipath management action. */
+export interface StorageActionRequest {
+  action:
+    | "scrub_start"
+    | "scrub_cancel"
+    | "fail_member"
+    | "remove_member"
+    | "add_member"
+    | "mpath_reinstate"
+    | "mpath_topology";
+  array?: string | null;
+  device?: string | null;
+  /**
+   * Destructive actions require the DEVICE path typed back verbatim — a
+   * typed confirmation that is not the thing being destroyed is a
+   * click-through with extra steps.
+   */
+  confirm?: string | null;
+}
+
+export interface StorageActionResult {
+  ok: boolean;
+  action: string;
+  detail: string;
+  output: string | null;
+}
+
+export interface StorageFinding {
+  /** `critical` | `warning` | `info`. */
+  severity: string;
+  /** `md` | `multipath`. */
+  kind: string;
+  name: string;
+  detail: string;
+}
+
+/**
+ * The raw reading, exactly as the supervisor shipped it. This is what
+ * rides in an `ApplianceRow`'s `cluster_health` JSONB — no verdict, and
+ * the row carries the classification in its own `storage_findings`.
+ */
+export interface NodeStorageReading {
+  md_supported: boolean;
+  md_arrays: MdArray[];
+  multipath_maps: MultipathMap[];
+}
+
+/**
+ * The reading plus its server-derived verdict, as the cluster-health
+ * snapshot returns it per node.
+ *
+ * The verdict is never re-derived in the browser: severity keys off
+ * redundancy remaining, not off `state`, and a second copy of that rule
+ * in TypeScript is exactly how a chip ends up saying "clean" while the
+ * alert says "degraded".
+ */
+export interface NodeStorage extends NodeStorageReading {
+  findings: StorageFinding[];
+  worst_severity: string | null;
+}
+
 export interface ClusterNodeVitals {
   name: string;
   ready: boolean;
@@ -12648,6 +12798,12 @@ export interface ClusterNodeVitals {
   psi_memory: ClusterPSIStats | null;
   psi_io: ClusterPSIStats | null;
   host_disk_partitions: HostPartition[];
+  /**
+   * `null` means the supervisor has not reported storage at all (too old
+   * to collect it) — UNKNOWN, never a green tick. An empty snapshot is a
+   * real "no arrays here" reading.
+   */
+  host_storage: NodeStorage | null;
 }
 
 /** One /proc/pressure line's rolling averages, as % of wall time. */

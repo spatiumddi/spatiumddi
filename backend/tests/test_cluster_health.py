@@ -349,6 +349,116 @@ async def test_health_endpoint_merges_host_partitions(
     assert root["total_bytes"] == 8_000_000_000
 
 
+@pytest.mark.asyncio
+async def test_host_storage_merged_with_derived_findings(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#999 Part A — md / multipath state rides the same cluster_health
+    JSONB as the #402 partitions, and the node carries the CLASSIFIED
+    verdict, not just the raw reading.
+
+    The verdict is derived server-side on purpose: the browser would
+    otherwise need its own copy of "severity comes from redundancy
+    remaining, not from the state string", and a drifted copy shows a
+    green chip over a red alert.
+    """
+    import hashlib
+    import os
+
+    from app.models.appliance import APPLIANCE_STATE_APPROVED, Appliance
+
+    _patch_kube(monkeypatch)  # kube node is "ddi1"
+    der = os.urandom(32)
+    db_session.add(
+        Appliance(
+            id=uuid.uuid4(),
+            hostname="ddi1",
+            public_key_der=der,
+            public_key_fingerprint=hashlib.sha256(der).hexdigest(),
+            state=APPLIANCE_STATE_APPROVED,
+            deployment_kind="appliance",
+            appliance_variant="control-plane",
+            session_token_hash="deadbeef",
+            cluster_health={
+                "kubeapi_ready": True,
+                "storage": {
+                    "md_supported": True,
+                    "md_arrays": [
+                        {
+                            "name": "md0",
+                            "level": "raid1",
+                            # The kernel says clean; the collector says
+                            # degraded, because one member is gone.
+                            "state": "degraded",
+                            "array_state": "clean",
+                            "members_expected": 2,
+                            "members_in_sync": 1,
+                            "members_faulty": 1,
+                            "spares": 0,
+                            "redundancy_remaining": 0,
+                            "min_working_members": 1,
+                            "size_bytes": 1000203804160,
+                            "members": [
+                                {"device": "sda1", "state": "in_sync", "slot": 0},
+                                {"device": "sdb1", "state": "faulty", "slot": None},
+                            ],
+                        }
+                    ],
+                    "multipath_maps": [],
+                },
+            },
+        )
+    )
+    admin = await _superadmin(db_session)
+    await db_session.commit()
+
+    r = await client.get(_HEALTH_URL, headers=_bearer(admin))
+    assert r.status_code == 200, r.text
+    node = r.json()["nodes"][0]
+    storage = node["host_storage"]
+    assert storage["md_supported"] is True
+    assert storage["md_arrays"][0]["array_state"] == "clean"
+    assert storage["md_arrays"][0]["state"] == "degraded"
+    assert storage["worst_severity"] == "critical"
+    assert len(storage["findings"]) == 1
+    assert "no redundancy remains" in storage["findings"][0]["detail"]
+
+
+@pytest.mark.asyncio
+async def test_host_storage_null_when_supervisor_never_reported(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A supervisor too old to collect storage leaves ``host_storage``
+    null — UNKNOWN, which the node card renders as nothing at all rather
+    than as an empty (and therefore reassuring) snapshot."""
+    import hashlib
+    import os
+
+    from app.models.appliance import APPLIANCE_STATE_APPROVED, Appliance
+
+    _patch_kube(monkeypatch)
+    der = os.urandom(32)
+    db_session.add(
+        Appliance(
+            id=uuid.uuid4(),
+            hostname="ddi1",
+            public_key_der=der,
+            public_key_fingerprint=hashlib.sha256(der).hexdigest(),
+            state=APPLIANCE_STATE_APPROVED,
+            deployment_kind="appliance",
+            appliance_variant="control-plane",
+            session_token_hash="deadbeef",
+            cluster_health={"kubeapi_ready": True},
+        )
+    )
+    admin = await _superadmin(db_session)
+    await db_session.commit()
+
+    r = await client.get(_HEALTH_URL, headers=_bearer(admin))
+    assert r.status_code == 200, r.text
+    assert r.json()["nodes"][0]["host_storage"] is None
+
+
 # ── PSI (#983 Phase 2 item 7) ───────────────────────────────────────────────
 #
 # The whole point of these is the null/zero distinction. A kubelet below 1.36

@@ -1,0 +1,121 @@
+#!/bin/bash
+# spatiumddi-esp-sync — keep the mirror member's ESP in step with the
+# primary's (#999 Part C2).
+#
+# WHY THIS EXISTS, stated plainly because it is the part of a RAID1
+# install that is easy to skip and fatal to skip:
+#
+#   The ESP cannot be an md member. Firmware reads it before any md
+#   driver exists, so a mirrored install has TWO independent ESPs, and
+#   nothing in the kernel keeps them in step. Every slot upgrade writes
+#   a new kernel + initrd and re-stamps grub.cfg; every set-default /
+#   set-next-boot writes grubenv. All of that lands on the PRIMARY ESP
+#   only. Pull the primary disk after an upgrade and the survivor boots
+#   the OLD kernel from a stale menu — a mirror that protected the data
+#   and lost the appliance.
+#
+# So this is called after every ESP mutation:
+#   * spatium-install, once, so the box is redundant from install
+#   * spatium-upgrade-slot, after the kernel/initrd/grub.cfg write
+#   * spatium-grub-render, after re-rendering the menu
+#   * the slot set-default / set-next-boot host runners, after grubenv
+#
+# It is a NO-OP on a single-disk appliance (no ESP2 label, exit 0), so
+# every caller can invoke it unconditionally without branching on
+# whether this install is mirrored.
+#
+# Usage: spatiumddi-esp-sync [--install-root DIR] [--check]
+#   --install-root  prefix for /boot/efi (the installer runs it in a
+#                   chroot where that is "/", the host leaves it unset)
+#   --check         report whether the two ESPs agree; change nothing.
+#                   Exit 0 = in sync (or not mirrored), 1 = drifted.
+
+set -euo pipefail
+
+INSTALL_ROOT=""
+CHECK_ONLY=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --install-root) INSTALL_ROOT="${2%/}"; shift 2 ;;
+        --check)        CHECK_ONLY=1; shift ;;
+        *) echo "unknown argument: $1" >&2; exit 2 ;;
+    esac
+done
+
+LOG_DIR="${INSTALL_ROOT}/var/log/spatiumddi"
+LOG="$LOG_DIR/esp-sync.log"
+PRIMARY="${INSTALL_ROOT}/boot/efi"
+MNT="${INSTALL_ROOT}/run/spatiumddi-esp2"
+
+log() {
+    mkdir -p "$LOG_DIR" 2>/dev/null || true
+    printf '%s %s\n' "$(date -Is 2>/dev/null || echo -)" "$*" >> "$LOG" 2>/dev/null || true
+}
+
+# Not a mirrored install → nothing to do, and that is a success.
+# Resolved by LABEL rather than by a recorded device name because disk
+# enumeration is not stable and this runs on every upgrade for the life
+# of the appliance.
+ESP2=$(blkid -L ESP2 2>/dev/null || true)
+if [ -z "$ESP2" ] || [ ! -b "$ESP2" ]; then
+    exit 0
+fi
+
+if [ ! -d "$PRIMARY/grub" ]; then
+    log "primary ESP has no grub directory at $PRIMARY — refusing to sync"
+    exit 1
+fi
+
+cleanup() {
+    if mountpoint -q "$MNT" 2>/dev/null; then
+        umount "$MNT" 2>/dev/null || true
+    fi
+    rmdir "$MNT" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+mkdir -p "$MNT"
+if ! mount "$ESP2" "$MNT" 2>>"$LOG"; then
+    log "could not mount ESP2 ($ESP2) — mirror member boot config is STALE"
+    exit 1
+fi
+
+if [ "$CHECK_ONLY" = 1 ]; then
+    # --dry-run with an itemised change list: any output means drift.
+    #
+    # ``-t`` AND ``--modify-window=2``, and both halves are required —
+    # verified on a live mirrored appliance, where the first fix was not
+    # enough.
+    #
+    # Dropping ``--no-times`` was necessary but useless on its own:
+    # ``-r`` does not imply ``-t``, so rsync still never PRESERVED the
+    # mtimes it was now willing to compare. Every file came back
+    # ``>f..T......`` on the very next run — the check reported the whole
+    # ESP as drifted, could never say "in sync", and the real sync
+    # re-copied everything every time. ``-t`` preserves them; the
+    # two-second window is because FAT stores mtimes at that resolution
+    # and an exact compare would never match either.
+    drift=$(rsync -rtin --delete --modify-window=2 --no-perms --no-owner --no-group \
+        "$PRIMARY/" "$MNT/" 2>/dev/null | head -20 || true)
+    if [ -n "$drift" ]; then
+        echo "ESP drift:"
+        echo "$drift"
+        exit 1
+    fi
+    echo "ESPs are in sync"
+    exit 0
+fi
+
+# -rt not -a: FAT carries no ownership or symlinks, so preserving those
+# is both impossible and a source of spurious "changed" results — but
+# TIMES must be preserved or the quick check has nothing to match on.
+# --delete so a file removed from the primary (an old kernel) does not
+# linger on the mirror and get booted.
+if rsync -rt --delete --modify-window=2 --no-perms --no-owner --no-group \
+        "$PRIMARY/" "$MNT/" 2>>"$LOG"; then
+    sync
+    log "ESP2 synced from $PRIMARY"
+else
+    log "ERROR: rsync to ESP2 failed — mirror member boot config is STALE"
+    exit 1
+fi

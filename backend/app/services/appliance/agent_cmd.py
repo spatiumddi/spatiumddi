@@ -139,9 +139,23 @@ class _Dispatch:
         self.futures: dict[str, asyncio.Future[NetToolResult]] = {}
 
 
-# Module-level singleton — the single replacement point for a future
-# Redis-backed dispatch (see _Dispatch docstring).
-_dispatch = _Dispatch()
+# Module-level singletons, one per CHANNEL — still the single
+# replacement point for a future Redis-backed dispatch (see _Dispatch
+# docstring), now keyed by channel name.
+#
+# #999 Part B added the second channel. Storage management shares this
+# transport (per-appliance queue + per-request future + the readiness
+# fast-fail) and deliberately NOT this queue: a nettool is a read-only
+# reachability probe, while ``mdadm --add`` overwrites a disk. Keeping
+# them on separate queues means a long-running topology dump cannot sit
+# in front of a ping, the two poll endpoints can carry different
+# permissions, and neither endpoint's name lies about what it moves.
+_dispatches: dict[str, _Dispatch] = defaultdict(_Dispatch)
+
+#: The read-only reachability-tool channel (ping / dig / port-test / …).
+CHANNEL_NETTOOL = "nettool"
+#: The #999 md / multipath management channel.
+CHANNEL_STORAGE = "storage"
 
 
 def appliance_ready(
@@ -180,6 +194,7 @@ async def enqueue_command(
     *,
     ready: bool = True,
     timeout: float = 30.0,
+    channel: str = CHANNEL_NETTOOL,
 ) -> NetToolResult:
     """Enqueue a nettool job bound for ``appliance_id`` and await the
     supervisor's result.
@@ -203,9 +218,9 @@ async def enqueue_command(
     command = NetToolCommand(request_id=request_id, tool=tool, params=dict(params))
 
     future: asyncio.Future[NetToolResult] = asyncio.get_running_loop().create_future()
-    _dispatch.futures[request_id] = future
+    _dispatches[channel].futures[request_id] = future
 
-    await _dispatch.queues[appliance_id].put(command)
+    await _dispatches[channel].queues[appliance_id].put(command)
     logger.info(
         "appliance.nettool.enqueued",
         appliance_id=str(appliance_id),
@@ -228,10 +243,15 @@ async def enqueue_command(
     finally:
         # Always evict the future map entry — a late result goes to
         # ``deliver_result`` which logs + discards.
-        _dispatch.futures.pop(request_id, None)
+        _dispatches[channel].futures.pop(request_id, None)
 
 
-async def pop_command(appliance_id: uuid.UUID, *, timeout: float = 30.0) -> NetToolCommand | None:
+async def pop_command(
+    appliance_id: uuid.UUID,
+    *,
+    timeout: float = 30.0,
+    channel: str = CHANNEL_NETTOOL,
+) -> NetToolCommand | None:
     """Long-poll for the next nettool job bound for ``appliance_id``.
 
     Returns the dequeued command, or ``None`` if none arrives within
@@ -239,7 +259,7 @@ async def pop_command(appliance_id: uuid.UUID, *, timeout: float = 30.0) -> NetT
     skipped so the supervisor never runs stale work. Same loop shape as
     ``k8s_proxy.pop_request``.
     """
-    queue = _dispatch.queues[appliance_id]
+    queue = _dispatches[channel].queues[appliance_id]
     deadline = asyncio.get_running_loop().time() + timeout
     while True:
         remaining = deadline - asyncio.get_running_loop().time()
@@ -259,7 +279,7 @@ async def pop_command(appliance_id: uuid.UUID, *, timeout: float = 30.0) -> NetT
         return command
 
 
-def deliver_result(result: NetToolResult) -> bool:
+def deliver_result(result: NetToolResult, *, channel: str = CHANNEL_NETTOOL) -> bool:
     """Hand a supervisor-returned result to the awaiting future.
 
     Returns True on a successful match, False when the future has
@@ -267,7 +287,7 @@ def deliver_result(result: NetToolResult) -> bool:
     endpoint returns 200 either way — late delivery isn't a
     supervisor-side error. Mirrors ``k8s_proxy.deliver_response``.
     """
-    future = _dispatch.futures.get(result.request_id)
+    future = _dispatches[channel].futures.get(result.request_id)
     if future is None or future.done():
         logger.info("appliance.nettool.result_stale", request_id=result.request_id)
         return False
@@ -275,10 +295,10 @@ def deliver_result(result: NetToolResult) -> bool:
     return True
 
 
-def queue_depth(appliance_id: uuid.UUID) -> int:
+def queue_depth(appliance_id: uuid.UUID, *, channel: str = CHANNEL_NETTOOL) -> int:
     """Operator-facing diagnostic: how many nettool jobs are queued for
     this appliance?"""
-    queue = _dispatch.queues.get(appliance_id)
+    queue = _dispatches[channel].queues.get(appliance_id)
     return queue.qsize() if queue is not None else 0
 
 

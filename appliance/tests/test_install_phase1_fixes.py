@@ -113,11 +113,18 @@ def test_neither_grub_install_is_unconditionally_ignored():
     install that otherwise succeeded.
     """
     blk = _grub_block()
-    for line in blk.splitlines():
+    # Join backslash continuations first: the grub-install calls span
+    # several physical lines, so a swallowed ``|| true`` would land on a
+    # continuation that does not itself contain the word "grub-install".
+    # That gap is exactly why the blanket "no swallow anywhere in this
+    # block" assertion existed — but blanket also flags unrelated
+    # best-effort lines (#999 added a `umount ... || true` for the mirror
+    # member's ESP), so the rule is applied per INVOCATION instead: same
+    # coverage, no false positive.
+    logical = blk.replace("\\\n", " ")
+    for line in logical.splitlines():
         if "grub-install" in line or "--bootloader-id" in line:
             assert "|| true" not in line, line
-    # And the swallow the item was filed about is gone specifically.
-    assert ">> \"$INSTALL_LOG\" 2>&1 || true" not in blk
 
 
 def test_both_firmware_modes_have_a_fatal_branch():

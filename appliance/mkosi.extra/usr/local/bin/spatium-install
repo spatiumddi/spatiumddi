@@ -212,6 +212,13 @@ KEEP_VAR="no"
 # STATE say which physical disk was written to. sdX is assigned in
 # discovery order and #581 already notes it can move.
 TARGET_DISK_BY_ID=""
+# #999 Part C2 — install onto a two-disk RAID1 mirror. "yes" makes
+# state / root_A / root_B / var md members across TARGET_DISK and
+# TARGET_DISK2; the ESP and the BIOS boot partition stay per-disk
+# (firmware reads the ESP before any md driver exists).
+MIRROR_MODE="no"
+TARGET_DISK2=""
+TARGET_DISK2_BY_ID=""
 # Whether to turn off password SSH once a key is installed. Only offered
 # when at least one key is present, or it locks the operator out.
 SSH_DISABLE_PASSWORD="no"
@@ -1329,6 +1336,52 @@ _disk_by_id() {
     printf '%s' "$best"
 }
 
+# #999 Part C3 — (re)create the kpartx partition maps for a multipath
+# target after its GPT is written. A no-op on anything else.
+#
+# Verified as a real failure mode, not a theoretical one: without this,
+# partition_node returns /dev/mapper/<name>-part4 and nothing has created
+# it, so the mkfs that follows creates a regular FILE at that path on the
+# installer's tmpfs — and reports success. The install then completes and
+# produces a LUN with a partition table and no filesystems.
+_kpartx_add() {
+    local disk="$1"
+    case "$disk" in
+        /dev/mapper/*|*/dm-*) ;;
+        *) return 0 ;;
+    esac
+    if ! command -v kpartx >/dev/null 2>&1; then
+        log "FATAL: $disk is a device-mapper target but kpartx is not installed."
+        exit 1
+    fi
+    kpartx -u -a -s "$disk" >> "$INSTALL_LOG" 2>&1 || \
+        kpartx -a -s "$disk" >> "$INSTALL_LOG" 2>&1 || true
+    udevadm settle >> "$INSTALL_LOG" 2>&1 || true
+    log "kpartx partition maps for $disk: $(ls -1 "${disk}"-part* 2>/dev/null | tr '\n' ' ')"
+}
+
+# #999 Part C3 — the multipath maps present on this machine, as
+# "<mapname> <size>" lines. Empty when multipath-tools is not installed
+# or no LUN is multipathed, which is every ordinary appliance.
+#
+# Read from lsblk rather than from `multipath -ll` because lsblk needs no
+# daemon: on the live ISO multipathd may not have started, while the dm
+# devices udev created are already there.
+_multipath_maps() {
+    command -v multipath >/dev/null 2>&1 || return 0
+    lsblk -dn -o NAME,SIZE,TYPE -r 2>/dev/null | awk '$3 == "mpath" {print $1, $2}'
+}
+
+# How many paths back a multipath map. Counts the kernel's own slave
+# links, so it needs no daemon and cannot disagree with what the map is
+# actually built from.
+_mpath_path_count() {
+    local name="$1" dm
+    dm=$(readlink -f "/dev/mapper/$name" 2>/dev/null || true)
+    [ -n "$dm" ] || { echo 0; return 0; }
+    ls "/sys/block/$(basename "$dm")/slaves" 2>/dev/null | wc -l | tr -d ' '
+}
+
 # The WWN a disk reports, or "". Two paths to the same SAN LUN report the
 # same WWN, which is how the picker collapses them (#995 item 24, now #999).
 _disk_wwn() {
@@ -1353,8 +1406,20 @@ _disk_hazard() {
     real=$(readlink -f "$dev" 2>/dev/null || echo "$dev")
     base=$(basename "$real")
     # A member of an assembled md array.
+    #
+    # #999 Part C2 — EXCEPT one that is a member of a SpatiumDDI mirror.
+    # Refusing those meant a mirrored appliance could never be
+    # reinstalled: both disks are md members, so both were refused, and
+    # the "keep /var" path is refused too — the box was a dead end, and
+    # the message even told the operator to do the full install that was
+    # also impossible. Our own array is a thing the installer knows how
+    # to take apart (``_stop_arrays_on`` runs before the wipe), so it is
+    # offered with its own tag rather than blocked. Somebody ELSE's array
+    # is still refused: wiping one member of it degrades it silently,
+    # which is what #995 filed this for.
     for holder in "/sys/block/$base"/holders/md* "/sys/block/$base"/*/holders/md*; do
         [ -e "$holder" ] || continue
+        _md_array_is_ours "/dev/$(basename "$holder")" && return 0
         printf '%s' "part of the software RAID array ${holder##*/}, which installing here would degrade"
         return 0
     done
@@ -1367,6 +1432,22 @@ _disk_hazard() {
         fi
     done
     printf ''
+}
+
+# #999 Part C2 — is this md array one WE built?
+#
+# Identified by the filesystem label on the array itself: the installer
+# mkfs's the mirrored arrays with the same five labels a single-disk
+# install uses. An array carrying one of them is a SpatiumDDI layout the
+# installer knows how to stop and re-create; anything else belongs to
+# the operator and stays refused.
+_md_array_is_ours() {
+    local md="$1" label
+    label=$(lsblk -nro LABEL "$md" 2>/dev/null | head -1)
+    case "$label" in
+        root_a|root_b|var|state) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 # Is there already a SpatiumDDI install on this disk? Prints its version
@@ -1408,6 +1489,26 @@ _existing_install_version() {
 # numbering it happens to use.
 _layout_is_reusable() {
     local dev="$1" want found part label
+    # #999 Part C2 — NOT reusable when the labels live on an md array.
+    #
+    # lsblk walks holders, so on a mirrored install the md devices show
+    # up here carrying the five labels and the layout looks reusable. It
+    # is not, and the failure is not the obvious one: the KEEP_VAR branch
+    # resolves each device by LABEL, so blkid correctly returns
+    # /dev/md/root_a and the mkfs targets the ARRAY rather than a live
+    # member. What breaks is downstream — KEEP_VAR forces MIRROR_MODE
+    # off, so the reinstalled slot gets an initrd with no md_mod, no
+    # raid1 and no mdadm.conf, and the box does not come back.
+    #
+    # Carrying the mirror through a reinstall is a real capability and a
+    # bigger change than this: it has to rediscover the second member
+    # from the array, re-run the bootloader on it and re-sync its ESP.
+    # Until that exists, refusing is the honest answer — the operator
+    # gets a full mirror install instead, which works.
+    if _layout_is_on_md "$dev"; then
+        log "Layout on $dev sits on an md array — 'keep /var' is not offered (#999)"
+        return 1
+    fi
     for want in ESP state root_a root_b var; do
         found=0
         for part in $(lsblk -nro NAME "$dev" 2>/dev/null | tail -n +2); do
@@ -1416,6 +1517,121 @@ _layout_is_reusable() {
         done
         [ "$found" = 1 ] || return 1
     done
+    return 0
+}
+
+# Does this disk carry a partition that is a member of an assembled md
+# array? Distinct from _disk_hazard, which answers "must not install
+# here": a SpatiumDDI mirror IS ours and is a legitimate target for a
+# full reinstall — just not for a table-preserving one.
+_layout_is_on_md() {
+    local dev="$1" base holder
+    base=$(basename "$(readlink -f "$dev" 2>/dev/null || echo "$dev")")
+    for holder in "/sys/block/$base"/holders/md* "/sys/block/$base"/*/holders/md*; do
+        [ -e "$holder" ] && return 0
+    done
+    return 1
+}
+
+# #999 Part C2 — offer a RAID1 mirror onto a second disk.
+#
+# Returns 0 to continue (mirrored or not), 1 to send the operator back to
+# the target-disk menu. Sets MIRROR_MODE / TARGET_DISK2 /
+# TARGET_DISK2_BY_ID.
+#
+# The candidate list is built with the SAME rules the target picker uses,
+# because a mirror member is every bit as much an install target as the
+# first disk:
+#   * the live boot medium is excluded,
+#   * SAN LUN paths are collapsed by WWN so one LUN is one row,
+#   * _disk_hazard refuses an md member or a multipath path,
+#   * the member must be at least as large as the target.
+#
+# That last one is the one that is easy to get backwards. raid1 sizes the
+# array to the SMALLEST member, so a smaller second disk does not fail —
+# it silently shrinks /var, on a layout whose sizes the operator just
+# confirmed. Refusing is the only honest answer.
+_ask_mirror_disk() {
+    local target_bytes="$1"
+
+    # The preseed short-circuit comes FIRST, before the reset. The other
+    # order clears the very values the answer file just supplied — latent
+    # today because pick_disk returns early on PRESEED_HAS_DISK and never
+    # reaches here, but it would silently drop a preseeded mirror the
+    # moment that changed, and "silently single-disk" is the outcome the
+    # parser refuses so hard to avoid.
+    if [ -n "${PRESEED_HAS_MIRROR_DISK:-}" ]; then
+        log "Preseed: mirror member $TARGET_DISK2 (RAID1)"
+        return 0
+    fi
+
+    MIRROR_MODE="no"
+    TARGET_DISK2=""
+    TARGET_DISK2_BY_ID=""
+    # A preseeded target with no mirror key means a single-disk install
+    # was asked for explicitly; do not stop an unattended run to ask.
+    if [ -n "${PRESEED_HAS_DISK:-}" ]; then
+        return 0
+    fi
+
+    local options=() line name size model wwn hazard bytes _d
+    declare -A seen_wwn=()
+    # Rebuild the live-medium set locally rather than leaning on
+    # pick_disk's local of the same name. Bash's dynamic scoping WOULD
+    # make the caller's visible, and that is exactly the kind of
+    # invisible coupling that breaks the day this is called from
+    # anywhere else — with the failure being "the installer offers you
+    # the USB stick it is running from" as a mirror member.
+    declare -A live_disks=()
+    while IFS= read -r _d; do
+        [ -n "$_d" ] && live_disks["$_d"]=1
+    done < <(_live_boot_disks)
+    # The target's own WWN, so its other paths are never offered as a
+    # "second" disk — mirroring a LUN onto itself is not redundancy.
+    wwn=$(_disk_wwn "$TARGET_DISK")
+    [ -n "$wwn" ] && seen_wwn["$wwn"]="$TARGET_DISK"
+    while IFS= read -r line; do
+        name=$(echo "$line" | awk '{print $1}')
+        size=$(echo "$line" | awk '{print $2}')
+        model=$(echo "$line" | cut -d' ' -f3- | sed -e 's/\\x20/ /g' -e 's/  */ /g')
+        [ -z "$model" ] && model="(no model)"
+        [ "/dev/$name" = "$TARGET_DISK" ] && continue
+        [ -n "${live_disks[/dev/$name]:-}" ] && continue
+        wwn=$(_disk_wwn "/dev/$name")
+        if [ -n "$wwn" ]; then
+            [ -n "${seen_wwn[$wwn]:-}" ] && continue
+            seen_wwn["$wwn"]="/dev/$name"
+        fi
+        hazard=$(_disk_hazard "/dev/$name")
+        [ -n "$hazard" ] && continue
+        bytes=$(blockdev --getsize64 "/dev/$name" 2>/dev/null || echo 0)
+        [ "$bytes" -lt "$target_bytes" ] && continue
+        options+=("/dev/$name" "$size - $(_ellipsis "$model" 40)")
+    done < <(lsblk -dn -o NAME,SIZE,MODEL -r 2>/dev/null | grep -vE "^(sr|loop|fd|ram|zram)")
+
+    if [ ${#options[@]} -eq 0 ]; then
+        log "Mirror not offered: no eligible second disk (>= target size, not a hazard)"
+        return 0
+    fi
+
+    if ! whiptail --backtitle "$BACKTITLE" --title "Mirror the OS across two disks?" \
+        --defaultno --yesno \
+        "SpatiumDDI can install onto a software RAID1 mirror, so the appliance keeps running and keeps BOOTING when one disk dies.\n\nThe OS slots, STATE and /var are mirrored. The EFI system partition cannot be (firmware reads it before the RAID driver exists), so each disk gets its own and SpatiumDDI keeps them in step on every upgrade.\n\nALL DATA on the second disk will be DESTROYED too.\n\nMirror onto a second disk?" \
+        20 74; then
+        log "Operator declined the RAID1 mirror; single-disk install"
+        return 0
+    fi
+
+    local pick
+    pick=$(whiptail --backtitle "$BACKTITLE" --title "Mirror member" \
+        --cancel-button "Back" \
+        --menu "Select the second disk.\nALL DATA on it will be DESTROYED.\n\nOnly disks at least as large as $TARGET_DISK are listed: a RAID1 is the size of its smallest member, so a smaller disk would silently shrink /var." \
+        20 "$_DISK_MENU_W" 8 "${options[@]}" 3>&1 1>&2 2>&3) || return 1
+
+    MIRROR_MODE="yes"
+    TARGET_DISK2="$pick"
+    TARGET_DISK2_BY_ID=$(_disk_by_id "$TARGET_DISK2")
+    log "Mirror member: $TARGET_DISK2 (${TARGET_DISK2_BY_ID:-no by-id name})"
     return 0
 }
 
@@ -1483,6 +1699,12 @@ pick_disk() {
         local suffix=""
         [ -n "$existing" ] && suffix=" [installed: $existing]"
         [ -n "$hazard" ] && suffix="$suffix [UNSUPPORTED]"
+        # #999 — a SpatiumDDI mirror member is installable (the arrays are
+        # stopped before the wipe) but the operator must be told that
+        # BOTH halves of the mirror go, not just this disk.
+        if [ -z "$hazard" ] && _layout_is_on_md "/dev/$name"; then
+            suffix="$suffix [RAID member — mirror destroyed]"
+        fi
         # The SUFFIXES are budgeted first and the MODEL absorbs whatever is
         # left, because newt does not truncate an over-wide --menu item — it
         # writes past the frame and the box border is destroyed. Reported
@@ -1507,7 +1729,41 @@ pick_disk() {
             budget=8
         fi
         options+=("/dev/$name" "$size - $(_ellipsis "$model" "$budget")$suffix")
-    done < <(lsblk -dn -o NAME,SIZE,MODEL -r 2>/dev/null | grep -vE "^(sr|loop|fd|ram|zram)")
+    done < <(lsblk -dn -o NAME,SIZE,MODEL -r 2>/dev/null | grep -vE "^(sr|loop|fd|ram|zram|dm-)")
+
+    # #999 Part C3 — offer the multipath MAPS themselves.
+    #
+    # ``dm-`` is filtered OUT of the generic loop above, and that filter
+    # is load-bearing rather than cosmetic. Without it every multipath
+    # LUN appears twice — once as the raw ``/dev/dm-N`` and once as the
+    # friendly ``/dev/mapper/<name>`` added below — and the two rows are
+    # not equivalent: ``partition_node`` maps ``/dev/dm-N`` to
+    # ``/dev/dm-N-partN``, which kpartx never creates, so the mkfs that
+    # follows writes a regular FILE onto the installer's tmpfs and
+    # reports success. The install then completes and produces a LUN with
+    # a partition table and no filesystems — the exact failure
+    # ``_kpartx_add`` exists to prevent, reachable through the other row.
+    # (An LVM LV or a LUKS mapping is a ``dm-`` too, and is not a valid
+    # whole-disk install target either.)
+    #
+    # The loop above lists whole disks, and a SAN LUN's individual paths
+    # are both collapsed by WWN and refused by _disk_hazard, so before
+    # this a LUN presented over multipath was simply not installable.
+    # The map is the correct target: writing through /dev/mapper/mpathX
+    # goes down whichever path is healthy, which is the entire point.
+    while IFS= read -r line; do
+        local mp_name mp_size mp_paths
+        mp_name=$(echo "$line" | awk '{print $1}')
+        [ -n "$mp_name" ] || continue
+        mp_size=$(echo "$line" | awk '{print $2}')
+        mp_paths=$(_mpath_path_count "$mp_name")
+        # A map down to one path is offered but flagged: installing to it
+        # works and has no failover, which the operator should be told
+        # rather than have discovered at the next switch reboot.
+        local mp_suffix=" [$mp_paths paths]"
+        [ "$mp_paths" -le 1 ] && mp_suffix=" [$mp_paths path — NO FAILOVER]"
+        options+=("/dev/mapper/$mp_name" "$mp_size - multipath LUN$mp_suffix")
+    done < <(_multipath_maps)
 
     if [ ${#options[@]} -eq 0 ]; then
         log "No installable disks found (lsblk: $(lsblk -dn -o NAME,SIZE,TYPE 2>&1 | tr '\n' ';'))"
@@ -1580,6 +1836,17 @@ pick_disk() {
                     done
                 fi
                 log "Picked target disk $TARGET_DISK (${TARGET_DISK_BY_ID:-no by-id name}) ($((DISK_BYTES / 1024 / 1024 / 1024)) GiB) keep_var=$KEEP_VAR"
+                # #999 Part C2 — offer the mirror. Only after the target
+                # is settled, and never on the reinstall path: KEEP_VAR
+                # reuses the EXISTING table, and turning a single-disk
+                # install into a mirror means repartitioning both disks,
+                # which is precisely what "keep /var" says not to do.
+                if [ "$KEEP_VAR" = "yes" ]; then
+                    MIRROR_MODE="no"
+                    TARGET_DISK2=""
+                elif ! _ask_mirror_disk "$DISK_BYTES"; then
+                    continue   # operator backed out of the mirror screen
+                fi
                 break
             fi
             continue
@@ -2790,6 +3057,11 @@ confirm() {
         s+="Pair code:   ●●●●●●●●\n"
     fi
     s+="Target disk: $TARGET_DISK\n"
+    # #999 Part C2 — a mirror changes what "ERASED" covers, so it is named
+    # on the review screen and again in the warning below.
+    if [ "$MIRROR_MODE" = "yes" ]; then
+        s+="Mirror (RAID1): $TARGET_DISK2\n"
+    fi
     if [ -n "$TARGET_DISK_BY_ID" ]; then
         s+="             $TARGET_DISK_BY_ID\n"
     fi
@@ -2866,6 +3138,9 @@ confirm() {
     if [ "$KEEP_VAR" = "yes" ]; then
         s+="\nREINSTALL: both OS slots on $TARGET_DISK are replaced.\n"
         s+="/var and STATE are KEPT. There is no undo.\n\n"
+    elif [ "$MIRROR_MODE" = "yes" ]; then
+        s+="\nWARNING: BOTH $TARGET_DISK and $TARGET_DISK2 will be ERASED.\n"
+        s+="There is no undo.\n\n"
     else
         s+="\nWARNING: $TARGET_DISK will be ERASED. There is no undo.\n\n"
     fi
@@ -2933,12 +3208,143 @@ confirm() {
 # ── Install ───────────────────────────────────────────────────────────────────
 
 partition_node() {
-    # Translate $TARGET_DISK + index → /dev/sdaN or /dev/nvme0n1pN
+    # Translate a disk + partition index → its device node.
+    #
+    # Three naming rules, not two (#999 Part C3 adds the third):
+    #   /dev/sda        → /dev/sda1        (bare index)
+    #   /dev/nvme0n1    → /dev/nvme0n1p1   ("p" separator)
+    #   /dev/mapper/mpX → /dev/mapper/mpX-part1  (kpartx "-part" suffix)
+    #
+    # The multipath rule is what makes a SAN LUN installable at all: the
+    # kernel does not create partition nodes for a device-mapper device
+    # the way it does for sd*, so kpartx maps them as
+    # ``<mapname>-part<N>`` under /dev/mapper. Getting this wrong does
+    # not fail loudly — it yields a path that does not exist, and the
+    # mkfs that follows would create a FILE at that path on the
+    # installer's tmpfs while reporting success.
+    #
+    # ``$2`` optionally names the disk; without it the global
+    # $TARGET_DISK is used, which is every pre-#999 call site.
     local idx="$1"
-    case "$TARGET_DISK" in
-        *nvme*|*mmcblk*) echo "${TARGET_DISK}p${idx}" ;;
-        *)               echo "${TARGET_DISK}${idx}"  ;;
+    local disk="${2:-$TARGET_DISK}"
+    case "$disk" in
+        /dev/mapper/*|*/dm-*) echo "${disk}-part${idx}" ;;
+        *nvme*|*mmcblk*)      echo "${disk}p${idx}"     ;;
+        *)                    echo "${disk}${idx}"      ;;
     esac
+}
+
+# #999 Part C2 — the md array device backing one logical partition when
+# installing to a mirror, e.g. index 4 (root_A) → /dev/md/root_a.
+#
+# NAMED arrays, not /dev/md0..3: the kernel assigns md minor numbers in
+# assembly order, so a numeric name is not stable across a boot where one
+# member is missing — exactly the boot this feature exists to survive.
+# ``mdadm --create /dev/md/<name>`` writes the name into the 1.2
+# superblock, and the initramfs assembles it back to the same
+# /dev/md/<name> symlink regardless of which member came up first.
+_MD_NAMES=([3]="state" [4]="root_a" [5]="root_b" [6]="var")
+
+md_node() {
+    local idx="$1"
+    echo "/dev/md/${_MD_NAMES[$idx]}"
+}
+
+# #999 Part C2 — stop every md array assembled on this disk.
+#
+# Called before the wipe. A running array holds its members open, and
+# the wipe does NOT respect that: `wipefs -af` and `sgdisk -Z` both
+# return 0 on a disk held open by a live map (measured for #995 item 10;
+# md behaves the same way), so without this the GPT is destroyed while
+# the kernel keeps serving the array from the stale table and the
+# subsequent mkfs writes through it to the old offsets.
+#
+# Deliberately scoped to arrays that actually have a member ON this
+# disk — an installer must not stop an array belonging to storage it was
+# not pointed at, the same rule _dm_maps_on_target enforces for LVM.
+_stop_arrays_on() {
+    local disk="$1" base md holder member
+    [ -n "$disk" ] || return 0
+    command -v mdadm >/dev/null 2>&1 || return 0
+    base=$(basename "$(readlink -f "$disk" 2>/dev/null || echo "$disk")")
+    # Holders of the whole disk AND of each of its partitions: a member
+    # is normally a partition (sda4), never the bare disk.
+    for holder in "/sys/block/$base"/holders/md* "/sys/block/$base"/*/holders/md*; do
+        [ -e "$holder" ] || continue
+        md="/dev/$(basename "$holder")"
+        log "Stopping md array $md (has a member on $disk)"
+        mdadm --stop "$md" >> "$INSTALL_LOG" 2>&1 || \
+            log "WARN: could not stop $md — the wipe below may not take effect"
+        # Erase the superblock so a later --scan cannot re-assemble a
+        # ghost of it from the member we are about to repartition.
+        #
+        # ``$holder`` is a SYSFS path (/sys/block/sda/sda4/holders/md127),
+        # so trimming the /holders/ suffix yields /sys/block/sda/sda4 —
+        # NOT a device node. mdadm errored on it every time and ``|| true``
+        # swallowed that, so this protection has never once run. Take the
+        # basename and address the real node.
+        member="/dev/$(basename "${holder%/holders/*}")"
+        if [ -b "$member" ]; then
+            mdadm --zero-superblock "$member" >> "$INSTALL_LOG" 2>&1 || \
+                log "WARN: could not zero the md superblock on $member"
+        else
+            log "WARN: could not resolve an md member device from $holder"
+        fi
+    done
+    return 0
+}
+
+# #999 Part C2 — build the four raid1 arrays across the two members.
+#
+# ``--metadata=1.2`` (the mdadm default, stated explicitly because the
+# whole layout depends on it): the superblock sits 4 KiB in, at the
+# START of the device, so the array is NOT byte-identical to a bare
+# partition and nothing can mistake a member for a mountable filesystem.
+# 0.90/1.0 put it at the end, where a member is mountable directly — and
+# an operator who mounts one member of a live mirror read-write has
+# silently forked the data.
+#
+# ``--assume-clean`` is deliberately NOT used. It skips the initial
+# resync, which is safe for a freshly-mkfs'd array in theory, and the
+# theory fails the first time somebody reads a block neither member has
+# written: the two copies disagree and raid1 serves whichever it picks.
+# The resync runs in the background, so the install does not wait for it.
+#
+# ``--homehost=any`` + a NAME: the array name is written into the
+# superblock, so the initramfs re-assembles it to /dev/md/<name>
+# regardless of member enumeration order or of the hostname the array
+# happened to be created under (the installer's is not the installed
+# system's).
+_create_mirror_arrays() {
+    local idx name dev1 dev2 md
+    for idx in 3 4 5 6; do
+        name="${_MD_NAMES[$idx]}"
+        dev1=$(partition_node "$idx" "$TARGET_DISK")
+        dev2=$(partition_node "$idx" "$TARGET_DISK2")
+        md=$(md_node "$idx")
+        log "Creating raid1 $md from $dev1 + $dev2"
+        if ! mdadm --create "$md" \
+                --level=1 --raid-devices=2 --metadata=1.2 \
+                --homehost=any --name="$name" \
+                --run "$dev1" "$dev2" >> "$INSTALL_LOG" 2>&1; then
+            log "FATAL: could not create the $name mirror from $dev1 + $dev2."
+            log "  Nothing further has been written. See $INSTALL_LOG."
+            exit 1
+        fi
+    done
+    udevadm settle >> "$INSTALL_LOG" 2>&1 || true
+    # Fail LOUDLY if a device we are about to mkfs is not actually there.
+    # mkfs against a non-existent /dev/md/x creates a regular FILE on the
+    # installer's tmpfs and reports success, so the install would run to
+    # completion and produce a disk with no filesystems on it.
+    for idx in 3 4 5 6; do
+        md=$(md_node "$idx")
+        if [ ! -b "$md" ]; then
+            log "FATAL: $md is not a block device after mdadm --create."
+            exit 1
+        fi
+    done
+    log "Mirror arrays created: $(cat /proc/mdstat 2>/dev/null | tr '\n' ' ')"
 }
 
 # #995 item 10 — device-mapper maps that must be released before
@@ -3203,21 +3609,28 @@ _assert_admin_user_available() {
 # guessing) and via a whiptail message + on_cancel when there is an
 # operator to tell.
 _assert_safe_wipe_target() {
+    # ``$1`` optionally names the disk and ``$2`` how to describe it, so
+    # the identical gate covers the #999 mirror member. It must: a
+    # preseed naming the live USB as ``mirror_disk`` is the #554
+    # "wipe the media you are booted from" bug through a new door, and
+    # the mirror is wiped in the same breath as the target.
+    local disk="${1:-$TARGET_DISK}"
+    local what="${2:-Target disk}"
     local why="" real
-    real=$(readlink -f "$TARGET_DISK" 2>/dev/null || echo "$TARGET_DISK")
+    real=$(readlink -f "$disk" 2>/dev/null || echo "$disk")
 
-    if [ -z "$TARGET_DISK" ]; then
+    if [ -z "$disk" ]; then
         why="No target disk was selected."
     elif [ ! -b "$real" ]; then
-        why="Target disk $TARGET_DISK ($real) is not a block device."
+        why="$what $disk ($real) is not a block device."
     elif [ ! -d "/sys/block/$(basename "$real")" ]; then
-        why="Target disk $TARGET_DISK resolves to $real, which is a partition, not a whole disk."
+        why="$what $disk resolves to $real, which is a partition, not a whole disk."
     else
         local _d
         while IFS= read -r _d; do
             [ -z "$_d" ] && continue
             if [ "$(readlink -f "$_d" 2>/dev/null || echo "$_d")" = "$real" ]; then
-                why="Target disk $TARGET_DISK ($real) is the live install medium this installer is running from. Wiping it would destroy the running system mid-install."
+                why="$what $disk ($real) is the live install medium this installer is running from. Wiping it would destroy the running system mid-install."
                 break
             fi
         done < <(_live_boot_disks)
@@ -3228,7 +3641,7 @@ _assert_safe_wipe_target() {
         bytes=$(blockdev --getsize64 "$real" 2>/dev/null || echo 0)
         min=$((MIN_DISK_GIB * 1024 * 1024 * 1024))
         if [ "$bytes" -lt "$min" ]; then
-            why="Target disk $TARGET_DISK is $((bytes / 1024 / 1024 / 1024)) GiB — below the ${MIN_DISK_GIB} GiB minimum for the A/B partition layout."
+            why="$what $disk is $((bytes / 1024 / 1024 / 1024)) GiB — below the ${MIN_DISK_GIB} GiB minimum for the A/B partition layout."
         fi
     fi
 
@@ -3238,15 +3651,26 @@ _assert_safe_wipe_target() {
     # naming one installs straight through the refusal, producing exactly
     # the no-failover install the change calls a trap, with nobody at the
     # console.
+    # #999 — the picker still refuses a disk that is already an md member
+    # or one path of a multipath map, and this is where that check is
+    # re-applied for a preseeded disk. It is NOT contradicted by the
+    # mirror install: #999 Part C creates an array from PLAIN disks. An
+    # existing member belongs to somebody else's array, and installing
+    # over it degrades that array silently — which is what the refusal
+    # has always been about.
+    #
+    # A multipath MAP (/dev/mapper/mpathX) is now a legitimate target
+    # (Part C3), and _disk_hazard does not flag one — it flags the
+    # individual paths, which remain wrong to install to.
     if [ -z "$why" ]; then
         local hazard
-        hazard=$(_disk_hazard "$TARGET_DISK")
-        [ -n "$hazard" ] && why="Target disk $TARGET_DISK is $hazard. Installing to software RAID or to a multipath LUN is not supported yet (#999)."
+        hazard=$(_disk_hazard "$disk")
+        [ -n "$hazard" ] && why="$what $disk is $hazard. Install to the whole disk, or to the multipath map (/dev/mapper/…) rather than one of its paths."
     fi
 
-    [ -z "$why" ] && { log "Pre-wipe guard OK: $TARGET_DISK ($real)"; return 0; }
+    [ -z "$why" ] && { log "Pre-wipe guard OK: $disk ($real)"; return 0; }
 
-    log "Pre-wipe guard REFUSED $TARGET_DISK: $why"
+    log "Pre-wipe guard REFUSED $disk: $why"
     if [ "$FULLY_UNATTENDED" = "1" ]; then
         preseed_halt "Refusing to wipe the preseeded target disk:"$'\n\n'"$why"
     fi
@@ -3254,7 +3678,7 @@ _assert_safe_wipe_target() {
     whiptail --backtitle "$BACKTITLE" --title "Unsafe target disk" \
         --msgbox "$why"$'\n\n'"Nothing has been written. Pick a different disk." 14 72 \
         || true
-    on_cancel "pre-wipe safety check ($TARGET_DISK)"
+    on_cancel "pre-wipe safety check ($disk)"
 }
 
 # #995 item 1 — carry the installer's own logs onto the installed
@@ -3332,6 +3756,39 @@ do_install() {
     # Re-validate the wipe target before anything destructive (#581).
     # Runs BEFORE `set -e` so its own probes can fail harmlessly.
     _assert_safe_wipe_target
+    # #999 Part C2 — the mirror member is wiped in the same breath, so it
+    # goes through the identical gate. Two extra refusals it must also
+    # make, which the single-disk gate has no reason to know about:
+    #   * mirroring a disk onto ITSELF is not redundancy, and on a
+    #     multipath LUN "the same disk" can wear two different names;
+    #   * a member smaller than the target silently shrinks /var,
+    #     because a raid1 is the size of its smallest member.
+    if [ "$MIRROR_MODE" = "yes" ]; then
+        _assert_safe_wipe_target "$TARGET_DISK2" "Mirror member"
+        local _t_real _m_real _t_bytes _m_bytes
+        _t_real=$(readlink -f "$TARGET_DISK" 2>/dev/null || echo "$TARGET_DISK")
+        _m_real=$(readlink -f "$TARGET_DISK2" 2>/dev/null || echo "$TARGET_DISK2")
+        if [ "$_t_real" = "$_m_real" ]; then
+            log "Pre-wipe guard REFUSED: mirror member resolves to the target ($_t_real)"
+            if [ "$FULLY_UNATTENDED" = "1" ]; then
+                preseed_halt "mirror_disk resolves to the same device as target_disk ($_t_real). A disk cannot mirror itself."
+            fi
+            whiptail --backtitle "$BACKTITLE" --title "Unsafe mirror member" \
+                --msgbox "The mirror member and the target disk are the same device ($_t_real)."$'\n\n'"Nothing has been written." 12 72 || true
+            on_cancel "pre-wipe safety check (mirror = target)"
+        fi
+        _t_bytes=$(blockdev --getsize64 "$_t_real" 2>/dev/null || echo 0)
+        _m_bytes=$(blockdev --getsize64 "$_m_real" 2>/dev/null || echo 0)
+        if [ "$_m_bytes" -lt "$_t_bytes" ]; then
+            log "Pre-wipe guard REFUSED: mirror member smaller than target ($_m_bytes < $_t_bytes)"
+            if [ "$FULLY_UNATTENDED" = "1" ]; then
+                preseed_halt "mirror_disk is smaller than target_disk. A RAID1 is the size of its smallest member, so this would silently shrink /var."
+            fi
+            whiptail --backtitle "$BACKTITLE" --title "Mirror member too small" \
+                --msgbox "The mirror member ($((_m_bytes / 1024 / 1024 / 1024)) GiB) is smaller than the target disk ($((_t_bytes / 1024 / 1024 / 1024)) GiB)."$'\n\n'"A RAID1 is the size of its smallest member, so this would silently shrink /var."$'\n\n'"Nothing has been written." 14 72 || true
+            on_cancel "pre-wipe safety check (mirror too small)"
+        fi
+    fi
     # ...and the account that will be the only way into the installed
     # system, for the same reason and in the same place (#995 item 4).
     _assert_admin_user_available
@@ -3378,6 +3835,29 @@ do_install() {
     ROOT_A=$(partition_node 4)
     ROOT_B=$(partition_node 5)
     VAR=$(partition_node 6)
+    # #999 Part C2 — mirror install. The FILESYSTEMS move onto md
+    # devices; the two boot-critical partitions do not.
+    #
+    #   bios_boot — grub embeds core.img in it per disk, so each member
+    #               needs its own and there is nothing to mirror.
+    #   ESP       — firmware reads it before any md driver exists, so it
+    #               CANNOT live on an array. Two independent ESPs,
+    #               kept byte-identical by ``spatiumddi-esp-sync``.
+    #   state / root_a / root_b / var — raid1 across both members.
+    #
+    # ESP2 is the second disk's ESP. It is labelled distinctly on
+    # purpose: two FAT filesystems both labelled ``ESP`` would make the
+    # image-baseline fstab's ``LABEL=ESP`` resolve to whichever udev
+    # enumerated last, so /boot/efi would silently be a different disk
+    # between boots — and the sync would then have no fixed direction.
+    local ESP2=""
+    if [ "$MIRROR_MODE" = "yes" ]; then
+        ESP2=$(partition_node 2 "$TARGET_DISK2")
+        STATE=$(md_node 3)
+        ROOT_A=$(md_node 4)
+        ROOT_B=$(md_node 5)
+        VAR=$(md_node 6)
+    fi
     # #995 item 25 — on the KEEP_VAR path the table is NOT rewritten, so
     # the positional names above are whatever the disk already has.
     # _layout_is_reusable gates on the five LABELs and its comment even
@@ -3445,17 +3925,31 @@ do_install() {
         # transient EBUSY (udev still holding a node open) rather than for
         # ordering. Bounded, because a map that will never release must
         # reach the gate below instead of spinning here.
-        local dm dm_maps
-        for _ in 1 2 3; do
-            dm_maps=$(_dm_maps_on_target "$TARGET_DISK")
-            [ -n "$dm_maps" ] || break
-            while read -r dm; do
-                [ -n "$dm" ] || continue
-                log "Releasing device-mapper map '$dm' (backed by $TARGET_DISK)"
-                dmsetup remove "$dm" >> "$INSTALL_LOG" 2>&1 || true
-            done <<EOF
+        local dm dm_maps _rel_disk
+        for _rel_disk in $TARGET_DISK ${MIRROR_MODE:+$TARGET_DISK2}; do
+            [ -n "$_rel_disk" ] || continue
+            # #999 Part C3 — when the TARGET IS a multipath map, the map
+            # is the thing we are installing to, not something holding
+            # the target open. Tearing it down here would remove the
+            # device under our own feet, and the kpartx partition maps
+            # are re-created after the new table is written anyway.
+            case "$_rel_disk" in
+                /dev/mapper/*|*/dm-*)
+                    log "Target $_rel_disk is a device-mapper device — skipping dm release (it IS the target)"
+                    continue
+                    ;;
+            esac
+            for _ in 1 2 3; do
+                dm_maps=$(_dm_maps_on_target "$_rel_disk")
+                [ -n "$dm_maps" ] || break
+                while read -r dm; do
+                    [ -n "$dm" ] || continue
+                    log "Releasing device-mapper map '$dm' (backed by $_rel_disk)"
+                    dmsetup remove "$dm" >> "$INSTALL_LOG" 2>&1 || true
+                done <<EOF
 $dm_maps
 EOF
+            done
         done
         _assert_target_released
 
@@ -3468,6 +3962,14 @@ EOF
             log "Reinstall keeping /var: partition table left intact on $TARGET_DISK"
         else
         echo "XXX"; echo "5"; echo "Partitioning $TARGET_DISK (A/B + var layout)..."; echo "XXX"
+        # #999 Part C2 — stop any array that is already assembled on
+        # EITHER target before repartitioning. A live md device holds its
+        # members open, and `wipefs -af` FORCES past that (measured — see
+        # _assert_target_released): the GPT would be destroyed while the
+        # kernel kept the array running on the stale table, and the mkfs
+        # that follows would write through it.
+        _stop_arrays_on "$TARGET_DISK"
+        [ "$MIRROR_MODE" = "yes" ] && _stop_arrays_on "$TARGET_DISK2"
         wipefs -af "$TARGET_DISK"           >> "$INSTALL_LOG" 2>&1
         sgdisk -Z "$TARGET_DISK"            >> "$INSTALL_LOG" 2>&1
         # Force the kernel to forget the old partition table before
@@ -3507,10 +4009,56 @@ EOF
         partprobe "$TARGET_DISK"            >> "$INSTALL_LOG" 2>&1 || true
         udevadm settle                      >> "$INSTALL_LOG" 2>&1 || true
         sleep 1
+        # #999 Part C3 — the kernel does not create partition nodes for a
+        # device-mapper device the way it does for sd*, so partprobe
+        # above did nothing useful on a multipath target. kpartx maps
+        # them as /dev/mapper/<name>-partN, which is what partition_node
+        # returns for this target.
+        _kpartx_add "$TARGET_DISK"
+        # #999 Part C2 — the mirror member gets the IDENTICAL table.
+        # Written out rather than sgdisk --replicate: --replicate also
+        # copies the GPT disk GUID, which must be unique (two disks
+        # claiming one GUID is exactly the ambiguity the ESP labelling
+        # below exists to avoid), and -G to randomise it afterwards is a
+        # second call that can fail on its own.
+        if [ "$MIRROR_MODE" = "yes" ]; then
+            echo "XXX"; echo "6"; echo "Partitioning mirror member $TARGET_DISK2..."; echo "XXX"
+            wipefs -af "$TARGET_DISK2"      >> "$INSTALL_LOG" 2>&1
+            sgdisk -Z "$TARGET_DISK2"       >> "$INSTALL_LOG" 2>&1
+            blockdev --rereadpt "$TARGET_DISK2" >> "$INSTALL_LOG" 2>&1 || true
+            # fd00 (Linux RAID) on every mirrored member, so the array is
+            # discoverable by type as well as by superblock and nothing
+            # else (a future installer, a rescue distro's autodetect)
+            # mistakes a member for a plain ext4 partition.
+            sgdisk -n1:0:+1M    -t1:ef02 -c1:bios_boot \
+                   -n2:0:+512M  -t2:ef00 -c2:ESP \
+                   -n3:0:+256M  -t3:fd00 -c3:state \
+                   -n4:0:+8G    -t4:fd00 -c4:root_A \
+                   -n5:0:+8G    -t5:fd00 -c5:root_B \
+                   -n6:0:0      -t6:fd00 -c6:var \
+                   "$TARGET_DISK2"          >> "$INSTALL_LOG" 2>&1
+            # ...and re-type the FIRST disk's mirrored partitions to
+            # match. They were laid down as 8300/8304/8310 above.
+            sgdisk -t3:fd00 -t4:fd00 -t5:fd00 -t6:fd00 \
+                   "$TARGET_DISK"           >> "$INSTALL_LOG" 2>&1
+            partprobe "$TARGET_DISK"        >> "$INSTALL_LOG" 2>&1 || true
+            partprobe "$TARGET_DISK2"       >> "$INSTALL_LOG" 2>&1 || true
+            udevadm settle                  >> "$INSTALL_LOG" 2>&1 || true
+            sleep 1
+            _create_mirror_arrays
+        fi
         fi
 
         echo "XXX"; echo "10"; echo "Formatting partitions..."; echo "XXX"
         mkfs.fat -F32 -n ESP "$ESP"         >> "$INSTALL_LOG" 2>&1
+        # #999 Part C2 — the mirror member's own ESP. Labelled ESP2, not
+        # ESP: the image-baseline fstab mounts /boot/efi by LABEL, and two
+        # filesystems sharing that label would resolve to whichever udev
+        # enumerated last, so /boot/efi could be a different disk between
+        # boots and the sync would have no fixed direction.
+        if [ "$MIRROR_MODE" = "yes" ]; then
+            mkfs.fat -F32 -n ESP2 "$ESP2"   >> "$INSTALL_LOG" 2>&1
+        fi
         # STATE partition — issue #276. Small ext4 holding machine
         # config + SSH host keys + supervisor identity. Mounted at
         # /var/lib/spatium-state. Label ``state`` so fstab can
@@ -3666,10 +4214,19 @@ EOF
         # back to image-baseline values). Mounted under /var so it
         # orders after the /var mount — the render service's
         # After=local-fs.target dependency covers ordering.
+        # #999 Part C2 — ``nofail`` on the ESP for the same reason STATE
+        # has it, and it is load-bearing on a mirror: the label ``ESP``
+        # exists on the PRIMARY disk only (the mirror member's is
+        # ``ESP2``, deliberately, so /boot/efi has a fixed direction).
+        # Lose the primary and the survivor boots — grub is on its own
+        # ESP and its own bios_boot — only to have systemd fail the
+        # /boot/efi mount and drop the whole box into emergency.target.
+        # The appliance would be storage-redundant and unbootable, which
+        # is precisely the outcome this feature exists to prevent.
         cat > "$MOUNT/etc/fstab" <<'EOF'
 LABEL=var    /var                    ext4   defaults                              0 2
 LABEL=state  /var/lib/spatium-state  ext4   defaults,nofail                       0 2
-LABEL=ESP    /boot/efi               vfat   fmask=0133,dmask=0022,shortname=winnt 0 2
+LABEL=ESP    /boot/efi               vfat   fmask=0133,dmask=0022,shortname=winnt,nofail 0 2
 tmpfs        /tmp                     tmpfs  nosuid,nodev,noexec,mode=1777         0 0
 EOF
         echo "$HOSTNAME" > "$MOUNT/etc/hostname"
@@ -4304,6 +4861,43 @@ virtio_net
 virtio_ring
 ext4
 EOF
+        # #999 Part C2 — a mirrored root cannot be mounted until the array
+        # is assembled, and that happens in the initrd. Two halves, and
+        # BOTH are required:
+        #
+        #   * the raid modules, so the kernel can drive an array at all;
+        #   * /etc/mdadm/mdadm.conf, because Debian's initramfs hook
+        #     copies that file in and its local-top script assembles from
+        #     it. Without ARRAY lines the assemble is a scan that may or
+        #     may not run depending on the AUTO policy — and "may or may
+        #     not" resolves to an unbootable box, so the real UUIDs are
+        #     written rather than relying on a scan.
+        if [ "$MIRROR_MODE" = "yes" ]; then
+            cat >> "$MOUNT/etc/initramfs-tools/modules" <<'EOF'
+# #999 — mirrored root: assembled by the initrd before / is mounted.
+md_mod
+raid1
+EOF
+            mkdir -p "$MOUNT/etc/mdadm"
+            {
+                echo "# Written by spatium-install (#999 Part C2)."
+                echo "# The initramfs hook copies this file in; its local-top"
+                echo "# script assembles these arrays before / is mounted."
+                echo "HOMEHOST <ignore>"
+                echo "DEVICE partitions"
+                mdadm --detail --scan 2>/dev/null
+            } > "$MOUNT/etc/mdadm/mdadm.conf"
+            log "mdadm.conf written:"
+            cat "$MOUNT/etc/mdadm/mdadm.conf" >> "$INSTALL_LOG" 2>&1
+            # An mdadm.conf with no ARRAY line would produce an initrd
+            # that cannot find root. Refuse now, while the operator is
+            # still in front of the installer.
+            if ! grep -q '^ARRAY' "$MOUNT/etc/mdadm/mdadm.conf"; then
+                log "FATAL: mdadm --detail --scan produced no ARRAY lines."
+                log "  The initrd would not assemble the mirror and the box would not boot."
+                exit 1
+            fi
+        fi
 
         echo "XXX"; echo "82"; echo "Regenerating initrd for disk boot..."; echo "XXX"
         # live-tools dpkg-diverts /usr/sbin/update-initramfs into a
@@ -4511,6 +5105,83 @@ EOF
             log "  booted in BIOS/CSM mode so the install continues, but the"
             log "  disk will NOT boot in a UEFI machine."
             echo "UEFI" > "$BOOT_LEG_MISSING_FILE" 2>/dev/null || true
+        fi
+
+        # #999 Part C2 — the mirror member must boot on its own, which is
+        # the entire point: a mirror whose surviving disk cannot boot has
+        # protected the data and not the appliance.
+        #
+        # This is the part of a RAID1 install that is easy to skip and
+        # fatal to skip. Three separate things have to land on disk 2:
+        #
+        #   1. BIOS core.img in ITS bios_boot partition (grub embeds a
+        #      disk-specific image; disk 1's is useless here).
+        #   2. EFI/BOOT/BOOTX64.EFI on ITS ESP, via --removable so no
+        #      efivars entry is needed — firmware falls back to the
+        #      removable path when the NVRAM entry points at a dead disk.
+        #   3. grub.cfg + grubenv, which live on the ESP and are NOT
+        #      mirrored (the ESP cannot be an md member — firmware reads
+        #      it before any md driver exists). Handled by the sync below
+        #      and kept in step afterwards by spatiumddi-esp-sync.
+        #
+        # Failures here are WARNINGS, not aborts: the appliance boots
+        # from disk 1 either way, and refusing the whole install because
+        # the redundant bootloader did not take would be a worse outcome
+        # than an install that works but is not yet fully redundant. The
+        # post-install verification pass re-checks it and says so.
+        if [ "$MIRROR_MODE" = "yes" ]; then
+            echo "XXX"; echo "90"; echo "Installing bootloader on the mirror member..."; echo "XXX"
+            # ESP2 is mounted FIRST, and BOTH installs point at it.
+            #
+            # The BIOS install is the subtle one. grub-install embeds the
+            # filesystem UUID of --boot-directory into the core.img it
+            # writes to that disk's bios_boot partition. Pointing it at
+            # /boot/efi — the PRIMARY disk's ESP — puts disk 2's core.img
+            # in the position of looking for a filesystem that is on the
+            # disk that just died, so BIOS-booting the survivor alone
+            # lands at `grub rescue>`. It has to embed ITS OWN ESP.
+            mkdir -p "$MOUNT/boot/efi2"
+            if mount "$ESP2" "$MOUNT/boot/efi2" >> "$INSTALL_LOG" 2>&1; then
+                if ! chroot "$MOUNT" /usr/sbin/grub-install --target=i386-pc \
+                        --boot-directory=/boot/efi2 \
+                        "$TARGET_DISK2" >> "$INSTALL_LOG" 2>&1; then
+                    log "WARN: grub-install --target=i386-pc failed on the mirror"
+                    log "  member $TARGET_DISK2. The array is redundant but the box"
+                    log "  will not BIOS-boot from that disk alone."
+                fi
+                if ! chroot "$MOUNT" /usr/sbin/grub-install --target=x86_64-efi \
+                        --efi-directory=/boot/efi2 \
+                        --boot-directory=/boot/efi2 \
+                        --bootloader-id=SPATIUMDDI \
+                        --removable \
+                        >> "$INSTALL_LOG" 2>&1; then
+                    log "WARN: grub-install --target=x86_64-efi failed on ESP2."
+                    log "  The box will not UEFI-boot from $TARGET_DISK2 alone."
+                fi
+                # Unmount BEFORE syncing: spatiumddi-esp-sync mounts ESP2
+                # itself (it has to — on the running appliance nothing
+                # else ever mounts it), and a second mount of the same
+                # device would either fail or give it a view it does not
+                # own.
+                umount "$MOUNT/boot/efi2" >> "$INSTALL_LOG" 2>&1 || true
+                # Unmount BEFORE syncing: spatiumddi-esp-sync mounts ESP2
+                # itself (it has to — on the running appliance nothing
+                # else ever mounts it), and a second mount of the same
+                # device would either fail or hand it a view it does not
+                # own.
+                umount "$MOUNT/boot/efi2" >> "$INSTALL_LOG" 2>&1 || \
+                    log "WARN: could not unmount ESP2 before the initial sync"
+                # Copy the rendered menu + environment across. Done here
+                # rather than left to the first sync so the appliance is
+                # redundant from the moment the installer finishes, not
+                # from the first upgrade.
+                chroot "$MOUNT" /usr/local/bin/spatiumddi-esp-sync --install-root / \
+                    >> "$INSTALL_LOG" 2>&1 || \
+                    log "WARN: initial ESP sync failed — run spatiumddi-esp-sync on the host."
+            else
+                log "WARN: could not mount $ESP2 — the mirror member has no boot config."
+            fi
+            rmdir "$MOUNT/boot/efi2" 2>/dev/null || true
         fi
 
         echo "XXX"; echo "93"; echo "Cloning root_A → root_B (slot redundancy)..."; echo "XXX"

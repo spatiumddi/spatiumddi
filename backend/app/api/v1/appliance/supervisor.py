@@ -113,6 +113,12 @@ from app.services.appliance.slot_image_target import (
 )
 from app.services.appliance.snmp import snmp_bundle
 from app.services.appliance.ssh import effective_ssh_scope, ssh_bundle
+from app.services.appliance.storage_health import (
+    StorageFinding,
+    evaluate_storage,
+    has_storage_report,
+    worst_severity,
+)
 from app.services.appliance.syslog import syslog_bundle
 
 logger = structlog.get_logger(__name__)
@@ -2723,8 +2729,20 @@ class ApplianceRow(BaseModel):
     # error?}}``; only patches with ``ok: false`` in the ledger appear.
     # Empty when all patches are applied / pre-#395 box.
     host_migration_health: dict[str, dict[str, Any]]
-    # Issue #183 Phase 4 — local k3s cluster health summary.
+    # Issue #183 Phase 4 — local k3s cluster health summary. Also
+    # carries the #402 host partitions and the #999 ``storage`` block.
     cluster_health: dict[str, Any]
+    # #999 Part A — storage redundancy, CLASSIFIED server-side from
+    # ``cluster_health["storage"]``. The raw block stays available above
+    # for the per-member / per-path table; this is the verdict, derived
+    # by the one function the alert rule and the copilot tool also call
+    # so no two surfaces can disagree about whether an array is in
+    # trouble. Empty on an appliance with no arrays AND on a supervisor
+    # too old to report — ``storage_reported`` separates those, because
+    # "nothing to say" and "we never looked" must not render alike.
+    storage_findings: list[dict[str, str]] = []
+    storage_worst_severity: str | None = None
+    storage_reported: bool = False
     # Issue #183 Phase 5 — installed k3s version (plain text, public).
     # NULL on legacy compose appliances / pre-#183 supervisors.
     k3s_version: str | None
@@ -2768,6 +2786,16 @@ def _require_superadmin(user: CurrentUser) -> None:
             status.HTTP_403_FORBIDDEN,
             "Appliance approval is restricted to superadmins.",
         )
+
+
+def _storage_findings(row: Appliance) -> list[StorageFinding]:
+    """Classified storage findings for one appliance row (#999 Part A)."""
+    ch = row.cluster_health if isinstance(row.cluster_health, dict) else {}
+    return evaluate_storage(ch.get("storage"))
+
+
+def _storage_worst_severity(row: Appliance) -> str | None:
+    return worst_severity(_storage_findings(row))
 
 
 def _row_to_schema(row: Appliance) -> ApplianceRow:
@@ -2828,6 +2856,12 @@ def _row_to_schema(row: Appliance) -> ApplianceRow:
         host_config_health=dict(row.host_config_health or {}),
         host_migration_health=dict(row.host_migration_health or {}),
         cluster_health=dict(row.cluster_health or {}),
+        storage_findings=[
+            {"severity": f.severity, "kind": f.kind, "name": f.name, "detail": f.detail}
+            for f in _storage_findings(row)
+        ],
+        storage_worst_severity=_storage_worst_severity(row),
+        storage_reported=has_storage_report(row.cluster_health),
         k3s_version=row.k3s_version,
         kubeconfig_set=row.kubeconfig_encrypted is not None,
         k3s_api_cert_expires_at=row.k3s_api_cert_expires_at,
@@ -5656,6 +5690,221 @@ async def nettool_reply(
         delivered=delivered,
     )
     return {"delivered": "true" if delivered else "stale"}
+
+
+# ── Storage management (md / multipath, #999 Part B) ─────────────────────
+#
+# Same transport as the nettool channel above (per-appliance queue +
+# per-request future) on its OWN queue, because a nettool is a read-only
+# reachability probe and ``mdadm --add`` overwrites a disk. Separate
+# queues mean a long-running topology dump cannot sit in front of a ping,
+# and neither endpoint's name lies about what it moves.
+#
+# The supervisor does not run mdadm itself — it writes a request file for
+# the host-side ``spatiumddi-storage-action`` runner and relays the
+# result, so the root binaries stay out of the container.
+
+
+class StoragePollResponse(BaseModel):
+    """Long-poll result for the supervisor's storage channel.
+
+    ``request_id`` is empty when the poll timed out with nothing queued.
+    ``params`` is the server-validated structured action — never a shell
+    string; the host runner re-validates every field against its own
+    allowlist and builds the argv itself.
+    """
+
+    request_id: str
+    params: dict[str, Any] = Field(default_factory=dict)
+
+
+class StorageReplyRequest(BaseModel):
+    """Supervisor-sent reply carrying the host runner's verdict."""
+
+    request_id: str
+    result: dict[str, Any] | None = None
+    error: str | None = None
+
+
+class StorageReplyAck(BaseModel):
+    """Whether the reply matched a still-waiting operator request.
+
+    ``stale`` is a normal outcome, not an error: the operator's request
+    may have timed out and had its future evicted while the host runner
+    was still working.
+    """
+
+    delivered: Literal["true", "stale"]
+
+
+@router.post(
+    "/supervisor/storage/poll",
+    response_model=StoragePollResponse,
+    summary="Long-poll for the next queued storage-management action",
+)
+async def storage_poll(request: Request, db: DB) -> StoragePollResponse:
+    """Supervisor-only endpoint (cert-authed). The queue is keyed by
+    appliance_id, so a cert only ever sees its own actions."""
+    from app.services.appliance import agent_cmd as _cmd  # noqa: PLC0415
+
+    appliance = await _require_cert_auth(request, db)
+    queued = await _cmd.pop_command(appliance.id, timeout=30.0, channel=_cmd.CHANNEL_STORAGE)
+    if queued is None:
+        return StoragePollResponse(request_id="", params={})
+    return StoragePollResponse(request_id=queued.request_id, params=queued.params)
+
+
+@router.post(
+    "/supervisor/storage/reply/{request_id}",
+    response_model=StorageReplyAck,
+    summary="Return a storage-action result to the awaiting operator action",
+)
+async def storage_reply(
+    request_id: str,
+    body: StorageReplyRequest,
+    request: Request,
+    db: DB,
+) -> StorageReplyAck:
+    """Supervisor-only endpoint (cert-authed)."""
+    from app.services.appliance import agent_cmd as _cmd  # noqa: PLC0415
+
+    appliance = await _require_cert_auth(request, db)
+    if body.request_id != request_id:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "request_id path/body mismatch",
+        )
+    delivered = _cmd.deliver_result(
+        _cmd.NetToolResult(request_id=request_id, result=body.result, error=body.error),
+        channel=_cmd.CHANNEL_STORAGE,
+    )
+    logger.info(
+        "appliance.storage.reply",
+        appliance_id=str(appliance.id),
+        request_id=request_id,
+        has_error=body.error is not None,
+        delivered=delivered,
+    )
+    return StorageReplyAck(delivered="true" if delivered else "stale")
+
+
+class StorageActionRequest(BaseModel):
+    """An operator's md / multipath management request."""
+
+    action: str
+    array: str | None = None
+    device: str | None = None
+    #: Destructive actions require the DEVICE path typed back — a typed
+    #: confirmation that is not the thing being destroyed is a
+    #: click-through with extra steps.
+    confirm: str | None = None
+
+
+class StorageActionResponse(BaseModel):
+    ok: bool
+    action: str
+    detail: str
+    output: str | None = None
+
+
+@router.post(
+    "/appliances/{appliance_id}/storage/action",
+    response_model=StorageActionResponse,
+    summary="Run an md / multipath management action on an appliance (#999 Part B)",
+)
+async def appliance_storage_action(
+    appliance_id: uuid.UUID,
+    body: StorageActionRequest,
+    request: Request,
+    db: DB,
+    user: CurrentUser,
+) -> StorageActionResponse:
+    """Superadmin only, audited, and refused rather than confirmed where
+    the operator could not inspect the consequence afterwards.
+
+    The control plane decides what may be ASKED for (this is the side
+    that knows who the operator is); the host runner decides what is
+    safe to do at the moment of the action, re-counting the array's
+    in-sync members from the kernel — because this side's view is up to
+    one heartbeat old and a member can have failed since.
+    """
+    from app.services.appliance import agent_cmd as _cmd  # noqa: PLC0415
+    from app.services.appliance.storage_actions import (  # noqa: PLC0415
+        ActionRefused,
+        summarize,
+        validate_action,
+    )
+
+    _require_superadmin(user)
+    row = await db.get(Appliance, appliance_id)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
+
+    try:
+        params = validate_action(
+            body.action, array=body.array, device=body.device, confirm=body.confirm
+        )
+    except ActionRefused as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+
+    summary = summarize(body.action, body.array, body.device)
+    # Recorded BEFORE dispatch, and committed either way: an action that
+    # was attempted and failed is exactly as interesting to an auditor as
+    # one that succeeded, and more interesting than one that was never
+    # recorded because the supervisor happened to be offline.
+    db.add(
+        AuditLog(
+            user_id=user.id,
+            user_display_name=user.display_name or user.username,
+            auth_source=user.auth_source or "local",
+            source_ip=_client_ip(request),
+            action="appliance.storage.action",
+            resource_type="appliance",
+            resource_id=str(row.id),
+            resource_display=row.hostname,
+            result="ok",
+            new_value={
+                "action": body.action,
+                "array": body.array,
+                "device": body.device,
+                "summary": summary,
+            },
+        )
+    )
+    await db.commit()
+
+    ready = _cmd.appliance_ready(state=row.state, last_seen_at=row.last_seen_at)
+    try:
+        outcome = await _cmd.enqueue_command(
+            row.id,
+            body.action,
+            params,
+            ready=ready,
+            timeout=90.0,
+            channel=_cmd.CHANNEL_STORAGE,
+        )
+    except _cmd.ApplianceOffline as exc:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            f"appliance {row.hostname} is offline or not approved",
+        ) from exc
+    except TimeoutError as exc:
+        raise HTTPException(
+            status.HTTP_504_GATEWAY_TIMEOUT,
+            f"{row.hostname} did not answer the storage action in time",
+        ) from exc
+
+    if outcome.error:
+        return StorageActionResponse(
+            ok=False, action=body.action, detail=outcome.error, output=None
+        )
+    result = outcome.result or {}
+    return StorageActionResponse(
+        ok=bool(result.get("ok")),
+        action=body.action,
+        detail=str(result.get("detail") or ""),
+        output=(str(result["output"]) if result.get("output") else None),
+    )
 
 
 # ── Packet capture (appliance-host vantage, #59 Phase 2) ─────────────────

@@ -352,6 +352,15 @@ def main() -> int:
     identity_for_nettool, _ = load_or_generate(cfg.state_dir)
     start_nettool_thread(cfg, identity_for_nettool)
 
+    # #999 Part B — md / multipath management. Same shape as the nettool
+    # thread (long-poll, act, reply) but the acting is delegated to the
+    # host runner over the trigger-file plane, because every action needs
+    # a root binary this container should not be executing directly.
+    # Dormant on an appliance with no arrays: nothing is ever queued.
+    from .storage_proxy import start_storage_thread  # noqa: PLC0415
+
+    start_storage_thread(cfg, identity_for_nettool)
+
     # #59 Phase 2 — appliance-host packet capture. Daemon thread that
     # long-polls for queued appliance-vantage captures, drives the host
     # runner over the trigger-file pattern, and streams the finished

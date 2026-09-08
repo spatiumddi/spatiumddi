@@ -744,3 +744,246 @@ def test_overall_verdict_webui_yellow_note_is_not_critical(m):
     )
     assert verdict == "DEGRADED"
     assert "Web UI" not in offender
+
+
+# ── #999 Part A — storage redundancy on the Disks row ─────────────────────
+#
+# The console is a THIRD reader of /sys/block (after the supervisor's
+# collector and the installer's ``_disk_hazard``) because it shares no
+# Python package with either. These build a fake sysfs and run the real
+# function against it — a structural check would not catch an inverted
+# comparison, and the failure mode of getting this wrong is a console
+# reporting HEALTHY over a mirror that is one disk from data loss.
+
+
+def _fake_md(
+    root,
+    name,
+    *,
+    level,
+    raid_disks,
+    members,
+    action="idle",
+    completed="none",
+    array_state="clean",
+):
+    """``members`` is ``[(device, state)]`` — the kernel's own strings."""
+    md = root / name / "md"
+    md.mkdir(parents=True)
+    (md / "level").write_text(level + "\n")
+    (md / "array_state").write_text(array_state + "\n")
+    (md / "raid_disks").write_text(f"{raid_disks}\n")
+    (md / "sync_action").write_text(action + "\n")
+    (md / "sync_completed").write_text(completed + "\n")
+    for dev, state in members:
+        (md / f"dev-{dev}").mkdir()
+        (md / f"dev-{dev}" / "state").write_text(state + "\n")
+
+
+def _fake_mpath(root, dm, *, friendly, uuid_, paths):
+    """``paths`` is ``[(device, scsi_state_or_None)]``."""
+    d = root / dm / "dm"
+    d.mkdir(parents=True)
+    (d / "uuid").write_text(uuid_ + "\n")
+    (d / "name").write_text(friendly + "\n")
+    (root / dm / "slaves").mkdir()
+    for dev, scsi in paths:
+        (root / dm / "slaves" / dev).mkdir()
+        if scsi is not None:
+            (root / dev / "device").mkdir(parents=True)
+            (root / dev / "device" / "state").write_text(scsi + "\n")
+
+
+def test_storage_summary_silent_without_arrays(m, monkeypatch, tmp_path):
+    """The ordinary single-disk appliance: the Disk row is unchanged."""
+    root = tmp_path / "block"
+    root.mkdir()
+    monkeypatch.setattr(m, "_SYS_BLOCK_DIR", str(root))
+    assert m.storage_summary() == []
+
+
+def test_storage_summary_healthy_mirror(m, monkeypatch, tmp_path):
+    root = tmp_path / "block"
+    root.mkdir()
+    _fake_md(
+        root,
+        "md0",
+        level="raid1",
+        raid_disks=2,
+        members=[("sda1", "in_sync"), ("sdb1", "in_sync")],
+    )
+    monkeypatch.setattr(m, "_SYS_BLOCK_DIR", str(root))
+    text, style, sev = m.storage_summary()[0]
+    assert text == "md0 raid1 ok 2/2"
+    assert style == "green"
+    assert sev == ""
+
+
+def test_storage_summary_degraded_pair_is_critical(m, monkeypatch, tmp_path):
+    """A mirror on its last disk. Capacity looks identical to a healthy
+    one, which is exactly why the chip has to exist."""
+    root = tmp_path / "block"
+    root.mkdir()
+    _fake_md(
+        root,
+        "md0",
+        level="raid1",
+        raid_disks=2,
+        members=[("sda1", "in_sync"), ("sdb1", "faulty")],
+    )
+    monkeypatch.setattr(m, "_SYS_BLOCK_DIR", str(root))
+    text, style, sev = m.storage_summary()[0]
+    assert "DEGRADED 1/2" in text
+    assert style == "bold red"
+    assert sev == "critical"
+
+
+def test_storage_summary_three_way_mirror_degraded_is_warning(m, monkeypatch, tmp_path):
+    """``2 of 3`` is the same word and not the same night as ``1 of 2``."""
+    root = tmp_path / "block"
+    root.mkdir()
+    _fake_md(
+        root,
+        "md0",
+        level="raid1",
+        raid_disks=3,
+        members=[("sda1", "in_sync"), ("sdb1", "in_sync"), ("sdc1", "faulty")],
+    )
+    monkeypatch.setattr(m, "_SYS_BLOCK_DIR", str(root))
+    text, style, sev = m.storage_summary()[0]
+    assert "DEGRADED 2/3" in text
+    assert style == "bold yellow"
+    assert sev == "warning"
+
+
+def test_storage_summary_rebuild_percent(m, monkeypatch, tmp_path):
+    root = tmp_path / "block"
+    root.mkdir()
+    _fake_md(
+        root,
+        "md0",
+        level="raid1",
+        raid_disks=2,
+        members=[("sda1", "in_sync"), ("sdb1", "spare")],
+        action="recover",
+        completed="300 / 1000",
+    )
+    monkeypatch.setattr(m, "_SYS_BLOCK_DIR", str(root))
+    text, _style, sev = m.storage_summary()[0]
+    # Still degraded while it rebuilds — "recovering" alone would read as
+    # recovery already achieved.
+    assert "DEGRADED 1/2 30%" in text
+    assert sev == "critical"
+
+
+def test_storage_summary_multipath_paths(m, monkeypatch, tmp_path):
+    root = tmp_path / "block"
+    root.mkdir()
+    _fake_mpath(
+        root,
+        "dm-0",
+        friendly="mpatha",
+        uuid_="mpath-3600508b4",
+        paths=[("sdc", "running"), ("sdd", "offline")],
+    )
+    monkeypatch.setattr(m, "_SYS_BLOCK_DIR", str(root))
+    text, style, sev = m.storage_summary()[0]
+    assert text == "mpatha mpath 1/2 paths"
+    assert style == "bold yellow"
+    assert sev == "warning"
+
+
+def test_storage_summary_ignores_non_multipath_dm(m, monkeypatch, tmp_path):
+    """An LVM LV is a ``dm-*`` too."""
+    root = tmp_path / "block"
+    root.mkdir()
+    _fake_mpath(root, "dm-0", friendly="vg0-lv0", uuid_="LVM-abc", paths=[("sda2", "running")])
+    monkeypatch.setattr(m, "_SYS_BLOCK_DIR", str(root))
+    assert m.storage_summary() == []
+
+
+def test_overall_verdict_degraded_array_is_critical(m):
+    state = m.DashboardState({}, _FakeTail(), "/dev/tty1")
+    state.storage_chips = [("md0 raid1 DEGRADED 1/2", "bold red", "critical")]
+    verdict, offender = m.overall_verdict(state)
+    assert verdict == "CRITICAL"
+    assert "md0" in offender
+
+
+def test_healthy_chips_render_after_the_capacity_list(m):
+    """The vitals row is ``no_wrap`` with a right-hand ellipsis, so what
+    is appended last is what a narrow console drops. A never-changing
+    green chip has no business evicting the disk readout; a degraded one
+    must never be evicted BY it."""
+    state = m.DashboardState({}, _FakeTail(), "/dev/tty1")
+    state.disks = [("/var", 3.9, 15.2, 26.0)]
+    state.storage_chips = [
+        ("md1 raid1 ok 2/2", "green", ""),
+        ("md0 raid1 DEGRADED 1/2", "bold red", "critical"),
+    ]
+    line = _ANSI.sub("", m.render_header(state, 0.0).renderable.renderables[-1].plain)
+    assert line.index("DEGRADED") < line.index("/var")
+    assert line.index("/var") < line.index("ok 2/2")
+
+
+def test_overall_verdict_reduced_but_survivable_array_is_degraded(m):
+    state = m.DashboardState({}, _FakeTail(), "/dev/tty1")
+    state.storage_chips = [("md0 raid1 DEGRADED 2/3", "bold yellow", "warning")]
+    verdict, offender = m.overall_verdict(state)
+    assert verdict == "DEGRADED"
+    assert "md0" in offender
+
+
+def test_storage_summary_failed_to_assemble_is_not_green(m, monkeypatch, tmp_path):
+    """The console must not tell the person standing in front of it the
+    opposite of what the Fleet screen says.
+
+    An array that failed to assemble reports ``array_state=inactive``
+    with ``raid_disks=0``, which falls through every member-count
+    comparison — so without reading ``array_state`` the console rendered
+    a green ``md127 none ok 0/0`` and left the box verdict HEALTHY while
+    the supervisor was reporting the same array as failed.
+    """
+    root = tmp_path / "block"
+    root.mkdir()
+    _fake_md(root, "md127", level="none", raid_disks=0, members=[])
+    (root / "md127" / "md" / "array_state").write_text("inactive\n")
+    monkeypatch.setattr(m, "_SYS_BLOCK_DIR", str(root))
+    text, style, sev = m.storage_summary()[0]
+    assert "FAILED" in text
+    assert style == "bold red"
+    assert sev == "critical"
+
+
+def test_storage_summary_ignores_imsm_container(m, monkeypatch, tmp_path):
+    """A metadata container is permanently inactive with raid_disks=0 on
+    a healthy box — reporting it would put an unclearable red chip on a
+    console that is fine."""
+    root = tmp_path / "block"
+    root.mkdir()
+    _fake_md(root, "md127", level="container", raid_disks=0, members=[])
+    (root / "md127" / "md" / "array_state").write_text("inactive\n")
+    monkeypatch.setattr(m, "_SYS_BLOCK_DIR", str(root))
+    assert m.storage_summary() == []
+
+
+def test_storage_summary_unreadable_member_count_is_not_dropped(m, monkeypatch, tmp_path):
+    """An assembled array that will not say how many members it should
+    have used to vanish from the row entirely — which looks exactly like
+    a healthy single disk, i.e. the silence this feature exists to end."""
+    root = tmp_path / "block"
+    root.mkdir()
+    _fake_md(root, "md0", level="raid1", raid_disks=2, members=[("sda1", "in_sync")])
+    (root / "md0" / "md" / "raid_disks").write_text("garbage\n")
+    monkeypatch.setattr(m, "_SYS_BLOCK_DIR", str(root))
+    text, style, sev = m.storage_summary()[0]
+    assert text == "md0 raid1 state unknown"
+    assert style == "bold yellow"
+    assert sev == "warning"
+
+
+def test_overall_verdict_healthy_array_does_not_alarm(m):
+    state = m.DashboardState({}, _FakeTail(), "/dev/tty1")
+    state.storage_chips = [("md0 raid1 ok 2/2", "green", "")]
+    verdict, _offender = m.overall_verdict(state)
+    assert verdict == "HEALTHY"

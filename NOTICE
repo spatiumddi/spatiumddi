@@ -26,6 +26,7 @@ Where the two disagree about a license, THIS file is authoritative.
 - unattended-upgrades — GPL v2 — https://github.com/mvo5/unattended-upgrades
 - newt / whiptail (install wizard dialogs) — LGPL v2 — https://pagure.io/newt
 - gdisk / parted / dosfstools / e2fsprogs — GPL v2 / GPL v3 — (Debian)
+- mdadm / multipath-tools / kpartx / lvm2 — GPL v2 (mdadm, kpartx) / LGPL v2.1 + GPL v2 (multipath-tools, lvm2) — (Debian)
 - rsync — GPL v3 — https://rsync.samba.org
 - qemu-guest-agent — GPL v2 — https://www.qemu.org
 - open-vm-tools — GPL v2 + BSD — https://github.com/vmware/open-vm-tools

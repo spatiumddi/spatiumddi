@@ -434,6 +434,10 @@ def cmd_apply(args) -> int:
     # the new tarballs, imports them, the chart's tags resolve.
     _refresh_baked_images(target_dev)
 
+    # #999 Part C2 — grub.cfg was just re-rendered (or patched) on the
+    # PRIMARY ESP. Mirror it before reporting success.
+    _sync_mirror_esp()
+
     print()
     print("✓ Image written to inactive slot.")
     print()
@@ -530,6 +534,40 @@ def _blkid_uuid(device: str) -> str | None:
 _UUID_RE = re.compile(
     r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
 )
+
+
+def _sync_mirror_esp() -> None:
+    """Push the primary ESP onto the mirror member's, if there is one
+    (#999 Part C2).
+
+    The ESP cannot be an md member — firmware reads it before any md
+    driver exists — so a mirrored install carries TWO independent ESPs
+    and nothing in the kernel keeps them in step. Everything this script
+    just wrote (the new kernel + initrd land on the slot, but grub.cfg
+    and grubenv live on the ESP) would otherwise exist on the primary
+    only, and pulling that disk would leave the survivor booting the OLD
+    kernel from a stale menu. A mirror that protected the data and lost
+    the appliance.
+
+    A no-op on a single-disk appliance, so it is called unconditionally.
+    Never fatal: the upgrade itself has succeeded by this point, and
+    failing it here would be a worse outcome than a warning plus a
+    degraded-redundancy report on the next heartbeat.
+    """
+    try:
+        rc = subprocess.run(
+            ["/usr/local/bin/spatiumddi-esp-sync"], check=False
+        ).returncode
+    except OSError as exc:
+        print(f"WARN: could not run spatiumddi-esp-sync: {exc}", file=sys.stderr)
+        return
+    if rc != 0:
+        print(
+            "WARN: the mirror member's ESP was NOT updated — it would boot the "
+            "previous kernel if the primary disk is lost. Run "
+            "'spatiumddi-esp-sync' once the disk is reachable.",
+            file=sys.stderr,
+        )
 
 
 def _patch_grub_cfg_slot_uuid(partlabel: str, new_uuid: str,
@@ -783,6 +821,9 @@ def cmd_set_next_boot(args) -> int:
         print(f"ERROR: grub-reboot failed: {exc}", file=sys.stderr)
         return 3
     current = _read_grubenv_default()
+    # #999 Part C2 — grubenv lives on the ESP, which is NOT mirrored.
+    # Without this the mirror member would boot the previously-armed slot.
+    _sync_mirror_esp()
     print(f"  grubenv saved_entry now = {current} (next boot only)")
     print()
     print(f"Active slot stays {active['partlabel']} until you `reboot`.")
@@ -867,6 +908,7 @@ def cmd_set_default(args) -> int:
     except (FileNotFoundError, subprocess.CalledProcessError) as exc:
         print(f"ERROR: grub-set-default failed: {exc}", file=sys.stderr)
         return 3
+    _sync_mirror_esp()
     print(f"  grubenv saved_entry = {_read_grubenv_default()}")
     return 0
 

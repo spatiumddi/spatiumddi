@@ -254,6 +254,9 @@ The bootable image is Debian 13 (trixie), built with
 | [unattended-upgrades](https://github.com/mvo5/unattended-upgrades) | GPL v2 | Security patches (no kernel upgrades) |
 | [newt / whiptail](https://pagure.io/newt) | LGPL v2 | Install wizard dialogs |
 | [gdisk](https://www.rodsbooks.com/gdisk/), dosfstools, e2fsprogs, parted | GPL v2 / GPL v3 | Disk partitioning + filesystems |
+| [mdadm](https://git.kernel.org/pub/scm/utils/mdadm/mdadm.git/) | GPL v2 | Builds + manages the software-RAID1 mirror install (#999 Part C); also what makes an array creatable at all, since `/proc/mdstat` is a kernel interface but creating one needs the userspace tool |
+| [multipath-tools](https://github.com/opensvc/multipath-tools) (incl. kpartx) | LGPL v2.1 (library), GPL v2 (tools) | Presents a SAN LUN's paths as one `/dev/mapper/mpathX` device so it can be an install target with failover, and maps the partitions inside it (#999 Part C3) |
+| [lvm2](https://sourceware.org/lvm2/) | GPL v2 / LGPL v2.1 | Device-mapper userspace that multipath-tools depends on |
 | [rsync](https://rsync.samba.org/) | GPL v3 | Rootfs mirror to target disk |
 | [qemu-guest-agent](https://www.qemu.org/) / [open-vm-tools](https://github.com/vmware/open-vm-tools) | GPL v2 / GPL v2 + BSD | Hypervisor integration; both no-op off their platform |
 | [zstd](https://facebook.github.io/zstd/) | BSD 3-Clause / GPL v2 | Image + airgap tarball compression |

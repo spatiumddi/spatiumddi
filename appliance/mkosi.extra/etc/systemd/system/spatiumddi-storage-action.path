@@ -1,0 +1,21 @@
+[Unit]
+Description=Watch for SpatiumDDI md / multipath management requests (issue #999 Part B)
+Documentation=https://github.com/spatiumddi/spatiumddi/issues/999
+# Skip on the live ISO — array management is not part of the installer
+# environment (the installer builds arrays directly).
+ConditionKernelCommandLine=!boot=live
+
+[Path]
+# Level-triggered on the request glob, matching the pcap sibling.
+#
+# ``PathChanged=`` on the directory was EDGE-triggered: a request written
+# while the runner was already executing produced no new event, so it sat
+# unanswered until the operator's 60 s timeout with nothing in the
+# journal to explain it. ``PathExistsGlob`` re-fires while a matching
+# file exists, so the second request is picked up as soon as the first
+# service invocation exits. The runner skips any request that already has
+# a result, and the supervisor deletes both when it collects them.
+PathExistsGlob=/var/lib/spatiumddi/release-state/storage/*.request.json
+
+[Install]
+WantedBy=multi-user.target

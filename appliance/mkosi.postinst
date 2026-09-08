@@ -60,6 +60,7 @@ for unit in chrony.service ssh.service \
             spatiumddi-tz-reload.path \
             spatiumddi-verbose-boot-reload.path \
             spatiumddi-pcap.path \
+            spatiumddi-storage-action.path \
             spatium-firewall-reload.path \
             spatiumddi-firewall-revert.timer \
             spatiumddi-image-prune.timer \
@@ -243,6 +244,18 @@ chmod 0755 "$BUILDROOT/usr/local/bin/spatium-network-adopt"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-upgrade-slot"
 # #395 — host-migration framework: renderer + orchestrator + patch registry.
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-grub-render"
+# #999 Part C2 — keeps the mirror member's ESP in step with the primary's.
+# Called by spatium-install, spatium-upgrade-slot (apply / set-next-boot /
+# set-default) and spatium-grub-render — i.e. every writer of grub.cfg or
+# grubenv, both of which live on the ESP and are therefore NOT mirrored.
+# A no-op on a single-disk appliance. Without the exec bit every one of
+# those callers silently skips it and the mirror member boots a stale
+# kernel from a stale menu after the first upgrade.
+chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-esp-sync"
+# #999 Part B — md / multipath management runner + its .path trigger.
+chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-storage-action"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-storage-action.path"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-storage-action.service"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-host-migrate"
 chmod 0755 "$BUILDROOT/usr/lib/spatiumddi/host-patches"
 chmod 0755 "$BUILDROOT/usr/lib/spatiumddi/host-patches/001-grub-render.sh"

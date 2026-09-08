@@ -2266,10 +2266,31 @@ suggestion, free-space treemap.
   only question worth asking); no new feature module (#14 — it extends an
   existing resource).
 
-- ⬜ [**Storage redundancy — RAID1 + multipath: fleet monitoring, management, and
+- 🟡 [**Storage redundancy — RAID1 + multipath: fleet monitoring, management, and
   install support**](https://github.com/spatiumddi/spatiumddi/issues/999) — split out
   of #995 items 23 + 24, whose *refusal* half shipped there. Three parts, and the
   **ordering is the design point**: monitoring first, install support last.
+  **Part A (monitoring) shipped** — `read_storage_health()` in the supervisor,
+  the three surfaces, the default-on `appliance_storage_degraded` rule and
+  `find_appliance_storage`; no manifest change, no heartbeat field, no migration,
+  and array state DERIVED from member counts because the kernel reports
+  `array_state=clean` for a mirror down to its last disk. **Part B (management)
+  + Part C (install support) shipped** — `mdadm` / `multipath-tools` / `kpartx`
+  / `lvm2` in the image, a mirror mode in the picker (`mirror_disk:` preseeds
+  it), named arrays with metadata 1.2, two ESPs kept in step by
+  `spatiumddi-esp-sync` from every writer, and a Fleet-UI management surface
+  over a host runner with the last-good-member / bootloader-member refusals.
+  **Hardware-verified 2026-09-08** on a two-disk VM: installs, boots from the
+  mirror, and — with one disk detached — boots the survivor in 40 s with all
+  four arrays serving `[2/1] [_U]` and `/boot/efi` absent. That test found the
+  bug that mattered: `spatium-grub-render`'s `discover_live_uuids()` resolves
+  the slot by PARTLABEL, which on a mirror is a `linux_raid_member`, so the
+  #395 first-boot re-render overwrote a working `grub.cfg` with the ARRAY's
+  UUID — install, boot once, unbootable. Plus `esp-sync`'s missing `-t` and a
+  host runner that did not claim its request (level-triggered `PathExistsGlob`
+  → start-limit → the path unit itself dead). **Still open: a
+  slot-upgrade-then-check-both-ESPs test, and C3 (multipath) has never been run
+  against a real SAN.**
   A mirrored root with no degraded-array alarm is a mirror that silently becomes a
   single disk — the operator pays for two disks, the array loses a member at 03:00,
   and the appliance keeps serving perfectly until the survivor dies. That is strictly
