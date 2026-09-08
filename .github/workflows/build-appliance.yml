@@ -94,6 +94,11 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="${{ inputs.version }}"
+          # #1026 — the architecture the ISO/slot image is built for.
+          # ``appliance/mkosi.conf`` still pins ``Architecture=x86-64``,
+          # so amd64 is a statement of fact rather than a default; the
+          # arm64 build leg overrides it when it lands.
+          APPLIANCE_ARCH="${APPLIANCE_ARCH:-amd64}"
           # Drop the build-time version stamp into mkosi.extra so it
           # gets baked into the rootfs at build. ``spatiumddi-firstboot``
           # + ``spatium-upgrade-slot`` + ``spatium-console`` all read
@@ -105,6 +110,13 @@ jobs:
               echo "APPLIANCE_VERSION=\"${VERSION}\""
               echo "BUILD_TIME=\"$(date -u -Iseconds)\""
               echo "GIT_SHA=\"${GITHUB_SHA}\""
+              # #1026 — the architecture this rootfs is built FOR, which
+              # is what ``spatium-upgrade-slot`` compares against the
+              # running node's own ``uname -m`` before it writes a slot.
+              # Not ``uname -m`` of the runner: the whole point is that
+              # the two can differ, and once the arm64 build exists the
+              # runner's architecture stops being the image's.
+              echo "APPLIANCE_ARCH=\"${APPLIANCE_ARCH}\""
           } > appliance/mkosi.extra/etc/spatiumddi/appliance-release
           echo "→ Stamped appliance-release:"
           cat appliance/mkosi.extra/etc/spatiumddi/appliance-release

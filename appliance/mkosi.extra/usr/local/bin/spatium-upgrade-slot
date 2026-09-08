@@ -26,6 +26,7 @@ import argparse
 import hashlib
 import json
 import os
+import platform
 import re
 import shutil
 import ssl
@@ -107,37 +108,64 @@ def detect_active_inactive() -> tuple[dict[str, str], dict[str, str]] | None:
     return active, inactive
 
 
-def slot_version_label(slot: dict[str, str]) -> str:
-    """Mount the slot read-only, read /etc/spatiumddi/appliance-release
-    + /usr/lib/etc.image/spatiumddi/appliance-release. Falls back to
-    "unknown" if neither file exists (empty/staging slot)."""
-    if not slot.get("fslabel"):
-        return "unknown"
-    # Quick probe — mount RO, read, unmount.
+def host_architecture() -> str | None:
+    """This machine's architecture as ``amd64`` / ``arm64`` (#1026).
+
+    Normalised to the names the build stamps into
+    ``/etc/spatiumddi/appliance-release`` and the control plane stores,
+    so the comparison is between like and like. None for anything
+    unrecognised, which never counts as a mismatch — a refusal on a
+    string we failed to parse would block upgrades on a port nobody has
+    built yet, which is the opposite of the protection wanted here.
+    """
+    raw = (platform.machine() or "").strip().lower()
+    return {
+        "x86_64": "amd64",
+        "amd64": "amd64",
+        "aarch64": "arm64",
+        "arm64": "arm64",
+    }.get(raw)
+
+
+def slot_release_fields(slot: dict[str, str]) -> dict[str, str] | None:
+    """Mount the slot read-only and parse its appliance-release file.
+
+    Returns the parsed ``KEY=value`` pairs, ``{}`` when the slot mounts
+    but carries no release file (empty / staging slot), or None when it
+    cannot be mounted at all. One mount serves every caller — the
+    version label and the #1026 architecture check both want fields out
+    of the same file, and probing twice would mean mounting twice.
+    """
     mountpoint = Path(f"/run/spatium-slot-probe-{slot['partlabel']}")
     mountpoint.mkdir(parents=True, exist_ok=True)
     try:
         try:
             run(["mount", "-o", "ro", slot["device"], str(mountpoint)])
         except subprocess.CalledProcessError:
-            return "unreadable"
+            return None
         for rel in (
             "etc/spatiumddi/appliance-release",
             "usr/lib/etc.image/spatiumddi/appliance-release",
         ):
             p = mountpoint / rel
-            if p.exists():
-                for line in p.read_text().splitlines():
-                    if line.startswith("APPLIANCE_VERSION="):
-                        return line.split("=", 1)[1].strip().strip('"')
-        return "unstamped"
+            if not p.exists():
+                continue
+            fields: dict[str, str] = {}
+            for line in p.read_text().splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                fields[key.strip()] = value.strip().strip('"')
+            return fields
+        return {}
     finally:
         try:
             run(["umount", str(mountpoint)], check=False)
         except Exception:
             # Best-effort cleanup — if umount fails the kernel will reap
             # the mount on process exit; we don't want a failure here to
-            # mask the actual status return value from the try body.
+            # mask the actual return value from the try body.
             pass
         try:
             mountpoint.rmdir()
@@ -145,6 +173,24 @@ def slot_version_label(slot: dict[str, str]) -> str:
             # Same: cleanup-only. Leaving the empty probe dir behind is
             # cosmetic — it's under /run, a tmpfs reclaimed on reboot.
             pass
+
+
+def slot_version_label(slot: dict[str, str]) -> str:
+    """The slot's APPLIANCE_VERSION, or a sentinel describing why not.
+
+    The three sentinels (``unknown`` / ``unreadable`` / ``unstamped``)
+    are load-bearing: they reach ``slot-versions.json``, the Fleet card,
+    the console and the GRUB menu titles, and the UI's ``slotVersion``
+    helper renders them as "—".
+    """
+    if not slot.get("fslabel"):
+        return "unknown"
+    fields = slot_release_fields(slot)
+    if fields is None:
+        return "unreadable"
+    version = fields.get("APPLIANCE_VERSION")
+    return version if version else "unstamped"
+
 
 
 def slot_versions_key(slot: dict[str, str]) -> str:
@@ -375,9 +421,44 @@ def cmd_apply(args) -> int:
         # Refresh our cached view so set-next-boot reflects the new UUID.
         inactive["uuid"] = new_uuid
 
-    # Read the freshly-written slot's APPLIANCE_VERSION for the sidecar +
-    # the grub.cfg title. Both are best-effort — apply succeeded regardless.
-    new_version = slot_version_label(inactive)
+    # Read the freshly-written slot's release fields once: the version
+    # feeds the sidecar + grub.cfg title, the architecture feeds the
+    # #1026 refusal below.
+    written = slot_release_fields(inactive)
+    new_version = (
+        "unreadable" if written is None else (written.get("APPLIANCE_VERSION") or "unstamped")
+    )
+
+    # #1026 — THE LAST LINE OF DEFENCE, and the position is the point.
+    #
+    # The control plane refuses a known architecture mismatch before it
+    # ever stamps desired state, but it can only refuse what it knows: an
+    # image uploaded without a declared architecture, or fetched from an
+    # operator-pasted external URL, reaches here unlabelled. This is the
+    # first moment the REAL bytes can be asked what they are.
+    #
+    # It runs AFTER the dd and BEFORE the bootloader is touched, which is
+    # the only window that is both possible and safe. Earlier is not
+    # possible — the architecture lives in a file inside an ext4
+    # filesystem inside a non-seekable xz stream, so reading it means
+    # decompressing the image, which is exactly what the dd just did.
+    # Later is not safe. The inactive slot is a SPARE: leaving a
+    # wrong-arch rootfs in it costs nothing, because the node keeps
+    # running on the active slot and the next apply overwrites it. What
+    # cannot be undone is pointing the bootloader at it — that is a node
+    # that does not come back, on hardware that may be in another
+    # building.
+    host_arch = host_architecture()
+    image_arch = (written or {}).get("APPLIANCE_ARCH") or None
+    if host_arch and image_arch and host_arch != image_arch:
+        msg = (
+            f"architecture mismatch: image is {image_arch}, this node is "
+            f"{host_arch}. Refusing to make {inactive['partlabel']} bootable "
+            "— it would not come back. The active slot is untouched."
+        )
+        print(f"ERROR: {msg}", file=sys.stderr)
+        _write_progress("failed", None, msg)
+        return 5
 
     # Sync the sidecar FIRST so the renderer reads correct per-slot labels
     # when it re-renders grub.cfg below. (Previously sync_slot_versions was

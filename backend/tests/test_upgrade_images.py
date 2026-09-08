@@ -68,8 +68,8 @@ def _release(tag: str, *, assets: list[dict]) -> dict:
     }
 
 
-def _image_assets(tag: str | None = None) -> list[dict]:
-    stem = f"spatiumddi-appliance-slot-{tag}-amd64" if tag else "spatiumddi-appliance-slot-amd64"
+def _image_assets(tag: str | None = None, arch: str = "amd64") -> list[dict]:
+    stem = f"spatiumddi-appliance-slot-{tag}-{arch}" if tag else f"spatiumddi-appliance-slot-{arch}"
     return [
         {"name": f"{stem}.raw.xz", "browser_download_url": f"https://x/{stem}.raw.xz", "size": 42},
         {"name": f"{stem}.sha256", "browser_download_url": f"https://x/{stem}.sha256"},
@@ -80,9 +80,11 @@ def _image_assets(tag: str | None = None) -> list[dict]:
 
 
 def test_pick_upgrade_assets_matches_pair() -> None:
+    # #1026 — keyed by architecture now, because a release publishing
+    # both would otherwise resolve to whichever name sorted longer.
     picked = releases_service._pick_upgrade_assets(_image_assets("2026.05.14-1"))
-    assert picked is not None
-    image_url, sha_url, size = picked
+    assert set(picked) == {"amd64"}
+    image_url, sha_url, size = picked["amd64"]
     assert image_url.endswith("-2026.05.14-1-amd64.raw.xz")
     assert sha_url.endswith("-2026.05.14-1-amd64.sha256")
     assert size == 42
@@ -95,15 +97,27 @@ def test_pick_upgrade_assets_missing_sha_returns_none() -> None:
             "browser_download_url": "https://x/raw",
         }
     ]
-    assert releases_service._pick_upgrade_assets(assets) is None
+    assert releases_service._pick_upgrade_assets(assets) == {}
 
 
 def test_pick_upgrade_assets_prefers_versioned() -> None:
     assets = _image_assets() + _image_assets("2026.05.14-1")
     picked = releases_service._pick_upgrade_assets(assets)
-    assert picked is not None
     # The versioned (longer) name wins.
-    assert "-2026.05.14-1-amd64.raw.xz" in picked[0]
+    assert "-2026.05.14-1-amd64.raw.xz" in picked["amd64"][0]
+
+
+def test_pick_upgrade_assets_keeps_the_architectures_apart() -> None:
+    """#1026's reason for keying by architecture. Sorting longest-first
+    across a mixed set would hand an arm64 URL to a caller that asked for
+    the release, and the version prefix makes the arm64 name the longer
+    one exactly half the time — a coin flip between an image that boots
+    and one that does not."""
+    assets = _image_assets("2026.05.14-1") + _image_assets("2026.05.14-1", arch="arm64")
+    picked = releases_service._pick_upgrade_assets(assets)
+    assert set(picked) == {"amd64", "arm64"}
+    assert picked["amd64"][0].endswith("-amd64.raw.xz")
+    assert picked["arm64"][0].endswith("-arm64.raw.xz")
 
 
 def test_partial_path_does_not_double_suffix() -> None:
@@ -237,6 +251,7 @@ async def test_available_endpoint(
         image_asset_url="https://x/r.raw.xz",
         checksum_asset_url="https://x/r.sha256",
         size_bytes=10,
+        architecture="amd64",
     )
 
     async def fake() -> tuple[bool, list]:
@@ -258,10 +273,13 @@ async def test_available_endpoint(
 async def test_import_from_github_404_no_assets(
     db_session: AsyncSession, client: AsyncClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    async def fake(tag: str):
-        return None
+    async def fake(tag: str, architecture: str | None = None):
+        # #1026 — one resolver rather than "resolve, then ask what was
+        # available", so a monkeypatch here cannot leave a second call
+        # reaching the network.
+        return releases_service.UpgradeImageChoice(spec=None, available=())
 
-    monkeypatch.setattr(releases_service, "get_upgrade_image_assets", fake)
+    monkeypatch.setattr(releases_service, "resolve_upgrade_image_choice", fake)
     token = await _token(db_session)
     resp = await client.post(
         f"{_BASE}/import-from-github",
@@ -325,6 +343,7 @@ async def test_find_available_upgrade_images_tool(
         image_asset_url="https://x/r.raw.xz",
         checksum_asset_url="https://x/r.sha256",
         size_bytes=10,
+        architecture="amd64",
     )
 
     async def fake() -> tuple[bool, list]:

@@ -523,6 +523,57 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **The upgrade path could hand a node a root filesystem for
+  another CPU architecture (#1026, part 1 of 3).** Every appliance
+  and every published slot image is x86-64 today, so this has
+  never fired — and it is a correctness fix on the existing
+  fleet, landing *before* any arm64 artifact exists rather than
+  alongside it. `appliance_upgrade_image` carried `filename`,
+  `size_bytes`, `sha256`, `appliance_version` and no
+  architecture; the catalogue, `desired_slot_image_url` and
+  `spatium-upgrade-slot` all selected by **version**. The day an
+  arm64 image exists, a per-box schedule or a fleet-wide upgrade
+  can point an amd64 appliance at it and nothing notices: the
+  download verifies (the SHA matches — it is a perfectly good
+  image), the slot writes, GRUB switches, and the node does not
+  come back. Now the node reports its architecture on every
+  heartbeat, images carry one, and **two independent gates**
+  refuse a mismatch: the control plane 422s before it stamps any
+  desired state, and `spatium-upgrade-slot` re-checks the real
+  decompressed image against the node's own `uname -m` and exits
+  5. Two, because the control plane can only refuse what it
+  knows — an operator-pasted external URL tells it nothing — and
+  it must never be the only gate on an operation that bricks a
+  node.
+  **The host check sits after the `dd` and before the
+  bootloader**, which is the only window that is both possible
+  and safe: earlier is not possible, because a slot image is a
+  bare ext4 filesystem inside a non-seekable xz stream (there is
+  no GPT type GUID to read — `build-slot-image.sh` extracts the
+  root partition), so learning what it is means decompressing
+  it, which is what the write just did; later is not safe,
+  because the inactive slot is a spare that the next apply
+  overwrites, while pointing the bootloader at it cannot be
+  undone from another building.
+  **NULL means UNKNOWN and never blocks.** Every image staged
+  before this carries no architecture and every one is amd64 —
+  and a backfill asserting that would be the wrong thing to
+  write, because the first unlabelled arm64 upload would then
+  inherit an amd64 claim and pass the gate. An honest UNKNOWN
+  falls through to the host check on the real bytes. On import
+  the architecture comes from the release asset name — metadata
+  *we* published, not a filename an operator chose — and a
+  release carrying both now appears once per architecture, with
+  a 422 rather than a coin flip if you import without saying
+  which. On upload it is declared beside `appliance_version`,
+  which is declared the same way. The Fleet picker disables an
+  image that does not fit the node and says which architecture
+  it needs, rather than hiding it — an image the operator
+  uploaded a minute ago silently missing reads as a broken
+  upload. Migration `f7c3a91e50b4`; two nullable columns, no
+  backfill. Parts 2 (arm64 ISO + installer) and 3 (CI matrix)
+  are still open.
+
 - **Alert forwarding was filtered — and in the default format,
   rendered — against keys alert payloads do not carry (#1031).**
   Three payload shapes go through one delivery path: audit rows

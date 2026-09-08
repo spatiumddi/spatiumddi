@@ -2432,6 +2432,63 @@ suggestion, free-space treemap.
   now resolved from the parent directory's mtime, which `unlink()` updates and which,
   unlike stamping "now", does not make the image permanently stale on every later run.
 
+- 🟡 [**Appliance ISO + upgrade image for arm64 — with an architecture gate on the slot-upgrade path first**](https://github.com/spatiumddi/spatiumddi/issues/1026)
+  — three parts, and the ordering is the issue's own: **part 1 (the gate) shipped
+  alone**, before any arm64 artifact exists, because it is a correctness fix on the
+  x86-64 fleet that already exists rather than a prerequisite for one that does not.
+  `appliance_upgrade_image` carried no architecture, and the catalogue,
+  `desired_slot_image_url` and `spatium-upgrade-slot` all selected by **version** — so
+  the day an arm64 image is published, a per-box schedule or a fleet-wide upgrade can
+  hand an amd64 appliance an arm64 root filesystem and nothing notices: the download
+  verifies (the SHA matches, it is a perfectly good image), the slot writes, GRUB
+  switches, and the node does not come back.
+  Now `appliance.architecture` (supervisor `uname -m`, reported on every heartbeat) and
+  `appliance_upgrade_image.architecture`, with **two independent gates**. The control
+  plane refuses at `stamp_desired_slot_image` — the one chokepoint all three write paths
+  already go through, so the check cannot be remembered in two of them and skipped in the
+  third — as a `SlotImageResolutionError` subclass, which is why both scheduling
+  endpoints answer 422 without either handler learning a new exception; the rolling
+  orchestrator catches it per-node instead, so a mixed-architecture fleet upgrades the
+  nodes the image fits rather than dying at whichever node was scheduled first. Then
+  `spatium-upgrade-slot` re-checks the real decompressed image against the node's own
+  `uname -m` and exits 5. **Two gates because the control plane can only refuse what it
+  knows** — an operator-pasted external URL tells it nothing — and it must never be the
+  only gate on an operation that bricks a node.
+  **Two premises in the issue did not survive contact with the artifacts**, and both
+  shaped the design. It proposed detecting an image's architecture from the root GPT type
+  GUID: there is no GPT. `build-slot-image.sh` extracts the root partition, so a slot
+  image is a **bare ext4 filesystem** — verified against a real `.raw.xz`, `53ef` at
+  0x438 — inside a non-seekable xz stream. So neither the control plane nor the host
+  runner can read a type GUID, and finding `/etc/spatiumddi/appliance-release` in it
+  means decompressing ~8 GiB. Hence the split: on import the architecture comes from the
+  release asset name (metadata *we* published, not a filename an operator chose — the
+  issue's "never from the filename" is about the upload path, where the answer is a
+  declared field beside `appliance_version`, which is declared the same way), and the
+  host runner reads the file for real, **after the `dd` and before the bootloader** —
+  the only window that is both possible and safe, since earlier cannot know and later
+  cannot be undone. That ordering is pinned by a structural test, which caught the first
+  draft anchoring on `_write_progress("bootloader")` — a progress *label* emitted several
+  steps before anything bootable is written.
+  **NULL means UNKNOWN and never blocks**, deliberately: every image staged before this
+  is amd64 in fact, and a backfill saying so would assert something the row never
+  reported, so the first unlabelled arm64 upload would inherit an amd64 claim and pass
+  the gate. The Fleet picker disables a mismatched image and names the architecture it
+  needs rather than hiding it — an image the operator uploaded a minute ago silently
+  missing reads as a broken upload. A release publishing both architectures is now one
+  row per architecture (the asset picker keyed by arch, not longest-name-wins, which was
+  a coin flip between an image that boots and one that does not), and importing without
+  saying which is a 422. Migration `f7c3a91e50b4`, two nullable columns, no backfill; 2
+  MCP tools gained the field; no new endpoint.
+  **Still open — parts 2 and 3.** Part 2 is the arm64 build itself: mkosi
+  `Architecture`, `linux-image-arm64` / `grub-efi-arm64-bin`, `grub-install
+  --target=arm64-efi`, root partition type `8305`, no BIOS-boot partition (UEFI or
+  refuse), the arch-appropriate PartType lookup in `build-slot-image.sh`, a UEFI-only
+  El Torito with `BOOTAA64.EFI`, and a per-arch bake — verified by hand in UTM on Apple
+  Silicon, which is the payoff (a native-speed local appliance test loop with no Proxmox
+  box). Part 3 is the CI matrix on `ubuntu-24.04-arm` runners plus release / nightly /
+  docs. The build stamps `APPLIANCE_ARCH` into `/etc/spatiumddi/appliance-release`
+  already, so part 2 inherits a working gate rather than needing one retrofitted.
+
 #### CLI tool
 
 - ⬜ [**`spddi` CLI**](https://github.com/spatiumddi/spatiumddi/issues/83)

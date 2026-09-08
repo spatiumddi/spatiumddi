@@ -53,6 +53,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.appliance import Appliance
 from app.services.appliance import k8s
 from app.services.appliance.slot_image_target import (
+    SlotImageArchitectureMismatch,
     SlotImageTarget,
     stamp_desired_slot_image,
 )
@@ -441,7 +442,17 @@ async def _step_trigger_slot_apply(
     # image fetch our own self-signed cert with verification on, and left
     # any stale sha256 from an earlier per-box schedule to fail the new
     # image as corrupt (#787).
-    stamp_desired_slot_image(appliance, slot_image, desired_version=target_version)
+    try:
+        stamp_desired_slot_image(appliance, slot_image, desired_version=target_version)
+    except SlotImageArchitectureMismatch as exc:
+        # #1026 — fail THIS node's step rather than raising out of the
+        # orchestrator. A fleet-wide run over a mixed-architecture fleet
+        # is a real shape (an arm64 node joined to an amd64 cluster), and
+        # the right outcome is that the nodes the image fits still
+        # upgrade while the one it does not is reported as failed with
+        # the reason, not that the whole run dies at whichever node
+        # happened to be scheduled first.
+        return step.finish(False, error=str(exc))
     await db.flush()
     # NB: db.commit is the orchestrator's responsibility — Phase D will
     # commit at every step transition. For testing in Phase C the

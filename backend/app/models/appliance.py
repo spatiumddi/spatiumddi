@@ -495,6 +495,17 @@ class Appliance(Base):
     # shape — the handler leaves the column untouched when the field
     # is missing so a stale supervisor doesn't null out its variant.
     appliance_variant: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # #1026 — the node's CPU architecture (``amd64`` / ``arm64``), from
+    # the supervisor's ``uname -m``. NULL on a supervisor too old to
+    # report it, and the handler leaves the column untouched when the
+    # field is absent so a stale supervisor doesn't null out a value a
+    # newer one already reported.
+    #
+    # Load-bearing rather than informational: it is one half of the gate
+    # that refuses to hand this node an upgrade image built for the
+    # other architecture. NULL is UNKNOWN and never matches — see
+    # ``services.appliance.architecture.architecture_conflict``.
+    architecture: Mapped[str | None] = mapped_column(String(16), nullable=True)
     installed_appliance_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
     current_slot: Mapped[str | None] = mapped_column(String(16), nullable=True)
     durable_default: Mapped[str | None] = mapped_column(String(16), nullable=True)
@@ -1004,6 +1015,26 @@ class ApplianceUpgradeImage(Base):
     size_bytes: Mapped[int] = mapped_column(sa.BigInteger, nullable=False)
     sha256: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
     appliance_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    # #1026 — which architecture this image's rootfs is built for
+    # (``amd64`` / ``arm64``). NULL means UNKNOWN, which every image
+    # uploaded before this column existed necessarily is.
+    #
+    # **Not derived from the filename.** On the import path it comes from
+    # the GitHub release asset we published; on the upload path the
+    # operator declares it alongside ``appliance_version``, which is
+    # already declared the same way. Neither is byte-level proof, and it
+    # deliberately is not the last word: ``spatium-upgrade-slot``
+    # re-checks the decompressed image against the node's own ``uname
+    # -m`` before it commits to writing, because the control plane must
+    # not be the only gate on an operation that bricks a node.
+    #
+    # Why not read it out of the bytes here: a slot image is a bare ext4
+    # filesystem (``build-slot-image.sh`` extracts the root partition,
+    # so there is no GPT to read a type GUID from) inside a
+    # non-seekable xz stream. Finding ``/etc/spatiumddi/appliance-release``
+    # in it means either an ext4 traversal or decompressing ~8 GiB — on
+    # an upload request, for a check the host repeats anyway.
+    architecture: Mapped[str | None] = mapped_column(String(16), nullable=True)
     uploaded_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("user.id", ondelete="SET NULL"),

@@ -84,6 +84,7 @@ from app.core.responses import OctetStreamResponse
 from app.models.appliance import ApplianceUpgradeImage
 from app.models.audit import AuditLog
 from app.services.appliance import releases as releases_service
+from app.services.appliance.architecture import ApplianceArchitecture
 
 logger = structlog.get_logger(__name__)
 
@@ -491,6 +492,11 @@ class UpgradeImageRow(BaseModel):
     size_bytes: int
     sha256: str
     appliance_version: str
+    # #1026 — None on every image stored before the column existed, and
+    # on any upload where the operator left it unset. The UI renders
+    # that as "unknown" rather than guessing, and the scheduling gate
+    # treats it as "do not block, the host will check".
+    architecture: str | None
     uploaded_by_user_id: uuid.UUID | None
     uploaded_at: datetime
     notes: str | None
@@ -511,6 +517,10 @@ class AvailableUpgradeImageRow(BaseModel):
     image_asset_url: str
     checksum_asset_url: str
     size_bytes: int | None
+    # #1026 — a release publishing both architectures appears as two
+    # rows, so the picker shows which is which instead of silently
+    # offering one of them.
+    architecture: str
 
 
 class AvailableUpgradeImagesResponse(BaseModel):
@@ -532,6 +542,15 @@ class ImportFromGithubRequest(BaseModel):
             "``GET /api/v1/appliance/upgrade-images/available``."
         ),
     )
+    architecture: ApplianceArchitecture | None = Field(
+        default=None,
+        description=(
+            "Which architecture's image to import (#1026). Optional when "
+            "the release publishes exactly one; required — 422 otherwise "
+            "— when it publishes several, because choosing for you would "
+            "be choosing which nodes boot afterwards."
+        ),
+    )
 
 
 def _row_to_schema(row: ApplianceUpgradeImage) -> UpgradeImageRow:
@@ -541,6 +560,7 @@ def _row_to_schema(row: ApplianceUpgradeImage) -> UpgradeImageRow:
         size_bytes=row.size_bytes,
         sha256=row.sha256,
         appliance_version=row.appliance_version,
+        architecture=row.architecture,
         uploaded_by_user_id=row.uploaded_by_user_id,
         uploaded_at=row.uploaded_at,
         notes=row.notes,
@@ -587,6 +607,20 @@ async def upload_upgrade_image(
             "(e.g. 2026.05.14-1). Used by the supervisor's "
             "auto-clear logic — installed_appliance_version must "
             "match this once the upgrade lands."
+        ),
+    ),
+    architecture: ApplianceArchitecture | None = Form(
+        default=None,
+        description=(
+            "Which architecture this image's rootfs is built for "
+            "(``amd64`` / ``arm64``). Declared, like ``appliance_version`` "
+            "beside it — a slot image is a bare ext4 filesystem inside a "
+            "non-seekable xz stream, so the server cannot read it out of "
+            "the bytes without decompressing the whole ~8 GiB on an "
+            "upload request. Leave unset if unsure: the value is used to "
+            "refuse an obviously-wrong upgrade early, and "
+            "``spatium-upgrade-slot`` re-checks the real image against "
+            "the node's own architecture before writing it either way."
         ),
     ),
     notes: str | None = Form(
@@ -670,6 +704,7 @@ async def upload_upgrade_image(
         size_bytes=bytes_written,
         sha256=expected_sha,
         appliance_version=appliance_version.strip(),
+        architecture=architecture,
         uploaded_by_user_id=current_user.id,
         notes=notes.strip() if notes else None,
     )
@@ -755,6 +790,7 @@ async def list_available_upgrade_images(
                 image_asset_url=r.image_asset_url,
                 checksum_asset_url=r.checksum_asset_url,
                 size_bytes=r.size_bytes,
+                architecture=r.architecture,
             )
             for r in releases
         ],
@@ -783,8 +819,30 @@ async def import_upgrade_image_from_github(
     _require_superadmin(current_user)
     tag = body.release_tag.strip()
 
-    spec = await releases_service.get_upgrade_image_assets(tag)
+    choice = await releases_service.resolve_upgrade_image_choice(tag, body.architecture)
+    spec = choice.spec
     if spec is None:
+        # #1026 — "this release publishes several architectures and you
+        # did not say which" is not a missing asset, it is a missing
+        # decision, and answering both with the same 404 would send an
+        # operator looking for a build that is right there.
+        arches = ", ".join(choice.available)
+        if body.architecture is None and len(choice.available) > 1:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                (
+                    f"Release {tag!r} publishes upgrade images for {arches}. "
+                    "Pass ``architecture`` to say which one to import."
+                ),
+            )
+        if body.architecture is not None and choice.available:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND,
+                (
+                    f"Release {tag!r} has no {body.architecture} upgrade "
+                    f"image (it publishes: {arches})."
+                ),
+            )
         raise HTTPException(
             status.HTTP_404_NOT_FOUND,
             (
@@ -864,6 +922,10 @@ async def import_upgrade_image_from_github(
             size_bytes=bytes_written,
             sha256=expected_sha,
             appliance_version=tag,
+            # From the release asset name we just resolved — the one
+            # place an architecture can be stated by us rather than
+            # taken on trust (#1026).
+            architecture=spec.architecture,
             uploaded_by_user_id=current_user.id,
             notes=f"Imported from GitHub release {tag}",
         )
