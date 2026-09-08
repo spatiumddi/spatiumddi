@@ -194,7 +194,14 @@ def run_action(params: dict[str, Any]) -> dict[str, Any]:
             try:
                 path.unlink()
             except OSError:
-                pass
+                # Best-effort by design: most of these never existed on
+                # any given call (the runner renames the request, so
+                # exactly one of req/claimed is present, and a timed-out
+                # action has no result). A failure to remove a file that
+                # is already gone is the expected case, and the host
+                # runner ignores any request that already has a result,
+                # so a genuine leftover cannot be re-executed either.
+                continue
 
 
 def _post_reply(

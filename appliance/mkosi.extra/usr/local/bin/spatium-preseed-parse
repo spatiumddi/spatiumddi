@@ -502,7 +502,11 @@ if _FAKE_DISK_BYTES and "=" in _FAKE_DISK_BYTES:
         try:
             _FAKE_DISK_MAP[_k.strip()] = int(_v)
         except ValueError:
-            pass
+            # Test-only seam: a malformed entry is simply not a known
+            # disk, which is the same thing the map already expresses by
+            # omission. Nothing to report — this variable is never set on
+            # a real install.
+            continue
 
 
 def resolve_disk(spec: str):

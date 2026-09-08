@@ -108,10 +108,21 @@ describe("formatEta", () => {
 });
 
 describe("storageSeverityClass", () => {
-  it("falls back to the healthy style for no finding", () => {
+  it("uses the healthy style only for an explicit absence of findings", () => {
     expect(storageSeverityClass(null)).toContain("emerald");
     expect(storageSeverityClass("critical")).toContain("rose");
     expect(storageSeverityClass("warning")).toContain("amber");
+  });
+
+  it("never renders an UNRECOGNISED severity as healthy", () => {
+    // The trap: the map has no `info` entry, so a fallback to `ok`
+    // would paint a severity we do not understand green — the same
+    // "unknown reads as healthy" failure the rest of this feature is
+    // built to avoid. Only `null` earns green.
+    for (const unknown of ["info", "fatal", "", "MAJOR"]) {
+      expect(storageSeverityClass(unknown)).not.toContain("emerald");
+      expect(storageSeverityClass(unknown)).toContain("muted");
+    }
   });
 });
 

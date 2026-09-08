@@ -16,7 +16,12 @@
  * short labels a chip has room for.
  */
 
-export type StorageSeverity = "critical" | "warning" | "info";
+/**
+ * The severities the server can actually emit. `info` is deliberately
+ * absent: a routine scrub is shown with its progress and is not a
+ * finding at all (see `storage_health.py`), so nothing produces one.
+ */
+export type StorageSeverity = "critical" | "warning";
 
 /** Chip classes per severity, plus the healthy case (no findings). */
 export const STORAGE_SEVERITY_CLASSES: Record<string, string> = {
@@ -30,9 +35,15 @@ export const STORAGE_SEVERITY_CLASSES: Record<string, string> = {
 };
 
 export function storageSeverityClass(severity: string | null): string {
-  return (
-    STORAGE_SEVERITY_CLASSES[severity ?? "ok"] ?? STORAGE_SEVERITY_CLASSES.ok
-  );
+  // `null` means "no finding", which for an md array is a real
+  // statement and earns green. Anything else UNRECOGNISED does not:
+  // falling back to green would render a severity we do not understand
+  // as healthy — the same trap as treating a missing reading as a clean
+  // bill of health, and the one this whole feature exists to avoid. A
+  // reintroduced `info` severity would otherwise have gone green
+  // silently.
+  if (severity == null) return STORAGE_SEVERITY_CLASSES.ok;
+  return STORAGE_SEVERITY_CLASSES[severity] ?? STORAGE_SEVERITY_CLASSES.unknown;
 }
 
 /**

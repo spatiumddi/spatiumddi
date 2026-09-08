@@ -157,6 +157,19 @@ CHANNEL_NETTOOL = "nettool"
 #: The #999 md / multipath management channel.
 CHANNEL_STORAGE = "storage"
 
+#: Every channel that has a supervisor polling it. Validated on the way
+#: in rather than left to the ``defaultdict``: an unrecognised name
+#: silently creates a queue nothing polls, so a typo would not raise —
+#: the command would sit there and the operator would get a 504 blaming
+#: the appliance for being offline.
+CHANNELS = frozenset({CHANNEL_NETTOOL, CHANNEL_STORAGE})
+
+
+def _queues(channel: str) -> _Dispatch:
+    if channel not in CHANNELS:
+        raise ValueError(f"unknown dispatch channel {channel!r}")
+    return _dispatches[channel]
+
 
 def appliance_ready(
     *,
@@ -218,9 +231,9 @@ async def enqueue_command(
     command = NetToolCommand(request_id=request_id, tool=tool, params=dict(params))
 
     future: asyncio.Future[NetToolResult] = asyncio.get_running_loop().create_future()
-    _dispatches[channel].futures[request_id] = future
+    _queues(channel).futures[request_id] = future
 
-    await _dispatches[channel].queues[appliance_id].put(command)
+    await _queues(channel).queues[appliance_id].put(command)
     logger.info(
         "appliance.nettool.enqueued",
         appliance_id=str(appliance_id),
@@ -243,7 +256,7 @@ async def enqueue_command(
     finally:
         # Always evict the future map entry — a late result goes to
         # ``deliver_result`` which logs + discards.
-        _dispatches[channel].futures.pop(request_id, None)
+        _queues(channel).futures.pop(request_id, None)
 
 
 async def pop_command(
@@ -259,7 +272,7 @@ async def pop_command(
     skipped so the supervisor never runs stale work. Same loop shape as
     ``k8s_proxy.pop_request``.
     """
-    queue = _dispatches[channel].queues[appliance_id]
+    queue = _queues(channel).queues[appliance_id]
     deadline = asyncio.get_running_loop().time() + timeout
     while True:
         remaining = deadline - asyncio.get_running_loop().time()
@@ -287,7 +300,7 @@ def deliver_result(result: NetToolResult, *, channel: str = CHANNEL_NETTOOL) -> 
     endpoint returns 200 either way — late delivery isn't a
     supervisor-side error. Mirrors ``k8s_proxy.deliver_response``.
     """
-    future = _dispatches[channel].futures.get(result.request_id)
+    future = _queues(channel).futures.get(result.request_id)
     if future is None or future.done():
         logger.info("appliance.nettool.result_stale", request_id=result.request_id)
         return False
@@ -298,7 +311,7 @@ def deliver_result(result: NetToolResult, *, channel: str = CHANNEL_NETTOOL) -> 
 def queue_depth(appliance_id: uuid.UUID, *, channel: str = CHANNEL_NETTOOL) -> int:
     """Operator-facing diagnostic: how many nettool jobs are queued for
     this appliance?"""
-    queue = _dispatches[channel].queues.get(appliance_id)
+    queue = _queues(channel).queues.get(appliance_id)
     return queue.qsize() if queue is not None else 0
 
 
