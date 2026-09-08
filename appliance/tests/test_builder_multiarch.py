@@ -27,6 +27,8 @@ No Docker, no root required.
 
 from __future__ import annotations
 
+import re
+
 import pathlib
 
 import pytest
@@ -71,9 +73,16 @@ def test_the_add_architecture_runs_in_the_same_layer_as_the_install(dockerfile):
     """
     # Match the RUN line, not the comment above it that explains why it
     # is there — the first cut of this test picked the comment.
+    #
+    # Backslash continuations are JOINED first (#1026). The property is
+    # about the logical command, not the physical line, and a second
+    # ``--add-architecture`` on its own continued line is still the same
+    # RUN — reading line-by-line reported a correct Dockerfile as a
+    # regression.
+    joined = re.sub(r"\\\n\s*", " ", dockerfile)
     run_line = next(
         line
-        for line in dockerfile.splitlines()
+        for line in joined.splitlines()
         if "dpkg --add-architecture" in line and line.lstrip().startswith("RUN ")
     )
     assert "apt-get update" in run_line

@@ -2315,7 +2315,7 @@ introduced by an upgrade don't clobber operator-created ones.
 1. Operator opens the **OS Image** card in `/appliance` →
    Releases. The image-URL field is pre-filled with
    `https://github.com/spatiumddi/spatiumddi/releases/latest/
-   download/spatiumddi-appliance-slot-amd64.raw.xz` so a
+   download/spatiumddi-appliance-slot-<arch>.raw.xz` so a
    first-time operator just clicks Apply.
 2. The api container writes a trigger file the host-side
    `spatiumddi-slot-upgrade.path` unit watches.
@@ -2352,6 +2352,10 @@ spatium-upgrade-slot status
 sudo spatium-upgrade-slot apply \
     https://github.com/.../spatiumddi-appliance-slot-amd64.raw.xz \
     --checksum https://.../spatiumddi-appliance-slot-amd64.sha256
+# …or -arm64 for an arm64 appliance (#1026). Pointing a node at the
+# other architecture's image is refused twice — by the control plane
+# before it stamps desired state, and by the runner above on the real
+# decompressed bytes before it touches the bootloader.
 
 # Arm one-shot next-boot
 sudo spatium-upgrade-slot set-next-boot
@@ -2506,6 +2510,14 @@ inside a non-seekable `xz` stream, so reading `APPLIANCE_ARCH` out of
 the bytes means decompressing ~8 GiB — on an upload request, for a check
 the host repeats anyway. An operator-pasted external URL tells it
 nothing at all.
+
+**Both architectures are built by the same pipeline.** `release.yml`
+and `nightly.yml` matrix over `[amd64, arm64]` and call the reusable
+`build-appliance.yml` once per leg, with `fail-fast: false` so a break
+in one does not withhold the other's ISO from a release. The arm64 leg
+runs on `ubuntu-24.04-arm` — a NATIVE runner, because mkosi's builder
+container cannot be emulated: under qemu-user it dies immediately on
+`mount_setattr(2)` (#991), and no amount of `--privileged` helps.
 
 Where the architecture comes from, therefore:
 

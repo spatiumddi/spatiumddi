@@ -381,11 +381,19 @@ jobs:
     permissions:
       contents: read
       packages: read
+    # #1026 — both architectures nightly, so an arm64 regression in the
+    # assembly surfaces overnight rather than when a release is cut.
+    # That is the whole argument #823 made for the nightly existing.
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
     uses: ./.github/workflows/build-appliance.yml
     with:
       version: ${{ needs.gate.outputs.version }}
       image_tag: ${{ needs.gate.outputs.date_tag }}
-      # The un-versioned spatiumddi-appliance-amd64.* names are the
+      arch: ${{ matrix.arch }}
+      # The un-versioned spatiumddi-appliance-<arch>.* names are the
       # RELEASE's /releases/latest/download/ link targets; emitting them
       # here would only bloat the artifact with byte-identical copies.
       stable_copies: false

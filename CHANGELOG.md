@@ -521,6 +521,56 @@ the formatter handles the rest.
   control plane's first config push does not put the pool back.
   `sources.d` and `conf.d` are left in place as the way back.
 
+### Added
+
+- **The appliance builds for arm64 — ISO and upgrade image, in
+  the release and the nightly (#1026, parts 2 + 3).** Apple
+  Silicon VMs, Graviton / Ampere instances and Raspberry Pi
+  5-class boards. `mkosi.conf` no longer pins `Architecture`;
+  the kernel, GRUB packages and `BiosBootloader` moved to
+  `mkosi.conf.d/` drop-ins matched on architecture, and the
+  Makefile always passes `--architecture` explicitly so an
+  Apple Silicon dev box does not silently start building arm64
+  by default. `release.yml` and `nightly.yml` matrix over
+  `[amd64, arm64]` with `fail-fast: false` — a break in one leg
+  must not withhold the other's ISO from a release — and the
+  arm64 leg runs on `ubuntu-24.04-arm`, a NATIVE runner,
+  because mkosi's builder cannot be emulated: under qemu-user
+  it dies on `mount_setattr(2)` (#991).
+  **arm64 is UEFI-only, and that is the platform rather than a
+  simplification.** There is no i386-pc GRUB target for AArch64
+  and no BIOS to chain-load from, so the installer lays down no
+  BIOS-boot partition, installs only `--target=arm64-efi`, and
+  **refuses before touching the disk** on a machine that did
+  not boot via EFI — a successful install that can never boot
+  is worse than an honest refusal. The partition NUMBERING is
+  identical on both architectures: p1 is simply absent on
+  arm64 rather than the rest shifting down, so `partition_node`,
+  `_MD_NAMES`, the #999 mirror path and the verification pass
+  all work unchanged. Root partitions are typed `8305` (Linux
+  root ARM-64) instead of `8304`, which `build-slot-image.sh`
+  and `wrap-iso.sh` now look up per architecture; the ISO is
+  built with `grub-mkrescue -d` forced to a single platform, so
+  an arm64 ISO cannot silently carry x86 boot paths just
+  because the builder image has the modules for both.
+  **The versioned ISO name gains its architecture.** It never
+  had one while the stable name always did — invisible with a
+  single build leg, a filename COLLISION with two, where
+  whichever leg uploaded second would win silently. The pruner
+  now treats the two architectures as a pair: its `*)`
+  fallthrough leaves unrecognised assets alone, which is right
+  for a genuinely new artifact and exactly wrong for an
+  architecture somebody added to the build matrix — ~3 GB per
+  release that nothing ever reclaims. A test pins the pruner's
+  architecture list against both workflow matrices.
+  Verified end to end on real hardware: the ISO boots in UTM on
+  an M4 (Apple Virtualization, UEFI), the installer runs, and
+  the installed system comes up with `root-arm64` partition
+  types, `BOOTAA64.EFI` on the ESP, no BIOS-boot partition, an
+  `ELF ARM aarch64` k3s binary, a Ready node on kernel
+  `6.12.107+deb13-arm64`, and A/B slot detection working
+  unchanged.
+
 ### Fixed
 
 - **The upgrade path could hand a node a root filesystem for
@@ -573,6 +623,28 @@ the formatter handles the rest.
   upload. Migration `f7c3a91e50b4`; two nullable columns, no
   backfill. Parts 2 (arm64 ISO + installer) and 3 (CI matrix)
   are still open.
+
+- **The k3s fetch cache could bake the wrong architecture's
+  binary, silently (#1026).** `fetch-k3s.sh`'s short-circuit
+  keyed on the pinned version alone, but the airgap tarball is
+  arch-named while the binary is a single un-suffixed path.
+  Build arm64, then amd64 again: the stamp matched, an amd64
+  tarball was still on disk, the binary existed — so it skipped,
+  leaving the **ARM** binary in place. The ISO builds, boots,
+  and k3s never starts, with nothing in the build log, because
+  from the fetcher's point of view everything asked for was
+  already there. The stamp now carries the architecture, and
+  the other architecture's airgap tarball is dropped rather
+  than baked in as ~250 MB of images for the wrong silicon.
+
+- **A post-install check reported a correct arm64 install as
+  failed (#1026).** The verification that runs before the Done
+  screen looked for `EFI/BOOT/BOOTX64.EFI`. The removable-media
+  bootloader filename is per-architecture (UEFI §3.5.1.1), so a
+  perfectly good arm64 install — which writes `BOOTAA64.EFI` —
+  showed `POST-INSTALL CHECKS FAILED` on the one screen whose
+  entire job is to tell the operator whether to trust the
+  reboot. Found on the first real UTM install.
 
 - **Alert forwarding was filtered — and in the default format,
   rendered — against keys alert payloads do not carry (#1031).**

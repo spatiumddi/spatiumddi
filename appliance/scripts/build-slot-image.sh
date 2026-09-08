@@ -6,9 +6,11 @@
 # Invoked from the appliance builder container (has root, kpartx,
 # mount, xz). Outputs $OUT_DIR/spatiumddi-appliance-slot-<v>.raw.xz.
 #
-# The mkosi disk image has a GPT layout with ESP / BIOS-boot / root.
-# We find the root partition by GPT PartType GUID (Linux root x86-64
-# = 4f68bce3-e8cd-4db1-96e7-fbcaf984b709), mount it read-only via
+# The mkosi disk image has a GPT layout with ESP / BIOS-boot / root
+# (no BIOS-boot on arm64 — UEFI only). We find the root partition by
+# GPT PartType GUID, which is per-architecture (#1026): Linux root
+# x86-64 = 4f68bce3-…, Linux root arm64 = b921b045-…. Mount it
+# read-only via
 # `mount -o loop,offset=…`, rsync its contents (minus /var content)
 # into a freshly-mkfs'd 4 GiB ext4 image, add the /usr/lib/etc.image
 # snapshot needed by Phase 8a's overlay, then xz-compress.
@@ -32,6 +34,20 @@ set -o pipefail
 
 INPUT_RAW="${1:?input raw image path required}"
 OUT_DIR="${2:?output directory required}"
+
+# #1026 — which architecture's raw are we extracting from? Passed in
+# rather than sniffed from ``uname -m``: this runs in a builder
+# container that may be a different architecture from the image, which
+# is the entire point of the #991 cross-build.
+APPLIANCE_ARCH="${APPLIANCE_ARCH:-amd64}"
+case "$APPLIANCE_ARCH" in
+    amd64|x86_64|x86-64) APPLIANCE_ARCH=amd64 ;;
+    arm64|aarch64)       APPLIANCE_ARCH=arm64 ;;
+    *)
+        echo "ERROR: unsupported APPLIANCE_ARCH '$APPLIANCE_ARCH' (amd64|arm64)" >&2
+        exit 1
+        ;;
+esac
 
 if [ ! -f "$INPUT_RAW" ]; then
     echo "ERROR: input raw image not found: $INPUT_RAW" >&2
@@ -67,14 +83,28 @@ for stale in $(losetup -j "$INPUT_RAW" 2>/dev/null | cut -d: -f1); do
     losetup -d "$stale" 2>/dev/null || true
 done
 
-# Find the Linux root x86-64 partition by GPT PartType GUID. sfdisk's
-# dump format is machine-parseable and present in every Debian build
-# image, so we don't have to install anything extra.
-echo "→ Locating Linux root x86-64 partition in $INPUT_RAW…"
+# Find the Linux root partition by GPT PartType GUID. sfdisk's dump
+# format is machine-parseable and present in every Debian build image,
+# so we don't have to install anything extra.
+#
+# #1026 — the GUID is per-architecture (Discoverable Partitions Spec),
+# and BOTH must stay supported because this one script runs for both
+# builds. Looking for the wrong one fails with "no root partition found"
+# on a perfectly good image, which reads as a corrupt build rather than
+# a mismatched flag — so the message names the architecture it looked
+# for.
+case "$APPLIANCE_ARCH" in
+    amd64) ROOT_TYPE_GUID='4f68bce3-e8cd-4db1-96e7-fbcaf984b709' ;;  # root-x86-64
+    arm64) ROOT_TYPE_GUID='b921b045-1df0-41c3-af44-4c6f280d3fae' ;;  # root-arm64
+esac
+echo "→ Locating the Linux root ($APPLIANCE_ARCH) partition in $INPUT_RAW…"
 PARTTABLE=$(sfdisk -d "$INPUT_RAW" 2>/dev/null)
-ROOT_LINE=$(printf '%s\n' "$PARTTABLE" | grep -iE 'type=4f68bce3-e8cd-4db1-96e7-fbcaf984b709' | head -1)
+ROOT_LINE=$(printf '%s\n' "$PARTTABLE" | grep -iE "type=$ROOT_TYPE_GUID" | head -1)
 if [ -z "$ROOT_LINE" ]; then
-    echo "ERROR: no Linux root x86-64 partition found in $INPUT_RAW" >&2
+    echo "ERROR: no Linux root ($APPLIANCE_ARCH, type $ROOT_TYPE_GUID) partition" >&2
+    echo "       found in $INPUT_RAW. If the partition table below shows a root" >&2
+    echo "       of the OTHER architecture, APPLIANCE_ARCH does not match the" >&2
+    echo "       image this was pointed at." >&2
     printf '%s\n' "$PARTTABLE" >&2
     exit 1
 fi

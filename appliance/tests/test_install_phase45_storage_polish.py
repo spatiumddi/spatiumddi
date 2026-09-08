@@ -218,9 +218,20 @@ def test_the_install_is_verified_before_it_is_called_done():
     # of item 30.
     blk = CODE[CODE.index("        _verify() {"):CODE.index("Saving installer logs to the target")]
     assert "verify_fail" in blk
-    for check in ("BOOTX64.EFI", "grub.cfg", "grub-script-check",
+    for check in ("EFI/BOOT/$_EFI_REMOVABLE", "grub.cfg", "grub-script-check",
                   "saved_entry=slot_a", "spatium-config.yaml", "root_B"):
         assert check in blk, check
+    # #1026 — the ESP-bootloader check is parameterised now, because the
+    # removable-media filename is per-architecture (UEFI §3.5.1.1). This
+    # test used to pin the x86 literal ``BOOTX64.EFI``, which reported a
+    # correct arm64 install as POST-INSTALL CHECKS FAILED on the one
+    # screen whose job is to say whether the reboot is safe.
+    #
+    # Pinning the variable alone would let it be defined as the empty
+    # string, so both spellings are asserted too: the check is only
+    # meaningful if it resolves to a real filename on both.
+    assert '_EFI_REMOVABLE="BOOTAA64.EFI"' in CODE
+    assert '_EFI_REMOVABLE="BOOTX64.EFI"' in CODE
 
 
 def test_verification_failures_survive_the_gauge_subshell():

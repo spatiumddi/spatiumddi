@@ -17,7 +17,11 @@ Subcommands:
 
 The current slot is detected from /proc/cmdline's root=UUID=... by
 looking up the matching partition via blkid. Inactive slot is the
-OTHER 8304-typed partition on the same disk.
+OTHER partition carrying a root_a / root_b PARTLABEL on the same disk.
+
+Matched on the PARTLABEL, not the GPT type code — which is what makes
+it architecture-independent: the root type is 8304 on x86-64 and 8305
+on arm64 (#1026), and the labels are the same on both.
 """
 
 from __future__ import annotations

@@ -898,8 +898,20 @@ Operators get a real Kubernetes node without managing one.
 
 #### Get the ISO
 
-- **Pre-built:** grab `spatiumddi-appliance-<version>.iso` from the
-  [latest release](https://github.com/spatiumddi/spatiumddi/releases).
+- **Pre-built:** grab the ISO for your architecture from the
+  [latest release](https://github.com/spatiumddi/spatiumddi/releases):
+
+  | Architecture | ISO | Firmware |
+  |---|---|---|
+  | x86-64 (Intel/AMD) | `spatiumddi-appliance-<version>-amd64.iso` | BIOS **or** UEFI |
+  | arm64 (Apple Silicon, Graviton, Ampere) | `spatiumddi-appliance-<version>-arm64.iso` | **UEFI only** |
+
+  The arm64 image is UEFI-only because AArch64 has no BIOS boot path —
+  there is no legacy firmware mode to fall back to, and the installer
+  refuses rather than completing an install that could never boot. Both
+  are also published under un-versioned names
+  (`spatiumddi-appliance-<arch>.iso`) that
+  `releases/latest/download/…` always points at.
 - **Nightly:** every night that `main` moves, a pre-release tagged
   `nightly-YYYY.MM.DD` ships the same artifacts a real release does —
   container images, the appliance ISO and the A/B slot image, assembled
@@ -908,7 +920,10 @@ Operators get a real Kubernetes node without managing one.
   days. Useful for testing a fix before it's tagged; not for production
   — nightlies are never tagged `:latest`.
 - **Build from source:** `make appliance-dev-iso` produces an
-  ISO in `appliance/build/`. See
+  ISO in `appliance/build/`. Add `APPLIANCE_ARCH=linux/arm64` for the
+  arm64 image — on an Apple Silicon Mac that is a NATIVE build, which
+  is also the quickest way to test the appliance locally (UTM, Apple
+  Virtualization backend). See
   [`docs/deployment/APPLIANCE.md`](docs/deployment/APPLIANCE.md)
   for prerequisites.
 

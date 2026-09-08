@@ -2432,7 +2432,7 @@ suggestion, free-space treemap.
   now resolved from the parent directory's mtime, which `unlink()` updates and which,
   unlike stamping "now", does not make the image permanently stale on every later run.
 
-- 🟡 [**Appliance ISO + upgrade image for arm64 — with an architecture gate on the slot-upgrade path first**](https://github.com/spatiumddi/spatiumddi/issues/1026)
+- ✅ [**Appliance ISO + upgrade image for arm64 — with an architecture gate on the slot-upgrade path first**](https://github.com/spatiumddi/spatiumddi/issues/1026)
   — three parts, and the ordering is the issue's own: **part 1 (the gate) shipped
   alone**, before any arm64 artifact exists, because it is a correctness fix on the
   x86-64 fleet that already exists rather than a prerequisite for one that does not.
@@ -2479,15 +2479,47 @@ suggestion, free-space treemap.
   a coin flip between an image that boots and one that does not), and importing without
   saying which is a 422. Migration `f7c3a91e50b4`, two nullable columns, no backfill; 2
   MCP tools gained the field; no new endpoint.
-  **Still open — parts 2 and 3.** Part 2 is the arm64 build itself: mkosi
-  `Architecture`, `linux-image-arm64` / `grub-efi-arm64-bin`, `grub-install
-  --target=arm64-efi`, root partition type `8305`, no BIOS-boot partition (UEFI or
-  refuse), the arch-appropriate PartType lookup in `build-slot-image.sh`, a UEFI-only
-  El Torito with `BOOTAA64.EFI`, and a per-arch bake — verified by hand in UTM on Apple
-  Silicon, which is the payoff (a native-speed local appliance test loop with no Proxmox
-  box). Part 3 is the CI matrix on `ubuntu-24.04-arm` runners plus release / nightly /
-  docs. The build stamps `APPLIANCE_ARCH` into `/etc/spatiumddi/appliance-release`
-  already, so part 2 inherits a working gate rather than needing one retrofitted.
+  **Parts 2 + 3 shipped alongside it.** `mkosi.conf` no longer pins `Architecture`;
+  the kernel, GRUB packages and `BiosBootloader` moved to `mkosi.conf.d/` drop-ins
+  matched on architecture, with the Makefile always passing `--architecture`
+  explicitly — left unset, mkosi defaults to the BUILD HOST, which on an Apple Silicon
+  dev box is a silent change to what `make appliance` produces. `release.yml` +
+  `nightly.yml` matrix `[amd64, arm64]`, `fail-fast: false`, arm64 on
+  `ubuntu-24.04-arm` because mkosi's builder cannot be emulated (#991's
+  `mount_setattr(2)` wall).
+  **arm64 is UEFI-only by platform, not by simplification** — no i386-pc target, no
+  BIOS to chain-load — so the installer lays down no BIOS-boot partition, installs only
+  `--target=arm64-efi`, and REFUSES before touching the disk if the machine did not
+  boot EFI. **The partition NUMBERING is identical on both**: p1 is absent on arm64
+  rather than the rest shifting down, so `partition_node`, `_MD_NAMES`, the #999 mirror
+  path and the verification pass need no arch branch at all — the single decision that
+  kept this change small. Roots are typed `8305`, looked up per-arch by
+  `build-slot-image.sh` and `wrap-iso.sh`; `grub-mkrescue -d` FORCES one platform, or an
+  arm64 ISO would silently carry x86 boot paths just because the builder has both
+  module sets.
+  **The versioned ISO name gained its architecture** — it never had one while the
+  stable name always did, which is invisible with one build leg and a filename
+  COLLISION with two. The pruner treats the arches as a pair: its `*)` fallthrough
+  leaves unknown assets alone, right for a new artifact and exactly wrong for an
+  architecture added to the matrix (~3 GB per release nothing reclaims), and a test pins
+  its arch list against both workflow matrices.
+  **Verified on real hardware** — UTM on an M4, Apple Virtualization, UEFI: ISO boots,
+  installer runs, installed system comes up with `root-arm64` partition types, no
+  `vda1`, `BOOTAA64.EFI` on the ESP, an `ELF ARM aarch64` k3s, a Ready node on
+  `6.12.107+deb13-arm64`, and A/B slot detection working unchanged (it matches on
+  PARTLABEL, not the type code — which is *why* it needed no change, and the docstring
+  claiming otherwise was corrected). Part 1's host gate was then proven on that box:
+  a real ext4 slot claiming `amd64` mounted against a real `uname -m` of `arm64` →
+  refused.
+  **Three bugs found doing it, all the same shape as the issue itself.** `fetch-k3s.sh`
+  keyed its cache on the version alone while the binary path carries no arch, so
+  building arm64 then amd64 again SKIPPED and left the ARM binary — an ISO that builds,
+  boots, and never starts k3s, with nothing in the log. The post-install check looked
+  for `EFI/BOOT/BOOTX64.EFI` and reported a correct arm64 install as FAILED on the one
+  screen that says whether to trust the reboot (found on the first real install). And
+  the arm64 UEFI refusal, in its first draft, ran at script load — which made `--help`
+  and `--check-preseed` exit 1 on any non-EFI arm64 host, including the macOS laptop the
+  preseed linter exists to run on; the appliance suite caught it within a minute.
 
 #### CLI tool
 

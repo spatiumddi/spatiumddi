@@ -42,6 +42,12 @@ FRONTEND_DIR   = frontend
 # absence it actually is.
 APPLIANCE_ARCH ?= linux/amd64
 
+# mkosi's spelling of the same thing. Its ``--architecture`` vocabulary
+# is x86-64 / arm64, while Docker platforms are linux/amd64 //arm64 and
+# the artifacts are named amd64 / arm64 (#1026). One translation, here,
+# rather than three call sites each getting it right.
+MKOSI_ARCH := $(if $(filter arm64,$(notdir $(APPLIANCE_ARCH))),arm64,x86-64)
+
 # Per-build identifier used as the image tag (compose substitutes via
 # ``${SPATIUMDDI_VERSION}``). Computed once per ``make`` invocation —
 # git short sha + 4 random hex chars — so each ISO cut produces a
@@ -502,6 +508,7 @@ appliance:
 	docker run --rm --privileged \
 	    -v $(PWD)/$(APPLIANCE_DIR):/work \
 	    $(APPLIANCE_BUILDER) \
+	    --architecture=$(MKOSI_ARCH) \
 	    --output-directory=build --force build
 	@raw=$$(ls $(APPLIANCE_OUT)/spatiumddi-appliance*.raw 2>/dev/null | head -1); \
 	if [ -n "$$raw" ]; then \
@@ -549,6 +556,7 @@ appliance-iso:
 	echo "→ Wrapping $$raw → $$iso (hybrid USB/CD)…"; \
 	docker run --rm --privileged \
 	    --entrypoint /work/scripts/wrap-iso.sh \
+	    -e APPLIANCE_ARCH=$(notdir $(APPLIANCE_ARCH)) \
 	    -v $(PWD)/$(APPLIANCE_DIR):/work \
 	    $(APPLIANCE_BUILDER) \
 	    "/work/build/$$(basename $$raw)" \
@@ -572,6 +580,7 @@ appliance-slot-image:
 	echo "→ Building slot image from $$raw …"; \
 	docker run --rm --privileged \
 	    --entrypoint /work/scripts/build-slot-image.sh \
+	    -e APPLIANCE_ARCH=$(notdir $(APPLIANCE_ARCH)) \
 	    -v $(PWD)/$(APPLIANCE_DIR):/work \
 	    $(APPLIANCE_BUILDER) \
 	    "/work/build/$$(basename $$raw)" \
@@ -616,7 +625,12 @@ K3S_VERSION ?= v1.36.4+k3s1
 # into an amd64 rootfs (won't exec / won't import). Keep in lock-step with
 # mkosi.conf's Architecture.
 appliance-fetch-k3s:
-	@K3S_VERSION="$(K3S_VERSION)" ARCH=x86_64 bash $(APPLIANCE_DIR)/scripts/fetch-k3s.sh
+	@# #1026 — ARCH follows APPLIANCE_ARCH rather than being pinned to
+	@# x86_64. fetch-k3s.sh has understood both since #991; it was the
+	@# caller that only ever asked for one. A mismatch here is not a
+	@# build failure — it is an appliance that boots and then cannot
+	@# start k3s, because the static binary is for the other silicon.
+	@K3S_VERSION="$(K3S_VERSION)" ARCH=$(notdir $(APPLIANCE_ARCH)) 	  bash $(APPLIANCE_DIR)/scripts/fetch-k3s.sh
 
 # Issue #183 Phase 3 — chart bake. Packages
 # charts/spatiumddi-appliance/ into a stable tgz at

@@ -27,6 +27,21 @@ ISO="${2:?usage: $0 <raw_image> <output_iso>}"
 
 [ -f "$RAW" ] || { echo "raw image not found: $RAW" >&2; exit 1; }
 
+# #1026 — which architecture's image are we wrapping? Passed in by the
+# Makefile rather than sniffed from ``uname -m``: this script runs in a
+# builder container that may be a different architecture from the image
+# it is wrapping (that is the whole point of #991's cross-build), so the
+# build host's own architecture is not the answer.
+APPLIANCE_ARCH="${APPLIANCE_ARCH:-amd64}"
+case "$APPLIANCE_ARCH" in
+    amd64|x86_64|x86-64) APPLIANCE_ARCH=amd64 ;;
+    arm64|aarch64)       APPLIANCE_ARCH=arm64 ;;
+    *)
+        echo "ERROR: unsupported APPLIANCE_ARCH '$APPLIANCE_ARCH' (amd64|arm64)" >&2
+        exit 1
+        ;;
+esac
+
 # mkosi stages the kernel + initrd next to the raw with matching
 # basenames. Prefer those — extracting from the raw would require
 # loop+mount and adds 30 s of work for the same bytes.
@@ -43,13 +58,24 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Find the root partition by GPT type GUID. mkosi's layout puts:
+# Find the root partition by GPT type GUID. mkosi's x86-64 layout puts:
 #   p1: ESP (FAT32)             type C12A7328-F81F-11D2-BA4B-00A0C93EC93B
 #   p2: BIOS Boot Partition     type 21686148-6449-6E6F-744E-656564454649
 #   p3: root-x86-64             type 4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709
 # Locating by GUID instead of position survives layout changes in
-# future mkosi versions.
-ROOT_TYPE_GUID='4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709'
+# future mkosi versions — and on arm64 the BIOS Boot partition is
+# absent entirely, so position would have been wrong there anyway.
+#
+# #1026 — the root type GUID is per-architecture, from the Discoverable
+# Partitions Specification. This is why the arch has to be passed in:
+# the two images differ in exactly this field, and looking for the wrong
+# one fails with "could not locate root partition" on a perfectly good
+# image.
+case "$APPLIANCE_ARCH" in
+    amd64) ROOT_TYPE_GUID='4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709' ;;  # root-x86-64
+    arm64) ROOT_TYPE_GUID='B921B045-1DF0-41C3-AF44-4C6F280D3FAE' ;;  # root-arm64
+esac
+echo "→ Wrapping an $APPLIANCE_ARCH image (root type $ROOT_TYPE_GUID)" 
 
 ROOT_INFO=$(sfdisk --json "$RAW" | jq -r --arg t "$ROOT_TYPE_GUID" '
     .partitiontable.partitions[] | select(.type == $t) | "\(.start) \(.size)"
@@ -210,16 +236,43 @@ menuentry "Rescue / diagnostics shell (verbose, for debugging)" {
 EOF
 
 # ── Build the ISO ─────────────────────────────────────────────────────────────
-# grub-mkrescue handles:
+# On x86-64 grub-mkrescue handles:
 #   - BIOS El Torito catalog + i386-pc eltorito.img
 #   - UEFI El Torito alt-boot + x86_64-efi FAT image
 #   - Hybrid MBR/GPT for USB-dd boot
 #   - ISO9660 + Joliet + Rock Ridge for cross-OS readability
-echo "→ Running grub-mkrescue…"
+#
+# On arm64 it is UEFI El Torito only — no BIOS catalog, no hybrid MBR,
+# because there is no i386-pc target to build one from.
+#
+# #1026 — the platform is FORCED with ``-d`` rather than left to
+# grub-mkrescue's auto-detection, and that is the load-bearing part.
+# The builder image now carries the modules for i386-pc, x86_64-efi AND
+# arm64-efi so it can build either ISO; left to itself, grub-mkrescue
+# embeds every platform it finds, so an "arm64" ISO would silently come
+# out carrying x86 boot paths as well — bootable on the wrong machine
+# and confusing on the right one.
+case "$APPLIANCE_ARCH" in
+    amd64) GRUB_PLATFORMS="i386-pc x86_64-efi" ;;
+    arm64) GRUB_PLATFORMS="arm64-efi" ;;
+esac
+GRUB_DIR_ARGS=()
+for plat in $GRUB_PLATFORMS; do
+    if [ ! -d "/usr/lib/grub/$plat" ]; then
+        echo "ERROR: /usr/lib/grub/$plat is missing from this builder image." >&2
+        echo "       An $APPLIANCE_ARCH ISO cannot be built without it — refusing" >&2
+        echo "       rather than producing an ISO with no boot path for the" >&2
+        echo "       architecture it claims to be." >&2
+        exit 1
+    fi
+    GRUB_DIR_ARGS+=(-d "/usr/lib/grub/$plat")
+done
+
+echo "→ Running grub-mkrescue ($APPLIANCE_ARCH: $GRUB_PLATFORMS)…"
 # `-volid SPATIUMDDI` is xorriso-native (sets the ISO9660 volume
 # label). No `-appid` — that's mkisofs-compat syntax and grub-mkrescue
 # invokes xorriso in native mode.
-grub-mkrescue -o "$ISO" "$ISO_ROOT" \
+grub-mkrescue "${GRUB_DIR_ARGS[@]}" -o "$ISO" "$ISO_ROOT" \
     -- \
     -volid 'SPATIUMDDI'
 

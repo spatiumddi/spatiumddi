@@ -413,10 +413,19 @@ jobs:
     permissions:
       contents: read
       packages: read
+    # #1026 — one leg per architecture. ``fail-fast: false`` so an arm64
+    # regression does not withhold the amd64 ISO from a release: the two
+    # are independent artifacts and one being broken is not a reason to
+    # ship neither.
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
     uses: ./.github/workflows/build-appliance.yml
     with:
       version: ${{ needs.meta.outputs.version }}
       image_tag: ${{ needs.meta.outputs.version }}
+      arch: ${{ matrix.arch }}
 
   # ── Export the OpenAPI contract (#903) ─────────────────────────────────────
   #

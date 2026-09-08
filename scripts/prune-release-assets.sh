@@ -108,6 +108,24 @@ del() {
 }
 
 idx=0
+# #1026 — every architecture the release pipeline publishes appliance
+# assets for. Keep in lock-step with the ``arch`` matrix in release.yml:
+# an architecture built there and missing here is one whose heavy assets
+# are never reclaimed.
+APPLIANCE_ARCHES=(amd64 arm64)
+
+# Exact-match membership. A ``case`` glob cannot express "one of these
+# N names" without either a generated pattern or a fallthrough that
+# also swallows names it should not.
+_in_list() {
+    local needle="$1"; shift
+    local x
+    for x in "$@"; do
+        [ "$x" = "$needle" ] && return 0
+    done
+    return 1
+}
+
 for line in "${RELEASES[@]}"; do
     tag="${line%%$'\t'*}"
     is_latest="${line##*$'\t'}"
@@ -134,12 +152,29 @@ for line in "${RELEASES[@]}"; do
 
     # Per-tag asset name conventions (must match release.yml's wrap-iso +
     # build-slot-image steps).
-    generic_iso="spatiumddi-appliance-amd64.iso"
-    generic_xz="spatiumddi-appliance-slot-amd64.raw.xz"
-    generic_sha="spatiumddi-appliance-slot-amd64.sha256"
-    ver_iso="spatiumddi-appliance-${tag}.iso"
-    ver_xz="spatiumddi-appliance-slot-${tag}-amd64.raw.xz"
-    ver_sha="spatiumddi-appliance-slot-${tag}-amd64.sha256"
+    #
+    # #1026 — ONE SET PER ARCHITECTURE, and the two are treated as a pair
+    # rather than one being the real release and the other an oddity. The
+    # ``*)`` fallthrough below leaves unrecognised assets alone, which is
+    # the right default for a genuinely new artifact and exactly wrong
+    # here: an unlisted arm64 ISO is not "future", it is a 1.6 GB binary
+    # per release that nothing ever removes, on a repo whose whole reason
+    # for having a pruner is that those add up.
+    GENERIC=()
+    VER_HEAVY=()
+    VER_SHA=()
+    for _a in "${APPLIANCE_ARCHES[@]}"; do
+        GENERIC+=("spatiumddi-appliance-${_a}.iso"
+                  "spatiumddi-appliance-slot-${_a}.raw.xz"
+                  "spatiumddi-appliance-slot-${_a}.sha256")
+        VER_HEAVY+=("spatiumddi-appliance-${tag}-${_a}.iso"
+                    "spatiumddi-appliance-slot-${tag}-${_a}.raw.xz")
+        VER_SHA+=("spatiumddi-appliance-slot-${tag}-${_a}.sha256")
+    done
+    # Pre-#1026 releases carry an ISO with no architecture in the name.
+    # Still prunable on the same terms — dropping it from the list would
+    # silently stop reclaiming every ISO cut before this change.
+    VER_HEAVY+=("spatiumddi-appliance-${tag}.iso")
 
     beyond_window="false"
     [ "$idx" -ge "$KEEP_VERSIONED" ] && beyond_window="true"
@@ -158,29 +193,34 @@ for line in "${RELEASES[@]}"; do
     fi
 
     for a in "${ASSETS[@]}"; do
-        case "$a" in
-            "$generic_iso" | "$generic_xz" | "$generic_sha")
-                # Tier 1 — generic dupes are dead weight on any non-latest.
-                [ "$is_latest" = "true" ] || del "$tag" "$a"
-                ;;
-            "$ver_iso" | "$ver_xz")
-                # Tier 2 — heavy versioned binaries beyond the keep window.
-                if [ "$beyond_window" = "true" ] && [ "$is_latest" != "true" ]; then
-                    del "$tag" "$a"
-                fi
-                ;;
-            "$ver_sha")
-                : # always keep the versioned provenance sidecar
-                ;;
-            spatiumddi-appliance-slot-*.sha256)
-                # Stray mkosi-ImageVersion sha (e.g. …-slot-0.1.0.sha256) —
-                # neither versioned nor generic. Junk on every release.
+        if _in_list "$a" "${VER_SHA[@]}"; then
+            : # always keep the versioned provenance sidecar
+        elif _in_list "$a" "${GENERIC[@]}"; then
+            # Tier 1 — generic dupes are dead weight on any non-latest.
+            [ "$is_latest" = "true" ] || del "$tag" "$a"
+        elif _in_list "$a" "${VER_HEAVY[@]}"; then
+            # Tier 2 — heavy versioned binaries beyond the keep window.
+            if [ "$beyond_window" = "true" ] && [ "$is_latest" != "true" ]; then
                 del "$tag" "$a"
-                ;;
-            *)
-                : # unknown / future asset — leave untouched
-                ;;
-        esac
+            fi
+        else
+            case "$a" in
+                spatiumddi-appliance-slot-*.sha256)
+                    # Stray mkosi-ImageVersion sha (e.g. …-slot-0.1.0.sha256)
+                    # — neither versioned nor generic. Junk on every release.
+                    #
+                    # Ordered AFTER the versioned-sha check above, not
+                    # before: this glob also matches every real
+                    # ``…-slot-<tag>-<arch>.sha256``, so reaching it first
+                    # would delete the provenance sidecar the line above
+                    # exists to protect.
+                    del "$tag" "$a"
+                    ;;
+                *)
+                    : # unknown / future asset — leave untouched
+                    ;;
+            esac
+        fi
     done
 
     idx=$((idx + 1))
