@@ -270,13 +270,6 @@ _NODE_PRESSURE_FULL_CRITICAL_PCT = 1.0
 _NODE_PRESSURE_RULE_NAME = "Node under sustained resource pressure"
 _CLUSTER_DNS_RULE_NAME = "Cluster DNS degraded"
 
-#: How long one cluster-health gather is shared between the rules that
-#: read it within a single evaluation sweep. Comfortably under the 60 s
-#: sweep interval, so consecutive sweeps still see fresh data.
-_CLUSTER_SNAPSHOT_TTL_S = 20.0
-
-#: ``(monotonic_deadline, snapshot)``, process-local and best-effort.
-_cluster_snapshot_cache: tuple[float, dict[str, Any]] | None = None
 
 # Issue #46 — planned-decommission awareness. Subject = subnet. Fires
 # when a subnet's ``decom_date`` falls within ``threshold_days`` (default
@@ -3042,10 +3035,15 @@ async def _cluster_health_snapshot() -> dict[str, Any] | None:
     including the message strings, so narrowing one bare ``except`` would
     have silently left the other wrong.
 
-    A short TTL cache also collapses the two gathers per 60 s sweep into
-    one: the snapshot does a node list, a cluster-wide pod list and a
-    kubelet round trip PER NODE, and both rules read the same instant's
-    truth anyway.
+    **Deliberately NOT cached.** The review suggested memoizing this so
+    the two rules share one gather per sweep, and a short-TTL module cache
+    was tried — it broke ten ``node_pressure`` tests and, more to the
+    point, it is wrong: a cache keyed on a clock answers the second rule
+    with the first rule's snapshot, so a cluster that goes from healthy to
+    unreadable inside the TTL keeps reporting healthy. Masking a health
+    transition to save one kubeapi round trip per minute is a bad trade
+    for an alerting path. The 60 s sweep can afford two gathers; the
+    dashboard already does one every 2 s.
 
     Raises :class:`AlertDataUnavailable` when the cluster cannot be read —
     a kubeapi blip and a dead cluster look alike from here, and neither is
@@ -3053,18 +3051,11 @@ async def _cluster_health_snapshot() -> dict[str, Any] | None:
     every open event and re-open it a minute later.
     """
     import asyncio  # noqa: PLC0415
-    import time  # noqa: PLC0415
 
     from app.config import settings  # noqa: PLC0415
 
     if not settings.appliance_mode:
         return None
-
-    global _cluster_snapshot_cache
-
-    cached = _cluster_snapshot_cache
-    if cached is not None and cached[0] > time.monotonic():
-        return cached[1]
 
     from app.services.appliance import cluster_health  # noqa: PLC0415
 
@@ -3074,7 +3065,6 @@ async def _cluster_health_snapshot() -> dict[str, Any] | None:
         raise AlertDataUnavailable(f"cluster health unreadable: {exc}") from exc
     if not snap.get("available"):
         raise AlertDataUnavailable(f"cluster health unavailable: {snap.get('detail')}")
-    _cluster_snapshot_cache = (time.monotonic() + _CLUSTER_SNAPSHOT_TTL_S, snap)
     return snap
 
 

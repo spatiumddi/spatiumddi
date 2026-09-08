@@ -472,6 +472,20 @@ def _cache_probe(verdict: dict[str, Any]) -> dict[str, Any]:
     return verdict
 
 
+def invalidate_probe_cache() -> None:
+    """Drop the memoized probe verdict.
+
+    Exists for the test suite, which resets every process-global TTL cache
+    around each test — these are keyed on a monotonic clock, not on the
+    per-test database, so a stubbed verdict outlives the TRUNCATE and
+    leaks into unrelated tests on the same worker. Third instance of the
+    pattern after ``maintenance_mode`` and ``feature_modules``.
+    """
+    global _probe_cache
+
+    _probe_cache = None
+
+
 def _cluster_dns_unavailable(detail: str) -> dict[str, Any]:
     """The shape callers get when cluster DNS could not be assessed.
 

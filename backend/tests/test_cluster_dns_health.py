@@ -68,9 +68,9 @@ def _no_real_dns(monkeypatch):
         lambda *a, **k: "10.43.0.10",
     )
     # The probe memoizes its verdict for 15 s so the 2 s SSE loop does not
-    # hammer CoreDNS; clear it between tests or one test's stub leaks into
-    # the next.
-    monkeypatch.setattr("app.services.appliance.cluster_health._probe_cache", None)
+    # hammer CoreDNS. conftest's ``_reset_global_caches`` clears it around
+    # every test — this stub would otherwise be answered from a previous
+    # test's verdict.
 
 
 # ── the two "unknown" cases, which must never read as zero ────────────
