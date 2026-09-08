@@ -65,6 +65,7 @@ logger = structlog.get_logger(__name__)
 _SEVERITY_SUCCESS = 6  # info
 _SEVERITY_DENIED = 4  # warning
 _SEVERITY_FAILED = 3  # err
+_SEVERITY_CRITICAL = 2  # crit — alert severity "critical" only (#1031)
 
 _APP_NAME = "spatiumddi"
 _MSG_ID = "AUDIT"
@@ -75,11 +76,26 @@ _PENDING_ATTR = "__spatium_audit_forward_pending__"
 
 # min_severity filter — higher rank means more severe. Keeps the
 # filter logic a single numeric compare.
+#
+# TWO vocabularies land here, and #1031 was filed because only one of
+# them was ranked. Audit rows bucket to ``info`` / ``warn`` / ``error`` /
+# ``denied`` (the values a target's ``min_severity`` may be set to);
+# alert + digest events carry ``info`` / ``warning`` / ``critical``
+# directly. Both are ranked on ONE scale so the gate is still a single
+# compare and an operator's threshold means the same thing whichever
+# stream the event came from.
+#
+# ``critical`` sits at the TOP of the scale, level with ``denied``,
+# deliberately: ``denied`` is the strictest threshold an operator can
+# select, and a threshold that silently opts you out of the most severe
+# alerts is the exact defect #1031 is about — just narrower.
 _SEVERITY_RANK = {
     "info": 0,
     "warn": 1,
+    "warning": 1,
     "error": 2,
     "denied": 3,
+    "critical": 3,
 }
 
 
@@ -106,15 +122,6 @@ def _serialize(row: AuditLog) -> dict[str, Any]:
     }
 
 
-def _severity_for_result(result: str | None) -> int:
-    r = (result or "").lower()
-    if r == "denied":
-        return _SEVERITY_DENIED
-    if r in ("failed", "error"):
-        return _SEVERITY_FAILED
-    return _SEVERITY_SUCCESS
-
-
 def _severity_bucket(result: str | None) -> str:
     r = (result or "").lower()
     if r == "denied":
@@ -122,6 +129,102 @@ def _severity_bucket(result: str | None) -> str:
     if r in ("failed", "error"):
         return "error"
     return "info"
+
+
+# ── Payload-shape adapters (issue #1031) ───────────────────────────────────
+#
+# THREE payload shapes reach the renderers below, and every one of them is
+# delivered by the same ``_deliver_to_target``:
+#
+#   * audit rows   — ``timestamp`` + ``result`` + ``action`` + ``resource_*``
+#   * alert events — ``fired_at``  + ``severity`` + ``rule_name`` + ``message``
+#   * AI digests   — ``fired_at``  + ``severity`` + ``title`` + ``summary``
+#
+# Everything here used to read the AUDIT keys unconditionally, so the other
+# two were mis-rendered in four separate ways at once: dropped by a
+# ``min_severity`` gate that bucketed them all to ``info``, stamped with a
+# syslog PRI that said "informational" on the wire whatever the alert
+# actually was, given CEF severity 3 for the same reason, and — for the
+# three RFC 5424 formats, ``rfc5424_json`` among them, which is the
+# DEFAULT — raised ``KeyError: 'timestamp'`` and never delivered at all.
+#
+# The last one hid the other three: ``alerts._deliver`` catches the
+# exception per-target and logs ``alert_deliver_failed``, so a syslog
+# target simply received nothing. And the "Test target" button sends an
+# audit-shaped payload with ``min_severity`` forced to None, so the probe
+# was green on a target that could not carry a single real alert.
+#
+# These adapters are the one place the shapes are reconciled; every
+# renderer and the delivery gate go through them.
+
+
+def _payload_severity(payload: dict[str, Any]) -> str:
+    """The event's severity as a string, whichever shape it arrived in.
+
+    Audit rows expose ``result`` (which we map via ``_severity_bucket``);
+    alert + digest payloads carry ``severity`` directly (``info`` /
+    ``warning`` / ``critical``).
+    """
+    sev = payload.get("severity")
+    if isinstance(sev, str) and sev:
+        return sev.lower()
+    return _severity_bucket(payload.get("result"))
+
+
+def _payload_timestamp(payload: dict[str, Any]) -> str:
+    """The event time, as an ISO-8601 string.
+
+    Audit rows carry ``timestamp``; alerts and digests carry ``fired_at``.
+    Falls back to now() rather than raising: a syslog line stamped a
+    millisecond late is a far better outcome than a delivery that fails,
+    which is what the bare ``payload["timestamp"]`` lookup used to do.
+    """
+    for key in ("timestamp", "fired_at"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return datetime.now(UTC).isoformat()
+
+
+#: CEF (0-10) and LEEF (1-10) both want a NUMBER. 3/6/9 is valid in
+#: both, and the audit half of it is exactly what ``_render_cef`` has
+#: always emitted — so sharing one map adds LEEF's missing ``sev``
+#: without moving a single existing CEF line.
+_SCALED_SEVERITY = {
+    "info": 3,
+    "warn": 6,
+    "warning": 6,
+    "error": 6,
+    "denied": 9,
+    "critical": 9,
+}
+
+
+def _payload_scaled_severity(payload: dict[str, Any]) -> int:
+    """CEF / LEEF numeric severity.
+
+    Defaults to 6 (medium) rather than 3 for an unrecognised value,
+    because reporting an unknown severity as *informational* is how a
+    real event gets filtered out of a SIEM.
+    """
+    return _SCALED_SEVERITY.get(_payload_severity(payload), 6)
+
+
+def _payload_syslog_severity(payload: dict[str, Any]) -> int:
+    """RFC 5424 numeric severity for the PRI field.
+
+    The audit mappings are unchanged byte-for-byte (a change there would
+    move every line an existing collector already indexes); the alert
+    severities are added alongside.
+    """
+    sev = _payload_severity(payload)
+    if sev == "critical":
+        return _SEVERITY_CRITICAL
+    if sev in ("denied", "warning", "warn"):
+        return _SEVERITY_DENIED
+    if sev == "error":
+        return _SEVERITY_FAILED
+    return _SEVERITY_SUCCESS
 
 
 def _hostname() -> str:
@@ -137,8 +240,8 @@ def _render_rfc5424_prefix(facility: int, severity: int, ts: str) -> str:
 
 
 def _render_rfc5424_json(facility: int, payload: dict[str, Any]) -> str:
-    severity = _severity_for_result(payload.get("result"))
-    prefix = _render_rfc5424_prefix(facility, severity, payload["timestamp"])
+    severity = _payload_syslog_severity(payload)
+    prefix = _render_rfc5424_prefix(facility, severity, _payload_timestamp(payload))
     return prefix + " " + json.dumps(payload, separators=(",", ":"), default=str)
 
 
@@ -163,14 +266,22 @@ def _render_cef(payload: dict[str, Any]) -> str:
 
     Fixed header: ``CEF:0|Vendor|Product|Version|SignatureID|Name|Severity``
     then key=value extension pairs. CEF severity is 0-10; we map our
-    three buckets to 3/6/9 for info/error/denied.
+    three audit buckets to 3/6/9 for info/error/denied, and the alert
+    severities alongside them (#1031).
     """
-    sev_map = {"info": 3, "error": 6, "denied": 9}
-    sev = sev_map[_severity_bucket(payload.get("result"))]
+    sev = _payload_scaled_severity(payload)
     action = payload.get("action") or "audit"
     resource_type = payload.get("resource_type") or ""
     signature = f"{resource_type}:{action}" if resource_type else action
     name = payload.get("resource_display") or signature
+    # Alert + digest events carry none of the audit identifiers, so
+    # without this they rendered as a content-free ``…|audit|audit|3|``
+    # line: two different alerts were indistinguishable in the SIEM.
+    if payload.get("kind") in ("alert", "digest"):
+        signature = str(payload.get("rule_type") or payload.get("kind") or "alert")
+        name = str(
+            payload.get("rule_name") or payload.get("title") or payload.get("kind") or "alert"
+        )
 
     header = "|".join(
         _cef_header_escape(x)
@@ -198,24 +309,51 @@ def _render_cef(payload: dict[str, Any]) -> str:
         ("cs3", payload.get("auth_source")),
         ("cs4Label", "changed_fields"),
         ("cs4", ",".join(payload.get("changed_fields") or [])),
-        ("externalId", payload.get("id")),
-        ("rt", payload.get("timestamp")),
+        ("externalId", payload.get("id") or payload.get("rule_id")),
+        ("rt", _payload_timestamp(payload)),
+        # Alert / digest fields. Empty on an audit row, so they drop out
+        # of the extension list below exactly like the audit fields do on
+        # an alert.
+        ("cs5Label", "rule_name"),
+        ("cs5", payload.get("rule_name") or payload.get("title")),
+        ("cs6Label", "subject"),
+        ("cs6", payload.get("subject_display")),
+        ("msg", payload.get("message")),
     ]
     ext = " ".join(f"{k}={_cef_escape(v)}" for k, v in ext_fields if v not in (None, ""))
     return f"{header}|{ext}"
 
 
 def _render_rfc5424_cef(facility: int, payload: dict[str, Any]) -> str:
-    severity = _severity_for_result(payload.get("result"))
-    prefix = _render_rfc5424_prefix(facility, severity, payload["timestamp"])
+    severity = _payload_syslog_severity(payload)
+    prefix = _render_rfc5424_prefix(facility, severity, _payload_timestamp(payload))
     return prefix + " " + _render_cef(payload)
+
+
+#: Declared in the LEEF header's DelimiterChar field. ``^`` rather than
+#: the LEEF default of tab, because tab gets mangled over UDP on some
+#: relays — which is why ``_leef_escape`` must escape THIS character.
+_LEEF_DELIMITER = "^"
 
 
 def _leef_escape(s: Any) -> str:
     v = "" if s is None else str(s)
-    # LEEF uses tab as the default delimiter between key=value pairs, so
-    # strip tabs from values. Backslash + = escape like CEF.
-    return v.replace("\\", "\\\\").replace("=", "\\=").replace("\t", " ").replace("\n", " ")
+    # ``_render_leef`` declares ``^`` as its delimiter (DelimiterChar
+    # ``5e``), NOT the LEEF default of tab — so ``^`` is the character
+    # that must be escaped here, and it was not. An unescaped one inside
+    # a value splits the record and every field after it is lost. That
+    # got sharply more likely when free-form text started coming through
+    # (``msg`` carries an alert message, or the AI digest's generated
+    # summary), which is why it is fixed alongside them. Tabs are still
+    # flattened, since the default delimiter is what a relay may
+    # re-parse against.
+    return (
+        v.replace("\\", "\\\\")
+        .replace("=", "\\=")
+        .replace(_LEEF_DELIMITER, "\\" + _LEEF_DELIMITER)
+        .replace("\t", " ")
+        .replace("\n", " ")
+    )
 
 
 def _render_leef(payload: dict[str, Any]) -> str:
@@ -228,13 +366,28 @@ def _render_leef(payload: dict[str, Any]) -> str:
     action = payload.get("action") or "audit"
     resource_type = payload.get("resource_type") or ""
     event_id = f"{resource_type}:{action}" if resource_type else action
+    if payload.get("kind") in ("alert", "digest"):
+        event_id = str(payload.get("rule_type") or payload.get("kind") or "alert")
 
-    header = "|".join(
-        _leef_escape(x) for x in ["LEEF:2.0", "SpatiumDDI", "SpatiumDDI", "1.0", event_id, "^"]
+    # The DelimiterChar field DECLARES the delimiter; it is a header
+    # control character, not a value, so it must not go through
+    # ``_leef_escape`` — which now escapes ``^`` and would emit ``\^``,
+    # telling a parser the delimiter is backslash-caret. Caught by the
+    # pre-existing header test the moment the escape was added.
+    header = (
+        "|".join(_leef_escape(x) for x in ["LEEF:2.0", "SpatiumDDI", "SpatiumDDI", "1.0", event_id])
+        + "|"
+        + _LEEF_DELIMITER
     )
 
     fields: list[tuple[str, Any]] = [
-        ("devTime", payload.get("timestamp")),
+        ("devTime", _payload_timestamp(payload)),
+        # NUMERIC. LEEF 2.0 defines ``sev`` as an integer 1-10, so a
+        # word here ("critical") is not a value QRadar can map — it
+        # leaves the event at default severity, which is the same
+        # "the wire says informational" defect being fixed for the
+        # syslog PRI and for CEF.
+        ("sev", _payload_scaled_severity(payload)),
         ("devTimeFormat", "yyyy-MM-dd'T'HH:mm:ss.SSSXXX"),
         ("act", payload.get("action")),
         ("outcome", payload.get("result")),
@@ -245,15 +398,18 @@ def _render_leef(payload: dict[str, Any]) -> str:
         ("resource", payload.get("resource_display")),
         ("authSource", payload.get("auth_source")),
         ("changedFields", ",".join(payload.get("changed_fields") or [])),
-        ("externalId", payload.get("id")),
+        ("externalId", payload.get("id") or payload.get("rule_id")),
+        ("ruleName", payload.get("rule_name") or payload.get("title")),
+        ("subject", payload.get("subject_display")),
+        ("msg", payload.get("message")),
     ]
-    body = "^".join(f"{k}={_leef_escape(v)}" for k, v in fields if v not in (None, ""))
+    body = _LEEF_DELIMITER.join(f"{k}={_leef_escape(v)}" for k, v in fields if v not in (None, ""))
     return f"{header}|{body}"
 
 
 def _render_rfc5424_leef(facility: int, payload: dict[str, Any]) -> str:
-    severity = _severity_for_result(payload.get("result"))
-    prefix = _render_rfc5424_prefix(facility, severity, payload["timestamp"])
+    severity = _payload_syslog_severity(payload)
+    prefix = _render_rfc5424_prefix(facility, severity, _payload_timestamp(payload))
     return prefix + " " + _render_leef(payload)
 
 
@@ -265,10 +421,10 @@ def _render_rfc3164(facility: int, payload: dict[str, Any]) -> str:
     JSON (keeps parsing simple for legacy collectors that index via
     regex).
     """
-    severity = _severity_for_result(payload.get("result"))
+    severity = _payload_syslog_severity(payload)
     pri = (facility << 3) | severity
     try:
-        ts = datetime.fromisoformat(payload["timestamp"])
+        ts = datetime.fromisoformat(_payload_timestamp(payload))
     except (KeyError, ValueError, TypeError):
         ts = datetime.now(UTC)
     # RFC 3164: single-digit days get a leading space, not zero.
@@ -385,16 +541,6 @@ _TEAMS_COLOURS = {
     "warning": "F59E0B",
     "critical": "DC2626",
 }
-
-
-def _payload_severity(payload: dict[str, Any]) -> str:
-    """Best-effort severity bucket. Audit rows expose ``result`` (which
-    we map via ``_severity_bucket``); alert payloads carry ``severity``
-    directly (``info`` / ``warning`` / ``critical``)."""
-    sev = payload.get("severity")
-    if isinstance(sev, str) and sev:
-        return sev
-    return _severity_bucket(payload.get("result"))
 
 
 def _payload_summary_lines(payload: dict[str, Any]) -> tuple[str, str]:
@@ -597,12 +743,38 @@ def _target_accepts(target: dict[str, Any], payload: dict[str, Any]) -> bool:
     ms = target.get("min_severity")
     if ms:
         needed = _SEVERITY_RANK.get(ms.lower())
-        got = _SEVERITY_RANK.get(_severity_bucket(payload.get("result")))
+        # #1031: this read ``payload["result"]``, a key only AUDIT rows
+        # carry, so every alert bucketed to ``info`` and any target with a
+        # threshold above ``info`` dropped the lot — criticals included.
+        got = _SEVERITY_RANK.get(_payload_severity(payload))
+        # Unknown on either side is fail-OPEN, deliberately: a severity
+        # string we cannot rank says nothing about whether the operator
+        # wanted the event, and silently swallowing it is the failure
+        # being fixed here.
         if needed is not None and got is not None and got < needed:
             return False
     rtypes = target.get("resource_types") or []
-    if rtypes and payload.get("resource_type") not in rtypes:
-        return False
+    if rtypes:
+        # Alerts name their subject as ``subject_type``, drawn from the
+        # same vocabulary as an audit row's ``resource_type``
+        # (``appliance``, ``dns_zone``, …). Without this fallback a
+        # target with an allowlist dropped every alert for want of a
+        # key — the #1031 failure again, in a different field. Digests
+        # set ``resource_type`` themselves and are unaffected.
+        #
+        # ONE rule NAMESPACES it: ``compliance_change`` fires against an
+        # audit row and reports ``audit:<resource_type>``. Matching only
+        # the raw string would leave exactly those alerts failing every
+        # allowlist — the bug this fallback exists to fix, surviving in
+        # the one rule whose subject IS an audited resource. Both forms
+        # are accepted, so an operator scoping a target to ``dns_zone``
+        # gets the compliance alerts about dns_zones too.
+        candidates = [payload.get("resource_type"), payload.get("subject_type")]
+        subject = payload.get("subject_type")
+        if isinstance(subject, str) and ":" in subject:
+            candidates.append(subject.split(":", 1)[1])
+        if not any(c in rtypes for c in candidates if c):
+            return False
     return True
 
 

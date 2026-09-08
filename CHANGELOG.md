@@ -523,6 +523,138 @@ the formatter handles the rest.
 
 ### Fixed
 
+- **Alert forwarding was filtered — and in the default format,
+  rendered — against keys alert payloads do not carry (#1031).**
+  Three payload shapes go through one delivery path: audit rows
+  carry `result` + `timestamp`, while alert events and the AI
+  digest carry `severity` + `fired_at`. Everything downstream read
+  the audit keys unconditionally, so alerts were mishandled in four
+  ways at once. **A target with a `min_severity` set dropped every
+  alert, criticals included** — the filed bug: alerts bucketed to
+  `info`, so any threshold above `info` discarded the lot while the
+  UI showed a filter the operator believed was working. **A syslog
+  target on `rfc5424_json` — the default — received no alert at
+  all**, because rendering raised `KeyError: 'timestamp'`; that is
+  the one that hid the other three, since `alerts._deliver` catches
+  per-target and logs `alert_deliver_failed`. The two remaining
+  syslog formats and CEF stamped every alert "informational" on the
+  wire whatever its severity, and CEF/LEEF rendered alerts as a
+  content-free `…|audit|audit|3|` line, so two different alerts
+  were indistinguishable in a SIEM. Nobody noticed because the
+  **"Test target" button sends an audit-shaped payload with the
+  filter forced off** — it was green on a target that could not
+  carry a single real alert. Now one set of adapters
+  (`_payload_severity` / `_payload_timestamp` /
+  `_payload_syslog_severity`) reconciles the shapes, and every
+  renderer and the gate go through them. Alert severities rank on
+  the same scale as the audit buckets, with `critical` level with
+  `denied` at the top: `denied` is the strictest threshold
+  selectable, and a threshold that silently opts you out of the
+  most severe alerts is the defect itself, one notch narrower. A
+  target's `resource_types` allowlist now matches an alert's
+  `subject_type` — the same vocabulary — for the same reason,
+  including the `audit:<type>` form `compliance_change` uses,
+  which would otherwise have been the one alert kind still
+  failing every allowlist. LEEF gains the numeric `sev` field it
+  never had (an integer 1–10 per LEEF 2.0, sharing CEF's scale so
+  the two cannot disagree about the same event), and
+  `_leef_escape` now escapes `^`, the delimiter this renderer
+  declares — an unescaped one in the free-form `msg` splits the
+  record and loses every field after it.
+  **The audit mappings are byte-identical**, pinned by a test:
+  moving them would move every line an existing collector already
+  indexes. **This is a behaviour change to read deliberately.**
+  Every target with a non-null `min_severity` currently receives
+  nothing; after this they receive whatever clears the threshold.
+  That is the intended behaviour, but for an operator who set the
+  field long ago and forgot, it will read as new noise — raise the
+  threshold rather than clearing it. It also revisits a decision
+  made in #999: a running RAID scrub was left out of the alert rule
+  partly because `info` could not be muted. It can now, but the
+  column still defaults to NULL, so the finding stays out — a
+  finding that is quiet only for operators who went and configured
+  it is not quiet.
+
+- **The bake's staleness guard aged correct images into a hard
+  failure (#1029).** It asked "is this image more than 24 h old?",
+  which cannot express what it means: a `docker build` that is a
+  complete cache hit produces the identical image — same digest,
+  same ID, same `.Created` — so an image whose inputs have not
+  changed can never refresh its own timestamp. It simply ages past
+  24 h and blocks every bake until somebody passes
+  `--allow-stale-images`, which is how a guard stops being read at
+  all. Observed cutting the #999 ISO: `make build` rebuilt all
+  eight images and exactly the three whose Dockerfiles a Dependabot
+  bump had *not* touched failed at 60 h, with a `--pull` rebuild
+  reproducing the same image IDs — i.e. no action could satisfy it.
+  The guard now asks "was this image built after its inputs last
+  moved?", answered from git: the last commit touching the paths
+  that image's Dockerfile copies, plus the mtime of anything dirty
+  or untracked under them, because an **uncommitted** edit is the
+  commonest shape of "I forgot to rebuild" and a commit-time-only
+  comparison would miss it. On this repo the change is visible in
+  both directions at once — the three DNS images drop from a hard
+  error to a note, and three images built two hours ago are
+  correctly flagged stale because their sources moved after them,
+  which the wall-clock rule could not see at all. The three DNS
+  images deliberately do **not** share one coarse `agent/dns`
+  mapping: a change under `images/bind9/` would flag powerdns, and
+  rebuilding powerdns is a cache hit that does not advance
+  `.Created` — the operator would be stuck on a false alarm they
+  cannot clear, which is this bug again. **Stated limit:** a
+  floating base tag rebuilt upstream moves nothing in git, so this
+  cannot see it; the wall-clock check survives as a note that says
+  so. An image with no mapping, or a checkout with no git, falls
+  back to the old rule and is named rather than silently
+  downgraded, and a test fails the build if an entry is added to
+  `IMAGES` without one.
+
+- **`appliance-verify-arch` false-positived on Docker Desktop's
+  containerd store, blocking the arm64 cross-build it was written
+  for (#1028).** It probed each image with
+  `docker image inspect -f '{{.Architecture}}'`, which for a tag
+  resolving to a multi-platform index answers for the **host**
+  platform — so on
+  the arm64 build host it reported `arm64` for one image and the
+  **empty string** for ten more, all of them correct amd64 content.
+  The workaround was to `docker rmi` every flagged image so the
+  guard took its "not present locally" branch, on every build. It
+  now asks for the platform explicitly, and the check moved out of
+  the Makefile recipe into `appliance/scripts/verify-image-arch.sh`
+  so it could be tested. **The fail-closed half is preserved and
+  pinned**, which the obvious one-line fix would have broken:
+  `--platform` exits non-zero for a genuinely wrong-arch image, so
+  bolted onto the old loop's `|| continue` it would have fallen
+  through to "not present locally (the bake will pull it)" —
+  inverting the guard into a silent pass on the one case it exists
+  for. Existence is therefore established first, and the three
+  outcomes are distinguished: correct, wrong-arch (error), and an
+  index that lists the platform without having pulled it, which is
+  reported and does **not** count towards "did we verify anything
+  at all". An older Docker CLI with no `--platform` degrades to the
+  previous behaviour and says so rather than reporting a pass that
+  means nothing.
+
+- **`lint_untyped_routes --check` reported a clean pass over an
+  empty listing (#1030).** The guard splits into a `--list` that
+  imports the app and a `--check` that compares its output against
+  a baseline. When `--list` fails it writes nothing, and `--check`
+  then found no unbaselined route in an empty file and printed
+  `OK — 0 untyped route(s), all baselined.` — exit 0, a green
+  meaning the guard had evaluated nothing. Any import-time error in
+  the app silently disabled it, which is exactly the kind of change
+  it exists to watch; hit for real on #999, where a `NameError`
+  turned `87` into `0` with nothing in the output saying which one
+  you were looking at. `--check` now refuses an empty listing when
+  the baseline is not empty (`--baseline` still accepts one, or the
+  last route could never be retired), the CI step chains with
+  `&&`, and the Makefile recipe stops sending the extraction's
+  stderr to `/dev/null` — when it fails, the traceback is the
+  diagnosis — and stages the listing through a temp file so a
+  failed run cannot leave an empty one behind. Same fail-closed
+  rule `appliance-verify-arch` and `bake-images.sh` already follow;
+  a sweep found no other producer/consumer guard with this shape.
+
 - **Two more host runners discarded their piped input (#1001).**
   Same defect as the SSH one above, at two more call sites, with
   the blast radius decided by whichever `except` clause each

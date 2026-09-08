@@ -2313,6 +2313,125 @@ suggestion, free-space treemap.
   easiest to skip and fatal to skip — **two ESPs kept in sync from the slot-upgrade
   path**, or the mirror boots the old kernel off the surviving disk after an upgrade.
 
+- ✅ [**Alert forwarding filtered — and rendered — against keys alert payloads never carry**](https://github.com/spatiumddi/spatiumddi/issues/1031)
+  — three payload shapes go through one delivery path, and only one of them was
+  handled. Audit rows carry `result` + `timestamp`; alert events and the AI digest
+  carry `severity` + `fired_at`. Everything downstream read the audit keys
+  unconditionally, so alerts were mishandled **four ways at once**. The filed bug:
+  a target with a `min_severity` set dropped every alert, criticals included, because
+  they all bucketed to `info` — the operator configured a filter and silently received
+  nothing. **The one that hid it:** a syslog target on `rfc5424_json`, the DEFAULT
+  format, received nothing at all, because rendering raised `KeyError: 'timestamp'`
+  and `alerts._deliver` catches per-target and logs `alert_deliver_failed`. The other
+  two RFC 5424 formats and CEF stamped every alert *informational* on the wire, and
+  CEF/LEEF rendered alerts as a content-free `…|audit|audit|3|` line — two different
+  alerts indistinguishable in a SIEM. **Nobody noticed because the "Test target"
+  button sends an audit-shaped payload with the filter forced off**, so the probe was
+  green on a target that could not carry a single real alert; the shape a test
+  exercises has to be the shape the feature sends.
+  One set of adapters (`_payload_severity` / `_payload_timestamp` /
+  `_payload_syslog_severity`) now reconciles the shapes and every renderer plus the
+  gate goes through them. Alert severities rank on the same scale as the audit
+  buckets, with **`critical` level with `denied` at the top**: `denied` is the
+  strictest threshold selectable, and a threshold that silently opts you out of the
+  most severe alerts is the same defect one notch narrower. `resource_types` matches
+  an alert's `subject_type` for the same reason — the same vocabulary, a different
+  key. The audit mappings are **byte-identical**, pinned by a test, because moving
+  them moves every line an existing collector already indexes; unrankable severities
+  fail OPEN, since silently swallowing one is the bug. **A deliberate behaviour
+  change** (CHANGELOG says so plainly): every target with a non-null `min_severity`
+  received nothing and now receives whatever clears it. It also revisits #999's
+  decision to drop the RAID-scrub finding — `info` is mutable now, but the column
+  still defaults to NULL, so a finding quiet only for operators who configured it is
+  not quiet, and it stays out. No migration, no new endpoint, no MCP change.
+  **Three more from /code-review, all in the SIEM formats.** LEEF 2.0 defines `sev` as an
+  integer 1–10, and the newly-added field emitted the word `critical` — not a value QRadar
+  can map, so it leaves the event at default severity: the same "the wire says
+  informational" defect being fixed for the PRI and for CEF, reintroduced by the fix.
+  `_leef_escape` did not escape `^`, the delimiter *this* renderer declares (its comment
+  described LEEF's default tab instead), and the diff had just started routing free-form
+  text through it — an alert message, or the AI digest's generated summary — where an
+  unescaped one splits the record and loses every field after it. **Fixing that broke the
+  header**, caught by the pre-existing header test: the DelimiterChar field declares the
+  delimiter and is a control character, not a value, so escaping it emitted a
+  backslash-caret and told a parser that was the delimiter. And the `subject_type`
+  fallback missed the one rule that NAMESPACES its subject — `compliance_change` reports
+  `audit:<resource_type>` — so precisely those alerts still failed every `resource_types`
+  allowlist, which is the bug the fallback exists to fix surviving in the one rule whose
+  subject genuinely is an audited resource.
+
+- ✅ [**Three build-guard defects that each made a guard useless in its own way**](https://github.com/spatiumddi/spatiumddi/issues/1028)
+  ([#1029](https://github.com/spatiumddi/spatiumddi/issues/1029),
+  [#1030](https://github.com/spatiumddi/spatiumddi/issues/1030)) — all three found
+  while cutting the #999 ISO, and they share a lesson the repo has now recorded four
+  times: **a guard that evaluates nothing looks exactly like one that passed.**
+  **(#1028)** `appliance-verify-arch` probed with
+  `docker image inspect -f '{{.Architecture}}'`, which on Docker Desktop's containerd
+  store answers for the HOST platform when the tag is a multi-platform index — so on
+  the arm64 cross-build host it reported `arm64` for one image and the **empty
+  string** for ten more, every one of them correct amd64 content, and blocked the
+  cross-build path on precisely the machine that path exists for. The fix asks for the
+  platform explicitly and moved out of the Makefile into
+  `appliance/scripts/verify-image-arch.sh` so it could be tested. **The obvious
+  one-line fix inverts the guard**, which is the part worth knowing: `--platform`
+  exits non-zero for a genuinely wrong-arch image, so bolted onto the old loop's
+  `|| continue` it falls through to "not present locally (the bake will pull it)" — a
+  silent pass on the one case the guard exists for. Existence is established first,
+  and three outcomes are separated: correct, wrong-arch, and an index that *lists* the
+  platform without having pulled it (reported, and not counted towards "did we verify
+  anything at all"). An older CLI with no `--platform` degrades to the previous
+  behaviour and says so.
+  **(#1029)** `bake-images.sh`'s staleness guard asked "is this image over 24 h old?",
+  which cannot express what it means: a `docker build` that is a complete cache hit
+  produces the identical image — same digest, same ID, same `.Created` — so an image
+  whose inputs have not changed **can never refresh its own timestamp**. It ages past
+  24 h and blocks every bake until somebody passes `--allow-stale-images`, which is
+  how a guard stops being read. It now asks "was this built AFTER its inputs last
+  moved?", from git: the last commit touching that image's copied paths, plus the mtime
+  of anything dirty or untracked under them, because an **uncommitted** edit is the
+  commonest shape of "I forgot to rebuild" and a commit-time comparison misses it. On
+  this repo it moved in both directions at once — the three DNS images dropped from a
+  hard error to a note, and three images built two hours earlier were correctly flagged
+  because their sources moved after them, which the wall-clock rule could not see at
+  all. The three DNS images deliberately do **not** share one coarse `agent/dns`
+  mapping: a `images/bind9/` change would flag powerdns, whose rebuild is a cache hit
+  that does not advance `.Created` — a false alarm the operator cannot clear, i.e. this
+  bug again. **Stated limit:** a floating base tag rebuilt upstream moves nothing in
+  git; the wall-clock check survives as a note saying so.
+  **(#1030)** `lint_untyped_routes --check` compared an empty listing against the
+  baseline, found no unbaselined route, and printed `OK — 0 untyped route(s), all
+  baselined.` So any import-time error in the app — exactly what the guard watches for
+  — silently disabled it, and `0` versus `87` was the entire signal with nothing in the
+  output naming which one you were reading. It now refuses an empty listing when the
+  baseline is not (`--baseline` still accepts one, or the last route could never be
+  retired), CI chains with `&&`, and the Makefile stops sending the extraction's stderr
+  to `/dev/null` — when it fails, the traceback IS the diagnosis — and stages through a
+  temp file so a failed run leaves no empty listing behind. A sweep found no other
+  producer/consumer guard with this shape.
+  Every one of the three is covered by tests that **execute the shipped script** against
+  stubs, and every test was run against the unpatched code first: 27 new appliance
+  cases, plus one pre-existing test loosened from pinning a function *name* to pinning
+  the *shape* it was really asserting, because #1029's rename had made a correct guard
+  report itself as a regression.
+  **/code-review found six, and the worst was the fix reproducing the bug class it was
+  fixing.** `inputs="$(image_inputs_mtime "$repo")"` is a BARE assignment, which takes the
+  command substitution's exit status as its own — and the script runs under `set -e`, so
+  rc=1 (no git) and rc=2 (no mapping) killed the whole bake right there instead of
+  reaching the `case` fallback, which was therefore dead code while the CHANGELOG
+  described it as the safety net. Outside a git repo the bake exited 1 straight after the
+  version banner, saying nothing. **The new tests could not see it because the harness
+  dropped `-e`** — it hardcoded `set -uo pipefail` instead of reading the script's own
+  `set` line, so it ran the shipped bytes in a shell the shipped bytes never meet. That is
+  the lesson rather than the shell trivia; the harness now extracts the real options, and
+  doing so immediately failed two existing tests for the same reason. Also:
+  `verify-image-arch.sh` reported "nothing was verified — run `make build`" AHEAD of the
+  wrong-arch verdict, so the flagship case (every image wrong, because `make build` ran
+  without `DOCKER_DEFAULT_PLATFORM`) told the operator to do exactly what they had just
+  done and never printed the line that fixes it. And an uncommitted *deletion* was skipped
+  by `[ -f ] || continue`, leaving an image judged fresh after a source file was removed —
+  now resolved from the parent directory's mtime, which `unlink()` updates and which,
+  unlike stamping "now", does not make the image permanently stale on every later run.
+
 #### CLI tool
 
 - ⬜ [**`spddi` CLI**](https://github.com/spatiumddi/spatiumddi/issues/83)

@@ -20,10 +20,26 @@ reason ``make openapi`` runs the exporter inside the API image:
 * ``--check FILE`` compares that listing against the baseline. Pure stdlib,
   so it runs anywhere, including a bare CI runner.
 
+Chain them with ``&&`` when invoking by hand — a failed ``--list`` must never
+reach ``--check``::
+
+    python3 scripts/lint_untyped_routes.py --list > /tmp/ur.txt \
+      && python3 scripts/lint_untyped_routes.py --check /tmp/ur.txt
+
 ``make lint-untyped-routes`` wires the two together; ``--baseline FILE``
 re-records. Re-record only when *removing* entries: a new one means a route
 shipped without a schema, which is the thing this exists to catch — type the
 route instead.
+
+The split is also the guard's own weak point (issue #1030). ``--list`` writes
+its findings to stdout, so when it FAILS it writes nothing — and ``--check``
+then compared an empty file against the baseline, found no unbaselined route,
+and reported ``OK — 0 untyped route(s), all baselined.`` Exit 0: a green that
+meant the guard had evaluated nothing. An import-time error in the app is
+exactly the kind of change this is meant to be watching, so any such error
+silently disabled it. ``--check`` now refuses an empty listing whenever the
+baseline is not empty, which is the same fail-closed rule ``appliance-verify-
+arch`` and ``bake-images.sh`` already follow.
 
 The listing walks the live ``app.routes`` rather than parsing source, because
 that is what actually reaches the OpenAPI document: a decorator this script
@@ -254,6 +270,32 @@ def main() -> int:
         for line in baseline_path.read_text().splitlines()
         if line.strip() and not line.startswith("#")
     }
+
+    # Fail closed on an empty listing (#1030). The producer is a separate
+    # process; if it died, this one is handed an empty file and every
+    # comparison below trivially passes. An empty listing is only ever
+    # legitimate when the baseline is empty too — i.e. when there is
+    # genuinely nothing left untyped, at which point the baseline should
+    # have been re-recorded to match.
+    #
+    # Checked for --check only: --baseline is how an operator RECORDS an
+    # empty set, so refusing there would make the last route impossible to
+    # retire.
+    if args.check and not current and known:
+        print(
+            f"Empty listing: {source} contains no routes, but the baseline has "
+            f"{len(known)}.",
+            file=sys.stderr,
+        )
+        print(
+            "The --list step that produces it almost certainly failed (an\n"
+            "import-time error in the app is the usual cause). Re-run it and\n"
+            "read its stderr:\n"
+            "  python3 scripts/lint_untyped_routes.py --list",
+            file=sys.stderr,
+        )
+        return 1
+
     new = [row for row in current if row not in known]
     # Fixed routes are reported but do not fail: the baseline should keep
     # shrinking, and a stale entry is untidy rather than dangerous.

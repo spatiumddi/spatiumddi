@@ -366,12 +366,20 @@ UNTYPED_LIST := /tmp/spatiumddi-untyped-routes.txt
 
 .PHONY: lint-untyped-routes lint-untyped-routes-baseline
 
+# NOT ``2>/dev/null`` (#1030): the extraction imports the app, so when it
+# fails the traceback IS the diagnosis — and hiding it left an operator
+# with a bare non-zero exit and nothing to read. stderr goes to the
+# terminal; only stdout is captured into the listing, so letting it
+# through costs nothing. The output goes to a temp file that is moved
+# into place only on success, so a failed run cannot leave an EMPTY
+# listing behind for a later ``--check`` to pass over.
 $(UNTYPED_LIST): FORCE
 	@$(COMPOSE_DEV) build api >/dev/null
 	@docker run --rm --network none \
 	  -v "$(PWD)/scripts:/scripts:ro" \
 	  spatiumddi-api:dev \
-	  python3 /scripts/lint_untyped_routes.py --list 2>/dev/null > $@
+	  python3 /scripts/lint_untyped_routes.py --list > $@.tmp
+	@mv $@.tmp $@
 
 lint-untyped-routes: $(UNTYPED_LIST)
 	@python3 scripts/lint_untyped_routes.py --check $(UNTYPED_LIST)
@@ -702,71 +710,23 @@ appliance-baked-iso-cross:
 	@echo "    docker compose -f docker-compose.dev.yml build"
 
 # Assert every source image really is the appliance's architecture
-# before it is baked (#991 §2).
-#
-# This is a real check rather than a documented manual step, because the
-# failure it catches is silent and only shows up on the appliance: a
-# third-party image already present as the HOST's arch (a ``redis`` or
-# ``nginx`` pulled by the dev compose stack on an arm64 laptop) satisfies
-# ``docker image inspect``, gets baked, and then ``exec format error``s
-# on first boot with nothing in the build log to explain it.
-#
-# It reads the image set from ``bake-images.sh --list-images`` — ALL four
-# arrays, not just SpatiumDDI's own. The first cut scraped the ``IMAGES=(``
-# array with sed, which covers precisely the images ``make build`` has
-# just produced under the right platform and therefore cannot be wrong;
-# the third-party ones it exists for live in the other three arrays. One
-# source of truth also means a reformat of that file cannot silently
-# empty the list.
-#
-# **It fails closed.** An unreadable list or no local images at all is an
-# error, not a friendly note and exit 0 — the same "a guard that
-# evaluates nothing is indistinguishable from one that passed" rule this
-# commit applies to the staleness check in bake-images.sh.
+# before it is baked (#991 §2). The check itself lives in
+# ``appliance/scripts/verify-image-arch.sh`` — it moved out of this
+# recipe in #1028, where the naive ``docker image inspect
+# -f '{{.Architecture}}'`` probe turned out to answer for the HOST
+# platform on Docker Desktop's containerd store and blocked the arm64
+# cross-build on correct images. The logic needed to distinguish three
+# outcomes rather than two, which is more than a make recipe should
+# carry and more importantly is now unit-testable
+# (``appliance/tests/test_verify_image_arch.py`` runs it against a
+# stubbed docker, including the negative controls).
 #
 # Run automatically by ``appliance-baked-iso-cross`` between building the
 # images and baking them, which is the only moment the mistake is still
 # cheap to fix.
 appliance-verify-arch: APPLIANCE_ARCH ?= linux/amd64
 appliance-verify-arch:
-	@want="$(notdir $(APPLIANCE_ARCH))"; bad=0; checked=0; \
-	imgs="$$($(APPLIANCE_DIR)/scripts/bake-images.sh --list-images 2>/dev/null)"; \
-	if [ -z "$$imgs" ]; then \
-	  echo "ERROR: could not read the image list from bake-images.sh --list-images." >&2; \
-	  echo "       Refusing to bake rather than reporting a clean check over" >&2; \
-	  echo "       nothing — a guard that evaluates nothing looks exactly like" >&2; \
-	  echo "       one that passed." >&2; \
-	  exit 1; \
-	fi; \
-	for image in $$imgs; do \
-	  short=$$(basename "$${image%%:*}"); found=0; \
-	  for tag in "$$image" "$${image%%:*}:dev" "spatiumddi-$$short:dev" "$$short:dev"; do \
-	    got=$$(docker image inspect -f '{{.Architecture}}' "$$tag" 2>/dev/null) || continue; \
-	    found=1; \
-	    if [ "$$got" != "$$want" ]; then \
-	      echo "  ✗ $$tag is $$got, expected $$want" >&2; bad=1; \
-	    else \
-	      printf '  ✓ %-52s %s\n' "$$tag" "$$got"; \
-	    fi; \
-	    checked=$$((checked+1)); \
-	    break; \
-	  done; \
-	  if [ "$$found" = 0 ]; then \
-	    echo "  ? $$image — not present locally (the bake will pull it)"; \
-	  fi; \
-	done; \
-	if [ "$$checked" = 0 ]; then \
-	  echo "ERROR: none of the bake's images is present locally — run 'make build'" >&2; \
-	  echo "       (and 'make build-supervisor') before verifying." >&2; \
-	  exit 1; \
-	fi; \
-	if [ "$$bad" != 0 ]; then \
-	  echo "" >&2; \
-	  echo "ERROR: source images are the wrong architecture for this appliance." >&2; \
-	  echo "       Rebuild them with DOCKER_DEFAULT_PLATFORM=$(APPLIANCE_ARCH), or use" >&2; \
-	  echo "       'make appliance-baked-iso-cross' which sets it for you." >&2; \
-	  exit 1; \
-	fi
+	@$(APPLIANCE_DIR)/scripts/verify-image-arch.sh "$(APPLIANCE_ARCH)"
 
 # Wipe any baked overlay artefacts that a previous
 # ``appliance-bake-images`` left under the mkosi.extra overlay. mkosi
