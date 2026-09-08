@@ -53,7 +53,11 @@ def _matrix_arches(workflow: Path) -> list[str]:
         arches = (job.get("strategy") or {}).get("matrix", {}).get("arch")
         assert arches, f"{workflow.name}: appliance job has no arch matrix"
         return sorted(arches)
-    pytest.fail(f"{workflow.name}: no job calls build-appliance.yml")
+    # ``raise``, not ``pytest.fail``: both end the test, but only this one
+    # is visibly not a fall-through. A reader (and a static analyser) sees
+    # a declared ``list[str]`` whose loop can finish, and has to know
+    # pytest.fail is NoReturn to rule out an implicit None.
+    raise AssertionError(f"{workflow.name}: no job calls build-appliance.yml")
 
 
 def test_the_pruner_covers_every_architecture_the_release_builds():
