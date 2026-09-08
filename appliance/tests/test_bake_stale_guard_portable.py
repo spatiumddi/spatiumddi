@@ -115,10 +115,22 @@ def test_an_unreadable_date_is_reported_rather_than_silently_skipped():
 
 def test_the_caller_still_distinguishes_stale_from_unreadable():
     """Regression guard for the original bug's shape: the old code used
-    ``age="$(image_age_seconds ...)" || continue``, which collapsed a
-    parse failure into "fine". The replacement must branch on the
-    function's status explicitly.
+    ``<var>="$(<reader> ...)" || continue``, which collapsed a parse
+    failure into "fine". The replacement must branch on the function's
+    status explicitly.
+
+    Matched on the SHAPE rather than on one function name. The first cut
+    pinned ``image_age_seconds`` literally and broke in #1029, which
+    renamed the timestamp reader to ``image_created_epoch`` — reporting a
+    correct guard as a regression, and tempting the next person to delete
+    the assertion rather than the brittleness.
     """
     body = SCRIPT.read_text()
-    assert 'age="$(image_age_seconds "$src")" || continue' not in body
-    assert 'if ! age="$(image_age_seconds "$src")"; then' in body
+    readers = ("image_age_seconds", "image_created_epoch")
+    for reader in readers:
+        assert f'"$({reader} "$src")" || continue' not in body, reader
+    assert any(
+        f'if ! {var}="$({reader} "$src")"; then' in body
+        for reader in readers
+        for var in ("age", "created")
+    ), "the timestamp read must be branched on explicitly, not '|| continue'd"

@@ -184,9 +184,15 @@ jobs:
       # installed, so no container is needed here.
       - name: Untyped-route guard
         working-directory: ${{ github.workspace }}
+        # ``&&`` rather than two statements (#1030). The default shell is
+        # already ``-e``, so this is belt-and-braces — but the pairing is
+        # the thing that must not drift: a failed ``--list`` writes an
+        # EMPTY file, and ``--check`` over an empty listing used to report
+        # a clean pass. The script now refuses that too; both halves are
+        # kept so neither is the only line of defence.
         run: |
-          python3 scripts/lint_untyped_routes.py --list > /tmp/untyped-routes.txt
-          python3 scripts/lint_untyped_routes.py --check /tmp/untyped-routes.txt
+          python3 scripts/lint_untyped_routes.py --list > /tmp/untyped-routes.txt \
+            && python3 scripts/lint_untyped_routes.py --check /tmp/untyped-routes.txt
 
       # Enforces the expand/contract migration contract (issue #296).
       # Every Alembic migration must be safe against BOTH N-1 and N

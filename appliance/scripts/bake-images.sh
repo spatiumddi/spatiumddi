@@ -279,24 +279,149 @@ rfc3339_to_epoch() {
 }
 
 image_age_seconds() {
-    local created created_epoch
-    created="$(docker image inspect "$1" --format '{{.Created}}' 2>/dev/null)" || return 1
-    created_epoch="$(rfc3339_to_epoch "$created")" || return 1
+    local created_epoch
+    created_epoch="$(image_created_epoch "$1")" || return 1
     echo $(( $(date +%s) - created_epoch ))
+}
+
+image_created_epoch() {
+    local created
+    created="$(docker image inspect "$1" --format '{{.Created}}' 2>/dev/null)" || return 1
+    rfc3339_to_epoch "$created" || return 1
+}
+
+# ── Input-drift staleness (#1029) ──────────────────────────────────────
+#
+# The guard below used to be "is this image more than 24 h old?", which
+# cannot express the thing it is actually asking. A ``docker build`` that
+# is a COMPLETE CACHE HIT produces the identical image — same digest,
+# same ID, same ``.Created`` — so an image whose inputs have not changed
+# can never refresh its own timestamp. It simply ages past 24 h and then
+# blocks every bake until somebody passes ``--allow-stale-images``, which
+# is how a guard stops being read at all.
+#
+# Observed on the #999 ISO: ``make build`` rebuilt all eight images, and
+# exactly the three whose Dockerfiles a Dependabot bump had NOT touched
+# failed at 60 h. A ``docker build --pull`` reproducing the same image ID
+# proved the base digest and every build input were unchanged — i.e.
+# there was no action the operator could take to satisfy it.
+#
+# So the question is now "was this image built AFTER its inputs last
+# moved?", answered from git: the last commit touching the paths that
+# image's Dockerfile copies, plus the mtime of anything dirty or
+# untracked under them (an uncommitted edit is exactly the "I forgot to
+# rebuild" case #272 filed this guard for, and a commit-time-only
+# comparison would miss it).
+#
+# STATED LIMIT, and the reason the wall-clock check survives as a
+# WARNING: a floating base tag rebuilt upstream (``alpine:3.23`` gaining
+# a CVE fix) moves nothing in git, so this cannot see it. Option 2 in
+# #1029 — comparing the base image's registry digest — would, at the cost
+# of a network round trip per image on every bake. Not taken; the warning
+# names it instead.
+
+#: Build inputs per image, as repo-relative paths. Keep in lock-step with
+#: the ``docker build`` lines in the Makefile's ``build`` target — a
+#: missing entry degrades that image to the wall-clock rule rather than
+#: leaving it unguarded, and ``appliance/tests/test_bake_input_staleness.py``
+#: fails when an IMAGES entry has no mapping here.
+#:
+#: The three DNS images deliberately do NOT share one coarse
+#: ``agent/dns`` entry: a change under ``images/bind9/`` would then flag
+#: powerdns and technitium as stale, and rebuilding those is a cache hit
+#: that does not advance ``.Created`` — the operator would be stuck on a
+#: false alarm they cannot clear, which is the very bug being fixed.
+image_source_paths() {
+    case "${1##*/}" in
+        spatium-supervisor)  echo "agent/supervisor" ;;
+        dns-bind9)           echo "agent/dns/pyproject.toml agent/dns/spatium_dns_agent agent/dns/images/bind9" ;;
+        dns-powerdns)        echo "agent/dns/pyproject.toml agent/dns/spatium_dns_agent agent/dns/images/powerdns" ;;
+        dns-technitium)      echo "agent/dns/pyproject.toml agent/dns/spatium_dns_agent agent/dns/images/technitium" ;;
+        dhcp-kea)            echo "agent/dhcp" ;;
+        looking-glass)       echo "agent/looking-glass" ;;
+        spatiumddi-api)      echo "backend" ;;
+        spatiumddi-frontend) echo "frontend" ;;
+        *) return 1 ;;
+    esac
+}
+
+# Newest mtime among ``$@`` that exists; echoes 0 when none do.
+# Both stat dialects, for the same reason ``rfc3339_to_epoch`` carries
+# both date dialects — this runs on the macOS cross-build host.
+file_mtime() {
+    stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || return 1
+}
+
+# Epoch seconds at which this image's build inputs last changed.
+#   0  echoed the timestamp
+#   1  git is unavailable / not a repo — caller falls back
+#   2  no path mapping for this image — caller falls back
+image_inputs_mtime() {
+    local paths newest t f
+    paths="$(image_source_paths "$1")" || return 2
+    git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1 || return 1
+    # $paths is a space-separated path list we control; none of the
+    # entries contain whitespace, so the split is intended. (The
+    # directive must sit alone on its line — shellcheck reads trailing
+    # prose as another key=value pair and IGNORES the whole disable,
+    # SC1125, which is how the first cut of this suppression did
+    # nothing.)
+    # shellcheck disable=SC2086
+    newest="$(git -C "$REPO_ROOT" log -1 --format=%ct -- $paths 2>/dev/null)" || return 1
+    [ -n "$newest" ] || newest=0
+    # Dirty + untracked. ``diff --name-only`` and ``ls-files --others``
+    # emit BARE paths, unlike ``status --porcelain`` whose XY prefix and
+    # rename arrows would have to be parsed; ``-z`` removes the quoting
+    # git otherwise applies to unusual filenames.
+    while IFS= read -r -d "" f; do
+        [ -f "$REPO_ROOT/$f" ] || continue
+        t="$(file_mtime "$REPO_ROOT/$f")" || continue
+        [ "$t" -gt "$newest" ] && newest="$t"
+    done < <(
+        # shellcheck disable=SC2086
+        {
+            git -C "$REPO_ROOT" diff --name-only -z HEAD -- $paths
+            git -C "$REPO_ROOT" ls-files --others --exclude-standard -z -- $paths
+        } 2>/dev/null
+    )
+    echo "$newest"
 }
 if [ "$BAKE_SOURCE" = "local" ] && [ "$ALLOW_STALE_IMAGES" != "1" ]; then
     stale=()
     undated=()
+    unmapped=()
+    aged=()
     for repo in "${IMAGES[@]}"; do
         src="$(resolve_source_tag "$repo")"
         docker image inspect "$src" >/dev/null 2>&1 || continue
-        if ! age="$(image_age_seconds "$src")"; then
+        if ! created="$(image_created_epoch "$src")"; then
             undated+=("$src")
             continue
         fi
-        if [ "$age" -gt "$STALE_MAX_AGE_S" ]; then
-            stale+=("$src ($(( age / 3600 ))h old)")
-        fi
+        age=$(( $(date +%s) - created ))
+
+        inputs="$(image_inputs_mtime "$repo")"
+        case "$?" in
+            0)
+                if [ "$created" -lt "$inputs" ]; then
+                    stale+=("$src (built $(( (inputs - created) / 3600 ))h BEFORE its last source change)")
+                elif [ "$age" -gt "$STALE_MAX_AGE_S" ]; then
+                    # Inputs unchanged, so this is NOT the "you forgot to
+                    # rebuild" case — it is reported only because a
+                    # floating base tag can move without moving git.
+                    aged+=("$src ($(( age / 3600 ))h old)")
+                fi
+                ;;
+            *)
+                # No mapping, or no git. Fall back to the wall-clock rule
+                # so the image is not left unguarded — but record WHY, so
+                # "the check ran a weaker test" is never silent.
+                unmapped+=("$src")
+                if [ "$age" -gt "$STALE_MAX_AGE_S" ]; then
+                    stale+=("$src ($(( age / 3600 ))h old, inputs not determinable)")
+                fi
+                ;;
+        esac
     done
     if [ "${#undated[@]}" -gt 0 ]; then
         # Not fatal — an unreadable timestamp says nothing about whether
@@ -305,11 +430,25 @@ if [ "$BAKE_SOURCE" = "local" ] && [ "$ALLOW_STALE_IMAGES" != "1" ]; then
         # quietly evaluates nothing is indistinguishable from a guard
         # that passed.
         echo "WARN: could not read a build date for $(( ${#undated[@]} )) source image(s);" >&2
-        echo "      the >$(( STALE_MAX_AGE_S / 3600 ))h staleness check did NOT run for them:" >&2
+        echo "      the staleness check did NOT run for them:" >&2
         for u in "${undated[@]}"; do echo "        $u" >&2; done
     fi
+    if [ "${#unmapped[@]}" -gt 0 ]; then
+        echo "WARN: no build-input mapping (or no git) for $(( ${#unmapped[@]} )) image(s);" >&2
+        echo "      they fell back to the weaker >$(( STALE_MAX_AGE_S / 3600 ))h wall-clock rule:" >&2
+        for u in "${unmapped[@]}"; do echo "        $u" >&2; done
+        echo "      Add them to image_source_paths() in this script." >&2
+    fi
+    if [ "${#aged[@]}" -gt 0 ]; then
+        echo "NOTE: $(( ${#aged[@]} )) source image(s) are over $(( STALE_MAX_AGE_S / 3600 ))h old" >&2
+        echo "      but their git inputs have NOT moved since they were built, so they" >&2
+        echo "      are current and the bake continues (#1029). A floating base tag" >&2
+        echo "      rebuilt upstream is the one drift this cannot see — 'make build'" >&2
+        echo "      with --pull if you want to be sure:" >&2
+        for a in "${aged[@]}"; do echo "        $a" >&2; done
+    fi
     if [ "${#stale[@]}" -gt 0 ]; then
-        echo "ERROR: stale local source image(s) older than $(( STALE_MAX_AGE_S / 3600 ))h:" >&2
+        echo "ERROR: stale local source image(s) — built before their own sources:" >&2
         for s in "${stale[@]}"; do echo "         $s" >&2; done
         echo "       Rebuild with 'make build' (+ 'make build-supervisor'), or bake them" >&2
         echo "       as-is with --allow-stale-images (or ALLOW_STALE_IMAGES=1)." >&2
