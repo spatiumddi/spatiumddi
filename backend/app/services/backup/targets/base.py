@@ -20,10 +20,31 @@ of every driver into the router.
 
 from __future__ import annotations
 
+import os
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
+
+#: The archive names SpatiumDDI writes. Every driver filters its listing
+#: with this so a destination shared with unrelated files stays clean.
+#:
+#: Shared rather than copied per driver: a change to the naming scheme that
+#: missed one file would make that destination's retention sweep and
+#: ``latest/download`` silently blind, with no error anywhere.
+ARCHIVE_NAME_RE = re.compile(r"^(spatiumddi-backup-|pre-restore-).*\.zip$")
+
+
+def safe_filename(filename: str) -> str:
+    """Strip path separators from an operator-supplied filename.
+
+    This is the defence that stops a crafted archive name escaping the
+    configured directory / prefix / collection, so it lives in one place
+    rather than being re-inlined per driver — hardening it in one copy
+    while three others stayed as they were is the failure worth avoiding.
+    """
+    return os.path.basename(filename)
 
 
 class BackupDestinationError(Exception):
@@ -62,11 +83,6 @@ class UnsupportedOperationError(BackupDestinationError):
     """
 
 
-def is_retention_locked(exc: BaseException) -> bool:
-    """True when ``exc`` means "refused, because the object is locked"."""
-    return isinstance(exc, RetentionLockedError)
-
-
 @dataclass(frozen=True)
 class ArchiveListing:
     """One archive present at a destination."""
@@ -74,6 +90,10 @@ class ArchiveListing:
     filename: str
     size_bytes: int
     created_at: datetime
+
+
+#: ``ConfigFieldSpec.type`` value for prose that renders without an input.
+NOTICE_FIELD_TYPE = "notice"
 
 
 @dataclass(frozen=True)
@@ -88,12 +108,30 @@ class ConfigFieldSpec:
     #: ``text`` / ``password`` / ``number`` render an input.
     #: ``notice`` renders as prose with NO input — for a caveat that
     #: belongs to the destination kind rather than to any one field
-    #: (``nfs``: AUTH_SYS has no credential at all). A notice field
-    #: must never be read back out of ``config``.
+    #: (``nfs``: AUTH_SYS has no credential at all).
+    #:
+    #: A notice is never read back out of ``config``, and that is
+    #: enforced rather than asserted: :func:`config_field_specs` drops
+    #: notices, and every generic consumer (validation, secret
+    #: redaction, PATCH merge) iterates that instead of ``config_fields``
+    #: — so a client that has not learned about the type cannot make one
+    #: required or round-trip its prose into stored config.
     type: str
     required: bool = True
     description: str | None = None
     secret: bool = False  # hide from list responses
+
+
+def config_field_specs(driver: BackupDestination) -> tuple[ConfigFieldSpec, ...]:
+    """The driver's INPUT fields — ``config_fields`` minus notices.
+
+    Every generic consumer (validation, secret redaction, the PATCH
+    merge) wants this one, not the raw tuple: a notice carries no value
+    and must never round-trip into stored ``config``. Enforcing it here
+    means a future notice cannot become required, or be read back, just
+    because a consumer forgot to branch on the type.
+    """
+    return tuple(f for f in driver.config_fields if f.type != NOTICE_FIELD_TYPE)
 
 
 class BackupDestination(ABC):

@@ -38,8 +38,8 @@ from app.services.backup.targets.libnfs_client import (
     build_url,
 )
 from app.services.backup.targets.nfs import (
-    _ARCHIVE_NAME_RE,
     _PART_SUFFIX,
+    ARCHIVE_NAME_RE,
     NfsDestination,
     _remote_path,
     _squash_hint,
@@ -155,8 +155,8 @@ def test_part_suffix_is_invisible_to_the_archive_regex():
     offers to the retention sweep and to ``latest/download``.
     """
     name = "spatiumddi-backup-20260907-120000.zip"
-    assert _ARCHIVE_NAME_RE.match(name)
-    assert not _ARCHIVE_NAME_RE.match(name + _PART_SUFFIX)
+    assert ARCHIVE_NAME_RE.match(name)
+    assert not ARCHIVE_NAME_RE.match(name + _PART_SUFFIX)
 
 
 # ── config validation ─────────────────────────────────────────────────
@@ -207,10 +207,21 @@ def test_url_hostile_characters_are_refused(driver, field, bad):
 # ── errno → cause ─────────────────────────────────────────────────────
 
 
-def test_permission_errors_name_squash_as_the_likely_cause():
+def test_permission_errors_name_both_likely_causes():
+    """EACCES on NFS has two common causes needing opposite fixes, and the
+    first cut named only one.
+
+    The api runs unprivileged, so libnfs connects from an unprivileged
+    source port — and Linux's ``secure`` export option (the default;
+    Synology's equivalent is off by default) refuses exactly that. An
+    operator told confidently that it "is almost always the squash
+    setting" changes uid/gid and it never works.
+    """
     hint = _squash_hint(NfsError("write failed", errno=errno.EACCES), action="write")
     assert "squash" in hint.lower()
     assert "uid" in hint.lower()
+    assert "insecure" in hint.lower(), "the privileged-port cause must be named"
+    assert "privileged" in hint.lower()
 
 
 def test_eperm_is_treated_like_eacces():

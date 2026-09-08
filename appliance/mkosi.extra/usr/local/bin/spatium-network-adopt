@@ -45,9 +45,35 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import stat
 import sys
 from pathlib import Path
+from typing import TypedDict
+
+
+class DriftEntry(TypedDict):
+    state: str
+    live: str
+
+
+class AdoptReport(TypedDict):
+    """The shape ``compare()`` returns, and ``--json`` prints.
+
+    A TypedDict rather than ``dict[str, object]``: the opaque form forced
+    an ``assert isinstance`` before every single field access — six lines
+    of ceremony that do nothing at runtime except break under ``python3
+    -O``, where asserts are stripped and the code then indexes a value it
+    never narrowed.
+    """
+
+    managed: bool
+    keyfile: str | None
+    reason: str | None
+    drift: dict[str, DriftEntry]
+    unadoptable: list[str]
+    extra_profiles: list[str]
 
 STATE_CONFIG = Path("/var/lib/spatium-state/spatium-config.yaml")
 NM_DIR = Path("/etc/NetworkManager/system-connections")
@@ -125,10 +151,18 @@ def write_state(updates: dict[str, str], path: Path = STATE_CONFIG) -> list[str]
     duplicate would be read as a no-op and the adopt would appear to do
     nothing. Keys not already present are appended.
 
-    Writes through a temp file in the same directory + rename, so an
-    interrupted write cannot leave STATE truncated. STATE is the file
-    that survives a factory reset; a torn one is not recoverable from
-    anywhere else on the box.
+    Writes through a temp file in the same directory + rename, and
+    **fsyncs both the file and its directory** before the rename is
+    considered done. The rename alone is only namespace-atomic: without
+    the fsyncs a power loss just after the console prints "Saved to
+    STATE" can leave a zero-length ``spatium-config.yaml`` on the one
+    partition nothing else on the box backs up.
+
+    The temp file also inherits the original's mode and ownership rather
+    than the process umask. A new inode would be created ``0666 & ~umask``
+    owned by whoever ran the tool, so one console "save to STATE" would
+    silently widen a root-only config — which carries the admin username,
+    the hostname and the control-plane URL — to world-readable.
     """
     if not path.exists():
         raise AdoptError(f"{path} does not exist — is the STATE partition mounted?")
@@ -149,9 +183,28 @@ def write_state(updates: dict[str, str], path: Path = STATE_CONFIG) -> list[str]
     for key, value in remaining.items():
         lines.append(f"{key}: {_quote(value)}")
         changed.append(key)
+    original = path.stat()
     tmp = path.with_suffix(path.suffix + ".new")
-    tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    tmp.replace(path)
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    # Carry the original's permissions and ownership onto the new inode.
+    os.chmod(tmp, stat.S_IMODE(original.st_mode))
+    try:
+        os.chown(tmp, original.st_uid, original.st_gid)
+    except PermissionError:
+        # Only root can change ownership. Running unprivileged on a file
+        # we already own is fine — chmod above is what matters — and this
+        # must not abort a save the operator asked for.
+        pass
+    os.replace(tmp, path)
+    # Durably record the rename itself, not just the bytes.
+    dir_fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
     return changed
 
 
@@ -249,17 +302,53 @@ def _state_from_keyfile(kf: dict[str, dict[str, str]]) -> dict[str, str]:
     return out
 
 
+#: Keys NetworkManager writes by itself when it saves a profile, which
+#: etc-render never renders and which carry no operator intent.
+#:
+#: Without this every nmtui save would list NM's own boilerplate on the
+#: "these WILL revert" panel — on every single visit — and the one entry
+#: that matters (``ethernet.mtu``) would be buried in it. This file
+#: already argues the principle for ``network6_mode`` forty lines up: an
+#: alarm that always fires is one operators learn to dismiss, which costs
+#: more than the feature is worth.
+_NM_DEFAULT_KEYS = {
+    ("connection", "timestamp"),
+    ("connection", "permissions"),
+    ("connection", "autoconnect-retries"),
+    ("connection", "multi-connect"),
+    ("ipv4", "may-fail"),
+    ("ipv4", "never-default"),
+    ("ipv4", "dns-search"),
+    ("ipv4", "ignore-auto-dns"),
+    ("ipv6", "may-fail"),
+    ("ipv6", "addr-gen-mode"),
+    ("ipv6", "dns-search"),
+    ("ipv6", "ip6-privacy"),
+    ("ipv6", "method"),
+    ("proxy", "method"),
+    ("proxy", "browser-only"),
+}
+
+
 def _unadoptable(kf: dict[str, dict[str, str]]) -> list[str]:
     """Settings present in the live keyfile that STATE cannot express.
 
-    These are the ones that WILL revert at the next boot however this
-    tool is used, so they are the ones the operator most needs named.
+    These WILL revert at the next boot however this tool is used, so they
+    are the ones the operator most needs named — which is exactly why the
+    list must not be padded with NetworkManager's own defaults.
     """
     out: list[str] = []
     for section, entries in kf.items():
-        for key in entries:
-            if (section, key) not in _MANAGED_KEYS:
-                out.append(f"{section}.{key}")
+        for key, value in entries.items():
+            if (section, key) in _MANAGED_KEYS:
+                continue
+            if (section, key) in _NM_DEFAULT_KEYS:
+                continue
+            if not value:
+                # An empty section header (``[ethernet]``, which
+                # etc-render writes itself) carries nothing to lose.
+                continue
+            out.append(f"{section}.{key}")
     return sorted(out)
 
 
@@ -300,7 +389,7 @@ def drift_for(state: dict[str, str], live: dict[str, str]) -> dict[str, dict[str
     }
 
 
-def compare(state: dict[str, str] | None = None) -> dict[str, object]:
+def compare(state: dict[str, str] | None = None) -> AdoptReport:
     """Report how the live managed profile differs from STATE."""
     state = read_state() if state is None else state
     keyfile = managed_keyfile(state)
@@ -360,7 +449,7 @@ def _extra_profiles() -> list[str]:
 # ── CLI ───────────────────────────────────────────────────────────────
 
 
-def _render(report: dict[str, object]) -> str:
+def _render(report: AdoptReport) -> str:
     lines: list[str] = []
     if not report["managed"]:
         lines.append(f"No managed profile: {report['reason']}")
@@ -369,7 +458,6 @@ def _render(report: dict[str, object]) -> str:
     else:
         lines.append(f"Managed profile: {report['keyfile']}")
     drift = report["drift"]
-    assert isinstance(drift, dict)
     if drift:
         lines.append("")
         lines.append("Differs from STATE (will revert at the next boot):")
@@ -382,7 +470,6 @@ def _render(report: dict[str, object]) -> str:
     elif report["managed"] and not report["reason"]:
         lines.append("Live profile matches STATE — nothing would revert.")
     unadoptable = report["unadoptable"]
-    assert isinstance(unadoptable, list)
     if unadoptable:
         lines.append("")
         lines.append("Settings STATE cannot store — these revert at the next boot")
@@ -390,7 +477,6 @@ def _render(report: dict[str, object]) -> str:
         for key in unadoptable:
             lines.append(f"  {key}")
     extra = report["extra_profiles"]
-    assert isinstance(extra, list)
     if extra:
         lines.append("")
         lines.append("Other NetworkManager profiles present (not deleted, but the")
@@ -430,7 +516,6 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.adopt:
         drift = report["drift"]
-        assert isinstance(drift, dict)
         if not drift:
             if args.json:
                 print(json.dumps({"adopted": [], **report}, indent=2))
@@ -450,7 +535,6 @@ def main(argv: list[str] | None = None) -> int:
             for key in changed:
                 print(f"  {key} = {updates[key]}")
             unadoptable = report["unadoptable"]
-            assert isinstance(unadoptable, list)
             if unadoptable:
                 print("")
                 print("NOTE: these are still not stored in STATE and WILL revert:")
@@ -458,13 +542,18 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"  {key}")
         return 0
 
+    # ``--check`` is the default behaviour, but branch on it explicitly
+    # rather than leaving it as a no-op flag: the console shells out with
+    # ``--check --json`` and parses the result, so the documented
+    # behaviour has to be the implemented one. Left implicit, any future
+    # change to the bare-invocation default would silently degrade the
+    # console's report to None and remove both the pre-nmtui warning and
+    # the adopt offer, with no error anywhere.
     if args.json:
         print(json.dumps(report, indent=2))
     else:
         print(_render(report))
-    drift = report["drift"]
-    assert isinstance(drift, dict)
-    return 10 if drift else 0
+    return 10 if report["drift"] else 0
 
 
 if __name__ == "__main__":

@@ -40,10 +40,10 @@ from app.services.backup.archive import (
 from app.services.backup.schedule import compute_next_run
 from app.services.backup.targets import (
     BackupDestinationError,
+    RetentionLockedError,
     SecretFieldError,
     decrypt_config_secrets,
     get_destination,
-    is_retention_locked,
 )
 
 logger = structlog.get_logger(__name__)
@@ -89,6 +89,12 @@ async def _retention_sweep(
         return 0
     driver = get_destination(target.kind)
     archives = await driver.list_archives(config=config)
+    # Archives an Object Lock refused. Counted and reported rather than
+    # only logged at DEBUG: a target with a 30-day lock and a keep-7
+    # policy prunes NOTHING every night while the run reports success and
+    # the UI keeps showing "keep last 7" — the same silent no-op the
+    # write-only retention guard exists to prevent, one field over.
+    locked: list[str] = []
 
     async def _prune(filename: str) -> bool:
         """Delete one archive, distinguishing "refused because it is
@@ -102,14 +108,18 @@ async def _retention_sweep(
         """
         try:
             await driver.delete(config=config, filename=filename)
+        except RetentionLockedError:
+            # Ordered before the base class rather than re-tested with an
+            # isinstance helper — Python's own dispatch does this, and the
+            # helper was one boolean spread over four files.
+            locked.append(filename)
+            logger.debug(
+                "backup_retention_object_locked",
+                target_id=str(target.id),
+                filename=filename,
+            )
+            return False
         except BackupDestinationError as exc:
-            if is_retention_locked(exc):
-                logger.debug(
-                    "backup_retention_object_locked",
-                    target_id=str(target.id),
-                    filename=filename,
-                )
-                return False
             logger.warning(
                 "backup_retention_delete_failed",
                 target_id=str(target.id),
@@ -129,6 +139,17 @@ async def _retention_sweep(
         for archive in archives:
             if archive.created_at.timestamp() < cutoff:
                 deleted += 1 if await _prune(archive.filename) else 0
+    if locked:
+        logger.info(
+            "backup_retention_blocked_by_object_lock",
+            target_id=str(target.id),
+            locked=len(locked),
+            hint=(
+                "retention is configured on this target but the destination's "
+                "Object Lock refused every delete — the archives will not be "
+                "pruned until their retention period expires"
+            ),
+        )
     return deleted
 
 

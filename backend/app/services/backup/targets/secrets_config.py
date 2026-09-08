@@ -44,7 +44,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.core.crypto import decrypt_str, encrypt_str
-from app.services.backup.targets.base import BackupDestination
+from app.services.backup.targets.base import BackupDestination, config_field_specs
 
 #: Prefix on stored config strings that have been Fernet-wrapped.
 #: Detection-by-prefix is enough because Fernet ciphertext is
@@ -64,7 +64,10 @@ class SecretFieldError(Exception):
 
 
 def _secret_field_names(driver: BackupDestination) -> set[str]:
-    return {f.name for f in driver.config_fields if f.secret}
+    # ``config_field_specs`` rather than ``config_fields``: a notice is
+    # prose, never a value, and must not participate in secret handling
+    # or the PATCH merge (#989 review).
+    return {f.name for f in config_field_specs(driver) if f.secret}
 
 
 def encrypt_config_secrets(driver: BackupDestination, config: dict[str, Any]) -> dict[str, Any]:

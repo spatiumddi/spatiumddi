@@ -62,34 +62,26 @@ from __future__ import annotations
 import asyncio
 import errno as _errno
 import os
-import re
 from datetime import UTC, datetime
 from typing import Any
 
 import structlog
 
 from app.services.backup.targets.base import (
+    ARCHIVE_NAME_RE,
     ArchiveListing,
     BackupDestination,
     BackupDestinationError,
     ConfigFieldSpec,
     DestinationConfigError,
+    safe_filename,
 )
-from app.services.backup.targets.libnfs_client import (
-    NfsConnection,
-    NfsError,
-    NfsUnavailableError,
-    connect,
-)
+from app.services.backup.targets.libnfs_client import NfsConnection, NfsError, connect
 
 logger = structlog.get_logger(__name__)
 
-#: Same archive-name pattern as every other driver — an export shared
-#: with unrelated files stays clean.
-_ARCHIVE_NAME_RE = re.compile(r"^(spatiumddi-backup-|pre-restore-).*\.zip$")
-
 #: Suffix for the in-flight write. Deliberately chosen so it does NOT
-#: match ``_ARCHIVE_NAME_RE``: a write killed halfway leaves a file a
+#: match ``ARCHIVE_NAME_RE``: a write killed halfway leaves a file a
 #: concurrent ``list_archives`` (and therefore the retention sweep, and
 #: therefore ``latest/download``) cannot see. The other drivers get this
 #: for free — an object store PUT is atomic — and NFS does not.
@@ -117,11 +109,19 @@ def _squash_hint(exc: NfsError, *, action: str) -> str:
     base = str(exc)
     if exc.errno in (_errno.EACCES, _errno.EPERM):
         return (
-            f"{base} — the server refused the {action}. This is almost always the "
-            "export's squash setting: with 'root_squash' (the default on most NAS "
-            "appliances) the uid SpatiumDDI presents is mapped to 'nobody', which "
-            "usually cannot write. Set the destination's uid/gid to an identity the "
-            "export allows, or grant that identity write access on the server."
+            f"{base} — the server refused the {action}. Two causes account for "
+            "nearly all of these, and they need opposite fixes. (1) The export "
+            "requires a PRIVILEGED SOURCE PORT: Linux's 'secure' export option is "
+            "the default (Synology calls it 'allow connections from non-privileged "
+            "ports', also off by default), and SpatiumDDI connects from an "
+            "unprivileged port because the control plane runs as a non-root user "
+            "with no CAP_NET_BIND_SERVICE — add 'insecure' to the export options on "
+            "the server. (2) SQUASHING: with 'root_squash' (also the default) the "
+            "uid presented here is mapped to 'nobody', which usually cannot write — "
+            "set the destination's uid/gid to an identity the export allows, or "
+            "grant that identity write access on the server. If the MOUNT itself "
+            "failed, (1) is the likely cause; if the mount succeeded and only the "
+            "write was refused, (2) is."
         )
     if exc.errno == _errno.EROFS:
         return f"{base} — the export is published read-only, so the {action} cannot succeed."
@@ -163,14 +163,14 @@ def _subdir(config: dict[str, Any]) -> str:
 
 
 def _remote_path(config: dict[str, Any], filename: str | None = None) -> str:
-    """Compose the path inside the export. ``os.path.basename`` defends
-    against an operator-supplied filename carrying separators — the same
-    defence every other driver applies.
+    """Compose the path inside the export. ``safe_filename`` defends
+    against an operator-supplied filename carrying separators — the
+    shared sanitiser every driver applies.
     """
     base = _subdir(config)
     if filename is None:
         return base or "/"
-    return f"{base}/{os.path.basename(filename)}"
+    return f"{base}/{safe_filename(filename)}"
 
 
 def _open(config: dict[str, Any]):
@@ -349,6 +349,20 @@ class NfsDestination(BackupDestination):
                 try:
                     conn.write(staged, archive_bytes)
                 except NfsError as exc:
+                    # Clean up before re-raising. The staged name is
+                    # deliberately invisible to ``list_archives``, which
+                    # also means the retention sweep can never reap it —
+                    # so without this, every failed run (an export that
+                    # filled up, say) leaves another multi-GB orphan under
+                    # a new timestamped name, forever, on exactly the
+                    # destination that just ran out of room.
+                    try:
+                        conn.unlink(staged)
+                    except NfsError:
+                        # Best effort — the write failure is the error
+                        # worth reporting, and a partial file we could not
+                        # remove must not mask it.
+                        logger.warning("nfs_partial_cleanup_failed", path=staged)
                     raise BackupDestinationError(_squash_hint(exc, action="write")) from exc
                 # Overwrite semantics: the ABC requires a same-named
                 # archive to be replaced. NFS rename is atomic and
@@ -389,7 +403,7 @@ class NfsDestination(BackupDestination):
                     ) from exc
                 rows: list[ArchiveListing] = []
                 for entry in entries:
-                    if not _ARCHIVE_NAME_RE.match(entry.name):
+                    if not ARCHIVE_NAME_RE.match(entry.name):
                         continue
                     size = entry.size
                     mtime = entry.mtime
@@ -426,7 +440,7 @@ class NfsDestination(BackupDestination):
                 except NfsError as exc:
                     if exc.errno == _errno.ENOENT:
                         raise BackupDestinationError(
-                            f"archive {os.path.basename(filename)!r} not found at {target}"
+                            f"archive {safe_filename(filename)!r} not found at {target}"
                         ) from exc
                     raise BackupDestinationError(
                         _squash_hint(exc, action=f"read of {target!r}")
@@ -520,11 +534,9 @@ class NfsDestination(BackupDestination):
 
         try:
             return await asyncio.to_thread(_do)
-        except NfsUnavailableError as exc:
-            return {"ok": False, "error": str(exc)}
-        except NfsError as exc:
-            return {"ok": False, "error": str(exc)}
-        except BackupDestinationError as exc:
+        except (NfsError, BackupDestinationError) as exc:
+            # NfsUnavailableError subclasses NfsError; three clauses with
+            # identical bodies were two too many.
             return {"ok": False, "error": str(exc)}
 
     # ── shared failure mapping ────────────────────────────────────────
@@ -539,7 +551,8 @@ class NfsDestination(BackupDestination):
         """
         try:
             return fn()
-        except NfsUnavailableError as exc:
-            raise BackupDestinationError(str(exc)) from exc
         except NfsError as exc:
+            # ``NfsUnavailableError`` (libnfs missing) subclasses this, so
+            # one clause covers both — a second, byte-identical clause for
+            # the subclass was dead and invited the bodies to drift apart.
             raise BackupDestinationError(str(exc)) from exc

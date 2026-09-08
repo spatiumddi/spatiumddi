@@ -478,8 +478,21 @@ function ClusterDnsCard({ dns }: { dns: ClusterDns | null }) {
   const thin =
     ready != null && expected != null && ready < expected && ready > 0;
   const coLocated = dns.spread_ok === false && !thin && (ready ?? 0) > 1;
+  // `null` is UNKNOWN and must never render green. Without this branch,
+  // a block where every count is null — a 403 on the cluster-wide pod
+  // list, or an unreadable snapshot — failed every test above (`ready ===
+  // 0` is false for null; `spread_ok === false` is false for null) and
+  // fell through to EMERALD, putting a green chip on the one panel whose
+  // job is to say cluster DNS state could not be read.
+  const unknown = !dns.available && !probeFailed;
   const color =
-    probeFailed || noReplicas ? ROSE : thin || coLocated ? AMBER : EMERALD;
+    probeFailed || noReplicas
+      ? ROSE
+      : thin || coLocated
+        ? AMBER
+        : unknown
+          ? SLATE
+          : EMERALD;
 
   const verdict = probeFailed
     ? "not answering"
@@ -489,9 +502,9 @@ function ClusterDnsCard({ dns }: { dns: ClusterDns | null }) {
         ? `${ready} of ${expected} replicas`
         : coLocated
           ? "replicas share a node"
-          : dns.available
-            ? "healthy"
-            : "unknown";
+          : unknown
+            ? "unknown"
+            : "healthy";
 
   return (
     <div className="rounded-xl border bg-card p-4 shadow-sm">

@@ -3027,9 +3027,17 @@ export interface RestoreDrillReadinessTarget {
   target_name: string;
   kind: string;
   enabled: boolean;
+  /** #989 — a write-only destination cannot be read back. */
+  write_only: boolean;
+  /**
+   * Why this target cannot be drilled at all, or null when it can.
+   * Non-null forces `verified` false: an unverifiable backup is an
+   * unknown, not a pass.
+   */
+  undrillable_reason: string | null;
   drills_scheduled: boolean;
   drill_cron: string | null;
-  /** Raw latest status, including "error" / "in_progress". */
+  /** Raw latest status, including "error" / "in_progress" / "cannot_drill". */
   latest_verdict: string;
   /** Latest terminal verdict, i.e. "passed" | "failed" | null. */
   latest_finished_verdict: string | null;

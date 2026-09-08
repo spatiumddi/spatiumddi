@@ -11,6 +11,7 @@ add ``s3`` / ``scp`` / ``azure_blob``; Phase 2 Tier 2 adds
 
 from app.services.backup.targets.azure_blob import AzureBlobDestination
 from app.services.backup.targets.base import (
+    ARCHIVE_NAME_RE,
     DESTINATIONS,
     ArchiveListing,
     BackupDestination,
@@ -19,7 +20,6 @@ from app.services.backup.targets.base import (
     RetentionLockedError,
     UnsupportedOperationError,
     get_destination,
-    is_retention_locked,
     list_destination_kinds,
 )
 from app.services.backup.targets.ftp import FtpDestination
@@ -54,6 +54,7 @@ DESTINATIONS["nfs"] = NfsDestination()
 DESTINATIONS["https_put"] = HttpsPutDestination()
 
 __all__ = [
+    "ARCHIVE_NAME_RE",
     "ArchiveListing",
     "BackupDestination",
     "BackupDestinationError",
@@ -76,7 +77,6 @@ __all__ = [
     "decrypt_config_secrets",
     "encrypt_config_secrets",
     "get_destination",
-    "is_retention_locked",
     "list_destination_kinds",
     "merge_config_for_update",
     "redact_config_secrets",

@@ -169,6 +169,13 @@ async def list_backup_targets(
             "last_run_error": t.last_run_error,
             "next_run_at": t.next_run_at.isoformat() if t.next_run_at else None,
             "passphrase_set": bool(t.passphrase_encrypted),
+            # #989 — the flag changes four visible behaviours (prune
+            # skipped, archive delete 409, pull-mode download 409, drills
+            # report cannot_drill). Without it the copilot reads
+            # "retention: null, last run: success" and describes a healthy
+            # target with no retention, unable to say why its recovery
+            # readiness is UNVERIFIED.
+            "write_only": t.write_only,
         }
         for t in rows
     ]

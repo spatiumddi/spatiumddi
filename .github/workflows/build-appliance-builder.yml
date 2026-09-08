@@ -30,6 +30,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # Required now that this builds two architectures on an amd64
+      # runner: without a registered binfmt handler for aarch64, BuildKit
+      # cannot execute the arm64 leg's RUN layers at all. Every other
+      # multi-arch build in this repo pairs these two the same way.
+      - uses: docker/setup-qemu-action@v4
       - uses: docker/setup-buildx-action@v4
 
       - name: Log in to ghcr.io
@@ -45,7 +50,14 @@ jobs:
         with:
           context: appliance/builder
           push: ${{ github.event_name != 'pull_request' }}
-          load: ${{ github.event_name == 'pull_request' }}
+          # NOT ``load`` on the PR path any more. buildx's docker
+          # exporter cannot export a manifest list, so ``--load`` with two
+          # platforms fails outright ("docker exporter does not currently
+          # support exporting manifest lists") — the single-platform pin
+          # this step used to carry was the invariant that made it legal.
+          # A PR build therefore just builds (into the cache) and pushes
+          # nothing, which is all the pre-merge check ever needed.
+          load: false
           tags: |
             ghcr.io/spatiumddi/appliance-builder:latest
           # Both, since #991. The appliance ISO is x86-64 and mkosi

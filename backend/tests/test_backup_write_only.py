@@ -23,26 +23,26 @@ import errno
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from app.api.v1.backup.targets import (
-    _archive_etag,
     _assert_retention_is_reachable,
-    _if_none_match_matches,
     _resolve_write_only,
 )
+from app.core.http_etag import etag_matches, format_etag
 from app.services.backup.targets import (
     DESTINATIONS,
     RetentionLockedError,
     UnsupportedOperationError,
     get_destination,
-    is_retention_locked,
 )
 from app.services.backup.targets.base import BackupDestinationError, DestinationConfigError
 from app.services.backup.targets.https_put import (
     HttpsPutDestination,
     _parse_extra_headers,
     _target_url,
+    is_single_object_url,
 )
 from app.services.backup.targets.s3 import _lock_headers, _lock_mode
 
@@ -53,10 +53,15 @@ def test_retention_locked_is_a_typed_error_not_a_string_match():
     """The prune has to tell "refused because locked" from "refused
     because broken", and the message it would otherwise match on comes
     from the storage SDK — not ours to depend on.
+
+    A typed exception rather than a helper: ``_prune`` orders its except
+    clauses, which is what Python's dispatch is for. The one-line
+    isinstance wrapper this used to call cost a definition, a re-export,
+    an ``__all__`` entry and an import for one boolean.
     """
-    assert is_retention_locked(RetentionLockedError("locked until 2027"))
-    assert not is_retention_locked(BackupDestinationError("connection reset"))
-    assert not is_retention_locked(OSError(errno.EACCES, "denied"))
+    assert issubclass(RetentionLockedError, BackupDestinationError)
+    assert not isinstance(BackupDestinationError("connection reset"), RetentionLockedError)
+    assert not isinstance(OSError(errno.EACCES, "denied"), RetentionLockedError)
 
 
 def test_retention_locked_is_still_a_destination_error():
@@ -432,9 +437,19 @@ def test_https_put_carries_the_write_only_caveat_as_a_notice():
 # ── item 4: conditional GET ───────────────────────────────────────────
 
 
-def test_archive_etag_is_quoted():
-    # A bare token is not a valid entity-tag; some clients drop it.
-    assert _archive_etag("spatiumddi-backup-1.zip") == '"spatiumddi-backup-1.zip"'
+def test_the_archive_etag_comes_from_the_shared_module():
+    """``app.core.http_etag`` rather than a local pair.
+
+    The local one minted a STRONG tag, which is #862's bug exactly:
+    nginx's gzip filter strips a strong validator, so the conditional
+    request silently stops working for any client sending
+    ``Accept-Encoding: gzip`` — which is the default for the pull-mode
+    tooling this feature is for. It also compared quoted-to-quoted, so a
+    client echoing the bare form never matched.
+    """
+    tag = format_etag("spatiumddi-backup-1.zip")
+    assert tag.startswith("W/"), "must be weak, or nginx drops it"
+    assert '"spatiumddi-backup-1.zip"' in tag
 
 
 def _req(header: str | None):
@@ -442,21 +457,44 @@ def _req(header: str | None):
 
 
 def test_if_none_match_matches_exact_star_and_list():
-    etag = _archive_etag("a.zip")
-    assert _if_none_match_matches(_req('"a.zip"'), etag)
-    assert _if_none_match_matches(_req("*"), etag)
-    assert _if_none_match_matches(_req('"b.zip", "a.zip"'), etag)
+    name = "a.zip"
+    assert etag_matches(format_etag(name), name)
+    assert etag_matches("*", name)
+    assert etag_matches(f'"b.zip", {format_etag(name)}', name)
 
 
-def test_if_none_match_handles_the_weak_prefix():
-    # RFC 9110 §13.1.2: a GET compares with the weak function, so a
-    # proxy that weakened the tag must still get its 304.
-    assert _if_none_match_matches(_req('W/"a.zip"'), _archive_etag("a.zip"))
+def test_if_none_match_handles_the_weak_prefix_and_the_bare_form():
+    # RFC 9110 §13.1.2 compares with the weak function on a GET, and the
+    # shared module additionally tolerates the legacy unquoted spelling.
+    assert etag_matches('W/"a.zip"', "a.zip")
+    assert etag_matches("a.zip", "a.zip")
 
 
 def test_if_none_match_does_not_match_a_different_archive():
-    assert not _if_none_match_matches(_req('"older.zip"'), _archive_etag("a.zip"))
-    assert not _if_none_match_matches(_req(None), _archive_etag("a.zip"))
+    assert not etag_matches('"older.zip"', "a.zip")
+    assert not etag_matches(None, "a.zip")
+
+
+def test_the_conditional_check_runs_after_the_archive_is_resolved():
+    """A 304 minted from the request path, before any lookup, asserts
+    "unchanged and present" about something nobody looked for.
+
+    A poller whose cached archive retention has since removed would be
+    told 304 forever and never notice; and ``If-None-Match: *`` would
+    answer 304 for a name that never existed, which RFC 9110 §13.2.1
+    forbids — a precondition is only evaluated when the unconditional
+    response would be 2xx.
+    """
+    import inspect
+
+    from app.api.v1.backup import targets as mod
+
+    src = inspect.getsource(mod.download_target_archive)
+    download_at = src.index("driver.download(")
+    condition_at = src.index("etag_matches(")
+    assert (
+        download_at < condition_at
+    ), "the archive must be resolved before the precondition is evaluated"
 
 
 # ── item 1: the two places the old code stated something false ────────
@@ -550,7 +588,18 @@ async def test_a_locked_object_is_skipped_quietly_not_warned_about(monkeypatch):
     names = [e.get("event") for e in events]
     assert "backup_retention_delete_failed" not in names
     assert names.count("backup_retention_object_locked") == 2
-    assert all(e["log_level"] == "debug" for e in events)
+    # Each skip is DEBUG, and exactly one INFO rollup names the situation
+    # once. Without that rollup a target with a 30-day lock and a keep-7
+    # policy prunes nothing every night while the run reports success and
+    # the UI keeps showing "keep last 7" — the same silent no-op the
+    # write-only retention guard exists to prevent, one field over.
+    assert all(
+        e["log_level"] == "debug"
+        for e in events
+        if e.get("event") == "backup_retention_object_locked"
+    )
+    rollup = [e for e in events if e.get("event") == "backup_retention_blocked_by_object_lock"]
+    assert len(rollup) == 1 and rollup[0]["locked"] == 2
 
 
 @pytest.mark.asyncio
@@ -642,3 +691,112 @@ async def test_an_unlistable_write_only_destination_is_cannot_drill_not_error(mo
         _target(write_only=True), live_db_url="postgresql+asyncpg://u:p@h:5432/live"
     )
     assert outcome.state == CANNOT_DRILL
+
+
+# ── review findings, each pinned ──────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_the_probe_refuses_a_presigned_url_instead_of_overwriting_the_archive():
+    """The worst bug the review found.
+
+    A presigned URL is valid for exactly one key, so nothing can be
+    appended to it — meaning the probe's target IS the archive's target.
+    Writing a 16-byte probe there destroys the most recent backup, and
+    nothing could ever reveal it: the kind is write-only, so there is no
+    listing, no download and no drill. The test is refused instead.
+    """
+    presigned = "https://bucket.s3.amazonaws.com/key?X-Amz-Signature=abc&X-Amz-Expires=900"
+    result = await HttpsPutDestination().test_connection(config={"url": presigned})
+    assert result["ok"] is False
+    assert "overwrite" in result["error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_the_probe_still_runs_on_a_collection_url(monkeypatch):
+    """Negative control: refusing the presigned case must not disable the
+    probe for the shape it is meant to serve.
+    """
+    sent: dict = {}
+
+    async def _fake_send(self, *, config, url, body, content_type):
+        sent["url"] = url
+        return httpx.Response(201, request=httpx.Request("PUT", url))
+
+    monkeypatch.setattr(HttpsPutDestination, "_send", _fake_send)
+    monkeypatch.setattr(
+        HttpsPutDestination, "validate_config_network", lambda self, config: _noop()
+    )
+    result = await HttpsPutDestination().test_connection(
+        config={"url": "https://nexus.internal-example.test/repository/backups"}
+    )
+    assert result["ok"] is True
+    assert sent["url"].endswith("/spatiumddi-test-probe.bin")
+
+
+async def _noop():
+    return None
+
+
+def test_a_placeholder_url_is_not_treated_as_single_object():
+    # A {filename} placeholder is the shape that DOES get a per-archive
+    # path, even when the URL also carries a query string.
+    assert is_single_object_url("https://x.test/k?sig=1")
+    assert not is_single_object_url("https://x.test/repo/backups")
+
+
+def test_extra_headers_may_not_override_the_credential():
+    """These fields get filled by pasting a working ``curl`` recipe, which
+    routinely carries its own ``Authorization:`` line.
+
+    Applied last (as they were), that plaintext value authenticated every
+    nightly backup while the Fernet-wrapped ``credential`` sat unused and
+    rotating it did nothing at all.
+    """
+    for name in ("Authorization", "authorization", "Content-Type", "Content-Length"):
+        with pytest.raises(DestinationConfigError) as exc:
+            _parse_extra_headers({"extra_headers": f"{name}: whatever"})
+        assert "may not set" in str(exc.value)
+
+
+def test_extra_headers_still_accepts_a_vendor_header():
+    assert _parse_extra_headers({"extra_headers": "X-JFrog-Art-Api: k"}) == {"X-JFrog-Art-Api": "k"}
+
+
+def test_invalid_url_is_caught_as_a_destination_error():
+    """``httpx.InvalidURL`` derives from Exception, NOT ``httpx.HTTPError``
+    — the trap #889 already recorded for the InfluxDB writer.
+
+    Uncaught it escapes the runner's except tuple, leaving the row stamped
+    ``in_progress``, which the schedule sweep skips forever: that target's
+    backups stop permanently and silently.
+    """
+    import inspect
+
+    from app.services.backup.targets import https_put as mod
+
+    src = inspect.getsource(mod.HttpsPutDestination._send)
+    assert "httpx.InvalidURL" in src
+    assert not issubclass(httpx.InvalidURL, httpx.HTTPError), (
+        "if httpx ever makes InvalidURL an HTTPError this test is obsolete, "
+        "but the explicit catch stays correct"
+    )
+
+
+def test_write_only_targets_never_report_verified(monkeypatch):
+    """A target hardened AFTER months of passing drills must stop reading
+    as verified.
+
+    The shipped advice is exactly that sequence — prove an S3 target, then
+    add Object Lock and tick write-only — and ``last_pass`` is an
+    unbounded historical query, so the old expression kept saying True off
+    a proof that can never be refreshed.
+    """
+    import inspect
+
+    from app.services.backup import drill as drill_mod
+
+    src = inspect.getsource(drill_mod.compute_drill_readiness)
+    assert (
+        "undrillable_reason is None" in src
+    ), "verified must be gated on drillability, not merely on last_pass"

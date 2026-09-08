@@ -258,7 +258,10 @@ URL that is dereferenced), and the DNSBL catalogue's homepage fields:
 where *you* type your own address: `app.example.com`,
 `ddi.example.com`, `dns.example.com`, `ipam.example.com`,
 `netbox.example.com`, `nc.example.com`, `nextcloud.example`,
-`my-resource.openai.azure.com`, `pdns.internal`, `tdns.internal`,
+`nexus.example` (the example receiver URL on the `https_put` backup
+destination's form — an address you replace with your own Artifactory,
+Nexus or internal receiver), `my-resource.openai.azure.com`,
+`pdns.internal`, `tdns.internal`,
 `api.meraki.cn` (named in a docstring as the regional shard a
 China-based operator would enter).
 

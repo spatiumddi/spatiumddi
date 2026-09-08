@@ -26,6 +26,7 @@ from sqlalchemy.orm import attributes
 from app.api.deps import DB, CurrentUser
 from app.core.crypto import encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
+from app.core.http_etag import etag_matches, format_etag
 from app.core.permissions import is_effective_superadmin
 from app.core.responses import ZipResponse
 from app.models.audit import AuditLog
@@ -40,6 +41,7 @@ from app.services.backup.targets import (
     BackupDestinationError,
     DestinationConfigError,
     SecretFieldError,
+    UnsupportedOperationError,
     decrypt_config_secrets,
     encrypt_config_secrets,
     get_destination,
@@ -59,44 +61,6 @@ def _valid_kinds() -> set[str]:
     from app.services.backup.targets.base import DESTINATIONS  # noqa: PLC0415
 
     return set(DESTINATIONS)
-
-
-def _archive_etag(filename: str) -> str:
-    """A strong ETag for one archive (#989 item 4).
-
-    The filename is a legitimate strong validator here, which is unusual
-    and worth stating: archive names carry a UTC timestamp to the second
-    and the bytes stored under a name are never rewritten — a new backup
-    is always a new name. So "same name" implies "same bytes", which is
-    exactly what a strong ETag asserts. Hashing the content instead would
-    mean downloading it to decide whether to download it.
-
-    Quoted per RFC 9110 §8.8.3, and the quotes are part of the value —
-    a bare token is not a valid entity-tag and some clients drop it.
-    """
-    return '"' + filename.replace('"', "") + '"'
-
-
-def _if_none_match_matches(request: Request, etag: str) -> bool:
-    """RFC 9110 §13.1.2 evaluation of ``If-None-Match`` against ``etag``.
-
-    Handles the three forms a real client sends: ``*``, a comma-separated
-    list, and the ``W/`` weak prefix (which the spec says to compare with
-    the weak function on a GET, so the prefix is simply stripped).
-    """
-    header = request.headers.get("if-none-match")
-    if not header:
-        return False
-    if header.strip() == "*":
-        return True
-
-    def _norm(value: str) -> str:
-        value = value.strip()
-        if value.startswith("W/"):
-            value = value[2:]
-        return value
-
-    return any(_norm(candidate) == _norm(etag) for candidate in header.split(","))
 
 
 def _resolve_write_only(driver, requested: bool) -> bool:
@@ -415,7 +379,18 @@ async def update_target(
         )
 
     driver = get_destination(row.kind)
-    new_write_only = _resolve_write_only(driver, payload.get("write_only", row.write_only))
+    # ``exclude_unset`` keeps a key the client explicitly set to null, and
+    # ``write_only`` is ``bool | None`` in the update model — so a literal
+    # ``{"write_only": null}`` (which the published OpenAPI declares legal,
+    # so a generated client will send it) would otherwise reach a NOT NULL
+    # column and answer 500, not 422, because the #922 integrity handler
+    # deliberately re-raises a NOT NULL violation. An explicit null means
+    # "leave it alone", which is what every nullable field on this handler
+    # already does. Same class as #700.
+    requested_write_only = payload.get("write_only")
+    if requested_write_only is None:
+        requested_write_only = row.write_only
+    new_write_only = _resolve_write_only(driver, requested_write_only)
     _assert_retention_is_reachable(
         driver, write_only=new_write_only, keep_n=new_keep_n, keep_days=new_keep_days
     )
@@ -567,9 +542,17 @@ async def run_target_now(target_id: uuid.UUID, db: DB, current_user: CurrentUser
 
 @router.post("/{target_id}/test")
 async def test_target(target_id: uuid.UUID, db: DB, current_user: CurrentUser) -> dict[str, Any]:
-    """Connectivity probe — write + list + delete a tiny file at
-    the destination. Doesn't touch the DB or build a real
-    archive.
+    """Connectivity probe — write a tiny file at the destination, verify
+    it, and remove it. Doesn't touch the DB or build a real archive.
+
+    **The probe object is not always removed, and the result says so.**
+    A write-only S3 key has no ``DeleteObject`` grant and ``https_put``
+    has no delete verb at all; in both cases the probe still passes and
+    reports ``probe_retained: true``, naming the object left behind —
+    failing there is what trains operators to widen a deliberately narrow
+    credential. On a single-object (presigned) ``https_put`` URL the
+    probe is refused outright rather than run, because writing it would
+    overwrite the stored archive.
     """
     _require_superadmin(current_user)
     row = await db.get(BackupTarget, target_id)
@@ -606,6 +589,8 @@ async def list_target_archives(
         plain_config = decrypt_config_secrets(driver, row.config)
         archives = await driver.list_archives(config=plain_config)
     except SecretFieldError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except UnsupportedOperationError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except BackupDestinationError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -678,8 +663,14 @@ async def download_latest_target_archive(
         raise HTTPException(status_code=404, detail=f"no archives at target {row.name!r}")
     # ``list_archives`` already returns newest-first by contract.
     newest = archives[0]
-    etag = _archive_etag(newest.filename)
-    if _if_none_match_matches(request, etag):
+    # ``format_etag`` / ``etag_matches`` from app.core.http_etag rather
+    # than a local pair: that module already handles ``*``, comma lists,
+    # the ``W/`` prefix and the legacy unquoted spelling, and it mints a
+    # WEAK tag — #862's lesson, that nginx's gzip filter strips a strong
+    # validator, so a hand-rolled strong ETag silently stops conditioning
+    # anything the moment a client sends ``Accept-Encoding: gzip``.
+    etag = format_etag(newest.filename)
+    if etag_matches(request.headers.get("if-none-match"), newest.filename):
         # 304 must carry the validators and no body (RFC 9110 §15.4.5).
         return Response(
             status_code=304,
@@ -743,22 +734,39 @@ async def download_target_archive(
         raise HTTPException(status_code=404, detail="backup target not found")
     driver = get_destination(row.kind)
     safe_name = filename.replace("/", "").replace("\\", "")
-    # Conditional GET, same reasoning as the ``latest`` route: the name
-    # is a strong validator, so a poller that already has this archive
-    # gets a 304 without the destination being touched at all.
-    etag = _archive_etag(safe_name)
-    if _if_none_match_matches(request, etag):
-        return Response(
-            status_code=304,
-            headers={"ETag": etag, "Cache-Control": "private, no-cache"},
-        )
+    etag = format_etag(safe_name)
+    # **The conditional check has to come AFTER the archive is resolved.**
+    #
+    # The ETag here is derived from the client's own path parameter, so a
+    # 304 returned before the lookup asserts "unchanged and present" about
+    # something nobody has looked for. A pull-mode poller that cached an
+    # archive which retention has since removed would then be told 304
+    # forever and never notice its copy is the only one left; and
+    # ``If-None-Match: *`` would answer 304 for a name that never existed,
+    # which RFC 9110 §13.2.1 forbids — a precondition is only evaluated
+    # when the unconditional response would be 2xx. The sibling ``latest``
+    # route gets this right by construction, because its validator comes
+    # out of a real listing.
     try:
         plain_config = decrypt_config_secrets(driver, row.config)
         archive_bytes = await driver.download(config=plain_config, filename=safe_name)
     except SecretFieldError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except UnsupportedOperationError as exc:
+        # A write-only kind cannot read an archive back. 409 rather than
+        # the generic 502 below, so the reason is legible instead of
+        # looking like the destination is down.
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except BackupDestinationError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    # The archive exists and is readable — only now is a precondition
+    # meaningful.
+    if etag_matches(request.headers.get("if-none-match"), safe_name):
+        return Response(
+            status_code=304,
+            headers={"ETag": etag, "Cache-Control": "private, no-cache"},
+        )
 
     def _iter():
         yield archive_bytes

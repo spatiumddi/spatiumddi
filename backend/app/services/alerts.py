@@ -270,6 +270,14 @@ _NODE_PRESSURE_FULL_CRITICAL_PCT = 1.0
 _NODE_PRESSURE_RULE_NAME = "Node under sustained resource pressure"
 _CLUSTER_DNS_RULE_NAME = "Cluster DNS degraded"
 
+#: How long one cluster-health gather is shared between the rules that
+#: read it within a single evaluation sweep. Comfortably under the 60 s
+#: sweep interval, so consecutive sweeps still see fresh data.
+_CLUSTER_SNAPSHOT_TTL_S = 20.0
+
+#: ``(monotonic_deadline, snapshot)``, process-local and best-effort.
+_cluster_snapshot_cache: tuple[float, dict[str, Any]] | None = None
+
 # Issue #46 — planned-decommission awareness. Subject = subnet. Fires
 # when a subnet's ``decom_date`` falls within ``threshold_days`` (default
 # 30). Same threshold-escalation shape as the other ``*_expiring`` rules
@@ -3025,6 +3033,51 @@ async def _matching_secret_expiring_subjects(
     return matches
 
 
+async def _cluster_health_snapshot() -> dict[str, Any] | None:
+    """The live cluster-health snapshot, or ``None`` off the appliance.
+
+    Shared by the two rules that read it (``node_pressure`` and
+    ``cluster_dns_degraded``) so they cannot disagree about what "unknown"
+    means — the preamble was previously copied verbatim between them,
+    including the message strings, so narrowing one bare ``except`` would
+    have silently left the other wrong.
+
+    A short TTL cache also collapses the two gathers per 60 s sweep into
+    one: the snapshot does a node list, a cluster-wide pod list and a
+    kubelet round trip PER NODE, and both rules read the same instant's
+    truth anyway.
+
+    Raises :class:`AlertDataUnavailable` when the cluster cannot be read —
+    a kubeapi blip and a dead cluster look alike from here, and neither is
+    evidence that a condition cleared, so returning ``[]`` would resolve
+    every open event and re-open it a minute later.
+    """
+    import asyncio  # noqa: PLC0415
+    import time  # noqa: PLC0415
+
+    from app.config import settings  # noqa: PLC0415
+
+    if not settings.appliance_mode:
+        return None
+
+    global _cluster_snapshot_cache
+
+    cached = _cluster_snapshot_cache
+    if cached is not None and cached[0] > time.monotonic():
+        return cached[1]
+
+    from app.services.appliance import cluster_health  # noqa: PLC0415
+
+    try:
+        snap = await asyncio.to_thread(cluster_health.get_cluster_health)
+    except Exception as exc:  # noqa: BLE001 - any read failure means "unknown"
+        raise AlertDataUnavailable(f"cluster health unreadable: {exc}") from exc
+    if not snap.get("available"):
+        raise AlertDataUnavailable(f"cluster health unavailable: {snap.get('detail')}")
+    _cluster_snapshot_cache = (time.monotonic() + _CLUSTER_SNAPSHOT_TTL_S, snap)
+    return snap
+
+
 async def _matching_cluster_dns_subjects(
     db: AsyncSession,  # noqa: ARG001
     rule: AlertRule,  # noqa: ARG001
@@ -3045,21 +3098,9 @@ async def _matching_cluster_dns_subjects(
     clear a real open event. So an unavailable block raises
     :class:`AlertDataUnavailable`, which leaves whatever was open standing.
     """
-    import asyncio  # noqa: PLC0415
-
-    from app.config import settings  # noqa: PLC0415
-
-    if not settings.appliance_mode:
+    snap = await _cluster_health_snapshot()
+    if snap is None:
         return []
-
-    from app.services.appliance import cluster_health  # noqa: PLC0415
-
-    try:
-        snap = await asyncio.to_thread(cluster_health.get_cluster_health)
-    except Exception as exc:  # noqa: BLE001 - any read failure means "unknown"
-        raise AlertDataUnavailable(f"cluster health unreadable: {exc}") from exc
-    if not snap.get("available"):
-        raise AlertDataUnavailable(f"cluster health unavailable: {snap.get('detail')}")
 
     cdns = snap.get("cluster_dns") or {}
     probe = cdns.get("resolve_probe") or {}
@@ -3112,13 +3153,21 @@ async def _matching_cluster_dns_subjects(
         reasons.append(f"{ready} of {expected} CoreDNS replicas ready")
         severity = severity or "warning"
 
-    if spread_ok is False and ready and ready > 1 and len(set(nodes)) < len(nodes):
-        # #633's failure: two replicas on one node is not HA, and Kubernetes
-        # never rebalances running pods, so it stays that way until something
-        # forces a reschedule.
+    # ``len(nodes) < ready``, NOT ``len(set(nodes)) < len(nodes)``.
+    #
+    # The producer already emits ``sorted(set(ready_nodes))``, so the
+    # deduplicated list can never contain duplicates and that test was
+    # unsatisfiable — meaning #633's exact failure, the one arm of this
+    # rule's WARNING severity, could never fire. The dashboard used a
+    # different predicate and rendered amber, so the two surfaces
+    # disagreed silently. Comparing distinct nodes against ready replicas
+    # is the fact actually wanted, and it survives the dedup.
+    if spread_ok is False and ready and ready > 1 and len(nodes) < ready:
         reasons.append(
-            f"all {ready} ready replicas are on the same node ({nodes[0] if nodes else '?'}) — "
-            "losing it takes cluster DNS with it"
+            f"all {ready} ready replicas are on {len(nodes)} node"
+            f"{'' if len(nodes) == 1 else 's'}"
+            f" ({', '.join(nodes) if nodes else '?'}) — losing "
+            f"{'it' if len(nodes) == 1 else 'one'} takes cluster DNS with it"
         )
         severity = severity or "warning"
 
@@ -3162,27 +3211,12 @@ async def _matching_node_pressure_subjects(
     one HTTPS round trip per node, which would otherwise stall the event
     loop for the whole 60 s tick.
     """
-    import asyncio  # noqa: PLC0415
-
-    from app.config import settings  # noqa: PLC0415
-
     # Cluster health only exists on the appliance; everywhere else the
     # ServiceAccount is not mounted and every node would silently report no
     # PSI, so skip the round trip entirely.
-    if not settings.appliance_mode:
+    snap = await _cluster_health_snapshot()
+    if snap is None:
         return []
-
-    from app.services.appliance import cluster_health  # noqa: PLC0415
-
-    try:
-        snap = await asyncio.to_thread(cluster_health.get_cluster_health)
-    except Exception as exc:  # noqa: BLE001 - any read failure means "unknown"
-        raise AlertDataUnavailable(f"cluster health unreadable: {exc}") from exc
-    if not snap.get("available"):
-        # A kubeapi blip and a genuinely dead cluster look the same from here,
-        # and neither is evidence that the pressure cleared. Returning [] would
-        # resolve every open event and re-open it a minute later.
-        raise AlertDataUnavailable(f"cluster health unavailable: {snap.get('detail')}")
 
     # ``is not None``, not ``or`` — the column is numeric and the form allows
     # 0, which ``or`` would silently rewrite to 50. Every other rule in this

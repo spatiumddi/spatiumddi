@@ -100,6 +100,15 @@ function StateChip({ state }: { state: string }) {
       icon: Loader2,
       label: "Running",
     },
+    // #989 — distinct from `never`. "Never verified" reads as "nobody has
+    // scheduled a drill"; this one means the destination cannot be read
+    // back at all, so no drill will ever run. Falling through to the
+    // `never` mapping lost that entirely.
+    cannot_drill: {
+      cls: "bg-amber-500/10 text-amber-600 dark:text-amber-400",
+      icon: ShieldQuestion,
+      label: "Cannot verify",
+    },
     never: {
       cls: "bg-muted text-muted-foreground",
       icon: ShieldQuestion,
@@ -267,6 +276,20 @@ export function RestoreDrillsSection() {
                         {readinessQ.isLoading ? (
                           <span className="text-muted-foreground">
                             &hellip;
+                          </span>
+                        ) : readiness?.undrillable_reason ? (
+                          // Say WHY, and never show a bare timestamp: a
+                          // target hardened to write-only after months of
+                          // passing drills still has a `last_passed_at`,
+                          // and rendering it alone claims a proof that can
+                          // never be refreshed.
+                          <span
+                            className="text-amber-600 dark:text-amber-400"
+                            title={readiness.undrillable_reason}
+                          >
+                            cannot be verified from here
+                            {readiness.last_passed_at &&
+                              ` (last passed ${relativeAge(readiness.last_passed_at)}, before it became write-only)`}
                           </span>
                         ) : readiness?.last_passed_at ? (
                           <span

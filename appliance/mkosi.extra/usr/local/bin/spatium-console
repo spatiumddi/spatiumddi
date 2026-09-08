@@ -4980,18 +4980,42 @@ def _network_managed_warning(console: Console, tty: str) -> None:
     _wait_for_key(tty, timeout=45.0)
 
 
-def _wait_for_key(tty: str, timeout: float = 45.0) -> None:
-    """Block until the operator presses something, or ``timeout``.
+def _wait_for_key(tty_path: str, timeout: float = 45.0) -> None:
+    """Block until the operator presses ANY key, or ``timeout``.
 
     A timeout rather than an unconditional wait: F4 is reachable from an
     unattended serial console, and a screen that waits forever would park
     the console on a notice nobody is there to dismiss.
+
+    **cbreak + no-echo is what makes "any key" true.** The dispatcher
+    calls ``keys.stop()`` before the action, which restores the terminal
+    to canonical mode — so a plain ``select()`` on the fd does not become
+    readable until a full LINE is submitted. Without this the screen said
+    "press any key" and responded only to Enter, echoing a stray
+    character over the panel and otherwise sitting for the full timeout.
+    Every other reader in this file (``confirm_modal``,
+    ``_health_cbreak_on``, ``KeyReader.run``) sets the same modes.
     """
+    saved = None
     try:
-        with open(tty, "rb", buffering=0) as fh:
+        with open(tty_path, "rb", buffering=0) as fh:
+            fd = fh.fileno()
+            try:
+                saved = termios.tcgetattr(fd)
+                tty.setcbreak(fd)
+                attrs = termios.tcgetattr(fd)
+                attrs[3] &= ~termios.ECHO  # lflag
+                termios.tcsetattr(fd, termios.TCSANOW, attrs)
+            except termios.error:
+                # Not a real terminal (a pipe under test, a closed serial
+                # port). The select below still works; it just needs a
+                # newline. Better than refusing to show the screen.
+                saved = None
             rlist, _, _ = select.select([fh], [], [], timeout)
             if rlist:
                 fh.read(1)
+            if saved is not None:
+                termios.tcsetattr(fd, termios.TCSANOW, saved)
     except OSError:
         time.sleep(min(timeout, 5.0))
 

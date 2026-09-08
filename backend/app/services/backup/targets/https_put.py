@@ -18,7 +18,7 @@ That constraint has real consequences an operator should decide about up
 front, so the form says them rather than leaving them to be discovered:
 
 * **No restore-from-destination and no restore drill.** Both start from
-  a listing. The drill reports ``cannot_drill_write_only`` and readiness
+  a listing. The drill reports ``cannot_drill`` and readiness
   counts the target as UNVERIFIED — never as healthy — because an
   unverifiable backup is an unknown, not a pass.
 * **No pull mode.** ``GET .../archives/latest/download`` needs a
@@ -59,7 +59,6 @@ from typing import Any
 from urllib.parse import quote, urlsplit
 
 import httpx
-import structlog
 
 from app.core.ssrf import SSRFBlockedError, assert_safe_target
 from app.services.backup.targets.base import (
@@ -69,9 +68,8 @@ from app.services.backup.targets.base import (
     ConfigFieldSpec,
     DestinationConfigError,
     UnsupportedOperationError,
+    safe_filename,
 )
-
-logger = structlog.get_logger(__name__)
 
 #: Generous, matching the WebDAV driver: a multi-GB archive over a slow
 #: link legitimately takes a long time.
@@ -81,9 +79,29 @@ _FILENAME_TOKEN = "{filename}"
 
 _AUTH_MODES = ("none", "bearer", "basic", "header")
 
+#: Header names ``extra_headers`` may not set, because this driver computes
+#: them and a silent override would defeat the secret handling.
+_RESERVED_HEADERS = {"authorization", "content-type", "content-length"}
 
-def _safe_filename(filename: str) -> str:
-    return os.path.basename(filename)
+
+def is_single_object_url(url: str) -> bool:
+    """True when this URL addresses ONE object rather than a collection.
+
+    A presigned URL carries its signature in the query string and is valid
+    for exactly one key, so nothing may be appended to it — doing so
+    invalidates the signature. That makes every write to such a target land
+    on the same object, which has two consequences the operator has to be
+    told rather than discover:
+
+    * each scheduled run OVERWRITES the previous archive, so retention is
+      effectively "keep the last one" whatever the target says;
+    * the connection test cannot write a probe without destroying the
+      stored archive, so it refuses instead of doing it.
+
+    A URL carrying a ``{filename}`` placeholder is unaffected — that is the
+    shape to use against a collection endpoint.
+    """
+    return bool(urlsplit(url).query)
 
 
 def _target_url(config: dict[str, Any], filename: str) -> str:
@@ -100,10 +118,10 @@ def _target_url(config: dict[str, Any], filename: str) -> str:
     3. Otherwise — the archive name is appended as a path segment.
     """
     url = config["url"]
-    name = _safe_filename(filename)
+    name = safe_filename(filename)
     if _FILENAME_TOKEN in url:
         return url.replace(_FILENAME_TOKEN, quote(name, safe=""))
-    if urlsplit(url).query:
+    if is_single_object_url(url):
         return url
     return url.rstrip("/") + "/" + quote(name, safe="")
 
@@ -124,6 +142,19 @@ def _parse_extra_headers(config: dict[str, Any]) -> dict[str, str]:
         value = value.strip()
         if not name:
             raise DestinationConfigError("'extra_headers' has a line with an empty name")
+        if name.lower() in _RESERVED_HEADERS:
+            # Refused, not overridden. These fields get filled by pasting a
+            # working ``curl`` recipe, which routinely carries its own
+            # ``Authorization:`` line — and that value would then be the one
+            # authenticating every nightly backup, in plaintext, while the
+            # Fernet-wrapped ``credential`` sat unused and rotating it did
+            # nothing at all. ``Content-Type`` would mislabel the archive.
+            raise DestinationConfigError(
+                f"'extra_headers' may not set {name!r} — this driver computes it "
+                "from the authentication fields (or from the archive body), and an "
+                "override here would silently replace the encrypted credential with "
+                "a plaintext one. Use the 'auth' and 'credential' fields instead."
+            )
         # A newline smuggled through a header value is header injection;
         # ``str.splitlines`` has already split on every newline form, so
         # reaching this with one would mean a bug above.
@@ -176,8 +207,11 @@ class HttpsPutDestination(BackupDestination):
                 "Where each archive is sent. Include {filename} to place the archive "
                 "name (e.g. https://nexus.example/repository/backups/{filename}); "
                 "otherwise it is appended as a path segment. A presigned URL is used "
-                "exactly as given — note that presigned URLs expire, which makes them "
-                "a poor fit for a recurring schedule."
+                "exactly as given — which means EVERY RUN OVERWRITES THE SAME OBJECT "
+                "(so only the newest archive ever exists there), the connection test "
+                "is refused because it would destroy that archive, and the signature "
+                "expires. Use a collection URL with a {filename} placeholder unless "
+                "you specifically want a single rolling object."
             ),
         ),
         ConfigFieldSpec(
@@ -326,7 +360,14 @@ class HttpsPutDestination(BackupDestination):
                         "Content-Length": str(len(body)),
                     },
                 )
-            except httpx.HTTPError as exc:
+            except (httpx.HTTPError, httpx.InvalidURL) as exc:
+                # ``InvalidURL`` derives from Exception, NOT from
+                # ``httpx.HTTPError`` — the trap #889 already recorded for
+                # the InfluxDB writer. Uncaught it escapes the runner's
+                # ``except (BackupArchiveError, BackupDestinationError,
+                # SecretFieldError)``, leaving the row stamped
+                # ``in_progress``, which the schedule sweep skips forever:
+                # that target's backups stop permanently and silently.
                 raise BackupDestinationError(f"{method} to {url} failed: {exc}") from exc
 
     # ── operations ────────────────────────────────────────────────────
@@ -389,6 +430,27 @@ class HttpsPutDestination(BackupDestination):
             await self.validate_config_network(config)
         except DestinationConfigError as exc:
             return {"ok": False, "error": str(exc)}
+
+        # **Refuse rather than probe on a single-object URL.** With a
+        # presigned URL there is no per-archive path, so the probe's
+        # target IS the archive's target — writing 16 random bytes there
+        # would destroy the most recent backup. And nothing could reveal
+        # it afterwards: this kind is write-only, so there is no listing,
+        # no download and no drill. Reporting that the test cannot run is
+        # far better than a green tick over a destroyed archive.
+        if is_single_object_url(config["url"]) and _FILENAME_TOKEN not in config["url"]:
+            return {
+                "ok": False,
+                "error": (
+                    "this URL addresses a single object (it carries a query string, "
+                    "so it looks like a presigned URL), which means a test write "
+                    "would land on the same object as the archive and overwrite it. "
+                    "The connection test is refused rather than run. Note that for "
+                    "the same reason every scheduled run overwrites the previous "
+                    "archive at this destination — use a collection URL with a "
+                    "{filename} placeholder if you need more than the newest one."
+                ),
+            }
 
         probe_name = "spatiumddi-test-probe.bin"
         url = _target_url(config, probe_name)

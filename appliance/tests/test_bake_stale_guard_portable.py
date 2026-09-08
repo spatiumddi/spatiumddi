@@ -26,26 +26,23 @@ No Docker, no root, no appliance ISO required.
 
 from __future__ import annotations
 
-import pathlib
-import re
 import subprocess
 
 import pytest
 
-SCRIPT = pathlib.Path(__file__).resolve().parents[1] / "scripts" / "bake-images.sh"
+from _installer_source import SCRIPTS, extract_fn  # noqa: E402 - sibling module
+
+SCRIPT = SCRIPTS / "bake-images.sh"
 
 
 def _extract(func: str) -> str:
-    """Pull one shell function verbatim out of the shipped script.
+    """One shell function out of the shipped script, verbatim.
 
-    Anchored on ``^<name>() {`` … ``^}`` because the body is indented and
-    the closing brace is not — the same shape every function in that file
-    has.
+    Uses the suite's shared extractor rather than a sixth respelling —
+    ``_installer_source`` was added precisely because five had
+    accumulated, and its docstring asks new files to import from there.
     """
-    body = SCRIPT.read_text()
-    match = re.search(rf"^{re.escape(func)}\(\) \{{\n(.*?)^\}}", body, re.S | re.M)
-    assert match, f"{func}() not found in {SCRIPT}"
-    return f"{func}() {{\n{match.group(1)}}}\n"
+    return extract_fn(func, SCRIPT.read_text())
 
 
 def _run(snippet: str) -> subprocess.CompletedProcess[str]:

@@ -738,10 +738,10 @@ async def compute_drill_readiness(db: AsyncSession) -> list[dict[str, Any]]:
     *finished* verdict is not a failure. ``hours_since_last_pass``
     carries the staleness so callers can judge how old the proof is.
 
-    A **write-only** target (#989 item 1) is reported ``drillable:
-    false`` with a reason, and stays ``verified: false`` — an
-    unverifiable backup is an unknown, which is the same category as an
-    untested one. ``cannot_drill`` behaves like ``error`` here: it is
+    A **write-only** target (#989 item 1) carries ``undrillable_reason``
+    and is forced to ``verified: false`` — an unverifiable backup is an
+    unknown, the same category as an untested one, and that holds even
+    when the target passed drills before write-only was switched on. ``cannot_drill`` behaves like ``error`` here: it is
     not in the ``latest_finished_verdict`` set, so it neither counts as
     a pass nor erases an earlier one.
     """
@@ -784,7 +784,6 @@ async def compute_drill_readiness(db: AsyncSession) -> list[dict[str, Any]]:
                 "kind": t.kind,
                 "enabled": t.enabled,
                 "write_only": t.write_only,
-                "drillable": undrillable_reason is None,
                 "undrillable_reason": undrillable_reason,
                 "drills_scheduled": bool(t.drill_enabled and t.drill_cron),
                 "drill_cron": t.drill_cron,
@@ -793,11 +792,27 @@ async def compute_drill_readiness(db: AsyncSession) -> list[dict[str, Any]]:
                 "latest_drill_at": t.drill_last_at.isoformat() if t.drill_last_at else None,
                 "last_passed_at": last_pass.isoformat() if last_pass else None,
                 "hours_since_last_pass": age_hours,
-                # Unchanged definition, and it already gives the right
-                # answer for an undrillable target: it has never passed,
-                # so ``last_pass`` is None and this is False. Stated
-                # explicitly because the temptation is to special-case it.
-                "verified": last_pass is not None and latest_finished != "failed",
+                # An undrillable target is NEVER verified — asserted, not
+                # inferred.
+                #
+                # The first cut left the expression alone, reasoning that
+                # such a target "has never passed, so last_pass is None".
+                # That holds only for a target created write-only on day
+                # one, and the shipped hardening advice is the opposite:
+                # prove an S3 target with drills for months, THEN add
+                # Object Lock and tick write-only. After that flip every
+                # drill returns ``cannot_drill``, which is excluded from
+                # the ``latest_finished`` set — so ``last_pass`` kept
+                # pointing at the old success and ``verified`` stayed true
+                # forever, off a proof that can never be refreshed, while
+                # ``hours_since_last_pass`` grew without bound. That is
+                # precisely the "unverifiable must never read as healthy"
+                # invariant this block exists to hold.
+                "verified": (
+                    undrillable_reason is None
+                    and last_pass is not None
+                    and latest_finished != "failed"
+                ),
             }
         )
     return out

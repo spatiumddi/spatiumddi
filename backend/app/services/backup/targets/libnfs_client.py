@@ -46,8 +46,8 @@ simplest and the correct lifetime.
 
 Portability note: the struct layouts below assume LP64 with natural
 alignment, which covers both architectures we ship (non-negotiable #11).
-``tests/test_libnfs_client.py`` pins the sizes and offsets so a layout
-that drifts fails loudly rather than reading a garbage field.
+``tests/test_backup_target_nfs.py`` pins the sizes and offsets so a
+layout that drifts fails loudly rather than reading a garbage field.
 """
 
 from __future__ import annotations
@@ -67,7 +67,6 @@ __all__ = [
     "NfsStat",
     "NfsConnection",
     "connect",
-    "library_available",
 ]
 
 
@@ -179,7 +178,24 @@ _NF3REG = 1
 _S_IFMT = 0o170000
 _S_IFREG = 0o100000
 
-_SONAMES = ("libnfs.so.14", "libnfs.so.13", "libnfs.so")
+#: The ONE soname whose ABI this module was written against — Debian's
+#: ``libnfs14`` (libnfs 5.0.2), which the backend image installs.
+#:
+#: Deliberately not a fallback list, and deliberately not
+#: ``ctypes.util.find_library("nfs")``. A soname bump exists *because*
+#: the ABI changed: libnfs 6.0 swapped ``nfs_pread`` / ``nfs_pwrite`` to
+#: POSIX ``(buf, count, offset)`` order, so binding a future
+#: ``libnfs.so.15`` with these prototypes would pass the buffer pointer
+#: as an offset and a NULL as the buffer — a segfault on write, and a
+#: silently empty read. The struct layouts have the same exposure: a
+#: wrong ``nfsdirent`` offset does not raise, it returns an adjacent
+#: field, and a garbage ``mtime`` flows into ``created_at``, which the
+#: ``retention_keep_days`` sweep compares against a cutoff and then
+#: DELETES on.
+#:
+#: A refusal to load is recoverable and names the package. A wrong-ABI
+#: bind destroys backups while reporting success, so this fails closed.
+_SONAME = "libnfs.so.14"
 
 
 # ── library loading ───────────────────────────────────────────────────
@@ -193,24 +209,16 @@ def _load() -> ctypes.CDLL:
     every pointer this API hands back to 32 bits. That corrupts silently
     on the first allocation above 4 GiB rather than failing at the call.
     """
-    last: Exception | None = None
-    lib: ctypes.CDLL | None = None
-    candidates = list(_SONAMES)
-    found = ctypes.util.find_library("nfs")
-    if found:
-        candidates.insert(0, found)
-    for soname in candidates:
-        try:
-            lib = ctypes.CDLL(soname)
-            break
-        except OSError as exc:
-            last = exc
-    if lib is None:
+    try:
+        lib = ctypes.CDLL(_SONAME)
+    except OSError as exc:
         raise NfsUnavailableError(
             "the NFS backup destination needs the libnfs shared library, "
-            "which is not present in this image (Debian package 'libnfs14'). "
-            f"Tried {', '.join(candidates)}: {last}"
-        )
+            f"which is not present in this image: could not load {_SONAME} "
+            f"({exc}). Install the Debian package 'libnfs14'. Note that only "
+            "this soname is accepted — see the comment on _SONAME for why a "
+            "different ABI is refused rather than used."
+        ) from exc
 
     ctx = ctypes.c_void_p
     fh = ctypes.c_void_p
@@ -279,18 +287,6 @@ def _lib() -> ctypes.CDLL:
     if _LIB is None:
         _LIB = _load()
     return _LIB
-
-
-def library_available() -> bool:
-    """True when ``libnfs`` can be loaded. Used by the driver's
-    ``test_connection`` to report a missing library as its own cause
-    rather than as an unreachable server.
-    """
-    try:
-        _lib()
-    except NfsUnavailableError:
-        return False
-    return True
 
 
 # ── public value types ────────────────────────────────────────────────
@@ -417,7 +413,11 @@ class NfsConnection:
         rc = self._lib.nfs_open(self._ctx, path.encode(), _O_RDONLY, ctypes.byref(handle))
         if rc < 0:
             raise self._err(rc, f"open {path!r}")
-        chunks: list[bytes] = []
+        # A bytearray rather than a list + ``b"".join``: the join held a
+        # second full copy at the moment it ran, so a 4 GB archive peaked
+        # at ~8 GB RSS in a memory-limited api pod — an OOMKill during a
+        # restore drill, which reads as "the drill failed".
+        out = bytearray()
         buf = ctypes.create_string_buffer(_CHUNK)
         offset = 0
         try:
@@ -427,11 +427,11 @@ class NfsConnection:
                     raise self._err(got, f"read {path!r}")
                 if got == 0:
                     break
-                chunks.append(buf.raw[:got])
+                out += memoryview(buf)[:got]
                 offset += got
         finally:
             self._lib.nfs_close(self._ctx, handle)
-        return b"".join(chunks)
+        return bytes(out)
 
     def write(self, path: str, data: bytes, *, mode: int = 0o640) -> None:
         handle = ctypes.c_void_p()
@@ -444,21 +444,55 @@ class NfsConnection:
             # lets us set the mode.
             rc2 = self._lib.nfs_creat(self._ctx, path.encode(), mode, ctypes.byref(handle))
             if rc2 < 0:
-                raise self._err(rc, f"create {path!r}")
+                # Report the CREAT's return code, not the OPEN's. The two
+                # can differ (EINVAL from open on a v3 server, then EACCES
+                # from creat under root_squash) and ``nfs_get_error`` now
+                # holds the creat's message — pairing that text with the
+                # open's errno makes ``_squash_hint`` give advice for a
+                # failure that did not happen.
+                raise self._err(rc2, f"create {path!r}")
+        closed = False
         try:
+            # Point straight into the caller's bytes rather than copying
+            # each chunk into a ctypes buffer: ``from_buffer_copy`` per
+            # iteration copied the whole archive an extra time (4 GB of
+            # pure memcpy on a 4 GB archive) for nothing, since
+            # ``nfs_pwrite`` takes a const pointer and never writes
+            # through it.
+            #
+            # ``src`` is held in a local on purpose — it owns the
+            # reference that keeps the bytes buffer alive for as long as
+            # ``base`` is used as a raw address.
+            src = ctypes.c_char_p(data)
+            base = ctypes.cast(src, ctypes.c_void_p).value or 0
             offset = 0
-            view = memoryview(data)
-            while offset < len(data):
-                chunk = view[offset : offset + _CHUNK]
-                buf = (ctypes.c_char * len(chunk)).from_buffer_copy(chunk)
-                put = self._lib.nfs_pwrite(self._ctx, handle, offset, len(chunk), buf)
+            total = len(data)
+            while offset < total:
+                span = min(_CHUNK, total - offset)
+                put = self._lib.nfs_pwrite(
+                    self._ctx, handle, offset, span, ctypes.c_void_p(base + offset)
+                )
                 if put < 0:
                     raise self._err(put, f"write {path!r}")
                 if put == 0:
                     raise NfsError(f"write {path!r} made no progress on {self._describe}")
                 offset += put
+            # **The close is the durability barrier, not the last write.**
+            # NFS writes go out UNSTABLE and libnfs issues the COMMIT at
+            # close, so ENOSPC / EDQUOT / a server reboot between WRITE and
+            # COMMIT are all reported HERE and nowhere earlier. Discarding
+            # this return code (it used to live in a bare ``finally``) let
+            # the driver rename a truncated archive into place and stamp
+            # the run "success" — discovered only at restore.
+            close_rc = self._lib.nfs_close(self._ctx, handle)
+            closed = True
+            if close_rc < 0:
+                raise self._err(close_rc, f"commit of {path!r} on close")
         finally:
-            self._lib.nfs_close(self._ctx, handle)
+            if not closed:
+                # An error above already has the operator's attention;
+                # this close is only to release the server-side state.
+                self._lib.nfs_close(self._ctx, handle)
 
     def unlink(self, path: str) -> None:
         rc = self._lib.nfs_unlink(self._ctx, path.encode())

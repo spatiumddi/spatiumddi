@@ -37,9 +37,16 @@ BAKE_SOURCE="${BAKE_SOURCE:-local}"  # local (docker :dev) | ghcr (pull from ghc
 # ghcr pulls are always fresh, so this only applies to BAKE_SOURCE=local.
 ALLOW_STALE_IMAGES="${ALLOW_STALE_IMAGES:-0}"
 STALE_MAX_AGE_S="${STALE_MAX_AGE_S:-86400}"  # 24h
+LIST_IMAGES_ONLY=0
 for arg in "$@"; do
     case "$arg" in
         --allow-stale-images) ALLOW_STALE_IMAGES=1 ;;
+        # Print every image this script would bake, one per line, and
+        # exit. ``make appliance-verify-arch`` consumes it so the
+        # architecture check and the bake read ONE list — a second copy
+        # (a sed scrape of the arrays below) covered only SpatiumDDI's
+        # own images, which are the ones that cannot be wrong.
+        --list-images) LIST_IMAGES_ONLY=1 ;;
         *) echo "WARN: ignoring unknown arg '$arg'" >&2 ;;
     esac
 done
@@ -170,6 +177,14 @@ CNPG_IMAGES=(
     "ghcr.io/cloudnative-pg/cloudnative-pg:1.30.0"
     "ghcr.io/cloudnative-pg/postgresql:16"
 )
+
+if [ "$LIST_IMAGES_ONLY" = 1 ]; then
+    for repo in "${IMAGES[@]}"; do printf '%s\n' "$repo"; done
+    for image in "${OBSERVABILITY_IMAGES[@]}" "${METALLB_IMAGES[@]}" "${CNPG_IMAGES[@]}"; do
+        printf '%s\n' "$image"
+    done
+    exit 0
+fi
 
 if ! command -v docker >/dev/null 2>&1; then
     echo "ERROR: docker CLI required on the build host (used to save + retag images)." >&2

@@ -382,6 +382,18 @@ All ten destination kinds register in the same driver registry; the UI's destina
 | `nfs` | 2 | NFSv4 (default) / NFSv3 exports — a NAS (Synology / TrueNAS / QNAP) or a Linux file server. Speaks NFS in **userspace** via `libnfs`, so no kernel mount and no `CAP_SYS_ADMIN`; works identically on compose, Kubernetes and the appliance |
 | `https_put` | 3 | Any receiver that takes a `PUT` or `POST` — Artifactory / Nexus generic repositories, a presigned S3 URL, an internal receiver. **Write-only by construction**: no listing, no delete, no restore-from-destination, no drill |
 
+**Two export options decide whether NFS works at all.** SpatiumDDI's control
+plane runs as a non-root user with no `CAP_NET_BIND_SERVICE`, so it connects
+from an *unprivileged source port* — and Linux's `secure` export option, which
+requires a port below 1024, is the **default** (on a Synology the equivalent is
+"allow connections from non-privileged ports", also off by default). Add
+`insecure` to the export options, or the mount is refused with a permission
+error. The second is `root_squash`, covered below. The driver's error message
+names both, because they need opposite fixes and a confident diagnosis of the
+wrong one sends the operator in circles: if the *mount* failed it is almost
+certainly the port; if the mount succeeded and only the write was refused, it is
+squash.
+
 **NFS has no authentication, and the form says so.** AUTH_SYS is the only
 security flavour v1 supports: the client asserts a uid and the server believes
 it. A passing connection test therefore says nothing about who *else* on the

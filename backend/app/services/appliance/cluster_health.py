@@ -22,7 +22,6 @@ Pydantic model in ``app.api.v1.appliance.cluster`` (so the SSE loop can
 
 from __future__ import annotations
 
-import os
 import time
 from datetime import UTC, datetime
 from typing import Any
@@ -318,10 +317,19 @@ def _ready_counts(pod: dict[str, Any]) -> tuple[int, int]:
 _CLUSTER_DNS_SELECTOR = ("k8s-app", "kube-dns")
 _CLUSTER_DNS_NAMESPACE = "kube-system"
 
-#: What ``ensure_coredns_ha`` itself targets: stock (1 replica) on a
-#: single node, two replicas on distinct nodes once a second node
-#: exists. Reused here so the card cannot disagree with the thing that
-#: does the patching.
+#: What ``ensure_coredns_ha`` targets: stock (1 replica) on a single
+#: node, two replicas on distinct nodes once a second node exists.
+#:
+#: **Re-declared, not shared** — the patcher lives in the supervisor
+#: (``agent/supervisor/spatium_supervisor/k8s_api.py``), a separate
+#: deployable that versions independently of this image, so there is no
+#: import to share. That means the two CAN drift: raise the supervisor's
+#: cap and this card keeps expecting 2, which would make a correctly
+#: scaled CoreDNS read as over-provisioned and — worse — stop the
+#: ``cluster_dns_degraded`` alert firing, since ``ready >= expected``
+#: would be satisfied by a stale target. If the supervisor's policy ever
+#: becomes a variable, report the applied value on the heartbeat (the
+#: #402 pattern) and render that instead of re-deriving it here.
 _CLUSTER_DNS_MAX_REPLICAS = 2
 
 #: The name every conformant cluster resolves, and the one thing we can
@@ -335,7 +343,7 @@ _CLUSTER_DNS_PROBE_NAME = "kubernetes.default.svc.cluster.local"
 _CLUSTER_DNS_PROBE_TIMEOUT_S = 2.0
 
 
-def _resolver_ip_from_resolv_conf(path: str = "/etc/resolv.conf") -> str | None:
+def _resolver_ip(path: str = "/etc/resolv.conf") -> str | None:
     """The nameserver this pod actually queries.
 
     Read from our own ``resolv.conf`` rather than from the ``kube-dns``
@@ -343,19 +351,39 @@ def _resolver_ip_from_resolv_conf(path: str = "/etc/resolv.conf") -> str | None:
     we do not already hold, and it is the more honest number — it is the
     address pods really send to, which is what a resolution failure is
     about.
+
+    Parsed by dnspython rather than by hand. It is already a hard
+    dependency and already relied on for exactly this in the DNSBL sweep
+    and the reverse-DNS resolver; a bespoke reader would handle only the
+    bare ``nameserver <ip>`` form and silently return None (rendering
+    "Resolver: unknown" and skipping the probe) on anything else.
     """
     try:
-        with open(path, encoding="utf-8", errors="replace") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line or line.startswith("#") or line.startswith(";"):
-                    continue
-                parts = line.split()
-                if len(parts) >= 2 and parts[0] == "nameserver":
-                    return parts[1]
-    except OSError:
+        import dns.resolver  # noqa: PLC0415
+
+        nameservers = dns.resolver.Resolver(filename=path).nameservers
+    except Exception:  # noqa: BLE001 - a missing/……unparseable file is "unknown"
         return None
-    return None
+    return str(nameservers[0]) if nameservers else None
+
+
+#: How long a probe verdict is reused. The Cluster dashboard streams the
+#: whole snapshot every 2 s per connected client, and the alert sweep
+#: gathers it too — without this, one open tab means a live DNS query
+#: every 2 s against the very CoreDNS the panel reports on, and five tabs
+#: means 2.5 queries/s. Worse in the case this feature exists for: a
+#: failing probe blocks its thread for the full 2 s timeout, so the
+#: stream cadence halves for every unrelated panel on the page exactly
+#: when cluster DNS is down.
+#:
+#: 15 s is well inside the "is DNS working right now" question's useful
+#: resolution and collapses N streams into one probe per window.
+_CLUSTER_DNS_PROBE_TTL_S = 15.0
+
+#: ``(monotonic_deadline, verdict)``. Process-local and best-effort — a
+#: torn read across threads would at worst reuse a verdict a moment
+#: longer, so it needs no lock.
+_probe_cache: tuple[float, dict[str, Any]] | None = None
 
 
 def _cluster_dns_probe(resolver_ip: str | None) -> dict[str, Any]:
@@ -367,12 +395,20 @@ def _cluster_dns_probe(resolver_ip: str | None) -> dict[str, Any]:
     flannel problem rather than a CoreDNS one — so it is reported as
     itself rather than collapsed into one boolean.
     """
+    global _probe_cache
+
     if not resolver_ip:
         return {
             "ok": False,
             "latency_ms": None,
             "error": "no nameserver found in /etc/resolv.conf",
         }
+    cached = _probe_cache
+    if cached is not None and cached[0] > time.monotonic():
+        # Copy: callers stamp ``from_node`` onto the returned dict, and a
+        # shared mutable verdict would attribute one vantage's probe to
+        # whichever replica read it next.
+        return dict(cached[1])
     try:
         import dns.exception  # noqa: PLC0415
         import dns.resolver  # noqa: PLC0415
@@ -391,42 +427,49 @@ def _cluster_dns_probe(resolver_ip: str | None) -> dict[str, Any]:
         # lesson), so fall back to the class name rather than reporting
         # an error of "".
         detail = str(exc) or exc.__class__.__name__
-        return {
-            "ok": False,
-            "latency_ms": round((time.monotonic() - started) * 1000, 1),
-            "error": f"{_CLUSTER_DNS_PROBE_NAME} did not resolve via {resolver_ip}: {detail}",
-        }
+        return _cache_probe(
+            {
+                "ok": False,
+                "latency_ms": round((time.monotonic() - started) * 1000, 1),
+                "error": f"{_CLUSTER_DNS_PROBE_NAME} did not resolve via {resolver_ip}: {detail}",
+            }
+        )
     except OSError as exc:
-        return {
-            "ok": False,
+        return _cache_probe(
+            {
+                "ok": False,
+                "latency_ms": round((time.monotonic() - started) * 1000, 1),
+                "error": f"could not reach {resolver_ip}: {exc}",
+            }
+        )
+    return _cache_probe(
+        {
+            "ok": True,
             "latency_ms": round((time.monotonic() - started) * 1000, 1),
-            "error": f"could not reach {resolver_ip}: {exc}",
+            "error": None,
         }
-    return {
-        "ok": True,
-        "latency_ms": round((time.monotonic() - started) * 1000, 1),
-        "error": None,
-    }
+    )
 
 
-def _own_node_name(pods_raw: list[dict[str, Any]]) -> str | None:
-    """Which node this api replica is running on.
+def _own_node_name() -> str | None:
+    """Which node this api replica runs on.
 
-    ``HOSTNAME`` inside a pod is the pod name, so the node is looked up
-    by finding our own pod in the list we already have. Falls back to the
-    ``SPATIUM_NODE_NAME`` downward-API env var if the chart sets one, and
-    to ``None`` rather than guessing.
+    ``settings.node_name`` is populated from the downward API
+    (``spec.nodeName``) by the api Deployment, and the slot endpoints
+    already read it for the same purpose — so this is one reader of one
+    field, not a second env-var convention to keep in step with the chart.
     """
-    explicit = os.environ.get("SPATIUM_NODE_NAME") or os.environ.get("NODE_NAME")
-    if explicit:
-        return explicit
-    me = os.environ.get("HOSTNAME")
-    if not me:
-        return None
-    for p in pods_raw:
-        if (p.get("metadata") or {}).get("name") == me:
-            return (p.get("spec") or {}).get("nodeName")
-    return None
+    from app.config import settings  # noqa: PLC0415
+
+    return settings.node_name or None
+
+
+def _cache_probe(verdict: dict[str, Any]) -> dict[str, Any]:
+    """Store ``verdict`` for :data:`_CLUSTER_DNS_PROBE_TTL_S` and return it."""
+    global _probe_cache
+
+    _probe_cache = (time.monotonic() + _CLUSTER_DNS_PROBE_TTL_S, dict(verdict))
+    return verdict
 
 
 def _cluster_dns_unavailable(detail: str) -> dict[str, Any]:
@@ -466,11 +509,29 @@ def _cluster_dns_health(
     to list ``kube-system``, this degrades to ``available: false`` with a
     reason rather than reporting an empty deployment.
     """
+    # **The probe runs first, and unconditionally.** It needs no RBAC at
+    # all — it is a DNS query from this pod — whereas the replica view
+    # needs a cluster-wide pod list. The Celery worker's ServiceAccount
+    # deliberately does NOT carry that grant (see
+    # charts/spatiumddi/templates/worker-rbac.yaml), and the alert
+    # evaluator runs in the worker: with the probe behind the
+    # pods-listable gate, the rule raised AlertDataUnavailable on every
+    # tick forever, so CoreDNS could be entirely down and the alert stayed
+    # silent while showing as enabled. Running the probe first is also
+    # what makes the "second vantage" claim true rather than aspirational.
+    resolver_ip = _resolver_ip()
+    probe = _cluster_dns_probe(resolver_ip)
+    probe["from_node"] = from_node
+
     if not pods_listable:
-        return _cluster_dns_unavailable(
+        out = _cluster_dns_unavailable(
             "pods could not be listed, so cluster DNS replicas are unknown — grant the "
-            "api ServiceAccount cluster-wide pod read to populate this card."
+            "api ServiceAccount cluster-wide pod read to populate this card. The "
+            "resolve probe below still reports whether cluster DNS answers."
         )
+        out["resolver_ip"] = resolver_ip
+        out["resolve_probe"] = probe
+        return out
 
     key, value = _CLUSTER_DNS_SELECTOR
     dns_pods = [
@@ -479,10 +540,6 @@ def _cluster_dns_health(
         if (p.get("metadata") or {}).get("namespace") == _CLUSTER_DNS_NAMESPACE
         and ((p.get("metadata") or {}).get("labels") or {}).get(key) == value
     ]
-
-    resolver_ip = _resolver_ip_from_resolv_conf()
-    probe = _cluster_dns_probe(resolver_ip)
-    probe["from_node"] = from_node
 
     if not dns_pods:
         # An empty *result* is different from an unreadable list. Both
@@ -822,7 +879,7 @@ def get_cluster_health() -> dict[str, Any]:
             pods_raw,
             nodes_total=len(nodes_raw),
             pods_listable=pods_listable,
-            from_node=_own_node_name(pods_raw),
+            from_node=_own_node_name(),
         ),
         "cpu_usage_cores": round(cluster_cpu_used, 4) if metrics_available else None,
         "cpu_capacity_cores": round(cluster_cpu_cap, 4) if cluster_cpu_cap else None,

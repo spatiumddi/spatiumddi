@@ -41,7 +41,8 @@ import sys
 
 import pytest
 
-BIN = pathlib.Path(__file__).resolve().parents[1] / "mkosi.extra" / "usr" / "local" / "bin"
+from _installer_source import BIN  # noqa: E402 - sibling module
+
 TOOL = BIN / "spatium-network-adopt"
 CONSOLE = BIN / "spatium-console"
 ETC_RENDER = BIN / "spatium-etc-render"
@@ -366,7 +367,17 @@ def test_the_write_is_atomic(config):
     import inspect
 
     body = inspect.getsource(sna.write_state)
-    assert ".replace(path)" in body, "must rename a temp file over the target"
+    assert "os.replace(tmp, path)" in body, "must rename a temp file over the target"
+    # The rename alone is only namespace-atomic. Without an fsync of the
+    # file AND of its directory, a power loss just after the console
+    # prints "Saved to STATE" can leave a zero-length config on the one
+    # partition nothing else on the box backs up.
+    assert body.count("os.fsync") == 2, "fsync the temp file and its directory"
+    # A fresh inode is created at 0666 & ~umask owned by whoever ran the
+    # tool, so a root-only STATE config — which carries the admin
+    # username, hostname and control-plane URL — would silently become
+    # world-readable after one save.
+    assert "os.chmod(tmp" in body and "os.chown(tmp" in body
 
 
 # ── the console side ──────────────────────────────────────────────────

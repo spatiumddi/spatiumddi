@@ -711,27 +711,54 @@ appliance-baked-iso-cross:
 # ``docker image inspect``, gets baked, and then ``exec format error``s
 # on first boot with nothing in the build log to explain it.
 #
+# It reads the image set from ``bake-images.sh --list-images`` — ALL four
+# arrays, not just SpatiumDDI's own. The first cut scraped the ``IMAGES=(``
+# array with sed, which covers precisely the images ``make build`` has
+# just produced under the right platform and therefore cannot be wrong;
+# the third-party ones it exists for live in the other three arrays. One
+# source of truth also means a reformat of that file cannot silently
+# empty the list.
+#
+# **It fails closed.** An unreadable list or no local images at all is an
+# error, not a friendly note and exit 0 — the same "a guard that
+# evaluates nothing is indistinguishable from one that passed" rule this
+# commit applies to the staleness check in bake-images.sh.
+#
 # Run automatically by ``appliance-baked-iso-cross`` between building the
 # images and baking them, which is the only moment the mistake is still
 # cheap to fix.
 appliance-verify-arch: APPLIANCE_ARCH ?= linux/amd64
 appliance-verify-arch:
-	@want="$(notdir $(APPLIANCE_ARCH))"; bad=0; found=0; \
-	for repo in $$(sed -n '/^IMAGES=(/,/^)/p' $(APPLIANCE_DIR)/scripts/bake-images.sh \
-	                | grep -oE '"[^"]+"' | tr -d '"'); do \
-	  short=$$(basename $$repo); \
-	  for tag in "$$repo:dev" "spatiumddi-$$short:dev" "$$short:dev"; do \
+	@want="$(notdir $(APPLIANCE_ARCH))"; bad=0; checked=0; \
+	imgs="$$($(APPLIANCE_DIR)/scripts/bake-images.sh --list-images 2>/dev/null)"; \
+	if [ -z "$$imgs" ]; then \
+	  echo "ERROR: could not read the image list from bake-images.sh --list-images." >&2; \
+	  echo "       Refusing to bake rather than reporting a clean check over" >&2; \
+	  echo "       nothing — a guard that evaluates nothing looks exactly like" >&2; \
+	  echo "       one that passed." >&2; \
+	  exit 1; \
+	fi; \
+	for image in $$imgs; do \
+	  short=$$(basename "$${image%%:*}"); found=0; \
+	  for tag in "$$image" "$${image%%:*}:dev" "spatiumddi-$$short:dev" "$$short:dev"; do \
 	    got=$$(docker image inspect -f '{{.Architecture}}' "$$tag" 2>/dev/null) || continue; \
+	    found=1; \
 	    if [ "$$got" != "$$want" ]; then \
 	      echo "  ✗ $$tag is $$got, expected $$want" >&2; bad=1; \
 	    else \
-	      printf '  ✓ %-46s %s\n' "$$tag" "$$got"; \
+	      printf '  ✓ %-52s %s\n' "$$tag" "$$got"; \
 	    fi; \
-	    found=1; break; \
+	    checked=$$((checked+1)); \
+	    break; \
 	  done; \
+	  if [ "$$found" = 0 ]; then \
+	    echo "  ? $$image — not present locally (the bake will pull it)"; \
+	  fi; \
 	done; \
-	if [ "$$found" = 0 ]; then \
-	  echo "  (no local :dev source images to check — 'make build' has not run)"; \
+	if [ "$$checked" = 0 ]; then \
+	  echo "ERROR: none of the bake's images is present locally — run 'make build'" >&2; \
+	  echo "       (and 'make build-supervisor') before verifying." >&2; \
+	  exit 1; \
 	fi; \
 	if [ "$$bad" != 0 ]; then \
 	  echo "" >&2; \
