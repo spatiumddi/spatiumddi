@@ -17,15 +17,23 @@ cannot.
 
 **A routine scrub or resync on an intact array is deliberately NOT a
 finding.** The issue asked for it as "informational, auto-clears", and
-that would be right if ``info`` were quiet — it is not. Alert delivery
-filters a target's ``min_severity`` against ``payload["result"]``, a
-key alert payloads do not carry (see ``audit_forward._target_accepts``),
-and the column defaults to NULL anyway, so an ``info`` event notifies
-exactly like a critical one. Debian runs ``checkarray`` monthly by
-cron, so an ``info`` finding here would mail every operator with an
-array, every month, about their array working correctly — which is how
-an alarm gets muted before the night it matters. The scrub IS surfaced,
-on all three screens, with its progress; it is just not an event.
+that would be right if ``info`` were quiet by default — it is not.
+``min_severity`` is nullable and defaults to NULL, which forwards
+everything, so on a stock install an ``info`` event notifies exactly
+like a critical one. Debian runs ``checkarray`` monthly by cron, so an
+``info`` finding here would mail every operator with an array, every
+month, about their array working correctly — which is how an alarm gets
+muted before the night it matters. The scrub IS surfaced, on all three
+screens, with its progress; it is just not an event.
+
+The original note here gave a second reason that no longer holds and is
+recorded because the difference matters: alert delivery used to filter
+``min_severity`` against ``payload["result"]``, a key alert payloads do
+not carry, so an operator who set a threshold received *nothing* —
+``info`` could not be muted, it could only be turned off wholesale.
+#1031 fixed that, so muting informational alerts per-target is now a
+real option. What has not changed is the DEFAULT, and a finding that is
+quiet only for operators who went and configured it is not quiet.
 
 The rebuild that DOES matter never reaches here as ``syncing`` anyway:
 an array with a member out of sync reports ``degraded``, and is

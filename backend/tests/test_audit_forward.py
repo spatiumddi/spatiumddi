@@ -293,3 +293,135 @@ async def test_invalid_format_rejected(client: AsyncClient, db_session: AsyncSes
 # split gets in the way of a clean assertion here. The behavior is
 # exercised in real upgrades and covered at the CRUD-roundtrip level
 # (a row written through the API shows up in a subsequent GET).
+
+
+# ── Alert / digest payload shapes (issue #1031) ────────────────────
+#
+# Three payload shapes go through ``_deliver_to_target``, and until #1031
+# only the audit one was handled: alerts and digests carry ``severity`` +
+# ``fired_at`` where an audit row carries ``result`` + ``timestamp``.
+#
+# These pin the WIRE OUTPUT rather than the helpers, because every one of
+# the four symptoms was visible only there — a PRI that said
+# "informational" for a critical alert, a CEF severity of 3, a gate that
+# dropped the event, and a KeyError that meant nothing was sent at all.
+
+
+def _alert(**overrides: object) -> dict[str, object]:
+    base: dict[str, object] = {
+        "kind": "alert",
+        "rule_id": "rule-1",
+        "rule_name": "Appliance storage degraded",
+        "rule_type": "appliance_storage_degraded",
+        "severity": "critical",
+        "fired_at": "2026-04-22T12:00:00+00:00",
+        "subject_type": "appliance",
+        "subject_id": "ap-1",
+        "subject_display": "ddi1",
+        "message": "array root_a is degraded (1 of 2 members)",
+    }
+    base.update(overrides)
+    return base
+
+
+def _digest(**overrides: object) -> dict[str, object]:
+    base: dict[str, object] = {
+        "kind": "digest",
+        "title": "SpatiumDDI Daily Operator Digest",
+        "severity": "info",
+        "resource_type": "ai.digest",
+        "fired_at": "2026-04-22T06:00:00+00:00",
+        "message": "all quiet",
+        "summary": "all quiet",
+    }
+    base.update(overrides)
+    return base
+
+
+@pytest.mark.parametrize("fmt", ["rfc5424_json", "rfc5424_cef", "rfc5424_leef", "rfc3164"])
+def test_alert_renders_in_every_syslog_format(fmt: str) -> None:
+    """The regression that mattered most: three of these raised
+    ``KeyError: 'timestamp'``, so an alert to a syslog target — on the
+    DEFAULT format — was never delivered, and ``alerts._deliver``
+    swallowed the exception into a log line."""
+    out = svc.render_for_target(fmt, facility=16, payload=_alert())
+    assert out
+
+
+@pytest.mark.parametrize("fmt", ["rfc5424_json", "rfc5424_cef", "rfc5424_leef", "rfc3164"])
+def test_digest_renders_in_every_syslog_format(fmt: str) -> None:
+    out = svc.render_for_target(fmt, facility=16, payload=_digest())
+    assert out
+
+
+def test_alert_severity_reaches_the_syslog_pri() -> None:
+    # facility 16 << 3 = 128; + 2 crit / 4 warning / 6 info.
+    assert svc.render_for_target(
+        "rfc5424_json", facility=16, payload=_alert(severity="critical")
+    ).startswith("<130>1 ")
+    assert svc.render_for_target(
+        "rfc5424_json", facility=16, payload=_alert(severity="warning")
+    ).startswith("<132>1 ")
+    assert svc.render_for_target(
+        "rfc5424_json", facility=16, payload=_alert(severity="info")
+    ).startswith("<134>1 ")
+
+
+def test_audit_syslog_severities_are_unchanged() -> None:
+    """The audit mappings must not move — an existing collector already
+    indexes those PRI values."""
+    for result, pri in (("success", "<134>"), ("failed", "<131>"), ("denied", "<132>")):
+        out = svc.render_for_target("rfc5424_json", facility=16, payload=_payload(result=result))
+        assert out.startswith(pri + "1 "), result
+
+
+def test_alert_syslog_timestamp_comes_from_fired_at() -> None:
+    """Not the wall clock. ``rfc3164`` rendered without raising before
+    the fix, but stamped 'now' — so a delayed or replayed alert was
+    filed under the wrong minute."""
+    out = svc.render_for_target("rfc3164", facility=16, payload=_alert())
+    assert out.startswith("<130>Apr 22 12:00:00 ")
+
+
+def test_alert_cef_carries_the_rule_not_the_word_audit() -> None:
+    out = svc.render_for_target("rfc5424_cef", facility=16, payload=_alert())
+    assert "|appliance_storage_degraded|Appliance storage degraded|9|" in out
+    assert "cs5=Appliance storage degraded" in out
+    assert "cs6=ddi1" in out
+
+
+def test_alert_leef_carries_the_rule_not_the_word_audit() -> None:
+    out = svc.render_for_target("rfc5424_leef", facility=16, payload=_alert())
+    assert "|appliance_storage_degraded|^" in out
+    assert "sev=critical" in out
+    assert "ruleName=Appliance storage degraded" in out
+
+
+def test_min_severity_no_longer_drops_every_alert() -> None:
+    """The filed bug. A target set to anything above ``info`` dropped the
+    lot, criticals included, because alerts bucketed to ``info``."""
+    for threshold in ("info", "warn", "error", "denied"):
+        target = {"kind": "syslog", "min_severity": threshold, "resource_types": None}
+        assert svc._target_accepts(target, _alert(severity="critical")) is True, threshold
+
+
+def test_min_severity_still_filters_alerts_it_should() -> None:
+    target = {"kind": "syslog", "min_severity": "error", "resource_types": None}
+    assert svc._target_accepts(target, _alert(severity="info")) is False
+    assert svc._target_accepts(target, _alert(severity="warning")) is False
+    assert svc._target_accepts(target, _alert(severity="critical")) is True
+
+
+def test_resource_types_allowlist_matches_an_alert_subject() -> None:
+    """``subject_type`` is the same vocabulary as ``resource_type``; with
+    no fallback a target carrying an allowlist dropped every alert."""
+    target = {"kind": "syslog", "min_severity": None, "resource_types": ["appliance"]}
+    assert svc._target_accepts(target, _alert()) is True
+    assert svc._target_accepts(target, _alert(subject_type="dns_zone")) is False
+
+
+def test_unrankable_severity_fails_open() -> None:
+    """A severity string we cannot rank says nothing about whether the
+    operator wanted the event; silently swallowing it is the bug."""
+    target = {"kind": "syslog", "min_severity": "error", "resource_types": None}
+    assert svc._target_accepts(target, _alert(severity="catastrophic")) is True
