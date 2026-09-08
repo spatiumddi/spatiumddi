@@ -24,6 +24,7 @@ import {
 } from "lucide-react";
 
 import {
+  applianceApi,
   applianceApprovalApi,
   applianceUpgradeImagesApi,
   authApi,
@@ -34,15 +35,25 @@ import {
   type ApplianceState,
   type ApplianceUpgradeStep,
   type ControlPlaneReplaceResult,
+  type StorageActionRequest,
+  type StorageActionResult,
   type SupervisorCapabilities,
   type UpgradeImage,
   formatApiError,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
+import { HeaderButton } from "@/components/ui/header-button";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { ReauthFields } from "@/components/ReauthFields";
 import { useSessionState } from "@/lib/useSessionState";
 import { cn } from "@/lib/utils";
+import {
+  formatEta,
+  formatMdLevel,
+  mpathChipLabel,
+  storageChipClass,
+  storageSeverityClass,
+} from "@/lib/storage-health";
 import { LLDPTab } from "./LLDPTab";
 import { AptTab } from "./AptTab";
 import { NTPTab } from "./NTPTab";
@@ -2579,6 +2590,8 @@ function ApplianceDrilldownModal({
             <ApplianceRoleHealthSection row={row} />
           )}
 
+        {row.state === "approved" && <ApplianceStorageSection row={row} />}
+
         {row.state === "approved" &&
           Object.keys(row.host_config_health ?? {}).length > 0 && (
             <ApplianceHostConfigHealthSection row={row} />
@@ -2860,6 +2873,461 @@ function ApplianceRoleHealthSection({ row }: { row: ApplianceRow }) {
           </tbody>
         </table>
       </div>
+    </div>
+  );
+}
+
+// #999 Part A — storage redundancy. Renders only when the supervisor
+// has actually reported arrays or multipath maps: an ordinary
+// single-disk appliance gains nothing, and a supervisor too old to
+// collect storage state gets no section rather than a green tick,
+// because "we never looked" is not "all clear".
+/**
+ * #999 Part B — the destructive-action modal.
+ *
+ * The device path has to be typed back, not a checkbox. A generic "yes"
+ * cannot catch the mistake that actually happens here: the operator
+ * meant one disk and clicked the row for the other. `mdadm --add`
+ * overwrites whatever it is given.
+ *
+ * The two actions that are REFUSED rather than confirmed (removing the
+ * last in-sync member, or the member the bootloader lives on) are not
+ * offered as a confirmation at all — the host runner refuses them, and
+ * this modal would be the wrong place to decide, because its view of the
+ * array is up to one heartbeat old.
+ */
+function StorageActionModal({
+  applianceId,
+  action,
+  array,
+  device,
+  onClose,
+}: {
+  applianceId: string;
+  action: StorageActionRequest["action"];
+  array: string | null;
+  device: string | null;
+  onClose: (changed: boolean) => void;
+}) {
+  // ``add_member`` names a device that is not in the array yet, so the
+  // operator supplies it here. Every other action already knows its
+  // device (it was clicked).
+  const needsDevicePick = action === "add_member" && !device;
+  const [picked, setPicked] = useState(device ?? "");
+  const effectiveDevice = needsDevicePick ? picked.trim() : (device ?? "");
+  const [typed, setTyped] = useState("");
+  const [result, setResult] = useState<StorageActionResult | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const destructive =
+    action === "fail_member" ||
+    action === "remove_member" ||
+    action === "add_member";
+  const needsDevice = action !== "scrub_start" && action !== "scrub_cancel";
+
+  const run = useMutation({
+    mutationFn: () =>
+      applianceApi.storageAction(applianceId, {
+        action,
+        array,
+        device: effectiveDevice || null,
+        confirm: destructive ? typed : undefined,
+      }),
+    onSuccess: (r) => {
+      setResult(r);
+      setError(null);
+    },
+    onError: (e: unknown) => {
+      // The FastAPI detail, not axios's "Request failed with status code
+      // 422" — which is what `err.message` always is and never what the
+      // operator needs (the #1009 lesson).
+      const ax = e as { response?: { data?: { detail?: string } } };
+      setError(ax.response?.data?.detail ?? "The action could not be run.");
+    },
+  });
+
+  const label: Record<string, string> = {
+    scrub_start: "Start a consistency scrub",
+    scrub_cancel: "Cancel the running scrub",
+    fail_member: "Mark this member failed",
+    remove_member: "Remove this member from the array",
+    add_member: "Add this device to the array",
+    mpath_reinstate: "Reinstate this path",
+  };
+
+  return (
+    <Modal
+      onClose={() => onClose(result?.ok === true)}
+      title={label[action] ?? action}
+    >
+      <div className="space-y-3 text-sm">
+        <dl className="grid grid-cols-[7rem_1fr] gap-1 text-xs">
+          {array && (
+            <>
+              <dt className="text-muted-foreground">Array</dt>
+              <dd className="font-mono break-all">{array}</dd>
+            </>
+          )}
+          {device && (
+            <>
+              <dt className="text-muted-foreground">Device</dt>
+              <dd className="font-mono break-all">{device}</dd>
+            </>
+          )}
+        </dl>
+
+        {needsDevicePick && !result && (
+          <label className="block text-xs">
+            <span className="text-muted-foreground">
+              Device to add (it will be erased)
+            </span>
+            <input
+              className="mt-1 w-full rounded-md border bg-background px-2 py-1 font-mono text-xs"
+              placeholder="/dev/sdc4"
+              value={picked}
+              onChange={(e) => setPicked(e.target.value)}
+              autoComplete="off"
+              spellCheck={false}
+            />
+          </label>
+        )}
+
+        {action === "add_member" && (
+          <p className="rounded-md border border-rose-500/40 bg-rose-500/10 px-2 py-1.5 text-xs text-rose-700 dark:text-rose-300">
+            This <strong>ERASES {effectiveDevice || "the device"}</strong>.
+            mdadm overwrites whatever device it is given.
+          </p>
+        )}
+        {(action === "fail_member" || action === "remove_member") && (
+          <p className="rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-1.5 text-xs text-amber-700 dark:text-amber-300">
+            The array loses this copy. Removing the last in-sync member, or the
+            one this appliance boots from, is refused by the node rather than
+            confirmed here — its view of the array is current and this
+            screen&apos;s is up to one heartbeat old.
+          </p>
+        )}
+
+        {destructive && !result && effectiveDevice && (
+          <label className="block text-xs">
+            <span className="text-muted-foreground">
+              Type <code className="font-mono">{effectiveDevice}</code> to
+              confirm
+            </span>
+            <input
+              className="mt-1 w-full rounded-md border bg-background px-2 py-1 font-mono text-xs"
+              value={typed}
+              onChange={(e) => setTyped(e.target.value)}
+              autoComplete="off"
+              spellCheck={false}
+            />
+          </label>
+        )}
+
+        {error && (
+          <p className="rounded-md border border-rose-500/40 bg-rose-500/10 px-2 py-1.5 text-xs text-rose-700 dark:text-rose-300">
+            {error}
+          </p>
+        )}
+        {result && (
+          <div
+            className={cn(
+              "rounded-md border px-2 py-1.5 text-xs",
+              result.ok
+                ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
+                : "border-rose-500/40 bg-rose-500/10 text-rose-700 dark:text-rose-300",
+            )}
+          >
+            {result.detail}
+            {result.output && (
+              <pre className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap font-mono text-[10px] opacity-80">
+                {result.output}
+              </pre>
+            )}
+          </div>
+        )}
+
+        <div className="flex justify-end gap-2 pt-1">
+          <HeaderButton
+            variant="secondary"
+            onClick={() => onClose(result?.ok === true)}
+          >
+            {result ? "Close" : "Cancel"}
+          </HeaderButton>
+          {!result && (
+            <HeaderButton
+              variant={destructive ? "destructive" : "primary"}
+              // Every action except the two scrub controls needs a
+              // device, and the destructive ones additionally need it
+              // typed back.
+              disabled={
+                run.isPending ||
+                (needsDevice && !effectiveDevice) ||
+                (destructive && typed !== effectiveDevice)
+              }
+              onClick={() => run.mutate()}
+            >
+              {run.isPending ? "Running…" : "Run"}
+            </HeaderButton>
+          )}
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+function ApplianceStorageSection({ row }: { row: ApplianceRow }) {
+  const qc = useQueryClient();
+  const [pending, setPending] = useState<{
+    action: StorageActionRequest["action"];
+    array: string | null;
+    device: string | null;
+  } | null>(null);
+  const storage = row.cluster_health?.storage;
+  const arrays = storage?.md_arrays ?? [];
+  const maps = storage?.multipath_maps ?? [];
+  if (!row.storage_reported || (arrays.length === 0 && maps.length === 0)) {
+    return null;
+  }
+  const findings = row.storage_findings ?? [];
+  const findingFor = (kind: string, name: string) =>
+    findings.find((f) => f.kind === kind && f.name === name) ?? null;
+
+  return (
+    <div className="border-t pt-4">
+      <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+        Storage redundancy
+      </h3>
+      <p className="mt-1 text-xs text-muted-foreground">
+        Read from the host&apos;s sysfs by the supervisor. A degraded mirror
+        keeps serving perfectly — which is exactly why it needs a screen: the
+        array state below is derived from member counts, not from the
+        kernel&apos;s own <code>array_state</code>, which reports{" "}
+        <code>clean</code> for a mirror down to its last disk.
+      </p>
+
+      {findings.length > 0 && (
+        <ul className="mt-2 space-y-1">
+          {findings.map((f, i) => (
+            <li
+              key={`${f.kind}-${f.name}-${i}`}
+              className={cn(
+                "rounded-md border px-2 py-1.5 text-[11px]",
+                storageSeverityClass(f.severity),
+              )}
+            >
+              {f.detail}
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {arrays.length > 0 && (
+        <div className="mt-2 overflow-hidden rounded-md border">
+          <table className="w-full text-xs">
+            <thead className="bg-muted/40 text-[10px] uppercase tracking-wide text-muted-foreground">
+              <tr>
+                <th className="px-3 py-1.5 text-left font-medium">Array</th>
+                <th className="px-3 py-1.5 text-left font-medium">Level</th>
+                <th className="px-3 py-1.5 text-left font-medium">State</th>
+                <th className="px-3 py-1.5 text-left font-medium">Members</th>
+                <th className="px-3 py-1.5 text-left font-medium">Progress</th>
+                <th className="px-3 py-1.5 text-left font-medium">Manage</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y">
+              {arrays.map((a) => (
+                <tr key={a.name}>
+                  <td className="px-3 py-1.5 font-mono">{a.name}</td>
+                  <td className="px-3 py-1.5">{formatMdLevel(a.level)}</td>
+                  <td className="px-3 py-1.5">
+                    <span
+                      className={cn(
+                        "inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-[10px] font-medium",
+                        storageChipClass(
+                          findingFor("md", a.name)?.severity ?? null,
+                          "md",
+                        ),
+                      )}
+                    >
+                      {a.state}
+                    </span>
+                  </td>
+                  <td className="px-3 py-1.5">
+                    <div className="text-muted-foreground">
+                      {a.members_in_sync} of {a.members_expected ?? "?"} in sync
+                      {a.members_faulty > 0 && ` · ${a.members_faulty} faulty`}
+                      {a.spares > 0 && ` · ${a.spares} spare`}
+                    </div>
+                    <div className="mt-0.5 flex flex-wrap gap-1">
+                      {a.members.map((m) => (
+                        <button
+                          key={m.device}
+                          type="button"
+                          className="rounded bg-muted px-1 font-mono text-[10px] hover:ring-1 hover:ring-ring"
+                          title={`${m.device}: ${m.state} — click to fail or remove it`}
+                          onClick={() =>
+                            setPending({
+                              // A member the kernel already calls faulty
+                              // is past failing; offer the next step.
+                              action: m.state.includes("faulty")
+                                ? "remove_member"
+                                : "fail_member",
+                              array: `/dev/${a.name}`,
+                              device: `/dev/${m.device}`,
+                            })
+                          }
+                        >
+                          {m.device}
+                          <span className="ml-1 opacity-70">{m.state}</span>
+                        </button>
+                      ))}
+                    </div>
+                  </td>
+                  <td className="px-3 py-1.5 text-muted-foreground">
+                    {a.sync
+                      ? `${a.sync.action}${
+                          a.sync.percent != null ? ` ${a.sync.percent}%` : ""
+                        }${
+                          a.sync.eta_seconds != null
+                            ? ` · ${formatEta(a.sync.eta_seconds)} left`
+                            : ""
+                        }`
+                      : "—"}
+                  </td>
+                  <td className="px-3 py-1.5">
+                    <div className="flex flex-wrap gap-1">
+                      <HeaderButton
+                        variant="secondary"
+                        onClick={() =>
+                          setPending({
+                            action: a.sync ? "scrub_cancel" : "scrub_start",
+                            array: `/dev/${a.name}`,
+                            device: null,
+                          })
+                        }
+                      >
+                        {a.sync ? "Cancel scrub" : "Scrub"}
+                      </HeaderButton>
+                      {/* Offered only when the array is SHORT a member.
+                          Adding to a complete array makes a hot spare,
+                          which is a different decision from replacing a
+                          failed disk and not what this screen is for. */}
+                      {a.members_expected != null &&
+                        a.members_in_sync < a.members_expected && (
+                          <HeaderButton
+                            variant="destructive"
+                            onClick={() =>
+                              setPending({
+                                action: "add_member",
+                                array: `/dev/${a.name}`,
+                                device: "",
+                              })
+                            }
+                          >
+                            Add member…
+                          </HeaderButton>
+                        )}
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {maps.length > 0 && (
+        <div className="mt-2 overflow-hidden rounded-md border">
+          <table className="w-full text-xs">
+            <thead className="bg-muted/40 text-[10px] uppercase tracking-wide text-muted-foreground">
+              <tr>
+                <th className="px-3 py-1.5 text-left font-medium">
+                  Multipath map
+                </th>
+                <th className="px-3 py-1.5 text-left font-medium">Paths</th>
+                <th className="px-3 py-1.5 text-left font-medium">Devices</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y">
+              {maps.map((m) => (
+                <tr key={m.dm_device}>
+                  <td className="px-3 py-1.5 font-mono">
+                    {m.name}
+                    <span className="ml-1 text-[10px] text-muted-foreground">
+                      {m.dm_device}
+                    </span>
+                  </td>
+                  <td className="px-3 py-1.5">
+                    <span
+                      className={cn(
+                        "inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-[10px] font-medium",
+                        storageChipClass(
+                          findingFor("multipath", m.name)?.severity ?? null,
+                          "multipath",
+                        ),
+                      )}
+                    >
+                      {mpathChipLabel(m)}
+                    </span>
+                  </td>
+                  <td className="px-3 py-1.5">
+                    <div className="flex flex-wrap gap-1">
+                      {m.paths.map((pth) => (
+                        <button
+                          key={pth.device}
+                          type="button"
+                          className="rounded bg-muted px-1 font-mono text-[10px] hover:ring-1 hover:ring-ring"
+                          title={
+                            (pth.device_state == null
+                              ? "This path reports no SCSI device state (an NVMe path has none)."
+                              : `SCSI device state: ${pth.device_state}`) +
+                            " Click to ask multipathd to reinstate it."
+                          }
+                          onClick={() =>
+                            setPending({
+                              action: "mpath_reinstate",
+                              array: null,
+                              device: `/dev/${pth.device}`,
+                            })
+                          }
+                        >
+                          {pth.device}
+                          <span className="ml-1 opacity-70">
+                            {pth.device_state ?? "state unknown"}
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <p className="border-t bg-muted/20 px-3 py-1.5 text-[10px] text-muted-foreground">
+            Per-path state is the SCSI device&apos;s, not dm-multipath&apos;s —
+            dm&apos;s own verdict needs <code>multipathd</code>. A path listed
+            here is present, not necessarily in use.
+          </p>
+        </div>
+      )}
+
+      {pending && (
+        <StorageActionModal
+          applianceId={row.id}
+          action={pending.action}
+          array={pending.array}
+          device={pending.device}
+          onClose={(changed) => {
+            setPending(null);
+            // Only on a real change: this block reads the appliance
+            // row's cluster_health, which the supervisor refreshes on
+            // its next heartbeat, so an unconditional invalidate would
+            // just repaint the same stale numbers.
+            if (changed) {
+              void qc.invalidateQueries({ queryKey: ["appliance", "fleet"] });
+            }
+          }}
+        />
+      )}
     </div>
   );
 }

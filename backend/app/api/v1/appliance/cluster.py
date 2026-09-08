@@ -36,6 +36,7 @@ from app.db import AsyncSessionLocal
 from app.models.appliance import APPLIANCE_STATE_APPROVED, Appliance
 from app.services.appliance import k8s
 from app.services.appliance.cluster_health import cluster_unavailable, get_cluster_health
+from app.services.appliance.storage_health import evaluate_storage, worst_severity
 
 logger = structlog.get_logger(__name__)
 
@@ -52,6 +53,113 @@ class HostPartition(BaseModel):
     label: str
     total_bytes: int
     used_bytes: int
+
+
+# ── #999 Part A — storage redundancy, as reported by the supervisor ──
+
+
+class MdMember(BaseModel):
+    device: str
+    #: The kernel's own comma-joined member state (``in_sync`` /
+    #: ``faulty`` / ``spare`` / ``write_mostly`` / …), verbatim rather
+    #: than collapsed — "faulty" and "spare" call for opposite actions.
+    state: str
+    slot: int | None = None
+
+
+class MdSync(BaseModel):
+    """A rebuild / resync / scrub in progress. Absent when idle."""
+
+    action: str
+    percent: float | None = None
+    eta_seconds: int | None = None
+
+
+class MdArray(BaseModel):
+    name: str
+    level: str
+    #: DERIVED, not copied from the kernel: a raid1 down to one member
+    #: reports ``array_state=clean`` because the survivor is internally
+    #: consistent, and reporting that verbatim would show a single point
+    #: of failure as healthy. ``unknown`` when the member count could not
+    #: be read, which is never to be rendered as healthy either.
+    state: str
+    array_state: str
+    #: ``None`` when ``raid_disks`` was unreadable — never 0, which would
+    #: make every degradation test false and drop the array through to
+    #: "clean". ``state`` is ``unknown`` in that case.
+    members_expected: int | None = None
+    members_in_sync: int
+    members_faulty: int
+    spares: int
+    #: How many more members can be lost before the array stops serving.
+    #: This — not ``state`` — is what decides alert severity.
+    redundancy_remaining: int | None = None
+    min_working_members: int | None = None
+    size_bytes: int | None = None
+    members: list[MdMember] = []
+    sync: MdSync | None = None
+
+
+class MultipathPath(BaseModel):
+    device: str
+    #: dm-multipath's own verdict, which needs the device-mapper ioctl
+    #: (``multipathd show topology``) — Part B tooling. Always
+    #: ``unknown`` here; a fabricated ``active`` would turn a missing
+    #: reading into a false all-clear.
+    state: str
+    #: The path's SCSI device state (``running`` / ``offline`` /
+    #: ``blocked``), which sysfs does answer. ``None`` on a path that
+    #: has none (an NVMe path).
+    device_state: str | None = None
+
+
+class MultipathMap(BaseModel):
+    name: str
+    dm_device: str
+    uuid: str
+    paths_total: int
+    #: Paths whose SCSI device reports a DEFINITE fault. Counted the
+    #: negative way round so an unreadable path never inflates a clean
+    #: bill of health.
+    paths_faulted: int
+    size_bytes: int | None = None
+    paths: list[MultipathPath] = []
+
+
+class StorageFindingOut(BaseModel):
+    """One classified thing worth saying about a node's redundancy."""
+
+    severity: str
+    kind: str
+    name: str
+    detail: str
+
+
+class NodeStorage(BaseModel):
+    """One node's storage-redundancy snapshot (#999 Part A).
+
+    ``md_supported`` separates "the kernel has no md support" from "md
+    is loaded and there are no arrays" — both produce an empty
+    ``md_arrays``, and only the first means the reading is unavailable.
+
+    ``findings`` is derived server-side by
+    ``services/appliance/storage_health.evaluate_storage`` rather than
+    left to each caller: the same function backs the
+    ``appliance_storage_degraded`` alert and the ``find_appliance_storage``
+    copilot tool, so a chip in the browser cannot say "clean" while the
+    alert says "degraded". Re-deriving it in TypeScript would be a second
+    copy of the rule, and the rule — severity from redundancy remaining,
+    not from the state string — is the whole subtlety.
+    """
+
+    md_supported: bool = False
+    md_arrays: list[MdArray] = []
+    multipath_maps: list[MultipathMap] = []
+    findings: list[StorageFindingOut] = []
+    #: Worst severity among ``findings``; ``None`` when there is nothing
+    #: to say.
+    worst_severity: str | None = None
 
 
 class PSIWindow(BaseModel):
@@ -141,6 +249,11 @@ class NodeVitals(BaseModel):
     psi_io: PSIStats | None = None
     # #402 — host partitions (root slot / var / ESP) from the supervisor.
     host_disk_partitions: list[HostPartition] = []
+    # #999 Part A — md arrays + multipath maps from the supervisor.
+    # ``None`` means the supervisor has not reported storage at all (too
+    # old to collect it), which is UNKNOWN and must never render as a
+    # green tick. An empty snapshot is a real "nothing here" reading.
+    host_storage: NodeStorage | None = None
 
 
 class PodSummary(BaseModel):
@@ -234,12 +347,19 @@ class ClusterHealth(BaseModel):
     top_pods_mem: list[PodSummary]
 
 
-async def _merge_host_partitions(db: AsyncSession, snap: dict[str, Any]) -> None:
-    """Attach supervisor-reported host partitions to each node in ``snap``.
+async def _merge_supervisor_host_state(db: AsyncSession, snap: dict[str, Any]) -> None:
+    """Attach supervisor-reported host state to each node in ``snap``.
 
-    The api pod is a container and can't see host partitions — the supervisor
-    statvfs's them and ships them inside its ``cluster_health`` JSONB (#402).
-    We match by hostname == kube node name. Mutates ``snap`` in place.
+    The api pod is a container and can't see the host's disks — the
+    supervisor statvfs's the partitions (#402) and reads md / multipath
+    state out of the host's sysfs (#999 Part A), shipping both inside its
+    ``cluster_health`` JSONB. We match by hostname == kube node name.
+    Mutates ``snap`` in place.
+
+    Storage is attached whenever the key is PRESENT, including when it
+    reports no arrays: an empty snapshot is what clears a torn-down array
+    off the screen, whereas a missing key means the supervisor is too old
+    to have looked and the node's ``host_storage`` stays ``None``.
     """
     if not snap.get("available") or not snap.get("nodes"):
         return
@@ -251,14 +371,33 @@ async def _merge_host_partitions(db: AsyncSession, snap: dict[str, Any]) -> None
         )
     ).all()
     pmap: dict[str, list[dict[str, Any]]] = {}
+    smap: dict[str, dict[str, Any]] = {}
     for hostname, ch in rows:
-        if hostname and isinstance(ch, dict):
-            parts = ch.get("host_disk_partitions")
-            if isinstance(parts, list) and parts:
-                pmap[hostname] = parts
+        if not hostname or not isinstance(ch, dict):
+            continue
+        parts = ch.get("host_disk_partitions")
+        if isinstance(parts, list) and parts:
+            pmap[hostname] = parts
+        storage = ch.get("storage")
+        if isinstance(storage, dict):
+            smap[hostname] = storage
     for node in snap["nodes"]:
         if node["name"] in pmap:
             node["host_disk_partitions"] = pmap[node["name"]]
+        if node["name"] in smap:
+            storage = dict(smap[node["name"]])
+            findings = evaluate_storage(storage)
+            storage["findings"] = [
+                {
+                    "severity": f.severity,
+                    "kind": f.kind,
+                    "name": f.name,
+                    "detail": f.detail,
+                }
+                for f in findings
+            ]
+            storage["worst_severity"] = worst_severity(findings)
+            node["host_storage"] = storage
 
 
 @router.get(
@@ -280,7 +419,7 @@ async def cluster_health(db: DB) -> ClusterHealth:
             status.HTTP_503_SERVICE_UNAVAILABLE,
             "kubeapi unreachable from api; retry shortly.",
         ) from exc
-    await _merge_host_partitions(db, snap)
+    await _merge_supervisor_host_state(db, snap)
     return ClusterHealth(**snap)
 
 
@@ -312,7 +451,7 @@ async def cluster_health_stream(request: Request) -> StreamingResponse:
                 # Short-lived session per tick (don't hold a connection open
                 # for the whole stream); cheap single-row-per-node lookup.
                 async with AsyncSessionLocal() as db:
-                    await _merge_host_partitions(db, snap)
+                    await _merge_supervisor_host_state(db, snap)
             except k8s.KubeapiUnavailableError as exc:
                 # Log detail server-side; keep the client-facing reason generic
                 # so an exception message can't leak internals to the browser

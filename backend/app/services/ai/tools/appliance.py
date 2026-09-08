@@ -222,6 +222,210 @@ async def find_appliance_fleet(
     }
 
 
+# ── find_appliance_storage ─────────────────────────────────────────
+
+
+class FindApplianceStorageArgs(BaseModel):
+    degraded_only: bool = Field(
+        default=True,
+        description=(
+            "Return only appliances with a storage finding (degraded / "
+            "failed array, or a multipath map short of paths). Set false "
+            "to list every appliance's storage, including healthy ones "
+            "and ones with no arrays at all."
+        ),
+    )
+    limit: int = Field(default=50, ge=1, le=200)
+
+
+@register_tool(
+    name="find_appliance_storage",
+    description=(
+        "Report software-RAID (md) and multipath storage redundancy "
+        "across the appliance fleet (superadmin only, #999). Each row "
+        "carries the arrays and multipath maps the node's supervisor "
+        "read out of the host's sysfs, plus classified findings with a "
+        "severity that keys off REDUNDANCY REMAINING — '2 of 3 members' "
+        "in a three-way mirror and '1 of 2' in a pair both report "
+        "'degraded', and only the second has nothing left to lose. Use "
+        "to answer 'is anything degraded across the fleet?', 'is the "
+        "rebuild on ddi1 finished?', or 'which boxes are actually "
+        "mirrored?'. IMPORTANT: with the default degraded_only=true, an "
+        "appliance missing from `appliances` is NOT necessarily healthy "
+        "— it may simply never have reported storage. Every result "
+        "therefore carries `not_reporting` (hostnames whose supervisor "
+        "has not reported storage at all, whatever the filter) and "
+        "`not_reporting_count`; say so rather than reading absence as "
+        "health. Pass degraded_only=false to list every appliance, "
+        "including healthy ones and ones with no arrays. A quiet "
+        "multipath map is also not proof of health: per-path state needs "
+        "multipathd, which the appliance image does not ship. Read-only."
+    ),
+    args_model=FindApplianceStorageArgs,
+    category="admin",
+    default_enabled=True,
+)
+async def find_appliance_storage(
+    db: AsyncSession, user: User, args: FindApplianceStorageArgs
+) -> dict[str, Any]:
+    if (err := _superadmin_gate(user)) is not None:
+        return err
+
+    from app.services.appliance.storage_health import (  # noqa: PLC0415
+        evaluate_storage,
+        worst_severity,
+    )
+
+    stmt = select(Appliance).where(Appliance.revoked_at.is_(None)).order_by(Appliance.hostname)
+    rows = list((await db.execute(stmt)).scalars().all())
+
+    out: list[dict[str, Any]] = []
+    # Tracked regardless of ``degraded_only``: an appliance filtered out
+    # of the list because it has no findings, and one filtered out
+    # because nobody ever looked, are the same absence to a reader —
+    # and the second one is the case where a degraded array hides.
+    not_reporting: list[str] = []
+    for row in rows:
+        ch = row.cluster_health if isinstance(row.cluster_health, dict) else {}
+        raw = ch.get("storage")
+        reported = isinstance(raw, dict)
+        if not reported:
+            not_reporting.append(row.hostname)
+        storage: dict[str, Any] = raw if reported else {}
+        findings = evaluate_storage(storage if reported else None)
+        if args.degraded_only and not findings:
+            continue
+        out.append(
+            {
+                "appliance_id": str(row.id),
+                "hostname": row.hostname,
+                "state": row.state,
+                # False means the supervisor never looked (too old to
+                # collect it) — distinct from "looked and found nothing".
+                "reported": reported,
+                # None, not False: an unreported node has no md verdict
+                # either way, and False would read as "md is unavailable".
+                "md_supported": storage.get("md_supported") if reported else None,
+                "md_arrays": storage.get("md_arrays") or [],
+                "multipath_maps": storage.get("multipath_maps") or [],
+                "worst_severity": worst_severity(findings),
+                "findings": [
+                    {
+                        "severity": f.severity,
+                        "kind": f.kind,
+                        "name": f.name,
+                        "detail": f.detail,
+                    }
+                    for f in findings
+                ],
+            }
+        )
+    out = out[: args.limit]
+    return {
+        "appliances": out,
+        "count": len(out),
+        # UNKNOWN, never a clean bill of health — see the tool
+        # description. Reported even when ``degraded_only`` filtered
+        # these rows out of ``appliances``.
+        "not_reporting": not_reporting,
+        "not_reporting_count": len(not_reporting),
+    }
+
+
+# ── propose_storage_action ─────────────────────────────────────────
+
+
+class ProposeStorageActionArgs(BaseModel):
+    appliance_id: str = Field(
+        description="UUID of the appliance. Use find_appliance_storage to discover it."
+    )
+    action: Literal[
+        "scrub_start",
+        "scrub_cancel",
+        "fail_member",
+        "remove_member",
+        "add_member",
+        "mpath_reinstate",
+    ] = Field(description="The management action to propose.")
+    array: str | None = Field(
+        default=None,
+        description="The md array, e.g. /dev/md/root_a. Required for every action except mpath_reinstate.",
+    )
+    device: str | None = Field(
+        default=None,
+        description="The member or path device, e.g. /dev/sdb4. Required for fail/remove/add and mpath_reinstate.",
+    )
+
+
+@register_tool(
+    name="propose_storage_action",
+    description=(
+        "Propose an md / multipath management action on an appliance "
+        "(superadmin only, #999 Part B) — fail or remove an array "
+        "member, add a replacement, start or cancel a consistency "
+        "scrub, or reinstate a downed multipath path. Returns a "
+        "PROPOSAL for a human to approve; it never executes anything. "
+        "Adding a member ERASES that device, and the approving human "
+        "must type the device path back before it runs. Removing the "
+        "last in-sync member, or the member the bootloader lives on, is "
+        "REFUSED outright rather than confirmed — there would be no "
+        "array left to inspect in the first case, and in the second the "
+        "array stays green while the machine silently stops booting."
+    ),
+    args_model=ProposeStorageActionArgs,
+    category="admin",
+    # Default OFF per non-negotiable #13's stated exception: these are
+    # broad-blast-radius writes that overwrite disks, and the safety of
+    # the destructive ones rests on a human reading what is about to
+    # happen and typing a device path back — none of which survives being
+    # driven from a chat window.
+    default_enabled=False,
+)
+async def propose_storage_action(
+    db: AsyncSession, user: User, args: ProposeStorageActionArgs
+) -> dict[str, Any]:
+    if (err := _superadmin_gate(user)) is not None:
+        return err
+
+    from app.services.appliance.storage_actions import (  # noqa: PLC0415
+        DESTRUCTIVE,
+        ActionRefused,
+        summarize,
+        validate_action,
+    )
+
+    try:
+        appliance_uuid = uuid.UUID(args.appliance_id)
+    except (ValueError, AttributeError):
+        return {"error": f"{args.appliance_id!r} is not a valid appliance UUID."}
+    row = await db.get(Appliance, appliance_uuid)
+    if row is None:
+        return {"error": f"No appliance with id {args.appliance_id}."}
+
+    try:
+        # Validated with the confirmation PRE-SUPPLIED so the shape check
+        # runs; the real confirmation is typed by the human approving the
+        # proposal, against the REST endpoint.
+        validate_action(args.action, array=args.array, device=args.device, confirm=args.device)
+    except ActionRefused as exc:
+        return {"error": str(exc)}
+
+    summary = summarize(args.action, args.array, args.device)
+    return {
+        "kind": "proposal",
+        "operation": "appliance_storage_action",
+        "appliance_id": str(row.id),
+        "hostname": row.hostname,
+        "destructive": args.action in DESTRUCTIVE,
+        "preview_text": f"On {row.hostname}: {summary}.",
+        "how_to_apply": (
+            "POST /api/v1/appliance/appliances/{id}/storage/action with "
+            "{action, array, device, confirm}. Destructive actions require "
+            "'confirm' to equal the device path exactly."
+        ),
+    }
+
+
 # ── find_control_plane_vip ─────────────────────────────────────────
 
 
@@ -855,6 +1059,8 @@ async def propose_assign_role(
 __all__ = [
     "find_pending_appliances",
     "find_appliance_fleet",
+    "find_appliance_storage",
+    "propose_storage_action",
     "find_upgrade_images",
     "find_available_upgrade_images",
     "propose_approve_appliance",

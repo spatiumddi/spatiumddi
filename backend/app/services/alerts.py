@@ -247,6 +247,27 @@ RULE_TYPE_NODE_PRESSURE = "node_pressure"
 #     kube-proxy or the CNI rather than at CoreDNS.
 RULE_TYPE_CLUSTER_DNS_DEGRADED = "cluster_dns_degraded"
 
+# Issue #999 Part A — storage redundancy. Subject = appliance.
+#
+# The alarm the appliance has never had, and the reason #999 ships
+# monitoring BEFORE it ships the ability to install onto a mirror: a
+# mirrored root with no degraded-array alarm is a mirror that silently
+# becomes a single disk. The operator pays for two disks, the array loses
+# a member at 03:00, and the box keeps serving perfectly until the
+# survivor dies — strictly worse than never mirroring, because it
+# displaced the backup discipline they would otherwise have kept.
+#
+# Severity is decided per finding by ``evaluate_storage`` and keys off
+# REDUNDANCY REMAINING rather than off the state string: ``2 of 3`` in a
+# three-way mirror and ``1 of 2`` in a pair both report "degraded", and
+# only the second has nothing left to lose. The rule's own severity is
+# just the floor.
+#
+# Silent where the reading does not exist — a supervisor too old to
+# collect storage state ships no ``storage`` key, and that is UNKNOWN,
+# not a clean bill of health.
+RULE_TYPE_APPLIANCE_STORAGE_DEGRADED = "appliance_storage_degraded"
+
 
 class AlertDataUnavailable(Exception):
     """A rule could not be evaluated because its input is temporarily gone.
@@ -269,6 +290,7 @@ class AlertDataUnavailable(Exception):
 _NODE_PRESSURE_FULL_CRITICAL_PCT = 1.0
 _NODE_PRESSURE_RULE_NAME = "Node under sustained resource pressure"
 _CLUSTER_DNS_RULE_NAME = "Cluster DNS degraded"
+_APPLIANCE_STORAGE_RULE_NAME = "Appliance storage redundancy degraded"
 
 
 # Issue #46 — planned-decommission awareness. Subject = subnet. Fires
@@ -498,6 +520,7 @@ RULE_TYPES = frozenset(
         RULE_TYPE_AGENT_CONFIG_REJECTED,
         RULE_TYPE_NODE_PRESSURE,
         RULE_TYPE_CLUSTER_DNS_DEGRADED,
+        RULE_TYPE_APPLIANCE_STORAGE_DEGRADED,
         RULE_TYPE_DECOM_EXPIRING,
         RULE_TYPE_DNS_NXDOMAIN_SPIKE,
         RULE_TYPE_DNS_QUERY_RATE_SPIKE,
@@ -3408,6 +3431,128 @@ async def _matching_firewall_apply_stalled_subjects(
     return matches
 
 
+async def _matching_appliance_storage_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+) -> list[tuple[str, str, str, str]]:
+    """Return ``[(subject_id, display, message, severity)]`` for appliances
+    whose storage redundancy is degraded (#999 Part A).
+
+    Reads the ``storage`` block the supervisor folds into its
+    ``cluster_health`` JSONB and classifies it through
+    ``services/appliance/storage_health.evaluate_storage`` — the same
+    function the ``find_appliance_storage`` copilot tool and the Cluster
+    screen's chip derive from, so an operator can never be told two
+    different things about one array.
+
+    Silent on three groups, each for its own reason:
+
+    * **Revoked appliances** — a decommissioned box's array is not an
+      operational problem, matching ``secret_expiring``'s treatment of
+      revoked rows.
+    * **Supervisors too old to report** — no ``storage`` key at all is
+      UNKNOWN. Firing would be a guess; treating it as healthy would be
+      a lie. It is simply not a match.
+    * **Nodes with no arrays and no multipath** — the ordinary
+      single-disk appliance, which reports an empty snapshot.
+
+    **A reading that DISAPPEARS is handled differently from one that was
+    never there**, and this is the subtle half. ``evaluate_all``
+    resolves every open event whose subject is absent from a pass, so
+    "not a match" means "recovered". An A/B slot rollback to a
+    pre-#999 supervisor would therefore auto-resolve a live critical
+    degraded-array event — announcing a recovery that did not happen, on
+    a node whose mirror is still one disk from data loss. So an
+    appliance that has an OPEN event for this rule and no current
+    reading is re-matched at its existing severity, which the caller
+    treats as a complete no-op (it never downgrades and never
+    re-delivers on an unchanged severity) and which keeps the event
+    standing until a real reading decides. That is per-subject what
+    ``AlertDataUnavailable`` is per-rule; raising instead would make the
+    whole rule inert across the fleet for as long as one old supervisor
+    exists.
+
+    One event per appliance rather than per array: the subject is the
+    box, and an operator dealing with two degraded arrays on one node is
+    dealing with one node. The message names every finding, worst first.
+    """
+    from app.models.alerts import AlertEvent  # noqa: PLC0415
+    from app.models.appliance import (  # noqa: PLC0415
+        APPLIANCE_STATE_APPROVED,
+        Appliance,
+    )
+    from app.services.appliance.storage_health import (  # noqa: PLC0415
+        evaluate_storage,
+        worst_severity,
+    )
+
+    rows = list(
+        (
+            await db.execute(
+                select(Appliance).where(
+                    Appliance.revoked_at.is_(None),
+                    Appliance.state == APPLIANCE_STATE_APPROVED,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    open_severity_by_subject: dict[str, str] = {
+        ev.subject_id: ev.severity
+        for ev in (
+            await db.execute(
+                select(AlertEvent).where(
+                    AlertEvent.rule_id == rule.id,
+                    AlertEvent.resolved_at.is_(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    }
+
+    matches: list[tuple[str, str, str, str]] = []
+    for a in rows:
+        subject_id = str(a.id)
+        ch = a.cluster_health if isinstance(a.cluster_health, dict) else {}
+        storage = ch.get("storage")
+        if not isinstance(storage, dict):
+            held = open_severity_by_subject.get(subject_id)
+            if held is None:
+                continue  # never reported — UNKNOWN, not healthy, not an alarm
+            # Had a reading, lost it. Hold the open event rather than
+            # resolving it into a false recovery.
+            matches.append(
+                (
+                    subject_id,
+                    a.hostname,
+                    f"Storage on {a.hostname} can no longer be read — the "
+                    "supervisor has stopped reporting array state (it may have "
+                    "been rolled back to a slot that predates storage "
+                    "monitoring). The last known state is left standing "
+                    "because unknown is not recovered.",
+                    held,
+                )
+            )
+            continue
+        findings = evaluate_storage(storage)
+        if not findings:
+            continue
+        severity = worst_severity(findings) or rule.severity
+        detail = " ".join(f.detail for f in findings)
+        matches.append(
+            (
+                subject_id,
+                a.hostname,
+                f"Storage on {a.hostname}: {detail}",
+                severity,
+            )
+        )
+    return matches
+
+
 async def _evaluate_circuit_status_changed_rule(
     db: AsyncSession,
     rule: AlertRule,
@@ -4198,6 +4343,59 @@ async def seed_cluster_dns_alert_rule() -> None:
                     "Auto-resolves when cluster DNS recovers."
                 ),
                 rule_type=RULE_TYPE_CLUSTER_DNS_DEGRADED,
+                severity="warning",
+                enabled=True,
+            )
+        )
+        await session.commit()
+
+
+async def seed_appliance_storage_alert_rule() -> None:
+    """Seed the #999 Part A rule, ENABLED by default.
+
+    Safe on everywhere for the same reason as ``cluster_dns_degraded``:
+    it needs no configuration and cannot fire where the reading does not
+    exist. A supervisor too old to collect storage state ships no
+    ``storage`` key and is skipped; an ordinary single-disk appliance
+    reports an empty snapshot and is skipped. So enabling it on upgrade
+    day is silent until somebody actually builds an array — which is the
+    point, because the day they do is the day the silence starts costing
+    them.
+
+    Severity is decided by the matcher per finding, not by the rule, so
+    the rule's own severity is only the floor. Keyed on ``name``; an
+    operator who disables or renames it is never overridden.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    async with AsyncSessionLocal() as session:
+        existing = await session.scalar(
+            select(AlertRule).where(AlertRule.name == _APPLIANCE_STORAGE_RULE_NAME)
+        )
+        if existing is not None:
+            return
+        session.add(
+            AlertRule(
+                name=_APPLIANCE_STORAGE_RULE_NAME,
+                description=(
+                    "Fires when an appliance's software RAID array or multipath "
+                    "map loses redundancy. A mirror nobody watches silently "
+                    "becomes a single disk: the array drops a member, the box "
+                    "keeps serving perfectly, and the operator finds out when "
+                    "the survivor dies. Critical when an array is running on the "
+                    "last members it needs or a LUN is down to one path; warning "
+                    "when redundancy is reduced but a further failure is still "
+                    "survivable, or when an assembled array will not report its "
+                    "member count. A routine scrub or resync on an intact array "
+                    "is shown on the dashboards with its progress and is "
+                    "deliberately NOT an event — a monthly checkarray cron would "
+                    "otherwise notify every operator with an array, every month, "
+                    "about their array working correctly. Silent on appliances "
+                    "with no arrays and on supervisors too old to report storage "
+                    "state. Auto-resolves when redundancy is restored."
+                ),
+                rule_type=RULE_TYPE_APPLIANCE_STORAGE_DEGRADED,
                 severity="warning",
                 enabled=True,
             )
@@ -5486,6 +5684,10 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 # tables. Without the prefix a dns_server and a dhcp_server
                 # sharing a UUID would collide into one event.
                 subject_type = "agent"
+            elif rule.rule_type == RULE_TYPE_APPLIANCE_STORAGE_DEGRADED:
+                storage_hits = await _matching_appliance_storage_subjects(db, rule)
+                matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in storage_hits]
+                subject_type = "appliance"
             elif rule.rule_type == RULE_TYPE_FIREWALL_APPLY_STALLED:
                 stalled = await _matching_firewall_apply_stalled_subjects(db, rule, now)
                 matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in stalled]

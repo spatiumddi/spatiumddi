@@ -118,11 +118,49 @@ def discover_live_uuids() -> dict[str, str]:
 
     def walk(node: dict) -> None:
         partlabel = (node.get("partlabel") or "").lower()
-        if partlabel in SLOT_PARTLABELS:
-            uuid = node.get("uuid") or ""
-            if uuid:
+        fstype = (node.get("fstype") or "").lower()
+        uuid = node.get("uuid") or ""
+        children = node.get("children") or []
+
+        if partlabel in SLOT_PARTLABELS and uuid:
+            # #999 — on a MIRRORED install the slot partition is not the
+            # filesystem, it is an md member, and its UUID is the ARRAY's
+            # UUID. Writing that into grub.cfg produces a menu whose
+            # `search --fs-uuid` matches nothing:
+            #
+            #   error: no such device: 8b4aa553-…
+            #   error: file '/boot/vmlinuz' not found.
+            #
+            # ...which is an UNBOOTABLE appliance, and it does not appear
+            # at install time — the installer passes the correct UUIDs
+            # explicitly. It appears on FIRST BOOT, when the #395
+            # host-migration re-render calls this function with no
+            # arguments and silently overwrites a working menu. Observed
+            # exactly that way on a live mirrored box.
+            #
+            # The filesystem is on the md CHILD, so descend to it.
+            if fstype == "linux_raid_member":
+                for child in children:
+                    child_uuid = child.get("uuid") or ""
+                    child_fs = (child.get("fstype") or "").lower()
+                    if child_uuid and child_fs not in ("", "linux_raid_member"):
+                        uuids[partlabel] = child_uuid
+                        break
+            else:
                 uuids[partlabel] = uuid
-        for child in node.get("children") or []:
+
+        # A belt-and-braces second route, and on a mirror it is the one
+        # that is unambiguous: mkfs stamped the FILESYSTEM label onto
+        # whatever holds the filesystem (the partition on a single disk,
+        # the array on a mirror), so a node carrying it is by definition
+        # the thing whose UUID grub must search for. Only fills a slot
+        # the partlabel walk did not.
+        label = (node.get("label") or "").lower()
+        if label in SLOT_PARTLABELS and uuid and label not in uuids:
+            if fstype not in ("", "linux_raid_member"):
+                uuids[label] = uuid
+
+        for child in children:
             walk(child)
 
     for top in data.get("blockdevices") or []:
@@ -266,6 +304,25 @@ def render_text(uuid_a: str, uuid_b: str,
         "insmod ext2",
         "insmod ext4",
         "insmod search_fs_uuid",
+        # #999 Part C2 — a mirrored install puts BOTH slot roots on
+        # /dev/md/root_*, and grub reaches them with `search --fs-uuid`
+        # + `linux /boot/vmlinuz` below. Without these two modules GRUB
+        # cannot see an md array at all, so it never finds the root
+        # filesystem and a mirrored install does not boot — the whole
+        # feature, dead, with a perfectly healthy array underneath.
+        #
+        # Emitted UNCONDITIONALLY rather than behind a "is this
+        # mirrored?" flag: grub-install copies its entire module
+        # directory onto the ESP, so `insmod` of an unused module is a
+        # no-op on a single-disk box, and a conditional here is one more
+        # thing that can be wrong in exactly the case nobody tests.
+        #
+        # The ESP itself is NOT on the array (firmware reads it before
+        # any md driver exists), so BIOS core.img needs only part_gpt +
+        # fat to reach this file — which is why the modules can live
+        # here rather than having to be embedded.
+        "insmod diskfilter",
+        "insmod mdraid1x",
         "",
         f'menuentry "{title_a}" --id=slot_a {{',
         f"    search --no-floppy --fs-uuid --set=root {uuid_a}",
@@ -490,7 +547,40 @@ def main(argv: list[str] | None = None) -> int:
         vers.get("slot_a"),
         vers.get("slot_b"),
     )
-    return write_atomic(GRUB_CFG, text)
+    rc = write_atomic(GRUB_CFG, text)
+    if rc == 0:
+        _sync_mirror_esp()
+    return rc
+
+
+def _sync_mirror_esp() -> None:
+    """Push the freshly-rendered menu onto the mirror member's ESP
+    (#999 Part C2).
+
+    grub.cfg lives on the ESP, which cannot be an md member — firmware
+    reads it before any md driver exists — so a mirrored install has two
+    independent ESPs and nothing in the kernel keeps them in step. This
+    renderer is one of the writers (the #395 host-migration re-render
+    reaches it without going through spatium-upgrade-slot), so without
+    this call a re-render leaves the second ESP holding the previous
+    menu — pointing at a slot UUID that may no longer be right.
+
+    A no-op on a single-disk appliance, and never fatal: the primary's
+    menu is already written and correct by this point.
+    """
+    try:
+        rc = subprocess.run(
+            ["/usr/local/bin/spatiumddi-esp-sync"], check=False
+        ).returncode
+    except OSError as exc:
+        print(f"WARN: could not run spatiumddi-esp-sync: {exc}", file=sys.stderr)
+        return
+    if rc != 0:
+        print(
+            "WARN: the mirror member's ESP was NOT updated — it holds the "
+            "previous boot menu.",
+            file=sys.stderr,
+        )
 
 
 if __name__ == "__main__":

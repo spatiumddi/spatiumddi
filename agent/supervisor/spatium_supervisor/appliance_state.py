@@ -2882,6 +2882,344 @@ def read_host_disk_partitions() -> list[dict[str, object]]:
     return out
 
 
+# ── Issue #999 Part A — storage redundancy telemetry ──────────────────
+#
+# Reported INSIDE the cluster_health dict, exactly like the #402 host
+# partitions above: the backend stores that dict verbatim to
+# appliance.cluster_health (JSONB), so this needs no new heartbeat
+# field, no column and no migration.
+#
+# Why monitoring ships BEFORE the install support (#999 Parts B + C):
+# a mirrored root with no degraded-array alarm is a mirror that
+# silently becomes a single disk. The operator pays for two disks, the
+# array loses a member at 03:00, nothing says so, and the appliance
+# keeps serving perfectly until the survivor dies — strictly worse
+# than never mirroring, because it displaced the backup discipline
+# they would otherwise have kept. So the alarm is a precondition for
+# offering the capability, not a follow-on to it.
+#
+# The reads are the HOST's. /sys is never PID- or mount-namespaced and
+# the supervisor DaemonSet runs ``privileged: true`` + ``hostPID:
+# true``, so /proc is the host's too — which is not a new assumption
+# here: ``_current_slot_from_cmdline()`` has read the host's
+# /proc/cmdline through the same window since #170, and
+# ``heartbeat.py`` already reads /sys/block/*/queue/rotational.
+_PROC_MDSTAT = Path("/proc/mdstat")
+_SYS_BLOCK = Path("/sys/block")
+
+# How many members a level can lose and still serve. Used to turn a
+# member count into "redundancy remaining", which is what decides the
+# alert severity: 2-of-3 in a three-way mirror and 1-of-2 in a pair
+# both report "degraded", and only the second one is an emergency.
+#
+# raid10 is deliberately pessimistic. A 4-disk raid10 survives two
+# failures if they land in different mirror pairs and one if they do
+# not, and sysfs does not say which member sits in which pair — so the
+# GUARANTEED tolerance is 1, and an alarm should be sized to the
+# guarantee rather than to the lucky case.
+# md ``level`` values that are not a redundancy group at all. A
+# ``container`` is the IMSM / DDF metadata holder that real arrays are
+# built inside; it is permanently ``inactive`` with ``raid_disks=0``.
+_NON_ARRAY_LEVELS = frozenset({"container"})
+
+
+def _min_working_members(level: str, total: int) -> int:
+    """Fewest in-sync members this array can serve on."""
+    if level == "raid1":
+        return 1
+    if level in ("raid4", "raid5"):
+        return max(total - 1, 1)
+    if level == "raid6":
+        return max(total - 2, 1)
+    if level == "raid10":
+        return max(total - 1, 1)
+    # raid0 / linear / anything unrecognised: assume no redundancy, so
+    # every member is load-bearing. Guessing generously here would
+    # under-report a real emergency.
+    return total
+
+
+def _read_sysfs(path: Path) -> str | None:
+    """First line of a sysfs attribute, or None when unreadable."""
+    try:
+        return path.read_text(errors="replace").strip()
+    except OSError:
+        return None
+
+
+def _read_sysfs_int(path: Path) -> int | None:
+    raw = _read_sysfs(path)
+    if raw is None:
+        return None
+    try:
+        return int(raw.split()[0])
+    except (ValueError, IndexError):
+        return None
+
+
+def _md_members(md_dir: Path) -> list[dict[str, object]]:
+    """Per-member state for one array, from ``/sys/block/mdX/md/dev-*``.
+
+    ``state`` is the kernel's own comma-joined member state
+    (``in_sync``, ``faulty``, ``spare``, ``write_mostly``, …) —
+    reported verbatim rather than collapsed, because "faulty" and
+    "spare" call for opposite operator actions.
+    """
+    members: list[dict[str, object]] = []
+    try:
+        entries = sorted(md_dir.glob("dev-*"))
+    except OSError:
+        return members
+    for entry in entries:
+        state = _read_sysfs(entry / "state") or "unknown"
+        slot_raw = _read_sysfs(entry / "slot")
+        try:
+            slot: int | None = int(slot_raw) if slot_raw not in (None, "none") else None
+        except ValueError:
+            slot = None
+        members.append(
+            {
+                "device": entry.name[len("dev-") :],
+                "state": state,
+                "slot": slot,
+            }
+        )
+    # Slot order is the order the operator sees in ``mdadm --detail``;
+    # a member with no slot (a spare, or one being removed) sorts last.
+    members.sort(
+        key=lambda m: (
+            m["slot"] is None,
+            m["slot"] if isinstance(m["slot"], int) else 0,
+            str(m["device"]),
+        )
+    )
+    return members
+
+
+def _md_sync(md_dir: Path) -> dict[str, object] | None:
+    """Rebuild / scrub progress, or None when the array is idle.
+
+    ``sync_completed`` is ``"<done> / <total>"`` in sectors while a sync
+    runs and the literal ``"none"`` when it does not. Both numbers come
+    from that one file and nothing substitutes for a missing total —
+    ``/sys/block/mdX/size`` is the ARRAY's size, which is not the
+    per-member extent being synced on anything but a mirror, so using it
+    as a denominator would quietly report a wrong percentage on raid5/6.
+    No reading beats a plausible wrong one.
+    """
+    action = _read_sysfs(md_dir / "sync_action")
+    if action in (None, "idle"):
+        return None
+    out: dict[str, object] = {"action": action}
+    completed_raw = _read_sysfs(md_dir / "sync_completed")
+    done = total = None
+    if completed_raw and "/" in completed_raw:
+        left, _, right = completed_raw.partition("/")
+        try:
+            done, total = int(left.strip()), int(right.strip())
+        except ValueError:
+            done = total = None
+    if done is not None and total:
+        out["percent"] = round(min(done / total, 1.0) * 100, 1)
+    # sync_speed is KB/s; a sector is 512 B, so two sectors per KB.
+    speed = _read_sysfs_int(md_dir / "sync_speed")
+    if speed and done is not None and total and total > done:
+        out["eta_seconds"] = int((total - done) / (speed * 2))
+    return out
+
+
+def _md_arrays() -> list[dict[str, object]]:
+    """Every assembled md array, from ``/sys/block/md*/md/``.
+
+    sysfs is the source rather than /proc/mdstat because mdstat is a
+    human-readable text format whose per-member and per-progress
+    fields have to be regex'd apart, while every one of them is its
+    own file here. mdstat is still consulted — by ``read_storage_
+    health`` — for whether md is SUPPORTED at all, which sysfs cannot
+    answer: no arrays and no md_mod produce an identical empty glob.
+    """
+    arrays: list[dict[str, object]] = []
+    try:
+        candidates = sorted(_SYS_BLOCK.glob("md*"))
+    except OSError:
+        return arrays
+    for block in candidates:
+        md_dir = block / "md"
+        if not md_dir.is_dir():
+            continue
+        level = _read_sysfs(md_dir / "level") or "unknown"
+        if level in _NON_ARRAY_LEVELS:
+            # An IMSM / DDF metadata CONTAINER (level ``container``) is
+            # not a redundancy group — it holds the vendor metadata that
+            # the real arrays inside it are built from, and it reports
+            # ``array_state=inactive`` with ``raid_disks=0`` forever, on
+            # a perfectly healthy box. Classifying it would open a
+            # critical alert nothing can ever clear. The member arrays
+            # (md126 and friends) carry the real level and are reported
+            # normally.
+            continue
+        array_state = _read_sysfs(md_dir / "array_state") or "unknown"
+        # None, never 0. ``raid_disks`` is how many members the array is
+        # SUPPOSED to have, so it is the denominator every degradation
+        # test divides by — and a 0 standing in for "could not read it"
+        # makes every one of those tests false, dropping an unreadable
+        # array through to "clean". Unknown is never clean.
+        expected = _read_sysfs_int(md_dir / "raid_disks")
+        members = _md_members(md_dir)
+        in_sync = sum(1 for m in members if "in_sync" in str(m["state"]).split(","))
+        faulty = sum(1 for m in members if "faulty" in str(m["state"]).split(","))
+        spares = sum(1 for m in members if "spare" in str(m["state"]).split(","))
+        # /sys/block/mdX/size is in 512-byte sectors.
+        size_sectors = _read_sysfs_int(block / "size")
+        sync = _md_sync(md_dir)
+        usable = expected is not None and expected > 0
+        minimum = _min_working_members(level, expected) if usable else None
+
+        # State is derived, not copied: array_state says "clean" for a
+        # degraded-but-consistent array, which is exactly the reading
+        # that must not read as healthy.
+        #
+        # ``inactive`` is tested FIRST and needs no member count: an
+        # array that failed to assemble often reports ``raid_disks=0``
+        # too, and deciding on the count would demote a real failure to
+        # "unknown". Containers, the other permanently-inactive thing in
+        # /sys/block, are already filtered out above.
+        if array_state == "inactive":
+            state = "failed"
+        elif not usable or minimum is None:
+            # The array exists (it has an ``md/`` directory) but will not
+            # say how many members it is supposed to have, so nothing
+            # below can be decided. Reported as its own state rather than
+            # folded into any of the others — a green tick here would be
+            # a claim we have no basis for.
+            state = "unknown"
+        elif in_sync < minimum:
+            state = "failed"
+        elif in_sync < expected:  # type: ignore[operator]
+            state = "degraded"
+        elif sync is not None:
+            state = "syncing"
+        else:
+            state = "clean"
+
+        entry: dict[str, object] = {
+            "name": block.name,
+            "level": level,
+            "state": state,
+            "array_state": array_state,
+            "members_expected": expected if usable else None,
+            "members_in_sync": in_sync,
+            "members_faulty": faulty,
+            "spares": spares,
+            # How many more members can be lost before the array stops
+            # serving. This — not the state string — is what decides
+            # alert severity, so it is computed once here rather than
+            # re-derived per surface.
+            "redundancy_remaining": (
+                max(in_sync - minimum, 0) if minimum is not None else None
+            ),
+            "min_working_members": minimum,
+            "size_bytes": size_sectors * 512 if size_sectors else None,
+            "members": members,
+        }
+        if sync is not None:
+            entry["sync"] = sync
+        arrays.append(entry)
+    return arrays
+
+
+def _multipath_maps() -> list[dict[str, object]]:
+    """Every device-mapper multipath map, from ``/sys/block/dm-*``.
+
+    Identified exactly as ``_disk_hazard()`` in the installer does it:
+    a ``dm/uuid`` whose first ``-``-separated field is ``mpath``.
+
+    Per-PATH state is reported ``unknown`` on purpose. dm-multipath's
+    own verdict for a path lives in the target's status line, reachable
+    only through the device-mapper ioctl (``dmsetup status`` /
+    ``multipathd show topology``) — Part B tooling, not in this image.
+    Fabricating ``active`` here would turn a missing reading into a
+    false all-clear, which is the one answer worse than "unknown".
+
+    What IS honestly readable is the SCSI device state of each path
+    (``/sys/block/<dev>/device/state``: ``running`` / ``offline`` /
+    ``blocked`` / ``transport-offline``), reported alongside as
+    ``device_state`` — a different fact from dm's path state, named
+    differently so the two are not confused.
+    """
+    maps: list[dict[str, object]] = []
+    try:
+        candidates = sorted(_SYS_BLOCK.glob("dm-*"))
+    except OSError:
+        return maps
+    for block in candidates:
+        uuid = _read_sysfs(block / "dm" / "uuid")
+        if not uuid or uuid.split("-", 1)[0] != "mpath":
+            continue
+        paths: list[dict[str, object]] = []
+        try:
+            slaves = sorted((block / "slaves").iterdir())
+        except OSError:
+            slaves = []
+        for slave in slaves:
+            paths.append(
+                {
+                    "device": slave.name,
+                    # dm's own path verdict — see the docstring.
+                    "state": "unknown",
+                    "device_state": _read_sysfs(
+                        _SYS_BLOCK / slave.name / "device" / "state"
+                    ),
+                }
+            )
+        # Counted the negative way round on purpose: a path whose SCSI
+        # state we cannot read (an NVMe path has no ``device/state``)
+        # must not be counted as HEALTHY, or an unreadable map would
+        # report a clean bill of health. A non-zero ``paths_faulted``
+        # is a definite fault; zero is "nothing says otherwise".
+        faulted = sum(
+            1
+            for p in paths
+            if p["device_state"] is not None and p["device_state"] != "running"
+        )
+        size_sectors = _read_sysfs_int(block / "size")
+        maps.append(
+            {
+                "name": _read_sysfs(block / "dm" / "name") or block.name,
+                "dm_device": block.name,
+                "uuid": uuid,
+                "paths_total": len(paths),
+                # Paths whose SCSI device reports a definite fault.
+                # Not a claim about which paths dm is USING.
+                "paths_faulted": faulted,
+                "size_bytes": size_sectors * 512 if size_sectors else None,
+                "paths": paths,
+            }
+        )
+    return maps
+
+
+def read_storage_health() -> dict[str, object]:
+    """Storage-redundancy snapshot for the fleet surfaces (#999 Part A).
+
+    Shape::
+
+        {"md_supported": bool, "md_arrays": [...], "multipath_maps": [...]}
+
+    An appliance with neither reports empty lists, which every surface
+    renders as nothing at all — an ordinary single-disk box gains no
+    clutter. ``md_supported`` distinguishes "the kernel has no md
+    support" from "md is loaded and there are no arrays"; without it
+    the two are the same empty list, and only the first one means the
+    reading is unavailable rather than clean.
+    """
+    return {
+        "md_supported": _PROC_MDSTAT.exists(),
+        "md_arrays": _md_arrays(),
+        "multipath_maps": _multipath_maps(),
+    }
+
+
 def read_node_ip() -> str | None:
     """Return this node's k3s-registered InternalIP (#272 Phase 7b).
 
@@ -3139,6 +3477,16 @@ def collect() -> dict[str, object]:
                 **(cluster_health or {}),
                 "host_disk_partitions": _partitions,
             }
+        # #999 Part A — storage redundancy (md arrays + multipath maps),
+        # folded into the same dict for the same reason. Shipped
+        # unconditionally rather than only when something is present:
+        # an empty snapshot is the signal that clears a stale array off
+        # every surface after the operator tears one down, and
+        # ``md_supported`` is a real reading even with no arrays.
+        cluster_health = {
+            **(cluster_health or {}),
+            "storage": read_storage_health(),
+        }
     k3s_version = read_k3s_version() if is_appliance else None
     kubeconfig = read_kubeconfig() if is_appliance else None
     k3s_api_cert_expires_at = read_k3s_api_cert_expiry() if is_appliance else None

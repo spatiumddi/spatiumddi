@@ -42,9 +42,17 @@ import {
   type ClusterNodeVitals,
   type ClusterPodSummary,
   type ClusterWorkloadHealth,
+  type NodeStorage,
   type SelfApplianceInfo,
 } from "@/lib/api";
+import {
+  formatEta,
+  mdChipLabel,
+  mpathChipLabel,
+  storageChipClass,
+} from "@/lib/storage-health";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
+import { cn } from "@/lib/utils";
 import {
   AMBER,
   EMERALD,
@@ -604,6 +612,84 @@ function ClusterDnsCard({ dns }: { dns: ClusterDns | null }) {
   );
 }
 
+/**
+ * Storage-redundancy chips for one node (#999 Part A).
+ *
+ * Renders NOTHING on an ordinary single-disk appliance — the common
+ * case must gain no clutter — and nothing at all when the supervisor
+ * has never reported storage, because that is UNKNOWN and a green
+ * "no problems" chip would be a claim we cannot support.
+ */
+function StorageRow({ storage }: { storage: NodeStorage | null }) {
+  if (!storage) return null;
+  const arrays = storage.md_arrays ?? [];
+  const maps = storage.multipath_maps ?? [];
+  if (arrays.length === 0 && maps.length === 0) return null;
+
+  // Severity comes from the server (see lib/storage-health.ts on why it
+  // is not recomputed here). Findings are keyed by array / map name so a
+  // healthy array beside a degraded one still renders green.
+  const sevByName = new Map<string, string>();
+  for (const f of storage.findings ?? []) {
+    const prev = sevByName.get(f.name);
+    if (prev == null || (prev !== "critical" && f.severity === "critical")) {
+      sevByName.set(f.name, f.severity);
+    }
+  }
+
+  return (
+    <div className="flex flex-wrap gap-1">
+      {arrays.map((a) => {
+        const finding = (storage.findings ?? []).find(
+          (f) => f.kind === "md" && f.name === a.name,
+        );
+        return (
+          <span
+            key={a.name}
+            className={cn(
+              "inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-[10px] font-medium",
+              storageChipClass(sevByName.get(a.name) ?? null, "md"),
+            )}
+            title={
+              finding?.detail ??
+              `${a.name}: ${a.members_in_sync} of ${a.members_expected} members in sync.`
+            }
+          >
+            <HardDrive className="h-2.5 w-2.5" />
+            {mdChipLabel(a)}
+            {a.sync?.eta_seconds != null && (
+              <span className="opacity-70">
+                · {formatEta(a.sync.eta_seconds)} left
+              </span>
+            )}
+          </span>
+        );
+      })}
+      {maps.map((m) => {
+        const finding = (storage.findings ?? []).find(
+          (f) => f.kind === "multipath" && f.name === m.name,
+        );
+        return (
+          <span
+            key={m.dm_device}
+            className={cn(
+              "inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-[10px] font-medium",
+              storageChipClass(sevByName.get(m.name) ?? null, "multipath"),
+            )}
+            title={
+              finding?.detail ??
+              `${m.name}: ${m.paths_total} path(s) present. dm's own per-path state needs multipathd, which this image does not ship — so this is not a clean bill of health, only an absence of complaints.`
+            }
+          >
+            <Network className="h-2.5 w-2.5" />
+            {m.name} · {mpathChipLabel(m)}
+          </span>
+        );
+      })}
+    </div>
+  );
+}
+
 function NodeCard({ node }: { node: ClusterNodeVitals }) {
   const cpuPct = pct(node.cpu_usage_cores, node.cpu_capacity_cores);
   const memPct = pct(node.memory_working_set_bytes, node.memory_capacity_bytes);
@@ -755,6 +841,11 @@ function NodeCard({ node }: { node: ClusterNodeVitals }) {
             had no way to see.
           */}
           <PressureRow node={node} />
+          {/*
+            #999 Part A — md / multipath redundancy. Silent on a node
+            with neither, so a single-disk appliance is unchanged.
+          */}
+          <StorageRow storage={node.host_storage ?? null} />
         </div>
       </div>
     </div>

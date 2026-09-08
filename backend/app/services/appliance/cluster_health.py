@@ -790,6 +790,11 @@ def get_cluster_health() -> dict[str, Any]:
                 # the supervisor's cluster_health JSONB (the api pod can't see
                 # host partitions itself); empty here so the shape is stable.
                 "host_disk_partitions": [],
+                # #999 Part A — md / multipath state, merged in the same way.
+                # None, not {}: a node the supervisor has not reported storage
+                # for is UNKNOWN, and an empty snapshot would read as "no
+                # arrays, all clear".
+                "host_storage": None,
             }
         )
 

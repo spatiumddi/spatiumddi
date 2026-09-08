@@ -1,0 +1,346 @@
+#!/bin/bash
+# spatiumddi-storage-action — host-side md / multipath management runner
+# (#999 Part B).
+#
+# WHY A HOST RUNNER. Every action here needs a root binary (mdadm,
+# multipathd) that the supervisor container should not be executing
+# directly, so the supervisor drops a request file and this unit — fired
+# by the matching .path — does the work and writes the result back. Same
+# trigger-file plane as the snmp / chrony / ssh reload runners, but
+# imperative rather than convergent: one request, one result, no desired
+# state to reconcile.
+#
+# REQUEST  /var/lib/spatiumddi/release-state/storage/<rid>.request.json
+#   {"action": "...", "array": "md0", "device": "/dev/sdb1"}
+# RESULT   /var/lib/spatiumddi/release-state/storage/<rid>.result.json
+#   {"ok": true|false, "action": "...", "detail": "...", "output": "..."}
+#
+# The supervisor polls for the result file, returns it to the control
+# plane, and deletes both. A result is ALWAYS written — including for a
+# refusal and for an unparseable request — because the caller is a
+# synchronous HTTP request blocking on it, and "no file" is
+# indistinguishable to it from "the runner never ran".
+#
+# ── The two refusals, and why they are refusals rather than warnings ──
+#
+# #999 states the rule: a refusal beats an acknowledgement when the
+# operator cannot inspect the consequence afterwards.
+#
+#   * Removing the LAST working member of an array destroys the data and
+#     leaves nothing to see. There is no state to inspect afterwards
+#     because there is no array afterwards.
+#   * Removing the member the bootloader is installed on leaves an array
+#     that is perfectly healthy and a machine that does not boot — a
+#     consequence that is invisible until the next reboot, which may be
+#     months away.
+#
+# Adding a member is destructive to the MEMBER, not to the array, and it
+# IS inspectable (the operator picked the disk, and the array reports
+# the resync). So that one is confirmed, not refused — the confirmation
+# lives in the control plane, which is where the operator is.
+
+set -uo pipefail
+
+STATE_DIR=/var/lib/spatiumddi/release-state/storage
+LOG_DIR=/var/log/spatiumddi
+LOG="$LOG_DIR/storage-action.log"
+
+mkdir -p "$STATE_DIR" "$LOG_DIR" 2>/dev/null || true
+
+# The disk this appliance booted from, used by the "do not remove the
+# bootloader's member" refusal below. Derived from whatever is mounted at
+# /boot/efi, which on every SpatiumDDI install is the ESP grub reads —
+# and on a mirror is deliberately NOT an array member, so it resolves to
+# exactly one physical disk.
+#
+# Empty when it cannot be determined, and the refusal then does not fire.
+# That is the honest direction: this guard exists to catch a specific
+# mistake, and a guard that blocks on "I could not tell" is one operators
+# learn to route around.
+_boot_disk() {
+    local esp parent
+    esp=$(findmnt -no SOURCE /boot/efi 2>/dev/null) || return 0
+    [ -n "$esp" ] || return 0
+    parent=$(lsblk -no PKNAME "$esp" 2>/dev/null | head -1)
+    [ -n "$parent" ] && printf '/dev/%s' "$parent"
+}
+BOOT_DISK="$(_boot_disk)"
+
+log() {
+    printf '%s %s\n' "$(date -Is 2>/dev/null || echo -)" "$*" >> "$LOG" 2>/dev/null || true
+}
+
+# Write the result and stop. ``$1`` ok(0/1), ``$2`` detail, ``$3`` output.
+emit() {
+    local ok="$1" detail="$2" output="${3:-}"
+    python3 - "$RESULT" "$ok" "$ACTION" "$detail" "$output" <<'PYEOF'
+import json, sys
+path, ok, action, detail, output = sys.argv[1:6]
+tmp = path + ".new"
+with open(tmp, "w") as fh:
+    json.dump({
+        "ok": ok == "1",
+        "action": action,
+        "detail": detail,
+        # Capped: this is relayed through an HTTP response, and mdadm
+        # --detail on a large array is long enough to be unhelpful.
+        "output": output[-4000:],
+    }, fh)
+import os
+os.replace(tmp, path)
+PYEOF
+    log "result ok=$ok action=$ACTION detail=$detail"
+    exit 0
+}
+
+# ONE request per firing: ``emit`` exits. The .path unit fires again for
+# the next one.
+#
+# THE CLAIM RENAME IS LOAD-BEARING, and its absence is not a missed
+# optimisation — it disables this entire plane. ``PathExistsGlob`` is
+# LEVEL-triggered: when this service exits with a matching file still
+# present, systemd re-triggers it immediately. Leaving the request in
+# place therefore produces a tight restart loop, which trips systemd's
+# start limit within a second and leaves the PATH UNIT ITSELF in
+# ``failed`` — after which no request ever fires again until an operator
+# notices and restarts it. Observed on a live appliance, exactly once,
+# which was enough.
+#
+# Renaming to ``.request.running`` makes the glob stop matching, so the
+# condition goes false and the unit re-arms cleanly. It is the same
+# claim the pcap runner performs for the same reason.
+for REQUEST in "$STATE_DIR"/*.request.json; do
+    [ -e "$REQUEST" ] || continue
+    RID=$(basename "$REQUEST" .request.json)
+    RESULT="$STATE_DIR/$RID.result.json"
+    [ -e "$RESULT" ] && continue   # already answered
+    # Claim it. mv is atomic within a directory, so two concurrent
+    # invocations cannot both win.
+    CLAIMED="$STATE_DIR/$RID.request.running"
+    mv "$REQUEST" "$CLAIMED" 2>/dev/null || continue
+    REQUEST="$CLAIMED"
+
+    ACTION=""
+    # Parsed with python3 (always present on the appliance) rather than
+    # with a shell regex: the values are device paths and array names
+    # that reach argv, and a hand-rolled parser is how one of those
+    # becomes a second argument.
+    read -r ACTION ARRAY DEVICE < <(python3 - "$REQUEST" <<'PYEOF'
+import json, re, sys
+try:
+    with open(sys.argv[1]) as fh:
+        req = json.load(fh)
+except Exception:
+    print("__badreq__ - -")
+    raise SystemExit(0)
+
+def clean(value, pattern):
+    v = str(value or "")
+    # A traversal is rejected by a SEPARATE component check that runs
+    # first. "." and "/" both have to be in the device class, and that
+    # alone admits "/dev/../etc/passwd" — a character class cannot carry
+    # both jobs.
+    if any(part in ("..", ".") for part in v.split("/")):
+        return "-"
+    return v if re.fullmatch(pattern, v) else "-"
+
+# Allowlists, not escaping. An md array is /dev/mdN or /dev/md/<name>; a
+# member is a plain block device path. Anything else becomes "-" and the
+# runner refuses, so no operator-supplied string can grow an argument.
+print(
+    clean(req.get("action"), r"[a-z_]{1,32}"),
+    clean(req.get("array"), r"/dev/md/?[A-Za-z0-9_.-]{1,32}"),
+    clean(req.get("device"), r"/dev/[A-Za-z0-9/_.-]{1,64}"),
+)
+PYEOF
+)
+    ACTION="${ACTION:-__badreq__}"
+    log "request $RID action=$ACTION array=$ARRAY device=$DEVICE"
+
+    if [ "$ACTION" = "__badreq__" ]; then
+        emit 0 "the request could not be parsed"
+    fi
+    if ! command -v mdadm >/dev/null 2>&1; then
+        emit 0 "mdadm is not installed on this appliance"
+    fi
+
+    case "$ACTION" in
+    scrub_start|scrub_cancel)
+        [ "$ARRAY" = "-" ] && emit 0 "no array named"
+        MD=$(basename "$ARRAY")
+        SYNC="/sys/block/$MD/md/sync_action"
+        # /dev/md/<name> is a symlink; resolve to the kernel name.
+        if [ ! -f "$SYNC" ]; then
+            MD=$(basename "$(readlink -f "$ARRAY" 2>/dev/null || echo "$ARRAY")")
+            SYNC="/sys/block/$MD/md/sync_action"
+        fi
+        [ -f "$SYNC" ] || emit 0 "no such array: $ARRAY"
+        if [ "$ACTION" = "scrub_start" ]; then
+            # ``check`` reads both copies and counts mismatches without
+            # rewriting anything — ``repair`` would silently pick a
+            # winner, which is not a decision a scrub button should make.
+            echo check > "$SYNC" 2>>"$LOG" && emit 1 "scrub started on $ARRAY" \
+                "$(cat "$SYNC" 2>/dev/null)"
+            emit 0 "could not start a scrub on $ARRAY"
+        else
+            echo idle > "$SYNC" 2>>"$LOG" && emit 1 "scrub cancelled on $ARRAY"
+            emit 0 "could not cancel the scrub on $ARRAY"
+        fi
+        ;;
+    fail_member|remove_member)
+        level=""; raid_disks=0; minimum=1; other_esp=0; lbl=""; dev=""; p2=""
+        [ "$ARRAY" = "-" ] && emit 0 "no array named"
+        [ "$DEVICE" = "-" ] && emit 0 "no member named"
+        MD=$(basename "$(readlink -f "$ARRAY" 2>/dev/null || echo "$ARRAY")")
+        MDDIR="/sys/block/$MD/md"
+        [ -d "$MDDIR" ] || emit 0 "no such array: $ARRAY"
+
+        # ── refusal 1: the last working member ──────────────────────
+        #
+        # Counted from the kernel's own per-member state rather than from
+        # what the caller believes, because the control plane's view is
+        # up to one heartbeat old and a member can have failed since.
+        in_sync=0
+        for d in "$MDDIR"/dev-*; do
+            [ -e "$d" ] || continue
+            case ",$(cat "$d/state" 2>/dev/null)," in
+                *,in_sync,*) in_sync=$((in_sync + 1)) ;;
+            esac
+        done
+        target_in_sync=0
+        tdev=$(basename "$(readlink -f "$DEVICE" 2>/dev/null || echo "$DEVICE")")
+        if [ -e "$MDDIR/dev-$tdev/state" ]; then
+            case ",$(cat "$MDDIR/dev-$tdev/state" 2>/dev/null)," in
+                *,in_sync,*) target_in_sync=1 ;;
+            esac
+        else
+            emit 0 "$DEVICE is not a member of $ARRAY"
+        fi
+        # How many in-sync members this array can serve on. ``-le 1`` was
+        # right for raid1 and wrong for everything else: a raid5 needs
+        # n-1, so removing the second-to-last member of a 4-disk raid5
+        # (in_sync 3 → 2, minimum 3) passed the old test and destroyed
+        # the array. Mirrors the table in the supervisor's collector.
+        level=$(cat "$MDDIR/level" 2>/dev/null || echo unknown)
+        raid_disks=$(cat "$MDDIR/raid_disks" 2>/dev/null || echo 0)
+        case "$level" in
+            raid1)          minimum=1 ;;
+            raid4|raid5)    minimum=$((raid_disks - 1)) ;;
+            raid6)          minimum=$((raid_disks - 2)) ;;
+            # raid10 tolerates two failures only if they land in
+            # different mirror pairs, and sysfs does not say which member
+            # is in which pair — so the GUARANTEED tolerance is 1, and a
+            # refusal is sized to the guarantee, not to the lucky case.
+            raid10)         minimum=$((raid_disks - 1)) ;;
+            # raid0 / linear / anything unrecognised: assume no
+            # redundancy. Guessing generously here permits a remove that
+            # destroys the array.
+            *)              minimum="$raid_disks" ;;
+        esac
+        [ "$minimum" -lt 1 ] && minimum=1
+        if [ "$target_in_sync" = 1 ] && [ "$in_sync" -le "$minimum" ]; then
+            emit 0 "REFUSED: $ARRAY ($level) needs $minimum in-sync member(s) and has $in_sync. Removing $DEVICE destroys the data, and there would be no array left to inspect afterwards."
+        fi
+
+        # ── refusal 2: the member the bootloader lives on ───────────
+        #
+        # An array that stays perfectly healthy while the machine stops
+        # booting is the worst shape this can take, because nothing
+        # reports it until the next reboot.
+        # The bootloader refusal, scoped so it does not make a mirror
+        # unmaintainable.
+        #
+        # The first cut refused ANY member on the booted disk, which on a
+        # two-disk mirror is half the members — so replacing a failed
+        # disk was impossible from the UI for exactly the layout the
+        # feature exists to support. A mirrored install puts a full
+        # bootloader and its own ESP on BOTH disks, so losing the booted
+        # one is survivable and the refusal is wrong there.
+        #
+        # What is NOT survivable is removing the boot disk's member when
+        # it is the only disk that can boot. So the test is "is there
+        # another ESP?", not "is this the boot disk?".
+        parent=$(lsblk -no PKNAME "/dev/$tdev" 2>/dev/null | head -1)
+        if [ -n "$parent" ] && [ -n "${BOOT_DISK:-}" ] && [ "/dev/$parent" = "$BOOT_DISK" ]; then
+            other_esp=0
+            for lbl in ESP ESP2; do
+                dev=$(blkid -L "$lbl" 2>/dev/null || true)
+                [ -n "$dev" ] || continue
+                p2=$(lsblk -no PKNAME "$dev" 2>/dev/null | head -1)
+                [ -n "$p2" ] && [ "/dev/$p2" != "$BOOT_DISK" ] && other_esp=1
+            done
+            if [ "$other_esp" = 0 ]; then
+                emit 0 "REFUSED: $DEVICE is on $BOOT_DISK, the only disk this appliance can boot from. The array would stay healthy and the machine would stop booting — which nothing reports until the next reboot."
+            fi
+        fi
+
+        out=""
+        rc=0
+        if [ "$ACTION" = "fail_member" ]; then
+            out=$(mdadm --manage "$ARRAY" --fail "$DEVICE" 2>&1) || rc=$?
+        else
+            # Fail first: mdadm refuses to remove an ACTIVE member, so a
+            # bare --remove on a healthy disk returns "device busy" and
+            # reads as a broken button.
+            mdadm --manage "$ARRAY" --fail "$DEVICE" >/dev/null 2>&1 || true
+            out=$(mdadm --manage "$ARRAY" --remove "$DEVICE" 2>&1) || rc=$?
+        fi
+        [ "$rc" -eq 0 ] && emit 1 "$ACTION on $DEVICE succeeded" "$out"
+        emit 0 "$ACTION on $DEVICE failed" "$out"
+        ;;
+    add_member)
+        h=""; parent=""; tdev=""
+        [ "$ARRAY" = "-" ] && emit 0 "no array named"
+        [ "$DEVICE" = "-" ] && emit 0 "no member named"
+        [ -b "$DEVICE" ] || emit 0 "$DEVICE is not a block device"
+        # mdadm --add OVERWRITES the device it is given. The control
+        # plane demands a typed confirmation naming this device before it
+        # gets here; this is the second gate, and it refuses the two
+        # cases a typed name cannot protect against.
+        # NO blanket boot-disk refusal here.
+        #
+        # The first cut refused any device on the booted disk, which
+        # blocks the single most common repair there is: a member of the
+        # ROOT mirror dropped out, and you re-add it — on the disk you
+        # are running from, because that is where the array lives. The
+        # feature would refuse the exact thing it exists to do.
+        #
+        # What actually has to be refused is overwriting something in
+        # use, and that is answered directly rather than by proxy: a
+        # mounted filesystem, or a partition that is already a member of
+        # some array. mdadm itself refuses a busy device too, but it
+        # reports "Device or resource busy", which reads as a bug rather
+        # than as a decision.
+        if [ -n "$(lsblk -no MOUNTPOINT "$DEVICE" 2>/dev/null | tr -d ' \n')" ]; then
+            emit 0 "REFUSED: $DEVICE is mounted. Adding it to an array erases it."
+        fi
+        tdev=$(basename "$(readlink -f "$DEVICE" 2>/dev/null || echo "$DEVICE")")
+        for h in "/sys/block/$tdev"/holders/md* "/sys/block/$(lsblk -no PKNAME "$DEVICE" 2>/dev/null | head -1)/$tdev"/holders/md*; do
+            [ -e "$h" ] || continue
+            emit 0 "REFUSED: $DEVICE is already a member of $(basename "$h")."
+        done
+        rc=0
+        out=$(mdadm --manage "$ARRAY" --add "$DEVICE" 2>&1) || rc=$?
+        [ "$rc" -eq 0 ] && emit 1 "$DEVICE added to $ARRAY; a rebuild has started" "$out"
+        emit 0 "could not add $DEVICE to $ARRAY" "$out"
+        ;;
+    mpath_reinstate)
+        [ "$DEVICE" = "-" ] && emit 0 "no path named"
+        command -v multipathd >/dev/null 2>&1 || \
+            emit 0 "multipath-tools is not installed on this appliance"
+        rc=0
+        out=$(multipathd reinstate path "$(basename "$DEVICE")" 2>&1) || rc=$?
+        [ "$rc" -eq 0 ] && emit 1 "path $DEVICE reinstated" "$out"
+        emit 0 "could not reinstate $DEVICE" "$out"
+        ;;
+    mpath_topology)
+        command -v multipathd >/dev/null 2>&1 || \
+            emit 0 "multipath-tools is not installed on this appliance"
+        out=$(multipathd show topology 2>&1)
+        emit 1 "topology read" "$out"
+        ;;
+    *)
+        emit 0 "unknown action: $ACTION"
+        ;;
+    esac
+done

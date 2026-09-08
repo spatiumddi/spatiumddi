@@ -1450,6 +1450,173 @@ def disk_summary() -> list[tuple[str, float, float, float]]:
     return rows
 
 
+# ── #999 Part A — storage redundancy on the Disks row ──────────────────
+#
+# A degraded mirror is exactly what somebody standing at the physical
+# console is there to look at, and until now the console said nothing
+# about it: the Disk row reported capacity, which stays perfectly normal
+# when a mirror drops to one disk.
+#
+# This is a THIRD reader of the same kernel interfaces (the supervisor's
+# ``read_storage_health`` is the first, the installer's ``_disk_hazard``
+# the second) and deliberately so — the console is a standalone host
+# script that shares no Python package with either. It is kept to the
+# minimum a one-line chip needs; anything richer belongs on the Fleet
+# screen, which reads the supervisor's fuller snapshot.
+_SYS_BLOCK_DIR = "/sys/block"
+
+
+def _sysfs_first_line(path: str) -> str:
+    try:
+        with open(path, "r", errors="replace") as fh:
+            return fh.readline().strip()
+    except OSError:
+        return ""
+
+
+def storage_summary() -> list[tuple[str, str, str]]:
+    """``[(text, style, severity)]`` chips for md arrays + multipath maps.
+
+    ``severity`` is ``""`` / ``"warning"`` / ``"critical"`` and is carried
+    explicitly rather than inferred back out of ``style`` — the box-level
+    verdict reads it, and deriving a verdict from a colour name is how a
+    palette tweak silently stops an appliance reporting CRITICAL.
+
+    Empty on an ordinary single-disk appliance, so the Disk row is
+    unchanged there. Severity follows the same rule as every other
+    surface: a degraded array is RED when it is down to the members it
+    needs and AMBER while a further loss is still survivable — ``1 of 2``
+    and ``2 of 3`` both read "degraded" and are not the same night.
+    """
+    chips: list[tuple[str, str, str]] = []
+    try:
+        names = sorted(os.listdir(_SYS_BLOCK_DIR))
+    except OSError:
+        return chips
+
+    for name in names:
+        if not name.startswith("md"):
+            continue
+        md = f"{_SYS_BLOCK_DIR}/{name}/md"
+        level = _sysfs_first_line(f"{md}/level") or "md"
+        # An IMSM / DDF metadata CONTAINER is not a redundancy group: it
+        # is permanently inactive with raid_disks=0 on a healthy box, and
+        # the real arrays live inside it. Reporting it would put a
+        # permanent red chip on a console that is fine.
+        if level == "container":
+            continue
+        array_state = _sysfs_first_line(f"{md}/array_state")
+        raw_expected = _sysfs_first_line(f"{md}/raid_disks")
+        try:
+            expected = int(raw_expected)
+        except ValueError:
+            expected = 0
+        # ``inactive`` first, and without needing the member count: an
+        # array that failed to assemble often reports raid_disks=0 too,
+        # and deciding on the count would demote a real failure. Without
+        # this the console rendered a failed-to-assemble array as a green
+        # "ok 0/0" and left the box verdict HEALTHY — telling the person
+        # standing at the console the opposite of the Fleet screen.
+        if array_state == "inactive":
+            chips.append((f"{name} {level} FAILED to assemble", "bold red", "critical"))
+            continue
+        if expected <= 0:
+            # Assembled but will not say how many members it should have,
+            # so nothing below can be decided. Reported as unknown rather
+            # than skipped: dropping it off the row is the silence this
+            # feature exists to end, and it would look exactly like a
+            # healthy single disk.
+            chips.append((f"{name} {level} state unknown", "bold yellow", "warning"))
+            continue
+        try:
+            devs = [d for d in os.listdir(md) if d.startswith("dev-")]
+        except OSError:
+            devs = []
+        in_sync = sum(
+            1
+            for d in devs
+            if "in_sync" in _sysfs_first_line(f"{md}/{d}/state").split(",")
+        )
+        action = _sysfs_first_line(f"{md}/sync_action")
+        pct = ""
+        completed = _sysfs_first_line(f"{md}/sync_completed")
+        if "/" in completed:
+            try:
+                done_s, total_s = completed.split("/", 1)
+                done, total = int(done_s.strip()), int(total_s.strip())
+                if total:
+                    pct = f" {min(done / total, 1.0) * 100:.0f}%"
+            except ValueError:
+                pct = ""
+        # min working members, mirroring the supervisor's table. Anything
+        # unrecognised is assumed to carry no redundancy, which errs
+        # towards alarming rather than towards silence.
+        if level == "raid1":
+            minimum = 1
+        elif level in ("raid4", "raid5", "raid10"):
+            minimum = max(expected - 1, 1)
+        elif level == "raid6":
+            minimum = max(expected - 2, 1)
+        else:
+            minimum = expected
+
+        if in_sync < minimum:
+            chips.append(
+                (f"{name} {level} FAILED {in_sync}/{expected}", "bold red", "critical")
+            )
+        elif in_sync < expected:
+            # At the minimum there is nothing left to lose; above it a
+            # further failure is still survivable.
+            crit = in_sync <= minimum
+            chips.append(
+                (
+                    f"{name} {level} DEGRADED {in_sync}/{expected}{pct}",
+                    "bold red" if crit else "bold yellow",
+                    "critical" if crit else "warning",
+                )
+            )
+        elif action and action != "idle":
+            chips.append((f"{name} {level} {action}{pct}", "cyan", ""))
+        else:
+            chips.append((f"{name} {level} ok {in_sync}/{expected}", "green", ""))
+
+    for name in names:
+        if not name.startswith("dm-"):
+            continue
+        uuid = _sysfs_first_line(f"{_SYS_BLOCK_DIR}/{name}/dm/uuid")
+        if not uuid or uuid.split("-", 1)[0] != "mpath":
+            continue
+        friendly = _sysfs_first_line(f"{_SYS_BLOCK_DIR}/{name}/dm/name") or name
+        try:
+            paths = os.listdir(f"{_SYS_BLOCK_DIR}/{name}/slaves")
+        except OSError:
+            paths = []
+        # A path whose SCSI device is not ``running`` is a definite
+        # fault; one with no ``device/state`` at all (NVMe) is unknown
+        # and is not counted either way.
+        faulted = 0
+        for path_dev in paths:
+            dev_state = _sysfs_first_line(
+                f"{_SYS_BLOCK_DIR}/{path_dev}/device/state"
+            )
+            if dev_state and dev_state != "running":
+                faulted += 1
+        total = len(paths)
+        if total <= 1:
+            chips.append((f"{friendly} mpath {total} path", "bold red", "critical"))
+        elif faulted:
+            chips.append(
+                (
+                    f"{friendly} mpath {total - faulted}/{total} paths",
+                    "bold yellow",
+                    "warning",
+                )
+            )
+        else:
+            chips.append((f"{friendly} mpath {total}/{total} paths", "green", ""))
+    return chips
+
+
 def detect_slot_info() -> tuple[str, str] | None:
     """Return (current_slot, durable_default) — both "slot_a"/"slot_b" or
     None if we can't determine. Phase 8c A/B boot detection:
@@ -2317,8 +2484,9 @@ def overall_verdict(
     ``HEALTHY`` / ``DEGRADED`` / ``CRITICAL`` and ``worst_offender`` is a
     short human phrase naming the most serious problem (``""`` when
     healthy). Reads only data already in ``state`` (pods / host_health /
-    disks / vip) plus the ``k3s_state`` + ``wd_status`` tuples the caller
-    already computed — so it adds NO subprocess on the render path.
+    disks / storage / vip) plus the ``k3s_state`` + ``wd_status`` tuples
+    the caller already computed — so it adds NO subprocess on the render
+    path.
 
     CRITICAL outranks DEGRADED; within a tier the first match wins, so
     the worst-offender phrase reflects the loudest problem. Inputs:
@@ -2329,10 +2497,12 @@ def overall_verdict(
       * Web UI self-check verdict `blocked` (#779) — CRITICAL
       * k3s unit failed — CRITICAL
       * disk >90% on any mount — CRITICAL
+      * an md array on its last working members / a LUN on one path — CRITICAL
       * k3s not yet ready / starting — DEGRADED
       * a retrying host-config plane — DEGRADED
       * watchdog loop stale / restart-cap — DEGRADED
       * a trial-boot pending (current != durable slot) — DEGRADED
+      * an md array degraded with redundancy still to spare — DEGRADED
     """
     hh = state.host_health
     # ── CRITICAL tier ──────────────────────────────────────────────
@@ -2367,6 +2537,12 @@ def overall_verdict(
     for mp, _used_g, _total_g, pct in state.disks:
         if pct >= _DISK_CRIT_PCT:
             return ("CRITICAL", f"disk {mp} {pct:.0f}% full")
+    # #999 Part A — an array running on the last members it needs, or a
+    # LUN down to one path. Capacity says nothing about this: a mirror
+    # that lost a disk reports exactly the same GiB as one that did not.
+    for text, _style, sev in state.storage_chips:
+        if sev == "critical":
+            return ("CRITICAL", text)
     # ── DEGRADED tier ──────────────────────────────────────────────
     # k3s up but not ready (starting / api not responding / disabled).
     if k3s_state is not None and "ready" not in k3s_state[0] and k3s_state[1] != "bold green":
@@ -2389,6 +2565,11 @@ def overall_verdict(
         _sp_ready, _sp_total = metallb_speaker_health(state.ps_rows)
         if _sp_total and _sp_ready < _sp_total:
             return ("DEGRADED", f"metallb {_sp_total - _sp_ready}/{_sp_total} speaker down")
+    # #999 Part A — redundancy reduced but a further loss still
+    # survivable (a 3-way mirror down to two).
+    for text, _style, sev in state.storage_chips:
+        if sev == "warning":
+            return ("DEGRADED", text)
     if wd_status is not None and wd_status[1] != "bold green":
         return ("DEGRADED", "supervisor watchdog stale")
     slots = slot_info()
@@ -2583,8 +2764,24 @@ def render_header(
     # Load gauge scaled 0..ncpu (a full bar = every core busy).
     vitals.append(" ")
     vitals.append_text(_heat_bar(load_1m, float(ncpu)))
-    if state.disks:
+    # #999 Part A — the vitals row is ``no_wrap`` with a right-hand
+    # ellipsis, so whatever is appended LAST is what a narrow terminal
+    # drops. That decides the order here: a chip reporting a problem goes
+    # ahead of the capacity list (a degraded array must never be elided
+    # to make room for a percentage that looks normal either way), while
+    # a chip reporting "ok" goes after it — a never-changing green chip
+    # has no business evicting the disk readout on an 80-column console.
+    alarming = [c for c in state.storage_chips if c[2]]
+    reassuring = [c for c in state.storage_chips if not c[2]]
+    if state.disks or state.storage_chips:
         vitals.append("   Disk ", style="dim")
+    for i, (text, style, _sev) in enumerate(alarming):
+        if i:
+            vitals.append(" ", style="dim")
+        vitals.append(f"[{text}]", style=style)
+    if state.disks:
+        if alarming:
+            vitals.append("  ", style="dim")
         # Split the disk string so EACH mount colours on its own % —
         # ``/`` healthy while ``/var`` is red shouldn't blend into one
         # uniform-coloured blob.
@@ -2595,6 +2792,9 @@ def render_header(
                 f"{mp} {used_g:.1f}/{total_g:.1f} GiB ({pct:.0f}%)",
                 style=_vital_style(pct, 80, 90),
             )
+    for chip_i, (text, style, _sev) in enumerate(reassuring):
+        vitals.append("  " if (state.disks or chip_i) else "", style="dim")
+        vitals.append(f"[{text}]", style=style)
 
     # Body assembly — a FIXED row count. WIDE/MEDIUM gets the Rule
     # divider between identity and vitals (4 content rows + rule);
@@ -4242,6 +4442,9 @@ class DashboardState:
             "%Y-%m-%d %H:%M:%S %Z"
         )
         self.disks: list[tuple[str, float, float, float]] = []
+        # #999 Part A — md / multipath chips for the Disk row. Empty on
+        # an appliance with neither, which is the common case.
+        self.storage_chips: list[tuple[str, str, str]] = []
         self.pod_stats: dict = {}
         # Phase 2 KPI-ribbon collectors (5 s data tier). Default empty so
         # the etcd / Postgres / API / Platform boxes render dim "n/a" until
@@ -4304,6 +4507,10 @@ class DashboardState:
                 "%Y-%m-%d %H:%M:%S %Z"
             )
             self.disks = disk_summary()
+            # Sysfs reads only — a handful of small files, no
+            # subprocess, so it belongs on the 1 s vitals tier alongside
+            # the capacity numbers it sits next to.
+            self.storage_chips = storage_summary()
             self.ip_v4, self.ip_v6 = host_ips()
         # Data tier (5 s, DATA_REFRESH_EVERY) — k3s pods / nodes / kubelet
         # metrics + the etcd/api/cnpg health fetches + env re-read.

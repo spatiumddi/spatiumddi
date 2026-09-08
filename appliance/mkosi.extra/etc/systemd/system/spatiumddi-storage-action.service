@@ -1,0 +1,11 @@
+[Unit]
+Description=Apply a pending SpatiumDDI md / multipath management request (issue #999 Part B)
+Documentation=https://github.com/spatiumddi/spatiumddi/issues/999
+# The request + result files live under /var/lib/spatiumddi, and the
+# runner reads /sys/block and shells to mdadm / multipathd.
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/spatiumddi-storage-action
+# No Install section — only invoked by the matching .path unit.

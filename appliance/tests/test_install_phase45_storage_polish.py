@@ -86,18 +86,30 @@ def test_keeping_var_skips_the_partition_table_and_the_two_filesystems():
     # Walk the guard depth line by line: state and var must be inside a
     # KEEP_VAR guard, the two OS slots outside it (they are replaced
     # either way).
-    depth, seen = 0, {}
+    # A STACK, not a counter. The counter form only incremented on a
+    # KEEP_VAR ``if`` while decrementing on every ``fi``, so any other
+    # conditional in the region (#999 added the mirror's second ESP
+    # mkfs) drove the depth negative and reported every label at the
+    # wrong level — the test failing for a reason unrelated to what it
+    # is pinning.
+    stack: list[bool] = []
+    seen = {}
     for line in fmt.splitlines():
         t = line.strip()
-        if t.startswith('if [ "$KEEP_VAR" != "yes" ]'):
-            depth += 1
+        if t.startswith("if ") or t.startswith("elif "):
+            if t.startswith("elif "):
+                if stack:
+                    stack[-1] = 'KEEP_VAR" != "yes"' in t
+            else:
+                stack.append('KEEP_VAR" != "yes"' in t)
             continue
         if t == "fi":
-            depth -= 1
+            if stack:
+                stack.pop()
             continue
         for label in ("state", "var", "root_a", "root_b"):
             if t.startswith(f"mkfs.ext4 -F -L {label} "):
-                seen[label] = depth
+                seen[label] = 1 if any(stack) else 0
     assert seen == {"state": 1, "root_a": 0, "root_b": 0, "var": 1}, seen
 
 

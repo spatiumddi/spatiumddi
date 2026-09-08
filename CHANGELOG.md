@@ -24,6 +24,240 @@ the formatter handles the rest.
 
 ### Added
 
+- **The appliance can install onto a RAID1 mirror, and arrays can be
+  managed from the Fleet UI (#999 Parts B + C).** #995 shipped the
+  honest refusal — a SAN LUN's paths collapsed and an md member marked
+  `[UNSUPPORTED]` — because the image had no way to create or even see
+  either. `mkosi.conf` now ships `mdadm`, `multipath-tools`, `kpartx`
+  and `lvm2`, and the refusal becomes an offer.
+  **What is mirrored is decided by what firmware can read.** `state`,
+  `root_A`, `root_B` and `var` become raid1 members; `bios_boot` and
+  the **ESP cannot** — firmware reads the ESP before any md driver
+  exists — so each disk keeps its own and `spatiumddi-esp-sync` keeps
+  them in step. That sync is the part that is easy to skip and fatal to
+  skip: every slot upgrade writes a kernel and re-stamps `grub.cfg`,
+  every set-default writes `grubenv`, and all of it lands on the
+  primary ESP. Without the sync, pulling that disk after an upgrade
+  leaves the survivor booting the OLD kernel from a stale menu — a
+  mirror that protected the data and lost the appliance. So it is
+  called from the installer, `spatium-upgrade-slot apply`,
+  `set-next-boot` and `set-default`, and is a no-op on a single-disk
+  box so no caller has to branch. The second ESP is labelled `ESP2`,
+  because two filesystems sharing `ESP` would make the fstab's
+  `LABEL=ESP` resolve to whichever udev enumerated last — `/boot/efi`
+  would be a different disk between boots and the sync would have no
+  fixed direction.
+  Arrays are **named** (`/dev/md/root_a`), not `md0..3`: kernel md
+  minor numbers are assigned in ASSEMBLY order, so a numeric name is
+  not stable across a boot with one member missing, which is the boot
+  the feature exists to survive. `metadata=1.2` puts the superblock at
+  the start, so a member is not mountable as a bare filesystem — 0.90
+  would leave it mountable, and mounting one member of a live mirror
+  read-write silently forks the data.
+  **Everything that would quietly produce something lesser is refused
+  instead**: a member smaller than the target (a RAID1 is the size of
+  its smallest member, so it would shrink `/var`), a member that
+  resolves to the target, an existing md member or multipath path, and
+  the live install medium — the #554 guard, which a preseed naming the
+  USB as `mirror_disk` would otherwise walk straight through. The
+  initrd's `mdadm.conf` is generated and **checked for ARRAY lines**,
+  because one without them yields an initrd that cannot find root, and
+  that is better discovered in the installer than at the first reboot.
+  **Multipath (C3):** the picker lists the maps themselves with their
+  path counts, `partition_node` learned kpartx's `-partN` naming, and
+  `kpartx -a` runs after the table is written — without which `mkfs`
+  against a non-existent node creates a regular FILE on the installer's
+  tmpfs and reports success. Not verified on hardware for want of a
+  SAN, and documented as such.
+  **Part B** makes the Fleet drilldown's Storage block interactive
+  (scrub start/cancel, fail / remove / add a member, reinstate a path)
+  over `POST /appliance/appliances/{id}/storage/action` — superadmin,
+  audited before dispatch so a failed attempt is recorded like a
+  successful one — plus 1 MCP tool (`propose_storage_action`, default
+  **off** per non-negotiable #13: broad-blast-radius writes whose
+  safety rests on a human typing a device path back). Nothing runs
+  `mdadm` in a container: the supervisor writes a request for the
+  host-side `spatiumddi-storage-action` runner over the trigger-file
+  plane and relays the result, so the operator gets the outcome in the
+  HTTP response rather than waiting for a heartbeat.
+  **The gates are in two places on purpose.** The control plane decides
+  what may be ASKED for — it knows who the operator is, and it is where
+  a destructive action demands the device path typed back, because a
+  generic "yes" cannot catch the mistake that actually happens (meaning
+  one disk and clicking the row for the other). The host runner decides
+  what is safe to do AT THE MOMENT of the action, re-counting the
+  array's in-sync members from the kernel, because the control plane's
+  view is up to one heartbeat old and a member can have failed since.
+  Removing the last in-sync member and removing the member the
+  bootloader lives on are **refused, not confirmed** — the first leaves
+  no array to inspect, the second leaves an array that stays green
+  while the machine silently stops booting.
+  **Found by its own test rather than by review:** the device allowlist
+  needs both `.` and `/` in its character class, and that alone admits
+  `/dev/../etc/passwd` — a traversal is now rejected by a separate
+  component check that runs first, in both the service and the runner.
+  **Two review passes found eighteen defects, and the pattern is worth
+  recording: the ones that mattered were all about the survivor.** The
+  array is the easy half. Three separate things had to be right before a
+  mirrored box would boot on one disk — `insmod mdraid1x` in `grub.cfg`
+  (without which GRUB cannot see an array and *no* mirrored install
+  boots at all), disk 2's BIOS `core.img` embedding **its own** ESP
+  rather than the primary's, and `nofail` on the ESP mount so the
+  survivor does not boot successfully and then drop into
+  `emergency.target`. Each fails silently and only on the day the disk
+  dies. Also fixed: the supervisor's reply omitted `request_id` so every
+  Part B action 422'd and timed out; `--zero-superblock` was handed a
+  sysfs path and the failure swallowed; a mirrored appliance could not be
+  reinstalled at all (both members were refused as md members, and the
+  keep-/var path pointed at a full install that was equally impossible);
+  the last-member refusal ignored the RAID level, so a 4-disk raid5 could
+  be destroyed; `add_member` refused the commonest repair there is
+  (re-adding a member on the disk you are running from); the ESP sync
+  used `--no-times`, so `--check` could never report "in sync" and every
+  sync re-copied everything; the trigger was edge-triggered, losing any
+  request written while the runner was busy; and each multipath LUN was
+  offered twice, with the raw `dm-N` row yielding partition paths kpartx
+  never creates.
+  **Then it was installed on a real two-disk box, and the boot test
+  found the one that mattered.** The install was correct; first boot
+  destroyed it. `spatium-grub-render`'s `discover_live_uuids()` — the
+  #395 fallback used when no UUIDs are passed — resolves the slot by
+  **PARTLABEL** and takes that partition's UUID. On a mirror the slot
+  partition is a `linux_raid_member`, so that UUID is the *array's*, not
+  the filesystem's. The installer passes the correct UUIDs explicitly,
+  so `grub.cfg` was right and the box booted; then the host-migration
+  re-render on first boot called this with no arguments and overwrote
+  the working menu with UUIDs `search --fs-uuid` can never match —
+  `error: no such device`, `file '/boot/vmlinuz' not found`. **Install,
+  boot once, unbootable from then on**, on a box whose arrays were
+  perfectly healthy. The fix descends to the md child (and accepts a
+  filesystem-LABEL match as a second route, which is unambiguous on both
+  layouts); a single-disk install is byte-for-byte unchanged, pinned by
+  its own test. A pre-existing #395 bug that only a mirror exposes.
+  **What the degraded boot then proved, on one disk with the other
+  detached:** GRUB found the array (`insmod mdraid1x`), booted from the
+  survivor's own `core.img` and its own ESP, and came up in 40 seconds
+  with all four arrays serving `[2/1] [_U]`, root on `/dev/md126`, and
+  `/boot/efi` **not mounted at all** — which without `nofail` would have
+  been `emergency.target`. Three separate fixes, each invisible until
+  that moment. The console read CRITICAL naming the offender throughout,
+  and the mirror was rebuilt afterwards through Part B's own `add_member`
+  — the repair the pre-review code would have refused.
+  **Two more found only by running it.** `spatiumddi-esp-sync --check`
+  reported the whole ESP as drifted on every run and re-copied it every
+  time: `-r` does not imply `-t`, so rsync compared mtimes it never
+  preserved (`--modify-window` alone fixed nothing). And the host
+  runner did not claim its request, so with `PathExistsGlob` being
+  level-triggered the service re-fired the instant it exited, tripped
+  systemd's start limit within a second, and left the **path unit itself
+  `failed`** — after which no storage action ever runs again. The first
+  request answered; the next two vanished silently. The runner now
+  renames the request to `.request.running` to claim it, exactly as the
+  pcap sibling does and as its own comment had described without
+  implementing.
+  **One alarm was removed rather than fixed.** #999 asked for "a LUN
+  down to its last path" to be critical; that needs a baseline nothing
+  has, and the installer explicitly permits a single-path LUN — so on
+  those appliances it would be critical forever, red on the console
+  forever, and clearable by no action. Zero paths is still critical; one
+  path is reported and not alarmed on.
+
+- **Storage redundancy is monitored across the fleet (#999 Part A).**
+  A mirrored root with no degraded-array alarm is a mirror that
+  silently becomes a single disk: the operator pays for two disks, the
+  array loses a member at 03:00, nothing says so, and the appliance
+  keeps serving perfectly until the survivor dies. That is strictly
+  worse than never mirroring, because it displaced the backup
+  discipline they would otherwise have kept. So the monitoring ships
+  **before** the ability to install onto a mirror (#999 Parts B + C) —
+  it is a precondition for offering the capability, not a follow-on,
+  and it is useful today on any appliance whose data disk is an
+  operator-built array. `read_storage_health()` in the supervisor
+  reads `/proc/mdstat` + `/sys/block` — the HOST's, through the
+  `privileged` + `hostPID` window `_current_slot_from_cmdline()` has
+  read the host's `/proc/cmdline` through since #170, so **no manifest
+  change** — and folds the reading into the `cluster_health` dict the
+  backend already stores verbatim, so there is **no new heartbeat
+  field, no column and no migration** (the #402 pattern). Surfaced as
+  a chip per array / map on the Cluster → Overview node cards, a
+  **Storage redundancy** block with per-member and per-path tables in
+  the Fleet drilldown, and on the TTY console's Disk row — where an
+  alarming chip goes *before* the capacity list and a healthy one
+  *after* it, because the vitals row right-truncates: a degraded array
+  must never be elided to make room for a percentage that looks normal
+  either way, and a green chip that never changes has no business
+  evicting the disk readout at 80 columns. Plus the default-on
+  `appliance_storage_degraded` alert rule and
+  1 MCP tool (`find_appliance_storage`, read-only, default on).
+  **Array state is derived, not copied.** A raid1 down to one member
+  reports `array_state=clean` — the survivor IS internally consistent
+  — so passing the kernel's word through would show a single point of
+  failure as healthy, which is the exact silence this exists to end.
+  State comes from member counts instead.
+  **Severity keys off redundancy remaining, never off that state
+  string.** `2 of 3` in a three-way mirror and `1 of 2` in a pair both
+  read "degraded", and only the second has nothing left to lose;
+  collapsing them would either page for something that can wait or
+  fail to page for something that cannot. One function
+  (`services/appliance/storage_health.py`) makes that call and the
+  alert matcher, the copilot tool and both dashboard surfaces all call
+  it, so a green chip can never sit over a red alert.
+  **A routine scrub or resync is shown on every screen and is
+  deliberately not an alert.** The issue asked for it as
+  "informational, auto-clears", which would be right if the `info`
+  severity were quiet — it is not: delivery filters a target's
+  `min_severity` against `payload["result"]`, a key alert payloads
+  never carry, and the column defaults to NULL, so an `info` event
+  notifies exactly like a critical one. Debian runs `checkarray`
+  monthly by cron, so that row would mail every operator with an
+  array, every month, about their array working correctly, which is
+  how an alarm gets muted before the night it matters. The rebuild
+  that DOES matter never reaches that branch anyway: an array with a
+  member out of sync reports `degraded` and is classified on
+  redundancy like any other.
+  **Multipath is under-sensitive by construction, and every surface
+  says so.** dm-multipath's own per-path verdict lives in the target's
+  status line, reachable only through the device-mapper ioctl
+  (`multipathd show topology`) — Part B tooling, absent from this
+  image. Fabricating `active` would turn a missing reading into a
+  false all-clear, the one answer worse than "unknown". What sysfs
+  *does* answer is each path's SCSI device state, reported alongside
+  under a different name and counted the negative way round
+  (`paths_faulted`, definite faults only) so an NVMe path with no
+  `device/state` never inflates a clean bill of health. But that
+  signal stays `running` for the commonest dm path failure there is —
+  multipathd's checker failing a path while the device is still
+  present — so **the absence of a multipath finding is not a clean
+  bill of health**, and a finding-less map renders NEUTRAL everywhere
+  rather than in the green an md array earns.
+  **Nothing unreadable is ever rendered as healthy.** An assembled
+  array whose `raid_disks` cannot be read reports `unknown` plus a
+  warning — a 0 standing in for "could not read it" would make every
+  degradation test false and drop it through to clean. One that failed
+  to *assemble* is `failed` regardless of its member count, which is
+  often 0 too, so deciding on the count first would demote a real
+  failure. `sync_completed` with no denominator reports no percentage
+  rather than borrowing `/sys/block/mdX/size`, which is the ARRAY's
+  size and would give a plausible wrong number on raid5/6. And a
+  reading that **disappears** is not a recovery: the alert engine
+  resolves any open event whose subject stops matching, so an A/B
+  rollback to a pre-#999 supervisor would announce a recovery on a node
+  whose mirror is still one disk from data loss — an appliance with an
+  open event and no current reading is held at its existing severity
+  instead. Three readings that are NOT the same are kept apart
+  throughout: no `storage` key at all means the supervisor is too old
+  to have looked (UNKNOWN — no chip, no alert), `md_supported: false`
+  means the kernel has no md support, and an empty `md_arrays` with md
+  loaded means there are genuinely no arrays. IMSM / DDF metadata
+  `container` devices are skipped entirely — permanently inactive with
+  `raid_disks=0` on a perfectly healthy box, they would otherwise raise
+  a critical alert nothing could ever clear. An appliance with neither
+  arrays nor multipath renders nothing on any surface, so the common
+  single-disk case gains no clutter.
+  Installing *to* a mirror or a LUN is still refused (#995); the
+  `mkosi.conf` packages, the initramfs work and the two-ESP sync that
+  needs are #999 Parts B + C.
+
 - **The SSH source-CIDR allowlist can now actually be enforced
   (#1009).** It has shipped since #157 and, on the default port,
   restricted nothing: `/etc/nftables.conf` opened `tcp dport 22`

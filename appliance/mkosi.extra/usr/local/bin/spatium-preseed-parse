@@ -482,10 +482,38 @@ if "confirm_wipe" in ps:
 # device to point the size-floor gate at, so when SPATIUM_FAKE_DISK_BYTES
 # is set we treat target_disk as a present whole disk of exactly that
 # many bytes. Inert on a real install (the env var is never set there).
+#
+# #999 Part C4 widened it to a PER-DISK map, because the mirror's two
+# load-bearing refusals — a member smaller than the target, and a member
+# that does not exist — are unreachable when every disk resolves at one
+# size. Both forms are accepted:
+#
+#   SPATIUM_FAKE_DISK_BYTES=68719476736                 every disk
+#   SPATIUM_FAKE_DISK_BYTES=/dev/sda=68719476736,/dev/sdb=34359738368
+#
+# In the map form a path that is NOT listed is treated as absent, which
+# is what makes "the mirror does not exist" testable.
 _FAKE_DISK_BYTES = os.environ.get("SPATIUM_FAKE_DISK_BYTES")
+_FAKE_DISK_MAP: dict[str, int] | None = None
+if _FAKE_DISK_BYTES and "=" in _FAKE_DISK_BYTES:
+    _FAKE_DISK_MAP = {}
+    for _entry in _FAKE_DISK_BYTES.split(","):
+        _k, _, _v = _entry.partition("=")
+        try:
+            _FAKE_DISK_MAP[_k.strip()] = int(_v)
+        except ValueError:
+            # Test-only seam: a malformed entry is simply not a known
+            # disk, which is the same thing the map already expresses by
+            # omission. Nothing to report — this variable is never set on
+            # a real install.
+            continue
 
 
 def resolve_disk(spec: str):
+    if _FAKE_DISK_MAP is not None:
+        if spec in _FAKE_DISK_MAP:
+            return spec, None
+        return None, f"target_disk {spec!r} does not exist"
     if _FAKE_DISK_BYTES is not None:
         return spec, None
     real = os.path.realpath(spec)
@@ -508,6 +536,8 @@ def resolve_disk(spec: str):
 def disk_size_bytes(real: str):
     """Capacity of a whole-disk /dev node via /sys/block/<name>/size
     (512-byte sectors). Returns None if unreadable."""
+    if _FAKE_DISK_MAP is not None:
+        return _FAKE_DISK_MAP.get(real)
     if _FAKE_DISK_BYTES is not None:
         try:
             return int(_FAKE_DISK_BYTES)
@@ -554,6 +584,63 @@ if target_spec:
                     "may renumber across boots — prefer a by-id path for "
                     "fleet rollouts"
                 )
+
+            # ── #999 Part C2 — optional RAID1 mirror member ──────────
+            #
+            # Only considered once the target itself is accepted: a
+            # mirror of a disk we are not installing to is meaningless,
+            # and validating it against a target that was refused would
+            # produce a second, confusing error about the wrong disk.
+            mirror_spec = as_str(ps.get("mirror_disk"))
+            if mirror_spec:
+                mreal, mwhy = resolve_disk(mirror_spec)
+                if mreal is None:
+                    # A headless run has no operator to fall back to, and
+                    # silently installing single-disk when a mirror was
+                    # asked for would hand back an appliance the operator
+                    # believes is redundant and is not.
+                    # resolve_disk phrases its reasons as "target_disk";
+                    # relabel so the operator is told which key is wrong.
+                    fail(
+                        (mwhy or f"mirror_disk {mirror_spec!r} does not exist").replace(
+                            "target_disk", "mirror_disk", 1
+                        )
+                        + " — refusing rather than installing without the "
+                        "mirror that was asked for"
+                    )
+                elif mreal == real:
+                    fail(
+                        f"mirror_disk {mirror_spec!r} resolves to the same "
+                        f"device as target_disk ({real}) — a disk cannot "
+                        "mirror itself"
+                    )
+                else:
+                    mbytes = disk_size_bytes(mreal)
+                    # raid1 is the size of its SMALLEST member, so a
+                    # smaller mirror does not fail — it silently shrinks
+                    # /var below the size the layout was sized for.
+                    if (
+                        mbytes is not None
+                        and nbytes is not None
+                        and mbytes < nbytes
+                    ):
+                        fail(
+                            f"mirror_disk {mirror_spec!r} is "
+                            f"{mbytes // 1024**3} GiB, smaller than target_disk "
+                            f"({nbytes // 1024**3} GiB). A RAID1 is the size of "
+                            "its smallest member, so this would silently shrink "
+                            "/var"
+                        )
+                    else:
+                        env["TARGET_DISK2"] = mreal
+                        env["MIRROR_MODE"] = "yes"
+                        env["PRESEED_HAS_MIRROR_DISK"] = "1"
+                        if not mirror_spec.startswith("/dev/disk/by-"):
+                            note(
+                                f"mirror_disk {mirror_spec!r} is not a stable "
+                                "/dev/disk/by-id or by-path id; prefer one for "
+                                "fleet rollouts"
+                            )
 
 # ── Hostname (RFC 1123, matching the wizard's ask_hostname) ───────────
 hostname = as_str(ps.get("hostname"))

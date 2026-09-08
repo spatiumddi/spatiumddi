@@ -30,6 +30,22 @@ spatium_preseed:
   confirm_wipe: true
   target_disk: /dev/disk/by-id/ata-QEMU_HARDDISK_QM00001
 
+  # ── Storage redundancy (#999 Part C2) ───────────────────────────────
+  # Optional. Install onto a two-disk software RAID1 mirror, so the
+  # appliance keeps running AND keeps booting when one disk dies.
+  #
+  # The OS slots, STATE and /var become md members. The EFI system
+  # partition cannot (firmware reads it before the RAID driver exists),
+  # so each disk keeps its own and SpatiumDDI syncs them on every
+  # upgrade. ALL DATA on the mirror member is destroyed too.
+  #
+  # Refused rather than silently downgraded to a single-disk install:
+  #   * a member that does not exist or is not a whole disk,
+  #   * a member that resolves to the same device as target_disk,
+  #   * a member SMALLER than target_disk — a RAID1 is the size of its
+  #     smallest member, so it would quietly shrink /var.
+  # mirror_disk: /dev/disk/by-id/ata-QEMU_HARDDISK_QM00002
+
   # ── Identity ────────────────────────────────────────────────────────
   hostname: ddi-control-1          # RFC 1123: alnum + hyphen, <= 63 chars
 
