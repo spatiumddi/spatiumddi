@@ -186,6 +186,30 @@ def _payload_timestamp(payload: dict[str, Any]) -> str:
     return datetime.now(UTC).isoformat()
 
 
+#: CEF (0-10) and LEEF (1-10) both want a NUMBER. 3/6/9 is valid in
+#: both, and the audit half of it is exactly what ``_render_cef`` has
+#: always emitted — so sharing one map adds LEEF's missing ``sev``
+#: without moving a single existing CEF line.
+_SCALED_SEVERITY = {
+    "info": 3,
+    "warn": 6,
+    "warning": 6,
+    "error": 6,
+    "denied": 9,
+    "critical": 9,
+}
+
+
+def _payload_scaled_severity(payload: dict[str, Any]) -> int:
+    """CEF / LEEF numeric severity.
+
+    Defaults to 6 (medium) rather than 3 for an unrecognised value,
+    because reporting an unknown severity as *informational* is how a
+    real event gets filtered out of a SIEM.
+    """
+    return _SCALED_SEVERITY.get(_payload_severity(payload), 6)
+
+
 def _payload_syslog_severity(payload: dict[str, Any]) -> int:
     """RFC 5424 numeric severity for the PRI field.
 
@@ -245,12 +269,7 @@ def _render_cef(payload: dict[str, Any]) -> str:
     three audit buckets to 3/6/9 for info/error/denied, and the alert
     severities alongside them (#1031).
     """
-    # ``.get`` with an explicit default, not ``[]``: an unrecognised
-    # severity must not take down a delivery. It defaults to 6 (medium)
-    # rather than 3, because reporting an unknown severity as
-    # *informational* is how a real event gets filtered out of a SIEM.
-    sev_map = {"info": 3, "warn": 6, "warning": 6, "error": 6, "denied": 9, "critical": 9}
-    sev = sev_map.get(_payload_severity(payload), 6)
+    sev = _payload_scaled_severity(payload)
     action = payload.get("action") or "audit"
     resource_type = payload.get("resource_type") or ""
     signature = f"{resource_type}:{action}" if resource_type else action
@@ -311,11 +330,30 @@ def _render_rfc5424_cef(facility: int, payload: dict[str, Any]) -> str:
     return prefix + " " + _render_cef(payload)
 
 
+#: Declared in the LEEF header's DelimiterChar field. ``^`` rather than
+#: the LEEF default of tab, because tab gets mangled over UDP on some
+#: relays — which is why ``_leef_escape`` must escape THIS character.
+_LEEF_DELIMITER = "^"
+
+
 def _leef_escape(s: Any) -> str:
     v = "" if s is None else str(s)
-    # LEEF uses tab as the default delimiter between key=value pairs, so
-    # strip tabs from values. Backslash + = escape like CEF.
-    return v.replace("\\", "\\\\").replace("=", "\\=").replace("\t", " ").replace("\n", " ")
+    # ``_render_leef`` declares ``^`` as its delimiter (DelimiterChar
+    # ``5e``), NOT the LEEF default of tab — so ``^`` is the character
+    # that must be escaped here, and it was not. An unescaped one inside
+    # a value splits the record and every field after it is lost. That
+    # got sharply more likely when free-form text started coming through
+    # (``msg`` carries an alert message, or the AI digest's generated
+    # summary), which is why it is fixed alongside them. Tabs are still
+    # flattened, since the default delimiter is what a relay may
+    # re-parse against.
+    return (
+        v.replace("\\", "\\\\")
+        .replace("=", "\\=")
+        .replace(_LEEF_DELIMITER, "\\" + _LEEF_DELIMITER)
+        .replace("\t", " ")
+        .replace("\n", " ")
+    )
 
 
 def _render_leef(payload: dict[str, Any]) -> str:
@@ -331,13 +369,25 @@ def _render_leef(payload: dict[str, Any]) -> str:
     if payload.get("kind") in ("alert", "digest"):
         event_id = str(payload.get("rule_type") or payload.get("kind") or "alert")
 
-    header = "|".join(
-        _leef_escape(x) for x in ["LEEF:2.0", "SpatiumDDI", "SpatiumDDI", "1.0", event_id, "^"]
+    # The DelimiterChar field DECLARES the delimiter; it is a header
+    # control character, not a value, so it must not go through
+    # ``_leef_escape`` — which now escapes ``^`` and would emit ``\^``,
+    # telling a parser the delimiter is backslash-caret. Caught by the
+    # pre-existing header test the moment the escape was added.
+    header = (
+        "|".join(_leef_escape(x) for x in ["LEEF:2.0", "SpatiumDDI", "SpatiumDDI", "1.0", event_id])
+        + "|"
+        + _LEEF_DELIMITER
     )
 
     fields: list[tuple[str, Any]] = [
         ("devTime", _payload_timestamp(payload)),
-        ("sev", _payload_severity(payload)),
+        # NUMERIC. LEEF 2.0 defines ``sev`` as an integer 1-10, so a
+        # word here ("critical") is not a value QRadar can map — it
+        # leaves the event at default severity, which is the same
+        # "the wire says informational" defect being fixed for the
+        # syslog PRI and for CEF.
+        ("sev", _payload_scaled_severity(payload)),
         ("devTimeFormat", "yyyy-MM-dd'T'HH:mm:ss.SSSXXX"),
         ("act", payload.get("action")),
         ("outcome", payload.get("result")),
@@ -353,7 +403,7 @@ def _render_leef(payload: dict[str, Any]) -> str:
         ("subject", payload.get("subject_display")),
         ("msg", payload.get("message")),
     ]
-    body = "^".join(f"{k}={_leef_escape(v)}" for k, v in fields if v not in (None, ""))
+    body = _LEEF_DELIMITER.join(f"{k}={_leef_escape(v)}" for k, v in fields if v not in (None, ""))
     return f"{header}|{body}"
 
 
@@ -705,14 +755,25 @@ def _target_accepts(target: dict[str, Any], payload: dict[str, Any]) -> bool:
             return False
     rtypes = target.get("resource_types") or []
     if rtypes:
-        # Alerts name their subject as ``subject_type`` — the SAME
-        # vocabulary as an audit row's ``resource_type`` (``appliance``,
-        # ``dns_zone``, …). Without the fallback, a target with an
-        # allowlist dropped every alert for want of a key, which is the
-        # #1031 failure again with a different field. Digests set
-        # ``resource_type`` themselves and are unaffected.
-        rtype = payload.get("resource_type") or payload.get("subject_type")
-        if rtype not in rtypes:
+        # Alerts name their subject as ``subject_type``, drawn from the
+        # same vocabulary as an audit row's ``resource_type``
+        # (``appliance``, ``dns_zone``, …). Without this fallback a
+        # target with an allowlist dropped every alert for want of a
+        # key — the #1031 failure again, in a different field. Digests
+        # set ``resource_type`` themselves and are unaffected.
+        #
+        # ONE rule NAMESPACES it: ``compliance_change`` fires against an
+        # audit row and reports ``audit:<resource_type>``. Matching only
+        # the raw string would leave exactly those alerts failing every
+        # allowlist — the bug this fallback exists to fix, surviving in
+        # the one rule whose subject IS an audited resource. Both forms
+        # are accepted, so an operator scoping a target to ``dns_zone``
+        # gets the compliance alerts about dns_zones too.
+        candidates = [payload.get("resource_type"), payload.get("subject_type")]
+        subject = payload.get("subject_type")
+        if isinstance(subject, str) and ":" in subject:
+            candidates.append(subject.split(":", 1)[1])
+        if not any(c in rtypes for c in candidates if c):
             return False
     return True
 

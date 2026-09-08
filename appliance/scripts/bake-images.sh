@@ -357,7 +357,7 @@ file_mtime() {
 #   1  git is unavailable / not a repo — caller falls back
 #   2  no path mapping for this image — caller falls back
 image_inputs_mtime() {
-    local paths newest t f
+    local paths newest t f d
     paths="$(image_source_paths "$1")" || return 2
     git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1 || return 1
     # $paths is a space-separated path list we control; none of the
@@ -374,8 +374,24 @@ image_inputs_mtime() {
     # rename arrows would have to be parsed; ``-z`` removes the quoting
     # git otherwise applies to unusual filenames.
     while IFS= read -r -d "" f; do
-        [ -f "$REPO_ROOT/$f" ] || continue
-        t="$(file_mtime "$REPO_ROOT/$f")" || continue
+        # A listed path that does not exist is an uncommitted DELETION,
+        # which is a source change like any other — skipping it (the
+        # first cut did) left an image judged FRESH after a file was
+        # removed without a rebuild. There is no file to stat, so use
+        # the nearest existing ancestor directory: unlink() updates the
+        # parent's mtime, and unlike stamping "now" it does not make the
+        # image permanently stale on every subsequent run.
+        t=""
+        if [ -e "$REPO_ROOT/$f" ]; then
+            t="$(file_mtime "$REPO_ROOT/$f")" || t=""
+        else
+            d="$(dirname "$REPO_ROOT/$f")"
+            while [ ! -d "$d" ] && [ "$d" != "/" ] && [ "$d" != "." ]; do
+                d="$(dirname "$d")"
+            done
+            [ -d "$d" ] && { t="$(file_mtime "$d")" || t=""; }
+        fi
+        [ -n "$t" ] || continue
         [ "$t" -gt "$newest" ] && newest="$t"
     done < <(
         # shellcheck disable=SC2086
@@ -400,8 +416,18 @@ if [ "$BAKE_SOURCE" = "local" ] && [ "$ALLOW_STALE_IMAGES" != "1" ]; then
         fi
         age=$(( $(date +%s) - created ))
 
-        inputs="$(image_inputs_mtime "$repo")"
-        case "$?" in
+        # ``inputs=$(...)`` as a BARE assignment takes the command
+        # substitution's exit status as its own, and this script runs
+        # under ``set -e`` — so rc=1 (no git) and rc=2 (no path mapping)
+        # killed the whole bake right here instead of reaching the
+        # fallback below, which was therefore dead code. Outside a git
+        # repo the bake exited 1 straight after the version banner, with
+        # nothing said. Putting the assignment in a ``||`` list is what
+        # exempts it; ``rc`` must be pre-seeded because ``$?`` is
+        # consumed by the assignment itself.
+        rc=0
+        inputs="$(image_inputs_mtime "$repo")" || rc=$?
+        case "$rc" in
             0)
                 if [ "$created" -lt "$inputs" ]; then
                     stale+=("$src (built $(( (inputs - created) / 3600 ))h BEFORE its last source change)")

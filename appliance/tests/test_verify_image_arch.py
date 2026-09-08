@@ -219,6 +219,24 @@ def test_wrong_arch_is_not_reported_as_absent(rig):
     assert r.returncode == 1
 
 
+def test_all_images_wrong_arch_reports_the_arch_error_not_make_build(rig):
+    """The flagship case, and an ORDERING bug the first cut had.
+
+    An operator on an arm64 host who ran ``make build`` without
+    DOCKER_DEFAULT_PLATFORM has EVERY image the wrong architecture. A
+    wrong-arch image sets ``bad`` without incrementing ``checked``, so
+    with the "nothing was verified" branch first they were told to "run
+    'make build'" — exactly what they had just done — and the one line
+    that actually fixes it never printed. Both exits are 1; the
+    difference is whether the message sends them in a circle.
+    """
+    r = rig(["wrong-single"])
+    assert r.returncode == 1
+    assert "wrong architecture" in r.stderr
+    assert "DOCKER_DEFAULT_PLATFORM" in r.stderr
+    assert "run 'make build'" not in r.stderr
+
+
 def test_unreadable_image_list_is_an_error(rig):
     r = rig([], list_exit=1)
     assert r.returncode == 1

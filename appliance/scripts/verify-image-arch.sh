@@ -154,6 +154,24 @@ main() {
         fi
     done
 
+    # WRONG-ARCH IS REPORTED FIRST, and the order is the point.
+    #
+    # A wrong-arch image sets ``bad`` without incrementing ``checked``,
+    # so on the flagship case — an operator on an arm64 host who ran
+    # ``make build`` without DOCKER_DEFAULT_PLATFORM, leaving EVERY image
+    # the wrong arch — ``checked`` is still 0. With the "nothing was
+    # verified" branch first, they were told to "run 'make build'", which
+    # is exactly what they had just done, and the one line that fixes it
+    # never printed. Both exits are 1; the difference is whether the
+    # message sends them in a circle.
+    if [ "$bad" != 0 ]; then
+        echo "" >&2
+        echo "ERROR: source images are the wrong architecture for this appliance." >&2
+        echo "       Rebuild them with DOCKER_DEFAULT_PLATFORM=$APPLIANCE_ARCH, or use" >&2
+        echo "       'make appliance-baked-iso-cross' which sets it for you." >&2
+        return 1
+    fi
+
     if [ "$checked" = 0 ]; then
         echo "ERROR: no source image was verified as $WANT — run 'make build'" >&2
         echo "       (and 'make build-supervisor') before verifying." >&2
@@ -161,14 +179,6 @@ main() {
             echo "       ($unpulled image(s) list $WANT but have not pulled its content," >&2
             echo "        which says nothing about the images the bake will build.)" >&2
         fi
-        return 1
-    fi
-
-    if [ "$bad" != 0 ]; then
-        echo "" >&2
-        echo "ERROR: source images are the wrong architecture for this appliance." >&2
-        echo "       Rebuild them with DOCKER_DEFAULT_PLATFORM=$APPLIANCE_ARCH, or use" >&2
-        echo "       'make appliance-baked-iso-cross' which sets it for you." >&2
         return 1
     fi
     return 0

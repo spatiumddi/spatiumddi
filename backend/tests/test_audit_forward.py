@@ -9,6 +9,7 @@ network send, not the real wire.
 
 from __future__ import annotations
 
+import re
 import uuid
 from unittest.mock import AsyncMock, patch
 
@@ -393,7 +394,8 @@ def test_alert_cef_carries_the_rule_not_the_word_audit() -> None:
 def test_alert_leef_carries_the_rule_not_the_word_audit() -> None:
     out = svc.render_for_target("rfc5424_leef", facility=16, payload=_alert())
     assert "|appliance_storage_degraded|^" in out
-    assert "sev=critical" in out
+    # ``sev`` is numeric — see test_leef_severity_is_numeric_not_a_word.
+    assert "sev=9" in out
     assert "ruleName=Appliance storage degraded" in out
 
 
@@ -425,3 +427,81 @@ def test_unrankable_severity_fails_open() -> None:
     operator wanted the event; silently swallowing it is the bug."""
     target = {"kind": "syslog", "min_severity": "error", "resource_types": None}
     assert svc._target_accepts(target, _alert(severity="catastrophic")) is True
+
+
+# ── LEEF conformance + the namespaced subject (code-review follow-ups)
+
+
+def test_leef_severity_is_numeric_not_a_word() -> None:
+    """LEEF 2.0 defines ``sev`` as an integer 1-10. A word is not a value
+    QRadar can map, so it leaves the event at default severity — the same
+    "the wire says informational" defect fixed for the PRI and for CEF,
+    reintroduced by the field that was added to fix them."""
+    out = svc.render_for_target("rfc5424_leef", facility=16, payload=_alert())
+    assert "sev=9" in out
+    assert "sev=critical" not in out
+    warn = svc.render_for_target("rfc5424_leef", facility=16, payload=_alert(severity="warning"))
+    assert "sev=6" in warn
+    info = svc.render_for_target("rfc5424_leef", facility=16, payload=_digest())
+    assert "sev=3" in info
+
+
+def test_leef_severity_matches_cef_for_audit_rows() -> None:
+    """One numeric map serves both renderers, so they cannot disagree
+    about how severe the same event was."""
+    for result, expected in (("success", 3), ("failed", 6), ("denied", 9)):
+        payload = _payload(result=result)
+        leef = svc.render_for_target("rfc5424_leef", facility=16, payload=payload)
+        cef = svc.render_for_target("rfc5424_cef", facility=16, payload=payload)
+        assert f"sev={expected}" in leef, result
+        assert f"|{expected}|" in cef, result
+
+
+def test_leef_escapes_its_own_delimiter() -> None:
+    """``_render_leef`` declares ``^`` as the delimiter, not LEEF's
+    default tab — so ``^`` is what has to be escaped, and it was not. An
+    unescaped one splits the record and every field after it is lost.
+    Free-form text (an alert message, the AI digest's generated summary)
+    now flows through here, which is what makes it reachable."""
+    out = svc.render_for_target(
+        "rfc5424_leef",
+        facility=16,
+        payload=_alert(message="array ^ degraded", subject_display="node^1"),
+    )
+    body = out.split("|^|", 1)[1]
+    # Split on UNESCAPED delimiters only — which is what a conforming
+    # parser does, and the thing being asserted. Every resulting field
+    # must be one key=value; an unescaped ``^`` inside a value produces
+    # a fragment with no "=" in it.
+    for field in re.split(r"(?<!\\)\^", body):
+        assert "=" in field, f"unescaped delimiter split the record: {field!r}"
+    assert "msg=array \\^ degraded" in out
+    assert "subject=node\\^1" in out
+    # The header's DelimiterChar DECLARES the delimiter and must stay
+    # unescaped, or a parser reads it as backslash-caret.
+    assert "|^|" in out
+    assert "|\\^|" not in out
+
+
+def test_cef_audit_severities_are_unchanged() -> None:
+    """Sharing the numeric map with LEEF must not have moved CEF."""
+    assert "|example.com.|3|" in svc.render_for_target(
+        "rfc5424_cef", facility=16, payload=_payload(result="success")
+    )
+    assert "|example.com.|9|" in svc.render_for_target(
+        "rfc5424_cef", facility=16, payload=_payload(result="denied")
+    )
+
+
+def test_resource_types_allowlist_matches_a_namespaced_subject() -> None:
+    """``compliance_change`` reports ``subject_type="audit:<type>"``
+    because its subject IS an audited resource. Matching only the raw
+    string left exactly those alerts failing every allowlist — the bug
+    the fallback exists to fix, surviving in the one rule that namespaces
+    its subject."""
+    target = {"kind": "syslog", "min_severity": None, "resource_types": ["dns_zone"]}
+    assert svc._target_accepts(target, _alert(subject_type="audit:dns_zone")) is True
+    assert svc._target_accepts(target, _alert(subject_type="audit:subnet")) is False
+    # The bare form still matches, and an unrelated one still does not.
+    assert svc._target_accepts(target, _alert(subject_type="dns_zone")) is True
+    assert svc._target_accepts(target, _alert(subject_type="appliance")) is False

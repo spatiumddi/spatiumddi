@@ -459,6 +459,12 @@ Alert severities map onto the same RFC 5424 scale: `critical` → 2 crit,
 byte-identical to what they always were, because moving them would move
 every line an existing collector already indexes.
 
+CEF and LEEF carry the same severity on their own **numeric** scales
+(3 / 6 / 9), from one shared map so the two renderers cannot disagree
+about how severe the same event was. LEEF's `sev` is new — LEEF 2.0
+defines it as an integer 1–10, and a word there is not something QRadar
+can map, so it would have left every alert at default severity.
+
 **Per-target filters.**
 - `min_severity` — drop events below this bucket (info / warn /
   error / denied). Null = forward everything. Alert severities rank on
@@ -469,9 +475,14 @@ every line an existing collector already indexes.
 - `resource_types` — optional allowlist of `AuditLog.resource_type`.
   Null / empty = forward everything. Useful for compliance-scoped
   targets that should only see, say, auth + IPAM events. An alert names
-  its subject as `subject_type` — the same vocabulary — and is matched
-  against that, or a target carrying an allowlist would drop every alert
-  for want of a key.
+  its subject as `subject_type`, drawn from the same vocabulary, and is
+  matched against that — without it a target carrying an allowlist
+  dropped every alert for want of a key. One rule **namespaces** its
+  subject: `compliance_change` fires against an audit row and reports
+  `audit:<resource_type>`, so both the raw and the suffix form are
+  accepted. Matching only the raw string would have left exactly those
+  alerts failing every allowlist — the same bug, surviving in the one
+  rule whose subject genuinely is an audited resource.
 
 > **Behaviour change in this release (#1031).** Before it, a target with
 > a non-null `min_severity` dropped **every** alert including criticals,

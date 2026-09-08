@@ -54,8 +54,29 @@ SRC = SCRIPT.read_text()
 _FUNCS = ("image_source_paths", "file_mtime", "image_inputs_mtime")
 
 
+def _shipped_set_options() -> str:
+    """The script's OWN ``set`` line, not a convenient subset.
+
+    The first cut hardcoded ``set -uo pipefail`` — dropping the ``-e``
+    the script actually runs under — and that is precisely why these
+    tests passed over a bug that aborted the whole bake: a bare
+    ``x="$(f)"`` assignment takes the substitution's exit status as its
+    own, so under ``-e`` a non-zero return kills the script instead of
+    reaching the caller's fallback. A harness that runs the shipped
+    bytes in a shell the shipped bytes never see is not testing them.
+    """
+    m = re.search(r"^set -[a-z]+ ?[a-z]*$", SRC, re.M)
+    assert m, "no 'set -...' line found in the shipped script"
+    return m.group(0)
+
+
 def _preamble() -> str:
-    return "set -uo pipefail\n" + "\n".join(extract_fn(f, SRC) for f in _FUNCS) + "\n"
+    return (
+        _shipped_set_options()
+        + "\n"
+        + "\n".join(extract_fn(f, SRC) for f in _FUNCS)
+        + "\n"
+    )
 
 
 def _git(repo: Path, *args: str, **kw) -> subprocess.CompletedProcess[str]:
@@ -125,8 +146,14 @@ def _run(repo: Path, body: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+#: How a caller under ``set -e`` must invoke it — the bare form aborts.
+#: This is the shape ``bake-images.sh`` itself now uses, so the tests
+#: exercise the real call site rather than a laxer one.
+_CALL = 'rc=0; out="$(image_inputs_mtime "{image}")" || rc=$?; echo "$out"; echo "rc=$rc"'
+
+
 def _inputs_mtime(repo: Path, image: str) -> tuple[int, int]:
-    r = _run(repo, f'image_inputs_mtime "{image}"; echo "rc=$?"')
+    r = _run(repo, _CALL.format(image=image))
     assert r.returncode == 0, r.stderr
     rc = int(re.search(r"rc=(\d+)", r.stdout).group(1))
     value = r.stdout.split("rc=")[0].strip()
@@ -287,7 +314,7 @@ def test_outside_a_git_repo_reports_rc_1(tmp_path: Path):
     rather than answer 0."""
     plain = tmp_path / "notarepo"
     (plain / "backend").mkdir(parents=True)
-    r = _run(plain, 'image_inputs_mtime "ghcr.io/spatiumddi/spatiumddi-api"; echo "rc=$?"')
+    r = _run(plain, _CALL.format(image="ghcr.io/spatiumddi/spatiumddi-api"))
     assert "rc=1" in r.stdout
 
 
@@ -301,3 +328,118 @@ def test_file_mtime_works_on_this_host(tmp_path: Path):
     r = _run(tmp_path, f'file_mtime "{f}"')
     assert r.returncode == 0, r.stderr
     assert abs(int(r.stdout.strip()) - int(f.stat().st_mtime)) <= 1
+
+
+# ── The guard must not abort the bake it guards ────────────────────
+
+
+def _stub_build_host(bindir: Path) -> None:
+    """Stub the two binaries the script requires of a build host.
+
+    ``docker`` answers every call successfully, printing a fresh
+    RFC 3339 timestamp. Unconditional on purpose: the existence probe
+    redirects stdout to /dev/null, so one behaviour serves both calls.
+    An earlier cut tried to tell them apart and got it wrong, which sent
+    every image down the ``undated`` branch — and that branch
+    ``continue``s BEFORE the assignment under test, so the test passed
+    over the very bug it was written for.
+
+    ``zstd`` is stubbed rather than skipped-around: the script's
+    prerequisite check runs before the guard and aborts without it, so
+    on a runner that has no zstd — the CI image, as it happens — a
+    ``skipif`` would leave this test silently not running. Which is the
+    failure class this whole change is about.
+    """
+    bindir.mkdir(parents=True, exist_ok=True)
+    docker = bindir / "docker"
+    docker.write_text(
+        "#!/usr/bin/env bash\ndate -u +%Y-%m-%dT%H:%M:%S.000000000Z\nexit 0\n"
+    )
+    docker.chmod(0o755)
+    zstd = bindir / "zstd"
+    zstd.write_text("#!/usr/bin/env bash\nexit 0\n")
+    zstd.chmod(0o755)
+
+
+def _run_whole_script(tree: Path, tmp_path: Path) -> subprocess.CompletedProcess[str]:
+    """The shipped script, end to end, in ``tree``."""
+    bindir = tmp_path / "stubbin"
+    _stub_build_host(bindir)
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}:{env['PATH']}"
+    env["SPATIUMDDI_VERSION"] = "test"
+    return subprocess.run(
+        ["bash", str(tree / "appliance" / "scripts" / SCRIPT.name)],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+
+@pytest.fixture
+def tree(tmp_path: Path) -> Path:
+    """A checkout-shaped directory with the shipped script in place and
+    NO git repository — the tarball-download case."""
+    t = tmp_path / "tree"
+    (t / "appliance" / "scripts").mkdir(parents=True)
+    for name in SCRIPT.parent.iterdir():
+        if name.is_file():
+            dest = t / "appliance" / "scripts" / name.name
+            dest.write_bytes(name.read_bytes())
+            dest.chmod(0o755)
+    for d in ("backend", "frontend", "agent"):
+        (t / d).mkdir()
+    return t
+
+
+def test_no_git_falls_back_instead_of_killing_the_bake(tree: Path, tmp_path: Path):
+    """The regression that mattered most, and the one the first cut of
+    THIS suite could not see.
+
+    ``inputs="$(image_inputs_mtime ...)"`` is a bare assignment, and the
+    script runs under ``set -e``: the substitution's non-zero status
+    becomes the assignment's, so rc=1 (no git) and rc=2 (no mapping)
+    killed the bake outright rather than reaching the ``case`` fallback
+    below them — which was therefore dead code, while the CHANGELOG
+    described it as the safety net. Outside a git repo the bake exited 1
+    immediately after the version banner with nothing said about why.
+    """
+    r = _run_whole_script(tree, tmp_path)
+    assert "no build-input mapping (or no git)" in r.stderr, r.stderr
+    # It got PAST the guard: either into the bake proper or to a later
+    # failure, but not aborted at the assignment.
+    assert "fell back to the weaker" in r.stderr
+
+
+def test_the_fallback_warning_is_not_dead_code(tree: Path, tmp_path: Path):
+    """Same defect from the other side: every image must be NAMED, so a
+    weaker check is never silent."""
+    r = _run_whole_script(tree, tmp_path)
+    for name in ("spatiumddi-api", "dns-bind9", "spatium-supervisor"):
+        assert name in r.stderr, name
+
+
+def test_an_uncommitted_deletion_moves_the_input_timestamp(repo: Path):
+    """``git diff --name-only`` lists a deleted path, and the first cut
+    skipped it with ``[ -f ] || continue`` — so removing a source file
+    and not rebuilding left the image judged FRESH, which is exactly the
+    "I forgot to rebuild" case the guard exists for. Resolved from the
+    parent directory's mtime, which unlink() updates."""
+    before, _ = _inputs_mtime(repo, "ghcr.io/spatiumddi/spatiumddi-api")
+    time.sleep(1.1)
+    (repo / "backend/f.txt").unlink()
+    after, _ = _inputs_mtime(repo, "ghcr.io/spatiumddi/spatiumddi-api")
+    assert after > before
+
+
+def test_a_deletion_does_not_make_the_image_permanently_stale(repo: Path):
+    """The reason a deletion resolves to the parent directory rather than
+    to ``now``: a moving target would report the image stale on every
+    run, including immediately after the rebuild that was supposed to
+    clear it."""
+    (repo / "backend/f.txt").unlink()
+    first, _ = _inputs_mtime(repo, "ghcr.io/spatiumddi/spatiumddi-api")
+    time.sleep(1.1)
+    second, _ = _inputs_mtime(repo, "ghcr.io/spatiumddi/spatiumddi-api")
+    assert first == second

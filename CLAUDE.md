@@ -2344,6 +2344,21 @@ suggestion, free-space treemap.
   decision to drop the RAID-scrub finding — `info` is mutable now, but the column
   still defaults to NULL, so a finding quiet only for operators who configured it is
   not quiet, and it stays out. No migration, no new endpoint, no MCP change.
+  **Three more from /code-review, all in the SIEM formats.** LEEF 2.0 defines `sev` as an
+  integer 1–10, and the newly-added field emitted the word `critical` — not a value QRadar
+  can map, so it leaves the event at default severity: the same "the wire says
+  informational" defect being fixed for the PRI and for CEF, reintroduced by the fix.
+  `_leef_escape` did not escape `^`, the delimiter *this* renderer declares (its comment
+  described LEEF's default tab instead), and the diff had just started routing free-form
+  text through it — an alert message, or the AI digest's generated summary — where an
+  unescaped one splits the record and loses every field after it. **Fixing that broke the
+  header**, caught by the pre-existing header test: the DelimiterChar field declares the
+  delimiter and is a control character, not a value, so escaping it emitted a
+  backslash-caret and told a parser that was the delimiter. And the `subject_type`
+  fallback missed the one rule that NAMESPACES its subject — `compliance_change` reports
+  `audit:<resource_type>` — so precisely those alerts still failed every `resource_types`
+  allowlist, which is the bug the fallback exists to fix surviving in the one rule whose
+  subject genuinely is an audited resource.
 
 - ✅ [**Three build-guard defects that each made a guard useless in its own way**](https://github.com/spatiumddi/spatiumddi/issues/1028)
   ([#1029](https://github.com/spatiumddi/spatiumddi/issues/1029),
@@ -2394,10 +2409,28 @@ suggestion, free-space treemap.
   temp file so a failed run leaves no empty listing behind. A sweep found no other
   producer/consumer guard with this shape.
   Every one of the three is covered by tests that **execute the shipped script** against
-  stubs, and every test was run against the unpatched code first: 23 new appliance
+  stubs, and every test was run against the unpatched code first: 27 new appliance
   cases, plus one pre-existing test loosened from pinning a function *name* to pinning
   the *shape* it was really asserting, because #1029's rename had made a correct guard
   report itself as a regression.
+  **/code-review found six, and the worst was the fix reproducing the bug class it was
+  fixing.** `inputs="$(image_inputs_mtime "$repo")"` is a BARE assignment, which takes the
+  command substitution's exit status as its own — and the script runs under `set -e`, so
+  rc=1 (no git) and rc=2 (no mapping) killed the whole bake right there instead of
+  reaching the `case` fallback, which was therefore dead code while the CHANGELOG
+  described it as the safety net. Outside a git repo the bake exited 1 straight after the
+  version banner, saying nothing. **The new tests could not see it because the harness
+  dropped `-e`** — it hardcoded `set -uo pipefail` instead of reading the script's own
+  `set` line, so it ran the shipped bytes in a shell the shipped bytes never meet. That is
+  the lesson rather than the shell trivia; the harness now extracts the real options, and
+  doing so immediately failed two existing tests for the same reason. Also:
+  `verify-image-arch.sh` reported "nothing was verified — run `make build`" AHEAD of the
+  wrong-arch verdict, so the flagship case (every image wrong, because `make build` ran
+  without `DOCKER_DEFAULT_PLATFORM`) told the operator to do exactly what they had just
+  done and never printed the line that fixes it. And an uncommitted *deletion* was skipped
+  by `[ -f ] || continue`, leaving an image judged fresh after a source file was removed —
+  now resolved from the parent directory's mtime, which `unlink()` updates and which,
+  unlike stamping "now", does not make the image permanently stale on every later run.
 
 #### CLI tool
 

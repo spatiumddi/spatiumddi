@@ -552,7 +552,15 @@ the formatter handles the rest.
   selectable, and a threshold that silently opts you out of the
   most severe alerts is the defect itself, one notch narrower. A
   target's `resource_types` allowlist now matches an alert's
-  `subject_type` — the same vocabulary — for the same reason.
+  `subject_type` — the same vocabulary — for the same reason,
+  including the `audit:<type>` form `compliance_change` uses,
+  which would otherwise have been the one alert kind still
+  failing every allowlist. LEEF gains the numeric `sev` field it
+  never had (an integer 1–10 per LEEF 2.0, sharing CEF's scale so
+  the two cannot disagree about the same event), and
+  `_leef_escape` now escapes `^`, the delimiter this renderer
+  declares — an unescaped one in the free-form `msg` splits the
+  record and loses every field after it.
   **The audit mappings are byte-identical**, pinned by a test:
   moving them would move every line an existing collector already
   indexes. **This is a behaviour change to read deliberately.**
