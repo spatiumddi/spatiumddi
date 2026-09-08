@@ -25,6 +25,9 @@ import re
 from pathlib import Path
 
 BIN = Path(__file__).parent.parent / "mkosi.extra" / "usr" / "local" / "bin"
+#: Build-host scripts (``bake-images.sh``, ``wrap-iso.sh``, …). A
+#: different directory from BIN, which holds what ships ON the appliance.
+SCRIPTS = Path(__file__).parent.parent / "scripts"
 INSTALLER = BIN / "spatium-install"
 PARSER = BIN / "spatium-preseed-parse"
 

@@ -14,10 +14,11 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from email.utils import format_datetime
 from typing import Any
 
 import structlog
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.orm import attributes
@@ -25,6 +26,7 @@ from sqlalchemy.orm import attributes
 from app.api.deps import DB, CurrentUser
 from app.core.crypto import encrypt_str
 from app.core.demo_mode import forbid_in_demo_mode
+from app.core.http_etag import etag_matches, format_etag
 from app.core.permissions import is_effective_superadmin
 from app.core.responses import ZipResponse
 from app.models.audit import AuditLog
@@ -39,6 +41,7 @@ from app.services.backup.targets import (
     BackupDestinationError,
     DestinationConfigError,
     SecretFieldError,
+    UnsupportedOperationError,
     decrypt_config_secrets,
     encrypt_config_secrets,
     get_destination,
@@ -58,6 +61,44 @@ def _valid_kinds() -> set[str]:
     from app.services.backup.targets.base import DESTINATIONS  # noqa: PLC0415
 
     return set(DESTINATIONS)
+
+
+def _resolve_write_only(driver, requested: bool) -> bool:
+    """A kind with no listing and no delete is write-only whatever the
+    operator asked for (#989 item 2).
+
+    Forcing it is not paternalism: with ``write_only=False`` the row
+    would accept a retention policy that can never run, and the nightly
+    prune would report success while deleting nothing. Better to make
+    the row state true than to let two settings disagree.
+    """
+    return True if driver.inherently_write_only else requested
+
+
+def _assert_retention_is_reachable(driver, *, write_only: bool, keep_n, keep_days) -> None:
+    """Refuse a retention policy that could never be applied.
+
+    A write-only target skips the prune by design, so accepting
+    ``retention_keep_last_n`` alongside it would leave the operator with
+    a number on screen that does nothing — the failure mode this whole
+    item exists to remove, reintroduced one field over.
+    """
+    if not write_only:
+        return
+    if keep_n is None and keep_days is None:
+        return
+    reason = (
+        "this destination kind cannot delete, so retention is the receiver's own policy"
+        if driver.inherently_write_only
+        else "a write-only target never prunes — retention is the destination's own policy"
+    )
+    raise HTTPException(
+        status_code=422,
+        detail=(
+            f"retention cannot be set on a write-only target: {reason}. "
+            "Clear retention_keep_last_n / retention_keep_days, or turn write_only off."
+        ),
+    )
 
 
 def _require_superadmin(current_user: CurrentUser) -> None:
@@ -82,6 +123,7 @@ class BackupTargetCreate(BaseModel):
     schedule_cron: str | None = Field(default=None, max_length=120)
     retention_keep_last_n: int | None = Field(default=None, ge=0, le=10_000)
     retention_keep_days: int | None = Field(default=None, ge=0, le=10_000)
+    write_only: bool = False
 
     @field_validator("kind")
     @classmethod
@@ -109,6 +151,7 @@ class BackupTargetUpdate(BaseModel):
     schedule_cron: str | None = None
     retention_keep_last_n: int | None = Field(default=None, ge=0, le=10_000)
     retention_keep_days: int | None = Field(default=None, ge=0, le=10_000)
+    write_only: bool | None = None
     drill_enabled: bool | None = None
     drill_cron: str | None = None
 
@@ -125,6 +168,7 @@ class BackupTargetResponse(BaseModel):
     schedule_cron: str | None
     retention_keep_last_n: int | None
     retention_keep_days: int | None
+    write_only: bool
     last_run_status: str
     last_run_at: datetime | None
     last_run_filename: str | None
@@ -165,6 +209,7 @@ def _to_response(t: BackupTarget) -> BackupTargetResponse:
         schedule_cron=t.schedule_cron,
         retention_keep_last_n=t.retention_keep_last_n,
         retention_keep_days=t.retention_keep_days,
+        write_only=t.write_only,
         last_run_status=t.last_run_status,
         last_run_at=t.last_run_at,
         last_run_filename=t.last_run_filename,
@@ -186,7 +231,13 @@ def _to_response(t: BackupTarget) -> BackupTargetResponse:
 
 
 class BackupTargetKinds(BaseModel):
-    """The destination kinds this build supports (s3 / sftp / …)."""
+    """The destination kinds this build supports (s3 / sftp / …).
+
+    Each entry carries ``inherently_write_only`` so the form can render
+    the write-only switch as forced-on for a kind that has no listing
+    and no delete at all (#989 item 2), rather than letting the operator
+    set a retention policy that could never run.
+    """
 
     kinds: list[dict[str, Any]]
 
@@ -237,8 +288,20 @@ async def create_target(
     driver = get_destination(body.kind)
     try:
         driver.validate_config(body.config)
+        # Second pass, allowed to resolve DNS (the https_put SSRF guard).
+        # Only at create / update / test — never on the scheduled-run
+        # path, which must not depend on a resolver.
+        await driver.validate_config_network(body.config)
     except DestinationConfigError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    write_only = _resolve_write_only(driver, body.write_only)
+    _assert_retention_is_reachable(
+        driver,
+        write_only=write_only,
+        keep_n=body.retention_keep_last_n,
+        keep_days=body.retention_keep_days,
+    )
 
     # Encrypt any ``secret=True`` fields before they hit the
     # JSONB column. Driver got plaintext for validation; storage
@@ -264,6 +327,7 @@ async def create_target(
         schedule_cron=body.schedule_cron,
         retention_keep_last_n=body.retention_keep_last_n,
         retention_keep_days=body.retention_keep_days,
+        write_only=write_only,
         next_run_at=next_run,
     )
     db.add(row)
@@ -280,6 +344,7 @@ async def create_target(
                 "kind": body.kind,
                 "enabled": body.enabled,
                 "schedule_cron": body.schedule_cron,
+                "write_only": write_only,
             },
         )
     )
@@ -313,8 +378,25 @@ async def update_target(
             ),
         )
 
+    driver = get_destination(row.kind)
+    # ``exclude_unset`` keeps a key the client explicitly set to null, and
+    # ``write_only`` is ``bool | None`` in the update model — so a literal
+    # ``{"write_only": null}`` (which the published OpenAPI declares legal,
+    # so a generated client will send it) would otherwise reach a NOT NULL
+    # column and answer 500, not 422, because the #922 integrity handler
+    # deliberately re-raises a NOT NULL violation. An explicit null means
+    # "leave it alone", which is what every nullable field on this handler
+    # already does. Same class as #700.
+    requested_write_only = payload.get("write_only")
+    if requested_write_only is None:
+        requested_write_only = row.write_only
+    new_write_only = _resolve_write_only(driver, requested_write_only)
+    _assert_retention_is_reachable(
+        driver, write_only=new_write_only, keep_n=new_keep_n, keep_days=new_keep_days
+    )
+    row.write_only = new_write_only
+
     if "config" in payload:
-        driver = get_destination(row.kind)
         # PATCH semantics for secret fields: an operator who only
         # changes the bucket name shouldn't have to retype the
         # secret access key. ``merge_config_for_update`` keeps the
@@ -324,6 +406,7 @@ async def update_target(
         merged = merge_config_for_update(driver, incoming=payload["config"], existing=row.config)
         try:
             driver.validate_config(merged)
+            await driver.validate_config_network(merged)
         except DestinationConfigError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         # Re-encrypt — fields carried over are already wrapped
@@ -459,9 +542,17 @@ async def run_target_now(target_id: uuid.UUID, db: DB, current_user: CurrentUser
 
 @router.post("/{target_id}/test")
 async def test_target(target_id: uuid.UUID, db: DB, current_user: CurrentUser) -> dict[str, Any]:
-    """Connectivity probe — write + list + delete a tiny file at
-    the destination. Doesn't touch the DB or build a real
-    archive.
+    """Connectivity probe — write a tiny file at the destination, verify
+    it, and remove it. Doesn't touch the DB or build a real archive.
+
+    **The probe object is not always removed, and the result says so.**
+    A write-only S3 key has no ``DeleteObject`` grant and ``https_put``
+    has no delete verb at all; in both cases the probe still passes and
+    reports ``probe_retained: true``, naming the object left behind —
+    failing there is what trains operators to widen a deliberately narrow
+    credential. On a single-object (presigned) ``https_put`` URL the
+    probe is refused outright rather than run, because writing it would
+    overwrite the stored archive.
     """
     _require_superadmin(current_user)
     row = await db.get(BackupTarget, target_id)
@@ -499,6 +590,8 @@ async def list_target_archives(
         archives = await driver.list_archives(config=plain_config)
     except SecretFieldError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except UnsupportedOperationError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except BackupDestinationError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     return [
@@ -523,12 +616,24 @@ async def download_latest_target_archive(
     target_id: uuid.UUID,
     db: DB,
     current_user: CurrentUser,
+    request: Request,
 ):
     """One-shot 'give me the newest archive at this target'
     download (issue #117 Phase 3). Resolves to the same code path
     as the explicit-filename download below — we just look up the
     newest entry from ``driver.list_archives`` first. Returns 404
     when the target has no archives yet.
+
+    This is the pull-mode entry point (#989 item 4): an external backup
+    tool (Veeam, Bacula, a cron ``curl``) fetches from here with an API
+    token restricted via ``allowed_paths`` to this one route.
+
+    It is conditional. Archive filenames are timestamped and the bytes
+    under a given name never change, so the filename *is* a strong
+    validator — ``ETag`` plus ``If-None-Match`` turns a poller's second
+    run into a 304 instead of a re-download of a multi-GB archive. The
+    ETag is computed from the listing, so an unchanged archive costs one
+    list call and no transfer at all.
     """
     from fastapi.responses import StreamingResponse  # noqa: PLC0415
 
@@ -536,6 +641,16 @@ async def download_latest_target_archive(
     row = await db.get(BackupTarget, target_id)
     if row is None:
         raise HTTPException(status_code=404, detail="backup target not found")
+    if row.write_only:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "this target is write-only, so SpatiumDDI cannot read archives back "
+                "from it — pull mode needs a destination it can list and download. "
+                "Point the puller at a readable target (a local_volume staging "
+                "target is the usual answer), or fetch from the destination directly."
+            ),
+        )
     driver = get_destination(row.kind)
     try:
         plain_config = decrypt_config_secrets(driver, row.config)
@@ -548,6 +663,23 @@ async def download_latest_target_archive(
         raise HTTPException(status_code=404, detail=f"no archives at target {row.name!r}")
     # ``list_archives`` already returns newest-first by contract.
     newest = archives[0]
+    # ``format_etag`` / ``etag_matches`` from app.core.http_etag rather
+    # than a local pair: that module already handles ``*``, comma lists,
+    # the ``W/`` prefix and the legacy unquoted spelling, and it mints a
+    # WEAK tag — #862's lesson, that nginx's gzip filter strips a strong
+    # validator, so a hand-rolled strong ETag silently stops conditioning
+    # anything the moment a client sends ``Accept-Encoding: gzip``.
+    etag = format_etag(newest.filename)
+    if etag_matches(request.headers.get("if-none-match"), newest.filename):
+        # 304 must carry the validators and no body (RFC 9110 §15.4.5).
+        return Response(
+            status_code=304,
+            headers={
+                "ETag": etag,
+                "Last-Modified": format_datetime(newest.created_at, usegmt=True),
+                "Cache-Control": "private, no-cache",
+            },
+        )
     try:
         archive_bytes = await driver.download(config=plain_config, filename=newest.filename)
     except BackupDestinationError as exc:
@@ -562,6 +694,11 @@ async def download_latest_target_archive(
         headers={
             "Content-Disposition": f'attachment; filename="{newest.filename}"',
             "Content-Length": str(len(archive_bytes)),
+            "ETag": etag,
+            "Last-Modified": format_datetime(newest.created_at, usegmt=True),
+            # The archive is encrypted, but it is still the whole
+            # install — no shared cache should hold it.
+            "Cache-Control": "private, no-cache",
         },
     )
 
@@ -579,6 +716,7 @@ async def download_target_archive(
     filename: str,
     db: DB,
     current_user: CurrentUser,
+    request: Request,
 ):
     """Stream a stored archive back to the operator's browser as a
     zip download. Works the same way for every destination kind —
@@ -596,13 +734,39 @@ async def download_target_archive(
         raise HTTPException(status_code=404, detail="backup target not found")
     driver = get_destination(row.kind)
     safe_name = filename.replace("/", "").replace("\\", "")
+    etag = format_etag(safe_name)
+    # **The conditional check has to come AFTER the archive is resolved.**
+    #
+    # The ETag here is derived from the client's own path parameter, so a
+    # 304 returned before the lookup asserts "unchanged and present" about
+    # something nobody has looked for. A pull-mode poller that cached an
+    # archive which retention has since removed would then be told 304
+    # forever and never notice its copy is the only one left; and
+    # ``If-None-Match: *`` would answer 304 for a name that never existed,
+    # which RFC 9110 §13.2.1 forbids — a precondition is only evaluated
+    # when the unconditional response would be 2xx. The sibling ``latest``
+    # route gets this right by construction, because its validator comes
+    # out of a real listing.
     try:
         plain_config = decrypt_config_secrets(driver, row.config)
         archive_bytes = await driver.download(config=plain_config, filename=safe_name)
     except SecretFieldError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except UnsupportedOperationError as exc:
+        # A write-only kind cannot read an archive back. 409 rather than
+        # the generic 502 below, so the reason is legible instead of
+        # looking like the destination is down.
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except BackupDestinationError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    # The archive exists and is readable — only now is a precondition
+    # meaningful.
+    if etag_matches(request.headers.get("if-none-match"), safe_name):
+        return Response(
+            status_code=304,
+            headers={"ETag": etag, "Cache-Control": "private, no-cache"},
+        )
 
     def _iter():
         yield archive_bytes
@@ -613,6 +777,8 @@ async def download_target_archive(
         headers={
             "Content-Disposition": f'attachment; filename="{safe_name}"',
             "Content-Length": str(len(archive_bytes)),
+            "ETag": etag,
+            "Cache-Control": "private, no-cache",
         },
     )
 
@@ -807,6 +973,20 @@ async def delete_target_archive(
     row = await db.get(BackupTarget, target_id)
     if row is None:
         raise HTTPException(status_code=404, detail="backup target not found")
+    if row.write_only:
+        # The point of a write-only target is that nothing SpatiumDDI
+        # holds can remove an archive — including this route. Refusing
+        # here rather than letting the driver's 403 surface as a 502
+        # keeps the reason legible.
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "this target is write-only: archives cannot be deleted through "
+                "SpatiumDDI. Retention is the destination's own policy — a bucket "
+                "lifecycle rule, an Object Lock retention period, or the receiver's "
+                "cleanup task. Remove it at the destination if you really need to."
+            ),
+        )
     driver = get_destination(row.kind)
     try:
         plain_config = decrypt_config_secrets(driver, row.config)

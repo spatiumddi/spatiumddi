@@ -34,6 +34,10 @@ mkosi.extra/usr/local/bin/kubectl
 mkosi.extra/usr/local/bin/crictl
 mkosi.extra/usr/local/bin/ctr
 mkosi.extra/var/lib/rancher/k3s/agent/images/*.tar.zst
+# bake-images.sh writes each archive to ``<name>.tar.zst.new`` first and
+# renames on success; a bake killed mid-save leaves the temp behind, and
+# ``*.tar.zst`` does not match it (#991 §3).
+mkosi.extra/var/lib/rancher/k3s/agent/images/*.tar.zst.new
 mkosi.extra/usr/share/doc/k3s/LICENSE
 mkosi.extra/usr/share/doc/k3s/NOTICE
 mkosi.extra/usr/share/doc/k3s/k3s-images.txt

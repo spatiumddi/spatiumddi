@@ -203,6 +203,20 @@ class Assertion:
         return {"name": self.name, "status": self.status, "detail": self.detail}
 
 
+#: Terminal drill state for "we could not check this one" (#989 item 1).
+#:
+#: Distinct from ``error`` (something broke) and from ``failed`` (the
+#: archive did not survive a test restore). A write-only destination
+#: cannot be listed *by design*, so neither of the other two is honest:
+#: ``error`` implies a fault to fix, ``failed`` is a claim about the
+#: archive that nothing here has evidence for.
+#:
+#: The name is short because ``restore_drill.state`` is ``String(20)``;
+#: the issue's ``cannot_drill_write_only`` does not fit, and the reason
+#: belongs in ``error`` anyway, which is where it goes.
+CANNOT_DRILL = "cannot_drill"
+
+
 @dataclass
 class DrillOutcome:
     state: str
@@ -723,6 +737,13 @@ async def compute_drill_readiness(db: AsyncSession) -> list[dict[str, Any]]:
     So: verified = has passed at some point AND the most recent
     *finished* verdict is not a failure. ``hours_since_last_pass``
     carries the staleness so callers can judge how old the proof is.
+
+    A **write-only** target (#989 item 1) carries ``undrillable_reason``
+    and is forced to ``verified: false`` — an unverifiable backup is an
+    unknown, the same category as an untested one, and that holds even
+    when the target passed drills before write-only was switched on. ``cannot_drill`` behaves like ``error`` here: it is
+    not in the ``latest_finished_verdict`` set, so it neither counts as
+    a pass nor erases an earlier one.
     """
     targets = (
         (await db.execute(select(BackupTarget).order_by(BackupTarget.name.asc()))).scalars().all()
@@ -743,12 +764,27 @@ async def compute_drill_readiness(db: AsyncSession) -> list[dict[str, Any]]:
             .limit(1)
         )
         age_hours = round((now - last_pass).total_seconds() / 3600, 1) if last_pass else None
+        # A write-only destination cannot be drilled from here (#989
+        # item 1). That is a supported configuration, not a fault — but
+        # it must never read as healthy, so it is surfaced as its own
+        # field rather than being folded into ``verified`` (which would
+        # make "unverifiable by design" indistinguishable from "failed a
+        # drill last night").
+        undrillable_reason = (
+            "this target is write-only, so SpatiumDDI cannot list or read its "
+            "archives back — verify it from the destination side, or keep a second "
+            "readable destination"
+            if t.write_only
+            else None
+        )
         out.append(
             {
                 "target_id": str(t.id),
                 "target_name": t.name,
                 "kind": t.kind,
                 "enabled": t.enabled,
+                "write_only": t.write_only,
+                "undrillable_reason": undrillable_reason,
                 "drills_scheduled": bool(t.drill_enabled and t.drill_cron),
                 "drill_cron": t.drill_cron,
                 "latest_verdict": t.drill_last_status,
@@ -756,7 +792,27 @@ async def compute_drill_readiness(db: AsyncSession) -> list[dict[str, Any]]:
                 "latest_drill_at": t.drill_last_at.isoformat() if t.drill_last_at else None,
                 "last_passed_at": last_pass.isoformat() if last_pass else None,
                 "hours_since_last_pass": age_hours,
-                "verified": last_pass is not None and latest_finished != "failed",
+                # An undrillable target is NEVER verified — asserted, not
+                # inferred.
+                #
+                # The first cut left the expression alone, reasoning that
+                # such a target "has never passed, so last_pass is None".
+                # That holds only for a target created write-only on day
+                # one, and the shipped hardening advice is the opposite:
+                # prove an S3 target with drills for months, THEN add
+                # Object Lock and tick write-only. After that flip every
+                # drill returns ``cannot_drill``, which is excluded from
+                # the ``latest_finished`` set — so ``last_pass`` kept
+                # pointing at the old success and ``verified`` stayed true
+                # forever, off a proof that can never be refreshed, while
+                # ``hours_since_last_pass`` grew without bound. That is
+                # precisely the "unverifiable must never read as healthy"
+                # invariant this block exists to hold.
+                "verified": (
+                    undrillable_reason is None
+                    and last_pass is not None
+                    and latest_finished != "failed"
+                ),
             }
         )
     return out
@@ -882,9 +938,37 @@ async def _execute(target: BackupTarget, *, live_db_url: str) -> DrillOutcome:
         plain_config = decrypt_config_secrets(driver, target.config)
         listings = await driver.list_archives(config=plain_config)
     except (BackupDestinationError, SecretFieldError, ValueError) as exc:
+        if target.write_only:
+            # A write-only target whose credential cannot list is the
+            # recommended shape, not a fault (#989 item 1). Reporting it
+            # as ``error`` every week would train the operator to ignore
+            # the one state that means "we cannot verify this backup".
+            return DrillOutcome(
+                state=CANNOT_DRILL,
+                error=(
+                    "this target is write-only and its destination cannot be listed, "
+                    f"so the archive cannot be verified from here ({exc}). Recovery "
+                    "readiness reports it as UNVERIFIED — restore-test it from the "
+                    "destination side, or keep a second readable destination."
+                ),
+            )
         return DrillOutcome(state="error", error=f"could not reach the destination: {exc}")
 
     if not listings:
+        if target.write_only:
+            # THE important branch. An empty listing from a destination
+            # we are not permitted to list is not evidence that there
+            # are no archives — and ``failed`` would state exactly that,
+            # in an alert, about a target that is very likely fine. The
+            # honest verdict is that we cannot tell.
+            return DrillOutcome(
+                state=CANNOT_DRILL,
+                error=(
+                    "this target is write-only, so SpatiumDDI cannot enumerate what it "
+                    "holds; an empty listing here is not evidence that the destination "
+                    "is empty. Recovery readiness reports it as UNVERIFIED."
+                ),
+            )
         assertions.append(
             Assertion(
                 "archive_available",

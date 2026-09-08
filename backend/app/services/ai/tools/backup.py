@@ -74,6 +74,24 @@ def _try_uuid(value: str) -> uuid.UUID | None:
         return None
 
 
+def _known_kinds() -> list[str]:
+    """The destination kinds this build registers, sorted.
+
+    Read from the same registry the API's ``GET /backup/targets/kinds``
+    reflects on, so the copilot and the UI picker cannot disagree about
+    what exists.
+
+    Imports the *package*, not ``.base``: the registry lives in ``base``
+    but is populated by the package's ``__init__`` as an import side
+    effect. Reaching straight for ``base`` would read an empty dict
+    whenever this module happens to be imported first — which yields an
+    empty enumeration in the description rather than an error.
+    """
+    from app.services.backup.targets import DESTINATIONS  # noqa: PLC0415
+
+    return sorted(DESTINATIONS)
+
+
 # ── list_backup_targets ───────────────────────────────────────────────
 
 
@@ -85,8 +103,14 @@ class ListBackupTargetsArgs(BaseModel):
     kind: str | None = Field(
         default=None,
         description=(
-            "Filter by destination kind: local_volume / s3 / scp / "
-            "azure_blob / smb / ftp / gcs / webdav."
+            # Enumerated from the driver registry rather than typed out.
+            # This string is what the model reads to decide which values
+            # are legal, so a hand-maintained list does not merely go
+            # stale — it makes a registered destination unaskable-about
+            # (``nfs`` in #971 was the case that surfaced it).
+            "Filter by destination kind: "
+            + " / ".join(_known_kinds())
+            + "."
         ),
     )
     last_run_status: Literal["never", "in_progress", "success", "failed"] | None = Field(
@@ -145,6 +169,13 @@ async def list_backup_targets(
             "last_run_error": t.last_run_error,
             "next_run_at": t.next_run_at.isoformat() if t.next_run_at else None,
             "passphrase_set": bool(t.passphrase_encrypted),
+            # #989 — the flag changes four visible behaviours (prune
+            # skipped, archive delete 409, pull-mode download 409, drills
+            # report cannot_drill). Without it the copilot reads
+            # "retention: null, last run: success" and describes a healthy
+            # target with no retention, unable to say why its recovery
+            # readiness is UNVERIFIED.
+            "write_only": t.write_only,
         }
         for t in rows
     ]
@@ -325,7 +356,7 @@ class FindRestoreDrillsArgs(BaseModel):
         default=None,
         description="Restrict to one target — id (UUID) or exact name.",
     )
-    state: Literal["running", "passed", "failed", "error"] | None = Field(
+    state: Literal["running", "passed", "failed", "error", "cannot_drill"] | None = Field(
         default=None,
         description=(
             "Filter by verdict. 'failed' means the archive did not "

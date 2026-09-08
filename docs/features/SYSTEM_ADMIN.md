@@ -367,7 +367,7 @@ The passphrase is **not** the destination's auth credential — every destinatio
 
 #### Destination kinds
 
-All eight destination kinds register in the same driver registry; the UI's destination picker reflects on `GET /backup/targets/kinds` so adding a new kind requires no frontend changes.
+All ten destination kinds register in the same driver registry; the UI's destination picker reflects on `GET /backup/targets/kinds` so adding a new kind requires no frontend changes.
 
 | Kind | Tier | Notes |
 |---|---|---|
@@ -379,8 +379,134 @@ All eight destination kinds register in the same driver registry; the UI's desti
 | `ftp` | 2 | Plain FTP / FTPS-explicit / FTPS-implicit; passive + active; `verify_tls` toggle for self-signed labs |
 | `gcs` | 2 | Google Cloud Storage; service-account JSON key (encrypted at rest) — no ADC by design |
 | `webdav` | 3 | WebDAV servers (Nextcloud, ownCloud, Apache `mod_dav`, IIS WebDAV, any RFC 4918 server) over `httpx` PUT / GET / PROPFIND / DELETE — no SDK dependency |
+| `nfs` | 2 | NFSv4 (default) / NFSv3 exports — a NAS (Synology / TrueNAS / QNAP) or a Linux file server. Speaks NFS in **userspace** via `libnfs`, so no kernel mount and no `CAP_SYS_ADMIN`; works identically on compose, Kubernetes and the appliance |
+| `https_put` | 3 | Any receiver that takes a `PUT` or `POST` — Artifactory / Nexus generic repositories, a presigned S3 URL, an internal receiver. **Write-only by construction**: no listing, no delete, no restore-from-destination, no drill |
+
+**Two export options decide whether NFS works at all.** SpatiumDDI's control
+plane runs as a non-root user with no `CAP_NET_BIND_SERVICE`, so it connects
+from an *unprivileged source port* — and Linux's `secure` export option, which
+requires a port below 1024, is the **default** (on a Synology the equivalent is
+"allow connections from non-privileged ports", also off by default). Add
+`insecure` to the export options, or the mount is refused with a permission
+error. The second is `root_squash`, covered below. The driver's error message
+names both, because they need opposite fixes and a confident diagnosis of the
+wrong one sends the operator in circles: if the *mount* failed it is almost
+certainly the port; if the mount succeeded and only the write was refused, it is
+squash.
+
+**NFS has no authentication, and the form says so.** AUTH_SYS is the only
+security flavour v1 supports: the client asserts a uid and the server believes
+it. A passing connection test therefore says nothing about who *else* on the
+network can read the export. Archives are encrypted with the target passphrase,
+so what an unrestricted export exposes is the metadata — archive names, sizes,
+and how often you back up — not the contents. Restrict the export to the control
+plane's address on the server side, and set the destination's `uid` / `gid` to an
+identity the export grants write access (with the usual `root_squash` default,
+presenting uid 0 gets mapped to `nobody` and every write fails; the driver
+detects that errno and names squash as the likely cause rather than reporting a
+bare `EACCES`). Kerberos (`sec=krb5*`) is out of scope for v1 — the same call
+`smb` made for NTLM-only.
+
+Two NFS behaviours differ from the object stores. Writes are staged to
+`<name>.part` and renamed into place, because a PUT is atomic and an NFS write is
+not — the staged name deliberately does not match the archive-name pattern, so a
+run killed halfway leaves nothing a retention sweep or `latest/download` can see.
+And `version` is an explicit choice rather than an auto-negotiation: NFSv3 also
+needs the portmapper (111) and mountd reachable, so falling back silently would
+turn a firewall rule into a mystery.
 
 Every driver implements the same four operations: `write` / `list_archives` / `delete` / `download` + a `test_connection` probe (writes a 16-byte random payload, head/stats it, deletes it — same shape as the DNS / DHCP server probes).
+
+#### Write-only and immutable destinations
+
+By default the credential that writes an archive can also delete it, and the
+retention sweep uses that credential on every scheduled run. So a compromised
+control plane, a leaked `backup_target.config`, or an attacker who reaches the
+API can wipe the backups with the same key that made them. Marking a target
+**write-only** removes that:
+
+| Behaviour | With `write_only` |
+|---|---|
+| Retention sweep | Skipped entirely — retention becomes the destination's own policy |
+| `DELETE /backup/targets/{id}/archives/{filename}` | 409, naming the reason |
+| `GET .../archives/latest/download` (pull mode) | 409 — there is nothing to list |
+| Connection test | A refused delete is tolerated and reported as `probe_retained` |
+| Restore drill | `cannot_drill`, and recovery readiness reports the target **unverified** — never healthy |
+
+Retention fields cannot be set alongside it: the API answers 422 rather than
+leave a keep-N on screen that silently does nothing every night.
+
+**The recommended shape**, which keeps restores and drills working while making
+retention unshortenable:
+
+1. Create the bucket with **Object Lock enabled** (it cannot be turned on
+   afterwards on S3) and add a lifecycle rule for eventual expiry.
+2. Mint an IAM key with `s3:PutObject`, `s3:GetObject` and `s3:ListBucket`, and
+   **no** `s3:DeleteObject`.
+3. On the target, set `object_lock_mode` to `compliance` and `object_lock_days`
+   to your retention period, and turn write-only **on**.
+
+Under compliance mode not even the bucket owner can delete an object before its
+retain-until date, so retention holds regardless of what credential leaks.
+`governance` mode is the softer variant — a principal holding
+`s3:BypassGovernanceRetention` can override it.
+
+Two behaviours are worth knowing about:
+
+* The connection **probe object is written without lock headers**. A probe under
+  a 30-day compliance lock would be undeletable litter created every time
+  somebody clicks Test. If the bucket carries a *default* retention rule the
+  probe is retained anyway — that is the bucket's choice, and the probe reports
+  it rather than failing.
+* When a target is *not* write-only but its objects are locked, the prune reads
+  `ObjectLockRetainUntilDate` from `head_object` and skips locked objects
+  **quietly**. A refused delete on a locked bucket is the feature working;
+  warning about it per file per night would make a correct configuration look
+  broken.
+
+Azure immutability policies and GCS bucket retention are bucket-level and
+already make deletes fail, so the `write_only` semantics above cover them.
+Driving per-object policies from SpatiumDDI (Azure version-level WORM, GCS
+object retention locks) is a follow-up once the S3 shape has proven itself.
+
+The `write_only` tolerance in the connection probe is implemented in the drivers
+where it is reachable — `s3` (a key without `DeleteObject`) and `https_put`
+(no delete verb at all). The filesystem-shaped kinds are not covered, because a
+destination that grants write but not unlink is not a configuration those
+protocols really produce.
+
+#### Pull mode — let a backup tool fetch, rather than pushing
+
+Enterprise backup tooling (Veeam, Bacula, Commvault, a cron `curl`) wants to
+*fetch*. That works today and is worth writing down:
+
+```bash
+# One archive, conditionally. The second run returns 304 and transfers nothing.
+curl -sS -f -o backup.zip -D headers.txt \
+     -H "Authorization: Bearer $SPATIUM_TOKEN" \
+     -H "If-None-Match: $(cat etag.txt 2>/dev/null || echo '\"none\"')" \
+     https://spatium.example/api/v1/backup/targets/$TARGET_ID/archives/latest/download
+grep -i '^etag:' headers.txt | cut -d' ' -f2- > etag.txt
+```
+
+Three things make this a least-privilege pull rather than a full API key:
+
+* **Mint the token with `allowed_paths`** restricted to that one route. A token
+  so restricted gets 403 on `GET /backup/targets` — it can fetch the archive and
+  nothing else.
+* **The response is conditional.** Archive filenames carry a UTC timestamp and
+  the bytes under a name are never rewritten, so the filename is a legitimate
+  strong `ETag`. A poller that already has the newest archive gets a `304` and
+  the destination is not read at all — without this, a nightly poller
+  re-downloads a multi-GB archive every run.
+* **The archive is encrypted with the target passphrase**, which the puller
+  never needs and should not have. It fetches ciphertext.
+
+Two limits: a **destination must exist** — for a pull-only deployment make a
+`local_volume` target the staging destination, because a `GET` that triggers a
+`pg_dump` would be neither idempotent nor safe to expose; and a **write-only
+target cannot serve pull** (there is nothing to list), which answers 409 saying
+so.
 
 #### Schedule + retention
 

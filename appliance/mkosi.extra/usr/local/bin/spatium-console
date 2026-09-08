@@ -4883,6 +4883,224 @@ def do_containers(console: Console, tty: str) -> None:
         time.sleep(3)
 
 
+def _network_adopt_report() -> dict | None:
+    """Ask ``spatium-network-adopt`` how the live profile differs from
+    STATE. ``None`` when the tool is unavailable or unreadable — an
+    older slot image, or a box with no STATE mounted.
+    """
+    try:
+        proc = subprocess.run(
+            ["spatium-network-adopt", "--check", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (FileNotFoundError, OSError, subprocess.SubprocessError):
+        return None
+    try:
+        return json.loads(proc.stdout)
+    except (ValueError, TypeError):
+        return None
+
+
+def _network_managed_warning(console: Console, tty: str) -> None:
+    """Say, BEFORE nmtui launches, which profiles are regenerated at boot.
+
+    #1016 — ``spatium-etc-render`` rewrites the managed keyfiles from
+    STATE on every boot, ordered ``Before=NetworkManager.service``, so an
+    edit to one of them works, is verified working, and reverts on a
+    reboot that may be weeks away — often a slot upgrade, which supplies
+    a much more plausible suspect. Nothing said so at any point: not the
+    console, not nmtui (which has no idea), and not the docs.
+
+    This screen is the cheapest honest fix and it changes no behaviour.
+    The adopt-back offer after nmtui exits makes the advertised workflow
+    real for the settings STATE models; this warning is what covers
+    everything else, which is why both exist.
+    """
+    report = _network_adopt_report()
+    lines: list[Text] = []
+    if report is not None and not report.get("managed"):
+        lines.append(
+            Text(
+                "This appliance has no SpatiumDDI-managed connection profile, so "
+                "your nmtui changes persist normally.",
+                style="green",
+            )
+        )
+    else:
+        lines.append(
+            Text(
+                "SpatiumDDI regenerates its own connection profile from the STATE "
+                "partition on every boot.",
+                style="bold yellow",
+            )
+        )
+        lines.append(Text(""))
+        managed = "10-spatium-static.nmconnection / 10-spatium-dhcp.nmconnection"
+        if report is not None and report.get("keyfile"):
+            managed = str(report["keyfile"]).rsplit("/", 1)[-1]
+        lines.append(Text(f"  Managed profile: {managed}", style="cyan"))
+        lines.append(Text(""))
+        lines.append(
+            Text(
+                "Edits you make to it apply immediately but are OVERWRITTEN at the "
+                "next boot. When you leave nmtui you will be offered the chance to "
+                "save the changes into STATE so they survive."
+            )
+        )
+        lines.append(Text(""))
+        lines.append(
+            Text(
+                "A profile you add yourself (a VLAN, bond or bridge) is not deleted "
+                "— but the managed profile has autoconnect-priority=100 and a new "
+                "one defaults to 0, so it still takes the interface.",
+                style="dim",
+            )
+        )
+    extra = (report or {}).get("extra_profiles") or []
+    if extra:
+        lines.append(Text(""))
+        lines.append(Text("  Other profiles present: " + ", ".join(extra), style="dim"))
+    lines.append(Text(""))
+    lines.append(Text("Press any key to open nmtui…", style="dim"))
+
+    panel = Panel(
+        Group(*lines),
+        box=SQUARE,
+        border_style="yellow",
+        padding=(1, 3),
+        title="[bold yellow] Before you edit the network [/bold yellow]",
+        title_align="center",
+        width=min(78, console.size.width - 4),
+    )
+    console.clear()
+    console.print(Align.center(panel))
+    _wait_for_key(tty, timeout=45.0)
+
+
+def _wait_for_key(tty_path: str, timeout: float = 45.0) -> None:
+    """Block until the operator presses ANY key, or ``timeout``.
+
+    A timeout rather than an unconditional wait: F4 is reachable from an
+    unattended serial console, and a screen that waits forever would park
+    the console on a notice nobody is there to dismiss.
+
+    **cbreak + no-echo is what makes "any key" true.** The dispatcher
+    calls ``keys.stop()`` before the action, which restores the terminal
+    to canonical mode — so a plain ``select()`` on the fd does not become
+    readable until a full LINE is submitted. Without this the screen said
+    "press any key" and responded only to Enter, echoing a stray
+    character over the panel and otherwise sitting for the full timeout.
+    Every other reader in this file (``confirm_modal``,
+    ``_health_cbreak_on``, ``KeyReader.run``) sets the same modes.
+    """
+    saved = None
+    try:
+        with open(tty_path, "rb", buffering=0) as fh:
+            fd = fh.fileno()
+            try:
+                saved = termios.tcgetattr(fd)
+                tty.setcbreak(fd)
+                attrs = termios.tcgetattr(fd)
+                attrs[3] &= ~termios.ECHO  # lflag
+                termios.tcsetattr(fd, termios.TCSANOW, attrs)
+            except termios.error:
+                # Not a real terminal (a pipe under test, a closed serial
+                # port). The select below still works; it just needs a
+                # newline. Better than refusing to show the screen.
+                saved = None
+            rlist, _, _ = select.select([fh], [], [], timeout)
+            if rlist:
+                fh.read(1)
+            if saved is not None:
+                termios.tcsetattr(fd, termios.TCSANOW, saved)
+    except OSError:
+        time.sleep(min(timeout, 5.0))
+
+
+def _offer_network_adopt(console: Console, tty: str) -> None:
+    """After nmtui exits, offer to save its changes into STATE (#1016).
+
+    Bounded to the settings STATE models, and it says which ones it
+    cannot take: an operator told "adopted 4 changes" while their MTU
+    silently stayed revertible is worse off than one told nothing at all.
+    """
+    report = _network_adopt_report()
+    if report is None or not report.get("managed"):
+        return
+    drift = report.get("drift") or {}
+    unadoptable = report.get("unadoptable") or []
+    if not drift and not unadoptable:
+        return
+
+    if drift:
+        detail = ", ".join(sorted(drift))
+        question = (
+            f"nmtui changed {len(drift)} setting(s) SpatiumDDI manages "
+            f"({detail}).\n\nSave them to STATE so they survive a reboot?"
+        )
+        if confirm_modal(console, question):
+            try:
+                proc = subprocess.run(
+                    ["spatium-network-adopt", "--adopt"],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                    check=False,
+                )
+            except (FileNotFoundError, OSError, subprocess.SubprocessError) as exc:
+                console.print(f"[red]Could not save to STATE: {exc}[/red]")
+                time.sleep(4)
+                return
+            if proc.returncode == 0:
+                console.print("[green]Saved to STATE — these now survive a reboot.[/green]")
+            else:
+                console.print(
+                    f"[red]Saving to STATE failed: {(proc.stderr or '').strip()}[/red]"
+                )
+            time.sleep(4)
+        else:
+            console.print(
+                "[yellow]Not saved — these changes revert at the next boot.[/yellow]"
+            )
+            time.sleep(3)
+
+    if unadoptable:
+        # Said whether or not anything was adopted: these revert either
+        # way, and that is exactly the case an operator would otherwise
+        # discover weeks later after a slot upgrade.
+        console.clear()
+        console.print(
+            Align.center(
+                Panel(
+                    Group(
+                        Text(
+                            "These settings are not stored in STATE and WILL revert "
+                            "at the next boot:",
+                            style="bold yellow",
+                        ),
+                        Text(""),
+                        *[Text(f"  {k}", style="cyan") for k in unadoptable[:12]],
+                        Text(""),
+                        Text(
+                            "Configure them from the SpatiumDDI UI where that is "
+                            "possible, or re-apply them after each reboot.",
+                            style="dim",
+                        ),
+                    ),
+                    box=SQUARE,
+                    border_style="yellow",
+                    padding=(1, 3),
+                    title="[bold yellow] Not saved [/bold yellow]",
+                    width=min(78, console.size.width - 4),
+                )
+            )
+        )
+        _wait_for_key(tty, timeout=30.0)
+
+
 def do_network(console: Console, tty: str) -> None:
     """Hand off to nmtui for network reconfiguration.
 
@@ -4893,7 +5111,12 @@ def do_network(console: Console, tty: str) -> None:
     at the physical console is already trusted enough to reboot /
     power off the appliance, so privilege-escalation isn't the threat
     model here.
+
+    #1016 — bracketed by a warning about which profile is regenerated
+    from STATE at boot, and an offer afterwards to adopt what nmtui
+    changed back into STATE.
     """
+    _network_managed_warning(console, tty)
     console.clear()
     _prepare_tty_for_subprocess(tty)
     # Same TTY-redirect pattern as do_pair — keep stderr off the
@@ -4919,6 +5142,8 @@ def do_network(console: Console, tty: str) -> None:
     except OSError as exc:
         console.print(f"[red]Failed to open {tty}: {exc}[/red]")
         time.sleep(3)
+        return
+    _offer_network_adopt(console, tty)
 
 
 def _fetch_warning_events(limit: int = 12) -> tuple[list[str], str | None]:

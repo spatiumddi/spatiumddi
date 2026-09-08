@@ -7,7 +7,8 @@
         trivy \
         appliance appliance-builder appliance-iso appliance-clean \
         appliance-bake-images appliance-clean-baked-images appliance-dev-iso \
-        appliance-baked-iso appliance-stamp-dev appliance-slot-image \
+        appliance-baked-iso appliance-baked-iso-cross appliance-verify-arch \
+        appliance-stamp-dev appliance-slot-image \
         appliance-fetch-k3s appliance-bake-chart appliance-bake-control-chart \
         appliance-bake-metallb-chart
 
@@ -653,6 +654,119 @@ appliance-baked-iso: appliance-stamp-dev appliance-fetch-k3s appliance-bake-char
 	@echo "  docker overlay image, builds the raw image, wraps as ISO, builds the"
 	@echo "  slot-upgrade .raw.xz + .sha256. Difference: BAKE_SOURCE=local (uses your"
 	@echo "  ``make build`` :dev tags) vs CI's BAKE_SOURCE=ghcr (pulls the cut tag)."
+
+# Cross-build entry point for an arm64 host — Apple Silicon, an
+# ARM server (#991).
+#
+# The appliance ISO is x86-64 (``Architecture=x86-64`` in mkosi.conf) and
+# mkosi cross-builds it without complaint, but ONE ``make`` invocation
+# cannot drive both halves of the build, because they need opposite
+# environments:
+#
+#   * the app-image builds and the third-party pulls must produce
+#     **amd64** artefacts, so they want DOCKER_DEFAULT_PLATFORM set;
+#   * mkosi, the ISO wrap and the slot image must run the builder
+#     **natively**, so they need it UNSET — an emulated builder dies on
+#     ``mount_setattr(2)``, which qemu-user and Rosetta do not implement
+#     and ``--privileged`` does not fix.
+#
+# So this target sets the variable per recipe line rather than for the
+# whole invocation. On an amd64 host it is simply equivalent to
+# ``appliance-baked-iso`` — the platform pins name the native arch — so
+# there is no second code path to keep in step.
+#
+# BAKE_SAVE_PLATFORM is what makes ``docker save`` work under Docker
+# Desktop's containerd image store, and what stops a third-party image
+# already present as arm64 (from the dev compose stack) being baked into
+# an x86-64 appliance, where it would ``exec format error`` on first boot.
+#
+# ⚠️  Side effect: ``make build`` retags the ``spatiumddi-*:dev`` images
+# the dev compose stack uses, so after this the dev stack would start
+# amd64 images under emulation. Restore them with
+# ``docker compose -f docker-compose.dev.yml build``.
+appliance-baked-iso-cross: APPLIANCE_ARCH ?= linux/amd64
+appliance-baked-iso-cross:
+	@echo "→ Cross-building an $(APPLIANCE_ARCH) appliance on $$(uname -m)"
+	DOCKER_DEFAULT_PLATFORM=$(APPLIANCE_ARCH) $(MAKE) build build-supervisor
+	$(MAKE) appliance-verify-arch APPLIANCE_ARCH=$(APPLIANCE_ARCH)
+	DOCKER_DEFAULT_PLATFORM=$(APPLIANCE_ARCH) BAKE_SAVE_PLATFORM=$(APPLIANCE_ARCH) \
+	  $(MAKE) appliance-stamp-dev appliance-fetch-k3s appliance-bake-chart \
+	          appliance-bake-control-chart appliance-bake-metallb-chart \
+	          appliance-bake-images
+	@# DOCKER_DEFAULT_PLATFORM deliberately absent from here down: the
+	@# builder container must run native or mkosi cannot start.
+	$(MAKE) appliance appliance-iso appliance-slot-image
+	@echo ""
+	@echo "✓ Cross-built appliance ISO ready at $(APPLIANCE_OUT)/"
+	@echo "  NOTE: your dev compose images are now $(APPLIANCE_ARCH). Restore with:"
+	@echo "    docker compose -f docker-compose.dev.yml build"
+
+# Assert every source image really is the appliance's architecture
+# before it is baked (#991 §2).
+#
+# This is a real check rather than a documented manual step, because the
+# failure it catches is silent and only shows up on the appliance: a
+# third-party image already present as the HOST's arch (a ``redis`` or
+# ``nginx`` pulled by the dev compose stack on an arm64 laptop) satisfies
+# ``docker image inspect``, gets baked, and then ``exec format error``s
+# on first boot with nothing in the build log to explain it.
+#
+# It reads the image set from ``bake-images.sh --list-images`` — ALL four
+# arrays, not just SpatiumDDI's own. The first cut scraped the ``IMAGES=(``
+# array with sed, which covers precisely the images ``make build`` has
+# just produced under the right platform and therefore cannot be wrong;
+# the third-party ones it exists for live in the other three arrays. One
+# source of truth also means a reformat of that file cannot silently
+# empty the list.
+#
+# **It fails closed.** An unreadable list or no local images at all is an
+# error, not a friendly note and exit 0 — the same "a guard that
+# evaluates nothing is indistinguishable from one that passed" rule this
+# commit applies to the staleness check in bake-images.sh.
+#
+# Run automatically by ``appliance-baked-iso-cross`` between building the
+# images and baking them, which is the only moment the mistake is still
+# cheap to fix.
+appliance-verify-arch: APPLIANCE_ARCH ?= linux/amd64
+appliance-verify-arch:
+	@want="$(notdir $(APPLIANCE_ARCH))"; bad=0; checked=0; \
+	imgs="$$($(APPLIANCE_DIR)/scripts/bake-images.sh --list-images 2>/dev/null)"; \
+	if [ -z "$$imgs" ]; then \
+	  echo "ERROR: could not read the image list from bake-images.sh --list-images." >&2; \
+	  echo "       Refusing to bake rather than reporting a clean check over" >&2; \
+	  echo "       nothing — a guard that evaluates nothing looks exactly like" >&2; \
+	  echo "       one that passed." >&2; \
+	  exit 1; \
+	fi; \
+	for image in $$imgs; do \
+	  short=$$(basename "$${image%%:*}"); found=0; \
+	  for tag in "$$image" "$${image%%:*}:dev" "spatiumddi-$$short:dev" "$$short:dev"; do \
+	    got=$$(docker image inspect -f '{{.Architecture}}' "$$tag" 2>/dev/null) || continue; \
+	    found=1; \
+	    if [ "$$got" != "$$want" ]; then \
+	      echo "  ✗ $$tag is $$got, expected $$want" >&2; bad=1; \
+	    else \
+	      printf '  ✓ %-52s %s\n' "$$tag" "$$got"; \
+	    fi; \
+	    checked=$$((checked+1)); \
+	    break; \
+	  done; \
+	  if [ "$$found" = 0 ]; then \
+	    echo "  ? $$image — not present locally (the bake will pull it)"; \
+	  fi; \
+	done; \
+	if [ "$$checked" = 0 ]; then \
+	  echo "ERROR: none of the bake's images is present locally — run 'make build'" >&2; \
+	  echo "       (and 'make build-supervisor') before verifying." >&2; \
+	  exit 1; \
+	fi; \
+	if [ "$$bad" != 0 ]; then \
+	  echo "" >&2; \
+	  echo "ERROR: source images are the wrong architecture for this appliance." >&2; \
+	  echo "       Rebuild them with DOCKER_DEFAULT_PLATFORM=$(APPLIANCE_ARCH), or use" >&2; \
+	  echo "       'make appliance-baked-iso-cross' which sets it for you." >&2; \
+	  exit 1; \
+	fi
 
 # Wipe any baked overlay artefacts that a previous
 # ``appliance-bake-images`` left under the mkosi.extra overlay. mkosi

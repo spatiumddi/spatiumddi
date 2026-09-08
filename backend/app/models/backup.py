@@ -53,6 +53,40 @@ class BackupTarget(Base):
     retention_keep_last_n: Mapped[int | None] = mapped_column(Integer, nullable=True)
     retention_keep_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
+    # Write-only destination (issue #989 item 1) — the ransomware gap.
+    #
+    # Without this, the credential that writes an archive can also delete
+    # it, and the retention sweep runs with that credential on every
+    # scheduled run. A compromised control plane, a leaked
+    # ``backup_target.config``, or an attacker who reaches the API can
+    # therefore wipe the backups with the same key that made them.
+    #
+    # Setting this flips four behaviours, and they are enforced in the
+    # runner / router / drill rather than in any one driver, so a kind
+    # that has no delete at all (``https_put``) and a kind that simply
+    # is not *permitted* to delete (an S3 key without ``DeleteObject``)
+    # behave identically:
+    #
+    #   * the retention prune is skipped entirely — retention becomes the
+    #     destination's own policy (a bucket lifecycle rule, an appliance
+    #     snapshot schedule);
+    #   * ``DELETE .../archives/{filename}`` answers 409;
+    #   * ``test_connection`` tolerates a refused delete and reports
+    #     ``probe_retained`` instead of failing — today a PutObject-only
+    #     key fails the probe at the delete step, which trains operators
+    #     to widen the key, i.e. the surface actively argues against its
+    #     own best practice;
+    #   * a restore drill that cannot read the destination reports
+    #     ``cannot_drill`` and readiness reports ``drillable: false``
+    #     with a reason — UNVERIFIED, never healthy.
+    #
+    # Listing and download stay best-effort: a key with ``ListBucket`` +
+    # ``GetObject`` keeps restore-from-destination and drills working,
+    # which is the recommended shape.
+    write_only: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+
     last_run_status: Mapped[str] = mapped_column(String(20), nullable=False, default="never")
     last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_run_filename: Mapped[str | None] = mapped_column(String(255), nullable=True)
@@ -118,12 +152,17 @@ class RestoreDrill(Base):
         nullable=False,
     )
 
-    # "running" → terminal "passed" / "failed" / "error".
+    # "running" → terminal "passed" / "failed" / "error" / "cannot_drill".
     # ``failed`` means the drill ran and an assertion did not hold —
     # that's a real finding about the archive. ``error`` means the
     # drill could not reach a verdict (destination unreachable,
     # scratch database couldn't be created); operationally distinct,
     # because only ``failed`` says anything about the backup itself.
+    # ``cannot_drill`` (#989) is the third kind of non-verdict: the
+    # target is write-only, so its destination cannot be listed or read
+    # back *by design*. Neither of the other two fits — ``error``
+    # implies a fault to fix, and ``failed`` would assert something
+    # about an archive nothing here has looked at.
     state: Mapped[str] = mapped_column(String(20), nullable=False, default="running")
     triggered_by: Mapped[str] = mapped_column(String(20), nullable=False, default="manual")
 

@@ -20,10 +20,31 @@ of every driver into the router.
 
 from __future__ import annotations
 
+import os
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
+
+#: The archive names SpatiumDDI writes. Every driver filters its listing
+#: with this so a destination shared with unrelated files stays clean.
+#:
+#: Shared rather than copied per driver: a change to the naming scheme that
+#: missed one file would make that destination's retention sweep and
+#: ``latest/download`` silently blind, with no error anywhere.
+ARCHIVE_NAME_RE = re.compile(r"^(spatiumddi-backup-|pre-restore-).*\.zip$")
+
+
+def safe_filename(filename: str) -> str:
+    """Strip path separators from an operator-supplied filename.
+
+    This is the defence that stops a crafted archive name escaping the
+    configured directory / prefix / collection, so it lives in one place
+    rather than being re-inlined per driver — hardening it in one copy
+    while three others stayed as they were is the failure worth avoiding.
+    """
+    return os.path.basename(filename)
 
 
 class BackupDestinationError(Exception):
@@ -38,6 +59,30 @@ class DestinationConfigError(BackupDestinationError):
     the API side."""
 
 
+class RetentionLockedError(BackupDestinationError):
+    """The destination refused a delete because the object is under a
+    retention lock (issue #989 item 1).
+
+    Distinct from a generic delete failure, and the distinction is the
+    whole point: on an S3 bucket in compliance mode a refused delete is
+    the feature working, so the retention sweep skips it quietly. Logging
+    it as a failure would produce a warning per archive per night on
+    exactly the installs that configured immutability correctly.
+
+    A *typed* exception rather than a string match on the driver's error
+    text: the message comes from the storage SDK and is not ours to
+    depend on.
+    """
+
+
+class UnsupportedOperationError(BackupDestinationError):
+    """This destination kind cannot perform the operation at all —
+    ``https_put`` is a one-way send to an operator-supplied receiver, so
+    it can neither read an archive back nor delete one. Distinct from a
+    permission failure, because no credential change would make it work.
+    """
+
+
 @dataclass(frozen=True)
 class ArchiveListing:
     """One archive present at a destination."""
@@ -45,6 +90,10 @@ class ArchiveListing:
     filename: str
     size_bytes: int
     created_at: datetime
+
+
+#: ``ConfigFieldSpec.type`` value for prose that renders without an input.
+NOTICE_FIELD_TYPE = "notice"
 
 
 @dataclass(frozen=True)
@@ -56,10 +105,33 @@ class ConfigFieldSpec:
 
     name: str
     label: str
-    type: str  # text / password / number
+    #: ``text`` / ``password`` / ``number`` render an input.
+    #: ``notice`` renders as prose with NO input — for a caveat that
+    #: belongs to the destination kind rather than to any one field
+    #: (``nfs``: AUTH_SYS has no credential at all).
+    #:
+    #: A notice is never read back out of ``config``, and that is
+    #: enforced rather than asserted: :func:`config_field_specs` drops
+    #: notices, and every generic consumer (validation, secret
+    #: redaction, PATCH merge) iterates that instead of ``config_fields``
+    #: — so a client that has not learned about the type cannot make one
+    #: required or round-trip its prose into stored config.
+    type: str
     required: bool = True
     description: str | None = None
     secret: bool = False  # hide from list responses
+
+
+def config_field_specs(driver: BackupDestination) -> tuple[ConfigFieldSpec, ...]:
+    """The driver's INPUT fields — ``config_fields`` minus notices.
+
+    Every generic consumer (validation, secret redaction, the PATCH
+    merge) wants this one, not the raw tuple: a notice carries no value
+    and must never round-trip into stored ``config``. Enforcing it here
+    means a future notice cannot become required, or be read back, just
+    because a consumer forgot to branch on the type.
+    """
+    return tuple(f for f in driver.config_fields if f.type != NOTICE_FIELD_TYPE)
 
 
 class BackupDestination(ABC):
@@ -78,12 +150,36 @@ class BackupDestination(ABC):
     #: with no configurable fields beyond name/passphrase.
     config_fields: tuple[ConfigFieldSpec, ...] = ()
 
+    #: True when the kind has no listing and no delete *by construction*
+    #: (``https_put``), as opposed to a kind whose credential merely
+    #: happens to lack delete permission. The API forces
+    #: ``backup_target.write_only`` on for these at create / update, so
+    #: an operator cannot configure a retention policy that could only
+    #: ever fail silently every night.
+    inherently_write_only: bool = False
+
     @abstractmethod
     def validate_config(self, config: dict[str, Any]) -> None:
         """Raise :class:`DestinationConfigError` if ``config`` is
         missing a required field or has the wrong type. Called on
         every create / update + before every run.
         """
+
+    async def validate_config_network(self, config: dict[str, Any]) -> None:
+        """Optional second validation pass that is allowed to touch the
+        network — a DNS resolution for the SSRF guard, say.
+
+        Split from :meth:`validate_config` because that one runs inside a
+        request handler *and* on every scheduled run, where a synchronous
+        ``getaddrinfo`` would block the event loop (non-negotiable #2)
+        and would make each nightly backup depend on a resolver that has
+        nothing to do with reaching the destination. This hook is called
+        only at create / update / test — the moments an operator is
+        waiting for an answer about a URL they just typed.
+
+        Default is a no-op; drivers that need it override.
+        """
+        return None
 
     @abstractmethod
     async def write(self, *, config: dict[str, Any], filename: str, archive_bytes: bytes) -> None:
@@ -148,6 +244,7 @@ def list_destination_kinds() -> list[dict[str, Any]]:
             {
                 "kind": d.kind,
                 "label": d.label,
+                "inherently_write_only": d.inherently_write_only,
                 "config_fields": [
                     {
                         "name": f.name,

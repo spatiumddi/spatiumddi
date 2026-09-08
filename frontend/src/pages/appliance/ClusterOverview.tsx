@@ -15,6 +15,7 @@ import {
   Network,
   Pause,
   Power,
+  Globe,
   Radio,
   RotateCcw,
   ScrollText,
@@ -36,6 +37,7 @@ import {
   applianceSystemApi,
   streamApplianceWorkloadLogs,
   versionApi,
+  type ClusterDns,
   type ClusterKubeletTransport,
   type ClusterNodeVitals,
   type ClusterPodSummary,
@@ -460,6 +462,145 @@ function KubeletTransportChip({
         ? "direct"
         : `${transport.direct_nodes} direct / ${transport.proxy_nodes} proxy`}
     </Chip>
+  );
+}
+
+function ClusterDnsCard({ dns }: { dns: ClusterDns | null }) {
+  if (!dns) return null;
+  const probe = dns.resolve_probe;
+  const ready = dns.replicas_ready;
+  const expected = dns.expected_replicas;
+
+  // Red beats amber, and a failed probe beats everything: replica counts
+  // say the pods exist, the probe says the path actually works.
+  const probeFailed = probe != null && !probe.ok;
+  const noReplicas = ready === 0;
+  const thin =
+    ready != null && expected != null && ready < expected && ready > 0;
+  const coLocated = dns.spread_ok === false && !thin && (ready ?? 0) > 1;
+  // `null` is UNKNOWN and must never render green. Without this branch,
+  // a block where every count is null — a 403 on the cluster-wide pod
+  // list, or an unreadable snapshot — failed every test above (`ready ===
+  // 0` is false for null; `spread_ok === false` is false for null) and
+  // fell through to EMERALD, putting a green chip on the one panel whose
+  // job is to say cluster DNS state could not be read.
+  const unknown = !dns.available && !probeFailed;
+  const color =
+    probeFailed || noReplicas
+      ? ROSE
+      : thin || coLocated
+        ? AMBER
+        : unknown
+          ? SLATE
+          : EMERALD;
+
+  const verdict = probeFailed
+    ? "not answering"
+    : noReplicas
+      ? "no ready replicas"
+      : thin
+        ? `${ready} of ${expected} replicas`
+        : coLocated
+          ? "replicas share a node"
+          : unknown
+            ? "unknown"
+            : "healthy";
+
+  return (
+    <div className="rounded-xl border bg-card p-4 shadow-sm">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h3 className="flex items-center gap-1.5 text-sm font-semibold">
+          <Globe className="h-4 w-4 text-muted-foreground" />
+          Cluster DNS
+        </h3>
+        <Chip
+          color={color}
+          title={
+            "Every pod resolves *.svc.cluster.local through CoreDNS — the api " +
+            "reaches Postgres and Redis that way — so a failure here shows up " +
+            "later as unrelated components failing to start."
+          }
+        >
+          {verdict}
+        </Chip>
+      </div>
+
+      <dl className="mt-3 space-y-1.5 text-xs">
+        <div className="flex justify-between gap-3">
+          <dt className="text-muted-foreground">Ready replicas</dt>
+          {/* `null` is UNKNOWN, never 0 — see the ClusterDns docs. */}
+          <dd className="font-medium">
+            {ready == null
+              ? "unknown"
+              : expected == null
+                ? ready
+                : `${ready} / ${expected}`}
+            {dns.replicas_total != null &&
+              ready != null &&
+              dns.replicas_total > ready && (
+                <span className="ml-1 font-normal text-muted-foreground">
+                  ({dns.replicas_total - ready} not ready)
+                </span>
+              )}
+          </dd>
+        </div>
+        {dns.nodes.length > 0 && (
+          <div className="flex justify-between gap-3">
+            <dt className="text-muted-foreground">On nodes</dt>
+            <dd className="text-right font-medium">{dns.nodes.join(", ")}</dd>
+          </div>
+        )}
+        <div className="flex justify-between gap-3">
+          <dt className="text-muted-foreground">Spread</dt>
+          <dd className="font-medium">
+            {dns.spread_ok == null
+              ? "unknown"
+              : dns.spread_ok
+                ? "one replica per node"
+                : "not spread across nodes"}
+          </dd>
+        </div>
+        <div className="flex justify-between gap-3">
+          <dt className="text-muted-foreground">Resolver</dt>
+          <dd className="font-mono text-[11px]">
+            {dns.resolver_ip ?? "unknown"}
+          </dd>
+        </div>
+        <div className="flex justify-between gap-3">
+          <dt className="text-muted-foreground">
+            Resolve probe
+            {probe?.from_node && (
+              <span className="ml-1 font-normal">from {probe.from_node}</span>
+            )}
+          </dt>
+          <dd className="font-medium">
+            {probe == null
+              ? "not run"
+              : probe.ok
+                ? `ok${probe.latency_ms != null ? ` · ${probe.latency_ms} ms` : ""}`
+                : "failed"}
+          </dd>
+        </div>
+      </dl>
+
+      {/* A probe failure alongside healthy replicas is its own diagnosis —
+          kube-proxy or the CNI, not CoreDNS — so it is not collapsed into
+          the replica verdict. */}
+      {probeFailed && (
+        <p className="mt-2 rounded-md border border-rose-500/40 bg-rose-500/10 px-2 py-1.5 text-[11px] text-rose-700 dark:text-rose-300">
+          {probe?.error}
+          {!noReplicas && ready != null && ready > 0 && (
+            <span className="mt-1 block">
+              CoreDNS replicas look healthy, so the fault is more likely in
+              kube-proxy or the pod network than in CoreDNS itself.
+            </span>
+          )}
+        </p>
+      )}
+      {!dns.available && dns.detail && (
+        <p className="mt-2 text-[11px] text-muted-foreground">{dns.detail}</p>
+      )}
+    </div>
   );
 }
 
@@ -1315,11 +1456,12 @@ export function ClusterOverview({
       {/* Hero live chart */}
       <HeroChart history={history} cpuPct={cpuPct} memPct={memPct} />
 
-      {/* Nodes */}
+      {/* Nodes + cluster DNS (#985) */}
       <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
         {s.nodes.map((n) => (
           <NodeCard key={n.name} node={n} />
         ))}
+        <ClusterDnsCard dns={s.cluster_dns} />
       </div>
 
       {/* Workloads + top pods (+ service roles when the supervisor reports them) */}

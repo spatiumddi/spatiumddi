@@ -166,6 +166,50 @@ class WorkloadHealth(BaseModel):
     status: str
 
 
+class ClusterDnsProbe(BaseModel):
+    """The resolve probe's verdict (#985).
+
+    Separate from the replica counts on purpose: pods existing and the
+    path working are different facts, and ``ready=2, spread_ok=true,
+    probe failed`` is a real state that points at kube-proxy or the CNI
+    rather than at CoreDNS.
+    """
+
+    ok: bool
+    latency_ms: float | None = None
+    error: str | None = None
+    #: Which node's api replica ran the probe. On a multi-node control
+    #: plane the request is served by whichever replica took it, so a
+    #: pass here is a statement about one vantage, not the cluster.
+    from_node: str | None = None
+
+
+class ClusterDns(BaseModel):
+    """Cluster DNS (CoreDNS) health (#985).
+
+    Every count is nullable and ``None`` means UNKNOWN — a zero would
+    read as "no replicas", which is a much more alarming claim than "we
+    could not look".
+    """
+
+    available: bool
+    detail: str | None = None
+    #: The nameserver this api pod actually queries, read from its own
+    #: ``/etc/resolv.conf`` rather than from the Service object.
+    resolver_ip: str | None = None
+    replicas_ready: int | None = None
+    replicas_total: int | None = None
+    #: ``ensure_coredns_ha``'s own target — ``min(nodes, 2)`` — not the
+    #: Deployment's ``spec.replicas``, which would need a grant this
+    #: snapshot does not hold.
+    expected_replicas: int | None = None
+    #: Nodes hosting a ready replica.
+    nodes: list[str] = []
+    spread_ok: bool | None = None
+    resolve_probe: ClusterDnsProbe | None = None
+    checked_at: str | None = None
+
+
 class ClusterHealth(BaseModel):
     available: bool
     detail: str | None = None
@@ -179,6 +223,7 @@ class ClusterHealth(BaseModel):
     control_plane_nodes: int
     metrics_available: bool
     kubelet_transport: KubeletTransport | None = None
+    cluster_dns: ClusterDns | None = None
     cpu_usage_cores: float | None = None
     cpu_capacity_cores: float | None = None
     memory_working_set_bytes: int | None = None

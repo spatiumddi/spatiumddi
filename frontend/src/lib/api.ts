@@ -2921,6 +2921,14 @@ export interface BackupTargetKind {
   kind: string;
   label: string;
   config_fields: BackupTargetConfigField[];
+  /**
+   * True when the kind has no listing and no delete at all (`https_put`),
+   * as opposed to a kind whose credential merely lacks delete permission.
+   * The API forces `write_only` on for these, so the form renders the
+   * switch as checked and disabled rather than offering a choice the
+   * server will override.
+   */
+  inherently_write_only: boolean;
 }
 
 export interface BackupTarget {
@@ -2935,6 +2943,13 @@ export interface BackupTarget {
   schedule_cron: string | null;
   retention_keep_last_n: number | null;
   retention_keep_days: number | null;
+  /**
+   * Write-only destination (#989). Retention is skipped, archive delete
+   * is refused, pull-mode download answers 409, and the restore drill
+   * reports `cannot_drill` — recovery readiness is UNVERIFIED, never
+   * healthy.
+   */
+  write_only: boolean;
   last_run_status: string;
   last_run_at: string | null;
   last_run_filename: string | null;
@@ -2962,6 +2977,7 @@ export interface BackupTargetCreate {
   schedule_cron?: string | null;
   retention_keep_last_n?: number | null;
   retention_keep_days?: number | null;
+  write_only?: boolean;
 }
 
 export interface BackupTargetUpdate {
@@ -2974,6 +2990,7 @@ export interface BackupTargetUpdate {
   schedule_cron?: string | null;
   retention_keep_last_n?: number | null;
   retention_keep_days?: number | null;
+  write_only?: boolean;
   drill_enabled?: boolean;
   drill_cron?: string | null;
 }
@@ -3010,9 +3027,17 @@ export interface RestoreDrillReadinessTarget {
   target_name: string;
   kind: string;
   enabled: boolean;
+  /** #989 — a write-only destination cannot be read back. */
+  write_only: boolean;
+  /**
+   * Why this target cannot be drilled at all, or null when it can.
+   * Non-null forces `verified` false: an unverifiable backup is an
+   * unknown, not a pass.
+   */
+  undrillable_reason: string | null;
   drills_scheduled: boolean;
   drill_cron: string | null;
-  /** Raw latest status, including "error" / "in_progress". */
+  /** Raw latest status, including "error" / "in_progress" / "cannot_drill". */
   latest_verdict: string;
   /** Latest terminal verdict, i.e. "passed" | "failed" | null. */
   latest_finished_verdict: string | null;
@@ -12679,6 +12704,37 @@ export interface ClusterWorkloadHealth {
   status: string;
 }
 
+/** The resolve probe's verdict (#985). */
+export interface ClusterDnsProbe {
+  ok: boolean;
+  latency_ms: number | null;
+  error: string | null;
+  /**
+   * Which node's api replica ran the probe. On a multi-node control plane
+   * the request is served by whichever replica took it, so a pass is a
+   * statement about one vantage, not the whole cluster.
+   */
+  from_node: string | null;
+}
+
+/**
+ * Cluster DNS (CoreDNS) health (#985). Every count is nullable and `null`
+ * means UNKNOWN — rendering it as 0 would claim "no replicas", which is a
+ * far more alarming statement than "we could not look".
+ */
+export interface ClusterDns {
+  available: boolean;
+  detail: string | null;
+  resolver_ip: string | null;
+  replicas_ready: number | null;
+  replicas_total: number | null;
+  expected_replicas: number | null;
+  nodes: string[];
+  spread_ok: boolean | null;
+  resolve_probe: ClusterDnsProbe | null;
+  checked_at: string | null;
+}
+
 export interface ClusterHealthSnapshot {
   available: boolean;
   detail: string | null;
@@ -12692,6 +12748,7 @@ export interface ClusterHealthSnapshot {
   control_plane_nodes: number;
   metrics_available: boolean;
   kubelet_transport: ClusterKubeletTransport | null;
+  cluster_dns: ClusterDns | null;
   cpu_usage_cores: number | null;
   cpu_capacity_cores: number | null;
   memory_working_set_bytes: number | null;

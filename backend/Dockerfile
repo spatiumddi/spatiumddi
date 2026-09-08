@@ -54,6 +54,11 @@ WORKDIR /app
 # "TCP/IP fingerprinting requires root privileges" when invoked by
 # the non-root app user. The cap is in Docker's default bounding set
 # so this works without needing cap_add at the compose / k8s layer.
+# libnfs14 backs the ``nfs`` backup destination (#971). Runtime shared
+# library only — the driver binds it through ctypes, so there is no
+# ``libnfs-dev`` and no compile step in the builder stage. Dynamic
+# linking is also what keeps the LGPL-2.1 obligation to the simple case;
+# see docs/THIRD_PARTY.md and the root NOTICE.
 # Add the official PostgreSQL apt repo so we can pin
 # ``postgresql-client-16`` (Debian trixie's default repos only carry
 # client-17). We need the client major to match the postgres SERVER
@@ -81,6 +86,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     whois \
     libcap2-bin \
     postgresql-client-16 \
+    libnfs14 \
     && setcap cap_net_raw,cap_net_bind_service+eip /usr/bin/nmap \
     # issue #59 — grant tcpdump CAP_NET_RAW so the non-root app user can
     # capture (server vantage). cap_net_admin is NOT granted; we run

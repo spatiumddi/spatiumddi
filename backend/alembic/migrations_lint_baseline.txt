@@ -292,6 +292,7 @@ backend/alembic/versions/b7f24d1e9a35_dns_rpz_hit.py:drop_table:64
 backend/alembic/versions/b8c3f2a9e147_appliance_lldp_settings.py:drop_column:109
 backend/alembic/versions/b8e3f1c47a92_packet_capture.py:drop_column:110
 backend/alembic/versions/b8e3f1c47a92_packet_capture.py:drop_table:115
+backend/alembic/versions/b8f4c02e7a19_backup_target_write_only.py:drop_column:45
 backend/alembic/versions/b95e2d71f042_appliance_snmp_settings.py:drop_column:95
 backend/alembic/versions/b9c3f5e1a8d4_dns_rrl_amplification.py:drop_column:100
 backend/alembic/versions/b9c3f5e1a8d4_dns_rrl_amplification.py:drop_column:101

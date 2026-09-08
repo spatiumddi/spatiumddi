@@ -153,8 +153,9 @@ async def create_test_schema() -> AsyncGenerator[None, None]:
 async def _reset_global_caches() -> AsyncGenerator[None, None]:
     """Reset the process-global short-TTL caches around every test.
 
-    System maintenance mode (``app.core.maintenance_mode``) and feature-
-    module enablement (``app.services.feature_modules``) are cached at
+    System maintenance mode (``app.core.maintenance_mode``), feature-
+    module enablement (``app.services.feature_modules``), the effective
+    TLD registry and the cluster-DNS probe verdict are all cached at
     module level, keyed on a monotonic clock — NOT on the per-test DB. So
     a test that flips maintenance mode on, or a feature module off, leaks
     that state into later tests on the same xdist worker for up to the
@@ -167,6 +168,7 @@ async def _reset_global_caches() -> AsyncGenerator[None, None]:
     """
     from app.core import maintenance_mode
     from app.services import feature_modules
+    from app.services.appliance import cluster_health
     from app.services.dns import tld_registry
 
     maintenance_mode.invalidate_cache()
@@ -175,10 +177,16 @@ async def _reset_global_caches() -> AsyncGenerator[None, None]:
     # that stores a snapshot would keep classifying later tests' zones
     # against it after the per-test TRUNCATE removed the row.
     tld_registry.invalidate_effective_cache()
+    # #985 — the CoreDNS resolve probe is memoized so the 2 s dashboard
+    # stream does not hammer cluster DNS. Keyed on a monotonic clock, so a
+    # stubbed verdict outlives the per-test TRUNCATE and would answer for
+    # unrelated tests.
+    cluster_health.invalidate_probe_cache()
     yield
     maintenance_mode.invalidate_cache()
     feature_modules.invalidate_cache()
     tld_registry.invalidate_effective_cache()
+    cluster_health.invalidate_probe_cache()
 
 
 @pytest_asyncio.fixture(autouse=True)

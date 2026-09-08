@@ -168,6 +168,136 @@ The `/appliance` section in the SpatiumDDI UI talks to k3s directly via the api 
 
 The api pod's ServiceAccount keeps minimal RBAC: namespace-scoped pods + pods/log read, the specific `spatium-appliance-tls` Secret patch, and the frontend Deployment annotation patch. The only cluster-scoped grant is **read-only** `nodes` + `nodes/proxy [get]` (added in #402) so the Cluster Overview dashboard can read per-node kubelet stats. Nothing destructive.
 
+### Reconfiguring the network after install
+
+The console's **F4** opens `nmtui`. What is not obvious, and used to be
+documented nowhere, is that SpatiumDDI **owns one connection profile** and
+regenerates it from the STATE partition on every boot (#276): the
+`spatium-etc-render` unit is ordered `Before=NetworkManager.service`, so NM
+never sees an edit made to that profile — it reads the regenerated file at
+startup.
+
+Which profile depends on how the box was installed:
+
+| Install shape | Managed keyfile | An nmtui edit to it |
+|---|---|---|
+| `network_mode=static` | `10-spatium-static.nmconnection` | regenerated at the next boot |
+| `network_mode=dhcp` **with** a pinned interface | `10-spatium-dhcp.nmconnection` | regenerated at the next boot |
+| `network_mode=dhcp`, no pinned interface | none | survives — it is NetworkManager's own auto profile |
+
+A *separate* profile you add — a VLAN, a bond, a bridge — is never deleted,
+since etc-render only rewrites its own two files. But it does not win
+either: both managed keyfiles carry `autoconnect-priority=100` and a fresh
+nmtui profile defaults to `0`, so re-pointing the appliance's primary
+address onto a bond fails in a way that looks like nmtui did nothing at all.
+
+**This used to be silent, and that was the real problem.** The change
+applies immediately, verifies as working, and reverts on a reboot that may
+be weeks later — often a slot upgrade, which supplies a much more plausible
+suspect. For an MTU or a route the presentation is worse still: pings and
+small requests keep working while large TCP hangs, so it does not even read
+as "my network configuration vanished".
+
+Since #1016 the console brackets nmtui with two things:
+
+1. **A screen before it launches**, naming the managed profile and saying
+   its edits are regenerated from STATE.
+2. **An offer when you leave it** to write what you changed back into
+   `spatium-config.yaml`, so the next boot renders it. This is bounded to
+   the fields STATE models — mode, interface, address, prefix, gateway,
+   DNS, and their IPv6 equivalents.
+
+Anything outside that set (an MTU, a static route, ethernet options, a bond
+or bridge) **cannot** be adopted, because etc-render would not render it
+back. Those are listed explicitly rather than quietly dropped: being told
+"adopted 4 changes" while your MTU stays revertible is worse than being told
+nothing. That is also why the warning in (1) exists rather than relying on
+the adopt-back alone.
+
+The same reconciliation is available directly:
+
+```sh
+spatium-network-adopt --check    # exit 0 converged, 10 drift
+spatium-network-adopt --adopt    # save the adoptable differences to STATE
+spatium-network-adopt --json     # machine-readable report
+```
+
+**What was deliberately not done:** etc-render was not changed to render
+only when the keyfile is absent. That is the simplest fix and it forfeits
+what #276 built the render path *for* — surviving a `/var` factory reset —
+and would strand an appliance whose STATE says one thing and whose `/etc`
+overlay says another. STATE stays the single source of truth; the adopt-back
+changes what STATE says rather than who owns the file.
+
+### Cluster DNS (CoreDNS)
+
+k3s runs CoreDNS in `kube-system`, and every pod on the appliance resolves
+`*.svc.cluster.local` through it: the api pod finds Postgres and Redis that
+way, the frontend nginx finds the api, and on a multi-node control plane a
+member's supervisor heartbeats the in-cluster api Service name. Nothing on
+the appliance talks to it from the LAN — it is not a DNS server operators put
+zones on, and it is unrelated to the BIND9 / Kea role containers.
+
+**What the appliance does to it.** k3s ships CoreDNS as a *single* replica
+with the default 300 s unreachable toleration, and on an appliance it
+deterministically lands on the seed node. Hard-kill that node and cluster DNS
+is gone for five minutes — and because the api readiness gate resolves the
+Postgres `-rw` Service and the Redis sentinel FQDNs through it, every api pod
+goes NotReady cluster-wide until CoreDNS finally reschedules (#590). So the
+supervisor's `ensure_coredns_ha` patches the bundled Deployment to a target
+that is a function of the **registered node count**:
+
+| Nodes | Target |
+|---|---|
+| 1 | Stock: 1 replica, no fast-evict toleration, no anti-affinity — both buy nothing with one node, and a 20 s toleration would evict the only DNS pod with nowhere to put it |
+| ≥2 | `min(nodes, 2)` replicas, fast-evict tolerations, and **required** (not preferred) pod anti-affinity |
+
+Required anti-affinity is deliberate and #633 has the evidence: *preferred*
+parked both replicas on the seed, and Kubernetes never rebalances running
+pods, so the "HA" DNS died with the seed anyway.
+
+**What the Cluster DNS card means** (Cluster → Overview, #985). Until now the
+appliance acted on cluster DNS and showed nothing about it, so a CoreDNS that
+was down, single-replica or co-located read as "everything healthy" until an
+unrelated pod restart failed to resolve. The card reports:
+
+- **Ready replicas** against `ensure_coredns_ha`'s own target — not the
+  Deployment's `spec.replicas`, which would need a `deployments get` grant in
+  `kube-system` that the api ServiceAccount does not hold.
+- **Spread** — amber when ready replicas share a node on a multi-node cluster,
+  which is not HA however healthy the count looks.
+- **Resolver** — the nameserver this api pod actually queries, read from its
+  own `/etc/resolv.conf` rather than from the `kube-dns` Service object. That
+  needs no extra grant and is the more honest number, since it is the address
+  pods really send to.
+- **Resolve probe** — a live lookup of `kubernetes.default.svc.cluster.local`
+  against that resolver, with the node the probing api replica runs on.
+
+The probe is the load-bearing part. Replica counts say the pods exist; the
+probe says the path works. **`ready 2 / spread ok / probe failed` is a real
+and distinct state** — it points at kube-proxy or the pod network rather than
+at CoreDNS, and the card says so rather than collapsing it into one verdict.
+A `null` count anywhere in this card means *unknown*, never zero: on a cluster
+whose `kube-system` pods the ServiceAccount cannot list, the card reports that
+it could not look instead of claiming there are no replicas.
+
+The default-on `Cluster DNS degraded` alert rule evaluates the same snapshot
+from the **worker** pod, which is a second probe vantage for free. Warning
+when replicas are missing or share a node; critical when none are ready or the
+probe fails.
+
+Pods match on the `k8s-app=kube-dns` label rather than on the deployment name
+`coredns` — the umbrella chart's cluster health renders on BYO clusters too,
+and GKE names its deployment `kube-dns`. On a cluster that labels DNS some
+third way, the replica view reports unknown and the probe still answers the
+question that matters.
+
+Editing CoreDNS configuration (stub domains or forwarders via a
+`coredns-custom` ConfigMap) is **not** in scope: appliance pods forward through
+the host resolver and that has not been a reported problem. There is no restart
+button either, for the same reason the Containers tab withholds one — on a
+single-node appliance restarting cluster DNS is a footgun.
+
 ### From-zero operator flow
 
 1. Boot the ISO → installer wizard asks for **role** + target disk + hostname + admin + network + timezone (+ pairing code / control-plane URL on Appliance).
@@ -1309,6 +1439,36 @@ rootfs — same constraint as `packer`, `live-build`, `diskimage-builder`.
 The builder image's `Dockerfile` lives at `appliance/builder/Dockerfile`
 and republishes via `.github/workflows/build-appliance-builder.yml` on
 changes to `appliance/builder/**`.
+
+**The builder is multi-arch; the ISO is not.** Since #991 the image
+publishes for `linux/amd64` *and* `linux/arm64`, so a developer on an
+Apple Silicon Mac or an ARM server gets a native builder and mkosi
+cross-builds the x86-64 image inside it. One `Dockerfile` serves both:
+`grub-pc-bin` and `grub-efi-amd64-bin` are amd64-only packages carrying
+only the x86 GRUB modules grub-mkrescue embeds in the ISO, so on arm64
+they install via `dpkg --add-architecture amd64` alongside the native
+`grub-mkrescue`. On amd64 the `:amd64` qualifiers name the native
+architecture and nothing changes. Verified: both builds produce an ISO
+with the same El Torito catalogue — a BIOS record at
+`/boot/grub/i386-pc/eltorito.img` and a UEFI record at `/efi.img`.
+
+**Running the builder emulated is a dead end — do not spend an afternoon
+on it.** With `--platform linux/amd64` on an arm64 host, mkosi fails
+immediately:
+
+```
+mkosi was unable to invoke the mount_setattr() system call.
+OSError: [Errno 38] Function not implemented
+```
+
+`mount_setattr(2)` belongs to the new mount API, which neither qemu-user
+nor Rosetta implements. The kernel inside the Docker Desktop VM supports
+it; the syscall translation layer does not, and `--privileged` does not
+help. The supported path is a native builder plus mkosi's own
+cross-build, which is what `make appliance-baked-iso-cross` does. See
+`appliance/README.md` for the full recipe, including the two
+`DOCKER_DEFAULT_PLATFORM` halves and the `docker save --platform`
+requirement under Docker Desktop's containerd image store.
 
 ### Phase 1 (current — landed 2026-05)
 

@@ -227,6 +227,26 @@ RULE_TYPE_AGENT_CONFIG_REJECTED = "agent_config_rejected"
 # level by definition, so a threshold on it could only ever be dead code.
 RULE_TYPE_NODE_PRESSURE = "node_pressure"
 
+# Issue #985 — cluster DNS (CoreDNS) degraded. Subject is the CLUSTER, not a
+# node: CoreDNS is a cluster-scoped service and "which node" is already inside
+# the message.
+#
+# We have acted on cluster DNS since #590 / #750 (``ensure_coredns_ha`` matches
+# replicas and spread to the node count) and shown nothing about it, so a
+# CoreDNS that is down, single-replica or co-located read as "everything
+# healthy" until an unrelated pod restart failed to resolve
+# ``spatium-control-spatiumddi-api.spatium.svc``.
+#
+# Two severities, because they are two different faults:
+#   * WARNING — fewer ready replicas than ``ensure_coredns_ha`` targets, or
+#     two replicas parked on the same node. Cluster DNS still answers; it just
+#     will not survive losing that node (#633's failure exactly).
+#   * CRITICAL — no ready replicas, or the resolve probe failed. The probe is
+#     the load-bearing one: replica counts say the pods exist, the probe says
+#     the path works, and a probe failure with healthy replicas points at
+#     kube-proxy or the CNI rather than at CoreDNS.
+RULE_TYPE_CLUSTER_DNS_DEGRADED = "cluster_dns_degraded"
+
 
 class AlertDataUnavailable(Exception):
     """A rule could not be evaluated because its input is temporarily gone.
@@ -248,6 +268,8 @@ class AlertDataUnavailable(Exception):
 # rules' fixed windows.
 _NODE_PRESSURE_FULL_CRITICAL_PCT = 1.0
 _NODE_PRESSURE_RULE_NAME = "Node under sustained resource pressure"
+_CLUSTER_DNS_RULE_NAME = "Cluster DNS degraded"
+
 
 # Issue #46 — planned-decommission awareness. Subject = subnet. Fires
 # when a subnet's ``decom_date`` falls within ``threshold_days`` (default
@@ -475,6 +497,7 @@ RULE_TYPES = frozenset(
         RULE_TYPE_SECRET_EXPIRING,
         RULE_TYPE_AGENT_CONFIG_REJECTED,
         RULE_TYPE_NODE_PRESSURE,
+        RULE_TYPE_CLUSTER_DNS_DEGRADED,
         RULE_TYPE_DECOM_EXPIRING,
         RULE_TYPE_DNS_NXDOMAIN_SPIKE,
         RULE_TYPE_DNS_QUERY_RATE_SPIKE,
@@ -3003,6 +3026,161 @@ async def _matching_secret_expiring_subjects(
     return matches
 
 
+async def _cluster_health_snapshot() -> dict[str, Any] | None:
+    """The live cluster-health snapshot, or ``None`` off the appliance.
+
+    Shared by the two rules that read it (``node_pressure`` and
+    ``cluster_dns_degraded``) so they cannot disagree about what "unknown"
+    means — the preamble was previously copied verbatim between them,
+    including the message strings, so narrowing one bare ``except`` would
+    have silently left the other wrong.
+
+    **Deliberately NOT cached.** The review suggested memoizing this so
+    the two rules share one gather per sweep, and a short-TTL module cache
+    was tried — it broke ten ``node_pressure`` tests and, more to the
+    point, it is wrong: a cache keyed on a clock answers the second rule
+    with the first rule's snapshot, so a cluster that goes from healthy to
+    unreadable inside the TTL keeps reporting healthy. Masking a health
+    transition to save one kubeapi round trip per minute is a bad trade
+    for an alerting path. The 60 s sweep can afford two gathers; the
+    dashboard already does one every 2 s.
+
+    Raises :class:`AlertDataUnavailable` when the cluster cannot be read —
+    a kubeapi blip and a dead cluster look alike from here, and neither is
+    evidence that a condition cleared, so returning ``[]`` would resolve
+    every open event and re-open it a minute later.
+    """
+    import asyncio  # noqa: PLC0415
+
+    from app.config import settings  # noqa: PLC0415
+
+    if not settings.appliance_mode:
+        return None
+
+    from app.services.appliance import cluster_health  # noqa: PLC0415
+
+    try:
+        snap = await asyncio.to_thread(cluster_health.get_cluster_health)
+    except Exception as exc:  # noqa: BLE001 - any read failure means "unknown"
+        raise AlertDataUnavailable(f"cluster health unreadable: {exc}") from exc
+    if not snap.get("available"):
+        raise AlertDataUnavailable(f"cluster health unavailable: {snap.get('detail')}")
+    return snap
+
+
+async def _matching_cluster_dns_subjects(
+    db: AsyncSession,  # noqa: ARG001
+    rule: AlertRule,  # noqa: ARG001
+) -> list[tuple[str, str, str, str | None]]:
+    """``cluster_dns_degraded`` — CoreDNS down, thin, co-located, or not
+    answering (#985).
+
+    Reads the same ``get_cluster_health()`` snapshot the Cluster screen
+    renders, so there is no new collector and no new permission. Running in
+    the worker pod is a bonus rather than an accident: it gives the resolve
+    probe a **second vantage**, since the dashboard's probe runs from
+    whichever api replica served the request.
+
+    ``None`` is never a match, in either direction. An unreadable snapshot,
+    an unlistable ``kube-system``, or a cluster that labels its DNS
+    differently all leave the counts unknown — and firing on unknown would
+    alarm every BYO-chart install, while silently resolving on unknown would
+    clear a real open event. So an unavailable block raises
+    :class:`AlertDataUnavailable`, which leaves whatever was open standing.
+    """
+    snap = await _cluster_health_snapshot()
+    if snap is None:
+        return []
+
+    cdns = snap.get("cluster_dns") or {}
+    probe = cdns.get("resolve_probe") or {}
+    probe_ran = bool(probe)
+    probe_ok = probe.get("ok") is True
+
+    if not cdns.get("available"):
+        # The replica view is unknown. The probe may still have run — and if
+        # it FAILED, that is a fact worth alerting on by itself, independent
+        # of whether we could enumerate pods.
+        if probe_ran and not probe_ok:
+            return [
+                (
+                    "cluster",
+                    "cluster DNS",
+                    (
+                        "Cluster DNS is not answering: "
+                        f"{probe.get('error') or 'the resolve probe failed'}"
+                        f"{_from_node_suffix(probe)}. Pods cannot resolve "
+                        "*.svc.cluster.local, which breaks the api's route to Postgres "
+                        "and Redis. Replica state could not be read "
+                        f"({cdns.get('detail') or 'no detail'})."
+                    ),
+                    "critical",
+                )
+            ]
+        raise AlertDataUnavailable(
+            f"cluster DNS state unknown: {cdns.get('detail') or 'no detail'}"
+        )
+
+    ready = cdns.get("replicas_ready")
+    expected = cdns.get("expected_replicas")
+    spread_ok = cdns.get("spread_ok")
+    nodes = cdns.get("nodes") or []
+
+    reasons: list[str] = []
+    severity: str | None = None
+
+    if probe_ran and not probe_ok:
+        reasons.append(
+            f"the resolve probe failed ({probe.get('error') or 'no detail'})"
+            f"{_from_node_suffix(probe)}"
+        )
+        severity = "critical"
+
+    if ready == 0:
+        reasons.append("no CoreDNS replica is ready")
+        severity = "critical"
+    elif ready is not None and expected is not None and ready < expected:
+        reasons.append(f"{ready} of {expected} CoreDNS replicas ready")
+        severity = severity or "warning"
+
+    # ``len(nodes) < ready``, NOT ``len(set(nodes)) < len(nodes)``.
+    #
+    # The producer already emits ``sorted(set(ready_nodes))``, so the
+    # deduplicated list can never contain duplicates and that test was
+    # unsatisfiable — meaning #633's exact failure, the one arm of this
+    # rule's WARNING severity, could never fire. The dashboard used a
+    # different predicate and rendered amber, so the two surfaces
+    # disagreed silently. Comparing distinct nodes against ready replicas
+    # is the fact actually wanted, and it survives the dedup.
+    if spread_ok is False and ready and ready > 1 and len(nodes) < ready:
+        reasons.append(
+            f"all {ready} ready replicas are on {len(nodes)} node"
+            f"{'' if len(nodes) == 1 else 's'}"
+            f" ({', '.join(nodes) if nodes else '?'}) — losing "
+            f"{'it' if len(nodes) == 1 else 'one'} takes cluster DNS with it"
+        )
+        severity = severity or "warning"
+
+    if not reasons:
+        return []
+    return [
+        (
+            "cluster",
+            "cluster DNS",
+            "Cluster DNS is degraded: "
+            + "; ".join(reasons)
+            + ". Every pod resolves *.svc.cluster.local through it, so this surfaces "
+            "later as unrelated components failing to reach Postgres, Redis or the api.",
+            severity,
+        )
+    ]
+
+
+def _from_node_suffix(probe: dict[str, Any]) -> str:
+    node = probe.get("from_node")
+    return f" (probed from {node})" if node else ""
+
+
 async def _matching_node_pressure_subjects(
     db: AsyncSession,  # noqa: ARG001
     rule: AlertRule,
@@ -3023,27 +3201,12 @@ async def _matching_node_pressure_subjects(
     one HTTPS round trip per node, which would otherwise stall the event
     loop for the whole 60 s tick.
     """
-    import asyncio  # noqa: PLC0415
-
-    from app.config import settings  # noqa: PLC0415
-
     # Cluster health only exists on the appliance; everywhere else the
     # ServiceAccount is not mounted and every node would silently report no
     # PSI, so skip the round trip entirely.
-    if not settings.appliance_mode:
+    snap = await _cluster_health_snapshot()
+    if snap is None:
         return []
-
-    from app.services.appliance import cluster_health  # noqa: PLC0415
-
-    try:
-        snap = await asyncio.to_thread(cluster_health.get_cluster_health)
-    except Exception as exc:  # noqa: BLE001 - any read failure means "unknown"
-        raise AlertDataUnavailable(f"cluster health unreadable: {exc}") from exc
-    if not snap.get("available"):
-        # A kubeapi blip and a genuinely dead cluster look the same from here,
-        # and neither is evidence that the pressure cleared. Returning [] would
-        # resolve every open event and re-open it a minute later.
-        raise AlertDataUnavailable(f"cluster health unavailable: {snap.get('detail')}")
 
     # ``is not None``, not ``or`` — the column is numeric and the form allows
     # 0, which ``or`` would silently rewrite to 50. Every other rule in this
@@ -3988,6 +4151,55 @@ async def seed_node_pressure_alert_rule() -> None:
                 severity="warning",
                 enabled=True,
                 threshold_percent=50,
+            )
+        )
+        await session.commit()
+
+
+async def seed_cluster_dns_alert_rule() -> None:
+    """Seed the #985 rule, ENABLED by default.
+
+    Safe on by default for the same reason as ``agent_config_rejected``: it
+    needs no configuration, reads a signal that is either present or
+    explicitly unknown, and the failure it catches is invisible on every
+    other panel. It is also inert off the appliance — the matcher returns
+    immediately when ``appliance_mode`` is off, and an unknown reading raises
+    rather than fires.
+
+    Severity is decided by the matcher per finding, not by the rule: a thin
+    or co-located deployment is a warning (DNS answers, it just will not
+    survive a node loss), while nothing ready or a failed resolve probe is
+    critical. So the rule's own severity is only the floor.
+
+    Keyed on ``name``; an operator who disables or renames it is never
+    overridden.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    async with AsyncSessionLocal() as session:
+        existing = await session.scalar(
+            select(AlertRule).where(AlertRule.name == _CLUSTER_DNS_RULE_NAME)
+        )
+        if existing is not None:
+            return
+        session.add(
+            AlertRule(
+                name=_CLUSTER_DNS_RULE_NAME,
+                description=(
+                    "Fires when the k3s cluster's DNS (CoreDNS) is down, thinner "
+                    "than the appliance targets, co-located on one node, or not "
+                    "answering a test lookup. Every pod resolves "
+                    "*.svc.cluster.local through it — the api reaches Postgres and "
+                    "Redis that way — so a failure here surfaces later as unrelated "
+                    "components failing to start. Warning when replicas are missing "
+                    "or share a node; critical when none are ready or the resolve "
+                    "probe fails. Silent where cluster DNS state cannot be read. "
+                    "Auto-resolves when cluster DNS recovers."
+                ),
+                rule_type=RULE_TYPE_CLUSTER_DNS_DEGRADED,
+                severity="warning",
+                enabled=True,
             )
         )
         await session.commit()
@@ -5258,6 +5470,13 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 # surface (Cluster screen, kubectl, the Fleet drilldown)
                 # identifies them by.
                 subject_type = "node"
+            elif rule.rule_type == RULE_TYPE_CLUSTER_DNS_DEGRADED:
+                degraded = await _matching_cluster_dns_subjects(db, rule)
+                matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in degraded]
+                # Subject is the cluster itself. CoreDNS is cluster-scoped —
+                # there is no row and no single node it belongs to, and which
+                # node a replica sits on is already in the message.
+                subject_type = "cluster"
             elif rule.rule_type == RULE_TYPE_AGENT_CONFIG_REJECTED:
                 rejected = await _matching_agent_config_rejected_subjects(db, rule)
                 matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in rejected]

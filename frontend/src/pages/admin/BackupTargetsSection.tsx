@@ -204,6 +204,14 @@ function TargetRow({
             {target.retention_keep_days != null && (
               <span>retain: {target.retention_keep_days} d</span>
             )}
+            {target.write_only && (
+              <span
+                className="rounded border border-emerald-500/40 bg-emerald-500/10 px-1.5 py-0.5 text-emerald-700 dark:text-emerald-300"
+                title="SpatiumDDI writes archives here but never deletes them. Retention is the destination's own policy, and restore drills cannot verify it from this side."
+              >
+                write-only
+              </span>
+            )}
           </div>
           {target.last_run_error && (
             <div className="mt-1 line-clamp-2 text-[11px] text-destructive">
@@ -670,12 +678,18 @@ function TargetFormModal({
   const [retentionDays, setRetentionDays] = useState(
     existing?.retention_keep_days?.toString() ?? "30",
   );
+  const [writeOnly, setWriteOnly] = useState(existing?.write_only ?? false);
   const [error, setError] = useState<string | null>(null);
 
   const kindMeta = useMemo<BackupTargetKind | undefined>(
     () => kindsQ.data?.find((k) => k.kind === kind),
     [kindsQ.data, kind],
   );
+  // A kind with no listing and no delete is write-only whatever the
+  // operator picks — the server forces it, so the form shows the real
+  // resulting state rather than a choice that gets silently overridden.
+  const forcedWriteOnly = kindMeta?.inherently_write_only ?? false;
+  const effectiveWriteOnly = forcedWriteOnly || writeOnly;
 
   const saveMut = useMutation({
     mutationFn: async () => {
@@ -687,10 +701,19 @@ function TargetFormModal({
         config,
         passphrase_hint: passphraseHint,
         schedule_cron: trimmedCron === "" ? null : trimmedCron,
+        // A write-only target never prunes, and the API refuses the
+        // combination outright — so the mode is forced to "none" here
+        // rather than posting a number that comes back as a 422 the
+        // operator has to decode.
         retention_keep_last_n:
-          retentionMode === "last_n" ? Number(retentionLastN) : null,
+          !effectiveWriteOnly && retentionMode === "last_n"
+            ? Number(retentionLastN)
+            : null,
         retention_keep_days:
-          retentionMode === "days" ? Number(retentionDays) : null,
+          !effectiveWriteOnly && retentionMode === "days"
+            ? Number(retentionDays)
+            : null,
+        write_only: effectiveWriteOnly,
       };
       if (mode === "create") {
         if (passphrase.length < 8) {
@@ -768,6 +791,23 @@ function TargetFormModal({
           )}
 
           {kindMeta?.config_fields.map((f) => {
+            // A ``notice`` field is prose that belongs to the destination
+            // kind rather than to any one input — NFS's "AUTH_SYS has no
+            // credential at all", for instance. Rendering it through the
+            // branch below would give the operator a text box whose value
+            // is then posted into ``config`` and rejected by the driver's
+            // validator, so it gets its own no-input shape.
+            if (f.type === "notice") {
+              return (
+                <div
+                  key={f.name}
+                  className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-900 dark:text-amber-200"
+                >
+                  <div className="font-medium">{f.label}</div>
+                  {f.description && <p className="mt-0.5">{f.description}</p>}
+                </div>
+              );
+            }
             const isSecretInEdit = f.secret && mode === "edit";
             return (
               <Field
@@ -864,7 +904,51 @@ function TargetFormModal({
           </Field>
 
           <fieldset className="space-y-2 rounded-md border bg-muted/30 px-3 py-2">
-            <legend className="px-1 text-xs font-medium">Retention</legend>
+            <legend className="px-1 text-xs font-medium">Immutability</legend>
+            <label className="flex items-start gap-2 text-xs">
+              <input
+                type="checkbox"
+                checked={effectiveWriteOnly}
+                disabled={forcedWriteOnly}
+                onChange={(e) => setWriteOnly(e.target.checked)}
+                className="mt-0.5 disabled:opacity-60"
+              />
+              <span>
+                <span className="font-medium">Write-only destination</span>
+                <span className="block text-muted-foreground">
+                  SpatiumDDI writes archives here but never deletes them:
+                  retention is skipped, the archive-delete action is refused,
+                  and pull-mode download is unavailable. Use with an S3 bucket
+                  under Object Lock and a key without <code>DeleteObject</code>,
+                  so nothing this install holds can shorten retention.{" "}
+                  <span className="text-amber-600 dark:text-amber-400">
+                    Restore drills cannot run against a destination we cannot
+                    read, so recovery readiness will report this target as
+                    unverified.
+                  </span>
+                  {forcedWriteOnly && (
+                    <span className="mt-1 block font-medium">
+                      This destination kind has no listing and no delete, so
+                      write-only is always on.
+                    </span>
+                  )}
+                </span>
+              </span>
+            </label>
+          </fieldset>
+
+          <fieldset
+            className="space-y-2 rounded-md border bg-muted/30 px-3 py-2 disabled:opacity-60"
+            disabled={effectiveWriteOnly}
+          >
+            <legend className="px-1 text-xs font-medium">
+              Retention
+              {effectiveWriteOnly && (
+                <span className="ml-1 font-normal text-muted-foreground">
+                  — the destination&apos;s own policy on a write-only target
+                </span>
+              )}
+            </legend>
             <label className="flex items-center gap-2 text-xs">
               <input
                 type="radio"

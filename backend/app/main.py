@@ -506,10 +506,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # no PSI at all, so enabling it everywhere is silent until it is real.
     try:
         from app.services.alerts import (  # noqa: PLC0415
+            seed_cluster_dns_alert_rule,
             seed_node_pressure_alert_rule,
         )
 
         await seed_node_pressure_alert_rule()
+        await seed_cluster_dns_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("node_pressure_alert_rule_seed_skipped", reason=str(exc))
     # DHCP packet-loss alert rule — singleton, ENABLED by default (issue

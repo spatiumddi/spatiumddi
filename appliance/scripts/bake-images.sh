@@ -37,9 +37,16 @@ BAKE_SOURCE="${BAKE_SOURCE:-local}"  # local (docker :dev) | ghcr (pull from ghc
 # ghcr pulls are always fresh, so this only applies to BAKE_SOURCE=local.
 ALLOW_STALE_IMAGES="${ALLOW_STALE_IMAGES:-0}"
 STALE_MAX_AGE_S="${STALE_MAX_AGE_S:-86400}"  # 24h
+LIST_IMAGES_ONLY=0
 for arg in "$@"; do
     case "$arg" in
         --allow-stale-images) ALLOW_STALE_IMAGES=1 ;;
+        # Print every image this script would bake, one per line, and
+        # exit. ``make appliance-verify-arch`` consumes it so the
+        # architecture check and the bake read ONE list — a second copy
+        # (a sed scrape of the arrays below) covered only SpatiumDDI's
+        # own images, which are the ones that cannot be wrong.
+        --list-images) LIST_IMAGES_ONLY=1 ;;
         *) echo "WARN: ignoring unknown arg '$arg'" >&2 ;;
     esac
 done
@@ -171,6 +178,14 @@ CNPG_IMAGES=(
     "ghcr.io/cloudnative-pg/postgresql:16"
 )
 
+if [ "$LIST_IMAGES_ONLY" = 1 ]; then
+    for repo in "${IMAGES[@]}"; do printf '%s\n' "$repo"; done
+    for image in "${OBSERVABILITY_IMAGES[@]}" "${METALLB_IMAGES[@]}" "${CNPG_IMAGES[@]}"; do
+        printf '%s\n' "$image"
+    done
+    exit 0
+fi
+
 if ! command -v docker >/dev/null 2>&1; then
     echo "ERROR: docker CLI required on the build host (used to save + retag images)." >&2
     echo "       The APPLIANCE itself ships zero docker; this is build-host tooling only." >&2
@@ -236,22 +251,63 @@ resolve_source_tag() {
 # so the operator fixes it in one rebuild rather than discovering a stale
 # image after a 10-minute ISO build. Missing images aren't flagged here —
 # the main loop's inspect handles those with a more specific error.
+
+# RFC3339 → epoch seconds, on GNU *and* BSD date (#991 §4).
+#
+# This guard ran only on Linux until the arm64 cross-build work put it on
+# macOS, where ``date -d`` is not a thing: the parse failed, the function
+# returned non-zero, and the caller's ``|| continue`` skipped the check for
+# every image. So the >24 h staleness guard the 2026-07 build notes rely on
+# simply did not exist there — silently, which is the worst way for a guard
+# not to exist. Hence both dialects, and a loud report below when neither
+# works rather than a third silent skip.
+rfc3339_to_epoch() {
+    local ts="$1" out
+    # Docker emits nanosecond precision; BSD date cannot parse it and
+    # neither dialect needs it.
+    ts="${ts%.*}"
+    ts="${ts%Z}"
+    if out="$(date -u -d "${ts}Z" +%s 2>/dev/null)"; then
+        echo "$out"
+        return 0
+    fi
+    if out="$(date -u -j -f '%Y-%m-%dT%H:%M:%S' "$ts" +%s 2>/dev/null)"; then
+        echo "$out"
+        return 0
+    fi
+    return 1
+}
+
 image_age_seconds() {
     local created created_epoch
     created="$(docker image inspect "$1" --format '{{.Created}}' 2>/dev/null)" || return 1
-    created_epoch="$(date -d "$created" +%s 2>/dev/null)" || return 1
+    created_epoch="$(rfc3339_to_epoch "$created")" || return 1
     echo $(( $(date +%s) - created_epoch ))
 }
 if [ "$BAKE_SOURCE" = "local" ] && [ "$ALLOW_STALE_IMAGES" != "1" ]; then
     stale=()
+    undated=()
     for repo in "${IMAGES[@]}"; do
         src="$(resolve_source_tag "$repo")"
         docker image inspect "$src" >/dev/null 2>&1 || continue
-        age="$(image_age_seconds "$src")" || continue
+        if ! age="$(image_age_seconds "$src")"; then
+            undated+=("$src")
+            continue
+        fi
         if [ "$age" -gt "$STALE_MAX_AGE_S" ]; then
             stale+=("$src ($(( age / 3600 ))h old)")
         fi
     done
+    if [ "${#undated[@]}" -gt 0 ]; then
+        # Not fatal — an unreadable timestamp says nothing about whether
+        # the image is stale, and refusing the build over it would be
+        # worse than the risk. But it is SAID, because a guard that
+        # quietly evaluates nothing is indistinguishable from a guard
+        # that passed.
+        echo "WARN: could not read a build date for $(( ${#undated[@]} )) source image(s);" >&2
+        echo "      the >$(( STALE_MAX_AGE_S / 3600 ))h staleness check did NOT run for them:" >&2
+        for u in "${undated[@]}"; do echo "        $u" >&2; done
+    fi
     if [ "${#stale[@]}" -gt 0 ]; then
         echo "ERROR: stale local source image(s) older than $(( STALE_MAX_AGE_S / 3600 ))h:" >&2
         for s in "${stale[@]}"; do echo "         $s" >&2; done
