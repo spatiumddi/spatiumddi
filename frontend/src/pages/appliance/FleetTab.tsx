@@ -5670,9 +5670,8 @@ function UpgradeImageManager() {
               </select>
               <p className="mt-1 text-[11px] text-muted-foreground">
                 From the asset name you downloaded. Lets the control plane
-                refuse this image for a node of the other architecture
-                before scheduling; the appliance re-checks the real image
-                either way.
+                refuse this image for a node of the other architecture before
+                scheduling; the appliance re-checks the real image either way.
               </p>
             </div>
             <div className="sm:col-span-2">
