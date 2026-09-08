@@ -29,10 +29,11 @@ BACKEND_DIR    = backend
 FRONTEND_DIR   = frontend
 
 # The architecture the APPLIANCE image is built for, as a Docker
-# platform string. ``appliance/mkosi.conf`` still pins
-# ``Architecture=x86-64``, so this is a statement of fact rather than a
-# knob — until #1026 phase 2 parameterises mkosi, overriding it changes
-# only which container images get baked, not the kernel or bootloader.
+# platform string (#1026). This drives the whole build: mkosi's
+# ``--architecture`` (and through it the kernel + GRUB packages selected
+# by ``appliance/mkosi.conf.d/``), the k3s fetch, the container-image
+# bake, the root GPT type both ISO scripts look for, and the
+# ``APPLIANCE_ARCH`` stamped into /etc/spatiumddi/appliance-release.
 #
 # Declared globally (rather than only target-scoped on the two
 # cross-build targets, where it was) because ``appliance-stamp-dev``

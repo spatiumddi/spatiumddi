@@ -23,8 +23,16 @@ from __future__ import annotations
 import uuid
 
 import pytest
+from httpx import AsyncClient
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.appliance import Appliance
+from app.core.security import create_access_token, hash_password
+from app.models.appliance import (
+    APPLIANCE_STATE_APPROVED,
+    Appliance,
+    ApplianceUpgradeImage,
+)
+from app.models.auth import User
 from app.services.appliance.architecture import architecture_conflict, normalize
 from app.services.appliance.slot_image_target import (
     SlotImageArchitectureMismatch,
@@ -184,3 +192,112 @@ def test_a_pre_1026_plan_rehydrates_as_unknown() -> None:
         "slot_image_nonce": None,
     }
     assert SlotImageTarget.from_plan_fields(plan).architecture is None
+
+
+# ── the refusal has to reach the operator as a 422 ─────────────────
+#
+# Asserting the subclass relationship (above) proves the exception COULD
+# be mapped. It does not prove the call that raises it sits inside the
+# handler that maps it — and in the first cut it did not: ``stamp`` was
+# outside the ``try``, so the mismatch escaped as a 500 while the
+# design, the docs and the Fleet picker's own comment all promised a
+# 422 naming both architectures. Found by code review, not by the unit
+# test, because a unit test of the exception class cannot see where the
+# call site is.
+
+
+async def _superadmin_headers(db: AsyncSession) -> dict[str, str]:
+    user = User(
+        username=f"arch-{uuid.uuid4().hex[:8]}",
+        email=f"{uuid.uuid4().hex[:8]}@example.com",
+        display_name="Arch Admin",
+        hashed_password=hash_password("test-pw-1026"),
+        is_superadmin=True,
+    )
+    db.add(user)
+    await db.flush()
+    return {"Authorization": f"Bearer {create_access_token(str(user.id))}"}
+
+
+async def _seed(db: AsyncSession, *, node_arch: str, image_arch: str | None):
+    appliance = Appliance(
+        id=uuid.uuid4(),
+        hostname=f"ddi-{uuid.uuid4().hex[:8]}",
+        state=APPLIANCE_STATE_APPROVED,
+        public_key_der=b"fake-key",
+        public_key_fingerprint=uuid.uuid4().hex * 2,
+        cert_serial="0001",
+        deployment_kind="appliance",
+        architecture=node_arch,
+        supervisor_version="2026.09.01-1",
+    )
+    image = ApplianceUpgradeImage(
+        id=uuid.uuid4(),
+        filename="spatiumddi-appliance-slot-2026.09.04-1-arm64.raw.xz",
+        size_bytes=1234,
+        sha256=uuid.uuid4().hex + uuid.uuid4().hex,
+        appliance_version="2026.09.04-1",
+        architecture=image_arch,
+    )
+    db.add_all([appliance, image])
+    await db.flush()
+    return appliance, image
+
+
+@pytest.mark.asyncio
+async def test_scheduling_a_cross_architecture_upgrade_is_a_422(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    headers = await _superadmin_headers(db_session)
+    appliance, image = await _seed(db_session, node_arch="amd64", image_arch="arm64")
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/v1/appliance/appliances/{appliance.id}/upgrade",
+        headers=headers,
+        json={"desired_appliance_version": "2026.09.04-1", "slot_image_id": str(image.id)},
+    )
+    assert resp.status_code == 422, resp.text
+    # The message has to name both sides — "incompatible image" sends an
+    # operator to re-download the one they already have.
+    detail = resp.text.lower()
+    assert "arm64" in detail and "amd64" in detail
+
+
+@pytest.mark.asyncio
+async def test_a_refused_schedule_leaves_no_desired_state(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    """A 422 that had already written half the desired-state columns
+    would leave the supervisor fetching nothing and reporting an upgrade
+    in flight forever."""
+    headers = await _superadmin_headers(db_session)
+    appliance, image = await _seed(db_session, node_arch="amd64", image_arch="arm64")
+    await db_session.commit()
+
+    await client.post(
+        f"/api/v1/appliance/appliances/{appliance.id}/upgrade",
+        headers=headers,
+        json={"desired_appliance_version": "2026.09.04-1", "slot_image_id": str(image.id)},
+    )
+    await db_session.refresh(appliance)
+    assert appliance.desired_appliance_version is None
+    assert appliance.desired_slot_image_url is None
+
+
+@pytest.mark.asyncio
+async def test_a_matching_architecture_schedules_normally(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    headers = await _superadmin_headers(db_session)
+    appliance, image = await _seed(db_session, node_arch="arm64", image_arch="arm64")
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/v1/appliance/appliances/{appliance.id}/upgrade",
+        headers=headers,
+        json={"desired_appliance_version": "2026.09.04-1", "slot_image_id": str(image.id)},
+    )
+    assert resp.status_code == 200, resp.text
+    await db_session.refresh(appliance)
+    assert appliance.desired_appliance_version == "2026.09.04-1"

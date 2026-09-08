@@ -5135,10 +5135,16 @@ async def schedule_appliance_upgrade(
         # A fresh nonce per click: re-applying the SAME image from the Fleet
         # button is an explicit retry and must re-fire the host trigger.
         target = replace(target, nonce=new_refire_nonce())
+        # #1026 — INSIDE the try. The architecture refusal is raised by
+        # ``stamp``, not by ``resolve``: resolve knows the image, stamp is
+        # the first place that also knows the node. Left outside, the
+        # mismatch escaped as a 500 while every surface — the design, the
+        # docs and the Fleet picker's own comment — promised a 422 naming
+        # both architectures.
+        stamp_desired_slot_image(row, target, desired_version=body.desired_appliance_version)
     except SlotImageResolutionError as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
 
-    stamp_desired_slot_image(row, target, desired_version=body.desired_appliance_version)
     resolved_url = row.desired_slot_image_url or target.url
     db.add(
         AuditLog(

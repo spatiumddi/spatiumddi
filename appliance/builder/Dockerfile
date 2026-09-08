@@ -89,7 +89,6 @@ RUN dpkg --add-architecture amd64 \
         # #1026 — ``efi.img`` for an arm64 ISO is assembled the same way,
         # so mtools covers both; what arm64 additionally needs is the
         # arm64-efi module directory named above.
-
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /work

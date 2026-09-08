@@ -5440,6 +5440,11 @@ function UpgradeImageManager() {
   const [file, setFile] = useState<File | null>(null);
   const [sha256, setSha256] = useState("");
   const [applianceVersion, setApplianceVersion] = useState("");
+  // #1026 — declared, like the version beside it. Empty means UNKNOWN
+  // and is a legitimate answer: the control-plane gate then does not
+  // block, and ``spatium-upgrade-slot`` still re-checks the real
+  // decompressed image against the node's own uname before it writes.
+  const [architecture, setArchitecture] = useState("");
   const [notes, setNotes] = useState("");
   const [progress, setProgress] = useState<{
     loaded: number;
@@ -5487,12 +5492,14 @@ function UpgradeImageManager() {
         applianceVersion.trim(),
         notes.trim() || undefined,
         (loaded, total) => setProgress({ loaded, total }),
+        architecture || undefined,
       ),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["appliance", "upgrade-images"] });
       setFile(null);
       setSha256("");
       setApplianceVersion("");
+      setArchitecture("");
       setNotes("");
       setProgress(null);
     },
@@ -5649,6 +5656,24 @@ function UpgradeImageManager() {
                 placeholder="e.g. 2026.06.01-1"
                 className="mt-1 w-full rounded-md border bg-background px-2 py-1"
               />
+            </div>
+            <div>
+              <label className="text-muted-foreground">Architecture</label>
+              <select
+                value={architecture}
+                onChange={(e) => setArchitecture(e.target.value)}
+                className="mt-1 w-full rounded-md border bg-background px-2 py-1"
+              >
+                <option value="">Unknown (don't check)</option>
+                <option value="amd64">amd64 (x86-64)</option>
+                <option value="arm64">arm64 (AArch64)</option>
+              </select>
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                From the asset name you downloaded. Lets the control plane
+                refuse this image for a node of the other architecture
+                before scheduling; the appliance re-checks the real image
+                either way.
+              </p>
             </div>
             <div className="sm:col-span-2">
               <label className="text-muted-foreground">SHA-256 (hex)</label>
