@@ -588,7 +588,10 @@ def connect(
         if rc < 0:
             raw = lib.nfs_get_error(ctx)
             detail = raw.decode("utf-8", "replace") if raw else ""
-            errno = -rc if rc < 0 else 0
+            # Unconditional: this is already inside ``if rc < 0``, so the
+            # guard ``_err`` carries (where the helper cannot assume its
+            # caller checked) would be dead here.
+            errno = -rc
             raise NfsError(
                 (
                     f"mount {describe} failed (NFSv{version}): {detail}"
