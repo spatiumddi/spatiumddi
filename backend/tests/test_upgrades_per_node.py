@@ -247,11 +247,27 @@ async def test_step_drain_timeout_reports_blocked(monkeypatch: pytest.MonkeyPatc
 
 
 class _FakeAppliance:
-    """Minimal stand-in carrying every column the stamper writes."""
+    """Minimal stand-in carrying every column the stamper reads or writes.
 
-    def __init__(self, *, supervisor_version: str | None = None) -> None:
+    "reads OR writes" is the whole contract, and #1026 is why the
+    distinction is now spelled out: the stamper gained a READ of
+    ``architecture`` for the cross-architecture refusal, this stub
+    carried only the columns it WRITES, and every test using it died on
+    ``AttributeError``.
+    """
+
+    def __init__(
+        self,
+        *,
+        supervisor_version: str | None = None,
+        architecture: str | None = None,
+    ) -> None:
         self.id = uuid.uuid4()
         self.hostname = "node-1"
+        # None = UNKNOWN, the answer from a supervisor predating #1026.
+        # It never conflicts, so these cases keep exercising the paths
+        # they were written for.
+        self.architecture = architecture
         self.supervisor_version = supervisor_version
         self.installed_appliance_version: str | None = None
         self.desired_appliance_version: str | None = None
