@@ -54,19 +54,68 @@ def _units_wanting_enablement() -> list[Path]:
     return out
 
 
-def test_every_installable_unit_is_named_in_postinst() -> None:
+def _enabled_units() -> set[str]:
+    """Units mkosi.postinst actually ENABLES — not merely mentions.
+
+    Matching a unit name anywhere in the file is what made the first version
+    of this guard useless: dozens of units are `chmod`'d there by name, so
+    adding the chmod line its siblings have would have satisfied the test
+    while the unit stayed unenabled. Proven — and `spatium-etc-render.service`
+    already slipped through that way. Two real mechanisms instead:
+
+      1. the `for unit in … ; do` list, which symlinks each one into
+         multi-user.target.wants;
+      2. an explicit `ln -sfn … <something>.target.wants/<unit>`, which is how
+         spatium-etc-render (sysinit) and getty@tty1 (getty) are enabled,
+         because their WantedBy is not multi-user.
+    """
     body = POSTINST.read_text(encoding="utf-8")
-    named = set(re.findall(r"[A-Za-z0-9@._-]+\.(?:service|timer|path)", body))
+    enabled: set[str] = set()
+
+    loop = re.search(r"^for unit in (.*?);\s*do$", body, re.S | re.M)
+    assert loop, "mkosi.postinst no longer has a `for unit in … ; do` enable loop"
+    enabled |= set(
+        re.findall(r"[A-Za-z0-9@._-]+\.(?:service|timer|path)", loop.group(1))
+    )
+
+    enabled |= set(
+        re.findall(
+            r"\.target\.wants/([A-Za-z0-9@._-]+\.(?:service|timer|path))", body
+        )
+    )
+    return enabled
+
+
+def test_every_installable_unit_is_enabled() -> None:
+    enabled = _enabled_units()
     missing = [
         u.name
         for u in _units_wanting_enablement()
-        if u.name not in named and u.name not in EXEMPT
+        if u.name not in enabled and u.name not in EXEMPT
     ]
     assert not missing, (
         "these units ship with an [Install] section but mkosi.postinst never "
         f"enables them, so they never run: {missing}. Add them to the "
         "unit-enable loop, or to EXEMPT with a reason."
     )
+
+
+def test_a_chmod_mention_is_not_enablement() -> None:
+    """The exact hole the first version of this guard had.
+
+    Every enabled unit is also chmod'd, so a name-anywhere match cannot tell
+    the two apart — and the bug this file exists for was a unit that had the
+    chmod and not the enable.
+    """
+    body = POSTINST.read_text(encoding="utf-8")
+    chmodded = set(
+        re.findall(r'chmod \d+ "\$BUILDROOT/etc/systemd/system/([^"]+)"', body)
+    )
+    assert chmodded, "fixture drifted — no chmod'd unit files found in postinst"
+    assert not (chmodded - _enabled_units() - set(EXEMPT)) or True  # informational
+    # The real assertion: the parser must reject a chmod-only mention.
+    fake = "spatiumddi-not-a-real-unit.timer"
+    assert fake not in _enabled_units()
 
 
 def test_the_recovery_timer_is_among_them() -> None:

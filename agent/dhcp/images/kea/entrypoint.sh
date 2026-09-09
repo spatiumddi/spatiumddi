@@ -176,7 +176,24 @@ fi
 # Forward container SIGTERM to all supervisor subshells and the
 # agent. The supervisors' own traps handle the in-flight daemon.
 _term() {
-    kill -TERM "$KEA_PID" "$KEA6_PID" "${RADVD_PID:-0}" "${AGENT_PID:-0}" 2>/dev/null || true
+    # NEVER expand an unset pid to 0. `kill -TERM 0` signals the CALLER'S
+    # ENTIRE PROCESS GROUP, and `trap _term TERM INT` below means that
+    # re-enters this function — unbounded recursion until the shell dies of
+    # stack exhaustion. The old `"${RADVD_PID:-0}"` did exactly that on every
+    # default install, because radvd is only started when RADVD_MANAGED=1 and
+    # the image default is 0, so RADVD_PID is empty.
+    #
+    # Latent until #1043: the only paths that reached _term were a clean
+    # SIGTERM (where the shell is already going away) and a `wait` return that
+    # the broken `wait -n` made unreachable. Making the crash path work is what
+    # exposed it — measured, the container exited 139 (SIGSEGV) after ~4000
+    # recursive _term calls instead of the child's status, and kea was never
+    # shut down.
+    for _tp in "$KEA_PID" "$KEA6_PID" "$RADVD_PID" "$AGENT_PID"; do
+        [ -n "$_tp" ] || continue
+        kill -TERM "$_tp" 2>/dev/null || true
+    done
+    return 0
 }
 trap _term TERM INT
 
@@ -226,6 +243,18 @@ set +e
 # while we sit in `sleep`, so the pid is gone from the table within a tick of
 # its exit, and `wait` on an already-reaped job still yields its remembered
 # status. Verified on busybox 1.37 in both directions.
+#
+# ALL THREE are watched, including kea-dhcp6, and that is a deliberate
+# behaviour change worth knowing about: because the broken `wait -n` never
+# returned, a kea-dhcp6 supervise loop that gave up (5 crashes in <30 s) used
+# to be TOLERATED — v4 kept serving and the dead v6 daemon was invisible. It
+# is fatal now. That restores the original intent — all three were named in
+# the `wait -n` list, and radvd is deliberately excluded from it precisely
+# because "a radvd flap must not take the DHCP server down" — and it matches
+# this whole change's thesis: a container that restarts is visible and
+# recoverable, a silently dead daemon is neither. A v6 misconfiguration now
+# CrashLoopBackOffs the pod rather than quietly serving v4 only, which is the
+# trade being made on purpose.
 EXIT_CODE=0
 while :; do
     for _pid in "$KEA_PID" "$KEA6_PID" "$AGENT_PID"; do

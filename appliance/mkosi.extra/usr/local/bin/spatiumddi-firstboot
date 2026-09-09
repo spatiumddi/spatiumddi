@@ -847,24 +847,26 @@ spec:
   chartContent: ${chart_b64}
   targetNamespace: spatium
   createNamespace: false
-  # #1042 — NEVER the CRD default, which is \`reinstall\`: "a clean uninstall
-  # and reinstall of the chart" whenever helm-controller finds the release
-  # not \`deployed\` when its job runs. This release is STATEFUL — it owns the
-  # Secret carrying SECRET_KEY, from which app/core/crypto.py derives the
-  # at-rest Fernet key — and an uninstall deleted it, so the reinstall minted
-  # a new key and orphaned the appliance CA private key, every integration
-  # credential and every JWT, with the control plane still reporting healthy.
-  # Three ddi-pg slot-upgrade walks hit exactly that.
+  # #1042 — failurePolicy is deliberately LEFT AT THE CRD DEFAULT (`reinstall`).
   #
-  # \`abort\` leaves a failed release REPAIRABLE instead of destroying it. It is
-  # safe to stop self-healing here because recovery is already explicit and
-  # logged: spatiumddi-helm-stuck-recover's timer walks HelmChart CRs for a
-  # latched Failed condition and clears the helm-install Job + the
-  # \`sh.helm.release.v1.*\` tracking secrets so helm-controller retries. That
-  # runner deletes only \`owner=helm\` release-storage secrets, so the app
-  # Secret — now annotated \`helm.sh/resource-policy: keep\` — survives it and
-  # the retry's \`lookup\` finds the same key.
-  failurePolicy: abort
+  # The first cut of this fix set `abort`, on the reasoning that a clean
+  # uninstall of a release owning SECRET_KEY is too destructive to self-heal
+  # into. Review measured the cost and it is worse than the disease:
+  # spatiumddi-helm-stuck-recover only acts on a HelmChart carrying a
+  # `Failed` condition, and only after a 600 s latch, on a 5 min tick. A
+  # release left `pending-upgrade` by the slot reboot — i.e. exactly the
+  # scenario #1042 was found in — may never set `Failed` at all, so `abort`
+  # risks an INDEFINITE outage with no API and no UI, where `reinstall`
+  # recovers in seconds.
+  #
+  # What made `reinstall` dangerous was never the reinstall: it was that the
+  # app Secret lacked `helm.sh/resource-policy: keep`, so the uninstall half
+  # DELETED it and the install half minted a new SECRET_KEY. With the
+  # annotation (charts/spatiumddi/templates/secret.yaml) the Secret survives
+  # the uninstall and the reinstall's `lookup` finds the same key — the same
+  # mechanism that carried the Postgres and Redis secrets through the very
+  # same event. A reinstall is disruptive and self-healing; it is no longer
+  # lossy, which is the property that actually mattered.
   valuesContent: |
     image:
       tag: "${SPATIUMDDI_VERSION}"

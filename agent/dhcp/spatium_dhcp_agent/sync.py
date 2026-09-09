@@ -96,6 +96,8 @@ def clear_ready_marker(state_dir: Path) -> None:
     try:
         marker.unlink()
     except FileNotFoundError:
+        # Already gone — the agent died before its first successful sync, so
+        # readiness was never claimed. Nothing to take back.
         pass
     except OSError:
         log.exception("ready_marker_clear_failed", path=str(marker))

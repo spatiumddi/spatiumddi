@@ -94,6 +94,10 @@ render() { # name chart [helm --set args...]
         -cache "$KUBECONFORM_CACHE" \
         "$file" || failures=$((failures + 1))
     python3 "$ROOT/.github/scripts/chart-no-besteffort.py" "$file" || failures=$((failures + 1))
+    # #1042 — a generated credential Secret must carry resource-policy: keep,
+    # checked on the RENDER so a value typo or a false condition cannot hide it.
+    python3 "$ROOT/.github/scripts/chart-credential-secrets-kept.py" "$file" \
+        || failures=$((failures + 1))
     # shellcheck disable=SC2086  # POSTURE_ARGS is a deliberate flag list
     python3 "$ROOT/.github/scripts/chart-pod-posture.py" $POSTURE_ARGS "$file" \
         || failures=$((failures + 1))

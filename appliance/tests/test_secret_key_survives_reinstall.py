@@ -59,15 +59,33 @@ def _generated_credential_secrets() -> list[Path]:
     return found
 
 
+#: The annotation as a real YAML entry, with the value that matters. Matching
+#: the key name anywhere in the file passed with the whole `annotations:` block
+#: deleted, because this template's own header prose explains the annotation —
+#: proven, and exactly the vacuous-guard shape these tests exist to prevent.
+_KEEP_ENTRY = re.compile(r'^\s*"?helm\.sh/resource-policy"?\s*:\s*keep\s*$', re.M)
+
+#: Helm's `{{/* … */}}` comments, stripped before matching so prose about the
+#: annotation can never satisfy the assertion.
+_HELM_COMMENT = re.compile(r"\{\{-?/\*.*?\*/-?\}\}", re.S)
+
+
+def _body_without_comments(path: Path) -> str:
+    body = _HELM_COMMENT.sub("", path.read_text(encoding="utf-8"))
+    return "\n".join(
+        ln for ln in body.splitlines() if not ln.lstrip().startswith("#")
+    )
+
+
 def test_generated_credential_secrets_are_kept_across_uninstall() -> None:
     missing = [
         p.name
         for p in _generated_credential_secrets()
-        if "helm.sh/resource-policy" not in p.read_text(encoding="utf-8")
+        if not _KEEP_ENTRY.search(_body_without_comments(p))
     ]
     assert not missing, (
         "these templates mint a credential but do not carry "
-        f"`helm.sh/resource-policy: keep`, so a reinstall rotates it: {missing}"
+        f"`helm.sh/resource-policy: keep` as a real annotation: {missing}"
     )
 
 
@@ -109,24 +127,29 @@ def _render_control_helmchart() -> dict:
     return yaml.safe_load(out)
 
 
-def test_control_helmchart_never_takes_the_destructive_default() -> None:
-    """`reinstall` uninstalls a stateful release; `abort` leaves it repairable.
+def test_the_control_helmchart_does_not_set_abort() -> None:
+    """`abort` was considered and REJECTED — this pins the decision (#1042).
 
-    Recovery is already explicit and logged — spatiumddi-helm-stuck-recover
-    clears the install Job and the `sh.helm.release.v1.*` tracking secrets so
-    helm-controller retries — so losing the self-healing reinstall costs
-    nothing here. `retry` would be acceptable too; `reinstall` is not.
+    It looks like the safer setting and is not. spatiumddi-helm-stuck-recover
+    only acts on a HelmChart carrying a `Failed` condition, and only after a
+    600 s latch on a 5 min tick — so a release left `pending-upgrade` by the
+    slot reboot, which is the scenario #1042 was found in, may never qualify.
+    `abort` there risks an indefinite outage with no API and no UI, where the
+    default `reinstall` recovers in seconds.
+
+    What made `reinstall` dangerous was the missing
+    `helm.sh/resource-policy: keep`, not the reinstall: with it the Secret
+    survives the uninstall and the reinstall's `lookup` finds the same key.
+    Disruptive and self-healing is fine; lossy was not.
     """
     manifest = _render_control_helmchart()
-    policy = manifest["spec"].get("failurePolicy")
-    assert policy in ("abort", "retry"), (
-        "spatium-control must not use the CRD default `reinstall`, which "
-        f"uninstalls the release that owns SECRET_KEY (got {policy!r})"
+    assert manifest["spec"].get("failurePolicy") != "abort", (
+        "failurePolicy: abort defers recovery to a timer that may never fire "
+        "for a pending-upgrade release — see this test's docstring"
     )
 
 
-def test_failure_policy_is_on_the_spec_not_in_the_values() -> None:
-    """A values key named failurePolicy would be silently inert."""
-    manifest = _render_control_helmchart()
-    values = yaml.safe_load(manifest["spec"]["valuesContent"])
-    assert "failurePolicy" not in values, "failurePolicy belongs on spec, not in valuesContent"
+def test_values_content_still_parses() -> None:
+    """Cheap structural check on the manifest the appliance actually applies."""
+    values = yaml.safe_load(_render_control_helmchart()["spec"]["valuesContent"])
+    assert isinstance(values, dict) and values, "firstboot rendered no values"

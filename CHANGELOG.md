@@ -558,24 +558,43 @@ the formatter handles the rest.
   member approval started answering 500 with
   `ValueError: encrypted value could not be decrypted` — while the
   control plane reported healthy and the data plane kept serving.
-  **Two independent fixes, because each covers a deployment shape the
-  other does not.** The Secret gains
-  `helm.sh/resource-policy: keep` — it was the ONLY credential Secret
-  in the chart without it, and the Postgres and Redis secrets survived
-  the very same event purely because they carry it. And the
-  appliance's control HelmChart now sets `failurePolicy: abort`, so
-  the destructive path is not taken at all. Losing the self-healing
-  reinstall costs nothing here: recovery is already explicit and
-  logged, since `spatiumddi-helm-stuck-recover` clears the
-  helm-install Job and the `sh.helm.release.v1.*` tracking secrets so
-  helm-controller retries — and it deletes only `owner=helm`
-  release-storage secrets, so the now-kept app Secret survives it and
-  the retry's `lookup` finds the same key.
+  **The fix is the annotation, and `failurePolicy` is deliberately
+  left alone.** The Secret gains `helm.sh/resource-policy: keep` — it
+  was the ONLY credential Secret in the chart without it, and the
+  Postgres and Redis secrets came through the very same event purely
+  because they carry it. With it, the uninstall half retains the
+  Secret and the reinstall's `lookup` finds the same key.
+  **`failurePolicy: abort` was written, then reverted in review**, and
+  the reason is worth recording: it looks like the safer setting and
+  is not. `spatiumddi-helm-stuck-recover` only acts on a HelmChart
+  carrying a `Failed` condition, and only after a 600 s latch on a
+  5 min tick — so a release left `pending-upgrade` by the slot reboot,
+  which is the scenario this was found in, may never qualify at all.
+  `abort` there risks an indefinite outage with no API and no UI,
+  where the default `reinstall` recovers in seconds. What made
+  `reinstall` dangerous was never the reinstall; it was the missing
+  annotation. Disruptive and self-healing is fine. Lossy was not.
   The chart guard is written against the *generator* rather than the
   filename — any Secret template that mints a credential with
   `randAlphaNum` must carry the annotation — with a negative control
   asserting SECRET_KEY's own template is still one of the templates
   being checked, so the guard cannot pass by looking at nothing.
+  **Both of the first-cut guards were themselves vacuous**, which
+  review proved rather than argued: deleting the entire `annotations:`
+  block left all four tests passing, because the template's own header
+  prose mentions the annotation; and the unit guard matched a name
+  anywhere in `mkosi.postinst`, where dozens of units are `chmod`'d by
+  name — so adding the chmod line its siblings have would have
+  satisfied it while the unit stayed unenabled (`spatium-etc-render`
+  already slipped through that way). They now strip Helm and shell
+  comments and match the annotation as a real YAML entry *with the
+  value `keep`*, and parse the `for unit in … ; do` list plus the
+  explicit `*.target.wants/` symlinks rather than the whole file.
+  A third check runs on the **rendered** manifest in
+  `charts-render-check.sh`, where a value typo or an annotation hidden
+  behind a false condition is visible and a template-text scan is not;
+  it reports how many Secrets it examined, so "checked nothing" cannot
+  read as "checked and clean".
   **Making `abort` safe turned up a third defect.** The recovery it
   leans on had never run: `spatiumddi-helm-stuck-recover.timer` ships
   in the image, carries `WantedBy=timers.target`, and has its runner
@@ -912,6 +931,28 @@ the formatter handles the rest.
   an already-reaped job still yields its remembered status. Verified
   in both directions on busybox 1.37.
   Two comments asserting the broken mechanism are corrected with it.
+  **Making the crash path reachable exposed a latent `kill -TERM 0`.**
+  `_term` expanded an unset `RADVD_PID` to `0` — radvd starts only
+  when `RADVD_MANAGED=1` and the image default is `0` — and
+  `kill -TERM 0` signals the CALLER'S PROCESS GROUP, which with
+  `trap _term TERM INT` re-enters `_term` and recurses until the shell
+  dies of stack exhaustion. Measured: the container exited **139
+  (SIGSEGV)** after ~4000 calls instead of the child's status, and kea
+  was never shut down. Latent before this change because nothing
+  reached `_term` on a crash, so the fix would have traded a hang for
+  a segfault. It now skips empty pids. Found by review because the
+  first cut of the tests STUBBED `_term`, which is exactly why they
+  passed; they run the real one now, with `trap _term TERM INT` and an
+  empty `RADVD_PID` because both are needed to reproduce it — and
+  `start_new_session=True`, because without it `kill -TERM 0` took out
+  the pytest process group, so the guard destroyed its own runner and
+  reported nothing.
+  **One deliberate behaviour change:** kea-dhcp6 is watched too, so a
+  v6 supervise loop that gives up now CrashLoopBackOffs the pod where
+  the broken `wait -n` tolerated it and left a dead v6 daemon
+  invisible. That restores the original intent — all three were in the
+  `wait -n` list, and radvd is excluded from it precisely because "a
+  radvd flap must not take the DHCP server down".
 
 - **The upgrade path could hand a node a root filesystem for
   another CPU architecture (#1026, part 1 of 3).** Every appliance
