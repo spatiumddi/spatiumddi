@@ -410,3 +410,41 @@ def test_upstream_summary_reports_failures_as_their_own_number(
     behind = [r for r in rows if r["behind"] and not r["hold"]]
     failed = [r for r in rows if r["error"]]
     assert (len(behind), len(failed)) == (0, 2)
+
+
+@pytest.mark.parametrize(
+    ("url", "allowed", "why"),
+    [
+        ("https://api.github.com/repos/x/y/releases/latest", True, "the real endpoint"),
+        ("https://hub.docker.com/v2/repositories/library/redis/tags", True, "docker hub"),
+        ("https://quay.io/api/v1/repository/coreos/etcd/tag/", True, "quay"),
+        ("https://rubygems.org/api/v1/versions/webrick/latest.json", True, "rubygems"),
+        (
+            "https://evil.example/api.github.com/repos/x/y",
+            False,
+            "the substring check this replaced would have sent the TOKEN here",
+        ),
+        ("https://api.github.com.evil.example/x", False, "suffix-attached lookalike host"),
+        ("http://api.github.com/x", False, "plaintext downgrade"),
+        ("file:///etc/passwd", False, "non-http scheme"),
+    ],
+)
+def test_only_allowlisted_https_hosts_are_fetched(
+    lint: types.ModuleType, url: str, allowed: bool, why: str
+) -> None:
+    """The token must be scoped by parsed HOSTNAME, never a URL substring.
+
+    ``"api.github.com" in url`` is also true of
+    ``https://evil.example/api.github.com/...`` — which is a credential
+    handed to whoever owns that domain. Flagged by CodeQL as incomplete URL
+    substring sanitization; the guard now parses the URL and matches the host
+    exactly, and refuses anything that is not https to a known endpoint.
+    """
+    import urllib.parse
+
+    parts = urllib.parse.urlsplit(url)
+    host = (parts.hostname or "").lower()
+    ok = parts.scheme == "https" and host in lint._ALLOWED_HOSTS
+    assert ok is allowed, why
+    if allowed:
+        assert (host == lint._GITHUB_API_HOST) == ("api.github.com" == host)

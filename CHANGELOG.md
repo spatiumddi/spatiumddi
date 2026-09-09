@@ -401,8 +401,8 @@ the formatter handles the rest.
   behind ON PURPOSE from real drift — the `hold` field carries
   each reason, so a known hold never reads as neglect.
   `make versions-upstream` runs it locally.
-  **Six defects in the guard itself, found by /code-review before
-  it shipped, and every one of them was the guard failing open.**
+  **Seven defects in the guard itself, found by /code-review and
+  CodeQL before it shipped, and every one was it failing open.**
   `--check` — the mode the script's own docstring documents — was
   not a flag: argparse resolves an unambiguous prefix, so it ran
   `--check-upstream`, the advisory network mode that always exits
@@ -426,7 +426,12 @@ the formatter handles the rest.
   the worst one to lose: the appliance never pulls, so a
   divergence there is ImagePullBackOff on an air-gapped box. And
   `docs/DEVELOPMENT.md` referred twice to a section that did not
-  exist, now written as §9.
+  exist, now written as §9. And the GitHub token was scoped to a
+  URL SUBSTRING — `"api.github.com" in url` is equally true of
+  `https://evil.example/api.github.com/x`, which is the token
+  handed to whoever owns that domain. It is matched on the parsed
+  hostname now, against an allowlist of the four endpoints this
+  script has any business reaching, https only.
 
 - **The pins the sweep found behind, bumped (#975).** Out of
   support: `ruby:3.2-slim` (EOL 2026-03-31) → 3.4, and with it

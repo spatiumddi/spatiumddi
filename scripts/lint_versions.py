@@ -202,14 +202,35 @@ def check(manifest: dict[str, Any], root: pathlib.Path) -> tuple[list[str], int]
 # ── the upstream check (advisory, network) ───────────────────────────────────
 
 
+#: Hosts this script is allowed to talk to. Every URL it builds is composed
+#: from a literal here plus a repo name out of the manifest, so the set is
+#: closed; asserting it anyway keeps a malformed ``upstream.repo`` from
+#: steering a request somewhere else.
+_ALLOWED_HOSTS = frozenset(
+    {"api.github.com", "hub.docker.com", "quay.io", "rubygems.org"}
+)
+
+#: The one host that gets the token.
+_GITHUB_API_HOST = "api.github.com"
+
+
 def _http_json(url: str, token: str | None = None) -> Any:
-    import urllib.error
+    import urllib.parse
     import urllib.request
 
+    parts = urllib.parse.urlsplit(url)
+    # Compare the parsed HOSTNAME, never a substring of the URL. ``"api.
+    # github.com" in url`` is also true for ``https://evil.example/api.
+    # github.com/x`` — which would send the token to whoever owns that host.
+    # (CodeQL: incomplete URL substring sanitization.)
+    host = (parts.hostname or "").lower()
+    if parts.scheme != "https" or host not in _ALLOWED_HOSTS:
+        raise LookupError(f"refusing to fetch {url!r}: not an allowed https endpoint")
+
     req = urllib.request.Request(url, headers={"User-Agent": "spatiumddi-lint-versions"})
-    if token and "api.github.com" in url:
+    if token and host == _GITHUB_API_HOST:
         req.add_header("Authorization", f"Bearer {token}")
-    with urllib.request.urlopen(req, timeout=20) as resp:  # noqa: S310 (fixed hosts)
+    with urllib.request.urlopen(req, timeout=20) as resp:  # noqa: S310 — https + allowlist above
         return json.loads(resp.read().decode("utf-8"))
 
 
