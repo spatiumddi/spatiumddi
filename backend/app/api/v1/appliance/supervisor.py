@@ -1051,6 +1051,15 @@ class SupervisorHeartbeatRequest(BaseModel):
         ]
         | None
     ) = None
+    # #1026 — the node's CPU architecture from the supervisor's
+    # ``platform.machine()``, normalised to the artifact vocabulary.
+    # None on a supervisor too old to report it; the handler leaves the
+    # column untouched in that case, same as ``appliance_variant``.
+    #
+    # A ``Literal`` rather than a free string, so an unrecognised value
+    # is a 422 at the door instead of a row that compares unequal to
+    # every real architecture and silently refuses every upgrade.
+    architecture: Literal["amd64", "arm64"] | None = None
     installed_appliance_version: str | None = None
     current_slot: Literal["slot_a", "slot_b"] | None = None
     durable_default: Literal["slot_a", "slot_b"] | None = None
@@ -1709,6 +1718,12 @@ async def supervisor_heartbeat(
         # config:ROLE and reports here. Leave the existing value alone
         # if the supervisor didn't ship the field this tick (pre-#272).
         row.appliance_variant = body.appliance_variant
+    if body.architecture is not None:
+        # #1026 — same partial-heartbeat rule: a supervisor that didn't
+        # ship the field leaves the known value in place rather than
+        # blanking it back to UNKNOWN, which would silently disarm the
+        # upgrade-architecture gate on every node during a rollout.
+        row.architecture = body.architecture
     if body.installed_appliance_version is not None:
         row.installed_appliance_version = body.installed_appliance_version
     if body.current_slot is not None:
@@ -2656,6 +2671,10 @@ class ApplianceRow(BaseModel):
     # #272 Phase 1 — installer-role variant. NULL on pre-#272
     # supervisors that haven't slot-upgraded yet.
     appliance_variant: str | None
+    # #1026 — the node's CPU architecture, so the Fleet drilldown can
+    # show it and the upgrade picker can refuse an image built for the
+    # other one before the operator schedules it.
+    architecture: str | None
     installed_appliance_version: str | None
     current_slot: str | None
     durable_default: str | None
@@ -2818,6 +2837,7 @@ def _row_to_schema(row: Appliance) -> ApplianceRow:
         cert_expires_at=row.cert_expires_at,
         deployment_kind=row.deployment_kind,
         appliance_variant=row.appliance_variant,
+        architecture=row.architecture,
         installed_appliance_version=row.installed_appliance_version,
         current_slot=row.current_slot,
         durable_default=row.durable_default,
@@ -5115,10 +5135,16 @@ async def schedule_appliance_upgrade(
         # A fresh nonce per click: re-applying the SAME image from the Fleet
         # button is an explicit retry and must re-fire the host trigger.
         target = replace(target, nonce=new_refire_nonce())
+        # #1026 — INSIDE the try. The architecture refusal is raised by
+        # ``stamp``, not by ``resolve``: resolve knows the image, stamp is
+        # the first place that also knows the node. Left outside, the
+        # mismatch escaped as a 500 while every surface — the design, the
+        # docs and the Fleet picker's own comment — promised a 422 naming
+        # both architectures.
+        stamp_desired_slot_image(row, target, desired_version=body.desired_appliance_version)
     except SlotImageResolutionError as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
 
-    stamp_desired_slot_image(row, target, desired_version=body.desired_appliance_version)
     resolved_url = row.desired_slot_image_url or target.url
     db.add(
         AuditLog(

@@ -278,5 +278,14 @@ if [ "$apply_rc" -eq 0 ]; then
 elif [ "$apply_rc" -eq 124 ] || [ "$apply_rc" -eq 137 ]; then
     fail "apply timed out after ${APPLY_TIMEOUT_SECONDS}s (stalled download or dd) — see slot-upgrade.log"
 else
-    fail "apply failed (rc=${apply_rc}) — see slot-upgrade.log for the cause (download / verify / write)"
+    # rc=5 is #1026's architecture refusal: the image was written to the
+    # inactive slot and the bootloader deliberately NOT pointed at it.
+    # Named separately because "apply failed" reads as a broken download
+    # or a bad disk, and this one is neither — the operator has to fetch
+    # a different image, not retry this one.
+    if [ "$apply_rc" -eq 5 ]; then
+        fail "apply refused: the image is built for a different CPU architecture than this node (rc=5) — the active slot is untouched; fetch the image for this node's architecture"
+    else
+        fail "apply failed (rc=${apply_rc}) — see slot-upgrade.log for the cause (download / verify / write / architecture)"
+    fi
 fi

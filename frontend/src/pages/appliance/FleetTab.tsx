@@ -38,6 +38,7 @@ import {
   type StorageActionRequest,
   type StorageActionResult,
   type SupervisorCapabilities,
+  type AvailableUpgradeImage,
   type UpgradeImage,
   formatApiError,
 } from "@/lib/api";
@@ -5094,6 +5095,26 @@ function ApplianceOsUpgradeSection({
     if (image) setTag(image.appliance_version);
   }
 
+  // #1026 — an image built for another architecture would download,
+  // verify, write and then not boot. The server refuses it (422) and
+  // the host runner refuses it again on the real bytes; this is the
+  // third gate, and the only one that saves the operator the round
+  // trip.
+  //
+  // DISABLED IN PLACE rather than filtered out of the list. An image an
+  // operator uploaded a minute ago silently missing from the picker
+  // reads as a bug in the upload, which is exactly the wrong place to
+  // send them looking. Both unknowns fall through as selectable: null
+  // means we do not know, and refusing on "do not know" would block
+  // every image staged before this field existed.
+  function imageArchMismatch(img: UpgradeImage): boolean {
+    return (
+      !!row.architecture &&
+      !!img.architecture &&
+      row.architecture !== img.architecture
+    );
+  }
+
   const scheduleUpgrade = useMutation({
     mutationFn: () =>
       applianceApprovalApi.scheduleUpgrade(
@@ -5251,9 +5272,17 @@ function ApplianceOsUpgradeSection({
               >
                 <option value="">(pick an uploaded image)</option>
                 {(uploadedQuery.data ?? []).map((img) => (
-                  <option key={img.id} value={img.id}>
+                  <option
+                    key={img.id}
+                    value={img.id}
+                    disabled={imageArchMismatch(img)}
+                  >
                     {img.filename} · v{img.appliance_version} ·{" "}
+                    {img.architecture ?? "arch unknown"} ·{" "}
                     {(img.size_bytes / (1024 * 1024)).toFixed(0)} MiB
+                    {imageArchMismatch(img)
+                      ? ` — needs ${row.architecture}`
+                      : ""}
                   </option>
                 ))}
               </select>
@@ -5387,6 +5416,20 @@ function ApplianceOsUpgradeSection({
   );
 }
 
+// #1026 — a release that publishes an image for both architectures is
+// TWO importable rows sharing one tag, so the picker's value has to
+// carry the architecture as well. Keyed on both rather than on an array
+// index, which would silently re-point at a different release the
+// moment the list refreshed underneath the operator.
+function availableKey(r: AvailableUpgradeImage): string {
+  return `${r.tag}\u0000${r.architecture}`;
+}
+
+function splitAvailableKey(key: string): [string, string | undefined] {
+  const [tag, arch] = key.split("\u0000");
+  return [tag, arch || undefined];
+}
+
 // ── UpgradeImageManager (#170 follow-up; GitHub import + air-gap
 // upload — #199) ──────────────────────────────────────────────────
 
@@ -5397,6 +5440,11 @@ function UpgradeImageManager() {
   const [file, setFile] = useState<File | null>(null);
   const [sha256, setSha256] = useState("");
   const [applianceVersion, setApplianceVersion] = useState("");
+  // #1026 — declared, like the version beside it. Empty means UNKNOWN
+  // and is a legitimate answer: the control-plane gate then does not
+  // block, and ``spatium-upgrade-slot`` still re-checks the real
+  // decompressed image against the node's own uname before it writes.
+  const [architecture, setArchitecture] = useState("");
   const [notes, setNotes] = useState("");
   const [progress, setProgress] = useState<{
     loaded: number;
@@ -5432,7 +5480,8 @@ function UpgradeImageManager() {
 
   // Default-select the newest available tag once the list lands.
   useEffect(() => {
-    if (!selectedTag && available.length > 0) setSelectedTag(available[0].tag);
+    if (!selectedTag && available.length > 0)
+      setSelectedTag(availableKey(available[0]));
   }, [available, selectedTag]);
 
   const upload = useMutation({
@@ -5443,12 +5492,14 @@ function UpgradeImageManager() {
         applianceVersion.trim(),
         notes.trim() || undefined,
         (loaded, total) => setProgress({ loaded, total }),
+        architecture || undefined,
       ),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["appliance", "upgrade-images"] });
       setFile(null);
       setSha256("");
       setApplianceVersion("");
+      setArchitecture("");
       setNotes("");
       setProgress(null);
     },
@@ -5456,7 +5507,10 @@ function UpgradeImageManager() {
   });
 
   const importGithub = useMutation({
-    mutationFn: () => applianceUpgradeImagesApi.importFromGithub(selectedTag),
+    mutationFn: () => {
+      const [tag, arch] = splitAvailableKey(selectedTag);
+      return applianceUpgradeImagesApi.importFromGithub(tag, arch);
+    },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["appliance", "upgrade-images"] });
     },
@@ -5536,8 +5590,9 @@ function UpgradeImageManager() {
                   className="mt-1 w-full rounded-md border bg-background px-2 py-1"
                 >
                   {available.map((r) => (
-                    <option key={r.tag} value={r.tag}>
+                    <option key={availableKey(r)} value={availableKey(r)}>
                       {r.tag}
+                      {` · ${r.architecture}`}
                       {r.is_prerelease ? " (pre-release)" : ""}
                       {r.is_installed ? " · installed" : ""}
                       {r.size_bytes
@@ -5601,6 +5656,23 @@ function UpgradeImageManager() {
                 placeholder="e.g. 2026.06.01-1"
                 className="mt-1 w-full rounded-md border bg-background px-2 py-1"
               />
+            </div>
+            <div>
+              <label className="text-muted-foreground">Architecture</label>
+              <select
+                value={architecture}
+                onChange={(e) => setArchitecture(e.target.value)}
+                className="mt-1 w-full rounded-md border bg-background px-2 py-1"
+              >
+                <option value="">Unknown (don't check)</option>
+                <option value="amd64">amd64 (x86-64)</option>
+                <option value="arm64">arm64 (AArch64)</option>
+              </select>
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                From the asset name you downloaded. Lets the control plane
+                refuse this image for a node of the other architecture before
+                scheduling; the appliance re-checks the real image either way.
+              </p>
             </div>
             <div className="sm:col-span-2">
               <label className="text-muted-foreground">SHA-256 (hex)</label>

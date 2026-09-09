@@ -413,10 +413,19 @@ jobs:
     permissions:
       contents: read
       packages: read
+    # #1026 — one leg per architecture. ``fail-fast: false`` so an arm64
+    # regression does not withhold the amd64 ISO from a release: the two
+    # are independent artifacts and one being broken is not a reason to
+    # ship neither.
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
     uses: ./.github/workflows/build-appliance.yml
     with:
       version: ${{ needs.meta.outputs.version }}
       image_tag: ${{ needs.meta.outputs.version }}
+      arch: ${{ matrix.arch }}
 
   # ── Export the OpenAPI contract (#903) ─────────────────────────────────────
   #
@@ -609,10 +618,17 @@ jobs:
             echo "PREV_TAG=$PREV_TAG" >> "$GITHUB_ENV"
           fi
 
-      - name: Download appliance artifacts (ISO + slot image)
+      - name: Download appliance artifacts (ISO + slot image, per arch)
         uses: actions/download-artifact@v8
         with:
-          name: appliance-artifacts
+          # #1026 — the appliance job is a matrix now, so it uploads
+          # ``appliance-artifacts-<arch>`` per leg. A bare ``name:`` of
+          # the old value matches nothing and download-artifact ERRORS,
+          # which would fail the release job outright — no assets, no
+          # release. ``merge-multiple`` flattens both legs into dist/,
+          # where the existing globs pick them up unchanged.
+          pattern: appliance-artifacts-*
+          merge-multiple: true
           path: dist/
 
       # #903 — the versioned API contract. Kept OUT of dist/ so the
@@ -639,8 +655,11 @@ jobs:
 
             ## OS Appliance ISO
 
-            Hybrid USB/CD installer image attached as a release asset
-            (``${{ needs.build-appliance-iso.outputs.iso_name }}``). Burn
+            Hybrid USB/CD installer images for **x86-64 and arm64**,
+            attached as release assets
+            (``spatiumddi-appliance-${{ needs.meta.outputs.version }}-amd64.iso``
+            and ``…-arm64.iso``). The arm64 image is **UEFI-only** —
+            AArch64 has no BIOS boot path. Burn
             to USB with ``sudo dd if=… of=/dev/sdX bs=4M conv=fsync`` or
             attach as a CD-ROM in your hypervisor. See
             [docs/deployment/APPLIANCE.md](https://github.com/${{ github.repository }}/blob/${{ needs.meta.outputs.version }}/docs/deployment/APPLIANCE.md)
@@ -651,6 +670,7 @@ jobs:
 
             ```
             https://github.com/${{ github.repository }}/releases/latest/download/spatiumddi-appliance-amd64.iso
+            https://github.com/${{ github.repository }}/releases/latest/download/spatiumddi-appliance-arm64.iso
             ```
 
             ## OS Appliance Slot Upgrade Image
@@ -665,11 +685,17 @@ jobs:
               --checksum https://github.com/${{ github.repository }}/releases/latest/download/spatiumddi-appliance-slot-amd64.sha256
             ```
 
+            …or ``-arm64`` for an arm64 appliance. Pointing a node at
+            the other architecture's image is refused twice — by the
+            control plane before it stamps desired state, and by the
+            runner on the real decompressed bytes before it touches the
+            bootloader (#1026).
+
             Writes the image into the inactive A/B slot, arms grub to
             try it on next boot, auto-rolls back if `/health/live`
             doesn't come up healthy. Active slot is never touched
-            during apply. Versioned filename
-            (``${{ needs.build-appliance-iso.outputs.slot_name }}``)
+            during apply. Versioned filenames
+            (``spatiumddi-appliance-slot-${{ needs.meta.outputs.version }}-<arch>.raw.xz``)
             attached too for archival.
 
             ## API Contract (`openapi.json`)

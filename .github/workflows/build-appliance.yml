@@ -13,7 +13,7 @@ name: Build appliance (reusable)
 # Callers differ only in the inputs:
 #
 #   release: version = image_tag = the CalVer tag; stable_copies on, so the
-#            un-versioned spatiumddi-appliance-amd64.* names exist for the
+#            un-versioned spatiumddi-appliance-<arch>.* names exist for the
 #            /releases/latest/download/ stable URLs.
 #   nightly: version is the gate's non-CalVer stamp string, image_tag is
 #            the immutable nightly-YYYYMMDD date tag (never the mutable
@@ -43,11 +43,20 @@ on:
         type: string
       stable_copies:
         description: >-
-          Also emit the un-versioned spatiumddi-appliance-amd64.* copies
+          Also emit the un-versioned spatiumddi-appliance-<arch>.* copies
           that /releases/latest/download/ URLs point at.
         required: false
         type: boolean
         default: true
+      arch:
+        description: >-
+          Which CPU architecture to build (#1026). ``amd64`` runs on
+          ubuntu-latest; ``arm64`` runs on GitHub's hosted arm64 runners
+          so mkosi builds NATIVELY — emulating it does not work, because
+          mkosi dies on mount_setattr(2) under qemu-user (#991).
+        required: false
+        type: string
+        default: amd64
       artifact_retention_days:
         description: Retention for the appliance-artifacts upload.
         required: false
@@ -76,8 +85,14 @@ jobs:
   # every image exists at ``image_tag`` (both callers ``needs:`` their
   # image-build jobs).
   build:
-    name: Build appliance ISO
-    runs-on: ubuntu-latest
+    name: Build appliance ISO (${{ inputs.arch }})
+    # #1026 — NATIVE runner per architecture. mkosi cross-builds a
+    # rootfs happily, but the builder container itself cannot be
+    # emulated: under qemu-user it dies immediately on mount_setattr(2)
+    # (#991), and no amount of --privileged helps. GitHub's hosted arm64
+    # runners are free for public repos, which is what makes this the
+    # cheap answer rather than the clever one.
+    runs-on: ${{ inputs.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     timeout-minutes: 60
     outputs:
       iso_name: ${{ steps.wrap.outputs.iso_name }}
@@ -94,6 +109,12 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="${{ inputs.version }}"
+          # #1026 — the architecture the ISO/slot image is built FOR,
+          # from the caller's matrix leg. Deliberately not ``uname -m``
+          # of the runner: those agree today because each leg runs
+          # natively, and the moment they stop agreeing the runner's
+          # architecture is the wrong answer.
+          APPLIANCE_ARCH="${{ inputs.arch }}"
           # Drop the build-time version stamp into mkosi.extra so it
           # gets baked into the rootfs at build. ``spatiumddi-firstboot``
           # + ``spatium-upgrade-slot`` + ``spatium-console`` all read
@@ -105,6 +126,13 @@ jobs:
               echo "APPLIANCE_VERSION=\"${VERSION}\""
               echo "BUILD_TIME=\"$(date -u -Iseconds)\""
               echo "GIT_SHA=\"${GITHUB_SHA}\""
+              # #1026 — the architecture this rootfs is built FOR, which
+              # is what ``spatium-upgrade-slot`` compares against the
+              # running node's own ``uname -m`` before it writes a slot.
+              # Not ``uname -m`` of the runner: the whole point is that
+              # the two can differ, and once the arm64 build exists the
+              # runner's architecture stops being the image's.
+              echo "APPLIANCE_ARCH=\"${APPLIANCE_ARCH}\""
           } > appliance/mkosi.extra/etc/spatiumddi/appliance-release
           echo "→ Stamped appliance-release:"
           cat appliance/mkosi.extra/etc/spatiumddi/appliance-release
@@ -131,7 +159,11 @@ jobs:
           # "Waiting for k3s /readyz". Mirrors what
           # ``make appliance-fetch-k3s`` does locally.
           chmod +x appliance/scripts/fetch-k3s.sh
-          appliance/scripts/fetch-k3s.sh
+          # #1026 — for the leg's architecture, not the runner's. They
+          # agree today because each leg is native, and relying on that
+          # is how the wrong static binary gets baked the first time
+          # they stop agreeing.
+          ARCH=${{ inputs.arch }} appliance/scripts/fetch-k3s.sh
           ls -lh appliance/mkosi.extra/usr/local/bin/k3s
           ls -lh appliance/mkosi.extra/var/lib/rancher/k3s/agent/images/k3s-airgap-images-*.tar.zst
       - name: Bake helm charts (appliance + control)
@@ -156,6 +188,12 @@ jobs:
         env:
           SPATIUMDDI_VERSION: ${{ inputs.image_tag }}
           BAKE_SOURCE: ghcr
+          # #1026 — pull + save the leg's architecture. Every SpatiumDDI
+          # image is multi-arch (non-negotiable #11), so without these
+          # the bake would take whatever the runner's default platform
+          # is; correct today only by the accident of a native runner.
+          DOCKER_DEFAULT_PLATFORM: linux/${{ inputs.arch }}
+          BAKE_SAVE_PLATFORM: linux/${{ inputs.arch }}
         run: |
           set -euo pipefail
           echo "→ Pulling every image at ${SPATIUMDDI_VERSION} + baking per-image tarballs"
@@ -166,8 +204,8 @@ jobs:
           # built a single ``docker-overlay.img`` overlay file via a
           # docker:dind sandbox is gone (no docker on the appliance
           # post-Phase-7).
-          # ``sudo -E`` preserves SPATIUMDDI_VERSION + BAKE_SOURCE
-          # from the job env. Without ``-E``, sudo strips them and
+          # ``sudo -E`` preserves SPATIUMDDI_VERSION + BAKE_SOURCE +
+          # the two #1026 platform vars from the job env. Without ``-E``, sudo strips them and
           # bake-images.sh falls back to its ``SPATIUMDDI_VERSION=dev``
           # / ``BAKE_SOURCE=local`` defaults — which then fails on the
           # runner with "no local image found" because no :dev tags
@@ -194,12 +232,14 @@ jobs:
           docker run --rm --privileged \
             -v "$PWD/appliance:/work" \
             "$BUILDER" \
+            --architecture=${{ inputs.arch == 'arm64' && 'arm64' || 'x86-64' }} \
             --output-directory=build --force build
           ls -lh appliance/build/
       - name: Wrap as hybrid USB/CD ISO
         id: wrap
         env:
           TAG: ${{ inputs.image_tag }}
+          ARCH: ${{ inputs.arch }}
           STABLE_COPIES: ${{ inputs.stable_copies }}
         run: |
           set -euo pipefail
@@ -209,6 +249,7 @@ jobs:
           ISO_INTERIM="${RAW%.raw}.iso"
           docker run --rm --privileged \
             --entrypoint /work/scripts/wrap-iso.sh \
+            -e APPLIANCE_ARCH="${{ inputs.arch }}" \
             -v "$PWD/appliance:/work" \
             "$BUILDER" \
             "/work/build/$(basename "$RAW")" \
@@ -217,20 +258,27 @@ jobs:
           #   - Versioned (archive trail — for a release, of every release
           #     ever cut)
           #   - Stable filename (un-versioned, so the README can link to
-          #     https://.../releases/latest/download/spatiumddi-appliance-amd64.iso
+          #     https://.../releases/latest/download/spatiumddi-appliance-<arch>.iso
           #     and that URL always 302s to the current release's ISO).
           #     Skipped when stable_copies is off — the nightly caller
           #     names its own assets and a byte-identical duplicate would
           #     only bloat the artifact.
           # mkosi's own ImageVersion in mkosi.conf is ``0.1.0`` (internal
           # scheme); we rename to the operator-visible tag here.
-          VERSIONED="appliance/build/spatiumddi-appliance-${TAG}.iso"
+          # #1026 — the VERSIONED name gains the architecture too. It
+          # did not have one, while the stable name always did — an
+          # asymmetry that was invisible with a single build leg and
+          # becomes a filename COLLISION with two: both legs would
+          # produce ``spatiumddi-appliance-<tag>.iso`` and whichever
+          # uploaded second would win, silently, with no way to tell
+          # from the release page which silicon the asset is for.
+          VERSIONED="appliance/build/spatiumddi-appliance-${TAG}-${ARCH}.iso"
           mv "$ISO_INTERIM" "$VERSIONED"
           if [ "$STABLE_COPIES" = "true" ]; then
-            cp "$VERSIONED" "appliance/build/spatiumddi-appliance-amd64.iso"
+            cp "$VERSIONED" "appliance/build/spatiumddi-appliance-${ARCH}.iso"
           fi
           ls -lh appliance/build/spatiumddi-appliance-*.iso
-          echo "iso_name=spatiumddi-appliance-${TAG}.iso" >> "$GITHUB_OUTPUT"
+          echo "iso_name=spatiumddi-appliance-${TAG}-${ARCH}.iso" >> "$GITHUB_OUTPUT"
       # Phase 8b-4 — build the slot upgrade image alongside the ISO so
       # operators can apply atomic OS upgrades from the /appliance UI
       # without manually building images locally. Same docker invocation
@@ -239,6 +287,7 @@ jobs:
         id: slot
         env:
           TAG: ${{ inputs.image_tag }}
+          ARCH: ${{ inputs.arch }}
           STABLE_COPIES: ${{ inputs.stable_copies }}
         run: |
           set -euo pipefail
@@ -248,6 +297,7 @@ jobs:
           chmod +x appliance/scripts/build-slot-image.sh
           docker run --rm --privileged \
             --entrypoint /work/scripts/build-slot-image.sh \
+            -e APPLIANCE_ARCH="${{ inputs.arch }}" \
             -v "$PWD/appliance:/work" \
             "$BUILDER" \
             "/work/build/$(basename "$RAW")" \
@@ -258,15 +308,15 @@ jobs:
           # target).
           SRC_XZ=$(ls appliance/build/spatiumddi-appliance-slot-*.raw.xz | head -1)
           [ -f "$SRC_XZ" ] || { echo "✗ no slot .raw.xz built"; exit 1; }
-          VERSIONED_XZ="appliance/build/spatiumddi-appliance-slot-${TAG}-amd64.raw.xz"
-          VERSIONED_SHA="appliance/build/spatiumddi-appliance-slot-${TAG}-amd64.sha256"
+          VERSIONED_XZ="appliance/build/spatiumddi-appliance-slot-${TAG}-${ARCH}.raw.xz"
+          VERSIONED_SHA="appliance/build/spatiumddi-appliance-slot-${TAG}-${ARCH}.sha256"
           mv "$SRC_XZ" "$VERSIONED_XZ"
           # Regenerate sha files so the hash inside them references the
           # correct (renamed) filename — important for `sha256sum -c`.
           ( cd appliance/build && sha256sum "$(basename "$VERSIONED_XZ")" > "$(basename "$VERSIONED_SHA")" )
           if [ "$STABLE_COPIES" = "true" ]; then
-            STABLE_XZ="appliance/build/spatiumddi-appliance-slot-amd64.raw.xz"
-            STABLE_SHA="appliance/build/spatiumddi-appliance-slot-amd64.sha256"
+            STABLE_XZ="appliance/build/spatiumddi-appliance-slot-${ARCH}.raw.xz"
+            STABLE_SHA="appliance/build/spatiumddi-appliance-slot-${ARCH}.sha256"
             cp "$VERSIONED_XZ" "$STABLE_XZ"
             ( cd appliance/build && sha256sum "$(basename "$STABLE_XZ")" > "$(basename "$STABLE_SHA")" )
           fi
@@ -279,11 +329,13 @@ jobs:
           SRC_SHA="${SRC_XZ%.raw.xz}.sha256"
           rm -f "$SRC_SHA"
           ls -lh appliance/build/spatiumddi-appliance-slot-*
-          echo "slot_name=spatiumddi-appliance-slot-${TAG}-amd64.raw.xz" >> "$GITHUB_OUTPUT"
+          echo "slot_name=spatiumddi-appliance-slot-${TAG}-${ARCH}.raw.xz" >> "$GITHUB_OUTPUT"
       - name: Upload appliance artifacts (ISO + slot image)
         uses: actions/upload-artifact@v7
         with:
-          name: appliance-artifacts
+          # #1026 — per-architecture, or the second leg's upload
+          # replaces the first's under one shared name.
+          name: appliance-artifacts-${{ inputs.arch }}
           path: |
             appliance/build/spatiumddi-appliance-*.iso
             appliance/build/spatiumddi-appliance-slot-*.raw.xz

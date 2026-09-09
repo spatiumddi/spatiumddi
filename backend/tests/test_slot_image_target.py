@@ -25,9 +25,23 @@ from app.services.appliance.slot_image_target import (
 
 
 def _fake_appliance(**overrides) -> SimpleNamespace:
-    """An Appliance row carrying every column the stamper reads or writes."""
+    """An Appliance row carrying every column the stamper reads or writes.
+
+    That docstring is a contract, and #1026 broke it: the stamper started
+    reading ``architecture`` (and ``hostname``, for the refusal message)
+    and this stub had neither, so every test here died with
+    ``AttributeError`` on a SimpleNamespace. A stand-in for a row has to
+    carry the columns the code under test actually touches — the
+    alternative is a ``getattr(..., None)`` in production that would also
+    swallow a genuinely missing attribute.
+    """
     return SimpleNamespace(
         **{
+            "hostname": "ddi-test",
+            # None = UNKNOWN, which is what an appliance whose supervisor
+            # predates #1026 reports. It never conflicts, so the existing
+            # cases keep exercising the paths they were written for.
+            "architecture": None,
             "supervisor_version": None,
             "installed_appliance_version": None,
             "desired_appliance_version": None,
@@ -68,7 +82,7 @@ async def test_uploaded_image_carries_hash_and_relaxes_tls() -> None:
     so the runner needs the hash to verify against AND permission to skip
     cert-verify for that fetch (#386)."""
     image_id = uuid.UUID("11111111-2222-3333-4444-555555555555")
-    image = SimpleNamespace(id=image_id, sha256="ab" * 32)
+    image = SimpleNamespace(id=image_id, sha256="ab" * 32, architecture=None)
 
     target = await resolve_slot_image_target(
         _FakeDB(image), base_url="https://cp.local/", slot_image_id=image_id

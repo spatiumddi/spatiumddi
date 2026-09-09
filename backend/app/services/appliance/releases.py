@@ -53,7 +53,16 @@ _CACHE_TTL_SECONDS = 60
 # retention prunes it from every release the moment a newer one is cut.
 # So a per-tag URL must use the versioned name, which is why the picker
 # below sorts longest-first.
-_UPGRADE_IMAGE_ASSET_RE = re.compile(r"^spatiumddi-appliance-slot.*-amd64\.raw\.xz$")
+# #1026 — the arch suffix is CAPTURED rather than hardcoded to amd64.
+# It is the one trustworthy statement of an imported image's
+# architecture: this name comes from a release WE published, over the
+# GitHub API, not from a file an operator named. (The upload path has no
+# equivalent and takes the operator's word — see the column comment on
+# ``ApplianceUpgradeImage.architecture`` for why reading it out of the
+# bytes is not cheap, and why the host runner re-checks either way.)
+_UPGRADE_IMAGE_ASSET_RE = re.compile(
+    r"^spatiumddi-appliance-slot.*-(?P<arch>amd64|arm64)\.raw\.xz$"
+)
 
 
 @dataclass
@@ -81,6 +90,11 @@ class UpgradeImageRelease:
     image_asset_url: str
     checksum_asset_url: str
     size_bytes: int | None
+    # #1026 — from the asset name. A release that publishes both
+    # architectures yields one row per architecture, so the picker can
+    # show (and the importer can select) the right one rather than
+    # whichever sorted first.
+    architecture: str
 
 
 # Cache the raw GitHub release dicts so both ``list_releases`` (plain)
@@ -166,53 +180,68 @@ async def list_releases() -> list[Release]:
     return releases
 
 
-def _pick_upgrade_assets(assets: list[dict]) -> tuple[str, str, int | None] | None:
-    """Pick the ``.raw.xz`` upgrade-image asset + its ``.sha256`` sibling.
+def _pick_upgrade_assets(assets: list[dict]) -> dict[str, tuple[str, str, int | None]]:
+    """Map each architecture to its ``.raw.xz`` + ``.sha256`` asset pair.
 
-    Returns ``(image_url, checksum_url, size_bytes)`` or ``None`` when a
-    release doesn't carry a matched pair. Prefers the versioned asset name
-    (the longer one) — and that preference is load-bearing, not cosmetic:
-    the stable name is pruned from every non-latest release (#392), so a
-    URL built from it would 404 for anything but the newest cut.
+    Returns ``{arch: (image_url, checksum_url, size_bytes)}`` — empty when
+    a release carries no matched pair. Prefers the versioned asset name
+    (the longer one) per architecture — and that preference is
+    load-bearing, not cosmetic: the stable name is pruned from every
+    non-latest release (#392), so a URL built from it would 404 for
+    anything but the newest cut.
 
-    Returning ``None`` on a half-pruned release is also deliberate. #392's
-    Tier 2 keeps the tiny ``.sha256`` provenance sidecar after dropping the
+    Skipping a half-pruned release is also deliberate. #392's Tier 2
+    keeps the tiny ``.sha256`` provenance sidecar after dropping the
     heavy ``.raw.xz``; requiring the matched PAIR is what makes such a
     release disappear from the picker instead of offering a dead link.
+
+    Keyed by architecture (#1026) rather than returning the first match:
+    a release that publishes both would otherwise resolve to whichever
+    name happened to be longer, which is a coin flip between an image
+    that boots and one that does not.
     """
     by_name = {(a.get("name") or ""): a for a in assets}
-    raws = [n for n in by_name if _UPGRADE_IMAGE_ASSET_RE.match(n)]
-    for raw_name in sorted(raws, key=len, reverse=True):
+    out: dict[str, tuple[str, str, int | None]] = {}
+    matches = [
+        (n, m.group("arch")) for n in by_name if (m := _UPGRADE_IMAGE_ASSET_RE.match(n)) is not None
+    ]
+    for raw_name, arch in sorted(matches, key=lambda t: len(t[0]), reverse=True):
+        if arch in out:
+            continue  # already took the longer (versioned) name for this arch
         sha_name = raw_name[: -len(".raw.xz")] + ".sha256"
         if sha_name not in by_name:
             continue
         image_url = by_name[raw_name].get("browser_download_url")
         sha_url = by_name[sha_name].get("browser_download_url")
         if image_url and sha_url:
-            return image_url, sha_url, by_name[raw_name].get("size")
-    return None
+            out[arch] = (image_url, sha_url, by_name[raw_name].get("size"))
+    return out
 
 
-def _to_upgrade_image_release(r: dict, installed: str, now: datetime) -> UpgradeImageRelease | None:
+def _to_upgrade_image_releases(r: dict, installed: str, now: datetime) -> list[UpgradeImageRelease]:
+    """One row per architecture the release publishes an image for."""
     tag = r.get("tag_name", "")
     if not tag:
-        return None
+        return []
     picked = _pick_upgrade_assets(r.get("assets") or [])
-    if picked is None:
-        return None
-    image_url, sha_url, size = picked
-    return UpgradeImageRelease(
-        tag=tag,
-        name=r.get("name") or tag,
-        published_at=_parse_published(r, now),
-        body=r.get("body") or "",
-        html_url=r.get("html_url", ""),
-        is_prerelease=bool(r.get("prerelease", False)),
-        is_installed=(tag == installed),
-        image_asset_url=image_url,
-        checksum_asset_url=sha_url,
-        size_bytes=size,
-    )
+    return [
+        UpgradeImageRelease(
+            tag=tag,
+            name=r.get("name") or tag,
+            published_at=_parse_published(r, now),
+            body=r.get("body") or "",
+            html_url=r.get("html_url", ""),
+            is_prerelease=bool(r.get("prerelease", False)),
+            is_installed=(tag == installed),
+            image_asset_url=image_url,
+            checksum_asset_url=sha_url,
+            size_bytes=size,
+            architecture=arch,
+        )
+        # Sorted so the listing order is stable across calls rather than
+        # following dict insertion, which follows GitHub's asset order.
+        for arch, (image_url, sha_url, size) in sorted(picked.items())
+    ]
 
 
 async def list_available_upgrade_images() -> tuple[bool, list[UpgradeImageRelease]]:
@@ -230,24 +259,64 @@ async def list_available_upgrade_images() -> tuple[bool, list[UpgradeImageReleas
     installed = get_installed_version()
     out: list[UpgradeImageRelease] = []
     for r in data[:25]:
-        row = _to_upgrade_image_release(r, installed, now)
-        if row is not None:
-            out.append(row)
+        out.extend(_to_upgrade_image_releases(r, installed, now))
     return (True, out)
 
 
-async def get_upgrade_image_assets(tag: str) -> UpgradeImageRelease | None:
-    """Resolve a single release tag's upgrade-image asset URLs.
+async def get_upgrade_image_assets(
+    tag: str, architecture: str | None = None
+) -> UpgradeImageRelease | None:
+    """Resolve one release tag's upgrade-image asset URLs.
 
     ``None`` when GitHub is unreachable, the tag isn't found, or the
-    release doesn't carry a matched ``.raw.xz`` + ``.sha256`` pair.
+    release doesn't carry a matched ``.raw.xz`` + ``.sha256`` pair for
+    the requested architecture.
+
+    ``architecture=None`` means "the only one there is" and returns
+    ``None`` when a release publishes several (#1026) — picking one for
+    the caller would be picking which nodes boot afterwards. The
+    importer surfaces that as a 422 naming the available choices.
     """
+    return (await resolve_upgrade_image_choice(tag, architecture)).spec
+
+
+@dataclass(frozen=True)
+class UpgradeImageChoice:
+    """The outcome of resolving one tag + architecture to an asset pair.
+
+    One call rather than "resolve, then ask what was available" (#1026):
+    the caller needs both answers to tell a missing asset apart from a
+    missing decision, and two calls means two chances for a caller — or
+    a test's monkeypatch — to cover only one of them and let the other
+    reach the network.
+    """
+
+    #: The resolved release, or None when nothing matched.
+    spec: UpgradeImageRelease | None
+    #: Every architecture this tag publishes an importable image for.
+    #: Empty when the tag is unknown or GitHub is unreachable.
+    available: tuple[str, ...]
+
+
+async def resolve_upgrade_image_choice(
+    tag: str, architecture: str | None = None
+) -> UpgradeImageChoice:
+    """Resolve one tag (+ optional architecture) to an importable asset pair."""
     data = await _fetch_raw_releases()
     if data is None:
-        return None
+        return UpgradeImageChoice(spec=None, available=())
     now = datetime.now(UTC)
     installed = get_installed_version()
     for r in data:
-        if r.get("tag_name") == tag:
-            return _to_upgrade_image_release(r, installed, now)
-    return None
+        if r.get("tag_name") != tag:
+            continue
+        rows = _to_upgrade_image_releases(r, installed, now)
+        available = tuple(x.architecture for x in rows)
+        if architecture is not None:
+            spec = next((x for x in rows if x.architecture == architecture), None)
+        else:
+            # Exactly one, or none — never a guess. See
+            # ``get_upgrade_image_assets``.
+            spec = rows[0] if len(rows) == 1 else None
+        return UpgradeImageChoice(spec=spec, available=available)
+    return UpgradeImageChoice(spec=None, available=())

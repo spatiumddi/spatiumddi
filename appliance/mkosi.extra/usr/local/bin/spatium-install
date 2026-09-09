@@ -86,6 +86,61 @@ if [ -d /sys/firmware/efi ]; then
 else
     FIRMWARE_MODE="bios"
 fi
+
+# #1026 — the architecture this installer is running on, which decides
+# the GPT root type code, whether a BIOS-boot partition is laid down at
+# all, and which grub target is installed.
+#
+# From ``uname -m`` and not from the build: the installer ships INSIDE
+# the image it installs, so the machine it is running on is by
+# construction the architecture of the rootfs it is about to copy. A
+# build-time stamp would be a second source that can only ever agree or
+# be wrong.
+case "$(uname -m)" in
+    x86_64|amd64)  TARGET_ARCH="amd64" ;;
+    aarch64|arm64) TARGET_ARCH="arm64" ;;
+    *)             TARGET_ARCH="unsupported" ;;
+esac
+
+# The two things the layout varies by, resolved once.
+#
+# An ARRAY rather than a word-split string: expanding an empty array as
+# "${_BIOS_BOOT_ARGS[@]}" contributes no arguments at all, which is
+# exactly what arm64 needs, and it does so without a shellcheck
+# suppression for splitting we would then have to keep correct forever.
+if [ "$TARGET_ARCH" = "arm64" ]; then
+    _ROOT_TYPE="8305"                        # Linux root (ARM-64)
+    _BIOS_BOOT_ARGS=()                       # no BIOS to chain-load from
+    _GRUB_EFI_TARGET="arm64-efi"
+    _EFI_REMOVABLE="BOOTAA64.EFI"
+else
+    _ROOT_TYPE="8304"                        # Linux root (x86-64)
+    _BIOS_BOOT_ARGS=(-n1:0:+1M -t1:ef02 -c1:bios_boot)
+    _GRUB_EFI_TARGET="x86_64-efi"
+    _EFI_REMOVABLE="BOOTX64.EFI"
+fi
+
+# **On arm64 the firmware question collapses to "UEFI, or refuse."**
+# There is no i386-pc GRUB target for AArch64 and no BIOS to chain-load
+# from — Apple Virtualization, UTM and AWS Graviton are all UEFI. So a
+# BIOS-booted arm64 machine is not a degraded install to warn about, it
+# is an install that cannot be made to boot.
+#
+# A FUNCTION called from the install path, NOT a check at load time.
+# ``--help`` and ``--check-preseed`` are host-portable entry points that
+# run this script unprivileged on an operator's own machine (#581), and
+# a load-time refusal made both of them exit 1 on any non-EFI arm64 host
+# — including the macOS laptop the preseed linter is written to run on.
+# Its own test suite caught that within a minute of the first draft.
+_assert_arch_bootable() {
+    [ "$TARGET_ARCH" = "arm64" ] || return 0
+    [ "$FIRMWARE_MODE" != "uefi" ] || return 0
+    log "FATAL: arm64 appliance on a machine that did not boot via EFI"
+    echo "ERROR: this machine booted without EFI, and the arm64 appliance is" >&2
+    echo "       UEFI-only (there is no BIOS boot path on AArch64). Enable UEFI" >&2
+    echo "       firmware for this machine and boot the installer again." >&2
+    exit 1
+}
 # The SPATIUM_INSTALL_LOG override + the /dev/null fallback below exist
 # for the host-portable `--check-preseed` linter (issue #581) and its
 # pytest suite, which run this script unprivileged on machines where
@@ -3753,6 +3808,10 @@ _save_install_logs() {
 }
 
 do_install() {
+    # #1026 — refuse an unbootable architecture/firmware pairing before
+    # the disk is touched. Both the wizard and the headless preseed path
+    # come through here, so one call covers both.
+    _assert_arch_bootable
     # Re-validate the wipe target before anything destructive (#581).
     # Runs BEFORE `set -e` so its own probes can fail harmlessly.
     _assert_safe_wipe_target
@@ -3802,6 +3861,12 @@ do_install() {
     # Talos-style STATE partition (issue #276):
     #
     #   p1  BIOS Boot     1 MiB     ef02   legacy chain-load (grub i386-pc)
+    #                                      **x86-64 ONLY** (#1026). On arm64
+    #                                      p1 is simply ABSENT — the rest do
+    #                                      NOT shift down, so every partition
+    #                                      index below is the same on both
+    #                                      architectures and nothing that
+    #                                      indexes them needs an arch branch.
     #   p2  ESP          512 MiB    ef00   FAT32, /boot/efi
     #   p3  state        256 MiB    8300   /var/lib/spatium-state — machine
     #                                      config, SSH host keys, supervisor
@@ -3811,6 +3876,7 @@ do_install() {
     #                                      that #272 Phase 1 bandaided.
     #   p4  root_A         8 GiB    8304   active slot (this install lands here)
     #   p5  root_B         8 GiB    8304   inactive slot (staging next image)
+    #                                      (8305 = Linux root ARM-64 on arm64)
     #   p6  var          rest       8310   /var, persisted across slot swaps
     #
     # Slot sizing — #170 Phase A4 bakes every container image into the
@@ -3984,11 +4050,16 @@ EOF
         #          by 8b's sysupdate slot picker
         #   8300 = generic Linux fs  (var; we mount via /etc/fstab)
         # Partition type codes:
-        #   ef02 = BIOS Boot                  (grub i386-pc core.img target)
+        #   ef02 = BIOS Boot                  (grub i386-pc core.img target;
+        #                                      x86-64 ONLY — omitted on
+        #                                      arm64, which has no BIOS)
         #   ef00 = EFI System                 (FAT32 /boot/efi)
-        #   8304 = Linux root x86-64          (systemd-gpt-auto-generator
+        #   8304 = Linux root x86-64 / 8305 = Linux root ARM-64 (#1026)
+        #                                     (systemd-gpt-auto-generator
         #                                      hint for root slot — used
-        #                                      by 8b's slot-write logic)
+        #                                      by 8b's slot-write logic;
+        #                                      $_ROOT_TYPE picks the one
+        #                                      matching this machine)
         #   8310 = Linux /var (4d21b016-...)  (sysd-gpt-auto-generator
         #                                      auto-mounts /var without
         #                                      needing an /etc/fstab
@@ -3999,11 +4070,17 @@ EOF
         #                                      mount; chicken+egg
         #                                      otherwise. Sets the var
         #                                      partition discoverable.)
-        sgdisk -n1:0:+1M    -t1:ef02 -c1:bios_boot \
+        # #1026 — two things vary by architecture, and NOTHING ELSE
+        # does. The partition NUMBERS are deliberately identical on both:
+        # p1 is simply absent on arm64 rather than the rest shifting
+        # down, so ``partition_node``, ``_MD_NAMES``, the mirror path and
+        # the verification pass all keep working with no arch branch of
+        # their own. sgdisk is happy to create p2..p6 with no p1.
+        sgdisk "${_BIOS_BOOT_ARGS[@]}" \
                -n2:0:+512M  -t2:ef00 -c2:ESP \
                -n3:0:+256M  -t3:8300 -c3:state \
-               -n4:0:+8G    -t4:8304 -c4:root_A \
-               -n5:0:+8G    -t5:8304 -c5:root_B \
+               -n4:0:+8G    "-t4:$_ROOT_TYPE" -c4:root_A \
+               -n5:0:+8G    "-t5:$_ROOT_TYPE" -c5:root_B \
                -n6:0:0      -t6:8310 -c6:var \
                "$TARGET_DISK"               >> "$INSTALL_LOG" 2>&1
         partprobe "$TARGET_DISK"            >> "$INSTALL_LOG" 2>&1 || true
@@ -4030,7 +4107,7 @@ EOF
             # discoverable by type as well as by superblock and nothing
             # else (a future installer, a rescue distro's autodetect)
             # mistakes a member for a plain ext4 partition.
-            sgdisk -n1:0:+1M    -t1:ef02 -c1:bios_boot \
+            sgdisk "${_BIOS_BOOT_ARGS[@]}" \
                    -n2:0:+512M  -t2:ef00 -c2:ESP \
                    -n3:0:+256M  -t3:fd00 -c3:state \
                    -n4:0:+8G    -t4:fd00 -c4:root_A \
@@ -5069,41 +5146,54 @@ EOF
         # one is fatal and the other stays best-effort.
         #
         # Neither ordering can be assumed away: `--removable` writes
-        # EFI/BOOT/BOOTX64.EFI and needs no efivars or efibootmgr, so the
+        # EFI/BOOT/BOOTX64.EFI (BOOTAA64.EFI on arm64) and needs no
+        # efivars or efibootmgr, so the
         # EFI install can legitimately succeed on a BIOS-booted machine,
         # and the i386-pc install can legitimately succeed on a UEFI one
         # because the BIOS Boot partition (p1, ef02) is laid down
         # regardless. Which is why the failure of the *other* one is a
         # log line rather than an abort.
-        if ! chroot "$MOUNT" /usr/sbin/grub-install --target=i386-pc \
-                --boot-directory=/boot/efi \
-                "$TARGET_DISK" >> "$INSTALL_LOG" 2>&1; then
-            if [ "$FIRMWARE_MODE" = "bios" ]; then
-                log "FATAL: grub-install --target=i386-pc failed and this"
-                log "  machine booted in BIOS/CSM mode, so that is the path it"
-                log "  will boot from. Refusing to report a successful install."
-                exit 1
+        # #1026 — the BIOS leg exists on x86-64 only. On arm64 there is
+        # no i386-pc target to install and no BIOS-boot partition to
+        # install it into, so skipping it is not a degraded install to
+        # warn about: the EFI leg below is the ONLY boot path, and it is
+        # already fatal-on-failure there because a non-UEFI arm64 machine
+        # was refused before the disk was touched.
+        if [ "$TARGET_ARCH" != "arm64" ]; then
+            if ! chroot "$MOUNT" /usr/sbin/grub-install --target=i386-pc \
+                    --boot-directory=/boot/efi \
+                    "$TARGET_DISK" >> "$INSTALL_LOG" 2>&1; then
+                if [ "$FIRMWARE_MODE" = "bios" ]; then
+                    log "FATAL: grub-install --target=i386-pc failed and this"
+                    log "  machine booted in BIOS/CSM mode, so that is the path it"
+                    log "  will boot from. Refusing to report a successful install."
+                    exit 1
+                fi
+                log "WARN: grub-install --target=i386-pc failed. This machine"
+                log "  booted in UEFI mode so the install continues, but the disk"
+                log "  will NOT boot in a BIOS/CSM machine."
+                echo "BIOS/CSM" > "$BOOT_LEG_MISSING_FILE" 2>/dev/null || true
             fi
-            log "WARN: grub-install --target=i386-pc failed. This machine"
-            log "  booted in UEFI mode so the install continues, but the disk"
-            log "  will NOT boot in a BIOS/CSM machine."
-            echo "BIOS/CSM" > "$BOOT_LEG_MISSING_FILE" 2>/dev/null || true
         fi
-        if ! chroot "$MOUNT" /usr/sbin/grub-install --target=x86_64-efi \
+        if ! chroot "$MOUNT" /usr/sbin/grub-install --target="$_GRUB_EFI_TARGET" \
                 --efi-directory=/boot/efi \
                 --boot-directory=/boot/efi \
                 --bootloader-id=SPATIUMDDI \
                 --removable \
                 >> "$INSTALL_LOG" 2>&1; then
+            # On arm64 this is unconditionally fatal — FIRMWARE_MODE
+            # cannot be anything but uefi by the time we get here, so the
+            # branch reads the same either way, but the message must not
+            # offer a BIOS consolation that does not exist.
             if [ "$FIRMWARE_MODE" = "uefi" ]; then
-                log "FATAL: grub-install --target=x86_64-efi failed and this"
-                log "  machine booted in UEFI mode, so that is the path it will"
-                log "  boot from. Refusing to report a successful install."
+                log "FATAL: grub-install --target=$_GRUB_EFI_TARGET failed and"
+                log "  this machine booted in UEFI mode, so that is the path it"
+                log "  will boot from. Refusing to report a successful install."
                 exit 1
             fi
-            log "WARN: grub-install --target=x86_64-efi failed. This machine"
-            log "  booted in BIOS/CSM mode so the install continues, but the"
-            log "  disk will NOT boot in a UEFI machine."
+            log "WARN: grub-install --target=$_GRUB_EFI_TARGET failed. This"
+            log "  machine booted in BIOS/CSM mode so the install continues, but"
+            log "  the disk will NOT boot in a UEFI machine."
             echo "UEFI" > "$BOOT_LEG_MISSING_FILE" 2>/dev/null || true
         fi
 
@@ -5116,7 +5206,8 @@ EOF
         #
         #   1. BIOS core.img in ITS bios_boot partition (grub embeds a
         #      disk-specific image; disk 1's is useless here).
-        #   2. EFI/BOOT/BOOTX64.EFI on ITS ESP, via --removable so no
+        #   2. EFI/BOOT/BOOTX64.EFI (BOOTAA64.EFI on arm64) on ITS ESP,
+        #      via --removable so no
         #      efivars entry is needed — firmware falls back to the
         #      removable path when the NVRAM entry points at a dead disk.
         #   3. grub.cfg + grubenv, which live on the ESP and are NOT
@@ -5142,20 +5233,25 @@ EOF
             # lands at `grub rescue>`. It has to embed ITS OWN ESP.
             mkdir -p "$MOUNT/boot/efi2"
             if mount "$ESP2" "$MOUNT/boot/efi2" >> "$INSTALL_LOG" 2>&1; then
-                if ! chroot "$MOUNT" /usr/sbin/grub-install --target=i386-pc \
-                        --boot-directory=/boot/efi2 \
-                        "$TARGET_DISK2" >> "$INSTALL_LOG" 2>&1; then
-                    log "WARN: grub-install --target=i386-pc failed on the mirror"
-                    log "  member $TARGET_DISK2. The array is redundant but the box"
-                    log "  will not BIOS-boot from that disk alone."
+                # #1026 — x86-64 only; arm64 has no BIOS boot path on
+                # either member, so there is nothing to install and
+                # nothing to warn about.
+                if [ "$TARGET_ARCH" != "arm64" ]; then
+                    if ! chroot "$MOUNT" /usr/sbin/grub-install --target=i386-pc \
+                            --boot-directory=/boot/efi2 \
+                            "$TARGET_DISK2" >> "$INSTALL_LOG" 2>&1; then
+                        log "WARN: grub-install --target=i386-pc failed on the mirror"
+                        log "  member $TARGET_DISK2. The array is redundant but the box"
+                        log "  will not BIOS-boot from that disk alone."
+                    fi
                 fi
-                if ! chroot "$MOUNT" /usr/sbin/grub-install --target=x86_64-efi \
+                if ! chroot "$MOUNT" /usr/sbin/grub-install --target="$_GRUB_EFI_TARGET" \
                         --efi-directory=/boot/efi2 \
                         --boot-directory=/boot/efi2 \
                         --bootloader-id=SPATIUMDDI \
                         --removable \
                         >> "$INSTALL_LOG" 2>&1; then
-                    log "WARN: grub-install --target=x86_64-efi failed on ESP2."
+                    log "WARN: grub-install --target=$_GRUB_EFI_TARGET failed on ESP2."
                     log "  The box will not UEFI-boot from $TARGET_DISK2 alone."
                 fi
                 # Unmount BEFORE syncing: spatiumddi-esp-sync mounts ESP2
@@ -5257,8 +5353,14 @@ EOF
             # A glob, so it needs a shell rather than `test`.
             compgen -G "/mnt/spatium-verify-b/boot/$1*" >/dev/null
         }
-        _verify "the ESP carries a UEFI bootloader (EFI/BOOT/BOOTX64.EFI)" \
-            test -f "$MOUNT/boot/efi/EFI/BOOT/BOOTX64.EFI"
+        # #1026 — the removable-media default bootloader filename is
+        # per-architecture (UEFI spec §3.5.1.1): BOOTX64.EFI on x86-64,
+        # BOOTAA64.EFI on AArch64. Hardcoding the x86 name made a
+        # perfectly good arm64 install report POST-INSTALL CHECKS FAILED
+        # on the Done screen — the one screen whose entire job is to tell
+        # the operator whether to trust the reboot.
+        _verify "the ESP carries a UEFI bootloader (EFI/BOOT/$_EFI_REMOVABLE)" \
+            test -f "$MOUNT/boot/efi/EFI/BOOT/$_EFI_REMOVABLE"
         _verify "the ESP carries grub.cfg" \
             test -f "$MOUNT/boot/efi/grub/grub.cfg"
         _verify "grub.cfg parses" \

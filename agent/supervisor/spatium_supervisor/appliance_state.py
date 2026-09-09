@@ -187,6 +187,39 @@ _LEGACY_VARIANT_ALIASES = {
 }
 
 
+def detect_architecture() -> str | None:
+    """The machine's CPU architecture as ``amd64`` / ``arm64``.
+
+    ``platform.machine()`` is ``uname -m`` without the subprocess. The
+    names are normalised to the pair the artifacts already use
+    (``fetch-k3s.sh``, ``BAKE_SAVE_PLATFORM``, the release asset names),
+    so the control plane never has to map between two spellings —
+    see ``app/services/appliance/architecture.py`` for why that matters.
+
+    Returns None for anything unrecognised rather than passing the raw
+    string through: the control plane treats None as UNKNOWN and skips
+    the comparison, whereas an unrecognised value would compare unequal
+    to a real one and refuse every upgrade on, say, a riscv64 port.
+
+    **This reads the CONTAINER's architecture**, which is the host's on
+    every appliance — the supervisor image is baked per-arch alongside
+    the rootfs, and nothing on an appliance runs under binfmt emulation.
+    A deliberately cross-run container (an amd64 supervisor on an arm64
+    host under qemu-user) would report the image's arch, not the host's;
+    that is not a shape the appliance builds can produce, and the host
+    runner re-checks against the real ``uname -m`` before writing.
+    """
+    import platform  # noqa: PLC0415 - stdlib, kept local to the one caller
+
+    raw = (platform.machine() or "").strip().lower()
+    return {
+        "x86_64": "amd64",
+        "amd64": "amd64",
+        "aarch64": "arm64",
+        "arm64": "arm64",
+    }.get(raw)
+
+
 def detect_appliance_variant() -> str | None:
     """Parse ``ROLE=`` out of ``/etc/spatiumddi-host/role-config``.
 
@@ -3507,6 +3540,13 @@ def collect() -> dict[str, object]:
         # running on. Only meaningful on appliance deploys; None on
         # docker / k8s.
         "appliance_variant": (detect_appliance_variant() if is_appliance else None),
+        # #1026 — the node's CPU architecture, one half of the gate that
+        # refuses to hand this node an upgrade image built for the other
+        # one. Reported on EVERY deployment kind, not just appliance:
+        # it is a fact about the machine rather than about the install
+        # shape, and gating it on ``is_appliance`` would report None for
+        # a docker/k8s supervisor that is perfectly able to say.
+        "architecture": detect_architecture(),
         "installed_appliance_version": (
             read_installed_version() if is_appliance else None
         ),

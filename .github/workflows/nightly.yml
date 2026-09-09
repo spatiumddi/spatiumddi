@@ -381,11 +381,19 @@ jobs:
     permissions:
       contents: read
       packages: read
+    # #1026 — both architectures nightly, so an arm64 regression in the
+    # assembly surfaces overnight rather than when a release is cut.
+    # That is the whole argument #823 made for the nightly existing.
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
     uses: ./.github/workflows/build-appliance.yml
     with:
       version: ${{ needs.gate.outputs.version }}
       image_tag: ${{ needs.gate.outputs.date_tag }}
-      # The un-versioned spatiumddi-appliance-amd64.* names are the
+      arch: ${{ matrix.arch }}
+      # The un-versioned spatiumddi-appliance-<arch>.* names are the
       # RELEASE's /releases/latest/download/ link targets; emitting them
       # here would only bloat the artifact with byte-identical copies.
       stable_copies: false
@@ -401,10 +409,13 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Download appliance artifacts
+      - name: Download appliance artifacts (per arch)
         uses: actions/download-artifact@v8
         with:
-          name: appliance-artifacts
+          # #1026 — one bundle per matrix leg. A bare ``name:`` of the
+          # old value matches nothing and download-artifact ERRORS.
+          pattern: appliance-artifacts-*
+          merge-multiple: true
           path: dist/
       - name: Upload to tonight's pre-release
         env:
@@ -417,12 +428,26 @@ jobs:
           # One pre-release PER night (see the header) — the build's dated
           # asset names ship as-is; no rename, no replace-in-place. The
           # prune-releases job bounds the ring to the trailing 7 days.
-          ISO="dist/spatiumddi-appliance-${DATE_TAG}.iso"
-          XZ="dist/spatiumddi-appliance-slot-${DATE_TAG}-amd64.raw.xz"
-          SHA="dist/spatiumddi-appliance-slot-${DATE_TAG}-amd64.sha256"
-          [ -f "$ISO" ] || { echo "✗ expected $ISO"; ls -l dist/; exit 1; }
-          [ -f "$XZ" ]  || { echo "✗ expected $XZ";  ls -l dist/; exit 1; }
-          [ -f "$SHA" ] || { echo "✗ expected $SHA"; ls -l dist/; exit 1; }
+          # #1026 — one triplet PER ARCHITECTURE. The ISO name gained
+          # its arch (it had none while the stable name always did, which
+          # collides the moment there are two build legs), and the two
+          # hardcoded ``-amd64`` lines below meant arm64 was built every
+          # night and published never.
+          #
+          # Every expected file is still asserted present: a nightly that
+          # quietly attaches one architecture is the regression this job
+          # exists to catch, one artifact later.
+          ARCHES="amd64 arm64"
+          UPLOAD=()
+          for arch in $ARCHES; do
+            ISO="dist/spatiumddi-appliance-${DATE_TAG}-${arch}.iso"
+            XZ="dist/spatiumddi-appliance-slot-${DATE_TAG}-${arch}.raw.xz"
+            SHA="dist/spatiumddi-appliance-slot-${DATE_TAG}-${arch}.sha256"
+            for f in "$ISO" "$XZ" "$SHA"; do
+              [ -f "$f" ] || { echo "✗ expected $f"; ls -l dist/; exit 1; }
+            done
+            UPLOAD+=("$ISO" "$XZ" "$SHA")
+          done
           ls -lh dist/
 
           # --target pins the tag to the exact commit this run built.
@@ -436,7 +461,7 @@ jobs:
               --prerelease --notes "build in progress"
           fi
           # --clobber keeps a same-day re-run (dispatch --force) idempotent.
-          gh release upload "$RELEASE_TAG" --clobber "$ISO" "$XZ" "$SHA"
+          gh release upload "$RELEASE_TAG" --clobber "${UPLOAD[@]}"
 
   # ── Prune the dated tag ring ──────────────────────────────────────────
   prune:

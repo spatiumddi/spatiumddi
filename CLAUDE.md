@@ -2432,6 +2432,95 @@ suggestion, free-space treemap.
   now resolved from the parent directory's mtime, which `unlink()` updates and which,
   unlike stamping "now", does not make the image permanently stale on every later run.
 
+- ✅ [**Appliance ISO + upgrade image for arm64 — with an architecture gate on the slot-upgrade path first**](https://github.com/spatiumddi/spatiumddi/issues/1026)
+  — three parts, and the ordering is the issue's own: **part 1 (the gate) shipped
+  alone**, before any arm64 artifact exists, because it is a correctness fix on the
+  x86-64 fleet that already exists rather than a prerequisite for one that does not.
+  `appliance_upgrade_image` carried no architecture, and the catalogue,
+  `desired_slot_image_url` and `spatium-upgrade-slot` all selected by **version** — so
+  the day an arm64 image is published, a per-box schedule or a fleet-wide upgrade can
+  hand an amd64 appliance an arm64 root filesystem and nothing notices: the download
+  verifies (the SHA matches, it is a perfectly good image), the slot writes, GRUB
+  switches, and the node does not come back.
+  Now `appliance.architecture` (supervisor `uname -m`, reported on every heartbeat) and
+  `appliance_upgrade_image.architecture`, with **two independent gates**. The control
+  plane refuses at `stamp_desired_slot_image` — the one chokepoint all three write paths
+  already go through, so the check cannot be remembered in two of them and skipped in the
+  third — as a `SlotImageResolutionError` subclass, which is why both scheduling
+  endpoints answer 422 without either handler learning a new exception; the rolling
+  orchestrator catches it per-node instead, so a mixed-architecture fleet upgrades the
+  nodes the image fits rather than dying at whichever node was scheduled first. Then
+  `spatium-upgrade-slot` re-checks the real decompressed image against the node's own
+  `uname -m` and exits 5. **Two gates because the control plane can only refuse what it
+  knows** — an operator-pasted external URL tells it nothing — and it must never be the
+  only gate on an operation that bricks a node.
+  **Two premises in the issue did not survive contact with the artifacts**, and both
+  shaped the design. It proposed detecting an image's architecture from the root GPT type
+  GUID: there is no GPT. `build-slot-image.sh` extracts the root partition, so a slot
+  image is a **bare ext4 filesystem** — verified against a real `.raw.xz`, `53ef` at
+  0x438 — inside a non-seekable xz stream. So neither the control plane nor the host
+  runner can read a type GUID, and finding `/etc/spatiumddi/appliance-release` in it
+  means decompressing ~8 GiB. Hence the split: on import the architecture comes from the
+  release asset name (metadata *we* published, not a filename an operator chose — the
+  issue's "never from the filename" is about the upload path, where the answer is a
+  declared field beside `appliance_version`, which is declared the same way), and the
+  host runner reads the file for real, **after the `dd` and before the bootloader** —
+  the only window that is both possible and safe, since earlier cannot know and later
+  cannot be undone. That ordering is pinned by a structural test, which caught the first
+  draft anchoring on `_write_progress("bootloader")` — a progress *label* emitted several
+  steps before anything bootable is written.
+  **NULL means UNKNOWN and never blocks**, deliberately: every image staged before this
+  is amd64 in fact, and a backfill saying so would assert something the row never
+  reported, so the first unlabelled arm64 upload would inherit an amd64 claim and pass
+  the gate. The Fleet picker disables a mismatched image and names the architecture it
+  needs rather than hiding it — an image the operator uploaded a minute ago silently
+  missing reads as a broken upload. A release publishing both architectures is now one
+  row per architecture (the asset picker keyed by arch, not longest-name-wins, which was
+  a coin flip between an image that boots and one that does not), and importing without
+  saying which is a 422. Migration `f7c3a91e50b4`, two nullable columns, no backfill; 2
+  MCP tools gained the field; no new endpoint.
+  **Parts 2 + 3 shipped alongside it.** `mkosi.conf` no longer pins `Architecture`;
+  the kernel, GRUB packages and `BiosBootloader` moved to `mkosi.conf.d/` drop-ins
+  matched on architecture, with the Makefile always passing `--architecture`
+  explicitly — left unset, mkosi defaults to the BUILD HOST, which on an Apple Silicon
+  dev box is a silent change to what `make appliance` produces. `release.yml` +
+  `nightly.yml` matrix `[amd64, arm64]`, `fail-fast: false`, arm64 on
+  `ubuntu-24.04-arm` because mkosi's builder cannot be emulated (#991's
+  `mount_setattr(2)` wall).
+  **arm64 is UEFI-only by platform, not by simplification** — no i386-pc target, no
+  BIOS to chain-load — so the installer lays down no BIOS-boot partition, installs only
+  `--target=arm64-efi`, and REFUSES before touching the disk if the machine did not
+  boot EFI. **The partition NUMBERING is identical on both**: p1 is absent on arm64
+  rather than the rest shifting down, so `partition_node`, `_MD_NAMES`, the #999 mirror
+  path and the verification pass need no arch branch at all — the single decision that
+  kept this change small. Roots are typed `8305`, looked up per-arch by
+  `build-slot-image.sh` and `wrap-iso.sh`; `grub-mkrescue -d` FORCES one platform, or an
+  arm64 ISO would silently carry x86 boot paths just because the builder has both
+  module sets.
+  **The versioned ISO name gained its architecture** — it never had one while the
+  stable name always did, which is invisible with one build leg and a filename
+  COLLISION with two. The pruner treats the arches as a pair: its `*)` fallthrough
+  leaves unknown assets alone, right for a new artifact and exactly wrong for an
+  architecture added to the matrix (~3 GB per release nothing reclaims), and a test pins
+  its arch list against both workflow matrices.
+  **Verified on real hardware** — UTM on an M4, Apple Virtualization, UEFI: ISO boots,
+  installer runs, installed system comes up with `root-arm64` partition types, no
+  `vda1`, `BOOTAA64.EFI` on the ESP, an `ELF ARM aarch64` k3s, a Ready node on
+  `6.12.107+deb13-arm64`, and A/B slot detection working unchanged (it matches on
+  PARTLABEL, not the type code — which is *why* it needed no change, and the docstring
+  claiming otherwise was corrected). Part 1's host gate was then proven on that box:
+  a real ext4 slot claiming `amd64` mounted against a real `uname -m` of `arm64` →
+  refused.
+  **Three bugs found doing it, all the same shape as the issue itself.** `fetch-k3s.sh`
+  keyed its cache on the version alone while the binary path carries no arch, so
+  building arm64 then amd64 again SKIPPED and left the ARM binary — an ISO that builds,
+  boots, and never starts k3s, with nothing in the log. The post-install check looked
+  for `EFI/BOOT/BOOTX64.EFI` and reported a correct arm64 install as FAILED on the one
+  screen that says whether to trust the reboot (found on the first real install). And
+  the arm64 UEFI refusal, in its first draft, ran at script load — which made `--help`
+  and `--check-preseed` exit 1 on any non-EFI arm64 host, including the macOS laptop the
+  preseed linter exists to run on; the appliance suite caught it within a minute.
+
 #### CLI tool
 
 - ⬜ [**`spddi` CLI**](https://github.com/spatiumddi/spatiumddi/issues/83)

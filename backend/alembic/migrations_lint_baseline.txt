@@ -770,6 +770,8 @@ backend/alembic/versions/f63d9a8e2c47_ai_operation_proposals.py:drop_table:109
 backend/alembic/versions/f7883fa6d413_bgp_lg_route_distinguisher.py:drop_column:69
 backend/alembic/versions/f7a2c4b91d35_alerts_framework.py:drop_table:120
 backend/alembic/versions/f7a2c4b91d35_alerts_framework.py:drop_table:123
+backend/alembic/versions/f7c3a91e50b4_appliance_architecture.py:drop_column:43
+backend/alembic/versions/f7c3a91e50b4_appliance_architecture.py:drop_column:44
 backend/alembic/versions/f8a3c1e7d925_dns_query_logging.py:drop_column:69
 backend/alembic/versions/f8a3c1e7d925_dns_query_logging.py:drop_column:70
 backend/alembic/versions/f8a3c1e7d925_dns_query_logging.py:drop_column:71

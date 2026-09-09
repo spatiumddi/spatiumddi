@@ -843,8 +843,10 @@ class FindUpgradeImagesArgs(BaseModel):
         "(superadmin only, #199). These are the ``.raw.xz`` artifacts an "
         "operator uploaded (air-gap) or imported from a GitHub release — "
         "the pool a fleet / per-box OS upgrade can point at. Each row "
-        "carries filename / appliance_version / size / a short SHA-256 / "
-        "upload time / notes. Use to answer 'which upgrade images do we "
+        "carries filename / appliance_version / architecture / size / a "
+        "short SHA-256 / upload time / notes. ``architecture`` is null for "
+        "an image nobody labelled — that means UNKNOWN, never amd64 "
+        "(#1026). Use to answer 'which upgrade images do we "
         "have staged?' or 'is 2026.06.01-1 already uploaded?'. Read-only "
         "— upload / import / delete happen in Fleet → Upgrade images."
     ),
@@ -874,6 +876,10 @@ async def find_upgrade_images(
                 "id": str(r.id),
                 "filename": r.filename,
                 "appliance_version": r.appliance_version,
+                # #1026 — null is UNKNOWN, not amd64. Said explicitly so
+                # the copilot cannot answer "which of these fits my arm64
+                # node" with an image nobody has labelled.
+                "architecture": r.architecture,
                 "size_bytes": r.size_bytes,
                 "sha256_short": (r.sha256[:12] + "…" + r.sha256[-6:]) if r.sha256 else None,
                 "uploaded_at": r.uploaded_at.isoformat(),
@@ -897,8 +903,10 @@ class FindAvailableUpgradeImagesArgs(BaseModel):
     description=(
         "List GitHub releases that carry an importable appliance upgrade "
         "image (superadmin only, #199). Returns each release tag + name + "
-        "prerelease/installed flags + the image size, plus whether GitHub "
-        "was reachable at all. Use to answer 'what upgrade images can I "
+        "architecture + prerelease/installed flags + the image size, plus "
+        "whether GitHub was reachable at all. A release that publishes "
+        "both architectures appears ONCE PER ARCHITECTURE, so the same tag "
+        "can be listed twice (#1026). Use to answer 'what upgrade images can I "
         "import?' before pointing the operator at Fleet → Upgrade images "
         "to do the import. Read-only — and it makes an outbound call to "
         "github.com, so it's opt-in (disabled by default)."
@@ -923,6 +931,7 @@ async def find_available_upgrade_images(
                 "name": r.name,
                 "is_prerelease": r.is_prerelease,
                 "is_installed": r.is_installed,
+                "architecture": r.architecture,
                 "size_bytes": r.size_bytes,
                 "published_at": r.published_at.isoformat(),
             }

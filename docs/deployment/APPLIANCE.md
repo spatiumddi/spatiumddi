@@ -2315,7 +2315,7 @@ introduced by an upgrade don't clobber operator-created ones.
 1. Operator opens the **OS Image** card in `/appliance` →
    Releases. The image-URL field is pre-filled with
    `https://github.com/spatiumddi/spatiumddi/releases/latest/
-   download/spatiumddi-appliance-slot-amd64.raw.xz` so a
+   download/spatiumddi-appliance-slot-<arch>.raw.xz` so a
    first-time operator just clicks Apply.
 2. The api container writes a trigger file the host-side
    `spatiumddi-slot-upgrade.path` unit watches.
@@ -2352,6 +2352,10 @@ spatium-upgrade-slot status
 sudo spatium-upgrade-slot apply \
     https://github.com/.../spatiumddi-appliance-slot-amd64.raw.xz \
     --checksum https://.../spatiumddi-appliance-slot-amd64.sha256
+# …or -arm64 for an arm64 appliance (#1026). Pointing a node at the
+# other architecture's image is refused twice — by the control plane
+# before it stamps desired state, and by the runner above on the real
+# decompressed bytes before it touches the bootloader.
 
 # Arm one-shot next-boot
 sudo spatium-upgrade-slot set-next-boot
@@ -2479,6 +2483,67 @@ Same A/B slot machinery as 5b/5c, walked across **every node of the
 cluster** under coordination from one driver pod. Lives in
 `/appliance` → **Rolling Upgrade** tab; runs against the local
 control-plane cluster itself, not the registered agent fleet.
+
+### Architecture is checked before an upgrade, twice (#1026)
+
+Every appliance published so far is x86-64, and the upgrade path
+selected an image purely by **version** — `appliance_upgrade_image`
+carried no architecture at all. The day an arm64 slot image exists, an
+operator (or a fleet-wide upgrade) could hand an amd64 appliance an
+arm64 root filesystem, and nothing would notice: the download verifies
+(the SHA matches, it is a perfectly good image), the slot writes, GRUB
+switches, and the node does not come back.
+
+So there are two gates, and neither one is sufficient alone:
+
+| Gate | Knows | Refuses |
+|---|---|---|
+| Control plane, at scheduling | `appliance.architecture` (supervisor's `uname -m`) vs `appliance_upgrade_image.architecture` | 422 before any desired state is stamped — per-box, and per-node inside a rolling run |
+| `spatium-upgrade-slot`, at apply | the node's own `uname -m` vs `APPLIANCE_ARCH` in the image's `/etc/spatiumddi/appliance-release` | exit 5, after the write and **before** the bootloader is touched |
+
+**The host gate is the one that inspects reality**, and the control
+plane is deliberately not the only gate on an operation that bricks a
+node. The reason the split exists is that the control plane cannot
+always know: a slot image is a bare ext4 filesystem (`build-slot-image.sh`
+extracts the root partition, so there is no GPT type GUID to read)
+inside a non-seekable `xz` stream, so reading `APPLIANCE_ARCH` out of
+the bytes means decompressing ~8 GiB — on an upload request, for a check
+the host repeats anyway. An operator-pasted external URL tells it
+nothing at all.
+
+**Both architectures are built by the same pipeline.** `release.yml`
+and `nightly.yml` matrix over `[amd64, arm64]` and call the reusable
+`build-appliance.yml` once per leg, with `fail-fast: false` so a break
+in one does not withhold the other's ISO from a release. The arm64 leg
+runs on `ubuntu-24.04-arm` — a NATIVE runner, because mkosi's builder
+container cannot be emulated: under qemu-user it dies immediately on
+`mount_setattr(2)` (#991), and no amount of `--privileged` helps.
+
+Where the architecture comes from, therefore:
+
+* **Import from GitHub** — from the release asset name
+  (`…-amd64.raw.xz`), which is metadata *we* published rather than a
+  filename an operator chose. A release publishing both architectures
+  appears once per architecture in the picker, and importing without
+  saying which is a 422 rather than a coin flip.
+* **Upload** — declared on the form beside `appliance_version`, which is
+  declared the same way. Optional.
+* **The node** — the supervisor reports it on every heartbeat.
+
+**NULL means UNKNOWN and never blocks.** Every image staged before this
+shipped carries no architecture, and every one of them is amd64 — but
+writing that in as a backfill would assert as fact something the row
+never reported, so the first unlabelled arm64 upload would inherit an
+amd64 claim and pass the gate. An honest UNKNOWN falls through to the
+host check on the real bytes instead.
+
+**On the host, the refusal sits after the `dd` and before the
+bootloader**, which is the only window that is both possible and safe.
+Earlier is not possible — learning what the image is means decompressing
+it, which is what the write just did. Later is not safe: the inactive
+slot is a spare, so a wrong-arch rootfs sitting in it costs nothing (the
+node keeps running on the active slot and the next apply overwrites it),
+whereas pointing the bootloader at it cannot be undone remotely.
 
 **Two source modes for the upgrade image:**
 

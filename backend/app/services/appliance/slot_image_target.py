@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.appliance import Appliance, ApplianceUpgradeImage
+from app.services.appliance.architecture import architecture_conflict
 
 # The host runner only learned to strip a URL ``#fragment`` before
 # fetching in #386 (2026-06-12). An older runner passes the fragment
@@ -38,6 +39,17 @@ URL_FRAGMENT_STRIP_MIN_VERSION = "2026.06.12"
 
 class SlotImageResolutionError(Exception):
     """The requested upgrade image could not be resolved to a fetchable target."""
+
+
+class SlotImageArchitectureMismatch(SlotImageResolutionError):
+    """The image and the node are built for different architectures (#1026).
+
+    A SUBCLASS of the resolution error on purpose: both API surfaces that
+    schedule an upgrade already map ``SlotImageResolutionError`` to a
+    422, so the refusal reaches the operator as a 422 with this message
+    without either handler having to learn a new exception. The
+    orchestrator, which stamps without resolving, catches it explicitly.
+    """
 
 
 @dataclass(frozen=True)
@@ -54,6 +66,11 @@ class SlotImageTarget:
     url: str
     sha256: str | None = None
     tls_insecure: bool = False
+    # #1026 — the architecture the image's rootfs is built for, when we
+    # know it: an uploaded/imported row carries one, an operator-pasted
+    # external URL never can. None is UNKNOWN and never blocks — the
+    # host runner re-checks the real bytes before writing them.
+    architecture: str | None = None
     # #386 Part B re-fire nonce, appended to the URL as ``#a=<nonce>`` so a
     # fresh apply of the same image is a distinct desired-state and the
     # supervisor's fire-once marker doesn't suppress it. It lives on the
@@ -71,6 +88,7 @@ class SlotImageTarget:
             "slot_image_sha256": self.sha256,
             "slot_image_tls_insecure": self.tls_insecure,
             "slot_image_nonce": self.nonce,
+            "slot_image_architecture": self.architecture,
         }
 
     @classmethod
@@ -85,6 +103,10 @@ class SlotImageTarget:
             sha256=plan.get("slot_image_sha256"),
             tls_insecure=bool(plan.get("slot_image_tls_insecure", False)),
             nonce=plan.get("slot_image_nonce"),
+            # Absent in a plan written before #1026 — those runs resolve
+            # to UNKNOWN and fall through to the host runner's check,
+            # which is the same answer they had when they were planned.
+            architecture=plan.get("slot_image_architecture"),
         )
 
 
@@ -148,6 +170,7 @@ async def resolve_slot_image_target(
         ),
         sha256=image.sha256,
         tls_insecure=True,
+        architecture=image.architecture,
     )
 
 
@@ -168,10 +191,31 @@ def stamp_desired_slot_image(
     (an orchestrator resume re-driving a node) reproduces the identical URL
     and the supervisor's fire-once marker still suppresses it. Appended
     only when the appliance's runner is known to strip the fragment (#419).
+
+    Raises ``SlotImageArchitectureMismatch`` when the image and the node
+    are known to be built for different architectures (#1026) — nothing
+    is written to ``row`` in that case.
     """
     url = target.url
     if target.nonce and supervisor_strips_url_fragment(row):
         url = f"{url}#a={target.nonce}"
+
+    if architecture_conflict(target.architecture, row.architecture):
+        # #1026. The download would verify (the SHA matches — it is a
+        # perfectly good image), the slot would be written, GRUB would
+        # switch, and the node would not come back. Nothing downstream
+        # of here can tell the difference, so the refusal belongs at the
+        # moment the desired state is written.
+        #
+        # It lives in ``stamp`` rather than in each caller for the reason
+        # this module exists at all: three surfaces write these columns,
+        # and a check remembered in two of them is a check the third one
+        # skips.
+        raise SlotImageArchitectureMismatch(
+            f"Upgrade image is {target.architecture}, but "
+            f"{row.hostname or 'this appliance'} is {row.architecture}. "
+            "Applying it would write a rootfs the node cannot boot."
+        )
 
     row.desired_appliance_version = desired_version
     row.desired_slot_image_url = url
@@ -181,6 +225,7 @@ def stamp_desired_slot_image(
 
 __all__ = [
     "URL_FRAGMENT_STRIP_MIN_VERSION",
+    "SlotImageArchitectureMismatch",
     "SlotImageResolutionError",
     "SlotImageTarget",
     "new_refire_nonce",

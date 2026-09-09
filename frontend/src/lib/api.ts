@@ -12050,6 +12050,10 @@ export interface ApplianceRow {
   // (Control plane vs Service agents). NULL on pre-#272 supervisors
   // that haven't slot-upgraded yet.
   appliance_variant: string | null;
+  // #1026 — the node's CPU architecture from the supervisor's uname.
+  // null on a supervisor too old to report it, and treated as UNKNOWN
+  // everywhere: it never matches and never blocks.
+  architecture: string | null;
   installed_appliance_version: string | null;
   current_slot: string | null;
   durable_default: string | null;
@@ -12532,6 +12536,12 @@ export interface UpgradeImage {
   size_bytes: number;
   sha256: string;
   appliance_version: string;
+  // #1026 — which CPU architecture this image's rootfs is built for.
+  // null is UNKNOWN (every image stored before the column existed, and
+  // any upload where the operator left it unset) and must render as
+  // such, never as a default: the whole point of the field is to stop
+  // an image being applied to a node it cannot boot on.
+  architecture: string | null;
   uploaded_by_user_id: string | null;
   uploaded_at: string;
   notes: string | null;
@@ -12549,6 +12559,9 @@ export interface AvailableUpgradeImage {
   image_asset_url: string;
   checksum_asset_url: string;
   size_bytes: number | null;
+  // #1026 — a release publishing both architectures appears as two
+  // rows, one per architecture.
+  architecture: string;
 }
 
 export interface AvailableUpgradeImages {
@@ -12568,10 +12581,14 @@ export const applianceUpgradeImagesApi = {
       .get<AvailableUpgradeImages>("/appliance/upgrade-images/available")
       .then((r) => r.data),
   // Control plane downloads + verifies + stores the release asset.
-  importFromGithub: (release_tag: string) =>
+  importFromGithub: (release_tag: string, architecture?: string) =>
     api
       .post<UpgradeImage>("/appliance/upgrade-images/import-from-github", {
         release_tag,
+        // Omitted rather than sent as null when the release publishes
+        // only one architecture — the server treats absent as "the only
+        // one there is" and 422s only on a genuine ambiguity.
+        ...(architecture ? { architecture } : {}),
       })
       .then((r) => r.data),
   upload: (
@@ -12580,11 +12597,13 @@ export const applianceUpgradeImagesApi = {
     appliance_version: string,
     notes: string | undefined,
     onProgress?: (loaded: number, total: number) => void,
+    architecture?: string,
   ) => {
     const fd = new FormData();
     fd.append("file", file);
     fd.append("sha256", sha256);
     fd.append("appliance_version", appliance_version);
+    if (architecture) fd.append("architecture", architecture);
     if (notes) fd.append("notes", notes);
     return api
       .post<UpgradeImage>("/appliance/upgrade-images", fd, {

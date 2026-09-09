@@ -38,7 +38,15 @@ ENV DEBIAN_FRONTEND=noninteractive
 # is fine; the translation layer is not, and no amount of ``--privileged``
 # helps. So the builder runs NATIVE and mkosi cross-builds — which is also
 # why ``build-appliance-builder.yml`` publishes both platforms.
-RUN dpkg --add-architecture amd64 && apt-get update && apt-get install -y --no-install-recommends \
+# #1026 — arm64 is added the same way, and for the same reason: an
+# appliance ISO for EITHER architecture can now be built on EITHER host,
+# so grub-mkrescue needs both target platforms' modules present whichever
+# way round the build is running. ``grub-efi-arm64-bin`` ships only
+# ``/usr/lib/grub/arm64-efi/*`` — no host-executable code — so it installs
+# as a foreign architecture exactly like the x86 pair does.
+RUN dpkg --add-architecture amd64 \
+    && dpkg --add-architecture arm64 \
+    && apt-get update && apt-get install -y --no-install-recommends \
         mkosi \
         qemu-utils \
         debian-archive-keyring \
@@ -64,6 +72,7 @@ RUN dpkg --add-architecture amd64 && apt-get update && apt-get install -y --no-i
         grub2-common \
         grub-pc-bin:amd64 \
         grub-efi-amd64-bin:amd64 \
+        grub-efi-arm64-bin:arm64 \
         # Phase 2 — true hybrid live ISO. grub-mkrescue (in
         # grub-common) builds the ISO with BIOS El Torito + UEFI El
         # Torito + USB-dd-bootable hybrid MBR. grub-pc-bin supplies
@@ -77,6 +86,9 @@ RUN dpkg --add-architecture amd64 && apt-get update && apt-get install -y --no-i
         # the FAT12 ESP image embedded as the UEFI El Torito boot
         # image. Without it the ISO produces no UEFI boot path.
         mtools \
+        # #1026 — ``efi.img`` for an arm64 ISO is assembled the same way,
+        # so mtools covers both; what arm64 additionally needs is the
+        # arm64-efi module directory named above.
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /work

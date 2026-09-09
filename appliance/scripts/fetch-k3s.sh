@@ -67,13 +67,38 @@ VERSION_STAMP="$DOC_DIR/.version"
 
 mkdir -p "$(dirname "$K3S_BIN")" "$AIRGAP_DIR" "$DOC_DIR"
 
-# Cache short-circuit: if the stamp matches the pinned version, every
-# artifact has been fetched against the same release tag — skip.
-if [ -f "$VERSION_STAMP" ] && [ "$(cat "$VERSION_STAMP")" = "$K3S_VERSION" ] \
+# Cache short-circuit: if the stamp matches the pinned version AND the
+# architecture, every artifact has been fetched against the same release
+# tag for the same silicon — skip.
+#
+# #1026 — THE ARCHITECTURE IS PART OF THE STAMP, and it has to be. The
+# airgap tarball is arch-named so both can sit side by side, but the
+# binary is a single un-suffixed path (``usr/local/bin/k3s``). Keyed on
+# the version alone, building arm64 and then amd64 again found a
+# matching stamp, an existing amd64 tarball and an existing binary — and
+# skipped, leaving the ARM binary in place. The ISO builds, boots, and
+# k3s never starts: "cannot execute binary file". Nothing in the build
+# log says a word, because from the fetcher's point of view everything
+# it was asked for was already there.
+STAMP_VALUE="$K3S_VERSION $AIRGAP_ARCH"
+if [ -f "$VERSION_STAMP" ] && [ "$(cat "$VERSION_STAMP")" = "$STAMP_VALUE" ] \
         && [ -x "$K3S_BIN" ] && [ -f "$AIRGAP_TARBALL" ]; then
     echo "→ k3s $K3S_VERSION already fetched for $AIRGAP_ARCH (skip)"
     exit 0
 fi
+
+# Drop any OTHER architecture's airgap tarball before fetching. They are
+# arch-named so they do not collide, which is exactly the problem: left
+# behind, mkosi bakes ~250 MiB of the wrong architecture's container
+# images into the rootfs, and k3s imports them at startup.
+for _stale in "$AIRGAP_DIR"/k3s-airgap-images-*.tar.zst; do
+    [ -e "$_stale" ] || continue
+    case "$_stale" in
+        "$AIRGAP_TARBALL") ;;
+        *) echo "  → dropping other-arch airgap tarball $(basename "$_stale")"
+           rm -f "$_stale" ;;
+    esac
+done
 
 BASE_URL="https://github.com/k3s-io/k3s/releases/download/${K3S_VERSION}"
 
@@ -135,7 +160,9 @@ if ! fetch "https://raw.githubusercontent.com/k3s-io/k3s/${K3S_VERSION}/NOTICE" 
 fi
 
 # 6. Stamp the version so re-runs short-circuit.
-echo "$K3S_VERSION" > "$VERSION_STAMP"
+# Written LAST, and carrying the architecture (#1026) so the
+# short-circuit above can tell an arch switch from a no-op.
+echo "$STAMP_VALUE" > "$VERSION_STAMP"
 
 # Sanity: confirm the binary is statically linked + executable.
 # A failed download or wrong-arch binary would surface as a libc
