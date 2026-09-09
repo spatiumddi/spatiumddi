@@ -1,0 +1,145 @@
+name: Nightly trigger
+
+# WHY THIS EXISTS. The nightly is wanted DONE by ~21:00 America/New_York
+# every night — the QA lane walks it before the team goes to bed — and
+# a build takes 45–55 min, so it has to START at ~20:05. GitHub's
+# scheduler cannot deliver that on its own: `schedule` runs in this
+# repository start 40 min to 7½ h after their cron — measured on every
+# scheduled workflow here (nightly, trivy-scheduled, prune-release-
+# assets) through August and September 2026 — and the delay changes
+# night to night. A cron alone lands the build somewhere in a seven-
+# hour window.
+#
+# So this workflow fires EARLY, waits for the target instant on the
+# Eastern clock, and only then dispatches nightly.yml. A workflow_dispatch
+# starts in seconds, not hours, and the dispatched run reads `main` at
+# dispatch time — so the build carries the day's work up to 20:05.
+# (Waiting inside nightly.yml instead would freeze its GITHUB_SHA at
+# whatever `main` was when the cron finally fired.)
+#
+# Cost: one hosted runner sleeps for at most MAX_HOP per run; free on a
+# public repository. A run that would need longer sleeps MAX_HOP and
+# then hands over to a fresh run of itself, so no job goes near the
+# 6 h limit however early GitHub happens to start it.
+#
+# Two crons, hours apart, because GitHub also DROPS scheduled runs
+# outright some nights: whichever run exists first does the waiting;
+# any other exits at once. nightly.yml's own 03:23 schedule is the
+# fallback of last resort — it builds only when the evening produced
+# no nightly (see the gate there).
+
+on:
+  schedule:
+    # 12:05 and 15:05 EDT (11:05 / 14:05 EST). Early on purpose, see
+    # above; :05 to stay off the top-of-hour cron stampede, like every
+    # other cron in this repository.
+    - cron: "5 16 * * *"
+    - cron: "5 19 * * *"
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Eastern wall-clock time (HH:MM) to start the nightly at. Default 20:05."
+        type: string
+        required: false
+        default: ""
+      hop:
+        description: "Internal — set when a run hands over to a fresh copy of itself."
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  # Dispatch nightly.yml, and this workflow when handing over.
+  actions: write
+  contents: read
+
+jobs:
+  wait-then-dispatch:
+    name: Wait for the Eastern target, then start the nightly
+    # Forks inherit this workflow (#830); never dispatch the publisher
+    # outside the canonical repo.
+    if: github.repository_owner == 'spatiumddi'
+    runs-on: ubuntu-latest
+    # MAX_HOP plus a generous margin; never the 6 h ceiling.
+    timeout-minutes: 340
+    steps:
+      - name: Wait, then dispatch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}  # no checkout in this job
+          TARGET_ET: ${{ github.event.inputs.target || '20:05' }}
+          HOP: ${{ github.event.inputs.hop || 'false' }}
+          RUN_ID: ${{ github.run_id }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          MAX_HOP=$((5 * 3600))
+          now=$(date -u +%s)
+          echo "→ run ${RUN_ID} (${EVENT_NAME}, hop=${HOP}) started $(TZ=America/New_York date -d "@$now" '+%F %H:%M %Z')"
+
+          # ── Which evening does this run belong to? ───────────────────
+          # The occurrence of TARGET_ET nearest to now: today's, unless
+          # today's is more than 12 h ahead — then GitHub started a run
+          # that was meant for last evening after midnight, and it is
+          # late for THAT evening, not early for tonight's. A run that
+          # is late dispatches at once; the nightly names its build by
+          # the evening it belongs to either way (see nightly.yml).
+          if ! [[ "$TARGET_ET" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]]; then
+            echo "::error::target '${TARGET_ET}' is not HH:MM"
+            exit 1
+          fi
+          today_et=$(TZ=America/New_York date -d "@$now" +%F)
+          target=$(TZ=America/New_York date -d "${today_et} ${TARGET_ET}" +%s)
+          if [ $((target - now)) -gt $((12 * 3600)) ]; then
+            target=$(TZ=America/New_York date -d "${today_et} -1 day ${TARGET_ET}" +%s)
+          fi
+          echo "→ target: $(TZ=America/New_York date -d "@$target" '+%F %H:%M %Z') ($(date -u -d "@$target" '+%H:%M UTC'))"
+
+          # ── Is another trigger already up for this evening? ──────────
+          # Two crons (and a hand-over) can each produce a run. The
+          # oldest one does the waiting. A hop trusts the run that
+          # created it — that parent is still finishing when the hop
+          # starts, and must not count as competition.
+          if [ "$HOP" != "true" ]; then
+            older=$(gh run list --workflow nightly-trigger.yml --status in_progress \
+                      --json databaseId \
+                      --jq "[.[] | select(.databaseId < ${RUN_ID}) | .databaseId | tostring] | join(\" \")")
+            if [ -n "$older" ]; then
+              echo "→ trigger run(s) ${older} already up and older than this one; nothing to do"
+              exit 0
+            fi
+          fi
+
+          # ── Has tonight's nightly already been dispatched? ───────────
+          # By this workflow or by hand — anything created in the hour
+          # before the target or later counts. (An afternoon dispatch by
+          # a human belongs to the previous evening; nightly.yml treats
+          # it that way too.)
+          since=$(date -u -d "@$((target - 3600))" +%FT%TZ)
+          already=$(gh run list --workflow nightly.yml --event workflow_dispatch --limit 20 \
+                      --json databaseId,createdAt \
+                      --jq "[.[] | select(.createdAt >= \"${since}\") | \"\\(.databaseId) (\\(.createdAt))\"] | join(\", \")")
+          if [ -n "$already" ]; then
+            echo "→ tonight's nightly was already dispatched: ${already}; nothing to do"
+            exit 0
+          fi
+
+          # ── Wait ─────────────────────────────────────────────────────
+          wait=$((target - now))
+          if [ "$wait" -gt "$MAX_HOP" ]; then
+            echo "→ ${wait}s to go; sleeping ${MAX_HOP}s, then handing over to a fresh run"
+            sleep "$MAX_HOP"
+            gh workflow run nightly-trigger.yml -f "target=${TARGET_ET}" -f hop=true
+            echo "→ handed over"
+            exit 0
+          fi
+          if [ "$wait" -gt 0 ]; then
+            echo "→ sleeping ${wait}s until the target"
+            sleep "$wait"
+          else
+            echo "→ $(( -wait / 60 )) min past the target already (GitHub started this run late); dispatching now"
+          fi
+
+          # ── Dispatch ─────────────────────────────────────────────────
+          gh workflow run nightly.yml
+          echo "→ nightly.yml dispatched at $(TZ=America/New_York date '+%F %H:%M:%S %Z')"
