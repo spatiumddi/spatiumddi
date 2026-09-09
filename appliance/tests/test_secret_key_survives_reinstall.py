@@ -25,8 +25,10 @@ taking the destructive path at all.
 
 from __future__ import annotations
 
+import base64
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -153,3 +155,43 @@ def test_values_content_still_parses() -> None:
     """Cheap structural check on the manifest the appliance actually applies."""
     values = yaml.safe_load(_render_control_helmchart()["spec"]["valuesContent"])
     assert isinstance(values, dict) and values, "firstboot rendered no values"
+
+
+# ── the render check must never echo a secret value ─────────────────────────
+
+RENDER_CHECK = REPO / ".github" / "scripts" / "chart-credential-secrets-kept.py"
+
+
+@pytest.mark.skipif(not RENDER_CHECK.exists(), reason="render check not in this checkout")
+def test_the_render_check_never_prints_a_secret_value(tmp_path: Path) -> None:
+    """CodeQL flags this script, and the flag is a false positive — pinned here.
+
+    `py/clear-text-logging-sensitive-data` taints the WHOLE parsed document
+    because it is a `Secret`, so every value derived from it is suspect —
+    including `metadata.name`, which is in any `kubectl get secrets` listing.
+    Removing the key names from the message did not clear it and could not.
+
+    Rather than dismiss on reasoning alone, this plants a canary in the Secret
+    and asserts it cannot reach the output on the FAILURE path — the only path
+    that prints anything per-Secret. If a future edit starts echoing the data
+    section, this fails even though CodeQL's verdict never changed.
+    """
+    doc = {
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {"name": "release-spatiumddi-app"},  # deliberately no annotations
+        "stringData": {"secret-key": "SUPERSECRETCANARY12345"},
+    }
+    render = tmp_path / "render.yaml"
+    render.write_text(yaml.safe_dump(doc), encoding="utf-8")
+
+    proc = subprocess.run(
+        [sys.executable, str(RENDER_CHECK), str(render)], capture_output=True, text=True
+    )
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 1, f"the failure path was not exercised:\n{out}"
+    assert "release-spatiumddi-app" in out, "the Secret's name is the whole diagnostic"
+    assert "SUPERSECRETCANARY12345" not in out, f"the secret VALUE leaked:\n{out}"
+    assert (
+        base64.b64encode(b"SUPERSECRETCANARY12345").decode() not in out
+    ), f"the secret value leaked base64-encoded:\n{out}"
