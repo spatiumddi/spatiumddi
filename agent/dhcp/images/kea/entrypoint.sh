@@ -7,8 +7,8 @@
 # the agent talks to kea-dhcp4 / kea-dhcp6 directly over their unix control
 # sockets (spatium_dhcp_agent/kea_ctrl.py — config-test, config-reload,
 # status-get, statistic-get-all). Supervising a daemon nothing calls was a
-# liability, not a feature: its crash-loop give-up path would return from
-# the ``wait -n`` below and take the whole container down with it.
+# liability, not a feature: its crash-loop give-up path would be seen by the
+# child-exit poll below and take the whole container down with it.
 #
 # kea-dhcp6 runs always-on alongside kea-dhcp4 (dual-stack): it boots
 # from a minimal idle config (``interfaces: []`` + empty ``subnet6``)
@@ -64,7 +64,7 @@ supervise_kea() {
     # Forward SIGTERM to the live daemon AND flip the stop flag so
     # the outer loop doesn't try to restart during container
     # shutdown. ``exit 0`` here ensures the subshell goes away
-    # cleanly so wait -n in the parent returns.
+    # cleanly so the parent's child-exit poll sees it.
     # shellcheck disable=SC2064
     trap 'STOPPING=1; [ -n "$KEA_CHILD" ] && kill -TERM "$KEA_CHILD" 2>/dev/null; exit 0' TERM INT
     fails=0
@@ -176,7 +176,24 @@ fi
 # Forward container SIGTERM to all supervisor subshells and the
 # agent. The supervisors' own traps handle the in-flight daemon.
 _term() {
-    kill -TERM "$KEA_PID" "$KEA6_PID" "${RADVD_PID:-0}" "${AGENT_PID:-0}" 2>/dev/null || true
+    # NEVER expand an unset pid to 0. `kill -TERM 0` signals the CALLER'S
+    # ENTIRE PROCESS GROUP, and `trap _term TERM INT` below means that
+    # re-enters this function — unbounded recursion until the shell dies of
+    # stack exhaustion. The old `"${RADVD_PID:-0}"` did exactly that on every
+    # default install, because radvd is only started when RADVD_MANAGED=1 and
+    # the image default is 0, so RADVD_PID is empty.
+    #
+    # Latent until #1043: the only paths that reached _term were a clean
+    # SIGTERM (where the shell is already going away) and a `wait` return that
+    # the broken `wait -n` made unreachable. Making the crash path work is what
+    # exposed it — measured, the container exited 139 (SIGSEGV) after ~4000
+    # recursive _term calls instead of the child's status, and kea was never
+    # shut down.
+    for _tp in "$KEA_PID" "$KEA6_PID" "$RADVD_PID" "$AGENT_PID"; do
+        [ -n "$_tp" ] || continue
+        kill -TERM "$_tp" 2>/dev/null || true
+    done
+    return 0
 }
 trap _term TERM INT
 
@@ -203,11 +220,58 @@ AGENT_PID=$!
 # only one that skipped it.
 set +e
 
-# wait -n is a bash-ism; busybox ash accepts it too as of 1.30+
-# (Alpine 3.11+). Fall back to plain wait on older variants.
-wait -n "$KEA_PID" "$KEA6_PID" "$AGENT_PID" 2>/dev/null \
-    || wait "$KEA_PID" "$KEA6_PID" "$AGENT_PID"
-EXIT_CODE=$?
+# Exit as soon as the FIRST of the three children does (#1043).
+#
+# This was `wait -n "$KEA_PID" "$KEA6_PID" "$AGENT_PID" || wait …`, whose
+# comment claimed busybox ash "accepts it too as of 1.30+". It accepts the
+# FLAG and ignores the SEMANTICS. Measured on busybox 1.37 (alpine 3.24, the
+# image's own base): with one child exiting at 0.2 s and another alive for
+# 5 s, `wait -n` returned after the full 5 s — it waited for ALL of them.
+#
+# That is not a cosmetic difference. `supervise_kea` and `supervise_kea6` are
+# restart loops that never exit on their own, so when the AGENT died the wait
+# simply never returned: the container kept running with kea serving a frozen
+# config and no agent in it, `kubectl get pod` reported 1/1 Running with an
+# unchanged restart count, and every DHCP change made through the API was
+# accepted, rendered, and silently never delivered. The trigger on the
+# ddi-pg walk was #1042's post-upgrade 401 — the agent's documented
+# "exit so supervisor restarts the container (→ re-bootstrap)" path — but ANY
+# unhandled agent crash lands the same way. The DNS image is immune only
+# because it `exec`s its agent, so the agent IS the container.
+#
+# `kill -0` is the portable test: ash reaps a background child on SIGCHLD
+# while we sit in `sleep`, so the pid is gone from the table within a tick of
+# its exit, and `wait` on an already-reaped job still yields its remembered
+# status. Verified on busybox 1.37 in both directions.
+#
+# ALL THREE are watched, including kea-dhcp6, and that is a deliberate
+# behaviour change worth knowing about: because the broken `wait -n` never
+# returned, a kea-dhcp6 supervise loop that gave up (5 crashes in <30 s) used
+# to be TOLERATED — v4 kept serving and the dead v6 daemon was invisible. It
+# is fatal now. That restores the original intent — all three were named in
+# the `wait -n` list, and radvd is deliberately excluded from it precisely
+# because "a radvd flap must not take the DHCP server down" — and it matches
+# this whole change's thesis: a container that restarts is visible and
+# recoverable, a silently dead daemon is neither. A v6 misconfiguration now
+# CrashLoopBackOffs the pod rather than quietly serving v4 only, which is the
+# trade being made on purpose.
+EXIT_CODE=0
+while :; do
+    for _pid in "$KEA_PID" "$KEA6_PID" "$AGENT_PID"; do
+        kill -0 "$_pid" 2>/dev/null && continue
+        wait "$_pid"
+        EXIT_CODE=$?
+        case "$_pid" in
+            "$AGENT_PID") _who="spatium-dhcp-agent" ;;
+            "$KEA_PID")   _who="kea-dhcp4 supervisor" ;;
+            *)            _who="kea-dhcp6 supervisor" ;;
+        esac
+        echo "entrypoint: $_who (pid $_pid) exited with $EXIT_CODE —" \
+             "shutting the container down so it restarts" >&2
+        break 2
+    done
+    sleep 1
+done
 _term
 wait
 exit "$EXIT_CODE"

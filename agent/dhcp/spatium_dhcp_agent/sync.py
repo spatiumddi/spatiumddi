@@ -78,6 +78,31 @@ def _touch_ready_marker(state_dir: Path) -> None:
         log.exception("ready_marker_touch_failed", path=str(state_dir / ".ready"))
 
 
+def clear_ready_marker(state_dir: Path) -> None:
+    """Remove ``<state_dir>/.ready`` so the readinessProbe starts failing (#1043).
+
+    The marker means "I have synced at least once", and nothing ever took it
+    back. When the agent's heartbeat thread died the container kept the marker,
+    the probe (``test -f .ready && grep -q ':0043 ' /proc/net/udp``) kept
+    passing on Kea's still-listening socket, and the pod stayed 1/1 Ready with
+    no agent in it — every DHCP change accepted, rendered, and never delivered.
+
+    The container exit is the primary cure; this is the half that makes a dead
+    agent VISIBLE to the platform even if the process somehow outlives its
+    threads. Best-effort for the same reason the touch is: a marker we cannot
+    remove must not stop the shutdown path that is already running.
+    """
+    marker = state_dir / ".ready"
+    try:
+        marker.unlink()
+    except FileNotFoundError:
+        # Already gone — the agent died before its first successful sync, so
+        # readiness was never claimed. Nothing to take back.
+        pass
+    except OSError:
+        log.exception("ready_marker_clear_failed", path=str(marker))
+
+
 _FAILURE_THRESHOLD = 3  # DHCP.md §6: offline after 3 consecutive failures
 _OFFLINE_RETRY_SECONDS = 60.0
 # Bootstrap reload races Kea's own startup — entrypoint launches kea-dhcp4

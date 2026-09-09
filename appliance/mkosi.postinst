@@ -65,6 +65,7 @@ for unit in chrony.service ssh.service \
             spatiumddi-firewall-revert.timer \
             spatiumddi-image-prune.timer \
             spatiumddi-webui-selfcheck.timer \
+            spatiumddi-helm-stuck-recover.timer \
             spatium-install.service \
             spatium-live-banner.service \
             spatium-live-bootstrap.service \
