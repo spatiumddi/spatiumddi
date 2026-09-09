@@ -47,9 +47,14 @@ def main(argv: list[str]) -> int:
             continue
         checked += 1
         name = doc["metadata"]["name"]
-        ann = doc["metadata"].get("annotations") or {}
-        if ann.get("helm.sh/resource-policy") != "keep":
-            bad.append(f"{name} (keys={sorted(keys & GENERATED_KEYS)}, annotations={ann})")
+        policy = (doc["metadata"].get("annotations") or {}).get("helm.sh/resource-policy")
+        if policy != "keep":
+            # NOTHING derived from `stringData` / `data` is echoed — not even a
+            # key NAME. A rendered chart carries the real SECRET_KEY in that
+            # section, this output lands in CI logs, and a diagnostic is not
+            # worth a taint path into one. The Secret's name identifies it
+            # unambiguously, and the annotation is the whole verdict.
+            bad.append(f"{name} (helm.sh/resource-policy={policy!r})")
 
     if bad:
         print(f"✗ {path.name}: credential Secret(s) missing "

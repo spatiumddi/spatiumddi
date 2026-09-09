@@ -953,6 +953,15 @@ the formatter handles the rest.
   invisible. That restores the original intent — all three were in the
   `wait -n` list, and radvd is excluded from it precisely because "a
   radvd flap must not take the DHCP server down".
+  The readiness clear gained the tests it shipped without — Copilot's
+  catch: neither the marker nor its clear had ANY coverage before, which
+  is how the pair could drift apart. The probe command is lifted from
+  the chart rather than retyped, so the test fails if either side moves.
+  And the render check never echoes anything derived from a Secret's
+  `data` / `stringData`, not even a key NAME: a rendered chart carries
+  the real SECRET_KEY there and the output lands in CI logs, so the
+  Secret's name plus the annotation is the whole diagnostic (CodeQL
+  flagged the first cut).
 
 - **The upgrade path could hand a node a root filesystem for
   another CPU architecture (#1026, part 1 of 3).** Every appliance
