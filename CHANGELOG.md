@@ -543,6 +543,56 @@ the formatter handles the rest.
   runs already start up to 13 h late.
 
 
+- **A slot upgrade could regenerate SECRET_KEY and orphan everything
+  encrypted at rest (#1042).** `app/core/crypto.py` derives the
+  at-rest Fernet key from SECRET_KEY whenever no explicit
+  `CREDENTIAL_ENCRYPTION_KEY` is set — which is every appliance — so
+  the chart-owned Secret carrying `secret-key` is the root of the
+  appliance CA private key, appliance certs, integration credentials,
+  OIDC/SAML secrets and every JWT.
+  A k3s HelmChart defaults to **`failurePolicy: reinstall`**,
+  documented as "a clean uninstall and reinstall of the chart". On
+  three ddi-pg slot-upgrade walks helm-controller took that path for
+  `spatium-control`, the Secret was deleted, the reinstall's `lookup`
+  found nothing, `randAlphaNum 64` minted a new key, and cluster
+  member approval started answering 500 with
+  `ValueError: encrypted value could not be decrypted` — while the
+  control plane reported healthy and the data plane kept serving.
+  **Two independent fixes, because each covers a deployment shape the
+  other does not.** The Secret gains
+  `helm.sh/resource-policy: keep` — it was the ONLY credential Secret
+  in the chart without it, and the Postgres and Redis secrets survived
+  the very same event purely because they carry it. And the
+  appliance's control HelmChart now sets `failurePolicy: abort`, so
+  the destructive path is not taken at all. Losing the self-healing
+  reinstall costs nothing here: recovery is already explicit and
+  logged, since `spatiumddi-helm-stuck-recover` clears the
+  helm-install Job and the `sh.helm.release.v1.*` tracking secrets so
+  helm-controller retries — and it deletes only `owner=helm`
+  release-storage secrets, so the now-kept app Secret survives it and
+  the retry's `lookup` finds the same key.
+  The chart guard is written against the *generator* rather than the
+  filename — any Secret template that mints a credential with
+  `randAlphaNum` must carry the annotation — with a negative control
+  asserting SECRET_KEY's own template is still one of the templates
+  being checked, so the guard cannot pass by looking at nothing.
+  **Making `abort` safe turned up a third defect.** The recovery it
+  leans on had never run: `spatiumddi-helm-stuck-recover.timer` ships
+  in the image, carries `WantedBy=timers.target`, and has its runner
+  covered by `test_helm_stuck_recover.py` — and was absent from
+  `mkosi.postinst`'s unit-enable loop, so on every appliance ever
+  built it was inert. Same class as #550, where a host runner shipped
+  without the `+x` its ExecStart needed: present, reviewed, tested,
+  and dead for one missing line of image plumbing. It is enabled now,
+  and a sweep of all 38 shipped units with an `[Install]` section
+  found no others. The guard that would have caught it matches
+  `[Install]` as a SECTION HEADER, never as a substring —
+  `spatiumddi-pcap.service` carries the comment "No [Install] —
+  invoked only by spatiumddi-pcap.path", and a substring match
+  reports that correct file as a violation, which is how an
+  exemption list fills up with noise and stops being read.
+
+
 ### Security
 
 - **The two source restrictions composed into a console-only
@@ -822,6 +872,46 @@ the formatter handles the rest.
   unchanged.
 
 ### Fixed
+
+
+- **The kea container outlived its own agent, and every health
+  surface stayed green (#1043).** `entrypoint.sh` backgrounds
+  kea-dhcp4, kea-dhcp6 and the Python agent and waits for the first
+  to exit so the container restarts — with
+  `wait -n "$KEA_PID" "$KEA6_PID" "$AGENT_PID" || wait …`, under a
+  comment claiming busybox ash "accepts it too as of 1.30+". It
+  accepts the FLAG and ignores the SEMANTICS. Measured on the image's
+  own base (busybox 1.37 / alpine 3.24): with one child exiting at
+  0.2 s and another alive for 5 s, `wait -n` returned after the full
+  **5 s** — it waited for all of them. dash is worse in a different
+  way: it rejects `-n` outright, so the `||` falls straight through to
+  a plain `wait` that also waits for all. Only bash does what the
+  line was written to do.
+  Because `supervise_kea` and `supervise_kea6` are restart loops that
+  never exit on their own, when the AGENT died the wait simply never
+  returned. The container ran on with Kea serving a frozen config and
+  no agent in it: `kubectl get pod` reported **1/1 Running** with an
+  unchanged restart count, the readiness marker stayed stamped, and
+  every DHCP change made through the API was accepted, rendered by
+  the control plane, and silently never delivered — a reservation
+  created post-upgrade did not reach `kea-dhcp4.conf` and dhclient
+  got a pool address instead. The trigger on the ddi-pg walk was
+  #1042's post-upgrade 401, the agent's own documented
+  "exit so the supervisor restarts the container" path, but **any**
+  unhandled agent crash lands identically. The DNS image is immune
+  only because it `exec`s its agent, so the agent IS the container.
+  Replaced with a POSIX poll over the three pids, and the agent now
+  clears its readiness marker on the way out so a dead agent is
+  visible to the platform even if the process somehow outlives its
+  threads. The tests run the **shipped** loop, extracted from the
+  real file, under dash and busybox — the only shells where the bug
+  is visible — and all six fail against the pre-fix entrypoint.
+  `kill -0` is the portable test rather than a `/proc` state read:
+  ash reaps a background child on SIGCHLD while the loop sits in
+  `sleep`, so the pid leaves the table within a tick, and `wait` on
+  an already-reaped job still yields its remembered status. Verified
+  in both directions on busybox 1.37.
+  Two comments asserting the broken mechanism are corrected with it.
 
 - **The upgrade path could hand a node a root filesystem for
   another CPU architecture (#1026, part 1 of 3).** Every appliance

@@ -847,6 +847,24 @@ spec:
   chartContent: ${chart_b64}
   targetNamespace: spatium
   createNamespace: false
+  # #1042 — NEVER the CRD default, which is \`reinstall\`: "a clean uninstall
+  # and reinstall of the chart" whenever helm-controller finds the release
+  # not \`deployed\` when its job runs. This release is STATEFUL — it owns the
+  # Secret carrying SECRET_KEY, from which app/core/crypto.py derives the
+  # at-rest Fernet key — and an uninstall deleted it, so the reinstall minted
+  # a new key and orphaned the appliance CA private key, every integration
+  # credential and every JWT, with the control plane still reporting healthy.
+  # Three ddi-pg slot-upgrade walks hit exactly that.
+  #
+  # \`abort\` leaves a failed release REPAIRABLE instead of destroying it. It is
+  # safe to stop self-healing here because recovery is already explicit and
+  # logged: spatiumddi-helm-stuck-recover's timer walks HelmChart CRs for a
+  # latched Failed condition and clears the helm-install Job + the
+  # \`sh.helm.release.v1.*\` tracking secrets so helm-controller retries. That
+  # runner deletes only \`owner=helm\` release-storage secrets, so the app
+  # Secret — now annotated \`helm.sh/resource-policy: keep\` — survives it and
+  # the retry's \`lookup\` finds the same key.
+  failurePolicy: abort
   valuesContent: |
     image:
       tag: "${SPATIUMDDI_VERSION}"

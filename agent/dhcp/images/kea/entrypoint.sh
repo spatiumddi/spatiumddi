@@ -7,8 +7,8 @@
 # the agent talks to kea-dhcp4 / kea-dhcp6 directly over their unix control
 # sockets (spatium_dhcp_agent/kea_ctrl.py — config-test, config-reload,
 # status-get, statistic-get-all). Supervising a daemon nothing calls was a
-# liability, not a feature: its crash-loop give-up path would return from
-# the ``wait -n`` below and take the whole container down with it.
+# liability, not a feature: its crash-loop give-up path would be seen by the
+# child-exit poll below and take the whole container down with it.
 #
 # kea-dhcp6 runs always-on alongside kea-dhcp4 (dual-stack): it boots
 # from a minimal idle config (``interfaces: []`` + empty ``subnet6``)
@@ -64,7 +64,7 @@ supervise_kea() {
     # Forward SIGTERM to the live daemon AND flip the stop flag so
     # the outer loop doesn't try to restart during container
     # shutdown. ``exit 0`` here ensures the subshell goes away
-    # cleanly so wait -n in the parent returns.
+    # cleanly so the parent's child-exit poll sees it.
     # shellcheck disable=SC2064
     trap 'STOPPING=1; [ -n "$KEA_CHILD" ] && kill -TERM "$KEA_CHILD" 2>/dev/null; exit 0' TERM INT
     fails=0
@@ -203,11 +203,46 @@ AGENT_PID=$!
 # only one that skipped it.
 set +e
 
-# wait -n is a bash-ism; busybox ash accepts it too as of 1.30+
-# (Alpine 3.11+). Fall back to plain wait on older variants.
-wait -n "$KEA_PID" "$KEA6_PID" "$AGENT_PID" 2>/dev/null \
-    || wait "$KEA_PID" "$KEA6_PID" "$AGENT_PID"
-EXIT_CODE=$?
+# Exit as soon as the FIRST of the three children does (#1043).
+#
+# This was `wait -n "$KEA_PID" "$KEA6_PID" "$AGENT_PID" || wait …`, whose
+# comment claimed busybox ash "accepts it too as of 1.30+". It accepts the
+# FLAG and ignores the SEMANTICS. Measured on busybox 1.37 (alpine 3.24, the
+# image's own base): with one child exiting at 0.2 s and another alive for
+# 5 s, `wait -n` returned after the full 5 s — it waited for ALL of them.
+#
+# That is not a cosmetic difference. `supervise_kea` and `supervise_kea6` are
+# restart loops that never exit on their own, so when the AGENT died the wait
+# simply never returned: the container kept running with kea serving a frozen
+# config and no agent in it, `kubectl get pod` reported 1/1 Running with an
+# unchanged restart count, and every DHCP change made through the API was
+# accepted, rendered, and silently never delivered. The trigger on the
+# ddi-pg walk was #1042's post-upgrade 401 — the agent's documented
+# "exit so supervisor restarts the container (→ re-bootstrap)" path — but ANY
+# unhandled agent crash lands the same way. The DNS image is immune only
+# because it `exec`s its agent, so the agent IS the container.
+#
+# `kill -0` is the portable test: ash reaps a background child on SIGCHLD
+# while we sit in `sleep`, so the pid is gone from the table within a tick of
+# its exit, and `wait` on an already-reaped job still yields its remembered
+# status. Verified on busybox 1.37 in both directions.
+EXIT_CODE=0
+while :; do
+    for _pid in "$KEA_PID" "$KEA6_PID" "$AGENT_PID"; do
+        kill -0 "$_pid" 2>/dev/null && continue
+        wait "$_pid"
+        EXIT_CODE=$?
+        case "$_pid" in
+            "$AGENT_PID") _who="spatium-dhcp-agent" ;;
+            "$KEA_PID")   _who="kea-dhcp4 supervisor" ;;
+            *)            _who="kea-dhcp6 supervisor" ;;
+        esac
+        echo "entrypoint: $_who (pid $_pid) exited with $EXIT_CODE —" \
+             "shutting the container down so it restarts" >&2
+        break 2
+    done
+    sleep 1
+done
 _term
 wait
 exit "$EXIT_CODE"

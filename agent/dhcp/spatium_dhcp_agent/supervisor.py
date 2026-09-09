@@ -28,7 +28,7 @@ from .mac_sighting import MacSightingShipper
 from .metrics import MetricsPoller
 from .peer_resolve import PeerResolveWatcher
 from .ra_sniffer import RASnifferShipper
-from .sync import SyncLoop
+from .sync import SyncLoop, clear_ready_marker
 
 log = structlog.get_logger(__name__)
 
@@ -172,6 +172,11 @@ def run(cfg: AgentConfig) -> int:
         dead = [t.name for t in threads if not t.is_alive()]
         if dead:
             log.error("dhcp_agent_thread_died", threads=dead)
+            # #1043 — stop claiming readiness on the way out. The container
+            # exit is what actually restarts us, but the kea entrypoint used
+            # to outlive this return, leaving a Ready pod with no agent in it.
+            # Clearing the marker makes that state visible rather than green.
+            clear_ready_marker(cfg.state_dir)
             return 2
 
     log.info("dhcp_agent_exiting")
