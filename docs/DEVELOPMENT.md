@@ -191,7 +191,7 @@ the canonical wording lives in `CLAUDE.md`.
 10. **Driver abstraction** — DHCP/DNS backend logic never leaks into the
     service layer (`backend/app/drivers/{dns,dhcp}/`).
 11. **Multi-arch builds** — all Docker images support `linux/amd64` and
-    `linux/arm64` (see §9).
+    `linux/arm64` (see §10).
 12. **K8s manifests stay current** — when you add or change a service,
     update `k8s/base/` and `k8s/README.md`.
 13. **MCP coverage for new features** — a new REST resource also gets
@@ -358,7 +358,7 @@ every push and pull request. Run it locally before pushing.
 make ci
 ```
 
-It chains five targets:
+It chains six targets:
 
 | `make` target | What it runs |
 |---|---|
@@ -367,6 +367,7 @@ It chains five targets:
 | `ci-frontend-build` | `npm run build` |
 | `charts-lint` | The `Charts — Lint & Template` gate, in a helm container (see the job table below) |
 | `perf-test` | `python -m pytest perf` in a python container |
+| `versions-check` | `python3 scripts/lint_versions.py` — asserts every pin in `versions.json` still matches the files that carry it (see §9). Stdlib-only, no container, no network |
 
 `make ci` requires the dev stack to be running (the backend checks
 execute inside the api container) and Node 20+ on the host. It does **not**
@@ -379,11 +380,11 @@ triggered on push to `main` and on every pull request:
 
 | Job | What it does |
 |---|---|
-| **Backend — Lint & Type Check** (`backend-lint`) | `pip install -e ".[dev]"` on Python 3.12, then `ruff check`, `black --check`, `mypy app`, **plus the migration-shape linter** (`python3 scripts/lint_migrations.py` — see §8). |
-| **Backend — Tests** (`backend-test`) | A required-check aggregator over **twelve** parallel `backend-test-shard` jobs. Each shard spins up `postgres:16-alpine` + `redis:8.8-alpine` services, runs `alembic upgrade head`, then `pytest -n auto --splits 12 --group N --store-durations --clean-durations` (pytest-split selects the shard's slice, **balanced by duration** from the committed `backend/.test_durations` — see §Shard balancing; `-n auto` parallelizes it across the runner's vCPUs, each xdist worker on its own `spatiumddi_test_gw<N>` DB). On a PR the `changes` job may first narrow the run to the test files the diff can affect (#1020 — see §Test-impact selection). The aggregator passes only if all twelve shards pass; on a full run it also merges the shards' measured durations into a `test-durations` artifact, and on a push to `main` it builds the `test-impact-map` artifact from the shards' coverage contexts. Coverage is otherwise **not** collected here (#1019). |
+| **Backend — Lint & Type Check** (`backend-lint`) | `pip install -e ".[dev]"` on Python 3.12, then `ruff check`, `black --check`, `mypy app`, **plus the migration-shape linter** (`python3 scripts/lint_migrations.py` — see §8) and the **version-pin manifest linter** (`python3 scripts/lint_versions.py` — see §9). |
+| **Backend — Tests** (`backend-test`) | A required-check aggregator over **twelve** parallel `backend-test-shard` jobs. Each shard spins up `postgres:16-alpine` + `redis:8.10.1-alpine` services, runs `alembic upgrade head`, then `pytest -n auto --splits 12 --group N --store-durations --clean-durations` (pytest-split selects the shard's slice, **balanced by duration** from the committed `backend/.test_durations` — see §Shard balancing; `-n auto` parallelizes it across the runner's vCPUs, each xdist worker on its own `spatiumddi_test_gw<N>` DB). On a PR the `changes` job may first narrow the run to the test files the diff can affect (#1020 — see §Test-impact selection). The aggregator passes only if all twelve shards pass; on a full run it also merges the shards' measured durations into a `test-durations` artifact, and on a push to `main` it builds the `test-impact-map` artifact from the shards' coverage contexts. Coverage is otherwise **not** collected here (#1019). |
 | **Frontend — Lint & Type Check** (`frontend-lint`) | Node 22, `npm install`, then `npm run lint`, `npm run format:check`, `npm run typecheck`, `npm test`. |
 | **Frontend — Build** (`frontend-build`) | Node 22, `npm install`, `npm run build`. |
-| **Charts — Lint & Template** (`charts-lint`) | Helm 3.20 + a checksum-pinned kubeconform. `helm lint --strict` both charts at defaults and with every role / feature toggle on, `helm template` six value sets (umbrella: defaults, all-on, external DB + Redis, the CNPG + Sentinel HA shape; appliance: defaults, all-on, the single-node full-stack shape), `kubeconform -strict` against the Kubernetes 1.36 + CRD-catalog schemas (kept at the version the appliance's k3s serves — it was five minors behind until #974), and `.github/scripts/chart-no-besteffort.py` on every render (#965 — no serving container may lack CPU + memory requests or limits; init containers are exempt, they finish before the pod serves) plus `chart-toggle-coverage.py`, which fails if a template is gated on a values key none of the value sets flips. Rendered manifests are uploaded as the `rendered-charts` artifact. Until #966 nothing on a PR parsed the appliance chart at all; it was first read by helm during the release. `make charts-lint` runs the same script in a helm container. |
+| **Charts — Lint & Template** (`charts-lint`) | Helm 3.21 + a checksum-pinned kubeconform. `helm lint --strict` both charts at defaults and with every role / feature toggle on, `helm template` six value sets (umbrella: defaults, all-on, external DB + Redis, the CNPG + Sentinel HA shape; appliance: defaults, all-on, the single-node full-stack shape), `kubeconform -strict` against the Kubernetes 1.36 + CRD-catalog schemas (kept at the version the appliance's k3s serves — it was five minors behind until #974), and `.github/scripts/chart-no-besteffort.py` on every render (#965 — no serving container may lack CPU + memory requests or limits; init containers are exempt, they finish before the pod serves) plus `chart-toggle-coverage.py`, which fails if a template is gated on a values key none of the value sets flips. Rendered manifests are uploaded as the `rendered-charts` artifact. Until #966 nothing on a PR parsed the appliance chart at all; it was first read by helm during the release. `make charts-lint` runs the same script in a helm container. |
 | **Perf — Tests** (`perf-test`) | Python 3.12 + pytest, `python -m pytest perf`. Hermetic (fake sockets, no network, no appliance). Tests only — `perf/` is outside the Backend Lint scope and carries pre-existing ruff/black drift (#968). `make perf-test` reproduces it. |
 
 Branch protection on `main` (the `protect-main` ruleset) requires every
@@ -613,7 +614,66 @@ python3 scripts/lint_migrations.py --show       # every finding, baselined or no
 
 ---
 
-## 9. Multi-Arch Image Builds
+## 9. Version Pins — `versions.json`
+
+Dependabot covers four ecosystems in this repo: `github-actions`,
+`docker` base images in the directories listed in
+[`.github/dependabot.yml`](../.github/dependabot.yml), `pip` and `npm`.
+Everything else is invisible to it. It has no Helm ecosystem, and it does
+not read Dockerfile `ARG` values, chart `values.yaml`, action `with:`
+inputs, CI shell-script defaults or the appliance bake arrays.
+
+Those pins are declared in **[`versions.json`](../versions.json)** at the
+repo root — one entry per component, carrying the canonical `version`,
+every file that holds a copy of it, the `upstream` to check it against,
+and (where a pin is deliberately behind) a `hold` field with the reason.
+
+```bash
+make versions-check       # offline; part of make ci and of CI's Backend Lint job
+make versions-upstream     # current-vs-latest table; advisory, needs network
+```
+
+### Bumping a component
+
+Edit the `version` field and run `make versions-check`. Every site's
+expected string is a **template** over that field, so the lint reports
+exactly which files still carry the old value — that list is the
+worklist. Nothing reads the manifest at build time, so the literals in
+each file stay real and greppable.
+
+### Adding a pin
+
+Add an entry with a `pinned_in` list. Two fields are easy to get wrong:
+
+- **`count`** is the *exact* number of occurrences required. Omit it and
+  the rule becomes "at least one" — which passes a bump that moved two
+  of three copies and left a mixed-version cluster. Use an exact count
+  wherever the copies must be exhaustive.
+- **`digest`**, for a component pinned by tag *and* digest. A digest does
+  not derive from a version, so the offline lint can only assert the
+  literal; `make versions-upstream` is what resolves the tag and reports
+  a pair that has come apart.
+
+Unknown keys are **refused** rather than ignored, because a typo such as
+`"counts": 3` would otherwise silently downgrade the guard.
+
+### What does not belong here
+
+Anything a lockfile or Dependabot already owns — `pyproject` /
+`package-lock` dependencies, `uses:` action refs, and `FROM` lines
+Dependabot actually bumps. Listing those twice re-creates the drift the
+file exists to remove.
+
+The **one deliberate exception** is a Dependabot-visible `FROM` that
+shares a component with a copy Dependabot cannot see. `nginx` is the
+worked example: the bot moved `frontend/Dockerfile` to 1.31 and the
+appliance chart's copy sat on 1.30.3 for seven weeks, because nothing
+connected them. Listing both means the next bot bump fails the lint until
+the other copies move with it.
+
+---
+
+## 10. Multi-Arch Image Builds
 
 Every Docker image must support **`linux/amd64` and `linux/arm64`**
 (non-negotiable #11). The release pipeline
@@ -625,7 +685,7 @@ multi-arch fan-out happens in CI on a tagged release.
 
 ---
 
-## 10. Branch & PR Conventions
+## 11. Branch & PR Conventions
 
 - **Branch from `main`.** The project uses one branch per issue, named
   `issue-NNN` (keep every phase of a multi-phase change on the same
@@ -656,7 +716,7 @@ multi-arch fan-out happens in CI on a tagged release.
 
 ---
 
-## 11. Security Disclosure
+## 12. Security Disclosure
 
 Do **not** file security vulnerabilities as public issues. Use
 [GitHub Security Advisories](https://github.com/spatiumddi/spatiumddi/security/advisories/new)

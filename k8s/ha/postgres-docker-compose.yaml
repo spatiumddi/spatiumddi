@@ -24,7 +24,7 @@ services:
   # on upstream — etcd already defaults to no auth) and the data-dir
   # mount path (``/bitnami/etcd`` → ``/var/lib/etcd``).
   etcd1:
-    image: quay.io/coreos/etcd:v3.5.30
+    image: quay.io/coreos/etcd:v3.5.33
     command: ["etcd"]
     networks: [spatiumddi]
     environment:
@@ -40,7 +40,7 @@ services:
     volumes: [etcd1_data:/var/lib/etcd]
 
   etcd2:
-    image: quay.io/coreos/etcd:v3.5.30
+    image: quay.io/coreos/etcd:v3.5.33
     command: ["etcd"]
     networks: [spatiumddi]
     environment:
@@ -56,7 +56,7 @@ services:
     volumes: [etcd2_data:/var/lib/etcd]
 
   etcd3:
-    image: quay.io/coreos/etcd:v3.5.30
+    image: quay.io/coreos/etcd:v3.5.33
     command: ["etcd"]
     networks: [spatiumddi]
     environment:
@@ -131,7 +131,7 @@ services:
 
   # ── HAProxy (transparent primary routing) ───────────────────────────────────
   haproxy:
-    image: haproxy:2.9-alpine
+    image: haproxy:3.4-alpine
     networks: [spatiumddi]
     ports:
       - "5000:5000"   # read/write → primary only

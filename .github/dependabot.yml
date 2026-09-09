@@ -82,12 +82,19 @@ updates:
       - dependency-name: "python"
         update-types:
           ["version-update:semver-minor", "version-update:semver-major"]
-      # Alpine 3.24 bumps the bundled Python 3.12→3.13, which breaks the agent
+      # Alpine 3.24 bumps the bundled Python 3.12→3.14.7, which breaks the agent
       # images: they install spatium_*_agent for 3.12, so on 3.24 the module
       # lands on the wrong Python path -> "ModuleNotFoundError: No module named
       # 'spatium_dns_agent'" -> CrashLoopBackOff (caught by agent-e2e on #672).
-      # Pin the agents to alpine 3.23.x until their Dockerfiles are updated for
-      # 3.13; patch bumps (3.23.x) still flow. The 3.24 move is a deliberate task.
+      # Pin the agents to alpine 3.23.x until their Dockerfiles are updated;
+      # patch bumps (3.23.x) still flow. The 3.24 move is a deliberate task.
+      #
+      # #975 — this comment said "3.12→3.13" until the sweep checked the Alpine
+      # package index: v3.24/main ships python3-3.14.7. That makes the blocker a
+      # 3.12 → 3.14 jump needing every agent's dependencies verified on 3.14,
+      # not the one-minor step the wrong number implied — a materially bigger
+      # task that had been under-scoped for as long as the comment stood.
+      # The full reason lives in versions.json under `alpine`.
       - dependency-name: "alpine"
         update-types:
           ["version-update:semver-minor", "version-update:semver-major"]

@@ -1,4 +1,4 @@
-.PHONY: charts-lint perf-test help up down dev build build-supervisor migrate lint test lint-backend lint-frontend test-backend test-cov test-durations \
+.PHONY: charts-lint perf-test versions-check versions-upstream help up down dev build build-supervisor migrate lint test lint-backend lint-frontend test-backend test-cov test-durations \
         openapi \
         lint-untyped-routes \
         lint-untyped-routes-baseline \
@@ -81,6 +81,8 @@ help:
 	@echo "  make docs        Serve the documentation site locally on :4000 (Jekyll)"
 	@echo "  make docs-down   Stop the local documentation site"
 	@echo "  make docs-verify Check every docs SVG diagram for overflow / clipping"
+	@echo "  make versions-check     Assert every pin matches versions.json (part of make ci)"
+	@echo "  make versions-upstream  Current-vs-latest table for every pinned component"
 	@echo "  make appliance      Build the OS-appliance qcow2 (Phase 1 — Debian 13 amd64)"
 	@echo "  make appliance-iso  Wrap the Phase 1 raw image as a hybrid USB/CD ISO (Phase 2)"
 	@echo ""
@@ -410,7 +412,7 @@ lint-untyped-routes-baseline: $(UNTYPED_LIST)
 
 FORCE:
 
-ci: ci-backend-lint ci-frontend-lint ci-frontend-build charts-lint perf-test
+ci: ci-backend-lint ci-frontend-lint ci-frontend-build charts-lint perf-test versions-check
 	@echo ""
 	@echo "✓ All CI checks passed — safe to push."
 
@@ -436,7 +438,7 @@ ci-frontend-build:
 # Charts — Lint & Template (#966): the same script CI's job runs, inside a
 # helm container so a dev box with no helm / kubeconform can run it. Renders
 # land in ./.charts-render/ (gitignored) for inspection.
-HELM_IMAGE ?= alpine/helm:3.20.2
+HELM_IMAGE ?= alpine/helm:3.21.4
 charts-lint:
 	@echo "→ Charts — Lint & Template (matches .github/workflows/ci.yml)"
 	@mkdir -p .charts-render
@@ -444,6 +446,23 @@ charts-lint:
 	  $(HELM_IMAGE) -c 'apk add -q --no-cache bash curl python3 py3-yaml \
 	    && .github/scripts/install-kubeconform.sh \
 	    && .github/scripts/charts-render-check.sh'
+
+# Version-pin manifest (#975). Asserts that every pin declared in the root
+# versions.json still appears, at that version, in each file that carries a
+# copy of it — Helm's five literals, chart values, Dockerfile ARGs, the
+# appliance bake arrays, CI script defaults. Same check CI's Backend Lint job
+# runs; stdlib-only, no network, no container.
+#
+# ``versions-upstream`` is the other half: it resolves each declared upstream
+# and prints a current-vs-latest table. Advisory and network-bound, so it is
+# deliberately NOT part of `make ci` — the weekly trivy-scheduled workflow
+# runs it and files the delta.
+versions-check:
+	@echo "→ Version-pin manifest (matches .github/workflows/ci.yml)"
+	@python3 scripts/lint_versions.py
+
+versions-upstream:
+	@python3 scripts/lint_versions.py --check-upstream
 
 # Perf — Tests (#968): hermetic, stdlib-only tests under perf/.
 perf-test:

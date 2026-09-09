@@ -91,12 +91,12 @@ IMAGES=(
 # ``charts/spatiumddi-appliance/values.yaml`` ``observability.*``
 # image refs.
 OBSERVABILITY_IMAGES=(
-    "registry.k8s.io/kube-state-metrics/kube-state-metrics:v2.18.0"
-    "quay.io/prometheus/node-exporter:v1.11.1"
+    "registry.k8s.io/kube-state-metrics/kube-state-metrics:v2.20.0"
+    "quay.io/prometheus/node-exporter:v1.12.1"
     # Agent landing page — always-on nginx serving the rendered
     # /var/lib/spatiumddi/agent-landing/index.html on :80. Pinned to
-    # 1.30.3-alpine matching values.yaml's ``agentLanding.image.tag``.
-    "nginx:1.30.3-alpine"
+    # 1.31.5-alpine matching values.yaml's ``agentLanding.image.tag``.
+    "nginx:1.31.5-alpine"
     # Phase 11 (#183) — Redis datastore for the control plane.
     # Tag follows the umbrella chart's ``redis.image.tag`` default.
     # NOTE: the standalone ``postgres:16-alpine`` image is intentionally
@@ -106,7 +106,7 @@ OBSERVABILITY_IMAGES=(
     # + operator are baked in CNPG_IMAGES below. The chart's standalone
     # StatefulSet path stays for non-appliance docker/k8s users, but the
     # appliance never renders it, so its image is dead weight in the ISO.
-    "redis:8.8-alpine"
+    "redis:8.10.1-alpine"
 )
 
 # #272 Phase 5 — MetalLB (control-plane HTTPS VIP + Phase 10 DNS/DHCP

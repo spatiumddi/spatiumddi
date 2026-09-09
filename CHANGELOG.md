@@ -365,6 +365,113 @@ the formatter handles the rest.
   trigger table and kept — the Code Quality bot threads are acted
   on.
 
+- **Every version pin Dependabot cannot see now lives in one
+  manifest, and CI fails when a copy drifts (#975).** Dependabot
+  covers four ecosystems here; it has no Helm ecosystem and does
+  not read Dockerfile `ARG` values, chart `values.yaml`, action
+  `with:` inputs, CI script defaults or the appliance bake
+  arrays. Those pins were spread across nine file types, several
+  behind upstream, two past end-of-life, and one component sat on
+  two different versions because only one of its copies was
+  Dependabot-visible: the appliance chart's nginx had fallen a
+  minor behind the frontend image's, with nothing connecting
+  them. Root `versions.json` now declares all 27, and
+  `scripts/lint_versions.py` asserts each still appears in each
+  file that carries it — 86 assertions, run in CI's
+  unconditional Backend Lint job and by `make ci`.
+  **Bumping is one edit**, because every site's expected string
+  is a template over the component's `version` field.
+  **The literals stay in the files rather than being read from
+  the manifest at build time.** A build-time read that yields an
+  empty string is the failure class this repo has hit repeatedly
+  (#1028, #1029, #1030): an action input resolving to `""` falls
+  back to the action's own default — for `azure/setup-helm`,
+  `latest` — with no error anywhere. The lint gives the same
+  single-source guarantee with no new build-time failure mode.
+  **The one Dependabot-owned pin that IS listed is nginx's
+  `FROM`**, deliberately: pairing it with the copies Dependabot
+  cannot see is what turns the next bot bump into a failing lint
+  instead of a silent minor of drift.
+  **`count` is the load-bearing field.** The Patroni overlay runs
+  three etcd services and three Redis containers; a substring
+  check with no count passes a bump that moved two of three and
+  left a mixed-version cluster.
+  A weekly `pin-drift` job in `trivy-scheduled.yml` resolves each
+  declared upstream and files the delta, separating pins that are
+  behind ON PURPOSE from real drift — the `hold` field carries
+  each reason, so a known hold never reads as neglect.
+  `make versions-upstream` runs it locally.
+  **Six defects in the guard itself, found by /code-review before
+  it shipped, and every one of them was the guard failing open.**
+  `--check` — the mode the script's own docstring documents — was
+  not a flag: argparse resolves an unambiguous prefix, so it ran
+  `--check-upstream`, the advisory network mode that always exits
+  0. Following the documentation turned the check off. It is a
+  real flag now and `allow_abbrev=False` stops the next one.
+  An unknown key was silently ignored, so `"counts": 3` left
+  `count` unset and downgraded an exact assertion to "at least
+  one" — a 2-of-3 partial bump passed; unknown keys are refused
+  at every level. The weekly job scraped the first number off a
+  prose line that opens "0 behind upstream" *when every lookup
+  failed*, so a rate-limited run would have reported the fleet
+  current and CLOSED the drift issue; the script now prints a
+  machine-readable `RESULT` line carrying `failed`, and any
+  component that could not be checked makes the verdict
+  indeterminate rather than clean. Technitium is pinned by tag
+  AND digest and only the tag was asserted, so bumping `version`
+  alone passed while the build stayed on the old image — the
+  digest is a manifest field now, asserted offline and resolved
+  against Docker Hub weekly. `ghcr.io/cloudnative-pg/postgresql`
+  was the one bake-array/chart-values pair still unguarded, and
+  the worst one to lose: the appliance never pulls, so a
+  divergence there is ImagePullBackOff on an air-gapped box. And
+  `docs/DEVELOPMENT.md` referred twice to a section that did not
+  exist, now written as §9.
+
+- **The pins the sweep found behind, bumped (#975).** Out of
+  support: `ruby:3.2-slim` (EOL 2026-03-31) → 3.4, and with it
+  `webrick` 1.8.1 → 1.9.2 — 1.8.1 predates the request-smuggling
+  fix in 1.8.2 (CVE-2024-47220) and was the only known-vulnerable
+  web server in the tree, seen by no lockfile and no bot;
+  `jekyll` 4.3.4 → 4.4.1; `haproxy:2.9-alpine`, a short-lived
+  non-LTS branch with no release since March 2025, → 3.4. Behind
+  upstream: Helm v3.20.2 → v3.21.4 across all five copies,
+  `redis` 8.8 → 8.10.1 across fifteen, the appliance chart's
+  nginx 1.30.3 → 1.31.5, kube-state-metrics v2.18.0 → v2.20.0,
+  node-exporter v1.11.1 → v1.12.1, GoBGP 4.7.0 → 4.9.0
+  (`make trivy IMAGE=looking-glass` clean), and the Patroni
+  overlay's etcd v3.5.30 → v3.5.33 on all three services. Every
+  non-held pin is now current.
+  **The HAProxy jump is the one an existing deployment must read
+  before upgrading**, because that overlay's `haproxy.cfg` is
+  operator-supplied and 3.x turned keywords deprecated across the
+  2.x series into hard failures. The canonical Patroni config was
+  validated unchanged on both 2.9 and 3.4, so a config of that
+  shape needs no edit; `BAREMETAL.md` now says so and gives the
+  one-line `haproxy -c` command to check a config that is not.
+  **MetalLB stays on 0.15.3**, re-verified rather than assumed:
+  metallb/metallb#3063 is still open, so the hold and its three
+  vendored sub-pins (frr-k8s, frr, kube-rbac-proxy) stand and are
+  now recorded with the reason.
+  **Three things the sweep got right that the issue text had
+  wrong.** `haproxy:lts-alpine` and `haproxy:3.4-alpine` resolve
+  to the same digest, so 3.4 IS the LTS branch — 3.2 is not.
+  Alpine 3.24 ships Python **3.14.7**, not the 3.13 the
+  `dependabot.yml` comment had claimed for as long as the hold
+  existed, which makes the agent-image blocker a 3.12 → 3.14 jump
+  needing every dependency re-verified, not the one-minor step
+  the wrong number implied. And `patroni-spatiumddi:latest` is
+  not an unpinned pull — the HA overlay BUILDS it inline from
+  `postgres:16-alpine`, so it names a purely local image; what is
+  genuinely unpinned there is the `pip install patroni[etcd3]`
+  beside it, now documented in `BAREMETAL.md`.
+  **Found while writing the manifest:** the backend test shards'
+  own Redis service in `ci.yml` was still on 8.8 — a real pin, in
+  the file the sweep was being written in, that the hand-written
+  issue table had missed. It is in the manifest now, along with
+  the prose in four docs pages that named a version as fact.
+
+
 ### Security
 
 - **The two source restrictions composed into a console-only
@@ -520,6 +627,30 @@ the formatter handles the rest.
   `platform_settings.ntp_pool_servers` as an empty list, so the
   control plane's first config push does not put the pool back.
   `sources.d` and `conf.d` are left in place as the way back.
+
+- **The weekly CVE scan could report "clean" and could never
+  report a CVE (#975).** Found while adding a second job to the
+  same workflow. GitHub Actions runs a `run:` block under
+  `bash -e`, and the `set -uo pipefail` at the top of the scan
+  step does **not** clear that flag — so the bare
+  `docker run ... trivy --exit-code 1` followed by `rc=$?` killed
+  the whole step the moment Trivy found something. That is the
+  first image with findings, which is the only case the job
+  exists for: every branch after it was dead code,
+  `has_findings` was never written, and the reporting step's own
+  fail-safe then correctly refused to touch the tracking issue on
+  an indeterminate result — logging a warning nobody reads on a
+  scheduled run. A clean week and a week full of criticals
+  produced the same visible outcome: no issue.
+  Both status captures now use the `if` form, whose condition is
+  exempt from `-e`. Verified by executing the shipped `run:`
+  bodies under `bash -e` against a stub where `docker build`
+  succeeds and the scan exits 1 — the fixed step reaches its
+  handler and writes `has_findings=1`, the unpatched one exits 1
+  having written nothing. The first attempt at that harness
+  proved nothing, because a stub that failed `docker build` too
+  took the build-failure path and never reached the scan.
+
 
 ### Added
 

@@ -45,9 +45,19 @@ The "Where" column throughout this page refers to these:
 | **Appliance OS** | The bootable Debian image, including its baked k3s |
 | **Helm charts** | `charts/spatiumddi` (generic Kubernetes) and `charts/spatiumddi-appliance` (on-appliance k3s) |
 
-Versions below are the pins on `main` at the time of writing. They move; the
-**Pinned in** column names the file that is actually authoritative, and that is
-the one to check rather than trusting this table's numbers.
+Versions below are the pins on `main` at the time of writing, and the
+**Pinned in** column names the file each one lives in.
+
+Since [#975](https://github.com/spatiumddi/spatiumddi/issues/975) this table no
+longer drifts on its own: the pins that neither Dependabot nor a lockfile owns
+are declared in
+[`versions.json`](https://github.com/spatiumddi/spatiumddi/blob/main/versions.json),
+and `scripts/lint_versions.py` — which runs on every CI build — fails when the
+version column here disagrees with it. So the numbers below for k3s, MetalLB,
+CloudNativePG, GoBGP, Technitium, Redis, PostgreSQL, HAProxy, Alpine,
+node-exporter and kube-state-metrics are checked, not merely written down.
+Rows the lint does not cover (an Alpine package version such as BIND's, which
+moves with the base image) are still "at the time of writing".
 
 ## DNS, DHCP and routing engines
 
@@ -63,7 +73,7 @@ to their control channels, it does not link against them.
 | [PowerDNS dnsdist](https://dnsdist.org/) | Alpine `dnsdist` | GPL v2 | DNS agent image | `agent/dns/images/dnsdist/Dockerfile` |
 | [ISC Kea DHCP](https://www.isc.org/kea/) | Alpine `kea`, v4 + v6 | MPL 2.0 | DHCP agent image | `agent/dhcp/images/kea/Dockerfile` |
 | [radvd](https://radvd.litech.org/) | Alpine `radvd` | BSD-style | DHCP agent image | `agent/dhcp/images/kea/Dockerfile` |
-| [GoBGP](https://github.com/osrg/gobgp) | 4.7.0 (built from source) | Apache 2.0 | Looking Glass image | `agent/looking-glass/images/gobgp/Dockerfile` |
+| [GoBGP](https://github.com/osrg/gobgp) | 4.9.0 (built from source) | Apache 2.0 | Looking Glass image | `agent/looking-glass/images/gobgp/Dockerfile` |
 | [BIND `dig` / `nsupdate`](https://www.isc.org/bind/) | `bind-tools` | MPL 2.0 | DNS + supervisor + API images | several Dockerfiles |
 
 Notes worth carrying:
@@ -95,7 +105,7 @@ Notes worth carrying:
 | [FRRouting](https://frrouting.org/) | via MetalLB frr-k8s | GPL v2 | Helm chart (opt-in) | `charts/spatiumddi-metallb` values |
 | [CloudNativePG](https://cloudnative-pg.io/) | chart 0.29.0 (operator 1.30.0) | Apache 2.0 | Helm chart (opt-in) | `charts/spatiumddi-appliance/Chart.yaml` |
 | [Patroni](https://github.com/patroni/patroni) | `k8s/ha/` overlay | MIT | Bare-metal HA overlay | `k8s/ha/` |
-| [HAProxy](https://www.haproxy.org/) | 2.9-alpine | GPL v2 (+ LGPL libs) | Patroni HA overlay | `k8s/ha/` |
+| [HAProxy](https://www.haproxy.org/) | 3.4-alpine | GPL v2 (+ LGPL libs) | Patroni HA overlay | `k8s/ha/` |
 
 Three of these deserve a sentence, because their state is not what you would
 assume from their presence:
@@ -118,14 +128,14 @@ assume from their presence:
 | Component | Version | License | Where | Pinned in |
 |---|---|---|---|---|
 | [PostgreSQL](https://www.postgresql.org/) | 16-alpine | PostgreSQL License | Compose + Helm chart | `docker-compose.yml` |
-| [Redis](https://redis.io/) | 8.8-alpine | RSALv2 / SSPLv1 / AGPLv3 (Redis 8+) | Compose + Helm chart | `docker-compose.yml` |
-| [Prometheus node-exporter](https://github.com/prometheus/node_exporter) | v1.11.1, **default off** | Apache 2.0 | Appliance chart | `charts/spatiumddi-appliance/values.yaml` |
-| [kube-state-metrics](https://github.com/kubernetes/kube-state-metrics) | v2.18.0, **default off** | Apache 2.0 | Appliance chart | `charts/spatiumddi-appliance/values.yaml` |
+| [Redis](https://redis.io/) | 8.10.1-alpine | RSALv2 / SSPLv1 / AGPLv3 (Redis 8+) | Compose + Helm chart | `docker-compose.yml` |
+| [Prometheus node-exporter](https://github.com/prometheus/node_exporter) | v1.12.1, **default off** | Apache 2.0 | Appliance chart | `charts/spatiumddi-appliance/values.yaml` |
+| [kube-state-metrics](https://github.com/kubernetes/kube-state-metrics) | v2.20.0, **default off** | Apache 2.0 | Appliance chart | `charts/spatiumddi-appliance/values.yaml` |
 | [prometheus-client](https://github.com/prometheus/client_python) | see manifest | Apache 2.0 AND BSD 2-Clause | API image | `backend/pyproject.toml` |
 
 **On Redis's license:** Redis relicensed away from BSD at 7.4 (RSALv2 + SSPLv1)
 and added an AGPLv3 option at 8.0. SpatiumDDI ships the stock upstream
-`redis:8.8-alpine` image unmodified and talks to it as a network service over
+`redis:8.10.1-alpine` image unmodified and talks to it as a network service over
 its own protocol — no Redis code is linked into or vendored by SpatiumDDI.
 
 Operators who would rather not run that license family can point the deployment

@@ -1,4 +1,4 @@
-name: Scheduled Image Vulnerability Scan
+name: Scheduled Dependency Health
 
 # Why this exists (issue #640, Gap 2):
 #
@@ -18,6 +18,13 @@ name: Scheduled Image Vulnerability Scan
 # Unlike ``make trivy`` (six agent images — the contributor pre-push gate),
 # this superset also covers ``backend/Dockerfile`` + ``frontend/Dockerfile``,
 # which had no Trivy coverage anywhere.
+#
+# #975 added a second, independent job: ``pin-drift``, which reports version
+# pins that have fallen behind upstream. The two answer different questions —
+# a CVE scan says "this image has a known vulnerability", drift says "this pin
+# is old", and a pin can be years stale with no CVE filed against it. They
+# share this workflow because they share a cadence and a reporting shape, not
+# because either depends on the other; neither job needs the other to run.
 
 on:
   schedule:
@@ -38,7 +45,8 @@ jobs:
   scan:
     name: Trivy — all shipped images
     # Forks inherit this workflow (#830); never run the publisher outside
-    # the canonical repo. (Single-job workflow.)
+    # the canonical repo. Repeated on every job here — a workflow-level guard
+    # does not exist, so each job that can file an issue carries its own.
     if: github.repository_owner == 'spatiumddi'
     runs-on: ubuntu-latest
     steps:
@@ -102,14 +110,28 @@ jobs:
             # CI's exact gate: HIGH,CRITICAL + fix-available only. exit-code 1
             # ⇒ findings, 0 ⇒ clean, ≥2 ⇒ scan error. Table → stdout, logs →
             # stderr (kept out of the report).
-            docker run --rm \
+            # #975 — the ``if`` form is load-bearing, not style. This step
+            # runs under ``bash -e`` (Actions' default shell), which
+            # ``set -uo pipefail`` at the top does NOT clear, so the previous
+            # ``docker run ...`` followed by ``rc=$?`` killed the whole step
+            # the moment Trivy exited 1 — i.e. on the FIRST image with
+            # findings, which is the only case this job exists for. Every
+            # branch below was unreachable, ``has_findings`` was never
+            # written, and the reporting step's fail-safe then left the
+            # tracking issue untouched with a warning. The scan could report
+            # "clean" and could never report a CVE. Commands in an ``if``
+            # condition are exempt from ``-e``; keep this shape.
+            if docker run --rm \
               -v /var/run/docker.sock:/var/run/docker.sock \
               -v "$cache":/root/.cache/ \
               aquasec/trivy:latest image \
               --severity HIGH,CRITICAL --ignore-unfixed --scanners vuln \
               --format table --exit-code 1 -q \
-              "trivy-scan-$name:scan" > "$RUNNER_TEMP/trivy-$name.txt" 2>"$RUNNER_TEMP/trivy-$name.log"
-            rc=$?
+              "trivy-scan-$name:scan" > "$RUNNER_TEMP/trivy-$name.txt" 2>"$RUNNER_TEMP/trivy-$name.log"; then
+              rc=0
+            else
+              rc=$?
+            fi
 
             if [ "$rc" -eq 0 ]; then
               echo "✅ clean"
@@ -244,4 +266,187 @@ jobs:
               core.info(`Closed tracking issue #${open.number} (now clean)`);
             } else {
               core.info('All images clean; no open tracking issue to close.');
+            }
+
+  # ── Version-pin drift (#975) ────────────────────────────────────────────────
+  # The other half of the same problem the scan above solves: the CVE scan
+  # tells us an image has a known vulnerability, this tells us a pin has gone
+  # stale — and the two failure modes are different. A pin can sit years
+  # behind with no CVE against it (kube-rbac-proxy v0.12.0 was a 2022 release)
+  # and nothing anywhere notices, because Dependabot cannot see any of the
+  # pins in versions.json: it has no Helm ecosystem, does not read ARG values,
+  # chart values.yaml, action `with:` inputs or the appliance bake arrays.
+  #
+  # Separate job, not a step on `scan`: this needs no Docker and no image
+  # build, so pinning it to that job's ~20 minutes would be waste, and a
+  # Docker build failure there must not take the drift report down with it.
+  #
+  # Deliberately never fails and never gates anything. `versions.json`'s
+  # `hold` field marks the pins that are behind ON PURPOSE (MetalLB on
+  # metallb#3063, Postgres 16 on #208, the Jekyll plugins on what the
+  # github-pages gem pins), and the report separates those from real drift —
+  # a known hold that reads as a failure every week is how a report stops
+  # being read.
+  pin-drift:
+    name: Version pins — upstream drift
+    if: github.repository_owner == 'spatiumddi'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Resolve every declared upstream
+        id: drift
+        env:
+          # Raises api.github.com's rate limit from 60/hr to 1000/hr. Most
+          # entries resolve through it, so unauthenticated runs would start
+          # reporting "check failed" rather than a version.
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          report="$RUNNER_TEMP/pin-drift.md"
+
+          # The ``if`` form, NOT ``cmd; rc=$?``. Actions runs this with
+          # ``bash -e``, and ``set -uo pipefail`` above does NOT clear that —
+          # so a bare failing command kills the step before any handler runs,
+          # and every line below would be dead code. Commands in an ``if``
+          # condition are exempt from ``-e``; this is the only shape that
+          # reliably captures a non-zero status here. (#975 — the sibling
+          # ``scan`` job had exactly this bug.)
+          if python3 scripts/lint_versions.py --check-upstream \
+               > "$report" 2>"$RUNNER_TEMP/pin-drift.err"; then
+            rc=0
+          else
+            rc=$?
+          fi
+
+          # The script is advisory and exits 0 even when components are behind,
+          # so a non-zero rc here means it could not run at all (an unparseable
+          # manifest, a missing interpreter). That is a real problem with the
+          # guard itself and must not be reported as "no drift" — the #1030
+          # lesson: an empty result and a clean result have to look different.
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::lint_versions.py --check-upstream failed (rc=$rc)"
+            sed 's/^/  /' "$RUNNER_TEMP/pin-drift.err" >&2
+            echo "status=error" >> "$GITHUB_OUTPUT"
+            {
+              echo "## Version-pin drift"
+              echo ""
+              echo "⚠️ The drift check could not run (rc=$rc). See the run log."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # Parse the machine-readable line the script prints last:
+          #   RESULT behind=N held=N failed=N total=N
+          #
+          # Reading `failed` is the load-bearing half. The PROSE line above it
+          # starts "0 behind upstream" when every single lookup failed — a
+          # rate-limited token, a GitHub outage, no egress — so a consumer that
+          # scraped only the first number would report the whole fleet current
+          # and CLOSE the drift issue on the one run that knew nothing. Any
+          # component we could not check makes the result indeterminate, which
+          # is a third state, not a clean bill of health.
+          result="$(grep -m1 '^RESULT ' "$report" || true)"
+          behind=""; failed=""
+          for field in $result; do
+            case "$field" in
+              behind=*) behind="${field#behind=}" ;;
+              failed=*) failed="${field#failed=}" ;;
+            esac
+          done
+
+          if [ -z "$behind" ] || [ -z "$failed" ]; then
+            echo "::warning::could not parse the RESULT line from the drift report"
+            echo "status=error" >> "$GITHUB_OUTPUT"
+          elif [ "$failed" -gt 0 ]; then
+            echo "::warning::$failed component(s) could not be checked — result is indeterminate"
+            echo "status=error" >> "$GITHUB_OUTPUT"
+          elif [ "$behind" -gt 0 ]; then
+            echo "status=behind" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=current" >> "$GITHUB_OUTPUT"
+          fi
+
+          {
+            echo "## Version-pin drift (\`versions.json\`)"
+            echo ""
+            cat "$report"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Open, update or close the drift tracking issue
+        if: always()
+        uses: actions/github-script@v9
+        env:
+          DRIFT_STATUS: ${{ steps.drift.outputs.status }}
+        with:
+          script: |
+            const fs = require('fs');
+            const { owner, repo } = context.repo;
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const today = new Date().toISOString().slice(0, 10);
+
+            // Same fail-safe as the Trivy job: an indeterminate result leaves
+            // any existing issue exactly as it is. Closing on "we could not
+            // tell" would report stale pins as current.
+            const status = process.env.DRIFT_STATUS;
+            if (status !== 'behind' && status !== 'current') {
+              core.warning(
+                `Drift check produced no definitive result (status=${JSON.stringify(status)}); ` +
+                `leaving any tracking issue untouched.`);
+              return;
+            }
+
+            const label = 'dependencies';
+            const title = 'Version pins behind upstream (versions.json)';
+            const marker = '<!-- versions-pin-drift -->';
+
+            const open = (await github.rest.issues.listForRepo({
+              owner, repo, state: 'open', labels: label, per_page: 100,
+            })).data.filter(i => !i.pull_request).find(i => (i.body || '').includes(marker));
+
+            if (status === 'behind') {
+              let table = '(report file missing — see the run log)';
+              const path = `${process.env.RUNNER_TEMP}/pin-drift.md`;
+              if (fs.existsSync(path)) table = fs.readFileSync(path, 'utf8');
+              let body =
+                `${marker}\n\n` +
+                `One or more pins in [\`versions.json\`](../blob/main/versions.json) are ` +
+                `behind upstream. Rows marked 🔒 are held on purpose — their reason is ` +
+                `the \`hold\` field on that component, and they are NOT what this issue ` +
+                `is about.\n\n` +
+                `- Check run: ${runUrl}\n- Last updated: ${today}\n\n` +
+                `${table}\n\n---\n` +
+                `Reproduce locally with \`make versions-upstream\`. Bumping a component ` +
+                `is one edit to \`versions.json\` plus whatever \`make versions-check\` ` +
+                `then reports. This issue auto-closes when every non-held pin is current.`;
+              if (body.length > 60000) body = body.slice(0, 60000) + '\n\n_…truncated._';
+
+              if (open) {
+                await github.rest.issues.update({ owner, repo, issue_number: open.number, body });
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: open.number,
+                  body: `🔁 Still behind as of ${today} — ${runUrl}`,
+                });
+                core.info(`Updated drift issue #${open.number}`);
+              } else {
+                const created = await github.rest.issues.create({
+                  owner, repo, title, labels: [label], body,
+                });
+                core.info(`Opened drift issue #${created.data.number}`);
+              }
+            } else if (open) {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: open.number,
+                body: `✅ Every non-held pin is current as of ${today} — ${runUrl}. Closing.`,
+              });
+              await github.rest.issues.update({
+                owner, repo, issue_number: open.number, state: 'closed',
+              });
+              core.info(`Closed drift issue #${open.number} (now current)`);
+            } else {
+              core.info('Every non-held pin is current; no open drift issue to close.');
             }

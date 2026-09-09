@@ -203,6 +203,19 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: python3 scripts/lint_migrations.py
 
+      # #975 — every version pin Dependabot cannot see (Helm's five copies,
+      # chart values.yaml, Dockerfile ARGs, the appliance bake arrays, CI
+      # script defaults, action `with:` inputs) is declared in the root
+      # versions.json, and this asserts the files still agree with it. Without
+      # it those pins drift silently: Dependabot moved the frontend image to
+      # nginx 1.31 on 2026-07-20 (#688) and the appliance chart's copy sat on
+      # 1.30.3 until #975, because only one of the two was Dependabot-visible
+      # and nothing connected them. stdlib-only; runs from repo root, so the
+      # ``working-directory: backend`` default is overridden here.
+      - name: Version-pin manifest linter
+        working-directory: ${{ github.workspace }}
+        run: python3 scripts/lint_versions.py
+
       # Guards the appliance host-side runner scripts (issues #550/#553):
       # every systemd ExecStart runner must be executable in the built
       # image (git +x OR chmod'd in mkosi.postinst) and bash -n clean.
@@ -279,7 +292,7 @@ jobs:
           --health-retries 5
 
       redis:
-        image: redis:8.8-alpine
+        image: redis:8.10.1-alpine
         ports:
           - 6379:6379
         options: >-
@@ -674,7 +687,7 @@ jobs:
       - name: Install Helm
         uses: azure/setup-helm@v5
         with:
-          version: v3.20.2
+          version: v3.21.4
 
       - name: Install kubeconform
         run: .github/scripts/install-kubeconform.sh
