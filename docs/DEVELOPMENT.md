@@ -478,10 +478,17 @@ than it saves.
 ### Nightly builds
 
 [`.github/workflows/nightly.yml`](../.github/workflows/nightly.yml) builds
-and publishes every image from `main` at **03:23 America/New_York** (the
-team works Eastern evenings, so the nightly runs after the late pushes —
-two UTC crons plus a wall-clock gate keep that true across DST). It exists
-because
+and publishes every image from `main` at **20:05 America/New_York**, so
+the pre-release is done by about 21:00 for the evening QA walk. GitHub
+starts scheduled runs in this repository hours late, so a small companion,
+[`nightly-trigger.yml`](../.github/workflows/nightly-trigger.yml), fires
+early, waits for the instant on the Eastern clock, and dispatches the
+build; `nightly.yml`'s own 03:23 crons are only a fallback for a night
+the trigger never fired. Every nightly is named for the **evening it
+belongs to** — a build between one 20:05 and the next is
+`nightly-<that evening's date>`, whether it ran at 20:05, after midnight,
+or as the 03:23 fallback — and an evening that already published is never
+rebuilt without `force`. It exists because
 nothing else builds the *release* image except a release — which is how
 [#732](https://github.com/spatiumddi/spatiumddi/issues/732) shipped an api
 image carrying pytest as root, undetected until the next release cut it.

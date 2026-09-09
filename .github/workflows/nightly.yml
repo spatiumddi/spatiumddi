@@ -51,16 +51,22 @@ name: Nightly
 
 on:
   schedule:
-    # Target: 03:23 America/New_York — Eric + Matt work Eastern evenings,
-    # so the nightly must run AFTER their late pushes, DST included. Cron
-    # is UTC-only, so schedule both candidate UTC hours (07:23 = 03:23
-    # EDT, 08:23 = 03:23 EST) and let the gate job keep exactly the one
-    # whose SCHEDULED slot reads 03 on the Eastern clock — the other fires
-    # and immediately skips. The gate decides from the cron string GitHub
-    # hands it (github.event.schedule), never from the clock at run time:
-    # GitHub starts these runs 40 min to 13 h late (measured, every
-    # night), so the run-time wall clock says nothing about which slot a
-    # run belongs to.
+    # FALLBACK ONLY. The nightly is normally started at 20:05
+    # America/New_York by nightly-trigger.yml, so the pre-release is done
+    # by ~21:00 for the evening QA walk. GitHub starts crons in this repo
+    # 40 min to 7½ h late, so that workflow fires early, waits for the
+    # instant, and dispatches this one. These crons cover the night the
+    # trigger never fires (GitHub also drops scheduled runs outright):
+    # the gate builds only when the evening produced no nightly, and
+    # names the build after that evening (see "Which evening" below).
+    #
+    # Slot: 03:23 America/New_York. Cron is UTC-only, so schedule both
+    # candidate UTC hours (07:23 = 03:23 EDT, 08:23 = 03:23 EST) and let
+    # the gate job keep exactly the one whose SCHEDULED slot reads 03 on
+    # the Eastern clock — the other fires and immediately skips. The gate
+    # decides from the cron string GitHub hands it (github.event.schedule),
+    # never from the clock at run time — see above for how late these
+    # runs start.
     #
     # The :23 is not decoration and must not be rounded to :00 — same
     # reason prune-release-assets.yml is off the hour: the top-of-hour
@@ -212,16 +218,40 @@ jobs:
           IMAGES_EOF
           echo "images=$(jq -c . /tmp/images.json)" >> "$GITHUB_OUTPUT"
 
-          # Both stamps use the EASTERN calendar date — the run targets
-          # 03:23 America/New_York, so "tonight's build" carries the date
-          # the team just worked through, not whatever UTC rolled over to.
-          DATE_TAG="nightly-$(TZ=America/New_York date +%Y%m%d)"
+          # ── Which evening is this build for? ─────────────────────────
+          # The nightly is built at 20:05 America/New_York (by
+          # nightly-trigger.yml), and every build from 19:00 one day to
+          # 19:00 the next belongs to the evening in between — the stamps
+          # use THAT date, not the calendar date the run happens to start
+          # on:
+          #   - the 03:23 fallback stands in for the evening before it and
+          #     is named after it, so the next evening's build never
+          #     collides with a fallback's tag;
+          #   - a run GitHub started after midnight is late for last
+          #     evening, not early for tonight;
+          #   - a re-run in the afternoon (dispatch --force) refreshes
+          #     last night's release rather than pre-empting tonight's.
+          # 19:00 rather than the trigger's own 20:05 so the two never
+          # have to agree to the minute: anything the trigger starts is
+          # comfortably inside its evening. Eastern throughout, so DST
+          # changes the instant and never the date.
+          NIGHT_BOUNDARY="19:00"
+          NOW=$(date -u +%s)
+          TODAY_ET=$(TZ=America/New_York date -d "@$NOW" +%F)
+          if [ "$NOW" -lt "$(TZ=America/New_York date -d "${TODAY_ET} ${NIGHT_BOUNDARY}" +%s)" ]; then
+            NIGHT_DATE=$(TZ=America/New_York date -d "${TODAY_ET} -1 day" +%Y%m%d)
+          else
+            NIGHT_DATE=$(TZ=America/New_York date -d "${TODAY_ET}" +%Y%m%d)
+          fi
+          DATE_TAG="nightly-${NIGHT_DATE}"
           echo "date_tag=${DATE_TAG}" >> "$GITHUB_OUTPUT"
           # Per-night pre-release tag: CalVer date so nightlies sort and
           # read like the releases they sit next to, PREFIXED so it can
           # never match release.yml's bare-CalVer tag trigger (a tag like
           # 2026.08.08-nightly would fire a full release build).
-          echo "release_tag=nightly-$(TZ=America/New_York date +%Y.%m.%d)" >> "$GITHUB_OUTPUT"
+          RELEASE_TAG="nightly-${NIGHT_DATE:0:4}.${NIGHT_DATE:4:2}.${NIGHT_DATE:6:2}"
+          echo "release_tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "→ this is the build for the evening of ${NIGHT_DATE} (${DATE_TAG}, ${RELEASE_TAG}); now $(TZ=America/New_York date -d "@$NOW" '+%F %H:%M %Z')"
           # Informational version string baked into the frontend build and
           # the appliance release stamp. Deliberately NOT CalVer-shaped, so
           # it can never be mistaken for a release by a human or a sort.
@@ -244,6 +274,21 @@ jobs:
           echo "last_sha=${LAST_SHA}" >> "$GITHUB_OUTPUT"
           echo "last nightly commit: ${LAST_SHA:-<none>}"
           echo "current main commit: ${GITHUB_SHA}"
+
+          # Skip when this evening already has its nightly. The 03:23
+          # fallback, and a second dispatch racing the first, must not
+          # rebuild an evening that published: the QA lane has walked
+          # those bytes, and a same-tag rebuild replaces them under it.
+          # "Published" means finalize stamped `built-from:` — a release
+          # that exists without it is an evening build that died part-way,
+          # and rebuilding that IS the fallback's job. `force` is the
+          # explicit way to rebuild a finished evening.
+          THIS_EVENING_SHA=$(gh release view "$RELEASE_TAG" --json body --jq '.body' 2>/dev/null                              | sed -n 's/^built-from: \([0-9a-f]\{40\}\).*/\1/p' | head -1 || true)
+          if [ "$FORCE" != "true" ] && [ -n "$THIS_EVENING_SHA" ]; then
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            echo "→ ${RELEASE_TAG} is already published (built-from ${THIS_EVENING_SHA::7}); this evening is done. Skipping — dispatch with force=true to rebuild it"
+            exit 0
+          fi
 
           # Skip when main has not moved. Republishing byte-identical images
           # over a quiet weekend burns runner time and, worse, makes the
