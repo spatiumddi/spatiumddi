@@ -50,11 +50,21 @@ INITRD="${RAW%.raw}.initrd"
 
 WORKDIR=$(mktemp -d)
 MOUNT_DIR=
+
+# unmount_tree (+ the story of nightly-20260909) lives in mount-lib.sh,
+# shared with build-slot-image.sh, which hit the same wall one step later.
+. "$(dirname "$0")/mount-lib.sh"
+
 cleanup() {
-    if [ -n "$MOUNT_DIR" ] && mountpoint -q "$MOUNT_DIR" 2>/dev/null; then
-        umount "$MOUNT_DIR" || true
+    local rc=$?
+    if [ -n "$MOUNT_DIR" ] && ! unmount_tree "$MOUNT_DIR"; then
+        echo "ERROR: refusing to rm -rf $WORKDIR with live mounts under it" >&2
+        exit 1
     fi
-    rm -rf "$WORKDIR"
+    # --one-file-system: even if a mount slipped past the check above,
+    # never delete across it (#553).
+    rm -rf --one-file-system "$WORKDIR"
+    exit "$rc"
 }
 trap cleanup EXIT
 
@@ -116,10 +126,14 @@ mount -o rw,loop,offset=$ROOT_OFFSET,sizelimit=$ROOT_SIZE "$RAW" "$MOUNT_DIR"
 echo "→ Regenerating initrd with live-boot hooks (chroot into rootfs)…"
 for d in proc sys dev; do
     mount --bind "/$d" "$MOUNT_DIR/$d"
+    # Private: whatever the builder's own /$d does after this point (a
+    # mount appearing under a shared /sys, say) must not propagate into
+    # the tree we are about to squash — see unmount_tree above.
+    mount --make-rprivate "$MOUNT_DIR/$d"
 done
 cleanup_chroot() {
     for d in dev sys proc; do
-        umount "$MOUNT_DIR/$d" 2>/dev/null || true
+        unmount_tree "$MOUNT_DIR/$d" || true
     done
 }
 trap 'cleanup_chroot; cleanup' EXIT
@@ -163,9 +177,29 @@ echo "→ Live initrd: $(ls -lh "$ISO_ROOT/live/initrd.img" | awk '{print $5}')"
 # ── Squashfs of the rootfs ────────────────────────────────────────────────────
 # Unmount the bind mounts before snapshotting — squashfs would
 # otherwise descend into /proc and /sys and try to pack their
-# contents, which fails on synthetic kernel files.
+# contents — and REFUSE to snapshot if any of them is still there.
+# The old ``umount … 2>/dev/null || true`` here is the line that turned
+# nightly-20260909 into a 24,000-line log and an exit 1 after a valid
+# ISO had been written (see unmount_tree).
 for d in dev sys proc; do
-    umount "$MOUNT_DIR/$d" 2>/dev/null || true
+    unmount_tree "$MOUNT_DIR/$d" || exit 1
+done
+for d in proc sys dev; do
+    if mountpoint -q "$MOUNT_DIR/$d" 2>/dev/null; then
+        echo "ERROR: $MOUNT_DIR/$d is still a mount point — refusing to squash a" >&2
+        echo "       rootfs with the builder's kernel filesystems in it." >&2
+        findmnt -R "$MOUNT_DIR/$d" >&2 || true
+        exit 1
+    fi
+done
+# The rootfs's own /proc and /sys are empty directories; anything in
+# them now is the builder's, not the appliance's.
+for d in proc sys; do
+    if [ -n "$(ls -A "$MOUNT_DIR/$d" 2>/dev/null)" ]; then
+        echo "ERROR: $MOUNT_DIR/$d is not empty — a kernel filesystem leaked into the rootfs:" >&2
+        ls -A "$MOUNT_DIR/$d" | head >&2
+        exit 1
+    fi
 done
 trap cleanup EXIT
 

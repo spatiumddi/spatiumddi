@@ -70,7 +70,12 @@ WORK=$(mktemp -d)
 # loop device. `umount -R` tears the submounts down first; `rm -rf
 # --one-file-system` is a belt-and-braces stop so rm never crosses a
 # still-mounted boundary even if an unmount failed.
-trap 'for mp in "$WORK/slot-mnt" "$WORK/src-mnt"; do umount -R "$mp" 2>/dev/null || umount "$mp" 2>/dev/null || true; done; rm -rf --one-file-system "$WORK"' EXIT
+# unmount_tree (mount-lib.sh, shared with wrap-iso.sh) is the recursive
+# unmount above plus a lazy-detach fallback and a findmnt proof, loud on
+# every failure — the same busy /sys that took wrap-iso.sh down on
+# nightly-20260909 stopped this script's bare `umount` one step later.
+. "$(dirname "$0")/mount-lib.sh"
+trap 'for mp in "$WORK/slot-mnt" "$WORK/src-mnt"; do unmount_tree "$mp" || true; done; rm -rf --one-file-system "$WORK"' EXIT
 
 mkdir -p "$WORK/src-mnt" "$WORK/slot-mnt"
 
@@ -229,9 +234,12 @@ ln -sf "initrd.img-$KVER" "$WORK/slot-mnt/boot/initrd.img"
 # dpkg-diverts update-initramfs into a no-op. Undivert it first so
 # the actual binary runs, then regenerate.
 echo "→ Regenerating initrd inside slot…"
-mount --bind /proc "$WORK/slot-mnt/proc"
-mount --bind /sys  "$WORK/slot-mnt/sys"
-mount --bind /dev  "$WORK/slot-mnt/dev"
+for d in proc sys dev; do
+    mount --bind "/$d" "$WORK/slot-mnt/$d"
+    # Private: nothing that appears under the builder's own /$d after this
+    # point may propagate into the tree we are about to image.
+    mount --make-rprivate "$WORK/slot-mnt/$d"
+done
 
 # Force virtio + ext4 modules into the initrd so the slot can find
 # its root partition on common VM hypervisors (Proxmox/QEMU/libvirt).
@@ -261,12 +269,21 @@ if [ ! -f "$WORK/slot-mnt/boot/initrd.img-$KVER" ]; then
     exit 1
 fi
 
-umount "$WORK/slot-mnt/proc"
-umount "$WORK/slot-mnt/sys"
-umount "$WORK/slot-mnt/dev"
+# Verified, recursive, lazy-fallback unmounts (see mount-lib.sh) — a
+# plain `umount "$WORK/slot-mnt/sys"` here returned "target is busy"
+# after the chroot's update-initramfs in the nightly-20260909 replay.
+for d in dev sys proc; do
+    unmount_tree "$WORK/slot-mnt/$d" || exit 1
+done
+for d in proc sys dev; do
+    if mountpoint -q "$WORK/slot-mnt/$d" 2>/dev/null; then
+        echo "ERROR: $WORK/slot-mnt/$d is still a mount point; refusing to image the slot" >&2
+        exit 1
+    fi
+done
 
-umount "$WORK/slot-mnt"
-umount "$WORK/src-mnt"
+unmount_tree "$WORK/slot-mnt" || exit 1
+unmount_tree "$WORK/src-mnt" || exit 1
 
 # Run an fsck pass so the image lands in a clean state. e2fsck -fy
 # trims unused-but-allocated blocks too, which helps xz compress.
