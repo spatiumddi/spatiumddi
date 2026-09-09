@@ -60,7 +60,21 @@ RUN git clone --depth 1 --branch "v${GOBGP_VERSION}" https://github.com/osrg/gob
 # 0.55 carries several HIGH (html XSS, IDNA punycode privilege escalation,
 # HTTP/2 DoS); x/text below 0.39 carries CVE-2026-56852 (norm.Iter infinite
 # loop); grpc-go below 1.82.1 carries GHSA-hrxh-6v49-42gf (xDS RBAC +
-# HTTP/2) and 1.83.0 carries CVE-2026-84304 (HIGH, fixed in 1.83.1).
+# HTTP/2), 1.83.0 carries CVE-2026-84304 (HIGH, fixed in 1.83.1) and
+# 1.83.1 carries CVE-2026-84445 (HIGH, xDS server DoS, fixed in 1.83.2).
+#
+# That last one was caught by CI on #1037, not locally: touching a
+# Dockerfile is what makes CI scan the image, so the PR inherits every
+# CVE published since the last time anything touched it. A local
+# `make trivy` against a stale DB reported clean an hour earlier.
+#
+# These three are NOT independent, and `go get` REFUSES a mismatched set
+# rather than resolving it — so raising one drags the others and the build
+# says exactly which. Bumping grpc alone to clear CVE-2026-84445 took two
+# more rounds: grpc 1.83.2 wanted x/net 0.58.0, then both wanted x/text
+# 0.41.0. That is a feature — the failure is loud and at build time — but
+# budget for it, and re-run `make trivy IMAGE=looking-glass` after, since
+# the versions you end up on are not the ones you set out to pin.
 #
 # EVERY ONE OF THESE MUST BE AN UPGRADE, NEVER A DOWNGRADE. ``go get pkg@vX``
 # sets exactly that version, so once GoBGP's own go.mod moves past one of
@@ -78,9 +92,9 @@ RUN git clone --depth 1 --branch "v${GOBGP_VERSION}" https://github.com/osrg/gob
 # not a tracked manifest, which is why they live in versions.json's orbit and
 # why `make trivy IMAGE=looking-glass` is what surfaces the next one.
 RUN go get \
-      golang.org/x/net@v0.57.0 \
-      golang.org/x/text@v0.40.0 \
-      google.golang.org/grpc@v1.83.1
+      golang.org/x/net@v0.58.0 \
+      golang.org/x/text@v0.41.0 \
+      google.golang.org/grpc@v1.83.2
 ENV CGO_ENABLED=0
 RUN GOOS="${TARGETOS:-linux}" GOARCH="${TARGETARCH}" \
       go build -trimpath -ldflags="-s -w" -o /out/gobgpd ./cmd/gobgpd \

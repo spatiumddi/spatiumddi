@@ -515,6 +515,15 @@ the formatter handles the rest.
   snapshot — the 4.9 → 5.0 crossing already happened on 3.22 →
   3.23), dnsdist → 2.0.8, bind → 9.20.27, Kea unchanged at 3.0.3.
   All eight images `make trivy` covers build clean and scan clean.
+  **CI surfaced one CVE the local scan had not**, which is the
+  path-filter effect this repo has hit before (#639): touching a
+  Dockerfile is what makes CI scan that image, so the PR inherits
+  everything published since the last time anything touched it.
+  `google.golang.org/grpc` was pinned at 1.83.1 for CVE-2026-84304
+  and 1.83.1 now carries CVE-2026-84445 (HIGH, xDS server DoS).
+  Clearing it took three rounds, because those `go get` pins are a
+  coupled set that `go get` refuses rather than resolves: grpc 1.83.2
+  wanted x/net 0.58.0, and both then wanted x/text 0.41.0.
   **`Agent — Tests` moves to 3.14 with them.** It ran on 3.12 while
   the images shipped 3.14, which is the skew that lets a
   3.14-only regression reach a pod with every check green. The
