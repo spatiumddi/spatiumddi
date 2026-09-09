@@ -54,6 +54,12 @@ scripts/merge_test_durations.py
 # future widening of the deny-list must not silently drop this one.
 scripts/lint_versions.py
 
+# test_lint_workflow_shell.py (#1036) loads the workflow shell-status guard
+# and pins it against the real pre-fix trivy-scheduled.yml body, plus the
+# false-positive case that made the first draft unusable (a `set -e` inside a
+# function is not evidence that -e is on at an arbitrary later line).
+scripts/lint_workflow_shell.py
+
 # test_zone_name_scope.py (#986) loads the release-prep TLD regenerator and
 # pins that it uses the PRODUCT's payload guard rather than a second copy —
 # so a PR that gives the script its own parser has to run the test that says

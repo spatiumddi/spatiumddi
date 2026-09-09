@@ -315,7 +315,7 @@ Apache license covers it.
 
 | Component | Version | License | Where |
 |---|---|---|---|
-| [Alpine Linux](https://alpinelinux.org/) | 3.23 | MIT (+ GPL v2 kernel) | All agent images, supervisor |
+| [Alpine Linux](https://alpinelinux.org/) | 3.24 | MIT (+ GPL v2 kernel) | All agent images, supervisor |
 | [Debian slim](https://www.debian.org/) | trixie / bookworm | DFSG (mixed) | Appliance builder, Technitium agent build stage |
 | [python:3.12-slim](https://www.python.org/) | 3.12 | PSF + Debian | API image |
 | [node](https://nodejs.org/) | 22-alpine | MIT | Frontend build stage |

@@ -53,6 +53,7 @@ _KNOWN_REPO_ROOT_READS: dict[str, str] = {
     "test_outbound_hosts_documented.py": "docs/PRIVACY.md",
     "test_zone_name_scope.py": "scripts/refresh_iana_tlds.py",
     "test_lint_versions.py": "scripts/lint_versions.py",
+    "test_lint_workflow_shell.py": "scripts/lint_workflow_shell.py",
     "test_dhcp_packet_loss.py": "agent/dhcp/spatium_dhcp_agent/metrics.py",
     "test_ntp_initial_seed.py": ("appliance/mkosi.extra/usr/local/bin/spatiumddi-firstboot"),
 }

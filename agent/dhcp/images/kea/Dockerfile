@@ -1,9 +1,9 @@
 # syntax=docker/dockerfile:1.7
 # SpatiumDDI Kea DHCP container — kea-dhcp4 + kea-dhcp6 + kea-ctrl-agent + spatium-dhcp-agent
 # Multi-arch: linux/amd64, linux/arm64 (non-negotiable #11)
-ARG PYTHON_VERSION=3.12
+ARG PYTHON_VERSION=3.14
 
-FROM alpine:3.23 AS agent-build
+FROM alpine:3.24 AS agent-build
 RUN apk add --no-cache python3 py3-pip py3-wheel
 WORKDIR /src
 COPY agent/dhcp/pyproject.toml /src/pyproject.toml
@@ -11,7 +11,7 @@ COPY agent/dhcp/spatium_dhcp_agent /src/spatium_dhcp_agent
 COPY agent/dhcp/README.md /src/README.md
 RUN python3 -m pip install --prefix=/install --no-cache-dir --break-system-packages .
 
-FROM alpine:3.23 AS runtime
+FROM alpine:3.24 AS runtime
 # libpcap is pulled in for scapy's BPF socket support, used by the
 # optional Phase 2 device-fingerprinting sniffer (DHCP_FINGERPRINT_ENABLED=1).
 # scapy itself is pure-python so the install works on amd64 + arm64
@@ -38,7 +38,7 @@ FROM alpine:3.23 AS runtime
 # raises NET_RAW into the *ambient* set via setpriv (survives the
 # setuid + execve into ``spatium``). See entrypoint.sh (#383).
 #
-# ``kea>=3.0.3-r0`` (issue #637) — alpine 3.23 ships Kea 3.0.3, ISC's first
+# ``kea>=3.0.3-r0`` (issue #637) — alpine 3.24 ships Kea 3.0.3, ISC's first
 # LTS. The explicit ``>=`` lower-bound is what makes the major EXPLICIT: the
 # old ``>=2.6.5-r0`` bound was *satisfied* by 3.0.3-r0, so flipping the base
 # tag alone would have silently pulled a major version bump. 3.0.3 (not
@@ -78,12 +78,12 @@ FROM alpine:3.23 AS runtime
 # database is fresh and any previously-baked layer carrying an older
 # libpq version (CVE-2026-6638 fixed in 17.10-r0 — pulled in
 # transitively by kea-admin's optional psql backend wiring) gets
-# re-resolved against the current alpine 3.23 index. GitHub Actions
+# re-resolved against the current alpine 3.24 index. GitHub Actions
 # Docker layer cache (``cache-from: type=gha``) is otherwise happy
 # to serve a 30-day-old ``apk add`` layer that Trivy will then flag.
 #
 # The old explicit ``libcrypto3>=3.5.7-r0`` / ``libssl3>=3.5.7-r0`` bounds
-# (CVE-2026-45447) are gone: the alpine 3.23 base already ships openssl
+# (CVE-2026-45447) are gone: the alpine 3.24 base already ships openssl
 # 3.5.7-r0, so they were redundant. ``apk upgrade`` above keeps them current.
 # ``APK_SNAPSHOT`` is what makes that upgrade actually run in CI. BuildKit
 # keys a layer on its RUN text, so a ``type=gha`` cache serves this whole
@@ -131,18 +131,30 @@ RUN chmod +x /usr/local/bin/spatium-dhcp-entrypoint \
  && chown spatium:spatium \
       /etc/kea/kea-dhcp4.conf /etc/kea/kea-dhcp6.conf
 
+ARG PYTHON_VERSION
 ENV CACHE_DIR=/var/lib/spatium-dhcp-agent \
     KEA_CONFIG_PATH=/etc/kea/kea-dhcp4.conf \
     KEA_CONTROL_SOCKET=/run/kea/kea4-ctrl-socket \
     KEA_LEASE_FILE=/var/lib/kea/kea-leases4.csv \
     KEA_CONFIG_PATH_V6=/etc/kea/kea-dhcp6.conf \
     KEA_CONTROL_SOCKET_V6=/run/kea/kea6-ctrl-socket \
-    PYTHONPATH=/usr/local/lib/python3.12/site-packages \
+    PYTHONPATH=/usr/local/lib/python${PYTHON_VERSION}/site-packages \
     LOG_LEVEL=INFO \
     RADVD_MANAGED=0 \
     RADVD_CONFIG_PATH=/etc/radvd/radvd.conf \
     RADVD_PIDFILE=/run/radvd/radvd.pid \
     RADVD_DEFAULT_IFACE=eth0
+
+# #1037 — prove PYTHONPATH matches THIS image's interpreter, at build time.
+# The agent is installed into /usr/local/lib/python<X.Y>/site-packages by the
+# build stage and is found only because PYTHONPATH names that exact directory.
+# When the Alpine base moves the bundled Python (3.23 shipped 3.12, 3.24 ships
+# 3.14) a stale PYTHONPATH yields an image that builds clean and then
+# CrashLoopBackOffs with ModuleNotFoundError — what #672 hit, and the reason
+# the base stayed pinned for a year. One import turns that into a build
+# failure, here, instead of a pod failure in the field.
+RUN python3 -c "import spatium_dhcp_agent"
+
 
 VOLUME ["/var/lib/spatium-dhcp-agent", "/var/lib/kea"]
 # DHCPv4 server

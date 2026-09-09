@@ -8,9 +8,10 @@
 # global default-export-policy is always "reject-route" and no
 # export-policy-list is ever populated, so the daemon can receive routes
 # from every configured peer but can never advertise one back.
+ARG PYTHON_VERSION=3.14
 ARG GOBGP_VERSION=4.9.0
 
-FROM alpine:3.23 AS agent-build
+FROM alpine:3.24 AS agent-build
 RUN apk add --no-cache python3 py3-pip py3-wheel
 WORKDIR /src
 COPY agent/looking-glass/pyproject.toml /src/pyproject.toml
@@ -86,7 +87,7 @@ RUN GOOS="${TARGETOS:-linux}" GOARCH="${TARGETARCH}" \
  && GOOS="${TARGETOS:-linux}" GOARCH="${TARGETARCH}" \
       go build -trimpath -ldflags="-s -w" -o /out/gobgp ./cmd/gobgp
 
-FROM alpine:3.23 AS runtime
+FROM alpine:3.24 AS runtime
 # ``libcap`` brings in ``setcap`` so gobgpd can bind BGP's privileged
 # TCP/179 as the unprivileged ``spatium`` user (same pattern as
 # kea-dhcp4/6 + named/pdns_server in the DHCP/DNS images — a
@@ -132,14 +133,26 @@ RUN chmod +x /usr/local/bin/spatium-lg-entrypoint \
       echo "gobgp=${GOBGP_VERSION}"; \
     } > /etc/spatiumddi-versions
 
+ARG PYTHON_VERSION
 ENV AGENT_STATE_DIR=/var/lib/spatium-lg-agent \
     GOBGPD_CONFIG_PATH=/etc/gobgp/gobgpd.json \
     GOBGPD_BIN=/usr/local/bin/gobgpd \
     GOBGP_BIN=/usr/local/bin/gobgp \
     GOBGP_GRPC_HOST=127.0.0.1 \
     GOBGP_GRPC_PORT=50051 \
-    PYTHONPATH=/usr/local/lib/python3.12/site-packages \
+    PYTHONPATH=/usr/local/lib/python${PYTHON_VERSION}/site-packages \
     LOG_LEVEL=INFO
+
+# #1037 — prove PYTHONPATH matches THIS image's interpreter, at build time.
+# The agent is installed into /usr/local/lib/python<X.Y>/site-packages by the
+# build stage and is found only because PYTHONPATH names that exact directory.
+# When the Alpine base moves the bundled Python (3.23 shipped 3.12, 3.24 ships
+# 3.14) a stale PYTHONPATH yields an image that builds clean and then
+# CrashLoopBackOffs with ModuleNotFoundError — what #672 hit, and the reason
+# the base stayed pinned for a year. One import turns that into a build
+# failure, here, instead of a pod failure in the field.
+RUN python3 -c "import spatium_lg_agent"
+
 
 VOLUME ["/var/lib/spatium-lg-agent"]
 # BGP (receive-only — see spatium_lg_agent/gobgp.py's module docstring)

@@ -2558,13 +2558,19 @@ make migrate                           # apply
 # Lint, typecheck, test
 make lint                              # ruff + black + mypy, eslint + prettier
 make ci                                # the lint/build/chart/perf jobs CI runs (backend-lint + frontend-lint + frontend-build
-                                       #   + charts-lint + perf-test + versions-check). Run before pushing.
+                                       #   + charts-lint + perf-test + versions-check + workflow-shell-check).
+                                       #   Run before pushing.
 make versions-check                    # Version-pin manifest (#975) — asserts every pin declared in the root versions.json
                                        #   still appears, at that version, in each file carrying a copy of it. Bumping a
                                        #   component is ONE edit (its `version` field) plus whatever this then reports.
                                        #   Covers what Dependabot cannot see: Helm's five copies, chart values.yaml,
                                        #   Dockerfile ARGs, action `with:` inputs, CI script defaults, the appliance bake
                                        #   arrays, and the version column of docs/THIRD_PARTY.md. Part of `make ci`.
+make workflow-shell-check              # Workflow shell-status guard (#1036) — refuses `$?` captured after a bare command
+                                       #   in a `run:` block. Actions supplies `bash -e` and `set -uo pipefail` does NOT
+                                       #   clear it, so `cmd; rc=$?` is dead code on exactly the failure it handles; that
+                                       #   silently disarmed the weekly CVE scan. Neither actionlint nor shellcheck flags
+                                       #   the shape. Part of `make ci`.
 make versions-upstream                 #   ...the other half: resolve each declared upstream and print a current-vs-latest
                                        #   table. Advisory + network-bound, so NOT part of `make ci`; the weekly
                                        #   trivy-scheduled workflow runs it and files the delta. `hold` entries in the

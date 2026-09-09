@@ -5,9 +5,9 @@
 # Phase A1 ships a near-empty supervisor — the box exists, builds
 # clean, and logs an idle heartbeat. Real work lands in Waves A2 → D.
 # See agent/supervisor/README.md.
-ARG PYTHON_VERSION=3.12
+ARG PYTHON_VERSION=3.14
 
-FROM alpine:3.23 AS build
+FROM alpine:3.24 AS build
 RUN apk add --no-cache python3 py3-pip py3-wheel
 WORKDIR /src
 COPY agent/supervisor/pyproject.toml /src/pyproject.toml
@@ -15,7 +15,7 @@ COPY agent/supervisor/spatium_supervisor /src/spatium_supervisor
 COPY agent/supervisor/README.md /src/README.md
 RUN python3 -m pip install --prefix=/install --no-cache-dir --break-system-packages .
 
-FROM alpine:3.23 AS runtime
+FROM alpine:3.24 AS runtime
 # Issue #183 Phase 7 — k3s-only appliance. ``docker-cli`` +
 # ``docker-cli-compose`` are gone; the supervisor's k3s lifecycle
 # module talks to the local kubeapi via stdlib http.client (no
@@ -91,9 +91,21 @@ COPY --from=build /install /usr/local
 COPY agent/supervisor/images/supervisor/entrypoint.sh /usr/local/bin/spatium-supervisor-entrypoint
 RUN chmod +x /usr/local/bin/spatium-supervisor-entrypoint
 
+ARG PYTHON_VERSION
 ENV STATE_DIR=/var/lib/spatium-supervisor \
-    PYTHONPATH=/usr/local/lib/python3.12/site-packages \
+    PYTHONPATH=/usr/local/lib/python${PYTHON_VERSION}/site-packages \
     LOG_LEVEL=INFO
+
+# #1037 — prove PYTHONPATH matches THIS image's interpreter, at build time.
+# The agent is installed into /usr/local/lib/python<X.Y>/site-packages by the
+# build stage and is found only because PYTHONPATH names that exact directory.
+# When the Alpine base moves the bundled Python (3.23 shipped 3.12, 3.24 ships
+# 3.14) a stale PYTHONPATH yields an image that builds clean and then
+# CrashLoopBackOffs with ModuleNotFoundError — what #672 hit, and the reason
+# the base stayed pinned for a year. One import turns that into a build
+# failure, here, instead of a pod failure in the field.
+RUN python3 -c "import spatium_supervisor"
+
 
 VOLUME ["/var/lib/spatium-supervisor"]
 

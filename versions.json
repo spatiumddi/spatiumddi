@@ -446,8 +446,34 @@
       "hold": "Same as jekyll-optional-front-matter: `github-pages` pins `= 0.6.1`. This plugin rewrites the .md links between docs pages, so a version skew here changes URLs in the preview that the published site would not produce -- the exact class of divergence the preview is supposed to rule out. 0.8.0 upstream."
     },
 
+    "agent-python": {
+      "version": "3.14",
+      "pinned_in": [
+        { "path": "agent/dns/images/bind9/Dockerfile", "match": "ARG PYTHON_VERSION={version}", "count": 1 },
+        { "path": "agent/dhcp/images/kea/Dockerfile", "match": "ARG PYTHON_VERSION={version}", "count": 1 },
+        { "path": "agent/dns/images/powerdns/Dockerfile", "match": "ARG PYTHON_VERSION={version}", "count": 1 },
+        { "path": "agent/looking-glass/images/gobgp/Dockerfile", "match": "ARG PYTHON_VERSION={version}", "count": 1 },
+        { "path": "agent/supervisor/images/supervisor/Dockerfile", "match": "ARG PYTHON_VERSION={version}", "count": 1 }
+      ],
+      "upstream": { "kind": "none" },
+      "note": "Not a choice -- it MUST equal the python3 that `alpine` above ships, because it is interpolated into PYTHONPATH and the agent lives at that exact path. Declared here so the pair is visibly coupled; the load-bearing check is the `RUN python3 -c \"import <agent>\"` in each image, which turns a mismatch into a build failure instead of the ModuleNotFoundError CrashLoopBackOff of #672. Until #1037 this arg was declared and referenced by NOTHING in four of the five images -- bumping it changed the image not at all, while the real pin sat hardcoded in PYTHONPATH."
+    },
+
+    "technitium-agent-python": {
+      "version": "3.12",
+      "pinned_in": [
+        {
+          "path": "agent/dns/images/technitium/Dockerfile",
+          "match": "ARG PYTHON_VERSION={version}",
+          "count": 1
+        }
+      ],
+      "upstream": { "kind": "none" },
+      "note": "Separate from `agent-python` above and NOT interchangeable with it: the technitium image is the one agent that is not Alpine-based. Its interpreter is whatever Ubuntu release the upstream technitium/dns-server image is built on, and this arg additionally selects the `python:<v>-slim-bookworm` builder that resolves the compiled cryptography wheel. Today both are 3.12 by coincidence; the coupling is enforced by the `RUN python3 -c \"import spatium_dns_agent, cryptography\"` in that Dockerfile, which fails the build if a TECHNITIUM_DIGEST bump moves the base onto a newer Ubuntu. Bump this only alongside that digest, never with `alpine`."
+    },
+
     "alpine": {
-      "version": "3.23",
+      "version": "3.24",
       "pinned_in": [
         { "path": "agent/dhcp/images/kea/Dockerfile", "match": "FROM alpine:{version}", "count": 2 },
         { "path": "agent/dns/images/bind9/Dockerfile", "match": "FROM alpine:{version}", "count": 2 },
@@ -466,8 +492,7 @@
         { "path": "docs/THIRD_PARTY.md", "match": "| {version} |", "count": 1 }
       ],
       "upstream": { "kind": "dockerhub", "repo": "library/alpine", "track": "^3\\.[0-9]+$" },
-      "hold": "Alpine 3.24 moves the bundled interpreter to Python 3.14.7 (NOT 3.13, as the dependabot.yml comment said until #975). The agent images install spatium_*_agent for 3.12, so on 3.24 the module lands off sys.path -> ModuleNotFoundError -> CrashLoopBackOff. The blocker is therefore a 3.12 -> 3.14 jump needing every agent's dependencies verified on 3.14, not the one-minor step the comment implied. Dependabot's ignore rule lets 3.23.x patches flow; this is the minor hold.",
-      "note": "3.24 also carries pdns 5.0.7, dnsdist 2.0.8 and bind 9.20.27 (Kea stays 3.0.3), so the bump moves four shipped daemons at once and wants its own change."
+      "note": "Bumped 3.23 -> 3.24 in #1037, which discharged the hold #975 corrected. It carried the agents Python 3.12 -> 3.14.7 (NOT 3.13, which the dependabot.yml comment claimed for a year) plus pdns 5.0.5 -> 5.0.7, dnsdist -> 2.0.8 and bind -> 9.20.27; Kea stays 3.0.3. The Python move is the sharp part: the agent is installed into /usr/local/lib/python<X.Y>/site-packages and found only via PYTHONPATH, so a base bump without a matching PYTHONPATH builds a clean image that CrashLoopBackOffs with ModuleNotFoundError (#672). PYTHONPATH now interpolates the PYTHON_VERSION arg -- which was declared and referenced by NOTHING in four of these images until #1037 -- and each image asserts `import <agent>` at build time, so a mismatch is a failed build rather than a failed pod. Dependabot still ignores Alpine minors: the next move is a deliberate task for the same reason, not a bot bump."
     }
   },
 

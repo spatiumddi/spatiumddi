@@ -1,4 +1,4 @@
-.PHONY: charts-lint perf-test versions-check versions-upstream help up down dev build build-supervisor migrate lint test lint-backend lint-frontend test-backend test-cov test-durations \
+.PHONY: charts-lint perf-test versions-check versions-upstream workflow-shell-check help up down dev build build-supervisor migrate lint test lint-backend lint-frontend test-backend test-cov test-durations \
         openapi \
         lint-untyped-routes \
         lint-untyped-routes-baseline \
@@ -83,6 +83,7 @@ help:
 	@echo "  make docs-verify Check every docs SVG diagram for overflow / clipping"
 	@echo "  make versions-check     Assert every pin matches versions.json (part of make ci)"
 	@echo "  make versions-upstream  Current-vs-latest table for every pinned component"
+	@echo "  make workflow-shell-check  Refuse \$$? captured after a bare command under set -e"
 	@echo "  make appliance      Build the OS-appliance qcow2 (Phase 1 — Debian 13 amd64)"
 	@echo "  make appliance-iso  Wrap the Phase 1 raw image as a hybrid USB/CD ISO (Phase 2)"
 	@echo ""
@@ -412,7 +413,7 @@ lint-untyped-routes-baseline: $(UNTYPED_LIST)
 
 FORCE:
 
-ci: ci-backend-lint ci-frontend-lint ci-frontend-build charts-lint perf-test versions-check
+ci: ci-backend-lint ci-frontend-lint ci-frontend-build charts-lint perf-test versions-check workflow-shell-check
 	@echo ""
 	@echo "✓ All CI checks passed — safe to push."
 
@@ -463,6 +464,14 @@ versions-check:
 
 versions-upstream:
 	@python3 scripts/lint_versions.py --check-upstream
+
+# Workflow shell-status guard (#1036). GitHub Actions runs every `run:` block
+# under `bash -e`, which `set -uo pipefail` does NOT clear — so `cmd; rc=$$?`
+# is dead code on exactly the failure it was written to handle. Neither
+# actionlint nor shellcheck reports it. Same check CI's Backend Lint job runs.
+workflow-shell-check:
+	@echo "→ Workflow shell-status linter (matches .github/workflows/ci.yml)"
+	@python3 scripts/lint_workflow_shell.py
 
 # Perf — Tests (#968): hermetic, stdlib-only tests under perf/.
 perf-test:
