@@ -285,7 +285,7 @@
         { "path": "docs/THIRD_PARTY.md", "match": "| {version} |", "count": 1 }
       ],
       "upstream": { "kind": "dockerhub", "repo": "library/redis", "track": "^8\\.[0-9]+\\.[0-9]+-alpine$" },
-      "note": "Fifteen copies across compose, CI service containers, two charts, a k8s overlay, the appliance bake array and four docs pages. The prose occurrences are asserted too, not just the image refs: a comment naming the old version is this repo's most-reported review finding, and here it would tell the next reader the chart and compose disagree when they do not. Redis 8+ is RSALv2 / SSPLv1 / AGPLv3 -- a MAJOR bump is a licence decision, not a version bump."
+      "note": "The most-copied component here: both compose files, the CI test-shard service container, two charts (values, template comment and Chart.yaml), the Sentinel overlay's three containers, the appliance bake array and four docs pages. Deliberately not stated as a number -- a count in prose goes stale the next time a copy is added, and the pinned_in list below is the count. The prose occurrences are asserted too, not just the image refs: a comment naming the old version is this repo's most-reported review finding, and here it would tell the next reader the chart and compose disagree when they do not. Redis 8+ is RSALv2 / SSPLv1 / AGPLv3 -- a MAJOR bump is a licence decision, not a version bump."
     },
 
     "postgres": {
@@ -306,7 +306,7 @@
         { "path": "docs/THIRD_PARTY.md", "match": "| {version} |", "count": 1 }
       ],
       "upstream": { "kind": "dockerhub", "repo": "library/postgres", "track": "^1[0-9]-alpine$" },
-      "hold": "Thirteen copies, so the #208 migration has to move all of them. PostgreSQL 16 is supported until Nov 2028. Moving to 18 is a data migration, not a tag bump, and has its own issue (#208). Dependabot defers the major; this records why."
+      "hold": "Copied about as widely as redis, so the #208 migration has to move every entry in pinned_in below -- that list is the worklist, and is why it is enumerated rather than summarised. PostgreSQL 16 is supported until Nov 2028. Moving to 18 is a data migration, not a tag bump, and has its own issue (#208). Dependabot defers the major; this records why."
     },
 
     "kube-state-metrics": {

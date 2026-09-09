@@ -375,9 +375,9 @@ the formatter handles the rest.
   two different versions because only one of its copies was
   Dependabot-visible: the appliance chart's nginx had fallen a
   minor behind the frontend image's, with nothing connecting
-  them. Root `versions.json` now declares all 27, and
+  them. Root `versions.json` now declares all 28, and
   `scripts/lint_versions.py` asserts each still appears in each
-  file that carries it — 86 assertions, run in CI's
+  file that carries it — 89 assertions, run in CI's
   unconditional Backend Lint job and by `make ci`.
   **Bumping is one edit**, because every site's expected string
   is a template over the component's `version` field.
@@ -441,8 +441,8 @@ the formatter handles the rest.
   `jekyll` 4.3.4 → 4.4.1; `haproxy:2.9-alpine`, a short-lived
   non-LTS branch with no release since March 2025, → 3.4. Behind
   upstream: Helm v3.20.2 → v3.21.4 across all five copies,
-  `redis` 8.8 → 8.10.1 across fifteen, the appliance chart's
-  nginx 1.30.3 → 1.31.5, kube-state-metrics v2.18.0 → v2.20.0,
+  `redis` 8.8 → 8.10.1 across every one of them, the appliance
+  chart's nginx 1.30.3 → 1.31.5, kube-state-metrics → v2.20.0,
   node-exporter v1.11.1 → v1.12.1, GoBGP 4.7.0 → 4.9.0
   (`make trivy IMAGE=looking-glass` clean), and the Patroni
   overlay's etcd v3.5.30 → v3.5.33 on all three services. Every
