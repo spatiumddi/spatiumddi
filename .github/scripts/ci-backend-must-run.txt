@@ -46,6 +46,14 @@ scripts/export_openapi.py
 # rather than published as the file the next release balances the shards with.
 scripts/merge_test_durations.py
 
+# test_lint_versions.py (#975) loads the version-pin manifest guard and pins
+# its negative cases — a renamed pinned_in path erroring rather than skipping,
+# and an exact occurrence count catching a partial bump. scripts/ is not
+# denied, so the gate would run the suite anyway; the entry exists because the
+# scan test above requires every declared read to be covered here, and a
+# future widening of the deny-list must not silently drop this one.
+scripts/lint_versions.py
+
 # test_zone_name_scope.py (#986) loads the release-prep TLD regenerator and
 # pins that it uses the PRODUCT's payload guard rather than a second copy —
 # so a PR that gives the script its own parser has to run the test that says

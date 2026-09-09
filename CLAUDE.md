@@ -37,7 +37,8 @@ Always read the relevant spec doc(s) before writing code for a feature area.
 | `docs/DEVELOPMENT.md` | Coding standards, test requirements, CI pipeline |
 | `docs/OBSERVABILITY.md` | Logging (centralized + UI viewer), metrics, health dashboard, alerting |
 | `docs/TROUBLESHOOTING.md` | Recovery recipes: accidentally deleted agent rows, password reset, subnet delete refused |
-| `docs/THIRD_PARTY.md` | Catalogue of every bundled/shipped third-party component — engine, library, OS package — with license, the artifact it ships in, and the rationale. Operator-facing companion to the root `NOTICE` (which stays authoritative for license text). **When you add a shipped component, update BOTH** |
+| `docs/THIRD_PARTY.md` | Catalogue of every bundled/shipped third-party component — engine, library, OS package — with license, the artifact it ships in, and the rationale. Operator-facing companion to the root `NOTICE` (which stays authoritative for license text). **When you add a shipped component, update BOTH** — and if you add a version pin, `versions.json` too (see below) |
+| `versions.json` | Root manifest of every version pin **neither Dependabot nor a lockfile owns** — Helm, chart `values.yaml`, Dockerfile `ARG`s, action `with:` inputs, CI script defaults, the appliance bake arrays. One entry per component: the canonical `version`, every file carrying a copy (with an exact occurrence count where the copies must be exhaustive), the `upstream` to check it against, and — for pins deliberately behind — a `hold` field carrying the reason. `scripts/lint_versions.py` fails CI when a file and the manifest disagree, so a bump is one edit plus whatever the lint reports ([#975](https://github.com/spatiumddi/spatiumddi/issues/975)) |
 | `docs/PRIVACY.md` | The privacy statement — no telemetry, no analytics, no phone-home — plus the **normative table of every outbound connection** the backend can make, its default, and what it sends. `backend/tests/test_outbound_hosts_documented.py` fails CI when a hostname literal in `backend/app` is absent from it. **When you add an outbound call, update this page in the same PR** (see non-negotiable #17) |
 | `docs/features/IPAM.md` | IP Space/Block/Subnet/Address management, VLAN/VXLAN, custom fields, import/export, tree UI |
 | `docs/features/DHCP.md` | DHCP servers, scopes, pools, static assignments, DDNS, caching, Windows DHCP (Path A) |
@@ -2557,7 +2558,17 @@ make migrate                           # apply
 # Lint, typecheck, test
 make lint                              # ruff + black + mypy, eslint + prettier
 make ci                                # the lint/build/chart/perf jobs CI runs (backend-lint + frontend-lint + frontend-build
-                                       #   + charts-lint + perf-test). Run before pushing.
+                                       #   + charts-lint + perf-test + versions-check). Run before pushing.
+make versions-check                    # Version-pin manifest (#975) — asserts every pin declared in the root versions.json
+                                       #   still appears, at that version, in each file carrying a copy of it. Bumping a
+                                       #   component is ONE edit (its `version` field) plus whatever this then reports.
+                                       #   Covers what Dependabot cannot see: Helm's five copies, chart values.yaml,
+                                       #   Dockerfile ARGs, action `with:` inputs, CI script defaults, the appliance bake
+                                       #   arrays, and the version column of docs/THIRD_PARTY.md. Part of `make ci`.
+make versions-upstream                 #   ...the other half: resolve each declared upstream and print a current-vs-latest
+                                       #   table. Advisory + network-bound, so NOT part of `make ci`; the weekly
+                                       #   trivy-scheduled workflow runs it and files the delta. `hold` entries in the
+                                       #   manifest carry the reason a pin is behind on purpose, and report separately.
 make trivy                             # container-image CVE scan — run before pushing ANY agent Dockerfile change.
 make openapi VERSION=2026.08.22-1      # export the OpenAPI contract the release attaches (#903). Byte-identical
                                        #   to the release asset at the same tag; runs --network none, so it also proves

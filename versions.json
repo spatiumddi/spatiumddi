@@ -1,0 +1,494 @@
+{
+  "$comment": [
+    "Every version pin in this repository that neither Dependabot nor a lockfile owns.",
+    "",
+    "WHY THIS FILE EXISTS (#975). Dependabot covers four ecosystems here:",
+    "github-actions, docker `FROM` lines in the directories listed in",
+    ".github/dependabot.yml, pip and npm. Everything else is invisible to it --",
+    "it has no Helm ecosystem, does not read `ARG` values, chart values.yaml,",
+    "action `with:` inputs, CI shell scripts or the appliance bake arrays. Those",
+    "pins were scattered across nine file types, several behind upstream, two",
+    "past end-of-life, and one component sat on two different versions because",
+    "only one of its copies was Dependabot-visible.",
+    "",
+    "HOW IT IS ENFORCED. scripts/lint_versions.py runs in CI's unconditional",
+    "Backend Lint job and asserts that every `match` below still appears in its",
+    "file the expected number of times. Bumping a component is ONE edit -- the",
+    "`version` field -- because every `match` is a template over it.",
+    "",
+    "WHY LITERALS STAY IN THE FILES rather than being read from here at build",
+    "time. A build-time read that silently yields an empty string is the exact",
+    "failure class this repo has been bitten by repeatedly (#1028, #1029, #1030):",
+    "a guard that evaluates nothing looks identical to one that passed. An",
+    "action input resolving to '' falls back to the action's own default (for",
+    "azure/setup-helm, `latest`) with no error anywhere. The lint gives the same",
+    "single-source guarantee with no new build-time failure mode, so the literal",
+    "stays and the lint keeps it honest.",
+    "",
+    "WHAT IS DELIBERATELY NOT HERE. Anything a lockfile or Dependabot already",
+    "owns -- pyproject / package-lock dependencies, `uses:` action refs, and",
+    "`FROM` lines Dependabot actually bumps. Listing those twice would create",
+    "the drift this file exists to remove.",
+    "",
+    "THE ONE EXCEPTION, and it is deliberate: where a Dependabot-visible `FROM`",
+    "shares a component with a copy Dependabot cannot see, the `FROM` IS listed",
+    "(see `nginx`). That is what turns a Dependabot bump into a failing lint",
+    "that forces the other copies to move with it, instead of letting them",
+    "silently fall a minor behind -- which is exactly what happened to the",
+    "appliance chart's nginx while the frontend image moved on without it.",
+    "",
+    "SCHEMA. Each entry under `components`:",
+    "  version     canonical version string; the single thing you edit to bump.",
+    "  digest      optional, for a component pinned by tag AND digest. A digest",
+    "              does not derive from a version, so it is asserted as a",
+    "              literal offline and --check-upstream resolves the tag to",
+    "              prove the PAIR still agrees. Without that second half,",
+    "              bumping `version` alone passes every assertion and still",
+    "              builds the old image.",
+    "  pinned_in   [{path, match, count?}]. `match` is a template over",
+    "              {version} and {version_no_v} (the same string with a leading",
+    "              'v' stripped). `count` is the EXACT number of occurrences",
+    "              required; omit it to require at least one. Use an exact count",
+    "              where the copies must be exhaustive (three etcd services, three",
+    "              redis containers) -- without it, bumping two of three passes.",
+    "  upstream    how --check-upstream resolves the current release. `kind`:",
+    "              github-release | dockerhub | quay | rubygems | none.",
+    "  hold        present when the pin is deliberately BEHIND upstream. The",
+    "              string is the reason; --check-upstream reports these",
+    "              separately so a known hold never reads as neglect.",
+    "  note        anything the next person needs before touching it.",
+    "",
+    "Unknown keys are REFUSED at every level, not ignored. A typo here is a",
+    "guard that silently stops guarding: `\"counts\": 3` leaves `count` unset,",
+    "downgrading an exact assertion to \"at least one\", and a bump that moved",
+    "two of three copies then passes.",
+    "",
+    "`holds` at the bottom records decisions that have no literal for a lint to",
+    "hold honest -- their pins live in Dependabot ignore rules or in a distro",
+    "codename that never changes. The reason is the deliverable there."
+  ],
+
+  "components": {
+    "k3s": {
+      "version": "v1.36.4+k3s1",
+      "pinned_in": [
+        { "path": "Makefile", "match": "K3S_VERSION ?= {version}", "count": 1 },
+        { "path": "appliance/scripts/fetch-k3s.sh", "match": "K3S_VERSION:-{version}", "count": 1 },
+        { "path": "docs/THIRD_PARTY.md", "match": "| {version} |", "count": 1 }
+      ],
+      "upstream": { "kind": "github-release", "repo": "k3s-io/k3s" },
+      "note": "Bump only alongside a slot-image cut. A Kubernetes minor is NOT slot-revertible: the k3s data dir lives on persistent /var, not in the A/B slot, so reverting the slot starts the old apiserver against a store the new one has written (#974). Moving this also moves kind-node and kubeconform-k8s-target below."
+    },
+
+    "kind-node": {
+      "version": "v1.36.4",
+      "pinned_in": [
+        {
+          "path": ".github/workflows/agent-e2e.yml",
+          "match": "kindest/node:{version}@sha256:",
+          "count": 1
+        }
+      ],
+      "upstream": { "kind": "none" },
+      "note": "Lock-stepped to k3s's Kubernetes minor, not chosen independently -- the e2e exists to prove the chart on the Kubernetes the appliance actually runs. Digest-pinned because kindest/node tags are re-pushed. Bump with k3s, and take the digest kind publishes for the tag."
+    },
+
+    "helm": {
+      "version": "v3.21.4",
+      "pinned_in": [
+        { "path": "Makefile", "match": "alpine/helm:{version_no_v}", "count": 1 },
+        { "path": ".github/workflows/ci.yml", "match": "version: {version}", "count": 1 },
+        { "path": ".github/workflows/release.yml", "match": "version: {version}", "count": 1 },
+        { "path": ".github/workflows/build-appliance.yml", "match": "version: {version}", "count": 1 },
+        { "path": ".github/workflows/agent-e2e.yml", "match": "version: {version}", "count": 1 }
+      ],
+      "upstream": { "kind": "github-release", "repo": "helm/helm", "track": "^v3\\." },
+      "note": "Build-time tool only -- nothing ships it. Stay on the 3.x track deliberately: the appliance renders charts through k3s's BUNDLED helm-controller, which is independent of this binary, so a Helm 4 move here buys nothing and risks the chart-rendering CLI diverging from what the appliance uses. Five copies, none of them Dependabot-visible; this component is the reason the manifest exists."
+    },
+
+    "kubeconform": {
+      "version": "v0.8.0",
+      "pinned_in": [
+        {
+          "path": ".github/scripts/install-kubeconform.sh",
+          "match": "KUBECONFORM_VERSION:-{version}",
+          "count": 1
+        },
+        { "path": ".github/workflows/ci.yml", "match": "kubeconform-schemas-{version}-", "count": 1 }
+      ],
+      "upstream": { "kind": "github-release", "repo": "yannh/kubeconform" },
+      "note": "The ci.yml occurrence is the schema cache key, which embeds both this version and kubeconform-k8s-target. Bumping either without the key is a stale-cache bug, so both are asserted against it."
+    },
+
+    "kubeconform-k8s-target": {
+      "version": "1.36.0",
+      "pinned_in": [
+        {
+          "path": ".github/scripts/charts-render-check.sh",
+          "match": "K8S_VERSION:-{version}",
+          "count": 1
+        },
+        { "path": ".github/workflows/ci.yml", "match": "-k8s-{version}-", "count": 1 }
+      ],
+      "upstream": { "kind": "none" },
+      "note": "The Kubernetes API version `make charts-lint` validates against. Lock-stepped to k3s above -- validating against a Kubernetes the appliance does not run is how a chart that renders in CI fails on the box (#974)."
+    },
+
+    "metallb": {
+      "version": "v0.15.3",
+      "pinned_in": [
+        {
+          "path": "charts/spatiumddi-metallb/Chart.yaml",
+          "match": "version: {version_no_v}",
+          "count": 1
+        },
+        { "path": "charts/spatiumddi-metallb/values.yaml", "match": "tag: {version}", "count": 2 },
+        {
+          "path": "appliance/scripts/bake-images.sh",
+          "match": "quay.io/metallb/controller:{version}",
+          "count": 1
+        },
+        {
+          "path": "appliance/scripts/bake-images.sh",
+          "match": "quay.io/metallb/speaker:{version}",
+          "count": 1
+        },
+        { "path": "docs/THIRD_PARTY.md", "match": "chart + images {version_no_v}", "count": 1 }
+      ],
+      "upstream": { "kind": "github-release", "repo": "metallb/metallb" },
+      "hold": "v0.16.x regressed the speaker's ServiceL2Status reconciler into an apiserver-flooding create-fail/not-found loop -- metallb/metallb#3063, still OPEN as of 2026-09-08. An image-only pin on the 0.16 chart does not work either: its speaker probe hits /healthz:17472, which 0.15.3 does not serve, so the pod crashloops. The chart is therefore pinned end-to-end. Re-check #3063 before bumping.",
+      "note": "frr-k8s, frr and kube-rbac-proxy below are this chart's vendored sub-pins, not independent choices -- they move when this moves, and the baked image refs must equal what the pod spec pulls or an air-gapped appliance gets ImagePullBackOff."
+    },
+
+    "frr-k8s": {
+      "version": "v0.0.21",
+      "pinned_in": [
+        { "path": "charts/spatiumddi-metallb/values.yaml", "match": "tag: {version}", "count": 1 },
+        {
+          "path": "appliance/scripts/bake-images.sh",
+          "match": "quay.io/metallb/frr-k8s:{version}",
+          "count": 1
+        }
+      ],
+      "upstream": { "kind": "github-release", "repo": "metallb/frr-k8s" },
+      "hold": "MetalLB sub-pin -- the default inside the vendored metallb-0.15.3 chart. Moves with metallb, which is held."
+    },
+
+    "frr": {
+      "version": "10.4.1",
+      "pinned_in": [
+        { "path": "charts/spatiumddi-metallb/values.yaml", "match": "tag: {version}", "count": 1 },
+        {
+          "path": "appliance/scripts/bake-images.sh",
+          "match": "quay.io/frrouting/frr:{version}",
+          "count": 1
+        }
+      ],
+      "upstream": { "kind": "github-release", "repo": "FRRouting/frr" },
+      "hold": "MetalLB sub-pin -- the frr-k8s 0.0.21 default. Moves with metallb, which is held. GPL-2.0, and only pulled when BGP mode is enabled (default off); flagged distinctly in NOTICE."
+    },
+
+    "kube-rbac-proxy": {
+      "version": "v0.12.0",
+      "pinned_in": [
+        { "path": "charts/spatiumddi-metallb/values.yaml", "match": "tag: {version}", "count": 1 },
+        {
+          "path": "appliance/scripts/bake-images.sh",
+          "match": "quay.io/brancz/kube-rbac-proxy:{version}",
+          "count": 1
+        }
+      ],
+      "upstream": { "kind": "github-release", "repo": "brancz/kube-rbac-proxy" },
+      "hold": "MetalLB sub-pin -- the vendored frr-k8s chart's default, inherited rather than chosen. Moves with metallb, which is held. Only reachable on the default-off BGP path. #575 moved it off the sunset gcr.io/kubebuilder mirror; the chart override and the bake entry must stay byte-identical or the baked image is not the one the pod pulls."
+    },
+
+    "cloudnative-pg-chart": {
+      "version": "0.29.0",
+      "pinned_in": [
+        {
+          "path": "charts/spatiumddi-appliance/Chart.yaml",
+          "match": "version: {version}",
+          "count": 1
+        },
+        { "path": "docs/THIRD_PARTY.md", "match": "chart {version} (operator", "count": 1 }
+      ],
+      "upstream": { "kind": "github-release", "repo": "cloudnative-pg/charts", "track": "^cloudnative-pg-v" },
+      "note": "Carries the operator version below; the two must move together. Run `helm dependency update` on a bump."
+    },
+
+    "cloudnative-pg-operator": {
+      "version": "1.30.0",
+      "pinned_in": [
+        {
+          "path": "appliance/scripts/bake-images.sh",
+          "match": "cloudnative-pg:{version}",
+          "count": 1
+        },
+        { "path": "docs/THIRD_PARTY.md", "match": "(operator {version})", "count": 1 }
+      ],
+      "upstream": { "kind": "github-release", "repo": "cloudnative-pg/cloudnative-pg" },
+      "note": "Set by cloudnative-pg-chart above -- this entry pins the image the appliance bakes, which must equal the operator that chart deploys or an air-gapped install cannot start Postgres. Watch the CNPG support matrix: 1.29.x reached EOL 2026-09-29."
+    },
+
+    "cloudnative-pg-postgresql": {
+      "version": "16",
+      "pinned_in": [
+        {
+          "path": "appliance/scripts/bake-images.sh",
+          "match": "ghcr.io/cloudnative-pg/postgresql:{version}",
+          "count": 1
+        },
+        {
+          "path": "charts/spatiumddi/values.yaml",
+          "match": "ghcr.io/cloudnative-pg/postgresql:{version}",
+          "count": 1
+        }
+      ],
+      "upstream": { "kind": "none" },
+      "hold": "The PostgreSQL major CNPG runs, so it moves with `postgres` above and with #208, not on its own. Bumping it alone would put the appliance's CNPG cluster on a different major from every other deployment shape.",
+      "note": "The one bake-array/chart-values pair the first pass of this manifest missed, and the pair where a divergence is worst: the appliance imports baked images into containerd and never pulls, so a chart naming a tag the bake did not save is ImagePullBackOff on an AIR-GAPPED box -- no error until the cluster is already offline and no network to recover over. `cnpg.imageName` in the umbrella chart and the CNPG_IMAGES entry must stay byte-identical."
+    },
+
+    "nginx": {
+      "version": "1.31.5-alpine",
+      "pinned_in": [
+        { "path": "frontend/Dockerfile", "match": "FROM nginx:{version}", "count": 1 },
+        { "path": "charts/spatiumddi-appliance/values.yaml", "match": "tag: {version}", "count": 1 },
+        {
+          "path": "charts/spatiumddi-appliance/templates/agent-landing.yaml",
+          "match": "``nginx:{version}``",
+          "count": 1
+        },
+        { "path": "appliance/scripts/bake-images.sh", "match": "\"nginx:{version}\"", "count": 1 }
+      ],
+      "upstream": { "kind": "dockerhub", "repo": "library/nginx", "track": "^1\\.[0-9]+\\.[0-9]+-alpine$" },
+      "note": "The frontend `FROM` IS Dependabot-visible and is listed anyway -- that is the deliberate exception in the header. It is the reason this entry exists: Dependabot moved the frontend image to 1.31 on 2026-07-20 (#688) and the appliance chart's agent-landing copy sat on 1.30.3 for the seven weeks until #975, because nothing connected them. Listing both means the next Dependabot bump fails this lint until the chart and the bake array move too."
+    },
+
+    "redis": {
+      "version": "8.10.1-alpine",
+      "pinned_in": [
+        { "path": "docker-compose.yml", "match": "image: redis:{version}", "count": 1 },
+        { "path": "docker-compose.dev.yml", "match": "image: redis:{version}", "count": 1 },
+        { "path": ".github/workflows/ci.yml", "match": "image: redis:{version}", "count": 1 },
+        { "path": "charts/spatiumddi/templates/redis.yaml", "match": "redis:{version}", "count": 1 },
+        { "path": "appliance/README.md", "match": "redis:{version}", "count": 1 },
+        { "path": "docs/deployment/APPLIANCE.md", "match": "redis:{version}", "count": 1 },
+        { "path": "docs/deployment/KUBERNETES.md", "match": "redis:{version}", "count": 1 },
+        { "path": "docs/DEVELOPMENT.md", "match": "redis:{version}", "count": 1 },
+        { "path": "docs/THIRD_PARTY.md", "match": "redis:{version}", "count": 1 },
+        { "path": "charts/spatiumddi/values.yaml", "match": "tag: \"{version}\"", "count": 1 },
+        { "path": "charts/spatiumddi/values.yaml", "match": "redis:{version}", "count": 2 },
+        { "path": "charts/spatiumddi/Chart.yaml", "match": "``redis:{version}``", "count": 1 },
+        { "path": "k8s/ha/redis-sentinel.yaml", "match": "image: redis:{version}", "count": 3 },
+        { "path": "appliance/scripts/bake-images.sh", "match": "\"redis:{version}\"", "count": 1 },
+        { "path": "docs/THIRD_PARTY.md", "match": "| {version} |", "count": 1 }
+      ],
+      "upstream": { "kind": "dockerhub", "repo": "library/redis", "track": "^8\\.[0-9]+\\.[0-9]+-alpine$" },
+      "note": "The most-copied component here: both compose files, the CI test-shard service container, two charts (values, template comment and Chart.yaml), the Sentinel overlay's three containers, the appliance bake array and four docs pages. Deliberately not stated as a number -- a count in prose goes stale the next time a copy is added, and the pinned_in list below is the count. The prose occurrences are asserted too, not just the image refs: a comment naming the old version is this repo's most-reported review finding, and here it would tell the next reader the chart and compose disagree when they do not. Redis 8+ is RSALv2 / SSPLv1 / AGPLv3 -- a MAJOR bump is a licence decision, not a version bump."
+    },
+
+    "postgres": {
+      "version": "16-alpine",
+      "pinned_in": [
+        { "path": "docker-compose.yml", "match": "image: postgres:{version}", "count": 1 },
+        { "path": "docker-compose.dev.yml", "match": "image: postgres:{version}", "count": 1 },
+        { "path": ".github/workflows/ci.yml", "match": "image: postgres:{version}", "count": 1 },
+        { "path": "charts/spatiumddi/values.yaml", "match": "tag: \"{version}\"", "count": 1 },
+        { "path": "charts/spatiumddi/values.yaml", "match": "postgres:{version}", "count": 2 },
+        { "path": "charts/spatiumddi/templates/postgres.yaml", "match": "postgres:{version}", "count": 1 },
+        { "path": "charts/spatiumddi/Chart.yaml", "match": "postgres:{version}", "count": 1 },
+        { "path": "k8s/ha/postgres-docker-compose.yaml", "match": "FROM postgres:{version}", "count": 1 },
+        { "path": "k8s/README.md", "match": "postgres:{version}", "count": 1 },
+        { "path": "docs/deployment/APPLIANCE.md", "match": "postgres:{version}", "count": 1 },
+        { "path": "docs/deployment/KUBERNETES.md", "match": "postgres:{version}", "count": 1 },
+        { "path": "docs/DEVELOPMENT.md", "match": "postgres:{version}", "count": 1 },
+        { "path": "docs/THIRD_PARTY.md", "match": "| {version} |", "count": 1 }
+      ],
+      "upstream": { "kind": "dockerhub", "repo": "library/postgres", "track": "^1[0-9]-alpine$" },
+      "hold": "Copied about as widely as redis, so the #208 migration has to move every entry in pinned_in below -- that list is the worklist, and is why it is enumerated rather than summarised. PostgreSQL 16 is supported until Nov 2028. Moving to 18 is a data migration, not a tag bump, and has its own issue (#208). Dependabot defers the major; this records why."
+    },
+
+    "kube-state-metrics": {
+      "version": "v2.20.0",
+      "pinned_in": [
+        { "path": "charts/spatiumddi-appliance/values.yaml", "match": "tag: {version}", "count": 1 },
+        {
+          "path": "appliance/scripts/bake-images.sh",
+          "match": "kube-state-metrics:{version}",
+          "count": 1
+        },
+        { "path": "docs/THIRD_PARTY.md", "match": "| {version}, **default off**", "count": 1 }
+      ],
+      "upstream": { "kind": "github-release", "repo": "kubernetes/kube-state-metrics" },
+      "note": "Default off. Baked regardless, so an operator can enable it on an air-gapped appliance without a pull."
+    },
+
+    "node-exporter": {
+      "version": "v1.12.1",
+      "pinned_in": [
+        { "path": "charts/spatiumddi-appliance/values.yaml", "match": "tag: {version}", "count": 1 },
+        {
+          "path": "appliance/scripts/bake-images.sh",
+          "match": "node-exporter:{version}",
+          "count": 1
+        },
+        { "path": "docs/THIRD_PARTY.md", "match": "| {version}, **default off**", "count": 1 }
+      ],
+      "upstream": { "kind": "github-release", "repo": "prometheus/node_exporter" },
+      "note": "Default off, like kube-state-metrics. The upstream repo is `node_exporter` with an underscore; the image is `node-exporter` with a hyphen."
+    },
+
+    "gobgp": {
+      "version": "4.9.0",
+      "pinned_in": [
+        {
+          "path": "agent/looking-glass/images/gobgp/Dockerfile",
+          "match": "ARG GOBGP_VERSION={version}",
+          "count": 1
+        },
+        { "path": "docs/THIRD_PARTY.md", "match": "| {version} (built from source)", "count": 1 }
+      ],
+      "upstream": { "kind": "github-release", "repo": "osrg/gobgp" },
+      "note": "Built from source in the image, so Dependabot's `FROM` coverage never sees it. Run `make trivy IMAGE=gobgp` on a bump -- the golang builder is a security pin (Go static-links its stdlib, so no apk upgrade can fix a stdlib CVE)."
+    },
+
+    "technitium": {
+      "version": "15.4.0",
+      "digest": "sha256:df7d90ef0f7b6fff6916d291a7022cd902290cc31c3141d4158b6c375a641b41",
+      "pinned_in": [
+        {
+          "path": "agent/dns/images/technitium/Dockerfile",
+          "match": "TECHNITIUM_VERSION={version}"
+        },
+        { "path": "docs/THIRD_PARTY.md", "match": "| {version} (digest-pinned)", "count": 1 }
+      ],
+      "upstream": { "kind": "dockerhub", "repo": "technitium/dns-server" },
+      "note": "The ONLY component here pinned by tag AND digest, and the two must move together: the Dockerfile pulls `technitium/dns-server:${TECHNITIUM_VERSION}@${TECHNITIUM_DIGEST}`, so bumping the tag alone builds the OLD image while every literal assertion still passes. The offline lint cannot catch that -- a digest does not derive from a version -- so `--check-upstream` resolves the tag on Docker Hub and reports a mismatch. Currently latest; listed so the next sweep is a lookup rather than a hunt."
+    },
+
+    "haproxy": {
+      "version": "3.4-alpine",
+      "pinned_in": [
+        {
+          "path": "k8s/ha/postgres-docker-compose.yaml",
+          "match": "image: haproxy:{version}",
+          "count": 1
+        },
+        { "path": "docs/THIRD_PARTY.md", "match": "| {version} |", "count": 1 }
+      ],
+      "upstream": { "kind": "dockerhub", "repo": "library/haproxy", "track": "^3\\.[0-9]+-alpine$" },
+      "note": "Stay on an LTS branch: this proxies every Patroni connection and nothing else in the repo watches it. 3.4 IS the current LTS -- `haproxy:lts-alpine` and `haproxy:3.4-alpine` resolve to the same digest, verified 2026-09-08. The previous pin (2.9) was a short-lived NON-LTS branch whose last release was March 2025, so it had gone 18 months with no security fixes at all."
+    },
+
+    "etcd-patroni": {
+      "version": "v3.5.33",
+      "pinned_in": [
+        {
+          "path": "k8s/ha/postgres-docker-compose.yaml",
+          "match": "image: quay.io/coreos/etcd:{version}",
+          "count": 3
+        }
+      ],
+      "upstream": { "kind": "quay", "repo": "coreos/etcd", "track": "^v3\\.5\\.[0-9]+$" },
+      "note": "The Patroni DCS in the bare-metal HA overlay -- NOT the etcd embedded in k3s, which the k3s bundle owns. Three services share it, hence the exact count: bumping two of three leaves a mixed-version DCS. Stay on 3.5 until 3.6 is verified with this Patroni version."
+    },
+
+    "patroni-image": {
+      "version": "latest",
+      "pinned_in": [
+        {
+          "path": "k8s/ha/postgres-docker-compose.yaml",
+          "match": "image: patroni-spatiumddi:{version}",
+          "count": 3
+        }
+      ],
+      "upstream": { "kind": "none" },
+      "note": "NOT a pin, and recorded here so it stops looking like one. The overlay BUILDS this image itself -- the sibling `build.dockerfile_inline` layers Patroni onto postgres:16-alpine via pip -- so `latest` names a purely local artifact that exists in no registry. Giving it a version number here would imply SpatiumDDI publishes one. The real unpinned thing in that block is `pip install patroni[etcd3]`, which resolves at build time, so two hosts built on different days get different Patroni versions; documented in docs/deployment/BAREMETAL.md rather than pinned, because the overlay is a reference template an operator is expected to adapt."
+    },
+
+    "ruby-docs-preview": {
+      "version": "3.4-slim",
+      "pinned_in": [{ "path": "docs/Dockerfile", "match": "FROM ruby:{version}", "count": 1 }],
+      "upstream": { "kind": "dockerhub", "repo": "library/ruby", "track": "^3\\.[0-9]+-slim$" },
+      "note": "Local docs-preview container only -- nothing ships it, and the published site is built by GitHub Pages, not by this image. Bumped off 3.2, which reached EOL 2026-03-31. Keep it on a supported branch anyway: it is the one place in the repo that runs a web server, and an EOL interpreter there is a CVE nobody is watching for."
+    },
+
+    "jekyll": {
+      "version": "4.4.1",
+      "pinned_in": [{ "path": "docs/Dockerfile", "match": "jekyll:{version}", "count": 1 }],
+      "upstream": { "kind": "rubygems", "repo": "jekyll" },
+      "note": "The local preview deliberately runs Jekyll 4.x while GitHub Pages runs 3.10.0 (pinned by the github-pages gem). The two agree on the plugin set and on the rendering this repo relies on; they are NOT the same Jekyll, so a page that renders only under 4.x is still a bug the preview will not catch. `make docs-verify` and the render sweep are the backstop."
+    },
+
+    "webrick": {
+      "version": "1.9.2",
+      "pinned_in": [{ "path": "docs/Dockerfile", "match": "webrick:{version}", "count": 1 }],
+      "upstream": { "kind": "rubygems", "repo": "webrick" },
+      "note": "`jekyll serve` needs it explicitly -- webrick stopped being a default gem in Ruby 3.x. Bumped off 1.8.1, which predates the request-smuggling fix in 1.8.2 (CVE-2024-47220). Local-only, but it was the only known-vulnerable web server in the tree and no lockfile or bot could see it."
+    },
+
+    "jekyll-optional-front-matter": {
+      "version": "0.3.2",
+      "pinned_in": [
+        { "path": "docs/Dockerfile", "match": "jekyll-optional-front-matter:{version}", "count": 1 }
+      ],
+      "upstream": { "kind": "rubygems", "repo": "jekyll-optional-front-matter" },
+      "hold": "Pinned to EXACTLY what the `github-pages` gem pins (verified against its published dependencies: `= 0.3.2`). 0.3.3 exists upstream and taking it would make the local preview render with a plugin the published site does not have -- which defeats the only reason this image exists. Bump when github-pages does, not when rubygems does."
+    },
+
+    "jekyll-relative-links": {
+      "version": "0.6.1",
+      "pinned_in": [
+        { "path": "docs/Dockerfile", "match": "jekyll-relative-links:{version}", "count": 1 }
+      ],
+      "upstream": { "kind": "rubygems", "repo": "jekyll-relative-links" },
+      "hold": "Same as jekyll-optional-front-matter: `github-pages` pins `= 0.6.1`. This plugin rewrites the .md links between docs pages, so a version skew here changes URLs in the preview that the published site would not produce -- the exact class of divergence the preview is supposed to rule out. 0.8.0 upstream."
+    },
+
+    "alpine": {
+      "version": "3.23",
+      "pinned_in": [
+        { "path": "agent/dhcp/images/kea/Dockerfile", "match": "FROM alpine:{version}", "count": 2 },
+        { "path": "agent/dns/images/bind9/Dockerfile", "match": "FROM alpine:{version}", "count": 2 },
+        { "path": "agent/dns/images/powerdns/Dockerfile", "match": "FROM alpine:{version}", "count": 2 },
+        { "path": "agent/dns/images/dnsdist/Dockerfile", "match": "FROM alpine:{version}", "count": 1 },
+        {
+          "path": "agent/looking-glass/images/gobgp/Dockerfile",
+          "match": "FROM alpine:{version}",
+          "count": 2
+        },
+        {
+          "path": "agent/supervisor/images/supervisor/Dockerfile",
+          "match": "FROM alpine:{version}",
+          "count": 2
+        },
+        { "path": "docs/THIRD_PARTY.md", "match": "| {version} |", "count": 1 }
+      ],
+      "upstream": { "kind": "dockerhub", "repo": "library/alpine", "track": "^3\\.[0-9]+$" },
+      "hold": "Alpine 3.24 moves the bundled interpreter to Python 3.14.7 (NOT 3.13, as the dependabot.yml comment said until #975). The agent images install spatium_*_agent for 3.12, so on 3.24 the module lands off sys.path -> ModuleNotFoundError -> CrashLoopBackOff. The blocker is therefore a 3.12 -> 3.14 jump needing every agent's dependencies verified on 3.14, not the one-minor step the comment implied. Dependabot's ignore rule lets 3.23.x patches flow; this is the minor hold.",
+      "note": "3.24 also carries pdns 5.0.7, dnsdist 2.0.8 and bind 9.20.27 (Kea stays 3.0.3), so the bump moves four shipped daemons at once and wants its own change."
+    }
+  },
+
+  "holds": [
+    {
+      "name": "Python (backend runtime + CI)",
+      "version": "3.12",
+      "reason": "3.14.7 is current. A deliberate, coordinated interpreter upgrade -- backend/Dockerfile, every setup-python step and the agents move together or not at all.",
+      "why_not_enforced": "The literal is `python-version: \"3.12\"` repeated across CI jobs, and an exact count there would fail every time a job is added -- a guard that fires for unrelated reasons is one people learn to weaken."
+    },
+    {
+      "name": "Node (frontend builder)",
+      "version": "22",
+      "reason": "24 is the active LTS; 22 is in maintenance until April 2027. Low priority, no known blocker.",
+      "why_not_enforced": "Dependabot owns the `FROM` and defers the major by an explicit ignore rule; there is no second copy for the two to drift apart."
+    },
+    {
+      "name": "Debian (appliance base)",
+      "version": "trixie",
+      "reason": "Pinned by codename, so point releases (13.6 today) flow at build time. Nothing to bump.",
+      "why_not_enforced": "A codename never changes; there is no version string for a lint to compare."
+    }
+  ]
+}

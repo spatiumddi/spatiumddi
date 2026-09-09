@@ -8,7 +8,7 @@
 # global default-export-policy is always "reject-route" and no
 # export-policy-list is ever populated, so the daemon can receive routes
 # from every configured peer but can never advertise one back.
-ARG GOBGP_VERSION=4.7.0
+ARG GOBGP_VERSION=4.9.0
 
 FROM alpine:3.23 AS agent-build
 RUN apk add --no-cache python3 py3-pip py3-wheel
@@ -55,16 +55,27 @@ RUN apk add --no-cache git
 WORKDIR /src
 RUN git clone --depth 1 --branch "v${GOBGP_VERSION}" https://github.com/osrg/gobgp .
 # Bump vulnerable transitive deps above the versions gobgp pins so Trivy
-# (HIGH/CRITICAL) stays green. gobgp v4.7.0 pins golang.org/x/net v0.48,
-# which carries several HIGH CVEs (html XSS, IDNA punycode privilege
-# escalation, HTTP/2 DoS — fixed in 0.55); x/text v0.38 carries
-# CVE-2026-56852 (norm.Iter infinite loop, fixed in 0.39); grpc-go
-# v1.79.3 carries GHSA-hrxh-6v49-42gf (xDS RBAC + HTTP/2, fixed in
-# 1.82.1) and, at v1.83.0, CVE-2026-84304 (HIGH, fixed in 1.83.1).
-# Re-check + drop/bump these pins when GoBGP's own go.mod moves past
-# them. Dependabot does not see these — they are `go get` arguments in a
-# Dockerfile, not a tracked manifest — so `make trivy IMAGE=looking-glass`
-# is what surfaces the next one.
+# (HIGH/CRITICAL) stays green. The CVEs these clear: golang.org/x/net below
+# 0.55 carries several HIGH (html XSS, IDNA punycode privilege escalation,
+# HTTP/2 DoS); x/text below 0.39 carries CVE-2026-56852 (norm.Iter infinite
+# loop); grpc-go below 1.82.1 carries GHSA-hrxh-6v49-42gf (xDS RBAC +
+# HTTP/2) and 1.83.0 carries CVE-2026-84304 (HIGH, fixed in 1.83.1).
+#
+# EVERY ONE OF THESE MUST BE AN UPGRADE, NEVER A DOWNGRADE. ``go get pkg@vX``
+# sets exactly that version, so once GoBGP's own go.mod moves past one of
+# these the line silently pulls the dependency BACKWARDS — reintroducing the
+# CVE it was added to clear, while the build stays green and the comment
+# still says it is a fix. Check upstream's go.mod on every GOBGP_VERSION bump
+# and drop or raise each pin. Deliberately written without naming the pinned
+# GoBGP version: a comment naming the pinned release goes stale on
+# the next bump and then asserts something false (#975 found it had).
+#
+# At v4.9.0 upstream pins x/net v0.55.0 (indirect), x/text v0.37.0 and
+# grpc v1.82.1 — so all three below are still upgrades.
+#
+# Dependabot does not see these: they are `go get` arguments in a Dockerfile,
+# not a tracked manifest, which is why they live in versions.json's orbit and
+# why `make trivy IMAGE=looking-glass` is what surfaces the next one.
 RUN go get \
       golang.org/x/net@v0.57.0 \
       golang.org/x/text@v0.40.0 \

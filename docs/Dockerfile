@@ -12,17 +12,17 @@
 #
 #   docker compose -f docker-compose.docs.yml up
 #   → http://localhost:4000
-FROM ruby:3.2-slim
+FROM ruby:3.4-slim
 
 # webrick is no longer a default gem on Ruby 3.x and jekyll serve needs it.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential \
     && rm -rf /var/lib/apt/lists/* \
     && gem install --no-document \
-         jekyll:4.3.4 \
+         jekyll:4.4.1 \
          jekyll-optional-front-matter:0.3.2 \
          jekyll-relative-links:0.6.1 \
-         webrick:1.8.1 \
+         webrick:1.9.2 \
     && apt-get purge -y build-essential \
     && apt-get autoremove -y
 

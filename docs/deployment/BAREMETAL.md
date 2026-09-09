@@ -66,6 +66,34 @@ Notes before you use it:
   mounts `./haproxy.cfg`, which is **not** included in the repo — you must supply
   your own HAProxy config that fronts the three Patroni REST APIs (`pg1`/`pg2`/`pg3`
   on `:8008`) and routes `:5000` to the current primary.
+  **If you are upgrading an existing deployment**, note that the HAProxy image
+  moved from `2.9-alpine` to `3.4-alpine` in
+  [#975](https://github.com/spatiumddi/spatiumddi/issues/975) — 2.9 was a
+  short-lived non-LTS branch with no release since March 2025, and 3.4 is the
+  current LTS (`haproxy:lts-alpine` and `haproxy:3.4-alpine` are the same
+  image). Your `haproxy.cfg` is yours, so **we cannot validate it for you**:
+  HAProxy 3.x removed keywords that were deprecated through the 2.x series, and
+  a config that only warned on 2.9 can be a hard startup failure on 3.4. The
+  canonical Patroni configuration from the Patroni documentation — `mode tcp`,
+  `option httpchk`, `http-check expect status 200`, `default-server ... on-marked-down
+  shutdown-sessions` — was verified unchanged on both versions, so a config of
+  that shape needs no edit. Check yours before deploying:
+
+  ```bash
+  docker run --rm -v "$PWD/haproxy.cfg:/c.cfg:ro" haproxy:3.4-alpine \
+      haproxy -c -f /c.cfg
+  ```
+- The three Patroni services run **`patroni-spatiumddi:latest`, which is built by
+  this overlay, not pulled.** The `build.dockerfile_inline` block in the same file
+  layers Patroni onto `postgres:16-alpine` via pip, so the image exists only on the
+  host that ran `docker compose`; nothing publishes it and the name resolves in no
+  registry. Two consequences worth knowing: the `latest` tag is local and
+  meaningless as a version (recorded as such in
+  [`versions.json`](https://github.com/spatiumddi/spatiumddi/blob/main/versions.json),
+  so it stops reading like a pin somebody forgot), and **the Patroni version is
+  whatever pip resolves at build time** — pin it in the inline Dockerfile if you
+  need two hosts to agree, because `docker compose build` on different days will
+  not.
 - Point the application at HAProxy by setting `DATABASE_URL` to the HAProxy
   endpoint (e.g. `postgresql+asyncpg://spatiumddi:<password>@haproxy:5000/spatiumddi`)
   instead of the default single-node `postgres` host.

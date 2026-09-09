@@ -356,7 +356,7 @@ observability:
     hostUsers:
     image:
       repository: registry.k8s.io/kube-state-metrics/kube-state-metrics
-      tag: v2.18.0
+      tag: v2.20.0
     # Resource cap — appliance VMs are typically 2-4 GB; KSM has a
     # bounded memory profile but a runaway pod shouldn't dent the
     # service pods' headroom.
@@ -374,7 +374,7 @@ observability:
     enabled: false
     image:
       repository: quay.io/prometheus/node-exporter
-      tag: v1.11.1
+      tag: v1.12.1
     resources:
       requests:
         cpu: 10m
@@ -450,7 +450,7 @@ agentLanding:
   priorityClassName: ""
   image:
     repository: nginx
-    tag: 1.30.3-alpine
+    tag: 1.31.5-alpine
   # #965 — token request so no pod in this chart is BestEffort (the CI
   # render check refuses one). A static nginx page needs nothing more.
   resources:
