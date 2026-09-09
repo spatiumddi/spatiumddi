@@ -82,19 +82,28 @@ updates:
       - dependency-name: "python"
         update-types:
           ["version-update:semver-minor", "version-update:semver-major"]
-      # Alpine 3.24 bumps the bundled Python 3.12→3.14.7, which breaks the agent
-      # images: they install spatium_*_agent for 3.12, so on 3.24 the module
-      # lands on the wrong Python path -> "ModuleNotFoundError: No module named
-      # 'spatium_dns_agent'" -> CrashLoopBackOff (caught by agent-e2e on #672).
-      # Pin the agents to alpine 3.23.x until their Dockerfiles are updated;
-      # patch bumps (3.23.x) still flow. The 3.24 move is a deliberate task.
+      # An Alpine MINOR carries the bundled Python with it, and the agent
+      # images are installed into /usr/local/lib/python<X.Y>/site-packages and
+      # found only via PYTHONPATH. A base bump alone therefore produces an
+      # image that builds clean and then CrashLoopBackOffs with
+      # "ModuleNotFoundError: No module named 'spatium_dns_agent'" — #672,
+      # caught by agent-e2e. It also drags pdns / dnsdist / bind along in the
+      # same step. So a minor stays a deliberate, verified change; patch bumps
+      # (3.24.x) still flow.
       #
-      # #975 — this comment said "3.12→3.13" until the sweep checked the Alpine
-      # package index: v3.24/main ships python3-3.14.7. That makes the blocker a
-      # 3.12 → 3.14 jump needing every agent's dependencies verified on 3.14,
-      # not the one-minor step the wrong number implied — a materially bigger
-      # task that had been under-scoped for as long as the comment stood.
-      # The full reason lives in versions.json under `alpine`.
+      # #1037 did that move: 3.23 → 3.24, Python 3.12 → 3.14.7. Two things
+      # changed so the next one is bounded rather than archaeological —
+      # PYTHONPATH now interpolates the PYTHON_VERSION arg instead of
+      # hardcoding a version (that arg was referenced by NOTHING in four of
+      # the five images before #1037), and every agent image asserts
+      # `import <agent>` at build time, so a mismatched pair fails the build
+      # instead of the pod. The full reason lives in versions.json under
+      # `alpine` and `agent-python`.
+      #
+      # Historical note worth keeping: this comment claimed "3.12→3.13" for a
+      # year. The #975 sweep checked the package index — v3.24/main ships
+      # python3-3.14.7 — which made the task materially bigger than the wrong
+      # number implied, and is why it had sat untouched.
       - dependency-name: "alpine"
         update-types:
           ["version-update:semver-minor", "version-update:semver-major"]

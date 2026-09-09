@@ -216,6 +216,17 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: python3 scripts/lint_versions.py
 
+      # #1036 — a `run:` step that captures $? after a bare command is dead
+      # code: Actions supplies `bash -e`, and the `set -uo pipefail` several
+      # steps open with does NOT clear it, so the capture is never reached on
+      # the failure it exists to handle. That silently disarmed the weekly
+      # CVE scan for as long as it had findings to report. Neither actionlint
+      # nor shellcheck -S style flags the shape (both checked), hence a
+      # linter of our own. stdlib-only; runs from repo root.
+      - name: Workflow shell-status linter
+        working-directory: ${{ github.workspace }}
+        run: python3 scripts/lint_workflow_shell.py
+
       # Guards the appliance host-side runner scripts (issues #550/#553):
       # every systemd ExecStart runner must be executable in the built
       # image (git +x OR chmod'd in mkosi.postinst) and bash -n clean.
@@ -615,7 +626,11 @@ jobs:
 
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.12"
+          # #1037 — the agent IMAGES ship Python 3.14 (alpine 3.24). Testing
+          # on 3.12 while shipping 3.14 is the skew that lets a 3.14-only
+          # regression reach a pod with every check green. All three suites
+          # were run on 3.14 before this moved.
+          python-version: "3.14"
           cache: pip
           cache-dependency-path: agent/${{ matrix.agent }}/pyproject.toml
 

@@ -7,7 +7,7 @@
 # operator's rate-limit rules, which the PowerDNS agent renders into a shared
 # read-only volume; it rebuilds + restarts dnsdist whenever the rules change.
 # Multi-arch: linux/amd64, linux/arm64 (non-negotiable #11).
-FROM alpine:3.23 AS runtime
+FROM alpine:3.24 AS runtime
 
 # apk upgrade before add so the layer cache can't serve a stale index that
 # Trivy would then flag (mirrors the powerdns image rationale).

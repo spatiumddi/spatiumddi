@@ -191,7 +191,7 @@ the canonical wording lives in `CLAUDE.md`.
 10. **Driver abstraction** — DHCP/DNS backend logic never leaks into the
     service layer (`backend/app/drivers/{dns,dhcp}/`).
 11. **Multi-arch builds** — all Docker images support `linux/amd64` and
-    `linux/arm64` (see §10).
+    `linux/arm64` (see §11).
 12. **K8s manifests stay current** — when you add or change a service,
     update `k8s/base/` and `k8s/README.md`.
 13. **MCP coverage for new features** — a new REST resource also gets
@@ -358,7 +358,7 @@ every push and pull request. Run it locally before pushing.
 make ci
 ```
 
-It chains six targets:
+It chains seven targets:
 
 | `make` target | What it runs |
 |---|---|
@@ -368,6 +368,7 @@ It chains six targets:
 | `charts-lint` | The `Charts — Lint & Template` gate, in a helm container (see the job table below) |
 | `perf-test` | `python -m pytest perf` in a python container |
 | `versions-check` | `python3 scripts/lint_versions.py` — asserts every pin in `versions.json` still matches the files that carry it (see §9). Stdlib-only, no container, no network |
+| `workflow-shell-check` | `python3 scripts/lint_workflow_shell.py` — refuses `$?` captured after a bare command in a workflow `run:` block, where GitHub's `bash -e` makes it dead code (see §10) |
 
 `make ci` requires the dev stack to be running (the backend checks
 execute inside the api container) and Node 20+ on the host. It does **not**
@@ -380,7 +381,7 @@ triggered on push to `main` and on every pull request:
 
 | Job | What it does |
 |---|---|
-| **Backend — Lint & Type Check** (`backend-lint`) | `pip install -e ".[dev]"` on Python 3.12, then `ruff check`, `black --check`, `mypy app`, **plus the migration-shape linter** (`python3 scripts/lint_migrations.py` — see §8) and the **version-pin manifest linter** (`python3 scripts/lint_versions.py` — see §9). |
+| **Backend — Lint & Type Check** (`backend-lint`) | `pip install -e ".[dev]"` on Python 3.12, then `ruff check`, `black --check`, `mypy app`, **plus the migration-shape linter** (`python3 scripts/lint_migrations.py` — see §8), the **version-pin manifest linter** (`python3 scripts/lint_versions.py` — see §9) and the **workflow shell-status linter** (`python3 scripts/lint_workflow_shell.py` — see §10). |
 | **Backend — Tests** (`backend-test`) | A required-check aggregator over **twelve** parallel `backend-test-shard` jobs. Each shard spins up `postgres:16-alpine` + `redis:8.10.1-alpine` services, runs `alembic upgrade head`, then `pytest -n auto --splits 12 --group N --store-durations --clean-durations` (pytest-split selects the shard's slice, **balanced by duration** from the committed `backend/.test_durations` — see §Shard balancing; `-n auto` parallelizes it across the runner's vCPUs, each xdist worker on its own `spatiumddi_test_gw<N>` DB). On a PR the `changes` job may first narrow the run to the test files the diff can affect (#1020 — see §Test-impact selection). The aggregator passes only if all twelve shards pass; on a full run it also merges the shards' measured durations into a `test-durations` artifact, and on a push to `main` it builds the `test-impact-map` artifact from the shards' coverage contexts. Coverage is otherwise **not** collected here (#1019). |
 | **Frontend — Lint & Type Check** (`frontend-lint`) | Node 22, `npm install`, then `npm run lint`, `npm run format:check`, `npm run typecheck`, `npm test`. |
 | **Frontend — Build** (`frontend-build`) | Node 22, `npm install`, `npm run build`. |
@@ -477,7 +478,7 @@ than it saves.
 ### Nightly builds
 
 [`.github/workflows/nightly.yml`](../.github/workflows/nightly.yml) builds
-and publishes every image from `main` at **02:23 America/New_York** (the
+and publishes every image from `main` at **03:23 America/New_York** (the
 team works Eastern evenings, so the nightly runs after the late pushes —
 two UTC crons plus a wall-clock gate keep that true across DST). It exists
 because
@@ -673,7 +674,63 @@ the other copies move with it.
 
 ---
 
-## 10. Multi-Arch Image Builds
+## 10. Workflow Shell — `$?` under `set -e`
+
+GitHub Actions runs every `run:` block under **`bash -e`**. Writing
+`set -uo pipefail` at the top — which several steps here do — does **not**
+clear that flag:
+
+```console
+$ bash -ec 'set -uo pipefail; case "$-" in *e*) echo "-e STILL ON";; esac'
+-e STILL ON
+```
+
+So this shape is dead code on exactly the failure it was written to handle:
+
+```bash
+some_command > out      # -e kills the step here when it fails
+rc=$?                   # never reached
+if [ "$rc" -eq 0 ]; ...
+```
+
+**It is invisible by construction.** The step is green on the happy path, and
+the branch that would report a problem is the one that never runs. It cost
+this repo a working weekly CVE scan: `trivy-scheduled.yml` captured Trivy's
+status this way, and Trivy exits 1 *on findings* — so the step died at the
+first image with a CVE, `has_findings` was never written, and a clean week
+looked identical to a week full of criticals
+([#1036](https://github.com/spatiumddi/spatiumddi/issues/1036)).
+
+`scripts/lint_workflow_shell.py` refuses the shape, in CI's Backend Lint job
+and in `make ci`. Neither `actionlint` nor `shellcheck -S style` reports it
+(both checked) — shellcheck's SC2181 fires on a direct `if [ $? -ne 0 ]` but
+not on `rc=$?` followed by a test of `$rc`.
+
+### The three accepted forms
+
+```bash
+if cmd; then rc=0; else rc=$?; fi   # preferred — keeps the status AND the guard
+cmd || true                          # when the status is not needed
+set +e; cmd; rc=$?; set -e           # for a long run of commands
+```
+
+A genuine exception carries `# lint-workflow-shell: allow`.
+
+### Standalone `.sh` files
+
+The linter also scans `.github/scripts/*.sh`, where `-e` comes from the script
+rather than the interpreter. Turning the check **on** there requires an
+*unindented* `set -e`; turning it **off** accepts a `set +e` at any indent.
+That asymmetry is deliberate — file order is not execution order.
+`spatium-install` is `set -uo pipefail` at the top and enables `-e` deep inside
+`do_install()`, which runs *after* the wizard loop and preseed parser that
+appear below it in the file. Counting an indented `set -e` produced four
+confident findings about code where `-e` is off, and a linter that cries wolf
+on the installer is one that gets deleted.
+
+---
+
+## 11. Multi-Arch Image Builds
 
 Every Docker image must support **`linux/amd64` and `linux/arm64`**
 (non-negotiable #11). The release pipeline
@@ -685,7 +742,7 @@ multi-arch fan-out happens in CI on a tagged release.
 
 ---
 
-## 11. Branch & PR Conventions
+## 12. Branch & PR Conventions
 
 - **Branch from `main`.** The project uses one branch per issue, named
   `issue-NNN` (keep every phase of a multi-phase change on the same
@@ -716,7 +773,7 @@ multi-arch fan-out happens in CI on a tagged release.
 
 ---
 
-## 12. Security Disclosure
+## 13. Security Disclosure
 
 Do **not** file security vulnerabilities as public issues. Use
 [GitHub Security Advisories](https://github.com/spatiumddi/spatiumddi/security/advisories/new)

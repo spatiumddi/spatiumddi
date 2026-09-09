@@ -8,9 +8,10 @@
 # global default-export-policy is always "reject-route" and no
 # export-policy-list is ever populated, so the daemon can receive routes
 # from every configured peer but can never advertise one back.
+ARG PYTHON_VERSION=3.14
 ARG GOBGP_VERSION=4.9.0
 
-FROM alpine:3.23 AS agent-build
+FROM alpine:3.24 AS agent-build
 RUN apk add --no-cache python3 py3-pip py3-wheel
 WORKDIR /src
 COPY agent/looking-glass/pyproject.toml /src/pyproject.toml
@@ -59,7 +60,21 @@ RUN git clone --depth 1 --branch "v${GOBGP_VERSION}" https://github.com/osrg/gob
 # 0.55 carries several HIGH (html XSS, IDNA punycode privilege escalation,
 # HTTP/2 DoS); x/text below 0.39 carries CVE-2026-56852 (norm.Iter infinite
 # loop); grpc-go below 1.82.1 carries GHSA-hrxh-6v49-42gf (xDS RBAC +
-# HTTP/2) and 1.83.0 carries CVE-2026-84304 (HIGH, fixed in 1.83.1).
+# HTTP/2), 1.83.0 carries CVE-2026-84304 (HIGH, fixed in 1.83.1) and
+# 1.83.1 carries CVE-2026-84445 (HIGH, xDS server DoS, fixed in 1.83.2).
+#
+# That last one was caught by CI on #1037, not locally: touching a
+# Dockerfile is what makes CI scan the image, so the PR inherits every
+# CVE published since the last time anything touched it. A local
+# `make trivy` against a stale DB reported clean an hour earlier.
+#
+# These three are NOT independent, and `go get` REFUSES a mismatched set
+# rather than resolving it — so raising one drags the others and the build
+# says exactly which. Bumping grpc alone to clear CVE-2026-84445 took two
+# more rounds: grpc 1.83.2 wanted x/net 0.58.0, then both wanted x/text
+# 0.41.0. That is a feature — the failure is loud and at build time — but
+# budget for it, and re-run `make trivy IMAGE=looking-glass` after, since
+# the versions you end up on are not the ones you set out to pin.
 #
 # EVERY ONE OF THESE MUST BE AN UPGRADE, NEVER A DOWNGRADE. ``go get pkg@vX``
 # sets exactly that version, so once GoBGP's own go.mod moves past one of
@@ -77,16 +92,16 @@ RUN git clone --depth 1 --branch "v${GOBGP_VERSION}" https://github.com/osrg/gob
 # not a tracked manifest, which is why they live in versions.json's orbit and
 # why `make trivy IMAGE=looking-glass` is what surfaces the next one.
 RUN go get \
-      golang.org/x/net@v0.57.0 \
-      golang.org/x/text@v0.40.0 \
-      google.golang.org/grpc@v1.83.1
+      golang.org/x/net@v0.58.0 \
+      golang.org/x/text@v0.41.0 \
+      google.golang.org/grpc@v1.83.2
 ENV CGO_ENABLED=0
 RUN GOOS="${TARGETOS:-linux}" GOARCH="${TARGETARCH}" \
       go build -trimpath -ldflags="-s -w" -o /out/gobgpd ./cmd/gobgpd \
  && GOOS="${TARGETOS:-linux}" GOARCH="${TARGETARCH}" \
       go build -trimpath -ldflags="-s -w" -o /out/gobgp ./cmd/gobgp
 
-FROM alpine:3.23 AS runtime
+FROM alpine:3.24 AS runtime
 # ``libcap`` brings in ``setcap`` so gobgpd can bind BGP's privileged
 # TCP/179 as the unprivileged ``spatium`` user (same pattern as
 # kea-dhcp4/6 + named/pdns_server in the DHCP/DNS images — a
@@ -132,14 +147,26 @@ RUN chmod +x /usr/local/bin/spatium-lg-entrypoint \
       echo "gobgp=${GOBGP_VERSION}"; \
     } > /etc/spatiumddi-versions
 
+ARG PYTHON_VERSION
 ENV AGENT_STATE_DIR=/var/lib/spatium-lg-agent \
     GOBGPD_CONFIG_PATH=/etc/gobgp/gobgpd.json \
     GOBGPD_BIN=/usr/local/bin/gobgpd \
     GOBGP_BIN=/usr/local/bin/gobgp \
     GOBGP_GRPC_HOST=127.0.0.1 \
     GOBGP_GRPC_PORT=50051 \
-    PYTHONPATH=/usr/local/lib/python3.12/site-packages \
+    PYTHONPATH=/usr/local/lib/python${PYTHON_VERSION}/site-packages \
     LOG_LEVEL=INFO
+
+# #1037 — prove PYTHONPATH matches THIS image's interpreter, at build time.
+# The agent is installed into /usr/local/lib/python<X.Y>/site-packages by the
+# build stage and is found only because PYTHONPATH names that exact directory.
+# When the Alpine base moves the bundled Python (3.23 shipped 3.12, 3.24 ships
+# 3.14) a stale PYTHONPATH yields an image that builds clean and then
+# CrashLoopBackOffs with ModuleNotFoundError — what #672 hit, and the reason
+# the base stayed pinned for a year. One import turns that into a build
+# failure, here, instead of a pod failure in the field.
+RUN python3 -c "import spatium_lg_agent"
+
 
 VOLUME ["/var/lib/spatium-lg-agent"]
 # BGP (receive-only — see spatium_lg_agent/gobgp.py's module docstring)

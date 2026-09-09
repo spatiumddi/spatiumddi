@@ -192,6 +192,17 @@ setpriv --reuid spatium --regid spatium --init-groups \
         spatium-dhcp-agent &
 AGENT_PID=$!
 
+# `set +e` from here to the end (#1036). This script runs under `set -eu`,
+# and everything below exists to CAPTURE a non-zero status and then clean up —
+# which is exactly what `-e` prevents. Reproduced against busybox ash: with a
+# supervised child exiting 3, the `||` list returns 3, `-e` killed the script
+# on that line, and `EXIT_CODE=$?`, `_term` and `exit` were ALL skipped. So a
+# kea or agent CRASH — the case this supervision block exists for — tore the
+# container down without terminating its siblings, while a clean SIGTERM
+# (which returns 0 here) ran the cleanup perfectly. The failure path was the
+# only one that skipped it.
+set +e
+
 # wait -n is a bash-ism; busybox ash accepts it too as of 1.30+
 # (Alpine 3.11+). Fall back to plain wait on older variants.
 wait -n "$KEA_PID" "$KEA6_PID" "$AGENT_PID" 2>/dev/null \

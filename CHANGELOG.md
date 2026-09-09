@@ -477,6 +477,72 @@ the formatter handles the rest.
   the prose in four docs pages that named a version as fact.
 
 
+- **The agent images move to Alpine 3.24 / Python 3.14.7, and the
+  arg that was supposed to control that becomes real (#1037).**
+  The base had been pinned to 3.23 for a year behind a
+  `dependabot.yml` comment that said 3.24 moves Python "3.12→3.13";
+  the #975 sweep checked the package index and found **3.14.7**, so
+  the task was a two-minor interpreter jump, not a one-minor step —
+  which is most of why nobody had done it. All three agent suites
+  were run on 3.14 first (dhcp 188, dns 276, supervisor 374; the
+  supervisor's 11 apparent failures were a test container with no
+  `bash`, identical on 3.12). The looking-glass agent has no suite
+  at all, so it and the others were additionally checked by
+  importing **every** submodule inside the shipped image — 96
+  across the five agents, none failing.
+  **The real pin was never `PYTHON_VERSION`.** Four of the five
+  images declared `ARG PYTHON_VERSION=3.12` and referenced it
+  **nowhere** — bumping it changed the image not at all — while
+  `PYTHONPATH=/usr/local/lib/python3.12/site-packages`, hardcoded,
+  was what actually located the agent. That is the exact shape #672
+  hit: base moves, PYTHONPATH does not, the image builds perfectly
+  and the pod CrashLoopBackOffs on `ModuleNotFoundError`. So
+  `PYTHONPATH` now interpolates the arg, and every agent image
+  asserts `import <agent>` as a build step — verified by building
+  with a deliberately stale `--build-arg PYTHON_VERSION=3.12`,
+  which now fails the BUILD instead of shipping.
+  **The technitium image needed a different assertion**, which
+  review caught it not having at all: it is the one agent that is
+  not Alpine-based, and its arg drives BOTH the builder and
+  `PYTHONPATH`, so those move together and an import alone still
+  passes when the arg is wrong (they resolve, because `cryptography`
+  and `pydantic-core` ship abi3 wheels that load across 3.x). What
+  can drift there is the interpreter inside the upstream
+  `technitium/dns-server` base, so that image compares
+  `sys.version_info` to the arg directly. Verified both ways.
+  Carried along by the same index: pdns 5.0.5 → 5.0.7 (a patch
+  within pdns 5, so the #638 LMDB schema guard correctly takes no
+  snapshot — the 4.9 → 5.0 crossing already happened on 3.22 →
+  3.23), dnsdist → 2.0.8, bind → 9.20.27, Kea unchanged at 3.0.3.
+  All eight images `make trivy` covers build clean and scan clean.
+  **CI surfaced one CVE the local scan had not**, which is the
+  path-filter effect this repo has hit before (#639): touching a
+  Dockerfile is what makes CI scan that image, so the PR inherits
+  everything published since the last time anything touched it.
+  `google.golang.org/grpc` was pinned at 1.83.1 for CVE-2026-84304
+  and 1.83.1 now carries CVE-2026-84445 (HIGH, xDS server DoS).
+  Clearing it took three rounds, because those `go get` pins are a
+  coupled set that `go get` refuses rather than resolves: grpc 1.83.2
+  wanted x/net 0.58.0, and both then wanted x/text 0.41.0.
+  **`Agent — Tests` moves to 3.14 with them.** It ran on 3.12 while
+  the images shipped 3.14, which is the skew that lets a
+  3.14-only regression reach a pod with every check green. The
+  backend stays on 3.12 — a separate, deliberate hold.
+
+- **The nightly build moves from 02:23 to 03:23 America/New_York,
+  which also closes a hole it had every spring.** Cron is UTC-only,
+  so the schedule is two twin crons plus a gate that keeps the one
+  whose slot reads the target hour on the Eastern clock. On the
+  spring-forward night the Eastern clock jumps 01:59 → 03:00, so
+  **no 02:xx exists and BOTH twins skipped** — the nightly silently
+  built nothing once a year. 03:xx exists on every night there is.
+  Verified against tzdata for normal EDT, normal EST and both DST
+  nights across 2026-2028: exactly one twin builds in every case.
+  The `:23` is kept deliberately and must not be rounded to `:00` —
+  the top-of-hour cron stampede delays runner scheduling, and these
+  runs already start up to 13 h late.
+
+
 ### Security
 
 - **The two source restrictions composed into a console-only
@@ -655,6 +721,54 @@ the formatter handles the rest.
   having written nothing. The first attempt at that harness
   proved nothing, because a stub that failed `docker build` too
   took the build-failure path and never reached the scan.
+
+
+- **A `run:` step that captures `$?` after a bare command is dead
+  code, and nothing anywhere said so (#1036).** GitHub Actions runs
+  every `run:` block under `bash -e`, and the `set -uo pipefail`
+  several steps open with does **not** clear it — so
+  `cmd; rc=$?` is never reached on the failure it was written to
+  handle. #975 fixed the two live sites; this adds the guard, which
+  that issue deliberately left out of scope.
+  The instance that matters: `trivy-scheduled.yml` captured Trivy's
+  status this way, and Trivy exits 1 **on findings**. The step died
+  at the first image with a CVE, `has_findings` was never written,
+  and the reporting step's fail-safe correctly declined to act on an
+  indeterminate result. **A clean week and a week full of criticals
+  produced the same visible outcome: no issue.**
+  `scripts/lint_workflow_shell.py` refuses the shape in CI's
+  unconditional Backend Lint job and in `make ci`. It is a linter of
+  our own because **neither `actionlint` nor `shellcheck -S style`
+  reports it** (both run against the exact snippet): SC2181 fires on
+  a direct `if [ $? -ne 0 ]` and not on `rc=$?` followed by a test
+  of `$rc`. It is pinned against the REAL pre-fix
+  `trivy-scheduled.yml` body, which it reports at the right line.
+  **The false positive it had to stop making is the interesting
+  half.** Turning the check on for a standalone script requires an
+  UNINDENTED `set -e`, because file order is not execution order and
+  this reads the file: `spatium-install` is `set -uo pipefail` at the
+  top and enables `-e` deep inside `do_install()`, which runs *after*
+  the wizard loop and preseed parser that appear below it. Counting
+  that produced four confident findings about code where `-e` is off
+  — and a linter that cries wolf on the installer is one that gets
+  deleted. Suppressing accepts weaker evidence than asserting, on
+  purpose.
+  **The sweep found a second live instance, in the DHCP agent's own
+  entrypoint** — and only after review caught that the guard was not
+  scanning the files its rationale was built on: it globbed `*.sh`,
+  and all 45 appliance host runners (`spatium-install` among them)
+  are extension-less. It now matches on a shell shebang too, and
+  refuses to print a pass when the script half scanned nothing.
+  What that turned up: `agent/dhcp/images/kea/entrypoint.sh` runs
+  under `set -eu` and ends with
+  `wait -n … || wait …` / `EXIT_CODE=$?` / `_term`. Reproduced
+  against busybox ash — when a supervised child exits non-zero the
+  list returns non-zero, `-e` kills the script on that line, and
+  `EXIT_CODE`, `_term` and `exit` are ALL skipped. So a kea or agent
+  **crash** — the case the supervision block exists for — tore the
+  container down without terminating its siblings, while a clean
+  SIGTERM (which returns 0) ran the cleanup perfectly. The failure
+  path was the only one that skipped it.
 
 
 ### Added

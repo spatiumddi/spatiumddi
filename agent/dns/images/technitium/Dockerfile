@@ -104,10 +104,37 @@ RUN chmod +x /usr/local/bin/spatium-dns-entrypoint
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/spatium-dns-entrypoint"]
 CMD []
 
+ARG PYTHON_VERSION
 ENV AGENT_DRIVER=technitium \
     AGENT_STATE_DIR=/var/lib/spatium-dns-agent \
-    PYTHONPATH=/usr/local/lib/python3.12/site-packages \
+    PYTHONPATH=/usr/local/lib/python${PYTHON_VERSION}/site-packages \
     LOG_LEVEL=INFO
+
+# #1037 — prove PYTHONPATH matches THIS image's interpreter, at build time.
+# Unlike the Alpine agents, PYTHON_VERSION here has to match TWO things: the
+# `python:${PYTHON_VERSION}-slim-bookworm` builder above (which resolves the
+# compiled `cryptography` wheel) and the python3 inside the upstream
+# `technitium/dns-server` image, which is whatever Ubuntu release it is built
+# on. Today both are 3.12 — by coincidence, not by construction. The next
+# TECHNITIUM_DIGEST bump onto a newer Ubuntu silently breaks the pair: the
+# wheels stay cp312, the interpreter does not, and the agent dies at runtime
+# with no build-time signal (#672's shape on the one image #1037 first missed).
+#
+# The version EQUALITY check is the load-bearing half, and an import alone is
+# not enough here — verified: building with `--build-arg PYTHON_VERSION=3.13`
+# moves the builder AND PYTHONPATH together, so the import still succeeds even
+# though the runtime interpreter is 3.12. (It succeeds because `cryptography`
+# and `pydantic-core` ship abi3 wheels, which load across 3.x — so the import
+# cannot see the skew that a pure-cp3XX dependency would trip over.) Compare
+# the interpreter to the arg directly instead.
+RUN set -eu; \
+    have="$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"; \
+    if [ "$have" != "${PYTHON_VERSION}" ]; then \
+        echo "PYTHON_VERSION=${PYTHON_VERSION} but this image ships python $have." >&2; \
+        echo "The technitium base moved Python: bump PYTHON_VERSION (and versions.json)." >&2; \
+        exit 1; \
+    fi; \
+    python3 -c "import spatium_dns_agent, cryptography"
 
 VOLUME ["/var/lib/spatium-dns-agent", "/etc/dns", "/var/log/technitium"]
 EXPOSE 53/udp 53/tcp
