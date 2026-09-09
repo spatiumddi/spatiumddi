@@ -259,7 +259,8 @@
           "match": "``nginx:{version}``",
           "count": 1
         },
-        { "path": "appliance/scripts/bake-images.sh", "match": "\"nginx:{version}\"", "count": 1 }
+        { "path": "appliance/scripts/bake-images.sh", "match": "\"nginx:{version}\"", "count": 1 },
+        { "path": "docs/THIRD_PARTY.md", "match": "| {version} |", "count": 1 }
       ],
       "upstream": { "kind": "dockerhub", "repo": "library/nginx", "track": "^1\\.[0-9]+\\.[0-9]+-alpine$" },
       "note": "The frontend `FROM` IS Dependabot-visible and is listed anyway -- that is the deliberate exception in the header. It is the reason this entry exists: Dependabot moved the frontend image to 1.31 on 2026-07-20 (#688) and the appliance chart's agent-landing copy sat on 1.30.3 for the seven weeks until #975, because nothing connected them. Listing both means the next Dependabot bump fails this lint until the chart and the bake array move too."

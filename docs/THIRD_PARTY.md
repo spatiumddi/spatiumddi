@@ -315,11 +315,12 @@ Apache license covers it.
 
 | Component | Version | License | Where |
 |---|---|---|---|
-| [Alpine Linux](https://alpinelinux.org/) | 3.24 | MIT (+ GPL v2 kernel) | All agent images, supervisor |
+| [Alpine Linux](https://alpinelinux.org/) | 3.24 | MIT (+ GPL v2 kernel) | BIND9 / PowerDNS / dnsdist / Kea / Looking Glass agent images, supervisor — **not** Technitium (see below) |
 | [Debian slim](https://www.debian.org/) | trixie / bookworm | DFSG (mixed) | Appliance builder, Technitium agent build stage |
+| [technitium/dns-server](https://hub.docker.com/r/technitium/dns-server) | 15.4.0 (digest-pinned; Ubuntu-based) | GPL v3 | Technitium agent image **runtime** — the one agent image that is not Alpine |
 | [python:3.12-slim](https://www.python.org/) | 3.12 | PSF + Debian | API image |
 | [node](https://nodejs.org/) | 22-alpine | MIT | Frontend build stage |
-| [nginx](https://nginx.org/) | 1.31.3-alpine | BSD 2-Clause | Frontend runtime |
+| [nginx](https://nginx.org/) | 1.31.5-alpine | BSD 2-Clause | Frontend runtime |
 | [ASP.NET Core runtime](https://dotnet.microsoft.com/) | 10.0 | MIT | Technitium agent image |
 | [tini](https://github.com/krallin/tini) | Alpine/Debian pkg | MIT | PID 1 in every agent image |
 | [su-exec](https://github.com/ncopa/su-exec) / [gosu](https://github.com/tianon/gosu) | Alpine / Debian pkg | MIT / Apache 2.0 | Privilege drop at entrypoint |
