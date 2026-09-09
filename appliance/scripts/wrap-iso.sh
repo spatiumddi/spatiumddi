@@ -56,7 +56,16 @@ MOUNT_DIR=
 . "$(dirname "$0")/mount-lib.sh"
 
 cleanup() {
-    local rc=$?
+    # ``${1:-$?}`` — the status is PASSED IN over the composite-trap window,
+    # because there ``$?`` is not the script's status. ``trap 'cleanup_chroot;
+    # cleanup' EXIT`` runs cleanup_chroot first, and its ``unmount_tree … ||
+    # true`` leaves ``$?`` at 0, so the bare ``$?`` exited 0 on every failure
+    # between the bind mounts and the squashfs — including the three refusals
+    # this script newly adds (``unmount_tree || exit 1``, "still a mount
+    # point", "not empty") and the two that predate it ("could not determine
+    # kernel version", "initrd was not created"). Seven paths printed ERROR
+    # and returned success; main exits 1 correctly, so it was a regression.
+    local rc=${1:-$?}
     if [ -n "$MOUNT_DIR" ] && ! unmount_tree "$MOUNT_DIR"; then
         echo "ERROR: refusing to rm -rf $WORKDIR with live mounts under it" >&2
         exit 1
@@ -136,7 +145,7 @@ cleanup_chroot() {
         unmount_tree "$MOUNT_DIR/$d" || true
     done
 }
-trap 'cleanup_chroot; cleanup' EXIT
+trap 'rc=$?; cleanup_chroot; cleanup "$rc"' EXIT
 
 # Pick the kernel version from /lib/modules/<kver>/. update-initramfs
 # needs an explicit version when /boot/vmlinuz isn't there — mkosi

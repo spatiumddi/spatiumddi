@@ -48,9 +48,48 @@ holders_of() {
     done
 }
 
+# Is anything mounted AT or BELOW $1? Reads /proc/mounts rather than asking
+# findmnt, because `findmnt -R <path>` resolves <path> to its own mountpoint
+# and reports nothing at all when <path> is a plain directory with mounts
+# underneath it — so it cannot answer this question, which is the one that
+# matters before an `rm -rf`.
+anything_mounted_under() {
+    local under=$1 target
+    while read -r _dev target _rest; do
+        case "$target" in
+            "$under"|"$under"/*) return 0 ;;
+        esac
+    done < /proc/mounts
+    return 1
+}
+
 unmount_tree() {
     local mp=$1
-    mountpoint -q "$mp" 2>/dev/null || return 0
+    # NOT `mountpoint -q || return 0`. That returned SUCCESS for a directory
+    # that is not itself a mount but has live mounts beneath it — and the
+    # findmnt "proof" below is blind the same way, so the function reported a
+    # clean tree while a bind was still up. Harmless at today's call sites
+    # (every one is a mount point) and exactly wrong for the next caller who
+    # passes $WORKDIR, which is the natural thing for "clean up everything"
+    # and what cleanup()'s own "live mounts under it" message already claims
+    # to check.
+    anything_mounted_under "$mp" || return 0
+    mountpoint -q "$mp" 2>/dev/null || {
+        # Sub-mounts but no mount at $mp itself: umount -R needs a mount
+        # point, so take them deepest-first by path length.
+        local target rc=0
+        for target in $(awk -v u="$mp" '$2 == u || index($2, u "/") == 1 {print length($2), $2}' \
+                            /proc/mounts | sort -rn | cut -d" " -f2-); do
+            umount -R "$target" 2>/dev/null || umount -l -R "$target" || rc=1
+        done
+        if anything_mounted_under "$mp"; then
+            echo "ERROR: mounts remain under $mp:" >&2
+            grep -F " $mp" /proc/mounts >&2 || true
+            holders_of "$mp" >&2 || true
+            return 1
+        fi
+        return "$rc"
+    }
     if ! umount -R "$mp"; then
         echo "  umount -R $mp failed; still mounted underneath it:" >&2
         findmnt -R "$mp" >&2 || true
@@ -59,9 +98,10 @@ unmount_tree() {
         echo "  detaching lazily" >&2
         umount -l -R "$mp" || true
     fi
-    if [ -n "$(findmnt -R -n -o TARGET "$mp" 2>/dev/null)" ]; then
+    if anything_mounted_under "$mp"; then
         echo "ERROR: $mp is still mounted after umount -R and a lazy detach:" >&2
         findmnt -R "$mp" >&2 || true
+        grep -F " $mp" /proc/mounts >&2 || true
         return 1
     fi
 }
