@@ -74,6 +74,17 @@ from app.models.dns_threat_mute import DNSThreatMute
 from app.models.dnsbl import DNSBLList, DNSBLListing, DNSBLPinnedIP
 from app.models.docker import DockerHost
 from app.models.domain import Domain
+from app.models.e911 import (
+    CIVIC_COLUMNS,
+    CIVIC_ELEMENTS,
+    DISPATCHABLE_DETAIL_COLUMNS,
+    ERL_CONFIDENCE_LEVELS,
+    ERL_RULE_PRECEDENCE,
+    ERL_RULE_TARGET_COLUMN,
+    E911ResolutionLog,
+    EmergencyResponseLocation,
+    ERLBinding,
+)
 from app.models.event_subscription import EventOutbox, EventSubscription
 from app.models.feature_module import FeatureModule
 from app.models.firewall import (
@@ -169,6 +180,15 @@ __all__ = [
     "APPLIANCE_STATE_PENDING_APPROVAL",
     "APPLIANCE_STATE_REJECTED",
     "APPLIANCE_STATES",
+    "CIVIC_COLUMNS",
+    "CIVIC_ELEMENTS",
+    "DISPATCHABLE_DETAIL_COLUMNS",
+    "ERLBinding",
+    "ERL_CONFIDENCE_LEVELS",
+    "ERL_RULE_PRECEDENCE",
+    "ERL_RULE_TARGET_COLUMN",
+    "E911ResolutionLog",
+    "EmergencyResponseLocation",
     "PairingClaim",
     "PairingCode",
     "AVFlowProfile",

@@ -94,6 +94,14 @@ async def _resolve_api_token(db: AsyncSession, raw: str, request: Request) -> Us
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Global-scope API tokens are not yet supported",
         )
+    # Record WHICH token authenticated this request. API-token auth resolves
+    # to the owning User, so without this a handler cannot tell a PBX's
+    # service token from the same person's browser session — and #972's
+    # location lookups have to log who asked about which identity, where
+    # "a token belonging to Alice" and "Alice at a keyboard" are different
+    # answers. Additive: nothing else reads it, and no behaviour changes.
+    request.state.api_token_id = token.id
+
     user = (await db.execute(select(User).where(User.id == token.user_id))).scalar_one_or_none()
     if user is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")

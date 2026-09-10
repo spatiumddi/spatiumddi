@@ -33,6 +33,7 @@ Every specification, deployment guide and driver internal, grouped by what you'r
 - [Integrations](features/INTEGRATIONS.md) — read-only Kubernetes + Docker + Proxmox VE + Tailscale + Cloud (AWS/Azure/GCP) mirrors into IPAM; per-integration setup, mirror semantics, dashboard surface, roadmap
 - [BGP Looking Glass](features/LOOKING_GLASS.md) — receive-only BGP collector (GoBGP) peering with the operator's routers; Sessions + Routes grid, RPKI status at ingest
 - [Vertical network awareness](features/VERTICALS.md) — AV-over-IP (Dante / AES67 / SMPTE 2110) flow descriptors, BACnet/IP device-instance registry + BBMD conformity, Industrial-OT inventory + Purdue zoning, DICOM AE Title registry + peer map, and the fragile-device do-not-probe flag
+- [E911 dispatchable location](features/E911.md) — SpatiumDDI as a Location Information Server: Emergency Response Locations as RFC 5139 civic addresses, switch-port / subnet / VLAN / device bindings, and a resolver that refuses a stale precise answer in favour of a fresh coarse one; RAY BAUM'S §506 conformity
 - [System Admin](features/SYSTEM_ADMIN.md) — config, health dashboard, backup/restore
 
 ## Deployment

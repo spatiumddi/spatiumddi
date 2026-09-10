@@ -19564,6 +19564,366 @@ export const dicomApi = {
       .then((r) => r.data),
 };
 
+// ── E911 dispatchable location (#972) ────────────────────────────────
+//
+// Mirrors app/api/v1/e911/router.py. CIVIC_FIELDS below is the one list
+// the forms iterate, so adding an RFC 5139 element is a single edit here
+// rather than a field added to four places — the backend keeps the same
+// property in app/models/e911.py::CIVIC_ELEMENTS, pinned by a test.
+
+export type E911RuleKind =
+  | "switch_port"
+  | "wireless_ap"
+  | "mac"
+  | "ip"
+  | "subnet"
+  | "vlan"
+  | "site_default";
+
+export type E911ValidationState = "unvalidated" | "validated" | "rejected";
+export type E911Confidence = "none" | "degraded" | "observed";
+
+/** Rule kinds most-specific first. Mirrors ERL_RULE_PRECEDENCE; the
+ *  server sends `precedence` on every binding so the UI never has to
+ *  derive the ordering itself — this is for labelling only. */
+export const E911_RULE_PRECEDENCE: E911RuleKind[] = [
+  "switch_port",
+  "wireless_ap",
+  "mac",
+  "ip",
+  "subnet",
+  "vlan",
+  "site_default",
+];
+
+export const E911_RULE_LABELS: Record<E911RuleKind, string> = {
+  switch_port: "Switch port",
+  wireless_ap: "Wireless AP",
+  mac: "MAC pin",
+  ip: "IP pin",
+  subnet: "Subnet",
+  vlan: "VLAN",
+  site_default: "Site default",
+};
+
+/** Which target field each rule kind requires. Mirrors
+ *  ERL_RULE_TARGET_COLUMN — the server refuses any other combination
+ *  with a 422 naming the field. */
+export const E911_RULE_TARGET: Record<E911RuleKind, keyof ERLBindingCreate> = {
+  switch_port: "network_interface_id",
+  wireless_ap: "bssid",
+  mac: "mac_address",
+  ip: "ip_address_id",
+  subnet: "subnet_id",
+  vlan: "vlan_ref_id",
+  site_default: "site_id",
+};
+
+export interface CivicAddress {
+  country?: string | null;
+  a1?: string | null;
+  a2?: string | null;
+  a3?: string | null;
+  a4?: string | null;
+  a5?: string | null;
+  a6?: string | null;
+  prd?: string | null;
+  pod?: string | null;
+  sts?: string | null;
+  hno?: string | null;
+  hns?: string | null;
+  lmk?: string | null;
+  loc?: string | null;
+  nam?: string | null;
+  pc?: string | null;
+  bld?: string | null;
+  unit?: string | null;
+  flr?: string | null;
+  room?: string | null;
+  plc?: string | null;
+  pcn?: string | null;
+  pobox?: string | null;
+  addcode?: string | null;
+  seat?: string | null;
+  rd?: string | null;
+  rdsec?: string | null;
+  rdbr?: string | null;
+  rdsubbr?: string | null;
+  prm?: string | null;
+  pom?: string | null;
+}
+
+/** The civic elements, grouped the way an operator fills them in rather
+ *  than the order RFC 5139 numbers them. "Interior" comes first because
+ *  it is the half RAY BAUM'S §506 is actually about — a street address
+ *  alone is not a dispatchable location. */
+export const CIVIC_FIELD_GROUPS: {
+  label: string;
+  hint?: string;
+  fields: { key: keyof CivicAddress; label: string; placeholder?: string }[];
+}[] = [
+  {
+    label: "Inside the building",
+    hint: "RAY BAUM'S §506 asks for room, floor, or similar. Without at least one of these an ERL is a street address, not a dispatchable location.",
+    fields: [
+      { key: "bld", label: "Building", placeholder: "A" },
+      { key: "flr", label: "Floor", placeholder: "3" },
+      { key: "unit", label: "Unit / suite", placeholder: "201" },
+      { key: "room", label: "Room", placeholder: "312" },
+      { key: "seat", label: "Seat / desk", placeholder: "14" },
+      {
+        key: "loc",
+        label: "Additional detail",
+        placeholder: "east wing, behind reception",
+      },
+    ],
+  },
+  {
+    label: "Street",
+    fields: [
+      { key: "hno", label: "House number", placeholder: "1234" },
+      { key: "hns", label: "Number suffix", placeholder: "A" },
+      { key: "prd", label: "Leading direction", placeholder: "N" },
+      { key: "rd", label: "Road name", placeholder: "Broadway" },
+      { key: "sts", label: "Street type", placeholder: "Avenue" },
+      { key: "pod", label: "Trailing suffix", placeholder: "SW" },
+    ],
+  },
+  {
+    label: "Locality",
+    fields: [
+      { key: "a3", label: "City", placeholder: "New York" },
+      { key: "a4", label: "City division" },
+      { key: "a5", label: "Neighbourhood" },
+      { key: "a2", label: "County" },
+      { key: "a1", label: "State / province", placeholder: "NY" },
+      { key: "pc", label: "Postal code", placeholder: "10001" },
+      {
+        key: "country",
+        label: "Country (ISO 3166-1 alpha-2)",
+        placeholder: "US",
+      },
+    ],
+  },
+  {
+    label: "Less common",
+    hint: "Carried because a provider's validated address must round-trip without loss.",
+    fields: [
+      { key: "nam", label: "Occupant / business name" },
+      { key: "lmk", label: "Landmark" },
+      { key: "plc", label: "Place type" },
+      { key: "pcn", label: "Postal community name" },
+      { key: "pobox", label: "PO box" },
+      { key: "addcode", label: "Additional code" },
+      { key: "a6", label: "Street (legacy A6)" },
+      { key: "rdsec", label: "Road section" },
+      { key: "rdbr", label: "Road branch" },
+      { key: "rdsubbr", label: "Road sub-branch" },
+      { key: "prm", label: "Road pre-modifier" },
+      { key: "pom", label: "Road post-modifier" },
+    ],
+  },
+];
+
+export interface GeoPoint {
+  latitude?: number | null;
+  longitude?: number | null;
+  altitude?: number | null;
+  altitude_unit?: "m" | "f" | null;
+}
+
+export interface ERL extends CivicAddress, GeoPoint {
+  id: string;
+  name: string;
+  site_id: string | null;
+  elins: string[];
+  validation_state: E911ValidationState;
+  validated_at: string | null;
+  validation_source: string | null;
+  validation_detail: string | null;
+  is_dispatchable: boolean;
+  is_active: boolean;
+  notes: string;
+  binding_count: number;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface ERLCreate extends CivicAddress, GeoPoint {
+  name: string;
+  site_id?: string | null;
+  elins?: string[];
+  is_active?: boolean;
+  notes?: string;
+}
+
+export type ERLUpdate = Partial<ERLCreate>;
+
+export interface ERLListResponse {
+  items: ERL[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface ERLListQuery {
+  limit?: number;
+  offset?: number;
+  site_id?: string;
+  validation_state?: E911ValidationState;
+  is_active?: boolean;
+  dispatchable?: boolean;
+  q?: string;
+}
+
+export interface E911ValidationVerdict {
+  state: E911ValidationState;
+  source?: string | null;
+  detail?: string | null;
+}
+
+export interface ERLBinding {
+  id: string;
+  erl_id: string;
+  erl_name: string;
+  rule_kind: E911RuleKind;
+  precedence: number;
+  network_interface_id: string | null;
+  bssid: string | null;
+  subnet_id: string | null;
+  vlan_ref_id: string | null;
+  mac_address: string | null;
+  ip_address_id: string | null;
+  site_id: string | null;
+  is_active: boolean;
+  notes: string;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface ERLBindingCreate {
+  erl_id: string;
+  rule_kind: E911RuleKind;
+  network_interface_id?: string | null;
+  bssid?: string | null;
+  subnet_id?: string | null;
+  vlan_ref_id?: string | null;
+  mac_address?: string | null;
+  ip_address_id?: string | null;
+  site_id?: string | null;
+  is_active?: boolean;
+  notes?: string;
+}
+
+/** Only the mutable fields — a binding's kind and target are its
+ *  identity, so repointing one is a delete plus a create. */
+export interface ERLBindingUpdate {
+  erl_id?: string;
+  is_active?: boolean;
+  notes?: string;
+}
+
+export interface ERLBindingListResponse {
+  items: ERLBinding[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface E911Evidence {
+  kind: string;
+  observed_at: string | null;
+  age_seconds: number | null;
+  window_seconds: number | null;
+  stale: boolean;
+  detail: string;
+}
+
+export interface E911Location {
+  identity_kind: string;
+  identity_value: string;
+  found: boolean;
+  confidence: E911Confidence;
+  rule_matched: E911RuleKind | null;
+  degraded_reason: string | null;
+  observed_at: string | null;
+  evidence_age_seconds: number | null;
+  erl: ERL | null;
+  evidence: E911Evidence[];
+}
+
+export const e911Api = {
+  listErls: (params?: ERLListQuery) =>
+    api.get<ERLListResponse>("/e911/erls", { params }).then((r) => r.data),
+  getErl: (id: string) => api.get<ERL>(`/e911/erls/${id}`).then((r) => r.data),
+  createErl: (data: ERLCreate) =>
+    api.post<ERL>("/e911/erls", data).then((r) => r.data),
+  updateErl: (id: string, data: ERLUpdate) =>
+    api.patch<ERL>(`/e911/erls/${id}`, data).then((r) => r.data),
+  removeErl: (id: string) => api.delete(`/e911/erls/${id}`),
+  // Records a verdict the operator obtained from their E911 provider.
+  // SpatiumDDI makes no outbound call and never decides this itself.
+  recordValidation: (id: string, data: E911ValidationVerdict) =>
+    api.post<ERL>(`/e911/erls/${id}/validation`, data).then((r) => r.data),
+
+  listBindings: (params?: {
+    limit?: number;
+    offset?: number;
+    erl_id?: string;
+    rule_kind?: E911RuleKind;
+    is_active?: boolean;
+  }) =>
+    api
+      .get<ERLBindingListResponse>("/e911/bindings", { params })
+      .then((r) => r.data),
+  createBinding: (data: ERLBindingCreate) =>
+    api.post<ERLBinding>("/e911/bindings", data).then((r) => r.data),
+  updateBinding: (id: string, data: ERLBindingUpdate) =>
+    api.patch<ERLBinding>(`/e911/bindings/${id}`, data).then((r) => r.data),
+  removeBinding: (id: string) => api.delete(`/e911/bindings/${id}`),
+
+  lookup: (params: {
+    ip?: string;
+    mac?: string;
+    chassis_id?: string;
+    port_id?: string;
+  }) => api.get<E911Location>("/e911/location", { params }).then((r) => r.data),
+
+  /** Exports (#972 Phase 3). Both return text the operator reads — the IOS
+   *  snippet is explicitly NOT applied to any device by SpatiumDDI.
+   *
+   *  Downloads through the axios client rather than a bare link so the
+   *  Authorization header is sent; these endpoints are permission-gated and a
+   *  plain `<a href>` would 401. Filename comes from Content-Disposition,
+   *  with the same UTC stamp fallback the IPAM exporter uses. */
+  download: async (kind: "csv" | "ios", siteId?: string) => {
+    const path =
+      kind === "csv" ? "/e911/export.csv" : "/e911/export/ios-lldp-med.txt";
+    const res = await api.get(path, {
+      params: siteId ? { site_id: siteId } : undefined,
+      responseType: "blob",
+    });
+    const disp = String(res.headers["content-disposition"] ?? "");
+    const match = disp.match(/filename="?([^"]+)"?/);
+    const ts = new Date()
+      .toISOString()
+      .slice(0, 19)
+      .replace(/[-:]/g, "")
+      .replace("T", "-");
+    const fallback =
+      kind === "csv" ? `e911-erls-${ts}.csv` : `e911-ios-lldp-med-${ts}.txt`;
+    const blob = new Blob([res.data as BlobPart]);
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = match ? match[1] : fallback;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  },
+};
+
 // ── OT / industrial devices (#542) ───────────────────────────────────
 
 export type OTProtocol =

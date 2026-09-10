@@ -37,7 +37,10 @@ _MANIFEST = _REPO_ROOT / ".github" / "scripts" / "ci-backend-must-run.txt"
 # entry here is only half the job — the read's prefix must also be in
 # ci-backend-must-run.txt, or the gate would skip the suite on the very
 # changes that break the test doing the reading.
-_KNOWN_REPO_ROOT_READS: dict[str, str] = {
+# A value may be a tuple when one test reads several out-of-tree files —
+# declaring only one of them would leave the other manifest prefix looking
+# unnecessary, which is the drift this guard exists to prevent.
+_KNOWN_REPO_ROOT_READS: dict[str, str | tuple[str, ...]] = {
     "test_spatium_console.py": "appliance/mkosi.extra/usr/local/bin/spatium-console",
     "test_appliance_join_auto_retry.py": (
         "appliance/mkosi.extra/usr/local/bin/spatium-cluster-join"
@@ -56,6 +59,14 @@ _KNOWN_REPO_ROOT_READS: dict[str, str] = {
     "test_lint_workflow_shell.py": "scripts/lint_workflow_shell.py",
     "test_dhcp_packet_loss.py": "agent/dhcp/spatium_dhcp_agent/metrics.py",
     "test_ntp_initial_seed.py": ("appliance/mkosi.extra/usr/local/bin/spatiumddi-firstboot"),
+    # #972 — the HELD endpoint is mounted at the application root, so it needs
+    # its own nginx location block in BOTH shipped templates or it falls
+    # through to the SPA and a PBX asking where a phone is gets index.html.
+    # The test reads both; both must therefore run this suite when edited.
+    "test_e911_held.py": (
+        "frontend/default.conf.template",
+        "charts/spatiumddi/templates/frontend-tls-config.yaml",
+    ),
 }
 
 # ``parents[2]`` from backend/tests/x.py is the repo root; anything at that
@@ -320,8 +331,10 @@ def test_every_declared_read_is_covered_by_the_manifest() -> None:
     Goes through the script rather than string-matching the manifest so the
     whole chain is exercised: read → manifest prefix → gate verdict.
     """
-    for test_file, read_path in _KNOWN_REPO_ROOT_READS.items():
-        assert _relevant(read_path), (
-            f"{test_file} reads {read_path}, but the gate would skip the "
-            f"suite on that path — add a covering prefix to {_MANIFEST.name}"
-        )
+    for test_file, declared in _KNOWN_REPO_ROOT_READS.items():
+        paths = (declared,) if isinstance(declared, str) else declared
+        for read_path in paths:
+            assert _relevant(read_path), (
+                f"{test_file} reads {read_path}, but the gate would skip the "
+                f"suite on that path — add a covering prefix to {_MANIFEST.name}"
+            )

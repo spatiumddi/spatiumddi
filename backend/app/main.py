@@ -5,13 +5,14 @@ from contextlib import asynccontextmanager, suppress
 
 import structlog
 import structlog.contextvars
-from fastapi import FastAPI, Request, Response
+from fastapi import Depends, FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from app.api.acme_well_known import router as acme_well_known_router
 from app.api.health import router as health_router
+from app.api.v1.e911.held_router import router as e911_held_router
 from app.api.v1.router import api_v1_router
 from app.config import settings
 from app.core.maintenance_mode import MaintenanceModeMiddleware
@@ -27,6 +28,7 @@ from app.services import (
     audit_forward,  # noqa: F401
     event_publisher,  # noqa: F401
 )
+from app.services.feature_modules import require_module
 
 logger = structlog.get_logger(__name__)
 
@@ -264,6 +266,7 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
             {"action": "admin", "resource_type": "av_flow"},
             {"action": "admin", "resource_type": "bacnet_device"},
             {"action": "admin", "resource_type": "dicom_ae"},
+            {"action": "admin", "resource_type": "e911_location"},
             {"action": "admin", "resource_type": "ot_device"},
             {"action": "admin", "resource_type": "network_service"},
             {"action": "admin", "resource_type": "overlay_network"},
@@ -863,6 +866,15 @@ def create_app() -> FastAPI:
     # Unauthenticated ACME http-01 well-known endpoint (issue #438 Phase 4),
     # mounted at root so the public CA can fetch it anonymously.
     app.include_router(acme_well_known_router)
+    # HELD (RFC 5985) at the application root, not under /api/v1: a HELD
+    # client is configured with a whole URL and the protocol names this
+    # path. Module-gated like the JSON surface; the third-party route is
+    # permission-gated on its own dependency and the self-query route is
+    # unauthenticated by design and off by default (#972).
+    app.include_router(
+        e911_held_router,
+        dependencies=[Depends(require_module("network.e911"))],
+    )
     app.include_router(api_v1_router, prefix="/api/v1")
 
     if settings.prometheus_metrics_enabled:

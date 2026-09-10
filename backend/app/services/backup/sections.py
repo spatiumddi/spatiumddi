@@ -193,7 +193,7 @@ SECTIONS: tuple[Section, ...] = (
     ),
     Section(
         key="verticals",
-        label="Vertical network awareness (multicast / AV / BACnet / OT / DICOM)",
+        label="Vertical network awareness (multicast / AV / BACnet / OT / DICOM / E911)",
         description=(
             "The multicast stream registry (groups + PIM domains + "
             "ports + memberships) and the vertical descriptors layered "
@@ -202,8 +202,15 @@ SECTIONS: tuple[Section, ...] = (
             "their internetwork-unique device instance numbers and "
             "BBMD tables, industrial-OT devices + Purdue zoning, and "
             "the DICOM AE Title registry with its configured "
-            "peer-association map. "
-            "References IPAM (space / subnet / address) and VLANs."
+            "peer-association map, and the E911 Emergency Response "
+            "Locations + their network bindings. "
+            "References IPAM (space / subnet / address) and VLANs. "
+            "NOTE: E911 bindings reference network_interface / subnet / "
+            "vlan / ip_address / site with ON DELETE CASCADE, so a "
+            "selective restore that rewinds IPAM or ownership without "
+            "this section leaves the dispatchable locations gone — which "
+            "is why they are catalogued here rather than left "
+            "unclassified."
         ),
         tables=(
             "multicast_domain",
@@ -217,6 +224,9 @@ SECTIONS: tuple[Section, ...] = (
             "ot_zone",
             "dicom_ae",
             "dicom_peer",
+            "emergency_response_location",
+            "erl_binding",
+            "e911_resolution_log",
         ),
     ),
     Section(

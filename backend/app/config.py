@@ -191,6 +191,19 @@ class Settings(BaseSettings):
     # See app/services/service_control/.
     service_control_enabled: bool = False
 
+    # #972 Phase 2 — the UNAUTHENTICATED HELD device self-query, where a
+    # phone asks for its own location and is answered from its TCP source
+    # address (RFC 5985 §6).
+    #
+    # Off by default, and that is not timidity: it is an endpoint that tells
+    # an anonymous caller which room the device at a given address is in.
+    # Turning it on is a decision to expose that to everything that can
+    # reach the API, so the operator is expected to firewall the path to the
+    # voice VLANs as well. It is rate-limited fail-CLOSED regardless, and it
+    # returns the location ONLY — never the MAC, the port or the hostname —
+    # because a phone has no need for those and an attacker would.
+    e911_self_query_enabled: bool = False
+
     # Appliance mode — set true by the appliance ISO compose env so
     # the API knows it's running on an appliance image (vs. plain
     # docker-compose / k8s). Gates the "Appliance" sidebar section

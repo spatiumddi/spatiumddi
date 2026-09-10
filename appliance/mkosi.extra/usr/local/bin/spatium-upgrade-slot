@@ -42,8 +42,9 @@ from pathlib import Path
 
 
 # Standard slot locations on a Phase 8a appliance install. These are
-# GPT partition names set by `sgdisk -c3:root_A -c4:root_B` in
-# spatium-install — distinct from the ext4 filesystem labels.
+# GPT partition names set by `sgdisk -c4:root_A -c5:root_B` in
+# spatium-install — distinct from the ext4 filesystem labels, which
+# ``_relabel_slot_filesystem`` below keeps in step with these (#1045).
 SLOT_PARTLABELS = {"root_a", "root_b"}
 
 
@@ -414,12 +415,68 @@ def cmd_apply(args) -> int:
     # filesystem's UUID before reading it so each slot stays unique.
     print(f"  randomising filesystem UUID on {target_dev} (tune2fs -U random)…")
     subprocess.run(["tune2fs", "-U", "random", target_dev], check=False)
-    # udev tag files cache UUIDs; nudge a re-read so the next blkid
-    # call doesn't return the stale baked-in value.
-    subprocess.run(["udevadm", "trigger", "--settle", target_dev], check=False)
+    # ...and the SAME argument applies to the filesystem LABEL, which is
+    # baked to `root_a` for both slots by build-slot-image.sh because it
+    # builds one image for both (#1045). Left alone, slot B comes out of
+    # its first upgrade labelled `root_a` and no partition on the disk
+    # carries `root_b` again, ever.
+    #
+    # Nothing on the boot path notices: grub.cfg renders `root=UUID=` and
+    # fstab has no root entry (only var / state / ESP, none of which a slot
+    # upgrade rewrites). What notices is the INSTALLER — spatium-install's
+    # `_layout_is_reusable` looked for a `root_b` label and silently stopped
+    # offering the #995 "Keep /var" reinstall. That side now matches slots
+    # by PARTLABEL so an already-duplicated disk still works; this is the
+    # fix for the cause rather than the symptom.
+    relabelled = _relabel_slot_filesystem(target_dev, inactive["partlabel"])
+
+    # Repair a disk written before that fix: the ACTIVE slot keeps whatever
+    # label a pre-#1045 upgrade left on it, and only becomes a target on a
+    # later upgrade. Safe to do live — it is one superblock field, on no
+    # boot path, and nothing reads it between here and the reboot; worst
+    # case the kernel's cached superblock wins and the label reverts, which
+    # is exactly the state we are already in. Never fatal for the same
+    # reason.
+    # The condition is the disagreement alone. An earlier draft required a
+    # truthy fslabel first, which skipped the repair on a slot carrying NO
+    # label at all — and "no label" is a missing label, the very thing being
+    # repaired, not a value to be cautious about. find_slot_partitions always
+    # sets the key (to "" when blkid reports none), so there is no third
+    # "unknown" state to protect here.
+    repaired_active = True
+    if active["fslabel"] != active["partlabel"]:
+        print(
+            f"  repairing active slot's filesystem label "
+            f"({active['fslabel'] or '(none)'} → {active['partlabel']}, #1045)…"
+        )
+        repaired_active = _relabel_slot_filesystem(
+            active["device"], active["partlabel"]
+        )
+
+    # udev tag files cache the UUID *and* the LABEL, so one settle covers
+    # every metadata change above — which is why it comes after BOTH
+    # relabels and not just the target's: a stale /dev/disk/by-label link
+    # for the active slot would otherwise survive until the next reboot.
+    for _dev in {target_dev, active["device"]}:
+        subprocess.run(["udevadm", "trigger", "--settle", _dev], check=False)
+
+    # Non-fatal, but not silent either. A label that provably did not stick
+    # is a real consequence the operator can act on — and a warning buried
+    # in a line that is followed by "upgrade complete" is one nobody reads,
+    # which is the #882 reporting lesson.
+    if not relabelled or not repaired_active:
+        print(
+            "  NOTE: a slot filesystem label could not be set (#1045). The "
+            "upgrade itself is unaffected — nothing boots by this label — "
+            "but a later reinstall of this box may not offer to keep /var. "
+            "`tune2fs -L <root_a|root_b> <slot device>` fixes it by hand.",
+            file=sys.stderr,
+        )
 
     # Re-read the partition's now-unique UUID. PARTLABEL is preserved because
-    # it lives in the GPT header, not the filesystem.
+    # it lives in the GPT header, not the filesystem — which is exactly the
+    # reasoning that missed the filesystem LABEL (#1045):
+    # that one IS inside the image, and is set explicitly above.
     new_uuid = _blkid_uuid(target_dev)
     if new_uuid:
         # Refresh our cached view so set-next-boot reflects the new UUID.
@@ -600,6 +657,67 @@ def _parent_disk(part_dev: str) -> str:
     if re.search(r"\dp\d+$", base):  # nvme0n1p5 / mmcblk0p5 / loop0p1
         return "/dev/" + re.sub(r"p\d+$", "", base)
     return "/dev/" + re.sub(r"\d+$", "", base)  # sda5 / vdb3
+
+
+def _relabel_slot_filesystem(device: str, partlabel: str) -> bool:
+    """Set ``device``'s ext4 label to ``partlabel``, its own GPT name (#1045).
+
+    Derived from the PARTLABEL rather than from a literal on purpose: the GPT
+    name is what genuinely identifies a slot, it is what ``find_slot_partitions``
+    already matches on, and it cannot be overwritten by a ``dd`` of a
+    filesystem image — which is the whole reason the filesystem label drifts.
+
+    Never fatal. The label is on no boot path (``root=UUID=`` on the kernel
+    cmdline, and fstab carries no root entry), and spatium-install matches the
+    slots by PARTLABEL, so a failure here costs nothing that is not already
+    the status quo. Returns whether the label now reads as intended.
+    """
+    if not device or partlabel not in SLOT_PARTLABELS:
+        return False
+    print(f"  labelling {device} filesystem '{partlabel}' (tune2fs -L)…")
+    proc = subprocess.run(
+        ["tune2fs", "-L", partlabel, device],
+        capture_output=True, text=True, check=False,
+    )
+    if proc.returncode != 0:
+        # stderr, not stdout: tune2fs reports a refusal there, and an
+        # unexplained "label not applied" is the thing that wastes an hour.
+        print(
+            f"  WARNING: could not label {device} '{partlabel}' "
+            f"(rc={proc.returncode}): {(proc.stderr or proc.stdout).strip()}",
+            file=sys.stderr,
+        )
+        return False
+    # Read it back off the device. On a MOUNTED filesystem tune2fs goes
+    # through FS_IOC_SETFSLABEL and the kernel owns the write, so this is
+    # also the only thing that distinguishes "applied" from "accepted and
+    # silently dropped".
+    actual = _blkid_label(device)
+    if actual != partlabel:
+        print(
+            f"  WARNING: {device} still reads LABEL={actual or '(none)'} "
+            f"after labelling it '{partlabel}'",
+            file=sys.stderr,
+        )
+        return False
+    return True
+
+
+def _blkid_label(device: str) -> str | None:
+    """Return the filesystem LABEL of the given block device, or None.
+
+    ``-p`` bypasses blkid's cache: the cache is exactly what is stale right
+    after a ``dd`` plus a relabel, and reading it would report the value we
+    are trying to verify has changed.
+    """
+    try:
+        proc = subprocess.run(
+            ["blkid", "-p", "-s", "LABEL", "-o", "value", device],
+            capture_output=True, text=True, check=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return None
+    return proc.stdout.strip() or None
 
 
 def _blkid_uuid(device: str) -> str | None:
