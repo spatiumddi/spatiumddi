@@ -882,25 +882,39 @@ async def delete_binding(binding_id: uuid.UUID, db: DB, user: CurrentUser) -> No
 # ══════════════════════════════════════════════════════════════════════
 
 
-def _log_row(
+def log_resolution(
+    db: AsyncSession,
     resolution: Resolution,
     *,
     user_id: uuid.UUID | None,
     api_token_id: uuid.UUID | None,
     source_ip: str | None,
-) -> E911ResolutionLog:
-    return E911ResolutionLog(
-        queried_at=datetime.now(UTC),
-        identity_kind=resolution.identity_kind,
-        identity_value=resolution.identity_value[:255],
-        actor_kind="api_token" if api_token_id else "user",
-        actor_id=api_token_id or user_id,
-        source_ip=source_ip,
-        erl_id=resolution.erl.id if resolution.erl else None,
-        rule_matched=resolution.rule_matched,
-        confidence=resolution.confidence,
-        degraded_reason=resolution.degraded_reason,
-        evidence_age_seconds=resolution.evidence_age_seconds,
+    actor_kind: str | None = None,
+) -> None:
+    """Record one lookup. Shared with the HELD surface.
+
+    Exported rather than private because the protocol a caller used changes
+    nothing about the fact that somebody asked where a person sits — and two
+    copies of this would be two places for the trail to quietly stop being
+    written.
+
+    ``actor_kind`` is derivable for an authenticated caller and is not for
+    the Phase 2 device self-query, where there is no user at all.
+    """
+    db.add(
+        E911ResolutionLog(
+            queried_at=datetime.now(UTC),
+            identity_kind=resolution.identity_kind,
+            identity_value=resolution.identity_value[:255],
+            actor_kind=actor_kind or ("api_token" if api_token_id else "user"),
+            actor_id=api_token_id or user_id,
+            source_ip=source_ip,
+            erl_id=resolution.erl.id if resolution.erl else None,
+            rule_matched=resolution.rule_matched,
+            confidence=resolution.confidence,
+            degraded_reason=resolution.degraded_reason,
+            evidence_age_seconds=resolution.evidence_age_seconds,
+        )
     )
 
 
@@ -945,13 +959,12 @@ async def get_location(
     # The trail is written whether or not anything was found: "nobody could
     # tell me where this phone was" is exactly the query an after-action
     # review needs to see.
-    db.add(
-        _log_row(
-            resolution,
-            user_id=user.id,
-            api_token_id=getattr(request.state, "api_token_id", None),
-            source_ip=request.client.host if request.client else None,
-        )
+    log_resolution(
+        db,
+        resolution,
+        user_id=user.id,
+        api_token_id=getattr(request.state, "api_token_id", None),
+        source_ip=request.client.host if request.client else None,
     )
     await db.commit()
 

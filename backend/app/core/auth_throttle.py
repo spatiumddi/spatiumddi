@@ -34,6 +34,12 @@ _LOGIN_RL_WINDOW_SECONDS = 60
 # once the challenge JWT expires the used-marker is moot.
 _MFA_USED_TTL_SECONDS = 5 * 60
 
+# 10 self-queries / 5 min / IP (#972 Phase 2). A phone asks for its own
+# location at boot and on a link change, not in a loop — so this is loose
+# for the legitimate caller and tight for anything enumerating a VLAN.
+_E911_SELF_RL_MAX = 10
+_E911_SELF_RL_WINDOW_SECONDS = 300
+
 
 async def login_rate_limited(ip: str | None) -> bool:
     """Increment the per-IP login counter and return True once it exceeds
@@ -54,6 +60,36 @@ async def login_rate_limited(ip: str | None) -> bool:
     except Exception as exc:  # noqa: BLE001 — throttle must never break login
         logger.warning("login_rate_limit_redis_unavailable", error=str(exc))
         return False
+
+
+async def e911_self_query_rate_limited(ip: str | None) -> bool:
+    """Per-source-IP budget on the unauthenticated HELD self-query (#972).
+
+    **Fails CLOSED, unlike the login throttle above.** That inversion is
+    deliberate and is the only one in this module. The login throttle
+    protects an endpoint whose real backstops are account lockout and a
+    second factor, so degrading it to a no-op during a Redis outage costs
+    little. This throttle IS the protection: behind it sits an
+    unauthenticated endpoint that answers "which room is the device at this
+    address in", and with Redis down an attacker inside the voice VLAN could
+    otherwise walk the estate at full speed. A phone asks once a boot; the
+    cost of failing closed is that it retries.
+    """
+    if not ip:
+        return True
+    key = f"e911_self_rl:{ip}"
+    try:
+        r = make_async_redis(settings.redis_url, socket_connect_timeout=2)
+        try:
+            count = await r.incr(key)
+            if count == 1:
+                await r.expire(key, _E911_SELF_RL_WINDOW_SECONDS)
+            return int(count) > _E911_SELF_RL_MAX
+        finally:
+            await r.aclose()
+    except Exception as exc:  # noqa: BLE001 — see the fail-closed note above
+        logger.warning("e911_self_query_rate_limit_redis_unavailable", error=str(exc))
+        return True
 
 
 async def mfa_challenge_consume(jti: str | None) -> bool:

@@ -43,6 +43,14 @@ class XmlResponse(Response):
     media_type = "application/xml"
 
 
+class HeldXmlResponse(Response):
+    """HELD (RFC 5985 §6.5) requires ``application/held+xml``, not
+    ``application/xml`` — a client content-negotiating on it would not
+    recognise the generic type."""
+
+    media_type = "application/held+xml"
+
+
 class PlainTextStreamResponse(Response):
     """``text/plain`` for a body assembled and returned whole (pod logs)."""
 
