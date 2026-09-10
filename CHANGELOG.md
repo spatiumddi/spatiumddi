@@ -367,7 +367,37 @@ the formatter handles the rest.
   one regex away from being none. Two new tests go at the parser
   directly, bypassing the guard, because the lesson is that reasoning
   about a parser's behaviour is not the same as measuring it.
-  209 backend tests. The resolver's were written before any API existed
+  **Four more from the PR's own bot reviewers, and the first is the
+  sharpest finding in the whole change.** The IP→MAC lease lookup was
+  unscoped across servers: DHCP leases are per-scope and the same
+  address legitimately exists in two overlapping networks — a 10.x
+  range reused behind two sites is the ordinary case, not a
+  pathological one. "Newest active lease for this IP" therefore
+  attached the caller to ANOTHER network's MAC, and from there to that
+  MAC's switch port and that port's room. A confident, precise,
+  completely wrong answer, which is the single failure mode this
+  module exists to prevent. It is now scoped to the subnet (resolved
+  first, for that reason), and an address resolving to more than one
+  distinct MAC makes the resolver decline to guess rather than pick
+  one.
+  The scoping is an OUTER join whose filter admits a lease with no
+  `scope_id`, and that detail is pinned by a test. An inner join
+  looked right and silently discarded every such lease — legitimate
+  and common, because a lease pulled from a server whose scopes
+  SpatiumDDI does not manage has nothing to point at. Admitting them
+  costs no safety: two candidate MACs decline either way.
+  The other three: a caller supplying `chassis_id` AND `port_id` fell
+  through to a MAC-only port lookup when that exact pair was not
+  found, so a stale or mistyped port returned the MAC's OTHER port and
+  the wrong room while looking authoritative — a named port now yields
+  no port match rather than a different one. The explicit chassis+port
+  path compared the raw lowercased string, so `aabb.cc11.2233` could
+  never match the same address stored as `aa:bb:cc:11:22:33` despite
+  the endpoint documenting that any common separator is accepted; a
+  MAC-shaped chassis-id is canonicalised now while an opaque subtype-7
+  identifier is still compared as given. And two unused locals in a
+  test.
+  216 backend tests. The resolver's were written before any API existed
   and both mutations were run against the shipped code to prove they
   bite — removing the staleness gate fails 4, reverting the precedence
   fails the pin test. **Deferred to their own changes:** HELD / PIDF-LO

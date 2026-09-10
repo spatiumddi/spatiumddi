@@ -836,3 +836,168 @@ async def test_a_fresh_ip_to_mac_mapping_still_reaches_the_pin(
     r = await resolve_location(db_session, ip=PHONE_IP, now=f.now)
     assert r.rule_matched == "mac"
     assert r.confidence == "observed"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Bot review findings on PR #1047
+# ══════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_an_ambiguous_ip_declines_to_guess_a_mac(db_session: AsyncSession) -> None:
+    """DHCP leases are per-scope and the same address legitimately exists in
+    two overlapping networks — a 10.x range reused behind two sites is the
+    ordinary case. An unscoped "newest active lease for this IP" attaches the
+    caller to ANOTHER network's MAC, and from there to that MAC's port and
+    that port's room: a confident, precise, completely wrong answer.
+
+    With no subnet to scope by and two candidate MACs, the resolver declines.
+    """
+    f = await _estate(db_session)
+    # Two active leases for the same address, different devices, no scope.
+    for mac in (PHONE_MAC, OTHER_MAC):
+        await _lease(db_session, f, ip="10.99.9.9", mac=mac)
+    await _bind(db_session, f.erls["pinned"], "mac", mac_address=PHONE_MAC)
+
+    r = await resolve_location(db_session, ip="10.99.9.9", now=f.now)
+    assert r.rule_matched != "mac", "guessed a MAC from an ambiguous address"
+    assert any("declining to guess" in e.detail for e in r.evidence)
+
+
+@pytest.mark.asyncio
+async def test_a_lease_with_no_scope_still_resolves(db_session: AsyncSession) -> None:
+    """Control, and it pins a decision a tidy-up would undo.
+
+    The scoping is an OUTER join whose filter admits a lease with NO
+    `scope_id`. An inner join looks right and silently discards every such
+    lease — which is legitimate and common, because a lease pulled from a
+    server whose scopes SpatiumDDI does not manage has nothing to point at.
+    This fixture's lease has no scope, so an inner join makes this test fail,
+    which is the point of it.
+    """
+    f = await _estate(db_session)
+    await _lease(db_session, f)
+    await _fdb(db_session, f, mac=PHONE_MAC, age_seconds=30)
+    await _bind(db_session, f.erls["room"], "switch_port", network_interface_id=f.iface.id)
+
+    r = await resolve_location(db_session, ip=PHONE_IP, now=f.now)
+    assert r.rule_matched == "switch_port"
+    assert r.erl is not None and r.erl.room == "312"
+
+
+@pytest.mark.asyncio
+async def test_a_named_port_does_not_fall_back_to_the_macs_other_port(
+    db_session: AsyncSession,
+) -> None:
+    """A caller that supplied `port_id` has told us which port it means.
+    Falling back to "wherever this MAC is learned" answers about a DIFFERENT
+    port, so a stale or mistyped port returned the wrong room while looking
+    authoritative."""
+    f = await _estate(db_session)
+    # The MAC IS learned on a port, and that port has the room-level binding.
+    await _fdb(db_session, f, mac=PHONE_MAC, age_seconds=30)
+    await _bind(db_session, f.erls["room"], "switch_port", network_interface_id=f.iface.id)
+    await _bind(db_session, f.erls["floor"], "subnet", subnet_id=f.subnet.id)
+
+    # ...but the caller names a port that does not exist.
+    r = await resolve_location(
+        db_session, ip=PHONE_IP, chassis_id=PHONE_MAC, port_id="Gi9/9/99", now=f.now
+    )
+    assert r.rule_matched != "switch_port", "fell back to the MAC's other port"
+    assert r.rule_matched == "subnet"
+
+
+@pytest.mark.asyncio
+async def test_a_chassis_id_matches_in_any_mac_spelling(
+    db_session: AsyncSession,
+) -> None:
+    """The endpoint documents that any common separator is accepted, and the
+    explicit chassis+port path compared the raw lowercased string — so
+    `aabb.cc11.2233` could never match the same address stored as
+    `aa:bb:cc:11:22:33`, silently breaking that promise."""
+    f = await _estate(db_session)
+    await _lldp(db_session, f, chassis_id=PHONE_MAC, age_seconds=30)
+    await _bind(db_session, f.erls["room"], "switch_port", network_interface_id=f.iface.id)
+
+    for spelling in ("AA:BB:CC:11:22:33", "aa-bb-cc-11-22-33", "aabb.cc11.2233", "aabbcc112233"):
+        r = await resolve_location(db_session, chassis_id=spelling, port_id="Gi3/0/12", now=f.now)
+        assert r.rule_matched == "switch_port", spelling
+        assert r.erl is not None and r.erl.room == "312", spelling
+
+
+@pytest.mark.asyncio
+async def test_an_opaque_chassis_id_is_compared_as_given(
+    db_session: AsyncSession,
+) -> None:
+    """An LLDP subtype-7 identifier has no canonical form, so canonicalising
+    must not be applied to it."""
+    f = await _estate(db_session)
+    db_session.add(
+        NetworkNeighbour(
+            device_id=f.device.id,
+            interface_id=f.iface.id,
+            local_port_num=12,
+            remote_chassis_id_subtype=7,
+            remote_chassis_id="switch-closet-3",
+            remote_port_id_subtype=5,
+            remote_port_id="Gi3/0/12",
+            first_seen=f.now - timedelta(seconds=90),
+            last_seen=f.now - timedelta(seconds=30),
+        )
+    )
+    await db_session.flush()
+    await _bind(db_session, f.erls["room"], "switch_port", network_interface_id=f.iface.id)
+
+    r = await resolve_location(
+        db_session, chassis_id="switch-closet-3", port_id="Gi3/0/12", now=f.now
+    )
+    assert r.rule_matched == "switch_port"
+
+
+@pytest.mark.asyncio
+async def test_a_lease_in_another_subnets_scope_is_not_used(
+    db_session: AsyncSession,
+) -> None:
+    """The positive direction of the scoping. A lease for the same address in
+    a DIFFERENT subnet's scope belongs to a different device, and using its
+    MAC would attach the caller to that device's port and room."""
+    from app.models.dhcp import DHCPScope, DHCPServerGroup
+
+    f = await _estate(db_session)
+    other = Subnet(
+        space_id=f.subnet.space_id,
+        block_id=f.subnet.block_id,
+        network="10.20.88.0/24",
+        name="other-site",
+        subnet_role="voice",
+    )
+    db_session.add(other)
+    await db_session.flush()
+    group = DHCPServerGroup(name=f"grp-{uuid.uuid4().hex[:6]}")
+    db_session.add(group)
+    await db_session.flush()
+    server = DHCPServer(name=f"kea-{uuid.uuid4().hex[:6]}", driver="kea", host="10.20.0.9")
+    db_session.add(server)
+    await db_session.flush()
+    # A scope belongs to a GROUP, not directly to a server.
+    scope = DHCPScope(group_id=group.id, subnet_id=other.id, name="other-scope")
+    db_session.add(scope)
+    await db_session.flush()
+    db_session.add(
+        DHCPLease(
+            server_id=server.id,
+            scope_id=scope.id,
+            ip_address=PHONE_IP,
+            mac_address=OTHER_MAC,
+            state="active",
+            last_seen_at=f.now - timedelta(seconds=5),
+        )
+    )
+    await db_session.flush()
+    # The other subnet's device is pinned to a different room.
+    await _bind(db_session, f.erls["pinned"], "mac", mac_address=OTHER_MAC)
+    await _bind(db_session, f.erls["floor"], "subnet", subnet_id=f.subnet.id)
+
+    r = await resolve_location(db_session, ip=PHONE_IP, now=f.now)
+    assert r.rule_matched != "mac", "used a lease from another subnet's scope"
+    assert r.rule_matched == "subnet"

@@ -51,7 +51,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 # package ``__init__`` — which is what keeps it out of a cycle. See
 # ``app/core/mac.py`` for the two earlier homes that were both wrong.
 from app.core.mac import canonicalize_mac
-from app.models.dhcp import DHCPLease
+from app.models.dhcp import DHCPLease, DHCPScope
 from app.models.e911 import (
     ERL_RULE_PRECEDENCE,
     EmergencyResponseLocation,
@@ -154,27 +154,66 @@ async def _freshness_window(db: AsyncSession, interface_id: uuid.UUID) -> int:
 
 
 async def _mac_from_ip(
-    db: AsyncSession, ip: str, now: datetime
+    db: AsyncSession, ip: str, now: datetime, *, subnet: Subnet | None
 ) -> tuple[str | None, Evidence | None]:
     """Resolve IP → MAC, preferring a live DHCP lease.
 
     The lease is the better source: it is the binding the DHCP server is
     currently honouring. ``IpMacHistory`` is the fallback for statically
     addressed phones, which never appear in a lease table at all.
+
+    **Scoped to the subnet, and ambiguity fails closed.** DHCP leases are
+    per-server and per-scope, so the same address legitimately exists in two
+    overlapping networks — a 10.x RFC 1918 range reused behind two different
+    sites is the ordinary case, not a pathological one. An unscoped "newest
+    active lease for this IP" therefore attaches the caller to ANOTHER
+    network's MAC, and from there to that MAC's switch port and that port's
+    room: a confident, precise, completely wrong answer, which is the single
+    failure mode this module exists to prevent.
+
+    So when the subnet is known the query is constrained to scopes serving it.
+    When it is not, and the address resolves to more than one distinct MAC,
+    the resolver declines to guess: no MAC is returned, the port-level and
+    pin rules are skipped, and the answer degrades to whatever the IP alone
+    supports.
     """
-    lease = (
-        await db.execute(
-            select(DHCPLease.mac_address, DHCPLease.last_seen_at)
-            .where(
-                DHCPLease.ip_address == ip,
-                DHCPLease.state == "active",
-            )
-            .order_by(DHCPLease.last_seen_at.desc())
-            .limit(1)
+    lease_q = (
+        select(DHCPLease.mac_address, DHCPLease.last_seen_at)
+        .where(DHCPLease.ip_address == ip, DHCPLease.state == "active")
+        .order_by(DHCPLease.last_seen_at.desc())
+    )
+    if subnet is not None:
+        # OUTER join, and the filter admits a lease with NO scope recorded.
+        # An inner join looked right and silently discarded every lease whose
+        # `scope_id` is NULL — which is legitimate and common: a lease pulled
+        # from a server whose scopes SpatiumDDI does not manage has nothing to
+        # point at. Dropping those would make the IP→MAC hop fail on exactly
+        # the estates that adopted the DHCP mirror without the scope model,
+        # and the feature would quietly stop working for them.
+        #
+        # Ambiguity is still refused below, so admitting the unscoped rows
+        # costs no safety: two candidate MACs decline either way.
+        lease_q = lease_q.outerjoin(DHCPScope, DHCPScope.id == DHCPLease.scope_id).where(
+            or_(DHCPScope.subnet_id == subnet.id, DHCPLease.scope_id.is_(None))
         )
-    ).first()
-    if lease is not None:
-        mac, seen = lease
+
+    leases = (await db.execute(lease_q.limit(10))).all()
+    distinct_macs = {str(m) for m, _seen in leases}
+    if len(distinct_macs) > 1:
+        # Two networks, one address. Declining is the whole point.
+        return None, Evidence(
+            kind="dhcp_lease",
+            observed_at=None,
+            age_seconds=None,
+            window_seconds=None,
+            stale=True,
+            detail=(
+                f"{len(distinct_macs)} active leases for {ip} on different "
+                "scopes — declining to guess which device it is"
+            ),
+        )
+    if leases:
+        mac, seen = leases[0]
         age = _age_seconds(seen, now)
         return str(mac), Evidence(
             kind="dhcp_lease",
@@ -184,28 +223,46 @@ async def _mac_from_ip(
             # A lease that has expired out of `active` is already excluded
             # above; age here is reported, not gated, because the DHCP
             # server's own lifetime is the authority on a lease and
-            # second-guessing it with our poll cadence would degrade
-            # answers that are perfectly current.
+            # second-guessing it with our poll cadence would degrade answers
+            # that are perfectly current.
             stale=False,
-            detail=f"active DHCP lease for {ip}",
+            detail=f"active DHCP lease for {ip}"
+            + (f" in {subnet.network}" if subnet is not None else ""),
         )
 
-    row = (
-        await db.execute(
-            # ``IPAddress.address == ip``, never a cast to text: an INET
-            # compared by SPELLING is the #877 failure — 2606:4700::1111 and
-            # its expanded form are one host and two strings, so an IPv6
-            # lookup would silently answer "no location". It is also
-            # non-sargable, on the flagship query of the feature.
-            select(IpMacHistory.mac_address, IpMacHistory.last_seen)
-            .join(IPAddress, IPAddress.id == IpMacHistory.ip_address_id)
-            .where(IPAddress.address == ip)
-            .order_by(IpMacHistory.last_seen.desc())
-            .limit(1)
+    hist_q = (
+        select(IpMacHistory.mac_address, IpMacHistory.last_seen)
+        # ``IPAddress.address == ip``, never a cast to text: an INET compared
+        # by SPELLING is the #877 failure — 2606:4700::1111 and its expanded
+        # form are one host and two strings, so an IPv6 lookup would silently
+        # answer "no location". It is also non-sargable, on the flagship
+        # query of the feature.
+        .join(IPAddress, IPAddress.id == IpMacHistory.ip_address_id)
+        .where(IPAddress.address == ip)
+        .order_by(IpMacHistory.last_seen.desc())
+    )
+    if subnet is not None:
+        # Same scoping argument, and here it is unconditional: an IPAM address
+        # row ALWAYS has a subnet (the column is NOT NULL), so there is no
+        # legitimate unscoped case to admit.
+        hist_q = hist_q.where(IPAddress.subnet_id == subnet.id)
+
+    rows = (await db.execute(hist_q.limit(10))).all()
+    hist_macs = {str(m) for m, _seen in rows}
+    if len(hist_macs) > 1:
+        return None, Evidence(
+            kind="ip_mac_history",
+            observed_at=None,
+            age_seconds=None,
+            window_seconds=None,
+            stale=True,
+            detail=(
+                f"{len(hist_macs)} addresses matching {ip} in different "
+                "subnets — declining to guess which device it is"
+            ),
         )
-    ).first()
-    if row is not None:
-        mac, seen = row
+    if rows:
+        mac, seen = rows[0]
         age = _age_seconds(seen, now)
         # Gated, unlike the lease branch. A lease is a binding the DHCP
         # server is currently honouring; an IpMacHistory row is only the last
@@ -475,6 +532,13 @@ async def resolve_location(
         identity_kind, identity_value = "ip", asked_ip
 
     # ── Facts ────────────────────────────────────────────────────────
+    #
+    # The subnet is resolved FIRST, before any IP→MAC inference, because that
+    # inference has to be scoped to it: leases are per-scope and the same
+    # address legitimately exists in two overlapping networks. See
+    # _mac_from_ip.
+    subnet = await _subnet_for_ip(db, ip) if ip else None
+
     mac_canon: str | None = None
     for candidate in (mac, chassis_id):
         if not candidate:
@@ -496,7 +560,7 @@ async def resolve_location(
     mac_inference_stale = False
     mac_stale_age: int | None = None
     if mac_canon is None and ip:
-        mac_canon, mac_evidence = await _mac_from_ip(db, ip, now)
+        mac_canon, mac_evidence = await _mac_from_ip(db, ip, now, subnet=subnet)
         if mac_evidence:
             evidence.append(mac_evidence)
             mac_inference_stale = mac_evidence.stale
@@ -507,13 +571,26 @@ async def resolve_location(
     if chassis_id and port_id:
         # An explicit chassis+port identity names the port directly — this
         # is how a PBX that already knows the wiremap asks.
+        #
+        # A MAC-shaped chassis-id is compared CANONICALLY, because the
+        # endpoint documents that any common separator is accepted and a raw
+        # lowercase compare silently breaks that promise: `aabb.cc11.2233`
+        # would never match the same address stored as `aa:bb:cc:11:22:33`.
+        # An opaque subtype-7 identifier has no canonical form and is
+        # compared as given.
+        if mac_canon is not None:
+            chassis_match = func.lower(
+                func.replace(func.replace(NetworkNeighbour.remote_chassis_id, ":", ""), "-", "")
+            ) == mac_canon.replace(":", "")
+        else:
+            chassis_match = func.lower(NetworkNeighbour.remote_chassis_id) == (chassis_id.lower())
         row = (
             await db.execute(
                 select(NetworkNeighbour.interface_id, NetworkNeighbour.last_seen)
                 .where(
                     NetworkNeighbour.interface_id.is_not(None),
                     NetworkNeighbour.remote_port_id == port_id,
-                    func.lower(NetworkNeighbour.remote_chassis_id) == chassis_id.lower(),
+                    chassis_match,
                 )
                 .order_by(NetworkNeighbour.last_seen.desc())
                 .limit(1)
@@ -531,12 +608,17 @@ async def resolve_location(
                 stale=age is not None and age > window,
                 detail=f"LLDP neighbour {chassis_id} on port {port_id}",
             )
-    if interface_id is None and mac_canon:
+    elif mac_canon:
+        # Only when no port was NAMED. A caller that supplied `port_id` has
+        # told us which port it means, and falling back to "wherever this MAC
+        # is learned" would answer about a different port — so a stale or
+        # mistyped port returns the wrong room while looking authoritative.
+        # No port match is the honest answer there; the coarser rules still
+        # apply.
         interface_id, port_evidence = await _port_from_mac(db, mac_canon, now)
     if port_evidence:
         evidence.append(port_evidence)
 
-    subnet = await _subnet_for_ip(db, ip) if ip else None
     site_id: uuid.UUID | None = subnet.site_id if subnet else None
     if site_id is None and interface_id is not None:
         site_id = (

@@ -477,7 +477,9 @@ async def test_held_requires_authentication(client, db_session) -> None:
 async def test_the_self_query_is_404_while_disabled(client, db_session) -> None:
     """A 404 rather than a 403, so a disabled surface does not advertise
     itself to a scanner."""
-    ip, _room = await _estate_with_location(db_session)
+    # The estate exists so the 404 is about the FEATURE being off, not about
+    # there being nothing to find. Its return value is deliberately unused.
+    await _estate_with_location(db_session)
     res = await client.post("/held/self", content=_req(""), headers=HELD_CT)
     assert res.status_code == 404
 
