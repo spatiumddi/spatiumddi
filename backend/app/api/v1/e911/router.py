@@ -473,7 +473,9 @@ async def list_erls(
     ),
 ) -> ERLListResponse:
     """List Emergency Response Locations, name order."""
-    filters = {
+    # Annotated dict[str, Any] so the ``**filters`` splat type-checks — the
+    # same shape the DICOM list route uses.
+    filters: dict[str, Any] = {
         "site_id": site_id,
         "validation_state": validation_state,
         "is_active": is_active,

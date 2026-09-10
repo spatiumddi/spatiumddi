@@ -160,6 +160,71 @@ _BUILTIN_POLICIES: list[dict[str, object]] = [
         "check_kind": "voice_segment_not_internet_facing",
         "check_args": {},
     },
+    # ── E911 dispatchable location (issue #972) ─────────────────────
+    #
+    # RAY BAUM'S Act §506 puts the dispatchable-location duty on the
+    # ENTERPRISE, not the carrier, so these are the first conformity
+    # policies in the tree that carry a real regulatory citation rather
+    # than ``framework: custom``.
+    {
+        "name": "Voice subnets must reach an Emergency Response Location",
+        "description": (
+            "Every subnet tagged as a voice segment must resolve to an "
+            "ERL by some rule — its own binding, its VLAN's, or its "
+            "site's default. A voice segment with no ERL at any level "
+            "means a 911 call from it carries no dispatchable location, "
+            "which is the RAY BAUM'S §506 gap. The site default counts: "
+            "the front door is a poor answer and it is still a "
+            "dispatchable location, where a policy demanding room-level "
+            "bindings would fail every site on day one and be turned off."
+        ),
+        "framework": "RAY BAUM'S Act",
+        "reference": "47 CFR 9.16(b)",
+        "severity": "critical",
+        "target_kind": "subnet",
+        "target_filter": {"subnet_role": "voice"},
+        "check_kind": "e911_voice_subnet_unbound",
+        "check_args": {},
+    },
+    {
+        "name": "In-use Emergency Response Locations are provider-validated",
+        "description": (
+            "Every ERL something is bound to carries an address-"
+            "validation verdict from the operator's E911 provider "
+            "against the MSAG / NG911 LVF. SpatiumDDI records the "
+            "verdict and never decides it, so this asks whether anybody "
+            "has confirmed the addresses — the question nobody asks "
+            "until a call fails to route. A REJECTED verdict fails "
+            "harder than a missing one: somebody checked and the answer "
+            "was no. Unbound ERLs are skipped, so drafts do not bury the "
+            "ones in use."
+        ),
+        "framework": "RAY BAUM'S Act",
+        "reference": "47 CFR 9.16(b)",
+        "severity": "critical",
+        "target_kind": "platform",
+        "target_filter": {},
+        "check_kind": "e911_erl_validated",
+        "check_args": {},
+    },
+    {
+        "name": "Switch-port ERL bindings sit on devices still being polled",
+        "description": (
+            "A port-level ERL binding is only as good as the FDB / LLDP "
+            "data behind it. When the switch stops being polled the "
+            "resolver ALREADY degrades every lookup for that port to a "
+            "coarser answer, silently from the operator's point of view. "
+            "This is the difference between 'our room-level locations "
+            "work' and 'they stopped working in March'."
+        ),
+        "framework": "RAY BAUM'S Act",
+        "reference": "47 CFR 9.16(b)",
+        "severity": "warning",
+        "target_kind": "platform",
+        "target_filter": {},
+        "check_kind": "e911_port_binding_evidence_fresh",
+        "check_args": {},
+    },
     # ── Multicast hygiene (issue #126) ──────────────────────────────
     {
         "name": "No multicast group address collisions within an IPSpace",

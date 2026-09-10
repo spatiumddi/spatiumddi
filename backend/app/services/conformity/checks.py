@@ -41,7 +41,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.alerts import AlertRule
@@ -50,8 +50,10 @@ from app.models.audit import AuditLog
 from app.models.av import AVFlowProfile, AVReservedRange
 from app.models.bacnet import BACnetDevice
 from app.models.dicom import DICOMApplicationEntity
+from app.models.e911 import EmergencyResponseLocation, ERLBinding
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
 from app.models.multicast import MulticastGroup
+from app.models.network import NetworkDevice, NetworkInterface
 from app.models.nmap import NmapScan
 from app.models.ot import OTDevice, OTZone
 from app.services import alerts as alert_service
@@ -1479,6 +1481,246 @@ async def check_dicom_ae_no_tls(
     )
 
 
+# ── E911 dispatchable location (#972) ───────────────────────────────
+#
+# Three checks answering the three questions an auditor actually asks: is
+# there a location for this network at all, has anybody confirmed the
+# address, and is the evidence behind the precise answers still arriving.
+
+
+@register("e911_voice_subnet_unbound")
+async def check_e911_voice_subnet_unbound(
+    db: AsyncSession,
+    *,
+    target: object | None,
+    target_kind: str,
+    args: dict[str, Any],
+    now: datetime,
+) -> CheckOutcome:
+    """Pass when a voice subnet can reach an ERL by SOME rule.
+
+    This is the RAY BAUM'S §506 gap, findable before the audit rather than
+    after an incident: a voice segment with no Emergency Response Location
+    at any level means a 911 call from it carries no dispatchable location.
+
+    "Some rule" deliberately includes the site default. The front door is a
+    poor answer and it is still a dispatchable location; a check demanding
+    room-level bindings would fail every site on day one and get turned
+    off, which is how a compliance signal becomes noise.
+    """
+    _ = args, now, target_kind
+    if not isinstance(target, Subnet):
+        return CheckOutcome.not_applicable("requires target_kind=subnet")
+    if target.subnet_role != "voice":
+        return CheckOutcome.not_applicable(
+            "subnet is not tagged as a voice segment",
+            {"subnet_role": target.subnet_role},
+        )
+
+    # The subnet's own rule, its VLAN's, or its site's default — the three
+    # levels the resolver can reach for a device here with no port-level
+    # evidence. A `mac` or `ip` pin is deliberately NOT counted: pinning one
+    # handset says nothing about the segment.
+    conditions = [ERLBinding.subnet_id == target.id]
+    if target.vlan_ref_id is not None:
+        conditions.append(ERLBinding.vlan_ref_id == target.vlan_ref_id)
+    if target.site_id is not None:
+        conditions.append(ERLBinding.site_id == target.site_id)
+
+    rule = (
+        await db.execute(
+            select(ERLBinding.rule_kind)
+            .join(
+                EmergencyResponseLocation,
+                EmergencyResponseLocation.id == ERLBinding.erl_id,
+            )
+            .where(
+                or_(*conditions),
+                ERLBinding.is_active.is_(True),
+                EmergencyResponseLocation.is_active.is_(True),
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if rule is None:
+        return CheckOutcome.fail(
+            "voice subnet has no ERL binding at subnet, VLAN or site level",
+            {
+                "subnet": str(target.network),
+                "vlan_ref_id": str(target.vlan_ref_id) if target.vlan_ref_id else None,
+                "site_id": str(target.site_id) if target.site_id else None,
+            },
+        )
+    return CheckOutcome.passed(
+        f"voice subnet reaches an ERL via its {rule} binding",
+        {"rule_kind": rule},
+    )
+
+
+@register("e911_erl_validated")
+async def check_e911_erl_validated(
+    db: AsyncSession,
+    *,
+    target: object | None,
+    target_kind: str,
+    args: dict[str, Any],
+    now: datetime,
+) -> CheckOutcome:
+    """Pass when every ERL in use carries a recent validation verdict.
+
+    SpatiumDDI never decides this — the verdict comes from the operator's
+    E911 provider against the MSAG / NG911 LVF and is recorded here. So the
+    check asks whether anybody has confirmed the addresses, which is exactly
+    the question nobody asks until a call fails to route.
+
+    An ERL with no bindings is skipped: an address nothing points at
+    dispatches nobody, and failing on drafts would bury the ones in use.
+    """
+    _ = target_kind
+    if target is not None:
+        return CheckOutcome.not_applicable("requires target_kind=platform")
+    max_age_days = int(args.get("max_age_days") or 365)
+
+    rows = list(
+        (
+            await db.execute(
+                select(EmergencyResponseLocation)
+                .join(ERLBinding, ERLBinding.erl_id == EmergencyResponseLocation.id)
+                .where(
+                    EmergencyResponseLocation.is_active.is_(True),
+                    ERLBinding.is_active.is_(True),
+                )
+                .distinct()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not rows:
+        return CheckOutcome.not_applicable("no ERL is currently bound to anything")
+
+    cutoff = now - timedelta(days=max_age_days)
+    never: list[str] = []
+    rejected: list[str] = []
+    stale: list[str] = []
+    for erl in rows:
+        if erl.validation_state == "rejected":
+            rejected.append(erl.name)
+        elif erl.validation_state != "validated" or erl.validated_at is None:
+            never.append(erl.name)
+        elif erl.validated_at < cutoff:
+            stale.append(erl.name)
+
+    if rejected:
+        # A REJECTED verdict is a stronger signal than one never sought:
+        # somebody checked, and the answer was no.
+        return CheckOutcome.fail(
+            f"{len(rejected)} in-use ERL(s) carry a REJECTED address verdict",
+            {"rejected": sorted(rejected)[:20], "never_validated": sorted(never)[:20]},
+        )
+    if never:
+        return CheckOutcome.fail(
+            f"{len(never)} in-use ERL(s) have never been validated",
+            {"never_validated": sorted(never)[:20], "total_in_use": len(rows)},
+        )
+    if stale:
+        # Warn, not fail: the address is almost certainly still right, and
+        # the re-validation cadence is the operator's policy, not ours.
+        return CheckOutcome.warn(
+            f"{len(stale)} in-use ERL(s) were last validated over {max_age_days} days ago",
+            {"stale": sorted(stale)[:20], "max_age_days": max_age_days},
+        )
+    return CheckOutcome.passed(
+        f"all {len(rows)} in-use ERL(s) carry a verdict inside {max_age_days} days",
+        {"total_in_use": len(rows)},
+    )
+
+
+@register("e911_port_binding_evidence_fresh")
+async def check_e911_port_binding_evidence_fresh(
+    db: AsyncSession,
+    *,
+    target: object | None,
+    target_kind: str,
+    args: dict[str, Any],
+    now: datetime,
+) -> CheckOutcome:
+    """Pass when every switch-port ERL binding sits on a polled device.
+
+    A port-level binding is only as good as the FDB/LLDP data behind it. If
+    the device stopped being polled, the resolver is ALREADY degrading every
+    lookup for that port to a coarser answer — silently, from the operator's
+    point of view. This says so out loud, which is the difference between
+    "our room-level locations work" and "they stopped working in March".
+
+    Keyed on the device's own poll state rather than on the evidence rows:
+    an unpolled switch eventually has no FDB rows at all, so a check that
+    looked for stale rows would PASS on the worst case.
+    """
+    _ = target_kind
+    if target is not None:
+        return CheckOutcome.not_applicable("requires target_kind=platform")
+
+    rows = (
+        await db.execute(
+            select(
+                NetworkDevice.name,
+                NetworkDevice.last_poll_at,
+                NetworkDevice.last_poll_status,
+                NetworkDevice.poll_interval_seconds,
+                NetworkDevice.is_active,
+                func.count(ERLBinding.id),
+            )
+            .select_from(ERLBinding)
+            .join(
+                NetworkInterface,
+                NetworkInterface.id == ERLBinding.network_interface_id,
+            )
+            .join(NetworkDevice, NetworkDevice.id == NetworkInterface.device_id)
+            .where(
+                ERLBinding.rule_kind == "switch_port",
+                ERLBinding.is_active.is_(True),
+            )
+            .group_by(
+                NetworkDevice.id,
+                NetworkDevice.name,
+                NetworkDevice.last_poll_at,
+                NetworkDevice.last_poll_status,
+                NetworkDevice.poll_interval_seconds,
+                NetworkDevice.is_active,
+            )
+        )
+    ).all()
+    if not rows:
+        return CheckOutcome.not_applicable("no switch-port ERL bindings exist")
+
+    broken: list[dict[str, Any]] = []
+    for name, last_poll, poll_status, interval, is_active, count in rows:
+        window = (int(interval) if interval else 300) * 2
+        why: str | None = None
+        if not is_active:
+            why = "device is not active"
+        elif last_poll is None:
+            why = "device has never been polled"
+        elif (now - last_poll).total_seconds() > window:
+            age = int((now - last_poll).total_seconds())
+            why = f"last polled {age}s ago (window {window}s)"
+        elif poll_status not in ("ok", "success"):
+            why = f"last poll status is {poll_status!r}"
+        if why:
+            broken.append({"device": name, "bindings": int(count), "reason": why})
+
+    if broken:
+        return CheckOutcome.fail(
+            f"{len(broken)} device(s) carrying switch-port ERL bindings are not polled",
+            {"devices": broken[:20]},
+        )
+    return CheckOutcome.passed(
+        f"all {len(rows)} device(s) with switch-port ERL bindings are polling normally",
+        {"device_count": len(rows)},
+    )
+
+
 CHECK_CATALOG: list[dict[str, Any]] = [
     {
         "name": "has_field",
@@ -1667,6 +1909,32 @@ CHECK_CATALOG: list[dict[str, Any]] = [
     {
         "name": "dicom_ae_no_tls",
         "label": "DICOM AEs are recorded as TLS-enabled",
+        "supports": ["platform"],
+        "args": [],
+    },
+    {
+        "name": "e911_voice_subnet_unbound",
+        "label": "Voice subnet can reach an Emergency Response Location",
+        "supports": ["subnet"],
+        "args": [],
+    },
+    {
+        "name": "e911_erl_validated",
+        "label": "Every in-use ERL carries a provider validation verdict",
+        "supports": ["platform"],
+        "args": [
+            {
+                "name": "max_age_days",
+                "type": "int",
+                "required": False,
+                "default": 365,
+                "label": "Warn when a verdict is older than N days",
+            }
+        ],
+    },
+    {
+        "name": "e911_port_binding_evidence_fresh",
+        "label": "Switch-port ERL bindings sit on devices that are still polled",
         "supports": ["platform"],
         "args": [],
     },
