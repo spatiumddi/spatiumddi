@@ -188,9 +188,22 @@ def test_the_active_slot_is_repaired_only_when_it_disagrees() -> None:
     superblock write for nothing."""
     body = _apply_body()
     assert re.search(
-        r'if active\.get\("fslabel"\) and active\["fslabel"\] != active\["partlabel"\]:',
-        body,
+        r'if active\["fslabel"\] != active\["partlabel"\]:', body
     ), "the active-slot repair must be gated on an actual disagreement"
+
+
+def test_an_unlabelled_active_slot_is_still_repaired() -> None:
+    """``active.get("fslabel") and …`` was the first draft, and it skipped
+    the repair on a slot carrying NO label — which is a missing label, i.e.
+    the thing being repaired, not a value to be careful about.
+    ``find_slot_partitions`` always sets the key, so there is no third
+    "unknown" state the truthiness check could have been protecting.
+    """
+    body = _apply_body()
+    assert 'active.get("fslabel") and' not in body
+    # And the message has to survive an empty value rather than printing
+    # "( → root_a)".
+    assert "active['fslabel'] or '(none)'" in body
 
 
 def test_the_stale_sgdisk_indices_in_the_comment_are_fixed() -> None:

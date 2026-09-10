@@ -437,11 +437,17 @@ def cmd_apply(args) -> int:
     # case the kernel's cached superblock wins and the label reverts, which
     # is exactly the state we are already in. Never fatal for the same
     # reason.
+    # The condition is the disagreement alone. An earlier draft required a
+    # truthy fslabel first, which skipped the repair on a slot carrying NO
+    # label at all — and "no label" is a missing label, the very thing being
+    # repaired, not a value to be cautious about. find_slot_partitions always
+    # sets the key (to "" when blkid reports none), so there is no third
+    # "unknown" state to protect here.
     repaired_active = True
-    if active.get("fslabel") and active["fslabel"] != active["partlabel"]:
+    if active["fslabel"] != active["partlabel"]:
         print(
             f"  repairing active slot's filesystem label "
-            f"({active['fslabel']} → {active['partlabel']}, #1045)…"
+            f"({active['fslabel'] or '(none)'} → {active['partlabel']}, #1045)…"
         )
         repaired_active = _relabel_slot_filesystem(
             active["device"], active["partlabel"]

@@ -980,8 +980,15 @@ the formatter handles the rest.
   was in that comment — so the guard was passing on the explanation
   while the code it describes had changed underneath it. Rewritten to
   assert on the calls.
-  33 new appliance tests plus that rewrite, every one of them run
-  against the unpatched scripts first — all 33 fail there, and the
+  The Copilot reviewer named two more without generating a comment for
+  either. One was moot — a mirror never reaches the relabel, since
+  `cmd_apply` aborts at slot detection first, and every write goes to
+  the device the `dd` already used. Chasing the other turned up a real
+  gap of its own: the active-slot repair was gated on a TRUTHY current
+  label, so a slot carrying no label at all — a missing label, which is
+  the thing being repaired — was skipped.
+  34 new appliance tests plus that rewrite, every one of them run
+  against the unpatched scripts first — all 34 fail there, and the
   rewritten guard fails while its 19 neighbours still pass. No
   migration, no API change.
 
