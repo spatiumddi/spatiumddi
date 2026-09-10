@@ -84,6 +84,20 @@ _KEA_OPTION_NAMES: dict[str, str] = {
 # Re-measure with `kea-dhcp4 -t` before adding a code here.
 _KEA_VENDOR_OPTION_DEFS: dict[int, dict[str, Any]] = {
     43: {"name": "spatium-opt-43", "code": 43, "space": "dhcp4", "type": "binary"},
+    # #972 Phase 2 — RFC 6225 GeoConf (123). ``binary`` because the payload
+    # is a 128-bit packed bitfield with no Kea type that describes it; the
+    # bytes are built by ``services/e911/dhcp_options`` and shipped as hex.
+    #
+    # **There is deliberately NO entry for option 99 here.** Measured against
+    # kea-dhcp4 3.0.3: Kea ships its own standard definition for 99 and
+    # refuses to let one be overridden —
+    #   "unable to override definition of option '99' in standard option
+    #    space 'dhcp4'"
+    # — which fails the ENTIRE configuration, not just that option. So 99 is
+    # emitted by Kea's own name, ``geoconf-civic``, and 123 (which has no
+    # standard definition; every name tried was rejected) by ours. Both
+    # verified with ``kea-dhcp4 -t``, per the instruction above this table.
+    123: {"name": "spatium-opt-123", "code": 123, "space": "dhcp4", "type": "binary"},
     132: {"name": "spatium-opt-132", "code": 132, "space": "dhcp4", "type": "string"},
     150: {
         "name": "spatium-opt-150",
@@ -146,7 +160,25 @@ def option_defs_for_option_maps(maps: Iterable[dict[str, Any] | None]) -> list[d
     codes: set[int] = set()
     names: set[str] = set()
     for m in maps:
-        for key in m or {}:
+        for key, value in (m or {}).items():
+            if key == "option_data":
+                # The raw Kea-shaped passthrough. Scanned too, because an
+                # entry here needs its definition exactly as much as a
+                # ``code:NN`` key does — and without it Kea rejects the WHOLE
+                # config ("definition for the option 'dhcp4.x' does not
+                # exist"), not just that option.
+                #
+                # This was a real hole, not a hypothetical one: #972's DHCP
+                # location options ride on this passthrough, and their
+                # option-def went unshipped until the integration test caught
+                # it. Any future raw producer is covered now.
+                for entry in value if isinstance(value, list) else ():
+                    if not isinstance(entry, dict):
+                        continue
+                    code = entry.get("code")
+                    if isinstance(code, int):
+                        codes.add(code)
+                continue
             if key.startswith("code:"):
                 try:
                     codes.add(int(key[5:]))

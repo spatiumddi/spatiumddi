@@ -126,9 +126,7 @@ PIDF_ELEMENT_ORDER: tuple[str, ...] = (
     "ADDCODE",
 )
 
-_TAG_BY_COLUMN: dict[str, str] = {
-    column: tag for column, _catype, tag, _desc in CIVIC_ELEMENTS
-}
+_TAG_BY_COLUMN: dict[str, str] = {column: tag for column, _catype, tag, _desc in CIVIC_ELEMENTS}
 _COLUMN_BY_TAG: dict[str, str] = {tag: column for column, tag in _TAG_BY_COLUMN.items()}
 
 #: ``(column, tag)`` in wire order.

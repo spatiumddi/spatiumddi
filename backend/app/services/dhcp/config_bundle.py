@@ -16,6 +16,7 @@ from __future__ import annotations
 import ipaddress
 import uuid
 from datetime import UTC, datetime
+from typing import Any
 
 import structlog
 from sqlalchemy import or_, select
@@ -53,6 +54,8 @@ from app.services.dhcp.device_policy import (
     load_fingerprint_snapshot,
 )
 from app.services.dhcp.radvd import build_ra_config, render_radvd_conf
+from app.services.e911 import effective_subnet_erl
+from app.services.e911.dhcp_options import kea_option_data
 from app.services.feature_modules import is_module_enabled
 
 log = structlog.get_logger(__name__)
@@ -304,7 +307,7 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
                 lease_time=sc.lease_time,
                 min_lease_time=sc.min_lease_time,
                 max_lease_time=sc.max_lease_time,
-                options=dict(sc.options or {}),
+                options=await _with_location_options(db, subnet, dict(sc.options or {})),
                 pools=pools,
                 statics=statics,
                 ddns_enabled=sc.ddns_enabled,
@@ -641,3 +644,47 @@ async def _assemble_device_policy_classes(
 
 
 __all__ = ["ConfigBundle", "build_config_bundle"]
+
+
+async def _with_location_options(
+    db: AsyncSession, subnet: Subnet, options: dict[str, Any]
+) -> dict[str, Any]:
+    """Merge the #972 DHCP location options into a scope's option mapping.
+
+    A phone that supports RFC 4776 / RFC 6225 learns its own civic address at
+    lease time, with no HELD exchange and no LLDP-MED. Rendered per SCOPE,
+    which is the floor-level answer — DHCP cannot know the room.
+
+    Three properties worth stating:
+
+    * **Additive and append-only.** The entries go onto whatever
+      ``option_data`` the mapping already carries (phone profiles and the
+      importers use the same raw passthrough), so this never displaces an
+      operator's option.
+    * **Silent when there is nothing to say.** No ERL, or an ERL that cannot
+      produce a valid option, contributes nothing — so the rendered config is
+      byte-identical to one without the feature and an unchanged bundle never
+      triggers a spurious Kea reload.
+    * **Never fatal.** ``kea_option_data`` fails closed to an empty list, and
+      the wrapper swallows a lookup failure: the blast radius of getting this
+      wrong is Kea refusing the whole configuration, so a location option is
+      never worth risking the lease service for.
+    """
+    try:
+        erl = await effective_subnet_erl(db, subnet)
+        if erl is None:
+            return options
+        entries = kea_option_data(erl)
+    except Exception as exc:  # noqa: BLE001 — see "never fatal" above
+        log.warning(
+            "dhcp_bundle_e911_options_skipped",
+            subnet_id=str(subnet.id),
+            error=str(exc),
+        )
+        return options
+    if not entries:
+        return options
+    existing = options.get("option_data")
+    merged = list(existing) if isinstance(existing, list) else []
+    merged.extend(entries)
+    return {**options, "option_data": merged}

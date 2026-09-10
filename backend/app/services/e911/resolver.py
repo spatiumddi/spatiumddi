@@ -44,11 +44,6 @@ from sqlalchemy import cast, func, select
 from sqlalchemy.dialects.postgresql import INET
 from sqlalchemy.ext.asyncio import AsyncSession
 
-# Imported rather than re-implemented: this is the fifth place in the tree
-# that would otherwise grow its own MAC cleaner, and #878 is the standing
-# lesson about two copies of one rule drifting apart. It is a pure
-# function with no FastAPI dependency.
-from app.api.v1.dhcp._mac import canonicalize_mac
 from app.models.dhcp import DHCPLease
 from app.models.e911 import (
     ERL_RULE_PRECEDENCE,
@@ -62,6 +57,13 @@ from app.models.network import (
     NetworkInterface,
     NetworkNeighbour,
 )
+
+# Imported rather than re-implemented: this would otherwise be the sixth MAC
+# cleaner in the tree, and #878 is the standing lesson about two copies of one
+# rule drifting apart. It lives in the service layer precisely because this
+# module is imported by the DHCP config bundle — reaching into ``app.api`` for
+# it made a circular import.
+from app.services.dhcp.normalize import canonicalize_mac
 
 #: One missed poll is tolerated; two is not.
 FRESHNESS_POLL_MULTIPLIER = 2
@@ -625,3 +627,44 @@ async def resolve_location(
         confidence="none",
         degraded_reason=degraded_reason or "no ERL binding matched this identity at any level",
     )
+
+
+async def effective_subnet_erl(
+    db: AsyncSession, subnet: Subnet
+) -> EmergencyResponseLocation | None:
+    """The ERL a SUBNET-level consumer should use, or None (#972 Phase 2).
+
+    DHCP can know which subnet a request came from and nothing finer, so the
+    only rules that can apply are the subnet's own, its VLAN's, and its
+    site's default — in that order. A ``switch_port`` or ``mac`` rule is
+    deliberately NOT consulted: those identify a device, and a DHCP option is
+    written once per scope for every client in it, so honouring one would
+    hand every phone on the floor the location of one desk.
+
+    Shares its rule set with the ``e911_voice_subnet_unbound`` conformity
+    check for the same reason, so "this subnet is covered" means the same
+    thing in the compliance report and in the rendered DHCP config.
+    """
+    for rule_kind, column, value in (
+        ("subnet", ERLBinding.subnet_id, subnet.id),
+        ("vlan", ERLBinding.vlan_ref_id, subnet.vlan_ref_id),
+        ("site_default", ERLBinding.site_id, subnet.site_id),
+    ):
+        if value is None:
+            continue
+        erl = (
+            await db.execute(
+                select(EmergencyResponseLocation)
+                .join(ERLBinding, ERLBinding.erl_id == EmergencyResponseLocation.id)
+                .where(
+                    ERLBinding.rule_kind == rule_kind,
+                    column == value,
+                    ERLBinding.is_active.is_(True),
+                    EmergencyResponseLocation.is_active.is_(True),
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if erl is not None:
+            return erl
+    return None
