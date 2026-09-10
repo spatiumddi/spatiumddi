@@ -284,7 +284,7 @@ restore_identity() {
 # Reads the log on stdin so it is unit-testable; ``_k3s_log_since`` is the
 # journal reader (overridable for tests).
 classify_join_failure() {
-    local log subject transport
+    local log subject transport kind
     log="$(cat)"
     # #1052 — classify by k3s's terminal VERDICT. Prefer the last level=fatal
     # line (k3s's own error); a "Shutdown request received" line is the
@@ -311,34 +311,40 @@ classify_join_failure() {
         *"TLS handshake timeout"*|*"connection reset"*|*"unexpected EOF"*) transport=1 ;;
         *) transport=0 ;;
     esac
+    # Two stages, on purpose: first decide WHAT happened, then name it — so
+    # every reason string is written exactly once below, and the backend's
+    # contract test (tests/test_appliance_join_auto_retry.py), which reads
+    # these printf payloads to keep _join_failure_is_permanent in step with the
+    # runner, sees one payload per reason however many paths lead to it.
     case "$subject" in
-        *"duplicate node name found"*)
-            printf '%s' "this hostname is already an etcd member of the target cluster — evict it (Fleet → Replace, or delete its k8s Node) before re-joining"
-            ;;
-        *"bootstrap data already found and encrypted with different token"*)
-            printf '%s' "stale k3s bootstrap data on disk — the join token does not match the cluster"
-            ;;
-        *"member has been permanently removed from the cluster"*)
-            printf '%s' "this node's etcd member was removed from the cluster — it must re-join as a NEW member (leave first)"
-            ;;
+        *"duplicate node name found"*) kind=stale_member ;;
+        *"bootstrap data already found and encrypted with different token"*) kind=stale_token ;;
+        *"member has been permanently removed from the cluster"*) kind=removed_member ;;
         # A transport error nested INSIDE "failed to validate token" is an
         # unreachable seed — k3s wraps the /cacerts fetch as a token failure
         # (pkg/cluster/bootstrap.go), so a DROP reads as a token error it never
         # got to judge. Reserve "rejected" for a bare token failure or a CA
         # hash mismatch: a seed that answered.
         *"failed to validate token"*)
-            if [ "$transport" = 1 ]; then
-                printf '%s' "could not reach the seed — check the firewall and tcp/6443 + tcp/2379-2380"
-            else
-                printf '%s' "the seed rejected the join token"
-            fi
+            if [ "$transport" = 1 ]; then kind=unreachable; else kind=rejected; fi ;;
+        *"token CA hash does not match"*) kind=rejected ;;
+        *)
+            if [ "$transport" = 1 ]; then kind=unreachable; else kind=""; fi ;;
+    esac
+    case "$kind" in
+        stale_member)
+            printf '%s' "this hostname is already an etcd member of the target cluster — evict it (Fleet → Replace, or delete its k8s Node) before re-joining"
             ;;
-        *"token CA hash does not match"*)
+        stale_token)
+            printf '%s' "stale k3s bootstrap data on disk — the join token does not match the cluster"
+            ;;
+        removed_member)
+            printf '%s' "this node's etcd member was removed from the cluster — it must re-join as a NEW member (leave first)"
+            ;;
+        rejected)
             printf '%s' "the seed rejected the join token"
             ;;
-        *"connection refused"*|*"i/o timeout"*|*"no route to host"*|\
-        *"context deadline exceeded"*|*"Client.Timeout exceeded"*|\
-        *"TLS handshake timeout"*|*"connection reset"*)
+        unreachable)
             printf '%s' "could not reach the seed — check the firewall and tcp/6443 + tcp/2379-2380"
             ;;
         *)
