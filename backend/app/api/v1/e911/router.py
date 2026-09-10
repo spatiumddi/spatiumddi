@@ -1,0 +1,876 @@
+"""E911 Location Information Server — ERLs, bindings, and the lookup (#972).
+
+Endpoints under ``/e911``:
+
+* ``/erls`` — Emergency Response Location list / create
+* ``/erls/{id}`` — read / patch / delete
+* ``/erls/{id}/validation`` — record an address-validation verdict
+* ``/bindings`` — network identity → ERL rules, list / create
+* ``/bindings/{id}`` — patch / delete
+* ``/location`` — **the point of the feature.** Given an IP, MAC, or LLDP
+  chassis+port, return the dispatchable location with its provenance.
+
+Permissions: every endpoint is gated on ``e911_location`` at the router
+level (GET→read, POST/PATCH→write, DELETE→delete; superadmin always
+passes). The intended shape for a third-party caller — a PBX, Cisco
+Emergency Responder, RedSky, an ops script — is an existing API token
+(#74) scoped to ``allowed_paths=["/api/v1/e911"]`` with that one read
+permission: read-only, revocable, audited, and no new credential
+mechanism.
+
+**Every ``/location`` answer writes an ``e911_resolution_log`` row.** It
+is a lookup of which desk a named person sits at; the trail is not
+optional. Mutations additionally write ``audit_log`` per non-negotiable
+#4.
+
+**We are not the 911 service provider.** Nothing here routes a call,
+uploads to an ALI database, provisions an ELIN, or talks to a PSAP. The
+operator's duty under 47 CFR §9.16 is theirs.
+
+**Address validation is recorded, never asserted.** ``POST
+/erls/{id}/validation`` stores a verdict the operator obtained from their
+E911 provider (RedSky, Intrado and Bandwidth all expose a validation call
+against the MSAG / NG911 LVF). SpatiumDDI makes no outbound call here —
+that is a separate PR precisely because it would be a new outbound
+connection under non-negotiable #17 and needs a ``docs/PRIVACY.md`` row.
+Marking an address valid on our own say-so is the one thing that would
+make this feature actively dangerous.
+"""
+
+from __future__ import annotations
+
+import uuid
+from datetime import UTC, datetime
+from typing import Any, Literal
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from pydantic import BaseModel, Field, field_validator, model_validator
+from sqlalchemy import Select, case, func, or_, select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.api.deps import DB, CurrentUser
+from app.api.v1.dhcp._mac import canonicalize_mac
+from app.api.v1.ownership._audit import write_audit
+from app.core.permissions import require_resource_permission
+from app.models.e911 import (
+    CIVIC_COLUMNS,
+    DISPATCHABLE_DETAIL_COLUMNS,
+    ERL_RULE_PRECEDENCE,
+    ERL_RULE_TARGET_COLUMN,
+    E911ResolutionLog,
+    EmergencyResponseLocation,
+    ERLBinding,
+)
+from app.services.e911.resolver import Resolution, resolve_location
+
+router = APIRouter(
+    tags=["e911"],
+    dependencies=[Depends(require_resource_permission("e911_location"))],
+)
+
+RuleKind = Literal["switch_port", "wireless_ap", "mac", "ip", "subnet", "vlan", "site_default"]
+ValidationState = Literal["unvalidated", "validated", "rejected"]
+
+#: The resource_type used in ``audit_log`` rows for both tables. One
+#: string, because an operator auditing "who changed our dispatchable
+#: locations" wants ERLs and the bindings that point at them together.
+AUDIT_RESOURCE = "e911"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Schemas
+# ══════════════════════════════════════════════════════════════════════
+
+
+class CivicAddress(BaseModel):
+    """The RFC 5139 civic-address elements.
+
+    Declared explicitly rather than generated from ``CIVIC_ELEMENTS``: a
+    ``pydantic.create_model`` would keep one source of truth but costs the
+    readability of the most-reviewed schema in the feature. The single
+    source of truth is enforced by a test instead
+    (``test_e911_schema_covers_every_civic_element``), which is this
+    repository's own idiom — a guard over cleverness.
+    """
+
+    country: str | None = Field(default=None, max_length=2, description="ISO 3166-1 alpha-2")
+    a1: str | None = Field(default=None, max_length=255, description="State / province")
+    a2: str | None = Field(default=None, max_length=255, description="County")
+    a3: str | None = Field(default=None, max_length=255, description="City")
+    a4: str | None = Field(default=None, max_length=255, description="City division")
+    a5: str | None = Field(default=None, max_length=255, description="Neighbourhood")
+    a6: str | None = Field(default=None, max_length=255, description="Street (legacy; prefer rd)")
+    prd: str | None = Field(default=None, max_length=64, description="Leading street direction")
+    pod: str | None = Field(default=None, max_length=64, description="Trailing street suffix")
+    sts: str | None = Field(default=None, max_length=64, description="Street suffix / type")
+    hno: str | None = Field(default=None, max_length=64, description="House number")
+    hns: str | None = Field(default=None, max_length=64, description="House number suffix")
+    lmk: str | None = Field(default=None, max_length=255, description="Landmark")
+    loc: str | None = Field(default=None, max_length=255, description="Additional location info")
+    nam: str | None = Field(default=None, max_length=255, description="Occupant / business name")
+    pc: str | None = Field(default=None, max_length=32, description="Postal code")
+    bld: str | None = Field(default=None, max_length=255, description="Building")
+    unit: str | None = Field(default=None, max_length=64, description="Unit / suite")
+    flr: str | None = Field(default=None, max_length=64, description="Floor")
+    room: str | None = Field(default=None, max_length=64, description="Room")
+    plc: str | None = Field(default=None, max_length=64, description="Place type")
+    pcn: str | None = Field(default=None, max_length=255, description="Postal community name")
+    pobox: str | None = Field(default=None, max_length=64, description="Post office box")
+    addcode: str | None = Field(default=None, max_length=64, description="Additional code")
+    seat: str | None = Field(default=None, max_length=64, description="Seat / desk")
+    rd: str | None = Field(default=None, max_length=255, description="Primary road name")
+    rdsec: str | None = Field(default=None, max_length=255, description="Road section")
+    rdbr: str | None = Field(default=None, max_length=255, description="Road branch")
+    rdsubbr: str | None = Field(default=None, max_length=255, description="Road sub-branch")
+    prm: str | None = Field(default=None, max_length=64, description="Road pre-modifier")
+    pom: str | None = Field(default=None, max_length=64, description="Road post-modifier")
+
+
+class GeoPoint(BaseModel):
+    latitude: float | None = Field(default=None, ge=-90, le=90)
+    longitude: float | None = Field(default=None, ge=-180, le=180)
+    altitude: float | None = None
+    altitude_unit: Literal["m", "f"] | None = Field(
+        default=None, description="RFC 6225 altitude type: metres or floors"
+    )
+
+    @model_validator(mode="after")
+    def _point_is_complete(self) -> GeoPoint:
+        # Mirrors ``ck_erl_point_is_complete``. A half-point is not a
+        # coarse location, it is a wrong one — and a 422 naming the field
+        # beats a 500 from the CHECK.
+        if (self.latitude is None) != (self.longitude is None):
+            raise ValueError("latitude and longitude must be given together, or neither")
+        return self
+
+
+class ERLCreate(CivicAddress, GeoPoint):
+    name: str = Field(min_length=1, max_length=255)
+    site_id: uuid.UUID | None = None
+    elins: list[str] = Field(default_factory=list)
+    is_active: bool = True
+    notes: str = ""
+
+    @field_validator("elins")
+    @classmethod
+    def _check_elins(cls, v: list[str]) -> list[str]:
+        out: list[str] = []
+        for raw in v:
+            e = raw.strip()
+            if not e:
+                continue
+            # Deliberately permissive: an ELIN is a DID in whatever form
+            # the operator's carrier wrote it on the PS-ALI paperwork, and
+            # refusing an extension-style short number would reject a real
+            # configuration. Only obvious junk is rejected.
+            if len(e) > 32 or not any(c.isdigit() for c in e):
+                raise ValueError(f"{raw!r} does not look like a dialable number")
+            out.append(e)
+        return out
+
+
+class ERLUpdate(CivicAddress, GeoPoint):
+    name: str | None = Field(default=None, min_length=1, max_length=255)
+    site_id: uuid.UUID | None = None
+    elins: list[str] | None = None
+    is_active: bool | None = None
+    notes: str | None = None
+
+
+class ERLRead(CivicAddress, GeoPoint):
+    id: uuid.UUID
+    name: str
+    site_id: uuid.UUID | None
+    elins: list[str]
+    validation_state: ValidationState
+    validated_at: datetime | None
+    validation_source: str | None
+    validation_detail: str | None
+    #: Does this ERL say anything beyond the street door? RAY BAUM'S asks
+    #: for "room number, floor number, or similar"; an ERL carrying none of
+    #: those is an address, not a dispatchable location. Derived, so it
+    #: cannot drift from the columns.
+    is_dispatchable: bool
+    is_active: bool
+    notes: str
+    binding_count: int
+    created_at: datetime
+    modified_at: datetime
+
+
+class ERLListResponse(BaseModel):
+    items: list[ERLRead]
+    total: int
+    limit: int
+    offset: int
+
+
+class ValidationVerdict(BaseModel):
+    """A verdict obtained from the operator's E911 provider, recorded here.
+
+    ``source`` is free text because it names whoever answered — a provider
+    product name, a ticket reference, or the 911 coordinator who checked it
+    against the MSAG by hand.
+    """
+
+    state: ValidationState
+    source: str | None = Field(default=None, max_length=64)
+    detail: str | None = None
+
+
+class BindingCreate(BaseModel):
+    erl_id: uuid.UUID
+    rule_kind: RuleKind
+    network_interface_id: uuid.UUID | None = None
+    bssid: str | None = Field(default=None, max_length=64)
+    subnet_id: uuid.UUID | None = None
+    vlan_ref_id: uuid.UUID | None = None
+    mac_address: str | None = None
+    ip_address_id: uuid.UUID | None = None
+    site_id: uuid.UUID | None = None
+    is_active: bool = True
+    notes: str = ""
+
+    @field_validator("mac_address")
+    @classmethod
+    def _canon_mac(cls, v: str | None) -> str | None:
+        return canonicalize_mac(v) if v else None
+
+    @model_validator(mode="after")
+    def _exactly_the_right_target(self) -> BindingCreate:
+        """Mirror the two DB CHECKs, so a wrong shape is a 422 naming the
+        field rather than a 500 out of Postgres.
+
+        The "exactly one" half alone is not enough: a ``subnet`` rule
+        carrying a ``mac_address`` satisfies it and then matches nothing,
+        and a rule that silently matches nothing is worse than a refused
+        one.
+        """
+        wanted = ERL_RULE_TARGET_COLUMN[self.rule_kind]
+        present = [c for c in ERL_RULE_TARGET_COLUMN.values() if getattr(self, c) is not None]
+        if present != [wanted]:
+            got = ", ".join(sorted(present)) or "none"
+            raise ValueError(
+                f"rule_kind {self.rule_kind!r} needs exactly {wanted} set (got: {got})"
+            )
+        return self
+
+
+class BindingUpdate(BaseModel):
+    """Only the mutable fields. A binding's target and kind are its
+    identity — repointing one would silently move every device it covers,
+    so that is a delete and a create, which leaves two audit rows."""
+
+    erl_id: uuid.UUID | None = None
+    is_active: bool | None = None
+    notes: str | None = None
+
+
+class BindingRead(BaseModel):
+    id: uuid.UUID
+    erl_id: uuid.UUID
+    erl_name: str
+    rule_kind: RuleKind
+    #: Which precedence level this rule sits at, 1 = most specific. Sent
+    #: because the ordering is fixed in code and an operator reading a list
+    #: of bindings otherwise has no way to see which one would win.
+    precedence: int
+    network_interface_id: uuid.UUID | None
+    bssid: str | None
+    subnet_id: uuid.UUID | None
+    vlan_ref_id: uuid.UUID | None
+    mac_address: str | None
+    ip_address_id: uuid.UUID | None
+    site_id: uuid.UUID | None
+    is_active: bool
+    notes: str
+    created_at: datetime
+    modified_at: datetime
+
+
+class BindingListResponse(BaseModel):
+    items: list[BindingRead]
+    total: int
+    limit: int
+    offset: int
+
+
+class EvidenceRead(BaseModel):
+    kind: str
+    observed_at: datetime | None
+    age_seconds: int | None
+    window_seconds: int | None
+    stale: bool
+    detail: str
+
+
+class LocationResponse(BaseModel):
+    """A dispatchable location, and why we believe it.
+
+    ``erl`` is null when nothing matched. There is deliberately no shape in
+    which this returns an address with no provenance: ``rule_matched`` and
+    ``confidence`` are always present, and ``confidence="degraded"`` means
+    a more precise answer existed and was REFUSED because its evidence was
+    stale — see ``degraded_reason``.
+    """
+
+    identity_kind: str
+    identity_value: str
+    found: bool
+    confidence: Literal["none", "degraded", "observed"]
+    rule_matched: RuleKind | None
+    degraded_reason: str | None
+    observed_at: datetime | None
+    evidence_age_seconds: int | None
+    erl: ERLRead | None
+    evidence: list[EvidenceRead]
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Serialisation
+# ══════════════════════════════════════════════════════════════════════
+
+
+def _is_dispatchable(row: EmergencyResponseLocation) -> bool:
+    return any(getattr(row, c) for c in DISPATCHABLE_DETAIL_COLUMNS)
+
+
+def _erl_read(row: EmergencyResponseLocation, binding_count: int = 0) -> ERLRead:
+    civic = {c: getattr(row, c) for c in CIVIC_COLUMNS}
+    return ERLRead(
+        id=row.id,
+        name=row.name,
+        site_id=row.site_id,
+        elins=list(row.elins or []),
+        latitude=float(row.latitude) if row.latitude is not None else None,
+        longitude=float(row.longitude) if row.longitude is not None else None,
+        altitude=float(row.altitude) if row.altitude is not None else None,
+        altitude_unit=row.altitude_unit,  # type: ignore[arg-type]
+        validation_state=row.validation_state,  # type: ignore[arg-type]
+        validated_at=row.validated_at,
+        validation_source=row.validation_source,
+        validation_detail=row.validation_detail,
+        is_dispatchable=_is_dispatchable(row),
+        is_active=row.is_active,
+        notes=row.notes,
+        binding_count=binding_count,
+        created_at=row.created_at,
+        modified_at=row.modified_at,
+        **civic,
+    )
+
+
+def _binding_read(row: ERLBinding, erl_name: str) -> BindingRead:
+    return BindingRead(
+        id=row.id,
+        erl_id=row.erl_id,
+        erl_name=erl_name,
+        rule_kind=row.rule_kind,  # type: ignore[arg-type]
+        precedence=ERL_RULE_PRECEDENCE.index(row.rule_kind) + 1,
+        network_interface_id=row.network_interface_id,
+        bssid=row.bssid,
+        subnet_id=row.subnet_id,
+        vlan_ref_id=row.vlan_ref_id,
+        mac_address=str(row.mac_address) if row.mac_address else None,
+        ip_address_id=row.ip_address_id,
+        site_id=row.site_id,
+        is_active=row.is_active,
+        notes=row.notes,
+        created_at=row.created_at,
+        modified_at=row.modified_at,
+    )
+
+
+async def _load_erl(db: AsyncSession, erl_id: uuid.UUID) -> EmergencyResponseLocation:
+    row = (
+        await db.execute(
+            select(EmergencyResponseLocation).where(EmergencyResponseLocation.id == erl_id)
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="ERL not found")
+    return row
+
+
+async def _binding_counts(db: AsyncSession, erl_ids: list[uuid.UUID]) -> dict[uuid.UUID, int]:
+    """One query for the whole page. Counting per row would be the N+1 the
+    #917 sweep found in the vendor-device lookup."""
+    if not erl_ids:
+        return {}
+    rows = (
+        await db.execute(
+            select(ERLBinding.erl_id, func.count(ERLBinding.id))
+            .where(ERLBinding.erl_id.in_(erl_ids))
+            .group_by(ERLBinding.erl_id)
+        )
+    ).all()
+    return {erl_id: int(n) for erl_id, n in rows}
+
+
+# ══════════════════════════════════════════════════════════════════════
+# ERLs
+# ══════════════════════════════════════════════════════════════════════
+
+
+def _apply_erl_filters(
+    stmt: Select[Any],
+    *,
+    site_id: uuid.UUID | None,
+    validation_state: str | None,
+    is_active: bool | None,
+    dispatchable: bool | None,
+    q: str | None,
+) -> Select[Any]:
+    if site_id is not None:
+        stmt = stmt.where(EmergencyResponseLocation.site_id == site_id)
+    if validation_state is not None:
+        stmt = stmt.where(EmergencyResponseLocation.validation_state == validation_state)
+    if is_active is not None:
+        stmt = stmt.where(EmergencyResponseLocation.is_active.is_(is_active))
+    if dispatchable is not None:
+        detail = or_(
+            *[
+                getattr(EmergencyResponseLocation, c).is_not(None)
+                for c in DISPATCHABLE_DETAIL_COLUMNS
+            ]
+        )
+        stmt = stmt.where(detail if dispatchable else ~detail)
+    if q:
+        like = f"%{q}%"
+        stmt = stmt.where(
+            or_(
+                EmergencyResponseLocation.name.ilike(like),
+                EmergencyResponseLocation.bld.ilike(like),
+                EmergencyResponseLocation.flr.ilike(like),
+                EmergencyResponseLocation.room.ilike(like),
+                EmergencyResponseLocation.rd.ilike(like),
+                EmergencyResponseLocation.a3.ilike(like),
+            )
+        )
+    return stmt
+
+
+@router.get("/erls", response_model=ERLListResponse)
+async def list_erls(
+    db: DB,
+    user: CurrentUser,
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    site_id: uuid.UUID | None = Query(default=None),
+    validation_state: ValidationState | None = Query(default=None),
+    is_active: bool | None = Query(default=None),
+    dispatchable: bool | None = Query(
+        default=None,
+        description=(
+            "True = only ERLs carrying detail beyond the street door (building, "
+            "floor, unit, room, seat or additional location info). False = only "
+            "the street-address-only ones, which is the RAY BAUM'S gap."
+        ),
+    ),
+    q: str | None = Query(
+        default=None, description="Substring on name / building / floor / room / street / city."
+    ),
+) -> ERLListResponse:
+    """List Emergency Response Locations, name order."""
+    filters = {
+        "site_id": site_id,
+        "validation_state": validation_state,
+        "is_active": is_active,
+        "dispatchable": dispatchable,
+        "q": q,
+    }
+    total = (
+        await db.execute(
+            _apply_erl_filters(select(func.count(EmergencyResponseLocation.id)), **filters)
+        )
+    ).scalar_one()
+    rows = (
+        (
+            await db.execute(
+                _apply_erl_filters(select(EmergencyResponseLocation), **filters)
+                .order_by(EmergencyResponseLocation.name.asc())
+                .limit(limit)
+                .offset(offset)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    counts = await _binding_counts(db, [r.id for r in rows])
+    return ERLListResponse(
+        items=[_erl_read(r, counts.get(r.id, 0)) for r in rows],
+        total=int(total),
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.post("/erls", response_model=ERLRead, status_code=status.HTTP_201_CREATED)
+async def create_erl(body: ERLCreate, db: DB, user: CurrentUser) -> ERLRead:
+    row = EmergencyResponseLocation(**body.model_dump())
+    db.add(row)
+    try:
+        await db.flush()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"An ERL named {body.name!r} already exists",
+        ) from exc
+    write_audit(
+        db,
+        user=user,
+        action="create",
+        resource_type=AUDIT_RESOURCE,
+        resource_id=str(row.id),
+        resource_display=row.name,
+        new_value={"name": row.name, "site_id": str(row.site_id) if row.site_id else None},
+    )
+    await db.commit()
+    await db.refresh(row)
+    return _erl_read(row)
+
+
+@router.get("/erls/{erl_id}", response_model=ERLRead)
+async def get_erl(erl_id: uuid.UUID, db: DB, user: CurrentUser) -> ERLRead:
+    row = await _load_erl(db, erl_id)
+    counts = await _binding_counts(db, [row.id])
+    return _erl_read(row, counts.get(row.id, 0))
+
+
+@router.patch("/erls/{erl_id}", response_model=ERLRead)
+async def update_erl(erl_id: uuid.UUID, body: ERLUpdate, db: DB, user: CurrentUser) -> ERLRead:
+    row = await _load_erl(db, erl_id)
+    # exclude_unset, so PATCHing one field does not null the other 40 —
+    # and an explicit null still clears a nullable civic element, which is
+    # how an operator corrects a wrong floor.
+    changes = body.model_dump(exclude_unset=True)
+    old = {k: getattr(row, k) for k in changes}
+    for field, value in changes.items():
+        setattr(row, field, value)
+
+    # Any address edit invalidates a provider's verdict about the OLD
+    # address. Silently keeping `validated` would leave the estate
+    # reporting a validated address nobody has ever checked — and the
+    # e911_erl_unvalidated conformity check would stay quiet about it.
+    if any(k in changes for k in CIVIC_COLUMNS) and row.validation_state != "unvalidated":
+        row.validation_state = "unvalidated"
+        row.validated_at = None
+        row.validation_detail = "reset: the civic address was edited after validation"
+        changes["validation_state"] = "unvalidated"
+
+    try:
+        await db.flush()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="That ERL name is already taken"
+        ) from exc
+    write_audit(
+        db,
+        user=user,
+        action="update",
+        resource_type=AUDIT_RESOURCE,
+        resource_id=str(row.id),
+        resource_display=row.name,
+        changed_fields=sorted(changes),
+        old_value={k: str(v) for k, v in old.items()},
+        new_value={k: str(v) for k, v in changes.items()},
+    )
+    await db.commit()
+    await db.refresh(row)
+    return _erl_read(row)
+
+
+@router.post("/erls/{erl_id}/validation", response_model=ERLRead)
+async def record_validation(
+    erl_id: uuid.UUID, body: ValidationVerdict, db: DB, user: CurrentUser
+) -> ERLRead:
+    """Record an address-validation verdict obtained from the provider.
+
+    SpatiumDDI makes no outbound call here and never decides this itself.
+    """
+    row = await _load_erl(db, erl_id)
+    row.validation_state = body.state
+    row.validation_source = body.source
+    row.validation_detail = body.detail
+    row.validated_at = datetime.now(UTC) if body.state != "unvalidated" else None
+    write_audit(
+        db,
+        user=user,
+        action="update",
+        resource_type=AUDIT_RESOURCE,
+        resource_id=str(row.id),
+        resource_display=row.name,
+        changed_fields=["validation_state"],
+        new_value={"validation_state": body.state, "validation_source": body.source or ""},
+    )
+    await db.commit()
+    await db.refresh(row)
+    return _erl_read(row)
+
+
+@router.delete("/erls/{erl_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_erl(erl_id: uuid.UUID, db: DB, user: CurrentUser) -> None:
+    row = await _load_erl(db, erl_id)
+    counts = await _binding_counts(db, [row.id])
+    write_audit(
+        db,
+        user=user,
+        action="delete",
+        resource_type=AUDIT_RESOURCE,
+        resource_id=str(row.id),
+        resource_display=row.name,
+        old_value={"name": row.name, "bindings_removed": str(counts.get(row.id, 0))},
+    )
+    # Bindings CASCADE. That fails safe: the resolver then degrades to the
+    # next-coarser rule rather than pointing at a location that is gone.
+    await db.delete(row)
+    await db.commit()
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Bindings
+# ══════════════════════════════════════════════════════════════════════
+
+
+@router.get("/bindings", response_model=BindingListResponse)
+async def list_bindings(
+    db: DB,
+    user: CurrentUser,
+    limit: int = Query(200, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    erl_id: uuid.UUID | None = Query(default=None),
+    rule_kind: RuleKind | None = Query(default=None),
+    is_active: bool | None = Query(default=None),
+) -> BindingListResponse:
+    """List bindings, most-specific rule kind first then ERL name.
+
+    Ordered by precedence rather than by creation time because the
+    question an operator has in front of this list is "which rule wins".
+    """
+    stmt = select(ERLBinding, EmergencyResponseLocation.name).join(
+        EmergencyResponseLocation, EmergencyResponseLocation.id == ERLBinding.erl_id
+    )
+    count_stmt = select(func.count(ERLBinding.id))
+    if erl_id is not None:
+        stmt = stmt.where(ERLBinding.erl_id == erl_id)
+        count_stmt = count_stmt.where(ERLBinding.erl_id == erl_id)
+    if rule_kind is not None:
+        stmt = stmt.where(ERLBinding.rule_kind == rule_kind)
+        count_stmt = count_stmt.where(ERLBinding.rule_kind == rule_kind)
+    if is_active is not None:
+        stmt = stmt.where(ERLBinding.is_active.is_(is_active))
+        count_stmt = count_stmt.where(ERLBinding.is_active.is_(is_active))
+
+    total = (await db.execute(count_stmt)).scalar_one()
+    # Precedence order expressed in SQL so it survives pagination: sorting
+    # each page in Python would order the pages independently, and a reader
+    # would find switch_port rules appearing on page 3. Built from the same
+    # constant the resolver walks, so the list cannot disagree with the
+    # behaviour it describes.
+    ordering = case(
+        {kind: i for i, kind in enumerate(ERL_RULE_PRECEDENCE)},
+        value=ERLBinding.rule_kind,
+        else_=len(ERL_RULE_PRECEDENCE),
+    )
+    rows = (
+        await db.execute(
+            stmt.order_by(ordering.asc(), EmergencyResponseLocation.name.asc())
+            .limit(limit)
+            .offset(offset)
+        )
+    ).all()
+    return BindingListResponse(
+        items=[_binding_read(b, name) for b, name in rows],
+        total=int(total),
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.post("/bindings", response_model=BindingRead, status_code=status.HTTP_201_CREATED)
+async def create_binding(body: BindingCreate, db: DB, user: CurrentUser) -> BindingRead:
+    erl = await _load_erl(db, body.erl_id)
+    row = ERLBinding(**body.model_dump())
+    db.add(row)
+    try:
+        await db.flush()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"A {body.rule_kind} binding already exists for that target. "
+                "One ERL per target per kind: a tie would otherwise be resolved "
+                "by whichever row the database returned first."
+            ),
+        ) from exc
+    write_audit(
+        db,
+        user=user,
+        action="create",
+        resource_type=AUDIT_RESOURCE,
+        resource_id=str(row.id),
+        resource_display=f"{body.rule_kind} → {erl.name}",
+        new_value={"rule_kind": body.rule_kind, "erl": erl.name},
+    )
+    await db.commit()
+    await db.refresh(row)
+    return _binding_read(row, erl.name)
+
+
+@router.patch("/bindings/{binding_id}", response_model=BindingRead)
+async def update_binding(
+    binding_id: uuid.UUID, body: BindingUpdate, db: DB, user: CurrentUser
+) -> BindingRead:
+    row = (
+        await db.execute(select(ERLBinding).where(ERLBinding.id == binding_id))
+    ).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Binding not found")
+    changes = body.model_dump(exclude_unset=True)
+    if "erl_id" in changes and changes["erl_id"] is not None:
+        await _load_erl(db, changes["erl_id"])
+    old = {k: getattr(row, k) for k in changes}
+    for field, value in changes.items():
+        setattr(row, field, value)
+    await db.flush()
+    erl = await _load_erl(db, row.erl_id)
+    write_audit(
+        db,
+        user=user,
+        action="update",
+        resource_type=AUDIT_RESOURCE,
+        resource_id=str(row.id),
+        resource_display=f"{row.rule_kind} → {erl.name}",
+        changed_fields=sorted(changes),
+        old_value={k: str(v) for k, v in old.items()},
+        new_value={k: str(v) for k, v in changes.items()},
+    )
+    await db.commit()
+    await db.refresh(row)
+    return _binding_read(row, erl.name)
+
+
+@router.delete("/bindings/{binding_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_binding(binding_id: uuid.UUID, db: DB, user: CurrentUser) -> None:
+    row = (
+        await db.execute(select(ERLBinding).where(ERLBinding.id == binding_id))
+    ).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Binding not found")
+    write_audit(
+        db,
+        user=user,
+        action="delete",
+        resource_type=AUDIT_RESOURCE,
+        resource_id=str(row.id),
+        resource_display=f"{row.rule_kind} binding",
+        old_value={"rule_kind": row.rule_kind, "erl_id": str(row.erl_id)},
+    )
+    await db.delete(row)
+    await db.commit()
+
+
+# ══════════════════════════════════════════════════════════════════════
+# The lookup
+# ══════════════════════════════════════════════════════════════════════
+
+
+def _log_row(
+    resolution: Resolution,
+    *,
+    user_id: uuid.UUID | None,
+    api_token_id: uuid.UUID | None,
+    source_ip: str | None,
+) -> E911ResolutionLog:
+    return E911ResolutionLog(
+        queried_at=datetime.now(UTC),
+        identity_kind=resolution.identity_kind,
+        identity_value=resolution.identity_value[:255],
+        actor_kind="api_token" if api_token_id else "user",
+        actor_id=api_token_id or user_id,
+        source_ip=source_ip,
+        erl_id=resolution.erl.id if resolution.erl else None,
+        rule_matched=resolution.rule_matched,
+        confidence=resolution.confidence,
+        degraded_reason=resolution.degraded_reason,
+        evidence_age_seconds=resolution.evidence_age_seconds,
+    )
+
+
+@router.get("/location", response_model=LocationResponse)
+async def get_location(
+    request: Request,
+    db: DB,
+    user: CurrentUser,
+    ip: str | None = Query(default=None, description="The device's IP address."),
+    mac: str | None = Query(default=None, description="Any common separator."),
+    chassis_id: str | None = Query(
+        default=None, description="LLDP chassis-id; a Cisco phone's is its MAC."
+    ),
+    port_id: str | None = Query(default=None, description="LLDP port-id. Needs chassis_id."),
+) -> LocationResponse:
+    """Resolve a network identity to a dispatchable location.
+
+    At least one identity is required. ``confidence="degraded"`` means a
+    more precise answer existed and was refused because its evidence was
+    stale — a stale precise answer is worse than a fresh coarse one.
+    """
+    if not any((ip, mac, chassis_id)):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Give at least one of ip, mac, or chassis_id (+ port_id).",
+        )
+    if port_id and not chassis_id:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="port_id identifies a port on a chassis; give chassis_id too.",
+        )
+    if mac:
+        try:
+            mac = canonicalize_mac(mac)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+            ) from exc
+
+    resolution = await resolve_location(db, ip=ip, mac=mac, chassis_id=chassis_id, port_id=port_id)
+
+    # The trail is written whether or not anything was found: "nobody could
+    # tell me where this phone was" is exactly the query an after-action
+    # review needs to see.
+    db.add(
+        _log_row(
+            resolution,
+            user_id=user.id,
+            api_token_id=getattr(request.state, "api_token_id", None),
+            source_ip=request.client.host if request.client else None,
+        )
+    )
+    await db.commit()
+
+    return LocationResponse(
+        identity_kind=resolution.identity_kind,
+        identity_value=resolution.identity_value,
+        found=resolution.found,
+        confidence=resolution.confidence,  # type: ignore[arg-type]
+        rule_matched=resolution.rule_matched,  # type: ignore[arg-type]
+        degraded_reason=resolution.degraded_reason,
+        observed_at=resolution.observed_at,
+        evidence_age_seconds=resolution.evidence_age_seconds,
+        erl=_erl_read(resolution.erl) if resolution.erl else None,
+        evidence=[
+            EvidenceRead(
+                kind=e.kind,
+                observed_at=e.observed_at,
+                age_seconds=e.age_seconds,
+                window_seconds=e.window_seconds,
+                stale=e.stale,
+                detail=e.detail,
+            )
+            for e in resolution.evidence
+        ],
+    )
