@@ -80,3 +80,12 @@ docs/PRIVACY.md
 # how the suite is invoked should exercise the suite. Other workflows are
 # denied — none of them runs backend tests.
 .github/workflows/ci.yml
+
+# The two shipped nginx templates (#972). `backend/tests/test_e911_held.py`
+# asserts both carry a `location /held` block: the HELD endpoint is mounted at
+# the application root rather than under /api/, so without one it falls through
+# to the SPA `location /` and a PBX asking where a phone is gets index.html
+# with a 200 — unreachable in production while every backend test passes.
+# Editing either must therefore run the suite that contains that assertion.
+frontend/default.conf.template
+charts/spatiumddi/templates/frontend-tls-config.yaml

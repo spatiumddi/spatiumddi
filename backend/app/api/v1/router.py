@@ -46,6 +46,7 @@ from app.api.v1.dns_tools import router as dns_tools_router
 from app.api.v1.dnsbl import router as dnsbl_router
 from app.api.v1.docker import router as docker_router
 from app.api.v1.domains import router as domains_router
+from app.api.v1.e911 import router as e911_router
 from app.api.v1.firewall_feeds.router import public_router as firewall_feeds_public_router
 from app.api.v1.firewall_feeds.router import router as firewall_feeds_router
 from app.api.v1.fortinet.router import router as fortinet_router
@@ -253,6 +254,12 @@ api_v1_router.include_router(
     prefix="/dicom",
     tags=["dicom"],
     dependencies=[Depends(require_module("network.dicom"))],
+)
+api_v1_router.include_router(
+    e911_router,
+    prefix="/e911",
+    tags=["e911"],
+    dependencies=[Depends(require_module("network.e911"))],
 )
 api_v1_router.include_router(
     dns_router,

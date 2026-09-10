@@ -43,6 +43,14 @@ class XmlResponse(Response):
     media_type = "application/xml"
 
 
+class HeldXmlResponse(Response):
+    """HELD (RFC 5985 §6.5) requires ``application/held+xml``, not
+    ``application/xml`` — a client content-negotiating on it would not
+    recognise the generic type."""
+
+    media_type = "application/held+xml"
+
+
 class PlainTextStreamResponse(Response):
     """``text/plain`` for a body assembled and returned whole (pod logs)."""
 
@@ -54,6 +62,17 @@ class EventStreamResponse(Response):
     this exists only so the documented type isn't ``application/json``."""
 
     media_type = "text/event-stream"
+
+
+class CsvResponse(Response):
+    media_type = "text/csv"
+
+
+class IosConfigResponse(Response):
+    """Generated switch-configuration text for an operator to review.
+    ``text/plain`` rather than a made-up type, so a browser shows it."""
+
+    media_type = "text/plain"
 
 
 class DnsZoneResponse(Response):

@@ -24,6 +24,393 @@ the formatter handles the rest.
 
 ### Added
 
+
+- **E911 dispatchable location — SpatiumDDI answers "which room is
+  this phone in, right now?" (#972, Phase 1a).** Behind the default-on
+  `network.e911` module: Emergency Response Locations, bindings from a
+  network identity to an ERL, and a resolver over data already
+  collected for IPAM. `dhcp_lease` / `ip_mac_history` give IP↔MAC,
+  `network_fdb_entry` gives MAC↔switch-port, `network_neighbour` gives
+  the phone's own LLDP claim, `subnet.site_id` gives the building and
+  `subnet.subnet_role='voice'` says which networks are phones. Every
+  input existed; nothing joined them. 3 tables (migration
+  `c1f4a90e7d63`), 11 REST routes, 3 conformity policies, 3 MCP tools.
+  **RAY BAUM'S Act §506 puts the dispatchable-location duty on the
+  ENTERPRISE, not the carrier**, so this is a location *source* and the
+  docs say plainly that installing it makes nobody compliant: no call
+  routing, no ALI upload, no ELIN provisioning, no PSAP. It also never
+  asserts an address is valid on its own say-so — validation is the
+  provider's verdict against the MSAG / NG911 LVF, recorded here, and
+  `unvalidated` means "nobody has confirmed this", not "this is wrong".
+  Editing any civic element **resets** the verdict, because a provider
+  validated the OLD address and keeping `validated` would leave an
+  estate reporting an address nobody ever checked.
+  **The load-bearing property: a stale precise answer is worse than a
+  fresh coarse one.** A phone re-patched onto another floor stays in the
+  switch's FDB on the old port until it ages out, and in *our* copy
+  until the next poll — so a port-level answer older than the freshness
+  window is REFUSED, the resolver falls back to a coarser rule, and the
+  response carries `confidence="degraded"` with the reason. There is no
+  code path that returns an address with no provenance. The window is
+  the polling device's own `poll_interval_seconds` × 2, so one missed
+  poll is tolerated and two are not; a fixed global number would be too
+  tight for a 15-minute poller and uselessly loose for a 60-second one.
+  **Two independent staleness signals, and the second is the one that
+  matters:** age, and an LLDP neighbour on the same port announcing a
+  different chassis-id than the FDB puts there. LLDP is the device's own
+  announcement, so on disagreement the FDB row is the one to distrust —
+  and this fires immediately where age must wait out the whole window,
+  which is the only way a phone swapped for a different phone on the
+  same port is caught quickly.
+  **The civic address is 31 separate RFC 5139 columns**, not one string
+  and not JSONB. PIDF-LO and every provider API want the elements apart,
+  a string cannot be decomposed later, and #917 established that an
+  unconstrained object publishes as `{"type": "object"}` with no
+  properties — unusable to a code generator, on the one field every
+  external consumer of this feature reads. `CIVIC_ELEMENTS` carries the
+  columns *with* their RFC 4776 CAtype numbers and PIDF-LO tag names, so
+  the deferred option-99 encoder and PIDF-LO renderer cannot drift from
+  the schema the way #878's two renderers did; a test pins the API
+  schema's field set to the column set.
+  **Binding precedence is a constant, not a column**, and one ERL per
+  target per kind is a UNIQUE constraint. An operator able to reorder
+  the rules could put `site_default` above `switch_port` and send every
+  ambulance to the front door while the UI still showed a rule for the
+  room, and a tie would otherwise be broken by whichever row the planner
+  returned. **The shipped order deviates from the issue's**, which
+  numbered the manual pin below `subnet` and `vlan`: that makes the pin
+  dead code, since every pinned device is also on some subnet, while the
+  pin exists precisely for the phone on a port nothing polls. Reverting
+  the constant to the issue's ordering makes
+  `test_a_manual_pin_beats_the_subnet` fail, which is the proof rather
+  than the argument.
+  Three conformity policies, the **first in the tree carrying a real
+  regulatory citation** (`47 CFR 9.16(b)`) rather than
+  `framework: custom`. `e911_voice_subnet_unbound` counts the site
+  default as a pass — the front door is a poor answer and still a
+  dispatchable location, where a check demanding room-level bindings
+  everywhere would fail every site on day one and be switched off.
+  `e911_erl_validated` fails harder on a REJECTED verdict than a missing
+  one, because somebody checked and the answer was no, and warns rather
+  than fails on an old one. `e911_port_binding_evidence_fresh` is keyed
+  on the switch's own poll state and not on stale FDB rows, because an
+  unpolled switch eventually has none and a stale-row check would PASS
+  on the worst case.
+  A third-party caller — a PBX, Cisco Emergency Responder, RedSky — uses
+  an existing API token scoped to `/api/v1/e911` with one read
+  permission; no new credential mechanism. **Every lookup writes an
+  `e911_resolution_log` row**, found or not, recording which token asked
+  about which identity: it is a query about which desk a named person
+  sits at, and "nobody could tell me where this phone was" is exactly
+  what an after-action review needs to see. To make that honest,
+  `deps.py` now records *which* API token authenticated a request —
+  token auth resolves to the owning User, so a handler otherwise cannot
+  tell a PBX's service token from the same person's browser session.
+  **No `propose_*` MCP tools**, an explicit decision under
+  non-negotiable #13: a wrong ERL binding misroutes an ambulance.
+  **/code-review found twelve, and the two sharpest were both about a
+  thing looking fine while being wrong.** `ip_address.address` is
+  unique only PER SUBNET — overlapping prefixes are normal, and this
+  feature's own tests carve a /28 out of a /24 — so an unscoped
+  `scalar_one_or_none()` raised MultipleResultsFound and 500'd the
+  whole lookup *before* the audit row was written. And the validation
+  reset keyed on a civic key being PRESENT while the edit form sends
+  all 31 elements on every save, so renaming an ERL or fixing a typo
+  in its notes silently destroyed a provider's `validated` verdict; it
+  now compares values and names the elements that actually moved.
+  Also: an unvalidated `ip` string reaching an INET comparison raises
+  22P02, and through the copilot tool the aborted transaction takes
+  out every later tool call in the chat turn, so a malformed address
+  is now a "no location" answer that still records what was asked;
+  `ERLUpdate` admitted an explicit `null` into NOT NULL columns
+  (surfacing as a bogus 409 name conflict) and skipped the ELIN
+  validator the create path had; a `chassis_id`-only lookup logged its
+  identity as `unknown` / empty, losing the one thing the trail exists
+  for; `observed_at` and `evidence_age_seconds` came from port
+  evidence even when a *config* rule matched, putting an unrelated
+  stale age beside a green `observed` answer; a blanket
+  `except IntegrityError` reported foreign-key violations as "already
+  exists", worst on `create_binding` where five of seven targets are
+  hand-pasted UUIDs; and no builtin role granted `e911_location`,
+  unlike all four sibling vertical registries on Network Editor, so
+  writes were undocumented superadmin-only with the UI quietly hiding
+  its own buttons.
+  **Two findings were the "a guard that cannot fire" class again.**
+  The port-binding check ignored `poll_fdb` / `poll_lldp`, so a switch
+  polled perfectly on schedule while collecting neither passed — which
+  is precisely the silent degradation it claims to catch. And it
+  tested `status not in ("ok", "success")` where the real vocabulary
+  is `pending | success | partial | failed | timeout`: `"ok"` is a
+  value no poller writes, so a `partial` poll whose only failure was
+  the unrelated IGMP leg was reported as "not polled", while the test
+  pinning that behaviour asserted on `"error"` — also not a real
+  value, which is how it survived.
+  **One finding changed a design decision rather than fixing a slip.**
+  The LLDP-disagreement signal fired on *any* other chassis-id on the
+  port, which makes a room-level answer permanently unreachable for a
+  PC daisy-chained behind an LLDP desk phone — the commonest wiring in
+  exactly these estates, where the PC is in the FDB and only the phone
+  announces LLDP. The signal is now NEWER, not merely different: the
+  FDB row is distrusted only when a contradicting neighbour was seen
+  more recently than it. After a swap the new device's LLDP is fresh
+  and the old device's FDB row is not, which is the case it exists
+  for; on a daisy chain both are current and neither displaces the
+  other.
+  **A second /code-review round found eleven more, and one would have
+  failed CI.** The three new tables were in no backup `Section` and not
+  in the unclassified baseline, so a selective restore of `ownership` or
+  `ipam` would TRUNCATE-CASCADE every ERL and binding and never
+  repopulate them — the #700 defect verbatim, and
+  `test_section_catalog_gap_does_not_grow` fails without the fix
+  (confirmed by reverting it). The resolver also compared an INET by
+  SPELLING via `cast(address, String)`, which is the #877 failure: an
+  IPv6 address in expanded form is a different string and the same host,
+  so those lookups silently answered "no location", on the flagship
+  query and non-sargably. And the FDB fallback picked the most recently
+  seen entry across ALL devices — but a MAC sits in the forwarding table
+  of every switch on the path to it, so on a two-tier network the
+  room-level binding fired only when the access switch happened to be
+  polled more recently than the core, intermittently, with the evidence
+  row naming the wrong port. It now prefers the interface with the
+  FEWEST MACs learned on it, which is how an edge port is identified
+  from bridge-MIB data and is a property of the topology rather than of
+  polling luck.
+  Also: an `IpMacHistory` row is only the last time anything was
+  OBSERVED at an address, unlike a lease, so a years-old mapping could
+  drive a `mac` pin to `confidence="observed"` — it is now gated, and a
+  stale inference disqualifies the rules that hang off the MAC while
+  leaving those that derive from the IP; `BindingUpdate` lacked the
+  explicit-null guard its ERL sibling had (a 23502 the global handler
+  re-raises as a 500); the reset verdict kept `validation_source`, so a
+  list rendered "unvalidated  RedSky Horizon"; `q` went into `ILIKE`
+  unescaped in both the router and the copilot tool (#879's `50%`); the
+  `is_dispatchable` field tested truthiness while its SQL filter tested
+  `IS NOT NULL`, so they disagreed on `""` and the gap report
+  under-counted; a dead `elif` hid the reachable "pending with a
+  completed poll" case; the ERL form never sent `site_id`, leaving the
+  column, the site filter and the copilot's argument unreachable from
+  the product; and `Number("12.3x")` is NaN, which serialises as null —
+  so typed garbage in a coordinate field saved silently as "no point"
+  and wiped an existing one on edit.
+  **Phase 1b — HELD and PIDF-LO.** `POST /held` takes an RFC 5985
+  `locationRequest` and returns PIDF-LO (RFC 4119 + RFC 5139 civic +
+  RFC 5491 geodetic) — the protocol CUCM, Cisco MPP firmware, the
+  Webex app, RedSky "HELD+", Intrado ERS and Bandwidth DLR already
+  speak, which is what makes this usable with **no phone-side
+  change**. Mounted at the application root because a HELD client is
+  configured with a whole URL and the protocol names the path. This is
+  the payoff for the 31-column decision: the element names come from
+  `CIVIC_ELEMENTS`, and `PIDF_ELEMENT_ORDER` fixes the WIRE order
+  separately, because the RFC 5139 schema sequence is not the column
+  order and a consumer validating an `xs:sequence` rejects
+  out-of-order children; a test pins the two lists to each other.
+  The `method` element is not decoration — RFC 4119 registers those
+  tokens and consumers treat them differently, so a switch-port answer
+  goes out as `Wiremap` and a subnet or site answer as `Manual`.
+  `retransmission-allowed` is `no`: this is the location of a person
+  at a desk, and a 911 path needs no onward distribution rights. The
+  resolver's confidence and matched rule ride on response headers,
+  because PIDF-LO has nowhere to say "this is a fallback answer". An
+  unknown device is a 404 with `locationUnknown`, which is what a
+  provider's retry logic expects, where an empty 200 would read as
+  "this device has no location by design".
+  **The load-bearing refusal is that a request with no identity is
+  refused.** RFC 5985's default is to answer from the requester's own
+  address, so falling through would hand a PBX the location of its own
+  server in response to a question about a phone — a perfectly-formed
+  answer that is completely wrong. A recognised-but-unresolvable
+  identity (`msisdn`, `imsi`) is reported rather than ignored, because
+  treating it as "no identity given" takes that same fall-through. XML
+  from the network is size-capped before parsing, a DOCTYPE is refused
+  outright rather than trusted to be inert, and parsing goes through
+  stdlib ElementTree, which supports no DTD and no external entities
+  at all — XXE and entity expansion are unavailable rather than
+  mitigated.
+  **Phase 2 — the device self-query and the DHCP options.** The
+  self-query is off behind `E911_SELF_QUERY_ENABLED`: 404 rather than
+  403 when disabled so it does not advertise itself to a scanner;
+  identity forced to the TCP source address with every body-supplied
+  identity discarded, including one that matches, since accepting it
+  when it matches would leak by timing whether a guessed address is
+  the caller's; rate-limited per source IP and **failing closed**, the
+  only inverted throttle in `auth_throttle`, because this throttle IS
+  the protection where the login one has lockout and a second factor
+  behind it; and the response carries the location only, not even the
+  confidence headers, which describe our internal evidence.
+  DHCP options 99 (RFC 4776 civic) and 123 (RFC 6225 geodetic) render
+  automatically into a scope whose subnet resolves to an ERL. Per
+  scope, never per client: DHCP can know the subnet and nothing finer,
+  so a switch-port or MAC binding is deliberately not consulted — a
+  DHCP option is written once for every client in the scope, and
+  honouring a device rule would hand every phone on the floor the
+  location of one desk.
+  **The encoders were verified by measurement, and the first attempt
+  produced a config Kea REFUSED OUTRIGHT** — which stops DHCP for
+  every client on the server. Against kea-dhcp4 3.0.3, option 99 has a
+  standard definition Kea will not let you override, so it goes out
+  under Kea's own name `geoconf-civic`, while 123 has none and rides
+  on ours. A second real hole surfaced the same way:
+  `option_defs_for_option_maps` scanned only `code:NN` keys and not
+  the raw `option_data` passthrough these ride on, so the definition
+  for 123 was never shipped and Kea would have rejected the whole
+  config.
+  Everything in the encoders fails closed to "emit no option": a value
+  that will not fit is dropped rather than truncated, because
+  truncating UTF-8 mid-sequence yields bytes a consumer cannot decode;
+  a total over 255 bytes stops at an element boundary rather than
+  emitting a partial TLV; no two-letter country means no option at
+  all; and an out-of-range coordinate yields nothing, because a
+  wrapped fixed-point value is a valid-looking location somewhere
+  else. Every test decodes the bytes back rather than comparing them
+  to a hex literal — a literal proves the encoder still does what it
+  did when the test was written, not that it does what the RFC says.
+  **Phase 3 — exports, with the provider connectors still deferred.**
+  One CSV of every ERL and its bindings, and one file of
+  `location civic-location` / `location elin-location` stanzas plus
+  the per-interface lines, as text the operator reviews and applies.
+  SpatiumDDI pushes no switch configuration (#60), and the snippet
+  says so in its own header.
+  **The real work in the exports is sanitisation.** A room name
+  carrying a newline followed by `no logging console` is arbitrary
+  configuration pasted into a switch by someone who trusted us, and a
+  building whose name starts with `=` executes as a formula when the
+  CSV is opened in Excel. A value that cannot be expressed safely is
+  omitted AND listed under its stanza, never shortened — an ERL
+  visibly missing its room is a problem an operator fixes, where a
+  silently truncated one is a phone in the wrong place that looks
+  correct. The three provider push reconcilers stay their own issues,
+  as #972 itself specifies, because each needs its API shape checked
+  against current vendor documentation rather than recalled.
+  **Also fixed on the way: two successive circular imports, the second
+  subtler than the first.** `canonicalize_mac` lived in
+  `app/api/v1/dhcp/_mac.py`; the E911 resolver needs it and the DHCP
+  config bundle imports that resolver, so reaching into `app.api`
+  broke the app at startup. Moving it to
+  `app/services/dhcp/normalize.py` replaced that with a cycle that
+  only appeared when something imported the e911 package FIRST,
+  because importing any `app.services.dhcp` submodule executes a
+  package `__init__` that imports `config_bundle`. It now lives in
+  `app/core/mac.py`, whose package `__init__` is empty, so a pure
+  string function cannot participate in a cycle at all.
+  **A third /code-review round found thirteen more, and the worst
+  would have stopped DHCP entirely.** `_with_location_options` ignored
+  address family, so an ERL reached by a `vlan` or `site_default`
+  binding injected `dhcp4`-space options 99 and 123 into an IPv6 scope
+  — the agent's v6 renderer passes the raw passthrough through
+  verbatim and kea-dhcp6 then rejects the WHOLE config, which is
+  exactly the outcome the encoders are otherwise so careful to avoid.
+  It is now an explicit IPv4 gate with a v6 test.
+  Two more made the feature unreachable rather than wrong. `/held` had
+  no nginx `location` block in either template, so it fell through to
+  the SPA `location /` and a PBX asking where a phone is got
+  `index.html` with a 200 — on compose, Helm and the appliance alike.
+  And neither HELD path was exempt from maintenance mode, so a change
+  window silently killed location delivery to CUCM while the
+  equivalent JSON lookup kept working, which was incoherent as well as
+  dangerous.
+  **One was a silent data loss in exactly the field that matters.**
+  The option-99 encoder stops at an element boundary when it runs out
+  of 255 bytes, so whatever is encoded LAST is what gets dropped — and
+  in column order that was building, floor, unit, room and seat,
+  because `lmk` / `loc` / `nam` are declared ahead of them and are the
+  free-text fields an operator writes a sentence into. A long
+  "additional location information" therefore produced a street
+  address with no room, which is the one thing RAY BAUM'S §506 is
+  about. Encoding order is now explicit and separate from column
+  order: street address first, then the dispatchable detail, then the
+  free text, which is the right thing to lose.
+  Also: the control-plane renderer had no `option_data` passthrough
+  (the agent's has always had one), so the rendered-config preview
+  stringified the whole list into one bogus entry and showed an
+  operator a config that would not load; `locationType` and `exact`
+  were parsed and read by nothing, so a caller asking exactly for
+  `geodetic` against a civic-only ERL got a 200 carrying civic data it
+  had said it could not use; the bundle had no `network.e911` module
+  gate, so disabling the module hid every surface for inspecting
+  bindings while the scopes kept shipping the options; and the subnet
+  lookup cost three queries per scope on the agent long-poll path,
+  which is 600 round trips on a 200-scope server with no bindings at
+  all, now one.
+  Three in the exports. The IOS snippet emitted bare interface names,
+  and `Gi1/0/12` exists on every switch in the estate — a file with no
+  device context gives an operator no way to tell which lines belong
+  to the switch in front of them, and pasting the wrong ones
+  mis-assigns ports to rooms. `_identifier_for` was positional while
+  its own docstring called it stable, so inserting one ERL renumbered
+  every later stanza and re-pointed port assignments an operator had
+  already applied; it now derives from the ERL's id. And `-` in the
+  CSV formula-leader list quoted every negative latitude and longitude
+  as text, in the spreadsheet the export exists for — the check is now
+  "is it a number", not "does it start with a hyphen".
+  Last two were smaller: an unknown client address answered 429
+  because the fail-closed throttle ran before the address check,
+  making the accurate 400 unreachable; and `auth_throttle`'s module
+  docstring still said "Both fail open" after a third, deliberately
+  fail-closed throttle joined it.
+  **And CodeQL found a real one that three review rounds missed, in a
+  docstring I had written confidently.** The HELD parser used stdlib
+  `xml.etree.ElementTree` and claimed that supports "no DTD and no
+  external entities at all — so XXE and entity-expansion are not
+  mitigated here, they are unavailable". Measured: half of that is
+  false. ET does refuse an EXTERNAL entity, so XXE really is
+  unavailable — but it expands INTERNAL ones happily, and a four-level
+  billion-laughs payload expanded to 50,000 characters. The only thing
+  standing between an unauthenticated XML endpoint and an expansion
+  bomb was a single `DOCTYPE` regex. `py/xml-bomb` was right and the
+  prose was wrong.
+  Parsing now goes through `lxml` with `resolve_entities=False`, which
+  leaves an entity reference unexpanded rather than growing it — lxml
+  is already in the image (python3-saml pulls it), so this adds no
+  dependency where `defusedxml` would have needed a NOTICE entry and a
+  `versions.json` pin. The `DOCTYPE` refusal is KEPT precisely because
+  it is no longer load-bearing: a guard that is the sole defence is
+  one regex away from being none. Two new tests go at the parser
+  directly, bypassing the guard, because the lesson is that reasoning
+  about a parser's behaviour is not the same as measuring it.
+  **Four more from the PR's own bot reviewers, and the first is the
+  sharpest finding in the whole change.** The IP→MAC lease lookup was
+  unscoped across servers: DHCP leases are per-scope and the same
+  address legitimately exists in two overlapping networks — a 10.x
+  range reused behind two sites is the ordinary case, not a
+  pathological one. "Newest active lease for this IP" therefore
+  attached the caller to ANOTHER network's MAC, and from there to that
+  MAC's switch port and that port's room. A confident, precise,
+  completely wrong answer, which is the single failure mode this
+  module exists to prevent. It is now scoped to the subnet (resolved
+  first, for that reason), and an address resolving to more than one
+  distinct MAC makes the resolver decline to guess rather than pick
+  one.
+  The scoping is an OUTER join whose filter admits a lease with no
+  `scope_id`, and that detail is pinned by a test. An inner join
+  looked right and silently discarded every such lease — legitimate
+  and common, because a lease pulled from a server whose scopes
+  SpatiumDDI does not manage has nothing to point at. Admitting them
+  costs no safety: two candidate MACs decline either way.
+  The other three: a caller supplying `chassis_id` AND `port_id` fell
+  through to a MAC-only port lookup when that exact pair was not
+  found, so a stale or mistyped port returned the MAC's OTHER port and
+  the wrong room while looking authoritative — a named port now yields
+  no port match rather than a different one. The explicit chassis+port
+  path compared the raw lowercased string, so `aabb.cc11.2233` could
+  never match the same address stored as `aa:bb:cc:11:22:33` despite
+  the endpoint documenting that any common separator is accepted; a
+  MAC-shaped chassis-id is canonicalised now while an opaque subtype-7
+  identifier is still compared as given. And two unused locals in a
+  test.
+  216 backend tests. The resolver's were written before any API existed
+  and both mutations were run against the shipped code to prove they
+  bite — removing the staleness gate fails 4, reverting the precedence
+  fails the pin test. **Deferred to their own changes:** HELD / PIDF-LO
+  (RFC 5985 + 6155, the protocol CUCM, Cisco MPP phones, Webex, RedSky,
+  Intrado and Bandwidth already speak, and what makes this work with
+  zero phone-side change); the provider validation *call*, which is a
+  new outbound connection needing a `docs/PRIVACY.md` row under
+  non-negotiable #17; DHCP options 99/123; device self-query; bulk CSV
+  import; the CER-format and IOS-snippet exports; and wireless, a data
+  gap rather than a design one — the UniFi and Meraki mirrors carry no
+  client→AP association, so the `wireless_ap` rule has nothing to match
+  and its precedence slot is reserved for when they do. See
+  `docs/features/E911.md`.
 - **The appliance can install onto a RAID1 mirror, and arrays can be
   managed from the Fleet UI (#999 Parts B + C).** #995 shipped the
   honest refusal — a SAN LUN's paths collapsed and an md member marked
