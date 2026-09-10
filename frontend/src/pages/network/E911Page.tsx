@@ -19,6 +19,7 @@ import {
   E911_RULE_TARGET,
   e911Api,
   formatApiError,
+  sitesApi,
   type CivicAddress,
   type E911Confidence,
   type E911Location,
@@ -441,6 +442,14 @@ function ERLModal({
   onSaved: () => void;
 }) {
   const [name, setName] = useState(erl?.name ?? "");
+  // Without this the column was unreachable from the product, so the
+  // `site_default` binding rule, the site filter and the copilot's site_id
+  // argument could never match anything.
+  const [siteId, setSiteId] = useState(erl?.site_id ?? "");
+  const sites = useQuery({
+    queryKey: ["sites", "e911-picker"],
+    queryFn: () => sitesApi.list({ limit: 500 }),
+  });
   const [civic, setCivic] = useState<CivicAddress>(() => {
     const out: CivicAddress = {};
     if (erl) {
@@ -460,6 +469,19 @@ function ERLModal({
   const hasInterior = CIVIC_FIELD_GROUPS[0].fields.some(
     (f) => (civic[f.key] ?? "") !== "",
   );
+  const pointHalfGiven = (lat === "") !== (lon === "");
+  // Number("12.3x") is NaN, which JSON.stringify renders as null — so typed
+  // garbage saved silently as "no point" and, on an edit, wiped a coordinate
+  // that was already there.
+  const pointUnparseable =
+    (lat !== "" && !Number.isFinite(Number(lat))) ||
+    (lon !== "" && !Number.isFinite(Number(lon)));
+  const pointOutOfRange =
+    (lat !== "" &&
+      Number.isFinite(Number(lat)) &&
+      Math.abs(Number(lat)) > 90) ||
+    (lon !== "" && Number.isFinite(Number(lon)) && Math.abs(Number(lon)) > 180);
+  const pointBad = pointHalfGiven || pointUnparseable || pointOutOfRange;
 
   const save = useMutation({
     mutationFn: () => {
@@ -477,6 +499,7 @@ function ERLModal({
       }
       const body: ERLCreate = {
         name: name.trim(),
+        site_id: siteId || null,
         ...cleanCivic,
         elins: elins
           .split(",")
@@ -516,6 +539,22 @@ function ERLModal({
               placeholder="Bldg A — Floor 3 — Room 312"
               className="w-full rounded-md border bg-background px-2 py-1.5"
             />
+          </label>
+          <label className="text-sm">
+            <span className="mb-1 block font-medium">Site</span>
+            <select
+              value={siteId}
+              onChange={(e) => setSiteId(e.target.value)}
+              className="w-full rounded-md border bg-background px-2 py-1.5"
+              title="The building this location is in. A site_default binding resolves through it, and it is how the compliance report groups the estate."
+            >
+              <option value="">No site</option>
+              {(sites.data?.items ?? []).map((site) => (
+                <option key={site.id} value={site.id}>
+                  {site.name}
+                </option>
+              ))}
+            </select>
           </label>
           <label className="text-sm">
             <span className="mb-1 block font-medium">
@@ -605,10 +644,21 @@ function ERLModal({
               />
             </label>
           </div>
-          {(lat === "") !== (lon === "") && (
+          {pointHalfGiven && (
             <p className="mt-2 text-xs text-rose-600">
               Give both or neither — half a point is not a coarse location, it
               is a wrong one.
+            </p>
+          )}
+          {pointUnparseable && (
+            <p className="mt-2 text-xs text-rose-600">
+              That is not a number. Left alone it would save as "no coordinates"
+              without saying so.
+            </p>
+          )}
+          {pointOutOfRange && (
+            <p className="mt-2 text-xs text-rose-600">
+              Latitude is ±90 and longitude ±180.
             </p>
           )}
         </fieldset>
@@ -642,7 +692,7 @@ function ERLModal({
           <HeaderButton
             type="submit"
             variant="primary"
-            disabled={save.isPending || (lat === "") !== (lon === "")}
+            disabled={save.isPending || pointBad}
           >
             {save.isPending ? "Saving…" : "Save"}
           </HeaderButton>

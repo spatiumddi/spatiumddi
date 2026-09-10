@@ -156,7 +156,43 @@ the formatter handles the rest.
   and the old device's FDB row is not, which is the case it exists
   for; on a daisy chain both are current and neither displaces the
   other.
-  59 backend tests. The resolver's were written before any API existed
+  **A second /code-review round found eleven more, and one would have
+  failed CI.** The three new tables were in no backup `Section` and not
+  in the unclassified baseline, so a selective restore of `ownership` or
+  `ipam` would TRUNCATE-CASCADE every ERL and binding and never
+  repopulate them — the #700 defect verbatim, and
+  `test_section_catalog_gap_does_not_grow` fails without the fix
+  (confirmed by reverting it). The resolver also compared an INET by
+  SPELLING via `cast(address, String)`, which is the #877 failure: an
+  IPv6 address in expanded form is a different string and the same host,
+  so those lookups silently answered "no location", on the flagship
+  query and non-sargably. And the FDB fallback picked the most recently
+  seen entry across ALL devices — but a MAC sits in the forwarding table
+  of every switch on the path to it, so on a two-tier network the
+  room-level binding fired only when the access switch happened to be
+  polled more recently than the core, intermittently, with the evidence
+  row naming the wrong port. It now prefers the interface with the
+  FEWEST MACs learned on it, which is how an edge port is identified
+  from bridge-MIB data and is a property of the topology rather than of
+  polling luck.
+  Also: an `IpMacHistory` row is only the last time anything was
+  OBSERVED at an address, unlike a lease, so a years-old mapping could
+  drive a `mac` pin to `confidence="observed"` — it is now gated, and a
+  stale inference disqualifies the rules that hang off the MAC while
+  leaving those that derive from the IP; `BindingUpdate` lacked the
+  explicit-null guard its ERL sibling had (a 23502 the global handler
+  re-raises as a 500); the reset verdict kept `validation_source`, so a
+  list rendered "unvalidated  RedSky Horizon"; `q` went into `ILIKE`
+  unescaped in both the router and the copilot tool (#879's `50%`); the
+  `is_dispatchable` field tested truthiness while its SQL filter tested
+  `IS NOT NULL`, so they disagreed on `""` and the gap report
+  under-counted; a dead `elif` hid the reachable "pending with a
+  completed poll" case; the ERL form never sent `site_id`, leaving the
+  column, the site filter and the copilot's argument unreachable from
+  the product; and `Number("12.3x")` is NaN, which serialises as null —
+  so typed garbage in a coordinate field saved silently as "no point"
+  and wiped an existing one on edit.
+  63 backend tests. The resolver's were written before any API existed
   and both mutations were run against the shipped code to prove they
   bite — removing the staleness gate fails 4, reverting the precedence
   fails the pin test. **Deferred to their own changes:** HELD / PIDF-LO

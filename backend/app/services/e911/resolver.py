@@ -40,7 +40,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
-from sqlalchemy import String, cast, func, select
+from sqlalchemy import cast, func, select
 from sqlalchemy.dialects.postgresql import INET
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -190,21 +190,32 @@ async def _mac_from_ip(
 
     row = (
         await db.execute(
+            # ``IPAddress.address == ip``, never a cast to text: an INET
+            # compared by SPELLING is the #877 failure — 2606:4700::1111 and
+            # its expanded form are one host and two strings, so an IPv6
+            # lookup would silently answer "no location". It is also
+            # non-sargable, on the flagship query of the feature.
             select(IpMacHistory.mac_address, IpMacHistory.last_seen)
             .join(IPAddress, IPAddress.id == IpMacHistory.ip_address_id)
-            .where(cast(IPAddress.address, String) == ip)
+            .where(IPAddress.address == ip)
             .order_by(IpMacHistory.last_seen.desc())
             .limit(1)
         )
     ).first()
     if row is not None:
         mac, seen = row
+        age = _age_seconds(seen, now)
+        # Gated, unlike the lease branch. A lease is a binding the DHCP
+        # server is currently honouring; an IpMacHistory row is only the last
+        # time anything was observed, and a years-old one driving a `mac` pin
+        # to confidence="observed" is exactly the stale-precise-answer this
+        # module exists to refuse.
         return str(mac), Evidence(
             kind="ip_mac_history",
             observed_at=seen,
-            age_seconds=_age_seconds(seen, now),
+            age_seconds=age,
             window_seconds=DEFAULT_FRESHNESS_SECONDS,
-            stale=False,
+            stale=age is not None and age > DEFAULT_FRESHNESS_SECONDS,
             detail=f"last observed MAC for {ip}",
         )
     return None, None
@@ -251,11 +262,35 @@ async def _port_from_mac(
             detail=f"LLDP neighbour claiming chassis-id {mac}",
         )
 
+    # A MAC appears in the forwarding table of EVERY switch on the path to
+    # it, so "most recently seen" is the wrong tie-break: on a two-tier
+    # network it resolves to whichever of the access switch and the core
+    # happened to be polled last, and the room-level binding then fires
+    # intermittently with the evidence row naming the wrong port.
+    #
+    # The access port is the one with the FEWEST MACs learned on it — an
+    # uplink carries every host behind it, an edge port carries one phone
+    # (or a phone and the PC behind it). That is the standard way to find an
+    # edge port from bridge-MIB data, and it is a property of the topology
+    # rather than of polling luck. Recency is kept as the second key so a
+    # genuine tie still prefers the fresher observation.
+    per_interface = (
+        select(
+            NetworkFdbEntry.interface_id.label("iface"),
+            func.count(NetworkFdbEntry.id).label("mac_count"),
+        )
+        .group_by(NetworkFdbEntry.interface_id)
+        .subquery()
+    )
     fdb = (
         await db.execute(
             select(NetworkFdbEntry.interface_id, NetworkFdbEntry.last_seen)
+            .join(per_interface, per_interface.c.iface == NetworkFdbEntry.interface_id)
             .where(NetworkFdbEntry.mac_address == mac)
-            .order_by(NetworkFdbEntry.last_seen.desc())
+            .order_by(
+                per_interface.c.mac_count.asc(),
+                NetworkFdbEntry.last_seen.desc(),
+            )
             .limit(1)
         )
     ).first()
@@ -331,7 +366,7 @@ async def _ip_row_id(db: AsyncSession, ip: str, subnet: Subnet | None) -> uuid.U
     audit row. Scoped first; ordered-and-limited as the fallback, because
     answering from one of several candidate rows beats answering nothing.
     """
-    stmt = select(IPAddress.id).where(cast(IPAddress.address, String) == ip)
+    stmt = select(IPAddress.id).where(IPAddress.address == ip)
     if subnet is not None:
         scoped = (
             await db.execute(stmt.where(IPAddress.subnet_id == subnet.id).limit(1))
@@ -451,10 +486,19 @@ async def resolve_location(
             # joined against anything we hold.
             continue
 
+    # True when the MAC was INFERRED from the IP and that inference is
+    # stale. The rules that hang off the MAC — the switch port it is learned
+    # on, and a `mac` pin — are then resting on a mapping that may belong to
+    # a different device, while `subnet` / `vlan` / `site_default` derive
+    # from the caller's IP directly and are unaffected.
+    mac_inference_stale = False
+    mac_stale_age: int | None = None
     if mac_canon is None and ip:
-        mac_canon, lease_evidence = await _mac_from_ip(db, ip, now)
-        if lease_evidence:
-            evidence.append(lease_evidence)
+        mac_canon, mac_evidence = await _mac_from_ip(db, ip, now)
+        if mac_evidence:
+            evidence.append(mac_evidence)
+            mac_inference_stale = mac_evidence.stale
+            mac_stale_age = mac_evidence.age_seconds
 
     interface_id: uuid.UUID | None = None
     port_evidence: Evidence | None = None
@@ -529,6 +573,12 @@ async def resolve_location(
         # Only the port-level rules rest on an observation that can go
         # stale. The rest are operator configuration, which is as current
         # as the moment it was saved.
+        if rule_kind in ("switch_port", "wireless_ap", "mac") and mac_inference_stale:
+            degraded_reason = (
+                f"declined the {rule_kind} binding: the IP→MAC mapping it rests "
+                f"on was last observed {mac_stale_age}s ago"
+            )
+            continue
         if (
             rule_kind in ("switch_port", "wireless_ap")
             and port_evidence is not None

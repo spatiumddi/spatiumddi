@@ -29,7 +29,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.crypto import encrypt_str
 from app.models.dhcp import DHCPLease, DHCPServer
 from app.models.e911 import EmergencyResponseLocation, ERLBinding
-from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
+from app.models.ipam import IPAddress, IPBlock, IpMacHistory, IPSpace, Subnet
 from app.models.network import (
     NetworkDevice,
     NetworkFdbEntry,
@@ -708,3 +708,131 @@ async def test_a_newer_lldp_neighbour_still_invalidates_the_fdb_row(
     assert r.rule_matched == "subnet"
     assert r.confidence == "degraded"
     assert "MORE RECENT" in (r.degraded_reason or "")
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Second /code-review round
+# ══════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_an_ipv6_lookup_is_compared_by_value_not_spelling(
+    db_session: AsyncSession,
+) -> None:
+    """``cast(address, String) == ip`` is the #877 failure: an INET compared
+    by SPELLING makes 2606:4700::1111 and its expanded form two different
+    hosts, so an IPv6 lookup silently answered "no location"."""
+    f = await _estate(db_session)
+    v6_block = IPBlock(space_id=f.subnet.space_id, network="2001:db8::/32", name="v6")
+    db_session.add(v6_block)
+    await db_session.flush()
+    v6 = Subnet(
+        space_id=f.subnet.space_id,
+        block_id=v6_block.id,
+        network="2001:db8:0:3::/64",
+        name="voice-v6",
+        subnet_role="voice",
+        site_id=f.site.id,
+    )
+    db_session.add(v6)
+    await db_session.flush()
+    db_session.add(IPAddress(subnet_id=v6.id, address="2001:db8:0:3::44", status="allocated"))
+    await db_session.flush()
+    await _bind(db_session, f.erls["room"], "subnet", subnet_id=v6.id)
+
+    # The compressed form and the expanded form are ONE host.
+    for spelling in ("2001:db8:0:3::44", "2001:0db8:0000:0003:0000:0000:0000:0044"):
+        r = await resolve_location(db_session, ip=spelling, now=f.now)
+        assert r.rule_matched == "subnet", spelling
+        assert r.erl is not None and r.erl.room == "312"
+
+
+@pytest.mark.asyncio
+async def test_the_access_port_wins_over_an_uplink(db_session: AsyncSession) -> None:
+    """A MAC is in the forwarding table of EVERY switch on the path to it, so
+    "most recently seen" resolved to whichever of the access switch and the
+    core was polled last — the room-level binding firing intermittently, with
+    the evidence naming the wrong port. The access port is the one with the
+    fewest MACs learned on it."""
+    f = await _estate(db_session)
+    # The core uplink: same MAC, seen MORE recently, but carrying 3 MACs.
+    uplink = NetworkInterface(
+        device_id=f.device.id, if_index=49, name="Te1/1/49", alias="uplink-to-core"
+    )
+    db_session.add(uplink)
+    await db_session.flush()
+    for mac in (PHONE_MAC, OTHER_MAC, "aa:bb:cc:55:55:55"):
+        db_session.add(
+            NetworkFdbEntry(
+                device_id=f.device.id,
+                interface_id=uplink.id,
+                mac_address=mac,
+                fdb_type="learned",
+                first_seen=f.now - timedelta(seconds=70),
+                last_seen=f.now - timedelta(seconds=1),
+            )
+        )
+    # The access port: older, and the only MAC on it.
+    await _fdb(db_session, f, mac=PHONE_MAC, age_seconds=40)
+    await _bind(db_session, f.erls["room"], "switch_port", network_interface_id=f.iface.id)
+    await _bind(db_session, f.erls["floor"], "switch_port", network_interface_id=uplink.id)
+    await db_session.flush()
+
+    r = await resolve_location(db_session, mac=PHONE_MAC, now=f.now)
+    assert r.rule_matched == "switch_port"
+    assert r.erl is not None and r.erl.room == "312", "resolved to the uplink, not the port"
+
+
+@pytest.mark.asyncio
+async def test_a_stale_ip_to_mac_mapping_does_not_yield_a_confident_pin(
+    db_session: AsyncSession,
+) -> None:
+    """An IpMacHistory row is only the last time anything was OBSERVED at that
+    address, unlike a lease, which is a binding the server is honouring. A
+    years-old one driving a `mac` pin to confidence="observed" is the
+    stale-precise-answer this module exists to refuse."""
+    f = await _estate(db_session)
+    db_session.add(
+        IpMacHistory(
+            ip_address_id=f.ip.id,
+            mac_address=PHONE_MAC,
+            first_seen=f.now - timedelta(days=400),
+            last_seen=f.now - timedelta(days=365),
+            classification="known",
+            source="arp",
+        )
+    )
+    await db_session.flush()
+    await _bind(db_session, f.erls["pinned"], "mac", mac_address=PHONE_MAC)
+    await _bind(db_session, f.erls["floor"], "subnet", subnet_id=f.subnet.id)
+
+    # No MAC given: it must be inferred, and the inference is ancient.
+    r = await resolve_location(db_session, ip=PHONE_IP, now=f.now)
+    assert r.rule_matched == "subnet"
+    assert r.confidence == "degraded"
+    assert "IP→MAC mapping" in (r.degraded_reason or "")
+
+
+@pytest.mark.asyncio
+async def test_a_fresh_ip_to_mac_mapping_still_reaches_the_pin(
+    db_session: AsyncSession,
+) -> None:
+    """Control: the gate is about staleness, not about IpMacHistory being a
+    second-class source."""
+    f = await _estate(db_session)
+    db_session.add(
+        IpMacHistory(
+            ip_address_id=f.ip.id,
+            mac_address=PHONE_MAC,
+            first_seen=f.now - timedelta(seconds=300),
+            last_seen=f.now - timedelta(seconds=60),
+            classification="known",
+            source="arp",
+        )
+    )
+    await db_session.flush()
+    await _bind(db_session, f.erls["pinned"], "mac", mac_address=PHONE_MAC)
+
+    r = await resolve_location(db_session, ip=PHONE_IP, now=f.now)
+    assert r.rule_matched == "mac"
+    assert r.confidence == "observed"

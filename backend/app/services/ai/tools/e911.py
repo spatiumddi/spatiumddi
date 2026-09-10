@@ -40,6 +40,7 @@ from app.models.e911 import (
 from app.models.ipam import Subnet
 from app.services.ai.tools.base import register_tool
 from app.services.e911.resolver import resolve_location
+from app.services.search.ranking import escape_like
 
 _MODULE = "network.e911"
 
@@ -227,7 +228,9 @@ async def find_erls(db: AsyncSession, user: User, args: FindERLsArgs) -> list[di
         )
         stmt = stmt.where(detail if args.dispatchable else ~detail)
     if args.q:
-        needle = f"%{args.q}%"
+        # escape_like — a model that echoes a user's "50%" would otherwise
+        # match every row (#879).
+        needle = f"%{escape_like(args.q)}%"
         stmt = stmt.where(
             or_(
                 EmergencyResponseLocation.name.ilike(needle),

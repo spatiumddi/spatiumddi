@@ -45,7 +45,7 @@ from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
-from sqlalchemy import Select, case, func, or_, select
+from sqlalchemy import Select, and_, case, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -63,6 +63,7 @@ from app.models.e911 import (
     ERLBinding,
 )
 from app.services.e911.resolver import Resolution, resolve_location
+from app.services.search.ranking import escape_like
 
 router = APIRouter(
     tags=["e911"],
@@ -303,6 +304,18 @@ class BindingUpdate(BaseModel):
     is_active: bool | None = None
     notes: str | None = None
 
+    @field_validator("erl_id", "is_active", "notes")
+    @classmethod
+    def _no_explicit_null(cls, v: object, info: ValidationInfo) -> object:
+        # Same reason as ERLUpdate: `is_active` and `notes` are NOT NULL, so
+        # an explicit null is a 23502 the #922 handler deliberately re-raises
+        # — a 500 for what is plainly a client error.
+        if v is None:
+            raise ValueError(
+                f"{info.field_name} cannot be null — omit the key to leave it unchanged"
+            )
+        return v
+
 
 class BindingRead(BaseModel):
     id: uuid.UUID
@@ -484,15 +497,25 @@ def _apply_erl_filters(
     if is_active is not None:
         stmt = stmt.where(EmergencyResponseLocation.is_active.is_(is_active))
     if dispatchable is not None:
+        # `!= ""` as well as `IS NOT NULL`: the Python side tests
+        # truthiness, so an empty string counted as absent there and present
+        # here — the serialised `is_dispatchable` then contradicted the
+        # filter, and the RAY BAUM'S gap report under-counted. The API
+        # converts "" to NULL on write; this covers rows that predate it or
+        # arrived another way.
         detail = or_(
             *[
-                getattr(EmergencyResponseLocation, c).is_not(None)
+                and_(
+                    getattr(EmergencyResponseLocation, c).is_not(None),
+                    getattr(EmergencyResponseLocation, c) != "",
+                )
                 for c in DISPATCHABLE_DETAIL_COLUMNS
             ]
         )
         stmt = stmt.where(detail if dispatchable else ~detail)
     if q:
-        like = f"%{q}%"
+        # escape_like, or a needle of `50%` matches every row — #879.
+        like = f"%{escape_like(q)}%"
         stmt = stmt.where(
             or_(
                 EmergencyResponseLocation.name.ilike(like),
@@ -625,6 +648,9 @@ async def update_erl(erl_id: uuid.UUID, body: ERLUpdate, db: DB, user: CurrentUs
     if civic_changed and row.validation_state != "unvalidated":
         row.validation_state = "unvalidated"
         row.validated_at = None
+        # Cleared too. Leaving it made the list render "unvalidated  RedSky
+        # Horizon", which reads as a provider that validated THIS address.
+        row.validation_source = None
         row.validation_detail = (
             "reset: " + ", ".join(sorted(civic_changed)) + " changed after validation"
         )

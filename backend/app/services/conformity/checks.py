@@ -1713,6 +1713,10 @@ async def check_e911_port_binding_evidence_fresh(
             # reports a healthy poll.
             why = "neither poll_fdb nor poll_lldp is enabled — no port evidence can exist"
         elif last_poll is None:
+            # Covers `pending` with no completed poll too, which is why there
+            # is no separate branch for it — an earlier draft had one below
+            # and it was unreachable. `pending` WITH a last_poll is a poll in
+            # flight over data that is still current, so it is healthy.
             why = "device has never been polled"
         elif (now - last_poll).total_seconds() > window:
             age = int((now - last_poll).total_seconds())
@@ -1725,8 +1729,6 @@ async def check_e911_port_binding_evidence_fresh(
             # where perhaps only the unrelated IGMP leg failed, as "not
             # polled at all".
             why = f"last poll {poll_status}"
-        elif poll_status == "pending" and last_poll is None:
-            why = "device has never completed a poll"
         if why:
             broken.append({"device": name, "bindings": int(count), "reason": why})
 
