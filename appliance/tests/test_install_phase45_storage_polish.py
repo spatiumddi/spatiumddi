@@ -18,6 +18,8 @@ HOW TO RUN (from the repo root):
 
 from __future__ import annotations
 
+import re
+
 from _installer_source import CODE, extract_fn
 
 # ── Items 23 + 24 — the trap ──────────────────────────────────────────
@@ -67,11 +69,29 @@ def test_reinstall_keeping_var_is_offered_only_on_a_reusable_layout():
     assert "_existing_install_version" in fn
 
 
-def test_the_layout_check_goes_by_label_not_partition_number():
+def test_the_layout_check_goes_by_identity_not_partition_number():
+    """All five parts of the layout are found by identity, so a disk
+    carrying them at other indices is still reusable.
+
+    ``assert "LABEL" in fn`` was the original form, and by #1045 the only
+    uppercase ``LABEL`` left in the function was in its own comments — so
+    the guard passed on prose while the code it describes had changed
+    underneath it. It now asserts on the calls, and on there being no
+    partition NUMBER, which is the property the name claims.
+    """
     fn = extract_fn("_layout_is_reusable")
-    assert "LABEL" in fn
-    for label in ("ESP", "state", "root_a", "root_b", "var"):
-        assert label in fn, label
+    code = "\n".join(ln.split("#", 1)[0] for ln in fn.splitlines())
+    for part in ("ESP", "state", "var"):
+        assert part in code, part
+    # ESP / state / var by filesystem label; the two OS slots by GPT name,
+    # which a slot upgrade cannot overwrite (#1045).
+    assert "_labelled_device_on" in code
+    for slot in ("root_a", "root_b"):
+        assert slot in code, slot
+    assert "_slot_device_on" in code
+    assert not re.search(r"\$\{?dev\}?[0-9]|partition_node", code), (
+        "the check must not reach for a partition number"
+    )
 
 
 def test_keeping_var_skips_the_partition_table_and_the_two_filesystems():

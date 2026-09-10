@@ -893,6 +893,98 @@ the formatter handles the rest.
 ### Fixed
 
 
+- **Both OS slots ended up labelled `root_a` after an A/B upgrade, and
+  the #995 "Keep /var" reinstall silently stopped being offered
+  (#1045).** `build-slot-image.sh` builds ONE image for both slots and
+  bakes `mkfs.ext4 -L root_a` into it, so every upgrade wrote `root_a`
+  onto whichever slot it targeted. `spatium-upgrade-slot` already knew
+  the baked-in filesystem identity was wrong for the target and fixed
+  half of it — `tune2fs -U random`, because a duplicate UUID wedges
+  slot detection — and left the label alone under a comment
+  ("PARTLABEL is preserved because it lives in the GPT header, not the
+  filesystem") showing it was never considered. So slot B came out of
+  its first upgrade labelled `root_a` and **no partition on the disk
+  carried `root_b` again, ever.**
+  **Nothing on the boot path notices**, which is why it survived
+  releases: `grub.cfg` renders `root=UUID=`, and the image-baseline
+  fstab carries no root entry — only `var` / `state` / `ESP`, none of
+  which a slot upgrade rewrites. What noticed was the INSTALLER.
+  `_layout_is_reusable` required all five labels, `root_b` among them,
+  so it refused every disk that had ever upgraded — withdrawing the
+  "Keep /var" offer and erasing the database of anyone reinstalling a
+  long-lived appliance. Silently: every `return 1` in it was bare, so
+  "a label is missing" and "this disk is not ours" produced identical
+  output. Proven against the shipped script rather than argued —
+  main's own `_layout_is_reusable`, run against the post-upgrade layout
+  #1042 reported, returns 1 and says nothing.
+  **Two halves, because they fail separately.**
+  `spatium-upgrade-slot` now labels the target from its own GPT name,
+  beside the UUID randomisation that already existed for the other half
+  of the same problem — derived from the PARTLABEL, never a literal,
+  because the GPT name is what genuinely identifies a slot, is what the
+  script already matches slots on, and is the one thing a `dd` of a
+  filesystem image cannot overwrite. The label is read back off the
+  device afterwards: on a MOUNTED filesystem `tune2fs` goes through
+  `FS_IOC_SETFSLABEL` and "accepted" is not "applied". And
+  `spatium-install` now matches the two slots by GPT name, which is the
+  half that repairs the fleet — a disk written by an older appliance
+  keeps working without anyone touching it. A pre-#1045 disk's ACTIVE
+  slot is repaired on its next upgrade too; never fatal, since the
+  label is on no boot path and the installer no longer depends on it.
+  **ESP / state / var deliberately keep the filesystem label as their
+  identity** — that is what fstab resolves them by — so the split is
+  per-partition-role rather than wholesale.
+  **Two more found on the way.** The KEEP_VAR reinstall resolved all
+  five devices with `blkid -L`, which searches **every disk on the
+  machine**: with a second SpatiumDDI disk attached it could answer
+  with the wrong one and `mkfs` a `/var` the operator never picked.
+  Now resolved against the target disk only, with an assertion that the
+  two slots are two different partitions. And
+  `_existing_install_version` gave up after the first slot it could
+  mount, so a slot that mounts and carries no release file
+  short-circuited the whole function to "unknown version" — which is
+  the state slot B is in on every freshly installed appliance, and is
+  also why a #999 mirror reported `unknown version` for a perfectly
+  good install (the raid member is tried first and cannot be mounted as
+  ext4). It now tries every candidate. Where both slots hold a release
+  it still reports slot A's, which on a node booted from B is the
+  older, inactive one; left as it is, and said so in the code, because
+  determining the active slot from the ISO means reading grubenv off
+  the ESP and this string only decides how a prompt is worded.
+  **/code-review found five, and two were about guards rather than
+  code.** `_layout_is_reusable` had no distinctness check of its own, so
+  a disk whose two slots resolve to the SAME device was offered "Keep
+  /var", the operator answered four more screens, and the install
+  aborted at the wipe — a refusal has to live where the offer is made,
+  not only in `do_install` (it is in both now; a preseeded install sets
+  KEEP_VAR without going through the picker at all).
+  `_existing_install_version` mounted slot B **twice** on a duplicated
+  disk, since it answers to both names, tripling the 10 s stall that
+  bound exists to cap — in the enumeration that runs before the
+  operator has picked anything. The active-slot repair sat after the one
+  `udevadm trigger --settle`, so its `by-label` link stayed stale until
+  the next reboot while a comment claimed one settle covered both; and
+  `_relabel_slot_filesystem`'s verification result was **discarded at
+  both call sites**, so a label that provably did not stick produced one
+  stderr line and an apply that still reported success (the #882
+  reporting lesson) — it now names the consequence and the one-line
+  manual fix. Plus two stale comments that had become load-bearing: the
+  #999 md-gate's justification described a `blkid`-by-label hazard that
+  no longer exists and whose direction has **inverted** (on a mirror
+  only the live raid MEMBERS carry a GPT name, so without that gate mkfs
+  would land on a disk the array is still using), and
+  `_layout_is_reusable`'s header still asserted the premise this issue
+  disproves. That second one mattered more than prose usually does:
+  `test_the_layout_check_goes_by_label_not_partition_number` asserted
+  `"LABEL" in fn`, and the only uppercase `LABEL` left in the function
+  was in that comment — so the guard was passing on the explanation
+  while the code it describes had changed underneath it. Rewritten to
+  assert on the calls.
+  33 new appliance tests plus that rewrite, every one of them run
+  against the unpatched scripts first — all 33 fail there, and the
+  rewritten guard fails while its 19 neighbours still pass. No
+  migration, no API change.
+
 - **The kea container outlived its own agent, and every health
   surface stayed green (#1043).** `entrypoint.sh` backgrounds
   kea-dhcp4, kea-dhcp6 and the Python agent and waits for the first
