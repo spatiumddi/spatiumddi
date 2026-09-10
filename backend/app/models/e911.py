@@ -283,9 +283,7 @@ class EmergencyResponseLocation(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     validation_state: Mapped[str] = mapped_column(
         String(16), nullable=False, default="unvalidated", server_default="unvalidated"
     )
-    validated_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    validated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     validation_source: Mapped[str | None] = mapped_column(String(64), nullable=True)
     validation_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
 

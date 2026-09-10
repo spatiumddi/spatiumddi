@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from sqlalchemy import String, cast, func, select
 from sqlalchemy.dialects.postgresql import INET
@@ -114,7 +114,7 @@ def _age_seconds(observed_at: datetime | None, now: datetime) -> int | None:
         # Defensive: every column here is timezone-aware, but a naive
         # value subtracted from an aware one raises TypeError, and this
         # function runs on the path that answers a 911 location query.
-        seen = seen.replace(tzinfo=timezone.utc)
+        seen = seen.replace(tzinfo=UTC)
     return max(0, int((now - seen).total_seconds()))
 
 
@@ -205,8 +205,7 @@ async def _port_from_mac(
             select(NetworkNeighbour.interface_id, NetworkNeighbour.last_seen)
             .where(
                 NetworkNeighbour.interface_id.is_not(None),
-                NetworkNeighbour.remote_chassis_id_subtype
-                == LLDP_CHASSIS_SUBTYPE_MAC,
+                NetworkNeighbour.remote_chassis_id_subtype == LLDP_CHASSIS_SUBTYPE_MAC,
                 func.lower(
                     func.replace(
                         func.replace(NetworkNeighbour.remote_chassis_id, ":", ""),
@@ -259,8 +258,7 @@ async def _port_from_mac(
                 select(NetworkNeighbour.remote_chassis_id)
                 .where(
                     NetworkNeighbour.interface_id == iface_id,
-                    NetworkNeighbour.remote_chassis_id_subtype
-                    == LLDP_CHASSIS_SUBTYPE_MAC,
+                    NetworkNeighbour.remote_chassis_id_subtype == LLDP_CHASSIS_SUBTYPE_MAC,
                     func.lower(
                         func.replace(
                             func.replace(NetworkNeighbour.remote_chassis_id, ":", ""),
@@ -308,9 +306,7 @@ async def _subnet_for_ip(db: AsyncSession, ip: str) -> Subnet | None:
     ).scalar_one_or_none()
 
 
-async def _binding(
-    db: AsyncSession, rule_kind: str, **target: object
-) -> ERLBinding | None:
+async def _binding(db: AsyncSession, rule_kind: str, **target: object) -> ERLBinding | None:
     stmt = select(ERLBinding).where(
         ERLBinding.rule_kind == rule_kind,
         ERLBinding.is_active.is_(True),
@@ -366,7 +362,7 @@ async def resolve_location(
     Exactly one identity is expected; when several are given they are all
     used as facts, which only ever makes the answer more specific.
     """
-    now = now or datetime.now(timezone.utc)
+    now = now or datetime.now(UTC)
     evidence: list[Evidence] = []
 
     identity_kind, identity_value = "unknown", ""
@@ -407,8 +403,7 @@ async def resolve_location(
                 .where(
                     NetworkNeighbour.interface_id.is_not(None),
                     NetworkNeighbour.remote_port_id == port_id,
-                    func.lower(NetworkNeighbour.remote_chassis_id)
-                    == chassis_id.lower(),
+                    func.lower(NetworkNeighbour.remote_chassis_id) == chassis_id.lower(),
                 )
                 .order_by(NetworkNeighbour.last_seen.desc())
                 .limit(1)
@@ -445,16 +440,12 @@ async def resolve_location(
     ip_row_id: uuid.UUID | None = None
     if ip:
         ip_row_id = (
-            await db.execute(
-                select(IPAddress.id).where(cast(IPAddress.address, String) == ip)
-            )
+            await db.execute(select(IPAddress.id).where(cast(IPAddress.address, String) == ip))
         ).scalar_one_or_none()
 
     # ── Walk the precedence, most specific first ─────────────────────
     targets: dict[str, dict[str, object] | None] = {
-        "switch_port": (
-            {"network_interface_id": interface_id} if interface_id else None
-        ),
+        "switch_port": ({"network_interface_id": interface_id} if interface_id else None),
         # Nothing populates a client→AP association yet (#972 Deferred), so
         # this rule is reachable only once a wireless mirror lands. Listed
         # so the precedence is visibly complete rather than silently short.
@@ -462,11 +453,7 @@ async def resolve_location(
         "mac": {"mac_address": mac_canon} if mac_canon else None,
         "ip": {"ip_address_id": ip_row_id} if ip_row_id else None,
         "subnet": {"subnet_id": subnet.id} if subnet else None,
-        "vlan": (
-            {"vlan_ref_id": subnet.vlan_ref_id}
-            if subnet and subnet.vlan_ref_id
-            else None
-        ),
+        "vlan": ({"vlan_ref_id": subnet.vlan_ref_id} if subnet and subnet.vlan_ref_id else None),
         "site_default": {"site_id": site_id} if site_id else None,
     }
 
@@ -518,6 +505,5 @@ async def resolve_location(
         identity_value=identity_value,
         evidence=evidence,
         confidence="none",
-        degraded_reason=degraded_reason
-        or "no ERL binding matched this identity at any level",
+        degraded_reason=degraded_reason or "no ERL binding matched this identity at any level",
     )
