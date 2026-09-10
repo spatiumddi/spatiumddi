@@ -250,7 +250,12 @@ client's User-Agent string, as RFC 8555 asks for), `fingerbank.org`,
 `aistudio.google.com` (the "get an API key" link in an error message),
 `bacnet.org`, `kea.readthedocs.io`, `schema.org` (a JSON-LD `@context`
 identifier in a Teams-format webhook payload — a namespace URI, not a
-URL that is dereferenced), and the DNSBL catalogue's homepage fields:
+URL that is dereferenced), `www.opengis.net` (the GML namespace in the
+E911 PIDF-LO renderer — likewise an XML namespace identifier, written
+into the document we *emit* and never fetched; the accompanying
+`urn:ogc:def:crs:EPSG::4326` CRS reference is a URN precisely because it
+names a coordinate system rather than locating a resource), and the DNSBL
+catalogue's homepage fields:
 `www.spamhaus.org`, `www.spamcop.net`, `www.barracudacentral.org`,
 `www.uceprotect.net`, `www.sorbs.net`, `psbl.org`.
 
