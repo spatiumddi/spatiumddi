@@ -10,9 +10,19 @@ Two complements to the per-account lockout (#71):
   ``jti`` so a captured (challenge + TOTP) pair can't be replayed inside
   the 5-minute token TTL (#7).
 
-Both **fail open** when Redis is unreachable: the per-account lockout +
-the always-required second factor remain the hard backstops, so a Redis
-outage degrades these to no-ops rather than locking everyone out.
+Plus one that is not an auth throttle at all:
+
+* ``e911_self_query_rate_limited`` — a per-source-IP budget on the
+  unauthenticated HELD device self-query (#972).
+
+**The two auth throttles fail OPEN** when Redis is unreachable: the
+per-account lockout + the always-required second factor remain the hard
+backstops, so a Redis outage degrades them to no-ops rather than locking
+everyone out.
+
+**The E911 one fails CLOSED**, and that inversion is the point rather than
+an oversight — see its docstring. It is not a complement to another
+protection; behind it sits an endpoint with no authentication at all.
 """
 
 from __future__ import annotations

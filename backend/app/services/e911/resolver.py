@@ -40,7 +40,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
-from sqlalchemy import cast, func, select
+from sqlalchemy import cast, func, or_, select
 from sqlalchemy.dialects.postgresql import INET
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -629,42 +629,80 @@ async def resolve_location(
     )
 
 
-async def effective_subnet_erl(
-    db: AsyncSession, subnet: Subnet
-) -> EmergencyResponseLocation | None:
-    """The ERL a SUBNET-level consumer should use, or None (#972 Phase 2).
+async def effective_subnet_erls(
+    db: AsyncSession, subnets: list[Subnet]
+) -> dict[uuid.UUID, EmergencyResponseLocation]:
+    """``{subnet_id: ERL}`` for a whole page of subnets, in ONE round trip.
 
     DHCP can know which subnet a request came from and nothing finer, so the
     only rules that can apply are the subnet's own, its VLAN's, and its
-    site's default — in that order. A ``switch_port`` or ``mac`` rule is
+    site's default — most specific first. A ``switch_port`` or ``mac`` rule is
     deliberately NOT consulted: those identify a device, and a DHCP option is
-    written once per scope for every client in it, so honouring one would
-    hand every phone on the floor the location of one desk.
+    written once per scope for every client in it, so honouring one would hand
+    every phone on the floor the location of one desk.
+
+    Batched because the caller is the agent ``/config`` long-poll: the
+    per-subnet version cost three queries per scope, which is 600 round trips
+    on a 200-scope server that has no ERL bindings at all.
 
     Shares its rule set with the ``e911_voice_subnet_unbound`` conformity
-    check for the same reason, so "this subnet is covered" means the same
-    thing in the compliance report and in the rendered DHCP config.
+    check, so "this subnet is covered" means the same thing in the compliance
+    report and in the rendered DHCP config.
     """
-    for rule_kind, column, value in (
-        ("subnet", ERLBinding.subnet_id, subnet.id),
-        ("vlan", ERLBinding.vlan_ref_id, subnet.vlan_ref_id),
-        ("site_default", ERLBinding.site_id, subnet.site_id),
-    ):
-        if value is None:
-            continue
-        erl = (
-            await db.execute(
-                select(EmergencyResponseLocation)
-                .join(ERLBinding, ERLBinding.erl_id == EmergencyResponseLocation.id)
-                .where(
-                    ERLBinding.rule_kind == rule_kind,
-                    column == value,
-                    ERLBinding.is_active.is_(True),
-                    EmergencyResponseLocation.is_active.is_(True),
-                )
-                .limit(1)
+    if not subnets:
+        return {}
+
+    subnet_ids = [s.id for s in subnets]
+    vlan_ids = [s.vlan_ref_id for s in subnets if s.vlan_ref_id is not None]
+    site_ids = [s.site_id for s in subnets if s.site_id is not None]
+
+    conditions = [ERLBinding.subnet_id.in_(subnet_ids)]
+    if vlan_ids:
+        conditions.append(ERLBinding.vlan_ref_id.in_(vlan_ids))
+    if site_ids:
+        conditions.append(ERLBinding.site_id.in_(site_ids))
+
+    rows = (
+        await db.execute(
+            select(ERLBinding, EmergencyResponseLocation)
+            .join(
+                EmergencyResponseLocation,
+                EmergencyResponseLocation.id == ERLBinding.erl_id,
             )
-        ).scalar_one_or_none()
+            .where(
+                or_(*conditions),
+                ERLBinding.rule_kind.in_(("subnet", "vlan", "site_default")),
+                ERLBinding.is_active.is_(True),
+                EmergencyResponseLocation.is_active.is_(True),
+            )
+        )
+    ).all()
+
+    by_subnet: dict[uuid.UUID, EmergencyResponseLocation] = {}
+    by_vlan: dict[uuid.UUID, EmergencyResponseLocation] = {}
+    by_site: dict[uuid.UUID, EmergencyResponseLocation] = {}
+    for binding, erl in rows:
+        if binding.rule_kind == "subnet" and binding.subnet_id is not None:
+            by_subnet[binding.subnet_id] = erl
+        elif binding.rule_kind == "vlan" and binding.vlan_ref_id is not None:
+            by_vlan[binding.vlan_ref_id] = erl
+        elif binding.rule_kind == "site_default" and binding.site_id is not None:
+            by_site[binding.site_id] = erl
+
+    out: dict[uuid.UUID, EmergencyResponseLocation] = {}
+    for subnet in subnets:
+        erl = by_subnet.get(subnet.id)
+        if erl is None and subnet.vlan_ref_id is not None:
+            erl = by_vlan.get(subnet.vlan_ref_id)
+        if erl is None and subnet.site_id is not None:
+            erl = by_site.get(subnet.site_id)
         if erl is not None:
-            return erl
-    return None
+            out[subnet.id] = erl
+    return out
+
+
+async def effective_subnet_erl(
+    db: AsyncSession, subnet: Subnet
+) -> EmergencyResponseLocation | None:
+    """Single-subnet convenience over :func:`effective_subnet_erls`."""
+    return (await effective_subnet_erls(db, [subnet])).get(subnet.id)

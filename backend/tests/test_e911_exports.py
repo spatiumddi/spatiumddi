@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import csv
 import io
+import re
 import uuid
 
 import pytest
@@ -161,7 +162,7 @@ def test_the_snippet_says_it_is_generated_for_review() -> None:
 
 def test_the_civic_stanza_carries_the_address() -> None:
     out = render_ios_snippets([(_erl(), [])])
-    assert "location civic-location identifier spatium-001" in out
+    assert re.search(r"location civic-location identifier spatium-[0-9a-f]{8}", out)
     assert " country US" in out
     assert " state NY" in out
     assert " city New York" in out
@@ -197,7 +198,7 @@ def test_an_elin_that_is_not_a_number_is_refused() -> None:
     erl = _erl()
     erl.elins = ["+12125550199", "'; reload"]
     out = render_ios_snippets([(erl, [])])
-    assert "location elin-location +12125550199 identifier spatium-001" in out
+    assert re.search(r"location elin-location \+12125550199 identifier spatium-[0-9a-f]{8}", out)
     assert not any("reload" in ln for ln in _live_lines(out))
 
 
@@ -216,20 +217,26 @@ def test_the_identifier_is_ios_safe_not_the_erl_name() -> None:
     stanza is which."""
     erl = _erl(name="Bldg A — Floor 3 — Room 312")
     out = render_ios_snippets([(erl, [])])
-    assert "identifier spatium-001" in out
+    assert re.search(r"identifier spatium-[0-9a-f]{8}", out)
     assert "! Bldg A — Floor 3 — Room 312" in out
 
 
 def test_per_interface_lines_are_emitted_for_a_switch_port_binding() -> None:
     erl = _erl()
-    out = render_ios_snippets([(erl, [])], interface_names={str(erl.id): ["GigabitEthernet3/0/12"]})
+    out = render_ios_snippets(
+        [(erl, [])],
+        interface_names={str(erl.id): [("sw-fl3-a", "GigabitEthernet3/0/12")]},
+    )
     assert "interface GigabitEthernet3/0/12" in out
-    assert " location civic-location-id spatium-001" in out
+    assert re.search(r" location civic-location-id spatium-[0-9a-f]{8}", out)
 
 
 def test_a_hostile_interface_name_is_refused() -> None:
     erl = _erl()
-    out = render_ios_snippets([(erl, [])], interface_names={str(erl.id): ["Gi1/0/1\n no shutdown"]})
+    out = render_ios_snippets(
+        [(erl, [])],
+        interface_names={str(erl.id): [("sw-a", "Gi1/0/1\n no shutdown")]},
+    )
     assert not any("no shutdown" in ln for ln in _live_lines(out))
     assert "OMITTED" in out
 
@@ -237,8 +244,8 @@ def test_a_hostile_interface_name_is_refused() -> None:
 def test_each_erl_gets_its_own_identifier() -> None:
     a, b = _erl(name="A"), _erl(name="B", room="401")
     out = render_ios_snippets([(a, []), (b, [])])
-    assert "identifier spatium-001" in out
-    assert "identifier spatium-002" in out
+    idents = set(re.findall(r"identifier (spatium-[0-9a-f]{8})", out))
+    assert len(idents) == 2, "two ERLs must not share an identifier"
 
 
 def test_an_empty_export_says_so() -> None:
@@ -251,3 +258,68 @@ def test_every_ios_keyword_maps_a_real_column() -> None:
     renders — the #899 "written, never read" class."""
     columns = {c for c, _n, _t, _d in CIVIC_ELEMENTS}
     assert set(IOS_CIVIC_KEYWORDS) <= columns
+
+
+# ══════════════════════════════════════════════════════════════════════
+# /code-review round 3
+# ══════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.parametrize("coord", ["-73.985428", "-33.86882", "-0.5", "-120"])
+def test_a_negative_coordinate_is_not_quoted_as_text(coord: str) -> None:
+    """`-` is a formula leader and every Southern or Western coordinate starts
+    with one. Quoting those imported latitude, longitude and altitude as TEXT
+    in the spreadsheet this export exists for, so the columns could not be
+    sorted, plotted or summed."""
+    erl = _erl()
+    erl.longitude = coord
+    row = _csv_rows([(erl, [])])[0]
+    assert row["longitude"] == coord
+
+
+def test_a_leading_hyphen_that_is_not_a_number_is_still_quoted() -> None:
+    """The narrowing is "is it a number", not "does it start with a hyphen"."""
+    row = _csv_rows([(_erl(bld="-cmd|calc"), [])])[0]
+    assert row["bld"] == "'-cmd|calc"
+
+
+def test_the_identifier_is_derived_from_the_erl_id_not_its_position() -> None:
+    """The first version was positional and documented as "stable" while being
+    the opposite: adding one ERL renumbered every later stanza, so an operator
+    who had already applied an export would re-point live port assignments at
+    the wrong locations the next time they pasted."""
+    a, b = _erl(name="A"), _erl(name="B")
+    first = render_ios_snippets([(a, [])])
+    # Insert another ERL ahead of it — a's identifier must not move.
+    second = render_ios_snippets([(b, []), (a, [])])
+    ident_a = [ln for ln in first.splitlines() if "identifier spatium-" in ln][0]
+    assert ident_a in second, "a's identifier changed when another ERL was inserted"
+
+
+def test_per_interface_lines_name_their_switch() -> None:
+    """`Gi1/0/12` exists on every switch in the estate. A file of bare
+    interface names gives an operator no way to tell which lines belong to the
+    switch in front of them, and pasting the wrong ones mis-assigns ports to
+    rooms."""
+    erl = _erl()
+    out = render_ios_snippets(
+        [(erl, [])],
+        interface_names={str(erl.id): [("sw-fl3-a", "GigabitEthernet3/0/12")]},
+    )
+    assert "! on sw-fl3-a" in out
+    assert "interface GigabitEthernet3/0/12" in out
+    # The heading comes before the interface it describes.
+    lines = out.splitlines()
+    assert lines.index("! on sw-fl3-a") < lines.index("interface GigabitEthernet3/0/12")
+
+
+def test_two_switches_sharing_a_port_name_are_distinguishable() -> None:
+    a, b = _erl(name="Room 312"), _erl(name="Room 401")
+    out = render_ios_snippets(
+        [(a, []), (b, [])],
+        interface_names={
+            str(a.id): [("sw-fl3-a", "Gi1/0/12")],
+            str(b.id): [("sw-fl4-a", "Gi1/0/12")],
+        },
+    )
+    assert "! on sw-fl3-a" in out and "! on sw-fl4-a" in out

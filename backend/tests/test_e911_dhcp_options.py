@@ -16,6 +16,8 @@ HOW TO RUN:
 
 from __future__ import annotations
 
+import uuid
+
 import pytest
 
 from app.models.e911 import CIVIC_ELEMENTS, EmergencyResponseLocation
@@ -30,7 +32,16 @@ from app.services.e911.dhcp_options import (
 
 
 def _erl(**kw) -> EmergencyResponseLocation:
-    base = dict(name="x", country="US", a1="NY", a3="New York", rd="Broadway", hno="1234")
+    # Unique by default — `uq_erl_name` makes a second row called "x" a
+    # conflict, which the batched test creates five of.
+    base = dict(
+        name=f"erl-{uuid.uuid4().hex[:10]}",
+        country="US",
+        a1="NY",
+        a3="New York",
+        rd="Broadway",
+        hno="1234",
+    )
     base.update(kw)
     return EmergencyResponseLocation(**base)
 
@@ -347,9 +358,11 @@ async def test_a_bound_subnet_renders_the_location_options(db_session) -> None:
     them is the #899 class — code that is right in a file nothing renders
     from."""
     from app.services.dhcp.config_bundle import _with_location_options
+    from app.services.e911 import effective_subnet_erls
 
     subnet, erl = await _bound_subnet(db_session)
-    options = await _with_location_options(db_session, subnet, {})
+    erls = await effective_subnet_erls(db_session, [subnet])
+    options = _with_location_options(erls, subnet, {}, address_family="ipv4")
     entries = {d["code"]: d for d in options["option_data"]}
     assert set(entries) == {99, 123}
     assert entries[99]["name"] == "geoconf-civic"
@@ -374,9 +387,11 @@ async def test_an_unbound_subnet_changes_nothing(db_session) -> None:
     """Byte-identical to a config without the feature, so an unchanged bundle
     never triggers a spurious Kea reload."""
     from app.services.dhcp.config_bundle import _with_location_options
+    from app.services.e911 import effective_subnet_erls
 
     subnet, _erl = await _bound_subnet(db_session, bind=False)
-    assert await _with_location_options(db_session, subnet, {}) == {}
+    erls = await effective_subnet_erls(db_session, [subnet])
+    assert _with_location_options(erls, subnet, {}, address_family="ipv4") == {}
 
 
 @pytest.mark.asyncio
@@ -384,10 +399,12 @@ async def test_existing_option_data_is_not_displaced(db_session) -> None:
     """Phone profiles and the importers use the same raw passthrough. This is
     additive, never a replacement."""
     from app.services.dhcp.config_bundle import _with_location_options
+    from app.services.e911 import effective_subnet_erls
 
     subnet, _erl = await _bound_subnet(db_session)
+    erls = await effective_subnet_erls(db_session, [subnet])
     mine = {"code": 150, "data": "10.0.0.1"}
-    out = await _with_location_options(db_session, subnet, {"option_data": [mine]})
+    out = _with_location_options(erls, subnet, {"option_data": [mine]}, address_family="ipv4")
     assert mine in out["option_data"]
     assert len(out["option_data"]) == 3
 
@@ -399,11 +416,13 @@ async def test_a_device_level_rule_does_not_reach_a_dhcp_scope(db_session) -> No
     every phone on the floor the location of a single desk."""
     from app.models.e911 import ERLBinding
     from app.services.dhcp.config_bundle import _with_location_options
+    from app.services.e911 import effective_subnet_erls
 
     subnet, erl = await _bound_subnet(db_session, bind=False)
     db_session.add(ERLBinding(erl_id=erl.id, rule_kind="mac", mac_address="aa:bb:cc:dd:ee:09"))
     await db_session.flush()
-    assert await _with_location_options(db_session, subnet, {}) == {}
+    erls = await effective_subnet_erls(db_session, [subnet])
+    assert _with_location_options(erls, subnet, {}, address_family="ipv4") == {}
 
 
 async def _bound_subnet(db, *, bind: bool = True):
@@ -435,3 +454,109 @@ async def _bound_subnet(db, *, bind: bool = True):
         db.add(ERLBinding(erl_id=erl.id, rule_kind="subnet", subnet_id=subnet.id))
         await db.flush()
     return subnet, erl
+
+
+# ══════════════════════════════════════════════════════════════════════
+# /code-review round 3
+# ══════════════════════════════════════════════════════════════════════
+
+
+def test_the_encode_order_covers_every_catype() -> None:
+    """Two lists describing one thing, pinned to each other. An element
+    missing from _ENCODE_ORDER would silently never be encoded."""
+    from app.services.e911.dhcp_options import _CATYPE_BY_COLUMN, _ENCODE_PAIRS
+
+    assert {c for c, _n in _ENCODE_PAIRS} == set(_CATYPE_BY_COLUMN)
+
+
+def test_an_overflow_drops_free_text_not_the_room() -> None:
+    """THE finding. The encoder stops at an element boundary when it runs out
+    of 255 bytes, so whatever is encoded LAST is what gets dropped — and in
+    column order that was building / floor / unit / room / seat, because
+    `lmk` / `loc` / `nam` are declared ahead of them and are exactly the
+    fields an operator writes a sentence into.
+
+    A long "additional location information" therefore silently produced a
+    street address with no room, which is the one thing RAY BAUM'S §506 is
+    about.
+    """
+    erl = _erl(
+        loc="x" * 200,
+        nam="y" * 200,
+        lmk="z" * 200,
+        bld="A",
+        flr="3",
+        room="312",
+        seat="14",
+        unit="2",
+    )
+    payload = encode_option_99(erl)
+    assert payload is not None
+    _what, _country, tlvs = _decode_99(payload)
+    by_column = {c: n for c, n, _t, _d in CIVIC_ELEMENTS if n is not None}
+    # The dispatchable detail survived...
+    for column, expected in (
+        ("bld", "A"),
+        ("flr", "3"),
+        ("room", "312"),
+        ("unit", "2"),
+        ("seat", "14"),
+    ):
+        assert tlvs.get(by_column[column]) == expected, column
+    # ...and the street address too, since a dispatcher needs it to find the
+    # building at all.
+    assert tlvs[by_column["hno"]] == "1234"
+    # Something had to go, and it was the free text.
+    assert by_column["loc"] not in tlvs or by_column["nam"] not in tlvs
+
+
+@pytest.mark.asyncio
+async def test_an_ipv6_scope_gets_no_v4_location_options(db_session) -> None:
+    """The worst finding of the round. Options 99 and 123 are DHCPv4 codes in
+    the `dhcp4` space; the agent's v6 renderer passes the raw passthrough
+    through verbatim and kea-dhcp6 then rejects the WHOLE config — the "DHCP
+    stops for every client" outcome this feature otherwise avoids.
+
+    An ERL reached by a `vlan` or `site_default` binding applies to both
+    families, so this is a real path rather than a hypothetical one.
+    """
+    from app.services.dhcp.config_bundle import _with_location_options
+    from app.services.e911 import effective_subnet_erls
+
+    subnet, _erl_row = await _bound_subnet(db_session)
+    erls = await effective_subnet_erls(db_session, [subnet])
+    assert erls, "fixture did not bind an ERL"
+
+    v4 = _with_location_options(erls, subnet, {}, address_family="ipv4")
+    assert "option_data" in v4
+
+    v6 = _with_location_options(erls, subnet, {}, address_family="ipv6")
+    assert v6 == {}, "v4 location options leaked into a Dhcp6 scope"
+
+
+@pytest.mark.asyncio
+async def test_the_subnet_lookup_is_batched(db_session) -> None:
+    """Runs inside the agent /config long-poll: three queries per scope is 600
+    round trips on a 200-scope server with no ERL bindings at all."""
+    from app.services.e911 import effective_subnet_erls
+
+    subnets = []
+    for _ in range(5):
+        subnet, _e = await _bound_subnet(db_session)
+        subnets.append(subnet)
+    out = await effective_subnet_erls(db_session, subnets)
+    assert len(out) == 5
+    # And an empty input costs nothing at all.
+    assert await effective_subnet_erls(db_session, []) == {}
+
+
+def test_the_control_plane_renderer_passes_option_data_through() -> None:
+    """The preview tab stringified the whole list into one bogus entry and
+    omitted the real ones, so an operator was shown a config that would not
+    load. The agent renderer has always had this passthrough."""
+    from app.drivers.dhcp.kea import _render_option_data
+
+    entry = {"name": "geoconf-civic", "code": 99, "csv-format": False, "data": "01"}
+    out = _render_option_data({"option_data": [entry], "routers": "10.0.0.1"})
+    assert entry in out
+    assert not any(d.get("name") == "option_data" for d in out)

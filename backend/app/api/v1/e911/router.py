@@ -63,7 +63,7 @@ from app.models.e911 import (
     EmergencyResponseLocation,
     ERLBinding,
 )
-from app.models.network import NetworkInterface
+from app.models.network import NetworkDevice, NetworkInterface
 from app.services.e911.exports import render_csv, render_ios_snippets
 from app.services.e911.resolver import Resolution, resolve_location
 from app.services.search.ranking import escape_like
@@ -1074,8 +1074,11 @@ async def export_ios_snippets(
     """
     rows = await _export_rows(db, site_id=site_id)
 
-    # interface_id → "Gi3/0/12", for the per-interface stanzas. One query.
-    port_names: dict[str, list[str]] = {}
+    # interface_id → (device name, "Gi3/0/12"), for the per-interface stanzas.
+    # The device name is carried because Gi3/0/12 exists on every switch in the
+    # estate and a bare list gives the operator no way to tell which lines
+    # belong to the switch in front of them. One query.
+    port_names: dict[str, list[tuple[str, str]]] = {}
     port_bound = [
         (erl, b)
         for erl, bindings in rows
@@ -1083,11 +1086,17 @@ async def export_ios_snippets(
         if b.rule_kind == "switch_port" and b.network_interface_id
     ]
     if port_bound:
-        names: dict[uuid.UUID, str] = {
-            iface_id: iface_name
-            for iface_id, iface_name in (
+        names: dict[uuid.UUID, tuple[str, str]] = {
+            iface_id: (str(device_name or "(unknown switch)"), str(iface_name))
+            for iface_id, iface_name, device_name in (
                 await db.execute(
-                    select(NetworkInterface.id, NetworkInterface.name).where(
+                    select(
+                        NetworkInterface.id,
+                        NetworkInterface.name,
+                        NetworkDevice.name,
+                    )
+                    .join(NetworkDevice, NetworkDevice.id == NetworkInterface.device_id)
+                    .where(
                         NetworkInterface.id.in_([b.network_interface_id for _e, b in port_bound])
                     )
                 )
@@ -1098,9 +1107,9 @@ async def export_ios_snippets(
             # filters on it — but mypy cannot see that through the
             # comprehension, and an assert here would be a runtime cost on a
             # path that is already proven.
-            ifname = names.get(b.network_interface_id) if b.network_interface_id else None
-            if ifname:
-                port_names.setdefault(str(erl.id), []).append(str(ifname))
+            pair = names.get(b.network_interface_id) if b.network_interface_id else None
+            if pair:
+                port_names.setdefault(str(erl.id), []).append(pair)
 
     stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
     write_audit(

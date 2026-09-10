@@ -280,7 +280,20 @@ def _render_option_data(
     is_v6 = address_family == "ipv6"
     name_map = _KEA_OPTION_NAMES_V6 if is_v6 else _KEA_OPTION_NAMES
     out: list[dict[str, Any]] = []
+
+    # The raw Kea-shaped passthrough (#972's location options ride on it).
+    # Mirrors the agent renderer's handling, which has always had it — without
+    # this the control-plane preview stringified the whole list into a single
+    # bogus ``{"name": "option_data", "data": "{'name': 'geoconf-civic'...}"}``
+    # entry and omitted the real ones, so the rendered-config tab showed an
+    # operator something that would not load.
+    raw = options.get("option_data")
+    if isinstance(raw, list):
+        out.extend(e for e in raw if isinstance(e, dict))
+
     for key, val in options.items():
+        if key == "option_data":
+            continue
         if is_v6 and key in _DHCP4_ONLY_OPTION_NAMES:
             logger.warning(
                 "kea_option_skipped_v6_no_equivalent",

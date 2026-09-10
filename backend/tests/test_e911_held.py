@@ -508,3 +508,97 @@ async def test_every_held_answer_writes_a_resolution_log_row(client, db_session)
     )
     after = (await db_session.execute(select(func.count(E911ResolutionLog.id)))).scalar_one()
     assert after == before + 1
+
+
+# ══════════════════════════════════════════════════════════════════════
+# /code-review round 3
+# ══════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_exact_geodetic_against_a_civic_only_erl_is_refused(client, db_session) -> None:
+    """RFC 5985 §6.1: with exact="true" the client wants ONLY the types it
+    listed. The first version parsed `locationType` and `exact` and read
+    neither, so a caller asking exactly for geodetic got a 200 carrying civic
+    data it had explicitly said it could not use."""
+    from tests.test_network_api import _make_admin
+
+    _user, token = await _make_admin(db_session)
+    ip, _room = await _estate_with_location(db_session)  # no coordinates
+    res = await client.post(
+        "/held",
+        content=_req(
+            f'<locationType exact="true">geodetic</locationType>' f"<device><ip>{ip}</ip></device>"
+        ),
+        headers={**HELD_CT, "Authorization": f"Bearer {token}"},
+    )
+    assert res.status_code == 400
+    assert ET.fromstring(res.content).get("code") == ERROR_CANNOT_PROVIDE
+
+
+@pytest.mark.asyncio
+async def test_exact_civic_is_still_answered(client, db_session) -> None:
+    """Control: the refusal is about a type we cannot supply, not about
+    `exact` itself."""
+    from tests.test_network_api import _make_admin
+
+    _user, token = await _make_admin(db_session)
+    ip, room = await _estate_with_location(db_session)
+    res = await client.post(
+        "/held",
+        content=_req(
+            f'<locationType exact="true">civic</locationType>' f"<device><ip>{ip}</ip></device>"
+        ),
+        headers={**HELD_CT, "Authorization": f"Bearer {token}"},
+    )
+    assert res.status_code == 200
+    assert ET.fromstring(res.content).find(f".//{{{NS_CIVIC}}}ROOM").text == room
+
+
+def test_held_is_exempt_from_maintenance_mode() -> None:
+    """A change window must not stop answering "which room is this phone in".
+    A PBX asking on behalf of a 911 call is the one caller that cannot wait for
+    the window to close — and `GET /api/v1/e911/location` kept working
+    throughout, so 503ing only the standards-track path was incoherent as well
+    as dangerous."""
+    from app.core.maintenance_mode import EXEMPT_PREFIXES
+
+    assert "/held" in EXEMPT_PREFIXES
+
+
+def test_nginx_proxies_held_in_both_templates() -> None:
+    """Without its own location block `/held` falls through to the SPA
+    `location /` and a PBX asking where a phone is gets index.html with a 200 —
+    unreachable through the shipped frontend on compose, Helm and the appliance
+    alike.
+
+    Skipped rather than failed when the repo root is absent: the api image
+    contains only ``backend/``, so this can only run from a full checkout,
+    which is what CI has. A skip here is honest; a pass would not be.
+    """
+    import pathlib as _p
+
+    root = _p.Path(__file__).resolve().parents[2]
+    templates = [
+        root / "frontend" / "default.conf.template",
+        root / "charts" / "spatiumddi" / "templates" / "frontend-tls-config.yaml",
+    ]
+    if not all(t.is_file() for t in templates):
+        pytest.skip("nginx templates are outside the api image; run from a checkout")
+    for t in templates:
+        assert "location /held" in t.read_text(), str(t)
+
+
+def test_an_unknown_client_address_is_a_400_not_a_429(monkeypatch) -> None:
+    """The throttle fails closed, so asking it first answered "slow down" for a
+    request that can never succeed however slowly it is retried — and made the
+    accurate message unreachable. Structural, because the ASGI test client
+    always supplies a client address."""
+    import inspect
+
+    from app.api.v1.e911 import held_router
+
+    src = inspect.getsource(held_router.held_self_query)
+    unknown = src.index("could not determine the requesting address")
+    throttled = src.index("e911_self_query_rate_limited")
+    assert unknown < throttled, "the throttle still runs before the address check"

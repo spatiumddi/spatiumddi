@@ -4,6 +4,7 @@ from app.services.e911.resolver import (
     Evidence,
     Resolution,
     effective_subnet_erl,
+    effective_subnet_erls,
     resolve_location,
 )
 
@@ -11,5 +12,6 @@ __all__ = [
     "Evidence",
     "Resolution",
     "effective_subnet_erl",
+    "effective_subnet_erls",
     "resolve_location",
 ]

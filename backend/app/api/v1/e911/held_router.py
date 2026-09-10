@@ -42,6 +42,7 @@ from app.core.permissions import require_resource_permission
 from app.core.responses import HeldXmlResponse
 from app.models.auth import User
 from app.services.e911.held import (
+    ERROR_CANNOT_PROVIDE,
     ERROR_LOCATION_UNKNOWN,
     ERROR_NOT_LOCATABLE,
     ERROR_REQUEST_ERROR,
@@ -119,6 +120,21 @@ async def _answer(
             resolution.degraded_reason or "no dispatchable location for that identity",
             status.HTTP_404_NOT_FOUND,
         )
+
+    # RFC 5985 §6.1: with exact="true" the client wants ONLY the types it
+    # listed. Honoured rather than parsed-and-ignored, which is what the first
+    # version did — a caller asking exactly for `geodetic` against an ERL with
+    # no coordinates got a 200 carrying civic data it had explicitly said it
+    # could not use, and would render nothing from.
+    if held.exact and not held.wants_civic:
+        has_point = resolution.erl.latitude is not None and resolution.erl.longitude is not None
+        if not has_point:
+            return _error(
+                ERROR_CANNOT_PROVIDE,
+                "this location has no coordinates; only a civic address is "
+                "available and the request asked exactly for geodetic",
+                status.HTTP_400_BAD_REQUEST,
+            )
 
     pidf = render_pidf_lo(
         resolution.erl,
@@ -206,6 +222,19 @@ async def held_self_query(request: Request, db: DB) -> Response:
         )
 
     source_ip = request.client.host if request.client else None
+    if source_ip is None:
+        # Checked BEFORE the throttle. The throttle refuses a falsy address
+        # (it fails closed), so asking it first answered 429 — "slow down" —
+        # for a request that can never succeed no matter how slowly it is
+        # retried, and made this accurate message unreachable. There is no safe
+        # fallback here: answering from a body-supplied address is the oracle
+        # this endpoint exists to avoid being.
+        return _error(
+            ERROR_NOT_LOCATABLE,
+            "could not determine the requesting address",
+            status.HTTP_400_BAD_REQUEST,
+        )
+
     if await e911_self_query_rate_limited(source_ip):
         return _error(
             ERROR_REQUEST_ERROR,
@@ -217,15 +246,6 @@ async def held_self_query(request: Request, db: DB) -> Response:
         parsed = parse_location_request(await request.body())
     except HeldError as exc:
         return _error(exc.code, exc.message, status.HTTP_400_BAD_REQUEST)
-
-    if source_ip is None:
-        # No source address means no identity on this path, and there is no
-        # safe fallback — answering from a body-supplied one is the oracle.
-        return _error(
-            ERROR_NOT_LOCATABLE,
-            "could not determine the requesting address",
-            status.HTTP_400_BAD_REQUEST,
-        )
 
     # Rebuilt from the source address alone. Every identity the body carried
     # is discarded, including an <ip> that happens to match — accepting it

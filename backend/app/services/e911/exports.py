@@ -94,18 +94,32 @@ IOS_CIVIC_KEYWORDS: dict[str, str] = {
 }
 
 
+def _is_number(text: str) -> bool:
+    try:
+        float(text)
+    except ValueError:
+        return False
+    return True
+
+
 def _csv_safe(value: object) -> str:
     """Stringify for CSV, defusing spreadsheet formula injection.
 
     A building named ``=cmd|' /C calc'!A0`` is a formula that executes when
     the file is opened. Prefixing a single quote is what every spreadsheet
-    reads as "this is text" — and unlike stripping the character it does not
-    alter an address that legitimately starts with a hyphen.
+    reads as "this is text".
+
+    **A plain negative number is left alone**, which is why the check is not
+    just ``startswith``. ``-`` is a formula leader, and every Southern or
+    Western coordinate starts with one — quoting those would import latitude,
+    longitude and altitude as TEXT in the spreadsheet this export exists for,
+    so the columns could not be sorted, plotted or summed. A leading ``-``
+    followed by something that is not a number is still quoted.
     """
     if value is None:
         return ""
     text = str(value)
-    if text.startswith(_FORMULA_LEADERS):
+    if text.startswith(_FORMULA_LEADERS) and not _is_number(text):
         return "'" + text
     return text
 
@@ -192,25 +206,45 @@ def render_csv(
 
 
 def _identifier_for(erl: EmergencyResponseLocation, index: int) -> str:
-    """A stable, IOS-safe civic-location identifier.
+    """A STABLE, IOS-safe civic-location identifier.
 
     IOS identifiers are short and may not contain spaces, and an ERL name is
-    neither. A positional ``spatium-NN`` is used instead, with the real name
-    in a comment above the stanza so an operator can tell which is which.
+    neither — so it cannot be the name.
+
+    Derived from the ERL's own id, not from its position. A positional
+    ``spatium-001`` was the first version and was documented as "stable" while
+    being the opposite: adding one ERL renumbers every later stanza, so an
+    operator who had already applied a previous export would be re-pointing
+    live port assignments at the wrong locations the next time they pasted.
+
+    ``index`` is kept only as the tie-break for an ERL with no id yet (an
+    unsaved row in a test), because two stanzas sharing an identifier is a
+    config where the second silently replaces the first.
     """
-    return f"spatium-{index:03d}"
+    raw = getattr(erl, "id", None)
+    if raw is None:
+        return f"spatium-{index:03d}"
+    # First 8 hex of the UUID: 4 billion values, short enough for IOS, and
+    # stable for the life of the row.
+    return f"spatium-{str(raw).replace('-', '')[:8]}"
 
 
 def render_ios_snippets(
     rows: list[tuple[EmergencyResponseLocation, list[ERLBinding]]],
     *,
-    interface_names: dict[str, list[str]] | None = None,
+    interface_names: dict[str, list[tuple[str, str]]] | None = None,
 ) -> str:
     """LLDP-MED civic-location stanzas, as text for an operator to review.
 
-    ``interface_names`` maps an ERL id to the switch interfaces bound to it,
-    so the per-interface ``location civic-location-id`` lines can be emitted
-    too. Absent, only the stanzas are produced.
+    ``interface_names`` maps an ERL id to ``(device_name, interface_name)``
+    pairs, so the per-interface ``location civic-location-id`` lines can be
+    emitted too. Absent, only the stanzas are produced.
+
+    The device name is carried because ``Gi1/0/12`` exists on every switch in
+    the estate: a file listing bare interface names gives an operator no way
+    to tell which lines belong to the switch in front of them, and pasting the
+    wrong ones mis-assigns ports to rooms. The interfaces are grouped under a
+    per-device heading for the same reason.
     """
     out: list[str] = [
         "! ------------------------------------------------------------------",
@@ -264,11 +298,14 @@ def render_ios_snippets(
                 continue
             out.append(f"location elin-location {safe_elin} identifier {ident}")
 
-        for ifname in interface_names.get(str(erl.id), []):
+        for device_name, ifname in interface_names.get(str(erl.id), []):
             safe_if = _ios_safe(ifname)
             if safe_if is None:
                 skipped.append(f"interface={ifname!r}")
                 continue
+            safe_dev = _ios_safe(device_name) or "(unknown switch)"
+            # Which switch. Gi1/0/12 exists on all of them.
+            out.append(f"! on {safe_dev}")
             out.append(f"interface {safe_if}")
             out.append(f" location civic-location-id {ident}")
             out.append(" exit")

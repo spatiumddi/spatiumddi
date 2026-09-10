@@ -55,9 +55,69 @@ LATLON_RESOLUTION_BITS = 30
 #: height is not claiming centimetres; 16 is metre-ish precision.
 ALTITUDE_RESOLUTION_BITS = 16
 
+#: Encoding order for the CAtype TLVs, and it is NOT the column order.
+#:
+#: The option is capped at 255 bytes and the encoder stops at an element
+#: boundary when it runs out of room — so whatever is last is what gets
+#: dropped. In column order that is the DISPATCHABLE detail (building, floor,
+#: unit, room, seat), because ``lmk`` / ``loc`` / ``nam`` are declared ahead of
+#: them and are exactly the free-text fields an operator writes a sentence
+#: into. A long "additional location information" would therefore have
+#: silently produced a street address with no room — the one thing RAY BAUM'S
+#: §506 is actually about.
+#:
+#: So the street address goes first (it is short, bounded, and useless to omit
+#: since a dispatcher needs it to find the building at all), then the interior
+#: detail, then the long free-text fields, which are the right thing to lose.
+_ENCODE_ORDER: tuple[str, ...] = (
+    # Administrative + street: short, bounded, and the part that gets anybody
+    # to the right building.
+    "a1",
+    "a2",
+    "a3",
+    "a4",
+    "a5",
+    "a6",
+    "prd",
+    "rd",
+    "sts",
+    "pod",
+    "hno",
+    "hns",
+    "pc",
+    # The dispatchable detail — RAY BAUM'S §506's "room number, floor number,
+    # or similar". Encoded before anything optional can crowd it out.
+    "bld",
+    "flr",
+    "unit",
+    "room",
+    "seat",
+    # Free text and the rarely-used remainder. First to be dropped, and the
+    # right things to drop.
+    "plc",
+    "nam",
+    "lmk",
+    "loc",
+    "pcn",
+    "pobox",
+    "addcode",
+    "rdsec",
+    "rdbr",
+    "rdsubbr",
+    "prm",
+    "pom",
+)
+
 _CATYPE_BY_COLUMN: dict[str, int] = {
     column: catype for column, catype, _tag, _desc in CIVIC_ELEMENTS if catype is not None
 }
+
+#: ``(column, catype)`` in encoding order. Built from both constants so a new
+#: civic element missing from ``_ENCODE_ORDER`` is caught by a test rather than
+#: silently never encoded.
+_ENCODE_PAIRS: tuple[tuple[str, int], ...] = tuple(
+    (column, _CATYPE_BY_COLUMN[column]) for column in _ENCODE_ORDER if column in _CATYPE_BY_COLUMN
+)
 
 
 def encode_option_99(
@@ -79,7 +139,7 @@ def encode_option_99(
     out = bytearray([what & 0xFF])
     out += country.encode("ascii")
 
-    for column, catype in _CATYPE_BY_COLUMN.items():
+    for column, catype in _ENCODE_PAIRS:
         raw = getattr(erl, column, None)
         if raw is None:
             continue
@@ -93,8 +153,11 @@ def encode_option_99(
             # produce bytes a consumer cannot decode.
             continue
         if len(out) + 2 + len(value) > MAX_OPTION_BYTES:
-            # Out of room. Stop cleanly rather than emitting a truncated
-            # TLV, which would make every byte after it garbage.
+            # Out of room. Stop cleanly rather than emitting a truncated TLV,
+            # which would make every byte after it garbage. ``_ENCODE_ORDER``
+            # is what makes this safe to do: by the time we can run out, the
+            # street address and the interior detail are already written and
+            # only free text is left.
             break
         out += bytes([catype, len(value)])
         out += value

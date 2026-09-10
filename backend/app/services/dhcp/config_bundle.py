@@ -54,7 +54,7 @@ from app.services.dhcp.device_policy import (
     load_fingerprint_snapshot,
 )
 from app.services.dhcp.radvd import build_ra_config, render_radvd_conf
-from app.services.e911 import effective_subnet_erl
+from app.services.e911 import effective_subnet_erls
 from app.services.e911.dhcp_options import kea_option_data
 from app.services.feature_modules import is_module_enabled
 
@@ -269,6 +269,27 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
         dropped_ids = {sc.id for sc, _ in dropped}
         scope_rows = [sc for sc in scope_rows if sc.id not in dropped_ids]
 
+    # #972 Phase 2 — one lookup for every scope's subnet, before the loop.
+    #
+    # Gated on the feature module: without it, disabling `network.e911` would
+    # hide every surface for inspecting bindings while the scopes kept shipping
+    # the options, which is the worst of both. The RA feature in this same
+    # function gates the same way.
+    #
+    # Batched because this runs inside the agent /config long-poll: three
+    # queries per scope is 600 round trips on a 200-scope server that has no
+    # ERL bindings at all.
+    location_erls: dict[uuid.UUID, Any] = {}
+    if await is_module_enabled(db, "network.e911"):
+        try:
+            location_erls = await effective_subnet_erls(
+                db,
+                [subnet_map[sc.subnet_id] for sc in scope_rows if sc.subnet_id in subnet_map],
+            )
+        except Exception as exc:  # noqa: BLE001 — a location option is never
+            # worth risking the lease service for.
+            log.warning("dhcp_bundle_e911_lookup_failed", error=str(exc))
+
     scopes: list[ScopeDef] = []
     for sc in scope_rows:
         subnet = subnet_map.get(sc.subnet_id)
@@ -307,7 +328,12 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
                 lease_time=sc.lease_time,
                 min_lease_time=sc.min_lease_time,
                 max_lease_time=sc.max_lease_time,
-                options=await _with_location_options(db, subnet, dict(sc.options or {})),
+                options=_with_location_options(
+                    location_erls,
+                    subnet,
+                    dict(sc.options or {}),
+                    address_family=getattr(sc, "address_family", "ipv4") or "ipv4",
+                ),
                 pools=pools,
                 statics=statics,
                 ddns_enabled=sc.ddns_enabled,
@@ -646,8 +672,12 @@ async def _assemble_device_policy_classes(
 __all__ = ["ConfigBundle", "build_config_bundle"]
 
 
-async def _with_location_options(
-    db: AsyncSession, subnet: Subnet, options: dict[str, Any]
+def _with_location_options(
+    location_erls: dict[uuid.UUID, Any],
+    subnet: Subnet,
+    options: dict[str, Any],
+    *,
+    address_family: str,
 ) -> dict[str, Any]:
     """Merge the #972 DHCP location options into a scope's option mapping.
 
@@ -655,33 +685,28 @@ async def _with_location_options(
     lease time, with no HELD exchange and no LLDP-MED. Rendered per SCOPE,
     which is the floor-level answer — DHCP cannot know the room.
 
-    Three properties worth stating:
+    **IPv4 only, and that is a correctness gate rather than a limitation.**
+    Options 99 and 123 are DHCPv4 codes in the ``dhcp4`` option space; the v6
+    equivalents are 36 and 63 and are not implemented. Emitting these into a
+    ``Dhcp6`` scope is not a harmless no-op — the agent's v6 renderer passes
+    the raw passthrough through verbatim and kea-dhcp6 then rejects the WHOLE
+    config, which is the "DHCP stops for every client" outcome this feature is
+    otherwise careful to avoid. An ERL reached by a ``vlan`` or
+    ``site_default`` binding applies to both families, so that case is real
+    rather than hypothetical.
 
-    * **Additive and append-only.** The entries go onto whatever
-      ``option_data`` the mapping already carries (phone profiles and the
-      importers use the same raw passthrough), so this never displaces an
-      operator's option.
-    * **Silent when there is nothing to say.** No ERL, or an ERL that cannot
-      produce a valid option, contributes nothing — so the rendered config is
-      byte-identical to one without the feature and an unchanged bundle never
-      triggers a spurious Kea reload.
-    * **Never fatal.** ``kea_option_data`` fails closed to an empty list, and
-      the wrapper swallows a lookup failure: the blast radius of getting this
-      wrong is Kea refusing the whole configuration, so a location option is
-      never worth risking the lease service for.
+    Otherwise: additive and append-only (phone profiles and the importers use
+    the same raw passthrough, so this never displaces an operator's option),
+    and silent when there is nothing to say, so the rendered config stays
+    byte-identical to one without the feature and an unchanged bundle never
+    triggers a spurious Kea reload.
     """
-    try:
-        erl = await effective_subnet_erl(db, subnet)
-        if erl is None:
-            return options
-        entries = kea_option_data(erl)
-    except Exception as exc:  # noqa: BLE001 — see "never fatal" above
-        log.warning(
-            "dhcp_bundle_e911_options_skipped",
-            subnet_id=str(subnet.id),
-            error=str(exc),
-        )
+    if address_family != "ipv4":
         return options
+    erl = location_erls.get(subnet.id)
+    if erl is None:
+        return options
+    entries = kea_option_data(erl)
     if not entries:
         return options
     existing = options.get("option_data")

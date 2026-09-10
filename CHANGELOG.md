@@ -292,7 +292,62 @@ the formatter handles the rest.
   package `__init__` that imports `config_bundle`. It now lives in
   `app/core/mac.py`, whose package `__init__` is empty, so a pure
   string function cannot participate in a cycle at all.
-  154 backend tests. The resolver's were written before any API existed
+  **A third /code-review round found thirteen more, and the worst
+  would have stopped DHCP entirely.** `_with_location_options` ignored
+  address family, so an ERL reached by a `vlan` or `site_default`
+  binding injected `dhcp4`-space options 99 and 123 into an IPv6 scope
+  — the agent's v6 renderer passes the raw passthrough through
+  verbatim and kea-dhcp6 then rejects the WHOLE config, which is
+  exactly the outcome the encoders are otherwise so careful to avoid.
+  It is now an explicit IPv4 gate with a v6 test.
+  Two more made the feature unreachable rather than wrong. `/held` had
+  no nginx `location` block in either template, so it fell through to
+  the SPA `location /` and a PBX asking where a phone is got
+  `index.html` with a 200 — on compose, Helm and the appliance alike.
+  And neither HELD path was exempt from maintenance mode, so a change
+  window silently killed location delivery to CUCM while the
+  equivalent JSON lookup kept working, which was incoherent as well as
+  dangerous.
+  **One was a silent data loss in exactly the field that matters.**
+  The option-99 encoder stops at an element boundary when it runs out
+  of 255 bytes, so whatever is encoded LAST is what gets dropped — and
+  in column order that was building, floor, unit, room and seat,
+  because `lmk` / `loc` / `nam` are declared ahead of them and are the
+  free-text fields an operator writes a sentence into. A long
+  "additional location information" therefore produced a street
+  address with no room, which is the one thing RAY BAUM'S §506 is
+  about. Encoding order is now explicit and separate from column
+  order: street address first, then the dispatchable detail, then the
+  free text, which is the right thing to lose.
+  Also: the control-plane renderer had no `option_data` passthrough
+  (the agent's has always had one), so the rendered-config preview
+  stringified the whole list into one bogus entry and showed an
+  operator a config that would not load; `locationType` and `exact`
+  were parsed and read by nothing, so a caller asking exactly for
+  `geodetic` against a civic-only ERL got a 200 carrying civic data it
+  had said it could not use; the bundle had no `network.e911` module
+  gate, so disabling the module hid every surface for inspecting
+  bindings while the scopes kept shipping the options; and the subnet
+  lookup cost three queries per scope on the agent long-poll path,
+  which is 600 round trips on a 200-scope server with no bindings at
+  all, now one.
+  Three in the exports. The IOS snippet emitted bare interface names,
+  and `Gi1/0/12` exists on every switch in the estate — a file with no
+  device context gives an operator no way to tell which lines belong
+  to the switch in front of them, and pasting the wrong ones
+  mis-assigns ports to rooms. `_identifier_for` was positional while
+  its own docstring called it stable, so inserting one ERL renumbered
+  every later stanza and re-pointed port assignments an operator had
+  already applied; it now derives from the ERL's id. And `-` in the
+  CSV formula-leader list quoted every negative latitude and longitude
+  as text, in the spreadsheet the export exists for — the check is now
+  "is it a number", not "does it start with a hyphen".
+  Last two were smaller: an unknown client address answered 429
+  because the fail-closed throttle ran before the address check,
+  making the accurate 400 unreachable; and `auth_throttle`'s module
+  docstring still said "Both fail open" after a third, deliberately
+  fail-closed throttle joined it.
+  205 backend tests. The resolver's were written before any API existed
   and both mutations were run against the shipped code to prove they
   bite — removing the staleness gate fails 4, reverting the precedence
   fails the pin test. **Deferred to their own changes:** HELD / PIDF-LO
