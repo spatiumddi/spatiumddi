@@ -66,7 +66,12 @@ cleanup() {
     # kernel version", "initrd was not created"). Seven paths printed ERROR
     # and returned success; main exits 1 correctly, so it was a regression.
     local rc=${1:-$?}
-    if [ -n "$MOUNT_DIR" ] && ! unmount_tree "$MOUNT_DIR"; then
+    # $WORKDIR, not $MOUNT_DIR — the refusal below says "with live mounts under
+    # $WORKDIR" and `rm -rf` is about to walk exactly that, so that is what has
+    # to be clear. Checking only $MOUNT_DIR made the claim wider than the check
+    # and left the non-mountpoint branch in unmount_tree unreachable from any
+    # call site. MOUNT_DIR lives under WORKDIR, so this is a superset.
+    if ! unmount_tree "$WORKDIR"; then
         echo "ERROR: refusing to rm -rf $WORKDIR with live mounts under it" >&2
         exit 1
     fi

@@ -31,7 +31,8 @@
 # `umount -R` takes sub-mounts down first; a lazy `-l -R` detach is the
 # fallback for a mount something still holds open (the tree is gone from
 # our namespace either way, which is all mksquashfs, rsync and rm need);
-# `findmnt` is the proof. build-slot-image.sh's #553 exit trap already
+# the mount-table scan is the proof — NOT `findmnt`, which cannot see a mount
+# below a plain directory at all. build-slot-image.sh's #553 exit trap already
 # had the recursive half of this; wrap-iso.sh never had any of it.
 
 # Processes (in this namespace) whose cwd, root or an open fd is under $1.
@@ -48,19 +49,59 @@ holders_of() {
     done
 }
 
-# Is anything mounted AT or BELOW $1? Reads /proc/mounts rather than asking
+# Where the mount table is read from. Overridable ONLY so the path-matching
+# below can be tested against a synthetic table without root — every caller
+# uses the default.
+: "${MOUNT_LIB_MOUNTS_FILE:=/proc/mounts}"
+
+# Canonicalise a path the way /proc/mounts already has. Without this the
+# comparison is a literal string match against the kernel's canonical target,
+# so a symlinked ancestor (a symlinked TMPDIR is enough) or a trailing slash
+# makes every mount invisible — and this helper is BOTH the gate and the
+# post-unmount proof, so a miss reads as "nothing mounted, safe to rm -rf".
+# Measured: without it, `unmount_tree "$W/link/mnt"` left the tmpfs mounted and
+# returned 0, where resolving first clears it.
+#
+# `realpath -m` does not require the path to exist (it may already be gone by
+# the time cleanup runs); `readlink -f` is the fallback, and the raw path the
+# last resort so a coreutils-less shell degrades to the old behaviour rather
+# than to an exception.
+_canon_path() {
+    realpath -m "$1" 2>/dev/null \
+        || readlink -f "$1" 2>/dev/null \
+        || printf '%s' "$1"
+}
+
+# Is anything mounted AT or BELOW $1? Reads the mount table rather than asking
 # findmnt, because `findmnt -R <path>` resolves <path> to its own mountpoint
 # and reports nothing at all when <path> is a plain directory with mounts
 # underneath it — so it cannot answer this question, which is the one that
 # matters before an `rm -rf`.
 anything_mounted_under() {
-    local under=$1 target
+    local under target
+    under=$(_canon_path "$1")
     while read -r _dev target _rest; do
+        # /proc/mounts octal-escapes space (\040), tab, newline and backslash.
+        # `printf %b` is what turns those back into the path we were handed.
+        target=$(printf '%b' "$target")
         case "$target" in
             "$under"|"$under"/*) return 0 ;;
         esac
-    done < /proc/mounts
+    done < "$MOUNT_LIB_MOUNTS_FILE"
     return 1
+}
+
+# Every mount at or below $1, deepest first — the order umount needs, since a
+# parent refuses while a child is mounted on it.
+mounts_under() {
+    local under target
+    under=$(_canon_path "$1")
+    while read -r _dev target _rest; do
+        target=$(printf '%b' "$target")
+        case "$target" in
+            "$under"|"$under"/*) printf '%s\t%s\n' "${#target}" "$target" ;;
+        esac
+    done < "$MOUNT_LIB_MOUNTS_FILE" | sort -rn | cut -f2-
 }
 
 unmount_tree() {
@@ -75,20 +116,32 @@ unmount_tree() {
     # to check.
     anything_mounted_under "$mp" || return 0
     mountpoint -q "$mp" 2>/dev/null || {
-        # Sub-mounts but no mount at $mp itself: umount -R needs a mount
-        # point, so take them deepest-first by path length.
-        local target rc=0
-        for target in $(awk -v u="$mp" '$2 == u || index($2, u "/") == 1 {print length($2), $2}' \
-                            /proc/mounts | sort -rn | cut -d" " -f2-); do
-            umount -R "$target" 2>/dev/null || umount -l -R "$target" || rc=1
+        # Sub-mounts but no mount at $mp itself: `umount -R` needs a mount
+        # point, so walk them deepest-first.
+        #
+        # The list is RE-READ every pass rather than snapshotted. One
+        # `umount -R` can take several entries down at once (stacked mounts at
+        # one target, or a subtree), and a stale entry then fails both attempts
+        # and latched a failure on a tree that was already clean — reporting
+        # ERROR with nothing of our own in the log, while every caller is
+        # `|| exit 1`. Bounded so a mount that genuinely will not go never
+        # spins; the verdict is the proof below, not the loop.
+        local target pass=0
+        while [ "$pass" -lt 20 ] && anything_mounted_under "$mp"; do
+            pass=$((pass + 1))
+            target=$(mounts_under "$mp" | head -n1)
+            [ -n "$target" ] || break
+            umount -R "$target" 2>/dev/null \
+                || umount -l -R "$target" 2>/dev/null \
+                || true
         done
         if anything_mounted_under "$mp"; then
-            echo "ERROR: mounts remain under $mp:" >&2
-            grep -F " $mp" /proc/mounts >&2 || true
+            echo "ERROR: mounts remain under $mp after $pass pass(es):" >&2
+            mounts_under "$mp" >&2 || true
             holders_of "$mp" >&2 || true
             return 1
         fi
-        return "$rc"
+        return 0
     }
     if ! umount -R "$mp"; then
         echo "  umount -R $mp failed; still mounted underneath it:" >&2
@@ -100,8 +153,8 @@ unmount_tree() {
     fi
     if anything_mounted_under "$mp"; then
         echo "ERROR: $mp is still mounted after umount -R and a lazy detach:" >&2
-        findmnt -R "$mp" >&2 || true
-        grep -F " $mp" /proc/mounts >&2 || true
+        mounts_under "$mp" >&2 || true
+        holders_of "$mp" >&2 || true
         return 1
     fi
 }

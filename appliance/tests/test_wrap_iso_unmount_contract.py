@@ -115,6 +115,77 @@ def test_the_composite_trap_passes_the_status_in() -> None:
 # ── 2. unmount_tree must see mounts BELOW a plain directory ──────────────────
 
 
+def _mounted_under(mounts_table: str, query: str, tmp_path: Path) -> bool:
+    """Ask the SHIPPED `anything_mounted_under` about a synthetic mount table.
+
+    `MOUNT_LIB_MOUNTS_FILE` exists for exactly this: the path-matching is where
+    the regression was, and it needs no root to exercise. The behavioural
+    unmount test below needs real mounts and skips where it cannot get them, so
+    without this seam the logic that actually broke had no coverage at all
+    anywhere it runs.
+    """
+    table = tmp_path / "mounts"
+    table.write_text(mounts_table, encoding="utf-8")
+    proc = subprocess.run(
+        ["bash", "-c", f'. "{MOUNT_LIB}"\nanything_mounted_under "{query}"'],
+        capture_output=True,
+        text=True,
+        env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "MOUNT_LIB_MOUNTS_FILE": str(table)},
+    )
+    assert proc.returncode in (0, 1), f"unexpected rc {proc.returncode}: {proc.stderr}"
+    return proc.returncode == 0
+
+
+def test_a_mount_below_a_plain_directory_is_seen(tmp_path: Path) -> None:
+    """The gate `mountpoint -q … || return 0` could not see this at all."""
+    d = tmp_path / "work"
+    (d / "mnt").mkdir(parents=True)
+    assert _mounted_under(f"none {d}/mnt tmpfs rw 0 0\n", str(d), tmp_path)
+
+
+def test_a_trailing_slash_does_not_hide_a_mount(tmp_path: Path) -> None:
+    d = tmp_path / "work"
+    (d / "mnt").mkdir(parents=True)
+    assert _mounted_under(f"none {d}/mnt tmpfs rw 0 0\n", f"{d}/", tmp_path)
+
+
+def test_a_symlinked_ancestor_does_not_hide_a_mount(tmp_path: Path) -> None:
+    """The regression this contract test exists for.
+
+    /proc/mounts records the kernel's CANONICAL target, so a literal compare
+    against a path reached through a symlink matches nothing — and because the
+    same helper is also the post-unmount proof, a miss reads as "clean, safe to
+    rm -rf". The first cut of this fix had exactly that, and it was a
+    regression: the original `mountpoint -q` form resolved symlinks for free.
+    """
+    real = tmp_path / "real"
+    (real / "mnt").mkdir(parents=True)
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    assert _mounted_under(f"none {real}/mnt tmpfs rw 0 0\n", f"{link}/mnt", tmp_path)
+
+
+def test_an_escaped_space_does_not_hide_a_mount(tmp_path: Path) -> None:
+    """/proc/mounts octal-escapes space as `\\040`."""
+    d = tmp_path / "sp ace"
+    (d / "mnt").mkdir(parents=True)
+    escaped = str(d / "mnt").replace(" ", "\\040")
+    assert _mounted_under(f"none {escaped} tmpfs rw 0 0\n", str(d), tmp_path)
+
+
+def test_an_unrelated_mount_is_not_claimed(tmp_path: Path) -> None:
+    """Negative control: the matcher must not be a blanket yes.
+
+    A sibling whose path merely shares a prefix (`/x/work2` vs `/x/work`) is
+    not under it — a plain `index(target, under) == 1` would say it is.
+    """
+    d = tmp_path / "work"
+    d.mkdir()
+    sibling = tmp_path / "work2"
+    (sibling / "mnt").mkdir(parents=True)
+    assert not _mounted_under(f"none {sibling}/mnt tmpfs rw 0 0\n", str(d), tmp_path)
+
+
 def test_unmount_tree_does_not_early_return_on_a_non_mountpoint() -> None:
     """The `mountpoint -q … || return 0` guard is what made it blind."""
     body = MOUNT_LIB.read_text(encoding="utf-8")
