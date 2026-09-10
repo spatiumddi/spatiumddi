@@ -19888,6 +19888,40 @@ export const e911Api = {
     chassis_id?: string;
     port_id?: string;
   }) => api.get<E911Location>("/e911/location", { params }).then((r) => r.data),
+
+  /** Exports (#972 Phase 3). Both return text the operator reads — the IOS
+   *  snippet is explicitly NOT applied to any device by SpatiumDDI.
+   *
+   *  Downloads through the axios client rather than a bare link so the
+   *  Authorization header is sent; these endpoints are permission-gated and a
+   *  plain `<a href>` would 401. Filename comes from Content-Disposition,
+   *  with the same UTC stamp fallback the IPAM exporter uses. */
+  download: async (kind: "csv" | "ios", siteId?: string) => {
+    const path =
+      kind === "csv" ? "/e911/export.csv" : "/e911/export/ios-lldp-med.txt";
+    const res = await api.get(path, {
+      params: siteId ? { site_id: siteId } : undefined,
+      responseType: "blob",
+    });
+    const disp = String(res.headers["content-disposition"] ?? "");
+    const match = disp.match(/filename="?([^"]+)"?/);
+    const ts = new Date()
+      .toISOString()
+      .slice(0, 19)
+      .replace(/[-:]/g, "")
+      .replace("T", "-");
+    const fallback =
+      kind === "csv" ? `e911-erls-${ts}.csv` : `e911-ios-lldp-med-${ts}.txt`;
+    const blob = new Blob([res.data as BlobPart]);
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = match ? match[1] : fallback;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  },
 };
 
 // ── OT / industrial devices (#542) ───────────────────────────────────

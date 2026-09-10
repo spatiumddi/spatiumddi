@@ -34,10 +34,10 @@ from fastapi import APIRouter, Depends, Request, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB, CurrentUser
-from app.api.v1.dhcp._mac import canonicalize_mac
 from app.api.v1.e911.router import log_resolution
 from app.config import settings
 from app.core.auth_throttle import e911_self_query_rate_limited
+from app.core.mac import canonicalize_mac
 from app.core.permissions import require_resource_permission
 from app.core.responses import HeldXmlResponse
 from app.models.auth import User

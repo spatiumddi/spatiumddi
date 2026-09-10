@@ -64,6 +64,17 @@ class EventStreamResponse(Response):
     media_type = "text/event-stream"
 
 
+class CsvResponse(Response):
+    media_type = "text/csv"
+
+
+class IosConfigResponse(Response):
+    """Generated switch-configuration text for an operator to review.
+    ``text/plain`` rather than a made-up type, so a browser shows it."""
+
+    media_type = "text/plain"
+
+
 class DnsZoneResponse(Response):
     """A zone in RFC 1035 master-file format."""
 

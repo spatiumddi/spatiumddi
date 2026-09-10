@@ -192,7 +192,107 @@ the formatter handles the rest.
   the product; and `Number("12.3x")` is NaN, which serialises as null —
   so typed garbage in a coordinate field saved silently as "no point"
   and wiped an existing one on edit.
-  63 backend tests. The resolver's were written before any API existed
+  **Phase 1b — HELD and PIDF-LO.** `POST /held` takes an RFC 5985
+  `locationRequest` and returns PIDF-LO (RFC 4119 + RFC 5139 civic +
+  RFC 5491 geodetic) — the protocol CUCM, Cisco MPP firmware, the
+  Webex app, RedSky "HELD+", Intrado ERS and Bandwidth DLR already
+  speak, which is what makes this usable with **no phone-side
+  change**. Mounted at the application root because a HELD client is
+  configured with a whole URL and the protocol names the path. This is
+  the payoff for the 31-column decision: the element names come from
+  `CIVIC_ELEMENTS`, and `PIDF_ELEMENT_ORDER` fixes the WIRE order
+  separately, because the RFC 5139 schema sequence is not the column
+  order and a consumer validating an `xs:sequence` rejects
+  out-of-order children; a test pins the two lists to each other.
+  The `method` element is not decoration — RFC 4119 registers those
+  tokens and consumers treat them differently, so a switch-port answer
+  goes out as `Wiremap` and a subnet or site answer as `Manual`.
+  `retransmission-allowed` is `no`: this is the location of a person
+  at a desk, and a 911 path needs no onward distribution rights. The
+  resolver's confidence and matched rule ride on response headers,
+  because PIDF-LO has nowhere to say "this is a fallback answer". An
+  unknown device is a 404 with `locationUnknown`, which is what a
+  provider's retry logic expects, where an empty 200 would read as
+  "this device has no location by design".
+  **The load-bearing refusal is that a request with no identity is
+  refused.** RFC 5985's default is to answer from the requester's own
+  address, so falling through would hand a PBX the location of its own
+  server in response to a question about a phone — a perfectly-formed
+  answer that is completely wrong. A recognised-but-unresolvable
+  identity (`msisdn`, `imsi`) is reported rather than ignored, because
+  treating it as "no identity given" takes that same fall-through. XML
+  from the network is size-capped before parsing, a DOCTYPE is refused
+  outright rather than trusted to be inert, and parsing goes through
+  stdlib ElementTree, which supports no DTD and no external entities
+  at all — XXE and entity expansion are unavailable rather than
+  mitigated.
+  **Phase 2 — the device self-query and the DHCP options.** The
+  self-query is off behind `E911_SELF_QUERY_ENABLED`: 404 rather than
+  403 when disabled so it does not advertise itself to a scanner;
+  identity forced to the TCP source address with every body-supplied
+  identity discarded, including one that matches, since accepting it
+  when it matches would leak by timing whether a guessed address is
+  the caller's; rate-limited per source IP and **failing closed**, the
+  only inverted throttle in `auth_throttle`, because this throttle IS
+  the protection where the login one has lockout and a second factor
+  behind it; and the response carries the location only, not even the
+  confidence headers, which describe our internal evidence.
+  DHCP options 99 (RFC 4776 civic) and 123 (RFC 6225 geodetic) render
+  automatically into a scope whose subnet resolves to an ERL. Per
+  scope, never per client: DHCP can know the subnet and nothing finer,
+  so a switch-port or MAC binding is deliberately not consulted — a
+  DHCP option is written once for every client in the scope, and
+  honouring a device rule would hand every phone on the floor the
+  location of one desk.
+  **The encoders were verified by measurement, and the first attempt
+  produced a config Kea REFUSED OUTRIGHT** — which stops DHCP for
+  every client on the server. Against kea-dhcp4 3.0.3, option 99 has a
+  standard definition Kea will not let you override, so it goes out
+  under Kea's own name `geoconf-civic`, while 123 has none and rides
+  on ours. A second real hole surfaced the same way:
+  `option_defs_for_option_maps` scanned only `code:NN` keys and not
+  the raw `option_data` passthrough these ride on, so the definition
+  for 123 was never shipped and Kea would have rejected the whole
+  config.
+  Everything in the encoders fails closed to "emit no option": a value
+  that will not fit is dropped rather than truncated, because
+  truncating UTF-8 mid-sequence yields bytes a consumer cannot decode;
+  a total over 255 bytes stops at an element boundary rather than
+  emitting a partial TLV; no two-letter country means no option at
+  all; and an out-of-range coordinate yields nothing, because a
+  wrapped fixed-point value is a valid-looking location somewhere
+  else. Every test decodes the bytes back rather than comparing them
+  to a hex literal — a literal proves the encoder still does what it
+  did when the test was written, not that it does what the RFC says.
+  **Phase 3 — exports, with the provider connectors still deferred.**
+  One CSV of every ERL and its bindings, and one file of
+  `location civic-location` / `location elin-location` stanzas plus
+  the per-interface lines, as text the operator reviews and applies.
+  SpatiumDDI pushes no switch configuration (#60), and the snippet
+  says so in its own header.
+  **The real work in the exports is sanitisation.** A room name
+  carrying a newline followed by `no logging console` is arbitrary
+  configuration pasted into a switch by someone who trusted us, and a
+  building whose name starts with `=` executes as a formula when the
+  CSV is opened in Excel. A value that cannot be expressed safely is
+  omitted AND listed under its stanza, never shortened — an ERL
+  visibly missing its room is a problem an operator fixes, where a
+  silently truncated one is a phone in the wrong place that looks
+  correct. The three provider push reconcilers stay their own issues,
+  as #972 itself specifies, because each needs its API shape checked
+  against current vendor documentation rather than recalled.
+  **Also fixed on the way: two successive circular imports, the second
+  subtler than the first.** `canonicalize_mac` lived in
+  `app/api/v1/dhcp/_mac.py`; the E911 resolver needs it and the DHCP
+  config bundle imports that resolver, so reaching into `app.api`
+  broke the app at startup. Moving it to
+  `app/services/dhcp/normalize.py` replaced that with a cycle that
+  only appeared when something imported the e911 package FIRST,
+  because importing any `app.services.dhcp` submodule executes a
+  package `__init__` that imports `config_bundle`. It now lives in
+  `app/core/mac.py`, whose package `__init__` is empty, so a pure
+  string function cannot participate in a cycle at all.
+  154 backend tests. The resolver's were written before any API existed
   and both mutations were run against the shipped code to prove they
   bite — removing the staleness gate fails 4, reverting the precedence
   fails the pin test. **Deferred to their own changes:** HELD / PIDF-LO

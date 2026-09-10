@@ -43,16 +43,17 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
 from sqlalchemy import Select, and_, case, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB, CurrentUser
-from app.api.v1.dhcp._mac import canonicalize_mac
 from app.api.v1.ownership._audit import write_audit
+from app.core.mac import canonicalize_mac
 from app.core.permissions import require_resource_permission
+from app.core.responses import CsvResponse, IosConfigResponse
 from app.models.e911 import (
     CIVIC_COLUMNS,
     DISPATCHABLE_DETAIL_COLUMNS,
@@ -62,6 +63,8 @@ from app.models.e911 import (
     EmergencyResponseLocation,
     ERLBinding,
 )
+from app.models.network import NetworkInterface
+from app.services.e911.exports import render_csv, render_ios_snippets
 from app.services.e911.resolver import Resolution, resolve_location
 from app.services.search.ranking import escape_like
 
@@ -989,4 +992,128 @@ async def get_location(
             )
             for e in resolution.evidence
         ],
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Exports (#972 Phase 3)
+# ══════════════════════════════════════════════════════════════════════
+
+
+async def _export_rows(
+    db: AsyncSession, *, site_id: uuid.UUID | None
+) -> list[tuple[EmergencyResponseLocation, list[ERLBinding]]]:
+    """Every ERL with its bindings, in two queries rather than one per row."""
+    stmt = select(EmergencyResponseLocation).order_by(EmergencyResponseLocation.name)
+    if site_id is not None:
+        stmt = stmt.where(EmergencyResponseLocation.site_id == site_id)
+    erls = list((await db.execute(stmt)).scalars().all())
+    if not erls:
+        return []
+    bindings = list(
+        (await db.execute(select(ERLBinding).where(ERLBinding.erl_id.in_([e.id for e in erls]))))
+        .scalars()
+        .all()
+    )
+    by_erl: dict[uuid.UUID, list[ERLBinding]] = {}
+    for b in bindings:
+        by_erl.setdefault(b.erl_id, []).append(b)
+    return [(e, by_erl.get(e.id, [])) for e in erls]
+
+
+@router.get("/export.csv", response_class=CsvResponse)
+async def export_csv(
+    db: DB,
+    user: CurrentUser,
+    site_id: uuid.UUID | None = Query(default=None),
+) -> Response:
+    """Every ERL and its bindings as CSV.
+
+    For bulk review, for the spreadsheet an auditor asked for, and as the
+    thing a shop already running Cisco Emergency Responder maps into CER's
+    own ERL bulk load — CER's columns differ between versions, so the
+    operator does the mapping rather than us guessing it.
+
+    Values that look like spreadsheet formulas are quoted, because a building
+    named ``=cmd|' /C calc'!A0`` executes when the file is opened.
+    """
+    rows = await _export_rows(db, site_id=site_id)
+    stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+    write_audit(
+        db,
+        user=user,
+        action="export",
+        resource_type=AUDIT_RESOURCE,
+        resource_id="export.csv",
+        resource_display=f"{len(rows)} ERL(s)",
+    )
+    await db.commit()
+    return Response(
+        content=render_csv(rows),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="e911-erls-{stamp}.csv"'},
+    )
+
+
+@router.get("/export/ios-lldp-med.txt", response_class=IosConfigResponse)
+async def export_ios_snippets(
+    db: DB,
+    user: CurrentUser,
+    site_id: uuid.UUID | None = Query(default=None),
+) -> Response:
+    """LLDP-MED ``location civic-location`` stanzas, as text to review.
+
+    LLDP-MED is the one delivery mechanism that needs no HELD, no DHCP option
+    and no phone-side configuration — the switch announces the location to the
+    handset per port.
+
+    **SpatiumDDI configures no switches.** This is generated text the operator
+    reads and applies; the snippet says so in its own header. Per-interface
+    lines are emitted for ERLs reached by a ``switch_port`` binding, because
+    that is the only rule that names a port.
+    """
+    rows = await _export_rows(db, site_id=site_id)
+
+    # interface_id → "Gi3/0/12", for the per-interface stanzas. One query.
+    port_names: dict[str, list[str]] = {}
+    port_bound = [
+        (erl, b)
+        for erl, bindings in rows
+        for b in bindings
+        if b.rule_kind == "switch_port" and b.network_interface_id
+    ]
+    if port_bound:
+        names: dict[uuid.UUID, str] = {
+            iface_id: iface_name
+            for iface_id, iface_name in (
+                await db.execute(
+                    select(NetworkInterface.id, NetworkInterface.name).where(
+                        NetworkInterface.id.in_([b.network_interface_id for _e, b in port_bound])
+                    )
+                )
+            ).all()
+        }
+        for erl, b in port_bound:
+            # `network_interface_id` is non-None by construction — port_bound
+            # filters on it — but mypy cannot see that through the
+            # comprehension, and an assert here would be a runtime cost on a
+            # path that is already proven.
+            ifname = names.get(b.network_interface_id) if b.network_interface_id else None
+            if ifname:
+                port_names.setdefault(str(erl.id), []).append(str(ifname))
+
+    stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+    write_audit(
+        db,
+        user=user,
+        action="export",
+        resource_type=AUDIT_RESOURCE,
+        resource_id="export/ios-lldp-med.txt",
+        resource_display=f"{len(rows)} ERL(s)",
+    )
+    await db.commit()
+    return Response(
+        content=render_ios_snippets(rows, interface_names=port_names),
+        media_type="text/plain",
+        headers={"Content-Disposition": (f'attachment; filename="e911-ios-lldp-med-{stamp}.txt"')},
     )

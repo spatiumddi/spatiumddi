@@ -3,6 +3,8 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
   BadgeCheck,
+  Download,
+  FileCode,
   MapPin,
   Pencil,
   Plus,
@@ -254,6 +256,18 @@ function LocationsTab({ canQuery }: { canQuery: boolean }) {
         </select>
         <HeaderButton onClick={() => void query.refetch()}>
           <RefreshCw className="h-4 w-4" /> Refresh
+        </HeaderButton>
+        <HeaderButton
+          onClick={() => void e911Api.download("csv")}
+          title="Every ERL and its bindings — for review, for an auditor, or to map into Cisco Emergency Responder's own bulk load"
+        >
+          <Download className="h-4 w-4" /> CSV
+        </HeaderButton>
+        <HeaderButton
+          onClick={() => void e911Api.download("ios")}
+          title="LLDP-MED location stanzas for you to review and apply yourself — SpatiumDDI configures no switches"
+        >
+          <FileCode className="h-4 w-4" /> IOS snippets
         </HeaderButton>
         {canWrite && (
           <HeaderButton

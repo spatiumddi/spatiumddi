@@ -44,6 +44,13 @@ from sqlalchemy import cast, func, select
 from sqlalchemy.dialects.postgresql import INET
 from sqlalchemy.ext.asyncio import AsyncSession
 
+# Imported rather than re-implemented: this would otherwise be the sixth MAC
+# cleaner in the tree, and #878 is the standing lesson about two copies of one
+# rule drifting apart. It lives in the service layer precisely because this
+# module is imported by the DHCP config bundle, and ``app.core`` has an empty
+# package ``__init__`` — which is what keeps it out of a cycle. See
+# ``app/core/mac.py`` for the two earlier homes that were both wrong.
+from app.core.mac import canonicalize_mac
 from app.models.dhcp import DHCPLease
 from app.models.e911 import (
     ERL_RULE_PRECEDENCE,
@@ -57,13 +64,6 @@ from app.models.network import (
     NetworkInterface,
     NetworkNeighbour,
 )
-
-# Imported rather than re-implemented: this would otherwise be the sixth MAC
-# cleaner in the tree, and #878 is the standing lesson about two copies of one
-# rule drifting apart. It lives in the service layer precisely because this
-# module is imported by the DHCP config bundle — reaching into ``app.api`` for
-# it made a circular import.
-from app.services.dhcp.normalize import canonicalize_mac
 
 #: One missed poll is tolerated; two is not.
 FRESHNESS_POLL_MULTIPLIER = 2
