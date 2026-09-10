@@ -2,6 +2,7 @@ import re
 import time
 
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
+from starlette.concurrency import run_in_threadpool
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
@@ -140,6 +141,18 @@ class PrometheusMiddleware(BaseHTTPMiddleware):
 
 
 async def metrics_endpoint(request: Request) -> Response:
-    """Prometheus scrape endpoint at /metrics."""
-    data = generate_latest()
+    """Prometheus scrape endpoint at /metrics.
+
+    #1051 — rendered in a worker thread, not on the event loop.
+    ``generate_latest`` is pure Python and walks every series in the
+    registry. The appliance scrapes this endpoint from its own console every
+    ~13 s (``spatium-console``); with the label leak above, each scrape came
+    to hold the single uvicorn event loop for 3-8 s — measured live on
+    2026-09-10, 81-83 % of the loop's samples inside this handler while
+    ``/health/live`` sat unanswered past the kubelet's 5 s budget. Off the
+    loop the render still costs the same CPU, but the loop keeps serving the
+    probes and the requests between GIL slices instead of going dark for the
+    duration.
+    """
+    data = await run_in_threadpool(generate_latest)
     return Response(content=data, media_type=CONTENT_TYPE_LATEST)
