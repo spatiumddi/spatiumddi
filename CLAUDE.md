@@ -1202,14 +1202,14 @@ suggestion, free-space treemap.
   has to present exactly once without writing it anywhere it protects.
 
 - 🟡 [**E911 dispatchable location — SpatiumDDI as a Location Information Server**](https://github.com/spatiumddi/spatiumddi/issues/972)
-  — **Phase 1a (LIS core) shipped.** Given a phone's IP, MAC or LLDP
+  — **Phases 1a–3 shipped.** Given a phone's IP, MAC or LLDP
   chassis+port, answer "which room is this device in, right now?" as a
   dispatchable location. Every input was already in the database, collected for
   IPAM, and nothing joined them: `dhcp_lease` / `ip_mac_history` for IP↔MAC,
   `network_fdb_entry` for MAC↔port, `network_neighbour` for the phone's own LLDP
   claim, `subnet.site_id` for the building, `subnet.subnet_role='voice'` for
   which networks are phones. Behind the default-on `network.e911` module; 3
-  tables (migration `c1f4a90e7d63`), 11 REST routes, 3 conformity policies, 3
+  tables (migration `c1f4a90e7d63`), 15 REST routes, 3 conformity policies, 3
   MCP tools.
   **RAY BAUM'S Act §506 puts the dispatchable-location duty on the ENTERPRISE**,
   not the carrier — so this is a location *source*: no call routing, no ALI
@@ -1254,15 +1254,73 @@ suggestion, free-space treemap.
   stale FDB rows, because an unpolled switch eventually has none and a
   stale-row check would PASS on the worst case). No `propose_*` MCP tools, per
   non-negotiable #13: a wrong binding misroutes an ambulance.
-  **Still open:** HELD / PIDF-LO (RFC 5985 + 6155 — the protocol CUCM, Cisco MPP
-  phones, Webex, RedSky, Intrado and Bandwidth already speak, and what makes this
-  work with zero phone-side change); the provider validation *call* (a new
-  outbound connection, so it needs a `docs/PRIVACY.md` row under non-negotiable
-  #17); DHCP options 99/123; device self-query; bulk CSV import; the CER-format
-  and IOS-snippet exports and provider push reconcilers; and wireless, which is a
-  data gap not a design one — the UniFi and Meraki mirrors carry no client→AP
-  association, so the `wireless_ap` rule has nothing to match and its precedence
-  slot is reserved for when they do. See
+  **Phases 2–3 added the protocol and the provisioning surfaces.** HELD
+  (RFC 5985) is mounted at the application root rather than under `/api/v1`,
+  because a HELD client is configured with a whole URL and the protocol names the
+  path, and it returns PIDF-LO (RFC 4119 + 5139 civic, RFC 5491 geodetic) — which
+  is what makes the feature work with **zero phone-side change**, since CUCM,
+  Cisco MPP firmware, Webex, RedSky, Intrado and Bandwidth all already speak it.
+  `PIDF_ELEMENT_ORDER` is the RFC 5139 *schema sequence*, deliberately not column
+  order, and the Geopriv `method` token distinguishes `Wiremap` (a cable was
+  traced) from `Manual`. PIDF-LO has nowhere to say "this answer is a fallback",
+  so the confidence and the matched rule ride on `X-SpatiumDDI-*` response headers
+  instead of being silently dropped.
+  **The parser is lxml with `resolve_entities=False`, which is a measured
+  correction rather than a preference:** a 4-level internal-entity bomb expands to
+  50,000 characters under `xml.etree.ElementTree` (CodeQL `py/xml-bomb` caught the
+  first cut, whose docstring asserted the opposite). The document is size-capped, a
+  DOCTYPE is refused outright, identities are matched by **local name**, and an
+  identity that cannot be resolved is *reported* rather than ignored.
+  **Device self-query (RFC 5985 §6) is opt-in and off by default**
+  (`E911_SELF_QUERY_ENABLED`): it answers by source address with no credential, so
+  it is rate-limited by the one throttle in the tree that fails **CLOSED** — an
+  open unauthenticated location oracle is a worse failure than refusing a lookup.
+  **DHCP options 99 (RFC 4776) and 123 (RFC 6225)**, IPv4-gated, module-gated and
+  batched per bundle. Kea **refuses to override a standard option definition**,
+  measured against a live `kea-dhcp4 -t`: 99 must be emitted under Kea's own
+  `geoconf-civic` name with no definition of ours, while 123 has none and needs
+  one. Getting that backwards does not degrade location, it stops DHCP for every
+  client on the server. The encode order puts street, then the dispatchable
+  detail, then free text, so an option overflowing 255 bytes drops the free text
+  and keeps the room.
+  **Both exports refuse rather than mangle.** The civic CSV quotes formula leaders
+  (`=` `+` `-` `@`) so a spreadsheet cannot execute a room name, and the IOS
+  LLDP-MED snippet **omits** any value it cannot express safely and lists it under
+  its stanza instead of truncating — a room silently shortened to `312` is a phone
+  in the wrong place that looks correct. Snippets are generated for review;
+  writing switch configuration is permanently out of scope.
+  **Still open: the provider validation *call* and the push reconcilers**, now one
+  issue per vendor —
+  [#1048](https://github.com/spatiumddi/spatiumddi/issues/1048) RedSky Horizon,
+  [#1049](https://github.com/spatiumddi/spatiumddi/issues/1049) Bandwidth 911
+  Access, [#1050](https://github.com/spatiumddi/spatiumddi/issues/1050) Intrado
+  ERS. Each is a new **outbound connection** needing a `docs/PRIVACY.md` row under
+  non-negotiable #17, and each needs its API shape checked against current vendor
+  documentation rather than recalled. **Checked 2026-09-10: none of the three is
+  obtainable without a commercial relationship.** RedSky's Provisioning API
+  Programmer's Guide is behind their support portal (403); Intrado provisions over
+  customer-only SOAP methods its own service guide calls a proprietary API; and
+  Bandwidth's public DLR guide — the one readable contract of the three — carries
+  **no floor and no room field at all**, only `AddressLine2`. So the single mapping
+  that matters, how `FLR` / `ROOM` / `UNIT` collapse into one free-text line, is
+  precisely what must be confirmed rather than guessed: a wrong composition still
+  pushes a correct street address and still returns success, losing only the
+  dispatchable part, which is the whole of §506. Do not implement these from
+  recalled field names.
+  Also open: **bulk CSV import** of ERLs and bindings (the export exists, the
+  reverse does not — the next piece of work here); **`locationURI`** in a HELD
+  response, which means minting a dereferenceable unauthenticated URL that hands
+  a person's location to whoever holds it, so a request demanding it
+  `exact="true"` gets `cannotProvideLiType` rather than a silent substitution;
+  **DHCPv6 options 36 / 63**; **Kari's Law on-site notification**, cheap now the
+  resolver exists and the thing front-desk staff actually want; **historical
+  lookup** for the PSAP callback case, pairing with time-travel
+  ([#56](https://github.com/spatiumddi/spatiumddi/issues/56)); and **wireless**,
+  which is a data gap not a design one — the UniFi and Meraki mirrors carry no
+  client→AP association, so the `wireless_ap` rule has nothing to match and its
+  precedence slot is reserved for when they do. There is deliberately **no
+  CER-format export**: CER's columns differ between versions, so the civic CSV is
+  what you map into its ERL bulk load rather than a format we claim to track. See
   [`docs/features/E911.md`](docs/features/E911.md).
 
 #### UX polish
