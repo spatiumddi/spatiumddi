@@ -21,6 +21,7 @@ import uuid
 from xml.etree import ElementTree as ET
 
 import pytest
+from lxml import etree
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.e911 import EmergencyResponseLocation, ERLBinding
@@ -246,16 +247,60 @@ def test_a_doctype_is_refused() -> None:
     assert e.value.code == ERROR_XML_ERROR
 
 
-def test_an_entity_expansion_bomb_does_not_expand() -> None:
-    """The billion-laughs shape. It is refused at the DOCTYPE gate, and
-    would be refused by the parser after it — two independent reasons."""
-    bomb = (
-        b'<!DOCTYPE b [<!ENTITY a "aaaaaaaaaa">'
-        b'<!ENTITY b "&a;&a;&a;&a;&a;&a;&a;&a;&a;&a;">]>'
-        b"<locationRequest>&b;</locationRequest>"
+def _bomb(levels: int = 4, width: int = 10) -> bytes:
+    """A billion-laughs payload, built rather than pasted so the growth
+    factor is visible: ``width ** levels`` copies of a 50-byte string."""
+    decls = [b'<!ENTITY e0 "' + b"a" * 50 + b'">']
+    for i in range(1, levels):
+        decls.append(f'<!ENTITY e{i} "'.encode() + (f"&e{i - 1};".encode() * width) + b'">')
+    return (
+        b'<?xml version="1.0"?><!DOCTYPE lolz [' + b"".join(decls) + b"]>"
+        b"<locationRequest>&e" + str(levels - 1).encode() + b";</locationRequest>"
     )
-    with pytest.raises(HeldError):
-        parse_location_request(bomb)
+
+
+def test_an_entity_expansion_bomb_is_refused() -> None:
+    """The billion-laughs shape, refused at the DOCTYPE gate."""
+    with pytest.raises(HeldError) as e:
+        parse_location_request(_bomb())
+    assert e.value.code == ERROR_XML_ERROR
+
+
+def test_the_parser_itself_does_not_expand_entities() -> None:
+    """The finding that mattered, and the reason this test exists.
+
+    The first version of this module parsed with stdlib ElementTree and its
+    docstring claimed that supports "no DTD and no external entities at all —
+    so XXE and entity-expansion are not mitigated here, they are unavailable".
+    Measured, half of that was false: ET refuses an EXTERNAL entity but
+    expands INTERNAL ones, and a four-level bomb expanded to 50,000
+    characters. CodeQL's ``py/xml-bomb`` was right; the docstring was wrong.
+
+    So this bypasses the DOCTYPE guard entirely and goes at the parser
+    directly. A guard that is the sole defence is one regex away from being
+    none, and the whole point of moving to lxml with
+    ``resolve_entities=False`` was to stop relying on it.
+    """
+    from app.services.e911.held import _parser
+
+    root = etree.fromstring(_bomb(), parser=_parser())
+    # The entity reference is LEFT UNEXPANDED rather than grown.
+    assert len(root.text or "") < 100, "the parser expanded an entity bomb"
+
+
+def test_the_parser_itself_refuses_an_external_entity() -> None:
+    """XXE, also at the parser rather than through the guard. ``no_network``
+    and ``resolve_entities=False`` both bear on this."""
+    from app.services.e911.held import _parser
+
+    xxe = (
+        b'<?xml version="1.0"?>'
+        b'<!DOCTYPE r [<!ENTITY x SYSTEM "file:///etc/passwd">]>'
+        b"<locationRequest>&x;</locationRequest>"
+    )
+    root = etree.fromstring(xxe, parser=_parser())
+    assert "root:" not in (root.text or ""), "the parser read a local file"
+    assert len(root.text or "") < 100
 
 
 def test_an_oversized_body_is_refused_before_parsing() -> None:

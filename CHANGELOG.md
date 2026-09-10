@@ -347,7 +347,27 @@ the formatter handles the rest.
   making the accurate 400 unreachable; and `auth_throttle`'s module
   docstring still said "Both fail open" after a third, deliberately
   fail-closed throttle joined it.
-  205 backend tests. The resolver's were written before any API existed
+  **And CodeQL found a real one that three review rounds missed, in a
+  docstring I had written confidently.** The HELD parser used stdlib
+  `xml.etree.ElementTree` and claimed that supports "no DTD and no
+  external entities at all — so XXE and entity-expansion are not
+  mitigated here, they are unavailable". Measured: half of that is
+  false. ET does refuse an EXTERNAL entity, so XXE really is
+  unavailable — but it expands INTERNAL ones happily, and a four-level
+  billion-laughs payload expanded to 50,000 characters. The only thing
+  standing between an unauthenticated XML endpoint and an expansion
+  bomb was a single `DOCTYPE` regex. `py/xml-bomb` was right and the
+  prose was wrong.
+  Parsing now goes through `lxml` with `resolve_entities=False`, which
+  leaves an entity reference unexpanded rather than growing it — lxml
+  is already in the image (python3-saml pulls it), so this adds no
+  dependency where `defusedxml` would have needed a NOTICE entry and a
+  `versions.json` pin. The `DOCTYPE` refusal is KEPT precisely because
+  it is no longer load-bearing: a guard that is the sole defence is
+  one regex away from being none. Two new tests go at the parser
+  directly, bypassing the guard, because the lesson is that reasoning
+  about a parser's behaviour is not the same as measuring it.
+  209 backend tests. The resolver's were written before any API existed
   and both mutations were run against the shipped code to prove they
   bite — removing the staleness gate fails 4, reverting the precedence
   fails the pin test. **Deferred to their own changes:** HELD / PIDF-LO

@@ -15,17 +15,35 @@ Two request shapes:
   identity at all; the LIS answers from the TCP source address. That is
   Phase 2 and is off by default, because it is an unauthenticated surface.
 
-**XML from the network is untrusted input**, so three things are
-deliberate. The body is size-capped before it is parsed. A ``DOCTYPE`` is
-refused outright rather than relied on to be harmless. And parsing goes
-through ``xml.etree.ElementTree``, which supports no DTD and no external
+**XML from the network is untrusted input**, and the first version of this
+module got the reasoning wrong in a way worth recording. It parsed with
+``xml.etree.ElementTree`` and claimed that supports "no DTD and no external
 entities at all — so XXE and entity-expansion are not mitigated here, they
-are unavailable. ``lxml`` is present in the image (python3-saml pulls it)
-and would need ``resolve_entities=False``, ``no_network=True`` and
-``load_dtd=False`` set correctly on every parser instance to reach the same
-place; ``defusedxml`` would be a new dependency needing a NOTICE entry and
-a ``versions.json`` pin. The stdlib parser is the one that is safe by
-construction.
+are unavailable". Measured: **half of that is false.** Stdlib ET refuses an
+external entity (``undefined entity &x;``), so XXE really is unavailable —
+but it expands INTERNAL entities happily, and a four-level billion-laughs
+payload expanded to 50,000 characters. CodeQL's ``py/xml-bomb`` was right
+and the docstring was wrong.
+
+So parsing now goes through ``lxml`` with ``resolve_entities=False``, which
+leaves an entity reference unexpanded instead of growing it. lxml is already
+in the image (python3-saml pulls it), so this adds no dependency —
+``defusedxml`` would have needed a NOTICE entry and a ``versions.json`` pin
+for the same outcome.
+
+Three layers, and the ordering is deliberate:
+
+1. The body is **size-capped** before anything parses it.
+2. A ``DOCTYPE`` declaration is **refused outright**. This was the only
+   thing standing between the old parser and an expansion bomb, which is
+   precisely why it is kept now that it is no longer load-bearing: a guard
+   that is the sole defence is one regex away from being none.
+3. The parser itself **does not resolve entities**, and has ``no_network``,
+   ``load_dtd`` and ``huge_tree`` off.
+
+Each of the three is tested against a real bomb and a real XXE payload,
+because the lesson here is that reasoning about a parser's behaviour is not
+the same as measuring it.
 
 **Identity elements are matched by LOCAL NAME, not by namespace.**
 Deliberate, and the reason is honesty about what has been verified: the
@@ -43,7 +61,8 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from xml.etree import ElementTree as ET
+
+from lxml import etree
 
 NS_HELD = "urn:ietf:params:xml:ns:geopriv:held"
 
@@ -99,8 +118,27 @@ class HeldRequest:
         return not self.location_types or bool(self.location_types & {"civic", "any"})
 
 
-def _local(tag: str) -> str:
-    """The local name of a possibly-namespaced ElementTree tag."""
+#: Hardened parser settings. ``resolve_entities=False`` is the one that
+#: stops an expansion bomb; the rest close the neighbouring doors.
+def _parser() -> etree.XMLParser:
+    return etree.XMLParser(
+        resolve_entities=False,
+        no_network=True,
+        load_dtd=False,
+        dtd_validation=False,
+        huge_tree=False,
+    )
+
+
+def _local(tag: object) -> str:
+    """The local name of a possibly-namespaced tag.
+
+    Tolerates a non-string tag: lxml's ``iter()`` yields comments and
+    processing instructions whose ``tag`` is a callable, and calling
+    ``rsplit`` on one raises.
+    """
+    if not isinstance(tag, str):
+        return ""
     return tag.rsplit("}", 1)[-1] if "}" in tag else tag
 
 
@@ -123,9 +161,11 @@ def parse_location_request(body: bytes) -> HeldRequest:
         raise HeldError(ERROR_XML_ERROR, "a DOCTYPE declaration is not accepted")
 
     try:
-        root = ET.fromstring(body)
-    except ET.ParseError as exc:
+        root = etree.fromstring(body, parser=_parser())
+    except etree.XMLSyntaxError as exc:
         raise HeldError(ERROR_XML_ERROR, f"malformed XML: {exc}") from exc
+    if root is None:
+        raise HeldError(ERROR_XML_ERROR, "no document element")
 
     if _local(root.tag) != "locationRequest":
         raise HeldError(
@@ -215,9 +255,8 @@ def render_error(code: str, message: str) -> bytes:
     ``message`` is attribute text, so ElementTree's escaping does the work
     — a parser error string can contain anything.
     """
-    root = ET.Element(f"{{{NS_HELD}}}error", {"code": code})
-    ET.SubElement(root, f"{{{NS_HELD}}}message").text = message
-    ET.register_namespace("", NS_HELD)
-    return b'<?xml version="1.0" encoding="UTF-8"?>\n' + ET.tostring(
+    root = etree.Element(f"{{{NS_HELD}}}error", {"code": code}, nsmap={None: NS_HELD})
+    etree.SubElement(root, f"{{{NS_HELD}}}message").text = message
+    return b'<?xml version="1.0" encoding="UTF-8"?>\n' + etree.tostring(
         root, encoding="utf-8", xml_declaration=False
     )
