@@ -75,6 +75,14 @@ EXEMPT_PREFIXES: Final[tuple[str, ...]] = (
     # gated; if a maintenance window 503'd it the appliance's own supervisor
     # could never register against its control plane (non-negotiable #5).
     "/api/v1/appliance/self-register-bootstrap",
+    # HELD (#972). A change window must not stop answering "which room is
+    # this phone in" — a PBX asking on behalf of a 911 call is the one
+    # caller that cannot wait for the window to close, and the equivalent
+    # GET /api/v1/e911/location kept working throughout, so 503ing only the
+    # standards-track path was incoherent as well as dangerous. Read-only
+    # either way: neither HELD route mutates anything a maintenance window
+    # is protecting.
+    "/held",
 )
 
 _API_TOKEN_PREFIX: Final[str] = "sddi_"

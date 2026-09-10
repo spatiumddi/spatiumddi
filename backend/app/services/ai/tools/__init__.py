@@ -32,6 +32,7 @@ from app.services.ai.tools import (  # noqa: F401, E402
     dns,
     dns_threat,
     dnsbl,
+    e911,
     firewall,
     imports,
     integrations,

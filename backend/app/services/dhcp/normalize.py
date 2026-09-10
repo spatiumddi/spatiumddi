@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import ipaddress
 
-__all__ = ["norm_ip", "norm_mac"]
+from app.core.mac import canonicalize_mac
+
+__all__ = ["canonicalize_mac", "norm_ip", "norm_mac"]
 
 
 def norm_mac(mac: str) -> str:

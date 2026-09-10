@@ -144,6 +144,21 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         description="Building-automation device registry — internetwork-unique device instance numbers, BACnet network numbers, and per-subnet BBMD designation, each attached to an existing IPAM address. Documents the BACnet topology (including the exactly-one-BBMD-per-subnet rule); never reads or writes device objects.",
     ),
     ModuleSpec(
+        id="network.e911",
+        label="E911 dispatchable location",
+        group="Network",
+        description=(
+            "Location Information Server for E911 — Emergency Response Locations as "
+            "RFC 5139 civic addresses, bindings from switch port / subnet / VLAN / "
+            "device to an ERL, and a resolver that answers 'which room is this device "
+            "in, right now?' from DHCP, FDB and LLDP data already collected for IPAM. "
+            "RAY BAUM'S Act §506 puts the dispatchable-location duty on the enterprise. "
+            "SpatiumDDI is a location SOURCE only: it does no call routing, no ALI "
+            "upload and no PSAP interaction, and it never asserts an address is valid "
+            "on its own say-so."
+        ),
+    ),
+    ModuleSpec(
         id="network.dicom",
         label="DICOM AE registry",
         group="Network",

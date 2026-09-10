@@ -317,6 +317,9 @@ backend/alembic/versions/c1f4a8b27d09_soft_delete.py:drop_column:93
 backend/alembic/versions/c1f4a8b27d09_soft_delete.py:drop_column:98
 backend/alembic/versions/c1f4a8b27d09_soft_delete.py:drop_column:99
 backend/alembic/versions/c1f4a8e3b29d_appliance_lldp_neighbour.py:drop_table:66
+backend/alembic/versions/c1f4a90e7d63_e911_dispatchable_location.py:drop_table:159
+backend/alembic/versions/c1f4a90e7d63_e911_dispatchable_location.py:drop_table:163
+backend/alembic/versions/c1f4a90e7d63_e911_dispatchable_location.py:drop_table:165
 backend/alembic/versions/c263ae1d381a_appliance_cluster_columns.py:drop_column:54
 backend/alembic/versions/c263ae1d381a_appliance_cluster_columns.py:drop_column:55
 backend/alembic/versions/c263ae1d381a_appliance_cluster_columns.py:drop_column:56
