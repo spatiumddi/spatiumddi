@@ -24,6 +24,104 @@ the formatter handles the rest.
 
 ### Added
 
+
+- **E911 dispatchable location — SpatiumDDI answers "which room is
+  this phone in, right now?" (#972, Phase 1a).** Behind the default-on
+  `network.e911` module: Emergency Response Locations, bindings from a
+  network identity to an ERL, and a resolver over data already
+  collected for IPAM. `dhcp_lease` / `ip_mac_history` give IP↔MAC,
+  `network_fdb_entry` gives MAC↔switch-port, `network_neighbour` gives
+  the phone's own LLDP claim, `subnet.site_id` gives the building and
+  `subnet.subnet_role='voice'` says which networks are phones. Every
+  input existed; nothing joined them. 3 tables (migration
+  `c1f4a90e7d63`), 11 REST routes, 3 conformity policies, 3 MCP tools.
+  **RAY BAUM'S Act §506 puts the dispatchable-location duty on the
+  ENTERPRISE, not the carrier**, so this is a location *source* and the
+  docs say plainly that installing it makes nobody compliant: no call
+  routing, no ALI upload, no ELIN provisioning, no PSAP. It also never
+  asserts an address is valid on its own say-so — validation is the
+  provider's verdict against the MSAG / NG911 LVF, recorded here, and
+  `unvalidated` means "nobody has confirmed this", not "this is wrong".
+  Editing any civic element **resets** the verdict, because a provider
+  validated the OLD address and keeping `validated` would leave an
+  estate reporting an address nobody ever checked.
+  **The load-bearing property: a stale precise answer is worse than a
+  fresh coarse one.** A phone re-patched onto another floor stays in the
+  switch's FDB on the old port until it ages out, and in *our* copy
+  until the next poll — so a port-level answer older than the freshness
+  window is REFUSED, the resolver falls back to a coarser rule, and the
+  response carries `confidence="degraded"` with the reason. There is no
+  code path that returns an address with no provenance. The window is
+  the polling device's own `poll_interval_seconds` × 2, so one missed
+  poll is tolerated and two are not; a fixed global number would be too
+  tight for a 15-minute poller and uselessly loose for a 60-second one.
+  **Two independent staleness signals, and the second is the one that
+  matters:** age, and an LLDP neighbour on the same port announcing a
+  different chassis-id than the FDB puts there. LLDP is the device's own
+  announcement, so on disagreement the FDB row is the one to distrust —
+  and this fires immediately where age must wait out the whole window,
+  which is the only way a phone swapped for a different phone on the
+  same port is caught quickly.
+  **The civic address is 31 separate RFC 5139 columns**, not one string
+  and not JSONB. PIDF-LO and every provider API want the elements apart,
+  a string cannot be decomposed later, and #917 established that an
+  unconstrained object publishes as `{"type": "object"}` with no
+  properties — unusable to a code generator, on the one field every
+  external consumer of this feature reads. `CIVIC_ELEMENTS` carries the
+  columns *with* their RFC 4776 CAtype numbers and PIDF-LO tag names, so
+  the deferred option-99 encoder and PIDF-LO renderer cannot drift from
+  the schema the way #878's two renderers did; a test pins the API
+  schema's field set to the column set.
+  **Binding precedence is a constant, not a column**, and one ERL per
+  target per kind is a UNIQUE constraint. An operator able to reorder
+  the rules could put `site_default` above `switch_port` and send every
+  ambulance to the front door while the UI still showed a rule for the
+  room, and a tie would otherwise be broken by whichever row the planner
+  returned. **The shipped order deviates from the issue's**, which
+  numbered the manual pin below `subnet` and `vlan`: that makes the pin
+  dead code, since every pinned device is also on some subnet, while the
+  pin exists precisely for the phone on a port nothing polls. Reverting
+  the constant to the issue's ordering makes
+  `test_a_manual_pin_beats_the_subnet` fail, which is the proof rather
+  than the argument.
+  Three conformity policies, the **first in the tree carrying a real
+  regulatory citation** (`47 CFR 9.16(b)`) rather than
+  `framework: custom`. `e911_voice_subnet_unbound` counts the site
+  default as a pass — the front door is a poor answer and still a
+  dispatchable location, where a check demanding room-level bindings
+  everywhere would fail every site on day one and be switched off.
+  `e911_erl_validated` fails harder on a REJECTED verdict than a missing
+  one, because somebody checked and the answer was no, and warns rather
+  than fails on an old one. `e911_port_binding_evidence_fresh` is keyed
+  on the switch's own poll state and not on stale FDB rows, because an
+  unpolled switch eventually has none and a stale-row check would PASS
+  on the worst case.
+  A third-party caller — a PBX, Cisco Emergency Responder, RedSky — uses
+  an existing API token scoped to `/api/v1/e911` with one read
+  permission; no new credential mechanism. **Every lookup writes an
+  `e911_resolution_log` row**, found or not, recording which token asked
+  about which identity: it is a query about which desk a named person
+  sits at, and "nobody could tell me where this phone was" is exactly
+  what an after-action review needs to see. To make that honest,
+  `deps.py` now records *which* API token authenticated a request —
+  token auth resolves to the owning User, so a handler otherwise cannot
+  tell a PBX's service token from the same person's browser session.
+  **No `propose_*` MCP tools**, an explicit decision under
+  non-negotiable #13: a wrong ERL binding misroutes an ambulance.
+  43 backend tests. The resolver's were written before any API existed
+  and both mutations were run against the shipped code to prove they
+  bite — removing the staleness gate fails 4, reverting the precedence
+  fails the pin test. **Deferred to their own changes:** HELD / PIDF-LO
+  (RFC 5985 + 6155, the protocol CUCM, Cisco MPP phones, Webex, RedSky,
+  Intrado and Bandwidth already speak, and what makes this work with
+  zero phone-side change); the provider validation *call*, which is a
+  new outbound connection needing a `docs/PRIVACY.md` row under
+  non-negotiable #17; DHCP options 99/123; device self-query; bulk CSV
+  import; the CER-format and IOS-snippet exports; and wireless, a data
+  gap rather than a design one — the UniFi and Meraki mirrors carry no
+  client→AP association, so the `wireless_ap` rule has nothing to match
+  and its precedence slot is reserved for when they do. See
+  `docs/features/E911.md`.
 - **The appliance can install onto a RAID1 mirror, and arrays can be
   managed from the Fleet UI (#999 Parts B + C).** #995 shipped the
   honest refusal — a SAN LUN's paths collapsed and an md member marked

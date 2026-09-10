@@ -49,6 +49,7 @@ Always read the relevant spec doc(s) before writing code for a feature area.
 | `docs/features/MIGRATION.md` | One-shot importers — DNS (BIND9 / Windows DNS / PowerDNS / Technitium) + DHCP (Kea / Windows DHCP / ISC dhcpd.conf) + NetBox → IPAM, into native rows; preview → commit, provenance, IPAM linkage. Also the **Windows → SpatiumDDI cutover** (#756), which is *not* an importer — parity → parallel run → per-item switch + rollback → decommission |
 | `docs/features/LOOKING_GLASS.md` | BGP Looking Glass — receive-only GoBGP collector peering with operator routers; Sessions + Routes grid, IPAM/ASN/VRF linkage at ingest, `bgp_lg_*` alerts, as-path Query tab + collector-vantage tools; distinct from the #527 public-table hijack monitor. The MetalLB BGP-mode VIP advertiser (#566 D1) ships alongside it, opt-in (`bgp.enabled=false`, `frrk8s.enabled=false` by default; enabling pulls in FRRouting / GPL-2.0) |
 | `docs/features/VERTICALS.md` | Vertical network awareness — AV-over-IP (Dante / AES67 / SMPTE 2110) flow descriptors + reserved multicast ranges, BACnet/IP device-instance registry + BBMD conformity, Industrial-OT device inventory + Purdue zoning, DICOM AE Title registry + peer-association map. Four default-on Network feature modules (`network.av` / `network.bacnet` / `network.ot` / `network.dicom`); registry + conformity only, no network probing (and why each discovery phase is deferred). Also the un-gated fragile-device `do_not_probe` flag (#722) that suppresses SpatiumDDI's own active probes |
+| `docs/features/E911.md` | E911 dispatchable location — SpatiumDDI as a Location Information Server. Emergency Response Locations as the 31 separate RFC 5139 civic elements, bindings from switch port / subnet / VLAN / device to an ERL at a **fixed** precedence, and a resolver whose load-bearing rule is that a stale precise answer is worse than a fresh coarse one. RAY BAUM'S Act §506 puts the duty on the enterprise; this is a location *source* only — no call routing, no ALI upload, no PSAP, and it never asserts an address is valid on its own say-so |
 | `docs/PERMISSIONS.md` | RBAC permission grammar (`{action, resource_type, resource_id?}`), builtin roles, wildcards |
 | `docs/features/SYSTEM_ADMIN.md` | System config, health dashboard, notifications, backup/restore, service control |
 | `docs/deployment/APPLIANCE.md` | OS appliance build, base OS selection, licensing |
@@ -1199,6 +1200,70 @@ suggestion, free-space treemap.
 - ⬜ [**Appliance full-disk encryption**](https://github.com/spatiumddi/spatiumddi/issues/881) — LUKS2 at install for
   STATE + `/var`, TPM2 auto-unlock, and a recovery key the installer
   has to present exactly once without writing it anywhere it protects.
+
+- 🟡 [**E911 dispatchable location — SpatiumDDI as a Location Information Server**](https://github.com/spatiumddi/spatiumddi/issues/972)
+  — **Phase 1a (LIS core) shipped.** Given a phone's IP, MAC or LLDP
+  chassis+port, answer "which room is this device in, right now?" as a
+  dispatchable location. Every input was already in the database, collected for
+  IPAM, and nothing joined them: `dhcp_lease` / `ip_mac_history` for IP↔MAC,
+  `network_fdb_entry` for MAC↔port, `network_neighbour` for the phone's own LLDP
+  claim, `subnet.site_id` for the building, `subnet.subnet_role='voice'` for
+  which networks are phones. Behind the default-on `network.e911` module; 3
+  tables (migration `c1f4a90e7d63`), 11 REST routes, 3 conformity policies, 3
+  MCP tools.
+  **RAY BAUM'S Act §506 puts the dispatchable-location duty on the ENTERPRISE**,
+  not the carrier — so this is a location *source*: no call routing, no ALI
+  upload, no ELIN provisioning, no PSAP, and the docs say plainly that installing
+  it does not make anyone compliant. It also never asserts an address is valid on
+  its own say-so; validation is the provider's verdict against the MSAG / NG911
+  LVF and SpatiumDDI records it.
+  **The civic address is 31 separate RFC 5139 columns**, not a string or a JSONB
+  blob: PIDF-LO and every provider API want the elements apart, a string cannot
+  be decomposed later, and #917 established that an unconstrained object
+  publishes as `{"type": "object"}` with no properties — unusable to a generated
+  client, on the one field every external consumer reads. `CIVIC_ELEMENTS` holds
+  the columns *with* their RFC 4776 CAtype numbers and PIDF-LO tags so the
+  deferred option-99 encoder and PIDF-LO renderer cannot drift from the schema
+  (#878's two-renderers lesson), pinned by a test.
+  **The load-bearing property is that a stale precise answer is worse than a
+  fresh coarse one.** A phone re-patched onto another floor stays in the switch's
+  FDB on the old port until it ages out, and in *our* copy until the next poll —
+  so a port-level answer older than the freshness window (the device's own
+  `poll_interval_seconds` × 2, so one missed poll is tolerated and two are not)
+  is REFUSED, the resolver degrades to a coarser rule, and the answer reports
+  `confidence="degraded"` with the reason. There is no code path returning an
+  address with no provenance. Two independent staleness signals: age, and an LLDP
+  neighbour on the same port announcing a different chassis-id than the FDB puts
+  there — which fires immediately where age must wait out the window, and is the
+  only thing that catches a phone swapped for another phone on the same port.
+  **Binding precedence is a constant, not a column.** An operator able to reorder
+  it could put `site_default` above `switch_port` and send every ambulance to the
+  front door while the UI showed a rule for the room; one ERL per target per kind
+  is a UNIQUE constraint for the same reason. **The shipped order deviates from
+  the issue's**, which numbered the manual pin below `subnet` — that makes the pin
+  dead code, since every pinned device is also on some subnet, and reverting the
+  constant to the issue's ordering makes `test_a_manual_pin_beats_the_subnet`
+  fail, which is the proof rather than the argument.
+  Three conformity policies, the first in the tree carrying a real regulatory
+  citation (`47 CFR 9.16(b)`) rather than `framework: custom`:
+  `e911_voice_subnet_unbound` (the §506 gap; counts the site default as a pass,
+  because a check demanding room-level bindings everywhere fails every site on
+  day one and gets switched off), `e911_erl_validated` (a REJECTED verdict fails
+  harder than a missing one — somebody checked and the answer was no), and
+  `e911_port_binding_evidence_fresh` (keyed on the switch's poll state, not on
+  stale FDB rows, because an unpolled switch eventually has none and a
+  stale-row check would PASS on the worst case). No `propose_*` MCP tools, per
+  non-negotiable #13: a wrong binding misroutes an ambulance.
+  **Still open:** HELD / PIDF-LO (RFC 5985 + 6155 — the protocol CUCM, Cisco MPP
+  phones, Webex, RedSky, Intrado and Bandwidth already speak, and what makes this
+  work with zero phone-side change); the provider validation *call* (a new
+  outbound connection, so it needs a `docs/PRIVACY.md` row under non-negotiable
+  #17); DHCP options 99/123; device self-query; bulk CSV import; the CER-format
+  and IOS-snippet exports and provider push reconcilers; and wireless, which is a
+  data gap not a design one — the UniFi and Meraki mirrors carry no client→AP
+  association, so the `wireless_ap` rule has nothing to match and its precedence
+  slot is reserved for when they do. See
+  [`docs/features/E911.md`](docs/features/E911.md).
 
 #### UX polish
 
