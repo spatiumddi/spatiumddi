@@ -1505,6 +1505,64 @@ _md_array_is_ours() {
     esac
 }
 
+# #1045 — resolve a partition of THIS disk by its ext4 filesystem label.
+#
+# Deliberately not `blkid -L`, which searches every disk on the machine: with
+# a second SpatiumDDI disk attached it answers with the OTHER disk's
+# partition, and on the KEEP_VAR path that is a `mkfs` on a /var the operator
+# never chose. Every caller here has already settled which disk it means.
+_labelled_device_on() {
+    local dev="$1" want="$2" part label
+    for part in $(lsblk -nro NAME "$dev" 2>/dev/null | tail -n +2); do
+        label=$(lsblk -nro LABEL "/dev/$part" 2>/dev/null | head -1)
+        [ "$label" = "$want" ] && { printf '/dev/%s' "$part"; return 0; }
+    done
+    return 1
+}
+
+# #1045 — every device on this disk that could be one of the two OS slots,
+# GPT-name matches first.
+#
+# The two slots are identified by their GPT PARTLABEL (`root_A` / `root_B`,
+# written by `sgdisk -c4:` / `-c5:` below), NOT by the ext4 filesystem label
+# the rest of the layout uses. build-slot-image.sh bakes `root_a` into the
+# one image both slots are dd'd from, so an upgraded slot B carries `root_a`
+# too and NO partition on the disk is labelled `root_b` any more. The GPT
+# name survives, because a slot upgrade writes a filesystem, not a table.
+# (spatium-upgrade-slot now relabels the filesystem as well, so a disk
+# upgraded by a current appliance is consistent — this keeps the installer
+# working on every disk written before that.)
+#
+# The filesystem label is still checked as a fallback, for the #999 mirror:
+# the md devices carry the labels and are not partitions, so they have no
+# GPT name to match at all.
+_slot_candidates_on() {
+    local dev="$1" want="$2" part partlabel label
+    for part in $(lsblk -nro NAME "$dev" 2>/dev/null | tail -n +2); do
+        partlabel=$(lsblk -nro PARTLABEL "/dev/$part" 2>/dev/null | head -1 \
+                      | tr '[:upper:]' '[:lower:]')
+        [ "$partlabel" = "$want" ] && printf '/dev/%s\n' "$part"
+    done
+    for part in $(lsblk -nro NAME "$dev" 2>/dev/null | tail -n +2); do
+        partlabel=$(lsblk -nro PARTLABEL "/dev/$part" 2>/dev/null | head -1 \
+                      | tr '[:upper:]' '[:lower:]')
+        # Already printed above; listing it twice would make a caller that
+        # stops at the first hit look like it tried two.
+        [ "$partlabel" = "$want" ] && continue
+        label=$(lsblk -nro LABEL "/dev/$part" 2>/dev/null | head -1)
+        [ "$label" = "$want" ] && printf '/dev/%s\n' "$part"
+    done
+}
+
+# The single best device for one slot, or nothing. `head -1` and not a
+# `return` inside the loop: _slot_candidates_on is a pipeline source.
+_slot_device_on() {
+    local first
+    first=$(_slot_candidates_on "$1" "$2" | head -1)
+    [ -n "$first" ] || return 1
+    printf '%s' "$first"
+}
+
 # Is there already a SpatiumDDI install on this disk? Prints its version
 # when there is (#995 item 25).
 _existing_install_version() {
@@ -1513,47 +1571,81 @@ _existing_install_version() {
     # the command-substitution subshell, so the caller silently got "" and
     # the whole "Keep /var" offer disappeared. A dirty ext4 that will not
     # mount read-only is exactly when someone reinstalls.
-    local dev="$1" part label ver="" mnt
-    for part in $(lsblk -nro NAME "$dev" 2>/dev/null | tail -n +2); do
-        label=$(lsblk -nro LABEL "/dev/$part" 2>/dev/null | head -1)
-        [ "$label" = "root_a" ] || continue
-        mnt=$(mktemp -d) || return 1
-        # noload: a plain `mount -o ro` on ext4 REPLAYS THE JOURNAL, so
-        # merely enumerating disks would write to one the operator has not
-        # chosen. Timeout because an unresponsive LUN or USB stick blocks
-        # in uninterruptible D state for the SCSI timeout with the console
-        # showing nothing.
-        if timeout 10 mount -o ro,noload -t ext4 "/dev/$part" "$mnt" 2>/dev/null; then
-            ver=$(_appliance_version_from "$mnt/etc/spatiumddi/appliance-release")
-            umount "$mnt" 2>/dev/null || true
-        fi
-        rmdir "$mnt" 2>/dev/null || true
-        [ -n "$ver" ] && { printf '%s' "$ver"; return 0; }
-        printf '%s' "unknown version"
-        return 0
+    local dev="$1" slot cand ver="" mnt found=0 tried=""
+    # #1045 — both slots, and by GPT name as well as by filesystem label.
+    # Slot A alone was not enough on two counts: an upgraded disk carries
+    # `root_a` on BOTH slots (so the label says nothing about which is
+    # which), and a slot that mounts but carries no release file used to
+    # short-circuit the whole function to "unknown version" without ever
+    # looking at the other one — which is the state slot B is in on every
+    # freshly installed appliance that has not upgraded yet.
+    #
+    # Slot A is still tried first, so the common answer does not change.
+    # When both slots hold a release this reports A's, which on a node
+    # booted from B is the older, inactive one. Left as it is: determining
+    # the active slot from the ISO means reading grubenv off the ESP, and
+    # this string only decides how a "there is an install here" prompt is
+    # WORDED — the prompt itself is gated on the layout, not the version.
+    for slot in root_a root_b; do
+        for cand in $(_slot_candidates_on "$dev" "$slot"); do
+            # On a disk carrying the #1045 duplicate, slot B answers to BOTH
+            # names — so without this it is mounted twice and the 10 s stall
+            # this loop is bounded by is paid three times per disk, in the
+            # enumeration that runs before the operator has picked anything.
+            case " $tried " in *" $cand "*) continue ;; esac
+            tried="$tried $cand"
+            found=1
+            mnt=$(mktemp -d) || return 1
+            # noload: a plain `mount -o ro` on ext4 REPLAYS THE JOURNAL, so
+            # merely enumerating disks would write to one the operator has not
+            # chosen. Timeout because an unresponsive LUN or USB stick blocks
+            # in uninterruptible D state for the SCSI timeout with the console
+            # showing nothing.
+            if timeout 10 mount -o ro,noload -t ext4 "$cand" "$mnt" 2>/dev/null; then
+                ver=$(_appliance_version_from "$mnt/etc/spatiumddi/appliance-release")
+                umount "$mnt" 2>/dev/null || true
+            fi
+            rmdir "$mnt" 2>/dev/null || true
+            [ -n "$ver" ] && { printf '%s' "$ver"; return 0; }
+        done
     done
+    # A slot is there but nothing in it says what it is — still an install,
+    # and still worth marking the disk.
+    [ "$found" = 1 ] && { printf '%s' "unknown version"; return 0; }
     printf ''
 }
 
 # Does this disk already carry the six-partition layout do_install
 # creates, with a /var big enough to be worth keeping (#995 item 25)?
 #
-# Checked by LABEL rather than by partition number: the labels are what
-# fstab and spatium-upgrade-slot address, and a disk that has the right
-# labels in the right roles is one this installer can reuse whatever
-# numbering it happens to use.
+# Checked by IDENTITY rather than by partition number, so a disk carrying
+# the layout at other indices is still reusable — but the identity is not
+# one thing (#1045). ESP / state / var go by filesystem label, which is
+# what the image-baseline fstab addresses them by. The two OS slots go by
+# GPT name, because a slot upgrade overwrites the filesystem and with it
+# the label: the header this replaced claimed the labels were "what fstab
+# and spatium-upgrade-slot address", and for the slots neither was ever
+# true — fstab has no root entry at all, and spatium-upgrade-slot matches
+# on PARTLABEL. Believing it cost every upgraded appliance the offer
+# below.
 _layout_is_reusable() {
-    local dev="$1" want found part label
+    local dev="$1" want
     # #999 Part C2 — NOT reusable when the labels live on an md array.
     #
     # lsblk walks holders, so on a mirrored install the md devices show
-    # up here carrying the five labels and the layout looks reusable. It
-    # is not, and the failure is not the obvious one: the KEEP_VAR branch
-    # resolves each device by LABEL, so blkid correctly returns
-    # /dev/md/root_a and the mkfs targets the ARRAY rather than a live
-    # member. What breaks is downstream — KEEP_VAR forces MIRROR_MODE
+    # up here carrying the labels and the layout looks reusable. It is
+    # not, and what breaks is downstream: KEEP_VAR forces MIRROR_MODE
     # off, so the reinstalled slot gets an initrd with no md_mod, no
     # raid1 and no mdadm.conf, and the box does not come back.
+    #
+    # The hazard on the way there INVERTED with #1045, which matters to
+    # whoever implements the mirror-preserving reinstall below. This used
+    # to say the KEEP_VAR branch resolved by LABEL and so would mkfs the
+    # ARRAY instead of a member. It no longer resolves by label at all,
+    # and on a mirror only the live raid MEMBERS carry a GPT name — so
+    # without this gate the slots would resolve to the members and the
+    # mkfs would land on a disk the array is still using, destroying the
+    # mirror rather than merely writing to the wrong level of it.
     #
     # Carrying the mirror through a reinstall is a real capability and a
     # bigger change than this: it has to rediscover the second member
@@ -1564,14 +1656,41 @@ _layout_is_reusable() {
         log "Layout on $dev sits on an md array — 'keep /var' is not offered (#999)"
         return 1
     fi
-    for want in ESP state root_a root_b var; do
-        found=0
-        for part in $(lsblk -nro NAME "$dev" 2>/dev/null | tail -n +2); do
-            label=$(lsblk -nro LABEL "/dev/$part" 2>/dev/null | head -1)
-            [ "$label" = "$want" ] && { found=1; break; }
-        done
-        [ "$found" = 1 ] || return 1
+    # ESP / state / var keep the filesystem label as their identity, because
+    # that is what the image-baseline fstab resolves them by. The two OS
+    # slots do NOT (#1045): a slot upgrade rewrites the filesystem and with
+    # it the label, so `root_b` is absent on every disk that has ever
+    # upgraded, and gating on it here silently withdrew the whole "Keep
+    # /var" offer from exactly the long-lived appliances most likely to
+    # want it. The GPT name is the thing a slot upgrade cannot touch.
+    for want in ESP state var; do
+        if ! _labelled_device_on "$dev" "$want" >/dev/null; then
+            # Every return below used to be bare, so a missing label was
+            # indistinguishable from "this disk is not ours" — which is how
+            # #1045 went unnoticed through a release. Name it.
+            log "Layout on $dev is not reusable — no partition labelled '$want'"
+            return 1
+        fi
     done
+    local _a _b
+    for want in root_a root_b; do
+        if ! _slot_device_on "$dev" "$want" >/dev/null; then
+            log "Layout on $dev is not reusable — no OS slot '$want' (no GPT name, no filesystem label)"
+            return 1
+        fi
+    done
+    # Both slots resolved, but to the same device? Only a disk with one GPT
+    # name and the other slot identified by a filesystem label can do that,
+    # and do_install refuses it outright. Refuse HERE too: the alternative
+    # is offering "Keep /var", letting the operator answer hostname, admin
+    # account, network and timezone, and then aborting at the wipe — the
+    # refusal has to be where the offer is made.
+    _a=$(_slot_device_on "$dev" root_a) || return 1
+    _b=$(_slot_device_on "$dev" root_b) || return 1
+    if [ "$_a" = "$_b" ]; then
+        log "Layout on $dev is not reusable — both OS slots resolve to $_a"
+        return 1
+    fi
     return 0
 }
 
@@ -3926,23 +4045,53 @@ do_install() {
     fi
     # #995 item 25 — on the KEEP_VAR path the table is NOT rewritten, so
     # the positional names above are whatever the disk already has.
-    # _layout_is_reusable gates on the five LABELs and its comment even
-    # promises numbering-independence, so a disk carrying them at other
+    # _layout_is_reusable gates on all five being findable and its comment
+    # even promises numbering-independence, so a disk carrying them at other
     # indices would get `mkfs -L root_a` written over the var the operator
-    # asked to keep. Resolve by label, and refuse if any is missing rather
+    # asked to keep. Resolve each one, and refuse if any is missing rather
     # than falling back to a position that could be anything.
     if [ "$KEEP_VAR" = "yes" ]; then
-        local _l _dev
-        for _l in ESP:ESP state:STATE root_a:ROOT_A root_b:ROOT_B var:VAR; do
-            _dev=$(blkid -L "${_l%%:*}" 2>/dev/null || true)
+        local _l _dev _name
+        # Resolved against THIS disk only. `blkid -L` searched every disk on
+        # the machine, so a box with a second SpatiumDDI disk attached could
+        # resolve `var` to the wrong one and mkfs the slots of a disk the
+        # operator never picked (#1045).
+        #
+        # ESP / state / var by filesystem label, the two OS slots by GPT name
+        # — same split, and for the same reason, as _layout_is_reusable.
+        for _l in ESP:ESP state:STATE var:VAR; do
+            _name="${_l%%:*}"
+            _dev=$(_labelled_device_on "$TARGET_DISK" "$_name" || true)
             if [ -z "$_dev" ] || [ ! -b "$_dev" ]; then
-                log "FATAL: reinstall keeping /var, but no partition is labelled '${_l%%:*}'."
+                log "FATAL: reinstall keeping /var, but no partition of $TARGET_DISK is labelled '$_name'."
                 log "  Refusing rather than guessing a partition number. Nothing has been written."
                 exit 1
             fi
             printf -v "${_l##*:}" '%s' "$_dev"
             log "Reinstall: ${_l##*:} resolved by label to $_dev"
         done
+        for _l in root_a:ROOT_A root_b:ROOT_B; do
+            _name="${_l%%:*}"
+            _dev=$(_slot_device_on "$TARGET_DISK" "$_name" || true)
+            if [ -z "$_dev" ] || [ ! -b "$_dev" ]; then
+                log "FATAL: reinstall keeping /var, but $TARGET_DISK has no OS slot '$_name'."
+                log "  Refusing rather than guessing a partition number. Nothing has been written."
+                exit 1
+            fi
+            printf -v "${_l##*:}" '%s' "$_dev"
+            log "Reinstall: ${_l##*:} resolved to $_dev"
+        done
+        # A disk carrying the #1045 duplicate resolves both slots by GPT name
+        # above, so they are two different partitions and the mkfs a few
+        # steps below writes each its correct label — the reinstall leaves
+        # the disk consistent. Assert it rather than trust it: installing
+        # both slots onto one partition would produce a box with no
+        # rollback and nothing would say so.
+        if [ "$ROOT_A" = "$ROOT_B" ]; then
+            log "FATAL: both OS slots of $TARGET_DISK resolved to $ROOT_A."
+            log "  Refusing rather than installing both slots onto one partition."
+            exit 1
+        fi
     fi
 
     # Disk-size validation lives in ``pick_disk`` now (fires right
@@ -4146,11 +4295,19 @@ EOF
         # avoid. The OS slots are replaced either way.
         if [ "$KEEP_VAR" != "yes" ]; then
         mkfs.ext4 -F -L state "$STATE"      >> "$INSTALL_LOG" 2>&1
-        # Label the slots distinctly so the boot loader / sysupdate
-        # can pick them by label rather than position. root_a is the
-        # active slot for this install; root_b is empty until 8b's
-        # `spatium-update` writes the next image there.
         fi
+        # Label the slots distinctly. NOT because anything boots by this
+        # label — grub.cfg renders `root=UUID=` and the image-baseline fstab
+        # carries no root entry — but so that `blkid` output, a support
+        # bundle and a human at a console all read honestly. The thing that
+        # actually identifies a slot is its GPT name (`-c4:root_A` /
+        # `-c5:root_B` above), which is what spatium-upgrade-slot matches on
+        # and what survives a slot being overwritten with a filesystem image.
+        #
+        # Both run on the KEEP_VAR path too: the OS slots are replaced either
+        # way, which is also what repairs the #1045 duplicate on a disk
+        # upgraded by an appliance that predates the fix. root_b is empty
+        # until `spatium-upgrade-slot` writes the next image there.
         mkfs.ext4 -F -L root_a "$ROOT_A"    >> "$INSTALL_LOG" 2>&1
         mkfs.ext4 -F -L root_b "$ROOT_B"    >> "$INSTALL_LOG" 2>&1
         if [ "$KEEP_VAR" != "yes" ]; then
