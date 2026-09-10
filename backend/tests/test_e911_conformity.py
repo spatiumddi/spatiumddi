@@ -318,12 +318,16 @@ async def test_a_never_polled_switch_fails(db_session: AsyncSession) -> None:
 
 @pytest.mark.asyncio
 async def test_a_failing_poll_status_fails(db_session: AsyncSession) -> None:
+    """``"error"`` was the status this test originally used and no poller
+    ever writes it — the real vocabulary is pending | success | partial |
+    failed | timeout. Asserting on a value that cannot occur is a test that
+    proves nothing, which is how the `partial` misclassification survived."""
     await _switch_with_port_binding(
-        db_session, last_poll_at=_now() - timedelta(seconds=60), poll_status="error"
+        db_session, last_poll_at=_now() - timedelta(seconds=60), poll_status="failed"
     )
     out = await _check(db_session, "e911_port_binding_evidence_fresh")
     assert out.status == STATUS_FAIL
-    assert "status" in out.diagnostic["devices"][0]["reason"]
+    assert "failed" in out.diagnostic["devices"][0]["reason"]
 
 
 @pytest.mark.asyncio
@@ -394,3 +398,83 @@ def test_the_three_checks_are_catalogued_and_seeded() -> None:
     for policy in seeded:
         assert policy["framework"] == "RAY BAUM'S Act"
         assert policy["reference"] == "47 CFR 9.16(b)"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Regressions from /code-review
+# ══════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_a_switch_collecting_neither_fdb_nor_lldp_fails(
+    db_session: AsyncSession,
+) -> None:
+    """The hole the first version left open, and precisely the silent
+    degradation the check claims to catch: a switch polled perfectly on
+    schedule but collecting NEITHER the forwarding table nor LLDP can never
+    produce port evidence, so every lookup for its ports degrades forever
+    while the device reports a healthy poll."""
+    device = await _switch_with_port_binding(
+        db_session, last_poll_at=_now() - timedelta(seconds=30)
+    )
+    device.poll_fdb = False
+    device.poll_lldp = False
+    await db_session.flush()
+    out = await _check(db_session, "e911_port_binding_evidence_fresh")
+    assert out.status == STATUS_FAIL
+    assert "no port evidence can exist" in out.diagnostic["devices"][0]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_either_fdb_or_lldp_alone_is_enough(db_session: AsyncSession) -> None:
+    """Control: the resolver needs one of the two, not both. Demanding both
+    would fail every LLDP-only or FDB-only switch for no reason."""
+    device = await _switch_with_port_binding(
+        db_session, last_poll_at=_now() - timedelta(seconds=30)
+    )
+    device.poll_fdb = False
+    device.poll_lldp = True
+    await db_session.flush()
+    assert (await _check(db_session, "e911_port_binding_evidence_fresh")).status == STATUS_PASS
+
+
+@pytest.mark.asyncio
+async def test_a_partial_poll_is_not_reported_as_unpolled(
+    db_session: AsyncSession,
+) -> None:
+    """The real vocabulary is pending | success | partial | failed | timeout.
+    The first version tested ``not in ("ok", "success")`` — "ok" is not a
+    value any poller writes — so a ``partial`` poll, where perhaps only the
+    unrelated IGMP leg failed, was reported as not polled at all."""
+    await _switch_with_port_binding(
+        db_session, last_poll_at=_now() - timedelta(seconds=30), poll_status="partial"
+    )
+    assert (await _check(db_session, "e911_port_binding_evidence_fresh")).status == STATUS_PASS
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_status", ["failed", "timeout"])
+async def test_a_genuinely_failed_poll_still_fails(
+    db_session: AsyncSession, bad_status: str
+) -> None:
+    await _switch_with_port_binding(
+        db_session, last_poll_at=_now() - timedelta(seconds=30), poll_status=bad_status
+    )
+    out = await _check(db_session, "e911_port_binding_evidence_fresh")
+    assert out.status == STATUS_FAIL
+    assert bad_status in out.diagnostic["devices"][0]["reason"]
+
+
+def test_network_editor_can_manage_locations() -> None:
+    """Every sibling vertical registry (bacnet_device / dicom_ae / ot_device)
+    is granted to the builtin Network Editor. Leaving e911_location out made
+    writes undocumented superadmin-only, with the UI quietly hiding its own
+    buttons for the role that exists to do this work."""
+    from app.main import _BUILTIN_ROLES
+
+    _description, perms = _BUILTIN_ROLES["Network Editor"]
+    resources = {p["resource_type"] for p in perms}
+    assert "e911_location" in resources
+    # Anchored against a sibling so a restructure of the role breaks this
+    # test rather than silently dropping the grant.
+    assert "dicom_ae" in resources

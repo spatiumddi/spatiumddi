@@ -306,15 +306,19 @@ async def test_an_lldp_disagreement_makes_the_fdb_row_stale_immediately(
     old one is fresh by age and wrong in fact — this is the case the age
     test cannot catch quickly, and LLDP is the device's own announcement."""
     f = await _estate(db_session)
-    await _fdb(db_session, f, mac=PHONE_MAC, age_seconds=10)
-    await _lldp(db_session, f, chassis_id=OTHER_MAC, age_seconds=10)
+    # The contradicting LLDP is NEWER than the FDB row — both well inside
+    # the 600 s window, so this is the immediacy the age test cannot give.
+    # Equal timestamps deliberately do NOT fire: that is a daisy chain, not
+    # a swap (see test_a_daisy_chained_pc_still_gets_a_room).
+    await _fdb(db_session, f, mac=PHONE_MAC, age_seconds=20)
+    await _lldp(db_session, f, chassis_id=OTHER_MAC, age_seconds=5)
     await _bind(db_session, f.erls["room"], "switch_port", network_interface_id=f.iface.id)
     await _bind(db_session, f.erls["floor"], "subnet", subnet_id=f.subnet.id)
 
     r = await resolve_location(db_session, ip=PHONE_IP, mac=PHONE_MAC, now=f.now)
     assert r.rule_matched == "subnet"
     assert r.confidence == "degraded"
-    assert "contradicted by an LLDP neighbour" in (r.degraded_reason or "")
+    assert "contradicted by a MORE RECENT" in (r.degraded_reason or "")
     assert OTHER_MAC in (r.degraded_reason or "")
 
 
@@ -585,3 +589,122 @@ async def test_the_most_specific_subnet_wins(db_session: AsyncSession) -> None:
     r = await resolve_location(db_session, ip=PHONE_IP, now=f.now)
     assert r.rule_matched == "subnet"
     assert r.erl is not None and r.erl.room == "312"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Regressions from /code-review
+# ══════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_overlapping_subnets_do_not_500_the_lookup(db_session: AsyncSession) -> None:
+    """``ip_address.address`` is unique only PER SUBNET. With a /28 carved
+    out of the /24 — which this suite already calls normal — an unscoped
+    ``scalar_one_or_none()`` raised MultipleResultsFound and took the whole
+    endpoint down *before* the audit row was written."""
+    f = await _estate(db_session)
+    narrow = Subnet(
+        space_id=f.subnet.space_id,
+        block_id=f.subnet.block_id,
+        network="10.20.3.32/28",
+        name="voice-confroom",
+        subnet_role="voice",
+        site_id=f.site.id,
+    )
+    db_session.add(narrow)
+    await db_session.flush()
+    # The SAME address in both subnets.
+    db_session.add(IPAddress(subnet_id=narrow.id, address=PHONE_IP, status="allocated"))
+    await db_session.flush()
+    await _bind(db_session, f.erls["room"], "subnet", subnet_id=narrow.id)
+
+    r = await resolve_location(db_session, ip=PHONE_IP, now=f.now)
+    assert r.rule_matched == "subnet"
+    assert r.erl is not None and r.erl.room == "312"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", ["10.20.3.4x", "not-an-ip", "", "10.20.3.4/24", "; DROP"])
+async def test_a_malformed_ip_answers_none_rather_than_aborting(
+    db_session: AsyncSession, bad: str
+) -> None:
+    """Unvalidated text reaching an INET comparison raises 22P02, and via
+    the copilot tool the aborted transaction takes out every later tool call
+    in the chat turn. A typo must be a "no location" answer."""
+    f = await _estate(db_session)
+    await _bind(db_session, f.erls["site"], "site_default", site_id=f.site.id)
+    r = await resolve_location(db_session, ip=bad, now=f.now)
+    # Nothing raised, and the identity still records what was asked.
+    assert r.confidence in ("none", "observed")
+    if bad:
+        assert r.identity_value == bad
+
+
+@pytest.mark.asyncio
+async def test_a_chassis_id_alone_is_recorded_in_the_identity(
+    db_session: AsyncSession,
+) -> None:
+    """Permitted on its own, and it used to log as ``unknown`` / "" — which
+    silently lost the one thing the audit trail exists to record."""
+    f = await _estate(db_session)
+    await _bind(db_session, f.erls["site"], "site_default", site_id=f.site.id)
+    r = await resolve_location(db_session, chassis_id=PHONE_MAC, now=f.now)
+    assert r.identity_kind == "chassis_id"
+    assert r.identity_value == PHONE_MAC
+
+
+@pytest.mark.asyncio
+async def test_a_config_rule_reports_no_evidence_age(db_session: AsyncSession) -> None:
+    """A `subnet` match is as current as the moment it was saved. Reporting
+    the port evidence's age beside it put an unrelated — possibly stale —
+    number next to a green ``observed`` answer, in the response and in the
+    log column documented as "the evidence the answer rests on"."""
+    f = await _estate(db_session)
+    # Port evidence exists and is old, but no switch_port binding does, so a
+    # subnet rule wins on its own terms rather than by degradation.
+    await _fdb(db_session, f, mac=PHONE_MAC, age_seconds=WINDOW + 500)
+    await _bind(db_session, f.erls["floor"], "subnet", subnet_id=f.subnet.id)
+
+    r = await resolve_location(db_session, ip=PHONE_IP, mac=PHONE_MAC, now=f.now)
+    assert r.rule_matched == "subnet"
+    assert r.confidence == "observed"
+    assert r.evidence_age_seconds is None
+    assert r.observed_at is None
+    # The observation is still REPORTED as evidence — it just does not
+    # pretend to be what the answer rests on.
+    assert any(e.kind == "fdb" for e in r.evidence)
+
+
+@pytest.mark.asyncio
+async def test_a_daisy_chained_pc_still_gets_a_room(db_session: AsyncSession) -> None:
+    """A desk phone with a PC behind it is the commonest wiring in exactly
+    the estates this serves: the PC's MAC is in the FDB and only the phone
+    announces LLDP. Treating that as a contradiction made a room-level
+    answer unreachable for every such PC, permanently."""
+    f = await _estate(db_session)
+    # Both current. The PC is in the FDB; the phone announces LLDP.
+    await _fdb(db_session, f, mac=OTHER_MAC, age_seconds=30)
+    await _lldp(db_session, f, chassis_id=PHONE_MAC, age_seconds=30)
+    await _bind(db_session, f.erls["room"], "switch_port", network_interface_id=f.iface.id)
+
+    r = await resolve_location(db_session, mac=OTHER_MAC, now=f.now)
+    assert r.rule_matched == "switch_port"
+    assert r.confidence == "observed"
+
+
+@pytest.mark.asyncio
+async def test_a_newer_lldp_neighbour_still_invalidates_the_fdb_row(
+    db_session: AsyncSession,
+) -> None:
+    """Control for the test above, and the case the signal exists for: after
+    a swap the new device's LLDP is NEWER than the old device's FDB row."""
+    f = await _estate(db_session)
+    await _fdb(db_session, f, mac=PHONE_MAC, age_seconds=300)
+    await _lldp(db_session, f, chassis_id=OTHER_MAC, age_seconds=30)
+    await _bind(db_session, f.erls["room"], "switch_port", network_interface_id=f.iface.id)
+    await _bind(db_session, f.erls["floor"], "subnet", subnet_id=f.subnet.id)
+
+    r = await resolve_location(db_session, ip=PHONE_IP, mac=PHONE_MAC, now=f.now)
+    assert r.rule_matched == "subnet"
+    assert r.confidence == "degraded"
+    assert "MORE RECENT" in (r.degraded_reason or "")

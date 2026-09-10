@@ -35,6 +35,7 @@ Two independent staleness signals, and they are not redundant:
 
 from __future__ import annotations
 
+import ipaddress
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -73,6 +74,24 @@ DEFAULT_FRESHNESS_SECONDS = 600
 #: Only that subtype can be compared against a MAC we hold; a
 #: subtype-7 (locally assigned) chassis-id is an opaque string.
 LLDP_CHASSIS_SUBTYPE_MAC = 4
+
+
+def _valid_ip(raw: str | None) -> str | None:
+    """Return ``raw`` only if Postgres will accept it as an INET.
+
+    Unvalidated text reaching an INET comparison raises 22P02, and the
+    blast radius is not one request: via the ``find_e911_location`` copilot
+    tool the aborted transaction takes out every later tool call and
+    message write in the chat turn. Refusing here keeps a typo a "no
+    location" answer, which is the honest one.
+    """
+    if not raw:
+        return None
+    try:
+        ipaddress.ip_address(raw.strip())
+    except ValueError:
+        return None
+    return raw.strip()
 
 
 @dataclass(frozen=True)
@@ -249,9 +268,21 @@ async def _port_from_mac(
     detail = f"switch FDB entry for {mac}"
 
     # Disagreement check. An LLDP neighbour on the SAME port announcing a
-    # different chassis-id means something else is plugged in there now,
-    # and the FDB row we just matched is history. This fires immediately
-    # where the age test has to wait out the whole window.
+    # different chassis-id can mean something else is plugged in there now,
+    # and that the FDB row we just matched is history — which fires
+    # immediately where the age test must wait out the whole window.
+    #
+    # But a port legitimately carries several devices: a desk phone with a
+    # PC daisy-chained behind it is the commonest wiring in exactly the
+    # estates this feature serves, and the PC's MAC appears in the FDB while
+    # only the phone announces LLDP. Treating that as a contradiction would
+    # make a room-level answer unreachable for every such PC, permanently.
+    #
+    # So the signal is NEWER, not merely different: distrust the FDB row
+    # only when a contradicting neighbour has been seen MORE RECENTLY than
+    # it. After a swap the new device's LLDP is fresh and the old device's
+    # FDB row is not, which is the case this exists for; on a daisy chain
+    # both are current and neither displaces the other.
     if not stale:
         other = (
             await db.execute(
@@ -259,6 +290,7 @@ async def _port_from_mac(
                 .where(
                     NetworkNeighbour.interface_id == iface_id,
                     NetworkNeighbour.remote_chassis_id_subtype == LLDP_CHASSIS_SUBTYPE_MAC,
+                    NetworkNeighbour.last_seen > seen,
                     func.lower(
                         func.replace(
                             func.replace(NetworkNeighbour.remote_chassis_id, ":", ""),
@@ -268,14 +300,15 @@ async def _port_from_mac(
                     )
                     != mac.replace(":", ""),
                 )
+                .order_by(NetworkNeighbour.last_seen.desc())
                 .limit(1)
             )
         ).scalar_one_or_none()
         if other is not None:
             stale = True
             detail = (
-                f"switch FDB entry for {mac}, contradicted by an LLDP neighbour "
-                f"on the same port announcing {other}"
+                f"switch FDB entry for {mac}, contradicted by a MORE RECENT "
+                f"LLDP neighbour on the same port announcing {other}"
             )
 
     return iface_id, Evidence(
@@ -286,6 +319,26 @@ async def _port_from_mac(
         stale=stale,
         detail=detail,
     )
+
+
+async def _ip_row_id(db: AsyncSession, ip: str, subnet: Subnet | None) -> uuid.UUID | None:
+    """The IPAM row for ``ip``, scoped to its subnet where we know it.
+
+    ``ip_address.address`` is unique only *per subnet* — overlapping
+    prefixes and VRFs are normal in IPAM, and this feature's own tests carve
+    a /28 out of a /24 — so an unscoped ``scalar_one_or_none()`` raises
+    MultipleResultsFound and 500s the whole lookup without even writing the
+    audit row. Scoped first; ordered-and-limited as the fallback, because
+    answering from one of several candidate rows beats answering nothing.
+    """
+    stmt = select(IPAddress.id).where(cast(IPAddress.address, String) == ip)
+    if subnet is not None:
+        scoped = (
+            await db.execute(stmt.where(IPAddress.subnet_id == subnet.id).limit(1))
+        ).scalar_one_or_none()
+        if scoped is not None:
+            return scoped
+    return (await db.execute(stmt.order_by(IPAddress.id).limit(1))).scalar_one_or_none()
 
 
 async def _subnet_for_ip(db: AsyncSession, ip: str) -> Subnet | None:
@@ -365,13 +418,24 @@ async def resolve_location(
     now = now or datetime.now(UTC)
     evidence: list[Evidence] = []
 
+    # A malformed IP is dropped rather than passed to an INET comparison
+    # (see _valid_ip). The identity below still records what was ASKED, so
+    # the audit row says "someone looked up 10.20.3.4x" rather than losing
+    # the query because it was a typo.
+    asked_ip = ip
+    ip = _valid_ip(ip)
+
     identity_kind, identity_value = "unknown", ""
     if chassis_id and port_id:
         identity_kind, identity_value = "chassis_port", f"{chassis_id}/{port_id}"
+    elif chassis_id:
+        # Permitted on its own, and it used to log as ``unknown`` / "" —
+        # which silently lost the one thing the trail exists to record.
+        identity_kind, identity_value = "chassis_id", chassis_id
     elif mac:
         identity_kind, identity_value = "mac", mac
-    elif ip:
-        identity_kind, identity_value = "ip", ip
+    elif asked_ip:
+        identity_kind, identity_value = "ip", asked_ip
 
     # ── Facts ────────────────────────────────────────────────────────
     mac_canon: str | None = None
@@ -437,11 +501,7 @@ async def resolve_location(
             )
         ).scalar_one_or_none()
 
-    ip_row_id: uuid.UUID | None = None
-    if ip:
-        ip_row_id = (
-            await db.execute(select(IPAddress.id).where(cast(IPAddress.address, String) == ip))
-        ).scalar_one_or_none()
+    ip_row_id = await _ip_row_id(db, ip, subnet) if ip else None
 
     # ── Walk the precedence, most specific first ─────────────────────
     targets: dict[str, dict[str, object] | None] = {
@@ -486,8 +546,16 @@ async def resolve_location(
             )
             continue
 
-        observed_at = port_evidence.observed_at if port_evidence else None
-        age = port_evidence.age_seconds if port_evidence else None
+        # Only a port-level rule rests on an observation. Reporting the
+        # port evidence's age beside a `subnet` or `site_default` match
+        # would put an unrelated — possibly stale — number next to a green
+        # `observed` answer, in the response AND in the log column
+        # documented as "the evidence the answer rests on". A config rule is
+        # as current as the moment it was saved, and says so by carrying no
+        # age at all.
+        rests_on_observation = rule_kind in ("switch_port", "wireless_ap")
+        observed_at = port_evidence.observed_at if rests_on_observation and port_evidence else None
+        age = port_evidence.age_seconds if rests_on_observation and port_evidence else None
         return Resolution(
             identity_kind=identity_kind,
             identity_value=identity_value,

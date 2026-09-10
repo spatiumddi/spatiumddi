@@ -1669,6 +1669,8 @@ async def check_e911_port_binding_evidence_fresh(
                 NetworkDevice.last_poll_status,
                 NetworkDevice.poll_interval_seconds,
                 NetworkDevice.is_active,
+                NetworkDevice.poll_fdb,
+                NetworkDevice.poll_lldp,
                 func.count(ERLBinding.id),
             )
             .select_from(ERLBinding)
@@ -1688,6 +1690,8 @@ async def check_e911_port_binding_evidence_fresh(
                 NetworkDevice.last_poll_status,
                 NetworkDevice.poll_interval_seconds,
                 NetworkDevice.is_active,
+                NetworkDevice.poll_fdb,
+                NetworkDevice.poll_lldp,
             )
         )
     ).all()
@@ -1695,18 +1699,34 @@ async def check_e911_port_binding_evidence_fresh(
         return CheckOutcome.not_applicable("no switch-port ERL bindings exist")
 
     broken: list[dict[str, Any]] = []
-    for name, last_poll, poll_status, interval, is_active, count in rows:
+    for name, last_poll, poll_status, interval, is_active, poll_fdb, poll_lldp, count in rows:
         window = (int(interval) if interval else 300) * 2
         why: str | None = None
         if not is_active:
             why = "device is not active"
+        elif not poll_fdb and not poll_lldp:
+            # The hole the first version of this check left open, and it is
+            # precisely the silent degradation the check claims to catch: a
+            # switch polled perfectly on schedule but collecting NEITHER the
+            # forwarding table nor LLDP can never produce port evidence, so
+            # every lookup for its ports degrades forever while the device
+            # reports a healthy poll.
+            why = "neither poll_fdb nor poll_lldp is enabled — no port evidence can exist"
         elif last_poll is None:
             why = "device has never been polled"
         elif (now - last_poll).total_seconds() > window:
             age = int((now - last_poll).total_seconds())
             why = f"last polled {age}s ago (window {window}s)"
-        elif poll_status not in ("ok", "success"):
-            why = f"last poll status is {poll_status!r}"
+        elif poll_status == "failed" or poll_status == "timeout":
+            # The real vocabulary is pending | success | partial | failed |
+            # timeout (``app.models.network``). The first version tested
+            # ``not in ("ok", "success")`` — "ok" is not a value any poller
+            # writes, and the test therefore reported a ``partial`` poll,
+            # where perhaps only the unrelated IGMP leg failed, as "not
+            # polled at all".
+            why = f"last poll {poll_status}"
+        elif poll_status == "pending" and last_poll is None:
+            why = "device has never completed a poll"
         if why:
             broken.append({"device": name, "bindings": int(count), "reason": why})
 

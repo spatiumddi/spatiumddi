@@ -24,6 +24,7 @@ than to whoever asked.
 
 from __future__ import annotations
 
+import uuid
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -41,6 +42,22 @@ from app.services.ai.tools.base import register_tool
 from app.services.e911.resolver import resolve_location
 
 _MODULE = "network.e911"
+
+
+def _as_uuid(raw: str | None) -> uuid.UUID | None:
+    """Parse an id the model handed us, or None.
+
+    A raw string compared against a UUID column raises 22P02, and an
+    aborted transaction inside a chat turn takes out every later tool call
+    — so a malformed id narrows nothing rather than failing the turn. The
+    repo-wide convention for model-supplied ids.
+    """
+    if not raw:
+        return None
+    try:
+        return uuid.UUID(raw)
+    except (ValueError, AttributeError, TypeError):
+        return None
 
 
 def _address_line(erl: EmergencyResponseLocation) -> str:
@@ -196,8 +213,9 @@ class FindERLsArgs(BaseModel):
 async def find_erls(db: AsyncSession, user: User, args: FindERLsArgs) -> list[dict[str, Any]]:
     _ = user
     stmt = select(EmergencyResponseLocation)
-    if args.site_id:
-        stmt = stmt.where(EmergencyResponseLocation.site_id == args.site_id)
+    site_id = _as_uuid(args.site_id)
+    if site_id is not None:
+        stmt = stmt.where(EmergencyResponseLocation.site_id == site_id)
     if args.validation_state:
         stmt = stmt.where(EmergencyResponseLocation.validation_state == args.validation_state)
     if args.dispatchable is not None:
@@ -275,8 +293,9 @@ async def count_e911_unbound_voice_subnets(
 ) -> dict[str, Any]:
     _ = user
     stmt = select(Subnet).where(Subnet.subnet_role == "voice")
-    if args.site_id:
-        stmt = stmt.where(Subnet.site_id == args.site_id)
+    site_id = _as_uuid(args.site_id)
+    if site_id is not None:
+        stmt = stmt.where(Subnet.site_id == site_id)
     subnets = list((await db.execute(stmt)).scalars().all())
     if not subnets:
         return {

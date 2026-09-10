@@ -44,7 +44,7 @@ from datetime import UTC, datetime
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
 from sqlalchemy import Select, case, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -145,6 +145,28 @@ class GeoPoint(BaseModel):
         return self
 
 
+def _clean_elins(v: list[str]) -> list[str]:
+    """Normalise an ELIN list, refusing only obvious junk.
+
+    Deliberately permissive: an ELIN is a DID in whatever form the
+    operator's carrier wrote it on the PS-ALI paperwork, and refusing an
+    extension-style short number would reject a real configuration.
+
+    A module-level function rather than a classmethod shared through
+    ``__func__``, so both the create and the update body get the same rule
+    without a binding trick that would break quietly.
+    """
+    out: list[str] = []
+    for raw in v:
+        e = raw.strip()
+        if not e:
+            continue
+        if len(e) > 32 or not any(c.isdigit() for c in e):
+            raise ValueError(f"{raw!r} does not look like a dialable number")
+        out.append(e)
+    return out
+
+
 class ERLCreate(CivicAddress, GeoPoint):
     name: str = Field(min_length=1, max_length=255)
     site_id: uuid.UUID | None = None
@@ -155,27 +177,42 @@ class ERLCreate(CivicAddress, GeoPoint):
     @field_validator("elins")
     @classmethod
     def _check_elins(cls, v: list[str]) -> list[str]:
-        out: list[str] = []
-        for raw in v:
-            e = raw.strip()
-            if not e:
-                continue
-            # Deliberately permissive: an ELIN is a DID in whatever form
-            # the operator's carrier wrote it on the PS-ALI paperwork, and
-            # refusing an extension-style short number would reject a real
-            # configuration. Only obvious junk is rejected.
-            if len(e) > 32 or not any(c.isdigit() for c in e):
-                raise ValueError(f"{raw!r} does not look like a dialable number")
-            out.append(e)
-        return out
+        return _clean_elins(v)
 
 
 class ERLUpdate(CivicAddress, GeoPoint):
+    """PATCH body. ``exclude_unset`` means an absent key is left alone.
+
+    An explicit ``null`` is a different thing from an absent key and must
+    not reach a NOT NULL column: without the validator below,
+    ``{"name": null}`` set the column to None and surfaced as a bogus 409
+    "that name is already taken", and ``{"is_active": null}`` 500'd. This is
+    the #700 ``exclude_unset``-plus-explicit-null shape. A null on a
+    *nullable* civic element still clears it, which is how an operator
+    corrects a wrong floor.
+    """
+
     name: str | None = Field(default=None, min_length=1, max_length=255)
     site_id: uuid.UUID | None = None
     elins: list[str] | None = None
     is_active: bool | None = None
     notes: str | None = None
+
+    @field_validator("name", "elins", "is_active", "notes")
+    @classmethod
+    def _no_explicit_null(cls, v: object, info: ValidationInfo) -> object:
+        if v is None:
+            raise ValueError(
+                f"{info.field_name} cannot be null — omit the key to leave it unchanged"
+            )
+        return v
+
+    @field_validator("elins")
+    @classmethod
+    def _check_elins(cls, v: list[str] | None) -> list[str] | None:
+        # Same rule as ERLCreate. The create path validating and the update
+        # path not is how a list nobody checked reaches the column.
+        return None if v is None else _clean_elins(v)
 
 
 class ERLRead(CivicAddress, GeoPoint):
@@ -382,6 +419,24 @@ def _binding_read(row: ERLBinding, erl_name: str) -> BindingRead:
     )
 
 
+def _is_unique_violation(exc: IntegrityError) -> bool:
+    """True only for a 23505 unique violation.
+
+    Everything else — above all 23503, a foreign key naming a target that
+    does not exist — must propagate to the #922 global handler, which
+    classifies it against the values the request actually carried and
+    answers 422 or 409 accordingly. A blanket ``except IntegrityError``
+    reported every one of them as "already exists", which on
+    ``create_binding`` is the likeliest failure of all: five of its seven
+    targets are UUIDs an operator pastes by hand.
+
+    ``exc.orig`` is SQLAlchemy's asyncpg wrapper, which re-exports
+    ``sqlstate`` — unlike ``detail``, which hangs off ``__cause__`` (the
+    trap #922 documents).
+    """
+    return getattr(exc.orig, "sqlstate", None) == "23505"
+
+
 async def _load_erl(db: AsyncSession, erl_id: uuid.UUID) -> EmergencyResponseLocation:
     row = (
         await db.execute(
@@ -515,6 +570,8 @@ async def create_erl(body: ERLCreate, db: DB, user: CurrentUser) -> ERLRead:
     try:
         await db.flush()
     except IntegrityError as exc:
+        if not _is_unique_violation(exc):
+            raise
         await db.rollback()
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -549,22 +606,35 @@ async def update_erl(erl_id: uuid.UUID, body: ERLUpdate, db: DB, user: CurrentUs
     # how an operator corrects a wrong floor.
     changes = body.model_dump(exclude_unset=True)
     old = {k: getattr(row, k) for k in changes}
+
+    # Which civic elements actually MOVED. Keyed on the value and not on the
+    # key being present, because the edit form sends all 31 elements on
+    # every save — so a presence test would throw away a provider's verdict
+    # for a rename or a notes tweak, which is both wrong and invisible.
+    civic_changed = [
+        k for k in changes if k in CIVIC_COLUMNS and (changes[k] or None) != (old[k] or None)
+    ]
+
     for field, value in changes.items():
         setattr(row, field, value)
 
-    # Any address edit invalidates a provider's verdict about the OLD
-    # address. Silently keeping `validated` would leave the estate
-    # reporting a validated address nobody has ever checked — and the
-    # e911_erl_unvalidated conformity check would stay quiet about it.
-    if any(k in changes for k in CIVIC_COLUMNS) and row.validation_state != "unvalidated":
+    # A real address edit invalidates a provider's verdict about the OLD
+    # address. Silently keeping `validated` would leave the estate reporting
+    # a validated address nobody has ever checked — and the
+    # e911_erl_validated conformity check would stay quiet about it.
+    if civic_changed and row.validation_state != "unvalidated":
         row.validation_state = "unvalidated"
         row.validated_at = None
-        row.validation_detail = "reset: the civic address was edited after validation"
+        row.validation_detail = (
+            "reset: " + ", ".join(sorted(civic_changed)) + " changed after validation"
+        )
         changes["validation_state"] = "unvalidated"
 
     try:
         await db.flush()
     except IntegrityError as exc:
+        if not _is_unique_violation(exc):
+            raise
         await db.rollback()
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail="That ERL name is already taken"
@@ -700,6 +770,11 @@ async def create_binding(body: BindingCreate, db: DB, user: CurrentUser) -> Bind
     try:
         await db.flush()
     except IntegrityError as exc:
+        # A 23503 here means the pasted target id does not exist; the global
+        # handler turns that into a 422 naming the field, which is what the
+        # operator needs rather than "already exists".
+        if not _is_unique_violation(exc):
+            raise
         await db.rollback()
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,

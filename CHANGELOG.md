@@ -108,7 +108,55 @@ the formatter handles the rest.
   tell a PBX's service token from the same person's browser session.
   **No `propose_*` MCP tools**, an explicit decision under
   non-negotiable #13: a wrong ERL binding misroutes an ambulance.
-  43 backend tests. The resolver's were written before any API existed
+  **/code-review found twelve, and the two sharpest were both about a
+  thing looking fine while being wrong.** `ip_address.address` is
+  unique only PER SUBNET — overlapping prefixes are normal, and this
+  feature's own tests carve a /28 out of a /24 — so an unscoped
+  `scalar_one_or_none()` raised MultipleResultsFound and 500'd the
+  whole lookup *before* the audit row was written. And the validation
+  reset keyed on a civic key being PRESENT while the edit form sends
+  all 31 elements on every save, so renaming an ERL or fixing a typo
+  in its notes silently destroyed a provider's `validated` verdict; it
+  now compares values and names the elements that actually moved.
+  Also: an unvalidated `ip` string reaching an INET comparison raises
+  22P02, and through the copilot tool the aborted transaction takes
+  out every later tool call in the chat turn, so a malformed address
+  is now a "no location" answer that still records what was asked;
+  `ERLUpdate` admitted an explicit `null` into NOT NULL columns
+  (surfacing as a bogus 409 name conflict) and skipped the ELIN
+  validator the create path had; a `chassis_id`-only lookup logged its
+  identity as `unknown` / empty, losing the one thing the trail exists
+  for; `observed_at` and `evidence_age_seconds` came from port
+  evidence even when a *config* rule matched, putting an unrelated
+  stale age beside a green `observed` answer; a blanket
+  `except IntegrityError` reported foreign-key violations as "already
+  exists", worst on `create_binding` where five of seven targets are
+  hand-pasted UUIDs; and no builtin role granted `e911_location`,
+  unlike all four sibling vertical registries on Network Editor, so
+  writes were undocumented superadmin-only with the UI quietly hiding
+  its own buttons.
+  **Two findings were the "a guard that cannot fire" class again.**
+  The port-binding check ignored `poll_fdb` / `poll_lldp`, so a switch
+  polled perfectly on schedule while collecting neither passed — which
+  is precisely the silent degradation it claims to catch. And it
+  tested `status not in ("ok", "success")` where the real vocabulary
+  is `pending | success | partial | failed | timeout`: `"ok"` is a
+  value no poller writes, so a `partial` poll whose only failure was
+  the unrelated IGMP leg was reported as "not polled", while the test
+  pinning that behaviour asserted on `"error"` — also not a real
+  value, which is how it survived.
+  **One finding changed a design decision rather than fixing a slip.**
+  The LLDP-disagreement signal fired on *any* other chassis-id on the
+  port, which makes a room-level answer permanently unreachable for a
+  PC daisy-chained behind an LLDP desk phone — the commonest wiring in
+  exactly these estates, where the PC is in the FDB and only the phone
+  announces LLDP. The signal is now NEWER, not merely different: the
+  FDB row is distrusted only when a contradicting neighbour was seen
+  more recently than it. After a swap the new device's LLDP is fresh
+  and the old device's FDB row is not, which is the case it exists
+  for; on a daisy chain both are current and neither displaces the
+  other.
+  59 backend tests. The resolver's were written before any API existed
   and both mutations were run against the shipped code to prove they
   bite — removing the staleness gate fails 4, reverting the precedence
   fails the pin test. **Deferred to their own changes:** HELD / PIDF-LO
