@@ -103,6 +103,39 @@ api:
   resources:
     requests: { cpu: 100m, memory: 256Mi }
     limits:   { cpu: 1000m, memory: 512Mi }
+  # #1051 — probe budgets sized for a BUSY event loop, not an idle one.
+  #
+  # The api is one uvicorn worker, so the kubelet's probes are answered by
+  # the same event loop that serves every request. Measured live on a
+  # 4-vCPU appliance under a sustained API load (2026-09-10, build
+  # d494b2a0): ``/health/live`` — a handler that touches nothing — went
+  # unanswered for its 5 s budget 57 times in 49 minutes, ``/health/ready``
+  # 107 times in 51 minutes, on a node with idle CPU. Every readiness miss
+  # pulled the only api pod out of the Service (the frontend answered 502
+  # to everyone; the DNS/DHCP agents got connection refused), and the
+  # fourth liveness miss in a row killed a process that was busy, not
+  # wedged.
+  #
+  #   * liveness answers "is the process alive". Four misses at a 30 s
+  #     budget restart a process that has said nothing for two minutes —
+  #     a wedged loop, not a loaded one.
+  #   * readiness's timeout must exceed the handler's OWN worst case:
+  #     ``/health/ready`` bounds its checks at 4 s (database) + 4 s
+  #     (schema) + 2 s (redis) = 10 s. Under a 5 s probe budget a slow
+  #     dependency and a dead process were indistinguishable to the
+  #     kubelet — both read "context deadline exceeded" — and the 503 that
+  #     names the failing check never arrived.
+  probes:
+    liveness:
+      initialDelaySeconds: 10
+      periodSeconds: 30
+      timeoutSeconds: 30
+      failureThreshold: 4
+    readiness:
+      initialDelaySeconds: 5
+      periodSeconds: 10
+      timeoutSeconds: 15
+      failureThreshold: 3
   env: []                        # extra env entries appended to container
   nodeSelector: {}
   # Fast-eviction tolerations are NOT a chart default: setting both taint
