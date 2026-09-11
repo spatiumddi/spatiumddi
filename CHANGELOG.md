@@ -1280,6 +1280,30 @@ the formatter handles the rest.
 ### Fixed
 
 
+- **A replaced control-plane member's Postgres instance now comes
+  back (#1058).** After a dead-node replace — the dead member evicted,
+  a replacement paired and promoted under a new hostname — the
+  CloudNativePG instance that lived on the dead node never returned:
+  its claim stayed `Bound` to a local-path volume whose node affinity
+  named the deleted node, the operator re-created the pod against that
+  same claim, and it sat `Pending` ("0/3 nodes are available: 3
+  node(s) didn't match PersistentVolume's node affinity") for good.
+  Postgres ran 2 of 3, the replacement never hosted an instance, and
+  `cluster/health` still reported the control plane HA. Observed live
+  on a nested three-node cluster 77 minutes after the replacement had
+  joined. The seed's eviction path already reclaimed the dead node's
+  Redis claim for the same reason (#590) and left CNPG's alone on the
+  premise that the operator manages its own — it does not. The seed
+  now reclaims a CNPG instance claim whose volume is pinned to a
+  hostname no Node carries (the claim, then the Pending pod — the
+  chart README's manual repair, done by the appliance itself), and
+  CNPG joins a fresh replica from the primary on a live node. Only a
+  replica's claim is ever touched: an instance the Cluster still names
+  as its current or target primary is deferred to the next heartbeat,
+  by which time the operator has failed over. Runs on every seed
+  heartbeat, so a deferred primary and a supervisor restart both
+  converge; one Cluster read per tick while Postgres is whole.
+
 - **Both OS slots ended up labelled `root_a` after an A/B upgrade, and
   the #995 "Keep /var" reinstall silently stopped being offered
   (#1045).** `build-slot-image.sh` builds ONE image for both slots and

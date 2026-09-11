@@ -1063,12 +1063,14 @@ def heartbeat_once(
         # backend clears the flag. Prune the stash to whatever the
         # backend still lists as pending (everything else is confirmed).
         evict_names = body_out.get("evict_node_names") or []
+        evicted_now: list[str] = []
         for name in evict_names:
             if name in _evicted_pending:
                 continue
             ok, evict_err = k8s_api.delete_node(str(name))
             if ok:
                 _evicted_pending.add(str(name))
+                evicted_now.append(str(name))
                 log.info("supervisor.heartbeat.node_evicted", node=name)
                 # #590 — the deleted node strands any local-path Redis PVC
                 # provisioned on it (node-affine PV): the replacement
@@ -1096,6 +1098,35 @@ def heartbeat_once(
                     "supervisor.heartbeat.node_evict_failed", node=name, error=evict_err
                 )
         _evicted_pending.intersection_update({str(n) for n in evict_names})
+
+        # #1058 — the deleted Node strands the CloudNativePG instance claim
+        # provisioned on it exactly as it strands Redis's, and the operator
+        # does NOT reclaim it: the re-created pod sits Pending on the dead
+        # node's PV affinity, Postgres runs 2 of 3 for good, and the
+        # replacement member never hosts an instance. Reclaim it the way
+        # the chart README says a human would — the claim, then the pod,
+        # and ONLY a replica's: an instance the Cluster still names as its
+        # primary is deferred to the next tick, by which time the operator
+        # has failed over. Every seed tick, not only the eviction one, so a
+        # deferred primary and a supervisor restart both converge; one CR
+        # read per tick while Postgres is whole.
+        pg_reclaimed, pg_deferred, pg_err = k8s_api.reclaim_stranded_postgres_storage(
+            evicted_nodes=evicted_now
+        )
+        if pg_reclaimed:
+            log.info(
+                "supervisor.heartbeat.postgres_storage_reclaimed",
+                pvcs=pg_reclaimed,
+                evicted=evicted_now,
+            )
+        if pg_deferred:
+            log.info(
+                "supervisor.heartbeat.postgres_storage_reclaim_deferred",
+                instances=pg_deferred,
+                reason="instance is the current or target primary; retrying next tick",
+            )
+        if pg_err:
+            log.warning("supervisor.heartbeat.postgres_storage_reclaim_failed", error=pg_err)
 
         # #590 — cluster DNS must survive a node loss. k3s's bundled
         # CoreDNS is a single replica that deterministically sits on the
