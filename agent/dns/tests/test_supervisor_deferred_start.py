@@ -21,6 +21,14 @@ failed container`` on every bind pod the two new members created.
 
 These tests pin the fixed contract: the liveness check is armed by the launch
 (a spawned or adopted pid), not by the boot.
+
+The same loop had a second misreading: on SIGTERM the handler stops every
+worker thread (and a rollout may take the daemon too), and the next tick's
+checks then found the threads it had just stopped dead and returned 2 —
+``dns_agent_thread_died`` on every DaemonSet rollout (containerd on the seed:
+``dns-bind9`` exit_status 2 at 21:20:53Z during the roles rollout, the
+``dhcp-kea`` container exit 0 the same second). A stop that was requested is
+the designed exit 0, whatever the stop killed.
 """
 
 from __future__ import annotations
@@ -28,6 +36,8 @@ from __future__ import annotations
 import dataclasses
 import signal
 import threading
+import time
+import types
 from pathlib import Path
 from typing import Any
 
@@ -187,16 +197,38 @@ class _Idle:
         self._stop.set()
 
 
+#: The names ``supervisor.run`` gives its worker threads, in construction
+#: order of the stubs that back them (heartbeat=idles[0], sync=idles[1], …).
+THREAD_NAMES = ("sync", "heartbeat", "metrics", "query-log", "rndc-status", "ingest")
+
+
 @pytest.fixture
 def supervised(agent_cfg: AgentConfig, monkeypatch):
     """``supervisor.run`` with the network-facing parts stubbed and the 1 s
     tick scripted.
 
-    Yields ``(driver, ticks, spy, run)``: ``run(script)`` executes the
-    supervisor, firing ``script[n]`` at tick ``n``, and returns the exit code.
+    Yields a namespace: ``run(script, cfg=None)`` executes the supervisor,
+    firing ``script[n]`` at tick ``n``, and returns the exit code; ``sigterm()``
+    raises SIGTERM and then waits for the stopped worker threads to actually
+    die — the order the live agent sees, since its 1 s sleep outlasts them;
+    ``settle(names)`` waits for just those threads; ``idles`` are the stubs.
     """
     drv = _ScriptedDriver(agent_cfg.state_dir)
     idles: list[_Idle] = []
+    real_sleep = time.sleep
+
+    def settle(names: tuple[str, ...] = THREAD_NAMES, timeout_s: float = 2.0) -> None:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            alive = [t for t in threading.enumerate() if t.name in names and t.is_alive()]
+            if not alive:
+                return
+            real_sleep(0.005)
+        raise AssertionError(f"threads still alive: {[t.name for t in alive]}")
+
+    def sigterm() -> None:
+        signal.raise_signal(signal.SIGTERM)  # the handler runs before we return
+        settle()
 
     def _idle(*a: Any, **kw: Any) -> _Idle:
         o = _Idle(*a, **kw)
@@ -237,14 +269,16 @@ def supervised(agent_cfg: AgentConfig, monkeypatch):
             for o in idles:
                 o.stop()
 
-    yield drv, ticks, spy, run
+    yield types.SimpleNamespace(drv=drv, ticks=ticks, spy=spy, run=run,
+                                sigterm=sigterm, settle=settle, idles=idles)
 
 
 def test_deferred_start_is_waited_out_then_a_real_death_exits_2(supervised) -> None:
     """Three ticks with nothing launched must not exit; the death at tick 6 must."""
-    drv, ticks, spy, run = supervised
+    sv = supervised
+    drv, ticks, spy = sv.drv, sv.ticks, sv.spy
 
-    rc = run({4: drv.launch, 6: drv.die})
+    rc = sv.run({4: drv.launch, 6: drv.die})
 
     assert drv.start_calls == 1
     assert rc == 2
@@ -267,38 +301,75 @@ def test_deferred_start_is_waited_out_then_a_real_death_exits_2(supervised) -> N
 def test_a_deferred_start_that_never_launches_is_not_an_exit(supervised) -> None:
     """Nothing launched, ever: the loop waits until told to stop, and exits 0.
     (In the pod, the chart's liveness probe on :53 bounds this wait.)"""
-    _drv, ticks, spy, run = supervised
+    sv = supervised
 
-    rc = run({5: lambda: signal.raise_signal(signal.SIGTERM)})
+    rc = sv.run({5: sv.sigterm})
 
     assert rc == 0
-    assert ticks[-1] == 5
-    assert "dns_daemon_exited" not in spy.events
-    assert spy.events.count("dns_daemon_start_deferred_waiting") == 1
-    assert "dns_agent_signal_received" in spy.events
-    assert spy.events[-1] == "dns_agent_exiting"
+    assert sv.ticks[-1] == 5
+    assert "dns_daemon_exited" not in sv.spy.events
+    assert "dns_agent_thread_died" not in sv.spy.events
+    assert sv.spy.events.count("dns_daemon_start_deferred_waiting") == 1
+    assert "dns_agent_signal_received" in sv.spy.events
+    assert sv.spy.events[-1] == "dns_agent_exiting"
+
+
+def test_a_stop_is_exit_0_even_when_it_takes_the_daemon_and_the_threads(supervised) -> None:
+    """A rollout's SIGTERM stops the threads and may kill the daemon in the
+    same instant; neither is a death the loop should report (the seed's bind
+    container exited 2 on every DaemonSet rollout before this)."""
+    sv = supervised
+
+    def stop_everything() -> None:
+        sv.drv.die()
+        sv.sigterm()
+
+    rc = sv.run({2: sv.drv.launch, 4: stop_everything})
+
+    assert rc == 0
+    assert sv.ticks[-1] == 4
+    assert "dns_daemon_exited" not in sv.spy.events
+    assert "dns_agent_thread_died" not in sv.spy.events
+    assert sv.spy.events[-2:] == ["dns_agent_signal_received", "dns_agent_exiting"]
+
+
+def test_a_thread_that_dies_while_not_stopping_still_exits_2(supervised) -> None:
+    """The self-restart path for a dead worker (a sync loop that dropped its
+    token, say) is intact: only a *requested* stop is exempt."""
+    sv = supervised
+
+    def kill_sync_thread() -> None:
+        sv.idles[1].stop()  # SyncLoop's stub backs the "sync" thread
+        sv.settle(("sync",))
+
+    rc = sv.run({1: sv.drv.launch, 3: kill_sync_thread})
+
+    assert rc == 2
+    assert sv.ticks[-1] == 3
+    assert ("error", "dns_agent_thread_died", {"threads": ["sync"]}) in sv.spy.calls
+    assert "dns_agent_exiting" not in sv.spy.events
 
 
 def test_a_daemon_that_was_running_at_boot_still_exits_on_death(supervised) -> None:
     """The pre-#1056 contract is intact when ``start_daemon`` did spawn."""
-    drv, ticks, spy, run = supervised
-    drv.launch()  # what a real start_daemon leaves behind when named.conf exists
+    sv = supervised
+    sv.drv.launch()  # what a real start_daemon leaves behind when named.conf exists
 
-    rc = run({2: drv.die})
+    rc = sv.run({2: sv.drv.die})
 
     assert rc == 2
-    assert ticks[-1] == 2
-    assert "dns_daemon_start_deferred_waiting" not in spy.events
-    assert spy.events[-1] == "dns_daemon_exited"
+    assert sv.ticks[-1] == 2
+    assert "dns_daemon_start_deferred_waiting" not in sv.spy.events
+    assert sv.spy.events[-1] == "dns_daemon_exited"
 
 
 def test_a_driver_that_does_not_manage_a_daemon_is_never_checked(supervised, agent_cfg) -> None:
     """Only the daemon-managing drivers take the liveness exit at all."""
-    _drv, _ticks, spy, run = supervised
+    sv = supervised
     cfg = dataclasses.replace(agent_cfg, driver="something-else")
 
-    rc = run({3: lambda: signal.raise_signal(signal.SIGTERM)}, cfg=cfg)
+    rc = sv.run({3: sv.sigterm}, cfg=cfg)
 
     assert rc == 0
-    assert "dns_daemon_start_deferred_waiting" not in spy.events
-    assert "dns_daemon_exited" not in spy.events
+    assert "dns_daemon_start_deferred_waiting" not in sv.spy.events
+    assert "dns_daemon_exited" not in sv.spy.events

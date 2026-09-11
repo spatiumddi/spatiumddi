@@ -148,6 +148,16 @@ def run(cfg: AgentConfig) -> int:
     waiting_since: float | None = None
     while not stopping.is_set():
         time.sleep(1.0)
+        # A stop requested during the tick (SIGTERM / SIGINT: a DaemonSet
+        # rollout, a scale-down, an operator) has already stopped every
+        # worker thread through ``_sig`` and may have taken the daemon with
+        # it. Whatever the checks below would find dead now died because we
+        # were told to stop — take the designed exit, not the crash exits,
+        # so the container's last state reads 0 rather than "thread died"
+        # / "daemon exited" (#1056: every rollout ended the old container
+        # with exit 2 and a dns_agent_thread_died in its log).
+        if stopping.is_set():
+            break
         if cfg.driver in daemon_managed_drivers:
             if driver.daemon_running():
                 if waiting_since is not None:
